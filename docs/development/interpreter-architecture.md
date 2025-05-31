@@ -357,13 +357,281 @@ end
 
 ## Multi-Paradigm Integration
 
-The architecture's key innovation is the unified execution model that allows seamless interaction between different programming paradigms.
+The architecture's key innovation is the unified execution model that allows seamless interaction between different programming paradigms. This is fundamentally enabled by treating **language elements themselves as first-class objects** that can have events, properties, and methods attached to them.
 
-### Unified Object Model
+### Language Elements as Objects Architecture
+
+The core architectural principle is that functions, variables, classes, and other language constructs are objects in the runtime system. This enables powerful meta-programming capabilities and seamless paradigm integration.
+
+#### Language Element Object Model
+
+```ruby
+class LanguageElement < PatlangObject
+  attr_accessor :element_type, :name, :metadata, :event_subscriptions
+  
+  def initialize(element_type, name)
+    super()
+    @element_type = element_type  # :function, :variable, :class, etc.
+    @name = name
+    @metadata = {}
+    @event_subscriptions = {}
+    @execution_context = nil
+  end
+  
+  # Language elements can have events attached
+  def attach_event_handler(event_name, handler)
+    @event_subscriptions[event_name] ||= []
+    @event_subscriptions[event_name] << handler
+  end
+  
+  # Emit events when language element is used
+  def emit_element_event(event_name, event_data)
+    handlers = @event_subscriptions[event_name] || []
+    handlers.each do |handler|
+      begin
+        handler.call(event_data, @execution_context)
+      rescue => e
+        # Handle event handler errors gracefully
+        @execution_context&.handle_event_error(e, event_name, handler)
+      end
+    end
+  end
+  
+  # Track usage metrics
+  def track_usage(usage_type, context)
+    @metadata[:usage_count] ||= 0
+    @metadata[:usage_count] += 1
+    @metadata[:last_used] = Time.now
+    
+    emit_element_event(usage_type, {
+      element: self,
+      context: context,
+      timestamp: Time.now,
+      usage_count: @metadata[:usage_count]
+    })
+  end
+end
+
+class FunctionElement < LanguageElement
+  attr_accessor :parameters, :body, :return_type, :contracts
+  
+  def initialize(name, parameters, body, return_type = nil)
+    super(:function, name)
+    @parameters = parameters
+    @body = body
+    @return_type = return_type
+    @contracts = []
+  end
+  
+  def call(args, context)
+    @execution_context = context
+    
+    # Emit 'called' event
+    call_event_data = {
+      function: self,
+      arguments: args,
+      timestamp: Time.now,
+      call_stack: context.call_stack.dup
+    }
+    emit_element_event(:called, call_event_data)
+    
+    begin
+      # Execute function body
+      start_time = Time.now
+      result = execute_function_body(args, context)
+      execution_time = Time.now - start_time
+      
+      # Emit 'completed' event
+      completed_event_data = call_event_data.merge({
+        result: result,
+        execution_time: execution_time
+      })
+      emit_element_event(:completed, completed_event_data)
+      
+      track_usage(:function_called, context)
+      result
+      
+    rescue => error
+      # Emit 'error' event
+      error_event_data = call_event_data.merge({
+        error: error,
+        error_type: error.class.name
+      })
+      emit_element_event(:error, error_event_data)
+      
+      raise error
+    end
+  end
+  
+  private
+  
+  def execute_function_body(args, context)
+    # Create function scope
+    func_scope = context.environment.create_child_scope
+    
+    # Bind parameters
+    @parameters.zip(args).each do |param, arg|
+      func_scope.bind(param.name, arg)
+    end
+    
+    # Execute with function scope
+    context.with_scope(func_scope) do
+      context.evaluate(@body)
+    end
+  end
+end
+
+class VariableElement < LanguageElement
+  attr_accessor :value, :type_annotation, :observers
+  
+  def initialize(name, initial_value = nil, type_annotation = nil)
+    super(:variable, name)
+    @value = initial_value
+    @type_annotation = type_annotation
+    @observers = []
+  end
+  
+  def set_value(new_value, context)
+    @execution_context = context
+    old_value = @value
+    
+    # Type checking if annotation exists
+    if @type_annotation && !type_compatible?(new_value, @type_annotation)
+      raise TypeError.new("Value #{new_value} is not compatible with type #{@type_annotation}")
+    end
+    
+    @value = new_value
+    
+    # Emit 'changed' event
+    change_event_data = {
+      variable: self,
+      old_value: old_value,
+      new_value: new_value,
+      timestamp: Time.now
+    }
+    emit_element_event(:changed, change_event_data)
+    
+    # Notify observers (for reactive programming)
+    @observers.each do |observer|
+      observer.notify_change(self, old_value, new_value, context)
+    end
+    
+    track_usage(:variable_changed, context)
+    new_value
+  end
+  
+  def get_value(context)
+    @execution_context = context
+    
+    # Emit 'accessed' event
+    access_event_data = {
+      variable: self,
+      value: @value,
+      timestamp: Time.now
+    }
+    emit_element_event(:accessed, access_event_data)
+    
+    track_usage(:variable_accessed, context)
+    @value
+  end
+  
+  def add_observer(observer)
+    @observers << observer
+  end
+  
+  private
+  
+  def type_compatible?(value, type_annotation)
+    # Simple type checking - expand as needed
+    case type_annotation.name
+    when 'number'
+      value.is_a?(Numeric)
+    when 'text'
+      value.is_a?(String)
+    when 'boolean'
+      value.is_a?(TrueClass) || value.is_a?(FalseClass)
+    else
+      true  # Unknown types pass for now
+    end
+  end
+end
+
+class ClassElement < LanguageElement
+  attr_accessor :fields, :methods, :superclass, :instances
+  
+  def initialize(name, fields = [], methods = [], superclass = nil)
+    super(:class, name)
+    @fields = fields
+    @methods = methods
+    @superclass = superclass
+    @instances = []
+  end
+  
+  def instantiate(args, context)
+    @execution_context = context
+    
+    # Create new instance
+    instance = PatlangObject.new(self)
+    
+    # Initialize fields with default values
+    @fields.each do |field|
+      instance.set_property(field.name, field.default_value)
+    end
+    
+    # Track instance
+    @instances << instance
+    
+    # Emit 'instantiated' event
+    instantiation_event_data = {
+      class: self,
+      instance: instance,
+      arguments: args,
+      timestamp: Time.now,
+      instance_count: @instances.length
+    }
+    emit_element_event(:instantiated, instantiation_event_data)
+    
+    # Call constructor if exists
+    if has_constructor?
+      constructor = find_method('initialize')
+      constructor.call([instance] + args, context)
+    end
+    
+    track_usage(:class_instantiated, context)
+    instance
+  end
+  
+  def method_called(method_name, instance, args, context)
+    # Emit 'method_called' event on the class
+    method_call_event_data = {
+      class: self,
+      method_name: method_name,
+      instance: instance,
+      arguments: args,
+      timestamp: Time.now
+    }
+    emit_element_event(:method_called, method_call_event_data)
+  end
+  
+  private
+  
+  def has_constructor?
+    @methods.any? { |method| method.name == 'initialize' }
+  end
+  
+  def find_method(name)
+    @methods.find { |method| method.name == name }
+  end
+end
+```
+
+### Enhanced Unified Object Model
+
+The unified object model is extended to support language elements as first-class objects:
 
 ```ruby
 class PatlangObject
-  attr_accessor :type, :properties, :methods, :goals, :event_handlers, :logic_facts
+  attr_accessor :type, :properties, :methods, :goals, :event_handlers, :logic_facts, :language_element
   
   def initialize(type = nil)
     @type = type
@@ -373,6 +641,43 @@ class PatlangObject
     @event_handlers = {}   # Event-driven: event subscriptions
     @logic_facts = {}      # Logic: associated facts
     @contracts = {}        # Contract programming: pre/post conditions
+    @language_element = nil # Reference to language element if this object represents one
+  end
+  
+  # Factory method for creating language element objects
+  def self.create_language_element(element_type, name, **options)
+    obj = new(element_type)
+    
+    case element_type
+    when :function
+      obj.language_element = FunctionElement.new(name, options[:parameters], options[:body], options[:return_type])
+    when :variable
+      obj.language_element = VariableElement.new(name, options[:initial_value], options[:type_annotation])
+    when :class
+      obj.language_element = ClassElement.new(name, options[:fields], options[:methods], options[:superclass])
+    end
+    
+    # Language elements are automatically event-enabled
+    obj.setup_language_element_events
+    obj
+  end
+  
+  # Set up default event handling for language elements
+  def setup_language_element_events
+    return unless @language_element
+    
+    # Forward language element events to object's event system
+    @language_element.attach_event_handler(:called) do |event_data|
+      emit_object_event(:language_element_called, event_data)
+    end
+    
+    @language_element.attach_event_handler(:changed) do |event_data|
+      emit_object_event(:language_element_changed, event_data)
+    end
+    
+    @language_element.attach_event_handler(:instantiated) do |event_data|
+      emit_object_event(:language_element_instantiated, event_data)
+    end
   end
   
   # Unified method dispatch - handles all paradigms
