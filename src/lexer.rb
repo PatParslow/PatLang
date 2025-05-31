@@ -68,8 +68,15 @@ class Lexer
       when ')'
         advance
         return Token.new(Token::TOKEN_TYPES[:RPAREN], ')', @position - 1)
+      when '='
+        advance
+        return Token.new(Token::TOKEN_TYPES[:EQUALS], '=', @position - 1)
       else
-        error
+        if alpha?(@current_char)
+          return read_identifier
+        else
+          error
+        end
       end
     end
 
@@ -85,5 +92,29 @@ class Lexer
     end
     tokens << token # Add EOF token
     tokens
+  end
+
+  private
+
+  def alpha?(char)
+    (char >= 'a' && char <= 'z') ||
+    (char >= 'A' && char <= 'Z') ||
+    char == '_'
+  end
+
+  def alphanumeric?(char)
+    alpha?(char) || char.match(/\d/)
+  end
+
+  def read_identifier
+    start_position = @position
+    result = ''
+    
+    while @current_char && alphanumeric?(@current_char)
+      result += @current_char
+      advance
+    end
+    
+    Token.new(Token::TOKEN_TYPES[:IDENTIFIER], result, start_position)
   end
 end

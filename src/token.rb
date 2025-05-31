@@ -9,6 +9,8 @@ class Token
     DIVIDE: :DIVIDE,
     LPAREN: :LPAREN,
     RPAREN: :RPAREN,
+    IDENTIFIER: :IDENTIFIER,
+    EQUALS: :EQUALS,
     EOF: :EOF
   }.freeze
 
