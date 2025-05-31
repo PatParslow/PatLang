@@ -66,13 +66,16 @@ class Parser
     node
   end
 
-  # Grammar: factor → NUMBER | '(' expression ')'
+  # Grammar: factor → NUMBER | IDENTIFIER | '(' expression ')'
   def factor
     token = @current_token
 
     if token.type == Token::TOKEN_TYPES[:NUMBER]
       eat(Token::TOKEN_TYPES[:NUMBER])
       return NumberNode.new(token.value)
+    elsif token.type == Token::TOKEN_TYPES[:IDENTIFIER]
+      eat(Token::TOKEN_TYPES[:IDENTIFIER])
+      return VariableNode.new(token.value)
     elsif token.type == Token::TOKEN_TYPES[:LPAREN]
       eat(Token::TOKEN_TYPES[:LPAREN])
       node = expression
@@ -83,12 +86,40 @@ class Parser
     end
   end
 
+  # Grammar: assignment → IDENTIFIER '=' expression
+  def assignment
+    if @current_token.type != Token::TOKEN_TYPES[:IDENTIFIER]
+      error("Expected identifier in assignment")
+    end
+    
+    var_name = @current_token.value
+    eat(Token::TOKEN_TYPES[:IDENTIFIER])
+    eat(Token::TOKEN_TYPES[:EQUALS])
+    expr = expression
+    
+    AssignmentNode.new(var_name, expr)
+  end
+
+  # Check if current input is an assignment (IDENTIFIER followed by EQUALS)
+  def is_assignment?
+    return false unless @current_token&.type == Token::TOKEN_TYPES[:IDENTIFIER]
+    return false unless @current_token_index + 1 < @tokens.length
+    
+    next_token = @tokens[@current_token_index + 1]
+    next_token.type == Token::TOKEN_TYPES[:EQUALS]
+  end
+
   def parse
     if @tokens.length == 1 && @tokens[0].type == Token::TOKEN_TYPES[:EOF]
       error("Empty expression")
     end
 
-    node = expression
+    # Check if this is an assignment or an expression
+    if is_assignment?
+      node = assignment
+    else
+      node = expression
+    end
     
     # Ensure we've consumed all tokens except EOF
     if @current_token && @current_token.type != Token::TOKEN_TYPES[:EOF]

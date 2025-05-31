@@ -190,4 +190,236 @@ class TestParser < Minitest::Test
     assert_equal var_expr, assignment.expression
     assert_equal "AssignmentNode(result, VariableNode(x))", assignment.to_s
   end
+  # Tests for variable assignment parsing
+  def test_parse_simple_assignment
+    lexer = Lexer.new("x = 42")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    assert_instance_of AssignmentNode, ast
+    assert_equal "x", ast.name
+    assert_instance_of NumberNode, ast.expression
+    assert_equal 42, ast.expression.value
+  end
+  
+  def test_parse_assignment_with_complex_expression
+    # result = x + y * 2
+    lexer = Lexer.new("result = x + y * 2")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    assert_instance_of AssignmentNode, ast
+    assert_equal "result", ast.name
+    
+    # Expression should be x + (y * 2)
+    expr = ast.expression
+    assert_instance_of BinaryOpNode, expr
+    assert_equal '+', expr.operator
+    
+    # Left side should be variable x
+    assert_instance_of VariableNode, expr.left
+    assert_equal "x", expr.left.name
+    
+    # Right side should be y * 2
+    assert_instance_of BinaryOpNode, expr.right
+    assert_equal '*', expr.right.operator
+    assert_instance_of VariableNode, expr.right.left
+    assert_equal "y", expr.right.left.name
+    assert_instance_of NumberNode, expr.right.right
+    assert_equal 2, expr.right.right.value
+  end
+  
+  def test_parse_assignment_with_variable_expression
+    # result = x
+    lexer = Lexer.new("result = x")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    assert_instance_of AssignmentNode, ast
+    assert_equal "result", ast.name
+    assert_instance_of VariableNode, ast.expression
+    assert_equal "x", ast.expression.name
+  end
+  
+  def test_parse_variable_reference_simple
+    lexer = Lexer.new("x")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    assert_instance_of VariableNode, ast
+    assert_equal "x", ast.name
+  end
+  
+  def test_parse_variable_reference_in_expression
+    # x + 5
+    lexer = Lexer.new("x + 5")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    assert_instance_of BinaryOpNode, ast
+    assert_equal '+', ast.operator
+    assert_instance_of VariableNode, ast.left
+    assert_equal "x", ast.left.name
+    assert_instance_of NumberNode, ast.right
+    assert_equal 5, ast.right.value
+  end
+  
+  def test_parse_complex_variable_expression
+    # x * y + z
+    lexer = Lexer.new("x * y + z")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    assert_instance_of BinaryOpNode, ast
+    assert_equal '+', ast.operator
+    
+    # Left side should be x * y
+    assert_instance_of BinaryOpNode, ast.left
+    assert_equal '*', ast.left.operator
+    assert_instance_of VariableNode, ast.left.left
+    assert_equal "x", ast.left.left.name
+    assert_instance_of VariableNode, ast.left.right
+    assert_equal "y", ast.left.right.name
+    
+    # Right side should be z
+    assert_instance_of VariableNode, ast.right
+    assert_equal "z", ast.right.name
+  end
+  
+  def test_parse_variables_with_parentheses
+    # (x + y) * z
+    lexer = Lexer.new("(x + y) * z")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    assert_instance_of BinaryOpNode, ast
+    assert_equal '*', ast.operator
+    
+    # Left side should be (x + y)
+    assert_instance_of BinaryOpNode, ast.left
+    assert_equal '+', ast.left.operator
+    assert_instance_of VariableNode, ast.left.left
+    assert_equal "x", ast.left.left.name
+    assert_instance_of VariableNode, ast.left.right
+    assert_equal "y", ast.left.right.name
+    
+    # Right side should be z
+    assert_instance_of VariableNode, ast.right
+    assert_equal "z", ast.right.name
+  end
+  
+  def test_parse_assignment_with_parentheses
+    # result = (x + y) * 2
+    lexer = Lexer.new("result = (x + y) * 2")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    assert_instance_of AssignmentNode, ast
+    assert_equal "result", ast.name
+    
+    # Expression should be (x + y) * 2
+    expr = ast.expression
+    assert_instance_of BinaryOpNode, expr
+    assert_equal '*', expr.operator
+    
+    # Left side should be (x + y)
+    assert_instance_of BinaryOpNode, expr.left
+    assert_equal '+', expr.left.operator
+    assert_instance_of VariableNode, expr.left.left
+    assert_equal "x", expr.left.left.name
+    assert_instance_of VariableNode, expr.left.right
+    assert_equal "y", expr.left.right.name
+    
+    # Right side should be 2
+    assert_instance_of NumberNode, expr.right
+    assert_equal 2, expr.right.value
+  end
+  
+  def test_parse_mixed_numbers_and_variables
+    # 10 + x * 3 - y
+    lexer = Lexer.new("10 + x * 3 - y")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    assert_instance_of BinaryOpNode, ast
+    assert_equal '-', ast.operator
+    
+    # Right side should be y
+    assert_instance_of VariableNode, ast.right
+    assert_equal "y", ast.right.name
+    
+    # Left side should be 10 + (x * 3)
+    assert_instance_of BinaryOpNode, ast.left
+    assert_equal '+', ast.left.operator
+    assert_instance_of NumberNode, ast.left.left
+    assert_equal 10, ast.left.left.value
+    
+    # Middle should be x * 3
+    assert_instance_of BinaryOpNode, ast.left.right
+    assert_equal '*', ast.left.right.operator
+    assert_instance_of VariableNode, ast.left.right.left
+    assert_equal "x", ast.left.right.left.name
+    assert_instance_of NumberNode, ast.left.right.right
+    assert_equal 3, ast.left.right.right.value
+  end
+  
+  # Error handling tests
+  def test_parse_assignment_missing_equals
+    lexer = Lexer.new("x 42")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    
+    assert_raises(RuntimeError) do
+      parser.parse
+    end
+  end
+  
+  def test_parse_assignment_missing_expression
+    lexer = Lexer.new("x =")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    
+    assert_raises(RuntimeError) do
+      parser.parse
+    end
+  end
+  
+  def test_parse_assignment_invalid_variable_name
+    # Test that numbers can't be assignment targets
+    lexer = Lexer.new("42 = x")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    
+    # This should parse as an expression "42" and fail on the unexpected "=" token
+    assert_raises(RuntimeError) do
+      parser.parse
+    end
+  end
+  
+  # Ensure existing arithmetic parsing still works
+  def test_existing_arithmetic_still_works
+    lexer = Lexer.new("2 + 3 * 4")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    # Should still parse as 2 + (3 * 4)
+    assert_instance_of BinaryOpNode, ast
+    assert_equal '+', ast.operator
+    assert_instance_of NumberNode, ast.left
+    assert_equal 2, ast.left.value
+    assert_instance_of BinaryOpNode, ast.right
+    assert_equal '*', ast.right.operator
+    assert_equal 3, ast.right.left.value
+    assert_equal 4, ast.right.right.value
+  end
 end
