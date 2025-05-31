@@ -2,12 +2,20 @@ require_relative 'ast_nodes'
 
 # Evaluator class for traversing AST and computing arithmetic results
 class Evaluator
+  def initialize
+    @variables = {}
+  end
+
   def evaluate(node)
     case node
     when NumberNode
       visit_number_node(node)
     when BinaryOpNode
       visit_binary_op_node(node)
+    when AssignmentNode
+      visit_assignment_node(node)
+    when VariableNode
+      visit_variable_node(node)
     else
       raise "Unknown node type: #{node.class}"
     end
@@ -38,5 +46,18 @@ class Evaluator
     else
       raise "Unknown operator: #{node.operator}"
     end
+  end
+
+  def visit_assignment_node(node)
+    value = evaluate(node.expression)
+    @variables[node.name] = value
+    value
+  end
+
+  def visit_variable_node(node)
+    unless @variables.key?(node.name)
+      raise "Undefined variable: #{node.name}"
+    end
+    @variables[node.name]
   end
 end

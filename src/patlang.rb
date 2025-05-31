@@ -92,6 +92,8 @@ class Patlang
     puts "Interactive REPL (type 'exit' to quit):"
     puts "-" * 40
     
+    evaluator = Evaluator.new  # Persistent evaluator for REPL
+    
     loop do
       print "> "
       input = gets
@@ -101,7 +103,7 @@ class Patlang
       next if input.strip.empty?
       
       begin
-        result = evaluate(input)
+        result = process_expression_with_evaluator(input, evaluator, show_details: false)
         puts result
       rescue => e
         puts "Error: #{e.message}"
@@ -118,6 +120,8 @@ class Patlang
     puts "Type 'exit' to quit."
     puts
     
+    evaluator = Evaluator.new  # Persistent evaluator for REPL
+    
     loop do
       print "> "
       input = gets
@@ -127,7 +131,7 @@ class Patlang
       next if input.strip.empty?
       
       begin
-        result = evaluate(input)
+        result = process_expression_with_evaluator(input, evaluator, show_details: false)
         puts result
       rescue => e
         puts "Error: #{e.message}"
@@ -135,6 +139,62 @@ class Patlang
     end
     
     puts "Goodbye!"
+  end
+
+  def self.process_expression_with_evaluator(expression, evaluator, show_details: false)
+    puts "Processing: #{expression}" if show_details
+    puts "=" * 50 if show_details
+    
+    begin
+      # Tokenization
+      if show_details
+        puts "TOKENS:"
+        puts "-" * 20
+      end
+      lexer = Lexer.new(expression)
+      tokens = lexer.tokenize
+      
+      if show_details
+        tokens.each_with_index do |token, index|
+          puts "#{index + 1}. #{token}"
+        end
+        puts "Total tokens: #{tokens.length}"
+        puts
+      end
+      
+      # Parsing
+      if show_details
+        puts "AST:"
+        puts "-" * 20
+      end
+      parser = Parser.new(tokens)
+      ast = parser.parse
+      
+      if show_details
+        puts "#{ast}"
+        puts
+      end
+      
+      # Evaluation with provided evaluator
+      if show_details
+        puts "EVALUATION:"
+        puts "-" * 20
+      end
+      result = evaluator.evaluate(ast)
+      
+      if show_details
+        puts "Result: #{result}"
+        puts
+      end
+      
+      result
+    rescue => e
+      if show_details
+        puts "Error: #{e.message}"
+        puts
+      end
+      raise e
+    end
   end
 end
 

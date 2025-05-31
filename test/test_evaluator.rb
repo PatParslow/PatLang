@@ -1,4 +1,4 @@
-require 'minitest/autorun'
+require_relative 'test_helper'
 require_relative '../src/evaluator'
 require_relative '../src/lexer'
 require_relative '../src/parser'
@@ -143,5 +143,174 @@ class TestEvaluator < Minitest::Test
     
     result = evaluator.evaluate(ast)
     assert_equal 10, result
+  end
+
+  # Variable assignment and lookup tests
+  def test_evaluate_simple_assignment
+    lexer = Lexer.new("x = 42")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    evaluator = Evaluator.new
+    
+    result = evaluator.evaluate(ast)
+    assert_equal 42, result
+  end
+
+  def test_evaluate_variable_lookup
+    evaluator = Evaluator.new
+    
+    # First assign a value
+    lexer = Lexer.new("x = 42")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    evaluator.evaluate(ast)
+    
+    # Then look up the variable
+    lexer = Lexer.new("x")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    result = evaluator.evaluate(ast)
+    assert_equal 42, result
+  end
+
+  def test_evaluate_assignment_with_expression
+    evaluator = Evaluator.new
+    
+    # First assign a value
+    lexer = Lexer.new("x = 10")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    evaluator.evaluate(ast)
+    
+    # Then assign based on expression
+    lexer = Lexer.new("y = x + 5")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    result = evaluator.evaluate(ast)
+    assert_equal 15, result
+  end
+
+  def test_evaluate_complex_expression_with_variables
+    evaluator = Evaluator.new
+    
+    # Set up variables
+    lexer = Lexer.new("x = 10")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    evaluator.evaluate(ast)
+    
+    lexer = Lexer.new("y = 5")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    evaluator.evaluate(ast)
+    
+    # Test complex expression
+    lexer = Lexer.new("result = x * y + 3")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    result = evaluator.evaluate(ast)
+    assert_equal 53, result
+  end
+
+  def test_evaluate_undefined_variable_error
+    lexer = Lexer.new("undefined_var")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    evaluator = Evaluator.new
+    
+    assert_raises(StandardError) do
+      evaluator.evaluate(ast)
+    end
+  end
+
+  def test_evaluate_variable_reassignment
+    evaluator = Evaluator.new
+    
+    # Initial assignment
+    lexer = Lexer.new("x = 10")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    result = evaluator.evaluate(ast)
+    assert_equal 10, result
+    
+    # Reassignment
+    lexer = Lexer.new("x = 20")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    result = evaluator.evaluate(ast)
+    assert_equal 20, result
+    
+    # Verify the new value
+    lexer = Lexer.new("x")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    result = evaluator.evaluate(ast)
+    assert_equal 20, result
+  end
+
+  def test_evaluate_multiple_variables_arithmetic
+    evaluator = Evaluator.new
+    
+    # Set up multiple variables
+    lexer = Lexer.new("a = 2")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    evaluator.evaluate(ast)
+    
+    lexer = Lexer.new("b = 3")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    evaluator.evaluate(ast)
+    
+    lexer = Lexer.new("c = 4")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    evaluator.evaluate(ast)
+    
+    # Test expression with multiple variables
+    lexer = Lexer.new("a + b * c")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    result = evaluator.evaluate(ast)
+    assert_equal 14, result  # 2 + 3 * 4 = 2 + 12 = 14
+  end
+
+  def test_evaluate_assignment_in_expression
+    evaluator = Evaluator.new
+    
+    # Test assignment within larger expression context
+    lexer = Lexer.new("x = 5")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    evaluator.evaluate(ast)
+    
+    lexer = Lexer.new("y = x * 2 + 1")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    result = evaluator.evaluate(ast)
+    assert_equal 11, result  # 5 * 2 + 1 = 11
   end
 end

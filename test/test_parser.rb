@@ -1,4 +1,4 @@
-require 'minitest/autorun'
+require_relative 'test_helper'
 require_relative '../src/parser'
 require_relative '../src/lexer'
 require_relative '../src/ast_nodes'
