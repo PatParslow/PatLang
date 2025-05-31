@@ -115,4 +115,43 @@ class TestLexer < Minitest::Test
       lexer.tokenize
     end
   end
+
+  def test_decimal_numbers
+    lexer = Lexer.new("3.14")
+    tokens = lexer.tokenize
+    
+    assert_equal 2, tokens.length
+    assert_equal Token::TOKEN_TYPES[:NUMBER], tokens[0].type
+    assert_equal 3.14, tokens[0].value
+    assert_equal Token::TOKEN_TYPES[:EOF], tokens[1].type
+  end
+
+  def test_decimal_arithmetic
+    lexer = Lexer.new("2.5 + 1.75")
+    tokens = lexer.tokenize
+    
+    expected_types = [
+      Token::TOKEN_TYPES[:NUMBER],
+      Token::TOKEN_TYPES[:PLUS],
+      Token::TOKEN_TYPES[:NUMBER],
+      Token::TOKEN_TYPES[:EOF]
+    ]
+    
+    assert_equal 4, tokens.length
+    expected_types.each_with_index do |expected_type, i|
+      assert_equal expected_type, tokens[i].type
+    end
+    
+    assert_equal 2.5, tokens[0].value
+    assert_equal 1.75, tokens[2].value
+  end
+
+  def test_mixed_integer_and_decimal
+    lexer = Lexer.new("42 * 3.14")
+    tokens = lexer.tokenize
+    
+    assert_equal 4, tokens.length
+    assert_equal 42, tokens[0].value
+    assert_equal 3.14, tokens[2].value
+  end
 end

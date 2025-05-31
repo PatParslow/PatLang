@@ -25,11 +25,17 @@ class Lexer
 
   def read_number
     result = ''
-    while @current_char && @current_char.match(/\d/)
+    has_decimal = false
+    
+    while @current_char && (@current_char.match(/\d/) || (@current_char == '.' && !has_decimal))
+      if @current_char == '.'
+        has_decimal = true
+      end
       result += @current_char
       advance
     end
-    result.to_i
+    
+    has_decimal ? result.to_f : result.to_i
   end
 
   def get_next_token

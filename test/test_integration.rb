@@ -98,4 +98,19 @@ class TestIntegration < Minitest::Test
     assert_equal 14, evaluate_expression(" 2+3*4 ")
     assert_equal 20, evaluate_expression("( 2 + 3 ) * 4")
   end
+
+  def test_decimal_literals
+    # Test that decimal literals are properly handled
+    assert_equal 3.14, evaluate_expression("3.14")
+    assert_equal 6.0, evaluate_expression("3.14 + 2.86")
+    assert_equal 10.0, evaluate_expression("2.5 * 4")
+    assert_equal 3.0, evaluate_expression("7.5 / 2.5")
+  end
+
+  def test_mixed_integer_decimal
+    # Test mixed integer and decimal arithmetic
+    assert_equal 13.5, evaluate_expression("10 + 3.5")
+    assert_equal 15.2, evaluate_expression("12.2 + 3")
+    assert_equal 21.0, evaluate_expression("3.5 * 6")
+  end
 end
