@@ -1005,6 +1005,377 @@ Data flows naturally between paradigms:
 4. **Goals → Events**: Goal completion emits events with result data
 5. **Events → OOP**: Event handlers modify object state and call methods
 
+## Internal Message Passing System
+
+Patlang's event-driven programming system extends naturally into a powerful **internal message passing system** that enables cross-thread communication, state persistence, and distributed computing capabilities. The event queue becomes a thread-safe message queue, providing a unified foundation for both local reactivity and distributed communication.
+
+### Core Concepts
+
+The message passing system builds on three fundamental principles:
+
+1. **Event Queue as Message Queue**: The existing event system doubles as a thread-safe message queue
+2. **Message Persistence**: Messages can be persisted to storage for replay and state recovery
+3. **Cross-Boundary Communication**: Messages can cross thread, process, and network boundaries
+
+### Message Queue Configuration
+
+```patlang
+# Configure message queue for persistence and distribution
+configure message_queue {
+  persistence: enabled
+  storage: "patlang_messages.db"
+  replay_on_startup: true
+  network_enabled: false
+  max_queue_size: 10000
+  compression: enabled
+}
+
+# Enable distributed messaging
+configure message_queue {
+  network_enabled: true
+  cluster_nodes: ["node1:8080", "node2:8080", "node3:8080"]
+  node_id: "primary_node"
+  heartbeat_interval: 5000  # milliseconds
+}
+```
+
+### Cross-Thread Communication
+
+Thread-safe message passing enables concurrent programming without traditional locking mechanisms:
+
+```patlang
+# Create worker threads with message passing
+worker_thread = create_thread {
+  # Worker thread listens for work messages
+  when main_thread: work_request {
+    data = event_data.work_data
+    result = process_heavy_computation(data)
+    
+    # Send result back to main thread
+    send_message main_thread: work_complete with {
+      original_request_id: event_data.request_id,
+      result: result,
+      processing_time: calculate_processing_time()
+    }
+  }
+  
+  # Handle shutdown messages
+  when main_thread: shutdown {
+    cleanup_resources()
+    send_message main_thread: shutdown_complete
+    exit_thread()
+  }
+}
+
+# Main thread sends work to worker
+request_id = generate_unique_id()
+send_message worker_thread: work_request with {
+  request_id: request_id,
+  work_data: large_dataset,
+  priority: "high"
+}
+
+# Main thread handles completion
+when worker_thread: work_complete {
+  if event_data.original_request_id == request_id then
+    process_worker_result(event_data.result)
+    log("Work completed in #{event_data.processing_time}ms")
+  end
+}
+```
+
+### Message Persistence and Replay
+
+Messages can be persisted for state recovery and time-travel debugging:
+
+```patlang
+# Enable selective message persistence
+configure message_persistence {
+  persist_pattern: ["state:*", "business:*", "audit:*"]
+  exclude_pattern: ["debug:*", "metrics:*"]
+  retention_period: "30_days"
+  compression_level: 6
+}
+
+# Save application state through messages
+save_application_state returns: {
+  state_data = {
+    variables: get_all_variables(),
+    objects: serialize_all_objects(),
+    thread_states: get_thread_states(),
+    timestamp: now()
+  }
+  
+  # Persist as message for replay
+  send_message system: state_checkpoint with {
+    checkpoint_id: generate_checkpoint_id(),
+    state_data: state_data,
+    persistence: required
+  }
+}
+
+# Restore application state from message queue
+restore_application_state takes: checkpoint_id returns: {
+  # Replay messages from specific checkpoint
+  checkpoint_message = find_persisted_message("system:state_checkpoint", checkpoint_id)
+  
+  if checkpoint_message then
+    restore_variables(checkpoint_message.state_data.variables)
+    restore_objects(checkpoint_message.state_data.objects)
+    restore_thread_states(checkpoint_message.state_data.thread_states)
+    
+    # Replay subsequent messages
+    replay_messages_after(checkpoint_message.timestamp)
+    
+    emit system: state_restored with checkpoint_id
+  else
+    throw StateRestorationError("Checkpoint #{checkpoint_id} not found")
+  end
+}
+```
+
+### Distributed Computing Support
+
+Messages can cross process and network boundaries for distributed applications:
+
+```patlang
+# Distributed work coordination
+make a goal called distribute_workload {
+  distribute_workload requires:
+    work_items - list of WorkItem
+    target_nodes - list of text
+    
+  distribute_workload is achieved when:
+    all work items are assigned and
+    all nodes have acknowledged assignment
+    
+  distribute_workload runs: {
+    work_distribution = partition_work(work_items, target_nodes)
+    
+    for each node, work_chunk in work_distribution do
+      send_message node: process_work_chunk with {
+        chunk_id: generate_chunk_id(),
+        work_items: work_chunk,
+        callback_node: current_node(),
+        deadline: now() + 5.minutes
+      }
+    end
+    
+    emit workload: distributed with {
+      total_items: work_items.length,
+      node_count: target_nodes.length,
+      distribution_time: now()
+    }
+  }
+}
+
+# Remote node processing
+when any_node: process_work_chunk {
+  chunk_data = event_data
+  
+  try
+    results = chunk_data.work_items.map(|item| process_work_item(item))
+    
+    # Send results back to coordinator
+    send_message chunk_data.callback_node: work_chunk_complete with {
+      chunk_id: chunk_data.chunk_id,
+      results: results,
+      processing_node: current_node(),
+      completion_time: now()
+    }
+    
+  catch WorkProcessingError as error
+    # Send error back to coordinator
+    send_message chunk_data.callback_node: work_chunk_failed with {
+      chunk_id: chunk_data.chunk_id,
+      error: error.message,
+      processing_node: current_node(),
+      failure_time: now()
+    }
+  end
+}
+
+# Coordinator handles results
+when any_node: work_chunk_complete {
+  update_work_progress(event_data.chunk_id, event_data.results)
+  
+  if all_work_chunks_complete() then
+    final_results = aggregate_all_results()
+    emit workload: completed with {
+      total_results: final_results.length,
+      processing_time: calculate_total_processing_time(),
+      participating_nodes: get_participating_nodes()
+    }
+  end
+}
+```
+
+### Message Routing and Filtering
+
+Advanced message routing enables complex communication patterns:
+
+```patlang
+# Set up message routing rules
+configure message_routing {
+  # Route high-priority messages to dedicated queue
+  route_if: { message.priority == "high" }
+  to_queue: "high_priority_queue"
+  
+  # Route messages by type to different handlers
+  route_pattern: "business:*"
+  to_handlers: ["business_logic_handler", "analytics_handler"]
+  
+  # Route cross-node messages through network layer
+  route_if: { message.target_node != current_node() }
+  to_gateway: "network_gateway"
+}
+
+# Message filtering for security and performance
+configure message_filtering {
+  # Security filters
+  reject_if: { not authorized_sender(message.sender) }
+  reject_pattern: ["admin:*"]  # Unless sender has admin role
+  
+  # Performance filters
+  throttle_pattern: "metrics:*"
+  max_rate: "100_per_second"
+  
+  # Content filters
+  transform_if: { message.contains_sensitive_data }
+  transformer: "data_anonymizer"
+}
+```
+
+### Time-Travel Debugging
+
+Message persistence enables powerful debugging capabilities:
+
+```patlang
+# Debug mode with enhanced message tracking
+configure debug_mode {
+  trace_all_messages: true
+  capture_stack_traces: true
+  record_variable_states: true
+  enable_time_travel: true
+}
+
+# Time-travel debugging session
+debug_session = create_debug_session {
+  start_time: "2024-01-15 14:30:00"
+  end_time: "2024-01-15 14:35:00"
+  focus_threads: ["main_thread", "worker_thread_1"]
+  track_variables: ["user_count", "error_rate"]
+}
+
+# Step through message history
+debug_session.step_forward()  # Next message in timeline
+debug_session.step_backward() # Previous message in timeline
+debug_session.jump_to_message(message_id)  # Jump to specific message
+
+# Replay with breakpoints
+debug_session.set_breakpoint(
+  condition: { message.type == "error" },
+  action: { inspect_system_state() }
+)
+
+debug_session.replay_from_checkpoint("checkpoint_1")
+```
+
+### Performance Considerations
+
+Message passing performance optimizations:
+
+```patlang
+# Configure performance optimizations
+configure message_performance {
+  # Batch small messages for efficiency
+  batch_size: 100
+  batch_timeout: "10ms"
+  
+  # Use circular buffers for high-throughput scenarios
+  use_ring_buffer: true
+  ring_buffer_size: 1000000
+  
+  # Compress large messages
+  compression_threshold: "1KB"
+  compression_algorithm: "lz4"
+  
+  # Priority queues for urgent messages
+  priority_levels: ["low", "normal", "high", "urgent"]
+  urgent_queue_size: 1000
+}
+
+# Monitor message queue performance
+when message_queue: performance_metrics {
+  metrics = event_data.metrics
+  
+  if metrics.queue_depth > 10000 then
+    emit alerts: high_queue_depth with metrics
+    activate scale_message_processing
+  end
+  
+  if metrics.message_latency > 100 then  # milliseconds
+    emit alerts: high_message_latency with metrics
+    activate optimize_message_routing
+  end
+}
+```
+
+### Integration with Existing Event System
+
+The message passing system seamlessly extends the existing event system:
+
+```patlang
+# Events automatically become messages when crossing boundaries
+when user: login is activated {
+  # Local event handling
+  update_user_session(user)
+  
+  # Cross-thread message for analytics
+  send_message analytics_thread: user_login with {
+    user_id: user.id,
+    login_time: now(),
+    session_id: generate_session_id()
+  }
+  
+  # Cross-process message for audit
+  send_message audit_service: login_event with {
+    user_id: user.id,
+    ip_address: user.ip_address,
+    login_time: now()
+  }
+}
+
+# Language element events can trigger messages
+when calculate_total: completed {
+  # Local performance monitoring
+  track_function_performance("calculate_total", event_data.execution_time)
+  
+  # Send performance data to monitoring service
+  if event_data.execution_time > 100 then
+    send_message monitoring_service: slow_function with {
+      function_name: "calculate_total",
+      execution_time: event_data.execution_time,
+      arguments: event_data.arguments,
+      node_id: current_node()
+    }
+  end
+}
+```
+
+### Related Documentation
+
+For comprehensive coverage of Patlang's message passing capabilities, see the following specialized documentation:
+
+- **[Message Passing System Overview](message-passing-system.md)**: Core concepts, basic usage, and cross-thread communication patterns
+- **[Message Persistence and State Management](message-persistence.md)**: State checkpoints, message replay, storage backends, and recovery scenarios
+- **[Time-Travel Debugging](time-travel-debugging.md)**: Debug sessions, stepping through message history, breakpoints, and flow analysis
+- **[Distributed Computing with Messages](distributed-messaging.md)**: Cluster configuration, work coordination, fault tolerance, and load balancing
+- **[Message Performance and Scalability](message-performance.md)**: High-performance patterns, memory optimization, latency tuning, and benchmarking
+- **[Message Security](message-security.md)**: Authentication, authorization, encryption, content filtering, and audit compliance
+
+These documents provide detailed implementation guidance, advanced patterns, and real-world examples for building robust message-driven applications in Patlang.
+
 ---
 
 ## Built-in Functions and Standard Library

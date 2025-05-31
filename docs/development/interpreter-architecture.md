@@ -818,6 +818,700 @@ class ExecutionContext
 end
 ```
 
+## Message Queue Architecture
+
+The message passing system extends the existing event architecture to provide thread-safe, persistent, and distributed communication capabilities. The event queue seamlessly transforms into a message queue while maintaining backward compatibility.
+
+### Core Message Queue Components
+
+```ruby
+class MessageQueue
+  attr_accessor :persistence_layer, :network_layer, :routing_engine, :filtering_engine
+  
+  def initialize(config = {})
+    @config = MessageQueueConfig.new(config)
+    @local_queue = ThreadSafeQueue.new(@config.max_queue_size)
+    @persistence_layer = create_persistence_layer if @config.persistence_enabled?
+    @network_layer = create_network_layer if @config.network_enabled?
+    @routing_engine = RoutingEngine.new(@config.routing_rules)
+    @filtering_engine = FilteringEngine.new(@config.filters)
+    @message_processors = {}
+    @subscribers = {}
+  end
+  
+  def send_message(target, message_type, data = {}, options = {})
+    message = create_message(target, message_type, data, options)
+    
+    # Apply filters and routing
+    return if @filtering_engine.should_reject?(message)
+    transformed_message = @filtering_engine.transform(message)
+    
+    # Route message based on target and rules
+    route_message(transformed_message)
+  end
+  
+  def subscribe(pattern, handler)
+    @subscribers[pattern] ||= []
+    @subscribers[pattern] << handler
+  end
+  
+  private
+  
+  def route_message(message)
+    routes = @routing_engine.determine_routes(message)
+    
+    routes.each do |route|
+      case route.type
+      when :local_queue
+        @local_queue.enqueue(message)
+      when :persistent_storage
+        @persistence_layer.store(message) if @persistence_layer
+      when :network_node
+        @network_layer.send_to_node(route.destination, message) if @network_layer
+      when :cross_thread
+        route.destination.message_queue.receive_message(message)
+      end
+    end
+    
+    # Process message locally if applicable
+    process_local_message(message) if routes.any? { |r| r.type == :local_queue }
+  end
+  
+  def process_local_message(message)
+    # Find matching subscribers
+    matching_subscribers = find_matching_subscribers(message)
+    
+    matching_subscribers.each do |subscriber|
+      begin
+        # Execute subscriber in appropriate context
+        execute_subscriber(subscriber, message)
+      rescue => error
+        handle_subscriber_error(error, subscriber, message)
+      end
+    end
+  end
+end
+
+class Message
+  attr_accessor :id, :source, :target, :type, :data, :timestamp, :priority, :persistence_required
+  
+  def initialize(source, target, type, data, options = {})
+    @id = options[:id] || generate_message_id
+    @source = source
+    @target = target
+    @type = type
+    @data = data
+    @timestamp = Time.now
+    @priority = options[:priority] || :normal
+    @persistence_required = options[:persistence] || false
+    @routing_metadata = {}
+    @processing_metadata = {}
+  end
+  
+  def serialize
+    {
+      id: @id,
+      source: serialize_endpoint(@source),
+      target: serialize_endpoint(@target),
+      type: @type,
+      data: serialize_data(@data),
+      timestamp: @timestamp.to_f,
+      priority: @priority,
+      persistence_required: @persistence_required,
+      routing_metadata: @routing_metadata,
+      processing_metadata: @processing_metadata
+    }
+  end
+  
+  def self.deserialize(data)
+    message = allocate
+    message.instance_variable_set(:@id, data[:id])
+    message.instance_variable_set(:@source, deserialize_endpoint(data[:source]))
+    message.instance_variable_set(:@target, deserialize_endpoint(data[:target]))
+    message.instance_variable_set(:@type, data[:type])
+    message.instance_variable_set(:@data, deserialize_data(data[:data]))
+    message.instance_variable_set(:@timestamp, Time.at(data[:timestamp]))
+    message.instance_variable_set(:@priority, data[:priority])
+    message.instance_variable_set(:@persistence_required, data[:persistence_required])
+    message.instance_variable_set(:@routing_metadata, data[:routing_metadata] || {})
+    message.instance_variable_set(:@processing_metadata, data[:processing_metadata] || {})
+    message
+  end
+  
+  def cross_thread_boundary?
+    @target.is_a?(Thread) && @target != Thread.current
+  end
+  
+  def cross_process_boundary?
+    @target.is_a?(String) && @target.include?(':')  # node:port format
+  end
+end
+```
+
+### Thread-Safe Message Queue Implementation
+
+```ruby
+class ThreadSafeQueue
+  def initialize(max_size = Float::INFINITY)
+    @queue = []
+    @mutex = Mutex.new
+    @condition = ConditionVariable.new
+    @max_size = max_size
+    @closed = false
+  end
+  
+  def enqueue(message)
+    @mutex.synchronize do
+      while @queue.size >= @max_size && !@closed
+        @condition.wait(@mutex)  # Block until space available
+      end
+      
+      raise QueueClosedError if @closed
+      
+      # Insert based on priority
+      insert_position = find_insert_position(message)
+      @queue.insert(insert_position, message)
+      
+      @condition.signal  # Wake up waiting dequeuers
+    end
+  end
+  
+  def dequeue(timeout = nil)
+    @mutex.synchronize do
+      if timeout
+        deadline = Time.now + timeout
+        while @queue.empty? && !@closed && Time.now < deadline
+          remaining = deadline - Time.now
+          @condition.wait(@mutex, remaining)
+        end
+      else
+        while @queue.empty? && !@closed
+          @condition.wait(@mutex)
+        end
+      end
+      
+      return nil if @queue.empty?
+      
+      message = @queue.shift
+      @condition.signal  # Wake up waiting enqueuers
+      message
+    end
+  end
+  
+  def close
+    @mutex.synchronize do
+      @closed = true
+      @condition.broadcast  # Wake up all waiting threads
+    end
+  end
+  
+  private
+  
+  def find_insert_position(message)
+    # Insert based on priority (urgent, high, normal, low)
+    priority_order = { urgent: 0, high: 1, normal: 2, low: 3 }
+    message_priority = priority_order[message.priority] || 2
+    
+    @queue.each_with_index do |queued_message, index|
+      queued_priority = priority_order[queued_message.priority] || 2
+      return index if message_priority < queued_priority
+    end
+    
+    @queue.size  # Insert at end if no higher priority found
+  end
+end
+
+class MessageProcessor
+  def initialize(thread_pool_size = 4)
+    @thread_pool = ThreadPool.new(thread_pool_size)
+    @processing_stats = ProcessingStats.new
+  end
+  
+  def process_message(message, subscriber)
+    @thread_pool.submit do
+      start_time = Time.now
+      
+      begin
+        result = subscriber.call(message)
+        execution_time = Time.now - start_time
+        
+        @processing_stats.record_success(message, execution_time)
+        result
+        
+      rescue => error
+        execution_time = Time.now - start_time
+        @processing_stats.record_error(message, error, execution_time)
+        
+        # Re-raise for error handling
+        raise error
+      end
+    end
+  end
+end
+```
+
+### Persistence Layer Architecture
+
+```ruby
+class MessagePersistenceLayer
+  def initialize(config)
+    @config = config
+    @storage_backend = create_storage_backend(config.storage_type)
+    @compression = CompressionEngine.new(config.compression_algorithm)
+    @retention_manager = RetentionManager.new(config.retention_policy)
+    @indexing_engine = IndexingEngine.new
+  end
+  
+  def store(message)
+    return unless should_persist?(message)
+    
+    # Serialize and compress message
+    serialized_data = message.serialize
+    compressed_data = @compression.compress(serialized_data)
+    
+    # Create storage record
+    record = StorageRecord.new(
+      message_id: message.id,
+      timestamp: message.timestamp,
+      data: compressed_data,
+      size: compressed_data.bytesize,
+      type: message.type,
+      source: message.source.to_s,
+      target: message.target.to_s
+    )
+    
+    # Store with indexing
+    @storage_backend.store(record)
+    @indexing_engine.index(record)
+    
+    # Schedule for retention management
+    @retention_manager.schedule_for_cleanup(record)
+  end
+  
+  def retrieve_messages(criteria)
+    # Use indexes for efficient retrieval
+    record_ids = @indexing_engine.search(criteria)
+    records = @storage_backend.retrieve_batch(record_ids)
+    
+    # Decompress and deserialize
+    records.map do |record|
+      decompressed_data = @compression.decompress(record.data)
+      Message.deserialize(decompressed_data)
+    end
+  end
+  
+  def replay_from_checkpoint(checkpoint_id)
+    checkpoint_message = find_checkpoint_message(checkpoint_id)
+    return nil unless checkpoint_message
+    
+    # Get all messages after checkpoint
+    criteria = {
+      timestamp_after: checkpoint_message.timestamp,
+      exclude_patterns: ['debug:*', 'metrics:*']  # Don't replay ephemeral messages
+    }
+    
+    messages = retrieve_messages(criteria)
+    
+    # Sort by timestamp for correct replay order
+    messages.sort_by(&:timestamp)
+  end
+  
+  private
+  
+  def should_persist?(message)
+    # Check persistence patterns
+    patterns = @config.persist_patterns
+    exclude_patterns = @config.exclude_patterns
+    
+    # Include if matches persist patterns
+    include_match = patterns.any? { |pattern| message_matches_pattern?(message, pattern) }
+    
+    # Exclude if matches exclude patterns
+    exclude_match = exclude_patterns.any? { |pattern| message_matches_pattern?(message, pattern) }
+    
+    # Persist if explicitly required or matches patterns and not excluded
+    message.persistence_required || (include_match && !exclude_match)
+  end
+  
+  def message_matches_pattern?(message, pattern)
+    # Support wildcard patterns like "business:*" or "state:checkpoint"
+    if pattern.end_with?('*')
+      prefix = pattern[0...-1]
+      message.type.start_with?(prefix)
+    else
+      message.type == pattern
+    end
+  end
+end
+
+class StorageBackend
+  # Abstract base class for different storage implementations
+  def store(record)
+    raise NotImplementedError
+  end
+  
+  def retrieve(record_id)
+    raise NotImplementedError
+  end
+  
+  def retrieve_batch(record_ids)
+    raise NotImplementedError
+  end
+end
+
+class SQLiteStorageBackend < StorageBackend
+  def initialize(db_path)
+    @db = SQLite3::Database.new(db_path)
+    create_tables
+  end
+  
+  def store(record)
+    @db.execute(
+      "INSERT INTO messages (id, timestamp, data, size, type, source, target) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      record.message_id, record.timestamp.to_f, record.data, record.size, record.type, record.source, record.target
+    )
+  end
+  
+  def retrieve(record_id)
+    row = @db.get_first_row("SELECT * FROM messages WHERE id = ?", record_id)
+    return nil unless row
+    
+    StorageRecord.from_database_row(row)
+  end
+  
+  def retrieve_batch(record_ids)
+    placeholders = (['?'] * record_ids.size).join(',')
+    rows = @db.execute("SELECT * FROM messages WHERE id IN (#{placeholders})", *record_ids)
+    
+    rows.map { |row| StorageRecord.from_database_row(row) }
+  end
+  
+  private
+  
+  def create_tables
+    @db.execute <<-SQL
+      CREATE TABLE IF NOT EXISTS messages (
+        id TEXT PRIMARY KEY,
+        timestamp REAL NOT NULL,
+        data BLOB NOT NULL,
+        size INTEGER NOT NULL,
+        type TEXT NOT NULL,
+        source TEXT NOT NULL,
+        target TEXT NOT NULL,
+        created_at REAL DEFAULT (julianday('now'))
+      )
+    SQL
+    
+    # Create indexes for efficient querying
+    @db.execute "CREATE INDEX IF NOT EXISTS idx_timestamp ON messages (timestamp)"
+    @db.execute "CREATE INDEX IF NOT EXISTS idx_type ON messages (type)"
+    @db.execute "CREATE INDEX IF NOT EXISTS idx_source ON messages (source)"
+    @db.execute "CREATE INDEX IF NOT EXISTS idx_target ON messages (target)"
+  end
+end
+```
+
+### Network Layer for Distributed Queues
+
+```ruby
+class NetworkLayer
+  def initialize(config)
+    @config = config
+    @local_node_id = config.node_id
+    @cluster_nodes = config.cluster_nodes
+    @connection_pool = ConnectionPool.new
+    @heartbeat_manager = HeartbeatManager.new(config.heartbeat_interval)
+    @message_serializer = NetworkMessageSerializer.new
+  end
+  
+  def send_to_node(node_id, message)
+    connection = @connection_pool.get_connection(node_id)
+    
+    # Serialize message for network transport
+    network_message = NetworkMessage.new(
+      source_node: @local_node_id,
+      target_node: node_id,
+      payload: message.serialize,
+      message_id: message.id,
+      timestamp: Time.now
+    )
+    
+    serialized_data = @message_serializer.serialize(network_message)
+    
+    begin
+      connection.send(serialized_data)
+      
+      # Wait for acknowledgment
+      ack = connection.receive_ack(timeout: 5.0)
+      handle_send_result(message, ack)
+      
+    rescue NetworkError => error
+      handle_network_error(message, node_id, error)
+    ensure
+      @connection_pool.return_connection(node_id, connection)
+    end
+  end
+  
+  def start_network_listener
+    @listener_thread = Thread.new do
+      server = TCPServer.new(@config.listen_port)
+      
+      while true
+        client = server.accept
+        handle_incoming_connection(client)
+      end
+    end
+  end
+  
+  private
+  
+  def handle_incoming_connection(client)
+    Thread.new do
+      begin
+        while data = client.gets
+          network_message = @message_serializer.deserialize(data)
+          
+          # Send acknowledgment
+          client.puts("ACK:#{network_message.message_id}")
+          
+          # Process received message
+          process_network_message(network_message)
+        end
+      rescue => error
+        log_network_error(error, client)
+      ensure
+        client.close
+      end
+    end
+  end
+  
+  def process_network_message(network_message)
+    # Deserialize the original message
+    original_message = Message.deserialize(network_message.payload)
+    
+    # Route to local message queue
+    local_message_queue = MessageQueue.current
+    local_message_queue.receive_external_message(original_message)
+  end
+end
+
+class ConnectionPool
+  def initialize
+    @connections = {}
+    @mutex = Mutex.new
+  end
+  
+  def get_connection(node_id)
+    @mutex.synchronize do
+      @connections[node_id] ||= create_connection(node_id)
+    end
+  end
+  
+  def return_connection(node_id, connection)
+    # For now, keep connections open
+    # In production, implement connection pooling
+  end
+  
+  private
+  
+  def create_connection(node_id)
+    host, port = parse_node_address(node_id)
+    TCPSocket.new(host, port)
+  rescue => error
+    raise NetworkError.new("Failed to connect to #{node_id}: #{error.message}")
+  end
+  
+  def parse_node_address(node_id)
+    parts = node_id.split(':')
+    [parts[0], parts[1].to_i]
+  end
+end
+```
+
+### Cross-Thread Communication Design
+
+```ruby
+class ThreadManager
+  def initialize
+    @threads = {}
+    @thread_message_queues = {}
+    @thread_registry = ThreadRegistry.new
+  end
+  
+  def create_thread(name = nil, &block)
+    thread = Thread.new do
+      # Set up thread-local message queue
+      thread_queue = MessageQueue.new
+      Thread.current[:message_queue] = thread_queue
+      Thread.current[:thread_name] = name || "thread_#{Thread.current.object_id}"
+      
+      # Register thread
+      @thread_registry.register(Thread.current)
+      
+      begin
+        # Execute thread block
+        block.call
+      ensure
+        # Clean up on thread exit
+        @thread_registry.unregister(Thread.current)
+        thread_queue.close
+      end
+    end
+    
+    # Store thread reference
+    @threads[name] = thread if name
+    @thread_message_queues[thread] = thread[:message_queue]
+    
+    thread
+  end
+  
+  def send_message_to_thread(target_thread, message_type, data = {})
+    target_queue = @thread_message_queues[target_thread]
+    raise ThreadNotFoundError.new("Thread not found or not message-enabled") unless target_queue
+    
+    message = Message.new(
+      source: Thread.current,
+      target: target_thread,
+      type: message_type,
+      data: data
+    )
+    
+    target_queue.enqueue(message)
+  end
+  
+  def get_thread_by_name(name)
+    @threads[name]
+  end
+  
+  def broadcast_message(message_type, data = {}, filter = nil)
+    @thread_message_queues.each do |thread, queue|
+      next if thread == Thread.current  # Don't send to self
+      next if filter && !filter.call(thread)
+      
+      message = Message.new(
+        source: Thread.current,
+        target: thread,
+        type: message_type,
+        data: data
+      )
+      
+      queue.enqueue(message)
+    end
+  end
+end
+
+class ThreadRegistry
+  def initialize
+    @registered_threads = {}
+    @mutex = Mutex.new
+  end
+  
+  def register(thread)
+    @mutex.synchronize do
+      @registered_threads[thread.object_id] = {
+        thread: thread,
+        name: thread[:thread_name],
+        created_at: Time.now,
+        message_queue: thread[:message_queue]
+      }
+    end
+  end
+  
+  def unregister(thread)
+    @mutex.synchronize do
+      @registered_threads.delete(thread.object_id)
+    end
+  end
+  
+  def find_by_name(name)
+    @mutex.synchronize do
+      entry = @registered_threads.values.find { |entry| entry[:name] == name }
+      entry&.[](:thread)
+    end
+  end
+  
+  def all_threads
+    @mutex.synchronize do
+      @registered_threads.values.map { |entry| entry[:thread] }
+    end
+  end
+end
+```
+
+### Integration with Existing Event System
+
+```ruby
+class EventSystemIntegration
+  def initialize(event_system, message_queue)
+    @event_system = event_system
+    @message_queue = message_queue
+    @integration_rules = []
+  end
+  
+  def setup_integration
+    # Events automatically become messages when crossing boundaries
+    @event_system.add_global_event_interceptor do |event, context|
+      if should_convert_to_message?(event, context)
+        convert_event_to_message(event, context)
+      end
+    end
+    
+    # Messages can trigger local events
+    @message_queue.subscribe("event:*") do |message|
+      event_type = message.type.sub(/^event:/, '')
+      @event_system.emit_event(event_type, message.data)
+    end
+  end
+  
+  def add_integration_rule(rule)
+    @integration_rules << rule
+  end
+  
+  private
+  
+  def should_convert_to_message?(event, context)
+    # Convert to message if:
+    # 1. Event has cross-thread targets
+    # 2. Event has network targets
+    # 3. Event requires persistence
+    # 4. Custom integration rules match
+    
+    has_cross_thread_targets?(event) ||
+    has_network_targets?(event) ||
+    requires_persistence?(event) ||
+    custom_rules_match?(event, context)
+  end
+  
+  def convert_event_to_message(event, context)
+    # Determine targets from event context
+    targets = extract_targets_from_event(event, context)
+    
+    targets.each do |target|
+      message_type = "event:#{event.type}"
+      @message_queue.send_message(target, message_type, event.data)
+    end
+  end
+  
+  def has_cross_thread_targets?(event)
+    # Check if event targets include other threads
+    event.targets&.any? { |target| target.is_a?(Thread) && target != Thread.current }
+  end
+  
+  def has_network_targets?(event)
+    # Check if event targets include network nodes
+    event.targets&.any? { |target| target.is_a?(String) && target.include?(':') }
+  end
+  
+  def requires_persistence?(event)
+    # Check if event should be persisted
+    event.metadata[:persist] == true ||
+    event.type.start_with?('state:', 'business:', 'audit:')
+  end
+end
+```
+
+---
+
 ## AST Node Hierarchy
 
 ```ruby
