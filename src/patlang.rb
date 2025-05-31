@@ -96,7 +96,7 @@ class Patlang
     
     loop do
       print "> "
-      input = gets
+      input = STDIN.gets
       break if input.nil? || input.chomp.downcase == 'exit'
       
       input = input.chomp
@@ -200,5 +200,20 @@ end
 
 # Run demo if this file is executed directly
 if __FILE__ == $0
-  Patlang.demo
+  if ARGV.include?('--demo') || ARGV.empty?
+    Patlang.demo
+  elsif ARGV.include?('--help') || ARGV.include?('-h')
+    puts "Patlang v0.2.0 - Variables and Assignment"
+    puts "Usage:"
+    puts "  ruby #{$0}         # Run demo mode"
+    puts "  ruby #{$0} --demo  # Run demo mode"
+    puts "  ruby #{$0} --help  # Show this help"
+    puts ""
+    puts "Demo mode shows lexer, parser, and evaluator output for sample expressions,"
+    puts "then enters an interactive REPL for testing variable assignments and arithmetic."
+  else
+    puts "Unknown argument: #{ARGV.join(' ')}"
+    puts "Use --help for usage information."
+    exit 1
+  end
 end
