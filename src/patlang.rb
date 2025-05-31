@@ -4,40 +4,69 @@ require_relative 'lexer'
 require_relative 'token'
 require_relative 'parser'
 require_relative 'ast_nodes'
+require_relative 'evaluator'
 
 # Main Patlang interpreter entry point
 class Patlang
-  def self.tokenize_and_parse(expression)
-    puts "Processing: #{expression}"
-    puts "=" * 50
+  def self.process_expression(expression, show_details: false)
+    puts "Processing: #{expression}" if show_details
+    puts "=" * 50 if show_details
     
     begin
       # Tokenization
-      puts "TOKENS:"
-      puts "-" * 20
+      if show_details
+        puts "TOKENS:"
+        puts "-" * 20
+      end
       lexer = Lexer.new(expression)
       tokens = lexer.tokenize
       
-      tokens.each_with_index do |token, index|
-        puts "#{index + 1}. #{token}"
+      if show_details
+        tokens.each_with_index do |token, index|
+          puts "#{index + 1}. #{token}"
+        end
+        puts "Total tokens: #{tokens.length}"
+        puts
       end
       
-      puts "Total tokens: #{tokens.length}"
-      puts
-      
       # Parsing
-      puts "AST:"
-      puts "-" * 20
+      if show_details
+        puts "AST:"
+        puts "-" * 20
+      end
       parser = Parser.new(tokens)
       ast = parser.parse
       
-      puts "#{ast}"
-      puts
+      if show_details
+        puts "#{ast}"
+        puts
+      end
       
+      # Evaluation
+      if show_details
+        puts "EVALUATION:"
+        puts "-" * 20
+      end
+      evaluator = Evaluator.new
+      result = evaluator.evaluate(ast)
+      
+      if show_details
+        puts "Result: #{result}"
+        puts
+      end
+      
+      result
     rescue => e
-      puts "Error: #{e.message}"
-      puts
+      if show_details
+        puts "Error: #{e.message}"
+        puts
+      end
+      raise e
     end
+  end
+
+  def self.evaluate(expression)
+    process_expression(expression, show_details: false)
   end
 
   def self.demo
@@ -56,11 +85,11 @@ class Patlang
     ]
     
     expressions.each do |expr|
-      tokenize_and_parse(expr)
+      process_expression(expr, show_details: true)
     end
     
-    # Interactive mode
-    puts "Interactive mode (type 'exit' to quit):"
+    # Interactive REPL mode
+    puts "Interactive REPL (type 'exit' to quit):"
     puts "-" * 40
     
     loop do
@@ -71,7 +100,38 @@ class Patlang
       input = input.chomp
       next if input.strip.empty?
       
-      tokenize_and_parse(input)
+      begin
+        result = evaluate(input)
+        puts result
+      rescue => e
+        puts "Error: #{e.message}"
+      end
+    end
+    
+    puts "Goodbye!"
+  end
+
+  def self.repl
+    puts "Patlang Arithmetic Interpreter REPL"
+    puts "=" * 40
+    puts "Enter arithmetic expressions to evaluate."
+    puts "Type 'exit' to quit."
+    puts
+    
+    loop do
+      print "> "
+      input = gets
+      break if input.nil? || input.chomp.downcase == 'exit'
+      
+      input = input.chomp
+      next if input.strip.empty?
+      
+      begin
+        result = evaluate(input)
+        puts result
+      rescue => e
+        puts "Error: #{e.message}"
+      end
     end
     
     puts "Goodbye!"
