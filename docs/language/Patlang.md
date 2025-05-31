@@ -20,7 +20,9 @@ The language is conceived as a multi-paradigm system, blending object-oriented, 
 
 #### 2.2.1. Object-Oriented Programming
 
-Inspired by Ruby, the language treats all values as objects, supporting classes, single inheritance, and mixins (modules) for code reuse. Methods can be defined on classes and objects, and objects can be extended at runtime. Encapsulation, polymorphism, and dynamic dispatch are core features, with a flexible module and namespace system for code organization.
+Inspired by Ruby, the language treats all values as objects, supporting classes, single inheritance, and mixins (modules) for code reuse. A fundamental architectural principle is that **language elements themselves are objects** - functions, variables, classes, and even control structures are first-class objects that can have properties, methods, and events attached to them. This enables unprecedented meta-programming capabilities and seamless multi-paradigm integration.
+
+Methods can be defined on classes and objects, and objects can be extended at runtime. Encapsulation, polymorphism, and dynamic dispatch are core features, with a flexible module and namespace system for code organization.
 
 #### 2.2.2. Type Inference and Type System
 
@@ -42,23 +44,86 @@ A logic programming subsystem is integrated into the language, supporting facts,
 
 The language features a high-performance event loop, supporting asynchronous I/O, timers, and inter-process communication. Events are first-class, with a publish-subscribe model, priority-based queues, and support for both synchronous and asynchronous handlers. Event handlers can be defined as blocks or methods, and the system supports event aggregation, filtering, and batching for high-throughput scenarios  .
 
-#### 2.2.7. Native Data Structures
+#### 2.2.7. Language Elements as Objects
+
+A revolutionary aspect of Patlang is that **language elements are first-class objects**. Functions, variables, classes, modules, and even control flow constructs are objects that can have properties, methods, and events attached to them. This architectural decision enables powerful meta-programming capabilities and seamless paradigm integration.
+
+**Functions as Objects:**
+Functions are objects with properties like name, parameter count, and execution metadata. They can have events attached for monitoring calls, completions, and errors:
+
+```patlang
+make a function called process_data {
+  process_data takes: data - list
+  process_data returns: processed_data
+}
+
+# Attach events to the function object
+when process_data: called {
+  log("Function process_data was called with: #{event_data.arguments}")
+}
+
+when process_data: completed {
+  log("Function process_data completed with result: #{event_data.result}")
+}
+
+when process_data: error {
+  log("Function process_data failed: #{event_data.error}")
+}
+```
+
+**Variables as Objects:**
+Variables are objects that can trigger events when their values change, enabling reactive programming patterns:
+
+```patlang
+user_count = 0
+
+when user_count: changed {
+  if user_count.new_value > 100 then
+    emit system:alert with "High user count: #{user_count.new_value}"
+  end
+}
+
+user_count = 150  # Triggers the 'changed' event
+```
+
+**Classes/Templates as Objects:**
+Classes themselves are objects that can monitor instantiation, method calls, and inheritance:
+
+```patlang
+make a template called User {
+  User has: name - text, email - email
+}
+
+when User: instantiated {
+  log("New User object created: #{event_data.instance}")
+  emit user_metrics:user_created with event_data.instance
+}
+
+when User: method_called {
+  log("Method #{event_data.method_name} called on User instance")
+}
+```
+
+**Multi-Paradigm Integration:**
+This object-oriented approach to language elements enables seamless integration between paradigms. Events on functions can trigger goals, variable changes can activate logic rules, and class instantiation can emit events that drive functional pipelines.
+
+#### 2.2.8. Native Data Structures
 
 Arrays are 1-indexed by default, aligning with mathematical conventions and languages like Fortran and Lua. Strings are stored with length-prefix encoding and can be implemented as linked lists for efficient manipulation of large or concatenated strings. Lists (and lists of lists) are native, supporting both array-like and Lisp-like operations.
 
-#### 2.2.8. Error Handling and Call Stack Tracing
+#### 2.2.9. Error Handling and Call Stack Tracing
 
 Robust error handling is provided via try/catch/finally constructs, with detailed error reporting and stack tracing. The runtime supports introspection and debugging tools for tracing call stacks, inspecting variables, and profiling performance.
 
-#### 2.2.9. Interactive Development and REPL
+#### 2.2.10. Interactive Development and REPL
 
 An interactive REPL (Read-Eval-Print Loop) is a core component, supporting incremental development, live code reloading, and stateful exploration. The REPL integrates with the type inference engine, memory management, and event system, providing immediate feedback and facilitating rapid prototyping  .
 
-#### 2.2.10. Testing and Tooling
+#### 2.2.11. Testing and Tooling
 
 Native support for unit testing, assertions, and coverage analysis is provided, with a standard testing framework included in the core library. Tooling for profiling, debugging, and visualization is integrated into the development environment.
 
-#### 2.2.11. Security Features
+#### 2.2.12. Security Features
 
 Security is integrated at every level, with memory safety, type safety, thread safety, capability-based access control, sandboxing, and secure standard library APIs. The language eliminates entire classes of vulnerabilities (e.g., buffer overflows, use-after-free, injection attacks) through design, static analysis, and runtime enforcement  .
 

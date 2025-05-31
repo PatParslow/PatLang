@@ -692,7 +692,170 @@ make a template called BankAccount {
 
 ## Multi-Paradigm Programming
 
-Patlang's multi-paradigm integration allows natural transitions between programming styles within the same code.
+Patlang's multi-paradigm integration allows natural transitions between programming styles within the same code. A foundational principle enabling this integration is that **language elements themselves are first-class objects** that can have events attached to them.
+
+### Language Elements as Objects
+
+In Patlang, functions, variables, classes, and other language constructs are objects that can have properties, methods, and events. This enables powerful meta-programming and reactive programming patterns.
+
+#### Functions as Event-Enabled Objects
+
+Functions can have events attached for monitoring and reactive programming:
+
+```patlang
+make a function called calculate_total {
+  calculate_total takes:
+    items - list of number
+  calculate_total returns:
+    items.reduce(|acc, item| acc + item, 0)
+}
+
+# Attach events to the function object
+when calculate_total: called {
+  log("calculate_total called with #{event_data.arguments.length} arguments")
+  emit metrics:function_call with {
+    function_name: "calculate_total",
+    timestamp: now(),
+    arguments: event_data.arguments
+  }
+}
+
+when calculate_total: completed {
+  log("calculate_total returned: #{event_data.result}")
+  if event_data.result > 1000 then
+    emit business:high_value_transaction with event_data.result
+  end
+}
+
+when calculate_total: error {
+  log("calculate_total failed: #{event_data.error}")
+  emit monitoring:function_error with {
+    function: "calculate_total",
+    error: event_data.error,
+    arguments: event_data.arguments
+  }
+}
+```
+
+#### Variables as Reactive Objects
+
+Variables trigger events when their values change, enabling reactive programming:
+
+```patlang
+make a number called inventory_count { inventory_count is 100 }
+
+# React to inventory changes
+when inventory_count: changed {
+  old_value = event_data.old_value
+  new_value = event_data.new_value
+  
+  log("Inventory changed from #{old_value} to #{new_value}")
+  
+  if new_value < 10 then
+    emit inventory:low_stock with {
+      item: "inventory_count",
+      current_level: new_value,
+      threshold: 10
+    }
+  elsif new_value > old_value then
+    emit inventory:restocked with {
+      item: "inventory_count",
+      added_quantity: new_value - old_value
+    }
+  end
+}
+
+# Variable changes trigger events automatically
+inventory_count = 50   # Triggers 'changed' event
+inventory_count = 5    # Triggers 'changed' and 'low_stock' events
+```
+
+#### Classes as Observable Objects
+
+Classes can monitor instantiation, method calls, and inheritance:
+
+```patlang
+make a template called User {
+  User has:
+    name - text
+    email - email
+    created_at - time = now()
+    
+  validate_email returns:
+    email.contains("@") and email.contains(".")
+}
+
+# Monitor class-level events
+when User: instantiated {
+  log("New User created: #{event_data.instance.name}")
+  emit analytics:user_created with {
+    user_id: event_data.instance.id,
+    timestamp: event_data.instance.created_at
+  }
+}
+
+when User: method_called {
+  log("Method #{event_data.method_name} called on User")
+  emit monitoring:method_usage with {
+    class_name: "User",
+    method_name: event_data.method_name,
+    instance_id: event_data.instance.id
+  }
+}
+
+# Usage
+john = User.new("John Doe", "john@example.com")  # Triggers 'instantiated' event
+john.validate_email()                            # Triggers 'method_called' event
+```
+
+#### Multi-Paradigm Event Integration
+
+Language element events integrate seamlessly with goals and logic programming:
+
+```patlang
+# Goal that responds to function events
+make a goal called optimize_performance {
+  optimize_performance requires:
+    function_metrics - metrics_data
+    
+  optimize_performance is achieved when:
+    average_execution_time < 100  # milliseconds
+    
+  optimize_performance runs: {
+    if function_metrics.execution_time > 200 then
+      activate cache_function_results with function_metrics.function_name
+    end
+  }
+}
+
+# Function event triggers goal
+when calculate_total: completed {
+  if event_data.execution_time > 100 then
+    activate optimize_performance with {
+      function_name: "calculate_total",
+      execution_time: event_data.execution_time
+    }
+  end
+}
+
+# Logic programming with language element facts
+when User: instantiated {
+  # Assert facts about the new user
+  assert user_exists(event_data.instance.id).
+  assert user_has_email(event_data.instance.id, event_data.instance.email).
+  
+  # Query business rules
+  query can_send_welcome_email(event_data.instance.id) returns:
+    user_exists(UserId) and
+    user_has_email(UserId, Email) and
+    Email is not empty
+  end
+  
+  if can_send_welcome_email(event_data.instance.id) then
+    activate send_welcome_email with event_data.instance
+  end
+}
+```
 
 ### Paradigm Integration Patterns
 

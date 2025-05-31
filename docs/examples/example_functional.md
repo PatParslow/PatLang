@@ -186,6 +186,145 @@ print lazy_squares(2) # Output: 9 (square of 3, the third item in numbers)
 
 ---
 
+### **Language Elements as Objects: Enhanced Functional Programming**
+
+Patlang's revolutionary "language elements as objects" concept extends functional programming with powerful event-driven capabilities. Functions themselves are objects that can have events attached:
+
+```patlang
+# Functions can have events for monitoring and reactive programming
+make a function called fibonacci {
+  fibonacci takes:
+    n - integer
+  fibonacci returns:
+    if n <= 1 then n else fibonacci(n-1) + fibonacci(n-2) end
+}
+
+# Attach events to the function object
+when fibonacci: called {
+  log("fibonacci called with argument: #{event_data.arguments[0]}")
+  if event_data.arguments[0] > 30 then
+    emit performance:warning with "Large fibonacci calculation: #{event_data.arguments[0]}"
+  end
+}
+
+when fibonacci: completed {
+  log("fibonacci(#{event_data.arguments[0]}) = #{event_data.result}")
+  emit metrics:function_performance with {
+    function_name: "fibonacci",
+    input: event_data.arguments[0],
+    result: event_data.result,
+    execution_time: event_data.execution_time
+  }
+}
+
+# Higher-order functions can also have events
+make a function called optimized_map {
+  optimized_map takes:
+    list - list
+    transform - block
+  optimized_map returns:
+    if list.length > 1000 then
+      # Use parallel processing for large lists
+      parallel_map(list, transform)
+    else
+      # Use standard map for small lists
+      list.map(transform)
+    end
+}
+
+when optimized_map: called {
+  if event_data.arguments[0].length > 1000 then
+    log("Using parallel processing for list of size #{event_data.arguments[0].length}")
+  end
+}
+
+# Variables are objects too and can trigger events
+make a number called computation_count { computation_count is 0 }
+
+when computation_count: changed {
+  if computation_count.new_value % 100 == 0 then
+    emit metrics:milestone with "Completed #{computation_count.new_value} computations"
+  end
+}
+
+# Event-driven functional programming
+when fibonacci: completed {
+  computation_count = computation_count + 1
+  
+  # Trigger optimizations based on usage patterns
+  if computation_count > 50 then
+    activate optimize_fibonacci_cache
+  end
+}
+
+# Goals can respond to function events
+make a goal called optimize_fibonacci_cache {
+  optimize_fibonacci_cache is achieved when:
+    fibonacci_cache is enabled
+    
+  optimize_fibonacci_cache runs: {
+    log("Enabling fibonacci memoization due to high usage")
+    fibonacci.enable_memoization()
+    emit system:optimization with "Fibonacci caching enabled"
+  }
+}
+```
+
+### **Multi-Paradigm Function Composition**
+
+Functions as objects enable seamless integration with other paradigms:
+
+```patlang
+# Function that emits events and triggers goals
+make a function called process_data_pipeline {
+  process_data_pipeline takes:
+    raw_data - list
+  process_data_pipeline returns: {
+    raw_data
+      |> validate_data
+      |> transform_data
+      |> enrich_data
+      |> save_results
+  }
+}
+
+# Each step in the pipeline can have monitoring
+when validate_data: completed {
+  if event_data.result.errors.length > 0 then
+    activate handle_data_validation_errors with event_data.result.errors
+  end
+}
+
+when transform_data: error {
+  emit alerts:data_processing_failed with {
+    stage: "transformation",
+    error: event_data.error,
+    input_data_sample: event_data.arguments[0].take(5)
+  }
+}
+
+# Logic programming integration with function events
+when save_results: completed {
+  # Assert facts about the processed data
+  assert data_processed(event_data.result.id, now()).
+  assert data_quality(event_data.result.id, event_data.result.quality_score).
+  
+  # Query business rules
+  query should_trigger_alert(event_data.result.quality_score) returns:
+    quality_score < 0.8 and
+    not recent_alert_sent_for_quality()
+  end
+  
+  if should_trigger_alert(event_data.result.quality_score) then
+    emit quality:low_quality_data with event_data.result
+  end
+}
+```
+
+---
+
 ### **Conclusion**
 
-This example demonstrates how **Patlang** supports functional programming through first-class functions, higher-order functions, immutability, and declarative syntax. By allowing both `begin...end` and `{...}` styles, the language provides flexibility while maintaining readability and expressiveness. This approach aligns with Patlang's goal of being a versatile, user-friendly, and powerful programming language.
+This example demonstrates how **Patlang** supports functional programming through first-class functions, higher-order functions, immutability, and declarative syntax. The revolutionary "language elements as objects" concept extends functional programming with event-driven capabilities, enabling reactive programming patterns and seamless multi-paradigm integration.
+
+Functions can monitor their own usage, trigger optimizations, emit metrics, and integrate with goals and logic programming - all while maintaining the clean, readable syntax that makes functional programming accessible. This approach aligns with Patlang's goal of being a versatile, user-friendly, and powerful programming language that unifies multiple paradigms in an intuitive way.
