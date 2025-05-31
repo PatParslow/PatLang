@@ -52,7 +52,7 @@ Patlang is being developed using an **incremental approach**:
 
 ## Current Status
 
-🎉 **v0.1.0 - Arithmetic Interpreter MVP Complete**
+🎉 **v0.2.0 - Variables and Assignment Complete**
 
 - ✅ Core language specification defined
 - ✅ Syntax rules and patterns established
@@ -60,14 +60,15 @@ Patlang is being developed using an **incremental approach**:
 - ✅ Testing strategy planned
 - ✅ **Complete arithmetic interpreter with lexer, parser, and evaluator**
 - ✅ **Interactive REPL for arithmetic expressions**
-- ✅ **Comprehensive test suite (42+ tests, 140+ assertions)**
+- ✅ **Variables and assignment functionality**
+- ✅ **REPL variable persistence across statements**
+- ✅ **Comprehensive test suite (93 tests, 393 assertions, 97.27% coverage)**
 - ✅ **Support for integers, decimals, and all arithmetic operations**
-- 🔄 Variables and assignment (next increment)
-- ⏳ Advanced language features (planned)
+- ⏳ Advanced language features (next increment)
 
 ## Try the Interpreter
 
-The current arithmetic interpreter supports:
+The current interpreter supports:
 
 ```bash
 # Run the interactive REPL
@@ -79,11 +80,20 @@ ruby -Isrc src/patlang.rb
 2 + 3 * 4            # => 14 (operator precedence)
 (2 + 3) * 4          # => 20 (parentheses)
 10 - 5 / 2           # => 7.5 (mixed operations)
+
+# Variable assignment and usage:
+x = 42               # => 42
+y = 3.14             # => 3.14
+x + y * 2            # => 48.28
+result = (x + y) / 2 # => 22.57
+result               # => 22.57
 ```
 
 **Supported Features:**
 - Integer and decimal number literals
 - Arithmetic operators: `+`, `-`, `*`, `/`
+- Variable assignment and lookup
+- Variable persistence in REPL sessions
 - Parentheses for grouping expressions
 - Proper operator precedence and associativity
 - Comprehensive error handling
