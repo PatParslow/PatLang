@@ -52,14 +52,41 @@ Patlang is being developed using an **incremental approach**:
 
 ## Current Status
 
-🚧 **In Development** - Language specification and design phase
+🎉 **v0.1.0 - Arithmetic Interpreter MVP Complete**
 
 - ✅ Core language specification defined
-- ✅ Syntax rules and patterns established  
+- ✅ Syntax rules and patterns established
 - ✅ Example programs written
 - ✅ Testing strategy planned
-- 🔄 Parser implementation (next phase)
-- ⏳ Interpreter development (planned)
+- ✅ **Complete arithmetic interpreter with lexer, parser, and evaluator**
+- ✅ **Interactive REPL for arithmetic expressions**
+- ✅ **Comprehensive test suite (42+ tests, 140+ assertions)**
+- ✅ **Support for integers, decimals, and all arithmetic operations**
+- 🔄 Variables and assignment (next increment)
+- ⏳ Advanced language features (planned)
+
+## Try the Interpreter
+
+The current arithmetic interpreter supports:
+
+```bash
+# Run the interactive REPL
+ruby -Isrc src/patlang.rb
+
+# Try these expressions:
+42                    # => 42
+3.14 + 2.86          # => 6.0
+2 + 3 * 4            # => 14 (operator precedence)
+(2 + 3) * 4          # => 20 (parentheses)
+10 - 5 / 2           # => 7.5 (mixed operations)
+```
+
+**Supported Features:**
+- Integer and decimal number literals
+- Arithmetic operators: `+`, `-`, `*`, `/`
+- Parentheses for grouping expressions
+- Proper operator precedence and associativity
+- Comprehensive error handling
 
 ## Getting Involved
 

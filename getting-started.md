@@ -43,12 +43,53 @@ This guide follows a progressive learning approach:
 
 ## Installation and Setup
 
-> **Note**: Patlang is currently in development. The final installation process will be available when the interpreter is complete.
+### Current Working Interpreter (v0.1.0)
 
-### Future Installation (When Available)
+**Patlang currently has a working arithmetic interpreter MVP!** You can try it right now:
 
 ```bash
-# Download and install Patlang
+# Prerequisites: Ruby 2.7+ and minitest gem
+gem install minitest
+
+# Clone the repository
+git clone https://github.com/your-org/patlang.git
+cd patlang
+
+# Run the interactive arithmetic REPL
+ruby -Isrc src/patlang.rb
+
+# Run the test suite
+ruby -Itest -Isrc test/test_integration.rb
+```
+
+### Try the Arithmetic Interpreter
+
+The current interpreter supports:
+
+```bash
+# Integer and decimal arithmetic
+42                    # => 42
+3.14 + 2.86          # => 6.0
+2 + 3 * 4            # => 14 (operator precedence)
+(2 + 3) * 4          # => 20 (parentheses)
+10 - 5 / 2           # => 7.5 (mixed operations)
+
+# All arithmetic operators
++ - * /              # Addition, subtraction, multiplication, division
+
+# Interactive REPL
+> 2 + 3
+5
+> (10 + 5) / 3
+5.0
+> exit
+Goodbye!
+```
+
+### Future Installation (When Complete)
+
+```bash
+# Download and install Patlang (coming soon)
 curl -sSL https://get.patlang.org | bash
 
 # Verify installation
@@ -58,15 +99,15 @@ patlang --version
 patlang
 ```
 
-### Current Development Setup
-
-For now, you can follow along with the examples in this guide to understand Patlang's concepts and syntax. The implementation is being built in Ruby following the architecture outlined in the language specification.
-
 ### Development Environment
 
-When available, Patlang will support:
-- **Command Line Interface**: `patlang script.pat`
-- **Interactive REPL**: Real-time code evaluation
+Currently available:
+- **Arithmetic REPL**: Interactive arithmetic evaluation
+- **Ruby-based implementation**: Clean, extensible codebase
+- **Comprehensive test suite**: 42+ tests ensuring reliability
+
+Coming soon:
+- **Full language interpreter**: Variables, functions, control flow
 - **IDE Integration**: Syntax highlighting and debugging support
 - **VS Code Extension**: Full language support
 
