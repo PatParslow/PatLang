@@ -34,3 +34,30 @@ class BinaryOpNode < ASTNode
     "BinaryOpNode(#{@left}, #{@operator}, #{@right})"
   end
 end
+
+# Node representing a variable reference/lookup
+class VariableNode < ASTNode
+  attr_reader :name
+
+  def initialize(name)
+    @name = name
+  end
+
+  def to_s
+    "VariableNode(#{@name})"
+  end
+end
+
+# Node representing a variable assignment
+class AssignmentNode < ASTNode
+  attr_reader :name, :expression
+
+  def initialize(name, expression)
+    @name = name
+    @expression = expression
+  end
+
+  def to_s
+    "AssignmentNode(#{@name}, #{@expression})"
+  end
+end

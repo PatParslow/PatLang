@@ -138,4 +138,56 @@ class TestParser < Minitest::Test
       parser.parse
     end
   end
+  
+  # Tests for new AST node classes
+  def test_variable_node_creation
+    node = VariableNode.new("x")
+    
+    assert_instance_of VariableNode, node
+    assert_equal "x", node.name
+    assert_equal "VariableNode(x)", node.to_s
+  end
+  
+  def test_variable_node_with_different_names
+    node1 = VariableNode.new("result")
+    node2 = VariableNode.new("myVar")
+    
+    assert_equal "result", node1.name
+    assert_equal "myVar", node2.name
+    assert_equal "VariableNode(result)", node1.to_s
+    assert_equal "VariableNode(myVar)", node2.to_s
+  end
+  
+  def test_assignment_node_creation
+    expr = NumberNode.new(42)
+    node = AssignmentNode.new("x", expr)
+    
+    assert_instance_of AssignmentNode, node
+    assert_equal "x", node.name
+    assert_equal expr, node.expression
+    assert_equal "AssignmentNode(x, NumberNode(42))", node.to_s
+  end
+  
+  def test_assignment_node_with_complex_expression
+    # Test assignment with a binary operation: y = x + 5
+    var_node = VariableNode.new("x")
+    num_node = NumberNode.new(5)
+    binary_expr = BinaryOpNode.new(var_node, "+", num_node)
+    assignment = AssignmentNode.new("y", binary_expr)
+    
+    assert_instance_of AssignmentNode, assignment
+    assert_equal "y", assignment.name
+    assert_equal binary_expr, assignment.expression
+    assert_equal "AssignmentNode(y, BinaryOpNode(VariableNode(x), +, NumberNode(5)))", assignment.to_s
+  end
+  
+  def test_assignment_node_with_variable_expression
+    # Test assignment with just a variable: result = x
+    var_expr = VariableNode.new("x")
+    assignment = AssignmentNode.new("result", var_expr)
+    
+    assert_equal "result", assignment.name
+    assert_equal var_expr, assignment.expression
+    assert_equal "AssignmentNode(result, VariableNode(x))", assignment.to_s
+  end
 end
