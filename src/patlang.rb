@@ -2,14 +2,19 @@
 
 require_relative 'lexer'
 require_relative 'token'
+require_relative 'parser'
+require_relative 'ast_nodes'
 
 # Main Patlang interpreter entry point
 class Patlang
-  def self.tokenize_and_print(expression)
-    puts "Tokenizing: #{expression}"
-    puts "-" * 40
+  def self.tokenize_and_parse(expression)
+    puts "Processing: #{expression}"
+    puts "=" * 50
     
     begin
+      # Tokenization
+      puts "TOKENS:"
+      puts "-" * 20
       lexer = Lexer.new(expression)
       tokens = lexer.tokenize
       
@@ -17,9 +22,18 @@ class Patlang
         puts "#{index + 1}. #{token}"
       end
       
-      puts "-" * 40
       puts "Total tokens: #{tokens.length}"
       puts
+      
+      # Parsing
+      puts "AST:"
+      puts "-" * 20
+      parser = Parser.new(tokens)
+      ast = parser.parse
+      
+      puts "#{ast}"
+      puts
+      
     rescue => e
       puts "Error: #{e.message}"
       puts
@@ -27,7 +41,7 @@ class Patlang
   end
 
   def self.demo
-    puts "Patlang Minimal Lexer Demo"
+    puts "Patlang Minimal Lexer & Parser Demo"
     puts "=" * 50
     puts
     
@@ -42,7 +56,7 @@ class Patlang
     ]
     
     expressions.each do |expr|
-      tokenize_and_print(expr)
+      tokenize_and_parse(expr)
     end
     
     # Interactive mode
@@ -57,7 +71,7 @@ class Patlang
       input = input.chomp
       next if input.strip.empty?
       
-      tokenize_and_print(input)
+      tokenize_and_parse(input)
     end
     
     puts "Goodbye!"
