@@ -422,4 +422,463 @@ class TestParser < Minitest::Test
     assert_equal 3, ast.right.left.value
     assert_equal 4, ast.right.right.value
   end
+
+  # Tests for boolean literal parsing
+  def test_parse_boolean_true
+    lexer = Lexer.new("true")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    assert_instance_of BooleanNode, ast
+    assert_equal true, ast.value
+  end
+
+  def test_parse_boolean_false
+    lexer = Lexer.new("false")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    assert_instance_of BooleanNode, ast
+    assert_equal false, ast.value
+  end
+
+  def test_parse_boolean_in_expression
+    # true + false (though semantically odd, should parse)
+    lexer = Lexer.new("true + false")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    assert_instance_of BinaryOpNode, ast
+    assert_equal '+', ast.operator
+    assert_instance_of BooleanNode, ast.left
+    assert_equal true, ast.left.value
+    assert_instance_of BooleanNode, ast.right
+    assert_equal false, ast.right.value
+  end
+
+  # Tests for comparison expression parsing
+  def test_parse_simple_equality
+    lexer = Lexer.new("x == 5")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    assert_instance_of ComparisonNode, ast
+    assert_instance_of VariableNode, ast.left
+    assert_equal "x", ast.left.name
+    assert_equal "==", ast.operator
+    assert_instance_of NumberNode, ast.right
+    assert_equal 5, ast.right.value
+  end
+
+  def test_parse_simple_inequality
+    lexer = Lexer.new("a != b")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    assert_instance_of ComparisonNode, ast
+    assert_instance_of VariableNode, ast.left
+    assert_equal "a", ast.left.name
+    assert_equal "!=", ast.operator
+    assert_instance_of VariableNode, ast.right
+    assert_equal "b", ast.right.name
+  end
+
+  def test_parse_less_than
+    lexer = Lexer.new("x < 10")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    assert_instance_of ComparisonNode, ast
+    assert_instance_of VariableNode, ast.left
+    assert_equal "x", ast.left.name
+    assert_equal "<", ast.operator
+    assert_instance_of NumberNode, ast.right
+    assert_equal 10, ast.right.value
+  end
+
+  def test_parse_greater_than
+    lexer = Lexer.new("y > 0")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    assert_instance_of ComparisonNode, ast
+    assert_instance_of VariableNode, ast.left
+    assert_equal "y", ast.left.name
+    assert_equal ">", ast.operator
+    assert_instance_of NumberNode, ast.right
+    assert_equal 0, ast.right.value
+  end
+
+  def test_parse_less_equal
+    lexer = Lexer.new("result <= 100")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    assert_instance_of ComparisonNode, ast
+    assert_instance_of VariableNode, ast.left
+    assert_equal "result", ast.left.name
+    assert_equal "<=", ast.operator
+    assert_instance_of NumberNode, ast.right
+    assert_equal 100, ast.right.value
+  end
+
+  def test_parse_greater_equal
+    lexer = Lexer.new("score >= 50")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    assert_instance_of ComparisonNode, ast
+    assert_instance_of VariableNode, ast.left
+    assert_equal "score", ast.left.name
+    assert_equal ">=", ast.operator
+    assert_instance_of NumberNode, ast.right
+    assert_equal 50, ast.right.value
+  end
+
+  def test_parse_comparison_with_arithmetic
+    # x + 5 == y * 2
+    lexer = Lexer.new("x + 5 == y * 2")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    assert_instance_of ComparisonNode, ast
+    assert_equal "==", ast.operator
+    
+    # Left side: x + 5
+    assert_instance_of BinaryOpNode, ast.left
+    assert_equal "+", ast.left.operator
+    assert_instance_of VariableNode, ast.left.left
+    assert_equal "x", ast.left.left.name
+    assert_instance_of NumberNode, ast.left.right
+    assert_equal 5, ast.left.right.value
+    
+    # Right side: y * 2
+    assert_instance_of BinaryOpNode, ast.right
+    assert_equal "*", ast.right.operator
+    assert_instance_of VariableNode, ast.right.left
+    assert_equal "y", ast.right.left.name
+    assert_instance_of NumberNode, ast.right.right
+    assert_equal 2, ast.right.right.value
+  end
+
+  # Tests for simple if statement parsing
+  def test_parse_simple_if_statement
+    lexer = Lexer.new("if x == 5 then y = 10 end")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    assert_instance_of IfNode, ast
+    
+    # Condition: x == 5
+    assert_instance_of ComparisonNode, ast.condition
+    assert_equal "==", ast.condition.operator
+    assert_instance_of VariableNode, ast.condition.left
+    assert_equal "x", ast.condition.left.name
+    assert_instance_of NumberNode, ast.condition.right
+    assert_equal 5, ast.condition.right.value
+    
+    # Then body: y = 10
+    assert_instance_of BlockNode, ast.then_body
+    assert_equal 1, ast.then_body.statements.length
+    assert_instance_of AssignmentNode, ast.then_body.statements[0]
+    assert_equal "y", ast.then_body.statements[0].name
+    assert_instance_of NumberNode, ast.then_body.statements[0].expression
+    assert_equal 10, ast.then_body.statements[0].expression.value
+    
+    # No else body
+    assert_nil ast.else_body
+  end
+
+  def test_parse_if_else_statement
+    lexer = Lexer.new("if x < 0 then y = -1 else y = 1 end")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    assert_instance_of IfNode, ast
+    
+    # Condition: x < 0
+    assert_instance_of ComparisonNode, ast.condition
+    assert_equal "<", ast.condition.operator
+    assert_instance_of VariableNode, ast.condition.left
+    assert_equal "x", ast.condition.left.name
+    assert_instance_of NumberNode, ast.condition.right
+    assert_equal 0, ast.condition.right.value
+    
+    # Then body: y = -1 (parsed as y = 0 - 1)
+    assert_instance_of BlockNode, ast.then_body
+    assert_equal 1, ast.then_body.statements.length
+    assert_instance_of AssignmentNode, ast.then_body.statements[0]
+    assert_equal "y", ast.then_body.statements[0].name
+    assert_instance_of BinaryOpNode, ast.then_body.statements[0].expression
+    assert_equal "-", ast.then_body.statements[0].expression.operator
+    assert_instance_of NumberNode, ast.then_body.statements[0].expression.left
+    assert_equal 0, ast.then_body.statements[0].expression.left.value
+    assert_instance_of NumberNode, ast.then_body.statements[0].expression.right
+    assert_equal 1, ast.then_body.statements[0].expression.right.value
+    
+    # Else body: y = 1
+    assert_instance_of BlockNode, ast.else_body
+    assert_equal 1, ast.else_body.statements.length
+    assert_instance_of AssignmentNode, ast.else_body.statements[0]
+    assert_equal "y", ast.else_body.statements[0].name
+    assert_instance_of NumberNode, ast.else_body.statements[0].expression
+    assert_equal 1, ast.else_body.statements[0].expression.value
+  end
+
+  def test_parse_if_with_boolean_condition
+    lexer = Lexer.new("if true then x = 42 end")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    assert_instance_of IfNode, ast
+    
+    # Condition: true
+    assert_instance_of BooleanNode, ast.condition
+    assert_equal true, ast.condition.value
+    
+    # Then body: x = 42
+    assert_instance_of BlockNode, ast.then_body
+    assert_equal 1, ast.then_body.statements.length
+    assert_instance_of AssignmentNode, ast.then_body.statements[0]
+    assert_equal "x", ast.then_body.statements[0].name
+    assert_instance_of NumberNode, ast.then_body.statements[0].expression
+    assert_equal 42, ast.then_body.statements[0].expression.value
+  end
+
+  # Tests for while loop parsing
+  def test_parse_simple_while_statement
+    lexer = Lexer.new("while x > 0 do x = x - 1 end")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    assert_instance_of WhileNode, ast
+    
+    # Condition: x > 0
+    assert_instance_of ComparisonNode, ast.condition
+    assert_equal ">", ast.condition.operator
+    assert_instance_of VariableNode, ast.condition.left
+    assert_equal "x", ast.condition.left.name
+    assert_instance_of NumberNode, ast.condition.right
+    assert_equal 0, ast.condition.right.value
+    
+    # Body: x = x - 1
+    assert_instance_of BlockNode, ast.body
+    assert_equal 1, ast.body.statements.length
+    assert_instance_of AssignmentNode, ast.body.statements[0]
+    assert_equal "x", ast.body.statements[0].name
+    
+    # Assignment expression: x - 1
+    assign_expr = ast.body.statements[0].expression
+    assert_instance_of BinaryOpNode, assign_expr
+    assert_equal "-", assign_expr.operator
+    assert_instance_of VariableNode, assign_expr.left
+    assert_equal "x", assign_expr.left.name
+    assert_instance_of NumberNode, assign_expr.right
+    assert_equal 1, assign_expr.right.value
+  end
+
+  def test_parse_while_with_boolean_condition
+    lexer = Lexer.new("while false do y = 5 end")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    assert_instance_of WhileNode, ast
+    
+    # Condition: false
+    assert_instance_of BooleanNode, ast.condition
+    assert_equal false, ast.condition.value
+    
+    # Body: y = 5
+    assert_instance_of BlockNode, ast.body
+    assert_equal 1, ast.body.statements.length
+    assert_instance_of AssignmentNode, ast.body.statements[0]
+    assert_equal "y", ast.body.statements[0].name
+    assert_instance_of NumberNode, ast.body.statements[0].expression
+    assert_equal 5, ast.body.statements[0].expression.value
+  end
+
+  # Tests for nested control flow structures
+  def test_parse_nested_if_in_while
+    lexer = Lexer.new("while x > 0 do if x == 5 then y = 100 end end")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    assert_instance_of WhileNode, ast
+    
+    # While condition: x > 0
+    assert_instance_of ComparisonNode, ast.condition
+    assert_equal ">", ast.condition.operator
+    
+    # While body contains if statement
+    assert_instance_of BlockNode, ast.body
+    assert_equal 1, ast.body.statements.length
+    assert_instance_of IfNode, ast.body.statements[0]
+    
+    # Nested if condition: x == 5
+    nested_if = ast.body.statements[0]
+    assert_instance_of ComparisonNode, nested_if.condition
+    assert_equal "==", nested_if.condition.operator
+    assert_instance_of VariableNode, nested_if.condition.left
+    assert_equal "x", nested_if.condition.left.name
+    assert_instance_of NumberNode, nested_if.condition.right
+    assert_equal 5, nested_if.condition.right.value
+  end
+
+  def test_parse_nested_while_in_if
+    lexer = Lexer.new("if x > 10 then while y < x do y = y + 1 end end")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    assert_instance_of IfNode, ast
+    
+    # If condition: x > 10
+    assert_instance_of ComparisonNode, ast.condition
+    assert_equal ">", ast.condition.operator
+    
+    # If body contains while statement
+    assert_instance_of BlockNode, ast.then_body
+    assert_equal 1, ast.then_body.statements.length
+    assert_instance_of WhileNode, ast.then_body.statements[0]
+    
+    # Nested while condition: y < x
+    nested_while = ast.then_body.statements[0]
+    assert_instance_of ComparisonNode, nested_while.condition
+    assert_equal "<", nested_while.condition.operator
+    assert_instance_of VariableNode, nested_while.condition.left
+    assert_equal "y", nested_while.condition.left.name
+    assert_instance_of VariableNode, nested_while.condition.right
+    assert_equal "x", nested_while.condition.right.name
+  end
+
+  # Tests for precedence handling
+  def test_comparison_precedence_over_assignment
+    # This should parse as an expression, not assignment, since comparison has higher precedence
+    lexer = Lexer.new("x == y")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    assert_instance_of ComparisonNode, ast
+    assert_equal "==", ast.operator
+    assert_instance_of VariableNode, ast.left
+    assert_equal "x", ast.left.name
+    assert_instance_of VariableNode, ast.right
+    assert_equal "y", ast.right.name
+  end
+
+  def test_arithmetic_precedence_in_comparison
+    # 2 + 3 < 4 * 5 should parse as (2 + 3) < (4 * 5)
+    lexer = Lexer.new("2 + 3 < 4 * 5")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    assert_instance_of ComparisonNode, ast
+    assert_equal "<", ast.operator
+    
+    # Left side: 2 + 3
+    assert_instance_of BinaryOpNode, ast.left
+    assert_equal "+", ast.left.operator
+    assert_equal 2, ast.left.left.value
+    assert_equal 3, ast.left.right.value
+    
+    # Right side: 4 * 5
+    assert_instance_of BinaryOpNode, ast.right
+    assert_equal "*", ast.right.operator
+    assert_equal 4, ast.right.left.value
+    assert_equal 5, ast.right.right.value
+  end
+
+  # Error handling tests for control flow
+  def test_parse_if_missing_then
+    lexer = Lexer.new("if x == 5 y = 10 end")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    
+    assert_raises(RuntimeError) do
+      parser.parse
+    end
+  end
+
+  def test_parse_if_missing_end
+    lexer = Lexer.new("if x == 5 then y = 10")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    
+    assert_raises(RuntimeError) do
+      parser.parse
+    end
+  end
+
+  def test_parse_while_missing_do
+    lexer = Lexer.new("while x > 0 x = x - 1 end")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    
+    assert_raises(RuntimeError) do
+      parser.parse
+    end
+  end
+
+  def test_parse_while_missing_end
+    lexer = Lexer.new("while x > 0 do x = x - 1")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    
+    assert_raises(RuntimeError) do
+      parser.parse
+    end
+  end
+
+  # Tests to ensure existing functionality still works
+  def test_backward_compatibility_arithmetic
+    lexer = Lexer.new("2 + 3 * 4")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    # Should still parse as 2 + (3 * 4) without comparison or control flow
+    assert_instance_of BinaryOpNode, ast
+    assert_equal '+', ast.operator
+    assert_instance_of NumberNode, ast.left
+    assert_equal 2, ast.left.value
+    assert_instance_of BinaryOpNode, ast.right
+    assert_equal '*', ast.right.operator
+    assert_equal 3, ast.right.left.value
+    assert_equal 4, ast.right.right.value
+  end
+
+  def test_backward_compatibility_assignment
+    lexer = Lexer.new("result = x + y")
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    # Should still parse as assignment
+    assert_instance_of AssignmentNode, ast
+    assert_equal "result", ast.name
+    assert_instance_of BinaryOpNode, ast.expression
+    assert_equal '+', ast.expression.operator
+    assert_instance_of VariableNode, ast.expression.left
+    assert_equal "x", ast.expression.left.name
+    assert_instance_of VariableNode, ast.expression.right
+    assert_equal "y", ast.expression.right.name
+  end
 end

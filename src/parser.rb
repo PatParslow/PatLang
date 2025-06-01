@@ -30,11 +30,45 @@ class Parser
     end
   end
 
-  # Grammar: expression → term (('+' | '-') term)*
+  # Grammar: expression → comparison
   def expression
-    node = term
+    comparison
+  end
 
-    while @current_token && [@tokens.first.class::TOKEN_TYPES[:PLUS], @tokens.first.class::TOKEN_TYPES[:MINUS]].include?(@current_token.type)
+  # Grammar: comparison → term (('==' | '!=' | '<' | '>' | '<=' | '>=') term)*
+  def comparison
+    node = term_addition
+
+    while @current_token && [Token::TOKEN_TYPES[:EQUAL], Token::TOKEN_TYPES[:NOT_EQUAL],
+                            Token::TOKEN_TYPES[:LESS_THAN], Token::TOKEN_TYPES[:GREATER_THAN],
+                            Token::TOKEN_TYPES[:LESS_EQUAL], Token::TOKEN_TYPES[:GREATER_EQUAL]].include?(@current_token.type)
+      token = @current_token
+      case token.type
+      when Token::TOKEN_TYPES[:EQUAL]
+        eat(Token::TOKEN_TYPES[:EQUAL])
+      when Token::TOKEN_TYPES[:NOT_EQUAL]
+        eat(Token::TOKEN_TYPES[:NOT_EQUAL])
+      when Token::TOKEN_TYPES[:LESS_THAN]
+        eat(Token::TOKEN_TYPES[:LESS_THAN])
+      when Token::TOKEN_TYPES[:GREATER_THAN]
+        eat(Token::TOKEN_TYPES[:GREATER_THAN])
+      when Token::TOKEN_TYPES[:LESS_EQUAL]
+        eat(Token::TOKEN_TYPES[:LESS_EQUAL])
+      when Token::TOKEN_TYPES[:GREATER_EQUAL]
+        eat(Token::TOKEN_TYPES[:GREATER_EQUAL])
+      end
+
+      node = ComparisonNode.new(node, token.value, term_addition)
+    end
+
+    node
+  end
+
+  # Grammar: term_addition → term_multiplication (('+' | '-') term_multiplication)*
+  def term_addition
+    node = term_multiplication
+
+    while @current_token && [Token::TOKEN_TYPES[:PLUS], Token::TOKEN_TYPES[:MINUS]].include?(@current_token.type)
       token = @current_token
       if token.type == Token::TOKEN_TYPES[:PLUS]
         eat(Token::TOKEN_TYPES[:PLUS])
@@ -42,14 +76,14 @@ class Parser
         eat(Token::TOKEN_TYPES[:MINUS])
       end
 
-      node = BinaryOpNode.new(node, token.value, term)
+      node = BinaryOpNode.new(node, token.value, term_multiplication)
     end
 
     node
   end
 
-  # Grammar: term → factor (('*' | '/') factor)*
-  def term
+  # Grammar: term_multiplication → factor (('*' | '/') factor)*
+  def term_multiplication
     node = factor
 
     while @current_token && [Token::TOKEN_TYPES[:MULTIPLY], Token::TOKEN_TYPES[:DIVIDE]].include?(@current_token.type)
@@ -66,7 +100,7 @@ class Parser
     node
   end
 
-  # Grammar: factor → NUMBER | IDENTIFIER | '(' expression ')'
+  # Grammar: factor → NUMBER | IDENTIFIER | boolean | '(' expression ')' | '-' factor
   def factor
     token = @current_token
 
@@ -76,6 +110,12 @@ class Parser
     elsif token.type == Token::TOKEN_TYPES[:IDENTIFIER]
       eat(Token::TOKEN_TYPES[:IDENTIFIER])
       return VariableNode.new(token.value)
+    elsif token.type == Token::TOKEN_TYPES[:TRUE] || token.type == Token::TOKEN_TYPES[:FALSE]
+      return parse_boolean
+    elsif token.type == Token::TOKEN_TYPES[:MINUS]
+      eat(Token::TOKEN_TYPES[:MINUS])
+      # Handle unary minus by creating a binary operation with 0 - factor
+      return BinaryOpNode.new(NumberNode.new(0), '-', factor)
     elsif token.type == Token::TOKEN_TYPES[:LPAREN]
       eat(Token::TOKEN_TYPES[:LPAREN])
       node = expression
@@ -83,6 +123,21 @@ class Parser
       return node
     else
       error("Unexpected token in factor")
+    end
+  end
+
+  # Grammar: boolean → 'true' | 'false'
+  def parse_boolean
+    token = @current_token
+    
+    if token.type == Token::TOKEN_TYPES[:TRUE]
+      eat(Token::TOKEN_TYPES[:TRUE])
+      return BooleanNode.new(true)
+    elsif token.type == Token::TOKEN_TYPES[:FALSE]
+      eat(Token::TOKEN_TYPES[:FALSE])
+      return BooleanNode.new(false)
+    else
+      error("Expected boolean literal")
     end
   end
 
@@ -114,18 +169,82 @@ class Parser
       error("Empty expression")
     end
 
-    # Check if this is an assignment or an expression
-    if is_assignment?
-      node = assignment
-    else
-      node = expression
-    end
+    # Parse program as sequence of statements
+    node = parse_program
     
     # Ensure we've consumed all tokens except EOF
     if @current_token && @current_token.type != Token::TOKEN_TYPES[:EOF]
-      error("Unexpected token after expression")
+      error("Unexpected token after program")
     end
 
     node
+  end
+
+  # Grammar: program → statement | block
+  def parse_program
+    # Check for control flow statements first
+    if @current_token&.type == Token::TOKEN_TYPES[:IF]
+      return parse_if_statement
+    elsif @current_token&.type == Token::TOKEN_TYPES[:WHILE]
+      return parse_while_statement
+    elsif is_assignment?
+      return assignment
+    else
+      return expression
+    end
+  end
+
+  # Grammar: if_statement → 'if' expression 'then' block ('else' block)? 'end'
+  def parse_if_statement
+    eat(Token::TOKEN_TYPES[:IF])
+    condition = expression
+    eat(Token::TOKEN_TYPES[:THEN])
+    then_body = parse_block
+    
+    else_body = nil
+    if @current_token&.type == Token::TOKEN_TYPES[:ELSE]
+      eat(Token::TOKEN_TYPES[:ELSE])
+      else_body = parse_block
+    end
+    
+    eat(Token::TOKEN_TYPES[:END])
+    IfNode.new(condition, then_body, else_body)
+  end
+
+  # Grammar: while_statement → 'while' expression 'do' block 'end'
+  def parse_while_statement
+    eat(Token::TOKEN_TYPES[:WHILE])
+    condition = expression
+    eat(Token::TOKEN_TYPES[:DO])
+    body = parse_block
+    eat(Token::TOKEN_TYPES[:END])
+    
+    WhileNode.new(condition, body)
+  end
+
+  # Grammar: block → statement*
+  def parse_block
+    statements = []
+    
+    # Parse statements until we hit a block terminator
+    while @current_token &&
+          ![Token::TOKEN_TYPES[:END], Token::TOKEN_TYPES[:ELSE], Token::TOKEN_TYPES[:EOF]].include?(@current_token.type)
+      
+      if @current_token.type == Token::TOKEN_TYPES[:IF]
+        statements << parse_if_statement
+      elsif @current_token.type == Token::TOKEN_TYPES[:WHILE]
+        statements << parse_while_statement
+      elsif is_assignment?
+        statements << assignment
+      else
+        statements << expression
+      end
+      
+      # Skip optional semicolons or newlines (not implemented in lexer yet, just continue)
+      break if @current_token.nil? ||
+               [Token::TOKEN_TYPES[:END], Token::TOKEN_TYPES[:ELSE], Token::TOKEN_TYPES[:EOF]].include?(@current_token.type)
+    end
+    
+    BlockNode.new(statements)
   end
 end
