@@ -163,8 +163,9 @@ class TestStringOperations < Minitest::Test
   end
 
   def test_method_call_non_string_error
-    assert_raises(RuntimeError, "Method calls are only supported for strings") do
-      evaluate_expression('123.length')
+    # Numbers now support length method, so test with an invalid method instead
+    assert_raises(RuntimeError, "Unknown number method") do
+      evaluate_expression('123.invalid_method')
     end
   end
 

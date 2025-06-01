@@ -171,7 +171,7 @@ class TestExtendedStringMethods < Minitest::Test
   def test_methods_with_variables
     code = <<~PATLANG
       text = "Hello World"
-      part = text.substring(0, 5)
+      part = text.substring(1, 5)
       part.lowercase()
     PATLANG
     assert_equal "hello", evaluate_program(code)
@@ -187,7 +187,7 @@ class TestExtendedStringMethods < Minitest::Test
   # Chained method calls
   def test_chained_methods
     assert_equal "HELLO", evaluate_expression('"  hello  ".trim().uppercase()')
-    assert_equal "wor", evaluate_expression('"Hello World".lowercase().substring(6, 3)')
+    assert_equal "wor", evaluate_expression('"Hello World".lowercase().substring(7, 3)')
     assert_equal true, evaluate_expression('"TESTING".lowercase().starts_with("test")')
   end
 
@@ -196,7 +196,7 @@ class TestExtendedStringMethods < Minitest::Test
     code = <<~PATLANG
       filename = "document.txt"
       if filename.ends_with(".txt") then
-        filename.substring(0, filename.length - 4).uppercase()
+        filename.substring(1, filename.length - 4).uppercase()
       else
         "Unknown file type"
       end
@@ -218,9 +218,9 @@ class TestExtendedStringMethods < Minitest::Test
   def test_string_methods_in_loops
     code = <<~PATLANG
       words = "hello world test"
-      i = 0
+      i = 1
       result = ""
-      while i < words.length do
+      while i <= words.length do
         char = words[i]
         if char != " " then
           result = result + char.uppercase()

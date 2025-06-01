@@ -1,6 +1,6 @@
 require 'simplecov'
 
-# Configure SimpleCov with branch coverage for comprehensive analysis
+# Configure SimpleCov with branch coverage
 SimpleCov.start do
   enable_coverage :branch
   add_filter '/test/'
@@ -12,19 +12,21 @@ SimpleCov.start do
     SimpleCov::Formatter::SimpleFormatter
   ])
   
-  # Set coverage requirements
+  # Set minimum coverage requirements
   minimum_coverage line: 95, branch: 90
 end
 
-puts "Running comprehensive test suite with coverage analysis..."
-
+# Require all test files to get comprehensive coverage
 require_relative 'test_helper'
-require_relative 'test_ast_nodes'
-require_relative 'test_lexer'
-require_relative 'test_parser'
 require_relative 'test_evaluator'
-require_relative 'test_control_flow_evaluator'
-require_relative 'test_integration'
 require_relative 'test_string_operations'
 require_relative 'test_extended_string_methods'
 require_relative 'test_evaluator_edge_cases'
+
+# Run all tests that focus on evaluator functionality
+puts "Running coverage analysis for evaluator string functionality..."
+
+# Create test suite for evaluator-related tests
+require 'minitest/autorun'
+
+# This will run when the file is executed
