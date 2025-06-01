@@ -1,0 +1,6 @@
+require_relative 'test_helper'
+require_relative 'test_ast_nodes'
+require_relative 'test_lexer'
+require_relative 'test_parser'
+require_relative 'test_evaluator'
+require_relative 'test_integration'
