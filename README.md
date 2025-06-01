@@ -13,25 +13,28 @@ Patlang introduces a unique approach to programming by combining:
 
 ## Current Development Status
 
-**Latest Release**: v0.3.0 Control Flow Structures (Production Ready)
-**Current Phase**: v0.4.0 String Operations (Next Priority)
+**Latest Release**: v0.4.0 String Operations (Production Ready)
+**Current Phase**: v0.5.0 Functions (Next Priority)
 **Strategic Goal**: Self-hosting capability - implementing Patlang in Patlang
 
-### ✅ v0.3.0 Complete - Control Flow Structures
-- ✅ **All Phases Complete**: Foundation, Lexer, Parser, Evaluator, and Testing
-- ✅ **Boolean values and variables** (`true`, `false`)
-- ✅ **Comparison operators** (`==`, `!=`, `<`, `>`, `<=`, `>=`)
-- ✅ **Conditional statements** (`if`/`then`/`else`/`end`)
-- ✅ **While loops** (`while`/`do`/`end`)
-- ✅ **Block statements** with proper sequencing
+### ✅ v0.4.0 Complete - String Operations
+- ✅ **All Phases Complete**: Critical Blocker #2 RESOLVED
+- ✅ **String literals with escape sequences** (`"Hello World"`, `"Line 1\nLine 2"`)
+- ✅ **String concatenation** (`"Hello" + " " + "World"`)
+- ✅ **String comparison operators** (`==`, `!=`, `<`, `>`, `<=`, `>=`)
+- ✅ **Character indexing** (`string[1]`, `string[-1]` for last character)
+- ✅ **String methods** (`.length`, `.uppercase()`, `.lowercase()`, `.trim()`, `.substring()`)
+- ✅ **Advanced string methods** (`.starts_with()`, `.ends_with()`)
+- ✅ **Method chaining** (`text.trim().uppercase().substring(1, 5)`)
+- ✅ **File execution support** (`ruby src/patlang.rb examples/string_demo.pat`)
 
-### 🎯 v0.4.0 Next - String Operations
-**Strategic Priority**: Foundation for text processing before functions
+### 🎯 v0.5.0 Next - Functions (Critical Blocker #3)
+**Strategic Priority**: Essential for modular code organization
 **Target Features**:
-- String literals with escape sequences
-- String concatenation and interpolation
-- String comparison and manipulation operations
-- Character access and substring operations
+- Function definition with parameters
+- Return values and local scope
+- Function calls and recursion
+- Parameter passing and argument validation
 
 For detailed development tracking, see:
 - [`docs/development/v0.3.0-control-flow-plan.md`](docs/development/v0.3.0-control-flow-plan.md) - Complete implementation plan
@@ -99,31 +102,52 @@ The current interpreter supports:
 
 ```bash
 # Run the interactive REPL
-ruby -Isrc src/patlang.rb
+ruby src/patlang.rb --repl
 
-# Try these expressions:
+# Run a file
+ruby src/patlang.rb examples/string_demo.pat
+
+# Try these expressions in REPL:
 42                    # => 42
 3.14 + 2.86          # => 6.0
 2 + 3 * 4            # => 14 (operator precedence)
 (2 + 3) * 4          # => 20 (parentheses)
-10 - 5 / 2           # => 7.5 (mixed operations)
 
 # Variable assignment and usage:
 x = 42               # => 42
 y = 3.14             # => 3.14
 x + y * 2            # => 48.28
-result = (x + y) / 2 # => 22.57
-result               # => 22.57
+
+# String operations:
+name = "Patlang"                    # => "Patlang"
+version = "0.4.0"                   # => "0.4.0"
+message = "Welcome to " + name      # => "Welcome to Patlang"
+length = message.length             # => 17
+first_char = name[1]                # => "P"
+upper_name = name.uppercase()       # => "PATLANG"
+formatted = name.trim().lowercase() # => "patlang"
+
+# Control flow with strings:
+if name.starts_with("Pat") then
+  "Language name starts with Pat!"
+else
+  "Different language"
+end
 ```
 
 **Supported Features:**
 - Integer and decimal number literals
 - Arithmetic operators: `+`, `-`, `*`, `/`
-- Variable assignment and lookup
-- Variable persistence in REPL sessions
+- String literals with escape sequences
+- String concatenation and comparison
+- String methods: `.length`, `.uppercase()`, `.lowercase()`, `.trim()`, `.substring()`, `.starts_with()`, `.ends_with()`
+- Character indexing with `[]` operator (1-based, negative indices supported)
+- Variable assignment and lookup with persistence
+- Boolean values and comparison operators
+- Control flow: `if`/`then`/`else`/`end`, `while`/`do`/`end`
 - Parentheses for grouping expressions
 - Proper operator precedence and associativity
-- Comprehensive error handling
+- Comprehensive error handling and bounds checking
 
 ## Getting Involved
 
