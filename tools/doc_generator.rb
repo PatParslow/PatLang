@@ -136,7 +136,7 @@ class PatLangDocGenerator
     highlighted.gsub!(/#(.*)$/, '<span class="comment">#\1</span>')
     
     # Operators
-    highlighted.gsub!(/([+\-*/=<>!]+)/, '<span class="operator">\1</span>')
+    highlighted.gsub!(/([+\-*\/=<>!]+)/, '<span class="operator">\1</span>')
     
     highlighted
   end
