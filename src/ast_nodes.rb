@@ -135,3 +135,45 @@ class BlockNode < ASTNode
     "BlockNode([#{@statements.map(&:to_s).join(', ')}])"
   end
 end
+
+# Node representing a string literal
+class StringNode < ASTNode
+  attr_reader :value
+
+  def initialize(value)
+    @value = value
+  end
+
+  def to_s
+    "StringNode(#{@value.inspect})"
+  end
+end
+
+# Node representing index access (e.g., string[index])
+class IndexAccessNode < ASTNode
+  attr_reader :object, :index
+
+  def initialize(object, index)
+    @object = object
+    @index = index
+  end
+
+  def to_s
+    "IndexAccessNode(#{@object}, #{@index})"
+  end
+end
+
+# Node representing method call (e.g., string.length)
+class MethodCallNode < ASTNode
+  attr_reader :object, :method_name, :arguments
+
+  def initialize(object, method_name, arguments = [])
+    @object = object
+    @method_name = method_name
+    @arguments = arguments
+  end
+
+  def to_s
+    "MethodCallNode(#{@object}, #{@method_name}, #{@arguments})"
+  end
+end

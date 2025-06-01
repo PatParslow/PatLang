@@ -100,8 +100,55 @@ class Parser
     node
   end
 
-  # Grammar: factor → NUMBER | IDENTIFIER | boolean | '(' expression ')' | '-' factor
+  # Grammar: factor → postfix
   def factor
+    postfix
+  end
+
+  # Grammar: postfix → primary ('[' expression ']' | '.' IDENTIFIER)*
+  def postfix
+    node = primary
+
+    while @current_token && (@current_token.type == Token::TOKEN_TYPES[:LBRACKET] || @current_token.type == Token::TOKEN_TYPES[:DOT])
+      if @current_token.type == Token::TOKEN_TYPES[:LBRACKET]
+        eat(Token::TOKEN_TYPES[:LBRACKET])
+        index = expression
+        eat(Token::TOKEN_TYPES[:RBRACKET])
+        node = IndexAccessNode.new(node, index)
+      elsif @current_token.type == Token::TOKEN_TYPES[:DOT]
+        eat(Token::TOKEN_TYPES[:DOT])
+        if @current_token.type != Token::TOKEN_TYPES[:IDENTIFIER]
+          error("Expected method name after '.'")
+        end
+        method_name = @current_token.value
+        eat(Token::TOKEN_TYPES[:IDENTIFIER])
+        
+        # Parse method arguments if parentheses are present
+        arguments = []
+        if @current_token && @current_token.type == Token::TOKEN_TYPES[:LPAREN]
+          eat(Token::TOKEN_TYPES[:LPAREN])
+          
+          # Parse argument list
+          unless @current_token && @current_token.type == Token::TOKEN_TYPES[:RPAREN]
+            arguments << expression
+            while @current_token && @current_token.type == Token::TOKEN_TYPES[:COMMA]
+              eat(Token::TOKEN_TYPES[:COMMA])
+              arguments << expression
+            end
+          end
+          
+          eat(Token::TOKEN_TYPES[:RPAREN])
+        end
+        
+        node = MethodCallNode.new(node, method_name, arguments)
+      end
+    end
+
+    node
+  end
+
+  # Grammar: primary → NUMBER | IDENTIFIER | STRING | boolean | '(' expression ')' | '-' factor
+  def primary
     token = @current_token
 
     if token.type == Token::TOKEN_TYPES[:NUMBER]
@@ -110,6 +157,9 @@ class Parser
     elsif token.type == Token::TOKEN_TYPES[:IDENTIFIER]
       eat(Token::TOKEN_TYPES[:IDENTIFIER])
       return VariableNode.new(token.value)
+    elsif token.type == Token::TOKEN_TYPES[:STRING]
+      eat(Token::TOKEN_TYPES[:STRING])
+      return StringNode.new(token.value)
     elsif token.type == Token::TOKEN_TYPES[:TRUE] || token.type == Token::TOKEN_TYPES[:FALSE]
       return parse_boolean
     elsif token.type == Token::TOKEN_TYPES[:MINUS]
@@ -180,17 +230,31 @@ class Parser
     node
   end
 
-  # Grammar: program → statement | block
+  # Grammar: program → statement*
   def parse_program
-    # Check for control flow statements first
-    if @current_token&.type == Token::TOKEN_TYPES[:IF]
-      return parse_if_statement
-    elsif @current_token&.type == Token::TOKEN_TYPES[:WHILE]
-      return parse_while_statement
-    elsif is_assignment?
-      return assignment
+    statements = []
+    
+    # Parse statements until we hit EOF
+    while @current_token && @current_token.type != Token::TOKEN_TYPES[:EOF]
+      if @current_token.type == Token::TOKEN_TYPES[:IF]
+        statements << parse_if_statement
+      elsif @current_token.type == Token::TOKEN_TYPES[:WHILE]
+        statements << parse_while_statement
+      elsif is_assignment?
+        statements << assignment
+      else
+        statements << expression
+      end
+      
+      # Break if we're at EOF or if we can't parse any more statements
+      break if @current_token.nil? || @current_token.type == Token::TOKEN_TYPES[:EOF]
+    end
+    
+    # If only one statement, return it directly; otherwise return a block
+    if statements.length == 1
+      statements[0]
     else
-      return expression
+      BlockNode.new(statements)
     end
   end
 

@@ -378,9 +378,12 @@ class TestParser < Minitest::Test
     tokens = lexer.tokenize
     parser = Parser.new(tokens)
     
-    assert_raises(RuntimeError) do
-      parser.parse
-    end
+    # This should parse as two separate statements: a variable reference and a number
+    result = parser.parse
+    assert_instance_of(BlockNode, result)
+    assert_equal(2, result.statements.length)
+    assert_instance_of(VariableNode, result.statements[0])
+    assert_instance_of(NumberNode, result.statements[1])
   end
   
   def test_parse_assignment_missing_expression

@@ -28,6 +28,12 @@ class Token
     END: :END,
     WHILE: :WHILE,
     DO: :DO,
+    # String operations
+    STRING: :STRING,
+    DOT: :DOT,
+    LBRACKET: :LBRACKET,
+    RBRACKET: :RBRACKET,
+    COMMA: :COMMA,
     EOF: :EOF
   }.freeze
 

@@ -27,7 +27,7 @@ class Lexer
     result = ''
     has_decimal = false
     
-    while @current_char && (@current_char.match(/\d/) || (@current_char == '.' && !has_decimal))
+    while @current_char && (@current_char.match(/\d/) || (@current_char == '.' && !has_decimal && peek_char&.match(/\d/)))
       if @current_char == '.'
         has_decimal = true
       end
@@ -103,6 +103,20 @@ class Lexer
           advance
           return Token.new(Token::TOKEN_TYPES[:GREATER_THAN], '>', @position - 1)
         end
+      when '"'
+        return tokenize_string
+      when '.'
+        advance
+        return Token.new(Token::TOKEN_TYPES[:DOT], '.', @position - 1)
+      when '['
+        advance
+        return Token.new(Token::TOKEN_TYPES[:LBRACKET], '[', @position - 1)
+      when ']'
+        advance
+        return Token.new(Token::TOKEN_TYPES[:RBRACKET], ']', @position - 1)
+      when ','
+        advance
+        return Token.new(Token::TOKEN_TYPES[:COMMA], ',', @position - 1)
       else
         if alpha?(@current_char)
           return read_identifier
@@ -175,5 +189,47 @@ class Lexer
                  end
     
     Token.new(token_type, result, start_position)
+  end
+
+  def tokenize_string
+    start_position = @position
+    advance  # Skip opening quote
+    value = ""
+    
+    while @current_char && @current_char != '"'
+      if @current_char == '\\'
+        # Handle escape sequences
+        advance
+        if @current_char
+          case @current_char
+          when 'n'
+            value += "\n"
+          when 't'
+            value += "\t"
+          when 'r'
+            value += "\r"
+          when '\\'
+            value += "\\"
+          when '"'
+            value += '"'
+          else
+            value += @current_char
+          end
+          advance
+        else
+          raise "Incomplete escape sequence at end of string"
+        end
+      else
+        value += @current_char
+        advance
+      end
+    end
+    
+    if @current_char != '"'
+      raise "Unterminated string literal starting at position #{start_position}"
+    end
+    
+    advance  # Skip closing quote
+    Token.new(Token::TOKEN_TYPES[:STRING], value, start_position)
   end
 end

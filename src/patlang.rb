@@ -196,21 +196,51 @@ class Patlang
       raise e
     end
   end
+
+  def self.run_file(filename)
+    unless File.exist?(filename)
+      puts "Error: File '#{filename}' not found."
+      exit 1
+    end
+    
+    begin
+      content = File.read(filename)
+      puts "Running #{filename}..."
+      puts "=" * 40
+      
+      evaluator = Evaluator.new
+      result = process_expression_with_evaluator(content, evaluator, show_details: false)
+      puts "Final result: #{result}" if result
+    rescue => e
+      puts "Error executing #{filename}: #{e.message}"
+      exit 1
+    end
+  end
 end
 
 # Run demo if this file is executed directly
 if __FILE__ == $0
-  if ARGV.include?('--demo') || ARGV.empty?
+  if ARGV.include?('--demo')
     Patlang.demo
+  elsif ARGV.include?('--repl')
+    Patlang.repl
   elsif ARGV.include?('--help') || ARGV.include?('-h')
-    puts "Patlang v0.2.0 - Variables and Assignment"
+    puts "Patlang v0.4.0 - String Operations"
     puts "Usage:"
-    puts "  ruby #{$0}         # Run demo mode"
-    puts "  ruby #{$0} --demo  # Run demo mode"
-    puts "  ruby #{$0} --help  # Show this help"
+    puts "  ruby #{$0}              # Run demo mode"
+    puts "  ruby #{$0} --demo       # Run demo mode"
+    puts "  ruby #{$0} --repl       # Run REPL mode"
+    puts "  ruby #{$0} <filename>   # Execute a .pat file"
+    puts "  ruby #{$0} --help       # Show this help"
     puts ""
-    puts "Demo mode shows lexer, parser, and evaluator output for sample expressions,"
-    puts "then enters an interactive REPL for testing variable assignments and arithmetic."
+    puts "Demo mode shows lexer, parser, and evaluator output for sample expressions."
+    puts "REPL mode provides an interactive shell for testing expressions."
+    puts "File mode executes Patlang programs from .pat files."
+  elsif ARGV.length == 1 && !ARGV[0].start_with?('--')
+    # Single argument that doesn't start with -- is treated as a filename
+    Patlang.run_file(ARGV[0])
+  elsif ARGV.empty?
+    Patlang.demo
   else
     puts "Unknown argument: #{ARGV.join(' ')}"
     puts "Use --help for usage information."
