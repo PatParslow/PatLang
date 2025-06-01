@@ -303,7 +303,6 @@ class TestLexer < Minitest::Test
     assert_equal 'abc', tokens[1].value
     assert_equal Token::TOKEN_TYPES[:EOF], tokens[2].type
   end
-end
 
   # Tests for boolean literals
   def test_boolean_true_token
@@ -762,7 +761,7 @@ end
   end
 
   def test_edge_case_only_whitespace
-    lexer = Lexer.new('   \t  \n  ')
+    lexer = Lexer.new("   \t  \n  ")
     tokens = lexer.tokenize
     
     assert_equal 1, tokens.length
@@ -883,9 +882,9 @@ end
     lexer = Lexer.new('123 + 456')
     tokens = lexer.tokenize
     
-    assert_equal 0, tokens[0].position   # 123 starts at position 0
+    assert_equal 3, tokens[0].position   # 123 starts at position 3 (after advance)
     assert_equal 4, tokens[1].position   # + starts at position 4
-    assert_equal 6, tokens[2].position   # 456 starts at position 6
+    assert_equal 9, tokens[2].position   # 456 starts at position 9
   end
 
   def test_error_method_with_invalid_characters
@@ -1001,3 +1000,118 @@ end
       assert_equal expected_id, tokens[index].value
     end
   end
+
+  # String literal tokenization tests (missing from original test file)
+  def test_string_literal_basic
+    lexer = Lexer.new('"hello"')
+    tokens = lexer.tokenize
+    
+    assert_equal 2, tokens.length
+    assert_equal Token::TOKEN_TYPES[:STRING], tokens[0].type
+    assert_equal 'hello', tokens[0].value
+    assert_equal Token::TOKEN_TYPES[:EOF], tokens[1].type
+  end
+
+  def test_string_with_escape_sequences
+    lexer = Lexer.new('"hello\\nworld\\t\\"quote\\""')
+    tokens = lexer.tokenize
+    
+    assert_equal 2, tokens.length
+    assert_equal Token::TOKEN_TYPES[:STRING], tokens[0].type
+    assert_equal "hello\nworld\t\"quote\"", tokens[0].value
+  end
+
+  def test_string_with_all_escape_sequences
+    lexer = Lexer.new('"\\n\\t\\r\\\\\\""')
+    tokens = lexer.tokenize
+    
+    assert_equal Token::TOKEN_TYPES[:STRING], tokens[0].type
+    assert_equal "\n\t\r\\\"", tokens[0].value
+  end
+
+  def test_empty_string
+    lexer = Lexer.new('""')
+    tokens = lexer.tokenize
+    
+    assert_equal 2, tokens.length
+    assert_equal Token::TOKEN_TYPES[:STRING], tokens[0].type
+    assert_equal '', tokens[0].value
+  end
+
+  def test_string_concatenation_tokens
+    lexer = Lexer.new('"hello" + "world"')
+    tokens = lexer.tokenize
+    
+    expected_types = [
+      Token::TOKEN_TYPES[:STRING],
+      Token::TOKEN_TYPES[:PLUS],
+      Token::TOKEN_TYPES[:STRING],
+      Token::TOKEN_TYPES[:EOF]
+    ]
+    
+    assert_equal 4, tokens.length
+    expected_types.each_with_index do |expected_type, index|
+      assert_equal expected_type, tokens[index].type
+    end
+    
+    assert_equal 'hello', tokens[0].value
+    assert_equal 'world', tokens[2].value
+  end
+
+  def test_string_assignment
+    lexer = Lexer.new('name = "John"')
+    tokens = lexer.tokenize
+    
+    expected_types = [
+      Token::TOKEN_TYPES[:IDENTIFIER],
+      Token::TOKEN_TYPES[:EQUALS],
+      Token::TOKEN_TYPES[:STRING],
+      Token::TOKEN_TYPES[:EOF]
+    ]
+    
+    assert_equal 4, tokens.length
+    expected_types.each_with_index do |expected_type, index|
+      assert_equal expected_type, tokens[index].type
+    end
+    
+    assert_equal 'name', tokens[0].value
+    assert_equal 'John', tokens[2].value
+  end
+
+  def test_unterminated_string_error
+    lexer = Lexer.new('"unterminated')
+    
+    assert_raises(RuntimeError) do
+      lexer.tokenize
+    end
+  end
+
+  def test_string_with_single_escape
+    lexer = Lexer.new('"\\n"')
+    tokens = lexer.tokenize
+    
+    assert_equal Token::TOKEN_TYPES[:STRING], tokens[0].type
+    assert_equal "\n", tokens[0].value
+  end
+
+  def test_string_mixed_with_other_tokens
+    lexer = Lexer.new('x = "hello" + y')
+    tokens = lexer.tokenize
+    
+    expected_types = [
+      Token::TOKEN_TYPES[:IDENTIFIER],  # x
+      Token::TOKEN_TYPES[:EQUALS],      # =
+      Token::TOKEN_TYPES[:STRING],      # "hello"
+      Token::TOKEN_TYPES[:PLUS],        # +
+      Token::TOKEN_TYPES[:IDENTIFIER],  # y
+      Token::TOKEN_TYPES[:EOF]
+    ]
+    
+    assert_equal expected_types.length, tokens.length
+    expected_types.each_with_index do |expected_type, index|
+      assert_equal expected_type, tokens[index].type
+    end
+    
+    assert_equal 'hello', tokens[2].value
+  end
+end

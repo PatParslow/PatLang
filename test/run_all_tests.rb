@@ -18,13 +18,29 @@ end
 
 puts "Running comprehensive test suite with coverage analysis..."
 
+# Always load test_helper first
 require_relative 'test_helper'
-require_relative 'test_ast_nodes'
-require_relative 'test_lexer'
-require_relative 'test_parser'
-require_relative 'test_evaluator'
-require_relative 'test_control_flow_evaluator'
-require_relative 'test_integration'
-require_relative 'test_string_operations'
-require_relative 'test_extended_string_methods'
-require_relative 'test_evaluator_edge_cases'
+
+# Dynamically discover and load all test files
+test_dir = File.dirname(__FILE__)
+test_files = Dir.glob(File.join(test_dir, 'test_*.rb')).sort
+
+# Filter out helper files and non-test files
+excluded_files = [
+  'test_helper.rb',
+  'run_all_tests.rb'
+]
+
+test_files_to_load = test_files.select do |file|
+  basename = File.basename(file)
+  !excluded_files.include?(basename) && basename.start_with?('test_')
+end
+
+puts "Discovered #{test_files_to_load.length} test files:"
+test_files_to_load.each do |file|
+  basename = File.basename(file, '.rb')
+  puts "  - #{basename}"
+  require_relative basename
+end
+
+puts "\nAll test files loaded successfully!"
