@@ -4,6 +4,10 @@ require_relative 'ast_nodes'
 class Evaluator
   def initialize
     @variables = {}
+    @functions = {}
+    @scope_stack = []
+    @return_value = nil
+    @returned = false
   end
 
   def evaluate(node)
@@ -32,6 +36,12 @@ class Evaluator
       visit_index_access_node(node)
     when MethodCallNode
       visit_method_call_node(node)
+    when FunctionDefinitionNode
+      visit_function_definition_node(node)
+    when FunctionCallNode
+      visit_function_call_node(node)
+    when ReturnNode
+      visit_return_node(node)
     else
       raise "Unknown node type: #{node.class}"
     end
@@ -71,15 +81,12 @@ class Evaluator
 
   def visit_assignment_node(node)
     value = evaluate(node.expression)
-    @variables[node.name] = value
+    set_variable(node.name, value)
     value
   end
 
   def visit_variable_node(node)
-    unless @variables.key?(node.name)
-      raise "Undefined variable: #{node.name}"
-    end
-    @variables[node.name]
+    get_variable(node.name)
   end
 
   def visit_boolean_node(node)
@@ -146,6 +153,8 @@ class Evaluator
     result = nil
     node.statements.each do |statement|
       result = evaluate(statement)
+      # Early return if we hit a return statement
+      break if @returned
     end
     result
   end
@@ -299,4 +308,122 @@ class Evaluator
       raise "Unknown number method: #{node.method_name}"
     end
   end
+
+  # Function evaluation methods
+
+  def visit_function_definition_node(node)
+    # Check for function overloading validation
+    if @functions.key?(node.name)
+      existing_params = @functions[node.name][:parameters].length
+      new_params = node.parameters.length
+      if existing_params == new_params
+        raise "Function '#{node.name}' with #{new_params} parameters already exists"
+      end
+    end
+
+    # Store function definition in function registry
+    function_key = "#{node.name}_#{node.parameters.length}"
+    @functions[function_key] = {
+      name: node.name,
+      parameters: node.parameters,
+      body: node.body,
+      return_type: node.return_type
+    }
+
+    # Also store by just name for zero or single parameter lookups
+    @functions[node.name] = @functions[function_key] if node.parameters.length <= 1
+
+    # Return the function name for assignment purposes
+    node.name
+  end
+
+  def visit_function_call_node(node)
+    # Look up function by name and parameter count
+    function_key = "#{node.function_name}_#{node.arguments.length}"
+    function_def = @functions[function_key] || @functions[node.function_name]
+
+    # If not found by exact match, search for any function with this name
+    unless function_def
+      matching_functions = @functions.select { |key, _| key.to_s.start_with?("#{node.function_name}_") }
+      if matching_functions.any?
+        # Take the first matching function to get parameter count for error message
+        function_def = matching_functions.values.first
+      end
+    end
+
+    unless function_def
+      raise "Undefined function: #{node.function_name}"
+    end
+
+    # Parameter count validation
+    expected_params = function_def[:parameters].length
+    actual_args = node.arguments.length
+
+    if actual_args != expected_params
+      raise "Function '#{node.function_name}' expects #{expected_params} arguments, got #{actual_args}"
+    end
+
+    # Create new scope for function execution
+    push_scope
+
+    # Bind parameters to arguments
+    function_def[:parameters].each_with_index do |param, index|
+      arg_value = evaluate(node.arguments[index])
+      set_variable(param.name, arg_value)
+    end
+
+    # Execute function body
+    @returned = false
+    @return_value = nil
+    
+    result = evaluate(function_def[:body])
+    
+    # Handle return value - use explicit return value if present, otherwise last expression
+    final_result = @returned ? @return_value : result
+    
+    # Reset return state
+    @returned = false
+    @return_value = nil
+    
+    # Restore previous scope
+    pop_scope
+
+    final_result
+  end
+
+  def visit_return_node(node)
+    @returned = true
+    @return_value = node.expression ? evaluate(node.expression) : nil
+    @return_value
+  end
+
+  # Scope management methods
+
+  def push_scope
+    @scope_stack.push(@variables.dup)
+  end
+
+  def pop_scope
+    if @scope_stack.empty?
+      raise "Cannot pop scope: scope stack is empty"
+    end
+    @variables = @scope_stack.pop
+  end
+
+  def set_variable(name, value)
+    @variables[name] = value
+  end
+
+  def get_variable(name)
+    # Look in current scope first, then up the scope stack
+    return @variables[name] if @variables.key?(name)
+
+    # Search through scope stack from most recent to oldest
+    @scope_stack.reverse_each do |scope|
+      return scope[name] if scope.key?(name)
+    end
+
+    raise "Undefined variable: #{name}"
+  end
+
 end
