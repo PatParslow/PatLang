@@ -2,15 +2,18 @@
 
 This document analyzes the gap between Patlang's current capabilities and what's required for self-hosting (implementing Patlang in Patlang itself). Self-hosting is a critical milestone that demonstrates language maturity and completeness.
 
-## Current Status: v0.2.0
+## Current Status: v0.3.0
 
-### ✅ What We Have
+### ✅ What We Have (COMPLETE)
 - **Arithmetic expressions**: `2 + 3 * 4`, `(x + y) / 2`
 - **Variables and assignment**: `x = 42`, `name = "Pat"`
-- **REPL environment**: Interactive development and testing
+- **Control flow structures**: `if/then/else/end`, `while/do/end` loops
+- **Boolean operations**: `true`, `false`, comparison operators (`==`, `!=`, `<`, `>`, `<=`, `>=`)
+- **Block statements**: Multi-statement sequences with proper scoping
+- **REPL environment**: Interactive development and testing with control flow support
 - **Error handling**: Basic lexical and parsing error reporting
 - **Symbol table**: Variable storage and retrieval
-- **AST-based evaluation**: Proper parse tree execution
+- **AST-based evaluation**: Proper parse tree execution including control flow
 
 ### 🎯 Self-Hosting Requirements
 
@@ -27,27 +30,40 @@ To implement Patlang in Patlang, we need to build:
 
 ### 🔴 CRITICAL BLOCKERS (Must Have)
 
-#### 1. Control Flow Structures
-**Current**: None  
-**Required**: `if/else`, `while`, `for`, `case/when`  
-**Priority**: v0.3.0 (Next)  
-**Blocker Impact**: Cannot implement parser state machines or conditional logic
+#### ✅ 1. Control Flow Structures (COMPLETE)
+**Current**: ✅ Complete - `if/then/else/end`, `while/do/end`, boolean operations
+**Required**: ✅ Implemented in v0.3.0
+**Status**: ✅ COMPLETE
+**Impact**: ✅ Can now implement parser state machines and conditional logic
 
 ```patlang
-# Required for parser implementation
+# Now available for parser implementation
 if token.type == NUMBER then
   return NumberNode(token.value)
-elsif token.type == IDENTIFIER then  
+elsif token.type == IDENTIFIER then
   return VariableNode(token.value)
 else
   raise_error("Unexpected token: #{token}")
 end
 ```
 
-#### 2. Functions and Procedures  
-**Current**: None  
-**Required**: Function definition, parameters, return values, local scope  
-**Priority**: v0.4.0  
+#### 2. String Manipulation (NEXT PRIORITY)
+**Current**: Basic string literals
+**Required**: Concatenation, substring, character access, pattern matching
+**Priority**: v0.4.0 (Next - before functions for better foundation)
+**Blocker Impact**: Cannot process source code text effectively
+
+```patlang
+if source_code.substring(pos, 2) == "//" then
+  skip_comment_line()
+end
+char = source_code[position]
+```
+
+#### 3. Functions and Procedures
+**Current**: None
+**Required**: Function definition, parameters, return values, local scope
+**Priority**: v0.5.0 (moved after strings)
 **Blocker Impact**: Cannot modularize lexer/parser/evaluator code
 
 ```patlang
@@ -60,10 +76,10 @@ make a function called tokenize {
 }
 ```
 
-#### 3. Arrays/Lists Data Structure
-**Current**: None  
-**Required**: Dynamic arrays for token streams, AST nodes  
-**Priority**: v0.5.0  
+#### 4. Arrays/Lists Data Structure
+**Current**: None
+**Required**: Dynamic arrays for token streams, AST nodes
+**Priority**: v0.6.0
 **Blocker Impact**: Cannot store collections of tokens or parse trees
 
 ```patlang
@@ -73,25 +89,12 @@ tokens.push(Token(PLUS, "+"))
 current_token = tokens[position]
 ```
 
-#### 4. String Manipulation
-**Current**: Basic string literals  
-**Required**: Concatenation, substring, character access, pattern matching  
-**Priority**: v0.3.0  
-**Blocker Impact**: Cannot process source code text
-
-```patlang
-if source_code.substring(pos, 2) == "//" then
-  skip_comment_line()
-end
-char = source_code[position]
-```
-
 ### 🟡 IMPORTANT FEATURES (High Priority)
 
 #### 5. File I/O Operations
-**Current**: None  
-**Required**: Read files, write files, file existence checks  
-**Priority**: v0.6.0  
+**Current**: None
+**Required**: Read files, write files, file existence checks
+**Priority**: v0.7.0
 **Impact**: Cannot read source files or write output
 
 ```patlang
@@ -100,9 +103,9 @@ write_file("output.pat", compiled_code)
 ```
 
 #### 6. Object-Oriented Features
-**Current**: Variables as objects foundation  
-**Required**: Classes, methods, inheritance  
-**Priority**: v0.7.0  
+**Current**: Variables as objects foundation
+**Required**: Classes, methods, inheritance
+**Priority**: v0.8.0
 **Impact**: Cannot implement clean AST node hierarchy
 
 ```patlang
@@ -118,9 +121,9 @@ make a class called ASTNode {
 ```
 
 #### 7. Exception Handling
-**Current**: Basic runtime errors  
-**Required**: try/catch, exception propagation  
-**Priority**: v0.6.0  
+**Current**: Basic runtime errors
+**Required**: try/catch, exception propagation
+**Priority**: v0.7.0
 **Impact**: Cannot implement robust parser error recovery
 
 ```patlang
@@ -148,37 +151,36 @@ try {
 
 ## Self-Hosting Implementation Phases
 
-### Phase 1: Foundation (v0.3.0 - v0.5.0)
-- Control flow structures
-- String manipulation  
-- Functions
-- Arrays/lists
+### Phase 1: Foundation (v0.3.0 - v0.6.0)
+- ✅ Control flow structures (COMPLETE)
+- String manipulation (v0.4.0)
+- Functions (v0.5.0)
+- Arrays/lists (v0.6.0)
 - **Milestone**: Can implement basic lexer logic
 
-### Phase 2: Core Infrastructure (v0.6.0 - v0.7.0)  
-- File I/O
-- Exception handling
-- Object-oriented features
+### Phase 2: Core Infrastructure (v0.7.0 - v0.8.0)
+- File I/O + Exception handling (v0.7.0)
+- Object-oriented features (v0.8.0)
 - **Milestone**: Can implement complete parser
 
-### Phase 3: Complete Implementation (v0.8.0 - v1.0.0)
-- Modules and namespaces
-- Standard library
-- Optimizations
+### Phase 3: Complete Implementation (v0.9.0 - v1.0.0)
+- Self-hosting prototype (v0.9.0)
+- Modules, namespaces, and optimizations (v1.0.0)
 - **Milestone**: Full self-hosting capability
 
 ## Estimated Timeline to Self-Hosting
 
 | Version | Features | Weeks | Cumulative |
 |---------|----------|-------|------------|
-| v0.3.0 | Control Flow + Strings | 3-4 | 3-4 weeks |
-| v0.4.0 | Functions | 2-3 | 5-7 weeks |
-| v0.5.0 | Arrays/Lists | 2-3 | 7-10 weeks |
-| v0.6.0 | File I/O + Exceptions | 3-4 | 10-14 weeks |
-| v0.7.0 | Objects/Classes | 4-5 | 14-19 weeks |
-| v0.8.0 | Self-Hosting Prototype | 3-4 | 17-23 weeks |
+| ✅ v0.3.0 | Control Flow (COMPLETE) | ✅ 4 | ✅ 4 weeks |
+| v0.4.0 | Strings | 2-3 | 6-7 weeks |
+| v0.5.0 | Functions | 2-3 | 8-10 weeks |
+| v0.6.0 | Arrays/Lists | 2-3 | 10-13 weeks |
+| v0.7.0 | File I/O + Exceptions | 3-4 | 13-17 weeks |
+| v0.8.0 | Objects/Classes | 4-5 | 17-22 weeks |
+| v0.9.0 | Self-Hosting Prototype | 3-4 | 20-26 weeks |
 
-**Estimated time to working self-hosted interpreter: 4-6 months**
+**Estimated time to working self-hosted interpreter: 3-5 months (reduced from original estimate)**
 
 ## Risk Assessment
 
@@ -195,9 +197,9 @@ try {
 ## Success Metrics
 
 ### Phase 1 Success (Foundation)
-- [ ] Can tokenize simple Patlang programs
-- [ ] Basic control flow works correctly
-- [ ] String processing handles source code
+- [x] Basic control flow works correctly ✅ COMPLETE
+- [ ] Can tokenize simple Patlang programs (needs strings)
+- [ ] String processing handles source code (v0.4.0)
 
 ### Phase 2 Success (Core)
 - [ ] Can parse complete Patlang grammar
@@ -211,9 +213,11 @@ try {
 
 ## Next Steps
 
-1. **Immediate (v0.3.0)**: Implement control flow structures
+1. **Immediate (v0.4.0)**: Implement string operations (prioritized before functions)
 2. **Track Progress**: Update this analysis after each version
 3. **Measure Gaps**: Quantify remaining work at each milestone
 4. **Adjust Timeline**: Refine estimates based on actual development velocity
 
 This gap analysis will be updated after each release to track progress toward self-hosting capability.
+
+**Last Updated**: June 1, 2025 - v0.3.0 Control Flow Complete
