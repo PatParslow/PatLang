@@ -93,4 +93,106 @@ class TestFunctionLexer < Minitest::Test
     assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[0].type
     assert_equal "make", tokens[0].value
   end
+  
+  def test_partial_function_phrases
+    # Test various partial phrases that should not trigger function detection
+    test_cases = [
+      "make a mistake",
+      "make a call",
+      "make function work",
+      "make a function",
+      "function called test",
+      "a function called test"
+    ]
+    
+    test_cases.each do |phrase|
+      lexer = Lexer.new(phrase)
+      tokens = lexer.tokenize
+      
+      # Should not have MAKE token type for function (except first case)
+      if phrase.start_with?("make a")
+        if phrase == "make a function"
+          assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[0].type, "Failed for: #{phrase}"
+        else
+          assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[0].type, "Failed for: #{phrase}"
+        end
+      end
+    end
+  end
+  
+  def test_function_phrase_detection_edge_cases
+    # Test the check_function_phrase method indirectly
+    lexer = Lexer.new("make    a    function    called    test")
+    tokens = lexer.tokenize
+    
+    # Should still detect function phrase despite extra whitespace
+    assert_equal Token::TOKEN_TYPES[:MAKE], tokens[0].type
+    assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[1].type
+    assert_equal "a", tokens[1].value
+    assert_equal Token::TOKEN_TYPES[:FUNCTION], tokens[2].type
+    assert_equal Token::TOKEN_TYPES[:CALLED], tokens[3].type
+    assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[4].type
+    assert_equal "test", tokens[4].value
+  end
+  
+  def test_complex_function_syntax
+    code = "make a function called calculate { calculate takes: x - number }"
+    lexer = Lexer.new(code)
+    tokens = lexer.tokenize
+    
+    expected_sequence = [
+      [Token::TOKEN_TYPES[:MAKE], "make"],
+      [Token::TOKEN_TYPES[:IDENTIFIER], "a"],
+      [Token::TOKEN_TYPES[:FUNCTION], "function"],
+      [Token::TOKEN_TYPES[:CALLED], "called"],
+      [Token::TOKEN_TYPES[:IDENTIFIER], "calculate"],
+      [Token::TOKEN_TYPES[:LBRACE], "{"],
+      [Token::TOKEN_TYPES[:IDENTIFIER], "calculate"],
+      [Token::TOKEN_TYPES[:TAKES], "takes"],
+      [Token::TOKEN_TYPES[:COLON], ":"],
+      [Token::TOKEN_TYPES[:IDENTIFIER], "x"],
+      [Token::TOKEN_TYPES[:MINUS], "-"],
+      [Token::TOKEN_TYPES[:IDENTIFIER], "number"],
+      [Token::TOKEN_TYPES[:RBRACE], "}"]
+    ]
+    
+    expected_sequence.each_with_index do |(expected_type, expected_value), index|
+      assert tokens[index], "Missing token at index #{index}"
+      assert_equal expected_type, tokens[index].type, "Wrong token type at index #{index}"
+      assert_equal expected_value, tokens[index].value, "Wrong token value at index #{index}"
+    end
+  end
+  
+  def test_lexer_function_phrase_backtracking
+    # Test that the lexer properly backtracks when function phrase detection fails
+    lexer = Lexer.new("make a good choice")
+    tokens = lexer.tokenize
+    
+    # All should be identifiers since it's not a function phrase
+    assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[0].type
+    assert_equal "make", tokens[0].value
+    assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[1].type
+    assert_equal "a", tokens[1].value
+    assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[2].type
+    assert_equal "good", tokens[2].value
+    assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[3].type
+    assert_equal "choice", tokens[3].value
+  end
+  
+  def test_nested_function_keywords
+    # Test function keywords in different contexts
+    code = "if make a function called test then call test end"
+    lexer = Lexer.new(code)
+    tokens = lexer.tokenize
+    
+    token_types = tokens.map(&:type)
+    
+    assert_includes token_types, Token::TOKEN_TYPES[:IF]
+    assert_includes token_types, Token::TOKEN_TYPES[:MAKE]
+    assert_includes token_types, Token::TOKEN_TYPES[:FUNCTION]
+    assert_includes token_types, Token::TOKEN_TYPES[:CALLED]
+    assert_includes token_types, Token::TOKEN_TYPES[:THEN]
+    assert_includes token_types, Token::TOKEN_TYPES[:CALL]
+    assert_includes token_types, Token::TOKEN_TYPES[:END]
+  end
 end

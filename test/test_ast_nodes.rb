@@ -221,4 +221,103 @@ class TestASTNodes < Minitest::Test
     assert_kind_of ASTNode, while_node
     assert_kind_of ASTNode, block_node
   end
+  
+  # Tests for new function-related AST nodes
+  def test_function_definition_node
+    params = [ParameterNode.new("x", "number"), ParameterNode.new("y", "number")]
+    body = NumberNode.new(42)
+    func_def = FunctionDefinitionNode.new("add", params, body, "number")
+    
+    assert_equal "add", func_def.name
+    assert_equal params, func_def.parameters
+    assert_equal body, func_def.body
+    assert_equal "number", func_def.return_type
+    assert_includes func_def.to_s, "FunctionDefinitionNode"
+    assert_includes func_def.to_s, "add"
+  end
+  
+  def test_function_definition_node_without_return_type
+    params = []
+    body = NumberNode.new(42)
+    func_def = FunctionDefinitionNode.new("simple", params, body)
+    
+    assert_equal "simple", func_def.name
+    assert_equal params, func_def.parameters
+    assert_equal body, func_def.body
+    assert_nil func_def.return_type
+  end
+  
+  def test_function_call_node
+    args = [NumberNode.new(1), NumberNode.new(2)]
+    func_call = FunctionCallNode.new("add", args)
+    
+    assert_equal "add", func_call.function_name
+    assert_equal args, func_call.arguments
+    assert_includes func_call.to_s, "FunctionCallNode"
+    assert_includes func_call.to_s, "add"
+  end
+  
+  def test_function_call_node_without_arguments
+    func_call = FunctionCallNode.new("get_value")
+    
+    assert_equal "get_value", func_call.function_name
+    assert_equal [], func_call.arguments
+  end
+  
+  def test_parameter_node
+    param = ParameterNode.new("count", "number", NumberNode.new(0))
+    
+    assert_equal "count", param.name
+    assert_equal "number", param.type
+    assert_equal 0, param.default_value.value
+    assert_includes param.to_s, "ParameterNode"
+    assert_includes param.to_s, "count"
+    assert_includes param.to_s, "number"
+  end
+  
+  def test_parameter_node_without_default
+    param = ParameterNode.new("name", "string")
+    
+    assert_equal "name", param.name
+    assert_equal "string", param.type
+    assert_nil param.default_value
+    refute_includes param.to_s, "NumberNode"
+  end
+  
+  def test_parameter_node_minimal
+    param = ParameterNode.new("x")
+    
+    assert_equal "x", param.name
+    assert_nil param.type
+    assert_nil param.default_value
+  end
+  
+  def test_return_node_with_expression
+    expr = NumberNode.new(42)
+    return_node = ReturnNode.new(expr)
+    
+    assert_equal expr, return_node.expression
+    assert_includes return_node.to_s, "ReturnNode"
+    assert_includes return_node.to_s, "NumberNode"
+  end
+  
+  def test_return_node_without_expression
+    return_node = ReturnNode.new
+    
+    assert_nil return_node.expression
+    assert_includes return_node.to_s, "ReturnNode()"
+  end
+  
+  def test_function_nodes_inheritance
+    # Test that function nodes inherit from ASTNode
+    func_def = FunctionDefinitionNode.new("test", [], NumberNode.new(1))
+    func_call = FunctionCallNode.new("test")
+    param = ParameterNode.new("x")
+    return_node = ReturnNode.new
+    
+    assert_kind_of ASTNode, func_def
+    assert_kind_of ASTNode, func_call
+    assert_kind_of ASTNode, param
+    assert_kind_of ASTNode, return_node
+  end
 end
