@@ -178,7 +178,7 @@ class PatLangDocGenerator
       if dir == '.'
         nav_html += "<div class=\"nav-section\">\n"
       else
-        nav_html += "<div class=\"nav-section\">\n<h3>#{dir.capitalize}</h3>\n"
+        nav_html += "<div class=\"..\">\n<h3>#{dir.capitalize}</h3>\n"
       end
       
       files.each do |file|
