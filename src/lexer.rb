@@ -117,6 +117,15 @@ class Lexer
       when ','
         advance
         return Token.new(Token::TOKEN_TYPES[:COMMA], ',', @position - 1)
+      when '{'
+        advance
+        return Token.new(Token::TOKEN_TYPES[:LBRACE], '{', @position - 1)
+      when '}'
+        advance
+        return Token.new(Token::TOKEN_TYPES[:RBRACE], '}', @position - 1)
+      when ':'
+        advance
+        return Token.new(Token::TOKEN_TYPES[:COLON], ':', @position - 1)
       else
         if alpha?(@current_char)
           return read_identifier
@@ -184,6 +193,25 @@ class Lexer
                    Token::TOKEN_TYPES[:WHILE]
                  when 'do'
                    Token::TOKEN_TYPES[:DO]
+                 when 'make'
+                   # Check for "make a function called" phrase
+                   if check_function_phrase
+                     Token::TOKEN_TYPES[:MAKE]
+                   else
+                     Token::TOKEN_TYPES[:IDENTIFIER]
+                   end
+                 when 'function'
+                   Token::TOKEN_TYPES[:FUNCTION]
+                 when 'called'
+                   Token::TOKEN_TYPES[:CALLED]
+                 when 'takes'
+                   Token::TOKEN_TYPES[:TAKES]
+                 when 'returns'
+                   Token::TOKEN_TYPES[:RETURNS]
+                 when 'return'
+                   Token::TOKEN_TYPES[:RETURN]
+                 when 'call'
+                   Token::TOKEN_TYPES[:CALL]
                  else
                    Token::TOKEN_TYPES[:IDENTIFIER]
                  end
@@ -231,5 +259,43 @@ class Lexer
     
     advance  # Skip closing quote
     Token.new(Token::TOKEN_TYPES[:STRING], value, start_position)
+  end
+
+  def check_function_phrase
+    # Look ahead to see if we have "a function called" after "make"
+    saved_position = @position
+    saved_char = @current_char
+    
+    # Skip whitespace
+    skip_whitespace
+    
+    # Check for "a"
+    if read_word == "a"
+      skip_whitespace
+      if read_word == "function"
+        skip_whitespace
+        if read_word == "called"
+          # Reset position - we'll tokenize these individually
+          @position = saved_position
+          @current_char = saved_char
+          return true
+        end
+      end
+    end
+    
+    # Reset position if not a function phrase
+    @position = saved_position
+    @current_char = saved_char
+    false
+  end
+  
+  def read_word
+    # Helper method to read a word without consuming it permanently
+    result = ''
+    while @current_char && alphanumeric?(@current_char)
+      result += @current_char
+      advance
+    end
+    result
   end
 end

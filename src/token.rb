@@ -34,6 +34,18 @@ class Token
     LBRACKET: :LBRACKET,
     RBRACKET: :RBRACKET,
     COMMA: :COMMA,
+    # Function definition keywords
+    MAKE: :MAKE,
+    FUNCTION: :FUNCTION,
+    CALLED: :CALLED,
+    TAKES: :TAKES,
+    RETURNS: :RETURNS,
+    RETURN: :RETURN,
+    CALL: :CALL,
+    # Block delimiters
+    LBRACE: :LBRACE,
+    RBRACE: :RBRACE,
+    COLON: :COLON,
     EOF: :EOF
   }.freeze
 

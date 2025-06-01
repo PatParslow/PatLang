@@ -177,3 +177,68 @@ class MethodCallNode < ASTNode
     "MethodCallNode(#{@object}, #{@method_name}, #{@arguments})"
   end
 end
+# Node representing a function definition
+class FunctionDefinitionNode < ASTNode
+  attr_reader :name, :parameters, :body, :return_type
+
+  def initialize(name, parameters, body, return_type = nil)
+    @name = name
+    @parameters = parameters
+    @body = body
+    @return_type = return_type
+  end
+
+  def to_s
+    "FunctionDefinitionNode(#{@name}, #{@parameters}, #{@body})"
+  end
+end
+
+# Node representing a function call
+class FunctionCallNode < ASTNode
+  attr_reader :function_name, :arguments
+
+  def initialize(function_name, arguments = [])
+    @function_name = function_name
+    @arguments = arguments
+  end
+
+  def to_s
+    "FunctionCallNode(#{@function_name}, #{@arguments})"
+  end
+end
+
+# Node representing a function parameter
+class ParameterNode < ASTNode
+  attr_reader :name, :type, :default_value
+
+  def initialize(name, type = nil, default_value = nil)
+    @name = name
+    @type = type
+    @default_value = default_value
+  end
+
+  def to_s
+    if @default_value
+      "ParameterNode(#{@name}, #{@type}, #{@default_value})"
+    else
+      "ParameterNode(#{@name}, #{@type})"
+    end
+  end
+end
+
+# Node representing a return statement
+class ReturnNode < ASTNode
+  attr_reader :expression
+
+  def initialize(expression = nil)
+    @expression = expression
+  end
+
+  def to_s
+    if @expression
+      "ReturnNode(#{@expression})"
+    else
+      "ReturnNode()"
+    end
+  end
+end
