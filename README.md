@@ -11,6 +11,32 @@ Patlang introduces a unique approach to programming by combining:
 - **Strong type inference** with optional explicit typing
 - **Functional and procedural** programming paradigms
 
+## Current Development Status
+
+**Latest Release**: v0.2.0 Variables and Assignment (Production Ready)
+**Current Phase**: v0.3.0 Control Flow Structures (Development Initiated)
+**Strategic Goal**: Self-hosting capability - implementing Patlang in Patlang
+
+### v0.3.0 Progress
+- ✅ **Planning Complete**: Comprehensive implementation plan established
+- 🔄 **Phase 1**: Foundation - Tokens and AST (Ready to Begin)
+- ⏳ **Phase 2**: Lexer Extensions (Pending)
+- ⏳ **Phase 3**: Parser Grammar Extensions (Pending)
+- ⏳ **Phase 4**: Evaluator Logic (Pending)
+- ⏳ **Phase 5**: Comprehensive Testing (Pending)
+
+**Target Features for v0.3.0**:
+- Boolean values and variables (`true`, `false`)
+- Comparison operators (`==`, `!=`, `<`, `>`, `<=`, `>=`)
+- Conditional statements (`if`/`then`/`else`/`end`)
+- While loops (`while`/`do`/`end`)
+- Block statements with proper sequencing
+
+For detailed development tracking, see:
+- [`docs/development/v0.3.0-control-flow-plan.md`](docs/development/v0.3.0-control-flow-plan.md) - Complete implementation plan
+- [`docs/development/v0.3.0-development-status.md`](docs/development/v0.3.0-development-status.md) - Live development progress
+- [`docs/development/self-hosting-gap-analysis.md`](docs/development/self-hosting-gap-analysis.md) - Strategic self-hosting roadmap
+
 ## Quick Start
 
 For a comprehensive introduction to Patlang, see:

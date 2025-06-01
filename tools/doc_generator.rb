@@ -153,7 +153,7 @@ class PatLangDocGenerator
           <meta charset="UTF-8">
           <meta name="viewport" content="width=device-width, initial-scale=1.0">
           <title>#{title} - Patlang Documentation</title>
-          <link rel="stylesheet" href="/patlang-docs.css">
+          <link rel="stylesheet" href="/patlang/docs_html/patlang-docs.css">
       </head>
       <body>
           <nav class="sidebar">

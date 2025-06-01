@@ -46,39 +46,80 @@
 **Known to Unknown Progression:**
 Variables are fundamental to programming and well-understood. This builds naturally on our arithmetic foundation without introducing complex concepts.
 
-## Future Increments (Tentative)
+## Next Increment - Strategic Priority for Self-Hosting
 
-### v0.3.0: String Literals and Operations
-- String literal support with double quotes
-- String concatenation operator
-- Mixed string and numeric expressions
-- String interpolation basics
+### 🎯 v0.3.0: Control Flow Structures (NEXT - Critical Blocker #1)
+**Strategic Priority**: Essential for self-hosting capability
+**Timeline**: 3-4 weeks
+**Self-Hosting Impact**: Enables parser state machines and conditional logic
 
-### v0.4.0: Boolean Logic and Comparisons
-- Boolean literals (`true`, `false`)
+**Core Features:**
+- Boolean literals (`true`, `false`) and boolean variables
 - Comparison operators (`==`, `!=`, `<`, `>`, `<=`, `>=`)
-- Logical operators (`and`, `or`, `not`)
-- Boolean expressions in conditions
+- Conditional statements (`if`/`then`/`else`/`end`)
+- While loops (`while`/`do`/`end`)
+- Block statements with proper sequencing
+- Enhanced REPL with multi-statement support
 
-### v0.5.0: Control Flow - Conditional Statements
-- `if`/`else` statements
-- Nested conditions
-- Conditional expressions
+**Technical Implementation:**
+- New tokens: BOOLEAN, IF, THEN, ELSE, END, WHILE, DO, comparison operators
+- New AST nodes: BooleanNode, ComparisonNode, IfNode, WhileNode, BlockNode
+- Parser grammar extensions for control flow structures
+- Evaluator logic for conditional execution and loops
+- Comprehensive testing with 50+ tests covering all control flow scenarios
 
-### v0.6.0: Control Flow - Loops
-- `while` loops
-- Basic iteration constructs
-- Loop control flow
+**Example Target Syntax:**
+```patlang
+count = 0
+if count < 10 then
+  while count < 5 do
+    count = count + 1
+  end
+else
+  count = 0
+end
+```
 
-### v0.7.0: Functions (Simple)
-- Function definition without parameters
-- Function calls and return values
-- Local scope basics
+**Success Criteria:**
+- All control flow constructs working correctly
+- Nested conditions and loops supported
+- Variable scoping within blocks
+- REPL supports interactive control flow development
+- 95%+ test coverage maintained
 
-### v0.8.0: Functions (Advanced)
-- Functions with parameters
-- Local variable scoping
-- Return statements
+## Future Increments (Self-Hosting Focused)
+
+### v0.4.0: Functions and Procedures (Critical Blocker #2)
+- Function definition with parameters
+- Return values and local scope
+- Function calls and recursion
+- **Self-Hosting Impact**: Enables modular parser/evaluator code
+
+### v0.5.0: Arrays and Data Structures (Critical Blocker #3)
+- Dynamic arrays for token streams
+- Array indexing and manipulation
+- **Self-Hosting Impact**: Enables token collection and AST node storage
+
+### v0.6.0: String Operations (Critical Blocker #4)
+- String literals with enhanced operations
+- String concatenation and substring operations
+- Character access and manipulation
+- **Self-Hosting Impact**: Enables source code processing
+
+### v0.7.0: File I/O and Error Handling
+- File reading and writing operations
+- Exception handling with try/catch
+- **Self-Hosting Impact**: Enables reading source files and robust error recovery
+
+### v0.8.0: Object-Oriented Features
+- Classes and methods
+- Inheritance and polymorphism
+- **Self-Hosting Impact**: Enables clean AST node hierarchy
+
+### v0.9.0: Self-Hosting Prototype
+- Complete Patlang interpreter written in Patlang
+- Bootstrap validation against Ruby implementation
+- **Milestone**: Self-hosting capability achieved
 
 ## Development Principles
 

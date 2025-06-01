@@ -69,8 +69,40 @@ class Lexer
         advance
         return Token.new(Token::TOKEN_TYPES[:RPAREN], ')', @position - 1)
       when '='
-        advance
-        return Token.new(Token::TOKEN_TYPES[:EQUALS], '=', @position - 1)
+        if peek_char == '='
+          advance
+          advance
+          return Token.new(Token::TOKEN_TYPES[:EQUAL], '==', @position - 2)
+        else
+          advance
+          return Token.new(Token::TOKEN_TYPES[:EQUALS], '=', @position - 1)
+        end
+      when '!'
+        if peek_char == '='
+          advance
+          advance
+          return Token.new(Token::TOKEN_TYPES[:NOT_EQUAL], '!=', @position - 2)
+        else
+          error
+        end
+      when '<'
+        if peek_char == '='
+          advance
+          advance
+          return Token.new(Token::TOKEN_TYPES[:LESS_EQUAL], '<=', @position - 2)
+        else
+          advance
+          return Token.new(Token::TOKEN_TYPES[:LESS_THAN], '<', @position - 1)
+        end
+      when '>'
+        if peek_char == '='
+          advance
+          advance
+          return Token.new(Token::TOKEN_TYPES[:GREATER_EQUAL], '>=', @position - 2)
+        else
+          advance
+          return Token.new(Token::TOKEN_TYPES[:GREATER_THAN], '>', @position - 1)
+        end
       else
         if alpha?(@current_char)
           return read_identifier
@@ -96,6 +128,11 @@ class Lexer
 
   private
 
+  def peek_char
+    next_position = @position + 1
+    next_position < @text.length ? @text[next_position] : nil
+  end
+
   def alpha?(char)
     (char >= 'a' && char <= 'z') ||
     (char >= 'A' && char <= 'Z') ||
@@ -115,6 +152,28 @@ class Lexer
       advance
     end
     
-    Token.new(Token::TOKEN_TYPES[:IDENTIFIER], result, start_position)
+    # Check if the identifier is a keyword
+    token_type = case result
+                 when 'true'
+                   Token::TOKEN_TYPES[:TRUE]
+                 when 'false'
+                   Token::TOKEN_TYPES[:FALSE]
+                 when 'if'
+                   Token::TOKEN_TYPES[:IF]
+                 when 'then'
+                   Token::TOKEN_TYPES[:THEN]
+                 when 'else'
+                   Token::TOKEN_TYPES[:ELSE]
+                 when 'end'
+                   Token::TOKEN_TYPES[:END]
+                 when 'while'
+                   Token::TOKEN_TYPES[:WHILE]
+                 when 'do'
+                   Token::TOKEN_TYPES[:DO]
+                 else
+                   Token::TOKEN_TYPES[:IDENTIFIER]
+                 end
+    
+    Token.new(token_type, result, start_position)
   end
 end
