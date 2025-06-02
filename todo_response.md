@@ -1,4 +1,6 @@
-require_relative 'token'
+<write_file>
+<path>src/parser.rb</path>
+<content>require_relative 'token'
 require_relative 'ast_nodes'
 require_relative 'ambiguous_token'
 
@@ -477,7 +479,8 @@ class Parser
     
     while @current_token&.type == :STAR ||
           @current_token&.type == :SLASH ||
-          @current_token&.type == :PERCENT
+          @current_token&.type == :PERCENT ||
+          @current_token&.type == :MODULO
       op = @current_token.type
       advance
       right = postfix
@@ -490,39 +493,48 @@ class Parser
   def postfix
     left = primary
     
-    # Handle string methods
-    while @current_token&.type == :DOT
-      advance # consume '.'
-      
-      if @current_token&.type == :IDENTIFIER
-        method_name = @current_token.value
-        advance
+    # CRITICAL FIX: Handle both method calls AND string indexing
+    while @current_token&.type == :DOT || @current_token&.type == :LBRACKET
+      if @current_token.type == :DOT
+        # Method call
+        advance # consume '.'
         
-        if @current_token&.type == :LPAREN
-          # Method call with arguments
-          advance # consume '('
+        if @current_token&.type == :IDENTIFIER
+          method_name = @current_token.value
+          advance
           
-          arguments = []
-          unless @current_token&.type == :RPAREN
-            loop do
-              arguments << expression
-              
-              if @current_token&.type == :COMMA
-                advance
-              else
-                break
+          if @current_token&.type == :LPAREN
+            # Method call with arguments
+            advance # consume '('
+            
+            arguments = []
+            unless @current_token&.type == :RPAREN
+              loop do
+                arguments << expression
+                
+                if @current_token&.type == :COMMA
+                  advance
+                else
+                  break
+                end
               end
             end
+            
+            eat(:RPAREN)
+            left = MethodCallNode.new(left, method_name, arguments)
+          else
+            # Method call without arguments
+            left = MethodCallNode.new(left, method_name, [])
           end
-          
-          eat(:RPAREN)
-          left = MethodCallNode.new(left, method_name, arguments)
         else
-          # Method call without arguments
-          left = MethodCallNode.new(left, method_name, [])
+          error("Expected method name after '.'")
         end
-      else
-        error("Expected method name after '.'")
+      elsif @current_token.type == :LBRACKET
+        # String indexing: string[index]
+        advance # consume '['
+        index = expression
+        eat(:RBRACKET)
+        left = IndexAccessNode.new(left, index)
       end
     end
     
@@ -595,6 +607,11 @@ class Parser
       node = expression
       eat(:RPAREN)
       return node
+    elsif token.type == :MINUS
+      # CRITICAL FIX: Handle unary minus (negative numbers)
+      advance
+      operand = primary
+      return UnaryOpNode.new(:MINUS, operand)
     else
       error("Unexpected token in factor")
     end
@@ -615,3 +632,5 @@ class Parser
     end
   end
 end
+</content>
+</write_file>

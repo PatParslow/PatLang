@@ -1,4 +1,5 @@
 require_relative 'token'
+require_relative 'ambiguous_token'
 
 # Lexer class for tokenizing Patlang source code
 class Lexer
@@ -6,6 +7,8 @@ class Lexer
     @text = text
     @position = 0
     @current_char = @text[@position]
+    @line = 1
+    @column = 1
   end
 
   def error
@@ -13,12 +16,30 @@ class Lexer
   end
 
   def advance
+    if @current_char == "\n"
+      @line += 1
+      @column = 1
+    else
+      @column += 1
+    end
+    
     @position += 1
     @current_char = @position < @text.length ? @text[@position] : nil
   end
 
   def skip_whitespace
     while @current_char && @current_char.match(/\s/)
+      advance
+    end
+  end
+
+  def skip_comment
+    # Skip comment until end of line
+    while @current_char && @current_char != "\n"
+      advance
+    end
+    # Skip the newline if present
+    if @current_char == "\n"
       advance
     end
   end
@@ -40,92 +61,128 @@ class Lexer
 
   def get_next_token
     while @current_char
+      # Skip whitespace
       if @current_char.match(/\s/)
         skip_whitespace
         next
       end
 
+      # Skip comments
+      if @current_char == '#'
+        skip_comment
+        next
+      end
+
       if @current_char.match(/\d/)
-        return Token.new(Token::TOKEN_TYPES[:NUMBER], read_number, @position)
+        start_line, start_column = @line, @column
+        return Token.new(Token::TOKEN_TYPES[:NUMBER], read_number, @position, start_line, start_column)
       end
 
       case @current_char
       when '+'
+        start_line, start_column = @line, @column
         advance
-        return Token.new(Token::TOKEN_TYPES[:PLUS], '+', @position - 1)
+        return Token.new(Token::TOKEN_TYPES[:PLUS], '+', @position - 1, start_line, start_column)
       when '-'
+        start_line, start_column = @line, @column
         advance
-        return Token.new(Token::TOKEN_TYPES[:MINUS], '-', @position - 1)
+        return Token.new(Token::TOKEN_TYPES[:MINUS], '-', @position - 1, start_line, start_column)
       when '*'
+        start_line, start_column = @line, @column
         advance
-        return Token.new(Token::TOKEN_TYPES[:MULTIPLY], '*', @position - 1)
+        return Token.new(:STAR, '*', @position - 1, start_line, start_column)
       when '/'
+        start_line, start_column = @line, @column
         advance
-        return Token.new(Token::TOKEN_TYPES[:DIVIDE], '/', @position - 1)
+        return Token.new(:SLASH, '/', @position - 1, start_line, start_column)
+      when '%'
+        start_line, start_column = @line, @column
+        advance
+        return Token.new(Token::TOKEN_TYPES[:MODULO], '%', @position - 1, start_line, start_column)
       when '('
+        start_line, start_column = @line, @column
         advance
-        return Token.new(Token::TOKEN_TYPES[:LPAREN], '(', @position - 1)
+        return Token.new(Token::TOKEN_TYPES[:LPAREN], '(', @position - 1, start_line, start_column)
       when ')'
+        start_line, start_column = @line, @column
         advance
-        return Token.new(Token::TOKEN_TYPES[:RPAREN], ')', @position - 1)
+        return Token.new(Token::TOKEN_TYPES[:RPAREN], ')', @position - 1, start_line, start_column)
       when '='
+        start_line, start_column = @line, @column
         if peek_char == '='
           advance
           advance
-          return Token.new(Token::TOKEN_TYPES[:EQUAL], '==', @position - 2)
+          return Token.new(Token::TOKEN_TYPES[:EQUAL], '==', @position - 2, start_line, start_column)
         else
           advance
-          return Token.new(Token::TOKEN_TYPES[:EQUALS], '=', @position - 1)
+          return Token.new(:ASSIGN, '=', @position - 1, start_line, start_column)
         end
       when '!'
+        start_line, start_column = @line, @column
         if peek_char == '='
           advance
           advance
-          return Token.new(Token::TOKEN_TYPES[:NOT_EQUAL], '!=', @position - 2)
+          return Token.new(Token::TOKEN_TYPES[:NOT_EQUAL], '!=', @position - 2, start_line, start_column)
         else
+          # Handle standalone ! as an error case
           error
         end
       when '<'
+        start_line, start_column = @line, @column
         if peek_char == '='
           advance
           advance
-          return Token.new(Token::TOKEN_TYPES[:LESS_EQUAL], '<=', @position - 2)
+          return Token.new(Token::TOKEN_TYPES[:LESS_EQUAL], '<=', @position - 2, start_line, start_column)
         else
           advance
-          return Token.new(Token::TOKEN_TYPES[:LESS_THAN], '<', @position - 1)
+          return Token.new(:LESS, '<', @position - 1, start_line, start_column)
         end
       when '>'
+        start_line, start_column = @line, @column
         if peek_char == '='
           advance
           advance
-          return Token.new(Token::TOKEN_TYPES[:GREATER_EQUAL], '>=', @position - 2)
+          return Token.new(Token::TOKEN_TYPES[:GREATER_EQUAL], '>=', @position - 2, start_line, start_column)
         else
           advance
-          return Token.new(Token::TOKEN_TYPES[:GREATER_THAN], '>', @position - 1)
+          return Token.new(:GREATER, '>', @position - 1, start_line, start_column)
         end
       when '"'
         return tokenize_string
       when '.'
-        advance
-        return Token.new(Token::TOKEN_TYPES[:DOT], '.', @position - 1)
+        # Check if this starts a decimal number
+        if peek_char&.match(/\d/)
+          start_line, start_column = @line, @column
+          return Token.new(Token::TOKEN_TYPES[:NUMBER], read_number, @position, start_line, start_column)
+        else
+          start_line, start_column = @line, @column
+          advance
+          return Token.new(Token::TOKEN_TYPES[:DOT], '.', @position - 1, start_line, start_column)
+        end
       when '['
+        start_line, start_column = @line, @column
         advance
-        return Token.new(Token::TOKEN_TYPES[:LBRACKET], '[', @position - 1)
+        return Token.new(Token::TOKEN_TYPES[:LBRACKET], '[', @position - 1, start_line, start_column)
       when ']'
+        start_line, start_column = @line, @column
         advance
-        return Token.new(Token::TOKEN_TYPES[:RBRACKET], ']', @position - 1)
+        return Token.new(Token::TOKEN_TYPES[:RBRACKET], ']', @position - 1, start_line, start_column)
       when ','
+        start_line, start_column = @line, @column
         advance
-        return Token.new(Token::TOKEN_TYPES[:COMMA], ',', @position - 1)
+        return Token.new(Token::TOKEN_TYPES[:COMMA], ',', @position - 1, start_line, start_column)
       when '{'
+        start_line, start_column = @line, @column
         advance
-        return Token.new(Token::TOKEN_TYPES[:LBRACE], '{', @position - 1)
+        return Token.new(Token::TOKEN_TYPES[:LBRACE], '{', @position - 1, start_line, start_column)
       when '}'
+        start_line, start_column = @line, @column
         advance
-        return Token.new(Token::TOKEN_TYPES[:RBRACE], '}', @position - 1)
+        return Token.new(Token::TOKEN_TYPES[:RBRACE], '}', @position - 1, start_line, start_column)
       when ':'
+        start_line, start_column = @line, @column
         advance
-        return Token.new(Token::TOKEN_TYPES[:COLON], ':', @position - 1)
+        return Token.new(Token::TOKEN_TYPES[:COLON], ':', @position - 1, start_line, start_column)
       else
         if alpha?(@current_char)
           return read_identifier
@@ -135,7 +192,7 @@ class Lexer
       end
     end
 
-    Token.new(Token::TOKEN_TYPES[:EOF], nil, @position)
+    Token.new(Token::TOKEN_TYPES[:EOF], nil, @position, @line, @column)
   end
 
   def tokenize
@@ -168,6 +225,7 @@ class Lexer
 
   def read_identifier
     start_position = @position
+    start_line, start_column = @line, @column
     result = ''
     
     while @current_char && alphanumeric?(@current_char)
@@ -193,13 +251,18 @@ class Lexer
                    Token::TOKEN_TYPES[:WHILE]
                  when 'do'
                    Token::TOKEN_TYPES[:DO]
+                 when 'print'
+                   Token::TOKEN_TYPES[:PRINT]
                  when 'make'
-                   # Check for "make a function called" phrase
-                   if check_function_phrase
-                     Token::TOKEN_TYPES[:MAKE]
-                   else
-                     Token::TOKEN_TYPES[:IDENTIFIER]
-                   end
+                   Token::TOKEN_TYPES[:MAKE]
+                 when 'a'
+                   # Create ambiguous token with both possibilities
+                   # Let the parser resolve this based on grammar context
+                   possibilities = [
+                     { type: Token::TOKEN_TYPES[:A], value: 'a' },
+                     { type: Token::TOKEN_TYPES[:IDENTIFIER], value: 'a' }
+                   ]
+                   return AmbiguousToken.new(possibilities, start_position, start_line, start_column)
                  when 'function'
                    Token::TOKEN_TYPES[:FUNCTION]
                  when 'called'
@@ -212,15 +275,18 @@ class Lexer
                    Token::TOKEN_TYPES[:RETURN]
                  when 'call'
                    Token::TOKEN_TYPES[:CALL]
+                 when 'with'
+                   Token::TOKEN_TYPES[:WITH]
                  else
                    Token::TOKEN_TYPES[:IDENTIFIER]
                  end
     
-    Token.new(token_type, result, start_position)
+    Token.new(token_type, result, start_position, start_line, start_column)
   end
 
   def tokenize_string
     start_position = @position
+    start_line, start_column = @line, @column
     advance  # Skip opening quote
     value = ""
     
@@ -258,35 +324,30 @@ class Lexer
     end
     
     advance  # Skip closing quote
-    Token.new(Token::TOKEN_TYPES[:STRING], value, start_position)
+    Token.new(Token::TOKEN_TYPES[:STRING], value, start_position, start_line, start_column)
   end
 
-  def check_function_phrase
-    # Look ahead to see if we have "a function called" after "make"
-    saved_position = @position
-    saved_char = @current_char
+  def in_function_definition_context?
+    # Look backwards to see if we recently saw "make"
+    # This is a simple heuristic - check the last few characters
+    look_back_start = [@position - 20, 0].max
+    recent_text = @text[look_back_start...@position]
     
-    # Skip whitespace
-    skip_whitespace
+    # If we see "make" recently, we're likely in a function definition context
+    recent_text =~ /\bmake\s*$/
+  end
+
+  def in_arithmetic_context?
+    # Look backwards in the text to see if we're in an arithmetic context
+    # Simple heuristic: if we see operators like =, +, -, *, / recently, treat "a" as identifier
+    # This is basic context detection - more sophisticated parsing would require full context
     
-    # Check for "a"
-    if read_word == "a"
-      skip_whitespace
-      if read_word == "function"
-        skip_whitespace
-        if read_word == "called"
-          # Reset position - we'll tokenize these individually
-          @position = saved_position
-          @current_char = saved_char
-          return true
-        end
-      end
-    end
+    # Look at recent characters (simplified approach)
+    look_back_start = [@position - 10, 0].max
+    recent_text = @text[look_back_start...@position]
     
-    # Reset position if not a function phrase
-    @position = saved_position
-    @current_char = saved_char
-    false
+    # If we see assignment or arithmetic operators recently, treat "a" as an identifier
+    !!(recent_text =~ /[=+\-*\/]\s*$/)
   end
   
   def read_word

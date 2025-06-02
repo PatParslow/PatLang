@@ -1,6 +1,5 @@
 require_relative 'token'
 require_relative 'ast_nodes'
-require_relative 'ambiguous_token'
 
 # Parser class for parsing Patlang source code with ambiguous token resolution
 class Parser
@@ -41,39 +40,28 @@ class Parser
   end
 
   # AMBIGUOUS TOKEN RESOLUTION - Core logic for resolving context-dependent tokens
-  def resolve_ambiguous_token(token, context_index = nil)
-    return token unless token.is_a?(AmbiguousToken)
+  def resolve_ambiguous_identifier(token)
+    return token unless token.type == Token::TOKEN_TYPES[:IDENTIFIER]
     
-    # Check if this is an assignment context: identifier followed by =
-    if context_index && context_index + 1 < @tokens.length && 
-       @tokens[context_index + 1]&.type == :ASSIGN
-      # This is a variable assignment, resolve to identifier
-      identifier_possibility = token.resolve_to(:IDENTIFIER)
-      return identifier_possibility if identifier_possibility
-    end
-    
-    # Check if this is part of a function definition phrase
-    if token.possible_types.include?(:MAKE)
+    # Check if this identifier is part of a function definition phrase
+    if token.value == "make"
       # Look ahead to see if this is "make a function called"
-      if context_index && context_index + 3 < @tokens.length &&
-         @tokens[context_index + 1]&.type == :IDENTIFIER && @tokens[context_index + 1]&.value == "a" &&
-         @tokens[context_index + 2]&.type == :IDENTIFIER && @tokens[context_index + 2]&.value == "function" &&
-         @tokens[context_index + 3]&.type == :IDENTIFIER && @tokens[context_index + 3]&.value == "called"
-        # This is a function definition, resolve to MAKE
-        make_possibility = token.resolve_to(:MAKE)
-        return make_possibility if make_possibility
+      if peek(1)&.type == Token::TOKEN_TYPES[:IDENTIFIER] && peek(1)&.value == "a" &&
+         peek(2)&.type == Token::TOKEN_TYPES[:IDENTIFIER] && peek(2)&.value == "function" &&
+         peek(3)&.type == Token::TOKEN_TYPES[:IDENTIFIER] && peek(3)&.value == "called"
+        # This is a function definition, transform token
+        return Token.new(Token::TOKEN_TYPES[:MAKE], "make")
       end
     end
     
-    # DEFAULT CASE: For variables and simple identifiers, resolve to IDENTIFIER
-    # This handles cases like 'a = 5' where 'a' is ambiguous between type A and IDENTIFIER
-    identifier_possibility = token.resolve_to(:IDENTIFIER)
-    if identifier_possibility
-      return identifier_possibility
+    # Check for assignment context: identifier followed by =
+    if peek(1)&.type == Token::TOKEN_TYPES[:ASSIGN]
+      # This is a variable assignment, keep as identifier
+      return token
     end
     
-    # Fallback: use the first possibility
-    return Token.new(token.possibilities.first[:type], token.possibilities.first[:value], token.position, token.line, token.column)
+    # Default: keep as identifier
+    return token
   end
 
   # Enhanced parse method with ambiguous token resolution
@@ -90,32 +78,26 @@ class Parser
     while i < @tokens.length
       token = @tokens[i]
       
-      if token.is_a?(AmbiguousToken)
-        # Use the current context to resolve the ambiguous token
-        resolved_token = resolve_ambiguous_token(token, i)
-        resolved_tokens << resolved_token
-        i += 1
-      elsif token.type == :IDENTIFIER && token.value == "make"
-        # Handle function definition phrases for regular identifiers
-        if i + 3 < @tokens.length &&
-           @tokens[i + 1].type == :IDENTIFIER && @tokens[i + 1].value == "a" &&
-           @tokens[i + 2].type == :IDENTIFIER && @tokens[i + 2].value == "function" &&
-           @tokens[i + 3].type == :IDENTIFIER && @tokens[i + 3].value == "called"
+      if token.type == Token::TOKEN_TYPES[:IDENTIFIER]
+        # Handle function definition phrases
+        if token.value == "make" && 
+           i + 3 < @tokens.length &&
+           @tokens[i + 1].type == Token::TOKEN_TYPES[:IDENTIFIER] && @tokens[i + 1].value == "a" &&
+           @tokens[i + 2].type == Token::TOKEN_TYPES[:IDENTIFIER] && @tokens[i + 2].value == "function" &&
+           @tokens[i + 3].type == Token::TOKEN_TYPES[:IDENTIFIER] && @tokens[i + 3].value == "called"
           
           # Replace the phrase with proper function tokens
-          resolved_tokens << Token.new(:MAKE, "make")
-          resolved_tokens << Token.new(:IDENTIFIER, "a")  # Skip this one actually
-          resolved_tokens << Token.new(:FUNCTION, "function")
-          resolved_tokens << Token.new(:CALLED, "called")
+          resolved_tokens << Token.new(Token::TOKEN_TYPES[:MAKE], "make")
+          resolved_tokens << Token.new(Token::TOKEN_TYPES[:IDENTIFIER], "a")  # Skip this one actually
+          resolved_tokens << Token.new(Token::TOKEN_TYPES[:FUNCTION], "function")
+          resolved_tokens << Token.new(Token::TOKEN_TYPES[:CALLED], "called")
           i += 4
-        else
-          resolved_tokens << token
-          i += 1
+          next
         end
-      else
-        resolved_tokens << token
-        i += 1
       end
+      
+      resolved_tokens << token
+      i += 1
     end
     
     @tokens = resolved_tokens
@@ -126,7 +108,7 @@ class Parser
   # Grammar: program → statement*
   def program
     statements = []
-    while @current_token && @current_token.type != :EOF
+    while @current_token
       stmt = statement
       statements << stmt if stmt
     end
@@ -138,32 +120,21 @@ class Parser
     return nil unless @current_token
 
     case @current_token.type
-    when :MAKE
-      # CRITICAL FIX: Check for assignment BEFORE falling through to function definition
-      if peek(1)&.type == :ASSIGN
-        return parse_assignment
-      elsif (peek(1)&.type == :IDENTIFIER && peek(1)&.value == "a" &&
-            peek(2)&.type == :FUNCTION) ||
-            (peek(1)&.type == :FUNCTION)
-        # This is a function definition: "make [a] function [called]..."
-        return parse_function_definition
-      else
-        # This is a standalone make variable reference
-        return expression
-      end
-    when :CALL
+    when Token::TOKEN_TYPES[:MAKE]
+      return parse_function_definition
+    when Token::TOKEN_TYPES[:CALL]
       return parse_function_call
-    when :IF
+    when Token::TOKEN_TYPES[:IF]
       return parse_if_statement
-    when :WHILE
+    when Token::TOKEN_TYPES[:WHILE]
       return parse_while_statement
-    when :RETURN
+    when Token::TOKEN_TYPES[:RETURN]
       return parse_return_statement
-    when :PRINT
+    when Token::TOKEN_TYPES[:PRINT]
       return parse_print_statement
-    when :IDENTIFIER
-      # CRITICAL FIX: Check for assignment BEFORE falling through to expression
-      if peek(1)&.type == :ASSIGN
+    when Token::TOKEN_TYPES[:IDENTIFIER]
+      # Check for assignment
+      if peek(1)&.type == Token::TOKEN_TYPES[:ASSIGN]
         return parse_assignment
       else
         return expression
@@ -173,60 +144,49 @@ class Parser
     end
   end
 
-  # Grammar: assignment → (IDENTIFIER | MAKE) '=' expression
+  # Grammar: assignment → IDENTIFIER '=' expression
   def parse_assignment
     var_name = @current_token.value
-    # Accept both IDENTIFIER and MAKE tokens as variable names
-    if @current_token.type == :IDENTIFIER
-      eat(:IDENTIFIER)
-    elsif @current_token.type == :MAKE
-      eat(:MAKE)
-    else
-      error("Expected IDENTIFIER or MAKE for variable assignment")
-    end
-    eat(:ASSIGN)
+    eat(Token::TOKEN_TYPES[:IDENTIFIER])
+    eat(Token::TOKEN_TYPES[:ASSIGN])
     value = expression
     return AssignmentNode.new(var_name, value)
   end
 
-  # Grammar: function_definition → 'make' ['a'] 'function' ['called'] IDENTIFIER parameter_list? '{' statement* '}'
+  # Grammar: function_definition → 'make' 'a' 'function' 'called' IDENTIFIER parameter_list? '{' statement* '}'
   def parse_function_definition
-    eat(:MAKE)
+    eat(Token::TOKEN_TYPES[:MAKE])
     
-    # Skip 'a' if present (optional)
-    if @current_token&.type == :IDENTIFIER && @current_token.value == "a"
+    # Skip 'a' if present
+    if @current_token&.type == Token::TOKEN_TYPES[:IDENTIFIER] && @current_token.value == "a"
       advance
     end
     
-    eat(:FUNCTION)
-    
-    # Skip 'called' if present (optional)
-    if @current_token&.type == :CALLED
-      advance
-    end
+    eat(Token::TOKEN_TYPES[:FUNCTION])
+    eat(Token::TOKEN_TYPES[:CALLED])
     
     function_name = @current_token.value
-    eat(:IDENTIFIER)
+    eat(Token::TOKEN_TYPES[:IDENTIFIER])
     
     # Parse parameters if present
     parameters = []
     return_type = nil
     
-    if @current_token&.type == :TAKES
-      eat(:TAKES)
-      eat(:COLON) if @current_token&.type == :COLON
+    if @current_token&.type == Token::TOKEN_TYPES[:TAKES]
+      eat(Token::TOKEN_TYPES[:TAKES])
+      eat(Token::TOKEN_TYPES[:COLON]) if @current_token&.type == Token::TOKEN_TYPES[:COLON]
       
       # Parse parameter list
       loop do
-        break unless @current_token&.type == :IDENTIFIER
+        break unless @current_token&.type == Token::TOKEN_TYPES[:IDENTIFIER]
         
         param_name = @current_token.value
-        eat(:IDENTIFIER)
+        eat(Token::TOKEN_TYPES[:IDENTIFIER])
         
         parameters << ParameterNode.new(param_name)
         
-        if @current_token&.type == :COMMA
-          eat(:COMMA)
+        if @current_token&.type == Token::TOKEN_TYPES[:COMMA]
+          eat(Token::TOKEN_TYPES[:COMMA])
         else
           break
         end
@@ -234,23 +194,23 @@ class Parser
     end
     
     # Parse return type if present
-    if @current_token&.type == :RETURNS
-      eat(:RETURNS)
-      eat(:COLON) if @current_token&.type == :COLON
+    if @current_token&.type == Token::TOKEN_TYPES[:RETURNS]
+      eat(Token::TOKEN_TYPES[:RETURNS])
+      eat(Token::TOKEN_TYPES[:COLON]) if @current_token&.type == Token::TOKEN_TYPES[:COLON]
       return_type = @current_token.value
-      eat(:IDENTIFIER)
+      eat(Token::TOKEN_TYPES[:IDENTIFIER])
     end
     
     # Parse function body
-    eat(:LBRACE)
+    eat(Token::TOKEN_TYPES[:LBRACE])
     
     body_statements = []
-    while @current_token && @current_token.type != :RBRACE
+    while @current_token && @current_token.type != Token::TOKEN_TYPES[:RBRACE]
       stmt = statement
       body_statements << stmt if stmt
     end
     
-    eat(:RBRACE)
+    eat(Token::TOKEN_TYPES[:RBRACE])
     
     body = body_statements.length == 1 ? body_statements[0] : BlockNode.new(body_statements)
     
@@ -259,56 +219,56 @@ class Parser
 
   # Grammar: function_call → 'call' IDENTIFIER ('with' argument_list)?
   def parse_function_call
-    eat(:CALL)
+    eat(Token::TOKEN_TYPES[:CALL])
     
     function_name = @current_token.value
-    eat(:IDENTIFIER)
+    eat(Token::TOKEN_TYPES[:IDENTIFIER])
     
     arguments = []
     
     # Handle different function call syntaxes
-    if @current_token&.type == :LPAREN
+    if @current_token&.type == Token::TOKEN_TYPES[:LPAREN]
       # Parentheses syntax: call func(arg1, arg2)
-      eat(:LPAREN)
+      eat(Token::TOKEN_TYPES[:LPAREN])
       
-      unless @current_token&.type == :RPAREN
+      unless @current_token&.type == Token::TOKEN_TYPES[:RPAREN]
         loop do
           arguments << expression
           
-          if @current_token&.type == :COMMA
-            eat(:COMMA)
+          if @current_token&.type == Token::TOKEN_TYPES[:COMMA]
+            eat(Token::TOKEN_TYPES[:COMMA])
           else
             break
           end
         end
       end
       
-      eat(:RPAREN)
-    elsif @current_token&.type == :WITH
+      eat(Token::TOKEN_TYPES[:RPAREN])
+    elsif @current_token&.type == Token::TOKEN_TYPES[:WITH]
       # With syntax: call func with arg1, arg2
-      eat(:WITH)
+      eat(Token::TOKEN_TYPES[:WITH])
       
       loop do
         arguments << expression
         
-        if @current_token&.type == :COMMA
-          eat(:COMMA)
+        if @current_token&.type == Token::TOKEN_TYPES[:COMMA]
+          eat(Token::TOKEN_TYPES[:COMMA])
         else
           break
         end
       end
-    elsif @current_token&.type == :IDENTIFIER && @current_token.value == "which"
+    elsif @current_token&.type == Token::TOKEN_TYPES[:IDENTIFIER] && @current_token.value == "which"
       # Goal-oriented syntax: call func which requires: arg1, arg2
       advance # skip 'which'
-      if @current_token&.type == :IDENTIFIER && @current_token.value == "requires"
+      if @current_token&.type == Token::TOKEN_TYPES[:IDENTIFIER] && @current_token.value == "requires"
         advance # skip 'requires'
-        eat(:COLON) if @current_token&.type == :COLON
+        eat(Token::TOKEN_TYPES[:COLON]) if @current_token&.type == Token::TOKEN_TYPES[:COLON]
         
         loop do
           arguments << expression
           
-          if @current_token&.type == :COMMA
-            eat(:COMMA)
+          if @current_token&.type == Token::TOKEN_TYPES[:COMMA]
+            eat(Token::TOKEN_TYPES[:COMMA])
           else
             break
           end
@@ -321,14 +281,13 @@ class Parser
 
   # Grammar: return_statement → 'return' expression?
   def parse_return_statement
-    eat(:RETURN)
+    eat(Token::TOKEN_TYPES[:RETURN])
     
     if @current_token && 
-       @current_token.type != :RBRACE &&
-       @current_token.type != :END &&
-       @current_token.type != :ELSE &&
-       @current_token.type != :ELSIF &&
-       @current_token.type != :EOF
+       @current_token.type != Token::TOKEN_TYPES[:RBRACE] &&
+       @current_token.type != Token::TOKEN_TYPES[:END] &&
+       @current_token.type != Token::TOKEN_TYPES[:ELSE] &&
+       @current_token.type != Token::TOKEN_TYPES[:ELSIF]
       
       expr = expression
       return ReturnNode.new(expr)
@@ -339,21 +298,21 @@ class Parser
 
   # Grammar: print_statement → 'print' expression
   def parse_print_statement
-    eat(:PRINT)
+    eat(Token::TOKEN_TYPES[:PRINT])
     expr = expression
     return PrintNode.new(expr)
   end
 
   # Grammar: if_statement → 'if' expression 'then' statement ('else' statement)? 'end'
   def parse_if_statement
-    eat(:IF)
+    eat(Token::TOKEN_TYPES[:IF])
     condition = expression
-    eat(:THEN)
+    eat(Token::TOKEN_TYPES[:THEN])
     
     then_statements = []
     while @current_token && 
-          @current_token.type != :ELSE && 
-          @current_token.type != :END
+          @current_token.type != Token::TOKEN_TYPES[:ELSE] && 
+          @current_token.type != Token::TOKEN_TYPES[:END]
       stmt = statement
       then_statements << stmt if stmt
     end
@@ -361,11 +320,11 @@ class Parser
     then_branch = then_statements.length == 1 ? then_statements[0] : BlockNode.new(then_statements)
     
     else_branch = nil
-    if @current_token&.type == :ELSE
-      eat(:ELSE)
+    if @current_token&.type == Token::TOKEN_TYPES[:ELSE]
+      eat(Token::TOKEN_TYPES[:ELSE])
       
       else_statements = []
-      while @current_token && @current_token.type != :END
+      while @current_token && @current_token.type != Token::TOKEN_TYPES[:END]
         stmt = statement
         else_statements << stmt if stmt
       end
@@ -373,26 +332,26 @@ class Parser
       else_branch = else_statements.length == 1 ? else_statements[0] : BlockNode.new(else_statements)
     end
     
-    eat(:END)
+    eat(Token::TOKEN_TYPES[:END])
     
     return IfNode.new(condition, then_branch, else_branch)
   end
 
   # Grammar: while_statement → 'while' expression 'do' statement* 'end'
   def parse_while_statement
-    eat(:WHILE)
+    eat(Token::TOKEN_TYPES[:WHILE])
     condition = expression
-    eat(:DO)
+    eat(Token::TOKEN_TYPES[:DO])
     
     body_statements = []
-    while @current_token && @current_token.type != :END
+    while @current_token && @current_token.type != Token::TOKEN_TYPES[:END]
       stmt = statement
       body_statements << stmt if stmt
     end
     
     body = body_statements.length == 1 ? body_statements[0] : BlockNode.new(body_statements)
     
-    eat(:END)
+    eat(Token::TOKEN_TYPES[:END])
     
     return WhileNode.new(condition, body)
   end
@@ -405,7 +364,7 @@ class Parser
   def logical_or
     left = logical_and
     
-    while @current_token&.type == :OR
+    while @current_token&.type == Token::TOKEN_TYPES[:OR]
       op = @current_token.type
       advance
       right = logical_and
@@ -418,7 +377,7 @@ class Parser
   def logical_and
     left = equality
     
-    while @current_token&.type == :AND
+    while @current_token&.type == Token::TOKEN_TYPES[:AND]
       op = @current_token.type
       advance
       right = equality
@@ -431,8 +390,8 @@ class Parser
   def equality
     left = comparison
     
-    while @current_token&.type == :EQUAL ||
-          @current_token&.type == :NOT_EQUAL
+    while @current_token&.type == Token::TOKEN_TYPES[:EQUAL] ||
+          @current_token&.type == Token::TOKEN_TYPES[:NOT_EQUAL]
       op = @current_token.type
       advance
       right = comparison
@@ -445,10 +404,10 @@ class Parser
   def comparison
     left = arithmetic
     
-    while @current_token&.type == :LESS ||
-          @current_token&.type == :LESS_EQUAL ||
-          @current_token&.type == :GREATER ||
-          @current_token&.type == :GREATER_EQUAL
+    while @current_token&.type == Token::TOKEN_TYPES[:LESS] ||
+          @current_token&.type == Token::TOKEN_TYPES[:LESS_EQUAL] ||
+          @current_token&.type == Token::TOKEN_TYPES[:GREATER] ||
+          @current_token&.type == Token::TOKEN_TYPES[:GREATER_EQUAL]
       op = @current_token.type
       advance
       right = arithmetic
@@ -461,8 +420,8 @@ class Parser
   def arithmetic
     left = term
     
-    while @current_token&.type == :PLUS ||
-          @current_token&.type == :MINUS
+    while @current_token&.type == Token::TOKEN_TYPES[:PLUS] ||
+          @current_token&.type == Token::TOKEN_TYPES[:MINUS]
       op = @current_token.type
       advance
       right = term
@@ -475,9 +434,9 @@ class Parser
   def term
     left = postfix
     
-    while @current_token&.type == :STAR ||
-          @current_token&.type == :SLASH ||
-          @current_token&.type == :PERCENT
+    while @current_token&.type == Token::TOKEN_TYPES[:STAR] ||
+          @current_token&.type == Token::TOKEN_TYPES[:SLASH] ||
+          @current_token&.type == Token::TOKEN_TYPES[:PERCENT]
       op = @current_token.type
       advance
       right = postfix
@@ -491,23 +450,23 @@ class Parser
     left = primary
     
     # Handle string methods
-    while @current_token&.type == :DOT
+    while @current_token&.type == Token::TOKEN_TYPES[:DOT]
       advance # consume '.'
       
-      if @current_token&.type == :IDENTIFIER
+      if @current_token&.type == Token::TOKEN_TYPES[:IDENTIFIER]
         method_name = @current_token.value
         advance
         
-        if @current_token&.type == :LPAREN
+        if @current_token&.type == Token::TOKEN_TYPES[:LPAREN]
           # Method call with arguments
           advance # consume '('
           
           arguments = []
-          unless @current_token&.type == :RPAREN
+          unless @current_token&.type == Token::TOKEN_TYPES[:RPAREN]
             loop do
               arguments << expression
               
-              if @current_token&.type == :COMMA
+              if @current_token&.type == Token::TOKEN_TYPES[:COMMA]
                 advance
               else
                 break
@@ -515,7 +474,7 @@ class Parser
             end
           end
           
-          eat(:RPAREN)
+          eat(Token::TOKEN_TYPES[:RPAREN])
           left = MethodCallNode.new(left, method_name, arguments)
         else
           # Method call without arguments
@@ -532,28 +491,28 @@ class Parser
   def primary
     token = @current_token
     
-    if token.type == :NUMBER
+    if token.type == Token::TOKEN_TYPES[:NUMBER]
       advance
       return NumberNode.new(token.value.to_f)
-    elsif token.type == :STRING
+    elsif token.type == Token::TOKEN_TYPES[:STRING]
       advance
       return StringNode.new(token.value)
-    elsif token.type == :TRUE || token.type == :FALSE
+    elsif token.type == Token::TOKEN_TYPES[:TRUE] || token.type == Token::TOKEN_TYPES[:FALSE]
       return parse_boolean
-    elsif token.type == :IDENTIFIER
+    elsif token.type == Token::TOKEN_TYPES[:IDENTIFIER]
       # This could be a variable reference or function call
-      if peek(1)&.type == :LPAREN
+      if peek(1)&.type == Token::TOKEN_TYPES[:LPAREN]
         # This looks like a function call
         function_name = token.value
         advance
-        eat(:LPAREN)
+        eat(Token::TOKEN_TYPES[:LPAREN])
         
         arguments = []
-        unless @current_token&.type == :RPAREN
+        unless @current_token&.type == Token::TOKEN_TYPES[:RPAREN]
           loop do
             arguments << expression
             
-            if @current_token&.type == :COMMA
+            if @current_token&.type == Token::TOKEN_TYPES[:COMMA]
               advance
             else
               break
@@ -561,39 +520,19 @@ class Parser
           end
         end
         
-        eat(:RPAREN)
+        eat(Token::TOKEN_TYPES[:RPAREN])
         return FunctionCallNode.new(function_name, arguments)
       else
         # Variable reference
         advance
         return VariableNode.new(token.value)
       end
-    elsif token.type == :MAKE
-      # MAKE token used as variable reference (not function definition)
-      advance
-      return VariableNode.new(token.value)
-    elsif token.type == :CALL
+    elsif token.type == Token::TOKEN_TYPES[:CALL]
       return parse_function_call
-    elsif token.type == :FUNCTION
-      # FUNCTION token used as variable reference (not function definition)
-      advance
-      return VariableNode.new(token.value)
-    elsif token.type == :CALLED
-      # CALLED token used as variable reference (not function definition)
-      advance
-      return VariableNode.new(token.value)
-    elsif token.type == :TAKES
-      # TAKES token used as variable reference (not function definition)
-      advance
-      return VariableNode.new(token.value)
-    elsif token.type == :RETURNS
-      # RETURNS token used as variable reference (not function definition)
-      advance
-      return VariableNode.new(token.value)
-    elsif token.type == :LPAREN
-      eat(:LPAREN)
+    elsif token.type == Token::TOKEN_TYPES[:LPAREN]
+      eat(Token::TOKEN_TYPES[:LPAREN])
       node = expression
-      eat(:RPAREN)
+      eat(Token::TOKEN_TYPES[:RPAREN])
       return node
     else
       error("Unexpected token in factor")
@@ -604,11 +543,11 @@ class Parser
   def parse_boolean
     token = @current_token
     
-    if token.type == :TRUE
-      eat(:TRUE)
+    if token.type == Token::TOKEN_TYPES[:TRUE]
+      eat(Token::TOKEN_TYPES[:TRUE])
       return BooleanNode.new(true)
-    elsif token.type == :FALSE
-      eat(:FALSE)
+    elsif token.type == Token::TOKEN_TYPES[:FALSE]
+      eat(Token::TOKEN_TYPES[:FALSE])
       return BooleanNode.new(false)
     else
       error("Expected boolean")

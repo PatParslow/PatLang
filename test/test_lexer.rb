@@ -1,719 +1,561 @@
+# frozen_string_literal: true
+
 require 'minitest/autorun'
 require_relative '../src/lexer'
 require_relative '../src/token'
 
 class TestLexer < Minitest::Test
-  def test_single_number
-    lexer = Lexer.new("42")
+  def test_empty_input
+    lexer = Lexer.new('')
     tokens = lexer.tokenize
-    
-    assert_equal 2, tokens.length
-    assert_equal Token::TOKEN_TYPES[:NUMBER], tokens[0].type
-    assert_equal 42, tokens[0].value
-    assert_equal Token::TOKEN_TYPES[:EOF], tokens[1].type
-  end
-
-  def test_simple_addition
-    lexer = Lexer.new("2 + 3")
-    tokens = lexer.tokenize
-    
-    expected_types = [
-      Token::TOKEN_TYPES[:NUMBER],
-      Token::TOKEN_TYPES[:PLUS],
-      Token::TOKEN_TYPES[:NUMBER],
-      Token::TOKEN_TYPES[:EOF]
-    ]
-    
-    assert_equal 4, tokens.length
-    expected_types.each_with_index do |expected_type, i|
-      assert_equal expected_type, tokens[i].type
-    end
-    
-    assert_equal 2, tokens[0].value
-    assert_equal 3, tokens[2].value
-  end
-
-  def test_complex_expression
-    lexer = Lexer.new("2 + 3 * 4")
-    tokens = lexer.tokenize
-    
-    expected_types = [
-      Token::TOKEN_TYPES[:NUMBER],
-      Token::TOKEN_TYPES[:PLUS],
-      Token::TOKEN_TYPES[:NUMBER],
-      Token::TOKEN_TYPES[:MULTIPLY],
-      Token::TOKEN_TYPES[:NUMBER],
-      Token::TOKEN_TYPES[:EOF]
-    ]
-    
-    assert_equal 6, tokens.length
-    expected_types.each_with_index do |expected_type, i|
-      assert_equal expected_type, tokens[i].type
-    end
-  end
-
-  def test_parentheses
-    lexer = Lexer.new("(2 + 3) * 4")
-    tokens = lexer.tokenize
-    
-    expected_types = [
-      Token::TOKEN_TYPES[:LPAREN],
-      Token::TOKEN_TYPES[:NUMBER],
-      Token::TOKEN_TYPES[:PLUS],
-      Token::TOKEN_TYPES[:NUMBER],
-      Token::TOKEN_TYPES[:RPAREN],
-      Token::TOKEN_TYPES[:MULTIPLY],
-      Token::TOKEN_TYPES[:NUMBER],
-      Token::TOKEN_TYPES[:EOF]
-    ]
-    
-    assert_equal 8, tokens.length
-    expected_types.each_with_index do |expected_type, i|
-      assert_equal expected_type, tokens[i].type
-    end
-  end
-
-  def test_all_operators
-    lexer = Lexer.new("1 + 2 - 3 * 4 / 5")
-    tokens = lexer.tokenize
-    
-    expected_types = [
-      Token::TOKEN_TYPES[:NUMBER],
-      Token::TOKEN_TYPES[:PLUS],
-      Token::TOKEN_TYPES[:NUMBER],
-      Token::TOKEN_TYPES[:MINUS],
-      Token::TOKEN_TYPES[:NUMBER],
-      Token::TOKEN_TYPES[:MULTIPLY],
-      Token::TOKEN_TYPES[:NUMBER],
-      Token::TOKEN_TYPES[:DIVIDE],
-      Token::TOKEN_TYPES[:NUMBER],
-      Token::TOKEN_TYPES[:EOF]
-    ]
-    
-    assert_equal 10, tokens.length
-    expected_types.each_with_index do |expected_type, i|
-      assert_equal expected_type, tokens[i].type
-    end
+    assert_equal 1, tokens.length
+    assert_equal :EOF, tokens[0].type
   end
 
   def test_whitespace_handling
-    lexer = Lexer.new("  42   +   3  ")
+    lexer = Lexer.new("   \t\n  ")
     tokens = lexer.tokenize
-    
-    assert_equal 4, tokens.length
-    assert_equal Token::TOKEN_TYPES[:NUMBER], tokens[0].type
-    assert_equal 42, tokens[0].value
-    assert_equal Token::TOKEN_TYPES[:PLUS], tokens[1].type
-    assert_equal Token::TOKEN_TYPES[:NUMBER], tokens[2].type
-    assert_equal 3, tokens[2].value
+    assert_equal 1, tokens.length
+    assert_equal :EOF, tokens[0].type
   end
 
-  def test_invalid_character
-    lexer = Lexer.new("2 @ 3")
-    
-    assert_raises(RuntimeError) do
-      lexer.tokenize
+  def test_single_character_tokens
+    test_cases = [
+      ['+', :PLUS],
+      ['-', :MINUS],
+      ['*', :STAR],
+      ['/', :SLASH],
+      ['%', :PERCENT],
+      ['(', :LPAREN],
+      [')', :RPAREN],
+      ['{', :LBRACE],
+      ['}', :RBRACE],
+      [':', :COLON],
+      [',', :COMMA]
+    ]
+
+    test_cases.each do |input, expected_type|
+      lexer = Lexer.new(input)
+      tokens = lexer.tokenize
+      assert_equal 2, tokens.length
+      assert_equal expected_type, tokens[0].type
+      assert_equal :EOF, tokens[1].type
     end
   end
 
-  def test_decimal_numbers
-    lexer = Lexer.new("3.14")
-    tokens = lexer.tokenize
-    
-    assert_equal 2, tokens.length
-    assert_equal Token::TOKEN_TYPES[:NUMBER], tokens[0].type
-    assert_equal 3.14, tokens[0].value
-    assert_equal Token::TOKEN_TYPES[:EOF], tokens[1].type
-  end
-
-  def test_decimal_arithmetic
-    lexer = Lexer.new("2.5 + 1.75")
-    tokens = lexer.tokenize
-    
-    expected_types = [
-      Token::TOKEN_TYPES[:NUMBER],
-      Token::TOKEN_TYPES[:PLUS],
-      Token::TOKEN_TYPES[:NUMBER],
-      Token::TOKEN_TYPES[:EOF]
+  def test_two_character_tokens
+    test_cases = [
+      ['==', :EQUAL],
+      ['!=', :NOT_EQUAL],
+      ['<=', :LESS_EQUAL],
+      ['>=', :GREATER_EQUAL]
     ]
-    
-    assert_equal 4, tokens.length
-    expected_types.each_with_index do |expected_type, i|
-      assert_equal expected_type, tokens[i].type
+
+    test_cases.each do |input, expected_type|
+      lexer = Lexer.new(input)
+      tokens = lexer.tokenize
+      assert_equal 2, tokens.length
+      assert_equal expected_type, tokens[0].type
+      assert_equal :EOF, tokens[1].type
     end
-    
-    assert_equal 2.5, tokens[0].value
-    assert_equal 1.75, tokens[2].value
   end
 
-  def test_mixed_integer_and_decimal
-    lexer = Lexer.new("42 * 3.14")
-    tokens = lexer.tokenize
-    
-    assert_equal 4, tokens.length
-    assert_equal 42, tokens[0].value
-    assert_equal 3.14, tokens[2].value
-  end
-  def test_identifier_tokens
-    lexer = Lexer.new('x variable _test var123 _var_name')
-    tokens = lexer.tokenize
-    
-    assert_equal 6, tokens.length # 5 identifiers + EOF
-    
-    assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[0].type
-    assert_equal 'x', tokens[0].value
-    
-    assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[1].type
-    assert_equal 'variable', tokens[1].value
-    
-    assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[2].type
-    assert_equal '_test', tokens[2].value
-    
-    assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[3].type
-    assert_equal 'var123', tokens[3].value
-    
-    assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[4].type
-    assert_equal '_var_name', tokens[4].value
-    
-    assert_equal Token::TOKEN_TYPES[:EOF], tokens[5].type
-  end
-
-  def test_equals_token
-    lexer = Lexer.new('=')
-    tokens = lexer.tokenize
-    
-    assert_equal 2, tokens.length
-    assert_equal Token::TOKEN_TYPES[:EQUALS], tokens[0].type
-    assert_equal '=', tokens[0].value
-    assert_equal Token::TOKEN_TYPES[:EOF], tokens[1].type
-  end
-
-  def test_assignment_expression
-    lexer = Lexer.new('x = 42')
-    tokens = lexer.tokenize
-    
-    assert_equal 4, tokens.length
-    assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[0].type
-    assert_equal 'x', tokens[0].value
-    assert_equal Token::TOKEN_TYPES[:EQUALS], tokens[1].type
-    assert_equal '=', tokens[1].value
-    assert_equal Token::TOKEN_TYPES[:NUMBER], tokens[2].type
-    assert_equal 42, tokens[2].value
-    assert_equal Token::TOKEN_TYPES[:EOF], tokens[3].type
-  end
-
-  def test_complex_expression_with_variables
-    lexer = Lexer.new('result = x + y * 2')
-    tokens = lexer.tokenize
-    
-    expected_types = [
-      Token::TOKEN_TYPES[:IDENTIFIER],  # result
-      Token::TOKEN_TYPES[:EQUALS],      # =
-      Token::TOKEN_TYPES[:IDENTIFIER],  # x
-      Token::TOKEN_TYPES[:PLUS],        # +
-      Token::TOKEN_TYPES[:IDENTIFIER],  # y
-      Token::TOKEN_TYPES[:MULTIPLY],    # *
-      Token::TOKEN_TYPES[:NUMBER],      # 2
-      Token::TOKEN_TYPES[:EOF]
+  def test_single_vs_double_character_disambiguation
+    # Test that single characters work when not part of double character tokens
+    test_cases = [
+      ['<', :LESS],
+      ['>', :GREATER],
+      ['=', :ASSIGN],
+      ['!', :NOT]
     ]
-    
+
+    test_cases.each do |input, expected_type|
+      lexer = Lexer.new(input)
+      tokens = lexer.tokenize
+      assert_equal 2, tokens.length
+      assert_equal expected_type, tokens[0].type
+      assert_equal :EOF, tokens[1].type
+    end
+  end
+
+  def test_numbers
+    test_cases = [
+      ['42', 42],
+      ['0', 0],
+      ['123', 123],
+      ['3.14', 3.14],
+      ['0.5', 0.5],
+      ['100.0', 100.0]
+    ]
+
+    test_cases.each do |input, expected_value|
+      lexer = Lexer.new(input)
+      tokens = lexer.tokenize
+      assert_equal 2, tokens.length
+      assert_equal :NUMBER, tokens[0].type
+      assert_equal expected_value, tokens[0].value
+      assert_equal :EOF, tokens[1].type
+    end
+  end
+
+  def test_strings
+    test_cases = [
+      ['"hello"', 'hello'],
+      ['"world"', 'world'],
+      ['""', ''],
+      ['"Hello, World!"', 'Hello, World!'],
+      ['"123"', '123']
+    ]
+
+    test_cases.each do |input, expected_value|
+      lexer = Lexer.new(input)
+      tokens = lexer.tokenize
+      assert_equal 2, tokens.length
+      assert_equal :STRING, tokens[0].type
+      assert_equal expected_value, tokens[0].value
+      assert_equal :EOF, tokens[1].type
+    end
+  end
+
+  def test_identifiers_and_keywords
+    keyword_tests = [
+      ['if', :IF],
+      ['then', :THEN],
+      ['else', :ELSE],
+      ['end', :END],
+      ['true', :TRUE],
+      ['false', :FALSE],
+      ['print', :PRINT],
+      ['make', :MAKE],
+      ['a', :A],
+      ['function', :FUNCTION],
+      ['called', :CALLED],
+      ['takes', :TAKES],
+      ['returns', :RETURNS],
+      ['return', :RETURN],
+      ['call', :CALL],
+      ['with', :WITH]
+    ]
+
+    keyword_tests.each do |input, expected_type|
+      lexer = Lexer.new(input)
+      tokens = lexer.tokenize
+      assert_equal 2, tokens.length
+      assert_equal expected_type, tokens[0].type
+      assert_equal :EOF, tokens[1].type
+    end
+
+    # Test regular identifiers
+    identifier_tests = [
+      ['variable', 'variable'],
+      ['x', 'x'],
+      ['myVar', 'myVar'],
+      ['test123', 'test123'],
+      ['_underscore', '_underscore']
+    ]
+
+    identifier_tests.each do |input, expected_value|
+      lexer = Lexer.new(input)
+      tokens = lexer.tokenize
+      assert_equal 2, tokens.length
+      assert_equal :IDENTIFIER, tokens[0].type
+      assert_equal expected_value, tokens[0].value
+      assert_equal :EOF, tokens[1].type
+    end
+  end
+
+  def test_complex_expressions
+    lexer = Lexer.new('x + 5 * (y - 2)')
+    tokens = lexer.tokenize
+
+    expected_types = [:IDENTIFIER, :PLUS, :NUMBER, :STAR, :LPAREN, :IDENTIFIER, :MINUS, :NUMBER, :RPAREN, :EOF]
+    expected_values = ['x', nil, 5, nil, nil, 'y', nil, 2, nil, nil]
+
     assert_equal expected_types.length, tokens.length
+
     expected_types.each_with_index do |expected_type, index|
       assert_equal expected_type, tokens[index].type
     end
-    
-    assert_equal 'result', tokens[0].value
-    assert_equal 'x', tokens[2].value
-    assert_equal 'y', tokens[4].value
-    assert_equal 2, tokens[6].value
-  end
 
-  def test_identifier_edge_cases
-    # Test that identifiers can start with underscore
-    lexer = Lexer.new('_start')
-    tokens = lexer.tokenize
-    assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[0].type
-    assert_equal '_start', tokens[0].value
-    
-    # Test mixed alphanumeric identifiers
-    lexer = Lexer.new('var_2_test')
-    tokens = lexer.tokenize
-    assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[0].type
-    assert_equal 'var_2_test', tokens[0].value
-    
-    # Test single character identifier
-    lexer = Lexer.new('a')
-    tokens = lexer.tokenize
-    assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[0].type
-    assert_equal 'a', tokens[0].value
-  end
-
-  def test_mixed_tokens_with_assignment
-    lexer = Lexer.new('y = 3.14')
-    tokens = lexer.tokenize
-    
-    expected_types = [
-      Token::TOKEN_TYPES[:IDENTIFIER],
-      Token::TOKEN_TYPES[:EQUALS],
-      Token::TOKEN_TYPES[:NUMBER],
-      Token::TOKEN_TYPES[:EOF]
-    ]
-    
-    assert_equal 4, tokens.length
-    expected_types.each_with_index do |expected_type, index|
-      assert_equal expected_type, tokens[index].type
-    end
-    
-    assert_equal 'y', tokens[0].value
-    assert_equal '=', tokens[1].value
-    assert_equal 3.14, tokens[2].value
-  end
-
-  def test_assignment_with_parentheses
-    lexer = Lexer.new('result = (x + y)')
-    tokens = lexer.tokenize
-    
-    expected_types = [
-      Token::TOKEN_TYPES[:IDENTIFIER],  # result
-      Token::TOKEN_TYPES[:EQUALS],      # =
-      Token::TOKEN_TYPES[:LPAREN],      # (
-      Token::TOKEN_TYPES[:IDENTIFIER],  # x
-      Token::TOKEN_TYPES[:PLUS],        # +
-      Token::TOKEN_TYPES[:IDENTIFIER],  # y
-      Token::TOKEN_TYPES[:RPAREN],      # )
-      Token::TOKEN_TYPES[:EOF]
-    ]
-    
-    assert_equal expected_types.length, tokens.length
-    expected_types.each_with_index do |expected_type, index|
-      assert_equal expected_type, tokens[index].type
-    end
-  end
-
-  def test_invalid_identifier_start
-    # Test that identifiers cannot start with numbers (should be parsed as number then identifier)
-    lexer = Lexer.new('123abc')
-    tokens = lexer.tokenize
-    
-    # This should tokenize as a number (123) followed by identifier (abc)
-    assert_equal 3, tokens.length
-    assert_equal Token::TOKEN_TYPES[:NUMBER], tokens[0].type
-    assert_equal 123, tokens[0].value
-    assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[1].type
-    assert_equal 'abc', tokens[1].value
-    assert_equal Token::TOKEN_TYPES[:EOF], tokens[2].type
-  end
-
-  # Tests for boolean literals
-  def test_boolean_true_token
-    lexer = Lexer.new('true')
-    tokens = lexer.tokenize
-    
-    assert_equal 2, tokens.length
-    assert_equal Token::TOKEN_TYPES[:TRUE], tokens[0].type
-    assert_equal 'true', tokens[0].value
-    assert_equal Token::TOKEN_TYPES[:EOF], tokens[1].type
-  end
-
-  def test_boolean_false_token
-    lexer = Lexer.new('false')
-    tokens = lexer.tokenize
-    
-    assert_equal 2, tokens.length
-    assert_equal Token::TOKEN_TYPES[:FALSE], tokens[0].type
-    assert_equal 'false', tokens[0].value
-    assert_equal Token::TOKEN_TYPES[:EOF], tokens[1].type
-  end
-
-  def test_boolean_tokens_in_expression
-    lexer = Lexer.new('x = true')
-    tokens = lexer.tokenize
-    
-    expected_types = [
-      Token::TOKEN_TYPES[:IDENTIFIER],
-      Token::TOKEN_TYPES[:EQUALS],
-      Token::TOKEN_TYPES[:TRUE],
-      Token::TOKEN_TYPES[:EOF]
-    ]
-    
-    assert_equal 4, tokens.length
-    expected_types.each_with_index do |expected_type, index|
-      assert_equal expected_type, tokens[index].type
-    end
-    
-    assert_equal 'x', tokens[0].value
-    assert_equal 'true', tokens[2].value
-  end
-
-  # Tests for comparison operators
-  def test_equal_operator
-    lexer = Lexer.new('==')
-    tokens = lexer.tokenize
-    
-    assert_equal 2, tokens.length
-    assert_equal Token::TOKEN_TYPES[:EQUAL], tokens[0].type
-    assert_equal '==', tokens[0].value
-    assert_equal Token::TOKEN_TYPES[:EOF], tokens[1].type
-  end
-
-  def test_not_equal_operator
-    lexer = Lexer.new('!=')
-    tokens = lexer.tokenize
-    
-    assert_equal 2, tokens.length
-    assert_equal Token::TOKEN_TYPES[:NOT_EQUAL], tokens[0].type
-    assert_equal '!=', tokens[0].value
-    assert_equal Token::TOKEN_TYPES[:EOF], tokens[1].type
-  end
-
-  def test_less_than_operator
-    lexer = Lexer.new('<')
-    tokens = lexer.tokenize
-    
-    assert_equal 2, tokens.length
-    assert_equal Token::TOKEN_TYPES[:LESS_THAN], tokens[0].type
-    assert_equal '<', tokens[0].value
-    assert_equal Token::TOKEN_TYPES[:EOF], tokens[1].type
-  end
-
-  def test_greater_than_operator
-    lexer = Lexer.new('>')
-    tokens = lexer.tokenize
-    
-    assert_equal 2, tokens.length
-    assert_equal Token::TOKEN_TYPES[:GREATER_THAN], tokens[0].type
-    assert_equal '>', tokens[0].value
-    assert_equal Token::TOKEN_TYPES[:EOF], tokens[1].type
-  end
-
-  def test_less_equal_operator
-    lexer = Lexer.new('<=')
-    tokens = lexer.tokenize
-    
-    assert_equal 2, tokens.length
-    assert_equal Token::TOKEN_TYPES[:LESS_EQUAL], tokens[0].type
-    assert_equal '<=', tokens[0].value
-    assert_equal Token::TOKEN_TYPES[:EOF], tokens[1].type
-  end
-
-  def test_greater_equal_operator
-    lexer = Lexer.new('>=')
-    tokens = lexer.tokenize
-    
-    assert_equal 2, tokens.length
-    assert_equal Token::TOKEN_TYPES[:GREATER_EQUAL], tokens[0].type
-    assert_equal '>=', tokens[0].value
-    assert_equal Token::TOKEN_TYPES[:EOF], tokens[1].type
-  end
-
-  def test_comparison_expression
-    lexer = Lexer.new('x == 42')
-    tokens = lexer.tokenize
-    
-    expected_types = [
-      Token::TOKEN_TYPES[:IDENTIFIER],
-      Token::TOKEN_TYPES[:EQUAL],
-      Token::TOKEN_TYPES[:NUMBER],
-      Token::TOKEN_TYPES[:EOF]
-    ]
-    
-    assert_equal 4, tokens.length
-    expected_types.each_with_index do |expected_type, index|
-      assert_equal expected_type, tokens[index].type
-    end
-    
-    assert_equal 'x', tokens[0].value
-    assert_equal '==', tokens[1].value
-    assert_equal 42, tokens[2].value
-  end
-
-  def test_all_comparison_operators_in_sequence
-    lexer = Lexer.new('a == b != c < d > e <= f >= g')
-    tokens = lexer.tokenize
-    
-    expected_types = [
-      Token::TOKEN_TYPES[:IDENTIFIER],   # a
-      Token::TOKEN_TYPES[:EQUAL],        # ==
-      Token::TOKEN_TYPES[:IDENTIFIER],   # b
-      Token::TOKEN_TYPES[:NOT_EQUAL],    # !=
-      Token::TOKEN_TYPES[:IDENTIFIER],   # c
-      Token::TOKEN_TYPES[:LESS_THAN],    # <
-      Token::TOKEN_TYPES[:IDENTIFIER],   # d
-      Token::TOKEN_TYPES[:GREATER_THAN], # >
-      Token::TOKEN_TYPES[:IDENTIFIER],   # e
-      Token::TOKEN_TYPES[:LESS_EQUAL],   # <=
-      Token::TOKEN_TYPES[:IDENTIFIER],   # f
-      Token::TOKEN_TYPES[:GREATER_EQUAL],# >=
-      Token::TOKEN_TYPES[:IDENTIFIER],   # g
-      Token::TOKEN_TYPES[:EOF]
-    ]
-    
-    assert_equal expected_types.length, tokens.length
-    expected_types.each_with_index do |expected_type, index|
-      assert_equal expected_type, tokens[index].type
-    end
-  end
-
-  # Tests for control flow keywords
-  def test_if_keyword
-    lexer = Lexer.new('if')
-    tokens = lexer.tokenize
-    
-    assert_equal 2, tokens.length
-    assert_equal Token::TOKEN_TYPES[:IF], tokens[0].type
-    assert_equal 'if', tokens[0].value
-    assert_equal Token::TOKEN_TYPES[:EOF], tokens[1].type
-  end
-
-  def test_then_keyword
-    lexer = Lexer.new('then')
-    tokens = lexer.tokenize
-    
-    assert_equal 2, tokens.length
-    assert_equal Token::TOKEN_TYPES[:THEN], tokens[0].type
-    assert_equal 'then', tokens[0].value
-    assert_equal Token::TOKEN_TYPES[:EOF], tokens[1].type
-  end
-
-  def test_else_keyword
-    lexer = Lexer.new('else')
-    tokens = lexer.tokenize
-    
-    assert_equal 2, tokens.length
-    assert_equal Token::TOKEN_TYPES[:ELSE], tokens[0].type
-    assert_equal 'else', tokens[0].value
-    assert_equal Token::TOKEN_TYPES[:EOF], tokens[1].type
-  end
-
-  def test_end_keyword
-    lexer = Lexer.new('end')
-    tokens = lexer.tokenize
-    
-    assert_equal 2, tokens.length
-    assert_equal Token::TOKEN_TYPES[:END], tokens[0].type
-    assert_equal 'end', tokens[0].value
-    assert_equal Token::TOKEN_TYPES[:EOF], tokens[1].type
-  end
-
-  def test_while_keyword
-    lexer = Lexer.new('while')
-    tokens = lexer.tokenize
-    
-    assert_equal 2, tokens.length
-    assert_equal Token::TOKEN_TYPES[:WHILE], tokens[0].type
-    assert_equal 'while', tokens[0].value
-    assert_equal Token::TOKEN_TYPES[:EOF], tokens[1].type
-  end
-
-  def test_do_keyword
-    lexer = Lexer.new('do')
-    tokens = lexer.tokenize
-    
-    assert_equal 2, tokens.length
-    assert_equal Token::TOKEN_TYPES[:DO], tokens[0].type
-    assert_equal 'do', tokens[0].value
-    assert_equal Token::TOKEN_TYPES[:EOF], tokens[1].type
-  end
-
-  def test_if_statement_keywords
-    lexer = Lexer.new('if x == 42 then y = 1 else y = 0 end')
-    tokens = lexer.tokenize
-    
-    expected_types = [
-      Token::TOKEN_TYPES[:IF],         # if
-      Token::TOKEN_TYPES[:IDENTIFIER], # x
-      Token::TOKEN_TYPES[:EQUAL],      # ==
-      Token::TOKEN_TYPES[:NUMBER],     # 42
-      Token::TOKEN_TYPES[:THEN],       # then
-      Token::TOKEN_TYPES[:IDENTIFIER], # y
-      Token::TOKEN_TYPES[:EQUALS],     # =
-      Token::TOKEN_TYPES[:NUMBER],     # 1
-      Token::TOKEN_TYPES[:ELSE],       # else
-      Token::TOKEN_TYPES[:IDENTIFIER], # y
-      Token::TOKEN_TYPES[:EQUALS],     # =
-      Token::TOKEN_TYPES[:NUMBER],     # 0
-      Token::TOKEN_TYPES[:END],        # end
-      Token::TOKEN_TYPES[:EOF]
-    ]
-    
-    assert_equal expected_types.length, tokens.length
-    expected_types.each_with_index do |expected_type, index|
-      assert_equal expected_type, tokens[index].type
-    end
-  end
-
-  def test_while_statement_keywords
-    lexer = Lexer.new('while x < 10 do x = x + 1 end')
-    tokens = lexer.tokenize
-    
-    expected_types = [
-      Token::TOKEN_TYPES[:WHILE],      # while
-      Token::TOKEN_TYPES[:IDENTIFIER], # x
-      Token::TOKEN_TYPES[:LESS_THAN],  # <
-      Token::TOKEN_TYPES[:NUMBER],     # 10
-      Token::TOKEN_TYPES[:DO],         # do
-      Token::TOKEN_TYPES[:IDENTIFIER], # x
-      Token::TOKEN_TYPES[:EQUALS],     # =
-      Token::TOKEN_TYPES[:IDENTIFIER], # x
-      Token::TOKEN_TYPES[:PLUS],       # +
-      Token::TOKEN_TYPES[:NUMBER],     # 1
-      Token::TOKEN_TYPES[:END],        # end
-      Token::TOKEN_TYPES[:EOF]
-    ]
-    
-    assert_equal expected_types.length, tokens.length
-    expected_types.each_with_index do |expected_type, index|
-      assert_equal expected_type, tokens[index].type
-    end
-  end
-
-  # Test edge cases and error conditions
-  def test_single_equals_vs_double_equals
-    # Single equals should be EQUALS token
-    lexer = Lexer.new('x = 5')
-    tokens = lexer.tokenize
-    assert_equal Token::TOKEN_TYPES[:EQUALS], tokens[1].type
-    assert_equal '=', tokens[1].value
-    
-    # Double equals should be EQUAL token
-    lexer = Lexer.new('x == 5')
-    tokens = lexer.tokenize
-    assert_equal Token::TOKEN_TYPES[:EQUAL], tokens[1].type
-    assert_equal '==', tokens[1].value
-  end
-
-  def test_invalid_exclamation_mark
-    lexer = Lexer.new('!')
-    
-    assert_raises(RuntimeError) do
-      lexer.tokenize
-    end
-  end
-
-  def test_keywords_case_sensitive
-    # Keywords should be case sensitive
-    lexer = Lexer.new('True FALSE If THEN')
-    tokens = lexer.tokenize
-    
-    # These should all be identifiers, not keywords
-    assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[0].type
-    assert_equal 'True', tokens[0].value
-    
-    assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[1].type
-    assert_equal 'FALSE', tokens[1].value
-    
-    assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[2].type
-    assert_equal 'If', tokens[2].value
-    
-    assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[3].type
-    assert_equal 'THEN', tokens[3].value
-  end
-# Additional coverage tests for new lexer features
-  def test_comprehensive_boolean_and_comparison_mix
-    lexer = Lexer.new('true == false != x < y > z <= a >= b')
-    tokens = lexer.tokenize
-    
-    expected_types = [
-      Token::TOKEN_TYPES[:TRUE],         # true
-      Token::TOKEN_TYPES[:EQUAL],        # ==
-      Token::TOKEN_TYPES[:FALSE],        # false
-      Token::TOKEN_TYPES[:NOT_EQUAL],    # !=
-      Token::TOKEN_TYPES[:IDENTIFIER],   # x
-      Token::TOKEN_TYPES[:LESS_THAN],    # <
-      Token::TOKEN_TYPES[:IDENTIFIER],   # y
-      Token::TOKEN_TYPES[:GREATER_THAN], # >
-      Token::TOKEN_TYPES[:IDENTIFIER],   # z
-      Token::TOKEN_TYPES[:LESS_EQUAL],   # <=
-      Token::TOKEN_TYPES[:IDENTIFIER],   # a
-      Token::TOKEN_TYPES[:GREATER_EQUAL],# >=
-      Token::TOKEN_TYPES[:IDENTIFIER],   # b
-      Token::TOKEN_TYPES[:EOF]
-    ]
-    
-    assert_equal expected_types.length, tokens.length
-    expected_types.each_with_index do |expected_type, index|
-      assert_equal expected_type, tokens[index].type
-    end
-  end
-
-  def test_all_new_keywords_in_complex_expression
-    lexer = Lexer.new('if true then x = 1 else y = 2 end while false do z = 3 end')
-    tokens = lexer.tokenize
-    
-    expected_types = [
-      Token::TOKEN_TYPES[:IF],           # if
-      Token::TOKEN_TYPES[:TRUE],         # true
-      Token::TOKEN_TYPES[:THEN],         # then
-      Token::TOKEN_TYPES[:IDENTIFIER],   # x
-      Token::TOKEN_TYPES[:EQUALS],       # =
-      Token::TOKEN_TYPES[:NUMBER],       # 1
-      Token::TOKEN_TYPES[:ELSE],         # else
-      Token::TOKEN_TYPES[:IDENTIFIER],   # y
-      Token::TOKEN_TYPES[:EQUALS],       # =
-      Token::TOKEN_TYPES[:NUMBER],       # 2
-      Token::TOKEN_TYPES[:END],          # end
-      Token::TOKEN_TYPES[:WHILE],        # while
-      Token::TOKEN_TYPES[:FALSE],        # false
-      Token::TOKEN_TYPES[:DO],           # do
-      Token::TOKEN_TYPES[:IDENTIFIER],   # z
-      Token::TOKEN_TYPES[:EQUALS],       # =
-      Token::TOKEN_TYPES[:NUMBER],       # 3
-      Token::TOKEN_TYPES[:END],          # end
-      Token::TOKEN_TYPES[:EOF]
-    ]
-    
-    assert_equal expected_types.length, tokens.length
-    expected_types.each_with_index do |expected_type, index|
-      assert_equal expected_type, tokens[index].type
-    end
-  end
-
-  def test_peek_char_functionality_with_lookahead
-    # Test that peek_char works correctly for multi-character tokens
-    lexer = Lexer.new('== != <= >=')
-    tokens = lexer.tokenize
-    
-    assert_equal 5, tokens.length
-    assert_equal Token::TOKEN_TYPES[:EQUAL], tokens[0].type
-    assert_equal '==', tokens[0].value
-    assert_equal Token::TOKEN_TYPES[:NOT_EQUAL], tokens[1].type
-    assert_equal '!=', tokens[1].value
-    assert_equal Token::TOKEN_TYPES[:LESS_EQUAL], tokens[2].type
-    assert_equal '<=', tokens[2].value
-    assert_equal Token::TOKEN_TYPES[:GREATER_EQUAL], tokens[3].type
-    assert_equal '>=', tokens[3].value
-    assert_equal Token::TOKEN_TYPES[:EOF], tokens[4].type
-  end
-
-  def test_mixed_single_and_double_character_operators
-    lexer = Lexer.new('x = y == z != a < b > c <= d >= e')
-    tokens = lexer.tokenize
-    
-    expected_values = ['x', '=', 'y', '==', 'z', '!=', 'a', '<', 'b', '>', 'c', '<=', 'd', '>=', 'e']
-    
-    assert_equal expected_values.length + 1, tokens.length # +1 for EOF
     expected_values.each_with_index do |expected_value, index|
+      next if expected_value.nil?
       assert_equal expected_value, tokens[index].value
     end
   end
 
-  def test_keywords_as_part_of_identifiers
-    # Test that keywords don't get matched when they're part of larger identifiers
-    lexer = Lexer.new('truthy falsey iff thence elsewhere endgame whiletrue document')
+  def test_if_statement_tokenization
+    lexer = Lexer.new('if x > 5 then print "big" else print "small" end')
     tokens = lexer.tokenize
-    
-    expected_values = ['truthy', 'falsey', 'iff', 'thence', 'elsewhere', 'endgame', 'whiletrue', 'document']
-    
-    assert_equal expected_values.length + 1, tokens.length # +1 for EOF
-    expected_values.each_with_index do |expected_value, index|
-      assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[index].type
+
+    expected_types = [
+      :IF, :IDENTIFIER, :GREATER, :NUMBER, :THEN, :PRINT, :STRING,
+      :ELSE, :PRINT, :STRING, :END, :EOF
+    ]
+
+    assert_equal expected_types.length, tokens.length
+    expected_types.each_with_index do |expected_type, index|
+      assert_equal expected_type, tokens[index].type
+    end
+  end
+
+  def test_assignment_and_comparison
+    lexer = Lexer.new('result = x == y')
+    tokens = lexer.tokenize
+
+    expected_types = [:IDENTIFIER, :ASSIGN, :IDENTIFIER, :EQUAL, :IDENTIFIER, :EOF]
+    assert_equal expected_types.length, tokens.length
+    expected_types.each_with_index do |expected_type, index|
+      assert_equal expected_type, tokens[index].type
+    end
+  end
+
+  def test_string_escaping
+    test_cases = [
+      ['"hello\\"world"', 'hello"world'],
+      ['"\\\\"', '\\'],
+      ['"\\n"', "\n"],
+      ['"\\t"', "\t"]
+    ]
+
+    test_cases.each do |input, expected_value|
+      lexer = Lexer.new(input)
+      tokens = lexer.tokenize
+      assert_equal 2, tokens.length
+      assert_equal :STRING, tokens[0].type
+      assert_equal expected_value, tokens[0].value
+    end
+  end
+
+  def test_position_tracking
+    lexer = Lexer.new("hello\nworld")
+    tokens = lexer.tokenize
+
+    assert_equal 1, tokens[0].line
+    assert_equal 1, tokens[0].column
+    assert_equal 2, tokens[1].line
+    assert_equal 1, tokens[1].column
+  end
+
+  def test_error_handling
+    # Test unclosed string
+    lexer = Lexer.new('"unclosed string')
+    assert_raises(RuntimeError) do
+      lexer.tokenize
+    end
+
+    # Test invalid number format
+    lexer = Lexer.new('3.14.159')
+    assert_raises(RuntimeError) do
+      lexer.tokenize
+    end
+  end
+
+  def test_function_tokenization
+    lexer = Lexer.new('make a function called test')
+    tokens = lexer.tokenize
+
+    expected_types = [:MAKE, :A, :FUNCTION, :CALLED, :IDENTIFIER, :EOF]
+    assert_equal expected_types.length, tokens.length
+    expected_types.each_with_index do |expected_type, index|
+      assert_equal expected_type, tokens[index].type
+    end
+  end
+
+  def test_function_call_tokenization
+    lexer = Lexer.new('call test with 5, 10')
+    tokens = lexer.tokenize
+
+    expected_types = [:CALL, :IDENTIFIER, :WITH, :NUMBER, :COMMA, :NUMBER, :EOF]
+    assert_equal expected_types.length, tokens.length
+    expected_types.each_with_index do |expected_type, index|
+      assert_equal expected_type, tokens[index].type
+    end
+  end
+
+  def test_function_definition_complete
+    input = 'make a function called add takes: x, y { return x + y }'
+    lexer = Lexer.new(input)
+    tokens = lexer.tokenize
+
+    expected_types = [
+      :MAKE, :A, :FUNCTION, :CALLED, :IDENTIFIER, :TAKES, :COLON,
+      :IDENTIFIER, :COMMA, :IDENTIFIER, :LBRACE, :RETURN,
+      :IDENTIFIER, :PLUS, :IDENTIFIER, :RBRACE, :EOF
+    ]
+
+    assert_equal expected_types.length, tokens.length
+    expected_types.each_with_index do |expected_type, index|
+      assert_equal expected_type, tokens[index].type, "Token #{index} should be #{expected_type}, got #{tokens[index].type}"
+    end
+  end
+
+  def test_boolean_and_comparison_operators
+    lexer = Lexer.new('true == false != x <= y >= z < a > b')
+    tokens = lexer.tokenize
+
+    expected_types = [
+      :TRUE, :EQUAL, :FALSE, :NOT_EQUAL, :IDENTIFIER,
+      :LESS_EQUAL, :IDENTIFIER, :GREATER_EQUAL, :IDENTIFIER,
+      :LESS, :IDENTIFIER, :GREATER, :IDENTIFIER, :EOF
+    ]
+
+    assert_equal expected_types.length, tokens.length
+    expected_types.each_with_index do |expected_type, index|
+      assert_equal expected_type, tokens[index].type
+    end
+  end
+
+  def test_arithmetic_expressions
+    lexer = Lexer.new('result = (a + b) * c / d - e % f')
+    tokens = lexer.tokenize
+
+    expected_types = [
+      :IDENTIFIER, :ASSIGN, :LPAREN, :IDENTIFIER, :PLUS, :IDENTIFIER,
+      :RPAREN, :STAR, :IDENTIFIER, :SLASH, :IDENTIFIER, :MINUS,
+      :IDENTIFIER, :PERCENT, :IDENTIFIER, :EOF
+    ]
+
+    assert_equal expected_types.length, tokens.length
+    expected_types.each_with_index do |expected_type, index|
+      assert_equal expected_type, tokens[index].type
+    end
+  end
+
+  def test_mixed_content_tokenization
+    input = <<~CODE
+      if x > 0 then
+        make a function called double takes: n {
+          return n * 2
+        }
+        call double with x
+      end
+    CODE
+
+    lexer = Lexer.new(input)
+    tokens = lexer.tokenize
+
+    # Verify we get sensible tokens without counting exact positions
+    assert_includes tokens.map(&:type), :IF
+    assert_includes tokens.map(&:type), :MAKE
+    assert_includes tokens.map(&:type), :FUNCTION
+    assert_includes tokens.map(&:type), :CALLED
+    assert_includes tokens.map(&:type), :TAKES
+    assert_includes tokens.map(&:type), :RETURN
+    assert_includes tokens.map(&:type), :CALL
+    assert_includes tokens.map(&:type), :WITH
+    assert_includes tokens.map(&:type), :END
+    assert_equal :EOF, tokens.last.type
+  end
+
+  def test_edge_case_tokenization
+    # Test adjacent operators
+    lexer = Lexer.new('x==y!=z<=a>=b')
+    tokens = lexer.tokenize
+
+    expected_types = [
+      :IDENTIFIER, :EQUAL, :IDENTIFIER, :NOT_EQUAL,
+      :IDENTIFIER, :LESS_EQUAL, :IDENTIFIER, :GREATER_EQUAL,
+      :IDENTIFIER, :EOF
+    ]
+
+    assert_equal expected_types.length, tokens.length
+    expected_types.each_with_index do |expected_type, index|
+      assert_equal expected_type, tokens[index].type
+    end
+  end
+
+  def test_number_edge_cases
+    test_cases = [
+      ['0.0', 0.0],
+      ['42.', 42.0],
+      ['.5', 0.5],
+      ['1000', 1000],
+      ['0001', 1]  # Leading zeros
+    ]
+
+    test_cases.each do |input, expected_value|
+      lexer = Lexer.new(input)
+      tokens = lexer.tokenize
+      assert_equal :NUMBER, tokens[0].type
+      assert_equal expected_value, tokens[0].value
+    end
+  end
+
+  def test_identifier_edge_cases
+    test_cases = [
+      'a',
+      '_',
+      '_var',
+      'var_',
+      'var123',
+      'CamelCase',
+      'snake_case',
+      'mixedCase_123'
+    ]
+
+    test_cases.each do |input|
+      lexer = Lexer.new(input)
+      tokens = lexer.tokenize
+      assert_equal :IDENTIFIER, tokens[0].type
+      assert_equal input, tokens[0].value
+    end
+  end
+
+  def test_keyword_case_sensitivity
+    # Keywords should be case sensitive
+    test_cases = [
+      ['IF', :IDENTIFIER],      # Should be identifier, not keyword
+      ['True', :IDENTIFIER],    # Should be identifier, not keyword
+      ['PRINT', :IDENTIFIER],   # Should be identifier, not keyword
+      ['if', :IF],             # Should be keyword
+      ['true', :TRUE],         # Should be keyword
+      ['print', :PRINT]        # Should be keyword
+    ]
+
+    test_cases.each do |input, expected_type|
+      lexer = Lexer.new(input)
+      tokens = lexer.tokenize
+      assert_equal expected_type, tokens[0].type
+    end
+  end
+
+  def test_complex_string_content
+    test_cases = [
+      ['"Hello, World!"', 'Hello, World!'],
+      ['"Numbers: 123 and symbols: @#$"', 'Numbers: 123 and symbols: @#$'],
+      ['"Mixed \\"quotes\\" content"', 'Mixed "quotes" content'],
+      ['"Newline\\nand tab\\there"', "Newline\nand tab\there"]
+    ]
+
+    test_cases.each do |input, expected_value|
+      lexer = Lexer.new(input)
+      tokens = lexer.tokenize
+      assert_equal :STRING, tokens[0].type
+      assert_equal expected_value, tokens[0].value
+    end
+  end
+
+  def test_whitespace_variations
+    inputs = [
+      "   token   ",      # Spaces
+      "\t\ttoken\t\t",   # Tabs
+      "\n\ntoken\n\n",   # Newlines
+      " \t\n token \n\t " # Mixed
+    ]
+
+    inputs.each do |input|
+      lexer = Lexer.new(input)
+      tokens = lexer.tokenize
+      assert_equal 2, tokens.length
+      assert_equal :IDENTIFIER, tokens[0].type
+      assert_equal 'token', tokens[0].value
+      assert_equal :EOF, tokens[1].type
+    end
+  end
+
+  def test_comprehensive_function_syntax
+    input = <<~CODE
+      make a function called calculate takes: x, y returns: number {
+        if x > y then
+          return x + y
+        else
+          return x - y
+        end
+      }
+      
+      result = call calculate with 10, 5
+    CODE
+
+    lexer = Lexer.new(input)
+    tokens = lexer.tokenize
+
+    # Verify essential function tokens are present
+    token_types = tokens.map(&:type)
+
+    assert_includes token_types, :MAKE
+    assert_includes token_types, :A
+    assert_includes token_types, :FUNCTION
+    assert_includes token_types, :CALLED
+    assert_includes token_types, :TAKES
+    assert_includes token_types, :RETURNS
+    assert_includes token_types, :RETURN
+    assert_includes token_types, :CALL
+    assert_includes token_types, :WITH
+    assert_includes token_types, :LBRACE
+    assert_includes token_types, :RBRACE
+    assert_includes token_types, :COLON
+    assert_includes token_types, :COMMA
+
+    # Check we have identifiers for function and variable names
+    identifier_tokens = tokens.select { |t| t.type == :IDENTIFIER }
+    assert_operator identifier_tokens.length, :>, 0
+
+    # Check we have numbers
+    number_tokens = tokens.select { |t| t.type == :NUMBER }
+    assert_operator number_tokens.length, :>, 0
+
+    assert_equal :EOF, tokens.last.type
+  end
+
+  def test_comment_handling
+    test_cases = [
+      ['# This is a comment', []],
+      ["# Comment\ntrue", [:TRUE]],
+      ["x = 5 # inline comment", [:IDENTIFIER, :ASSIGN, :NUMBER]],
+      ["# First line\n# Second line\nx = 1", [:IDENTIFIER, :ASSIGN, :NUMBER]]
+    ]
+
+    test_cases.each do |input, expected_types|
+      lexer = Lexer.new(input)
+      tokens = lexer.tokenize
+      
+      # Remove EOF token for comparison
+      actual_types = tokens[0..-2].map(&:type)
+      assert_equal expected_types, actual_types, "Failed for input: #{input.inspect}"
+    end
+  end
+
+  def test_numeric_precision
+    test_cases = [
+      ['3.141592653589793', 3.141592653589793],
+      ['0.000001', 0.000001],
+      ['1234567890', 1234567890],
+      ['99.99', 99.99]
+    ]
+
+    test_cases.each do |input, expected_value|
+      lexer = Lexer.new(input)
+      tokens = lexer.tokenize
+      assert_equal :NUMBER, tokens[0].type
+      assert_equal expected_value, tokens[0].value
+    end
+  end
+
+  def test_comprehensive_token_values
+    input = 'test_var = 42.5 + "hello world"'
+    lexer = Lexer.new(input)
+    tokens = lexer.tokenize
+
+    expected_tokens = [
+      [:IDENTIFIER, 'test_var'],
+      [:ASSIGN, nil],
+      [:NUMBER, 42.5],
+      [:PLUS, nil],
+      [:STRING, 'hello world'],
+      [:EOF, nil]
+    ]
+
+    assert_equal expected_tokens.length, tokens.length
+
+    expected_tokens.each_with_index do |(expected_type, expected_value), index|
+      assert_equal expected_type, tokens[index].type
       assert_equal expected_value, tokens[index].value
     end
   end
 
   def test_error_handling_comprehensive
-    # Test various invalid character combinations
-    invalid_inputs = ['@', '#', '$', '%', '^', '&', '~', '`']
+    # Test various invalid character combinations (excluding # which is now valid for comments)
+    invalid_inputs = ['@', '$', '%', '^', '&', '~', '`']
     
     invalid_inputs.each do |invalid_char|
       lexer = Lexer.new(invalid_char)
@@ -728,390 +570,52 @@ class TestLexer < Minitest::Test
     tokens = lexer.tokenize
     
     # Check that positions are correctly tracked
-    assert_equal 0, tokens[0].position  # true at position 0
-    assert_equal 5, tokens[1].position  # == at position 5
-    assert_equal 8, tokens[2].position  # false at position 8
+    assert_equal 1, tokens[0].line
+    assert_equal 1, tokens[0].column
+    assert_equal 1, tokens[1].line
+    assert_equal 6, tokens[1].column  # After 'true '
+    assert_equal 1, tokens[2].line
+    assert_equal 9, tokens[2].column  # After 'true == '
   end
 
-  def test_whitespace_around_new_operators
-    lexer = Lexer.new('  true   ==   false   !=   x   ')
-    tokens = lexer.tokenize
-    
-    expected_types = [
-      Token::TOKEN_TYPES[:TRUE],
-      Token::TOKEN_TYPES[:EQUAL],
-      Token::TOKEN_TYPES[:FALSE],
-      Token::TOKEN_TYPES[:NOT_EQUAL],
-      Token::TOKEN_TYPES[:IDENTIFIER],
-      Token::TOKEN_TYPES[:EOF]
-    ]
-    
-    assert_equal expected_types.length, tokens.length
-    expected_types.each_with_index do |expected_type, index|
-      assert_equal expected_type, tokens[index].type
-    end
-  end
-
-  def test_edge_case_empty_input
-    lexer = Lexer.new('')
-    tokens = lexer.tokenize
-    
-    assert_equal 1, tokens.length
-    assert_equal Token::TOKEN_TYPES[:EOF], tokens[0].type
-  end
-
-  def test_edge_case_only_whitespace
-    lexer = Lexer.new("   \t  \n  ")
-    tokens = lexer.tokenize
-    
-    assert_equal 1, tokens.length
-    assert_equal Token::TOKEN_TYPES[:EOF], tokens[0].type
-  end
-
-  def test_complex_nested_comparison_expression
-    lexer = Lexer.new('if (x >= 10) then if (y != 5) then z = true else z = false end end')
-    tokens = lexer.tokenize
-    
-    # This tests complex nesting with all our new token types
-    assert tokens.length > 15
-    
-    # Verify key tokens are present
-    token_values = tokens.map(&:value)
-    assert_includes token_values, 'if'
-    assert_includes token_values, '>='
-    assert_includes token_values, 'then'
-    assert_includes token_values, '!='
-    assert_includes token_values, 'true'
-    assert_includes token_values, 'false'
-    assert_includes token_values, 'else'
-    assert_includes token_values, 'end'
-  end
-# Additional lexer coverage tests for edge cases and error paths
-  def test_get_next_token_method_directly
-    # Test the get_next_token method for all token types
-    lexer = Lexer.new('42')
-    token = lexer.get_next_token
-    assert_equal Token::TOKEN_TYPES[:NUMBER], token.type
-    assert_equal 42, token.value
-    
-    # Get EOF token
-    token = lexer.get_next_token
-    assert_equal Token::TOKEN_TYPES[:EOF], token.type
-  end
-
-  def test_read_number_with_decimal_edge_cases
-    # Test decimal number parsing edge cases
-    lexer = Lexer.new('0.5')
-    tokens = lexer.tokenize
-    assert_equal 0.5, tokens[0].value
-    
-    lexer = Lexer.new('123.0')
-    tokens = lexer.tokenize
-    assert_equal 123.0, tokens[0].value
-    
-    lexer = Lexer.new('0.0')
-    tokens = lexer.tokenize
-    assert_equal 0.0, tokens[0].value
-  end
-
-  def test_advance_method_at_end_of_input
-    lexer = Lexer.new('x')
-    # Manually advance to test edge case
-    lexer.get_next_token  # Consume 'x'
-    token = lexer.get_next_token  # Should be EOF
-    assert_equal Token::TOKEN_TYPES[:EOF], token.type
-  end
-
-  def test_skip_whitespace_various_characters
-    # Test all whitespace characters: space, tab, newline
-    lexer = Lexer.new("  \t\n\r  42")
-    tokens = lexer.tokenize
-    assert_equal Token::TOKEN_TYPES[:NUMBER], tokens[0].type
-    assert_equal 42, tokens[0].value
-  end
-
-  def test_alpha_helper_method_coverage
-    # Test identifier starting with various valid characters
+  def test_function_phrase_tokenization
+    # Test natural language function phrases
     test_cases = [
-      'a123', 'Z999', '_test', 'A_B_C', 'z', 'X'
+      ['make a function', [:MAKE, :A, :FUNCTION]],
+      ['function called', [:FUNCTION, :CALLED]],
+      ['takes:', [:TAKES, :COLON]],
+      ['returns:', [:RETURNS, :COLON]],
+      ['call test with', [:CALL, :IDENTIFIER, :WITH]]
     ]
-    
-    test_cases.each do |identifier|
-      lexer = Lexer.new(identifier)
+
+    test_cases.each do |input, expected_types|
+      lexer = Lexer.new(input)
       tokens = lexer.tokenize
-      assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[0].type
-      assert_equal identifier, tokens[0].value
+      
+      # Remove EOF for comparison
+      actual_types = tokens[0..-2].map(&:type)
+      assert_equal expected_types, actual_types, "Failed for input: #{input}"
     end
   end
 
-  def test_alphanumeric_helper_method_coverage
-    # Test identifiers with numbers and underscores
-    lexer = Lexer.new('var_123_test')
-    tokens = lexer.tokenize
-    assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[0].type
-    assert_equal 'var_123_test', tokens[0].value
-  end
+  def test_nested_braces_and_complex_structure
+    input = <<~CODE
+      make a function called nested {
+        if true then {
+          return call other with { x: 1, y: 2 }
+        }
+      }
+    CODE
 
-  def test_read_identifier_position_tracking
-    lexer = Lexer.new('hello world')
-    tokens = lexer.tokenize
-    
-    assert_equal 0, tokens[0].position  # 'hello' starts at position 0
-    assert_equal 6, tokens[1].position  # 'world' starts at position 6
-  end
-
-  def test_all_single_character_tokens
-    single_char_tests = [
-      ['+', Token::TOKEN_TYPES[:PLUS]],
-      ['-', Token::TOKEN_TYPES[:MINUS]],
-      ['*', Token::TOKEN_TYPES[:MULTIPLY]],
-      ['/', Token::TOKEN_TYPES[:DIVIDE]],
-      ['(', Token::TOKEN_TYPES[:LPAREN]],
-      [')', Token::TOKEN_TYPES[:RPAREN]]
-    ]
-    
-    single_char_tests.each do |char, expected_type|
-      lexer = Lexer.new(char)
-      tokens = lexer.tokenize
-      assert_equal expected_type, tokens[0].type
-      assert_equal char, tokens[0].value
-    end
-  end
-
-  def test_number_token_position_tracking
-    lexer = Lexer.new('123 + 456')
+    lexer = Lexer.new(input)
     tokens = lexer.tokenize
     
-    assert_equal 3, tokens[0].position   # 123 starts at position 3 (after advance)
-    assert_equal 4, tokens[1].position   # + starts at position 4
-    assert_equal 9, tokens[2].position   # 456 starts at position 9
-  end
-
-  def test_error_method_with_invalid_characters
-    # Test error method is called for various invalid characters
-    invalid_chars = ['@', '#', '$', '%', '^', '&', '~', '`', '\\', '|']
+    # Count braces
+    lbrace_count = tokens.count { |t| t.type == :LBRACE }
+    rbrace_count = tokens.count { |t| t.type == :RBRACE }
     
-    invalid_chars.each do |char|
-      lexer = Lexer.new(char)
-      error_raised = false
-      begin
-        lexer.tokenize
-      rescue RuntimeError => e
-        error_raised = true
-        assert_includes e.message, "Invalid character"
-        assert_includes e.message, char
-      end
-      assert error_raised, "Expected error for character: #{char}"
-    end
-  end
-
-  def test_peek_char_at_end_of_input
-    # Test peek_char when at end of input
-    lexer = Lexer.new('x')
-    lexer.get_next_token  # Consume 'x'
-    # peek_char should return nil when at end
-    token = lexer.get_next_token  # This should be EOF
-    assert_equal Token::TOKEN_TYPES[:EOF], token.type
-  end
-
-  def test_tokenize_method_returns_all_tokens
-    lexer = Lexer.new('1 + 2')
-    tokens = lexer.tokenize
-    
-    # Verify all expected tokens are present
-    assert_equal 4, tokens.length
-    assert_equal Token::TOKEN_TYPES[:NUMBER], tokens[0].type
-    assert_equal Token::TOKEN_TYPES[:PLUS], tokens[1].type
-    assert_equal Token::TOKEN_TYPES[:NUMBER], tokens[2].type
-    assert_equal Token::TOKEN_TYPES[:EOF], tokens[3].type
-  end
-
-  def test_comparison_operators_without_second_character
-    # Test single < and > (not <= or >=)
-    lexer = Lexer.new('< >')
-    tokens = lexer.tokenize
-    
-    assert_equal 3, tokens.length
-    assert_equal Token::TOKEN_TYPES[:LESS_THAN], tokens[0].type
-    assert_equal '<', tokens[0].value
-    assert_equal Token::TOKEN_TYPES[:GREATER_THAN], tokens[1].type
-    assert_equal '>', tokens[1].value
-    assert_equal Token::TOKEN_TYPES[:EOF], tokens[2].type
-  end
-
-  def test_equals_vs_double_equals_edge_cases
-    # Test various combinations
-    lexer = Lexer.new('= == === ====')
-    tokens = lexer.tokenize
-    
-    # Should tokenize as: =, ==, ==, =, ==, ==
-    expected_types = [
-      Token::TOKEN_TYPES[:EQUALS],  # =
-      Token::TOKEN_TYPES[:EQUAL],   # ==
-      Token::TOKEN_TYPES[:EQUAL],   # ==
-      Token::TOKEN_TYPES[:EQUALS],  # =
-      Token::TOKEN_TYPES[:EQUAL],   # ==
-      Token::TOKEN_TYPES[:EQUAL],   # ==
-      Token::TOKEN_TYPES[:EOF]
-    ]
-    
-    assert_equal expected_types.length, tokens.length
-    expected_types.each_with_index do |expected_type, index|
-      assert_equal expected_type, tokens[index].type
-    end
-  end
-
-  def test_exclamation_mark_error_conditions
-    # Test ! without = following it
-    lexer = Lexer.new('!x')
-    assert_raises(RuntimeError) do
-      lexer.tokenize
-    end
-    
-    lexer = Lexer.new('! ')
-    assert_raises(RuntimeError) do
-      lexer.tokenize
-    end
-  end
-
-  def test_mixed_numbers_and_operators_comprehensive
-    lexer = Lexer.new('1+2-3*4/5')  # No spaces
-    tokens = lexer.tokenize
-    
-    expected_values = [1, '+', 2, '-', 3, '*', 4, '/', 5]
-    
-    assert_equal expected_values.length + 1, tokens.length  # +1 for EOF
-    expected_values.each_with_index do |expected_value, index|
-      assert_equal expected_value, tokens[index].value
-    end
-  end
-
-  def test_keyword_boundary_detection
-    # Test that keywords must be complete words
-    lexer = Lexer.new('truefalse ifx thenor elsebut endian whilex doit')
-    tokens = lexer.tokenize
-    
-    # All should be identifiers, not keywords
-    expected_identifiers = ['truefalse', 'ifx', 'thenor', 'elsebut', 'endian', 'whilex', 'doit']
-    
-    assert_equal expected_identifiers.length + 1, tokens.length  # +1 for EOF
-    expected_identifiers.each_with_index do |expected_id, index|
-      assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[index].type
-      assert_equal expected_id, tokens[index].value
-    end
-  end
-
-  # String literal tokenization tests (missing from original test file)
-  def test_string_literal_basic
-    lexer = Lexer.new('"hello"')
-    tokens = lexer.tokenize
-    
-    assert_equal 2, tokens.length
-    assert_equal Token::TOKEN_TYPES[:STRING], tokens[0].type
-    assert_equal 'hello', tokens[0].value
-    assert_equal Token::TOKEN_TYPES[:EOF], tokens[1].type
-  end
-
-  def test_string_with_escape_sequences
-    lexer = Lexer.new('"hello\\nworld\\t\\"quote\\""')
-    tokens = lexer.tokenize
-    
-    assert_equal 2, tokens.length
-    assert_equal Token::TOKEN_TYPES[:STRING], tokens[0].type
-    assert_equal "hello\nworld\t\"quote\"", tokens[0].value
-  end
-
-  def test_string_with_all_escape_sequences
-    lexer = Lexer.new('"\\n\\t\\r\\\\\\""')
-    tokens = lexer.tokenize
-    
-    assert_equal Token::TOKEN_TYPES[:STRING], tokens[0].type
-    assert_equal "\n\t\r\\\"", tokens[0].value
-  end
-
-  def test_empty_string
-    lexer = Lexer.new('""')
-    tokens = lexer.tokenize
-    
-    assert_equal 2, tokens.length
-    assert_equal Token::TOKEN_TYPES[:STRING], tokens[0].type
-    assert_equal '', tokens[0].value
-  end
-
-  def test_string_concatenation_tokens
-    lexer = Lexer.new('"hello" + "world"')
-    tokens = lexer.tokenize
-    
-    expected_types = [
-      Token::TOKEN_TYPES[:STRING],
-      Token::TOKEN_TYPES[:PLUS],
-      Token::TOKEN_TYPES[:STRING],
-      Token::TOKEN_TYPES[:EOF]
-    ]
-    
-    assert_equal 4, tokens.length
-    expected_types.each_with_index do |expected_type, index|
-      assert_equal expected_type, tokens[index].type
-    end
-    
-    assert_equal 'hello', tokens[0].value
-    assert_equal 'world', tokens[2].value
-  end
-
-  def test_string_assignment
-    lexer = Lexer.new('name = "John"')
-    tokens = lexer.tokenize
-    
-    expected_types = [
-      Token::TOKEN_TYPES[:IDENTIFIER],
-      Token::TOKEN_TYPES[:EQUALS],
-      Token::TOKEN_TYPES[:STRING],
-      Token::TOKEN_TYPES[:EOF]
-    ]
-    
-    assert_equal 4, tokens.length
-    expected_types.each_with_index do |expected_type, index|
-      assert_equal expected_type, tokens[index].type
-    end
-    
-    assert_equal 'name', tokens[0].value
-    assert_equal 'John', tokens[2].value
-  end
-
-  def test_unterminated_string_error
-    lexer = Lexer.new('"unterminated')
-    
-    assert_raises(RuntimeError) do
-      lexer.tokenize
-    end
-  end
-
-  def test_string_with_single_escape
-    lexer = Lexer.new('"\\n"')
-    tokens = lexer.tokenize
-    
-    assert_equal Token::TOKEN_TYPES[:STRING], tokens[0].type
-    assert_equal "\n", tokens[0].value
-  end
-
-  def test_string_mixed_with_other_tokens
-    lexer = Lexer.new('x = "hello" + y')
-    tokens = lexer.tokenize
-    
-    expected_types = [
-      Token::TOKEN_TYPES[:IDENTIFIER],  # x
-      Token::TOKEN_TYPES[:EQUALS],      # =
-      Token::TOKEN_TYPES[:STRING],      # "hello"
-      Token::TOKEN_TYPES[:PLUS],        # +
-      Token::TOKEN_TYPES[:IDENTIFIER],  # y
-      Token::TOKEN_TYPES[:EOF]
-    ]
-    
-    assert_equal expected_types.length, tokens.length
-    expected_types.each_with_index do |expected_type, index|
-      assert_equal expected_type, tokens[index].type
-    end
-    
-    assert_equal 'hello', tokens[2].value
+    assert_equal 3, lbrace_count
+    assert_equal 3, rbrace_count
+    assert_equal :EOF, tokens.last.type
   end
 end

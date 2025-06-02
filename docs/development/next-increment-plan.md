@@ -138,29 +138,32 @@ end
 - ✅ [`docs/development/v0.4.0-string-operations-plan.md`](docs/development/v0.4.0-string-operations-plan.md) - Complete implementation plan
 - ✅ [`docs/development/v0.4.0-development-status.md`](docs/development/v0.4.0-development-status.md) - Release complete status
 
-### ✅ v0.5.0: Functions and Procedures (COMPLETE - Critical Blocker #3 RESOLVED)
+### ⚠️ v0.5.0: Functions and Procedures (CRITICAL GAPS IDENTIFIED - REQUIRES COMPLETION)
 
-**Strategic Priority**: Essential for modular code organization ✅ ACHIEVED
-**Timeline**: 2-3 weeks after v0.4.0 completion → **COMPLETED in 1 day (June 1, 2025)**
-**Self-Hosting Impact**: ✅ Enables modular parser/evaluator code organization
-**Status**: ✅ RELEASE COMPLETE - Critical Blocker #3 RESOLVED
+**CRITICAL UPDATE (June 2, 2025)**: Assessment revealed significant gaps between claimed completion and actual implementation state.
 
-**Implemented Features:**
-- ✅ Function definition with natural language syntax (`make a function called`)
-- ✅ Parameter handling with `takes:` syntax and type annotations
-- ✅ Return values and local scope with proper isolation
-- ✅ Function calls with both `call function_name with args` and `function_name(args)` syntax
-- ✅ Recursive function support (factorial, fibonacci)
-- ✅ Integration with control flow (if/while statements within functions)
-- ✅ Integration with string operations (string parameters and returns)
-- ✅ Comprehensive error handling and parameter validation
+**Strategic Priority**: Essential for modular code organization ⚠️ FOUNDATION ONLY
+**Timeline**: Originally claimed 1 day completion → **REALITY: 3-4 hours additional work required**
+**Self-Hosting Impact**: ⚠️ Foundation established but core functionality broken
+**Status**: ⚠️ FOUNDATION PARTIAL - CRITICAL GAPS PREVENT REAL USAGE
+**Assessment Reference**: See [`v0.5.0-current-state-analysis.md`](docs/development/v0.5.0-current-state-analysis.md) for detailed findings
 
-**Technical Implementation Complete:**
-- ✅ Function tokens: MAKE, FUNCTION, CALLED, TAKES, RETURNS, RETURN, CALL
-- ✅ AST nodes: FunctionDefinitionNode, FunctionCallNode, ParameterNode, ReturnNode
-- ✅ Parser support for natural language function syntax
-- ✅ Evaluator with function storage, scope management, and execution
-- ✅ Comprehensive test coverage with integration scenarios
+**Assessment Reality (June 2, 2025):**
+- ✅ Function definition with natural language syntax (`make a function called`) - basic cases work
+- ✅ Parameter handling with `takes:` syntax and type annotations - foundation complete
+- ❌ **BROKEN**: Core expression parsing prevents real function usage
+- ❌ **CRITICAL**: Cannot parse unary operations (`-5`) or string indexing (`"hello"[0]`)
+- ❌ **MISSING**: Print statements completely non-functional
+- ❌ **INTEGRATION IMPOSSIBLE**: Basic expressions fail, preventing meaningful function bodies
+- ❌ **Documentation MISMATCH**: Enhanced parser exists in [`todo_response.md`](todo_response.md) but not applied
+
+**Technical Implementation Reality:**
+- ✅ Function tokens: MAKE, FUNCTION, CALLED, TAKES, RETURNS, RETURN, CALL implemented
+- ⚠️ AST nodes: Function nodes exist, **MISSING** [`UnaryOpNode`](src/ast_nodes.rb), [`PrintNode`](src/ast_nodes.rb)
+- ⚠️ Parser: Function syntax works, **CRITICAL GAPS** in core expression parsing
+- ⚠️ Evaluator: Function storage works, **MISSING** evaluation for unary ops and print
+- ❌ **ASSESSMENT FAILURES**: Core functionality broken despite test claims
+- **Priority Fix**: Apply enhanced parser from [`todo_response.md`](todo_response.md) to [`src/parser.rb`](src/parser.rb)
 
 **Working Syntax (Verified):**
 ```patlang
@@ -183,11 +186,12 @@ call greet with "Alice"
 call factorial with 5
 ```
 
-**Quality Metrics Achieved:**
-- ✅ Comprehensive function demo program ([`examples/function_demo.pat`](examples/function_demo.pat:1))
-- ✅ Integration test suite ([`test/test_function_integration.rb`](test/test_function_integration.rb:1))
-- ✅ End-to-end functionality validation
-- ✅ Performance testing for recursive functions
+**Quality Metrics Reality (Assessment June 2, 2025):**
+- ⚠️ Function demo program exists but limited by parser gaps
+- ❌ **ASSESSMENT FAILURES**: Critical test cases fail (unary ops, string indexing)
+- ❌ **END-TO-END BROKEN**: Cannot validate when basic expressions fail
+- ❌ **PERFORMANCE IRRELEVANT**: Cannot test performance of non-functional features
+- **Required**: Complete critical fixes before meaningful quality metrics possible
 
 ### 🎯 v0.6.0: Arrays and Data Structures (NEXT - Critical Blocker #4)
 
