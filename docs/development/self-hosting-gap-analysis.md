@@ -2,8 +2,9 @@
 
 This document analyzes the gap between Patlang's current capabilities and what's required for self-hosting (implementing Patlang in Patlang itself). Self-hosting is a critical milestone that demonstrates language maturity and completeness.
 
-**Current Status**: v0.5.0 Functions Week 1 COMPLETE (ahead of schedule)
-**Strategic Path**: Ruby transpilation for fastest self-hosting
+**Current Status**: v0.5.0 Functions foundation partial, critical gaps identified (June 2, 2025)
+**Strategic Path**: Ruby transpilation for fastest self-hosting (blocked by core functionality gaps)
+**Assessment Reference**: See [`v0.5.0-current-state-analysis.md`](docs/development/v0.5.0-current-state-analysis.md)
 **Updated Timeline**: Self-hosting achievable by v0.9.0 (ahead of original schedule)
 
 ## Current Status: v0.5.0 (Significantly Ahead of Schedule)
@@ -68,12 +69,13 @@ char = source_code[position]
 token_text = source_code.substring(start_pos, end_pos)
 ```
 
-#### 🔄 3. Functions and Procedures (Week 1 COMPLETE)
-**Current**: ✅ Foundation complete - natural language syntax, AST nodes, lexer support
+#### ⚠️ 3. Functions and Procedures (CRITICAL GAPS IDENTIFIED)
+**Current**: ⚠️ Foundation partial - function syntax works, core expression parsing broken
 **Required**: Function definition, parameters, return values, local scope
-**Status**: 🔄 Week 1 of 4 COMPLETE (Parser, Evaluator, Integration remaining)
-**Progress**: 25% complete, ahead of schedule
-**Blocker Impact**: ⚠️ Partially resolved - can define function structure, needs execution
+**Status**: ⚠️ BLOCKED - Core functionality gaps prevent real function usage
+**Assessment**: Basic function definition works, but unary ops (`-5`) and string indexing (`"hello"[0]`) fail
+**Blocker Impact**: 🚨 **CRITICAL** - Cannot implement meaningful functions when basic expressions broken
+**Fix Required**: 3-4 hours to complete missing AST nodes and parser gaps
 
 ```patlang
 # Foundation now available
@@ -184,7 +186,7 @@ try {
 |---------|----------|-------|------------|---------|
 | ✅ v0.3.0 | Control Flow | ✅ 4 | ✅ 4 weeks | ✅ COMPLETE |
 | ✅ v0.4.0 | String Operations | ✅ 2 | ✅ 6 weeks | ✅ COMPLETE |
-| 🔄 v0.5.0 | Functions | 3 remaining | 9 weeks | 🔄 Week 1/4 COMPLETE |
+| ⚠️ v0.5.0 | Functions | 3-4 hours + 3 weeks | 9+ weeks | ⚠️ CRITICAL GAPS BLOCK PROGRESS |
 | v0.6.0 | Arrays/Lists | 3-4 | 12-13 weeks | 📋 PLANNED |
 | v0.7.0 | File I/O + Exceptions | 3-4 | 15-17 weeks | 📋 PLANNED |
 | v0.8.0 | Objects/Classes | 4-5 | 19-22 weeks | 📋 PLANNED |
@@ -250,4 +252,7 @@ Based on comprehensive analysis in [`docs/development/compilation-strategy.md`](
 
 This gap analysis will be updated after each release to track progress toward self-hosting capability.
 
-**Last Updated**: June 1, 2025 - v0.5.0 Functions Week 1 Complete (Ahead of Schedule)
+**Last Updated**: June 2, 2025 - Critical Gap Assessment Complete, Status Corrected
+**Previous Inaccurate Update**: June 1, 2025 - False completion claims
+**Assessment Reference**: [`v0.5.0-current-state-analysis.md`](docs/development/v0.5.0-current-state-analysis.md)
+**Current Reality**: Foundation partial, core functionality requires immediate fixes before self-hosting can proceed
