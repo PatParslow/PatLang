@@ -8,15 +8,9 @@ module EvaluatorModules
     end
 
     def visit_function_definition_node(node)
-      # Check for function overloading validation
-      if @evaluator.functions.key?(node.name)
-        existing_params = @evaluator.functions[node.name][:parameters].length
-        new_params = node.parameters.length
-        if existing_params == new_params
-          raise "Function '#{node.name}' with #{new_params} parameters already exists"
-        end
-      end
-
+      # Allow function redefinition - remove validation that prevents it
+      # This allows the same function to be redefined with same parameters
+      
       # Store function definition in function registry
       function_key = "#{node.name}_#{node.parameters.length}"
       @evaluator.functions[function_key] = {

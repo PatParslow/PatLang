@@ -80,8 +80,7 @@ call quadruple with 3
     code = 'make a function called test { return 42 }'
     
     result = Patlang.evaluate(code)
-    assert_instance_of FunctionDefinitionNode, result, "Function definition should return FunctionDefinitionNode"
-    assert_equal "test", result.name, "Function name should be preserved"
+    assert_equal "test", result, "Function definition should return function name"
   end
   
   def test_recursive_function

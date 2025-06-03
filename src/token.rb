@@ -9,16 +9,18 @@ class Token
     STAR: :MULTIPLY,  # Alias for backward compatibility
     DIVIDE: :DIVIDE,
     SLASH: :DIVIDE,   # Alias for backward compatibility
-    MODULO: :MODULO,
+    PERCENT: :PERCENT,
+    MODULO: :PERCENT,  # Alias for backward compatibility
     LPAREN: :LPAREN,
     RPAREN: :RPAREN,
     IDENTIFIER: :IDENTIFIER,
-    EQUALS: :EQUALS,
-    ASSIGN: :EQUALS,  # Alias for backward compatibility
+    ASSIGN: :ASSIGN,
+    EQUALS: :ASSIGN,  # Alias for backward compatibility
     # Boolean literals
     TRUE: :TRUE,
     FALSE: :FALSE,
     # Comparison operators
+    NOT: :NOT,
     EQUAL: :EQUAL,
     NOT_EQUAL: :NOT_EQUAL,
     LESS_THAN: :LESS_THAN,

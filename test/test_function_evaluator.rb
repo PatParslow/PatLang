@@ -51,7 +51,7 @@ class TestFunctionEvaluator < Minitest::Test
     assert_equal "square", result
   end
 
-  def test_function_overloading_validation_same_params
+  def test_function_redefinition_allowed_same_params
     input1 = <<~PATLANG
       make a function called test takes: x {
         return x
@@ -64,12 +64,19 @@ class TestFunctionEvaluator < Minitest::Test
       }
     PATLANG
     
-    parse_and_evaluate(input1)
+    result1 = parse_and_evaluate(input1)
+    assert_equal "test", result1
     
-    error = assert_raises(RuntimeError) do
-      parse_and_evaluate(input2)
-    end
-    assert_match(/Function 'test' with 1 parameters already exists/, error.message)
+    result2 = parse_and_evaluate(input2)
+    assert_equal "test", result2
+    
+    # Test that the redefined function works
+    input3 = <<~PATLANG
+      call test(5)
+    PATLANG
+    
+    result3 = parse_and_evaluate(input3)
+    assert_equal 10, result3  # y * 2 = 5 * 2 = 10
   end
 
   def test_function_overloading_different_params

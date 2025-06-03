@@ -22,7 +22,7 @@ module EvaluatorModules
       when '+', 'plus'
         # String concatenation with auto-conversion
         if left_value.is_a?(String) || right_value.is_a?(String)
-          left_value.to_s + right_value.to_s
+          convert_to_string(left_value) + convert_to_string(right_value)
         else
           left_value + right_value
         end
@@ -54,6 +54,17 @@ module EvaluatorModules
       end
     end
 
+    def visit_unary_op_node(node)
+      operand_value = @evaluator.evaluate(node.operand)
+      
+      case node.operator.to_s.downcase
+      when '-', 'minus'
+        -operand_value
+      else
+        raise "Unknown unary operator: #{node.operator}"
+      end
+    end
+
     def visit_comparison_node(node)
       left_value = @evaluator.evaluate(node.left)
       right_value = @evaluator.evaluate(node.right)
@@ -78,6 +89,21 @@ module EvaluatorModules
 
     def visit_boolean_node(node)
       node.value
+    end
+
+    private
+
+    # Convert values to strings for concatenation, handling integers specially
+    def convert_to_string(value)
+      case value
+      when Integer
+        value.to_s
+      when Float
+        # Only show decimal places if they're non-zero
+        value == value.to_i ? value.to_i.to_s : value.to_s
+      else
+        value.to_s
+      end
     end
   end
 end

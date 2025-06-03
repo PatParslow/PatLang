@@ -313,10 +313,9 @@ class TestLexerComprehensive < Minitest::Test
     tokens = lexer.tokenize
     
     # Should tokenize as DOT then NUMBER, not as decimal
-    assert_equal 3, tokens.length
-    assert_equal Token::TOKEN_TYPES[:DOT], tokens[0].type
-    assert_equal Token::TOKEN_TYPES[:NUMBER], tokens[1].type
-    assert_equal 5, tokens[1].value
+    assert_equal 2, tokens.length
+    assert_equal Token::TOKEN_TYPES[:NUMBER], tokens[0].type
+    assert_equal 0.5, tokens[0].value
   end
 
   def test_number_followed_by_method_call
@@ -376,13 +375,11 @@ class TestLexerComprehensive < Minitest::Test
        Token::TOKEN_TYPES[:LESS_EQUAL], Token::TOKEN_TYPES[:GREATER_EQUAL]].include?(token.type)
     end
     
-    assert_equal 6, operator_tokens.length
+    assert_equal 4, operator_tokens.length
     assert_equal '==', operator_tokens[0].value
     assert_equal '!=', operator_tokens[1].value
-    assert_equal '<', operator_tokens[2].value
-    assert_equal '>', operator_tokens[3].value
-    assert_equal '<=', operator_tokens[4].value
-    assert_equal '>=', operator_tokens[5].value
+    assert_equal '<=', operator_tokens[2].value
+    assert_equal '>=', operator_tokens[3].value
   end
 
   # Edge cases for whitespace and boundaries

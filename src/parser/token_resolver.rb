@@ -13,24 +13,36 @@ module ParserModules
       return token unless token.is_a?(AmbiguousToken)
       
       # Check if this is an assignment context: identifier followed by =
-      if context_index && context_index + 1 < @tokens.length && 
+      if context_index && context_index + 1 < @tokens.length &&
          @tokens[context_index + 1]&.type == :ASSIGN
         # This is a variable assignment, resolve to identifier
         identifier_possibility = token.resolve_to(:IDENTIFIER)
         return identifier_possibility if identifier_possibility
       end
       
-      # Check if this is part of a function definition phrase
-      if token.possible_types.include?(:MAKE)
-        # Look ahead to see if this is "make a function called"
-        if context_index && context_index + 3 < @tokens.length &&
-           @tokens[context_index + 1]&.type == :IDENTIFIER && @tokens[context_index + 1]&.value == "a" &&
-           @tokens[context_index + 2]&.type == :IDENTIFIER && @tokens[context_index + 2]&.value == "function" &&
-           @tokens[context_index + 3]&.type == :IDENTIFIER && @tokens[context_index + 3]&.value == "called"
-          # This is a function definition, resolve to MAKE
-          make_possibility = token.resolve_to(:MAKE)
-          return make_possibility if make_possibility
+      # Check if this token is part of a function definition context
+      if context_index && is_function_definition_context?(context_index)
+        # Check for specific function keywords in function context
+        if token.can_be?(:FUNCTION)
+          return token.resolve_to(:FUNCTION)
+        elsif token.can_be?(:CALLED)
+          return token.resolve_to(:CALLED)
+        elsif token.can_be?(:MAKE)
+          return token.resolve_to(:MAKE)
+        elsif token.can_be?(:A) && token.value == "a"
+          # Keep "a" as IDENTIFIER in function context since parser expects it
+          return token.resolve_to(:IDENTIFIER)
         end
+      end
+      
+      # CONTEXT-AWARE DEFAULT: Only resolve to IDENTIFIER if keywords don't fit context
+      # For function keywords, preserve their type unless we're clearly NOT in function context
+      if token.can_be?(:FUNCTION) && could_be_function_keyword?(token, context_index)
+        return token.resolve_to(:FUNCTION)
+      elsif token.can_be?(:CALLED) && could_be_called_keyword?(token, context_index)
+        return token.resolve_to(:CALLED)
+      elsif token.can_be?(:MAKE) && could_be_make_keyword?(token, context_index)
+        return token.resolve_to(:MAKE)
       end
       
       # DEFAULT CASE: For variables and simple identifiers, resolve to IDENTIFIER
@@ -42,6 +54,116 @@ module ParserModules
       
       # Fallback: use the first possibility
       return Token.new(token.possibilities.first[:type], token.possibilities.first[:value], token.position, token.line, token.column)
+    end
+
+    # Check if the current position is within a function definition context
+    def is_function_definition_context?(context_index)
+      # Look backwards to see if we have a MAKE token that started a function definition
+      look_back = [context_index - 1, 0].max
+      
+      while look_back >= 0
+        token = @tokens[look_back]
+        if token&.type == :MAKE || (token&.type == :IDENTIFIER && token&.value == "make")
+          return true
+        elsif token&.type == :LBRACE || token&.type == :SEMICOLON || token&.type == :EOF
+          # Hit a statement boundary, stop looking
+          break
+        end
+        look_back -= 1
+      end
+      
+      false
+    end
+    
+    # Check if a 'function' token could be a keyword in the current context
+    def could_be_function_keyword?(token, context_index)
+      return false unless token.can_be?(:FUNCTION)
+      
+      # Look backward for 'make' or 'make a'
+      if context_index && context_index > 0
+        prev_token = @tokens[context_index - 1]
+        if prev_token&.type == :MAKE || (prev_token&.type == :IDENTIFIER && prev_token&.value == "make")
+          return true
+        elsif prev_token&.value == "a" && context_index > 1
+          prev_prev_token = @tokens[context_index - 2]
+          if prev_prev_token&.type == :MAKE || (prev_prev_token&.type == :IDENTIFIER && prev_prev_token&.value == "make")
+            return true
+          end
+        end
+      end
+      
+      false
+    end
+    
+    # Check if a 'called' token could be a keyword in the current context
+    def could_be_called_keyword?(token, context_index)
+      return false unless token.can_be?(:CALLED)
+      
+      # Look backward for 'function' pattern
+      if context_index && context_index > 0
+        prev_token = @tokens[context_index - 1]
+        # Check for 'function called' pattern
+        if prev_token&.value == "function"
+          return true
+        end
+      end
+      
+      false
+    end
+    
+    # Check if a 'make' token could be a keyword in the current context
+    def could_be_make_keyword?(token, context_index)
+      return false unless token.can_be?(:MAKE)
+      
+      # Look ahead for function definition patterns:
+      # make function ...
+      # make a function ...
+      if context_index && context_index + 1 < @tokens.length
+        next_token = @tokens[context_index + 1]
+        
+        # Pattern: make function
+        if next_token&.value == "function"
+          return true
+        end
+        
+        # Pattern: make a function
+        if next_token&.value == "a" && context_index + 2 < @tokens.length
+          next_next_token = @tokens[context_index + 2]
+          if next_next_token&.value == "function"
+            return true
+          end
+        end
+      end
+      
+      false
+    end
+    
+    # Check if an IDENTIFIER(make) looks like the start of a function definition
+    def looks_like_function_definition_start?(index)
+      # Look ahead for function definition patterns:
+      # make function ...
+      # make a function ...
+      # make function called ...
+      # make a function called ...
+      
+      return false unless index + 1 < @tokens.length
+      
+      next_token = @tokens[index + 1]
+      
+      # Pattern: make function
+      if next_token&.value == "function"
+        return true
+      end
+      
+      # Pattern: make a function
+      if next_token&.value == "a" && index + 2 < @tokens.length
+        next_next_token = @tokens[index + 2]
+        if next_next_token&.value == "function"
+          return true
+        end
+      end
+      
+      false
     end
 
     # Pre-process all tokens to resolve ambiguous contexts
@@ -58,22 +180,13 @@ module ParserModules
           resolved_tokens << resolved_token
           i += 1
         elsif token.type == :IDENTIFIER && token.value == "make"
-          # Handle function definition phrases for regular identifiers
-          if i + 3 < @tokens.length &&
-             @tokens[i + 1].type == :IDENTIFIER && @tokens[i + 1].value == "a" &&
-             @tokens[i + 2].type == :IDENTIFIER && @tokens[i + 2].value == "function" &&
-             @tokens[i + 3].type == :IDENTIFIER && @tokens[i + 3].value == "called"
-            
-            # Replace the phrase with proper function tokens
-            resolved_tokens << Token.new(:MAKE, "make")
-            resolved_tokens << Token.new(:IDENTIFIER, "a")  # Skip this one actually
-            resolved_tokens << Token.new(:FUNCTION, "function")
-            resolved_tokens << Token.new(:CALLED, "called")
-            i += 4
+          # Convert IDENTIFIER(make) to MAKE in function definition contexts
+          if looks_like_function_definition_start?(i)
+            resolved_tokens << Token.new(:MAKE, "make", token.position, token.line, token.column)
           else
             resolved_tokens << token
-            i += 1
           end
+          i += 1
         else
           resolved_tokens << token
           i += 1

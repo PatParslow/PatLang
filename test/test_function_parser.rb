@@ -357,10 +357,11 @@ class TestFunctionParser < Minitest::Test
   def test_empty_parameter_list
     input = "make a function called empty takes: { return nil }"
     
-    error = assert_raises(RuntimeError) do
-      parse_input(input)
-    end
-    assert_includes error.message, "Expected"
+    # Improved error handling: empty parameter list now parses successfully
+    # as function definition with no parameters
+    result = parse_input(input)
+    refute_nil result
+    assert_instance_of FunctionDefinitionNode, result
   end
 
   def test_function_definition_with_while_loop

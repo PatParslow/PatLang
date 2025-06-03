@@ -6,11 +6,12 @@ require_relative 'evaluator/scope_manager'
 
 # Evaluator class for traversing AST with modular architecture
 class Evaluator
-  attr_reader :functions, :return_value, :returned
+  attr_reader :functions, :return_value, :returned, :variables
   attr_writer :return_value, :returned
 
   def initialize
     @scope_manager = EvaluatorModules::ScopeManager.new
+    @variables = @scope_manager.variables  # Delegate to scope manager's variables
     @functions = {}
     @return_value = nil
     @returned = false
@@ -27,6 +28,8 @@ class Evaluator
       @arithmetic_evaluator.visit_number_node(node)
     when BinaryOpNode
       @arithmetic_evaluator.visit_binary_op_node(node)
+    when UnaryOpNode
+      @arithmetic_evaluator.visit_unary_op_node(node)
     when AssignmentNode
       visit_assignment_node(node)
     when VariableNode

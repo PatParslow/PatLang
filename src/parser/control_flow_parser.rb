@@ -21,7 +21,7 @@ module ParserModules
         then_statements << stmt if stmt
       end
       
-      then_branch = then_statements.length == 1 ? then_statements[0] : BlockNode.new(then_statements)
+      then_branch = BlockNode.new(then_statements)
       
       else_branch = nil
       if @parser.current_token&.type == :ELSE
@@ -33,7 +33,7 @@ module ParserModules
           else_statements << stmt if stmt
         end
         
-        else_branch = else_statements.length == 1 ? else_statements[0] : BlockNode.new(else_statements)
+        else_branch = BlockNode.new(else_statements)
       end
       
       @parser.eat(:END)
@@ -53,7 +53,7 @@ module ParserModules
         body_statements << stmt if stmt
       end
       
-      body = body_statements.length == 1 ? body_statements[0] : BlockNode.new(body_statements)
+      body = BlockNode.new(body_statements)
       
       @parser.eat(:END)
       

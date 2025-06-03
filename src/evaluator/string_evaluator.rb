@@ -19,9 +19,16 @@ module EvaluatorModules
         raise "Index access is only supported for strings, got #{object_value.class}"
       end
 
-      unless index_value.is_a?(Integer)
+      unless index_value.is_a?(Numeric)
         raise "String index must be an integer, got #{index_value.class}"
       end
+
+      # Convert to integer (check if it's a whole number)
+      if index_value.is_a?(Float) && index_value != index_value.to_i
+        raise "String index must be an integer, got #{index_value.class}"
+      end
+      
+      index_value = index_value.to_i
 
       # Convert from 1-based to 0-based indexing
       zero_based_index = index_value - 1
@@ -33,7 +40,7 @@ module EvaluatorModules
 
       # Bounds checking (1-based indexing)
       if index_value == 0 || zero_based_index < 0 || zero_based_index >= object_value.length
-        raise "String index #{@evaluator.evaluate(node.index)} out of bounds for string of length #{object_value.length} (1-based indexing)"
+        raise "String index #{index_value} out of bounds for string of length #{object_value.length} (1-based indexing)"
       end
 
       object_value[zero_based_index]
@@ -67,12 +74,23 @@ module EvaluatorModules
         start_arg = @evaluator.evaluate(node.arguments[0])
         length_arg = @evaluator.evaluate(node.arguments[1])
         
-        unless start_arg.is_a?(Integer)
+        unless start_arg.is_a?(Numeric)
           raise "String.substring start must be an integer, got #{start_arg.class}"
         end
-        unless length_arg.is_a?(Integer)
+        unless length_arg.is_a?(Numeric)
           raise "String.substring length must be an integer, got #{length_arg.class}"
         end
+
+        # Convert to integer (check if they're whole numbers)
+        if start_arg.is_a?(Float) && start_arg != start_arg.to_i
+          raise "String.substring start must be an integer, got #{start_arg.class}"
+        end
+        if length_arg.is_a?(Float) && length_arg != length_arg.to_i
+          raise "String.substring length must be an integer, got #{length_arg.class}"
+        end
+        
+        start_arg = start_arg.to_i
+        length_arg = length_arg.to_i
         
         # Handle empty string case
         if object_value.length == 0
@@ -151,7 +169,12 @@ module EvaluatorModules
           raise "Number.length method takes no arguments, got #{node.arguments.length}"
         end
         # Return the length of the string representation of the number
-        object_value.to_s.length
+        # Check if number is a whole number (no fractional part)
+        if object_value % 1 == 0
+          object_value.to_i.to_s.length  # Convert to integer first
+        else
+          object_value.to_s.length       # Keep as float
+        end
       else
         raise "Unknown number method: #{node.method_name}"
       end

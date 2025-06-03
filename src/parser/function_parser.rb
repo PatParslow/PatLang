@@ -41,7 +41,16 @@ module ParserModules
           param_name = @parser.current_token.value
           @parser.eat(:IDENTIFIER)
           
-          parameters << ParameterNode.new(param_name)
+          # Check for compound type (parameter-type syntax)
+          param_type = nil
+          if @parser.current_token&.type == :MINUS &&
+             @parser.peek&.type == :IDENTIFIER
+            @parser.eat(:MINUS)
+            param_type = @parser.current_token.value
+            @parser.eat(:IDENTIFIER)
+          end
+          
+          parameters << ParameterNode.new(param_name, param_type)
           
           if @parser.current_token&.type == :COMMA
             @parser.eat(:COMMA)
@@ -70,7 +79,7 @@ module ParserModules
       
       @parser.eat(:RBRACE)
       
-      body = body_statements.length == 1 ? body_statements[0] : BlockNode.new(body_statements)
+      body = BlockNode.new(body_statements)
       
       return FunctionDefinitionNode.new(function_name, parameters, body, return_type)
     end
