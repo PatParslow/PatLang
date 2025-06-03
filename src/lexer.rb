@@ -233,14 +233,14 @@ class Lexer
       advance
     end
     
-    # Check for function phrase keywords - only treat as function keywords if part of complete phrase
+    # Check for function phrase keywords - return AmbiguousTokens to let parser resolve context
     if result == 'make'
-      # Only return MAKE token for complete "make a function called" phrase
-      if check_complete_function_phrase
-        return Token.new(Token::TOKEN_TYPES[:MAKE], result, start_position, start_line, start_column)
-      else
-        return Token.new(Token::TOKEN_TYPES[:IDENTIFIER], result, start_position, start_line, start_column)
-      end
+      # Return ambiguous token - let parser resolve context
+      possibilities = [
+        { type: Token::TOKEN_TYPES[:MAKE], value: result },
+        { type: Token::TOKEN_TYPES[:IDENTIFIER], value: result }
+      ]
+      return AmbiguousToken.new(possibilities, start_position, start_line, start_column)
     elsif result == 'a'
       # Return ambiguous token - let parser resolve context
       possibilities = [
@@ -365,55 +365,6 @@ class Lexer
     !!(recent_text =~ /[=+\-*\/]\s*$/)
   end
   
-  def check_complete_function_phrase
-    # Check if "make" is followed by "a function called" pattern
-    # This method is read-only and doesn't modify lexer state
-    pos = @position
-    
-    # Skip whitespace after "make"
-    while pos < @text.length && @text[pos].match(/\s/)
-      pos += 1
-    end
-    
-    # Check for "a"
-    word_start = pos
-    while pos < @text.length && alphanumeric?(@text[pos])
-      pos += 1
-    end
-    return false unless @text[word_start...pos] == 'a'
-    
-    # Skip whitespace after "a"
-    while pos < @text.length && @text[pos].match(/\s/)
-      pos += 1
-    end
-    
-    # Check for "function"
-    word_start = pos
-    while pos < @text.length && alphanumeric?(@text[pos])
-      pos += 1
-    end
-    return false unless @text[word_start...pos] == 'function'
-    
-    # Skip whitespace after "function"
-    while pos < @text.length && @text[pos].match(/\s/)
-      pos += 1
-    end
-    
-    # Check for "called"
-    word_start = pos
-    while pos < @text.length && alphanumeric?(@text[pos])
-      pos += 1
-    end
-    return false unless @text[word_start...pos] == 'called'
-    
-    # Skip whitespace after "called"
-    while pos < @text.length && @text[pos].match(/\s/)
-      pos += 1
-    end
-    
-    # Must have an identifier after "called"
-    return pos < @text.length && alpha?(@text[pos])
-  end
   
   
   
