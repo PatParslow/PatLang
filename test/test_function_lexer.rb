@@ -9,7 +9,7 @@ class TestFunctionLexer < Minitest::Test
     assert_equal Token::TOKEN_TYPES[:MAKE], tokens[0].type
     assert_equal "make", tokens[0].value
     
-    assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[1].type
+    assert_equal Token::TOKEN_TYPES[:A], tokens[1].type
     assert_equal "a", tokens[1].value
     
     assert_equal Token::TOKEN_TYPES[:FUNCTION], tokens[2].type
@@ -90,7 +90,7 @@ class TestFunctionLexer < Minitest::Test
     lexer = Lexer.new("make something")
     tokens = lexer.tokenize
     
-    assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[0].type
+    assert_equal Token::TOKEN_TYPES[:MAKE], tokens[0].type
     assert_equal "make", tokens[0].value
   end
   
@@ -109,12 +109,12 @@ class TestFunctionLexer < Minitest::Test
       lexer = Lexer.new(phrase)
       tokens = lexer.tokenize
       
-      # Should not have MAKE token type for function (except first case)
+      # With AmbiguousToken architecture, "make" returns :MAKE token
       if phrase.start_with?("make a")
         if phrase == "make a function"
-          assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[0].type, "Failed for: #{phrase}"
+          assert_equal Token::TOKEN_TYPES[:MAKE], tokens[0].type, "Failed for: #{phrase}"
         else
-          assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[0].type, "Failed for: #{phrase}"
+          assert_equal Token::TOKEN_TYPES[:MAKE], tokens[0].type, "Failed for: #{phrase}"
         end
       end
     end
@@ -127,7 +127,7 @@ class TestFunctionLexer < Minitest::Test
     
     # Should still detect function phrase despite extra whitespace
     assert_equal Token::TOKEN_TYPES[:MAKE], tokens[0].type
-    assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[1].type
+    assert_equal Token::TOKEN_TYPES[:A], tokens[1].type
     assert_equal "a", tokens[1].value
     assert_equal Token::TOKEN_TYPES[:FUNCTION], tokens[2].type
     assert_equal Token::TOKEN_TYPES[:CALLED], tokens[3].type
@@ -142,7 +142,7 @@ class TestFunctionLexer < Minitest::Test
     
     expected_sequence = [
       [Token::TOKEN_TYPES[:MAKE], "make"],
-      [Token::TOKEN_TYPES[:IDENTIFIER], "a"],
+      [Token::TOKEN_TYPES[:A], "a"],
       [Token::TOKEN_TYPES[:FUNCTION], "function"],
       [Token::TOKEN_TYPES[:CALLED], "called"],
       [Token::TOKEN_TYPES[:IDENTIFIER], "calculate"],
@@ -168,10 +168,10 @@ class TestFunctionLexer < Minitest::Test
     lexer = Lexer.new("make a good choice")
     tokens = lexer.tokenize
     
-    # All should be identifiers since it's not a function phrase
-    assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[0].type
+    # With AmbiguousToken architecture, "make" and "a" return their respective tokens
+    assert_equal Token::TOKEN_TYPES[:MAKE], tokens[0].type
     assert_equal "make", tokens[0].value
-    assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[1].type
+    assert_equal Token::TOKEN_TYPES[:A], tokens[1].type
     assert_equal "a", tokens[1].value
     assert_equal Token::TOKEN_TYPES[:IDENTIFIER], tokens[2].type
     assert_equal "good", tokens[2].value

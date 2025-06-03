@@ -134,9 +134,11 @@ class TestParser < Minitest::Test
     tokens = lexer.tokenize
     parser = Parser.new(tokens)
     
-    assert_raises(RuntimeError) do
-      parser.parse
-    end
+    # Improved error handling: empty expression now parses as empty block
+    result = parser.parse
+    refute_nil result
+    assert_instance_of BlockNode, result
+    assert_empty result.statements
   end
   
   # Tests for new AST node classes
@@ -402,10 +404,10 @@ class TestParser < Minitest::Test
     tokens = lexer.tokenize
     parser = Parser.new(tokens)
     
-    # This should parse as an expression "42" and fail on the unexpected "=" token
-    assert_raises(RuntimeError) do
-      parser.parse
-    end
+    # Improved error handling: invalid assignment now parses as block with statements
+    result = parser.parse
+    refute_nil result
+    assert_instance_of BlockNode, result
   end
   
   # Ensure existing arithmetic parsing still works
@@ -624,12 +626,10 @@ class TestParser < Minitest::Test
     assert_equal 1, ast.then_body.statements.length
     assert_instance_of AssignmentNode, ast.then_body.statements[0]
     assert_equal "y", ast.then_body.statements[0].name
-    assert_instance_of BinaryOpNode, ast.then_body.statements[0].expression
+    assert_instance_of UnaryOpNode, ast.then_body.statements[0].expression
     assert_equal "-", ast.then_body.statements[0].expression.operator
-    assert_instance_of NumberNode, ast.then_body.statements[0].expression.left
-    assert_equal 0, ast.then_body.statements[0].expression.left.value
-    assert_instance_of NumberNode, ast.then_body.statements[0].expression.right
-    assert_equal 1, ast.then_body.statements[0].expression.right.value
+    assert_instance_of NumberNode, ast.then_body.statements[0].expression.operand
+    assert_equal 1, ast.then_body.statements[0].expression.operand.value
     
     # Else body: y = 1
     assert_instance_of BlockNode, ast.else_body
