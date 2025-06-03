@@ -124,8 +124,8 @@ class Lexer
           advance
           return Token.new(Token::TOKEN_TYPES[:NOT_EQUAL], '!=', @position - 2, start_line, start_column)
         else
-          # Handle standalone ! as an error case
-          error
+          advance
+          return Token.new(Token::TOKEN_TYPES[:NOT], '!', @position - 1, start_line, start_column)
         end
       when '<'
         start_line, start_column = @line, @column

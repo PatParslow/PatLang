@@ -20,6 +20,7 @@ class Token
     TRUE: :TRUE,
     FALSE: :FALSE,
     # Comparison operators
+    NOT: :NOT,
     EQUAL: :EQUAL,
     NOT_EQUAL: :NOT_EQUAL,
     LESS_THAN: :LESS_THAN,
