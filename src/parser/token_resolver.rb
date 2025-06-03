@@ -27,6 +27,8 @@ module ParserModules
           return token.resolve_to(:FUNCTION)
         elsif token.can_be?(:CALLED)
           return token.resolve_to(:CALLED)
+        elsif token.can_be?(:MAKE)
+          return token.resolve_to(:MAKE)
         elsif token.can_be?(:A) && token.value == "a"
           # Keep "a" as IDENTIFIER in function context since parser expects it
           return token.resolve_to(:IDENTIFIER)
@@ -39,6 +41,8 @@ module ParserModules
         return token.resolve_to(:FUNCTION)
       elsif token.can_be?(:CALLED) && could_be_called_keyword?(token, context_index)
         return token.resolve_to(:CALLED)
+      elsif token.can_be?(:MAKE) && could_be_make_keyword?(token, context_index)
+        return token.resolve_to(:MAKE)
       end
       
       # DEFAULT CASE: For variables and simple identifiers, resolve to IDENTIFIER
@@ -101,6 +105,33 @@ module ParserModules
         # Check for 'function called' pattern
         if prev_token&.value == "function"
           return true
+        end
+      end
+      
+      false
+    end
+    
+    # Check if a 'make' token could be a keyword in the current context
+    def could_be_make_keyword?(token, context_index)
+      return false unless token.can_be?(:MAKE)
+      
+      # Look ahead for function definition patterns:
+      # make function ...
+      # make a function ...
+      if context_index && context_index + 1 < @tokens.length
+        next_token = @tokens[context_index + 1]
+        
+        # Pattern: make function
+        if next_token&.value == "function"
+          return true
+        end
+        
+        # Pattern: make a function
+        if next_token&.value == "a" && context_index + 2 < @tokens.length
+          next_next_token = @tokens[context_index + 2]
+          if next_next_token&.value == "function"
+            return true
+          end
         end
       end
       
