@@ -82,7 +82,7 @@ class Lexer
       when '+'
         start_line, start_column = @line, @column
         advance
-        return Token.new(Token::TOKEN_TYPES[:PLUS], '+', @position - 1, start_line, start_column)
+        return Token.new(Token::TOKEN_TYPES[:PLUS], nil, @position - 1, start_line, start_column)
       when '-'
         start_line, start_column = @line, @column
         advance
@@ -98,7 +98,7 @@ class Lexer
       when '%'
         start_line, start_column = @line, @column
         advance
-        return Token.new(Token::TOKEN_TYPES[:MODULO], '%', @position - 1, start_line, start_column)
+        return Token.new(:PERCENT, '%', @position - 1, start_line, start_column)
       when '('
         start_line, start_column = @line, @column
         advance
@@ -115,7 +115,7 @@ class Lexer
           return Token.new(Token::TOKEN_TYPES[:EQUAL], '==', @position - 2, start_line, start_column)
         else
           advance
-          return Token.new(:ASSIGN, '=', @position - 1, start_line, start_column)
+          return Token.new(:ASSIGN, nil, @position - 1, start_line, start_column)
         end
       when '!'
         start_line, start_column = @line, @column
@@ -233,7 +233,36 @@ class Lexer
       advance
     end
     
-    # Check if the identifier is a keyword
+    # Check for function phrase keywords - only treat as function keywords if part of complete phrase
+    if result == 'make'
+      # Only return MAKE token for complete "make a function called" phrase
+      if check_complete_function_phrase
+        return Token.new(Token::TOKEN_TYPES[:MAKE], result, start_position, start_line, start_column)
+      else
+        return Token.new(Token::TOKEN_TYPES[:IDENTIFIER], result, start_position, start_line, start_column)
+      end
+    elsif result == 'a'
+      # Return ambiguous token - let parser resolve context
+      possibilities = [
+        { type: Token::TOKEN_TYPES[:A], value: result },
+        { type: Token::TOKEN_TYPES[:IDENTIFIER], value: result }
+      ]
+      return AmbiguousToken.new(possibilities, start_position, start_line, start_column)
+    elsif result == 'function'
+      possibilities = [
+        { type: Token::TOKEN_TYPES[:FUNCTION], value: result },
+        { type: Token::TOKEN_TYPES[:IDENTIFIER], value: result }
+      ]
+      return AmbiguousToken.new(possibilities, start_position, start_line, start_column)
+    elsif result == 'called'
+      possibilities = [
+        { type: Token::TOKEN_TYPES[:CALLED], value: result },
+        { type: Token::TOKEN_TYPES[:IDENTIFIER], value: result }
+      ]
+      return AmbiguousToken.new(possibilities, start_position, start_line, start_column)
+    end
+    
+    # Check if the identifier is a keyword (non-function keywords)
     token_type = case result
                  when 'true'
                    Token::TOKEN_TYPES[:TRUE]
@@ -253,20 +282,6 @@ class Lexer
                    Token::TOKEN_TYPES[:DO]
                  when 'print'
                    Token::TOKEN_TYPES[:PRINT]
-                 when 'make'
-                   Token::TOKEN_TYPES[:MAKE]
-                 when 'a'
-                   # Create ambiguous token with both possibilities
-                   # Let the parser resolve this based on grammar context
-                   possibilities = [
-                     { type: Token::TOKEN_TYPES[:A], value: 'a' },
-                     { type: Token::TOKEN_TYPES[:IDENTIFIER], value: 'a' }
-                   ]
-                   return AmbiguousToken.new(possibilities, start_position, start_line, start_column)
-                 when 'function'
-                   Token::TOKEN_TYPES[:FUNCTION]
-                 when 'called'
-                   Token::TOKEN_TYPES[:CALLED]
                  when 'takes'
                    Token::TOKEN_TYPES[:TAKES]
                  when 'returns'
@@ -348,6 +363,83 @@ class Lexer
     
     # If we see assignment or arithmetic operators recently, treat "a" as an identifier
     !!(recent_text =~ /[=+\-*\/]\s*$/)
+  end
+  
+  def check_complete_function_phrase
+    # Check if "make" is followed by "a function called" pattern
+    # This method is read-only and doesn't modify lexer state
+    pos = @position
+    
+    # Skip whitespace after "make"
+    while pos < @text.length && @text[pos].match(/\s/)
+      pos += 1
+    end
+    
+    # Check for "a"
+    word_start = pos
+    while pos < @text.length && alphanumeric?(@text[pos])
+      pos += 1
+    end
+    return false unless @text[word_start...pos] == 'a'
+    
+    # Skip whitespace after "a"
+    while pos < @text.length && @text[pos].match(/\s/)
+      pos += 1
+    end
+    
+    # Check for "function"
+    word_start = pos
+    while pos < @text.length && alphanumeric?(@text[pos])
+      pos += 1
+    end
+    return false unless @text[word_start...pos] == 'function'
+    
+    # Skip whitespace after "function"
+    while pos < @text.length && @text[pos].match(/\s/)
+      pos += 1
+    end
+    
+    # Check for "called"
+    word_start = pos
+    while pos < @text.length && alphanumeric?(@text[pos])
+      pos += 1
+    end
+    return false unless @text[word_start...pos] == 'called'
+    
+    # Skip whitespace after "called"
+    while pos < @text.length && @text[pos].match(/\s/)
+      pos += 1
+    end
+    
+    # Must have an identifier after "called"
+    return pos < @text.length && alpha?(@text[pos])
+  end
+  
+  
+  
+  def peek_word
+    # Look ahead to see what the next word is without consuming it
+    saved_position = @position
+    saved_char = @current_char
+    
+    result = ''
+    while @current_char && alphanumeric?(@current_char)
+      result += @current_char
+      advance
+    end
+    
+    # Restore position
+    @position = saved_position
+    @current_char = saved_char
+    
+    result
+  end
+  
+  def skip_word
+    # Skip the current word
+    while @current_char && alphanumeric?(@current_char)
+      advance
+    end
   end
   
   def read_word

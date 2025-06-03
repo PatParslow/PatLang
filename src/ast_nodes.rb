@@ -35,6 +35,20 @@ class BinaryOpNode < ASTNode
   end
 end
 
+# Node representing a unary operation (e.g., -x, !x)
+class UnaryOpNode < ASTNode
+  attr_reader :operator, :operand
+
+  def initialize(operator, operand)
+    @operator = operator
+    @operand = operand
+  end
+
+  def to_s
+    "UnaryOpNode(#{@operator}, #{@operand})"
+  end
+end
+
 # Node representing a variable reference/lookup
 class VariableNode < ASTNode
   attr_reader :name

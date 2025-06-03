@@ -15,7 +15,7 @@ module ParserModules
       left = logical_and
       
       while @parser.current_token&.type == :OR
-        op = @parser.current_token.type
+        op = @parser.current_token.value
         @parser.advance
         right = logical_and
         left = BinaryOpNode.new(left, op, right)
@@ -28,7 +28,7 @@ module ParserModules
       left = equality
       
       while @parser.current_token&.type == :AND
-        op = @parser.current_token.type
+        op = @parser.current_token.value
         @parser.advance
         right = equality
         left = BinaryOpNode.new(left, op, right)
@@ -42,10 +42,10 @@ module ParserModules
       
       while @parser.current_token&.type == :EQUAL ||
             @parser.current_token&.type == :NOT_EQUAL
-        op = @parser.current_token.type
+        op = @parser.current_token.value
         @parser.advance
         right = comparison
-        left = BinaryOpNode.new(left, op, right)
+        left = ComparisonNode.new(left, op, right)
       end
       
       left
@@ -58,10 +58,10 @@ module ParserModules
             @parser.current_token&.type == :LESS_EQUAL ||
             @parser.current_token&.type == :GREATER ||
             @parser.current_token&.type == :GREATER_EQUAL
-        op = @parser.current_token.type
+        op = @parser.current_token.value
         @parser.advance
         right = arithmetic
-        left = BinaryOpNode.new(left, op, right)
+        left = ComparisonNode.new(left, op, right)
       end
       
       left
@@ -72,7 +72,7 @@ module ParserModules
       
       while @parser.current_token&.type == :PLUS ||
             @parser.current_token&.type == :MINUS
-        op = @parser.current_token.type
+        op = @parser.current_token.value
         @parser.advance
         right = term
         left = BinaryOpNode.new(left, op, right)
@@ -82,56 +82,76 @@ module ParserModules
     end
 
     def term
-      left = postfix
+      left = unary
       
       while @parser.current_token&.type == :STAR ||
             @parser.current_token&.type == :SLASH ||
             @parser.current_token&.type == :PERCENT
-        op = @parser.current_token.type
+        op = @parser.current_token.value
         @parser.advance
-        right = postfix
+        right = unary
         left = BinaryOpNode.new(left, op, right)
       end
       
       left
     end
 
+    def unary
+      if @parser.current_token&.type == :MINUS
+        op = @parser.current_token.value
+        @parser.advance
+        operand = unary
+        return UnaryOpNode.new(op, operand)
+      end
+      
+      postfix
+    end
+
     def postfix
       left = primary
       
-      # Handle string methods
-      while @parser.current_token&.type == :DOT
-        @parser.advance # consume '.'
-        
-        if @parser.current_token&.type == :IDENTIFIER
-          method_name = @parser.current_token.value
-          @parser.advance
+      # Handle bracket indexing and string methods
+      loop do
+        if @parser.current_token&.type == :LBRACKET
+          @parser.advance # consume '['
+          index = expression
+          @parser.eat(:RBRACKET)
+          left = IndexAccessNode.new(left, index)
+        elsif @parser.current_token&.type == :DOT
+          @parser.advance # consume '.'
           
-          if @parser.current_token&.type == :LPAREN
-            # Method call with arguments
-            @parser.advance # consume '('
+          if @parser.current_token&.type == :IDENTIFIER
+            method_name = @parser.current_token.value
+            @parser.advance
             
-            arguments = []
-            unless @parser.current_token&.type == :RPAREN
-              loop do
-                arguments << expression
-                
-                if @parser.current_token&.type == :COMMA
-                  @parser.advance
-                else
-                  break
+            if @parser.current_token&.type == :LPAREN
+              # Method call with arguments
+              @parser.advance # consume '('
+              
+              arguments = []
+              unless @parser.current_token&.type == :RPAREN
+                loop do
+                  arguments << expression
+                  
+                  if @parser.current_token&.type == :COMMA
+                    @parser.advance
+                  else
+                    break
+                  end
                 end
               end
+              
+              @parser.eat(:RPAREN)
+              left = MethodCallNode.new(left, method_name, arguments)
+            else
+              # Method call without arguments
+              left = MethodCallNode.new(left, method_name, [])
             end
-            
-            @parser.eat(:RPAREN)
-            left = MethodCallNode.new(left, method_name, arguments)
           else
-            # Method call without arguments
-            left = MethodCallNode.new(left, method_name, [])
+            @parser.error("Expected method name after '.'")
           end
         else
-          @parser.error("Expected method name after '.'")
+          break
         end
       end
       

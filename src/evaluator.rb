@@ -27,6 +27,8 @@ class Evaluator
       @arithmetic_evaluator.visit_number_node(node)
     when BinaryOpNode
       @arithmetic_evaluator.visit_binary_op_node(node)
+    when UnaryOpNode
+      @arithmetic_evaluator.visit_unary_op_node(node)
     when AssignmentNode
       visit_assignment_node(node)
     when VariableNode
