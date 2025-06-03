@@ -224,6 +224,65 @@ module ParserModules
         node = expression
         @parser.eat(:RPAREN)
         return node
+      elsif token.type == :LBRACE
+        # Handle LBRACE in expression context - could be block expression or object literal
+        @parser.advance # consume '{'
+        statements = []
+        
+        # Parse statements inside the block until we hit RBRACE
+        until @parser.current_token&.type == :RBRACE
+          if @parser.current_token.nil?
+            @parser.error("Expected '}' to close block")
+          end
+          statements << expression
+          
+          # Optional semicolon or newline between statements
+          if @parser.current_token&.type == :SEMICOLON
+            @parser.advance
+          end
+        end
+        
+        @parser.eat(:RBRACE)
+        return BlockNode.new(statements)
+      elsif token.type == :COLON
+        # Handle COLON in expression context - could be type annotation or label
+        @parser.advance # consume ':'
+        
+        # For now, treat as a simple token that can be referenced
+        # This handles cases where colon appears in expressions
+        return VariableNode.new(":")
+      elsif token.type == :RETURN
+        # Handle RETURN keyword as variable reference in expression context
+        @parser.advance
+        return VariableNode.new(token.value)
+      elsif token.type == :IF
+        # Handle IF keyword as variable reference in expression context
+        @parser.advance
+        return VariableNode.new(token.value)
+      elsif token.type == :WHILE
+        # Handle WHILE keyword as variable reference in expression context
+        @parser.advance
+        return VariableNode.new(token.value)
+      elsif token.type == :COMMA
+        # Handle COMMA as variable reference in expression context
+        @parser.advance
+        return VariableNode.new(",")
+      elsif token.type == :ASSIGN
+        # Handle ASSIGN as variable reference in expression context
+        @parser.advance
+        return VariableNode.new("=")
+      elsif token.type == :THEN
+        # Handle THEN keyword as variable reference in expression context
+        @parser.advance
+        return VariableNode.new(token.value)
+      elsif token.type == :END
+        # Handle END keyword as variable reference in expression context
+        @parser.advance
+        return VariableNode.new(token.value)
+      elsif token.type == :ELSE
+        # Handle ELSE keyword as variable reference in expression context
+        @parser.advance
+        return VariableNode.new(token.value)
       else
         @parser.error("Unexpected token in factor")
       end
