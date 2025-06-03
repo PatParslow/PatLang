@@ -20,7 +20,7 @@ module EvaluatorModules
       end
 
       unless index_value.is_a?(Numeric)
-        raise "String index must be a number, got #{index_value.class}"
+        raise "String index must be an integer, got #{index_value.class}"
       end
 
       # Convert to integer (check if it's a whole number)
@@ -75,10 +75,10 @@ module EvaluatorModules
         length_arg = @evaluator.evaluate(node.arguments[1])
         
         unless start_arg.is_a?(Numeric)
-          raise "String.substring start must be a number, got #{start_arg.class}"
+          raise "String.substring start must be an integer, got #{start_arg.class}"
         end
         unless length_arg.is_a?(Numeric)
-          raise "String.substring length must be a number, got #{length_arg.class}"
+          raise "String.substring length must be an integer, got #{length_arg.class}"
         end
 
         # Convert to integer (check if they're whole numbers)
@@ -169,7 +169,12 @@ module EvaluatorModules
           raise "Number.length method takes no arguments, got #{node.arguments.length}"
         end
         # Return the length of the string representation of the number
-        object_value.to_s.length
+        # Check if number is a whole number (no fractional part)
+        if object_value % 1 == 0
+          object_value.to_i.to_s.length  # Convert to integer first
+        else
+          object_value.to_s.length       # Keep as float
+        end
       else
         raise "Unknown number method: #{node.method_name}"
       end
