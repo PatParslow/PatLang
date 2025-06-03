@@ -82,7 +82,7 @@ class Lexer
       when '+'
         start_line, start_column = @line, @column
         advance
-        return Token.new(Token::TOKEN_TYPES[:PLUS], nil, @position - 1, start_line, start_column)
+        return Token.new(Token::TOKEN_TYPES[:PLUS], '+', @position - 1, start_line, start_column)
       when '-'
         start_line, start_column = @line, @column
         advance
