@@ -6,11 +6,12 @@ require_relative 'evaluator/scope_manager'
 
 # Evaluator class for traversing AST with modular architecture
 class Evaluator
-  attr_reader :functions, :return_value, :returned
+  attr_reader :functions, :return_value, :returned, :variables
   attr_writer :return_value, :returned
 
   def initialize
     @scope_manager = EvaluatorModules::ScopeManager.new
+    @variables = @scope_manager.variables  # Delegate to scope manager's variables
     @functions = {}
     @return_value = nil
     @returned = false

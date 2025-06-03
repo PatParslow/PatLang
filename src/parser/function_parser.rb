@@ -79,7 +79,7 @@ module ParserModules
       
       @parser.eat(:RBRACE)
       
-      body = body_statements.length == 1 ? body_statements[0] : BlockNode.new(body_statements)
+      body = BlockNode.new(body_statements)
       
       return FunctionDefinitionNode.new(function_name, parameters, body, return_type)
     end
