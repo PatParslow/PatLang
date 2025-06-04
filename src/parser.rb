@@ -77,7 +77,15 @@ class Parser
     case @current_token.type
     when :MAKE
       # CRITICAL FIX: Check for assignment BEFORE falling through to function definition
-      if peek(1)&.type == :ASSIGN
+      if peek(1)&.type == :ASSIGN || peek(1)&.type == :IS
+        # "make var = value" or "make var is value"
+        return parse_assignment
+      elsif peek(1)&.type == :IDENTIFIER && 
+            (peek(2)&.type == :ASSIGN || peek(2)&.type == :IS || 
+             peek(2)&.type == :NUMBER || peek(2)&.type == :STRING || 
+             peek(2)&.type == :IDENTIFIER || peek(2)&.type == :LPAREN ||
+             peek(2)&.type == :EOF || peek(2) == nil)
+        # "make var value" - elegant syntax without assignment operator
         return parse_assignment
       elsif (peek(1)&.type == :IDENTIFIER && peek(1)&.value == "a" &&
             peek(2)&.type == :FUNCTION) ||
@@ -100,7 +108,7 @@ class Parser
       return @control_flow_parser.parse_print_statement
     when :IDENTIFIER
       # CRITICAL FIX: Check for assignment BEFORE falling through to expression
-      if peek(1)&.type == :ASSIGN
+      if peek(1)&.type == :ASSIGN || peek(1)&.type == :IS
         return parse_assignment
       else
         return expression
@@ -110,20 +118,47 @@ class Parser
     end
   end
 
-  # Grammar: assignment → (IDENTIFIER | MAKE) '=' expression
+  # Grammar: assignment → IDENTIFIER ('=' | 'is') expression | MAKE IDENTIFIER (('=' | 'is') | '') expression
   def parse_assignment
-    var_name = @current_token.value
-    # Accept both IDENTIFIER and MAKE tokens as variable names
-    if @current_token.type == :IDENTIFIER
-      eat(:IDENTIFIER)
-    elsif @current_token.type == :MAKE
+    if @current_token.type == :MAKE
+      # Handle "make variable ..." patterns
       eat(:MAKE)
+      var_name = @current_token.value
+      eat(:IDENTIFIER)
+      
+      # MAKE can be followed by assignment operator OR directly by expression
+      if @current_token.type == :ASSIGN || @current_token.type == :IS
+        # "make y = 17" or "make y is 17" (though "make y is 17" is discouraged)
+        if @current_token.type == :ASSIGN
+          eat(:ASSIGN)
+        else
+          eat(:IS)
+        end
+      end
+      # If no assignment operator, proceed directly to expression: "make y 17"
+      
+      value = expression
+      return AssignmentNode.new(var_name, value)
+      
+    elsif @current_token.type == :IDENTIFIER
+      # Handle "variable is/= ..." patterns
+      var_name = @current_token.value
+      eat(:IDENTIFIER)
+      
+      # IDENTIFIER must be followed by assignment operator
+      if @current_token.type == :ASSIGN
+        eat(:ASSIGN)
+      elsif @current_token.type == :IS
+        eat(:IS)
+      else
+        error("Expected '=' or 'is' after identifier for assignment")
+      end
+      
+      value = expression
+      return AssignmentNode.new(var_name, value)
     else
       error("Expected IDENTIFIER or MAKE for variable assignment")
     end
-    eat(:ASSIGN)
-    value = expression
-    return AssignmentNode.new(var_name, value)
   end
 
   # Delegate expression parsing to the specialized parser

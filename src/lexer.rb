@@ -292,6 +292,8 @@ class Lexer
                    Token::TOKEN_TYPES[:CALL]
                  when 'with'
                    Token::TOKEN_TYPES[:WITH]
+                 when 'is'
+                   Token::TOKEN_TYPES[:IS]
                  else
                    Token::TOKEN_TYPES[:IDENTIFIER]
                  end

@@ -16,6 +16,7 @@ class Token
     IDENTIFIER: :IDENTIFIER,
     ASSIGN: :ASSIGN,
     EQUALS: :ASSIGN,  # Alias for backward compatibility
+    IS: :IS,           # Patlang's revolutionary assignment syntax
     # Boolean literals
     TRUE: :TRUE,
     FALSE: :FALSE,
