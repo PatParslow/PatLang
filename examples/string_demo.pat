@@ -1,3 +1,20 @@
+# =============================================================================
+# 🎯 Roadmap Feature - Planned for v0.7.0+ based on object model foundation
+# =============================================================================
+#
+# ⚠️  IMPLEMENTATION STATUS: String operations not yet integrated
+#     This example demonstrates the planned comprehensive string capabilities
+#     that will be built on top of our revolutionary v0.6.0 object model foundation.
+#
+# 🎯 To see working object model capabilities right now:
+#     ruby examples/oo_event_system_demo_fixed.rb
+#     ruby examples/network_transparent_demo_fixed.rb
+#
+# This file showcases the target architecture that will extend our
+# 'everything is objects' foundation with rich string manipulation syntax.
+#
+# =============================================================================
+
 greeting = "Hello"
 name = "World"
 punctuation = "!"
