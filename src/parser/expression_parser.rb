@@ -112,7 +112,24 @@ module ParserModules
       
       # Handle bracket indexing and string methods
       loop do
-        if @parser.current_token&.type == :LBRACKET
+        if @parser.current_token&.type == :LPAREN
+          # Direct function call like fact(args)
+          @parser.advance # consume '('
+          
+          arguments = []
+          until @parser.current_token&.type == :RPAREN
+            arguments << expression
+            
+            if @parser.current_token&.type == :COMMA
+              @parser.advance
+            elsif @parser.current_token&.type != :RPAREN
+              @parser.error("Expected ',' or ')' in argument list")
+            end
+          end
+          
+          @parser.eat(:RPAREN)
+          left = FunctionCallNode.new(left.name, arguments)
+        elsif @parser.current_token&.type == :LBRACKET
           @parser.advance # consume '['
           index = expression
           @parser.eat(:RBRACKET)
@@ -281,6 +298,10 @@ module ParserModules
         return VariableNode.new(token.value)
       elsif token.type == :ELSE
         # Handle ELSE keyword as variable reference in expression context
+        @parser.advance
+        return VariableNode.new(token.value)
+      elsif token.type == :FACT
+        # Handle FACT keyword as variable reference in expression context (for fact() calls)
         @parser.advance
         return VariableNode.new(token.value)
       else

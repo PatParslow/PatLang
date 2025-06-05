@@ -5,6 +5,10 @@ require_relative 'token'
 require_relative 'parser'
 require_relative 'ast_nodes'
 require_relative 'evaluator'
+require_relative 'reasoning/reasoning_coordinator'
+require_relative 'reasoning/form_validator'
+require_relative 'reasoning/goal_system'
+require_relative 'reasoning/facts_database'
 
 # Main Patlang interpreter entry point
 class Patlang
@@ -66,7 +70,32 @@ class Patlang
   end
 
   def self.evaluate(expression)
-    process_expression(expression, show_details: false)
+    # Enhanced evaluate method with reasoning integration
+    if expression.is_a?(String) && (expression.include?('form') || expression.include?('goal') || expression.include?('fact'))
+      # Use reasoning-enhanced evaluation
+      evaluate_with_reasoning(expression)
+    else
+      # Use standard evaluation
+      process_expression(expression, show_details: false)
+    end
+  end
+
+  def self.evaluate_with_reasoning(code)
+    # Initialize reasoning coordinator
+    coordinator = ReasoningCoordinator.new
+    
+    # Register reasoning components
+    coordinator.register_component(:form_validator, FormValidator.new)
+    coordinator.register_component(:goal_system, GoalSystem.new)
+    coordinator.register_component(:facts_database, FactsDatabase.new)
+    
+    begin
+      # Process through reasoning coordinator
+      coordinator.process_expression(code)
+    rescue => e
+      # Fallback to standard evaluation if reasoning fails
+      process_expression(code, show_details: false)
+    end
   end
 
   def self.demo

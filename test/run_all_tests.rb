@@ -1,4 +1,5 @@
 require 'simplecov'
+require 'pathname'
 
 # Configure SimpleCov with branch coverage for comprehensive analysis
 SimpleCov.start do
@@ -19,11 +20,11 @@ end
 puts "Running comprehensive test suite with coverage analysis..."
 
 # Always load test_helper first
-require_relative 'test_helper'
+require_relative 'helpers/test_helper'
 
-# Dynamically discover and load all test files
+# Dynamically discover and load all test files from all subdirectories
 test_dir = File.dirname(__FILE__)
-test_files = Dir.glob(File.join(test_dir, 'test_*.rb')).sort
+test_files = Dir.glob(File.join(test_dir, '**', 'test_*.rb')).sort
 
 # Filter out helper files and non-test files
 excluded_files = [
@@ -38,9 +39,10 @@ end
 
 puts "Discovered #{test_files_to_load.length} test files:"
 test_files_to_load.each do |file|
+  relative_path = Pathname.new(file).relative_path_from(Pathname.new(test_dir)).to_s
   basename = File.basename(file, '.rb')
-  puts "  - #{basename}"
-  require_relative basename
+  puts "  - #{relative_path}"
+  require_relative relative_path.sub('.rb', '')
 end
 
 puts "\nAll test files loaded successfully!"

@@ -10,8 +10,13 @@ require_relative 'parser/control_flow_parser'
 class Parser
   attr_reader :current_token
 
-  def initialize(tokens)
-    @tokens = tokens
+  def initialize(tokens_or_lexer)
+    # Handle both tokens array and lexer object
+    if tokens_or_lexer.is_a?(Lexer)
+      @tokens = tokens_or_lexer.tokenize
+    else
+      @tokens = tokens_or_lexer
+    end
     @current_token_index = 0
     @current_token = @tokens[@current_token_index]
     
@@ -106,6 +111,20 @@ class Parser
       return @control_flow_parser.parse_return_statement
     when :PRINT
       return @control_flow_parser.parse_print_statement
+    when :REASONING
+      return parse_reasoning_mode
+    when :CONSTRAIN
+      return parse_constraint
+    when :GOAL
+      return parse_goal
+    when :ASSERT
+      return parse_assert
+    when :QUERY
+      return parse_query
+    when :RULE
+      return parse_rule
+    when :PURSUE
+      return parse_pursue
     when :IDENTIFIER
       # CRITICAL FIX: Check for assignment BEFORE falling through to expression
       if peek(1)&.type == :ASSIGN || peek(1)&.type == :IS
@@ -169,5 +188,150 @@ class Parser
   # Delegate function call parsing to the specialized parser
   def parse_function_call
     @function_parser.parse_function_call
+  end
+
+  # Parse reasoning mode control: reasoning mode on/off
+  def parse_reasoning_mode
+    eat(:REASONING)
+    eat(:MODE)
+    
+    if @current_token.type == :ON
+      eat(:ON)
+      ReasoningModeNode.new(true)
+    elsif @current_token.type == :OFF
+      eat(:OFF)
+      ReasoningModeNode.new(false)
+    else
+      error("Expected 'on' or 'off' after 'reasoning mode'")
+    end
+  end
+
+  # Parse constraint declaration: constrain x :: Number where x > 0
+  def parse_constraint
+    eat(:CONSTRAIN)
+    
+    variable = @current_token.value
+    eat(:IDENTIFIER)
+    
+    eat(:DOUBLE_COLON)
+    
+    type = @current_token.value
+    eat(:IDENTIFIER)
+    
+    conditions = nil
+    if @current_token.type == :WHERE
+      eat(:WHERE)
+      conditions = expression
+    end
+    
+    ConstraintNode.new(variable, type, conditions)
+  end
+
+  # Parse goal declaration: goal find_answer { postcondition: answer > 0 }
+  def parse_goal
+    eat(:GOAL)
+    
+    goal_name = @current_token.value
+    eat(:IDENTIFIER)
+    
+    parameters = []
+    if @current_token.type == :LPAREN
+      eat(:LPAREN)
+      while @current_token.type != :RPAREN
+        parameters << @current_token.value
+        eat(:IDENTIFIER)
+        if @current_token.type == :COMMA
+          eat(:COMMA)
+        end
+      end
+      eat(:RPAREN)
+    end
+    
+    precondition = nil
+    postcondition = nil
+    strategy = nil
+    
+    if @current_token.type == :LBRACE
+      eat(:LBRACE)
+      
+      while @current_token.type != :RBRACE
+        case @current_token.type
+        when :PRECONDITION
+          eat(:PRECONDITION)
+          eat(:COLON)
+          precondition = expression
+        when :POSTCONDITION
+          eat(:POSTCONDITION)
+          eat(:COLON)
+          postcondition = expression
+        when :STRATEGY
+          eat(:STRATEGY)
+          eat(:COLON)
+          strategy = @current_token.value
+          eat(:IDENTIFIER)
+        else
+          error("Expected precondition, postcondition, or strategy in goal body")
+        end
+        
+        if @current_token.type == :COMMA
+          eat(:COMMA)
+        end
+      end
+      
+      eat(:RBRACE)
+    end
+    
+    GoalNode.new(goal_name, parameters, precondition, postcondition, strategy)
+  end
+
+  # Parse assert statement: assert fact(likes(alice, bob))
+  def parse_assert
+    eat(:ASSERT)
+    fact = expression
+    AssertNode.new(fact)
+  end
+
+  # Parse query: query likes(X, bob)
+  def parse_query
+    eat(:QUERY)
+    pattern = expression
+    QueryNode.new(pattern)
+  end
+
+  # Parse rule definition: rule ancestor(X, Y) :- parent(X, Y)
+  def parse_rule
+    eat(:RULE)
+    head = expression
+    
+    # Look for :- operator (we'll need to add this to the lexer)
+    if @current_token.type == :COLON && peek(1)&.type == :MINUS
+      eat(:COLON)
+      eat(:MINUS)
+      body = expression
+      RuleNode.new(head, body)
+    else
+      error("Expected ':-' after rule head")
+    end
+  end
+
+  # Parse pursue statement: pursue find_answer
+  def parse_pursue
+    eat(:PURSUE)
+    goal_name = @current_token.value
+    eat(:IDENTIFIER)
+    
+    arguments = []
+    if @current_token.type == :LPAREN
+      eat(:LPAREN)
+      while @current_token.type != :RPAREN
+        arguments << expression
+        if @current_token.type == :COMMA
+          eat(:COMMA)
+        end
+      end
+      eat(:RPAREN)
+    end
+    
+    PursueNode.new(goal_name, arguments)
   end
 end

@@ -256,3 +256,105 @@ class ReturnNode < ASTNode
     end
   end
 end
+# Node representing a type constraint declaration (e.g., constrain x :: Number where x > 0)
+class ConstraintNode < ASTNode
+  attr_reader :variable, :type, :conditions
+
+  def initialize(variable, type, conditions = nil)
+    @variable = variable
+    @type = type
+    @conditions = conditions
+  end
+
+  def to_s
+    if @conditions
+      "ConstraintNode(#{@variable} :: #{@type} where #{@conditions})"
+    else
+      "ConstraintNode(#{@variable} :: #{@type})"
+    end
+  end
+end
+
+# Node representing a goal declaration (e.g., goal find_answer { postcondition: answer > 0 })
+class GoalNode < ASTNode
+  attr_reader :name, :parameters, :precondition, :postcondition, :strategy
+
+  def initialize(name, parameters = [], precondition = nil, postcondition = nil, strategy = nil)
+    @name = name
+    @parameters = parameters
+    @precondition = precondition
+    @postcondition = postcondition
+    @strategy = strategy
+  end
+
+  def to_s
+    "GoalNode(#{@name})"
+  end
+end
+
+# Node representing a fact assertion (e.g., assert fact(likes(alice, bob)))
+class AssertNode < ASTNode
+  attr_reader :fact
+
+  def initialize(fact)
+    @fact = fact
+  end
+
+  def to_s
+    "AssertNode(#{@fact})"
+  end
+end
+
+# Node representing a query (e.g., query likes(X, bob))
+class QueryNode < ASTNode
+  attr_reader :pattern
+
+  def initialize(pattern)
+    @pattern = pattern
+  end
+
+  def to_s
+    "QueryNode(#{@pattern})"
+  end
+end
+
+# Node representing a rule definition (e.g., rule ancestor(X, Y) :- parent(X, Y))
+class RuleNode < ASTNode
+  attr_reader :head, :body
+
+  def initialize(head, body)
+    @head = head
+    @body = body
+  end
+
+  def to_s
+    "RuleNode(#{@head} :- #{@body})"
+  end
+end
+
+# Node representing goal pursuit (e.g., pursue find_answer)
+class PursueNode < ASTNode
+  attr_reader :goal_name, :arguments
+
+  def initialize(goal_name, arguments = [])
+    @goal_name = goal_name
+    @arguments = arguments
+  end
+
+  def to_s
+    "PursueNode(#{@goal_name})"
+  end
+end
+
+# Node representing reasoning mode control (e.g., reasoning mode on)
+class ReasoningModeNode < ASTNode
+  attr_reader :enabled
+
+  def initialize(enabled)
+    @enabled = enabled
+  end
+
+  def to_s
+    "ReasoningModeNode(#{@enabled ? 'on' : 'off'})"
+  end
+end

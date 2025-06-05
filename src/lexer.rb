@@ -181,8 +181,14 @@ class Lexer
         return Token.new(Token::TOKEN_TYPES[:RBRACE], '}', @position - 1, start_line, start_column)
       when ':'
         start_line, start_column = @line, @column
-        advance
-        return Token.new(Token::TOKEN_TYPES[:COLON], ':', @position - 1, start_line, start_column)
+        if peek_char == ':'
+          advance
+          advance
+          return Token.new(Token::TOKEN_TYPES[:DOUBLE_COLON], '::', @position - 2, start_line, start_column)
+        else
+          advance
+          return Token.new(Token::TOKEN_TYPES[:COLON], ':', @position - 1, start_line, start_column)
+        end
       else
         if alpha?(@current_char)
           return read_identifier
@@ -229,6 +235,12 @@ class Lexer
     result = ''
     
     while @current_char && alphanumeric?(@current_char)
+      result += @current_char
+      advance
+    end
+    
+    # Allow ? at the end of identifiers (Ruby method naming convention)
+    if @current_char == '?'
       result += @current_char
       advance
     end
@@ -294,6 +306,40 @@ class Lexer
                    Token::TOKEN_TYPES[:WITH]
                  when 'is'
                    Token::TOKEN_TYPES[:IS]
+                 when 'reasoning'
+                   Token::TOKEN_TYPES[:REASONING]
+                 when 'mode'
+                   Token::TOKEN_TYPES[:MODE]
+                 when 'on'
+                   Token::TOKEN_TYPES[:ON]
+                 when 'off'
+                   Token::TOKEN_TYPES[:OFF]
+                 when 'constrain'
+                   Token::TOKEN_TYPES[:CONSTRAIN]
+                 when 'assert'
+                   Token::TOKEN_TYPES[:ASSERT]
+                 when 'fact'
+                   Token::TOKEN_TYPES[:FACT]
+                 when 'goal'
+                   Token::TOKEN_TYPES[:GOAL]
+                 when 'pursue'
+                   Token::TOKEN_TYPES[:PURSUE]
+                 when 'query'
+                   Token::TOKEN_TYPES[:QUERY]
+                 when 'rule'
+                   Token::TOKEN_TYPES[:RULE]
+                 when 'where'
+                   Token::TOKEN_TYPES[:WHERE]
+                 when 'and'
+                   Token::TOKEN_TYPES[:AND]
+                 when 'or'
+                   Token::TOKEN_TYPES[:OR]
+                 when 'precondition'
+                   Token::TOKEN_TYPES[:PRECONDITION]
+                 when 'postcondition'
+                   Token::TOKEN_TYPES[:POSTCONDITION]
+                 when 'strategy'
+                   Token::TOKEN_TYPES[:STRATEGY]
                  else
                    Token::TOKEN_TYPES[:IDENTIFIER]
                  end

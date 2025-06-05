@@ -58,6 +58,25 @@ class Token
     LBRACE: :LBRACE,
     RBRACE: :RBRACE,
     COLON: :COLON,
+    # Reasoning keywords
+    REASONING: :REASONING,
+    MODE: :MODE,
+    ON: :ON,
+    OFF: :OFF,
+    CONSTRAIN: :CONSTRAIN,
+    ASSERT: :ASSERT,
+    FACT: :FACT,
+    GOAL: :GOAL,
+    PURSUE: :PURSUE,
+    QUERY: :QUERY,
+    RULE: :RULE,
+    WHERE: :WHERE,
+    AND: :AND,
+    OR: :OR,
+    PRECONDITION: :PRECONDITION,
+    POSTCONDITION: :POSTCONDITION,
+    STRATEGY: :STRATEGY,
+    DOUBLE_COLON: :DOUBLE_COLON,
     EOF: :EOF
   }.freeze
 

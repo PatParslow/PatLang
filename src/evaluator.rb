@@ -4,6 +4,10 @@ require_relative 'evaluator/string_evaluator'
 require_relative 'evaluator/function_evaluator'
 require_relative 'evaluator/scope_manager'
 require_relative 'evaluator/object_evaluator'
+require_relative 'reasoning/reasoning_coordinator'
+require_relative 'reasoning/form_validator'
+require_relative 'reasoning/goal_system'
+require_relative 'reasoning/facts_database'
 
 # Evaluator class for traversing AST with modular architecture
 class Evaluator
@@ -22,6 +26,12 @@ class Evaluator
     @string_evaluator = EvaluatorModules::StringEvaluator.new(self)
     @function_evaluator = EvaluatorModules::FunctionEvaluator.new(self)
     @object_evaluator = EvaluatorModules::ObjectEvaluator.new(self)
+    
+    # Initialize reasoning system (RED phase - will fail)
+    @reasoning_coordinator = nil
+    @form_validator = nil
+    @goal_system = nil
+    @facts_database = nil
   end
   
   # Enable object-based evaluation mode
@@ -37,6 +47,95 @@ class Evaluator
   # Check if object mode is enabled
   def object_mode_enabled?
     @object_evaluator.object_mode_enabled
+  end
+  
+  # Reasoning system integration methods
+  def set_reasoning_coordinator(coordinator)
+    @reasoning_coordinator = coordinator
+    # Initialize reasoning components when coordinator is set
+    initialize_reasoning_systems
+  end
+  
+  def reasoning_coordinator
+    @reasoning_coordinator
+  end
+  
+  def initialize_reasoning_systems
+    return unless @reasoning_coordinator
+    
+    # Initialize reasoning components
+    @form_validator = FormValidator.new(self)
+    @goal_system = GoalSystem.new(self)
+    @facts_database = FactsDatabase.new(self)
+    
+    # Set up cross-component communication
+    @form_validator.set_reasoning_coordinator(@reasoning_coordinator)
+    @goal_system.set_reasoning_coordinator(@reasoning_coordinator)
+    @facts_database.set_reasoning_coordinator(@reasoning_coordinator)
+    
+    # Register components with coordinator
+    @reasoning_coordinator.register_component(:form_validator, @form_validator)
+    @reasoning_coordinator.register_component(:goal_system, @goal_system)
+    @reasoning_coordinator.register_component(:facts_database, @facts_database)
+  end
+
+  # Reasoning mode methods
+  def enable_reasoning_mode
+    return "Reasoning coordinator not set" unless @reasoning_coordinator
+    @reasoning_coordinator.enable_reasoning_mode
+  end
+
+  def disable_reasoning_mode
+    return "Reasoning coordinator not set" unless @reasoning_coordinator
+    @reasoning_coordinator.disable_reasoning_mode
+  end
+
+  def reasoning_mode_enabled?
+    @reasoning_coordinator&.reasoning_mode_enabled? || false
+  end
+
+  # Form validation integration
+  def validate_form(form_name, form_definition, data)
+    return nil unless @form_validator
+    @form_validator.validate_form(form_name, form_definition, data)
+  end
+
+  # Goal system integration
+  def declare_goal(name, definition)
+    return nil unless @goal_system
+    @goal_system.declare_goal(name, definition)
+  end
+
+  def pursue_goal(name, **context)
+    return nil unless @goal_system
+    @goal_system.pursue_goal(name, **context)
+  end
+
+  # Facts database integration
+  def assert_fact(fact)
+    return nil unless @facts_database
+    @facts_database.assert_fact(fact)
+  end
+
+  def define_rule(rule)
+    return nil unless @facts_database
+    @facts_database.define_rule(rule)
+  end
+
+  def query_facts(query)
+    return [] unless @facts_database
+    @facts_database.query(query)
+  end
+
+  # Type constraint integration
+  def create_constraint(variable, constraint_type, constraint_data, **options)
+    return nil unless @reasoning_coordinator
+    @reasoning_coordinator.create_constraint(variable, constraint_type, constraint_data, **options)
+  end
+
+  def validate_assignment(variable, value)
+    return true unless @reasoning_coordinator
+    @reasoning_coordinator.validate_assignment(variable, value)
   end
 
   def evaluate(node)
@@ -97,6 +196,20 @@ class Evaluator
       @function_evaluator.visit_function_call_node(node)
     when ReturnNode
       @function_evaluator.visit_return_node(node)
+    when ConstraintNode
+      visit_constraint_node(node)
+    when GoalNode
+      visit_goal_node(node)
+    when AssertNode
+      visit_assert_node(node)
+    when QueryNode
+      visit_query_node(node)
+    when RuleNode
+      visit_rule_node(node)
+    when PursueNode
+      visit_pursue_node(node)
+    when ReasoningModeNode
+      visit_reasoning_mode_node(node)
     else
       raise "Unknown node type: #{node.class}"
     end
@@ -174,5 +287,48 @@ class Evaluator
   # Helper method to determine truthiness according to Patlang rules
   def is_truthy(value)
     value != false && value != nil
+  end
+
+  # Reasoning system visitor methods
+  def visit_constraint_node(node)
+    # For now, just return a placeholder - the reasoning system will handle the logic
+    puts "CONSTRAINT: #{node.variable} :: #{node.type}#{node.conditions ? " where #{node.conditions}" : ""}"
+    nil
+  end
+
+  def visit_goal_node(node)
+    # For now, just return a placeholder - the reasoning system will handle the logic
+    puts "GOAL: #{node.name}"
+    nil
+  end
+
+  def visit_assert_node(node)
+    # For now, just return a placeholder - the reasoning system will handle the logic
+    puts "ASSERT: #{node.fact}"
+    nil
+  end
+
+  def visit_query_node(node)
+    # For now, just return a placeholder - the reasoning system will handle the logic
+    puts "QUERY: #{node.pattern}"
+    nil
+  end
+
+  def visit_rule_node(node)
+    # For now, just return a placeholder - the reasoning system will handle the logic
+    puts "RULE: #{node.head} :- #{node.body}"
+    nil
+  end
+
+  def visit_pursue_node(node)
+    # For now, just return a placeholder - the reasoning system will handle the logic
+    puts "PURSUE: #{node.goal_name}"
+    nil
+  end
+
+  def visit_reasoning_mode_node(node)
+    # For now, just return a placeholder - the reasoning system will handle the logic
+    puts "REASONING MODE: #{node.enabled ? 'ON' : 'OFF'}"
+    nil
   end
 end
