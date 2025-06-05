@@ -552,7 +552,11 @@ class TestLexer < Minitest::Test
 
     expected_tokens.each_with_index do |(expected_type, expected_value), index|
       assert_equal expected_type, tokens[index].type
-      assert_equal expected_value, tokens[index].value
+      if expected_value.nil?
+        assert_nil tokens[index].value
+      else
+        assert_equal expected_value, tokens[index].value
+      end
     end
   end
 

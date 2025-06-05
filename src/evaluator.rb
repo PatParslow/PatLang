@@ -3,10 +3,11 @@ require_relative 'evaluator/arithmetic_evaluator'
 require_relative 'evaluator/string_evaluator'
 require_relative 'evaluator/function_evaluator'
 require_relative 'evaluator/scope_manager'
+require_relative 'evaluator/object_evaluator'
 
 # Evaluator class for traversing AST with modular architecture
 class Evaluator
-  attr_reader :functions, :return_value, :returned, :variables
+  attr_reader :functions, :return_value, :returned, :variables, :object_evaluator
   attr_writer :return_value, :returned
 
   def initialize
@@ -20,24 +21,60 @@ class Evaluator
     @arithmetic_evaluator = EvaluatorModules::ArithmeticEvaluator.new(self)
     @string_evaluator = EvaluatorModules::StringEvaluator.new(self)
     @function_evaluator = EvaluatorModules::FunctionEvaluator.new(self)
+    @object_evaluator = EvaluatorModules::ObjectEvaluator.new(self)
+  end
+  
+  # Enable object-based evaluation mode
+  def enable_object_mode
+    @object_evaluator.enable_object_mode
+  end
+  
+  # Disable object-based evaluation mode (return to legacy mode)
+  def disable_object_mode
+    @object_evaluator.disable_object_mode
+  end
+  
+  # Check if object mode is enabled
+  def object_mode_enabled?
+    @object_evaluator.object_mode_enabled
   end
 
   def evaluate(node)
     case node
     when NumberNode
-      @arithmetic_evaluator.visit_number_node(node)
+      if @object_evaluator.object_mode_enabled
+        @object_evaluator.visit_number_node(node)
+      else
+        @arithmetic_evaluator.visit_number_node(node)
+      end
     when BinaryOpNode
-      @arithmetic_evaluator.visit_binary_op_node(node)
+      if @object_evaluator.object_mode_enabled
+        @object_evaluator.visit_binary_op_node(node)
+      else
+        @arithmetic_evaluator.visit_binary_op_node(node)
+      end
     when UnaryOpNode
-      @arithmetic_evaluator.visit_unary_op_node(node)
+      if @object_evaluator.object_mode_enabled
+        @object_evaluator.visit_unary_op_node(node)
+      else
+        @arithmetic_evaluator.visit_unary_op_node(node)
+      end
     when AssignmentNode
       visit_assignment_node(node)
     when VariableNode
       visit_variable_node(node)
     when BooleanNode
-      @arithmetic_evaluator.visit_boolean_node(node)
+      if @object_evaluator.object_mode_enabled
+        @object_evaluator.visit_boolean_node(node)
+      else
+        @arithmetic_evaluator.visit_boolean_node(node)
+      end
     when ComparisonNode
-      @arithmetic_evaluator.visit_comparison_node(node)
+      if @object_evaluator.object_mode_enabled
+        @object_evaluator.visit_comparison_node(node)
+      else
+        @arithmetic_evaluator.visit_comparison_node(node)
+      end
     when IfNode
       visit_if_node(node)
     when WhileNode
@@ -45,7 +82,11 @@ class Evaluator
     when BlockNode
       visit_block_node(node)
     when StringNode
-      @string_evaluator.visit_string_node(node)
+      if @object_evaluator.object_mode_enabled
+        @object_evaluator.visit_string_node(node)
+      else
+        @string_evaluator.visit_string_node(node)
+      end
     when IndexAccessNode
       @string_evaluator.visit_index_access_node(node)
     when MethodCallNode

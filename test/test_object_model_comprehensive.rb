@@ -400,7 +400,7 @@ class TestObjectModelComprehensive < Minitest::Test
     # Test with various value types
     assert_equal 42, extractor.extract_value(42)
     assert_equal "test", extractor.extract_value("test")
-    assert_equal nil, extractor.extract_value(nil)
+    assert_nil extractor.extract_value(nil)
     
     # Test with PatlangObjects
     obj = PatlangObject.create_number(42)

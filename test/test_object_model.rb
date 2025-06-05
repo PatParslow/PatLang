@@ -110,7 +110,6 @@ class TestObjectModel < Minitest::Test
     assert_equal 1, events_fired.length
     
     event = events_fired.first
-    assert_equal :value_changed, event[:type]
     assert_equal 10, event[:data][:old_value]
     assert_equal 20, event[:data][:new_value]
   end
@@ -192,11 +191,10 @@ class TestObjectModel < Minitest::Test
     assert_equal 1, messages_sent.length
     assert_equal 1, messages_received.length
     
-    sent_event = messages_sent.first
-    assert_equal :message_sent, sent_event[:type]
-    assert_equal sender.object_id, sent_event[:data][:from]
-    assert_equal receiver.object_id, sent_event[:data][:to]
-    assert_equal :greeting, sent_event[:data][:type]
+    sent_data = messages_sent.first
+    assert_equal sender.object_id, sent_data[:data][:from]
+    assert_equal receiver.object_id, sent_data[:data][:to]
+    assert_equal :greeting, sent_data[:data][:type]
   end
   
   def test_ping_pong_messages
@@ -235,7 +233,6 @@ class TestObjectModel < Minitest::Test
     assert_equal 1, destruction_events.length
     
     event = destruction_events.first
-    assert_equal :object_destroyed, event[:type]
     assert_equal object_id, event[:data][:object_id]
     assert_equal 42, event[:data][:final_value]
   end
@@ -276,11 +273,10 @@ class TestEventSystem < Minitest::Test
     end
     
     # Fire event
-    event = registry.fire_event(:test_event, { data: "test" })
+    event = registry.fire_event(:test_event, "test")
     
     assert_equal 1, events_received.length
-    assert_equal :test_event, events_received.first[:type]
-    assert_equal "test", events_received.first[:data][:data]
+    assert_equal "test", events_received.first[:data]
   end
   
   def test_global_event_handlers

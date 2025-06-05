@@ -67,7 +67,7 @@ module EventSystem
         end
       end
       
-      # Fire to global handlers
+      # Fire to global handlers (always get full event)
       @global_handlers.each do |handler|
         begin
           handler.call(event)
@@ -160,6 +160,18 @@ module EventSystem
       @instance_event_registry.register_global_handler(block)
     end
     
+    # Register for cross-object events (receives full event objects)
+    def on_cross_object_event(event_type, &block)
+      @cross_object_event_registry ||= EventRegistry.new
+      @cross_object_event_registry.register_handler(event_type, block)
+    end
+    
+    # Register for all cross-object events (receives full event objects)
+    def on_all_cross_object_events(&block)
+      @cross_object_event_registry ||= EventRegistry.new
+      @cross_object_event_registry.register_global_handler(block)
+    end
+    
     # Fire an event from this object
     def fire_event(event_type, event_data = {})
       # Add source object information
@@ -170,18 +182,23 @@ module EventSystem
         @instance_event_registry.fire_event(event_type, enhanced_data)
       end
       
+      # Fire on cross-object handlers
+      if @cross_object_event_registry
+        @cross_object_event_registry.fire_event(event_type, enhanced_data)
+      end
+      
       # Fire on class handlers
       self.class.event_registry.fire_event(event_type, enhanced_data)
     end
     
-    # Subscribe to events from another object
+    # Subscribe to events from another object (gets full event objects)
     def subscribe_to(other_object, event_type = nil, &block)
       subscription_id = block.object_id
       
       if event_type
-        handler_id = other_object.on_event(event_type, &block)
+        handler_id = other_object.on_cross_object_event(event_type, &block)
       else
-        handler_id = other_object.on_all_events(&block)
+        handler_id = other_object.on_all_cross_object_events(&block)
       end
       
       # Track subscription for cleanup
@@ -219,15 +236,37 @@ module EventSystem
       end
     end
     
-    # Remove specific event handlers
+    # Remove specific event handlers (tries both instance and cross-object registries)
     def remove_event_handler(event_type, handler_id)
-      return false unless @instance_event_registry
-      @instance_event_registry.remove_handler(event_type, handler_id)
+      result = false
+      
+      # Try instance registry first
+      if @instance_event_registry
+        result = @instance_event_registry.remove_handler(event_type, handler_id) || result
+      end
+      
+      # Try cross-object registry
+      if @cross_object_event_registry
+        result = @cross_object_event_registry.remove_handler(event_type, handler_id) || result
+      end
+      
+      result
     end
     
     def remove_global_handler(handler_id)
-      return false unless @instance_event_registry
-      @instance_event_registry.remove_global_handler(handler_id)
+      result = false
+      
+      # Try instance registry first
+      if @instance_event_registry
+        result = @instance_event_registry.remove_global_handler(handler_id) || result
+      end
+      
+      # Try cross-object registry
+      if @cross_object_event_registry
+        result = @cross_object_event_registry.remove_global_handler(handler_id) || result
+      end
+      
+      result
     end
     
     # Get event history for this object
@@ -335,5 +374,25 @@ module EventSystem
   # Convenience method for global message sending
   def self.send_message(from_object, to_object, message_type, payload = {})
     message_bus.send_message(from_object, to_object, message_type, payload)
+  end
+  
+  # Global event registry for system-wide events
+  def self.global_registry
+    @global_registry ||= EventRegistry.new
+  end
+  
+  # Global subscribe method for testing and system-wide event handling
+  def self.subscribe(event_type, &block)
+    global_registry.register_handler(event_type, block)
+  end
+  
+  # Global fire event method
+  def self.fire_global_event(event_type, event_data = {})
+    global_registry.fire_event(event_type, event_data)
+  end
+  
+  # Clear global event handlers (useful for testing)
+  def self.clear_global_handlers
+    @global_registry = EventRegistry.new
   end
 end

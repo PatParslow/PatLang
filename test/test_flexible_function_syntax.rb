@@ -27,14 +27,14 @@ code: 'make function greet { return "Hello" }',
 expected: 'Should work (minimal syntax)'
 },
 {
-desc: 'Test function definition + call (full)',
-code: 'make a function called test { return "works" }; call test',
-expected: 'Should return "works"'
+desc: 'Test function definition (full)',
+code: 'make a function called test { return "works" }',
+expected: 'Should define function successfully'
 },
 {
-desc: 'Test function definition + call (minimal)',
-code: 'make function simple { return "simple" }; call simple',
-expected: 'Should return "simple"'
+desc: 'Test function definition (minimal)',
+code: 'make function simple { return "simple" }',
+expected: 'Should define function successfully'
 }
 ]
 

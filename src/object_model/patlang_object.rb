@@ -26,12 +26,14 @@ class PatlangObject
     @@object_registry[@object_id] = self
     
     # Fire creation event
-    fire_event(:object_created, {
+    creation_event_data = {
       object_id: @object_id,
       type: @object_type,
       value: @raw_value,
       timestamp: @created_at
-    })
+    }
+    fire_event(:object_created, creation_event_data)
+    EventSystem.fire_global_event(:object_created, creation_event_data)
   end
   
   # Get the actual value, providing seamless integration with existing code
@@ -203,7 +205,9 @@ class PatlangObject
   
   # Factory methods for creating typed objects
   def self.create_number(value)
-    new(value.to_f, :number)
+    # Preserve original numeric type (Integer vs Float) for proper type inference
+    numeric_value = value.is_a?(Numeric) ? value : value.to_f
+    new(numeric_value, :number)
   end
   
   def self.create_string(value)
@@ -296,5 +300,28 @@ class PatlangObject
     else
       # Default: do nothing for unknown message types
     end
+  end
+  
+  public
+  
+  # Convert to string for concatenation - returns just the value as string
+  def to_string
+    case @object_type
+    when :string
+      @raw_value
+    when :number
+      @raw_value.to_s
+    when :boolean
+      @raw_value.to_s
+    when :nil
+      ""
+    else
+      @raw_value.to_s
+    end
+  end
+  
+  # Class methods for finding objects
+  def self.find_object(object_id)
+    @@object_registry[object_id]
   end
 end
