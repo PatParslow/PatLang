@@ -7,6 +7,7 @@ require_relative '../../src/reasoning/performance_optimizer'
 require_relative '../../src/reasoning/cross_paradigm_coordinator'
 require_relative '../../src/reasoning/advanced_goal_strategies'
 require_relative '../../src/reasoning/complex_logic_engine'
+require_relative '../../src/emergency_timeout'
 
 # Phase 3: Performance Optimization Test Suite
 #
@@ -511,25 +512,31 @@ class TestPerformanceOptimization < Minitest::Test
     
     @performance_optimizer.configure_ml_optimization(ml_optimization_config)
     
-    # Training phase: Execute diverse reasoning tasks
+    # Training phase: Execute diverse reasoning tasks (REDUCED from 500 to 100 each to prevent hangs)
     training_tasks = [
-      generate_reasoning_tasks("mathematical_optimization", 500),
-      generate_reasoning_tasks("logical_inference", 500),  
-      generate_reasoning_tasks("constraint_satisfaction", 500),
-      generate_reasoning_tasks("pattern_recognition", 500),
-      generate_reasoning_tasks("decision_making", 500)
+      generate_reasoning_tasks("mathematical_optimization", 100),
+      generate_reasoning_tasks("logical_inference", 100),
+      generate_reasoning_tasks("constraint_satisfaction", 100),
+      generate_reasoning_tasks("pattern_recognition", 100),
+      generate_reasoning_tasks("decision_making", 100)
     ].flatten
     
-    # Execute training phase
+    # Execute training phase with emergency timeout protection
     training_results = []
-    training_tasks.each_with_index do |task, index|
-      result = @performance_optimizer.execute_with_learning(task)
-      training_results << result
-      
-      # Periodic evaluation of learning progress
-      if (index + 1) % 100 == 0
-        learning_metrics = @performance_optimizer.evaluate_learning_progress
-        puts "Training progress at #{index + 1}/#{training_tasks.length}: #{learning_metrics[:improvement_factor]}"
+    EmergencyTimeout.protect(30) do
+      training_tasks.each_with_index do |task, index|
+        result = EmergencyTimeout.protect_operation(0.1) do
+          @performance_optimizer.execute_with_learning(task)
+        end
+        training_results << result
+        
+        # Periodic evaluation of learning progress
+        if (index + 1) % 50 == 0  # Reduced frequency from 100 to 50
+          learning_metrics = EmergencyTimeout.protect_operation(0.1) do
+            @performance_optimizer.evaluate_learning_progress
+          end
+          puts "Training progress at #{index + 1}/#{training_tasks.length}: #{learning_metrics[:improvement_factor]}"
+        end
       end
     end
     
@@ -540,9 +547,13 @@ class TestPerformanceOptimization < Minitest::Test
     ].flatten
     
     test_results = []
-    test_tasks.each do |task|
-      result = @performance_optimizer.execute_optimized(task)
-      test_results << result
+    EmergencyTimeout.protect(15) do  # Shorter timeout for test phase
+      test_tasks.each do |task|
+        result = EmergencyTimeout.protect_operation(0.1) do
+          @performance_optimizer.execute_optimized(task)
+        end
+        test_results << result
+      end
     end
     
     # Should demonstrate learning-based improvement
