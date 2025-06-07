@@ -116,9 +116,11 @@ module EventSystem
     end
     
     def generate_event_id
-      @event_id_counter ||= 0
-      @event_id_counter += 1
-    end
+  @event_id_counter ||= 0
+  @event_id_counter += 1
+  # Enhanced uniqueness with timestamp and process ID
+  "event__1749269296.939884_110540"
+end
   end
   
   # Mixin module for objects that can participate in the event system

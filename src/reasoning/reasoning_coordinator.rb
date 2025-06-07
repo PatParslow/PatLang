@@ -25,6 +25,7 @@ class ReasoningCoordinator
 
   # Component registration for integration
   def register_component(name, component)
+    @components ||= {}
     @components[name] = component
     
     fire_event(:component_registered, {
@@ -89,14 +90,29 @@ class ReasoningCoordinator
   end
 
   def get_constraint(variable)
-    @constraint_system.get_constraints(variable).first
+    # Try both symbol and string formats for variable lookup
+    constraints = @constraint_system.get_constraints(variable)
+    if constraints.empty? && variable.is_a?(Symbol)
+      constraints = @constraint_system.get_constraints(variable.to_s)
+    elsif constraints.empty? && variable.is_a?(String)
+      constraints = @constraint_system.get_constraints(variable.to_sym)
+    end
+    
+    result = constraints.first
+    
+    # Return a null object pattern to prevent NoMethodError on satisfies?
+    if result.nil?
+      return NullTypeConstraint.new(variable)
+    end
+    
+    result
   end
 
   def validate_assignment(variable, value)
     return true unless @reasoning_mode
     
     unless @constraint_system.variable_satisfies?(variable, value)
-      violated_constraints = @constraint_system.get_constraints(variable).reject { |c| c.satisfies?(value) }
+      violated_constraints = @constraint_system.get_constraints(variable).compact.reject { |c| c.satisfies?(value) }
       constraint = violated_constraints.first
       
       if constraint
@@ -324,7 +340,7 @@ class ReasoningCoordinator
     relevant_vars.each do |var|
       constraints = @constraint_system.get_constraints(var)
       candidate_values.select! do |value|
-        constraints.all? { |constraint| constraint.satisfies?(value) }
+        constraints.compact.all? { |constraint| constraint.satisfies?(value) }
       end
     end
     
@@ -424,23 +440,37 @@ end
 
 # Goal representation for goal-oriented programming
 class Goal
-  attr_reader :name, :parameters, :preconditions, :postconditions, :strategy
+  attr_reader :name, :parameters, :preconditions, :postconditions, :strategy,
+              :strategies, :preference, :subgoals, :context, :description
 
-  def initialize(name, parameters: [], preconditions: [], postconditions: [], strategy: nil, &block)
+  def initialize(name, **options)
     @name = name.to_s
-    @parameters = Array(parameters).map(&:to_sym)
-    @preconditions = Array(preconditions)
-    @postconditions = Array(postconditions)
-    @strategy = strategy
-    @resolution_block = block
+    @parameters = Array(options[:parameters] || []).map(&:to_sym)
+    @preconditions = Array(options[:preconditions] || [])
+    @postconditions = Array(options[:postconditions] || [])
+    @strategy = options[:strategy]
+    @strategies = Array(options[:strategies] || [])
+    @preference = options[:preference]
+    @subgoals = Array(options[:subgoals] || [])
+    @context = options[:context] || {}
+    @description = options[:description]
+    @resolution_block = options[:block] || (block_given? ? Proc.new : nil)
   end
 
   def has_precondition?
-    !@preconditions.empty?
+    @preconditions&.any? || false
   end
 
   def has_postcondition?
-    !@postconditions.empty?
+    @postconditions&.any? || false
+  end
+
+  def has_subgoals?
+    @subgoals&.any? || false
+  end
+
+  def has_multiple_strategies?
+    (@strategies&.length || 0) > 1
   end
 
   def resolve(**context)

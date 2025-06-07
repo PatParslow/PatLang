@@ -327,19 +327,19 @@ class Goal
   end
 
   def has_precondition?
-    !@preconditions.empty?
+    @preconditions && !@preconditions.empty?
   end
 
   def has_postcondition?
-    !@postconditions.empty?
+    @postconditions && !@postconditions.empty?
   end
 
   def has_subgoals?
-    !@subgoals.empty?
+    @subgoals&.any? || false
   end
 
   def has_multiple_strategies?
-    @strategies.length > 1
+    (@strategies&.length || 0) > 1
   end
 
   def resolve(**context)

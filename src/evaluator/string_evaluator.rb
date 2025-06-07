@@ -53,12 +53,55 @@ module EvaluatorModules
         handle_string_method(object_value, node)
       elsif object_value.is_a?(Numeric)
         handle_number_method(object_value, node)
+      elsif object_value.is_a?(Class)
+        handle_class_method(object_value, node)
+      elsif object_value.respond_to?(:patlang_object?) || object_value.is_a?(PatlangObject)
+        handle_patlang_object_method(object_value, node)
       else
-        raise "Method calls are only supported for strings and numbers, got #{object_value.class}"
+        raise "Method calls are only supported for strings, numbers, classes, and PatlangObjects, got #{object_value.class}"
       end
     end
 
     private
+
+    def handle_class_method(object_value, node)
+      case node.method_name
+      when 'new'
+        # Call the class's new method to create an instance
+        object_value.new(*node.arguments)
+      else
+        raise "Unknown method '#{node.method_name}' for class #{object_value}"
+      end
+    end
+
+    def handle_patlang_object_method(object_value, node)
+      method_name = node.method_name
+      
+      # Handle property assignment (setter methods ending with =)
+      if method_name.end_with?('=')
+        property_name = method_name[0...-1]  # Remove the = suffix
+        if node.arguments.length != 1
+          raise "Property assignment '#{method_name}' requires exactly one argument, got #{node.arguments.length}"
+        end
+        # Evaluate the argument and set it as a property
+        value = @evaluator.evaluate(node.arguments[0])
+        object_value.set_metadata(property_name.to_sym, value)
+        return value
+      else
+        # Handle property access (getter methods)
+        property_value = object_value.metadata[method_name.to_sym]
+        return property_value if object_value.metadata.key?(method_name.to_sym)
+        
+        # If property doesn't exist, try to call method on the object
+        if object_value.respond_to?(method_name)
+          args = node.arguments.map { |arg| @evaluator.evaluate(arg) }
+          return object_value.send(method_name, *args)
+        else
+          # Return nil for non-existent properties (common behavior)
+          return nil
+        end
+      end
+    end
 
     def handle_string_method(object_value, node)
       case node.method_name

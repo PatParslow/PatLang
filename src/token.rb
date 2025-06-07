@@ -28,6 +28,8 @@ class Token
     LESS: :LESS_THAN,  # Alias for backward compatibility
     GREATER_THAN: :GREATER_THAN,
     GREATER: :GREATER_THAN,  # Alias for backward compatibility
+    # Special tokens for edge case handling
+    UNKNOWN: :UNKNOWN,
     LESS_EQUAL: :LESS_EQUAL,
     GREATER_EQUAL: :GREATER_EQUAL,
     # Control flow keywords

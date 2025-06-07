@@ -76,6 +76,21 @@ class AssignmentNode < ASTNode
   end
 end
 
+# Node representing a property assignment (obj.prop = value)
+class PropertyAssignmentNode < ASTNode
+  attr_reader :object_name, :property_name, :expression
+
+  def initialize(object_name, property_name, expression)
+    @object_name = object_name
+    @property_name = property_name
+    @expression = expression
+  end
+
+  def to_s
+    "PropertyAssignmentNode(#{@object_name}.#{@property_name}, #{@expression})"
+  end
+end
+
 # Node representing a boolean literal (true/false)
 class BooleanNode < ASTNode
   attr_reader :value
@@ -277,14 +292,20 @@ end
 
 # Node representing a goal declaration (e.g., goal find_answer { postcondition: answer > 0 })
 class GoalNode < ASTNode
-  attr_reader :name, :parameters, :precondition, :postcondition, :strategy
+  attr_reader :name, :parameters, :precondition, :postcondition, :strategy,
+              :description, :strategies, :subgoals, :context
 
-  def initialize(name, parameters = [], precondition = nil, postcondition = nil, strategy = nil)
+  def initialize(name, parameters = [], precondition = nil, postcondition = nil, strategy = nil,
+                 description = nil, strategies = [], subgoals = [], context = {})
     @name = name
     @parameters = parameters
     @precondition = precondition
     @postcondition = postcondition
     @strategy = strategy
+    @description = description
+    @strategies = strategies
+    @subgoals = subgoals
+    @context = context
   end
 
   def to_s
@@ -356,5 +377,19 @@ class ReasoningModeNode < ASTNode
 
   def to_s
     "ReasoningModeNode(#{@enabled ? 'on' : 'off'})"
+  end
+end
+
+# Node representing a parser error with recovery
+class ErrorNode < ASTNode
+  attr_reader :message, :recovered_value
+  
+  def initialize(message, recovered_value = nil)
+    @message = message
+    @recovered_value = recovered_value
+  end
+  
+  def to_s
+    "ErrorNode(#{@message.inspect})"
   end
 end

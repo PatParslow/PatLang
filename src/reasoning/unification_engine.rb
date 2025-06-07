@@ -3,7 +3,8 @@
 # Core unification engine for type inference and reasoning
 # This is a minimal stub implementation for Phase 1 TDD
 class UnificationEngine
-  def initialize
+  def initialize(evaluator = nil)
+    @evaluator = evaluator
     @event_handlers = {}
     @unification_count = 0
   end

@@ -474,25 +474,6 @@ end
 
 # These classes represent the expected API after GREEN phase implementation
 
-class FormValidator
-  def initialize(evaluator)
-    @evaluator = evaluator
-    @event_handlers = {}
-  end
-
-  def on_validation_error(&block)
-    @event_handlers[:validation_error] = block
-  end
-
-  def on_validation_success(&block)
-    @event_handlers[:validation_success] = block
-  end
-
-  def validate_form(form_name, form_definition, data)
-    # This method should be implemented during GREEN phase
-    raise NotImplementedError, "FormValidator not yet implemented - this is RED phase"
-  end
-end
 
 class ValidationResult
   attr_reader :errors, :validated_data

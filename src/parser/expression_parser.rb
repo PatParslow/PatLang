@@ -8,16 +8,32 @@ module ParserModules
     end
 
     def expression
-      logical_or
+      # Add error recovery for expression parsing
+      return create_error_placeholder("Empty expression") if @parser.current_token.nil?
+      
+      begin
+        logical_or
+      rescue ParseError => e
+        # Error recovery: return a placeholder node with error info
+        create_error_placeholder("Expression parse error: #{e.message}")
+      end
     end
 
     def logical_or
       left = logical_and
+      return left unless left
       
       while @parser.current_token&.type == :OR
         op = @parser.current_token.value
         @parser.advance
+        
+        # Error recovery for incomplete logical expressions
+        if @parser.current_token.nil?
+          return create_error_placeholder("Incomplete logical OR expression")
+        end
+        
         right = logical_and
+        return left unless right # If right side fails, return left side
         left = BinaryOpNode.new(left, op, right)
       end
       
@@ -26,11 +42,19 @@ module ParserModules
 
     def logical_and
       left = equality
+      return left unless left
       
       while @parser.current_token&.type == :AND
         op = @parser.current_token.value
         @parser.advance
+        
+        # Error recovery for incomplete logical expressions
+        if @parser.current_token.nil?
+          return create_error_placeholder("Incomplete logical AND expression")
+        end
+        
         right = equality
+        return left unless right # If right side fails, return left side
         left = BinaryOpNode.new(left, op, right)
       end
       
@@ -38,14 +62,28 @@ module ParserModules
     end
 
     def equality
-      left = comparison
+      left = type_annotation
       
       while @parser.current_token&.type == :EQUAL ||
             @parser.current_token&.type == :NOT_EQUAL
         op = @parser.current_token.value
         @parser.advance
-        right = comparison
+        right = type_annotation
         left = ComparisonNode.new(left, op, right)
+      end
+      
+      left
+    end
+
+    # Handle type annotations like "data :: Object"
+    def type_annotation
+      left = comparison
+      
+      if @parser.current_token&.type == :DOUBLE_COLON
+        op = @parser.current_token.value
+        @parser.advance
+        right = comparison
+        left = BinaryOpNode.new(left, op, right)
       end
       
       left
@@ -69,12 +107,20 @@ module ParserModules
 
     def arithmetic
       left = term
+      return left unless left
       
       while @parser.current_token&.type == :PLUS ||
             @parser.current_token&.type == :MINUS
         op = @parser.current_token.value
         @parser.advance
+        
+        # Error recovery for incomplete arithmetic expressions
+        if @parser.current_token.nil?
+          return create_error_placeholder("Incomplete arithmetic expression")
+        end
+        
         right = term
+        return left unless right # If right side fails, return left side
         left = BinaryOpNode.new(left, op, right)
       end
       
@@ -83,13 +129,21 @@ module ParserModules
 
     def term
       left = unary
+      return left unless left
       
       while @parser.current_token&.type == :STAR ||
             @parser.current_token&.type == :SLASH ||
             @parser.current_token&.type == :PERCENT
         op = @parser.current_token.value
         @parser.advance
+        
+        # Error recovery for incomplete term expressions
+        if @parser.current_token.nil?
+          return create_error_placeholder("Incomplete term expression")
+        end
+        
         right = unary
+        return left unless right # If right side fails, return left side
         left = BinaryOpNode.new(left, op, right)
       end
       
@@ -104,40 +158,112 @@ module ParserModules
         return UnaryOpNode.new(op, operand)
       end
       
-      postfix
+      exponentiation
+    end
+
+    def exponentiation
+      left = postfix
+      
+      # Right-associative exponentiation (2^3^2 = 2^(3^2) = 2^9 = 512)
+      if @parser.current_token&.type == :CARET
+        op = @parser.current_token.value
+        @parser.advance
+        right = exponentiation  # Right-associative
+        left = BinaryOpNode.new(left, op, right)
+      end
+      
+      left
     end
 
     def postfix
       left = primary
+      return left unless left
       
-      # Handle bracket indexing and string methods
+      # Handle bracket indexing and string methods with error recovery
+      # Use a counter to prevent infinite loops and track token changes
+      loop_count = 0
+      max_loops = 50  # Reduced safety limit
+      last_token_position = nil
+      
       loop do
-        if @parser.current_token&.type == :LPAREN
-          # Direct function call like fact(args)
+        break unless @parser.current_token
+        break if loop_count >= max_loops  # Safety break
+        
+        # CRITICAL: Track token position to detect infinite loops
+        current_token_position = @parser.current_token.object_id
+        if last_token_position == current_token_position && loop_count > 0
+          # Token hasn't changed - we're in an infinite loop!
+          @parser.error("Parser infinite loop detected at token: #{@parser.current_token.type}")
+          return create_error_placeholder("Parser infinite loop detected")
+        end
+        last_token_position = current_token_position
+        
+        loop_count += 1
+        current_token_type = @parser.current_token.type
+        
+        if current_token_type == :LPAREN
+          # Direct function call like fact(args) with error recovery
           @parser.advance # consume '('
           
           arguments = []
           until @parser.current_token&.type == :RPAREN
-            arguments << expression
+            if @parser.current_token.nil?
+              # Error recovery: incomplete function call
+              return create_error_placeholder("Incomplete function call - missing closing parenthesis")
+            end
+            
+            arg = expression
+            arguments << arg if arg
             
             if @parser.current_token&.type == :COMMA
               @parser.advance
             elsif @parser.current_token&.type != :RPAREN
-              @parser.error("Expected ',' or ')' in argument list")
+              if @parser.current_token.nil?
+                return create_error_placeholder("Incomplete function call arguments")
+              end
+              # Instead of raising error, return error placeholder
+              return create_error_placeholder("Expected ',' or ')' in argument list")
             end
           end
           
-          @parser.eat(:RPAREN)
-          left = FunctionCallNode.new(left.name, arguments)
-        elsif @parser.current_token&.type == :LBRACKET
+          if @parser.current_token&.type == :RPAREN
+            @parser.advance
+          else
+            return create_error_placeholder("Missing closing parenthesis in function call")
+          end
+          
+          # Handle different node types that could be function names
+          function_name = case left
+                         when VariableNode
+                           left.name
+                         when StringNode
+                           left.value
+                         else
+                           left.respond_to?(:value) ? left.value : left.to_s
+                         end
+          left = FunctionCallNode.new(function_name, arguments)
+        elsif current_token_type == :LBRACKET
           @parser.advance # consume '['
+          
+          if @parser.current_token.nil?
+            return create_error_placeholder("Incomplete array index - missing expression")
+          end
+          
           index = expression
-          @parser.eat(:RBRACKET)
+          if @parser.current_token&.type == :RBRACKET
+            @parser.advance
+          else
+            return create_error_placeholder("Missing closing bracket in array access")
+          end
           left = IndexAccessNode.new(left, index)
-        elsif @parser.current_token&.type == :DOT
+        elsif current_token_type == :DOT
           @parser.advance # consume '.'
           
-          if @parser.current_token&.type == :IDENTIFIER
+          if @parser.current_token.nil?
+            return create_error_placeholder("Incomplete method call - missing method name")
+          end
+          
+          if @parser.current_token.type == :IDENTIFIER
             method_name = @parser.current_token.value
             @parser.advance
             
@@ -147,8 +273,17 @@ module ParserModules
               
               arguments = []
               unless @parser.current_token&.type == :RPAREN
+                arg_loop_count = 0
                 loop do
-                  arguments << expression
+                  break if arg_loop_count >= 50  # Safety for inner loop
+                  arg_loop_count += 1
+                  
+                  if @parser.current_token.nil?
+                    return create_error_placeholder("Incomplete method call arguments")
+                  end
+                  
+                  arg = expression
+                  arguments << arg if arg
                   
                   if @parser.current_token&.type == :COMMA
                     @parser.advance
@@ -158,14 +293,18 @@ module ParserModules
                 end
               end
               
-              @parser.eat(:RPAREN)
+              if @parser.current_token&.type == :RPAREN
+                @parser.advance
+              else
+                return create_error_placeholder("Missing closing parenthesis in method call")
+              end
               left = MethodCallNode.new(left, method_name, arguments)
             else
               # Method call without arguments
               left = MethodCallNode.new(left, method_name, [])
             end
           else
-            @parser.error("Expected method name after '.'")
+            return create_error_placeholder("Expected method name after '.'")
           end
         else
           break
@@ -177,6 +316,9 @@ module ParserModules
 
     def primary
       token = @parser.current_token
+      
+      # Error recovery for nil token
+      return create_error_placeholder("Unexpected end of input") if token.nil?
       
       if token.type == :NUMBER
         @parser.advance
@@ -192,12 +334,22 @@ module ParserModules
           # This looks like a function call
           function_name = token.value
           @parser.advance
-          @parser.eat(:LPAREN)
+          
+          if @parser.current_token&.type == :LPAREN
+            @parser.advance # consume '('
+          else
+            return create_error_placeholder("Expected '(' for function call")
+          end
           
           arguments = []
           unless @parser.current_token&.type == :RPAREN
             loop do
-              arguments << expression
+              if @parser.current_token.nil?
+                return create_error_placeholder("Incomplete function call arguments")
+              end
+              
+              arg = expression
+              arguments << arg if arg
               
               if @parser.current_token&.type == :COMMA
                 @parser.advance
@@ -207,7 +359,11 @@ module ParserModules
             end
           end
           
-          @parser.eat(:RPAREN)
+          if @parser.current_token&.type == :RPAREN
+            @parser.advance
+          else
+            return create_error_placeholder("Missing closing parenthesis in function call")
+          end
           return FunctionCallNode.new(function_name, arguments)
         else
           # Variable reference
@@ -237,9 +393,24 @@ module ParserModules
         @parser.advance
         return VariableNode.new(token.value)
       elsif token.type == :LPAREN
-        @parser.eat(:LPAREN)
+        @parser.advance # consume '('
+        
+        # Handle empty parentheses as error recovery
+        if @parser.current_token&.type == :RPAREN
+          @parser.advance
+          return create_error_placeholder("Empty parentheses expression")
+        end
+        
+        if @parser.current_token.nil?
+          return create_error_placeholder("Incomplete parenthesized expression")
+        end
+        
         node = expression
-        @parser.eat(:RPAREN)
+        if @parser.current_token&.type == :RPAREN
+          @parser.advance
+        else
+          return create_error_placeholder("Missing closing parenthesis")
+        end
         return node
       elsif token.type == :LBRACE
         # Handle LBRACE in expression context - could be block expression or object literal
@@ -249,9 +420,11 @@ module ParserModules
         # Parse statements inside the block until we hit RBRACE
         until @parser.current_token&.type == :RBRACE
           if @parser.current_token.nil?
-            @parser.error("Expected '}' to close block")
+            return create_error_placeholder("Incomplete block - missing '}'")
           end
-          statements << expression
+          
+          stmt = expression
+          statements << stmt if stmt
           
           # Optional semicolon or newline between statements
           if @parser.current_token&.type == :SEMICOLON
@@ -259,7 +432,11 @@ module ParserModules
           end
         end
         
-        @parser.eat(:RBRACE)
+        if @parser.current_token&.type == :RBRACE
+          @parser.advance
+        else
+          return create_error_placeholder("Missing closing brace in block")
+        end
         return BlockNode.new(statements)
       elsif token.type == :COLON
         # Handle COLON in expression context - could be type annotation or label
@@ -304,9 +481,53 @@ module ParserModules
         # Handle FACT keyword as variable reference in expression context (for fact() calls)
         @parser.advance
         return VariableNode.new(token.value)
+      elsif token.type == :PURSUE
+        # Handle PURSUE keyword as function name for goal pursuit
+        @parser.advance
+        return VariableNode.new(token.value)
+      elsif token.type == :QUERY
+        # Handle QUERY keyword as function name for logic queries
+        @parser.advance
+        return VariableNode.new(token.value)
+      elsif token.type == :GOAL
+        # Handle GOAL keyword as identifier in expressions
+        @parser.advance
+        return VariableNode.new(token.value)
+      elsif token.type == :DOUBLE_COLON
+        # Handle DOUBLE_COLON in expression context - this creates a type annotation node
+        # This allows expressions like "user.name :: String" to be parsed
+        @parser.advance
+        return VariableNode.new("::")
+      elsif token.type == :WHERE
+        # Handle WHERE keyword as identifier in query expressions
+        @parser.advance
+        return VariableNode.new(token.value)
+      elsif token.type == :EOF
+        # Handle EOF token gracefully
+        return create_error_placeholder("Unexpected end of input")
+      elsif [:PLUS, :MINUS, :STAR, :SLASH, :PERCENT].include?(token.type)
+        # Handle operators appearing where primary expressions are expected
+        return create_error_placeholder("Unexpected operator '#{token.value}' in expression")
+      elsif [:RPAREN, :RBRACKET, :RBRACE].include?(token.type)
+        # Handle unmatched closing tokens
+        return create_error_placeholder("Unexpected closing '#{token.value}'")
+      elsif token.type == :DOT
+        # Handle dot without preceding expression
+        return create_error_placeholder("Unexpected '.' at start of expression")
+      elsif token.type == :LBRACKET
+        # Handle array literals and bracket expressions
+        return create_error_placeholder("Array literals not supported in this context")
       else
-        @parser.error("Unexpected token in factor")
+        return create_error_placeholder("Unexpected token '#{token.value}' in expression")
       end
+    end
+    
+    private
+    
+    def create_error_placeholder(message)
+      # Create a special error node that doesn't crash the parser
+      # This allows parsing to continue and provides better error reporting
+      ErrorNode.new(message)
     end
 
     # Grammar: boolean → 'true' | 'false'

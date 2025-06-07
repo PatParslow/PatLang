@@ -560,13 +560,6 @@ class CrossParadigmCoordinator
     @event_handlers[event_type] << block
   end
 
-  def execute_workflow(name, definition, context = {})
-    # Use the actual CrossParadigmCoordinator implementation
-    mock_evaluator = Object.new
-    @coordinator ||= CrossParadigmCoordinator.new(mock_evaluator)
-    @coordinator.execute_workflow(name, definition, context)
-  end
-
   private
 
   def fire_event(event_type, data)

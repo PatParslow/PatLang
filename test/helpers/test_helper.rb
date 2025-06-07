@@ -7,3 +7,4 @@ SimpleCov.start do
 end
 
 require 'minitest/autorun'
+require_relative '../../src/parse_error'

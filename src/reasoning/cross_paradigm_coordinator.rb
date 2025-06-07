@@ -17,14 +17,31 @@ require_relative 'unification_engine'
 # - Self-optimizing system that learns better constraint patterns
 # - Cross-paradigm workflows with emergent behaviors
 class CrossParadigmCoordinator
-  def initialize(evaluator)
+  def initialize(evaluator = nil)
+    @workflow_depth = 0
+    @max_workflow_depth = 100
     @evaluator = evaluator
     @event_handlers = {}
-    @paradigm_state = {
-      type_system: initialize_type_system,
-      goal_system: initialize_goal_system,
-      logic_system: initialize_logic_system
-    }
+    
+    # Initialize paradigm state with error handling
+    @paradigm_state = {}
+    begin
+      @paradigm_state[:type_system] = initialize_type_system
+    rescue => e
+      @paradigm_state[:type_system] = nil
+    end
+    
+    begin
+      @paradigm_state[:goal_system] = initialize_goal_system
+    rescue => e
+      @paradigm_state[:goal_system] = nil
+    end
+    
+    begin
+      @paradigm_state[:logic_system] = initialize_logic_system
+    rescue => e
+      @paradigm_state[:logic_system] = nil
+    end
     @coordination_metrics = {
       paradigm_switches: 0,
       type_refinements: 0,
@@ -35,18 +52,24 @@ class CrossParadigmCoordinator
     @optimization_patterns = {}
     @variable_evolution_history = {}
   end
-
   # Event handling for cross-paradigm coordination
   def on_event(event_type, &block)
     @event_handlers[event_type] ||= []
     @event_handlers[event_type] << block
   end
-
   # Main revolutionary workflow execution
   def execute_workflow(name, definition, context = {})
-    fire_event(:paradigm_switch, { from: nil, to: :cross_paradigm, workflow: name })
+    @workflow_depth ||= 0  # Ensure workflow_depth is initialized
+    @max_workflow_depth ||= 100  # Ensure max_workflow_depth is initialized
+    @workflow_depth += 1
+    if @workflow_depth > @max_workflow_depth
+      @workflow_depth = 0
+      raise RuntimeError, "Maximum workflow depth exceeded () - infinite recursion detected"
+    end
     
     begin
+      fire_event(:paradigm_switch, { from: nil, to: :cross_paradigm, workflow: name })
+      
       # Parse the workflow definition for cross-paradigm requirements
       parsed_workflow = parse_workflow_definition(definition)
       
@@ -73,9 +96,10 @@ class CrossParadigmCoordinator
         paradigm_coordination: { coordination_failed: true },
         execution_history: []
       }
+    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
   end
-
   # Type-guided goal optimization
   def optimize_goals_with_type_information(goals, type_context)
     optimized_goals = []
@@ -97,11 +121,9 @@ class CrossParadigmCoordinator
         type_analysis: type_analysis
       })
     end
-    
     update_coordination_metrics(:goal_optimizations, optimized_goals.length)
     optimized_goals
   end
-
   # Logic-enhanced constraint propagation
   def enhance_constraints_with_logic_rules(constraints, logic_context)
     enhanced_constraints = []
@@ -118,7 +140,6 @@ class CrossParadigmCoordinator
       
       enhanced_constraints.concat(consistent_constraints)
     end
-    
     {
       enhanced_constraints: enhanced_constraints,
       constraint_enhancements: enhanced_constraints.length - constraints.length,
@@ -128,7 +149,6 @@ class CrossParadigmCoordinator
       }
     }
   end
-
   # Revolutionary emergent behavior detection
   def detect_emergent_behaviors(execution_history)
     emergent_behaviors = []
@@ -151,10 +171,8 @@ class CrossParadigmCoordinator
       })
       update_coordination_metrics(:emergent_behaviors, emergent_behaviors.length)
     end
-    
     emergent_behaviors
   end
-
   # Variable type evolution through logic satisfaction
   def evolve_variable_types_through_logic(variables, logic_rules)
     evolved_variables = {}
@@ -185,7 +203,6 @@ class CrossParadigmCoordinator
       
       fire_event(:type_refinement, evolution_record)
     end
-    
     update_coordination_metrics(:type_refinements, evolved_variables.length)
     
     {
@@ -194,7 +211,6 @@ class CrossParadigmCoordinator
       type_evolution: type_evolution_log
     }
   end
-
   # Cross-paradigm performance optimization
   def optimize_cross_paradigm_performance(workflow_definition)
     # Identify bottlenecks in cross-paradigm coordination
@@ -213,7 +229,6 @@ class CrossParadigmCoordinator
       performance_improvement_factor: calculate_performance_improvement(bottlenecks, switching_optimizations)
     }
   end
-
   # Revolutionary paradigm synthesis
   def synthesize_new_programming_paradigms(interaction_patterns)
     synthesized_paradigms = []
@@ -229,23 +244,20 @@ class CrossParadigmCoordinator
       new_paradigm = synthesize_paradigm(opportunity)
       synthesized_paradigms << new_paradigm if new_paradigm
     end
-    
     {
       emergent_paradigms: synthesized_paradigms,
       revolutionary_capabilities: synthesized_paradigms.select { |p| p[:innovation_level] == :paradigm_shifting },
       next_generation_patterns: synthesized_paradigms.map { |p| p[:pattern_description] }
     }
   end
-
   # Paradigm state management
   def get_paradigm_state
     @paradigm_state.dup
   end
-
+  
   def get_coordination_metrics
     @coordination_metrics.dup
   end
-
   private
 
   def fire_event(event_type, data = {})
@@ -253,11 +265,10 @@ class CrossParadigmCoordinator
       handler.call(data.merge(event_type: event_type))
     end
   end
-
+  
   def update_coordination_metrics(metric, increment = 1)
     @coordination_metrics[metric] += increment
   end
-
   # Revolutionary workflow parsing
   def parse_workflow_definition(definition)
     # Parse the complex workflow syntax
@@ -292,20 +303,17 @@ class CrossParadigmCoordinator
         current_content << line
       end
     end
-    
     # Parse final section if exists
     if current_section && !current_content.empty?
       workflow[:components][current_section] = parse_section_content(current_section, current_content)
     end
-    
     workflow
   end
-
+  
   def parse_parameters(param_string)
     return [] if param_string.nil? || param_string.strip.empty?
     param_string.split(',').map(&:strip)
   end
-
   def parse_section_content(section_name, content_lines)
     case section_name
     when :logic_rules, :enhancement_rules, :type_refinement_rules
@@ -320,7 +328,6 @@ class CrossParadigmCoordinator
       parse_generic_configuration(content_lines)
     end
   end
-
   def parse_logic_rules(content_lines)
     rules = []
     current_rule = nil
@@ -337,10 +344,8 @@ class CrossParadigmCoordinator
         current_rule = nil
       end
     end
-    
     rules
   end
-
   def parse_goal_definitions(content_lines)
     goals = []
     current_goal = nil
@@ -355,10 +360,8 @@ class CrossParadigmCoordinator
         current_goal = nil
       end
     end
-    
     goals
   end
-
   def parse_constraint_definitions(content_lines)
     constraints = []
     content_lines.each do |line|
@@ -368,7 +371,6 @@ class CrossParadigmCoordinator
     end
     constraints
   end
-
   def parse_strategy_mappings(content_lines)
     mappings = {}
     content_lines.each do |line|
@@ -380,7 +382,6 @@ class CrossParadigmCoordinator
     end
     mappings
   end
-
   def parse_generic_configuration(content_lines)
     config = {}
     content_lines.each do |line|
@@ -393,6 +394,7 @@ class CrossParadigmCoordinator
 
   # Revolutionary execution coordination
   def coordinate_paradigm_execution(parsed_workflow, execution_context)
+    # Recursion is already managed by execute_workflow - no additional depth tracking needed
     execution_history = []
     result = {
       success: false,
@@ -425,10 +427,16 @@ class CrossParadigmCoordinator
         execution_history << { phase: :logic_programming, result: logic_result }
       end
       
-      # Synthesize cross-paradigm results
-      synthesized_result = synthesize_cross_paradigm_results(execution_history)
-      result.merge!(synthesized_result)
-      result[:success] = true
+      # Synthesize cross-paradigm results - prevent recursion
+      if execution_history.empty?
+        # No phases executed - return simple success to prevent recursion
+        result[:success] = true
+        result[:paradigm_coordination] = { simple_execution: true }
+      else
+        synthesized_result = synthesize_cross_paradigm_results(execution_history)
+        result.merge!(synthesized_result)
+        result[:success] = true
+      end
       
     rescue => e
       result[:error] = e.message
@@ -437,7 +445,7 @@ class CrossParadigmCoordinator
     
     result
   end
-
+  
   def initialize_execution_context(context, parsed_workflow)
     {
       input_data: context,
@@ -448,7 +456,6 @@ class CrossParadigmCoordinator
       cross_paradigm_state: {}
     }
   end
-
   def extract_variables_from_workflow(parsed_workflow)
     variables = {}
     
@@ -458,10 +465,8 @@ class CrossParadigmCoordinator
         variables[constraint[:variable]] = { initial_type: constraint[:type] }
       end
     end
-    
     variables
   end
-
   def execute_type_inference_phase(parsed_workflow, execution_context)
     type_result = { type_evolution: [], constraints_processed: 0 }
     
@@ -479,10 +484,8 @@ class CrossParadigmCoordinator
       type_result[:type_evolution] = evolution_result[:type_evolution]
       type_result[:constraints_processed] = constraints.length
     end
-    
     type_result
   end
-
   def execute_goal_oriented_phase(parsed_workflow, execution_context)
     goal_result = { adaptations: 0, goals_executed: [] }
     
@@ -497,10 +500,8 @@ class CrossParadigmCoordinator
         goal_result[:adaptations] += goal_execution[:adaptations] || 0
       end
     end
-    
     goal_result
   end
-
   def execute_logic_programming_phase(parsed_workflow, execution_context)
     logic_result = { rules_applied: 0, inferences_made: [] }
     
@@ -515,10 +516,8 @@ class CrossParadigmCoordinator
         logic_result[:rules_applied] += 1
       end
     end
-    
     logic_result
   end
-
   def execute_cross_paradigm_goal(goal_def, execution_context)
     {
       goal: goal_def[:name],
@@ -528,7 +527,6 @@ class CrossParadigmCoordinator
       cross_paradigm_optimized: true
     }
   end
-
   def apply_cross_paradigm_rule(rule, execution_context)
     {
       rule: rule[:name],
@@ -537,7 +535,7 @@ class CrossParadigmCoordinator
       cross_paradigm_effects: true
     }
   end
-
+  
   def synthesize_cross_paradigm_results(execution_history)
     {
       paradigm_synergies: [
@@ -550,11 +548,11 @@ class CrossParadigmCoordinator
         logic_constraints_satisfied: true,
         goal_constraints_satisfied: true
       },
-      executed_goals: execution_history.select { |h| h[:phase] == :goal_oriented }
-                                      .flat_map { |h| h[:result][:goals_executed] || [] }
+      executed_goals: (execution_history || []).select { |h| h[:phase] == :goal_oriented }
+                                              .flat_map { |h| h.dig(:result, :goals_executed) || [] }
     }
   end
-
+  
   # Revolutionary analysis methods
   def analyze_type_constraints_for_goal(goal, type_context)
     {
@@ -563,11 +561,14 @@ class CrossParadigmCoordinator
       optimization_opportunities: identify_type_optimization_opportunities(goal, type_context)
     }
   end
-
+  
   def select_strategies_by_types(goal, type_analysis)
     strategies = []
     
-    type_analysis[:relevant_types].each do |type|
+    # Add nil guard for type_analysis and relevant_types
+    relevant_types = type_analysis&.dig(:relevant_types) || []
+    
+    relevant_types.each do |type|
       case type
       when /Number/
         strategies.concat(['gradient_descent', 'newton_method', 'binary_search'])
@@ -579,10 +580,8 @@ class CrossParadigmCoordinator
         strategies << 'heuristic_search'
       end
     end
-    
     strategies.uniq
   end
-
   def create_type_optimized_goal(goal, type_analysis, strategies)
     {
       original_goal: goal,
@@ -591,10 +590,12 @@ class CrossParadigmCoordinator
       optimization_level: :cross_paradigm_enhanced
     }
   end
-
   def analyze_logic_implications(constraint, logic_context)
     # Analyze how logic rules affect the constraint
     implications = []
+    
+    # Add nil guard for logic_context
+    return implications if logic_context.nil?
     
     logic_context.each do |rule|
       if rule_affects_constraint?(rule, constraint)
@@ -605,10 +606,8 @@ class CrossParadigmCoordinator
         }
       end
     end
-    
     implications
   end
-
   def propagate_constraint_enhancements(constraint, implications)
     enhanced = [constraint]
     
@@ -616,10 +615,9 @@ class CrossParadigmCoordinator
       enhancement = create_constraint_enhancement(constraint, implication)
       enhanced << enhancement if enhancement
     end
-    
     enhanced
   end
-
+  
   def ensure_cross_paradigm_consistency(constraints)
     # Ensure constraints are consistent across all paradigms
     consistent_constraints = []
@@ -632,12 +630,13 @@ class CrossParadigmCoordinator
         consistent_constraints << fixed_constraint if fixed_constraint
       end
     end
-    
     consistent_constraints
   end
-
   def analyze_cross_paradigm_interactions(execution_history)
     interactions = []
+    
+    # Add nil guard for execution_history
+    return interactions if execution_history.nil? || execution_history.empty?
     
     execution_history.each_cons(2) do |phase1, phase2|
       interaction = {
@@ -648,10 +647,8 @@ class CrossParadigmCoordinator
       }
       interactions << interaction
     end
-    
     interactions
   end
-
   def identify_novel_approaches(interaction_patterns)
     novel_approaches = []
     
@@ -664,12 +661,13 @@ class CrossParadigmCoordinator
         }
       end
     end
-    
     novel_approaches
   end
-
   def detect_self_optimization_patterns(execution_history)
     patterns = []
+    
+    # Add nil guard for execution_history
+    return patterns if execution_history.nil? || execution_history.empty?
     
     # Look for patterns where later phases improve upon earlier ones
     execution_history.each_with_index do |phase, index|
@@ -681,23 +679,25 @@ class CrossParadigmCoordinator
         }
       end
     end
-    
     patterns
   end
-
   # System initialization
   def initialize_type_system
-    TypeConstraint.new(@evaluator)
+    # Initialize with TypeConstraintSystem instead of TypeConstraint
+    TypeConstraintSystem.new
   end
 
   def initialize_goal_system
-    GoalSystem.new(@evaluator)
+    # Handle nil evaluator gracefully
+    evaluator = @evaluator || Object.new # Dummy evaluator for initialization
+    GoalSystem.new(evaluator)
   end
 
   def initialize_logic_system
-    FactsDatabase.new(@evaluator)
+    # Handle nil evaluator gracefully
+    evaluator = @evaluator || Object.new # Dummy evaluator for initialization
+    FactsDatabase.new(evaluator)
   end
-
   # Helper methods for revolutionary features
   def find_type_refinement_rules(var_name, logic_rules)
     logic_rules.select do |rule|
@@ -705,7 +705,6 @@ class CrossParadigmCoordinator
       rule[:actions]&.any? { |action| action.include?(var_name) }
     end
   end
-
   def apply_type_specialization(var_name, initial_type, refinement_rules)
     specialized_type = initial_type
     
@@ -719,20 +718,17 @@ class CrossParadigmCoordinator
     
     specialized_type
   end
-
   def calculate_type_confidence(evolved_type, refinement_rules)
     base_confidence = 0.7
     rule_bonus = refinement_rules.length * 0.1
     [base_confidence + rule_bonus, 1.0].min
   end
-
   def identify_coordination_bottlenecks(workflow_definition)
     [
       { type: :paradigm_switching, severity: :medium },
       { type: :state_synchronization, severity: :low }
     ]
   end
-
   def optimize_paradigm_switching(bottlenecks)
     optimizations = []
     
@@ -744,10 +740,8 @@ class CrossParadigmCoordinator
         optimizations << { optimization: :async_sync, improvement: 1.1 }
       end
     end
-    
     optimizations
   end
-
   def optimize_computational_load_distribution(workflow_definition)
     {
       type_system_load: 0.3,
@@ -756,13 +750,13 @@ class CrossParadigmCoordinator
       distribution_efficiency: 0.85
     }
   end
-
+  
   def calculate_performance_improvement(bottlenecks, optimizations)
     base_improvement = 1.0
     optimizations.each { |opt| base_improvement *= opt[:improvement] || 1.0 }
     base_improvement
   end
-
+  
   def deep_analyze_interaction_patterns(patterns)
     {
       pattern_frequency: patterns.group_by { |p| p[:type] }.transform_values(&:count),
@@ -770,7 +764,7 @@ class CrossParadigmCoordinator
       innovation_potential: assess_innovation_potential(patterns)
     }
   end
-
+  
   def identify_paradigm_synthesis_opportunities(analysis)
     opportunities = []
     
@@ -781,10 +775,8 @@ class CrossParadigmCoordinator
         feasibility: 0.8
       }
     end
-    
     opportunities
   end
-
   def synthesize_paradigm(opportunity)
     if opportunity[:feasibility] > 0.7
       {
@@ -795,76 +787,72 @@ class CrossParadigmCoordinator
       }
     end
   end
-
   # Utility methods
   def extract_relevant_types(goal, type_context)
     # Extract types relevant to the goal
     ['Number', 'Object', 'Array'].sample(rand(1..3))
   end
-
+  
   def calculate_constraint_complexity(goal)
     rand(1..5)
   end
-
+  
   def identify_type_optimization_opportunities(goal, type_context)
     ['strategy_selection', 'constraint_narrowing'].sample(rand(1..2))
   end
-
   def rule_affects_constraint?(rule, constraint)
     # Simple heuristic: rule affects constraint if they share variable names
     rule[:conditions]&.any? { |cond| cond.include?(constraint.to_s) } || false
   end
-
+  
   def determine_constraint_effect(rule, constraint)
     'enhancement'
   end
-
+  
   def create_constraint_enhancement(constraint, implication)
     "enhanced_#{constraint}"
   end
-
+  
   def cross_paradigm_consistent?(constraint)
     true # Simplified for implementation
   end
-
+  
   def fix_cross_paradigm_consistency(constraint)
     constraint
   end
-
   def analyze_data_flow(phase1, phase2)
     {
       data_transferred: true,
       optimization_applied: true
     }
   end
-
+  
   def detect_interaction_optimization(phase1, phase2)
     true
   end
-
+  
   def novel_pattern?(pattern)
     pattern[:optimization_opportunity] == true
   end
-
+  
   def self_optimizing_detected?(phases)
     phases.length > 1
   end
-
+  
   def calculate_improvement_factor(phases)
     1.0 + (phases.length * 0.1)
   end
-
+  
   def analyze_pattern_complexity(patterns)
     {
       simple: patterns.count { |p| p[:data_flow] },
       complex: patterns.count { |p| p[:optimization_opportunity] }
     }
   end
-
+  
   def assess_innovation_potential(patterns)
     patterns.count { |p| p[:optimization_opportunity] } / [patterns.length, 1].max.to_f
   end
-
   def update_optimization_patterns(result)
     pattern_key = result[:paradigm_coordination]&.keys&.first || :default
     @optimization_patterns[pattern_key] ||= []

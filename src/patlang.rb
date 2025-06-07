@@ -81,13 +81,14 @@ class Patlang
   end
 
   def self.evaluate_with_reasoning(code)
-    # Initialize reasoning coordinator
-    coordinator = ReasoningCoordinator.new
+    # Initialize reasoning coordinator with evaluator instance
+    evaluator = Evaluator.new
+    coordinator = ReasoningCoordinator.new(evaluator)
     
-    # Register reasoning components
-    coordinator.register_component(:form_validator, FormValidator.new)
-    coordinator.register_component(:goal_system, GoalSystem.new)
-    coordinator.register_component(:facts_database, FactsDatabase.new)
+    # Register reasoning components with evaluator
+    coordinator.register_component(:form_validator, FormValidator.new(evaluator))
+    coordinator.register_component(:goal_system, GoalSystem.new(evaluator))
+    coordinator.register_component(:facts_database, FactsDatabase.new(evaluator))
     
     begin
       # Process through reasoning coordinator

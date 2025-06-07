@@ -562,7 +562,7 @@ class TestLexer < Minitest::Test
 
   def test_error_handling_comprehensive
     # Test various invalid character combinations (excluding # for comments and % for modulo operator)
-    invalid_inputs = ['@', '$', '^', '&', '~', '`']
+    invalid_inputs = ['@', '$', '&', '~', '`']
     
     invalid_inputs.each do |invalid_char|
       lexer = Lexer.new(invalid_char)

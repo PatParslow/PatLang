@@ -12,10 +12,12 @@ class Lexer
   end
 
   def error
-    raise "Invalid character '#{@current_char}' at position #{@position}"
+    raise RuntimeError, "Invalid character '#{@current_char}' at position #{@position}"
   end
 
   def advance
+    return unless @current_char  # Guard against nil current_char
+    
     if @current_char == "\n"
       @line += 1
       @column = 1
@@ -99,6 +101,10 @@ class Lexer
         start_line, start_column = @line, @column
         advance
         return Token.new(:PERCENT, '%', @position - 1, start_line, start_column)
+      when '^'
+        start_line, start_column = @line, @column
+        advance
+        return Token.new(:CARET, '^', @position - 1, start_line, start_column)
       when '('
         start_line, start_column = @line, @column
         advance
@@ -148,7 +154,9 @@ class Lexer
           return Token.new(:GREATER, '>', @position - 1, start_line, start_column)
         end
       when '"'
-        return tokenize_string
+        return tokenize_string('"')
+      when "'"
+        return tokenize_string("'")
       when '.'
         # Check if this starts a decimal number
         if peek_char&.match(/\d/)
@@ -189,16 +197,46 @@ class Lexer
           advance
           return Token.new(Token::TOKEN_TYPES[:COLON], ':', @position - 1, start_line, start_column)
         end
+      when '\\'
+        # Handle backslash as a special character - could be escape sequence or standalone
+        start_line, start_column = @line, @column
+        advance
+        if @current_char && @current_char.match(/[ntr"'\\]/)
+          # This looks like the start of an escape sequence in a string context
+          # but we're not in a string, so treat as error
+          error
+        else
+          # Standalone backslash - return as unknown token for now
+          return Token.new(:UNKNOWN, '\\', @position - 1, start_line, start_column)
+        end
       else
         if alpha?(@current_char)
           return read_identifier
         else
-          error
+          # Enhanced error handling for special characters
+          case @current_char
+          when '@', '$', '&', '~', '`'
+            # These characters should raise RuntimeError
+            error
+          when '#'
+            # Skip unsupported special characters gracefully (# is handled elsewhere as comment)
+            start_line, start_column = @line, @column
+            char = @current_char
+            advance
+            return Token.new(:UNKNOWN, char, @position - 1, start_line, start_column)
+          else
+            error
+          end
         end
       end
     end
 
     Token.new(Token::TOKEN_TYPES[:EOF], nil, @position, @line, @column)
+  end
+
+  # Alias for get_next_token to provide the expected interface
+  def next_token
+    get_next_token
   end
 
   def tokenize
@@ -347,13 +385,13 @@ class Lexer
     Token.new(token_type, result, start_position, start_line, start_column)
   end
 
-  def tokenize_string
+  def tokenize_string(quote_type = '"')
     start_position = @position
     start_line, start_column = @line, @column
     advance  # Skip opening quote
     value = ""
     
-    while @current_char && @current_char != '"'
+    while @current_char && @current_char != quote_type
       if @current_char == '\\'
         # Handle escape sequences
         advance
@@ -369,6 +407,8 @@ class Lexer
             value += "\\"
           when '"'
             value += '"'
+          when "'"
+            value += "'"
           else
             value += @current_char
           end
@@ -382,8 +422,8 @@ class Lexer
       end
     end
     
-    if @current_char != '"'
-      raise "Unterminated string literal starting at position #{start_position}"
+    if @current_char != quote_type
+      raise RuntimeError, "Unterminated string literal starting at position #{start_position}"
     end
     
     advance  # Skip closing quote

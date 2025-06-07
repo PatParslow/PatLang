@@ -37,6 +37,9 @@ module EvaluatorModules
         left_value.to_f / right_value
       when '%', 'modulo'
         left_value % right_value
+      when '^', 'power', 'exponent'
+        # FIXED: Add exponentiation support
+        left_value ** right_value
       when '==', 'equal'
         left_value == right_value
       when '!=', 'not_equal'

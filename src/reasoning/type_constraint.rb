@@ -50,7 +50,7 @@ class TypeConstraintSystem
     constraints = get_constraints(variable)
     return true if constraints.empty?
     
-    constraints.all? do |constraint|
+    constraints.compact.all? do |constraint|
       result = constraint.satisfies?(value)
       fire_event(:constraint_validated, {
         variable: variable,
@@ -65,7 +65,7 @@ class TypeConstraintSystem
   # Set a variable's value and trigger propagation
   def set_variable_value(variable, value)
     unless variable_satisfies?(variable, value)
-      violated_constraints = get_constraints(variable).reject { |c| c.satisfies?(value) }
+      violated_constraints = get_constraints(variable).compact.reject { |c| c.satisfies?(value) }
       raise ConstraintViolationError.new(
         "Value #{value} violates constraints for #{variable}",
         variable: variable,
@@ -159,7 +159,7 @@ class TypeConstraintSystem
         # Check if new value satisfies target constraints
         unless variable_satisfies?(target_var, new_value)
           raise ConstraintViolationError.new(
-            "Propagation conflict: #{new_value} violates constraints for #{target_var}",
+            "propagation conflict: #{new_value} violates constraints for #{target_var}",
             variable: target_var,
             value: new_value,
             source_variable: variable,
@@ -244,7 +244,7 @@ class TypeConstraint
 
   # Check if this constraint has additional conditions
   def has_condition?
-    !@conditions.empty?
+    @conditions&.any? || false
   end
 
   # Check if this constraint respects object metadata
@@ -441,4 +441,43 @@ class ConstraintViolationError < StandardError
     @source_variable = source_variable
     @source_value = source_value
   end
+end
+
+# Null object pattern for missing constraints to prevent NoMethodError
+class NullTypeConstraint
+attr_reader :variable
+
+def initialize(variable)
+  @variable = variable
+end
+
+def satisfies?(value)
+  # A null constraint accepts nothing - this ensures tests fail properly
+  # rather than crashing with NoMethodError
+  false
+end
+
+def validate!(value)
+  false
+end
+
+def has_condition?
+  false
+end
+
+def constraint_type
+  :null
+end
+
+def constraint_data
+  nil
+end
+
+def to_s
+  "#{@variable} :: <missing constraint>"
+end
+
+def inspect
+  "#<NullTypeConstraint:#{@variable}>"
+end
 end
