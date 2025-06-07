@@ -547,14 +547,22 @@ class Evaluator
     end
     @reasoning_mode
   end
-end
 
-  def visit_function_call(node)
-    func_name = node.name
-    func = @functions[func_name]
-    if func.nil?
-      raise "Undefined function: #{func_name}"
+  # Priority 1 Fix: Add missing evaluate_string method
+  # This method is expected by many tests but was missing from the API
+  def evaluate_string(code)
+    require_relative 'lexer'
+    require_relative 'parser'
+    
+    begin
+      lexer = Lexer.new(code)
+      tokens = lexer.tokenize
+      parser = Parser.new(tokens)
+      ast = parser.parse
+      evaluate(ast)
+    rescue => e
+      # Re-raise with better context for debugging
+      raise e.class, "Error evaluating string: #{code.inspect}\nOriginal: #{e.message}", e.backtrace
     end
-    # Execute function (simplified)
-    visit(func.body) if func.respond_to?(:body)
   end
+end
