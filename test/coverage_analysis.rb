@@ -17,7 +17,7 @@ SimpleCov.start do
 end
 
 # Require all test files to get comprehensive coverage
-require_relative 'test_helper'
+require_relative '../helpers/test_helper'
 require_relative 'test_evaluator'
 require_relative 'test_string_operations'
 require_relative 'test_extended_string_methods'

@@ -1,265 +1,247 @@
-# frozen_string_literal: true
+require_relative '../object_model/patlang_object'
 
-# Core unification engine for type inference and reasoning
-# This is a minimal stub implementation for Phase 1 TDD
-class UnificationEngine
-  def initialize(evaluator = nil)
-    @evaluator = evaluator
-    @event_handlers = {}
-    @unification_count = 0
-  end
-
-  # Register event handlers for unification events
-  def on_event(event_type, &block)
-    @event_handlers[event_type] ||= []
-    @event_handlers[event_type] << block
-  end
-
-  # Main unification method - attempts to unify two terms with a substitution
-  # Returns true if unification succeeds, false otherwise
-  # Modifies the substitution hash in place with new bindings
-  def unify(term1, term2, substitution, **options)
-    @unification_count += 1
-    event_id = generate_event_id
+# Robinson's Unification Algorithm Implementation
+# This is the core unification engine for Patlang's type inference system
+class UnificationEngine < PatlangObject
+  def initialize
+    super("unification_engine", :unification_engine)
     
-    validate_inputs!(term1, term2, substitution)
+    # Initialize the event system
+    initialize_event_system
+    
+    # Set up metadata for the PatlangObject
+    set_metadata(:type, :unification_engine)
+    set_metadata(:created_at, Time.now)
+  end
+  
+  # Main unification method implementing Robinson's algorithm
+  def unify(term1, term2, substitution)
+    validate_inputs(term1, term2, substitution)
     
     fire_event(:unification_started, {
-      event_id: event_id,
+      event_type: :unification_started,
       term1: term1,
       term2: term2,
-      substitution: substitution.dup
+      timestamp: Time.now
     })
-
+    
     begin
-      result = perform_unification(term1, term2, substitution, **options)
+      result = unify_internal(term1, term2, substitution)
       
       if result
         fire_event(:unification_completed, {
-          event_id: event_id,
-          success: true,
+          event_type: :unification_completed,
           term1: term1,
           term2: term2,
-          substitution: substitution.dup
+          success: true,
+          substitution: substitution.dup,
+          timestamp: Time.now
         })
       else
         fire_event(:unification_failed, {
-          event_id: event_id,
+          event_type: :unification_failed,
           term1: term1,
           term2: term2,
-          reason: "Terms do not unify"
+          reason: "Terms do not unify",
+          timestamp: Time.now
         })
       end
       
       result
-    rescue => e
+    rescue => error
       fire_event(:unification_failed, {
-        event_id: event_id,
+        event_type: :unification_failed,
         term1: term1,
         term2: term2,
-        error: e.message
+        reason: error.message,
+        timestamp: Time.now
       })
       raise
     end
   end
-
-  # Get statistics about unification operations
-  def statistics
-    {
-      total_unifications: @unification_count,
-      event_handlers: @event_handlers.keys
-    }
-  end
-
+  
   private
-
-  def validate_inputs!(term1, term2, substitution)
-    if term1.nil? || term2.nil?
-      raise UnificationError, "Cannot unify with nil terms"
+  
+  def unify_internal(term1, term2, substitution)
+    # Dereference variables if they're already bound
+    term1 = deref(term1, substitution)
+    term2 = deref(term2, substitution)
+    
+    # Case 1: Both terms are identical (atoms, numbers, strings, etc.)
+    return true if term1 == term2
+    
+    # Case 2: term1 is a variable
+    if variable?(term1)
+      return unify_variable(term1, term2, substitution)
     end
     
-    unless substitution.is_a?(Hash)
-      raise UnificationError, "substitution must be a Hash, got #{substitution.class}"
+    # Case 3: term2 is a variable
+    if variable?(term2)
+      return unify_variable(term2, term1, substitution)
     end
     
-    unless valid_term?(term1) && valid_term?(term2)
-      raise UnificationError, "Invalid term: malformed term structure"
+    # Case 4: Both are compound terms
+    if compound?(term1) && compound?(term2)
+      return unify_compound(term1, term2, substitution)
+    end
+    
+    # Case 5: Terms are different types and cannot unify
+    false
+  end
+  
+  def unify_variable(var, term, substitution)
+    # Check if variable is already bound
+    if substitution.key?(var.name)
+      return unify_internal(substitution[var.name], term, substitution)
+    end
+    
+    # Check if term is a variable that's already bound
+    if variable?(term) && substitution.key?(term.name)
+      return unify_internal(var, substitution[term.name], substitution)
+    end
+    
+    # Occurs check: prevent infinite structures like X = f(X)
+    if occurs_check(var, term, substitution)
+      return false
+    end
+    
+    # Bind the variable
+    substitution[var.name] = term
+    true
+  end
+  
+  def unify_compound(term1, term2, substitution)
+    # Check functor and arity match
+    return false unless term1.functor == term2.functor
+    return false unless term1.arity == term2.arity
+    
+    # Unify all arguments
+    term1.args.zip(term2.args).all? do |arg1, arg2|
+      unify_internal(arg1, arg2, substitution)
     end
   end
-
-  def valid_term?(term)
-    case term
-    when Symbol, String, Numeric, TrueClass, FalseClass
-      true
-    when TypeVariable
-      true
-    when Term
-      term.valid?
+  
+  def occurs_check(var, term, substitution)
+    return false unless compound?(term)
+    
+    # Check if variable occurs in the term structure
+    occurs_in_term?(var, term, substitution)
+  end
+  
+  def occurs_in_term?(var, term, substitution)
+    # Dereference the term first
+    term = deref(term, substitution)
+    
+    # If it's the same variable, we have an occurs check violation
+    return true if variable?(term) && term.name == var.name
+    
+    # If it's a compound term, check recursively
+    if compound?(term)
+      term.args.any? { |arg| occurs_in_term?(var, arg, substitution) }
     else
       false
     end
   end
-
-  def perform_unification(term1, term2, substitution, **options)
-    # Apply existing substitutions
-    term1 = apply_substitution(term1, substitution)
-    term2 = apply_substitution(term2, substitution)
-    
-    # Core unification algorithm
-    # Handle identical terms first
-    return true if term1 == term2
-    
-    # Handle variable unification
-    if term1.is_a?(TypeVariable)
-      return unify_variable_with_term(term1, term2, substitution)
-    elsif term2.is_a?(TypeVariable)
-      return unify_variable_with_term(term2, term1, substitution)
-    end
-    
-    # Handle compound terms
-    if term1.is_a?(Term) && term2.is_a?(Term)
-      return unify_compound_terms(term1, term2, substitution)
-    end
-    
-    # Different types that aren't variables can't unify
-    false
-  end
-
-  def apply_substitution(term, substitution)
-    case term
-    when TypeVariable
-      substitution[term.name] || term
-    when Term
-      Term.new(term.functor, term.args.map { |arg| apply_substitution(arg, substitution) })
+  
+  def deref(term, substitution)
+    if variable?(term) && substitution.key?(term.name)
+      # Follow the chain of substitutions
+      deref(substitution[term.name], substitution)
     else
       term
     end
   end
-
-  def unify_variable_with_term(variable, term, substitution)
-    return false unless variable.is_a?(TypeVariable)
+  
+  def variable?(term)
+    term.is_a?(TypeVariable)
+  end
+  
+  def compound?(term)
+    term.is_a?(Term)
+  end
+  
+  def validate_inputs(term1, term2, substitution)
+    raise ArgumentError, "First term cannot be nil" if term1.nil?
+    raise ArgumentError, "Second term cannot be nil" if term2.nil?
+    raise ArgumentError, "Substitution must be a Hash" unless substitution.is_a?(Hash)
     
-    # Check if variable is already bound
-    if substitution.key?(variable.name)
-      return unify(substitution[variable.name], term, substitution)
+    # Validate term types
+    unless valid_term?(term1)
+      raise ArgumentError, "Invalid term type: #{term1.class}. Must be atom, variable, or compound term."
     end
     
-    # Occurs check - prevent infinite terms like X = f(X)
-    if occurs_check(variable, term, substitution)
-      return false
-    end
-    
-    # Create binding
-    substitution[variable.name] = term
-    true
-  end
-
-  def unify_compound_terms(term1, term2, substitution)
-    return false if term1.functor != term2.functor
-    return false if term1.arity != term2.arity
-    
-    # Unify all arguments
-    term1.args.zip(term2.args).all? do |arg1, arg2|
-      unify(arg1, arg2, substitution)
+    unless valid_term?(term2)
+      raise ArgumentError, "Invalid term type: #{term2.class}. Must be atom, variable, or compound term."
     end
   end
-
-  def occurs_check(variable, term, substitution)
-    case term
-    when TypeVariable
-      if term.name == variable.name
-        true
-      elsif substitution.key?(term.name)
-        occurs_check(variable, substitution[term.name], substitution)
-      else
-        false
-      end
-    when Term
-      term.args.any? { |arg| occurs_check(variable, arg, substitution) }
-    else
-      false
-    end
+  
+  def valid_term?(term)
+    # Valid terms: atoms (symbols), variables, compound terms, numbers, strings
+    term.is_a?(Symbol) || 
+    term.is_a?(TypeVariable) || 
+    term.is_a?(Term) ||
+    term.is_a?(Numeric) ||
+    term.is_a?(String)
   end
-
-  def fire_event(event_type, data)
-    handlers = @event_handlers[event_type]
-    return unless handlers
-    
-    handlers.each do |handler|
-      begin
-        handler.call(data.merge(event_type: event_type, timestamp: Time.now))
-      rescue => e
-        # Log error but don't let it break unification
-        warn "Event handler error for #{event_type}: #{e.message}"
-      end
-    end
-  end
-
-  def generate_event_id
-    "unif_#{@unification_count}_#{Time.now.to_f}_#{rand(1000)}"
-  end
+  
 end
 
-# Type variable for unification
+# Support classes for unification
+
 class TypeVariable
   attr_reader :name
-
+  
   def initialize(name)
-    @name = name.to_sym
+    @name = name
   end
-
+  
   def ==(other)
-    other.is_a?(TypeVariable) && @name == other.name
+    other.is_a?(TypeVariable) && other.name == @name
   end
-
+  
   def hash
     @name.hash
   end
-
+  
   def eql?(other)
     self == other
   end
-
+  
   def to_s
-    "?#{@name}"
+    @name.to_s
   end
-
+  
   def inspect
-    "#<TypeVariable:#{@name}>"
+    "TypeVariable(#{@name})"
   end
 end
 
-# Compound term for unification
 class Term
   attr_reader :functor, :args
-
+  
   def initialize(functor, args = [])
-    @functor = functor.to_sym
-    @args = Array(args)
+    @functor = functor
+    @args = args
   end
-
+  
   def arity
     @args.length
   end
-
+  
   def ==(other)
     other.is_a?(Term) && 
-      @functor == other.functor && 
-      @args == other.args
+    other.functor == @functor && 
+    other.args == @args
   end
-
+  
   def hash
     [@functor, @args].hash
   end
-
+  
   def eql?(other)
     self == other
   end
-
-  def valid?
-    @functor.is_a?(Symbol) && @args.is_a?(Array)
-  end
-
+  
   def to_s
     if @args.empty?
       @functor.to_s
@@ -267,19 +249,8 @@ class Term
       "#{@functor}(#{@args.map(&:to_s).join(', ')})"
     end
   end
-
+  
   def inspect
-    "#<Term:#{to_s}>"
-  end
-end
-
-# Custom error for unification failures
-class UnificationError < StandardError
-  attr_reader :term1, :term2
-
-  def initialize(message, term1: nil, term2: nil)
-    super(message)
-    @term1 = term1
-    @term2 = term2
+    "Term(#{@functor}, #{@args.inspect})"
   end
 end
