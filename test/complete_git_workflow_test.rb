@@ -151,9 +151,9 @@ class CompleteGitWorkflowTest
     puts "📡 Testing pre-push hook validation..."
     
     start_time = Time.now
-    # Simulate pre-push hook execution directly since no remote is configured
-    puts "🧪 Simulating pre-push hook validation..."
-    push_success = system("#{File.join('.git', 'hooks', 'pre-push')} origin dummy_url")
+    # Test pre-push hook with actual remote configuration
+    puts "🧪 Testing pre-push hook with csgitlab remote..."
+    push_success = system("#{File.join('.git', 'hooks', 'pre-push')} csgitlab https://csgitlab.reading.ac.uk/patparslow/patlang.git")
     push_duration = Time.now - start_time
     
     @monitor.record_git_operation("push_dry_run", {
