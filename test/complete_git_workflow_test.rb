@@ -153,7 +153,8 @@ class CompleteGitWorkflowTest
     start_time = Time.now
     # Test pre-push hook with actual remote configuration
     puts "🧪 Testing pre-push hook with csgitlab remote..."
-    push_success = system("#{File.join('.git', 'hooks', 'pre-push')} csgitlab https://csgitlab.reading.ac.uk/patparslow/patlang.git")
+    system("#{File.join('.git', 'hooks', 'pre-push')} csgitlab https://csgitlab.reading.ac.uk/patparslow/patlang.git")
+    push_success = $?.exitstatus == 0
     push_duration = Time.now - start_time
     
     @monitor.record_git_operation("push_dry_run", {
