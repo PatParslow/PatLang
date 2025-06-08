@@ -153,7 +153,8 @@ class CompleteGitWorkflowTest
     start_time = Time.now
     # Test pre-push hook with actual remote configuration
     puts "🧪 Testing pre-push hook with csgitlab remote..."
-    hook_output = `#{File.join('.git', 'hooks', 'pre-push')} csgitlab https://csgitlab.reading.ac.uk/patparslow/patlang.git 2>&1`
+    hook_path = File.join(@base_path, '.git', 'hooks', 'pre-push')
+    hook_output = `ruby "#{hook_path}" csgitlab https://csgitlab.reading.ac.uk/patparslow/patlang.git 2>&1`
     push_success = $?.exitstatus == 0
     push_duration = Time.now - start_time
     
