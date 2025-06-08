@@ -235,7 +235,7 @@ module ParserModules
           # Handle different node types that could be function names
           function_name = case left
                          when VariableNode
-                           left.name
+                           left.value
                          when StringNode
                            left.value
                          else
@@ -495,7 +495,7 @@ module ParserModules
         return VariableNode.new(token.value)
       elsif token.type == :DOUBLE_COLON
         # Handle DOUBLE_COLON in expression context - this creates a type annotation node
-        # This allows expressions like "user.name :: String" to be parsed
+        # This allows expressions like "user.value :: String" to be parsed
         @parser.advance
         return VariableNode.new("::")
       elsif token.type == :WHERE

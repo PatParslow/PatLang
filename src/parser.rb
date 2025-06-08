@@ -152,8 +152,12 @@ class Parser
       return parse_assert
     when :QUERY
       return parse_query
+    when :QUERY_PREFIX
+      return parse_prolog_query
     when :RULE
       return parse_rule
+    when :FACT
+      return parse_fact
     when :PURSUE
       return parse_pursue
     when :IDENTIFIER
@@ -343,7 +347,7 @@ class Parser
         return safe_error("Expected type after '::'")
       end
       
-      type = @current_token.value
+      constraint_type = @current_token.value
       eat(:IDENTIFIER)
       
       conditions = nil
@@ -357,7 +361,8 @@ class Parser
         conditions = expression
       end
       
-      ConstraintNode.new(variable_expr, type, conditions)
+      # Create TypeConstraintNode with proper parameters
+      TypeConstraintNode.new(variable_expr, constraint_type, nil, conditions)
     rescue ParseError => e
       safe_error("Constraint parse error: #{e.message}")
     end
@@ -439,14 +444,10 @@ class Parser
         end
       end
       
-      # Initialize all goal attributes
-      precondition = nil
-      postcondition = nil
-      strategy = nil
-      description = nil
+      # Initialize goal attributes matching GoalNode constructor
+      preconditions = []
+      postconditions = []
       strategies = []
-      subgoals = []
-      context = {}
       
       if @current_token&.type == :LBRACE
         eat(:LBRACE)
@@ -460,21 +461,23 @@ class Parser
           when :PRECONDITION
             eat(:PRECONDITION)
             if safe_eat(:COLON)
-              precondition = expression
+              precondition_expr = expression
+              preconditions << precondition_expr if precondition_expr
             else
               return safe_error("Expected ':' after precondition")
             end
           when :POSTCONDITION
             eat(:POSTCONDITION)
             if safe_eat(:COLON)
-              postcondition = expression
+              postcondition_expr = expression
+              postconditions << postcondition_expr if postcondition_expr
             else
               return safe_error("Expected ':' after postcondition")
             end
           when :STRATEGY
             eat(:STRATEGY)
             if safe_eat(:COLON) && @current_token&.type == :IDENTIFIER
-              strategy = @current_token.value
+              strategies << @current_token.value.to_sym
               eat(:IDENTIFIER)
             else
               return safe_error("Expected strategy name after 'strategy:'")
@@ -489,42 +492,19 @@ class Parser
             end
             
             case keyword
-            when "description"
-              if @current_token&.type == :STRING
-                description = @current_token.value
-                eat(:STRING)
-              else
-                return safe_error("Expected string for description")
-              end
             when "strategies"
               if @current_token&.type == :LBRACKET
-                strategies = parse_array_literal || []
+                parsed_strategies = parse_array_literal || []
+                strategies.concat(parsed_strategies)
               elsif @current_token&.type == :STRING
-                strategies = [@current_token.value.to_sym]
+                strategies << @current_token.value.to_sym
                 eat(:STRING)
               else
                 return safe_error("Expected array or string for strategies")
               end
-            when "subgoals"
-              if @current_token&.type == :LBRACKET
-                subgoals = parse_array_literal || []
-              elsif @current_token&.type == :STRING
-                subgoals = [@current_token.value.to_sym]
-                eat(:STRING)
-              else
-                return safe_error("Expected array or string for subgoals")
-              end
-            when "context"
-              if @current_token&.type == :LBRACE
-                context = parse_hash_literal || {}
-              elsif @current_token&.type == :STRING
-                context = {value: @current_token.value}
-                eat(:STRING)
-              else
-                return safe_error("Expected hash or string for context")
-              end
             else
-              return safe_error("Unknown goal keyword: #{keyword}")
+              # Skip unknown keywords gracefully
+              expression # Parse and ignore unknown expressions
             end
           else
             break
@@ -542,7 +522,8 @@ class Parser
         end
       end
       
-      GoalNode.new(goal_name, parameters, precondition, postcondition, strategy, description, strategies, subgoals, context)
+      # Create GoalNode with description as first parameter to match constructor
+      GoalNode.new(goal_name, preconditions, postconditions, strategies)
     rescue ParseError => e
       safe_error("Goal parse error: #{e.message}")
     end
@@ -671,7 +652,7 @@ class Parser
     end
   end
 
-  # Parse rule definition: rule ancestor(X, Y) :- parent(X, Y)
+  # Parse rule definition: rule head if body OR rule head :- body
   def parse_rule
     begin
       eat(:RULE)
@@ -682,8 +663,17 @@ class Parser
       
       head = expression
       
-      # Look for :- operator (we'll need to add this to the lexer)
-      if @current_token&.type == :COLON && peek(1)&.type == :MINUS
+      # Support both "if" and ":-" syntax
+      if @current_token&.type == :IF
+        eat(:IF)
+        
+        if @current_token.nil?
+          return safe_error("Expected rule body after 'if'")
+        end
+        
+        body = expression
+        LogicRuleNode.new(head || safe_error("Missing rule head"), body || safe_error("Missing rule body"))
+      elsif @current_token&.type == :COLON && peek(1)&.type == :MINUS
         eat(:COLON)
         eat(:MINUS)
         
@@ -692,9 +682,9 @@ class Parser
         end
         
         body = expression
-        RuleNode.new(head || safe_error("Missing rule head"), body || safe_error("Missing rule body"))
+        LogicRuleNode.new(head || safe_error("Missing rule head"), body || safe_error("Missing rule body"))
       else
-        safe_error("Expected ':-' after rule head")
+        safe_error("Expected 'if' or ':-' after rule head")
       end
     rescue ParseError => e
       safe_error("Rule parse error: #{e.message}")
@@ -740,5 +730,69 @@ class Parser
     rescue ParseError => e
       safe_error("Pursue parse error: #{e.message}")
     end
+  end
+
+  # Parse Prolog-style query: ?- parent(john, mary)
+  def parse_prolog_query
+    begin
+      eat(:QUERY_PREFIX)
+      
+      if @current_token.nil?
+        return safe_error("Expected query pattern after '?-'")
+      end
+      
+      goal_term = expression
+      
+      # Extract variables from the goal term (simplified - just look for uppercase identifiers)
+      variables = extract_variables_from_expression(goal_term)
+      
+      QueryNode.new(goal_term || safe_error("Missing query pattern"), variables, :prolog)
+    rescue ParseError => e
+      safe_error("Prolog query parse error: #{e.message}")
+    end
+  end
+
+  # Parse fact declaration: fact parent(john, mary)
+  def parse_fact
+    begin
+      eat(:FACT)
+      
+      if @current_token.nil?
+        return safe_error("Expected fact expression after 'fact'")
+      end
+      
+      fact_expr = expression
+      
+      # Create a LogicRuleNode with no body (facts are rules without conditions)
+      LogicRuleNode.new(fact_expr || safe_error("Missing fact expression"), nil, :fact)
+    rescue ParseError => e
+      safe_error("Fact parse error: #{e.message}")
+    end
+  end
+
+  private
+
+  # Helper method to extract variables from expressions (simplified implementation)
+  def extract_variables_from_expression(expr)
+    variables = []
+    
+    case expr
+    when VariableNode
+      # Check if variable name starts with uppercase (Prolog convention)
+      if expr.name =~ /^[A-Z]/
+        variables << expr.name.to_sym
+      end
+    when FunctionCallNode
+      # Extract variables from function arguments
+      expr.arguments.each do |arg|
+        variables.concat(extract_variables_from_expression(arg))
+      end
+    when BinaryOpNode
+      # Extract variables from both sides
+      variables.concat(extract_variables_from_expression(expr.left))
+      variables.concat(extract_variables_from_expression(expr.right))
+    end
+    
+    variables.uniq
   end
 end

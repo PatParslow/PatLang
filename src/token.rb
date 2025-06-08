@@ -79,6 +79,11 @@ class Token
     POSTCONDITION: :POSTCONDITION,
     STRATEGY: :STRATEGY,
     DOUBLE_COLON: :DOUBLE_COLON,
+    AT: :AT,
+    # Additional reasoning tokens
+    IF_RULE: :IF_RULE,        # For logic rules: "if"
+    QUERY_PREFIX: :QUERY_PREFIX,  # For queries: "?-"
+    QUESTION: :QUESTION,      # For standalone question mark: "?"
     EOF: :EOF
   }.freeze
 

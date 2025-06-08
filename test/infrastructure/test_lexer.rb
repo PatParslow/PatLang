@@ -31,7 +31,8 @@ class TestLexer < Minitest::Test
       ['{', :LBRACE],
       ['}', :RBRACE],
       [':', :COLON],
-      [',', :COMMA]
+      [',', :COMMA],
+      ['@', :AT]
     ]
 
     test_cases.each do |input, expected_type|
@@ -561,8 +562,8 @@ class TestLexer < Minitest::Test
   end
 
   def test_error_handling_comprehensive
-    # Test various invalid character combinations (excluding # for comments and % for modulo operator)
-    invalid_inputs = ['@', '$', '&', '~', '`']
+    # Test various invalid character combinations (excluding # for comments, % for modulo operator, and @ for AT token)
+    invalid_inputs = ['$', '&', '~', '`']
     
     invalid_inputs.each do |invalid_char|
       lexer = Lexer.new(invalid_char)
@@ -575,6 +576,11 @@ class TestLexer < Minitest::Test
     lexer = Lexer.new('%')
     tokens = lexer.tokenize
     assert_equal :PERCENT, tokens[0].type
+    
+    # Test that @ is now valid (AT token)
+    lexer = Lexer.new('@')
+    tokens = lexer.tokenize
+    assert_equal :AT, tokens[0].type
   end
 
   def test_position_tracking_for_new_tokens

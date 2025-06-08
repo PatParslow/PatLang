@@ -69,19 +69,19 @@ puts "\n📋 TEST 4: Event System Implementation"
 begin
   require_relative '../src/object_model/event_system'
   if defined?(EventSystem)
-    puts "✅ EventSystem class exists"
+    puts "✅ EventSystem module exists"
     
-    # Test if common events can be fired
-    event_system = EventSystem.new
+    # Test if common events can be fired using the module's class methods
     test_events = [:type_refinement, :emergent_behavior_detected, :logic_goal_synthesis]
     
     test_events.each do |event|
       begin
-        # Assume fire_event method exists
-        if event_system.respond_to?(:fire_event)
+        # Test using EventSystem's global fire_event method
+        if EventSystem.respond_to?(:fire_global_event)
+          EventSystem.fire_global_event(event, { test: true })
           puts "   ✅ Event system can fire #{event}"
         else
-          puts "   ❌ Event system missing fire_event method"
+          puts "   ❌ Event system missing fire_global_event method"
           break
         end
       rescue => e

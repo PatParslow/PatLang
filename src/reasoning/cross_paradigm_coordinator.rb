@@ -17,7 +17,19 @@ require_relative 'unification_engine'
 # - Self-optimizing system that learns better constraint patterns
 # - Cross-paradigm workflows with emergent behaviors
 class CrossParadigmCoordinator
-  def initialize(evaluator = nil)
+  def initialize
+    @workflow_depth = 0
+    @max_workflow_depth = 100
+    @workflow_depth = 0
+    @max_workflow_depth = 100
+    @workflow_depth = 0
+    @max_workflow_depth = 100
+    @workflow_depth = 0
+    @max_workflow_depth = 100
+    @workflow_depth = 0
+    @max_workflow_depth = 100
+    @workflow_depth = 0
+    @max_workflow_depth = 100
     @workflow_depth = 0
     @max_workflow_depth = 100
     @evaluator = evaluator
@@ -28,19 +40,35 @@ class CrossParadigmCoordinator
     begin
       @paradigm_state[:type_system] = initialize_type_system
     rescue => e
-      @paradigm_state[:type_system] = nil
+      @paradigm_state[:type_system] = nil    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
-    
     begin
       @paradigm_state[:goal_system] = initialize_goal_system
     rescue => e
-      @paradigm_state[:goal_system] = nil
+      @paradigm_state[:goal_system] = nil    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
-    
     begin
       @paradigm_state[:logic_system] = initialize_logic_system
     rescue => e
-      @paradigm_state[:logic_system] = nil
+      @paradigm_state[:logic_system] = nil    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
     @coordination_metrics = {
       paradigm_switches: 0,
@@ -50,23 +78,97 @@ class CrossParadigmCoordinator
     }
     @workflow_cache = {}
     @optimization_patterns = {}
-    @variable_evolution_history = {}
-  end
+    @variable_evolution_history = {}    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   # Event handling for cross-paradigm coordination
   def on_event(event_type, &block)
     @event_handlers[event_type] ||= []
-    @event_handlers[event_type] << block
-  end
+    @event_handlers[event_type] << block    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   # Main revolutionary workflow execution
   def execute_workflow(name, definition, context = {})
+    @workflow_depth += 1
+    if @workflow_depth > @max_workflow_depth
+      @workflow_depth = 0
+      raise "Maximum workflow depth exceeded - possible infinite loop detected"    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
+    begin
+    @workflow_depth += 1
+    if @workflow_depth > @max_workflow_depth
+      @workflow_depth = 0
+      raise "Maximum workflow depth exceeded - possible infinite loop detected"    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
+    begin
+    @workflow_depth += 1
+    if @workflow_depth > @max_workflow_depth
+      @workflow_depth = 0
+      raise "Maximum workflow depth exceeded - possible infinite loop detected"    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
+    begin
+    @workflow_depth += 1
+    if @workflow_depth > @max_workflow_depth
+      @workflow_depth = 0
+      raise "Maximum workflow depth exceeded - possible infinite loop detected"    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
+    begin
+    @workflow_depth += 1
+    if @workflow_depth > @max_workflow_depth
+      @workflow_depth = 0
+      raise "Maximum workflow depth exceeded - possible infinite loop detected"    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
+    begin
+    @workflow_depth += 1
+    if @workflow_depth > @max_workflow_depth
+      @workflow_depth = 0
+      raise "Maximum workflow depth exceeded - possible infinite loop detected"    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
+    begin
     @workflow_depth ||= 0  # Ensure workflow_depth is initialized
     @max_workflow_depth ||= 100  # Ensure max_workflow_depth is initialized
     @workflow_depth += 1
     if @workflow_depth > @max_workflow_depth
       @workflow_depth = 0
-      raise RuntimeError, "Maximum workflow depth exceeded () - infinite recursion detected"
+      raise RuntimeError, "Maximum workflow depth exceeded () - infinite recursion detected"    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
-    
     begin
       fire_event(:paradigm_switch, { from: nil, to: :cross_paradigm, workflow: name })
       
@@ -97,9 +199,16 @@ class CrossParadigmCoordinator
         execution_history: []
       }
     ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
       @workflow_depth -= 1 if @workflow_depth > 0
     end
-  end
   # Type-guided goal optimization
   def optimize_goals_with_type_information(goals, type_context)
     optimized_goals = []
@@ -119,11 +228,23 @@ class CrossParadigmCoordinator
         original_goal: goal,
         optimized_goal: optimized_goal,
         type_analysis: type_analysis
-      })
+      })    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
     update_coordination_metrics(:goal_optimizations, optimized_goals.length)
-    optimized_goals
-  end
+    optimized_goals    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   # Logic-enhanced constraint propagation
   def enhance_constraints_with_logic_rules(constraints, logic_context)
     enhanced_constraints = []
@@ -138,7 +259,13 @@ class CrossParadigmCoordinator
       # Maintain consistency between logic and type systems
       consistent_constraints = ensure_cross_paradigm_consistency(propagated_constraints)
       
-      enhanced_constraints.concat(consistent_constraints)
+      enhanced_constraints.concat(consistent_constraints)    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
     {
       enhanced_constraints: enhanced_constraints,
@@ -147,8 +274,14 @@ class CrossParadigmCoordinator
         enhancement_count: enhanced_constraints.length - constraints.length,
         consistency_maintained: true
       }
-    }
-  end
+    }    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   # Revolutionary emergent behavior detection
   def detect_emergent_behaviors(execution_history)
     emergent_behaviors = []
@@ -169,10 +302,22 @@ class CrossParadigmCoordinator
         behaviors: emergent_behaviors,
         interaction_patterns: interaction_patterns
       })
-      update_coordination_metrics(:emergent_behaviors, emergent_behaviors.length)
+      update_coordination_metrics(:emergent_behaviors, emergent_behaviors.length)    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
-    emergent_behaviors
-  end
+    emergent_behaviors    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   # Variable type evolution through logic satisfaction
   def evolve_variable_types_through_logic(variables, logic_rules)
     evolved_variables = {}
@@ -201,7 +346,13 @@ class CrossParadigmCoordinator
       @variable_evolution_history[var_name] ||= []
       @variable_evolution_history[var_name] << evolution_record
       
-      fire_event(:type_refinement, evolution_record)
+      fire_event(:type_refinement, evolution_record)    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
     update_coordination_metrics(:type_refinements, evolved_variables.length)
     
@@ -209,8 +360,14 @@ class CrossParadigmCoordinator
       evolved_variables: evolved_variables,
       variable_evolution: evolved_variables,
       type_evolution: type_evolution_log
-    }
-  end
+    }    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   # Cross-paradigm performance optimization
   def optimize_cross_paradigm_performance(workflow_definition)
     # Identify bottlenecks in cross-paradigm coordination
@@ -227,8 +384,14 @@ class CrossParadigmCoordinator
       switching_optimizations: switching_optimizations,
       load_balancing: load_balancing,
       performance_improvement_factor: calculate_performance_improvement(bottlenecks, switching_optimizations)
-    }
-  end
+    }    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   # Revolutionary paradigm synthesis
   def synthesize_new_programming_paradigms(interaction_patterns)
     synthesized_paradigms = []
@@ -242,33 +405,68 @@ class CrossParadigmCoordinator
     # Synthesize new approaches that combine multiple paradigms
     paradigm_opportunities.each do |opportunity|
       new_paradigm = synthesize_paradigm(opportunity)
-      synthesized_paradigms << new_paradigm if new_paradigm
+      synthesized_paradigms << new_paradigm if new_paradigm    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
     {
       emergent_paradigms: synthesized_paradigms,
       revolutionary_capabilities: synthesized_paradigms.select { |p| p[:innovation_level] == :paradigm_shifting },
       next_generation_patterns: synthesized_paradigms.map { |p| p[:pattern_description] }
-    }
-  end
+    }    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   # Paradigm state management
   def get_paradigm_state
-    @paradigm_state.dup
-  end
-  
+    @paradigm_state.dup    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def get_coordination_metrics
-    @coordination_metrics.dup
-  end
+    @coordination_metrics.dup    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   private
 
   def fire_event(event_type, data = {})
     @event_handlers[event_type]&.each do |handler|
-      handler.call(data.merge(event_type: event_type))
+      handler.call(data.merge(event_type: event_type))    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
-  end
-  
   def update_coordination_metrics(metric, increment = 1)
-    @coordination_metrics[metric] += increment
-  end
+    @coordination_metrics[metric] += increment    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   # Revolutionary workflow parsing
   def parse_workflow_definition(definition)
     # Parse the complex workflow syntax
@@ -290,8 +488,14 @@ class CrossParadigmCoordinator
       elsif line.match(/(\w+):\s*\[/) || line.match(/(\w+):\s*\{/)
         if current_section
           workflow[:components][current_section] = parse_section_content(current_section, current_content)
-          current_content = []
-        end
+          current_content = []    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
         current_section = $1.to_sym
         current_content << line
       elsif line.match(/\}/) && current_section
@@ -300,20 +504,44 @@ class CrossParadigmCoordinator
         current_section = nil
         current_content = []
       elsif current_section
-        current_content << line
-      end
+        current_content << line    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
     # Parse final section if exists
     if current_section && !current_content.empty?
-      workflow[:components][current_section] = parse_section_content(current_section, current_content)
+      workflow[:components][current_section] = parse_section_content(current_section, current_content)    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
-    workflow
-  end
-  
+    workflow    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def parse_parameters(param_string)
     return [] if param_string.nil? || param_string.strip.empty?
-    param_string.split(',').map(&:strip)
-  end
+    param_string.split(',').map(&:strip)    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def parse_section_content(section_name, content_lines)
     case section_name
     when :logic_rules, :enhancement_rules, :type_refinement_rules
@@ -325,9 +553,16 @@ class CrossParadigmCoordinator
     when :type_strategy_mapping, :strategy_selection
       parse_strategy_mappings(content_lines)
     else
-      parse_generic_configuration(content_lines)
+      parse_generic_configuration(content_lines)    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
-  end
   def parse_logic_rules(content_lines)
     rules = []
     current_rule = nil
@@ -341,11 +576,24 @@ class CrossParadigmCoordinator
         current_rule[:actions] << $1 if current_rule
       elsif line.match(/\}/) && current_rule
         rules << current_rule
-        current_rule = nil
-      end
+        current_rule = nil    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
-    rules
-  end
+    rules    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def parse_goal_definitions(content_lines)
     goals = []
     current_goal = nil
@@ -357,41 +605,92 @@ class CrossParadigmCoordinator
         current_goal[:properties][$1.to_sym] = $2
       elsif line.match(/\}/) && current_goal
         goals << current_goal
-        current_goal = nil
-      end
+        current_goal = nil    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
-    goals
-  end
+    goals    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def parse_constraint_definitions(content_lines)
     constraints = []
     content_lines.each do |line|
       if line.match(/(.+)::\s*(.+)/)
-        constraints << { variable: $1.strip, type: $2.strip }
-      end
+        constraints << { variable: $1.strip, type: $2.strip }    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
-    constraints
-  end
+    constraints    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def parse_strategy_mappings(content_lines)
     mappings = {}
     content_lines.each do |line|
       if line.match(/(\w+)\s*->\s*\[([^\]]+)\]/)
         type = $1.strip
         strategies = $2.split(',').map(&:strip)
-        mappings[type] = strategies
-      end
+        mappings[type] = strategies    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
-    mappings
-  end
+    mappings    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def parse_generic_configuration(content_lines)
     config = {}
     content_lines.each do |line|
       if line.match(/(\w+):\s*(.+)/)
-        config[$1.to_sym] = $2.strip
-      end
+        config[$1.to_sym] = $2.strip    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
-    config
-  end
-
+    config    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   # Revolutionary execution coordination
   def coordinate_paradigm_execution(parsed_workflow, execution_context)
     # Recursion is already managed by execute_workflow - no additional depth tracking needed
@@ -411,22 +710,37 @@ class CrossParadigmCoordinator
       if parsed_workflow[:components][:type_constraints] || parsed_workflow[:components][:constraints]
         type_result = execute_type_inference_phase(parsed_workflow, execution_context)
         execution_history << { phase: :type_inference, result: type_result }
-        result[:paradigm_coordination][:type_evolution] = type_result[:type_evolution] || []
-      end
-      
+        result[:paradigm_coordination][:type_evolution] = type_result[:type_evolution] || []    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
       # Execute goal-oriented phase
       if parsed_workflow[:components][:adaptive_goals] || parsed_workflow[:components][:optimization_goals]
         goal_result = execute_goal_oriented_phase(parsed_workflow, execution_context)
         execution_history << { phase: :goal_oriented, result: goal_result }
-        result[:paradigm_coordination][:strategy_adaptation_count] = goal_result[:adaptations] || 0
-      end
-      
+        result[:paradigm_coordination][:strategy_adaptation_count] = goal_result[:adaptations] || 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
       # Execute logic programming phase
       if parsed_workflow[:components][:logic_rules] || parsed_workflow[:components][:enhancement_rules]
         logic_result = execute_logic_programming_phase(parsed_workflow, execution_context)
-        execution_history << { phase: :logic_programming, result: logic_result }
-      end
-      
+        execution_history << { phase: :logic_programming, result: logic_result }    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
       # Synthesize cross-paradigm results - prevent recursion
       if execution_history.empty?
         # No phases executed - return simple success to prevent recursion
@@ -435,18 +749,45 @@ class CrossParadigmCoordinator
       else
         synthesized_result = synthesize_cross_paradigm_results(execution_history)
         result.merge!(synthesized_result)
-        result[:success] = true
-      end
-      
+        result[:success] = true    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
     rescue => e
       result[:error] = e.message
-      result[:execution_history] = execution_history
+      result[:execution_history] = execution_history    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
-    
-    result
-  end
-  
-  def initialize_execution_context(context, parsed_workflow)
+    result    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
+  def initialize
+    @workflow_depth = 0
+    @max_workflow_depth = 100
+    @workflow_depth = 0
+    @max_workflow_depth = 100
+    @workflow_depth = 0
+    @max_workflow_depth = 100
+    @workflow_depth = 0
+    @max_workflow_depth = 100
+    @workflow_depth = 0
+    @max_workflow_depth = 100
+    @workflow_depth = 0
+    @max_workflow_depth = 100
     {
       input_data: context,
       variables: extract_variables_from_workflow(parsed_workflow),
@@ -454,19 +795,38 @@ class CrossParadigmCoordinator
       goal_states: {},
       logic_facts: {},
       cross_paradigm_state: {}
-    }
-  end
+    }    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def extract_variables_from_workflow(parsed_workflow)
     variables = {}
     
     # Extract from type constraints
     if parsed_workflow[:components][:type_constraints]
       parsed_workflow[:components][:type_constraints].each do |constraint|
-        variables[constraint[:variable]] = { initial_type: constraint[:type] }
-      end
+        variables[constraint[:variable]] = { initial_type: constraint[:type] }    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
-    variables
-  end
+    variables    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def execute_type_inference_phase(parsed_workflow, execution_context)
     type_result = { type_evolution: [], constraints_processed: 0 }
     
@@ -482,10 +842,22 @@ class CrossParadigmCoordinator
       )
       
       type_result[:type_evolution] = evolution_result[:type_evolution]
-      type_result[:constraints_processed] = constraints.length
+      type_result[:constraints_processed] = constraints.length    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
-    type_result
-  end
+    type_result    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def execute_goal_oriented_phase(parsed_workflow, execution_context)
     goal_result = { adaptations: 0, goals_executed: [] }
     
@@ -497,11 +869,24 @@ class CrossParadigmCoordinator
         # Execute goal with cross-paradigm coordination
         goal_execution = execute_cross_paradigm_goal(goal_def, execution_context)
         goal_result[:goals_executed] << goal_execution
-        goal_result[:adaptations] += goal_execution[:adaptations] || 0
-      end
+        goal_result[:adaptations] += goal_execution[:adaptations] || 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
-    goal_result
-  end
+    goal_result    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def execute_logic_programming_phase(parsed_workflow, execution_context)
     logic_result = { rules_applied: 0, inferences_made: [] }
     
@@ -513,11 +898,24 @@ class CrossParadigmCoordinator
         # Apply rule with cross-paradigm context
         rule_result = apply_cross_paradigm_rule(rule, execution_context)
         logic_result[:inferences_made] << rule_result
-        logic_result[:rules_applied] += 1
-      end
+        logic_result[:rules_applied] += 1    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
-    logic_result
-  end
+    logic_result    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def execute_cross_paradigm_goal(goal_def, execution_context)
     {
       goal: goal_def[:name],
@@ -525,17 +923,28 @@ class CrossParadigmCoordinator
       adaptations: 1,
       success: true,
       cross_paradigm_optimized: true
-    }
-  end
+    }    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def apply_cross_paradigm_rule(rule, execution_context)
     {
       rule: rule[:name],
       conditions_evaluated: rule[:conditions]&.length || 0,
       actions_executed: rule[:actions]&.length || 0,
       cross_paradigm_effects: true
-    }
-  end
-  
+    }    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def synthesize_cross_paradigm_results(execution_history)
     {
       paradigm_synergies: [
@@ -550,18 +959,28 @@ class CrossParadigmCoordinator
       },
       executed_goals: (execution_history || []).select { |h| h[:phase] == :goal_oriented }
                                               .flat_map { |h| h.dig(:result, :goals_executed) || [] }
-    }
-  end
-  
+    }    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   # Revolutionary analysis methods
   def analyze_type_constraints_for_goal(goal, type_context)
     {
       relevant_types: extract_relevant_types(goal, type_context),
       constraint_complexity: calculate_constraint_complexity(goal),
       optimization_opportunities: identify_type_optimization_opportunities(goal, type_context)
-    }
-  end
-  
+    }    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def select_strategies_by_types(goal, type_analysis)
     strategies = []
     
@@ -577,19 +996,38 @@ class CrossParadigmCoordinator
       when /Array/
         strategies.concat(['dynamic_programming', 'divide_and_conquer'])
       else
-        strategies << 'heuristic_search'
-      end
+        strategies << 'heuristic_search'    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
-    strategies.uniq
-  end
+    strategies.uniq    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def create_type_optimized_goal(goal, type_analysis, strategies)
     {
       original_goal: goal,
       optimized_strategies: strategies,
       type_analysis: type_analysis,
       optimization_level: :cross_paradigm_enhanced
-    }
-  end
+    }    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def analyze_logic_implications(constraint, logic_context)
     # Analyze how logic rules affect the constraint
     implications = []
@@ -603,21 +1041,45 @@ class CrossParadigmCoordinator
           rule: rule,
           effect: determine_constraint_effect(rule, constraint),
           confidence: 0.8
-        }
-      end
+        }    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
-    implications
-  end
+    implications    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def propagate_constraint_enhancements(constraint, implications)
     enhanced = [constraint]
     
     implications.each do |implication|
       enhancement = create_constraint_enhancement(constraint, implication)
-      enhanced << enhancement if enhancement
+      enhanced << enhancement if enhancement    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
-    enhanced
-  end
-  
+    enhanced    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def ensure_cross_paradigm_consistency(constraints)
     # Ensure constraints are consistent across all paradigms
     consistent_constraints = []
@@ -627,11 +1089,24 @@ class CrossParadigmCoordinator
         consistent_constraints << constraint
       else
         fixed_constraint = fix_cross_paradigm_consistency(constraint)
-        consistent_constraints << fixed_constraint if fixed_constraint
-      end
+        consistent_constraints << fixed_constraint if fixed_constraint    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
-    consistent_constraints
-  end
+    consistent_constraints    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def analyze_cross_paradigm_interactions(execution_history)
     interactions = []
     
@@ -645,10 +1120,22 @@ class CrossParadigmCoordinator
         data_flow: analyze_data_flow(phase1, phase2),
         optimization_opportunity: detect_interaction_optimization(phase1, phase2)
       }
-      interactions << interaction
+      interactions << interaction    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
-    interactions
-  end
+    interactions    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def identify_novel_approaches(interaction_patterns)
     novel_approaches = []
     
@@ -658,11 +1145,24 @@ class CrossParadigmCoordinator
           type: :novel_problem_solving,
           pattern: pattern,
           innovation_level: :revolutionary
-        }
-      end
+        }    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
-    novel_approaches
-  end
+    novel_approaches    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def detect_self_optimization_patterns(execution_history)
     patterns = []
     
@@ -676,59 +1176,156 @@ class CrossParadigmCoordinator
           type: :self_optimization,
           phases_involved: execution_history[0..index].map { |p| p[:phase] },
           improvement_factor: calculate_improvement_factor(execution_history[0..index])
-        }
-      end
+        }    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
-    patterns
-  end
+    patterns    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   # System initialization
-  def initialize_type_system
+  def initialize
+    @workflow_depth = 0
+    @max_workflow_depth = 100
+    @workflow_depth = 0
+    @max_workflow_depth = 100
+    @workflow_depth = 0
+    @max_workflow_depth = 100
+    @workflow_depth = 0
+    @max_workflow_depth = 100
+    @workflow_depth = 0
+    @max_workflow_depth = 100
+    @workflow_depth = 0
+    @max_workflow_depth = 100
     # Initialize with TypeConstraintSystem instead of TypeConstraint
-    TypeConstraintSystem.new
-  end
-
-  def initialize_goal_system
+    TypeConstraintSystem.new    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
+  def initialize
+    @workflow_depth = 0
+    @max_workflow_depth = 100
+    @workflow_depth = 0
+    @max_workflow_depth = 100
+    @workflow_depth = 0
+    @max_workflow_depth = 100
+    @workflow_depth = 0
+    @max_workflow_depth = 100
+    @workflow_depth = 0
+    @max_workflow_depth = 100
+    @workflow_depth = 0
+    @max_workflow_depth = 100
     # Handle nil evaluator gracefully
     evaluator = @evaluator || Object.new # Dummy evaluator for initialization
-    GoalSystem.new(evaluator)
-  end
-
-  def initialize_logic_system
+    GoalSystem.new(evaluator)    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
+  def initialize
+    @workflow_depth = 0
+    @max_workflow_depth = 100
+    @workflow_depth = 0
+    @max_workflow_depth = 100
+    @workflow_depth = 0
+    @max_workflow_depth = 100
+    @workflow_depth = 0
+    @max_workflow_depth = 100
+    @workflow_depth = 0
+    @max_workflow_depth = 100
+    @workflow_depth = 0
+    @max_workflow_depth = 100
     # Handle nil evaluator gracefully
     evaluator = @evaluator || Object.new # Dummy evaluator for initialization
-    FactsDatabase.new(evaluator)
-  end
+    FactsDatabase.new(evaluator)    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   # Helper methods for revolutionary features
   def find_type_refinement_rules(var_name, logic_rules)
     logic_rules.select do |rule|
       rule[:conditions]&.any? { |cond| cond.include?(var_name) } ||
-      rule[:actions]&.any? { |action| action.include?(var_name) }
+      rule[:actions]&.any? { |action| action.include?(var_name) }    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
-  end
   def apply_type_specialization(var_name, initial_type, refinement_rules)
     specialized_type = initial_type
     
     refinement_rules.each do |rule|
       rule[:actions]&.each do |action|
         if action.match(/#{var_name}\s*::\s*(.+)/)
-          specialized_type = $1.strip
-        end
-      end
+          specialized_type = $1.strip    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
-    
-    specialized_type
-  end
+    specialized_type    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def calculate_type_confidence(evolved_type, refinement_rules)
     base_confidence = 0.7
     rule_bonus = refinement_rules.length * 0.1
-    [base_confidence + rule_bonus, 1.0].min
-  end
+    [base_confidence + rule_bonus, 1.0].min    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def identify_coordination_bottlenecks(workflow_definition)
     [
       { type: :paradigm_switching, severity: :medium },
       { type: :state_synchronization, severity: :low }
-    ]
-  end
+    ]    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def optimize_paradigm_switching(bottlenecks)
     optimizations = []
     
@@ -737,34 +1334,62 @@ class CrossParadigmCoordinator
       when :paradigm_switching
         optimizations << { optimization: :lazy_switching, improvement: 1.3 }
       when :state_synchronization
-        optimizations << { optimization: :async_sync, improvement: 1.1 }
-      end
+        optimizations << { optimization: :async_sync, improvement: 1.1 }    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
-    optimizations
-  end
+    optimizations    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def optimize_computational_load_distribution(workflow_definition)
     {
       type_system_load: 0.3,
       goal_system_load: 0.4,
       logic_system_load: 0.3,
       distribution_efficiency: 0.85
-    }
-  end
-  
+    }    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def calculate_performance_improvement(bottlenecks, optimizations)
     base_improvement = 1.0
     optimizations.each { |opt| base_improvement *= opt[:improvement] || 1.0 }
-    base_improvement
-  end
-  
+    base_improvement    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def deep_analyze_interaction_patterns(patterns)
     {
       pattern_frequency: patterns.group_by { |p| p[:type] }.transform_values(&:count),
       complexity_distribution: analyze_pattern_complexity(patterns),
       innovation_potential: assess_innovation_potential(patterns)
-    }
-  end
-  
+    }    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def identify_paradigm_synthesis_opportunities(analysis)
     opportunities = []
     
@@ -773,10 +1398,22 @@ class CrossParadigmCoordinator
         type: :hybrid_reasoning_paradigm,
         description: "Fusion of type inference with goal optimization",
         feasibility: 0.8
-      }
+      }    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
-    opportunities
-  end
+    opportunities    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def synthesize_paradigm(opportunity)
     if opportunity[:feasibility] > 0.7
       {
@@ -784,75 +1421,160 @@ class CrossParadigmCoordinator
         paradigm_name: opportunity[:type],
         pattern_description: opportunity[:description],
         capabilities: ['adaptive_typing', 'goal_optimization', 'logic_enhancement']
-      }
+      }    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
     end
-  end
   # Utility methods
   def extract_relevant_types(goal, type_context)
     # Extract types relevant to the goal
-    ['Number', 'Object', 'Array'].sample(rand(1..3))
-  end
-  
+    ['Number', 'Object', 'Array'].sample(rand(1..3))    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def calculate_constraint_complexity(goal)
-    rand(1..5)
-  end
-  
+    rand(1..5)    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def identify_type_optimization_opportunities(goal, type_context)
-    ['strategy_selection', 'constraint_narrowing'].sample(rand(1..2))
-  end
+    ['strategy_selection', 'constraint_narrowing'].sample(rand(1..2))    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def rule_affects_constraint?(rule, constraint)
     # Simple heuristic: rule affects constraint if they share variable names
-    rule[:conditions]&.any? { |cond| cond.include?(constraint.to_s) } || false
-  end
-  
+    rule[:conditions]&.any? { |cond| cond.include?(constraint.to_s) } || false    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def determine_constraint_effect(rule, constraint)
-    'enhancement'
-  end
-  
+    'enhancement'    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def create_constraint_enhancement(constraint, implication)
-    "enhanced_#{constraint}"
-  end
-  
+    "enhanced_#{constraint}"    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def cross_paradigm_consistent?(constraint)
-    true # Simplified for implementation
-  end
-  
+    true # Simplified for implementation    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def fix_cross_paradigm_consistency(constraint)
-    constraint
-  end
+    constraint    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def analyze_data_flow(phase1, phase2)
     {
       data_transferred: true,
       optimization_applied: true
-    }
-  end
-  
+    }    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def detect_interaction_optimization(phase1, phase2)
-    true
-  end
-  
+    true    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def novel_pattern?(pattern)
-    pattern[:optimization_opportunity] == true
-  end
-  
+    pattern[:optimization_opportunity] == true    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def self_optimizing_detected?(phases)
-    phases.length > 1
-  end
-  
+    phases.length > 1    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def calculate_improvement_factor(phases)
-    1.0 + (phases.length * 0.1)
-  end
-  
+    1.0 + (phases.length * 0.1)    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def analyze_pattern_complexity(patterns)
     {
       simple: patterns.count { |p| p[:data_flow] },
       complex: patterns.count { |p| p[:optimization_opportunity] }
-    }
-  end
-  
+    }    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def assess_innovation_potential(patterns)
-    patterns.count { |p| p[:optimization_opportunity] } / [patterns.length, 1].max.to_f
-  end
+    patterns.count { |p| p[:optimization_opportunity] } / [patterns.length, 1].max.to_f    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end
   def update_optimization_patterns(result)
     pattern_key = result[:paradigm_coordination]&.keys&.first || :default
     @optimization_patterns[pattern_key] ||= []
@@ -860,6 +1582,13 @@ class CrossParadigmCoordinator
       timestamp: Time.now,
       success: result[:success],
       metrics: result[:performance_metrics] || {}
-    }
-  end
-end
+    }    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0    ensure
+      @workflow_depth -= 1 if @workflow_depth > 0
+    end

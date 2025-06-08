@@ -271,45 +271,64 @@ class ReturnNode < ASTNode
     end
   end
 end
-# Node representing a type constraint declaration (e.g., constrain x :: Number where x > 0)
-class ConstraintNode < ASTNode
-  attr_reader :variable, :type, :conditions
+# Node representing a type constraint declaration for unified reasoning
+class TypeConstraintNode < ASTNode
+  attr_reader :variable, :constraint_type, :constraint_data, :conditions
 
-  def initialize(variable, type, conditions = nil)
+  def initialize(variable, constraint_type, constraint_data = nil, conditions = nil)
     @variable = variable
-    @type = type
+    @constraint_type = constraint_type
+    @constraint_data = constraint_data
     @conditions = conditions
+  end
+
+  def satisfies?(value)
+    # Method stub - evaluation logic to be implemented later
+    raise NotImplementedError, "satisfies? method not yet implemented"
+  end
+
+  def validate
+    # Method stub - validation logic to be implemented later
+    raise NotImplementedError, "validate method not yet implemented"
+  end
+
+  def error_message
+    # Method stub - error message generation to be implemented later
+    raise NotImplementedError, "error_message method not yet implemented"
   end
 
   def to_s
     if @conditions
-      "ConstraintNode(#{@variable} :: #{@type} where #{@conditions})"
+      "TypeConstraintNode(#{@variable} :: #{@constraint_type} where #{@conditions})"
     else
-      "ConstraintNode(#{@variable} :: #{@type})"
+      "TypeConstraintNode(#{@variable} :: #{@constraint_type})"
     end
   end
 end
 
-# Node representing a goal declaration (e.g., goal find_answer { postcondition: answer > 0 })
+# Node representing a goal declaration for goal-oriented programming
 class GoalNode < ASTNode
-  attr_reader :name, :parameters, :precondition, :postcondition, :strategy,
-              :description, :strategies, :subgoals, :context
+  attr_reader :description, :preconditions, :postconditions, :strategies
 
-  def initialize(name, parameters = [], precondition = nil, postcondition = nil, strategy = nil,
-                 description = nil, strategies = [], subgoals = [], context = {})
-    @name = name
-    @parameters = parameters
-    @precondition = precondition
-    @postcondition = postcondition
-    @strategy = strategy
+  def initialize(description, preconditions = [], postconditions = [], strategies = [])
     @description = description
+    @preconditions = preconditions
+    @postconditions = postconditions
     @strategies = strategies
-    @subgoals = subgoals
-    @context = context
+  end
+
+  def can_pursue?
+    # Method stub - pursuit validation logic to be implemented later
+    raise NotImplementedError, "can_pursue? method not yet implemented"
+  end
+
+  def success_criteria
+    # Method stub - success criteria evaluation to be implemented later
+    raise NotImplementedError, "success_criteria method not yet implemented"
   end
 
   def to_s
-    "GoalNode(#{@name})"
+    "GoalNode(#{@description})"
   end
 end
 
@@ -326,30 +345,53 @@ class AssertNode < ASTNode
   end
 end
 
-# Node representing a query (e.g., query likes(X, bob))
-class QueryNode < ASTNode
-  attr_reader :pattern
+# Node representing a logic programming rule
+class LogicRuleNode < ASTNode
+  attr_reader :head, :body, :rule_type
 
-  def initialize(pattern)
-    @pattern = pattern
+  def initialize(head, body, rule_type = :standard)
+    @head = head
+    @body = body
+    @rule_type = rule_type
+  end
+
+  def matches?(query)
+    # Method stub - pattern matching logic to be implemented later
+    raise NotImplementedError, "matches? method not yet implemented"
+  end
+
+  def apply(bindings = {})
+    # Method stub - rule application logic to be implemented later
+    raise NotImplementedError, "apply method not yet implemented"
   end
 
   def to_s
-    "QueryNode(#{@pattern})"
+    "LogicRuleNode(#{@head} :- #{@body}, type: #{@rule_type})"
   end
 end
 
-# Node representing a rule definition (e.g., rule ancestor(X, Y) :- parent(X, Y))
-class RuleNode < ASTNode
-  attr_reader :head, :body
+# Node representing a logic programming query
+class QueryNode < ASTNode
+  attr_reader :goal_term, :variables, :query_type
 
-  def initialize(head, body)
-    @head = head
-    @body = body
+  def initialize(goal_term, variables = [], query_type = :standard)
+    @goal_term = goal_term
+    @variables = variables
+    @query_type = query_type
+  end
+
+  def bind_variables(bindings = {})
+    # Method stub - variable binding logic to be implemented later
+    raise NotImplementedError, "bind_variables method not yet implemented"
+  end
+
+  def result_format
+    # Method stub - result formatting logic to be implemented later
+    raise NotImplementedError, "result_format method not yet implemented"
   end
 
   def to_s
-    "RuleNode(#{@head} :- #{@body})"
+    "QueryNode(#{@goal_term}, vars: #{@variables}, type: #{@query_type})"
   end
 end
 

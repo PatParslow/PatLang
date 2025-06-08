@@ -197,6 +197,20 @@ class Lexer
           advance
           return Token.new(Token::TOKEN_TYPES[:COLON], ':', @position - 1, start_line, start_column)
         end
+      when '@'
+        start_line, start_column = @line, @column
+        advance
+        return Token.new(Token::TOKEN_TYPES[:AT], '@', @position - 1, start_line, start_column)
+      when '?'
+        start_line, start_column = @line, @column
+        if peek_char == '-'
+          advance
+          advance
+          return Token.new(Token::TOKEN_TYPES[:QUERY_PREFIX], '?-', @position - 2, start_line, start_column)
+        else
+          advance
+          return Token.new(:QUESTION, '?', @position - 1, start_line, start_column)
+        end
       when '\\'
         # Handle backslash as a special character - could be escape sequence or standalone
         start_line, start_column = @line, @column
@@ -215,7 +229,7 @@ class Lexer
         else
           # Enhanced error handling for special characters
           case @current_char
-          when '@', '$', '&', '~', '`'
+          when '$', '&', '~', '`'
             # These characters should raise RuntimeError
             error
           when '#'
@@ -378,6 +392,8 @@ class Lexer
                    Token::TOKEN_TYPES[:POSTCONDITION]
                  when 'strategy'
                    Token::TOKEN_TYPES[:STRATEGY]
+                 when 'fact'
+                   Token::TOKEN_TYPES[:FACT]
                  else
                    Token::TOKEN_TYPES[:IDENTIFIER]
                  end
