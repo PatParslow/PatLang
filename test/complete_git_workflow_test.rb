@@ -151,8 +151,9 @@ class CompleteGitWorkflowTest
     puts "📡 Testing pre-push hook validation..."
     
     start_time = Time.now
-    # Use --dry-run to test pre-push without actually pushing
-    push_success = system("git push --dry-run origin #{current_branch}")
+    # Simulate pre-push hook execution directly since no remote is configured
+    puts "🧪 Simulating pre-push hook validation..."
+    push_success = system("#{File.join('.git', 'hooks', 'pre-push')} origin dummy_url")
     push_duration = Time.now - start_time
     
     @monitor.record_git_operation("push_dry_run", {
