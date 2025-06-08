@@ -484,7 +484,7 @@ class TestEvaluator < Minitest::Test
     error = assert_raises(StandardError) do
       evaluator.evaluate(ast)
     end
-    assert_match(/Method calls are only supported for strings and numbers/, error.message)
+    assert_match(/Method calls are only supported for strings, numbers, classes, and PatlangObjects/, error.message)
     
     # Test length method with arguments
     lexer = Lexer.new('"hello".length("extra")')
