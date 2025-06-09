@@ -5,45 +5,89 @@ require_relative '../../src/lexer'
 require_relative '../../src/token'
 
 class TestLexerErrorRecovery < Minitest::Test
-  def test_invalid_unicode_characters
-    # Test various invalid Unicode characters
-    invalid_chars = [
+  def test_unicode_characters_produce_tokens
+    # Test that lexer creates tokens for Unicode characters instead of raising errors
+    # The lexer should NEVER raise RuntimeError - it should tokenize everything
+    unicode_chars = [
       "\u{FEFF}", # Byte Order Mark
       "\u{200B}", # Zero Width Space
       "\u{2028}", # Line Separator
       "\u{2029}", # Paragraph Separator
-      "\u{FFFD}", # Replacement character (instead of invalid FFFF)
-      "\u{1FFFE}", # Non-character (valid but not intended for use)
-      "\u{1FFFF}"  # Non-character (valid but not intended for use)
+      "\u{FFFD}", # Replacement character
+      "\u{1FFFE}", # Non-character
+      "\u{1FFFF}"  # Non-character
     ]
 
-    invalid_chars.each do |char|
+    unicode_chars.each do |char|
       lexer = Lexer.new("x = #{char}42")
-      assert_raises(RuntimeError, "Should raise error for Unicode char: #{char.inspect}") do
-        lexer.tokenize
+      
+      # Lexer should NEVER raise errors - it should always produce tokens
+      tokens = lexer.tokenize
+      assert tokens.any?, "Should produce tokens for Unicode char: #{char.inspect}"
+      
+      # Should have identifiers and numbers
+      identifiers = tokens.select { |token| token.type == :IDENTIFIER }
+      numbers = tokens.select { |token| token.type == :NUMBER }
+      
+      assert identifiers.any?, "Should produce identifier 'x' for input with Unicode char: #{char.inspect}"
+      assert numbers.any?, "Should produce number '42' for input with Unicode char: #{char.inspect}"
+    end
+  end
+
+  def test_lexer_creates_tokens_for_all_characters
+    # Test that lexer creates tokens for all characters instead of raising errors
+    # The lexer should NEVER raise RuntimeError - it should tokenize everything
+    test_inputs = [
+      "@",        # AT character - should produce AT token
+      "$",        # Dollar sign - should produce UNKNOWN token
+      "~",        # Tilde - should produce UNKNOWN token
+      "€",        # Euro symbol - should produce UNKNOWN token
+      "∞",        # Mathematical symbol - should produce UNKNOWN token
+      "α",        # Greek letter - should produce UNKNOWN token
+      "中",        # Chinese character - should produce UNKNOWN token
+      "🚀",       # Emoji - should produce UNKNOWN token
+      "@#$%",     # Mixed characters including AT
+    ]
+
+    test_inputs.each do |input|
+      lexer = Lexer.new(input)
+      
+      # Lexer should NEVER raise errors - it should always produce tokens
+      tokens = lexer.tokenize
+      assert tokens.any?, "Should produce tokens for input: #{input.inspect}"
+      
+      # Should have at least one non-EOF token
+      non_eof_tokens = tokens.reject { |token| token.type == :EOF }
+      assert non_eof_tokens.any?, "Should produce at least one non-EOF token for: #{input.inspect}"
+      
+      # For '@' specifically, should produce AT token
+      if input.include?('@')
+        at_tokens = tokens.select { |token| token.type == :AT }
+        assert at_tokens.any?, "Should produce AT token for input containing '@': #{input.inspect}"
       end
     end
   end
 
-  def test_invalid_character_error_handling
-    # Test various invalid characters that should trigger error method
-    invalid_inputs = [
-      "@#$%",     # Invalid symbols
-      "~!",       # Tilde and other chars
-      "€£¥",      # Currency symbols
-      "∞∑∏",      # Mathematical symbols
-      "αβγ",      # Greek letters
-      "中文",      # Chinese characters
-      "🚀💻",     # Emojis
+  def test_at_character_produces_valid_tokens
+    # Test that '@' character correctly produces AT tokens
+    at_inputs = [
+      "@",           # Simple @ character
+      "@identifier", # @ followed by identifier
+      "@#$%",        # @ followed by other chars
     ]
 
-    invalid_inputs.each do |input|
+    at_inputs.each do |input|
       lexer = Lexer.new(input)
-      error = assert_raises(RuntimeError) do
-        lexer.tokenize
-      end
-      assert_match(/Invalid character/, error.message)
-      assert_match(/at position/, error.message)
+      tokens = lexer.tokenize
+      
+      # Should have at least one AT token
+      at_tokens = tokens.select { |token| token.type == :AT }
+      assert at_tokens.any?, "Should produce AT token for input: #{input.inspect}"
+      
+      # First AT token should be at position 0
+      first_at = at_tokens.first
+      assert_equal '@', first_at.value
+      assert_equal 0, first_at.position
     end
   end
 
@@ -202,27 +246,39 @@ class TestLexerErrorRecovery < Minitest::Test
     end
   end
 
-  def test_error_recovery_mechanisms
-    # Test lexer's ability to continue after errors (if implemented)
+  def test_mixed_content_tokenization
+    # Test lexer's ability to handle mixed valid and special character content
+    # The lexer should tokenize everything, never raise errors
     
-    # Input with mixed valid and invalid content
-    mixed_input = "valid = 42\n@invalid\nmore = 123"
+    # Input with mixed valid content and special characters
+    mixed_input = "valid = 42\n@invalid\n$unknown\nmore = 123"
     
     lexer = Lexer.new(mixed_input)
-    error_raised = false
+    tokens = lexer.tokenize
     
-    begin
-      tokens = lexer.tokenize
-    rescue RuntimeError => e
-      error_raised = true
-      # Verify error message contains useful information
-      assert_match(/Invalid character/, e.message)
-      assert_match(/@|Invalid character/, e.message)
-      assert_match(/position/, e.message)
-    end
+    # Should successfully tokenize without errors
+    assert tokens.any?, "Should successfully tokenize mixed content"
     
-    # For now, lexer should raise error on invalid character
-    assert error_raised, "Should raise error for invalid character @"
+    # Should contain AT token for the @ character
+    at_tokens = tokens.select { |token| token.type == :AT }
+    assert at_tokens.any?, "Should produce AT token for @ character"
+    
+    # Should contain identifiers for 'valid', 'invalid', and 'more'
+    identifiers = tokens.select { |token| token.type == :IDENTIFIER }
+    identifier_values = identifiers.map(&:value)
+    assert_includes identifier_values, 'valid'
+    assert_includes identifier_values, 'invalid'
+    assert_includes identifier_values, 'more'
+    
+    # Should contain numbers for 42 and 123
+    numbers = tokens.select { |token| token.type == :NUMBER }
+    number_values = numbers.map(&:value)
+    assert_includes number_values, 42
+    assert_includes number_values, 123
+    
+    # Should handle the $ character (as UNKNOWN token or similar)
+    # The key point is that it should NOT raise an error
+    puts "Tokens produced: #{tokens.map { |t| "#{t.type}:#{t.value}" }.join(', ')}"
   end
 
   def test_token_boundary_edge_cases

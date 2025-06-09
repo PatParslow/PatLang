@@ -217,8 +217,8 @@ class Lexer
         advance
         if @current_char && @current_char.match(/[ntr"'\\]/)
           # This looks like the start of an escape sequence in a string context
-          # but we're not in a string, so treat as error
-          error
+          # but we're not in a string, so treat as unknown token
+          return Token.new(:UNKNOWN, '\\', @position - 1, start_line, start_column)
         else
           # Standalone backslash - return as unknown token for now
           return Token.new(:UNKNOWN, '\\', @position - 1, start_line, start_column)
@@ -227,20 +227,12 @@ class Lexer
         if alpha?(@current_char)
           return read_identifier
         else
-          # Enhanced error handling for special characters
-          case @current_char
-          when '$', '&', '~', '`'
-            # These characters should raise RuntimeError
-            error
-          when '#'
-            # Skip unsupported special characters gracefully (# is handled elsewhere as comment)
-            start_line, start_column = @line, @column
-            char = @current_char
-            advance
-            return Token.new(:UNKNOWN, char, @position - 1, start_line, start_column)
-          else
-            error
-          end
+          # Handle all unknown characters by creating UNKNOWN tokens
+          # Lexer should NEVER raise errors - always create tokens
+          start_line, start_column = @line, @column
+          char = @current_char
+          advance
+          return Token.new(:UNKNOWN, char, @position - 1, start_line, start_column)
         end
       end
     end
