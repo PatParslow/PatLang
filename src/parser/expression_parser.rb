@@ -551,6 +551,14 @@ module ParserModules
     def create_error_placeholder(message)
       # Create a special error node that doesn't crash the parser
       # This allows parsing to continue and provides better error reporting
+      #
+      # CRITICAL FIX: Advance token position to prevent infinite loops
+      # When we create an error placeholder, we must consume the problematic token
+      # to ensure the parser doesn't get stuck in the same position
+      if @parser.current_token && @parser.current_token.type != :EOF
+        @parser.advance  # Consume the problematic token
+      end
+      
       ErrorNode.new(message)
     end
 
