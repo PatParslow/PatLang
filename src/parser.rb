@@ -15,11 +15,14 @@ require_relative 'hash_extensions'
 class Parser
   include EventSystem::EventCapable
   include ParserModules::TimeoutProtection
-  attr_reader :current_token, :current_token_index
+  attr_reader :current_token, :current_token_index, :collected_errors
 
   def initialize(tokens_or_lexer)
     # Initialize event system
     initialize_event_system
+    
+    # Initialize error collection for comprehensive error recovery
+    @collected_errors = []
     
     # Handle both tokens array and lexer object
     if tokens_or_lexer.is_a?(Lexer)
@@ -36,6 +39,22 @@ class Parser
     @function_parser = ParserModules::FunctionParser.new(self)
     @control_flow_parser = ParserModules::ControlFlowParser.new(self)
     @type_constraint_parser = ParserModules::TypeConstraintParser.new(self)
+  end
+
+  # Collect error information for comprehensive error reporting
+  def collect_error(error_info)
+    @collected_errors << error_info
+    puts "[Parser ERROR COLLECTION] #{error_info[:message]} at position #{error_info[:position]}"
+  end
+
+  # Get all collected errors for comprehensive reporting
+  def get_all_errors
+    @collected_errors
+  end
+
+  # Check if any errors were collected during parsing
+  def has_errors?
+    !@collected_errors.empty?
   end
 
   def error(message = "Parse error")

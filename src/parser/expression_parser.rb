@@ -549,17 +549,30 @@ module ParserModules
     private
     
     def create_error_placeholder(message)
-      # Create a special error node that doesn't crash the parser
-      # This allows parsing to continue and provides better error reporting
-      #
-      # CRITICAL FIX: Advance token position to prevent infinite loops
-      # When we create an error placeholder, we must consume the problematic token
-      # to ensure the parser doesn't get stuck in the same position
-      if @parser.current_token && @parser.current_token.type != :EOF
-        @parser.advance  # Consume the problematic token
+      # ERROR RECOVERY: Always advance past problematic tokens to enable continued parsing
+      # This implements comprehensive error recovery to identify ALL errors in source code
+      # instead of stopping at the first error.
+      
+      # Collect error information for comprehensive reporting
+      error_info = {
+        message: message,
+        token: @parser.current_token,
+        position: @parser.current_token_index
+      }
+      
+      # Add to parser's error collection if it exists
+      if @parser.respond_to?(:collect_error)
+        @parser.collect_error(error_info)
       end
       
-      ErrorNode.new(message)
+      # CRITICAL: Always advance past problematic tokens for error recovery
+      # This enables the parser to continue and find multiple errors
+      if @parser.current_token && @parser.current_token.type != :EOF
+        puts "[Parser RECOVERY] Advancing past problematic token: #{@parser.current_token.type} (#{@parser.current_token.value}) - #{message}"
+        @parser.advance
+      end
+      
+      ErrorNode.new(message, error_info)
     end
 
     # Grammar: boolean → 'true' | 'false'
