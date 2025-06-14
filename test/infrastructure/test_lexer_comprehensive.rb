@@ -109,20 +109,20 @@ class TestLexerComprehensive < Minitest::Test
   # String error conditions
   def test_unterminated_string_error
     lexer = Lexer.new('"unterminated string')
+    tokens = lexer.tokenize
     
-    error_raised = false
-    begin
-      lexer.tokenize
-    rescue RuntimeError => e
-      error_raised = true
-      assert_includes e.message, "Unterminated string literal"
-    end
-    assert error_raised, "Expected unterminated string error"
+    # Lexer follows "Never Fail, Always Token" principle
+    # Unterminated strings return UNTERMINATED_STRING token
+    assert_equal 2, tokens.length
+    assert_equal :UNTERMINATED_STRING, tokens[0].type
+    assert_equal 'unterminated string', tokens[0].value
+    assert_equal Token::TOKEN_TYPES[:EOF], tokens[1].type
   end
 
   def test_incomplete_escape_at_end_error
     lexer = Lexer.new('"incomplete escape\\')
     
+    # This still raises an error as documented in the lexer
     error_raised = false
     begin
       lexer.tokenize

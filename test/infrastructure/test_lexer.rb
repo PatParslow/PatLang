@@ -238,11 +238,15 @@ class TestLexer < Minitest::Test
   end
 
   def test_error_handling
-    # Test unclosed string
+    # Test unclosed string - lexer follows "Never Fail, Always Token" principle
     lexer = Lexer.new('"unclosed string')
-    assert_raises(RuntimeError) do
-      lexer.tokenize
-    end
+    tokens = lexer.tokenize
+    
+    # Should return UNTERMINATED_STRING token, not raise error
+    assert_equal 2, tokens.length
+    assert_equal :UNTERMINATED_STRING, tokens[0].type
+    assert_equal 'unclosed string', tokens[0].value
+    assert_equal :EOF, tokens[1].type
 
     # Improved parsing: '3.14.159' now parses as separate tokens instead of erroring
     lexer = Lexer.new('3.14.159')
@@ -562,14 +566,18 @@ class TestLexer < Minitest::Test
   end
 
   def test_error_handling_comprehensive
-    # Test various invalid character combinations (excluding # for comments, % for modulo operator, and @ for AT token)
+    # Test various invalid character combinations - lexer follows "Never Fail, Always Token" principle
     invalid_inputs = ['$', '&', '~', '`']
     
     invalid_inputs.each do |invalid_char|
       lexer = Lexer.new(invalid_char)
-      assert_raises(RuntimeError) do
-        lexer.tokenize
-      end
+      tokens = lexer.tokenize
+      
+      # Should return UNKNOWN token, not raise error
+      assert_equal 2, tokens.length
+      assert_equal Token::TOKEN_TYPES[:UNKNOWN], tokens[0].type
+      assert_equal invalid_char, tokens[0].value
+      assert_equal Token::TOKEN_TYPES[:EOF], tokens[1].type
     end
     
     # Test that % is now valid (modulo operator)
