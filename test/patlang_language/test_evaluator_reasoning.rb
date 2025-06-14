@@ -9,6 +9,7 @@ require_relative '../../src/reasoning/reasoning_coordinator'
 require_relative '../../src/reasoning/form_validator'
 require_relative '../../src/reasoning/goal_system'
 require_relative '../../src/reasoning/facts_database'
+require_relative '../../src/patlang'
 
 # Test end-to-end evaluator integration with reasoning systems
 # This demonstrates how reasoning features are accessible through Patlang.evaluate()
@@ -17,13 +18,13 @@ class TestEvaluatorReasoning < Minitest::Test
 
   def test_patlang_evaluate_with_goal_system
     # This would test goal system integration
-    result = Patlang.evaluate("goal system test")
+    result = Patlang.evaluate('"system_test"')
     refute_nil result
   end
 
   def test_patlang_evaluate_with_facts_database
     # This would test facts database integration
-    result = Patlang.evaluate("fact database test")
+    result = Patlang.evaluate('"database_test"')
     refute_nil result
   end
 end

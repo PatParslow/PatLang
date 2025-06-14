@@ -84,7 +84,7 @@ class NumberObject < PatlangObject
       }
       fire_event(:arithmetic_error, error_data)
       EventSystem.fire_global_event(:arithmetic_error, error_data)
-      raise "Division by zero"
+      raise ZeroDivisionError, "Division by zero"
     end
     
     result_value = @raw_value / other_value

@@ -1,6 +1,6 @@
 require_relative '../helpers/test_helper'
 require_relative '../../src/lexer'
-require_relative '../../src/parse_error'
+require_relative '../../src/exceptions'
 
 class TestLexerErrorScenarios < Minitest::Test
   def setup

@@ -2,7 +2,7 @@
 
 require_relative 'src/lexer'
 require_relative 'src/parser'
-require_relative 'src/parse_error'
+require_relative 'src/exceptions'
 
 def test_parse_error_fixes
   puts "=== Testing Priority 3 ParseError Fixes ==="

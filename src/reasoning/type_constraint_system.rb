@@ -23,11 +23,16 @@ class TypeConstraintSystem < PatlangObject
     set_metadata(:created_at, Time.now)
   end
   
+  # Get total number of constraints across all variables
+  def constraint_count
+    @constraints.values.map(&:length).sum
+  end
+  
   # Create a new type constraint for a variable
-  def create_constraint(variable, constraint_type, constraint_data)
+  def create_constraint(variable, constraint_type, constraint_data, **options)
     validate_constraint_inputs(variable, constraint_type, constraint_data)
     
-    constraint = TypeConstraint.new(variable, constraint_type, constraint_data, self)
+    constraint = TypeConstraint.new(variable, constraint_type, constraint_data, **options)
     @constraints[variable] << constraint
     
     fire_event(:constraint_created, {
@@ -68,6 +73,23 @@ class TypeConstraintSystem < PatlangObject
       
       result
     end
+  end
+  
+  # Alias for compatibility with reasoning_coordinator
+  alias variable_satisfies? satisfies_all_constraints?
+  
+  # Set a variable's value - for tracking constraint validation
+  def set_variable_value(variable, value)
+    # Store the value for constraint validation
+    @variable_values ||= {}
+    @variable_values[variable] = value
+    
+    # Fire event for variable assignment
+    fire_event(:variable_assigned, {
+      variable: variable,
+      value: value,
+      timestamp: Time.now
+    })
   end
   
   # Detect conflicts between constraints on a variable
@@ -199,6 +221,12 @@ class TypeConstraintSystem < PatlangObject
     @relationships.each_value { |vars| vars.delete(variable) }
   end
   
+  # Public fire_event method for test compatibility
+  def fire_event(event_type, event_data = {})
+    # Delegate to parent class fire_event method
+    super
+  end
+  
   private
   
   def validate_constraint_inputs(variable, constraint_type, constraint_data)
@@ -316,10 +344,10 @@ class TypeConstraint
   # Validate a value and return detailed result
   def validate(value)
     if satisfies?(value)
-      ValidationResult.new(true)
+      ValidationResult.new(valid: true)
     else
       error_message = generate_error_message(value)
-      ValidationResult.new(false, error_message)
+      ValidationResult.new(valid: false, errors: [error_message])
     end
   end
   
@@ -445,7 +473,7 @@ end
 class ValidationResult
   attr_reader :success, :error_message
   
-  def initialize(success, error_message = nil)
+  def initialize(success, error_message = nil, *additional_args)
     @success = success
     @error_message = error_message
   end
@@ -458,7 +486,7 @@ end
 class UnificationResult
   attr_reader :success, :error_message
   
-  def initialize(success, error_message = nil)
+  def initialize(success, error_message = nil, *additional_args)
     @success = success
     @error_message = error_message
   end

@@ -112,6 +112,11 @@ class PatlangObject
     @metadata[key]
   end
   
+  # Alias for set_metadata to maintain compatibility
+  def set_attribute(key, value)
+    set_metadata(key, value)
+  end
+  
   # Type checking and conversion
   def is_type?(type)
     @object_type == type
@@ -323,5 +328,34 @@ class PatlangObject
   # Class methods for finding objects
   def self.find_object(object_id)
     @@object_registry[object_id]
+  end
+  
+  # Add merge method for Hash compatibility
+  def merge(other)
+    return self unless other.respond_to?(:each) || other.is_a?(Hash)
+    
+    # If other is a hash, merge into our attributes
+    if other.is_a?(Hash)
+      other.each do |key, value|
+        if self.respond_to?("#{key}=")
+          self.send("#{key}=", value)
+        elsif self.respond_to?(:set_attribute)
+          self.set_attribute(key, value)
+        end
+      end
+    end
+    
+    self
+  end
+  
+  # Add + operator for string concatenation compatibility
+  def +(other)
+    if self.respond_to?(:value) && other.respond_to?(:value)
+      self.class.new(self.value.to_s + other.value.to_s)
+    elsif self.respond_to?(:value)
+      self.class.new(self.value.to_s + other.to_s)
+    else
+      self.to_s + other.to_s
+    end
   end
 end

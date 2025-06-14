@@ -232,6 +232,14 @@ require_relative 'evaluator/function_evaluator'
 
 ### Error Handling Patterns
 
+**⚠️ CRITICAL: Lexer Error Handling Specification**
+
+**The lexer has special error handling requirements that MUST be followed:**
+- See [`lexer-error-handling-specification.md`](lexer-error-handling-specification.md) for complete details
+- **NEVER change the lexer to raise exceptions for unrecognized input**
+- **ALWAYS return tokens (UNKNOWN, AMBIGUOUS, or EOF)**
+- Only raise exceptions for genuine system errors (IO, memory, etc.)
+
 **Consistent Error Types:**
 ```ruby
 # ✅ GOOD: Custom error hierarchy
@@ -248,11 +256,21 @@ module Patlang
   class FunctionNotFoundError < EvaluationError; end
 end
 
-# Usage in methods
+# Usage in methods (NON-LEXER components only)
 def evaluate_variable(name)
   return @variables[name] if @variables.key?(name)
   
   raise UndefinedVariableError, "Variable '#{name}' is not defined"
+end
+
+# ❌ FORBIDDEN in lexer: Never raise exceptions for parsing issues
+def lexer_error_method
+  raise SyntaxError, "Invalid character"  # WRONG!
+end
+
+# ✅ CORRECT in lexer: Return UNKNOWN tokens
+def lexer_error_method
+  return Token.new(:UNKNOWN, @current_char, @position, @line, @column)
 end
 ```
 

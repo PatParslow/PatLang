@@ -1,4 +1,5 @@
 require_relative '../helpers/test_helper'
+require_relative '../../src/evaluator'
 
 class TestErrorHandlingCoverage < Minitest::Test
   def setup

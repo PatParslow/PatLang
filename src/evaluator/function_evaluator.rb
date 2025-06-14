@@ -42,7 +42,7 @@ module EvaluatorModules
       end
 
       unless function_def
-        raise "Undefined function: #{node.function_name}"
+        raise RuntimeError, "Undefined function: #{node.function_name}"
       end
 
       # Parameter count validation

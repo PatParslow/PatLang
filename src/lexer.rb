@@ -2,6 +2,22 @@ require_relative 'token'
 require_relative 'ambiguous_token'
 
 # Lexer class for tokenizing Patlang source code
+#
+# ⚠️  CRITICAL LEXER ERROR HANDLING RULE ⚠️
+#
+# THE LEXER MUST NEVER RAISE EXCEPTIONS FOR UNRECOGNIZED INPUT!
+#
+# This lexer follows the "Never Fail, Always Token" principle:
+# - NEVER throw exceptions for unrecognized characters or invalid syntax
+# - ALWAYS return a token (UNKNOWN, AMBIGUOUS, or EOF)
+# - CONTINUE processing after encountering invalid input
+# - ONLY raise exceptions for genuine system errors (IO failures, memory issues)
+#
+# This design ensures robust parsing and enables error recovery at the parser level.
+#
+# See docs/development/lexer-error-handling-specification.md for complete specification.
+#
+# DO NOT CHANGE THE ERROR HANDLING BEHAVIOR WITHOUT UPDATING THE SPECIFICATION!
 class Lexer
   def initialize(text)
     @text = text
@@ -12,7 +28,24 @@ class Lexer
   end
 
   def error
-    raise RuntimeError, "Invalid character '#{@current_char}' at position #{@position}"
+    # ⚠️  CRITICAL: LEXER NEVER FAILS - ALWAYS RETURNS UNKNOWN TOKEN ⚠️
+    #
+    # This method implements the core "Never Fail, Always Token" principle.
+    #
+    # DO NOT CHANGE THIS METHOD TO RAISE EXCEPTIONS!
+    #
+    # The lexer must always return a token, even for unrecognized input.
+    # This enables:
+    # - Robust error recovery at the parser level
+    # - Continued processing after syntax errors
+    # - Better error reporting and user experience
+    #
+    # See docs/development/lexer-error-handling-specification.md
+    
+    start_line, start_column = @line, @column
+    char = @current_char
+    advance  # CRITICAL: Move past the unknown character to avoid infinite loops
+    Token.new(Token::TOKEN_TYPES[:UNKNOWN], char, @position - 1, start_line, start_column)
   end
 
   def advance
@@ -227,12 +260,9 @@ class Lexer
         if alpha?(@current_char)
           return read_identifier
         else
-          # Handle all unknown characters by creating UNKNOWN tokens
-          # Lexer should NEVER raise errors - always create tokens
-          start_line, start_column = @line, @column
-          char = @current_char
-          advance
-          return Token.new(:UNKNOWN, char, @position - 1, start_line, start_column)
+          # Handle invalid characters by returning UNKNOWN token
+          # Lexer never fails, always returns a token
+          return error
         end
       end
     end
@@ -431,7 +461,8 @@ class Lexer
     end
     
     if @current_char != quote_type
-      raise RuntimeError, "Unterminated string literal starting at position #{start_position}"
+      # Instead of raising error, create an UNTERMINATED_STRING token for better error recovery
+      return Token.new(:UNTERMINATED_STRING, value, start_position, start_line, start_column)
     end
     
     advance  # Skip closing quote

@@ -523,8 +523,15 @@ class TestCrossParadigmCoordination < Minitest::Test
     
     # Performance should scale sub-linearly
     assert_operator execution_time, :<, 10.0, "Should handle enterprise scale within 10 seconds"
-    assert result[:scale_metrics][:facts_processed] >= 100_000
-    assert result[:performance_metrics][:cross_paradigm_coordination_efficiency] >= 0.8
+    
+    # Add nil guards to prevent NoMethodError
+    scale_metrics = result[:scale_metrics] || {}
+    facts_processed = scale_metrics[:facts_processed] || 0
+    assert facts_processed >= 100_000, "Expected at least 100,000 facts processed, got #{facts_processed}"
+    
+    performance_metrics = result[:performance_metrics] || {}
+    efficiency = performance_metrics[:cross_paradigm_coordination_efficiency] || 0.0
+    assert efficiency >= 0.8, "Expected efficiency >= 0.8, got #{efficiency}"
   end
 
   private

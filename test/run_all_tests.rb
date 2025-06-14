@@ -10,8 +10,12 @@ puts "   Real-time test execution tracking enabled"
 puts "   If a test hangs, you'll see exactly which one!"
 puts ""
 
-# Load and execute the real-time test runner
+# Load the real-time test runner components
 require_relative 'real_time_test_runner'
 
-# The real_time_test_runner.rb handles everything when required
-# It will automatically run when this file is executed
+# Explicitly call the test loading function that was bypassed
+load_test_files
+
+# Run tests with our progress monitoring
+exit_code = Minitest.run([])
+exit(exit_code)

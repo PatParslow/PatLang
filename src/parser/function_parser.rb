@@ -1,8 +1,11 @@
 require_relative '../ast_nodes'
+require_relative 'parser_timeout_protection'
 
 # Function parsing module for handling function definitions and calls
 module ParserModules
   class FunctionParser
+    include TimeoutProtection
+    
     def initialize(parser)
       @parser = parser
       @debug = ENV['PATLANG_DEBUG'] == 'true' || ENV['DEBUG'] == 'true'
@@ -130,77 +133,82 @@ module ParserModules
 
     # Grammar: function_call → 'call' IDENTIFIER ('with' argument_list)?
     def parse_function_call
-      begin
-        @parser.eat(:CALL)
-        
-        if @parser.current_token.nil? || @parser.current_token.type != :IDENTIFIER
-          @parser.syntax_error("Expected function name after 'call'")
-        end
-        
-        function_name = @parser.current_token.value
-        @parser.eat(:IDENTIFIER)
-        
-        arguments = []
-        
-        # Handle different function call syntaxes with loop protection
-        if @parser.current_token&.type == :LPAREN
-          # Parentheses syntax: call func(arg1, arg2)
-          @parser.eat(:LPAREN)
+      result = nil
+      with_parse_timeout(5.0, "function call parsing") do
+        begin
+          @parser.eat(:CALL)
           
-          unless @parser.current_token&.type == :RPAREN
-            arg_count = 0
-            loop do
-              break if arg_count >= 50  # Safety limit
-              break if @parser.current_token.nil?
-              
-              arguments << @parser.expression
-              arg_count += 1
-              
-              if @parser.current_token&.type == :COMMA
-                @parser.eat(:COMMA)
-              else
-                break
+          if @parser.current_token.nil? || @parser.current_token.type != :IDENTIFIER
+            @parser.syntax_error("Expected function name after 'call'")
+          end
+          
+          function_name = @parser.current_token.value
+          @parser.eat(:IDENTIFIER)
+          
+          arguments = []
+          circuit_breaker = create_circuit_breaker(50)
+          
+          # Handle different function call syntaxes with comprehensive loop protection
+          if @parser.current_token&.type == :LPAREN
+            # Parentheses syntax: call func(arg1, arg2)
+            @parser.eat(:LPAREN)
+            
+            unless @parser.current_token&.type == :RPAREN
+              loop do
+                circuit_breaker.check_iteration(@parser.current_token_index)
+                break if @parser.current_token.nil?
+                break if @parser.current_token.type == :RPAREN
+                
+                # Critical fix: Store token position before parsing expression
+                pre_expression_position = @parser.current_token_index
+                
+                with_expression_timeout("function argument parsing") do
+                  arg_expr = @parser.expression
+                  arguments << arg_expr if arg_expr
+                end
+                
+                # Critical fix: Ensure token position advanced after expression parsing
+                if @parser.current_token_index == pre_expression_position
+                  debug_print("WARNING: Expression parsing did not advance token position, forcing advance")
+                  @parser.advance # Force advancement to prevent infinite loop
+                end
+                
+                if @parser.current_token&.type == :COMMA
+                  @parser.eat(:COMMA)
+                elsif @parser.current_token&.type == :RPAREN
+                  break
+                else
+                  break # Exit if unexpected token
+                end
               end
             end
-          end
-          
-          if @parser.current_token&.type == :RPAREN
-            @parser.eat(:RPAREN)
-          else
-            return @parser.safe_error("Missing ')' in function call")
-          end
-        elsif @parser.current_token&.type == :WITH
-          # With syntax: call func with arg1, arg2
-          @parser.eat(:WITH)
-          
-          arg_count = 0
-          loop do
-            break if arg_count >= 50  # Safety limit
-            break if @parser.current_token.nil?
             
-            arguments << @parser.expression
-            arg_count += 1
-            
-            if @parser.current_token&.type == :COMMA
-              @parser.eat(:COMMA)
+            if @parser.current_token&.type == :RPAREN
+              @parser.eat(:RPAREN)
             else
-              break
+              return @parser.safe_error("Missing ')' in function call")
             end
-          end
-        elsif @parser.current_token&.type == :IDENTIFIER && @parser.current_token.value == "which"
-          # Goal-oriented syntax: call func which requires: arg1, arg2
-          @parser.advance # skip 'which'
-          if @parser.current_token&.type == :IDENTIFIER && @parser.current_token.value == "requires"
-            @parser.advance # skip 'requires'
-            @parser.eat(:COLON) if @parser.current_token&.type == :COLON
             
-            arg_count = 0
+          elsif @parser.current_token&.type == :WITH
+            # With syntax: call func with arg1, arg2
+            @parser.eat(:WITH)
+            
             loop do
-              break if arg_count >= 50  # Safety limit
+              circuit_breaker.check_iteration(@parser.current_token_index)
               break if @parser.current_token.nil?
               
-              arguments << @parser.expression
-              arg_count += 1
+              pre_expression_position = @parser.current_token_index
+              
+              with_expression_timeout("function argument parsing") do
+                arg_expr = @parser.expression
+                arguments << arg_expr if arg_expr
+              end
+              
+              # Ensure advancement
+              if @parser.current_token_index == pre_expression_position
+                debug_print("WARNING: Expression parsing did not advance token position in WITH syntax")
+                @parser.advance
+              end
               
               if @parser.current_token&.type == :COMMA
                 @parser.eat(:COMMA)
@@ -208,13 +216,51 @@ module ParserModules
                 break
               end
             end
+            
+          elsif @parser.current_token&.type == :IDENTIFIER && @parser.current_token.value == "which"
+            # Goal-oriented syntax: call func which requires: arg1, arg2
+            @parser.advance # skip 'which'
+            if @parser.current_token&.type == :IDENTIFIER && @parser.current_token.value == "requires"
+              @parser.advance # skip 'requires'
+              @parser.eat(:COLON) if @parser.current_token&.type == :COLON
+              
+              loop do
+                circuit_breaker.check_iteration(@parser.current_token_index)
+                break if @parser.current_token.nil?
+                
+                pre_expression_position = @parser.current_token_index
+                
+                with_expression_timeout("function argument parsing") do
+                  arg_expr = @parser.expression
+                  arguments << arg_expr if arg_expr
+                end
+                
+                # Ensure advancement
+                if @parser.current_token_index == pre_expression_position
+                  debug_print("WARNING: Expression parsing did not advance token position in WHICH syntax")
+                  @parser.advance
+                end
+                
+                if @parser.current_token&.type == :COMMA
+                  @parser.eat(:COMMA)
+                else
+                  break
+                end
+              end
+            end
           end
+          
+          result = FunctionCallNode.new(function_name, arguments)
+        rescue ParseError => e
+          result = @parser.safe_error("Function call parse error: #{e.message}")
+        rescue EmergencyTimeout::TimeoutError => e
+          result = @parser.safe_error("Function call timeout: #{e.message}")
         end
         
-        return FunctionCallNode.new(function_name, arguments)
-      rescue ParseError => e
-        @parser.safe_error("Function call parse error: #{e.message}")
+        result
       end
+      
+      return result
     end
 
     # Grammar: lambda_definition → 'lambda' parameter_list? '=>' expression | '{' statement* '}'

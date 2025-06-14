@@ -2,7 +2,7 @@
 
 require_relative 'src/lexer'
 require_relative 'src/parser'
-require_relative 'src/parse_error'
+require_relative 'src/exceptions'
 
 # Safe test script to validate parser edge case handling without infinite loops
 class SafeParseErrorAnalysis

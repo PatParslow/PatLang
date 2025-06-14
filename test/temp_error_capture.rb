@@ -1,6 +1,6 @@
 require 'timeout'
 
-output_file = 'test/temp_test_output.txt'
+output_file = './temp_test_output.txt'
 
 begin
   Timeout::timeout(30) do
@@ -17,7 +17,7 @@ begin
         $LOAD_PATH.unshift(File.join(File.dirname(__FILE__), '..'))
         $LOAD_PATH.unshift(File.dirname(__FILE__))
         
-        load 'test/patlang_language/test_regression_core.rb'
+        load './infrastructure/test_type_constraint_parser.rb'
       end
     rescue => e
       File.open(output_file, 'a') do |f|

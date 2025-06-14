@@ -40,7 +40,7 @@ module EvaluatorModules
 
       # Bounds checking (1-based indexing)
       if index_value == 0 || zero_based_index < 0 || zero_based_index >= object_value.length
-        raise "String index #{index_value} out of bounds for string of length #{object_value.length} (1-based indexing)"
+        raise RuntimeError, "String index #{index_value} out of bounds for string of length #{object_value.length} (1-based indexing)"
       end
 
       object_value[zero_based_index]

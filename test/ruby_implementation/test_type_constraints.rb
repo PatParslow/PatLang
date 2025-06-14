@@ -379,7 +379,7 @@ class TypeConstraintSystem
     @event_handlers[event_type] << block
   end
 
-  def create_constraint(variable, type, data)
+  def create_constraint(variable, type, data, **options)
     # Check for conflicts
     existing = @constraints[variable] || []
     if type == :range && existing.any? { |c| c.constraint_type == :range }
@@ -573,15 +573,6 @@ class TypeConstraint
   end
 end
 
-class TypeConstraintViolation < StandardError
-  attr_reader :variable, :value
-
-  def initialize(variable, value, message)
-    @variable = variable
-    @value = value
-    super("Variable #{variable}: #{message}")
-  end
-end
 
 class ConstraintConflictError < StandardError; end
 class ConstraintViolationError < StandardError; end

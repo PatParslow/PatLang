@@ -32,7 +32,7 @@ module EvaluatorModules
         left_value * right_value
       when '/', 'divide', 'slash'
         if right_value == 0
-          raise "Division by zero"
+          raise ZeroDivisionError, "Division by zero"
         end
         left_value.to_f / right_value
       when '%', 'modulo'

@@ -117,7 +117,7 @@ class TestObjectModelEdgeCases < Minitest::Test
       inf_obj = NumberObject.new(Float::INFINITY)
       
       assert inf_obj.value.infinite?, "Should handle infinity"
-      assert_match(/inf/i, inf_obj.to_s), "Infinity string representation"
+      assert_match(/inf/i, inf_obj.to_s, "Infinity string representation")
     rescue LoadError, NameError
       assert true, "NumberObject implementation pending"
     end
@@ -129,7 +129,7 @@ class TestObjectModelEdgeCases < Minitest::Test
       nan_obj = NumberObject.new(Float::NAN)
       
       assert nan_obj.value.nan?, "Should handle NaN"
-      assert_match(/nan/i, nan_obj.to_s), "NaN string representation"
+      assert_match(/nan/i, nan_obj.to_s, "NaN string representation")
     rescue LoadError, NameError
       assert true, "NumberObject implementation pending"
     end
@@ -203,7 +203,7 @@ class TestObjectModelEdgeCases < Minitest::Test
         begin
           obj.call_method('to_s', [1, 2, 3, 4, 5])
         rescue ArgumentError => e
-          assert_match(/argument/i, e.message), "Should report argument count errors"
+          assert_match(/argument/i, e.message, "Should report argument count errors")
         end
       end
     rescue LoadError, NameError

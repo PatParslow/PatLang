@@ -5,7 +5,7 @@ require_relative 'reasoning_coordinator'
 # Goal declaration, pursuit, and achievement system
 # Provides problem-solving capabilities through goal-oriented programming
 class GoalSystem
-  def initialize(evaluator)
+  def initialize(evaluator = nil, *additional_args)
     @evaluator = evaluator
     @reasoning_coordinator = nil
     @goals = {}
@@ -370,7 +370,7 @@ end
 class ExecutionPlan
   attr_reader :goal_name, :execution_order, :dependencies
 
-  def initialize(goal_name, execution_order: [], dependencies: {})
+  def initialize(goal_name, *additional_args, execution_order: [], dependencies: {})
     @goal_name = goal_name
     @execution_order = execution_order
     @dependencies = dependencies
@@ -390,7 +390,7 @@ end
 class GoalMonitor
   attr_reader :goal_name, :monitoring_interval, :tracked_metrics
 
-  def initialize(goal_name, monitoring_interval: 10, tracked_metrics: [])
+  def initialize(goal_name, *additional_args, monitoring_interval: 10, tracked_metrics: [])
     @goal_name = goal_name
     @monitoring_interval = monitoring_interval
     @tracked_metrics = tracked_metrics

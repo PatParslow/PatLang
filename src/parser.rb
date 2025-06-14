@@ -1,17 +1,26 @@
 require_relative 'token'
 require_relative 'ast_nodes'
 require_relative 'ambiguous_token'
-require_relative 'parse_error'
+require_relative 'exceptions'
 require_relative 'parser/token_resolver'
 require_relative 'parser/expression_parser'
 require_relative 'parser/function_parser'
 require_relative 'parser/control_flow_parser'
+require_relative 'parser/type_constraint_parser'
+require_relative 'parser/parser_timeout_protection'
+require_relative 'object_model/event_system'
 
 # Parser class for parsing Patlang source code with modular architecture
+require_relative 'hash_extensions'
 class Parser
-  attr_reader :current_token
+  include EventSystem::EventCapable
+  include ParserModules::TimeoutProtection
+  attr_reader :current_token, :current_token_index
 
   def initialize(tokens_or_lexer)
+    # Initialize event system
+    initialize_event_system
+    
     # Handle both tokens array and lexer object
     if tokens_or_lexer.is_a?(Lexer)
       @tokens = tokens_or_lexer.tokenize
@@ -26,6 +35,7 @@ class Parser
     @expression_parser = ParserModules::ExpressionParser.new(self)
     @function_parser = ParserModules::FunctionParser.new(self)
     @control_flow_parser = ParserModules::ControlFlowParser.new(self)
+    @type_constraint_parser = ParserModules::TypeConstraintParser.new(self)
   end
 
   def error(message = "Parse error")
@@ -88,22 +98,42 @@ class Parser
     end
   end
 
-  # Enhanced parse method with token resolution
+  # Enhanced parse method with comprehensive timeout protection
   def parse
-    @tokens = @token_resolver.resolve_all_ambiguous_tokens
-    @current_token_index = 0
-    @current_token = @tokens[0] if @tokens.length > 0
-    program
+    with_parse_timeout(15.0, "main parse operation") do
+      @tokens = @token_resolver.resolve_all_ambiguous_tokens
+      @current_token_index = 0
+      @current_token = @tokens[0] if @tokens.length > 0
+      program
+    end
+  rescue EmergencyTimeout::TimeoutError => e
+    safe_error("Parser timeout: #{e.message}")
   end
 
-  # Grammar: program → statement*
+  # Grammar: program → statement* with loop protection
   def program
     statements = []
+    circuit_breaker = create_circuit_breaker(1000)
+    
     while @current_token && @current_token.type != :EOF
+      circuit_breaker.check_iteration(@current_token_index)
+      
+      # Store position before parsing statement
+      pre_statement_position = @current_token_index
+      
       stmt = statement
       statements << stmt if stmt
+      
+      # Critical protection: ensure position advances after each statement
+      if @current_token_index == pre_statement_position && @current_token
+        puts "[Parser WARNING] Statement parsing did not advance token position, forcing advance"
+        advance # Force advancement to prevent infinite loop
+      end
     end
+    
     return statements.length == 1 ? statements[0] : BlockNode.new(statements)
+  rescue EmergencyTimeout::TimeoutError => e
+    safe_error("Program parsing timeout: #{e.message}")
   end
 
   # Grammar: statement → assignment | expression | function_definition | function_call | control_flow
@@ -161,8 +191,12 @@ class Parser
     when :PURSUE
       return parse_pursue
     when :IDENTIFIER
-      # CRITICAL FIX: Check for assignment BEFORE falling through to expression
-      if peek(1)&.type == :ASSIGN || peek(1)&.type == :IS
+      # CRITICAL FIX: Check for type annotation and assignment BEFORE falling through to expression
+      if peek(1)&.type == :DOUBLE_COLON
+        return @type_constraint_parser.parse_type_annotation
+      elsif peek(1)&.type == :COLON
+        return @type_constraint_parser.parse_typed_assignment
+      elsif peek(1)&.type == :ASSIGN || peek(1)&.type == :IS
         return parse_assignment
       elsif is_property_assignment?
         return parse_property_assignment
@@ -796,3 +830,7 @@ class Parser
     variables.uniq
   end
 end
+# Parser constants
+STATEMENT_KEYWORDS = %w[def if while for class module].freeze
+EXPRESSION_KEYWORDS = %w[true false nil].freeze
+OPERATORS = %w[+ - * / % == != < > <= >= && || !].freeze

@@ -57,6 +57,11 @@ class VariableNode < ASTNode
     @name = name
   end
 
+  # Alias for compatibility with test expectations
+  def value
+    @name
+  end
+
   def to_s
     "VariableNode(#{@name})"
   end
@@ -433,5 +438,192 @@ class ErrorNode < ASTNode
   
   def to_s
     "ErrorNode(#{@message.inspect})"
+  end
+end
+
+# === Type Constraint AST Nodes ===
+
+# Node representing a type annotation (e.g., x :: Number)
+class TypeAnnotationNode < ASTNode
+  attr_reader :variable_name, :type_constraint
+
+  def initialize(variable_name, type_constraint)
+    @variable_name = variable_name
+    @type_constraint = type_constraint
+  end
+
+  def to_s
+    "TypeAnnotationNode(#{@variable_name} :: #{@type_constraint})"
+  end
+end
+
+# Node representing a generic type constraint (e.g., Array[Number])
+class GenericTypeConstraint < ASTNode
+  attr_reader :base_type, :type_parameters
+
+  def initialize(base_type, type_parameters)
+    @base_type = base_type
+    @type_parameters = type_parameters
+  end
+
+  def to_s
+    params = @type_parameters.map(&:to_s).join(', ')
+    "GenericTypeConstraint(#{@base_type}[#{params}])"
+  end
+end
+
+# Node representing a range constraint (e.g., Number(0..100))
+class RangeConstraint < ASTNode
+  attr_reader :base_type, :min_value, :max_value, :exclusive_max
+
+  def initialize(base_type, min_value, max_value, exclusive_max = false)
+    @base_type = base_type
+    @min_value = min_value
+    @max_value = max_value
+    @exclusive_max = exclusive_max
+  end
+
+  def exclusive_max?
+    @exclusive_max
+  end
+
+  def to_s
+    range_op = @exclusive_max ? '...' : '..'
+    "RangeConstraint(#{@base_type}(#{@min_value}#{range_op}#{@max_value}))"
+  end
+end
+
+# Node representing a pattern constraint (e.g., String(/regex/))
+class PatternConstraint < ASTNode
+  attr_reader :base_type, :pattern
+
+  def initialize(base_type, pattern)
+    @base_type = base_type
+    @pattern = pattern
+  end
+
+  def to_s
+    "PatternConstraint(#{@base_type}(#{@pattern.inspect}))"
+  end
+end
+
+# Node representing a structural constraint (e.g., {name: String, age: Number})
+class StructuralConstraint < ASTNode
+  attr_reader :field_constraints
+
+  def initialize(field_constraints)
+    @field_constraints = field_constraints
+  end
+
+  def to_s
+    fields = @field_constraints.map { |name, constraint| "#{name}: #{constraint}" }.join(', ')
+    "StructuralConstraint({#{fields}})"
+  end
+end
+
+# Node representing a union type constraint (e.g., Number | String)
+class UnionTypeConstraint < ASTNode
+  attr_reader :allowed_types
+
+  def initialize(allowed_types)
+    @allowed_types = allowed_types
+  end
+
+  def to_s
+    types = @allowed_types.map(&:to_s).join(' | ')
+    "UnionTypeConstraint(#{types})"
+  end
+end
+
+# Node representing a field constraint within a structural constraint
+class FieldConstraint < ASTNode
+  attr_reader :type_constraint, :required
+
+  def initialize(type_constraint, required = true)
+    @type_constraint = type_constraint
+    @required = required
+  end
+
+  def required?
+    @required
+  end
+
+  def to_s
+    req_marker = @required ? '!' : '?'
+    "FieldConstraint(#{@type_constraint}#{req_marker})"
+  end
+end
+
+# Enhanced AssignmentNode to support type constraints
+class TypedAssignmentNode < AssignmentNode
+  attr_reader :type_constraint
+
+  def initialize(name, type_constraint, expression)
+    super(name, expression)
+    @type_constraint = type_constraint
+  end
+
+  alias_method :variable_name, :name
+  alias_method :value, :expression
+
+  def to_s
+    "TypedAssignmentNode(#{@name}: #{@type_constraint} = #{@expression})"
+  end
+end
+
+# Enhanced FunctionDefinitionNode to support parameter and return type constraints
+class TypedFunctionDefinitionNode < ASTNode
+  attr_reader :function_name, :parameters, :return_type_constraint, :body
+
+  def initialize(function_name, parameters, return_type_constraint, body = nil)
+    @function_name = function_name
+    @parameters = parameters
+    @return_type_constraint = return_type_constraint
+    @body = body
+  end
+
+  def to_s
+    params = @parameters.map(&:to_s).join(', ')
+    "TypedFunctionDefinitionNode(#{@function_name}(#{params}) -> #{@return_type_constraint})"
+  end
+end
+
+# Node representing a function parameter with type constraint
+class ParameterNode < ASTNode
+  attr_reader :name, :type, :default_value, :required
+
+  def initialize(name, type = nil, default_value = nil, required = true)
+    @name = name
+    @type = type
+    @default_value = default_value
+    @required = required
+  end
+
+  def required?
+    @required
+  end
+
+  # Backward compatibility
+  def type_constraint
+    @type
+  end
+
+  def to_s
+    req_marker = @required ? '' : '?'
+    default_part = @default_value ? " = #{@default_value}" : ""
+    "ParameterNode(#{@name}#{req_marker}: #{@type}#{default_part})"
+  end
+end
+
+# Node representing a program with multiple statements
+class ProgramNode < ASTNode
+  attr_reader :statements
+
+  def initialize(statements)
+    @statements = statements
+  end
+
+  def to_s
+    "ProgramNode(#{@statements.length} statements)"
   end
 end

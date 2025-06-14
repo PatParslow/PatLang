@@ -3,11 +3,20 @@ require_relative '../object_model/patlang_object'
 # Robinson's Unification Algorithm Implementation
 # This is the core unification engine for Patlang's type inference system
 class UnificationEngine < PatlangObject
-  def initialize
+  def initialize(evaluator = nil)
     super("unification_engine", :unification_engine)
+    @evaluator = evaluator
     
     # Initialize the event system
     initialize_event_system
+    
+    # Initialize performance tracking
+    @unification_attempts = 0
+    @unification_successes = 0
+    @unification_failures = 0
+    @total_unification_time = 0.0
+    @cache_hits = 0
+    @occurs_check_calls = 0
     
     # Set up metadata for the PatlangObject
     set_metadata(:type, :unification_engine)
@@ -15,8 +24,11 @@ class UnificationEngine < PatlangObject
   end
   
   # Main unification method implementing Robinson's algorithm
-  def unify(term1, term2, substitution)
+  def unify(term1, term2, substitution = {})
     validate_inputs(term1, term2, substitution)
+    
+    start_time = Time.now
+    @unification_attempts += 1
     
     fire_event(:unification_started, {
       event_type: :unification_started,
@@ -27,37 +39,62 @@ class UnificationEngine < PatlangObject
     
     begin
       result = unify_internal(term1, term2, substitution)
+      execution_time = Time.now - start_time
+      @total_unification_time += execution_time
       
       if result
+        @unification_successes += 1
         fire_event(:unification_completed, {
           event_type: :unification_completed,
           term1: term1,
           term2: term2,
           success: true,
           substitution: substitution.dup,
+          execution_time: execution_time,
           timestamp: Time.now
         })
       else
+        @unification_failures += 1
         fire_event(:unification_failed, {
           event_type: :unification_failed,
           term1: term1,
           term2: term2,
           reason: "Terms do not unify",
+          execution_time: execution_time,
           timestamp: Time.now
         })
       end
       
       result
     rescue => error
+      execution_time = Time.now - start_time
+      @total_unification_time += execution_time
+      @unification_failures += 1
+      
       fire_event(:unification_failed, {
         event_type: :unification_failed,
         term1: term1,
         term2: term2,
         reason: error.message,
+        execution_time: execution_time,
         timestamp: Time.now
       })
       raise
     end
+  end
+  
+  # Statistics method for reasoning coordination integration
+  def statistics
+    {
+      unification_attempts: @unification_attempts,
+      unification_successes: @unification_successes,
+      unification_failures: @unification_failures,
+      success_rate: @unification_attempts > 0 ? (@unification_successes.to_f / @unification_attempts * 100).round(2) : 0.0,
+      total_unification_time: @total_unification_time.round(6),
+      average_unification_time: @unification_attempts > 0 ? (@total_unification_time / @unification_attempts).round(6) : 0.0,
+      occurs_check_calls: @occurs_check_calls,
+      cache_hits: @cache_hits
+    }
   end
   
   private
@@ -122,6 +159,7 @@ class UnificationEngine < PatlangObject
   end
   
   def occurs_check(var, term, substitution)
+    @occurs_check_calls += 1
     return false unless compound?(term)
     
     # Check if variable occurs in the term structure
@@ -176,12 +214,15 @@ class UnificationEngine < PatlangObject
   end
   
   def valid_term?(term)
-    # Valid terms: atoms (symbols), variables, compound terms, numbers, strings
-    term.is_a?(Symbol) || 
-    term.is_a?(TypeVariable) || 
+    # Valid terms: atoms (symbols), variables, compound terms, numbers, strings, AST nodes
+    term.is_a?(Symbol) ||
+    term.is_a?(TypeVariable) ||
     term.is_a?(Term) ||
     term.is_a?(Numeric) ||
-    term.is_a?(String)
+    term.is_a?(String) ||
+    term.respond_to?(:name) ||  # AST nodes like VariableNode
+    term.respond_to?(:class_name) ||  # Other AST node types
+    term.respond_to?(:function_name)  # Function call nodes
   end
   
 end

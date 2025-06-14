@@ -18,7 +18,14 @@ class CategoryTestRunner
   end
 
   def run_category(category)
-    puts "=== RUNNING #{@categories[category].upcase} ==="
+    category_description = @categories[category]
+    unless category_description
+      puts "❌ Unknown category: #{category}"
+      puts "Available categories: #{@categories.keys.join(', ')}"
+      return false
+    end
+    
+    puts "=== RUNNING #{category_description.upcase} ==="
     puts
 
     case category
@@ -30,10 +37,6 @@ class CategoryTestRunner
       run_patlang_language_tests
     when 'all'
       run_all_categories
-    else
-      puts "❌ Unknown category: #{category}"
-      puts "Available categories: #{@categories.keys.join(', ')}"
-      return false
     end
   end
 
@@ -60,6 +63,21 @@ class CategoryTestRunner
       puts "Loading #{category} tests..."
       load_category_tests(category)
     end
+  end
+
+  def show_usage
+    puts "USAGE: ruby test/run_category_tests.rb [CATEGORY]"
+    puts
+    puts "Available categories:"
+    @categories.each do |key, description|
+      puts "  #{key.ljust(20)} - #{description}"
+    end
+    puts
+    puts "Examples:"
+    puts "  ruby test/run_category_tests.rb infrastructure"
+    puts "  ruby test/run_category_tests.rb patlang_language"
+    puts "  ruby test/run_category_tests.rb all"
+    puts
   end
 
   private
@@ -133,20 +151,6 @@ class CategoryTestRunner
     true
   end
 
-  def show_usage
-    puts "USAGE: ruby test/run_category_tests.rb [CATEGORY]"
-    puts
-    puts "Available categories:"
-    @categories.each do |key, description|
-      puts "  #{key.ljust(20)} - #{description}"
-    end
-    puts
-    puts "Examples:"
-    puts "  ruby test/run_category_tests.rb infrastructure"
-    puts "  ruby test/run_category_tests.rb patlang_language" 
-    puts "  ruby test/run_category_tests.rb all"
-    puts
-  end
 end
 
 # Main execution

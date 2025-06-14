@@ -5,6 +5,7 @@ require_relative '../../src/ast_nodes'
 
 class TestParser < Minitest::Test
   def test_parse_simple_number
+    puts "[DEBUG] Starting test_parse_simple_number"
     lexer = Lexer.new("42")
     tokens = lexer.tokenize
     parser = Parser.new(tokens)
@@ -15,6 +16,7 @@ class TestParser < Minitest::Test
   end
 
   def test_parse_simple_addition
+    puts "[DEBUG] Starting test_parse_simple_addition"
     lexer = Lexer.new("2 + 3")
     tokens = lexer.tokenize
     parser = Parser.new(tokens)
@@ -29,6 +31,7 @@ class TestParser < Minitest::Test
   end
 
   def test_parse_simple_multiplication
+    puts "[DEBUG] Starting test_parse_simple_multiplication"
     lexer = Lexer.new("4 * 5")
     tokens = lexer.tokenize
     parser = Parser.new(tokens)
@@ -43,6 +46,7 @@ class TestParser < Minitest::Test
   end
 
   def test_parse_operator_precedence
+    puts "[DEBUG] Starting test_parse_operator_precedence"
     # 2 + 3 * 4 should parse as 2 + (3 * 4)
     lexer = Lexer.new("2 + 3 * 4")
     tokens = lexer.tokenize
@@ -62,6 +66,7 @@ class TestParser < Minitest::Test
   end
 
   def test_parse_parentheses
+    puts "[DEBUG] Starting test_parse_parentheses"
     # (2 + 3) * 4 should parse as (2 + 3) * 4
     lexer = Lexer.new("(2 + 3) * 4")
     tokens = lexer.tokenize
@@ -83,6 +88,7 @@ class TestParser < Minitest::Test
   end
 
   def test_parse_complex_expression
+    puts "[DEBUG] Starting test_parse_complex_expression"
     # 1 + 2 * 3 + 4 should parse as ((1 + (2 * 3)) + 4)
     lexer = Lexer.new("1 + 2 * 3 + 4")
     tokens = lexer.tokenize
@@ -109,6 +115,7 @@ class TestParser < Minitest::Test
   end
 
   def test_parse_all_operators
+    puts "[DEBUG] Starting test_parse_all_operators"
     # Test all four operators: 8 / 2 - 1
     lexer = Lexer.new("8 / 2 - 1")
     tokens = lexer.tokenize
@@ -130,6 +137,7 @@ class TestParser < Minitest::Test
   end
 
   def test_parse_empty_expression
+    puts "[DEBUG] Starting test_parse_empty_expression"
     lexer = Lexer.new("")
     tokens = lexer.tokenize
     parser = Parser.new(tokens)
@@ -143,6 +151,7 @@ class TestParser < Minitest::Test
   
   # Tests for new AST node classes
   def test_variable_node_creation
+    puts "[DEBUG] Starting test_variable_node_creation"
     node = VariableNode.new("x")
     
     assert_instance_of VariableNode, node
@@ -151,6 +160,7 @@ class TestParser < Minitest::Test
   end
   
   def test_variable_node_with_different_names
+    puts "[DEBUG] Starting test_variable_node_with_different_names"
     node1 = VariableNode.new("result")
     node2 = VariableNode.new("myVar")
     
@@ -161,6 +171,7 @@ class TestParser < Minitest::Test
   end
   
   def test_assignment_node_creation
+    puts "[DEBUG] Starting test_assignment_node_creation"
     expr = NumberNode.new(42)
     node = AssignmentNode.new("x", expr)
     
@@ -171,6 +182,7 @@ class TestParser < Minitest::Test
   end
   
   def test_assignment_node_with_complex_expression
+    puts "[DEBUG] Starting test_assignment_node_with_complex_expression"
     # Test assignment with a binary operation: y = x + 5
     var_node = VariableNode.new("x")
     num_node = NumberNode.new(5)
@@ -184,6 +196,7 @@ class TestParser < Minitest::Test
   end
   
   def test_assignment_node_with_variable_expression
+    puts "[DEBUG] Starting test_assignment_node_with_variable_expression"
     # Test assignment with just a variable: result = x
     var_expr = VariableNode.new("x")
     assignment = AssignmentNode.new("result", var_expr)
@@ -194,6 +207,7 @@ class TestParser < Minitest::Test
   end
   # Tests for variable assignment parsing
   def test_parse_simple_assignment
+    puts "[DEBUG] Starting test_parse_simple_assignment"
     lexer = Lexer.new("x = 42")
     tokens = lexer.tokenize
     parser = Parser.new(tokens)
@@ -206,6 +220,7 @@ class TestParser < Minitest::Test
   end
   
   def test_parse_assignment_with_complex_expression
+    puts "[DEBUG] Starting test_parse_assignment_with_complex_expression"
     # result = x + y * 2
     lexer = Lexer.new("result = x + y * 2")
     tokens = lexer.tokenize
@@ -234,6 +249,7 @@ class TestParser < Minitest::Test
   end
   
   def test_parse_assignment_with_variable_expression
+    puts "[DEBUG] Starting test_parse_assignment_with_variable_expression"
     # result = x
     lexer = Lexer.new("result = x")
     tokens = lexer.tokenize
@@ -247,6 +263,7 @@ class TestParser < Minitest::Test
   end
   
   def test_parse_variable_reference_simple
+    puts "[DEBUG] Starting test_parse_variable_reference_simple"
     lexer = Lexer.new("x")
     tokens = lexer.tokenize
     parser = Parser.new(tokens)
@@ -257,6 +274,7 @@ class TestParser < Minitest::Test
   end
   
   def test_parse_variable_reference_in_expression
+    puts "[DEBUG] Starting test_parse_variable_reference_in_expression"
     # x + 5
     lexer = Lexer.new("x + 5")
     tokens = lexer.tokenize
@@ -272,6 +290,7 @@ class TestParser < Minitest::Test
   end
   
   def test_parse_complex_variable_expression
+    puts "[DEBUG] Starting test_parse_complex_variable_expression"
     # x * y + z
     lexer = Lexer.new("x * y + z")
     tokens = lexer.tokenize
@@ -295,6 +314,7 @@ class TestParser < Minitest::Test
   end
   
   def test_parse_variables_with_parentheses
+    puts "[DEBUG] Starting test_parse_variables_with_parentheses"
     # (x + y) * z
     lexer = Lexer.new("(x + y) * z")
     tokens = lexer.tokenize

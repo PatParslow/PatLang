@@ -1,7 +1,9 @@
 # frozen_string_literal: true
 
 require_relative 'unification_engine'
+require_relative 'type_constraint_system'
 require_relative 'type_constraint'
+require_relative '../exceptions'
 
 # Unified reasoning coordinator that integrates type inference, goals, and logic programming
 # This is a minimal stub implementation for Phase 1 TDD
@@ -505,7 +507,3 @@ class Goal
     end
   end
 end
-
-# Exception classes
-class ReasoningModeError < StandardError; end
-class LogicError < StandardError; end

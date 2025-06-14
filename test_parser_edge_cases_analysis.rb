@@ -2,7 +2,7 @@
 
 require_relative 'src/lexer'
 require_relative 'src/parser'
-require_relative 'src/parse_error'
+require_relative 'src/exceptions'
 
 # Test script to identify specific ParseError cases and edge case handling
 class ParseErrorAnalysis

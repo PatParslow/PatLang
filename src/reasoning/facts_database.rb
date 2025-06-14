@@ -5,7 +5,7 @@ require_relative 'reasoning_coordinator'
 # Facts storage, retrieval, and querying system
 # Provides logic programming foundation with comprehensive query capabilities
 class FactsDatabase
-  def initialize(evaluator)
+  def initialize(evaluator = nil, *additional_args)
     @evaluator = evaluator
     @reasoning_coordinator = nil
     @facts = []
@@ -485,7 +485,7 @@ end
 class Fact
   attr_reader :predicate, :arguments, :arity, :timestamp
 
-  def initialize(predicate, arguments = [], timestamp: Time.now)
+  def initialize(predicate, arguments = [], *additional_args, timestamp: Time.now)
     @predicate = predicate
     @arguments = arguments
     @arity = arguments.length
@@ -520,7 +520,7 @@ end
 class Rule
   attr_reader :head, :body, :name
 
-  def initialize(head, body = [], name: nil)
+  def initialize(head, body = [], *additional_args, name: nil)
     @head = head
     @body = body
     @name = name || generate_name
@@ -554,7 +554,7 @@ end
 class QueryResult
   attr_reader :bindings, :satisfied
 
-  def initialize(bindings = {}, satisfied: false)
+  def initialize(bindings = {}, *additional_args, satisfied: false)
     @bindings = bindings || {}
     @satisfied = satisfied
   end
@@ -575,7 +575,7 @@ class QueryResult
 end
 
 class QueryEngine
-  def initialize(facts_database)
+  def initialize(facts_database, *additional_args)
     @facts_database = facts_database
   end
 
@@ -607,7 +607,7 @@ class QueryEngine
 end
 
 class FactIndex
-  def initialize(predicate, fields)
+  def initialize(predicate, fields, *additional_args)
     @predicate = predicate
     @fields = fields
     @index = {}

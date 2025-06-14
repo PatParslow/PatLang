@@ -151,6 +151,21 @@ end
       @event_subscriptions = {}
     end
     
+    # CRITICAL FIX: Add cleanup method to prevent memory leaks
+    def cleanup_event_system
+      # Clear all subscriptions
+      clear_all_subscriptions if respond_to?(:clear_all_subscriptions)
+      
+      # Clear event registries
+      @instance_event_registry&.clear_history
+      @cross_object_event_registry&.clear_history if @cross_object_event_registry
+      
+      # Clear handlers
+      @instance_event_registry = EventRegistry.new if @instance_event_registry
+      @cross_object_event_registry = nil
+      @event_subscriptions&.clear
+    end
+    
     # Instance-level event handling
     def on_event(event_type, &block)
       initialize_event_system unless @instance_event_registry

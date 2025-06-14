@@ -1,219 +1,34 @@
 # frozen_string_literal: true
 
 require_relative 'unification_engine'
+require_relative '../exceptions'
 
-# Type constraint system for unified reasoning
-# This is a minimal stub implementation for Phase 1 TDD
-class TypeConstraintSystem
-  def initialize
-    @constraints = {}
-    @variables = {}
-    @relationships = {}
-    @event_handlers = {}
-    @constraint_count = 0
-  end
-
-  # Register event handlers for constraint events
-  def on_event(event_type, &block)
-    @event_handlers[event_type] ||= []
-    @event_handlers[event_type] << block
-  end
-
-  # Create a new type constraint
-  def create_constraint(variable, constraint_type, constraint_data, **options)
-    @constraint_count += 1
-    
-    # Check for conflicts with existing constraints
-    existing_constraints = @constraints[variable] || []
-    check_constraint_conflicts!(variable, constraint_type, constraint_data, existing_constraints)
-    
-    constraint = TypeConstraint.new(variable, constraint_type, constraint_data, **options)
-    @constraints[variable] ||= []
-    @constraints[variable] << constraint
-    
-    fire_event(:constraint_created, {
-      variable: variable,
-      constraint: constraint,
-      constraint_id: @constraint_count
-    })
-    
-    constraint
-  end
-
-  # Get all constraints for a variable
-  def get_constraints(variable)
-    @constraints[variable] || []
-  end
-
-  # Check if a variable satisfies all its constraints
-  def variable_satisfies?(variable, value)
-    constraints = get_constraints(variable)
-    return true if constraints.empty?
-    
-    constraints.compact.all? do |constraint|
-      result = constraint.satisfies?(value)
-      fire_event(:constraint_validated, {
-        variable: variable,
-        value: value,
-        constraint: constraint,
-        result: result
-      })
-      result
-    end
-  end
-
-  # Set a variable's value and trigger propagation
-  def set_variable_value(variable, value)
-    unless variable_satisfies?(variable, value)
-      violated_constraints = get_constraints(variable).compact.reject { |c| c.satisfies?(value) }
-      raise ConstraintViolationError.new(
-        "Value #{value} violates constraints for #{variable}",
-        variable: variable,
-        value: value,
-        constraints: violated_constraints
-      )
-    end
-    
-    @variables[variable] = value
-    propagate_from(variable)
-  end
-
-  # Get a variable's current value
-  def get_variable_value(variable)
-    @variables[variable]
-  end
-
-  # Add a relationship between variables for propagation
-  def add_relationship(from_var, to_var, transform)
-    @relationships[from_var] ||= []
-    @relationships[from_var] << {
-      target: to_var,
-      transform: transform
-    }
-  end
-
-  # Get total number of constraints in the system
-  def constraint_count
-    @constraints.values.flatten.length
-  end
-
-  # Remove all constraints for a variable (for cleanup)
-  def remove_constraints(variable)
-    removed = @constraints.delete(variable) || []
-    @variables.delete(variable)
-    
-    removed.each do |constraint|
-      fire_event(:constraint_removed, {
-        variable: variable,
-        constraint: constraint
-      })
-    end
-    
-    removed.length
-  end
-
-  private
-
-  def check_constraint_conflicts!(variable, new_type, new_data, existing_constraints)
-    case new_type
-    when :range
-      existing_range = existing_constraints.find { |c| c.constraint_type == :range }
-      if existing_range && !ranges_compatible?(existing_range.constraint_data, new_data)
-        raise ConstraintConflictError.new(
-          "Range constraint conflict for variable :#{variable}",
-          variable: variable,
-          existing_constraint: existing_range,
-          new_constraint_type: new_type,
-          new_constraint_data: new_data
-        )
-      end
-    when :type
-      existing_type = existing_constraints.find { |c| c.constraint_type == :type }
-      if existing_type && existing_type.constraint_data != new_data
-        raise ConstraintConflictError.new(
-          "Type constraint conflict for variable :#{variable}",
-          variable: variable,
-          existing_constraint: existing_type,
-          new_constraint_type: new_type,
-          new_constraint_data: new_data
-        )
-      end
-    end
-  end
-
-  def ranges_compatible?(range1, range2)
-    # Two ranges are compatible if they overlap
-    return false if range1.max < range2.min || range2.max < range1.min
-    true
-  end
-
-  def propagate_from(variable)
-    relationships = @relationships[variable] || []
-    source_value = @variables[variable]
-    
-    relationships.each do |rel|
-      begin
-        new_value = rel[:transform].call(source_value)
-        target_var = rel[:target]
-        
-        # Check if new value satisfies target constraints
-        unless variable_satisfies?(target_var, new_value)
-          raise ConstraintViolationError.new(
-            "propagation conflict: #{new_value} violates constraints for #{target_var}",
-            variable: target_var,
-            value: new_value,
-            source_variable: variable,
-            source_value: source_value
-          )
-        end
-        
-        @variables[target_var] = new_value
-        fire_event(:type_refined, {
-          variable: target_var,
-          new_value: new_value,
-          source: variable,
-          source_value: source_value
-        })
-        
-        # Continue propagation from target variable
-        propagate_from(target_var)
-        
-      rescue => e
-        fire_event(:propagation_failed, {
-          source_variable: variable,
-          target_variable: rel[:target],
-          error: e.message
-        })
-        raise
-      end
-    end
-  end
-
-  def fire_event(event_type, data)
-    handlers = @event_handlers[event_type]
-    return unless handlers
-    
-    handlers.each do |handler|
-      begin
-        handler.call(data.merge(event_type: event_type, timestamp: Time.now))
-      rescue => e
-        warn "Event handler error for #{event_type}: #{e.message}"
-      end
-    end
-  end
-end
+# Type constraint classes for unified reasoning
+# TypeConstraintSystem is defined in type_constraint_system.rb to avoid conflicts
 
 # Individual type constraint
 class TypeConstraint
   attr_reader :variable, :constraint_type, :constraint_data, :conditions
 
-  def initialize(variable, constraint_type, constraint_data, **options)
-    @variable = variable.to_sym
-    @constraint_type = constraint_type.to_sym
-    @constraint_data = constraint_data
+  def initialize(variable, constraint_type, constraint_data = nil, conditions_or_options = nil, **options)
+  @variable = variable.to_sym
+  @constraint_type = constraint_type.to_sym
+  @constraint_data = constraint_data
+  
+  # Handle both old 4-argument style and new flexible style
+  if conditions_or_options.is_a?(Array) || conditions_or_options.is_a?(Hash)
+    if conditions_or_options.is_a?(Array)
+      @conditions = conditions_or_options
+      @metadata = options[:metadata] || {}
+    else
+      @conditions = conditions_or_options[:conditions] || []
+      @metadata = conditions_or_options[:metadata] || {}
+    end
+  else
     @conditions = options[:conditions] || []
     @metadata = options[:metadata] || {}
   end
+end
 
   # Check if a value satisfies this constraint
   def satisfies?(value)
@@ -244,7 +59,18 @@ class TypeConstraint
 
   # Check if this constraint has additional conditions
   def has_condition?
-    @conditions&.any? || false
+    return false unless @conditions
+    
+    # Handle different condition types
+    case @conditions
+    when Array
+      @conditions.any?
+    when String
+      !@conditions.empty?
+    else
+      # For AST nodes like BinaryOpNode or other objects
+      !@conditions.nil?
+    end
   end
 
   # Check if this constraint respects object metadata
@@ -407,16 +233,6 @@ class TypeConstraint
   end
 end
 
-# Exception classes
-class TypeConstraintViolation < StandardError
-  attr_reader :variable, :value
-
-  def initialize(variable, value, message)
-    @variable = variable
-    @value = value
-    super("Variable #{variable}: #{message}")
-  end
-end
 
 class ConstraintConflictError < StandardError
   attr_reader :variable, :existing_constraint, :new_constraint_type, :new_constraint_data
