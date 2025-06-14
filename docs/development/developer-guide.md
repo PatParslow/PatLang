@@ -1153,6 +1153,7 @@ bundle exec ruby tools/leak_detector.rb
 - [`interpreter-architecture.md`](interpreter-architecture.md) - Core interpreter design and component interactions
 - [`language-reference.md`](language-reference.md) - Complete language specification and grammar
 - [`syntax.md`](syntax.md) - Detailed syntax rules and examples
+- [`lexer-error-handling-specification.md`](lexer-error-handling-specification.md) - **CRITICAL**: Lexer error handling requirements
 
 **Development Planning:**
 - [`devplan.md`](devplan.md) - 22-week development timeline and milestones  

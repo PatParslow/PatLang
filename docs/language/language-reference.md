@@ -125,6 +125,12 @@ statement = declaration | assignment | expression_statement | control_flow_state
 
 ### Lexical Elements
 
+#### Lexer Error Handling
+
+**Important**: The Patlang lexer is designed for robustness and never fails on unrecognized input. When encountering invalid characters or malformed tokens, the lexer returns special token types (UNKNOWN, UNTERMINATED_STRING, etc.) rather than raising exceptions. This enables better error recovery and user experience.
+
+For implementation details, see [`docs/development/lexer-error-handling-specification.md`](../development/lexer-error-handling-specification.md).
+
 #### Comments
 
 ```patlang
