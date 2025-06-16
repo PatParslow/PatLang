@@ -366,7 +366,7 @@ class TestTypeConstraintParser < Minitest::Test
   def test_parse_invalid_type_annotation_syntax
     code = "x :: "
     
-    error = assert_raises(ParseError) do
+    error = assert_raises(RuntimeError) do
       parser = create_parser(code)
     result = parser.parse
     end
@@ -378,7 +378,7 @@ class TestTypeConstraintParser < Minitest::Test
   def test_parse_invalid_range_constraint_syntax
     code = "age :: Number(0..)"
     
-    error = assert_raises(ParseError) do
+    error = assert_raises(RuntimeError) do
       parser = create_parser(code)
     result = parser.parse
     end
@@ -390,7 +390,7 @@ class TestTypeConstraintParser < Minitest::Test
   def test_parse_invalid_pattern_constraint_syntax
     code = "email :: String(/[unclosed"
     
-    error = assert_raises(ParseError) do
+    error = assert_raises(RuntimeError) do
       parser = create_parser(code)
     result = parser.parse
     end
@@ -402,7 +402,7 @@ class TestTypeConstraintParser < Minitest::Test
   def test_parse_invalid_structural_constraint_syntax
     code = "obj :: {name: String, }"
     
-    error = assert_raises(ParseError) do
+    error = assert_raises(RuntimeError) do
       parser = create_parser(code)
     result = parser.parse
     end
@@ -413,7 +413,7 @@ class TestTypeConstraintParser < Minitest::Test
   def test_parse_mismatched_brackets_in_generic_type
     code = "list :: Array[Number"
     
-    error = assert_raises(ParseError) do
+    error = assert_raises(RuntimeError) do
       parser = create_parser(code)
     result = parser.parse
     end

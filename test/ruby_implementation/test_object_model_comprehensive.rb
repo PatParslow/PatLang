@@ -221,9 +221,9 @@ class TestObjectModelComprehensive < Minitest::Test
     received_events = []
     
     # Create multiple subscriptions
-    sub1 = obj1.subscribe_to(obj2, :event1) { |e| received_events << "sub1_#{e[:type]}" }
-    sub2 = obj1.subscribe_to(obj2, :event2) { |e| received_events << "sub2_#{e[:type]}" }
-    sub3 = obj1.subscribe_to(obj2) { |e| received_events << "sub3_#{e[:type]}" }  # Global subscription
+    sub1 = obj1.subscribe_to(obj2, :event1) { |e| received_events << "sub1_#{e[:event_type]}" }
+    sub2 = obj1.subscribe_to(obj2, :event2) { |e| received_events << "sub2_#{e[:event_type]}" }
+    sub3 = obj1.subscribe_to(obj2) { |e| received_events << "sub3_#{e[:event_type]}" }  # Global subscription
     
     # Fire events
     obj2.fire_event(:event1, {})
@@ -322,7 +322,7 @@ class TestObjectModelComprehensive < Minitest::Test
     
     assert_equal 1, failed_messages.length
     failed_event = failed_messages.first
-    assert_equal :message_failed, failed_event[:type]
+    assert_equal :message_failed, failed_event[:event_type]
     assert_includes failed_event[:data][:error], "Message processing error"
   end
 
@@ -601,7 +601,7 @@ class TestObjectModelComprehensive < Minitest::Test
     assert_equal 2, operation_events.length  # One for each operand
     
     event = operation_events.first
-    assert_equal :operation_performed, event[:type]
+    assert_equal :operation_performed, event[:event_type]
     assert_equal :add, event[:data][:operation]
     assert_equal obj1.object_id, event[:data][:left_operand]
     assert_equal obj2.object_id, event[:data][:right_operand]

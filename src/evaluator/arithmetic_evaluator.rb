@@ -1,4 +1,5 @@
 require_relative '../ast_nodes'
+require_relative '../exceptions'
 
 # Arithmetic evaluation module for handling number and binary operations
 module EvaluatorModules
@@ -32,10 +33,25 @@ module EvaluatorModules
         left_value * right_value
       when '/', 'divide', 'slash'
         if right_value == 0
-          raise ZeroDivisionError, "Division by zero"
+          raise PatlangDivisionByZeroError.new(
+            "Division by zero",
+            operator: operator,
+            left_operand: left_value,
+            right_operand: right_value,
+            dividend: left_value
+          )
         end
         left_value.to_f / right_value
       when '%', 'modulo'
+        if right_value == 0
+          raise PatlangDivisionByZeroError.new(
+            "Division by zero",
+            operator: operator,
+            left_operand: left_value,
+            right_operand: right_value,
+            dividend: left_value
+          )
+        end
         left_value % right_value
       when '^', 'power', 'exponent'
         # FIXED: Add exponentiation support
@@ -53,7 +69,13 @@ module EvaluatorModules
       when '>=', 'greater_equal'
         left_value >= right_value
       else
-        raise "Unknown operator: #{node.operator}"
+        raise PatlangArithmeticError.new(
+          "Unknown operator",
+          operator: node.operator,
+          left_operand: left_value,
+          right_operand: right_value,
+          operation_type: "binary"
+        )
       end
     end
 
@@ -64,7 +86,12 @@ module EvaluatorModules
       when '-', 'minus'
         -operand_value
       else
-        raise "Unknown unary operator: #{node.operator}"
+        raise PatlangArithmeticError.new(
+          "Unknown unary operator",
+          operator: node.operator,
+          left_operand: operand_value,
+          operation_type: "unary"
+        )
       end
     end
 
@@ -86,7 +113,13 @@ module EvaluatorModules
       when '>='
         left_value >= right_value
       else
-        raise "Unknown comparison operator: #{node.operator}"
+        raise PatlangArithmeticError.new(
+          "Unknown comparison operator",
+          operator: node.operator,
+          left_operand: left_value,
+          right_operand: right_value,
+          operation_type: "comparison"
+        )
       end
     end
 

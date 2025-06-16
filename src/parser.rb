@@ -7,7 +7,9 @@ require_relative 'parser/expression_parser'
 require_relative 'parser/function_parser'
 require_relative 'parser/control_flow_parser'
 require_relative 'parser/type_constraint_parser'
+require_relative 'parser/reasoning_parser_extensions'
 require_relative 'parser/parser_timeout_protection'
+require_relative 'ast/enhanced_reasoning_nodes'
 require_relative 'object_model/event_system'
 
 # Parser class for parsing Patlang source code with modular architecture
@@ -15,6 +17,7 @@ require_relative 'hash_extensions'
 class Parser
   include EventSystem::EventCapable
   include ParserModules::TimeoutProtection
+  include ParserModules::ReasoningParserExtensions
   attr_reader :current_token, :current_token_index, :collected_errors
 
   def initialize(tokens_or_lexer)
@@ -44,7 +47,7 @@ class Parser
   # Collect error information for comprehensive error reporting
   def collect_error(error_info)
     @collected_errors << error_info
-    puts "[Parser ERROR COLLECTION] #{error_info[:message]} at position #{error_info[:position]}"
+    # puts "[Parser ERROR COLLECTION] #{error_info[:message]} at position #{error_info[:position]}"
   end
 
   # Get all collected errors for comprehensive reporting
@@ -145,7 +148,7 @@ class Parser
       
       # Critical protection: ensure position advances after each statement
       if @current_token_index == pre_statement_position && @current_token
-        puts "[Parser WARNING] Statement parsing did not advance token position, forcing advance"
+        # puts "[Parser WARNING] Statement parsing did not advance token position, forcing advance"
         advance # Force advancement to prevent infinite loop
       end
     end

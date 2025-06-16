@@ -1,5 +1,6 @@
 require_relative '../object_model/patlang_object'
 require_relative 'unification_engine'
+require_relative '../exceptions'
 
 # Type Constraint System for Patlang's Type Inference
 # Provides constraint creation, validation, and propagation for unified reasoning
@@ -14,7 +15,7 @@ class TypeConstraintSystem < PatlangObject
     
     # Subscribe to object destruction events for cleanup
     on_all_events do |event_data|
-      if event_data[:type] == :object_destroyed
+      if event_data[:event_type] == :object_destroyed
         cleanup_constraints_for_object(event_data[:data][:object_id].to_s)
       end
     end
@@ -30,9 +31,13 @@ class TypeConstraintSystem < PatlangObject
   
   # Create a new type constraint for a variable
   def create_constraint(variable, constraint_type, constraint_data, **options)
-    validate_constraint_inputs(variable, constraint_type, constraint_data)
+    # Store original data and get processed data from validation
+    processed_data = validate_constraint_inputs(variable, constraint_type, constraint_data)
     
-    constraint = TypeConstraint.new(variable, constraint_type, constraint_data, **options)
+    # Use processed data if validation modified it (e.g., Range -> Hash conversion)
+    final_constraint_data = processed_data || constraint_data
+    
+    constraint = TypeConstraint.new(variable, constraint_type, final_constraint_data, self, **options)
     @constraints[variable] << constraint
     
     fire_event(:constraint_created, {
@@ -44,6 +49,9 @@ class TypeConstraintSystem < PatlangObject
     
     constraint
   end
+  # Alias for backward compatibility
+  alias_method :add_constraint, :create_constraint
+
   
   # Check if a value satisfies all constraints for a variable
   def satisfies_all_constraints?(variable, value)
@@ -238,24 +246,41 @@ class TypeConstraintSystem < PatlangObject
       raise ArgumentError, "Invalid constraint type: #{constraint_type}. Must be one of #{valid_types.join(', ')}"
     end
     
+    processed_data = nil
+    
     case constraint_type
     when :range
-      unless constraint_data.is_a?(Hash) && constraint_data.key?(:min) && constraint_data.key?(:max)
-        raise ArgumentError, "Range constraint data must be a hash with :min and :max keys"
+      if constraint_data.is_a?(Range)
+        # Convert Range object to hash format for internal use
+        # This handles both inclusive (1..10) and exclusive (1...10) ranges
+        max_value = constraint_data.exclude_end? ? constraint_data.end - 1 : constraint_data.end
+        processed_data = { min: constraint_data.begin, max: max_value }
+      elsif constraint_data.is_a?(Hash) && constraint_data.key?(:min) && constraint_data.key?(:max)
+        # Hash format is already correct
+        processed_data = constraint_data
+      else
+        raise ArgumentError, "Range constraint data must be a Range object (e.g., 1..10) or a hash with :min and :max keys"
       end
     when :pattern
       unless constraint_data.is_a?(Regexp)
         raise ArgumentError, "Pattern constraint data must be a Regexp"
       end
+      processed_data = constraint_data
     when :structural
       unless constraint_data.is_a?(Hash)
         raise ArgumentError, "Structural constraint data must be a Hash"
       end
+      processed_data = constraint_data
     when :custom
       unless constraint_data.respond_to?(:call)
         raise ArgumentError, "Custom constraint data must be callable (proc/lambda)"
       end
+      processed_data = constraint_data
+    when :type
+      processed_data = constraint_data
     end
+    
+    processed_data
   end
   
   def ranges_conflict?(ranges)
@@ -351,6 +376,14 @@ class TypeConstraint
     end
   end
   
+  # Validate a value and raise exception if constraint is violated
+  def validate!(value)
+    return true if satisfies?(value)
+    
+    error_message = generate_error_message(value)
+    raise TypeConstraintViolation.new(@variable, value, error_message, constraint: self)
+  end
+  
   private
   
   def satisfies_type_constraint?(value)
@@ -424,6 +457,7 @@ class TypeConstraint
   end
   
   def satisfies_custom_constraint?(value)
+    return false unless @constraint_data.respond_to?(:call)
     begin
       @constraint_data.call(value)
     rescue
@@ -471,11 +505,12 @@ end
 
 # Result classes for validation and unification
 class ValidationResult
-  attr_reader :success, :error_message
+  attr_reader :success, :error_message, :errors
   
-  def initialize(success, error_message = nil, *additional_args)
-    @success = success
-    @error_message = error_message
+  def initialize(valid: true, errors: [])
+    @success = valid
+    @errors = errors
+    @error_message = errors.first if errors.any?
   end
   
   def success?

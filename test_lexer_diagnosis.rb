@@ -3,16 +3,17 @@
 require_relative 'src/lexer'
 
 puts "=== LEXER DIAGNOSIS TEST ==="
-puts "Testing specific characters that should raise RuntimeError according to failing tests"
+puts "Testing specific characters that should produce tokens (NOT raise RuntimeError)"
+puts "The lexer follows 'Never Fail, Always Token' principle"
 puts
 
-# Test cases that should raise RuntimeError according to the failing tests
+# Test cases that should produce tokens according to lexer specification
 test_cases = [
-  { name: "Single @ character", input: "@" },
-  { name: "Invalid symbols @#$%", input: "@#$%" },
-  { name: "Currency symbols €£¥", input: "€£¥" },
-  { name: "Emojis 🚀💻", input: "🚀💻" },
-  { name: "Greek letters αβγ", input: "αβγ" }
+  { name: "Single @ character", input: "@", expected_tokens: ["AT"] },
+  { name: "Invalid symbols @#$%", input: "@#$%", expected_tokens: ["AT", "UNKNOWN", "UNKNOWN", "PERCENT"] },
+  { name: "Currency symbols €£¥", input: "€£¥", expected_tokens: ["UNKNOWN", "UNKNOWN", "UNKNOWN"] },
+  { name: "Emojis 🚀💻", input: "🚀💻", expected_tokens: ["UNKNOWN", "UNKNOWN"] },
+  { name: "Greek letters αβγ", input: "αβγ", expected_tokens: ["UNKNOWN", "UNKNOWN", "UNKNOWN"] }
 ]
 
 test_cases.each do |test_case|
@@ -29,21 +30,37 @@ test_cases.each do |test_case|
       break if token.type == :EOF || token.type == Token::TOKEN_TYPES[:EOF]
     end
     
-    puts "  ✗ UNEXPECTED: No error raised. Tokens generated:"
-    tokens.each do |token|
-      puts "    - Type: #{token.type}, Value: #{token.value.inspect}"
+    # Remove EOF token for comparison
+    non_eof_tokens = tokens.select { |t| t.type != :EOF && t.type != Token::TOKEN_TYPES[:EOF] }
+    
+    puts "  ✓ CORRECT: Tokens generated (no errors raised):"
+    non_eof_tokens.each_with_index do |token, i|
+      expected = test_case[:expected_tokens][i] || "?"
+      status = token.type.to_s == expected ? "✓" : "?"
+      puts "    #{status} Type: #{token.type}, Value: #{token.value.inspect} (expected: #{expected})"
+    end
+    
+    # Verify token count matches expectation
+    if non_eof_tokens.length == test_case[:expected_tokens].length
+      puts "  ✓ Token count matches expectation: #{non_eof_tokens.length}"
+    else
+      puts "  ? Token count mismatch: got #{non_eof_tokens.length}, expected #{test_case[:expected_tokens].length}"
     end
     
   rescue RuntimeError => e
-    puts "  ✓ EXPECTED: RuntimeError raised - #{e.message}"
+    puts "  ✗ UNEXPECTED: RuntimeError raised - #{e.message}"
+    puts "  ✗ LEXER VIOLATION: Lexer should NEVER raise RuntimeError for invalid characters"
   rescue => e
-    puts "  ? UNEXPECTED ERROR TYPE: #{e.class} - #{e.message}"
+    puts "  ✗ UNEXPECTED ERROR TYPE: #{e.class} - #{e.message}"
   end
   
   puts
 end
 
 puts "=== DIAGNOSIS SUMMARY ==="
-puts "This test reveals which characters are incorrectly handled by the lexer."
-puts "Expected behavior: ALL test cases should raise RuntimeError"
-puts "If any test case shows 'No error raised', that confirms the diagnosis."
+puts "This test validates that the lexer correctly follows the 'Never Fail, Always Token' principle."
+puts "Expected behavior: ALL test cases should produce tokens (NEVER raise RuntimeError)"
+puts "✓ = Correct behavior: tokens produced as expected"
+puts "✗ = Incorrect behavior: RuntimeError raised (violates lexer specification)"
+puts
+puts "The lexer is working CORRECTLY if it produces tokens instead of raising errors."

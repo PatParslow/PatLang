@@ -488,7 +488,7 @@ class TypeConstraint
   def validate!(value)
     return true if satisfies?(value)
     
-    raise TypeConstraintViolation.new(@variable, value, constraint_message)
+    raise TypeConstraintViolation.new(@variable, value, constraint_message(value))
   end
 
   private
@@ -559,7 +559,7 @@ class TypeConstraint
     end
   end
 
-  def constraint_message
+  def constraint_message(value)
     case @constraint_type
     when :type
       "Expected #{@constraint_data}, got #{value.class.name}"

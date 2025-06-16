@@ -91,7 +91,7 @@ module EventSystem
     
     # Get events of a specific type from history
     def events_of_type(event_type, limit = nil)
-      events = @event_history.select { |e| e[:type] == event_type }
+      events = @event_history.select { |e| e[:event_type] == event_type }
       limit ? events.last(limit) : events
     end
     
@@ -99,7 +99,7 @@ module EventSystem
     
     def create_event(event_type, event_data)
       {
-        type: event_type,
+        event_type: event_type,
         data: event_data,
         timestamp: Time.now,
         event_id: generate_event_id
@@ -315,7 +315,7 @@ end
         id: generate_message_id,
         from: from_object,
         to: to_object,
-        type: message_type,
+        event_type: message_type,
         payload: payload,
         timestamp: Time.now,
         status: :pending

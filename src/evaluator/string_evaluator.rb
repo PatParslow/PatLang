@@ -1,4 +1,5 @@
 require_relative '../ast_nodes'
+require_relative '../exceptions'
 
 # String evaluation module for handling string operations and methods
 module EvaluatorModules
@@ -16,16 +17,31 @@ module EvaluatorModules
       index_value = @evaluator.evaluate(node.index)
 
       unless object_value.is_a?(String)
-        raise "Index access is only supported for strings, got #{object_value.class}"
+        raise PatlangTypeError.new(
+          "Index access only supported for strings",
+          expected_type: "String",
+          actual_type: object_value.class.to_s,
+          value: object_value
+        )
       end
 
       unless index_value.is_a?(Numeric)
-        raise "String index must be an integer, got #{index_value.class}"
+        raise PatlangTypeError.new(
+          "String index must be numeric",
+          expected_type: "Numeric",
+          actual_type: index_value.class.to_s,
+          value: index_value
+        )
       end
 
       # Convert to integer (check if it's a whole number)
       if index_value.is_a?(Float) && index_value != index_value.to_i
-        raise "String index must be an integer, got #{index_value.class}"
+        raise PatlangTypeError.new(
+          "String index must be integer",
+          expected_type: "Integer",
+          actual_type: "Float",
+          value: index_value
+        )
       end
       
       index_value = index_value.to_i
@@ -40,7 +56,13 @@ module EvaluatorModules
 
       # Bounds checking (1-based indexing)
       if index_value == 0 || zero_based_index < 0 || zero_based_index >= object_value.length
-        raise RuntimeError, "String index #{index_value} out of bounds for string of length #{object_value.length} (1-based indexing)"
+        raise PatlangIndexError.new(
+          "String index out of bounds",
+          index: index_value,
+          collection_size: object_value.length,
+          collection_type: "String",
+          zero_based: false
+        )
       end
 
       object_value[zero_based_index]

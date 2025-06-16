@@ -2,7 +2,7 @@
 
 require 'minitest/autorun'
 require_relative '../helpers/test_helper'
-require_relative '../../src/reasoning/type_constraint'
+require_relative '../../src/reasoning/type_constraint_system'
 
 # Test the type constraint system for unified reasoning
 class TestTypeConstraints < Minitest::Test

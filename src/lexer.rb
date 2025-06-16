@@ -102,8 +102,8 @@ class Lexer
         next
       end
 
-      # Skip comments
-      if @current_char == '#'
+      # Skip comments only if # is at start of line or after whitespace (proper comment context)
+      if @current_char == '#' && comment_context?
         skip_comment
         next
       end
@@ -528,5 +528,15 @@ class Lexer
       advance
     end
     result
+  end
+  
+  def comment_context?
+    # Only treat # as comment if it's at start of line or preceded by whitespace
+    # This prevents # from being consumed as comment when it should be an UNKNOWN token
+    return true if @position == 0  # Start of input
+    
+    # Look at the previous character
+    prev_char = @position > 0 ? @text[@position - 1] : nil
+    prev_char.nil? || prev_char.match(/\s/)
   end
 end

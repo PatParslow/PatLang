@@ -5,6 +5,7 @@ require_relative 'evaluator/string_evaluator'
 require_relative 'evaluator/function_evaluator'
 require_relative 'evaluator/scope_manager'
 require_relative 'evaluator/object_evaluator'
+require_relative 'evaluator/reasoning_evaluator'
 require_relative 'object_model/object_integration'
 require_relative 'reasoning/reasoning_coordinator'
 require_relative 'reasoning/form_validator'
@@ -12,8 +13,8 @@ require_relative 'reasoning/goal_system'
 require_relative 'reasoning/facts_database'
 require_relative 'exceptions'
 
-# Simple Goal class for basic goal evaluation
-class Goal
+# Simple Goal class for basic goal evaluation (renamed to avoid conflicts)
+class SimpleGoal
   attr_reader :name, :postcondition, :precondition
   
   def initialize(name, options = {})
@@ -40,6 +41,7 @@ class Evaluator
     @string_evaluator = EvaluatorModules::StringEvaluator.new(self)
     @function_evaluator = EvaluatorModules::FunctionEvaluator.new(self)
     @object_evaluator = EvaluatorModules::ObjectEvaluator.new(self)
+    @reasoning_evaluator = EvaluatorModules::ReasoningEvaluator.new(self)
     
     # Initialize reasoning system components (basic implementations)
     @reasoning_mode = false
@@ -70,14 +72,16 @@ class Evaluator
   # Reasoning mode management
   def enable_reasoning_mode
     @reasoning_mode = true
+    @reasoning_evaluator.enable_reasoning_mode
   end
   
   def disable_reasoning_mode
     @reasoning_mode = false
+    @reasoning_evaluator.disable_reasoning_mode
   end
   
   def reasoning_mode_enabled?
-    @reasoning_mode
+    @reasoning_evaluator.reasoning_mode_enabled
   end
   
   # Reasoning system integration methods
@@ -117,21 +121,6 @@ class Evaluator
     setup_performance_monitoring
   end
 
-  # Reasoning mode methods
-  def enable_reasoning_mode
-    return "Reasoning coordinator not set" unless @reasoning_coordinator
-    return "Invalid reasoning coordinator" unless @reasoning_coordinator.respond_to?(:enable_reasoning_mode)
-    @reasoning_coordinator.enable_reasoning_mode
-  end
-
-  def disable_reasoning_mode
-    return "Reasoning coordinator not set" unless @reasoning_coordinator
-    @reasoning_coordinator.disable_reasoning_mode
-  end
-
-  def reasoning_mode_enabled?
-    @reasoning_coordinator&.reasoning_mode_enabled? || false
-  end
 
   # Form validation integration
   def validate_form(form_name, form_definition, data)
@@ -173,8 +162,31 @@ class Evaluator
   end
 
   def validate_assignment(variable, value)
-    return true unless @reasoning_coordinator
-    @reasoning_coordinator.validate_assignment(variable, value)
+    if reasoning_mode_enabled?
+      @reasoning_evaluator.validate_assignment(variable, value)
+    else
+      true
+    end
+  end
+  
+  # Create constraints through ReasoningEvaluator
+  def create_constraint(variable, constraint_type, constraint_data, **options)
+    @reasoning_evaluator.create_constraint(variable, constraint_type, constraint_data, **options)
+  end
+  
+  # Check if variable satisfies constraints
+  def variable_satisfies_constraints?(variable, value)
+    @reasoning_evaluator.variable_satisfies_constraints?(variable, value)
+  end
+  
+  # Get reasoning statistics
+  def reasoning_statistics
+    @reasoning_evaluator.statistics
+  end
+  
+  # Access reasoning evaluator directly
+  def reasoning_evaluator
+    @reasoning_evaluator
   end
 
   def evaluate(node)
@@ -290,6 +302,12 @@ class Evaluator
       return :query_builtin
     when 'rule'
       return :rule_builtin
+    when 'where'
+      return :where_builtin
+    when 'knows'
+      return :knows_builtin
+    when 'ancestor'
+      return :ancestor_builtin
     end
     
     @scope_manager.get_variable(name)
@@ -417,15 +435,9 @@ class Evaluator
   def visit_assignment_node(node)
     value = evaluate(node.expression)
     
-    # Validate assignment against reasoning constraints if enabled
+    # Use ReasoningEvaluator for constraint checking
     if reasoning_mode_enabled?
-      validate_assignment_with_reasoning(node.name, value)
-      
-      # Update reasoning stats
-      if @reasoning_stats
-        @reasoning_stats[:assignments_validated] ||= 0
-        @reasoning_stats[:assignments_validated] += 1
-      end
+      @reasoning_evaluator.validate_assignment(node.name, value)
     end
     
     set_variable(node.name, value)
@@ -508,149 +520,19 @@ class Evaluator
 
   # Reasoning system visitor methods for new AST nodes
   def visit_type_constraint_node(node)
-    # Ensure reasoning mode is enabled for constraint creation
-    unless reasoning_mode_enabled?
-      raise ReasoningModeError, "Type constraints require reasoning mode to be enabled"
-    end
-    
-    # Create constraint through reasoning coordinator if available
-    if @reasoning_coordinator
-      # Map type names to :type constraint and put the type name in data
-      constraint_type = :type
-      constraint_data = node.constraint_type.to_sym  # Convert "Number" to :Number
-      
-      constraint = @reasoning_coordinator.create_constraint(
-        node.variable,
-        constraint_type,
-        constraint_data,
-        conditions: node.conditions
-      )
-      
-      # Register constraint in evaluator's constraint tracking
-      variable_sym = node.variable.to_sym
-      @constraints[variable_sym] = constraint
-      
-      return constraint
-    else
-      # Fallback: create basic TypeConstraint object
-      require_relative 'reasoning/type_constraint'
-      constraint = TypeConstraint.new(node.variable, node.constraint_type, node.constraint_data || node.conditions)
-      variable_sym = node.variable.to_sym
-      @constraints[variable_sym] = constraint
-      constraint
-    end
+    @reasoning_evaluator.visit_type_constraint_node(node)
   end
 
   def visit_goal_node(node)
-    # Ensure reasoning mode is enabled for goal creation
-    unless reasoning_mode_enabled?
-      raise "Goal declarations require reasoning mode to be enabled"
-    end
-    
-    # Handle the new GoalNode structure with description, preconditions, postconditions, strategies
-    goal_name = node.description.to_s.gsub(/\s+/, '_').to_sym
-    
-    # Check if we have a goal system available for proper integration
-    if @goal_system
-      # Create a goal definition string for the GoalSystem
-      definition = build_enhanced_goal_definition_from_node(node)
-      goal = @goal_system.declare_goal(goal_name, definition)
-      
-      # Register goal in evaluator's goal tracking
-      @goals[goal_name] = goal
-      
-      return goal
-    else
-      # Fallback to storing goal data in a simple structure
-      goal_data = {
-        description: node.description,
-        preconditions: node.preconditions,
-        postconditions: node.postconditions,
-        strategies: node.strategies,
-        created_at: Time.now
-      }
-      @goals[goal_name] = goal_data
-      
-      # Create a simple Goal object for compatibility
-      require_relative 'reasoning/goal_system'
-      goal = Goal.new(goal_name,
-        postcondition: node.postconditions&.first,
-        precondition: node.preconditions&.first
-      )
-      
-      goal
-    end
+    @reasoning_evaluator.visit_goal_node(node)
   end
 
   def visit_logic_rule_node(node)
-    # Ensure reasoning mode is enabled for rule assertion
-    unless reasoning_mode_enabled?
-      raise "Logic rules require reasoning mode to be enabled"
-    end
-    
-    # Handle the new LogicRuleNode with head, body, and rule_type
-    rule_data = {
-      head: node.head,
-      body: node.body,
-      rule_type: node.rule_type,
-      created_at: Time.now
-    }
-    
-    # Assert rule through facts database if available
-    if @facts_database
-      # Convert rule to string format for FactsDatabase
-      rule_string = "#{node.head} :- #{node.body}"
-      @facts_database.assert_fact(rule_string)
-      
-      # Also store in local rules collection for backward compatibility
-      @rules << rule_data
-    else
-      # Fallback: store in local rules collection
-      @rules << rule_data
-    end
-    
-    rule_data
+    @reasoning_evaluator.visit_logic_rule_node(node)
   end
 
   def visit_query_node(node)
-    # Ensure reasoning mode is enabled for queries
-    unless reasoning_mode_enabled?
-      raise "Logic queries require reasoning mode to be enabled"
-    end
-    
-    # Handle the new QueryNode with goal_term, variables, and query_type
-    query_data = {
-      goal_term: node.goal_term,
-      variables: node.variables,
-      query_type: node.query_type,
-      executed_at: Time.now
-    }
-    
-    # Execute query through facts database if available
-    if @facts_database
-      query_string = node.goal_term.to_s
-      results = @facts_database.query(query_string)
-      
-      return {
-        query: query_data,
-        results: results,
-        result_count: results.length,
-        executed_via: :facts_database
-      }
-    else
-      # Fallback: perform basic pattern matching against stored facts/rules
-      matching_facts = @facts.select { |fact| fact.to_s.include?(node.goal_term.to_s) }
-      matching_rules = @rules.select { |rule| rule[:head].to_s.include?(node.goal_term.to_s) }
-      
-      all_matches = matching_facts + matching_rules.map { |r| r[:head] }
-      
-      return {
-        query: query_data,
-        results: all_matches,
-        result_count: all_matches.length,
-        executed_via: :local_search
-      }
-    end
+    @reasoning_evaluator.visit_query_node(node)
   end
 
   private
@@ -791,13 +673,7 @@ class Evaluator
   end
 
   def visit_reasoning_mode_node(node)
-    # Actually enable/disable reasoning mode instead of just printing
-    if node.enabled
-      enable_reasoning_mode
-    else
-      disable_reasoning_mode
-    end
-    @reasoning_mode
+    @reasoning_evaluator.visit_reasoning_mode_node(node)
   end
 
   def visit_error_node(node)
@@ -826,6 +702,57 @@ class Evaluator
     rescue => e
       # Re-raise with better context for debugging
       raise e.class, "Error evaluating string: #{code.inspect}\nOriginal: #{e.message}", e.backtrace
+    end
+  end
+
+  # Missing reasoning keyword implementations for Phase 3 fix
+  def where(*conditions)
+    # 'where' keyword for conditional reasoning - filters facts/results based on conditions
+    return "where_not_implemented" unless reasoning_mode_enabled?
+    
+    if @facts_database
+      # Filter facts based on conditions
+      results = []
+      conditions.each do |condition|
+        matching_facts = @facts_database.query(condition)
+        results.concat(matching_facts) if matching_facts
+      end
+      results
+    else
+      conditions # Return conditions if no facts database available
+    end
+  end
+
+  def knows(fact_or_query)
+    # 'knows' keyword for knowledge base queries - checks if system knows about something
+    return "knows_not_implemented" unless reasoning_mode_enabled?
+    
+    if @facts_database
+      # Check if fact exists in knowledge base
+      result = @facts_database.query(fact_or_query)
+      !result.nil? && !result.empty?
+    else
+      false # Unknown if no facts database
+    end
+  end
+
+  def ancestor(entity, ancestor_entity = nil)
+    # 'ancestor' keyword for hierarchical reasoning - finds ancestors in knowledge base
+    return "ancestor_not_implemented" unless reasoning_mode_enabled?
+    
+    if @facts_database
+      if ancestor_entity
+        # Check if ancestor_entity is an ancestor of entity
+        ancestry_query = "ancestor(#{entity}, #{ancestor_entity})"
+        result = @facts_database.query(ancestry_query)
+        !result.nil? && !result.empty?
+      else
+        # Find all ancestors of entity
+        ancestry_query = "ancestor(#{entity}, X)"
+        @facts_database.query(ancestry_query) || []
+      end
+    else
+      ancestor_entity ? false : [] # No ancestors if no facts database
     end
   end
 end

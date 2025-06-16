@@ -10,7 +10,7 @@ require_relative '../exceptions'
 class ReasoningCoordinator
   attr_reader :evaluator, :unification_engine, :constraint_system
 
-  def initialize(evaluator)
+  def initialize(evaluator = nil)
     @evaluator = evaluator
     @reasoning_mode = false
     @unification_engine = UnificationEngine.new
@@ -131,10 +131,10 @@ class ReasoningCoordinator
 
   def create_goal(name, **options)
     check_reasoning_mode!
-    
+
     goal = Goal.new(name, **options)
     @goals[name] = goal
-    
+
     fire_event(:goal_created, {
       name: name,
       goal: goal,
@@ -142,9 +142,12 @@ class ReasoningCoordinator
       has_precondition: goal.has_precondition?,
       has_postcondition: goal.has_postcondition?
     })
-    
+
     goal
   end
+
+  # Alias for backward compatibility
+  alias_method :define_goal, :create_goal
 
   def pursue_goal(goal_name, **context)
     check_reasoning_mode!

@@ -36,7 +36,11 @@ class GoalSystem
     goal
   end
 
-  def pursue_goal(name, **context)
+  def pursue_goal(name, context = {})
+    # Handle both keyword arguments and positional arguments
+    context = {} if context.nil?
+    context = context.is_a?(Hash) ? context : {}
+    
     goal = @goals[name]
     raise ArgumentError, "Goal #{name} not found" unless goal
     
@@ -71,7 +75,7 @@ class GoalSystem
           result: result,
           timestamp: Time.now
         })
-        raise "Goal #{name}: Postconditions not satisfied by result #{result}"
+        raise RuntimeError, "Postconditions not satisfied"
       end
     end
     
@@ -167,8 +171,13 @@ class GoalSystem
       context: {}
     }
     
-    lines.each do |line|
-      next if line.start_with?('goal ') || line == '}'
+    i = 0
+    while i < lines.length
+      line = lines[i]
+      if line.start_with?('goal ') || line == '}'
+        i += 1
+        next
+      end
       
       case line
       when /description:\s*"(.+)"/
@@ -180,8 +189,25 @@ class GoalSystem
       when /strategy:\s*(\w+)/
         goal_options[:strategy] = $1.to_sym
       when /strategies:\s*\[(.*)\]/
+        # Single-line strategies format
         strategy_list = $1.split(',').map { |s| s.strip.to_sym }
         goal_options[:strategies] = strategy_list
+      when /strategies:\s*\[/
+        # Multi-line strategies format - collect until closing bracket
+        strategies = []
+        i += 1
+        while i < lines.length && !lines[i].include?(']')
+          strategy_line = lines[i].strip
+          if strategy_line.empty?
+            i += 1
+            next
+          end
+          # Remove trailing comma and convert to symbol
+          strategy = strategy_line.chomp(',').strip.to_sym
+          strategies << strategy unless strategy.to_s.empty?
+          i += 1
+        end
+        goal_options[:strategies] = strategies
       when /preference:\s*(\w+)/
         goal_options[:preference] = $1.to_sym
       when /subgoals:\s*\[(.*)\]/
@@ -190,6 +216,8 @@ class GoalSystem
       when /context:\s*\{(.*)\}/
         goal_options[:context] = parse_context_block($1)
       end
+      
+      i += 1
     end
     
     goal_options
@@ -235,6 +263,7 @@ class GoalSystem
       max_val = context[:max] || 100
       (min_val..max_val).find { |n| prime?(n) } || 2
     else
+      # Allow goal to handle its own resolution
       goal.resolve(**context)
     end
   end
@@ -383,7 +412,18 @@ class ExecutionPlan
 
   def can_execute?(step)
     required_deps = @dependencies[step] || []
-    required_deps.all? { |dep| @execution_order.index(dep) < @execution_order.index(step) }
+    # Check if all dependencies have been completed (marked as completed)
+    @completed_steps ||= []
+    required_deps.all? { |dep| @completed_steps.include?(dep) }
+  end
+  
+  def mark_completed(step)
+    @completed_steps ||= []
+    @completed_steps << step unless @completed_steps.include?(step)
+  end
+  
+  def completed_steps
+    @completed_steps ||= []
   end
 end
 

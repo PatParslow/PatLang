@@ -1132,11 +1132,11 @@ class AdvancedGoalStrategies
   end
 
   def adaptation_required_for_event?(event, config)
-    [:accident, :emergency_vehicle, :weather_change].include?(event[:type])
+    [:accident, :emergency_vehicle, :weather_change].include?(event[:event_type])
   end
 
   def determine_adaptation_type(event)
-    case event[:type]
+    case event[:event_type]
     when :accident
       :rerouting
     when :emergency_vehicle

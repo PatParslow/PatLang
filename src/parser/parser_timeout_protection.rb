@@ -25,7 +25,7 @@ module ParserModules
         
         # Check for excessive iterations
         if @iteration_count > @max_iterations
-          raise EmergencyTimeout::TimeoutError, "Circuit breaker: Maximum iterations (#{@max_iterations}) exceeded"
+          raise EmergencyTimeout::TimeoutError, "Circuit breaker: Maximum iterations exceeded - possible infinite loop detected"
         end
         
         # Check for position loops (same token position repeatedly)

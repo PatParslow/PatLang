@@ -627,3 +627,6 @@ class ProgramNode < ASTNode
     "ProgramNode(#{@statements.length} statements)"
   end
 end
+
+# Load enhanced reasoning nodes after base classes are defined
+require_relative 'ast/enhanced_reasoning_nodes'

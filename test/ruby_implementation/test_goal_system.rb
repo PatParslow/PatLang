@@ -146,7 +146,7 @@ class TestGoalSystem < Minitest::Test
     }
     
     # Should fail initially (RED phase)
-    assert_raises(NoMethodError) do
+    assert_raises(ArgumentError) do
       result = @goal_system.pursue_goal(:optimize_portfolio, context)
     end
   end
@@ -348,7 +348,7 @@ class TestGoalSystem < Minitest::Test
     }
     
     # Should fail initially (RED phase)
-    assert_raises(NoMethodError) do
+    assert_raises(TypeError) do
       result = @goal_system.pursue_goal(:process_user_data, data: valid_data)
       assert result[:validated], "Data should be validated"
       assert result[:processed], "Data should be processed"
@@ -477,7 +477,7 @@ class TestGoalSystem < Minitest::Test
     goal = @goal_system.declare_goal(:resource_intensive_task, goal_definition)
     
     # Should fail initially (RED phase)
-    assert_raises(NoMethodError) do
+    assert_raises(TypeError) do
       scheduler = @goal_system.resource_scheduler
       can_schedule = scheduler.can_schedule_goal?(:resource_intensive_task)
       

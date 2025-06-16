@@ -1,5 +1,6 @@
 require_relative 'patlang_object'
 require_relative 'event_system'
+require_relative '../exceptions'
 
 # NumberObject - Specialized object for numeric values with arithmetic operations
 # 
@@ -84,7 +85,13 @@ class NumberObject < PatlangObject
       }
       fire_event(:arithmetic_error, error_data)
       EventSystem.fire_global_event(:arithmetic_error, error_data)
-      raise ZeroDivisionError, "Division by zero"
+      raise PatlangDivisionByZeroError.new(
+        "Division by zero",
+        operator: "/",
+        left_operand: @raw_value,
+        right_operand: other_value,
+        dividend: @raw_value
+      )
     end
     
     result_value = @raw_value / other_value
@@ -339,8 +346,18 @@ class NumberObject < PatlangObject
   
   # String representation
   def to_s
+    # Handle special float values first
+    return "NaN" if @raw_value.respond_to?(:nan?) && @raw_value.nan?
+    return "Infinity" if @raw_value == Float::INFINITY
+    return "-Infinity" if @raw_value == -Float::INFINITY
+    
     # Only show decimal places if they're non-zero
-    @raw_value == @raw_value.to_i ? @raw_value.to_i.to_s : @raw_value.to_s
+    begin
+      @raw_value == @raw_value.to_i ? @raw_value.to_i.to_s : @raw_value.to_s
+    rescue FloatDomainError
+      # Fallback for any other special float cases
+      @raw_value.to_s
+    end
   end
   
   # String conversion for concatenation - delegate to intelligent to_s

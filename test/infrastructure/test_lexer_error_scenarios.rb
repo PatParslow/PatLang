@@ -17,22 +17,24 @@ class TestLexerErrorScenarios < Minitest::Test
     input = '"unclosed string'
     lexer = create_lexer(input)
     
-    error = assert_raises(ParseError) do
-      lexer.tokenize
-    end
-    
-    assert_match(/unterminated string/i, error.message)
-    assert_equal 1, error.line if error.respond_to?(:line)
+    # Lexer handles unclosed strings gracefully by returning UNTERMINATED_STRING token
+    tokens = lexer.tokenize
+    assert_equal 2, tokens.length
+    assert_equal :UNTERMINATED_STRING, tokens[0].type
+    assert_equal "unclosed string", tokens[0].value
+    assert_equal :EOF, tokens[1].type
   end
 
   def test_unclosed_single_quote_string_error
     input = "'unclosed string"
     lexer = create_lexer(input)
     
-    error = assert_raises(ParseError) do
-      lexer.tokenize
-    end
-    
+    # Lexer handles unclosed single quote strings gracefully by returning UNTERMINATED_STRING token
+    tokens = lexer.tokenize
+    assert_equal 2, tokens.length
+    assert_equal :UNTERMINATED_STRING, tokens[0].type
+    assert_equal "unclosed string", tokens[0].value
+    assert_equal :EOF, tokens[1].type
     assert_match(/unterminated string/i, error.message)
   end
 

@@ -2,6 +2,7 @@ require_relative '../helpers/test_helper'
 require_relative '../../src/lexer'
 require_relative '../../src/parser'
 require_relative '../../src/evaluator'
+require_relative '../../src/exceptions'
 
 class TestFunctionEvaluator < Minitest::Test
   def setup
@@ -472,7 +473,7 @@ class TestFunctionEvaluator < Minitest::Test
       call divide(10, 0)
     PATLANG
     
-    error = assert_raises(RuntimeError) do
+    error = assert_raises(PatlangDivisionByZeroError) do
       parse_and_evaluate(input)
     end
     assert_match(/Division by zero/, error.message)

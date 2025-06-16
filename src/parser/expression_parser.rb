@@ -568,7 +568,7 @@ module ParserModules
       # CRITICAL: Always advance past problematic tokens for error recovery
       # This enables the parser to continue and find multiple errors
       if @parser.current_token && @parser.current_token.type != :EOF
-        puts "[Parser RECOVERY] Advancing past problematic token: #{@parser.current_token.type} (#{@parser.current_token.value}) - #{message}"
+        # puts "[Parser RECOVERY] Advancing past problematic token: #{@parser.current_token.type} (#{@parser.current_token.value}) - #{message}"
         @parser.advance
       end
       

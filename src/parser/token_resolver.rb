@@ -201,6 +201,12 @@ module ParserModules
 
     # Pre-process all tokens to resolve ambiguous contexts with comprehensive protection
     def resolve_all_ambiguous_tokens
+    @resolution_depth ||= 0
+    @resolution_depth += 1
+    if @resolution_depth > 100
+      @resolution_depth = 0
+      raise "Token resolution depth exceeded - possible circular dependency"
+    end
       result = with_token_resolution_timeout("token resolution") do
         resolved_tokens = []
         i = 0

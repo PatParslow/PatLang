@@ -1,4 +1,5 @@
 require_relative '../ast_nodes'
+require_relative '../exceptions'
 
 # Function evaluation module for handling function definitions and calls
 module EvaluatorModules
@@ -42,7 +43,11 @@ module EvaluatorModules
       end
 
       unless function_def
-        raise RuntimeError, "Undefined function: #{node.function_name}"
+        raise PatlangFunctionError.new(
+          "Undefined function",
+          function_name: node.function_name,
+          arguments: node.arguments
+        )
       end
 
       # Parameter count validation
@@ -50,7 +55,13 @@ module EvaluatorModules
       actual_args = node.arguments.length
 
       if actual_args != expected_params
-        raise "Function '#{node.function_name}' expects #{expected_params} arguments, got #{actual_args}"
+        raise PatlangFunctionError.new(
+          "Wrong number of arguments",
+          function_name: node.function_name,
+          arguments: node.arguments,
+          expected_params: expected_params,
+          actual_params: actual_args
+        )
       end
 
       # Create new scope for function execution

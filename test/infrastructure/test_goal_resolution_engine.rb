@@ -183,7 +183,7 @@ class TestGoalResolutionEngine < Minitest::Test
     # Mock a goal that might fail postconditions
     class << @goal_system
       def execute_goal_strategy(goal, strategy, context)
-        return 5 if goal.name == "strict_goal"  # This violates postcondition
+        return 5 if goal.name == :strict_goal  # This violates postcondition
         super
       end
     end

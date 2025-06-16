@@ -202,12 +202,13 @@ end
 
   def satisfies_custom_constraint?(value)
     case @constraint_data
-    when Proc
+    when Proc, Method
       @constraint_data.call(value)
-    when Method
-      @constraint_data.call(value)
+    when TrueClass, FalseClass
+      @constraint_data  # Return the boolean value directly
     else
-      false
+      # For other types, assume it's a callable if it responds to call
+      @constraint_data.respond_to?(:call) ? @constraint_data.call(value) : false
     end
   rescue
     false
