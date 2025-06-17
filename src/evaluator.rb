@@ -265,6 +265,8 @@ class Evaluator
       visit_reasoning_mode_node(node)
     when ErrorNode
       visit_error_node(node)
+    when AutoOutputNode
+      visit_auto_output_node(node)
     else
       raise "Unknown node type: #{node.class}"
     end
@@ -686,6 +688,37 @@ class Evaluator
       nil
     end
   end
+
+  def visit_auto_output_node(node)
+    # Evaluate the expression and automatically output it to console
+    result = evaluate(node.expression)
+    
+    # Format the output appropriately based on data type
+    output = format_output(result)
+    puts output
+    
+    # Return the result so it can still be used in expressions
+    result
+  end
+
+  private
+
+  def format_output(value)
+    case value
+    when String
+      value
+    when Numeric
+      value.to_s
+    when TrueClass, FalseClass
+      value.to_s
+    when NilClass
+      ""
+    else
+      value.to_s
+    end
+  end
+
+  public
 
   # Priority 1 Fix: Add missing evaluate_string method
   # This method is expected by many tests but was missing from the API

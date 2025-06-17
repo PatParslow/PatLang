@@ -276,6 +276,20 @@ class ReturnNode < ASTNode
     end
   end
 end
+
+# Node representing an expression that should automatically output to console
+class AutoOutputNode < ASTNode
+  attr_reader :expression
+
+  def initialize(expression)
+    @expression = expression
+  end
+
+  def to_s
+    "AutoOutputNode(#{@expression})"
+  end
+end
+
 # Node representing a type constraint declaration for unified reasoning
 class TypeConstraintNode < ASTNode
   attr_reader :variable, :constraint_type, :constraint_data, :conditions

@@ -223,10 +223,14 @@ class Parser
       elsif is_property_assignment?
         return parse_property_assignment
       else
-        return expression
+        # This is a standalone expression - wrap it for auto-output
+        expr = expression
+        return expr.is_a?(ErrorNode) ? expr : AutoOutputNode.new(expr)
       end
     else
-      return expression
+      # This is a standalone expression - wrap it for auto-output
+      expr = expression
+      return expr.is_a?(ErrorNode) ? expr : AutoOutputNode.new(expr)
     end
   end
 
