@@ -36,7 +36,7 @@ module EvaluatorModules
     # Visit type constraint nodes from the AST
     def visit_type_constraint_node(node)
       unless @reasoning_mode_enabled
-        raise ReasoningModeError, "Type constraints require reasoning mode to be enabled"
+        raise ReasoningModeError, "Type constraints require reasoning mode to be enabled. For .patlang files, reasoning mode should be auto-enabled. Try: 'reasoning mode on' or check file extension."
       end
       
       @performance_stats[:constraints_checked] += 1
@@ -93,7 +93,7 @@ module EvaluatorModules
     # Create constraints programmatically
     def create_constraint(variable, constraint_type, constraint_data, **options)
       unless @reasoning_mode_enabled
-        raise ReasoningModeError, "Constraint creation requires reasoning mode to be enabled"
+        raise ReasoningModeError, "Constraint creation requires reasoning mode to be enabled. For .patlang files, reasoning mode should be auto-enabled. Try: 'reasoning mode on' or check file extension."
       end
       
       @performance_stats[:reasoning_operations] += 1
@@ -115,7 +115,7 @@ module EvaluatorModules
     # Unify two terms using the unification engine
     def unify(term1, term2, substitution = {})
       unless @reasoning_mode_enabled
-        raise ReasoningModeError, "Unification requires reasoning mode to be enabled"
+        raise ReasoningModeError, "Unification requires reasoning mode to be enabled. For .patlang files, reasoning mode should be auto-enabled. Try: 'reasoning mode on' or check file extension."
       end
       
       @performance_stats[:reasoning_operations] += 1
@@ -161,7 +161,7 @@ module EvaluatorModules
     # Visit goal nodes for goal-based reasoning
     def visit_goal_node(node)
       unless @reasoning_mode_enabled
-        raise ReasoningModeError, "Goal declarations require reasoning mode to be enabled"
+        raise ReasoningModeError, "Goal declarations require reasoning mode to be enabled. For .patlang files, reasoning mode should be auto-enabled. Try: 'reasoning mode on' or check file extension."
       end
       
       @performance_stats[:reasoning_operations] += 1
@@ -181,7 +181,7 @@ module EvaluatorModules
     # Visit logic rule nodes
     def visit_logic_rule_node(node)
       unless @reasoning_mode_enabled
-        raise ReasoningModeError, "Logic rules require reasoning mode to be enabled"
+        raise ReasoningModeError, "Logic rules require reasoning mode to be enabled. For .patlang files, reasoning mode should be auto-enabled. Try: 'reasoning mode on' or check file extension."
       end
       
       @performance_stats[:reasoning_operations] += 1
@@ -200,7 +200,7 @@ module EvaluatorModules
     # Visit query nodes
     def visit_query_node(node)
       unless @reasoning_mode_enabled
-        raise ReasoningModeError, "Logic queries require reasoning mode to be enabled"
+        raise ReasoningModeError, "Logic queries require reasoning mode to be enabled. For .patlang files, reasoning mode should be auto-enabled. Try: 'reasoning mode on' or check file extension."
       end
       
       @performance_stats[:reasoning_operations] += 1

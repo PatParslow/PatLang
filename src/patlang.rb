@@ -239,8 +239,19 @@ class Patlang
       puts "=" * 40
       
       evaluator = Evaluator.new
+      
+      # Auto-enable reasoning mode for .patlang files
+      if filename.end_with?('.patlang')
+        puts "Auto-enabling reasoning mode for .patlang file"
+        evaluator.enable_reasoning_mode
+      end
+      
       result = process_expression_with_evaluator(content, evaluator, show_details: false)
       puts "Final result: #{result}" if result
+    rescue ReasoningModeError => e
+      puts "Reasoning Mode Error: #{e.message}"
+      puts "Hint: .patlang files require reasoning mode. Please ensure reasoning mode is enabled."
+      exit 127
     rescue => e
       puts "Error executing #{filename}: #{e.message}"
       exit 1
