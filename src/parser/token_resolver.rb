@@ -54,7 +54,10 @@ module ParserModules
           elsif token.can_be?(:MAKE)
             return token.resolve_to(:MAKE)
           elsif token.can_be?(:A) && token.value == "a"
-            # Keep "a" as IDENTIFIER in function context since parser expects it
+            # Resolve "a" to A token type for function parsing
+            return token.resolve_to(:A)
+          elsif token.can_be?(:END) && token.value == "end" && is_parameter_context?(context_index)
+            # In parameter context, "end" should be treated as an identifier
             return token.resolve_to(:IDENTIFIER)
           end
         end
@@ -82,6 +85,34 @@ module ParserModules
         @visited_positions.delete(context_index) if context_index
         @resolution_depth -= 1
       end
+    end
+
+    # Check if the current position is within a parameter list context
+    def is_parameter_context?(context_index)
+      return false unless context_index
+      
+      # Look backwards to see if we have "takes:" indicating parameter context
+      # But also check we haven't hit an opening brace yet (which would end parameter context)
+      look_back = [context_index - 1, 0].max
+      iterations = 0
+      max_iterations = 10 # Parameters are usually close to "takes:"
+      found_takes = false
+      
+      while look_back >= 0 && iterations < max_iterations
+        token = @tokens[look_back]
+        if token&.type == :TAKES
+          found_takes = true
+        elsif token&.type == :LBRACE
+          # If we found takes before hitting a brace, we're in parameter context
+          return found_takes
+        elsif token&.type == :SEMICOLON || token&.type == :EOF
+          break # Hit boundary, not in parameter context
+        end
+        look_back -= 1
+        iterations += 1
+      end
+      
+      found_takes
     end
 
     # Check if the current position is within a function definition context with loop protection

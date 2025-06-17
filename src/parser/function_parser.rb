@@ -23,7 +23,7 @@ module ParserModules
         @parser.eat(:MAKE)
         
         # Skip 'a' if present (optional)
-        if @parser.current_token&.type == :IDENTIFIER && @parser.current_token.value == "a"
+        if @parser.current_token&.type == :A
           @parser.advance
         end
         

@@ -267,6 +267,8 @@ class Evaluator
       visit_error_node(node)
     when AutoOutputNode
       visit_auto_output_node(node)
+    when PrintNode
+      visit_print_node(node)
     else
       raise "Unknown node type: #{node.class}"
     end
@@ -698,6 +700,18 @@ class Evaluator
     puts output
     
     # Return the result so it can still be used in expressions
+    result
+  end
+
+  def visit_print_node(node)
+    # Evaluate the expression and output it to console
+    result = evaluate(node.expression)
+    
+    # Format the output appropriately based on data type
+    output = format_output(result)
+    puts output
+    
+    # Return the result (similar to AutoOutputNode behavior)
     result
   end
 

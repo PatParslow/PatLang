@@ -91,9 +91,10 @@ make a function called double takes: x {
   return x * 2
 }
 
-make a function called quadruple takes: x {
+make a function called quadruple takes: x 
+{
   return call double with call double with x
-end
+}
 
 # Complex function with multiple operations
 make a function called calculate_area takes: length, width {

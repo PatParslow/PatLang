@@ -76,7 +76,13 @@ class Parser
   
   # Raise RuntimeError for critical syntax errors that should not be recovered from
   def syntax_error(message = "Syntax error")
-    raise RuntimeError, message
+    if @current_token
+      formatted_message = "#{message} at line #{@current_token.line}, column #{@current_token.column}: [#{@current_token.type}:#{@current_token.value}] (position #{@current_token_index})"
+      raise RuntimeError, formatted_message
+    else
+      formatted_message = "#{message} at end of input (position #{@current_token_index})"
+      raise RuntimeError, formatted_message
+    end
   end
   
   # Safe error method that returns an ErrorNode instead of raising
@@ -175,7 +181,7 @@ class Parser
              peek(2)&.type == :EOF || peek(2) == nil)
         # "make var value" - elegant syntax without assignment operator
         return parse_assignment
-      elsif (peek(1)&.type == :IDENTIFIER && peek(1)&.value == "a" &&
+      elsif (peek(1)&.type == :A && peek(1)&.value == "a" &&
             peek(2)&.type == :FUNCTION) ||
             (peek(1)&.type == :FUNCTION)
         # This is a function definition: "make [a] function [called]..."

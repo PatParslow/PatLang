@@ -361,7 +361,12 @@ class Lexer
                  when 'else'
                    Token::TOKEN_TYPES[:ELSE]
                  when 'end'
-                   Token::TOKEN_TYPES[:END]
+                   # Return ambiguous token - let parser resolve context
+                   possibilities = [
+                     { type: Token::TOKEN_TYPES[:END], value: result },
+                     { type: Token::TOKEN_TYPES[:IDENTIFIER], value: result }
+                   ]
+                   return AmbiguousToken.new(possibilities, start_position, start_line, start_column)
                  when 'while'
                    Token::TOKEN_TYPES[:WHILE]
                  when 'do'

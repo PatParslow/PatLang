@@ -290,6 +290,19 @@ class AutoOutputNode < ASTNode
   end
 end
 
+# Node representing a print statement (e.g., print "text")
+class PrintNode < ASTNode
+  attr_reader :expression
+
+  def initialize(expression)
+    @expression = expression
+  end
+
+  def to_s
+    "PrintNode(#{@expression})"
+  end
+end
+
 # Node representing a type constraint declaration for unified reasoning
 class TypeConstraintNode < ASTNode
   attr_reader :variable, :constraint_type, :constraint_data, :conditions

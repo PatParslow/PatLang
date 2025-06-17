@@ -25,6 +25,8 @@ else
   result = 50
 end
 
+result
+
 # While loop with accumulator
 counter = 1
 sum = 0
@@ -32,6 +34,8 @@ while counter <= 5 do
   sum = sum + counter
   counter = counter + 1
 end
+
+sum
 
 # Nested control flow
 i = 0
@@ -42,3 +46,5 @@ while i < 4 do
     factorial = factorial * i
   end
 end
+
+factorial
