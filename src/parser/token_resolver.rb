@@ -56,9 +56,28 @@ module ParserModules
           elsif token.can_be?(:A) && token.value == "a"
             # Resolve "a" to A token type for function parsing
             return token.resolve_to(:A)
-          elsif token.can_be?(:END) && token.value == "end" && is_parameter_context?(context_index)
+          elsif token.can_be?(:END) && token.value == "end"
+            if is_parameter_context?(context_index)
+              # In parameter context, "end" should be treated as an identifier
+              return token.resolve_to(:IDENTIFIER)
+            else
+              # In control flow context, "end" should be treated as END keyword
+              return token.resolve_to(:END)
+            end
+          end
+        end
+        
+        # Handle END tokens outside of function definition context
+        if token.can_be?(:END) && token.value == "end"
+          if is_parameter_context?(context_index)
             # In parameter context, "end" should be treated as an identifier
             return token.resolve_to(:IDENTIFIER)
+          elsif is_control_flow_context?(context_index)
+            # In control flow context (if/while/etc), "end" should be treated as END keyword
+            return token.resolve_to(:END)
+          else
+            # Default to END keyword unless clearly an identifier context
+            return token.resolve_to(:END)
           end
         end
         
@@ -113,6 +132,30 @@ module ParserModules
       end
       
       found_takes
+    end
+
+    # Check if the current position is within a control flow context (if/while/etc)
+    def is_control_flow_context?(context_index)
+      return false unless context_index
+      
+      # Look backwards to find control flow keywords like IF, WHILE, etc.
+      look_back = [context_index - 1, 0].max
+      iterations = 0
+      max_iterations = 20 # Control flow statements are usually short
+      
+      while look_back >= 0 && iterations < max_iterations
+        token = @tokens[look_back]
+        if token&.type == :IF || token&.type == :WHILE || token&.type == :FOR
+          return true
+        elsif token&.type == :SEMICOLON || token&.type == :EOF || token&.type == :LBRACE
+          # Hit a statement boundary, stop looking
+          break
+        end
+        look_back -= 1
+        iterations += 1
+      end
+      
+      false
     end
 
     # Check if the current position is within a function definition context with loop protection

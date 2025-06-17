@@ -1,11 +1,37 @@
 require 'simplecov'
-require_relative 'test_constants'
 
+# Configure SimpleCov with explicit root and coverage tracking
 SimpleCov.start do
   enable_coverage :branch
+  
+  # Set root to project directory for proper path resolution
+  root File.expand_path('../../../', __FILE__)
+  
+  # Add filters - exclude test files from coverage measurement
   add_filter '/test/'
+  
+  # Add source group for organization
   add_group 'Source', 'src'
+  
+  # Set coverage directory
+  coverage_dir 'test/coverage'
 end
+
+# Load source files AFTER SimpleCov is configured but BEFORE test constants
+puts "📊 Loading source files for coverage tracking..."
+begin
+  require_relative '../../src/lexer'
+  require_relative '../../src/token'
+  require_relative '../../src/ast_nodes'
+  puts "✅ Source files loaded for coverage tracking"
+rescue LoadError => e
+  puts "⚠️  Warning: Some source files not found: #{e.message}"
+rescue => e
+  puts "⚠️  Warning: Error loading source files: #{e.message}"
+end
+
+# Now load test constants
+require_relative 'test_constants'
 
 require 'minitest/autorun'
 require 'minitest/assertions'
