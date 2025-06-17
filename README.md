@@ -13,37 +13,37 @@ Patlang introduces a unique approach to programming by combining:
 
 ## Current Development Status
 
-**Latest Release**: v0.4.0 String Operations (Production Ready)
-**Current Phase**: v0.5.0 Functions (Next Priority)
-**Strategic Goal**: Self-hosting capability - implementing Patlang in Patlang
+**Current Status**: Active Development - Solid Foundation (June 2025)
+**Test Success Rate**: 40.7% (24/59 test files passing)
+**Core Infrastructure**: 56% passing - solid foundation established
+**Strategic Goal**: Building toward self-hosting capability
 
-### 🎉 MAJOR ACHIEVEMENT: 100% Test Suite Success (June 2025)
-**Milestone**: Complete elimination of all test failures through systematic approach
-- **427 tests passing** with 1912 assertions, 0 failures, 0 errors
-- **99.7% line coverage** with comprehensive validation
-- **Sub-second execution** providing fast feedback for development
-- **Robust foundation** for confident continued development
+### 📊 Current Test Status Summary (June 2025)
+Based on comprehensive test analysis ([`current-test-status.txt`](current-test-status.txt)):
 
-See [`docs/development/test-infrastructure-success.md`](docs/development/test-infrastructure-success.md) for full details.
+**✅ Strong Foundation Areas (Working Well)**:
+- **Core Infrastructure** (56% passing): Lexer, Parser, AST nodes, Facts database
+- **Branch Coverage Testing** (100% passing): Conditional logic and error handling
+- **Utility Components** (100% passing): Auto output, dependency mapping, performance analysis
 
-### ✅ v0.4.0 Complete - String Operations
-- ✅ **All Phases Complete**: Critical Blocker #2 RESOLVED
-- ✅ **String literals with escape sequences** (`"Hello World"`, `"Line 1\nLine 2"`)
-- ✅ **String concatenation** (`"Hello" + " " + "World"`)
-- ✅ **String comparison operators** (`==`, `!=`, `<`, `>`, `<=`, `>=`)
-- ✅ **Character indexing** (`string[1]`, `string[-1]` for last character)
-- ✅ **String methods** (`.length`, `.uppercase()`, `.lowercase()`, `.trim()`, `.substring()`)
-- ✅ **Advanced string methods** (`.starts_with()`, `.ends_with()`)
-- ✅ **Method chaining** (`text.trim().uppercase().substring(1, 5)`)
-- ✅ **File execution support** (`ruby src/patlang.rb examples/string_demo.pat`)
+**🚧 Partially Working Features**:
+- **Language Features** (30% passing): Flexible function syntax, IS keyword implementation, basic evaluator
+- **Ruby Implementation** (20% passing): Object model foundation exists but needs stability improvements
 
-### 🎯 v0.5.0 Next - Functions (Critical Blocker #3)
-**Strategic Priority**: Essential for modular code organization
-**Target Features**:
-- Function definition with parameters
-- Return values and local scope
-- Function calls and recursion
-- Parameter passing and argument validation
+**🎯 Areas Under Development**:
+- Integration layer reliability (0% passing)
+- Helper components (errors need resolution)
+- Test coverage improvement (currently 9.38% line coverage)
+
+### ✅ Confirmed Working Features
+- **Arithmetic expressions** with proper operator precedence
+- **Lexer functionality** with comprehensive error handling
+- **Parser core operations** for syntax analysis
+- **AST node processing** for syntax tree manipulation
+- **Facts database operations** for reasoning foundation
+- **Flexible function syntax** (partial implementation)
+- **IS keyword implementation** (partial functionality)
+- **Branch coverage validation** (complete test suite)
 
 For detailed development tracking, see:
 - [`docs/development/v0.3.0-control-flow-plan.md`](docs/development/v0.3.0-control-flow-plan.md) - Complete implementation plan
@@ -89,74 +89,71 @@ Patlang is being developed using an **incremental approach**:
 5. **Advanced Features** - Pattern matching, goal constructs
 6. **Optimization** - Performance improvements
 
-## Current Status
+## Current Capabilities
 
-🎉 **v0.2.0 - Variables and Assignment Complete**
+### ✅ Working Now
+- **Basic arithmetic interpreter** with lexer, parser, and evaluator
+- **Interactive REPL** for arithmetic expressions
+- **Core infrastructure** components (lexer, parser, AST processing)
+- **Comprehensive error handling** and bounds checking
+- **Branch coverage testing** framework
+- **Performance analysis** and dependency mapping tools
 
-- ✅ Core language specification defined
-- ✅ Syntax rules and patterns established
-- ✅ Example programs written
-- ✅ Testing strategy planned
-- ✅ **Complete arithmetic interpreter with lexer, parser, and evaluator**
-- ✅ **Interactive REPL for arithmetic expressions**
-- ✅ **Variables and assignment functionality**
-- ✅ **REPL variable persistence across statements**
-- ✅ **Comprehensive test suite (93 tests, 393 assertions, 97.27% coverage)**
-- ✅ **Support for integers, decimals, and all arithmetic operations**
-- ⏳ Advanced language features (next increment)
+### 🚧 In Active Development
+- **Variable assignment** and lookup (IS keyword partially working)
+- **Function definitions** and calls (flexible syntax partially implemented)
+- **Object model integration** (foundation exists, needs stability)
+- **String operations** (architecture planned)
+- **Control flow** constructs (parser support exists)
 
-## Try the Interpreter
+### 🎯 Architecture Completed
+- Language specification and syntax rules
+- Parser infrastructure and AST framework
+- Reasoning system foundation
+- Test infrastructure and coverage analysis
+- Error handling and diagnostic systems
 
-The current interpreter supports:
+## Try the Current Interpreter
+
+The current interpreter supports basic arithmetic evaluation:
 
 ```bash
-# Run the interactive REPL
-ruby src/patlang.rb --repl
+# Run the interactive arithmetic REPL
+ruby src/patlang.rb
 
-# Run a file
-ruby src/patlang.rb examples/string_demo.pat
-
-# Try these expressions in REPL:
+# Try these working expressions in REPL:
 42                    # => 42
 3.14 + 2.86          # => 6.0
 2 + 3 * 4            # => 14 (operator precedence)
 (2 + 3) * 4          # => 20 (parentheses)
+10 - 5 / 2           # => 7.5 (mixed operations)
 
-# Variable assignment and usage:
-x = 42               # => 42
-y = 3.14             # => 3.14
-x + y * 2            # => 48.28
-
-# String operations:
-name = "Patlang"                    # => "Patlang"
-version = "0.4.0"                   # => "0.4.0"
-message = "Welcome to " + name      # => "Welcome to Patlang"
-length = message.length             # => 17
-first_char = name[1]                # => "P"
-upper_name = name.uppercase()       # => "PATLANG"
-formatted = name.trim().lowercase() # => "patlang"
-
-# Control flow with strings:
-if name.starts_with("Pat") then
-  "Language name starts with Pat!"
-else
-  "Different language"
-end
+# Exit the REPL
+exit                 # => Goodbye!
 ```
 
-**Supported Features:**
-- Integer and decimal number literals
-- Arithmetic operators: `+`, `-`, `*`, `/`
-- String literals with escape sequences
-- String concatenation and comparison
-- String methods: `.length`, `.uppercase()`, `.lowercase()`, `.trim()`, `.substring()`, `.starts_with()`, `.ends_with()`
-- Character indexing with `[]` operator (1-based, negative indices supported)
-- Variable assignment and lookup with persistence
-- Boolean values and comparison operators
-- Control flow: `if`/`then`/`else`/`end`, `while`/`do`/`end`
-- Parentheses for grouping expressions
-- Proper operator precedence and associativity
-- Comprehensive error handling and bounds checking
+### ✅ Currently Supported Features:
+- **Arithmetic Operations**: Integer and decimal number literals with operators `+`, `-`, `*`, `/`
+- **Expression Evaluation**: Parentheses for grouping with proper operator precedence
+- **Interactive REPL**: Live arithmetic expression evaluation
+- **Error Handling**: Comprehensive bounds checking and diagnostic messages
+
+### 🚧 Partially Working (Under Development):
+- **Variable Assignment**: IS keyword implementation (foundation exists)
+- **Function Syntax**: Flexible function definitions (parser support exists)
+- **String Operations**: Architecture designed (not yet integrated)
+- **Control Flow**: Basic constructs (parser foundation exists)
+
+### 📊 Test Status
+Run the test suite to see current development progress:
+```bash
+# Run comprehensive tests (see current-test-status.txt for latest results)
+ruby test/comprehensive_test_suite_runner.rb
+
+# Current status: 40.7% passing (24/59 test files)
+# Strong areas: Core infrastructure (56% passing), Branch coverage (100% passing)
+# Development areas: Integration layer, Ruby implementation stability
+```
 
 ## Getting Involved
 

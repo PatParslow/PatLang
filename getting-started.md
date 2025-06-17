@@ -4,28 +4,28 @@
 
 All code examples in this guide are marked with implementation status indicators:
 
-- **✅ Working** - Fully implemented and tested (available now in v0.6.0)
-- **🚧 In Progress** - Partially implemented or object model foundation exists
-- **🎯 Roadmap** - Planned, architecture designed (target v0.7.0+)
-- **❌ Not Implemented** - Requires development (future versions)
+- **✅ Working** - Fully implemented and tested (available now)
+- **🚧 In Progress** - Partially implemented, foundation exists but needs development
+- **🎯 Roadmap** - Planned, architecture designed for future versions
+- **❌ Not Implemented** - Requires significant development
 
-## What Works Now (v0.6.0)
+## What Works Now (Current Status: 40.7% Test Success)
 
-Patlang v0.6.0 delivers a **revolutionary object-oriented foundation** with these working capabilities:
+PatLang has a **solid foundation** with core infrastructure working well. Based on current test analysis ([`current-test-status.txt`](current-test-status.txt)):
 
 ### ✅ Working Features
-- **Basic Arithmetic**: Full expression evaluation with operator precedence
-- **Object Model Foundation**: Everything-is-objects architecture with 448 passing tests
-- **Event System**: Built-in reactive programming with message passing
-- **Network Transparency**: Smalltalk-style distributed method calls
-- **Enterprise Security**: Zero-configuration security with TLS/capability-based auth
+- **Basic Arithmetic**: Full expression evaluation with operator precedence and parentheses
+- **Interactive REPL**: Live arithmetic evaluation with proper error handling
+- **Core Infrastructure**: Lexer, Parser, AST processing (56% of tests passing)
+- **Branch Coverage Testing**: Complete test validation framework (100% passing)
+- **Performance Analysis**: Dependency mapping and diagnostic tools (100% passing)
 
-### 🚧 Object Model Foundation Ready
-The revolutionary objects/messages/networking/security framework is **fully implemented** and tested. All future language features will be built on this solid foundation, enabling:
-- **Universal Object Model**: All language elements as objects with events
-- **Network-Transparent Methods**: Local and remote calls with identical syntax
-- **Built-in Security**: Enterprise-grade protection with zero configuration
-- **Reactive Programming**: Event-driven capabilities with 515K+ events/second
+### 🚧 Partially Working (Under Active Development)
+The following features have foundation code but need stability improvements:
+- **Flexible Function Syntax**: Parser support exists, evaluation needs work
+- **IS Keyword Implementation**: Variable assignment foundation exists
+- **Basic Evaluator**: Core functionality present, integration needed
+- **Object Model**: Architecture designed, Ruby implementation needs debugging
 
 ## Table of Contents
 
@@ -70,12 +70,12 @@ This guide follows a progressive learning approach:
 
 ## Installation and Setup
 
-### Current Working Interpreter (v0.6.0)
+### Current Working Interpreter (Active Development)
 
-**Patlang v0.6.0 has a working arithmetic interpreter with revolutionary object model foundation!** You can try it right now:
+**PatLang has a working arithmetic interpreter with solid core infrastructure!** You can try it right now:
 
 ```bash
-# Prerequisites: Ruby 2.7+ and minitest gem
+# Prerequisites: Ruby 2.7+ (minitest gem recommended for running tests)
 gem install minitest
 
 # Clone the repository
@@ -83,43 +83,49 @@ git clone https://github.com/your-org/patlang.git
 cd patlang
 
 # Run the interactive arithmetic REPL
-ruby -Isrc src/patlang.rb
+ruby src/patlang.rb
 
-# Run the test suite
-ruby -Itest -Isrc test/test_integration.rb
+# Run the comprehensive test suite to see current status
+ruby test/comprehensive_test_suite_runner.rb
 ```
 
 ### ✅ Try the Working Arithmetic Interpreter
 
-The current interpreter supports full arithmetic evaluation:
+The current interpreter supports arithmetic evaluation with proper error handling:
 
 ```bash
-# ✅ Integer and decimal arithmetic (WORKING)
+# ✅ Integer and decimal arithmetic (WORKING NOW)
 42                    # => 42
 3.14 + 2.86          # => 6.0
-2 + 3 * 4            # => 14 (operator precedence)
-(2 + 3) * 4          # => 20 (parentheses)
-10 - 5 / 2           # => 7.5 (mixed operations)
+2 + 3 * 4            # => 14 (proper operator precedence)
+(2 + 3) * 4          # => 20 (parentheses grouping)
+10 - 5 / 2           # => 7.5 (mixed integer/decimal operations)
 
-# ✅ All arithmetic operators (WORKING)
+# ✅ All basic arithmetic operators (WORKING NOW)
 + - * /              # Addition, subtraction, multiplication, division
 
-# ✅ Interactive REPL (WORKING)
+# ✅ Interactive REPL with error handling (WORKING NOW)
 > 2 + 3
 5
 > (10 + 5) / 3
 5.0
+> invalid syntax
+[Error message with helpful diagnostic]
 > exit
 Goodbye!
 ```
 
-### 🚧 Object Model Capabilities (Foundation Ready)
+### 🚧 Development Status and Known Limitations
 
-```ruby
-# Revolutionary object model is implemented and ready
-ruby examples/oo_event_system_demo_fixed.rb    # Live object/event demo
-ruby examples/network_transparent_demo_fixed.rb # Network transparency demo
-ruby examples/secure_network_demo_fixed.rb     # Enterprise security demo
+Current test results show strong foundation with areas needing work:
+
+```bash
+# Check current test status
+cat current-test-status.txt
+
+# Current overall success: 40.7% (24/59 test files passing)
+# Core infrastructure: 56% passing (solid foundation)
+# Areas needing attention: Integration layer, Ruby implementation stability
 ```
 
 ### Future Installation (When Complete)
@@ -153,47 +159,73 @@ patlang
 
 ---
 
-## Your First Patlang Program
+## Your First PatLang Program
 
-Let's start with the classic "Hello, World!" program:
+Let's start with what actually works right now:
 
-### 🎯 Hello World (Roadmap - Target v0.7.0)
+### ✅ Your First Working Program (Available Now)
+
+```bash
+# Start the PatLang REPL
+ruby src/patlang.rb
+
+# Try your first expressions:
+> 42
+42
+> 3 + 4 * 5
+23
+> (3 + 4) * 5
+35
+> 2.5 + 1.5
+4.0
+```
+
+This demonstrates PatLang's working arithmetic interpreter with proper operator precedence and decimal support.
+
+### ✅ Interactive Arithmetic Session (Working Now)
+
+Let's try a more complex session:
+
+```bash
+> 100
+100
+> 50 + 25
+75
+> (100 - 50) / 2
+25.0
+> 3.14159 * 2
+6.28318
+> exit
+Goodbye!
+```
+
+### Current Capabilities Explained
+
+- **Arithmetic expressions**: Full support for `+`, `-`, `*`, `/` operators
+- **Operator precedence**: Multiplication and division before addition and subtraction
+- **Parentheses**: Proper grouping support for complex expressions
+- **Numbers**: Both integers (`42`) and decimals (`3.14`) supported
+- **Interactive REPL**: Live evaluation with friendly error messages
+
+### 🚧 Coming Soon (Under Development)
 
 ```patlang
-# 🎯 Your first Patlang program (planned)
+# 🚧 Variables (foundation exists, needs integration)
+x is 42
+y is 3.14
+result is x + y
+
+# 🚧 Functions (parser support exists, needs evaluator work)
+make a function called add {
+  add takes: a - number, b - number
+  add returns: a + b
+}
+
+# 🎯 Full language features (roadmap)
 print "Hello, World!"
 ```
 
-This simple program demonstrates Patlang's natural syntax. The `print` function outputs text to the console.
-
-### 🎯 Interactive Hello World (Roadmap)
-
-Let's make it interactive:
-
-```patlang
-# 🎯 Interactive hello world (planned)
-print "What's your name?"
-name is read_line()
-print "Hello, " + name + "!"
-```
-
-### Explanation
-
-- `name is read_line()` reads user input and assigns it to the variable `name`
-- String concatenation uses the `+` operator
-- Variables are created automatically when assigned
-
-### 🎯 Hello World with Types (Roadmap)
-
-```patlang
-# 🎯 Hello world with explicit types (planned)
-make a text called greeting { greeting is "Hello" }
-make a text called name { name is read_line() }
-make a text called message { message is greeting + ", " + name + "!" }
-print message
-```
-
-**🚧 Architecture Foundation:** The object model foundation for these features is **already implemented**. Variables will be first-class objects with automatic event generation and type inference.
+**Development Status**: The core infrastructure (lexer, parser, AST) has solid foundation (56% of tests passing). Variable assignment and function definitions have architectural support but need integration work.
 
 ---
 
@@ -1860,63 +1892,76 @@ A: Yes, Patlang's multi-paradigm approach and strong type system make it excelle
 
 ## Next Steps
 
-Congratulations! You've learned about Patlang's revolutionary multi-paradigm vision and experienced the working v0.6.0 foundation. Here's how to continue your journey:
+Congratulations! You've learned about PatLang's multi-paradigm vision and tried the working arithmetic interpreter. Here's how to continue your journey:
 
 ### Immediate Next Steps
 
-1. **✅ Try Working Features**: Experience the revolutionary object model foundation
+1. **✅ Try the Working Interpreter**: Get hands-on with what works now
    ```bash
    # Try the working arithmetic interpreter
-   ruby -Isrc src/patlang.rb
+   ruby src/patlang.rb
    
-   # Experience the object/event system
-   ruby examples/oo_event_system_demo_fixed.rb
+   # Explore the core with some calculations
+   > 2 + 3 * 4
+   > (10 + 5) / 3
+   > 3.14159 * 2.5
    
-   # See network transparency in action
-   ruby examples/network_transparent_demo_fixed.rb
-   
-   # Explore enterprise security
-   ruby examples/secure_network_demo_fixed.rb
+   # Check current development status
+   cat current-test-status.txt
    ```
 
-2. **🚧 Understand the Foundation**: Study the implemented object model architecture
-3. **🎯 Track Development**: Follow the v0.7.0 roadmap for language feature integration
-4. **📖 Read Documentation**: Dive deeper into the object model and event system
+2. **🧪 Run the Test Suite**: See the current development progress
+   ```bash
+   # Run comprehensive tests
+   ruby test/comprehensive_test_suite_runner.rb
+   
+   # Current results: 40.7% passing, strong infrastructure foundation
+   ```
 
-### Building Real Applications
+3. **📖 Understand the Architecture**: Study the working infrastructure components
+4. **🎯 Track Development**: Follow progress as more features come online
 
-1. **✅ Start with Working Features**: Build applications using the object model and events
-2. **🚧 Leverage the Foundation**: Use the architectural patterns already implemented
-3. **🎯 Prepare for v0.7.0**: Design applications ready for variable and function integration
-4. **📈 Performance**: Benefit from the optimized object/event architecture (515K+ events/sec)
+### Understanding Current Capabilities
 
-### Advanced Topics to Explore
+1. **✅ Working Foundation**: Arithmetic interpreter with solid core infrastructure (56% tests passing)
+2. **🚧 Partial Features**: Variable assignment and function syntax (parser support exists)
+3. **🎯 Development Areas**: Integration layer and Ruby implementation stability
+4. **📊 Test Coverage**: Comprehensive test framework showing clear progress path
 
-1. **✅ Object Model Architecture**: Deep dive into the revolutionary 'everything is objects' foundation
-2. **✅ Event-Driven Programming**: Master reactive programming with built-in events
-3. **✅ Network Transparency**: Explore distributed programming capabilities
-4. **✅ Enterprise Security**: Understand zero-configuration security architecture
-5. **🎯 Future Integration**: Prepare for goal-oriented and logic programming features
+### Development and Contribution Opportunities
+
+1. **🧪 Testing**: Help test the current interpreter and report issues
+2. **📝 Documentation**: Document patterns and usage of working features
+3. **🐛 Bug Fixes**: Contribute to improving the 40.7% → higher success rate
+4. **🏗️ Infrastructure**: Help stabilize the Ruby implementation layer
+5. **🔧 Integration**: Work on connecting parser components to evaluator
+
+### Learning Path Forward
+
+1. **Master Current Features**: Become expert with arithmetic expressions and REPL
+2. **Study Architecture**: Understand lexer, parser, and AST processing
+3. **Follow Test Results**: Track which features are becoming stable
+4. **Prepare for Growth**: As variables and functions come online, you'll be ready
 
 ### Community and Resources
 
-- **✅ Working Demonstrations**: [`examples/`](examples/) - Live object model and event system demos
-- **📖 Architecture Documentation**: [`docs/development/v0.6.0-*`](docs/development/) - Complete technical docs
-- **🧪 Test Suite**: [`test/`](test/) - 448 passing tests demonstrating capabilities
-- **🎯 Roadmap**: Strategic development plans for v0.7.0+ features
-- **💬 GitHub Repository**: Source code, issues, and development tracking
+- **📊 Current Status**: [`current-test-status.txt`](current-test-status.txt) - Live development progress
+- **🧪 Test Suite**: [`test/`](test/) - 59 test files showing development areas
+- **📖 Documentation**: [`docs/`](docs/) - Language specification and development guides
+- **💻 Source Code**: [`src/`](src/) - Working interpreter implementation
+- **💬 GitHub Repository**: Report issues, contribute, track development
 
-### Contributing to Patlang
+### Contributing to PatLang
 
-Patlang v0.6.0 represents a **revolutionary breakthrough** in programming language design. Ways to contribute:
+PatLang is in **active development** with a solid foundation. Ways to contribute:
 
-1. **✅ Experience the Foundation**: Try the working object model and provide feedback
-2. **🧪 Test and Validate**: Help test the object/event architecture in real applications
-3. **📝 Document Patterns**: Share interesting use cases of the object model
-4. **🎯 Shape the Future**: Contribute to syntax design for v0.7.0 features
-5. **Core Development**: Contribute to the interpreter and compiler
+1. **✅ Test Current Features**: Use the arithmetic interpreter and report any issues
+2. **🧪 Improve Test Success**: Help move from 40.7% to higher success rates
+3. **📝 Document Working Patterns**: Share effective ways to use current capabilities
+4. **🔧 Fix Infrastructure**: Contribute to stabilizing the Ruby implementation
+5. **🏗️ Build Features**: Help integrate parser components with evaluation
 
-Welcome to the Patlang community! The multi-paradigm approach opens up new possibilities for expressing complex problems clearly and maintainably. Happy coding!
+Welcome to the PatLang community! We're building a unique multi-paradigm language with a solid foundation. Your contributions help make the vision reality. Happy coding!
 
 ---
 
