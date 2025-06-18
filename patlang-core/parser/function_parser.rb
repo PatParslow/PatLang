@@ -17,7 +17,7 @@ module ParserModules
       puts "[FunctionParser DEBUG] #{message}"
     end
 
-    # Grammar: function_definition → 'make' ['a'] 'function' ['called'] IDENTIFIER parameter_list? '{' statement* '}'
+    # Grammar: function_definition → 'make' ['a'] 'function' ['called'] IDENTIFIER parameter_list? ('{' statement* '}' | statement* 'end')
     def parse_function_definition
       begin
         @parser.eat(:MAKE)
@@ -100,27 +100,47 @@ module ParserModules
           end
         end
         
-        # Parse function body
-        if @parser.current_token.nil? || @parser.current_token.type != :LBRACE
-          @parser.syntax_error("Expected '{' to start function body")
-        end
-        
-        @parser.eat(:LBRACE)
-        
+        # Parse function body - support both brace-delimited and end-delimited syntax
         body_statements = []
-        loop_count = 0
-        while @parser.current_token &&
-              @parser.current_token.type != :RBRACE &&
-              loop_count < 1000  # Safety limit
-          stmt = @parser.statement
-          body_statements << stmt if stmt
-          loop_count += 1
-        end
         
-        if @parser.current_token&.type == :RBRACE
-          @parser.eat(:RBRACE)
+        if @parser.current_token&.type == :LBRACE
+          # Brace-delimited syntax: { statements }
+          debug_print("Parsing brace-delimited function body")
+          @parser.eat(:LBRACE)
+          
+          loop_count = 0
+          while @parser.current_token &&
+                @parser.current_token.type != :RBRACE &&
+                loop_count < 1000  # Safety limit
+            stmt = @parser.statement
+            body_statements << stmt if stmt
+            loop_count += 1
+          end
+          
+          if @parser.current_token&.type == :RBRACE
+            @parser.eat(:RBRACE)
+          else
+            return @parser.safe_error("Missing '}' to close function body")
+          end
+          
         else
-          return @parser.safe_error("Missing '}' to close function body")
+          # End-delimited syntax: statements end
+          debug_print("Parsing end-delimited function body")
+          
+          loop_count = 0
+          while @parser.current_token &&
+                @parser.current_token.type != :END &&
+                loop_count < 1000  # Safety limit
+            stmt = @parser.statement
+            body_statements << stmt if stmt
+            loop_count += 1
+          end
+          
+          if @parser.current_token&.type == :END
+            @parser.eat(:END)
+          else
+            return @parser.safe_error("Missing 'end' to close function body")
+          end
         end
         
         body = BlockNode.new(body_statements)
