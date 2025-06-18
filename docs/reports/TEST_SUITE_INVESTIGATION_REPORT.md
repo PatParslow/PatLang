@@ -96,7 +96,7 @@ ruby test/phase_1_test_runner.rb --dry-run
 
 #### **Core Implementation**
 ```ruby
-# Enhanced Test Discovery - test/enhanced_comprehensive_test_suite_runner.rb
+# Enhanced Test Discovery - test/enhanced_fixed_comprehensive_coverage_runner.rb
 def discover_all_test_files
   # Find ALL test_*.rb files recursively
   all_test_files = Dir.glob(File.join(@base_path, '**', 'test_*.rb'))
@@ -206,7 +206,7 @@ performance:
 
 #### **File Structure**
 ```
-test/enhanced_comprehensive_test_suite_runner.rb
+test/enhanced_fixed_comprehensive_coverage_runner.rb
 ├── Dynamic Test Discovery
 ├── Refined Exclusion Patterns
 ├── Category-Based Organization
@@ -379,5 +379,5 @@ The enhanced solution provides both comprehensive validation capabilities and ma
 **Next Review**: Upon completion of coverage integration investigation  
 **Related Documents**: 
 - [`TEST_SUITE_DOCUMENTATION_AND_MAINTENANCE_PLAN.md`](TEST_SUITE_DOCUMENTATION_AND_MAINTENANCE_PLAN.md)
-- [`enhanced_comprehensive_test_suite_runner.rb`](test/enhanced_comprehensive_test_suite_runner.rb)
+- [`enhanced_fixed_comprehensive_coverage_runner.rb`](test/enhanced_fixed_comprehensive_coverage_runner.rb)
 - [`ENHANCED_COMPREHENSIVE_TEST_SUITE_REPORT.md`](test/ENHANCED_COMPREHENSIVE_TEST_SUITE_REPORT.md)

@@ -87,7 +87,7 @@ PatLang has achieved a solid foundation with working arithmetic interpreter, lex
 - [ ] **Simple Executable Script (`bin/patlang`)**
   ```bash
   #!/usr/bin/env ruby
-  # Simple wrapper that calls ruby src/patlang.rb with arguments
+  # Simple wrapper that calls ruby ruby-host/bootstrap/patlang_bootstrap.rb with arguments
   # Handles .pat file execution, REPL mode, and help
   ```
 
@@ -97,7 +97,7 @@ PatLang has achieved a solid foundation with working arithmetic interpreter, lex
   - Error reporting for file not found, syntax errors
 
 - [ ] **Integration with Current System**
-  - Use existing `src/patlang.rb` infrastructure
+  - Use existing `ruby-host/bootstrap/patlang_bootstrap.rb` infrastructure
   - Maintain backward compatibility
   - Add simple usage documentation
 

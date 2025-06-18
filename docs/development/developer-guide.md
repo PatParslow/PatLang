@@ -134,19 +134,15 @@ The project uses these key gems:
 Verify your testing environment:
 
 ```bash
-# Run all tests
-bundle exec rspec
-
-# Run with coverage
-bundle exec rspec --format documentation
+# Run all tests using the updated test runner
+ruby test/fixed_comprehensive_coverage_runner.rb
 
 # Run specific test categories
-bundle exec rspec spec/lexer_spec.rb
-bundle exec rspec spec/parser_spec.rb
-bundle exec rspec spec/interpreter_spec.rb
+ruby dev-tools/testing/branch_coverage_test_runner.rb
+ruby dev-tools/testing/diagnostic_test_runner.rb
 
-# Run performance tests
-bundle exec rspec spec/performance_spec.rb
+# Try the working interpreter
+ruby ruby-host/bootstrap/patlang_bootstrap.rb
 
 # Generate documentation
 bundle exec yard doc
@@ -160,26 +156,33 @@ bundle exec yard doc
 
 ```
 patlang/
-├── lib/                    # Core interpreter implementation
-│   ├── patlang/
-│   │   ├── lexer.rb       # Tokenization
-│   │   ├── parser.rb      # AST generation
-│   │   ├── interpreter.rb # Core execution engine
-│   │   ├── type_system.rb # Type checking and inference
-│   │   └── paradigms/     # Paradigm-specific implementations
-│   │       ├── oop/       # Object-oriented features
-│   │       ├── functional/ # Functional programming
-│   │       ├── goals/     # Goal-oriented programming
-│   │       ├── events/    # Event-driven programming
-│   │       └── logic/     # Logic programming
-├── spec/                  # Test suite
-│   ├── unit/              # Unit tests
-│   ├── integration/       # Integration tests
-│   ├── acceptance/        # End-to-end tests
-│   └── performance/       # Performance tests
-├── docs/                  # Documentation
-├── examples/              # Example programs
-└── tools/                 # Development tools
+├── patlang-core/          # Core language implementation
+│   ├── ast/              # Abstract Syntax Tree nodes
+│   ├── evaluator/        # Expression and statement evaluation
+│   ├── lexer/            # Tokenization and lexical analysis
+│   ├── object_model/     # Object system and type infrastructure
+│   ├── parser/           # Syntax parsing and analysis
+│   ├── reasoning/        # Logic programming and constraint solving
+│   └── exceptions.rb     # Core exception classes
+├── ruby-host/            # Ruby bootstrap and runtime environment
+│   ├── bootstrap/        # Language bootstrap and entry points
+│   ├── interop/          # Ruby-Patlang interoperability
+│   └── runtime/          # Runtime support and utilities
+├── dev-tools/            # Development and build tools
+│   ├── analysis/         # Code analysis tools
+│   ├── build/            # Build scripts and VS Code extensions
+│   ├── coverage/         # Coverage analysis tools
+│   └── testing/          # Test runners and diagnostic tools
+├── test/                 # Comprehensive test suite
+│   ├── core_pipeline/    # Core pipeline tests
+│   ├── infrastructure/   # Infrastructure tests
+│   ├── safety_critical/  # Safety critical tests
+│   ├── patlang_language/ # Language feature tests
+│   ├── ruby_implementation/ # Ruby implementation tests
+│   └── integration/      # Integration tests
+├── docs/                 # Documentation
+├── examples/             # Example programs
+└── src/                  # Legacy source files (being migrated)
 ```
 
 ### Branch Structure

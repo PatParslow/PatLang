@@ -10,11 +10,11 @@ Based on comprehensive coverage analysis of PatLang's core components, current o
 
 | Component | Current Coverage | Lines Covered | Total Lines | Priority |
 |-----------|------------------|---------------|-------------|----------|
-| **src/ast_nodes.rb** | 59.09% | 195/659 | 659 | HIGH ✅ |
-| **src/lexer.rb** | 52.10% | 149/547 | 547 | HIGH ✅ |
-| **src/evaluator.rb** | 31.02% | 125/838 | 838 | CRITICAL 🔥 |
-| **src/parser.rb** | 28.37% | 122/868 | 868 | CRITICAL 🔥 |
-| **src/token.rb** | 89.47% | 85/95 | 95 | GOOD ✅ |
+| **patlang-core/ast/ast_nodes.rb** | 59.09% | 195/659 | 659 | HIGH ✅ |
+| **patlang-core/lexer/lexer.rb** | 52.10% | 149/547 | 547 | HIGH ✅ |
+| **patlang-core/evaluator/evaluator.rb** | 31.02% | 125/838 | 838 | CRITICAL 🔥 |
+| **patlang-core/parser/parser.rb** | 28.37% | 122/868 | 868 | CRITICAL 🔥 |
+| **patlang-core/lexer/token.rb** | 89.47% | 85/95 | 95 | GOOD ✅ |
 
 ### Key Findings
 

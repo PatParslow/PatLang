@@ -33,7 +33,7 @@ result = engine.unify(term1, term2, substitution)
 ```
 
 ### 2. Type Constraint System (✅ FULLY WORKING)
-**Location**: `src/reasoning/type_constraint.rb`
+**Location**: `patlang-core/reasoning/type_constraint.rb`
 
 #### TypeConstraintSystem Implementation
 - ✅ **Constraint creation** for type, range, and pattern constraints

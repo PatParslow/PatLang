@@ -6,9 +6,9 @@ Following the v0.5.0 current state analysis, this document outlines a comprehens
 
 **Key Findings:**
 - 19 experimental files cluttering root directory (debug scripts, test files, patches)
-- [`src/parser.rb`](src/parser.rb:1) at 617 lines needs modular breakdown
-- [`src/evaluator.rb`](src/evaluator.rb:1) at 446 lines has clear separation boundaries
-- 3 backup parser files in src/ directory should be archived
+- [`patlang-core/parser/parser.rb`](patlang-core/parser/parser.rb:1) at 617 lines needs modular breakdown
+- [`patlang-core/evaluator/evaluator.rb`](patlang-core/evaluator/evaluator.rb:1) at 446 lines has clear separation boundaries
+- 3 backup parser files in patlang-core/ directory should be archived
 - Well-structured test suite and documentation require minimal changes
 
 ## Experimental Files Catalog
@@ -44,16 +44,16 @@ These are version control artifacts:
 1. [`evaluator_fix.patch`](evaluator_fix.patch:1) - Evaluator patch file
 2. [`test_fix.patch`](test_fix.patch:1) - Test patch file
 
-### Archive from src/ - Backup Files (3 files)
-Move to `src/archive/` subdirectory:
+### Archive from patlang-core/ - Backup Files (3 files)
+Move to `patlang-core/archive/` subdirectory:
 
-1. [`src/parser_backup.rb`](src/parser_backup.rb:1) - Parser backup
-2. [`src/parser_fixed.rb`](src/parser_fixed.rb:1) - Fixed parser version
-3. [`src/parser_with_ambiguous_resolution.rb`](src/parser_with_ambiguous_resolution.rb:1) - Experimental parser
+1. [`patlang-core/parser_backup.rb`](patlang-core/parser_backup.rb:1) - Parser backup
+2. [`patlang-core/parser_fixed.rb`](patlang-core/parser_fixed.rb:1) - Fixed parser version
+3. [`patlang-core/parser_with_ambiguous_resolution.rb`](patlang-core/parser_with_ambiguous_resolution.rb:1) - Experimental parser
 
 ## File Size and Complexity Analysis
 
-### [`src/parser.rb`](src/parser.rb:1) - 617 lines (HIGH PRIORITY)
+### [`patlang-core/parser/parser.rb`](patlang-core/parser/parser.rb:1) - 617 lines (HIGH PRIORITY)
 **Current structure analysis:**
 - Lines 1-42: Core parser infrastructure (advance, eat, peek)
 - Lines 43-124: Ambiguous token resolution logic
@@ -66,11 +66,11 @@ Move to `src/archive/` subdirectory:
 
 **Complexity issues:**
 - Single class handling 6 major responsibilities
-- 80+ line [`resolve_all_ambiguous_tokens`](src/parser.rb:85) method
+- 80+ line [`resolve_all_ambiguous_tokens`](patlang-core/parser/parser.rb:85) method
 - Deeply nested expression parsing methods
 - Function parsing logic spread across multiple methods
 
-### [`src/evaluator.rb`](src/evaluator.rb:1) - 446 lines (MEDIUM PRIORITY)
+### [`patlang-core/evaluator/evaluator.rb`](patlang-core/evaluator/evaluator.rb:1) - 446 lines (MEDIUM PRIORITY)
 **Current structure analysis:**
 - Lines 1-48: Core evaluation dispatcher
 - Lines 50-137: Basic node visitors (numbers, operators, variables)
@@ -84,7 +84,7 @@ Move to `src/archive/` subdirectory:
 - Function evaluation logic is distinct (87+ lines)
 - Scope management could be extracted (30+ lines)
 
-### [`src/ast_nodes.rb`](src/ast_nodes.rb:1) - 244 lines (LOW PRIORITY)
+### [`patlang-core/ast/ast_nodes.rb`](patlang-core/ast/ast_nodes.rb:1) - 244 lines (LOW PRIORITY)
 **Current structure:**
 - Well-organized node definitions
 - Consistent structure across all node classes
@@ -94,84 +94,84 @@ Move to `src/archive/` subdirectory:
 ## Refactoring Strategy
 
 ### Phase 1: Parser Modularization
-Break [`src/parser.rb`](src/parser.rb:1) into focused components:
+Break [`patlang-core/parser/parser.rb`](patlang-core/parser/parser.rb:1) into focused components:
 
-#### [`src/parser/core_parser.rb`](src/parser/core_parser.rb:1)
+#### [`patlang-core/parser/core_parser.rb`](patlang-core/parser/core_parser.rb:1)
 - Basic parsing infrastructure (advance, eat, peek, error)
 - Statement-level parsing coordination
 - **Estimated size:** ~150 lines
 
-#### [`src/parser/expression_parser.rb`](src/parser/expression_parser.rb:1)
+#### [`patlang-core/parser/expression_parser.rb`](patlang-core/parser/expression_parser.rb:1)
 - Expression hierarchy (logical_or → primary)
 - Operator precedence handling
 - **Estimated size:** ~180 lines
 
-#### [`src/parser/function_parser.rb`](src/parser/function_parser.rb:1)
+#### [`patlang-core/parser/function_parser.rb`](patlang-core/parser/function_parser.rb:1)
 - Function definition parsing
 - Function call parsing (all syntaxes)
 - Parameter/argument handling
 - **Estimated size:** ~120 lines
 
-#### [`src/parser/control_flow_parser.rb`](src/parser/control_flow_parser.rb:1)
+#### [`patlang-core/parser/control_flow_parser.rb`](patlang-core/parser/control_flow_parser.rb:1)
 - If/then/else parsing
 - While loop parsing
 - Return statement parsing
 - **Estimated size:** ~80 lines
 
-#### [`src/parser/token_resolver.rb`](src/parser/token_resolver.rb:1)
+#### [`patlang-core/parser/token_resolver.rb`](patlang-core/parser/token_resolver.rb:1)
 - Ambiguous token resolution logic
 - Context-dependent token handling
 - **Estimated size:** ~85 lines
 
 ### Phase 2: Evaluator Modularization
-Break [`src/evaluator.rb`](src/evaluator.rb:1) into specialized evaluators:
+Break [`patlang-core/evaluator/evaluator.rb`](patlang-core/evaluator/evaluator.rb:1) into specialized evaluators:
 
-#### [`src/evaluator/core_evaluator.rb`](src/evaluator/core_evaluator.rb:1)
+#### [`patlang-core/evaluator/core_evaluator.rb`](patlang-core/evaluator/core_evaluator.rb:1)
 - Main evaluation dispatcher
 - Basic node visitors (numbers, variables, assignments)
 - **Estimated size:** ~120 lines
 
-#### [`src/evaluator/expression_evaluator.rb`](src/evaluator/expression_evaluator.rb:1)
+#### [`patlang-core/evaluator/expression_evaluator.rb`](patlang-core/evaluator/expression_evaluator.rb:1)
 - Binary operations
 - Comparison operations
 - Arithmetic evaluation
 - **Estimated size:** ~80 lines
 
-#### [`src/evaluator/string_evaluator.rb`](src/evaluator/string_evaluator.rb:1)
+#### [`patlang-core/evaluator/string_evaluator.rb`](patlang-core/evaluator/string_evaluator.rb:1)
 - String method handling
 - String operations
 - **Estimated size:** ~110 lines
 
-#### [`src/evaluator/function_evaluator.rb`](src/evaluator/function_evaluator.rb:1)
+#### [`patlang-core/evaluator/function_evaluator.rb`](patlang-core/evaluator/function_evaluator.rb:1)
 - Function definition storage
 - Function call execution
 - Parameter binding
 - **Estimated size:** ~90 lines
 
-#### [`src/evaluator/scope_manager.rb`](src/evaluator/scope_manager.rb:1)
+#### [`patlang-core/evaluator/scope_manager.rb`](patlang-core/evaluator/scope_manager.rb:1)
 - Scope stack management
 - Variable storage/retrieval
 - **Estimated size:** ~45 lines
 
 ### Phase 3: AST Node Grouping (Optional)
-If beneficial, group [`src/ast_nodes.rb`](src/ast_nodes.rb:1) by functionality:
+If beneficial, group [`patlang-core/ast/ast_nodes.rb`](patlang-core/ast/ast_nodes.rb:1) by functionality:
 
-#### [`src/ast_nodes/basic_nodes.rb`](src/ast_nodes/basic_nodes.rb:1)
+#### [`patlang-core/ast_nodes/basic_nodes.rb`](patlang-core/ast_nodes/basic_nodes.rb:1)
 - NumberNode, StringNode, BooleanNode, VariableNode
 
-#### [`src/ast_nodes/expression_nodes.rb`](src/ast_nodes/expression_nodes.rb:1)
+#### [`patlang-core/ast_nodes/expression_nodes.rb`](patlang-core/ast_nodes/expression_nodes.rb:1)
 - BinaryOpNode, ComparisonNode, MethodCallNode
 
-#### [`src/ast_nodes/control_flow_nodes.rb`](src/ast_nodes/control_flow_nodes.rb:1)
+#### [`patlang-core/ast_nodes/control_flow_nodes.rb`](patlang-core/ast_nodes/control_flow_nodes.rb:1)
 - IfNode, WhileNode, BlockNode
 
-#### [`src/ast_nodes/function_nodes.rb`](src/ast_nodes/function_nodes.rb:1)
+#### [`patlang-core/ast_nodes/function_nodes.rb`](patlang-core/ast_nodes/function_nodes.rb:1)
 - FunctionDefinitionNode, FunctionCallNode, ParameterNode, ReturnNode
 
 ## Implementation Plan
 
 ### Step 1: Environment Preparation
-1. Create archive directory: `src/archive/`
+1. Create archive directory: `patlang-core/archive/`
 2. Move backup parser files to archive
 3. Create parser and evaluator subdirectories
 
@@ -181,18 +181,18 @@ If beneficial, group [`src/ast_nodes.rb`](src/ast_nodes.rb:1) by functionality:
 3. Run full test suite to ensure no dependencies
 
 ### Step 3: Parser Refactoring (Medium Risk)
-1. Extract [`TokenResolver`](src/parser/token_resolver.rb:1) first (least dependent)
-2. Extract [`ExpressionParser`](src/parser/expression_parser.rb:1) (well-defined boundary)
-3. Extract [`FunctionParser`](src/parser/function_parser.rb:1) and [`ControlFlowParser`](src/parser/control_flow_parser.rb:1)
-4. Refactor [`CoreParser`](src/parser/core_parser.rb:1) to coordinate modules
+1. Extract [`TokenResolver`](patlang-core/parser/token_resolver.rb:1) first (least dependent)
+2. Extract [`ExpressionParser`](patlang-core/parser/expression_parser.rb:1) (well-defined boundary)
+3. Extract [`FunctionParser`](patlang-core/parser/function_parser.rb:1) and [`ControlFlowParser`](patlang-core/parser/control_flow_parser.rb:1)
+4. Refactor [`CoreParser`](patlang-core/parser/core_parser.rb:1) to coordinate modules
 5. Update require statements and test files
 
 ### Step 4: Evaluator Refactoring (Medium Risk)
-1. Extract [`ScopeManager`](src/evaluator/scope_manager.rb:1) (self-contained)
-2. Extract [`StringEvaluator`](src/evaluator/string_evaluator.rb:1) (clear boundary)
-3. Extract [`FunctionEvaluator`](src/evaluator/function_evaluator.rb:1)
-4. Extract [`ExpressionEvaluator`](src/evaluator/expression_evaluator.rb:1)
-5. Refactor [`CoreEvaluator`](src/evaluator/core_evaluator.rb:1) to coordinate modules
+1. Extract [`ScopeManager`](patlang-core/evaluator/scope_manager.rb:1) (self-contained)
+2. Extract [`StringEvaluator`](patlang-core/evaluator/string_evaluator.rb:1) (clear boundary)
+3. Extract [`FunctionEvaluator`](patlang-core/evaluator/function_evaluator.rb:1)
+4. Extract [`ExpressionEvaluator`](patlang-core/evaluator/expression_evaluator.rb:1)
+5. Refactor [`CoreEvaluator`](patlang-core/evaluator/core_evaluator.rb:1) to coordinate modules
 
 ### Step 5: Testing and Validation
 1. Run comprehensive test suite after each extraction

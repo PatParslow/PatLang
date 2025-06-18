@@ -16,8 +16,8 @@ The planning work has established three interconnected reasoning paradigms that 
 
 ### Core Design Principles
 
-- **Event-Driven Coordination**: Cross-paradigm communication through [`EventSystem`](../../src/object_model/event_system.rb:1)
-- **Object-Oriented Foundation**: Built on [`PatlangObject`](../../src/object_model/patlang_object.rb:1) infrastructure
+- **Event-Driven Coordination**: Cross-paradigm communication through [`EventSystem`](../../patlang-core/object_model/event_system.rb:1)
+- **Object-Oriented Foundation**: Built on [`PatlangObject`](../../patlang-core/object_model/patlang_object.rb:1) infrastructure
 - **Incremental Implementation**: Phased approach ensuring compatibility
 - **Test-Driven Development**: Comprehensive testing from the ground up
 
@@ -59,7 +59,7 @@ The planning work has established three interconnected reasoning paradigms that 
 
 #### Type Inference System
 - **UnificationEngine**: Robinson's algorithm with event notifications
-- **TypeConstraint**: Constraint representation as [`PatlangObject`](../../src/object_model/patlang_object.rb:96)
+- **TypeConstraint**: Constraint representation as [`PatlangObject`](../../patlang-core/object_model/patlang_object.rb:96)
 - **TypePropagationNetwork**: Event-driven constraint propagation
 - **TypeInferenceSystem**: Central coordination of type reasoning
 
@@ -237,7 +237,7 @@ The roadmap defines a systematic 17-week implementation across 5 phases:
 - [`UnificationEngine`](../../docs/development/unified-reasoning-architecture.md:77) with Robinson's algorithm
 - [`TypeConstraint`](../../docs/development/unified-reasoning-architecture.md:55) and [`TypePropagationNetwork`](../../docs/development/unified-reasoning-architecture.md:107)
 - Basic type constraint syntax in parser
-- Integration with existing [`Evaluator`](../../src/evaluator.rb:9)
+- Integration with existing [`Evaluator`](../../patlang-core/evaluator/evaluator.rb:9)
 
 #### Phase 2: Goal-Oriented Programming (4 weeks)
 - **Week 5**: Goal system foundation and lifecycle
@@ -246,7 +246,7 @@ The roadmap defines a systematic 17-week implementation across 5 phases:
 - **Week 8**: Advanced goal features and strategies
 
 **Key Deliverables:**
-- [`Goal`](../../docs/development/unified-reasoning-architecture.md:152) class with [`PatlangObject`](../../src/object_model/patlang_object.rb:1) integration
+- [`Goal`](../../docs/development/unified-reasoning-architecture.md:152) class with [`PatlangObject`](../../patlang-core/object_model/patlang_object.rb:1) integration
 - [`GoalResolutionEngine`](../../docs/development/unified-reasoning-architecture.md:186) with choice points
 - Goal declaration and pursuit syntax
 - Strategy pattern for resolution methods
@@ -387,7 +387,7 @@ This represents growth from the current 534 tests to approximately 834 tests, ma
 
 ### Evaluator Integration
 
-The reasoning systems integrate with the existing [`Evaluator`](../../src/evaluator.rb:9) through a new [`ReasoningEvaluator`](../../docs/development/unified-reasoning-architecture.md:421) module:
+The reasoning systems integrate with the existing [`Evaluator`](../../patlang-core/evaluator/evaluator.rb:9) through a new [`ReasoningEvaluator`](../../docs/development/unified-reasoning-architecture.md:421) module:
 
 ```ruby
 module EvaluatorModules
@@ -443,7 +443,7 @@ end
 - Lazy evaluation of reasoning chains
 
 ### Memory Management
-- Automatic cleanup using [`PatlangObject`](../../src/object_model/patlang_object.rb:183) lifecycle
+- Automatic cleanup using [`PatlangObject`](../../patlang-core/object_model/patlang_object.rb:183) lifecycle
 - Reference counting for constraint networks
 - Garbage collection integration
 - Memory pressure response strategies

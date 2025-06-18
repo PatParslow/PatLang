@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-This roadmap outlines a phased implementation strategy for integrating Type Inference, Goal-Oriented Programming, and Logic Programming into Patlang's existing infrastructure. The approach builds incrementally on the current [`PatlangObject`](../../src/object_model/patlang_object.rb:1) and [`EventSystem`](../../src/object_model/event_system.rb:1) foundation, ensuring compatibility with the established test infrastructure.
+This roadmap outlines a phased implementation strategy for integrating Type Inference, Goal-Oriented Programming, and Logic Programming into Patlang's existing infrastructure. The approach builds incrementally on the current [`PatlangObject`](../../patlang-core/object_model/patlang_object.rb:1) and [`EventSystem`](../../patlang-core/object_model/event_system.rb:1) foundation, ensuring compatibility with the established test infrastructure.
 
 ## Implementation Phases
 
@@ -12,12 +12,12 @@ This roadmap outlines a phased implementation strategy for integrating Type Infe
 
 **Objectives:**
 - Implement Robinson's unification algorithm
-- Integrate with [`PatlangObject`](../../src/object_model/patlang_object.rb:1) metadata system
+- Integrate with [`PatlangObject`](../../patlang-core/object_model/patlang_object.rb:1) metadata system
 - Add basic type constraint support
 
 **Deliverables:**
 ```
-src/reasoning/
+patlang-core/reasoning/
 ├── unification_engine.rb
 ├── type_constraint.rb
 ├── type_variable.rb
@@ -32,7 +32,7 @@ test/infrastructure/
 **Implementation Details:**
 
 ```ruby
-# src/reasoning/unification_engine.rb
+# patlang-core/reasoning/unification_engine.rb
 class UnificationEngine
   include EventSystem::EventCapable
   
@@ -107,11 +107,11 @@ end
 **Objectives:**
 - Build constraint propagation network
 - Implement basic type inference
-- Integration with existing [`Evaluator`](../../src/evaluator.rb:9)
+- Integration with existing [`Evaluator`](../../patlang-core/evaluator/evaluator.rb:9)
 
 **Deliverables:**
 ```ruby
-# src/reasoning/type_inference_system.rb
+# patlang-core/reasoning/type_inference_system.rb
 class TypeInferenceSystem
   include EventSystem::EventCapable
   
@@ -153,12 +153,12 @@ end
 
 **Objectives:**
 - Add AST nodes for type constraints
-- Extend [`ExpressionParser`](../../src/parser/expression_parser.rb:1) for type syntax
+- Extend [`ExpressionParser`](../../patlang-core/parser/expression_parser.rb:1) for type syntax
 - Basic language syntax support
 
 **Implementation:**
 ```ruby
-# src/ast_nodes.rb additions
+# patlang-core/ast/ast_nodes.rb additions
 class TypeConstraintNode < ASTNode
   attr_reader :variable, :constraint_type, :constraint_data
   
@@ -173,7 +173,7 @@ class TypeConstraintNode < ASTNode
   end
 end
 
-# src/parser/type_parser.rb
+# patlang-core/parser/type_parser.rb
 module ParserModules
   class TypeParser
     def initialize(parser)
@@ -233,11 +233,11 @@ end
 **Objectives:**
 - Implement goal representation and lifecycle
 - Basic goal pursuit mechanism
-- Integration with [`EventSystem`](../../src/object_model/event_system.rb:1)
+- Integration with [`EventSystem`](../../patlang-core/object_model/event_system.rb:1)
 
 **Deliverables:**
 ```ruby
-# src/reasoning/goal_system.rb
+# patlang-core/reasoning/goal_system.rb
 class Goal < PatlangObject
   def initialize(description, preconditions = [], postconditions = [])
     super({
@@ -297,7 +297,7 @@ end
 
 **Implementation:**
 ```ruby
-# src/reasoning/goal_resolution_engine.rb
+# patlang-core/reasoning/goal_resolution_engine.rb
 class GoalResolutionEngine
   include EventSystem::EventCapable
   
@@ -396,7 +396,7 @@ result = pursue find_maximum([1, 3, 2])
 
 **Implementation:**
 ```ruby
-# src/reasoning/facts_database.rb
+# patlang-core/reasoning/facts_database.rb
 class FactsDatabase
   include EventSystem::EventCapable
   
@@ -487,7 +487,7 @@ solutions = query grandparent(john, X)
 
 **Implementation:**
 ```ruby
-# src/reasoning/unified_reasoning_coordinator.rb
+# patlang-core/reasoning/unified_reasoning_coordinator.rb
 class UnifiedReasoningCoordinator
   include EventSystem::EventCapable
   

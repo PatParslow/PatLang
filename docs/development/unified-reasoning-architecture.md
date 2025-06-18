@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-This document specifies the technical architecture for integrating **Type Inference**, **Goal-Oriented Programming**, and **Logic Programming** paradigms within Patlang's existing object-oriented, event-driven infrastructure. The architecture leverages the established [`PatlangObject`](../../src/object_model/patlang_object.rb:1) foundation and [`EventSystem`](../../src/object_model/event_system.rb:1) to create a unified reasoning engine that coordinates constraint propagation, unification, and declarative programming.
+This document specifies the technical architecture for integrating **Type Inference**, **Goal-Oriented Programming**, and **Logic Programming** paradigms within Patlang's existing object-oriented, event-driven infrastructure. The architecture leverages the established [`PatlangObject`](../../patlang-core/object_model/patlang_object.rb:1) foundation and [`EventSystem`](../../patlang-core/object_model/event_system.rb:1) to create a unified reasoning engine that coordinates constraint propagation, unification, and declarative programming.
 
 ## Architecture Overview
 
@@ -49,7 +49,7 @@ This document specifies the technical architecture for integrating **Type Infere
 
 ### Type Constraint Engine
 
-Extends [`PatlangObject`](../../src/object_model/patlang_object.rb:96) metadata system to store type constraints:
+Extends [`PatlangObject`](../../patlang-core/object_model/patlang_object.rb:96) metadata system to store type constraints:
 
 ```ruby
 class TypeConstraint < PatlangObject
@@ -101,7 +101,7 @@ end
 
 ### Type Propagation Network
 
-Event-driven constraint propagation using existing [`EventSystem`](../../src/object_model/event_system.rb:286):
+Event-driven constraint propagation using existing [`EventSystem`](../../patlang-core/object_model/event_system.rb:286):
 
 ```ruby
 class TypePropagationNetwork
@@ -145,7 +145,7 @@ end
 
 ### Goal Stack Management
 
-Built on [`PatlangObject`](../../src/object_model/patlang_object.rb:1) for lifecycle tracking:
+Built on [`PatlangObject`](../../patlang-core/object_model/patlang_object.rb:1) for lifecycle tracking:
 
 ```ruby
 class Goal < PatlangObject
@@ -238,7 +238,7 @@ end
 
 ### Facts and Rules Database
 
-Extends [`PatlangObject`](../../src/object_model/patlang_object.rb:185) registry pattern:
+Extends [`PatlangObject`](../../patlang-core/object_model/patlang_object.rb:185) registry pattern:
 
 ```ruby
 class FactsDatabase
@@ -355,7 +355,7 @@ end
 
 ### Unified Reasoning Coordinator
 
-Central orchestration using [`EventSystem`](../../src/object_model/event_system.rb:369) message bus:
+Central orchestration using [`EventSystem`](../../patlang-core/object_model/event_system.rb:369) message bus:
 
 ```ruby
 class UnifiedReasoningCoordinator
@@ -413,10 +413,10 @@ end
 
 ### Evaluator Integration
 
-Extends existing [`Evaluator`](../../src/evaluator.rb:9) architecture:
+Extends existing [`Evaluator`](../../patlang-core/evaluator/evaluator.rb:9) architecture:
 
 ```ruby
-# In src/evaluator/reasoning_evaluator.rb
+# In patlang-core/evaluator/reasoning_evaluator.rb
 module EvaluatorModules
   class ReasoningEvaluator
     def initialize(evaluator)
@@ -470,7 +470,7 @@ end
 New AST nodes for reasoning constructs:
 
 ```ruby
-# In src/ast_nodes.rb extensions
+# In patlang-core/ast/ast_nodes.rb extensions
 class TypeConstraintNode < ASTNode
   attr_reader :variable, :constraint_type, :constraint_data
   
@@ -514,7 +514,7 @@ end
 
 ### Event System Optimization
 
-Leverages existing [`EventSystem`](../../src/object_model/event_system.rb:12) performance features:
+Leverages existing [`EventSystem`](../../patlang-core/object_model/event_system.rb:12) performance features:
 
 - Event batching for constraint propagation
 - Selective subscription patterns
@@ -523,7 +523,7 @@ Leverages existing [`EventSystem`](../../src/object_model/event_system.rb:12) pe
 
 ### Memory Management
 
-Uses [`PatlangObject`](../../src/object_model/patlang_object.rb:183) lifecycle management:
+Uses [`PatlangObject`](../../patlang-core/object_model/patlang_object.rb:183) lifecycle management:
 
 - Automatic cleanup of reasoning artifacts
 - Reference counting for constraint networks
@@ -605,7 +605,7 @@ end
 
 ### Event Security
 
-Extends [`EventSystem`](../../src/object_model/event_system.rb:1) security model:
+Extends [`EventSystem`](../../patlang-core/object_model/event_system.rb:1) security model:
 
 - Event source verification
 - Payload validation
@@ -618,7 +618,7 @@ This architecture provides a foundation for implementing unified reasoning capab
 
 1. **Incremental Implementation**: Each paradigm can be developed independently
 2. **Event-Driven Coordination**: Natural integration with existing patterns
-3. **Object-Oriented Foundation**: Leverages established [`PatlangObject`](../../src/object_model/patlang_object.rb:1) capabilities
+3. **Object-Oriented Foundation**: Leverages established [`PatlangObject`](../../patlang-core/object_model/patlang_object.rb:1) capabilities
 4. **Extensible Design**: Clean extension points for future reasoning paradigms
 
 The next phase involves detailed API design and implementation roadmap planning.

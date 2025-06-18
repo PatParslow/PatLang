@@ -207,17 +207,17 @@ The system builds a comprehensive map of relationships between source files and 
 ### Dependency Rules
 
 #### Infrastructure Tests
-- **Dependencies**: `src/lexer.rb`, `src/parser.rb`, `src/token.rb`, `src/ast_nodes.rb`
+- **Dependencies**: `patlang-core/lexer/lexer.rb`, `patlang-core/parser/parser.rb`, `patlang-core/lexer/token.rb`, `patlang-core/ast/ast_nodes.rb`
 - **Priority**: Highest (infrastructure changes affect everything)
 - **Fast Tests**: Core lexer and parser functionality
 
 #### Ruby Implementation Tests
-- **Dependencies**: `src/object_model/`, `src/evaluator.rb`
+- **Dependencies**: `patlang-core/object_model/`, `patlang-core/evaluator/evaluator.rb`
 - **Priority**: Medium (implementation-specific)
 - **Fast Tests**: Object model and string operations
 
 #### PATLANG Language Tests
-- **Dependencies**: All `src/` files (end-to-end testing)
+- **Dependencies**: All `patlang-core/` files (end-to-end testing)
 - **Priority**: Lower (integration tests)
 - **Fast Tests**: Basic integration scenarios
 
@@ -237,7 +237,7 @@ The system builds a comprehensive map of relationships between source files and 
       "priority": 1,
       "fast_tests": ["test_lexer.rb", "test_parser.rb"],
       "smoke_tests": ["test_lexer.rb"],
-      "dependencies": ["src/lexer.rb", "src/parser.rb"]
+      "dependencies": ["patlang-core/lexer/lexer.rb", "patlang-core/parser/parser.rb"]
     }
   }
 }

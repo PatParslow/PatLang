@@ -547,10 +547,10 @@ The grammar defines syntactic structure. Additional semantic constraints include
 
 ## Cross-References
 
-- **Lexer Implementation**: [`src/lexer.rb`](../../src/lexer.rb:1)
-- **Parser Implementation**: [`src/parser.rb`](../../src/parser.rb:1)
-- **Token Definitions**: [`src/token.rb`](../../src/token.rb:1)
-- **AST Node Definitions**: [`src/ast_nodes.rb`](../../src/ast_nodes.rb:1)
+- **Lexer Implementation**: [`patlang-core/lexer/lexer.rb`](../../patlang-core/lexer/lexer.rb:1)
+- **Parser Implementation**: [`patlang-core/parser/parser.rb`](../../patlang-core/parser/parser.rb:1)
+- **Token Definitions**: [`patlang-core/lexer/token.rb`](../../patlang-core/lexer/token.rb:1)
+- **AST Node Definitions**: [`patlang-core/ast/ast_nodes.rb`](../../patlang-core/ast/ast_nodes.rb:1)
 - **Language Examples**: [`examples/unified-reasoning-examples.md`](../../examples/unified-reasoning-examples.md:1)
 
 ## Conclusion

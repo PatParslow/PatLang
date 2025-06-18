@@ -11,6 +11,14 @@ Patlang introduces a unique approach to programming by combining:
 - **Strong type inference** with optional explicit typing
 - **Functional and procedural** programming paradigms
 
+## ⚠️ Architecture Migration Notice
+
+**Patlang has migrated to a new modular architecture!** If you're an existing user:
+
+- **New Entry Point**: `ruby ruby-host/bootstrap/patlang_bootstrap.rb` (was `ruby src/patlang.rb`)
+- **New Test Runner**: `ruby test/fixed_comprehensive_coverage_runner.rb`
+- **Migration Guide**: See [`ARCHITECTURE_MIGRATION_GUIDE.md`](ARCHITECTURE_MIGRATION_GUIDE.md) for complete migration instructions
+
 ## Current Development Status
 
 **Current Status**: Active Development - Solid Foundation (June 2025)
@@ -119,7 +127,7 @@ The current interpreter supports basic arithmetic evaluation:
 
 ```bash
 # Run the interactive arithmetic REPL
-ruby src/patlang.rb
+ruby ruby-host/bootstrap/patlang_bootstrap.rb
 
 # Try these working expressions in REPL:
 42                    # => 42
@@ -148,7 +156,7 @@ exit                 # => Goodbye!
 Run the test suite to see current development progress:
 ```bash
 # Run comprehensive tests (see current-test-status.txt for latest results)
-ruby test/comprehensive_test_suite_runner.rb
+ruby test/fixed_comprehensive_coverage_runner.rb
 
 # Current status: 40.7% passing (24/59 test files)
 # Strong areas: Core infrastructure (56% passing), Branch coverage (100% passing)
@@ -157,25 +165,42 @@ ruby test/comprehensive_test_suite_runner.rb
 
 ## Getting Involved
 
-1. Read the [Developer Guide](docs/development/developer-guide.md)
-2. Review the [Language Specification](docs/language/Patlang.md)
-3. Try the [Examples](docs/examples/)
-4. Check the [Development Plan](docs/development/devplan.md)
+1. **Migration**: Read the [Architecture Migration Guide](ARCHITECTURE_MIGRATION_GUIDE.md) for updated paths and commands
+2. **Development**: Read the [Developer Guide](docs/development/developer-guide.md) for contribution guidelines
+3. **Language**: Review the [Language Specification](docs/language/Patlang.md) for syntax and features
+4. **Architecture**: See the [Modular Architecture Overview](docs/architecture/MODULAR_ARCHITECTURE_OVERVIEW.md) for system design
+5. **Examples**: Try the [Examples](docs/examples/) to see Patlang in action
+6. **Planning**: Check the [Development Plan](docs/development/devplan.md) for roadmap
 
 ## Project Structure
 
 ```
 /
+├── patlang-core/         # Core language implementation
+│   ├── ast/             # Abstract Syntax Tree nodes
+│   ├── evaluator/       # Expression and statement evaluation
+│   ├── lexer/           # Tokenization and lexical analysis
+│   ├── object_model/    # Object system and type infrastructure
+│   ├── parser/          # Syntax parsing and analysis
+│   └── reasoning/       # Logic programming and constraint solving
+├── ruby-host/           # Ruby bootstrap and runtime environment
+│   ├── bootstrap/       # Language bootstrap and entry points
+│   ├── interop/         # Ruby-Patlang interoperability
+│   └── runtime/         # Runtime support and utilities
+├── dev-tools/           # Development and build tools
+│   ├── analysis/        # Code analysis tools
+│   ├── build/           # Build scripts and VS Code extensions
+│   ├── coverage/        # Coverage analysis tools
+│   └── testing/         # Test runners and diagnostic tools
 ├── docs/
-│   ├── language/          # Language specification and reference
-│   ├── development/       # Developer guides and processes  
-│   ├── testing/          # Test plans and strategies
-│   └── examples/         # Language examples and use cases
-├── src/                  # Future interpreter source code
-├── test/                 # Test files and frameworks
-├── tools/                # Build tools and scripts
-├── getting-started.md    # Quick start guide
-└── README.md            # This file
+│   ├── language/        # Language specification and reference
+│   ├── development/     # Developer guides and processes
+│   ├── testing/         # Test plans and strategies
+│   └── examples/        # Language examples and use cases
+├── test/                # Comprehensive test suite
+├── examples/            # Example programs and tutorials
+├── getting-started.md   # Quick start guide
+└── README.md           # This file
 ```
 
 ---

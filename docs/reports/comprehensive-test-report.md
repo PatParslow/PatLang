@@ -94,7 +94,7 @@ Execution Time: 29.5s
 - **test_parser_edge_cases.rb** (infrastructure)
   - Status: failed
   - Execution Time: 1.582s
-  - Error: #<Thread:0x000002d57c638630 E:/patlang/src/emergency_timeout.rb:18 run> terminated with exception (report_on_exception is true):
+  - Error: #<Thread:0x000002d57c638630 E:/patlang/ruby-host/bootstrap/emergency_timeout.rb:18 run> terminated with exception (report_on_exception is true):
 C:/Users/p/.local/share/gem/ruby/3.3.0/gems/minitest-5.25.5/lib/minitest...
 
 - **test_extended_string_methods.rb** (ruby_implementation)

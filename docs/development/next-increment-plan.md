@@ -24,10 +24,10 @@
 - ✅ Excellent code coverage (97.27% line, 88.31% branch)
 
 **Technical Implementation Completed:**
-- ✅ `IDENTIFIER` and `EQUALS` tokens in lexer ([`src/lexer.rb`](src/lexer.rb:1))
-- ✅ `AssignmentNode` and `VariableNode` AST nodes ([`src/ast_nodes.rb`](src/ast_nodes.rb:1))
-- ✅ Assignment statement parsing and evaluation ([`src/parser.rb`](src/parser.rb:1), [`src/evaluator.rb`](src/evaluator.rb:1))
-- ✅ Symbol table with variable persistence ([`src/evaluator.rb`](src/evaluator.rb:7))
+- ✅ `IDENTIFIER` and `EQUALS` tokens in lexer ([`patlang-core/lexer/lexer.rb`](patlang-core/lexer/lexer.rb:1))
+- ✅ `AssignmentNode` and `VariableNode` AST nodes ([`patlang-core/ast/ast_nodes.rb`](patlang-core/ast/ast_nodes.rb:1))
+- ✅ Assignment statement parsing and evaluation ([`patlang-core/parser/parser.rb`](patlang-core/parser/parser.rb:1), [`patlang-core/evaluator/evaluator.rb`](patlang-core/evaluator/evaluator.rb:1))
+- ✅ Symbol table with variable persistence ([`patlang-core/evaluator/evaluator.rb`](patlang-core/evaluator/evaluator.rb:7))
 - ✅ Error handling for undefined variable access
 - ✅ Integration testing and production readiness ([`test/test_integration.rb`](test/test_integration.rb:1))
 
@@ -159,11 +159,11 @@ end
 
 **Technical Implementation Reality:**
 - ✅ Function tokens: MAKE, FUNCTION, CALLED, TAKES, RETURNS, RETURN, CALL implemented
-- ⚠️ AST nodes: Function nodes exist, **MISSING** [`UnaryOpNode`](src/ast_nodes.rb), [`PrintNode`](src/ast_nodes.rb)
+- ⚠️ AST nodes: Function nodes exist, **MISSING** [`UnaryOpNode`](patlang-core/ast/ast_nodes.rb), [`PrintNode`](patlang-core/ast/ast_nodes.rb)
 - ⚠️ Parser: Function syntax works, **CRITICAL GAPS** in core expression parsing
 - ⚠️ Evaluator: Function storage works, **MISSING** evaluation for unary ops and print
 - ❌ **ASSESSMENT FAILURES**: Core functionality broken despite test claims
-- **Priority Fix**: Apply enhanced parser from [`todo_response.md`](todo_response.md) to [`src/parser.rb`](src/parser.rb)
+- **Priority Fix**: Apply enhanced parser from [`todo_response.md`](todo_response.md) to [`patlang-core/parser/parser.rb`](patlang-core/parser/parser.rb)
 
 **Working Syntax (Verified):**
 ```patlang

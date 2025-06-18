@@ -44,23 +44,23 @@ coverage_issues:
 
 ### **Current SimpleCov Configuration**
 ```ruby
-# From enhanced_comprehensive_test_suite_runner.rb
+# From enhanced_fixed_comprehensive_coverage_runner.rb
 SimpleCov.start do
   enable_coverage :branch
   add_filter '/test/'
   add_filter '/adhoc_scripts/'
   add_filter '/tools/'
   
-  track_files 'src/**/*.rb'
+  track_files 'patlang-core/**/*.rb'
   
   # Create separate groups for better organization
-  add_group 'Core Language', 'src/core'
-  add_group 'Evaluator', 'src/evaluator'
-  add_group 'Parser', 'src/parser'
-  add_group 'Lexer', 'src/lexer'
-  add_group 'Object Model', 'src/object_model'
-  add_group 'Reasoning', 'src/reasoning'
-  add_group 'Utilities', 'src/utils'
+  add_group 'Core Language', 'patlang-core/core'
+  add_group 'Evaluator', 'patlang-core/evaluator'
+  add_group 'Parser', 'patlang-core/parser'
+  add_group 'Lexer', 'patlang-core/lexer'
+  add_group 'Object Model', 'patlang-core/object_model'
+  add_group 'Reasoning', 'patlang-core/reasoning'
+  add_group 'Utilities', 'patlang-core/utils'
   
   formatter SimpleCov::Formatter::MultiFormatter.new([
     SimpleCov::Formatter::HTMLFormatter,
@@ -118,7 +118,7 @@ class LoadPathAnalyzer
     $LOAD_PATH.each_with_index { |path, i| puts "  #{i}: #{path}" }
     
     puts "\n=== Source File Detection ==="
-    source_files = Dir.glob("src/**/*.rb")
+    source_files = Dir.glob("patlang-core/**/*.rb")
     puts "Source files found: #{source_files.length}"
     source_files.each { |file| puts "  - #{file}" }
     
@@ -145,9 +145,9 @@ class LoadPathAnalyzer
   
   def find_source_file(requirement)
     possible_paths = [
-      "src/#{requirement}.rb",
+      "patlang-core/#{requirement}.rb",
       "#{requirement}.rb",
-      "src/**/#{requirement}.rb"
+      "patlang-core/**/#{requirement}.rb"
     ]
     
     possible_paths.each do |pattern|
@@ -282,7 +282,7 @@ class SourceConnectivityTester
   def test_source_file_loading
     puts "=== Source File Connectivity Test ==="
     
-    source_files = Dir.glob("src/**/*.rb")
+    source_files = Dir.glob("patlang-core/**/*.rb")
     puts "Testing #{source_files.length} source files..."
     
     source_files.each do |source_file|
@@ -341,8 +341,8 @@ class SourceConnectivityTester
       
       # Check if this points to a source file
       source_candidates = [
-        "src/#{requirement}.rb",
-        "src/#{requirement}",
+        "patlang-core/#{requirement}.rb",
+        "patlang-core/#{requirement}",
         requirement
       ]
       
@@ -351,7 +351,7 @@ class SourceConnectivityTester
       if source_file
         puts "  ✓ #{requirement} -> #{source_file}"
       else
-        puts "  ? #{requirement} (not in src/)"
+        puts "  ? #{requirement} (not in patlang-core/)"
       end
     end
   end
@@ -445,10 +445,10 @@ class SimpleCovIntegrationDebugger
       result = SimpleCov.result
       
       puts "Total files tracked: #{result.files.length}"
-      puts "Source files in src/: #{Dir.glob('src/**/*.rb').length}"
+      puts "Source files in patlang-core/: #{Dir.glob('patlang-core/**/*.rb').length}"
       
       # Check which files are being tracked
-      tracked_source_files = result.files.select { |f| f.filename.include?('src/') }
+      tracked_source_files = result.files.select { |f| f.filename.include?('patlang-core/') }
       puts "Source files tracked: #{tracked_source_files.length}"
       
       if tracked_source_files.empty?
@@ -464,7 +464,7 @@ class SimpleCovIntegrationDebugger
     
     filters = SimpleCov.filters
     test_files = Dir.glob("test/**/*.rb")
-    source_files = Dir.glob("src/**/*.rb")
+    source_files = Dir.glob("patlang-core/**/*.rb")
     
     puts "Filters configured: #{filters.length}"
     
@@ -553,7 +553,7 @@ class ExecutionEnvironmentAnalyzer
     puts "Analyzing test runner execution..."
     
     # Execute via the test runner and check coverage
-    result = execute_command("ruby test/enhanced_comprehensive_test_suite_runner.rb --health-check")
+    result = execute_command("ruby test/enhanced_fixed_comprehensive_coverage_runner.rb --health-check")
     puts "Test runner execution result: #{result[:exit_code]}"
     analyze_coverage_in_output(result[:output])
   end
@@ -879,4 +879,4 @@ This investigation will transform the current successful test discovery and exec
 - [`TEST_SUITE_INVESTIGATION_REPORT.md`](TEST_SUITE_INVESTIGATION_REPORT.md)
 - [`TEST_SUITE_BASELINE_METRICS.md`](TEST_SUITE_BASELINE_METRICS.md)
 - [`TEST_SUITE_MAINTENANCE_GUIDE.md`](TEST_SUITE_MAINTENANCE_GUIDE.md)
-- [`enhanced_comprehensive_test_suite_runner.rb`](test/enhanced_comprehensive_test_suite_runner.rb)
+- [`enhanced_fixed_comprehensive_coverage_runner.rb`](test/enhanced_fixed_comprehensive_coverage_runner.rb)

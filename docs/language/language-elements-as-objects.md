@@ -218,7 +218,7 @@ Each variable in v0.2.0 maintains:
 The v0.2.0 evaluator uses a symbol table that serves as the foundation for variable objects:
 
 ```ruby
-# Current implementation in src/evaluator.rb
+# Current implementation in patlang-core/evaluator/evaluator.rb
 class Evaluator
   def initialize
     @symbol_table = {}  # Maps variable names to values

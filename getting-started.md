@@ -83,10 +83,10 @@ git clone https://github.com/your-org/patlang.git
 cd patlang
 
 # Run the interactive arithmetic REPL
-ruby src/patlang.rb
+ruby ruby-host/bootstrap/patlang_bootstrap.rb
 
 # Run the comprehensive test suite to see current status
-ruby test/comprehensive_test_suite_runner.rb
+ruby test/fixed_comprehensive_coverage_runner.rb
 ```
 
 ### ✅ Try the Working Arithmetic Interpreter
@@ -167,7 +167,7 @@ Let's start with what actually works right now:
 
 ```bash
 # Start the PatLang REPL
-ruby src/patlang.rb
+ruby ruby-host/bootstrap/patlang_bootstrap.rb
 
 # Try your first expressions:
 > 42
@@ -1899,7 +1899,7 @@ Congratulations! You've learned about PatLang's multi-paradigm vision and tried 
 1. **✅ Try the Working Interpreter**: Get hands-on with what works now
    ```bash
    # Try the working arithmetic interpreter
-   ruby src/patlang.rb
+   ruby ruby-host/bootstrap/patlang_bootstrap.rb
    
    # Explore the core with some calculations
    > 2 + 3 * 4
@@ -1913,7 +1913,7 @@ Congratulations! You've learned about PatLang's multi-paradigm vision and tried 
 2. **🧪 Run the Test Suite**: See the current development progress
    ```bash
    # Run comprehensive tests
-   ruby test/comprehensive_test_suite_runner.rb
+   ruby test/fixed_comprehensive_coverage_runner.rb
    
    # Current results: 40.7% passing, strong infrastructure foundation
    ```
@@ -1948,7 +1948,7 @@ Congratulations! You've learned about PatLang's multi-paradigm vision and tried 
 - **📊 Current Status**: [`current-test-status.txt`](current-test-status.txt) - Live development progress
 - **🧪 Test Suite**: [`test/`](test/) - 59 test files showing development areas
 - **📖 Documentation**: [`docs/`](docs/) - Language specification and development guides
-- **💻 Source Code**: [`src/`](src/) - Working interpreter implementation
+- **💻 Source Code**: [`patlang-core/`](patlang-core/) - Working interpreter implementation
 - **💬 GitHub Repository**: Report issues, contribute, track development
 
 ### Contributing to PatLang

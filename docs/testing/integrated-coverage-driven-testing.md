@@ -101,10 +101,10 @@ ruby test/production_readiness_validator.rb
 
 ### Automated Gap Detection
 The system identifies coverage gaps in:
-- `src/lexer.rb` - Token parsing and error handling
-- `src/parser.rb` - AST construction and syntax analysis  
-- `src/evaluator.rb` - Expression evaluation and type handling
-- `src/reasoning/unification_engine.rb` - Logic programming features
+- `patlang-core/lexer/lexer.rb` - Token parsing and error handling
+- `patlang-core/parser/parser.rb` - AST construction and syntax analysis  
+- `patlang-core/evaluator/evaluator.rb` - Expression evaluation and type handling
+- `patlang-core/reasoning/unification_engine.rb` - Logic programming features
 
 ### Targeted Test Selection
 Coverage gaps automatically trigger:

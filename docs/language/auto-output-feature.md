@@ -75,12 +75,12 @@ result                          # → big number
 The auto-output feature is implemented using three key components:
 
 1. **AutoOutputNode**: New AST node type that wraps expressions requiring auto-output
-2. **Parser Enhancement**: Modified [`statement()`](../src/parser.rb:162) method to detect standalone expressions
-3. **Evaluator Enhancement**: New [`visit_auto_output_node()`](../src/evaluator.rb:691) method for handling output
+2. **Parser Enhancement**: Modified [`statement()`](../patlang-core/parser/parser.rb:162) method to detect standalone expressions
+3. **Evaluator Enhancement**: New [`visit_auto_output_node()`](../patlang-core/evaluator/evaluator.rb:691) method for handling output
 
 ### Detection Logic
 
-The parser identifies standalone expressions by checking if a parsed expression falls through to the default [`expression()`](../src/parser.rb:226) handler rather than being handled by specific statement types (assignments, conditionals, etc.).
+The parser identifies standalone expressions by checking if a parsed expression falls through to the default [`expression()`](../patlang-core/parser/parser.rb:226) handler rather than being handled by specific statement types (assignments, conditionals, etc.).
 
 ### Output Formatting
 
@@ -95,9 +95,9 @@ Values are formatted appropriately based on their data type:
 
 ### Files Modified
 
-- [`src/ast_nodes.rb`](../src/ast_nodes.rb): Added [`AutoOutputNode`](../src/ast_nodes.rb:196) class
-- [`src/parser.rb`](../src/parser.rb): Modified [`statement()`](../src/parser.rb:162) method to wrap standalone expressions
-- [`src/evaluator.rb`](../src/evaluator.rb): Added [`visit_auto_output_node()`](../src/evaluator.rb:691) method and case handling
+- [`patlang-core/ast/ast_nodes.rb`](../patlang-core/ast/ast_nodes.rb): Added [`AutoOutputNode`](../patlang-core/ast/ast_nodes.rb:196) class
+- [`patlang-core/parser/parser.rb`](../patlang-core/parser/parser.rb): Modified [`statement()`](../patlang-core/parser/parser.rb:162) method to wrap standalone expressions
+- [`patlang-core/evaluator/evaluator.rb`](../patlang-core/evaluator/evaluator.rb): Added [`visit_auto_output_node()`](../patlang-core/evaluator/evaluator.rb:691) method and case handling
 
 ### Testing
 
