@@ -4,7 +4,7 @@ require 'minitest/autorun'
 require_relative '../helpers/test_helper'
 require_relative '../../src/reasoning/reasoning_coordinator'
 require_relative '../../src/reasoning/goal_system'
-require_relative '../../src/evaluator'
+require_relative '../../patlang-core/evaluator/evaluator'
 
 # Comprehensive integration tests for the unified reasoning system
 class TestUnifiedReasoningIntegration < Minitest::Test

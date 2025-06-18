@@ -50,7 +50,7 @@ puts "\n🎯 RUNNING CORE ARITHMETIC TESTS:"
 require_relative 'src/lexer'
 require_relative 'src/parser'
 require_relative 'src/evaluator'
-require_relative 'src/patlang'
+require_relative 'ruby-host/bootstrap/patlang'
 
 # Simple arithmetic tests
 arithmetic_tests = [

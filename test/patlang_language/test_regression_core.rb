@@ -1,6 +1,6 @@
 #!/usr/bin/env ruby
 
-require_relative '../../src/patlang'
+require_relative '../../ruby-host/bootstrap/patlang'
 
 puts '🔍 CORE REGRESSION TEST FOR FLEXIBLE FUNCTION SYNTAX'
 puts '=' * 60

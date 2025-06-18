@@ -1,5 +1,5 @@
 require_relative '../helpers/test_helper'
-require_relative '../../src/lexer'
+require_relative '../../patlang-core/lexer/lexer'
 
 class TestFunctionLexer < Minitest::Test
   def test_function_keywords

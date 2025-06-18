@@ -1,6 +1,6 @@
 require_relative '../helpers/test_helper'
-require_relative '../../src/lexer'
-require_relative '../../src/exceptions'
+require_relative '../../patlang-core/lexer/lexer'
+require_relative '../../patlang-core/exceptions'
 
 class TestLexerErrorScenarios < Minitest::Test
   def setup

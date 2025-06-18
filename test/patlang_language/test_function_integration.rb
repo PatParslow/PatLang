@@ -1,10 +1,10 @@
 # frozen_string_literal: true
 
 require 'minitest/autorun'
-require_relative '../../src/lexer'
-require_relative '../../src/parser'
-require_relative '../../src/evaluator'
-require_relative '../../src/ast_nodes'
+require_relative '../../patlang-core/lexer/lexer'
+require_relative '../../patlang-core/parser/parser'
+require_relative '../../patlang-core/evaluator/evaluator'
+require_relative '../../patlang-core/ast/ast_nodes'
 
 class TestFunctionIntegration < Minitest::Test
   def parse_and_evaluate(input)

@@ -2,10 +2,10 @@ require_relative '../helpers/test_helper'
 require_relative '../../src/ast/identifier_node'
 require_relative '../../src/ast/number_node'
 require_relative '../../src/ast/string_node'
-require_relative '../../src/parser'
-require_relative '../../src/lexer'
-require_relative '../../src/ast_nodes'
-require_relative '../../src/exceptions'
+require_relative '../../patlang-core/parser/parser'
+require_relative '../../patlang-core/lexer/lexer'
+require_relative '../../patlang-core/ast/ast_nodes'
+require_relative '../../patlang-core/exceptions'
 
 class TestParserBranchCoverage < Minitest::Test
   def setup

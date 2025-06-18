@@ -34,7 +34,7 @@ puts "-" * 30
 
 begin
   puts "Attempting to require lexer..."
-  require_relative '../src/lexer'
+  require_relative '../patlang-core/lexer/lexer'
   puts "✅ Lexer required successfully"
   
   # Check if Lexer class is defined

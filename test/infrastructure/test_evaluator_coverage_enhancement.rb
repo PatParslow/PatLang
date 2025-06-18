@@ -1,8 +1,8 @@
 require 'minitest/autorun'
-require_relative '../../src/evaluator'
-require_relative '../../src/parser'
-require_relative '../../src/lexer'
-require_relative '../../src/ast_nodes'
+require_relative '../../patlang-core/evaluator/evaluator'
+require_relative '../../patlang-core/parser/parser'
+require_relative '../../patlang-core/lexer/lexer'
+require_relative '../../patlang-core/ast/ast_nodes'
 
 # Additional evaluator tests to achieve 90% coverage on working features
 # Focus on arithmetic evaluation and basic functionality

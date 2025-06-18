@@ -1,5 +1,5 @@
 require_relative '../test_helper'
-require_relative '../../src/ast_nodes'
+require_relative '../../patlang-core/ast/ast_nodes'
 
 # Comprehensive test suite for AST Nodes - Phase 1 Foundation
 # Target: 80%+ coverage for src/ast_nodes.rb

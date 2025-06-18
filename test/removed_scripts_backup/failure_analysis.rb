@@ -79,7 +79,7 @@ class FailureAnalyzer
   
   def self.check_type_expectation_issues
     puts "\n🎯 Type Expectation Analysis:"
-    require_relative '../src/evaluator'
+    require_relative '../patlang-core/evaluator/evaluator'
     
     evaluator = Evaluator.new
     

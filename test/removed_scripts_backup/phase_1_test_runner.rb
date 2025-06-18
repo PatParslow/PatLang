@@ -61,8 +61,8 @@ class Phase1TestRunner
     # Explicitly require source files for coverage tracking
     puts "📝 Loading source files for coverage tracking..."
     require_relative '../src/ast_nodes'
-    require_relative '../src/lexer'
-    require_relative '../src/token'
+    require_relative '../patlang-core/lexer/lexer'
+    require_relative '../patlang-core/lexer/token'
     
     # Load Phase 1 core tests
     puts "📝 Loading Phase 1 test suites..."

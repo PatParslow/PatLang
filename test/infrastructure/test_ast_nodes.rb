@@ -1,5 +1,5 @@
 require 'minitest/autorun'
-require_relative '../../src/ast_nodes'
+require_relative '../../patlang-core/ast/ast_nodes'
 
 class TestASTNodes < Minitest::Test
   # Tests for BooleanNode

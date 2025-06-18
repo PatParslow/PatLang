@@ -24,7 +24,7 @@ end
 # Test 2: Check reasoning mode functionality
 puts "\n📋 TEST 2: Reasoning Mode Implementation"
 begin
-  require_relative '../src/evaluator'
+  require_relative '../patlang-core/evaluator/evaluator'
   evaluator = Evaluator.new
   
   # Test enable reasoning mode
@@ -48,8 +48,8 @@ test_cases = [
   'email matches /\\w+@\\w+\\.\\w+/'
 ]
 
-require_relative '../src/parser'
-require_relative '../src/lexer'
+require_relative '../patlang-core/parser/parser'
+require_relative '../patlang-core/lexer/lexer'
 
 test_cases.each_with_index do |syntax, index|
   puts "\n   Test #{index + 1}: #{syntax}"
@@ -100,7 +100,7 @@ puts "\n📋 TEST 5: Core Function Implementations"
 core_functions = ['knows', 'likes', 'parent', 'ancestor']
 
 begin
-  require_relative '../src/evaluator'
+  require_relative '../patlang-core/evaluator/evaluator'
   evaluator = Evaluator.new
   
   core_functions.each do |func|

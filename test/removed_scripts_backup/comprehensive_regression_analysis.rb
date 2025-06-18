@@ -306,7 +306,7 @@ class ComprehensiveRegressionAnalyzer
     puts "  ✓ Testing lexer functionality..."
     
     begin
-      require_relative '../src/lexer'
+      require_relative '../patlang-core/lexer/lexer'
       
       lexer = Lexer.new("1 + 2")
       tokens = lexer.tokenize
@@ -335,8 +335,8 @@ class ComprehensiveRegressionAnalyzer
     puts "  ✓ Testing parser functionality..."
     
     begin
-      require_relative '../src/parser'
-      require_relative '../src/lexer'
+      require_relative '../patlang-core/parser/parser'
+      require_relative '../patlang-core/lexer/lexer'
       
       lexer = Lexer.new("1 + 2")
       tokens = lexer.tokenize

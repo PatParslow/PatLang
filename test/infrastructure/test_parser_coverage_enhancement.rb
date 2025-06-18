@@ -1,7 +1,7 @@
 require 'minitest/autorun'
-require_relative '../../src/parser'
-require_relative '../../src/lexer'
-require_relative '../../src/ast_nodes'
+require_relative '../../patlang-core/parser/parser'
+require_relative '../../patlang-core/lexer/lexer'
+require_relative '../../patlang-core/ast/ast_nodes'
 
 # Additional parser tests to achieve 90% coverage on working features
 # Focus on arithmetic, assignments, and basic parsing - avoid control flow

@@ -2,7 +2,7 @@
 
 require 'minitest/autorun'
 require_relative '../helpers/test_helper'
-require_relative '../../src/evaluator'
+require_relative '../../patlang-core/evaluator/evaluator'
 require_relative '../../src/reasoning/performance_optimizer'
 require_relative '../../src/reasoning/cross_paradigm_coordinator'
 require_relative '../../src/reasoning/advanced_goal_strategies'

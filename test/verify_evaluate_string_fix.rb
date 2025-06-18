@@ -7,7 +7,7 @@ puts "=" * 40
 
 begin
   # Load the updated evaluator
-  require_relative '../src/evaluator'
+  require_relative '../patlang-core/evaluator/evaluator'
   
   puts "✅ Evaluator class loaded successfully"
   

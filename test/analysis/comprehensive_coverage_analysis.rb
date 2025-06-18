@@ -31,7 +31,7 @@ require_relative 'src/parser'
 require_relative 'src/evaluator'
 require_relative 'src/ast_nodes'
 require_relative 'src/token'
-require_relative 'src/patlang'
+require_relative 'ruby-host/bootstrap/patlang'
 
 # Test basic functionality to trigger code execution
 puts "\n📊 TRIGGERING CODE EXECUTION FOR COVERAGE ANALYSIS:"

@@ -3,8 +3,8 @@
 # Test file to verify lexer error handling specification compliance
 # This file demonstrates and tests the "Never Fail, Always Token" principle
 
-require_relative '../src/lexer'
-require_relative '../src/token'
+require_relative '../patlang-core/lexer/lexer'
+require_relative '../patlang-core/lexer/token'
 
 class TestLexerErrorHandlingSpecification
   def initialize

@@ -1,8 +1,8 @@
 #!/usr/bin/env ruby
 
-require_relative '../src/evaluator'
-require_relative '../src/lexer'
-require_relative '../src/parser'
+require_relative '../patlang-core/evaluator/evaluator'
+require_relative '../patlang-core/lexer/lexer'
+require_relative '../patlang-core/parser/parser'
 
 # Test cases for automatic output functionality
 class TestAutoOutputFunctionality

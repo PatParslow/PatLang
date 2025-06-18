@@ -2,14 +2,14 @@
 
 require 'minitest/autorun'
 require_relative '../helpers/test_helper'
-require_relative '../../src/evaluator'
-require_relative '../../src/parser'
-require_relative '../../src/lexer'
+require_relative '../../patlang-core/evaluator/evaluator'
+require_relative '../../patlang-core/parser/parser'
+require_relative '../../patlang-core/lexer/lexer'
 require_relative '../../src/reasoning/reasoning_coordinator'
 require_relative '../../src/reasoning/form_validator'
 require_relative '../../src/reasoning/goal_system'
 require_relative '../../src/reasoning/facts_database'
-require_relative '../../src/patlang'
+require_relative '../../ruby-host/bootstrap/patlang'
 
 # Test end-to-end evaluator integration with reasoning systems
 # This demonstrates how reasoning features are accessible through Patlang.evaluate()

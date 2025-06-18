@@ -20,9 +20,9 @@ end
 # Load source files AFTER SimpleCov is configured but BEFORE test constants
 puts "📊 Loading source files for coverage tracking..."
 begin
-  require_relative '../../src/lexer'
-  require_relative '../../src/token'
-  require_relative '../../src/ast_nodes'
+  require_relative '../../patlang-core/lexer/lexer'
+  require_relative '../../patlang-core/lexer/token'
+  require_relative '../../patlang-core/ast/ast_nodes'
   puts "✅ Source files loaded for coverage tracking"
 rescue LoadError => e
   puts "⚠️  Warning: Some source files not found: #{e.message}"
@@ -73,7 +73,7 @@ class Minitest::Test
   end
 end
 
-require_relative '../../src/exceptions'
+require_relative '../../patlang-core/exceptions'
 # Mock Evaluator for testing ReasoningCoordinator
 class MockEvaluator
   def initialize

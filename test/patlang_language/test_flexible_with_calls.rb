@@ -1,6 +1,6 @@
 #!/usr/bin/env ruby
 
-require_relative '../../src/patlang'
+require_relative '../../ruby-host/bootstrap/patlang'
 
 puts '🎯 TESTING FLEXIBLE FUNCTION SYNTAX WITH CALLS'
 puts '=' * 50

@@ -1,6 +1,6 @@
 require 'minitest/autorun'
-require_relative '../../src/lexer'
-require_relative '../../src/token'
+require_relative '../../patlang-core/lexer/lexer'
+require_relative '../../patlang-core/lexer/token'
 
 # Additional lexer tests to achieve 90% coverage on working features
 class TestLexerCoverageEnhancement < Minitest::Test

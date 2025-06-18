@@ -4,9 +4,9 @@
 # Tests both traditional '=' and revolutionary 'is' assignment syntax
 # Plus elegant MAKE patterns as suggested
 
-require_relative '../../src/lexer'
-require_relative '../../src/parser'
-require_relative '../../src/evaluator'
+require_relative '../../patlang-core/lexer/lexer'
+require_relative '../../patlang-core/parser/parser'
+require_relative '../../patlang-core/evaluator/evaluator'
 
 def test_assignment_syntax
   puts "🚀 TESTING PATLANG'S REVOLUTIONARY 'IS' KEYWORD IMPLEMENTATION"

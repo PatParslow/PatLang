@@ -111,14 +111,14 @@ class TestErrorHandlingCoverage < Minitest::Test
   end
 
   def test_variable_node_value_method
-    require_relative '../../src/ast_nodes'
+    require_relative '../../patlang-core/ast/ast_nodes'
     
     node = VariableNode.new('test_var')
     assert_equal 'test_var', node.value
   end
 
   def test_error_node_handling
-    require_relative '../../src/ast_nodes'
+    require_relative '../../patlang-core/ast/ast_nodes'
     
     # Create mock ErrorNode if it doesn't exist
     error_node_class = Class.new do
@@ -156,7 +156,7 @@ class TestErrorHandlingCoverage < Minitest::Test
   end
 
   def test_parser_error_recovery_branches
-    require_relative '../../src/parser'
+    require_relative '../../patlang-core/parser/parser'
     
     parser = Parser.new([])
     

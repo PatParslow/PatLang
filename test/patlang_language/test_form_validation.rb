@@ -2,9 +2,9 @@
 
 require 'minitest/autorun'
 require_relative '../helpers/test_helper'
-require_relative '../../src/evaluator'
-require_relative '../../src/parser'
-require_relative '../../src/lexer'
+require_relative '../../patlang-core/evaluator/evaluator'
+require_relative '../../patlang-core/parser/parser'
+require_relative '../../patlang-core/lexer/lexer'
 require_relative '../../src/reasoning/form_validator'
 
 # Test comprehensive form validation using type constraints

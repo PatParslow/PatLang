@@ -1,6 +1,6 @@
 require_relative '../test_helper'
-require_relative '../../src/lexer'
-require_relative '../../src/token'
+require_relative '../../patlang-core/lexer/lexer'
+require_relative '../../patlang-core/lexer/token'
 
 # Comprehensive test suite for Lexer - Phase 1 Foundation
 # Target: 75%+ coverage for src/lexer.rb

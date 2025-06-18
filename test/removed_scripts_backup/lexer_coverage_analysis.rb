@@ -4,8 +4,8 @@ SimpleCov.start do
   enable_coverage :line
 end
 
-require_relative '../src/lexer'
-require_relative '../src/token'
+require_relative '../patlang-core/lexer/lexer'
+require_relative '../patlang-core/lexer/token'
 
 # Test current lexer functionality to see what's covered
 def test_basic_lexer_coverage

@@ -1,9 +1,9 @@
 #!/usr/bin/env ruby
 
 require_relative 'test_helper'
-require_relative '../src/lexer'
-require_relative '../src/parser'
-require_relative '../src/evaluator'
+require_relative '../patlang-core/lexer/lexer'
+require_relative '../patlang-core/parser/parser'
+require_relative '../patlang-core/evaluator/evaluator'
 require_relative '../src/object_model/patlang_object'
 require_relative '../src/object_model/number_object'
 require_relative '../src/object_model/string_object'

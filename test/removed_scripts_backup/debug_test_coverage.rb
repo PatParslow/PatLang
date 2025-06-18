@@ -10,8 +10,8 @@ end
 
 # Load source files first
 require_relative '../src/ast_nodes'
-require_relative '../src/lexer'
-require_relative '../src/token'
+require_relative '../patlang-core/lexer/lexer'
+require_relative '../patlang-core/lexer/token'
 
 # Load test files
 require_relative 'helpers/test_helper'

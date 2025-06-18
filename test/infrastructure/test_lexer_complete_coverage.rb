@@ -1,8 +1,8 @@
 # frozen_string_literal: true
 
 require 'minitest/autorun'
-require_relative '../../src/lexer'
-require_relative '../../src/token'
+require_relative '../../patlang-core/lexer/lexer'
+require_relative '../../patlang-core/lexer/token'
 
 # Comprehensive lexer coverage tests for Phase 1 (High Priority) and Phase 2 (Medium Priority) gaps
 # Tests follow the "Never Fail, Always Token" principle - lexer must never raise exceptions

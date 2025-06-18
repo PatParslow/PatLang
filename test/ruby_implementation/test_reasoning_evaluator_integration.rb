@@ -3,7 +3,7 @@
 require 'minitest/autorun'
 require_relative '../helpers/test_helper'
 require_relative '../../src/reasoning/reasoning_coordinator'
-require_relative '../../src/evaluator'
+require_relative '../../patlang-core/evaluator/evaluator'
 
 # Comprehensive tests for reasoning system integration with the Ruby evaluator
 class TestReasoningEvaluatorIntegration < Minitest::Test

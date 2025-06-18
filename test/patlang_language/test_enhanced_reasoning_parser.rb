@@ -2,9 +2,9 @@
 
 require 'minitest/autorun'
 require_relative '../helpers/test_helper'
-require_relative '../../src/parser'
-require_relative '../../src/lexer'
-require_relative '../../src/ast_nodes'
+require_relative '../../patlang-core/parser/parser'
+require_relative '../../patlang-core/lexer/lexer'
+require_relative '../../patlang-core/ast/ast_nodes'
 
 # Test enhanced reasoning parser integration with advanced syntax support
 class TestEnhancedReasoningParser < Minitest::Test

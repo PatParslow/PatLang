@@ -1,8 +1,8 @@
 require_relative '../helpers/test_helper'
-require_relative '../../src/lexer'
-require_relative '../../src/parser'
-require_relative '../../src/evaluator'
-require_relative '../../src/exceptions'
+require_relative '../../patlang-core/lexer/lexer'
+require_relative '../../patlang-core/parser/parser'
+require_relative '../../patlang-core/evaluator/evaluator'
+require_relative '../../patlang-core/exceptions'
 
 class TestFunctionEvaluator < Minitest::Test
   def setup

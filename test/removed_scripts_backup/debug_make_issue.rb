@@ -1,7 +1,7 @@
 #!/usr/bin/env ruby
 
-require_relative '../src/lexer'
-require_relative '../src/parser'
+require_relative '../patlang-core/lexer/lexer'
+require_relative '../patlang-core/parser/parser'
 
 # Debug the MAKE token issue
 test_code = "make z 25"

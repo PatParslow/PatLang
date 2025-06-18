@@ -1,8 +1,8 @@
 # frozen_string_literal: true
 
 require 'minitest/autorun'
-require_relative '../../src/lexer'
-require_relative '../../src/token'
+require_relative '../../patlang-core/lexer/lexer'
+require_relative '../../patlang-core/lexer/token'
 
 # Phase 3 (Low Priority) Edge Case Tests for Complete Lexer Coverage
 # Targets remaining 10-15% coverage gap to achieve 95-100% coverage

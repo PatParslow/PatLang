@@ -3,7 +3,7 @@ require_relative '../helpers/test_helper'
 class TestEvaluatorErrorHandling < Minitest::Test
   def setup
     begin
-      require_relative '../../src/evaluator'
+      require_relative '../../patlang-core/evaluator/evaluator'
       @evaluator = Evaluator.new
     rescue LoadError, NameError
       @evaluator = nil

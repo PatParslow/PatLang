@@ -1,5 +1,5 @@
 require_relative '../helpers/test_helper'
-require_relative '../../src/patlang'
+require_relative '../../ruby-host/bootstrap/patlang'
 
 class TestFunctionValidation < Minitest::Test
   def test_basic_function_definition_and_call

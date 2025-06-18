@@ -21,7 +21,7 @@ puts "\n📊 TESTING CORE ARITHMETIC (KNOWN WORKING):"
 require_relative 'src/lexer'
 require_relative 'src/parser'
 require_relative 'src/evaluator'
-require_relative 'src/patlang'
+require_relative 'ruby-host/bootstrap/patlang'
 
 # Test basic arithmetic that we know works
 working_arithmetic = [

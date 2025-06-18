@@ -1,9 +1,9 @@
 # frozen_string_literal: true
 
 require_relative '../helpers/test_helper'
-require_relative '../../src/lexer'
-require_relative '../../src/parser'
-require_relative '../../src/token'
+require_relative '../../patlang-core/lexer/lexer'
+require_relative '../../patlang-core/parser/parser'
+require_relative '../../patlang-core/lexer/token'
 require_relative '../../src/emergency_timeout'
 require 'minitest/autorun'
 

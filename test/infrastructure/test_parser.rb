@@ -1,7 +1,7 @@
 require_relative '../helpers/test_helper'
-require_relative '../../src/parser'
-require_relative '../../src/lexer'
-require_relative '../../src/ast_nodes'
+require_relative '../../patlang-core/parser/parser'
+require_relative '../../patlang-core/lexer/lexer'
+require_relative '../../patlang-core/ast/ast_nodes'
 
 class TestParser < Minitest::Test
   def test_parse_simple_number

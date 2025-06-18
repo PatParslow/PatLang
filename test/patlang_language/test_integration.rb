@@ -1,7 +1,7 @@
 require 'minitest/autorun'
-require_relative '../../src/lexer'
-require_relative '../../src/parser'
-require_relative '../../src/evaluator'
+require_relative '../../patlang-core/lexer/lexer'
+require_relative '../../patlang-core/parser/parser'
+require_relative '../../patlang-core/evaluator/evaluator'
 
 class TestIntegration < Minitest::Test
   def setup
