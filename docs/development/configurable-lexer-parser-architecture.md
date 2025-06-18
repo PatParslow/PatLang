@@ -97,7 +97,7 @@ graph TB
 
 ### 1.2 Pluggable Tokenization Rules
 
-**Architecture**: Extends current [`Lexer`](../../src/lexer.rb:5) class with configuration-driven token recognition.
+**Architecture**: Extends current [`Lexer`](../../patlang-core/lexer/lexer.rb:5) class with configuration-driven token recognition.
 
 ```mermaid
 classDiagram
@@ -151,13 +151,13 @@ classDiagram
 
 ### 1.4 Custom Token Types and Patterns
 
-**Design Philosophy**: Extend the current token type system while maintaining compatibility with existing [`Token`](../../src/token.rb:2) class.
+**Design Philosophy**: Extend the current token type system while maintaining compatibility with existing [`Token`](../../patlang-core/lexer/token.rb:2) class.
 
 **Implementation Strategy**:
-- Custom token classes inherit from base [`Token`](../../src/token.rb:2) class
+- Custom token classes inherit from base [`Token`](../../patlang-core/lexer/token.rb:2) class
 - Pattern-based token recognition with regex validation
 - Type-safe token creation through factory pattern
-- Integration with existing [`TOKEN_TYPES`](../../src/token.rb:4) constant
+- Integration with existing [`TOKEN_TYPES`](../../patlang-core/lexer/token.rb:4) constant
 
 ### 1.5 Token Configuration Validation System
 
@@ -241,14 +241,14 @@ sequenceDiagram
 ```
 
 **Integration Points**:
-- Extends existing [`ASTNode`](../../src/ast_nodes.rb:4) hierarchy
-- Compatible with current [`Evaluator`](../../src/evaluator.rb:9) visitor pattern
+- Extends existing [`ASTNode`](../../patlang-core/ast/ast_nodes.rb:4) hierarchy
+- Compatible with current [`Evaluator`](../../patlang-core/evaluator/evaluator.rb:9) visitor pattern
 - Maintains type safety through dynamic class generation
 - Preserves existing node relationships and inheritance
 
 ### 2.3 Extensible Precedence and Associativity Configuration
 
-**Integration Strategy**: Extends existing precedence handling in [`ExpressionParser`](../../src/parser/expression_parser.rb:6) with configurable rules.
+**Integration Strategy**: Extends existing precedence handling in [`ExpressionParser`](../../patlang-core/parser/expression_parser.rb:6) with configurable rules.
 
 ```ruby
 # Enhanced precedence system
@@ -407,7 +407,7 @@ end
 
 ### 4.1 Extension Points for Custom Language Features
 
-**Plugin Architecture**: Leverages existing [`EventSystem`](../../src/object_model/event_system.rb:1) for plugin communication while maintaining parser stability.
+**Plugin Architecture**: Leverages existing [`EventSystem`](../../patlang-core/object_model/event_system.rb:1) for plugin communication while maintaining parser stability.
 
 ```mermaid
 graph TD
@@ -502,7 +502,7 @@ graph TD
 
 ### 5.1 Integration with Current Parser Timeout Protection
 
-**Enhancement**: Extends existing [`TimeoutProtection`](../../src/parser/parser_timeout_protection.rb:7) system with configuration-aware protection.
+**Enhancement**: Extends existing [`TimeoutProtection`](../../patlang-core/parser/parser_timeout_protection.rb:7) system with configuration-aware protection.
 
 ```ruby
 module ConfigurableTimeoutProtection
@@ -521,7 +521,7 @@ end
 ```
 
 **Integration Strategy**:
-- Preserves existing [`CircuitBreaker`](../../src/parser/parser_timeout_protection.rb:14) functionality
+- Preserves existing [`CircuitBreaker`](../../patlang-core/parser/parser_timeout_protection.rb:14) functionality
 - Extends timeout configuration through JSON settings
 - Maintains compatibility with current error handling
 - Adds configuration-specific timeout profiles
@@ -531,7 +531,7 @@ end
 **Integration Points**:
 - Extends existing reasoning AST nodes with configuration support
 - Maintains compatibility with [`UnifiedReasoningCoordinator`](../../docs/development/unified-reasoning-architecture.md:361)
-- Preserves [`EventSystem`](../../src/object_model/event_system.rb:1) integration patterns
+- Preserves [`EventSystem`](../../patlang-core/object_model/event_system.rb:1) integration patterns
 - Supports dynamic reasoning rule configuration
 
 ### 5.3 Migration Path from Current Hardcoded Approach
@@ -892,12 +892,12 @@ end
 ### Phase 2: Configurable Lexer (Weeks 3-4)
 1. **Token Configuration System**
    - Dynamic token definition loading
-   - Integration with existing [`Token`](../../src/token.rb:2) class
+   - Integration with existing [`Token`](../../patlang-core/lexer/token.rb:2) class
    - Conflict resolution enhancement using [`AmbiguousToken`](../../src/ambiguous_token.rb:4)
    - Hot-reload implementation for safe token changes
 
 2. **Lexer Integration**
-   - Extend current [`Lexer`](../../src/lexer.rb:5) class with configuration support
+   - Extend current [`Lexer`](../../patlang-core/lexer/lexer.rb:5) class with configuration support
    - Preserve existing tokenization behavior
    - Performance optimization for configurable tokenization
    - Custom token type support
@@ -916,20 +916,20 @@ end
 
 2. **Precedence and Associativity**
    - Dynamic precedence table generation
-   - Integration with [`ExpressionParser`](../../src/parser/expression_parser.rb:6)
+   - Integration with [`ExpressionParser`](../../patlang-core/parser/expression_parser.rb:6)
    - Conflict detection and resolution
    - Performance optimization for precedence lookups
 
 3. **AST Node Factory**
    - Dynamic AST node creation system
-   - Integration with existing [`ASTNode`](../../src/ast_nodes.rb:4) hierarchy
+   - Integration with existing [`ASTNode`](../../patlang-core/ast/ast_nodes.rb:4) hierarchy
    - Type safety preservation
    - Evaluator compatibility maintenance
 
 ### Phase 4: Plugin System and Advanced Features (Weeks 7-8)
 1. **Extension Points**
    - Plugin architecture design and implementation
-   - Integration with [`EventSystem`](../../src/object_model/event_system.rb:1)
+   - Integration with [`EventSystem`](../../patlang-core/object_model/event_system.rb:1)
    - Security and sandboxing framework
    - Plugin lifecycle management
 

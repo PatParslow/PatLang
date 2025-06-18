@@ -52,25 +52,25 @@ Based on validation testing, all core language features are working reliably:
 
 The reasoning infrastructure has been implemented following TDD principles:
 
-#### 1. Form Validator (`src/reasoning/form_validator.rb`)
+#### 1. Form Validator (`patlang-core/reasoning/form_validator.rb`)
 - **Status**: 🔴 RED PHASE (Test-Driven Development)
 - **Architecture**: Complete interface design
 - **Test Coverage**: Comprehensive test scenarios prepared
 - **Purpose**: Multi-field validation, cross-field constraints, error reporting
 
-#### 2. Goal System (`src/reasoning/goal_system.rb`)
+#### 2. Goal System (`patlang-core/reasoning/goal_system.rb`)
 - **Status**: 🔴 RED PHASE (Test-Driven Development)
 - **Architecture**: Hierarchical goals, preconditions/postconditions
 - **Test Coverage**: Business process scenarios defined
 - **Purpose**: Goal-oriented programming, strategy selection
 
-#### 3. Facts Database (`src/reasoning/facts_database.rb`)
+#### 3. Facts Database (`patlang-core/reasoning/facts_database.rb`)
 - **Status**: 🔴 RED PHASE (Test-Driven Development)
 - **Architecture**: SLD resolution, indexing, rule systems
 - **Test Coverage**: Logic programming scenarios prepared
 - **Purpose**: Knowledge bases, complex queries, rule inference
 
-#### 4. Reasoning Coordinator (`src/reasoning/reasoning_coordinator.rb`)
+#### 4. Reasoning Coordinator (`patlang-core/reasoning/reasoning_coordinator.rb`)
 - **Status**: ✅ INTEGRATED
 - **Architecture**: Cross-paradigm workflow coordination
 - **Integration**: Connected to Patlang main interpreter

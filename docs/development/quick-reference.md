@@ -119,13 +119,13 @@ ruby -I src -r patlang -e 'puts Patlang.evaluate("1 + 2 * 3")'
 
 **Step 1: Add Token Types**
 ```ruby
-# In src/token.rb
+# In patlang-core/lexer/token.rb
 module TokenTypes
   # ... existing types ...
   NEW_KEYWORD = :NEW_KEYWORD
 end
 
-# In src/lexer.rb  
+# In patlang-core/lexer/lexer.rb  
 KEYWORDS = {
   # ... existing keywords ...
   'new_keyword' => TokenTypes::NEW_KEYWORD
@@ -134,7 +134,7 @@ KEYWORDS = {
 
 **Step 2: Create AST Node**
 ```ruby
-# In src/ast_nodes.rb
+# In patlang-core/ast/ast_nodes.rb
 class NewFeatureNode < ASTNode
   attr_reader :feature_data
   
@@ -147,7 +147,7 @@ end
 
 **Step 3: Add Parser Module**
 ```ruby
-# In src/parser/new_feature_parser.rb
+# In patlang-core/parser/new_feature_parser.rb
 module Patlang
   module ParserModules
     class NewFeatureParser
@@ -166,7 +166,7 @@ end
 
 **Step 4: Add Evaluator Module**
 ```ruby
-# In src/evaluator/new_feature_evaluator.rb
+# In patlang-core/evaluator/new_feature_evaluator.rb
 module Patlang
   module EvaluatorModules
     class NewFeatureEvaluator
@@ -180,7 +180,7 @@ end
 
 **Step 5: Integrate**
 ```ruby
-# In src/parser.rb
+# In patlang-core/parser/parser.rb
 def parse_statement
   case peek.type
   when TokenTypes::NEW_KEYWORD
@@ -189,7 +189,7 @@ def parse_statement
   end
 end
 
-# In src/evaluator.rb
+# In patlang-core/evaluator/evaluator.rb
 def evaluate(node)
   case node.type
   when :new_feature
@@ -288,7 +288,7 @@ ruby -I src -r patlang -e '
 ```
 LexError: Unexpected character: @ at line 1, column 5
 ```
-✅ **Solution:** Add character handling in [`lexer.rb`](../src/lexer.rb) `scan_token` method
+✅ **Solution:** Add character handling in [`lexer.rb`](../patlang-core/lexer/lexer.rb) `scan_token` method
 
 ❌ **Problem:** Unterminated string errors
 ```
@@ -309,7 +309,7 @@ ParseError: Expected ')' after function arguments. Found IDENTIFIER
 # Input: 1 + 2 * 3
 # Expected: 7, Got: 9
 ```
-✅ **Solution:** Review operator precedence in [`expression_parser.rb`](../src/parser/expression_parser.rb)
+✅ **Solution:** Review operator precedence in [`expression_parser.rb`](../patlang-core/parser/expression_parser.rb)
 
 **Evaluator Errors:**
 
@@ -373,7 +373,7 @@ src/
 
 **Parser Modules:**
 ```
-src/parser/
+patlang-core/parser/
 ├── expression_parser.rb    # Expression parsing
 ├── control_flow_parser.rb  # If, while, etc.
 ├── function_parser.rb      # Function definitions
@@ -382,7 +382,7 @@ src/parser/
 
 **Evaluator Modules:**
 ```
-src/evaluator/
+patlang-core/evaluator/
 ├── arithmetic_evaluator.rb # Math operations
 ├── function_evaluator.rb   # Function calls
 ├── string_evaluator.rb     # String operations
@@ -469,10 +469,10 @@ mkdir -p src/new_directory
 **Ruby-Specific:**
 ```bash
 # Check syntax
-ruby -c src/parser.rb
+ruby -c patlang-core/parser/parser.rb
 
 # Run with debugging
-ruby -d src/patlang.rb
+ruby -d ruby-host/bootstrap/patlang_bootstrap.rb
 
 # Load and test interactively
 ruby -I src -r patlang
@@ -632,20 +632,20 @@ assert_equal expected, result, "Failed for input: #{input}"
 
 ### Add New Operator
 
-1. **Add token type:** Update [`TokenTypes`](../src/token.rb)
-2. **Add lexer support:** Update [`Lexer`](../src/lexer.rb) `scan_token`
-3. **Add AST support:** Update [`BinaryOpNode`](../src/ast_nodes.rb) or create new node
-4. **Add parser support:** Update [`ExpressionParser`](../src/parser/expression_parser.rb)
-5. **Add evaluator support:** Update [`ArithmeticEvaluator`](../src/evaluator/arithmetic_evaluator.rb)
+1. **Add token type:** Update [`TokenTypes`](../patlang-core/lexer/token.rb)
+2. **Add lexer support:** Update [`Lexer`](../patlang-core/lexer/lexer.rb) `scan_token`
+3. **Add AST support:** Update [`BinaryOpNode`](../patlang-core/ast/ast_nodes.rb) or create new node
+4. **Add parser support:** Update [`ExpressionParser`](../patlang-core/parser/expression_parser.rb)
+5. **Add evaluator support:** Update [`ArithmeticEvaluator`](../patlang-core/evaluator/arithmetic_evaluator.rb)
 6. **Add tests:** Create test cases for new operator
 
 ### Add New Statement Type
 
-1. **Add keyword token:** Update [`TokenTypes`](../src/token.rb) and [`KEYWORDS`](../src/lexer.rb)
-2. **Create AST node:** Add new statement node in [`ast_nodes.rb`](../src/ast_nodes.rb)
-3. **Create parser module:** Add parser in [`parser/`](../src/parser/) directory
-4. **Create evaluator module:** Add evaluator in [`evaluator/`](../src/evaluator/) directory
-5. **Integrate:** Update main [`parser.rb`](../src/parser.rb) and [`evaluator.rb`](../src/evaluator.rb)
+1. **Add keyword token:** Update [`TokenTypes`](../patlang-core/lexer/token.rb) and [`KEYWORDS`](../patlang-core/lexer/lexer.rb)
+2. **Create AST node:** Add new statement node in [`ast_nodes.rb`](../patlang-core/ast/ast_nodes.rb)
+3. **Create parser module:** Add parser in [`parser/`](../patlang-core/parser/) directory
+4. **Create evaluator module:** Add evaluator in [`evaluator/`](../patlang-core/evaluator/) directory
+5. **Integrate:** Update main [`parser.rb`](../patlang-core/parser/parser.rb) and [`evaluator.rb`](../patlang-core/evaluator/evaluator.rb)
 6. **Test:** Add comprehensive test coverage
 
 ### Debug Parser Issues
@@ -690,7 +690,7 @@ This quick reference provides essential commands, patterns, and solutions for Pa
 3. **Debugging**: Minimal cases → Debug output → Step-through → Fix
 
 ### Essential Files:
-- Core: [`patlang.rb`](../src/patlang.rb), [`lexer.rb`](../src/lexer.rb), [`parser.rb`](../src/parser.rb), [`evaluator.rb`](../src/evaluator.rb)
+- Core: [`patlang.rb`](../ruby-host/bootstrap/patlang_bootstrap.rb), [`lexer.rb`](../patlang-core/lexer/lexer.rb), [`parser.rb`](../patlang-core/parser/parser.rb), [`evaluator.rb`](../patlang-core/evaluator/evaluator.rb)
 - Tests: [`run_all_tests.rb`](../test/run_all_tests.rb), [`assessment_test.rb`](../../assessment_test.rb)
 - Docs: [`development-guidelines.md`](development-guidelines.md), [`patlang-coding-standards.md`](patlang-coding-standards.md)
 

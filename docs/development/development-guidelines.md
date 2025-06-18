@@ -29,16 +29,16 @@ This document establishes comprehensive development guidelines for maintaining t
 **When to Split Files:**
 ```ruby
 # ❌ BAD: Large monolithic file
-# src/parser.rb (500+ lines)
+# patlang-core/parser/parser.rb (500+ lines)
 class Parser
   # 50+ methods handling all parsing logic
 end
 
 # ✅ GOOD: Modular approach
-# src/parser.rb (main entry point)
-# src/parser/expression_parser.rb
-# src/parser/control_flow_parser.rb  
-# src/parser/function_parser.rb
+# patlang-core/parser/parser.rb (main entry point)
+# patlang-core/parser/expression_parser.rb
+# patlang-core/parser/control_flow_parser.rb  
+# patlang-core/parser/function_parser.rb
 ```
 
 ### Method Size Guidelines
@@ -132,7 +132,7 @@ File.readlines(filename, chomp: true)
 **Cross-Platform Path Construction:**
 ```ruby
 # ❌ BAD: Platform-specific paths
-path = "src/parser/modules.rb"           # Unix-style
+path = "patlang-core/parser/modules.rb"           # Unix-style
 path = "src\\parser\\modules.rb"         # Windows-style
 path = ENV['HOME'] + "/patlang/src"      # Unix-specific
 

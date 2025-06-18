@@ -8,7 +8,7 @@ This document defines a comprehensive error handling strategy for Patlang that e
 
 ### Problems Identified
 
-1. **Inconsistent Error Hierarchy**: [`PatlangZeroDivisionError`](src/exceptions.rb:77) inherits from Ruby's `ZeroDivisionError` instead of [`PatlangError`](src/exceptions.rb:4)
+1. **Inconsistent Error Hierarchy**: [`PatlangZeroDivisionError`](patlang-core/exceptions.rb:77) inherits from Ruby's `ZeroDivisionError` instead of [`PatlangError`](patlang-core/exceptions.rb:4)
 2. **Mixed Error Types**: Evaluators throw mix of strings, `RuntimeError`, and native exceptions
 3. **Missing Error Context**: No standardized way to capture operation context, values, or location
 4. **Test Mismatch**: Test expects `RuntimeError` but receives `ZeroDivisionError`
@@ -16,8 +16,8 @@ This document defines a comprehensive error handling strategy for Patlang that e
 
 ### Current Error Locations
 
-- [`src/evaluator/arithmetic_evaluator.rb:35`](src/evaluator/arithmetic_evaluator.rb:35) - throws `ZeroDivisionError`
-- [`src/object_model/number_object.rb:87`](src/object_model/number_object.rb:87) - throws `ZeroDivisionError`
+- [`patlang-core/evaluator/arithmetic_evaluator.rb:35`](patlang-core/evaluator/arithmetic_evaluator.rb:35) - throws `ZeroDivisionError`
+- [`patlang-core/object_model/number_object.rb:87`](patlang-core/object_model/number_object.rb:87) - throws `ZeroDivisionError`
 - [`test/ruby_implementation/test_function_evaluator.rb:475`](test/ruby_implementation/test_function_evaluator.rb:475) - expects `RuntimeError`
 
 ## Proposed Patlang Error Hierarchy
@@ -202,7 +202,7 @@ end
 
 ### Phase 1: Update Exception Hierarchy (Priority 1)
 
-1. **Fix [`PatlangZeroDivisionError`](src/exceptions.rb:77)**
+1. **Fix [`PatlangZeroDivisionError`](patlang-core/exceptions.rb:77)**
    - Change inheritance from `ZeroDivisionError` to `PatlangArithmeticError`
    - Add context properties for operands and operator
 
@@ -213,34 +213,34 @@ end
    - `PatlangTypeError` - for type violations
    - `PatlangIndexError` - for collection access issues
 
-3. **Enhance [`PatlangError`](src/exceptions.rb:4) Base Class**
+3. **Enhance [`PatlangError`](patlang-core/exceptions.rb:4) Base Class**
    - Add `simple_message()` and `detailed_message()` methods
    - Improve context handling and formatting
    - Add error code system for programmatic handling
 
 ### Phase 2: Update Evaluator Modules (Priority 1)
 
-1. **Arithmetic Evaluator [`src/evaluator/arithmetic_evaluator.rb`](src/evaluator/arithmetic_evaluator.rb)**
-   - Replace [`ZeroDivisionError`](src/evaluator/arithmetic_evaluator.rb:35) with `PatlangDivisionByZeroError`
+1. **Arithmetic Evaluator [`patlang-core/evaluator/arithmetic_evaluator.rb`](patlang-core/evaluator/arithmetic_evaluator.rb)**
+   - Replace [`ZeroDivisionError`](patlang-core/evaluator/arithmetic_evaluator.rb:35) with `PatlangDivisionByZeroError`
    - Add context capture for all arithmetic operations
    - Standardize error messages
 
-2. **Object Model [`src/object_model/number_object.rb`](src/object_model/number_object.rb)**
-   - Replace [`ZeroDivisionError`](src/object_model/number_object.rb:87) with `PatlangDivisionByZeroError`
+2. **Object Model [`patlang-core/object_model/number_object.rb`](patlang-core/object_model/number_object.rb)**
+   - Replace [`ZeroDivisionError`](patlang-core/object_model/number_object.rb:87) with `PatlangDivisionByZeroError`
    - Maintain event system integration
    - Add operation context
 
-3. **Function Evaluator [`src/evaluator/function_evaluator.rb`](src/evaluator/function_evaluator.rb)**
+3. **Function Evaluator [`patlang-core/evaluator/function_evaluator.rb`](patlang-core/evaluator/function_evaluator.rb)**
    - Replace string raises with `PatlangFunctionError`
    - Add function context to all errors
    - Improve parameter validation error messages
 
-4. **String Evaluator [`src/evaluator/string_evaluator.rb`](src/evaluator/string_evaluator.rb)**
+4. **String Evaluator [`patlang-core/evaluator/string_evaluator.rb`](patlang-core/evaluator/string_evaluator.rb)**
    - Replace string raises with `PatlangTypeError`/`PatlangIndexError`
    - Add type and index context
    - Standardize string operation error handling
 
-5. **Object Evaluator [`src/evaluator/object_evaluator.rb`](src/evaluator/object_evaluator.rb)**
+5. **Object Evaluator [`patlang-core/evaluator/object_evaluator.rb`](patlang-core/evaluator/object_evaluator.rb)**
    - Standardize all error throwing patterns
    - Add operation context for all errors
 

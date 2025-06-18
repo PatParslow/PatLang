@@ -10,7 +10,7 @@ This document describes the critical fix implemented to resolve the Phase 1 comp
 - **Problem**: .patlang files with reasoning syntax (constrain, goal, fact, rule, query) were failing with `ReasoningModeError` 
 - **Root Cause**: Reasoning mode was not automatically enabled when processing .patlang files
 - **Impact**: Phase 1 validation success rate was only 30.8% due to silent failures with exit code 127
-- **Error Location**: `src/evaluator/reasoning_evaluator.rb:38-40`
+- **Error Location**: `patlang-core/evaluator/reasoning_evaluator.rb:38-40`
 
 ### Debug Analysis Results
 The debugging revealed that the "infinite loop" was actually a `ReasoningModeError` exception being thrown when reasoning syntax was encountered without reasoning mode being enabled.
@@ -19,7 +19,7 @@ The debugging revealed that the "infinite loop" was actually a `ReasoningModeErr
 
 ### 1. Primary Fix: Auto-Enable Reasoning Mode
 
-**Location**: `src/patlang.rb` line 241 in the `run_file` method
+**Location**: `ruby-host/bootstrap/patlang_bootstrap.rb` line 241 in the `run_file` method
 
 **Changes Made**:
 ```ruby
@@ -32,7 +32,7 @@ end
 
 ### 2. Enhanced Error Handling
 
-**Location**: `src/evaluator/reasoning_evaluator.rb` lines 38-40, 95-96, 117-118, 163-164, 183-184, 202-203
+**Location**: `patlang-core/evaluator/reasoning_evaluator.rb` lines 38-40, 95-96, 117-118, 163-164, 183-184, 202-203
 
 **Changes Made**:
 - Enhanced error messages to include guidance about .patlang files
@@ -48,7 +48,7 @@ end
 
 ### 3. Integration Safeguards
 
-**Location**: `src/patlang.rb` exception handling
+**Location**: `ruby-host/bootstrap/patlang_bootstrap.rb` exception handling
 
 **Changes Made**:
 ```ruby

@@ -1125,9 +1125,9 @@ Patlang-specific coding standards ensure consistency and maintainability across 
 ### Key Standards:
 
 1. **Module Organization**: Use [`ParserModules`](../src/parser) and [`EvaluatorModules`](../src/evaluator) namespaces
-2. **AST Nodes**: Inherit from [`ASTNode`](../src/ast_nodes.rb) with consistent patterns
+2. **AST Nodes**: Inherit from [`ASTNode`](../patlang-core/ast/ast_nodes.rb) with consistent patterns
 3. **Error Handling**: Use project-specific error types with rich context
-4. **Token Management**: Follow [`TokenTypes`](../src/token.rb) constants and [`Token`](../src/token.rb) class patterns
+4. **Token Management**: Follow [`TokenTypes`](../patlang-core/lexer/token.rb) constants and [`Token`](../patlang-core/lexer/token.rb) class patterns
 5. **Integration**: Test complete pipelines and component interactions
 
 ### Architecture Principles:
@@ -1139,10 +1139,10 @@ Patlang-specific coding standards ensure consistency and maintainability across 
 
 ### Extension Guidelines:
 
-- Add token types in [`token.rb`](../src/token.rb)
-- Create AST nodes in [`ast_nodes.rb`](../src/ast_nodes.rb)
+- Add token types in [`token.rb`](../patlang-core/lexer/token.rb)
+- Create AST nodes in [`ast_nodes.rb`](../patlang-core/ast/ast_nodes.rb)
 - Build parser modules in [`parser/`](../src/parser) directory
 - Build evaluator modules in [`evaluator/`](../src/evaluator) directory
-- Update main [`parser.rb`](../src/parser.rb) and [`evaluator.rb`](../src/evaluator.rb) for integration
+- Update main [`parser.rb`](../patlang-core/parser/parser.rb) and [`evaluator.rb`](../patlang-core/evaluator/evaluator.rb) for integration
 
 Refer to [`development-guidelines.md`](development-guidelines.md) for general coding standards and [`mode-specific-guidelines.md`](mode-specific-guidelines.md) for development workflow practices.

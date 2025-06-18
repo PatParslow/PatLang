@@ -53,7 +53,7 @@ daily_checks:
 # File: test_suite_daily_health_check.rb
 
 # Execute comprehensive test discovery
-ruby test/enhanced_comprehensive_test_suite_runner.rb --health-check
+ruby test/enhanced_fixed_comprehensive_coverage_runner.rb --health-check
 
 # Generate daily report
 ruby test/test_suite_health_reporter.rb --daily-summary

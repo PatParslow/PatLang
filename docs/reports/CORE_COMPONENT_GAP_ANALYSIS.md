@@ -19,7 +19,7 @@
 
 ## Detailed Gap Analysis by Component
 
-## 1. LEXER (src/lexer.rb) - 52.10% Coverage
+## 1. LEXER (patlang-core/lexer/lexer.rb) - 52.10% Coverage
 
 ### Critical Missing Areas
 
@@ -104,7 +104,7 @@ Token.new(Token::TOKEN_TYPES[:UNKNOWN], char, @position - 1, start_line, start_c
 
 ---
 
-## 2. PARSER (src/parser.rb) - 28.37% Coverage
+## 2. PARSER (patlang-core/parser/parser.rb) - 28.37% Coverage
 
 ### Critical Missing Areas
 
@@ -188,7 +188,7 @@ function with_return() { return value }
 
 ---
 
-## 3. EVALUATOR (src/evaluator.rb) - 31.02% Coverage
+## 3. EVALUATOR (patlang-core/evaluator/evaluator.rb) - 31.02% Coverage
 
 ### Critical Missing Areas
 
@@ -263,7 +263,7 @@ nested_function_calls()
 
 ---
 
-## 4. AST_NODES (src/ast_nodes.rb) - 59.09% Coverage
+## 4. AST_NODES (patlang-core/ast/ast_nodes.rb) - 59.09% Coverage
 
 ### Critical Missing Areas
 

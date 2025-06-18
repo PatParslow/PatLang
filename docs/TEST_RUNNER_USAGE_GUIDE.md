@@ -11,16 +11,16 @@ This guide provides comprehensive instructions for using the PatLang project's d
 
 ```bash
 # Comprehensive Testing (All 70 Test Files)
-ruby test/enhanced_comprehensive_test_suite_runner.rb
+ruby test/enhanced_fixed_comprehensive_coverage_runner.rb
 
 # Focused Testing (Phase-Specific)
 ruby test/phase_1_test_runner.rb
 
 # Health Check Only
-ruby test/enhanced_comprehensive_test_suite_runner.rb --health-check
+ruby test/enhanced_fixed_comprehensive_coverage_runner.rb --health-check
 
 # Dry Run (Discovery Only)
-ruby test/enhanced_comprehensive_test_suite_runner.rb --dry-run
+ruby test/enhanced_fixed_comprehensive_coverage_runner.rb --dry-run
 ```
 
 ---
@@ -29,7 +29,7 @@ ruby test/enhanced_comprehensive_test_suite_runner.rb --dry-run
 
 ### **Purpose and Use Cases**
 
-The [`enhanced_comprehensive_test_suite_runner.rb`](test/enhanced_comprehensive_test_suite_runner.rb) provides complete test coverage across all discovered test files.
+The [`enhanced_fixed_comprehensive_coverage_runner.rb`](test/enhanced_fixed_comprehensive_coverage_runner.rb) provides complete test coverage across all discovered test files.
 
 #### **When to Use Comprehensive Runner**
 ✅ **Pre-release validation**: Complete system verification before releases  
@@ -50,7 +50,7 @@ The [`enhanced_comprehensive_test_suite_runner.rb`](test/enhanced_comprehensive_
 #### **Standard Execution**
 ```bash
 # Run all discovered tests with full reporting
-ruby test/enhanced_comprehensive_test_suite_runner.rb
+ruby test/enhanced_fixed_comprehensive_coverage_runner.rb
 
 # Expected Output:
 # ================================================================================
@@ -66,16 +66,16 @@ ruby test/enhanced_comprehensive_test_suite_runner.rb
 #### **Command Line Options**
 ```bash
 # Health Check Mode (Discovery + Quick Validation)
-ruby test/enhanced_comprehensive_test_suite_runner.rb --health-check
+ruby test/enhanced_fixed_comprehensive_coverage_runner.rb --health-check
 
 # Dry Run Mode (Discovery Only, No Execution)
-ruby test/enhanced_comprehensive_test_suite_runner.rb --dry-run
+ruby test/enhanced_fixed_comprehensive_coverage_runner.rb --dry-run
 
 # Verbose Output Mode
-ruby test/enhanced_comprehensive_test_suite_runner.rb --verbose
+ruby test/enhanced_fixed_comprehensive_coverage_runner.rb --verbose
 
 # Silent Mode (Minimal Output)
-ruby test/enhanced_comprehensive_test_suite_runner.rb --silent
+ruby test/enhanced_fixed_comprehensive_coverage_runner.rb --silent
 ```
 
 ### **Understanding Output**
@@ -260,7 +260,7 @@ if [ $? -ne 0 ]; then
 fi
 
 echo "✅ Focused tests passed. Checking test discovery..."
-ruby test/enhanced_comprehensive_test_suite_runner.rb --health-check
+ruby test/enhanced_fixed_comprehensive_coverage_runner.rb --health-check
 
 if [ $? -ne 0 ]; then
     echo "⚠️  Test discovery issues detected. Review before pushing."
@@ -273,11 +273,11 @@ fi
 # .git/hooks/pre-push
 
 echo "Running comprehensive test validation..."
-ruby test/enhanced_comprehensive_test_suite_runner.rb
+ruby test/enhanced_fixed_comprehensive_coverage_runner.rb
 
 if [ $? -ne 0 ]; then
     echo "❌ Comprehensive tests failed. Push aborted."
-    echo "Run: ruby test/enhanced_comprehensive_test_suite_runner.rb"
+    echo "Run: ruby test/enhanced_fixed_comprehensive_coverage_runner.rb"
     echo "Review: test/ENHANCED_COMPREHENSIVE_TEST_SUITE_REPORT.md"
     exit 1
 fi
@@ -297,7 +297,7 @@ echo "✅ All tests passed. Push approved."
       "label": "Run Comprehensive Tests",
       "type": "shell",
       "command": "ruby",
-      "args": ["test/enhanced_comprehensive_test_suite_runner.rb"],
+      "args": ["test/enhanced_fixed_comprehensive_coverage_runner.rb"],
       "group": "test",
       "presentation": {
         "echo": true,
@@ -323,7 +323,7 @@ echo "✅ All tests passed. Push approved."
       "label": "Test Discovery Health Check",
       "type": "shell",
       "command": "ruby",
-      "args": ["test/enhanced_comprehensive_test_suite_runner.rb", "--health-check"],
+      "args": ["test/enhanced_fixed_comprehensive_coverage_runner.rb", "--health-check"],
       "group": "test"
     }
   ]
@@ -464,7 +464,7 @@ end
 find test/ -name "test_*.rb" | sort
 
 # Run discovery diagnostic
-ruby test/enhanced_comprehensive_test_suite_runner.rb --dry-run
+ruby test/enhanced_fixed_comprehensive_coverage_runner.rb --dry-run
 
 # Validate exclusion patterns
 ruby test/test_discovery_diagnostic.rb
@@ -491,7 +491,7 @@ ruby -r test/helpers/test_helper -e "puts 'Helper loaded successfully'"
 # Solution: Identify and optimize slow tests
 
 # Profile test execution
-ruby test/enhanced_comprehensive_test_suite_runner.rb --profile
+ruby test/enhanced_fixed_comprehensive_coverage_runner.rb --profile
 
 # Identify slow tests
 ruby test/slow_test_analyzer.rb
@@ -526,7 +526,7 @@ coverage_troubleshooting:
 #### **Diagnostic Commands**
 ```bash
 # Test suite health check
-ruby test/enhanced_comprehensive_test_suite_runner.rb --health-check
+ruby test/enhanced_fixed_comprehensive_coverage_runner.rb --health-check
 
 # Discovery diagnostic
 ruby test/test_discovery_diagnostic.rb
@@ -648,4 +648,4 @@ Following the established conventions for test organization and naming ensures t
 - [`TEST_SUITE_INVESTIGATION_REPORT.md`](TEST_SUITE_INVESTIGATION_REPORT.md)
 - [`TEST_SUITE_MAINTENANCE_GUIDE.md`](TEST_SUITE_MAINTENANCE_GUIDE.md)
 - [`TEST_SUITE_BASELINE_METRICS.md`](TEST_SUITE_BASELINE_METRICS.md)
-- [`enhanced_comprehensive_test_suite_runner.rb`](test/enhanced_comprehensive_test_suite_runner.rb)
+- [`enhanced_fixed_comprehensive_coverage_runner.rb`](test/enhanced_fixed_comprehensive_coverage_runner.rb)

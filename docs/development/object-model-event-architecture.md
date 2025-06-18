@@ -24,7 +24,7 @@ Patlang implements a comprehensive "everything is an object" philosophy where al
 
 ### Core Design Principles
 
-1. **Universal Object Model**: All values are wrapped in [`PatlangObject`](../../src/object_model/patlang_object.rb:8) instances
+1. **Universal Object Model**: All values are wrapped in [`PatlangObject`](../../patlang-core/object_model/patlang_object.rb:8) instances
 2. **Event-Driven Architecture**: Every significant operation fires events for observability
 3. **Multi-Scope Events**: Instance, class, and global event scopes for different use cases
 4. **Message Passing**: Objects communicate through structured message passing
@@ -274,20 +274,20 @@ The event system operates on three distinct scopes, each serving different archi
 
 #### 1. Instance-Level Events
 - **Scope**: Individual object instances
-- **Registration**: [`obj.on_event(:event_type, &block)`](../../src/object_model/event_system.rb:153)
-- **Firing**: [`obj.fire_event(:event_type, data)`](../../src/object_model/event_system.rb:164)
+- **Registration**: [`obj.on_event(:event_type, &block)`](../../patlang-core/object_model/event_system.rb:153)
+- **Firing**: [`obj.fire_event(:event_type, data)`](../../patlang-core/object_model/event_system.rb:164)
 - **Use Case**: Object-specific behaviors and state changes
 
 #### 2. Class-Level Events
 - **Scope**: All instances of a specific class
-- **Registration**: [`Class.on_event(:event_type, &block)`](../../src/object_model/event_system.rb:138)
+- **Registration**: [`Class.on_event(:event_type, &block)`](../../patlang-core/object_model/event_system.rb:138)
 - **Firing**: Automatically fired when instance events occur
 - **Use Case**: Class-wide monitoring and statistics
 
 #### 3. Global Events
 - **Scope**: System-wide across all objects
-- **Registration**: [`EventSystem.subscribe(:event_type, &block)`](../../src/object_model/event_system.rb:346)
-- **Firing**: [`EventSystem.fire_global_event(:event_type, data)`](../../src/object_model/event_system.rb:351)
+- **Registration**: [`EventSystem.subscribe(:event_type, &block)`](../../patlang-core/object_model/event_system.rb:346)
+- **Firing**: [`EventSystem.fire_global_event(:event_type, data)`](../../patlang-core/object_model/event_system.rb:351)
 - **Use Case**: System monitoring, logging, and cross-cutting concerns
 
 ### Event Data Structure
@@ -468,12 +468,12 @@ graph TD
 ### Event Flow Patterns
 
 #### Pattern 1: Standard Object Event Flow
-1. **Instance Event**: [`obj.fire_event(:value_changed, data)`](../../src/object_model/event_system.rb:164)
+1. **Instance Event**: [`obj.fire_event(:value_changed, data)`](../../patlang-core/object_model/event_system.rb:164)
 2. **Class Event**: Automatically fired via EventCapable mixin
 3. **Global Event**: Optional, fired for system-wide monitoring
 
 #### Pattern 2: Global-Only Events
-1. **Global Event**: [`EventSystem.fire_global_event(:system_shutdown, data)`](../../src/object_model/event_system.rb:351)
+1. **Global Event**: [`EventSystem.fire_global_event(:system_shutdown, data)`](../../patlang-core/object_model/event_system.rb:351)
 2. **No Instance/Class Propagation**: Direct global notification
 
 #### Pattern 3: Message Bus Events
@@ -610,7 +610,7 @@ end
 **Debugging Steps:**
 1. Check if object mode is enabled in evaluator
 2. Verify return type expectations vs actual types
-3. Use [`obj.value`](../../src/object_model/patlang_object.rb:40) to access raw values
+3. Use [`obj.value`](../../patlang-core/object_model/patlang_object.rb:40) to access raw values
 4. Test both object mode and normal mode behaviors
 
 #### 3. MINITEST_COMPATIBILITY
@@ -803,17 +803,17 @@ end
 
 ### Event System Usage
 
-1. **Global Subscription for System Events**: Use [`EventSystem.subscribe`](../../src/object_model/event_system.rb:346) for object creation monitoring
-2. **Instance Subscription for Object-Specific Logic**: Use [`obj.on_event`](../../src/object_model/event_system.rb:153) for object state tracking
+1. **Global Subscription for System Events**: Use [`EventSystem.subscribe`](../../patlang-core/object_model/event_system.rb:346) for object creation monitoring
+2. **Instance Subscription for Object-Specific Logic**: Use [`obj.on_event`](../../patlang-core/object_model/event_system.rb:153) for object state tracking
 3. **Event Handler Error Management**: Always handle potential exceptions in event handlers
 4. **Event History Cleanup**: Periodically clear event history to prevent memory leaks
 
 ### Object Model Best Practices
 
 1. **Consistent Type Checking**: Always verify object types before operations
-2. **Value Access Patterns**: Use [`obj.value`](../../src/object_model/patlang_object.rb:40) for raw values, object methods for operations
+2. **Value Access Patterns**: Use [`obj.value`](../../patlang-core/object_model/patlang_object.rb:40) for raw values, object methods for operations
 3. **Registry Cleanup**: Clear object registry in test teardown
-4. **Factory Method Usage**: Prefer [`PatlangObject.create_*`](../../src/object_model/patlang_object.rb:207) methods over direct instantiation
+4. **Factory Method Usage**: Prefer [`PatlangObject.create_*`](../../patlang-core/object_model/patlang_object.rb:207) methods over direct instantiation
 
 ### Testing Recommendations
 

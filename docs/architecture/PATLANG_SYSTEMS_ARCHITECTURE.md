@@ -67,7 +67,7 @@ graph TB
 
 ### Lexical Analysis Layer
 
-The [`Lexer`](../../src/lexer.rb:1) component provides comprehensive tokenization with support for:
+The [`Lexer`](../../patlang-core/lexer/lexer.rb:1) component provides comprehensive tokenization with support for:
 
 - **80+ Token Types**: Complete coverage from basic arithmetic to advanced reasoning constructs
 - **Position Tracking**: Line and column information for error reporting
@@ -98,7 +98,7 @@ graph LR
 
 ### Parsing Architecture
 
-The [`Parser`](../../src/parser.rb:1) implements a modular recursive descent parser with specialized sub-parsers:
+The [`Parser`](../../patlang-core/parser/parser.rb:1) implements a modular recursive descent parser with specialized sub-parsers:
 
 - **TokenResolver**: Handles ambiguous token resolution
 - **ExpressionParser**: Arithmetic and boolean expressions
@@ -150,7 +150,7 @@ graph TB
 
 ### Evaluation Engine
 
-The [`Evaluator`](../../src/evaluator.rb:1) orchestrates execution through specialized modules:
+The [`Evaluator`](../../patlang-core/evaluator/evaluator.rb:1) orchestrates execution through specialized modules:
 
 ```mermaid
 graph TB
@@ -301,7 +301,7 @@ graph TB
 
 ### EventSystem Architecture
 
-The [`EventSystem`](../../src/object_model/event_system.rb:1) provides the coordination backbone:
+The [`EventSystem`](../../patlang-core/object_model/event_system.rb:1) provides the coordination backbone:
 
 ```mermaid
 graph TB
@@ -495,14 +495,14 @@ graph TB
 
 ## Component Cross-References
 
-- **Lexer Implementation**: [`src/lexer.rb`](../../src/lexer.rb:1)
-- **Parser Core**: [`src/parser.rb`](../../src/parser.rb:1)
-- **AST Definitions**: [`src/ast_nodes.rb`](../../src/ast_nodes.rb:1)
-- **Evaluator Engine**: [`src/evaluator.rb`](../../src/evaluator.rb:1)
-- **Object Model**: [`src/object_model/patlang_object.rb`](../../src/object_model/patlang_object.rb:1)
-- **Event System**: [`src/object_model/event_system.rb`](../../src/object_model/event_system.rb:1)
-- **Reasoning Coordinator**: [`src/reasoning/reasoning_coordinator.rb`](../../src/reasoning/reasoning_coordinator.rb:1)
-- **Goal System**: [`src/reasoning/goal_system.rb`](../../src/reasoning/goal_system.rb:1)
+- **Lexer Implementation**: [`patlang-core/lexer/lexer.rb`](../../patlang-core/lexer/lexer.rb:1)
+- **Parser Core**: [`patlang-core/parser/parser.rb`](../../patlang-core/parser/parser.rb:1)
+- **AST Definitions**: [`patlang-core/ast/ast_nodes.rb`](../../patlang-core/ast/ast_nodes.rb:1)
+- **Evaluator Engine**: [`patlang-core/evaluator/evaluator.rb`](../../patlang-core/evaluator/evaluator.rb:1)
+- **Object Model**: [`patlang-core/object_model/patlang_object.rb`](../../patlang-core/object_model/patlang_object.rb:1)
+- **Event System**: [`patlang-core/object_model/event_system.rb`](../../patlang-core/object_model/event_system.rb:1)
+- **Reasoning Coordinator**: [`patlang-core/reasoning/reasoning_coordinator.rb`](../../patlang-core/reasoning/reasoning_coordinator.rb:1)
+- **Goal System**: [`patlang-core/reasoning/goal_system.rb`](../../patlang-core/reasoning/goal_system.rb:1)
 
 ## Conclusion
 

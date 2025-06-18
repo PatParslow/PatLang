@@ -30,7 +30,7 @@ system("mkdir -p src/new_module")
 # ✅ GOOD: Ruby file operations
 File.write("output.txt", "content")
 File.read("input.txt").lines.grep(/pattern/)
-FileUtils.mkdir_p("src/new_module")
+FileUtils.mkdir_p("patlang-core/new_module")
 ```
 
 ### Write File Tool Usage

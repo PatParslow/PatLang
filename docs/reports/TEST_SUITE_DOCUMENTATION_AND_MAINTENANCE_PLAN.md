@@ -17,7 +17,7 @@ This document outlines a comprehensive plan for documenting the test suite inves
 3. **Test Discovery Algorithm**: Insufficient dynamic discovery of test files
 
 ### Solution Implemented
-- **Enhanced Dynamic Discovery**: Created [`enhanced_comprehensive_test_suite_runner.rb`](test/enhanced_comprehensive_test_suite_runner.rb)
+- **Enhanced Dynamic Discovery**: Created [`enhanced_fixed_comprehensive_coverage_runner.rb`](test/enhanced_fixed_comprehensive_coverage_runner.rb)
 - **Refined Exclusion Patterns**: More specific patterns to prevent over-exclusion
 - **Category-Based Organization**: Automatic test categorization by directory structure
 
@@ -315,7 +315,7 @@ reports:
 #### When to Use Comprehensive Runner
 ```bash
 # Full project validation
-ruby test/enhanced_comprehensive_test_suite_runner.rb
+ruby test/enhanced_fixed_comprehensive_coverage_runner.rb
 
 # Use Cases:
 - Pre-release validation
