@@ -303,6 +303,47 @@ class PrintNode < ASTNode
   end
 end
 
+# Node representing an expression statement (expression used as a statement)
+class ExpressionStatementNode < ASTNode
+  attr_reader :expression
+
+  def initialize(expression)
+    @expression = expression
+  end
+
+  def to_s
+    "ExpressionStatementNode(#{@expression})"
+  end
+end
+
+# Node representing a literal value (used as a fallback/mock)
+class LiteralNode < ASTNode
+  attr_reader :value
+
+  def initialize(value)
+    @value = value
+  end
+
+  def to_s
+    "LiteralNode(#{@value})"
+  end
+end
+
+# Node representing a conditional node (used as a fallback/mock)
+class ConditionalNode < ASTNode
+  attr_reader :condition, :then_body, :else_body
+
+  def initialize(condition, then_body, else_body = nil)
+    @condition = condition
+    @then_body = then_body
+    @else_body = else_body
+  end
+
+  def to_s
+    "ConditionalNode(#{@condition}, #{@then_body}, #{@else_body})"
+  end
+end
+
 # Node representing a type constraint declaration for unified reasoning
 class TypeConstraintNode < ASTNode
   attr_reader :variable, :constraint_type, :constraint_data, :conditions
