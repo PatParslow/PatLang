@@ -1,119 +1,691 @@
 #!/usr/bin/env ruby
 
-# PatLang Executable Wrapper
-# Simple wrapper script to make PatLang easy to use from command line
+# PaTLang Professional Command-Line Interface
+# Multi-backend execution with comprehensive features
 
 require 'pathname'
+require 'optparse'
+require 'json'
+require 'benchmark'
 
 # Get the project root directory
 PATLANG_ROOT = Pathname.new(__FILE__).parent.parent.expand_path
-PATLANG_SRC = PATLANG_ROOT.join('src')
 
-# Add src to load path
-$LOAD_PATH.unshift(PATLANG_SRC.to_s)
+# Add required paths to load path
+$LOAD_PATH.unshift(PATLANG_ROOT.join('patlang-core').to_s)
+$LOAD_PATH.unshift(PATLANG_ROOT.join('ruby-host').to_s)
+$LOAD_PATH.unshift(PATLANG_ROOT.join('native_evaluator').to_s)
 
-# Load PatLang
-require_relative File.join(PATLANG_ROOT, 'src', 'patlang')
+# Load PaTLang components
+require_relative File.join(PATLANG_ROOT, 'patlang-core', 'evaluator', 'evaluator')
+require_relative File.join(PATLANG_ROOT, 'patlang-core', 'parser', 'parser')
+require_relative File.join(PATLANG_ROOT, 'patlang-core', 'lexer', 'lexer')
 
-def show_help
-  puts <<~HELP
-    PatLang v0.4.0 - Multi-Paradigm Programming Language
+# Backend implementations
+class PaTLangCLI
+  VERSION = "1.0.0"
+  
+  # Available backends
+  BACKENDS = {
+    'ruby' => 'Ruby evaluator (default)',
+    'phase1' => 'Phase 1 self-hosting bridge',
+    'native' => 'Native evaluator (when available)',
+    'transpile' => 'Transpile to C and compile'
+  }.freeze
+  
+  def initialize
+    @options = {
+      backend: 'ruby',
+      verbose: false,
+      debug: false,
+      timing: false,
+      output: nil,
+      compare: false,
+      quiet: false
+    }
     
-    Usage:
-      patlang [file.pat]           # Execute a PatLang file
-      patlang --repl              # Start interactive REPL
-      patlang --demo              # Run demonstration
-      patlang --version           # Show version information
-      patlang --help              # Show this help
+    @stats = {
+      files_processed: 0,
+      total_time: 0.0,
+      backend_times: Hash.new(0.0)
+    }
+  end
+  
+  def run(args)
+    begin
+      parse_options(args)
+      
+      if args.empty?
+        show_help
+        return 0
+      end
+      
+      filename = args[0]
+      unless File.exist?(filename)
+        error("File not found: #{filename}")
+        return 1
+      end
+      
+      # Validate file extension
+      ext = File.extname(filename).downcase
+      unless ['.pat', '.patlang'].include?(ext)
+        warning("Unrecognized file extension: #{ext}. Proceeding anyway...")
+      end
+      
+      # Execute file with selected backend(s)
+      if @options[:compare]
+        execute_with_comparison(filename)
+      else
+        execute_with_backend(filename, @options[:backend])
+      end
+      
+      show_stats if @options[:timing]
+      return 0
+      
+    rescue => e
+      error("CLI Error: #{e.message}")
+      debug_output("Backtrace:\n#{e.backtrace.join("\n")}") if @options[:debug]
+      return 1
+    end
+  end
+  
+  private
+  
+  def parse_options(args)
+    parser = OptionParser.new do |opts|
+      opts.banner = "Usage: patlang [options] <file.pat|file.patlang>"
+      opts.separator ""
+      opts.separator "Backend Selection:"
+      
+      opts.on("-b", "--backend BACKEND", BACKENDS.keys, 
+              "Select backend: #{BACKENDS.keys.join(', ')} (default: ruby)") do |backend|
+        @options[:backend] = backend
+      end
+      
+      opts.on("-c", "--compare", "Compare results across all available backends") do
+        @options[:compare] = true
+      end
+      
+      opts.separator ""
+      opts.separator "Output Options:"
+      
+      opts.on("-o", "--output FILE", "Save output to file") do |file|
+        @options[:output] = file
+      end
+      
+      opts.on("-q", "--quiet", "Suppress non-essential output") do
+        @options[:quiet] = true
+      end
+      
+      opts.separator ""
+      opts.separator "Debugging Options:"
+      
+      opts.on("-v", "--verbose", "Enable verbose output") do
+        @options[:verbose] = true
+      end
+      
+      opts.on("-d", "--debug", "Enable debug mode") do
+        @options[:debug] = true
+      end
+      
+      opts.on("-t", "--time", "Show execution timing") do
+        @options[:timing] = true
+      end
+      
+      opts.separator ""
+      opts.separator "Information:"
+      
+      opts.on("--version", "Show version information") do
+        show_version
+        exit 0
+      end
+      
+      opts.on("-h", "--help", "Show this help") do
+        puts opts
+        show_examples
+        exit 0
+      end
+      
+      opts.on("--backends", "List available backends") do
+        show_backends
+        exit 0
+      end
+    end
     
-    Examples:
-      patlang script.pat          # Run script.pat
-      patlang examples/hello.pat  # Run example file
-      patlang --repl              # Start interactive mode
-    
-    File Extensions:
-      .pat        PatLang source files
-      .patlang    PatLang source files (reasoning mode enabled)
-    
-    For more information, visit: https://github.com/patlang/patlang
-  HELP
-end
-
-def show_version
-  puts "PatLang v0.4.0"
-  puts "Multi-Paradigm Programming Language"
-  puts "Copyright (c) 2025 PatLang Project"
-end
-
-def run_file(filename)
-  unless File.exist?(filename)
-    puts "Error: File '#{filename}' not found."
+    parser.parse!(args)
+  rescue OptionParser::InvalidOption => e
+    error("Invalid option: #{e.message}")
     exit 1
   end
   
-  # Check file extension
-  ext = File.extname(filename)
-  unless ['.pat', '.patlang'].include?(ext)
-    puts "Warning: File extension '#{ext}' not recognized. Proceeding anyway..."
+  def execute_with_backend(filename, backend)
+    verbose_output("Executing #{filename} with #{backend} backend")
+    
+    start_time = Time.now
+    
+    begin
+      result = case backend
+      when 'ruby'
+        execute_ruby_backend(filename)
+      when 'phase1'
+        execute_phase1_backend(filename)
+      when 'native'
+        execute_native_backend(filename)
+      when 'transpile'
+        execute_transpile_backend(filename)
+      else
+        raise "Unknown backend: #{backend}"
+      end
+      
+      end_time = Time.now
+      execution_time = end_time - start_time
+      
+      @stats[:files_processed] += 1
+      @stats[:total_time] += execution_time
+      @stats[:backend_times][backend] += execution_time
+      
+      # Output result
+      output_result(result, filename, backend, execution_time)
+      return result
+      
+    rescue => e
+      error("Execution failed with #{backend} backend: #{e.message}")
+      debug_output("Error details: #{e.class}: #{e.message}")
+      debug_output("Backtrace:\n#{e.backtrace.join("\n")}") if @options[:debug]
+      return nil
+    end
   end
   
-  begin
-    Patlang.run_file(filename)
-  rescue => e
-    puts "Error executing #{filename}: #{e.message}"
-    exit 1
+  def execute_with_comparison(filename)
+    verbose_output("Comparing execution across all backends for #{filename}")
+    
+    results = {}
+    available_backends = get_available_backends
+    
+    available_backends.each do |backend|
+      info_output("Testing with #{backend} backend...")
+      
+      begin
+        start_time = Time.now
+        result = case backend
+        when 'ruby'
+          execute_ruby_backend(filename)
+        when 'phase1'
+          execute_phase1_backend(filename)
+        when 'native'
+          execute_native_backend(filename)
+        when 'transpile'
+          execute_transpile_backend(filename)
+        end
+        end_time = Time.now
+        
+        results[backend] = {
+          result: result,
+          success: true,
+          time: end_time - start_time,
+          error: nil
+        }
+        
+      rescue => e
+        results[backend] = {
+          result: nil,
+          success: false,
+          time: 0,
+          error: e.message
+        }
+        warning("#{backend} backend failed: #{e.message}")
+      end
+    end
+    
+    # Display comparison results
+    show_comparison_results(results, filename)
+  end
+  
+  def execute_ruby_backend(filename)
+    debug_output("Loading Ruby evaluator...")
+    
+    # Load file content
+    content = File.read(filename)
+    
+    # Create evaluator
+    evaluator = Evaluator.new
+    
+    # Enable reasoning mode for .patlang files
+    if filename.end_with?('.patlang')
+      debug_output("Auto-enabling reasoning mode for .patlang file")
+      evaluator.enable_reasoning_mode
+    end
+    
+    # Parse and evaluate
+    lexer = Lexer.new(content)
+    tokens = lexer.tokenize
+    
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    
+    result = evaluator.evaluate(ast)
+    
+    {
+      value: result,
+      type: infer_type(result),
+      backend: 'ruby',
+      success: true
+    }
+  end
+  
+  def execute_phase1_backend(filename)
+    debug_output("Loading Phase 1 self-hosting bridge...")
+    
+    begin
+      require_relative File.join(PATLANG_ROOT, 'native_evaluator', 'ruby_bridge')
+      
+      bridge = PaTLangPhase1Bridge.new
+      content = File.read(filename)
+      
+      # Use Phase 1 bridge with preference for PaTLang evaluator
+      result = bridge.evaluate(content, prefer_patlang: true)
+      
+      {
+        value: result[:value],
+        type: result[:type],
+        backend: 'phase1',
+        success: result[:success],
+        evaluator_used: result[:evaluator_used],
+        error: result[:error]
+      }
+      
+    rescue LoadError => e
+      raise "Phase 1 backend not available: #{e.message}"
+    end
+  end
+  
+  def execute_native_backend(filename)
+    debug_output("Attempting native evaluator...")
+    
+    # Check if native evaluator is available
+    native_evaluator_path = PATLANG_ROOT.join('native_evaluator', 'patlang_native')
+    
+    unless File.exist?(native_evaluator_path)
+      raise "Native evaluator not compiled. Run 'make' in native_evaluator/ directory."
+    end
+    
+    # Execute using native evaluator
+    command = "#{native_evaluator_path} #{filename}"
+    debug_output("Executing: #{command}")
+    
+    output = `#{command} 2>&1`
+    exit_code = $?.exitstatus
+    
+    if exit_code == 0
+      # Parse native evaluator output
+      lines = output.strip.split("\n")
+      result_line = lines.find { |line| line.start_with?("RESULT:") }
+      
+      if result_line
+        result_value = result_line.sub("RESULT:", "").strip
+        {
+          value: parse_native_result(result_value),
+          type: { base_type: 'Unknown', constraints: [] },
+          backend: 'native',
+          success: true,
+          native_output: output
+        }
+      else
+        {
+          value: output,
+          type: { base_type: 'String', constraints: [] },
+          backend: 'native',
+          success: true
+        }
+      end
+    else
+      raise "Native evaluator failed with exit code #{exit_code}: #{output}"
+    end
+  end
+  
+  def execute_transpile_backend(filename)
+    debug_output("Transpiling to C and compiling...")
+    
+    # Check if transpiler is available
+    transpiler_path = PATLANG_ROOT.join('transpiler', 'patlang_transpiler.rb')
+    
+    unless File.exist?(transpiler_path)
+      raise "Transpiler not available. Transpile backend not implemented."
+    end
+    
+    # Generate C code
+    c_filename = filename.sub(/\.(pat|patlang)$/, '.c')
+    
+    command = "ruby #{transpiler_path} #{filename} -o #{c_filename}"
+    debug_output("Transpiling: #{command}")
+    
+    output = `#{command} 2>&1`
+    exit_code = $?.exitstatus
+    
+    unless exit_code == 0
+      raise "Transpilation failed: #{output}"
+    end
+    
+    # Compile C code
+    exe_filename = c_filename.sub(/\.c$/, '')
+    compile_command = "gcc -o #{exe_filename} #{c_filename} -lm"
+    debug_output("Compiling: #{compile_command}")
+    
+    compile_output = `#{compile_command} 2>&1`
+    compile_exit_code = $?.exitstatus
+    
+    unless compile_exit_code == 0
+      raise "Compilation failed: #{compile_output}"
+    end
+    
+    # Execute compiled program
+    exec_output = `./#{exe_filename} 2>&1`
+    exec_exit_code = $?.exitstatus
+    
+    # Clean up generated files
+    File.delete(c_filename) if File.exist?(c_filename)
+    File.delete(exe_filename) if File.exist?(exe_filename)
+    
+    if exec_exit_code == 0
+      {
+        value: exec_output.strip,
+        type: { base_type: 'String', constraints: [] },
+        backend: 'transpile',
+        success: true,
+        transpile_output: output,
+        compile_output: compile_output
+      }
+    else
+      raise "Compiled program failed with exit code #{exec_exit_code}: #{exec_output}"
+    end
+  end
+  
+  def get_available_backends
+    available = ['ruby']  # Ruby is always available
+    
+    # Check Phase 1 bridge
+    phase1_bridge_path = PATLANG_ROOT.join('native_evaluator', 'ruby_bridge.rb')
+    available << 'phase1' if File.exist?(phase1_bridge_path)
+    
+    # Check native evaluator
+    native_evaluator_path = PATLANG_ROOT.join('native_evaluator', 'patlang_native')
+    available << 'native' if File.exist?(native_evaluator_path)
+    
+    # Check transpiler
+    transpiler_path = PATLANG_ROOT.join('transpiler', 'patlang_transpiler.rb')
+    available << 'transpile' if File.exist?(transpiler_path)
+    
+    available
+  end
+  
+  def output_result(result, filename, backend, execution_time)
+    if @options[:output]
+      save_result_to_file(result, filename, backend, execution_time)
+    else
+      display_result(result, filename, backend, execution_time)
+    end
+  end
+  
+  def display_result(result, filename, backend, execution_time)
+    unless @options[:quiet]
+      info_output("Executed #{filename} using #{backend} backend")
+      
+      if @options[:timing]
+        info_output("Execution time: #{'%.3f' % execution_time}s")
+      end
+      
+      if @options[:verbose]
+        verbose_output("Result type: #{result[:type]}")
+        verbose_output("Backend: #{result[:backend]}")
+        verbose_output("Success: #{result[:success]}")
+      end
+    end
+    
+    # Always show the result value
+    if result[:success]
+      puts format_result_value(result[:value])
+    else
+      error("Execution failed: #{result[:error]}")
+    end
+  end
+  
+  def save_result_to_file(result, filename, backend, execution_time)
+    output_data = {
+      filename: filename,
+      backend: backend,
+      execution_time: execution_time,
+      timestamp: Time.now.iso8601,
+      result: result
+    }
+    
+    File.write(@options[:output], JSON.pretty_generate(output_data))
+    info_output("Results saved to #{@options[:output]}")
+  end
+  
+  def show_comparison_results(results, filename)
+    puts "\n" + "="*60
+    puts "BACKEND COMPARISON RESULTS"
+    puts "="*60
+    puts "File: #{filename}"
+    puts "Timestamp: #{Time.now}"
+    puts
+    
+    # Success/failure summary
+    successful_backends = results.select { |_, data| data[:success] }.keys
+    failed_backends = results.select { |_, data| !data[:success] }.keys
+    
+    puts "Successful backends: #{successful_backends.join(', ')}"
+    puts "Failed backends: #{failed_backends.join(', ')}" unless failed_backends.empty?
+    puts
+    
+    # Detailed results
+    results.each do |backend, data|
+      puts "#{backend.upcase} BACKEND:"
+      puts "-" * 20
+      
+      if data[:success]
+        puts "✓ Success"
+        puts "Result: #{format_result_value(data[:result][:value])}"
+        puts "Time: #{'%.3f' % data[:time]}s"
+        
+        if @options[:verbose] && data[:result][:type]
+          puts "Type: #{data[:result][:type]}"
+        end
+      else
+        puts "✗ Failed"
+        puts "Error: #{data[:error]}"
+      end
+      
+      puts
+    end
+    
+    # Performance comparison
+    if successful_backends.length > 1
+      puts "PERFORMANCE COMPARISON:"
+      puts "-" * 20
+      
+      fastest_backend = successful_backends.min_by { |b| results[b][:time] }
+      fastest_time = results[fastest_backend][:time]
+      
+      successful_backends.each do |backend|
+        time = results[backend][:time]
+        relative_speed = time / fastest_time
+        
+        status = backend == fastest_backend ? "⚡ FASTEST" : "#{'%.1f' % relative_speed}x slower"
+        puts "#{backend}: #{'%.3f' % time}s (#{status})"
+      end
+      puts
+    end
+    
+    # Result consistency check
+    if successful_backends.length > 1
+      puts "RESULT CONSISTENCY:"
+      puts "-" * 20
+      
+      result_values = successful_backends.map { |b| results[b][:result][:value] }
+      all_same = result_values.all? { |v| v == result_values.first }
+      
+      if all_same
+        puts "✓ All backends produced identical results"
+      else
+        puts "⚠ Backends produced different results:"
+        successful_backends.each do |backend|
+          puts "  #{backend}: #{format_result_value(results[backend][:result][:value])}"
+        end
+      end
+    end
+  end
+  
+  def format_result_value(value)
+    case value
+    when String
+      value
+    when Numeric
+      value.to_s
+    when TrueClass, FalseClass
+      value.to_s
+    when NilClass
+      "nil"
+    when Hash
+      value.inspect
+    when Array
+      value.inspect
+    else
+      value.to_s
+    end
+  end
+  
+  def parse_native_result(result_str)
+    # Try to parse as JSON first
+    begin
+      JSON.parse(result_str)
+    rescue JSON::ParserError
+      # Try to parse as number
+      if result_str =~ /^-?\d+$/
+        result_str.to_i
+      elsif result_str =~ /^-?\d+\.\d+$/
+        result_str.to_f
+      elsif result_str == "true"
+        true
+      elsif result_str == "false"
+        false
+      elsif result_str == "nil" || result_str == "null"
+        nil
+      else
+        result_str  # Return as string
+      end
+    end
+  end
+  
+  def infer_type(value)
+    case value
+    when Numeric
+      { base_type: 'Number', constraints: [] }
+    when String
+      { base_type: 'String', constraints: [] }
+    when TrueClass, FalseClass
+      { base_type: 'Boolean', constraints: [] }
+    when NilClass
+      { base_type: 'Void', constraints: [] }
+    else
+      { base_type: 'Object', constraints: [] }
+    end
+  end
+  
+  def show_stats
+    puts "\n" + "="*40
+    puts "EXECUTION STATISTICS"
+    puts "="*40
+    puts "Files processed: #{@stats[:files_processed]}"
+    puts "Total time: #{'%.3f' % @stats[:total_time]}s"
+    
+    if @stats[:backend_times].any?
+      puts "Backend breakdown:"
+      @stats[:backend_times].each do |backend, time|
+        puts "  #{backend}: #{'%.3f' % time}s"
+      end
+    end
+  end
+  
+  def show_version
+    puts "PaTLang CLI v#{VERSION}"
+    puts "Multi-Paradigm Programming Language"
+    puts "Copyright (c) 2025 PaTLang Project"
+    puts
+    puts "Available backends: #{get_available_backends.join(', ')}"
+  end
+  
+  def show_backends
+    puts "Available PaTLang Backends:"
+    puts "=" * 40
+    
+    available = get_available_backends
+    
+    BACKENDS.each do |backend, description|
+      status = available.include?(backend) ? "✓ Available" : "✗ Not available"
+      puts "#{backend.ljust(12)} - #{description} (#{status})"
+    end
+    
+    puts
+    puts "To use a specific backend:"
+    puts "  patlang --backend ruby script.pat"
+    puts "  patlang --backend phase1 script.pat"
+    puts "  patlang --compare script.pat  # Compare all backends"
+  end
+  
+  def show_examples
+    puts
+    puts "Examples:"
+    puts "  patlang script.pat                    # Run with default Ruby backend"
+    puts "  patlang --backend phase1 script.pat  # Use Phase 1 self-hosting bridge"
+    puts "  patlang --compare script.pat         # Compare all available backends"
+    puts "  patlang --verbose --time script.pat  # Show detailed output and timing"
+    puts "  patlang --output results.json script.pat  # Save results to file"
+    puts
+    puts "Supported file extensions: .pat, .patlang"
+    puts
+    puts "For more information, visit: https://github.com/patlang/patlang"
+  end
+  
+  def show_help
+    puts "PaTLang CLI v#{VERSION} - Professional Command-Line Interface"
+    puts
+    puts "Usage: patlang [options] <file.pat|file.patlang>"
+    puts
+    puts "Quick start:"
+    puts "  patlang script.pat                    # Execute with default backend"
+    puts "  patlang --help                        # Show full help"
+    puts "  patlang --backends                    # List available backends"
+    puts "  patlang --compare script.pat         # Compare all backends"
+    puts
+    puts "Use --help for detailed options."
+  end
+  
+  # Output methods
+  def info_output(message)
+    puts "INFO: #{message}" unless @options[:quiet]
+  end
+  
+  def verbose_output(message)
+    puts "VERBOSE: #{message}" if @options[:verbose]
+  end
+  
+  def debug_output(message)
+    puts "DEBUG: #{message}" if @options[:debug]
+  end
+  
+  def warning(message)
+    puts "WARNING: #{message}" unless @options[:quiet]
+  end
+  
+  def error(message)
+    $stderr.puts "ERROR: #{message}"
   end
 end
 
-def start_repl
-  puts "Starting PatLang REPL..."
-  begin
-    Patlang.repl
-  rescue Interrupt
-    puts "\nGoodbye!"
-    exit 0
-  rescue => e
-    puts "REPL error: #{e.message}"
-    exit 1
-  end
-end
-
-def run_demo
-  puts "Running PatLang demonstration..."
-  begin
-    Patlang.demo
-  rescue => e
-    puts "Demo error: #{e.message}"
-    exit 1
-  end
-end
-
-# Main execution logic
-case ARGV.length
-when 0
-  # No arguments - show help
-  show_help
-  
-when 1
-  arg = ARGV[0]
-  
-  case arg
-  when '--help', '-h'
-    show_help
-  when '--version', '-v'
-    show_version
-  when '--repl', '-r'
-    start_repl
-  when '--demo', '-d'
-    run_demo
-  else
-    # Assume it's a filename
-    run_file(arg)
-  end
-  
-else
-  # Multiple arguments - show error
-  puts "Error: Too many arguments."
-  puts "Use 'patlang --help' for usage information."
-  exit 1
+# Main execution
+if __FILE__ == $0
+  cli = PaTLangCLI.new
+  exit_code = cli.run(ARGV)
+  exit exit_code
 end

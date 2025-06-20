@@ -8,6 +8,7 @@ require_relative 'function_evaluator'
 require_relative 'scope_manager'
 require_relative 'object_evaluator'
 require_relative 'reasoning_evaluator'
+require_relative 'goal_integration'
 require_relative '../object_model/object_integration'
 require_relative '../reasoning/reasoning_coordinator'
 require_relative '../reasoning/form_validator'
@@ -44,6 +45,7 @@ class Evaluator
     @function_evaluator = EvaluatorModules::FunctionEvaluator.new(self)
     @object_evaluator = EvaluatorModules::ObjectEvaluator.new(self)
     @reasoning_evaluator = EvaluatorModules::ReasoningEvaluator.new(self)
+    @goal_integration = EvaluatorModules::GoalIntegration.new(self)
     
     # Initialize reasoning system components (basic implementations)
     @reasoning_mode = false
@@ -130,21 +132,39 @@ class Evaluator
     @form_validator.validate_form(form_name, form_definition, data)
   end
 
-  # Goal system integration
+  # Goal system integration - delegate to goal integration layer
   def declare_goal(name, definition)
-    return nil unless @goal_system
-    @goal_system.declare_goal(name, definition)
+    @goal_integration.declare_goal(name, definition)
   end
 
-  def pursue_goal(name, **context)
-    return nil unless @goal_system
-    @goal_system.pursue_goal(name, **context)
+  def pursue_goal(name, context = {})
+    @goal_integration.pursue_goal(name, context)
   end
 
-  # Facts database integration
+  # Facts database integration - delegate to goal integration layer
   def assert_fact(fact)
-    return nil unless @facts_database
-    @facts_database.assert_fact(fact)
+    @goal_integration.assert_fact(fact)
+  end
+
+  def query_facts(query)
+# Goal integration status and monitoring
+  def goal_integration_enabled?
+    @goal_integration.integration_enabled?
+  end
+
+  def goal_integration_stats
+    @goal_integration.integration_stats
+  end
+    @goal_integration.query_facts(query)
+  end
+
+  # Goal integration status and monitoring
+  def goal_integration_enabled?
+    @goal_integration.integration_enabled?
+  end
+
+  def goal_integration_stats
+    @goal_integration.integration_stats
   end
 
   def define_rule(rule)
@@ -153,8 +173,7 @@ class Evaluator
   end
 
   def query_facts(query)
-    return [] unless @facts_database
-    @facts_database.query(query)
+    @goal_integration.query_facts(query)
   end
 
   # Type constraint integration
@@ -649,15 +668,11 @@ class Evaluator
   end
 
   def visit_goal_node(node)
-    @reasoning_evaluator.visit_goal_node(node)
+    @goal_integration.visit_goal_node(node)
   end
 
   def visit_logic_rule_node(node)
     @reasoning_evaluator.visit_logic_rule_node(node)
-  end
-
-  def visit_query_node(node)
-    @reasoning_evaluator.visit_query_node(node)
   end
 
   private
@@ -695,56 +710,15 @@ class Evaluator
   end
 
   def visit_assert_node(node)
-    # Store the fact instead of just printing
-    fact_string = node.fact.to_s
-    @facts << fact_string
-    @facts
+    @goal_integration.visit_assert_node(node)
   end
 
-
-
   def visit_pursue_node(node)
-    # Basic goal pursuit implementation
-    goal_name = node.goal_name
-    
-    # Ensure the goal variable is registered in scope
-    goal_name_str = goal_name.to_s
-    unless @scope_manager.variables.key?(goal_name_str)
-      set_variable(goal_name_str, :"#{goal_name_str}_goal")
-    end
-    
-    goal = @goals[goal_name]
-    
-    if goal
-      # Simple goal resolution - just return a sample result for now
-      # In a full implementation, this would use backtracking and constraint solving
-      case goal_name.to_s
-      when 'find_answer'
-        42  # Sample answer that satisfies > 0 and < 100
-      when 'find_valid_x'
-        6   # Sample answer that's even and divisible by 3
-      when 'complex_search'
-        53  # Prime number between 50 and 60
-      when 'discover_relationships'
-        'alice-bob-friend'  # Sample relationship discovery
-      when 'find_even'
-        22  # Even number > 10
-      when 'optimize'
-        49  # Optimized value divisible by 7 and < 100
-      else
-        goal.name  # Return the goal name as a fallback
-      end
-    else
-      # Return a reasonable default even if goal not found
-      case goal_name.to_s
-      when 'complex_search'
-        53
-      when 'discover_relationships'
-        'relationship_discovered'
-      else
-        :"#{goal_name_str}_result"
-      end
-    end
+    @goal_integration.visit_pursue_node(node)
+  end
+
+  def visit_query_node(node)
+    @goal_integration.visit_query_node(node)
   end
   
   # Helper methods for goal resolution

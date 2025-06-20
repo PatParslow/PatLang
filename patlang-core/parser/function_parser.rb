@@ -49,7 +49,49 @@ module ParserModules
         parameters = []
         return_type = nil
         
-        if @parser.current_token&.type == :TAKES
+        # Handle both parentheses syntax: func(param1, param2) and TAKES syntax: func takes: param1, param2
+        if @parser.current_token&.type == :LPAREN
+          # Parentheses syntax: func(param1, param2)
+          debug_print("Parsing parentheses parameter syntax")
+          @parser.eat(:LPAREN)
+          
+          unless @parser.current_token&.type == :RPAREN
+            param_count = 0
+            loop do
+              break unless @parser.current_token&.type == :IDENTIFIER || @parser.current_token&.type == :MINUS
+              break if param_count >= 50  # Safety limit
+              
+              # Check for missing parameter name (starts with type like "-string")
+              if @parser.current_token&.type == :MINUS
+                @parser.syntax_error("Expected parameter name before type annotation")
+              end
+              
+              param_name = @parser.current_token.value
+              @parser.eat(:IDENTIFIER)
+              
+              # Check for compound type (parameter-type syntax)
+              param_type = nil
+              if @parser.current_token&.type == :MINUS &&
+                 @parser.peek&.type == :IDENTIFIER
+                @parser.eat(:MINUS)
+                param_type = @parser.current_token.value
+                @parser.eat(:IDENTIFIER)
+              end
+              
+              parameters << ParameterNode.new(param_name, param_type)
+              param_count += 1
+              
+              if @parser.current_token&.type == :COMMA
+                @parser.eat(:COMMA)
+              else
+                break
+              end
+            end
+          end
+          
+          @parser.eat(:RPAREN)
+          
+        elsif @parser.current_token&.type == :TAKES
           @parser.eat(:TAKES)
           @parser.eat(:COLON) if @parser.current_token&.type == :COLON
           

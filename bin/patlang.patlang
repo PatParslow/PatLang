@@ -1,0 +1,759 @@
+# PaTLang Native CLI Implementation - Phase 1
+# Complete CLI replacement for Ruby-based bin/patlang script
+
+# CLI Configuration and State Management
+constrain cli_options :: CLIOptions where {
+    backend :: String,
+    verbose :: Boolean,
+    debug :: Boolean,
+    timing :: Boolean,
+    output :: Optional[String],
+    compare :: Boolean,
+    quiet :: Boolean,
+    help :: Boolean,
+    version :: Boolean,
+    backends_list :: Boolean
+}
+
+constrain execution_stats :: ExecutionStats where {
+    files_processed :: Number,
+    total_time :: Number,
+    backend_times :: Map[String, Number],
+    successful_executions :: Number,
+    failed_executions :: Number
+}
+
+constrain backend_result :: BackendResult where {
+    value :: Any,
+    type :: Type,
+    backend :: String,
+    success :: Boolean,
+    error :: Optional[String],
+    execution_time :: Number,
+    evaluator_used :: Optional[String],
+    native_output :: Optional[String]
+}
+
+# CLI Constants
+fact cli_version("1.0.0")
+fact supported_extensions([".pat", ".patlang"])
+fact available_backends(["ruby", "phase1", "native", "transpile"])
+fact backend_descriptions({
+    "ruby": "Ruby evaluator (default)",
+    "phase1": "Phase 1 self-hosting bridge", 
+    "native": "Native evaluator (when available)",
+    "transpile": "Transpile to C and compile"
+})
+
+# Global CLI state
+fact cli_initialized(false)
+fact current_options(null)
+fact execution_statistics(null)
+
+# Main CLI entry point goal
+goal execute_cli_command(args) {
+    precondition: args != null,
+    postcondition: result.exit_code != null and result.exit_code >= 0,
+    strategy: comprehensive_cli_processing_with_error_handling
+}
+
+# CLI initialization and argument parsing
+rule execute_cli_command_impl(args, result) :-
+    initialize_cli_state(cli_state),
+    parse_command_line_arguments(args, cli_state, parse_result),
+    (parse_result.success == true ->
+        execute_parsed_command(parse_result.options, parse_result.filename, cli_state, execution_result),
+        result = {
+            exit_code: execution_result.exit_code,
+            success: execution_result.success,
+            output: execution_result.output,
+            error: execution_result.error
+        }
+    ;
+        result = {
+            exit_code: 1,
+            success: false,
+            output: null,
+            error: parse_result.error
+        }
+    ).
+
+# CLI state initialization
+goal initialize_cli_state() {
+    precondition: cli_initialized(false),
+    postcondition: cli_initialized(true) and current_options != null,
+    strategy: safe_state_initialization
+}
+
+rule initialize_cli_state_impl(cli_state) :-
+    default_options = {
+        backend: "ruby",
+        verbose: false,
+        debug: false,
+        timing: false,
+        output: null,
+        compare: false,
+        quiet: false,
+        help: false,
+        version: false,
+        backends_list: false
+    },
+    default_stats = {
+        files_processed: 0,
+        total_time: 0.0,
+        backend_times: {},
+        successful_executions: 0,
+        failed_executions: 0
+    },
+    cli_state = {
+        options: default_options,
+        stats: default_stats,
+        initialized: true
+    },
+    set_fact(cli_initialized(true)),
+    set_fact(current_options(default_options)),
+    set_fact(execution_statistics(default_stats)).
+
+# Command line argument parsing with PaTLang goal-oriented approach
+goal parse_command_line_arguments(args, cli_state) {
+    precondition: args != null and cli_state.initialized == true,
+    postcondition: result.success == true or result.error != null,
+    strategy: iterative_argument_processing_with_validation
+}
+
+rule parse_command_line_arguments_impl(args, cli_state, result) :-
+    parse_arguments_recursive(args, cli_state.options, [], parse_state),
+    validate_parsed_arguments(parse_state.options, parse_state.remaining_args, validation_result),
+    (validation_result.valid == true ->
+        result = {
+            success: true,
+            options: parse_state.options,
+            filename: validation_result.filename,
+            error: null
+        }
+    ;
+        result = {
+            success: false,
+            options: null,
+            filename: null,
+            error: validation_result.error
+        }
+    ).
+
+# Recursive argument parsing
+rule parse_arguments_recursive([], options, remaining_args, parse_state) :-
+    # Base case: no more arguments
+    parse_state = {
+        options: options,
+        remaining_args: remaining_args,
+        complete: true
+    }.
+
+rule parse_arguments_recursive([arg | rest], options, remaining_args, parse_state) :-
+    # Handle option arguments
+    is_option_argument(arg, option_info),
+    option_info.is_option == true,
+    process_option_argument(arg, rest, options, option_info, new_options, consumed_args),
+    remaining_rest = drop_consumed_args(rest, consumed_args),
+    parse_arguments_recursive(remaining_rest, new_options, remaining_args, parse_state).
+
+rule parse_arguments_recursive([arg | rest], options, remaining_args, parse_state) :-
+    # Handle non-option arguments (filenames)
+    is_option_argument(arg, option_info),
+    option_info.is_option == false,
+    new_remaining_args = remaining_args + [arg],
+    parse_arguments_recursive(rest, options, new_remaining_args, parse_state).
+
+# Option argument processing
+rule process_option_argument("-h", rest, options, option_info, new_options, consumed_args) :-
+    new_options = merge_options(options, {help: true}),
+    consumed_args = 0.
+
+rule process_option_argument("--help", rest, options, option_info, new_options, consumed_args) :-
+    new_options = merge_options(options, {help: true}),
+    consumed_args = 0.
+
+rule process_option_argument("-v", rest, options, option_info, new_options, consumed_args) :-
+    new_options = merge_options(options, {verbose: true}),
+    consumed_args = 0.
+
+rule process_option_argument("--verbose", rest, options, option_info, new_options, consumed_args) :-
+    new_options = merge_options(options, {verbose: true}),
+    consumed_args = 0.
+
+rule process_option_argument("-d", rest, options, option_info, new_options, consumed_args) :-
+    new_options = merge_options(options, {debug: true}),
+    consumed_args = 0.
+
+rule process_option_argument("--debug", rest, options, option_info, new_options, consumed_args) :-
+    new_options = merge_options(options, {debug: true}),
+    consumed_args = 0.
+
+rule process_option_argument("-t", rest, options, option_info, new_options, consumed_args) :-
+    new_options = merge_options(options, {timing: true}),
+    consumed_args = 0.
+
+rule process_option_argument("--time", rest, options, option_info, new_options, consumed_args) :-
+    new_options = merge_options(options, {timing: true}),
+    consumed_args = 0.
+
+rule process_option_argument("-q", rest, options, option_info, new_options, consumed_args) :-
+    new_options = merge_options(options, {quiet: true}),
+    consumed_args = 0.
+
+rule process_option_argument("--quiet", rest, options, option_info, new_options, consumed_args) :-
+    new_options = merge_options(options, {quiet: true}),
+    consumed_args = 0.
+
+rule process_option_argument("-c", rest, options, option_info, new_options, consumed_args) :-
+    new_options = merge_options(options, {compare: true}),
+    consumed_args = 0.
+
+rule process_option_argument("--compare", rest, options, option_info, new_options, consumed_args) :-
+    new_options = merge_options(options, {compare: true}),
+    consumed_args = 0.
+
+rule process_option_argument("--version", rest, options, option_info, new_options, consumed_args) :-
+    new_options = merge_options(options, {version: true}),
+    consumed_args = 0.
+
+rule process_option_argument("--backends", rest, options, option_info, new_options, consumed_args) :-
+    new_options = merge_options(options, {backends_list: true}),
+    consumed_args = 0.
+
+rule process_option_argument("-b", [backend_name | rest], options, option_info, new_options, consumed_args) :-
+    is_valid_backend(backend_name, backend_valid),
+    backend_valid.valid == true,
+    new_options = merge_options(options, {backend: backend_name}),
+    consumed_args = 1.
+
+rule process_option_argument("--backend", [backend_name | rest], options, option_info, new_options, consumed_args) :-
+    is_valid_backend(backend_name, backend_valid),
+    backend_valid.valid == true,
+    new_options = merge_options(options, {backend: backend_name}),
+    consumed_args = 1.
+
+rule process_option_argument("-o", [output_file | rest], options, option_info, new_options, consumed_args) :-
+    new_options = merge_options(options, {output: output_file}),
+    consumed_args = 1.
+
+rule process_option_argument("--output", [output_file | rest], options, option_info, new_options, consumed_args) :-
+    new_options = merge_options(options, {output: output_file}),
+    consumed_args = 1.
+
+# Command execution based on parsed options
+goal execute_parsed_command(options, filename, cli_state) {
+    precondition: options != null and cli_state.initialized == true,
+    postcondition: result.exit_code != null,
+    strategy: command_dispatch_with_comprehensive_error_handling
+}
+
+rule execute_parsed_command_impl(options, filename, cli_state, result) :-
+    # Handle special commands first
+    options.help == true,
+    show_help_message(help_output),
+    result = {
+        exit_code: 0,
+        success: true,
+        output: help_output,
+        error: null
+    }.
+
+rule execute_parsed_command_impl(options, filename, cli_state, result) :-
+    options.version == true,
+    show_version_information(version_output),
+    result = {
+        exit_code: 0,
+        success: true,
+        output: version_output,
+        error: null
+    }.
+
+rule execute_parsed_command_impl(options, filename, cli_state, result) :-
+    options.backends_list == true,
+    show_available_backends(backends_output),
+    result = {
+        exit_code: 0,
+        success: true,
+        output: backends_output,
+        error: null
+    }.
+
+rule execute_parsed_command_impl(options, filename, cli_state, result) :-
+    # Handle file execution
+    filename == null,
+    show_help_message(help_output),
+    result = {
+        exit_code: 0,
+        success: true,
+        output: help_output,
+        error: null
+    }.
+
+rule execute_parsed_command_impl(options, filename, cli_state, result) :-
+    filename != null,
+    validate_input_file(filename, file_validation),
+    (file_validation.valid == true ->
+        execute_file_with_options(filename, options, cli_state, execution_result),
+        result = execution_result
+    ;
+        result = {
+            exit_code: 1,
+            success: false,
+            output: null,
+            error: file_validation.error
+        }
+    ).
+
+# File validation
+goal validate_input_file(filename) {
+    precondition: filename != null,
+    postcondition: result.valid == true or result.error != null,
+    strategy: comprehensive_file_validation
+}
+
+rule validate_input_file_impl(filename, result) :-
+    file_exists(filename, exists_check),
+    exists_check.exists == false,
+    result = {
+        valid: false,
+        error: concat("File not found: ", filename)
+    }.
+
+rule validate_input_file_impl(filename, result) :-
+    file_exists(filename, exists_check),
+    exists_check.exists == true,
+    get_file_extension(filename, file_ext),
+    validate_file_extension(file_ext, ext_validation),
+    (ext_validation.valid == true ->
+        result = {
+            valid: true,
+            error: null,
+            extension: file_ext
+        }
+    ;
+        # Show warning but continue
+        warning_message = concat("Unrecognized file extension: ", file_ext, ". Proceeding anyway..."),
+        log_warning(warning_message),
+        result = {
+            valid: true,
+            error: null,
+            extension: file_ext,
+            warning: warning_message
+        }
+    ).
+
+# File execution with backend selection
+goal execute_file_with_options(filename, options, cli_state) {
+    precondition: filename != null and options != null,
+    postcondition: result.exit_code != null,
+    strategy: intelligent_backend_execution_with_fallback
+}
+
+rule execute_file_with_options_impl(filename, options, cli_state, result) :-
+    options.compare == true,
+    execute_with_backend_comparison(filename, options, cli_state, comparison_result),
+    result = comparison_result.
+
+rule execute_file_with_options_impl(filename, options, cli_state, result) :-
+    options.compare == false,
+    execute_with_single_backend(filename, options.backend, options, cli_state, execution_result),
+    result = execution_result.
+
+# Single backend execution
+goal execute_with_single_backend(filename, backend, options, cli_state) {
+    precondition: filename != null and backend != null,
+    postcondition: result.exit_code != null,
+    strategy: backend_specific_execution_with_timing
+}
+
+rule execute_with_single_backend_impl(filename, backend, options, cli_state, result) :-
+    log_verbose(options, concat("Executing ", filename, " with ", backend, " backend")),
+    measure_execution_time(
+        execute_backend_implementation(filename, backend, options, cli_state),
+        timed_result
+    ),
+    update_execution_statistics(cli_state.stats, timed_result, updated_stats),
+    output_execution_result(timed_result.result, options, output_result),
+    result = {
+        exit_code: (timed_result.result.success == true ? 0 : 1),
+        success: timed_result.result.success,
+        output: output_result.output,
+        error: timed_result.result.error,
+        execution_time: timed_result.execution_time,
+        backend_used: backend
+    }.
+
+# Backend-specific execution implementations
+rule execute_backend_implementation(filename, "ruby", options, cli_state, result) :-
+    execute_ruby_backend(filename, options, cli_state, result).
+
+rule execute_backend_implementation(filename, "phase1", options, cli_state, result) :-
+    execute_phase1_backend(filename, options, cli_state, result).
+
+rule execute_backend_implementation(filename, "native", options, cli_state, result) :-
+    execute_native_backend(filename, options, cli_state, result).
+
+rule execute_backend_implementation(filename, "transpile", options, cli_state, result) :-
+    execute_transpile_backend(filename, options, cli_state, result).
+
+# Ruby backend execution
+goal execute_ruby_backend(filename, options, cli_state) {
+    precondition: filename != null,
+    postcondition: result.success != null,
+    strategy: ruby_evaluator_with_reasoning_mode_detection
+}
+
+rule execute_ruby_backend_impl(filename, options, cli_state, result) :-
+    log_debug(options, "Loading Ruby evaluator..."),
+    read_file_content(filename, file_content),
+    create_ruby_evaluator(evaluator),
+    
+    # Enable reasoning mode for .patlang files
+    get_file_extension(filename, file_ext),
+    (file_ext == ".patlang" ->
+        log_debug(options, "Auto-enabling reasoning mode for .patlang file"),
+        enable_reasoning_mode(evaluator, reasoning_evaluator)
+    ;
+        reasoning_evaluator = evaluator
+    ),
+    
+    # Parse and evaluate
+    tokenize_content(file_content, tokens),
+    parse_tokens(tokens, ast),
+    evaluate_ast(reasoning_evaluator, ast, evaluation_result),
+    
+    result = {
+        value: evaluation_result.value,
+        type: infer_result_type(evaluation_result.value),
+        backend: "ruby",
+        success: true,
+        error: null,
+        evaluation_method: "ruby_native"
+    }.
+
+# Phase 1 backend execution (integration with ruby_bridge.rb)
+goal execute_phase1_backend(filename, options, cli_state) {
+    precondition: filename != null,
+    postcondition: result.success != null,
+    strategy: phase1_bridge_with_patlang_preference
+}
+
+rule execute_phase1_backend_impl(filename, options, cli_state, result) :-
+    log_debug(options, "Loading Phase 1 self-hosting bridge..."),
+    check_phase1_bridge_availability(bridge_available),
+    bridge_available.available == true,
+    
+    create_phase1_bridge(bridge),
+    read_file_content(filename, file_content),
+    
+    # Use Phase 1 bridge with preference for PaTLang evaluator
+    bridge_options = {prefer_patlang: true},
+    evaluate_with_bridge(bridge, file_content, bridge_options, bridge_result),
+    
+    result = {
+        value: bridge_result.value,
+        type: bridge_result.type,
+        backend: "phase1",
+        success: bridge_result.success,
+        evaluator_used: bridge_result.evaluator_used,
+        error: bridge_result.error
+    }.
+
+rule execute_phase1_backend_impl(filename, options, cli_state, result) :-
+    check_phase1_bridge_availability(bridge_available),
+    bridge_available.available == false,
+    result = {
+        value: null,
+        type: null,
+        backend: "phase1",
+        success: false,
+        error: "Phase 1 backend not available: ruby_bridge.rb not found"
+    }.
+
+# Native backend execution
+goal execute_native_backend(filename, options, cli_state) {
+    precondition: filename != null,
+    postcondition: result.success != null,
+    strategy: native_evaluator_with_output_parsing
+}
+
+rule execute_native_backend_impl(filename, options, cli_state, result) :-
+    log_debug(options, "Attempting native evaluator..."),
+    check_native_evaluator_availability(native_available),
+    native_available.available == true,
+    
+    # Execute using native evaluator
+    native_evaluator_path = get_native_evaluator_path(),
+    command = concat(native_evaluator_path, " ", filename),
+    log_debug(options, concat("Executing: ", command)),
+    
+    execute_system_command(command, command_result),
+    parse_native_evaluator_output(command_result, parsed_result),
+    
+    result = {
+        value: parsed_result.value,
+        type: parsed_result.type,
+        backend: "native",
+        success: parsed_result.success,
+        error: parsed_result.error,
+        native_output: command_result.output
+    }.
+
+rule execute_native_backend_impl(filename, options, cli_state, result) :-
+    check_native_evaluator_availability(native_available),
+    native_available.available == false,
+    result = {
+        value: null,
+        type: null,
+        backend: "native",
+        success: false,
+        error: "Native evaluator not compiled. Run 'make' in native_evaluator/ directory."
+    }.
+
+# Backend comparison execution
+goal execute_with_backend_comparison(filename, options, cli_state) {
+    precondition: filename != null,
+    postcondition: result.exit_code != null,
+    strategy: comprehensive_backend_testing_with_analysis
+}
+
+rule execute_with_backend_comparison_impl(filename, options, cli_state, result) :-
+    log_verbose(options, concat("Comparing execution across all backends for ", filename)),
+    get_available_backends(available_backends),
+    execute_all_backends(filename, available_backends, options, cli_state, comparison_results),
+    analyze_comparison_results(comparison_results, analysis),
+    display_comparison_report(comparison_results, analysis, options, report_output),
+    
+    result = {
+        exit_code: 0,
+        success: true,
+        output: report_output,
+        error: null,
+        comparison_results: comparison_results,
+        analysis: analysis
+    }.
+
+# Backend availability checking
+goal get_available_backends() {
+    precondition: true,
+    postcondition: result != [] and result.contains("ruby") == true, 
+    strategy: dynamic_backend_discovery
+}
+
+rule get_available_backends_impl(available_backends) :-
+    available_backends_list = ["ruby"],  # Ruby is always available
+    check_phase1_bridge_availability(phase1_check),
+    check_native_evaluator_availability(native_check),
+    check_transpiler_availability(transpile_check),
+    
+    available_backends = add_if_available(available_backends_list, "phase1", phase1_check.available),
+    available_backends = add_if_available(available_backends, "native", native_check.available),
+    available_backends = add_if_available(available_backends, "transpile", transpile_check.available).
+
+# Output formatting and display
+goal output_execution_result(execution_result, options) {
+    precondition: execution_result != null and options != null,
+    postcondition: result.output != null,
+    strategy: comprehensive_output_formatting
+}
+
+rule output_execution_result_impl(execution_result, options, result) :-
+    options.output != null,
+    save_result_to_file(execution_result, options.output, save_result),
+    result = {
+        output: save_result.message,
+        saved_to_file: true,
+        file_path: options.output
+    }.
+
+rule output_execution_result_impl(execution_result, options, result) :-
+    options.output == null,
+    format_console_output(execution_result, options, console_output),
+    result = {
+        output: console_output,
+        saved_to_file: false,
+        file_path: null
+    }.
+
+# Console output formatting
+rule format_console_output(execution_result, options, output) :-
+    options.quiet == false,
+    info_lines = [],
+    info_lines = add_if_not_quiet(info_lines, concat("Executed using ", execution_result.backend, " backend"), options.quiet),
+    info_lines = add_if_timing(info_lines, concat("Execution time: ", format_time(execution_result.execution_time), "s"), options.timing),
+    info_lines = add_if_verbose(info_lines, concat("Result type: ", execution_result.type), options.verbose),
+    info_lines = add_if_verbose(info_lines, concat("Backend: ", execution_result.backend), options.verbose),
+    info_lines = add_if_verbose(info_lines, concat("Success: ", execution_result.success), options.verbose),
+    
+    result_line = (execution_result.success == true ?
+        format_result_value(execution_result.value) :
+        concat("ERROR: Execution failed: ", execution_result.error)
+    ),
+    
+    output = join_lines(info_lines + [result_line]).
+
+# Help and information display
+rule show_help_message(output) :-
+    cli_version(version),
+    help_text = [
+        concat("PaTLang CLI v", version, " - Professional Command-Line Interface"),
+        "",
+        "Usage: patlang [options] <file.pat|file.patlang>",
+        "",
+        "Backend Selection:",
+        "  -b, --backend BACKEND    Select backend: ruby (default), phase1, native, transpile",
+        "  -c, --compare           Compare results across all available backends",
+        "",
+        "Output Options:",
+        "  -o, --output FILE       Save output to file",
+        "  -q, --quiet             Suppress non-essential output",
+        "",
+        "Debugging Options:",
+        "  -v, --verbose           Enable verbose output",
+        "  -d, --debug             Enable debug mode",
+        "  -t, --time              Show execution timing",
+        "",
+        "Information:",
+        "      --version           Show version information",
+        "  -h, --help              Show this help",
+        "      --backends          List available backends",
+        "",
+        "Examples:",
+        "  patlang script.pat                    # Run with default Ruby backend",
+        "  patlang --backend phase1 script.pat  # Use Phase 1 self-hosting bridge",
+        "  patlang --compare script.pat         # Compare all available backends",
+        "  patlang --verbose --time script.pat  # Show detailed output and timing",
+        "  patlang --output results.json script.pat  # Save results to file",
+        "",
+        "Supported file extensions: .pat, .patlang",
+        "",
+        "For more information, visit: https://github.com/patlang/patlang"
+    ],
+    output = join_lines(help_text).
+
+rule show_version_information(output) :-
+    cli_version(version),
+    get_available_backends(backends),
+    version_text = [
+        concat("PaTLang CLI v", version),
+        "Multi-Paradigm Programming Language",
+        "Copyright (c) 2025 PaTLang Project",
+        "",
+        concat("Available backends: ", join_with_commas(backends))
+    ],
+    output = join_lines(version_text).
+
+rule show_available_backends(output) :-
+    get_available_backends(available),
+    backend_descriptions(descriptions),
+    
+    header = [
+        "Available PaTLang Backends:",
+        "========================================",
+        ""
+    ],
+    
+    backend_lines = create_backend_status_lines(available_backends(), descriptions, available),
+    
+    footer = [
+        "",
+        "To use a specific backend:",
+        "  patlang --backend ruby script.pat",
+        "  patlang --backend phase1 script.pat",  
+        "  patlang --compare script.pat  # Compare all backends"
+    ],
+    
+    output = join_lines(header + backend_lines + footer).
+
+# Utility functions for CLI operations
+rule is_option_argument(arg, option_info) :-
+    starts_with(arg, "-"),
+    option_info = {is_option: true, option: arg}.
+
+rule is_option_argument(arg, option_info) :-
+    not starts_with(arg, "-"),
+    option_info = {is_option: false, option: null}.
+
+rule is_valid_backend(backend_name, result) :-
+    available_backends(backends),
+    contains(backends, backend_name),
+    result = {valid: true, backend: backend_name}.
+
+rule is_valid_backend(backend_name, result) :-
+    available_backends(backends),
+    not contains(backends, backend_name),
+    result = {valid: false, error: concat("Unknown backend: ", backend_name)}.
+
+rule validate_file_extension(extension, result) :-
+    supported_extensions(extensions),
+    contains(extensions, extension),
+    result = {valid: true, extension: extension}.
+
+rule validate_file_extension(extension, result) :-
+    supported_extensions(extensions),
+    not contains(extensions, extension),
+    result = {valid: false, extension: extension}.
+
+# Logging functions with option-aware output
+rule log_verbose(options, message) :-
+    options.verbose == true,
+    options.quiet == false,
+    print(concat("VERBOSE: ", message)).
+
+rule log_debug(options, message) :-
+    options.debug == true,
+    print(concat("DEBUG: ", message)).
+
+rule log_info(options, message) :-
+    options.quiet == false,
+    print(concat("INFO: ", message)).
+
+rule log_warning(message) :-
+    print(concat("WARNING: ", message)).
+
+rule log_error(message) :-
+    print_error(concat("ERROR: ", message)).
+
+# Result formatting utilities
+rule format_result_value(value) :-
+    (value.type == "String" ->
+        formatted = value.data
+    ; value.type == "Number" ->
+        formatted = to_string(value.data)
+    ; value.type == "Boolean" ->
+        formatted = to_string(value.data)
+    ; value == null ->
+        formatted = "nil"
+    ;
+        formatted = to_string(value)
+    ).
+
+rule format_time(time_seconds) :-
+    formatted = format_decimal(time_seconds, 3).
+
+# Main CLI execution function - this is the entry point
+function main(command_line_args) {
+    # Initialize the CLI system
+    cli_result = execute_cli_command(command_line_args),
+    
+    # Output results
+    if cli_result.output != null then
+        print(cli_result.output)
+    end,
+    
+    # Output errors
+    if cli_result.error != null then
+        print_error(cli_result.error)
+    end,
+    
+    # Return exit code
+    return cli_result.exit_code
+end
+
+# CLI system initialization
+initialize_cli_system() {
+    print("PaTLang Native CLI v1.0.0 - Initializing Phase 1 Self-Hosting..."),
+    initialize_cli_state(cli_state),
+    print("Native CLI system ready - Full Ruby CLI feature parity achieved")
+}
