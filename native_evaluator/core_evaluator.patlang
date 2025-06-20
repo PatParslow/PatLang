@@ -1,0 +1,457 @@
+# PaTLang Self-Hosting Evaluator - Phase 1 Implementation
+# Core evaluator that can evaluate PaTLang code including itself
+
+# Core evaluation context and state management
+constrain evaluator_context :: EvaluatorContext where {
+    scope_stack :: [Scope],
+    value_stack :: [Value],
+    call_stack :: [CallFrame],
+    memory_manager :: MemoryManager,
+    type_checker :: TypeChecker,
+    native_bridge :: NativeBridge,
+    error_handler :: ErrorHandler,
+    recursion_depth :: Number,
+    max_recursion_depth :: Number
+}
+
+constrain evaluation_result :: EvaluationResult where {
+    value :: Value,
+    type :: Type,
+    success :: Boolean,
+    error :: Optional[Error],
+    side_effects :: [SideEffect],
+    evaluation_time :: Number,
+    memory_allocated :: Number
+}
+
+constrain patlang_value :: Value where {
+    data :: Any,
+    type :: Type,
+    ref_count :: Number,
+    gc_mark :: Boolean,
+    source_location :: Optional[SourceLocation]
+}
+
+# Initialize evaluator context with safe defaults
+fact default_max_recursion_depth(1000)
+fact default_memory_limit(1048576)  # 1MB default
+fact native_bridge_initialized(false)
+
+# Main evaluation goal - the heart of self-hosting
+goal evaluate_ast_node(node, context) {
+    precondition: node != null and node.valid == true and context.initialized == true,
+    postcondition: result.success == true or result.error != null,
+    strategy: dispatch_by_node_type_with_stack_protection
+}
+
+# Safe evaluation with recursion protection
+rule evaluate_ast_node_impl(node, context, result) :-
+    check_recursion_limit(context, recursion_check),
+    recursion_check.safe == true,
+    increment_recursion_depth(context, incremented_context),
+    dispatch_evaluation_by_type(node, incremented_context, dispatch_result),
+    decrement_recursion_depth(incremented_context, final_context),
+    result = {
+        value: dispatch_result.value,
+        type: dispatch_result.type,
+        success: dispatch_result.success,
+        error: dispatch_result.error,
+        side_effects: dispatch_result.side_effects,
+        evaluation_time: dispatch_result.evaluation_time,
+        memory_allocated: dispatch_result.memory_allocated
+    }.
+
+# Main dispatch based on AST node type
+rule dispatch_evaluation_by_type(node, context, result) :-
+    node.type == "Program",
+    evaluate_program(node, context, result).
+
+rule dispatch_evaluation_by_type(node, context, result) :-
+    node.type == "NumberLiteral",
+    evaluate_number_literal(node, context, result).
+
+rule dispatch_evaluation_by_type(node, context, result) :-
+    node.type == "StringLiteral",
+    evaluate_string_literal(node, context, result).
+
+rule dispatch_evaluation_by_type(node, context, result) :-
+    node.type == "BinaryOperation",
+    evaluate_binary_operation(node, context, result).
+
+rule dispatch_evaluation_by_type(node, context, result) :-
+    node.type == "Assignment",
+    evaluate_assignment(node, context, result).
+
+rule dispatch_evaluation_by_type(node, context, result) :-
+    node.type == "FunctionCall",
+    evaluate_function_call(node, context, result).
+
+rule dispatch_evaluation_by_type(node, context, result) :-
+    node.type == "FunctionDefinition",
+    evaluate_function_definition(node, context, result).
+
+rule dispatch_evaluation_by_type(node, context, result) :-
+    node.type == "Goal",
+    evaluate_goal_construct(node, context, result).
+
+rule dispatch_evaluation_by_type(node, context, result) :-
+    node.type == "Fact",
+    evaluate_fact_definition(node, context, result).
+
+rule dispatch_evaluation_by_type(node, context, result) :-
+    node.type == "Rule",
+    evaluate_rule_definition(node, context, result).
+
+# Program evaluation - sequential execution of statements
+goal evaluate_program(program_node, context) {
+    precondition: program_node.type == "Program" and program_node.statements != [],
+    postcondition: result.success == true and context.final_state != null,
+    strategy: sequential_statement_execution_with_error_handling
+}
+
+rule evaluate_program_impl(program_node, context, result) :-
+    initialize_program_scope(context, program_context),
+    evaluate_statement_list(program_node.statements, program_context, [], statements_result),
+    finalize_program_context(program_context, statements_result, final_context),
+    result = {
+        value: statements_result.last_value,
+        type: statements_result.last_type,
+        success: statements_result.all_success,
+        error: statements_result.first_error,
+        side_effects: statements_result.all_side_effects,
+        evaluation_time: statements_result.total_time,
+        memory_allocated: statements_result.total_memory
+    }.
+
+# Statement list evaluation with accumulation
+goal evaluate_statement_list(statements, context, accumulator) {
+    precondition: statements != [] and context != null,
+    postcondition: result.all_evaluated == true,
+    strategy: left_to_right_evaluation_with_early_termination_on_error
+}
+
+rule evaluate_statement_list_impl([], context, accumulator, result) :-
+    # Base case: empty statement list
+    result = {
+        last_value: get_last_value(accumulator),
+        last_type: get_last_type(accumulator),
+        all_success: all_successful(accumulator),
+        first_error: get_first_error(accumulator),
+        all_side_effects: flatten_side_effects(accumulator),
+        total_time: sum_times(accumulator),
+        total_memory: sum_memory(accumulator),
+        all_evaluated: true
+    }.
+
+rule evaluate_statement_list_impl([head | tail], context, accumulator, result) :-
+    # Recursive case: evaluate head, then tail
+    evaluate_ast_node(head, context, head_result),
+    append_result(accumulator, head_result, new_accumulator),
+    head_result.success == true,  # Continue only if successful
+    evaluate_statement_list(tail, context, new_accumulator, result).
+
+rule evaluate_statement_list_impl([head | tail], context, accumulator, result) :-
+    # Error case: stop evaluation on first error
+    evaluate_ast_node(head, context, head_result),
+    head_result.success == false,
+    append_result(accumulator, head_result, final_accumulator),
+    result = {
+        last_value: head_result.value,
+        last_type: head_result.type,
+        all_success: false,
+        first_error: head_result.error,
+        all_side_effects: flatten_side_effects(final_accumulator),
+        total_time: sum_times(final_accumulator),
+        total_memory: sum_memory(final_accumulator),
+        all_evaluated: false
+    }.
+
+# Number literal evaluation
+goal evaluate_number_literal(number_node, context) {
+    precondition: number_node.type == "NumberLiteral" and number_node.value != null,
+    postcondition: result.value.type == "Number" and result.success == true,
+    strategy: direct_value_creation_with_type_annotation
+}
+
+rule evaluate_number_literal_impl(number_node, context, result) :-
+    create_number_value(number_node.value, context.memory_manager, number_value),
+    result = {
+        value: number_value,
+        type: {base_type: "Number", constraints: []},
+        success: true,
+        error: null,
+        side_effects: [],
+        evaluation_time: 0.001,  # Minimal time for literal
+        memory_allocated: calculate_number_size(number_node.value)
+    }.
+
+# String literal evaluation
+goal evaluate_string_literal(string_node, context) {
+    precondition: string_node.type == "StringLiteral" and string_node.value != null,
+    postcondition: result.value.type == "String" and result.success == true,
+    strategy: string_interning_with_memory_management
+}
+
+rule evaluate_string_literal_impl(string_node, context, result) :-
+    intern_string(string_node.value, context.memory_manager, interned_string),
+    create_string_value(interned_string, context.memory_manager, string_value),
+    result = {
+        value: string_value,
+        type: {base_type: "String", constraints: []},
+        success: true,
+        error: null,
+        side_effects: [],
+        evaluation_time: 0.002,  # Slightly more for string processing
+        memory_allocated: calculate_string_size(string_node.value)
+    }.
+
+# Binary operation evaluation with operator precedence
+goal evaluate_binary_operation(binary_node, context) {
+    precondition: binary_node.type == "BinaryOperation" and binary_node.operator != null,
+    postcondition: result.success == true or result.error != null,
+    strategy: type_checked_operator_dispatch_with_coercion
+}
+
+rule evaluate_binary_operation_impl(binary_node, context, result) :-
+    # Evaluate operands
+    evaluate_ast_node(binary_node.left, context, left_result),
+    left_result.success == true,
+    evaluate_ast_node(binary_node.right, context, right_result),
+    right_result.success == true,
+    
+    # Type check and coerce if necessary
+    check_binary_operation_types(binary_node.operator, left_result.type, right_result.type, type_check_result),
+    type_check_result.valid == true,
+    
+    # Perform operation
+    perform_binary_operation(binary_node.operator, left_result.value, right_result.value, type_check_result.result_type, operation_result),
+    
+    result = {
+        value: operation_result.value,
+        type: operation_result.type,
+        success: true,
+        error: null,
+        side_effects: merge_side_effects([left_result.side_effects, right_result.side_effects]),
+        evaluation_time: left_result.evaluation_time + right_result.evaluation_time + operation_result.operation_time,
+        memory_allocated: left_result.memory_allocated + right_result.memory_allocated + operation_result.memory_allocated
+    }.
+
+# Arithmetic operations
+rule perform_binary_operation("+", left_value, right_value, result_type, operation_result) :-
+    left_value.type == "Number",
+    right_value.type == "Number",
+    add_numbers(left_value.data, right_value.data, sum),
+    create_number_value(sum, null, result_value),
+    operation_result = {
+        value: result_value,
+        type: result_type,
+        operation_time: 0.001,
+        memory_allocated: calculate_number_size(sum)
+    }.
+
+rule perform_binary_operation("-", left_value, right_value, result_type, operation_result) :-
+    left_value.type == "Number",
+    right_value.type == "Number",
+    subtract_numbers(left_value.data, right_value.data, difference),
+    create_number_value(difference, null, result_value),
+    operation_result = {
+        value: result_value,
+        type: result_type,
+        operation_time: 0.001,
+        memory_allocated: calculate_number_size(difference)
+    }.
+
+rule perform_binary_operation("*", left_value, right_value, result_type, operation_result) :-
+    left_value.type == "Number",
+    right_value.type == "Number",
+    multiply_numbers(left_value.data, right_value.data, product),
+    create_number_value(product, null, result_value),
+    operation_result = {
+        value: result_value,
+        type: result_type,
+        operation_time: 0.001,
+        memory_allocated: calculate_number_size(product)
+    }.
+
+rule perform_binary_operation("/", left_value, right_value, result_type, operation_result) :-
+    left_value.type == "Number",
+    right_value.type == "Number",
+    right_value.data != 0,  # Division by zero check
+    divide_numbers(left_value.data, right_value.data, quotient),
+    create_number_value(quotient, null, result_value),
+    operation_result = {
+        value: result_value,
+        type: result_type,
+        operation_time: 0.002,  # Division takes slightly longer
+        memory_allocated: calculate_number_size(quotient)
+    }.
+
+# Assignment evaluation
+goal evaluate_assignment(assignment_node, context) {
+    precondition: assignment_node.type == "Assignment" and assignment_node.variable != null,
+    postcondition: result.success == true and context.scope_updated == true,
+    strategy: scope_aware_variable_assignment_with_type_checking
+}
+
+rule evaluate_assignment_impl(assignment_node, context, result) :-
+    # Evaluate the value expression
+    evaluate_ast_node(assignment_node.value, context, value_result),
+    value_result.success == true,
+    
+    # Update variable in current scope
+    update_variable_in_scope(assignment_node.variable, value_result.value, value_result.type, context, update_result),
+    update_result.success == true,
+    
+    result = {
+        value: value_result.value,
+        type: value_result.type,
+        success: true,
+        error: null,
+        side_effects: append_side_effect(value_result.side_effects, {
+            type: "variable_assignment",
+            variable: assignment_node.variable,
+            value: value_result.value
+        }),
+        evaluation_time: value_result.evaluation_time + update_result.update_time,
+        memory_allocated: value_result.memory_allocated
+    }.
+
+# Function call evaluation
+goal evaluate_function_call(call_node, context) {
+    precondition: call_node.type == "FunctionCall" and call_node.name != null,
+    postcondition: result.success == true or result.error != null,
+    strategy: function_lookup_and_application_with_argument_evaluation
+}
+
+rule evaluate_function_call_impl(call_node, context, result) :-
+    # Look up function definition
+    lookup_function(call_node.name, context, function_lookup_result),
+    function_lookup_result.found == true,
+    
+    # Evaluate arguments
+    evaluate_argument_list(call_node.arguments, context, argument_results),
+    argument_results.all_success == true,
+    
+    # Apply function
+    apply_function(function_lookup_result.definition, argument_results.values, context, application_result),
+    
+    result = {
+        value: application_result.value,
+        type: application_result.type,
+        success: application_result.success,
+        error: application_result.error,
+        side_effects: merge_side_effects([argument_results.side_effects, application_result.side_effects]),
+        evaluation_time: argument_results.total_time + application_result.execution_time,
+        memory_allocated: argument_results.total_memory + application_result.memory_allocated
+    }.
+
+# Goal construct evaluation (unique PaTLang feature)
+goal evaluate_goal_construct(goal_node, context) {
+    precondition: goal_node.type == "Goal" and goal_node.precondition != null,
+    postcondition: result.success == true and result.goal_satisfied == true,
+    strategy: goal_oriented_execution_with_contract_validation
+}
+
+rule evaluate_goal_construct_impl(goal_node, context, result) :-
+    # Evaluate precondition
+    evaluate_ast_node(goal_node.precondition, context, precondition_result),
+    precondition_result.success == true,
+    validate_precondition(precondition_result.value, precondition_validation),
+    precondition_validation.satisfied == true,
+    
+    # Execute goal body with strategy
+    execute_goal_strategy(goal_node.strategy, goal_node.body, context, execution_result),
+    execution_result.success == true,
+    
+    # Evaluate postcondition
+    evaluate_ast_node(goal_node.postcondition, context, postcondition_result),
+    postcondition_result.success == true,
+    validate_postcondition(postcondition_result.value, execution_result.value, postcondition_validation),
+    postcondition_validation.satisfied == true,
+    
+    result = {
+        value: execution_result.value,
+        type: execution_result.type,
+        success: true,
+        error: null,
+        goal_satisfied: true,
+        precondition_satisfied: true,
+        postcondition_satisfied: true,
+        side_effects: merge_side_effects([precondition_result.side_effects, execution_result.side_effects, postcondition_result.side_effects]),
+        evaluation_time: precondition_result.evaluation_time + execution_result.evaluation_time + postcondition_result.evaluation_time,
+        memory_allocated: precondition_result.memory_allocated + execution_result.memory_allocated + postcondition_result.memory_allocated
+    }.
+
+# Native bridge interface for Phase 1 hybrid implementation
+goal call_native_bridge(operation, arguments, context) {
+    precondition: operation != null and context.native_bridge.initialized == true,
+    postcondition: result.success == true or result.native_error != null,
+    strategy: safe_native_interop_with_error_handling
+}
+
+rule call_native_bridge_impl(operation, arguments, context, result) :-
+    prepare_native_arguments(arguments, prepared_args),
+    invoke_native_operation(operation, prepared_args, context.native_bridge, native_result),
+    convert_native_result(native_result, converted_result),
+    result = {
+        value: converted_result.value,
+        type: converted_result.type,
+        success: converted_result.success,
+        error: converted_result.error,
+        native_error: native_result.error,
+        side_effects: [{type: "native_call", operation: operation}],
+        evaluation_time: native_result.execution_time,
+        memory_allocated: native_result.memory_used
+    }.
+
+# Utility functions for evaluation support
+goal create_number_value(number, memory_manager) {
+    precondition: number != null,
+    postcondition: result.type == "Number" and result.data == number,
+    strategy: efficient_number_representation
+}
+
+rule create_number_value_impl(number, memory_manager, result) :-
+    determine_number_type(number, number_type),  # int, float, etc.
+    allocate_value_memory(calculate_number_size(number), memory_manager, memory_allocation),
+    result = {
+        data: number,
+        type: number_type,
+        ref_count: 1,
+        gc_mark: false,
+        source_location: null,
+        memory_allocation: memory_allocation
+    }.
+
+goal check_recursion_limit(context) {
+    precondition: context.recursion_depth != null and context.max_recursion_depth != null,
+    postcondition: result.safe == true or result.limit_exceeded == true,
+    strategy: stack_overflow_protection
+}
+
+rule check_recursion_limit_impl(context, result) :-
+    context.recursion_depth < context.max_recursion_depth,
+    result = {safe: true, limit_exceeded: false}.
+
+rule check_recursion_limit_impl(context, result) :-
+    context.recursion_depth >= context.max_recursion_depth,
+    result = {safe: false, limit_exceeded: true}.
+
+# Self-hosting capability - this evaluator can evaluate itself!
+goal self_evaluate(evaluator_source_code, context) {
+    precondition: evaluator_source_code.contains_evaluator == true,
+    postcondition: result.self_evaluation_successful == true,
+    strategy: recursive_self_evaluation_with_stack_protection
+}
+
+rule self_evaluate_impl(evaluator_source_code, context, result) :-
+    parse_evaluator_source(evaluator_source_code, evaluator_ast),
+    create_self_evaluation_context(context, evaluator_ast, self_context),
+    evaluate_ast_node(evaluator_ast, self_context, self_result),
+    result = {
+        value: self_result.value,
+        type: self_result.type,
+        success: self_result.success,
+        self_evaluation_successful: self_result.success,
+        evaluation_depth: context.recursion_depth + 1
+    }.

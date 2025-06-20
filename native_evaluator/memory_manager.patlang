@@ -1,0 +1,468 @@
+# PaTLang Memory Manager - Phase 1 Self-Hosting Implementation
+# Hybrid memory management with native bridge support
+
+constrain memory_manager :: MemoryManager where {
+    heap :: Heap,
+    stack :: Stack,
+    gc :: GarbageCollector,
+    native_bridge :: NativeBridge,
+    allocation_stats :: AllocationStats,
+    memory_pools :: [MemoryPool],
+    gc_threshold :: Number,
+    total_allocated :: Number,
+    total_freed :: Number
+}
+
+constrain heap_object :: HeapObject where {
+    address :: Address,
+    size :: Number,
+    type :: Type,
+    ref_count :: Number,
+    gc_mark :: Boolean,
+    finalizeable :: Boolean,
+    allocation_time :: Number,
+    last_access_time :: Number
+}
+
+constrain memory_pool :: MemoryPool where {
+    pool_id :: Symbol,
+    object_size :: Number,
+    total_objects :: Number,
+    free_objects :: Number,
+    objects :: [PoolObject],
+    allocation_strategy :: Symbol
+}
+
+constrain allocation_stats :: AllocationStats where {
+    total_allocations :: Number,
+    total_deallocations :: Number,
+    current_memory_usage :: Number,
+    peak_memory_usage :: Number,
+    gc_cycles :: Number,
+    allocation_failures :: Number
+}
+
+# Memory manager initialization
+fact small_object_threshold(256)
+fact large_object_threshold(4096)
+fact gc_trigger_threshold(0.8)  # Trigger GC at 80% memory usage
+fact memory_pool_sizes([8, 16, 32, 64, 128, 256])
+
+# Main allocation goal
+goal allocate_object(type, size, alignment, context) {
+    precondition: size > 0 and alignment > 0 and type != null,
+    postcondition: result.address != null and result.tracked == true,
+    strategy: size_based_allocation_with_pool_optimization
+}
+
+rule allocate_object_impl(type, size, alignment, context, result) :-
+    size <= small_object_threshold,
+    allocate_from_pool(type, size, alignment, context, pool_result),
+    result = pool_result.
+
+rule allocate_object_impl(type, size, alignment, context, result) :-
+    size > small_object_threshold,
+    size <= large_object_threshold,
+    allocate_medium_object(type, size, alignment, context, medium_result),
+    result = medium_result.
+
+rule allocate_object_impl(type, size, alignment, context, result) :-
+    size > large_object_threshold,
+    allocate_large_object(type, size, alignment, context, large_result),
+    result = large_result.
+
+# Small object allocation using memory pools
+goal allocate_from_pool(type, size, alignment, context) {
+    precondition: size <= small_object_threshold,
+    postcondition: result.address != null and result.allocation_time < 0.001,
+    strategy: object_pool_with_free_list
+}
+
+rule allocate_from_pool_impl(type, size, alignment, context, result) :-
+    find_suitable_pool(size, context.memory_manager.memory_pools, pool),
+    pool != null,
+    pool.free_objects > 0,
+    allocate_from_existing_pool(pool, type, size, alignment, pool_allocation),
+    update_pool_stats(pool, pool_allocation, updated_pool),
+    register_allocation(pool_allocation, context.memory_manager, registration_result),
+    result = {
+        address: pool_allocation.address,
+        size: pool_allocation.actual_size,
+        tracked: true,
+        allocation_time: pool_allocation.allocation_time,
+        pool_id: pool.pool_id,
+        ref_count: 1
+    }.
+
+rule allocate_from_pool_impl(type, size, alignment, context, result) :-
+    find_suitable_pool(size, context.memory_manager.memory_pools, pool),
+    pool == null,
+    create_new_pool(size, context, new_pool),
+    allocate_from_existing_pool(new_pool, type, size, alignment, pool_allocation),
+    add_pool_to_manager(new_pool, context.memory_manager, updated_manager),
+    result = {
+        address: pool_allocation.address,
+        size: pool_allocation.actual_size,
+        tracked: true,
+        allocation_time: pool_allocation.allocation_time + new_pool.creation_time,
+        pool_id: new_pool.pool_id,
+        ref_count: 1
+    }.
+
+# Medium object allocation (direct heap allocation)
+goal allocate_medium_object(type, size, alignment, context) {
+    precondition: size > small_object_threshold and size <= large_object_threshold,
+    postcondition: result.address != null and result.heap_allocated == true,
+    strategy: heap_allocation_with_fragmentation_management
+}
+
+rule allocate_medium_object_impl(type, size, alignment, context, result) :-
+    find_heap_space(size, alignment, context.memory_manager.heap, heap_space),
+    heap_space != null,
+    allocate_from_heap(heap_space, type, size, alignment, heap_allocation),
+    update_heap_metadata(context.memory_manager.heap, heap_allocation, updated_heap),
+    register_heap_object(heap_allocation, context.memory_manager, registration_result),
+    result = {
+        address: heap_allocation.address,
+        size: heap_allocation.actual_size,
+        tracked: true,
+        heap_allocated: true,
+        allocation_time: heap_allocation.allocation_time,
+        ref_count: 1
+    }.
+
+# Large object allocation (native bridge)
+goal allocate_large_object(type, size, alignment, context) {
+    precondition: size > large_object_threshold,
+    postcondition: result.address != null and result.native_allocated == true,
+    strategy: native_allocation_with_gc_registration
+}
+
+rule allocate_large_object_impl(type, size, alignment, context, result) :-
+    prepare_native_allocation_request(size, alignment, type, native_request),
+    call_native_allocator(native_request, context.memory_manager.native_bridge, native_result),
+    native_result.success == true,
+    wrap_native_allocation(native_result, type, size, wrapped_allocation),
+    register_large_object(wrapped_allocation, context.memory_manager, registration_result),
+    result = {
+        address: wrapped_allocation.address,
+        size: wrapped_allocation.actual_size,
+        tracked: true,
+        native_allocated: true,
+        allocation_time: native_result.allocation_time,
+        ref_count: 1
+    }.
+
+# Deallocation and reference counting
+goal deallocate_object(address, context) {
+    precondition: address != null and context.memory_manager != null,
+    postcondition: result.deallocated == true or result.ref_count_decremented == true,
+    strategy: reference_counting_with_immediate_deallocation
+}
+
+rule deallocate_object_impl(address, context, result) :-
+    lookup_object_metadata(address, context.memory_manager, object_metadata),
+    object_metadata.found == true,
+    decrement_ref_count(object_metadata.object, decremented_object),
+    decremented_object.ref_count > 0,
+    update_object_metadata(decremented_object, context.memory_manager, update_result),
+    result = {
+        deallocated: false,
+        ref_count_decremented: true,
+        new_ref_count: decremented_object.ref_count
+    }.
+
+rule deallocate_object_impl(address, context, result) :-
+    lookup_object_metadata(address, context.memory_manager, object_metadata),
+    object_metadata.found == true,
+    decrement_ref_count(object_metadata.object, decremented_object),
+    decremented_object.ref_count == 0,
+    perform_immediate_deallocation(decremented_object, context.memory_manager, deallocation_result),
+    result = {
+        deallocated: true,
+        ref_count_decremented: true,
+        new_ref_count: 0,
+        memory_freed: deallocation_result.memory_freed
+    }.
+
+# Garbage collection implementation
+goal trigger_garbage_collection(collection_type, context) {
+    precondition: context.memory_manager != null,
+    postcondition: result.memory_freed > 0 and result.gc_completed == true,
+    strategy: generational_mark_and_sweep_with_reference_counting
+}
+
+rule trigger_garbage_collection_impl("minor", context, result) :-
+    perform_minor_gc(context.memory_manager, minor_result),
+    result = {
+        memory_freed: minor_result.memory_freed,
+        objects_collected: minor_result.objects_collected,
+        gc_completed: true,
+        gc_time: minor_result.gc_time,
+        gc_type: "minor"
+    }.
+
+rule trigger_garbage_collection_impl("major", context, result) :-
+    perform_major_gc(context.memory_manager, major_result),
+    result = {
+        memory_freed: major_result.memory_freed,
+        objects_collected: major_result.objects_collected,
+        gc_completed: true,
+        gc_time: major_result.gc_time,
+        gc_type: "major"
+    }.
+
+rule trigger_garbage_collection_impl("full", context, result) :-
+    perform_full_gc(context.memory_manager, full_result),
+    result = {
+        memory_freed: full_result.memory_freed,
+        objects_collected: full_result.objects_collected,
+        gc_completed: true,
+        gc_time: full_result.gc_time,
+        gc_type: "full"
+    }.
+
+# Minor garbage collection (young generation)
+goal perform_minor_gc(memory_manager) {
+    precondition: memory_manager.heap.young_generation != null,
+    postcondition: result.young_generation_processed == true,
+    strategy: copying_collection_with_survivor_spaces
+}
+
+rule perform_minor_gc_impl(memory_manager, result) :-
+    mark_young_generation_roots(memory_manager, marked_roots),
+    copy_live_objects_to_survivor(marked_roots, memory_manager, copied_objects),
+    update_references_after_copy(copied_objects, memory_manager, reference_updates),
+    clear_young_generation(memory_manager, clear_result),
+    promote_long_lived_objects(copied_objects, memory_manager, promotion_result),
+    result = {
+        young_generation_processed: true,
+        memory_freed: clear_result.memory_freed,
+        objects_collected: clear_result.objects_collected,
+        objects_promoted: promotion_result.objects_promoted,
+        gc_time: clear_result.gc_time + promotion_result.promotion_time
+    }.
+
+# Major garbage collection (full heap)
+goal perform_major_gc(memory_manager) {
+    precondition: memory_manager.heap != null,
+    postcondition: result.full_heap_processed == true,
+    strategy: mark_and_sweep_with_compaction
+}
+
+rule perform_major_gc_impl(memory_manager, result) :-
+    mark_all_reachable_objects(memory_manager, marked_objects),
+    sweep_unmarked_objects(memory_manager, swept_objects),
+    compact_heap_if_fragmented(memory_manager, compaction_result),
+    update_allocation_stats(memory_manager, swept_objects, compaction_result, stats_update),
+    result = {
+        full_heap_processed: true,
+        memory_freed: swept_objects.total_memory_freed,
+        objects_collected: swept_objects.objects_collected,
+        compaction_performed: compaction_result.performed,
+        gc_time: swept_objects.sweep_time + compaction_result.compaction_time
+    }.
+
+# Memory pool management
+goal create_memory_pool(object_size, initial_count, context) {
+    precondition: object_size > 0 and initial_count > 0,
+    postcondition: result.pool_created == true and result.pool.free_objects == initial_count,
+    strategy: aligned_pool_allocation_with_free_list
+}
+
+rule create_memory_pool_impl(object_size, initial_count, context, result) :-
+    calculate_pool_size(object_size, initial_count, total_pool_size),
+    allocate_pool_memory(total_pool_size, context.memory_manager.native_bridge, pool_memory),
+    initialize_pool_structure(pool_memory, object_size, initial_count, pool_structure),
+    create_free_list(pool_structure, free_list),
+    generate_pool_id(pool_id),
+    result = {
+        pool_created: true,
+        pool: {
+            pool_id: pool_id,
+            object_size: object_size,
+            total_objects: initial_count,
+            free_objects: initial_count,
+            objects: pool_structure.objects,
+            allocation_strategy: "free_list",
+            memory_base: pool_memory.address,
+            creation_time: pool_memory.allocation_time
+        }
+    }.
+
+# Native bridge integration for memory operations
+goal call_native_allocator(request, native_bridge) {
+    precondition: request.size > 0 and native_bridge.initialized == true,
+    postcondition: result.success == true or result.error != null,
+    strategy: safe_native_memory_allocation
+}
+
+rule call_native_allocator_impl(request, native_bridge, result) :-
+    prepare_native_call_args(request, native_args),
+    invoke_native_function("allocate_memory", native_args, native_bridge, native_response),
+    native_response.success == true,
+    result = {
+        success: true,
+        address: native_response.address,
+        actual_size: native_response.size,
+        allocation_time: native_response.execution_time,
+        native_handle: native_response.handle
+    }.
+
+rule call_native_allocator_impl(request, native_bridge, result) :-
+    prepare_native_call_args(request, native_args),
+    invoke_native_function("allocate_memory", native_args, native_bridge, native_response),
+    native_response.success == false,
+    result = {
+        success: false,
+        error: native_response.error,
+        error_code: native_response.error_code
+    }.
+
+# Memory pressure monitoring and automatic GC triggering
+goal monitor_memory_pressure(memory_manager) {
+    precondition: memory_manager.allocation_stats != null,
+    postcondition: result.pressure_level != null,
+    strategy: threshold_based_pressure_monitoring
+}
+
+rule monitor_memory_pressure_impl(memory_manager, result) :-
+    calculate_memory_usage_ratio(memory_manager, usage_ratio),
+    usage_ratio < 0.6,
+    result = {
+        pressure_level: "low",
+        usage_ratio: usage_ratio,
+        gc_recommended: false
+    }.
+
+rule monitor_memory_pressure_impl(memory_manager, result) :-
+    calculate_memory_usage_ratio(memory_manager, usage_ratio),
+    usage_ratio >= 0.6,
+    usage_ratio < 0.8,
+    result = {
+        pressure_level: "medium",
+        usage_ratio: usage_ratio,
+        gc_recommended: true,
+        gc_type: "minor"
+    }.
+
+rule monitor_memory_pressure_impl(memory_manager, result) :-
+    calculate_memory_usage_ratio(memory_manager, usage_ratio),
+    usage_ratio >= 0.8,
+    result = {
+        pressure_level: "high",
+        usage_ratio: usage_ratio,
+        gc_recommended: true,
+        gc_type: "major"
+    }.
+
+# Automatic memory management integration
+goal auto_manage_memory(memory_manager, context) {
+    precondition: memory_manager.auto_management_enabled == true,
+    postcondition: result.management_actions != [],
+    strategy: proactive_memory_management_with_performance_awareness
+}
+
+rule auto_manage_memory_impl(memory_manager, context, result) :-
+    monitor_memory_pressure(memory_manager, pressure_result),
+    pressure_result.gc_recommended == true,
+    trigger_garbage_collection(pressure_result.gc_type, context, gc_result),
+    compact_memory_pools_if_needed(memory_manager, compaction_result),
+    result = {
+        management_actions: [
+            {type: "gc_triggered", gc_type: pressure_result.gc_type, memory_freed: gc_result.memory_freed},
+            {type: "pool_compaction", pools_compacted: compaction_result.pools_compacted}
+        ],
+        memory_pressure_reduced: true,
+        new_pressure_level: "low"
+    }.
+
+rule auto_manage_memory_impl(memory_manager, context, result) :-
+    monitor_memory_pressure(memory_manager, pressure_result),
+    pressure_result.gc_recommended == false,
+    optimize_memory_pools(memory_manager, optimization_result),
+    result = {
+        management_actions: [
+            {type: "pool_optimization", pools_optimized: optimization_result.pools_optimized}
+        ],
+        memory_pressure_reduced: false,
+        current_pressure_level: pressure_result.pressure_level
+    }.
+
+# Memory statistics and debugging support
+goal get_memory_statistics(memory_manager) {
+    precondition: memory_manager != null,
+    postcondition: result.statistics != null,
+    strategy: comprehensive_memory_statistics_collection
+}
+
+rule get_memory_statistics_impl(memory_manager, result) :-
+    collect_allocation_stats(memory_manager, allocation_stats),
+    collect_gc_stats(memory_manager, gc_stats),
+    collect_pool_stats(memory_manager, pool_stats),
+    collect_heap_stats(memory_manager, heap_stats),
+    result = {
+        statistics: {
+            allocation: allocation_stats,
+            garbage_collection: gc_stats,
+            memory_pools: pool_stats,
+            heap: heap_stats,
+            total_memory_used: allocation_stats.current_memory_usage,
+            peak_memory_used: allocation_stats.peak_memory_usage,
+            gc_efficiency: calculate_gc_efficiency(gc_stats),
+            fragmentation_ratio: calculate_fragmentation_ratio(heap_stats)
+        }
+    }.
+
+# Memory debugging and validation
+goal validate_memory_integrity(memory_manager) {
+    precondition: memory_manager != null,
+    postcondition: result.integrity_check_passed == true or result.corruption_detected == true,
+    strategy: comprehensive_memory_integrity_validation
+}
+
+rule validate_memory_integrity_impl(memory_manager, result) :-
+    validate_heap_structure(memory_manager.heap, heap_validation),
+    validate_pool_consistency(memory_manager.memory_pools, pool_validation),
+    validate_reference_counts(memory_manager, ref_count_validation),
+    validate_gc_metadata(memory_manager.gc, gc_validation),
+    
+    heap_validation.valid == true,
+    pool_validation.valid == true,
+    ref_count_validation.valid == true,
+    gc_validation.valid == true,
+    
+    result = {
+        integrity_check_passed: true,
+        heap_valid: true,
+        pools_valid: true,
+        ref_counts_valid: true,
+        gc_metadata_valid: true
+    }.
+
+rule validate_memory_integrity_impl(memory_manager, result) :-
+    validate_heap_structure(memory_manager.heap, heap_validation),
+    validate_pool_consistency(memory_manager.memory_pools, pool_validation),
+    validate_reference_counts(memory_manager, ref_count_validation),
+    validate_gc_metadata(memory_manager.gc, gc_validation),
+    
+    # At least one validation failed
+    (heap_validation.valid == false or
+     pool_validation.valid == false or
+     ref_count_validation.valid == false or
+     gc_validation.valid == false),
+    
+    result = {
+        integrity_check_passed: false,
+        corruption_detected: true,
+        heap_valid: heap_validation.valid,
+        pools_valid: pool_validation.valid,
+        ref_counts_valid: ref_count_validation.valid,
+        gc_metadata_valid: gc_validation.valid,
+        corruption_details: {
+            heap_errors: heap_validation.errors,
+            pool_errors: pool_validation.errors,
+            ref_count_errors: ref_count_validation.errors,
+            gc_errors: gc_validation.errors
+        }
+    }.
