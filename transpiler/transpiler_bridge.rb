@@ -32,11 +32,14 @@ class PaTLangTranspilerBridge
       transpiler_source = File.read(File.join(__dir__, 'core_transpiler.patlang'))
       templates_source = File.read(File.join(__dir__, 'code_templates.patlang'))
       
+      puts "Loading transpiler files (#{transpiler_source.length + templates_source.length} chars)..."
+      
       # Parse the transpiler using Phase 1 infrastructure
       combined_source = transpiler_source + "\n\n" + templates_source
       
-      # Use Phase 1 to load the transpiler
-      result = @phase1_bridge.evaluate(combined_source, prefer_patlang: true)
+      # Use Phase 1 to load the transpiler with timeout protection
+      puts "Evaluating transpiler source code..."
+      result = evaluate_with_timeout(combined_source, 30) # 30 second timeout
       
       if result[:success]
         @transpiler_loaded = true
@@ -44,12 +47,35 @@ class PaTLangTranspilerBridge
         puts "PaTLang transpiler loaded successfully in Phase 2"
       else
         puts "Warning: Could not load PaTLang transpiler: #{result[:error]}"
+        puts "Continuing with simulation mode..."
         @transpiler_loaded = false
       end
       
     rescue => e
       puts "Warning: Transpiler loading failed: #{e.message}"
+      puts "Continuing with simulation mode..."
       @transpiler_loaded = false
+    end
+  end
+  
+  # Evaluate with timeout protection
+  def evaluate_with_timeout(source, timeout_seconds)
+    require 'timeout'
+    
+    begin
+      Timeout::timeout(timeout_seconds) do
+        @phase1_bridge.evaluate(source, prefer_patlang: true)
+      end
+    rescue Timeout::Error
+      {
+        success: false,
+        error: "Evaluation timed out after #{timeout_seconds} seconds"
+      }
+    rescue => e
+      {
+        success: false,
+        error: "Evaluation failed: #{e.message}"
+      }
     end
   end
   
@@ -181,6 +207,11 @@ class PaTLangTranspilerBridge
       puts "Transpiling transpiler source code..."
       result = transpile_to_c(transpiler_source, optimization_level: 1)
       
+      # write the transpiled C code to a temporary file
+      if result[:success]
+        File.write("transpiled_transpiler.c", result[:c_code])
+      end
+
       if result[:success]
         puts "✓ Transpiler successfully transpiled itself"
         puts "  Generated #{result[:generated_lines]} lines of C code"

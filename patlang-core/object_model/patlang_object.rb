@@ -13,12 +13,14 @@ class PatlangObject
   @@next_object_id = 1
   
   attr_reader :object_id, :object_type, :raw_value, :metadata
+  attr_accessor :next
   
   def initialize(value, type = nil)
     @object_id = generate_object_id
     @raw_value = value
     @object_type = type || infer_type(value)
     @metadata = {}
+    @next = nil  # For list functionality - every object can be part of a list
     @created_at = Time.now
     @modified_at = @created_at
     
@@ -357,5 +359,41 @@ class PatlangObject
     else
       self.to_s + other.to_s
     end
+  end
+  
+  # List functionality methods
+  def is_empty?
+    @raw_value.nil? && @next.nil?
+  end
+  
+  def head
+    self
+  end
+  
+  def tail
+    @next
+  end
+  
+  # Factory methods for creating lists
+  def self.make_empty_list
+    new(nil, :empty_list)
+  end
+  
+  def self.make_list(head_value, tail = nil)
+    head_obj = wrap(head_value)
+    head_obj.next = tail
+    head_obj
+  end
+  
+  # Convert list to array for debugging
+  def to_array
+    return [] if is_empty?
+    result = [self.value]
+    current = @next
+    while current && !current.is_empty?
+      result << current.value
+      current = current.next
+    end
+    result
   end
 end

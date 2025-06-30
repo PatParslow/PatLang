@@ -574,6 +574,30 @@ class Evaluator
     
     # Add Object to the evaluator's variable scope
     set_variable('Object', object_class)
+    
+    # Add list factory functions to the function registry
+    @functions['make_empty_list'] = {
+      name: 'make_empty_list',
+      parameters: [],
+      body: proc { PatlangObject.make_empty_list },
+      return_type: nil,
+      builtin: true
+    }
+    
+    @functions['make_list'] = {
+      name: 'make_list',
+      parameters: [
+        OpenStruct.new(name: 'head'),
+        OpenStruct.new(name: 'tail')
+      ],
+      body: proc { |head, tail = nil|
+        # Ensure tail is an empty list if nil
+        tail = PatlangObject.make_empty_list if tail.nil?
+        PatlangObject.make_list(head, tail)
+      },
+      return_type: nil,
+      builtin: true
+    }
   end
 
   def visit_assignment_node(node)

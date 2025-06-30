@@ -77,7 +77,15 @@ module EvaluatorModules
       @evaluator.returned = false
       @evaluator.return_value = nil
       
-      result = @evaluator.evaluate(function_def[:body])
+      # Handle built-in functions with proc bodies
+      if function_def[:builtin] && function_def[:body].is_a?(Proc)
+        # Call the proc directly with evaluated arguments
+        arg_values = node.arguments.map { |arg| @evaluator.evaluate(arg) }
+        result = function_def[:body].call(*arg_values)
+      else
+        # Normal function evaluation
+        result = @evaluator.evaluate(function_def[:body])
+      end
       
       # Handle return value - use explicit return value if present, otherwise last expression
       final_result = @evaluator.returned ? @evaluator.return_value : result
