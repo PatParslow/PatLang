@@ -15,16 +15,19 @@
 
 static int json_mode = 0;
 
-#define ASSERT(cond, msg) \
+#define ASSERT(cond, ...) \
     do { \
         if (!(cond)) { \
             if (json_mode && failed_count < MAX_FAILURES) { \
                 failed_asserts[failed_count].file = __FILE__; \
                 failed_asserts[failed_count].line = __LINE__; \
-                failed_asserts[failed_count].msg = msg; \
+                snprintf(failed_asserts[failed_count].msg_buf, sizeof(failed_asserts[failed_count].msg_buf), __VA_ARGS__); \
+                failed_asserts[failed_count].msg = failed_asserts[failed_count].msg_buf; \
                 failed_count++; \
             } \
-            if (!json_mode) printf("[FAIL] %s:%d: %s\n", __FILE__, __LINE__, msg); \
+            if (!json_mode) printf("[FAIL] %s:%d: ", __FILE__, __LINE__); \
+            if (!json_mode) printf(__VA_ARGS__); \
+            if (!json_mode) printf("\n"); \
             failures++; \
         } else { \
             passes++; \
@@ -38,9 +41,9 @@ static struct {
     const char* file;
     int line;
     const char* msg;
+    char msg_buf[256];
 } failed_asserts[MAX_FAILURES];
 static int failed_count = 0;
-static int json_mode = 0;
 
 // =====================
 // Memory Management Tests

@@ -12,7 +12,7 @@
 
 // Stub declarations for directory primitives
 #include <sys/stat.h>
-int native_mkdir(const char *path) { return mkdir(path, 0777); }
+static int native_mkdir(const char *path) { return mkdir(path, 0777); }
 #include <sys/stat.h>
 int native_dir_exists(const char *path) {
     struct stat st;

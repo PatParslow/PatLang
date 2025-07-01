@@ -7,13 +7,15 @@
  *   --json   Output test results as JSON (pass/fail counts and failed test names)
  *   If --json is not specified, output is unchanged.
  */
+// Add string.h for strcmp
 #include <stdio.h>
 #include <assert.h>
+#include <string.h>
 
 // Stub declarations for file I/O primitives
 #include <fcntl.h>
 #include <unistd.h>
-int native_open(const char *filename, int flags) { return open(filename, flags, 0644); }
+static int native_open(const char *filename, int flags) { return open(filename, flags, 0644); }
 #include <unistd.h>
 int native_read(int fd, void *buf, size_t count) { return read(fd, buf, count); }
 #include <unistd.h>

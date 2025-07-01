@@ -14,24 +14,25 @@ int native_open(const char *filename, int flags) {
 #include <string.h>
 #include <stdlib.h>
 // Recursively evaluate an expression tree
-// Recursive evaluator for expr_node_t supporting arithmetic and string concatenation
-ArithmeticResult eval_expr(expr_node_t* expr) {
-    ArithmeticResult result = {0};
+// Recursive evaluator for ast_node_t supporting arithmetic and string concatenation
+ArithmeticResult eval_expr(ast_node_t* expr) {
     if (!expr) {
+        ArithmeticResult result = {0};
         result.error = 1;
         result.error_message = "Null expression";
         return result;
     }
+    ArithmeticResult result = {0};
     switch (expr->type) {
         case EXPR_LITERAL: {
             int found = 0;
-            double val = get_variable(expr->value, &found);
+            double val = get_variable(expr->var_name, &found);
             if (found) {
                 result.is_number = 1;
                 result.number_value = val;
             } else {
                 char* endptr = NULL;
-                double num = strtod(expr->value, &endptr);
+                double num = strtod(expr->var_name, &endptr);
                 if (endptr && *endptr == '\0') {
                     result.is_number = 1;
                     result.number_value = num;
@@ -44,9 +45,9 @@ ArithmeticResult eval_expr(expr_node_t* expr) {
         }
         case EXPR_STRING: {
             // If this is a binary string operation (e.g., concatenation)
-            if (expr->left && expr->right && expr->value[0] == '+') {
-                ArithmeticResult left = eval_expr(expr->left);
-                ArithmeticResult right = eval_expr(expr->right);
+            if (expr->expr && expr->next && expr->var_name[0] == '+') {
+                ArithmeticResult left = eval_expr(expr->expr);
+                ArithmeticResult right = eval_expr(expr->next);
                 if (left.error) return left;
                 if (right.error) return right;
                 // Use arithmetic_evaluator's string concat logic
@@ -54,7 +55,7 @@ ArithmeticResult eval_expr(expr_node_t* expr) {
             } else {
                 result.is_string = 1;
                 // Remove leading/trailing whitespace and quotes
-                char* v = expr->value;
+                char* v = expr->var_name;
                 while (*v == ' ' || *v == '\t' || *v == '\n') v++;
                 size_t len = strlen(v);
                 while (len > 0 && (v[len-1] == ' ' || v[len-1] == '\t' || v[len-1] == '\n')) {
@@ -70,18 +71,18 @@ ArithmeticResult eval_expr(expr_node_t* expr) {
             break;
         }
         case EXPR_ARITHMETIC: {
-            ArithmeticResult left = eval_expr(expr->left);
-            ArithmeticResult right = eval_expr(expr->right);
+            ArithmeticResult left = eval_expr(expr->expr);
+            ArithmeticResult right = eval_expr(expr->next);
             if (left.error) return left;
             if (right.error) return right;
             // Support == for equality test (for if/else)
-            if (strcmp(expr->value, "==") == 0) {
+            if (strcmp(expr->var_name, "==") == 0) {
                 result.is_number = 1;
                 result.number_value = (left.number_value == right.number_value) ? 1.0 : 0.0;
                 return result;
             }
             // Only support +, -, *, /, %
-            char op = expr->value[0];
+            char op = expr->var_name[0];
             ArithmeticOp aop;
             switch (op) {
                 case '+': aop = ARITH_OP_ADD; break;

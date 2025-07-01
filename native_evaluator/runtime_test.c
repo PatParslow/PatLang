@@ -75,103 +75,120 @@ void test_assignment_and_lookup() {
 // Test for arithmetic and string concatenation
 void test_binary_ops_and_concat() {
     // Arithmetic: 1 + 2
-    expr_node_t* add = (expr_node_t*)calloc(1, sizeof(expr_node_t));
-    add->type = EXPR_ARITHMETIC;
-    add->value[0] = '+';
-    add->value[1] = '\0';
-    add->left = (expr_node_t*)calloc(1, sizeof(expr_node_t));
-    add->left->type = EXPR_LITERAL;
-    strncpy(add->left->value, "1", sizeof(add->left->value)-1);
-    add->right = (expr_node_t*)calloc(1, sizeof(expr_node_t));
-    add->right->type = EXPR_LITERAL;
-    strncpy(add->right->value, "2", sizeof(add->right->value)-1);
+    ast_node_t* add_left = (ast_node_t*)calloc(1, sizeof(ast_node_t));
+    add_left->type = (ast_type_t)EXPR_LITERAL;
+    strncpy(add_left->var_name, "1", sizeof(add_left->var_name)-1);
+
+    ast_node_t* add_right = (ast_node_t*)calloc(1, sizeof(ast_node_t));
+    add_right->type = (ast_type_t)EXPR_LITERAL;
+    strncpy(add_right->var_name, "2", sizeof(add_right->var_name)-1);
+
+    ast_node_t* add = (ast_node_t*)calloc(1, sizeof(ast_node_t));
+    add->type = (ast_type_t)EXPR_ARITHMETIC;
+    strncpy(add->var_name, "+", sizeof(add->var_name)-1);
+    add->expr = add_left;
+    add->next = add_right;
 
     ArithmeticResult r = eval_expr(add);
     ASSERT_EQ(r.number_value, 3.0, 1e-9, "1 + 2 == 3");
-    free(add->left);
-    free(add->right);
+    free(add_left);
+    free(add_right);
     free(add);
 
     // String concat: "a" + "b"
-    expr_node_t* s_add = (expr_node_t*)calloc(1, sizeof(expr_node_t));
-    s_add->type = EXPR_STRING;
-    s_add->value[0] = '+';
-    s_add->value[1] = '\0';
-    s_add->left = (expr_node_t*)calloc(1, sizeof(expr_node_t));
-    s_add->left->type = EXPR_STRING;
-    strncpy(s_add->left->value, "a", sizeof(s_add->left->value)-1);
-    s_add->right = (expr_node_t*)calloc(1, sizeof(expr_node_t));
-    s_add->right->type = EXPR_STRING;
-    strncpy(s_add->right->value, "b", sizeof(s_add->right->value)-1);
+    ast_node_t* s_add_left = (ast_node_t*)calloc(1, sizeof(ast_node_t));
+    s_add_left->type = (ast_type_t)EXPR_STRING;
+    strncpy(s_add_left->var_name, "a", sizeof(s_add_left->var_name)-1);
+
+    ast_node_t* s_add_right = (ast_node_t*)calloc(1, sizeof(ast_node_t));
+    s_add_right->type = (ast_type_t)EXPR_STRING;
+    strncpy(s_add_right->var_name, "b", sizeof(s_add_right->var_name)-1);
+
+    ast_node_t* s_add = (ast_node_t*)calloc(1, sizeof(ast_node_t));
+    s_add->type = (ast_type_t)EXPR_STRING;
+    strncpy(s_add->var_name, "+", sizeof(s_add->var_name)-1);
+    s_add->expr = s_add_left;
+    s_add->next = s_add_right;
 
     ArithmeticResult sr = eval_expr(s_add);
     ASSERT(sr.is_string && strcmp(sr.string_value, "ab") == 0, "\"a\" + \"b\" == \"ab\"");
-    free(s_add->left);
-    free(s_add->right);
+    free(s_add_left);
+    free(s_add_right);
     free(s_add);
 
     // String + number: "foo" + 1
-    expr_node_t* sn_add = (expr_node_t*)calloc(1, sizeof(expr_node_t));
-    sn_add->type = EXPR_STRING;
-    sn_add->value[0] = '+';
-    sn_add->value[1] = '\0';
-    sn_add->left = (expr_node_t*)calloc(1, sizeof(expr_node_t));
-    sn_add->left->type = EXPR_STRING;
-    strncpy(sn_add->left->value, "foo", sizeof(sn_add->left->value)-1);
-    sn_add->right = (expr_node_t*)calloc(1, sizeof(expr_node_t));
-    sn_add->right->type = EXPR_LITERAL;
-    strncpy(sn_add->right->value, "1", sizeof(sn_add->right->value)-1);
+    ast_node_t* sn_add_left = (ast_node_t*)calloc(1, sizeof(ast_node_t));
+    sn_add_left->type = (ast_type_t)EXPR_STRING;
+    strncpy(sn_add_left->var_name, "foo", sizeof(sn_add_left->var_name)-1);
+
+    ast_node_t* sn_add_right = (ast_node_t*)calloc(1, sizeof(ast_node_t));
+    sn_add_right->type = (ast_type_t)EXPR_LITERAL;
+    strncpy(sn_add_right->var_name, "1", sizeof(sn_add_right->var_name)-1);
+
+    ast_node_t* sn_add = (ast_node_t*)calloc(1, sizeof(ast_node_t));
+    sn_add->type = (ast_type_t)EXPR_STRING;
+    strncpy(sn_add->var_name, "+", sizeof(sn_add->var_name)-1);
+    sn_add->expr = sn_add_left;
+    sn_add->next = sn_add_right;
 
     ArithmeticResult snr = eval_expr(sn_add);
     ASSERT(snr.is_string && strcmp(snr.string_value, "foo1") == 0, "\"foo\" + 1 == \"foo1\"");
-    free(sn_add->left);
-    free(sn_add->right);
+    free(sn_add_left);
+    free(sn_add_right);
     free(sn_add);
 
     // Number + string: 2 + "bar"
-    expr_node_t* ns_add = (expr_node_t*)calloc(1, sizeof(expr_node_t));
-    ns_add->type = EXPR_STRING;
-    ns_add->value[0] = '+';
-    ns_add->value[1] = '\0';
-    ns_add->left = (expr_node_t*)calloc(1, sizeof(expr_node_t));
-    ns_add->left->type = EXPR_LITERAL;
-    strncpy(ns_add->left->value, "2", sizeof(ns_add->left->value)-1);
-    ns_add->right = (expr_node_t*)calloc(1, sizeof(expr_node_t));
-    ns_add->right->type = EXPR_STRING;
-    strncpy(ns_add->right->value, "bar", sizeof(ns_add->right->value)-1);
+    ast_node_t* ns_add_left = (ast_node_t*)calloc(1, sizeof(ast_node_t));
+    ns_add_left->type = (ast_type_t)EXPR_LITERAL;
+    strncpy(ns_add_left->var_name, "2", sizeof(ns_add_left->var_name)-1);
+
+    ast_node_t* ns_add_right = (ast_node_t*)calloc(1, sizeof(ast_node_t));
+    ns_add_right->type = (ast_type_t)EXPR_STRING;
+    strncpy(ns_add_right->var_name, "bar", sizeof(ns_add_right->var_name)-1);
+
+    ast_node_t* ns_add = (ast_node_t*)calloc(1, sizeof(ast_node_t));
+    ns_add->type = (ast_type_t)EXPR_STRING;
+    strncpy(ns_add->var_name, "+", sizeof(ns_add->var_name)-1);
+    ns_add->expr = ns_add_left;
+    ns_add->next = ns_add_right;
 
     ArithmeticResult nsr = eval_expr(ns_add);
     ASSERT(nsr.is_string && strcmp(nsr.string_value, "2bar") == 0, "2 + \"bar\" == \"2bar\"");
-    free(ns_add->left);
-    free(ns_add->right);
+    free(ns_add_left);
+    free(ns_add_right);
     free(ns_add);
 
     // Nested: ("a" + "b") + "c"
-    expr_node_t* nest = (expr_node_t*)calloc(1, sizeof(expr_node_t));
-    nest->type = EXPR_STRING;
-    nest->value[0] = '+';
-    nest->value[1] = '\0';
-    nest->left = (expr_node_t*)calloc(1, sizeof(expr_node_t));
-    nest->left->type = EXPR_STRING;
-    nest->left->value[0] = '+';
-    nest->left->value[1] = '\0';
-    nest->left->left = (expr_node_t*)calloc(1, sizeof(expr_node_t));
-    nest->left->left->type = EXPR_STRING;
-    strncpy(nest->left->left->value, "a", sizeof(nest->left->left->value)-1);
-    nest->left->right = (expr_node_t*)calloc(1, sizeof(expr_node_t));
-    nest->left->right->type = EXPR_STRING;
-    strncpy(nest->left->right->value, "b", sizeof(nest->left->right->value)-1);
-    nest->right = (expr_node_t*)calloc(1, sizeof(expr_node_t));
-    nest->right->type = EXPR_STRING;
-    strncpy(nest->right->value, "c", sizeof(nest->right->value)-1);
-    test_binary_ops_and_concat();
+    ast_node_t* nest_left_left = (ast_node_t*)calloc(1, sizeof(ast_node_t));
+    nest_left_left->type = (ast_type_t)EXPR_STRING;
+    strncpy(nest_left_left->var_name, "a", sizeof(nest_left_left->var_name)-1);
+
+    ast_node_t* nest_left_right = (ast_node_t*)calloc(1, sizeof(ast_node_t));
+    nest_left_right->type = (ast_type_t)EXPR_STRING;
+    strncpy(nest_left_right->var_name, "b", sizeof(nest_left_right->var_name)-1);
+
+    ast_node_t* nest_left = (ast_node_t*)calloc(1, sizeof(ast_node_t));
+    nest_left->type = (ast_type_t)EXPR_STRING;
+    strncpy(nest_left->var_name, "+", sizeof(nest_left->var_name)-1);
+    nest_left->expr = nest_left_left;
+    nest_left->next = nest_left_right;
+
+    ast_node_t* nest_right = (ast_node_t*)calloc(1, sizeof(ast_node_t));
+    nest_right->type = (ast_type_t)EXPR_STRING;
+    strncpy(nest_right->var_name, "c", sizeof(nest_right->var_name)-1);
+
+    ast_node_t* nest = (ast_node_t*)calloc(1, sizeof(ast_node_t));
+    nest->type = (ast_type_t)EXPR_STRING;
+    strncpy(nest->var_name, "+", sizeof(nest->var_name)-1);
+    nest->expr = nest_left;
+    nest->next = nest_right;
 
     ArithmeticResult nestr = eval_expr(nest);
     ASSERT(nestr.is_string && strcmp(nestr.string_value, "abc") == 0, "(\"a\"+\"b\")+\"c\" == \"abc\"");
-    free(nest->left->left);
-    free(nest->left->right);
-    free(nest->left);
-    free(nest->right);
+    free(nest_left_left);
+    free(nest_left_right);
+    free(nest_left);
+    free(nest_right);
     free(nest);
 }
 
@@ -201,32 +218,32 @@ void test_if_else_control_flow() {
     ast_node_t* then_node = (ast_node_t*)calloc(1, sizeof(ast_node_t));
     then_node->type = AST_ASSIGN;
     strncpy(then_node->var_name, "y", sizeof(then_node->var_name)-1);
-    then_node->expr = (expr_node_t*)calloc(1, sizeof(expr_node_t));
-    then_node->expr->type = EXPR_LITERAL;
-    strncpy(then_node->expr->value, "42", sizeof(then_node->expr->value)-1);
+    then_node->expr = (ast_node_t*)calloc(1, sizeof(ast_node_t));
+    then_node->expr->type = (ast_type_t)EXPR_LITERAL;
+    strncpy(then_node->expr->var_name, "42", sizeof(then_node->expr->var_name)-1);
 
     // Construct else branch: y = 99
     ast_node_t* else_node = (ast_node_t*)calloc(1, sizeof(ast_node_t));
     else_node->type = AST_ASSIGN;
     strncpy(else_node->var_name, "y", sizeof(else_node->var_name)-1);
-    else_node->expr = (expr_node_t*)calloc(1, sizeof(expr_node_t));
-    else_node->expr->type = EXPR_LITERAL;
-    strncpy(else_node->expr->value, "99", sizeof(else_node->expr->value)-1);
+    else_node->expr = (ast_node_t*)calloc(1, sizeof(ast_node_t));
+    else_node->expr->type = (ast_type_t)EXPR_LITERAL;
+    strncpy(else_node->expr->var_name, "99", sizeof(else_node->expr->var_name)-1);
 
     // Construct condition: x == 1 as a binary expression
-    expr_node_t* cond_left = (expr_node_t*)calloc(1, sizeof(expr_node_t));
-    cond_left->type = EXPR_LITERAL;
-    strncpy(cond_left->value, "x", sizeof(cond_left->value)-1);
+    ast_node_t* cond_left = (ast_node_t*)calloc(1, sizeof(ast_node_t));
+    cond_left->type = (ast_type_t)EXPR_LITERAL;
+    strncpy(cond_left->var_name, "x", sizeof(cond_left->var_name)-1);
 
-    expr_node_t* cond_right = (expr_node_t*)calloc(1, sizeof(expr_node_t));
-    cond_right->type = EXPR_LITERAL;
-    strncpy(cond_right->value, "1", sizeof(cond_right->value)-1);
+    ast_node_t* cond_right = (ast_node_t*)calloc(1, sizeof(ast_node_t));
+    cond_right->type = (ast_type_t)EXPR_LITERAL;
+    strncpy(cond_right->var_name, "1", sizeof(cond_right->var_name)-1);
 
-    expr_node_t* cond_expr = (expr_node_t*)calloc(1, sizeof(expr_node_t));
-    cond_expr->type = EXPR_ARITHMETIC; // Use EXPR_ARITHMETIC for binary ops
-    strncpy(cond_expr->value, "==", sizeof(cond_expr->value)-1);
-    cond_expr->left = cond_left;
-    cond_expr->right = cond_right;
+    ast_node_t* cond_expr = (ast_node_t*)calloc(1, sizeof(ast_node_t));
+    cond_expr->type = (ast_type_t)EXPR_ARITHMETIC; // Use EXPR_ARITHMETIC for binary ops
+    strncpy(cond_expr->var_name, "==", sizeof(cond_expr->var_name)-1);
+    cond_expr->expr = cond_left;
+    cond_expr->next = cond_right;
 
     // Construct if node
     ast_node_t* if_node = (ast_node_t*)calloc(1, sizeof(ast_node_t));
