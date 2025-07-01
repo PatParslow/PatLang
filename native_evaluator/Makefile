@@ -18,14 +18,14 @@ CFLAGS := -Wall -Wextra -std=c11
 # Automatically find all *_test.c files and define TESTS as their corresponding binaries
 TEST_SRCS := $(wildcard *_test.c)
 TESTS := $(patsubst %.c,%$(EXE_EXT),$(TEST_SRCS))
-DEPS := native_bridge.c
+DEPS := native_bridge.c transpiled/transpiled_core_evaluator.c
 
 # Default target: build all tests
 all: $(TESTS) patlang$(EXE_EXT) cli_test$(EXE_EXT)
 
 # Pattern rule for building test executables
 %$(EXE_EXT): %.c $(DEPS)
-	$(CC) $(CFLAGS) $< $(DEPS) arithmetic_evaluator.c string_evaluator.c runtime.c cli_common.c loader.c parser.c -o $@
+	$(CC) $(CFLAGS) -Itranspiled $< $(DEPS) arithmetic_evaluator.c string_evaluator.c runtime.c cli_common.c loader.c parser.c -o $@
 
 # patlang CLI build
 patlang$(EXE_EXT): patlang.c loader.c parser.c runtime.c
@@ -61,6 +61,10 @@ test-cli: cli_test$(EXE_EXT)
 	@$(CC) $(CFLAGS) -DTEST_MAIN cli_test.c cli_common.c loader.c parser.c runtime.c -o cli_test$(EXE_EXT)
 	./cli_test$(EXE_EXT)
 
+# Test transpiled evaluator
+test-transpiled: transpiled_evaluator_test$(EXE_EXT)
+	./transpiled_evaluator_test$(EXE_EXT)
+
 # Clean up build artifacts
 clean:
-	$(RM) $(TESTS) patlang$(EXE_EXT) cli_test$(EXE_EXT)
+	$(RM) $(TESTS) patlang$(EXE_EXT) cli_test$(EXE_EXT) transpiled/*.o
