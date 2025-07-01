@@ -3,9 +3,6 @@
 #include "arithmetic_types.h"
 #include "ast.h"
 
-typedef struct ast_t {
-    ast_node_t* head;
-} ast_t;
 
 // Stub for program execution
 void run_program(ast_t* ast);

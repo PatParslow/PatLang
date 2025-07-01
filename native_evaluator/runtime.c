@@ -23,84 +23,91 @@ ArithmeticResult eval_expr(ast_node_t* expr) {
         return result;
     }
     ArithmeticResult result = {0};
-    switch (expr->type) {
-        case EXPR_LITERAL: {
-            int found = 0;
-            double val = get_variable(expr->var_name, &found);
-            if (found) {
-                result.is_number = 1;
-                result.number_value = val;
-            } else {
-                char* endptr = NULL;
-                double num = strtod(expr->var_name, &endptr);
-                if (endptr && *endptr == '\0') {
+    // If this is an expression node (type == 0), dispatch on expr_type
+    if (expr->type == 0) {
+        switch (expr->expr_type) {
+            case EXPR_LITERAL: {
+                int found = 0;
+                double val = get_variable(expr->var_name, &found);
+                if (found) {
                     result.is_number = 1;
-                    result.number_value = num;
+                    result.number_value = val;
                 } else {
-                    result.error = 1;
-                    result.error_message = "undefined variable";
+                    char* endptr = NULL;
+                    double num = strtod(expr->var_name, &endptr);
+                    if (endptr && *endptr == '\0') {
+                        result.is_number = 1;
+                        result.number_value = num;
+                    } else {
+                        result.error = 1;
+                        result.error_message = "undefined variable";
+                    }
                 }
+                break;
             }
-            break;
-        }
-        case EXPR_STRING: {
-            // If this is a binary string operation (e.g., concatenation)
-            if (expr->expr && expr->next && expr->var_name[0] == '+') {
+            case EXPR_STRING: {
+                // If this is a binary string operation (e.g., concatenation)
+                if (expr->expr && expr->next && expr->var_name[0] == '+') {
+                    ArithmeticResult left = eval_expr(expr->expr);
+                    ArithmeticResult right = eval_expr(expr->next);
+                    if (left.error) return left;
+                    if (right.error) return right;
+                    // Use arithmetic_evaluator's string concat logic
+                    return eval_binary_op(ARITH_OP_ADD, left, right);
+                } else {
+                    result.is_string = 1;
+                    // Remove leading/trailing whitespace and quotes
+                    char* v = expr->var_name;
+                    while (*v == ' ' || *v == '\t' || *v == '\n') v++;
+                    size_t len = strlen(v);
+                    while (len > 0 && (v[len-1] == ' ' || v[len-1] == '\t' || v[len-1] == '\n')) {
+                        v[len-1] = '\0';
+                        len--;
+                    }
+                    if ((*v == '"' && v[len-1] == '"') || (*v == '\'' && v[len-1] == '\'')) {
+                        v[len-1] = '\0';
+                        v++;
+                    }
+                    result.string_value = v;
+                }
+                break;
+            }
+            case EXPR_ARITHMETIC: {
                 ArithmeticResult left = eval_expr(expr->expr);
                 ArithmeticResult right = eval_expr(expr->next);
                 if (left.error) return left;
                 if (right.error) return right;
-                // Use arithmetic_evaluator's string concat logic
-                return eval_binary_op(ARITH_OP_ADD, left, right);
-            } else {
-                result.is_string = 1;
-                // Remove leading/trailing whitespace and quotes
-                char* v = expr->var_name;
-                while (*v == ' ' || *v == '\t' || *v == '\n') v++;
-                size_t len = strlen(v);
-                while (len > 0 && (v[len-1] == ' ' || v[len-1] == '\t' || v[len-1] == '\n')) {
-                    v[len-1] = '\0';
-                    len--;
-                }
-                if ((*v == '"' && v[len-1] == '"') || (*v == '\'' && v[len-1] == '\'')) {
-                    v[len-1] = '\0';
-                    v++;
-                }
-                result.string_value = v;
-            }
-            break;
-        }
-        case EXPR_ARITHMETIC: {
-            ArithmeticResult left = eval_expr(expr->expr);
-            ArithmeticResult right = eval_expr(expr->next);
-            if (left.error) return left;
-            if (right.error) return right;
-            // Support == for equality test (for if/else)
-            if (strcmp(expr->var_name, "==") == 0) {
-                result.is_number = 1;
-                result.number_value = (left.number_value == right.number_value) ? 1.0 : 0.0;
-                return result;
-            }
-            // Only support +, -, *, /, %
-            char op = expr->var_name[0];
-            ArithmeticOp aop;
-            switch (op) {
-                case '+': aop = ARITH_OP_ADD; break;
-                case '-': aop = ARITH_OP_SUBTRACT; break;
-                case '*': aop = ARITH_OP_MULTIPLY; break;
-                case '/': aop = ARITH_OP_DIVIDE; break;
-                case '%': aop = ARITH_OP_MODULO; break;
-                default:
-                    result.error = 1;
-                    result.error_message = "Unknown operator";
+                // Support == for equality test (for if/else)
+                if (strcmp(expr->var_name, "==") == 0) {
+                    result.is_number = 1;
+                    result.number_value = (left.number_value == right.number_value) ? 1.0 : 0.0;
                     return result;
+                }
+                // Only support +, -, *, /, %
+                char op = expr->var_name[0];
+                ArithmeticOp aop;
+                switch (op) {
+                    case '+': aop = ARITH_OP_ADD; break;
+                    case '-': aop = ARITH_OP_SUBTRACT; break;
+                    case '*': aop = ARITH_OP_MULTIPLY; break;
+                    case '/': aop = ARITH_OP_DIVIDE; break;
+                    case '%': aop = ARITH_OP_MODULO; break;
+                    default:
+                        result.error = 1;
+                        result.error_message = "Unknown operator";
+                        return result;
+                }
+                return eval_binary_op(aop, left, right);
             }
-            return eval_binary_op(aop, left, right);
+            default:
+                result.error = 1;
+                result.error_message = "Unknown expr_type";
+                break;
         }
-        default:
-            result.error = 1;
-            result.error_message = "Unknown expr type";
-            break;
+    } else {
+        // Not an expression node; should not be evaluated here
+        result.error = 1;
+        result.error_message = "Invalid node type for eval_expr";
     }
     return result;
 }
@@ -139,6 +146,7 @@ void set_variable(const char* name, double value) {
 void run_program(ast_t* ast) {
     ast_node_t* node = ast->head;
     while (node) {
+        printf("[DEBUG][runtime] Visiting node type: %d\n", node->type);
         if (node->type == AST_ASSIGN) {
             // Evaluate right-hand side expression
             ArithmeticResult res = eval_expr(node->expr);
@@ -147,9 +155,9 @@ void run_program(ast_t* ast) {
                 fflush(stdout);
             } else if (res.is_number) {
                 set_variable(node->var_name, res.number_value);
-                printf("%s = %g\n", node->var_name, res.number_value);
             } else if (res.is_string) {
-                printf("%s = %s\n", node->var_name, res.string_value);
+                // If string assignment is supported, set variable here
+                // (currently only number assignment is handled)
             }
         } else if (node->type == AST_PRINT) {
             printf("[DEBUG][runtime] Evaluating AST_PRINT node\n");
