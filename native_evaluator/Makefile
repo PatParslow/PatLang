@@ -33,7 +33,7 @@ patlang$(EXE_EXT): patlang.c loader.c parser.c runtime.c
 
 # CLI test build
 cli_test$(EXE_EXT): cli_test.c cli_common.c loader.c parser.c runtime.c
-	$(CC) $(CFLAGS) cli_test.c cli_common.c loader.c parser.c runtime.c arithmetic_evaluator.c string_evaluator.c -o cli_test$(EXE_EXT)
+	$(CC) $(CFLAGS) cli_test.c cli_common.c loader.c parser.c arithmetic_evaluator.c string_evaluator.c runtime.c -o cli_test$(EXE_EXT)
 
 # Run all *_test binaries
 .PHONY: run_all clean test-cli test-runtime
