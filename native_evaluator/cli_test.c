@@ -15,6 +15,22 @@
 #include <string.h>
 #include <unistd.h>
 #include "cli_common.h"
+// Helper: filter out lines starting with "[DEBUG"
+void filter_debug_lines(const char* in, char* out, size_t outsz) {
+    out[0] = 0;
+    const char* p = in;
+    while (*p) {
+        // Find end of line
+        const char* nl = strchr(p, '\n');
+        size_t linelen = nl ? (size_t)(nl - p) : strlen(p);
+        if (strncmp(p, "[DEBUG", 6) != 0) {
+            strncat(out, p, linelen);
+            strncat(out, "\n", 1);
+        }
+        p += linelen;
+        if (*p == '\n') ++p;
+    }
+}
 #include "loader.h"
 
 #define MAX_FAILS 128
@@ -136,11 +152,13 @@ void test_program_flow() {
     write_mock_pat(fname, src_if);
     memset(buf, 0, sizeof(buf));
     run_patlang_and_capture(NULL, fname, buf, sizeof(buf));
-    int pass1 = strstr(buf, "gt3") != NULL;
-    print_test_debug("if/then true branch", src_if, "Should print gt3", buf, pass1);
+    char filtered[512] = {0};
+    filter_debug_lines(buf, filtered, sizeof(filtered));
+    int pass1 = strstr(filtered, "gt3") != NULL;
+    print_test_debug("if/then true branch", src_if, "Should print gt3", filtered, pass1);
     ASSERT(pass1, "if/then true branch should print gt3");
-    int pass2 = strstr(buf, "lt3") == NULL;
-    print_test_debug("if/then false branch", src_if, "Should not print lt3", buf, pass2);
+    int pass2 = strstr(filtered, "lt3") == NULL;
+    print_test_debug("if/then false branch", src_if, "Should not print lt3", filtered, pass2);
     ASSERT(pass2, "if/then false branch should not print lt3");
 
     // while

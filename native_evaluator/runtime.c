@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <sys/stat.h>
 int native_mkdir(const char *path) {
     return mkdir(path, 0777);
@@ -11,6 +12,7 @@ int native_open(const char *filename, int flags) {
 
 #include "arithmetic_evaluator.h"
 #include "string_evaluator.h"
+#define _GNU_SOURCE
 #include <string.h>
 #include <stdlib.h>
 // Recursively evaluate an expression tree
@@ -33,14 +35,20 @@ ArithmeticResult eval_expr(ast_node_t* expr) {
                     result.is_number = 1;
                     result.number_value = val;
                 } else {
-                    char* endptr = NULL;
-                    double num = strtod(expr->var_name, &endptr);
-                    if (endptr && *endptr == '\0') {
-                        result.is_number = 1;
-                        result.number_value = num;
+                    char* sval = get_variable_string(expr->var_name, &found);
+                    if (found && sval) {
+                        result.is_string = 1;
+                        result.string_value = sval;
                     } else {
-                        result.error = 1;
-                        result.error_message = "undefined variable";
+                        char* endptr = NULL;
+                        double num = strtod(expr->var_name, &endptr);
+                        if (endptr && *endptr == '\0') {
+                            result.is_number = 1;
+                            result.number_value = num;
+                        } else {
+                            result.error = 1;
+                            result.error_message = "undefined variable";
+                        }
                     }
                 }
                 break;
@@ -68,7 +76,8 @@ ArithmeticResult eval_expr(ast_node_t* expr) {
                         v[len-1] = '\0';
                         v++;
                     }
-                    result.string_value = v;
+                    // Always duplicate for result, but do not store pointer to stack buffer
+                    result.string_value = strdup(v);
                 }
                 break;
             }
@@ -77,10 +86,35 @@ ArithmeticResult eval_expr(ast_node_t* expr) {
                 ArithmeticResult right = eval_expr(expr->next);
                 if (left.error) return left;
                 if (right.error) return right;
-                // Support == for equality test (for if/else)
+                // Support relational operators for conditionals
                 if (strcmp(expr->var_name, "==") == 0) {
                     result.is_number = 1;
                     result.number_value = (left.number_value == right.number_value) ? 1.0 : 0.0;
+                    return result;
+                }
+                if (strcmp(expr->var_name, "!=") == 0) {
+                    result.is_number = 1;
+                    result.number_value = (left.number_value != right.number_value) ? 1.0 : 0.0;
+                    return result;
+                }
+                if (strcmp(expr->var_name, ">") == 0) {
+                    result.is_number = 1;
+                    result.number_value = (left.number_value > right.number_value) ? 1.0 : 0.0;
+                    return result;
+                }
+                if (strcmp(expr->var_name, "<") == 0) {
+                    result.is_number = 1;
+                    result.number_value = (left.number_value < right.number_value) ? 1.0 : 0.0;
+                    return result;
+                }
+                if (strcmp(expr->var_name, ">=") == 0) {
+                    result.is_number = 1;
+                    result.number_value = (left.number_value >= right.number_value) ? 1.0 : 0.0;
+                    return result;
+                }
+                if (strcmp(expr->var_name, "<=") == 0) {
+                    result.is_number = 1;
+                    result.number_value = (left.number_value <= right.number_value) ? 1.0 : 0.0;
                     return result;
                 }
                 // Only support +, -, *, /, %
@@ -116,7 +150,7 @@ static variable_entry_t variable_table[MAX_VARIABLES];
 
 double get_variable(const char* name, int* found) {
     for (int i = 0; i < MAX_VARIABLES; ++i) {
-        if (variable_table[i].is_set && strcmp(variable_table[i].name, name) == 0) {
+        if (variable_table[i].is_set && strcmp(variable_table[i].name, name) == 0 && variable_table[i].type == 1) {
             if (found) *found = 1;
             return variable_table[i].value;
         }
@@ -125,10 +159,28 @@ double get_variable(const char* name, int* found) {
     return 0.0;
 }
 
+char* get_variable_string(const char* name, int* found) {
+    for (int i = 0; i < MAX_VARIABLES; ++i) {
+        if (variable_table[i].is_set && strcmp(variable_table[i].name, name) == 0 && variable_table[i].type == 2) {
+            if (found) *found = 1;
+            return variable_table[i].string_value;
+        }
+    }
+    if (found) *found = 0;
+    return NULL;
+}
+
 void set_variable(const char* name, double value) {
     for (int i = 0; i < MAX_VARIABLES; ++i) {
         if (variable_table[i].is_set && strcmp(variable_table[i].name, name) == 0) {
+            if (variable_table[i].type == 2 && variable_table[i].string_value) {
+                free(variable_table[i].string_value);
+                variable_table[i].string_value = NULL;
+            }
             variable_table[i].value = value;
+            variable_table[i].type = 1;
+            variable_table[i].string_value = NULL;
+            variable_table[i].string_value = NULL;
             return;
         }
     }
@@ -137,6 +189,32 @@ void set_variable(const char* name, double value) {
             strncpy(variable_table[i].name, name, sizeof(variable_table[i].name) - 1);
             variable_table[i].name[sizeof(variable_table[i].name) - 1] = '\0';
             variable_table[i].value = value;
+            variable_table[i].string_value = NULL;
+            variable_table[i].type = 1;
+            variable_table[i].is_set = 1;
+            return;
+        }
+    }
+}
+
+void set_variable_string(const char* name, const char* value) {
+    for (int i = 0; i < MAX_VARIABLES; ++i) {
+        if (variable_table[i].is_set && strcmp(variable_table[i].name, name) == 0) {
+            if (variable_table[i].type == 2 && variable_table[i].string_value) {
+                free(variable_table[i].string_value);
+            }
+            variable_table[i].string_value = strdup(value);
+            variable_table[i].type = 2;
+            return;
+        }
+    }
+    for (int i = 0; i < MAX_VARIABLES; ++i) {
+        if (!variable_table[i].is_set) {
+            strncpy(variable_table[i].name, name, sizeof(variable_table[i].name) - 1);
+            variable_table[i].name[sizeof(variable_table[i].name) - 1] = '\0';
+            variable_table[i].value = 0.0;
+            variable_table[i].string_value = strdup(value);
+            variable_table[i].type = 2;
             variable_table[i].is_set = 1;
             return;
         }
@@ -156,8 +234,7 @@ void run_program(ast_t* ast) {
             } else if (res.is_number) {
                 set_variable(node->var_name, res.number_value);
             } else if (res.is_string) {
-                // If string assignment is supported, set variable here
-                // (currently only number assignment is handled)
+                set_variable_string(node->var_name, res.string_value);
             }
         } else if (node->type == AST_PRINT) {
             printf("[DEBUG][runtime] Evaluating AST_PRINT node\n");
@@ -165,7 +242,9 @@ void run_program(ast_t* ast) {
             if (res.error) {
                 printf("[ERROR] %s\n", res.error_message);
                 fflush(stdout);
-            } else {
+            } else if (res.is_string) {
+                printf("%s\n", res.string_value);
+            } else if (res.is_number) {
                 char *outstr = arith_convert_to_string(res);
                 printf("%s\n", outstr);
                 free(outstr);

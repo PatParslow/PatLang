@@ -92,6 +92,42 @@ int parse_patlang(const char* source) {
                 cond_buf[cond_len] = '\0';
                 // Build expression tree for condition
                 if_node->cond_expr = parse_expression(cond_buf);
+
+                // Parse the statement after "then" as the then_branch
+                char* then_stmt = then_pos + 4;
+                while (*then_stmt == ' ' || *then_stmt == '\t') then_stmt++;
+                if (*then_stmt != '\0') {
+                    // Only support print or assignment for single-line then_branch
+                    if (strncmp(then_stmt, "print ", 6) == 0) {
+                        ast_node_t* print_node = (ast_node_t*)calloc(1, sizeof(ast_node_t));
+                        print_node->type = AST_PRINT;
+                        print_node->expr = parse_expression(then_stmt + 6);
+                        if_node->then_branch = print_node;
+                    } else {
+                        // Try assignment: look for '='
+                        char* eq = strchr(then_stmt, '=');
+                        if (eq) {
+                            char varname[64] = {0};
+                            size_t varlen = eq - then_stmt;
+                            if (varlen >= sizeof(varname)) varlen = sizeof(varname) - 1;
+                            strncpy(varname, then_stmt, varlen);
+                            varname[varlen] = '\0';
+                            // Remove trailing whitespace from varname
+                            for (int i = varlen - 1; i >= 0 && (varname[i] == ' ' || varname[i] == '\t'); --i) {
+                                varname[i] = '\0';
+                            }
+                            char* after_eq = eq + 1;
+                            while (*after_eq == ' ' || *after_eq == '\t') after_eq++;
+                            if (*after_eq != '\0') {
+                                ast_node_t* assign_node = (ast_node_t*)calloc(1, sizeof(ast_node_t));
+                                assign_node->type = AST_ASSIGN;
+                                strncpy(assign_node->var_name, varname, sizeof(assign_node->var_name) - 1);
+                                assign_node->expr = parse_expression(after_eq);
+                                if_node->then_branch = assign_node;
+                            }
+                        }
+                    }
+                }
             }
             // Add to AST list
             if (!ast.head) {
@@ -113,8 +149,7 @@ int parse_patlang(const char* source) {
 
 // Minimal stub for undefined reference
 ast_node_t* parse_expression(const char* src) {
-    // Minimal parser for numbers, variables, and simple arithmetic: "a + b * 3"
-    // Only supports: number, variable, or "a + b", "a * b", "a + b * c"
+    // Minimal parser for numbers, variables, arithmetic, and relational ops
     char buf[128];
     strncpy(buf, src, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
@@ -124,7 +159,29 @@ ast_node_t* parse_expression(const char* src) {
     size_t len = strlen(s);
     while (len > 0 && (s[len-1] == ' ' || s[len-1] == '\t')) s[--len] = '\0';
 
-    // Try to find operator: support +, -, *, /
+    // Relational operators (lowest precedence): ==, !=, >=, <=, >, <
+    const char* rel_ops[] = {"==", "!=", ">=", "<=", ">", "<"};
+    int rel_op_count = 6;
+    for (int r = 0; r < rel_op_count; ++r) {
+        char* pos = strstr(s, rel_ops[r]);
+        if (pos && pos != s) {
+            char left[64], right[64];
+            size_t l_len = pos - s;
+            strncpy(left, s, l_len);
+            left[l_len] = '\0';
+            strncpy(right, pos + strlen(rel_ops[r]), sizeof(right) - 1);
+            right[sizeof(right) - 1] = '\0';
+            ast_node_t* node = (ast_node_t*)calloc(1, sizeof(ast_node_t));
+            node->type = 0;
+            node->expr_type = EXPR_ARITHMETIC; // Reuse for relational
+            strncpy(node->var_name, rel_ops[r], sizeof(node->var_name) - 1);
+            node->expr = parse_expression(left);
+            node->next = parse_expression(right);
+            return node;
+        }
+    }
+
+    // Arithmetic: +, -, *, /
     char* ops = "+-*/";
     char* op_pos = NULL;
     char op = 0;
@@ -158,6 +215,7 @@ ast_node_t* parse_expression(const char* src) {
         node->type = 0; // Not a statement node
         node->expr_type = EXPR_ARITHMETIC;
         strncpy(node->var_name, &op, 1);
+        node->var_name[1] = '\0';
         node->expr = parse_expression(left);
         node->next = parse_expression(right);
         return node;
