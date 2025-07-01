@@ -47,6 +47,22 @@ PaTLangResult patlang_evaluate_binary_operation(ast_node_t* node, EvaluatorConte
 PaTLangResult patlang_evaluate_function_call(ast_node_t* node, EvaluatorContext* context);
 PaTLangResult patlang_evaluate_program(ast_node_t* program_node, EvaluatorContext* context);
 
+// Week 2: Enhanced pattern evaluation functions
+PaTLangResult patlang_evaluate_variable_assignment(ast_node_t* node, EvaluatorContext* context);
+PaTLangResult patlang_evaluate_if_statement(ast_node_t* node, EvaluatorContext* context);
+PaTLangResult patlang_evaluate_while_loop(ast_node_t* node, EvaluatorContext* context);
+PaTLangResult patlang_evaluate_complex_expression(ast_node_t* node, EvaluatorContext* context);
+PaTLangResult patlang_evaluate_goal_construct(ast_node_t* node, EvaluatorContext* context);
+
+// Week 2: Enhanced binary operation functions
+PaTLangResult patlang_perform_binary_operation(char operator, PaTLangResult* left, PaTLangResult* right, EvaluatorContext* context);
+PaTLangResult patlang_perform_numeric_operation(char operator, PaTLangResult* left, PaTLangResult* right, EvaluatorContext* context);
+PaTLangResult patlang_perform_string_operation(char operator, PaTLangResult* left, PaTLangResult* right, EvaluatorContext* context);
+
+// Week 2: Utility functions for result creation
+PaTLangResult patlang_create_number_result(double value);
+PaTLangResult patlang_create_boolean_result(bool value);
+
 // Context management functions
 EvaluatorContext* create_evaluator_context(size_t max_recursion_depth);
 void destroy_evaluator_context(EvaluatorContext* ctx);
