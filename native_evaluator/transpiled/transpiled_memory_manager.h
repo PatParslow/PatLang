@@ -152,4 +152,11 @@ MemoryIntegrityResult patlang_validate_memory_integrity(MemoryManager* mm);
 }
 #endif
 
+// Enhanced Memory Manager Functions with Validation
+MemoryManager* patlang_create_memory_manager_with_validation(size_t initial_heap_size);
+bool patlang_reset_memory_manager_state(MemoryManager* mm);
+AllocationResult patlang_allocate_object_with_validation(ObjectType type, size_t size, size_t alignment, MemoryManager* mm);
+bool patlang_prepare_test_isolation(MemoryManager* mm);
+bool patlang_cleanup_test_isolation(MemoryManager* mm);
+
 #endif // TRANSPILED_MEMORY_MANAGER_H

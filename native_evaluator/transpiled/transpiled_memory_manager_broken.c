@@ -1,10 +1,9 @@
-// Transpiled PaTLang Memory Manager - Week 2 Implementation - FIXED VERSION
+// Transpiled PaTLang Memory Manager - Week 2 Implementation
 // Source: memory_manager.patlang
-// Generated: 2025-07-02 00:27:00 +0100
-// Week 2 Memory Management Transpilation with Corruption Detection
+// Generated: 2025-07-01 21:06:00 +0100
+// Week 2 Memory Management Transpilation
 
 #include "transpiled_memory_manager.h"
-#include "memory_manager_validation.h"
 #include "../native_bridge.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -410,6 +409,134 @@ MemoryIntegrityResult patlang_validate_memory_integrity(MemoryManager* mm) {
         return result;
     }
     
+    // Enhanced Memory Manager Functions with Corruption Detection
+    MemoryManager* patlang_create_memory_manager_with_validation(size_t initial_heap_size) {
+        MemoryManager* mm = patlang_create_memory_manager(initial_heap_size);
+        if (!mm) return NULL;
+        
+        // Initialize with validation enabled
+        MM_DEBUG_PRINT("Memory manager created with validation support");
+        
+        // Perform initial validation
+        MemoryIntegrityResult integrity = patlang_validate_memory_integrity(mm);
+        if (!integrity.integrity_check_passed) {
+            MM_DEBUG_PRINT("Warning: Initial integrity check failed");
+        }
+        
+        return mm;
+    }
+    
+    bool patlang_reset_memory_manager_state(MemoryManager* mm) {
+        if (!mm) return false;
+        
+        MM_DEBUG_PRINT("Resetting memory manager state");
+        
+        // Reset all memory pools
+        for (size_t i = 0; i < mm->num_pools; i++) {
+            if (mm->memory_pools[i]) {
+                MemoryPool* pool = mm->memory_pools[i];
+                pool->free_objects = pool->total_objects;
+                
+                // Reinitialize free list
+                char* base = (char*)pool->memory_base;
+                for (size_t j = 0; j < pool->total_objects; j++) {
+                    pool->free_list[j] = base + (j * pool->object_size);
+                }
+            }
+        }
+        
+        // Reset statistics but preserve configuration
+        size_t old_gc_threshold = mm->gc_threshold;
+        bool old_auto_gc = mm->auto_gc_enabled;
+        
+        memset(&mm->allocation_stats, 0, sizeof(AllocationStats));
+        mm->total_allocated = 0;
+        mm->total_freed = 0;
+        
+        // Restore configuration
+        mm->gc_threshold = old_gc_threshold;
+        mm->auto_gc_enabled = old_auto_gc;
+        
+        MM_DEBUG_PRINT("Memory manager state reset completed");
+        return true;
+    }
+    
+    AllocationResult patlang_allocate_object_with_validation(ObjectType type, size_t size, size_t alignment, MemoryManager* mm) {
+        AllocationResult result = {0};
+        
+        if (!mm) {
+            result.success = false;
+            result.error_message = "Memory manager is NULL";
+            return result;
+        }
+        
+        // Pre-allocation integrity check
+        MemoryIntegrityResult pre_check = patlang_validate_memory_integrity(mm);
+        if (!pre_check.integrity_check_passed || pre_check.corruption_detected) {
+            MM_DEBUG_PRINT("Pre-allocation integrity check failed");
+            result.success = false;
+            result.error_message = "Memory manager corrupted before allocation";
+            return result;
+        }
+        
+        // Perform allocation
+        result = patlang_allocate_object(type, size, alignment, mm);
+        
+        if (result.success) {
+            // Post-allocation integrity check
+            MemoryIntegrityResult post_check = patlang_validate_memory_integrity(mm);
+            if (!post_check.integrity_check_passed || post_check.corruption_detected) {
+                MM_DEBUG_PRINT("Post-allocation integrity check failed, rolling back");
+                
+                // Attempt rollback
+                patlang_deallocate_object(result.address, mm);
+                result.success = false;
+                result.error_message = "Allocation caused memory corruption";
+                result.address = NULL;
+            }
+        }
+        
+        return result;
+    }
+    
+    bool patlang_prepare_test_isolation(MemoryManager* mm) {
+        if (!mm) return false;
+        
+        MM_DEBUG_PRINT("Preparing test isolation environment");
+        
+        // Reset memory manager to clean state
+        if (!patlang_reset_memory_manager_state(mm)) {
+            MM_DEBUG_PRINT("Failed to reset memory manager");
+            return false;
+        }
+        
+        // Validate clean state
+        MemoryIntegrityResult integrity = patlang_validate_memory_integrity(mm);
+        if (!integrity.integrity_check_passed) {
+            MM_DEBUG_PRINT("Memory manager not in clean state after reset");
+            return false;
+        }
+        
+        MM_DEBUG_PRINT("Test isolation environment ready");
+        return true;
+    }
+    
+    bool patlang_cleanup_test_isolation(MemoryManager* mm) {
+        if (!mm) return false;
+        
+        MM_DEBUG_PRINT("Cleaning up test isolation environment");
+        
+        // Check for leaks or corruption
+        MemoryStatistics stats = patlang_get_memory_statistics(mm);
+        if (stats.total_memory_used > 0) {
+            MM_DEBUG_PRINT("Warning: %zu bytes still allocated after test",
+                           stats.total_memory_used);
+        }
+        
+        // Reset to clean state
+        return patlang_reset_memory_manager_state(mm);
+    }
+    
     // Simplified integrity checks
     bool pools_valid = true;
     for (size_t i = 0; i < mm->num_pools; i++) {
@@ -427,132 +554,4 @@ MemoryIntegrityResult patlang_validate_memory_integrity(MemoryManager* mm) {
     result.corruption_detected = !pools_valid;
     
     return result;
-}
-
-// Enhanced Memory Manager Functions with Corruption Detection
-MemoryManager* patlang_create_memory_manager_with_validation(size_t initial_heap_size) {
-    MemoryManager* mm = patlang_create_memory_manager(initial_heap_size);
-    if (!mm) return NULL;
-    
-    // Initialize with validation enabled
-    MM_DEBUG_PRINT("Memory manager created with validation support");
-    
-    // Perform initial validation
-    MemoryIntegrityResult integrity = patlang_validate_memory_integrity(mm);
-    if (!integrity.integrity_check_passed) {
-        MM_DEBUG_PRINT("Warning: Initial integrity check failed");
-    }
-    
-    return mm;
-}
-
-bool patlang_reset_memory_manager_state(MemoryManager* mm) {
-    if (!mm) return false;
-    
-    MM_DEBUG_PRINT("Resetting memory manager state");
-    
-    // Reset all memory pools
-    for (size_t i = 0; i < mm->num_pools; i++) {
-        if (mm->memory_pools[i]) {
-            MemoryPool* pool = mm->memory_pools[i];
-            pool->free_objects = pool->total_objects;
-            
-            // Reinitialize free list
-            char* base = (char*)pool->memory_base;
-            for (size_t j = 0; j < pool->total_objects; j++) {
-                pool->free_list[j] = base + (j * pool->object_size);
-            }
-        }
-    }
-    
-    // Reset statistics but preserve configuration
-    size_t old_gc_threshold = mm->gc_threshold;
-    bool old_auto_gc = mm->auto_gc_enabled;
-    
-    memset(&mm->allocation_stats, 0, sizeof(AllocationStats));
-    mm->total_allocated = 0;
-    mm->total_freed = 0;
-    
-    // Restore configuration
-    mm->gc_threshold = old_gc_threshold;
-    mm->auto_gc_enabled = old_auto_gc;
-    
-    MM_DEBUG_PRINT("Memory manager state reset completed");
-    return true;
-}
-
-AllocationResult patlang_allocate_object_with_validation(ObjectType type, size_t size, size_t alignment, MemoryManager* mm) {
-    AllocationResult result = {0};
-    
-    if (!mm) {
-        result.success = false;
-        result.error_message = "Memory manager is NULL";
-        return result;
-    }
-    
-    // Pre-allocation integrity check
-    MemoryIntegrityResult pre_check = patlang_validate_memory_integrity(mm);
-    if (!pre_check.integrity_check_passed || pre_check.corruption_detected) {
-        MM_DEBUG_PRINT("Pre-allocation integrity check failed");
-        result.success = false;
-        result.error_message = "Memory manager corrupted before allocation";
-        return result;
-    }
-    
-    // Perform allocation
-    result = patlang_allocate_object(type, size, alignment, mm);
-    
-    if (result.success) {
-        // Post-allocation integrity check
-        MemoryIntegrityResult post_check = patlang_validate_memory_integrity(mm);
-        if (!post_check.integrity_check_passed || post_check.corruption_detected) {
-            MM_DEBUG_PRINT("Post-allocation integrity check failed, rolling back");
-            
-            // Attempt rollback
-            patlang_deallocate_object(result.address, mm);
-            result.success = false;
-            result.error_message = "Allocation caused memory corruption";
-            result.address = NULL;
-        }
-    }
-    
-    return result;
-}
-
-bool patlang_prepare_test_isolation(MemoryManager* mm) {
-    if (!mm) return false;
-    
-    MM_DEBUG_PRINT("Preparing test isolation environment");
-    
-    // Reset memory manager to clean state
-    if (!patlang_reset_memory_manager_state(mm)) {
-        MM_DEBUG_PRINT("Failed to reset memory manager");
-        return false;
-    }
-    
-    // Validate clean state
-    MemoryIntegrityResult integrity = patlang_validate_memory_integrity(mm);
-    if (!integrity.integrity_check_passed) {
-        MM_DEBUG_PRINT("Memory manager not in clean state after reset");
-        return false;
-    }
-    
-    MM_DEBUG_PRINT("Test isolation environment ready");
-    return true;
-}
-
-bool patlang_cleanup_test_isolation(MemoryManager* mm) {
-    if (!mm) return false;
-    
-    MM_DEBUG_PRINT("Cleaning up test isolation environment");
-    
-    // Check for leaks or corruption
-    MemoryStatistics stats = patlang_get_memory_statistics(mm);
-    if (stats.total_memory_used > 0) {
-        MM_DEBUG_PRINT("Warning: %zu bytes still allocated after test", 
-                       stats.total_memory_used);
-    }
-    
-    // Reset to clean state
-    return patlang_reset_memory_manager_state(mm);
 }

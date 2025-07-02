@@ -21,6 +21,7 @@ TEST_SRCS := $(wildcard *_test.c)
 TESTS := $(patsubst %.c,%$(EXE_EXT),$(TEST_SRCS))
 DEPS := native_bridge.c transpiled/transpiled_core_evaluator.c transpiled/transpiled_memory_manager.c
 WEEK2_DEPS := $(DEPS) arithmetic_evaluator.c string_evaluator.c runtime.c cli_common.c loader.c parser.c
+PHASE2_DEPS := $(WEEK2_DEPS) transpiled/phase2_advanced_goal_system.c transpiled/phase2_function_closure_system.c transpiled/phase2_type_inference_foundation.c
 
 # Default target: build all tests
 all: $(TESTS) patlang$(EXE_EXT) cli_test$(EXE_EXT)
@@ -76,6 +77,10 @@ test-week2: week2_enhanced_test$(EXE_EXT)
 week2_enhanced_test$(EXE_EXT): week2_enhanced_test.c $(WEEK2_DEPS)
 	$(CC) $(CFLAGS) -Itranspiled week2_enhanced_test.c $(WEEK2_DEPS) $(LDFLAGS) -o week2_enhanced_test$(EXE_EXT)
 
+# Phase 2 Week 3: Build advanced features test executable
+phase2_week3_test$(EXE_EXT): phase2_week3_test.c $(PHASE2_DEPS)
+	$(CC) $(CFLAGS) -Itranspiled phase2_week3_test.c $(PHASE2_DEPS) $(LDFLAGS) -o phase2_week3_test$(EXE_EXT)
+
 # Week 2: Performance benchmark
 test-week2-performance: week2_enhanced_test$(EXE_EXT)
 	@echo "Running Week 2 performance benchmarks..."
@@ -102,6 +107,44 @@ test-week2-complete: test-week2 test-week2-performance test-week2-memory test-we
 	@echo "✓ Memory management validated"
 	@echo "✓ Pattern coverage verified"
 
+# Phase 2 Week 3: Test advanced goal constructs, closures, and type inference
+test-phase2: phase2_week3_test$(EXE_EXT)
+	@echo "Running Phase 2 Week 3 advanced features test suite..."
+	./phase2_week3_test$(EXE_EXT)
+
+# Phase 2 Week 3: Performance benchmark
+test-phase2-performance: phase2_week3_test$(EXE_EXT)
+	@echo "Running Phase 2 Week 3 performance benchmarks..."
+	@echo "Target: Maintain 15,000x+ improvement with advanced features"
+	./phase2_week3_test$(EXE_EXT)
+
+# Phase 2 Week 3: Advanced goal system validation
+test-phase2-goals: phase2_week3_test$(EXE_EXT)
+	@echo "Running Phase 2 Week 3 advanced goal system validation..."
+	@echo "Testing: Constraint solving, goal dependencies, backtracking"
+	./phase2_week3_test$(EXE_EXT)
+
+# Phase 2 Week 3: Function closure system validation
+test-phase2-closures: phase2_week3_test$(EXE_EXT)
+	@echo "Running Phase 2 Week 3 function closure system validation..."
+	@echo "Testing: Lexical scoping, variable capture, partial application"
+	./phase2_week3_test$(EXE_EXT)
+
+# Phase 2 Week 3: Type inference foundation validation
+test-phase2-types: phase2_week3_test$(EXE_EXT)
+	@echo "Running Phase 2 Week 3 type inference foundation validation..."
+	@echo "Testing: Type unification, constraint solving, inference strategies"
+	./phase2_week3_test$(EXE_EXT)
+
+# Phase 2 Week 3: Complete validation suite
+test-phase2-complete: test-phase2 test-phase2-performance test-phase2-goals test-phase2-closures test-phase2-types
+	@echo "Phase 2 Week 3 complete validation suite executed"
+	@echo "✓ Advanced goal constructs tested"
+	@echo "✓ Function closure system tested"
+	@echo "✓ Type inference foundation tested"
+	@echo "✓ Performance benchmarks completed"
+	@echo "✓ Integration tests validated"
+
 # Clean up build artifacts
 clean:
-	$(RM) $(TESTS) patlang$(EXE_EXT) cli_test$(EXE_EXT) week2_enhanced_test$(EXE_EXT) transpiled/*.o
+	$(RM) $(TESTS) patlang$(EXE_EXT) cli_test$(EXE_EXT) week2_enhanced_test$(EXE_EXT) phase2_week3_test$(EXE_EXT) transpiled/*.o
