@@ -20,20 +20,28 @@ pub payload: String,
 }
 
 /// Minimal public EventSystem struct for integration.
-#[derive(Debug, Default)]
-pub struct EventSystem;
+#[derive(Default)]
+pub struct EventSystem {
+    handlers: Vec<Box<dyn EventListener>>,
+}
+
 impl EventSystem {
     /// Creates a new EventSystem instance.
     pub fn new() -> Self {
-        EventSystem
+        EventSystem {
+            handlers: Vec::new(),
+        }
     }
+
     /// Registers an event handler.
-    pub fn register_handler(&mut self, _handler: Box<dyn EventListener>) {
-        // Stub implementation
+    pub fn register_handler(&mut self, handler: Box<dyn EventListener>) {
+        self.handlers.push(handler);
     }
 
     /// Emits an event to all registered handlers.
-    pub fn emit(&self, _event: &Event) {
-        // Stub implementation
+    pub fn emit(&self, event: &Event) {
+        for handler in &self.handlers {
+            handler.on_event(event);
+        }
     }
 }
