@@ -5,13 +5,24 @@ use std::sync::{Arc, Mutex};
 
 #[test]
 fn test_event_handler_registration_and_emission() {
-    let system = EventSystem::new();
+    use patlang_runtime::event_system::EventListener;
+
+    struct TestHandler {
+        called: Arc<Mutex<bool>>,
+    }
+
+    impl EventListener for TestHandler {
+        fn on_event(&self, _event: &Event) {
+            *self.called.lock().unwrap() = true;
+        }
+    }
+
+    let mut system = EventSystem::new();
     let called = Arc::new(Mutex::new(false));
-    let called_clone = called.clone();
-    let handler = Arc::new(move |_event| {
-        *called_clone.lock().unwrap() = true;
+    let handler = Box::new(TestHandler {
+        called: called.clone(),
     });
-    system.register_handler("test_event", handler);
+    system.register_handler(handler);
     let event = Event {
         event_type: "test_event".to_string(),
         payload: "".to_string(),
