@@ -1,6 +1,6 @@
 //! Tests for InferencingEngine core module
 
-use patlang_runtime::inferencing_engine::{InferencingEngine, Term, Goal, InferenceResult, UnificationResult};
+use patlang_runtime::inferencing_engine::{InferencingEngine, Term, Goal};
 
 #[test]
 fn test_inferencing_engine_new() {
