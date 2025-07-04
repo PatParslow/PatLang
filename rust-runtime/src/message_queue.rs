@@ -12,7 +12,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 /// Represents a message to be sent through the queue.
 /// Extendable for typed, structured, or secure messages.

@@ -13,7 +13,7 @@
 //! This is a scaffold for the core evaluator logic.
 
 use crate::event_system::{Event, EventListener};
-use crate::message_queue::{Message, MessageConsumer};
+use crate::message_queue::MessageConsumer;
 use crate::error_handler::{ErrorHandler, RuntimeError};
 use crate::secure_distributed_code_support::{SecurityPolicy, DistributedProtocol};
 

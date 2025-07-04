@@ -103,7 +103,7 @@ impl ErrorHandler for DefaultErrorHandler {
 // These would be replaced with actual imports and usage in real integration.
 
 pub mod integration {
-    use super::{RuntimeError, RuntimeErrorKind};
+    use super::RuntimeError;
 
     pub trait CoreEvaluatorError {
         fn on_error(&self, error: &RuntimeError);
