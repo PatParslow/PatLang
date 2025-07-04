@@ -1,7 +1,6 @@
 //! Tests for MessageQueue core module
 
 use patlang_runtime::message_queue::{Message, MessageQueue};
-use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 
 #[tokio::test]
@@ -40,7 +39,7 @@ async fn test_message_queue_len_and_empty() {
 
 #[tokio::test]
 async fn test_message_queue_error_handling() {
-    let (queue, mut rx) = MessageQueue::new(1);
+    let (queue, rx) = MessageQueue::new(1);
     let msg1 = Message {
         sender: "S".to_string(),
         recipient: "R".to_string(),
