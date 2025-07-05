@@ -1,5 +1,7 @@
 //! patlang_runtime library crate root.
 //! Exports all core modules for use in integration tests and external crates.
+pub mod ast;
+pub mod lexer;
 
 pub mod core_evaluator;
 pub mod memory_manager;
@@ -12,3 +14,9 @@ pub mod error_handler;
 pub mod event_system;
 pub mod message_queue;
 pub mod secure_distributed_code_support;
+pub mod arithmetic;
+pub mod string;
+pub mod function;
+pub mod object;
+pub mod reasoning;
+pub mod parser;
