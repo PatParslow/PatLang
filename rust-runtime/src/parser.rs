@@ -72,8 +72,47 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_statement(&mut self) -> Result<Stmt, ParserError> {
-        // Stub: dispatch to subparsers based on current_token
-        self.parse_expression_statement()
+        // Dispatch to subparsers based on current_token
+        match &self.current_token {
+            Token::Goal => self.parse_goal_block(),
+            Token::Rule => self.parse_rule_block(),
+            _ => self.parse_expression_statement(),
+        }
+    }
+    
+    // Stub implementations for goal/rule blocks
+    fn parse_goal_block(&mut self) -> Result<Stmt, ParserError> {
+        // For now, just consume the 'goal' token and the next identifier, then skip to next newline or EOF
+        self.advance()?; // consume 'goal'
+        let name = if let Token::Identifier(ref s) = self.current_token {
+            s.clone()
+        } else {
+            return Err(ParserError::UnexpectedToken(self.current_token.clone()));
+        };
+        self.advance()?; // consume identifier
+        // Optionally parse parameters, block, etc.
+        // For now, skip to next newline or EOF
+        while self.current_token != Token::EOF && self.current_token != Token::Newline {
+            self.advance()?;
+        }
+        Ok(Stmt::ExprStmt(Expr::Identifier(format!("goal:{}", name))))
+    }
+    
+    fn parse_rule_block(&mut self) -> Result<Stmt, ParserError> {
+        // For now, just consume the 'rule' token and the next identifier, then skip to next newline or EOF
+        self.advance()?; // consume 'rule'
+        let name = if let Token::Identifier(ref s) = self.current_token {
+            s.clone()
+        } else {
+            return Err(ParserError::UnexpectedToken(self.current_token.clone()));
+        };
+        self.advance()?; // consume identifier
+        // Optionally parse parameters, block, etc.
+        // For now, skip to next newline or EOF
+        while self.current_token != Token::EOF && self.current_token != Token::Newline {
+            self.advance()?;
+        }
+        Ok(Stmt::ExprStmt(Expr::Identifier(format!("rule:{}", name))))
     }
 
     fn parse_expression_statement(&mut self) -> Result<Stmt, ParserError> {
