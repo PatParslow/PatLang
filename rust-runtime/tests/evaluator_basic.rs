@@ -1,37 +1,25 @@
-//! Basic tests for Patlang Rust evaluator
-
-use rust_runtime::core_evaluator::{AstKind, AstNode, CoreEvaluator};
+use patlang_runtime::core_evaluator;
 
 #[test]
-fn test_arithmetic_add() {
-    let left = AstNode { kind: AstKind::Number(2.0), children: vec![] };
-    let right = AstNode { kind: AstKind::Number(3.0), children: vec![] };
-    let node = AstNode {
-        kind: AstKind::BinaryOp {
-            op: rust_runtime::arithmetic::ArithmeticOp::Add,
-            left: Box::new(left),
-            right: Box::new(right),
-        },
-        children: vec![],
-    };
-    let mut evaluator = CoreEvaluator::new(None, None, None, None, None);
-    let result = evaluator.execute_node(&node);
+fn test_simple_assignment() {
+    let src = "x = 1";
+    let result = core_evaluator::evaluate_patlang_source(src);
     assert!(result.is_ok());
 }
 
 #[test]
-fn test_string_concat() {
-    let left = AstNode { kind: AstKind::String("foo".to_string()), children: vec![] };
-    let right = AstNode { kind: AstKind::String("bar".to_string()), children: vec![] };
-    let node = AstNode {
-        kind: AstKind::StringOp {
-            op: rust_runtime::string::StringOp::Concat,
-            left: Box::new(left),
-            right: Some(Box::new(right)),
-        },
-        children: vec![],
-    };
-    let mut evaluator = CoreEvaluator::new(None, None, None, None, None);
-    let result = evaluator.execute_node(&node);
+fn test_simple_expression() {
+    let src = "y = 2 + 3";
+    let result = core_evaluator::evaluate_patlang_source(src);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_function_definition_and_call() {
+    let src = r#"
+        fn add(a, b) { a + b }
+        result = add(2, 3)
+    "#;
+    let result = core_evaluator::evaluate_patlang_source(src);
     assert!(result.is_ok());
 }
