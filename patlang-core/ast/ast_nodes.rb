@@ -696,5 +696,119 @@ class ProgramNode < ASTNode
   end
 end
 
+# AST node representing a for-loop construct.
+class ForLoopNode < ASTNode
+  # @param loop_variable [String] The loop variable name
+  # @param iterable [ASTNode] The iterable expression
+  # @param body [ASTNode] The body of the loop
+  attr_reader :loop_variable, :iterable, :body
+
+  def initialize(loop_variable, iterable, body)
+    @loop_variable = loop_variable
+    @iterable = iterable
+    @body = body
+  end
+end
+
+# AST node representing a pattern match construct.
+class PatternMatchNode < ASTNode
+  # @param expression [ASTNode] The expression to match
+  # @param patterns [Array<Hash>] Array of pattern-handler pairs
+  #        Each pattern is a hash: { pattern: ASTNode, body: ASTNode }
+  attr_reader :expression, :patterns
+
+  def initialize(expression, patterns)
+    @expression = expression
+    @patterns = patterns
+  end
+end
+
+# AST node representing a try-catch construct.
+class TryCatchNode < ASTNode
+  # @param try_body [ASTNode] The body to try
+  # @param catch_handlers [Array<Hash>] Array of catch handlers
+  #        Each handler is a hash: { exception_type: String, handler_body: ASTNode }
+  # @param finally_body [ASTNode, nil] Optional finally block
+  attr_reader :try_body, :catch_handlers, :finally_body
+
+  def initialize(try_body, catch_handlers, finally_body = nil)
+    @try_body = try_body
+    @catch_handlers = catch_handlers
+    @finally_body = finally_body
+  end
+end
+
+# AST node representing a non-local return (e.g., from within nested blocks).
+class NonLocalReturnNode < ASTNode
+  # @param expression [ASTNode] The expression to return
+  # @param target_scope [String, nil] Optional identifier for the target scope
+  attr_reader :expression, :target_scope
+
+  def initialize(expression, target_scope = nil)
+    @expression = expression
+    @target_scope = target_scope
+  end
+end
+
 # Load enhanced reasoning nodes after base classes are defined
 require_relative 'enhanced_reasoning_nodes'
+# === Advanced Control Flow AST Nodes ===
+
+# Node representing a for loop
+class ForLoopNode < ASTNode
+  attr_reader :iterator, :iterable, :body
+
+  def initialize(iterator, iterable, body)
+    @iterator = iterator
+    @iterable = iterable
+    @body = body
+  end
+
+  def to_s
+    "ForLoopNode(#{@iterator}, #{iterable}, #{body})"
+  end
+end
+
+# Node representing a pattern match expression
+class PatternMatchNode < ASTNode
+  attr_reader :expression, :patterns
+
+  def initialize(expression, patterns)
+    @expression = expression
+    @patterns = patterns # Array of [pattern, body]
+  end
+
+  def to_s
+    "PatternMatchNode(#{@expression}, #{patterns})"
+  end
+end
+
+# Node representing a try/catch/finally block
+class TryCatchNode < ASTNode
+  attr_reader :try_block, :catch_var, :catch_block, :finally_block
+
+  def initialize(try_block, catch_var, catch_block, finally_block = nil)
+    @try_block = try_block
+    @catch_var = catch_var
+    @catch_block = catch_block
+    @finally_block = finally_block
+  end
+
+  def to_s
+    "TryCatchNode(try: #{try_block}, catch: #{catch_var}, #{catch_block}, finally: #{finally_block})"
+  end
+end
+
+# Node representing non-local returns (break, continue, return)
+class NonLocalReturnNode < ASTNode
+  attr_reader :type, :expression
+
+  def initialize(type, expression = nil)
+    @type = type # :break, :continue, :return
+    @expression = expression
+  end
+
+  def to_s
+    "NonLocalReturnNode(#{type}, #{expression})"
+  end
+end

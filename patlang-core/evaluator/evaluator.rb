@@ -252,6 +252,14 @@ class Evaluator
       visit_if_node(node)
     when WhileNode
       visit_while_node(node)
+    when ForLoopNode
+      visit_for_loop_node(node)
+    when PatternMatchNode
+      visit_pattern_match_node(node)
+    when TryCatchNode
+      visit_try_catch_node(node)
+    when NonLocalReturnNode
+      visit_non_local_return_node(node)
     when BlockNode
       visit_block_node(node)
     when StringNode
@@ -293,6 +301,93 @@ class Evaluator
     else
       raise "Unknown node type: #{node.class}"
     end
+  end
+
+  # Evaluate a for loop node
+  def visit_for_loop_node(node)
+    result = nil
+    iterable = evaluate(node.iterable)
+    return unless iterable.respond_to?(:each)
+    push_scope
+    begin
+      iterable.each do |value|
+        set_variable(node.iterator, value)
+        begin
+          r = evaluate(node.body)
+          result = r unless r.nil?
+        rescue NonLocalReturnSignal => signal
+          case signal.type
+          when :break
+            break
+          when :continue
+            next
+          when :return
+            pop_scope
+            raise signal
+          end
+        end
+      end
+    ensure
+      pop_scope
+    end
+    result
+  end
+
+  # Evaluate a pattern match node
+  def visit_pattern_match_node(node)
+    value = evaluate(node.expression)
+    node.patterns.each do |pattern, body|
+      if pattern === value || (pattern.respond_to?(:call) && pattern.call(value))
+        push_scope
+        begin
+          # Optionally bind pattern variables here if needed
+          return evaluate(body)
+        ensure
+          pop_scope
+        end
+      end
+    end
+    nil
+  end
+
+  # Evaluate a try/catch/finally node
+  def visit_try_catch_node(node)
+    result = nil
+    begin
+      result = evaluate(node.try_block)
+    rescue => e
+      if node.catch_block
+        push_scope
+        set_variable(node.catch_var, e) if node.catch_var
+        begin
+          result = evaluate(node.catch_block)
+        ensure
+          pop_scope
+        end
+      else
+        raise
+      end
+    ensure
+      if node.finally_block
+        evaluate(node.finally_block)
+      end
+    end
+    result
+  end
+
+  # Evaluate a non-local return node (break, continue, return)
+  class NonLocalReturnSignal < StandardError
+    attr_reader :type, :value
+    def initialize(type, value = nil)
+      @type = type
+      @value = value
+      super("#{type}#{value ? " #{value}" : ""}")
+    end
+  end
+
+  def visit_non_local_return_node(node)
+    value = node.expression ? evaluate(node.expression) : nil
+    raise NonLocalReturnSignal.new(node.type, value)
   end
 
   # Delegate scope management methods
