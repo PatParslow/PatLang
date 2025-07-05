@@ -24,6 +24,11 @@ pub enum Token {
     LessEqual,
     Newline,
     EOF,
+    // Patlang-specific tokens
+    Goal,
+    Rule,
+    BlockStart, // e.g. '{'
+    BlockEnd,   // e.g. '}'
     // Extend with more tokens as needed
 }
 
@@ -100,10 +105,21 @@ impl<'a> Lexer<'a> {
                     "let" => Token::Let,
                     "fn" => Token::Fn,
                     "return" => Token::Return,
+                    "goal" => Token::Goal,
+                    "rule" => Token::Rule,
                     "true" | "false" => Token::Identifier(ident.to_string()), // treat as identifier for now
                     "not" | "and" | "or" | "print" => Token::Identifier(ident.to_string()),
                     _ => Token::Identifier(ident.to_string()),
                 });
+            }
+            // Block delimiters (for future use, e.g. '{' and '}')
+            if c == '{' {
+                self.position += 1;
+                return Ok(Token::BlockStart);
+            }
+            if c == '}' {
+                self.position += 1;
+                return Ok(Token::BlockEnd);
             }
             // String literals
             if c == '"' {
