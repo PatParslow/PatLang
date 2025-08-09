@@ -266,6 +266,14 @@ impl<'a> CoreEvaluator<'a> {
                 // Evaluate args once
                 let mut eval_args: Vec<String> = Vec::with_capacity(args.len());
                 for a in args { eval_args.push(self.execute_node(a)?); }
+                // Special-case: emit(event_name) triggers registered when-handlers
+                if name == "emit" {
+                    if let Some(ev) = eval_args.get(0) {
+                        return self.emit_event(ev);
+                    } else {
+                        return Ok(String::new());
+                    }
+                }
                 // Enforce contracts if present (best-effort)
                 if !self.check_contract_with_values(name, &eval_args)? {
                     return Ok(String::new());
