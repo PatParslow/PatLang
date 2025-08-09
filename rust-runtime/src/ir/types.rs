@@ -67,6 +67,8 @@ pub enum Instr {
 
     // Function calls (host for Stage 0)
     CallHost(String, usize), // name, arg_count
+    // User function call by name
+    Call(String, usize),     // function name, arg_count
 
     // Collections
     BuildList(usize), // pop N items and push a list in original order

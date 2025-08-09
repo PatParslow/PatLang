@@ -59,6 +59,8 @@ pub enum AstKind {
     },
     // Add more as needed
     Block(Vec<AstNode>),
+    // Register an event handler captured from: when <event> { body }
+    WhenRegister { event: String, body: Vec<AstNode> },
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +97,8 @@ pub struct ExecutionContext {
     pub closures: HashMap<String, (Vec<String>, Vec<AstNode>)>,
     // Simple counters for generating ids per class/type
     pub counters: HashMap<String, usize>,
+    // Event handlers registry: event name -> list of handler bodies (as AST nodes)
+    pub event_handlers: HashMap<String, Vec<Vec<AstNode>>>,
 }
 
 impl ExecutionContext {
@@ -114,6 +118,7 @@ impl ExecutionContext {
             lists: HashMap::new(),
             closures: HashMap::new(),
             counters: HashMap::new(),
+            event_handlers: HashMap::new(),
         }
     }
 
@@ -495,6 +500,15 @@ impl<'a> CoreEvaluator<'a> {
                 }
                 Ok(last)
             }
+            AstKind::WhenRegister { event, body } => {
+                // Store handler body for the event
+                self.context
+                    .event_handlers
+                    .entry(event.clone())
+                    .or_default()
+                    .push(body.clone());
+                Ok(String::new())
+            }
             _ => {
                 // Recursively execute children
                 let mut last = String::new();
@@ -597,6 +611,21 @@ impl<'a> CoreEvaluator<'a> {
             }
         }
         Ok(true)
+    }
+
+    // Emit an event by name: run all registered handlers sequentially.
+    fn emit_event(&mut self, event: &str) -> Result<String, RuntimeError> {
+    if let Some(handlers) = self.context.event_handlers.get(event).cloned() {
+            let mut last = String::new();
+            for body in handlers {
+                for n in body {
+                    last = self.execute_node(&n)?;
+                }
+            }
+            Ok(last)
+        } else {
+            Ok(String::new())
+        }
     }
 
     /// Manage context and scope (stub).
@@ -724,10 +753,11 @@ fn stmt_to_astnode(stmt: &crate::ast::Stmt) -> AstNode {
             AstNode { kind: AstKind::FunctionCall { name: fname, args: vec![prop_node, value_node] }, children: vec![] }
         }
         // Extend for other Stmt variants as needed
-        _ => AstNode {
-            kind: AstKind::Block(vec![]),
-            children: vec![],
-        },
+        crate::ast::Stmt::When { event, body } => {
+            let body_nodes: Vec<AstNode> = body.iter().map(|s| stmt_to_astnode(s)).collect();
+            AstNode { kind: AstKind::WhenRegister { event: event.clone(), body: body_nodes }, children: vec![] }
+        }
+        _ => AstNode { kind: AstKind::Block(vec![]), children: vec![] },
     }
 }
 

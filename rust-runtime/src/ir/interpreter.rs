@@ -30,10 +30,14 @@ impl Interpreter {
         self.run_function(program, entry, &[])
     }
 
-    fn run_function(&self, _program: &Program, func: &Function, _args: &[Value]) -> Result<Value, String> {
+    fn run_function(&self, program: &Program, func: &Function, args: &[Value]) -> Result<Value, String> {
         let mut pc: usize = 0;
         let mut stack: Vec<Value> = Vec::new();
         let mut locals: HashMap<String, Value> = HashMap::new();
+        // Bind parameters as locals if present
+        for (i, name) in func.params.iter().enumerate() {
+            if let Some(v) = args.get(i) { locals.insert(name.clone(), v.clone()); }
+        }
 
         while pc < func.body.len() {
             match &func.body[pc] {
@@ -83,6 +87,15 @@ impl Interpreter {
                     let f = self.host.get(name).ok_or_else(|| format!("host fn '{}' not found", name))?;
                     let res = f(&args)?;
                     stack.push(res);
+                }
+                Instr::Call(fname, argc) => {
+                    let argc = *argc;
+                    if stack.len() < argc { return Err("stack underflow".into()); }
+                    let args_index = stack.len() - argc;
+                    let argsv: Vec<Value> = stack.drain(args_index..).collect();
+                    let callee = program.functions.get(fname).ok_or_else(|| format!("function '{}' not found", fname))?;
+                    let ret = self.run_function(program, callee, &argsv)?;
+                    stack.push(ret);
                 }
                 Instr::BuildList(n) => {
                     let n = *n;

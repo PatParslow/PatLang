@@ -121,16 +121,62 @@ impl<'a> Parser<'a> {
                             }));
                         }
                     }
+                    // Fact DSL: if used without parentheses (not a normal call), treat as no-op.
+                    // If the next token is '(', let normal call parsing handle fact(...)
+                    if curr_ident == "fact" && !matches!(self.peek, Token::LParen) {
+                        // Skip rest of the line or until terminating '.'
+                        while !matches!(self.curr, Token::Newline | Token::EOF) {
+                            if matches!(self.curr, Token::Dot) { self.advance()?; break; }
+                            self.advance()?;
+                        }
+                        return Ok(Stmt::ExprStmt(Expr::String(String::new())));
+                    }
+                    // Rules: rule name(args) :- ...  → skip to line end or to '.' when not used as normal call
+                    if curr_ident == "rule" && !matches!(self.peek, Token::LParen) {
+                        // consume tokens until newline or '.'
+                        while !matches!(self.curr, Token::Newline | Token::EOF) {
+                            if matches!(self.curr, Token::Dot) { self.advance()?; break; }
+                            self.advance()?;
+                        }
+                        return Ok(Stmt::ExprStmt(Expr::String(String::new())));
+                    }
+                    // Goals: goal name { ... } → skip brace block if present (but preserve call form goal(...))
+                    if curr_ident == "goal" && !matches!(self.peek, Token::LParen) {
+                        // consume until '{' then skip block; otherwise skip rest of line
+                        while !matches!(self.curr, Token::BlockStart | Token::Newline | Token::EOF) { self.advance()?; }
+                        if matches!(self.curr, Token::BlockStart) { self.skip_brace_block()?; }
+                        return Ok(Stmt::ExprStmt(Expr::String(String::new())));
+                    }
+                    // Reasoning mode on/off: skip rest of line
+                    if curr_ident == "reasoning" {
+                        while !matches!(self.curr, Token::Newline | Token::EOF) { self.advance()?; }
+                        return Ok(Stmt::ExprStmt(Expr::String(String::new())));
+                    }
+                    // pursue ... : skip rest of line
+                    if curr_ident == "pursue" {
+                        while !matches!(self.curr, Token::Newline | Token::EOF) { self.advance()?; }
+                        return Ok(Stmt::ExprStmt(Expr::String(String::new())));
+                    }
                     // DSL sugar: make a function called Name { ... }
                     if curr_ident == "make" {
                         if let Some(stmt) = self.parse_make_construct()? { return Ok(stmt); }
                     }
-                    // DSL events: when ... { ... } → skip block
+                    // DSL events: when <event> { ... } → capture as Stmt::When
                     if curr_ident == "when" {
-                        // Consume tokens until '{', then skip the block
-                        while !matches!(self.curr, Token::BlockStart | Token::EOF) { self.advance()?; }
-                        if matches!(self.curr, Token::BlockStart) { self.skip_brace_block()?; }
-                        return Ok(Stmt::ExprStmt(Expr::String(String::new())));
+                        self.advance()?; // consume 'when'
+                        // capture a simple identifier as event name; otherwise, fallback to skip
+                        let event_name = match &self.curr { Token::Identifier(s) => { let n = s.clone(); self.advance()?; n }, _ => String::new() };
+                        if matches!(self.curr, Token::BlockStart) {
+                            // Parse the block body using normal rules
+                            self.advance()?; // '{'
+                            let body = self.parse_block()?;
+                            return Ok(Stmt::When { event: event_name, body });
+                        } else {
+                            // Fallback: skip to next block to avoid breaking flow
+                            while !matches!(self.curr, Token::BlockStart | Token::EOF) { self.advance()?; }
+                            if matches!(self.curr, Token::BlockStart) { self.skip_brace_block()?; }
+                            return Ok(Stmt::ExprStmt(Expr::String(String::new())));
+                        }
                     }
                     // Relationship declarations: skip until trailing '.'
                     if curr_ident == "relationship" {
@@ -226,19 +272,54 @@ impl<'a> Parser<'a> {
             _ => return Ok(None),
         };
         self.advance()?;
-        // expect block start
-        if !matches!(self.curr, Token::BlockStart) { return Ok(None); }
-        // For function, extract the `returns: { ... }` block as the function body,
-        // skipping DSL-specific sections like `takes:` and `ensures:`.
-        if kind_is_function {
-            let body = self.parse_make_function_block()?;
-            return Ok(Some(Stmt::Function { name, params: vec![], body }));
-        }
-        // For template, skip raw block (we don't parse fields/method specs yet)
-        if kind_is_template {
-            self.skip_brace_block()?;
+        // Two forms supported:
+        // 1) Curly form: { ... returns: { ... } }
+        // 2) Inline form: takes x, y returns <expr> end
+        if matches!(self.curr, Token::BlockStart) {
+            if kind_is_function {
+                let body = self.parse_make_function_block()?;
+                return Ok(Some(Stmt::Function { name, params: vec![], body }));
+            } else if kind_is_template {
+                self.skip_brace_block()?;
+                return Ok(Some(Stmt::ExprStmt(Expr::String(String::new()))));
+            }
+        } else if kind_is_function {
+            // Attempt to parse inline: optional 'takes' params, then 'returns' expr, ending with 'end'
+            let mut params: Vec<String> = Vec::new();
+            // optional 'takes'
+            if let Token::Identifier(ref s) = self.curr { if s == "takes" { self.advance()?; } }
+            // parse zero or more identifiers separated by commas until we see 'returns' or 'end'
+            loop {
+                match &self.curr {
+                    Token::Identifier(s) if s == "returns" || s == "end" => break,
+                    Token::Identifier(s) => { params.push(s.clone()); self.advance()?; },
+                    Token::Comma => { self.advance()?; },
+                    Token::Newline => { self.advance()?; },
+                    _ => break,
+                }
+            }
+            // optional 'returns'
+            let mut body: Vec<Stmt> = Vec::new();
+            if let Token::Identifier(ref s) = self.curr { if s == "returns" { self.advance()?; } }
+            // try to parse an expression for return until we hit 'end'
+            // allow multi-line expression; stop on Identifier("end") or EOF
+            if !matches!(self.curr, Token::Identifier(_)) {
+                // nothing to return
+            }
+            // Save parser state and attempt expression parse; if it fails, skip to 'end'
+            let ret_expr = self.parse_expression(0).ok();
+            if let Some(expr) = ret_expr { body.push(Stmt::Return(Some(expr))); }
+            // consume until 'end'
+            while let Token::Identifier(ref s) = self.curr { if s == "end" { break; } else { self.advance()?; } }
+            if let Token::Identifier(ref s) = self.curr { if s == "end" { self.advance()?; } }
+            return Ok(Some(Stmt::Function { name, params, body }));
+        } else if kind_is_template {
+            // Inline template: skip to 'end'
+            while let Token::Identifier(ref s) = self.curr { if s == "end" { break; } else { self.advance()?; } }
+            if let Token::Identifier(ref s) = self.curr { if s == "end" { self.advance()?; } }
             return Ok(Some(Stmt::ExprStmt(Expr::String(String::new()))));
         }
+        // If none matched, fall back to None
         Ok(None)
     }
 

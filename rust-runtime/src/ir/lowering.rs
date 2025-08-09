@@ -6,22 +6,43 @@ use super::types::*;
 pub struct Lowerer {
     // minimal tracking of declared locals to avoid lowering unknown identifiers
     known_locals: HashSet<String>,
+    // track declared function names to allow lowering calls
+    known_functions: HashSet<String>,
 }
 
 impl Lowerer {
     pub fn new() -> Self { Self::default() }
 
     pub fn lower_program_basic(&mut self, stmts: &[Stmt]) -> Program {
-        let mut f = Function { name: "main".into(), ..Default::default() };
+    let mut main_fn = Function { name: "main".into(), ..Default::default() };
+        let mut program = Program::default();
+        program.entry = "main".into();
+        // First pass: collect function definitions into program
         for s in stmts {
-            self.lower_stmt(s, &mut f);
+            if let Stmt::Function { name, params, body } = s.clone() {
+        self.known_functions.insert(name.clone());
+                let mut f = Function { name: name.clone(), params: params.clone(), ..Default::default() };
+                // Lower the function body
+                let mut saved_locals = std::mem::take(&mut self.known_locals);
+                // params are considered known locals
+                self.known_locals = params.iter().cloned().collect();
+                for st in body {
+                    self.lower_stmt(&st, &mut f);
+                }
+                f.body.push(Instr::Return);
+                program.functions.insert(name.clone(), f);
+                self.known_locals = saved_locals; // restore
+            }
         }
-        // implicit return of last value on stack or Unit
-        f.body.push(Instr::Return);
-        let mut p = Program::default();
-        p.entry = "main".into();
-        p.functions.insert("main".into(), f);
-        p
+        // Second pass: lower top-level statements into main
+        for s in stmts {
+            if !matches!(s, Stmt::Function { .. }) {
+                self.lower_stmt(s, &mut main_fn);
+            }
+        }
+        main_fn.body.push(Instr::Return);
+        program.functions.insert("main".into(), main_fn);
+        program
     }
 
     fn lower_stmt(&mut self, s: &Stmt, f: &mut Function) {
@@ -80,7 +101,7 @@ impl Lowerer {
             Expr::BinaryOp { left, right, .. } => self.expr_is_safe(left) && self.expr_is_safe(right),
             Expr::Call { function, args } => {
                 if let Expr::Identifier(name) = &**function {
-                    self.is_allowed_host(name) && args.iter().all(|a| self.expr_is_safe(a))
+                    (self.is_allowed_host(name) || self.known_functions.contains(name)) && args.iter().all(|a| self.expr_is_safe(a))
                 } else { false }
             }
             _ => false,
@@ -90,7 +111,7 @@ impl Lowerer {
     fn is_allowed_host(&self, name: &str) -> bool {
         matches!(name,
             "print"|"add"|"multiply"|"subtract"|"max"|"min"|"calculate"|"calculate_result"|
-            "get_value"|"process"|"validate"
+            "get_value"|"process"|"validate"|"len"|"get"|"send"
         )
     }
 
@@ -112,17 +133,38 @@ impl Lowerer {
                 for it in items { self.lower_expr(it, f); }
                 f.body.push(Instr::BuildList(items.len()));
             }
-            Expr::Member { object: _, property: _ } => {
-                // Stage 0: no object support yet; push Unit to keep expression positions consistent
-                f.body.push(Instr::Const(Value::Unit));
+            Expr::Member { object, property } => {
+                // Map property reads to host calls: length/len -> len(obj); otherwise get(obj, "prop")
+                self.lower_expr(object, f);
+                if property == "length" || property == "len" {
+                    f.body.push(Instr::CallHost("len".into(), 1));
+                } else {
+                    f.body.push(Instr::Const(Value::String(property.clone())));
+                    f.body.push(Instr::CallHost("get".into(), 2));
+                }
             }
             Expr::Call { function, args } => {
-                // Stage 0: only support identifier calls as host calls
-                if let Expr::Identifier(name) = &**function {
-                    for arg in args { self.lower_expr(arg, f); }
-                    f.body.push(Instr::CallHost(name.clone(), args.len()));
-                } else {
-                    // Unsupported callee; no-op for now
+                // Identifier calls map to host calls; member calls map to message send
+                match &**function {
+                    Expr::Identifier(name) => {
+                        for arg in args { self.lower_expr(arg, f); }
+                        // If identifier refers to known local function, emit Call; otherwise host call
+                        if self.known_functions.contains(name) {
+                            f.body.push(Instr::Call(name.clone(), args.len()));
+                        } else {
+                            f.body.push(Instr::CallHost(name.clone(), args.len()));
+                        }
+                    }
+                    Expr::Member { object, property } => {
+                        // send(object, "method", ...args)
+                        self.lower_expr(object, f);
+                        f.body.push(Instr::Const(Value::String(property.clone())));
+                        for arg in args { self.lower_expr(arg, f); }
+                        f.body.push(Instr::CallHost("send".into(), 2 + args.len()));
+                    }
+                    _ => {
+                        // Unsupported callee; no-op for now
+                    }
                 }
             }
             Expr::UnaryOp { op, expr } => {
@@ -135,23 +177,65 @@ impl Lowerer {
             }
             Expr::BinaryOp { left, op, right } => {
                 use BinaryOperator::*;
-                self.lower_expr(left, f);
-                self.lower_expr(right, f);
-                let instr = match op {
-                    Add => Instr::BinOp(BinOpKind::Add),
-                    Sub => Instr::BinOp(BinOpKind::Sub),
-                    Mul => Instr::BinOp(BinOpKind::Mul),
-                    Div => Instr::BinOp(BinOpKind::Div),
-                    Mod => Instr::BinOp(BinOpKind::Mod),
-                    Equal => Instr::BinOp(BinOpKind::Eq),
-                    Greater => Instr::BinOp(BinOpKind::Gt),
-                    GreaterEqual => Instr::BinOp(BinOpKind::Ge),
-                    Less => Instr::BinOp(BinOpKind::Lt),
-                    LessEqual => Instr::BinOp(BinOpKind::Le),
-                    And => Instr::BinOp(BinOpKind::And),
-                    Or => Instr::BinOp(BinOpKind::Or),
-                };
-                f.body.push(instr);
+                match op {
+                    And => {
+                        // Short-circuit: if left is falsey -> false, else result is truthiness of right
+                        self.lower_expr(left, f);
+                        f.body.push(Instr::UnOp(UnOpKind::Not)); // !left
+                        let jif_idx = f.body.len();
+                        f.body.push(Instr::JumpIfFalse(usize::MAX)); // if !left == false => left true -> eval right
+                        // left is false path
+                        f.body.push(Instr::Const(Value::Bool(false)));
+                        let jmp_end_idx = f.body.len();
+                        f.body.push(Instr::Jump(usize::MAX));
+                        // eval right
+                        let eval_right_pc = f.body.len();
+                        if let Instr::JumpIfFalse(ref mut tgt) = f.body[jif_idx] { *tgt = eval_right_pc; }
+                        self.lower_expr(right, f);
+                        // coerce to bool using double-not
+                        f.body.push(Instr::UnOp(UnOpKind::Not));
+                        f.body.push(Instr::UnOp(UnOpKind::Not));
+                        let end_pc = f.body.len();
+                        if let Instr::Jump(ref mut tgt) = f.body[jmp_end_idx] { *tgt = end_pc; }
+                    }
+                    Or => {
+                        // Short-circuit: if left is truthy -> true, else result is truthiness of right
+                        self.lower_expr(left, f);
+                        f.body.push(Instr::UnOp(UnOpKind::Not)); // !left
+                        let jif_idx = f.body.len();
+                        f.body.push(Instr::JumpIfFalse(usize::MAX)); // when !left == false => left true
+                        // left false -> eval right
+                        self.lower_expr(right, f);
+                        f.body.push(Instr::UnOp(UnOpKind::Not));
+                        f.body.push(Instr::UnOp(UnOpKind::Not));
+                        let jmp_end_idx = f.body.len();
+                        f.body.push(Instr::Jump(usize::MAX));
+                        // push true for left true case
+                        let push_true_pc = f.body.len();
+                        if let Instr::JumpIfFalse(ref mut tgt) = f.body[jif_idx] { *tgt = push_true_pc; }
+                        f.body.push(Instr::Const(Value::Bool(true)));
+                        let end_pc = f.body.len();
+                        if let Instr::Jump(ref mut tgt) = f.body[jmp_end_idx] { *tgt = end_pc; }
+                    }
+                    _ => {
+                        self.lower_expr(left, f);
+                        self.lower_expr(right, f);
+                        let instr = match op {
+                            Add => Instr::BinOp(BinOpKind::Add),
+                            Sub => Instr::BinOp(BinOpKind::Sub),
+                            Mul => Instr::BinOp(BinOpKind::Mul),
+                            Div => Instr::BinOp(BinOpKind::Div),
+                            Mod => Instr::BinOp(BinOpKind::Mod),
+                            Equal => Instr::BinOp(BinOpKind::Eq),
+                            Greater => Instr::BinOp(BinOpKind::Gt),
+                            GreaterEqual => Instr::BinOp(BinOpKind::Ge),
+                            Less => Instr::BinOp(BinOpKind::Lt),
+                            LessEqual => Instr::BinOp(BinOpKind::Le),
+                            And | Or => unreachable!(),
+                        };
+                        f.body.push(instr);
+                    }
+                }
             }
             _ => { /* TODO: calls, lists, etc. */ }
         }

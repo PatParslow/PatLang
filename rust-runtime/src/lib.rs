@@ -1,5 +1,6 @@
 //! patlang_runtime library crate root.
 //! Exports all core modules for use in integration tests and external crates.
+#![cfg_attr(debug_assertions, allow(dead_code, unused_imports, unused_variables, unused_mut))]
 pub mod ast;
 pub mod lexer;
 
