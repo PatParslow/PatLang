@@ -1,0 +1,272 @@
+# Main web server class combining multiple paradigms
+make a template called WebServer {
+  WebServer has:
+    port - integer = 3000
+    middleware_stack - list of Middleware = []
+    routes - RoutingTable
+    database - DatabaseConnection
+    request_count - integer = 0
+    
+  WebServer maintains:
+    port > 0 and port <= 65535
+    middleware_stack is not nil
+    
+  start_server takes:
+    config - ServerConfig
+  start_server ensures:
+    server is listening on port
+    all middleware is initialized
+  start_server returns: {
+    database = DatabaseConnection.new(config.database_url)
+    routes = RoutingTable.new()
+    
+    configure_middleware(config.middleware_options)
+    setup_routes()
+    
+    print "Starting server on port #{port}"
+    listen_for_connections()
+  }
+  
+  configure_middleware takes:
+    options - MiddlewareOptions
+  configure_middleware returns: {
+    # Add authentication middleware
+    auth_middleware = AuthenticationMiddleware.new(options.auth_secret)
+    middleware_stack.add(auth_middleware)
+    
+    # Add logging middleware
+    logger = RequestLogger.new(options.log_level)
+    middleware_stack.add(logger)
+    
+    # Add CORS middleware
+    cors = CORSMiddleware.new(options.allowed_origins)
+    middleware_stack.add(cors)
+  }
+  
+  setup_routes returns: {
+    # RESTful API routes using functional composition
+    routes.get("/users", |request| handle_get_users(request))
+    routes.post("/users", |request| handle_create_user(request))
+    routes.put("/users/:id", |request| handle_update_user(request))
+    routes.delete("/users/:id", |request| handle_delete_user(request))
+    
+    # Static file serving
+    routes.static("/assets", "./public/assets")
+  }
+}
+
+# Event-driven request handling
+when WebServer: connection_received is activated {
+  request_count becomes request_count + 1
+  
+  # Create request processing goal
+  make a goal called process_request {
+    process_request requires:
+      raw_request - HTTPRequest
+      middleware_stack - list of Middleware
+      routes - RoutingTable
+      
+    process_request is achieved when:
+      request is parsed and validated
+      middleware chain is executed successfully
+      route handler is found and executed
+      response is generated and sent
+      
+    process_request runs: {
+      # Parse HTTP request
+      parsed_request = HTTPRequestParser.parse(raw_request)
+      
+      # Execute middleware chain (functional composition)
+      processed_request = middleware_stack.reduce(parsed_request, |req, middleware| {
+        middleware.process(req)
+      })
+      
+      # Route matching and handler execution
+      route_match = routes.find_matching_route(processed_request.path, processed_request.method)
+      
+      if route_match then
+        response = route_match.handler.call(processed_request)
+        send_response(response)
+      else
+        send_error_response(404, "Route not found")
+      end
+    }
+  }
+  
+  # Activate the goal with the incoming request
+  activate process_request with [connection.request, middleware_stack, routes]
+}
+
+# Authentication middleware with logic programming
+make a template called AuthenticationMiddleware {
+  AuthenticationMiddleware has:
+    secret_key - text
+    user_store - UserStore
+    
+  process takes:
+    request - HTTPRequest
+  process ensures:
+    request has authentication information
+  process returns: {
+    auth_header = request.headers["Authorization"]
+    
+    if auth_header is nil then
+      request.authenticated = false
+      request.user = nil
+    else
+      token = extract_token(auth_header)
+      user = verify_token(token)
+      request.authenticated = user is not nil
+      request.user = user
+    end
+    
+    request
+  }
+  
+  verify_token takes:
+    token - text
+  verify_token returns: {
+    # Logic programming for token validation
+    query token_is_valid(token) returns:
+      token is not expired and
+      token.signature is valid and
+      token.user_id exists in user_store
+    end
+    
+    if token_is_valid(token) then
+      user_store.find_by_id(token.user_id)
+    else
+      nil
+    end
+  }
+}
+
+# Database operations with goal-oriented error handling
+make a template called UserController {
+  UserController has:
+    database - DatabaseConnection
+    validator - UserValidator
+    
+  handle_get_users takes:
+    request - HTTPRequest
+  handle_get_users returns: {
+    # Goal-oriented database operation
+    make a goal called fetch_users {
+      fetch_users requires:
+        database_connection - DatabaseConnection
+        pagination_params - PaginationParams
+        
+      fetch_users is achieved when:
+        database connection is healthy
+        pagination parameters are valid
+        users are successfully retrieved
+        
+      fetch_users runs: {
+        page = request.query_params["page"] or 1
+        limit = request.query_params["limit"] or 20
+        
+        pagination = PaginationParams.new(page, limit)
+        users = database.query("SELECT * FROM users LIMIT #{limit} OFFSET #{(page-1)*limit}")
+        
+        JSONResponse.new(200, users.map(|user| user.to_hash))
+      }
+    }
+    
+    try
+      activate fetch_users with [database, extract_pagination(request)]
+    catch DatabaseError as error
+      JSONResponse.new(500, {error: "Database unavailable"})
+    catch ValidationError as error
+      JSONResponse.new(400, {error: error.message})
+    end
+  }
+  
+  handle_create_user takes:
+    request - HTTPRequest
+  handle_create_user returns: {
+    user_data = JSON.parse(request.body)
+    
+    # Functional validation pipeline
+    validation_result = [user_data]
+      .map(|data| validator.validate_required_fields(data))
+      .map(|data| validator.validate_email_format(data))
+      .map(|data| validator.validate_password_strength(data))
+      .map(|data| validator.check_email_uniqueness(data, database))
+    
+    if validation_result.is_valid then
+      # Event-driven user creation
+      new_user = database.create_user(validation_result.data)
+      emit user_created with new_user
+      JSONResponse.new(201, new_user.to_hash)
+    else
+      JSONResponse.new(422, {errors: validation_result.errors})
+    end
+  }
+}
+
+# Event handlers for cross-cutting concerns
+when user: created is activated {
+  print "New user registered: #{user.email}"
+  
+  # Chain multiple goals triggered by user creation
+  activate send_welcome_email with [user]
+  activate update_analytics with ["user_registered", user.id]
+  activate setup_user_preferences with [user]
+}
+
+when database: connection_lost is activated {
+  print "Database connection lost, attempting reconnection..."
+  
+  make a goal called restore_database_connection {
+    restore_database_connection requires:
+      connection_config - DatabaseConfig
+      retry_count - integer = 0
+      max_retries - integer = 5
+      
+    restore_database_connection is achieved when:
+      database connection is restored or
+      max retries exceeded
+      
+    restore_database_connection runs: {
+      if retry_count >= max_retries then
+        throw SystemError("Failed to restore database connection after #{max_retries} attempts")
+      else
+        try
+          database.reconnect(connection_config)
+          print "Database connection restored"
+        catch ConnectionError
+          retry_count becomes retry_count + 1
+          sleep(2 ** retry_count)  # Exponential backoff
+          activate restore_database_connection with [connection_config, retry_count, max_retries]
+        end
+      end
+    }
+  }
+  
+  activate restore_database_connection with [database.config]
+}
+
+# Server configuration and startup
+make a function called start_web_application {
+  start_web_application takes:
+    config_file - text
+    
+  start_web_application returns: {
+    config = ServerConfig.load_from_file(config_file)
+    server = WebServer.new()
+  server.port = 8123
+    
+    # Set up global error handling
+    when any: error_occurred {
+      ErrorLogger.log(error)
+      if error.is_critical then
+        server.graceful_shutdown()
+      end
+    }
+    
+    server.start_server(config)
+  }
+}
+
+# Usage
+start_web_application("server_config.json")

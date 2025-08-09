@@ -20,3 +20,6 @@ pub mod function;
 pub mod object;
 pub mod reasoning;
 pub mod parser;
+pub mod logic_engine;
+pub mod runtime_integration;
+pub mod builtins;

@@ -1,10 +1,23 @@
 //! Patlang AST definitions for Rust parser
 
-#[derive(Debug, Clone, PartialEq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Expr {
     Number(f64),
     String(String),
     Identifier(String),
+    // List literal: [a, b, c]
+    List(Vec<Expr>),
+    Member {
+        object: Box<Expr>,
+        property: String,
+    },
+    // Closure literal: |params| { body }
+    Closure {
+        params: Vec<String>,
+        body: Vec<Stmt>,
+    },
     UnaryOp {
         op: String,
         expr: Box<Expr>,
@@ -21,11 +34,17 @@ pub enum Expr {
     // Extend with more expression types as needed
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Stmt {
     ExprStmt(Expr),
     Let {
         name: String,
+        value: Expr,
+    },
+    // Assignment to an object's property: obj.prop = value
+    MemberAssign {
+        object: Expr,
+        property: String,
         value: Expr,
     },
     Function {
@@ -34,10 +53,23 @@ pub enum Stmt {
         body: Vec<Stmt>,
     },
     Return(Option<Expr>),
+    If {
+        cond: Expr,
+        then_branch: Vec<Stmt>,
+        else_branch: Option<Vec<Stmt>>,
+    },
+    Fact {
+        name: String,
+        args: Vec<Expr>,
+    },
+    Query {
+        name: String,
+        args: Vec<Expr>,
+    },
     // Extend with more statement types as needed
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum BinaryOperator {
     Add,
     Sub,
@@ -46,6 +78,7 @@ pub enum BinaryOperator {
     Mod,
     And,
     Or,
+    Equal,
     Greater,
     GreaterEqual,
     Less,
@@ -53,7 +86,7 @@ pub enum BinaryOperator {
     // Extend with more operators as needed
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum BinaryOpKind {
     Arithmetic(BinaryOperator),
     Logical(BinaryOperator),
@@ -70,7 +103,8 @@ impl BinaryOpKind {
             | BinaryOperator::Mod => BinaryOpKind::Arithmetic(op.clone()),
             BinaryOperator::And
             | BinaryOperator::Or => BinaryOpKind::Logical(op.clone()),
-            BinaryOperator::Greater
+            BinaryOperator::Equal
+            | BinaryOperator::Greater
             | BinaryOperator::GreaterEqual
             | BinaryOperator::Less
             | BinaryOperator::LessEqual => BinaryOpKind::Comparison(op.clone()),
