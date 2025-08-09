@@ -15,6 +15,7 @@ fn main() {
     //   --ir-run <file.pat>
     //   --emit-rust <file.pat> [--out <file.rs>]
     //   --build-run <file.pat>  (emit, compile with rustc, then run)
+    //   --patc <file.pat> [--out <file.exe>] (compile to native exe, no run)
     //   --compare <file.pat> [--time]  (run interpreter vs compiled and compare outputs, optionally timings)
     let mut mode = "eval".to_string();
     let mut filename: Option<&str> = None;
@@ -25,6 +26,7 @@ fn main() {
             "--ir-run" => { mode = "ir-run".into(); if i+1 < args.len() { filename = Some(&args[i+1]); i+=1; } }
             "--emit-rust" => { mode = "emit-rust".into(); if i+1 < args.len() { filename = Some(&args[i+1]); i+=1; } }
             "--build-run" => { mode = "build-run".into(); if i+1 < args.len() { filename = Some(&args[i+1]); i+=1; } }
+            "--patc" => { mode = "patc".into(); if i+1 < args.len() { filename = Some(&args[i+1]); i+=1; } }
             "--compare" => { mode = "compare".into(); if i+1 < args.len() { filename = Some(&args[i+1]); i+=1; } }
             "--time" => { /* handled later via env flag */ }
             "--out" => { if i+1 < args.len() { out_file = Some(&args[i+1]); i+=1; } }
@@ -33,7 +35,7 @@ fn main() {
         }
         i+=1;
     }
-    let filename = match filename { Some(f) => f, None => { eprintln!("Usage: {} [--ir-run|--emit-rust] <file.pat> [--out file.rs]", args[0]); process::exit(1); } };
+    let filename = match filename { Some(f) => f, None => { eprintln!("Usage: {} [--ir-run|--emit-rust|--build-run|--patc|--compare] <file.pat> [--out <path>]", args[0]); process::exit(1); } };
     let source = match fs::read_to_string(filename) {
         Ok(s) => s,
         Err(e) => {
@@ -41,7 +43,7 @@ fn main() {
             process::exit(1);
         }
     };
-    if mode == "ir-run" || mode == "emit-rust" || mode == "build-run" || mode == "compare" {
+    if mode == "ir-run" || mode == "emit-rust" || mode == "build-run" || mode == "compare" || mode == "patc" {
         // Guardrail: quick scan for unsupported high-level constructs before parsing
         let unsupported_markers = [
             "reasoning mode",
@@ -68,7 +70,7 @@ fn main() {
     let mut lower = Lowerer::new();
     let program = lower.lower_program_basic(&ast);
 
-    if mode == "emit-rust" || mode == "build-run" || mode == "compare" {
+    if mode == "emit-rust" || mode == "build-run" || mode == "compare" || mode == "patc" {
         let cg = RustCodegen::new();
         let rust_src = cg.emit_rust(&program);
         if mode == "emit-rust" {
@@ -84,7 +86,7 @@ fn main() {
             }
             return;
         }
-        // build-run or compare: write to temp, rustc, then run
+        // build-run, patc, or compare: write to temp, rustc, then run/emit
         let mut tmp = std::env::temp_dir();
         tmp.push("patlang_emit");
         let _ = std::fs::create_dir_all(&tmp);
@@ -93,20 +95,46 @@ fn main() {
             eprintln!("Failed to write {}: {}", src_path.display(), e);
             process::exit(1);
         }
-        let exe_path = if cfg!(windows) { tmp.join("generated_main.exe") } else { tmp.join("generated_main") };
+        use std::path::{Path, PathBuf};
+        // Destination path for patc, if requested (we will emit directly to this path)
+        let patc_dest: Option<PathBuf> = if mode == "patc" {
+            if let Some(out) = out_file { Some(PathBuf::from(out)) } else {
+                let in_path = Path::new(filename);
+                let stem = in_path.file_stem().and_then(|s| s.to_str()).unwrap_or("a");
+                let parent = in_path.parent().unwrap_or_else(|| Path::new("."));
+                let mut out = parent.join(stem);
+                if cfg!(windows) { out.set_extension("exe"); }
+                Some(out)
+            }
+        } else { None };
+        // Determine the output path for rustc -o
+        let compile_exe_path = if let Some(dest) = &patc_dest {
+            // Ensure parent dir exists for destination
+            if let Some(parent) = dest.parent() { let _ = std::fs::create_dir_all(parent); }
+            dest.clone()
+        } else {
+            if cfg!(windows) { tmp.join("generated_main.exe") } else { tmp.join("generated_main") }
+        };
         let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+        if mode == "patc" { eprintln!("[patc] Compiling with {} -> {}", rustc, compile_exe_path.display()); }
         let status = std::process::Command::new(&rustc)
             .arg("-O")
             .arg(&src_path)
             .arg("-o")
-            .arg(&exe_path)
+            .arg(&compile_exe_path)
             .status();
         match status {
             Ok(st) if st.success() => {
+                if mode == "patc" {
+                    let dest = compile_exe_path;
+                    let abs = std::fs::canonicalize(&dest).unwrap_or(dest);
+                    println!("Wrote {}", abs.display());
+                    return;
+                }
                 if mode == "build-run" {
-                    let output = std::process::Command::new(&exe_path)
+                    let output = std::process::Command::new(&compile_exe_path)
                         .output()
-                        .unwrap_or_else(|e| { eprintln!("Failed to run {}: {}", exe_path.display(), e); process::exit(1); });
+                        .unwrap_or_else(|e| { eprintln!("Failed to run {}: {}", compile_exe_path.display(), e); process::exit(1); });
                     print!("{}", String::from_utf8_lossy(&output.stdout));
                     if !output.status.success() {
                         eprintln!("Child exited with status: {}", output.status);
@@ -123,6 +151,9 @@ fn main() {
                         let mut interp = Interpreter::new();
                         // register same hosts as IR mode
                         interp.host.insert("print", ir_host_print);
+                        interp.host.insert("sed", ir_host_sed);
+                        // emit is a no-op in pure interpreter for this compare path
+                        interp.host.insert("emit", |_args| Ok(Value::Unit));
                         interp.host.insert("add", |args| host_bin_num(args, |a,b| a + b));
                         interp.host.insert("multiply", |args| host_bin_num(args, |a,b| a * b));
                         interp.host.insert("subtract", |args| host_bin_num(args, |a,b| a - b));
@@ -155,9 +186,9 @@ fn main() {
 
                     // Compiled run
                     let comp_start = std::time::Instant::now();
-                    let output = std::process::Command::new(&exe_path)
+                    let output = std::process::Command::new(&compile_exe_path)
                         .output()
-                        .unwrap_or_else(|e| { eprintln!("Failed to run {}: {}", exe_path.display(), e); process::exit(1); });
+                        .unwrap_or_else(|e| { eprintln!("Failed to run {}: {}", compile_exe_path.display(), e); process::exit(1); });
                     let comp_dur = comp_start.elapsed();
                     if !output.status.success() {
                         eprintln!("Compiled program failed: {}", output.status);
@@ -186,6 +217,7 @@ fn main() {
     let mut interp = Interpreter::new();
     // Provide basic host built-ins for IR mode
     interp.host.insert("print", ir_host_print);
+    interp.host.insert("sed", ir_host_sed);
     interp.host.insert("add", |args| host_bin_num(args, |a,b| a + b));
     interp.host.insert("multiply", |args| host_bin_num(args, |a,b| a * b));
     interp.host.insert("subtract", |args| host_bin_num(args, |a,b| a - b));
@@ -279,6 +311,89 @@ fn ir_host_print(args: &[Value]) -> Result<Value, String> {
         println!("");
     }
     Ok(Value::Unit)
+}
+
+fn ir_host_sed(args: &[Value]) -> Result<Value, String> {
+    // sed("s/pat/repl/[flags]", input)
+    let cmd = match args.get(0) { Some(Value::String(s)) => s.as_str(), _ => return Ok(Value::Unit) };
+    let dv;
+    let input: &str = match args.get(1) {
+        Some(Value::String(s)) => s.as_str(),
+        Some(v) => { dv = display_value(v); dv.as_str() },
+        None => "",
+    };
+    let out = sed_command(cmd, input);
+    Ok(Value::String(out))
+}
+
+fn sed_command(cmd: &str, input: &str) -> String {
+    // Minimal sed: supports s/pat/repl/[g|i|gi]
+    if !cmd.starts_with('s') { return input.to_string(); }
+    let mut parts = cmd.splitn(4, '/');
+    let _s = parts.next(); // "s"
+    let pat = match parts.next() { Some(p) => p, None => return input.to_string() };
+    let repl = match parts.next() { Some(r) => r, None => return input.to_string() };
+    let flags = parts.next().unwrap_or("");
+    let global = flags.contains('g');
+    let ci = flags.contains('i');
+    replace_lit(input, pat, repl, global, ci)
+}
+
+fn replace_lit(hay: &str, pat: &str, rep: &str, global: bool, ci: bool) -> String {
+    if pat.is_empty() { return hay.to_string(); }
+    if !ci {
+        if !global {
+            if let Some(pos) = hay.find(pat) {
+                let mut out = String::with_capacity(hay.len());
+                out.push_str(&hay[..pos]);
+                out.push_str(rep);
+                out.push_str(&hay[pos+pat.len()..]);
+                return out;
+            }
+            return hay.to_string();
+        } else {
+            let mut out = String::with_capacity(hay.len());
+            let mut start = 0usize;
+            let mut rest = hay;
+            while let Some(pos) = rest.find(pat) {
+                let abs = start + pos;
+                out.push_str(&hay[start..abs]);
+                out.push_str(rep);
+                start = abs + pat.len();
+                rest = &hay[start..];
+            }
+            out.push_str(&hay[start..]);
+            return out;
+        }
+    }
+    // case-insensitive: naive ASCII-only approach
+    let hay_l = hay.to_ascii_lowercase();
+    let pat_l = pat.to_ascii_lowercase();
+    if !global {
+        if let Some(pos) = hay_l.find(&pat_l) {
+            let mut out = String::with_capacity(hay.len());
+            out.push_str(&hay[..pos]);
+            out.push_str(rep);
+            out.push_str(&hay[pos+pat.len()..]);
+            return out;
+        }
+        return hay.to_string();
+    } else {
+        let mut out = String::with_capacity(hay.len());
+        let mut start = 0usize;
+        let mut idx = 0usize;
+        while idx <= hay_l.len() {
+            if let Some(pos) = hay_l[idx..].find(&pat_l) {
+                let abs = idx + pos;
+                out.push_str(&hay[start..abs]);
+                out.push_str(rep);
+                start = abs + pat.len();
+                idx = start;
+            } else { break; }
+        }
+        out.push_str(&hay[start..]);
+        return out;
+    }
 }
 
 fn host_bin_num(args: &[Value], f: fn(f64, f64) -> f64) -> Result<Value, String> {

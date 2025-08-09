@@ -212,6 +212,12 @@ impl<'a> Parser<'a> {
                         self.skip_until_ident("end")?;
                         return Ok(Stmt::ExprStmt(Expr::String(String::new())));
                     }
+                    // Skip simple while-do-end loops used in examples
+                    if curr_ident == "while" {
+                        // consume until we find an Identifier("end")
+                        self.skip_until_ident("end")?;
+                        return Ok(Stmt::ExprStmt(Expr::String(String::new())));
+                    }
                 }
                 // Best-effort fallback: if the current token starts with our DSL words like 'make' or 'when',
                 // skip ahead to the next block and consume it, treating it as a no-op block statement.
@@ -512,29 +518,85 @@ impl<'a> Parser<'a> {
         self.advance()?;
         // condition expression
         let cond = self.parse_expression(0)?;
-        // then block
+        // Support two forms:
+        // 1) Brace form: if <cond> { ... } [else { ... }]
+        // 2) Ruby-like form: if <cond> then ... [else ...] end
+        if matches!(self.curr, Token::BlockStart) {
+            // then block with '{}'
+            self.advance()?;
+            let then_branch = self.parse_block()?;
+            // optional else/elif
+            let else_branch = if matches!(self.curr, Token::Else | Token::Elif) {
+                match self.curr {
+                    Token::Else => {
+                        self.advance()?;
+                        self.expect(Token::BlockStart, "'{' to start 'else' block", "Start the 'else' block with '{'" )?;
+                        Some(self.parse_block()?)
+                    }
+                    Token::Elif => {
+                        // elif -> else { if ... }
+                        self.advance()?;
+                        let cond2 = self.parse_expression(0)?;
+                        self.expect(Token::BlockStart, "'{' to start 'elif' block", "Start the 'elif' block with '{'" )?;
+                        let then2 = self.parse_block()?;
+                        Some(vec![Stmt::If { cond: cond2, then_branch: then2, else_branch: None }])
+                    }
+                    _ => None,
+                }
+            } else { None };
+            return Ok(Stmt::If { cond, then_branch, else_branch });
+        } else if let Token::Identifier(ref s) = self.curr {
+            if s == "then" {
+                // Ruby-like: if cond then ... else ... end
+                self.advance()?; // consume 'then'
+                let mut then_branch: Vec<Stmt> = Vec::new();
+                // parse statements until 'else' or 'end'
+                loop {
+                    // stop on else/end/EOF
+                    match &self.curr {
+                        Token::Identifier(t) if t == "else" => break,
+                        Token::Identifier(t) if t == "end" => break,
+                        Token::EOF => break,
+                        _ => {}
+                    }
+                    // consume newlines
+                    self.consume_newlines()?;
+                    if matches!(self.curr, Token::Identifier(_)|Token::Let|Token::Fn|Token::If|Token::Return|Token::Number(_)|Token::String(_)|Token::LParen) {
+                        let st = self.parse_statement()?;
+                        then_branch.push(st);
+                    } else {
+                        // advance to avoid infinite loop
+                        if !matches!(self.curr, Token::EOF) { self.advance()?; }
+                    }
+                    self.consume_newlines()?;
+                }
+                // optional else
+                let else_branch = if let Token::Identifier(ref e) = self.curr { if e == "else" {
+                    self.advance()?; // consume 'else'
+                    let mut else_body: Vec<Stmt> = Vec::new();
+                    loop {
+                        match &self.curr {
+                            Token::Identifier(t) if t == "end" => break,
+                            Token::EOF => break,
+                            _ => {}
+                        }
+                        self.consume_newlines()?;
+                        if matches!(self.curr, Token::Identifier(_)|Token::Let|Token::Fn|Token::If|Token::Return|Token::Number(_)|Token::String(_)|Token::LParen) {
+                            let st = self.parse_statement()?; else_body.push(st);
+                        } else { if !matches!(self.curr, Token::EOF) { self.advance()?; } }
+                        self.consume_newlines()?;
+                    }
+                    Some(else_body)
+                } else { None } } else { None };
+                // require 'end'
+                if let Token::Identifier(ref endkw) = self.curr { if endkw == "end" { self.advance()?; } }
+                return Ok(Stmt::If { cond, then_branch, else_branch });
+            }
+        }
+        // fallback: expecting brace form if none matched
         self.expect(Token::BlockStart, "'{' to start 'if' block", "Start the 'if' block with '{'" )?;
         let then_branch = self.parse_block()?;
-        // optional else/elif
-        let else_branch = if matches!(self.curr, Token::Else | Token::Elif) {
-            match self.curr {
-                Token::Else => {
-                    self.advance()?;
-                    self.expect(Token::BlockStart, "'{' to start 'else' block", "Start the 'else' block with '{'" )?;
-                    Some(self.parse_block()?)
-                }
-                Token::Elif => {
-                    // elif -> else { if ... }
-                    self.advance()?;
-                    let cond2 = self.parse_expression(0)?;
-                    self.expect(Token::BlockStart, "'{' to start 'elif' block", "Start the 'elif' block with '{'" )?;
-                    let then2 = self.parse_block()?;
-                    Some(vec![Stmt::If { cond: cond2, then_branch: then2, else_branch: None }])
-                }
-                _ => None,
-            }
-        } else { None };
-        Ok(Stmt::If { cond, then_branch, else_branch })
+        Ok(Stmt::If { cond, then_branch, else_branch: None })
     }
 
     // Pratt parser

@@ -84,9 +84,24 @@ impl Interpreter {
                     if stack.len() < argc { return Err("stack underflow".into()); }
                     let args_index = stack.len() - argc;
                     let args: Vec<Value> = stack.drain(args_index..).collect();
-                    let f = self.host.get(name).ok_or_else(|| format!("host fn '{}' not found", name))?;
-                    let res = f(&args)?;
-                    stack.push(res);
+                    if name == "emit" {
+                        // args: event name (string), optional payload (any)
+                        let ev = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => String::new() };
+                        let payload = args.get(1).cloned().unwrap_or(Value::Unit);
+                        let mut last = Value::Unit;
+                        if let Some(handlers) = program.event_handlers.get(&ev) {
+                            for h in handlers {
+                                let callee = program.functions.get(h).ok_or_else(|| format!("function '{}' not found", h))?;
+                                // Handlers take (event_name, event_data)
+                                last = self.run_function(program, callee, &[Value::String(ev.clone()), payload.clone()])?;
+                            }
+                        }
+                        stack.push(last);
+                    } else {
+                        let f = self.host.get(name).ok_or_else(|| format!("host fn '{}' not found", name))?;
+                        let res = f(&args)?;
+                        stack.push(res);
+                    }
                 }
                 Instr::Call(fname, argc) => {
                     let argc = *argc;
