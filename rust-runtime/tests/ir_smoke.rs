@@ -57,3 +57,34 @@ fn ir_interpreter_host_call() {
     let v = interp.run(&program).expect("run ok");
     assert_eq!(v, Value::Number(10.0));
 }
+
+#[test]
+fn ir_interpreter_truthiness_and_or() {
+    // return (true and false) or (1 and -1) or ("" or "x")
+    let mut f = Function { name: "main".into(), ..Default::default() };
+    // true and false -> false
+    f.body.push(Instr::Const(Value::Bool(true)));
+    f.body.push(Instr::Const(Value::Bool(false)));
+    f.body.push(Instr::BinOp(BinOpKind::And));
+    // 1 and -1 -> true
+    f.body.push(Instr::Const(Value::Number(1.0)));
+    f.body.push(Instr::Const(Value::Number(-1.0)));
+    f.body.push(Instr::BinOp(BinOpKind::And));
+    // (false) or (true) -> true
+    f.body.push(Instr::BinOp(BinOpKind::Or));
+    // "" or "x" -> true
+    f.body.push(Instr::Const(Value::String(String::new())));
+    f.body.push(Instr::Const(Value::String("x".into())));
+    f.body.push(Instr::BinOp(BinOpKind::Or));
+    // (true) or (true) -> true
+    f.body.push(Instr::BinOp(BinOpKind::Or));
+    f.body.push(Instr::Return);
+
+    let mut program = Program::default();
+    program.entry = "main".into();
+    program.functions.insert("main".into(), f);
+
+    let interp = Interpreter::new();
+    let v = interp.run(&program).expect("run ok");
+    assert_eq!(v, Value::Bool(true));
+}

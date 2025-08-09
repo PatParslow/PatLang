@@ -51,3 +51,24 @@ fn lower_and_run_reassignment() {
   let v = interp.run(&program).expect("run ok");
   assert_eq!(v, Value::Number(42.0));
 }
+
+#[test]
+fn lower_and_run_boolean_ops_and_truthiness() {
+  let src = r#"
+    let t = true
+    let f = false
+    let n1 = 1
+    let n0 = 0
+    let s0 = ""
+    let sx = "x"
+  # combine a few
+    return (t and f) or (n1 and n0) or (s0 or sx)
+  "#;
+  let mut p = Parser::new(src).expect("parser");
+  let ast = p.parse().expect("parse ok");
+  let mut lower = Lowerer::new();
+  let program = lower.lower_program_basic(&ast);
+  let interp = Interpreter::new();
+  let v = interp.run(&program).expect("run ok");
+  assert_eq!(v, Value::Bool(true));
+}

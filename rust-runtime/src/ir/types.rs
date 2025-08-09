@@ -37,7 +37,11 @@ impl Value {
         match self {
             Value::Bool(b) => Ok(*b),
             Value::Unit => Ok(false),
-            _ => Err("expected bool".into()),
+            Value::Number(n) => Ok(*n != 0.0),
+            Value::String(s) => Ok(!s.is_empty()),
+            Value::List(xs) => Ok(!xs.is_empty()),
+            Value::Object(map) => Ok(!map.is_empty()),
+            Value::HostFunction(_) => Ok(true),
         }
     }
 }
