@@ -66,6 +66,11 @@ pub enum Stmt {
         name: String,
         args: Vec<Expr>,
     },
+    // Event-driven handler: when <event> { body }
+    When {
+        event: String,
+        body: Vec<Stmt>,
+    },
     // Extend with more statement types as needed
 }
 

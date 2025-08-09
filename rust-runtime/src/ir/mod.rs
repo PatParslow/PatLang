@@ -5,8 +5,10 @@ pub mod types;
 pub mod ops;
 pub mod interpreter;
 pub mod lowering;
+pub mod codegen;
 
 pub use types::*;
 pub use ops::*;
 pub use interpreter::*;
 pub use lowering::*;
+pub use codegen::*;
