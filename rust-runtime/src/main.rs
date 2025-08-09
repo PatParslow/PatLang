@@ -150,7 +150,8 @@ fn main() {
                     let interp_v = {
                         let mut interp = Interpreter::new();
                         // register same hosts as IR mode
-                        interp.host.insert("print", ir_host_print);
+                        // For compare, have print return the printed text so the final value reflects stdout
+                        interp.host.insert("print", ir_host_print_ret);
                         interp.host.insert("sed", ir_host_sed);
                         // emit is a no-op in pure interpreter for this compare path
                         interp.host.insert("emit", |_args| Ok(Value::Unit));
@@ -311,6 +312,18 @@ fn ir_host_print(args: &[Value]) -> Result<Value, String> {
         println!("");
     }
     Ok(Value::Unit)
+}
+
+// Variant used in --compare: also returns the printed text so the interpreter's final value
+// can be compared against the compiled program's stdout.
+fn ir_host_print_ret(args: &[Value]) -> Result<Value, String> {
+    let s = if let Some(arg0) = args.get(0) {
+        display_value(arg0)
+    } else {
+        String::new()
+    };
+    println!("{}", s);
+    Ok(Value::String(s))
 }
 
 fn ir_host_sed(args: &[Value]) -> Result<Value, String> {

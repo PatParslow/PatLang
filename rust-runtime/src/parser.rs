@@ -80,14 +80,9 @@ impl<'a> Parser<'a> {
             }
 
             // If the next token can start a statement but we didn't see any separator,
-            // require either a newline or a semicolon between statements on the same line.
-            if self.can_start_statement() && !saw_sep && !saw_nl {
-                return Err(ParserError::ExpectedToken {
-                    expected: "statement separator",
-                    line: self.line_no,
-                    hint: "Add ';' or a newline between statements",
-                });
-            }
+            // be tolerant and allow implicit separation (native .patlang often omits explicit separators).
+            // Previously this returned an error; we now continue parsing.
+            let _ = (saw_sep, saw_nl);
 
             // Otherwise, continue; any non-statement-start here is an error (handled at next parse attempt)
         }
@@ -100,6 +95,35 @@ impl<'a> Parser<'a> {
             Token::Fn => self.parse_function(),
             Token::Return => self.parse_return(),
             Token::If => self.parse_if(),
+            // Native DSL: handle 'goal' and 'rule' tokens directly and skip their bodies/lines.
+            Token::Goal => {
+                // consume 'goal' and skip until matching block if present, or to line end/dot
+                self.advance()?;
+                // consume until '{' or '.' or newline/EOF
+                while !matches!(self.curr, Token::BlockStart | Token::Dot | Token::Newline | Token::EOF) {
+                    self.advance()?;
+                }
+                if matches!(self.curr, Token::BlockStart) {
+                    // Skip the goal's brace block
+                    self.skip_brace_block()?;
+                }
+                // If we see a trailing '.', consume it
+                if matches!(self.curr, Token::Dot) { self.advance()?; }
+                Ok(Stmt::ExprStmt(Expr::String(String::new())))
+            }
+            Token::Rule => {
+                // consume 'rule' and skip until terminating '.' (may span multiple lines); skip any brace blocks
+                self.advance()?;
+                loop {
+                    match self.curr {
+                        Token::EOF => break,
+                        Token::Dot => { self.advance()?; break; },
+                        Token::BlockStart => { self.skip_brace_block()?; },
+                        _ => { self.advance()?; }
+                    }
+                }
+                Ok(Stmt::ExprStmt(Expr::String(String::new())))
+            }
             // identifier assignment: name = expr (but not member assignment)
             Token::Identifier(_) if matches!(self.peek, Token::Equal) => self.parse_assignment(),
             _ => {
@@ -150,6 +174,13 @@ impl<'a> Parser<'a> {
                     // Reasoning mode on/off: skip rest of line
                     if curr_ident == "reasoning" {
                         while !matches!(self.curr, Token::Newline | Token::EOF) { self.advance()?; }
+                        return Ok(Stmt::ExprStmt(Expr::String(String::new())));
+                    }
+                    // Skip 'constrain X :: Y where { ... }' spec blocks used in native self-hosting files
+                    if curr_ident == "constrain" {
+                        // consume until a '{', then skip the brace block; otherwise skip to end of line
+                        while !matches!(self.curr, Token::BlockStart | Token::Newline | Token::EOF) { self.advance()?; }
+                        if matches!(self.curr, Token::BlockStart) { self.skip_brace_block()?; }
                         return Ok(Stmt::ExprStmt(Expr::String(String::new())));
                     }
                     // pursue ... : skip rest of line
@@ -216,6 +247,18 @@ impl<'a> Parser<'a> {
                     if curr_ident == "while" {
                         // consume until we find an Identifier("end")
                         self.skip_until_ident("end")?;
+                        return Ok(Stmt::ExprStmt(Expr::String(String::new())));
+                    }
+                    // Label-style lines inside DSL blocks: precondition:, postcondition:, strategy:, etc.
+                    // If we see Identifier followed by ':', skip to end of line or block separator.
+                    if matches!(self.peek, Token::Colon) {
+                        // consume ident and ':'
+                        self.advance()?; // ident
+                        self.advance()?; // ':'
+                        // skip until newline, '}', or EOF
+                        while !matches!(self.curr, Token::Newline | Token::BlockEnd | Token::EOF) {
+                            self.advance()?;
+                        }
                         return Ok(Stmt::ExprStmt(Expr::String(String::new())));
                     }
                 }
@@ -290,7 +333,8 @@ impl<'a> Parser<'a> {
                 return Ok(Some(Stmt::ExprStmt(Expr::String(String::new()))));
             }
         } else if kind_is_function {
-            // Attempt to parse inline: optional 'takes' params, then 'returns' expr, ending with 'end'
+            // Attempt to parse inline form: optional 'takes' params, optional 'returns <var>' hint,
+            // then a sequence of statements ending at 'end'.
             let mut params: Vec<String> = Vec::new();
             // optional 'takes'
             if let Token::Identifier(ref s) = self.curr { if s == "takes" { self.advance()?; } }
@@ -304,25 +348,41 @@ impl<'a> Parser<'a> {
                     _ => break,
                 }
             }
-            // optional 'returns'
-            let mut body: Vec<Stmt> = Vec::new();
-            if let Token::Identifier(ref s) = self.curr { if s == "returns" { self.advance()?; } }
-            // try to parse an expression for return until we hit 'end'
-            // allow multi-line expression; stop on Identifier("end") or EOF
-            if !matches!(self.curr, Token::Identifier(_)) {
-                // nothing to return
+            // optional 'returns <var>' hint
+            let mut return_hint: Option<String> = None;
+            if let Token::Identifier(ref s) = self.curr { if s == "returns" { self.advance()?; }
+                if let Token::Identifier(var) = &self.curr {
+                    return_hint = Some(var.clone());
+                    self.advance()?;
+                }
             }
-            // Save parser state and attempt expression parse; if it fails, skip to 'end'
-            let ret_expr = self.parse_expression(0).ok();
-            if let Some(expr) = ret_expr { body.push(Stmt::Return(Some(expr))); }
-            // consume until 'end'
-            while let Token::Identifier(ref s) = self.curr { if s == "end" { break; } else { self.advance()?; } }
-            if let Token::Identifier(ref s) = self.curr { if s == "end" { self.advance()?; } }
+            // Parse statements until we encounter Identifier("end")
+            let mut body: Vec<Stmt> = Vec::new();
+            loop {
+                // stop on 'end' or EOF
+                if let Token::Identifier(ref t) = self.curr { if t == "end" { self.advance()?; break; } }
+                if matches!(self.curr, Token::EOF) { break; }
+                self.consume_newlines()?;
+                if matches!(self.curr, Token::Identifier(_)|Token::Let|Token::Fn|Token::If|Token::Return|Token::Number(_)|Token::String(_)|Token::LParen|Token::BlockStart) {
+                    let st = self.parse_statement()?;
+                    body.push(st);
+                } else {
+                    // advance to avoid infinite loop
+                    self.advance()?;
+                }
+                self.consume_newlines()?;
+            }
+            // If a return hint was provided and no explicit return found, append it as final return
+            if let Some(var) = return_hint {
+                let has_return = body.iter().any(|s| matches!(s, Stmt::Return(_)));
+                if !has_return {
+                    body.push(Stmt::Return(Some(Expr::Identifier(var))));
+                }
+            }
             return Ok(Some(Stmt::Function { name, params, body }));
         } else if kind_is_template {
             // Inline template: skip to 'end'
-            while let Token::Identifier(ref s) = self.curr { if s == "end" { break; } else { self.advance()?; } }
-            if let Token::Identifier(ref s) = self.curr { if s == "end" { self.advance()?; } }
+            self.skip_until_ident("end")?;
             return Ok(Some(Stmt::ExprStmt(Expr::String(String::new()))));
         }
         // If none matched, fall back to None
@@ -489,14 +549,8 @@ impl<'a> Parser<'a> {
             if matches!(self.curr, Token::BlockEnd | Token::EOF) { break; }
 
             // If the next token can start a statement but we didn't see any separator,
-            // require either a newline or a semicolon between statements on the same line.
-            if self.can_start_statement() && !saw_sep && !saw_nl {
-                return Err(ParserError::ExpectedToken {
-                    expected: "statement separator",
-                    line: self.line_no,
-                    hint: "Add ';' or a newline between statements",
-                });
-            }
+            // be tolerant within blocks as well (native .patlang style).
+            let _ = (saw_sep, saw_nl);
         }
         self.expect(Token::BlockEnd, "'}' to close block", "Close the block with '}'" )?;
         Ok(body)
@@ -554,7 +608,7 @@ impl<'a> Parser<'a> {
                 loop {
                     // stop on else/end/EOF
                     match &self.curr {
-                        Token::Identifier(t) if t == "else" => break,
+                        Token::Else => break,
                         Token::Identifier(t) if t == "end" => break,
                         Token::EOF => break,
                         _ => {}
@@ -571,7 +625,7 @@ impl<'a> Parser<'a> {
                     self.consume_newlines()?;
                 }
                 // optional else
-                let else_branch = if let Token::Identifier(ref e) = self.curr { if e == "else" {
+                let else_branch = if matches!(self.curr, Token::Else) {
                     self.advance()?; // consume 'else'
                     let mut else_body: Vec<Stmt> = Vec::new();
                     loop {
@@ -587,7 +641,7 @@ impl<'a> Parser<'a> {
                         self.consume_newlines()?;
                     }
                     Some(else_body)
-                } else { None } } else { None };
+                } else { None };
                 // require 'end'
                 if let Token::Identifier(ref endkw) = self.curr { if endkw == "end" { self.advance()?; } }
                 return Ok(Stmt::If { cond, then_branch, else_branch });
@@ -635,6 +689,7 @@ impl<'a> Parser<'a> {
                 Token::Slash => (BinaryOperator::Div, 20, 21),
                 Token::Percent => (BinaryOperator::Mod, 20, 21),
                 Token::EqualEqual => (BinaryOperator::Equal, 5, 6),
+                Token::Equal => (BinaryOperator::Equal, 5, 6),
                 Token::Greater => (BinaryOperator::Greater, 7, 8),
                 Token::GreaterEqual => (BinaryOperator::GreaterEqual, 7, 8),
                 Token::Less => (BinaryOperator::Less, 7, 8),
@@ -740,6 +795,22 @@ impl<'a> Parser<'a> {
                     }
                     self.expect(Token::RParen, ")' after arguments", "Close the call with ')'" )?;
                     expr = Expr::Call { function: Box::new(expr), args };
+                }
+                Token::BlockStart => {
+                    // Treat a trailing '{ ... }' as an implicit closure block. If expr is a call,
+                    // append the closure as the last argument; otherwise, produce a Closure expr.
+                    self.advance()?; // consume '{'
+                    let block_body = self.parse_block()?;
+                    let closure = Expr::Closure { params: vec![], body: block_body };
+                    match expr {
+                        Expr::Call { function, mut args } => {
+                            args.push(closure);
+                            expr = Expr::Call { function, args };
+                        }
+                        _ => {
+                            expr = closure;
+                        }
+                    }
                 }
                 Token::Dot => {
                     // Only treat as member access if next token is an identifier; otherwise it's a terminator (e.g., facts)
