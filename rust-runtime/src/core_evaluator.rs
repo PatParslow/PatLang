@@ -266,10 +266,11 @@ impl<'a> CoreEvaluator<'a> {
                 // Evaluate args once
                 let mut eval_args: Vec<String> = Vec::with_capacity(args.len());
                 for a in args { eval_args.push(self.execute_node(a)?); }
-                // Special-case: emit(event_name) triggers registered when-handlers
+                // Special-case: emit(event_name[, payload]) triggers registered when-handlers
                 if name == "emit" {
                     if let Some(ev) = eval_args.get(0) {
-                        return self.emit_event(ev);
+                        let payload = eval_args.get(1).cloned();
+                        return self.emit_event(ev, payload);
                     } else {
                         return Ok(String::new());
                     }
@@ -621,14 +622,19 @@ impl<'a> CoreEvaluator<'a> {
         Ok(true)
     }
 
-    // Emit an event by name: run all registered handlers sequentially.
-    fn emit_event(&mut self, event: &str) -> Result<String, RuntimeError> {
-    if let Some(handlers) = self.context.event_handlers.get(event).cloned() {
+    // Emit an event by name: run all registered handlers sequentially, binding payload.
+    fn emit_event(&mut self, event: &str, payload: Option<String>) -> Result<String, RuntimeError> {
+        if let Some(handlers) = self.context.event_handlers.get(event).cloned() {
             let mut last = String::new();
             for body in handlers {
+                // Execute each handler body in its own lexical scope with bound variables
+                self.context.push_scope();
+                self.context.set_var("event_name", event.to_string());
+                if let Some(p) = &payload { self.context.set_var("event_data", p.clone()); }
                 for n in body {
                     last = self.execute_node(&n)?;
                 }
+                self.context.pop_scope();
             }
             Ok(last)
         } else {

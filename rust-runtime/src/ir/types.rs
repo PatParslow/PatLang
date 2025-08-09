@@ -89,4 +89,6 @@ pub struct Function {
 pub struct Program {
     pub functions: HashMap<String, Function>,
     pub entry: String,
+    // Event name -> handler function names
+    pub event_handlers: HashMap<String, Vec<String>>,
 }

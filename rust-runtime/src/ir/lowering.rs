@@ -34,6 +34,25 @@ impl Lowerer {
                 self.known_locals = saved_locals; // restore
             }
         }
+    // Synthesize event handlers for when-blocks at top-level
+        let mut handler_counter: usize = 0;
+        for s in stmts {
+            if let Stmt::When { event, body } = s {
+                handler_counter += 1;
+                let hname = format!("__when_{}_{}", event, handler_counter);
+                // Lower body into a standalone function with params 'event_name', 'event_data'
+                let mut hf = Function { name: hname.clone(), params: vec!["event_name".into(), "event_data".into()], ..Default::default() };
+                // Use a fresh locals set and seed with param names so they can be referenced safely
+                let saved = std::mem::take(&mut self.known_locals);
+                self.known_locals.insert("event_name".into());
+                self.known_locals.insert("event_data".into());
+                for st in body { self.lower_stmt(st, &mut hf); }
+                hf.body.push(Instr::Return);
+                program.functions.insert(hname.clone(), hf);
+                program.event_handlers.entry(event.clone()).or_default().push(hname);
+                self.known_locals = saved;
+            }
+        }
         // Second pass: lower top-level statements into main
         for s in stmts {
             if !matches!(s, Stmt::Function { .. }) {
@@ -111,7 +130,7 @@ impl Lowerer {
     fn is_allowed_host(&self, name: &str) -> bool {
         matches!(name,
             "print"|"add"|"multiply"|"subtract"|"max"|"min"|"calculate"|"calculate_result"|
-            "get_value"|"process"|"validate"|"len"|"get"|"send"
+            "get_value"|"process"|"validate"|"len"|"get"|"send"|"emit"|"sed"
         )
     }
 

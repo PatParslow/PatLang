@@ -60,9 +60,17 @@ pub enum LexerError {
     // Extend with more error types as needed
 }
 
+macro_rules! lex_debug {
+    ($($arg:tt)*) => {{
+        if std::env::var("PATLANG_LEXER_DEBUG").map(|v| v == "1").unwrap_or(false) {
+            eprintln!($($arg)*);
+        }
+    }};
+}
+
 impl<'a> Lexer<'a> {
     pub fn new(input: &'a str) -> Self {
-        println!("[DEBUG] Lexer::new called with input:\n{}", input);
+        lex_debug!("[DEBUG] Lexer::new called with input:\n{}", input);
         Lexer { input, position: 0 }
     }
 
@@ -71,7 +79,7 @@ impl<'a> Lexer<'a> {
         let len = bytes.len();
         while self.position < len {
             let c = bytes[self.position] as char;
-            println!("[DEBUG][lexer] At position {}: char {:?}", self.position, c);
+            lex_debug!("[DEBUG][lexer] At position {}: char {:?}", self.position, c);
 
             // Recognize '.' as Dot token
             if c == '.' {
@@ -105,7 +113,7 @@ impl<'a> Lexer<'a> {
             // Newline as statement separator
             if c == '\n' {
                 self.position += 1;
-                println!("[DEBUG][lexer] Returning Token::Newline");
+                lex_debug!("[DEBUG][lexer] Returning Token::Newline");
                 return Ok(Token::Newline);
             }
             // Skip whitespace (except newline)
@@ -128,7 +136,7 @@ impl<'a> Lexer<'a> {
                 }
                 let num_str = &self.input[start..self.position];
                 let num = num_str.parse::<f64>().unwrap_or(0.0);
-                println!("[DEBUG][lexer] Returning Token::Number({})", num);
+                lex_debug!("[DEBUG][lexer] Returning Token::Number({})", num);
                 return Ok(Token::Number(num));
             }
             // Identifiers and keywords (allow trailing '?' like any?)
@@ -144,7 +152,7 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 let ident = &self.input[start..self.position];
-                println!("[DEBUG][lexer] Returning Token::Identifier({})", ident);
+                lex_debug!("[DEBUG][lexer] Returning Token::Identifier({})", ident);
                 return Ok(match ident {
                     "let" => Token::Let,
                     "fn" => Token::Fn,
@@ -182,7 +190,7 @@ impl<'a> Lexer<'a> {
                 let s = &self.input[start..self.position];
                 if self.position < len && bytes[self.position] as char == '"' {
                     self.position += 1;
-                    println!("[DEBUG][lexer] Returning Token::String({})", s);
+                    lex_debug!("[DEBUG][lexer] Returning Token::String({})", s);
                     return Ok(Token::String(s.to_string()));
                 } else {
                     return Err(LexerError::UnterminatedString(self.position));
@@ -229,10 +237,10 @@ impl<'a> Lexer<'a> {
                 },
                 _ => Token::EOF,
             };
-            println!("[DEBUG][lexer] Returning {:?}", token);
+            lex_debug!("[DEBUG][lexer] Returning {:?}", token);
             return Ok(token);
         }
-        println!("[DEBUG][lexer] Returning Token::EOF");
+        lex_debug!("[DEBUG][lexer] Returning Token::EOF");
         Ok(Token::EOF)
     }
 }
