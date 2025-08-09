@@ -24,7 +24,17 @@ fn main() {
         }
     };
     match core_evaluator::evaluate_patlang_source(&source) {
-        Ok(result) => println!("{}", result.message),
+        Ok(result) => {
+            println!("{}", result.message);
+            // crude keepalive: if runtime requested, sleep loop
+            if let Some(keep) = result.objects.iter().find(|(n, _)| n == "__runtime") {
+                let has = keep.1.iter().any(|(k, v)| k == "keepalive" && v == "true");
+                if has {
+                    println!("WebServer running. Press Ctrl+C to stop.");
+                    loop { std::thread::sleep(std::time::Duration::from_secs(3600)); }
+                }
+            }
+        },
         Err(err) => {
             eprintln!("{}", err.message);
             process::exit(1);

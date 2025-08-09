@@ -257,3 +257,75 @@ pub fn on_event(event: &crate::event_system::Event) {
     //     listener.on_event(event);
     // }
 }
+
+// =========================
+// === Concrete Impl: In-memory Policy & Protocol ===
+// =========================
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+/// A simple in-memory security policy that stores node credentials and per-action permissions.
+#[derive(Default)]
+pub struct InMemorySecurityPolicy {
+    nodes: HashMap<String, Vec<u8>>,                         // node_id -> credentials
+    perms: HashMap<(String, String, String), bool>,          // (subject, action, resource) -> allowed
+}
+
+impl InMemorySecurityPolicy {
+    pub fn new() -> Self { Self { nodes: HashMap::new(), perms: HashMap::new() } }
+    /// Register a node's credentials (exact match).
+    pub fn register_node(mut self, node_id: impl Into<String>, credentials: impl Into<Vec<u8>>) -> Self {
+        self.nodes.insert(node_id.into(), credentials.into());
+        self
+    }
+    /// Grant a permission triple.
+    pub fn grant(mut self, subject: impl Into<String>, action: impl Into<String>, resource: impl Into<String>) -> Self {
+        self.perms.insert((subject.into(), action.into(), resource.into()), true);
+        self
+    }
+    /// Revoke a permission triple.
+    pub fn revoke(mut self, subject: impl Into<String>, action: impl Into<String>, resource: impl Into<String>) -> Self {
+        self.perms.insert((subject.into(), action.into(), resource.into()), false);
+        self
+    }
+}
+
+impl SecurityPolicy for InMemorySecurityPolicy {
+    fn authenticate(&self, node_id: &str, credentials: &[u8]) -> Result<bool, crate::error_handler::RuntimeError> {
+        Ok(self.nodes.get(node_id).map(|c| c.as_slice() == credentials).unwrap_or(false))
+    }
+    fn authorize(&self, subject: &str, action: &str, resource: &str) -> Result<bool, crate::error_handler::RuntimeError> {
+        Ok(*self.perms.get(&(subject.to_string(), action.to_string(), resource.to_string())).unwrap_or(&false))
+    }
+}
+
+/// A local protocol that records deployments and executions in memory (for tests/demo).
+#[derive(Default, Clone)]
+pub struct LocalDistributedProtocol {
+    deployments: Arc<Mutex<HashMap<String, Vec<Vec<u8>>>>>, // node_id -> list of code blobs
+    executions: Arc<Mutex<Vec<(String, Vec<u8>)>>>,          // (node_id, payload)
+}
+
+impl LocalDistributedProtocol {
+    pub fn new() -> Self { Self::default() }
+    pub fn deployments_for(&self, node_id: &str) -> Vec<Vec<u8>> {
+        self.deployments.lock().unwrap().get(node_id).cloned().unwrap_or_default()
+    }
+    pub fn execution_count(&self) -> usize { self.executions.lock().unwrap().len() }
+}
+
+impl DistributedProtocol for LocalDistributedProtocol {
+    fn deploy(&self, code_package: &[u8], target_nodes: &[String]) -> Result<(), crate::error_handler::RuntimeError> {
+        let mut dep = self.deployments.lock().unwrap();
+        for n in target_nodes {
+            dep.entry(n.clone()).or_default().push(code_package.to_vec());
+        }
+        Ok(())
+    }
+    fn execute(&self, node_id: &str, payload: &[u8]) -> Result<Vec<u8>, crate::error_handler::RuntimeError> {
+        self.executions.lock().unwrap().push((node_id.to_string(), payload.to_vec()));
+        // Echo response to demonstrate a round-trip
+        Ok(payload.to_vec())
+    }
+}

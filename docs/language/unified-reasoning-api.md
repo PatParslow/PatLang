@@ -682,4 +682,33 @@ define_predicate(distance) {
 }
 ```
 
+### Built-in Function and Object Method Registries
+
+Patlang’s runtime exposes two extensibility points that keep the evaluator generic while enabling rich behavior through pluggable handlers:
+
+- Function built-ins registry
+  - Dispatches plain function calls by name.
+  - Current built-ins include:
+    - new(class, id) → ensures an object exists in the store
+    - infer_type_for(predicate, position, class) → registers type inference based on logic query results
+    - contract(signature, argType1, argType2, ...) → declares argument contracts for calls (e.g., "Person.set")
+    - fact(name, a, b, ...) → asserts a logic fact
+    - query(name, a, b, ...) → runs a logic query and records results; also triggers type inference hooks
+    - goal(description | object) → records a goal for inspection
+  - Arguments are evaluated before dispatch; declared contracts are enforced on these evaluated values.
+
+- Object method registry
+  - Dispatches member calls obj.method(...) using class-aware lookup with fallback to a global (any-class) handler.
+  - Default methods provided out of the box:
+    - set(key, value) → set a property on the object
+    - get(key) → retrieve a property
+    - infer_relations() → derive relation-based flags from facts (e.g., has_parent via parent(_, obj))
+    - infer_is_adult() → simple example that sets is_adult if age >= 18
+  - Per-class overrides are supported; if no class-specific handler is found, the any-class handler is used.
+
+Implementation notes (runtime):
+- The evaluator pre-evaluates call arguments, performs contract checks, then delegates to the function/method registries.
+- Logic query results flow through a type inference integration that can refine object classes in the object store.
+- These registries are designed to be extended without changing the evaluator, allowing domain features to live outside core execution.
+
 This API specification provides a comprehensive interface for working with Patlang's unified reasoning systems while maintaining compatibility with the existing object-oriented foundation and event-driven architecture.

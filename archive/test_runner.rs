@@ -20,7 +20,7 @@ fn main() {
     for entry in entries {
         let entry = entry.unwrap();
         let path = entry.path();
-        if path.extension().map(|ext| ext == "patlang").unwrap_or(false) {
+        if path.extension().map(|ext| ext == "patlang" || ext == "pat").unwrap_or(false) {
             total += 1;
             let filename = path.display().to_string();
             let source = match fs::read_to_string(&path) {

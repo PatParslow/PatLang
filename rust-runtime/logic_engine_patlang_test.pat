@@ -1,0 +1,5 @@
+# Patlang logic engine test: parent(alice, bob) and query parent(alice, X)
+
+fact parent(alice, bob).
+
+query parent(alice, X).

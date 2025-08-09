@@ -13,15 +13,29 @@ pub enum Token {
     LParen,
     RParen,
     Comma,
+    Semicolon,
+    Dot, // Added for fact/query termination
+    Colon,
+    Pipe,
+    // Combined pipeline operator '|>'
+    PipeGreater,
+    LBracket,
+    RBracket,
     Let,
     Fn,
     Return,
+    If,
+    Else,
+    Elif,
     Equal,
     EqualEqual,
     Greater,
     GreaterEqual,
     Less,
     LessEqual,
+    And,
+    Or,
+    Not,
     Newline,
     EOF,
     // Patlang-specific tokens
@@ -32,14 +46,14 @@ pub enum Token {
     // Extend with more tokens as needed
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Lexer<'a> {
     input: &'a str,
     position: usize,
     // Add more fields as needed
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum LexerError {
     UnexpectedCharacter(char, usize),
     UnterminatedString(usize),
@@ -58,6 +72,36 @@ impl<'a> Lexer<'a> {
         while self.position < len {
             let c = bytes[self.position] as char;
             println!("[DEBUG][lexer] At position {}: char {:?}", self.position, c);
+
+            // Recognize '.' as Dot token
+            if c == '.' {
+                self.position += 1;
+                return Ok(Token::Dot);
+            }
+            // Recognize ':' as Colon token
+            if c == ':' {
+                self.position += 1;
+                return Ok(Token::Colon);
+            }
+            // Recognize pipeline '|>' or standalone '|'
+            if c == '|' {
+                if self.position + 1 < len && bytes[self.position + 1] as char == '>' {
+                    self.position += 2;
+                    return Ok(Token::PipeGreater);
+                } else {
+                    self.position += 1;
+                    return Ok(Token::Pipe);
+                }
+            }
+            // Recognize '[' and ']'
+            if c == '[' {
+                self.position += 1;
+                return Ok(Token::LBracket);
+            }
+            if c == ']' {
+                self.position += 1;
+                return Ok(Token::RBracket);
+            }
             // Newline as statement separator
             if c == '\n' {
                 self.position += 1;
@@ -87,13 +131,13 @@ impl<'a> Lexer<'a> {
                 println!("[DEBUG][lexer] Returning Token::Number({})", num);
                 return Ok(Token::Number(num));
             }
-            // Identifiers and keywords
-            if c.is_ascii_alphabetic() || c == '_' {
+            // Identifiers and keywords (allow trailing '?' like any?)
+        if c.is_ascii_alphabetic() || c == '_' {
                 let start = self.position;
                 self.position += 1;
                 while self.position < len {
                     let nc = bytes[self.position] as char;
-                    if nc.is_ascii_alphanumeric() || nc == '_' {
+            if nc.is_ascii_alphanumeric() || nc == '_' || nc == '?' {
                         self.position += 1;
                     } else {
                         break;
@@ -105,10 +149,16 @@ impl<'a> Lexer<'a> {
                     "let" => Token::Let,
                     "fn" => Token::Fn,
                     "return" => Token::Return,
+                    "if" => Token::If,
+                    "else" => Token::Else,
+                    "elif" => Token::Elif,
                     "goal" => Token::Goal,
                     "rule" => Token::Rule,
+                    "and" => Token::And,
+                    "or" => Token::Or,
+                    "not" => Token::Not,
                     "true" | "false" => Token::Identifier(ident.to_string()), // treat as identifier for now
-                    "not" | "and" | "or" | "print" => Token::Identifier(ident.to_string()),
+                    "print" => Token::Identifier(ident.to_string()),
                     _ => Token::Identifier(ident.to_string()),
                 });
             }
@@ -149,6 +199,7 @@ impl<'a> Lexer<'a> {
                 '(' => Token::LParen,
                 ')' => Token::RParen,
                 ',' => Token::Comma,
+                ';' => Token::Semicolon,
                 '=' => {
                     // Check for ==
                     if self.position < len && bytes[self.position] as char == '=' {
