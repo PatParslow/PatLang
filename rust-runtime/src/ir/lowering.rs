@@ -89,7 +89,8 @@ impl Lowerer {
 
     fn is_allowed_host(&self, name: &str) -> bool {
         matches!(name,
-            "print"|"add"|"multiply"|"subtract"|"max"|"min"|"calculate"|"calculate_result"
+            "print"|"add"|"multiply"|"subtract"|"max"|"min"|"calculate"|"calculate_result"|
+            "get_value"|"process"|"validate"
         )
     }
 
