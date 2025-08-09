@@ -50,6 +50,10 @@ fn main() {
     // placeholder demo functions
     interp.host.insert("calculate", |_args| Ok(Value::Number(0.0)));
     interp.host.insert("calculate_result", |_args| Ok(Value::Number(0.0)));
+    // additional stubs used in examples
+    interp.host.insert("get_value", |_args| Ok(Value::Number(0.0)));
+    interp.host.insert("process", |_args| Ok(Value::Bool(true)));
+    interp.host.insert("validate", |_args| Ok(Value::Bool(true)));
     match interp.run(&program) {
             Ok(v) => {
                 println!("{}", display_value(&v));

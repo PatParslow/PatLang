@@ -2,40 +2,41 @@ use super::types::*;
 
 pub fn add(a: &Value, b: &Value) -> Result<Value, String> {
     match (a, b) {
-        (Value::Number(x), Value::Number(y)) => Ok(Value::Number(x + y)),
+        // String concatenation (including mixed types)
         (Value::String(x), Value::String(y)) => Ok(Value::String(format!("{}{}", x, y))),
         (Value::String(x), other) => Ok(Value::String(format!("{}{}", x, v_to_string(other)))),
         (other, Value::String(y)) => Ok(Value::String(format!("{}{}", v_to_string(other), y))),
-        _ => Err("type error in add".into()),
+        // Numeric addition with permissive coercion via as_number (Unit -> 0.0)
+        _ => {
+            let an = a.as_number().map_err(|_| "type error in add".to_string())?;
+            let bn = b.as_number().map_err(|_| "type error in add".to_string())?;
+            Ok(Value::Number(an + bn))
+        }
     }
 }
 
 pub fn sub(a: &Value, b: &Value) -> Result<Value, String> {
-    match (a, b) {
-        (Value::Number(x), Value::Number(y)) => Ok(Value::Number(x - y)),
-        _ => Err("type error in sub".into()),
-    }
+    let an = a.as_number().map_err(|_| "type error in sub".to_string())?;
+    let bn = b.as_number().map_err(|_| "type error in sub".to_string())?;
+    Ok(Value::Number(an - bn))
 }
 
 pub fn mul(a: &Value, b: &Value) -> Result<Value, String> {
-    match (a, b) {
-        (Value::Number(x), Value::Number(y)) => Ok(Value::Number(x * y)),
-        _ => Err("type error in mul".into()),
-    }
+    let an = a.as_number().map_err(|_| "type error in mul".to_string())?;
+    let bn = b.as_number().map_err(|_| "type error in mul".to_string())?;
+    Ok(Value::Number(an * bn))
 }
 
 pub fn div(a: &Value, b: &Value) -> Result<Value, String> {
-    match (a, b) {
-        (Value::Number(x), Value::Number(y)) => Ok(Value::Number(x / y)),
-        _ => Err("type error in div".into()),
-    }
+    let an = a.as_number().map_err(|_| "type error in div".to_string())?;
+    let bn = b.as_number().map_err(|_| "type error in div".to_string())?;
+    Ok(Value::Number(an / bn))
 }
 
 pub fn modu(a: &Value, b: &Value) -> Result<Value, String> {
-    match (a, b) {
-        (Value::Number(x), Value::Number(y)) => Ok(Value::Number(x % y)),
-        _ => Err("type error in mod".into()),
-    }
+    let an = a.as_number().map_err(|_| "type error in mod".to_string())?;
+    let bn = b.as_number().map_err(|_| "type error in mod".to_string())?;
+    Ok(Value::Number(an % bn))
 }
 
 pub fn cmp(kind: BinOpKind, a: &Value, b: &Value) -> Result<Value, String> {
