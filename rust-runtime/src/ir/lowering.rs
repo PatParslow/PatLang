@@ -104,6 +104,22 @@ impl Lowerer {
                 let after_else = f.body.len();
                 if let Instr::Jump(ref mut tgt) = f.body[jmp_over_idx] { *tgt = after_else; }
             }
+            Stmt::While { cond, body } => {
+                // loop_start:
+                let loop_start = f.body.len();
+                // evaluate condition
+                self.lower_expr(cond, f);
+                // if false -> jump to after loop
+                let jif_idx = f.body.len();
+                f.body.push(Instr::JumpIfFalse(usize::MAX));
+                // body
+                for s in body { self.lower_stmt(s, f); }
+                // jump back to loop_start
+                f.body.push(Instr::Jump(loop_start));
+                // patch JumpIfFalse to after body
+                let after = f.body.len();
+                if let Instr::JumpIfFalse(ref mut tgt) = f.body[jif_idx] { *tgt = after; }
+            }
             _ => {
                 // unsupported yet: ignore safely
             }

@@ -8,6 +8,12 @@ use crate::runtime_integration::on_query_results;
 
 // We reuse the evaluator's ExecutionContext type to avoid large refactors right now.
 use crate::core_evaluator::ExecutionContext;
+use std::path::{Path, PathBuf};
+
+// IR pipeline pieces used by patc built-ins
+use crate::parser::Parser as Stage0Parser;
+use crate::ir::{Lowerer, RustCodegen};
+use crate::ast::{Expr, Stmt};
 
 /// Handle a built-in function call by name.
 /// - `name`: function name like "new", "fact", "query", "goal", etc.
@@ -19,6 +25,104 @@ pub fn handle_function(
     eval_args: &[String],
 ) -> Option<Result<String, RuntimeError>> {
     match name {
+        // Map helpers for interchange (tokens/AST as maps)
+        "map_new" => {
+            let id = format!("__map_{}", ctx.counters.entry("map".into()).and_modify(|c| *c += 1).or_insert(1usize));
+            let _ = ctx.object_store.ensure(&id, "Map");
+            Some(Ok(id))
+        }
+        "map_set" => {
+            if eval_args.len() != 3 { return Some(Ok(String::new())); }
+            let id = &eval_args[0];
+            let key = &eval_args[1];
+            let val = &eval_args[2];
+            ctx.object_store.set(id, key, val.clone());
+            Some(Ok(id.clone()))
+        }
+        // Lower a minimal AST-shape (maps/lists) and compile to an exe; returns canonical path
+        // Schema supported (subset):
+        // Program { type:"Program", stmts: <list_id> }
+        // Print stmt: { type:"Print", expr: <expr_id> }
+        // String expr: { type:"String", value: <string> }
+        "lower_and_compile" => {
+            if eval_args.is_empty() { return Some(Ok(String::new())); }
+            let prog_id = &eval_args[0];
+            let out_opt = eval_args.get(1).cloned();
+            Some(lower_and_compile_impl(ctx, prog_id, out_opt))
+        }
+        // Minimal native patc: compile a .patlang file to a native executable using the Stage 0 backend.
+        // Usage: patc_compile(input_path[, out_path]) -> canonical exe path (string) or empty on error
+        "patc_compile" => {
+            let in_path = eval_args.get(0).cloned().unwrap_or_default();
+            let out_opt = eval_args.get(1).cloned();
+            Some(patc_compile_impl(&in_path, out_opt))
+        }
+        // Variant that reads args from the current process argv:
+        // patc_compile_from_argv() -> canonical exe path
+        "patc_compile_from_argv" => {
+            let mut args: Vec<String> = std::env::args().collect();
+            // Expect: bin [--patc] <input> [--out <path>]
+            // Find first non-flag as input, unless it's --patc then skip to next
+            let mut input: Option<String> = None;
+            let mut out: Option<String> = None;
+            let mut i = 1usize;
+            while i < args.len() {
+                let s = &args[i];
+                if s == "--out" {
+                    if i+1 < args.len() { out = Some(args[i+1].clone()); i += 2; continue; } else { break; }
+                }
+                if s == "--patc" || s == "--emit-rust" || s == "--build-run" || s == "--ir-run" || s == "--compare" {
+                    i += 1; continue;
+                }
+                if !s.starts_with('-') && input.is_none() { input = Some(s.clone()); i += 1; continue; }
+                i += 1;
+            }
+            let inp = input.unwrap_or_default();
+            Some(patc_compile_impl(&inp, out))
+        }
+        // Access argv as a list id (excluding program name)
+        "get_argv" => {
+            let mut argv: Vec<String> = std::env::args().collect();
+            if !argv.is_empty() { argv.remove(0); }
+            let id = format!("__list_{}", ctx.lists.len()+1);
+            ctx.lists.insert(id.clone(), argv);
+            Some(Ok(id))
+        }
+        // List helpers for simple CLI parsing in patlang
+        "list_len" => {
+            let lid = eval_args.get(0).cloned().unwrap_or_default();
+            let n = ctx.lists.get(&lid).map(|v| v.len()).unwrap_or(0);
+            Some(Ok(n.to_string()))
+        }
+        "list_get" => {
+            if eval_args.len() != 2 { return Some(Ok(String::new())); }
+            let lid = &eval_args[0];
+            let idx = eval_args[1].parse::<usize>().unwrap_or(0);
+            let s = ctx.lists.get(lid).and_then(|v| v.get(idx).cloned()).unwrap_or_default();
+            Some(Ok(s))
+        }
+        // Read a file as string
+        "read_file" => {
+            let path = eval_args.get(0).cloned().unwrap_or_default();
+            match std::fs::read_to_string(&path) {
+                Ok(s) => Some(Ok(s)),
+                Err(e) => Some(Err(RuntimeError::new(
+                    crate::error_handler::RuntimeErrorKind::CoreEvaluator,
+                    format!("read_file: {}", e),
+                ))),
+            }
+        }
+        // Parse a tiny subset of patlang and return a Program map id
+        // Supports lines:
+        //   let name = 123
+        //   let name = "string"
+        //   let name = other
+        //   print("string")
+        //   print(name)
+        "parse_tiny_source" => {
+            let path = eval_args.get(0).cloned().unwrap_or_default();
+            Some(parse_tiny_source_impl(ctx, &path))
+        }
         "build_dependency_graph" => {
             // args[0] is a list id of targets; create a graph object and attach nodes property
             let list_id = eval_args.get(0).cloned().unwrap_or_default();
@@ -378,3 +482,703 @@ fn register_defaults() -> MethodRegistry {
 
 // Ensure registry is initialized
 fn registry() -> &'static MethodRegistry { METHOD_REGISTRY.get_or_init(register_defaults) }
+
+// --- Helpers ---
+
+fn patc_compile_impl(in_path: &str, out_opt: Option<String>) -> Result<String, RuntimeError> {
+    if in_path.is_empty() {
+        return Err(RuntimeError::new(
+            crate::error_handler::RuntimeErrorKind::CoreEvaluator,
+            "patc_compile: missing input path",
+        ));
+    }
+    let src = std::fs::read_to_string(in_path).map_err(|e| RuntimeError::new(
+        crate::error_handler::RuntimeErrorKind::CoreEvaluator,
+        format!("patc_compile: read '{}': {}", in_path, e),
+    ))?;
+    // Parse → Lower → Emit Rust
+    let mut parser = Stage0Parser::new(&src).map_err(|e| RuntimeError::new(
+        crate::error_handler::RuntimeErrorKind::CoreEvaluator,
+        format!("patc_compile: parse init error: {:?}", e),
+    ))?;
+    let ast = parser.parse().map_err(|e| RuntimeError::new(
+        crate::error_handler::RuntimeErrorKind::CoreEvaluator,
+        format!("patc_compile: parse error: {:?}", e),
+    ))?;
+    let mut lower = Lowerer::new();
+    let program = lower.lower_program_basic(&ast);
+    let cg = RustCodegen::new();
+    let rust_src = cg.emit_rust(&program);
+
+    // Prepare output path
+    let in_p = Path::new(in_path);
+    let dest: PathBuf = if let Some(out) = out_opt {
+        PathBuf::from(out)
+    } else {
+        let stem = in_p.file_stem().and_then(|s| s.to_str()).unwrap_or("a");
+        let parent = in_p.parent().unwrap_or_else(|| Path::new("."));
+        let mut out = parent.join(stem);
+        if cfg!(windows) { out.set_extension("exe"); }
+        out
+    };
+    if let Some(par) = dest.parent() { let _ = std::fs::create_dir_all(par); }
+
+    // Write temp rust src and invoke rustc
+    let mut tmp = std::env::temp_dir();
+    tmp.push("patlang_emit_native");
+    let _ = std::fs::create_dir_all(&tmp);
+    let src_path = tmp.join("generated_main.rs");
+    std::fs::write(&src_path, &rust_src).map_err(|e| RuntimeError::new(
+        crate::error_handler::RuntimeErrorKind::CoreEvaluator,
+        format!("patc_compile: write {}: {}", src_path.display(), e),
+    ))?;
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let status = std::process::Command::new(&rustc)
+        .arg("-O")
+        .arg(&src_path)
+        .arg("-o")
+        .arg(&dest)
+        .status()
+        .map_err(|e| RuntimeError::new(
+            crate::error_handler::RuntimeErrorKind::CoreEvaluator,
+            format!("patc_compile: failed to run rustc: {}", e),
+        ))?;
+    if !status.success() {
+        return Err(RuntimeError::new(
+            crate::error_handler::RuntimeErrorKind::CoreEvaluator,
+            format!("patc_compile: rustc failed with status {}", status),
+        ));
+    }
+    let abs = std::fs::canonicalize(&dest).unwrap_or(dest);
+    Ok(abs.display().to_string())
+}
+
+fn lower_and_compile_impl(ctx: &mut ExecutionContext, program_id: &str, out_opt: Option<String>) -> Result<String, RuntimeError> {
+    // Decode Program
+    let p_type = ctx.object_store.get(program_id, "type").unwrap_or_default();
+    if p_type != "Program" { return Err(RuntimeError::new(crate::error_handler::RuntimeErrorKind::CoreEvaluator, "lower_and_compile: root.type != Program")); }
+    let stmts_list = ctx.object_store.get(program_id, "stmts").unwrap_or_default();
+    let mut stmts: Vec<Stmt> = Vec::new();
+    if let Some(ids) = ctx.lists.get(&stmts_list).cloned() {
+        for sid in ids {
+            if let Some(t) = ctx.object_store.get(&sid, "type") {
+                match t.as_str() {
+                    "Print" => {
+                        let expr_id = ctx.object_store.get(&sid, "expr").unwrap_or_default();
+                        let expr = decode_expr(ctx, &expr_id)?;
+                        stmts.push(Stmt::ExprStmt(Expr::Call { function: Box::new(Expr::Identifier("print".into())), args: vec![expr] }));
+                    }
+                    "Let" => {
+                        let name = ctx.object_store.get(&sid, "name").unwrap_or_default();
+                        let expr_id = ctx.object_store.get(&sid, "value").unwrap_or_default();
+                        let value = decode_expr(ctx, &expr_id)?;
+                        stmts.push(Stmt::Let { name, value });
+                    }
+                    "Return" => {
+                        let val_id = ctx.object_store.get(&sid, "value").unwrap_or_default();
+                        if val_id.is_empty() {
+                            stmts.push(Stmt::Return(None));
+                        } else {
+                            let v = decode_expr(ctx, &val_id)?;
+                            stmts.push(Stmt::Return(Some(v)));
+                        }
+                    }
+                    // Generic expression statement holder if present: { type:"ExprStmt", expr: <expr_id> }
+                    "ExprStmt" => {
+                        let expr_id = ctx.object_store.get(&sid, "expr").unwrap_or_default();
+                        if !expr_id.is_empty() {
+                            let e = decode_expr(ctx, &expr_id)?;
+                            stmts.push(Stmt::ExprStmt(e));
+                        }
+                    }
+                    // Call statement: { type:"Call", name:"fn", args: <list_id> }
+                    "Call" => {
+                        let e = decode_expr(ctx, &sid)?;
+                        stmts.push(Stmt::ExprStmt(e));
+                    }
+                    "If" => {
+                        let cond_id = ctx.object_store.get(&sid, "cond").unwrap_or_default();
+                        let then_list = ctx.object_store.get(&sid, "then").unwrap_or_default();
+                        let else_list = ctx.object_store.get(&sid, "else");
+                        let cond = decode_expr(ctx, &cond_id)?;
+                        let mut then_stmts: Vec<Stmt> = Vec::new();
+                        if let Some(ids2) = ctx.lists.get(&then_list) {
+                            for tid in ids2 { if let Ok(s) = decode_stmt_like(ctx, tid) { if let Some(st) = s { then_stmts.push(st); } } }
+                        }
+                        let mut else_stmts: Option<Vec<Stmt>> = None;
+                        if let Some(el) = else_list {
+                            if let Some(ids3) = ctx.lists.get(&el) {
+                                let mut es: Vec<Stmt> = Vec::new();
+                                for eid in ids3 { if let Ok(s) = decode_stmt_like(ctx, eid) { if let Some(st) = s { es.push(st); } } }
+                                else_stmts = Some(es);
+                            }
+                        }
+                        stmts.push(Stmt::If { cond, then_branch: then_stmts, else_branch: else_stmts });
+                    }
+                    "While" => {
+                        let cond_id = ctx.object_store.get(&sid, "cond").unwrap_or_default();
+                        let body_list = ctx.object_store.get(&sid, "body").unwrap_or_default();
+                        let cond = decode_expr(ctx, &cond_id)?;
+                        let mut body_stmts: Vec<Stmt> = Vec::new();
+                        if let Some(ids2) = ctx.lists.get(&body_list) {
+                            for tid in ids2 { if let Ok(s) = decode_stmt_like(ctx, tid) { if let Some(st) = s { body_stmts.push(st); } } }
+                        }
+                        stmts.push(Stmt::While { cond, body: body_stmts });
+                    }
+                    _ => { /* ignore unsupported */ }
+                }
+            }
+        }
+    }
+    // Lower → IR → Emit Rust
+    let mut lower = Lowerer::new();
+    let program = lower.lower_program_basic(&stmts);
+    let cg = RustCodegen::new();
+    let rust_src = cg.emit_rust(&program);
+    // Choose output path
+    let out_clean = out_opt.and_then(|s| if s.trim().is_empty() { None } else { Some(s) });
+    let dest = out_clean.map(PathBuf::from).unwrap_or_else(|| {
+        let mut p = std::env::temp_dir().join("patlang_native_out");
+        let _ = std::fs::create_dir_all(&p);
+        p.push(if cfg!(windows) { "a.exe" } else { "a.out" });
+        p
+    });
+    compile_rust_src_to(&rust_src, &dest)?;
+    let abs = std::fs::canonicalize(&dest).unwrap_or(dest);
+    Ok(abs.display().to_string())
+}
+
+fn decode_expr(ctx: &ExecutionContext, id: &str) -> Result<Expr, RuntimeError> {
+    let t = ctx.object_store.get(id, "type").unwrap_or_default();
+    match t.as_str() {
+        "Identifier" => {
+            let v = ctx.object_store.get(id, "name").unwrap_or_default();
+            Ok(Expr::Identifier(v))
+        }
+        "Number" => {
+            let v = ctx.object_store.get(id, "value").unwrap_or_else(|| "0".into());
+            let n = v.parse::<f64>().unwrap_or(0.0);
+            Ok(Expr::Number(n))
+        }
+        "String" => {
+            let v = ctx.object_store.get(id, "value").unwrap_or_default();
+            Ok(Expr::String(v))
+        }
+        "UnaryOp" => {
+            let op = ctx.object_store.get(id, "op").unwrap_or_default();
+            let expr_id = ctx.object_store.get(id, "expr").unwrap_or_default();
+            let inner = decode_expr(ctx, &expr_id)?;
+            Ok(Expr::UnaryOp { op, expr: Box::new(inner) })
+        }
+        "BinaryOp" => {
+            // Expect: op, left, right
+            let op_s = ctx.object_store.get(id, "op").unwrap_or_default();
+            let left_id = ctx.object_store.get(id, "left").unwrap_or_default();
+            let right_id = ctx.object_store.get(id, "right").unwrap_or_default();
+            let left = Box::new(decode_expr(ctx, &left_id)?);
+            let right = Box::new(decode_expr(ctx, &right_id)?);
+            let op = match op_s.as_str() {
+                "+" => crate::ast::BinaryOperator::Add,
+                "-" => crate::ast::BinaryOperator::Sub,
+                "*" => crate::ast::BinaryOperator::Mul,
+                "/" => crate::ast::BinaryOperator::Div,
+                "%" => crate::ast::BinaryOperator::Mod,
+                "==" => crate::ast::BinaryOperator::Equal,
+                ">" => crate::ast::BinaryOperator::Greater,
+                ">=" => crate::ast::BinaryOperator::GreaterEqual,
+                "<" => crate::ast::BinaryOperator::Less,
+                "<=" => crate::ast::BinaryOperator::LessEqual,
+                other => return Err(RuntimeError::new(
+                    crate::error_handler::RuntimeErrorKind::CoreEvaluator,
+                    format!("lower_and_compile: unsupported BinaryOp op '{}'", other),
+                )),
+            };
+            Ok(Expr::BinaryOp { left, op, right })
+        }
+        "Call" => {
+            // Expect: name, args(list)
+            let name = ctx.object_store.get(id, "name").unwrap_or_default();
+            let args_list = ctx.object_store.get(id, "args").unwrap_or_default();
+            let mut args: Vec<Expr> = Vec::new();
+            if let Some(items) = ctx.lists.get(&args_list) {
+                for aid in items {
+                    args.push(decode_expr(ctx, aid)?);
+                }
+            }
+            Ok(Expr::Call { function: Box::new(Expr::Identifier(name)), args })
+        }
+        _ => Err(RuntimeError::new(crate::error_handler::RuntimeErrorKind::CoreEvaluator, format!("lower_and_compile: unsupported expr type '{}'", t)))
+    }
+}
+
+fn decode_stmt_like(ctx: &ExecutionContext, id: &str) -> Result<Option<Stmt>, RuntimeError> {
+    if let Some(t) = ctx.object_store.get(id, "type") {
+        return Ok(match t.as_str() {
+            "Print" => {
+                let expr_id = ctx.object_store.get(id, "expr").unwrap_or_default();
+                let expr = decode_expr(ctx, &expr_id)?;
+                Some(Stmt::ExprStmt(Expr::Call { function: Box::new(Expr::Identifier("print".into())), args: vec![expr] }))
+            }
+            "Let" => {
+                let name = ctx.object_store.get(id, "name").unwrap_or_default();
+                let expr_id = ctx.object_store.get(id, "value").unwrap_or_default();
+                let value = decode_expr(ctx, &expr_id)?;
+                Some(Stmt::Let { name, value })
+            }
+            "Return" => {
+                let val_id = ctx.object_store.get(id, "value").unwrap_or_default();
+                if val_id.is_empty() { Some(Stmt::Return(None)) } else { Some(Stmt::Return(Some(decode_expr(ctx, &val_id)?))) }
+            }
+            "Call" => Some(Stmt::ExprStmt(decode_expr(ctx, id)?)),
+            _ => None,
+        });
+    }
+    Ok(None)
+}
+
+fn compile_rust_src_to(rust_src: &str, dest: &Path) -> Result<(), RuntimeError> {
+    let mut tmp = std::env::temp_dir();
+    tmp.push("patlang_emit_from_shape");
+    let _ = std::fs::create_dir_all(&tmp);
+    let src_path = tmp.join("generated_main.rs");
+    std::fs::write(&src_path, rust_src).map_err(|e| RuntimeError::new(
+        crate::error_handler::RuntimeErrorKind::CoreEvaluator,
+        format!("lower_and_compile: write {}: {}", src_path.display(), e),
+    ))?;
+    if let Some(par) = dest.parent() { let _ = std::fs::create_dir_all(par); }
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let status = std::process::Command::new(&rustc)
+        .arg("-O")
+        .arg(&src_path)
+        .arg("-o")
+        .arg(dest)
+        .status()
+        .map_err(|e| RuntimeError::new(
+            crate::error_handler::RuntimeErrorKind::CoreEvaluator,
+            format!("lower_and_compile: failed to run rustc: {}", e),
+        ))?;
+    if !status.success() {
+        return Err(RuntimeError::new(
+            crate::error_handler::RuntimeErrorKind::CoreEvaluator,
+            format!("lower_and_compile: rustc failed with status {}", status),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_tiny_source_impl(ctx: &mut ExecutionContext, path: &str) -> Result<String, RuntimeError> {
+    let content = std::fs::read_to_string(path).map_err(|e| RuntimeError::new(
+        crate::error_handler::RuntimeErrorKind::CoreEvaluator,
+        format!("parse_tiny_source: read '{}': {}", path, e),
+    ))?;
+
+    // Create Program object
+    let prog_id = new_map_obj(ctx, "Program");
+    let stmts_list = {
+        let id = format!("__list_{}", ctx.lists.len()+1);
+        ctx.lists.insert(id.clone(), Vec::new());
+        id
+    };
+    // Helpers: use functions to avoid long-lived borrows in closures
+
+    let raw_lines: Vec<&str> = content.lines().collect();
+    let mut i: usize = 0;
+    while i < raw_lines.len() {
+        let mut line = raw_lines[i].trim().to_string();
+        i += 1;
+        if line.is_empty() { continue; }
+        if line.starts_with('#') { continue; }
+        if line.ends_with(';') { line.pop(); }
+        // while cond do ... end (support single-line and multi-line)
+        if let Some(rest) = line.strip_prefix("while ") {
+            if let Some(do_pos) = rest.find(" do") {
+                let cond_src = rest[..do_pos].trim();
+                let cond_id = parse_tiny_expr(ctx, cond_src)?;
+                let body_list_id = format!("__list_{}", ctx.lists.len()+1);
+                ctx.lists.insert(body_list_id.clone(), Vec::new());
+                // Case A: single-line: body before ' end'
+                if let Some(end_pos) = rest.find(" end") {
+                    let body_src = rest[do_pos+3..end_pos].trim();
+                    if !body_src.is_empty() {
+                        for stmt_txt in body_src.split(';') { tiny_add_stmt_to_list(ctx, &body_list_id, stmt_txt); }
+                    }
+                } else {
+                    // Case B: multi-line: collect until a line 'end'
+                    while i < raw_lines.len() {
+                        let mut body_line = raw_lines[i].trim().to_string();
+                        i += 1;
+                        if body_line.is_empty() || body_line.starts_with('#') { continue; }
+                        if body_line.ends_with(';') { body_line.pop(); }
+                        if body_line == "end" { break; }
+                        tiny_add_stmt_to_list(ctx, &body_list_id, &body_line);
+                    }
+                }
+                let s = new_map_obj(ctx, "While");
+                ctx.object_store.set(&s, "type", "While");
+                ctx.object_store.set(&s, "cond", cond_id);
+                ctx.object_store.set(&s, "body", body_list_id);
+                push_to_list(ctx, &stmts_list, s);
+                continue;
+            }
+        }
+        // if cond then ... else ... end (support single-line and multi-line)
+        if let Some(rest) = line.strip_prefix("if ") {
+            if let Some(then_pos) = rest.find(" then") {
+                let cond_src = rest[..then_pos].trim();
+                let cond_id = parse_tiny_expr(ctx, cond_src)?;
+                let mut then_id = format!("__list_{}", ctx.lists.len()+1);
+                ctx.lists.insert(then_id.clone(), Vec::new());
+                let mut else_id: Option<String> = None;
+                let after_then = &rest[then_pos+5..];
+                if after_then.contains(" end") {
+                    // Single-line form
+                    let (then_src, else_src) = if let Some(ep) = after_then.find(" else ") { (&after_then[..ep], Some(&after_then[ep+6..])) } else { (after_then, None) };
+                    let (then_body, else_body) = match else_src {
+                        Some(e) => { let e2 = e.trim_end_matches(" end"); (then_src.trim(), Some(e2.trim())) }
+                        None => (then_src.trim_end_matches(" end").trim(), None),
+                    };
+                    for part in then_body.split(';') { tiny_add_stmt_to_list(ctx, &then_id, part); }
+                    if let Some(es) = else_body { let id = format!("__list_{}", ctx.lists.len()+1); ctx.lists.insert(id.clone(), Vec::new()); for part in es.split(';') { tiny_add_stmt_to_list(ctx, &id, part); } else_id = Some(id); }
+                } else {
+                    // Multi-line form: collect then lines until 'else' or 'end'
+                    // If any content appears on the same line after 'then', treat it as a statement line first
+                    let trailing = after_then.trim();
+                    if !trailing.is_empty() { tiny_add_stmt_to_list(ctx, &then_id, trailing); }
+                    // Now consume body lines
+                    let mut in_else = false;
+                    while i < raw_lines.len() {
+                        let mut body_line = raw_lines[i].trim().to_string();
+                        i += 1;
+                        if body_line.is_empty() || body_line.starts_with('#') { continue; }
+                        if body_line.ends_with(';') { body_line.pop(); }
+                        if body_line == "else" { in_else = true; let id = format!("__list_{}", ctx.lists.len()+1); ctx.lists.insert(id.clone(), Vec::new()); else_id = Some(id); continue; }
+                        if body_line == "end" { break; }
+                        match in_else {
+                            false => tiny_add_stmt_to_list(ctx, &then_id, &body_line),
+                            true => if let Some(ref eid) = else_id { tiny_add_stmt_to_list(ctx, eid, &body_line); },
+                        }
+                    }
+                }
+                let s = new_map_obj(ctx, "If");
+                ctx.object_store.set(&s, "type", "If");
+                ctx.object_store.set(&s, "cond", cond_id);
+                ctx.object_store.set(&s, "then", then_id);
+                if let Some(eid) = else_id { ctx.object_store.set(&s, "else", eid); }
+                push_to_list(ctx, &stmts_list, s);
+                continue;
+            }
+        }
+        // let statement
+        if let Some(rest) = line.strip_prefix("let ") {
+            if let Some(eq_pos) = rest.find('=') {
+                let name = rest[..eq_pos].trim().to_string();
+                let rhs = rest[eq_pos+1..].trim();
+                let expr_id = parse_tiny_expr(ctx, rhs)?;
+                let s = new_map_obj(ctx, "Let");
+                ctx.object_store.set(&s, "type", "Let");
+                ctx.object_store.set(&s, "name", name);
+                ctx.object_store.set(&s, "value", expr_id);
+                push_to_list(ctx, &stmts_list, s);
+                continue;
+            }
+        }
+        // return statement
+        if let Some(rest) = line.strip_prefix("return ") {
+            let expr_id = if rest.trim().is_empty() { String::new() } else { parse_tiny_expr(ctx, rest.trim())? };
+            let s = new_map_obj(ctx, "Return");
+            ctx.object_store.set(&s, "type", "Return");
+            if !expr_id.is_empty() { ctx.object_store.set(&s, "value", expr_id); }
+            push_to_list(ctx, &stmts_list, s);
+            continue;
+        }
+        // print statement as special form for convenience
+        if line.starts_with("print(") && line.ends_with(')') {
+            let inner = &line[6..line.len()-1];
+            let expr_id = parse_tiny_expr(ctx, inner.trim())?;
+            let s = new_map_obj(ctx, "Print");
+            ctx.object_store.set(&s, "type", "Print");
+            ctx.object_store.set(&s, "expr", expr_id);
+            push_to_list(ctx, &stmts_list, s);
+            continue;
+        }
+        // generic call statement like fn(a, b)
+        if let Some(_paren) = line.find('(') {
+            if line.ends_with(')') {
+                // Attempt to parse as call expression and wrap into ExprStmt
+                let expr_id = parse_tiny_expr(ctx, &line)?;
+                let t = ctx.object_store.get(&expr_id, "type").unwrap_or_default();
+                if t == "Call" { push_to_list(ctx, &stmts_list, expr_id); continue; }
+            }
+        }
+        // Unknown line: ignore for tiny parser
+    }
+    ctx.object_store.set(&prog_id, "stmts", stmts_list);
+    Ok(prog_id)
+}
+
+fn new_map_obj(ctx: &mut ExecutionContext, class: &str) -> String {
+    let idx = ctx.counters.entry("map".into()).and_modify(|c| *c += 1).or_insert(1usize);
+    let id = format!("__map_{}", *idx);
+    let _ = ctx.object_store.ensure(&id, class);
+    id
+}
+
+fn push_to_list(ctx: &mut ExecutionContext, list_id: &str, value: String) {
+    if let Some(v) = ctx.lists.get_mut(list_id) { v.push(value); }
+}
+
+// --- Tiny expression parser for parse_tiny_source ---
+// Supports numbers, strings, identifiers, function calls, parentheses,
+// arithmetic (+,-,*,/,%) and comparisons (==, <, <=, >, >=).
+
+#[derive(Clone, Debug, PartialEq)]
+enum TTok {
+    Num(String), Str(String), Ident(String),
+    LParen, RParen, Comma,
+    Op(String),
+}
+
+fn tiny_tokenize(input: &str) -> Vec<TTok> {
+    let mut t: Vec<TTok> = Vec::new();
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c.is_ascii_whitespace() { i += 1; continue; }
+        if c.is_ascii_digit() {
+            let start = i; i += 1;
+            while i < bytes.len() && (bytes[i] as char).is_ascii_digit() { i += 1; }
+            if i < bytes.len() && (bytes[i] as char) == '.' { i += 1; while i < bytes.len() && (bytes[i] as char).is_ascii_digit() { i += 1; } }
+            t.push(TTok::Num(String::from_utf8(bytes[start..i].to_vec()).unwrap()));
+            continue;
+        }
+        if c == '"' {
+            i += 1; let start = i;
+            while i < bytes.len() && (bytes[i] as char) != '"' { i += 1; }
+            let s = String::from_utf8(bytes[start..i].to_vec()).unwrap_or_default();
+            if i < bytes.len() { i += 1; }
+            t.push(TTok::Str(s));
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == '_' {
+            let start = i; i += 1;
+            while i < bytes.len() {
+                let ch = bytes[i] as char;
+                if ch.is_ascii_alphanumeric() || ch == '_' { i += 1; } else { break; }
+            }
+            t.push(TTok::Ident(String::from_utf8(bytes[start..i].to_vec()).unwrap()));
+            continue;
+        }
+        match c {
+            '(' => { t.push(TTok::LParen); i += 1; }
+            ')' => { t.push(TTok::RParen); i += 1; }
+            ',' => { t.push(TTok::Comma); i += 1; }
+            '+' | '-' | '*' | '/' | '%' | '<' | '>' | '=' => {
+                // two-char ops: <= >= ==
+                if i+1 < bytes.len() {
+                    let pair = (bytes[i] as char).to_string() + &(bytes[i+1] as char).to_string();
+                    if pair == "<=" || pair == ">=" || pair == "==" { t.push(TTok::Op(pair)); i += 2; continue; }
+                }
+                t.push(TTok::Op(c.to_string())); i += 1;
+            }
+            _ => { i += 1; }
+        }
+    }
+    t
+}
+
+struct TinyP<'a> { toks: &'a [TTok], pos: usize, ctx: *mut ExecutionContext }
+
+impl<'a> TinyP<'a> {
+    fn new(toks: &'a [TTok], ctx: *mut ExecutionContext) -> Self { Self { toks, pos: 0, ctx } }
+    fn peek(&self) -> Option<&TTok> { self.toks.get(self.pos) }
+    fn bump(&mut self) -> Option<TTok> { let p = self.pos; self.pos += 1; self.toks.get(p).cloned() }
+
+    fn parse_expr(&mut self) -> Result<String, RuntimeError> { self.parse_equality() }
+    fn parse_equality(&mut self) -> Result<String, RuntimeError> {
+        let mut lhs = self.parse_relation()?;
+        loop {
+            let op_s = match self.peek() {
+                Some(TTok::Op(op)) if op == "==" => op.clone(),
+                _ => break,
+            };
+            let _ = self.bump();
+            let rhs = self.parse_relation()?;
+            lhs = self.mk_bin(&lhs, &op_s, &rhs);
+        }
+        Ok(lhs)
+    }
+    fn parse_relation(&mut self) -> Result<String, RuntimeError> {
+        let mut lhs = self.parse_add()?;
+        loop {
+            let op_s = match self.peek() {
+                Some(TTok::Op(op)) if op == "<" || op == "<=" || op == ">" || op == ">=" => op.clone(),
+                _ => break,
+            };
+            let _ = self.bump();
+            let rhs = self.parse_add()?;
+            lhs = self.mk_bin(&lhs, &op_s, &rhs);
+        }
+        Ok(lhs)
+    }
+    fn parse_add(&mut self) -> Result<String, RuntimeError> {
+        let mut lhs = self.parse_mul()?;
+        loop {
+            let op_s = match self.peek() {
+                Some(TTok::Op(op)) if op == "+" || op == "-" => op.clone(),
+                _ => break,
+            };
+            let _ = self.bump();
+            let rhs = self.parse_mul()?;
+            lhs = self.mk_bin(&lhs, &op_s, &rhs);
+        }
+        Ok(lhs)
+    }
+    fn parse_mul(&mut self) -> Result<String, RuntimeError> {
+        let mut lhs = self.parse_unary()?;
+        loop {
+            let op_s = match self.peek() {
+                Some(TTok::Op(op)) if op == "*" || op == "/" || op == "%" => op.clone(),
+                _ => break,
+            };
+            let _ = self.bump();
+            let rhs = self.parse_unary()?;
+            lhs = self.mk_bin(&lhs, &op_s, &rhs);
+        }
+        Ok(lhs)
+    }
+    fn parse_unary(&mut self) -> Result<String, RuntimeError> {
+        match self.peek() {
+            Some(TTok::Op(op)) if op == "-" => { let _ = self.bump(); let expr_id = self.parse_unary()?; Ok(self.mk_unary("-", &expr_id)) }
+            Some(TTok::Ident(s)) if s == "not" => { let _ = self.bump(); let expr_id = self.parse_unary()?; Ok(self.mk_unary("not", &expr_id)) }
+            _ => self.parse_primary(),
+        }
+    }
+    fn parse_primary(&mut self) -> Result<String, RuntimeError> {
+        match self.bump() {
+            Some(TTok::Num(n)) => Ok(self.mk_number(&n)),
+            Some(TTok::Str(s)) => Ok(self.mk_string(&s)),
+            Some(TTok::Ident(name)) => {
+                // function call?
+                if let Some(TTok::LParen) = self.peek() {
+                    let _ = self.bump(); // consume '('
+                    let args_list_id = self.mk_list();
+                    // parse zero or more args
+                    if let Some(TTok::RParen) = self.peek() { let _ = self.bump(); } else {
+                        loop {
+                            let expr_id = self.parse_expr()?;
+                            self.list_push(&args_list_id, &expr_id);
+                            match self.peek() {
+                                Some(TTok::Comma) => { let _ = self.bump(); }
+                                Some(TTok::RParen) => { let _ = self.bump(); break; }
+                                _ => break,
+                            }
+                        }
+                    }
+                    Ok(self.mk_call(&name, args_list_id))
+                } else {
+                    Ok(self.mk_ident(name.clone()))
+                }
+            }
+            Some(TTok::LParen) => {
+                let inner = self.parse_expr()?;
+                let _ = self.bump(); // expect RParen (best-effort)
+                Ok(inner)
+            }
+            _ => Ok(self.mk_ident("".into())),
+        }
+    }
+
+    // --- node builders ---
+    fn mk_number(&mut self, n: &str) -> String {
+        let id = new_map_obj(unsafe { &mut *self.ctx }, "Number");
+        unsafe { &mut *self.ctx }.object_store.set(&id, "type", "Number");
+        unsafe { &mut *self.ctx }.object_store.set(&id, "value", n.to_string());
+        id
+    }
+    fn mk_string(&mut self, s: &str) -> String {
+        let id = new_map_obj(unsafe { &mut *self.ctx }, "String");
+        unsafe { &mut *self.ctx }.object_store.set(&id, "type", "String");
+        unsafe { &mut *self.ctx }.object_store.set(&id, "value", s.to_string());
+        id
+    }
+    fn mk_ident(&mut self, name: String) -> String {
+        let id = new_map_obj(unsafe { &mut *self.ctx }, "Identifier");
+        unsafe { &mut *self.ctx }.object_store.set(&id, "type", "Identifier");
+        unsafe { &mut *self.ctx }.object_store.set(&id, "name", name);
+        id
+    }
+    fn mk_list(&mut self) -> String {
+        let id = format!("__list_{}", unsafe { &mut *self.ctx }.lists.len()+1);
+        unsafe { &mut *self.ctx }.lists.insert(id.clone(), Vec::new());
+        id
+    }
+    fn list_push(&mut self, list_id: &str, value_id: &str) {
+        if let Some(v) = unsafe { &mut *self.ctx }.lists.get_mut(list_id) { v.push(value_id.to_string()); }
+    }
+    fn mk_bin(&mut self, left_id: &str, op: &str, right_id: &str) -> String {
+        let id = new_map_obj(unsafe { &mut *self.ctx }, "BinaryOp");
+        unsafe { &mut *self.ctx }.object_store.set(&id, "type", "BinaryOp");
+        unsafe { &mut *self.ctx }.object_store.set(&id, "op", op.to_string());
+        unsafe { &mut *self.ctx }.object_store.set(&id, "left", left_id.to_string());
+        unsafe { &mut *self.ctx }.object_store.set(&id, "right", right_id.to_string());
+        id
+    }
+    fn mk_call(&mut self, name: &str, args_list_id: String) -> String {
+        let id = new_map_obj(unsafe { &mut *self.ctx }, "Call");
+        unsafe { &mut *self.ctx }.object_store.set(&id, "type", "Call");
+        unsafe { &mut *self.ctx }.object_store.set(&id, "name", name.to_string());
+        unsafe { &mut *self.ctx }.object_store.set(&id, "args", args_list_id);
+        id
+    }
+    fn mk_unary(&mut self, op: &str, expr_id: &str) -> String {
+        let id = new_map_obj(unsafe { &mut *self.ctx }, "UnaryOp");
+        unsafe { &mut *self.ctx }.object_store.set(&id, "type", "UnaryOp");
+        unsafe { &mut *self.ctx }.object_store.set(&id, "op", op.to_string());
+        unsafe { &mut *self.ctx }.object_store.set(&id, "expr", expr_id.to_string());
+        id
+    }
+}
+
+fn parse_tiny_expr(ctx: &mut ExecutionContext, src: &str) -> Result<String, RuntimeError> {
+    let toks = tiny_tokenize(src);
+    let ctx_ptr: *mut ExecutionContext = ctx as *mut _;
+    let mut p = TinyP::new(&toks, ctx_ptr);
+    p.parse_expr()
+}
+
+fn tiny_add_stmt_to_list(ctx: &mut ExecutionContext, list: &str, src: &str) {
+    let st = src.trim(); if st.is_empty() { return; }
+    if st.starts_with("let ") {
+        if let Some(eq) = st.find('=') {
+            let name = st[4..eq].trim().to_string();
+            let rhs = st[eq+1..].trim();
+            if let Ok(expr_id) = parse_tiny_expr(ctx, rhs) {
+                let s = new_map_obj(ctx, "Let");
+                ctx.object_store.set(&s, "type", "Let");
+                ctx.object_store.set(&s, "name", name);
+                ctx.object_store.set(&s, "value", expr_id);
+                push_to_list(ctx, list, s);
+            }
+        }
+    } else if st.starts_with("print(") && st.ends_with(')') {
+        if let Ok(expr_id) = parse_tiny_expr(ctx, &st[6..st.len()-1]) {
+            let s = new_map_obj(ctx, "Print");
+            ctx.object_store.set(&s, "type", "Print");
+            ctx.object_store.set(&s, "expr", expr_id);
+            push_to_list(ctx, list, s);
+        }
+    } else if st.starts_with("return ") {
+        let rest = &st[7..];
+        if let Ok(expr_id) = parse_tiny_expr(ctx, rest.trim()) {
+            let s = new_map_obj(ctx, "Return");
+            ctx.object_store.set(&s, "type", "Return");
+            if !expr_id.is_empty() { ctx.object_store.set(&s, "value", expr_id); }
+            push_to_list(ctx, list, s);
+        }
+    } else if st.contains('(') && st.ends_with(')') {
+        if let Ok(expr_id) = parse_tiny_expr(ctx, st) {
+            if ctx.object_store.get(&expr_id, "type").unwrap_or_default() == "Call" { push_to_list(ctx, list, expr_id); }
+        }
+    }
+}

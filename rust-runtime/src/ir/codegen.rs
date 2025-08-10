@@ -98,6 +98,275 @@ struct Host;
 impl Host {
     fn call(name: &str, args: &[Value]) -> Result<Value, String> {
         match name {
+            "parse_tiny_source" => {
+                // Return a lightweight Program object carrying the source path for delegation.
+                // { type: "Program", source_path: <string> }
+                let path = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
+                let mut m = std::collections::HashMap::new();
+                m.insert("type".to_string(), Value::String("Program".to_string()));
+                m.insert("source_path".to_string(), Value::String(path));
+                Ok(Value::Object(m))
+            }
+            "lower_and_compile" => {
+                // Delegate compilation to the Stage 0 interpreter (pat) if available.
+                // Accepts: lower_and_compile(programObj[, outPath])
+                // programObj is expected to be { type: "Program", source_path: <string> } from parse_tiny_source.
+                println!("[host lower_and_compile] ENTER args_len={}", args.len());
+                if args.is_empty() { println!("[host lower_and_compile] no args"); return Ok(Value::String(String::new())); }
+                let src_path = match &args[0] {
+                    Value::Object(map) => match map.get("source_path") { Some(Value::String(s)) => s.clone(), _ => String::new() },
+                    Value::String(s) => s.clone(),
+                    other => display_value(other),
+                };
+                let out_opt = args.get(1).map(|v| match v { Value::String(s) => s.clone(), other => display_value(other) });
+                println!("[host lower_and_compile] src_path={} out_opt={}", src_path, out_opt.clone().unwrap_or_default());
+
+                // Resolve Stage 0 runner strictly from project-local paths (no PATH fallback)
+                let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                let rel_candidates = [
+                    "rust-runtime/target/debug/pat",
+                    "rust-runtime/target/debug/pat.exe",
+                    "./rust-runtime/target/debug/pat",
+                    "./rust-runtime/target/debug/pat.exe",
+                    "..\\rust-runtime\\target\\debug\\pat.exe",
+                    "rust-runtime\\target\\debug\\pat.exe",
+                ];
+                let abs_candidates: Vec<String> = rel_candidates.iter()
+                    .map(|p| cwd.join(p).display().to_string())
+                    .collect();
+                let pat_path = abs_candidates.iter().find(|p| std::path::Path::new(p).exists()).cloned();
+                let pat_path = match pat_path {
+                    Some(p) => p,
+                    None => {
+                        return Err(format!(
+                            "lower_and_compile: could not find project pat runner. Checked:\n{}",
+                            abs_candidates.join("\n")
+                        ));
+                    }
+                };
+                println!("[host lower_and_compile] using pat at {}", pat_path);
+                // Use raw strings, but on Windows convert MSYS-style (/e/...) to Windows (E:\...) for child rustc.
+                let script_raw: &str = "./patc_native.patlang";
+                let input_raw: String = src_path.clone();
+                let out_raw: Option<String> = out_opt.clone();
+
+                #[allow(unused_variables)]
+                fn msys_to_win_path(p: &str) -> String {
+                    #[cfg(windows)]
+                    {
+                        let b = p.as_bytes();
+                        if b.len() >= 3 && b[0] == b'/' && b[2] == b'/' {
+                            let drive = (b[1] as char).to_ascii_uppercase();
+                            let rest = &p[3..];
+                            let rest_bs = rest.replace('/', "\\");
+                            return format!("{}:\\{}", drive, rest_bs);
+                        }
+                        // Otherwise, just replace forward slashes with backslashes to be safe
+                        return p.replace('/', "\\");
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        p.to_string()
+                    }
+                }
+
+                // Make input absolute for reliability
+                let input_abs = {
+                    let p = std::path::Path::new(&input_raw);
+                    if p.is_absolute() { p.to_path_buf() } else { std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")).join(p) }
+                };
+                let input_arg = msys_to_win_path(&input_abs.display().to_string());
+                // Normalize desired out path (if user provided a non-empty file path) to absolute
+                let desired_out_abs: Option<String> = out_raw.as_ref().and_then(|s| {
+                    let t = s.trim();
+                    if t.is_empty() { return None; }
+                    let p = std::path::Path::new(t);
+                    let cwd_here = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    let abs = if p.is_absolute() { p.to_path_buf() } else { cwd_here.join(p) };
+                    // If the path points to an existing directory or looks like a directory (trailing sep), ignore it
+                    let looks_dir = t.ends_with('/') || t.ends_with('\\');
+                    if abs.is_dir() || looks_dir { None } else { Some(abs.display().to_string()) }
+                });
+
+                // Build command: pat --emit-rust <input> (capture Rust source, we compile with rustc)
+                let mut cmd = std::process::Command::new(&pat_path);
+                if let Ok(cwd) = std::env::current_dir() { let _ = cmd.current_dir(&cwd); }
+                cmd.arg("--emit-rust");
+                if !input_arg.is_empty() { cmd.arg(&input_arg); }
+                cmd.env_remove("RUST_LOG");
+                cmd.env_remove("PATLANG_DEBUG");
+                // Always print a concise debug line to aid bootstrap troubleshooting and write to a local log file
+                let cwd_dbg = std::env::current_dir().ok().map(|p| p.display().to_string()).unwrap_or_default();
+                println!(
+                    "[host lower_and_compile] cwd={} using_pat={} cmd: pat --emit-rust {:?} {}",
+                    cwd_dbg,
+                    pat_path,
+                    input_arg,
+                    match &desired_out_abs { Some(p) => format!("(will compile to {:?})", p), None => String::from("") }
+                );
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("boot_host.log") {
+                    use std::io::Write;
+                    let _ = writeln!(
+                        f,
+                        "cwd={} pat={} cmd: pat --emit-rust {} {}",
+                        cwd_dbg,
+                        pat_path,
+                        input_arg,
+                        match &desired_out_abs { Some(p) => format!("(will compile to {})", p), None => String::from("(no dest)") }
+                    );
+                }
+                println!("[host lower_and_compile] spawning child...");
+                let out = cmd.output().map_err(|e| format!("lower_and_compile: failed to spawn pat: {}", e))?;
+                println!("[host lower_and_compile] DONE status={} stdout_len={} stderr_len={}", out.status, out.stdout.len(), out.stderr.len());
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("boot_host.log") {
+                    use std::io::Write;
+                    let _ = writeln!(f, "status={} stdout_len={} stderr_len={}", out.status, out.stdout.len(), out.stderr.len());
+                }
+                if !out.status.success() {
+                    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                    return Err(format!("lower_and_compile: pat exited with {}\n{}", out.status, stderr));
+                }
+                // Try to locate the emitted Rust source file from Stage 0 output
+                let out_stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                let out_stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                let combined = format!("{}\n{}", out_stdout, out_stderr);
+                let mut rs_path: Option<String> = None;
+                for line in combined.lines() {
+                    let l = line.trim();
+                    if let Some(rest) = l.strip_prefix("Wrote ") {
+                        let p = rest.trim();
+                        if p.ends_with(".rs") { rs_path = Some(p.to_string()); }
+                    }
+                }
+                // Fallback: look for a recently created emitted_*.rs in CWD
+                if rs_path.is_none() {
+                    if let Ok(cwd) = std::env::current_dir() {
+                        if let Ok(mut entries) = std::fs::read_dir(&cwd) {
+                            let mut newest: Option<(std::time::SystemTime, String)> = None;
+                            while let Some(Ok(e)) = entries.next() {
+                                if let Some(name) = e.file_name().to_str() {
+                                    if name.ends_with(".rs") && name.starts_with("emitted_") {
+                                        if let Ok(md) = e.metadata() {
+                                            if let Ok(t) = md.modified() {
+                                                let path_str = e.path().display().to_string();
+                                                newest = match newest {
+                                                    Some((prev_t, _)) => if t > prev_t { Some((t, path_str)) } else { newest },
+                                                    None => Some((t, path_str)),
+                                                };
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some((_, p)) = newest { rs_path = Some(p); }
+                        }
+                    }
+                }
+                let rs_path = rs_path.ok_or_else(|| format!("lower_and_compile: couldn't find emitted .rs file in pat output. output was:\n{}", combined))?;
+                println!("[host lower_and_compile] will compile Rust source at {}", rs_path);
+                let rust_src = std::fs::read_to_string(&rs_path).map_err(|e| format!("lower_and_compile: failed to read {}: {}", rs_path, e))?;
+                if rust_src.trim().is_empty() { return Err("lower_and_compile: emitted .rs file was empty".into()); }
+                // Choose destination path
+                let dest_path: String = if let Some(d) = desired_out_abs { d } else {
+                    let in_p = std::path::Path::new(&input_arg);
+                    let stem = in_p.file_stem().and_then(|s| s.to_str()).unwrap_or("a");
+                    let parent = in_p.parent().unwrap_or_else(|| std::path::Path::new("."));
+                    let mut outp = parent.join(stem);
+                    if cfg!(windows) { outp.set_extension("exe"); }
+                    outp.display().to_string()
+                };
+                // Precreate the output file to test write permissions
+                {
+                    let dp = std::path::Path::new(&dest_path);
+                    if let Some(par) = dp.parent() { let _ = std::fs::create_dir_all(par); }
+                    match std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&dp) {
+                        Ok(_) => {
+                            println!("[host lower_and_compile] precreated output file at {}", dp.display());
+                        }
+                        Err(e) => {
+                            println!("[host lower_and_compile] precreate failed at {}: {}", dp.display(), e);
+                            return Err(format!("lower_and_compile: cannot create output file at {}: {}", dp.display(), e));
+                        }
+                    }
+                    println!("[host lower_and_compile] precreate exists={}", dp.exists());
+                }
+                // Write rust src to temp and run rustc -o dest
+                let mut tmp = std::env::temp_dir();
+                tmp.push("patlang_emit_native_boot");
+                let _ = std::fs::create_dir_all(&tmp);
+                let src_path = tmp.join("generated_main.rs");
+                std::fs::write(&src_path, &rust_src).map_err(|e| format!("lower_and_compile: write {}: {}", src_path.display(), e))?;
+                if let Some(par) = std::path::Path::new(&dest_path).parent() { let _ = std::fs::create_dir_all(par); }
+                let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+                let status = std::process::Command::new(&rustc)
+                    .arg("-O")
+                    .arg(&src_path)
+                    .arg("-o")
+                    .arg(&dest_path)
+                    .status()
+                    .map_err(|e| format!("lower_and_compile: failed to run rustc: {}", e))?;
+                if !status.success() { return Err(format!("lower_and_compile: rustc failed with status {}", status)); }
+                let p = std::path::Path::new(&dest_path);
+                if p.exists() {
+                    if let Ok(canon) = std::fs::canonicalize(p) { return Ok(Value::String(format!("{}", canon.display()))); }
+                    return Ok(Value::String(dest_path));
+                }
+                Err(format!("lower_and_compile: expected output '{}' not found after rustc", dest_path))
+            }
+            "get_argv" => {
+                // Mimic `pat ./patc_native.patlang <input> [--out path]` argv shape expected by patc_native:
+                // Prepend a synthetic script name so indexing matches (argv[0] is the script path).
+                let mut rest: Vec<String> = std::env::args().collect();
+                if !rest.is_empty() { rest.remove(0); }
+                let mut full = Vec::with_capacity(rest.len()+1);
+                full.push("./patc_native.patlang".to_string());
+                full.extend(rest);
+                Ok(Value::List(full.into_iter().map(Value::String).collect()))
+            }
+            "list_get" => {
+                // list_get(list, index)
+                if args.len() != 2 { return Err("expected 2 args".into()); }
+                let idx = match &args[1] { Value::Number(n) => *n as usize, Value::String(s) => s.parse::<usize>().unwrap_or(0), _ => 0 };
+                match &args[0] {
+                    Value::List(xs) => Ok(xs.get(idx).cloned().unwrap_or(Value::Unit)),
+                    Value::String(s) => {
+                        let ch = s.chars().nth(idx).unwrap_or('\0');
+                        Ok(Value::String(if ch == '\0' { String::new() } else { ch.to_string() }))
+                    }
+                    _ => Ok(Value::Unit),
+                }
+            }
+            "list_len" => {
+                // list_len(listOrString) -> String count (to match Stage 0 builtins)
+                if args.len() != 1 { return Err("expected 1 arg".into()); }
+                let n = match &args[0] {
+                    Value::List(xs) => xs.len(),
+                    Value::String(s) => s.chars().count(),
+                    _ => 0,
+                };
+                Ok(Value::String(n.to_string()))
+            }
+            "touch_file" => {
+                // touch_file(path) -> String message (OK <abs> or ERR: <msg>)
+                let p = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
+                if p.is_empty() { return Ok(Value::String("ERR: empty path".into())); }
+                let path = std::path::Path::new(&p);
+                if let Some(par) = path.parent() { let _ = std::fs::create_dir_all(par); }
+                let res = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&path);
+                match res {
+                    Ok(_) => {
+                        let abs = std::fs::canonicalize(&path).unwrap_or_else(|_| path.to_path_buf());
+                        Ok(Value::String(format!("OK {}", abs.display())))
+                    }
+                    Err(e) => Ok(Value::String(format!("ERR: {}", e)))
+                }
+            }
+            "file_exists" => {
+                // file_exists(path) -> "1" or "0"
+                let p = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
+                let exists = std::path::Path::new(&p).exists();
+                Ok(Value::String(if exists { "1".into() } else { "0".into() }))
+            }
             "infer_type_for" => {
                 // args: pred, index, class
                 if args.len() != 3 { return Ok(Value::Unit); }
@@ -470,9 +739,24 @@ fn mul(a:&Value,b:&Value)->Result<Value,String>{ Ok(Value::Number(a.as_number()?
 fn div(a:&Value,b:&Value)->Result<Value,String>{ Ok(Value::Number(a.as_number()? / b.as_number()?)) }
 fn modu(a:&Value,b:&Value)->Result<Value,String>{ Ok(Value::Number(a.as_number()? % b.as_number()?)) }
 fn cmp(k:&BinOpKind,a:&Value,b:&Value)->Result<Value,String>{
-    let (an,bn)=(a.as_number()?, b.as_number()?);
     use BinOpKind::*;
-    let res = match k { Eq=>an==bn, Ne=>an!=bn, Lt=>an<bn, Le=>an<=bn, Gt=>an>bn, Ge=>an>=bn, _=>false };
+    let res = match k {
+        // Structural equality for Eq/Ne across all Value variants
+        Eq => a == b,
+        Ne => a != b,
+        // Relational ops are numeric-only comparisons
+        Lt | Le | Gt | Ge => {
+            let (an, bn) = (a.as_number()?, b.as_number()?);
+            match k {
+                Lt => an < bn,
+                Le => an <= bn,
+                Gt => an > bn,
+                Ge => an >= bn,
+                _ => unreachable!(),
+            }
+        }
+        _ => false,
+    };
     Ok(Value::Bool(res))
 }
 fn to_s(v:&Value)->String{ match v { Value::Unit=>String::new(), Value::Bool(b)=>b.to_string(), Value::Number(n)=> if n.fract()==0.0 {format!("{}",*n as i64)} else {n.to_string()}, Value::String(s)=>s.clone(), Value::List(xs)=>{ let parts:Vec<String>=xs.iter().map(|x|to_s(x)).collect(); format!("[{}]", parts.join(", ")) }, Value::Object(map)=>{ let mut kvs:Vec<String>=map.iter().map(|(k,v)| format!("{}: {}",k,to_s(v))).collect(); kvs.sort(); format!("{{{}}}", kvs.join(", ")) } } }

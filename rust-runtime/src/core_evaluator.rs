@@ -30,6 +30,15 @@ pub enum AstKind {
     List(Vec<AstNode>),
     Closure { params: Vec<String>, body: Vec<AstNode> },
     Print(Box<AstNode>),
+    If {
+        cond: Box<AstNode>,
+        then_branch: Vec<AstNode>,
+        else_branch: Option<Vec<AstNode>>,
+    },
+    While {
+        cond: Box<AstNode>,
+        body: Vec<AstNode>,
+    },
     BinaryOp {
         op: crate::ast::BinaryOpKind,
         left: Box<AstNode>,
@@ -193,8 +202,10 @@ impl<'a> CoreEvaluator<'a> {
         use crate::arithmetic::{eval_arithmetic, ArithmeticOp};
         use crate::string::{eval_string, StringOp};
 
-        // TEMP DEBUG: Log each node as it is evaluated
-        println!("[DEBUG] Evaluating node: {:?}", node.kind);
+        // Optional debug logging
+        if std::env::var("PATLANG_DEBUG").is_ok() {
+            println!("[DEBUG] Evaluating node: {:?}", node.kind);
+        }
 
         match &node.kind {
             AstKind::Number(n) => {
@@ -256,8 +267,10 @@ impl<'a> CoreEvaluator<'a> {
             AstKind::Print(expr) => {
                 // Evaluate the expression and return its string representation
                 let val = self.execute_node(expr)?;
-                println!("[DEBUG][evaluator] Print node evaluated to: {:?}", val);
-                println!("[DEBUG][evaluator] Print node inner AST: {:?}", expr.kind);
+                if std::env::var("PATLANG_DEBUG").is_ok() {
+                    println!("[DEBUG][evaluator] Print node evaluated to: {:?}", val);
+                    println!("[DEBUG][evaluator] Print node inner AST: {:?}", expr.kind);
+                }
                 // Track last print in context
                 self.context.last_print = Some(val.clone());
                 Ok(val)
@@ -278,6 +291,20 @@ impl<'a> CoreEvaluator<'a> {
                 // Enforce contracts if present (best-effort)
                 if !self.check_contract_with_values(name, &eval_args)? {
                     return Ok(String::new());
+                }
+                // Call user-defined function by name if present
+                if let Some((params, body_stmts)) = self.context.functions.get(name).cloned() {
+                    self.context.push_scope();
+                    for (i, p) in params.iter().enumerate() {
+                        if let Some(v) = eval_args.get(i) { self.context.set_var(p, v.clone()); }
+                    }
+                    let mut last = String::new();
+                    for s in &body_stmts {
+                        let n = stmt_to_astnode(s);
+                        last = self.execute_node(&n)?;
+                    }
+                    self.context.pop_scope();
+                    return Ok(last);
                 }
                 // If function name refers to a stored closure id, execute the closure body with bindings
                 if let Some((params, body)) = self.context.closures.get(name).cloned() {
@@ -509,6 +536,32 @@ impl<'a> CoreEvaluator<'a> {
                 }
                 Ok(last)
             }
+            AstKind::If { cond, then_branch, else_branch } => {
+                let cval = self.execute_node(cond)?;
+                let truthy = !cval.is_empty() && cval != "false" && cval != "0";
+                let branch = if truthy { Some(then_branch) } else { else_branch.as_ref() };
+                if let Some(stmts) = branch {
+                    let mut last = String::new();
+                    for n in stmts { last = self.execute_node(n)?; }
+                    Ok(last)
+                } else {
+                    Ok(String::new())
+                }
+            }
+            AstKind::While { cond, body } => {
+                let mut last = String::new();
+                // crude loop guard to avoid infinite loops in buggy input
+                let mut iter = 0usize;
+                while {
+                    let cval = self.execute_node(cond)?;
+                    let truthy = !cval.is_empty() && cval != "false" && cval != "0";
+                    truthy && iter < 1_000_000
+                } {
+                    for n in body { last = self.execute_node(n)?; }
+                    iter += 1;
+                }
+                Ok(last)
+            }
             AstKind::WhenRegister { event, body } => {
                 // Store handler body for the event
                 self.context
@@ -673,9 +726,13 @@ pub fn evaluate_patlang_source(source: &str) -> Result<EvalResult, EvalError> {
     use crate::ast::{Stmt, Expr};
     // Parse the source into statements
     let mut parser = Parser::new(source).map_err(|e| EvalError { message: format!("Parse error: {:?}", e) })?;
-    println!("[DEBUG] Starting parse of source:\n{}", source);
+    if std::env::var("PATLANG_DEBUG").is_ok() {
+        println!("[DEBUG] Starting parse of source:\n{}", source);
+    }
     let stmts = parser.parse().map_err(|e| EvalError { message: format!("Parse error: {:?}", e) })?;
-    println!("[DEBUG] Parsed statements: {:#?}", stmts);
+    if std::env::var("PATLANG_DEBUG").is_ok() {
+        println!("[DEBUG] Parsed statements: {:#?}", stmts);
+    }
     // Convert statements to a Block and evaluate with a single evaluator to retain context.
     // Also register any user-defined functions into the context.
     let mut nodes: Vec<AstNode> = Vec::new();
@@ -738,6 +795,13 @@ fn stmt_to_astnode(stmt: &crate::ast::Stmt) -> AstNode {
             let value_node = AstNode { kind: expr_to_astkind(value), children: vec![] };
             AstNode { kind: AstKind::FunctionCall { name: "set_var".to_string(), args: vec![name_node, value_node] }, children: vec![] }
         }
+        crate::ast::Stmt::If { cond, then_branch, else_branch } => {
+            let cond_node = AstNode::from(cond.clone());
+            let mut then_nodes: Vec<AstNode> = Vec::new();
+            for s in then_branch { then_nodes.push(stmt_to_astnode(s)); }
+            let else_nodes: Option<Vec<AstNode>> = else_branch.as_ref().map(|v| v.iter().map(stmt_to_astnode).collect());
+            AstNode { kind: AstKind::If { cond: Box::new(cond_node), then_branch: then_nodes, else_branch: else_nodes }, children: vec![] }
+        }
         crate::ast::Stmt::MemberAssign { object, property, value } => {
             // Translate obj.prop = value into a method call: obj.set("prop", value)
             let obj_ident = match object {
@@ -765,6 +829,12 @@ fn stmt_to_astnode(stmt: &crate::ast::Stmt) -> AstNode {
             let prop_node = AstNode { kind: AstKind::String(property.clone()), children: vec![] };
             let value_node = AstNode { kind: expr_to_astkind(value), children: vec![] };
             AstNode { kind: AstKind::FunctionCall { name: fname, args: vec![prop_node, value_node] }, children: vec![] }
+        }
+        crate::ast::Stmt::While { cond, body } => {
+            let cond_node = AstNode::from(cond.clone());
+            let mut body_nodes: Vec<AstNode> = Vec::new();
+            for s in body { body_nodes.push(stmt_to_astnode(s)); }
+            AstNode { kind: AstKind::While { cond: Box::new(cond_node), body: body_nodes }, children: vec![] }
         }
         // Extend for other Stmt variants as needed
         crate::ast::Stmt::When { event, body } => {
@@ -800,16 +870,22 @@ fn expr_to_astkind(expr: &crate::ast::Expr) -> AstKind {
             AstKind::Identifier(format!("{}.{}", obj, property))
         }
         crate::ast::Expr::Call { function, args } => {
-            println!("[DEBUG] Expr::Call detected: function={:?}, args={:?}", function, args);
+            if std::env::var("PATLANG_DEBUG").is_ok() {
+                println!("[DEBUG] Expr::Call detected: function={:?}, args={:?}", function, args);
+            }
             // Detect print calls: function is identifier "print" and one argument
             if let crate::ast::Expr::Identifier(name) = &**function {
-                println!("[DEBUG] Expr::Call function identifier: {}", name);
+                if std::env::var("PATLANG_DEBUG").is_ok() {
+                    println!("[DEBUG] Expr::Call function identifier: {}", name);
+                }
                 if name == "print" && args.len() == 1 {
                     let arg_node = AstNode {
                         kind: expr_to_astkind(&args[0]),
                         children: vec![],
                     };
-                    println!("[DEBUG] Matched print call, converting to AstKind::Print");
+                    if std::env::var("PATLANG_DEBUG").is_ok() {
+                        println!("[DEBUG] Matched print call, converting to AstKind::Print");
+                    }
                     return AstKind::Print(Box::new(arg_node));
                 }
             }

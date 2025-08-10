@@ -17,6 +17,9 @@ pub struct Parser<'a> {
     curr: Token,
     peek: Token,
     line_no: usize,
+    // When true, do not treat a trailing '{ ... }' after an expression as a closure argument.
+    // This is used when parsing conditions like `if cond { ... }` to avoid consuming the block.
+    stop_trailing_block_for_condition: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -24,7 +27,7 @@ impl<'a> Parser<'a> {
         let mut lexer = Lexer::new(input);
         let curr = lexer.next_token().map_err(ParserError::Lexer)?;
         let peek = lexer.next_token().map_err(ParserError::Lexer)?;
-        Ok(Parser { lexer, curr, peek, line_no: 1 })
+    Ok(Parser { lexer, curr, peek, line_no: 1, stop_trailing_block_for_condition: false })
     }
 
     fn advance(&mut self) -> Result<(), ParserError> {
@@ -79,10 +82,15 @@ impl<'a> Parser<'a> {
                 break;
             }
 
-            // If the next token can start a statement but we didn't see any separator,
-            // be tolerant and allow implicit separation (native .patlang often omits explicit separators).
-            // Previously this returned an error; we now continue parsing.
-            let _ = (saw_sep, saw_nl);
+            // If the next token can start a statement but we didn't see any separator
+            // and there was no newline, require a separator on the same line.
+            if self.can_start_statement() && !saw_sep && !saw_nl {
+                return Err(ParserError::ExpectedToken {
+                    expected: "separator between statements",
+                    line: self.line_no,
+                    hint: "Insert ';' or a newline between statements",
+                });
+            }
 
             // Otherwise, continue; any non-statement-start here is an error (handled at next parse attempt)
         }
@@ -95,24 +103,33 @@ impl<'a> Parser<'a> {
             Token::Fn => self.parse_function(),
             Token::Return => self.parse_return(),
             Token::If => self.parse_if(),
+            Token::While => self.parse_while(),
             // Native DSL: handle 'goal' and 'rule' tokens directly and skip their bodies/lines.
             Token::Goal => {
-                // consume 'goal' and skip until matching block if present, or to line end/dot
-                self.advance()?;
-                // consume until '{' or '.' or newline/EOF
+                // If followed by '(', treat as normal call: goal(...)
+                if matches!(self.peek, Token::LParen) {
+                    // Rebind current token to Identifier("goal") and parse as expression statement
+                    self.curr = Token::Identifier("goal".into());
+                    let expr = self.parse_expression(0)?;
+                    return Ok(Stmt::ExprStmt(expr));
+                }
+                // Otherwise, skip DSL-style goal header/body.
+                self.advance()?; // consume 'goal'
                 while !matches!(self.curr, Token::BlockStart | Token::Dot | Token::Newline | Token::EOF) {
                     self.advance()?;
                 }
-                if matches!(self.curr, Token::BlockStart) {
-                    // Skip the goal's brace block
-                    self.skip_brace_block()?;
-                }
-                // If we see a trailing '.', consume it
+                if matches!(self.curr, Token::BlockStart) { self.skip_brace_block()?; }
                 if matches!(self.curr, Token::Dot) { self.advance()?; }
                 Ok(Stmt::ExprStmt(Expr::String(String::new())))
             }
             Token::Rule => {
-                // consume 'rule' and skip until terminating '.' (may span multiple lines); skip any brace blocks
+                // If followed by '(', treat as normal call: rule(...)
+                if matches!(self.peek, Token::LParen) {
+                    self.curr = Token::Identifier("rule".into());
+                    let expr = self.parse_expression(0)?;
+                    return Ok(Stmt::ExprStmt(expr));
+                }
+                // Otherwise, skip DSL-style rule declaration until '.'
                 self.advance()?;
                 loop {
                     match self.curr {
@@ -130,8 +147,9 @@ impl<'a> Parser<'a> {
                 // Special forms
                 if let Token::Identifier(ref s0) = self.curr {
                     let curr_ident = s0.clone();
+                    let curr_lc = curr_ident.to_lowercase();
                     // Bare print: `print expr` → treat like call
-                    if curr_ident == "print" {
+                    if curr_lc == "print" {
                         // If next token is '(', let normal call parsing handle print(...)
                         if matches!(self.peek, Token::LParen) {
                             // fallthrough without consuming 'print'
@@ -147,7 +165,7 @@ impl<'a> Parser<'a> {
                     }
                     // Fact DSL: if used without parentheses (not a normal call), treat as no-op.
                     // If the next token is '(', let normal call parsing handle fact(...)
-                    if curr_ident == "fact" && !matches!(self.peek, Token::LParen) {
+                    if curr_lc == "fact" && !matches!(self.peek, Token::LParen) {
                         // Skip rest of the line or until terminating '.'
                         while !matches!(self.curr, Token::Newline | Token::EOF) {
                             if matches!(self.curr, Token::Dot) { self.advance()?; break; }
@@ -156,7 +174,7 @@ impl<'a> Parser<'a> {
                         return Ok(Stmt::ExprStmt(Expr::String(String::new())));
                     }
                     // Rules: rule name(args) :- ...  → skip to line end or to '.' when not used as normal call
-                    if curr_ident == "rule" && !matches!(self.peek, Token::LParen) {
+                    if curr_lc == "rule" && !matches!(self.peek, Token::LParen) {
                         // consume tokens until newline or '.'
                         while !matches!(self.curr, Token::Newline | Token::EOF) {
                             if matches!(self.curr, Token::Dot) { self.advance()?; break; }
@@ -165,35 +183,35 @@ impl<'a> Parser<'a> {
                         return Ok(Stmt::ExprStmt(Expr::String(String::new())));
                     }
                     // Goals: goal name { ... } → skip brace block if present (but preserve call form goal(...))
-                    if curr_ident == "goal" && !matches!(self.peek, Token::LParen) {
+                    if curr_lc == "goal" && !matches!(self.peek, Token::LParen) {
                         // consume until '{' then skip block; otherwise skip rest of line
                         while !matches!(self.curr, Token::BlockStart | Token::Newline | Token::EOF) { self.advance()?; }
                         if matches!(self.curr, Token::BlockStart) { self.skip_brace_block()?; }
                         return Ok(Stmt::ExprStmt(Expr::String(String::new())));
                     }
                     // Reasoning mode on/off: skip rest of line
-                    if curr_ident == "reasoning" {
+                    if curr_lc == "reasoning" {
                         while !matches!(self.curr, Token::Newline | Token::EOF) { self.advance()?; }
                         return Ok(Stmt::ExprStmt(Expr::String(String::new())));
                     }
                     // Skip 'constrain X :: Y where { ... }' spec blocks used in native self-hosting files
-                    if curr_ident == "constrain" {
+                    if curr_lc == "constrain" {
                         // consume until a '{', then skip the brace block; otherwise skip to end of line
                         while !matches!(self.curr, Token::BlockStart | Token::Newline | Token::EOF) { self.advance()?; }
                         if matches!(self.curr, Token::BlockStart) { self.skip_brace_block()?; }
                         return Ok(Stmt::ExprStmt(Expr::String(String::new())));
                     }
                     // pursue ... : skip rest of line
-                    if curr_ident == "pursue" {
+                    if curr_lc == "pursue" {
                         while !matches!(self.curr, Token::Newline | Token::EOF) { self.advance()?; }
                         return Ok(Stmt::ExprStmt(Expr::String(String::new())));
                     }
                     // DSL sugar: make a function called Name { ... }
-                    if curr_ident == "make" {
+                    if curr_lc == "make" {
                         if let Some(stmt) = self.parse_make_construct()? { return Ok(stmt); }
                     }
                     // DSL events: when <event> { ... } → capture as Stmt::When
-                    if curr_ident == "when" {
+                    if curr_lc == "when" {
                         self.advance()?; // consume 'when'
                         // capture a simple identifier as event name; otherwise, fallback to skip
                         let event_name = match &self.curr { Token::Identifier(s) => { let n = s.clone(); self.advance()?; n }, _ => String::new() };
@@ -210,7 +228,7 @@ impl<'a> Parser<'a> {
                         }
                     }
                     // Relationship declarations: skip until trailing '.'
-                    if curr_ident == "relationship" {
+                    if curr_lc == "relationship" {
                         // Consume tokens until we find a Dot immediately followed by Newline,
                         // which we treat as the terminator for the relationship declaration.
                         loop {
@@ -228,23 +246,23 @@ impl<'a> Parser<'a> {
                         return Ok(Stmt::ExprStmt(Expr::String(String::new())));
                     }
                     // Activation statements: skip rest of line
-                    if curr_ident == "activate" {
+                    if curr_lc == "activate" {
                         while !matches!(self.curr, Token::Newline | Token::EOF) { self.advance()?; }
                         return Ok(Stmt::ExprStmt(Expr::String(String::new())));
                     }
                     // Skip 'case ... end' constructs (Ruby-like)
-                    if curr_ident == "case" {
+                    if curr_lc == "case" {
                         self.skip_until_ident("end")?;
                         return Ok(Stmt::ExprStmt(Expr::String(String::new())));
                     }
                     // Skip inline 'query ... end' blocks used in DSL examples
                     // Only when this is NOT a normal function call like query(...)
-                    if curr_ident == "query" && !matches!(self.peek, Token::LParen) {
+                    if curr_lc == "query" && !matches!(self.peek, Token::LParen) {
                         self.skip_until_ident("end")?;
                         return Ok(Stmt::ExprStmt(Expr::String(String::new())));
                     }
                     // Skip simple while-do-end loops used in examples
-                    if curr_ident == "while" {
+                    if curr_lc == "while" {
                         // consume until we find an Identifier("end")
                         self.skip_until_ident("end")?;
                         return Ok(Stmt::ExprStmt(Expr::String(String::new())));
@@ -265,7 +283,8 @@ impl<'a> Parser<'a> {
                 // Best-effort fallback: if the current token starts with our DSL words like 'make' or 'when',
                 // skip ahead to the next block and consume it, treating it as a no-op block statement.
                 if let Token::Identifier(ref s) = self.curr {
-                    if s == "make" || s == "when" {
+                    let lc = s.to_lowercase();
+                    if lc == "make" || lc == "when" {
                         // consume tokens until a '{', then consume a block
                         while !matches!(self.curr, Token::BlockStart | Token::EOF) {
                             self.advance()?;
@@ -571,7 +590,12 @@ impl<'a> Parser<'a> {
         // consume 'if'
         self.advance()?;
         // condition expression
-        let cond = self.parse_expression(0)?;
+    let prev_flag = self.stop_trailing_block_for_condition;
+    self.stop_trailing_block_for_condition = true;
+    let cond = self.parse_expression(0)?;
+    self.stop_trailing_block_for_condition = prev_flag;
+        // allow newlines between condition and block/then
+        self.consume_newlines()?;
         // Support two forms:
         // 1) Brace form: if <cond> { ... } [else { ... }]
         // 2) Ruby-like form: if <cond> then ... [else ...] end
@@ -580,17 +604,26 @@ impl<'a> Parser<'a> {
             self.advance()?;
             let then_branch = self.parse_block()?;
             // optional else/elif
+            // allow newlines before else/elif
+            self.consume_newlines()?;
             let else_branch = if matches!(self.curr, Token::Else | Token::Elif) {
                 match self.curr {
                     Token::Else => {
                         self.advance()?;
+                        // tolerate newline before '{'
+                        self.consume_newlines()?;
                         self.expect(Token::BlockStart, "'{' to start 'else' block", "Start the 'else' block with '{'" )?;
                         Some(self.parse_block()?)
                     }
                     Token::Elif => {
                         // elif -> else { if ... }
                         self.advance()?;
+                        let prev_flag2 = self.stop_trailing_block_for_condition;
+                        self.stop_trailing_block_for_condition = true;
                         let cond2 = self.parse_expression(0)?;
+                        self.stop_trailing_block_for_condition = prev_flag2;
+                        // tolerate newline before '{'
+                        self.consume_newlines()?;
                         self.expect(Token::BlockStart, "'{' to start 'elif' block", "Start the 'elif' block with '{'" )?;
                         let then2 = self.parse_block()?;
                         Some(vec![Stmt::If { cond: cond2, then_branch: then2, else_branch: None }])
@@ -648,9 +681,52 @@ impl<'a> Parser<'a> {
             }
         }
         // fallback: expecting brace form if none matched
-        self.expect(Token::BlockStart, "'{' to start 'if' block", "Start the 'if' block with '{'" )?;
+    // allow newlines before '{'
+    self.consume_newlines()?;
+    self.expect(Token::BlockStart, "'{' to start 'if' block", "Start the 'if' block with '{'" )?;
         let then_branch = self.parse_block()?;
         Ok(Stmt::If { cond, then_branch, else_branch: None })
+    }
+
+    fn parse_while(&mut self) -> Result<Stmt, ParserError> {
+        // consume 'while'
+        self.advance()?;
+        // parse condition (prevent postfix block capture)
+        let prev_flag = self.stop_trailing_block_for_condition;
+        self.stop_trailing_block_for_condition = true;
+        let cond = self.parse_expression(0)?;
+        self.stop_trailing_block_for_condition = prev_flag;
+        // allow newlines
+        self.consume_newlines()?;
+        // Two forms: while <cond> { ... }  or  while <cond> do ... end
+        if matches!(self.curr, Token::BlockStart) {
+            self.advance()?;
+            let body = self.parse_block()?;
+            return Ok(Stmt::While { cond, body });
+        }
+        if let Token::Identifier(ref s) = self.curr {
+            if s == "do" {
+                self.advance()?;
+                let mut body: Vec<Stmt> = Vec::new();
+                loop {
+                    match &self.curr {
+                        Token::Identifier(t) if t == "end" => { self.advance()?; break; }
+                        Token::EOF => break,
+                        _ => {}
+                    }
+                    self.consume_newlines()?;
+                    if matches!(self.curr, Token::Identifier(_)|Token::Let|Token::Fn|Token::If|Token::Return|Token::Number(_)|Token::String(_)|Token::LParen) {
+                        let st = self.parse_statement()?; body.push(st);
+                    } else { if !matches!(self.curr, Token::EOF) { self.advance()?; } }
+                    self.consume_newlines()?;
+                }
+                return Ok(Stmt::While { cond, body });
+            }
+        }
+        // fallback: expect brace form
+        self.expect(Token::BlockStart, "'{' to start 'while' block", "Start the 'while' block with '{'")?;
+        let body = self.parse_block()?;
+        Ok(Stmt::While { cond, body })
     }
 
     // Pratt parser
@@ -797,6 +873,11 @@ impl<'a> Parser<'a> {
                     expr = Expr::Call { function: Box::new(expr), args };
                 }
                 Token::BlockStart => {
+                    // If we're parsing a condition (e.g., `if cond { ... }`), do not
+                    // consume the block here as a trailing closure; let the caller handle it.
+                    if self.stop_trailing_block_for_condition {
+                        break;
+                    }
                     // Treat a trailing '{ ... }' as an implicit closure block. If expr is a call,
                     // append the closure as the last argument; otherwise, produce a Closure expr.
                     self.advance()?; // consume '{'
