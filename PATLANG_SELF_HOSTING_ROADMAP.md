@@ -9,14 +9,25 @@ This document outlines the pragmatic next steps to reach self-hosting by leverag
   - Compare mode aligns interpreter vs compiled by returning text from print in interpreter during compare.
 - Parser tolerances (Stage 0)
   - Ruby-like `if ... then ... else ... end` accepted (Else token supported).
-  - Statement separators relaxed between top-level statements and within blocks.
+  - Statement separators relaxed between top-level statements and within blocks; still require a separator when two statements are on the same line (semicolon or newline).
   - Inline “make a function … takes … returns … end” parsed; optional implicit return of hinted var.
   - Accept `=` as equality (maps to Equal) in expressions.
-  - Postfix `{ ... }` blocks treated as closures (attach to previous call where applicable).
-  - Goal/Rule recognized and skipped; multi-line rule termination by trailing `.` tolerated.
+  - Postfix `{ ... }` blocks treated as closures (attach to previous call where applicable), while avoiding consuming the `{}` after an `if`/`elif` condition.
+  - Goal/Rule recognized and skipped when used as DSL headers; treat `goal(...)` and `rule(...)` as normal function calls.
+  - DSL keywords are handled case-insensitively (e.g., `Goal`, `Rule`, `Fact`).
+  - Newlines tolerated around brace-style `if {}` and before `else`/`elif` blocks.
   - Label lines like `precondition:`, `postcondition:`, `strategy:` tolerated/skipped.
 - Native sources
   - `native_lexer.patlang`, `native_parser.patlang`, and `core_evaluator.patlang` parse under the current evaluator without fatal parse errors.
+
+### recent progress (Aug 10, 2025)
+
+- Fixed a regression in brace-style `if { ... } else { ... }` parsing and added tolerance for newlines around blocks; all parser and lowering smoke tests pass.
+- Hardened DSL compatibility: case-insensitive `Goal/Rule/Fact`, and `goal(...)`/`rule(...)` treated as calls; label lines and relationship/activate/case/query/while blocks skipped.
+- End-to-end tests are green across suites (warnings only).
+- Compiled the `docs/examples/webserver.patlang` example to a native Windows executable via `--patc` (see Try it).
+- Minimal native patc bootstrap: added built-ins `patc_compile`, `patc_compile_from_argv`, and argv helpers; `patc.patlang` now delegates to the Stage 0 backend and prints the canonical exe path. Verified by producing `demo2.exe` from `demo.patlang`.
+- Reduced default noise: evaluator/parser debug logs are gated behind the `PATLANG_DEBUG` env var.
 
 ## objective
 
@@ -71,10 +82,18 @@ Run the native PatLang lexer → parser → evaluator on small programs and prog
   - Invokes native_evaluator on that AST to compute a final value.
 - Validate with 2–3 tiny programs: arithmetic, print, and a short list pipeline (`[1,2,3].map { |x| x + 1 }`).
 
+7.1) Native patc CLI (bootstrap achieved)
+- Current: `patc.patlang` calls `patc_compile_from_argv()` (new host built-in) to reuse the Rust Stage 0 pipeline.
+- Next: improve CLI UX and error surfaces in `.patlang` (usage, exit codes), then gradually switch its internals to the native lexer/parser when ready.
+
 8) Integrate with Stage 0 IR/codegen
 - Write a converter that lowers the AST shape (maps/lists) produced by native_parser into Stage 0 AST/IR structs used by `Lowerer`.
 - From there, use existing Rust codegen to emit and patc to produce a native .exe.
 - Milestone: patc compiling a small program where the AST was produced by the native parser.
+
+8.1) Wire `patc.patlang` to native parser
+- Replace the internal call to `patc_compile_*` with: native_lexer + native_parser → AST-shape → call a new host lowering function to Stage 0 IR → Rust codegen.
+- Keep `patc_compile_*` as a fallback switch (env/flag) until parity is proven.
 
 9) Quality gates and documentation
 - Minimal CI: cargo test includes the parser tolerance tests and the bootstrap smoke.
@@ -96,12 +115,50 @@ Run the native PatLang lexer → parser → evaluator on small programs and prog
 - Parse native sources:
   - `native_lexer.patlang`, `native_parser.patlang`, and `core_evaluator.patlang` currently parse under the evaluator without fatal parse errors.
 
+Try the webserver demo (Windows, from `rust-runtime`):
+
+```bash
+cd e:/patlang/rust-runtime
+# Run without producing an exe (build-run path)
+cargo run -- --build-run ../docs/examples/webserver.patlang
+
+# Compile to a native exe with patc
+cargo run -- --patc ../docs/examples/webserver.patlang --out ../docs/examples/webserver.exe
+
+# Then run the exe (starts a localhost server on the configured port)
+../docs/examples/webserver.exe
+```
+
+Note: The server prints a keepalive message and listens on the port set in the script (8123 in the example). Press Ctrl+C to stop.
+
+Try the minimal native patc (bootstrap path):
+
+```bash
+cd e:/patlang
+# Using the built binary
+./rust-runtime/target/debug/pat ./patc.patlang ./demo.patlang --out ./demo2.exe
+
+# Or via cargo
+cd e:/patlang/rust-runtime
+cargo run -- ../patc.patlang ../demo.patlang --out ../demo3.exe
+```
+
+Tip: Set `PATLANG_DEBUG=1` to see detailed evaluator/parser logs during bootstrap debugging.
+
 ## deliverables summary
 - Parser tolerance tests (short, focused).
 - Tiny `.patlang` harnesses: lexer demo, parser demo, evaluator demo.
 - Bootstrap `.patlang` pipeline wiring all three.
 - AST-to-IR lowering adapter for integration with codegen/patc.
 - README + status matrix.
+
+### immediate next steps
+
+- Define the minimal token/AST interchange (maps/lists). If needed, add small helper constructors (e.g., `map_new`, `map_set`) to ease encoding from `.patlang`.
+- Create a tiny `.patlang` lexer harness to produce a token list for a 2–3 line program and print a summary.
+- Build the native-parser harness to accept that token list and print a compact AST shape.
+- Implement the AST-shape → Stage 0 AST/IR adapter and add a smoke test that compiles a tiny program end-to-end via the native parser.
+- Enhance `patc.patlang` UX: usage/help, error codes, and a fallback flag to force the Stage 0 backend while native parity is in progress.
 
 ---
 Maintaining a small Stage 0 while leaning on the native `.patlang` implementations lets us iterate quickly toward self-hosting without overcommitting semantics early.

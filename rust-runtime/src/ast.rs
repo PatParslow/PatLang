@@ -58,6 +58,10 @@ pub enum Stmt {
         then_branch: Vec<Stmt>,
         else_branch: Option<Vec<Stmt>>,
     },
+    While {
+        cond: Expr,
+        body: Vec<Stmt>,
+    },
     Fact {
         name: String,
         args: Vec<Expr>,
