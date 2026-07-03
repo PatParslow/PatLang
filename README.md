@@ -61,7 +61,8 @@ For detailed development tracking, see:
 ## Quick Start
 
 For a comprehensive introduction to Patlang, see:
-- [`getting-started.md`](getting-started.md) - Complete tutorial and examples
+- [`TUTORIAL.md`](TUTORIAL.md) - **Start here**: tutorial for the working native runtime and self-hosted compiler (build, run, compile, all paradigms)
+- [`getting-started.md`](getting-started.md) - Older tutorial and examples (legacy evaluator)
 
 ## Documentation Structure
 
