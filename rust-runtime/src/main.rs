@@ -43,6 +43,12 @@ fn main() {
             process::exit(1);
         }
     };
+    // Expand include "path" lines relative to the script's directory
+    let base_dir = std::path::Path::new(filename).parent().map(|p| p.to_path_buf()).unwrap_or_else(|| std::path::PathBuf::from("."));
+    let source = match patlang_runtime::preprocess::expand_includes(&source, &base_dir) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("Include error: {}", e); process::exit(1); }
+    };
     if mode == "ir-run" || mode == "emit-rust" || mode == "build-run" || mode == "compare" || mode == "patc" {
         // Guardrail: quick scan for unsupported high-level constructs before parsing
         let unsupported_markers = [
@@ -180,6 +186,7 @@ fn main() {
                             let key = match &args[1] { Value::String(s) => s.clone(), _ => return Err("expected string key".into()) };
                             match &args[0] { Value::Object(map) => Ok(map.get(&key).cloned().unwrap_or(Value::Unit)), _ => Ok(Value::Unit), }
                         });
+                        register_stage0_shims(&mut interp);
                         interp.run(&program).unwrap_or(Value::Unit)
                     };
                     let interp_dur = interp_start.elapsed();
@@ -252,6 +259,7 @@ fn main() {
             _ => Ok(Value::Unit),
         }
     });
+    register_stage0_shims(&mut interp);
     match interp.run(&program) {
             Ok(v) => {
                 println!("{}", display_value(&v));
@@ -416,3 +424,7 @@ fn host_bin_num(args: &[Value], f: fn(f64, f64) -> f64) -> Result<Value, String>
     let bn = match b { Value::Number(n) => *n, _ => return Err("expected number".into()) };
     Ok(Value::Number(f(an, bn)))
 }
+
+// Stage 0 string/list host shims live in the library so tests and other
+// consumers register the same set: patlang_runtime::ir::hosts
+use patlang_runtime::ir::hosts::register_stage0_shims;

@@ -17,10 +17,16 @@ impl Lowerer {
     let mut main_fn = Function { name: "main".into(), ..Default::default() };
         let mut program = Program::default();
         program.entry = "main".into();
-        // First pass: collect function definitions into program
+        // Pre-pass: collect all function names so forward references and mutual
+        // recursion lower to Call rather than CallHost regardless of definition order
+        for s in stmts {
+            if let Stmt::Function { name, .. } = s {
+                self.known_functions.insert(name.clone());
+            }
+        }
+        // First pass: lower function definitions into program
         for s in stmts {
             if let Stmt::Function { name, params, body } = s.clone() {
-        self.known_functions.insert(name.clone());
                 let mut f = Function { name: name.clone(), params: params.clone(), ..Default::default() };
                 // Lower the function body
                 let mut saved_locals = std::mem::take(&mut self.known_locals);
@@ -131,7 +137,9 @@ impl Lowerer {
             Expr::Number(_) | Expr::String(_) => true,
             Expr::Identifier(name) => name == "true" || name == "false" || self.known_locals.contains(name),
             Expr::List(items) => items.iter().all(|it| self.expr_is_safe(it)),
-            Expr::Member { .. } => false,
+            // Member reads lower to len/get host calls; safe when the object expr is safe
+            Expr::Member { object, .. } => self.expr_is_safe(object),
+            Expr::Index { object, index } => self.expr_is_safe(object) && self.expr_is_safe(index),
             Expr::UnaryOp { expr, .. } => self.expr_is_safe(expr),
             Expr::BinaryOp { left, right, .. } => self.expr_is_safe(left) && self.expr_is_safe(right),
             Expr::Call { function, args } => {
@@ -146,7 +154,8 @@ impl Lowerer {
     fn is_allowed_host(&self, name: &str) -> bool {
         matches!(name,
             "print"|"add"|"multiply"|"subtract"|"max"|"min"|"calculate"|"calculate_result"|
-            "get_value"|"process"|"validate"|"len"|"get"|"send"|"emit"|"sed"
+            "get_value"|"process"|"validate"|"len"|"get"|"send"|"emit"|"sed"|
+            "list_get"|"list_len"|"list_push"|"char_code"|"substr"|"to_num"|"read_file"|"compile_shape"
         )
     }
 
@@ -177,6 +186,12 @@ impl Lowerer {
                     f.body.push(Instr::Const(Value::String(property.clone())));
                     f.body.push(Instr::CallHost("get".into(), 2));
                 }
+            }
+            Expr::Index { object, index } => {
+                // xs[i] lowers to host list_get(xs, i); also yields string char at i
+                self.lower_expr(object, f);
+                self.lower_expr(index, f);
+                f.body.push(Instr::CallHost("list_get".into(), 2));
             }
             Expr::Call { function, args } => {
                 // Identifier calls map to host calls; member calls map to message send
@@ -262,6 +277,7 @@ impl Lowerer {
                             Div => Instr::BinOp(BinOpKind::Div),
                             Mod => Instr::BinOp(BinOpKind::Mod),
                             Equal => Instr::BinOp(BinOpKind::Eq),
+                            NotEqual => Instr::BinOp(BinOpKind::Ne),
                             Greater => Instr::BinOp(BinOpKind::Gt),
                             GreaterEqual => Instr::BinOp(BinOpKind::Ge),
                             Less => Instr::BinOp(BinOpKind::Lt),

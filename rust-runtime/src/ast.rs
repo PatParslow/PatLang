@@ -13,6 +13,11 @@ pub enum Expr {
         object: Box<Expr>,
         property: String,
     },
+    // Index expression: xs[i]
+    Index {
+        object: Box<Expr>,
+        index: Box<Expr>,
+    },
     // Closure literal: |params| { body }
     Closure {
         params: Vec<String>,
@@ -88,6 +93,7 @@ pub enum BinaryOperator {
     And,
     Or,
     Equal,
+    NotEqual,
     Greater,
     GreaterEqual,
     Less,
@@ -113,6 +119,7 @@ impl BinaryOpKind {
             BinaryOperator::And
             | BinaryOperator::Or => BinaryOpKind::Logical(op.clone()),
             BinaryOperator::Equal
+            | BinaryOperator::NotEqual
             | BinaryOperator::Greater
             | BinaryOperator::GreaterEqual
             | BinaryOperator::Less
