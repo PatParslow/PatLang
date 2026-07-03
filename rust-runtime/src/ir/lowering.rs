@@ -159,7 +159,7 @@ impl Lowerer {
             "vec_new"|"vec_push"|"vec_set"|"vec_get"|"vec_len"|"vec_to_list"|"sb_new"|"sb_push"|"sb_str"|
             "str_intern"|"sc_len"|"sc_code"|"sc_char"|"now_ms"|"read_file_b64"|"exec_capture"|
             "fact"|"query"|"goal"|"new"|"set_var"|"apply"|
-            "tcp_listen"|"tcp_accept"|"tcp_read"|"tcp_write"|"tcp_close"
+            "tcp_listen"|"tcp_accept"|"tcp_accept_timeout"|"sleep_ms"|"tcp_read"|"tcp_write"|"tcp_close"
         )
     }
 

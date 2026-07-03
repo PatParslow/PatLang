@@ -919,6 +919,39 @@ pub fn host_tcp_accept(args: &[Value]) -> Result<Value, String> {
     Ok(Value::Number(id as f64))
 }
 
+pub fn host_sleep_ms(args: &[Value]) -> Result<Value, String> {
+    let ms = arg_num(args, 0, "sleep_ms")?.max(0.0) as u64;
+    std::thread::sleep(std::time::Duration::from_millis(ms));
+    Ok(Value::Unit)
+}
+
+pub fn host_tcp_accept_timeout(args: &[Value]) -> Result<Value, String> {
+    // tcp_accept_timeout(port, ms) -> conn id, or -1 if nothing arrived in
+    // time. The non-blocking primitive under PatLang event loops.
+    let port = arg_num(args, 0, "tcp_accept_timeout")? as u16;
+    let ms = arg_num(args, 1, "tcp_accept_timeout")?.max(0.0) as u64;
+    let listener = LISTENERS.with(|l| l.borrow().get(&port).map(|x| x.try_clone()))
+        .ok_or_else(|| format!("tcp_accept_timeout: no listener on port {}", port))?
+        .map_err(|e| format!("tcp_accept_timeout: {}", e))?;
+    listener.set_nonblocking(true).map_err(|e| format!("tcp_accept_timeout: {}", e))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let _ = stream.set_nonblocking(false);
+                let id = NEXT_CONN.with(|n| { let mut b = n.borrow_mut(); let v = *b; *b += 1; v });
+                CONNS.with(|c| c.borrow_mut().insert(id, stream));
+                return Ok(Value::Number(id as f64));
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline { return Ok(Value::Number(-1.0)); }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(e) => return Err(format!("tcp_accept_timeout: {}", e)),
+        }
+    }
+}
+
 pub fn host_tcp_read(args: &[Value]) -> Result<Value, String> {
     use std::io::Read;
     let id = arg_num(args, 0, "tcp_read")? as usize;
@@ -1008,6 +1041,8 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     // networking
     interp.host.insert("tcp_listen", host_tcp_listen);
     interp.host.insert("tcp_accept", host_tcp_accept);
+    interp.host.insert("tcp_accept_timeout", host_tcp_accept_timeout);
+    interp.host.insert("sleep_ms", host_sleep_ms);
     interp.host.insert("tcp_read", host_tcp_read);
     interp.host.insert("tcp_write", host_tcp_write);
     interp.host.insert("tcp_close", host_tcp_close);
