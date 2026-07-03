@@ -1078,6 +1078,16 @@ fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Va
                         last = run_function(program, callee, &[Value::String(ev.clone()), payload.clone()])?;
                     }
                     stack.push(last);
+                } else if n == "apply" {
+                    // apply(fname, args...): call a program function by name
+                    let fname = match args.get(0) {
+                        Some(Value::String(s)) => s.clone(),
+                        _ => return Err("apply: expected function name string".into()),
+                    };
+                    let callee = program.functions.get(&fname)
+                        .ok_or_else(|| format!("apply: function '{}' not found", fname))?;
+                    let r = run_function(program, callee, &args[1..])?;
+                    stack.push(r);
                 } else {
                     let r = Host::call(n, &args)?; stack.push(r);
                 }

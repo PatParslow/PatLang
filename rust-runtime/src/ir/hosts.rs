@@ -104,7 +104,110 @@ pub fn host_get(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 { return Err("expected 2 args".into()); }
     let key = match &args[1] { Value::String(s) => s.clone(), _ => return Err("expected string key".into()) };
     match &args[0] {
+        // String receiver reads from the named-object store (OO style), matching
+        // the codegen template's `get` arm
+        Value::String(name) => Ok(obj_get(name, &key).unwrap_or(Value::Unit)),
         Value::Object(map) => Ok(map.get(&key).cloned().unwrap_or(Value::Unit)),
+        _ => Ok(Value::Unit),
+    }
+}
+
+// --- OO + logic state (mirrors the thread-locals in the codegen template) ---
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+thread_local! {
+    static OBJECTS: RefCell<HashMap<String, HashMap<String, Value>>> = RefCell::new(HashMap::new());
+    static FACTS: RefCell<HashMap<String, Vec<(String, String)>>> = RefCell::new(HashMap::new());
+    static GOALS: RefCell<Vec<(String, Vec<String>)>> = RefCell::new(Vec::new());
+}
+
+fn obj_get(name: &str, prop: &str) -> Option<Value> {
+    OBJECTS.with(|o| o.borrow().get(name).and_then(|m| m.get(prop)).cloned())
+}
+
+fn obj_set(name: &str, prop: &str, val: Value) {
+    OBJECTS.with(|o| {
+        let mut b = o.borrow_mut();
+        b.entry(name.to_string()).or_insert_with(HashMap::new).insert(prop.to_string(), val);
+    });
+}
+
+fn ensure_obj(name: &str, class: &str) {
+    obj_set(name, "type", Value::String(class.to_string()));
+    obj_set(name, "name", Value::String(name.to_string()));
+}
+
+/// Reset OO/logic state — call between independent runs (tests).
+pub fn reset_world() {
+    OBJECTS.with(|o| o.borrow_mut().clear());
+    FACTS.with(|f| f.borrow_mut().clear());
+    GOALS.with(|g| g.borrow_mut().clear());
+}
+
+fn to_s(v: &Value) -> String { display_value(v) }
+
+pub fn host_fact(args: &[Value]) -> Result<Value, String> {
+    // fact(pred, a, b) records a binary fact
+    if args.len() != 3 { return Ok(Value::Unit); }
+    let pred = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
+    let a = to_s(&args[1]);
+    let b = to_s(&args[2]);
+    FACTS.with(|f| f.borrow_mut().entry(pred).or_insert_with(Vec::new).push((a, b)));
+    Ok(Value::Unit)
+}
+
+pub fn host_query(args: &[Value]) -> Result<Value, String> {
+    // query(pred, a, _) -> Number of facts matching (pred, a, *)
+    if args.len() != 3 { return Ok(Value::Number(0.0)); }
+    let pred = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
+    let a = to_s(&args[1]);
+    let count = FACTS.with(|f| {
+        f.borrow().get(&pred).map(|v| v.iter().filter(|(x, _)| x == &a).count()).unwrap_or(0)
+    });
+    Ok(Value::Number(count as f64))
+}
+
+pub fn host_goal(args: &[Value]) -> Result<Value, String> {
+    // goal(pred, items...) records a pending goal
+    if args.is_empty() { return Ok(Value::Unit); }
+    let pred = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
+    let items: Vec<String> = args[1..].iter().map(to_s).collect();
+    GOALS.with(|g| g.borrow_mut().push((pred, items)));
+    Ok(Value::Unit)
+}
+
+pub fn host_new(args: &[Value]) -> Result<Value, String> {
+    // new(class, name) -> name, registering the object
+    if args.len() != 2 { return Ok(Value::Unit); }
+    let class = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
+    let name = match &args[1] { Value::String(s) => s.clone(), _ => String::new() };
+    if !name.is_empty() { ensure_obj(&name, &class); }
+    Ok(Value::String(name))
+}
+
+pub fn host_set_var(args: &[Value]) -> Result<Value, String> {
+    // set_var(key, val) stores into the shared __vars object
+    if args.len() != 2 { return Ok(Value::Unit); }
+    let key = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
+    if !key.is_empty() { obj_set("__vars", &key, args[1].clone()); }
+    Ok(Value::Unit)
+}
+
+pub fn host_send(args: &[Value]) -> Result<Value, String> {
+    // send(recv, method, args...) — supports "set" like the template arm
+    if args.len() < 2 { return Ok(Value::Unit); }
+    let recv = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
+    let method = match &args[1] { Value::String(s) => s.clone(), _ => String::new() };
+    let rest = &args[2..];
+    match method.as_str() {
+        "set" => {
+            if rest.len() != 2 { return Ok(Value::Unit); }
+            let prop = match &rest[0] { Value::String(s) => s.clone(), _ => String::new() };
+            if !recv.is_empty() && !prop.is_empty() { obj_set(&recv, &prop, rest[1].clone()); }
+            Ok(Value::Unit)
+        }
         _ => Ok(Value::Unit),
     }
 }
@@ -115,7 +218,7 @@ pub fn host_get(args: &[Value]) -> Result<Value, String> {
 //   ["Let", name, expr] | ["Print", expr]
 //   ["Num", text] | ["Str", text] | ["Var", name] | ["Bin", op, lhs, rhs]
 
-use super::types::{Program, Function, Instr, BinOpKind};
+use super::types::{Program, Function, Instr, BinOpKind, UnOpKind};
 
 fn shape_list(v: &Value) -> Result<&Vec<Value>, String> {
     match v { Value::List(xs) => Ok(xs), _ => Err(format!("compile_shape: expected list node, got {}", display_value(v))) }
@@ -129,7 +232,15 @@ fn shape_str(xs: &[Value], i: usize, what: &str) -> Result<String, String> {
     match xs.get(i) { Some(Value::String(s)) => Ok(s.clone()), _ => Err(format!("compile_shape: expected string {} in node", what)) }
 }
 
-fn lower_shape_expr(v: &Value, f: &mut Function) -> Result<(), String> {
+fn shape_stmt_list<'a>(xs: &'a [Value], i: usize, what: &str) -> Result<&'a Vec<Value>, String> {
+    match xs.get(i) { Some(Value::List(s)) => Ok(s), _ => Err(format!("compile_shape: expected statement list {}", what)) }
+}
+
+struct ShapeCtx {
+    user_fns: std::collections::HashSet<String>,
+}
+
+fn lower_shape_expr(v: &Value, f: &mut Function, ctx: &ShapeCtx) -> Result<(), String> {
     let xs = shape_list(v)?;
     match shape_tag(xs)? {
         "Num" => {
@@ -141,6 +252,10 @@ fn lower_shape_expr(v: &Value, f: &mut Function) -> Result<(), String> {
             let text = shape_str(xs, 1, "string text")?;
             f.body.push(Instr::Const(Value::String(text)));
         }
+        "Bool" => {
+            let text = shape_str(xs, 1, "bool text")?;
+            f.body.push(Instr::Const(Value::Bool(text == "true")));
+        }
         "Var" => {
             let name = shape_str(xs, 1, "variable name")?;
             f.body.push(Instr::LoadLocal(name));
@@ -149,8 +264,8 @@ fn lower_shape_expr(v: &Value, f: &mut Function) -> Result<(), String> {
             let op = shape_str(xs, 1, "operator")?;
             let lhs = xs.get(2).ok_or("compile_shape: Bin missing lhs")?;
             let rhs = xs.get(3).ok_or("compile_shape: Bin missing rhs")?;
-            lower_shape_expr(lhs, f)?;
-            lower_shape_expr(rhs, f)?;
+            lower_shape_expr(lhs, f, ctx)?;
+            lower_shape_expr(rhs, f, ctx)?;
             let kind = match op.as_str() {
                 "+" => BinOpKind::Add,
                 "-" => BinOpKind::Sub,
@@ -163,28 +278,113 @@ fn lower_shape_expr(v: &Value, f: &mut Function) -> Result<(), String> {
                 "<=" => BinOpKind::Le,
                 ">" => BinOpKind::Gt,
                 ">=" => BinOpKind::Ge,
+                // Note: unlike the Stage 0 lowerer these do not short-circuit;
+                // both operands are evaluated, then combined by truthiness.
+                "and" => BinOpKind::And,
+                "or" => BinOpKind::Or,
                 other => return Err(format!("compile_shape: unknown operator '{}'", other)),
             };
             f.body.push(Instr::BinOp(kind));
+        }
+        "Un" => {
+            let op = shape_str(xs, 1, "unary operator")?;
+            let e = xs.get(2).ok_or("compile_shape: Un missing operand")?;
+            lower_shape_expr(e, f, ctx)?;
+            match op.as_str() {
+                "-" => f.body.push(Instr::UnOp(UnOpKind::Neg)),
+                "not" => f.body.push(Instr::UnOp(UnOpKind::Not)),
+                other => return Err(format!("compile_shape: unknown unary operator '{}'", other)),
+            }
+        }
+        "Call" => {
+            let name = shape_str(xs, 1, "call name")?;
+            let args = shape_stmt_list(xs, 2, "in Call")?;
+            for a in args { lower_shape_expr(a, f, ctx)?; }
+            if ctx.user_fns.contains(&name) {
+                f.body.push(Instr::Call(name, args.len()));
+            } else {
+                f.body.push(Instr::CallHost(name, args.len()));
+            }
+        }
+        "List" => {
+            let items = shape_stmt_list(xs, 1, "in List")?;
+            for it in items { lower_shape_expr(it, f, ctx)?; }
+            f.body.push(Instr::BuildList(items.len()));
+        }
+        "Index" => {
+            let obj = xs.get(1).ok_or("compile_shape: Index missing object")?;
+            let idx = xs.get(2).ok_or("compile_shape: Index missing index")?;
+            lower_shape_expr(obj, f, ctx)?;
+            lower_shape_expr(idx, f, ctx)?;
+            f.body.push(Instr::CallHost("list_get".into(), 2));
+        }
+        "Member" => {
+            let obj = xs.get(1).ok_or("compile_shape: Member missing object")?;
+            let prop = shape_str(xs, 2, "member name")?;
+            lower_shape_expr(obj, f, ctx)?;
+            if prop == "length" || prop == "len" {
+                f.body.push(Instr::CallHost("len".into(), 1));
+            } else {
+                f.body.push(Instr::Const(Value::String(prop)));
+                f.body.push(Instr::CallHost("get".into(), 2));
+            }
         }
         other => return Err(format!("compile_shape: unknown expr node '{}'", other)),
     }
     Ok(())
 }
 
-fn lower_shape_stmt(v: &Value, f: &mut Function) -> Result<(), String> {
+fn lower_shape_stmt(v: &Value, f: &mut Function, ctx: &ShapeCtx) -> Result<(), String> {
     let xs = shape_list(v)?;
     match shape_tag(xs)? {
         "Let" => {
             let name = shape_str(xs, 1, "let name")?;
             let expr = xs.get(2).ok_or("compile_shape: Let missing expr")?;
-            lower_shape_expr(expr, f)?;
+            lower_shape_expr(expr, f, ctx)?;
             f.body.push(Instr::StoreLocal(name));
         }
         "Print" => {
+            // legacy alias for ["Expr", ["Call", "print", [e]]]
             let expr = xs.get(1).ok_or("compile_shape: Print missing expr")?;
-            lower_shape_expr(expr, f)?;
+            lower_shape_expr(expr, f, ctx)?;
             f.body.push(Instr::CallHost("print".into(), 1));
+        }
+        "Expr" => {
+            let expr = xs.get(1).ok_or("compile_shape: Expr missing expr")?;
+            lower_shape_expr(expr, f, ctx)?;
+        }
+        "Return" => {
+            let expr = xs.get(1).ok_or("compile_shape: Return missing expr")?;
+            lower_shape_expr(expr, f, ctx)?;
+            f.body.push(Instr::Return);
+        }
+        "If" => {
+            let cond = xs.get(1).ok_or("compile_shape: If missing cond")?;
+            let then_stmts = shape_stmt_list(xs, 2, "in If then-branch")?;
+            let else_stmts = shape_stmt_list(xs, 3, "in If else-branch")?;
+            lower_shape_expr(cond, f, ctx)?;
+            let jif_idx = f.body.len();
+            f.body.push(Instr::JumpIfFalse(usize::MAX));
+            for s in then_stmts { lower_shape_stmt(s, f, ctx)?; }
+            let jmp_idx = f.body.len();
+            f.body.push(Instr::Jump(usize::MAX));
+            let else_pc = f.body.len();
+            if let Instr::JumpIfFalse(ref mut t) = f.body[jif_idx] { *t = else_pc; }
+            for s in else_stmts { lower_shape_stmt(s, f, ctx)?; }
+            let after = f.body.len();
+            if let Instr::Jump(ref mut t) = f.body[jmp_idx] { *t = after; }
+        }
+        "While" => {
+            let cond = xs.get(1).ok_or("compile_shape: While missing cond")?;
+            let body = shape_stmt_list(xs, 2, "in While body")?;
+            let loop_start = f.body.len();
+            lower_shape_expr(cond, f, ctx)?;
+            let jif_idx = f.body.len();
+            f.body.push(Instr::JumpIfFalse(usize::MAX));
+            for s in body { lower_shape_stmt(s, f, ctx)?; }
+            f.body.push(Instr::Jump(loop_start));
+            let after = f.body.len();
+            if let Instr::JumpIfFalse(ref mut t) = f.body[jif_idx] { *t = after; }
         }
         "Err" => {
             return Err(format!("compile_shape: parse error node: {}", shape_str(xs, 1, "message").unwrap_or_default()));
@@ -194,17 +394,66 @@ fn lower_shape_stmt(v: &Value, f: &mut Function) -> Result<(), String> {
     Ok(())
 }
 
-/// Convert a list-shaped AST into an IR Program with a single main function.
+/// Convert a list-shaped AST into an IR Program: Func nodes become functions,
+/// When nodes become event handlers, everything else lowers into main.
 pub fn shape_to_program(v: &Value) -> Result<Program, String> {
     let xs = shape_list(v)?;
     if shape_tag(xs)? != "Program" { return Err("compile_shape: root node must be Program".into()); }
     let stmts = match xs.get(1) { Some(Value::List(s)) => s, _ => return Err("compile_shape: Program missing statement list".into()) };
-    let mut f = Function { name: "main".into(), ..Default::default() };
-    for s in stmts { lower_shape_stmt(s, &mut f)?; }
-    f.body.push(Instr::Return);
+
+    // Pass 1: collect user function names so calls lower to Call, not CallHost
+    let mut ctx = ShapeCtx { user_fns: std::collections::HashSet::new() };
+    for s in stmts {
+        if let Ok(nx) = shape_list(s) {
+            if shape_tag(nx) == Ok("Func") {
+                ctx.user_fns.insert(shape_str(nx, 1, "function name")?);
+            }
+        }
+    }
+
     let mut program = Program::default();
     program.entry = "main".into();
-    program.functions.insert("main".into(), f);
+    let mut main_fn = Function { name: "main".into(), ..Default::default() };
+    let mut handler_counter = 0usize;
+
+    for s in stmts {
+        let nx = shape_list(s)?;
+        match shape_tag(nx)? {
+            "Func" => {
+                let name = shape_str(nx, 1, "function name")?;
+                let params: Vec<String> = match nx.get(2) {
+                    Some(Value::List(ps)) => ps.iter().map(|p| match p {
+                        Value::String(s) => Ok(s.clone()),
+                        _ => Err("compile_shape: function param must be a string".to_string()),
+                    }).collect::<Result<_, _>>()?,
+                    _ => return Err("compile_shape: Func missing params".into()),
+                };
+                let body = shape_stmt_list(nx, 3, "in Func body")?;
+                let mut f = Function { name: name.clone(), params, ..Default::default() };
+                for st in body { lower_shape_stmt(st, &mut f, &ctx)?; }
+                f.body.push(Instr::Return);
+                program.functions.insert(name, f);
+            }
+            "When" => {
+                let event = shape_str(nx, 1, "event name")?;
+                let body = shape_stmt_list(nx, 2, "in When body")?;
+                handler_counter += 1;
+                let hname = format!("__when_{}_{}", event, handler_counter);
+                let mut hf = Function {
+                    name: hname.clone(),
+                    params: vec!["event_name".into(), "event_data".into()],
+                    ..Default::default()
+                };
+                for st in body { lower_shape_stmt(st, &mut hf, &ctx)?; }
+                hf.body.push(Instr::Return);
+                program.functions.insert(hname.clone(), hf);
+                program.event_handlers.entry(event).or_default().push(hname);
+            }
+            _ => lower_shape_stmt(s, &mut main_fn, &ctx)?,
+        }
+    }
+    main_fn.body.push(Instr::Return);
+    program.functions.insert("main".into(), main_fn);
     Ok(program)
 }
 
@@ -253,4 +502,11 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("to_num", host_to_num);
     interp.host.insert("read_file", host_read_file);
     interp.host.insert("compile_shape", host_compile_shape);
+    // OO + logic hosts (state shared per thread, matching compiled semantics)
+    interp.host.insert("fact", host_fact);
+    interp.host.insert("query", host_query);
+    interp.host.insert("goal", host_goal);
+    interp.host.insert("new", host_new);
+    interp.host.insert("set_var", host_set_var);
+    interp.host.insert("send", host_send);
 }
