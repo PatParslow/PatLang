@@ -477,16 +477,21 @@ pub fn shape_to_program(v: &Value) -> Result<Program, String> {
     Ok(program)
 }
 
-/// Shared back half: emit Rust for a Program and compile it with rustc.
-fn compile_program_to_exe(program: &Program, out: &str, what: &str) -> Result<Value, String> {
-    let cg = super::codegen::RustCodegen::new();
-    let rust_src = cg.emit_rust(program);
-
+/// Shared tail: write Rust source to a temp file and compile it with rustc.
+fn compile_source_to_exe(rust_src: &str, out: &str, what: &str) -> Result<Value, String> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
     let mut tmp = std::env::temp_dir();
     tmp.push("patlang_shape_compile");
     std::fs::create_dir_all(&tmp).map_err(|e| format!("{}: temp dir: {}", what, e))?;
-    let src_path = tmp.join("shape_main.rs");
-    std::fs::write(&src_path, &rust_src).map_err(|e| format!("{}: write {}: {}", what, src_path.display(), e))?;
+    // Unique per process+invocation: parallel test threads must not clobber
+    // each other's source while rustc is reading it
+    let src_path = tmp.join(format!(
+        "shape_main_{}_{}.rs",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&src_path, rust_src).map_err(|e| format!("{}: write {}: {}", what, src_path.display(), e))?;
 
     if let Some(parent) = std::path::Path::new(out).parent() { let _ = std::fs::create_dir_all(parent); }
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
@@ -501,6 +506,31 @@ fn compile_program_to_exe(program: &Program, out: &str, what: &str) -> Result<Va
     let p = std::path::Path::new(out);
     let abs = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     Ok(Value::String(abs.display().to_string()))
+}
+
+/// Shared back half: emit Rust for a Program and compile it with rustc.
+fn compile_program_to_exe(program: &Program, out: &str, what: &str) -> Result<Value, String> {
+    let cg = super::codegen::RustCodegen::new();
+    let rust_src = cg.emit_rust(program);
+    compile_source_to_exe(&rust_src, out, what)
+}
+
+/// codegen_prelude() -> the static runtime library text embedded in every
+/// emitted program. Self-hosted codegen concatenates this with its own
+/// generated build_program section.
+pub fn host_codegen_prelude(_args: &[Value]) -> Result<Value, String> {
+    Ok(Value::String(super::codegen::RustCodegen::prelude().to_string()))
+}
+
+/// rustc_build(rust_source, out_path) -> compiled exe path.
+/// The dumbest possible back end: write the given Rust source and run rustc.
+pub fn host_rustc_build(args: &[Value]) -> Result<Value, String> {
+    let src = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => return Err("rustc_build: expected Rust source string".into()) };
+    let out = match args.get(1) {
+        Some(Value::String(s)) if !s.trim().is_empty() => s.clone(),
+        _ => return Err("rustc_build: expected output path as second argument".into()),
+    };
+    compile_source_to_exe(&src, &out, "rustc_build")
 }
 
 /// compile_shape(ast_shape, out_path) -> compiled exe path.
@@ -715,6 +745,8 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("read_file", host_read_file);
     interp.host.insert("compile_shape", host_compile_shape);
     interp.host.insert("compile_ir", host_compile_ir);
+    interp.host.insert("codegen_prelude", host_codegen_prelude);
+    interp.host.insert("rustc_build", host_rustc_build);
     // OO + logic hosts (state shared per thread, matching compiled semantics)
     interp.host.insert("fact", host_fact);
     interp.host.insert("query", host_query);
