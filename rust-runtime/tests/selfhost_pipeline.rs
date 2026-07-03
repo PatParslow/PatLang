@@ -148,6 +148,31 @@ fn selfhost_stage3_lowering_in_patlang() {
 }
 
 #[test]
+fn selfhost_runtime_text_parity() {
+    // The runtime prelude expressed as PatLang source (lib/runtime_rs.patlang)
+    // must reproduce the host template byte-for-byte. If this fails after a
+    // template change, regenerate: dump_prelude.patlang + transcribe_prelude.py
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let codegen_lib = std::fs::read_to_string(format!("{}/../self_hosting/lib/codegen.patlang", manifest)).expect("read codegen lib");
+    let runtime_lib = std::fs::read_to_string(format!("{}/../self_hosting/lib/runtime_rs.patlang", manifest)).expect("read runtime lib");
+    let driver = "let a = emit_runtime_rs()\nlet b = codegen_prelude()\nif a == b then\n  print(\"PARITY-OK\")\nelse\n  print(\"PARITY-MISMATCH\")\nend\n";
+    let full_src = format!("{}\n{}\n{}", codegen_lib, runtime_lib, driver);
+
+    let mut parser = Stage0Parser::new(&full_src).expect("lexer init");
+    let ast = parser.parse().expect("parity source should parse");
+    let mut lower = Lowerer::new();
+    let program = lower.lower_program_basic(&ast);
+    let mut interp = Interpreter::new();
+    interp.host.insert("print", capture_print);
+    register_stage0_shims(&mut interp);
+    PRINTED.with(|p| p.borrow_mut().clear());
+    interp.run(&program).expect("parity check should run");
+    let lines = PRINTED.with(|p| p.borrow().clone());
+    assert!(lines.iter().any(|l| l == "PARITY-OK"),
+        "PatLang runtime text differs from host template — regenerate runtime_rs.patlang: {:?}", lines);
+}
+
+#[test]
 fn selfhost_stage4_codegen_in_patlang() {
     // Fixpoint step 2a: lexing, parsing, lowering, AND Rust code generation
     // all happen in PatLang; the host only supplies the fixed runtime prelude
@@ -163,6 +188,7 @@ fn selfhost_stage4_codegen_in_patlang() {
     let parser_lib = std::fs::read_to_string(format!("{}/../self_hosting/lib/parser.patlang", manifest)).expect("read parser lib");
     let lower_lib = std::fs::read_to_string(format!("{}/../self_hosting/lib/lower.patlang", manifest)).expect("read lower lib");
     let codegen_lib = std::fs::read_to_string(format!("{}/../self_hosting/lib/codegen.patlang", manifest)).expect("read codegen lib");
+    let runtime_lib = std::fs::read_to_string(format!("{}/../self_hosting/lib/runtime_rs.patlang", manifest)).expect("read runtime lib");
     let demo_path = format!("{}/../self_hosting/examples/feature_demo.patlang", manifest).replace('\\', "/");
 
     let out_dir = std::env::temp_dir().join("patlang_selfhost_pipeline_test");
@@ -180,7 +206,7 @@ fn selfhost_stage4_codegen_in_patlang() {
          print(\"COMPILED\")\n",
         demo_path, exe_str
     );
-    let full_src = format!("{}\n{}\n{}\n{}\n{}", lexer_lib, parser_lib, lower_lib, codegen_lib, driver);
+    let full_src = format!("{}\n{}\n{}\n{}\n{}\n{}", lexer_lib, parser_lib, lower_lib, codegen_lib, runtime_lib, driver);
 
     let mut parser = Stage0Parser::new(&full_src).expect("lexer init");
     let ast = parser.parse().expect("stage 4 pipeline source should parse");
@@ -232,11 +258,12 @@ fn selfhost_fixpoint_patc_compiles_itself() {
 
     // Concatenate the compiler's own source (same as build_patc1.patlang)
     let compiler_src = format!(
-        "{}\n{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}\n{}",
         read("self_hosting/lib/lexer.patlang"),
         read("self_hosting/lib/parser.patlang"),
         read("self_hosting/lib/lower.patlang"),
         read("self_hosting/lib/codegen.patlang"),
+        read("self_hosting/lib/runtime_rs.patlang"),
         read("self_hosting/patc1_main.patlang"),
     );
 
