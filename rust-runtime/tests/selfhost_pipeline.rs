@@ -87,6 +87,73 @@ fn selfhost_pipeline_compiles_feature_demo() {
 }
 
 #[test]
+fn selfhost_pipeline_compiles_tcp_echo_server() {
+    // Networking through the self-hosted front-end: the Stage 1 echo server
+    // compiles natively, binds a TCP port, and answers two HTTP requests.
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    if std::process::Command::new(&rustc).arg("--version").output().is_err() {
+        eprintln!("rustc not found; skipping echo server test");
+        return;
+    }
+
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let lexer_lib = std::fs::read_to_string(format!("{}/../self_hosting/lib/lexer.patlang", manifest)).expect("read lexer lib");
+    let parser_lib = std::fs::read_to_string(format!("{}/../self_hosting/lib/parser.patlang", manifest)).expect("read parser lib");
+    let demo_path = format!("{}/../self_hosting/examples/echo_server.patlang", manifest).replace('\\', "/");
+
+    let out_dir = std::env::temp_dir().join("patlang_selfhost_pipeline_test");
+    let _ = std::fs::create_dir_all(&out_dir);
+    let exe_path = out_dir.join(if cfg!(windows) { "echo_server.exe" } else { "echo_server" });
+    let exe_str = exe_path.display().to_string().replace('\\', "/");
+
+    let driver = format!(
+        "let source = read_file(\"{}\")\n\
+         let toks = tokenize(source)\n\
+         let ast = parse_program(toks)\n\
+         let exe = compile_shape(ast, \"{}\")\n\
+         print(\"COMPILED\")\n",
+        demo_path, exe_str
+    );
+    let full_src = format!("{}\n{}\n{}", lexer_lib, parser_lib, driver);
+
+    let mut parser = Stage0Parser::new(&full_src).expect("lexer init");
+    let ast = parser.parse().expect("pipeline source should parse");
+    let mut lower = Lowerer::new();
+    let program = lower.lower_program_basic(&ast);
+
+    let mut interp = Interpreter::new();
+    interp.host.insert("print", capture_print);
+    register_stage0_shims(&mut interp);
+    PRINTED.with(|p| p.borrow_mut().clear());
+    interp.run(&program).expect("echo server pipeline should run");
+    assert!(exe_path.exists(), "compiled echo server not found at {}", exe_path.display());
+
+    // Spawn the server, read the bound port from its stdout, hit it twice
+    use std::io::{BufRead, BufReader, Read, Write};
+    let mut child = std::process::Command::new(&exe_path)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn echo server");
+    let stdout = child.stdout.take().expect("child stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut first = String::new();
+    reader.read_line(&mut first).expect("read PORT line");
+    let port: u16 = first.trim().strip_prefix("PORT: ").expect("PORT line").parse().expect("port number");
+
+    for path in ["/hello", "/again"] {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        write!(stream, "GET {} HTTP/1.1\r\nHost: localhost\r\n\r\n", path).expect("send request");
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).expect("read response");
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "bad response: {}", resp);
+        assert!(resp.contains(&format!("echo: GET {} HTTP/1.1", path)), "echo missing: {}", resp);
+    }
+
+    let status = child.wait().expect("server exit");
+    assert!(status.success(), "server exited with {:?}", status);
+}
+
+#[test]
 fn selfhost_pipeline_compiles_program_via_patlang_frontend() {
     // rustc is required to complete the pipeline; skip when unavailable
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());

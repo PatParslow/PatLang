@@ -24,6 +24,17 @@ thread_local! {
     static GOALS: RefCell<Vec<(String, Vec<String>)>> = RefCell::new(Vec::new());
     static TYPE_RULES: RefCell<HashMap<(String, usize), String>> = RefCell::new(HashMap::new());
     static EVENT_HANDLERS: RefCell<HashMap<String, Vec<String>>> = RefCell::new(HashMap::new());
+    static LISTENERS: RefCell<HashMap<u16, std::net::TcpListener>> = RefCell::new(HashMap::new());
+    static CONNS: RefCell<HashMap<usize, std::net::TcpStream>> = RefCell::new(HashMap::new());
+    static NEXT_CONN: RefCell<usize> = RefCell::new(1);
+}
+
+fn arg_num(args: &[Value], i: usize, what: &str) -> Result<f64, String> {
+    match args.get(i) {
+        Some(Value::Number(n)) => Ok(*n),
+        Some(Value::String(s)) => s.trim().parse::<f64>().map_err(|_| format!("{}: expected number", what)),
+        _ => Err(format!("{}: expected number", what)),
+    }
 }
 
 fn obj_get(name: &str, prop: &str) -> Option<Value> {
@@ -699,6 +710,12 @@ impl Host {
                 let count = match &args[2] { Value::Number(n) => (*n).max(0.0) as usize, Value::String(t) => t.parse::<usize>().unwrap_or(0), _ => 0 };
                 Ok(Value::String(s.chars().skip(start).take(count).collect()))
             }
+            "chr" => {
+                // chr(code) -> 1-char string (empty for invalid code points)
+                let n = match args.get(0) { Some(Value::Number(n)) => *n, Some(Value::String(s)) => s.trim().parse::<f64>().unwrap_or(-1.0), _ => -1.0 };
+                if n < 0.0 { return Ok(Value::String(String::new())); }
+                Ok(Value::String(char::from_u32(n as u32).map(|c| c.to_string()).unwrap_or_default()))
+            }
             "to_num" => {
                 // to_num(value) -> Number (parse string, else 0)
                 let v = args.get(0).cloned().unwrap_or(Value::Unit);
@@ -714,6 +731,54 @@ impl Host {
                 // read_file(path) -> String contents
                 let p = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
                 std::fs::read_to_string(&p).map(Value::String).map_err(|e| format!("read_file: {}: {}", p, e))
+            }
+            "tcp_listen" => {
+                // tcp_listen(port) -> Number actual bound port (0 = OS-assigned)
+                let port = arg_num(&args, 0, "tcp_listen")? as u16;
+                let listener = std::net::TcpListener::bind(("127.0.0.1", port))
+                    .map_err(|e| format!("tcp_listen: bind {}: {}", port, e))?;
+                let actual = listener.local_addr().map_err(|e| format!("tcp_listen: {}", e))?.port();
+                LISTENERS.with(|l| l.borrow_mut().insert(actual, listener));
+                Ok(Value::Number(actual as f64))
+            }
+            "tcp_accept" => {
+                // tcp_accept(port) -> Number connection id (blocks)
+                let port = arg_num(&args, 0, "tcp_accept")? as u16;
+                let listener = LISTENERS.with(|l| l.borrow().get(&port).map(|x| x.try_clone()))
+                    .ok_or_else(|| format!("tcp_accept: no listener on port {}", port))?
+                    .map_err(|e| format!("tcp_accept: {}", e))?;
+                let (stream, _) = listener.accept().map_err(|e| format!("tcp_accept: {}", e))?;
+                let id = NEXT_CONN.with(|n| { let mut b = n.borrow_mut(); let v = *b; *b += 1; v });
+                CONNS.with(|c| c.borrow_mut().insert(id, stream));
+                Ok(Value::Number(id as f64))
+            }
+            "tcp_read" => {
+                // tcp_read(conn) -> String (single read, up to 64 KiB)
+                use std::io::Read;
+                let id = arg_num(&args, 0, "tcp_read")? as usize;
+                let mut stream = CONNS.with(|c| c.borrow().get(&id).map(|s| s.try_clone()))
+                    .ok_or_else(|| format!("tcp_read: unknown connection {}", id))?
+                    .map_err(|e| format!("tcp_read: {}", e))?;
+                let mut buf = vec![0u8; 65536];
+                let n = stream.read(&mut buf).map_err(|e| format!("tcp_read: {}", e))?;
+                Ok(Value::String(String::from_utf8_lossy(&buf[..n]).to_string()))
+            }
+            "tcp_write" => {
+                // tcp_write(conn, data) -> Bool
+                use std::io::Write;
+                let id = arg_num(&args, 0, "tcp_write")? as usize;
+                let data = match args.get(1) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
+                let mut stream = CONNS.with(|c| c.borrow().get(&id).map(|s| s.try_clone()))
+                    .ok_or_else(|| format!("tcp_write: unknown connection {}", id))?
+                    .map_err(|e| format!("tcp_write: {}", e))?;
+                stream.write_all(data.as_bytes()).map_err(|e| format!("tcp_write: {}", e))?;
+                let _ = stream.flush();
+                Ok(Value::Bool(true))
+            }
+            "tcp_close" => {
+                let id = arg_num(&args, 0, "tcp_close")? as usize;
+                CONNS.with(|c| c.borrow_mut().remove(&id));
+                Ok(Value::Unit)
             }
             "touch_file" => {
                 // touch_file(path) -> String message (OK <abs> or ERR: <msg>)
@@ -813,6 +878,10 @@ impl Host {
                     let s = display_value(x);
                     let out = interpolate(&s);
                     println!("{}", out);
+                    // Flush so piped consumers (tests, process supervisors) see
+                    // output promptly — stdout is block-buffered when not a tty
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
                 }
                 Ok(Value::Unit)
             },

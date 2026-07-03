@@ -41,6 +41,11 @@ output-verified by `tests/selfhost_pipeline.rs` via
 - **OO**: `new`/`send`/`get` against the named-object store
 - **functional**: `apply(fname, args...)` call-by-name in both VMs enables
   map/filter/reduce written in PatLang (see feature_demo)
+- **networking**: blocking TCP hosts (`tcp_listen`/`tcp_accept`/`tcp_read`/
+  `tcp_write`/`tcp_close`, plus `chr`) in both VMs; a working HTTP echo server
+  written in Stage 1 PatLang compiles natively and answers real requests
+  (`self_hosting/examples/echo_server.patlang`, verified by
+  `selfhost_pipeline_compiles_tcp_echo_server`)
 
 ### next steps toward full self-hosting
 1. Move AST-shape → IR lowering from the `compile_shape` host into PatLang
@@ -52,9 +57,9 @@ output-verified by `tests/selfhost_pipeline.rs` via
 4. Grow the Stage 1 language until it can express `self_hosting/lib/*` itself
    (remaining gaps: string escape decoding in the Stage 1 lexer, `include` at
    the Stage 1 level, closures proper rather than call-by-name).
-5. Async + networking: TCP host arms in the codegen template + IR interpreter
-   (mirroring the webserver.patlang evaluator path); async model to be built
-   as an event loop over the existing event system.
+5. Async: build an event loop over the existing event system (blocking TCP
+   hosts landed July 3, 2026; concurrency/async dispatch is the open half —
+   e.g. accept-loop emitting request events to `when` handlers, timers).
 
 Note: the older `native_lexer/`, `native_parser/`, `native_evaluator/` sources
 are written in a richer aspirational dialect that parses under Stage 0 (kept
