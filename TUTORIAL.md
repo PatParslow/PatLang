@@ -204,21 +204,24 @@ pat --ir-run self_hosting/pipeline_stage2.patlang   # or compile echo_server dir
 
 ## 5. The self-hosting pipeline
 
-PatLang's compiler front and middle end are written in PatLang:
+PatLang's compiler is written in PatLang, end to end:
 
 | Component | File | Written in |
 |-----------|------|-----------|
 | Lexer | `self_hosting/lib/lexer.patlang` | PatLang |
 | Parser | `self_hosting/lib/parser.patlang` | PatLang |
 | Lowerer (AST → IR) | `self_hosting/lib/lower.patlang` | PatLang |
-| IR decode + codegen + rustc | `rust-runtime/src/ir/` | Rust (Stage 0) |
+| Codegen (IR → Rust source text) | `self_hosting/lib/codegen.patlang` | PatLang |
+| Runtime prelude text + "write file, run rustc" | `rust-runtime/src/ir/` | Rust (Stage 0 host) |
 
-Watch the whole thing run — PatLang code tokenizes, parses, and lowers a
-PatLang program, then hands finished IR to the host for native compilation:
+Watch the whole thing run — PatLang code tokenizes, parses, lowers, and
+generates ~78 KB of Rust source for a PatLang program; the host contributes
+only the fixed runtime prelude string (`codegen_prelude()`) and the dumbest
+possible back end (`rustc_build(source, out)`):
 
 ```bash
-pat --ir-run self_hosting/pipeline_stage3.patlang
-./selfhost_stage3_demo.exe
+pat --ir-run self_hosting/pipeline_stage4.patlang
+./selfhost_stage4_demo.exe
 ```
 
 The interchange formats are plain lists, easy to inspect:
@@ -226,9 +229,12 @@ The interchange formats are plain lists, easy to inspect:
 - Token: `["IDENT", "let", 1]` — type, text, line
 - AST node: `["Bin", "+", ["Var", "x"], ["Num", "1"]]`
 - IR instruction: `["CallHost", "print", 1]`
+- Codegen output: a Rust source string, e.g. `body.push(Instr::CallHost("print".to_string(), 1));`
 
-`self_hosting/pipeline_stage1.patlang` and `pipeline_stage2.patlang` show the
-earlier stages (host-side lowering via `compile_shape`).
+`pipeline_stage1.patlang` through `pipeline_stage3.patlang` show the earlier
+stages, where the host still did lowering (`compile_shape`) or IR decoding
+(`compile_ir`). Each stage produces byte-identical program output, verified by
+`rust-runtime/tests/selfhost_pipeline.rs`.
 
 ## 6. Debugging tips
 

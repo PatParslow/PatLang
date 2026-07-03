@@ -54,11 +54,17 @@ output-verified by `tests/selfhost_pipeline.rs` via
    decodes finished IR and runs codegen + rustc. `pipeline_stage3.patlang`
    runs lexer + parser + lowerer all in PatLang; verified by
    `selfhost_stage3_lowering_in_patlang` (identical output to stage 2).
-2. Embed codegen in compiled programs so a natively compiled patc can compile
-   without the `pat` interpreter (true fixpoint: patc.exe compiles patc).
-   Next concrete piece: emit the Rust source text from PatLang too (walk the
-   IR shape and build the program-builder section as a string), leaving only
-   "write file + invoke rustc" on the host.
+2. ✅ DONE (July 3, 2026, step 2a): Rust source emission moved into PatLang.
+   `self_hosting/lib/codegen.patlang` walks the IR shape and generates the
+   program-builder Rust text (rs_escape/rs_str built with chr(), staying in
+   the escape-free Stage 1 dialect); hosts shrank to `codegen_prelude()`
+   (fixed runtime library string) and `rustc_build(source, out)` (write +
+   rustc). `pipeline_stage4.patlang` runs lexer + parser + lowerer + codegen
+   all in PatLang; verified by `selfhost_stage4_codegen_in_patlang`.
+   Step 2b (remaining): a natively *compiled* patc — requires the Stage 1
+   dialect to express the compiler libs themselves (see step 4) so the
+   pipeline can compile its own sources; then patc.exe embeds the prelude
+   text and shells out to rustc without the `pat` interpreter.
 3. Switch `patc.patlang` internals from `patc_compile_from_argv` delegation to
    the native lexer/parser pipeline, keeping the host path as a fallback flag.
 4. Grow the Stage 1 language until it can express `self_hosting/lib/*` itself

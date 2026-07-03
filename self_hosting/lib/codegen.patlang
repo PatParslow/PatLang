@@ -1,0 +1,217 @@
+# =============================================================================
+# Stage 1 self-hosted code generator (Stage 0 compilable subset).
+# Walks the list-shaped IR from lib/lower.patlang and emits the Rust source
+# text of the program-builder section. Combined with the fixed runtime
+# prelude (codegen_prelude host), this is the complete emitted program —
+# the host back end is reduced to "write file, run rustc" (rustc_build).
+#
+# Uses chr(34)/chr(10) for quotes/newlines so this file stays inside the
+# escape-free Stage 1 dialect (ready for eventual self-compilation).
+# =============================================================================
+
+make a function called q returns s
+  return chr(34)
+end
+
+make a function called nl returns s
+  return chr(10)
+end
+
+make a function called rs_escape takes s returns out
+  let out = ""
+  let i = 0
+  while i < s.length do
+    let c = char_code(s, i)
+    if c == 92 then
+      let out = out + chr(92) + chr(92)
+    else
+      if c == 34 then
+        let out = out + chr(92) + chr(34)
+      else
+        if c == 10 then
+          let out = out + chr(92) + "n"
+        else
+          if c == 9 then
+            let out = out + chr(92) + "t"
+          else
+            if c == 13 then
+              let out = out + chr(92) + "r"
+            else
+              let out = out + s[i]
+            end
+          end
+        end
+      end
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# Rust expression for an owned string: "escaped".to_string()
+make a function called rs_str takes s returns out
+  return q() + rs_escape(s) + q() + ".to_string()"
+end
+
+make a function called binop_name takes op returns name
+  if op == "+" then
+    return "Add"
+  else
+    if op == "-" then
+      return "Sub"
+    else
+      if op == "*" then
+        return "Mul"
+      else
+        if op == "/" then
+          return "Div"
+        else
+          if op == "%" then
+            return "Mod"
+          else
+            if op == "==" then
+              return "Eq"
+            else
+              if op == "!=" then
+                return "Ne"
+              else
+                if op == "<" then
+                  return "Lt"
+                else
+                  if op == "<=" then
+                    return "Le"
+                  else
+                    if op == ">" then
+                      return "Gt"
+                    else
+                      if op == ">=" then
+                        return "Ge"
+                      else
+                        if op == "and" then
+                          return "And"
+                        else
+                          if op == "or" then
+                            return "Or"
+                          else
+                            return "Eq"
+                          end
+                        end
+                      end
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+make a function called emit_instr_rs takes instr returns out
+  let ty = instr[0]
+  if ty == "Const" then
+    let kind = instr[1]
+    if kind == "num" then
+      return "Instr::Const(Value::Number(" + instr[2] + "f64))"
+    else
+      if kind == "str" then
+        return "Instr::Const(Value::String(" + rs_str(instr[2]) + "))"
+      else
+        return "Instr::Const(Value::Bool(" + instr[2] + "))"
+      end
+    end
+  else
+    if ty == "Load" then
+      return "Instr::LoadLocal(" + rs_str(instr[1]) + ")"
+    else
+      if ty == "Store" then
+        return "Instr::StoreLocal(" + rs_str(instr[1]) + ")"
+      else
+        if ty == "Bin" then
+          return "Instr::BinOp(BinOpKind::" + binop_name(instr[1]) + ")"
+        else
+          if ty == "Un" then
+            if instr[1] == "not" then
+              return "Instr::UnOp(UnOpKind::Not)"
+            else
+              return "Instr::UnOp(UnOpKind::Neg)"
+            end
+          else
+            if ty == "Jump" then
+              return "Instr::Jump(" + instr[1] + ")"
+            else
+              if ty == "JumpIfFalse" then
+                return "Instr::JumpIfFalse(" + instr[1] + ")"
+              else
+                if ty == "CallHost" then
+                  return "Instr::CallHost(" + rs_str(instr[1]) + ", " + instr[2] + ")"
+                else
+                  if ty == "Call" then
+                    return "Instr::Call(" + rs_str(instr[1]) + ", " + instr[2] + ")"
+                  else
+                    if ty == "BuildList" then
+                      return "Instr::BuildList(" + instr[1] + ")"
+                    else
+                      return "Instr::Return"
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+make a function called emit_build_program takes ir returns out
+  let s = "fn build_program() -> Program {" + nl()
+  let s = s + "    let mut functions: HashMap<String, Function> = HashMap::new();" + nl()
+  let s = s + "    // Seed event handlers registry from embedded Program" + nl()
+  let s = s + "    EVENT_HANDLERS.with(|m| { let mut mm = m.borrow_mut();" + nl()
+  let events = ir[3]
+  let i = 0
+  while i < events.length do
+    let ev = events[i]
+    let s = s + "        mm.entry(" + rs_str(ev[1]) + ").or_insert_with(Vec::new).push(" + rs_str(ev[2]) + ");" + nl()
+    let i = i + 1
+  end
+  let s = s + "    });" + nl()
+  let funcs = ir[2]
+  let i = 0
+  while i < funcs.length do
+    let f = funcs[i]
+    let s = s + "    // function " + f[1] + nl()
+    let s = s + "    let mut body: Vec<Instr> = Vec::new();" + nl()
+    let instrs = f[3]
+    let k = 0
+    while k < instrs.length do
+      let s = s + "    body.push(" + emit_instr_rs(instrs[k]) + ");" + nl()
+      let k = k + 1
+    end
+    let s = s + "    let params: Vec<String> = vec!["
+    let params = f[2]
+    let k = 0
+    while k < params.length do
+      if k > 0 then
+        let s = s + ", "
+      end
+      let s = s + rs_str(params[k])
+      let k = k + 1
+    end
+    let s = s + "];" + nl()
+    let s = s + "    functions.insert(" + rs_str(f[1]) + ", Function { name: " + rs_str(f[1]) + ", params, body });" + nl()
+    let i = i + 1
+  end
+  let s = s + "    Program { functions, entry: " + rs_str(ir[1]) + " }" + nl()
+  let s = s + "}" + nl()
+  return s
+end
+
+# Full emitted program: fixed runtime prelude + generated builder section
+make a function called emit_program_rs takes ir returns out
+  return codegen_prelude() + emit_build_program(ir)
+end
