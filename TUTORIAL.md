@@ -262,14 +262,24 @@ pat --ir-run self_hosting/build_patc1.patlang        # -> ./patc1.exe
 runtime prelude from `self_hosting/runtime/prelude.rs` (relative to the
 working directory), so run it from the repo root or pass the path explicitly.
 
-Two fixed artifacts remain outside PatLang, both deliberate:
+The runtime library embedded in every emitted program is itself PatLang
+source: `self_hosting/lib/runtime_rs.patlang` emits the runtime text
+(parity-checked byte-for-byte against the host template by the test suite),
+so **every byte of an emitted program originates from `.patlang` files
+processed by the PatLang toolchain**. After changing the host template,
+regenerate with:
 
-- **The runtime prelude** (`self_hosting/runtime/prelude.rs`) — the runtime
-  library text embedded in every emitted program, analogous to a libc.
-  Regenerate it after changing the host template:
-  `pat --ir-run self_hosting/tools/dump_prelude.patlang`.
+```bash
+pat --ir-run self_hosting/tools/dump_prelude.patlang
+python self_hosting/tools/transcribe_prelude.py
+```
+
+What remains outside PatLang is the irreducible bootstrap seed:
+
 - **rustc** — the machine-code back end, used the way other compilers use
   LLVM.
+- **The Stage 0 interpreter** (`pat`) — used once per fresh system for
+  Generation A; after that, patc compiles patc.
 
 The full bootstrap is exercised by the (slow, `#[ignore]`d) test:
 `cargo test --test selfhost_pipeline -- --ignored`.
