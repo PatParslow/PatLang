@@ -874,6 +874,14 @@ impl Host {
                 let p = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
                 std::fs::read_to_string(&p).map(Value::String).map_err(|e| format!("read_file: {}: {}", p, e))
             }
+            "now_ms" => {
+                // now_ms() -> Number: milliseconds since the Unix epoch
+                let ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as f64)
+                    .unwrap_or(0.0);
+                Ok(Value::Number(ms))
+            }
             "write_file" => {
                 // write_file(path, contents) -> Bool
                 let p = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };

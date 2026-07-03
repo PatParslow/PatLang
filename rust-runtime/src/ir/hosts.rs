@@ -275,6 +275,42 @@ pub fn host_write_file(args: &[Value]) -> Result<Value, String> {
     std::fs::write(&p, contents).map(|_| Value::Bool(true)).map_err(|e| format!("write_file: {}: {}", p, e))
 }
 
+pub fn host_now_ms(_args: &[Value]) -> Result<Value, String> {
+    // now_ms() -> Number: milliseconds since the Unix epoch (monotonic-enough
+    // for self-timing; under the browser WASI shim it maps to performance.now)
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as f64)
+        .unwrap_or(0.0);
+    Ok(Value::Number(ms))
+}
+
+pub fn host_read_file_b64(args: &[Value]) -> Result<Value, String> {
+    // read_file_b64(path) -> base64 of the raw bytes (for embedding binary
+    // artifacts like .wasm in generated HTML). Builder-side host.
+    let p = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
+    let data = std::fs::read(&p).map_err(|e| format!("read_file_b64: {}: {}", p, e))?;
+    const TBL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(TBL[(n >> 18) as usize & 63] as char);
+        out.push(TBL[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { TBL[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TBL[n as usize & 63] as char } else { '=' });
+    }
+    Ok(Value::String(out))
+}
+
+pub fn host_exec_capture(args: &[Value]) -> Result<Value, String> {
+    // exec_capture(path) -> stdout of running the program (no arguments).
+    // Builder-side host for capturing native transcripts of compiled demos.
+    let p = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => return Err("exec_capture: expected program path".into()) };
+    let out = std::process::Command::new(&p).output().map_err(|e| format!("exec_capture: {}: {}", p, e))?;
+    Ok(Value::String(String::from_utf8_lossy(&out.stdout).to_string()))
+}
+
 pub fn host_argv(args: &[Value]) -> Result<Value, String> {
     // argv() -> List of program arguments, normalized so the same PatLang code
     // works interpreted (`pat --ir-run script.patlang a b`) and compiled
@@ -955,6 +991,9 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("read_file", host_read_file);
     interp.host.insert("write_file", host_write_file);
     interp.host.insert("argv", host_argv);
+    interp.host.insert("now_ms", host_now_ms);
+    interp.host.insert("read_file_b64", host_read_file_b64);
+    interp.host.insert("exec_capture", host_exec_capture);
     interp.host.insert("compile_shape", host_compile_shape);
     interp.host.insert("compile_ir", host_compile_ir);
     interp.host.insert("codegen_prelude", host_codegen_prelude);
