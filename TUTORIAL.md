@@ -284,7 +284,65 @@ What remains outside PatLang is the irreducible bootstrap seed:
 The full bootstrap is exercised by the (slow, `#[ignore]`d) test:
 `cargo test --test selfhost_pipeline -- --ignored`.
 
-## 6. Debugging tips
+## 6. WebAssembly
+
+Because the compiler emits portable Rust, targeting WASM is one argument:
+
+```patlang
+let wasm = rustc_build(rs, "./program.wasm", "wasm32-wasip1")
+```
+
+Setup (one-time): `rustup target add wasm32-wasip1`. Run the module with any
+WASI runtime — with Node.js:
+
+```js
+// run_wasi.mjs
+import { readFile } from 'node:fs/promises';
+import { WASI } from 'node:wasi';
+import { argv, env } from 'node:process';
+const wasi = new WASI({ version: 'preview1', args: argv.slice(2), env });
+const wasm = await WebAssembly.compile(await readFile(argv[2]));
+const instance = await WebAssembly.instantiate(wasm, wasi.getImportObject());
+wasi.start(instance);
+```
+
+```bash
+node --no-warnings run_wasi.mjs program.wasm
+```
+
+The feature demo (events, logic, OO, functional) runs on WASM with output
+identical to native. Caveat: WASI preview1 has no sockets or subprocesses,
+so the `tcp_*` hosts and `rustc_build` fail at runtime there — compute-,
+event-, and file-oriented programs are the WASM sweet spot.
+
+## 7. Browser GUI (HTML + JavaScript output)
+
+`self_hosting/lib/html.patlang` builds well-formed HTML5 pages with embedded
+JavaScript, making the browser PatLang's cross-platform GUI. Two patterns:
+
+**Static page** — PatLang computes data and generates an interactive page
+(`self_hosting/examples/gui_demo.patlang`):
+
+```patlang
+let page = html_page("My App", build_body(), build_script(data))
+write_file("app.html", page)
+```
+
+**Live backend** — a native PatLang server serves the page, and the page's
+JS `fetch`es JSON computed live by the same process
+(`self_hosting/examples/gui_server_demo.patlang`):
+
+```patlang
+let port = tcp_listen(0)
+# GET /      -> html_page(...) via http_ok("text/html", ...)
+# GET /data  -> live JSON via http_ok("application/json", ...)
+```
+
+Tip: use single quotes inside embedded JS/CSS/HTML attributes — the Stage 1
+dialect has no string escapes, and single-quoted JS needs none. `q()` gives a
+double quote where one is unavoidable (e.g. JSON keys).
+
+## 8. Debugging tips
 
 - `PATLANG_DEBUG=1` enables evaluator/parser debug logs.
 - `pat --emit-rust file.patlang` prints the generated Rust for a program —
@@ -292,7 +350,7 @@ The full bootstrap is exercised by the (slow, `#[ignore]`d) test:
 - `pat --compare file.patlang` catches interpreter/compiled divergence.
 - The test suite is the ground truth: `cd rust-runtime && cargo test`.
 
-## 7. Current limitations
+## 9. Current limitations
 
 - The self-hosted (Stage 1) dialect has no string escape sequences yet — use
   `chr(code)` to build special characters (`chr(10)` = newline).

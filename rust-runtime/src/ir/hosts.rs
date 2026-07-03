@@ -660,7 +660,8 @@ pub fn shape_to_program(v: &Value) -> Result<Program, String> {
 }
 
 /// Shared tail: write Rust source to a temp file and compile it with rustc.
-fn compile_source_to_exe(rust_src: &str, out: &str, what: &str) -> Result<Value, String> {
+/// `target`: optional rustc target triple (e.g. "wasm32-wasip1").
+fn compile_source_to_exe(rust_src: &str, out: &str, what: &str, target: Option<&str>) -> Result<Value, String> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static SEQ: AtomicUsize = AtomicUsize::new(0);
     let mut tmp = std::env::temp_dir();
@@ -677,13 +678,10 @@ fn compile_source_to_exe(rust_src: &str, out: &str, what: &str) -> Result<Value,
 
     if let Some(parent) = std::path::Path::new(out).parent() { let _ = std::fs::create_dir_all(parent); }
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
-    let status = std::process::Command::new(&rustc)
-        .arg("-O")
-        .arg(&src_path)
-        .arg("-o")
-        .arg(out)
-        .status()
-        .map_err(|e| format!("{}: failed to run rustc: {}", what, e))?;
+    let mut cmd = std::process::Command::new(&rustc);
+    cmd.arg("-O").arg(&src_path).arg("-o").arg(out);
+    if let Some(t) = target { cmd.arg("--target").arg(t); }
+    let status = cmd.status().map_err(|e| format!("{}: failed to run rustc: {}", what, e))?;
     if !status.success() { return Err(format!("{}: rustc failed with status {}", what, status)); }
     let p = std::path::Path::new(out);
     let abs = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
@@ -694,7 +692,7 @@ fn compile_source_to_exe(rust_src: &str, out: &str, what: &str) -> Result<Value,
 fn compile_program_to_exe(program: &Program, out: &str, what: &str) -> Result<Value, String> {
     let cg = super::codegen::RustCodegen::new();
     let rust_src = cg.emit_rust(program);
-    compile_source_to_exe(&rust_src, out, what)
+    compile_source_to_exe(&rust_src, out, what, None)
 }
 
 /// codegen_prelude() -> the static runtime library text embedded in every
@@ -704,15 +702,17 @@ pub fn host_codegen_prelude(_args: &[Value]) -> Result<Value, String> {
     Ok(Value::String(super::codegen::RustCodegen::prelude().to_string()))
 }
 
-/// rustc_build(rust_source, out_path) -> compiled exe path.
+/// rustc_build(rust_source, out_path[, target_triple]) -> compiled artifact path.
 /// The dumbest possible back end: write the given Rust source and run rustc.
+/// Pass a target triple (e.g. "wasm32-wasip1") to cross-compile.
 pub fn host_rustc_build(args: &[Value]) -> Result<Value, String> {
     let src = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => return Err("rustc_build: expected Rust source string".into()) };
     let out = match args.get(1) {
         Some(Value::String(s)) if !s.trim().is_empty() => s.clone(),
         _ => return Err("rustc_build: expected output path as second argument".into()),
     };
-    compile_source_to_exe(&src, &out, "rustc_build")
+    let target = match args.get(2) { Some(Value::String(s)) if !s.trim().is_empty() => Some(s.clone()), _ => None };
+    compile_source_to_exe(&src, &out, "rustc_build", target.as_deref())
 }
 
 /// compile_shape(ast_shape, out_path) -> compiled exe path.

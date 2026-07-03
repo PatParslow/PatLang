@@ -46,6 +46,14 @@ output-verified by `tests/selfhost_pipeline.rs` via
   written in Stage 1 PatLang compiles natively and answers real requests
   (`self_hosting/examples/echo_server.patlang`, verified by
   `selfhost_pipeline_compiles_tcp_echo_server`)
+- **WebAssembly** (July 4, 2026): `rustc_build(rs, out, "wasm32-wasip1")`
+  cross-compiles emitted programs unchanged; the feature demo runs under
+  Node's WASI with identical output (`wasm_target_compiles_and_runs_feature_demo`)
+- **browser GUI** (July 4, 2026): `lib/html.patlang` builds well-formed
+  HTML5+JS pages; `examples/gui_demo.patlang` (static interactive page via
+  write_file) and `examples/gui_server_demo.patlang` (native PatLang server
+  serving the page plus live JSON consumed by the page's fetch) — verified by
+  `selfhost_targets.rs`
 
 ### next steps toward full self-hosting
 1. ✅ DONE (July 3, 2026): AST → IR lowering moved into PatLang.

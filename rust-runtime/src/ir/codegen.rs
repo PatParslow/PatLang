@@ -888,10 +888,12 @@ impl Host {
                 Ok(Value::List(rest.into_iter().map(Value::String).collect()))
             }
             "rustc_build" => {
-                // rustc_build(rust_source, out_path) -> compiled exe path.
+                // rustc_build(rust_source, out_path[, target_triple]) -> artifact path.
                 // The self-hosted compiler's back end: write source, run rustc.
+                // Optional target triple (e.g. "wasm32-wasip1") cross-compiles.
                 let src = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => return Err("rustc_build: expected Rust source string".into()) };
                 let out = match args.get(1) { Some(Value::String(s)) if !s.trim().is_empty() => s.clone(), _ => return Err("rustc_build: expected output path".into()) };
+                let target = match args.get(2) { Some(Value::String(s)) if !s.trim().is_empty() => Some(s.clone()), _ => None };
                 let mut tmp = std::env::temp_dir();
                 tmp.push("patlang_selfhost_build");
                 std::fs::create_dir_all(&tmp).map_err(|e| format!("rustc_build: temp dir: {}", e))?;
@@ -899,10 +901,10 @@ impl Host {
                 std::fs::write(&src_path, &src).map_err(|e| format!("rustc_build: write {}: {}", src_path.display(), e))?;
                 if let Some(parent) = std::path::Path::new(&out).parent() { let _ = std::fs::create_dir_all(parent); }
                 let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
-                let status = std::process::Command::new(&rustc)
-                    .arg("-O").arg(&src_path).arg("-o").arg(&out)
-                    .status()
-                    .map_err(|e| format!("rustc_build: failed to run rustc: {}", e))?;
+                let mut cmd = std::process::Command::new(&rustc);
+                cmd.arg("-O").arg(&src_path).arg("-o").arg(&out);
+                if let Some(t) = &target { cmd.arg("--target").arg(t); }
+                let status = cmd.status().map_err(|e| format!("rustc_build: failed to run rustc: {}", e))?;
                 if !status.success() { return Err(format!("rustc_build: rustc failed with status {}", status)); }
                 let p = std::path::Path::new(&out);
                 let abs = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
