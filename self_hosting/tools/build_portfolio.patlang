@@ -1,0 +1,171 @@
+# =============================================================================
+# Portfolio builder: generates portfolio/index.html — a self-contained page
+# showing PatLang example sources, running them IN THE BROWSER (compiled to
+# wasm32-wasip1, embedded as base64, executed via an inline WASI shim), with
+# self-reported timings compared against native transcripts captured at
+# build time. The builder itself is PatLang, using the self-hosted compiler.
+#
+# Run from the repo root (requires rustup target add wasm32-wasip1):
+#   rust-runtime/target/release/pat --ir-run self_hosting/tools/build_portfolio.patlang
+# Then open portfolio/index.html in a browser.
+# =============================================================================
+
+include "../lib/lexer.patlang"
+include "../lib/parser.patlang"
+include "../lib/lower.patlang"
+include "../lib/codegen.patlang"
+include "../lib/runtime_rs.patlang"
+include "../lib/html.patlang"
+
+make a function called compile_both takes src, id returns wasmb64
+  let toks = tokenize(src)
+  let ast = parse_program(toks)
+  let ir = lower_program(ast)
+  let rs = emit_program_rs(ir)
+  rustc_build(rs, "portfolio/build/" + id + ".exe")
+  rustc_build(rs, "portfolio/build/" + id + ".wasm", "wasm32-wasip1")
+  return read_file_b64("portfolio/build/" + id + ".wasm")
+end
+
+make a function called demo_card takes b, id, title, blurb, src, transcript returns done
+  sb_push(b, "<div class='card'>" + nl())
+  sb_push(b, "<h2>" + html_escape(title) + "</h2>" + nl())
+  sb_push(b, "<p>" + blurb + "</p>" + nl())
+  sb_push(b, "<details><summary>PatLang source</summary><pre class='src'>" + html_escape(src) + "</pre></details>" + nl())
+  sb_push(b, "<p><button onclick='runWasm(" + q() + id + q() + ")'>Run in this browser (WASM)</button> <span class='ms' id='ms-" + id + "'></span></p>" + nl())
+  sb_push(b, "<pre class='out' id='out-" + id + "'>(not run yet)</pre>" + nl())
+  sb_push(b, "<p class='label'>Native run on the build machine:</p>" + nl())
+  sb_push(b, "<pre class='out native'>" + html_escape(transcript) + "</pre>" + nl())
+  sb_push(b, "</div>" + nl())
+  return true
+end
+
+make a function called wasi_shim_js takes b returns done
+  sb_push(b, "function b64bytes(s) {" + nl())
+  sb_push(b, "  const bin = atob(s);" + nl())
+  sb_push(b, "  const a = new Uint8Array(bin.length);" + nl())
+  sb_push(b, "  for (let i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i);" + nl())
+  sb_push(b, "  return a;" + nl())
+  sb_push(b, "}" + nl())
+  sb_push(b, "async function runWasm(id) {" + nl())
+  sb_push(b, "  const out = document.getElementById('out-' + id);" + nl())
+  sb_push(b, "  out.textContent = 'running...';" + nl())
+  sb_push(b, "  let stdout = '';" + nl())
+  sb_push(b, "  const dec = new TextDecoder();" + nl())
+  sb_push(b, "  let mem = null;" + nl())
+  sb_push(b, "  const wasi = {" + nl())
+  sb_push(b, "    fd_write(fd, iovs, len, nw) {" + nl())
+  sb_push(b, "      const dv = new DataView(mem.buffer); let w = 0;" + nl())
+  sb_push(b, "      for (let i = 0; i < len; i++) {" + nl())
+  sb_push(b, "        const p = iovs + 8 * i;" + nl())
+  sb_push(b, "        const ptr = dv.getUint32(p, true), l = dv.getUint32(p + 4, true);" + nl())
+  sb_push(b, "        stdout += dec.decode(new Uint8Array(mem.buffer, ptr, l)); w += l;" + nl())
+  sb_push(b, "      }" + nl())
+  sb_push(b, "      dv.setUint32(nw, w, true); return 0;" + nl())
+  sb_push(b, "    }," + nl())
+  sb_push(b, "    random_get(p, l) { crypto.getRandomValues(new Uint8Array(mem.buffer, p, l)); return 0; }," + nl())
+  sb_push(b, "    clock_time_get(cid, prec, tp) {" + nl())
+  sb_push(b, "      const dv = new DataView(mem.buffer);" + nl())
+  sb_push(b, "      const ns = BigInt(Math.round((performance.timeOrigin + performance.now()) * 1e6));" + nl())
+  sb_push(b, "      dv.setBigUint64(tp, ns, true); return 0;" + nl())
+  sb_push(b, "    }," + nl())
+  sb_push(b, "    args_sizes_get(pc, ps) { const dv = new DataView(mem.buffer); dv.setUint32(pc, 0, true); dv.setUint32(ps, 0, true); return 0; }," + nl())
+  sb_push(b, "    args_get() { return 0; }," + nl())
+  sb_push(b, "    environ_sizes_get(pc, ps) { const dv = new DataView(mem.buffer); dv.setUint32(pc, 0, true); dv.setUint32(ps, 0, true); return 0; }," + nl())
+  sb_push(b, "    environ_get() { return 0; }," + nl())
+  sb_push(b, "    proc_exit(c) { const e = new Error('exit'); e.exitCode = c; throw e; }," + nl())
+  sb_push(b, "    fd_close() { return 0; }, fd_fdstat_get() { return 0; }, fd_seek() { return 70; }," + nl())
+  sb_push(b, "    fd_read() { return 8; }, fd_prestat_get() { return 8; }, fd_prestat_dir_name() { return 8; }," + nl())
+  sb_push(b, "    path_open() { return 76; }, sched_yield() { return 0; }, poll_oneoff() { return 52; }" + nl())
+  sb_push(b, "  };" + nl())
+  sb_push(b, "  // Unknown WASI imports resolve to a stub returning ENOTSUP (58)" + nl())
+  sb_push(b, "  const wasiNs = new Proxy(wasi, { get(t, k) { return k in t ? t[k] : (() => 58); } });" + nl())
+  sb_push(b, "  try {" + nl())
+  sb_push(b, "    const t0 = performance.now();" + nl())
+  sb_push(b, "    const mod = await WebAssembly.compile(b64bytes(WASMS[id]));" + nl())
+  sb_push(b, "    const inst = await WebAssembly.instantiate(mod, { wasi_snapshot_preview1: wasiNs });" + nl())
+  sb_push(b, "    mem = inst.exports.memory;" + nl())
+  sb_push(b, "    try { inst.exports._start(); } catch (e) { if (!(e && e.exitCode === 0)) throw e; }" + nl())
+  sb_push(b, "    const ms = (performance.now() - t0).toFixed(1);" + nl())
+  sb_push(b, "    out.textContent = stdout;" + nl())
+  sb_push(b, "    document.getElementById('ms-' + id).textContent = ms + ' ms wall (compile+run, this browser)';" + nl())
+  sb_push(b, "  } catch (e) {" + nl())
+  sb_push(b, "    out.textContent = stdout + ' [error: ' + e + ']';" + nl())
+  sb_push(b, "  }" + nl())
+  sb_push(b, "}" + nl())
+  return true
+end
+
+print("building demos...")
+let feature_src = read_file("self_hosting/examples/feature_demo.patlang")
+let bench_src = read_file("self_hosting/examples/fib_bench.patlang")
+let gui_src = read_file("self_hosting/lib/html.patlang") + chr(10) + read_file("self_hosting/examples/gui_demo.patlang")
+
+let feature_b64 = compile_both(feature_src, "feature")
+let feature_native = exec_capture("portfolio/build/feature.exe")
+print("feature demo done")
+
+let bench_b64 = compile_both(bench_src, "bench")
+let bench_native = exec_capture("portfolio/build/bench.exe")
+print("bench done")
+
+let ignored = compile_both(gui_src, "gui")
+let gui_native = exec_capture("portfolio/build/gui.exe")
+print("gui done")
+
+# Compiler self-metrics: the PatLang front+middle end processing its own source
+let compiler_src = read_file("self_hosting/lib/lexer.patlang")
+let compiler_src = compiler_src + chr(10) + read_file("self_hosting/lib/parser.patlang")
+let compiler_src = compiler_src + chr(10) + read_file("self_hosting/lib/lower.patlang")
+let compiler_src = compiler_src + chr(10) + read_file("self_hosting/lib/codegen.patlang")
+let compiler_src = compiler_src + chr(10) + read_file("self_hosting/lib/runtime_rs.patlang")
+let compiler_src = compiler_src + chr(10) + read_file("self_hosting/patc1_main.patlang")
+let m0 = now_ms()
+let ctoks = tokenize(compiler_src)
+let m1 = now_ms()
+let cast = parse_program(ctoks)
+let m2 = now_ms()
+let cir = lower_program(cast)
+let m3 = now_ms()
+let crs = emit_program_rs(cir)
+let m4 = now_ms()
+print("compiler metrics done")
+
+# ---- assemble the page ----
+let body = sb_new()
+sb_push(body, "<h1>PatLang portfolio</h1>" + nl())
+sb_push(body, "<p>Each example below is written in PatLang, compiled by the <em>self-hosted</em> PatLang compiler (lexer, parser, lowerer, and code generator all written in PatLang), and embedded here as WebAssembly. Press Run to execute it in your browser; programs time themselves with <code>now_ms()</code>, so you can compare the in-browser numbers with the native transcript captured on the build machine.</p>" + nl())
+
+demo_card(body, "feature", "All paradigms in one program", "Recursion, control flow, lists, <strong>events</strong> (when/emit), <strong>logic</strong> (fact/query), <strong>OO</strong> (new/send/get), and <strong>functional</strong> map/filter via <code>apply</code>.", feature_src, feature_native)
+demo_card(body, "bench", "Self-timing benchmark", "fib(27), a 2-million iteration loop, and a 200k-element vector build, each reporting its own elapsed milliseconds.", bench_src, bench_native)
+
+sb_push(body, "<div class='card'>" + nl())
+sb_push(body, "<h2>Browser GUI generator</h2>" + nl())
+sb_push(body, "<p>This program computes data natively and generates an interactive HTML+JS page (the browser as PatLang's cross-platform GUI). It uses <code>write_file</code>, so it runs natively rather than in the sandboxed WASM here.</p>" + nl())
+sb_push(body, "<details><summary>PatLang source</summary><pre class='src'>" + html_escape(gui_src) + "</pre></details>" + nl())
+sb_push(body, "<p class='label'>Native run on the build machine:</p>" + nl())
+sb_push(body, "<pre class='out native'>" + html_escape(gui_native) + "</pre>" + nl())
+sb_push(body, "</div>" + nl())
+
+sb_push(body, "<div class='card'>" + nl())
+sb_push(body, "<h2>The compiler, measured on itself</h2>" + nl())
+sb_push(body, "<p>The self-hosted compiler front+middle end processing its own complete source (" + compiler_src.length + " chars), run under the Stage 0 interpreter while building this page:</p>" + nl())
+sb_push(body, "<ul>" + nl())
+sb_push(body, "<li>tokenize: " + vec_len(ctoks) + " tokens in " + (m1 - m0) + " ms</li>" + nl())
+sb_push(body, "<li>parse: " + cast[1].length + " top-level statements in " + (m2 - m1) + " ms</li>" + nl())
+sb_push(body, "<li>lower: " + cir[2].length + " functions in " + (m3 - m2) + " ms</li>" + nl())
+sb_push(body, "<li>codegen: " + crs.length + " chars of Rust in " + (m4 - m3) + " ms</li>" + nl())
+sb_push(body, "</ul>" + nl())
+sb_push(body, "<p>The natively compiled compiler (patc1) runs the same front end roughly two orders of magnitude faster; rustc then dominates end-to-end compile time.</p>" + nl())
+sb_push(body, "</div>" + nl())
+
+let js = sb_new()
+sb_push(js, "const WASMS = {" + nl())
+sb_push(js, "  feature: '" + feature_b64 + "'," + nl())
+sb_push(js, "  bench: '" + bench_b64 + "'" + nl())
+sb_push(js, "};" + nl())
+wasi_shim_js(js)
+
+let page = html_page("PatLang Portfolio", sb_str(body), sb_str(js))
+write_file("portfolio/index.html", page)
+print("WROTE: portfolio/index.html (" + page.length + " chars)")
