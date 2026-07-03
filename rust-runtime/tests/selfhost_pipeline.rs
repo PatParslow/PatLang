@@ -212,6 +212,90 @@ fn selfhost_stage4_codegen_in_patlang() {
 }
 
 #[test]
+#[ignore = "full bootstrap takes ~7 minutes; run with: cargo test --test selfhost_pipeline -- --ignored"]
+fn selfhost_fixpoint_patc_compiles_itself() {
+    // The true fixpoint (step 2b):
+    //   Gen A: the interpreter runs the PatLang compiler to compile the
+    //          compiler's own source into a native patc1
+    //   Gen B: patc1 compiles the feature demo (native compiler works)
+    //   Gen C: patc1 compiles its own source into patc2; patc2 compiles the
+    //          feature demo with identical output
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    if std::process::Command::new(&rustc).arg("--version").output().is_err() {
+        eprintln!("rustc not found; skipping fixpoint test");
+        return;
+    }
+
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let repo_root = std::path::Path::new(manifest).parent().unwrap().to_path_buf();
+    let read = |rel: &str| std::fs::read_to_string(repo_root.join(rel)).unwrap_or_else(|e| panic!("read {}: {}", rel, e));
+
+    // Concatenate the compiler's own source (same as build_patc1.patlang)
+    let compiler_src = format!(
+        "{}\n{}\n{}\n{}\n{}",
+        read("self_hosting/lib/lexer.patlang"),
+        read("self_hosting/lib/parser.patlang"),
+        read("self_hosting/lib/lower.patlang"),
+        read("self_hosting/lib/codegen.patlang"),
+        read("self_hosting/patc1_main.patlang"),
+    );
+
+    let out_dir = std::env::temp_dir().join("patlang_fixpoint_test");
+    let _ = std::fs::create_dir_all(&out_dir);
+    let all_src_path = out_dir.join("patc1_all.patlang");
+    std::fs::write(&all_src_path, &compiler_src).expect("write combined compiler source");
+    let exe = |n: &str| out_dir.join(if cfg!(windows) { format!("{}.exe", n) } else { n.to_string() });
+    let (patc1, patc2, demo_b, demo_c) = (exe("patc1"), exe("patc2"), exe("demo_b"), exe("demo_c"));
+    let fwd = |p: &std::path::Path| p.display().to_string().replace('\\', "/");
+
+    // --- Gen A: interpreter runs the PatLang compiler on its own source ---
+    let driver = format!(
+        "let source = read_file(\"{}\")\n\
+         let toks = tokenize(source)\n\
+         let ast = parse_program(toks)\n\
+         let ir = lower_program(ast)\n\
+         let rs = emit_program_rs(ir)\n\
+         let exe = rustc_build(rs, \"{}\")\n\
+         print(\"GEN A OK\")\n",
+        fwd(&all_src_path), fwd(&patc1)
+    );
+    let gen_a_src = format!("{}\n{}", compiler_src, driver);
+    let mut parser = Stage0Parser::new(&gen_a_src).expect("lexer init");
+    let ast = parser.parse().expect("gen A source should parse");
+    let mut lower = Lowerer::new();
+    let program = lower.lower_program_basic(&ast);
+    let mut interp = Interpreter::new();
+    interp.host.insert("print", capture_print);
+    register_stage0_shims(&mut interp);
+    PRINTED.with(|p| p.borrow_mut().clear());
+    interp.run(&program).expect("gen A should run");
+    assert!(patc1.exists(), "gen A did not produce patc1");
+
+    // patc1 resolves the prelude relative to its CWD; run from repo root
+    let run_patc = |compiler: &std::path::Path, input: &std::path::Path, output: &std::path::Path| {
+        let st = std::process::Command::new(compiler)
+            .arg(fwd(input)).arg(fwd(output))
+            .current_dir(&repo_root)
+            .status().expect("run self-hosted compiler");
+        assert!(st.success(), "{} failed on {}", compiler.display(), input.display());
+    };
+
+    // --- Gen B: native compiler compiles the feature demo ---
+    let demo_src = repo_root.join("self_hosting/examples/feature_demo.patlang");
+    run_patc(&patc1, &demo_src, &demo_b);
+    let out_b = std::process::Command::new(&demo_b).output().expect("run demo B");
+    let text_b = String::from_utf8_lossy(&out_b.stdout).to_string();
+    assert!(text_b.contains("fib(10) = 55") && text_b.contains("evens: [2, 4]"), "demo B wrong: {}", text_b);
+
+    // --- Gen C: patc1 compiles its own source; patc2 must behave identically ---
+    run_patc(&patc1, &all_src_path, &patc2);
+    run_patc(&patc2, &demo_src, &demo_c);
+    let out_c = std::process::Command::new(&demo_c).output().expect("run demo C");
+    let text_c = String::from_utf8_lossy(&out_c.stdout).to_string();
+    assert_eq!(text_b, text_c, "fixpoint broken: Gen B and Gen C outputs differ");
+}
+
+#[test]
 fn selfhost_pipeline_compiles_tcp_echo_server() {
     // Networking through the self-hosted front-end: the Stage 1 echo server
     // compiles natively, binds a TCP port, and answers two HTTP requests.

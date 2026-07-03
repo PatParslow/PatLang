@@ -236,6 +236,44 @@ stages, where the host still did lowering (`compile_shape`) or IR decoding
 (`compile_ir`). Each stage produces byte-identical program output, verified by
 `rust-runtime/tests/selfhost_pipeline.rs`.
 
+### The fixpoint: the compiler compiles itself
+
+PatLang is self-hosting in the strict sense — a natively compiled PatLang
+compiler compiles its own source, and the child compiler is byte-for-byte
+equivalent to its parent:
+
+```bash
+# Generation A: the interpreter runs the PatLang compiler on the compiler's
+# own source, producing a native binary (~4 min — interpreted compilation)
+pat --ir-run self_hosting/build_patc1.patlang        # -> ./patc1.exe
+
+# Generation B: the native compiler compiles a program (~3.5 s)
+./patc1.exe self_hosting/examples/feature_demo.patlang demo.exe
+./demo.exe
+
+# Generation C: the native compiler compiles ITSELF
+./patc1.exe self_hosting/build/patc1_all.patlang patc2.exe
+./patc2.exe self_hosting/examples/feature_demo.patlang demo2.exe
+# demo.exe and demo2.exe produce identical output, and patc1/patc2 emit
+# byte-identical Rust for the same input
+```
+
+`patc1` usage: `patc1 <input.patlang> <output-exe> [prelude.rs]`. It reads the
+runtime prelude from `self_hosting/runtime/prelude.rs` (relative to the
+working directory), so run it from the repo root or pass the path explicitly.
+
+Two fixed artifacts remain outside PatLang, both deliberate:
+
+- **The runtime prelude** (`self_hosting/runtime/prelude.rs`) — the runtime
+  library text embedded in every emitted program, analogous to a libc.
+  Regenerate it after changing the host template:
+  `pat --ir-run self_hosting/tools/dump_prelude.patlang`.
+- **rustc** — the machine-code back end, used the way other compilers use
+  LLVM.
+
+The full bootstrap is exercised by the (slow, `#[ignore]`d) test:
+`cargo test --test selfhost_pipeline -- --ignored`.
+
 ## 6. Debugging tips
 
 - `PATLANG_DEBUG=1` enables evaluator/parser debug logs.

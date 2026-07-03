@@ -155,7 +155,7 @@ impl Lowerer {
         matches!(name,
             "print"|"add"|"multiply"|"subtract"|"max"|"min"|"calculate"|"calculate_result"|
             "get_value"|"process"|"validate"|"len"|"get"|"send"|"emit"|"sed"|
-            "list_get"|"list_len"|"list_push"|"list_set"|"char_code"|"substr"|"chr"|"to_num"|"read_file"|"compile_shape"|"compile_ir"|"codegen_prelude"|"rustc_build"|
+            "list_get"|"list_len"|"list_push"|"list_set"|"char_code"|"substr"|"chr"|"to_num"|"read_file"|"write_file"|"argv"|"compile_shape"|"compile_ir"|"codegen_prelude"|"rustc_build"|
             "fact"|"query"|"goal"|"new"|"set_var"|"apply"|
             "tcp_listen"|"tcp_accept"|"tcp_read"|"tcp_write"|"tcp_close"
         )
