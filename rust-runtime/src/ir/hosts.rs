@@ -73,6 +73,13 @@ pub fn host_substr(args: &[Value]) -> Result<Value, String> {
     Ok(Value::String(s.chars().skip(start).take(count).collect()))
 }
 
+pub fn host_chr(args: &[Value]) -> Result<Value, String> {
+    // chr(code) -> 1-char string (empty for invalid code points)
+    let n = match args.get(0) { Some(Value::Number(n)) => *n, Some(Value::String(s)) => s.trim().parse::<f64>().unwrap_or(-1.0), _ => -1.0 };
+    if n < 0.0 { return Ok(Value::String(String::new())); }
+    Ok(Value::String(char::from_u32(n as u32).map(|c| c.to_string()).unwrap_or_default()))
+}
+
 pub fn host_to_num(args: &[Value]) -> Result<Value, String> {
     let v = args.get(0).cloned().unwrap_or(Value::Unit);
     let n = match v {
@@ -490,6 +497,77 @@ pub fn host_compile_shape(args: &[Value]) -> Result<Value, String> {
     Ok(Value::String(abs.display().to_string()))
 }
 
+// --- Networking hosts (blocking TCP; async/event-loop model is future work) ---
+// tcp_listen(port) -> Number actual bound port (use 0 for OS-assigned)
+// tcp_accept(port) -> Number connection id (blocks)
+// tcp_read(conn)   -> String (single read, up to 64 KiB, lossy UTF-8)
+// tcp_write(conn, data) -> Bool
+// tcp_close(conn)  -> Unit
+
+thread_local! {
+    static LISTENERS: RefCell<HashMap<u16, std::net::TcpListener>> = RefCell::new(HashMap::new());
+    static CONNS: RefCell<HashMap<usize, std::net::TcpStream>> = RefCell::new(HashMap::new());
+    static NEXT_CONN: RefCell<usize> = RefCell::new(1);
+}
+
+fn arg_num(args: &[Value], i: usize, what: &str) -> Result<f64, String> {
+    match args.get(i) {
+        Some(Value::Number(n)) => Ok(*n),
+        Some(Value::String(s)) => s.trim().parse::<f64>().map_err(|_| format!("{}: expected number", what)),
+        _ => Err(format!("{}: expected number", what)),
+    }
+}
+
+pub fn host_tcp_listen(args: &[Value]) -> Result<Value, String> {
+    let port = arg_num(args, 0, "tcp_listen")? as u16;
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port))
+        .map_err(|e| format!("tcp_listen: bind {}: {}", port, e))?;
+    let actual = listener.local_addr().map_err(|e| format!("tcp_listen: {}", e))?.port();
+    LISTENERS.with(|l| l.borrow_mut().insert(actual, listener));
+    Ok(Value::Number(actual as f64))
+}
+
+pub fn host_tcp_accept(args: &[Value]) -> Result<Value, String> {
+    let port = arg_num(args, 0, "tcp_accept")? as u16;
+    let listener = LISTENERS.with(|l| {
+        l.borrow().get(&port).map(|x| x.try_clone())
+    }).ok_or_else(|| format!("tcp_accept: no listener on port {}", port))?
+        .map_err(|e| format!("tcp_accept: {}", e))?;
+    let (stream, _) = listener.accept().map_err(|e| format!("tcp_accept: {}", e))?;
+    let id = NEXT_CONN.with(|n| { let mut b = n.borrow_mut(); let v = *b; *b += 1; v });
+    CONNS.with(|c| c.borrow_mut().insert(id, stream));
+    Ok(Value::Number(id as f64))
+}
+
+pub fn host_tcp_read(args: &[Value]) -> Result<Value, String> {
+    use std::io::Read;
+    let id = arg_num(args, 0, "tcp_read")? as usize;
+    let mut stream = CONNS.with(|c| c.borrow().get(&id).map(|s| s.try_clone()))
+        .ok_or_else(|| format!("tcp_read: unknown connection {}", id))?
+        .map_err(|e| format!("tcp_read: {}", e))?;
+    let mut buf = vec![0u8; 65536];
+    let n = stream.read(&mut buf).map_err(|e| format!("tcp_read: {}", e))?;
+    Ok(Value::String(String::from_utf8_lossy(&buf[..n]).to_string()))
+}
+
+pub fn host_tcp_write(args: &[Value]) -> Result<Value, String> {
+    use std::io::Write;
+    let id = arg_num(args, 0, "tcp_write")? as usize;
+    let data = match args.get(1) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
+    let mut stream = CONNS.with(|c| c.borrow().get(&id).map(|s| s.try_clone()))
+        .ok_or_else(|| format!("tcp_write: unknown connection {}", id))?
+        .map_err(|e| format!("tcp_write: {}", e))?;
+    stream.write_all(data.as_bytes()).map_err(|e| format!("tcp_write: {}", e))?;
+    let _ = stream.flush();
+    Ok(Value::Bool(true))
+}
+
+pub fn host_tcp_close(args: &[Value]) -> Result<Value, String> {
+    let id = arg_num(args, 0, "tcp_close")? as usize;
+    CONNS.with(|c| c.borrow_mut().remove(&id));
+    Ok(Value::Unit)
+}
+
 /// Register the Stage 0 string/list/file shims on an interpreter.
 pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("len", host_len);
@@ -499,6 +577,7 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("list_push", host_list_push);
     interp.host.insert("char_code", host_char_code);
     interp.host.insert("substr", host_substr);
+    interp.host.insert("chr", host_chr);
     interp.host.insert("to_num", host_to_num);
     interp.host.insert("read_file", host_read_file);
     interp.host.insert("compile_shape", host_compile_shape);
@@ -509,4 +588,10 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("new", host_new);
     interp.host.insert("set_var", host_set_var);
     interp.host.insert("send", host_send);
+    // networking
+    interp.host.insert("tcp_listen", host_tcp_listen);
+    interp.host.insert("tcp_accept", host_tcp_accept);
+    interp.host.insert("tcp_read", host_tcp_read);
+    interp.host.insert("tcp_write", host_tcp_write);
+    interp.host.insert("tcp_close", host_tcp_close);
 }
