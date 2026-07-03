@@ -109,6 +109,30 @@ pub fn host_read_file(args: &[Value]) -> Result<Value, String> {
     std::fs::read_to_string(&p).map(Value::String).map_err(|e| format!("read_file: {}: {}", p, e))
 }
 
+pub fn host_write_file(args: &[Value]) -> Result<Value, String> {
+    // write_file(path, contents) -> Bool
+    let p = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
+    let contents = match args.get(1) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
+    if let Some(parent) = std::path::Path::new(&p).parent() { let _ = std::fs::create_dir_all(parent); }
+    std::fs::write(&p, contents).map(|_| Value::Bool(true)).map_err(|e| format!("write_file: {}: {}", p, e))
+}
+
+pub fn host_argv(args: &[Value]) -> Result<Value, String> {
+    // argv() -> List of program arguments, normalized so the same PatLang code
+    // works interpreted (`pat --ir-run script.patlang a b`) and compiled
+    // (`prog.exe a b`): the runner exe, mode flags, and the script path are
+    // stripped, leaving just the user arguments.
+    let _ = args;
+    let mut rest: Vec<String> = std::env::args().collect();
+    if !rest.is_empty() { rest.remove(0); } // drop runner exe
+    // drop a leading mode flag and the script path when running under pat
+    if matches!(rest.first().map(|s| s.as_str()), Some("--ir-run") | Some("--build-run") | Some("--patc") | Some("--emit-rust") | Some("--compare")) {
+        rest.remove(0);
+        if !rest.is_empty() { rest.remove(0); } // script path
+    }
+    Ok(Value::List(rest.into_iter().map(Value::String).collect()))
+}
+
 pub fn host_len(args: &[Value]) -> Result<Value, String> {
     let v = args.get(0).cloned().unwrap_or(Value::Unit);
     let n = match v {
@@ -743,6 +767,8 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("chr", host_chr);
     interp.host.insert("to_num", host_to_num);
     interp.host.insert("read_file", host_read_file);
+    interp.host.insert("write_file", host_write_file);
+    interp.host.insert("argv", host_argv);
     interp.host.insert("compile_shape", host_compile_shape);
     interp.host.insert("compile_ir", host_compile_ir);
     interp.host.insert("codegen_prelude", host_codegen_prelude);

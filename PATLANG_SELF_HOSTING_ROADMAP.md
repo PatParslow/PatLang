@@ -61,10 +61,25 @@ output-verified by `tests/selfhost_pipeline.rs` via
    (fixed runtime library string) and `rustc_build(source, out)` (write +
    rustc). `pipeline_stage4.patlang` runs lexer + parser + lowerer + codegen
    all in PatLang; verified by `selfhost_stage4_codegen_in_patlang`.
-   Step 2b (remaining): a natively *compiled* patc — requires the Stage 1
-   dialect to express the compiler libs themselves (see step 4) so the
-   pipeline can compile its own sources; then patc.exe embeds the prelude
-   text and shells out to rustc without the `pat` interpreter.
+   ✅ DONE (July 3, 2026, step 2b): **THE FIXPOINT IS ACHIEVED.**
+   The compiler libs were already expressible in the Stage 1 dialect. With
+   `argv`/`write_file` hosts and a `rustc_build` arm in the emitted-program
+   template, plus the runtime prelude exported to
+   `self_hosting/runtime/prelude.rs` (read at compile time — resolving the
+   quine problem the standard way, by shipping the runtime as a file):
+   - Gen A: `build_patc1.patlang` (interpreter) compiles the concatenated
+     compiler source (36 KB, 7787 tokens, 41 functions) → native `patc1.exe`
+   - Gen B: `patc1.exe` compiles feature_demo in 3.5 s (~65x faster than the
+     interpreted pipeline) with correct output
+   - Gen C: `patc1.exe` compiles its own source → `patc2.exe`, which compiles
+     feature_demo identically; patc1 and patc2 emit **byte-identical Rust**
+     for the same input
+   Verified by `selfhost_fixpoint_patc_compiles_itself`
+   (`cargo test --test selfhost_pipeline -- --ignored`, ~7 min).
+   PatLang development is now independent of other languages: the compiler is
+   written in PatLang and compiles itself; the host contributions are the
+   fixed prelude file (a runtime library artifact) and rustc as the machine
+   back end.
 3. Switch `patc.patlang` internals from `patc_compile_from_argv` delegation to
    the native lexer/parser pipeline, keeping the host path as a fallback flag.
 4. Grow the Stage 1 language until it can express `self_hosting/lib/*` itself
