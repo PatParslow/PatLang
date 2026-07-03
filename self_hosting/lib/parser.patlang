@@ -1,10 +1,78 @@
 # =============================================================================
 # Stage 1 self-hosted parser library (Stage 0 compilable subset).
-# Consumes tokens from lib/lexer.patlang, produces list-shaped AST nodes:
-#   ["Program", [stmts]]  ["Let", name, expr]  ["Print", expr]
-#   ["Num", text]  ["Str", text]  ["Var", name]  ["Bin", op, lhs, rhs]
-# Parser functions return [node, next_pos] pairs.
+# Consumes tokens from lib/lexer.patlang, produces list-shaped AST nodes.
+#
+# Statements:
+#   ["Let", name, expr]            let NAME = expr
+#   ["Expr", expr]                 call statements, e.g. print(x), emit(e, p)
+#   ["If", cond, [then], [else]]   if expr then ... [else ...] end
+#   ["While", cond, [body]]        while expr do ... end
+#   ["Func", name, [params], [b]]  make a function called N takes a, b returns r ... end
+#   ["Return", expr]               return expr
+#   ["When", event, [body]]        when EVENT do ... end   (event handler)
+#   ["Err", message]               parse error placeholder
+#
+# Expressions:
+#   ["Num", text] ["Str", text] ["Bool", "true"/"false"] ["Var", name]
+#   ["Bin", op, lhs, rhs]   op: + - * / % == != < <= > >= and or
+#   ["Un", op, expr]        op: not -
+#   ["Call", name, [args]]
+#   ["List", [items]]
+#   ["Index", obj, idx]
+#   ["Member", obj, prop]
+#
+# All parse functions return [node, next_pos] pairs; parse_args and
+# parse_stmts_until return [list, next_pos].
 # =============================================================================
+
+make a function called tok_is takes t, ty, tx returns r
+  return (t[0] == ty) and (t[1] == tx)
+end
+
+make a function called skip_nl takes toks, pos returns p
+  let p = pos
+  let looping = true
+  while looping do
+    let t = toks[p]
+    if t[0] == "NL" then
+      let p = p + 1
+    else
+      let looping = false
+    end
+  end
+  return p
+end
+
+# ---- expressions ----
+
+make a function called parse_args takes toks, pos returns r
+  # pos points just after '('; returns [args, pos_after_rparen]
+  let args = []
+  let p = pos
+  let t = toks[p]
+  if tok_is(t, "OP", ")") then
+    return [args, p + 1]
+  else
+    let looping = true
+    while looping do
+      let e = parse_expr(toks, p)
+      let args = list_push(args, e[0])
+      let p = e[1]
+      let t2 = toks[p]
+      if tok_is(t2, "OP", ",") then
+        let p = p + 1
+      else
+        let looping = false
+      end
+    end
+    let t3 = toks[p]
+    if tok_is(t3, "OP", ")") then
+      return [args, p + 1]
+    else
+      return [[["Err", "expected ) in argument list"]], p]
+    end
+  end
+end
 
 make a function called parse_primary takes toks, pos returns r
   let t = toks[pos]
@@ -17,37 +85,124 @@ make a function called parse_primary takes toks, pos returns r
       return [["Str", tx], pos + 1]
     else
       if ty == "IDENT" then
-        return [["Var", tx], pos + 1]
+        if (tx == "true") or (tx == "false") then
+          return [["Bool", tx], pos + 1]
+        else
+          let nx = toks[pos + 1]
+          if tok_is(nx, "OP", "(") then
+            let a = parse_args(toks, pos + 2)
+            return [["Call", tx, a[0]], a[1]]
+          else
+            return [["Var", tx], pos + 1]
+          end
+        end
       else
-        if (ty == "OP") and (tx == "(") then
-          let inner = parse_cmp(toks, pos + 1)
+        if tok_is(t, "OP", "(") then
+          let inner = parse_expr(toks, pos + 1)
           let p = inner[1]
           let t2 = toks[p]
-          if (t2[0] == "OP") and (t2[1] == ")") then
+          if tok_is(t2, "OP", ")") then
             return [inner[0], p + 1]
           else
             return [["Err", "expected )"], p]
           end
         else
-          return [["Err", "unexpected " + ty + " '" + tx + "'"], pos + 1]
+          if tok_is(t, "OP", "[") then
+            let items = []
+            let p = pos + 1
+            let t2 = toks[p]
+            if tok_is(t2, "OP", "]") then
+              return [["List", items], p + 1]
+            else
+              let looping = true
+              while looping do
+                let e = parse_expr(toks, p)
+                let items = list_push(items, e[0])
+                let p = e[1]
+                let t3 = toks[p]
+                if tok_is(t3, "OP", ",") then
+                  let p = p + 1
+                else
+                  let looping = false
+                end
+              end
+              let t4 = toks[p]
+              if tok_is(t4, "OP", "]") then
+                return [["List", items], p + 1]
+              else
+                return [["Err", "expected ] in list"], p]
+              end
+            end
+          else
+            return [["Err", "unexpected " + ty + " '" + tx + "'"], pos + 1]
+          end
         end
       end
     end
   end
 end
 
-make a function called parse_mul takes toks, pos returns r
+make a function called parse_postfix takes toks, pos returns r
   let r1 = parse_primary(toks, pos)
   let node = r1[0]
   let p = r1[1]
   let looping = true
   while looping do
     let t = toks[p]
-    let ty = t[0]
-    let tx = t[1]
-    if (ty == "OP") and ((tx == "*") or (tx == "/") or (tx == "%")) then
-      let r2 = parse_primary(toks, p + 1)
-      let node = ["Bin", tx, node, r2[0]]
+    if tok_is(t, "OP", "[") then
+      let idx = parse_expr(toks, p + 1)
+      let p2 = idx[1]
+      let t2 = toks[p2]
+      if tok_is(t2, "OP", "]") then
+        let node = ["Index", node, idx[0]]
+        let p = p2 + 1
+      else
+        let node = ["Err", "expected ] after index"]
+        let looping = false
+      end
+    else
+      if tok_is(t, "OP", ".") then
+        let nameTok = toks[p + 1]
+        if nameTok[0] == "IDENT" then
+          let node = ["Member", node, nameTok[1]]
+          let p = p + 2
+        else
+          let node = ["Err", "expected name after ."]
+          let looping = false
+        end
+      else
+        let looping = false
+      end
+    end
+  end
+  return [node, p]
+end
+
+make a function called parse_unary takes toks, pos returns r
+  let t = toks[pos]
+  if tok_is(t, "IDENT", "not") then
+    let e = parse_unary(toks, pos + 1)
+    return [["Un", "not", e[0]], e[1]]
+  else
+    if tok_is(t, "OP", "-") then
+      let e = parse_unary(toks, pos + 1)
+      return [["Un", "-", e[0]], e[1]]
+    else
+      return parse_postfix(toks, pos)
+    end
+  end
+end
+
+make a function called parse_mul takes toks, pos returns r
+  let r1 = parse_unary(toks, pos)
+  let node = r1[0]
+  let p = r1[1]
+  let looping = true
+  while looping do
+    let t = toks[p]
+    if (t[0] == "OP") and ((t[1] == "*") or (t[1] == "/") or (t[1] == "%")) then
+      let r2 = parse_unary(toks, p + 1)
+      let node = ["Bin", t[1], node, r2[0]]
       let p = r2[1]
     else
       let looping = false
@@ -63,11 +218,9 @@ make a function called parse_add takes toks, pos returns r
   let looping = true
   while looping do
     let t = toks[p]
-    let ty = t[0]
-    let tx = t[1]
-    if (ty == "OP") and ((tx == "+") or (tx == "-")) then
+    if (t[0] == "OP") and ((t[1] == "+") or (t[1] == "-")) then
       let r2 = parse_mul(toks, p + 1)
-      let node = ["Bin", tx, node, r2[0]]
+      let node = ["Bin", t[1], node, r2[0]]
       let p = r2[1]
     else
       let looping = false
@@ -83,11 +236,9 @@ make a function called parse_cmp takes toks, pos returns r
   let looping = true
   while looping do
     let t = toks[p]
-    let ty = t[0]
-    let tx = t[1]
-    if (ty == "OP") and ((tx == "==") or (tx == "!=") or (tx == "<") or (tx == "<=") or (tx == ">") or (tx == ">=")) then
+    if (t[0] == "OP") and ((t[1] == "==") or (t[1] == "!=") or (t[1] == "<") or (t[1] == "<=") or (t[1] == ">") or (t[1] == ">=")) then
       let r2 = parse_add(toks, p + 1)
-      let node = ["Bin", tx, node, r2[0]]
+      let node = ["Bin", t[1], node, r2[0]]
       let p = r2[1]
     else
       let looping = false
@@ -96,53 +247,253 @@ make a function called parse_cmp takes toks, pos returns r
   return [node, p]
 end
 
-make a function called parse_stmt takes toks, pos returns r
-  let t = toks[pos]
-  let ty = t[0]
-  let tx = t[1]
-  if (ty == "IDENT") and (tx == "let") then
-    let nameTok = toks[pos + 1]
-    let name = nameTok[1]
-    let eqTok = toks[pos + 2]
-    if (eqTok[0] == "OP") and (eqTok[1] == "=") then
-      let r1 = parse_cmp(toks, pos + 3)
-      return [["Let", name, r1[0]], r1[1]]
-    else
-      return [["Err", "expected = after let name"], pos + 1]
-    end
-  else
-    if (ty == "IDENT") and (tx == "print") then
-      let lp = toks[pos + 1]
-      if (lp[0] == "OP") and (lp[1] == "(") then
-        let r1 = parse_cmp(toks, pos + 2)
-        let p = r1[1]
-        let rp = toks[p]
-        if (rp[0] == "OP") and (rp[1] == ")") then
-          return [["Print", r1[0]], p + 1]
-        else
-          return [["Err", "expected ) after print arg"], p]
-        end
-      else
-        return [["Err", "expected ( after print"], pos + 1]
-      end
-    else
-      return [["Err", "unexpected token '" + tx + "'"], pos + 1]
-    end
-  end
-end
-
-make a function called skip_nl takes toks, pos returns p
-  let p = pos
+make a function called parse_and takes toks, pos returns r
+  let r1 = parse_cmp(toks, pos)
+  let node = r1[0]
+  let p = r1[1]
   let looping = true
   while looping do
     let t = toks[p]
-    if t[0] == "NL" then
-      let p = p + 1
+    if tok_is(t, "IDENT", "and") then
+      let r2 = parse_cmp(toks, p + 1)
+      let node = ["Bin", "and", node, r2[0]]
+      let p = r2[1]
     else
       let looping = false
     end
   end
-  return p
+  return [node, p]
+end
+
+make a function called parse_expr takes toks, pos returns r
+  let r1 = parse_and(toks, pos)
+  let node = r1[0]
+  let p = r1[1]
+  let looping = true
+  while looping do
+    let t = toks[p]
+    if tok_is(t, "IDENT", "or") then
+      let r2 = parse_and(toks, p + 1)
+      let node = ["Bin", "or", node, r2[0]]
+      let p = r2[1]
+    else
+      let looping = false
+    end
+  end
+  return [node, p]
+end
+
+# ---- statements ----
+
+make a function called at_block_stop takes toks, pos returns r
+  let t = toks[pos]
+  if t[0] == "EOF" then
+    return true
+  else
+    if (t[0] == "IDENT") and ((t[1] == "end") or (t[1] == "else")) then
+      return true
+    else
+      return false
+    end
+  end
+end
+
+make a function called parse_stmts_until takes toks, pos returns r
+  # Collect statements until 'end' / 'else' / EOF (stopper not consumed).
+  let stmts = []
+  let p = skip_nl(toks, pos)
+  let looping = true
+  while looping do
+    if at_block_stop(toks, p) then
+      let looping = false
+    else
+      let s = parse_stmt(toks, p)
+      let stmts = list_push(stmts, s[0])
+      let p = skip_nl(toks, s[1])
+    end
+  end
+  return [stmts, p]
+end
+
+make a function called parse_if takes toks, pos returns r
+  # pos points at 'if'
+  let c = parse_expr(toks, pos + 1)
+  let cond = c[0]
+  let p = c[1]
+  let t = toks[p]
+  if tok_is(t, "IDENT", "then") then
+    let thenPart = parse_stmts_until(toks, p + 1)
+    let p2 = thenPart[1]
+    let t2 = toks[p2]
+    if tok_is(t2, "IDENT", "else") then
+      let elsePart = parse_stmts_until(toks, p2 + 1)
+      let p3 = elsePart[1]
+      let t3 = toks[p3]
+      if tok_is(t3, "IDENT", "end") then
+        return [["If", cond, thenPart[0], elsePart[0]], p3 + 1]
+      else
+        return [["Err", "expected end after else block"], p3]
+      end
+    else
+      if tok_is(t2, "IDENT", "end") then
+        return [["If", cond, thenPart[0], []], p2 + 1]
+      else
+        return [["Err", "expected else or end after if block"], p2]
+      end
+    end
+  else
+    return [["Err", "expected then after if condition"], p]
+  end
+end
+
+make a function called parse_while takes toks, pos returns r
+  # pos points at 'while'
+  let c = parse_expr(toks, pos + 1)
+  let cond = c[0]
+  let p = c[1]
+  let t = toks[p]
+  if tok_is(t, "IDENT", "do") then
+    let body = parse_stmts_until(toks, p + 1)
+    let p2 = body[1]
+    let t2 = toks[p2]
+    if tok_is(t2, "IDENT", "end") then
+      return [["While", cond, body[0]], p2 + 1]
+    else
+      return [["Err", "expected end after while body"], p2]
+    end
+  else
+    return [["Err", "expected do after while condition"], p]
+  end
+end
+
+make a function called parse_function_def takes toks, pos returns r
+  # pos points at 'make'; expect: make a function called NAME
+  #   [takes a, b] [returns r] NL body end
+  let p = pos + 1
+  if tok_is(toks[p], "IDENT", "a") then
+    let p = p + 1
+  end
+  if tok_is(toks[p], "IDENT", "function") then
+    let p = p + 1
+  else
+    return [["Err", "expected 'function' after make"], p]
+  end
+  if tok_is(toks[p], "IDENT", "called") then
+    let p = p + 1
+  end
+  let nameTok = toks[p]
+  if nameTok[0] == "IDENT" then
+    let name = nameTok[1]
+    let p = p + 1
+    let params = []
+    if tok_is(toks[p], "IDENT", "takes") then
+      let p = p + 1
+      let looping = true
+      while looping do
+        let t = toks[p]
+        if t[0] == "IDENT" then
+          if (t[1] == "returns") then
+            let looping = false
+          else
+            let params = list_push(params, t[1])
+            let p = p + 1
+          end
+        else
+          if tok_is(t, "OP", ",") then
+            let p = p + 1
+          else
+            let looping = false
+          end
+        end
+      end
+    end
+    if tok_is(toks[p], "IDENT", "returns") then
+      # return-var hint: parsed and ignored (Stage 1 requires explicit return)
+      let p = p + 2
+    end
+    let body = parse_stmts_until(toks, p)
+    let p2 = body[1]
+    if tok_is(toks[p2], "IDENT", "end") then
+      return [["Func", name, params, body[0]], p2 + 1]
+    else
+      return [["Err", "expected end after function body"], p2]
+    end
+  else
+    return [["Err", "expected function name"], p]
+  end
+end
+
+make a function called parse_when takes toks, pos returns r
+  # pos points at 'when'; expect: when EVENT do body end
+  let nameTok = toks[pos + 1]
+  if nameTok[0] == "IDENT" then
+    let ev = nameTok[1]
+    let p = pos + 2
+    if tok_is(toks[p], "IDENT", "do") then
+      let body = parse_stmts_until(toks, p + 1)
+      let p2 = body[1]
+      if tok_is(toks[p2], "IDENT", "end") then
+        return [["When", ev, body[0]], p2 + 1]
+      else
+        return [["Err", "expected end after when body"], p2]
+      end
+    else
+      return [["Err", "expected do after when event"], p]
+    end
+  else
+    return [["Err", "expected event name after when"], pos + 1]
+  end
+end
+
+make a function called parse_stmt takes toks, pos returns r
+  let t = toks[pos]
+  let ty = t[0]
+  let tx = t[1]
+  if ty == "IDENT" then
+    if tx == "let" then
+      let nameTok = toks[pos + 1]
+      let name = nameTok[1]
+      let eqTok = toks[pos + 2]
+      if tok_is(eqTok, "OP", "=") then
+        let e = parse_expr(toks, pos + 3)
+        return [["Let", name, e[0]], e[1]]
+      else
+        return [["Err", "expected = after let name"], pos + 1]
+      end
+    else
+      if tx == "if" then
+        return parse_if(toks, pos)
+      else
+        if tx == "while" then
+          return parse_while(toks, pos)
+        else
+          if tx == "return" then
+            let e = parse_expr(toks, pos + 1)
+            return [["Return", e[0]], e[1]]
+          else
+            if tx == "make" then
+              return parse_function_def(toks, pos)
+            else
+              if tx == "when" then
+                return parse_when(toks, pos)
+              else
+                # general call statement: NAME(args)
+                let nx = toks[pos + 1]
+                if tok_is(nx, "OP", "(") then
+                  let a = parse_args(toks, pos + 2)
+                  return [["Expr", ["Call", tx, a[0]]], a[1]]
+                else
+                  return [["Err", "unexpected token '" + tx + "'"], pos + 1]
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  else
+    return [["Err", "unexpected " + ty + " '" + tx + "'"], pos + 1]
+  end
 end
 
 make a function called parse_program takes toks returns ast
@@ -162,6 +513,21 @@ make a function called parse_program takes toks returns ast
   return ["Program", stmts]
 end
 
+# ---- AST pretty printer ----
+
+make a function called ast_list_to_str takes nodes returns s
+  let s = ""
+  let i = 0
+  while i < nodes.length do
+    if i > 0 then
+      let s = s + "; "
+    end
+    let s = s + ast_to_str(nodes[i])
+    let i = i + 1
+  end
+  return s
+end
+
 make a function called ast_to_str takes node returns s
   let ty = node[0]
   if ty == "Num" then
@@ -170,19 +536,63 @@ make a function called ast_to_str takes node returns s
     if ty == "Str" then
       return "Str('" + node[1] + "')"
     else
-      if ty == "Var" then
-        return "Var(" + node[1] + ")"
+      if ty == "Bool" then
+        return "Bool(" + node[1] + ")"
       else
-        if ty == "Bin" then
-          return "(" + ast_to_str(node[2]) + " " + node[1] + " " + ast_to_str(node[3]) + ")"
+        if ty == "Var" then
+          return "Var(" + node[1] + ")"
         else
-          if ty == "Let" then
-            return "Let " + node[1] + " = " + ast_to_str(node[2])
+          if ty == "Bin" then
+            return "(" + ast_to_str(node[2]) + " " + node[1] + " " + ast_to_str(node[3]) + ")"
           else
-            if ty == "Print" then
-              return "Print " + ast_to_str(node[1])
+            if ty == "Un" then
+              return "(" + node[1] + " " + ast_to_str(node[2]) + ")"
             else
-              return "Err(" + node[1] + ")"
+              if ty == "Call" then
+                return node[1] + "(" + ast_list_to_str(node[2]) + ")"
+              else
+                if ty == "List" then
+                  return "[" + ast_list_to_str(node[1]) + "]"
+                else
+                  if ty == "Index" then
+                    return ast_to_str(node[1]) + "[" + ast_to_str(node[2]) + "]"
+                  else
+                    if ty == "Member" then
+                      return ast_to_str(node[1]) + "." + node[2]
+                    else
+                      if ty == "Let" then
+                        return "Let " + node[1] + " = " + ast_to_str(node[2])
+                      else
+                        if ty == "Expr" then
+                          return ast_to_str(node[1])
+                        else
+                          if ty == "If" then
+                            return "If " + ast_to_str(node[1]) + " Then {" + ast_list_to_str(node[2]) + "} Else {" + ast_list_to_str(node[3]) + "}"
+                          else
+                            if ty == "While" then
+                              return "While " + ast_to_str(node[1]) + " {" + ast_list_to_str(node[2]) + "}"
+                            else
+                              if ty == "Func" then
+                                return "Func " + node[1] + " {" + ast_list_to_str(node[3]) + "}"
+                              else
+                                if ty == "Return" then
+                                  return "Return " + ast_to_str(node[1])
+                                else
+                                  if ty == "When" then
+                                    return "When " + node[1] + " {" + ast_list_to_str(node[2]) + "}"
+                                  else
+                                    return "Err(" + node[1] + ")"
+                                  end
+                                end
+                              end
+                            end
+                          end
+                        end
+                      end
+                    end
+                  end
+                end
+              end
             end
           end
         end

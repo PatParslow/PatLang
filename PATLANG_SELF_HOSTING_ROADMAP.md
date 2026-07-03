@@ -24,18 +24,37 @@ Stage 0 runtime, and drives native compilation end-to-end:
   `read_file`, `compile_shape`), forward-reference/mutual-recursion support in
   the lowerer, `while` accepted inside function/if/while bodies (parser bug).
 
-Current grammar of the self-hosted parser (Stage 1): `let`, `print(expr)`,
-arithmetic/comparison expressions with precedence, strings, parens.
+Current grammar of the self-hosted parser (Stage 1, extended July 3, 2026):
+`let`, general call statements, `if/then/else/end`, `while/do/end`,
+`make a function called N takes a, b returns r ... end`, `return`,
+`when EVENT do ... end` event handlers, list literals, indexing `xs[i]`,
+member access `.length`/`.prop`, `and`/`or`/`not`, unary minus, bool literals.
+
+Feature coverage through the self-hosted front-end (all natively compiled and
+output-verified by `tests/selfhost_pipeline.rs` via
+`self_hosting/examples/feature_demo.patlang`):
+- functions + recursion, full control flow, lists
+- **event-driven**: `when` handlers + `emit` (IR event_handlers in both the
+  IR interpreter and compiled programs)
+- **logic**: `fact`/`query`/`goal` hosts (thread-local FACTS, parity between
+  interpreted and compiled runs via `ir/hosts.rs`)
+- **OO**: `new`/`send`/`get` against the named-object store
+- **functional**: `apply(fname, args...)` call-by-name in both VMs enables
+  map/filter/reduce written in PatLang (see feature_demo)
 
 ### next steps toward full self-hosting
-1. Grow the Stage 1 parser grammar: `if/else`, `while`, function definitions,
-   calls — mirroring what the Stage 0 lowerer already supports.
-2. Move AST-shape → IR lowering from the `compile_shape` host into PatLang
+1. Move AST-shape → IR lowering from the `compile_shape` host into PatLang
    (emit the IR shape from PatLang; keep only codegen+rustc on the host).
-3. Embed codegen in compiled programs so a natively compiled patc can compile
+2. Embed codegen in compiled programs so a natively compiled patc can compile
    without the `pat` interpreter (true fixpoint: patc.exe compiles patc).
-4. Switch `patc.patlang` internals from `patc_compile_from_argv` delegation to
+3. Switch `patc.patlang` internals from `patc_compile_from_argv` delegation to
    the native lexer/parser pipeline, keeping the host path as a fallback flag.
+4. Grow the Stage 1 language until it can express `self_hosting/lib/*` itself
+   (remaining gaps: string escape decoding in the Stage 1 lexer, `include` at
+   the Stage 1 level, closures proper rather than call-by-name).
+5. Async + networking: TCP host arms in the codegen template + IR interpreter
+   (mirroring the webserver.patlang evaluator path); async model to be built
+   as an event loop over the existing event system.
 
 Note: the older `native_lexer/`, `native_parser/`, `native_evaluator/` sources
 are written in a richer aspirational dialect that parses under Stage 0 (kept

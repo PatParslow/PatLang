@@ -97,6 +97,17 @@ impl Interpreter {
                             }
                         }
                         stack.push(last);
+                    } else if name == "apply" {
+                        // apply(fname, args...): call a program function by name,
+                        // enabling higher-order style (map/filter over named fns)
+                        let fname = match args.get(0) {
+                            Some(Value::String(s)) => s.clone(),
+                            other => return Err(format!("apply: expected function name string, got {:?}", other)),
+                        };
+                        let callee = program.functions.get(&fname)
+                            .ok_or_else(|| format!("apply: function '{}' not found", fname))?;
+                        let ret = self.run_function(program, callee, &args[1..])?;
+                        stack.push(ret);
                     } else {
                         let f = self.host.get(name).ok_or_else(|| format!("host fn '{}' not found", name))?;
                         let res = f(&args)?;
