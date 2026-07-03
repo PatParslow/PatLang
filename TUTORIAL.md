@@ -198,6 +198,41 @@ actual port), `tcp_accept(port)`, `tcp_read(conn)`, `tcp_write(conn, data)`,
 pat --ir-run self_hosting/pipeline_stage2.patlang   # or compile echo_server directly
 ```
 
+### Async: the event loop
+
+Concurrency is event-driven and single-threaded, like JavaScript: a loop
+turns external happenings into events, and `when` handlers consume them.
+`tcp_accept_timeout(port, ms)` is the non-blocking primitive (returns -1 on
+timeout), `sleep_ms(ms)` yields time, and shared state lives in the object
+store via `set_var`/`get`:
+
+```patlang
+when request do
+  # event_data is the connection id
+  let text = tcp_read(event_data)
+  tcp_write(event_data, "...")
+  tcp_close(event_data)
+end
+
+when tick do
+  set_var("ticks", get("__vars", "ticks") + 1)
+end
+
+set_var("ticks", 0)
+let port = tcp_listen(0)
+while running do
+  let conn = tcp_accept_timeout(port, 50)
+  if conn >= 0 then
+    emit("request", conn)
+  else
+    emit("tick", 0)
+  end
+end
+```
+
+The complete program is `self_hosting/examples/event_loop_server.patlang` —
+it compiles natively and serves real HTTP requests while counting idle ticks.
+
 ### Files
 
 `read_file(path)` returns a file's contents as a string.
@@ -338,9 +373,9 @@ let port = tcp_listen(0)
 # GET /data  -> live JSON via http_ok("application/json", ...)
 ```
 
-Tip: use single quotes inside embedded JS/CSS/HTML attributes — the Stage 1
-dialect has no string escapes, and single-quoted JS needs none. `q()` gives a
-double quote where one is unavoidable (e.g. JSON keys).
+Tip: single quotes inside embedded JS/CSS/HTML attributes keep pages
+readable (escape-free); `\"` or `q()` both give a double quote where one is
+needed (e.g. JSON keys).
 
 ## 8. The portfolio
 
@@ -365,11 +400,17 @@ rust-runtime/target/release/pat --ir-run self_hosting/tools/build_portfolio.patl
 
 ## 10. Current limitations
 
-- The self-hosted (Stage 1) dialect has no string escape sequences yet — use
-  `chr(code)` to build special characters (`chr(10)` = newline).
-- `and` / `or` do not short-circuit in code compiled through the Stage 1
-  pipeline (both operands evaluate).
-- Objects, facts, and event handlers live in per-thread state.
-- Functions are not yet first-class closures; use `apply(name, ...)`.
-- Networking is blocking; the async/event-loop model is on the roadmap
-  (`PATLANG_SELF_HOSTING_ROADMAP.md`).
+- Functions are not yet first-class closures; pass function names and invoke
+  with `apply(name, ...)`. Lexical closures are the next major IR feature
+  (see `PATLANG_SELF_HOSTING_ROADMAP.md`).
+- Concurrency is cooperative: the event loop (section 4, Async) is
+  single-threaded like JavaScript's. There are no OS threads in the language
+  yet — which is also why the object/fact/event-handler stores being
+  per-thread is unobservable in practice.
+- Compiling is fast; *self*-compiling takes minutes because rustc digests the
+  ~1 MB emitted compiler. `patc` output is unoptimized for size (WASM modules
+  ~2 MB); `strip`/`opt-level=s` support is on the roadmap.
+
+Fixed since earlier versions: string escapes (`\n \t \r \" \\`) now work in
+the Stage 1 dialect, and `and`/`or` short-circuit in Stage-1-compiled code
+exactly as in Stage 0.

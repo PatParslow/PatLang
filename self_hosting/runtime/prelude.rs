@@ -925,6 +925,36 @@ impl Host {
                 CONNS.with(|c| c.borrow_mut().insert(id, stream));
                 Ok(Value::Number(id as f64))
             }
+            "sleep_ms" => {
+                let ms = arg_num(&args, 0, "sleep_ms")?.max(0.0) as u64;
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                Ok(Value::Unit)
+            }
+            "tcp_accept_timeout" => {
+                // tcp_accept_timeout(port, ms) -> conn id, or -1 on timeout
+                let port = arg_num(&args, 0, "tcp_accept_timeout")? as u16;
+                let ms = arg_num(&args, 1, "tcp_accept_timeout")?.max(0.0) as u64;
+                let listener = LISTENERS.with(|l| l.borrow().get(&port).map(|x| x.try_clone()))
+                    .ok_or_else(|| format!("tcp_accept_timeout: no listener on port {}", port))?
+                    .map_err(|e| format!("tcp_accept_timeout: {}", e))?;
+                listener.set_nonblocking(true).map_err(|e| format!("tcp_accept_timeout: {}", e))?;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let _ = stream.set_nonblocking(false);
+                            let id = NEXT_CONN.with(|n| { let mut b = n.borrow_mut(); let v = *b; *b += 1; v });
+                            CONNS.with(|c| c.borrow_mut().insert(id, stream));
+                            return Ok(Value::Number(id as f64));
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if std::time::Instant::now() >= deadline { return Ok(Value::Number(-1.0)); }
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                        Err(e) => return Err(format!("tcp_accept_timeout: {}", e)),
+                    }
+                }
+            }
             "tcp_read" => {
                 // tcp_read(conn) -> String (single read, up to 64 KiB)
                 use std::io::Read;

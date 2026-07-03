@@ -199,3 +199,44 @@ fn gui_server_serves_page_and_live_json() {
     let status = child.wait().expect("server exit");
     assert!(status.success());
 }
+
+#[test]
+fn stage1_escapes_and_short_circuit() {
+    // String escapes decode in the Stage 1 lexer, and and/or short-circuit
+    // in Stage-1-compiled code (missing_fn would error if evaluated)
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    if std::process::Command::new(&rustc).arg("--version").output().is_err() {
+        eprintln!("rustc not found; skipping");
+        return;
+    }
+    let out_dir = std::env::temp_dir().join("patlang_targets_test");
+    let _ = std::fs::create_dir_all(&out_dir);
+    let exe_path = out_dir.join(if cfg!(windows) { "sc_test.exe" } else { "sc_test" });
+
+    let program = "let x = false\n\
+        if x and missing_fn(1) then\n  print(\"bad\")\nelse\n  print(\"and-sc\")\nend\n\
+        if true or missing_fn(2) then\n  print(\"or-sc\")\nend\n\
+        print(\"T[\t]Q[\\\"]N\")\n";
+    let src_path = out_dir.join("sc_test.patlang");
+    std::fs::write(&src_path, program).expect("write program");
+
+    let driver = format!(
+        "let source = read_file(\"{}\")\n\
+         let toks = tokenize(source)\n\
+         let ast = parse_program(toks)\n\
+         let ir = lower_program(ast)\n\
+         let rs = emit_program_rs(ir)\n\
+         let exe = rustc_build(rs, \"{}\")\n\
+         print(\"COMPILED\")\n",
+        fwd(&src_path), fwd(&exe_path)
+    );
+    let lines = run_pipeline(&driver);
+    assert!(lines.iter().any(|l| l == "COMPILED"), "did not compile: {:?}", lines);
+
+    let out = std::process::Command::new(&exe_path).output().expect("run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let printed: Vec<&str> = stdout.lines().collect();
+    assert_eq!(printed.get(0).copied(), Some("and-sc"), "and short-circuit: {}", stdout);
+    assert_eq!(printed.get(1).copied(), Some("or-sc"), "or short-circuit: {}", stdout);
+    assert_eq!(printed.get(2).copied(), Some("T[\t]Q[\"]N"), "escapes: {}", stdout);
+}
