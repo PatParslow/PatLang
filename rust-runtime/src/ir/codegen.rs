@@ -692,6 +692,18 @@ impl Host {
                 xs.push(args[1].clone());
                 Ok(Value::List(xs))
             }
+            "list_set" => {
+                // list_set(list, index, value) -> new list with element replaced
+                if args.len() != 3 { return Err("list_set: expected 3 args".into()); }
+                let mut xs = match &args[0] {
+                    Value::List(xs) => xs.clone(),
+                    _ => return Err("list_set: expected list".into()),
+                };
+                let idx = match &args[1] { Value::Number(n) => *n as usize, Value::String(s) => s.parse::<usize>().unwrap_or(usize::MAX), _ => usize::MAX };
+                if idx >= xs.len() { return Err(format!("list_set: index {} out of range (len {})", idx, xs.len())); }
+                xs[idx] = args[2].clone();
+                Ok(Value::List(xs))
+            }
             "char_code" => {
                 // char_code(string, index) -> Number code point, or -1 if out of range
                 if args.len() != 2 { return Err("char_code: expected 2 args".into()); }

@@ -87,6 +87,67 @@ fn selfhost_pipeline_compiles_feature_demo() {
 }
 
 #[test]
+fn selfhost_stage3_lowering_in_patlang() {
+    // Fixpoint step 1: lexing, parsing, AND lowering all happen in PatLang;
+    // the compile_ir host only decodes finished IR and runs codegen + rustc.
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    if std::process::Command::new(&rustc).arg("--version").output().is_err() {
+        eprintln!("rustc not found; skipping stage 3 test");
+        return;
+    }
+
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let lexer_lib = std::fs::read_to_string(format!("{}/../self_hosting/lib/lexer.patlang", manifest)).expect("read lexer lib");
+    let parser_lib = std::fs::read_to_string(format!("{}/../self_hosting/lib/parser.patlang", manifest)).expect("read parser lib");
+    let lower_lib = std::fs::read_to_string(format!("{}/../self_hosting/lib/lower.patlang", manifest)).expect("read lower lib");
+    let demo_path = format!("{}/../self_hosting/examples/feature_demo.patlang", manifest).replace('\\', "/");
+
+    let out_dir = std::env::temp_dir().join("patlang_selfhost_pipeline_test");
+    let _ = std::fs::create_dir_all(&out_dir);
+    let exe_path = out_dir.join(if cfg!(windows) { "stage3_demo.exe" } else { "stage3_demo" });
+    let exe_str = exe_path.display().to_string().replace('\\', "/");
+
+    let driver = format!(
+        "let source = read_file(\"{}\")\n\
+         let toks = tokenize(source)\n\
+         let ast = parse_program(toks)\n\
+         let ir = lower_program(ast)\n\
+         let exe = compile_ir(ir, \"{}\")\n\
+         print(\"COMPILED\")\n",
+        demo_path, exe_str
+    );
+    let full_src = format!("{}\n{}\n{}\n{}", lexer_lib, parser_lib, lower_lib, driver);
+
+    let mut parser = Stage0Parser::new(&full_src).expect("lexer init");
+    let ast = parser.parse().expect("stage 3 pipeline source should parse");
+    let mut lower = Lowerer::new();
+    let program = lower.lower_program_basic(&ast);
+
+    let mut interp = Interpreter::new();
+    interp.host.insert("print", capture_print);
+    register_stage0_shims(&mut interp);
+    PRINTED.with(|p| p.borrow_mut().clear());
+    interp.run(&program).expect("stage 3 pipeline should run");
+    let lines = PRINTED.with(|p| p.borrow().clone());
+    assert!(lines.iter().any(|l| l == "COMPILED"), "did not reach compile step: {:?}", lines);
+    assert!(exe_path.exists(), "compiled executable not found at {}", exe_path.display());
+
+    let out = std::process::Command::new(&exe_path).output().expect("run compiled exe");
+    assert!(out.status.success(), "compiled exe failed: {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let printed: Vec<&str> = stdout.lines().collect();
+    // Identical output to the host-lowered stage 2 pipeline
+    assert_eq!(printed.get(0).copied(), Some("fib(10) = 55"), "recursion: {}", stdout);
+    assert_eq!(printed.get(1).copied(), Some("sum = 10"), "lists/while: {}", stdout);
+    assert_eq!(printed.get(2).copied(), Some("sum ok"), "if/else: {}", stdout);
+    assert_eq!(printed.get(3).copied(), Some("event received: hello events"), "events: {}", stdout);
+    assert_eq!(printed.get(4).copied(), Some("alice children: 2"), "logic: {}", stdout);
+    assert_eq!(printed.get(5).copied(), Some("kim age: 42"), "OO: {}", stdout);
+    assert_eq!(printed.get(6).copied(), Some("doubled: [2, 4, 6, 8]"), "functional map: {}", stdout);
+    assert_eq!(printed.get(7).copied(), Some("evens: [2, 4]"), "functional filter: {}", stdout);
+}
+
+#[test]
 fn selfhost_pipeline_compiles_tcp_echo_server() {
     // Networking through the self-hosted front-end: the Stage 1 echo server
     // compiles natively, binds a TCP port, and answers two HTTP requests.

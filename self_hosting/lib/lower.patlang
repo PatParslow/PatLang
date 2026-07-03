@@ -1,0 +1,204 @@
+# =============================================================================
+# Stage 1 self-hosted lowerer (Stage 0 compilable subset).
+# Walks the list-shaped AST from lib/parser.patlang and emits list-shaped IR
+# instructions. The host's compile_ir only decodes this IR and runs codegen —
+# lexing, parsing, AND lowering all happen in PatLang.
+#
+# IR shape:
+#   ["ProgramIR", entry, [functions], [events]]
+#   ["FuncIR", name, [params], [instrs]]
+#   ["EventIR", event, handler_name]
+# Instructions:
+#   ["Const", "num"|"str"|"bool", text]   ["Load", name]   ["Store", name]
+#   ["Bin", op]   ["Un", op]   ["Jump", n]   ["JumpIfFalse", n]
+#   ["CallHost", name, argc]   ["Call", name, argc]
+#   ["BuildList", n]   ["Return"]
+# =============================================================================
+
+make a function called contains_str takes xs, s returns r
+  let i = 0
+  while i < xs.length do
+    if xs[i] == s then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called lower_expr takes node, code, fns returns out
+  let ty = node[0]
+  if ty == "Num" then
+    return list_push(code, ["Const", "num", node[1]])
+  else
+    if ty == "Str" then
+      return list_push(code, ["Const", "str", node[1]])
+    else
+      if ty == "Bool" then
+        return list_push(code, ["Const", "bool", node[1]])
+      else
+        if ty == "Var" then
+          return list_push(code, ["Load", node[1]])
+        else
+          if ty == "Bin" then
+            let code = lower_expr(node[2], code, fns)
+            let code = lower_expr(node[3], code, fns)
+            return list_push(code, ["Bin", node[1]])
+          else
+            if ty == "Un" then
+              let code = lower_expr(node[2], code, fns)
+              return list_push(code, ["Un", node[1]])
+            else
+              if ty == "Call" then
+                let args = node[2]
+                let i = 0
+                while i < args.length do
+                  let code = lower_expr(args[i], code, fns)
+                  let i = i + 1
+                end
+                if contains_str(fns, node[1]) then
+                  return list_push(code, ["Call", node[1], args.length])
+                else
+                  return list_push(code, ["CallHost", node[1], args.length])
+                end
+              else
+                if ty == "List" then
+                  let items = node[1]
+                  let i = 0
+                  while i < items.length do
+                    let code = lower_expr(items[i], code, fns)
+                    let i = i + 1
+                  end
+                  return list_push(code, ["BuildList", items.length])
+                else
+                  if ty == "Index" then
+                    let code = lower_expr(node[1], code, fns)
+                    let code = lower_expr(node[2], code, fns)
+                    return list_push(code, ["CallHost", "list_get", 2])
+                  else
+                    if ty == "Member" then
+                      let code = lower_expr(node[1], code, fns)
+                      if (node[2] == "length") or (node[2] == "len") then
+                        return list_push(code, ["CallHost", "len", 1])
+                      else
+                        let code = list_push(code, ["Const", "str", node[2]])
+                        return list_push(code, ["CallHost", "get", 2])
+                      end
+                    else
+                      # unknown expression: lower as unit-ish empty string
+                      return list_push(code, ["Const", "str", ""])
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+make a function called lower_stmt takes node, code, fns returns out
+  let ty = node[0]
+  if ty == "Let" then
+    let code = lower_expr(node[2], code, fns)
+    return list_push(code, ["Store", node[1]])
+  else
+    if ty == "Expr" then
+      return lower_expr(node[1], code, fns)
+    else
+      if ty == "Print" then
+        let code = lower_expr(node[1], code, fns)
+        return list_push(code, ["CallHost", "print", 1])
+      else
+        if ty == "Return" then
+          let code = lower_expr(node[1], code, fns)
+          return list_push(code, ["Return"])
+        else
+          if ty == "If" then
+            let code = lower_expr(node[1], code, fns)
+            let jif = code.length
+            let code = list_push(code, ["JumpIfFalse", 0])
+            let code = lower_block(node[2], code, fns)
+            let jmp = code.length
+            let code = list_push(code, ["Jump", 0])
+            let code = list_set(code, jif, ["JumpIfFalse", code.length])
+            let code = lower_block(node[3], code, fns)
+            let code = list_set(code, jmp, ["Jump", code.length])
+            return code
+          else
+            if ty == "While" then
+              let start = code.length
+              let code = lower_expr(node[1], code, fns)
+              let jif = code.length
+              let code = list_push(code, ["JumpIfFalse", 0])
+              let code = lower_block(node[2], code, fns)
+              let code = list_push(code, ["Jump", start])
+              let code = list_set(code, jif, ["JumpIfFalse", code.length])
+              return code
+            else
+              # unknown statement: no code
+              return code
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+make a function called lower_block takes stmts, code, fns returns out
+  let i = 0
+  while i < stmts.length do
+    let code = lower_stmt(stmts[i], code, fns)
+    let i = i + 1
+  end
+  return code
+end
+
+make a function called collect_fns takes stmts returns fns
+  let fns = []
+  let i = 0
+  while i < stmts.length do
+    let s = stmts[i]
+    if s[0] == "Func" then
+      let fns = list_push(fns, s[1])
+    end
+    let i = i + 1
+  end
+  return fns
+end
+
+make a function called lower_program takes ast returns ir
+  let stmts = ast[1]
+  let fns = collect_fns(stmts)
+  let funcs = []
+  let events = []
+  let mainCode = []
+  let handlerCount = 0
+  let i = 0
+  while i < stmts.length do
+    let s = stmts[i]
+    if s[0] == "Func" then
+      let code = lower_block(s[3], [], fns)
+      let code = list_push(code, ["Return"])
+      let funcs = list_push(funcs, ["FuncIR", s[1], s[2], code])
+    else
+      if s[0] == "When" then
+        let handlerCount = handlerCount + 1
+        let hname = "__when_" + s[1] + "_" + handlerCount
+        let code = lower_block(s[2], [], fns)
+        let code = list_push(code, ["Return"])
+        let funcs = list_push(funcs, ["FuncIR", hname, ["event_name", "event_data"], code])
+        let events = list_push(events, ["EventIR", s[1], hname])
+      else
+        let mainCode = lower_stmt(s, mainCode, fns)
+      end
+    end
+    let i = i + 1
+  end
+  let mainCode = list_push(mainCode, ["Return"])
+  let funcs = list_push(funcs, ["FuncIR", "main", [], mainCode])
+  return ["ProgramIR", "main", funcs, events]
+end

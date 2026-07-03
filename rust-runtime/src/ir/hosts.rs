@@ -55,6 +55,19 @@ pub fn host_list_push(args: &[Value]) -> Result<Value, String> {
     Ok(Value::List(xs))
 }
 
+pub fn host_list_set(args: &[Value]) -> Result<Value, String> {
+    // list_set(list, index, value) -> new list with element replaced
+    if args.len() != 3 { return Err("list_set: expected 3 args".into()); }
+    let mut xs = match &args[0] {
+        Value::List(xs) => xs.clone(),
+        _ => return Err("list_set: expected list".into()),
+    };
+    let idx = match &args[1] { Value::Number(n) => *n as usize, Value::String(s) => s.parse::<usize>().unwrap_or(usize::MAX), _ => usize::MAX };
+    if idx >= xs.len() { return Err(format!("list_set: index {} out of range (len {})", idx, xs.len())); }
+    xs[idx] = args[2].clone();
+    Ok(Value::List(xs))
+}
+
 pub fn host_char_code(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 { return Err("char_code: expected 2 args".into()); }
     let s = match &args[0] { Value::String(s) => s.clone(), v => display_value(v) };
@@ -464,8 +477,34 @@ pub fn shape_to_program(v: &Value) -> Result<Program, String> {
     Ok(program)
 }
 
+/// Shared back half: emit Rust for a Program and compile it with rustc.
+fn compile_program_to_exe(program: &Program, out: &str, what: &str) -> Result<Value, String> {
+    let cg = super::codegen::RustCodegen::new();
+    let rust_src = cg.emit_rust(program);
+
+    let mut tmp = std::env::temp_dir();
+    tmp.push("patlang_shape_compile");
+    std::fs::create_dir_all(&tmp).map_err(|e| format!("{}: temp dir: {}", what, e))?;
+    let src_path = tmp.join("shape_main.rs");
+    std::fs::write(&src_path, &rust_src).map_err(|e| format!("{}: write {}: {}", what, src_path.display(), e))?;
+
+    if let Some(parent) = std::path::Path::new(out).parent() { let _ = std::fs::create_dir_all(parent); }
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let status = std::process::Command::new(&rustc)
+        .arg("-O")
+        .arg(&src_path)
+        .arg("-o")
+        .arg(out)
+        .status()
+        .map_err(|e| format!("{}: failed to run rustc: {}", what, e))?;
+    if !status.success() { return Err(format!("{}: rustc failed with status {}", what, status)); }
+    let p = std::path::Path::new(out);
+    let abs = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    Ok(Value::String(abs.display().to_string()))
+}
+
 /// compile_shape(ast_shape, out_path) -> compiled exe path.
-/// Lowers the list-shaped AST to IR, emits Rust, and compiles with rustc.
+/// Lowers the list-shaped AST to IR (host-side), emits Rust, compiles with rustc.
 pub fn host_compile_shape(args: &[Value]) -> Result<Value, String> {
     let shape = args.get(0).ok_or("compile_shape: expected AST shape")?;
     let out = match args.get(1) {
@@ -473,28 +512,121 @@ pub fn host_compile_shape(args: &[Value]) -> Result<Value, String> {
         _ => return Err("compile_shape: expected output path as second argument".into()),
     };
     let program = shape_to_program(shape)?;
-    let cg = super::codegen::RustCodegen::new();
-    let rust_src = cg.emit_rust(&program);
+    compile_program_to_exe(&program, &out, "compile_shape")
+}
 
-    let mut tmp = std::env::temp_dir();
-    tmp.push("patlang_shape_compile");
-    std::fs::create_dir_all(&tmp).map_err(|e| format!("compile_shape: temp dir: {}", e))?;
-    let src_path = tmp.join("shape_main.rs");
-    std::fs::write(&src_path, &rust_src).map_err(|e| format!("compile_shape: write {}: {}", src_path.display(), e))?;
+// --- IR-shape decoding: list-shaped IR produced by the PatLang lowerer ---
+// ["ProgramIR", entry, [functions], [events]]
+//   function: ["FuncIR", name, [param strings], [instrs]]
+//   event:    ["EventIR", event_name, handler_fn_name]
+//   instr:    ["Const", "num"|"str"|"bool", text] | ["Load", name] | ["Store", name]
+//             ["Bin", op] | ["Un", op] | ["Jump", n] | ["JumpIfFalse", n]
+//             ["CallHost", name, argc] | ["Call", name, argc]
+//             ["BuildList", n] | ["Return"]
 
-    if let Some(parent) = std::path::Path::new(&out).parent() { let _ = std::fs::create_dir_all(parent); }
-    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
-    let status = std::process::Command::new(&rustc)
-        .arg("-O")
-        .arg(&src_path)
-        .arg("-o")
-        .arg(&out)
-        .status()
-        .map_err(|e| format!("compile_shape: failed to run rustc: {}", e))?;
-    if !status.success() { return Err(format!("compile_shape: rustc failed with status {}", status)); }
-    let p = std::path::Path::new(&out);
-    let abs = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    Ok(Value::String(abs.display().to_string()))
+fn shape_num(xs: &[Value], i: usize, what: &str) -> Result<f64, String> {
+    match xs.get(i) {
+        Some(Value::Number(n)) => Ok(*n),
+        Some(Value::String(s)) => s.trim().parse::<f64>().map_err(|_| format!("compile_ir: expected number {}", what)),
+        _ => Err(format!("compile_ir: expected number {}", what)),
+    }
+}
+
+fn decode_ir_instr(v: &Value) -> Result<Instr, String> {
+    let xs = shape_list(v)?;
+    let instr = match shape_tag(xs)? {
+        "Const" => {
+            let kind = shape_str(xs, 1, "const kind")?;
+            let text = shape_str(xs, 2, "const text")?;
+            let val = match kind.as_str() {
+                "num" => Value::Number(text.trim().parse::<f64>().map_err(|_| format!("compile_ir: bad number '{}'", text))?),
+                "str" => Value::String(text),
+                "bool" => Value::Bool(text == "true"),
+                other => return Err(format!("compile_ir: unknown const kind '{}'", other)),
+            };
+            Instr::Const(val)
+        }
+        "Load" => Instr::LoadLocal(shape_str(xs, 1, "load name")?),
+        "Store" => Instr::StoreLocal(shape_str(xs, 1, "store name")?),
+        "Bin" => {
+            let op = shape_str(xs, 1, "bin op")?;
+            let kind = match op.as_str() {
+                "+" => BinOpKind::Add, "-" => BinOpKind::Sub, "*" => BinOpKind::Mul,
+                "/" => BinOpKind::Div, "%" => BinOpKind::Mod,
+                "==" => BinOpKind::Eq, "!=" => BinOpKind::Ne,
+                "<" => BinOpKind::Lt, "<=" => BinOpKind::Le,
+                ">" => BinOpKind::Gt, ">=" => BinOpKind::Ge,
+                "and" => BinOpKind::And, "or" => BinOpKind::Or,
+                other => return Err(format!("compile_ir: unknown bin op '{}'", other)),
+            };
+            Instr::BinOp(kind)
+        }
+        "Un" => {
+            let op = shape_str(xs, 1, "un op")?;
+            match op.as_str() {
+                "-" => Instr::UnOp(UnOpKind::Neg),
+                "not" => Instr::UnOp(UnOpKind::Not),
+                other => return Err(format!("compile_ir: unknown unary op '{}'", other)),
+            }
+        }
+        "Jump" => Instr::Jump(shape_num(xs, 1, "jump target")? as usize),
+        "JumpIfFalse" => Instr::JumpIfFalse(shape_num(xs, 1, "jump target")? as usize),
+        "CallHost" => Instr::CallHost(shape_str(xs, 1, "host name")?, shape_num(xs, 2, "argc")? as usize),
+        "Call" => Instr::Call(shape_str(xs, 1, "function name")?, shape_num(xs, 2, "argc")? as usize),
+        "BuildList" => Instr::BuildList(shape_num(xs, 1, "count")? as usize),
+        "Return" => Instr::Return,
+        other => return Err(format!("compile_ir: unknown instruction '{}'", other)),
+    };
+    Ok(instr)
+}
+
+/// Convert a list-shaped IR (produced by the PatLang lowerer) into a Program.
+pub fn ir_shape_to_program(v: &Value) -> Result<Program, String> {
+    let xs = shape_list(v)?;
+    if shape_tag(xs)? != "ProgramIR" { return Err("compile_ir: root node must be ProgramIR".into()); }
+    let entry = shape_str(xs, 1, "entry name")?;
+    let funcs = shape_stmt_list(xs, 2, "in ProgramIR functions")?;
+    let events = shape_stmt_list(xs, 3, "in ProgramIR events")?;
+
+    let mut program = Program::default();
+    program.entry = entry;
+    for fv in funcs {
+        let fx = shape_list(fv)?;
+        if shape_tag(fx)? != "FuncIR" { return Err("compile_ir: expected FuncIR node".into()); }
+        let name = shape_str(fx, 1, "function name")?;
+        let params: Vec<String> = match fx.get(2) {
+            Some(Value::List(ps)) => ps.iter().map(|p| match p {
+                Value::String(s) => Ok(s.clone()),
+                _ => Err("compile_ir: param must be a string".to_string()),
+            }).collect::<Result<_, _>>()?,
+            _ => return Err("compile_ir: FuncIR missing params".into()),
+        };
+        let instrs = shape_stmt_list(fx, 3, "in FuncIR body")?;
+        let mut f = Function { name: name.clone(), params, ..Default::default() };
+        for iv in instrs { f.body.push(decode_ir_instr(iv)?); }
+        program.functions.insert(name, f);
+    }
+    for ev in events {
+        let ex = shape_list(ev)?;
+        if shape_tag(ex)? != "EventIR" { return Err("compile_ir: expected EventIR node".into()); }
+        let event = shape_str(ex, 1, "event name")?;
+        let handler = shape_str(ex, 2, "handler name")?;
+        program.event_handlers.entry(event).or_default().push(handler);
+    }
+    Ok(program)
+}
+
+/// compile_ir(ir_shape, out_path) -> compiled exe path.
+/// The lowering has already happened in PatLang; this only decodes the IR
+/// shape, emits Rust, and runs rustc.
+pub fn host_compile_ir(args: &[Value]) -> Result<Value, String> {
+    let shape = args.get(0).ok_or("compile_ir: expected IR shape")?;
+    let out = match args.get(1) {
+        Some(Value::String(s)) if !s.trim().is_empty() => s.clone(),
+        _ => return Err("compile_ir: expected output path as second argument".into()),
+    };
+    let program = ir_shape_to_program(shape)?;
+    compile_program_to_exe(&program, &out, "compile_ir")
 }
 
 // --- Networking hosts (blocking TCP; async/event-loop model is future work) ---
@@ -575,12 +707,14 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("list_get", host_list_get);
     interp.host.insert("list_len", host_list_len);
     interp.host.insert("list_push", host_list_push);
+    interp.host.insert("list_set", host_list_set);
     interp.host.insert("char_code", host_char_code);
     interp.host.insert("substr", host_substr);
     interp.host.insert("chr", host_chr);
     interp.host.insert("to_num", host_to_num);
     interp.host.insert("read_file", host_read_file);
     interp.host.insert("compile_shape", host_compile_shape);
+    interp.host.insert("compile_ir", host_compile_ir);
     // OO + logic hosts (state shared per thread, matching compiled semantics)
     interp.host.insert("fact", host_fact);
     interp.host.insert("query", host_query);

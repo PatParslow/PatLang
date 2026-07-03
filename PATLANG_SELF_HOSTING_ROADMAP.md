@@ -48,10 +48,17 @@ output-verified by `tests/selfhost_pipeline.rs` via
   `selfhost_pipeline_compiles_tcp_echo_server`)
 
 ### next steps toward full self-hosting
-1. Move AST-shape → IR lowering from the `compile_shape` host into PatLang
-   (emit the IR shape from PatLang; keep only codegen+rustc on the host).
+1. ✅ DONE (July 3, 2026): AST → IR lowering moved into PatLang.
+   `self_hosting/lib/lower.patlang` emits list-shaped IR instructions (with
+   jump patching via the new `list_set` host); the `compile_ir` host only
+   decodes finished IR and runs codegen + rustc. `pipeline_stage3.patlang`
+   runs lexer + parser + lowerer all in PatLang; verified by
+   `selfhost_stage3_lowering_in_patlang` (identical output to stage 2).
 2. Embed codegen in compiled programs so a natively compiled patc can compile
    without the `pat` interpreter (true fixpoint: patc.exe compiles patc).
+   Next concrete piece: emit the Rust source text from PatLang too (walk the
+   IR shape and build the program-builder section as a string), leaving only
+   "write file + invoke rustc" on the host.
 3. Switch `patc.patlang` internals from `patc_compile_from_argv` delegation to
    the native lexer/parser pipeline, keeping the host path as a fallback flag.
 4. Grow the Stage 1 language until it can express `self_hosting/lib/*` itself
