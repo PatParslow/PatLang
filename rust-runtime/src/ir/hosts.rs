@@ -29,7 +29,14 @@ pub fn host_list_get(args: &[Value]) -> Result<Value, String> {
     let idx = match &args[1] { Value::Number(n) => *n as usize, Value::String(s) => s.parse::<usize>().unwrap_or(usize::MAX), _ => usize::MAX };
     match &args[0] {
         Value::List(xs) => Ok(xs.get(idx).cloned().unwrap_or(Value::Unit)),
-        Value::String(s) => Ok(match s.chars().nth(idx) { Some(c) => Value::String(c.to_string()), None => Value::String(String::new()) }),
+        Value::String(s) => {
+            // O(1) byte indexing for ASCII strings; chars().nth for the rest
+            if s.is_ascii() {
+                Ok(match s.as_bytes().get(idx) { Some(b) => Value::String((*b as char).to_string()), None => Value::String(String::new()) })
+            } else {
+                Ok(match s.chars().nth(idx) { Some(c) => Value::String(c.to_string()), None => Value::String(String::new()) })
+            }
+        }
         _ => Ok(Value::Unit),
     }
 }
@@ -72,6 +79,9 @@ pub fn host_char_code(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 { return Err("char_code: expected 2 args".into()); }
     let s = match &args[0] { Value::String(s) => s.clone(), v => display_value(v) };
     let idx = match &args[1] { Value::Number(n) => *n as usize, Value::String(t) => t.parse::<usize>().unwrap_or(usize::MAX), _ => usize::MAX };
+    if s.is_ascii() {
+        return Ok(Value::Number(match s.as_bytes().get(idx) { Some(b) => *b as f64, None => -1.0 }));
+    }
     match s.chars().nth(idx) {
         Some(c) => Ok(Value::Number(c as u32 as f64)),
         None => Ok(Value::Number(-1.0)),
@@ -83,7 +93,155 @@ pub fn host_substr(args: &[Value]) -> Result<Value, String> {
     let s = match &args[0] { Value::String(s) => s.clone(), v => display_value(v) };
     let start = match &args[1] { Value::Number(n) => (*n).max(0.0) as usize, Value::String(t) => t.parse::<usize>().unwrap_or(0), _ => 0 };
     let count = match &args[2] { Value::Number(n) => (*n).max(0.0) as usize, Value::String(t) => t.parse::<usize>().unwrap_or(0), _ => 0 };
+    if s.is_ascii() {
+        let b = s.as_bytes();
+        let st = start.min(b.len());
+        let en = st.saturating_add(count).min(b.len());
+        return Ok(Value::String(String::from_utf8_lossy(&b[st..en]).to_string()));
+    }
     Ok(Value::String(s.chars().skip(start).take(count).collect()))
+}
+
+// --- Handle-based builders: O(1) push/index for large collections, avoiding
+// the whole-list clone that value-semantics locals otherwise imply ---
+
+thread_local! {
+    static VECS: RefCell<Vec<Vec<Value>>> = RefCell::new(Vec::new());
+    static SBUFS: RefCell<Vec<String>> = RefCell::new(Vec::new());
+}
+
+fn arg_usize(args: &[Value], i: usize, what: &str) -> Result<usize, String> {
+    match args.get(i) {
+        Some(Value::Number(n)) => Ok(*n as usize),
+        Some(Value::String(s)) => s.trim().parse::<usize>().map_err(|_| format!("{}: expected index", what)),
+        _ => Err(format!("{}: expected number", what)),
+    }
+}
+
+pub fn host_vec_new(_args: &[Value]) -> Result<Value, String> {
+    let id = VECS.with(|v| { let mut b = v.borrow_mut(); b.push(Vec::new()); b.len() - 1 });
+    Ok(Value::Number(id as f64))
+}
+
+pub fn host_vec_push(args: &[Value]) -> Result<Value, String> {
+    let id = arg_usize(args, 0, "vec_push")?;
+    let item = args.get(1).cloned().unwrap_or(Value::Unit);
+    VECS.with(|v| {
+        let mut b = v.borrow_mut();
+        b.get_mut(id).ok_or_else(|| format!("vec_push: unknown vec {}", id)).map(|xs| xs.push(item))
+    })?;
+    Ok(Value::Unit)
+}
+
+pub fn host_vec_set(args: &[Value]) -> Result<Value, String> {
+    let id = arg_usize(args, 0, "vec_set")?;
+    let idx = arg_usize(args, 1, "vec_set")?;
+    let item = args.get(2).cloned().unwrap_or(Value::Unit);
+    VECS.with(|v| {
+        let mut b = v.borrow_mut();
+        let xs = b.get_mut(id).ok_or_else(|| format!("vec_set: unknown vec {}", id))?;
+        if idx >= xs.len() { return Err(format!("vec_set: index {} out of range (len {})", idx, xs.len())); }
+        xs[idx] = item;
+        Ok(())
+    })?;
+    Ok(Value::Unit)
+}
+
+pub fn host_vec_get(args: &[Value]) -> Result<Value, String> {
+    let id = arg_usize(args, 0, "vec_get")?;
+    let idx = arg_usize(args, 1, "vec_get")?;
+    VECS.with(|v| {
+        let b = v.borrow();
+        b.get(id).ok_or_else(|| format!("vec_get: unknown vec {}", id))
+            .map(|xs| xs.get(idx).cloned().unwrap_or(Value::Unit))
+    })
+}
+
+pub fn host_vec_len(args: &[Value]) -> Result<Value, String> {
+    let id = arg_usize(args, 0, "vec_len")?;
+    VECS.with(|v| {
+        let b = v.borrow();
+        b.get(id).ok_or_else(|| format!("vec_len: unknown vec {}", id)).map(|xs| Value::Number(xs.len() as f64))
+    })
+}
+
+pub fn host_vec_to_list(args: &[Value]) -> Result<Value, String> {
+    let id = arg_usize(args, 0, "vec_to_list")?;
+    VECS.with(|v| {
+        let b = v.borrow();
+        b.get(id).ok_or_else(|| format!("vec_to_list: unknown vec {}", id)).map(|xs| Value::List(xs.clone()))
+    })
+}
+
+// Interned read-only strings: O(1) handle passing for hot loops (the
+// tokenizer indexes the whole source per character; a Value::String local
+// would be cloned on every access)
+thread_local! {
+    static ISTRINGS: RefCell<Vec<String>> = RefCell::new(Vec::new());
+}
+
+pub fn host_str_intern(args: &[Value]) -> Result<Value, String> {
+    let s = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
+    let id = ISTRINGS.with(|v| { let mut b = v.borrow_mut(); b.push(s); b.len() - 1 });
+    Ok(Value::Number(id as f64))
+}
+
+pub fn host_sc_len(args: &[Value]) -> Result<Value, String> {
+    let id = arg_usize(args, 0, "sc_len")?;
+    ISTRINGS.with(|v| {
+        let b = v.borrow();
+        b.get(id).ok_or_else(|| format!("sc_len: unknown string {}", id))
+            .map(|s| Value::Number(if s.is_ascii() { s.len() as f64 } else { s.chars().count() as f64 }))
+    })
+}
+
+pub fn host_sc_code(args: &[Value]) -> Result<Value, String> {
+    let id = arg_usize(args, 0, "sc_code")?;
+    let idx = arg_usize(args, 1, "sc_code")?;
+    ISTRINGS.with(|v| {
+        let b = v.borrow();
+        let s = b.get(id).ok_or_else(|| format!("sc_code: unknown string {}", id))?;
+        if s.is_ascii() {
+            return Ok(Value::Number(match s.as_bytes().get(idx) { Some(c) => *c as f64, None => -1.0 }));
+        }
+        Ok(Value::Number(match s.chars().nth(idx) { Some(c) => c as u32 as f64, None => -1.0 }))
+    })
+}
+
+pub fn host_sc_char(args: &[Value]) -> Result<Value, String> {
+    let id = arg_usize(args, 0, "sc_char")?;
+    let idx = arg_usize(args, 1, "sc_char")?;
+    ISTRINGS.with(|v| {
+        let b = v.borrow();
+        let s = b.get(id).ok_or_else(|| format!("sc_char: unknown string {}", id))?;
+        if s.is_ascii() {
+            return Ok(match s.as_bytes().get(idx) { Some(c) => Value::String((*c as char).to_string()), None => Value::String(String::new()) });
+        }
+        Ok(match s.chars().nth(idx) { Some(c) => Value::String(c.to_string()), None => Value::String(String::new()) })
+    })
+}
+
+pub fn host_sb_new(_args: &[Value]) -> Result<Value, String> {
+    let id = SBUFS.with(|v| { let mut b = v.borrow_mut(); b.push(String::new()); b.len() - 1 });
+    Ok(Value::Number(id as f64))
+}
+
+pub fn host_sb_push(args: &[Value]) -> Result<Value, String> {
+    let id = arg_usize(args, 0, "sb_push")?;
+    let text = match args.get(1) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
+    SBUFS.with(|v| {
+        let mut b = v.borrow_mut();
+        b.get_mut(id).ok_or_else(|| format!("sb_push: unknown buffer {}", id)).map(|s| s.push_str(&text))
+    })?;
+    Ok(Value::Unit)
+}
+
+pub fn host_sb_str(args: &[Value]) -> Result<Value, String> {
+    let id = arg_usize(args, 0, "sb_str")?;
+    SBUFS.with(|v| {
+        let b = v.borrow();
+        b.get(id).ok_or_else(|| format!("sb_str: unknown buffer {}", id)).map(|s| Value::String(s.clone()))
+    })
 }
 
 pub fn host_chr(args: &[Value]) -> Result<Value, String> {
@@ -749,8 +907,23 @@ pub fn host_tcp_write(args: &[Value]) -> Result<Value, String> {
 }
 
 pub fn host_tcp_close(args: &[Value]) -> Result<Value, String> {
+    use std::io::Read;
     let id = arg_num(args, 0, "tcp_close")? as usize;
-    CONNS.with(|c| c.borrow_mut().remove(&id));
+    if let Some(stream) = CONNS.with(|c| c.borrow_mut().remove(&id)) {
+        // Drain any unread inbound bytes and half-close, so the peer receives
+        // a graceful FIN instead of an RST that could clobber our response
+        let _ = stream.set_nonblocking(true);
+        let mut sink = [0u8; 4096];
+        let mut s = stream;
+        loop {
+            match s.read(&mut sink) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        let _ = s.shutdown(std::net::Shutdown::Write);
+    }
     Ok(Value::Unit)
 }
 
@@ -762,6 +935,19 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("list_len", host_list_len);
     interp.host.insert("list_push", host_list_push);
     interp.host.insert("list_set", host_list_set);
+    interp.host.insert("vec_new", host_vec_new);
+    interp.host.insert("vec_push", host_vec_push);
+    interp.host.insert("vec_set", host_vec_set);
+    interp.host.insert("vec_get", host_vec_get);
+    interp.host.insert("vec_len", host_vec_len);
+    interp.host.insert("vec_to_list", host_vec_to_list);
+    interp.host.insert("sb_new", host_sb_new);
+    interp.host.insert("sb_push", host_sb_push);
+    interp.host.insert("sb_str", host_sb_str);
+    interp.host.insert("str_intern", host_str_intern);
+    interp.host.insert("sc_len", host_sc_len);
+    interp.host.insert("sc_code", host_sc_code);
+    interp.host.insert("sc_char", host_sc_char);
     interp.host.insert("char_code", host_char_code);
     interp.host.insert("substr", host_substr);
     interp.host.insert("chr", host_chr);
