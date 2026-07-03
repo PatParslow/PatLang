@@ -30,6 +30,7 @@ pub enum Token {
     Elif,
     Equal,
     EqualEqual,
+    NotEqual,
     Greater,
     GreaterEqual,
     Less,
@@ -181,19 +182,35 @@ impl<'a> Lexer<'a> {
                 self.position += 1;
                 return Ok(Token::BlockEnd);
             }
-            // String literals
+            // String literals with standard escapes: \" \\ \n \t \r
             if c == '"' {
                 self.position += 1;
-                let start = self.position;
+                let mut s = String::new();
                 while self.position < len && bytes[self.position] as char != '"' {
-                    // Handle escape sequences later
+                    let ch = bytes[self.position] as char;
+                    if ch == '\\' && self.position + 1 < len {
+                        let esc = bytes[self.position + 1] as char;
+                        let decoded = match esc {
+                            'n' => Some('\n'),
+                            't' => Some('\t'),
+                            'r' => Some('\r'),
+                            '"' => Some('"'),
+                            '\\' => Some('\\'),
+                            _ => None,
+                        };
+                        if let Some(d) = decoded {
+                            s.push(d);
+                            self.position += 2;
+                            continue;
+                        }
+                    }
+                    s.push(ch);
                     self.position += 1;
                 }
-                let s = &self.input[start..self.position];
                 if self.position < len && bytes[self.position] as char == '"' {
                     self.position += 1;
                     lex_debug!("[DEBUG][lexer] Returning Token::String({})", s);
-                    return Ok(Token::String(s.to_string()));
+                    return Ok(Token::String(s));
                 } else {
                     return Err(LexerError::UnterminatedString(self.position));
                 }
@@ -235,6 +252,15 @@ impl<'a> Lexer<'a> {
                         Token::LessEqual
                     } else {
                         Token::Less
+                    }
+                },
+                '!' => {
+                    // Check for !=; bare '!' is logical not
+                    if self.position < len && bytes[self.position] as char == '=' {
+                        self.position += 1;
+                        Token::NotEqual
+                    } else {
+                        Token::Not
                     }
                 },
                 _ => Token::EOF,

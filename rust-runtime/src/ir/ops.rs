@@ -44,10 +44,26 @@ pub fn cmp(kind: BinOpKind, a: &Value, b: &Value) -> Result<Value, String> {
     match kind {
         Eq => Ok(Value::Bool(a == b)),
         Ne => Ok(Value::Bool(a != b)),
-        Lt => Ok(Value::Bool(a.as_number()? < b.as_number()?)),
-        Le => Ok(Value::Bool(a.as_number()? <= b.as_number()?)),
-        Gt => Ok(Value::Bool(a.as_number()? > b.as_number()?)),
-        Ge => Ok(Value::Bool(a.as_number()? >= b.as_number()?)),
+        // Relational: lexicographic for string pairs, numeric otherwise
+        Lt | Le | Gt | Ge => {
+            if let (Value::String(x), Value::String(y)) = (a, b) {
+                return Ok(Value::Bool(match kind {
+                    Lt => x < y,
+                    Le => x <= y,
+                    Gt => x > y,
+                    Ge => x >= y,
+                    _ => unreachable!(),
+                }));
+            }
+            let (an, bn) = (a.as_number()?, b.as_number()?);
+            Ok(Value::Bool(match kind {
+                Lt => an < bn,
+                Le => an <= bn,
+                Gt => an > bn,
+                Ge => an >= bn,
+                _ => unreachable!(),
+            }))
+        }
         _ => Err("invalid cmp op".into()),
     }
 }

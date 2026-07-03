@@ -60,10 +60,11 @@ pub fn handle_function(
         // Variant that reads args from the current process argv:
         // patc_compile_from_argv() -> canonical exe path
         "patc_compile_from_argv" => {
-            let mut args: Vec<String> = std::env::args().collect();
-            // Expect: bin [--patc] <input> [--out <path>]
-            // Find first non-flag as input, unless it's --patc then skip to next
-            let mut input: Option<String> = None;
+            let args: Vec<String> = std::env::args().collect();
+            // Interpreter invocation shape: pat [--flags] <script.patlang> <input> [--out <path>]
+            // The first non-flag arg is the running script itself; the input to
+            // compile is the second non-flag arg.
+            let mut nonflags: Vec<String> = Vec::new();
             let mut out: Option<String> = None;
             let mut i = 1usize;
             while i < args.len() {
@@ -71,13 +72,13 @@ pub fn handle_function(
                 if s == "--out" {
                     if i+1 < args.len() { out = Some(args[i+1].clone()); i += 2; continue; } else { break; }
                 }
-                if s == "--patc" || s == "--emit-rust" || s == "--build-run" || s == "--ir-run" || s == "--compare" {
-                    i += 1; continue;
-                }
-                if !s.starts_with('-') && input.is_none() { input = Some(s.clone()); i += 1; continue; }
+                if s.starts_with('-') { i += 1; continue; }
+                nonflags.push(s.clone());
                 i += 1;
             }
-            let inp = input.unwrap_or_default();
+            // nonflags[0] = script path (patc.patlang), nonflags[1] = input to compile.
+            // Fall back to nonflags[0] only if it's the sole argument (direct invocation).
+            let inp = if nonflags.len() >= 2 { nonflags[1].clone() } else { nonflags.get(0).cloned().unwrap_or_default() };
             Some(patc_compile_impl(&inp, out))
         }
         // Access argv as a list id (excluding program name)
@@ -367,9 +368,9 @@ fn register_defaults() -> MethodRegistry {
         // Port is stored on object under key "port".
         let port_str = _ctx.object_store.get(obj_id, "port").unwrap_or_else(|| "8080".to_string());
         let port: u16 = port_str.parse().unwrap_or(8080);
-    // Mark keepalive so main can keep process alive
-    _ctx.object_store.set("__runtime", "keepalive", "true");
-    std::thread::spawn(move || {
+        // Mark keepalive so main can keep process alive
+        _ctx.object_store.set("__runtime", "keepalive", "true");
+        std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async move {
                 use hyper::{Body, Request, Response, Server};
@@ -378,12 +379,16 @@ fn register_defaults() -> MethodRegistry {
                     Ok(Response::new(Body::from("Hello from patlang WebServer")))
                 }
                 let addr = ([127, 0, 0, 1], port).into();
+                println!("[patlang WebServer] Binding to http://{}:{}", "127.0.0.1", port);
                 let make_svc = make_service_fn(|_conn| async { Ok::<_, hyper::Error>(service_fn(handle)) });
                 let server = Server::bind(&addr).serve(make_svc);
-                if let Err(e) = server.await { eprintln!("server error: {}", e); }
+                match server.await {
+                    Ok(_) => println!("[patlang WebServer] Server exited normally."),
+                    Err(e) => eprintln!("[patlang WebServer] server error: {}", e),
+                }
             });
         });
-    Ok(String::new())
+        Ok(String::new())
     });
 
     // BuildConfiguration.load_from_file(path): parse minimal YAML with target names
@@ -495,6 +500,12 @@ fn patc_compile_impl(in_path: &str, out_opt: Option<String>) -> Result<String, R
     let src = std::fs::read_to_string(in_path).map_err(|e| RuntimeError::new(
         crate::error_handler::RuntimeErrorKind::CoreEvaluator,
         format!("patc_compile: read '{}': {}", in_path, e),
+    ))?;
+    // Expand include "path" lines relative to the input file's directory
+    let base_dir = Path::new(in_path).parent().map(|p| p.to_path_buf()).unwrap_or_else(|| std::path::PathBuf::from("."));
+    let src = crate::preprocess::expand_includes(&src, &base_dir).map_err(|e| RuntimeError::new(
+        crate::error_handler::RuntimeErrorKind::CoreEvaluator,
+        format!("patc_compile: {}", e),
     ))?;
     // Parse → Lower → Emit Rust
     let mut parser = Stage0Parser::new(&src).map_err(|e| RuntimeError::new(

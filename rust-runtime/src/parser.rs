@@ -67,13 +67,13 @@ impl<'a> Parser<'a> {
             let stmt = self.parse_statement()?;
             stmts.push(stmt);
 
-            // After a statement, collect separators (semicolons/newlines/periods for facts)
+            // After a statement, collect separators (semicolons/newlines/periods for facts,
+            // commas for DSL-style clause sequences)
             let mut saw_sep = false;
             let mut saw_nl = false;
-            while matches!(self.curr, Token::Semicolon | Token::Newline | Token::Dot) {
-                if matches!(self.curr, Token::Semicolon) { saw_sep = true; }
+            while matches!(self.curr, Token::Semicolon | Token::Newline | Token::Dot | Token::Comma) {
+                if matches!(self.curr, Token::Semicolon | Token::Dot | Token::Comma) { saw_sep = true; }
                 if matches!(self.curr, Token::Newline) { saw_nl = true; }
-                if matches!(self.curr, Token::Dot) { saw_sep = true; }
                 self.advance()?;
             }
 
@@ -129,12 +129,14 @@ impl<'a> Parser<'a> {
                     let expr = self.parse_expression(0)?;
                     return Ok(Stmt::ExprStmt(expr));
                 }
-                // Otherwise, skip DSL-style rule declaration until '.'
+                // Otherwise, skip DSL-style rule declaration until terminating '.'
+                // (a '.' only ends the clause when followed by newline/EOF, so member
+                // access dots inside the body do not terminate the skip early)
                 self.advance()?;
                 loop {
                     match self.curr {
                         Token::EOF => break,
-                        Token::Dot => { self.advance()?; break; },
+                        Token::Dot if matches!(self.peek, Token::Newline | Token::EOF) => { self.advance()?; break; },
                         Token::BlockStart => { self.skip_brace_block()?; },
                         _ => { self.advance()?; }
                     }
@@ -209,6 +211,35 @@ impl<'a> Parser<'a> {
                     // DSL sugar: make a function called Name { ... }
                     if curr_lc == "make" {
                         if let Some(stmt) = self.parse_make_construct()? { return Ok(stmt); }
+                    }
+                    // JS-style: function Name(params) { ... }
+                    if curr_lc == "function" {
+                        if let Token::Identifier(_) = self.peek {
+                            self.advance()?; // consume 'function'
+                            let fname = match &self.curr {
+                                Token::Identifier(s) => { let n = s.clone(); self.advance()?; n }
+                                _ => unreachable!(),
+                            };
+                            let mut params: Vec<String> = Vec::new();
+                            if matches!(self.curr, Token::LParen) {
+                                self.advance()?;
+                                loop {
+                                    match &self.curr {
+                                        Token::Identifier(s) => { params.push(s.clone()); self.advance()?; }
+                                        Token::Comma => { self.advance()?; }
+                                        Token::Newline => { self.advance()?; }
+                                        Token::RParen => { self.advance()?; break; }
+                                        _ => break,
+                                    }
+                                }
+                            }
+                            self.consume_newlines()?;
+                            let body = if matches!(self.curr, Token::BlockStart) {
+                                self.advance()?; // '{'
+                                self.parse_block()?
+                            } else { vec![] };
+                            return Ok(Stmt::Function { name: fname, params, body });
+                        }
                     }
                     // DSL events: when <event> { ... } → capture as Stmt::When
                     if curr_lc == "when" {
@@ -382,7 +413,7 @@ impl<'a> Parser<'a> {
                 if let Token::Identifier(ref t) = self.curr { if t == "end" { self.advance()?; break; } }
                 if matches!(self.curr, Token::EOF) { break; }
                 self.consume_newlines()?;
-                if matches!(self.curr, Token::Identifier(_)|Token::Let|Token::Fn|Token::If|Token::Return|Token::Number(_)|Token::String(_)|Token::LParen|Token::BlockStart) {
+                if matches!(self.curr, Token::Identifier(_)|Token::Let|Token::Fn|Token::If|Token::While|Token::Return|Token::Number(_)|Token::String(_)|Token::LParen|Token::BlockStart) {
                     let st = self.parse_statement()?;
                     body.push(st);
                 } else {
@@ -554,13 +585,12 @@ impl<'a> Parser<'a> {
             let stmt = self.parse_statement()?;
             body.push(stmt);
 
-            // After a statement, collect separators (semicolons/newlines/periods)
+            // After a statement, collect separators (semicolons/newlines/periods/commas)
             let mut saw_sep = false;
             let mut saw_nl = false;
-            while matches!(self.curr, Token::Semicolon | Token::Newline | Token::Dot) {
-                if matches!(self.curr, Token::Semicolon) { saw_sep = true; }
+            while matches!(self.curr, Token::Semicolon | Token::Newline | Token::Dot | Token::Comma) {
+                if matches!(self.curr, Token::Semicolon | Token::Dot | Token::Comma) { saw_sep = true; }
                 if matches!(self.curr, Token::Newline) { saw_nl = true; }
-                if matches!(self.curr, Token::Dot) { saw_sep = true; }
                 self.advance()?;
             }
 
@@ -648,7 +678,7 @@ impl<'a> Parser<'a> {
                     }
                     // consume newlines
                     self.consume_newlines()?;
-                    if matches!(self.curr, Token::Identifier(_)|Token::Let|Token::Fn|Token::If|Token::Return|Token::Number(_)|Token::String(_)|Token::LParen) {
+                    if matches!(self.curr, Token::Identifier(_)|Token::Let|Token::Fn|Token::If|Token::While|Token::Return|Token::Number(_)|Token::String(_)|Token::LParen) {
                         let st = self.parse_statement()?;
                         then_branch.push(st);
                     } else {
@@ -668,7 +698,7 @@ impl<'a> Parser<'a> {
                             _ => {}
                         }
                         self.consume_newlines()?;
-                        if matches!(self.curr, Token::Identifier(_)|Token::Let|Token::Fn|Token::If|Token::Return|Token::Number(_)|Token::String(_)|Token::LParen) {
+                        if matches!(self.curr, Token::Identifier(_)|Token::Let|Token::Fn|Token::If|Token::While|Token::Return|Token::Number(_)|Token::String(_)|Token::LParen) {
                             let st = self.parse_statement()?; else_body.push(st);
                         } else { if !matches!(self.curr, Token::EOF) { self.advance()?; } }
                         self.consume_newlines()?;
@@ -715,7 +745,7 @@ impl<'a> Parser<'a> {
                         _ => {}
                     }
                     self.consume_newlines()?;
-                    if matches!(self.curr, Token::Identifier(_)|Token::Let|Token::Fn|Token::If|Token::Return|Token::Number(_)|Token::String(_)|Token::LParen) {
+                    if matches!(self.curr, Token::Identifier(_)|Token::Let|Token::Fn|Token::If|Token::While|Token::Return|Token::Number(_)|Token::String(_)|Token::LParen) {
                         let st = self.parse_statement()?; body.push(st);
                     } else { if !matches!(self.curr, Token::EOF) { self.advance()?; } }
                     self.consume_newlines()?;
@@ -741,7 +771,7 @@ impl<'a> Parser<'a> {
                     Token::Plus | Token::Minus | Token::Star | Token::Slash | Token::Percent => {
                         self.advance()?; // consume newline and continue
                     }
-                    Token::EqualEqual | Token::Greater | Token::GreaterEqual | Token::Less | Token::LessEqual => {
+                    Token::EqualEqual | Token::NotEqual | Token::Greater | Token::GreaterEqual | Token::Less | Token::LessEqual => {
                         self.advance()?;
                     }
                     _ => { /* newline may separate statements; do not consume here */ }
@@ -765,6 +795,7 @@ impl<'a> Parser<'a> {
                 Token::Slash => (BinaryOperator::Div, 20, 21),
                 Token::Percent => (BinaryOperator::Mod, 20, 21),
                 Token::EqualEqual => (BinaryOperator::Equal, 5, 6),
+                Token::NotEqual => (BinaryOperator::NotEqual, 5, 6),
                 Token::Equal => (BinaryOperator::Equal, 5, 6),
                 Token::Greater => (BinaryOperator::Greater, 7, 8),
                 Token::GreaterEqual => (BinaryOperator::GreaterEqual, 7, 8),
@@ -840,6 +871,13 @@ impl<'a> Parser<'a> {
                 Expr::List(items)
             }
             Token::Identifier(name) => { let id = name.clone(); self.advance()?; Expr::Identifier(id) }
+            // Tolerance: brace block in expression position (e.g. object-literal DSL)
+            // parses as a parameterless closure; Stage 0 assigns no semantics yet.
+            Token::BlockStart => {
+                self.advance()?; // '{'
+                let body = self.parse_block()?;
+                Expr::Closure { params: vec![], body }
+            }
             Token::LParen => {
                 self.advance()?; // '('
                 let inner = self.parse_expression(0)?;
@@ -892,6 +930,15 @@ impl<'a> Parser<'a> {
                             expr = closure;
                         }
                     }
+                }
+                Token::LBracket => {
+                    // Index expression: expr[index]
+                    self.advance()?; // '['
+                    while matches!(self.curr, Token::Newline) { self.advance()?; }
+                    let index = self.parse_expression(0)?;
+                    while matches!(self.curr, Token::Newline) { self.advance()?; }
+                    self.expect(Token::RBracket, "] to close index", "Close the index with ']'")?;
+                    expr = Expr::Index { object: Box::new(expr), index: Box::new(index) };
                 }
                 Token::Dot => {
                     // Only treat as member access if next token is an identifier; otherwise it's a terminator (e.g., facts)

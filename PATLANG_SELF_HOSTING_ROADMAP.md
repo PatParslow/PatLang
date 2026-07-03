@@ -2,6 +2,46 @@
 
 This document outlines the pragmatic next steps to reach self-hosting by leveraging the existing PatLang implementations of the lexer, parser, and evaluator, while keeping Stage 0 semantics small and focused.
 
+## status update (July 3, 2026): Stage 1 front-end is self-hosted
+
+The compiler front-end (lexer + parser) now runs in PatLang, executed by the
+Stage 0 runtime, and drives native compilation end-to-end:
+
+- `self_hosting/lib/lexer.patlang` — tokenizer written in the Stage 0
+  compilable subset. Runs under `pat --ir-run` AND compiles to a native exe via
+  patc with identical output (verified by `tests/selfhost_lexer.rs`).
+- `self_hosting/lib/parser.patlang` — recursive-descent parser producing
+  list-shaped AST nodes (`["Program", [stmts]]`, `["Let", name, expr]`,
+  `["Bin", op, l, r]`, ...). Handles precedence, parens, strings.
+- `self_hosting/pipeline_stage1.patlang` — full pipeline: PatLang lexer →
+  PatLang parser → `compile_shape` host (AST-shape → Stage 0 IR → rustc) →
+  native executable. Verified by `tests/selfhost_pipeline.rs`.
+- `include "path"` preprocessor added to Stage 0 (interpreter + patc paths) as
+  the minimal module mechanism for self-hosted sources.
+- Language/runtime additions that made this possible: `!=` operator, index
+  expressions `xs[i]`, string escapes in literals, lexicographic string
+  comparison, host shims (`list_push`, `char_code`, `substr`, `to_num`,
+  `read_file`, `compile_shape`), forward-reference/mutual-recursion support in
+  the lowerer, `while` accepted inside function/if/while bodies (parser bug).
+
+Current grammar of the self-hosted parser (Stage 1): `let`, `print(expr)`,
+arithmetic/comparison expressions with precedence, strings, parens.
+
+### next steps toward full self-hosting
+1. Grow the Stage 1 parser grammar: `if/else`, `while`, function definitions,
+   calls — mirroring what the Stage 0 lowerer already supports.
+2. Move AST-shape → IR lowering from the `compile_shape` host into PatLang
+   (emit the IR shape from PatLang; keep only codegen+rustc on the host).
+3. Embed codegen in compiled programs so a natively compiled patc can compile
+   without the `pat` interpreter (true fixpoint: patc.exe compiles patc).
+4. Switch `patc.patlang` internals from `patc_compile_from_argv` delegation to
+   the native lexer/parser pipeline, keeping the host path as a fallback flag.
+
+Note: the older `native_lexer/`, `native_parser/`, `native_evaluator/` sources
+are written in a richer aspirational dialect that parses under Stage 0 (kept
+green by `tests/bootstrap_native_pipeline.rs`) but does not execute; the
+runnable self-hosted implementation lives in `self_hosting/`.
+
 ## current status
 
 - CLI/runtime

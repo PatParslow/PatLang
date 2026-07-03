@@ -25,3 +25,4 @@ pub mod logic_engine;
 pub mod runtime_integration;
 pub mod builtins;
 pub mod ir;
+pub mod preprocess;

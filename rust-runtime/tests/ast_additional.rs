@@ -142,14 +142,14 @@ fn test_stmt_variants() {
 fn test_binary_operator_variants() {
     let ops = [
         BinaryOperator::Add, BinaryOperator::Sub, BinaryOperator::Mul, BinaryOperator::Div, BinaryOperator::Mod,
-        BinaryOperator::And, BinaryOperator::Or, BinaryOperator::Equal, BinaryOperator::Greater, BinaryOperator::GreaterEqual,
-        BinaryOperator::Less, BinaryOperator::LessEqual,
+        BinaryOperator::And, BinaryOperator::Or, BinaryOperator::Equal, BinaryOperator::NotEqual, BinaryOperator::Greater,
+        BinaryOperator::GreaterEqual, BinaryOperator::Less, BinaryOperator::LessEqual,
     ];
     for op in ops.iter() {
         match op {
             BinaryOperator::Add | BinaryOperator::Sub | BinaryOperator::Mul | BinaryOperator::Div | BinaryOperator::Mod |
-            BinaryOperator::And | BinaryOperator::Or | BinaryOperator::Equal | BinaryOperator::Greater | BinaryOperator::GreaterEqual |
-            BinaryOperator::Less | BinaryOperator::LessEqual => {}
+            BinaryOperator::And | BinaryOperator::Or | BinaryOperator::Equal | BinaryOperator::NotEqual | BinaryOperator::Greater |
+            BinaryOperator::GreaterEqual | BinaryOperator::Less | BinaryOperator::LessEqual => {}
         }
     }
 }
