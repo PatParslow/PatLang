@@ -918,6 +918,25 @@ impl Host {
                 let abs = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
                 Ok(Value::String(abs.display().to_string()))
             }
+            "contract_check" => {
+                // contract_check(func_name, kind, text, ok) - design-by-contract
+                // enforcement, identical semantics to the interpreter's host arm.
+                if args.len() != 4 { return Err("contract_check: expected 4 args".into()); }
+                let func = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
+                let kind = match &args[1] { Value::String(s) => s.clone(), _ => String::new() };
+                let text = match &args[2] { Value::String(s) => s.clone(), _ => String::new() };
+                let ok = args[3].as_bool()?;
+                if ok {
+                    Ok(Value::Unit)
+                } else {
+                    let label = match kind.as_str() {
+                        "require" => "precondition",
+                        "ensure" => "postcondition",
+                        _ => "assertion",
+                    };
+                    Err(format!("contract violation: {} failed in {}(): {}", label, func, text))
+                }
+            }
             "run_ir" => {
                 // run_ir(ir_shape): decode a freshly lowered IR shape and run
                 // it on this runtime's VM (the browser-playground back end)

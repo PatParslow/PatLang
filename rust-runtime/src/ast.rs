@@ -80,6 +80,13 @@ pub enum Stmt {
         event: String,
         body: Vec<Stmt>,
     },
+    // Design-by-contract check: kind is "require" | "ensure" | "assert".
+    // Lowers to a contract_check(func_name, kind, text, ok) host call that
+    // aborts execution with a descriptive error when the condition is false.
+    Assert {
+        kind: String,
+        expr: Expr,
+    },
     // Extend with more statement types as needed
 }
 

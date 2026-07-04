@@ -240,3 +240,47 @@ fn stage1_escapes_and_short_circuit() {
     assert_eq!(printed.get(1).copied(), Some("or-sc"), "or short-circuit: {}", stdout);
     assert_eq!(printed.get(2).copied(), Some("T[\t]Q[\"]N"), "escapes: {}", stdout);
 }
+
+#[test]
+fn stage1_multiline_lists_and_calls() {
+    // Regression: the Stage 1 self-hosted lexer emits an explicit NL token for
+    // every newline (no bracket-depth suppression like the Stage 0 Rust
+    // lexer), so list literals and call arguments spanning multiple lines
+    // used to desugar into a parse Err silently swallowed as an empty
+    // string/list. parser.patlang's list-literal and parse_args loops now
+    // skip_nl around '[', ',', ']'/'(', ',', ')'.
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    if std::process::Command::new(&rustc).arg("--version").output().is_err() {
+        eprintln!("rustc not found; skipping");
+        return;
+    }
+    let out_dir = std::env::temp_dir().join("patlang_targets_test");
+    let _ = std::fs::create_dir_all(&out_dir);
+    let exe_path = out_dir.join(if cfg!(windows) { "ml_test.exe" } else { "ml_test" });
+
+    let program = "let xs = [\n  1,\n  2,\n  3\n]\n\
+        print(\"len: \" + xs.length)\n\
+        make a function called add3 takes a, b, c returns r\n  return a + b + c\nend\n\
+        print(\"sum: \" + add3(\n  1,\n  2,\n  3\n))\n";
+    let src_path = out_dir.join("ml_test.patlang");
+    std::fs::write(&src_path, program).expect("write program");
+
+    let driver = format!(
+        "let source = read_file(\"{}\")\n\
+         let toks = tokenize(source)\n\
+         let ast = parse_program(toks)\n\
+         let ir = lower_program(ast)\n\
+         let rs = emit_program_rs(ir)\n\
+         let exe = rustc_build(rs, \"{}\")\n\
+         print(\"COMPILED\")\n",
+        fwd(&src_path), fwd(&exe_path)
+    );
+    let lines = run_pipeline(&driver);
+    assert!(lines.iter().any(|l| l == "COMPILED"), "did not compile: {:?}", lines);
+
+    let out = std::process::Command::new(&exe_path).output().expect("run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let printed: Vec<&str> = stdout.lines().collect();
+    assert_eq!(printed.get(0).copied(), Some("len: 3"), "multi-line list: {}", stdout);
+    assert_eq!(printed.get(1).copied(), Some("sum: 6"), "multi-line call args: {}", stdout);
+}

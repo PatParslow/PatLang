@@ -2,6 +2,70 @@
 
 This document outlines the pragmatic next steps to reach self-hosting by leveraging the existing PatLang implementations of the lexer, parser, and evaluator, while keeping Stage 0 semantics small and focused.
 
+## status update (July 4, 2026): design by contract + dev-tool portfolio wiring
+
+**Design by contract** (`require`/`ensure`/`assert`) landed as a genuine
+VM-level semantic, not a codegen feature — deliberately, since rustc is the
+slow part of this stack and contract *checking* has nothing to do with it:
+
+- New `Stmt::Assert { kind, expr }` in both the Stage 0 Rust AST/parser/
+  lowerer and the Stage 1 self-hosted parser/lowerer (`self_hosting/lib/
+  parser.patlang` reuses its own `ast_to_str` to render violation messages;
+  `lower.patlang` threads a `fname` parameter through `lower_block`/
+  `lower_stmt` for "which function" context).
+- One shared `contract_check(func_name, kind, text, ok)` host arm, present
+  verbatim in both the interpreter (`ir/hosts.rs`) and the emitted-program
+  codegen template (`ir/codegen.rs`) — so enforcement is byte-for-byte
+  identical whether a program is interpreted, executed via `run_ir` (no
+  rustc — the browser-playground path), or compiled natively. Proved this
+  explicitly: a precondition violation was demonstrated through all three
+  paths before anything else was built on top.
+- `ensure` is checked wherever it's written (not wrapped around every
+  `return`), so multi-exit functions just repeat `ensure` before whichever
+  exits they want checked — no hidden control-flow rewriting.
+- `self_hosting/examples/contracts_demo.patlang`: passing require/ensure/
+  assert on `safe_divide`/`clamp`/`factorial`, then one deliberate
+  precondition violation, so the demo shows enforcement actually firing.
+- `host_exec_capture` now appends stderr when the process exits non-zero,
+  so native transcripts of intentionally-failing demos show the violation
+  message instead of silently truncating.
+- Found and fixed one non-ASCII character (an em dash in a new codegen
+  comment) that broke the prelude byte-parity test — a reminder that the
+  "prelude must be pure ASCII" invariant from the performance work
+  (stage 7) is easy to violate accidentally and is caught immediately by
+  `selfhost_runtime_text_parity`.
+
+**Dev tools wired more deeply into the portfolio:**
+- `flowgraph` now renders *multiple* programs into one navigable page
+  (`<flowgraph <output.html> [inputs...]>`; with no arguments it renders a
+  curated set — the benchmark, the contracts demo, the point-of-sale
+  bundle, and the all-paradigms demo). Rendering IR doesn't require
+  semantic resolution, so a library+driver pair can be bundled with a
+  `lib.patlang+demo.patlang` spec without needing a real module system.
+- `patbuild.manifest` gained `contracts_demo` and `pos_demo` as real
+  targets; `patbuild_main.patlang` gained the same `+`-bundling convention
+  (`read_bundle`) so a manifest target can combine a library with its
+  driver.
+- Portfolio gained a `contracts` card (runnable in-browser, showing both
+  the passing checks and the violation) and the playground's example
+  selector now includes it.
+
+**Bug found and fixed while writing the curated flowgraph list:** the
+Stage 1 self-hosted lexer emits an explicit `NL` token for every newline
+with no bracket-depth suppression (unlike the Stage 0 Rust lexer, which
+already tolerates newlines around brackets). A multi-line list literal or
+function call therefore desugared into a swallowed parse error — silently,
+because the malformed `Err` node fell through `lower_expr`'s catch-all into
+an empty string, so `xs.length` on a "broken" 3-element list literal
+quietly read `0` instead of raising anything. Fixed by having
+`parser.patlang`'s list-literal and `parse_args` loops call `skip_nl`
+around `[`/`(`, `,`, and `]`/`)`, matching the Stage 0 parser's existing
+tolerance. Caught by writing `flowgraph`'s curated example list across
+multiple lines for readability and noticing the published page came out
+empty — a good reminder that the two parsers (Rust and self-hosted) can
+still drift on tolerances that were only ever added to one side. Regression
+test: `selfhost_targets.rs::stage1_multiline_lists_and_calls`.
+
 ## status update (July 3, 2026): Stage 1 front-end is self-hosted
 
 The compiler front-end (lexer + parser) now runs in PatLang, executed by the

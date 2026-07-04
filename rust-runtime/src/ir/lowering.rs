@@ -8,6 +8,8 @@ pub struct Lowerer {
     known_locals: HashSet<String>,
     // track declared function names to allow lowering calls
     known_functions: HashSet<String>,
+    // name of the function currently being lowered, for contract-violation messages
+    current_function: String,
 }
 
 impl Lowerer {
@@ -30,6 +32,7 @@ impl Lowerer {
                 let mut f = Function { name: name.clone(), params: params.clone(), ..Default::default() };
                 // Lower the function body
                 let mut saved_locals = std::mem::take(&mut self.known_locals);
+                let saved_fname = std::mem::replace(&mut self.current_function, name.clone());
                 // params are considered known locals
                 self.known_locals = params.iter().cloned().collect();
                 for st in body {
@@ -38,6 +41,7 @@ impl Lowerer {
                 f.body.push(Instr::Return);
                 program.functions.insert(name.clone(), f);
                 self.known_locals = saved_locals; // restore
+                self.current_function = saved_fname;
             }
         }
     // Synthesize event handlers for when-blocks at top-level
@@ -50,6 +54,7 @@ impl Lowerer {
                 let mut hf = Function { name: hname.clone(), params: vec!["event_name".into(), "event_data".into()], ..Default::default() };
                 // Use a fresh locals set and seed with param names so they can be referenced safely
                 let saved = std::mem::take(&mut self.known_locals);
+                let saved_fname = std::mem::replace(&mut self.current_function, hname.clone());
                 self.known_locals.insert("event_name".into());
                 self.known_locals.insert("event_data".into());
                 for st in body { self.lower_stmt(st, &mut hf); }
@@ -57,9 +62,11 @@ impl Lowerer {
                 program.functions.insert(hname.clone(), hf);
                 program.event_handlers.entry(event.clone()).or_default().push(hname);
                 self.known_locals = saved;
+                self.current_function = saved_fname;
             }
         }
         // Second pass: lower top-level statements into main
+        self.current_function = "main".into();
         for s in stmts {
             if !matches!(s, Stmt::Function { .. }) {
                 self.lower_stmt(s, &mut main_fn);
@@ -125,6 +132,15 @@ impl Lowerer {
                 // patch JumpIfFalse to after body
                 let after = f.body.len();
                 if let Instr::JumpIfFalse(ref mut tgt) = f.body[jif_idx] { *tgt = after; }
+            }
+            Stmt::Assert { kind, expr } => {
+                // contract_check(func_name, kind, condition_text, ok) — pushed in
+                // that order so CallHost's arg order matches; ok is evaluated last.
+                f.body.push(Instr::Const(Value::String(self.current_function.clone())));
+                f.body.push(Instr::Const(Value::String(kind.clone())));
+                f.body.push(Instr::Const(Value::String(expr_to_text(expr))));
+                self.lower_expr(expr, f);
+                f.body.push(Instr::CallHost("contract_check".into(), 4));
             }
             _ => {
                 // unsupported yet: ignore safely
@@ -294,5 +310,32 @@ impl Lowerer {
             }
             _ => { /* TODO: calls, lists, etc. */ }
         }
+    }
+}
+
+/// Render an expression back to readable source text, for contract-violation
+/// messages ("require b != 0" should report "b != 0", not a debug dump).
+pub fn expr_to_text(e: &Expr) -> String {
+    match e {
+        Expr::Number(n) => if n.fract() == 0.0 { format!("{}", *n as i64) } else { n.to_string() },
+        Expr::String(s) => format!("\"{}\"", s),
+        Expr::Identifier(name) => name.clone(),
+        Expr::List(items) => format!("[{}]", items.iter().map(expr_to_text).collect::<Vec<_>>().join(", ")),
+        Expr::Member { object, property } => format!("{}.{}", expr_to_text(object), property),
+        Expr::Index { object, index } => format!("{}[{}]", expr_to_text(object), expr_to_text(index)),
+        Expr::Closure { .. } => "<closure>".into(),
+        Expr::UnaryOp { op, expr } => format!("{}{}", op, expr_to_text(expr)),
+        Expr::BinaryOp { left, op, right } => {
+            let sym = match op {
+                BinaryOperator::Add => "+", BinaryOperator::Sub => "-",
+                BinaryOperator::Mul => "*", BinaryOperator::Div => "/", BinaryOperator::Mod => "%",
+                BinaryOperator::And => "and", BinaryOperator::Or => "or",
+                BinaryOperator::Equal => "==", BinaryOperator::NotEqual => "!=",
+                BinaryOperator::Greater => ">", BinaryOperator::GreaterEqual => ">=",
+                BinaryOperator::Less => "<", BinaryOperator::LessEqual => "<=",
+            };
+            format!("{} {} {}", expr_to_text(left), sym, expr_to_text(right))
+        }
+        Expr::Call { function, args } => format!("{}({})", expr_to_text(function), args.iter().map(expr_to_text).collect::<Vec<_>>().join(", ")),
     }
 }
