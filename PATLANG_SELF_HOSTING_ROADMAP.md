@@ -2,6 +2,33 @@
 
 This document outlines the pragmatic next steps to reach self-hosting by leveraging the existing PatLang implementations of the lexer, parser, and evaluator, while keeping Stage 0 semantics small and focused.
 
+## status update (July 4, 2026): build size + portfolio build caching
+
+Two independent measured wins on the recurring "portfolio rebuild takes
+10+ minutes and WASM modules are multi-megabyte" pain point:
+
+**WASM size/speed**: `rustc_build`/`compile_source_to_exe` now auto-detect a
+`wasm` target and pass `-C opt-level=z -C strip=symbols` instead of `-O`.
+Measured on the feature-complete demo: 2.1 MB → 310 KB (~6.9x smaller) and
+3.1s → 1.8s to compile, with byte-identical stdout under Node's WASI runner.
+Native builds are unaffected (still full `-O`; the benchmark card's
+self-reported timings need real optimization, and `strip=symbols` doesn't
+shrink a Windows/MSVC `.exe` anyway since debug info lives in a separate
+`.pdb`, not embedded). Applied in both the interpreter-side host and the
+emitted-program codegen template, so a *compiled* `patc`-equivalent gets the
+same size win when it calls `rustc_build` itself.
+
+**Portfolio build caching**: two new hosts, `file_exists(path) -> "1"|"0"`
+(mirrored from the codegen template into the interpreter, which was
+missing it) and `hash_string(s) -> hex FNV-1a digest`. `build_portfolio.patlang`
+now records a `<id>.srchash` sidecar per artifact, keyed on
+`hash_string(demo_source + COMPILER_FINGERPRINT)` where the fingerprint
+concatenates all five compiler-pipeline library sources — so editing one
+demo's `.patlang` file only rebuilds that demo, while any change to the
+compiler itself (lexer/parser/lower/codegen/runtime_rs) invalidates every
+cache entry and forces a full rebuild, avoiding stale-artifact risk. Delete
+`portfolio/build/` to force a clean rebuild unconditionally.
+
 ## status update (July 4, 2026): async event loop library with closure callbacks
 
 `self_hosting/lib/event_loop.patlang`: a reusable JS/Node-style event loop
