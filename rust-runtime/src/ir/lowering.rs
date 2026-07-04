@@ -191,9 +191,9 @@ impl Lowerer {
             "get_value"|"process"|"validate"|"len"|"get"|"send"|"emit"|"sed"|
             "list_get"|"list_len"|"list_push"|"list_set"|"char_code"|"substr"|"chr"|"to_num"|"read_file"|"write_file"|"file_exists"|"hash_string"|"argv"|"compile_shape"|"compile_ir"|"run_ir"|"codegen_prelude"|"rustc_build"|
             "vec_new"|"vec_push"|"vec_set"|"vec_get"|"vec_len"|"vec_to_list"|"sb_new"|"sb_push"|"sb_str"|
-            "str_intern"|"sc_len"|"sc_code"|"sc_char"|"now_ms"|"read_file_b64"|"exec_capture"|
+            "str_intern"|"sc_len"|"sc_code"|"sc_char"|"now_ms"|"read_line"|"byte_length"|"read_file_b64"|"exec_capture"|
             "fact"|"query"|"goal"|"new"|"set_var"|"apply"|
-            "tcp_listen"|"tcp_accept"|"tcp_accept_timeout"|"sleep_ms"|"tcp_read"|"tcp_write"|"tcp_close"
+            "tcp_listen"|"tcp_connect"|"tcp_accept"|"tcp_accept_timeout"|"sleep_ms"|"tcp_read"|"tcp_write"|"tcp_close"
         )
     }
 

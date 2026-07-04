@@ -1,0 +1,256 @@
+# Ollama chat CLI - a small real-world PatLang program talking to a local
+# Ollama server over raw TCP/HTTP (no rustc needed to run it: `pat --ir-run
+# self_hosting/examples/ollama_chat.patlang`).
+#
+# Paradigms on display:
+#   - object-oriented: the conversation is a "Session" object (model,
+#     message history) via new/send/get.
+#   - event-driven: a user_message emitted at the prompt cascades through
+#     request_built -> response_received -> assistant_message, each with
+#     a `when` handler - the same shape you'd use if the transport were
+#     truly async.
+#   - functional: the JSON message array is built by mapping the session's
+#     history through a small transform, not hand-assembled per call site.
+#   - honesty about "async": each HTTP round-trip here is a single blocking
+#     tcp_connect/tcp_write/tcp_read cycle - there's no background thread
+#     or real concurrency. The event pipeline organizes the *logic*, not
+#     the I/O model. (self_hosting/lib/event_loop.patlang is the actual
+#     non-blocking primitive, built for servers polling tcp_accept_timeout;
+#     it doesn't apply to a single outbound request awaiting one reply.)
+
+include "../lib/json.patlang"
+
+set_var("ollama_host", "127.0.0.1")
+set_var("ollama_port", 11434)
+
+# ---- tiny HTTP client (raw sockets, not a library) ----
+make a function called crlf returns s
+  return chr(13) + chr(10)
+end
+
+make a function called find_substr takes hay, needle returns idx
+  if needle.length == 0 then
+    return 0
+  end
+  let i = 0
+  while i <= (hay.length - needle.length) do
+    if substr(hay, i, needle.length) == needle then
+      return i
+    end
+    let i = i + 1
+  end
+  return -1
+end
+
+# Ollama's Go HTTP server sends some responses (e.g. /api/tags) with
+# Transfer-Encoding: chunked rather than a Content-Length - each chunk is a
+# hex size, CRLF, that many bytes, CRLF, repeated, ending in a zero-size
+# chunk. Since we read the whole connection to close anyway, decoding just
+# means stripping the chunk framing out of what we already have.
+make a function called dechunk takes raw returns body
+  let b = sb_new()
+  let pos = 0
+  let done = false
+  while not done do
+    if pos >= raw.length then
+      let done = true
+    else
+      let line_end = find_substr(substr(raw, pos, raw.length - pos), crlf())
+      if line_end < 0 then
+        let done = true
+      else
+        let size = json_hex_to_num(substr(raw, pos, line_end))
+        if size <= 0 then
+          let done = true
+        else
+          let data_start = pos + line_end + 2
+          sb_push(b, substr(raw, data_start, size))
+          let pos = data_start + size + 2
+        end
+      end
+    end
+  end
+  return sb_str(b)
+end
+
+make a function called http_body takes raw returns body
+  let sep = crlf() + crlf()
+  let idx = find_substr(raw, sep)
+  if idx < 0 then
+    return raw
+  end
+  let headers = substr(raw, 0, idx)
+  let payload = substr(raw, idx + sep.length, raw.length - idx - sep.length)
+  if find_substr(headers, "chunked") >= 0 then
+    return dechunk(payload)
+  end
+  return payload
+end
+
+make a function called http_roundtrip takes request returns body
+  let conn = tcp_connect(get("__vars", "ollama_host"), get("__vars", "ollama_port"))
+  tcp_write(conn, request)
+  let raw = ""
+  let chunk = tcp_read(conn)
+  while chunk != "" do
+    let raw = raw + chunk
+    let chunk = tcp_read(conn)
+  end
+  tcp_close(conn)
+  return http_body(raw)
+end
+
+make a function called http_get takes path returns body
+  let req = "GET " + path + " HTTP/1.1" + crlf() + "Host: " + get("__vars", "ollama_host") + crlf() + "Connection: close" + crlf() + crlf()
+  return http_roundtrip(req)
+end
+
+make a function called http_post takes path, body returns resp
+  let req = "POST " + path + " HTTP/1.1" + crlf() + "Host: " + get("__vars", "ollama_host") + crlf() + "Content-Type: application/json" + crlf() + "Content-Length: " + byte_length(body) + crlf() + "Connection: close" + crlf() + crlf() + body
+  return http_roundtrip(req)
+end
+
+# ---- session (OO) ----
+make a function called session_new takes model returns done
+  new("Session", "session")
+  send("session", "set", "model", model)
+  send("session", "set", "history", [])
+  return true
+end
+
+make a function called session_add takes role, content returns done
+  let h = list_push(get("session", "history"), [role, content])
+  send("session", "set", "history", h)
+  return true
+end
+
+# functional: map the history (a list of [role, content] pairs) into a JSON
+# array, rather than hand-building the string per call site.
+make a function called message_to_json takes m returns json
+  return "{\"role\":" + json_quote(m[0]) + ",\"content\":" + json_quote(m[1]) + "}"
+end
+
+make a function called messages_json takes history returns json
+  let b = sb_new()
+  sb_push(b, "[")
+  let i = 0
+  while i < history.length do
+    if i > 0 then
+      sb_push(b, ",")
+    end
+    sb_push(b, message_to_json(history[i]))
+    let i = i + 1
+  end
+  sb_push(b, "]")
+  return sb_str(b)
+end
+
+# ---- event pipeline ----
+when user_message do
+  session_add("user", event_data)
+  emit("request_built", event_data)
+end
+
+when request_built do
+  let body = "{\"model\":" + json_quote(get("session", "model")) + ",\"messages\":" + messages_json(get("session", "history")) + ",\"stream\":false}"
+  print("  (thinking...)")
+  let resp_text = http_post("/api/chat", body)
+  emit("response_received", resp_text)
+end
+
+when response_received do
+  let v = json_parse(event_data)
+  let err = json_get(v, "error")
+  if err[0] == "str" then
+    emit("chat_error", json_str(err))
+  else
+    let content = json_str(json_get(json_get(v, "message"), "content"))
+    session_add("assistant", content)
+    emit("assistant_message", content)
+  end
+end
+
+when assistant_message do
+  print("")
+  print(get("session", "model") + "> " + event_data)
+  print("")
+end
+
+when chat_error do
+  print("  error: " + event_data)
+end
+
+# ---- model selection ----
+make a function called list_models returns names
+  let v = json_parse(http_get("/api/tags"))
+  let models = json_arr(json_get(v, "models"))
+  let names = []
+  let i = 0
+  while i < models.length do
+    let names = list_push(names, json_str(json_get(models[i], "name")))
+    let i = i + 1
+  end
+  return names
+end
+
+make a function called default_model_index takes names returns idx
+  let i = 0
+  while i < names.length do
+    if substr(names[i], 0, 8) == "llama3.1" then
+      return i
+    end
+    let i = i + 1
+  end
+  return 0
+end
+
+make a function called choose_model returns model
+  let names = list_models()
+  if names.length == 0 then
+    print("Could not reach Ollama at " + get("__vars", "ollama_host") + ":" + get("__vars", "ollama_port") + " (is `ollama serve` running?) - trying llama3.1:latest anyway.")
+    return "llama3.1:latest"
+  end
+  let def = default_model_index(names)
+  print("Models available on this Ollama instance:")
+  let i = 0
+  while i < names.length do
+    if i == def then
+      print("  " + (i + 1) + ". " + names[i] + "  (default)")
+    else
+      print("  " + (i + 1) + ". " + names[i])
+    end
+    let i = i + 1
+  end
+  print("Pick a number, or press Enter for the default:")
+  let choice = read_line()
+  let idx = def
+  if choice != "" then
+    let n = to_num(choice) - 1
+    if (n >= 0) and (n < names.length) then
+      let idx = n
+    end
+  end
+  return names[idx]
+end
+
+# ---- main loop ----
+print("PatLang <-> Ollama chat. Type 'exit' to quit.")
+print("")
+let model = choose_model()
+session_new(model)
+print("")
+print("Chatting with " + model + ". Type 'exit' to quit.")
+print("")
+
+let running = true
+while running do
+  print("you>")
+  let line = read_line()
+  if (line == "exit") or (line == "") then
+    let running = false
+  else
+    emit("user_message", line)
+  end
+end
+
+print("bye!")

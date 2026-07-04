@@ -298,6 +298,25 @@ pub fn host_write_file(args: &[Value]) -> Result<Value, String> {
     std::fs::write(&p, contents).map(|_| Value::Bool(true)).map_err(|e| format!("write_file: {}: {}", p, e))
 }
 
+pub fn host_byte_length(args: &[Value]) -> Result<Value, String> {
+    // byte_length(s) -> Number of UTF-8 bytes (unlike .length, which counts
+    // chars) - needed for exact HTTP Content-Length framing of any non-ASCII
+    // text.
+    let s = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
+    Ok(Value::Number(s.len() as f64))
+}
+
+pub fn host_read_line(_args: &[Value]) -> Result<Value, String> {
+    // read_line() -> String: one line from stdin, without the trailing
+    // newline, or "" at EOF.
+    use std::io::BufRead;
+    let mut line = String::new();
+    let n = std::io::stdin().lock().read_line(&mut line).map_err(|e| format!("read_line: {}", e))?;
+    if n == 0 { return Ok(Value::String(String::new())); }
+    while line.ends_with('\n') || line.ends_with('\r') { line.pop(); }
+    Ok(Value::String(line))
+}
+
 pub fn host_now_ms(_args: &[Value]) -> Result<Value, String> {
     // now_ms() -> Number: milliseconds since the Unix epoch (monotonic-enough
     // for self-timing; under the browser WASI shim it maps to performance.now)
@@ -961,6 +980,17 @@ pub fn host_tcp_listen(args: &[Value]) -> Result<Value, String> {
     Ok(Value::Number(actual as f64))
 }
 
+pub fn host_tcp_connect(args: &[Value]) -> Result<Value, String> {
+    // tcp_connect(host, port) -> Number connection id (blocks until connected)
+    let host = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => return Err("tcp_connect: expected host string".into()) };
+    let port = arg_num(args, 1, "tcp_connect")? as u16;
+    let stream = std::net::TcpStream::connect((host.as_str(), port))
+        .map_err(|e| format!("tcp_connect: {}:{}: {}", host, port, e))?;
+    let id = NEXT_CONN.with(|n| { let mut b = n.borrow_mut(); let v = *b; *b += 1; v });
+    CONNS.with(|c| c.borrow_mut().insert(id, stream));
+    Ok(Value::Number(id as f64))
+}
+
 pub fn host_tcp_accept(args: &[Value]) -> Result<Value, String> {
     let port = arg_num(args, 0, "tcp_accept")? as u16;
     let listener = LISTENERS.with(|l| {
@@ -1125,6 +1155,8 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("hash_string", host_hash_string);
     interp.host.insert("argv", host_argv);
     interp.host.insert("now_ms", host_now_ms);
+    interp.host.insert("read_line", host_read_line);
+    interp.host.insert("byte_length", host_byte_length);
     interp.host.insert("read_file_b64", host_read_file_b64);
     interp.host.insert("exec_capture", host_exec_capture);
     interp.host.insert("compile_shape", host_compile_shape);
@@ -1142,6 +1174,7 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("send", host_send);
     // networking
     interp.host.insert("tcp_listen", host_tcp_listen);
+    interp.host.insert("tcp_connect", host_tcp_connect);
     interp.host.insert("tcp_accept", host_tcp_accept);
     interp.host.insert("tcp_accept_timeout", host_tcp_accept_timeout);
     interp.host.insert("sleep_ms", host_sleep_ms);

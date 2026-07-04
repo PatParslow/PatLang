@@ -886,6 +886,23 @@ impl Host {
                     .unwrap_or(0.0);
                 Ok(Value::Number(ms))
             }
+            "byte_length" => {
+                // byte_length(s) -> Number of UTF-8 bytes (unlike .length,
+                // which counts chars) - for exact HTTP Content-Length framing.
+                let s = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
+                Ok(Value::Number(s.len() as f64))
+            }
+            "read_line" => {
+                // read_line() -> String: one line from stdin, no trailing
+                // newline, or "" at EOF.
+                use std::io::BufRead;
+                let mut line = String::new();
+                let n = std::io::stdin().lock().read_line(&mut line).map_err(|e| format!("read_line: {}", e))?;
+                if n == 0 { Ok(Value::String(String::new())) } else {
+                    while line.ends_with('\n') || line.ends_with('\r') { line.pop(); }
+                    Ok(Value::String(line))
+                }
+            }
             "write_file" => {
                 // write_file(path, contents) -> Bool
                 let p = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
@@ -1039,6 +1056,16 @@ impl Host {
                 let actual = listener.local_addr().map_err(|e| format!("tcp_listen: {}", e))?.port();
                 LISTENERS.with(|l| l.borrow_mut().insert(actual, listener));
                 Ok(Value::Number(actual as f64))
+            }
+            "tcp_connect" => {
+                // tcp_connect(host, port) -> Number connection id (blocks until connected)
+                let host = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => return Err("tcp_connect: expected host string".into()) };
+                let port = arg_num(&args, 1, "tcp_connect")? as u16;
+                let stream = std::net::TcpStream::connect((host.as_str(), port))
+                    .map_err(|e| format!("tcp_connect: {}:{}: {}", host, port, e))?;
+                let id = NEXT_CONN.with(|n| { let mut b = n.borrow_mut(); let v = *b; *b += 1; v });
+                CONNS.with(|c| c.borrow_mut().insert(id, stream));
+                Ok(Value::Number(id as f64))
             }
             "tcp_accept" => {
                 // tcp_accept(port) -> Number connection id (blocks)
