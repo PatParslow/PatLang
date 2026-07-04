@@ -2,6 +2,41 @@
 
 This document outlines the pragmatic next steps to reach self-hosting by leveraging the existing PatLang implementations of the lexer, parser, and evaluator, while keeping Stage 0 semantics small and focused.
 
+## status update (July 4, 2026): async event loop library with closure callbacks
+
+`self_hosting/lib/event_loop.patlang`: a reusable JS/Node-style event loop
+built on the existing `tcp_accept_timeout`/`sleep_ms` primitives, but with
+callbacks as ordinary closures (`event_loop_on_tick(loop, cb)`,
+`event_loop_listen(loop, port, cb)`, `event_loop_stop(loop)`,
+`event_loop_run(loop, poll_ms)`) instead of the `when`/`emit` + `set_var`/`get`
+global-dispatch pattern from `examples/event_loop_server.patlang` (kept as
+the earlier, still-working approach for comparison).
+
+Key design point: closures snapshot captured variables by value, so any
+counter that must persist across repeated callback invocations (e.g. a
+served-request count) has to live in a mutable cell — here, the object
+store — rather than a captured plain variable; the closure captures the
+object's *name* (a plain string, cheap to snapshot) and mutates through
+`get`/`send`, which is visible on every subsequent call. This is the same
+value-semantics model used everywhere else in the language (`list_push`
+returns a new list; captured closure variables are snapshots), just applied
+to callback state.
+
+Callbacks are invoked via `let cb = get(loop, "on_tick"); cb()` rather than
+`get(loop, "on_tick")()` directly — the Stage 0 Rust parser supports calling
+the result of an arbitrary expression, but the Stage 1 self-hosted parser
+currently only supports calling a named local variable (same limitation as
+immediately-invoked closure literals), so routing through a `let` binding
+keeps the library source portable across both parsers.
+
+`examples/event_loop_demo.patlang`: an HTTP server using the library —
+`on_tick` mutates a shared tick counter, `on_request` serves a request,
+updates a shared counter, and calls `event_loop_stop(loop)` from inside
+itself once two requests are served. Compiled through the full self-hosted
+pipeline (lexer → parser → lower → codegen → rustc) and verified against two
+real HTTP requests over an actual socket. Regression test:
+`selfhost_targets.rs::event_loop_closures_serve_and_stop`.
+
 ## status update (July 4, 2026): closures
 
 Real closures landed in both Stage 0 (Rust) and Stage 1 (self-hosted):
