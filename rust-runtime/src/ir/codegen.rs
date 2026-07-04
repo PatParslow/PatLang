@@ -918,6 +918,81 @@ impl Host {
                 let abs = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
                 Ok(Value::String(abs.display().to_string()))
             }
+            "run_ir" => {
+                // run_ir(ir_shape): decode a freshly lowered IR shape and run
+                // it on this runtime's VM (the browser-playground back end)
+                fn sl(v: &Value) -> Result<&Vec<Value>, String> {
+                    match v { Value::List(xs) => Ok(xs), _ => Err("run_ir: expected list node".into()) }
+                }
+                fn st(xs: &[Value], i: usize) -> Result<String, String> {
+                    match xs.get(i) { Some(Value::String(s)) => Ok(s.clone()), _ => Err("run_ir: expected string".into()) }
+                }
+                fn snum(xs: &[Value], i: usize) -> Result<f64, String> {
+                    match xs.get(i) {
+                        Some(Value::Number(n)) => Ok(*n),
+                        Some(Value::String(s)) => s.trim().parse::<f64>().map_err(|_| "run_ir: expected number".to_string()),
+                        _ => Err("run_ir: expected number".into()),
+                    }
+                }
+                fn dinstr(v: &Value) -> Result<Instr, String> {
+                    let xs = sl(v)?;
+                    let tag = st(xs, 0)?;
+                    Ok(match tag.as_str() {
+                        "Const" => {
+                            let kind = st(xs, 1)?; let text = st(xs, 2)?;
+                            let val = match kind.as_str() {
+                                "num" => Value::Number(text.trim().parse::<f64>().map_err(|_| "run_ir: bad number".to_string())?),
+                                "str" => Value::String(text),
+                                _ => Value::Bool(text == "true"),
+                            };
+                            Instr::Const(val)
+                        }
+                        "Load" => Instr::LoadLocal(st(xs, 1)?),
+                        "Store" => Instr::StoreLocal(st(xs, 1)?),
+                        "Bin" => {
+                            let op = st(xs, 1)?;
+                            let k = match op.as_str() {
+                                "+" => BinOpKind::Add, "-" => BinOpKind::Sub, "*" => BinOpKind::Mul,
+                                "/" => BinOpKind::Div, "%" => BinOpKind::Mod,
+                                "==" => BinOpKind::Eq, "!=" => BinOpKind::Ne,
+                                "<" => BinOpKind::Lt, "<=" => BinOpKind::Le,
+                                ">" => BinOpKind::Gt, ">=" => BinOpKind::Ge,
+                                "and" => BinOpKind::And, _ => BinOpKind::Or,
+                            };
+                            Instr::BinOp(k)
+                        }
+                        "Un" => { if st(xs, 1)? == "not" { Instr::UnOp(UnOpKind::Not) } else { Instr::UnOp(UnOpKind::Neg) } }
+                        "Jump" => Instr::Jump(snum(xs, 1)? as usize),
+                        "JumpIfFalse" => Instr::JumpIfFalse(snum(xs, 1)? as usize),
+                        "CallHost" => Instr::CallHost(st(xs, 1)?, snum(xs, 2)? as usize),
+                        "Call" => Instr::Call(st(xs, 1)?, snum(xs, 2)? as usize),
+                        "BuildList" => Instr::BuildList(snum(xs, 1)? as usize),
+                        _ => Instr::Return,
+                    })
+                }
+                let shape = args.get(0).ok_or("run_ir: expected IR shape")?;
+                let xs = sl(shape)?;
+                if st(xs, 0)? != "ProgramIR" { return Err("run_ir: root must be ProgramIR".into()); }
+                let entry = st(xs, 1)?;
+                let mut program = Program { functions: HashMap::new(), entry: entry.clone() };
+                for fv in sl(xs.get(2).ok_or("run_ir: missing functions")?)? {
+                    let fx = sl(fv)?;
+                    let name = st(fx, 1)?;
+                    let params: Vec<String> = sl(fx.get(2).ok_or("run_ir: missing params")?)?
+                        .iter().map(|p| match p { Value::String(s) => Ok(s.clone()), _ => Err("run_ir: bad param".to_string()) })
+                        .collect::<Result<_, _>>()?;
+                    let mut body = Vec::new();
+                    for iv in sl(fx.get(3).ok_or("run_ir: missing body")?)? { body.push(dinstr(iv)?); }
+                    program.functions.insert(name.clone(), Function { name, params, body });
+                }
+                for ev in sl(xs.get(3).ok_or("run_ir: missing events")?)? {
+                    let ex = sl(ev)?;
+                    let event = st(ex, 1)?; let handler = st(ex, 2)?;
+                    EVENT_HANDLERS.with(|m| m.borrow_mut().entry(event).or_insert_with(Vec::new).push(handler));
+                }
+                let f = program.functions.get(&program.entry).ok_or("run_ir: entry not found")?;
+                run_function(&program, f, &[])
+            }
             "tcp_listen" => {
                 // tcp_listen(port) -> Number actual bound port (0 = OS-assigned)
                 let port = arg_num(&args, 0, "tcp_listen")? as u16;
