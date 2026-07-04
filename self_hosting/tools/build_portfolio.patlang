@@ -60,6 +60,21 @@ make a function called compile_both takes src, id returns wasmb64
   return read_file_b64(wasm_path)
 end
 
+make a function called compile_wasm_only takes src, id returns wasmb64
+  let wasm_path = "portfolio/build/" + id + ".wasm"
+  if cache_valid(id, src) and (file_exists(wasm_path) == "1") then
+    print("[cache] " + id + " unchanged, skipping rebuild")
+    return read_file_b64(wasm_path)
+  end
+  let toks = tokenize(src)
+  let ast = parse_program(toks)
+  let ir = lower_program(ast)
+  let rs = emit_program_rs(ir)
+  rustc_build(rs, wasm_path, "wasm32-wasip1")
+  save_cache(id, src)
+  return read_file_b64(wasm_path)
+end
+
 make a function called compile_native takes src, id returns exe
   let exe_path = "portfolio/build/" + id + ".exe"
   if cache_valid(id, src) and (file_exists(exe_path) == "1") then
@@ -109,7 +124,7 @@ make a function called wasi_shim_js takes b returns done
   sb_push(b, "const MODCACHE = {};" + nl())
   sb_push(b, "async function runWasm(outId, wasmId, extraArgs) {" + nl())
   sb_push(b, "  const out = document.getElementById('out-' + outId);" + nl())
-  sb_push(b, "  out.textContent = 'running...';" + nl())
+  sb_push(b, "  if (out) out.textContent = 'running...';" + nl())
   sb_push(b, "  let stdout = '';" + nl())
   sb_push(b, "  const dec = new TextDecoder();" + nl())
   sb_push(b, "  let mem = null;" + nl())
@@ -163,10 +178,13 @@ make a function called wasi_shim_js takes b returns done
   sb_push(b, "    mem = inst.exports.memory;" + nl())
   sb_push(b, "    try { inst.exports._start(); } catch (e) { if (!(e && e.exitCode === 0)) throw e; }" + nl())
   sb_push(b, "    const ms = (performance.now() - t0).toFixed(1);" + nl())
-  sb_push(b, "    out.textContent = stdout;" + nl())
-  sb_push(b, "    document.getElementById('ms-' + outId).textContent = ms + ' ms wall (compile+run, this browser)';" + nl())
+  sb_push(b, "    if (out) out.textContent = stdout;" + nl())
+  sb_push(b, "    const msEl = document.getElementById('ms-' + outId);" + nl())
+  sb_push(b, "    if (msEl) msEl.textContent = ms + ' ms wall (compile+run, this browser)';" + nl())
+  sb_push(b, "    return stdout;" + nl())
   sb_push(b, "  } catch (e) {" + nl())
-  sb_push(b, "    out.textContent = stdout + ' [error: ' + e + ']';" + nl())
+  sb_push(b, "    if (out) out.textContent = stdout + ' [error: ' + e + ']';" + nl())
+  sb_push(b, "    return stdout;" + nl())
   sb_push(b, "  }" + nl())
   sb_push(b, "}" + nl())
   sb_push(b, "const KW = new Set(['let','if','then','else','end','while','do','return','make','a','function','called','takes','returns','when','emit','and','or','not','true','false','print']);" + nl())
@@ -242,35 +260,103 @@ compile_native(flow_full, "flowgraph")
 let flow_native = exec_capture("portfolio/build/flowgraph.exe")
 print("flowgraph done")
 
-# Maze solver page: generated directly (lib/maze.patlang is already included
-# above), no subprocess and no rustc - this is dev tooling, not a demo of
-# native compilation, so it follows the same run_ir-first philosophy as the
-# in-browser playground.
+# Maze solver page: an interactive page around a small wasm module (lexer +
+# parser + lower + lib/maze + a driver taking generate/solve subcommands),
+# so mazes of any size/seed are generated and solved live in the browser -
+# no rustc beyond this one-time wasm build, matching the IDE/playground.
 let maze_src = read_file("self_hosting/lib/maze.patlang")
-let maze_grid = [
-  "S.#........",
-  "..#.#####.#",
-  "..#.#...#.#",
-  ".##.#.###.#",
-  "....#.#...#",
-  "###.#.#.###",
-  "#...#.#.#..",
-  "#.###.#.#.#",
-  "#.....#...#",
-  "#####.###.#",
-  "#.........E"
-]
-let maze_path = solve_maze(maze_grid)
+let maze_wasm_src = read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + read_file("self_hosting/lib/lower.patlang") + chr(10) + maze_src + chr(10) + read_file("self_hosting/examples/maze_wasm_main.patlang")
+let maze_b64 = compile_wasm_only(maze_wasm_src, "maze")
+print("maze wasm done")
+
 let maze_body = sb_new()
 sb_push(maze_body, "<h1>PatLang maze solver</h1>" + nl())
-sb_push(maze_body, "<p>The grid is compiled into <code>open</code> facts, a <code>solve</code> goal announces intent, a recursive depth-first search does the work using <code>query</code> to check the facts, and a <code>solved</code>/<code>unsolved</code> event reports the outcome. Logic, goal-oriented, functional recursion, and events, in one page.</p>" + nl())
+sb_push(maze_body, "<p>A grid compiled into logic-programming <code>fact</code>s, solved by a recursive depth-first search driven by <code>query</code>, announced with <code>goal</code>, and reported through a <code>solved</code>/<code>unsolved</code> event - generation and solving both run live in this page (compiled to WASM once, no rustc per maze). Pick a size and seed, generate a maze, then watch it solve one visited cell at a time.</p>" + nl())
 sb_push(maze_body, maze_css())
-sb_push(maze_body, render_maze_grid(maze_grid, maze_path))
-sb_push(maze_body, "<p>" + maze_path.length + " steps from S to E.</p>" + nl())
+sb_push(maze_body, "<style>" + nl())
+sb_push(maze_body, ".mz-visited{background:#f6b93b}" + nl())
+sb_push(maze_body, "#mz-canvas{display:grid;gap:2px}" + nl())
+sb_push(maze_body, "</style>" + nl())
+sb_push(maze_body, "<p>" + nl())
+sb_push(maze_body, "<label>Width <input id='mz-w' type='number' value='16' min='2' max='60' style='width:4em'></label> " + nl())
+sb_push(maze_body, "<label>Height <input id='mz-h' type='number' value='12' min='2' max='60' style='width:4em'></label> " + nl())
+sb_push(maze_body, "<label>Seed <input id='mz-seed' type='number' value='1' min='0' max='32767' style='width:5em'></label> " + nl())
+sb_push(maze_body, "<button onclick='mzGenerate()'>Generate maze</button> " + nl())
+sb_push(maze_body, "<label>Speed <input id='mz-speed' type='range' min='1' max='60' value='25'></label>" + nl())
+sb_push(maze_body, "</p>" + nl())
+sb_push(maze_body, "<p><button onclick='mzSolve()'>Watch it solve</button> <button onclick='mzSolveInstant()'>Solve instantly</button> <span id='mz-status' class='ms'></span></p>" + nl())
+sb_push(maze_body, "<div id='mz-canvas'></div>" + nl())
+sb_push(maze_body, "<pre class='out' id='out-maze' hidden></pre>" + nl())
 sb_push(maze_body, "<h2>Source</h2>" + nl())
-sb_push(maze_body, "<pre>" + html_escape(maze_src) + "</pre>" + nl())
-write_file("portfolio/maze.html", html_page("PatLang maze solver", sb_str(maze_body), ""))
-print("maze done (" + maze_path.length + " steps)")
+sb_push(maze_body, "<details><summary>lib/maze.patlang</summary><pre class='src'>" + html_escape(maze_src) + "</pre></details>" + nl())
+
+let maze_js = sb_new()
+sb_push(maze_js, "const WASMS = {" + nl())
+sb_push(maze_js, "  maze: '" + maze_b64 + "'" + nl())
+sb_push(maze_js, "};" + nl())
+wasi_shim_js(maze_js)
+sb_push(maze_js, "let mzCols = 0, mzRows = 0, mzGrid = [], mzCells = [];" + nl())
+sb_push(maze_js, "function mzClassFor(c) { if (c === '#') return 'mz-wall'; if (c === 'S') return 'mz-start'; if (c === 'E') return 'mz-end'; return 'mz-open'; }" + nl())
+sb_push(maze_js, "function mzRender(grid) {" + nl())
+sb_push(maze_js, "  mzGrid = grid; mzRows = grid.length; mzCols = grid[0].length; mzCells = [];" + nl())
+sb_push(maze_js, "  const c = document.getElementById('mz-canvas');" + nl())
+sb_push(maze_js, "  c.style.gridTemplateColumns = 'repeat(' + mzCols + ', 1.4em)';" + nl())
+sb_push(maze_js, "  c.innerHTML = '';" + nl())
+sb_push(maze_js, "  for (let y = 0; y < mzRows; y++) for (let x = 0; x < mzCols; x++) {" + nl())
+sb_push(maze_js, "    const d = document.createElement('div');" + nl())
+sb_push(maze_js, "    d.style.width = d.style.height = '1.4em';" + nl())
+sb_push(maze_js, "    d.className = mzClassFor(grid[y][x]);" + nl())
+sb_push(maze_js, "    c.appendChild(d); mzCells.push(d);" + nl())
+sb_push(maze_js, "  }" + nl())
+sb_push(maze_js, "}" + nl())
+sb_push(maze_js, "async function mzGenerate() {" + nl())
+sb_push(maze_js, "  const w = document.getElementById('mz-w').value, h = document.getElementById('mz-h').value, seed = document.getElementById('mz-seed').value;" + nl())
+sb_push(maze_js, "  const text = await runWasm('maze', 'maze', ['generate', w, h, seed]);" + nl())
+sb_push(maze_js, "  mzRender(text.split(String.fromCharCode(10)).filter(function(r) { return r.length > 0; }));" + nl())
+sb_push(maze_js, "  document.getElementById('mz-status').textContent = 'generated ' + w + 'x' + h + ' maze, seed ' + seed;" + nl())
+sb_push(maze_js, "}" + nl())
+sb_push(maze_js, "function mzCellIndex(key) { const p = key.split(','); return (Number(p[1]) * mzCols) + Number(p[0]); }" + nl())
+sb_push(maze_js, "async function mzRunSolve() {" + nl())
+sb_push(maze_js, "  for (const el of mzCells) { el.classList.remove('mz-visited', 'mz-path'); }" + nl())
+sb_push(maze_js, "  const text = await runWasm('maze', 'maze', ['solve', mzGrid.join(String.fromCharCode(10))]);" + nl())
+sb_push(maze_js, "  const lines = text.split(String.fromCharCode(10));" + nl())
+sb_push(maze_js, "  const trace = lines[0] ? lines[0].split(';') : [];" + nl())
+sb_push(maze_js, "  const path = lines[1] ? lines[1].split(';') : [];" + nl())
+sb_push(maze_js, "  const msg = lines[2] || '';" + nl())
+sb_push(maze_js, "  return { trace, path, msg };" + nl())
+sb_push(maze_js, "}" + nl())
+sb_push(maze_js, "function mzPaintPath(path) {" + nl())
+sb_push(maze_js, "  for (const key of path) {" + nl())
+sb_push(maze_js, "    const el = mzCells[mzCellIndex(key)];" + nl())
+sb_push(maze_js, "    if (el && !el.classList.contains('mz-start') && !el.classList.contains('mz-end')) el.classList.add('mz-path');" + nl())
+sb_push(maze_js, "  }" + nl())
+sb_push(maze_js, "}" + nl())
+sb_push(maze_js, "async function mzSolve() {" + nl())
+sb_push(maze_js, "  document.getElementById('mz-status').textContent = 'solving...';" + nl())
+sb_push(maze_js, "  const { trace, path, msg } = await mzRunSolve();" + nl())
+sb_push(maze_js, "  const speed = 61 - Number(document.getElementById('mz-speed').value);" + nl())
+sb_push(maze_js, "  let i = 0;" + nl())
+sb_push(maze_js, "  const timer = setInterval(() => {" + nl())
+sb_push(maze_js, "    if (i >= trace.length) {" + nl())
+sb_push(maze_js, "      clearInterval(timer); mzPaintPath(path); document.getElementById('mz-status').textContent = msg;" + nl())
+sb_push(maze_js, "      return;" + nl())
+sb_push(maze_js, "    }" + nl())
+sb_push(maze_js, "    const el = mzCells[mzCellIndex(trace[i])];" + nl())
+sb_push(maze_js, "    if (el && !el.classList.contains('mz-start') && !el.classList.contains('mz-end')) el.classList.add('mz-visited');" + nl())
+sb_push(maze_js, "    i++;" + nl())
+sb_push(maze_js, "  }, speed);" + nl())
+sb_push(maze_js, "}" + nl())
+sb_push(maze_js, "async function mzSolveInstant() {" + nl())
+sb_push(maze_js, "  document.getElementById('mz-status').textContent = 'solving...';" + nl())
+sb_push(maze_js, "  const { trace, path, msg } = await mzRunSolve();" + nl())
+sb_push(maze_js, "  for (const key of trace) { const el = mzCells[mzCellIndex(key)]; if (el && !el.classList.contains('mz-start') && !el.classList.contains('mz-end')) el.classList.add('mz-visited'); }" + nl())
+sb_push(maze_js, "  mzPaintPath(path);" + nl())
+sb_push(maze_js, "  document.getElementById('mz-status').textContent = msg;" + nl())
+sb_push(maze_js, "}" + nl())
+sb_push(maze_js, "window.addEventListener('DOMContentLoaded', mzGenerate);" + nl())
+
+write_file("portfolio/maze.html", html_page("PatLang maze solver", sb_str(maze_body), sb_str(maze_js)))
+print("maze done")
 
 # IDE page: a bigger standalone editor around the same playground.wasm engine
 # (no new wasm build - the mode argument added to playground_main.patlang
