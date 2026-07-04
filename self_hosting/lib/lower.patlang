@@ -2,7 +2,8 @@
 # Stage 1 self-hosted lowerer (Stage 0 compilable subset).
 # Walks the list-shaped AST from lib/parser.patlang and emits list-shaped IR
 # instructions. The host's compile_ir only decodes this IR and runs codegen —
-# lexing, parsing, AND lowering all happen in PatLang.
+# lexing, parsing, lowering, AND (via lib/codegen.patlang) code generation all
+# happen in PatLang.
 #
 # IR shape:
 #   ["ProgramIR", entry, [functions], [events]]
@@ -12,7 +13,17 @@
 #   ["Const", "num"|"str"|"bool", text]   ["Load", name]   ["Store", name]
 #   ["Bin", op]   ["Un", op]   ["Jump", n]   ["JumpIfFalse", n]
 #   ["CallHost", name, argc]   ["Call", name, argc]
+#   ["MakeClosure", func_name, [captured_names]]   ["CallValue", argc]
 #   ["BuildList", n]   ["Return"]
+#
+# Closures: |params| do body end (Stage 1 has no brace-delimited blocks
+# anywhere, so closures use the same do/end convention as while-loops rather
+# than Stage 0's |params| { body }). A closure captures its ENTIRE enclosing
+# locals list (over-capture, not precise free-variable analysis) as leading
+# hidden parameters of a synthesized function — simpler than exact capture
+# and still correct: the flat per-call locals map means a closure's own
+# `let` of a same-named variable just overwrites the pre-bound captured
+# value, exactly matching intended shadowing.
 # =============================================================================
 
 make a function called contains_str takes xs, s returns r
@@ -26,7 +37,35 @@ make a function called contains_str takes xs, s returns r
   return false
 end
 
-make a function called lower_expr takes node, code, fns returns out
+make a function called vec_contains takes v, s returns r
+  let i = 0
+  let n = vec_len(v)
+  while i < n do
+    if vec_get(v, i) == s then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called next_closure_name returns name
+  let n = get("__vars", "__closure_seq")
+  if not n then
+    let n = 0
+  end
+  set_var("__closure_seq", n + 1)
+  return "__closure_" + n
+end
+
+# lower_expr(node, code, fns, locals, pending) -> code
+#   fns:     list of top-level function names (static call vs host call)
+#   locals:  vec of names currently bound in the enclosing scope (for
+#            disambiguating a call through a closure-valued variable, and
+#            for over-capturing into new closures)
+#   pending: vec of synthesized ["FuncIR", ...] nodes from closure literals,
+#            merged into the program's function list once lowering finishes
+make a function called lower_expr takes node, code, fns, locals, pending returns out
   let ty = node[0]
   if ty == "Num" then
     vec_push(code, ["Const", "num", node[1]])
@@ -47,7 +86,7 @@ make a function called lower_expr takes node, code, fns returns out
           if ty == "Bin" then
             if node[1] == "and" then
               # short-circuit: false when lhs falsey, else truthiness of rhs
-              let code = lower_expr(node[2], code, fns)
+              let code = lower_expr(node[2], code, fns, locals, pending)
               vec_push(code, ["Un", "not"])
               let jif = vec_len(code)
               vec_push(code, ["JumpIfFalse", 0])
@@ -55,7 +94,7 @@ make a function called lower_expr takes node, code, fns returns out
               let jmp = vec_len(code)
               vec_push(code, ["Jump", 0])
               vec_set(code, jif, ["JumpIfFalse", vec_len(code)])
-              let code = lower_expr(node[3], code, fns)
+              let code = lower_expr(node[3], code, fns, locals, pending)
               vec_push(code, ["Un", "not"])
               vec_push(code, ["Un", "not"])
               vec_set(code, jmp, ["Jump", vec_len(code)])
@@ -63,11 +102,11 @@ make a function called lower_expr takes node, code, fns returns out
             else
               if node[1] == "or" then
                 # short-circuit: true when lhs truthy, else truthiness of rhs
-                let code = lower_expr(node[2], code, fns)
+                let code = lower_expr(node[2], code, fns, locals, pending)
                 vec_push(code, ["Un", "not"])
                 let jif = vec_len(code)
                 vec_push(code, ["JumpIfFalse", 0])
-                let code = lower_expr(node[3], code, fns)
+                let code = lower_expr(node[3], code, fns, locals, pending)
                 vec_push(code, ["Un", "not"])
                 vec_push(code, ["Un", "not"])
                 let jmp = vec_len(code)
@@ -77,51 +116,69 @@ make a function called lower_expr takes node, code, fns returns out
                 vec_set(code, jmp, ["Jump", vec_len(code)])
                 return code
               else
-                let code = lower_expr(node[2], code, fns)
-                let code = lower_expr(node[3], code, fns)
+                let code = lower_expr(node[2], code, fns, locals, pending)
+                let code = lower_expr(node[3], code, fns, locals, pending)
                 vec_push(code, ["Bin", node[1]])
                 return code
               end
             end
           else
             if ty == "Un" then
-              let code = lower_expr(node[2], code, fns)
+              let code = lower_expr(node[2], code, fns, locals, pending)
               vec_push(code, ["Un", node[1]])
               return code
             else
               if ty == "Call" then
+                let callee = node[1]
                 let args = node[2]
-                let i = 0
-                while i < args.length do
-                  let code = lower_expr(args[i], code, fns)
-                  let i = i + 1
-                end
-                if contains_str(fns, node[1]) then
-                  vec_push(code, ["Call", node[1], args.length])
+                if contains_str(fns, callee) then
+                  let i = 0
+                  while i < args.length do
+                    let code = lower_expr(args[i], code, fns, locals, pending)
+                    let i = i + 1
+                  end
+                  vec_push(code, ["Call", callee, args.length])
                   return code
                 else
-                  vec_push(code, ["CallHost", node[1], args.length])
-                  return code
+                  if vec_contains(locals, callee) then
+                    # dynamic call through a local variable holding a closure
+                    vec_push(code, ["Load", callee])
+                    let i = 0
+                    while i < args.length do
+                      let code = lower_expr(args[i], code, fns, locals, pending)
+                      let i = i + 1
+                    end
+                    vec_push(code, ["CallValue", args.length])
+                    return code
+                  else
+                    let i = 0
+                    while i < args.length do
+                      let code = lower_expr(args[i], code, fns, locals, pending)
+                      let i = i + 1
+                    end
+                    vec_push(code, ["CallHost", callee, args.length])
+                    return code
+                  end
                 end
               else
                 if ty == "List" then
                   let items = node[1]
                   let i = 0
                   while i < items.length do
-                    let code = lower_expr(items[i], code, fns)
+                    let code = lower_expr(items[i], code, fns, locals, pending)
                     let i = i + 1
                   end
                   vec_push(code, ["BuildList", items.length])
                   return code
                 else
                   if ty == "Index" then
-                    let code = lower_expr(node[1], code, fns)
-                    let code = lower_expr(node[2], code, fns)
+                    let code = lower_expr(node[1], code, fns, locals, pending)
+                    let code = lower_expr(node[2], code, fns, locals, pending)
                     vec_push(code, ["CallHost", "list_get", 2])
                     return code
                   else
                     if ty == "Member" then
-                      let code = lower_expr(node[1], code, fns)
+                      let code = lower_expr(node[1], code, fns, locals, pending)
                       if (node[2] == "length") or (node[2] == "len") then
                         vec_push(code, ["CallHost", "len", 1])
                         return code
@@ -131,9 +188,13 @@ make a function called lower_expr takes node, code, fns returns out
                         return code
                       end
                     else
-                      # unknown expression: lower as unit-ish empty string
-                      vec_push(code, ["Const", "str", ""])
-                      return code
+                      if ty == "Closure" then
+                        return lower_closure_literal(node[1], node[2], code, fns, locals, pending)
+                      else
+                        # unknown expression: lower as unit-ish empty string
+                        vec_push(code, ["Const", "str", ""])
+                        return code
+                      end
                     end
                   end
                 end
@@ -146,44 +207,84 @@ make a function called lower_expr takes node, code, fns returns out
   end
 end
 
-make a function called lower_stmt takes node, code, fns, fname returns out
+# Lowers a closure literal: synthesizes a Function (params = the enclosing
+# scope's current locals ++ the closure's own params) queued in `pending`,
+# and emits the Load.../MakeClosure sequence at the creation site into `code`.
+make a function called lower_closure_literal takes params, body, code, fns, locals, pending returns out
+  let captured = vec_to_list(locals)
+  let func_name = next_closure_name()
+  let all_params = []
+  let i = 0
+  while i < captured.length do
+    let all_params = list_push(all_params, captured[i])
+    let i = i + 1
+  end
+  let i = 0
+  while i < params.length do
+    let all_params = list_push(all_params, params[i])
+    let i = i + 1
+  end
+
+  let inner_locals = vec_new()
+  let i = 0
+  while i < all_params.length do
+    vec_push(inner_locals, all_params[i])
+    let i = i + 1
+  end
+  let inner_code = lower_block(body, vec_new(), fns, func_name, inner_locals, pending)
+  vec_push(inner_code, ["Return"])
+  vec_push(pending, ["FuncIR", func_name, all_params, vec_to_list(inner_code)])
+
+  # At the creation site: push captured values in the SAME order used for
+  # all_params's leading section, then bundle them.
+  let i = 0
+  while i < captured.length do
+    vec_push(code, ["Load", captured[i]])
+    let i = i + 1
+  end
+  vec_push(code, ["MakeClosure", func_name, captured])
+  return code
+end
+
+make a function called lower_stmt takes node, code, fns, fname, locals, pending returns out
   let ty = node[0]
   if ty == "Let" then
-    let code = lower_expr(node[2], code, fns)
+    let code = lower_expr(node[2], code, fns, locals, pending)
     vec_push(code, ["Store", node[1]])
+    vec_push(locals, node[1])
     return code
   else
     if ty == "Expr" then
-      return lower_expr(node[1], code, fns)
+      return lower_expr(node[1], code, fns, locals, pending)
     else
       if ty == "Print" then
-        let code = lower_expr(node[1], code, fns)
+        let code = lower_expr(node[1], code, fns, locals, pending)
         vec_push(code, ["CallHost", "print", 1])
         return code
       else
         if ty == "Return" then
-          let code = lower_expr(node[1], code, fns)
+          let code = lower_expr(node[1], code, fns, locals, pending)
           vec_push(code, ["Return"])
           return code
         else
           if ty == "If" then
-            let code = lower_expr(node[1], code, fns)
+            let code = lower_expr(node[1], code, fns, locals, pending)
             let jif = vec_len(code)
             vec_push(code, ["JumpIfFalse", 0])
-            let code = lower_block(node[2], code, fns, fname)
+            let code = lower_block(node[2], code, fns, fname, locals, pending)
             let jmp = vec_len(code)
             vec_push(code, ["Jump", 0])
             vec_set(code, jif, ["JumpIfFalse", vec_len(code)])
-            let code = lower_block(node[3], code, fns, fname)
+            let code = lower_block(node[3], code, fns, fname, locals, pending)
             vec_set(code, jmp, ["Jump", vec_len(code)])
             return code
           else
             if ty == "While" then
               let start = vec_len(code)
-              let code = lower_expr(node[1], code, fns)
+              let code = lower_expr(node[1], code, fns, locals, pending)
               let jif = vec_len(code)
               vec_push(code, ["JumpIfFalse", 0])
-              let code = lower_block(node[2], code, fns, fname)
+              let code = lower_block(node[2], code, fns, fname, locals, pending)
               vec_push(code, ["Jump", start])
               vec_set(code, jif, ["JumpIfFalse", vec_len(code)])
               return code
@@ -194,7 +295,7 @@ make a function called lower_stmt takes node, code, fns, fname returns out
                 vec_push(code, ["Const", "str", fname])
                 vec_push(code, ["Const", "str", node[1]])
                 vec_push(code, ["Const", "str", ast_to_str(node[2])])
-                let code = lower_expr(node[2], code, fns)
+                let code = lower_expr(node[2], code, fns, locals, pending)
                 vec_push(code, ["CallHost", "contract_check", 4])
                 return code
               else
@@ -209,10 +310,10 @@ make a function called lower_stmt takes node, code, fns, fname returns out
   end
 end
 
-make a function called lower_block takes stmts, code, fns, fname returns out
+make a function called lower_block takes stmts, code, fns, fname, locals, pending returns out
   let i = 0
   while i < stmts.length do
-    let code = lower_stmt(stmts[i], code, fns, fname)
+    let code = lower_stmt(stmts[i], code, fns, fname, locals, pending)
     let i = i + 1
   end
   return code
@@ -232,34 +333,54 @@ make a function called collect_fns takes stmts returns fns
 end
 
 make a function called lower_program takes ast returns ir
+  set_var("__closure_seq", 0)
   let stmts = ast[1]
   let fns = collect_fns(stmts)
   let funcs = []
   let events = []
   let mainCode = vec_new()
+  let mainLocals = vec_new()
+  let pending = vec_new()
   let handlerCount = 0
   let i = 0
   while i < stmts.length do
     let s = stmts[i]
     if s[0] == "Func" then
-      let code = lower_block(s[3], vec_new(), fns, s[1])
+      let flocals = vec_new()
+      let k = 0
+      while k < s[2].length do
+        vec_push(flocals, s[2][k])
+        let k = k + 1
+      end
+      let code = lower_block(s[3], vec_new(), fns, s[1], flocals, pending)
       vec_push(code, ["Return"])
       let funcs = list_push(funcs, ["FuncIR", s[1], s[2], vec_to_list(code)])
     else
       if s[0] == "When" then
         let handlerCount = handlerCount + 1
         let hname = "__when_" + s[1] + "_" + handlerCount
-        let code = lower_block(s[2], vec_new(), fns, hname)
+        let hlocals = vec_new()
+        vec_push(hlocals, "event_name")
+        vec_push(hlocals, "event_data")
+        let code = lower_block(s[2], vec_new(), fns, hname, hlocals, pending)
         vec_push(code, ["Return"])
         let funcs = list_push(funcs, ["FuncIR", hname, ["event_name", "event_data"], vec_to_list(code)])
         let events = list_push(events, ["EventIR", s[1], hname])
       else
-        let mainCode = lower_stmt(s, mainCode, fns, "main")
+        let mainCode = lower_stmt(s, mainCode, fns, "main", mainLocals, pending)
       end
     end
     let i = i + 1
   end
   vec_push(mainCode, ["Return"])
   let funcs = list_push(funcs, ["FuncIR", "main", [], vec_to_list(mainCode)])
+
+  let pendingList = vec_to_list(pending)
+  let i = 0
+  while i < pendingList.length do
+    let funcs = list_push(funcs, pendingList[i])
+    let i = i + 1
+  end
+
   return ["ProgramIR", "main", funcs, events]
 end

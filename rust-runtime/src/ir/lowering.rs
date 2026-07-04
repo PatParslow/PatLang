@@ -10,6 +10,11 @@ pub struct Lowerer {
     known_functions: HashSet<String>,
     // name of the function currently being lowered, for contract-violation messages
     current_function: String,
+    // functions synthesized from closure literals, merged into the program
+    // once top-level lowering completes
+    pending_closures: Vec<Function>,
+    // unique naming for synthesized closure functions
+    closure_counter: usize,
 }
 
 impl Lowerer {
@@ -74,6 +79,9 @@ impl Lowerer {
         }
         main_fn.body.push(Instr::Return);
         program.functions.insert("main".into(), main_fn);
+        for f in self.pending_closures.drain(..) {
+            program.functions.insert(f.name.clone(), f);
+        }
         program
     }
 
@@ -159,10 +167,20 @@ impl Lowerer {
             Expr::UnaryOp { expr, .. } => self.expr_is_safe(expr),
             Expr::BinaryOp { left, right, .. } => self.expr_is_safe(left) && self.expr_is_safe(right),
             Expr::Call { function, args } => {
-                if let Expr::Identifier(name) = &**function {
-                    (self.is_allowed_host(name) || self.known_functions.contains(name)) && args.iter().all(|a| self.expr_is_safe(a))
-                } else { false }
+                let callee_safe = match &**function {
+                    Expr::Identifier(name) => {
+                        self.is_allowed_host(name) || self.known_functions.contains(name) || self.known_locals.contains(name)
+                    }
+                    // Any other safe callee expression (e.g. an inline closure
+                    // literal) dispatches through CallValue, which cannot
+                    // corrupt lowering state even if the runtime value turns
+                    // out not to be callable.
+                    other => self.expr_is_safe(other),
+                };
+                callee_safe && args.iter().all(|a| self.expr_is_safe(a))
             }
+            // Closure literals never fail to lower (MakeClosure is infallible)
+            Expr::Closure { .. } => true,
             _ => false,
         }
     }
@@ -214,16 +232,24 @@ impl Lowerer {
                 f.body.push(Instr::CallHost("list_get".into(), 2));
             }
             Expr::Call { function, args } => {
-                // Identifier calls map to host calls; member calls map to message send
+                // Identifier calls: static function, closure-valued local, or host call.
+                // Member calls map to message send. Any other callee expression
+                // (e.g. an inline closure literal called immediately) evaluates to
+                // a closure value and dispatches through CallValue.
                 match &**function {
+                    Expr::Identifier(name) if self.known_functions.contains(name) => {
+                        for arg in args { self.lower_expr(arg, f); }
+                        f.body.push(Instr::Call(name.clone(), args.len()));
+                    }
+                    Expr::Identifier(name) if self.known_locals.contains(name) => {
+                        // Dynamic call through a local variable holding a closure
+                        f.body.push(Instr::LoadLocal(name.clone()));
+                        for arg in args { self.lower_expr(arg, f); }
+                        f.body.push(Instr::CallValue(args.len()));
+                    }
                     Expr::Identifier(name) => {
                         for arg in args { self.lower_expr(arg, f); }
-                        // If identifier refers to known local function, emit Call; otherwise host call
-                        if self.known_functions.contains(name) {
-                            f.body.push(Instr::Call(name.clone(), args.len()));
-                        } else {
-                            f.body.push(Instr::CallHost(name.clone(), args.len()));
-                        }
+                        f.body.push(Instr::CallHost(name.clone(), args.len()));
                     }
                     Expr::Member { object, property } => {
                         // send(object, "method", ...args)
@@ -232,10 +258,17 @@ impl Lowerer {
                         for arg in args { self.lower_expr(arg, f); }
                         f.body.push(Instr::CallHost("send".into(), 2 + args.len()));
                     }
-                    _ => {
-                        // Unsupported callee; no-op for now
+                    other => {
+                        // Arbitrary callee expression (e.g. an inline closure
+                        // literal): evaluate it to a closure value, then CallValue
+                        self.lower_expr(other, f);
+                        for arg in args { self.lower_expr(arg, f); }
+                        f.body.push(Instr::CallValue(args.len()));
                     }
                 }
+            }
+            Expr::Closure { params, body } => {
+                self.lower_closure_literal(params, body, f);
             }
             Expr::UnaryOp { op, expr } => {
                 self.lower_expr(expr, f);
@@ -310,6 +343,121 @@ impl Lowerer {
             }
             _ => { /* TODO: calls, lists, etc. */ }
         }
+    }
+
+    /// Lowers a closure literal: analyzes free variables, synthesizes a
+    /// Function (params = captured names ++ the closure's own params, in
+    /// that order) queued in `pending_closures`, and emits the
+    /// LoadLocal.../MakeClosure sequence at the creation site in `f`.
+    fn lower_closure_literal(&mut self, params: &[String], body: &[Stmt], f: &mut Function) {
+        // This language has no block scoping (reassigning a local inside an
+        // if/while branch is already visible after it, everywhere else in
+        // this codebase) so a flat union of the closure's params and every
+        // name it `let`-binds anywhere in its body is a consistent notion of
+        // "bound within the closure" for deciding what must be captured.
+        let mut own: HashSet<String> = params.iter().cloned().collect();
+        collect_let_bound_names(body, &mut own);
+
+        let mut referenced: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        collect_referenced_idents(body, &mut referenced, &mut seen);
+
+        // Capture only names that are (a) free in the closure and (b) actually
+        // present in the enclosing scope right now (anything else is presumably
+        // a host/global function name, not a variable to snapshot).
+        let captured_names: Vec<String> = referenced.into_iter()
+            .filter(|n| !own.contains(n) && self.known_locals.contains(n))
+            .collect();
+
+        self.closure_counter += 1;
+        let func_name = format!("__closure_{}", self.closure_counter);
+        let mut cf = Function {
+            name: func_name.clone(),
+            params: captured_names.iter().cloned().chain(params.iter().cloned()).collect(),
+            ..Default::default()
+        };
+        let saved_locals = std::mem::take(&mut self.known_locals);
+        let saved_fname = std::mem::replace(&mut self.current_function, func_name.clone());
+        self.known_locals = cf.params.iter().cloned().collect();
+        for st in body { self.lower_stmt(st, &mut cf); }
+        cf.body.push(Instr::Return);
+        self.known_locals = saved_locals;
+        self.current_function = saved_fname;
+        self.pending_closures.push(cf);
+
+        // At the creation site, push captured values in the same order used
+        // for the synthesized function's leading params, then bundle them.
+        for name in &captured_names {
+            f.body.push(Instr::LoadLocal(name.clone()));
+        }
+        f.body.push(Instr::MakeClosure(func_name, captured_names));
+    }
+}
+
+fn collect_let_bound_names(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Let { name, .. } => { out.insert(name.clone()); }
+            Stmt::If { then_branch, else_branch, .. } => {
+                collect_let_bound_names(then_branch, out);
+                if let Some(eb) = else_branch { collect_let_bound_names(eb, out); }
+            }
+            Stmt::While { body, .. } => collect_let_bound_names(body, out),
+            Stmt::When { body, .. } => collect_let_bound_names(body, out),
+            _ => {}
+        }
+    }
+}
+
+fn collect_referenced_idents(stmts: &[Stmt], out: &mut Vec<String>, seen: &mut HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::ExprStmt(e) => collect_ident_expr(e, out, seen),
+            Stmt::Let { value, .. } => collect_ident_expr(value, out, seen),
+            Stmt::MemberAssign { object, value, .. } => { collect_ident_expr(object, out, seen); collect_ident_expr(value, out, seen); }
+            Stmt::Function { body, .. } => collect_referenced_idents(body, out, seen),
+            Stmt::Return(opt) => { if let Some(e) = opt { collect_ident_expr(e, out, seen); } }
+            Stmt::If { cond, then_branch, else_branch } => {
+                collect_ident_expr(cond, out, seen);
+                collect_referenced_idents(then_branch, out, seen);
+                if let Some(eb) = else_branch { collect_referenced_idents(eb, out, seen); }
+            }
+            Stmt::While { cond, body } => { collect_ident_expr(cond, out, seen); collect_referenced_idents(body, out, seen); }
+            Stmt::Fact { args, .. } | Stmt::Query { args, .. } => { for a in args { collect_ident_expr(a, out, seen); } }
+            Stmt::When { body, .. } => collect_referenced_idents(body, out, seen),
+            Stmt::Assert { expr, .. } => collect_ident_expr(expr, out, seen),
+        }
+    }
+}
+
+fn collect_ident_expr(e: &Expr, out: &mut Vec<String>, seen: &mut HashSet<String>) {
+    match e {
+        Expr::Identifier(name) => {
+            if name != "true" && name != "false" && seen.insert(name.clone()) {
+                out.push(name.clone());
+            }
+        }
+        Expr::List(items) => for it in items { collect_ident_expr(it, out, seen); },
+        Expr::Member { object, .. } => collect_ident_expr(object, out, seen),
+        Expr::Index { object, index } => { collect_ident_expr(object, out, seen); collect_ident_expr(index, out, seen); }
+        Expr::UnaryOp { expr, .. } => collect_ident_expr(expr, out, seen),
+        Expr::BinaryOp { left, right, .. } => { collect_ident_expr(left, out, seen); collect_ident_expr(right, out, seen); }
+        Expr::Call { function, args } => {
+            collect_ident_expr(function, out, seen);
+            for a in args { collect_ident_expr(a, out, seen); }
+        }
+        Expr::Closure { params, body } => {
+            // A nested closure's free variables (excluding its own params) are
+            // also free variables of the enclosing closure, so they propagate
+            // outward and get captured at whichever scope actually has them.
+            let mut inner_out = Vec::new();
+            let mut inner_seen: HashSet<String> = params.iter().cloned().collect();
+            collect_referenced_idents(body, &mut inner_out, &mut inner_seen);
+            for n in inner_out {
+                if seen.insert(n.clone()) { out.push(n); }
+            }
+        }
+        Expr::Number(_) | Expr::String(_) => {}
     }
 }
 

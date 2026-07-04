@@ -41,9 +41,8 @@ emit("foo", "P")
     assert_eq!(f.params[0], "event_name");
     assert_eq!(f.params[1], "event_data");
 
-    // Run the program; there is no built-in output, but ensure no panic and return Unit
-    let res = interp.run(&program).unwrap_or(Value::Unit);
-    match res { Value::Unit | Value::String(_) | Value::Bool(_) | Value::Number(_) | Value::List(_) | Value::Object(_) | Value::HostFunction(_) => {} }
+    // Run the program; there is no built-in output, but ensure no panic
+    let _res = interp.run(&program).unwrap_or(Value::Unit);
 }
 
 #[test]

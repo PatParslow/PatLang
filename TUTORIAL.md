@@ -187,6 +187,39 @@ end
 print(map_list([1, 2, 3], "double"))   # [2, 4, 6]
 ```
 
+`apply` calls a function *by name*; real closures — anonymous functions that
+capture surrounding variables — also exist:
+
+```patlang
+make a function called make_adder takes n returns r
+  return |x| { return x + n }     # captures n from the enclosing call
+end
+
+let add_three = make_adder(3)
+print(add_three(7))               # 10
+
+let inc = |x| { return x + 1 }
+make a function called twice takes f, x returns r
+  return f(f(x))                  # calling a closure held in a variable
+end
+print(twice(inc, 10))             # 12
+```
+
+Captured variables are snapshotted **by value** at the moment the closure is
+created — reassigning the outer variable afterwards does not change what an
+already-created closure sees, consistent with this language's value
+semantics everywhere else (`list_push` returning a new list rather than
+mutating in place, etc). Closures can be returned from functions, stored in
+variables, passed as arguments, and nested (a closure can itself return a
+closure that captures the outer one's variables).
+
+The self-hosted (Stage 1) dialect uses `|params| do ... end` instead of
+Stage 0's `|params| { ... }`, matching the rest of Stage 1's keyword-based
+block syntax (which has no brace-delimited blocks anywhere); it also only
+supports calling a closure through a named variable, not invoking a closure
+literal immediately in place (`(|x| { ... })(5)` — that works in Stage 0,
+not yet in the self-hosted compiler).
+
 ### Networking
 
 Blocking TCP built-ins: `tcp_listen(port)` (0 = OS-assigned; returns the

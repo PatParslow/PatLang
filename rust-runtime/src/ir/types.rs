@@ -22,6 +22,10 @@ pub enum Value {
     // Functions are closures with env; for Stage 0 keep them host-side only in the interpreter
     HostFunction(fn(&[Value]) -> Result<Value, String>),
     Object(HashMap<String, Value>),
+    // A closure value: the name of its synthesized Function (params =
+    // captured names ++ the closure's own params, in that order) plus the
+    // captured environment snapshotted at closure-creation time.
+    Closure { func_name: String, captured: Vec<(String, Value)> },
 }
 
 impl Value {
@@ -42,6 +46,7 @@ impl Value {
             Value::List(xs) => Ok(!xs.is_empty()),
             Value::Object(map) => Ok(!map.is_empty()),
             Value::HostFunction(_) => Ok(true),
+            Value::Closure { .. } => Ok(true),
         }
     }
 }
@@ -69,6 +74,14 @@ pub enum Instr {
     CallHost(String, usize), // name, arg_count
     // User function call by name
     Call(String, usize),     // function name, arg_count
+
+    // Closures: capture N values already on the stack (pushed via LoadLocal
+    // in the same order as captured_names) into a Value::Closure bound to
+    // func_name, whose params are captured_names ++ the closure's own params.
+    MakeClosure(String, Vec<String>), // func_name, captured_names
+    // Call a closure value: stack has [closure_value, arg0, .., argN-1]
+    // (closure pushed first, then args), argc = N.
+    CallValue(usize),
 
     // Collections
     BuildList(usize), // pop N items and push a list in original order

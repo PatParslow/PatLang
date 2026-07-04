@@ -284,3 +284,54 @@ fn stage1_multiline_lists_and_calls() {
     assert_eq!(printed.get(0).copied(), Some("len: 3"), "multi-line list: {}", stdout);
     assert_eq!(printed.get(1).copied(), Some("sum: 6"), "multi-line call args: {}", stdout);
 }
+
+#[test]
+fn stage1_closures_native() {
+    // Closures through the fully self-hosted pipeline (lexer, parser, lower,
+    // codegen all PatLang), compiled to a native executable: basic capture,
+    // a nested closure capturing its enclosing function's own parameter, and
+    // a closure passed as a higher-order argument.
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    if std::process::Command::new(&rustc).arg("--version").output().is_err() {
+        eprintln!("rustc not found; skipping");
+        return;
+    }
+    let out_dir = std::env::temp_dir().join("patlang_targets_test");
+    let _ = std::fs::create_dir_all(&out_dir);
+    let exe_path = out_dir.join(if cfg!(windows) { "closures_test.exe" } else { "closures_test" });
+
+    let program = "let add_five = |x| do\n  return x + 5\nend\n\
+        print(add_five(10))\n\n\
+        make a function called make_adder takes n returns r\n\
+          return |x| do\n    return x + n\n  end\n\
+        end\n\
+        let add_three = make_adder(3)\n\
+        print(add_three(7))\n\n\
+        make a function called twice takes f, x returns r\n\
+          return f(f(x))\n\
+        end\n\
+        let inc = |x| do\n  return x + 1\nend\n\
+        print(twice(inc, 10))\n";
+    let src_path = out_dir.join("closures_test.patlang");
+    std::fs::write(&src_path, program).expect("write program");
+
+    let driver = format!(
+        "let source = read_file(\"{}\")\n\
+         let toks = tokenize(source)\n\
+         let ast = parse_program(toks)\n\
+         let ir = lower_program(ast)\n\
+         let rs = emit_program_rs(ir)\n\
+         let exe = rustc_build(rs, \"{}\")\n\
+         print(\"COMPILED\")\n",
+        fwd(&src_path), fwd(&exe_path)
+    );
+    let lines = run_pipeline(&driver);
+    assert!(lines.iter().any(|l| l == "COMPILED"), "did not compile: {:?}", lines);
+
+    let out = std::process::Command::new(&exe_path).output().expect("run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let printed: Vec<&str> = stdout.lines().collect();
+    assert_eq!(printed.get(0).copied(), Some("15"), "basic closure: {}", stdout);
+    assert_eq!(printed.get(1).copied(), Some("10"), "nested closure capturing outer param: {}", stdout);
+    assert_eq!(printed.get(2).copied(), Some("12"), "closure as higher-order argument: {}", stdout);
+}

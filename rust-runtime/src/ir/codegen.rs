@@ -111,6 +111,7 @@ enum Value {
     String(String),
     List(Vec<Value>),
     Object(HashMap<String, Value>),
+    Closure { func_name: String, captured: Vec<(String, Value)> },
 }
 
 impl Value {
@@ -129,6 +130,7 @@ impl Value {
             Value::String(s) => Ok(!s.is_empty()),
             Value::List(xs) => Ok(!xs.is_empty()),
             Value::Object(map) => Ok(!map.is_empty()),
+            Value::Closure { .. } => Ok(true),
         }
     }
 }
@@ -149,6 +151,8 @@ enum Instr {
     JumpIfFalse(usize),
     CallHost(String, usize),
     Call(String, usize),
+    MakeClosure(String, Vec<String>),
+    CallValue(usize),
     BuildList(usize),
     Return,
 }
@@ -985,6 +989,16 @@ impl Host {
                         "JumpIfFalse" => Instr::JumpIfFalse(snum(xs, 1)? as usize),
                         "CallHost" => Instr::CallHost(st(xs, 1)?, snum(xs, 2)? as usize),
                         "Call" => Instr::Call(st(xs, 1)?, snum(xs, 2)? as usize),
+                        "MakeClosure" => {
+                            let func_name = st(xs, 1)?;
+                            let names_list = sl(xs.get(2).ok_or("run_ir: MakeClosure missing captured names")?)?;
+                            let mut captured_names = Vec::with_capacity(names_list.len());
+                            for nv in names_list {
+                                captured_names.push(match nv { Value::String(s) => s.clone(), _ => return Err("run_ir: captured name must be a string".into()) });
+                            }
+                            Instr::MakeClosure(func_name, captured_names)
+                        }
+                        "CallValue" => Instr::CallValue(snum(xs, 1)? as usize),
                         "BuildList" => Instr::BuildList(snum(xs, 1)? as usize),
                         _ => Instr::Return,
                     })
@@ -1315,6 +1329,7 @@ fn display_value(v: &Value) -> String {
             kvs.sort();
             format!("{{{}}}", kvs.join(", "))
         }
+        Value::Closure { .. } => "<closure>".into(),
     }
 }
 
@@ -1492,6 +1507,30 @@ fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Va
                 let callee = program.functions.get(n).ok_or_else(|| format!("function '{}' not found", n))?;
                 let r = run_function(program, callee, &args)?; stack.push(r);
             }
+            Instr::MakeClosure(func_name, captured_names) => {
+                let n = captured_names.len();
+                if stack.len() < n { return Err("stack underflow".into()); }
+                let start = stack.len() - n;
+                let vals: Vec<Value> = stack.drain(start..).collect();
+                let captured: Vec<(String, Value)> = captured_names.iter().cloned().zip(vals).collect();
+                stack.push(Value::Closure { func_name: func_name.clone(), captured });
+            }
+            Instr::CallValue(argc) => {
+                let argc = *argc; if stack.len() < argc { return Err("stack underflow".into()); }
+                let args_index = stack.len() - argc;
+                let call_args: Vec<Value> = stack.drain(args_index..).collect();
+                let callee_val = stack.pop().ok_or("stack underflow")?;
+                match callee_val {
+                    Value::Closure { func_name, captured } => {
+                        let mut full_args: Vec<Value> = captured.into_iter().map(|(_, v)| v).collect();
+                        full_args.extend(call_args);
+                        let callee = program.functions.get(&func_name).ok_or_else(|| format!("function '{}' not found", func_name))?;
+                        let r = run_function(program, callee, &full_args)?;
+                        stack.push(r);
+                    }
+                    other => return Err(format!("cannot call non-closure value: {:?}", other)),
+                }
+            }
             Instr::BuildList(n) => { let n=*n; if stack.len()<n {return Err("stack underflow".into());} let start=stack.len()-n; let items: Vec<Value>=stack.drain(start..).collect(); stack.push(Value::List(items)); }
             Instr::Return => { return Ok(stack.pop().unwrap_or(Value::Unit)); }
         }
@@ -1542,7 +1581,7 @@ fn cmp(k:&BinOpKind,a:&Value,b:&Value)->Result<Value,String>{
     };
     Ok(Value::Bool(res))
 }
-fn to_s(v:&Value)->String{ match v { Value::Unit=>String::new(), Value::Bool(b)=>b.to_string(), Value::Number(n)=> if n.fract()==0.0 {format!("{}",*n as i64)} else {n.to_string()}, Value::String(s)=>s.clone(), Value::List(xs)=>{ let parts:Vec<String>=xs.iter().map(|x|to_s(x)).collect(); format!("[{}]", parts.join(", ")) }, Value::Object(map)=>{ let mut kvs:Vec<String>=map.iter().map(|(k,v)| format!("{}: {}",k,to_s(v))).collect(); kvs.sort(); format!("{{{}}}", kvs.join(", ")) } } }
+fn to_s(v:&Value)->String{ match v { Value::Unit=>String::new(), Value::Bool(b)=>b.to_string(), Value::Number(n)=> if n.fract()==0.0 {format!("{}",*n as i64)} else {n.to_string()}, Value::String(s)=>s.clone(), Value::List(xs)=>{ let parts:Vec<String>=xs.iter().map(|x|to_s(x)).collect(); format!("[{}]", parts.join(", ")) }, Value::Object(map)=>{ let mut kvs:Vec<String>=map.iter().map(|(k,v)| format!("{}: {}",k,to_s(v))).collect(); kvs.sort(); format!("{{{}}}", kvs.join(", ")) }, Value::Closure{..} => "<closure>".to_string() } }
 
 fn main(){
     let program = build_program();
@@ -1623,6 +1662,11 @@ fn main(){
             Instr::Call(n, argc) => {
                 out.push_str(&format!("Instr::Call(\"{}\".to_string(), {})", rust_str(n), argc));
             }
+            Instr::MakeClosure(name, captured) => {
+                let names = captured.iter().map(|c| format!("\"{}\".to_string()", rust_str(c))).collect::<Vec<_>>().join(", ");
+                out.push_str(&format!("Instr::MakeClosure(\"{}\".to_string(), vec![{}])", rust_str(name), names));
+            }
+            Instr::CallValue(argc) => out.push_str(&format!("Instr::CallValue({})", argc)),
             Instr::BuildList(n) => out.push_str(&format!("Instr::BuildList({})", n)),
             Instr::Return => out.push_str("Instr::Return"),
         }
@@ -1665,6 +1709,11 @@ fn main(){
                 }
             }
             Value::HostFunction(_) => { out.push_str("Value::Unit"); }
+            Value::Closure { .. } => {
+                // Closures are always created at runtime via MakeClosure, never
+                // as a Const literal; a lowerer that emits one is a bug.
+                panic!("emit_value: closures cannot appear as compile-time constants");
+            }
         }
     }
 }
