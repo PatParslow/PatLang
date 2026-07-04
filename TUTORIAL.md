@@ -7,7 +7,8 @@ the test suite.
 
 ## 1. Build the runtime
 
-You need a Rust toolchain (`rustc`/`cargo`).
+You need a Rust toolchain (`rustc`/`cargo`) for this one step only. This is
+the bootstrap: it builds the `pat` binary once, from `rust-runtime/` source.
 
 ```bash
 cd rust-runtime
@@ -21,6 +22,15 @@ repository root; alias it if you like:
 ```bash
 alias pat=./rust-runtime/target/debug/pat
 ```
+
+After this one-time build, `rustc` is no longer required for normal PatLang
+development. `pat --ir-run <file>` — the form used throughout this tutorial —
+lexes, parses, lowers, and executes a program directly on the VM (the same
+`run_ir` mechanism the in-browser playground uses), with zero further calls to
+`rustc`. The Rust toolchain only comes back into play if you deliberately ask
+for a standalone native/WASM binary (`pat --patc`, or a tool that calls
+`rustc_build`, like the portfolio builder or `patbuild --native`) — that's an
+opt-in, occasional step, not part of the everyday edit-run loop.
 
 ## 2. Your first program
 
