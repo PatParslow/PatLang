@@ -306,9 +306,20 @@ pub fn host_read_file_b64(args: &[Value]) -> Result<Value, String> {
 pub fn host_exec_capture(args: &[Value]) -> Result<Value, String> {
     // exec_capture(path) -> stdout of running the program (no arguments).
     // Builder-side host for capturing native transcripts of compiled demos.
+    // If the process exits with failure (e.g. an unhandled contract
+    // violation), stderr is appended too, so transcripts of intentionally
+    // failing demos still show the violation message.
     let p = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => return Err("exec_capture: expected program path".into()) };
     let out = std::process::Command::new(&p).output().map_err(|e| format!("exec_capture: {}: {}", p, e))?;
-    Ok(Value::String(String::from_utf8_lossy(&out.stdout).to_string()))
+    let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        if !err.trim().is_empty() {
+            if !text.is_empty() && !text.ends_with('\n') { text.push('\n'); }
+            text.push_str(&err);
+        }
+    }
+    Ok(Value::String(text))
 }
 
 pub fn host_argv(args: &[Value]) -> Result<Value, String> {
@@ -996,6 +1007,30 @@ pub fn host_tcp_close(args: &[Value]) -> Result<Value, String> {
     Ok(Value::Unit)
 }
 
+/// contract_check(func_name, kind, text, ok) — the shared design-by-contract
+/// enforcement primitive. `kind` is "require" | "ensure" | "assert". This is a
+/// VM-level semantic: it behaves identically whether the program is
+/// interpreted, executed via run_ir (no rustc — e.g. the browser playground),
+/// or compiled natively, because the same logic is duplicated verbatim into
+/// the codegen template's host arm.
+pub fn host_contract_check(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 4 { return Err("contract_check: expected 4 args".into()); }
+    let func = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
+    let kind = match &args[1] { Value::String(s) => s.clone(), _ => String::new() };
+    let text = match &args[2] { Value::String(s) => s.clone(), _ => String::new() };
+    let ok = args[3].as_bool().unwrap_or(false);
+    if ok {
+        Ok(Value::Unit)
+    } else {
+        let label = match kind.as_str() {
+            "require" => "precondition",
+            "ensure" => "postcondition",
+            _ => "assertion",
+        };
+        Err(format!("contract violation: {} failed in {}(): {}", label, func, text))
+    }
+}
+
 fn playground_print(args: &[Value]) -> Result<Value, String> {
     if let Some(v) = args.get(0) {
         println!("{}", display_value(v));
@@ -1050,6 +1085,7 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("compile_shape", host_compile_shape);
     interp.host.insert("compile_ir", host_compile_ir);
     interp.host.insert("run_ir", host_run_ir);
+    interp.host.insert("contract_check", host_contract_check);
     interp.host.insert("codegen_prelude", host_codegen_prelude);
     interp.host.insert("rustc_build", host_rustc_build);
     // OO + logic hosts (state shared per thread, matching compiled semantics)

@@ -208,6 +208,12 @@ impl<'a> Parser<'a> {
                         while !matches!(self.curr, Token::Newline | Token::EOF) { self.advance()?; }
                         return Ok(Stmt::ExprStmt(Expr::String(String::new())));
                     }
+                    // Design-by-contract: require/ensure/assert EXPR
+                    if curr_lc == "require" || curr_lc == "ensure" || curr_lc == "assert" {
+                        self.advance()?; // consume the keyword
+                        let expr = self.parse_expression(0)?;
+                        return Ok(Stmt::Assert { kind: curr_lc, expr });
+                    }
                     // DSL sugar: make a function called Name { ... }
                     if curr_lc == "make" {
                         if let Some(stmt) = self.parse_make_construct()? { return Ok(stmt); }
