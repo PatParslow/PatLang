@@ -118,3 +118,32 @@ end
 print(factorial(5))
 print(factorial(0))
 ```
+
+Second worked example, showing list iteration with a `while` loop (never a
+`for` loop) and building up a running result:
+```
+make a function called sum_list takes xs returns total
+  let total = 0
+  let i = 0
+  while i < xs.length do
+    let total = total + xs[i]
+    let i = i + 1
+  end
+  return total
+end
+
+make a function called max_list takes xs returns best
+  let best = xs[0]
+  let i = 1
+  while i < xs.length do
+    if xs[i] > best then
+      let best = xs[i]
+    end
+    let i = i + 1
+  end
+  return best
+end
+
+print(sum_list([1, 2, 3, 4]))
+print(max_list([3, 7, 2, 9, 4]))
+```
