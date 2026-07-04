@@ -327,13 +327,15 @@ pub fn host_read_file_b64(args: &[Value]) -> Result<Value, String> {
 }
 
 pub fn host_exec_capture(args: &[Value]) -> Result<Value, String> {
-    // exec_capture(path) -> stdout of running the program (no arguments).
+    // exec_capture(path, [arg1, arg2, ...]) -> stdout of running the program.
+    // Trailing string args (if any) are passed through as argv to the child.
     // Builder-side host for capturing native transcripts of compiled demos.
     // If the process exits with failure (e.g. an unhandled contract
     // violation), stderr is appended too, so transcripts of intentionally
     // failing demos still show the violation message.
     let p = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => return Err("exec_capture: expected program path".into()) };
-    let out = std::process::Command::new(&p).output().map_err(|e| format!("exec_capture: {}: {}", p, e))?;
+    let extra: Vec<String> = args[1..].iter().filter_map(|v| match v { Value::String(s) => Some(s.clone()), _ => None }).collect();
+    let out = std::process::Command::new(&p).args(&extra).output().map_err(|e| format!("exec_capture: {}: {}", p, e))?;
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
