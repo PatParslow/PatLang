@@ -901,7 +901,12 @@ impl Host {
                 if let Some(parent) = std::path::Path::new(&out).parent() { let _ = std::fs::create_dir_all(parent); }
                 let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
                 let mut cmd = std::process::Command::new(&rustc);
-                cmd.arg("-O").arg(&src_path).arg("-o").arg(&out);
+                // Size-optimize + strip WASM builds (measured ~7x smaller, faster
+                // to compile, byte-identical stdout); native keeps full -O.
+                let is_wasm = target.as_deref().map(|t| t.contains("wasm")).unwrap_or(false);
+                if is_wasm { cmd.arg("-C").arg("opt-level=z"); } else { cmd.arg("-O"); }
+                cmd.arg("-C").arg("strip=symbols");
+                cmd.arg(&src_path).arg("-o").arg(&out);
                 if let Some(t) = &target { cmd.arg("--target").arg(t); }
                 let status = cmd.status().map_err(|e| format!("rustc_build: failed to run rustc: {}", e))?;
                 if !status.success() { return Err(format!("rustc_build: rustc failed with status {}", status)); }
@@ -1126,6 +1131,16 @@ impl Host {
                 let p = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
                 let exists = std::path::Path::new(&p).exists();
                 Ok(Value::String(if exists { "1".into() } else { "0".into() }))
+            }
+            "hash_string" => {
+                // hash_string(s) -> lowercase hex FNV-1a 64-bit digest
+                let s = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
+                let mut hash: u64 = 0xcbf29ce484222325;
+                for b in s.as_bytes() {
+                    hash ^= *b as u64;
+                    hash = hash.wrapping_mul(0x100000001b3);
+                }
+                Ok(Value::String(format!("{:016x}", hash)))
             }
             "infer_type_for" => {
                 // args: pred, index, class
