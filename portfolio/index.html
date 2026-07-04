@@ -165,10 +165,10 @@ print(&quot;total: &quot; + (t5 - t0) + &quot; ms&quot;)
 <p><button onclick='runCard("bench")'>Compile and run in this browser</button> <span class='ms' id='ms-bench'></span></p>
 <pre class='out' id='out-bench'>(not run yet)</pre>
 <p class='label'>Native run on the build machine:</p>
-<pre class='out native'>fib(27) = 196418  [222 ms]
-sum 1..2000000 = 2000001000000  [545 ms]
-built vector of 200000  [64 ms]
-total: 831 ms
+<pre class='out native'>fib(27) = 196418  [201 ms]
+sum 1..2000000 = 2000001000000  [615 ms]
+built vector of 200000  [66 ms]
+total: 882 ms
 
 </pre>
 </div>
@@ -743,25 +743,57 @@ IR runtime error: contract violation: precondition failed in safe_divide(): (Var
 </div>
 <div class='card'>
 <h2>Project report writer (goal-oriented)</h2>
-<p>Writing the abstract requires every other section to exist first, and several sections have real sub-tasks of their own with their own delegated workers, gated by a QA review stage &mdash; a dependency DAG resolved goal by goal, not a linear chain (<code>lit_review</code> and <code>discussion</code> are each required twice, but only done once). <a href='report.html'>Watch it run as an animated timeline</a>, with each task delegated to a worker role and reviewed before it counts as done.</p>
+<p>Writing the abstract requires every other section to exist first, and several sections have real sub-tasks of their own with their own delegated workers, gated by a QA review stage &mdash; a dependency DAG resolved goal by goal, not a linear chain. Real projects aren't linear either: a review can fail and blame an earlier stage, reopening it and everything downstream that depended on it (design sent back to methodology, experiments back to implementation, data analysis requiring experiments to be re-run, and so on). <a href='report.html'>Watch it run as an animated timeline</a>, with failed reviews and rework shown in red.</p>
 <details><summary>PatLang source</summary><pre class='src'># Project report simulator: goal-oriented dependency resolution, with each
 # task delegated to a worker role (OO), gated by a QA review stage, and
-# timestamped on a virtual clock (a plain counter, not real wall-clock time -
-# the whole simulation still computes instantly) so a browser can replay the
-# schedule as an animated timeline. Logic (`fact`/`query`), events
-# (`when`/`emit`), and recursion all support the goal-oriented core.
+# timestamped on a virtual clock (a plain counter, not real wall-clock time)
+# so a browser can replay the schedule as an animated timeline. Real
+# projects aren't linear: a review can fail and blame an earlier stage,
+# which reopens it AND everything downstream that depended on it - design
+# might get sent back to methodology, experiments might get sent back to
+# implementation or methodology, data analysis might require experiments to
+# be re-run, and so on. Each task can only trigger this once itself
+# (attempts &lt; 1), so the whole simulation is guaranteed to converge no
+# matter how the dice land.
 
-make a function called task takes name, worker, duration, requires returns done
+# Tiny LCG (same constants as lib/maze.patlang's, duplicated rather than
+# shared since the two demos are otherwise unrelated) for the QA dice-roll.
+make a function called rand_seed takes seed returns done
+  let s = seed % 32768
+  if s &lt; 0 then
+    let s = s + 32768
+  end
+  set_var(&quot;rp_rand&quot;, s)
+  return true
+end
+
+make a function called rand_next returns r
+  let s = get(&quot;__vars&quot;, &quot;rp_rand&quot;)
+  let s2 = ((s * 1103) + 12345) % 32768
+  set_var(&quot;rp_rand&quot;, s2)
+  return s2
+end
+
+make a function called rand_below takes n returns r
+  return rand_next() % n
+end
+
+make a function called registry_init returns done
+  new(&quot;Registry&quot;, &quot;registry&quot;)
+  send(&quot;registry&quot;, &quot;set&quot;, &quot;names&quot;, [])
+  return true
+end
+
+make a function called task takes name, worker, duration, requires, rework_targets returns done
   new(&quot;Task&quot;, name)
   send(name, &quot;set&quot;, &quot;worker&quot;, worker)
   send(name, &quot;set&quot;, &quot;duration&quot;, duration)
   send(name, &quot;set&quot;, &quot;requires&quot;, requires)
+  send(name, &quot;set&quot;, &quot;rework_targets&quot;, rework_targets)
+  send(name, &quot;set&quot;, &quot;attempts&quot;, 0)
   send(name, &quot;set&quot;, &quot;status&quot;, &quot;pending&quot;)
+  send(&quot;registry&quot;, &quot;set&quot;, &quot;names&quot;, list_push(get(&quot;registry&quot;, &quot;names&quot;), name))
   return true
-end
-
-make a function called is_approved takes name returns yes
-  return get(name, &quot;status&quot;) == &quot;approved&quot;
 end
 
 make a function called vclock returns t
@@ -792,12 +824,46 @@ make a function called log_event takes phase, name, worker returns done
   return true
 end
 
-# Achieving a goal: make sure every requirement is already approved (facts),
-# recursing into whichever aren't yet; then delegate the work itself to its
-# assigned worker, and gate completion behind a QA review before the task
-# counts as done.
+# Marks a task (and, transitively, every task that required it, directly or
+# indirectly) as no longer approved, since their prior work assumed an input
+# that has just changed. A fixed-point relaxation over the whole registry -
+# cheap at this scale, and doesn't need a precomputed reverse-dependency map.
+make a function called reopen_cascade takes name returns done
+  send(name, &quot;set&quot;, &quot;status&quot;, &quot;pending&quot;)
+  let names = get(&quot;registry&quot;, &quot;names&quot;)
+  let changed = true
+  while changed do
+    let changed = false
+    let i = 0
+    while i &lt; names.length do
+      let t = names[i]
+      if get(t, &quot;status&quot;) != &quot;pending&quot; then
+        let reqs = get(t, &quot;requires&quot;)
+        let j = 0
+        let hit = false
+        while j &lt; reqs.length do
+          if get(reqs[j], &quot;status&quot;) == &quot;pending&quot; then
+            let hit = true
+          end
+          let j = j + 1
+        end
+        if hit then
+          send(t, &quot;set&quot;, &quot;status&quot;, &quot;pending&quot;)
+          let changed = true
+        end
+      end
+      let i = i + 1
+    end
+  end
+  return true
+end
+
+# Achieving a goal: make sure every requirement is already approved,
+# recursing into whichever aren't; delegate the work to its assigned
+# worker; then gate it behind a QA review, which - once per task, at
+# most - might fail and blame an earlier stage instead of approving it.
 make a function called achieve takes name returns done
-  if is_approved(name) then
+  if get(name, &quot;status&quot;) == &quot;approved&quot; then
     return true
   end
   goal(&quot;complete&quot;, name)
@@ -816,6 +882,25 @@ make a function called achieve takes name returns done
   send(name, &quot;set&quot;, &quot;status&quot;, &quot;in_review&quot;)
   log_event(&quot;review_start&quot;, name, &quot;qa&quot;)
   advance(review_time(duration))
+
+  let attempts = get(name, &quot;attempts&quot;)
+  let targets = get(name, &quot;rework_targets&quot;)
+  let should_fail = false
+  if (attempts &lt; 1) and (targets.length &gt; 0) then
+    if rand_below(100) &lt; 30 then
+      let should_fail = true
+    end
+  end
+
+  if should_fail then
+    let blame = targets[rand_below(targets.length)]
+    log_event(&quot;rework:&quot; + blame, name, &quot;qa&quot;)
+    send(name, &quot;set&quot;, &quot;attempts&quot;, attempts + 1)
+    reopen_cascade(blame)
+    emit(&quot;task_reworked&quot;, name + &quot;:&quot; + blame)
+    return achieve(name)
+  end
+
   log_event(&quot;review_done&quot;, name, &quot;qa&quot;)
   send(name, &quot;set&quot;, &quot;status&quot;, &quot;approved&quot;)
   fact(&quot;approved&quot;, name, &quot;1&quot;)
@@ -826,34 +911,41 @@ end
 make a function called report_reset returns done
   set_var(&quot;vt&quot;, 0)
   set_var(&quot;report_log&quot;, &quot;&quot;)
+  registry_init()
+  rand_seed(7)
   return true
 end
 
 # Project report writer (concatenate after lib/report.patlang). Writing the
 # abstract requires every other section to exist first, and several of
-# those have real sub-tasks of their own with their own workers: running
-# experiments, gathering data, and analysing it are distinct delegated
-# tasks, not just &quot;implementation&quot;. lit_review and discussion are each
-# required twice but only ever done once (memoized by the &quot;approved&quot; fact).
+# those have real sub-tasks of their own with their own workers. Real
+# projects aren't linear: a QA review can fail and blame an earlier stage -
+# design might get sent back to methodology, experiments to implementation
+# or methodology, data analysis might require experiments to be re-run -
+# reopening it and everything downstream that depended on it.
 
 report_reset()
 
-task(&quot;background&quot;, &quot;researcher&quot;, 400, [])
-task(&quot;intro&quot;, &quot;writer&quot;, 300, [&quot;background&quot;])
-task(&quot;lit_review&quot;, &quot;researcher&quot;, 600, [&quot;background&quot;])
-task(&quot;methodology&quot;, &quot;architect&quot;, 400, [&quot;intro&quot;, &quot;lit_review&quot;])
-task(&quot;design&quot;, &quot;architect&quot;, 500, [&quot;methodology&quot;])
-task(&quot;implementation&quot;, &quot;developer&quot;, 900, [&quot;design&quot;])
-task(&quot;experiments&quot;, &quot;researcher&quot;, 700, [&quot;implementation&quot;])
-task(&quot;data_gathering&quot;, &quot;researcher&quot;, 500, [&quot;experiments&quot;])
-task(&quot;data_analysis&quot;, &quot;analyst&quot;, 800, [&quot;data_gathering&quot;])
-task(&quot;results&quot;, &quot;analyst&quot;, 300, [&quot;data_analysis&quot;])
-task(&quot;discussion&quot;, &quot;writer&quot;, 600, [&quot;results&quot;, &quot;lit_review&quot;])
-task(&quot;limitations&quot;, &quot;writer&quot;, 300, [&quot;discussion&quot;])
-task(&quot;conclusion&quot;, &quot;writer&quot;, 300, [&quot;discussion&quot;, &quot;limitations&quot;])
-task(&quot;abstract&quot;, &quot;writer&quot;, 400, [&quot;background&quot;, &quot;intro&quot;, &quot;lit_review&quot;, &quot;methodology&quot;, &quot;design&quot;, &quot;implementation&quot;, &quot;experiments&quot;, &quot;data_gathering&quot;, &quot;data_analysis&quot;, &quot;results&quot;, &quot;discussion&quot;, &quot;limitations&quot;, &quot;conclusion&quot;])
+task(&quot;background&quot;, &quot;researcher&quot;, 400, [], [])
+task(&quot;intro&quot;, &quot;writer&quot;, 300, [&quot;background&quot;], [])
+task(&quot;lit_review&quot;, &quot;researcher&quot;, 600, [&quot;background&quot;], [])
+task(&quot;methodology&quot;, &quot;architect&quot;, 400, [&quot;intro&quot;, &quot;lit_review&quot;], [&quot;lit_review&quot;])
+task(&quot;design&quot;, &quot;architect&quot;, 500, [&quot;methodology&quot;], [&quot;methodology&quot;])
+task(&quot;implementation&quot;, &quot;developer&quot;, 900, [&quot;design&quot;], [&quot;design&quot;, &quot;methodology&quot;])
+task(&quot;experiments&quot;, &quot;researcher&quot;, 700, [&quot;implementation&quot;], [&quot;implementation&quot;, &quot;methodology&quot;])
+task(&quot;data_gathering&quot;, &quot;researcher&quot;, 500, [&quot;experiments&quot;], [&quot;experiments&quot;])
+task(&quot;data_analysis&quot;, &quot;analyst&quot;, 800, [&quot;data_gathering&quot;], [&quot;data_gathering&quot;, &quot;experiments&quot;])
+task(&quot;results&quot;, &quot;analyst&quot;, 300, [&quot;data_analysis&quot;], [&quot;data_analysis&quot;])
+task(&quot;discussion&quot;, &quot;writer&quot;, 600, [&quot;results&quot;, &quot;lit_review&quot;], [&quot;results&quot;])
+task(&quot;limitations&quot;, &quot;writer&quot;, 300, [&quot;discussion&quot;], [])
+task(&quot;conclusion&quot;, &quot;writer&quot;, 300, [&quot;discussion&quot;, &quot;limitations&quot;], [])
+task(&quot;abstract&quot;, &quot;writer&quot;, 400, [&quot;background&quot;, &quot;intro&quot;, &quot;lit_review&quot;, &quot;methodology&quot;, &quot;design&quot;, &quot;implementation&quot;, &quot;experiments&quot;, &quot;data_gathering&quot;, &quot;data_analysis&quot;, &quot;results&quot;, &quot;discussion&quot;, &quot;limitations&quot;, &quot;conclusion&quot;], [])
 
 let all_tasks = [&quot;background&quot;, &quot;intro&quot;, &quot;lit_review&quot;, &quot;methodology&quot;, &quot;design&quot;, &quot;implementation&quot;, &quot;experiments&quot;, &quot;data_gathering&quot;, &quot;data_analysis&quot;, &quot;results&quot;, &quot;discussion&quot;, &quot;limitations&quot;, &quot;conclusion&quot;, &quot;abstract&quot;]
+
+when task_reworked do
+  print(&quot;[&quot; + vclock() + &quot;ms] REWORK: &quot; + event_data + &quot; (qa review failed, sending it back)&quot;)
+end
 
 when task_done do
   print(&quot;[&quot; + vclock() + &quot;ms] approved: &quot; + event_data + &quot; (&quot; + get(event_data, &quot;worker&quot;) + &quot;, reviewed by qa)&quot;)
@@ -875,15 +967,19 @@ print(all_tasks.length + &quot; tasks approved across 5 worker roles + qa review
 [2950ms] approved: design (architect, reviewed by qa)
 [4075ms] approved: implementation (developer, reviewed by qa)
 [4950ms] approved: experiments (researcher, reviewed by qa)
-[5600ms] approved: data_gathering (researcher, reviewed by qa)
-[6600ms] approved: data_analysis (analyst, reviewed by qa)
-[7050ms] approved: results (analyst, reviewed by qa)
-[7800ms] approved: discussion (writer, reviewed by qa)
-[8250ms] approved: limitations (writer, reviewed by qa)
-[8700ms] approved: conclusion (writer, reviewed by qa)
-[9250ms] approved: abstract (writer, reviewed by qa)
+[5600ms] REWORK: data_gathering:experiments (qa review failed, sending it back)
+[6475ms] approved: experiments (researcher, reviewed by qa)
+[7125ms] approved: data_gathering (researcher, reviewed by qa)
+[8125ms] REWORK: data_analysis:data_gathering (qa review failed, sending it back)
+[8775ms] approved: data_gathering (researcher, reviewed by qa)
+[9775ms] approved: data_analysis (analyst, reviewed by qa)
+[10225ms] approved: results (analyst, reviewed by qa)
+[10975ms] approved: discussion (writer, reviewed by qa)
+[11425ms] approved: limitations (writer, reviewed by qa)
+[11875ms] approved: conclusion (writer, reviewed by qa)
+[12425ms] approved: abstract (writer, reviewed by qa)
 
-14 tasks approved across 5 worker roles + qa review, 9250ms of simulated (not real) time.
+14 tasks approved across 5 worker roles + qa review, 12425ms of simulated (not real) time.
 
 </pre>
 </div>
@@ -1523,10 +1619,10 @@ print(&quot;WROTE: gui_demo.html (&quot; + page.length + &quot; chars)&quot;)
 <h2>The compiler, measured on itself</h2>
 <p>The self-hosted compiler front+middle end processing its own complete source (186314 chars), run under the Stage 0 interpreter while building this page:</p>
 <ul>
-<li>tokenize: 34278 tokens in 2066 ms</li>
-<li>parse: 65 top-level statements in 712 ms</li>
-<li>lower: 64 functions in 4355 ms</li>
-<li>codegen: 1067832 chars of Rust in 5042 ms</li>
+<li>tokenize: 34278 tokens in 2089 ms</li>
+<li>parse: 65 top-level statements in 696 ms</li>
+<li>lower: 64 functions in 3837 ms</li>
+<li>codegen: 1067832 chars of Rust in 4826 ms</li>
 </ul>
 <p>The natively compiled compiler (patc1) runs the same front end roughly two orders of magnitude faster; rustc then dominates end-to-end compile time.</p>
 </div>

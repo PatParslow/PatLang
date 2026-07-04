@@ -1,21 +1,53 @@
 # Project report simulator: goal-oriented dependency resolution, with each
 # task delegated to a worker role (OO), gated by a QA review stage, and
-# timestamped on a virtual clock (a plain counter, not real wall-clock time -
-# the whole simulation still computes instantly) so a browser can replay the
-# schedule as an animated timeline. Logic (`fact`/`query`), events
-# (`when`/`emit`), and recursion all support the goal-oriented core.
+# timestamped on a virtual clock (a plain counter, not real wall-clock time)
+# so a browser can replay the schedule as an animated timeline. Real
+# projects aren't linear: a review can fail and blame an earlier stage,
+# which reopens it AND everything downstream that depended on it - design
+# might get sent back to methodology, experiments might get sent back to
+# implementation or methodology, data analysis might require experiments to
+# be re-run, and so on. Each task can only trigger this once itself
+# (attempts < 1), so the whole simulation is guaranteed to converge no
+# matter how the dice land.
 
-make a function called task takes name, worker, duration, requires returns done
+# Tiny LCG (same constants as lib/maze.patlang's, duplicated rather than
+# shared since the two demos are otherwise unrelated) for the QA dice-roll.
+make a function called rand_seed takes seed returns done
+  let s = seed % 32768
+  if s < 0 then
+    let s = s + 32768
+  end
+  set_var("rp_rand", s)
+  return true
+end
+
+make a function called rand_next returns r
+  let s = get("__vars", "rp_rand")
+  let s2 = ((s * 1103) + 12345) % 32768
+  set_var("rp_rand", s2)
+  return s2
+end
+
+make a function called rand_below takes n returns r
+  return rand_next() % n
+end
+
+make a function called registry_init returns done
+  new("Registry", "registry")
+  send("registry", "set", "names", [])
+  return true
+end
+
+make a function called task takes name, worker, duration, requires, rework_targets returns done
   new("Task", name)
   send(name, "set", "worker", worker)
   send(name, "set", "duration", duration)
   send(name, "set", "requires", requires)
+  send(name, "set", "rework_targets", rework_targets)
+  send(name, "set", "attempts", 0)
   send(name, "set", "status", "pending")
+  send("registry", "set", "names", list_push(get("registry", "names"), name))
   return true
-end
-
-make a function called is_approved takes name returns yes
-  return get(name, "status") == "approved"
 end
 
 make a function called vclock returns t
@@ -46,12 +78,46 @@ make a function called log_event takes phase, name, worker returns done
   return true
 end
 
-# Achieving a goal: make sure every requirement is already approved (facts),
-# recursing into whichever aren't yet; then delegate the work itself to its
-# assigned worker, and gate completion behind a QA review before the task
-# counts as done.
+# Marks a task (and, transitively, every task that required it, directly or
+# indirectly) as no longer approved, since their prior work assumed an input
+# that has just changed. A fixed-point relaxation over the whole registry -
+# cheap at this scale, and doesn't need a precomputed reverse-dependency map.
+make a function called reopen_cascade takes name returns done
+  send(name, "set", "status", "pending")
+  let names = get("registry", "names")
+  let changed = true
+  while changed do
+    let changed = false
+    let i = 0
+    while i < names.length do
+      let t = names[i]
+      if get(t, "status") != "pending" then
+        let reqs = get(t, "requires")
+        let j = 0
+        let hit = false
+        while j < reqs.length do
+          if get(reqs[j], "status") == "pending" then
+            let hit = true
+          end
+          let j = j + 1
+        end
+        if hit then
+          send(t, "set", "status", "pending")
+          let changed = true
+        end
+      end
+      let i = i + 1
+    end
+  end
+  return true
+end
+
+# Achieving a goal: make sure every requirement is already approved,
+# recursing into whichever aren't; delegate the work to its assigned
+# worker; then gate it behind a QA review, which - once per task, at
+# most - might fail and blame an earlier stage instead of approving it.
 make a function called achieve takes name returns done
-  if is_approved(name) then
+  if get(name, "status") == "approved" then
     return true
   end
   goal("complete", name)
@@ -70,6 +136,25 @@ make a function called achieve takes name returns done
   send(name, "set", "status", "in_review")
   log_event("review_start", name, "qa")
   advance(review_time(duration))
+
+  let attempts = get(name, "attempts")
+  let targets = get(name, "rework_targets")
+  let should_fail = false
+  if (attempts < 1) and (targets.length > 0) then
+    if rand_below(100) < 30 then
+      let should_fail = true
+    end
+  end
+
+  if should_fail then
+    let blame = targets[rand_below(targets.length)]
+    log_event("rework:" + blame, name, "qa")
+    send(name, "set", "attempts", attempts + 1)
+    reopen_cascade(blame)
+    emit("task_reworked", name + ":" + blame)
+    return achieve(name)
+  end
+
   log_event("review_done", name, "qa")
   send(name, "set", "status", "approved")
   fact("approved", name, "1")
@@ -80,5 +165,7 @@ end
 make a function called report_reset returns done
   set_var("vt", 0)
   set_var("report_log", "")
+  registry_init()
+  rand_seed(7)
   return true
 end
