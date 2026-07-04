@@ -996,6 +996,26 @@ pub fn host_tcp_close(args: &[Value]) -> Result<Value, String> {
     Ok(Value::Unit)
 }
 
+fn playground_print(args: &[Value]) -> Result<Value, String> {
+    if let Some(v) = args.get(0) {
+        println!("{}", display_value(v));
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    }
+    Ok(Value::Unit)
+}
+
+/// run_ir(ir_shape) -> executes a freshly lowered IR shape on a nested
+/// interpreter with the standard hosts. The playground back end: no rustc.
+pub fn host_run_ir(args: &[Value]) -> Result<Value, String> {
+    let shape = args.get(0).ok_or("run_ir: expected IR shape")?;
+    let program = ir_shape_to_program(shape)?;
+    let mut interp = Interpreter::new();
+    interp.host.insert("print", playground_print);
+    register_stage0_shims(&mut interp);
+    interp.run(&program).map(|_| Value::Unit).map_err(|e| format!("run_ir: {}", e))
+}
+
 /// Register the Stage 0 string/list/file shims on an interpreter.
 pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("len", host_len);
@@ -1029,6 +1049,7 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("exec_capture", host_exec_capture);
     interp.host.insert("compile_shape", host_compile_shape);
     interp.host.insert("compile_ir", host_compile_ir);
+    interp.host.insert("run_ir", host_run_ir);
     interp.host.insert("codegen_prelude", host_codegen_prelude);
     interp.host.insert("rustc_build", host_rustc_build);
     // OO + logic hosts (state shared per thread, matching compiled semantics)
