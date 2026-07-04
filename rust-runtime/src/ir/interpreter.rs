@@ -123,6 +123,32 @@ impl Interpreter {
                     let ret = self.run_function(program, callee, &argsv)?;
                     stack.push(ret);
                 }
+                Instr::MakeClosure(func_name, captured_names) => {
+                    let n = captured_names.len();
+                    if stack.len() < n { return Err("stack underflow".into()); }
+                    let start = stack.len() - n;
+                    let vals: Vec<Value> = stack.drain(start..).collect();
+                    let captured: Vec<(String, Value)> = captured_names.iter().cloned().zip(vals).collect();
+                    stack.push(Value::Closure { func_name: func_name.clone(), captured });
+                }
+                Instr::CallValue(argc) => {
+                    let argc = *argc;
+                    if stack.len() < argc { return Err("stack underflow".into()); }
+                    let args_index = stack.len() - argc;
+                    let call_args: Vec<Value> = stack.drain(args_index..).collect();
+                    let callee_val = stack.pop().ok_or("stack underflow")?;
+                    match callee_val {
+                        Value::Closure { func_name, captured } => {
+                            let mut full_args: Vec<Value> = captured.into_iter().map(|(_, v)| v).collect();
+                            full_args.extend(call_args);
+                            let callee = program.functions.get(&func_name)
+                                .ok_or_else(|| format!("function '{}' not found", func_name))?;
+                            let ret = self.run_function(program, callee, &full_args)?;
+                            stack.push(ret);
+                        }
+                        other => return Err(format!("cannot call non-closure value: {:?}", other)),
+                    }
+                }
                 Instr::BuildList(n) => {
                     let n = *n;
                     if stack.len() < n { return Err("stack underflow".into()); }

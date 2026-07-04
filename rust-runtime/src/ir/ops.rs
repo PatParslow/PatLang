@@ -81,6 +81,7 @@ fn v_to_string(v: &Value) -> String {
             format!("[{}]", parts.join(", "))
         }
         Value::HostFunction(_) => "<hostfn>".into(),
+        Value::Closure { .. } => "<closure>".into(),
         Value::Object(map) => {
             let mut kvs: Vec<String> = map.iter().map(|(k, v)| format!("{}: {}", k, v_to_string(v))).collect();
             kvs.sort();

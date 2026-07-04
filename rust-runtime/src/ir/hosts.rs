@@ -16,6 +16,7 @@ fn display_value(v: &Value) -> String {
             format!("[{}]", parts.join(", "))
         }
         Value::HostFunction(_) => "<hostfn>".into(),
+        Value::Closure { .. } => "<closure>".into(),
         Value::Object(map) => {
             let mut kvs: Vec<String> = map.iter().map(|(k, v)| format!("{}: {}", k, display_value(v))).collect();
             kvs.sort();
@@ -832,6 +833,16 @@ fn decode_ir_instr(v: &Value) -> Result<Instr, String> {
         "JumpIfFalse" => Instr::JumpIfFalse(shape_num(xs, 1, "jump target")? as usize),
         "CallHost" => Instr::CallHost(shape_str(xs, 1, "host name")?, shape_num(xs, 2, "argc")? as usize),
         "Call" => Instr::Call(shape_str(xs, 1, "function name")?, shape_num(xs, 2, "argc")? as usize),
+        "MakeClosure" => {
+            let func_name = shape_str(xs, 1, "closure func name")?;
+            let names_list = shape_stmt_list(xs, 2, "in MakeClosure")?;
+            let mut captured_names = Vec::with_capacity(names_list.len());
+            for nv in names_list {
+                captured_names.push(match nv { Value::String(s) => s.clone(), _ => return Err("compile_ir: captured name must be a string".into()) });
+            }
+            Instr::MakeClosure(func_name, captured_names)
+        }
+        "CallValue" => Instr::CallValue(shape_num(xs, 1, "argc")? as usize),
         "BuildList" => Instr::BuildList(shape_num(xs, 1, "count")? as usize),
         "Return" => Instr::Return,
         other => return Err(format!("compile_ir: unknown instruction '{}'", other)),

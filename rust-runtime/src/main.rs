@@ -305,6 +305,7 @@ fn display_value(v: &Value) -> String {
             format!("[{}]", parts.join(", "))
         }
         Value::HostFunction(_) => "<hostfn>".into(),
+        Value::Closure { .. } => "<closure>".into(),
         Value::Object(map) => {
             let mut kvs: Vec<String> = map.iter().map(|(k, v)| format!("{}: {}", k, display_value(v))).collect();
             kvs.sort();

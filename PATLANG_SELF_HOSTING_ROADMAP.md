@@ -2,6 +2,45 @@
 
 This document outlines the pragmatic next steps to reach self-hosting by leveraging the existing PatLang implementations of the lexer, parser, and evaluator, while keeping Stage 0 semantics small and focused.
 
+## status update (July 4, 2026): closures
+
+Real closures landed in both Stage 0 (Rust) and Stage 1 (self-hosted):
+
+- `Value::Closure { func_name, captured }` — a closure value is a synthesized
+  function name plus a snapshot of its captured environment. `Instr::MakeClosure`
+  bundles N stack values (pushed via `LoadLocal`) into a closure; `Instr::CallValue`
+  pops a closure value plus call args and dispatches to the synthesized function
+  (captured values become its leading hidden parameters).
+- Stage 0 (`rust-runtime/src/ir/lowering.rs`): a real free-variable analysis
+  (`collect_referenced_idents`/`collect_let_bound_names`) walks a closure
+  literal's body, intersects referenced identifiers with the enclosing
+  `known_locals`, and captures exactly those — including transitively through
+  nested closures. `Expr::Call` on an identifier now disambiguates three ways:
+  known top-level function → `Call`, known local variable → `CallValue`
+  (dynamic dispatch through whatever closure value it holds), otherwise → `CallHost`.
+- Stage 1 (`self_hosting/lib/*.patlang`): same design, simplified — rather than
+  precise free-variable analysis, a closure captures its *entire* enclosing
+  locals list (over-capture). This is correct by construction given the flat
+  per-call locals map already used throughout: a closure's own `let` of a
+  same-named variable just overwrites the pre-bound captured slot, which is
+  exactly the intended shadowing behaviour, so no exclusion logic is needed.
+  `locals` and a `pending` (synthesized closure functions) vec are threaded
+  as extra parameters through `lower_expr`/`lower_stmt`/`lower_block`.
+  Closure syntax is `|params| do body end` (not Stage 0's `{ }`), matching
+  Stage 1's brace-free block convention everywhere else; immediately-invoked
+  closure literals aren't supported yet (the `Call` AST node assumes a
+  string callee name — calling through a named variable holding a closure
+  works fine).
+- Verified end-to-end: interpreted, compiled natively (rustc) via both the
+  Stage 0 and Stage 1 codegen paths — nested closures capturing an
+  enclosing function's own parameter, closures as higher-order arguments,
+  and value-semantics capture snapshots (reassigning the outer variable
+  after closure creation doesn't change what the closure sees). Regression
+  tests: `rust-runtime/tests/closures.rs` (Stage 0, 6 tests) and
+  `selfhost_targets.rs::stage1_closures_native` (Stage 1).
+- Prelude regenerated (`Value`/`Instr` enum additions + VM loop are part of
+  the fixed runtime text baked into every emitted program).
+
 ## status update (July 4, 2026): design by contract + dev-tool portfolio wiring
 
 **Design by contract** (`require`/`ensure`/`assert`) landed as a genuine
