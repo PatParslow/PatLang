@@ -335,3 +335,62 @@ fn stage1_closures_native() {
     assert_eq!(printed.get(1).copied(), Some("10"), "nested closure capturing outer param: {}", stdout);
     assert_eq!(printed.get(2).copied(), Some("12"), "closure as higher-order argument: {}", stdout);
 }
+
+#[test]
+fn event_loop_closures_serve_and_stop() {
+    // lib/event_loop.patlang: a JS-style event loop where callbacks are
+    // ordinary closures (registered via event_loop_on_tick/event_loop_listen)
+    // rather than the when/emit + set_var/get global-dispatch pattern. The
+    // on_tick closure mutates shared state through the object store (captured
+    // by name, so mutation is visible across calls despite closures snapshotting
+    // captured values); on_request calls event_loop_stop(loop) from inside
+    // itself once two requests are served, ending event_loop_run's while loop.
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    if std::process::Command::new(&rustc).arg("--version").output().is_err() {
+        eprintln!("rustc not found; skipping event loop test");
+        return;
+    }
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let read = |rel: &str| std::fs::read_to_string(format!("{}/../self_hosting/{}", manifest, rel)).expect("read");
+    let out_dir = std::env::temp_dir().join("patlang_targets_test");
+    let _ = std::fs::create_dir_all(&out_dir);
+    let exe_path = out_dir.join(if cfg!(windows) { "event_loop_demo.exe" } else { "event_loop_demo" });
+
+    let program_src = format!("{}\n{}", read("lib/event_loop.patlang"), read("examples/event_loop_demo.patlang"));
+    let src_path = out_dir.join("event_loop_all.patlang");
+    std::fs::write(&src_path, &program_src).expect("write combined event loop source");
+    let driver = format!(
+        "let source = read_file(\"{}\")\n\
+         let toks = tokenize(source)\n\
+         let ast = parse_program(toks)\n\
+         let ir = lower_program(ast)\n\
+         let rs = emit_program_rs(ir)\n\
+         let exe = rustc_build(rs, \"{}\")\n\
+         print(\"COMPILED\")\n",
+        fwd(&src_path), fwd(&exe_path)
+    );
+    let lines = run_pipeline(&driver);
+    assert!(lines.iter().any(|l| l == "COMPILED"), "event loop demo did not compile: {:?}", lines);
+
+    use std::io::{BufRead, BufReader, Read, Write};
+    let mut child = std::process::Command::new(&exe_path)
+        .stdout(std::process::Stdio::piped())
+        .spawn().expect("spawn event loop demo");
+    let stdout = child.stdout.take().expect("child stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut first = String::new();
+    reader.read_line(&mut first).expect("read PORT line");
+    let port: u16 = first.trim().strip_prefix("PORT: ").expect("PORT line").parse().expect("port");
+
+    for path in ["/first", "/second"] {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        write!(stream, "GET {} HTTP/1.1\r\nHost: localhost\r\n\r\n", path).expect("send");
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).expect("read");
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "bad response: {}", resp);
+        assert!(resp.contains(&format!("GET {} HTTP/1.1", path)), "echo missing: {}", resp);
+    }
+
+    let status = child.wait().expect("event loop demo exit");
+    assert!(status.success(), "event loop demo exited with {:?}", status);
+}

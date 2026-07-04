@@ -266,6 +266,41 @@ end
 The complete program is `self_hosting/examples/event_loop_server.patlang` —
 it compiles natively and serves real HTTP requests while counting idle ticks.
 
+**`lib/event_loop.patlang`** wraps the same primitives in a reusable library
+with closure callbacks instead of named events and a shared `__vars`
+namespace:
+
+```patlang
+let loop = event_loop_new()
+new("Stats", "stats")
+send("stats", "set", "served", 0)
+
+event_loop_on_tick(loop, || do
+  print("idle")
+end)
+
+event_loop_listen(loop, tcp_listen(0), |conn| do
+  let served = get("stats", "served") + 1
+  send("stats", "set", "served", served)
+  tcp_write(conn, "...")
+  tcp_close(conn)
+  if served >= 2 then
+    event_loop_stop(loop)     # called from inside the callback itself
+  end
+end)
+
+print("PORT: " + get(loop, "port"))
+event_loop_run(loop, 50)       # blocks until event_loop_stop
+```
+
+Closures snapshot captured variables by value, so a counter that must
+persist across many calls (like `served` above) lives in the object store
+(a mutable cell) rather than a captured plain variable — the closure
+captures the object's *name*, and mutates through it via `get`/`send`,
+which is visible on every call. `self_hosting/examples/event_loop_demo.patlang`
+is the full version, compiled through the self-hosted pipeline; it serves
+two real requests then stops itself.
+
 ### Files
 
 `read_file(path)` returns a file's contents as a string.
