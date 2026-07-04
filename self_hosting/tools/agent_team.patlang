@@ -1,0 +1,177 @@
+# AI dev team: four agents (orchestrator, designer, coder, tester), each a
+# local Ollama model with a distinct role, collaborating to write and
+# verify a small PatLang program. Run with:
+#   pat --ir-run self_hosting/tools/agent_team.patlang
+#
+# Paradigms:
+#   - object-oriented: each agent is a named object (new/send/get) with a
+#     model and a system prompt, not a dispatch-on-string function.
+#   - goal-oriented: the same shape as examples/report_demo.patlang's
+#     worker-delegation-plus-QA-review model, except the "QA reviewer" here
+#     is a REAL judge - pat.exe actually running the code - not a coin
+#     flip, and the "workers" are real LLM calls, not simulated durations.
+#   - event-driven: stage transitions (brief_ready, design_ready, etc.) are
+#     reported through when/emit, mirroring the report/chat demos' style.
+#   - functional-ish: prompts and file paths are built by small pure
+#     transforms, not string-mashed inline everywhere.
+#
+# Safety note: this executes LLM-GENERATED CODE via pat.exe on your own
+# machine, with the same privileges as any other PatLang script (file
+# writes under agent_work/, and whatever hosts the generated code happens
+# to call). It is not sandboxed. Only run this against local models you
+# trust the output of enough to execute unreviewed.
+
+include "../lib/json.patlang"
+include "../lib/ollama.patlang"
+
+let PAT_EXE = "rust-runtime/target/release/pat.exe"
+let WORK_DIR = "agent_work/"
+let MAX_ATTEMPTS = 3
+
+# ---- agents (OO) ----
+make a function called agent_new takes role, model, prompt returns done
+  new("Agent", role)
+  send(role, "set", "model", model)
+  send(role, "set", "prompt", prompt)
+  return true
+end
+
+# A too-short reply (empty, or a handful of chars) means the call failed
+# in some way that didn't surface as an explicit Ollama error - seen once
+# in practice, likely transient request contention. Retry a few times
+# rather than silently feeding the next agent garbage.
+make a function called agent_call takes role, input returns reply
+  let tries = 0
+  let reply = ""
+  while (tries < 3) and (reply.length < 10) do
+    let tries = tries + 1
+    print("  [" + role + " / " + get(role, "model") + "] thinking... (try " + tries + ")")
+    let reply = ollama_chat_once(get(role, "model"), get(role, "prompt"), input)
+    if reply.length < 10 then
+      print("  [" + role + "] reply too short (" + reply.length + " chars) - retrying")
+    end
+  end
+  return reply
+end
+
+# ---- prompts ----
+make a function called orchestrator_prompt returns s
+  return "You are the orchestrator of a small software team. Given a one-line task from a user, restate it as a precise, unambiguous brief for a designer: what should be built, what the inputs/outputs are, and any edge cases the user implied. Do not write code or design a solution yourself - just clarify the brief. Keep it under 8 lines."
+end
+
+make a function called designer_prompt takes ref returns s
+  return "You are a software designer. Given a brief, produce a concise design for a PatLang program: the function name(s), their parameters, the algorithm/approach in plain English, and edge cases to handle. Do not write PatLang code - just the design, under 15 lines." + chr(10) + chr(10) + "PatLang language reference, for context on what's implementable:" + chr(10) + ref
+end
+
+make a function called coder_prompt takes ref returns s
+  return "You are a PatLang programmer. Given a design (and possibly feedback from a failed previous attempt), write a complete, runnable .patlang program implementing it, ending with a few print() calls demonstrating example usage. Respond with ONLY PatLang source code - no explanation, no markdown code fences, no commentary before or after." + chr(10) + chr(10) + ref
+end
+
+make a function called tester_prompt takes ref returns s
+  return "You are a PatLang test writer. You will be given a design and an implementation. Write ADDITIONAL PatLang code, to be appended after the implementation, that calls the already-defined function(s) with several test cases (including edge cases) and prints exactly 'PASS: <case>' or 'FAIL: <case> expected X got Y' for each one. Do not redefine the functions being tested. Respond with ONLY PatLang code - no explanation, no markdown fences." + chr(10) + chr(10) + ref
+end
+
+# ---- helpers ----
+make a function called strip_code_fences takes s returns out
+  let start_idx = find_substr(s, "```")
+  if start_idx < 0 then
+    return s
+  end
+  let after_fence = start_idx + 3
+  let nl_idx = find_substr(substr(s, after_fence, s.length - after_fence), chr(10))
+  let content_start = after_fence
+  if nl_idx >= 0 then
+    let content_start = after_fence + nl_idx + 1
+  end
+  let rest = substr(s, content_start, s.length - content_start)
+  let end_idx = find_substr(rest, "```")
+  if end_idx >= 0 then
+    return substr(rest, 0, end_idx)
+  end
+  return rest
+end
+
+when stage do
+  print("")
+  print("=== " + event_data + " ===")
+end
+
+# ---- main flow ----
+print("=== PatLang AI dev team (orchestrator / designer / coder / tester) ===")
+print("Models: orchestrator+designer = qwen3.5:latest, coder+tester = qwen2.5-coder:14b")
+print("")
+print("Describe a small function or program you want built:")
+let task = read_line()
+if task == "" then
+  let task = "Write a function that checks whether a number is prime."
+  print("(no input - using a default task: " + task + ")")
+end
+
+let ref = read_file("self_hosting/tools/patlang_cheatsheet.md")
+
+agent_new("orchestrator", "qwen3.5:latest", orchestrator_prompt())
+agent_new("designer", "qwen3.5:latest", designer_prompt(ref))
+agent_new("coder", "qwen2.5-coder:14b", coder_prompt(ref))
+agent_new("tester", "qwen2.5-coder:14b", tester_prompt(ref))
+
+emit("stage", "orchestrator: refining the brief")
+let brief = agent_call("orchestrator", task)
+print(brief)
+
+emit("stage", "designer: producing a design")
+let design = agent_call("designer", brief)
+print(design)
+
+let attempt = 0
+let done = false
+let feedback = ""
+
+while (not done) and (attempt < MAX_ATTEMPTS) do
+  let attempt = attempt + 1
+  emit("stage", "coder: writing implementation (attempt " + attempt + ")")
+  let coder_input = design
+  if feedback != "" then
+    let coder_input = design + chr(10) + chr(10) + "Your previous attempt failed. Fix it based on this feedback:" + chr(10) + feedback
+  end
+  let code = strip_code_fences(agent_call("coder", coder_input))
+  print(code)
+
+  emit("stage", "tester: writing tests")
+  let tests = strip_code_fences(agent_call("tester", design + chr(10) + chr(10) + "Implementation:" + chr(10) + code))
+  print(tests)
+
+  let attempt_path = WORK_DIR + "attempt_" + attempt + ".patlang"
+  write_file(attempt_path, code + chr(10) + chr(10) + tests)
+
+  emit("stage", "running attempt " + attempt + " for real via pat.exe")
+  let result = exec_capture(PAT_EXE, "--ir-run", attempt_path)
+  print("--- output ---")
+  print(result)
+  print("--------------")
+
+  if find_substr(result, "FAIL") >= 0 then
+    let feedback = "The tests reported a failure. Full run output:" + chr(10) + result
+  else
+    if (find_substr(result, "error") >= 0) or (find_substr(result, "Error") >= 0) then
+      let feedback = "The program did not run cleanly. Full run output:" + chr(10) + result
+    else
+      if find_substr(result, "PASS") < 0 then
+        # No FAIL and no error text isn't enough proof on its own: Stage 0
+        # can silently drop an unrecognized statement inside a function
+        # body (a known parser limitation) instead of raising an error,
+        # which would make a no-op test function look like a clean run.
+        # Require positive evidence the tests actually executed.
+        let feedback = "The run produced no PASS/FAIL output at all, so the tests likely didn't execute (check for unsupported syntax - PatLang has no `for` loop, only `while`). Full run output:" + chr(10) + result
+      else
+        let done = true
+      end
+    end
+  end
+end
+
+print("")
+if done then
+  print("SUCCESS after " + attempt + " attempt(s). See " + WORK_DIR + "attempt_" + attempt + ".patlang")
+else
+  print("Gave up after " + MAX_ATTEMPTS + " attempt(s). Last attempt saved to " + WORK_DIR + "attempt_" + attempt + ".patlang for inspection.")
+end

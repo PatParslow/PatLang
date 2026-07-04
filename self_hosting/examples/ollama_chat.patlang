@@ -17,98 +17,12 @@
 #     the I/O model. (self_hosting/lib/event_loop.patlang is the actual
 #     non-blocking primitive, built for servers polling tcp_accept_timeout;
 #     it doesn't apply to a single outbound request awaiting one reply.)
+#
+# The HTTP/JSON plumbing lives in lib/ollama.patlang + lib/json.patlang,
+# shared with tools/agent_team.patlang.
 
 include "../lib/json.patlang"
-
-set_var("ollama_host", "127.0.0.1")
-set_var("ollama_port", 11434)
-
-# ---- tiny HTTP client (raw sockets, not a library) ----
-make a function called crlf returns s
-  return chr(13) + chr(10)
-end
-
-make a function called find_substr takes hay, needle returns idx
-  if needle.length == 0 then
-    return 0
-  end
-  let i = 0
-  while i <= (hay.length - needle.length) do
-    if substr(hay, i, needle.length) == needle then
-      return i
-    end
-    let i = i + 1
-  end
-  return -1
-end
-
-# Ollama's Go HTTP server sends some responses (e.g. /api/tags) with
-# Transfer-Encoding: chunked rather than a Content-Length - each chunk is a
-# hex size, CRLF, that many bytes, CRLF, repeated, ending in a zero-size
-# chunk. Since we read the whole connection to close anyway, decoding just
-# means stripping the chunk framing out of what we already have.
-make a function called dechunk takes raw returns body
-  let b = sb_new()
-  let pos = 0
-  let done = false
-  while not done do
-    if pos >= raw.length then
-      let done = true
-    else
-      let line_end = find_substr(substr(raw, pos, raw.length - pos), crlf())
-      if line_end < 0 then
-        let done = true
-      else
-        let size = json_hex_to_num(substr(raw, pos, line_end))
-        if size <= 0 then
-          let done = true
-        else
-          let data_start = pos + line_end + 2
-          sb_push(b, substr(raw, data_start, size))
-          let pos = data_start + size + 2
-        end
-      end
-    end
-  end
-  return sb_str(b)
-end
-
-make a function called http_body takes raw returns body
-  let sep = crlf() + crlf()
-  let idx = find_substr(raw, sep)
-  if idx < 0 then
-    return raw
-  end
-  let headers = substr(raw, 0, idx)
-  let payload = substr(raw, idx + sep.length, raw.length - idx - sep.length)
-  if find_substr(headers, "chunked") >= 0 then
-    return dechunk(payload)
-  end
-  return payload
-end
-
-make a function called http_roundtrip takes request returns body
-  let conn = tcp_connect(get("__vars", "ollama_host"), get("__vars", "ollama_port"))
-  tcp_write(conn, request)
-  let raw = ""
-  let chunk = tcp_read(conn)
-  while chunk != "" do
-    let raw = raw + chunk
-    let chunk = tcp_read(conn)
-  end
-  tcp_close(conn)
-  return http_body(raw)
-end
-
-make a function called http_get takes path returns body
-  let req = "GET " + path + " HTTP/1.1" + crlf() + "Host: " + get("__vars", "ollama_host") + crlf() + "Connection: close" + crlf() + crlf()
-  return http_roundtrip(req)
-end
-
-make a function called http_post takes path, body returns resp
-  let req = "POST " + path + " HTTP/1.1" + crlf() + "Host: " + get("__vars", "ollama_host") + crlf() + "Content-Type: application/json" + crlf() + "Content-Length: " + byte_length(body) + crlf() + "Connection: close" + crlf() + crlf() + body
-  return http_roundtrip(req)
-end
+include "../lib/ollama.patlang"
 
 # ---- session (OO) ----
 make a function called session_new takes model returns done
@@ -181,18 +95,6 @@ when chat_error do
 end
 
 # ---- model selection ----
-make a function called list_models returns names
-  let v = json_parse(http_get("/api/tags"))
-  let models = json_arr(json_get(v, "models"))
-  let names = []
-  let i = 0
-  while i < models.length do
-    let names = list_push(names, json_str(json_get(models[i], "name")))
-    let i = i + 1
-  end
-  return names
-end
-
 make a function called default_model_index takes names returns idx
   let i = 0
   while i < names.length do
