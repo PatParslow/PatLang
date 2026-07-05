@@ -26,7 +26,7 @@ include "../lib/ollama.patlang"
 
 let PAT_EXE = "rust-runtime/target/release/pat.exe"
 let WORK_DIR = "agent_work/"
-let MAX_ATTEMPTS = 6
+let MAX_ATTEMPTS = 10
 
 # ---- agents (OO) ----
 make a function called agent_new takes role, model, prompt returns done
@@ -86,6 +86,31 @@ end
 
 make a function called coder_prompt takes ref returns s
   return "You are a PatLang programmer. Given a design (and possibly feedback from a failed previous attempt), write a complete, runnable .patlang program implementing it, ending with a few print() calls demonstrating example usage. PatLang has five paradigms available (plain functions/loops, object-oriented, event-driven, logic/goal-oriented, and functional map/filter) - pick whichever genuinely fits the design; most tasks are still best served by plain functions, so only reach for the others when the design is naturally about independent stateful things (use OO), reactions to occurrences (use events), relationships/rules (use logic), or transforming every element of a list (use the functional helpers). Respond with ONLY PatLang source code - no explanation, no markdown code fences, no commentary before or after." + chr(10) + chr(10) + ref
+end
+
+# Task-splitting: rather than expecting the coder to get everything right
+# in one pass, split "write correct code" into "write code" -> "check it
+# against a specific checklist of mistakes we've actually seen happen" ->
+# "targeted fix", each a separate focused call. The checklist is exactly
+# the recurring mistakes real coder models have made in this pipeline
+# (else-if chains, `mod`, `break`, ternaries, nonexistent library calls
+# like sqrt, C-style braces, unreassigned list_push) - deliberately narrow,
+# so the reviewer isn't asked to also judge algorithm correctness (that's
+# what real execution + the tester are for).
+make a function called reviewer_prompt takes ref returns s
+  return "You are a PatLang code reviewer. Given a PatLang program, check it ONLY for these specific known mistakes, nothing else: (1) 'else if' or 'elif' as a single construct (invalid - must nest a full if inside else, with one 'end' per nesting level), (2) 'mod' as a word operator (must be '%'), (3) 'break' or 'continue' (do not exist and are silently ignored rather than erroring), (4) an inline if/else used as an expression (e.g. 'let x = if c then a else b', a ternary - does not exist), (5) calling any math/library function that isn't a basic arithmetic operator, such as sqrt/floor/abs/round (none exist), (6) C-style curly braces '{' '}' instead of then/else/end, (7) calling list_push(xs, v) without reassigning its result (it returns a NEW list, it doesn't mutate in place). If you find ANY of these, respond with 'ISSUES FOUND:' followed by a short bullet list naming the specific problem. If you find NONE of these specific issues, respond with exactly the single word 'CLEAN' and nothing else. Do not comment on style, algorithm correctness, naming, or anything outside this checklist." + chr(10) + chr(10) + ref
+end
+
+# Flow-control decision (an LLM call this time, unlike the deterministic
+# vacuous-test stub-check): given a genuine test failure, is the
+# implementation wrong, or are the tests wrong? Both are possible - a test
+# can assert an expected value that's inconsistent with the design even
+# though the code correctly implements the design. Judging that requires
+# actually reading the design as the source of truth, which is a real
+# judgment call rather than something objectively checkable, unlike the
+# vacuous-test case.
+make a function called judge_prompt returns s
+  return "You are a code reviewer judging why a test run failed. You will be given the design (the source of truth for what's correct), the implementation, the tests, and the actual failure output. Decide whether the IMPLEMENTATION is wrong (doesn't correctly follow the design) or the TESTS are wrong (incorrect expected values, or checking something the design doesn't actually require). Respond with exactly one word first - either CODE or TESTS - then a colon and a one-line reason, nothing else. Example replies: 'CODE: the loop condition is off by one, so isPrime(9) is misclassified.' or 'TESTS: the design says empty input returns an empty list, but the test expects null.'"
 end
 
 make a function called tester_prompt takes ref returns s
@@ -214,6 +239,8 @@ agent_new("orchestrator", "qwen3.5:latest", orchestrator_prompt())
 agent_new("designer", "qwen3.5:latest", designer_prompt())
 agent_new("coder", coder_model, coder_prompt(ref))
 agent_new("tester", coder_model, tester_prompt(ref))
+agent_new("reviewer", "qwen3.5:latest", reviewer_prompt(ref))
+agent_new("judge", "qwen3.5:latest", judge_prompt())
 
 emit("stage", "orchestrator: refining the brief")
 let brief = agent_call("orchestrator", task)
@@ -228,6 +255,10 @@ let done = false
 let feedback = ""
 let regen_code = true
 let code = ""
+let review_flags = 0
+let vacuous_rejections = 0
+let judge_blamed_tests = 0
+let judge_blamed_code = 0
 let coder_phase_start_ms = now_ms()
 
 while (not done) and (attempt < MAX_ATTEMPTS) do
@@ -241,6 +272,19 @@ while (not done) and (attempt < MAX_ATTEMPTS) do
     end
     let code = strip_code_fences(agent_call("coder", coder_input))
     print(code)
+
+    emit("stage", "reviewer: checking for known pitfalls")
+    let review = agent_call("reviewer", code)
+    if find_substr(review, "CLEAN") < 0 then
+      let review_flags = review_flags + 1
+      print("  [reviewer] flagged issues:")
+      print(review)
+      emit("stage", "coder: fixing flagged issues (attempt " + attempt + ")")
+      let code = strip_code_fences(agent_call("coder", "Your code:" + chr(10) + code + chr(10) + chr(10) + "A reviewer flagged these specific issues in it - fix ONLY these, keep everything else the same, respond with the complete corrected program:" + chr(10) + review))
+      print(code)
+    else
+      print("  [reviewer] clean - no known pitfalls detected")
+    end
   else
     print("  (keeping the previous implementation - only its tests were rejected as vacuous)")
   end
@@ -271,10 +315,10 @@ while (not done) and (attempt < MAX_ATTEMPTS) do
 
   if vacuous then
     print("  vacuous tests detected: every function was replaced with a wrong stub and the tests still reported no failures. Rejecting and asking the tester to rewrite - the implementation is kept as-is.")
+    let vacuous_rejections = vacuous_rejections + 1
     let feedback = "Your tests are vacuous: when every function you're testing was replaced with a deliberately WRONG stub implementation, your tests still reported no failures at all. That means they aren't checking anything real. Rewrite them with concrete, specific expected values a wrong implementation cannot satisfy."
     let regen_code = false
   else
-    let regen_code = true
     let attempt_path = WORK_DIR + "attempt_" + attempt + ".patlang"
     write_file(attempt_path, code + chr(10) + chr(10) + tests)
 
@@ -284,17 +328,27 @@ while (not done) and (attempt < MAX_ATTEMPTS) do
     print(result)
     print("--------------")
 
-    # Flow-control decision #2: given a real failure, who's to blame? For
-    # now this still always retries the coder (attributing failures to the
-    # code, not the tests) - the vacuous-test case above is the one clearly
-    # separable, objective sub-case; general blame attribution between a
-    # buggy implementation and a buggy-but-non-vacuous test is a fuzzier
-    # judgment call left for later.
     if find_substr(result, "FAIL") >= 0 then
-      let feedback = "The tests reported a failure. Full run output:" + chr(10) + result
+      # A genuine test failure is the one case that's really ambiguous:
+      # the implementation could be wrong, or the test's expected value
+      # could be wrong relative to the design. This is the judge's call,
+      # not a deterministic check - unlike the vacuous-test case above.
+      emit("stage", "judge: deciding whether the code or the tests are at fault")
+      let verdict = agent_call("judge", "Design:" + chr(10) + design + chr(10) + chr(10) + "Implementation:" + chr(10) + code + chr(10) + chr(10) + "Tests:" + chr(10) + tests + chr(10) + chr(10) + "Failure output:" + chr(10) + result)
+      print("  [judge] " + verdict)
+      if substr(verdict, 0, 5) == "TESTS" then
+        let judge_blamed_tests = judge_blamed_tests + 1
+        let feedback = "A reviewer examined this failure against the design and concluded the TESTS are wrong, not the implementation: " + verdict + chr(10) + chr(10) + "Full run output:" + chr(10) + result
+        let regen_code = false
+      else
+        let judge_blamed_code = judge_blamed_code + 1
+        let feedback = "A reviewer examined this failure against the design and concluded the IMPLEMENTATION is wrong: " + verdict + chr(10) + chr(10) + "Full run output:" + chr(10) + result
+        let regen_code = true
+      end
     else
       if (find_substr(result, "error") >= 0) or (find_substr(result, "Error") >= 0) then
         let feedback = "The program did not run cleanly. Full run output:" + chr(10) + result
+        let regen_code = true
       else
         if find_substr(result, "PASS") < 0 then
           # No FAIL and no error text isn't enough proof on its own: Stage 0
@@ -303,6 +357,7 @@ while (not done) and (attempt < MAX_ATTEMPTS) do
           # which would make a no-op test function look like a clean run.
           # Require positive evidence the tests actually executed.
           let feedback = "The run produced no PASS/FAIL output at all, so the tests likely didn't execute (check for unsupported syntax - PatLang has no `for` loop, only `while`). Full run output:" + chr(10) + result
+          let regen_code = true
         else
           let done = true
         end
