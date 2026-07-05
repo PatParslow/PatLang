@@ -55,8 +55,21 @@ make a function called agent_call takes role, input returns reply
 end
 
 # ---- prompts ----
+# This is the spec-writing half of "orchestration" (paired with
+# designer_prompt below): pure requirements clarification, nothing else.
+# Deciding retries, routing feedback, and judging whether a failure is a
+# code bug or a test bug is a *different* responsibility - handled below
+# as deterministic flow-control logic in the main loop, not by an LLM call,
+# since "did the tests catch an obviously wrong stub" is objectively
+# checkable and doesn't need judgment.
+# Explicitly forbidding invented UI/interface framing below because,
+# without it, this prompt was observed reframing plain functions ("filter a
+# list") as "build an input field with Submit/Clear buttons and a Green
+# check/Red X status indicator" - fabricated requirements nobody asked for,
+# which then doomed the downstream design and code regardless of which
+# coder model was used.
 make a function called orchestrator_prompt returns s
-  return "You are the orchestrator of a small software team. Given a one-line task from a user, restate it as a precise, unambiguous brief for a designer: what should be built, what the inputs/outputs are, and any edge cases the user implied. Do not write code or design a solution yourself - just clarify the brief. Keep it under 8 lines."
+  return "You are the requirements-clarifier for a small software team. Given a one-line task from a user, restate it as a precise, unambiguous brief for a designer: what should be built, what the inputs/outputs are, and any edge cases the user implied. Do not write code or design a solution yourself - just clarify the brief. Do NOT invent a user interface, input fields, buttons, forms, or any interactive/visual presentation layer unless the user's task explicitly described one - assume a plain function unless told otherwise. Do not add requirements the user did not state or imply. Keep it under 8 lines."
 end
 
 # Deliberately language-agnostic: the designer's job is the algorithm and
@@ -76,7 +89,75 @@ make a function called coder_prompt takes ref returns s
 end
 
 make a function called tester_prompt takes ref returns s
-  return "You are a PatLang test writer. You will be given a design and an implementation. Write ADDITIONAL PatLang code, to be appended after the implementation, that calls the already-defined function(s) with several test cases (including edge cases) and prints exactly 'PASS: <case>' or 'FAIL: <case> expected X got Y' for each one. Do not redefine the functions being tested." + chr(10) + chr(10) + "Worked example, testing a function `add(a, b)`:" + chr(10) + "```" + chr(10) + "make a function called check_add takes a, b, expected returns done" + chr(10) + "  let actual = add(a, b)" + chr(10) + "  if actual == expected then" + chr(10) + "    print(\"PASS: add(\" + a + \", \" + b + \")\")" + chr(10) + "  else" + chr(10) + "    print(\"FAIL: add(\" + a + \", \" + b + \") expected \" + expected + \" got \" + actual)" + chr(10) + "  end" + chr(10) + "  return true" + chr(10) + "end" + chr(10) + chr(10) + "check_add(2, 3, 5)" + chr(10) + "check_add(-1, 1, 0)" + chr(10) + "check_add(0, 0, 0)" + chr(10) + "```" + chr(10) + "Follow this exact shape: one small checker function taking the inputs plus the expected value, called once per test case as a plain top-level statement. Never use a `for` loop, a list of test cases with a loop over it, or an inline if/else expression - just repeated plain calls to the checker function, one per line, like the example. Respond with ONLY PatLang code - no explanation, no markdown fences." + chr(10) + chr(10) + ref
+  return "You are a PatLang test writer. You will be given a design and an implementation. Write ADDITIONAL PatLang code, to be appended after the implementation, that calls the already-defined function(s) with several test cases (including edge cases) and prints exactly 'PASS: <case>' or 'FAIL: <case> expected X got Y' for each one. Do not redefine the functions being tested. Your tests will be checked against a deliberately wrong stub implementation before being trusted - if they can't tell the real implementation apart from an obviously broken one, they'll be rejected - so use concrete, specific expected values (not comparisons that would trivially pass either way)." + chr(10) + chr(10) + "Worked example, testing a function `add(a, b)`:" + chr(10) + "```" + chr(10) + "make a function called check_add takes a, b, expected returns done" + chr(10) + "  let actual = add(a, b)" + chr(10) + "  if actual == expected then" + chr(10) + "    print(\"PASS: add(\" + a + \", \" + b + \")\")" + chr(10) + "  else" + chr(10) + "    print(\"FAIL: add(\" + a + \", \" + b + \") expected \" + expected + \" got \" + actual)" + chr(10) + "  end" + chr(10) + "  return true" + chr(10) + "end" + chr(10) + chr(10) + "check_add(2, 3, 5)" + chr(10) + "check_add(-1, 1, 0)" + chr(10) + "check_add(0, 0, 0)" + chr(10) + "```" + chr(10) + "Follow this exact shape: one small checker function taking the inputs plus the expected value, called once per test case as a plain top-level statement. Never use a `for` loop, a list of test cases with a loop over it, or an inline if/else expression - just repeated plain calls to the checker function, one per line, like the example. Respond with ONLY PatLang code - no explanation, no markdown fences." + chr(10) + chr(10) + ref
+end
+
+# ---- vacuous-test detection ("flow" logic: a deterministic, objectively
+# checkable decision, not another LLM call) ----
+# Before trusting the tester's tests, run them against a deliberately WRONG
+# stub of every function the coder defined (same signature, body replaced
+# with a fixed sentinel string that can't match any real expected value).
+# If the tests don't report a single FAIL against that obviously-broken
+# implementation, they aren't testing anything - a real bug found the hard
+# way: a palindrome checker whose test always compared against "success"
+# regardless of input, reporting PASS for genuine non-palindromes.
+make a function called trim takes s returns out
+  let start = 0
+  while (start < s.length) and ((char_code(s, start) == 32) or (char_code(s, start) == 13) or (char_code(s, start) == 10) or (char_code(s, start) == 9)) do
+    let start = start + 1
+  end
+  let stop = s.length
+  while (stop > start) and ((char_code(s, stop - 1) == 32) or (char_code(s, stop - 1) == 13) or (char_code(s, stop - 1) == 10) or (char_code(s, stop - 1) == 9)) do
+    let stop = stop - 1
+  end
+  return substr(s, start, stop - start)
+end
+
+make a function called line_end_index takes s, pos returns idx
+  let i = pos
+  while (i < s.length) and (char_code(s, i) != 10) do
+    let i = i + 1
+  end
+  return i
+end
+
+# Best-effort text scan for "make a function called X takes P returns Y"
+# header lines - not a real parser, so a function whose header doesn't
+# match that exact one-line shape is just skipped (degrades gracefully:
+# fewer functions get stubbed, rather than erroring out).
+make a function called extract_stubs takes code returns stub_src
+  let b = sb_new()
+  let marker = "make a function called "
+  let search_from = 0
+  let searching = true
+  while searching do
+    let rest = substr(code, search_from, code.length - search_from)
+    let found = find_substr(rest, marker)
+    if found < 0 then
+      let searching = false
+    else
+      let pos = search_from + found
+      let line_stop = line_end_index(code, pos)
+      let header = trim(substr(code, pos, line_stop - pos))
+      let after_called = substr(header, marker.length, header.length - marker.length)
+      let takes_idx = find_substr(after_called, " takes ")
+      if takes_idx >= 0 then
+        let name = trim(substr(after_called, 0, takes_idx))
+        let after_takes = substr(after_called, takes_idx + 7, after_called.length - takes_idx - 7)
+        let returns_idx = find_substr(after_takes, " returns ")
+        if returns_idx >= 0 then
+          let params = trim(substr(after_takes, 0, returns_idx))
+          let retvar = trim(substr(after_takes, returns_idx + 9, after_takes.length - returns_idx - 9))
+          sb_push(b, "make a function called " + name + " takes " + params + " returns " + retvar + chr(10))
+          sb_push(b, "  let " + retvar + " = " + chr(34) + "STUB_WRONG_VALUE_" + name + chr(34) + chr(10))
+          sb_push(b, "  return " + retvar + chr(10))
+          sb_push(b, "end" + chr(10) + chr(10))
+        end
+      end
+      let search_from = line_stop
+    end
+  end
+  return sb_str(b)
 end
 
 # ---- helpers ----
@@ -145,46 +226,86 @@ print(design)
 let attempt = 0
 let done = false
 let feedback = ""
+let regen_code = true
+let code = ""
 let coder_phase_start_ms = now_ms()
 
 while (not done) and (attempt < MAX_ATTEMPTS) do
   let attempt = attempt + 1
-  emit("stage", "coder: writing implementation (attempt " + attempt + ")")
-  let coder_input = design
-  if feedback != "" then
-    let coder_input = design + chr(10) + chr(10) + "Your previous attempt failed. Fix it based on this feedback:" + chr(10) + feedback
+
+  if regen_code then
+    emit("stage", "coder: writing implementation (attempt " + attempt + ")")
+    let coder_input = design
+    if feedback != "" then
+      let coder_input = design + chr(10) + chr(10) + "Your previous attempt failed. Fix it based on this feedback:" + chr(10) + feedback
+    end
+    let code = strip_code_fences(agent_call("coder", coder_input))
+    print(code)
+  else
+    print("  (keeping the previous implementation - only its tests were rejected as vacuous)")
   end
-  let code = strip_code_fences(agent_call("coder", coder_input))
-  print(code)
 
   emit("stage", "tester: writing tests")
-  let tests = strip_code_fences(agent_call("tester", design + chr(10) + chr(10) + "Implementation:" + chr(10) + code))
+  let tester_input = design + chr(10) + chr(10) + "Implementation:" + chr(10) + code
+  if (feedback != "") and (not regen_code) then
+    let tester_input = tester_input + chr(10) + chr(10) + feedback
+  end
+  let tests = strip_code_fences(agent_call("tester", tester_input))
   print(tests)
 
-  let attempt_path = WORK_DIR + "attempt_" + attempt + ".patlang"
-  write_file(attempt_path, code + chr(10) + chr(10) + tests)
+  # Flow-control decision #1 (deterministic, no LLM call): are these tests
+  # actually testing anything? Run them against every function replaced by
+  # an obviously wrong stub; if nothing fails, reject the tests and retry
+  # only the tester, keeping the working implementation as-is.
+  let stubs = extract_stubs(code)
+  let vacuous = false
+  if stubs.length > 0 then
+    emit("stage", "verifying the tests catch a deliberately broken stub")
+    let stub_path = WORK_DIR + "stub_check.patlang"
+    write_file(stub_path, stubs + chr(10) + tests)
+    let stub_result = exec_capture(PAT_EXE, "--ir-run", stub_path)
+    if find_substr(stub_result, "FAIL") < 0 then
+      let vacuous = true
+    end
+  end
 
-  emit("stage", "running attempt " + attempt + " for real via pat.exe")
-  let result = exec_capture(PAT_EXE, "--ir-run", attempt_path)
-  print("--- output ---")
-  print(result)
-  print("--------------")
-
-  if find_substr(result, "FAIL") >= 0 then
-    let feedback = "The tests reported a failure. Full run output:" + chr(10) + result
+  if vacuous then
+    print("  vacuous tests detected: every function was replaced with a wrong stub and the tests still reported no failures. Rejecting and asking the tester to rewrite - the implementation is kept as-is.")
+    let feedback = "Your tests are vacuous: when every function you're testing was replaced with a deliberately WRONG stub implementation, your tests still reported no failures at all. That means they aren't checking anything real. Rewrite them with concrete, specific expected values a wrong implementation cannot satisfy."
+    let regen_code = false
   else
-    if (find_substr(result, "error") >= 0) or (find_substr(result, "Error") >= 0) then
-      let feedback = "The program did not run cleanly. Full run output:" + chr(10) + result
+    let regen_code = true
+    let attempt_path = WORK_DIR + "attempt_" + attempt + ".patlang"
+    write_file(attempt_path, code + chr(10) + chr(10) + tests)
+
+    emit("stage", "running attempt " + attempt + " for real via pat.exe")
+    let result = exec_capture(PAT_EXE, "--ir-run", attempt_path)
+    print("--- output ---")
+    print(result)
+    print("--------------")
+
+    # Flow-control decision #2: given a real failure, who's to blame? For
+    # now this still always retries the coder (attributing failures to the
+    # code, not the tests) - the vacuous-test case above is the one clearly
+    # separable, objective sub-case; general blame attribution between a
+    # buggy implementation and a buggy-but-non-vacuous test is a fuzzier
+    # judgment call left for later.
+    if find_substr(result, "FAIL") >= 0 then
+      let feedback = "The tests reported a failure. Full run output:" + chr(10) + result
     else
-      if find_substr(result, "PASS") < 0 then
-        # No FAIL and no error text isn't enough proof on its own: Stage 0
-        # can silently drop an unrecognized statement inside a function
-        # body (a known parser limitation) instead of raising an error,
-        # which would make a no-op test function look like a clean run.
-        # Require positive evidence the tests actually executed.
-        let feedback = "The run produced no PASS/FAIL output at all, so the tests likely didn't execute (check for unsupported syntax - PatLang has no `for` loop, only `while`). Full run output:" + chr(10) + result
+      if (find_substr(result, "error") >= 0) or (find_substr(result, "Error") >= 0) then
+        let feedback = "The program did not run cleanly. Full run output:" + chr(10) + result
       else
-        let done = true
+        if find_substr(result, "PASS") < 0 then
+          # No FAIL and no error text isn't enough proof on its own: Stage 0
+          # can silently drop an unrecognized statement inside a function
+          # body (a known parser limitation) instead of raising an error,
+          # which would make a no-op test function look like a clean run.
+          # Require positive evidence the tests actually executed.
+          let feedback = "The run produced no PASS/FAIL output at all, so the tests likely didn't execute (check for unsupported syntax - PatLang has no `for` loop, only `while`). Full run output:" + chr(10) + result
+        else
+          let done = true
+        end
       end
     end
   end
