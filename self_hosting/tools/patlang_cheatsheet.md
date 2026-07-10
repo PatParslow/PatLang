@@ -103,6 +103,35 @@ exist in other languages):
       let x = b
     end
     ```
+  - Multi-line string/expression concatenation with a leading operator on
+    the continuation line - **only safe when the program is parsed by the
+    Rust CLI's own native frontend** (e.g. `pat --ir-run`/`--build-run` on
+    a plain `.patlang` file, or anything reached via a top-level `include`).
+    It silently truncates when the program is instead tokenized by the
+    self-hosted, PatLang-authored parser (`self_hosting/lib/parser.patlang`,
+    used whenever source is compiled via `tokenize`/`parse_program` calls,
+    e.g. `compile_both`/`compile_native` in `build_portfolio.patlang`, or
+    anything run through `run_ir`/the live browser playground) - that
+    parser's `parse_add`/`parse_mul` don't skip newlines before checking
+    for a continuation operator, unlike its own list/argument parsing
+    (which does) and unlike the native frontend. Concretely, this silently
+    breaks and drops everything after the first line:
+    ```
+    let s = "a" + chr(10)
+      + "b" + chr(10)
+      + "c"
+    # s is just "a\n" here when self-hosted-compiled - "b"/"c" vanish
+    ```
+    Safe everywhere: one `let` per concatenation step, each a complete
+    single-line expression:
+    ```
+    let s1 = "a" + chr(10)
+    let s2 = s1 + "b" + chr(10)
+    let s = s2 + "c"
+    ```
+    Use this style for any `.patlang` file that will be `read_file`'d as
+    text and compiled/run via `tokenize`/`parse_program` (not just
+    `include`d), which includes every demo card in the portfolio.
 
 Example of a complete, correct program:
 ```
@@ -229,3 +258,29 @@ end
 
 print(map_list([1, 2, 3], "double"))   # [2, 4, 6]
 ```
+
+Dynamic code execution ("eval") and runtime syntax extension - `tokenize`,
+`parse_program`, `lower_program`, and `run_ir` (all library/host functions,
+defined in `self_hosting/lib/{lexer,parser,lower}.patlang` and a host
+function respectively) are ordinary PatLang-callable functions, not special
+compile-time magic - a running program can build a source string however it
+likes (concatenation, data read at runtime, whatever) and compile+execute
+it in the same run:
+```
+let src = "print(" + chr(34) + "hello from generated code" + chr(34) + ")"
+let ir = lower_program(parse_program(tokenize(src)))
+run_ir(ir)
+```
+This is exactly what `self_hosting/examples/playground_main.patlang` does
+with whatever a user types into the live browser IDE.
+
+`syntax NAME { ... }` grammar-extension blocks (see `self_hosting/lib/
+syntax_dsl.patlang`) are no exception: `expand_syntax_dsls_with(src,
+existing_defs)` is a plain, stateless string-in/list-out function - it can
+define a syntax whose trigger keyword and rules are computed from runtime
+data, and a LATER, separate call can use it by threading the returned
+`defs` list forward, with no syntax declaration text needed at the use
+site. See `self_hosting/examples/dynamic_syntax_demo.patlang` for a worked
+example that defines and uses a grammar extension in two separate calls
+within one run. `expand_syntax_dsls(src)` (no `existing_defs` argument) is
+a thin wrapper over this for the common single-call case.
