@@ -303,25 +303,34 @@ fn i64_from_bigint(b: &BigIntT) -> Option<i64> {
 // ComplexT
 // ===========================================================================
 
+// `re`/`im` are boxed so `ComplexT` (and thus `Value::Complex`) stays a
+// single pointer wide instead of inlining a full `NumT` (which can itself
+// hold a `RationalT`) twice. The *compiled-program* `Value` enum embeds
+// `ComplexT` directly (no external crate available to give it a
+// `Box<Value>` the way the interpreter's own `Value::Complex` already
+// does) -- an unboxed `ComplexT` there would make every `Value` on the
+// compiled VM's stack pay for the largest variant's size even in programs
+// that never construct a Complex. See ir/codegen.rs's PRELUDE_NUMERIC_TOWER
+// chunk, which mirrors this exact shape.
 #[derive(Debug, Clone)]
 pub struct ComplexT {
-    pub re: NumT,
-    pub im: NumT,
+    pub re: Box<NumT>,
+    pub im: Box<NumT>,
 }
 
 impl ComplexT {
     pub fn new(re: NumT, im: NumT) -> Self {
-        ComplexT { re, im }
+        ComplexT { re: Box::new(re), im: Box::new(im) }
     }
 
     /// `(a+bi) + (c+di) = (a+c) + (b+d)i`
     pub fn add(&self, other: &ComplexT) -> ComplexT {
-        ComplexT { re: self.re.add(&other.re), im: self.im.add(&other.im) }
+        ComplexT::new(self.re.add(&other.re), self.im.add(&other.im))
     }
 
     /// `(a+bi) - (c+di) = (a-c) + (b-d)i`
     pub fn sub(&self, other: &ComplexT) -> ComplexT {
-        ComplexT { re: self.re.sub(&other.re), im: self.im.sub(&other.im) }
+        ComplexT::new(self.re.sub(&other.re), self.im.sub(&other.im))
     }
 
     /// `(a+bi)(c+di) = (ac-bd) + (ad+bc)i`
@@ -330,7 +339,7 @@ impl ComplexT {
         let bd = self.im.mul(&other.im);
         let ad = self.re.mul(&other.im);
         let bc = self.im.mul(&other.re);
-        ComplexT { re: ac.sub(&bd), im: ad.add(&bc) }
+        ComplexT::new(ac.sub(&bd), ad.add(&bc))
     }
 
     /// `(a+bi)/(c+di) = (a+bi)(c-di) / (c^2+d^2)`, standard division via the
@@ -360,13 +369,13 @@ impl ComplexT {
             if let (Some(nre), Some(nim)) = (to_bigint_exact(&num_re), to_bigint_exact(&num_im)) {
                 let re = NumT::Rat(RationalT::new(nre, denom_big.clone())).normalize();
                 let im = NumT::Rat(RationalT::new(nim, denom_big)).normalize();
-                return ComplexT { re, im };
+                return ComplexT::new(re, im);
             }
         }
         // Fallback: lossy f64 division, documented limitation for exotic
         // BigInt-denominator / non-integer-Rational-component cases.
         let d = denom.to_f64();
-        ComplexT { re: NumT::Float(num_re.to_f64() / d), im: NumT::Float(num_im.to_f64() / d) }
+        ComplexT::new(NumT::Float(num_re.to_f64() / d), NumT::Float(num_im.to_f64() / d))
     }
 
     /// Mirrors Stage 36's `Complex`-with-zero-imaginary-part demotion rule
@@ -374,7 +383,7 @@ impl ComplexT {
     /// of the real component when the imaginary part is exactly zero.
     pub fn to_real_if_zero_imaginary(&self) -> Option<NumT> {
         if self.im.is_zero() {
-            Some(self.re.clone())
+            Some((*self.re).clone())
         } else {
             None
         }
@@ -578,11 +587,11 @@ mod tests {
     }
 
     fn as_ints(c: &ComplexT) -> (i64, i64) {
-        let re = match &c.re {
+        let re = match c.re.as_ref() {
             NumT::Int(n) => *n,
             other => panic!("expected Int re, got {other:?}"),
         };
-        let im = match &c.im {
+        let im = match c.im.as_ref() {
             NumT::Int(n) => *n,
             other => panic!("expected Int im, got {other:?}"),
         };
@@ -646,12 +655,12 @@ mod tests {
         let a = ComplexT::new(NumT::Int(1), NumT::Float(2.5));
         let b = ComplexT::new(NumT::Int(3), NumT::Float(0.5));
         let got = a.add(&b);
-        match got.re {
+        match *got.re {
             NumT::Int(n) => assert_eq!(n, 4),
             NumT::Float(f) => assert_eq!(f, 4.0),
             other => panic!("unexpected re kind: {other:?}"),
         }
-        match got.im {
+        match *got.im {
             NumT::Float(f) => assert!((f - 3.0).abs() < 1e-12),
             other => panic!("expected Float im, got {other:?}"),
         }

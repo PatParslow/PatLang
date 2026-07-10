@@ -174,8 +174,20 @@ const HOST_CHUNK_TABLE: &[(&str, ChunkId)] = &[
 /// `numeric_tower` -- otherwise `math`'s chunk text fails to compile against
 /// the fast `Value` definition, which has no `BigInt`/`Rational`/`Complex`
 /// variants at all.
+///
+/// `oo -> logic`: found via the benchmark suite (a program using `send()`
+/// but no `fact`/`query`/`goal`). `host_call_oo_inner`'s `send()` dispatcher
+/// has a `"infer_relations"` method arm that reads the `FACTS` thread-local
+/// -- but `FACTS` is only *declared* in `PRELUDE_LOGIC`'s text. Since chunks
+/// are selected whole-chunk (not per-match-arm), any program calling `send`
+/// at all pulls in this arm's text regardless of which method name it
+/// actually uses at runtime, so `oo` unconditionally needs `logic`'s
+/// declarations to compile, even though nothing in the portfolio's own demo
+/// cards happened to exercise `send` without also using `fact`/`query`
+/// (which is why this went unnoticed until now).
 const CROSS_CHUNK_EDGES: &[(ChunkId, ChunkId)] = &[
     (ChunkId::Math, ChunkId::NumericTower),
+    (ChunkId::Oo, ChunkId::Logic),
 ];
 
 pub struct RustCodegen;
@@ -1018,18 +1030,18 @@ impl NumT {
 fn nt_i64_from_bigint(b: &BigIntT) -> Option<i64> { b.to_string().parse::<i64>().ok() }
 
 #[derive(Debug, Clone, PartialEq)]
-struct ComplexT { re: NumT, im: NumT }
+struct ComplexT { re: Box<NumT>, im: Box<NumT> }
 
 impl ComplexT {
-    fn new(re: NumT, im: NumT) -> Self { ComplexT { re, im } }
-    fn add(&self, other: &ComplexT) -> ComplexT { ComplexT { re: self.re.add(&other.re), im: self.im.add(&other.im) } }
-    fn sub(&self, other: &ComplexT) -> ComplexT { ComplexT { re: self.re.sub(&other.re), im: self.im.sub(&other.im) } }
+    fn new(re: NumT, im: NumT) -> Self { ComplexT { re: Box::new(re), im: Box::new(im) } }
+    fn add(&self, other: &ComplexT) -> ComplexT { ComplexT::new(self.re.add(&other.re), self.im.add(&other.im)) }
+    fn sub(&self, other: &ComplexT) -> ComplexT { ComplexT::new(self.re.sub(&other.re), self.im.sub(&other.im)) }
     fn mul(&self, other: &ComplexT) -> ComplexT {
         let ac = self.re.mul(&other.re);
         let bd = self.im.mul(&other.im);
         let ad = self.re.mul(&other.im);
         let bc = self.im.mul(&other.re);
-        ComplexT { re: ac.sub(&bd), im: ad.add(&bc) }
+        ComplexT::new(ac.sub(&bd), ad.add(&bc))
     }
     fn div(&self, other: &ComplexT) -> ComplexT {
         let denom = other.re.mul(&other.re).add(&other.im.mul(&other.im));
@@ -1040,13 +1052,13 @@ impl ComplexT {
             if let (Some(nre), Some(nim)) = (nt_to_bigint_exact(&num_re), nt_to_bigint_exact(&num_im)) {
                 let re = NumT::Rat(RationalT::new(nre, denom_big.clone())).normalize();
                 let im = NumT::Rat(RationalT::new(nim, denom_big)).normalize();
-                return ComplexT { re, im };
+                return ComplexT::new(re, im);
             }
         }
         let d = denom.to_f64();
-        ComplexT { re: NumT::Float(num_re.to_f64() / d), im: NumT::Float(num_im.to_f64() / d) }
+        ComplexT::new(NumT::Float(num_re.to_f64() / d), NumT::Float(num_im.to_f64() / d))
     }
-    fn to_real_if_zero_imaginary(&self) -> Option<NumT> { if self.im.is_zero() { Some(self.re.clone()) } else { None } }
+    fn to_real_if_zero_imaginary(&self) -> Option<NumT> { if self.im.is_zero() { Some((*self.re).clone()) } else { None } }
 }
 
 fn nt_to_bigint_exact(v: &NumT) -> Option<BigIntT> {
@@ -1223,7 +1235,7 @@ fn neg(a:&Value)->Result<Value,String>{
         Value::Number(n) => Ok(Value::Number(-n)),
         Value::BigInt(b) => Ok(nt_to_value(NumT::Big(b.negate()).normalize())),
         Value::Rational(r) => Ok(nt_to_value(NumT::Rat(RationalT::new(r.num.negate(), r.den.clone())).normalize())),
-        Value::Complex(c) => Ok(nt_normalize_complex(ComplexT { re: c.re.negate(), im: c.im.negate() })),
+        Value::Complex(c) => Ok(nt_normalize_complex(ComplexT::new(c.re.negate(), c.im.negate()))),
         Value::Unit => Ok(Value::Int(0)),
         _ => Err("expected number".to_string()),
     }
