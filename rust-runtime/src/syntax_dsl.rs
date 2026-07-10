@@ -77,11 +77,13 @@ impl RegexEngine {
         let args = [
             Value::String(pattern.to_string()),
             Value::String(text.to_string()),
-            Value::Number(start as f64),
+            Value::Int(start as i64),
         ];
         match self.interp.call_function(&self.program, "regex_match_string_at", &args)? {
-            Value::Number(n) if n >= 0.0 => Ok(Some(n as usize)),
-            _ => Ok(None),
+            v => match v.as_number() {
+                Ok(n) if n >= 0.0 => Ok(Some(n as usize)),
+                _ => Ok(None),
+            },
         }
     }
 }

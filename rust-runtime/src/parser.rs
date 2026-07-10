@@ -54,7 +54,7 @@ impl<'a> Parser<'a> {
     fn can_start_statement(&self) -> bool {
         match self.curr {
             Token::Let | Token::Fn | Token::If | Token::Return => true,
-            Token::Identifier(_) | Token::Number(_) | Token::String(_) | Token::LParen => true, // expression stmt
+            Token::Identifier(_) | Token::Number(_) | Token::Float(_) | Token::String(_) | Token::LParen => true, // expression stmt
             _ => false,
         }
     }
@@ -266,7 +266,7 @@ impl<'a> Parser<'a> {
                                 if matches!(self.curr, Token::EOF) { break; }
                                 self.consume_newlines()?;
                                 if let Token::Identifier(ref t) = self.curr { if t == "end" { self.advance()?; break; } }
-                                if matches!(self.curr, Token::Identifier(_)|Token::Let|Token::Fn|Token::If|Token::While|Token::Return|Token::Goal|Token::Rule|Token::Number(_)|Token::String(_)|Token::LParen) {
+                                if matches!(self.curr, Token::Identifier(_)|Token::Let|Token::Fn|Token::If|Token::While|Token::Return|Token::Goal|Token::Rule|Token::Number(_)|Token::Float(_)|Token::String(_)|Token::LParen) {
                                     body.push(self.parse_statement()?);
                                 } else if !matches!(self.curr, Token::EOF) {
                                     self.advance()?;
@@ -436,7 +436,7 @@ impl<'a> Parser<'a> {
                 if let Token::Identifier(ref t) = self.curr { if t == "end" { self.advance()?; break; } }
                 if matches!(self.curr, Token::EOF) { break; }
                 self.consume_newlines()?;
-                if matches!(self.curr, Token::Identifier(_)|Token::Let|Token::Fn|Token::If|Token::While|Token::Return|Token::Goal|Token::Rule|Token::Number(_)|Token::String(_)|Token::LParen|Token::BlockStart) {
+                if matches!(self.curr, Token::Identifier(_)|Token::Let|Token::Fn|Token::If|Token::While|Token::Return|Token::Goal|Token::Rule|Token::Number(_)|Token::Float(_)|Token::String(_)|Token::LParen|Token::BlockStart) {
                     let st = self.parse_statement()?;
                     body.push(st);
                 } else {
@@ -701,7 +701,7 @@ impl<'a> Parser<'a> {
                     }
                     // consume newlines
                     self.consume_newlines()?;
-                    if matches!(self.curr, Token::Identifier(_)|Token::Let|Token::Fn|Token::If|Token::While|Token::Return|Token::Goal|Token::Rule|Token::Number(_)|Token::String(_)|Token::LParen) {
+                    if matches!(self.curr, Token::Identifier(_)|Token::Let|Token::Fn|Token::If|Token::While|Token::Return|Token::Goal|Token::Rule|Token::Number(_)|Token::Float(_)|Token::String(_)|Token::LParen) {
                         let st = self.parse_statement()?;
                         then_branch.push(st);
                     } else {
@@ -721,7 +721,7 @@ impl<'a> Parser<'a> {
                             _ => {}
                         }
                         self.consume_newlines()?;
-                        if matches!(self.curr, Token::Identifier(_)|Token::Let|Token::Fn|Token::If|Token::While|Token::Return|Token::Goal|Token::Rule|Token::Number(_)|Token::String(_)|Token::LParen) {
+                        if matches!(self.curr, Token::Identifier(_)|Token::Let|Token::Fn|Token::If|Token::While|Token::Return|Token::Goal|Token::Rule|Token::Number(_)|Token::Float(_)|Token::String(_)|Token::LParen) {
                             let st = self.parse_statement()?; else_body.push(st);
                         } else { if !matches!(self.curr, Token::EOF) { self.advance()?; } }
                         self.consume_newlines()?;
@@ -768,7 +768,7 @@ impl<'a> Parser<'a> {
                         _ => {}
                     }
                     self.consume_newlines()?;
-                    if matches!(self.curr, Token::Identifier(_)|Token::Let|Token::Fn|Token::If|Token::While|Token::Return|Token::Goal|Token::Rule|Token::Number(_)|Token::String(_)|Token::LParen) {
+                    if matches!(self.curr, Token::Identifier(_)|Token::Let|Token::Fn|Token::If|Token::While|Token::Return|Token::Goal|Token::Rule|Token::Number(_)|Token::Float(_)|Token::String(_)|Token::LParen) {
                         let st = self.parse_statement()?; body.push(st);
                     } else { if !matches!(self.curr, Token::EOF) { self.advance()?; } }
                     self.consume_newlines()?;
@@ -849,6 +849,7 @@ impl<'a> Parser<'a> {
             Token::Not => { self.advance()?; let inner = self.parse_primary()?; Expr::UnaryOp { op: "not".into(), expr: Box::new(inner) } }
             Token::Minus => { self.advance()?; let inner = self.parse_primary()?; Expr::UnaryOp { op: "-".into(), expr: Box::new(inner) } }
             Token::Number(n) => { let v = *n; self.advance()?; Expr::Number(v) }
+            Token::Float(n) => { let v = *n; self.advance()?; Expr::Float(v) }
             Token::String(s) => { let v = s.clone(); self.advance()?; Expr::String(v) }
             Token::Goal => { self.advance()?; Expr::Identifier("goal".to_string()) }
             Token::Rule => { self.advance()?; Expr::Identifier("rule".to_string()) }

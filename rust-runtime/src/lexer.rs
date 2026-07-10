@@ -3,6 +3,11 @@
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     Number(f64),
+    // Stage 36: a literal written with a decimal point (`42.5`), distinct
+    // from `Number` (`42`) so the IR lowering step can pick the fast `Int`
+    // path by default and only pay for `Float` when the source explicitly
+    // asked for it.
+    Float(f64),
     String(String),
     Identifier(String),
     Plus,
@@ -123,7 +128,7 @@ impl TokenExpectation {
     /// lookahead buffer) against an expected set using the same names.
     pub fn classify_token(tok: &Token) -> TokenExpectation {
         match tok {
-            Token::Number(_) => TokenExpectation::Digit,
+            Token::Number(_) | Token::Float(_) => TokenExpectation::Digit,
             Token::Dot => TokenExpectation::Dot,
             Token::Plus | Token::Minus | Token::Star | Token::Slash | Token::Percent
             | Token::Equal | Token::EqualEqual | Token::NotEqual
@@ -257,8 +262,10 @@ impl<'a> Lexer<'a> {
                 }
                 let next_class = TokenExpectation::classify_char(bytes.get(self.position).map(|b| *b as char));
                 let after_next_class = TokenExpectation::classify_char(bytes.get(self.position + 1).map(|b| *b as char));
+                let mut is_float = false;
                 if next_class == TokenExpectation::Dot && after_next_class == TokenExpectation::Digit {
                     // '.' followed by a digit: consume it and the fractional digits.
+                    is_float = true;
                     self.position += 1;
                     while self.position < len && (bytes[self.position] as char).is_ascii_digit() {
                         self.position += 1;
@@ -269,6 +276,10 @@ impl<'a> Lexer<'a> {
                 // stop here and let the next `next_token` call classify it.
                 let num_str = &self.input[start..self.position];
                 let num = num_str.parse::<f64>().unwrap_or(0.0);
+                if is_float {
+                    lex_debug!("[DEBUG][lexer] Returning Token::Float({})", num);
+                    return Ok(Token::Float(num));
+                }
                 lex_debug!("[DEBUG][lexer] Returning Token::Number({})", num);
                 return Ok(Token::Number(num));
             }

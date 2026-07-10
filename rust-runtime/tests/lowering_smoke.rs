@@ -5,13 +5,12 @@ fn register_test_hosts(interp: &mut Interpreter) {
   interp.host.insert("len", |args| {
     let v = args.get(0).cloned().unwrap_or(Value::Unit);
     let n = match v {
-      Value::String(ref s) => s.chars().count() as f64,
-      Value::List(ref xs) => xs.len() as f64,
-      Value::Object(ref m) => m.len() as f64,
-      Value::Unit => 0.0,
-      _ => 0.0,
+      Value::String(ref s) => s.chars().count() as i64,
+      Value::List(ref xs) => xs.len() as i64,
+      Value::Object(ref m) => m.len() as i64,
+      _ => 0,
     };
-    Ok(Value::Number(n))
+    Ok(Value::Int(n))
   });
   interp.host.insert("get", |args| {
     if args.len() != 2 { return Err("expected 2 args".into()); }
@@ -42,7 +41,7 @@ fn lower_and_run_basic_if() {
 
     let interp = Interpreter::new();
     let v = interp.run(&program).expect("run ok");
-    assert_eq!(v, Value::Number(7.0));
+    assert_eq!(v, Value::Int(7));
 }
 
 #[test]
@@ -58,7 +57,7 @@ fn lower_and_run_list_literal() {
   let mut interp = Interpreter::new();
   register_test_hosts(&mut interp);
   let v = interp.run(&program).expect("run ok");
-  assert_eq!(v, Value::List(vec![Value::Number(1.0), Value::Number(2.0), Value::Number(3.0)]));
+  assert_eq!(v, Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]));
 }
 
 #[test]
@@ -74,7 +73,7 @@ fn lower_and_run_reassignment() {
   let program = lower.lower_program_basic(&ast);
   let interp = Interpreter::new();
   let v = interp.run(&program).expect("run ok");
-  assert_eq!(v, Value::Number(42.0));
+  assert_eq!(v, Value::Int(42));
 }
 
 #[test]
@@ -115,5 +114,5 @@ fn lower_and_run_member_access_len_and_get() {
   let mut interp = Interpreter::new();
   register_test_hosts(&mut interp);
   let v = interp.run(&program).expect("run ok");
-  assert_eq!(v, Value::Number(8.0)); // "hello" -> 5, [1,2,3] -> 3
+  assert_eq!(v, Value::Int(8)); // "hello" -> 5, [1,2,3] -> 3
 }

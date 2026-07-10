@@ -9,6 +9,9 @@ pub mod logging;
 pub mod file_ops;
 pub mod codegen;
 pub mod hosts;
+pub mod numeric;
+pub mod bignum_template;
+pub mod rational_complex_template;
 
 pub use types::*;
 pub use ops::*;

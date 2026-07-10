@@ -2,6 +2,182 @@ use super::logging::{log_to_file, debug};
 use super::file_ops::{create_temp_file, write_to_file, move_or_copy, file_exists, ensure_dir};
 use super::types::*;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ChunkId {
+    Core,
+    StringsExt,
+    CollectionsHandles,
+    Files,
+    IoMisc,
+    Oo,
+    Logic,
+    Contracts,
+    Networking,
+    CodegenBootstrap,
+    NumericTower,
+    Math,
+}
+
+impl ChunkId {
+    pub const CANONICAL_ORDER: &'static [ChunkId] = &[
+        ChunkId::Core,
+        ChunkId::StringsExt,
+        ChunkId::CollectionsHandles,
+        ChunkId::Files,
+        ChunkId::IoMisc,
+        ChunkId::Oo,
+        ChunkId::Logic,
+        ChunkId::Contracts,
+        ChunkId::Networking,
+        ChunkId::CodegenBootstrap,
+        ChunkId::NumericTower,
+        ChunkId::Math,
+    ];
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            ChunkId::Core => "core",
+            ChunkId::StringsExt => "strings_ext",
+            ChunkId::CollectionsHandles => "collections_handles",
+            ChunkId::Files => "files",
+            ChunkId::IoMisc => "io_misc",
+            ChunkId::Oo => "oo",
+            ChunkId::Logic => "logic",
+            ChunkId::Contracts => "contracts",
+            ChunkId::Networking => "networking",
+            ChunkId::CodegenBootstrap => "codegen_bootstrap",
+            ChunkId::NumericTower => "numeric_tower",
+            ChunkId::Math => "math",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<ChunkId> {
+        Self::CANONICAL_ORDER.iter().copied().find(|c| c.name() == s)
+    }
+
+    fn text(&self) -> &'static str {
+        match self {
+            ChunkId::Core => RustCodegen::PRELUDE_CORE,
+            ChunkId::StringsExt => RustCodegen::PRELUDE_STRINGS_EXT,
+            ChunkId::CollectionsHandles => RustCodegen::PRELUDE_COLLECTIONS_HANDLES,
+            ChunkId::Files => RustCodegen::PRELUDE_FILES,
+            ChunkId::IoMisc => RustCodegen::PRELUDE_IO_MISC,
+            ChunkId::Oo => RustCodegen::PRELUDE_OO,
+            ChunkId::Logic => RustCodegen::PRELUDE_LOGIC,
+            ChunkId::Contracts => RustCodegen::PRELUDE_CONTRACTS,
+            ChunkId::Networking => RustCodegen::PRELUDE_NETWORKING,
+            ChunkId::CodegenBootstrap => RustCodegen::PRELUDE_CODEGEN_BOOTSTRAP,
+            ChunkId::NumericTower => RustCodegen::PRELUDE_NUMERIC_TOWER,
+            ChunkId::Math => RustCodegen::PRELUDE_MATH,
+        }
+    }
+}
+
+/// Static host-function-name -> chunk table, derived from the same
+/// regrouping as the prelude split above.
+const HOST_CHUNK_TABLE: &[(&str, ChunkId)] = &[
+    ("list_get", ChunkId::Core),
+    ("list_len", ChunkId::Core),
+    ("list_push", ChunkId::Core),
+    ("list_set", ChunkId::Core),
+    ("char_code", ChunkId::StringsExt),
+    ("substr", ChunkId::StringsExt),
+    ("chr", ChunkId::StringsExt),
+    ("to_num", ChunkId::StringsExt),
+    ("hash_string", ChunkId::StringsExt),
+    ("vec_new", ChunkId::CollectionsHandles),
+    ("vec_push", ChunkId::CollectionsHandles),
+    ("vec_set", ChunkId::CollectionsHandles),
+    ("vec_get", ChunkId::CollectionsHandles),
+    ("vec_len", ChunkId::CollectionsHandles),
+    ("vec_to_list", ChunkId::CollectionsHandles),
+    ("str_intern", ChunkId::CollectionsHandles),
+    ("sc_len", ChunkId::CollectionsHandles),
+    ("sc_code", ChunkId::CollectionsHandles),
+    ("sc_char", ChunkId::CollectionsHandles),
+    ("sb_new", ChunkId::CollectionsHandles),
+    ("sb_push", ChunkId::CollectionsHandles),
+    ("sb_str", ChunkId::CollectionsHandles),
+    ("read_file", ChunkId::Files),
+    ("write_file", ChunkId::Files),
+    ("touch_file", ChunkId::Files),
+    ("file_exists", ChunkId::Files),
+    ("now_ms", ChunkId::IoMisc),
+    ("byte_length", ChunkId::IoMisc),
+    ("read_line", ChunkId::IoMisc),
+    ("argv", ChunkId::IoMisc),
+    ("print", ChunkId::IoMisc),
+    ("sed", ChunkId::IoMisc),
+    ("add", ChunkId::IoMisc),
+    ("multiply", ChunkId::IoMisc),
+    ("subtract", ChunkId::IoMisc),
+    ("max", ChunkId::IoMisc),
+    ("min", ChunkId::IoMisc),
+    ("calculate", ChunkId::IoMisc),
+    ("calculate_result", ChunkId::IoMisc),
+    ("get_value", ChunkId::IoMisc),
+    ("process", ChunkId::IoMisc),
+    ("validate", ChunkId::IoMisc),
+    ("len", ChunkId::IoMisc),
+    ("new", ChunkId::Oo),
+    ("set_var", ChunkId::Oo),
+    ("get", ChunkId::Oo),
+    ("send", ChunkId::Oo),
+    ("infer_type_for", ChunkId::Logic),
+    ("fact", ChunkId::Logic),
+    ("goal", ChunkId::Logic),
+    ("query", ChunkId::Logic),
+    ("contract_check", ChunkId::Contracts),
+    ("tcp_listen", ChunkId::Networking),
+    ("tcp_connect", ChunkId::Networking),
+    ("tcp_accept", ChunkId::Networking),
+    ("sleep_ms", ChunkId::Networking),
+    ("tcp_accept_timeout", ChunkId::Networking),
+    ("tcp_read", ChunkId::Networking),
+    ("tcp_write", ChunkId::Networking),
+    ("tcp_close", ChunkId::Networking),
+    ("parse_tiny_source", ChunkId::CodegenBootstrap),
+    ("lower_and_compile", ChunkId::CodegenBootstrap),
+    ("emit_rust_for", ChunkId::CodegenBootstrap),
+    ("copy_file", ChunkId::CodegenBootstrap),
+    ("patc_compile_from_argv", ChunkId::CodegenBootstrap),
+    ("get_argv", ChunkId::CodegenBootstrap),
+    ("rustc_build", ChunkId::CodegenBootstrap),
+    ("run_ir", ChunkId::CodegenBootstrap),
+    ("sqrt", ChunkId::Math),
+    ("pow", ChunkId::Math),
+    ("sin", ChunkId::Math),
+    ("cos", ChunkId::Math),
+    ("tan", ChunkId::Math),
+    ("asin", ChunkId::Math),
+    ("acos", ChunkId::Math),
+    ("atan", ChunkId::Math),
+    ("atan2", ChunkId::Math),
+    ("log", ChunkId::Math),
+    ("exp", ChunkId::Math),
+    ("floor", ChunkId::Math),
+    ("ceil", ChunkId::Math),
+    ("round", ChunkId::Math),
+    ("trunc", ChunkId::Math),
+    ("abs", ChunkId::Math),
+    ("numeric_kind", ChunkId::Math),
+];
+
+/// Cross-chunk dependency edges between non-`core` chunks, for
+/// `required_chunks`'s transitive closure. Stage 39 adds the first real
+/// entry: `math`'s chunk text is written entirely in terms of the full
+/// numeric tower's `Value` variants (BigInt/Rational/Complex) and its
+/// NumT/BigIntT/RationalT/ComplexT helper types, so a program that calls
+/// e.g. `sqrt(4)` with NO ordinary arithmetic `BinOp` anywhere (which would
+/// otherwise leave `required_chunks` selecting the FAST plain-`Number(f64)`
+/// `Value` definition per Stage 38's existing rule) must still pull in
+/// `numeric_tower` -- otherwise `math`'s chunk text fails to compile against
+/// the fast `Value` definition, which has no `BigInt`/`Rational`/`Complex`
+/// variants at all.
+const CROSS_CHUNK_EDGES: &[(ChunkId, ChunkId)] = &[
+    (ChunkId::Math, ChunkId::NumericTower),
+];
+
 pub struct RustCodegen;
 
 impl RustCodegen {
@@ -10,8 +186,22 @@ impl RustCodegen {
     // The static runtime library embedded in every emitted program. Exposed
     // separately so self-hosted codegen (PatLang) can build the full source
     // text itself: prelude + generated build_program section.
-    pub fn prelude() -> &'static str {
-        r##"// Auto-generated by patlang IR->Rust codegen (Stage 0)
+    // ---------------------------------------------------------------
+    // Host-function prelude chunking (Stage 37A). The runtime library
+    // text embedded in every emitted program used to be one ~1600-line
+    // `&'static str` (see git history). It is now split into named,
+    // independently-emittable chunks derived directly from the original
+    // `Host::call` match arms (a regrouping, not a redesign): every arm's
+    // body below is byte-for-byte the same code that used to live inline
+    // in the monolithic match statement, just relocated into its chunk's
+    // own `host_call_<chunk>_inner` function.
+    //
+    // `numeric_tower` (Stage 38) and `math` (Stage 39) plug in as future
+    // ChunkId variants once those chunks have real content -- not added
+    // here, out of scope for this task.
+    // ---------------------------------------------------------------
+
+    const PRELUDE_CORE: &'static str = r##"// Auto-generated by patlang IR->Rust codegen (Stage 0)
 #![allow(dead_code, unused_imports, unused_variables, unused_mut)]
 // Standalone runtime + embedded program
 
@@ -21,16 +211,7 @@ use std::cell::RefCell;
 
 thread_local! {
     static OBJECTS: RefCell<HashMap<String, HashMap<String, Value>>> = RefCell::new(HashMap::new());
-    static FACTS: RefCell<HashMap<String, Vec<(String, String)>>> = RefCell::new(HashMap::new());
-    static GOALS: RefCell<Vec<(String, Vec<String>)>> = RefCell::new(Vec::new());
-    static TYPE_RULES: RefCell<HashMap<(String, usize), String>> = RefCell::new(HashMap::new());
     static EVENT_HANDLERS: RefCell<HashMap<String, Vec<String>>> = RefCell::new(HashMap::new());
-    static LISTENERS: RefCell<HashMap<u16, std::net::TcpListener>> = RefCell::new(HashMap::new());
-    static CONNS: RefCell<HashMap<usize, std::net::TcpStream>> = RefCell::new(HashMap::new());
-    static NEXT_CONN: RefCell<usize> = RefCell::new(1);
-    static VECS: RefCell<Vec<Vec<Value>>> = RefCell::new(Vec::new());
-    static SBUFS: RefCell<Vec<String>> = RefCell::new(Vec::new());
-    static ISTRINGS: RefCell<Vec<String>> = RefCell::new(Vec::new());
 }
 
 fn arg_usize(args: &[Value], i: usize, what: &str) -> Result<usize, String> {
@@ -69,7 +250,2020 @@ fn ensure_obj(name: &str, class: &str) {
     obj_set(name, "name", Value::String(name.to_string()));
 }
 
-fn log_to_file(filename: &str, msg: &str) {
+// NOTE: `enum Value` and its `impl` (as_number/as_bool), plus display_value,
+// add/sub/mul/div/modu/cmp/to_s/neg, used to live inline here. As of Stage 38
+// they are provided by exactly one of two mutually-exclusive value-modules
+// selected per compiled program by `prelude_for` (never both, never
+// neither): `PRELUDE_VALUE_FAST` (today's plain `Number(f64)` + new cheap
+// `Int(i64)`/`Float(f64)` fast-path variants, no bignum) when the program's
+// IR contains no numeric operator at all, or `PRELUDE_NUMERIC_TOWER` (adds
+// BigInt/Rational/Complex, hand-rolled, no external crates) when it does.
+// This split exists because `Value`'s definition is shared/monomorphic
+// across every other chunk's text, so its variant set can't differ chunk by
+// chunk within a single build -- see the doc comment on `PRELUDE_VALUE_FAST`
+// for the full rationale (Stage 38, "risky shared-dependency edit").
+
+#[derive(Clone, Debug, PartialEq)]
+enum BinOpKind { Add, Sub, Mul, Div, Mod, Eq, Ne, Lt, Le, Gt, Ge, And, Or }
+#[derive(Clone, Debug, PartialEq)]
+enum UnOpKind { Neg, Not }
+
+#[derive(Clone, Debug, PartialEq)]
+enum Instr {
+    Const(Value),
+    LoadLocal(String),
+    StoreLocal(String),
+    BinOp(BinOpKind),
+    UnOp(UnOpKind),
+    Jump(usize),
+    JumpIfFalse(usize),
+    CallHost(String, usize),
+    Call(String, usize),
+    MakeClosure(String, Vec<String>),
+    CallValue(usize),
+    BuildList(usize),
+    Return,
+}
+
+struct Host;
+
+// Stage 38: literals now emit `Value::Int`/`Value::Float` by default (see
+// `emit_value`), not `Value::Number`, so that `div`'s int/int exactness check
+// can tell them apart. Every host function OTHER than the arithmetic BinOp
+// dispatch (add/sub/mul/div/modu/cmp, handled directly in `run_function`, not
+// via `Host::call`) still pattern-matches `Value::Number` explicitly in its
+// own unmodified chunk text (list indices, counts, etc.) -- per Stage 38's
+// "minimal blast radius" goal those chunks are left untouched. Instead,
+// arguments are coerced back to plain `Number(f64)` right at the `Host::call`
+// boundary, restoring pre-Stage-38 behavior for every non-arithmetic host
+// function regardless of which value-module (`PRELUDE_VALUE_FAST` or
+// `PRELUDE_NUMERIC_TOWER`) is selected.
+fn host_coerce_arg(v: &Value) -> Value {
+    match v {
+        Value::Int(n) => Value::Number(*n as f64),
+        Value::Float(n) => Value::Number(*n),
+        // BigInt/Rational/Complex are passed through UNCHANGED, not lossily
+        // flattened: `print`/`display_value` (and anything else that just
+        // consumes a `Value` generically rather than pattern-matching
+        // `Value::Number` for an index/count) must see the exact tower value,
+        // or e.g. `print(10 / 3)` would silently lose exactness at this
+        // boundary and print a lossy float instead of "10/3". Any
+        // non-arithmetic host function that genuinely expected a plain index
+        // here already had no better fallback pre-Stage-38 either (a
+        // non-`Number`/`String` arg always fell through to that function's
+        // own `_ => default` arm).
+        other => other.clone(),
+    }
+}
+
+impl Host {
+    fn call(name: &str, args: &[Value]) -> Result<Value, String> {
+        let __coerced_args: Vec<Value> = args.iter().map(host_coerce_arg).collect();
+        let args: &[Value] = &__coerced_args;
+        match name {
+"list_get" => {
+                // list_get(list, index)
+                if args.len() != 2 { return Err("expected 2 args".into()); }
+                let idx = match &args[1] { Value::Number(n) => *n as usize, Value::String(s) => s.parse::<usize>().unwrap_or(0), _ => 0 };
+                match &args[0] {
+                    Value::List(xs) => Ok(xs.get(idx).cloned().unwrap_or(Value::Unit)),
+                    Value::String(s) => {
+                        if s.is_ascii() {
+                            return Ok(match s.as_bytes().get(idx) { Some(b) => Value::String((*b as char).to_string()), None => Value::String(String::new()) });
+                        }
+                        let ch = s.chars().nth(idx).unwrap_or('\0');
+                        Ok(Value::String(if ch == '\0' { String::new() } else { ch.to_string() }))
+                    }
+                    _ => Ok(Value::Unit),
+                }
+            }
+            "list_len" => {
+                // list_len(listOrString) -> String count (to match Stage 0 builtins)
+                if args.len() != 1 { return Err("expected 1 arg".into()); }
+                let n = match &args[0] {
+                    Value::List(xs) => xs.len(),
+                    Value::String(s) => s.chars().count(),
+                    _ => 0,
+                };
+                Ok(Value::String(n.to_string()))
+            }
+            "list_push" => {
+                // list_push(list, item) -> new list with item appended
+                if args.len() != 2 { return Err("list_push: expected 2 args".into()); }
+                let mut xs = match &args[0] {
+                    Value::List(xs) => xs.clone(),
+                    Value::Unit => Vec::new(),
+                    _ => return Err("list_push: expected list".into()),
+                };
+                xs.push(args[1].clone());
+                Ok(Value::List(xs))
+            }
+            "list_set" => {
+                // list_set(list, index, value) -> new list with element replaced
+                if args.len() != 3 { return Err("list_set: expected 3 args".into()); }
+                let mut xs = match &args[0] {
+                    Value::List(xs) => xs.clone(),
+                    _ => return Err("list_set: expected list".into()),
+                };
+                let idx = match &args[1] { Value::Number(n) => *n as usize, Value::String(s) => s.parse::<usize>().unwrap_or(usize::MAX), _ => usize::MAX };
+                if idx >= xs.len() { return Err(format!("list_set: index {} out of range (len {})", idx, xs.len())); }
+                xs[idx] = args[2].clone();
+                Ok(Value::List(xs))
+            }
+                        _ => call_dispatch(name, args),
+        }
+    }
+}
+
+// display_value now comes from whichever value-module is selected (see the
+// note above `enum BinOpKind`).
+
+#[derive(Clone)]
+struct Function { name: String, params: Vec<String>, body: Vec<Instr> }
+
+struct Program { functions: HashMap<String, Function>, entry: String }
+
+fn run(program: &Program) -> Result<Value,String> {
+    let entry = program.functions.get(&program.entry).ok_or("entry not found")?;
+    run_function(program, entry, &[])
+}
+
+fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Value,String> {
+    let mut pc: usize = 0;
+    let mut stack: Vec<Value> = Vec::new();
+    let mut locals: HashMap<String, Value> = HashMap::new();
+    // bind params
+    for (i, p) in func.params.iter().enumerate() { if let Some(v) = args.get(i) { locals.insert(p.clone(), v.clone()); } }
+    while pc < func.body.len() {
+        match &func.body[pc] {
+            Instr::Const(v) => stack.push(v.clone()),
+            Instr::LoadLocal(n) => stack.push(locals.get(n).cloned().unwrap_or(Value::Unit)),
+            Instr::StoreLocal(n) => { let v = stack.pop().ok_or("stack underflow")?; locals.insert(n.clone(), v); },
+            Instr::UnOp(k) => {
+                let a = stack.pop().ok_or("stack underflow")?;
+                let r = match k { UnOpKind::Neg => neg(&a)?, UnOpKind::Not => Value::Bool(!a.as_bool()?) };
+                stack.push(r);
+            }
+            Instr::BinOp(k) => {
+                use BinOpKind::*;
+                let b = stack.pop().ok_or("stack underflow")?;
+                let a = stack.pop().ok_or("stack underflow")?;
+                let r = match k {
+                    Add => add(&a,&b)?, Sub => sub(&a,&b)?, Mul => mul(&a,&b)?, Div => div(&a,&b)?, Mod => modu(&a,&b)?,
+                    Eq|Ne|Lt|Le|Gt|Ge => cmp(k, &a, &b)?,
+                    And => Value::Bool(a.as_bool()? && b.as_bool()?),
+                    Or => Value::Bool(a.as_bool()? || b.as_bool()?),
+                };
+                stack.push(r);
+            }
+            Instr::Jump(t) => { pc = *t; continue; }
+            Instr::JumpIfFalse(t) => { let c = stack.pop().ok_or("stack underflow")?; if !c.as_bool()? { pc = *t; continue; } }
+            Instr::CallHost(n, argc) => {
+                let argc = *argc; if stack.len() < argc { return Err("stack underflow".into()); }
+                let args_index = stack.len() - argc; let args: Vec<Value> = stack.drain(args_index..).collect();
+                if n == "emit" {
+                    let ev = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => String::new() };
+                    let payload = args.get(1).cloned().unwrap_or(Value::Unit);
+                    let mut last = Value::Unit;
+                    let handlers: Vec<String> = EVENT_HANDLERS.with(|m| m.borrow().get(&ev).cloned().unwrap_or_default());
+                    for h in handlers {
+                        let callee = program.functions.get(&h).ok_or_else(|| format!("function '{}' not found", h))?;
+                        // Expose event locals for interpolation via __vars as well
+                        obj_set("__vars", "event_name", Value::String(ev.clone()));
+                        obj_set("__vars", "event_data", payload.clone());
+                        // Handlers are synthesized with parameters (event_name, event_data)
+                        last = run_function(program, callee, &[Value::String(ev.clone()), payload.clone()])?;
+                    }
+                    stack.push(last);
+                } else if n == "apply" {
+                    // apply(fname, args...): call a program function by name
+                    let fname = match args.get(0) {
+                        Some(Value::String(s)) => s.clone(),
+                        _ => return Err("apply: expected function name string".into()),
+                    };
+                    let callee = program.functions.get(&fname)
+                        .ok_or_else(|| format!("apply: function '{}' not found", fname))?;
+                    let r = run_function(program, callee, &args[1..])?;
+                    stack.push(r);
+                } else {
+                    let r = Host::call(n, &args)?; stack.push(r);
+                }
+            }
+            Instr::Call(n, argc) => {
+                let argc = *argc; if stack.len() < argc { return Err("stack underflow".into()); }
+                let args_index = stack.len() - argc; let args: Vec<Value> = stack.drain(args_index..).collect();
+                let callee = program.functions.get(n).ok_or_else(|| format!("function '{}' not found", n))?;
+                let r = run_function(program, callee, &args)?; stack.push(r);
+            }
+            Instr::MakeClosure(func_name, captured_names) => {
+                let n = captured_names.len();
+                if stack.len() < n { return Err("stack underflow".into()); }
+                let start = stack.len() - n;
+                let vals: Vec<Value> = stack.drain(start..).collect();
+                let captured: Vec<(String, Value)> = captured_names.iter().cloned().zip(vals).collect();
+                stack.push(Value::Closure { func_name: func_name.clone(), captured });
+            }
+            Instr::CallValue(argc) => {
+                let argc = *argc; if stack.len() < argc { return Err("stack underflow".into()); }
+                let args_index = stack.len() - argc;
+                let call_args: Vec<Value> = stack.drain(args_index..).collect();
+                let callee_val = stack.pop().ok_or("stack underflow")?;
+                match callee_val {
+                    Value::Closure { func_name, captured } => {
+                        let mut full_args: Vec<Value> = captured.into_iter().map(|(_, v)| v).collect();
+                        full_args.extend(call_args);
+                        let callee = program.functions.get(&func_name).ok_or_else(|| format!("function '{}' not found", func_name))?;
+                        let r = run_function(program, callee, &full_args)?;
+                        stack.push(r);
+                    }
+                    other => return Err(format!("cannot call non-closure value: {:?}", other)),
+                }
+            }
+            Instr::BuildList(n) => { let n=*n; if stack.len()<n {return Err("stack underflow".into());} let start=stack.len()-n; let items: Vec<Value>=stack.drain(start..).collect(); stack.push(Value::List(items)); }
+            Instr::Return => { return Ok(stack.pop().unwrap_or(Value::Unit)); }
+        }
+        pc += 1;
+    }
+    Ok(stack.pop().unwrap_or(Value::Unit))
+}
+
+// add/sub/mul/div/modu/cmp/to_s/neg now come from whichever value-module is
+// selected (see the note above `enum BinOpKind`).
+
+fn main(){
+    let program = build_program();
+    match run(&program) { Ok(v) => println!("{}", display_value(&v)), Err(e) => { eprintln!("IR runtime error: {}", e); std::process::exit(1); } }
+}
+
+"##;
+
+    // -----------------------------------------------------------------
+    // Stage 38 -- Value module (mutually exclusive pair).
+    //
+    // `enum Value` (and its arithmetic: as_number/as_bool/display_value/
+    // add/sub/mul/div/modu/cmp/to_s/neg) used to be fixed, always-present
+    // text inside `PRELUDE_CORE`. Stage 38 needed to add BigInt/Rational/
+    // Complex variants, but `Value` is a single shared type referenced by
+    // every other chunk's text (Core's VM loop calls add/sub/etc
+    // unconditionally per `Instr::BinOp`, and every chunk pattern-matches
+    // `Value::Number` in dozens of places) -- so its variant set cannot
+    // differ chunk-by-chunk within one compiled program, and the struct
+    // backing a `BigInt` variant (`BigIntT`) must exist for the enum to
+    // type-check at all if the variant is present in the text.
+    //
+    // Resolution (a pragmatic, explicitly-flagged judgment call -- see
+    // `review-memory-for-the-swirling-octopus.md` Stage 38 step 2): rather
+    // than always paying for the tower, `prelude_for` selects EXACTLY ONE
+    // of these two modules per compiled program, in the slot
+    // `ChunkId::NumericTower` occupies in `CANONICAL_ORDER`:
+    //   - `PRELUDE_VALUE_FAST`: today's `Number(f64)` plus new but cheap
+    //     `Int(i64)`/`Float(f64)` variants (literals emit these by default
+    //     now -- see `emit_value` -- so every compiled program needs them
+    //     regardless of whether it does arithmetic). No BigInt/Rational/
+    //     Complex, no hand-rolled bignum text. Chosen when `required_chunks`
+    //     finds no numeric operator anywhere in the program's IR.
+    //   - `PRELUDE_NUMERIC_TOWER`: adds BigInt/Rational/Complex (hand-rolled
+    //     `BigIntT`/`RationalT`/`ComplexT`/`NumT`, transcribed from the
+    //     already-unit-tested `ir/bignum_template.rs` /
+    //     `ir/rational_complex_template.rs`, std-only, no external crates --
+    //     the emitted program builds via bare `rustc` with no Cargo.toml).
+    //     Chosen whenever `required_chunks` finds any numeric `BinOp`
+    //     (Add/Sub/Mul/Div/Mod) or `UnOp(Neg)` in the IR (a deliberately
+    //     coarse, documented over-approximation per the design doc, not an
+    //     attempt to prove overflow is reachable).
+    // Every other chunk's own text is completely unmodified either way --
+    // both modules define the same function names/signatures
+    // (add/sub/mul/div/modu/cmp/to_s/display_value/neg, `impl Value` with
+    // as_number/as_bool), so whichever one is textually present is exactly
+    // what the rest of the concatenated program links against.
+    // -----------------------------------------------------------------
+
+    const PRELUDE_VALUE_FAST: &'static str = r##"#[derive(Clone, Debug, PartialEq)]
+enum Value {
+    Unit,
+    Bool(bool),
+    Number(f64),
+    Int(i64),
+    Float(f64),
+    String(String),
+    List(Vec<Value>),
+    Object(HashMap<String, Value>),
+    Closure { func_name: String, captured: Vec<(String, Value)> },
+}
+
+impl Value {
+    fn as_number(&self) -> Result<f64, String> {
+        match self {
+            Value::Number(n) => Ok(*n),
+            Value::Int(n) => Ok(*n as f64),
+            Value::Float(n) => Ok(*n),
+            Value::Unit => Ok(0.0),
+            _ => Err("expected number".into()),
+        }
+    }
+    fn as_bool(&self) -> Result<bool, String> {
+        match self {
+            Value::Bool(b) => Ok(*b),
+            Value::Unit => Ok(false),
+            Value::Number(n) => Ok(*n != 0.0),
+            Value::Int(n) => Ok(*n != 0),
+            Value::Float(n) => Ok(*n != 0.0),
+            Value::String(s) => Ok(!s.is_empty()),
+            Value::List(xs) => Ok(!xs.is_empty()),
+            Value::Object(map) => Ok(!map.is_empty()),
+            Value::Closure { .. } => Ok(true),
+        }
+    }
+}
+
+fn display_value(v: &Value) -> String {
+    match v {
+        Value::Unit => String::new(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => if n.fract()==0.0 { format!("{}", *n as i64) } else { n.to_string() },
+        Value::Int(n) => n.to_string(),
+        Value::Float(n) => if n.fract()==0.0 && n.is_finite() { format!("{}", *n as i64) } else { n.to_string() },
+        Value::String(s) => s.clone(),
+        Value::List(xs) => {
+            let parts: Vec<String> = xs.iter().map(|x| display_value(x)).collect();
+            format!("[{}]", parts.join(", "))
+        }
+        Value::Object(map) => {
+            let mut kvs: Vec<String> = map.iter().map(|(k,v)| format!("{}: {}", k, display_value(v))).collect();
+            kvs.sort();
+            format!("{{{}}}", kvs.join(", "))
+        }
+        Value::Closure { .. } => "<closure>".into(),
+    }
+}
+
+fn add(a:&Value,b:&Value)->Result<Value,String>{
+    match (a,b) {
+        (Value::String(sa), _) => Ok(Value::String(format!("{}{}", sa, to_s(b)))),
+        (_, Value::String(sb)) => Ok(Value::String(format!("{}{}", to_s(a), sb))),
+        _ => Ok(Value::Number(a.as_number()? + b.as_number()?)),
+    }
+}
+fn sub(a:&Value,b:&Value)->Result<Value,String>{ Ok(Value::Number(a.as_number()? - b.as_number()?)) }
+fn mul(a:&Value,b:&Value)->Result<Value,String>{ Ok(Value::Number(a.as_number()? * b.as_number()?)) }
+fn div(a:&Value,b:&Value)->Result<Value,String>{ Ok(Value::Number(a.as_number()? / b.as_number()?)) }
+fn modu(a:&Value,b:&Value)->Result<Value,String>{ Ok(Value::Number(a.as_number()? % b.as_number()?)) }
+fn neg(a:&Value)->Result<Value,String>{ Ok(Value::Number(-a.as_number()?)) }
+fn cmp(k:&BinOpKind,a:&Value,b:&Value)->Result<Value,String>{
+    use BinOpKind::*;
+    let res = match k {
+        // Structural equality for Eq/Ne across all Value variants
+        Eq => a == b,
+        Ne => a != b,
+        // Relational: lexicographic for string pairs, numeric otherwise
+        Lt | Le | Gt | Ge => {
+            if let (Value::String(x), Value::String(y)) = (a, b) {
+                match k {
+                    Lt => x < y,
+                    Le => x <= y,
+                    Gt => x > y,
+                    Ge => x >= y,
+                    _ => unreachable!(),
+                }
+            } else {
+                let (an, bn) = (a.as_number()?, b.as_number()?);
+                match k {
+                    Lt => an < bn,
+                    Le => an <= bn,
+                    Gt => an > bn,
+                    Ge => an >= bn,
+                    _ => unreachable!(),
+                }
+            }
+        }
+        _ => false,
+    };
+    Ok(Value::Bool(res))
+}
+fn to_s(v:&Value)->String{ match v { Value::Unit=>String::new(), Value::Bool(b)=>b.to_string(), Value::Number(n)=> if n.fract()==0.0 {format!("{}",*n as i64)} else {n.to_string()}, Value::Int(n)=>n.to_string(), Value::Float(n)=> if n.fract()==0.0 && n.is_finite() {format!("{}",*n as i64)} else {n.to_string()}, Value::String(s)=>s.clone(), Value::List(xs)=>{ let parts:Vec<String>=xs.iter().map(|x|to_s(x)).collect(); format!("[{}]", parts.join(", ")) }, Value::Object(map)=>{ let mut kvs:Vec<String>=map.iter().map(|(k,v)| format!("{}: {}",k,to_s(v))).collect(); kvs.sort(); format!("{{{}}}", kvs.join(", ")) }, Value::Closure{..} => "<closure>".to_string() } }
+"##;
+
+    // Stage 38 -- numeric tower value module. Selected instead of
+    // `PRELUDE_VALUE_FAST` whenever `required_chunks` sees a numeric BinOp
+    // or UnOp(Neg) anywhere in the program's IR. BigIntT/RationalT/NumT/
+    // ComplexT below are hand-transcribed, unmodified-logic copies of
+    // `ir/bignum_template.rs` (Milestone 1) and
+    // `ir/rational_complex_template.rs` (Milestone 2), which are already
+    // unit-tested (23 + 22 tests) in this repo's own `cargo test` -- their
+    // arithmetic is not re-derived here, only adapted to construct/consume
+    // this file's own `Value` enum instead of a bare return type.
+    //
+    // DELIBERATE ASYMMETRY (documented at both definition sites per the
+    // design doc): the *interpreter* (`ir/numeric.rs`) uses the real
+    // `num_bigint::BigInt` crate. This module hand-rolls its own BigIntT
+    // because the emitted program compiles via bare `rustc` on a single
+    // `.rs` file with no `Cargo.toml` and cannot depend on any crate.
+    const PRELUDE_NUMERIC_TOWER: &'static str = r##"#[derive(Clone, Debug, PartialEq)]
+enum Value {
+    Unit,
+    Bool(bool),
+    Number(f64),
+    Int(i64),
+    Float(f64),
+    BigInt(BigIntT),
+    Rational(RationalT),
+    Complex(ComplexT),
+    String(String),
+    List(Vec<Value>),
+    Object(HashMap<String, Value>),
+    Closure { func_name: String, captured: Vec<(String, Value)> },
+}
+
+// ===== BigIntT (hand-transcribed from ir/bignum_template.rs, unmodified logic) =====
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sign { Zero, Positive, Negative }
+
+const NT_BASE: u64 = 1_000_000_000;
+const NT_BASE_DIGITS: usize = 9;
+
+#[derive(Debug, Clone)]
+struct BigIntT { sign: Sign, limbs: Vec<u32> }
+
+impl BigIntT {
+    fn zero() -> Self { BigIntT { sign: Sign::Zero, limbs: Vec::new() } }
+    fn is_zero(&self) -> bool { self.sign == Sign::Zero }
+    fn is_negative(&self) -> bool { self.sign == Sign::Negative }
+
+    fn normalize(mut self) -> Self {
+        while self.limbs.last() == Some(&0) { self.limbs.pop(); }
+        if self.limbs.is_empty() { self.sign = Sign::Zero; }
+        self
+    }
+
+    fn from_i64(n: i64) -> Self {
+        if n == 0 { return BigIntT::zero(); }
+        let sign = if n < 0 { Sign::Negative } else { Sign::Positive };
+        let mut mag: u64 = if n == i64::MIN { (i64::MAX as u64) + 1 } else { n.unsigned_abs() };
+        let mut limbs = Vec::new();
+        if mag == 0 { limbs.push(0); }
+        while mag > 0 { limbs.push((mag % NT_BASE) as u32); mag /= NT_BASE; }
+        BigIntT { sign, limbs }.normalize()
+    }
+
+    fn from_decimal_str(s: &str) -> Option<Self> {
+        let s = s.trim();
+        if s.is_empty() { return None; }
+        let (neg, digits) = match s.as_bytes()[0] {
+            b'-' => (true, &s[1..]),
+            b'+' => (false, &s[1..]),
+            _ => (false, s),
+        };
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) { return None; }
+        let trimmed = digits.trim_start_matches('0');
+        if trimmed.is_empty() { return Some(BigIntT::zero()); }
+        let mut limbs = Vec::new();
+        let bytes = trimmed.as_bytes();
+        let mut end = bytes.len();
+        while end > 0 {
+            let start = if end >= NT_BASE_DIGITS { end - NT_BASE_DIGITS } else { 0 };
+            let chunk = std::str::from_utf8(&bytes[start..end]).unwrap();
+            let limb: u32 = chunk.parse().unwrap();
+            limbs.push(limb);
+            end = start;
+        }
+        let sign = if neg { Sign::Negative } else { Sign::Positive };
+        Some(BigIntT { sign, limbs }.normalize())
+    }
+
+    fn to_string(&self) -> String {
+        if self.is_zero() { return "0".to_string(); }
+        let mut s = String::new();
+        if self.sign == Sign::Negative { s.push('-'); }
+        let mut iter = self.limbs.iter().rev();
+        let msl = iter.next().unwrap();
+        s.push_str(&msl.to_string());
+        for limb in iter { s.push_str(&format!("{:0width$}", limb, width = NT_BASE_DIGITS)); }
+        s
+    }
+
+    fn negate(&self) -> Self {
+        let sign = match self.sign { Sign::Zero => Sign::Zero, Sign::Positive => Sign::Negative, Sign::Negative => Sign::Positive };
+        BigIntT { sign, limbs: self.limbs.clone() }
+    }
+
+    fn cmp_mag(a: &[u32], b: &[u32]) -> std::cmp::Ordering {
+        if a.len() != b.len() { return a.len().cmp(&b.len()); }
+        for i in (0..a.len()).rev() { if a[i] != b[i] { return a[i].cmp(&b[i]); } }
+        std::cmp::Ordering::Equal
+    }
+
+    fn add_mag(a: &[u32], b: &[u32]) -> Vec<u32> {
+        let mut result = Vec::with_capacity(a.len().max(b.len()) + 1);
+        let mut carry: u64 = 0;
+        for i in 0..a.len().max(b.len()) {
+            let av = *a.get(i).unwrap_or(&0) as u64;
+            let bv = *b.get(i).unwrap_or(&0) as u64;
+            let sum = av + bv + carry;
+            result.push((sum % NT_BASE) as u32);
+            carry = sum / NT_BASE;
+        }
+        if carry > 0 { result.push(carry as u32); }
+        result
+    }
+
+    fn sub_mag(a: &[u32], b: &[u32]) -> Vec<u32> {
+        let mut result = Vec::with_capacity(a.len());
+        let mut borrow: i64 = 0;
+        for i in 0..a.len() {
+            let av = a[i] as i64;
+            let bv = *b.get(i).unwrap_or(&0) as i64;
+            let mut diff = av - bv - borrow;
+            if diff < 0 { diff += NT_BASE as i64; borrow = 1; } else { borrow = 0; }
+            result.push(diff as u32);
+        }
+        result
+    }
+
+    fn add(&self, other: &BigIntT) -> BigIntT {
+        if self.is_zero() { return other.clone(); }
+        if other.is_zero() { return self.clone(); }
+        if self.sign == other.sign {
+            BigIntT { sign: self.sign, limbs: Self::add_mag(&self.limbs, &other.limbs) }.normalize()
+        } else {
+            match Self::cmp_mag(&self.limbs, &other.limbs) {
+                std::cmp::Ordering::Equal => BigIntT::zero(),
+                std::cmp::Ordering::Greater => BigIntT { sign: self.sign, limbs: Self::sub_mag(&self.limbs, &other.limbs) }.normalize(),
+                std::cmp::Ordering::Less => BigIntT { sign: other.sign, limbs: Self::sub_mag(&other.limbs, &self.limbs) }.normalize(),
+            }
+        }
+    }
+
+    fn sub(&self, other: &BigIntT) -> BigIntT { self.add(&other.negate()) }
+
+    fn mul(&self, other: &BigIntT) -> BigIntT {
+        if self.is_zero() || other.is_zero() { return BigIntT::zero(); }
+        let mut result = vec![0u64; self.limbs.len() + other.limbs.len()];
+        for (i, &av) in self.limbs.iter().enumerate() {
+            if av == 0 { continue; }
+            let mut carry: u64 = 0;
+            for (j, &bv) in other.limbs.iter().enumerate() {
+                let idx = i + j;
+                let prod = (av as u64) * (bv as u64) + result[idx] + carry;
+                result[idx] = prod % NT_BASE;
+                carry = prod / NT_BASE;
+            }
+            let mut k = i + other.limbs.len();
+            while carry > 0 { let sum = result[k] + carry; result[k] = sum % NT_BASE; carry = sum / NT_BASE; k += 1; }
+        }
+        let sign = if self.sign == other.sign { Sign::Positive } else { Sign::Negative };
+        let limbs: Vec<u32> = result.into_iter().map(|x| x as u32).collect();
+        BigIntT { sign, limbs }.normalize()
+    }
+
+    fn div_rem(&self, other: &BigIntT) -> (BigIntT, BigIntT) {
+        if other.is_zero() { panic!("BigIntT division by zero"); }
+        if self.is_zero() { return (BigIntT::zero(), BigIntT::zero()); }
+        if Self::cmp_mag(&self.limbs, &other.limbs) == std::cmp::Ordering::Less {
+            return (BigIntT::zero(), self.clone());
+        }
+        let other_mag = BigIntT { sign: Sign::Positive, limbs: other.limbs.clone() };
+        let mut remainder = BigIntT::zero();
+        let mut quotient_limbs = vec![0u32; self.limbs.len()];
+        for i in (0..self.limbs.len()).rev() {
+            remainder = remainder.mul_by_base().add(&BigIntT::from_i64(self.limbs[i] as i64));
+            let mut lo: u64 = 0;
+            let mut hi: u64 = NT_BASE - 1;
+            while lo < hi {
+                let mid = (lo + hi + 1) / 2;
+                let candidate = other_mag.mul(&BigIntT::from_i64(mid as i64));
+                if Self::cmp_mag(&candidate.limbs, &remainder.limbs) != std::cmp::Ordering::Greater { lo = mid; } else { hi = mid - 1; }
+            }
+            quotient_limbs[i] = lo as u32;
+            remainder = remainder.sub(&other_mag.mul(&BigIntT::from_i64(lo as i64)));
+        }
+        let quotient_sign_positive = self.sign == other.sign;
+        let quotient = BigIntT {
+            sign: if quotient_limbs.iter().all(|&x| x == 0) { Sign::Zero } else if quotient_sign_positive { Sign::Positive } else { Sign::Negative },
+            limbs: quotient_limbs,
+        }.normalize();
+        let remainder = if remainder.is_zero() { BigIntT::zero() } else { BigIntT { sign: self.sign, limbs: remainder.limbs }.normalize() };
+        (quotient, remainder)
+    }
+
+    fn mul_by_base(&self) -> BigIntT {
+        if self.is_zero() { return BigIntT::zero(); }
+        let mut limbs = Vec::with_capacity(self.limbs.len() + 1);
+        limbs.push(0);
+        limbs.extend_from_slice(&self.limbs);
+        BigIntT { sign: self.sign, limbs }.normalize()
+    }
+
+    fn cmp(&self, other: &BigIntT) -> std::cmp::Ordering {
+        use Sign::*;
+        match (self.sign, other.sign) {
+            (Zero, Zero) => std::cmp::Ordering::Equal,
+            (Zero, Positive) => std::cmp::Ordering::Less,
+            (Zero, Negative) => std::cmp::Ordering::Greater,
+            (Positive, Zero) => std::cmp::Ordering::Greater,
+            (Negative, Zero) => std::cmp::Ordering::Less,
+            (Positive, Negative) => std::cmp::Ordering::Greater,
+            (Negative, Positive) => std::cmp::Ordering::Less,
+            (Positive, Positive) => Self::cmp_mag(&self.limbs, &other.limbs),
+            (Negative, Negative) => Self::cmp_mag(&other.limbs, &self.limbs),
+        }
+    }
+
+    fn eq(&self, other: &BigIntT) -> bool { self.cmp(other) == std::cmp::Ordering::Equal }
+}
+
+impl std::fmt::Display for BigIntT { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.to_string()) } }
+impl PartialEq for BigIntT { fn eq(&self, other: &Self) -> bool { BigIntT::eq(self, other) } }
+impl Eq for BigIntT {}
+impl PartialOrd for BigIntT { fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) } }
+impl Ord for BigIntT { fn cmp(&self, other: &Self) -> std::cmp::Ordering { BigIntT::cmp(self, other) } }
+
+fn nt_gcd(a: &BigIntT, b: &BigIntT) -> BigIntT {
+    let mut a = BigIntT { sign: if a.is_zero() { Sign::Zero } else { Sign::Positive }, limbs: a.limbs.clone() };
+    let mut b = BigIntT { sign: if b.is_zero() { Sign::Zero } else { Sign::Positive }, limbs: b.limbs.clone() };
+    while !b.is_zero() {
+        let (_, r) = a.div_rem(&b);
+        let r_abs = BigIntT { sign: if r.is_zero() { Sign::Zero } else { Sign::Positive }, limbs: r.limbs };
+        a = b;
+        b = r_abs;
+    }
+    a
+}
+
+// ===== RationalT/NumT/ComplexT (hand-transcribed from ir/rational_complex_template.rs, unmodified logic) =====
+
+#[derive(Debug, Clone, PartialEq)]
+struct RationalT { num: BigIntT, den: BigIntT }
+
+impl RationalT {
+    fn new(num: BigIntT, den: BigIntT) -> Self {
+        if den.is_zero() { panic!("RationalT: zero denominator"); }
+        let (num, den) = if den.is_negative() { (num.negate(), den.negate()) } else { (num, den) };
+        if num.is_zero() { return RationalT { num: BigIntT::zero(), den: BigIntT::from_i64(1) }; }
+        let g = nt_gcd(&num, &den);
+        if g.is_zero() || g.eq(&BigIntT::from_i64(1)) {
+            RationalT { num, den }
+        } else {
+            let (qn, _) = num.div_rem(&g);
+            let (qd, _) = den.div_rem(&g);
+            RationalT { num: qn, den: qd }
+        }
+    }
+    fn from_i64_pair(n: i64, d: i64) -> Self { RationalT::new(BigIntT::from_i64(n), BigIntT::from_i64(d)) }
+    fn is_zero(&self) -> bool { self.num.is_zero() }
+    fn add(&self, other: &RationalT) -> RationalT {
+        let num = self.num.mul(&other.den).add(&other.num.mul(&self.den));
+        let den = self.den.mul(&other.den);
+        RationalT::new(num, den)
+    }
+    fn sub(&self, other: &RationalT) -> RationalT {
+        let num = self.num.mul(&other.den).sub(&other.num.mul(&self.den));
+        let den = self.den.mul(&other.den);
+        RationalT::new(num, den)
+    }
+    fn mul(&self, other: &RationalT) -> RationalT { RationalT::new(self.num.mul(&other.num), self.den.mul(&other.den)) }
+    fn div(&self, other: &RationalT) -> RationalT {
+        if other.is_zero() { panic!("RationalT: division by zero"); }
+        RationalT::new(self.num.mul(&other.den), self.den.mul(&other.num))
+    }
+    fn cmp(&self, other: &RationalT) -> std::cmp::Ordering {
+        let lhs = self.num.mul(&other.den);
+        let rhs = other.num.mul(&self.den);
+        lhs.cmp(&rhs)
+    }
+    fn eq(&self, other: &RationalT) -> bool { self.cmp(other) == std::cmp::Ordering::Equal }
+    fn to_bigint_if_integer(&self) -> Option<BigIntT> {
+        if self.den.eq(&BigIntT::from_i64(1)) { Some(self.num.clone()) } else { None }
+    }
+    fn to_f64(&self) -> f64 { nt_bigint_to_f64_lossy(&self.num) / nt_bigint_to_f64_lossy(&self.den) }
+}
+
+fn nt_bigint_to_f64_lossy(b: &BigIntT) -> f64 { b.to_string().parse::<f64>().unwrap_or(f64::NAN) }
+
+#[derive(Debug, Clone, PartialEq)]
+enum NumT { Int(i64), Float(f64), Big(BigIntT), Rat(RationalT) }
+
+impl NumT {
+    fn rank(&self) -> u8 { match self { NumT::Int(_) => 0, NumT::Big(_) => 1, NumT::Rat(_) => 2, NumT::Float(_) => 3 } }
+    fn to_bigint(&self) -> BigIntT { match self { NumT::Int(n) => BigIntT::from_i64(*n), NumT::Big(b) => b.clone(), _ => panic!("NumT::to_bigint: not integer-valued") } }
+    fn to_rational(&self) -> RationalT {
+        match self {
+            NumT::Int(n) => RationalT::from_i64_pair(*n, 1),
+            NumT::Big(b) => RationalT::new(b.clone(), BigIntT::from_i64(1)),
+            NumT::Rat(r) => r.clone(),
+            NumT::Float(_) => panic!("NumT::to_rational: not exact"),
+        }
+    }
+    fn to_f64(&self) -> f64 {
+        match self { NumT::Int(n) => *n as f64, NumT::Float(f) => *f, NumT::Big(b) => nt_bigint_to_f64_lossy(b), NumT::Rat(r) => r.to_f64() }
+    }
+    fn promote_pair(a: &NumT, b: &NumT) -> (NumT, NumT) {
+        let ra = a.rank(); let rb = b.rank();
+        if ra == 3 || rb == 3 { return (NumT::Float(a.to_f64()), NumT::Float(b.to_f64())); }
+        if ra == 2 || rb == 2 { return (NumT::Rat(a.to_rational()), NumT::Rat(b.to_rational())); }
+        if ra == 1 || rb == 1 { return (NumT::Big(a.to_bigint()), NumT::Big(b.to_bigint())); }
+        (a.clone(), b.clone())
+    }
+    fn normalize(self) -> NumT {
+        match self {
+            NumT::Big(b) => match nt_i64_from_bigint(&b) { Some(n) => NumT::Int(n), None => NumT::Big(b) },
+            NumT::Rat(r) => match r.to_bigint_if_integer() { Some(b) => NumT::Big(b).normalize(), None => NumT::Rat(r) },
+            other => other,
+        }
+    }
+    fn add(&self, other: &NumT) -> NumT {
+        let (a, b) = NumT::promote_pair(self, other);
+        let result = match (a, b) {
+            (NumT::Int(x), NumT::Int(y)) => match x.checked_add(y) { Some(v) => NumT::Int(v), None => NumT::Big(BigIntT::from_i64(x).add(&BigIntT::from_i64(y))) },
+            (NumT::Big(x), NumT::Big(y)) => NumT::Big(x.add(&y)),
+            (NumT::Rat(x), NumT::Rat(y)) => NumT::Rat(x.add(&y)),
+            (NumT::Float(x), NumT::Float(y)) => NumT::Float(x + y),
+            _ => unreachable!("promote_pair always yields same-kind pairs"),
+        };
+        result.normalize()
+    }
+    fn sub(&self, other: &NumT) -> NumT {
+        let (a, b) = NumT::promote_pair(self, other);
+        let result = match (a, b) {
+            (NumT::Int(x), NumT::Int(y)) => match x.checked_sub(y) { Some(v) => NumT::Int(v), None => NumT::Big(BigIntT::from_i64(x).sub(&BigIntT::from_i64(y))) },
+            (NumT::Big(x), NumT::Big(y)) => NumT::Big(x.sub(&y)),
+            (NumT::Rat(x), NumT::Rat(y)) => NumT::Rat(x.sub(&y)),
+            (NumT::Float(x), NumT::Float(y)) => NumT::Float(x - y),
+            _ => unreachable!("promote_pair always yields same-kind pairs"),
+        };
+        result.normalize()
+    }
+    fn mul(&self, other: &NumT) -> NumT {
+        let (a, b) = NumT::promote_pair(self, other);
+        let result = match (a, b) {
+            (NumT::Int(x), NumT::Int(y)) => match x.checked_mul(y) { Some(v) => NumT::Int(v), None => NumT::Big(BigIntT::from_i64(x).mul(&BigIntT::from_i64(y))) },
+            (NumT::Big(x), NumT::Big(y)) => NumT::Big(x.mul(&y)),
+            (NumT::Rat(x), NumT::Rat(y)) => NumT::Rat(x.mul(&y)),
+            (NumT::Float(x), NumT::Float(y)) => NumT::Float(x * y),
+            _ => unreachable!("promote_pair always yields same-kind pairs"),
+        };
+        result.normalize()
+    }
+    fn is_zero(&self) -> bool { match self { NumT::Int(n) => *n == 0, NumT::Float(f) => *f == 0.0, NumT::Big(b) => b.is_zero(), NumT::Rat(r) => r.is_zero() } }
+    fn negate(&self) -> NumT {
+        match self {
+            NumT::Int(x) => match x.checked_neg() { Some(r) => NumT::Int(r), None => NumT::Big(BigIntT::from_i64(*x).negate()) },
+            NumT::Float(x) => NumT::Float(-x),
+            NumT::Big(b) => NumT::Big(b.negate()),
+            NumT::Rat(r) => NumT::Rat(RationalT::new(r.num.negate(), r.den.clone())),
+        }
+    }
+}
+
+fn nt_i64_from_bigint(b: &BigIntT) -> Option<i64> { b.to_string().parse::<i64>().ok() }
+
+#[derive(Debug, Clone, PartialEq)]
+struct ComplexT { re: NumT, im: NumT }
+
+impl ComplexT {
+    fn new(re: NumT, im: NumT) -> Self { ComplexT { re, im } }
+    fn add(&self, other: &ComplexT) -> ComplexT { ComplexT { re: self.re.add(&other.re), im: self.im.add(&other.im) } }
+    fn sub(&self, other: &ComplexT) -> ComplexT { ComplexT { re: self.re.sub(&other.re), im: self.im.sub(&other.im) } }
+    fn mul(&self, other: &ComplexT) -> ComplexT {
+        let ac = self.re.mul(&other.re);
+        let bd = self.im.mul(&other.im);
+        let ad = self.re.mul(&other.im);
+        let bc = self.im.mul(&other.re);
+        ComplexT { re: ac.sub(&bd), im: ad.add(&bc) }
+    }
+    fn div(&self, other: &ComplexT) -> ComplexT {
+        let denom = other.re.mul(&other.re).add(&other.im.mul(&other.im));
+        if denom.is_zero() { panic!("ComplexT: division by zero (zero-magnitude divisor)"); }
+        let num_re = self.re.mul(&other.re).add(&self.im.mul(&other.im));
+        let num_im = self.im.mul(&other.re).sub(&self.re.mul(&other.im));
+        if let Some(denom_big) = nt_to_bigint_exact(&denom) {
+            if let (Some(nre), Some(nim)) = (nt_to_bigint_exact(&num_re), nt_to_bigint_exact(&num_im)) {
+                let re = NumT::Rat(RationalT::new(nre, denom_big.clone())).normalize();
+                let im = NumT::Rat(RationalT::new(nim, denom_big)).normalize();
+                return ComplexT { re, im };
+            }
+        }
+        let d = denom.to_f64();
+        ComplexT { re: NumT::Float(num_re.to_f64() / d), im: NumT::Float(num_im.to_f64() / d) }
+    }
+    fn to_real_if_zero_imaginary(&self) -> Option<NumT> { if self.im.is_zero() { Some(self.re.clone()) } else { None } }
+}
+
+fn nt_to_bigint_exact(v: &NumT) -> Option<BigIntT> {
+    match v { NumT::Int(n) => Some(BigIntT::from_i64(*n)), NumT::Big(b) => Some(b.clone()), NumT::Rat(r) => r.to_bigint_if_integer(), NumT::Float(_) => None }
+}
+
+// ===== Value <-> tower bridge, and Value-level as_number/as_bool/display/arith =====
+
+fn nt_from_value(v: &Value) -> Result<NumT, String> {
+    match v {
+        Value::Int(n) => Ok(NumT::Int(*n)),
+        Value::Float(n) => Ok(NumT::Float(*n)),
+        Value::Number(n) => Ok(NumT::Float(*n)),
+        Value::BigInt(b) => Ok(NumT::Big(b.clone())),
+        Value::Rational(r) => Ok(NumT::Rat(r.clone())),
+        Value::Unit => Ok(NumT::Int(0)),
+        _ => Err("expected number".to_string()),
+    }
+}
+fn nt_to_value(n: NumT) -> Value {
+    match n {
+        NumT::Int(x) => Value::Int(x),
+        NumT::Float(x) => Value::Float(x),
+        NumT::Big(b) => Value::BigInt(b),
+        NumT::Rat(r) => Value::Rational(r),
+    }
+}
+fn nt_to_complex(v: &Value) -> Result<ComplexT, String> {
+    match v {
+        Value::Complex(c) => Ok(c.clone()),
+        other => Ok(ComplexT::new(nt_from_value(other)?, NumT::Int(0))),
+    }
+}
+fn nt_normalize_complex(c: ComplexT) -> Value {
+    match c.to_real_if_zero_imaginary() {
+        Some(n) => nt_to_value(n.normalize()),
+        None => Value::Complex(c),
+    }
+}
+
+impl Value {
+    fn as_number(&self) -> Result<f64, String> {
+        match self {
+            Value::Number(n) => Ok(*n),
+            Value::Int(n) => Ok(*n as f64),
+            Value::Float(n) => Ok(*n),
+            Value::BigInt(b) => Ok(nt_bigint_to_f64_lossy(b)),
+            Value::Rational(r) => Ok(r.to_f64()),
+            Value::Complex(c) => Ok(c.re.to_f64()),
+            Value::Unit => Ok(0.0),
+            _ => Err("expected number".into()),
+        }
+    }
+    fn as_bool(&self) -> Result<bool, String> {
+        match self {
+            Value::Bool(b) => Ok(*b),
+            Value::Unit => Ok(false),
+            Value::Number(n) => Ok(*n != 0.0),
+            Value::Int(n) => Ok(*n != 0),
+            Value::Float(n) => Ok(*n != 0.0),
+            Value::BigInt(b) => Ok(!b.is_zero()),
+            Value::Rational(r) => Ok(!r.is_zero()),
+            Value::Complex(_) => Ok(true),
+            Value::String(s) => Ok(!s.is_empty()),
+            Value::List(xs) => Ok(!xs.is_empty()),
+            Value::Object(map) => Ok(!map.is_empty()),
+            Value::Closure { .. } => Ok(true),
+        }
+    }
+}
+
+fn nt_value_to_string(v: &Value) -> String {
+    match v {
+        Value::Unit => String::new(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => if n.fract()==0.0 { format!("{}", *n as i64) } else { n.to_string() },
+        Value::Int(n) => n.to_string(),
+        Value::Float(n) => if n.fract()==0.0 && n.is_finite() { format!("{}", *n as i64) } else { n.to_string() },
+        Value::BigInt(b) => b.to_string(),
+        Value::Rational(r) => format!("{}/{}", r.num, r.den),
+        Value::Complex(c) => format!("{}+{}i", nt_num_to_string(&c.re), nt_num_to_string(&c.im)),
+        Value::String(s) => s.clone(),
+        Value::List(xs) => { let parts: Vec<String> = xs.iter().map(nt_value_to_string).collect(); format!("[{}]", parts.join(", ")) }
+        Value::Object(map) => {
+            let mut kvs: Vec<String> = map.iter().map(|(k,v)| format!("{}: {}", k, nt_value_to_string(v))).collect();
+            kvs.sort();
+            format!("{{{}}}", kvs.join(", "))
+        }
+        Value::Closure { .. } => "<closure>".into(),
+    }
+}
+fn nt_num_to_string(n: &NumT) -> String {
+    match n {
+        NumT::Int(x) => x.to_string(),
+        NumT::Float(x) => if x.fract()==0.0 && x.is_finite() { format!("{}", *x as i64) } else { x.to_string() },
+        NumT::Big(b) => b.to_string(),
+        NumT::Rat(r) => format!("{}/{}", r.num, r.den),
+    }
+}
+
+fn display_value(v: &Value) -> String { nt_value_to_string(v) }
+fn to_s(v: &Value) -> String { nt_value_to_string(v) }
+
+fn add(a:&Value,b:&Value)->Result<Value,String>{
+    match (a,b) {
+        (Value::String(sa), _) => Ok(Value::String(format!("{}{}", sa, to_s(b)))),
+        (_, Value::String(sb)) => Ok(Value::String(format!("{}{}", to_s(a), sb))),
+        (Value::Complex(_), _) | (_, Value::Complex(_)) => Ok(nt_normalize_complex(nt_to_complex(a)?.add(&nt_to_complex(b)?))),
+        _ => Ok(nt_to_value(nt_from_value(a)?.add(&nt_from_value(b)?))),
+    }
+}
+fn sub(a:&Value,b:&Value)->Result<Value,String>{
+    match (a,b) {
+        (Value::Complex(_), _) | (_, Value::Complex(_)) => Ok(nt_normalize_complex(nt_to_complex(a)?.sub(&nt_to_complex(b)?))),
+        _ => Ok(nt_to_value(nt_from_value(a)?.sub(&nt_from_value(b)?))),
+    }
+}
+fn mul(a:&Value,b:&Value)->Result<Value,String>{
+    match (a,b) {
+        (Value::Complex(_), _) | (_, Value::Complex(_)) => Ok(nt_normalize_complex(nt_to_complex(a)?.mul(&nt_to_complex(b)?))),
+        _ => Ok(nt_to_value(nt_from_value(a)?.mul(&nt_from_value(b)?))),
+    }
+}
+fn div(a:&Value,b:&Value)->Result<Value,String>{
+    if matches!(a, Value::Complex(_)) || matches!(b, Value::Complex(_)) {
+        return Ok(nt_normalize_complex(nt_to_complex(a)?.div(&nt_to_complex(b)?)));
+    }
+    let na = nt_from_value(a)?; let nb = nt_from_value(b)?;
+    let (pa, pb) = NumT::promote_pair(&na, &nb);
+    match (pa, pb) {
+        (NumT::Float(x), NumT::Float(y)) => Ok(Value::Float(x / y)),
+        (NumT::Int(x), NumT::Int(y)) => {
+            if y == 0 { return Err("division by zero".to_string()); }
+            if x % y == 0 { Ok(Value::Int(x / y)) } else { Ok(nt_to_value(NumT::Rat(RationalT::from_i64_pair(x, y)).normalize())) }
+        }
+        (NumT::Big(x), NumT::Big(y)) => {
+            if y.is_zero() { return Err("division by zero".to_string()); }
+            let (q, r) = x.div_rem(&y);
+            if r.is_zero() { Ok(nt_to_value(NumT::Big(q).normalize())) } else { Ok(nt_to_value(NumT::Rat(RationalT::new(x, y)).normalize())) }
+        }
+        (NumT::Rat(x), NumT::Rat(y)) => {
+            if y.is_zero() { return Err("division by zero".to_string()); }
+            Ok(nt_to_value(NumT::Rat(x.div(&y)).normalize()))
+        }
+        _ => Err("type error in div".to_string()),
+    }
+}
+fn modu(a:&Value,b:&Value)->Result<Value,String>{
+    if matches!(a, Value::Complex(_)) || matches!(b, Value::Complex(_)) { return Err("modulo not supported for complex".to_string()); }
+    let na = nt_from_value(a)?; let nb = nt_from_value(b)?;
+    let (pa, pb) = NumT::promote_pair(&na, &nb);
+    match (pa, pb) {
+        (NumT::Float(x), NumT::Float(y)) => Ok(Value::Float(x % y)),
+        (NumT::Int(x), NumT::Int(y)) => { if y == 0 { return Err("modulo by zero".to_string()); } Ok(Value::Int(x % y)) }
+        (NumT::Big(x), NumT::Big(y)) => {
+            if y.is_zero() { return Err("modulo by zero".to_string()); }
+            let (_, r) = x.div_rem(&y);
+            Ok(nt_to_value(NumT::Big(r).normalize()))
+        }
+        (NumT::Rat(x), NumT::Rat(y)) => {
+            if y.is_zero() { return Err("modulo by zero".to_string()); }
+            let common = x.num.mul(&y.den);
+            let rhs = y.num.mul(&x.den);
+            let (_, rem) = common.div_rem(&rhs);
+            Ok(nt_to_value(NumT::Rat(RationalT::new(rem, x.den.mul(&y.den))).normalize()))
+        }
+        _ => Err("type error in mod".to_string()),
+    }
+}
+fn neg(a:&Value)->Result<Value,String>{
+    match a {
+        Value::Int(n) => match n.checked_neg() { Some(r) => Ok(Value::Int(r)), None => Ok(nt_to_value(NumT::Big(BigIntT::from_i64(*n).negate()).normalize())) },
+        Value::Float(n) => Ok(Value::Float(-n)),
+        Value::Number(n) => Ok(Value::Number(-n)),
+        Value::BigInt(b) => Ok(nt_to_value(NumT::Big(b.negate()).normalize())),
+        Value::Rational(r) => Ok(nt_to_value(NumT::Rat(RationalT::new(r.num.negate(), r.den.clone())).normalize())),
+        Value::Complex(c) => Ok(nt_normalize_complex(ComplexT { re: c.re.negate(), im: c.im.negate() })),
+        Value::Unit => Ok(Value::Int(0)),
+        _ => Err("expected number".to_string()),
+    }
+}
+fn cmp(k:&BinOpKind,a:&Value,b:&Value)->Result<Value,String>{
+    use BinOpKind::*;
+    if let (Value::String(x), Value::String(y)) = (a, b) {
+        let res = match k { Eq=>x==y, Ne=>x!=y, Lt=>x<y, Le=>x<=y, Gt=>x>y, Ge=>x>=y, _=>false };
+        return Ok(Value::Bool(res));
+    }
+    let na = nt_from_value(a).ok();
+    let nb = nt_from_value(b).ok();
+    if let (Some(na), Some(nb)) = (na, nb) {
+        let (pa, pb) = NumT::promote_pair(&na, &nb);
+        let ord = match (&pa, &pb) {
+            (NumT::Int(x), NumT::Int(y)) => x.cmp(y),
+            (NumT::Float(x), NumT::Float(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
+            (NumT::Big(x), NumT::Big(y)) => x.cmp(y),
+            (NumT::Rat(x), NumT::Rat(y)) => x.cmp(y),
+            _ => std::cmp::Ordering::Equal,
+        };
+        let res = match k { Eq=>ord==std::cmp::Ordering::Equal, Ne=>ord!=std::cmp::Ordering::Equal, Lt=>ord==std::cmp::Ordering::Less, Le=>ord!=std::cmp::Ordering::Greater, Gt=>ord==std::cmp::Ordering::Greater, Ge=>ord!=std::cmp::Ordering::Less, _=>false };
+        return Ok(Value::Bool(res));
+    }
+    if matches!(a, Value::Complex(_)) || matches!(b, Value::Complex(_)) {
+        let ca = nt_to_complex(a)?; let cb = nt_to_complex(b)?;
+        let eq = ca == cb;
+        let res = match k { Eq=>eq, Ne=>!eq, _=>false };
+        return Ok(Value::Bool(res));
+    }
+    let res = match k { Eq=>a==b, Ne=>a!=b, _=>false };
+    Ok(Value::Bool(res))
+}
+"##;
+
+    // Stage 39 -- math library primitives, mirroring `ir/hosts.rs`'s
+    // `host_sqrt`/`host_pow`/etc but operating on the emitted program's own
+    // `Value`/`NumT`/`BigIntT`/`RationalT`/`ComplexT` types (reusing the
+    // `PRELUDE_NUMERIC_TOWER` building blocks rather than re-deriving BigInt
+    // sqrt/pow from scratch). Always paired with `numeric_tower` via
+    // `CROSS_CHUNK_EDGES` (see that table's doc comment) so these types exist
+    // whenever this chunk's text is present.
+    //
+    // Judgment call (documented, not a bug): `Host::call`'s existing
+    // `host_coerce_arg` (see the note above `impl Host`) flattens `Value::Int`
+    // and `Value::Float` down to `Value::Number(f64)` at the host-call
+    // boundary for every non-arithmetic host function, math's primitives
+    // included -- only `BigInt`/`Rational`/`Complex` survive that boundary
+    // unchanged. So a small literal like `sqrt(4)` arrives here as
+    // `Value::Number(4.0)`, not `Value::Int(4)`; exactness for perfect
+    // squares/integer powers is recovered by treating a whole-valued
+    // `Value::Number` the same as an `Int` would be, which is exact for any
+    // magnitude that survives an f64 round-trip and degrades gracefully (falls
+    // back to the float path) beyond that -- already-promoted `BigInt`/
+    // `Rational` values (e.g. the result of prior arithmetic) keep full
+    // exactness regardless, since those variants are untouched by coercion.
+    const PRELUDE_MATH: &'static str = r##"fn math_num_decimal_digits(n: &BigIntT) -> usize {
+    let s = n.to_string();
+    s.trim_start_matches('-').len()
+}
+
+fn math_pow10(exp: usize) -> BigIntT {
+    let mut r = BigIntT::from_i64(1);
+    let ten = BigIntT::from_i64(10);
+    for _ in 0..exp { r = r.mul(&ten); }
+    r
+}
+
+// Floor of the true integer square root via Newton's method, for a
+// non-negative BigIntT. Mirrors ir/hosts.rs's bigint_isqrt.
+fn math_isqrt(n: &BigIntT) -> BigIntT {
+    if n.is_zero() { return BigIntT::zero(); }
+    let digits = math_num_decimal_digits(n);
+    let mut x = math_pow10(digits / 2 + 1);
+    loop {
+        let (q, _) = n.div_rem(&x);
+        let y = x.add(&q);
+        let (y, _) = y.div_rem(&BigIntT::from_i64(2));
+        if BigIntT::cmp(&y, &x) != std::cmp::Ordering::Less { break; }
+        x = y;
+    }
+    x
+}
+
+fn math_is_negative(v: &Value) -> bool {
+    match v {
+        Value::Int(n) => *n < 0,
+        Value::Float(f) => *f < 0.0,
+        Value::Number(f) => *f < 0.0,
+        Value::BigInt(b) => b.is_negative(),
+        Value::Rational(r) => r.num.is_negative(),
+        _ => false,
+    }
+}
+
+fn math_sqrt_nonneg(v: &Value) -> Result<Value, String> {
+    match v {
+        Value::Int(n) => {
+            let bi = BigIntT::from_i64(*n);
+            let r = math_isqrt(&bi);
+            if r.mul(&r).eq(&bi) { Ok(nt_to_value(NumT::Big(r).normalize())) } else { Ok(Value::Float((*n as f64).sqrt())) }
+        }
+        Value::Number(f) if f.fract() == 0.0 && f.abs() < 9.0e15 => {
+            let n = *f as i64;
+            let bi = BigIntT::from_i64(n);
+            let r = math_isqrt(&bi);
+            if r.mul(&r).eq(&bi) { Ok(nt_to_value(NumT::Big(r).normalize())) } else { Ok(Value::Float(f.sqrt())) }
+        }
+        Value::Number(f) => Ok(Value::Number(f.sqrt())),
+        Value::BigInt(b) => {
+            let r = math_isqrt(b);
+            if r.mul(&r).eq(b) { Ok(nt_to_value(NumT::Big(r).normalize())) } else { Ok(Value::Float(v.as_number()?.sqrt())) }
+        }
+        Value::Rational(rat) => {
+            let rn = math_isqrt(&rat.num);
+            let rd = math_isqrt(&rat.den);
+            if rn.mul(&rn).eq(&rat.num) && rd.mul(&rd).eq(&rat.den) {
+                Ok(nt_to_value(NumT::Rat(RationalT::new(rn, rd)).normalize()))
+            } else {
+                Ok(Value::Float(v.as_number()?.sqrt()))
+            }
+        }
+        Value::Float(f) => Ok(Value::Float(f.sqrt())),
+        Value::Unit => Ok(Value::Int(0)),
+        _ => Err("sqrt: expected numeric value".to_string()),
+    }
+}
+
+fn math_sqrt(v: &Value) -> Result<Value, String> {
+    if matches!(v, Value::Complex(_)) { return Err("sqrt: complex input not supported".to_string()); }
+    if math_is_negative(v) {
+        let pos = neg(v)?;
+        let root = math_sqrt_nonneg(&pos)?;
+        Ok(nt_normalize_complex(ComplexT::new(NumT::Int(0), nt_from_value(&root)?)))
+    } else {
+        math_sqrt_nonneg(v)
+    }
+}
+
+fn math_exact_base(v: &Value) -> Option<Value> {
+    match v {
+        Value::Int(_) | Value::BigInt(_) | Value::Rational(_) => Some(v.clone()),
+        Value::Number(f) if f.fract() == 0.0 && f.abs() < 9.0e15 => Some(Value::Int(*f as i64)),
+        _ => None,
+    }
+}
+
+fn math_exp_as_i64(v: &Value) -> Option<i64> {
+    match v {
+        Value::Int(n) => Some(*n),
+        Value::BigInt(b) => b.to_string().parse::<i64>().ok(),
+        Value::Number(f) if f.fract() == 0.0 && f.abs() < 9.0e15 => Some(*f as i64),
+        _ => None,
+    }
+}
+
+fn math_int_pow_exact(base: &Value, exp: i64) -> Result<Value, String> {
+    if exp == 0 { return Ok(Value::Int(1)); }
+    if exp < 0 {
+        let pos = math_int_pow_exact(base, -exp)?;
+        return div(&Value::Int(1), &pos);
+    }
+    let mut result = Value::Int(1);
+    let mut b = base.clone();
+    let mut e = exp as u64;
+    while e > 0 {
+        if e & 1 == 1 { result = mul(&result, &b)?; }
+        e >>= 1;
+        if e > 0 { b = mul(&b, &b)?; }
+    }
+    Ok(result)
+}
+
+fn math_pow(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 { return Err("pow: expected 2 args".to_string()); }
+    if let (Some(b), Some(e)) = (math_exact_base(&args[0]), math_exp_as_i64(&args[1])) {
+        return math_int_pow_exact(&b, e);
+    }
+    let bf = args[0].as_number()?;
+    let ef = args[1].as_number()?;
+    Ok(Value::Float(bf.powf(ef)))
+}
+
+fn math_round_f(f: f64, mode: &str) -> f64 {
+    match mode { "floor" => f.floor(), "ceil" => f.ceil(), "round" => f.round(), "trunc" => f.trunc(), _ => f }
+}
+
+fn math_round_like(v: &Value, mode: &str) -> Result<Value, String> {
+    match v {
+        Value::Int(_) | Value::BigInt(_) => Ok(v.clone()),
+        Value::Number(f) if f.fract() == 0.0 => Ok(v.clone()),
+        Value::Rational(r) => {
+            let (q, rem) = r.num.div_rem(&r.den);
+            let n_is_neg = r.num.is_negative();
+            let n_is_pos = !r.num.is_zero() && !n_is_neg;
+            let result = match mode {
+                "trunc" => q,
+                "floor" => if !rem.is_zero() && n_is_neg { q.sub(&BigIntT::from_i64(1)) } else { q },
+                "ceil" => if !rem.is_zero() && n_is_pos { q.add(&BigIntT::from_i64(1)) } else { q },
+                "round" => {
+                    let two_rem = rem.mul(&BigIntT::from_i64(2));
+                    let two_rem_abs = if two_rem.is_negative() { two_rem.negate() } else { two_rem };
+                    let past_half = BigIntT::cmp(&two_rem_abs, &r.den) != std::cmp::Ordering::Less;
+                    if past_half { if n_is_neg { q.sub(&BigIntT::from_i64(1)) } else { q.add(&BigIntT::from_i64(1)) } } else { q }
+                }
+                _ => q,
+            };
+            Ok(nt_to_value(NumT::Big(result).normalize()))
+        }
+        Value::Float(f) => Ok(Value::Float(math_round_f(*f, mode))),
+        Value::Number(f) => Ok(Value::Number(math_round_f(*f, mode))),
+        Value::Unit => Ok(Value::Int(0)),
+        _ => Err(format!("{}: expected numeric value", mode)),
+    }
+}
+
+fn math_abs(args: &[Value]) -> Result<Value, String> {
+    let v = args.get(0).ok_or("abs: expected 1 arg".to_string())?;
+    match v {
+        Value::Int(_) | Value::BigInt(_) | Value::Rational(_) => {
+            if math_is_negative(v) { neg(v) } else { Ok(v.clone()) }
+        }
+        Value::Number(f) => Ok(Value::Number(f.abs())),
+        Value::Float(f) => Ok(Value::Float(f.abs())),
+        Value::Complex(c) => {
+            let re2 = nt_to_value(c.re.mul(&c.re));
+            let im2 = nt_to_value(c.im.mul(&c.im));
+            let sum = add(&re2, &im2)?;
+            math_sqrt(&sum)
+        }
+        Value::Unit => Ok(Value::Int(0)),
+        _ => Err("abs: expected numeric value".to_string()),
+    }
+}
+
+fn math_numeric_kind(args: &[Value]) -> Result<Value, String> {
+    let v = args.get(0).ok_or("numeric_kind: expected 1 arg".to_string())?;
+    let s = match v {
+        Value::Int(_) => "int",
+        Value::Number(f) => if f.fract() == 0.0 { "int" } else { "float" },
+        Value::Float(_) => "float",
+        Value::BigInt(_) => "bigint",
+        Value::Rational(_) => "rational",
+        Value::Complex(_) => "complex",
+        _ => "other",
+    };
+    Ok(Value::String(s.to_string()))
+}
+
+fn host_call_math_inner(name: &str, args: &[Value]) -> Result<Value, String> {
+    match name {
+        "sqrt" => math_sqrt(args.get(0).ok_or("sqrt: expected 1 arg")?),
+        "pow" => math_pow(args),
+        "sin" => Ok(Value::Float(arg_num(args, 0, "sin")?.sin())),
+        "cos" => Ok(Value::Float(arg_num(args, 0, "cos")?.cos())),
+        "tan" => Ok(Value::Float(arg_num(args, 0, "tan")?.tan())),
+        "asin" => Ok(Value::Float(arg_num(args, 0, "asin")?.asin())),
+        "acos" => Ok(Value::Float(arg_num(args, 0, "acos")?.acos())),
+        "atan" => Ok(Value::Float(arg_num(args, 0, "atan")?.atan())),
+        "atan2" => Ok(Value::Float(arg_num(args, 0, "atan2")?.atan2(arg_num(args, 1, "atan2")?))),
+        "log" => Ok(Value::Float(arg_num(args, 0, "log")?.ln())),
+        "exp" => Ok(Value::Float(arg_num(args, 0, "exp")?.exp())),
+        "floor" => math_round_like(args.get(0).ok_or("floor: expected 1 arg")?, "floor"),
+        "ceil" => math_round_like(args.get(0).ok_or("ceil: expected 1 arg")?, "ceil"),
+        "round" => math_round_like(args.get(0).ok_or("round: expected 1 arg")?, "round"),
+        "trunc" => math_round_like(args.get(0).ok_or("trunc: expected 1 arg")?, "trunc"),
+        "abs" => math_abs(args),
+        "numeric_kind" => math_numeric_kind(args),
+        _ => Err(format!("host fn '{}' not found", name)),
+    }
+}
+
+fn host_call_math(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    match name {
+        "sqrt" | "pow" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2" | "log" | "exp"
+        | "floor" | "ceil" | "round" | "trunc" | "abs" | "numeric_kind" => Some(host_call_math_inner(name, args)),
+        _ => None,
+    }
+}
+
+"##;
+
+    const PRELUDE_STRINGS_EXT: &'static str = r##"fn host_call_strings_ext_inner(name: &str, args: &[Value]) -> Result<Value, String> {
+    match name {
+"char_code" => {
+                // char_code(string, index) -> Number code point, or -1 if out of range
+                if args.len() != 2 { return Err("char_code: expected 2 args".into()); }
+                let s = match &args[0] { Value::String(s) => s.clone(), v => to_s(v) };
+                let idx = match &args[1] { Value::Number(n) => *n as usize, Value::String(t) => t.parse::<usize>().unwrap_or(usize::MAX), _ => usize::MAX };
+                if s.is_ascii() {
+                    return Ok(Value::Number(match s.as_bytes().get(idx) { Some(b) => *b as f64, None => -1.0 }));
+                }
+                match s.chars().nth(idx) {
+                    Some(c) => Ok(Value::Number(c as u32 as f64)),
+                    None => Ok(Value::Number(-1.0)),
+                }
+            }
+            "substr" => {
+                // substr(string, start, len) -> String slice by chars (clamped)
+                if args.len() != 3 { return Err("substr: expected 3 args".into()); }
+                let s = match &args[0] { Value::String(s) => s.clone(), v => to_s(v) };
+                let start = match &args[1] { Value::Number(n) => (*n).max(0.0) as usize, Value::String(t) => t.parse::<usize>().unwrap_or(0), _ => 0 };
+                let count = match &args[2] { Value::Number(n) => (*n).max(0.0) as usize, Value::String(t) => t.parse::<usize>().unwrap_or(0), _ => 0 };
+                if s.is_ascii() {
+                    let b = s.as_bytes();
+                    let st = start.min(b.len());
+                    let en = st.saturating_add(count).min(b.len());
+                    return Ok(Value::String(String::from_utf8_lossy(&b[st..en]).to_string()));
+                }
+                Ok(Value::String(s.chars().skip(start).take(count).collect()))
+            }
+            "chr" => {
+                // chr(code) -> 1-char string (empty for invalid code points)
+                let n = match args.get(0) { Some(Value::Number(n)) => *n, Some(Value::String(s)) => s.trim().parse::<f64>().unwrap_or(-1.0), _ => -1.0 };
+                if n < 0.0 { return Ok(Value::String(String::new())); }
+                Ok(Value::String(char::from_u32(n as u32).map(|c| c.to_string()).unwrap_or_default()))
+            }
+            "to_num" => {
+                // to_num(value) -> Number (parse string, else 0)
+                let v = args.get(0).cloned().unwrap_or(Value::Unit);
+                let n = match v {
+                    Value::Number(n) => n,
+                    Value::String(s) => s.trim().parse::<f64>().unwrap_or(0.0),
+                    Value::Bool(b) => if b { 1.0 } else { 0.0 },
+                    _ => 0.0,
+                };
+                Ok(Value::Number(n))
+            }
+            "hash_string" => {
+                // hash_string(s) -> lowercase hex FNV-1a 64-bit digest
+                let s = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
+                let mut hash: u64 = 0xcbf29ce484222325;
+                for b in s.as_bytes() {
+                    hash ^= *b as u64;
+                    hash = hash.wrapping_mul(0x100000001b3);
+                }
+                Ok(Value::String(format!("{:016x}", hash)))
+            }
+                    _ => Err(format!("host fn '{}' not found", name)),
+    }
+}
+
+fn host_call_strings_ext(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    match name {
+        "char_code" | "substr" | "chr" | "to_num" | "hash_string" => Some(host_call_strings_ext_inner(name, args)),
+        _ => None,
+    }
+}
+
+"##;
+
+    const PRELUDE_COLLECTIONS_HANDLES: &'static str = r##"thread_local! {
+    static VECS: RefCell<Vec<Vec<Value>>> = RefCell::new(Vec::new());
+    static SBUFS: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    static ISTRINGS: RefCell<Vec<String>> = RefCell::new(Vec::new());
+}
+
+fn host_call_collections_handles_inner(name: &str, args: &[Value]) -> Result<Value, String> {
+    match name {
+"vec_new" => {
+                let id = VECS.with(|v| { let mut b = v.borrow_mut(); b.push(Vec::new()); b.len() - 1 });
+                Ok(Value::Number(id as f64))
+            }
+            "vec_push" => {
+                let id = arg_usize(&args, 0, "vec_push")?;
+                let item = args.get(1).cloned().unwrap_or(Value::Unit);
+                VECS.with(|v| {
+                    let mut b = v.borrow_mut();
+                    b.get_mut(id).ok_or_else(|| format!("vec_push: unknown vec {}", id)).map(|xs| xs.push(item))
+                })?;
+                Ok(Value::Unit)
+            }
+            "vec_set" => {
+                let id = arg_usize(&args, 0, "vec_set")?;
+                let idx = arg_usize(&args, 1, "vec_set")?;
+                let item = args.get(2).cloned().unwrap_or(Value::Unit);
+                VECS.with(|v| {
+                    let mut b = v.borrow_mut();
+                    let xs = b.get_mut(id).ok_or_else(|| format!("vec_set: unknown vec {}", id))?;
+                    if idx >= xs.len() { return Err(format!("vec_set: index {} out of range (len {})", idx, xs.len())); }
+                    xs[idx] = item;
+                    Ok(())
+                })?;
+                Ok(Value::Unit)
+            }
+            "vec_get" => {
+                let id = arg_usize(&args, 0, "vec_get")?;
+                let idx = arg_usize(&args, 1, "vec_get")?;
+                VECS.with(|v| {
+                    let b = v.borrow();
+                    b.get(id).ok_or_else(|| format!("vec_get: unknown vec {}", id))
+                        .map(|xs| xs.get(idx).cloned().unwrap_or(Value::Unit))
+                })
+            }
+            "vec_len" => {
+                let id = arg_usize(&args, 0, "vec_len")?;
+                VECS.with(|v| {
+                    let b = v.borrow();
+                    b.get(id).ok_or_else(|| format!("vec_len: unknown vec {}", id)).map(|xs| Value::Number(xs.len() as f64))
+                })
+            }
+            "vec_to_list" => {
+                let id = arg_usize(&args, 0, "vec_to_list")?;
+                VECS.with(|v| {
+                    let b = v.borrow();
+                    b.get(id).ok_or_else(|| format!("vec_to_list: unknown vec {}", id)).map(|xs| Value::List(xs.clone()))
+                })
+            }
+            "str_intern" => {
+                let s = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
+                let id = ISTRINGS.with(|v| { let mut b = v.borrow_mut(); b.push(s); b.len() - 1 });
+                Ok(Value::Number(id as f64))
+            }
+            "sc_len" => {
+                let id = arg_usize(&args, 0, "sc_len")?;
+                ISTRINGS.with(|v| {
+                    let b = v.borrow();
+                    b.get(id).ok_or_else(|| format!("sc_len: unknown string {}", id))
+                        .map(|s| Value::Number(if s.is_ascii() { s.len() as f64 } else { s.chars().count() as f64 }))
+                })
+            }
+            "sc_code" => {
+                let id = arg_usize(&args, 0, "sc_code")?;
+                let idx = arg_usize(&args, 1, "sc_code")?;
+                ISTRINGS.with(|v| {
+                    let b = v.borrow();
+                    let s = b.get(id).ok_or_else(|| format!("sc_code: unknown string {}", id))?;
+                    if s.is_ascii() {
+                        return Ok(Value::Number(match s.as_bytes().get(idx) { Some(c) => *c as f64, None => -1.0 }));
+                    }
+                    Ok(Value::Number(match s.chars().nth(idx) { Some(c) => c as u32 as f64, None => -1.0 }))
+                })
+            }
+            "sc_char" => {
+                let id = arg_usize(&args, 0, "sc_char")?;
+                let idx = arg_usize(&args, 1, "sc_char")?;
+                ISTRINGS.with(|v| {
+                    let b = v.borrow();
+                    let s = b.get(id).ok_or_else(|| format!("sc_char: unknown string {}", id))?;
+                    if s.is_ascii() {
+                        return Ok(match s.as_bytes().get(idx) { Some(c) => Value::String((*c as char).to_string()), None => Value::String(String::new()) });
+                    }
+                    Ok(match s.chars().nth(idx) { Some(c) => Value::String(c.to_string()), None => Value::String(String::new()) })
+                })
+            }
+            "sb_new" => {
+                let id = SBUFS.with(|v| { let mut b = v.borrow_mut(); b.push(String::new()); b.len() - 1 });
+                Ok(Value::Number(id as f64))
+            }
+            "sb_push" => {
+                let id = arg_usize(&args, 0, "sb_push")?;
+                let text = match args.get(1) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
+                SBUFS.with(|v| {
+                    let mut b = v.borrow_mut();
+                    b.get_mut(id).ok_or_else(|| format!("sb_push: unknown buffer {}", id)).map(|s| s.push_str(&text))
+                })?;
+                Ok(Value::Unit)
+            }
+            "sb_str" => {
+                let id = arg_usize(&args, 0, "sb_str")?;
+                SBUFS.with(|v| {
+                    let b = v.borrow();
+                    b.get(id).ok_or_else(|| format!("sb_str: unknown buffer {}", id)).map(|s| Value::String(s.clone()))
+                })
+            }
+                    _ => Err(format!("host fn '{}' not found", name)),
+    }
+}
+
+fn host_call_collections_handles(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    match name {
+        "vec_new" | "vec_push" | "vec_set" | "vec_get" | "vec_len" | "vec_to_list" | "str_intern" | "sc_len" | "sc_code" | "sc_char" | "sb_new" | "sb_push" | "sb_str" => Some(host_call_collections_handles_inner(name, args)),
+        _ => None,
+    }
+}
+
+"##;
+
+    const PRELUDE_FILES: &'static str = r##"fn host_call_files_inner(name: &str, args: &[Value]) -> Result<Value, String> {
+    match name {
+"read_file" => {
+                // read_file(path) -> String contents
+                let p = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
+                std::fs::read_to_string(&p).map(Value::String).map_err(|e| format!("read_file: {}: {}", p, e))
+            }
+            "write_file" => {
+                // write_file(path, contents) -> Bool
+                let p = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
+                let contents = match args.get(1) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
+                if let Some(parent) = std::path::Path::new(&p).parent() { let _ = std::fs::create_dir_all(parent); }
+                std::fs::write(&p, contents).map(|_| Value::Bool(true)).map_err(|e| format!("write_file: {}: {}", p, e))
+            }
+            "touch_file" => {
+                // touch_file(path) -> String message (OK <abs> or ERR: <msg>)
+                let p = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
+                if p.is_empty() { return Ok(Value::String("ERR: empty path".into())); }
+                let path = std::path::Path::new(&p);
+                if let Some(par) = path.parent() { let _ = std::fs::create_dir_all(par); }
+                let res = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&path);
+                match res {
+                    Ok(_) => {
+                        let abs = std::fs::canonicalize(&path).unwrap_or_else(|_| path.to_path_buf());
+                        Ok(Value::String(format!("OK {}", abs.display())))
+                    }
+                    Err(e) => Ok(Value::String(format!("ERR: {}", e)))
+                }
+            }
+            "file_exists" => {
+                // file_exists(path) -> "1" or "0"
+                let p = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
+                let exists = std::path::Path::new(&p).exists();
+                Ok(Value::String(if exists { "1".into() } else { "0".into() }))
+            }
+                    _ => Err(format!("host fn '{}' not found", name)),
+    }
+}
+
+fn host_call_files(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    match name {
+        "read_file" | "write_file" | "touch_file" | "file_exists" => Some(host_call_files_inner(name, args)),
+        _ => None,
+    }
+}
+
+"##;
+
+    // `len` (below) returns `Value::Int`, not `Value::Number`/f64: a length
+    // is always an exact integer, and callers (e.g. lib/math.patlang's
+    // mean()) divide by it expecting exact-Rational division on a
+    // non-even split, not silent float contagion. `Value::Int` exists in
+    // both of the two mutually-exclusive Value definitions (see the NOTE
+    // above `enum Value`), so this is safe regardless of which one a given
+    // compiled program selects.
+    const PRELUDE_IO_MISC: &'static str = r##"fn host_bin_num(args: &[Value], f: fn(f64,f64)->f64) -> Result<Value, String> {
+    let a = args.get(0).ok_or("expected 2 args")?;
+    let b = args.get(1).ok_or("expected 2 args")?;
+    let an = a.as_number()?; let bn = b.as_number()?;
+    Ok(Value::Number(f(an,bn)))
+}
+
+fn sed_command(cmd: &str, input: &str) -> String {
+    if !cmd.starts_with('s') { return input.to_string(); }
+    let mut parts = cmd.splitn(4, '/');
+    let _s = parts.next();
+    let pat = match parts.next() { Some(p) => p, None => return input.to_string() };
+    let repl = match parts.next() { Some(r) => r, None => return input.to_string() };
+    let flags = parts.next().unwrap_or("");
+    let global = flags.contains('g');
+    let ci = flags.contains('i');
+    replace_lit(input, pat, repl, global, ci)
+}
+
+fn replace_lit(hay: &str, pat: &str, rep: &str, global: bool, ci: bool) -> String {
+    if pat.is_empty() { return hay.to_string(); }
+    if !ci {
+        if !global {
+            if let Some(pos) = hay.find(pat) {
+                let mut out = String::with_capacity(hay.len());
+                out.push_str(&hay[..pos]);
+                out.push_str(rep);
+                out.push_str(&hay[pos+pat.len()..]);
+                return out;
+            }
+            return hay.to_string();
+        } else {
+            let mut out = String::with_capacity(hay.len());
+            let mut start = 0usize;
+            let mut rest = hay;
+            while let Some(pos) = rest.find(pat) {
+                let abs = start + pos;
+                out.push_str(&hay[start..abs]);
+                out.push_str(rep);
+                start = abs + pat.len();
+                rest = &hay[start..];
+            }
+            out.push_str(&hay[start..]);
+            return out;
+        }
+    }
+    let hay_l = hay.to_ascii_lowercase();
+    let pat_l = pat.to_ascii_lowercase();
+    if !global {
+        if let Some(pos) = hay_l.find(&pat_l) {
+            let mut out = String::with_capacity(hay.len());
+            out.push_str(&hay[..pos]);
+            out.push_str(rep);
+            out.push_str(&hay[pos+pat.len()..]);
+            return out;
+        }
+        return hay.to_string();
+    } else {
+        let mut out = String::with_capacity(hay.len());
+        let mut start = 0usize;
+        let mut idx = 0usize;
+        while idx <= hay_l.len() {
+            if let Some(pos) = hay_l[idx..].find(&pat_l) {
+                let abs = idx + pos;
+                out.push_str(&hay[start..abs]);
+                out.push_str(rep);
+                start = abs + pat.len();
+                idx = start;
+            } else { break; }
+        }
+        out.push_str(&hay[start..]);
+        return out;
+    }
+}
+
+// Simple interpolation: replace occurrences of #{name} using OBJECTS store vars or event locals if provided in scope.
+fn interpolate(input: &str) -> String {
+    let mut out = String::new();
+    let b = input.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        if i + 2 < b.len() && b[i] as char == '#' && b[i+1] as char == '{' {
+            i += 2; let start = i;
+            while i < b.len() && b[i] as char != '}' { i += 1; }
+            let key = &input[start..i];
+            let val = resolve_interp_var(key);
+            out.push_str(&val);
+            if i < b.len() && b[i] as char == '}' { i += 1; }
+        } else { out.push(b[i] as char); i += 1; }
+    }
+    out
+}
+
+fn resolve_interp_var(key: &str) -> String {
+    // Try OBJECTS first (object.name property), then fall back to key itself.
+    if let Some((obj, prop)) = key.split_once('.') {
+        if let Some(v) = obj_get(obj, prop) { return display_value(&v); }
+    } else {
+        // No dot: may refer to a plain variable set on a synthetic "__vars" object by handlers.
+        if let Some(v) = obj_get("__vars", key) { return display_value(&v); }
+    }
+    String::new()
+}
+
+fn host_call_io_misc_inner(name: &str, args: &[Value]) -> Result<Value, String> {
+    match name {
+"now_ms" => {
+                // now_ms() -> Number: milliseconds since the Unix epoch
+                let ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as f64)
+                    .unwrap_or(0.0);
+                Ok(Value::Number(ms))
+            }
+            "byte_length" => {
+                // byte_length(s) -> Number of UTF-8 bytes (unlike .length,
+                // which counts chars) - for exact HTTP Content-Length framing.
+                let s = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
+                Ok(Value::Number(s.len() as f64))
+            }
+            "read_line" => {
+                // read_line() -> String: one line from stdin, no trailing
+                // newline, or "" at EOF.
+                use std::io::BufRead;
+                let mut line = String::new();
+                let n = std::io::stdin().lock().read_line(&mut line).map_err(|e| format!("read_line: {}", e))?;
+                if n == 0 { Ok(Value::String(String::new())) } else {
+                    while line.ends_with('\n') || line.ends_with('\r') { line.pop(); }
+                    Ok(Value::String(line))
+                }
+            }
+            "argv" => {
+                // argv() -> List of user arguments (program name stripped)
+                let mut rest: Vec<String> = std::env::args().collect();
+                if !rest.is_empty() { rest.remove(0); }
+                Ok(Value::List(rest.into_iter().map(Value::String).collect()))
+            }
+            "print" => {
+                if let Some(x) = args.get(0) {
+                    // Support simple string interpolation for IR runtime: "#{var}"
+                    let s = display_value(x);
+                    let out = interpolate(&s);
+                    println!("{}", out);
+                    // Flush so piped consumers (tests, process supervisors) see
+                    // output promptly -- stdout is block-buffered when not a tty
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                }
+                Ok(Value::Unit)
+            },
+            "sed" => {
+                // sed("s/pat/repl/[flags]", input)
+                let cmd = match args.get(0) { Some(Value::String(s)) => s.as_str(), _ => "" };
+                let dv;
+                let input: &str = match args.get(1) {
+                    Some(Value::String(s)) => s.as_str(),
+                    Some(v) => { dv = display_value(v); dv.as_str() },
+                    None => "",
+                };
+                let out = sed_command(cmd, input);
+                Ok(Value::String(out))
+            },
+            "add" => host_bin_num(args, |a,b| a+b),
+            "multiply" => host_bin_num(args, |a,b| a*b),
+            "subtract" => host_bin_num(args, |a,b| a-b),
+            "max" => host_bin_num(args, |a,b| a.max(b)),
+            "min" => host_bin_num(args, |a,b| a.min(b)),
+            "calculate" => Ok(Value::Number(0.0)),
+            "calculate_result" => Ok(Value::Number(0.0)),
+            "get_value" => Ok(Value::Number(0.0)),
+            "process" => Ok(Value::Bool(true)),
+            "validate" => Ok(Value::Bool(true)),
+            "len" => {
+                let v = args.get(0).cloned().unwrap_or(Value::Unit);
+                let n = match v {
+                    Value::String(s) => s.chars().count() as i64,
+                    Value::List(xs) => xs.len() as i64,
+                    Value::Object(m) => m.len() as i64,
+                    Value::Unit => 0,
+                    _ => 0,
+                };
+                Ok(Value::Int(n))
+            }
+                    _ => Err(format!("host fn '{}' not found", name)),
+    }
+}
+
+fn host_call_io_misc(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    match name {
+        "now_ms" | "byte_length" | "read_line" | "argv" | "print" | "sed" | "add" | "multiply" | "subtract" | "max" | "min" | "calculate" | "calculate_result" | "get_value" | "process" | "validate" | "len" => Some(host_call_io_misc_inner(name, args)),
+        _ => None,
+    }
+}
+
+"##;
+
+    const PRELUDE_OO: &'static str = r##"fn host_call_oo_inner(name: &str, args: &[Value]) -> Result<Value, String> {
+    match name {
+"new" => {
+                if args.len() != 2 { return Ok(Value::Unit); }
+                let class = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
+                let name = match &args[1] { Value::String(s) => s.clone(), _ => String::new() };
+                if !name.is_empty() { ensure_obj(&name, &class); }
+                Ok(Value::String(name))
+            }
+            "set_var" => {
+                if args.len() != 2 { return Ok(Value::Unit); }
+                let key = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
+                let val = args.get(1).cloned().unwrap_or(Value::Unit);
+                if !key.is_empty() {
+                    OBJECTS.with(|o| {
+                        let mut b = o.borrow_mut();
+                        let m = b.entry("__vars".to_string()).or_insert_with(HashMap::new);
+                        m.insert(key, val);
+                    });
+                }
+                Ok(Value::Unit)
+            }
+            "get" => {
+                if args.len() != 2 { return Err("expected 2 args".into()); }
+                let key = match &args[1] { Value::String(s) => s.clone(), _ => return Err("expected string key".into()) };
+                match &args[0] {
+                    Value::String(name) => Ok(obj_get(name, &key).unwrap_or(Value::Unit)),
+                    Value::Object(map) => Ok(map.get(&key).cloned().unwrap_or(Value::Unit)),
+                    _ => Ok(Value::Unit),
+                }
+            }
+            "send" => {
+                if args.len() < 2 { return Ok(Value::Unit); }
+                let recv = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
+                let method = match &args[1] { Value::String(s) => s.clone(), _ => String::new() };
+                let rest = &args[2..];
+                match method.as_str() {
+                    "set" => {
+                        if rest.len() != 2 { return Ok(Value::Unit); }
+                        let prop = match &rest[0] { Value::String(s) => s.clone(), _ => String::new() };
+                        let val = rest[1].clone();
+                        if !recv.is_empty() && !prop.is_empty() { obj_set(&recv, &prop, val); }
+                        Ok(Value::Unit)
+                    }
+                    "infer_is_adult" => {
+                        // reads age, sets is_adult when >= 18
+                        if let Some(Value::Number(age)) = obj_get(&recv, "age") {
+                            if age >= 18.0 { obj_set(&recv, "is_adult", Value::Bool(true)); return Ok(Value::Bool(true)); }
+                        } else if let Some(Value::String(s)) = obj_get(&recv, "age") {
+                            if s.parse::<f64>().unwrap_or(0.0) >= 18.0 { obj_set(&recv, "is_adult", Value::Bool(true)); return Ok(Value::Bool(true)); }
+                        }
+                        Ok(Value::Bool(false))
+                    }
+                    "infer_relations" => {
+                        // if exists fact("parent", X, recv) then set has_parent true
+                        let mut has = false;
+                        FACTS.with(|f| {
+                            if let Some(v) = f.borrow().get("parent") {
+                                has = v.iter().any(|(_, child)| child == &recv);
+                            }
+                        });
+                        if has { obj_set(&recv, "has_parent", Value::Bool(true)); return Ok(Value::Bool(true)); }
+                        Ok(Value::Bool(false))
+                    }
+                    _ => Ok(Value::Unit),
+                }
+            }
+                    _ => Err(format!("host fn '{}' not found", name)),
+    }
+}
+
+fn host_call_oo(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    match name {
+        "new" | "set_var" | "get" | "send" => Some(host_call_oo_inner(name, args)),
+        _ => None,
+    }
+}
+
+"##;
+
+    const PRELUDE_LOGIC: &'static str = r##"thread_local! {
+    static FACTS: RefCell<HashMap<String, Vec<(String, String)>>> = RefCell::new(HashMap::new());
+    static GOALS: RefCell<Vec<(String, Vec<String>)>> = RefCell::new(Vec::new());
+    static TYPE_RULES: RefCell<HashMap<(String, usize), String>> = RefCell::new(HashMap::new());
+}
+
+fn host_call_logic_inner(name: &str, args: &[Value]) -> Result<Value, String> {
+    match name {
+"infer_type_for" => {
+                // args: pred, index, class
+                if args.len() != 3 { return Ok(Value::Unit); }
+                let pred = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
+                let idx = match &args[1] { Value::Number(n) => *n as usize, Value::String(s) => s.parse::<usize>().unwrap_or(0), _ => 0 };
+                let class = match &args[2] { Value::String(s) => s.clone(), _ => String::new() };
+                TYPE_RULES.with(|tr| { tr.borrow_mut().insert((pred, idx), class); });
+                Ok(Value::Unit)
+            }
+            "fact" => {
+                if args.len() != 3 { return Ok(Value::Unit); }
+                let pred = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
+                let a = to_s(args.get(1).unwrap_or(&Value::Unit));
+                let b = to_s(args.get(2).unwrap_or(&Value::Unit));
+                FACTS.with(|f| {
+                    let mut m = f.borrow_mut();
+                    m.entry(pred).or_insert_with(Vec::new).push((a, b));
+                });
+                Ok(Value::Unit)
+            }
+            "goal" => {
+                if args.is_empty() { return Ok(Value::Unit); }
+                let pred = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
+                let mut items: Vec<String> = Vec::new();
+                for a in &args[1..] { items.push(to_s(a)); }
+                GOALS.with(|g| { g.borrow_mut().push((pred, items)); });
+                Ok(Value::Unit)
+            }
+            "query" => {
+                if args.len() != 3 { return Ok(Value::Number(0.0)); }
+                let pred = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
+                let a = to_s(args.get(1).unwrap_or(&Value::Unit));
+                let mut count = 0usize;
+                let mut bs: Vec<String> = Vec::new();
+                FACTS.with(|f| {
+                    if let Some(v) = f.borrow().get(&pred) {
+                        for (x, b) in v.iter() {
+                            if x == &a { count += 1; bs.push(b.clone()); }
+                        }
+                    }
+                });
+                // Apply simple type inference rules recorded
+                TYPE_RULES.with(|tr| {
+                    let rules = tr.borrow();
+                    if let Some(class0) = rules.get(&(pred.clone(), 0usize)) { ensure_obj(&a, class0); }
+                    if let Some(class1) = rules.get(&(pred.clone(), 1usize)) {
+                        for b in bs.iter() { ensure_obj(b, class1); }
+                    }
+                });
+                Ok(Value::Number(count as f64))
+            }
+                    _ => Err(format!("host fn '{}' not found", name)),
+    }
+}
+
+fn host_call_logic(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    match name {
+        "infer_type_for" | "fact" | "goal" | "query" => Some(host_call_logic_inner(name, args)),
+        _ => None,
+    }
+}
+
+"##;
+
+    const PRELUDE_CONTRACTS: &'static str = r##"fn host_call_contracts_inner(name: &str, args: &[Value]) -> Result<Value, String> {
+    match name {
+"contract_check" => {
+                // contract_check(func_name, kind, text, ok) - design-by-contract
+                // enforcement, identical semantics to the interpreter's host arm.
+                if args.len() != 4 { return Err("contract_check: expected 4 args".into()); }
+                let func = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
+                let kind = match &args[1] { Value::String(s) => s.clone(), _ => String::new() };
+                let text = match &args[2] { Value::String(s) => s.clone(), _ => String::new() };
+                let ok = args[3].as_bool()?;
+                if ok {
+                    Ok(Value::Unit)
+                } else {
+                    let label = match kind.as_str() {
+                        "require" => "precondition",
+                        "ensure" => "postcondition",
+                        _ => "assertion",
+                    };
+                    Err(format!("contract violation: {} failed in {}(): {}", label, func, text))
+                }
+            }
+                    _ => Err(format!("host fn '{}' not found", name)),
+    }
+}
+
+fn host_call_contracts(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    match name {
+        "contract_check" => Some(host_call_contracts_inner(name, args)),
+        _ => None,
+    }
+}
+
+"##;
+
+    const PRELUDE_NETWORKING: &'static str = r##"thread_local! {
+    static LISTENERS: RefCell<HashMap<u16, std::net::TcpListener>> = RefCell::new(HashMap::new());
+    static CONNS: RefCell<HashMap<usize, std::net::TcpStream>> = RefCell::new(HashMap::new());
+    static NEXT_CONN: RefCell<usize> = RefCell::new(1);
+}
+
+fn host_call_networking_inner(name: &str, args: &[Value]) -> Result<Value, String> {
+    match name {
+"tcp_listen" => {
+                // tcp_listen(port) -> Number actual bound port (0 = OS-assigned)
+                let port = arg_num(&args, 0, "tcp_listen")? as u16;
+                let listener = std::net::TcpListener::bind(("127.0.0.1", port))
+                    .map_err(|e| format!("tcp_listen: bind {}: {}", port, e))?;
+                let actual = listener.local_addr().map_err(|e| format!("tcp_listen: {}", e))?.port();
+                LISTENERS.with(|l| l.borrow_mut().insert(actual, listener));
+                Ok(Value::Number(actual as f64))
+            }
+            "tcp_connect" => {
+                // tcp_connect(host, port) -> Number connection id (blocks until connected)
+                let host = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => return Err("tcp_connect: expected host string".into()) };
+                let port = arg_num(&args, 1, "tcp_connect")? as u16;
+                let stream = std::net::TcpStream::connect((host.as_str(), port))
+                    .map_err(|e| format!("tcp_connect: {}:{}: {}", host, port, e))?;
+                let id = NEXT_CONN.with(|n| { let mut b = n.borrow_mut(); let v = *b; *b += 1; v });
+                CONNS.with(|c| c.borrow_mut().insert(id, stream));
+                Ok(Value::Number(id as f64))
+            }
+            "tcp_accept" => {
+                // tcp_accept(port) -> Number connection id (blocks)
+                let port = arg_num(&args, 0, "tcp_accept")? as u16;
+                let listener = LISTENERS.with(|l| l.borrow().get(&port).map(|x| x.try_clone()))
+                    .ok_or_else(|| format!("tcp_accept: no listener on port {}", port))?
+                    .map_err(|e| format!("tcp_accept: {}", e))?;
+                let (stream, _) = listener.accept().map_err(|e| format!("tcp_accept: {}", e))?;
+                let id = NEXT_CONN.with(|n| { let mut b = n.borrow_mut(); let v = *b; *b += 1; v });
+                CONNS.with(|c| c.borrow_mut().insert(id, stream));
+                Ok(Value::Number(id as f64))
+            }
+            "sleep_ms" => {
+                let ms = arg_num(&args, 0, "sleep_ms")?.max(0.0) as u64;
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                Ok(Value::Unit)
+            }
+            "tcp_accept_timeout" => {
+                // tcp_accept_timeout(port, ms) -> conn id, or -1 on timeout
+                let port = arg_num(&args, 0, "tcp_accept_timeout")? as u16;
+                let ms = arg_num(&args, 1, "tcp_accept_timeout")?.max(0.0) as u64;
+                let listener = LISTENERS.with(|l| l.borrow().get(&port).map(|x| x.try_clone()))
+                    .ok_or_else(|| format!("tcp_accept_timeout: no listener on port {}", port))?
+                    .map_err(|e| format!("tcp_accept_timeout: {}", e))?;
+                listener.set_nonblocking(true).map_err(|e| format!("tcp_accept_timeout: {}", e))?;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let _ = stream.set_nonblocking(false);
+                            let id = NEXT_CONN.with(|n| { let mut b = n.borrow_mut(); let v = *b; *b += 1; v });
+                            CONNS.with(|c| c.borrow_mut().insert(id, stream));
+                            return Ok(Value::Number(id as f64));
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if std::time::Instant::now() >= deadline { return Ok(Value::Number(-1.0)); }
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                        Err(e) => return Err(format!("tcp_accept_timeout: {}", e)),
+                    }
+                }
+            }
+            "tcp_read" => {
+                // tcp_read(conn) -> String (single read, up to 64 KiB)
+                use std::io::Read;
+                let id = arg_num(&args, 0, "tcp_read")? as usize;
+                let mut stream = CONNS.with(|c| c.borrow().get(&id).map(|s| s.try_clone()))
+                    .ok_or_else(|| format!("tcp_read: unknown connection {}", id))?
+                    .map_err(|e| format!("tcp_read: {}", e))?;
+                let mut buf = vec![0u8; 65536];
+                let n = stream.read(&mut buf).map_err(|e| format!("tcp_read: {}", e))?;
+                Ok(Value::String(String::from_utf8_lossy(&buf[..n]).to_string()))
+            }
+            "tcp_write" => {
+                // tcp_write(conn, data) -> Bool
+                use std::io::Write;
+                let id = arg_num(&args, 0, "tcp_write")? as usize;
+                let data = match args.get(1) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
+                let mut stream = CONNS.with(|c| c.borrow().get(&id).map(|s| s.try_clone()))
+                    .ok_or_else(|| format!("tcp_write: unknown connection {}", id))?
+                    .map_err(|e| format!("tcp_write: {}", e))?;
+                stream.write_all(data.as_bytes()).map_err(|e| format!("tcp_write: {}", e))?;
+                let _ = stream.flush();
+                Ok(Value::Bool(true))
+            }
+            "tcp_close" => {
+                use std::io::Read;
+                let id = arg_num(&args, 0, "tcp_close")? as usize;
+                if let Some(stream) = CONNS.with(|c| c.borrow_mut().remove(&id)) {
+                    // Drain unread inbound bytes and half-close so the peer
+                    // gets a graceful FIN rather than an RST
+                    let _ = stream.set_nonblocking(true);
+                    let mut sink = [0u8; 4096];
+                    let mut s = stream;
+                    loop {
+                        match s.read(&mut sink) {
+                            Ok(0) => break,
+                            Ok(_) => continue,
+                            Err(_) => break,
+                        }
+                    }
+                    let _ = s.shutdown(std::net::Shutdown::Write);
+                }
+                Ok(Value::Unit)
+            }
+                    _ => Err(format!("host fn '{}' not found", name)),
+    }
+}
+
+fn host_call_networking(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    match name {
+        "tcp_listen" | "tcp_connect" | "tcp_accept" | "sleep_ms" | "tcp_accept_timeout" | "tcp_read" | "tcp_write" | "tcp_close" => Some(host_call_networking_inner(name, args)),
+        _ => None,
+    }
+}
+
+"##;
+
+    const PRELUDE_CODEGEN_BOOTSTRAP: &'static str = r##"fn log_to_file(filename: &str, msg: &str) {
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(filename) {
         let _ = writeln!(f, "{}", msg);
@@ -103,66 +2297,9 @@ fn file_exists(path: &str) -> bool {
     std::path::Path::new(path).exists()
 }
 
-#[derive(Clone, Debug, PartialEq)]
-enum Value {
-    Unit,
-    Bool(bool),
-    Number(f64),
-    String(String),
-    List(Vec<Value>),
-    Object(HashMap<String, Value>),
-    Closure { func_name: String, captured: Vec<(String, Value)> },
-}
-
-impl Value {
-    fn as_number(&self) -> Result<f64, String> {
-        match self {
-            Value::Number(n) => Ok(*n),
-            Value::Unit => Ok(0.0),
-            _ => Err("expected number".into()),
-        }
-    }
-    fn as_bool(&self) -> Result<bool, String> {
-        match self {
-            Value::Bool(b) => Ok(*b),
-            Value::Unit => Ok(false),
-            Value::Number(n) => Ok(*n != 0.0),
-            Value::String(s) => Ok(!s.is_empty()),
-            Value::List(xs) => Ok(!xs.is_empty()),
-            Value::Object(map) => Ok(!map.is_empty()),
-            Value::Closure { .. } => Ok(true),
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum BinOpKind { Add, Sub, Mul, Div, Mod, Eq, Ne, Lt, Le, Gt, Ge, And, Or }
-#[derive(Clone, Debug, PartialEq)]
-enum UnOpKind { Neg, Not }
-
-#[derive(Clone, Debug, PartialEq)]
-enum Instr {
-    Const(Value),
-    LoadLocal(String),
-    StoreLocal(String),
-    BinOp(BinOpKind),
-    UnOp(UnOpKind),
-    Jump(usize),
-    JumpIfFalse(usize),
-    CallHost(String, usize),
-    Call(String, usize),
-    MakeClosure(String, Vec<String>),
-    CallValue(usize),
-    BuildList(usize),
-    Return,
-}
-
-struct Host;
-
-impl Host {
-    fn call(name: &str, args: &[Value]) -> Result<Value, String> {
-        match name {
-            "parse_tiny_source" => {
+fn host_call_codegen_bootstrap_inner(name: &str, args: &[Value]) -> Result<Value, String> {
+    match name {
+"parse_tiny_source" => {
                 // Return a lightweight Program object carrying the source path for delegation.
                 // { type: "Program", source_path: <string> }
                 let path = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
@@ -674,248 +2811,6 @@ impl Host {
                 full.extend(rest);
                 Ok(Value::List(full.into_iter().map(Value::String).collect()))
             }
-            "list_get" => {
-                // list_get(list, index)
-                if args.len() != 2 { return Err("expected 2 args".into()); }
-                let idx = match &args[1] { Value::Number(n) => *n as usize, Value::String(s) => s.parse::<usize>().unwrap_or(0), _ => 0 };
-                match &args[0] {
-                    Value::List(xs) => Ok(xs.get(idx).cloned().unwrap_or(Value::Unit)),
-                    Value::String(s) => {
-                        if s.is_ascii() {
-                            return Ok(match s.as_bytes().get(idx) { Some(b) => Value::String((*b as char).to_string()), None => Value::String(String::new()) });
-                        }
-                        let ch = s.chars().nth(idx).unwrap_or('\0');
-                        Ok(Value::String(if ch == '\0' { String::new() } else { ch.to_string() }))
-                    }
-                    _ => Ok(Value::Unit),
-                }
-            }
-            "list_len" => {
-                // list_len(listOrString) -> String count (to match Stage 0 builtins)
-                if args.len() != 1 { return Err("expected 1 arg".into()); }
-                let n = match &args[0] {
-                    Value::List(xs) => xs.len(),
-                    Value::String(s) => s.chars().count(),
-                    _ => 0,
-                };
-                Ok(Value::String(n.to_string()))
-            }
-            "list_push" => {
-                // list_push(list, item) -> new list with item appended
-                if args.len() != 2 { return Err("list_push: expected 2 args".into()); }
-                let mut xs = match &args[0] {
-                    Value::List(xs) => xs.clone(),
-                    Value::Unit => Vec::new(),
-                    _ => return Err("list_push: expected list".into()),
-                };
-                xs.push(args[1].clone());
-                Ok(Value::List(xs))
-            }
-            "list_set" => {
-                // list_set(list, index, value) -> new list with element replaced
-                if args.len() != 3 { return Err("list_set: expected 3 args".into()); }
-                let mut xs = match &args[0] {
-                    Value::List(xs) => xs.clone(),
-                    _ => return Err("list_set: expected list".into()),
-                };
-                let idx = match &args[1] { Value::Number(n) => *n as usize, Value::String(s) => s.parse::<usize>().unwrap_or(usize::MAX), _ => usize::MAX };
-                if idx >= xs.len() { return Err(format!("list_set: index {} out of range (len {})", idx, xs.len())); }
-                xs[idx] = args[2].clone();
-                Ok(Value::List(xs))
-            }
-            "vec_new" => {
-                let id = VECS.with(|v| { let mut b = v.borrow_mut(); b.push(Vec::new()); b.len() - 1 });
-                Ok(Value::Number(id as f64))
-            }
-            "vec_push" => {
-                let id = arg_usize(&args, 0, "vec_push")?;
-                let item = args.get(1).cloned().unwrap_or(Value::Unit);
-                VECS.with(|v| {
-                    let mut b = v.borrow_mut();
-                    b.get_mut(id).ok_or_else(|| format!("vec_push: unknown vec {}", id)).map(|xs| xs.push(item))
-                })?;
-                Ok(Value::Unit)
-            }
-            "vec_set" => {
-                let id = arg_usize(&args, 0, "vec_set")?;
-                let idx = arg_usize(&args, 1, "vec_set")?;
-                let item = args.get(2).cloned().unwrap_or(Value::Unit);
-                VECS.with(|v| {
-                    let mut b = v.borrow_mut();
-                    let xs = b.get_mut(id).ok_or_else(|| format!("vec_set: unknown vec {}", id))?;
-                    if idx >= xs.len() { return Err(format!("vec_set: index {} out of range (len {})", idx, xs.len())); }
-                    xs[idx] = item;
-                    Ok(())
-                })?;
-                Ok(Value::Unit)
-            }
-            "vec_get" => {
-                let id = arg_usize(&args, 0, "vec_get")?;
-                let idx = arg_usize(&args, 1, "vec_get")?;
-                VECS.with(|v| {
-                    let b = v.borrow();
-                    b.get(id).ok_or_else(|| format!("vec_get: unknown vec {}", id))
-                        .map(|xs| xs.get(idx).cloned().unwrap_or(Value::Unit))
-                })
-            }
-            "vec_len" => {
-                let id = arg_usize(&args, 0, "vec_len")?;
-                VECS.with(|v| {
-                    let b = v.borrow();
-                    b.get(id).ok_or_else(|| format!("vec_len: unknown vec {}", id)).map(|xs| Value::Number(xs.len() as f64))
-                })
-            }
-            "vec_to_list" => {
-                let id = arg_usize(&args, 0, "vec_to_list")?;
-                VECS.with(|v| {
-                    let b = v.borrow();
-                    b.get(id).ok_or_else(|| format!("vec_to_list: unknown vec {}", id)).map(|xs| Value::List(xs.clone()))
-                })
-            }
-            "str_intern" => {
-                let s = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
-                let id = ISTRINGS.with(|v| { let mut b = v.borrow_mut(); b.push(s); b.len() - 1 });
-                Ok(Value::Number(id as f64))
-            }
-            "sc_len" => {
-                let id = arg_usize(&args, 0, "sc_len")?;
-                ISTRINGS.with(|v| {
-                    let b = v.borrow();
-                    b.get(id).ok_or_else(|| format!("sc_len: unknown string {}", id))
-                        .map(|s| Value::Number(if s.is_ascii() { s.len() as f64 } else { s.chars().count() as f64 }))
-                })
-            }
-            "sc_code" => {
-                let id = arg_usize(&args, 0, "sc_code")?;
-                let idx = arg_usize(&args, 1, "sc_code")?;
-                ISTRINGS.with(|v| {
-                    let b = v.borrow();
-                    let s = b.get(id).ok_or_else(|| format!("sc_code: unknown string {}", id))?;
-                    if s.is_ascii() {
-                        return Ok(Value::Number(match s.as_bytes().get(idx) { Some(c) => *c as f64, None => -1.0 }));
-                    }
-                    Ok(Value::Number(match s.chars().nth(idx) { Some(c) => c as u32 as f64, None => -1.0 }))
-                })
-            }
-            "sc_char" => {
-                let id = arg_usize(&args, 0, "sc_char")?;
-                let idx = arg_usize(&args, 1, "sc_char")?;
-                ISTRINGS.with(|v| {
-                    let b = v.borrow();
-                    let s = b.get(id).ok_or_else(|| format!("sc_char: unknown string {}", id))?;
-                    if s.is_ascii() {
-                        return Ok(match s.as_bytes().get(idx) { Some(c) => Value::String((*c as char).to_string()), None => Value::String(String::new()) });
-                    }
-                    Ok(match s.chars().nth(idx) { Some(c) => Value::String(c.to_string()), None => Value::String(String::new()) })
-                })
-            }
-            "sb_new" => {
-                let id = SBUFS.with(|v| { let mut b = v.borrow_mut(); b.push(String::new()); b.len() - 1 });
-                Ok(Value::Number(id as f64))
-            }
-            "sb_push" => {
-                let id = arg_usize(&args, 0, "sb_push")?;
-                let text = match args.get(1) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
-                SBUFS.with(|v| {
-                    let mut b = v.borrow_mut();
-                    b.get_mut(id).ok_or_else(|| format!("sb_push: unknown buffer {}", id)).map(|s| s.push_str(&text))
-                })?;
-                Ok(Value::Unit)
-            }
-            "sb_str" => {
-                let id = arg_usize(&args, 0, "sb_str")?;
-                SBUFS.with(|v| {
-                    let b = v.borrow();
-                    b.get(id).ok_or_else(|| format!("sb_str: unknown buffer {}", id)).map(|s| Value::String(s.clone()))
-                })
-            }
-            "char_code" => {
-                // char_code(string, index) -> Number code point, or -1 if out of range
-                if args.len() != 2 { return Err("char_code: expected 2 args".into()); }
-                let s = match &args[0] { Value::String(s) => s.clone(), v => to_s(v) };
-                let idx = match &args[1] { Value::Number(n) => *n as usize, Value::String(t) => t.parse::<usize>().unwrap_or(usize::MAX), _ => usize::MAX };
-                if s.is_ascii() {
-                    return Ok(Value::Number(match s.as_bytes().get(idx) { Some(b) => *b as f64, None => -1.0 }));
-                }
-                match s.chars().nth(idx) {
-                    Some(c) => Ok(Value::Number(c as u32 as f64)),
-                    None => Ok(Value::Number(-1.0)),
-                }
-            }
-            "substr" => {
-                // substr(string, start, len) -> String slice by chars (clamped)
-                if args.len() != 3 { return Err("substr: expected 3 args".into()); }
-                let s = match &args[0] { Value::String(s) => s.clone(), v => to_s(v) };
-                let start = match &args[1] { Value::Number(n) => (*n).max(0.0) as usize, Value::String(t) => t.parse::<usize>().unwrap_or(0), _ => 0 };
-                let count = match &args[2] { Value::Number(n) => (*n).max(0.0) as usize, Value::String(t) => t.parse::<usize>().unwrap_or(0), _ => 0 };
-                if s.is_ascii() {
-                    let b = s.as_bytes();
-                    let st = start.min(b.len());
-                    let en = st.saturating_add(count).min(b.len());
-                    return Ok(Value::String(String::from_utf8_lossy(&b[st..en]).to_string()));
-                }
-                Ok(Value::String(s.chars().skip(start).take(count).collect()))
-            }
-            "chr" => {
-                // chr(code) -> 1-char string (empty for invalid code points)
-                let n = match args.get(0) { Some(Value::Number(n)) => *n, Some(Value::String(s)) => s.trim().parse::<f64>().unwrap_or(-1.0), _ => -1.0 };
-                if n < 0.0 { return Ok(Value::String(String::new())); }
-                Ok(Value::String(char::from_u32(n as u32).map(|c| c.to_string()).unwrap_or_default()))
-            }
-            "to_num" => {
-                // to_num(value) -> Number (parse string, else 0)
-                let v = args.get(0).cloned().unwrap_or(Value::Unit);
-                let n = match v {
-                    Value::Number(n) => n,
-                    Value::String(s) => s.trim().parse::<f64>().unwrap_or(0.0),
-                    Value::Bool(b) => if b { 1.0 } else { 0.0 },
-                    _ => 0.0,
-                };
-                Ok(Value::Number(n))
-            }
-            "read_file" => {
-                // read_file(path) -> String contents
-                let p = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
-                std::fs::read_to_string(&p).map(Value::String).map_err(|e| format!("read_file: {}: {}", p, e))
-            }
-            "now_ms" => {
-                // now_ms() -> Number: milliseconds since the Unix epoch
-                let ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as f64)
-                    .unwrap_or(0.0);
-                Ok(Value::Number(ms))
-            }
-            "byte_length" => {
-                // byte_length(s) -> Number of UTF-8 bytes (unlike .length,
-                // which counts chars) - for exact HTTP Content-Length framing.
-                let s = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
-                Ok(Value::Number(s.len() as f64))
-            }
-            "read_line" => {
-                // read_line() -> String: one line from stdin, no trailing
-                // newline, or "" at EOF.
-                use std::io::BufRead;
-                let mut line = String::new();
-                let n = std::io::stdin().lock().read_line(&mut line).map_err(|e| format!("read_line: {}", e))?;
-                if n == 0 { Ok(Value::String(String::new())) } else {
-                    while line.ends_with('\n') || line.ends_with('\r') { line.pop(); }
-                    Ok(Value::String(line))
-                }
-            }
-            "write_file" => {
-                // write_file(path, contents) -> Bool
-                let p = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
-                let contents = match args.get(1) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
-                if let Some(parent) = std::path::Path::new(&p).parent() { let _ = std::fs::create_dir_all(parent); }
-                std::fs::write(&p, contents).map(|_| Value::Bool(true)).map_err(|e| format!("write_file: {}: {}", p, e))
-            }
-            "argv" => {
-                // argv() -> List of user arguments (program name stripped)
-                let mut rest: Vec<String> = std::env::args().collect();
-                if !rest.is_empty() { rest.remove(0); }
-                Ok(Value::List(rest.into_iter().map(Value::String).collect()))
-            }
             "rustc_build" => {
                 // rustc_build(rust_source, out_path[, target_triple]) -> artifact path.
                 // The self-hosted compiler's back end: write source, run rustc.
@@ -944,25 +2839,6 @@ impl Host {
                 let abs = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
                 Ok(Value::String(abs.display().to_string()))
             }
-            "contract_check" => {
-                // contract_check(func_name, kind, text, ok) - design-by-contract
-                // enforcement, identical semantics to the interpreter's host arm.
-                if args.len() != 4 { return Err("contract_check: expected 4 args".into()); }
-                let func = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
-                let kind = match &args[1] { Value::String(s) => s.clone(), _ => String::new() };
-                let text = match &args[2] { Value::String(s) => s.clone(), _ => String::new() };
-                let ok = args[3].as_bool()?;
-                if ok {
-                    Ok(Value::Unit)
-                } else {
-                    let label = match kind.as_str() {
-                        "require" => "precondition",
-                        "ensure" => "postcondition",
-                        _ => "assertion",
-                    };
-                    Err(format!("contract violation: {} failed in {}(): {}", label, func, text))
-                }
-            }
             "run_ir" => {
                 // run_ir(ir_shape): decode a freshly lowered IR shape and run
                 // it on this runtime's VM (the browser-playground back end)
@@ -975,6 +2851,8 @@ impl Host {
                 fn snum(xs: &[Value], i: usize) -> Result<f64, String> {
                     match xs.get(i) {
                         Some(Value::Number(n)) => Ok(*n),
+                        Some(Value::Int(n)) => Ok(*n as f64),
+                        Some(Value::Float(n)) => Ok(*n),
                         Some(Value::String(s)) => s.trim().parse::<f64>().map_err(|_| "run_ir: expected number".to_string()),
                         _ => Err("run_ir: expected number".into()),
                     }
@@ -986,7 +2864,16 @@ impl Host {
                         "Const" => {
                             let kind = st(xs, 1)?; let text = st(xs, 2)?;
                             let val = match kind.as_str() {
-                                "num" => Value::Number(text.trim().parse::<f64>().map_err(|_| "run_ir: bad number".to_string())?),
+                                // Same Int-by-default/Float-if-decimal-point rule as
+                                // hosts.rs's decode_ir_instr "Const" arm (Stage 38).
+                                "num" => {
+                                    let t = text.trim();
+                                    if t.contains('.') {
+                                        Value::Float(t.parse::<f64>().map_err(|_| "run_ir: bad number".to_string())?)
+                                    } else {
+                                        Value::Int(t.parse::<i64>().map_err(|_| "run_ir: bad number".to_string())?)
+                                    }
+                                }
                                 "str" => Value::String(text),
                                 _ => Value::Bool(text == "true"),
                             };
@@ -1048,595 +2935,150 @@ impl Host {
                 let f = program.functions.get(&program.entry).ok_or("run_ir: entry not found")?;
                 run_function(&program, f, &[])
             }
-            "tcp_listen" => {
-                // tcp_listen(port) -> Number actual bound port (0 = OS-assigned)
-                let port = arg_num(&args, 0, "tcp_listen")? as u16;
-                let listener = std::net::TcpListener::bind(("127.0.0.1", port))
-                    .map_err(|e| format!("tcp_listen: bind {}: {}", port, e))?;
-                let actual = listener.local_addr().map_err(|e| format!("tcp_listen: {}", e))?.port();
-                LISTENERS.with(|l| l.borrow_mut().insert(actual, listener));
-                Ok(Value::Number(actual as f64))
-            }
-            "tcp_connect" => {
-                // tcp_connect(host, port) -> Number connection id (blocks until connected)
-                let host = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => return Err("tcp_connect: expected host string".into()) };
-                let port = arg_num(&args, 1, "tcp_connect")? as u16;
-                let stream = std::net::TcpStream::connect((host.as_str(), port))
-                    .map_err(|e| format!("tcp_connect: {}:{}: {}", host, port, e))?;
-                let id = NEXT_CONN.with(|n| { let mut b = n.borrow_mut(); let v = *b; *b += 1; v });
-                CONNS.with(|c| c.borrow_mut().insert(id, stream));
-                Ok(Value::Number(id as f64))
-            }
-            "tcp_accept" => {
-                // tcp_accept(port) -> Number connection id (blocks)
-                let port = arg_num(&args, 0, "tcp_accept")? as u16;
-                let listener = LISTENERS.with(|l| l.borrow().get(&port).map(|x| x.try_clone()))
-                    .ok_or_else(|| format!("tcp_accept: no listener on port {}", port))?
-                    .map_err(|e| format!("tcp_accept: {}", e))?;
-                let (stream, _) = listener.accept().map_err(|e| format!("tcp_accept: {}", e))?;
-                let id = NEXT_CONN.with(|n| { let mut b = n.borrow_mut(); let v = *b; *b += 1; v });
-                CONNS.with(|c| c.borrow_mut().insert(id, stream));
-                Ok(Value::Number(id as f64))
-            }
-            "sleep_ms" => {
-                let ms = arg_num(&args, 0, "sleep_ms")?.max(0.0) as u64;
-                std::thread::sleep(std::time::Duration::from_millis(ms));
-                Ok(Value::Unit)
-            }
-            "tcp_accept_timeout" => {
-                // tcp_accept_timeout(port, ms) -> conn id, or -1 on timeout
-                let port = arg_num(&args, 0, "tcp_accept_timeout")? as u16;
-                let ms = arg_num(&args, 1, "tcp_accept_timeout")?.max(0.0) as u64;
-                let listener = LISTENERS.with(|l| l.borrow().get(&port).map(|x| x.try_clone()))
-                    .ok_or_else(|| format!("tcp_accept_timeout: no listener on port {}", port))?
-                    .map_err(|e| format!("tcp_accept_timeout: {}", e))?;
-                listener.set_nonblocking(true).map_err(|e| format!("tcp_accept_timeout: {}", e))?;
-                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
-                loop {
-                    match listener.accept() {
-                        Ok((stream, _)) => {
-                            let _ = stream.set_nonblocking(false);
-                            let id = NEXT_CONN.with(|n| { let mut b = n.borrow_mut(); let v = *b; *b += 1; v });
-                            CONNS.with(|c| c.borrow_mut().insert(id, stream));
-                            return Ok(Value::Number(id as f64));
-                        }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            if std::time::Instant::now() >= deadline { return Ok(Value::Number(-1.0)); }
-                            std::thread::sleep(std::time::Duration::from_millis(2));
-                        }
-                        Err(e) => return Err(format!("tcp_accept_timeout: {}", e)),
+                    _ => Err(format!("host fn '{}' not found", name)),
+    }
+}
+
+fn host_call_codegen_bootstrap(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+    match name {
+        "parse_tiny_source" | "lower_and_compile" | "emit_rust_for" | "copy_file" | "patc_compile_from_argv" | "get_argv" | "rustc_build" | "run_ir" => Some(host_call_codegen_bootstrap_inner(name, args)),
+        _ => None,
+    }
+}
+
+"##;
+
+    pub fn prelude() -> String {
+        Self::prelude_for(&Self::all_chunks())
+    }
+
+    pub fn all_chunks() -> std::collections::BTreeSet<ChunkId> {
+        ChunkId::CANONICAL_ORDER.iter().copied().collect()
+    }
+
+    /// One pass over every function's IR collecting distinct `Instr::CallHost`
+    /// names, mapped to chunks via `HOST_CHUNK_TABLE`, plus `core` always,
+    /// plus the transitive closure over `CROSS_CHUNK_EDGES` (empty today --
+    /// see the comment on that table for why).
+    pub fn required_chunks(program: &Program) -> std::collections::BTreeSet<ChunkId> {
+        let mut set = std::collections::BTreeSet::new();
+        set.insert(ChunkId::Core);
+        for f in program.functions.values() {
+            for instr in &f.body {
+                if let Instr::CallHost(name, _) = instr {
+                    if let Some((_, c)) = HOST_CHUNK_TABLE.iter().find(|(n, _)| *n == name.as_str()) {
+                        set.insert(*c);
                     }
-                }
-            }
-            "tcp_read" => {
-                // tcp_read(conn) -> String (single read, up to 64 KiB)
-                use std::io::Read;
-                let id = arg_num(&args, 0, "tcp_read")? as usize;
-                let mut stream = CONNS.with(|c| c.borrow().get(&id).map(|s| s.try_clone()))
-                    .ok_or_else(|| format!("tcp_read: unknown connection {}", id))?
-                    .map_err(|e| format!("tcp_read: {}", e))?;
-                let mut buf = vec![0u8; 65536];
-                let n = stream.read(&mut buf).map_err(|e| format!("tcp_read: {}", e))?;
-                Ok(Value::String(String::from_utf8_lossy(&buf[..n]).to_string()))
-            }
-            "tcp_write" => {
-                // tcp_write(conn, data) -> Bool
-                use std::io::Write;
-                let id = arg_num(&args, 0, "tcp_write")? as usize;
-                let data = match args.get(1) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
-                let mut stream = CONNS.with(|c| c.borrow().get(&id).map(|s| s.try_clone()))
-                    .ok_or_else(|| format!("tcp_write: unknown connection {}", id))?
-                    .map_err(|e| format!("tcp_write: {}", e))?;
-                stream.write_all(data.as_bytes()).map_err(|e| format!("tcp_write: {}", e))?;
-                let _ = stream.flush();
-                Ok(Value::Bool(true))
-            }
-            "tcp_close" => {
-                use std::io::Read;
-                let id = arg_num(&args, 0, "tcp_close")? as usize;
-                if let Some(stream) = CONNS.with(|c| c.borrow_mut().remove(&id)) {
-                    // Drain unread inbound bytes and half-close so the peer
-                    // gets a graceful FIN rather than an RST
-                    let _ = stream.set_nonblocking(true);
-                    let mut sink = [0u8; 4096];
-                    let mut s = stream;
-                    loop {
-                        match s.read(&mut sink) {
-                            Ok(0) => break,
-                            Ok(_) => continue,
-                            Err(_) => break,
+                    // `run_ir` interprets an IR tree built at RUNTIME from
+                    // not-yet-known user source (the browser playground) --
+                    // static analysis of the *host* program's own IR can
+                    // never see what the eventually-submitted user code will
+                    // call, so force-include the numeric tower and math
+                    // primitives unconditionally whenever `run_ir` appears
+                    // anywhere, regardless of what this program's own static
+                    // CallHost/BinOp scan would otherwise conclude.
+                    if name.as_str() == "run_ir" {
+                        // A live playground must support arbitrary PatLang --
+                        // not just numeric/math -- so force-include every
+                        // optional chunk (oo/logic/contracts/networking/etc
+                        // have the exact same "can't statically see the
+                        // user's future code" gap as numeric_tower/math did).
+                        for c in ChunkId::CANONICAL_ORDER {
+                            set.insert(*c);
                         }
                     }
-                    let _ = s.shutdown(std::net::Shutdown::Write);
                 }
-                Ok(Value::Unit)
-            }
-            "touch_file" => {
-                // touch_file(path) -> String message (OK <abs> or ERR: <msg>)
-                let p = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
-                if p.is_empty() { return Ok(Value::String("ERR: empty path".into())); }
-                let path = std::path::Path::new(&p);
-                if let Some(par) = path.parent() { let _ = std::fs::create_dir_all(par); }
-                let res = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&path);
-                match res {
-                    Ok(_) => {
-                        let abs = std::fs::canonicalize(&path).unwrap_or_else(|_| path.to_path_buf());
-                        Ok(Value::String(format!("OK {}", abs.display())))
+                // Stage 38: `numeric_tower` is a special case, not driven by
+                // `HOST_CHUNK_TABLE` -- any numeric BinOp (arithmetic, not
+                // comparison/logic) or unary negation could in principle
+                // overflow into bignum or hit inexact int division, and
+                // there's no cheap static proof either way from bare IR, so
+                // inclusion is deliberately coarse/conservative (a documented
+                // limitation, not a bug) rather than trying to prove a
+                // specific op site can't overflow.
+                match instr {
+                    Instr::BinOp(BinOpKind::Add) | Instr::BinOp(BinOpKind::Sub) | Instr::BinOp(BinOpKind::Mul)
+                    | Instr::BinOp(BinOpKind::Div) | Instr::BinOp(BinOpKind::Mod)
+                    | Instr::UnOp(UnOpKind::Neg) => {
+                        set.insert(ChunkId::NumericTower);
                     }
-                    Err(e) => Ok(Value::String(format!("ERR: {}", e)))
-                }
-            }
-            "file_exists" => {
-                // file_exists(path) -> "1" or "0"
-                let p = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
-                let exists = std::path::Path::new(&p).exists();
-                Ok(Value::String(if exists { "1".into() } else { "0".into() }))
-            }
-            "hash_string" => {
-                // hash_string(s) -> lowercase hex FNV-1a 64-bit digest
-                let s = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
-                let mut hash: u64 = 0xcbf29ce484222325;
-                for b in s.as_bytes() {
-                    hash ^= *b as u64;
-                    hash = hash.wrapping_mul(0x100000001b3);
-                }
-                Ok(Value::String(format!("{:016x}", hash)))
-            }
-            "infer_type_for" => {
-                // args: pred, index, class
-                if args.len() != 3 { return Ok(Value::Unit); }
-                let pred = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
-                let idx = match &args[1] { Value::Number(n) => *n as usize, Value::String(s) => s.parse::<usize>().unwrap_or(0), _ => 0 };
-                let class = match &args[2] { Value::String(s) => s.clone(), _ => String::new() };
-                TYPE_RULES.with(|tr| { tr.borrow_mut().insert((pred, idx), class); });
-                Ok(Value::Unit)
-            }
-            "fact" => {
-                if args.len() != 3 { return Ok(Value::Unit); }
-                let pred = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
-                let a = to_s(args.get(1).unwrap_or(&Value::Unit));
-                let b = to_s(args.get(2).unwrap_or(&Value::Unit));
-                FACTS.with(|f| {
-                    let mut m = f.borrow_mut();
-                    m.entry(pred).or_insert_with(Vec::new).push((a, b));
-                });
-                Ok(Value::Unit)
-            }
-            "goal" => {
-                if args.is_empty() { return Ok(Value::Unit); }
-                let pred = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
-                let mut items: Vec<String> = Vec::new();
-                for a in &args[1..] { items.push(to_s(a)); }
-                GOALS.with(|g| { g.borrow_mut().push((pred, items)); });
-                Ok(Value::Unit)
-            }
-            "query" => {
-                if args.len() != 3 { return Ok(Value::Number(0.0)); }
-                let pred = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
-                let a = to_s(args.get(1).unwrap_or(&Value::Unit));
-                let mut count = 0usize;
-                let mut bs: Vec<String> = Vec::new();
-                FACTS.with(|f| {
-                    if let Some(v) = f.borrow().get(&pred) {
-                        for (x, b) in v.iter() {
-                            if x == &a { count += 1; bs.push(b.clone()); }
-                        }
+                    Instr::Const(Value::BigInt(_)) | Instr::Const(Value::Rational(_, _)) | Instr::Const(Value::Complex(_, _)) => {
+                        set.insert(ChunkId::NumericTower);
                     }
-                });
-                // Apply simple type inference rules recorded
-                TYPE_RULES.with(|tr| {
-                    let rules = tr.borrow();
-                    if let Some(class0) = rules.get(&(pred.clone(), 0usize)) { ensure_obj(&a, class0); }
-                    if let Some(class1) = rules.get(&(pred.clone(), 1usize)) {
-                        for b in bs.iter() { ensure_obj(b, class1); }
-                    }
-                });
-                Ok(Value::Number(count as f64))
-            }
-            "new" => {
-                if args.len() != 2 { return Ok(Value::Unit); }
-                let class = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
-                let name = match &args[1] { Value::String(s) => s.clone(), _ => String::new() };
-                if !name.is_empty() { ensure_obj(&name, &class); }
-                Ok(Value::String(name))
-            }
-            "set_var" => {
-                if args.len() != 2 { return Ok(Value::Unit); }
-                let key = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
-                let val = args.get(1).cloned().unwrap_or(Value::Unit);
-                if !key.is_empty() {
-                    OBJECTS.with(|o| {
-                        let mut b = o.borrow_mut();
-                        let m = b.entry("__vars".to_string()).or_insert_with(HashMap::new);
-                        m.insert(key, val);
-                    });
-                }
-                Ok(Value::Unit)
-            }
-            "print" => {
-                if let Some(x) = args.get(0) {
-                    // Support simple string interpolation for IR runtime: "#{var}"
-                    let s = display_value(x);
-                    let out = interpolate(&s);
-                    println!("{}", out);
-                    // Flush so piped consumers (tests, process supervisors) see
-                    // output promptly -- stdout is block-buffered when not a tty
-                    use std::io::Write;
-                    let _ = std::io::stdout().flush();
-                }
-                Ok(Value::Unit)
-            },
-            "sed" => {
-                // sed("s/pat/repl/[flags]", input)
-                let cmd = match args.get(0) { Some(Value::String(s)) => s.as_str(), _ => "" };
-                let dv;
-                let input: &str = match args.get(1) {
-                    Some(Value::String(s)) => s.as_str(),
-                    Some(v) => { dv = display_value(v); dv.as_str() },
-                    None => "",
-                };
-                let out = sed_command(cmd, input);
-                Ok(Value::String(out))
-            },
-            "add" => host_bin_num(args, |a,b| a+b),
-            "multiply" => host_bin_num(args, |a,b| a*b),
-            "subtract" => host_bin_num(args, |a,b| a-b),
-            "max" => host_bin_num(args, |a,b| a.max(b)),
-            "min" => host_bin_num(args, |a,b| a.min(b)),
-            "calculate" => Ok(Value::Number(0.0)),
-            "calculate_result" => Ok(Value::Number(0.0)),
-            "get_value" => Ok(Value::Number(0.0)),
-            "process" => Ok(Value::Bool(true)),
-            "validate" => Ok(Value::Bool(true)),
-            "len" => {
-                let v = args.get(0).cloned().unwrap_or(Value::Unit);
-                let n = match v {
-                    Value::String(s) => s.chars().count() as f64,
-                    Value::List(xs) => xs.len() as f64,
-                    Value::Object(m) => m.len() as f64,
-                    Value::Unit => 0.0,
-                    _ => 0.0,
-                };
-                Ok(Value::Number(n))
-            }
-            "get" => {
-                if args.len() != 2 { return Err("expected 2 args".into()); }
-                let key = match &args[1] { Value::String(s) => s.clone(), _ => return Err("expected string key".into()) };
-                match &args[0] {
-                    Value::String(name) => Ok(obj_get(name, &key).unwrap_or(Value::Unit)),
-                    Value::Object(map) => Ok(map.get(&key).cloned().unwrap_or(Value::Unit)),
-                    _ => Ok(Value::Unit),
+                    _ => {}
                 }
             }
-            "send" => {
-                if args.len() < 2 { return Ok(Value::Unit); }
-                let recv = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
-                let method = match &args[1] { Value::String(s) => s.clone(), _ => String::new() };
-                let rest = &args[2..];
-                match method.as_str() {
-                    "set" => {
-                        if rest.len() != 2 { return Ok(Value::Unit); }
-                        let prop = match &rest[0] { Value::String(s) => s.clone(), _ => String::new() };
-                        let val = rest[1].clone();
-                        if !recv.is_empty() && !prop.is_empty() { obj_set(&recv, &prop, val); }
-                        Ok(Value::Unit)
-                    }
-                    "infer_is_adult" => {
-                        // reads age, sets is_adult when >= 18
-                        if let Some(Value::Number(age)) = obj_get(&recv, "age") {
-                            if age >= 18.0 { obj_set(&recv, "is_adult", Value::Bool(true)); return Ok(Value::Bool(true)); }
-                        } else if let Some(Value::String(s)) = obj_get(&recv, "age") {
-                            if s.parse::<f64>().unwrap_or(0.0) >= 18.0 { obj_set(&recv, "is_adult", Value::Bool(true)); return Ok(Value::Bool(true)); }
-                        }
-                        Ok(Value::Bool(false))
-                    }
-                    "infer_relations" => {
-                        // if exists fact("parent", X, recv) then set has_parent true
-                        let mut has = false;
-                        FACTS.with(|f| {
-                            if let Some(v) = f.borrow().get("parent") {
-                                has = v.iter().any(|(_, child)| child == &recv);
-                            }
-                        });
-                        if has { obj_set(&recv, "has_parent", Value::Bool(true)); return Ok(Value::Bool(true)); }
-                        Ok(Value::Bool(false))
-                    }
-                    _ => Ok(Value::Unit),
-                }
-            }
-            other => Err(format!("host fn '{}' not found", other)),
         }
-    }
-}
-
-fn host_bin_num(args: &[Value], f: fn(f64,f64)->f64) -> Result<Value, String> {
-    let a = args.get(0).ok_or("expected 2 args")?;
-    let b = args.get(1).ok_or("expected 2 args")?;
-    let an = a.as_number()?; let bn = b.as_number()?;
-    Ok(Value::Number(f(an,bn)))
-}
-
-fn display_value(v: &Value) -> String {
-    match v {
-        Value::Unit => String::new(),
-        Value::Bool(b) => b.to_string(),
-        Value::Number(n) => if n.fract()==0.0 { format!("{}", *n as i64) } else { n.to_string() },
-        Value::String(s) => s.clone(),
-        Value::List(xs) => {
-            let parts: Vec<String> = xs.iter().map(|x| display_value(x)).collect();
-            format!("[{}]", parts.join(", "))
-        }
-        Value::Object(map) => {
-            let mut kvs: Vec<String> = map.iter().map(|(k,v)| format!("{}: {}", k, display_value(v))).collect();
-            kvs.sort();
-            format!("{{{}}}", kvs.join(", "))
-        }
-        Value::Closure { .. } => "<closure>".into(),
-    }
-}
-
-fn sed_command(cmd: &str, input: &str) -> String {
-    if !cmd.starts_with('s') { return input.to_string(); }
-    let mut parts = cmd.splitn(4, '/');
-    let _s = parts.next();
-    let pat = match parts.next() { Some(p) => p, None => return input.to_string() };
-    let repl = match parts.next() { Some(r) => r, None => return input.to_string() };
-    let flags = parts.next().unwrap_or("");
-    let global = flags.contains('g');
-    let ci = flags.contains('i');
-    replace_lit(input, pat, repl, global, ci)
-}
-
-fn replace_lit(hay: &str, pat: &str, rep: &str, global: bool, ci: bool) -> String {
-    if pat.is_empty() { return hay.to_string(); }
-    if !ci {
-        if !global {
-            if let Some(pos) = hay.find(pat) {
-                let mut out = String::with_capacity(hay.len());
-                out.push_str(&hay[..pos]);
-                out.push_str(rep);
-                out.push_str(&hay[pos+pat.len()..]);
-                return out;
+        loop {
+            let mut changed = false;
+            for (from, to) in CROSS_CHUNK_EDGES {
+                if set.contains(from) && !set.contains(to) {
+                    set.insert(*to);
+                    changed = true;
+                }
             }
-            return hay.to_string();
-        } else {
-            let mut out = String::with_capacity(hay.len());
-            let mut start = 0usize;
-            let mut rest = hay;
-            while let Some(pos) = rest.find(pat) {
-                let abs = start + pos;
-                out.push_str(&hay[start..abs]);
-                out.push_str(rep);
-                start = abs + pat.len();
-                rest = &hay[start..];
-            }
-            out.push_str(&hay[start..]);
-            return out;
+            if !changed { break; }
         }
+        set
     }
-    let hay_l = hay.to_ascii_lowercase();
-    let pat_l = pat.to_ascii_lowercase();
-    if !global {
-        if let Some(pos) = hay_l.find(&pat_l) {
-            let mut out = String::with_capacity(hay.len());
-            out.push_str(&hay[..pos]);
-            out.push_str(rep);
-            out.push_str(&hay[pos+pat.len()..]);
-            return out;
-        }
-        return hay.to_string();
-    } else {
-        let mut out = String::with_capacity(hay.len());
-        let mut start = 0usize;
-        let mut idx = 0usize;
-        while idx <= hay_l.len() {
-            if let Some(pos) = hay_l[idx..].find(&pat_l) {
-                let abs = idx + pos;
-                out.push_str(&hay[start..abs]);
-                out.push_str(rep);
-                start = abs + pat.len();
-                idx = start;
-            } else { break; }
-        }
-        out.push_str(&hay[start..]);
-        return out;
-    }
-}
 
-// Simple interpolation: replace occurrences of #{name} using OBJECTS store vars or event locals if provided in scope.
-fn interpolate(input: &str) -> String {
-    let mut out = String::new();
-    let b = input.as_bytes();
-    let mut i = 0usize;
-    while i < b.len() {
-        if i + 2 < b.len() && b[i] as char == '#' && b[i+1] as char == '{' {
-            i += 2; let start = i;
-            while i < b.len() && b[i] as char != '}' { i += 1; }
-            let key = &input[start..i];
-            let val = resolve_interp_var(key);
-            out.push_str(&val);
-            if i < b.len() && b[i] as char == '}' { i += 1; }
-        } else { out.push(b[i] as char); i += 1; }
-    }
-    out
-}
-
-fn resolve_interp_var(key: &str) -> String {
-    // Try OBJECTS first (object.name property), then fall back to key itself.
-    if let Some((obj, prop)) = key.split_once('.') {
-        if let Some(v) = obj_get(obj, prop) { return display_value(&v); }
-    } else {
-        // No dot: may refer to a plain variable set on a synthetic "__vars" object by handlers.
-        if let Some(v) = obj_get("__vars", key) { return display_value(&v); }
-    }
-    String::new()
-}
-
-#[derive(Clone)]
-struct Function { name: String, params: Vec<String>, body: Vec<Instr> }
-
-struct Program { functions: HashMap<String, Function>, entry: String }
-
-fn run(program: &Program) -> Result<Value,String> {
-    let entry = program.functions.get(&program.entry).ok_or("entry not found")?;
-    run_function(program, entry, &[])
-}
-
-fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Value,String> {
-    let mut pc: usize = 0;
-    let mut stack: Vec<Value> = Vec::new();
-    let mut locals: HashMap<String, Value> = HashMap::new();
-    // bind params
-    for (i, p) in func.params.iter().enumerate() { if let Some(v) = args.get(i) { locals.insert(p.clone(), v.clone()); } }
-    while pc < func.body.len() {
-        match &func.body[pc] {
-            Instr::Const(v) => stack.push(v.clone()),
-            Instr::LoadLocal(n) => stack.push(locals.get(n).cloned().unwrap_or(Value::Unit)),
-            Instr::StoreLocal(n) => { let v = stack.pop().ok_or("stack underflow")?; locals.insert(n.clone(), v); },
-            Instr::UnOp(k) => {
-                let a = stack.pop().ok_or("stack underflow")?;
-                let r = match k { UnOpKind::Neg => Value::Number(-a.as_number()?), UnOpKind::Not => Value::Bool(!a.as_bool()?) };
-                stack.push(r);
-            }
-            Instr::BinOp(k) => {
-                use BinOpKind::*;
-                let b = stack.pop().ok_or("stack underflow")?;
-                let a = stack.pop().ok_or("stack underflow")?;
-                let r = match k {
-                    Add => add(&a,&b)?, Sub => sub(&a,&b)?, Mul => mul(&a,&b)?, Div => div(&a,&b)?, Mod => modu(&a,&b)?,
-                    Eq|Ne|Lt|Le|Gt|Ge => cmp(k, &a, &b)?,
-                    And => Value::Bool(a.as_bool()? && b.as_bool()?),
-                    Or => Value::Bool(a.as_bool()? || b.as_bool()?),
-                };
-                stack.push(r);
-            }
-            Instr::Jump(t) => { pc = *t; continue; }
-            Instr::JumpIfFalse(t) => { let c = stack.pop().ok_or("stack underflow")?; if !c.as_bool()? { pc = *t; continue; } }
-            Instr::CallHost(n, argc) => {
-                let argc = *argc; if stack.len() < argc { return Err("stack underflow".into()); }
-                let args_index = stack.len() - argc; let args: Vec<Value> = stack.drain(args_index..).collect();
-                if n == "emit" {
-                    let ev = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => String::new() };
-                    let payload = args.get(1).cloned().unwrap_or(Value::Unit);
-                    let mut last = Value::Unit;
-                    let handlers: Vec<String> = EVENT_HANDLERS.with(|m| m.borrow().get(&ev).cloned().unwrap_or_default());
-                    for h in handlers {
-                        let callee = program.functions.get(&h).ok_or_else(|| format!("function '{}' not found", h))?;
-                        // Expose event locals for interpolation via __vars as well
-                        obj_set("__vars", "event_name", Value::String(ev.clone()));
-                        obj_set("__vars", "event_data", payload.clone());
-                        // Handlers are synthesized with parameters (event_name, event_data)
-                        last = run_function(program, callee, &[Value::String(ev.clone()), payload.clone()])?;
-                    }
-                    stack.push(last);
-                } else if n == "apply" {
-                    // apply(fname, args...): call a program function by name
-                    let fname = match args.get(0) {
-                        Some(Value::String(s)) => s.clone(),
-                        _ => return Err("apply: expected function name string".into()),
-                    };
-                    let callee = program.functions.get(&fname)
-                        .ok_or_else(|| format!("apply: function '{}' not found", fname))?;
-                    let r = run_function(program, callee, &args[1..])?;
-                    stack.push(r);
+    /// Concatenate the selected chunks (in `ChunkId::CANONICAL_ORDER`) plus a
+    /// dynamically-assembled `call_dispatch` free function routing unhandled
+    /// `core` host names to whichever optional chunks were included. This is
+    /// the only part of the emitted text that isn't a static `&'static str`
+    /// chunk constant, since which chunks are present varies per program.
+    pub fn prelude_for(chunks: &std::collections::BTreeSet<ChunkId>) -> String {
+        let mut out = String::new();
+        for c in ChunkId::CANONICAL_ORDER {
+            if *c == ChunkId::NumericTower {
+                // Mutually exclusive value-module selection (see the doc
+                // comment above `PRELUDE_VALUE_FAST`): exactly one of the two
+                // is always emitted here, never both, never neither.
+                if chunks.contains(c) {
+                    out.push_str(RustCodegen::PRELUDE_NUMERIC_TOWER);
                 } else {
-                    let r = Host::call(n, &args)?; stack.push(r);
+                    out.push_str(RustCodegen::PRELUDE_VALUE_FAST);
                 }
+                continue;
             }
-            Instr::Call(n, argc) => {
-                let argc = *argc; if stack.len() < argc { return Err("stack underflow".into()); }
-                let args_index = stack.len() - argc; let args: Vec<Value> = stack.drain(args_index..).collect();
-                let callee = program.functions.get(n).ok_or_else(|| format!("function '{}' not found", n))?;
-                let r = run_function(program, callee, &args)?; stack.push(r);
-            }
-            Instr::MakeClosure(func_name, captured_names) => {
-                let n = captured_names.len();
-                if stack.len() < n { return Err("stack underflow".into()); }
-                let start = stack.len() - n;
-                let vals: Vec<Value> = stack.drain(start..).collect();
-                let captured: Vec<(String, Value)> = captured_names.iter().cloned().zip(vals).collect();
-                stack.push(Value::Closure { func_name: func_name.clone(), captured });
-            }
-            Instr::CallValue(argc) => {
-                let argc = *argc; if stack.len() < argc { return Err("stack underflow".into()); }
-                let args_index = stack.len() - argc;
-                let call_args: Vec<Value> = stack.drain(args_index..).collect();
-                let callee_val = stack.pop().ok_or("stack underflow")?;
-                match callee_val {
-                    Value::Closure { func_name, captured } => {
-                        let mut full_args: Vec<Value> = captured.into_iter().map(|(_, v)| v).collect();
-                        full_args.extend(call_args);
-                        let callee = program.functions.get(&func_name).ok_or_else(|| format!("function '{}' not found", func_name))?;
-                        let r = run_function(program, callee, &full_args)?;
-                        stack.push(r);
-                    }
-                    other => return Err(format!("cannot call non-closure value: {:?}", other)),
-                }
-            }
-            Instr::BuildList(n) => { let n=*n; if stack.len()<n {return Err("stack underflow".into());} let start=stack.len()-n; let items: Vec<Value>=stack.drain(start..).collect(); stack.push(Value::List(items)); }
-            Instr::Return => { return Ok(stack.pop().unwrap_or(Value::Unit)); }
-        }
-        pc += 1;
-    }
-    Ok(stack.pop().unwrap_or(Value::Unit))
-}
-
-fn add(a:&Value,b:&Value)->Result<Value,String>{
-    match (a,b) {
-        (Value::String(sa), _) => Ok(Value::String(format!("{}{}", sa, to_s(b)))),
-        (_, Value::String(sb)) => Ok(Value::String(format!("{}{}", to_s(a), sb))),
-        _ => Ok(Value::Number(a.as_number()? + b.as_number()?)),
-    }
-}
-fn sub(a:&Value,b:&Value)->Result<Value,String>{ Ok(Value::Number(a.as_number()? - b.as_number()?)) }
-fn mul(a:&Value,b:&Value)->Result<Value,String>{ Ok(Value::Number(a.as_number()? * b.as_number()?)) }
-fn div(a:&Value,b:&Value)->Result<Value,String>{ Ok(Value::Number(a.as_number()? / b.as_number()?)) }
-fn modu(a:&Value,b:&Value)->Result<Value,String>{ Ok(Value::Number(a.as_number()? % b.as_number()?)) }
-fn cmp(k:&BinOpKind,a:&Value,b:&Value)->Result<Value,String>{
-    use BinOpKind::*;
-    let res = match k {
-        // Structural equality for Eq/Ne across all Value variants
-        Eq => a == b,
-        Ne => a != b,
-        // Relational: lexicographic for string pairs, numeric otherwise
-        Lt | Le | Gt | Ge => {
-            if let (Value::String(x), Value::String(y)) = (a, b) {
-                match k {
-                    Lt => x < y,
-                    Le => x <= y,
-                    Gt => x > y,
-                    Ge => x >= y,
-                    _ => unreachable!(),
-                }
-            } else {
-                let (an, bn) = (a.as_number()?, b.as_number()?);
-                match k {
-                    Lt => an < bn,
-                    Le => an <= bn,
-                    Gt => an > bn,
-                    Ge => an >= bn,
-                    _ => unreachable!(),
-                }
+            if chunks.contains(c) {
+                out.push_str(c.text());
             }
         }
-        _ => false,
-    };
-    Ok(Value::Bool(res))
-}
-fn to_s(v:&Value)->String{ match v { Value::Unit=>String::new(), Value::Bool(b)=>b.to_string(), Value::Number(n)=> if n.fract()==0.0 {format!("{}",*n as i64)} else {n.to_string()}, Value::String(s)=>s.clone(), Value::List(xs)=>{ let parts:Vec<String>=xs.iter().map(|x|to_s(x)).collect(); format!("[{}]", parts.join(", ")) }, Value::Object(map)=>{ let mut kvs:Vec<String>=map.iter().map(|(k,v)| format!("{}: {}",k,to_s(v))).collect(); kvs.sort(); format!("{{{}}}", kvs.join(", ")) }, Value::Closure{..} => "<closure>".to_string() } }
-
-fn main(){
-    let program = build_program();
-    match run(&program) { Ok(v) => println!("{}", display_value(&v)), Err(e) => { eprintln!("IR runtime error: {}", e); std::process::exit(1); } }
-}
-
-"##
+        out.push_str(&Self::build_dispatch(chunks));
+        out
     }
+
+    /// Raw text for a single named chunk (used by the per-chunk parity test),
+    /// or the dispatch glue alone via the sentinel name `"__dispatch_all__"`.
+    pub fn chunk_text_by_name(name: &str) -> Option<String> {
+        if name == "__dispatch_all__" {
+            return Some(Self::build_dispatch(&Self::all_chunks()));
+        }
+        if name == "__value_fast__" {
+            return Some(RustCodegen::PRELUDE_VALUE_FAST.to_string());
+        }
+        ChunkId::from_name(name).map(|c| c.text().to_string())
+    }
+
+    fn build_dispatch(chunks: &std::collections::BTreeSet<ChunkId>) -> String {
+        let mut s = String::new();
+        s.push_str("fn call_dispatch(name: &str, args: &[Value]) -> Result<Value, String> {\n");
+        for c in ChunkId::CANONICAL_ORDER {
+            if *c == ChunkId::Core || *c == ChunkId::NumericTower { continue; }
+            if chunks.contains(c) {
+                s.push_str(&format!("    if let Some(r) = host_call_{}(name, args) {{ return r; }}\n", c.name()));
+            }
+        }
+        s.push_str("    Err(format!(\"host fn '{}' not found\", name))\n}\n\n");
+        s
+    }
+
 
     // Emit a standalone Rust program that embeds the IR as a multi-function Program
     pub fn emit_rust(&self, program: &Program) -> String {
         let mut out = String::new();
-        out.push_str(Self::prelude());
+        out.push_str(&Self::prelude_for(&Self::required_chunks(program)));
 
         // program builder: emit all functions with params and bodies
         out.push_str("fn build_program() -> Program {\n    let mut functions: HashMap<String, Function> = HashMap::new();\n");
@@ -1720,16 +3162,61 @@ fn main(){
         out.push_str(&format!("BinOpKind::{}", s));
     }
 
+    /// Emits a `NumT::...` constructor for `ComplexT`'s re/im components
+    /// (which cannot themselves be `Complex` -- the interpreter's own
+    /// `Value::Complex(Box<Value>, Box<Value>)` never nests, per
+    /// `ir/numeric.rs`'s promotion rules).
+    fn emit_numt(&self, v: &Value, out: &mut String) {
+        match v {
+            Value::Int(n) => out.push_str(&format!("NumT::Int({})", n)),
+            Value::Float(n) => out.push_str(&format!("NumT::Float({})", n)),
+            Value::BigInt(b) => out.push_str(&format!("NumT::Big(BigIntT::from_decimal_str(\"{}\").unwrap())", b)),
+            Value::Rational(n, d) => out.push_str(&format!(
+                "NumT::Rat(RationalT::new(BigIntT::from_decimal_str(\"{}\").unwrap(), BigIntT::from_decimal_str(\"{}\").unwrap()))",
+                n, d
+            )),
+            other => out.push_str(&format!("NumT::Int({})", other.as_number().map(|f| f as i64).unwrap_or(0))),
+        }
+    }
+
     fn emit_value(&self, v: &Value, out: &mut String) {
         match v {
             Value::Unit => out.push_str("Value::Unit"),
             Value::Bool(b) => out.push_str(&format!("Value::Bool({})", b)),
-            Value::Number(n) => {
-                if n.fract() == 0.0 {
-                    out.push_str(&format!("Value::Number({}.0)", *n as i64));
+            // Stage 38: whole-number literal source syntax (no decimal point)
+            // stays on the fast `Value::Int` path; `.`-containing literals
+            // become `Value::Float` -- mirrors the interpreter's own
+            // Int-by-default/Float-if-decimal-point rule (Stage 36,
+            // `ir/lowering.rs`'s `Expr::Number`/`Expr::Float` split). Whichever
+            // value-module `prelude_for` selects (`PRELUDE_VALUE_FAST` or
+            // `PRELUDE_NUMERIC_TOWER`) defines both variants identically, so
+            // this text is valid either way.
+            Value::Int(n) => out.push_str(&format!("Value::Int({})", n)),
+            Value::Float(n) => {
+                if n.fract() == 0.0 && n.is_finite() {
+                    out.push_str(&format!("Value::Float({}.0)", *n as i64));
                 } else {
-                    out.push_str(&format!("Value::Number({})", n));
+                    out.push_str(&format!("Value::Float({})", n));
                 }
+            }
+            // BigInt/Rational/Complex compile-time constants are rare (they'd
+            // only arise from a meta-compilation path folding a tower value
+            // into a `Const` at IR-build time, not from ordinary source
+            // literals), but are supported: emitted via the numeric_tower
+            // chunk's own constructors. Only valid when that chunk is
+            // selected -- `required_chunks` below also scans `Instr::Const`
+            // for these kinds so the chunk is never silently dropped.
+            Value::BigInt(b) => out.push_str(&format!("Value::BigInt(BigIntT::from_decimal_str(\"{}\").unwrap())", b)),
+            Value::Rational(n, d) => out.push_str(&format!(
+                "Value::Rational(RationalT::new(BigIntT::from_decimal_str(\"{}\").unwrap(), BigIntT::from_decimal_str(\"{}\").unwrap()))",
+                n, d
+            )),
+            Value::Complex(re, im) => {
+                out.push_str("Value::Complex(ComplexT::new(");
+                self.emit_numt(re, out);
+                out.push_str(", ");
+                self.emit_numt(im, out);
+                out.push_str("))");
             }
             Value::String(s) => out.push_str(&format!("Value::String(\"{}\".to_string())", rust_str(s))),
             Value::List(items) => {

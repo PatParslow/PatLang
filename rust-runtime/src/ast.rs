@@ -4,7 +4,12 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Expr {
+    // Written without a decimal point in source (`42`) — lowers to the fast
+    // Value::Int path (Stage 36 numeric tower).
     Number(f64),
+    // Written with a decimal point in source (`42.5`) — lowers to
+    // Value::Float, standard IEEE double semantics.
+    Float(f64),
     String(String),
     Identifier(String),
     // List literal: [a, b, c]

@@ -64,7 +64,7 @@ impl Interpreter {
                 Instr::UnOp(kind) => {
                     let a = stack.pop().ok_or("stack underflow")?;
                     let res = match kind {
-                        UnOpKind::Neg => Value::Number(-a.as_number()?),
+                        UnOpKind::Neg => ops::negate(&a)?,
                         UnOpKind::Not => Value::Bool(!a.as_bool()?),
                     };
                     stack.push(res);

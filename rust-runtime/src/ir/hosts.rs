@@ -4,30 +4,26 @@
 
 use super::interpreter::Interpreter;
 use super::types::Value;
+use super::ops::{self, v_to_string, as_index};
+use super::numeric::{normalize, make_rational};
+use num_bigint::BigInt;
 
+// Kept as a thin wrapper: delegates to ops::v_to_string so display formatting
+// stays in one place across the numeric tower's new variants.
 fn display_value(v: &Value) -> String {
-    match v {
-        Value::Unit => String::new(),
-        Value::Bool(b) => b.to_string(),
-        Value::Number(n) => if n.fract() == 0.0 { format!("{}", *n as i64) } else { n.to_string() },
-        Value::String(s) => s.clone(),
-        Value::List(xs) => {
-            let parts: Vec<String> = xs.iter().map(display_value).collect();
-            format!("[{}]", parts.join(", "))
-        }
-        Value::HostFunction(_) => "<hostfn>".into(),
-        Value::Closure { .. } => "<closure>".into(),
-        Value::Object(map) => {
-            let mut kvs: Vec<String> = map.iter().map(|(k, v)| format!("{}: {}", k, display_value(v))).collect();
-            kvs.sort();
-            format!("{{{}}}", kvs.join(", "))
-        }
-    }
+    v_to_string(v)
 }
+
+// Best-effort index extraction for the ad hoc `Value::Number(n) => *n as
+// usize, Value::String(s) => ..., _ => usize::MAX` call sites below: unlike
+// `as_index` (which errors on bad input), these sites historically fell back
+// to usize::MAX / 0 rather than propagating an error, so we preserve that by
+// treating an as_index error as the same fallback the String-parse arm uses.
+fn number_or_max(v: &Value) -> Option<usize> { as_index(v).ok() }
 
 pub fn host_list_get(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 { return Err("list_get: expected 2 args".into()); }
-    let idx = match &args[1] { Value::Number(n) => *n as usize, Value::String(s) => s.parse::<usize>().unwrap_or(usize::MAX), _ => usize::MAX };
+    let idx = match &args[1] { Value::String(s) => s.parse::<usize>().unwrap_or(usize::MAX), v => number_or_max(v).unwrap_or(usize::MAX) };
     match &args[0] {
         Value::List(xs) => Ok(xs.get(idx).cloned().unwrap_or(Value::Unit)),
         Value::String(s) => {
@@ -70,7 +66,7 @@ pub fn host_list_set(args: &[Value]) -> Result<Value, String> {
         Value::List(xs) => xs.clone(),
         _ => return Err("list_set: expected list".into()),
     };
-    let idx = match &args[1] { Value::Number(n) => *n as usize, Value::String(s) => s.parse::<usize>().unwrap_or(usize::MAX), _ => usize::MAX };
+    let idx = match &args[1] { Value::String(s) => s.parse::<usize>().unwrap_or(usize::MAX), v => number_or_max(v).unwrap_or(usize::MAX) };
     if idx >= xs.len() { return Err(format!("list_set: index {} out of range (len {})", idx, xs.len())); }
     xs[idx] = args[2].clone();
     Ok(Value::List(xs))
@@ -79,21 +75,21 @@ pub fn host_list_set(args: &[Value]) -> Result<Value, String> {
 pub fn host_char_code(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 { return Err("char_code: expected 2 args".into()); }
     let s = match &args[0] { Value::String(s) => s.clone(), v => display_value(v) };
-    let idx = match &args[1] { Value::Number(n) => *n as usize, Value::String(t) => t.parse::<usize>().unwrap_or(usize::MAX), _ => usize::MAX };
+    let idx = match &args[1] { Value::String(t) => t.parse::<usize>().unwrap_or(usize::MAX), v => number_or_max(v).unwrap_or(usize::MAX) };
     if s.is_ascii() {
-        return Ok(Value::Number(match s.as_bytes().get(idx) { Some(b) => *b as f64, None => -1.0 }));
+        return Ok(Value::Int(match s.as_bytes().get(idx) { Some(b) => *b as i64, None => -1 }));
     }
     match s.chars().nth(idx) {
-        Some(c) => Ok(Value::Number(c as u32 as f64)),
-        None => Ok(Value::Number(-1.0)),
+        Some(c) => Ok(Value::Int(c as u32 as i64)),
+        None => Ok(Value::Int(-1)),
     }
 }
 
 pub fn host_substr(args: &[Value]) -> Result<Value, String> {
     if args.len() != 3 { return Err("substr: expected 3 args".into()); }
     let s = match &args[0] { Value::String(s) => s.clone(), v => display_value(v) };
-    let start = match &args[1] { Value::Number(n) => (*n).max(0.0) as usize, Value::String(t) => t.parse::<usize>().unwrap_or(0), _ => 0 };
-    let count = match &args[2] { Value::Number(n) => (*n).max(0.0) as usize, Value::String(t) => t.parse::<usize>().unwrap_or(0), _ => 0 };
+    let start = match &args[1] { Value::String(t) => t.parse::<usize>().unwrap_or(0), v => number_or_max(v).unwrap_or(0) };
+    let count = match &args[2] { Value::String(t) => t.parse::<usize>().unwrap_or(0), v => number_or_max(v).unwrap_or(0) };
     if s.is_ascii() {
         let b = s.as_bytes();
         let st = start.min(b.len());
@@ -113,15 +109,15 @@ thread_local! {
 
 fn arg_usize(args: &[Value], i: usize, what: &str) -> Result<usize, String> {
     match args.get(i) {
-        Some(Value::Number(n)) => Ok(*n as usize),
         Some(Value::String(s)) => s.trim().parse::<usize>().map_err(|_| format!("{}: expected index", what)),
+        Some(v) => as_index(v).map_err(|_| format!("{}: expected number", what)),
         _ => Err(format!("{}: expected number", what)),
     }
 }
 
 pub fn host_vec_new(_args: &[Value]) -> Result<Value, String> {
     let id = VECS.with(|v| { let mut b = v.borrow_mut(); b.push(Vec::new()); b.len() - 1 });
-    Ok(Value::Number(id as f64))
+    Ok(Value::Int(id as i64))
 }
 
 pub fn host_vec_push(args: &[Value]) -> Result<Value, String> {
@@ -162,7 +158,7 @@ pub fn host_vec_len(args: &[Value]) -> Result<Value, String> {
     let id = arg_usize(args, 0, "vec_len")?;
     VECS.with(|v| {
         let b = v.borrow();
-        b.get(id).ok_or_else(|| format!("vec_len: unknown vec {}", id)).map(|xs| Value::Number(xs.len() as f64))
+        b.get(id).ok_or_else(|| format!("vec_len: unknown vec {}", id)).map(|xs| Value::Int(xs.len() as i64))
     })
 }
 
@@ -184,7 +180,7 @@ thread_local! {
 pub fn host_str_intern(args: &[Value]) -> Result<Value, String> {
     let s = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
     let id = ISTRINGS.with(|v| { let mut b = v.borrow_mut(); b.push(s); b.len() - 1 });
-    Ok(Value::Number(id as f64))
+    Ok(Value::Int(id as i64))
 }
 
 pub fn host_sc_len(args: &[Value]) -> Result<Value, String> {
@@ -192,7 +188,7 @@ pub fn host_sc_len(args: &[Value]) -> Result<Value, String> {
     ISTRINGS.with(|v| {
         let b = v.borrow();
         b.get(id).ok_or_else(|| format!("sc_len: unknown string {}", id))
-            .map(|s| Value::Number(if s.is_ascii() { s.len() as f64 } else { s.chars().count() as f64 }))
+            .map(|s| Value::Int(if s.is_ascii() { s.len() as i64 } else { s.chars().count() as i64 }))
     })
 }
 
@@ -203,9 +199,9 @@ pub fn host_sc_code(args: &[Value]) -> Result<Value, String> {
         let b = v.borrow();
         let s = b.get(id).ok_or_else(|| format!("sc_code: unknown string {}", id))?;
         if s.is_ascii() {
-            return Ok(Value::Number(match s.as_bytes().get(idx) { Some(c) => *c as f64, None => -1.0 }));
+            return Ok(Value::Int(match s.as_bytes().get(idx) { Some(c) => *c as i64, None => -1 }));
         }
-        Ok(Value::Number(match s.chars().nth(idx) { Some(c) => c as u32 as f64, None => -1.0 }))
+        Ok(Value::Int(match s.chars().nth(idx) { Some(c) => c as u32 as i64, None => -1 }))
     })
 }
 
@@ -224,7 +220,7 @@ pub fn host_sc_char(args: &[Value]) -> Result<Value, String> {
 
 pub fn host_sb_new(_args: &[Value]) -> Result<Value, String> {
     let id = SBUFS.with(|v| { let mut b = v.borrow_mut(); b.push(String::new()); b.len() - 1 });
-    Ok(Value::Number(id as f64))
+    Ok(Value::Int(id as i64))
 }
 
 pub fn host_sb_push(args: &[Value]) -> Result<Value, String> {
@@ -247,20 +243,24 @@ pub fn host_sb_str(args: &[Value]) -> Result<Value, String> {
 
 pub fn host_chr(args: &[Value]) -> Result<Value, String> {
     // chr(code) -> 1-char string (empty for invalid code points)
-    let n = match args.get(0) { Some(Value::Number(n)) => *n, Some(Value::String(s)) => s.trim().parse::<f64>().unwrap_or(-1.0), _ => -1.0 };
+    let n = match args.get(0) { Some(Value::String(s)) => s.trim().parse::<f64>().unwrap_or(-1.0), Some(v) => v.as_number().unwrap_or(-1.0), _ => -1.0 };
     if n < 0.0 { return Ok(Value::String(String::new())); }
     Ok(Value::String(char::from_u32(n as u32).map(|c| c.to_string()).unwrap_or_default()))
 }
 
 pub fn host_to_num(args: &[Value]) -> Result<Value, String> {
     let v = args.get(0).cloned().unwrap_or(Value::Unit);
-    let n = match v {
-        Value::Number(n) => n,
-        Value::String(s) => s.trim().parse::<f64>().unwrap_or(0.0),
-        Value::Bool(b) => if b { 1.0 } else { 0.0 },
-        _ => 0.0,
-    };
-    Ok(Value::Number(n))
+    // Preserve the value's own numeric kind where possible (e.g. Value::Int
+    // stays Int) rather than always collapsing to Float.
+    match v {
+        Value::Int(_) | Value::Float(_) | Value::BigInt(_) | Value::Rational(_, _) => Ok(v),
+        Value::String(s) => {
+            let t = s.trim();
+            if let Ok(i) = t.parse::<i64>() { Ok(Value::Int(i)) } else { Ok(Value::Float(t.parse::<f64>().unwrap_or(0.0))) }
+        }
+        Value::Bool(b) => Ok(Value::Int(if b { 1 } else { 0 })),
+        _ => Ok(Value::Int(0)),
+    }
 }
 
 pub fn host_read_file(args: &[Value]) -> Result<Value, String> {
@@ -303,7 +303,7 @@ pub fn host_byte_length(args: &[Value]) -> Result<Value, String> {
     // chars) - needed for exact HTTP Content-Length framing of any non-ASCII
     // text.
     let s = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
-    Ok(Value::Number(s.len() as f64))
+    Ok(Value::Int(s.len() as i64))
 }
 
 pub fn host_read_line(_args: &[Value]) -> Result<Value, String> {
@@ -322,9 +322,9 @@ pub fn host_now_ms(_args: &[Value]) -> Result<Value, String> {
     // for self-timing; under the browser WASI shim it maps to performance.now)
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as f64)
-        .unwrap_or(0.0);
-    Ok(Value::Number(ms))
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    Ok(Value::Int(ms))
 }
 
 pub fn host_read_file_b64(args: &[Value]) -> Result<Value, String> {
@@ -385,12 +385,12 @@ pub fn host_argv(args: &[Value]) -> Result<Value, String> {
 pub fn host_len(args: &[Value]) -> Result<Value, String> {
     let v = args.get(0).cloned().unwrap_or(Value::Unit);
     let n = match v {
-        Value::String(ref s) => s.chars().count() as f64,
-        Value::List(ref xs) => xs.len() as f64,
-        Value::Object(ref m) => m.len() as f64,
-        _ => 0.0,
+        Value::String(ref s) => s.chars().count() as i64,
+        Value::List(ref xs) => xs.len() as i64,
+        Value::Object(ref m) => m.len() as i64,
+        _ => 0,
     };
-    Ok(Value::Number(n))
+    Ok(Value::Int(n))
 }
 
 pub fn host_get(args: &[Value]) -> Result<Value, String> {
@@ -467,13 +467,13 @@ pub fn host_fact(args: &[Value]) -> Result<Value, String> {
 
 pub fn host_query(args: &[Value]) -> Result<Value, String> {
     // query(pred, a, _) -> Number of facts matching (pred, a, *)
-    if args.len() != 3 { return Ok(Value::Number(0.0)); }
+    if args.len() != 3 { return Ok(Value::Int(0)); }
     let pred = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
     let a = to_s(&args[1]);
     let count = FACTS.with(|f| {
         f.borrow().get(&pred).map(|v| v.iter().filter(|(x, _)| x == &a).count()).unwrap_or(0)
     });
-    Ok(Value::Number(count as f64))
+    Ok(Value::Int(count as i64))
 }
 
 pub fn host_goal(args: &[Value]) -> Result<Value, String> {
@@ -556,8 +556,16 @@ fn lower_shape_expr(v: &Value, f: &mut Function, ctx: &ShapeCtx) -> Result<(), S
     match shape_tag(xs)? {
         "Num" => {
             let text = shape_str(xs, 1, "number text")?;
-            let n = text.trim().parse::<f64>().map_err(|_| format!("compile_shape: bad number '{}'", text))?;
-            f.body.push(Instr::Const(Value::Number(n)));
+            // Mirrors the lexer's own Int-by-default/Float-if-decimal-point
+            // discrimination (Stage 36): whole-number literals stay on the
+            // fast Int path, only `.`-containing text becomes Float.
+            let t = text.trim();
+            let v = if t.contains('.') {
+                Value::Float(t.parse::<f64>().map_err(|_| format!("compile_shape: bad number '{}'", text))?)
+            } else {
+                Value::Int(t.parse::<i64>().map_err(|_| format!("compile_shape: bad number '{}'", text))?)
+            };
+            f.body.push(Instr::Const(v));
         }
         "Str" => {
             let text = shape_str(xs, 1, "string text")?;
@@ -819,6 +827,21 @@ pub fn host_codegen_prelude(_args: &[Value]) -> Result<Value, String> {
     Ok(Value::String(super::codegen::RustCodegen::prelude().to_string()))
 }
 
+/// codegen_prelude_chunk(name) -> the raw text of a single named prelude
+/// chunk (Stage 37A), or the dispatch-glue text alone via the sentinel name
+/// `"__dispatch_all__"`. Used by the redesigned per-chunk parity test
+/// (`selfhost_runtime_text_parity`) to compare each chunk individually
+/// against its `self_hosting/lib/runtime_rs.patlang` mirror.
+pub fn host_codegen_prelude_chunk(args: &[Value]) -> Result<Value, String> {
+    let name = match args.get(0) {
+        Some(Value::String(s)) => s.clone(),
+        _ => return Err("codegen_prelude_chunk: expected chunk name string".into()),
+    };
+    super::codegen::RustCodegen::chunk_text_by_name(&name)
+        .map(Value::String)
+        .ok_or_else(|| format!("codegen_prelude_chunk: unknown chunk '{}'", name))
+}
+
 /// rustc_build(rust_source, out_path[, target_triple]) -> compiled artifact path.
 /// The dumbest possible back end: write the given Rust source and run rustc.
 /// Pass a target triple (e.g. "wasm32-wasip1") to cross-compile.
@@ -855,8 +878,8 @@ pub fn host_compile_shape(args: &[Value]) -> Result<Value, String> {
 
 fn shape_num(xs: &[Value], i: usize, what: &str) -> Result<f64, String> {
     match xs.get(i) {
-        Some(Value::Number(n)) => Ok(*n),
         Some(Value::String(s)) => s.trim().parse::<f64>().map_err(|_| format!("compile_ir: expected number {}", what)),
+        Some(v) => v.as_number().map_err(|_| format!("compile_ir: expected number {}", what)),
         _ => Err(format!("compile_ir: expected number {}", what)),
     }
 }
@@ -868,7 +891,16 @@ fn decode_ir_instr(v: &Value) -> Result<Instr, String> {
             let kind = shape_str(xs, 1, "const kind")?;
             let text = shape_str(xs, 2, "const text")?;
             let val = match kind.as_str() {
-                "num" => Value::Number(text.trim().parse::<f64>().map_err(|_| format!("compile_ir: bad number '{}'", text))?),
+                // Same Int-by-default/Float-if-decimal-point rule as
+                // lower_shape_expr's "Num" arm (Stage 36).
+                "num" => {
+                    let t = text.trim();
+                    if t.contains('.') {
+                        Value::Float(t.parse::<f64>().map_err(|_| format!("compile_ir: bad number '{}'", text))?)
+                    } else {
+                        Value::Int(t.parse::<i64>().map_err(|_| format!("compile_ir: bad number '{}'", text))?)
+                    }
+                }
                 "str" => Value::String(text),
                 "bool" => Value::Bool(text == "true"),
                 other => return Err(format!("compile_ir: unknown const kind '{}'", other)),
@@ -983,8 +1015,8 @@ thread_local! {
 
 fn arg_num(args: &[Value], i: usize, what: &str) -> Result<f64, String> {
     match args.get(i) {
-        Some(Value::Number(n)) => Ok(*n),
         Some(Value::String(s)) => s.trim().parse::<f64>().map_err(|_| format!("{}: expected number", what)),
+        Some(v) => v.as_number().map_err(|_| format!("{}: expected number", what)),
         _ => Err(format!("{}: expected number", what)),
     }
 }
@@ -995,7 +1027,7 @@ pub fn host_tcp_listen(args: &[Value]) -> Result<Value, String> {
         .map_err(|e| format!("tcp_listen: bind {}: {}", port, e))?;
     let actual = listener.local_addr().map_err(|e| format!("tcp_listen: {}", e))?.port();
     LISTENERS.with(|l| l.borrow_mut().insert(actual, listener));
-    Ok(Value::Number(actual as f64))
+    Ok(Value::Int(actual as i64))
 }
 
 pub fn host_tcp_connect(args: &[Value]) -> Result<Value, String> {
@@ -1006,7 +1038,7 @@ pub fn host_tcp_connect(args: &[Value]) -> Result<Value, String> {
         .map_err(|e| format!("tcp_connect: {}:{}: {}", host, port, e))?;
     let id = NEXT_CONN.with(|n| { let mut b = n.borrow_mut(); let v = *b; *b += 1; v });
     CONNS.with(|c| c.borrow_mut().insert(id, stream));
-    Ok(Value::Number(id as f64))
+    Ok(Value::Int(id as i64))
 }
 
 pub fn host_tcp_accept(args: &[Value]) -> Result<Value, String> {
@@ -1018,7 +1050,7 @@ pub fn host_tcp_accept(args: &[Value]) -> Result<Value, String> {
     let (stream, _) = listener.accept().map_err(|e| format!("tcp_accept: {}", e))?;
     let id = NEXT_CONN.with(|n| { let mut b = n.borrow_mut(); let v = *b; *b += 1; v });
     CONNS.with(|c| c.borrow_mut().insert(id, stream));
-    Ok(Value::Number(id as f64))
+    Ok(Value::Int(id as i64))
 }
 
 pub fn host_sleep_ms(args: &[Value]) -> Result<Value, String> {
@@ -1043,10 +1075,10 @@ pub fn host_tcp_accept_timeout(args: &[Value]) -> Result<Value, String> {
                 let _ = stream.set_nonblocking(false);
                 let id = NEXT_CONN.with(|n| { let mut b = n.borrow_mut(); let v = *b; *b += 1; v });
                 CONNS.with(|c| c.borrow_mut().insert(id, stream));
-                return Ok(Value::Number(id as f64));
+                return Ok(Value::Int(id as i64));
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if std::time::Instant::now() >= deadline { return Ok(Value::Number(-1.0)); }
+                if std::time::Instant::now() >= deadline { return Ok(Value::Int(-1)); }
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
             Err(e) => return Err(format!("tcp_accept_timeout: {}", e)),
@@ -1142,6 +1174,224 @@ pub fn host_run_ir(args: &[Value]) -> Result<Value, String> {
     interp.run(&program).map(|_| Value::Unit).map_err(|e| format!("run_ir: {}", e))
 }
 
+// --- Stage 39 — Math library primitives ---
+// These are the small set of Host:: arms that need direct access to tower
+// internals (exactness checks, BigInt sqrt, etc); everything expressible in
+// terms of these primitives instead lives in self_hosting/lib/math.patlang.
+// Mirrored in the `math` codegen chunk (both codegen.rs and
+// runtime_rs.patlang) for the compiled path, and every name here MUST also be
+// added to `Lowerer::is_allowed_host`'s allowlist in ir/lowering.rs or it gets
+// silently dropped from top-level statements.
+
+fn arg_f64(args: &[Value], i: usize, what: &str) -> Result<f64, String> {
+    args.get(i).ok_or_else(|| format!("{}: expected numeric arg", what))?.as_number()
+}
+
+/// Integer square root (floor of the true square root) via Newton's method,
+/// for a non-negative BigInt. Used to test perfect-square-ness exactly rather
+/// than via a lossy f64 round-trip, which would be wrong for large magnitudes.
+fn bigint_isqrt(n: &BigInt) -> BigInt {
+    let zero = BigInt::from(0);
+    if *n <= zero { return zero; }
+    if *n < BigInt::from(4) { return BigInt::from(1); }
+    let bits = n.bits();
+    let mut x = BigInt::from(1) << (bits / 2 + 1);
+    loop {
+        let y = (&x + n / &x) / BigInt::from(2);
+        if y >= x { break; }
+        x = y;
+    }
+    x
+}
+
+/// sqrt of a value already known to be non-negative: exact Int/BigInt/Rational
+/// result for perfect squares (numerator and denominator each perfect
+/// squares, for Rational), Float otherwise.
+fn sqrt_nonneg(v: &Value) -> Result<Value, String> {
+    match v {
+        Value::Int(n) => {
+            let bi = BigInt::from(*n);
+            let r = bigint_isqrt(&bi);
+            if &r * &r == bi { Ok(normalize(Value::BigInt(r))) } else { Ok(Value::Float((*n as f64).sqrt())) }
+        }
+        Value::BigInt(b) => {
+            let r = bigint_isqrt(b);
+            if &r * &r == *b { Ok(normalize(Value::BigInt(r))) } else { Ok(Value::Float(v.as_number()?.sqrt())) }
+        }
+        Value::Rational(n, d) => {
+            let rn = bigint_isqrt(n);
+            let rd = bigint_isqrt(d);
+            if &rn * &rn == *n && &rd * &rd == *d {
+                Ok(make_rational(rn, rd))
+            } else {
+                Ok(Value::Float(v.as_number()?.sqrt()))
+            }
+        }
+        Value::Float(f) => Ok(Value::Float(f.sqrt())),
+        Value::Unit => Ok(Value::Int(0)),
+        _ => Err("sqrt: expected numeric value".into()),
+    }
+}
+
+fn is_negative(v: &Value) -> bool {
+    match v {
+        Value::Int(n) => *n < 0,
+        Value::Float(f) => *f < 0.0,
+        Value::BigInt(b) => *b < BigInt::from(0),
+        Value::Rational(n, _) => *n < BigInt::from(0),
+        _ => false,
+    }
+}
+
+/// sqrt(x): exact Int/BigInt/Rational for perfect squares, Float otherwise,
+/// for x >= 0. For x < 0, returns Complex(0, sqrt(-x)) — the doc's named
+/// trigger case for producing a Complex value from PatLang source.
+pub fn host_sqrt(args: &[Value]) -> Result<Value, String> {
+    let v = args.get(0).ok_or("sqrt: expected 1 arg")?;
+    if matches!(v, Value::Complex(_, _)) { return Err("sqrt: complex input not supported".into()); }
+    if is_negative(v) {
+        let pos = ops::negate(v)?;
+        let root = sqrt_nonneg(&pos)?;
+        Ok(normalize(Value::Complex(Box::new(Value::Int(0)), Box::new(root))))
+    } else {
+        sqrt_nonneg(v)
+    }
+}
+
+/// pow(base, exp): integer exponent on an integer/rational base stays exact
+/// via repeated squaring routed through the same `ops::mul`/`ops::div`
+/// arithmetic used by `*`/`/` (so it naturally promotes to BigInt on
+/// overflow); non-integer exponent or float base falls back to f64::powf.
+pub fn host_pow(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 { return Err("pow: expected 2 args".into()); }
+    let base = &args[0];
+    let exp = &args[1];
+    let base_is_exact = matches!(base, Value::Int(_) | Value::BigInt(_) | Value::Rational(_, _));
+    let exp_int: Option<i64> = match exp {
+        Value::Int(n) => Some(*n),
+        Value::BigInt(b) => i64::try_from(b).ok(),
+        _ => None,
+    };
+    if let (true, Some(e)) = (base_is_exact, exp_int) {
+        return int_pow_exact(base, e);
+    }
+    let b = base.as_number()?;
+    let e = exp.as_number()?;
+    Ok(Value::Float(b.powf(e)))
+}
+
+fn int_pow_exact(base: &Value, exp: i64) -> Result<Value, String> {
+    if exp == 0 { return Ok(Value::Int(1)); }
+    if exp < 0 {
+        let pos = int_pow_exact(base, -exp)?;
+        return ops::div(&Value::Int(1), &pos);
+    }
+    let mut result = Value::Int(1);
+    let mut b = base.clone();
+    let mut e = exp as u64;
+    while e > 0 {
+        if e & 1 == 1 { result = ops::mul(&result, &b)?; }
+        e >>= 1;
+        if e > 0 { b = ops::mul(&b, &b)?; }
+    }
+    Ok(result)
+}
+
+pub fn host_sin(args: &[Value]) -> Result<Value, String> { Ok(Value::Float(arg_f64(args, 0, "sin")?.sin())) }
+pub fn host_cos(args: &[Value]) -> Result<Value, String> { Ok(Value::Float(arg_f64(args, 0, "cos")?.cos())) }
+pub fn host_tan(args: &[Value]) -> Result<Value, String> { Ok(Value::Float(arg_f64(args, 0, "tan")?.tan())) }
+pub fn host_asin(args: &[Value]) -> Result<Value, String> { Ok(Value::Float(arg_f64(args, 0, "asin")?.asin())) }
+pub fn host_acos(args: &[Value]) -> Result<Value, String> { Ok(Value::Float(arg_f64(args, 0, "acos")?.acos())) }
+pub fn host_atan(args: &[Value]) -> Result<Value, String> { Ok(Value::Float(arg_f64(args, 0, "atan")?.atan())) }
+pub fn host_atan2(args: &[Value]) -> Result<Value, String> {
+    let y = arg_f64(args, 0, "atan2")?;
+    let x = arg_f64(args, 1, "atan2")?;
+    Ok(Value::Float(y.atan2(x)))
+}
+pub fn host_log(args: &[Value]) -> Result<Value, String> { Ok(Value::Float(arg_f64(args, 0, "log")?.ln())) }
+pub fn host_exp(args: &[Value]) -> Result<Value, String> { Ok(Value::Float(arg_f64(args, 0, "exp")?.exp())) }
+
+/// floor/ceil/round/trunc: exact for Int/BigInt/Rational (integer division
+/// done directly on the BigInt numerator/denominator, never via a lossy f64
+/// round-trip), Float fallback for Float input.
+fn round_like(args: &[Value], mode: &str) -> Result<Value, String> {
+    let v = args.get(0).ok_or_else(|| format!("{}: expected 1 arg", mode))?;
+    match v {
+        Value::Int(_) | Value::BigInt(_) => Ok(v.clone()),
+        Value::Rational(n, d) => {
+            // Invariant (numeric.rs::make_rational): d is always > 0.
+            let q = n / d; // truncates toward zero
+            let r = n - &q * d; // remainder, same sign as n (or zero)
+            let zero = BigInt::from(0);
+            let result = match mode {
+                "trunc" => q,
+                "floor" => if r != zero && *n < zero { &q - 1 } else { q },
+                "ceil" => if r != zero && *n > zero { &q + 1 } else { q },
+                "round" => {
+                    let two_r = &r * BigInt::from(2);
+                    let past_half = if *n >= zero { two_r >= *d } else { -&two_r >= *d };
+                    if past_half { if *n >= zero { &q + 1 } else { &q - 1 } } else { q }
+                }
+                _ => q,
+            };
+            Ok(normalize(Value::BigInt(result)))
+        }
+        Value::Float(f) => Ok(Value::Float(match mode {
+            "floor" => f.floor(),
+            "ceil" => f.ceil(),
+            "round" => f.round(),
+            "trunc" => f.trunc(),
+            _ => *f,
+        })),
+        Value::Unit => Ok(Value::Int(0)),
+        _ => Err(format!("{}: expected numeric value", mode)),
+    }
+}
+
+pub fn host_floor(args: &[Value]) -> Result<Value, String> { round_like(args, "floor") }
+pub fn host_ceil(args: &[Value]) -> Result<Value, String> { round_like(args, "ceil") }
+pub fn host_round(args: &[Value]) -> Result<Value, String> { round_like(args, "round") }
+pub fn host_trunc(args: &[Value]) -> Result<Value, String> { round_like(args, "trunc") }
+
+/// abs(x): exact for all real kinds (Int/BigInt/Rational — just clear the
+/// sign, reusing ops::negate so overflow of i64::MIN is handled the same way
+/// `-x` already is), complex modulus (sqrt(re^2+im^2), itself going through
+/// host_sqrt) for Complex.
+pub fn host_abs(args: &[Value]) -> Result<Value, String> {
+    let v = args.get(0).ok_or("abs: expected 1 arg")?;
+    match v {
+        Value::Int(_) | Value::BigInt(_) | Value::Rational(_, _) => {
+            if is_negative(v) { ops::negate(v) } else { Ok(v.clone()) }
+        }
+        Value::Float(f) => Ok(Value::Float(f.abs())),
+        Value::Complex(re, im) => {
+            let re2 = ops::mul(re, re)?;
+            let im2 = ops::mul(im, im)?;
+            let sum = ops::add(&re2, &im2)?;
+            host_sqrt(&[sum])
+        }
+        Value::Unit => Ok(Value::Int(0)),
+        _ => Err("abs: expected numeric value".into()),
+    }
+}
+
+/// numeric_kind(x) -> "int"|"float"|"bigint"|"rational"|"complex"|"other":
+/// runtime introspection since PatLang has no source-level type annotations,
+/// so a program needs some way to branch on what representation a value
+/// ended up in after tower promotion.
+pub fn host_numeric_kind(args: &[Value]) -> Result<Value, String> {
+    let v = args.get(0).ok_or("numeric_kind: expected 1 arg")?;
+    let s = match v {
+        Value::Int(_) => "int",
+        Value::Float(_) => "float",
+        Value::BigInt(_) => "bigint",
+        Value::Rational(_, _) => "rational",
+        Value::Complex(_, _) => "complex",
+        _ => "other",
+    };
+    Ok(Value::String(s.to_string()))
+}
+
 /// Register the Stage 0 string/list/file shims on an interpreter.
 pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("len", host_len);
@@ -1182,6 +1432,7 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("run_ir", host_run_ir);
     interp.host.insert("contract_check", host_contract_check);
     interp.host.insert("codegen_prelude", host_codegen_prelude);
+    interp.host.insert("codegen_prelude_chunk", host_codegen_prelude_chunk);
     interp.host.insert("rustc_build", host_rustc_build);
     // OO + logic hosts (state shared per thread, matching compiled semantics)
     interp.host.insert("fact", host_fact);
@@ -1199,4 +1450,22 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("tcp_read", host_tcp_read);
     interp.host.insert("tcp_write", host_tcp_write);
     interp.host.insert("tcp_close", host_tcp_close);
+    // math library primitives (Stage 39)
+    interp.host.insert("sqrt", host_sqrt);
+    interp.host.insert("pow", host_pow);
+    interp.host.insert("sin", host_sin);
+    interp.host.insert("cos", host_cos);
+    interp.host.insert("tan", host_tan);
+    interp.host.insert("asin", host_asin);
+    interp.host.insert("acos", host_acos);
+    interp.host.insert("atan", host_atan);
+    interp.host.insert("atan2", host_atan2);
+    interp.host.insert("log", host_log);
+    interp.host.insert("exp", host_exp);
+    interp.host.insert("floor", host_floor);
+    interp.host.insert("ceil", host_ceil);
+    interp.host.insert("round", host_round);
+    interp.host.insert("trunc", host_trunc);
+    interp.host.insert("abs", host_abs);
+    interp.host.insert("numeric_kind", host_numeric_kind);
 }

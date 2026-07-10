@@ -182,20 +182,19 @@ fn main() {
                         interp.host.insert("subtract", |args| host_bin_num(args, |a,b| a - b));
                         interp.host.insert("max", |args| host_bin_num(args, |a,b| a.max(b)));
                         interp.host.insert("min", |args| host_bin_num(args, |a,b| a.min(b)));
-                        interp.host.insert("calculate", |_args| Ok(Value::Number(0.0)));
-                        interp.host.insert("calculate_result", |_args| Ok(Value::Number(0.0)));
-                        interp.host.insert("get_value", |_args| Ok(Value::Number(0.0)));
+                        interp.host.insert("calculate", |_args| Ok(Value::Int(0)));
+                        interp.host.insert("calculate_result", |_args| Ok(Value::Int(0)));
+                        interp.host.insert("get_value", |_args| Ok(Value::Int(0)));
                         interp.host.insert("process", |_args| Ok(Value::Bool(true)));
                         interp.host.insert("validate", |_args| Ok(Value::Bool(true)));
                         interp.host.insert("len", |args| {
                             let v = args.get(0).cloned().unwrap_or(Value::Unit);
                             let n = match v {
-                                Value::String(ref s) => s.chars().count() as f64,
-                                Value::List(ref xs) => xs.len() as f64,
-                                Value::Object(ref m) => m.len() as f64,
-                                Value::Unit => 0.0,
-                                _ => 0.0,
-                            }; Ok(Value::Number(n))
+                                Value::String(ref s) => s.chars().count() as i64,
+                                Value::List(ref xs) => xs.len() as i64,
+                                Value::Object(ref m) => m.len() as i64,
+                                _ => 0,
+                            }; Ok(Value::Int(n))
                         });
                         interp.host.insert("get", |args| {
                             if args.len() != 2 { return Err("expected 2 args".into()); }
@@ -248,22 +247,21 @@ fn main() {
     interp.host.insert("max", |args| host_bin_num(args, |a,b| a.max(b)));
     interp.host.insert("min", |args| host_bin_num(args, |a,b| a.min(b)));
     // placeholder demo functions
-    interp.host.insert("calculate", |_args| Ok(Value::Number(0.0)));
-    interp.host.insert("calculate_result", |_args| Ok(Value::Number(0.0)));
+    interp.host.insert("calculate", |_args| Ok(Value::Int(0)));
+    interp.host.insert("calculate_result", |_args| Ok(Value::Int(0)));
     // additional stubs used in examples
-    interp.host.insert("get_value", |_args| Ok(Value::Number(0.0)));
+    interp.host.insert("get_value", |_args| Ok(Value::Int(0)));
     interp.host.insert("process", |_args| Ok(Value::Bool(true)));
     interp.host.insert("validate", |_args| Ok(Value::Bool(true)));
     interp.host.insert("len", |args| {
         let v = args.get(0).cloned().unwrap_or(Value::Unit);
         let n = match v {
-            Value::String(ref s) => s.chars().count() as f64,
-            Value::List(ref xs) => xs.len() as f64,
-            Value::Object(ref m) => m.len() as f64,
-            Value::Unit => 0.0,
-            _ => 0.0,
+            Value::String(ref s) => s.chars().count() as i64,
+            Value::List(ref xs) => xs.len() as i64,
+            Value::Object(ref m) => m.len() as i64,
+            _ => 0,
         };
-        Ok(Value::Number(n))
+        Ok(Value::Int(n))
     });
     interp.host.insert("get", |args| {
         // get(obj, key) -> returns value or Unit
@@ -307,27 +305,10 @@ fn main() {
     }
 }
 
+// Delegates to the numeric-tower-aware formatter in ir::ops so main.rs's
+// display formatting stays in sync with the interpreter/hosts path.
 fn display_value(v: &Value) -> String {
-    match v {
-        Value::Unit => String::new(),
-        Value::Bool(b) => b.to_string(),
-        Value::Number(n) => {
-            // trim trailing .0 for integers
-            if n.fract() == 0.0 { format!("{}", *n as i64) } else { n.to_string() }
-        }
-        Value::String(s) => s.clone(),
-        Value::List(xs) => {
-            let parts: Vec<String> = xs.iter().map(|x| display_value(x)).collect();
-            format!("[{}]", parts.join(", "))
-        }
-        Value::HostFunction(_) => "<hostfn>".into(),
-        Value::Closure { .. } => "<closure>".into(),
-        Value::Object(map) => {
-            let mut kvs: Vec<String> = map.iter().map(|(k, v)| format!("{}: {}", k, display_value(v))).collect();
-            kvs.sort();
-            format!("{{{}}}", kvs.join(", "))
-        }
-    }
+    patlang_runtime::ir::ops::v_to_string(v)
 }
 
 fn ir_host_print(args: &[Value]) -> Result<Value, String> {
@@ -437,9 +418,9 @@ fn replace_lit(hay: &str, pat: &str, rep: &str, global: bool, ci: bool) -> Strin
 fn host_bin_num(args: &[Value], f: fn(f64, f64) -> f64) -> Result<Value, String> {
     let a = args.get(0).ok_or("expected 2 args")?;
     let b = args.get(1).ok_or("expected 2 args")?;
-    let an = match a { Value::Number(n) => *n, _ => return Err("expected number".into()) };
-    let bn = match b { Value::Number(n) => *n, _ => return Err("expected number".into()) };
-    Ok(Value::Number(f(an, bn)))
+    let an = a.as_number().map_err(|_| "expected number".to_string())?;
+    let bn = b.as_number().map_err(|_| "expected number".to_string())?;
+    Ok(Value::Float(f(an, bn)))
 }
 
 // Stage 0 string/list host shims live in the library so tests and other

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use num_bigint::BigInt;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Type {
@@ -12,11 +13,24 @@ pub enum Type {
     Object,
 }
 
+// Numeric tower (Stage 36 — interpreter only, no codegen-template changes):
+// Int is the fast default path for whole numbers; Float is standard IEEE
+// double contagion; BigInt/Rational/Complex are auto-promoted to on overflow,
+// inexact integer division, and (future, Stage 39) sqrt of a negative number,
+// respectively. See ir/numeric.rs for promotion/normalization rules and
+// ir/ops.rs for the arithmetic itself.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     Unit,
     Bool(bool),
-    Number(f64),
+    Int(i64),
+    Float(f64),
+    BigInt(BigInt),
+    // Always kept reduced (gcd'd) with a strictly positive denominator.
+    Rational(BigInt, BigInt),
+    // Real/imaginary parts are each Int|Float|BigInt|Rational (never Complex
+    // or a non-numeric kind); enforced by construction sites, not the type.
+    Complex(Box<Value>, Box<Value>),
     String(String),
     List(Vec<Value>),
     // Functions are closures with env; for Stage 0 keep them host-side only in the interpreter
@@ -28,10 +42,22 @@ pub enum Value {
     Closure { func_name: String, captured: Vec<(String, Value)> },
 }
 
+// Lossy BigInt/Rational -> f64 conversion via decimal string round-trip.
+// This avoids pulling in num-traits just for `ToPrimitive`; precision loss
+// for values outside f64's range/precision is expected and documented here
+// per the plan's "document, don't error" guidance.
+fn bigint_to_f64_lossy(b: &BigInt) -> f64 {
+    b.to_string().parse::<f64>().unwrap_or(if b.sign() == num_bigint::Sign::Minus { f64::NEG_INFINITY } else { f64::INFINITY })
+}
+
 impl Value {
     pub fn as_number(&self) -> Result<f64, String> {
         match self {
-            Value::Number(n) => Ok(*n),
+            Value::Int(n) => Ok(*n as f64),
+            Value::Float(n) => Ok(*n),
+            Value::BigInt(b) => Ok(bigint_to_f64_lossy(b)),
+            Value::Rational(n, d) => Ok(bigint_to_f64_lossy(n) / bigint_to_f64_lossy(d)),
+            Value::Complex(_, _) => Err("expected number, found complex".into()),
             Value::Unit => Ok(0.0),
             _ => Err("expected number".into()),
         }
@@ -41,7 +67,11 @@ impl Value {
         match self {
             Value::Bool(b) => Ok(*b),
             Value::Unit => Ok(false),
-            Value::Number(n) => Ok(*n != 0.0),
+            Value::Int(n) => Ok(*n != 0),
+            Value::Float(n) => Ok(*n != 0.0),
+            Value::BigInt(b) => Ok(!b.eq(&BigInt::from(0))),
+            Value::Rational(n, _) => Ok(!n.eq(&BigInt::from(0))),
+            Value::Complex(re, im) => Ok(re.as_bool().unwrap_or(true) || im.as_bool().unwrap_or(false)),
             Value::String(s) => Ok(!s.is_empty()),
             Value::List(xs) => Ok(!xs.is_empty()),
             Value::Object(map) => Ok(!map.is_empty()),

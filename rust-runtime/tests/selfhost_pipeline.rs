@@ -17,7 +17,7 @@ thread_local! {
 fn capture_print(args: &[Value]) -> Result<Value, String> {
     let s = match args.get(0) {
         Some(Value::String(s)) => s.clone(),
-        Some(Value::Number(n)) => if n.fract() == 0.0 { format!("{}", *n as i64) } else { n.to_string() },
+        Some(v @ (Value::Int(_)|Value::Float(_)|Value::BigInt(_)|Value::Rational(_,_))) => patlang_runtime::ir::ops::v_to_string(v),
         Some(Value::Bool(b)) => b.to_string(),
         _ => String::new(),
     };
@@ -149,13 +149,37 @@ fn selfhost_stage3_lowering_in_patlang() {
 
 #[test]
 fn selfhost_runtime_text_parity() {
-    // The runtime prelude expressed as PatLang source (lib/runtime_rs.patlang)
-    // must reproduce the host template byte-for-byte. If this fails after a
-    // template change, regenerate: dump_prelude.patlang + transcribe_prelude.py
+    // Stage 37A: the runtime prelude is split into named chunks on both
+    // sides (rust-runtime/src/ir/codegen.rs's ChunkId constants vs
+    // self_hosting/lib/runtime_rs.patlang's emit_chunk_<name>() functions).
+    // Assert each chunk reproduces its host counterpart byte-for-byte
+    // (better failure localization than the old all-or-nothing diff), then
+    // keep one whole-program assertion that concatenating every chunk (plus
+    // the dynamically-assembled call_dispatch glue) on both sides still
+    // agrees -- a regression guard that the split itself didn't change the
+    // concatenated output.
     let manifest = env!("CARGO_MANIFEST_DIR");
     let codegen_lib = std::fs::read_to_string(format!("{}/../self_hosting/lib/codegen.patlang", manifest)).expect("read codegen lib");
     let runtime_lib = std::fs::read_to_string(format!("{}/../self_hosting/lib/runtime_rs.patlang", manifest)).expect("read runtime lib");
-    let driver = "let a = emit_runtime_rs()\nlet b = codegen_prelude()\nif a == b then\n  print(\"PARITY-OK\")\nelse\n  print(\"PARITY-MISMATCH\")\nend\n";
+
+    let chunk_names = [
+        "core", "strings_ext", "collections_handles", "files", "io_misc",
+        "oo", "logic", "contracts", "networking", "codegen_bootstrap",
+        "numeric_tower", "math",
+    ];
+
+    let mut driver = String::new();
+    for name in chunk_names {
+        driver.push_str(&format!(
+            "let a_{name} = emit_chunk_{name}()\nlet b_{name} = codegen_prelude_chunk(\"{name}\")\nif a_{name} == b_{name} then\n  print(\"PARITY-OK-{name}\")\nelse\n  print(\"PARITY-MISMATCH-{name}\")\nend\n",
+            name = name
+        ));
+    }
+    // Whole-program regression guard: all chunks concatenated (+ dispatch glue).
+    driver.push_str(
+        "let all_a = emit_runtime_rs()\nlet all_b = codegen_prelude()\nif all_a == all_b then\n  print(\"PARITY-OK-all\")\nelse\n  print(\"PARITY-MISMATCH-all\")\nend\n"
+    );
+
     let full_src = format!("{}\n{}\n{}", codegen_lib, runtime_lib, driver);
 
     let mut parser = Stage0Parser::new(&full_src).expect("lexer init");
@@ -168,8 +192,16 @@ fn selfhost_runtime_text_parity() {
     PRINTED.with(|p| p.borrow_mut().clear());
     interp.run(&program).expect("parity check should run");
     let lines = PRINTED.with(|p| p.borrow().clone());
-    assert!(lines.iter().any(|l| l == "PARITY-OK"),
-        "PatLang runtime text differs from host template — regenerate runtime_rs.patlang: {:?}", lines);
+
+    let mut failed: Vec<&str> = Vec::new();
+    for name in chunk_names.iter().chain(std::iter::once(&"all")) {
+        let ok = format!("PARITY-OK-{}", name);
+        if !lines.iter().any(|l| l == &ok) {
+            failed.push(name);
+        }
+    }
+    assert!(failed.is_empty(),
+        "PatLang runtime chunk(s) differ from host template chunk(s) {:?} — regenerate runtime_rs.patlang: {:?}", failed, lines);
 }
 
 #[test]

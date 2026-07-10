@@ -6,9 +6,9 @@ fn codegen_build_and_run_matches_interpreter_output() {
     let mut f = Function { name: "main".into(), ..Default::default() };
     f.body.push(Instr::Const(Value::String("hi".into())));
     f.body.push(Instr::StoreLocal("s".into()));
-    f.body.push(Instr::Const(Value::Number(1.0)));
-    f.body.push(Instr::Const(Value::Number(2.0)));
-    f.body.push(Instr::Const(Value::Number(3.0)));
+    f.body.push(Instr::Const(Value::Int(1)));
+    f.body.push(Instr::Const(Value::Int(2)));
+    f.body.push(Instr::Const(Value::Int(3)));
     f.body.push(Instr::BuildList(3));
     f.body.push(Instr::StoreLocal("a".into()));
     f.body.push(Instr::LoadLocal("s".into()));
@@ -26,16 +26,15 @@ fn codegen_build_and_run_matches_interpreter_output() {
     interp.host.insert("len", |args| {
         let v = args.get(0).cloned().unwrap_or(Value::Unit);
         let n = match v {
-            Value::String(ref s) => s.chars().count() as f64,
-            Value::List(ref xs) => xs.len() as f64,
-            Value::Object(ref m) => m.len() as f64,
-            Value::Unit => 0.0,
-            _ => 0.0,
+            Value::String(ref s) => s.chars().count() as i64,
+            Value::List(ref xs) => xs.len() as i64,
+            Value::Object(ref m) => m.len() as i64,
+            _ => 0,
         };
-        Ok(Value::Number(n))
+        Ok(Value::Int(n))
     });
     let v = interp.run(&p).expect("run ok");
-    let expected = match v { Value::Number(n) => n, _ => panic!("unexpected value") };
+    let expected = v.as_number().expect("unexpected value");
 
     // Emit Rust
     let cg = RustCodegen::new();

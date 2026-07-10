@@ -7,13 +7,13 @@ fn ir_interpreter_add_and_branch() {
     //   if x > 5 { return x; } else { return 0; }
     // }
     let mut f = Function { name: "main".into(), ..Default::default() };
-    f.body.push(Instr::Const(Value::Number(3.0)));
-    f.body.push(Instr::Const(Value::Number(4.0)));
+    f.body.push(Instr::Const(Value::Int(3)));
+    f.body.push(Instr::Const(Value::Int(4)));
     f.body.push(Instr::BinOp(BinOpKind::Add));
     f.body.push(Instr::StoreLocal("x".into()));
     // load x, const 5, gt
     f.body.push(Instr::LoadLocal("x".into()));
-    f.body.push(Instr::Const(Value::Number(5.0)));
+    f.body.push(Instr::Const(Value::Int(5)));
     f.body.push(Instr::BinOp(BinOpKind::Gt));
     // if false jump to else
     // then branch: return x
@@ -22,7 +22,7 @@ fn ir_interpreter_add_and_branch() {
     f.body.push(Instr::LoadLocal("x".into()));
     f.body.push(Instr::Return);
     // else: return 0
-    f.body.push(Instr::Const(Value::Number(0.0)));
+    f.body.push(Instr::Const(Value::Int(0)));
     f.body.push(Instr::Return);
 
     let mut program = Program::default();
@@ -31,15 +31,15 @@ fn ir_interpreter_add_and_branch() {
 
     let interp = Interpreter::new();
     let v = interp.run(&program).expect("run ok");
-    assert_eq!(v, Value::Number(7.0));
+    assert_eq!(v, Value::Int(7));
 }
 
 #[test]
 fn ir_interpreter_host_call() {
     // return print_num(2+3)
     let mut f = Function { name: "main".into(), ..Default::default() };
-    f.body.push(Instr::Const(Value::Number(2.0)));
-    f.body.push(Instr::Const(Value::Number(3.0)));
+    f.body.push(Instr::Const(Value::Int(2)));
+    f.body.push(Instr::Const(Value::Int(3)));
     f.body.push(Instr::BinOp(BinOpKind::Add));
     f.body.push(Instr::CallHost("double".into(), 1));
     f.body.push(Instr::Return);
@@ -51,11 +51,11 @@ fn ir_interpreter_host_call() {
     let mut interp = Interpreter::new();
     interp.host.insert("double", |args: &[Value]| {
         let x = args[0].as_number()?;
-        Ok(Value::Number(x * 2.0))
+        Ok(Value::Int((x * 2.0) as i64))
     });
 
     let v = interp.run(&program).expect("run ok");
-    assert_eq!(v, Value::Number(10.0));
+    assert_eq!(v, Value::Int(10));
 }
 
 #[test]
@@ -67,8 +67,8 @@ fn ir_interpreter_truthiness_and_or() {
     f.body.push(Instr::Const(Value::Bool(false)));
     f.body.push(Instr::BinOp(BinOpKind::And));
     // 1 and -1 -> true
-    f.body.push(Instr::Const(Value::Number(1.0)));
-    f.body.push(Instr::Const(Value::Number(-1.0)));
+    f.body.push(Instr::Const(Value::Int(1)));
+    f.body.push(Instr::Const(Value::Int(-1)));
     f.body.push(Instr::BinOp(BinOpKind::And));
     // (false) or (true) -> true
     f.body.push(Instr::BinOp(BinOpKind::Or));

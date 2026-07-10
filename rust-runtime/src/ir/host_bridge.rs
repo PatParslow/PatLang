@@ -42,21 +42,20 @@ impl Host {
 			"subtract" => host_bin_num(args, |a,b| a-b),
 			"max" => host_bin_num(args, |a,b| a.max(b)),
 			"min" => host_bin_num(args, |a,b| a.min(b)),
-			"calculate" => Ok(Value::Number(0.0)),
-			"calculate_result" => Ok(Value::Number(0.0)),
-			"get_value" => Ok(Value::Number(0.0)),
+			"calculate" => Ok(Value::Int(0)),
+			"calculate_result" => Ok(Value::Int(0)),
+			"get_value" => Ok(Value::Int(0)),
 			"process" => Ok(Value::Bool(true)),
 			"validate" => Ok(Value::Bool(true)),
 			"len" => {
 				let v = args.get(0).cloned().unwrap_or(Value::Unit);
 				let n = match v {
-					Value::String(s) => s.chars().count() as f64,
-					Value::List(xs) => xs.len() as f64,
-					Value::Object(m) => m.len() as f64,
-					Value::Unit => 0.0,
-					_ => 0.0,
+					Value::String(s) => s.chars().count() as i64,
+					Value::List(xs) => xs.len() as i64,
+					Value::Object(m) => m.len() as i64,
+					_ => 0,
 				};
-				Ok(Value::Number(n))
+				Ok(Value::Int(n))
 			}
 			"get" => {
 				if args.len() != 2 { return Err("expected 2 args".into()); }
@@ -81,8 +80,8 @@ impl Host {
 						Ok(Value::Unit)
 					}
 					"infer_is_adult" => {
-						if let Some(Value::Number(age)) = obj_get(&recv, "age") {
-							if age >= 18.0 { obj_set(&recv, "is_adult", Value::Bool(true)); return Ok(Value::Bool(true)); }
+						if let Some(v @ (Value::Int(_) | Value::Float(_))) = obj_get(&recv, "age") {
+							if v.as_number().unwrap_or(0.0) >= 18.0 { obj_set(&recv, "is_adult", Value::Bool(true)); return Ok(Value::Bool(true)); }
 						} else if let Some(Value::String(s)) = obj_get(&recv, "age") {
 							if s.parse::<f64>().unwrap_or(0.0) >= 18.0 { obj_set(&recv, "is_adult", Value::Bool(true)); return Ok(Value::Bool(true)); }
 						}
@@ -110,14 +109,18 @@ fn host_bin_num(args: &[Value], f: fn(f64,f64)->f64) -> Result<Value, String> {
 	let a = args.get(0).ok_or("expected 2 args")?;
 	let b = args.get(1).ok_or("expected 2 args")?;
 	let an = a.as_number()?; let bn = b.as_number()?;
-	Ok(Value::Number(f(an,bn)))
+	Ok(Value::Float(f(an,bn)))
 }
 
 fn display_value(v: &Value) -> String {
 	match v {
 		Value::Unit => String::new(),
 		Value::Bool(b) => b.to_string(),
-		Value::Number(n) => if n.fract()==0.0 { format!("{}", *n as i64) } else { n.to_string() },
+		Value::Int(n) => n.to_string(),
+		Value::Float(n) => n.to_string(),
+		Value::BigInt(b) => b.to_string(),
+		Value::Rational(n, d) => format!("{}/{}", n, d),
+		Value::Complex(re, im) => format!("{}+{}i", display_value(re), display_value(im)),
 		Value::String(s) => s.clone(),
 		Value::List(xs) => {
 			let parts: Vec<String> = xs.iter().map(|x| display_value(x)).collect();

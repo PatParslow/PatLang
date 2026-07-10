@@ -158,7 +158,7 @@ impl Lowerer {
 
     fn expr_is_safe(&self, e: &Expr) -> bool {
         match e {
-            Expr::Number(_) | Expr::String(_) => true,
+            Expr::Number(_) | Expr::Float(_) | Expr::String(_) => true,
             Expr::Identifier(name) => name == "true" || name == "false" || self.known_locals.contains(name),
             Expr::List(items) => items.iter().all(|it| self.expr_is_safe(it)),
             // Member reads lower to len/get host calls; safe when the object expr is safe
@@ -189,17 +189,22 @@ impl Lowerer {
         matches!(name,
             "print"|"add"|"multiply"|"subtract"|"max"|"min"|"calculate"|"calculate_result"|
             "get_value"|"process"|"validate"|"len"|"get"|"send"|"emit"|"sed"|
-            "list_get"|"list_len"|"list_push"|"list_set"|"char_code"|"substr"|"chr"|"to_num"|"read_file"|"write_file"|"file_exists"|"hash_string"|"argv"|"compile_shape"|"compile_ir"|"run_ir"|"codegen_prelude"|"rustc_build"|
+            "list_get"|"list_len"|"list_push"|"list_set"|"char_code"|"substr"|"chr"|"to_num"|"read_file"|"write_file"|"file_exists"|"hash_string"|"argv"|"compile_shape"|"compile_ir"|"run_ir"|"codegen_prelude"|"codegen_prelude_chunk"|"rustc_build"|
             "vec_new"|"vec_push"|"vec_set"|"vec_get"|"vec_len"|"vec_to_list"|"sb_new"|"sb_push"|"sb_str"|
             "str_intern"|"sc_len"|"sc_code"|"sc_char"|"now_ms"|"read_line"|"byte_length"|"read_file_b64"|"exec_capture"|
             "fact"|"query"|"goal"|"new"|"set_var"|"apply"|
-            "tcp_listen"|"tcp_connect"|"tcp_accept"|"tcp_accept_timeout"|"sleep_ms"|"tcp_read"|"tcp_write"|"tcp_close"
+            "tcp_listen"|"tcp_connect"|"tcp_accept"|"tcp_accept_timeout"|"sleep_ms"|"tcp_read"|"tcp_write"|"tcp_close"|
+            "sqrt"|"pow"|"sin"|"cos"|"tan"|"asin"|"acos"|"atan"|"atan2"|"log"|"exp"|
+            "floor"|"ceil"|"round"|"trunc"|"abs"|"numeric_kind"
         )
     }
 
     fn lower_expr(&mut self, e: &Expr, f: &mut Function) {
         match e {
-            Expr::Number(n) => f.body.push(Instr::Const(Value::Number(*n))),
+            // Whole-number literal source syntax (no decimal point) stays on
+            // the fast Int path by default (Stage 36 numeric tower).
+            Expr::Number(n) => f.body.push(Instr::Const(Value::Int(*n as i64))),
+            Expr::Float(n) => f.body.push(Instr::Const(Value::Float(*n))),
             Expr::String(s) => f.body.push(Instr::Const(Value::String(s.clone()))),
             Expr::Identifier(name) => {
                 // Treat 'true' and 'false' as boolean literals in Stage 0
@@ -457,7 +462,7 @@ fn collect_ident_expr(e: &Expr, out: &mut Vec<String>, seen: &mut HashSet<String
                 if seen.insert(n.clone()) { out.push(n); }
             }
         }
-        Expr::Number(_) | Expr::String(_) => {}
+        Expr::Number(_) | Expr::Float(_) | Expr::String(_) => {}
     }
 }
 
@@ -465,7 +470,8 @@ fn collect_ident_expr(e: &Expr, out: &mut Vec<String>, seen: &mut HashSet<String
 /// messages ("require b != 0" should report "b != 0", not a debug dump).
 pub fn expr_to_text(e: &Expr) -> String {
     match e {
-        Expr::Number(n) => if n.fract() == 0.0 { format!("{}", *n as i64) } else { n.to_string() },
+        Expr::Number(n) => format!("{}", *n as i64),
+        Expr::Float(n) => n.to_string(),
         Expr::String(s) => format!("\"{}\"", s),
         Expr::Identifier(name) => name.clone(),
         Expr::List(items) => format!("[{}]", items.iter().map(expr_to_text).collect::<Vec<_>>().join(", ")),
