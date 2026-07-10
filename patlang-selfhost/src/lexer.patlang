@@ -1,0 +1,255 @@
+# Lexer module for Patlang (self-hosted)
+# Implements contract-driven, goal-oriented, logic-based tokenization
+
+# --- Token Types and Structures ---
+
+constrain TokenType :: String where
+    TokenType in [
+        "NUMBER", "IDENTIFIER", "STRING", "KEYWORD", "PLUS", "MINUS", "MULTIPLY", "DIVIDE", "MODULO",
+        "LPAREN", "RPAREN", "LBRACE", "RBRACE", "LBRACKET", "RBRACKET",
+        "COMMA", "COLON", "SEMICOLON", "DOT", "ASSIGN", "EQ", "NEQ", "LT", "GT", "LEQ", "GEQ",
+        "IF", "THEN", "ELSE", "END", "WHILE", "DO",
+        "MAKE", "A", "FUNCTION", "CALLED", "IS", "TAKES", "RETURNS",
+        "REASONING", "MODE", "ON", "OFF", "FACT", "RULE", "GOAL", "PURSUE",
+        "QUERY", "WHERE", "AND", "OR", "NOT",
+        "CONSTRAIN", "ASSERT", "PRECONDITION", "POSTCONDITION",
+        "TRUE", "FALSE",
+        "EOF", "UNKNOWN", "AMBIGUOUS", "UNTERMINATED_STRING"
+    ]
+
+constrain Token :: {
+    type: TokenType,
+    value: String,
+    position: {
+        line: Number,
+        column: Number,
+        absolute: Number
+    },
+    context: {
+        previous_tokens: Array[Token],
+        following_text: String,
+        parsing_mode: String
+    },
+    confidence: Number
+}
+
+constrain TokenStream :: {
+    tokens: Array[Token]
+}
+
+constrain LexerState :: {
+    input: String,
+    pos: Number,
+    line: Number,
+    column: Number,
+    previous_tokens: Array[Token]
+}
+
+constrain LexerError :: {
+    message: String,
+    position: {
+        line: Number,
+        column: Number,
+        absolute: Number
+    }
+}
+
+# --- Reserved Words ---
+
+RESERVED_WORDS = [
+    "if", "then", "else", "end", "while", "do",
+    "make", "a", "function", "called", "is", "takes", "returns",
+    "reasoning", "mode", "on", "off", "fact", "rule", "goal", "pursue",
+    "query", "where", "and", "or", "not",
+    "constrain", "assert", "precondition", "postcondition",
+    "true", "false"
+]
+
+# --- Token Patterns ---
+
+fact token_pattern("NUMBER", /^\d+(\.\d+)?$/)
+fact token_pattern("IDENTIFIER", /^[a-zA-Z_][a-zA-Z0-9_]*$/)
+fact token_pattern("STRING", /^"([^"\\]|\\.)*"$/)
+fact token_pattern("STRING", /^'([^'\\]|\\.)*'$/)
+fact token_pattern("KEYWORD", RESERVED_WORDS)
+
+# --- Main Tokenization Goal ---
+
+goal tokenize(source: String): TokenStream | LexerError {
+    precondition: source != null,
+    postcondition: result is TokenStream xor result is LexerError,
+    strategy: goal_oriented_tokenization
+}
+
+rule tokenize(source) :- 
+    initialize_lexer_state(source, state0),
+    extract_tokens_from_text(state0, token_stream, error),
+    (error == null -> result = token_stream ; result = error).
+
+# --- Lexer Initialization ---
+
+rule initialize_lexer_state(source, state) :-
+    state.input = source,
+    state.pos = 0,
+    state.line = 1,
+    state.column = 1,
+    state.previous_tokens = [].
+
+# --- Token Extraction Engine ---
+
+goal extract_tokens_from_text(state: LexerState, token_stream: TokenStream, error: LexerError | null) {
+    precondition: state.input != null,
+    postcondition: token_stream != null xor error != null,
+    strategy: sequential_token_extraction
+}
+
+rule extract_tokens_from_text(state, token_stream, error) :-
+    tokens = [],
+    curr_state = state,
+    loop {
+        (next_token(curr_state, token, next_state),
+         token.type == "EOF" -> tokens.append(token); break,
+         token.type == "UNKNOWN" -> tokens.append(token); curr_state = next_state,
+         token.type == "UNTERMINATED_STRING" -> tokens.append(token); curr_state = next_state,
+         token.type == "AMBIGUOUS" -> tokens.append(token); curr_state = next_state,
+         token.type != null -> tokens.append(token); curr_state = next_state,
+         token.type == null -> error = make_lexer_error("Unknown tokenization error", curr_state); break
+        )
+    },
+    token_stream.tokens = tokens,
+    error = null.
+
+# --- Next Token Recognition ---
+
+goal next_token(state: LexerState): (Token | LexerError, LexerState) {
+    precondition: state.input != null and 0 <= state.pos <= len(state.input),
+    postcondition: (next is Token) xor (next is LexerError),
+    strategy: pattern_priority_matching
+}
+
+rule next_token(state, token, next_state) :-
+    skip_whitespace_and_comments(state, s1),
+    (s1.pos >= len(s1.input) -> 
+        token = make_token("EOF", "", s1), next_state = s1;
+        recognize_token(s1, token, s2), next_state = s2
+    ).
+
+# --- Whitespace and Comment Skipping ---
+
+rule skip_whitespace_and_comments(state, next_state) :-
+    pos = state.pos,
+    line = state.line,
+    column = state.column,
+    input = state.input,
+    while pos < len(input) and (input[pos] in [' ', '\t', '\r', '\n', '#']) {
+        if input[pos] == '\n' {
+            line += 1
+            column = 1
+        } else {
+            column += 1
+        }
+        pos += 1
+    },
+    next_state.input = input,
+    next_state.pos = pos,
+    next_state.line = line,
+    next_state.column = column,
+    next_state.previous_tokens = state.previous_tokens.
+
+# --- Token Recognition Logic ---
+
+rule recognize_token(state, token, next_state) :-
+    input = state.input,
+    pos = state.pos,
+    line = state.line,
+    column = state.column,
+    # Try number
+    match_regex(input, pos, /^\d+(\.\d+)?/, value, length) ->
+        token = make_token("NUMBER", value, state),
+        advance_state(state, length, next_state);
+    # Try identifier/keyword
+    match_regex(input, pos, /^[a-zA-Z_][a-zA-Z0-9_]*/, value, length) ->
+        (value in RESERVED_WORDS ->
+            token = make_token("KEYWORD", value, state);
+            token = make_token("IDENTIFIER", value, state)
+        ),
+        advance_state(state, length, next_state);
+    # Try string (double quotes)
+    input[pos] == '"' ->
+        match_string_literal(input, pos, '"', value, length, unterminated) ->
+            (unterminated ->
+                token = make_token("UNTERMINATED_STRING", value, state);
+                advance_state(state, length, next_state);
+             token = make_token("STRING", value, state);
+                advance_state(state, length, next_state)
+            );
+    # Try string (single quotes)
+    input[pos] == "'" ->
+        match_string_literal(input, pos, "'", value, length, unterminated) ->
+            (unterminated ->
+                token = make_token("UNTERMINATED_STRING", value, state);
+                advance_state(state, length, next_state);
+             token = make_token("STRING", value, state);
+                advance_state(state, length, next_state)
+            );
+    # Try operators and punctuation
+    match_operator_or_punct(input, pos, op_type, op_value, length) ->
+        token = make_token(op_type, op_value, state),
+        advance_state(state, length, next_state);
+    # Unknown character
+    input[pos] != null ->
+        token = make_token("UNKNOWN", input[pos], state),
+        advance_state(state, 1, next_state).
+
+# --- Helper: Match Regex at Position ---
+
+rule match_regex(input, pos, regex, value, length) :-
+    # Implementation: match regex at input[pos..] and return value/length if match, else fail
+    # (Stub for self-hosted pattern matching)
+    fail_if_no_match.
+
+# --- Helper: Match String Literal ---
+
+rule match_string_literal(input, pos, quote_char, value, length, unterminated) :-
+    # Implementation: scan for closing quote, handle escapes, set unterminated if not found
+    fail_if_no_match.
+
+# --- Helper: Match Operator or Punctuation ---
+
+rule match_operator_or_punct(input, pos, op_type, op_value, length) :-
+    # Implementation: match known operators/punctuation, return type/value/length
+    fail_if_no_match.
+
+# --- Helper: Advance State ---
+
+rule advance_state(state, length, next_state) :-
+    # Implementation: advance pos/column/line by length, update next_state accordingly
+    fail_if_no_match.
+
+# --- Helper: Make Token ---
+
+rule make_token(type, value, state) :-
+    token.type = type,
+    token.value = value,
+    token.position.line = state.line,
+    token.position.column = state.column,
+    token.position.absolute = state.pos,
+    token.context.previous_tokens = state.previous_tokens,
+    token.context.following_text = state.input[state.pos:],
+    token.context.parsing_mode = "default",
+    token.confidence = 1.0.
+
+# --- Helper: Make Lexer Error ---
+
+rule make_lexer_error(message, state) :-
+    error.message = message,
+    error.position.line = state.line,
+    error.position.column = state.column,
+    error.position.absolute = state.pos.
+
+# --- Contract Utility Predicates ---
+
+predicate tokens_cover_input(token_stream: TokenStream, source: String): Bool
+predicate non_overlapping_ordered_spans(token_stream: TokenStream): Bool
+
+# --- End of Lexer Module ---

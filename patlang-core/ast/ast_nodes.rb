@@ -1,814 +1,793 @@
-# Abstract Syntax Tree node classes for Patlang
+# frozen_string_literal: true
 
-# Base class for all AST nodes
-class ASTNode
-  def to_s
-    self.class.name
-  end
-end
+# AST Node definitions for PatLang
+# These nodes form the abstract syntax tree produced by the parser
 
-# Node representing a number literal
-class NumberNode < ASTNode
-  attr_reader :value
-
-  def initialize(value)
-    @value = value
-  end
-
-  def to_s
-    "NumberNode(#{@value})"
-  end
-end
-
-# Node representing a binary operation
-class BinaryOpNode < ASTNode
-  attr_reader :left, :operator, :right
-
-  def initialize(left, operator, right)
-    @left = left
-    @operator = operator
-    @right = right
-  end
-
-  def to_s
-    "BinaryOpNode(#{@left}, #{@operator}, #{@right})"
-  end
-end
-
-# Node representing a unary operation (e.g., -x, !x)
-class UnaryOpNode < ASTNode
-  attr_reader :operator, :operand
-
-  def initialize(operator, operand)
-    @operator = operator
-    @operand = operand
-  end
-
-  def to_s
-    "UnaryOpNode(#{@operator}, #{@operand})"
-  end
-end
-
-# Node representing a variable reference/lookup
-class VariableNode < ASTNode
-  attr_reader :name
-
-  def initialize(name)
-    @name = name
-  end
-
-  # Alias for compatibility with test expectations
-  def value
-    @name
-  end
-
-  def to_s
-    "VariableNode(#{@name})"
-  end
-end
-
-# Node representing a variable assignment
-class AssignmentNode < ASTNode
-  attr_reader :name, :expression
-
-  def initialize(name, expression)
-    @name = name
-    @expression = expression
-  end
-
-  def to_s
-    "AssignmentNode(#{@name}, #{@expression})"
-  end
-end
-
-# Node representing a property assignment (obj.prop = value)
-class PropertyAssignmentNode < ASTNode
-  attr_reader :object_name, :property_name, :expression
-
-  def initialize(object_name, property_name, expression)
-    @object_name = object_name
-    @property_name = property_name
-    @expression = expression
-  end
-
-  def to_s
-    "PropertyAssignmentNode(#{@object_name}.#{@property_name}, #{@expression})"
-  end
-end
-
-# Node representing a boolean literal (true/false)
-class BooleanNode < ASTNode
-  attr_reader :value
-
-  def initialize(value)
-    @value = value
-  end
-
-  def to_s
-    "BooleanNode(#{@value})"
-  end
-end
-
-# Node representing a comparison operation
-class ComparisonNode < ASTNode
-  attr_reader :left, :operator, :right
-
-  def initialize(left, operator, right)
-    @left = left
-    @operator = operator
-    @right = right
-  end
-
-  def to_s
-    "ComparisonNode(#{@left}, #{@operator}, #{@right})"
-  end
-end
-
-# Node representing an if/then/else conditional statement
-class IfNode < ASTNode
-  attr_reader :condition, :then_body, :else_body
-
-  def initialize(condition, then_body, else_body = nil)
-    @condition = condition
-    @then_body = then_body
-    @else_body = else_body
-  end
-
-  def to_s
-    if @else_body
-      "IfNode(#{@condition}, #{@then_body}, #{@else_body})"
-    else
-      "IfNode(#{@condition}, #{@then_body})"
+module Patlang
+  module AST
+    # Base node class
+    class Node
+      attr_reader :line, :column
+      
+      def initialize(line: 1, column: 1)
+        @line = line
+        @column = column
+      end
+      
+      def accept(visitor)
+        visitor.visit(self)
+      end
+      
+      def to_s
+        self.class.name.split('::').last
+      end
     end
-  end
-end
-
-# Node representing a while loop statement
-class WhileNode < ASTNode
-  attr_reader :condition, :body
-
-  def initialize(condition, body)
-    @condition = condition
-    @body = body
-  end
-
-  def to_s
-    "WhileNode(#{@condition}, #{@body})"
-  end
-end
-
-# Node representing a block of statements
-class BlockNode < ASTNode
-  attr_reader :statements
-
-  def initialize(statements = [])
-    @statements = statements
-  end
-
-  def to_s
-    "BlockNode([#{@statements.map(&:to_s).join(', ')}])"
-  end
-end
-
-# Node representing a string literal
-class StringNode < ASTNode
-  attr_reader :value
-
-  def initialize(value)
-    @value = value
-  end
-
-  def to_s
-    "StringNode(#{@value.inspect})"
-  end
-end
-
-# Node representing index access (e.g., string[index])
-class IndexAccessNode < ASTNode
-  attr_reader :object, :index
-
-  def initialize(object, index)
-    @object = object
-    @index = index
-  end
-
-  def to_s
-    "IndexAccessNode(#{@object}, #{@index})"
-  end
-end
-
-# Node representing method call (e.g., string.length)
-class MethodCallNode < ASTNode
-  attr_reader :object, :method_name, :arguments
-
-  def initialize(object, method_name, arguments = [])
-    @object = object
-    @method_name = method_name
-    @arguments = arguments
-  end
-
-  def to_s
-    "MethodCallNode(#{@object}, #{@method_name}, #{@arguments})"
-  end
-end
-# Node representing a function definition
-class FunctionDefinitionNode < ASTNode
-  attr_reader :name, :parameters, :body, :return_type
-
-  def initialize(name, parameters, body, return_type = nil)
-    @name = name
-    @parameters = parameters
-    @body = body
-    @return_type = return_type
-  end
-
-  def to_s
-    "FunctionDefinitionNode(#{@name}, #{@parameters}, #{@body})"
-  end
-end
-
-# Node representing a function call
-class FunctionCallNode < ASTNode
-  attr_reader :function_name, :arguments
-
-  def initialize(function_name, arguments = [])
-    @function_name = function_name
-    @arguments = arguments
-  end
-
-  def to_s
-    "FunctionCallNode(#{@function_name}, #{@arguments})"
-  end
-end
-
-# Node representing a function parameter
-class ParameterNode < ASTNode
-  attr_reader :name, :type, :default_value
-
-  def initialize(name, type = nil, default_value = nil)
-    @name = name
-    @type = type
-    @default_value = default_value
-  end
-
-  def to_s
-    if @default_value
-      "ParameterNode(#{@name}, #{@type}, #{@default_value})"
-    else
-      "ParameterNode(#{@name}, #{@type})"
+    
+    # Program - root node containing all statements
+    class ProgramNode < Node
+      attr_reader :statements
+      
+      def initialize(statements, line: 1, column: 1)
+        super(line: line, column: column)
+        @statements = statements
+      end
+      
+      def accept(visitor)
+        visitor.visit_program(self)
+      end
     end
-  end
-end
-
-# Node representing a return statement
-class ReturnNode < ASTNode
-  attr_reader :expression
-
-  def initialize(expression = nil)
-    @expression = expression
-  end
-
-  def to_s
-    if @expression
-      "ReturnNode(#{@expression})"
-    else
-      "ReturnNode()"
+    
+    # ============================================================
+    # Declaration Nodes
+    # ============================================================
+    
+    class DeclarationNode < Node; end
+    
+    # Function declaration
+    class FunctionDeclarationNode < DeclarationNode
+      attr_reader :name, :parameters, :return_type, :preconditions, :postconditions, :body
+      
+      def initialize(name, parameters:, return_type: nil, preconditions: [], postconditions: [], body:, line: 1, column: 1)
+        super(line: line, column: column)
+        @name = name
+        @parameters = parameters          # Array of ParameterNode
+        @return_type = return_type        # TypeAnnotationNode or nil
+        @preconditions = preconditions    # Array of ExpressionNode
+        @postconditions = postconditions  # Array of ExpressionNode
+        @body = body                      # BlockNode
+      end
+      
+      def accept(visitor)
+        visitor.visit_function_declaration(self)
+      end
     end
-  end
-end
-
-# Node representing an expression that should automatically output to console
-class AutoOutputNode < ASTNode
-  attr_reader :expression
-
-  def initialize(expression)
-    @expression = expression
-  end
-
-  def to_s
-    "AutoOutputNode(#{@expression})"
-  end
-end
-
-# Node representing a print statement (e.g., print "text")
-class PrintNode < ASTNode
-  attr_reader :expression
-
-  def initialize(expression)
-    @expression = expression
-  end
-
-  def to_s
-    "PrintNode(#{@expression})"
-  end
-end
-
-# Node representing an expression statement (expression used as a statement)
-class ExpressionStatementNode < ASTNode
-  attr_reader :expression
-
-  def initialize(expression)
-    @expression = expression
-  end
-
-  def to_s
-    "ExpressionStatementNode(#{@expression})"
-  end
-end
-
-# Node representing a literal value (used as a fallback/mock)
-class LiteralNode < ASTNode
-  attr_reader :value
-
-  def initialize(value)
-    @value = value
-  end
-
-  def to_s
-    "LiteralNode(#{@value})"
-  end
-end
-
-# Node representing a conditional node (used as a fallback/mock)
-class ConditionalNode < ASTNode
-  attr_reader :condition, :then_body, :else_body
-
-  def initialize(condition, then_body, else_body = nil)
-    @condition = condition
-    @then_body = then_body
-    @else_body = else_body
-  end
-
-  def to_s
-    "ConditionalNode(#{@condition}, #{@then_body}, #{@else_body})"
-  end
-end
-
-# Node representing a type constraint declaration for unified reasoning
-class TypeConstraintNode < ASTNode
-  attr_reader :variable, :constraint_type, :constraint_data, :conditions
-
-  def initialize(variable, constraint_type, constraint_data = nil, conditions = nil)
-    @variable = variable
-    @constraint_type = constraint_type
-    @constraint_data = constraint_data
-    @conditions = conditions
-  end
-
-  def satisfies?(value)
-    # Method stub - evaluation logic to be implemented later
-    raise NotImplementedError, "satisfies? method not yet implemented"
-  end
-
-  def validate
-    # Method stub - validation logic to be implemented later
-    raise NotImplementedError, "validate method not yet implemented"
-  end
-
-  def error_message
-    # Method stub - error message generation to be implemented later
-    raise NotImplementedError, "error_message method not yet implemented"
-  end
-
-  def to_s
-    if @conditions
-      "TypeConstraintNode(#{@variable} :: #{@constraint_type} where #{@conditions})"
-    else
-      "TypeConstraintNode(#{@variable} :: #{@constraint_type})"
+    
+    # Class/template declaration
+    class TemplateDeclarationNode < DeclarationNode
+      attr_reader :name, :parent, :fields, :invariants, :methods
+      
+      def initialize(name, parent: nil, fields: [], invariants: [], methods: [], line: 1, column: 1)
+        super(line: line, column: column)
+        @name = name
+        @parent = parent                  # IdentifierNode or nil
+        @fields = fields                  # Array of FieldNode
+        @invariants = invariants          # Array of ExpressionNode
+        @methods = methods                # Array of FunctionDeclarationNode
+      end
+      
+      def accept(visitor)
+        visitor.visit_template_declaration(self)
+      end
     end
-  end
-end
-
-# Node representing a goal declaration for goal-oriented programming
-class GoalNode < ASTNode
-  attr_reader :description, :preconditions, :postconditions, :strategies
-
-  def initialize(description, preconditions = [], postconditions = [], strategies = [])
-    @description = description
-    @preconditions = preconditions
-    @postconditions = postconditions
-    @strategies = strategies
-  end
-
-  def can_pursue?
-    # Method stub - pursuit validation logic to be implemented later
-    raise NotImplementedError, "can_pursue? method not yet implemented"
-  end
-
-  def success_criteria
-    # Method stub - success criteria evaluation to be implemented later
-    raise NotImplementedError, "success_criteria method not yet implemented"
-  end
-
-  def to_s
-    "GoalNode(#{@description})"
-  end
-end
-
-# Node representing a fact assertion (e.g., assert fact(likes(alice, bob)))
-class AssertNode < ASTNode
-  attr_reader :fact
-
-  def initialize(fact)
-    @fact = fact
-  end
-
-  def to_s
-    "AssertNode(#{@fact})"
-  end
-end
-
-# Node representing a logic programming rule
-class LogicRuleNode < ASTNode
-  attr_reader :head, :body, :rule_type
-
-  def initialize(head, body, rule_type = :standard)
-    @head = head
-    @body = body
-    @rule_type = rule_type
-  end
-
-  def matches?(query)
-    # Method stub - pattern matching logic to be implemented later
-    raise NotImplementedError, "matches? method not yet implemented"
-  end
-
-  def apply(bindings = {})
-    # Method stub - rule application logic to be implemented later
-    raise NotImplementedError, "apply method not yet implemented"
-  end
-
-  def to_s
-    "LogicRuleNode(#{@head} :- #{@body}, type: #{@rule_type})"
-  end
-end
-
-# Node representing a logic programming query
-class QueryNode < ASTNode
-  attr_reader :goal_term, :variables, :query_type
-
-  def initialize(goal_term, variables = [], query_type = :standard)
-    @goal_term = goal_term
-    @variables = variables
-    @query_type = query_type
-  end
-
-  def bind_variables(bindings = {})
-    # Method stub - variable binding logic to be implemented later
-    raise NotImplementedError, "bind_variables method not yet implemented"
-  end
-
-  def result_format
-    # Method stub - result formatting logic to be implemented later
-    raise NotImplementedError, "result_format method not yet implemented"
-  end
-
-  def to_s
-    "QueryNode(#{@goal_term}, vars: #{@variables}, type: #{@query_type})"
-  end
-end
-
-# Node representing goal pursuit (e.g., pursue find_answer)
-class PursueNode < ASTNode
-  attr_reader :goal_name, :arguments
-
-  def initialize(goal_name, arguments = [])
-    @goal_name = goal_name
-    @arguments = arguments
-  end
-
-  def to_s
-    "PursueNode(#{@goal_name})"
-  end
-end
-
-# Node representing reasoning mode control (e.g., reasoning mode on)
-class ReasoningModeNode < ASTNode
-  attr_reader :enabled
-
-  def initialize(enabled)
-    @enabled = enabled
-  end
-
-  def to_s
-    "ReasoningModeNode(#{@enabled ? 'on' : 'off'})"
-  end
-end
-
-# Node representing a parser error with recovery
-class ErrorNode < ASTNode
-  attr_reader :message, :recovered_value
+    
+    # Goal declaration
+    class GoalDeclarationNode < DeclarationNode
+      attr_reader :name, :requirements, :achievement_conditions, :body
+      
+      def initialize(name, requirements: [], achievement_conditions: [], body: nil, line: 1, column: 1)
+        super(line: line, column: column)
+        @name = name
+        @requirements = requirements              # Array of RequirementNode
+        @achievement_conditions = achievement_conditions  # Array of ExpressionNode
+        @body = body                              # BlockNode or nil
+      end
+      
+      def accept(visitor)
+        visitor.visit_goal_declaration(self)
+      end
+    end
+    
+    # List/Variable declaration with initializer
+    class VariableDeclarationNode < DeclarationNode
+      attr_reader :name, :type, :initializer
+      
+      def initialize(name, type: nil, initializer: nil, line: 1, column: 1)
+        super(line: line, column: column)
+        @name = name
+        @type = type
+        @initializer = initializer
+      end
+      
+      def accept(visitor)
+        visitor.visit_variable_declaration(self)
+      end
+    end
+    
+    # ============================================================
+    # Supporting Declaration Nodes
+    # ============================================================
+    
+    class ParameterNode < Node
+      attr_reader :name, :type, :default_value
+      
+      def initialize(name, type: nil, default_value: nil, line: 1, column: 1)
+        super(line: line, column: column)
+        @name = name
+        @type = type
+        @default_value = default_value
+      end
+      
+      def accept(visitor)
+        visitor.visit_parameter(self)
+      end
+    end
+    
+    class FieldNode < Node
+      attr_reader :name, :type, :default_value
+      
+      def initialize(name, type: nil, default_value: nil, line: 1, column: 1)
+        super(line: line, column: column)
+        @name = name
+        @type = type
+        @default_value = default_value
+      end
+      
+      def accept(visitor)
+        visitor.visit_field(self)
+      end
+    end
+    
+    class RequirementNode < Node
+      attr_reader :name, :type, :default_value
+      
+      def initialize(name, type: nil, default_value: nil, line: 1, column: 1)
+        super(line: line, column: column)
+        @name = name
+        @type = type
+        @default_value = default_value
+      end
+      
+      def accept(visitor)
+        visitor.visit_requirement(self)
+      end
+    end
+    
+    class TypeAnnotationNode < Node
+      attr_reader :type_name, :type_args
+      
+      def initialize(type_name, type_args: [], line: 1, column: 1)
+        super(line: line, column: column)
+        @type_name = type_name
+        @type_args = type_args
+      end
+      
+      def accept(visitor)
+        visitor.visit_type_annotation(self)
+      end
+    end
+    
+    # ============================================================
+    # Statement Nodes
+    # ============================================================
+    
+    class StatementNode < Node; end
+    
+    # Block of statements
+    class BlockNode < StatementNode
+      attr_reader :statements
+      
+      def initialize(statements, line: 1, column: 1)
+        super(line: line, column: column)
+        @statements = statements
+      end
+      
+      def accept(visitor)
+        visitor.visit_block(self)
+      end
+    end
+    
+    # If statement
+    class IfStatementNode < StatementNode
+      attr_reader :condition, :then_branch, :elsif_branches, :else_branch
+      
+      def initialize(condition, then_branch, elsif_branches: [], else_branch: nil, line: 1, column: 1)
+        super(line: line, column: column)
+        @condition = condition
+        @then_branch = then_branch
+        @elsif_branches = elsif_branches  # Array of [condition, branch]
+        @else_branch = else_branch
+      end
+      
+      def accept(visitor)
+        visitor.visit_if_statement(self)
+      end
+    end
+    
+    # While loop
+    class WhileStatementNode < StatementNode
+      attr_reader :condition, :body
+      
+      def initialize(condition, body, line: 1, column: 1)
+        super(line: line, column: column)
+        @condition = condition
+        @body = body
+      end
+      
+      def accept(visitor)
+        visitor.visit_while_statement(self)
+      end
+    end
+    
+    # For loop
+    class ForStatementNode < StatementNode
+      attr_reader :variable, :iterable, :body, :is_range
+      attr_reader :range_start, :range_end
+      
+      def initialize(variable, iterable, body, is_range: false, range_start: nil, range_end: nil, line: 1, column: 1)
+        super(line: line, column: column)
+        @variable = variable
+        @iterable = iterable
+        @body = body
+        @is_range = is_range
+        @range_start = range_start
+        @range_end = range_end
+      end
+      
+      def accept(visitor)
+        visitor.visit_for_statement(self)
+      end
+    end
+    
+    # Assignment (IS - binding)
+    class AssignmentNode < StatementNode
+      attr_reader :name, :value
+      
+      def initialize(name, value, line: 1, column: 1)
+        super(line: line, column: column)
+        @name = name
+        @value = value
+      end
+      
+      def accept(visitor)
+        visitor.visit_assignment(self)
+      end
+    end
+    
+    # Mutation (BECOMES)
+    class MutationNode < StatementNode
+      attr_reader :name, :value
+      
+      def initialize(name, value, line: 1, column: 1)
+        super(line: line, column: column)
+        @name = name
+        @value = value
+      end
+      
+      def accept(visitor)
+        visitor.visit_mutation(self)
+      end
+    end
+    
+    # Event handler
+    class EventHandlerNode < StatementNode
+      attr_reader :event_name, :event_action, :body
+      
+      def initialize(event_name, event_action: nil, body:, line: 1, column: 1)
+        super(line: line, column: column)
+        @event_name = event_name
+        @event_action = event_action  # :called, :completed, :error, :changed, :activated
+        @body = body
+      end
+      
+      def accept(visitor)
+        visitor.visit_event_handler(self)
+      end
+    end
+    
+    # Activate goal
+    class ActivateStatementNode < StatementNode
+      attr_reader :goal_name, :arguments
+      
+      def initialize(goal_name, arguments: nil, line: 1, column: 1)
+        super(line: line, column: column)
+        @goal_name = goal_name
+        @arguments = arguments
+      end
+      
+      def accept(visitor)
+        visitor.visit_activate_statement(self)
+      end
+    end
+    
+    # Query statement
+    class QueryStatementNode < StatementNode
+      attr_reader :name, :body
+      
+      def initialize(name, body, line: 1, column: 1)
+        super(line: line, column: column)
+        @name = name
+        @body = body
+      end
+      
+      def accept(visitor)
+        visitor.visit_query_statement(self)
+      end
+      end
   
-  def initialize(message, recovered_value = nil)
-    @message = message
-    @recovered_value = recovered_value
-  end
+      # Select statement
+      class SelectStatementNode < StatementNode
+      attr_reader :select
+    
+      def initialize(select, line: 1, column: 1)
+        super(line: line, column: column)
+        @select = select
+      end
+    
+      def accept(visitor)
+        visitor.visit_select_statement(self)
+      end
+      end
   
-  def to_s
-    "ErrorNode(#{@message.inspect})"
-  end
-end
-
-# === Type Constraint AST Nodes ===
-
-# Node representing a type annotation (e.g., x :: Number)
-class TypeAnnotationNode < ASTNode
-  attr_reader :variable_name, :type_constraint
-
-  def initialize(variable_name, type_constraint)
-    @variable_name = variable_name
-    @type_constraint = type_constraint
-  end
-
-  def to_s
-    "TypeAnnotationNode(#{@variable_name} :: #{@type_constraint})"
-  end
-end
-
-# Node representing a generic type constraint (e.g., Array[Number])
-class GenericTypeConstraint < ASTNode
-  attr_reader :base_type, :type_parameters
-
-  def initialize(base_type, type_parameters)
-    @base_type = base_type
-    @type_parameters = type_parameters
-  end
-
-  def to_s
-    params = @type_parameters.map(&:to_s).join(', ')
-    "GenericTypeConstraint(#{@base_type}[#{params}])"
-  end
-end
-
-# Node representing a range constraint (e.g., Number(0..100))
-class RangeConstraint < ASTNode
-  attr_reader :base_type, :min_value, :max_value, :exclusive_max
-
-  def initialize(base_type, min_value, max_value, exclusive_max = false)
-    @base_type = base_type
-    @min_value = min_value
-    @max_value = max_value
-    @exclusive_max = exclusive_max
-  end
-
-  def exclusive_max?
-    @exclusive_max
-  end
-
-  def to_s
-    range_op = @exclusive_max ? '...' : '..'
-    "RangeConstraint(#{@base_type}(#{@min_value}#{range_op}#{@max_value}))"
-  end
-end
-
-# Node representing a pattern constraint (e.g., String(/regex/))
-class PatternConstraint < ASTNode
-  attr_reader :base_type, :pattern
-
-  def initialize(base_type, pattern)
-    @base_type = base_type
-    @pattern = pattern
-  end
-
-  def to_s
-    "PatternConstraint(#{@base_type}(#{@pattern.inspect}))"
-  end
-end
-
-# Node representing a structural constraint (e.g., {name: String, age: Number})
-class StructuralConstraint < ASTNode
-  attr_reader :field_constraints
-
-  def initialize(field_constraints)
-    @field_constraints = field_constraints
-  end
-
-  def to_s
-    fields = @field_constraints.map { |name, constraint| "#{name}: #{constraint}" }.join(', ')
-    "StructuralConstraint({#{fields}})"
-  end
-end
-
-# Node representing a union type constraint (e.g., Number | String)
-class UnionTypeConstraint < ASTNode
-  attr_reader :allowed_types
-
-  def initialize(allowed_types)
-    @allowed_types = allowed_types
-  end
-
-  def to_s
-    types = @allowed_types.map(&:to_s).join(' | ')
-    "UnionTypeConstraint(#{types})"
-  end
-end
-
-# Node representing a field constraint within a structural constraint
-class FieldConstraint < ASTNode
-  attr_reader :type_constraint, :required
-
-  def initialize(type_constraint, required = true)
-    @type_constraint = type_constraint
-    @required = required
-  end
-
-  def required?
-    @required
-  end
-
-  def to_s
-    req_marker = @required ? '!' : '?'
-    "FieldConstraint(#{@type_constraint}#{req_marker})"
-  end
-end
-
-# Enhanced AssignmentNode to support type constraints
-class TypedAssignmentNode < AssignmentNode
-  attr_reader :type_constraint
-
-  def initialize(name, type_constraint, expression)
-    super(name, expression)
-    @type_constraint = type_constraint
-  end
-
-  alias_method :variable_name, :name
-  alias_method :value, :expression
-
-  def to_s
-    "TypedAssignmentNode(#{@name}: #{@type_constraint} = #{@expression})"
-  end
-end
-
-# Enhanced FunctionDefinitionNode to support parameter and return type constraints
-class TypedFunctionDefinitionNode < ASTNode
-  attr_reader :function_name, :parameters, :return_type_constraint, :body
-
-  def initialize(function_name, parameters, return_type_constraint, body = nil)
-    @function_name = function_name
-    @parameters = parameters
-    @return_type_constraint = return_type_constraint
-    @body = body
-  end
-
-  def to_s
-    params = @parameters.map(&:to_s).join(', ')
-    "TypedFunctionDefinitionNode(#{@function_name}(#{params}) -> #{@return_type_constraint})"
-  end
-end
-
-# Node representing a function parameter with type constraint
-class ParameterNode < ASTNode
-  attr_reader :name, :type, :default_value, :required
-
-  def initialize(name, type = nil, default_value = nil, required = true)
-    @name = name
-    @type = type
-    @default_value = default_value
-    @required = required
-  end
-
-  def required?
-    @required
-  end
-
-  # Backward compatibility
-  def type_constraint
-    @type
-  end
-
-  def to_s
-    req_marker = @required ? '' : '?'
-    default_part = @default_value ? " = #{@default_value}" : ""
-    "ParameterNode(#{@name}#{req_marker}: #{@type}#{default_part})"
-  end
-end
-
-# Node representing a program with multiple statements
-class ProgramNode < ASTNode
-  attr_reader :statements
-
-  def initialize(statements)
-    @statements = statements
-  end
-
-  def to_s
-    "ProgramNode(#{@statements.length} statements)"
-  end
-end
-
-# AST node representing a for-loop construct.
-class ForLoopNode < ASTNode
-  # @param loop_variable [String] The loop variable name
-  # @param iterable [ASTNode] The iterable expression
-  # @param body [ASTNode] The body of the loop
-  attr_reader :loop_variable, :iterable, :body
-
-  def initialize(loop_variable, iterable, body)
-    @loop_variable = loop_variable
-    @iterable = iterable
-    @body = body
-  end
-end
-
-# AST node representing a pattern match construct.
-class PatternMatchNode < ASTNode
-  # @param expression [ASTNode] The expression to match
-  # @param patterns [Array<Hash>] Array of pattern-handler pairs
-  #        Each pattern is a hash: { pattern: ASTNode, body: ASTNode }
-  attr_reader :expression, :patterns
-
-  def initialize(expression, patterns)
-    @expression = expression
-    @patterns = patterns
-  end
-end
-
-# AST node representing a try-catch construct.
-class TryCatchNode < ASTNode
-  # @param try_body [ASTNode] The body to try
-  # @param catch_handlers [Array<Hash>] Array of catch handlers
-  #        Each handler is a hash: { exception_type: String, handler_body: ASTNode }
-  # @param finally_body [ASTNode, nil] Optional finally block
-  attr_reader :try_body, :catch_handlers, :finally_body
-
-  def initialize(try_body, catch_handlers, finally_body = nil)
-    @try_body = try_body
-    @catch_handlers = catch_handlers
-    @finally_body = finally_body
-  end
-end
-
-# AST node representing a non-local return (e.g., from within nested blocks).
-class NonLocalReturnNode < ASTNode
-  # @param expression [ASTNode] The expression to return
-  # @param target_scope [String, nil] Optional identifier for the target scope
-  attr_reader :expression, :target_scope
-
-  def initialize(expression, target_scope = nil)
-    @expression = expression
-    @target_scope = target_scope
-  end
-end
-
-# Load enhanced reasoning nodes after base classes are defined
-require_relative 'enhanced_reasoning_nodes'
-# === Advanced Control Flow AST Nodes ===
-
-# Node representing a for loop
-class ForLoopNode < ASTNode
-  attr_reader :iterator, :iterable, :body
-
-  def initialize(iterator, iterable, body)
-    @iterator = iterator
-    @iterable = iterable
-    @body = body
-  end
-
-  def to_s
-    "ForLoopNode(#{@iterator}, #{iterable}, #{body})"
-  end
-end
-
-# Node representing a pattern match expression
-class PatternMatchNode < ASTNode
-  attr_reader :expression, :patterns
-
-  def initialize(expression, patterns)
-    @expression = expression
-    @patterns = patterns # Array of [pattern, body]
-  end
-
-  def to_s
-    "PatternMatchNode(#{@expression}, #{patterns})"
-  end
-end
-
-# Node representing a try/catch/finally block
-class TryCatchNode < ASTNode
-  attr_reader :try_block, :catch_var, :catch_block, :finally_block
-
-  def initialize(try_block, catch_var, catch_block, finally_block = nil)
-    @try_block = try_block
-    @catch_var = catch_var
-    @catch_block = catch_block
-    @finally_block = finally_block
-  end
-
-  def to_s
-    "TryCatchNode(try: #{try_block}, catch: #{catch_var}, #{catch_block}, finally: #{finally_block})"
-  end
-end
-
-# Node representing non-local returns (break, continue, return)
-class NonLocalReturnNode < ASTNode
-  attr_reader :type, :expression
-
-  def initialize(type, expression = nil)
-    @type = type # :break, :continue, :return
-    @expression = expression
-  end
-
-  def to_s
-    "NonLocalReturnNode(#{type}, #{expression})"
+      # Assert fact
+    class AssertStatementNode < StatementNode
+      attr_reader :predicate, :arguments
+      
+      def initialize(predicate, arguments: [], line: 1, column: 1)
+        super(line: line, column: column)
+        @predicate = predicate
+        @arguments = arguments
+      end
+      
+      def accept(visitor)
+        visitor.visit_assert_statement(self)
+      end
+    end
+    
+    # Return statement
+    class ReturnStatementNode < StatementNode
+      attr_reader :value
+      
+      def initialize(value = nil, line: 1, column: 1)
+        super(line: line, column: column)
+        @value = value
+      end
+      
+      def accept(visitor)
+        visitor.visit_return_statement(self)
+      end
+    end
+    
+    # Expression statement (for REPL)
+    class ExpressionStatementNode < StatementNode
+      attr_reader :expression
+      
+      def initialize(expression, line: 1, column: 1)
+        super(line: line, column: column)
+        @expression = expression
+      end
+      
+      def accept(visitor)
+        visitor.visit_expression_statement(self)
+      end
+    end
+    
+    # Import statement
+    class ImportStatementNode < StatementNode
+      attr_reader :path
+      
+      def initialize(path, line: 1, column: 1)
+        super(line: line, column: column)
+        @path = path
+      end
+      
+      def accept(visitor)
+        visitor.visit_import_statement(self)
+      end
+    end
+    
+    # ============================================================
+    # Expression Nodes
+    # ============================================================
+    
+    class ExpressionNode < Node; end
+    
+    # Literals
+    class IntegerLiteralNode < ExpressionNode
+      attr_reader :value
+      
+      def initialize(value, line: 1, column: 1)
+        super(line: line, column: column)
+        @value = value
+      end
+      
+      def accept(visitor)
+        visitor.visit_integer_literal(self)
+      end
+    end
+    
+    class FloatLiteralNode < ExpressionNode
+      attr_reader :value
+      
+      def initialize(value, line: 1, column: 1)
+        super(line: line, column: column)
+        @value = value
+      end
+      
+      def accept(visitor)
+        visitor.visit_float_literal(self)
+      end
+    end
+    
+    class StringLiteralNode < ExpressionNode
+      attr_reader :value
+      
+      def initialize(value, line: 1, column: 1)
+        super(line: line, column: column)
+        @value = value
+      end
+      
+      def accept(visitor)
+        visitor.visit_string_literal(self)
+      end
+    end
+    
+    class BooleanLiteralNode < ExpressionNode
+      attr_reader :value
+      
+      def initialize(value, line: 1, column: 1)
+        super(line: line, column: column)
+        @value = value
+      end
+      
+      def accept(visitor)
+        visitor.visit_boolean_literal(self)
+      end
+    end
+    
+    class NilLiteralNode < ExpressionNode
+      def initialize(line: 1, column: 1)
+        super(line: line, column: column)
+      end
+      
+      def accept(visitor)
+        visitor.visit_nil_literal(self)
+      end
+    end
+    
+    # Identifier/Variable reference
+    class IdentifierNode < ExpressionNode
+      attr_reader :name
+      
+      def initialize(name, line: 1, column: 1)
+        super(line: line, column: column)
+        @name = name
+      end
+      
+      def accept(visitor)
+        visitor.visit_identifier(self)
+      end
+    end
+    
+    # Function call
+    class CallNode < ExpressionNode
+      attr_reader :callee, :arguments
+      
+      def initialize(callee, arguments: [], line: 1, column: 1)
+        super(line: line, column: column)
+        @callee = callee
+        @arguments = arguments
+      end
+      
+      def accept(visitor)
+        visitor.visit_call(self)
+      end
+    end
+    
+    # Lambda/Block literal
+    class LambdaNode < ExpressionNode
+      attr_reader :parameters, :body
+      attr_accessor :captured_env
+      
+      def initialize(parameters, body, line: 1, column: 1)
+        super(line: line, column: column)
+        @parameters = parameters  # Array of ParameterNode (no default values for lambdas)
+        @body = body
+        @captured_env = nil
+      end
+      
+      def accept(visitor)
+        visitor.visit_lambda(self)
+      end
+    end
+    
+    # List literal
+    class ListLiteralNode < ExpressionNode
+      attr_reader :elements
+      
+      def initialize(elements, line: 1, column: 1)
+        super(line: line, column: column)
+        @elements = elements
+      end
+      
+      def accept(visitor)
+        visitor.visit_list_literal(self)
+      end
+    end
+    
+    # Object literal (key-value pairs)
+    class ObjectLiteralNode < ExpressionNode
+      attr_reader :pairs
+      
+      def initialize(pairs, line: 1, column: 1)
+        super(line: line, column: column)
+        @pairs = pairs
+      end
+      
+      def accept(visitor)
+        visitor.visit_object_literal(self)
+      end
+    end
+    
+    # Key-value pair for object literals
+    class KeyValuePairNode < ExpressionNode
+      attr_reader :key, :value
+      
+      def initialize(key, value, line: 1, column: 1)
+        super(line: line, column: column)
+        @key = key
+        @value = value
+      end
+      
+      def accept(visitor)
+        visitor.visit_key_value_pair(self)
+      end
+    end
+    
+    # Member access (obj.property or obj.method())
+    class MemberAccessNode < ExpressionNode
+      attr_reader :object, :member
+      
+      def initialize(object, member, line: 1, column: 1)
+        super(line: line, column: column)
+        @object = object
+        @member = member
+      end
+      
+      def accept(visitor)
+        visitor.visit_member_access(self)
+      end
+    end
+    
+    # Binary operations
+    class BinaryOpNode < ExpressionNode
+      attr_reader :left, :operator, :right
+      
+      def initialize(left, operator, right, line: 1, column: 1)
+        super(line: line, column: column)
+        @left = left
+        @operator = operator
+        @right = right
+      end
+      
+      def accept(visitor)
+        visitor.visit_binary_op(self)
+      end
+    end
+    
+    # Unary operations
+    class UnaryOpNode < ExpressionNode
+      attr_reader :operator, :operand
+      
+      def initialize(operator, operand, line: 1, column: 1)
+        super(line: line, column: column)
+        @operator = operator
+        @operand = operand
+      end
+      
+      def accept(visitor)
+        visitor.visit_unary_op(self)
+      end
+    end
+    
+    # Parenthesized expression
+    class ParenExpressionNode < ExpressionNode
+      attr_reader :expression
+      
+      def initialize(expression, line: 1, column: 1)
+        super(line: line, column: column)
+        @expression = expression
+      end
+      
+      def accept(visitor)
+        visitor.visit_paren_expression(self)
+      end
+    end
+    
+    # Logic fact (for queries/asserts)
+    class FactNode < ExpressionNode
+      attr_reader :predicate, :arguments
+      
+      def initialize(predicate, arguments: [], line: 1, column: 1)
+        super(line: line, column: column)
+        @predicate = predicate
+        @arguments = arguments
+      end
+      
+      def accept(visitor)
+        visitor.visit_fact(self)
+      end
+    end
+    
+    # Async/await expressions
+    class AsyncExpressionNode < ExpressionNode
+      attr_reader :body
+      
+      def initialize(body, line: 1, column: 1)
+        super(line: line, column: column)
+        @body = body
+      end
+      
+      def accept(visitor)
+        visitor.visit_async_expression(self)
+      end
+    end
+    
+    class AwaitExpressionNode < ExpressionNode
+      attr_reader :expression
+      
+      def initialize(expression, line: 1, column: 1)
+        super(line: line, column: column)
+        @expression = expression
+      end
+      
+      def accept(visitor)
+        visitor.visit_await_expression(self)
+      end
+    end
+    
+    # Channel operations
+    class ChannelCreateNode < ExpressionNode
+      attr_reader :buffer_size
+      
+      def initialize(buffer_size = nil, line: 1, column: 1)
+        super(line: line, column: column)
+        @buffer_size = buffer_size
+      end
+      
+      def accept(visitor)
+        visitor.visit_channel_create(self)
+      end
+    end
+    
+    class ChannelSendNode < ExpressionNode
+      attr_reader :channel, :value
+      
+      def initialize(channel, value, line: 1, column: 1)
+        super(line: line, column: column)
+        @channel = channel
+        @value = value
+      end
+      
+      def accept(visitor)
+        visitor.visit_channel_send(self)
+      end
+    end
+    
+    class ChannelReceiveNode < ExpressionNode
+      attr_reader :channel
+      
+      def initialize(channel, line: 1, column: 1)
+        super(line: line, column: column)
+        @channel = channel
+      end
+      
+      def accept(visitor)
+        visitor.visit_channel_receive(self)
+      end
+    end
+    
+    class SelectNode < ExpressionNode
+      attr_reader :cases
+      
+      def initialize(cases, line: 1, column: 1)
+        super(line: line, column: column)
+        @cases = cases
+      end
+      
+      def accept(visitor)
+        visitor.visit_select(self)
+      end
+    end
+    
+    class SelectCaseNode < ExpressionNode
+      attr_reader :channel, :pattern, :body
+      
+      def initialize(channel, pattern, body, line: 1, column: 1)
+        super(line: line, column: column)
+        @channel = channel
+        @pattern = pattern
+        @body = body
+      end
+      
+      def accept(visitor)
+        visitor.visit_select_case(self)
+      end
+    end
+    
+    # Actor model
+    class ActorCreateNode < ExpressionNode
+      attr_reader :behavior, :initial_state
+      
+      def initialize(behavior, initial_state = nil, line: 1, column: 1)
+        super(line: line, column: column)
+        @behavior = behavior
+        @initial_state = initial_state
+      end
+      
+      def accept(visitor)
+        visitor.visit_actor_create(self)
+      end
+    end
+    
+    class ActorSendNode < ExpressionNode
+      attr_reader :actor, :message
+      
+      def initialize(actor, message, line: 1, column: 1)
+        super(line: line, column: column)
+        @actor = actor
+        @message = message
+      end
+      
+      def accept(visitor)
+        visitor.visit_actor_send(self)
+      end
+    end
+    
+    # Mutex operations
+    class MutexCreateNode < ExpressionNode
+      def initialize(line: 1, column: 1)
+        super(line: line, column: column)
+      end
+      
+      def accept(visitor)
+        visitor.visit_mutex_create(self)
+      end
+    end
+    
+    class MutexLockNode < ExpressionNode
+      attr_reader :mutex
+      
+      def initialize(mutex, line: 1, column: 1)
+        super(line: line, column: column)
+        @mutex = mutex
+      end
+      
+      def accept(visitor)
+        visitor.visit_mutex_lock(self)
+      end
+    end
+    
+    class MutexUnlockNode < ExpressionNode
+      attr_reader :mutex
+      
+      def initialize(mutex, line: 1, column: 1)
+        super(line: line, column: column)
+        @mutex = mutex
+      end
+      
+      def accept(visitor)
+        visitor.visit_mutex_unlock(self)
+      end
+    end
   end
 end

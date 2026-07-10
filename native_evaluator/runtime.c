@@ -348,6 +348,16 @@ void run_program(ast_t* ast) {
                     body_node = next_save;
                 }
             }
+        } else if (node->type == AST_INCLUDE) {
+            // Evaluate include statement
+            ArithmeticResult filename_res = eval_expr(node->expr);
+            if (filename_res.error || !filename_res.is_string) {
+                printf("[ERROR] Invalid include filename\n");
+            } else {
+                printf("[DEBUG][runtime] Including file: %s\n", filename_res.string_value);
+                extern void loader_load_and_eval(const char* filename);
+                loader_load_and_eval(filename_res.string_value);
+            }
         } else {
             printf("[UNKNOWN NODE]\n");
         }

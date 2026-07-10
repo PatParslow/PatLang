@@ -1,0 +1,309 @@
+# A small general-purpose regex engine, written in PatLang, for use by the
+# Rust-side `syntax_dsl` source preprocessor (and anything else that needs
+# pattern matching) without depending on Rust's `regex` crate or any other
+# Rust-native pattern-matching feature. PatLang is meant to be fully
+# self-hosting, so the actual matching *logic* has to be genuine PatLang
+# code, invoked from Rust only as "run this program's function with these
+# arguments" (see `Interpreter::call_function`).
+#
+# Supported syntax subset:
+#   literals            a b c ...
+#   escapes             \\ \. \d \w \s \b (and \n \t \\ \( \) \[ \] \| \* \+ \? \^ \$)
+#   any char            .
+#   character class     [abc] [a-z0-9] [^abc]
+#   grouping             (...)
+#   alternation          a|b|c
+#   quantifiers          a* a+ a?
+#   anchors              ^ $ \b (word boundary)
+#
+# No capture groups are extracted (whole-match only) — sufficient for
+# tokenizing DSL blocks, which only need "does this token pattern match here,
+# and how long is the match".
+#
+# AST nodes are tagged lists: ["lit", ch], ["any"], ["class", negate, items],
+# ["seq", nodes], ["alt", branches], ["star", node], ["plus", node],
+# ["opt", node], ["bol"], ["eol"], ["wordb"].
+
+fn is_digit_char(ch) {
+    return ch == "0" or ch == "1" or ch == "2" or ch == "3" or ch == "4" or ch == "5" or ch == "6" or ch == "7" or ch == "8" or ch == "9"
+}
+
+fn is_word_char(ch) {
+    if ch == "_" { return true }
+    if is_digit_char(ch) { return true }
+    let code = char_code(ch, 0)
+    # A-Z: 65-90, a-z: 97-122
+    if code >= 65 and code <= 90 { return true }
+    if code >= 97 and code <= 122 { return true }
+    return false
+}
+
+fn is_space_char(ch) {
+    return ch == " " or ch == "\t" or ch == "\n" or ch == "\r"
+}
+
+# ---------------------------------------------------------------------
+# Parsing: pattern (string) -> AST node. Returns [node, next_pos]; on
+# failure next_pos is -1.
+# ---------------------------------------------------------------------
+
+fn regex_parse(pattern) {
+    let result = regex_parse_alt(pattern, 0)
+    return list_get(result, 0)
+}
+
+fn regex_parse_alt(pattern, pos) {
+    let plen = to_num(list_len(pattern))
+    let first = regex_parse_seq(pattern, pos)
+    let node = list_get(first, 0)
+    let p = list_get(first, 1)
+    if p < 0 { return [node, p] }
+    let branches = list_push([], node)
+    while p < plen and substr(pattern, p, 1) == "|" {
+        let nxt = regex_parse_seq(pattern, p + 1)
+        branches = list_push(branches, list_get(nxt, 0))
+        p = list_get(nxt, 1)
+        if p < 0 { return [["alt", branches], -1] }
+    }
+    let n = to_num(list_len(branches))
+    if n == 1 {
+        return [list_get(branches, 0), p]
+    }
+    return [["alt", branches], p]
+}
+
+fn regex_parse_seq(pattern, pos) {
+    let plen = to_num(list_len(pattern))
+    let nodes = []
+    let p = pos
+    while p < plen and substr(pattern, p, 1) != "|" and substr(pattern, p, 1) != ")" {
+        let r = regex_parse_quantified(pattern, p)
+        let node = list_get(r, 0)
+        p = list_get(r, 1)
+        if p < 0 { return [["seq", nodes], -1] }
+        nodes = list_push(nodes, node)
+    }
+    return [["seq", nodes], p]
+}
+
+fn regex_parse_quantified(pattern, pos) {
+    let r = regex_parse_atom(pattern, pos)
+    let node = list_get(r, 0)
+    let p = list_get(r, 1)
+    if p < 0 { return [node, -1] }
+    let plen = to_num(list_len(pattern))
+    if p < plen {
+        let c = substr(pattern, p, 1)
+        if c == "*" { return [["star", node], p + 1] }
+        if c == "+" { return [["plus", node], p + 1] }
+        if c == "?" { return [["opt", node], p + 1] }
+    }
+    return [node, p]
+}
+
+fn regex_atom_for_escape(ch) {
+    if ch == "d" { return ["class", 0, [["range", "0", "9"]]] }
+    if ch == "w" { return ["class", 0, [["range", "a", "z"], ["range", "A", "Z"], ["range", "0", "9"], ["char", "_"]]] }
+    if ch == "s" { return ["class", 0, [["char", " "], ["char", "\t"], ["char", "\n"], ["char", "\r"]]] }
+    if ch == "b" { return ["wordb"] }
+    if ch == "n" { return ["lit", "\n"] }
+    if ch == "t" { return ["lit", "\t"] }
+    return ["lit", ch]
+}
+
+fn regex_parse_atom(pattern, pos) {
+    let plen = to_num(list_len(pattern))
+    if pos >= plen { return [["seq", []], -1] }
+    let c = substr(pattern, pos, 1)
+    if c == "(" {
+        let inner = regex_parse_alt(pattern, pos + 1)
+        let node = list_get(inner, 0)
+        let p = list_get(inner, 1)
+        if p < 0 { return [node, -1] }
+        if p >= plen or substr(pattern, p, 1) != ")" { return [node, -1] }
+        return [["group", node], p + 1]
+    }
+    if c == "." { return [["any"], pos + 1] }
+    if c == "^" { return [["bol"], pos + 1] }
+    if c == "$" { return [["eol"], pos + 1] }
+    if c == "\\" {
+        if pos + 1 >= plen { return [["lit", "\\"], pos + 1] }
+        let esc = substr(pattern, pos + 1, 1)
+        return [regex_atom_for_escape(esc), pos + 2]
+    }
+    if c == "[" {
+        return regex_parse_class(pattern, pos + 1)
+    }
+    return [["lit", c], pos + 1]
+}
+
+fn regex_parse_class(pattern, pos) {
+    let plen = to_num(list_len(pattern))
+    let negate = 0
+    let p = pos
+    if p < plen and substr(pattern, p, 1) == "^" {
+        negate = 1
+        p = p + 1
+    }
+    let items = []
+    while p < plen and substr(pattern, p, 1) != "]" {
+        let c = substr(pattern, p, 1)
+        if c == "\\" and p + 1 < plen {
+            c = substr(pattern, p + 1, 1)
+            p = p + 1
+        }
+        if p + 2 < plen and substr(pattern, p + 1, 1) == "-" and substr(pattern, p + 2, 1) != "]" {
+            let hi = substr(pattern, p + 2, 1)
+            items = list_push(items, ["range", c, hi])
+            p = p + 3
+        } else {
+            items = list_push(items, ["char", c])
+            p = p + 1
+        }
+    }
+    if p >= plen { return [["class", negate, items], -1] }
+    return [["class", negate, items], p + 1]
+}
+
+# ---------------------------------------------------------------------
+# Matching: attempts to match `node` in `text` starting at `pos`, calling
+# `k(new_pos)` (a closure) with every position reachable after a successful
+# match, until `k` returns a non-negative number (accepted) or all
+# possibilities are exhausted (returns -1). This continuation style is what
+# makes backtracking over alternation/quantifiers correct: `k` represents
+# "the rest of the overall pattern", so a quantifier can retry with fewer
+# repetitions if a later part of the pattern needs the characters back.
+# ---------------------------------------------------------------------
+
+fn regex_class_matches(items, ch) {
+    let n = to_num(list_len(items))
+    let i = 0
+    while i < n {
+        let it = list_get(items, i)
+        let tag = list_get(it, 0)
+        if tag == "char" {
+            if ch == list_get(it, 1) { return true }
+        } else {
+            if ch >= list_get(it, 1) and ch <= list_get(it, 2) { return true }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn regex_match_node(node, text, pos, k) {
+    let tag = list_get(node, 0)
+    let tlen = to_num(list_len(text))
+    if tag == "lit" {
+        if pos < tlen and substr(text, pos, 1) == list_get(node, 1) {
+            return k(pos + 1)
+        }
+        return -1
+    }
+    if tag == "any" {
+        if pos < tlen and substr(text, pos, 1) != "\n" {
+            return k(pos + 1)
+        }
+        return -1
+    }
+    if tag == "class" {
+        if pos >= tlen { return -1 }
+        let ch = substr(text, pos, 1)
+        let hit = regex_class_matches(list_get(node, 2), ch)
+        let negate = list_get(node, 1)
+        if negate == 1 { hit = not hit }
+        if hit { return k(pos + 1) }
+        return -1
+    }
+    if tag == "bol" {
+        if pos == 0 { return k(pos) }
+        if pos > 0 and substr(text, pos - 1, 1) == "\n" { return k(pos) }
+        return -1
+    }
+    if tag == "eol" {
+        if pos == tlen { return k(pos) }
+        if pos < tlen and substr(text, pos, 1) == "\n" { return k(pos) }
+        return -1
+    }
+    if tag == "wordb" {
+        let before = false
+        let after = false
+        if pos > 0 { before = is_word_char(substr(text, pos - 1, 1)) }
+        if pos < tlen { after = is_word_char(substr(text, pos, 1)) }
+        if before != after { return k(pos) }
+        return -1
+    }
+    if tag == "group" {
+        return regex_match_node(list_get(node, 1), text, pos, k)
+    }
+    if tag == "seq" {
+        return regex_match_seq(list_get(node, 1), 0, text, pos, k)
+    }
+    if tag == "alt" {
+        return regex_match_alt(list_get(node, 1), 0, text, pos, k)
+    }
+    if tag == "star" {
+        return regex_match_repeat(list_get(node, 1), text, pos, k, 0)
+    }
+    if tag == "plus" {
+        return regex_match_repeat(list_get(node, 1), text, pos, k, 1)
+    }
+    if tag == "opt" {
+        let inner = list_get(node, 1)
+        let r = regex_match_node(inner, text, pos, k)
+        if r >= 0 { return r }
+        return k(pos)
+    }
+    return -1
+}
+
+fn regex_match_seq(nodes, idx, text, pos, k) {
+    let n = to_num(list_len(nodes))
+    if idx >= n { return k(pos) }
+    let node = list_get(nodes, idx)
+    return regex_match_node(node, text, pos, |p2| { regex_match_seq(nodes, idx + 1, text, p2, k) })
+}
+
+fn regex_match_alt(branches, idx, text, pos, k) {
+    let n = to_num(list_len(branches))
+    if idx >= n { return -1 }
+    let r = regex_match_node(list_get(branches, idx), text, pos, k)
+    if r >= 0 { return r }
+    return regex_match_alt(branches, idx + 1, text, pos, k)
+}
+
+# Backtracking repetition: tries the greatest number of repetitions first,
+# then backs off, so that whatever comes after (represented by `k`) still
+# gets a chance to match — the standard greedy-with-backtracking behavior.
+fn regex_match_repeat(node, text, pos, k, min_count) {
+    let r = regex_match_node(node, text, pos, |p2| {
+        if p2 == pos { return -1 }
+        return regex_match_repeat(node, text, p2, k, 0)
+    })
+    if r >= 0 { return r }
+    if min_count <= 0 { return k(pos) }
+    return -1
+}
+
+# Attempts to match `pattern_ast` (already parsed via regex_parse) against
+# `text` starting exactly at `start`. Returns the end position of the
+# longest-preferred (leftmost-greedy) match, or -1 if there is no match
+# anchored at `start`.
+#
+# Note: the "return the position unchanged" continuation is written as an
+# inline closure literal (`|p| { p }`), not a reference to a plain top-level
+# function — bare references to named functions lower to a local-variable
+# load (and thus to Unit, since no such local exists), only closure literals
+# actually produce a callable value in this IR. See `regex_match_seq` etc.
+# below for the same reason every "rest of the match" continuation passed
+# around is built the same way.
+fn regex_match_at(pattern_ast, text, start) {
+    return regex_match_node(pattern_ast, text, start, |p| { p })
+}
+
+# Convenience combined entry point for callers that only have the raw
+# pattern string (no pre-parsed AST cached) — parses then matches.
+fn regex_match_string_at(pattern, text, start) {
+    let ast = regex_parse(pattern)
+    return regex_match_at(ast, text, start)
+}

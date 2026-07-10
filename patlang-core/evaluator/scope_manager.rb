@@ -25,7 +25,19 @@ module EvaluatorModules
       
       # Convert to string for consistent key handling
       name_str = name.to_s
-      @variables[name_str] = value
+
+      # Assign to the nearest scope where the variable exists, else current scope
+      found = false
+      (@scope_stack.reverse_each do |scope|
+        if scope.key?(name_str)
+          scope[name_str] = value
+          found = true
+          break
+        end
+      end) unless @scope_stack.empty?
+      unless found
+        @variables[name_str] = value
+      end
     end
   
     def get_variable(name)

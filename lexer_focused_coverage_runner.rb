@@ -58,9 +58,6 @@ lexer_test_files = [
 puts "\n2️⃣ Found #{lexer_test_files.length} lexer test files:"
 lexer_test_files.each { |file| puts "   📄 #{file}" }
 
-# Load minitest framework
-require 'minitest/autorun'
-
 puts "\n3️⃣ Loading and executing lexer tests..."
 
 # Disable autorun to prevent automatic execution

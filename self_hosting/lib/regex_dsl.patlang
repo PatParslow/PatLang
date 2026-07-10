@@ -1,0 +1,493 @@
+# =============================================================================
+# General-purpose regex engine, Stage 1 self-hosted dialect (concatenate
+# after nothing else; only uses host functions available to the self-hosted
+# compiler pipeline: char_code/substr/chr/list_push/list_get/list_len/to_num).
+#
+# This is the self-hosted-dialect twin of the Stage 0 (`fn`/`{}`) engine at
+# rust-runtime's self_hosting/lib/regex.patlang, used by the Rust CLI's
+# `syntax_dsl.rs` preprocessor. That version cannot be `include`d into
+# anything compiled by the self-hosted pipeline (lib/lexer.patlang +
+# lib/parser.patlang don't lex `{`/`}` as anything meaningful — this dialect
+# is do/end-delimited throughout), so the logic is duplicated here in the
+# dialect lib/lexer.patlang and lib/parser.patlang actually understand. Keep
+# both in sync if the regex feature set changes.
+#
+# Supported syntax subset: literals, \d \w \s \b \n \t escapes, '.' (any),
+# [abc] / [a-z0-9] / [^abc] classes, (...) grouping, '|' alternation,
+# '*' '+' '?' quantifiers, '^' '$' anchors. No capture-group extraction —
+# whole-match length only.
+#
+# AST nodes are tagged lists: ["lit", ch], ["any"], ["class", negate, items],
+# ["seq", nodes], ["alt", branches], ["star", node], ["plus", node],
+# ["opt", node], ["bol"], ["eol"], ["wordb"], ["group", node].
+# =============================================================================
+
+make a function called is_digit_char takes ch returns r
+  if ch == "0" then
+    return true
+  else
+    if ch == "1" then
+      return true
+    else
+      if ch == "2" then
+        return true
+      else
+        if ch == "3" then
+          return true
+        else
+          if ch == "4" then
+            return true
+          else
+            if ch == "5" then
+              return true
+            else
+              if ch == "6" then
+                return true
+              else
+                if ch == "7" then
+                  return true
+                else
+                  if ch == "8" then
+                    return true
+                  else
+                    return ch == "9"
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+make a function called is_word_char takes ch returns r
+  if ch == "_" then
+    return true
+  else
+    if is_digit_char(ch) then
+      return true
+    else
+      let code = char_code(ch, 0)
+      if (code >= 65) and (code <= 90) then
+        return true
+      else
+        if (code >= 97) and (code <= 122) then
+          return true
+        else
+          return false
+        end
+      end
+    end
+  end
+end
+
+# ---------------------------------------------------------------------
+# Parsing: pattern (string) -> AST node. Internal helpers return
+# [node, next_pos] pairs; next_pos is -1 on failure.
+# ---------------------------------------------------------------------
+
+make a function called regex_atom_for_escape takes ch returns node
+  if ch == "d" then
+    return ["class", 0, [["range", "0", "9"]]]
+  else
+    if ch == "w" then
+      return ["class", 0, [["range", "a", "z"], ["range", "A", "Z"], ["range", "0", "9"], ["char", "_"]]]
+    else
+      if ch == "s" then
+        return ["class", 0, [["char", " "], ["char", "\t"], ["char", "\n"], ["char", "\r"]]]
+      else
+        if ch == "b" then
+          return ["wordb"]
+        else
+          if ch == "n" then
+            return ["lit", "\n"]
+          else
+            if ch == "t" then
+              return ["lit", "\t"]
+            else
+              return ["lit", ch]
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+make a function called regex_parse_class takes pattern, pos returns r
+  let plen = to_num(list_len(pattern))
+  let negate = 0
+  let p = pos
+  if (p < plen) and (substr(pattern, p, 1) == "^") then
+    let negate = 1
+    let p = p + 1
+  end
+  let items = []
+  let scanning = true
+  while (p < plen) and scanning do
+    if substr(pattern, p, 1) == "]" then
+      let scanning = false
+    else
+      let c = substr(pattern, p, 1)
+      if (c == "\\") and ((p + 1) < plen) then
+        let c = substr(pattern, p + 1, 1)
+        let p = p + 1
+      end
+      if ((p + 2) < plen) and (substr(pattern, p + 1, 1) == "-") and (substr(pattern, p + 2, 1) != "]") then
+        let hi = substr(pattern, p + 2, 1)
+        let items = list_push(items, ["range", c, hi])
+        let p = p + 3
+      else
+        let items = list_push(items, ["char", c])
+        let p = p + 1
+      end
+    end
+  end
+  if p >= plen then
+    return [["class", negate, items], -1]
+  else
+    return [["class", negate, items], p + 1]
+  end
+end
+
+make a function called regex_parse_atom takes pattern, pos returns r
+  let plen = to_num(list_len(pattern))
+  if pos >= plen then
+    return [["seq", []], -1]
+  else
+    let c = substr(pattern, pos, 1)
+    if c == "(" then
+      let inner = regex_parse_alt(pattern, pos + 1)
+      let node = inner[0]
+      let p = inner[1]
+      if p < 0 then
+        return [node, -1]
+      else
+        if (p >= plen) or (substr(pattern, p, 1) != ")") then
+          return [node, -1]
+        else
+          return [["group", node], p + 1]
+        end
+      end
+    else
+      if c == "." then
+        return [["any"], pos + 1]
+      else
+        if c == "^" then
+          return [["bol"], pos + 1]
+        else
+          if c == "$" then
+            return [["eol"], pos + 1]
+          else
+            if c == "\\" then
+              if (pos + 1) >= plen then
+                return [["lit", "\\"], pos + 1]
+              else
+                let esc = substr(pattern, pos + 1, 1)
+                return [regex_atom_for_escape(esc), pos + 2]
+              end
+            else
+              if c == "[" then
+                return regex_parse_class(pattern, pos + 1)
+              else
+                return [["lit", c], pos + 1]
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+make a function called regex_parse_quantified takes pattern, pos returns r
+  let r = regex_parse_atom(pattern, pos)
+  let node = r[0]
+  let p = r[1]
+  if p < 0 then
+    return [node, -1]
+  else
+    let plen = to_num(list_len(pattern))
+    if p < plen then
+      let c = substr(pattern, p, 1)
+      if c == "*" then
+        return [["star", node], p + 1]
+      else
+        if c == "+" then
+          return [["plus", node], p + 1]
+        else
+          if c == "?" then
+            return [["opt", node], p + 1]
+          else
+            return [node, p]
+          end
+        end
+      end
+    else
+      return [node, p]
+    end
+  end
+end
+
+make a function called regex_parse_seq takes pattern, pos returns r
+  let plen = to_num(list_len(pattern))
+  let nodes = []
+  let p = pos
+  let scanning = true
+  while (p < plen) and scanning do
+    if (substr(pattern, p, 1) == "|") or (substr(pattern, p, 1) == ")") then
+      let scanning = false
+    else
+      let r = regex_parse_quantified(pattern, p)
+      let node = r[0]
+      let p = r[1]
+      if p < 0 then
+        let scanning = false
+      else
+        let nodes = list_push(nodes, node)
+      end
+    end
+  end
+  return [["seq", nodes], p]
+end
+
+make a function called regex_parse_alt takes pattern, pos returns r
+  let plen = to_num(list_len(pattern))
+  let first = regex_parse_seq(pattern, pos)
+  let node = first[0]
+  let p = first[1]
+  if p < 0 then
+    return [node, p]
+  else
+    let branches = list_push([], node)
+    let scanning = true
+    while (p < plen) and scanning and (substr(pattern, p, 1) == "|") do
+      let nxt = regex_parse_seq(pattern, p + 1)
+      let branches = list_push(branches, nxt[0])
+      let p = nxt[1]
+      if p < 0 then
+        let scanning = false
+      end
+    end
+    if p < 0 then
+      return [["alt", branches], -1]
+    else
+      let n = to_num(list_len(branches))
+      if n == 1 then
+        return [branches[0], p]
+      else
+        return [["alt", branches], p]
+      end
+    end
+  end
+end
+
+make a function called regex_parse takes pattern returns node
+  let result = regex_parse_alt(pattern, 0)
+  return result[0]
+end
+
+# ---------------------------------------------------------------------
+# Matching: attempts to match `node` in `text` starting at `pos`, calling
+# the closure `k(new_pos)` with every position reachable after a successful
+# match, until `k` returns a non-negative number (accepted) or every
+# possibility is exhausted (-1). This continuation-passing style is what
+# makes backtracking over alternation/quantifiers correct: `k` represents
+# "the rest of the overall pattern", so a quantifier can retry with fewer
+# repetitions if a later part of the pattern needs the characters back.
+# ---------------------------------------------------------------------
+
+make a function called regex_class_matches takes items, ch returns r
+  let n = to_num(list_len(items))
+  let i = 0
+  let found = false
+  while (i < n) and (not found) do
+    let it = items[i]
+    if it[0] == "char" then
+      if ch == it[1] then
+        let found = true
+      end
+    else
+      if (ch >= it[1]) and (ch <= it[2]) then
+        let found = true
+      end
+    end
+    let i = i + 1
+  end
+  return found
+end
+
+make a function called regex_match_seq takes nodes, idx, text, pos, k returns r
+  let n = to_num(list_len(nodes))
+  if idx >= n then
+    return k(pos)
+  else
+    let node = nodes[idx]
+    return regex_match_node(node, text, pos, |p2| do return regex_match_seq(nodes, idx + 1, text, p2, k) end)
+  end
+end
+
+make a function called regex_match_alt takes branches, idx, text, pos, k returns r
+  let n = to_num(list_len(branches))
+  if idx >= n then
+    return -1
+  else
+    let r = regex_match_node(branches[idx], text, pos, k)
+    if r >= 0 then
+      return r
+    else
+      return regex_match_alt(branches, idx + 1, text, pos, k)
+    end
+  end
+end
+
+# Backtracking repetition: tries the greatest number of repetitions first,
+# then backs off, so whatever comes after (represented by `k`) still gets a
+# chance to match — standard greedy-with-backtracking behavior.
+make a function called regex_match_repeat takes node, text, pos, k, min_count returns r
+  let r = regex_match_node(node, text, pos, |p2| do
+    if p2 == pos then
+      return -1
+    else
+      return regex_match_repeat(node, text, p2, k, 0)
+    end
+  end)
+  if r >= 0 then
+    return r
+  else
+    if min_count <= 0 then
+      return k(pos)
+    else
+      return -1
+    end
+  end
+end
+
+make a function called regex_match_node takes node, text, pos, k returns r
+  let tag = node[0]
+  let tlen = to_num(list_len(text))
+  if tag == "lit" then
+    if (pos < tlen) and (substr(text, pos, 1) == node[1]) then
+      return k(pos + 1)
+    else
+      return -1
+    end
+  else
+    if tag == "any" then
+      if (pos < tlen) and (substr(text, pos, 1) != "\n") then
+        return k(pos + 1)
+      else
+        return -1
+      end
+    else
+      if tag == "class" then
+        if pos >= tlen then
+          return -1
+        else
+          let ch = substr(text, pos, 1)
+          let hit = regex_class_matches(node[2], ch)
+          if node[1] == 1 then
+            let hit = not hit
+          end
+          if hit then
+            return k(pos + 1)
+          else
+            return -1
+          end
+        end
+      else
+        if tag == "bol" then
+          if pos == 0 then
+            return k(pos)
+          else
+            if substr(text, pos - 1, 1) == "\n" then
+              return k(pos)
+            else
+              return -1
+            end
+          end
+        else
+          if tag == "eol" then
+            if pos == tlen then
+              return k(pos)
+            else
+              if substr(text, pos, 1) == "\n" then
+                return k(pos)
+              else
+                return -1
+              end
+            end
+          else
+            if tag == "wordb" then
+              let before = false
+              let after = false
+              if pos > 0 then
+                let before = is_word_char(substr(text, pos - 1, 1))
+              end
+              if pos < tlen then
+                let after = is_word_char(substr(text, pos, 1))
+              end
+              if before != after then
+                return k(pos)
+              else
+                return -1
+              end
+            else
+              if tag == "group" then
+                return regex_match_node(node[1], text, pos, k)
+              else
+                if tag == "seq" then
+                  return regex_match_seq(node[1], 0, text, pos, k)
+                else
+                  if tag == "alt" then
+                    return regex_match_alt(node[1], 0, text, pos, k)
+                  else
+                    if tag == "star" then
+                      return regex_match_repeat(node[1], text, pos, k, 0)
+                    else
+                      if tag == "plus" then
+                        return regex_match_repeat(node[1], text, pos, k, 1)
+                      else
+                        if tag == "opt" then
+                          let inner = node[1]
+                          let r = regex_match_node(inner, text, pos, k)
+                          if r >= 0 then
+                            return r
+                          else
+                            return k(pos)
+                          end
+                        else
+                          return -1
+                        end
+                      end
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+# Attempts to match `pattern_ast` (already parsed via regex_parse) against
+# `text` starting exactly at `start`. Returns the end position of the
+# leftmost-greedy match, or -1 if there is no match anchored at `start`.
+#
+# Note: closures in this dialect must use an explicit `return` for their
+# body value to propagate — a bare trailing expression statement (no
+# `return`) does not implicitly become the closure's return value.
+make a function called regex_match_at takes pattern_ast, text, start returns r
+  return regex_match_node(pattern_ast, text, start, |p| do return p end)
+end
+
+# Convenience combined entry point for callers that only have the raw
+# pattern string (no pre-parsed AST cached) — parses then matches.
+make a function called regex_match_string_at takes pattern, text, start returns r
+  let ast = regex_parse(pattern)
+  return regex_match_at(ast, text, start)
+end

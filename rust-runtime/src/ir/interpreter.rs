@@ -30,6 +30,17 @@ impl Interpreter {
         self.run_function(program, entry, &[])
     }
 
+    /// Call an arbitrary named function in `program` with explicit argument
+    /// values, without going through `program.entry`. Used by embedders (e.g.
+    /// the `syntax_dsl` source preprocessor) that load a small PatLang library
+    /// program once and then repeatedly invoke one of its functions directly,
+    /// rather than re-running a `main`/entry point each time.
+    pub fn call_function(&self, program: &Program, name: &str, args: &[Value]) -> Result<Value, String> {
+        let func = program.functions.get(name)
+            .ok_or_else(|| format!("function '{}' not found", name))?;
+        self.run_function(program, func, args)
+    }
+
     fn run_function(&self, program: &Program, func: &Function, args: &[Value]) -> Result<Value, String> {
         let mut pc: usize = 0;
         let mut stack: Vec<Value> = Vec::new();

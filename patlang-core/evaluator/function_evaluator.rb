@@ -21,8 +21,12 @@ module EvaluatorModules
         return_type: node.return_type
       }
 
-      # Also store by just name for zero or single parameter lookups
-      @evaluator.functions[node.name] = @evaluator.functions[function_key] if node.parameters.length <= 1
+  # Also store by plain name (legacy lookup) regardless of arity
+  @evaluator.functions[node.name] = @evaluator.functions[function_key]
+
+      if defined?(PatlangDebug)
+        PatlangDebug.log(:FUNC) { "register #{node.name} arity=#{node.parameters.length}" }
+      end
 
       # Return the function name for assignment purposes
       node.name

@@ -15,51 +15,138 @@ module ParserModules
         if @parser.current_token.nil?
           return @parser.safe_error("Expected condition after 'if'")
         end
-        
-        condition = @parser.expression
-        
-        if @parser.current_token.nil? || @parser.current_token.type != :THEN
-          @parser.syntax_error("Expected 'then' after if condition")
+
+        # Collect tokens for the condition up to 'then' or '{'
+        condition_tokens = []
+        paren_depth = 0
+        last_token = nil
+        starters = [:IDENTIFIER, :IF, :WHILE, :RETURN, :PRINT, :INCLUDE, :MAKE, :CALL, :MATCH, :FACT, :RULE, :QUERY, :QUERY_PREFIX, :ASSERT, :GOAL, :CONSTRAIN, :PURSUE, :LBRACE]
+        while @parser.current_token && !((paren_depth == 0) && (@parser.current_token.type == :THEN || @parser.current_token.type == :LBRACE))
+          tok = @parser.current_token
+          # Break on implicit newline termination: line break + starter token at paren depth 0
+            if paren_depth == 0 && last_token && tok.line > last_token.line && starters.include?(tok.type)
+            break
+          end
+          if tok.type == :LPAREN
+            paren_depth += 1
+          elsif tok.type == :RPAREN
+            paren_depth -= 1 if paren_depth > 0
+          end
+          condition_tokens << tok
+          last_token = tok
+          @parser.advance
         end
-        
-        @parser.eat(:THEN)
-        
+
+        if condition_tokens.empty?
+          return @parser.safe_error("Expected condition after 'if'")
+        end
+
+        # Parse the collected tokens as an expression using a minimal helper parser
+        require_relative 'expression_parser'
+        helper_parser = Object.new
+        helper_parser.instance_variable_set(:@tokens, condition_tokens)
+        helper_parser.instance_variable_set(:@current_token_index, 0)
+        def helper_parser.current_token
+          @tokens[@current_token_index]
+        end
+        def helper_parser.advance
+          @current_token_index += 1
+        end
+        def helper_parser.peek(offset = 1)
+          @tokens[@current_token_index + offset]
+        end
+        def helper_parser.current_token_index
+          @current_token_index
+        end
+        expr_parser = ParserModules::ExpressionParser.new(helper_parser)
+        condition = expr_parser.expression
+
+        then_used_braces = false
         then_statements = []
-        loop_count = 0
-        while @parser.current_token &&
-              @parser.current_token.type != :ELSE &&
-              @parser.current_token.type != :END &&
-              loop_count < 1000  # Safety limit
-          stmt = @parser.statement
-          then_statements << stmt if stmt
-          loop_count += 1
+        if @parser.current_token && @parser.current_token.type == :THEN
+          @parser.eat(:THEN)
+          loop_count = 0
+          while @parser.current_token &&
+                @parser.current_token.type != :ELSE &&
+                @parser.current_token.type != :END &&
+                loop_count < 1000  # Safety limit
+            stmt = @parser.statement
+            then_statements << stmt if stmt
+            loop_count += 1
+          end
+        elsif @parser.current_token && @parser.current_token.type == :LBRACE
+          @parser.eat(:LBRACE)
+          then_used_braces = true
+          loop_count = 0
+          while @parser.current_token &&
+                @parser.current_token.type != :RBRACE &&
+                loop_count < 1000  # Safety limit
+            stmt = @parser.statement
+            then_statements << stmt if stmt
+            loop_count += 1
+          end
+          @parser.eat(:RBRACE)
+        else
+          # Enhancement: allow implicit THEN if next token appears to start a statement (newline style)
+          # Heuristic: if current_token begins a statement (IDENTIFIER, IF, WHILE, RETURN, PRINT, INCLUDE, MAKE, CALL, MATCH, FACT, RULE, QUERY, QUERY_PREFIX, ASSERT, GOAL, CONSTRAIN, PURSUE, LBRACE)
+          starters = [:IDENTIFIER, :IF, :WHILE, :RETURN, :PRINT, :INCLUDE, :MAKE, :CALL, :MATCH, :FACT, :RULE, :QUERY, :QUERY_PREFIX, :ASSERT, :GOAL, :CONSTRAIN, :PURSUE, :LBRACE]
+          if @parser.current_token && starters.include?(@parser.current_token.type)
+            # Implicit single-line or multi-line block until ELSE/END
+            loop_count = 0
+            while @parser.current_token &&
+                  @parser.current_token.type != :ELSE &&
+                  @parser.current_token.type != :END &&
+                  loop_count < 1000
+              stmt = @parser.statement
+              then_statements << stmt if stmt
+              loop_count += 1
+            end
+          else
+            @parser.syntax_error("Expected 'then' or '{' after if condition")
+          end
         end
-        
+
         then_branch = BlockNode.new(then_statements)
         
+        else_used_braces = false
         else_branch = nil
         if @parser.current_token&.type == :ELSE
           @parser.eat(:ELSE)
           
           else_statements = []
-          loop_count = 0
-          while @parser.current_token &&
-                @parser.current_token.type != :END &&
-                loop_count < 1000  # Safety limit
-            stmt = @parser.statement
-            else_statements << stmt if stmt
-            loop_count += 1
+          if @parser.current_token && @parser.current_token.type == :LBRACE
+            @parser.eat(:LBRACE)
+            else_used_braces = true
+            loop_count = 0
+            while @parser.current_token &&
+                  @parser.current_token.type != :RBRACE &&
+                  loop_count < 1000  # Safety limit
+              stmt = @parser.statement
+              else_statements << stmt if stmt
+              loop_count += 1
+            end
+            @parser.eat(:RBRACE)
+          else
+            loop_count = 0
+            while @parser.current_token &&
+                  @parser.current_token.type != :END &&
+                  loop_count < 1000  # Safety limit
+              stmt = @parser.statement
+              else_statements << stmt if stmt
+              loop_count += 1
+            end
           end
-          
           else_branch = BlockNode.new(else_statements)
         end
         
-        if @parser.current_token&.type == :END
-          @parser.eat(:END)
-        else
-          @parser.syntax_error("Missing 'end' for if statement")
+        if !(then_used_braces || else_used_braces)
+          if @parser.current_token&.type == :END
+            @parser.eat(:END)
+          else
+            @parser.syntax_error("Missing 'end' for if statement")
+          end
         end
-        
+
         return IfNode.new(condition, then_branch, else_branch)
       rescue ParseError => e
         @parser.safe_error("If statement parse error: #{e.message}")
@@ -77,30 +164,44 @@ module ParserModules
         
         condition = @parser.expression
         
-        if @parser.current_token.nil? || @parser.current_token.type != :DO
-          @parser.syntax_error("Expected 'do' after while condition")
-        end
-        
-        @parser.eat(:DO)
-        
+        used_braces = false
         body_statements = []
-        loop_count = 0
-        while @parser.current_token &&
-              @parser.current_token.type != :END &&
-              loop_count < 1000  # Safety limit
-          stmt = @parser.statement
-          body_statements << stmt if stmt
-          loop_count += 1
+        if @parser.current_token && @parser.current_token.type == :DO
+          @parser.eat(:DO)
+          loop_count = 0
+          while @parser.current_token &&
+                @parser.current_token.type != :END &&
+                loop_count < 1000  # Safety limit
+            stmt = @parser.statement
+            body_statements << stmt if stmt
+            loop_count += 1
+          end
+        elsif @parser.current_token && @parser.current_token.type == :LBRACE
+          @parser.eat(:LBRACE)
+          used_braces = true
+          loop_count = 0
+          while @parser.current_token &&
+                @parser.current_token.type != :RBRACE &&
+                loop_count < 1000  # Safety limit
+            stmt = @parser.statement
+            body_statements << stmt if stmt
+            loop_count += 1
+          end
+          @parser.eat(:RBRACE)
+        else
+          @parser.syntax_error("Expected 'do' or '{' after while condition")
         end
-        
+
         body = BlockNode.new(body_statements)
         
-        if @parser.current_token&.type == :END
-          @parser.eat(:END)
-        else
-          @parser.syntax_error("Missing 'end' for while statement")
+        if !used_braces
+          if @parser.current_token&.type == :END
+            @parser.eat(:END)
+          else
+            @parser.syntax_error("Missing 'end' for while statement")
+          end
         end
-        
+
         return WhileNode.new(condition, body)
       rescue ParseError => e
         @parser.safe_error("While statement parse error: #{e.message}")
@@ -130,6 +231,18 @@ module ParserModules
       @parser.eat(:PRINT)
       expr = @parser.expression
       return PrintNode.new(expr)
+    end
+
+    # Grammar: include_statement → 'include' expression
+    def parse_include_statement
+  include_token = @parser.current_token
+  @parser.eat(:INCLUDE)
+  expr = @parser.expression
+  # Attach source location metadata so evaluator can resolve relative paths
+  node = IncludeNode.new(expr, @parser.filename, include_token&.line, include_token&.column)
+  # Debug file attachment
+  # puts "[PARSER DEBUG] Created IncludeNode with file=#{node.file} line=#{node.line} col=#{node.column}"
+  return node
     end
     # Grammar: for_statement → 'for' IDENTIFIER 'in' expression 'do' statement* 'end'
     def parse_for_statement

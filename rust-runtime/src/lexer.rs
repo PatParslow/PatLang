@@ -59,7 +59,82 @@ pub struct Lexer<'a> {
 pub enum LexerError {
     UnexpectedCharacter(char, usize),
     UnterminatedString(usize),
+    /// A caller (typically the parser, via `next_token_expecting`) declared a
+    /// set of acceptable next-token classes and the lexer found something
+    /// outside that set. Carries what was actually found so the caller can
+    /// report a precise diagnostic instead of a generic parse error.
+    UnexpectedContinuation { found: TokenExpectation, expected: Vec<TokenExpectation>, position: usize },
     // Extend with more error types as needed
+}
+
+/// A coarse classification of "what kind of thing comes next", used to let a
+/// caller (the parser, or in the future a user-defined grammar extension)
+/// declare what it is willing to accept *before* the lexer commits to a
+/// specific token. This is the seed of an expectation-driven lexer/parser
+/// protocol: rather than the lexer unilaterally deciding token boundaries via
+/// its own hard-coded lookahead, ambiguous positions (like a `.` that could be
+/// a decimal point, a member-access operator, or a plain statement
+/// terminator) can be resolved by asking "given what I'm expecting next, does
+/// this character/token qualify?" and reporting a clear failure if not.
+///
+/// Today this is wired into the one place that already had a hand-rolled
+/// version of this decision (integer-vs-decimal continuation, see
+/// `next_token`'s number-lexing branch) and into the parser's member-access
+/// (`.identifier`) handling. Extending it so the *parser* proactively drives
+/// every token fetch with an explicit expected set (rather than the parser's
+/// two-token lookahead buffer being filled unconstrained) is a larger,
+/// follow-on architectural change — see `docs/plans/` for the write-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenExpectation {
+    /// An ASCII digit — e.g. valid continuation of an integer/fraction.
+    Digit,
+    /// A literal '.' — decimal point or member-access/terminator dot.
+    Dot,
+    /// An arithmetic/comparison/logical operator character.
+    Operator,
+    /// Whitespace, a statement/expression terminator, or end of input —
+    /// anything that legitimately ends a token run.
+    Terminator,
+    /// The start of an identifier or keyword (ASCII letter or `_`).
+    Letter,
+    /// No constraint — accept whatever the lexer produces. Used by every
+    /// existing call site that doesn't (yet) participate in this protocol,
+    /// so introducing it does not change behavior anywhere else.
+    Any,
+}
+
+impl TokenExpectation {
+    /// Classify a single lookahead character into its coarse expectation
+    /// class. `None` represents end-of-input.
+    fn classify_char(c: Option<char>) -> TokenExpectation {
+        match c {
+            None => TokenExpectation::Terminator,
+            Some(c) if c.is_ascii_digit() => TokenExpectation::Digit,
+            Some('.') => TokenExpectation::Dot,
+            Some(c) if "+-*/%<>=!&|".contains(c) => TokenExpectation::Operator,
+            Some(c) if c.is_whitespace() || matches!(c, ';' | ',' | ')' | ']' | '}') => TokenExpectation::Terminator,
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => TokenExpectation::Letter,
+            Some(_) => TokenExpectation::Any,
+        }
+    }
+
+    /// Classify an already-lexed `Token` into the same coarse vocabulary, so
+    /// the parser can validate tokens it already holds (e.g. in its
+    /// lookahead buffer) against an expected set using the same names.
+    pub fn classify_token(tok: &Token) -> TokenExpectation {
+        match tok {
+            Token::Number(_) => TokenExpectation::Digit,
+            Token::Dot => TokenExpectation::Dot,
+            Token::Plus | Token::Minus | Token::Star | Token::Slash | Token::Percent
+            | Token::Equal | Token::EqualEqual | Token::NotEqual
+            | Token::Greater | Token::GreaterEqual | Token::Less | Token::LessEqual
+            | Token::And | Token::Or | Token::Not => TokenExpectation::Operator,
+            Token::Identifier(_) => TokenExpectation::Letter,
+            Token::Newline | Token::EOF | Token::Semicolon | Token::Comma
+            | Token::RParen | Token::RBracket | Token::BlockEnd => TokenExpectation::Terminator,
+            _ => TokenExpectation::Any,
+        }
+    }
 }
 
 macro_rules! lex_debug {
@@ -76,7 +151,39 @@ impl<'a> Lexer<'a> {
         Lexer { input, position: 0 }
     }
 
+    /// Fetch the next token with no constraint on what it may be — the
+    /// existing, unconstrained entry point used by the vast majority of the
+    /// parser, preserved unchanged for backward compatibility.
     pub fn next_token(&mut self) -> Result<Token, LexerError> {
+        self.next_token_expecting(&[])
+    }
+
+    /// Fetch the next token, optionally validating it against a declared set
+    /// of acceptable coarse classes (`expected`). An empty `expected` slice
+    /// means "accept anything" (equivalent to plain `next_token`).
+    ///
+    /// This is the entry point for the expectation-driven protocol: a caller
+    /// that knows, from grammar context, what kind of thing must come next
+    /// (e.g. "an identifier after this '.'", or internally, "a digit or a
+    /// decimal point after this integer run") can pass that expectation in
+    /// and get back either a matching token or a precise
+    /// `LexerError::UnexpectedContinuation` naming what was actually found.
+    pub fn next_token_expecting(&mut self, expected: &[TokenExpectation]) -> Result<Token, LexerError> {
+        let tok = self.next_token_unconstrained()?;
+        if !expected.is_empty() {
+            let found = TokenExpectation::classify_token(&tok);
+            if !expected.contains(&found) && !expected.contains(&TokenExpectation::Any) {
+                return Err(LexerError::UnexpectedContinuation {
+                    found,
+                    expected: expected.to_vec(),
+                    position: self.position,
+                });
+            }
+        }
+        Ok(tok)
+    }
+
+    fn next_token_unconstrained(&mut self) -> Result<Token, LexerError> {
         let bytes = self.input.as_bytes();
         let len = bytes.len();
         while self.position < len {
@@ -130,12 +237,36 @@ impl<'a> Lexer<'a> {
                 }
                 continue;
             }
-            // Numbers (integer only for now)
+            // Numbers: integer part, optionally followed by a decimal point and
+            // fractional digits (e.g. `42`, `3.14`). This is the concrete
+            // worked example of the expectation-driven disambiguation
+            // described on `TokenExpectation`: after the integer run, the
+            // only two classes of continuation we're willing to accept as
+            // "still part of this literal" are (a) a '.' immediately
+            // followed by a digit (decimal point) or (b) nothing — anything
+            // else (an operator, a letter, a lone '.' not followed by a
+            // digit, whitespace/terminator) ends the literal here and is
+            // left untouched for the *next* call to `next_token` to
+            // classify on its own. This is what makes `2.34.to_s` lex as
+            // Number(2.34), Dot, Identifier("to_s") rather than greedily
+            // misreading the second '.' as another decimal point.
             if c.is_ascii_digit() {
                 let start = self.position;
                 while self.position < len && (bytes[self.position] as char).is_ascii_digit() {
                     self.position += 1;
                 }
+                let next_class = TokenExpectation::classify_char(bytes.get(self.position).map(|b| *b as char));
+                let after_next_class = TokenExpectation::classify_char(bytes.get(self.position + 1).map(|b| *b as char));
+                if next_class == TokenExpectation::Dot && after_next_class == TokenExpectation::Digit {
+                    // '.' followed by a digit: consume it and the fractional digits.
+                    self.position += 1;
+                    while self.position < len && (bytes[self.position] as char).is_ascii_digit() {
+                        self.position += 1;
+                    }
+                }
+                // Any other next_class (Dot-not-followed-by-digit, Letter,
+                // Operator, Terminator) is not a valid numeric continuation —
+                // stop here and let the next `next_token` call classify it.
                 let num_str = &self.input[start..self.position];
                 let num = num_str.parse::<f64>().unwrap_or(0.0);
                 lex_debug!("[DEBUG][lexer] Returning Token::Number({})", num);

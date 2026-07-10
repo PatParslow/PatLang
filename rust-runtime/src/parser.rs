@@ -1,7 +1,7 @@
 //! Minimal Patlang parser (Rust)
 
 use crate::ast::{BinaryOperator, Expr, Stmt};
-use crate::lexer::{Lexer, LexerError, Token};
+use crate::lexer::{Lexer, LexerError, Token, TokenExpectation};
 
 #[derive(Debug)]
 pub enum ParserError {
@@ -965,8 +965,15 @@ impl<'a> Parser<'a> {
                     expr = Expr::Index { object: Box::new(expr), index: Box::new(index) };
                 }
                 Token::Dot => {
-                    // Only treat as member access if next token is an identifier; otherwise it's a terminator (e.g., facts)
-                    if let Token::Identifier(_) = self.peek {
+                    // Member access requires an identifier to follow; anything
+                    // else (e.g. end of a fact/sentence) means this '.' is a
+                    // terminator, not part of this expression. Expressed using
+                    // the same `TokenExpectation` vocabulary the lexer uses
+                    // internally to resolve the analogous decimal-point
+                    // ambiguity (see `TokenExpectation` in lexer.rs) — the
+                    // parser here declares "I expect a Letter-class token" and
+                    // checks the already-buffered lookahead against it.
+                    if TokenExpectation::classify_token(&self.peek) == TokenExpectation::Letter {
                         self.advance()?; // '.'
                         let prop = match &self.curr {
                             Token::Identifier(s) => s.clone(),

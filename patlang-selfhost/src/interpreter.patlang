@@ -1,0 +1,261 @@
+# Interpreter module: core execution logic for Patlang IR
+# Contract: ../contracts/interpreter_contract.patlang
+
+require 'set'
+
+module Interpreter
+  # Function table for user-defined functions (name -> {params, body})
+  @functions ||= {}
+  # Tracks loaded files to prevent duplicate includes
+  @loaded_files ||= Set.new
+
+  # Execute a list of IR instructions with an initial environment
+  # program: List[Instr] (IR), env: Env (Hash or custom)
+  # Returns: Value | RuntimeError
+  def run(program, env)
+    # Contract: requires program != null
+    return RuntimeError.new("Null program") if program.nil?
+    stack = []
+    # Scope management: clone env to avoid mutation
+    locals = env.clone || {}
+    begin
+      program.each do |instr|
+        case instr.op
+        when :FunctionDef
+          name = instr.args[0]
+          params = instr.args[1]
+          body = instr.args[2]
+          @functions[name] = { params: params, body: body }
+          next
+        when :Call
+          name = instr.args[0]
+          argc = instr.args[1]
+          args = stack.pop(argc)
+          if @functions.key?(name)
+            fn = @functions[name]
+            fn_locals = {}
+            fn.params.each_with_index { |param, i| fn_locals[param] = args[i] }
+            fn_stack = []
+            fn_body = fn.body
+            fn_body.each do |fn_instr|
+              case fn_instr.op
+              when :Return
+                stack.push(fn_stack.pop)
+                break
+              else
+                case fn_instr.op
+                when :Const
+                  fn_stack.push(fn_instr.args[0])
+                when :LoadLocal
+                  pname = fn_instr.args[0]
+                  fn_stack.push(fn_locals[pname])
+                when :BinOp
+                  op = fn_instr.args[0]
+                  right = fn_stack.pop
+                  left = fn_stack.pop
+                  fn_stack.push(apply_binop(op, left, right))
+                # ...existing code...
+                end
+              end
+            end
+            next
+          end
+        when :Const
+          stack.push(instr.args[0])
+        when :LoadLocal
+          name = instr.args[0]
+          if locals.key?(name)
+            stack.push(locals[name])
+          else
+            return RuntimeError.new("Undefined variable: #{name}")
+          end
+        when :Contract
+          next
+        when :Include
+          path = instr.args[0]
+          included_ir = load_file(path)
+          if included_ir.is_a?(RuntimeError)
+            return included_ir
+          end
+          result = run(included_ir, locals)
+          if result.is_a?(RuntimeError)
+            return result
+          end
+          next
+        when :StoreLocal
+          name = instr.args[0]
+          value = stack.pop
+          locals[name] = value
+        when :BinOp
+          op = instr.args[0]
+          right = stack.pop
+          left = stack.pop
+          begin
+            stack.push(apply_binop(op, left, right))
+          rescue => e
+            return RuntimeError.new("BinOp error: #{e.message}")
+          end
+        when :UnOp
+          op = instr.args[0]
+          operand = stack.pop
+          begin
+            stack.push(apply_unop(op, operand))
+          rescue => e
+            return RuntimeError.new("UnOp error: #{e.message}")
+          end
+        # --- Control flow ---
+        when :If
+          cond_code = instr.args[0]
+          then_code = instr.args[1]
+          else_code = instr.args[2]
+          cond_result = run(cond_code, locals)
+          if cond_result.is_a?(RuntimeError)
+            return cond_result
+          end
+          # If cond_result is truthy, run then_code, else else_code
+          if cond_result
+            result = run(then_code, locals)
+            return result if result.is_a?(RuntimeError)
+          else
+            result = run(else_code, locals)
+            return result if result.is_a?(RuntimeError)
+          end
+        when :While
+          cond_code = instr.args[0]
+          body_code = instr.args[1]
+          loop do
+            cond_result = run(cond_code, locals)
+            break if cond_result.is_a?(RuntimeError)
+            break unless cond_result
+            result = run(body_code, locals)
+            return result if result.is_a?(RuntimeError)
+          end
+        # --- Error handling ---
+        when :Throw
+          error = instr.args[0]
+          return RuntimeError.new("Throw: #{error}")
+        when :TryCatch
+          try_code = instr.args[0]
+          catch_var = instr.args[1]
+          catch_code = instr.args[2]
+          begin
+            result = run(try_code, locals)
+            if result.is_a?(RuntimeError)
+              # Bind error to catch_var and run catch_code
+              catch_env = locals.clone
+              catch_env[catch_var] = result
+              result2 = run(catch_code, catch_env)
+              return result2
+            else
+              return result
+            end
+          rescue => e
+            catch_env = locals.clone
+            catch_env[catch_var] = RuntimeError.new("TryCatch: #{e.message}")
+            result2 = run(catch_code, catch_env)
+            return result2
+          end
+  # Loads and parses the included file, ensuring each file is loaded only once per execution
+  def load_file(path)
+    @loaded_files ||= Set.new
+    abs_path = File.expand_path(path)
+    return nil if @loaded_files.include?(abs_path)
+    @loaded_files.add(abs_path)
+    begin
+      source = File.read(abs_path)
+    rescue => e
+      return RuntimeError.new("Failed to read included file: #{abs_path} (#{e.message})")
+    end
+
+    # Tokenize
+    tokens = Lexer.tokenize(source)
+    if tokens.is_a?(LexerError)
+      return RuntimeError.new("Lexer error in included file: #{abs_path} (#{tokens.message})")
+    end
+
+    # Parse
+    ast = Parser.parse(tokens)
+    if ast.is_a?(ParseError)
+      return RuntimeError.new("Parse error in included file: #{abs_path} (#{ast.message})")
+    end
+
+    # Compile
+    ir = Compiler.compile(ast)
+    if ir.is_a?(CompileError)
+      return RuntimeError.new("Compile error in included file: #{abs_path} (#{ir.message})")
+    end
+
+    ir
+  end
+          else
+            stack.push(result)
+          end
+        else
+          return RuntimeError.new("Unknown IR instruction: #{instr.op}")
+        end
+      end
+      # Contract: ensures (result is Value) xor (result is RuntimeError)
+      stack.empty? ? RuntimeError.new("No result on stack") : stack.last
+    rescue => e
+      RuntimeError.new("Interpreter error: #{e.message}")
+    end
+  end
+
+  # Dynamic dispatch with method_missing fallback
+  # Returns: Value | MethodMissing
+  def dispatch(receiver, method, args, env)
+    # Contract: ensures (result is Value) xor (result is MethodMissing)
+    if receiver.respond_to?(method)
+      begin
+        result = receiver.send(method, *args)
+        Value.new(result)
+      rescue => e
+        RuntimeError.new("Dispatch error: #{e.message}")
+      end
+    else
+      MethodMissing.new(receiver, method, args, env)
+    end
+  end
+
+  # Event hook invoked when a method is missing
+  # Returns: Value | HostFallback | NoHandler
+  def method_missing(receiver, method, args, env)
+    # Default: signal HostFallback for host bridge, else NoHandler
+    if HostBridge.supports(receiver.class, method)
+      HostFallback.new(receiver, method, args, env)
+    else
+      NoHandler.new(receiver, method, args, env)
+    end
+  end
+
+  private
+
+  def apply_binop(op, left, right)
+    case op
+    when :Add then left + right
+    when :Sub then left - right
+    when :Mul then left * right
+    when :Div then left / right
+    when :Mod then left % right
+    when :Eq  then left == right
+    when :Ne  then left != right
+    when :Lt  then left < right
+    when :Le  then left <= right
+    when :Gt  then left > right
+    when :Ge  then left >= right
+    when :And then left && right
+    when :Or  then left || right
+    else
+      raise "Unknown BinOp: #{op}"
+    end
+  end
+
+  def apply_unop(op, operand)
+    case op
+    when :Neg then -operand
+    when :Not then !operand
+    else
+      raise "Unknown UnOp: #{op}"
+    end
+  end
+end

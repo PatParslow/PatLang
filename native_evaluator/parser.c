@@ -79,6 +79,20 @@ int parse_patlang(const char* source) {
                 last = print_node;
             }
             printf("[DEBUG][parser] Added AST_PRINT node\n");
+        } else if (strncmp(line, "include ", 8) == 0) {
+            // Include statement
+            ast_node_t* include_node = (ast_node_t*)calloc(1, sizeof(ast_node_t));
+            include_node->type = AST_INCLUDE;
+            include_node->expr = parse_expression(line + 8);
+            // Add to AST list
+            if (!ast.head) {
+                ast.head = include_node;
+                last = include_node;
+            } else {
+                last->next = include_node;
+                last = include_node;
+            }
+            printf("[DEBUG][parser] Added AST_INCLUDE node\n");
         } else if (strncmp(line, "if ", 3) == 0) {
             ast_node_t* if_node = (ast_node_t*)calloc(1, sizeof(ast_node_t));
             if_node->type = AST_IF;

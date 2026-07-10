@@ -1,11 +1,7 @@
 #!/usr/bin/env ruby
 # Test runner to identify failing UnificationEngine tests
 
-require 'minitest/autorun'
-require 'minitest/reporters'
-
 # Set up basic reporting
-Minitest::Reporters.use! [Minitest::Reporters::SpecReporter.new(color: true)]
 
 # Set up load paths
 $LOAD_PATH.unshift(File.expand_path('src', __dir__))

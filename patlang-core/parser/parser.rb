@@ -1,868 +1,1130 @@
-require_relative '../lexer/token'
+# frozen_string_literal: true
+
+# Recursive Descent Parser for PatLang
+# Implements expectation-driven token resolution per SPECIFICATION.md
+
 require_relative '../ast/ast_nodes'
-require_relative '../lexer/ambiguous_token'
-require_relative '../exceptions'
-require_relative 'token_resolver'
-require_relative 'expression_parser'
-require_relative 'function_parser'
-require_relative 'control_flow_parser'
-require_relative 'type_constraint_parser'
-require_relative 'reasoning_parser_extensions'
-require_relative 'parser_timeout_protection'
-require_relative '../ast/enhanced_reasoning_nodes'
-require_relative '../object_model/event_system'
 
-# Parser class for parsing Patlang source code with modular architecture
-require_relative '../../ruby-host/bootstrap/hash_extensions'
-class Parser
-  include EventSystem::EventCapable
-  include ParserModules::TimeoutProtection
-  include ParserModules::ReasoningParserExtensions
-  attr_reader :current_token, :current_token_index, :collected_errors
-
-  def initialize(tokens_or_lexer)
-    # Initialize event system
-    initialize_event_system
-    
-    # Initialize error collection for comprehensive error recovery
-    @collected_errors = []
-    
-    # Handle both tokens array and lexer object
-    if tokens_or_lexer.is_a?(Lexer)
-      @tokens = tokens_or_lexer.tokenize
-    else
-      @tokens = tokens_or_lexer
-    end
-    @current_token_index = 0
-    @current_token = @tokens[@current_token_index]
-    
-    # Initialize specialized parsers
-    @token_resolver = ParserModules::TokenResolver.new(@tokens)
-    @expression_parser = ParserModules::ExpressionParser.new(self)
-    @function_parser = ParserModules::FunctionParser.new(self)
-    @control_flow_parser = ParserModules::ControlFlowParser.new(self)
-    @type_constraint_parser = ParserModules::TypeConstraintParser.new(self)
-  end
-
-  # Collect error information for comprehensive error reporting
-  def collect_error(error_info)
-    @collected_errors << error_info
-    # puts "[Parser ERROR COLLECTION] #{error_info[:message]} at position #{error_info[:position]}"
-  end
-
-  # Get all collected errors for comprehensive reporting
-  def get_all_errors
-    @collected_errors
-  end
-
-  # Check if any errors were collected during parsing
-  def has_errors?
-    !@collected_errors.empty?
-  end
-
-  def error(message = "Parse error")
-    if @current_token
-      raise ParseError.new(
-        "#{message} at token #{@current_token}",
-        line: @current_token.line,
-        column: @current_token.column,
-        position: @current_token.position,
-        token: @current_token
-      )
-    else
-      raise ParseError.new(message)
-    end
-  end
-  
-  # Raise RuntimeError for critical syntax errors that should not be recovered from
-  def syntax_error(message = "Syntax error")
-    if @current_token
-      formatted_message = "#{message} at line #{@current_token.line}, column #{@current_token.column}: [#{@current_token.type}:#{@current_token.value}] (position #{@current_token_index})"
-      raise RuntimeError, formatted_message
-    else
-      formatted_message = "#{message} at end of input (position #{@current_token_index})"
-      raise RuntimeError, formatted_message
-    end
-  end
-  
-  # Safe error method that returns an ErrorNode instead of raising
-  def safe_error(message = "Parse error")
-    ErrorNode.new(message)
-  end
-
-  def advance
-    @current_token_index += 1
-    if @current_token_index < @tokens.length
-      @current_token = @tokens[@current_token_index]
-    else
-      @current_token = nil
-    end
-  end
-
-  def eat(expected_type)
-    if @current_token && @current_token.type == expected_type
-      advance
-    else
-      error("Expected #{expected_type}, got #{@current_token&.type}")
-    end
-  end
-  
-  # Safe eat method that doesn't raise errors
-  def safe_eat(expected_type)
-    if @current_token && @current_token.type == expected_type
-      advance
-      true
-    else
-      false
-    end
-  end
-
-  def peek(offset = 1)
-    peek_index = @current_token_index + offset
-    if peek_index < @tokens.length
-      @tokens[peek_index]
-    else
-      nil
-    end
-  end
-
-  # Enhanced parse method with comprehensive timeout protection
-  def parse
-    with_parse_timeout(15.0, "main parse operation") do
-      @tokens = @token_resolver.resolve_all_ambiguous_tokens
-      @current_token_index = 0
-      @current_token = @tokens[0] if @tokens.length > 0
-      program
-    end
-  rescue EmergencyTimeout::TimeoutError => e
-    safe_error("Parser timeout: #{e.message}")
-  end
-
-  # Grammar: program → statement* with loop protection
-  def program
-    statements = []
-    circuit_breaker = create_circuit_breaker(1000)
-    
-    while @current_token && @current_token.type != :EOF
-      circuit_breaker.check_iteration(@current_token_index)
+module Patlang
+  module Parser
+    class ParseError < StandardError
+      attr_reader :token, :expected
       
-      # Store position before parsing statement
-      pre_statement_position = @current_token_index
-      
-      stmt = statement
-      statements << stmt if stmt
-      
-      # Critical protection: ensure position advances after each statement
-      if @current_token_index == pre_statement_position && @current_token
-        # puts "[Parser WARNING] Statement parsing did not advance token position, forcing advance"
-        advance # Force advancement to prevent infinite loop
+      def initialize(message, token: nil, expected: [])
+        super(message)
+        @token = token
+        @expected = expected
       end
     end
     
-    return statements.length == 1 ? statements[0] : BlockNode.new(statements)
-  rescue EmergencyTimeout::TimeoutError => e
-    safe_error("Program parsing timeout: #{e.message}")
-  end
-
-  # Grammar: statement → assignment | expression | function_definition | function_call | control_flow
-  def statement
-    return nil unless @current_token
-
-    case @current_token.type
-    when :MAKE
-      # CRITICAL FIX: Check for assignment BEFORE falling through to function definition
-      if peek(1)&.type == :ASSIGN || peek(1)&.type == :IS
-        # "make var = value" or "make var is value"
-        return parse_assignment
-      elsif peek(1)&.type == :IDENTIFIER && 
-            (peek(2)&.type == :ASSIGN || peek(2)&.type == :IS || 
-             peek(2)&.type == :NUMBER || peek(2)&.type == :STRING || 
-             peek(2)&.type == :IDENTIFIER || peek(2)&.type == :LPAREN ||
-             peek(2)&.type == :EOF || peek(2) == nil)
-        # "make var value" - elegant syntax without assignment operator
-        return parse_assignment
-      elsif (peek(1)&.type == :A && peek(1)&.value == "a" &&
-            peek(2)&.type == :FUNCTION) ||
-            (peek(1)&.type == :FUNCTION)
-        # This is a function definition: "make [a] function [called]..."
-        return @function_parser.parse_function_definition
-      else
-        # This is a standalone make variable reference
-        return expression
+    class Parser
+      def initialize(tokens)
+        @tokens = tokens
+        @current = 0
       end
-    when :CALL
-      return @function_parser.parse_function_call
-    when :IF
-      return @control_flow_parser.parse_if_statement
-    when :WHILE
-      return @control_flow_parser.parse_while_statement
-    when :RETURN
-      return @control_flow_parser.parse_return_statement
-    when :PRINT
-      return @control_flow_parser.parse_print_statement
-    when :REASONING
-      return parse_reasoning_mode
-    when :CONSTRAIN
-      return parse_constraint
-    when :GOAL
-      return parse_goal
-    when :ASSERT
-      return parse_assert
-    when :QUERY
-      return parse_query
-    when :QUERY_PREFIX
-      return parse_prolog_query
-    when :RULE
-      return parse_rule
-    when :FACT
-      return parse_fact
-    when :PURSUE
-      return parse_pursue
-    when :IDENTIFIER
-      # CRITICAL FIX: Check for type annotation and assignment BEFORE falling through to expression
-      if peek(1)&.type == :DOUBLE_COLON
-        return @type_constraint_parser.parse_type_annotation
-      elsif peek(1)&.type == :COLON
-        return @type_constraint_parser.parse_typed_assignment
-      elsif peek(1)&.type == :ASSIGN || peek(1)&.type == :IS
-        return parse_assignment
-      elsif is_property_assignment?
-        return parse_property_assignment
-      else
-        # This is a standalone expression - wrap it for auto-output
-        expr = expression
-        return expr.is_a?(ErrorNode) ? expr : AutoOutputNode.new(expr)
-      end
-    else
-      # This is a standalone expression - wrap it for auto-output
-      expr = expression
-      return expr.is_a?(ErrorNode) ? expr : AutoOutputNode.new(expr)
-    end
-  end
-
-  # Grammar: assignment → IDENTIFIER ('=' | 'is') expression | MAKE IDENTIFIER (('=' | 'is') | '') expression
-  def parse_assignment
-    begin
-      if @current_token.type == :MAKE
-        # Handle "make variable ..." patterns
-        eat(:MAKE)
-        
-        # Error recovery: check for missing identifier
-        if @current_token.nil? || @current_token.type != :IDENTIFIER
-          return safe_error("Expected identifier after 'make'")
+      
+      def parse
+        statements = []
+        until at_end? || current_token.type == :EOF
+          stmt = statement
+          statements << stmt if stmt
         end
-        
-        var_name = @current_token.value
-        eat(:IDENTIFIER)
-        
-        # MAKE can be followed by assignment operator OR directly by expression
-        if @current_token&.type == :ASSIGN || @current_token&.type == :IS
-          # "make y = 17" or "make y is 17" (though "make y is 17" is discouraged)
-          if @current_token.type == :ASSIGN
-            eat(:ASSIGN)
-          else
-            eat(:IS)
+        AST::ProgramNode.new(statements)
+      end
+      
+      private
+      
+      attr_reader :tokens, :current
+      
+      def current_token
+        @tokens[@current] || TokenType::EOF
+      end
+      
+      def peek_token(offset = 1)
+        @tokens[@current + offset] || TokenType::EOF
+      end
+      
+      def advance
+        @current += 1 unless at_end?
+        previous_token
+      end
+      
+      def previous_token
+        @tokens[@current - 1]
+      end
+      
+      def at_end?
+        @current >= @tokens.length || current_token.type == :EOF
+      end
+      
+      def check(type)
+        current_token.type == type
+      end
+      
+      def match(*types)
+        types.each do |type|
+          if check(type)
+            advance
+            return true
           end
         end
-        # If no assignment operator, proceed directly to expression: "make y 17"
-        
-        # Error recovery: check for missing value
-        if @current_token.nil?
-          return safe_error("Expected value after variable declaration")
-        end
-        
-        value = expression
-        return AssignmentNode.new(var_name, value || safe_error("Missing assignment value"))
-        
-      elsif @current_token.type == :IDENTIFIER
-        # Handle "variable is/= ..." patterns
-        var_name = @current_token.value
-        eat(:IDENTIFIER)
-        
-        # IDENTIFIER must be followed by assignment operator
-        if @current_token&.type == :ASSIGN
-          eat(:ASSIGN)
-        elsif @current_token&.type == :IS
-          eat(:IS)
+        false
+      end
+      
+      def consume(type, message = "Expected #{type}")
+        if check(type)
+          advance
         else
-          return safe_error("Expected '=' or 'is' after identifier for assignment")
+          raise ParseError.new(message, token: current_token, expected: [type])
         end
-        
-        # Error recovery: check for missing value
-        if @current_token.nil?
-          syntax_error("Expected value after assignment operator")
-        end
-        
-        value = expression
-        # Check if expression parsing failed with critical error
-        if value.is_a?(ErrorNode) && value.message.include?("Unexpected end of input")
-          syntax_error("Expected value after assignment operator")
-        end
-        return AssignmentNode.new(var_name, value || safe_error("Missing assignment value"))
-      else
-        return safe_error("Expected IDENTIFIER or MAKE for variable assignment")
-      end
-    rescue ParseError => e
-      return safe_error("Assignment parse error: #{e.message}")
-    end
-  end
-
-  # Check if current position looks like a property assignment: obj.prop = value
-  def is_property_assignment?
-    return false unless @current_token.type == :IDENTIFIER
-    return false unless peek(1)&.type == :DOT
-    return false unless peek(2)&.type == :IDENTIFIER
-    return peek(3)&.type == :ASSIGN || peek(3)&.type == :IS
-  end
-
-  # Parse property assignment: obj.prop = value
-  def parse_property_assignment
-    # Parse the object reference
-    object_name = @current_token.value
-    eat(:IDENTIFIER)
-    eat(:DOT)
-    
-    # Parse the property name
-    property_name = @current_token.value
-    eat(:IDENTIFIER)
-    
-    # Parse the assignment operator
-    if @current_token.type == :ASSIGN
-      eat(:ASSIGN)
-    elsif @current_token.type == :IS
-      eat(:IS)
-    else
-      error("Expected '=' or 'is' for property assignment")
-    end
-    
-    # Parse the value expression
-    value = expression
-    
-    # Create a PropertyAssignmentNode
-    return PropertyAssignmentNode.new(object_name, property_name, value)
-  end
-
-  # Delegate expression parsing to the specialized parser with error recovery
-  def expression
-    begin
-      @expression_parser.expression
-    rescue ParseError => e
-      safe_error("Expression parse error: #{e.message}")
-    end
-  end
-
-  # Delegate function call parsing to the specialized parser
-  def parse_function_call
-    @function_parser.parse_function_call
-  end
-
-  # Parse reasoning mode control: reasoning mode on/off
-  def parse_reasoning_mode
-    begin
-      eat(:REASONING)
-      
-      if @current_token.nil?
-        return safe_error("Expected 'mode' after 'reasoning'")
       end
       
-      eat(:MODE)
-      
-      if @current_token.nil?
-        return safe_error("Expected 'on' or 'off' after 'reasoning mode'")
-      end
-      
-      if @current_token.type == :ON
-        eat(:ON)
-        ReasoningModeNode.new(true)
-      elsif @current_token.type == :OFF
-        eat(:OFF)
-        ReasoningModeNode.new(false)
-      else
-        safe_error("Expected 'on' or 'off' after 'reasoning mode'")
-      end
-    rescue ParseError => e
-      safe_error("Reasoning mode parse error: #{e.message}")
-    end
-  end
-
-  # Parse constraint declaration: constrain x :: Number where x > 0
-  # Enhanced to support dotted expressions: constrain obj.field :: Type
-  def parse_constraint
-    begin
-      eat(:CONSTRAIN)
-      
-      if @current_token.nil?
-        return safe_error("Expected variable after 'constrain'")
-      end
-      
-      # Parse variable expression (can be simple identifier or dotted expression)
-      variable_expr = parse_constraint_variable
-      
-      # If parse_constraint_variable failed, return error
-      if variable_expr.nil?
-        return safe_error("Invalid constraint variable")
-      end
-      
-      if @current_token.nil? || @current_token.type != :DOUBLE_COLON
-        return safe_error("Expected '::' after constraint variable")
-      end
-      
-      eat(:DOUBLE_COLON)
-      
-      if @current_token.nil? || @current_token.type != :IDENTIFIER
-        return safe_error("Expected type after '::'")
-      end
-      
-      constraint_type = @current_token.value
-      eat(:IDENTIFIER)
-      
-      conditions = nil
-      if @current_token&.type == :WHERE
-        eat(:WHERE)
-        
-        if @current_token.nil?
-          return safe_error("Expected condition after 'where'")
-        end
-        
-        conditions = expression
-      end
-      
-      # Create TypeConstraintNode with proper parameters
-      TypeConstraintNode.new(variable_expr, constraint_type, nil, conditions)
-    rescue ParseError => e
-      safe_error("Constraint parse error: #{e.message}")
-    end
-  end
-
-  # Parse constraint variable which can be:
-  # - Simple identifier: x
-  # - Dotted expression: obj.field, user.name.length
-  def parse_constraint_variable
-    begin
-      if @current_token.nil? || @current_token.type != :IDENTIFIER
-        return nil # Signal error to caller
-      end
-      
-      # Start with base identifier
-      base = @current_token.value
-      eat(:IDENTIFIER)
-      
-      # Check for dot notation
-      if @current_token&.type == :DOT
-        # Build dotted expression string (keep as string for dotted expressions)
-        result = base
-        while @current_token&.type == :DOT
-          eat(:DOT)
-          
-          if @current_token.nil? || @current_token.type != :IDENTIFIER
-            return nil # Signal error to caller
+      def consume_expecting(types)
+        types.each do |type|
+          if check(type)
+            return advance
           end
-          
-          field = @current_token.value
-          eat(:IDENTIFIER)
-          result += ".#{field}"
         end
-        return result
-      else
-        # Return symbol for simple variable names
-        return base.to_sym
-      end
-    rescue ParseError => e
-      nil # Signal error to caller
-    end
-  end
-
-  # Parse goal declaration: goal find_answer { postcondition: answer > 0 }
-  def parse_goal
-    begin
-      eat(:GOAL)
-      
-      if @current_token.nil? || @current_token.type != :IDENTIFIER
-        return safe_error("Expected goal name after 'goal'")
+        raise ParseError.new(
+          "Expected one of #{types}, got #{current_token.type}",
+          token: current_token,
+          expected: types
+        )
       end
       
-      goal_name = @current_token.value
-      eat(:IDENTIFIER)
+      def expect_next(expectations)
+        expectations
+      end
       
-      parameters = []
-      if @current_token&.type == :LPAREN
-        eat(:LPAREN)
-        while @current_token&.type != :RPAREN
-          if @current_token.nil?
-            return safe_error("Incomplete goal parameters - missing closing parenthesis")
-          end
-          
-          if @current_token.type == :IDENTIFIER
-            parameters << @current_token.value
-            eat(:IDENTIFIER)
-            if @current_token&.type == :COMMA
-              eat(:COMMA)
-            end
+      # ============================================================
+      # Statement Parsing
+      # ============================================================
+      
+      def statement
+        return nil if match(:NEWLINE)
+        
+        case current_token.type
+        when :MAKE_KEYWORD
+          make_declaration
+        when :WHEN_KEYWORD
+          event_handler
+        when :IMPORT_KEYWORD
+          import_statement
+        when :IF_KW
+          if_statement
+        when :WHILE_KEYWORD
+          while_statement
+        when :FOR_KEYWORD
+          for_statement
+        when :ACTIVATE_KEYWORD
+          activate_statement
+        when :QUERY_KEYWORD
+          query_statement
+        when :ASSERT_KEYWORD
+          assert_statement
+        when :SELECT_KEYWORD
+          select_statement
+        when :RETURN_KEYWORD
+          return_statement
+        when :IDENTIFIER
+          if peek_token.type == :IS_KEYWORD || peek_token.type == :BECOMES_KEYWORD
+            assignment_or_mutation
           else
-            break
+            expression_statement
           end
-        end
-        
-        if @current_token&.type == :RPAREN
-          eat(:RPAREN)
         else
-          return safe_error("Missing closing parenthesis in goal parameters")
+          expression_statement
         end
       end
       
-      # Initialize goal attributes matching GoalNode constructor
-      preconditions = []
-      postconditions = []
-      strategies = []
+      # ============================================================
+      # Declaration Parsing
+      # ============================================================
       
-      if @current_token&.type == :LBRACE
-        eat(:LBRACE)
+      def make_declaration
+        start_token = consume(:MAKE_KEYWORD)
         
-        while @current_token&.type != :RBRACE
-          if @current_token.nil?
-            return safe_error("Incomplete goal body - missing closing brace")
-          end
-          
-          case @current_token.type
-          when :PRECONDITION
-            eat(:PRECONDITION)
-            if safe_eat(:COLON)
-              precondition_expr = expression
-              preconditions << precondition_expr if precondition_expr
-            else
-              return safe_error("Expected ':' after precondition")
-            end
-          when :POSTCONDITION
-            eat(:POSTCONDITION)
-            if safe_eat(:COLON)
-              postcondition_expr = expression
-              postconditions << postcondition_expr if postcondition_expr
-            else
-              return safe_error("Expected ':' after postcondition")
-            end
-          when :STRATEGY
-            eat(:STRATEGY)
-            if safe_eat(:COLON) && @current_token&.type == :IDENTIFIER
-              strategies << @current_token.value.to_sym
-              eat(:IDENTIFIER)
-            else
-              return safe_error("Expected strategy name after 'strategy:'")
-            end
-          when :IDENTIFIER
-            # Handle keywords as identifiers for extended goal syntax
-            keyword = @current_token.value.to_s
-            eat(:IDENTIFIER)
-            
-            if !safe_eat(:COLON)
-              return safe_error("Expected ':' after goal keyword '#{keyword}'")
-            end
-            
-            case keyword
-            when "strategies"
-              if @current_token&.type == :LBRACKET
-                parsed_strategies = parse_array_literal || []
-                strategies.concat(parsed_strategies)
-              elsif @current_token&.type == :STRING
-                strategies << @current_token.value.to_sym
-                eat(:STRING)
+        # Expect ARTICLE ('a' or 'an')
+        consume_expecting([:ARTICLE])
+        
+        # Expect declaration type
+        decl_type = consume_expecting([
+          :FUNCTION_KW, :CLASS_KW, :TEMPLATE_KW, :GOAL_KW, :LIST_KW, :TYPE_KW, :DECL_TYPE
+        ])
+        
+        # Expect CALLED
+        consume(:CALLED)
+        
+        # Expect name (IDENTIFIER)
+        name_token = consume(:IDENTIFIER)
+        name = name_token.value
+        
+        case decl_type.value
+        when 'function'
+          parse_function_declaration(name, start_token)
+        when 'class', 'template'
+          body = block
+          parse_template(name, body, start_token, decl_type.value == 'class')
+        when 'goal'
+          parse_goal(name, start_token)
+        when 'list'
+          body = block
+          initialize_list(name, body, start_token)
+        when 'number', 'text', 'boolean'
+          body = block
+          initialize_typed_var(name, decl_type.value, body, start_token)
+        else
+          raise ParseError.new("Unknown declaration type: #{decl_type.value}")
+        end
+      end
+      
+      def parse_function_declaration(name, start_token)
+        params = []
+        return_type = nil
+        preconditions = []
+        postconditions = []
+        body_statements = []
+        
+        if match(:BLOCK_START)
+          until match(:BLOCK_END) || at_end?
+            if match(:TAKES_KEYWORD)
+              consume(:COLON)
+              until match(:NEWLINE) || check(:BLOCK_END) || at_end?
+                param_name = consume(:IDENTIFIER).value
+                param_type = nil
+                if match(:MINUS)
+                  param_type = consume_expecting([:TYPE_KW, :IDENTIFIER]).value
+                end
+                params << AST::ParameterNode.new(param_name, type: param_type)
+                match(:COMMA)
+              end
+            elsif match(:RETURNS_KEYWORD)
+              consume(:COLON)
+              # Check if next token is a type keyword or identifier (type annotation)
+              # or an expression (including block expressions)
+              next_token = peek_token
+              expression_starters = [:PLUS, :MINUS, :STAR, :SLASH, :LPAREN, :LBRACKET, :BLOCK_START, :INTEGER_LITERAL, :FLOAT_LITERAL, :STRING_LITERAL]
+              # Block start (BLOCK_START) should be treated as expression, not type
+              if check(:TYPE_KW) || (check(:IDENTIFIER) && !expression_starters.include?(next_token.type))
+                return_type = parse_type_annotation
               else
-                return safe_error("Expected array or string for strategies")
+                # Parse as return expression
+                body_statements << AST::ReturnStatementNode.new(expression)
+              end
+              match(:NEWLINE)
+            elsif match(:REQUIRES_KEYWORD)
+              consume(:COLON)
+              until match(:NEWLINE) || check(:BLOCK_END) || at_end?
+                preconditions << expression
+                match(:COMMA)
+              end
+            elsif match(:ENSURES_KEYWORD)
+              consume(:COLON)
+              until match(:NEWLINE) || check(:BLOCK_END) || at_end?
+                postconditions << expression
+                match(:COMMA)
               end
             else
-              # Skip unknown keywords gracefully
-              expression # Parse and ignore unknown expressions
+              stmt = statement
+              body_statements << stmt if stmt
+              match(:NEWLINE)
+            end
+          end
+        elsif match(:BEGIN_KEYWORD)
+          until match(:END_KEYWORD) || at_end?
+            stmt = statement
+            body_statements << stmt if stmt
+            match(:NEWLINE)
+          end
+        else
+          body_statements << expression_statement
+        end
+        
+        AST::FunctionDeclarationNode.new(
+          name,
+          parameters: params,
+          return_type: return_type,
+          preconditions: preconditions,
+          postconditions: postconditions,
+          body: AST::BlockNode.new(body_statements),
+          line: start_token.line,
+          column: start_token.column
+        )
+      end
+      
+      def parse_template(name, body, start_token, is_class)
+        parent = nil
+        fields = []
+        invariants = []
+        methods = []
+        
+        body.statements.each do |stmt|
+          if stmt.is_a?(AST::ExpressionStatementNode)
+            expr = stmt.expression
+            if expr.is_a?(AST::CallNode) && expr.callee.is_a?(AST::IdentifierNode)
+              case expr.callee.name
+              when 'inherits'
+                parent = expr.arguments.first
+              when 'has'
+                expr.arguments.each do |arg|
+                  fields << parse_field(arg) if arg.is_a?(AST::CallNode)
+                end
+              when 'maintains'
+                invariants += expr.arguments
+              end
+            else
+              methods << stmt if stmt.is_a?(AST::FunctionDeclarationNode)
+            end
+          end
+        end
+        
+        AST::TemplateDeclarationNode.new(
+          name,
+          parent: parent,
+          fields: fields,
+          invariants: invariants,
+          methods: methods,
+          line: start_token.line,
+          column: start_token.column
+        )
+      end
+      
+      def parse_goal(name, start_token)
+        requirements = []
+        achievement_conditions = []
+        goal_body = nil
+        
+        consume(:BLOCK_START)
+        until match(:BLOCK_END) || at_end?
+          match(:NEWLINE)
+          
+          if match(:REQUIRES_KEYWORD)
+            consume(:COLON)
+            until match(:NEWLINE) || check(:BLOCK_END) || at_end?
+              req_name = consume(:IDENTIFIER).value
+              requirements << AST::RequirementNode.new(req_name)
+              match(:COMMA)
+            end
+          elsif match(:ACHIEVED_KEYWORD)
+            if match(:WHEN_KEYWORD)
+              consume(:COLON)
+            else
+              consume(:COLON)
+            end
+            until match(:NEWLINE) || check(:BLOCK_END) || at_end?
+              achievement_conditions << expression
+              match(:COMMA)
+            end
+          elsif match(:RUNS_KEYWORD)
+            consume(:COLON)
+            if match(:BLOCK_START)
+              body_statements = []
+              until match(:BLOCK_END) || at_end?
+                body_statements << statement
+                match(:NEWLINE)
+              end
+              goal_body = AST::BlockNode.new(body_statements)
+            else
+              goal_body = expression
+            end
+            match(:NEWLINE)
+          else
+            match(:NEWLINE)
+          end
+        end
+        
+        AST::GoalDeclarationNode.new(
+          name,
+          requirements: requirements,
+          achievement_conditions: achievement_conditions,
+          body: goal_body,
+          line: start_token.line,
+          column: start_token.column
+        )
+      end
+      
+      def parse_field(call_node)
+        name = call_node.callee.name if call_node.callee.is_a?(AST::IdentifierNode)
+        AST::FieldNode.new(name, line: call_node.line, column: call_node.column)
+      end
+      
+      def parse_requirement(call_node)
+        name = call_node.callee.name if call_node.callee.is_a?(AST::IdentifierNode)
+        AST::RequirementNode.new(name, line: call_node.line, column: call_node.column)
+      end
+      
+      def initialize_list(name, body, start_token)
+        elements = []
+        body.statements.each do |stmt|
+          if stmt.is_a?(AST::ExpressionStatementNode)
+            elements << stmt.expression
+          end
+        end
+        
+        AST::VariableDeclarationNode.new(
+          name,
+          initializer: AST::ListLiteralNode.new(elements, line: start_token.line, column: start_token.column),
+          line: start_token.line,
+          column: start_token.column
+        )
+      end
+      
+      def initialize_typed_var(name, type_name, body, start_token)
+        initializer = nil
+        body.statements.each do |stmt|
+          if stmt.is_a?(AST::ExpressionStatementNode)
+            initializer = stmt.expression
+            break
+          end
+        end
+        
+        AST::VariableDeclarationNode.new(
+          name,
+          type: AST::TypeAnnotationNode.new(type_name, line: start_token.line, column: start_token.column),
+          initializer: initializer,
+          line: start_token.line,
+          column: start_token.column
+        )
+      end
+      
+      def event_handler
+        start_token = consume(:WHEN_KEYWORD)
+        
+        event_name_token = consume(:IDENTIFIER)
+        event_name = event_name_token.value
+        
+        event_action = nil
+        if match(:COLON)
+          action_token = consume_expecting([:EVENT_ACTION_KW, :IDENTIFIER])
+          event_action = action_token.value.to_sym
+        end
+        
+        body = block
+        
+        AST::EventHandlerNode.new(
+          event_name,
+          event_action: event_action,
+          body: body,
+          line: start_token.line,
+          column: start_token.column
+        )
+      end
+      
+      def if_statement
+        start_token = consume(:IF_KW)
+        condition = expression
+        match(:THEN_KEYWORD)
+        then_branch = block
+        
+        elsif_branches = []
+        while match(:ELSIF_KEYWORD)
+          elsif_condition = expression
+          match(:THEN_KEYWORD)
+          elsif_branch = block
+          elsif_branches << [elsif_condition, elsif_branch]
+        end
+        
+        else_branch = nil
+        if match(:ELSE_KEYWORD)
+          else_branch = block
+        end
+        
+        consume(:END_KEYWORD)
+        
+        AST::IfStatementNode.new(
+          condition,
+          then_branch,
+          elsif_branches: elsif_branches,
+          else_branch: else_branch,
+          line: start_token.line,
+          column: start_token.column
+        )
+      end
+      
+      def while_statement
+        start_token = consume(:WHILE_KEYWORD)
+        condition = expression
+        consume(:DO_KEYWORD)
+        body = block
+        consume(:END_KEYWORD)
+        
+        AST::WhileStatementNode.new(
+          condition,
+          body,
+          line: start_token.line,
+          column: start_token.column
+        )
+      end
+      
+      def for_statement
+        start_token = consume(:FOR_KEYWORD)
+        
+        variable_token = consume(:IDENTIFIER)
+        variable = variable_token.value
+        
+        consume(:IN_KEYWORD)
+        
+        is_range = false
+        range_start = nil
+        range_end = nil
+        iterable = nil
+        
+        if match(:RANGE_KEYWORD)
+          is_range = true
+          consume(:LPAREN)
+          range_start = expression
+          consume(:COMMA)
+          range_end = expression
+          consume(:RPAREN)
+        else
+          iterable = expression
+        end
+        
+        consume(:DO_KEYWORD)
+        body = block
+        consume(:END_KEYWORD)
+        
+        AST::ForStatementNode.new(
+          variable,
+          iterable,
+          body,
+          is_range: is_range,
+          range_start: range_start,
+          range_end: range_end,
+          line: start_token.line,
+          column: start_token.column
+        )
+      end
+      
+      def assignment_or_mutation
+        name_token = consume(:IDENTIFIER)
+        name = name_token.value
+        
+        if match(:IS_KEYWORD)
+          value = expression
+          AST::AssignmentNode.new(
+            name,
+            value,
+            line: name_token.line,
+            column: name_token.column
+          )
+        elsif match(:BECOMES_KEYWORD)
+          value = expression
+          AST::MutationNode.new(
+            name,
+            value,
+            line: name_token.line,
+            column: name_token.column
+          )
+        else
+          raise ParseError.new("Expected 'is' or 'becomes' after identifier")
+        end
+      end
+      
+      def activate_statement
+        start_token = consume(:ACTIVATE_KEYWORD)
+        goal_name_token = consume(:IDENTIFIER)
+        goal_name = goal_name_token.value
+        
+        arguments = nil
+        if match(:WITH_KEYWORD)
+          arguments = expression
+        end
+        
+        AST::ActivateStatementNode.new(
+          goal_name,
+          arguments: arguments,
+          line: start_token.line,
+          column: start_token.column
+        )
+      end
+      
+      def query_statement
+        start_token = consume(:QUERY_KEYWORD)
+        name_token = consume(:IDENTIFIER)
+        name = name_token.value
+        body = block
+        consume(:END_KEYWORD)
+        
+        AST::QueryStatementNode.new(
+          name,
+          body,
+          line: start_token.line,
+          column: start_token.column
+        )
+      end
+      
+      def assert_statement
+        start_token = consume(:ASSERT_KEYWORD)
+        
+        predicate_token = consume(:IDENTIFIER)
+        predicate = predicate_token.value
+        
+        arguments = []
+        if match(:LPAREN)
+          until match(:RPAREN) || at_end?
+            arguments << expression
+            match(:COMMA)
+          end
+        end
+        
+        AST::AssertStatementNode.new(
+          predicate,
+          arguments: arguments,
+          line: start_token.line,
+          column: start_token.column
+        )
+      end
+      
+      def select_statement
+        select_node = parse_select
+        AST::SelectStatementNode.new(select_node)
+      end
+      
+      def import_statement
+        start_token = consume(:IMPORT_KEYWORD)
+        # Expect string literal for module path
+        path_token = consume(:STRING_LITERAL)
+        path = path_token.value
+        
+        # For now, just create a simple node - import is handled at load time
+        AST::ImportStatementNode.new(path, line: start_token.line, column: start_token.column)
+      end
+      
+      def return_statement
+        start_token = consume(:RETURN_KEYWORD)
+        value = nil
+        
+        unless check(:NEWLINE) || check(:END_KEYWORD) || check(:EOF)
+          value = expression
+        end
+        
+        AST::ReturnStatementNode.new(
+          value,
+          line: start_token.line,
+          column: start_token.column
+        )
+      end
+      
+      def expression_statement
+        expr = expression
+        AST::ExpressionStatementNode.new(expr)
+      end
+      
+      def block
+        statements = []
+        
+        if match(:BLOCK_START)
+          until match(:BLOCK_END) || at_end?
+            stmt = statement
+            statements << stmt if stmt
+            match(:NEWLINE)
+          end
+          # Consume optional trailing newline after block end
+          match(:NEWLINE)
+        elsif match(:BEGIN_KEYWORD)
+          until match(:END_KEYWORD) || at_end?
+            stmt = statement
+            statements << stmt if stmt
+            match(:NEWLINE)
+          end
+        else
+          stmt = statement
+          statements << stmt if stmt
+        end
+        
+        AST::BlockNode.new(statements)
+      end
+      
+      def expression
+        logical_or
+      end
+      
+      def logical_or
+        left = logical_and
+        while match(:OR_KEYWORD)
+          operator = previous_token
+          right = logical_and
+          left = AST::BinaryOpNode.new(left, operator.value, right, line: operator.line, column: operator.column)
+        end
+        left
+      end
+      
+      def logical_and
+        left = equality
+        while match(:AND_KEYWORD)
+          operator = previous_token
+          right = equality
+          left = AST::BinaryOpNode.new(left, operator.value, right, line: operator.line, column: operator.column)
+        end
+        left
+      end
+      
+      def equality
+        left = comparison
+        while match(:IS_KEYWORD, :IS_NOT_KEYWORD, :EQ, :NEQ)
+          operator = previous_token
+          right = comparison
+          left = AST::BinaryOpNode.new(left, operator.value, right, line: operator.line, column: operator.column)
+        end
+        left
+      end
+      
+      def comparison
+        left = additive
+        while match(:LT, :GT, :LTE, :GTE)
+          operator = previous_token
+          right = additive
+          left = AST::BinaryOpNode.new(left, operator.value, right, line: operator.line, column: operator.column)
+        end
+        left
+      end
+      
+      def additive
+        left = multiplicative
+        while match(:PLUS, :MINUS)
+          operator = previous_token
+          right = multiplicative
+          left = AST::BinaryOpNode.new(left, operator.value, right, line: operator.line, column: operator.column)
+        end
+        left
+      end
+      
+      def multiplicative
+        left = unary
+        while match(:STAR, :SLASH, :PERCENT)
+          operator = previous_token
+          right = unary
+          left = AST::BinaryOpNode.new(left, operator.value, right, line: operator.line, column: operator.column)
+        end
+        left
+      end
+      
+      def unary
+        if match(:NOT_KEYWORD, :MINUS)
+          operator = previous_token
+          operand = unary
+          return AST::UnaryOpNode.new(operator.value, operand, line: operator.line, column: operator.column)
+        end
+        parse_postfix
+      end
+      
+      def primary
+        case current_token.type
+        when :INTEGER_LITERAL
+          token = advance
+          AST::IntegerLiteralNode.new(token.value, line: token.line, column: token.column)
+        when :FLOAT_LITERAL
+          token = advance
+          AST::FloatLiteralNode.new(token.value, line: token.line, column: token.column)
+        when :STRING_LITERAL
+          token = advance
+          AST::StringLiteralNode.new(token.value, line: token.line, column: token.column)
+        when :TRUE_KEYWORD
+          token = advance
+          AST::BooleanLiteralNode.new(true, line: token.line, column: token.column)
+        when :FALSE_KEYWORD
+          token = advance
+          AST::BooleanLiteralNode.new(false, line: token.line, column: token.column)
+        when :NIL_KEYWORD
+          token = advance
+          AST::NilLiteralNode.new(line: token.line, column: token.column)
+        when :IDENTIFIER
+          parse_identifier_or_call
+        when :AND_KEYWORD, :OR_KEYWORD, :NOT_KEYWORD, :RANGE_KEYWORD
+          # Allow logical keywords as function names when followed by (
+          if peek_token.type == :LPAREN
+            parse_identifier_or_call
+          else
+            raise ParseError.new("Unexpected token in expression: #{current_token.type}", token: current_token)
+          end
+        when :ASYNC_KEYWORD
+          parse_async_expression
+        when :AWAIT_KEYWORD
+          parse_await_expression
+        when :CHANNEL_KEYWORD
+          parse_channel_create
+        when :ACTOR_KEYWORD
+          parse_actor_create
+        when :RECEIVE_KEYWORD
+          parse_channel_receive
+        when :SELECT_KEYWORD
+          parse_select
+        when :MUTEX_KEYWORD
+          parse_mutex_create
+        when :LOCK_KEYWORD
+          parse_lock
+        when :UNLOCK_KEYWORD
+          parse_unlock
+        when :LPAREN
+          parse_paren_or_lambda
+        when :BLOCK_PARAM_START
+          parse_lambda
+        when :BLOCK_START
+          if peek_is_takes_or_returns
+            parse_lambda_expression
+          else
+            parse_block_expression
+          end
+        when :LBRACKET
+          parse_list_literal
+        else
+          raise ParseError.new("Unexpected token in expression: #{current_token.type}", token: current_token)
+        end
+      end
+      
+      def parse_postfix
+        # Parse primary then handle member access (dot notation) and call chaining
+        node = primary
+        
+        while true
+          if match(:DOT)
+            # Member access: obj.method or obj.property
+            member_token = consume(:IDENTIFIER)
+            member_name = member_token.value
+            
+            # Create member access node
+            member_access = AST::MemberAccessNode.new(
+              node,
+              member_name,
+              line: member_token.line,
+              column: member_token.column
+            )
+            
+            if match(:LPAREN)
+              # Method call: obj.method(args)
+              arguments = []
+              until match(:RPAREN) || at_end?
+                arguments << expression
+                match(:COMMA)
+              end
+              node = AST::CallNode.new(
+                member_access,
+                arguments: arguments,
+                line: member_token.line,
+                column: member_token.column
+              )
+            else
+              # Property access: obj.property
+              node = member_access
             end
           else
             break
           end
-          
-          if @current_token&.type == :COMMA
-            eat(:COMMA)
+        end
+        
+        node
+      end
+      
+      def parse_block_expression
+        # Check if this looks like an object literal (key: value pairs) BEFORE consuming BLOCK_START
+        if is_object_literal?
+          return parse_object_literal
+        end
+        
+        # Otherwise parse as regular block expression - block() will consume BLOCK_START
+        body = block
+        body
+      end
+      
+      def is_object_literal?
+        # Current position is at BLOCK_START (not yet consumed)
+        saved_idx = @current
+        
+        # Skip BLOCK_START
+        advance
+        
+        # Skip whitespace/newlines
+        while current_token.type == :NEWLINE
+          advance
+        end
+        
+        result = false
+        if current_token.type == :IDENTIFIER || current_token.type == :STRING_LITERAL
+          peek_idx = @current + 1
+          while peek_idx < @tokens.length && @tokens[peek_idx].type == :NEWLINE
+            peek_idx += 1
+          end
+          if peek_idx < @tokens.length && @tokens[peek_idx].type == :COLON
+            result = true
           end
         end
         
-        if @current_token&.type == :RBRACE
-          eat(:RBRACE)
+        @current = saved_idx
+        result
+      end
+      
+      def parse_object_literal
+        consume(:BLOCK_START)
+        obj_pairs = []
+        
+        until at_end?
+          match(:NEWLINE)
+          
+          if check(:BLOCK_END)
+            break
+          end
+          
+          if (check(:IDENTIFIER) || check(:STRING_LITERAL)) && peek_token.type == :COLON
+            key_token = consume_expecting([:IDENTIFIER, :STRING_LITERAL])
+            key = key_token.value
+            consume(:COLON)
+            value = expression
+            obj_pairs << AST::KeyValuePairNode.new(key, value)
+            match(:COMMA)
+          else
+            return parse_block_expression_fallback
+          end
+        end
+        
+        consume(:BLOCK_END)
+        AST::ObjectLiteralNode.new(obj_pairs)
+      end
+      
+      def parse_block_expression_fallback
+        consume(:BLOCK_END)
+        AST::ObjectLiteralNode.new([])
+      end
+      
+      def peek_is_takes_or_returns
+        saved_idx = @current
+        saved_token = @tokens[@current]
+        
+        advance
+        while current_token.type == :NEWLINE
+          advance
+        end
+        
+        result = current_token.type == :TAKES_KEYWORD || current_token.type == :RETURNS_KEYWORD
+        
+        @current = saved_idx
+        @tokens[saved_idx] = saved_token
+        result
+      end
+      
+      def parse_lambda_expression
+        consume(:BLOCK_START)
+        
+        params = []
+        return_type = nil
+        preconditions = []
+        postconditions = []
+        body_statements = []
+        
+        until match(:BLOCK_END) || at_end?
+          if match(:TAKES_KEYWORD)
+            consume(:COLON)
+            until match(:NEWLINE) || check(:BLOCK_END) || at_end?
+              param_name = consume(:IDENTIFIER).value
+              param_type = nil
+              if match(:MINUS)
+                param_type = consume_expecting([:TYPE_KW, :IDENTIFIER]).value
+              end
+              params << AST::ParameterNode.new(param_name, type: param_type)
+              match(:COMMA)
+            end
+          elsif match(:RETURNS_KEYWORD)
+            consume(:COLON)
+            if check(:TYPE_KW)
+              return_type = parse_type_annotation
+            else
+              body_statements << AST::ReturnStatementNode.new(expression)
+            end
+            match(:NEWLINE)
+          elsif match(:REQUIRES_KEYWORD)
+            consume(:COLON)
+            until match(:NEWLINE) || check(:BLOCK_END) || at_end?
+              preconditions << expression
+              match(:COMMA)
+            end
+          elsif match(:ENSURES_KEYWORD)
+            consume(:COLON)
+            until match(:NEWLINE) || check(:BLOCK_END) || at_end?
+              postconditions << expression
+              match(:COMMA)
+            end
+          else
+            body_statements << statement
+            match(:NEWLINE)
+          end
+        end
+        
+        AST::LambdaNode.new(params, AST::BlockNode.new(body_statements))
+      end
+      
+      def parse_identifier_or_call
+        # Handle both identifiers and keywords that can be function names
+        if current_token.type == :IDENTIFIER
+          name_token = consume(:IDENTIFIER)
         else
-          return safe_error("Missing closing brace in goal body")
+          # Allow keywords like and, or, not, range as function names
+          name_token = consume_expecting([:AND_KEYWORD, :OR_KEYWORD, :NOT_KEYWORD, :RANGE_KEYWORD])
         end
-      end
-      
-      # Create GoalNode with description as first parameter to match constructor
-      GoalNode.new(goal_name, preconditions, postconditions, strategies)
-    rescue ParseError => e
-      safe_error("Goal parse error: #{e.message}")
-    end
-  end
-
-  # Helper method to parse array literals like [item1, item2, item3]
-  def parse_array_literal
-    begin
-      array = []
-      eat(:LBRACKET)
-      
-      while @current_token&.type != :RBRACKET
-        if @current_token.nil?
-          return nil # Signal error to caller
-        end
+        name = name_token.value
         
-        if @current_token.type == :IDENTIFIER
-          array << @current_token.value.to_sym
-          eat(:IDENTIFIER)
-        elsif @current_token.type == :STRING
-          array << @current_token.value
-          eat(:STRING)
+        if match(:LPAREN)
+          arguments = []
+          until match(:RPAREN) || at_end?
+            arguments << expression
+            match(:COMMA)
+          end
+          AST::CallNode.new(
+            AST::IdentifierNode.new(name, line: name_token.line, column: name_token.column),
+            arguments: arguments,
+            line: name_token.line,
+            column: name_token.column
+          )
         else
-          return nil # Signal error to caller
-        end
-        
-        if @current_token&.type == :COMMA
-          eat(:COMMA)
+          AST::IdentifierNode.new(name, line: name_token.line, column: name_token.column)
         end
       end
       
-      if @current_token&.type == :RBRACKET
-        eat(:RBRACKET)
-      else
-        return nil # Signal error to caller
-      end
-      
-      array
-    rescue ParseError => e
-      nil # Signal error to caller
-    end
-  end
-
-  # Helper method to parse hash literals like {key: value, key2: value2}
-  def parse_hash_literal
-    begin
-      hash = {}
-      eat(:LBRACE)
-      
-      while @current_token&.type != :RBRACE
-        if @current_token.nil?
-          return nil # Signal error to caller
-        end
+      def parse_paren_or_lambda
+        consume(:LPAREN)
         
-        # Parse key
-        if @current_token.type == :IDENTIFIER
-          key = @current_token.value
-          eat(:IDENTIFIER)
+        if current_token.type == :BLOCK_PARAM_START
+          lambda_node = parse_lambda
+          consume(:RPAREN)
+          lambda_node
         else
-          return nil # Signal error to caller
-        end
-        
-        if !safe_eat(:COLON)
-          return nil # Signal error to caller
-        end
-        
-        # Parse value
-        if @current_token&.type == :STRING
-          value = @current_token.value
-          eat(:STRING)
-        elsif @current_token&.type == :IDENTIFIER
-          value = @current_token.value
-          eat(:IDENTIFIER)
-        else
-          return nil # Signal error to caller
-        end
-        
-        hash[key.to_sym] = value
-        
-        if @current_token&.type == :COMMA
-          eat(:COMMA)
+          expr = expression
+          consume(:RPAREN)
+          AST::ParenExpressionNode.new(expr)
         end
       end
       
-      if @current_token&.type == :RBRACE
-        eat(:RBRACE)
-      else
-        return nil # Signal error to caller
-      end
-      
-      hash
-    rescue ParseError => e
-      nil # Signal error to caller
-    end
-  end
-
-  # Parse assert statement: assert fact(likes(alice, bob))
-  def parse_assert
-    begin
-      eat(:ASSERT)
-      
-      if @current_token.nil?
-        return safe_error("Expected expression after 'assert'")
-      end
-      
-      fact = expression
-      AssertNode.new(fact || safe_error("Missing assertion expression"))
-    rescue ParseError => e
-      safe_error("Assert parse error: #{e.message}")
-    end
-  end
-
-  # Parse query: query likes(X, bob)
-  def parse_query
-    begin
-      eat(:QUERY)
-      
-      if @current_token.nil?
-        return safe_error("Expected pattern after 'query'")
-      end
-      
-      pattern = expression
-      QueryNode.new(pattern || safe_error("Missing query pattern"))
-    rescue ParseError => e
-      safe_error("Query parse error: #{e.message}")
-    end
-  end
-
-  # Parse rule definition: rule head if body OR rule head :- body
-  def parse_rule
-    begin
-      eat(:RULE)
-      
-      if @current_token.nil?
-        return safe_error("Expected rule head after 'rule'")
-      end
-      
-      head = expression
-      
-      # Support both "if" and ":-" syntax
-      if @current_token&.type == :IF
-        eat(:IF)
+      def parse_lambda
+        consume(:BLOCK_PARAM_START)
         
-        if @current_token.nil?
-          return safe_error("Expected rule body after 'if'")
+        parameters = []
+        until match(:BLOCK_PARAM_END) || at_end?
+          param_token = consume(:IDENTIFIER)
+          parameters << AST::ParameterNode.new(param_token.value, line: param_token.line, column: param_token.column)
+          match(:COMMA)
         end
         
+        body = block
+        
+        AST::LambdaNode.new(parameters, body)
+      end
+      
+      def parse_lambda
+        consume(:BLOCK_PARAM_START)
+        
+        parameters = []
+        until match(:BLOCK_PARAM_END) || at_end?
+          param_token = consume(:IDENTIFIER)
+          parameters << AST::ParameterNode.new(param_token.value, line: param_token.line, column: param_token.column)
+          match(:COMMA)
+        end
+        
+        body = block
+        
+        AST::LambdaNode.new(parameters, body)
+      end
+      
+      def parse_async_expression
+        consume(:ASYNC_KEYWORD)
         body = expression
-        LogicRuleNode.new(head || safe_error("Missing rule head"), body || safe_error("Missing rule body"))
-      elsif @current_token&.type == :COLON && peek(1)&.type == :MINUS
-        eat(:COLON)
-        eat(:MINUS)
-        
-        if @current_token.nil?
-          return safe_error("Expected rule body after ':-'")
+        AST::AsyncExpressionNode.new(body)
+      end
+      
+      def parse_await_expression
+        consume(:AWAIT_KEYWORD)
+        expr = expression
+        AST::AwaitExpressionNode.new(expr)
+      end
+      
+      def parse_channel_create
+        consume(:CHANNEL_KEYWORD)
+        buffer_size = nil
+        if match(:LPAREN)
+          buffer_size = expression
+          consume(:RPAREN)
         end
-        
-        body = expression
-        LogicRuleNode.new(head || safe_error("Missing rule head"), body || safe_error("Missing rule body"))
-      else
-        safe_error("Expected 'if' or ':-' after rule head")
-      end
-    rescue ParseError => e
-      safe_error("Rule parse error: #{e.message}")
-    end
-  end
-
-  # Parse pursue statement: pursue find_answer
-  def parse_pursue
-    begin
-      eat(:PURSUE)
-      
-      if @current_token.nil? || @current_token.type != :IDENTIFIER
-        return safe_error("Expected goal name after 'pursue'")
+        AST::ChannelCreateNode.new(buffer_size)
       end
       
-      goal_name = @current_token.value
-      eat(:IDENTIFIER)
+      def parse_actor_create
+        consume(:ACTOR_KEYWORD)
+        initial_state = nil
+        if match(:WITH_KEYWORD)
+          initial_state = expression
+        end
+        behavior = expression
+        AST::ActorCreateNode.new(behavior, initial_state)
+      end
       
-      arguments = []
-      if @current_token&.type == :LPAREN
-        eat(:LPAREN)
-        while @current_token&.type != :RPAREN
-          if @current_token.nil?
-            return safe_error("Incomplete pursue arguments - missing closing parenthesis")
+      def parse_send
+        consume(:SEND_KEYWORD)
+        target = expression
+        message = expression
+        AST::ActorSendNode.new(target, message)
+      end
+      
+      def parse_channel_receive
+        consume(:RECEIVE_KEYWORD)
+        channel = expression
+        AST::ChannelReceiveNode.new(channel)
+      end
+      
+      def parse_select
+        consume(:SELECT_KEYWORD)
+        cases = []
+        if match(:BLOCK_START)
+          until match(:BLOCK_END) || at_end?
+            match(:NEWLINE)
+            if match(:RECEIVE_KEYWORD)
+              consume(:LPAREN)
+              channel = expression
+              consume(:RPAREN)
+              consume(:SEND_ARROW)
+              pattern = expression
+              body = block
+              cases << AST::SelectCaseNode.new(channel, pattern, body)
+              match(:NEWLINE)
+            end
           end
-          
-          arg = expression
-          arguments << arg if arg
-          
-          if @current_token&.type == :COMMA
-            eat(:COMMA)
-          end
+        end
+        AST::SelectNode.new(cases)
+      end
+      
+      def parse_mutex_create
+        consume(:MUTEX_KEYWORD)
+        AST::MutexCreateNode.new
+      end
+      
+      def parse_lock
+        consume(:LOCK_KEYWORD)
+        mutex = expression
+        AST::MutexLockNode.new(mutex)
+      end
+      
+      def parse_unlock
+        consume(:UNLOCK_KEYWORD)
+        mutex = expression
+        AST::MutexUnlockNode.new(mutex)
+      end
+      
+      def parse_list_literal
+        consume(:LBRACKET)
+        elements = []
+        until match(:RBRACKET) || at_end?
+          elements << expression
+          match(:COMMA)
         end
         
-        if @current_token&.type == :RPAREN
-          eat(:RPAREN)
-        else
-          return safe_error("Missing closing parenthesis in pursue arguments")
-        end
+        AST::ListLiteralNode.new(elements)
       end
       
-      PursueNode.new(goal_name, arguments)
-    rescue ParseError => e
-      safe_error("Pursue parse error: #{e.message}")
+      def parse_type_annotation
+        token = consume_expecting([:TYPE_KW, :IDENTIFIER])
+        AST::TypeAnnotationNode.new(token.value, line: token.line, column: token.column)
+      end
+      
+      def expression_to_condition(expr)
+        expr
+      end
     end
-  end
-
-  # Parse Prolog-style query: ?- parent(john, mary)
-  def parse_prolog_query
-    begin
-      eat(:QUERY_PREFIX)
-      
-      if @current_token.nil?
-        return safe_error("Expected query pattern after '?-'")
-      end
-      
-      goal_term = expression
-      
-      # Extract variables from the goal term (simplified - just look for uppercase identifiers)
-      variables = extract_variables_from_expression(goal_term)
-      
-      QueryNode.new(goal_term || safe_error("Missing query pattern"), variables, :prolog)
-    rescue ParseError => e
-      safe_error("Prolog query parse error: #{e.message}")
-    end
-  end
-
-  # Parse fact declaration: fact parent(john, mary)
-  def parse_fact
-    begin
-      eat(:FACT)
-      
-      if @current_token.nil?
-        return safe_error("Expected fact expression after 'fact'")
-      end
-      
-      fact_expr = expression
-      
-      # Create a LogicRuleNode with no body (facts are rules without conditions)
-      LogicRuleNode.new(fact_expr || safe_error("Missing fact expression"), nil, :fact)
-    rescue ParseError => e
-      safe_error("Fact parse error: #{e.message}")
-    end
-  end
-
-  private
-
-  # Helper method to extract variables from expressions (simplified implementation)
-  def extract_variables_from_expression(expr)
-    variables = []
-    
-    case expr
-    when VariableNode
-      # Check if variable name starts with uppercase (Prolog convention)
-      if expr.name =~ /^[A-Z]/
-        variables << expr.name.to_sym
-      end
-    when FunctionCallNode
-      # Extract variables from function arguments
-      expr.arguments.each do |arg|
-        variables.concat(extract_variables_from_expression(arg))
-      end
-    when BinaryOpNode
-      # Extract variables from both sides
-      variables.concat(extract_variables_from_expression(expr.left))
-      variables.concat(extract_variables_from_expression(expr.right))
-    end
-    
-    variables.uniq
   end
 end
-# Parser constants
-STATEMENT_KEYWORDS = %w[def if while for class module].freeze
-EXPRESSION_KEYWORDS = %w[true false nil].freeze
-OPERATORS = %w[+ - * / % == != < > <= >= && || !].freeze

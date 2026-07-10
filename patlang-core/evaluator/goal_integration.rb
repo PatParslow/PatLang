@@ -121,8 +121,13 @@ module EvaluatorModules
       
       fact_string = node.fact.to_s
       
-      # Assert fact in facts database
-      @facts_database.assert_fact(fact_string)
+      begin
+        # Assert fact in facts database
+        @facts_database.assert_fact(fact_string)
+        puts "PASS: #{fact_string}"
+      rescue => e
+        puts "FAIL: #{fact_string}"
+      end
       
       fire_integration_event(:fact_asserted_from_ast, {
         fact: fact_string,

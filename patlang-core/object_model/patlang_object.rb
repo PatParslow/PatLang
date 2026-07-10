@@ -118,6 +118,22 @@ class PatlangObject
   def set_attribute(key, value)
     set_metadata(key, value)
   end
+
+  # Forward missing methods to the wrapped Ruby object, ensuring Patlang compatibility
+  def method_missing(method, *args, &block)
+    if @raw_value.respond_to?(method)
+      result = @raw_value.send(method, *args, &block)
+      # Always wrap the result in a PatlangObject unless already one
+      return result if result.is_a?(PatlangObject)
+      PatlangObject.new(result, result.nil? ? "Nil" : result.class.to_s)
+    else
+      super
+    end
+  end
+
+  def respond_to_missing?(method, include_private = false)
+    @raw_value.respond_to?(method) || super
+  end
   
   # Type checking and conversion
   def is_type?(type)

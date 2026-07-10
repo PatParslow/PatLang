@@ -30,11 +30,14 @@ module EvaluatorModules
     end
     
     def visit_string_node(node)
+      puts "[DIAGNOSTIC] ObjectEvaluator: visit_string_node called with value=#{node.value.inspect}, object_mode_enabled=#{@object_mode_enabled.inspect}"
       if @object_mode_enabled
-        StringObject.new(node.value)
+        result = StringObject.new(node.value)
       else
-        node.value  # Backward compatibility
+        result = node.value  # Backward compatibility
       end
+      puts "[DIAGNOSTIC] ObjectEvaluator: returning #{result.inspect}"
+      result
     end
     
     def visit_binary_op_node(node)

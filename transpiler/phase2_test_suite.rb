@@ -4,8 +4,6 @@
 # Comprehensive testing for the PaTLang-to-C transpiler
 
 require_relative 'transpiler_bridge'
-require 'minitest/autorun'
-require 'minitest/reporters'
 require 'tmpdir'
 
 Minitest::Reporters.use! [Minitest::Reporters::ProgressReporter.new]

@@ -4,7 +4,6 @@
 require 'simplecov'
 require 'pathname'
 require 'timeout'
-require 'minitest/autorun'
 
 # Configure SimpleCov with branch coverage for comprehensive analysis
 SimpleCov.start do

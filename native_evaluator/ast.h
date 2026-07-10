@@ -23,7 +23,8 @@ typedef enum {
     AST_IF,
     AST_WHILE,
     AST_FOR,
-    AST_CASE
+    AST_CASE,
+    AST_INCLUDE
     // Add more as needed
 } ast_type_t;
 

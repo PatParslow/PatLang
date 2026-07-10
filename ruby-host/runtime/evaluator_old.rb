@@ -1,4 +1,6 @@
-require_relative '../ast/ast_nodes'
+require_relative '../../patlang-core/ast/ast_nodes'
+require_relative '../../patlang-core/parser/parser'
+require_relative '../../patlang-core/lexer/lexer'
 
 # Evaluator class for traversing AST and computing arithmetic results
 class Evaluator
@@ -42,6 +44,8 @@ class Evaluator
       visit_function_call_node(node)
     when ReturnNode
       visit_return_node(node)
+    when IncludeNode
+      visit_include_node(node)
     else
       raise "Unknown node type: #{node.class}"
     end
@@ -112,6 +116,20 @@ class Evaluator
 
   def visit_string_node(node)
     node.value
+  end
+
+  def visit_include_node(node)
+    filename = evaluate(node.expr)
+    unless filename.is_a?(String)
+      raise "IncludeNode: filename must be a String, got #{filename.inspect} (#{filename.class})"
+    end
+    raise "Included file not found: #{filename}" unless File.exist?(filename)
+    source = File.read(filename)
+    lexer = Lexer.new(source)
+    tokens = lexer.tokenize
+    parser = Parser.new(tokens)
+    ast = parser.parse
+    evaluate(ast)
   end
 
   def visit_comparison_node(node)

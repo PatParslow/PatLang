@@ -1,547 +1,590 @@
-require_relative '../lexer/token'
-require_relative 'ambiguous_token'
+# frozen_string_literal: true
 
-# Lexer class for tokenizing Patlang source code
-#
-# ⚠️  CRITICAL LEXER ERROR HANDLING RULE ⚠️
-#
-# THE LEXER MUST NEVER RAISE EXCEPTIONS FOR UNRECOGNIZED INPUT!
-#
-# This lexer follows the "Never Fail, Always Token" principle:
-# - NEVER throw exceptions for unrecognized characters or invalid syntax
-# - ALWAYS return a token (UNKNOWN, AMBIGUOUS, or EOF)
-# - CONTINUE processing after encountering invalid input
-# - ONLY raise exceptions for genuine system errors (IO failures, memory issues)
-#
-# This design ensures robust parsing and enables error recovery at the parser level.
-#
-# See docs/development/lexer-error-handling-specification.md for complete specification.
-#
-# DO NOT CHANGE THE ERROR HANDLING BEHAVIOR WITHOUT UPDATING THE SPECIFICATION!
-class Lexer
-  def initialize(text)
-    @text = text
-    @position = 0
-    @current_char = @text[@position]
-    @line = 1
-    @column = 1
-  end
+require_relative 'token'
 
-  def error
-    # ⚠️  CRITICAL: LEXER NEVER FAILS - ALWAYS RETURNS UNKNOWN TOKEN ⚠️
-    #
-    # This method implements the core "Never Fail, Always Token" principle.
-    #
-    # DO NOT CHANGE THIS METHOD TO RAISE EXCEPTIONS!
-    #
-    # The lexer must always return a token, even for unrecognized input.
-    # This enables:
-    # - Robust error recovery at the parser level
-    # - Continued processing after syntax errors
-    # - Better error reporting and user experience
-    #
-    # See docs/development/lexer-error-handling-specification.md
-    
-    start_line, start_column = @line, @column
-    char = @current_char
-    advance  # CRITICAL: Move past the unknown character to avoid infinite loops
-    Token.new(Token::TOKEN_TYPES[:UNKNOWN], char, @position - 1, start_line, start_column)
-  end
-
-  def advance
-    return unless @current_char  # Guard against nil current_char
-    
-    if @current_char == "\n"
-      @line += 1
-      @column = 1
-    else
-      @column += 1
-    end
-    
-    @position += 1
-    @current_char = @position < @text.length ? @text[@position] : nil
-  end
-
-  def skip_whitespace
-    while @current_char && @current_char.match(/\s/)
-      advance
-    end
-  end
-
-  def skip_comment
-    # Skip comment until end of line
-    while @current_char && @current_char != "\n"
-      advance
-    end
-    # Skip the newline if present
-    if @current_char == "\n"
-      advance
-    end
-  end
-
-  def read_number
-    result = ''
-    has_decimal = false
-    
-    while @current_char && (@current_char.match(/\d/) || (@current_char == '.' && !has_decimal && peek_char&.match(/\d/)))
-      if @current_char == '.'
-        has_decimal = true
+module Patlang
+  module Lexer
+    # Expectation-driven lexer - incremental API for parser
+    class Lexer
+      # Keyword tables for disambiguation
+      KEYWORDS = {
+        'make' => TokenType::MAKE_KEYWORD,
+        'a' => TokenType::ARTICLE,
+        'an' => TokenType::ARTICLE,
+        'function' => TokenType::FUNCTION_KW,
+        'class' => TokenType::CLASS_KW,
+        'template' => TokenType::TEMPLATE_KW,
+        'goal' => TokenType::GOAL_KW,
+        'list' => TokenType::LIST_KW,
+        'number' => TokenType::TYPE_KW,
+        'text' => TokenType::TYPE_KW,
+        'boolean' => TokenType::TYPE_KW,
+        'called' => TokenType::CALLED,
+        'completed' => TokenType::COMPLETED,
+        'error' => TokenType::ERROR_KEYWORD,
+        'changed' => TokenType::CHANGED,
+        'activated' => TokenType::ACTIVATED,
+        'when' => TokenType::WHEN_KEYWORD,
+        'if' => TokenType::IF_KW,
+        'then' => TokenType::THEN_KEYWORD,
+        'elsif' => TokenType::ELSIF_KEYWORD,
+        'else' => TokenType::ELSE_KEYWORD,
+        'end' => TokenType::END_KEYWORD,
+        'begin' => TokenType::BEGIN_KEYWORD,
+        'is' => TokenType::IS_KEYWORD,
+        'becomes' => TokenType::BECOMES_KEYWORD,
+        'is not' => TokenType::IS_NOT_KEYWORD,
+        'not' => TokenType::NOT_KEYWORD,
+        'and' => TokenType::AND_KEYWORD,
+        'or' => TokenType::OR_KEYWORD,
+        'takes' => TokenType::TAKES_KEYWORD,
+        'returns' => TokenType::RETURNS_KEYWORD,
+        'requires' => TokenType::REQUIRES_KEYWORD,
+        'ensures' => TokenType::ENSURES_KEYWORD,
+        'maintains' => TokenType::MAINTAINS_KEYWORD,
+        'achieved' => TokenType::ACHIEVED_KEYWORD,
+        'runs' => TokenType::RUNS_KEYWORD,
+        'activate' => TokenType::ACTIVATE_KEYWORD,
+        'with' => TokenType::WITH_KEYWORD,
+        'query' => TokenType::QUERY_KEYWORD,
+        'assert' => TokenType::ASSERT_KEYWORD,
+        'return' => TokenType::RETURN_KEYWORD,
+        'true' => TokenType::TRUE_KEYWORD,
+        'false' => TokenType::FALSE_KEYWORD,
+        'nil' => TokenType::NIL_KEYWORD,
+        'while' => TokenType::WHILE_KEYWORD,
+        'for' => TokenType::FOR_KEYWORD,
+        'in' => TokenType::IN_KEYWORD,
+        'do' => TokenType::DO_KEYWORD,
+        'range' => TokenType::RANGE_KEYWORD,
+        'import' => TokenType::IMPORT_KEYWORD,
+        'async' => TokenType::ASYNC_KEYWORD,
+        'await' => TokenType::AWAIT_KEYWORD,
+        'channel' => TokenType::CHANNEL_KEYWORD,
+        'actor' => TokenType::ACTOR_KEYWORD,
+        'receive' => TokenType::RECEIVE_KEYWORD,
+        'select' => TokenType::SELECT_KEYWORD,
+        'mutex' => TokenType::MUTEX_KEYWORD,
+        'lock' => TokenType::LOCK_KEYWORD,
+        'unlock' => TokenType::UNLOCK_KEYWORD,
+      }.freeze
+      
+      TWO_WORD_KEYWORDS = {
+        'is not' => TokenType::IS_NOT_KEYWORD
+      }.freeze
+      
+      DECLARATION_TYPES = %w[function class template goal list number text boolean].freeze
+      
+      ARTICLES = %w[a an].freeze
+      
+      EVENT_ACTIONS = %w[called completed error changed activated].freeze
+      
+      def initialize(source)
+        @source = source
+        @position = 0
+        @line = 1
+        @column = 1
+        @current_char = @source.empty? ? nil : @source[0]
+        @defaults = Set.new
+        @expectations = Set.new
+        @in_parameter_list = false
+        @parameter_context = false
+        @pending_tokens = []
+        @batch_mode = false
+        @in_lambda_params = false
+        @in_declaration_article_expected = false
+        @in_event_spec = false
       end
-      result += @current_char
-      advance
-    end
-    
-    has_decimal ? result.to_f : result.to_i
-  end
-
-  def get_next_token
-    while @current_char
-      # Skip whitespace
-      if @current_char.match(/\s/)
-        skip_whitespace
-        next
-      end
-
-      # Skip comments only if # is at start of line or after whitespace (proper comment context)
-      if @current_char == '#' && comment_context?
-        skip_comment
-        next
-      end
-
-      if @current_char.match(/\d/)
-        start_line, start_column = @line, @column
-        return Token.new(Token::TOKEN_TYPES[:NUMBER], read_number, @position, start_line, start_column)
-      end
-
-      case @current_char
-      when '+'
-        start_line, start_column = @line, @column
-        advance
-        return Token.new(Token::TOKEN_TYPES[:PLUS], '+', @position - 1, start_line, start_column)
-      when '-'
-        start_line, start_column = @line, @column
-        advance
-        return Token.new(Token::TOKEN_TYPES[:MINUS], '-', @position - 1, start_line, start_column)
-      when '*'
-        start_line, start_column = @line, @column
-        advance
-        return Token.new(:STAR, '*', @position - 1, start_line, start_column)
-      when '/'
-        start_line, start_column = @line, @column
-        advance
-        return Token.new(:SLASH, '/', @position - 1, start_line, start_column)
-      when '%'
-        start_line, start_column = @line, @column
-        advance
-        return Token.new(:PERCENT, '%', @position - 1, start_line, start_column)
-      when '^'
-        start_line, start_column = @line, @column
-        advance
-        return Token.new(:CARET, '^', @position - 1, start_line, start_column)
-      when '('
-        start_line, start_column = @line, @column
-        advance
-        return Token.new(Token::TOKEN_TYPES[:LPAREN], '(', @position - 1, start_line, start_column)
-      when ')'
-        start_line, start_column = @line, @column
-        advance
-        return Token.new(Token::TOKEN_TYPES[:RPAREN], ')', @position - 1, start_line, start_column)
-      when '='
-        start_line, start_column = @line, @column
-        if peek_char == '='
-          advance
-          advance
-          return Token.new(Token::TOKEN_TYPES[:EQUAL], '==', @position - 2, start_line, start_column)
-        else
-          advance
-          return Token.new(:ASSIGN, nil, @position - 1, start_line, start_column)
+      
+      # Get next token with optional expectations for this token
+      def next_token(expectations = nil)
+        # If expectations provided directly, use them (for incremental API)
+        @expectations = Set.new(expectations) if expectations
+        # If we have pending tokens from handle_pipe, return them
+        return @pending_tokens.shift if @pending_tokens.any?
+        
+        # Skip whitespace unless expecting NEWLINE
+        skip_whitespace unless @expectations.include?(TokenType::NEWLINE)
+        
+        # Skip comments
+        while @current_char == '#'
+          skip_comment
+          skip_whitespace unless @expectations.include?(TokenType::NEWLINE)
         end
-      when '!'
-        start_line, start_column = @line, @column
-        if peek_char == '='
+        
+        return new_token(TokenType::EOF, '') if @current_char.nil?
+        
+        case
+        when newline?
           advance
-          advance
-          return Token.new(Token::TOKEN_TYPES[:NOT_EQUAL], '!=', @position - 2, start_line, start_column)
+          new_token(TokenType::NEWLINE, "\n")
+        when @current_char == '"'
+          handle_string
+        when @current_char == '|'
+          handle_pipe
+        when @current_char == '{'
+          advance; new_token(TokenType::BLOCK_START, '{')
+        when @current_char == '}'
+          advance; new_token(TokenType::BLOCK_END, '}')
+        when letter? || @current_char == '_'
+          handle_identifier_or_keyword
+        when digit?
+          handle_number
         else
-          advance
-          return Token.new(Token::TOKEN_TYPES[:NOT], '!', @position - 1, start_line, start_column)
-        end
-      when '<'
-        start_line, start_column = @line, @column
-        if peek_char == '='
-          advance
-          advance
-          return Token.new(Token::TOKEN_TYPES[:LESS_EQUAL], '<=', @position - 2, start_line, start_column)
-        else
-          advance
-          return Token.new(:LESS, '<', @position - 1, start_line, start_column)
-        end
-      when '>'
-        start_line, start_column = @line, @column
-        if peek_char == '='
-          advance
-          advance
-          return Token.new(Token::TOKEN_TYPES[:GREATER_EQUAL], '>=', @position - 2, start_line, start_column)
-        else
-          advance
-          return Token.new(:GREATER, '>', @position - 1, start_line, start_column)
-        end
-      when '"'
-        return tokenize_string('"')
-      when "'"
-        return tokenize_string("'")
-      when '.'
-        # Check if this starts a decimal number
-        if peek_char&.match(/\d/)
-          start_line, start_column = @line, @column
-          return Token.new(Token::TOKEN_TYPES[:NUMBER], read_number, @position, start_line, start_column)
-        else
-          start_line, start_column = @line, @column
-          advance
-          return Token.new(Token::TOKEN_TYPES[:DOT], '.', @position - 1, start_line, start_column)
-        end
-      when '['
-        start_line, start_column = @line, @column
-        advance
-        return Token.new(Token::TOKEN_TYPES[:LBRACKET], '[', @position - 1, start_line, start_column)
-      when ']'
-        start_line, start_column = @line, @column
-        advance
-        return Token.new(Token::TOKEN_TYPES[:RBRACKET], ']', @position - 1, start_line, start_column)
-      when ','
-        start_line, start_column = @line, @column
-        advance
-        return Token.new(Token::TOKEN_TYPES[:COMMA], ',', @position - 1, start_line, start_column)
-      when '{'
-        start_line, start_column = @line, @column
-        advance
-        return Token.new(Token::TOKEN_TYPES[:LBRACE], '{', @position - 1, start_line, start_column)
-      when '}'
-        start_line, start_column = @line, @column
-        advance
-        return Token.new(Token::TOKEN_TYPES[:RBRACE], '}', @position - 1, start_line, start_column)
-      when ':'
-        start_line, start_column = @line, @column
-        if peek_char == ':'
-          advance
-          advance
-          return Token.new(Token::TOKEN_TYPES[:DOUBLE_COLON], '::', @position - 2, start_line, start_column)
-        else
-          advance
-          return Token.new(Token::TOKEN_TYPES[:COLON], ':', @position - 1, start_line, start_column)
-        end
-      when '@'
-        start_line, start_column = @line, @column
-        advance
-        return Token.new(Token::TOKEN_TYPES[:AT], '@', @position - 1, start_line, start_column)
-      when '?'
-        start_line, start_column = @line, @column
-        if peek_char == '-'
-          advance
-          advance
-          return Token.new(Token::TOKEN_TYPES[:QUERY_PREFIX], '?-', @position - 2, start_line, start_column)
-        else
-          advance
-          return Token.new(:QUESTION, '?', @position - 1, start_line, start_column)
-        end
-      when '\\'
-        # Handle backslash as a special character - could be escape sequence or standalone
-        start_line, start_column = @line, @column
-        advance
-        if @current_char && @current_char.match(/[ntr"'\\]/)
-          # This looks like the start of an escape sequence in a string context
-          # but we're not in a string, so treat as unknown token
-          return Token.new(:UNKNOWN, '\\', @position - 1, start_line, start_column)
-        else
-          # Standalone backslash - return as unknown token for now
-          return Token.new(:UNKNOWN, '\\', @position - 1, start_line, start_column)
-        end
-      else
-        if alpha?(@current_char)
-          return read_identifier
-        else
-          # Handle invalid characters by returning UNKNOWN token
-          # Lexer never fails, always returns a token
-          return error
+          handle_single_char
         end
       end
-    end
-
-    Token.new(Token::TOKEN_TYPES[:EOF], nil, @position, @line, @column)
-  end
-
-  # Alias for get_next_token to provide the expected interface
-  def next_token
-    get_next_token
-  end
-
-  def tokenize
-    tokens = []
-    token = get_next_token
-    while token.type != Token::TOKEN_TYPES[:EOF]
-      tokens << token
-      token = get_next_token
-    end
-    tokens << token # Add EOF token
-    tokens
-  end
-
-  private
-
-  def peek_char
-    next_position = @position + 1
-    next_position < @text.length ? @text[next_position] : nil
-  end
-
-  def alpha?(char)
-    (char >= 'a' && char <= 'z') ||
-    (char >= 'A' && char <= 'Z') ||
-    char == '_'
-  end
-
-  def alphanumeric?(char)
-    alpha?(char) || char.match(/\d/)
-  end
-
-  def read_identifier
-    start_position = @position
-    start_line, start_column = @line, @column
-    result = ''
-    
-    while @current_char && alphanumeric?(@current_char)
-      result += @current_char
-      advance
-    end
-    
-    # Allow ? at the end of identifiers (Ruby method naming convention)
-    if @current_char == '?'
-      result += @current_char
-      advance
-    end
-    
-    # Check for function phrase keywords - return AmbiguousTokens to let parser resolve context
-    if result == 'make'
-      # Return ambiguous token - let parser resolve context
-      possibilities = [
-        { type: Token::TOKEN_TYPES[:MAKE], value: result },
-        { type: Token::TOKEN_TYPES[:IDENTIFIER], value: result }
-      ]
-      return AmbiguousToken.new(possibilities, start_position, start_line, start_column)
-    elsif result == 'a'
-      # Return ambiguous token - let parser resolve context
-      possibilities = [
-        { type: Token::TOKEN_TYPES[:A], value: result },
-        { type: Token::TOKEN_TYPES[:IDENTIFIER], value: result }
-      ]
-      return AmbiguousToken.new(possibilities, start_position, start_line, start_column)
-    elsif result == 'function'
-      possibilities = [
-        { type: Token::TOKEN_TYPES[:FUNCTION], value: result },
-        { type: Token::TOKEN_TYPES[:IDENTIFIER], value: result }
-      ]
-      return AmbiguousToken.new(possibilities, start_position, start_line, start_column)
-    elsif result == 'called'
-      possibilities = [
-        { type: Token::TOKEN_TYPES[:CALLED], value: result },
-        { type: Token::TOKEN_TYPES[:IDENTIFIER], value: result }
-      ]
-      return AmbiguousToken.new(possibilities, start_position, start_line, start_column)
-    end
-    
-    # Check if the identifier is a keyword (non-function keywords)
-    token_type = case result
-                 when 'true'
-                   Token::TOKEN_TYPES[:TRUE]
-                 when 'false'
-                   Token::TOKEN_TYPES[:FALSE]
-                 when 'if'
-                   Token::TOKEN_TYPES[:IF]
-                 when 'then'
-                   Token::TOKEN_TYPES[:THEN]
-                 when 'else'
-                   Token::TOKEN_TYPES[:ELSE]
-                 when 'end'
-                   # Return ambiguous token - let parser resolve context
-                   possibilities = [
-                     { type: Token::TOKEN_TYPES[:END], value: result },
-                     { type: Token::TOKEN_TYPES[:IDENTIFIER], value: result }
-                   ]
-                   return AmbiguousToken.new(possibilities, start_position, start_line, start_column)
-                 when 'while'
-                   Token::TOKEN_TYPES[:WHILE]
-                 when 'do'
-                   Token::TOKEN_TYPES[:DO]
-                 when 'print'
-                   Token::TOKEN_TYPES[:PRINT]
-                 when 'takes'
-                   Token::TOKEN_TYPES[:TAKES]
-                 when 'returns'
-                   Token::TOKEN_TYPES[:RETURNS]
-                 when 'return'
-                   Token::TOKEN_TYPES[:RETURN]
-                 when 'call'
-                   Token::TOKEN_TYPES[:CALL]
-                 when 'with'
-                   Token::TOKEN_TYPES[:WITH]
-                 when 'is'
-                   Token::TOKEN_TYPES[:IS]
-                 when 'reasoning'
-                   Token::TOKEN_TYPES[:REASONING]
-                 when 'mode'
-                   Token::TOKEN_TYPES[:MODE]
-                 when 'on'
-                   Token::TOKEN_TYPES[:ON]
-                 when 'off'
-                   Token::TOKEN_TYPES[:OFF]
-                 when 'constrain'
-                   Token::TOKEN_TYPES[:CONSTRAIN]
-                 when 'assert'
-                   Token::TOKEN_TYPES[:ASSERT]
-                 when 'fact'
-                   Token::TOKEN_TYPES[:FACT]
-                 when 'goal'
-                   Token::TOKEN_TYPES[:GOAL]
-                 when 'pursue'
-                   Token::TOKEN_TYPES[:PURSUE]
-                 when 'query'
-                   Token::TOKEN_TYPES[:QUERY]
-                 when 'rule'
-                   Token::TOKEN_TYPES[:RULE]
-                 when 'where'
-                   Token::TOKEN_TYPES[:WHERE]
-                 when 'and'
-                   Token::TOKEN_TYPES[:AND]
-                 when 'or'
-                   Token::TOKEN_TYPES[:OR]
-                 when 'precondition'
-                   Token::TOKEN_TYPES[:PRECONDITION]
-                 when 'postcondition'
-                   Token::TOKEN_TYPES[:POSTCONDITION]
-                 when 'strategy'
-                   Token::TOKEN_TYPES[:STRATEGY]
-                 when 'fact'
-                   Token::TOKEN_TYPES[:FACT]
-                 else
-                   Token::TOKEN_TYPES[:IDENTIFIER]
-                 end
-    
-    Token.new(token_type, result, start_position, start_line, start_column)
-  end
-
-  def tokenize_string(quote_type = '"')
-    start_position = @position
-    start_line, start_column = @line, @column
-    advance  # Skip opening quote
-    value = ""
-    
-    while @current_char && @current_char != quote_type
-      if @current_char == '\\'
-        # Handle escape sequences
-        advance
-        if @current_char
-          case @current_char
-          when 'n'
-            value += "\n"
-          when 't'
-            value += "\t"
-          when 'r'
-            value += "\r"
-          when '\\'
-            value += "\\"
-          when '"'
-            value += '"'
-          when "'"
-            value += "'"
+      
+      # Tokenize entire source with optional expectations (backward compatibility for tests)
+      def tokenize(expectations: nil, expectations_overrides: [])
+        # Reset state for fresh tokenization
+        @position = 0
+        @line = 1
+        @column = 1
+        @current_char = @source.empty? ? nil : @source[0]
+        @defaults = Set.new(expectations || [])
+        @expectations = @defaults.dup
+        @in_parameter_list = false
+        @parameter_context = false
+        @pending_tokens = []
+        @batch_mode = true
+        @in_lambda_params = false
+        @in_declaration_article_expected = false
+        @in_event_spec = false
+        @override_idx = 0
+        
+        tokens = []
+        loop do
+          # Apply per-token override expectations if provided
+          @expectations = @defaults.dup
+          unless expectations_overrides.empty?
+            if @override_idx < expectations_overrides.size
+              override = expectations_overrides[@override_idx]
+              if override.is_a?(Symbol)
+                # Single expected type for this token
+                @expectations.clear
+                @expectations.add(override)
+              elsif override.respond_to?(:each)
+                @expectations.merge(override)
+              end
+            end
+          end
+          @override_idx += 1
+          
+          tokens << next_token
+          break if tokens.last.type == TokenType::EOF
+        end
+        @batch_mode = false
+        @in_lambda_params = false
+        @in_declaration_article_expected = false
+        @in_event_spec = false
+        tokens
+      end
+      
+      def expect(*types)
+        @expectations.merge(types)
+        self
+      end
+      
+      def clear_expectations
+        @expectations.clear
+        self
+      end
+      
+      private
+      
+      attr_reader :source, :position, :line, :column, :current_char, :expectations
+      
+      def advance
+        return if @current_char.nil?
+        
+        if @current_char == "\n"
+          @line += 1
+          @column = 1
+        else
+          @column += 1
+        end
+        
+        @position += 1
+        @current_char = @position < source.length ? source[@position] : nil
+      end
+      
+      def peek(offset = 1)
+        pos = @position + offset
+        pos < source.length ? source[pos] : nil
+      end
+      
+      def whitespace?
+        @current_char =~ /\s/ && @current_char != "\n"
+      end
+      
+      def newline?
+        @current_char == "\n"
+      end
+      
+      def letter?
+        @current_char =~ /[a-zA-Z]/
+      end
+      
+      def digit?
+        @current_char =~ /\d/
+      end
+      
+      def skip_whitespace
+        while whitespace?
+          advance
+        end
+      end
+      
+      def skip_comment
+        advance # skip '#'
+        while @current_char && @current_char != "\n"
+          advance
+        end
+      end
+      
+      def handle_identifier_or_keyword
+        start_col = @column
+        start_line = @line
+        value = String.new
+        
+        # Read first word (identifier/keyword without spaces)
+        while @current_char && (letter? || digit? || @current_char == '_' || @current_char == '?' || @current_char == '!')
+          value << @current_char
+          advance
+        end
+        
+        # Check for known two-word keywords by peeking ahead
+        if !@current_char.nil? && @current_char == ' ' && !value.empty?
+          # Save position to check if next word forms a multi-word keyword
+          saved_pos = @position
+          saved_char = @current_char
+          saved_line = @line
+          saved_col = @column
+          
+          advance # skip space
+          next_word = String.new
+          while @current_char && (letter? || digit? || @current_char == '_' || @current_char == '?' || @current_char == '!')
+            next_word << @current_char
+            advance
+          end
+          
+          combined = (value + ' ' + next_word).downcase
+          if TWO_WORD_KEYWORDS.key?(combined)
+            # It's a known two-word keyword
+            value << ' ' << next_word
           else
-            value += @current_char
+            # Not a known combination - restore position
+            @position = saved_pos
+            @current_char = saved_char
+            @line = saved_line
+            @column = saved_col
+          end
+        end
+        
+        # Check two-word keywords first
+        if TWO_WORD_KEYWORDS.key?(value.downcase)
+          return new_token(TWO_WORD_KEYWORDS[value.downcase], value, start_line, start_col)
+        end
+        
+        # Check if it matches expectations for keyword vs identifier
+        token_type = resolve_keyword_or_identifier(value)
+        new_token(token_type, value, start_line, start_col)
+      end
+      
+      def resolve_keyword_or_identifier(value)
+        lower = value.downcase
+        
+        # In batch mode, rely on context tracking rather than expectations
+        if @batch_mode
+          # Check for known two-word keywords
+          if TWO_WORD_KEYWORDS.key?(lower)
+            return TWO_WORD_KEYWORDS[lower]
+          end
+          
+          # In parameter context, articles are identifiers
+          if @parameter_context && ARTICLES.include?(lower)
+            return TokenType::IDENTIFIER
+          end
+          
+          # In declaration context (after MAKE_KEYWORD), article is expected
+          # Track this via a simple state
+          if @in_declaration_article_expected && ARTICLES.include?(lower)
+            @in_declaration_article_expected = false
+            return TokenType::ARTICLE
+          end
+          
+          # If expectations explicitly include ARTICLE for this token, honor it
+          if @expectations.include?(TokenType::ARTICLE) && ARTICLES.include?(lower) && !@parameter_context
+            return TokenType::ARTICLE
+          end
+          
+          # Fallback to keyword table
+          # Articles should be identifiers unless in declaration context
+          result = if ARTICLES.include?(lower)
+            if @in_declaration_article_expected
+              TokenType::ARTICLE
+            else
+              TokenType::IDENTIFIER
+            end
+          else
+            KEYWORDS.fetch(lower, TokenType::IDENTIFIER)
+          end
+          result
+          return result
+        end
+        
+        # Incremental mode: use expectations
+        if @expectations.any?
+          # Check for declaration type expectation
+          if @expectations.include?(:DECL_TYPE) && DECLARATION_TYPES.include?(lower)
+            return :DECL_TYPE
+          end
+          
+          # In parameter context, identifier takes precedence over article
+          if @parameter_context && @expectations.include?(TokenType::IDENTIFIER) && ARTICLES.include?(lower)
+            return TokenType::IDENTIFIER
+          end
+          
+          # Check specific keyword expectations FIRST (before article check)
+          KEYWORDS.each do |kw, type|
+            if @expectations.include?(type) && kw == lower
+              return type
+            end
+          end
+          
+          # Check for article expectation (unless in parameter context or IDENTIFIER expected)
+          if @expectations.include?(TokenType::ARTICLE) && ARTICLES.include?(lower) && !@parameter_context && !@expectations.include?(TokenType::IDENTIFIER)
+            return TokenType::ARTICLE
+          end
+          
+          # Check for identifier expectation
+          if @expectations.include?(TokenType::IDENTIFIER) && @parameter_context && ARTICLES.include?(lower)
+            return TokenType::IDENTIFIER
+          end
+          
+          # Check event action keywords
+          if @expectations.include?(TokenType::EVENT_ACTION_KW) && EVENT_ACTIONS.include?(lower)
+            return TokenType::EVENT_ACTION_KW
+          end
+        end
+        
+        # Fallback to keyword table
+        # Articles should be identifiers unless parser explicitly expects ARTICLE
+        result = if ARTICLES.include?(lower)
+          if @expectations.include?(TokenType::ARTICLE)
+            TokenType::ARTICLE
+          else
+            TokenType::IDENTIFIER
+          end
+        else
+          KEYWORDS.fetch(lower, TokenType::IDENTIFIER)
+        end
+        result
+      end
+      
+      def handle_number
+        start_col = @column
+        value = String.new
+        has_dot = false
+        
+        while @current_char && (digit? || (@current_char == '.' && !has_dot))
+          if @current_char == '.'
+            has_dot = true
+          end
+          value << @current_char
+          advance
+        end
+        
+        if has_dot
+          new_token(TokenType::FLOAT_LITERAL, value.to_f, @line, start_col)
+        else
+          new_token(TokenType::INTEGER_LITERAL, value.to_i, @line, start_col)
+        end
+      end
+      
+      def handle_string
+        start_col = @column
+        advance # skip opening quote
+        value = String.new
+        
+        while @current_char && @current_char != '"'
+          if @current_char == '\\'
+            advance
+            case @current_char
+            when 'n' then value << "\n"
+            when 't' then value << "\t"
+            when 'r' then value << "\r"
+            when '\\' then value << "\\"
+            when '"' then value << '"'
+            else value << @current_char
+            end
+          else
+            value << @current_char
           end
           advance
-        else
-          raise "Incomplete escape sequence at end of string"
         end
-      else
-        value += @current_char
-        advance
+        
+        if @current_char != '"'
+          raise LexerError, "Unterminated string at line #{@line}, column #{@column}"
+        end
+        
+        advance # skip closing quote
+        new_token(TokenType::STRING_LITERAL, value, @line, start_col)
+      end
+      
+      def handle_pipe
+        start_col = @column
+        start_line = @line
+        advance # skip first '|'
+        
+        # In batch mode, tokenize | as BLOCK_PARAM_START or BLOCK_PARAM_END
+        # based on whether we're inside a lambda parameter list
+        if @batch_mode
+          if !@in_lambda_params
+            # First | - start of lambda params
+            @in_lambda_params = true
+            new_token(TokenType::BLOCK_PARAM_START, '|', start_line, start_col)
+          else
+            # Closing | - end of lambda params
+            @in_lambda_params = false
+            new_token(TokenType::BLOCK_PARAM_END, '|', start_line, start_col)
+          end
+        else
+          # Incremental mode: parse full parameter list
+          first_token = new_token(TokenType::BLOCK_PARAM_START, '|', start_line, start_col)
+          
+          @parameter_context = true
+          while @current_char && @current_char != '|'
+            if whitespace?
+              skip_whitespace
+            elsif letter? || @current_char == '_'
+              @pending_tokens << handle_identifier_or_keyword
+            elsif @current_char == ','
+              advance
+              @pending_tokens << new_token(TokenType::COMMA, ',', @line, @column)
+            else
+              raise LexerError, "Unexpected character in block parameters: #{@current_char}"
+            end
+          end
+          
+          if @current_char == '|'
+            @pending_tokens << new_token(TokenType::BLOCK_PARAM_END, '|', @line, @column)
+            advance
+          else
+            raise LexerError, "Unterminated block parameter list"
+          end
+          
+          @parameter_context = false
+          first_token
+        end
+      end
+      
+      def handle_single_char
+        start_col = @column
+        
+        # Two-char operators first
+        two_char = @current_char + (peek || '')
+        case two_char
+        when '=>'
+          advance; advance
+          return new_token(TokenType::ARROW, '=>', @line, start_col)
+        when '->'
+          advance; advance
+          return new_token(TokenType::SEND_ARROW, '->', @line, start_col)
+        when '=='
+          advance; advance
+          return new_token(TokenType::EQ, '==', @line, start_col)
+        when '!='
+          advance; advance
+          return new_token(TokenType::NEQ, '!=', @line, start_col)
+        when '<='
+          advance; advance
+          return new_token(TokenType::LTE, '<=', @line, start_col)
+        when '>='
+          advance; advance
+          return new_token(TokenType::GTE, '>=', @line, start_col)
+        end
+        
+        # Single-char operators and delimiters
+        case @current_char
+        when '+'
+          advance; new_token(TokenType::PLUS, '+', @line, start_col)
+        when '-'
+          advance; new_token(TokenType::MINUS, '-', @line, start_col)
+        when '*'
+          advance; new_token(TokenType::STAR, '*', @line, start_col)
+        when '/'
+          advance; new_token(TokenType::SLASH, '/', @line, start_col)
+        when '%'
+          advance; new_token(TokenType::PERCENT, '%', @line, start_col)
+        when '='
+          advance; new_token(TokenType::EQ, '=', @line, start_col)
+        when '<'
+          advance; new_token(TokenType::LT, '<', @line, start_col)
+        when '>'
+          advance; new_token(TokenType::GT, '>', @line, start_col)
+        when '('
+          advance; new_token(TokenType::LPAREN, '(', @line, start_col)
+        when ')'
+          advance; new_token(TokenType::RPAREN, ')', @line, start_col)
+        when '{'
+          advance; new_token(TokenType::LBRACE, '{', @line, start_col)
+        when '}'
+          advance; new_token(TokenType::BLOCK_END, '}', @line, start_col)
+        when '['
+          advance; new_token(TokenType::LBRACKET, '[', @line, start_col)
+        when ']'
+          advance; new_token(TokenType::RBRACKET, ']', @line, start_col)
+        when ','
+          advance; new_token(TokenType::COMMA, ',', @line, start_col)
+        when '.'
+          advance; new_token(TokenType::DOT, '.', @line, start_col)
+        when ':'
+          advance
+          # Check if we're in event spec context with EVENT_ACTION_SPECIFIER expectation
+          if @in_event_spec && @expectations.include?(TokenType::EVENT_ACTION_SPECIFIER)
+            new_token(TokenType::EVENT_ACTION_SPECIFIER, ':', @line, start_col)
+          else
+            new_token(TokenType::COLON, ':', @line, start_col)
+          end
+        when ';'
+          advance; new_token(TokenType::SEMICOLON, ';', @line, start_col)
+        when '|'
+          # Handled in handle_pipe
+          raise LexerError, "Unexpected '|' at #{@line}:#{@column}"
+        else
+          raise LexerError, "Unexpected character '#{@current_char}' at line #{@line}, column #{@column}"
+        end
+      end
+      
+      def new_token(type, value, token_line = @line, token_col = @column)
+        token = Token.new(type: type, value: value, line: token_line, column: token_col)
+        
+        # Track parameter list and declaration context
+        if type == TokenType::MAKE_KEYWORD
+          @in_declaration_article_expected = true
+        elsif type == TokenType::WHEN_KEYWORD
+          # After WHEN_KEYWORD, next identifier starts event spec
+          @in_event_spec = true
+        elsif type == TokenType::TAKES_KEYWORD
+          @in_parameter_list = true
+        elsif type == TokenType::COLON && @in_parameter_list
+          @in_parameter_list = false
+          @parameter_context = true
+        elsif type == TokenType::ARTICLE && @in_declaration_article_expected
+          @in_declaration_article_expected = false
+        elsif type == TokenType::ARTICLE && @in_event_spec
+          # After event name, ':' starts event action spec
+          @in_event_spec = false
+        # Only reset parameter context on block end or section keywords, not on newlines
+        elsif type == TokenType::BLOCK_END || 
+              [:RETURNS_KEYWORD, :REQUIRES_KEYWORD, :ENSURES_KEYWORD, :MAINTAINS_KEYWORD, :ACHIEVED_KEYWORD, :RUNS_KEYWORD].include?(type)
+          @parameter_context = false
+        end
+        
+        token
       end
     end
-    
-    if @current_char != quote_type
-      # Instead of raising error, create an UNTERMINATED_STRING token for better error recovery
-      return Token.new(:UNTERMINATED_STRING, value, start_position, start_line, start_column)
-    end
-    
-    advance  # Skip closing quote
-    Token.new(Token::TOKEN_TYPES[:STRING], value, start_position, start_line, start_column)
-  end
-
-  def in_function_definition_context?
-    # Look backwards to see if we recently saw "make"
-    # This is a simple heuristic - check the last few characters
-    look_back_start = [@position - 20, 0].max
-    recent_text = @text[look_back_start...@position]
-    
-    # If we see "make" recently, we're likely in a function definition context
-    recent_text =~ /\bmake\s*$/
-  end
-
-  def in_arithmetic_context?
-    # Look backwards in the text to see if we're in an arithmetic context
-    # Simple heuristic: if we see operators like =, +, -, *, / recently, treat "a" as identifier
-    # This is basic context detection - more sophisticated parsing would require full context
-    
-    # Look at recent characters (simplified approach)
-    look_back_start = [@position - 10, 0].max
-    recent_text = @text[look_back_start...@position]
-    
-    # If we see assignment or arithmetic operators recently, treat "a" as an identifier
-    !!(recent_text =~ /[=+\-*\/]\s*$/)
-  end
-  
-  
-  
-  
-  def peek_word
-    # Look ahead to see what the next word is without consuming it
-    saved_position = @position
-    saved_char = @current_char
-    
-    result = ''
-    while @current_char && alphanumeric?(@current_char)
-      result += @current_char
-      advance
-    end
-    
-    # Restore position
-    @position = saved_position
-    @current_char = saved_char
-    
-    result
-  end
-  
-  def skip_word
-    # Skip the current word
-    while @current_char && alphanumeric?(@current_char)
-      advance
-    end
-  end
-  
-  def read_word
-    # Helper method to read a word without consuming it permanently
-    result = ''
-    while @current_char && alphanumeric?(@current_char)
-      result += @current_char
-      advance
-    end
-    result
-  end
-  
-  def comment_context?
-    # Only treat # as comment if it's at start of line or preceded by whitespace
-    # This prevents # from being consumed as comment when it should be an UNKNOWN token
-    return true if @position == 0  # Start of input
-    
-    # Look at the previous character
-    prev_char = @position > 0 ? @text[@position - 1] : nil
-    prev_char.nil? || prev_char.match(/\s/)
   end
 end

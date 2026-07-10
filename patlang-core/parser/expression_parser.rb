@@ -45,7 +45,7 @@ module ParserModules
         
         right = logical_and
         return left unless right # If right side fails, return left side
-        left = BinaryOpNode.new(left, op, right)
+        left = BinaryOpNode.new(left, op, right, @parser.instance_variable_get(:@filename), @parser.current_token&.line, @parser.current_token&.column)
       end
       
       left
@@ -72,7 +72,7 @@ module ParserModules
         
         right = equality
         return left unless right # If right side fails, return left side
-        left = BinaryOpNode.new(left, op, right)
+        left = BinaryOpNode.new(left, op, right, @parser.instance_variable_get(:@filename), @parser.current_token&.line, @parser.current_token&.column)
       end
       
       left
@@ -102,7 +102,7 @@ module ParserModules
         op = @parser.current_token.value
         @parser.advance
         right = comparison
-        left = BinaryOpNode.new(left, op, right)
+        left = BinaryOpNode.new(left, op, right, @parser.instance_variable_get(:@filename), @parser.current_token&.line, @parser.current_token&.column)
       end
       
       left
@@ -144,7 +144,7 @@ module ParserModules
         
         right = term
         return left unless right # If right side fails, return left side
-        left = BinaryOpNode.new(left, op, right)
+        left = BinaryOpNode.new(left, op, right, @parser.instance_variable_get(:@filename), @parser.current_token&.line, @parser.current_token&.column)
       end
       
       left
@@ -173,7 +173,7 @@ module ParserModules
         
         right = unary
         return left unless right # If right side fails, return left side
-        left = BinaryOpNode.new(left, op, right)
+        left = BinaryOpNode.new(left, op, right, @parser.instance_variable_get(:@filename), @parser.current_token&.line, @parser.current_token&.column)
       end
       
       left
@@ -186,7 +186,7 @@ module ParserModules
         op = @parser.current_token.value
         @parser.advance
         operand = unary
-        return UnaryOpNode.new(op, operand)
+        return UnaryOpNode.new(op, operand, @parser.instance_variable_get(:@filename), @parser.current_token&.line, @parser.current_token&.column)
       end
       
       exponentiation
@@ -200,7 +200,7 @@ module ParserModules
         op = @parser.current_token.value
         @parser.advance
         right = exponentiation  # Right-associative
-        left = BinaryOpNode.new(left, op, right)
+        left = BinaryOpNode.new(left, op, right, @parser.instance_variable_get(:@filename), @parser.current_token&.line, @parser.current_token&.column)
       end
       
       left
@@ -343,7 +343,7 @@ module ParserModules
       
       if token.type == :NUMBER
         @parser.advance
-        return NumberNode.new(token.value.to_f)
+        return NumberNode.new(token.value.to_f, @parser.instance_variable_get(:@filename), token.line, token.column)
       elsif token.type == :STRING
         @parser.advance
         return StringNode.new(token.value)
@@ -392,30 +392,30 @@ module ParserModules
         else
           # Variable reference
           @parser.advance
-          return VariableNode.new(token.value)
+          return VariableNode.new(token.value, @parser.instance_variable_get(:@filename), token.line, token.column)
         end
       elsif token.type == :MAKE
         # MAKE token used as variable reference (not function definition)
         @parser.advance
-        return VariableNode.new(token.value)
+        return VariableNode.new(token.value, @parser.instance_variable_get(:@filename), token.line, token.column)
       elsif token.type == :CALL
         return @parser.parse_function_call
       elsif token.type == :FUNCTION
         # FUNCTION token used as variable reference (not function definition)
         @parser.advance
-        return VariableNode.new(token.value)
+        return VariableNode.new(token.value, @parser.instance_variable_get(:@filename), token.line, token.column)
       elsif token.type == :CALLED
         # CALLED token used as variable reference (not function definition)
         @parser.advance
-        return VariableNode.new(token.value)
+        return VariableNode.new(token.value, @parser.instance_variable_get(:@filename), token.line, token.column)
       elsif token.type == :TAKES
         # TAKES token used as variable reference (not function definition)
         @parser.advance
-        return VariableNode.new(token.value)
+        return VariableNode.new(token.value, @parser.instance_variable_get(:@filename), token.line, token.column)
       elsif token.type == :RETURNS
         # RETURNS token used as variable reference (not function definition)
         @parser.advance
-        return VariableNode.new(token.value)
+        return VariableNode.new(token.value, @parser.instance_variable_get(:@filename), token.line, token.column)
       elsif token.type == :LPAREN
         @parser.advance # consume '('
         
@@ -439,93 +439,114 @@ module ParserModules
       elsif token.type == :LBRACE
         # Handle LBRACE in expression context - could be block expression or object literal
         @parser.advance # consume '{'
+        parameters = []
         statements = []
-        
+
+        # Support Ruby-style block parameters: { |x, y| ... }
+        if @parser.current_token&.type == :PIPE
+          @parser.advance # consume '|'
+          while @parser.current_token && @parser.current_token.type == :IDENTIFIER
+            parameters << @parser.current_token.value
+            @parser.advance
+            break if @parser.current_token&.type == :PIPE
+            if @parser.current_token&.type == :COMMA
+              @parser.advance
+            else
+              break
+            end
+          end
+          if @parser.current_token&.type == :PIPE
+            @parser.advance # consume closing '|'
+          else
+            return create_error_placeholder("Expected closing '|' after block parameters")
+          end
+        end
+
         # Parse statements inside the block until we hit RBRACE
         until @parser.current_token&.type == :RBRACE
           if @parser.current_token.nil?
             return create_error_placeholder("Incomplete block - missing '}'")
           end
-          
+
           stmt = expression
           statements << stmt if stmt
-          
+
           # Optional semicolon or newline between statements
           if @parser.current_token&.type == :SEMICOLON
             @parser.advance
           end
         end
-        
+
         if @parser.current_token&.type == :RBRACE
           @parser.advance
         else
           return create_error_placeholder("Missing closing brace in block")
         end
-        return BlockNode.new(statements)
+        return BlockNode.new(statements, parameters)
       elsif token.type == :COLON
         # Handle COLON in expression context - could be type annotation or label
         @parser.advance # consume ':'
         
         # For now, treat as a simple token that can be referenced
         # This handles cases where colon appears in expressions
-        return VariableNode.new(":")
+        return VariableNode.new(":", @parser.instance_variable_get(:@filename), token.line, token.column)
       elsif token.type == :RETURN
         # Handle RETURN keyword as variable reference in expression context
         @parser.advance
-        return VariableNode.new(token.value)
+        return VariableNode.new(token.value, @parser.instance_variable_get(:@filename), token.line, token.column)
       elsif token.type == :IF
         # Handle IF keyword as variable reference in expression context
         @parser.advance
-        return VariableNode.new(token.value)
+        return VariableNode.new(token.value, @parser.instance_variable_get(:@filename), token.line, token.column)
       elsif token.type == :WHILE
         # Handle WHILE keyword as variable reference in expression context
         @parser.advance
-        return VariableNode.new(token.value)
+        return VariableNode.new(token.value, @parser.instance_variable_get(:@filename), token.line, token.column)
       elsif token.type == :COMMA
         # Handle COMMA as variable reference in expression context
         @parser.advance
-        return VariableNode.new(",")
+        return VariableNode.new(",", @parser.instance_variable_get(:@filename), token.line, token.column)
       elsif token.type == :ASSIGN
         # Handle ASSIGN as variable reference in expression context
         @parser.advance
-        return VariableNode.new("=")
+        return VariableNode.new("=", @parser.instance_variable_get(:@filename), token.line, token.column)
       elsif token.type == :THEN
         # Handle THEN keyword as variable reference in expression context
         @parser.advance
-        return VariableNode.new(token.value)
+        return VariableNode.new(token.value, @parser.instance_variable_get(:@filename), token.line, token.column)
       elsif token.type == :END
         # Handle END keyword as variable reference in expression context
         @parser.advance
-        return VariableNode.new(token.value)
+        return VariableNode.new(token.value, @parser.instance_variable_get(:@filename), token.line, token.column)
       elsif token.type == :ELSE
         # Handle ELSE keyword as variable reference in expression context
         @parser.advance
-        return VariableNode.new(token.value)
+        return VariableNode.new(token.value, @parser.instance_variable_get(:@filename), token.line, token.column)
       elsif token.type == :FACT
         # Handle FACT keyword as variable reference in expression context (for fact() calls)
         @parser.advance
-        return VariableNode.new(token.value)
+        return VariableNode.new(token.value, @parser.instance_variable_get(:@filename), token.line, token.column)
       elsif token.type == :PURSUE
         # Handle PURSUE keyword as function name for goal pursuit
         @parser.advance
-        return VariableNode.new(token.value)
+        return VariableNode.new(token.value, @parser.instance_variable_get(:@filename), token.line, token.column)
       elsif token.type == :QUERY
         # Handle QUERY keyword as function name for logic queries
         @parser.advance
-        return VariableNode.new(token.value)
+        return VariableNode.new(token.value, @parser.instance_variable_get(:@filename), token.line, token.column)
       elsif token.type == :GOAL
         # Handle GOAL keyword as identifier in expressions
         @parser.advance
-        return VariableNode.new(token.value)
+        return VariableNode.new(token.value, @parser.instance_variable_get(:@filename), token.line, token.column)
       elsif token.type == :DOUBLE_COLON
         # Handle DOUBLE_COLON in expression context - this creates a type annotation node
         # This allows expressions like "user.value :: String" to be parsed
         @parser.advance
-        return VariableNode.new("::")
+        return VariableNode.new("::", @parser.instance_variable_get(:@filename), token.line, token.column)
       elsif token.type == :WHERE
         # Handle WHERE keyword as identifier in query expressions
         @parser.advance
-        return VariableNode.new(token.value)
+        return VariableNode.new(token.value, @parser.instance_variable_get(:@filename), token.line, token.column)
       elsif token.type == :EOF
         # Handle EOF token gracefully
         return create_error_placeholder("Unexpected end of input")

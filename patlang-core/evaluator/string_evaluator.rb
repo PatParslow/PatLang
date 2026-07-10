@@ -1,5 +1,6 @@
 require_relative '../ast/ast_nodes'
 require_relative '../exceptions'
+require_relative '../debug/instrumentation'
 
 # String evaluation module for handling string operations and methods
 module EvaluatorModules
@@ -9,7 +10,10 @@ module EvaluatorModules
     end
 
     def visit_string_node(node)
-      node.value
+      PatlangDebug.log(:STRING) { "visit value=#{node.value.inspect}" }
+      result = node.value
+      PatlangDebug.log(:STRING) { "return #{result.inspect}" }
+      result
     end
 
     def visit_index_access_node(node)
@@ -69,7 +73,38 @@ module EvaluatorModules
     end
 
     def visit_method_call_node(node)
+      # Intercept legacy stdlib style calls like IO.puts / FS.write mapping to rewritten function names
+      # Legacy object name mapping (variable form)
+      if node.object.is_a?(VariableNode)
+        legacy_obj = node.object.name
+        mapped = map_legacy(legacy_obj, node.method_name)
+        return @evaluator.evaluate(FunctionCallNode.new(mapped, node.arguments)) if mapped && @evaluator.functions[mapped]
+      end
+
       object_value = @evaluator.evaluate(node.object)
+
+      # Sentinel string mapping (IO_SHIM / FS_SHIM / NET_SHIM)
+      if object_value.is_a?(String)
+        case object_value
+        when 'IO_SHIM'
+          mapped = map_legacy('IO', node.method_name)
+          return @evaluator.evaluate(FunctionCallNode.new(mapped, node.arguments)) if mapped && @evaluator.functions[mapped]
+        when 'FS_SHIM'
+          mapped = map_legacy('FS', node.method_name)
+          return @evaluator.evaluate(FunctionCallNode.new(mapped, node.arguments)) if mapped && @evaluator.functions[mapped]
+        when 'NET_SHIM'
+          mapped = map_legacy('Net', node.method_name)
+          return @evaluator.evaluate(FunctionCallNode.new(mapped, node.arguments)) if mapped && @evaluator.functions[mapped]
+        when 'FS'
+          mapped = map_legacy('FS', node.method_name)
+          return @evaluator.evaluate(FunctionCallNode.new(mapped, node.arguments)) if mapped && @evaluator.functions[mapped]
+        when 'Net'
+          mapped = map_legacy('Net', node.method_name)
+          return @evaluator.evaluate(FunctionCallNode.new(mapped, node.arguments)) if mapped && @evaluator.functions[mapped]
+        end
+      end
+
+  # object_value already obtained above
 
       if object_value.is_a?(String)
         handle_string_method(object_value, node)
@@ -79,8 +114,28 @@ module EvaluatorModules
         handle_class_method(object_value, node)
       elsif object_value.respond_to?(:patlang_object?) || object_value.is_a?(PatlangObject)
         handle_patlang_object_method(object_value, node)
+      elsif object_value.respond_to?(node.method_name)
+        # Generic object method dispatch (HostBridge stub, future host objects)
+        args = node.arguments.map { |a| @evaluator.evaluate(a) }
+        object_value.send(node.method_name, *args)
       else
-        raise "Method calls are only supported for strings, numbers, classes, and PatlangObjects, got #{object_value.class}"
+  PatlangDebug.log(:METHOD) { "unsupported object=#{object_value.inspect} class=#{object_value.class} method=#{node.method_name}" }
+  raise "Method calls are only supported for strings, numbers, classes, PatlangObjects, or legacy shims, got #{object_value.class}"
+      end
+    end
+
+    private
+
+    def map_legacy(obj_name, method_name)
+      case obj_name
+      when 'IO'
+        "IO_#{method_name}"
+      when 'FS'
+        "FS_#{method_name}"
+      when 'Net'
+        "Net_#{method_name}"
+      else
+        nil
       end
     end
 

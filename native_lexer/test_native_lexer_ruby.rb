@@ -10,97 +10,128 @@ require_relative '../patlang-core/evaluator/evaluator'
 def test_native_lexer_components
   puts "🚀 Testing Native PaTLang Lexer - Phase 1 Foundation"
   puts "=" * 70
-  
+
+  results = []
   # Test each component individually
-  test_token_system
-  test_lexical_patterns
-  test_basic_lexer
-  test_integration
+  [method(:test_token_system), method(:test_lexical_patterns), method(:test_basic_lexer), method(:test_integration)].each do |test_method|
+    begin
+      test_method.call
+      results << "TEST: #{test_method.name} PASS"
+    rescue => e
+      results << "TEST: #{test_method.name} FAIL"
+      puts "   Location: #{e.backtrace.first}"
+    end
+  end
+
+  puts "\n=== TEST SUMMARY ==="
+  pass_count = 0
+  fail_count = 0
+  results.each do |line|
+    puts line
+    if line.include?("PASS")
+      pass_count += 1
+    else
+      fail_count += 1
+    end
+  end
+  puts "Total: #{results.size}, Passed: #{pass_count}, Failed: #{fail_count}"
 end
 
 def test_token_system
+  test_name = "token_system"
   puts "\n📝 Testing Token System Component"
   puts "-" * 40
-  
-  # Read the token system code
   token_system_code = File.read('native_lexer/token_system.patlang')
-  
   begin
     lexer = Lexer.new(token_system_code)
     tokens = lexer.tokenize
-    puts "✅ Token system lexing: #{tokens.length} tokens"
-    
+    if tokens.length > 0
+      puts "TEST: #{test_name}_lexing PASS"
+    else
+      puts "TEST: #{test_name}_lexing FAIL"
+    end
+
     parser = Parser.new(tokens)
     ast = parser.parse
-    puts "✅ Token system parsing: AST generated"
-    
+    if ast
+      puts "TEST: #{test_name}_parsing PASS"
+    else
+      puts "TEST: #{test_name}_parsing FAIL"
+    end
+
     evaluator = Evaluator.new
     result = evaluator.evaluate(ast)
-    puts "✅ Token system evaluation: Complete"
-    
-    # Test some basic token system functionality
+    puts "TEST: #{test_name}_evaluation PASS"
+
     test_basic_token_operations(evaluator)
-    
   rescue => e
-    puts "❌ Token system failed: #{e.message}"
+    puts "TEST: #{test_name} FAIL"
     puts "   Location: #{e.backtrace.first}"
   end
 end
 
 def test_lexical_patterns
+  test_name = "lexical_patterns"
   puts "\n📝 Testing Lexical Patterns Component"
   puts "-" * 40
-  
-  # Read the lexical patterns code
   patterns_code = File.read('native_lexer/lexical_patterns.patlang')
-  
   begin
     lexer = Lexer.new(patterns_code)
     tokens = lexer.tokenize
-    puts "✅ Lexical patterns lexing: #{tokens.length} tokens"
-    
+    if tokens.length > 0
+      puts "TEST: #{test_name}_lexing PASS"
+    else
+      puts "TEST: #{test_name}_lexing FAIL"
+    end
+
     parser = Parser.new(tokens)
     ast = parser.parse
-    puts "✅ Lexical patterns parsing: AST generated"
-    
+    if ast
+      puts "TEST: #{test_name}_parsing PASS"
+    else
+      puts "TEST: #{test_name}_parsing FAIL"
+    end
+
     evaluator = Evaluator.new
     result = evaluator.evaluate(ast)
-    puts "✅ Lexical patterns evaluation: Complete"
-    
-    # Test some pattern recognition functionality
+    puts "TEST: #{test_name}_evaluation PASS"
+
     test_pattern_recognition(evaluator)
-    
   rescue => e
-    puts "❌ Lexical patterns failed: #{e.message}"
+    puts "TEST: #{test_name} FAIL"
     puts "   Location: #{e.backtrace.first}"
   end
 end
 
 def test_basic_lexer
+  test_name = "basic_lexer"
   puts "\n📝 Testing Basic Lexer Framework"
   puts "-" * 40
-  
-  # Read the main lexer code
   lexer_code = File.read('native_lexer/native_lexer.patlang')
-  
   begin
     lexer = Lexer.new(lexer_code)
     tokens = lexer.tokenize
-    puts "✅ Main lexer lexing: #{tokens.length} tokens"
-    
+    if tokens.length > 0
+      puts "TEST: #{test_name}_lexing PASS"
+    else
+      puts "TEST: #{test_name}_lexing FAIL"
+    end
+
     parser = Parser.new(tokens)
     ast = parser.parse
-    puts "✅ Main lexer parsing: AST generated"
-    
+    if ast
+      puts "TEST: #{test_name}_parsing PASS"
+    else
+      puts "TEST: #{test_name}_parsing FAIL"
+    end
+
     evaluator = Evaluator.new
     result = evaluator.evaluate(ast)
-    puts "✅ Main lexer evaluation: Complete"
-    
-    # Test lexer framework functionality
+    puts "TEST: #{test_name}_evaluation PASS"
+
     test_lexer_framework(evaluator)
-    
   rescue => e
-    puts "❌ Main lexer failed: #{e.message}"
+    puts "TEST: #{test_name} FAIL"
     puts "   Location: #{e.backtrace.first}"
   end
 end
@@ -267,6 +298,36 @@ def test_individual_features
     rescue => e
       puts "❌ FAILED: #{e.message}"
     end
+  end
+end
+
+def test_invalid_token
+  test_name = "invalid_token"
+  begin
+    lexer = Lexer.new("$$$")
+    tokens = lexer.tokenize
+    if tokens.any? { |t| t.type == :INVALID }
+      puts "TEST: #{test_name} PASS"
+    else
+      puts "TEST: #{test_name} FAIL"
+    end
+  rescue => e
+    puts "TEST: #{test_name} FAIL"
+  end
+end
+
+def test_unclosed_string
+  test_name = "unclosed_string"
+  begin
+    lexer = Lexer.new('"unterminated string')
+    tokens = lexer.tokenize
+    if tokens.any? { |t| t.type == :ERROR }
+      puts "TEST: #{test_name} PASS"
+    else
+      puts "TEST: #{test_name} FAIL"
+    end
+  rescue => e
+    puts "TEST: #{test_name} FAIL"
   end
 end
 

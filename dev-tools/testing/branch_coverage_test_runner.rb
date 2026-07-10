@@ -2,7 +2,6 @@
 
 require 'simplecov'
 require 'json'
-require 'minitest/autorun'
 require_relative 'helpers/config_loader'
 
 # Configure SimpleCov using configuration

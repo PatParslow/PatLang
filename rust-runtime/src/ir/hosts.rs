@@ -401,7 +401,21 @@ pub fn host_get(args: &[Value]) -> Result<Value, String> {
         // the codegen template's `get` arm
         Value::String(name) => Ok(obj_get(name, &key).unwrap_or(Value::Unit)),
         Value::Object(map) => Ok(map.get(&key).cloned().unwrap_or(Value::Unit)),
-        _ => Ok(Value::Unit),
+        // Primitive receivers (Number/Bool/List) have no property store, but do
+        // support a small set of Ruby-style built-in methods called without
+        // parens (e.g. `2.34.to_s`), lowered here since a paren-less `Member`
+        // expression goes through `get`, not `send`.
+        recv => Ok(builtin_primitive_method(recv, &key).unwrap_or(Value::Unit)),
+    }
+}
+
+/// Ruby-style built-in methods available on any primitive value, regardless of
+/// receiver kind. Returns `None` if `method` isn't one of these built-ins, so
+/// callers can fall back to their own "unknown property/method" behavior.
+fn builtin_primitive_method(recv: &Value, method: &str) -> Option<Value> {
+    match method {
+        "to_s" => Some(Value::String(display_value(recv))),
+        _ => None,
     }
 }
 
@@ -491,17 +505,21 @@ pub fn host_set_var(args: &[Value]) -> Result<Value, String> {
 pub fn host_send(args: &[Value]) -> Result<Value, String> {
     // send(recv, method, args...) — supports "set" like the template arm
     if args.len() < 2 { return Ok(Value::Unit); }
-    let recv = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
+    let recv = &args[0];
     let method = match &args[1] { Value::String(s) => s.clone(), _ => String::new() };
     let rest = &args[2..];
     match method.as_str() {
         "set" => {
+            let recv_name = match recv { Value::String(s) => s.clone(), _ => String::new() };
             if rest.len() != 2 { return Ok(Value::Unit); }
             let prop = match &rest[0] { Value::String(s) => s.clone(), _ => String::new() };
-            if !recv.is_empty() && !prop.is_empty() { obj_set(&recv, &prop, rest[1].clone()); }
+            if !recv_name.is_empty() && !prop.is_empty() { obj_set(&recv_name, &prop, rest[1].clone()); }
             Ok(Value::Unit)
         }
-        _ => Ok(Value::Unit),
+        // Ruby-style built-in methods callable with parens (e.g. `2.34.to_s()`),
+        // available on any receiver kind — mirrors the paren-less path in
+        // `host_get`/`builtin_primitive_method`.
+        _ => Ok(builtin_primitive_method(recv, &method).unwrap_or(Value::Unit)),
     }
 }
 

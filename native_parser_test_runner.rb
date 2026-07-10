@@ -42,24 +42,50 @@ class NativeParserTestRunner
     demo_examples = load_demo_examples
     
     # Test categories
-    run_basic_expression_tests
-    run_variable_assignment_tests
-    run_function_definition_tests
-    run_control_flow_tests
-    run_reasoning_construct_tests
-    run_complex_mixed_program_tests(demo_examples)
-    run_error_recovery_tests
-    run_performance_benchmarks(demo_examples)
+    capture_and_parse_patlang_tests { run_basic_expression_tests }
+    capture_and_parse_patlang_tests { run_variable_assignment_tests }
+    capture_and_parse_patlang_tests { run_function_definition_tests }
+    capture_and_parse_patlang_tests { run_control_flow_tests }
+    capture_and_parse_patlang_tests { run_reasoning_construct_tests }
+    capture_and_parse_patlang_tests { run_complex_mixed_program_tests(demo_examples) }
+    capture_and_parse_patlang_tests { run_error_recovery_tests }
+    capture_and_parse_patlang_tests { run_performance_benchmarks(demo_examples) }
     
     # Generate comprehensive report
     generate_test_report
     
+    # Patlang-level test/assert summary
+    if defined?(@patlang_test_results) && @patlang_test_results
+      pat_pass = @patlang_test_results.count { |r| r[:result] == "PASS" }
+      pat_fail = @patlang_test_results.count { |r| r[:result] == "FAIL" }
+      pat_total = @patlang_test_results.size
+      puts "\n=== Patlang Test/Assert Results ==="
+      @patlang_test_results.each do |r|
+        puts "  #{r[:name]}: #{r[:result]}"
+      end
+      puts "Summary: #{pat_pass} passed, #{pat_fail} failed, #{pat_total} total"
+    end
+
     puts "\n🎯 All Tests Complete!"
     puts "Passed: #{@passed_tests}, Failed: #{@failed_tests}, Total: #{@test_counter}"
   end
 
   private
 
+  # Capture stdout during Patlang evaluation and parse TEST: lines
+  def capture_and_parse_patlang_tests
+    require 'stringio'
+    old_stdout = $stdout
+    $stdout = StringIO.new
+    yield
+    output = $stdout.string
+    $stdout = old_stdout
+    test_lines = output.scan(/^TEST: (.+?) (PASS|FAIL)$/)
+    test_lines.each do |name, result|
+      @patlang_test_results ||= []
+      @patlang_test_results << { name: name, result: result }
+    end
+  end
   # Load examples from native_parser_demo.pat
   def load_demo_examples
     demo_file = 'native_parser/examples/native_parser_demo.pat'
@@ -572,6 +598,8 @@ class NativeParserTestRunner
   end
 
   def record_test_result(code, category, passed, error_message)
+    # Emit standardized per-test result line
+    puts "TEST: #{category} #{passed ? 'PASS' : 'FAIL'}"
     @test_results << {
       code: code.length > 100 ? code[0..100] + "..." : code,
       category: category,

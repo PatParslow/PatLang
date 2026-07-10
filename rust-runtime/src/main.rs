@@ -49,6 +49,22 @@ fn main() {
         Ok(s) => s,
         Err(e) => { eprintln!("Include error: {}", e); process::exit(1); }
     };
+    // Expand any user-defined `syntax NAME { ... }` DSL blocks and their
+    // triggered usages into plain PatLang before the normal Lexer/Parser
+    // runs. Only pay the cost of loading the (PatLang-authored) regex engine
+    // when the source actually declares a `syntax` block.
+    let source = if source.contains("syntax ") {
+        let regex_engine = match patlang_runtime::syntax_dsl::RegexEngine::load() {
+            Ok(r) => r,
+            Err(e) => { eprintln!("syntax DSL error: failed to load regex engine: {}", e); process::exit(1); }
+        };
+        match patlang_runtime::syntax_dsl::expand_syntax_dsls(&source, &regex_engine) {
+            Ok(s) => s,
+            Err(e) => { eprintln!("syntax DSL error: {}", e); process::exit(1); }
+        }
+    } else {
+        source
+    };
     if mode == "ir-run" || mode == "emit-rust" || mode == "build-run" || mode == "compare" || mode == "patc" {
         // Guardrail: quick scan for unsupported high-level constructs before parsing
         let unsupported_markers = [

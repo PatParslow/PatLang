@@ -1,6 +1,5 @@
 #!/usr/bin/env ruby
 
-require 'minitest/autorun'
 require 'simplecov'
 
 # Configure SimpleCov for lexer-focused coverage measurement

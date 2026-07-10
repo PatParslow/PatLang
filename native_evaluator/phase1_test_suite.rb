@@ -4,10 +4,6 @@
 # Comprehensive testing for the self-hosting evaluator implementation
 
 require_relative 'ruby_bridge'
-require 'minitest/autorun'
-require 'minitest/reporters'
-
-Minitest::Reporters.use! [Minitest::Reporters::ProgressReporter.new]
 
 class Phase1SelfHostingTest < Minitest::Test
   def setup

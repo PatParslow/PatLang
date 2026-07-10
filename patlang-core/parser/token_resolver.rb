@@ -66,6 +66,15 @@ module ParserModules
             end
           end
         end
+
+        # Variable assignment heuristic: 'make IDENTIFIER =' pattern should treat 'make' as MAKE
+        if context_index && token.can_be?(:MAKE)
+          if (next_tok = @tokens[context_index + 1]) && next_tok.type == :IDENTIFIER
+            if (next_next = @tokens[context_index + 2]) && next_next.type == :ASSIGN
+              return token.resolve_to(:MAKE)
+            end
+          end
+        end
         
         # Handle END tokens outside of function definition context
         if token.can_be?(:END) && token.value == "end"
