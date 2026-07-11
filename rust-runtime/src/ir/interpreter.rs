@@ -173,6 +173,18 @@ impl Interpreter {
                     } else if name == "fiber_alive" {
                         let id = args.get(0).cloned().unwrap_or(Value::Unit);
                         stack.push(super::fiber::fiber_alive(&id)?);
+                    } else if name == "budgeted_run" {
+                        let ms = match args.get(0) { Some(v) => v.as_number().map_err(|_| "budgeted_run: expected a number of ms".to_string())? as i64, None => return Err("budgeted_run: expected ms".into()) };
+                        let fname = match args.get(1) {
+                            Some(Value::String(s)) => s.clone(),
+                            other => return Err(format!("budgeted_run: expected a function name string, got {:?}", other)),
+                        };
+                        let captured = args.get(2).cloned().unwrap_or(Value::List(vec![]));
+                        let existing = args.get(3).cloned().unwrap_or(Value::Unit);
+                        stack.push(super::fiber::budgeted_run(program, ms, &fname, captured, &existing)?);
+                    } else if name == "budget_check" {
+                        super::fiber::budget_check()?;
+                        stack.push(Value::Unit);
                     } else {
                         let f = self.host.get(name).ok_or_else(|| format!("host fn '{}' not found", name))?;
                         let res = f(&args)?;

@@ -19,6 +19,13 @@ pub struct Lowerer {
     pending_closures: Vec<Function>,
     // unique naming for synthesized closure functions
     closure_counter: usize,
+    // unique naming for synthesized budgeted() functions
+    budgeted_counter: usize,
+    // >0 while lowering the body of a budgeted(ms) { ... } block (nesting-
+    // depth counter, not a bool, so a budgeted block nested inside another
+    // still counts as "inside"): while-loop back-edges lowered in this state
+    // get a budget_check() call injected just before the jump.
+    in_budgeted_depth: usize,
 }
 
 impl Lowerer {
@@ -170,11 +177,61 @@ impl Lowerer {
                 f.body.push(Instr::JumpIfFalse(usize::MAX));
                 // body
                 for s in body { self.lower_stmt(s, f); }
+                // Lexically inside a budgeted(ms) { ... } block: check the
+                // time budget just before looping back, suspending (via
+                // fiber_yield inside budget_check) once it's exhausted.
+                if self.in_budgeted_depth > 0 {
+                    f.body.push(Instr::CallHost("budget_check".into(), 0));
+                }
                 // jump back to loop_start
                 f.body.push(Instr::Jump(loop_start));
                 // patch JumpIfFalse to after body
                 let after = f.body.len();
                 if let Instr::JumpIfFalse(ref mut tgt) = f.body[jif_idx] { *tgt = after; }
+            }
+            Stmt::Budgeted { ms, body } => {
+                self.budgeted_counter += 1;
+                let func_name = format!("__budgeted_{}", self.budgeted_counter);
+                // Over-capture the entire enclosing locals list (same
+                // approach lower_closure_literal uses) rather than precise
+                // free-variable analysis -- simpler, and still correct given
+                // the flat per-call locals model. fiber_new only ever passes
+                // ONE initial argument to the spawned function, so all
+                // captured values are bundled into a single List and the
+                // synthesized function's sole declared parameter unpacks
+                // them again in its own prologue.
+                let captured: Vec<(String, bool)> = self.known_locals.iter().map(|(k, v)| (k.clone(), *v)).collect();
+                let mut bf = Function { name: func_name.clone(), params: vec!["__captured".into()], ..Default::default() };
+                for (i, (name, _)) in captured.iter().enumerate() {
+                    bf.body.push(Instr::LoadLocal("__captured".into()));
+                    bf.body.push(Instr::Const(Value::Int(i as i64)));
+                    bf.body.push(Instr::CallHost("list_get".into(), 2));
+                    bf.body.push(Instr::StoreLocal(name.clone()));
+                }
+                let saved_locals = std::mem::take(&mut self.known_locals);
+                let saved_fname = std::mem::replace(&mut self.current_function, func_name.clone());
+                self.known_locals.insert("__captured".into(), true);
+                for (name, mutable) in &captured { self.known_locals.insert(name.clone(), *mutable); }
+                self.in_budgeted_depth += 1;
+                for st in body { self.lower_stmt(st, &mut bf); }
+                self.in_budgeted_depth -= 1;
+                bf.body.push(Instr::Return);
+                self.pending_closures.push(bf);
+                self.known_locals = saved_locals;
+                self.current_function = saved_fname;
+
+                // budgeted_run(ms, func_name, captured_list, Unit) -- Unit
+                // in the fourth slot means "no existing fiber, start a new
+                // one"; a real resume (passing back the ["paused", id]
+                // handle from this call's result) is the caller's job, not
+                // something the lowerer can synthesize, since only the
+                // caller knows whether/when to ask for another timeslice.
+                self.lower_expr(ms, f);
+                f.body.push(Instr::Const(Value::String(func_name)));
+                for (name, _) in &captured { f.body.push(Instr::LoadLocal(name.clone())); }
+                f.body.push(Instr::BuildList(captured.len()));
+                f.body.push(Instr::Const(Value::Unit));
+                f.body.push(Instr::CallHost("budgeted_run".into(), 4));
             }
             Stmt::Assert { kind, expr } => {
                 // contract_check(func_name, kind, condition_text, ok) — pushed in
@@ -231,7 +288,8 @@ impl Lowerer {
             "tcp_listen"|"tcp_connect"|"tcp_accept"|"tcp_accept_timeout"|"sleep_ms"|"tcp_read"|"tcp_write"|"tcp_close"|
             "sqrt"|"pow"|"sin"|"cos"|"tan"|"asin"|"acos"|"atan"|"atan2"|"log"|"exp"|
             "floor"|"ceil"|"round"|"trunc"|"abs"|"numeric_kind"|"type_of"|
-            "parallel_map"|"fiber_new"|"fiber_resume"|"fiber_yield"|"fiber_alive"
+            "parallel_map"|"fiber_new"|"fiber_resume"|"fiber_yield"|"fiber_alive"|
+            "budgeted_run"|"budget_check"
         )
     }
 
@@ -467,6 +525,7 @@ fn collect_referenced_idents(stmts: &[Stmt], out: &mut Vec<String>, seen: &mut H
             Stmt::Fact { args, .. } | Stmt::Query { args, .. } => { for a in args { collect_ident_expr(a, out, seen); } }
             Stmt::When { body, .. } => collect_referenced_idents(body, out, seen),
             Stmt::Assert { expr, .. } => collect_ident_expr(expr, out, seen),
+            Stmt::Budgeted { ms, body } => { collect_ident_expr(ms, out, seen); collect_referenced_idents(body, out, seen); }
         }
     }
 }

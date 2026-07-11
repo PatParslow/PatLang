@@ -100,6 +100,15 @@ pub enum Stmt {
         kind: String,
         expr: Expr,
     },
+    // Cooperative time-budget block: budgeted(ms) { body } / do...end.
+    // Lowers to a synthesized function (like a closure/when-handler) run via
+    // an implicit fiber; while-loop back-edges lexically inside the body get
+    // a budget check injected that yields (fiber_yield) once the block's
+    // budget is exhausted or predicted to be about to be.
+    Budgeted {
+        ms: Expr,
+        body: Vec<Stmt>,
+    },
     // Extend with more statement types as needed
 }
 

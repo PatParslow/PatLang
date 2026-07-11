@@ -21,6 +21,23 @@ fn display_value(v: &Value) -> String {
 // treating an as_index error as the same fallback the String-parse arm uses.
 fn number_or_max(v: &Value) -> Option<usize> { as_index(v).ok() }
 
+// `print` isn't part of register_stage0_shims's set below historically --
+// main.rs's --ir-run mode registers its own local `ir_host_print` directly
+// on the top-level Interpreter instead. That means any code that spawns a
+// *fresh* Interpreter and only calls register_stage0_shims (fiber_new's and
+// parallel_map's worker threads) doesn't have `print` available at all,
+// which surfaces as a confusing "host fn 'print' not found" the first time
+// fiber/budgeted-block code tries to print. Registered here so every
+// shims-only interpreter gets it too.
+pub fn host_print(args: &[Value]) -> Result<Value, String> {
+    if let Some(arg0) = args.get(0) {
+        println!("{}", display_value(arg0));
+    } else {
+        println!();
+    }
+    Ok(Value::Unit)
+}
+
 pub fn host_list_get(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 { return Err("list_get: expected 2 args".into()); }
     let idx = match &args[1] { Value::String(s) => s.parse::<usize>().unwrap_or(usize::MAX), v => number_or_max(v).unwrap_or(usize::MAX) };
