@@ -10,6 +10,21 @@ use std::fs;
 use patlang_runtime::{core_evaluator, parser::Parser, ir::{Lowerer, Interpreter, Value, RustCodegen}};
 
 fn main() {
+    // Run on a spawned thread with a much larger stack than the OS-default
+    // main thread stack: deeply recursive-descent PatLang programs
+    // interpreted via `--ir-run` (notably the self-hosted compiler's own
+    // lexer/parser/lowerer running over large sources) can exceed the
+    // default stack. Any `process::exit()` call inside `real_main` still
+    // terminates the whole process regardless of which thread calls it.
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(real_main)
+        .expect("failed to spawn worker thread")
+        .join()
+        .unwrap_or(());
+}
+
+fn real_main() {
     let args: Vec<String> = env::args().collect();
     // Modes:
     //   --ir-run <file.pat>

@@ -50,6 +50,14 @@ pub enum Stmt {
     Let {
         name: String,
         value: Expr,
+        // true when written as `NAME = value` with no `let` keyword -- a
+        // reassignment of an existing binding, not a fresh declaration.
+        // Legal at lowering time only if that binding was declared `mut`.
+        is_reassignment: bool,
+        // true when declared via `let mut NAME = value`. Irrelevant when
+        // is_reassignment is true (the original declaration's mutability
+        // governs whether reassignment is allowed).
+        mutable: bool,
     },
     // Assignment to an object's property: obj.prop = value
     MemberAssign {

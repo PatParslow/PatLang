@@ -25,7 +25,7 @@ fn test_stmt_json_roundtrip() {
         name: "g".into(),
         params: vec!["a".into(), "b".into()],
         body: vec![
-            Stmt::Let { name: "x".into(), value: Expr::Number(3.14) },
+            Stmt::Let { name: "x".into(), value: Expr::Number(3.14), is_reassignment: false, mutable: false },
             Stmt::Return(Some(Expr::BinaryOp {
                 left: Box::new(Expr::Identifier("a".into())),
                 op: BinaryOperator::Mul,

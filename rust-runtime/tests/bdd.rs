@@ -150,7 +150,7 @@ fn given_value_module(world: &mut PatWorld, which: String) {
     // with a probe that just reports `size_of::<Value>()` instead of
     // appending a second `main` (which wouldn't compile) or trying to
     // provide a fake `build_program()`.
-    let real_main = "fn main(){\n    let program = build_program();\n    match run(&program) { Ok(v) => println!(\"{}\", display_value(&v)), Err(e) => { eprintln!(\"IR runtime error: {}\", e); std::process::exit(1); } }\n}\n";
+    let real_main = "#[cfg(not(target_arch = \"wasm32\"))]\nfn main(){\n    let child = std::thread::Builder::new()\n        .stack_size(256 * 1024 * 1024)\n        .spawn(|| {\n            let program = build_program();\n            match run(&program) {\n                Ok(v) => { println!(\"{}\", display_value(&v)); 0 }\n                Err(e) => { eprintln!(\"IR runtime error: {}\", e); 1 }\n            }\n        })\n        .expect(\"failed to spawn worker thread\");\n    let code = child.join().unwrap_or(1);\n    std::process::exit(code);\n}\n";
     let probe_main = "fn main() { println!(\"{}\", std::mem::size_of::<Value>()); }\n";
     assert!(
         prelude.contains(real_main),

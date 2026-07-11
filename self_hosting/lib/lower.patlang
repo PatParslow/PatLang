@@ -49,6 +49,24 @@ make a function called vec_contains takes v, s returns r
   return false
 end
 
+# Finds the mutability flag for the MOST RECENT declaration of `name` in
+# `locals`/`mutables` (index-parallel vecs) -- a re-`let` shadows, so the
+# latest declaration's flag is the one that governs a later reassignment.
+make a function called find_mut_flag takes locals, mutables, name returns r
+  let n = vec_len(locals)
+  let i = n - 1
+  let found = false
+  let result = false
+  while (i >= 0) and (not found) do
+    if vec_get(locals, i) == name then
+      let found = true
+      let result = vec_get(mutables, i)
+    end
+    let i = i - 1
+  end
+  return result
+end
+
 make a function called next_closure_name returns name
   let n = get("__vars", "__closure_seq")
   if not n then
@@ -226,12 +244,14 @@ make a function called lower_closure_literal takes params, body, code, fns, loca
   end
 
   let inner_locals = vec_new()
+  let inner_mutables = vec_new()
   let i = 0
   while i < all_params.length do
     vec_push(inner_locals, all_params[i])
+    vec_push(inner_mutables, true)
     let i = i + 1
   end
-  let inner_code = lower_block(body, vec_new(), fns, func_name, inner_locals, pending)
+  let inner_code = lower_block(body, vec_new(), fns, func_name, inner_locals, inner_mutables, pending)
   vec_push(inner_code, ["Return"])
   vec_push(pending, ["FuncIR", func_name, all_params, vec_to_list(inner_code)])
 
@@ -246,14 +266,50 @@ make a function called lower_closure_literal takes params, body, code, fns, loca
   return code
 end
 
-make a function called lower_stmt takes node, code, fns, fname, locals, pending returns out
+make a function called lower_stmt takes node, code, fns, fname, locals, mutables, pending returns out
   let ty = node[0]
   if ty == "Let" then
     let code = lower_expr(node[2], code, fns, locals, pending)
-    vec_push(code, ["Store", node[1]])
-    vec_push(locals, node[1])
+    let isReassign = node[3]
+    let isMut = node[4]
+    if isReassign then
+      if vec_contains(locals, node[1]) then
+        let flag = find_mut_flag(locals, mutables, node[1])
+        if not flag then
+          # Statically-known immutable reassignment: emit a contract_check
+          # that always fails at this point (mirrors the native Stage 0
+          # lowerer's approach -- lower_program is infallible here too, so
+          # this is enforced as a guaranteed-fail assertion at the
+          # reassignment site rather than a hard compile error).
+          vec_push(code, ["Const", "str", fname])
+          vec_push(code, ["Const", "str", "assert"])
+          vec_push(code, ["Const", "str", "cannot assign twice to immutable variable `" + node[1] + "` (declare it `let mut " + node[1] + "` to allow reassignment)"])
+          vec_push(code, ["Const", "bool", "false"])
+          vec_push(code, ["CallHost", "contract_check", 4])
+        end
+        vec_push(code, ["Store", node[1]])
+      else
+        # Not seen in this scope (e.g. a captured/outer-scope name this flat
+        # tracker can't see) -- fall back to the old permissive behaviour.
+        vec_push(code, ["Store", node[1]])
+        vec_push(locals, node[1])
+        vec_push(mutables, true)
+      end
+    else
+      # `let` / `let mut`: always allowed to introduce or shadow.
+      vec_push(code, ["Store", node[1]])
+      vec_push(locals, node[1])
+      vec_push(mutables, isMut)
+    end
     return code
   else
+    if ty == "MemberAssign" then
+      let code = lower_expr(node[1], code, fns, locals, pending)
+      vec_push(code, ["Const", "str", node[2]])
+      let code = lower_expr(node[3], code, fns, locals, pending)
+      vec_push(code, ["CallHost", "set", 3])
+      return code
+    else
     if ty == "Expr" then
       return lower_expr(node[1], code, fns, locals, pending)
     else
@@ -271,11 +327,11 @@ make a function called lower_stmt takes node, code, fns, fname, locals, pending 
             let code = lower_expr(node[1], code, fns, locals, pending)
             let jif = vec_len(code)
             vec_push(code, ["JumpIfFalse", 0])
-            let code = lower_block(node[2], code, fns, fname, locals, pending)
+            let code = lower_block(node[2], code, fns, fname, locals, mutables, pending)
             let jmp = vec_len(code)
             vec_push(code, ["Jump", 0])
             vec_set(code, jif, ["JumpIfFalse", vec_len(code)])
-            let code = lower_block(node[3], code, fns, fname, locals, pending)
+            let code = lower_block(node[3], code, fns, fname, locals, mutables, pending)
             vec_set(code, jmp, ["Jump", vec_len(code)])
             return code
           else
@@ -284,7 +340,7 @@ make a function called lower_stmt takes node, code, fns, fname, locals, pending 
               let code = lower_expr(node[1], code, fns, locals, pending)
               let jif = vec_len(code)
               vec_push(code, ["JumpIfFalse", 0])
-              let code = lower_block(node[2], code, fns, fname, locals, pending)
+              let code = lower_block(node[2], code, fns, fname, locals, mutables, pending)
               vec_push(code, ["Jump", start])
               vec_set(code, jif, ["JumpIfFalse", vec_len(code)])
               return code
@@ -307,13 +363,14 @@ make a function called lower_stmt takes node, code, fns, fname, locals, pending 
         end
       end
     end
+    end
   end
 end
 
-make a function called lower_block takes stmts, code, fns, fname, locals, pending returns out
+make a function called lower_block takes stmts, code, fns, fname, locals, mutables, pending returns out
   let i = 0
   while i < stmts.length do
-    let code = lower_stmt(stmts[i], code, fns, fname, locals, pending)
+    let code = lower_stmt(stmts[i], code, fns, fname, locals, mutables, pending)
     let i = i + 1
   end
   return code
@@ -340,6 +397,7 @@ make a function called lower_program takes ast returns ir
   let events = []
   let mainCode = vec_new()
   let mainLocals = vec_new()
+  let mainMutables = vec_new()
   let pending = vec_new()
   let handlerCount = 0
   let i = 0
@@ -347,12 +405,14 @@ make a function called lower_program takes ast returns ir
     let s = stmts[i]
     if s[0] == "Func" then
       let flocals = vec_new()
+      let fmutables = vec_new()
       let k = 0
       while k < s[2].length do
         vec_push(flocals, s[2][k])
+        vec_push(fmutables, true)
         let k = k + 1
       end
-      let code = lower_block(s[3], vec_new(), fns, s[1], flocals, pending)
+      let code = lower_block(s[3], vec_new(), fns, s[1], flocals, fmutables, pending)
       vec_push(code, ["Return"])
       let funcs = list_push(funcs, ["FuncIR", s[1], s[2], vec_to_list(code)])
     else
@@ -360,14 +420,17 @@ make a function called lower_program takes ast returns ir
         let handlerCount = handlerCount + 1
         let hname = "__when_" + s[1] + "_" + handlerCount
         let hlocals = vec_new()
+        let hmutables = vec_new()
         vec_push(hlocals, "event_name")
+        vec_push(hmutables, true)
         vec_push(hlocals, "event_data")
-        let code = lower_block(s[2], vec_new(), fns, hname, hlocals, pending)
+        vec_push(hmutables, true)
+        let code = lower_block(s[2], vec_new(), fns, hname, hlocals, hmutables, pending)
         vec_push(code, ["Return"])
         let funcs = list_push(funcs, ["FuncIR", hname, ["event_name", "event_data"], vec_to_list(code)])
         let events = list_push(events, ["EventIR", s[1], hname])
       else
-        let mainCode = lower_stmt(s, mainCode, fns, "main", mainLocals, pending)
+        let mainCode = lower_stmt(s, mainCode, fns, "main", mainLocals, mainMutables, pending)
       end
     end
     let i = i + 1

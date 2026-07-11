@@ -583,7 +583,7 @@ fn lower_and_compile_impl(ctx: &mut ExecutionContext, program_id: &str, out_opt:
                         let name = ctx.object_store.get(&sid, "name").unwrap_or_default();
                         let expr_id = ctx.object_store.get(&sid, "value").unwrap_or_default();
                         let value = decode_expr(ctx, &expr_id)?;
-                        stmts.push(Stmt::Let { name, value });
+                        stmts.push(Stmt::Let { name, value, is_reassignment: false, mutable: true });
                     }
                     "Return" => {
                         let val_id = ctx.object_store.get(&sid, "value").unwrap_or_default();
@@ -734,7 +734,7 @@ fn decode_stmt_like(ctx: &ExecutionContext, id: &str) -> Result<Option<Stmt>, Ru
                 let name = ctx.object_store.get(id, "name").unwrap_or_default();
                 let expr_id = ctx.object_store.get(id, "value").unwrap_or_default();
                 let value = decode_expr(ctx, &expr_id)?;
-                Some(Stmt::Let { name, value })
+                Some(Stmt::Let { name, value, is_reassignment: false, mutable: true })
             }
             "Return" => {
                 let val_id = ctx.object_store.get(id, "value").unwrap_or_default();

@@ -778,7 +778,7 @@ pub fn shape_to_program(v: &Value) -> Result<Program, String> {
 
 /// Shared tail: write Rust source to a temp file and compile it with rustc.
 /// `target`: optional rustc target triple (e.g. "wasm32-wasip1").
-fn compile_source_to_exe(rust_src: &str, out: &str, what: &str, target: Option<&str>) -> Result<Value, String> {
+fn compile_source_to_exe(rust_src: &str, out: &str, what: &str, target: Option<&str>, opt_level: Option<&str>) -> Result<Value, String> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static SEQ: AtomicUsize = AtomicUsize::new(0);
     let mut tmp = std::env::temp_dir();
@@ -800,9 +800,20 @@ fn compile_source_to_exe(rust_src: &str, out: &str, what: &str, target: Option<&
     // ~7x smaller and faster to compile than the default (measured: a
     // feature-complete demo went from 2.1MB/-O to 310KB/opt-level=z, both
     // producing byte-identical stdout). Native builds keep full -O since
-    // the portfolio's benchmark card reports real timings.
+    // the portfolio's benchmark card reports real timings -- unless the
+    // caller explicitly overrides via opt_level (needed for unusually large
+    // generated sources: rustc's optimizer has been observed to blow up to
+    // 30GB+ RAM, or separately hang indefinitely burning CPU at opt-level 1,
+    // on the self-hosted compiler's own ~1.6MB generated interpreter source;
+    // opt-level 0 compiles that same source correctly in ~10s).
     let is_wasm = target.map(|t| t.contains("wasm")).unwrap_or(false);
-    if is_wasm { cmd.arg("-C").arg("opt-level=z"); } else { cmd.arg("-O"); }
+    if let Some(lvl) = opt_level {
+        cmd.arg("-C").arg(format!("opt-level={}", lvl));
+    } else if is_wasm {
+        cmd.arg("-C").arg("opt-level=z");
+    } else {
+        cmd.arg("-O");
+    }
     cmd.arg("-C").arg("strip=symbols");
     cmd.arg(&src_path).arg("-o").arg(out);
     if let Some(t) = target { cmd.arg("--target").arg(t); }
@@ -817,7 +828,7 @@ fn compile_source_to_exe(rust_src: &str, out: &str, what: &str, target: Option<&
 fn compile_program_to_exe(program: &Program, out: &str, what: &str) -> Result<Value, String> {
     let cg = super::codegen::RustCodegen::new();
     let rust_src = cg.emit_rust(program);
-    compile_source_to_exe(&rust_src, out, what, None)
+    compile_source_to_exe(&rust_src, out, what, None, None)
 }
 
 /// codegen_prelude() -> the static runtime library text embedded in every
@@ -842,9 +853,11 @@ pub fn host_codegen_prelude_chunk(args: &[Value]) -> Result<Value, String> {
         .ok_or_else(|| format!("codegen_prelude_chunk: unknown chunk '{}'", name))
 }
 
-/// rustc_build(rust_source, out_path[, target_triple]) -> compiled artifact path.
+/// rustc_build(rust_source, out_path[, target_triple[, opt_level]]) -> compiled artifact path.
 /// The dumbest possible back end: write the given Rust source and run rustc.
-/// Pass a target triple (e.g. "wasm32-wasip1") to cross-compile.
+/// Pass a target triple (e.g. "wasm32-wasip1") to cross-compile. Pass an
+/// opt_level ("0".."3", "s", "z") to override the default -O -- see
+/// compile_source_to_exe's comment for why this exists.
 pub fn host_rustc_build(args: &[Value]) -> Result<Value, String> {
     let src = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => return Err("rustc_build: expected Rust source string".into()) };
     let out = match args.get(1) {
@@ -852,7 +865,8 @@ pub fn host_rustc_build(args: &[Value]) -> Result<Value, String> {
         _ => return Err("rustc_build: expected output path as second argument".into()),
     };
     let target = match args.get(2) { Some(Value::String(s)) if !s.trim().is_empty() => Some(s.clone()), _ => None };
-    compile_source_to_exe(&src, &out, "rustc_build", target.as_deref())
+    let opt_level = match args.get(3) { Some(Value::String(s)) if !s.trim().is_empty() => Some(s.clone()), _ => None };
+    compile_source_to_exe(&src, &out, "rustc_build", target.as_deref(), opt_level.as_deref())
 }
 
 /// compile_shape(ast_shape, out_path) -> compiled exe path.

@@ -38,8 +38,10 @@ fn test_let_stmt() {
     let stmt = Stmt::Let {
         name: "x".to_string(),
         value: Expr::Number(5.0),
+        is_reassignment: false,
+        mutable: false,
     };
-    if let Stmt::Let { name, value } = stmt {
+    if let Stmt::Let { name, value, .. } = stmt {
         assert_eq!(name, "x");
         assert_eq!(value, Expr::Number(5.0));
     } else {

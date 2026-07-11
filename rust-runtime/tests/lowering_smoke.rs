@@ -63,7 +63,7 @@ fn lower_and_run_list_literal() {
 #[test]
 fn lower_and_run_reassignment() {
   let src = r#"
-    let x = 1
+    let mut x = 1
     x = x + 41
     return x
   "#;

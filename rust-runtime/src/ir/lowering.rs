@@ -5,7 +5,11 @@ use super::types::*;
 #[derive(Default)]
 pub struct Lowerer {
     // minimal tracking of declared locals to avoid lowering unknown identifiers
-    known_locals: HashSet<String>,
+    // maps declared local name -> whether it was declared `mut` (or is a
+    // function parameter, which is always reassignable). Used both to check
+    // whether an identifier is safe to lower and to enforce mutability on
+    // bare (non-`let`) reassignment.
+    known_locals: std::collections::HashMap<String, bool>,
     // track declared function names to allow lowering calls
     known_functions: HashSet<String>,
     // name of the function currently being lowered, for contract-violation messages
@@ -38,8 +42,9 @@ impl Lowerer {
                 // Lower the function body
                 let mut saved_locals = std::mem::take(&mut self.known_locals);
                 let saved_fname = std::mem::replace(&mut self.current_function, name.clone());
-                // params are considered known locals
-                self.known_locals = params.iter().cloned().collect();
+                // params are considered known locals; always reassignable
+                // (Phase 1 does not require `mut` on parameters).
+                self.known_locals = params.iter().map(|p| (p.clone(), true)).collect();
                 for st in body {
                     self.lower_stmt(&st, &mut f);
                 }
@@ -60,8 +65,8 @@ impl Lowerer {
                 // Use a fresh locals set and seed with param names so they can be referenced safely
                 let saved = std::mem::take(&mut self.known_locals);
                 let saved_fname = std::mem::replace(&mut self.current_function, hname.clone());
-                self.known_locals.insert("event_name".into());
-                self.known_locals.insert("event_data".into());
+                self.known_locals.insert("event_name".into(), true);
+                self.known_locals.insert("event_data".into(), true);
                 for st in body { self.lower_stmt(st, &mut hf); }
                 hf.body.push(Instr::Return);
                 program.functions.insert(hname.clone(), hf);
@@ -95,10 +100,40 @@ impl Lowerer {
                 }
                 // leave value on stack (caller may Return at end)
             }
-            Stmt::Let { name, value } => {
+            Stmt::Let { name, value, is_reassignment, mutable } => {
                 self.lower_expr(value, f);
+                if *is_reassignment {
+                    match self.known_locals.get(name) {
+                        Some(true) => { /* declared mut: reassignment is fine */ }
+                        Some(false) => {
+                            // Statically-known immutable reassignment: emit a
+                            // contract_check that always fails at this point,
+                            // rather than rejecting the whole program here --
+                            // lower_program_basic is infallible today, so this
+                            // is enforced as a guaranteed-fail assertion at the
+                            // reassignment site instead of a hard compile error.
+                            f.body.push(Instr::Const(Value::String(self.current_function.clone())));
+                            f.body.push(Instr::Const(Value::String("assert".into())));
+                            f.body.push(Instr::Const(Value::String(format!(
+                                "cannot assign twice to immutable variable `{}` (declare it `let mut {}` to allow reassignment)",
+                                name, name
+                            ))));
+                            f.body.push(Instr::Const(Value::Bool(false)));
+                            f.body.push(Instr::CallHost("contract_check".into(), 4));
+                        }
+                        None => {
+                            // Not seen in this function's local scope (e.g. a
+                            // captured/outer-scope name this flat tracker can't
+                            // see) -- fall back to the old permissive behaviour
+                            // rather than false-positive on legitimate code.
+                            self.known_locals.insert(name.clone(), true);
+                        }
+                    }
+                } else {
+                    // `let` / `let mut`: always allowed to introduce or shadow.
+                    self.known_locals.insert(name.clone(), *mutable);
+                }
                 f.body.push(Instr::StoreLocal(name.clone()));
-                self.known_locals.insert(name.clone());
             }
             Stmt::Return(opt) => {
                 if let Some(e) = opt { self.lower_expr(e, f); }
@@ -159,7 +194,7 @@ impl Lowerer {
     fn expr_is_safe(&self, e: &Expr) -> bool {
         match e {
             Expr::Number(_) | Expr::Float(_) | Expr::String(_) => true,
-            Expr::Identifier(name) => name == "true" || name == "false" || self.known_locals.contains(name),
+            Expr::Identifier(name) => name == "true" || name == "false" || self.known_locals.contains_key(name),
             Expr::List(items) => items.iter().all(|it| self.expr_is_safe(it)),
             // Member reads lower to len/get host calls; safe when the object expr is safe
             Expr::Member { object, .. } => self.expr_is_safe(object),
@@ -169,7 +204,7 @@ impl Lowerer {
             Expr::Call { function, args } => {
                 let callee_safe = match &**function {
                     Expr::Identifier(name) => {
-                        self.is_allowed_host(name) || self.known_functions.contains(name) || self.known_locals.contains(name)
+                        self.is_allowed_host(name) || self.known_functions.contains(name) || self.known_locals.contains_key(name)
                     }
                     // Any other safe callee expression (e.g. an inline closure
                     // literal) dispatches through CallValue, which cannot
@@ -247,7 +282,7 @@ impl Lowerer {
                         for arg in args { self.lower_expr(arg, f); }
                         f.body.push(Instr::Call(name.clone(), args.len()));
                     }
-                    Expr::Identifier(name) if self.known_locals.contains(name) => {
+                    Expr::Identifier(name) if self.known_locals.contains_key(name) => {
                         // Dynamic call through a local variable holding a closure
                         f.body.push(Instr::LoadLocal(name.clone()));
                         for arg in args { self.lower_expr(arg, f); }
@@ -372,7 +407,7 @@ impl Lowerer {
         // present in the enclosing scope right now (anything else is presumably
         // a host/global function name, not a variable to snapshot).
         let captured_names: Vec<String> = referenced.into_iter()
-            .filter(|n| !own.contains(n) && self.known_locals.contains(n))
+            .filter(|n| !own.contains(n) && self.known_locals.contains_key(n))
             .collect();
 
         self.closure_counter += 1;
@@ -384,7 +419,7 @@ impl Lowerer {
         };
         let saved_locals = std::mem::take(&mut self.known_locals);
         let saved_fname = std::mem::replace(&mut self.current_function, func_name.clone());
-        self.known_locals = cf.params.iter().cloned().collect();
+        self.known_locals = cf.params.iter().map(|p| (p.clone(), true)).collect();
         for st in body { self.lower_stmt(st, &mut cf); }
         cf.body.push(Instr::Return);
         self.known_locals = saved_locals;

@@ -137,9 +137,7 @@ make a function called parse_primary takes toks, pos returns r
             end
           else
             if tok_is(t, "OP", "|") then
-              # Closure literal: |params| do body end (Stage 1 uses do/end
-              # rather than Stage 0's brace-delimited |params| { body },
-              # consistent with the rest of this dialect's block syntax)
+              # Closure literal: |params| do body end, or |params| { body }
               let p = pos + 1
               let params = []
               let looping = true
@@ -173,7 +171,18 @@ make a function called parse_primary takes toks, pos returns r
                   return [["Err", "expected end after closure body"], p2]
                 end
               else
-                return [["Err", "expected do after closure params"], p]
+                if tok_is(dt, "OP", "{") then
+                  let body = parse_stmts_until(toks, p + 1)
+                  let p2 = body[1]
+                  let et = vec_get(toks, p2)
+                  if tok_is(et, "OP", "}") then
+                    return [["Closure", params, body[0]], p2 + 1]
+                  else
+                    return [["Err", "expected } after closure body"], p2]
+                  end
+                else
+                  return [["Err", "expected do or { after closure params"], p]
+                end
               end
             else
               return [["Err", "unexpected " + ty + " '" + tx + "'"], pos + 1]
@@ -341,10 +350,14 @@ make a function called at_block_stop takes toks, pos returns r
   if t[0] == "EOF" then
     return true
   else
-    if (t[0] == "IDENT") and ((t[1] == "end") or (t[1] == "else")) then
+    if (t[0] == "IDENT") and ((t[1] == "end") or (t[1] == "else") or (t[1] == "elif")) then
       return true
     else
-      return false
+      if (t[0] == "OP") and (t[1] == "}") then
+        return true
+      else
+        return false
+      end
     end
   end
 end
@@ -366,39 +379,106 @@ make a function called parse_stmts_until takes toks, pos returns r
   return [stmts, p]
 end
 
-make a function called parse_if takes toks, pos returns r
-  # pos points at 'if'
-  let c = parse_expr(toks, pos + 1)
-  let cond = c[0]
-  let p = c[1]
-  let t = vec_get(toks, p)
-  if tok_is(t, "IDENT", "then") then
-    let thenPart = parse_stmts_until(toks, p + 1)
-    let p2 = thenPart[1]
-    let t2 = vec_get(toks, p2)
-    if tok_is(t2, "IDENT", "else") then
-      let elsePart = parse_stmts_until(toks, p2 + 1)
-      let p3 = elsePart[1]
+make a function called parse_if_then_tail takes toks, cond, pos returns r
+  # pos points just after 'then'. Handles [elif cond then ...]* [else ...] end.
+  let thenPart = parse_stmts_until(toks, pos)
+  let p2 = thenPart[1]
+  let t2 = vec_get(toks, p2)
+  if tok_is(t2, "IDENT", "else") then
+    let elsePart = parse_stmts_until(toks, p2 + 1)
+    let p3 = elsePart[1]
+    let t3 = vec_get(toks, p3)
+    if tok_is(t3, "IDENT", "end") then
+      return [["If", cond, thenPart[0], elsePart[0]], p3 + 1]
+    else
+      return [["Err", "expected end after else block"], p3]
+    end
+  else
+    if tok_is(t2, "IDENT", "elif") then
+      let c2 = parse_expr(toks, p2 + 1)
+      let cond2 = c2[0]
+      let p3 = c2[1]
       let t3 = vec_get(toks, p3)
-      if tok_is(t3, "IDENT", "end") then
-        return [["If", cond, thenPart[0], elsePart[0]], p3 + 1]
+      if tok_is(t3, "IDENT", "then") then
+        let nested = parse_if_then_tail(toks, cond2, p3 + 1)
+        return [["If", cond, thenPart[0], [nested[0]]], nested[1]]
       else
-        return [["Err", "expected end after else block"], p3]
+        return [["Err", "expected then after elif condition"], p3]
       end
     else
       if tok_is(t2, "IDENT", "end") then
         return [["If", cond, thenPart[0], []], p2 + 1]
       else
-        return [["Err", "expected else or end after if block"], p2]
+        return [["Err", "expected else, elif, or end after if block"], p2]
+      end
+    end
+  end
+end
+
+make a function called parse_if_brace_tail takes toks, cond, pos returns r
+  # pos points just after '{'. Handles [elif cond { ... }]* [else { ... }] '}'.
+  let thenPart = parse_stmts_until(toks, pos)
+  let p2 = thenPart[1]
+  let t2 = vec_get(toks, p2)
+  if tok_is(t2, "OP", "}") then
+    let p3 = p2 + 1
+    let t3 = vec_get(toks, p3)
+    if tok_is(t3, "IDENT", "else") then
+      let t4 = vec_get(toks, p3 + 1)
+      if tok_is(t4, "OP", "{") then
+        let elsePart = parse_stmts_until(toks, p3 + 2)
+        let p5 = elsePart[1]
+        let t5 = vec_get(toks, p5)
+        if tok_is(t5, "OP", "}") then
+          return [["If", cond, thenPart[0], elsePart[0]], p5 + 1]
+        else
+          return [["Err", "expected } after else block"], p5]
+        end
+      else
+        return [["Err", "expected { after else"], p3 + 1]
+      end
+    else
+      if tok_is(t3, "IDENT", "elif") then
+        let c2 = parse_expr(toks, p3 + 1)
+        let cond2 = c2[0]
+        let p4 = c2[1]
+        let t4 = vec_get(toks, p4)
+        if tok_is(t4, "OP", "{") then
+          let nested = parse_if_brace_tail(toks, cond2, p4 + 1)
+          return [["If", cond, thenPart[0], [nested[0]]], nested[1]]
+        else
+          return [["Err", "expected { after elif condition"], p4]
+        end
+      else
+        return [["If", cond, thenPart[0], []], p3]
       end
     end
   else
-    return [["Err", "expected then after if condition"], p]
+    return [["Err", "expected } after if block"], p2]
+  end
+end
+
+make a function called parse_if takes toks, pos returns r
+  # pos points at 'if'. Supports both `if cond then ... end` and
+  # `if cond { ... }`, with `elif` accepted in either form.
+  let c = parse_expr(toks, pos + 1)
+  let cond = c[0]
+  let p = c[1]
+  let t = vec_get(toks, p)
+  if tok_is(t, "IDENT", "then") then
+    return parse_if_then_tail(toks, cond, p + 1)
+  else
+    if tok_is(t, "OP", "{") then
+      return parse_if_brace_tail(toks, cond, p + 1)
+    else
+      return [["Err", "expected then or { after if condition"], p]
+    end
   end
 end
 
 make a function called parse_while takes toks, pos returns r
-  # pos points at 'while'
+  # pos points at 'while'. Supports both `while cond do ... end` and
+  # `while cond { ... }`.
   let c = parse_expr(toks, pos + 1)
   let cond = c[0]
   let p = c[1]
@@ -413,7 +493,18 @@ make a function called parse_while takes toks, pos returns r
       return [["Err", "expected end after while body"], p2]
     end
   else
-    return [["Err", "expected do after while condition"], p]
+    if tok_is(t, "OP", "{") then
+      let body = parse_stmts_until(toks, p + 1)
+      let p2 = body[1]
+      let t2 = vec_get(toks, p2)
+      if tok_is(t2, "OP", "}") then
+        return [["While", cond, body[0]], p2 + 1]
+      else
+        return [["Err", "expected } after while body"], p2]
+      end
+    else
+      return [["Err", "expected do or { after while condition"], p]
+    end
   end
 end
 
@@ -462,12 +553,23 @@ make a function called parse_function_def takes toks, pos returns r
       # return-var hint: parsed and ignored (Stage 1 requires explicit return)
       let p = p + 2
     end
-    let body = parse_stmts_until(toks, p)
-    let p2 = body[1]
-    if tok_is(vec_get(toks, p2), "IDENT", "end") then
-      return [["Func", name, params, body[0]], p2 + 1]
+    # Body may be `... end` (word form) or `{ ... }` (brace form).
+    if tok_is(vec_get(toks, p), "OP", "{") then
+      let body = parse_stmts_until(toks, p + 1)
+      let p2 = body[1]
+      if tok_is(vec_get(toks, p2), "OP", "}") then
+        return [["Func", name, params, body[0]], p2 + 1]
+      else
+        return [["Err", "expected } after function body"], p2]
+      end
     else
-      return [["Err", "expected end after function body"], p2]
+      let body = parse_stmts_until(toks, p)
+      let p2 = body[1]
+      if tok_is(vec_get(toks, p2), "IDENT", "end") then
+        return [["Func", name, params, body[0]], p2 + 1]
+      else
+        return [["Err", "expected end after function body"], p2]
+      end
     end
   else
     return [["Err", "expected function name"], p]
@@ -475,7 +577,7 @@ make a function called parse_function_def takes toks, pos returns r
 end
 
 make a function called parse_when takes toks, pos returns r
-  # pos points at 'when'; expect: when EVENT do body end
+  # pos points at 'when'; expect: when EVENT do body end, or when EVENT { body }
   let nameTok = vec_get(toks, pos + 1)
   if nameTok[0] == "IDENT" then
     let ev = nameTok[1]
@@ -489,7 +591,17 @@ make a function called parse_when takes toks, pos returns r
         return [["Err", "expected end after when body"], p2]
       end
     else
-      return [["Err", "expected do after when event"], p]
+      if tok_is(vec_get(toks, p), "OP", "{") then
+        let body = parse_stmts_until(toks, p + 1)
+        let p2 = body[1]
+        if tok_is(vec_get(toks, p2), "OP", "}") then
+          return [["When", ev, body[0]], p2 + 1]
+        else
+          return [["Err", "expected } after when body"], p2]
+        end
+      else
+        return [["Err", "expected do or { after when event"], p]
+      end
     end
   else
     return [["Err", "expected event name after when"], pos + 1]
@@ -502,14 +614,20 @@ make a function called parse_stmt takes toks, pos returns r
   let tx = t[1]
   if ty == "IDENT" then
     if tx == "let" then
-      let nameTok = vec_get(toks, pos + 1)
+      let mutTok = vec_get(toks, pos + 1)
+      let isMut = tok_is(mutTok, "IDENT", "mut")
+      let nameIdx = pos + 1
+      if isMut then
+        let nameIdx = pos + 2
+      end
+      let nameTok = vec_get(toks, nameIdx)
       let name = nameTok[1]
-      let eqTok = vec_get(toks, pos + 2)
+      let eqTok = vec_get(toks, nameIdx + 1)
       if tok_is(eqTok, "OP", "=") then
-        let e = parse_expr(toks, pos + 3)
-        return [["Let", name, e[0]], e[1]]
+        let e = parse_expr(toks, nameIdx + 2)
+        return [["Let", name, e[0], false, isMut], e[1]]
       else
-        return [["Err", "expected = after let name"], pos + 1]
+        return [["Err", "expected = after let name"], nameIdx]
       end
     else
       if tx == "if" then
@@ -532,13 +650,33 @@ make a function called parse_stmt takes toks, pos returns r
               if tx == "when" then
                 return parse_when(toks, pos)
               else
-                # general call statement: NAME(args)
+                # bare identifier statement: call NAME(args), bare
+                # reassignment NAME = value, or member assignment
+                # obj.prop = value.
                 let nx = vec_get(toks, pos + 1)
                 if tok_is(nx, "OP", "(") then
                   let a = parse_args(toks, pos + 2)
                   return [["Expr", ["Call", tx, a[0]]], a[1]]
                 else
-                  return [["Err", "unexpected token '" + tx + "'"], pos + 1]
+                  if tok_is(nx, "OP", "=") then
+                    let vr = parse_expr(toks, pos + 2)
+                    return [["Let", tx, vr[0], true, false], vr[1]]
+                  else
+                    if tok_is(nx, "OP", ".") then
+                      let r = parse_postfix(toks, pos)
+                      let node = r[0]
+                      let p2 = r[1]
+                      let eqTok = vec_get(toks, p2)
+                      if (node[0] == "Member") and tok_is(eqTok, "OP", "=") then
+                        let vr = parse_expr(toks, p2 + 1)
+                        return [["MemberAssign", node[1], node[2], vr[0]], vr[1]]
+                      else
+                        return [["Expr", node], p2]
+                      end
+                    else
+                      return [["Err", "unexpected token '" + tx + "'"], pos + 1]
+                    end
+                  end
                 end
               end
             end
@@ -636,6 +774,9 @@ make a function called ast_to_str takes node returns s
                       if ty == "Let" then
                         return "Let " + node[1] + " = " + ast_to_str(node[2])
                       else
+                        if ty == "MemberAssign" then
+                          return ast_to_str(node[1]) + "." + node[2] + " = " + ast_to_str(node[3])
+                        else
                         if ty == "Expr" then
                           return ast_to_str(node[1])
                         else
@@ -669,6 +810,7 @@ make a function called ast_to_str takes node returns s
                     end
                   end
                 end
+              end
               end
             end
           end

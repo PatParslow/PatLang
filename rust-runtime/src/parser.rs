@@ -53,9 +53,42 @@ impl<'a> Parser<'a> {
 
     fn can_start_statement(&self) -> bool {
         match self.curr {
-            Token::Let | Token::Fn | Token::If | Token::Return => true,
-            Token::Identifier(_) | Token::Number(_) | Token::Float(_) | Token::String(_) | Token::LParen => true, // expression stmt
+            Token::Let | Token::Fn | Token::If | Token::While | Token::Return | Token::Goal | Token::Rule => true,
+            Token::Identifier(_) | Token::Number(_) | Token::Float(_) | Token::String(_) | Token::LParen | Token::BlockStart => true, // expression stmt
             _ => false,
+        }
+    }
+
+    // Shared word-delimited block collector for `do...end`/`then...end`
+    // style blocks, replacing what used to be four independently
+    // hand-duplicated loops (if/while/when/inline-make-function). Consumes
+    // statements via `parse_statement()`, using `can_start_statement()` as
+    // the continue-condition, until a bare identifier in `stop_words` is
+    // seen (or, when `stop_on_else` is set, the dedicated `Token::Else`).
+    // Returns the body plus which stop word was actually found, so callers
+    // like `if` can distinguish `else` from `end`.
+    fn parse_word_block(&mut self, stop_words: &[&str], stop_on_else: bool) -> Result<(Vec<Stmt>, String), ParserError> {
+        let mut body: Vec<Stmt> = Vec::new();
+        loop {
+            self.consume_newlines()?;
+            if stop_on_else && matches!(self.curr, Token::Else) {
+                return Ok((body, "else".to_string()));
+            }
+            if let Token::Identifier(ref t) = self.curr {
+                if stop_words.contains(&t.as_str()) {
+                    let found = t.clone();
+                    self.advance()?;
+                    return Ok((body, found));
+                }
+            }
+            if matches!(self.curr, Token::EOF) {
+                return Ok((body, "EOF".to_string()));
+            }
+            if self.can_start_statement() {
+                body.push(self.parse_statement()?);
+            } else {
+                self.advance()?;
+            }
         }
     }
 
@@ -260,19 +293,7 @@ impl<'a> Parser<'a> {
                         } else if matches!(&self.curr, Token::Identifier(s) if s == "do") {
                             // Stage 1 form: when EVENT do ... end
                             self.advance()?; // 'do'
-                            let mut body: Vec<Stmt> = Vec::new();
-                            loop {
-                                if let Token::Identifier(ref t) = self.curr { if t == "end" { self.advance()?; break; } }
-                                if matches!(self.curr, Token::EOF) { break; }
-                                self.consume_newlines()?;
-                                if let Token::Identifier(ref t) = self.curr { if t == "end" { self.advance()?; break; } }
-                                if matches!(self.curr, Token::Identifier(_)|Token::Let|Token::Fn|Token::If|Token::While|Token::Return|Token::Goal|Token::Rule|Token::Number(_)|Token::Float(_)|Token::String(_)|Token::LParen) {
-                                    body.push(self.parse_statement()?);
-                                } else if !matches!(self.curr, Token::EOF) {
-                                    self.advance()?;
-                                }
-                                self.consume_newlines()?;
-                            }
+                            let (body, _) = self.parse_word_block(&["end"], false)?;
                             return Ok(Stmt::When { event: event_name, body });
                         } else {
                             // Fallback: skip to next block to avoid breaking flow
@@ -360,10 +381,10 @@ impl<'a> Parser<'a> {
                         let value = self.parse_expression(0)?;
                         return Ok(Stmt::MemberAssign { object: *object, property, value });
                     } else if let Expr::Identifier(name) = expr {
-                        // fallback: simple identifier assignment
+                        // fallback: simple identifier assignment (bare reassignment)
                         self.advance()?; // consume '='
                         let value = self.parse_expression(0)?;
-                        return Ok(Stmt::Let { name, value });
+                        return Ok(Stmt::Let { name, value, is_reassignment: true, mutable: false });
                     } else {
                         return Err(ParserError::UnexpectedToken { token: self.curr.clone(), line: self.line_no, hint: "Unexpected token; check for missing operators or delimiters" });
                     }
@@ -430,21 +451,7 @@ impl<'a> Parser<'a> {
                 }
             }
             // Parse statements until we encounter Identifier("end")
-            let mut body: Vec<Stmt> = Vec::new();
-            loop {
-                // stop on 'end' or EOF
-                if let Token::Identifier(ref t) = self.curr { if t == "end" { self.advance()?; break; } }
-                if matches!(self.curr, Token::EOF) { break; }
-                self.consume_newlines()?;
-                if matches!(self.curr, Token::Identifier(_)|Token::Let|Token::Fn|Token::If|Token::While|Token::Return|Token::Goal|Token::Rule|Token::Number(_)|Token::Float(_)|Token::String(_)|Token::LParen|Token::BlockStart) {
-                    let st = self.parse_statement()?;
-                    body.push(st);
-                } else {
-                    // advance to avoid infinite loop
-                    self.advance()?;
-                }
-                self.consume_newlines()?;
-            }
+            let (mut body, _) = self.parse_word_block(&["end"], false)?;
             // If a return hint was provided and no explicit return found, append it as final return
             if let Some(var) = return_hint {
                 let has_return = body.iter().any(|s| matches!(s, Stmt::Return(_)));
@@ -534,6 +541,11 @@ impl<'a> Parser<'a> {
     fn parse_let(&mut self) -> Result<Stmt, ParserError> {
         // consume 'let'
         self.advance()?;
+        // optional 'mut'
+        let mutable = if let Token::Identifier(ref s) = self.curr {
+            if s == "mut" { true } else { false }
+        } else { false };
+        if mutable { self.advance()?; }
         let name = match &self.curr {
             Token::Identifier(s) => s.clone(),
             _ => return Err(ParserError::ExpectedIdentifier { line: self.line_no, hint: "Expected variable name after 'let'" }),
@@ -548,7 +560,7 @@ impl<'a> Parser<'a> {
         // value expression (allow multi-line continuation)
         let value = self.parse_expression(0)?;
         // optional terminator handled by caller
-        Ok(Stmt::Let { name, value })
+        Ok(Stmt::Let { name, value, is_reassignment: false, mutable })
     }
 
     fn parse_assignment(&mut self) -> Result<Stmt, ParserError> {
@@ -562,7 +574,7 @@ impl<'a> Parser<'a> {
             _ => return Err(ParserError::ExpectedToken { expected: "'=' after identifier", line: self.line_no, hint: "Use 'name = value'" }),
         }
         let value = self.parse_expression(0)?;
-        Ok(Stmt::Let { name, value })
+        Ok(Stmt::Let { name, value, is_reassignment: true, mutable: false })
     }
 
     fn parse_function(&mut self) -> Result<Stmt, ParserError> {
@@ -687,50 +699,9 @@ impl<'a> Parser<'a> {
             return Ok(Stmt::If { cond, then_branch, else_branch });
         } else if let Token::Identifier(ref s) = self.curr {
             if s == "then" {
-                // Ruby-like: if cond then ... else ... end
+                // Ruby-like: if cond then ... [elif cond then ...] [else ...] end
                 self.advance()?; // consume 'then'
-                let mut then_branch: Vec<Stmt> = Vec::new();
-                // parse statements until 'else' or 'end'
-                loop {
-                    // stop on else/end/EOF
-                    match &self.curr {
-                        Token::Else => break,
-                        Token::Identifier(t) if t == "end" => break,
-                        Token::EOF => break,
-                        _ => {}
-                    }
-                    // consume newlines
-                    self.consume_newlines()?;
-                    if matches!(self.curr, Token::Identifier(_)|Token::Let|Token::Fn|Token::If|Token::While|Token::Return|Token::Goal|Token::Rule|Token::Number(_)|Token::Float(_)|Token::String(_)|Token::LParen) {
-                        let st = self.parse_statement()?;
-                        then_branch.push(st);
-                    } else {
-                        // advance to avoid infinite loop
-                        if !matches!(self.curr, Token::EOF) { self.advance()?; }
-                    }
-                    self.consume_newlines()?;
-                }
-                // optional else
-                let else_branch = if matches!(self.curr, Token::Else) {
-                    self.advance()?; // consume 'else'
-                    let mut else_body: Vec<Stmt> = Vec::new();
-                    loop {
-                        match &self.curr {
-                            Token::Identifier(t) if t == "end" => break,
-                            Token::EOF => break,
-                            _ => {}
-                        }
-                        self.consume_newlines()?;
-                        if matches!(self.curr, Token::Identifier(_)|Token::Let|Token::Fn|Token::If|Token::While|Token::Return|Token::Goal|Token::Rule|Token::Number(_)|Token::Float(_)|Token::String(_)|Token::LParen) {
-                            let st = self.parse_statement()?; else_body.push(st);
-                        } else { if !matches!(self.curr, Token::EOF) { self.advance()?; } }
-                        self.consume_newlines()?;
-                    }
-                    Some(else_body)
-                } else { None };
-                // require 'end'
-                if let Token::Identifier(ref endkw) = self.curr { if endkw == "end" { self.advance()?; } }
-                return Ok(Stmt::If { cond, then_branch, else_branch });
+                return self.parse_if_then_tail(cond);
             }
         }
         // fallback: expecting brace form if none matched
@@ -739,6 +710,28 @@ impl<'a> Parser<'a> {
     self.expect(Token::BlockStart, "'{' to start 'if' block", "Start the 'if' block with '{'" )?;
         let then_branch = self.parse_block()?;
         Ok(Stmt::If { cond, then_branch, else_branch: None })
+    }
+
+    // Parses the tail of a Ruby-like `if cond then ...` form, assuming
+    // 'then' has already been consumed: then-branch, optional `elif`
+    // (desugared to `else { if ... }`, matching the brace form), optional
+    // `else`, and the closing `end`.
+    fn parse_if_then_tail(&mut self, cond: Expr) -> Result<Stmt, ParserError> {
+        let (then_branch, stopper) = self.parse_word_block(&["end", "elif"], true)?;
+        let else_branch = if stopper == "else" {
+            let (else_body, _) = self.parse_word_block(&["end"], false)?;
+            Some(else_body)
+        } else if stopper == "elif" {
+            let prev_flag2 = self.stop_trailing_block_for_condition;
+            self.stop_trailing_block_for_condition = true;
+            let cond2 = self.parse_expression(0)?;
+            self.stop_trailing_block_for_condition = prev_flag2;
+            self.consume_newlines()?;
+            if let Token::Identifier(ref s2) = self.curr { if s2 == "then" { self.advance()?; } }
+            let nested = self.parse_if_then_tail(cond2)?;
+            Some(vec![nested])
+        } else { None };
+        Ok(Stmt::If { cond, then_branch, else_branch })
     }
 
     fn parse_while(&mut self) -> Result<Stmt, ParserError> {
@@ -760,19 +753,7 @@ impl<'a> Parser<'a> {
         if let Token::Identifier(ref s) = self.curr {
             if s == "do" {
                 self.advance()?;
-                let mut body: Vec<Stmt> = Vec::new();
-                loop {
-                    match &self.curr {
-                        Token::Identifier(t) if t == "end" => { self.advance()?; break; }
-                        Token::EOF => break,
-                        _ => {}
-                    }
-                    self.consume_newlines()?;
-                    if matches!(self.curr, Token::Identifier(_)|Token::Let|Token::Fn|Token::If|Token::While|Token::Return|Token::Goal|Token::Rule|Token::Number(_)|Token::Float(_)|Token::String(_)|Token::LParen) {
-                        let st = self.parse_statement()?; body.push(st);
-                    } else { if !matches!(self.curr, Token::EOF) { self.advance()?; } }
-                    self.consume_newlines()?;
-                }
+                let (body, _) = self.parse_word_block(&["end"], false)?;
                 return Ok(Stmt::While { cond, body });
             }
         }
@@ -868,10 +849,14 @@ impl<'a> Parser<'a> {
                             _ => { break; }
                         }
                     }
-                    // Expect body block
+                    // Expect body block: either '{ ... }' or 'do ... end'
                     let body = if matches!(self.curr, Token::BlockStart) {
                         self.advance()?; // '{'
                         self.parse_block()?
+                    } else if matches!(&self.curr, Token::Identifier(s) if s == "do") {
+                        self.advance()?; // 'do'
+                        let (b, _) = self.parse_word_block(&["end"], false)?;
+                        b
                     } else { vec![] };
                     Expr::Closure { params, body }
                 }

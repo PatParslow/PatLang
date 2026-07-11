@@ -80,9 +80,11 @@ fn test_stmt_variants() {
     let s = Stmt::Let {
         name: "x".to_string(),
         value: Expr::Number(2.0),
+        is_reassignment: false,
+        mutable: false,
     };
     match s {
-        Stmt::Let { name, value } => {
+        Stmt::Let { name, value, .. } => {
             assert_eq!(name, "x");
             assert_eq!(value, Expr::Number(2.0));
         }

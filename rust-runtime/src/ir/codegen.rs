@@ -538,6 +538,30 @@ fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Va
 // add/sub/mul/div/modu/cmp/to_s/neg now come from whichever value-module is
 // selected (see the note above `enum BinOpKind`).
 
+// Native builds run on a spawned thread with a much larger stack than the
+// OS-default main thread stack: deeply recursive-descent programs (notably
+// the self-hosted compiler recompiling its own ~300K-char source) can
+// exceed the default stack, especially at lower optimization levels where
+// inlining/tail-call-friendly codegen doesn't shrink frame sizes. WASM
+// (wasip1) targets keep the original direct-call main -- std::thread
+// support there is not guaranteed across WASI runtimes.
+#[cfg(not(target_arch = "wasm32"))]
+fn main(){
+    let child = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(|| {
+            let program = build_program();
+            match run(&program) {
+                Ok(v) => { println!("{}", display_value(&v)); 0 }
+                Err(e) => { eprintln!("IR runtime error: {}", e); 1 }
+            }
+        })
+        .expect("failed to spawn worker thread");
+    let code = child.join().unwrap_or(1);
+    std::process::exit(code);
+}
+
+#[cfg(target_arch = "wasm32")]
 fn main(){
     let program = build_program();
     match run(&program) { Ok(v) => println!("{}", display_value(&v)), Err(e) => { eprintln!("IR runtime error: {}", e); std::process::exit(1); } }
@@ -2893,12 +2917,26 @@ fn host_call_codegen_bootstrap_inner(name: &str, args: &[Value]) -> Result<Value
                 Ok(Value::List(full.into_iter().map(Value::String).collect()))
             }
             "rustc_build" => {
-                // rustc_build(rust_source, out_path[, target_triple]) -> artifact path.
+                // rustc_build(rust_source, out_path[, target_triple[, opt_level]]) -> artifact path.
                 // The self-hosted compiler's back end: write source, run rustc.
                 // Optional target triple (e.g. "wasm32-wasip1") cross-compiles.
+                // Optional opt_level ("0".."3", "s", "z") overrides the default
+                // -O (opt-level=2) used for ordinary native builds. Needed
+                // because LLVM's optimizer has been observed to blow up to
+                // 30GB+ RAM at opt-level 2 (and hang indefinitely at level 1,
+                // still consuming CPU with no progress) on the self-hosted
+                // compiler's own ~1.6MB generated interpreter source -- a
+                // pathological case tied to that file's size/shape, not a
+                // general problem (ordinary, much smaller generated programs
+                // compile fine at the default level). opt-level=0 was
+                // confirmed to compile that same file correctly in ~10s with
+                // no memory blowup, so callers building unusually large
+                // generated programs (self_hosting/build_patc1.patlang) pass
+                // "0" explicitly rather than changing the default for everyone.
                 let src = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => return Err("rustc_build: expected Rust source string".into()) };
                 let out = match args.get(1) { Some(Value::String(s)) if !s.trim().is_empty() => s.clone(), _ => return Err("rustc_build: expected output path".into()) };
                 let target = match args.get(2) { Some(Value::String(s)) if !s.trim().is_empty() => Some(s.clone()), _ => None };
+                let opt_level = match args.get(3) { Some(Value::String(s)) if !s.trim().is_empty() => Some(s.clone()), _ => None };
                 let mut tmp = std::env::temp_dir();
                 tmp.push("patlang_selfhost_build");
                 std::fs::create_dir_all(&tmp).map_err(|e| format!("rustc_build: temp dir: {}", e))?;
@@ -2908,9 +2946,16 @@ fn host_call_codegen_bootstrap_inner(name: &str, args: &[Value]) -> Result<Value
                 let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
                 let mut cmd = std::process::Command::new(&rustc);
                 // Size-optimize + strip WASM builds (measured ~7x smaller, faster
-                // to compile, byte-identical stdout); native keeps full -O.
+                // to compile, byte-identical stdout); native keeps full -O
+                // unless the caller explicitly overrides via opt_level.
                 let is_wasm = target.as_deref().map(|t| t.contains("wasm")).unwrap_or(false);
-                if is_wasm { cmd.arg("-C").arg("opt-level=z"); } else { cmd.arg("-O"); }
+                if let Some(lvl) = &opt_level {
+                    cmd.arg("-C").arg(format!("opt-level={}", lvl));
+                } else if is_wasm {
+                    cmd.arg("-C").arg("opt-level=z");
+                } else {
+                    cmd.arg("-O");
+                }
                 cmd.arg("-C").arg("strip=symbols");
                 cmd.arg(&src_path).arg("-o").arg(&out);
                 if let Some(t) = &target { cmd.arg("--target").arg(t); }

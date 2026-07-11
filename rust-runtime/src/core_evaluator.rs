@@ -773,7 +773,7 @@ fn stmt_to_astnode(stmt: &crate::ast::Stmt) -> AstNode {
     match stmt {
         crate::ast::Stmt::ExprStmt(expr) => AstNode::from(expr.clone()),
     // Recognize `let name = Class.new(...)` and convert to built-in new("Class","name")
-        crate::ast::Stmt::Let { name, value } => {
+        crate::ast::Stmt::Let { name, value, .. } => {
             if let crate::ast::Expr::Call { function, args: _ } = value {
                 if let crate::ast::Expr::Member { object, property } = &**function {
                     if let crate::ast::Expr::Identifier(class_name) = &**object {
