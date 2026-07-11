@@ -464,6 +464,35 @@ fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Va
                         .ok_or_else(|| format!("apply: function '{}' not found", fname))?;
                     let r = run_function(program, callee, &args[1..])?;
                     stack.push(r);
+                } else if n == "parallel_map" {
+                    // parallel_map(items, "func_name") -> list, computed
+                    // across real OS threads (std::thread::scope -- Program/
+                    // Function/Value here are plain data with no interior
+                    // mutability, so workers can borrow `program` directly,
+                    // no cloning needed). Mirrors ir/interpreter.rs's own
+                    // parallel_map exactly.
+                    let items = match args.get(0) {
+                        Some(Value::List(xs)) => xs.clone(),
+                        other => return Err(format!("parallel_map: expected a list as the first arg, got {:?}", other)),
+                    };
+                    let fname = match args.get(1) {
+                        Some(Value::String(s)) => s.clone(),
+                        other => return Err(format!("parallel_map: expected a function name string as the second arg, got {:?}", other)),
+                    };
+                    if !program.functions.contains_key(&fname) {
+                        return Err(format!("parallel_map: function '{}' not found", fname));
+                    }
+                    let results: Result<Vec<Value>, String> = std::thread::scope(|scope| {
+                        let handles: Vec<_> = items.iter().map(|item| {
+                            let fname = &fname;
+                            scope.spawn(move || {
+                                let callee = program.functions.get(fname).unwrap();
+                                run_function(program, callee, std::slice::from_ref(item))
+                            })
+                        }).collect();
+                        handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("parallel_map: a worker thread panicked".to_string()))).collect()
+                    });
+                    stack.push(Value::List(results?));
                 } else {
                     let r = Host::call(n, &args)?; stack.push(r);
                 }

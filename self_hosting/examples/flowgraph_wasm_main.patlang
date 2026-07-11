@@ -1,0 +1,147 @@
+# Flowgraph wasm driver (concatenate after lib/lexer + lib/parser + lib/lower
+# + lib/html). Renders every function in a given PatLang source's flow graph
+# as SVG. No rustc once this module is built -- unlike tools/flowgraph_main.
+# patlang (which reads program files from disk via read_file/argv and
+# writes an HTML file via write_file), this variant takes source TEXT
+# directly as its single argv entry and prints the rendered SVG HTML to
+# stdout, so it can run against arbitrary pasted/example source inside the
+# WASI sandbox (no real filesystem needed).
+#
+# Usage: flowgraph_wasm <source text>
+
+make a function called contains_num takes xs, v returns r
+  let i = 0
+  while i < xs.length do
+    if xs[i] == v then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called instr_text takes ins returns s
+  let s = ins[0]
+  if ins.length > 1 then
+    let s = s + " " + ins[1]
+  end
+  if ins.length > 2 then
+    let s = s + " " + ins[2]
+  end
+  return s
+end
+
+# Render one function's CFG as SVG appended to builder b; returns block count
+make a function called render_func takes b, f returns blocks
+  let instrs = f[3]
+  let n = instrs.length
+  let starts = [0]
+  let i = 0
+  while i < n do
+    let ins = instrs[i]
+    let tag = ins[0]
+    if (tag == "Jump") or (tag == "JumpIfFalse") then
+      if not contains_num(starts, ins[1]) then
+        let starts = list_push(starts, ins[1])
+      end
+      if not contains_num(starts, i + 1) then
+        let starts = list_push(starts, i + 1)
+      end
+    end
+    let i = i + 1
+  end
+  let rowh = 26
+  let y = 10
+  sb_push(b, "<h3>" + html_escape(f[1]) + "</h3>" + nl())
+  let blockTops = []
+  let blockIds = []
+  let i = 0
+  let bod = sb_new()
+  let edges = sb_new()
+  let blocks = 0
+  while i < n do
+    if contains_num(starts, i) then
+      let blocks = blocks + 1
+      let blockTops = list_push(blockTops, y)
+      let blockIds = list_push(blockIds, i)
+      sb_push(bod, "<text x='16' y='" + (y + 16) + "' class='bh'>B@" + i + "</text>" + nl())
+      let y = y + rowh
+    end
+    let ins = instrs[i]
+    sb_push(bod, "<text x='28' y='" + (y + 14) + "'>" + html_escape(instr_text(ins)) + "</text>" + nl())
+    let tag = ins[0]
+    if (tag == "Jump") or (tag == "JumpIfFalse") then
+      let edges = edges
+      sb_push(edges, "" + (y + 8) + " " + ins[1] + " " + tag + "\n")
+    end
+    let y = y + rowh
+    let i = i + 1
+  end
+  let height = y + 20
+  sb_push(b, "<svg viewBox='0 0 560 " + height + "' width='560' height='" + height + "' xmlns='http://www.w3.org/2000/svg'>" + nl())
+  let elist = sb_str(edges)
+  let eh = str_intern(elist)
+  let elen = sc_len(eh)
+  let k = 0
+  let word = sb_new()
+  let fields = []
+  while k <= elen do
+    let c = sc_code(eh, k)
+    if (c == 32) or (c == 10) or (c == -1) then
+      let w = sb_str(word)
+      let word = sb_new()
+      if w != "" then
+        let fields = list_push(fields, w)
+      end
+      if (c == 10) and (fields.length == 3) then
+        let fromY = to_num(fields[0])
+        let tIdx = to_num(fields[1])
+        let ti = 0
+        let tY = 10
+        while ti < blockIds.length do
+          if blockIds[ti] == tIdx then
+            let tY = blockTops[ti]
+          end
+          let ti = ti + 1
+        end
+        let color = "#d64"
+        if fields[2] == "Jump" then
+          let color = "#48c"
+        end
+        sb_push(b, "<path d='M 330 " + fromY + " C 520 " + fromY + ", 520 " + (tY + 10) + ", 335 " + (tY + 10) + "' fill='none' stroke='" + color + "' marker-end='url(#arr)'/>" + nl())
+        let fields = []
+      end
+    else
+      sb_push(word, sc_char(eh, k))
+    end
+    let k = k + 1
+  end
+  sb_push(b, "<defs><marker id='arr' viewBox='0 0 8 8' refX='7' refY='4' markerWidth='6' markerHeight='6' orient='auto'><path d='M 0 0 L 8 4 L 0 8 z' fill='#888'/></marker></defs>" + nl())
+  sb_push(b, sb_str(bod))
+  sb_push(b, "</svg>" + nl())
+  return blocks
+end
+
+# ---- driver ----
+let args = argv()
+let source = ""
+if args.length >= 1 then
+  let source = args[0]
+end
+
+let toks = tokenize(source)
+let ast = parse_program(toks)
+let ir = lower_program(ast)
+let funcs = ir[2]
+
+let b = sb_new()
+if funcs.length == 0 then
+  sb_push(b, "<p><em>No functions found (top-level statements aren't shown as a flow graph).</em></p>" + nl())
+else
+  let i = 0
+  while i < funcs.length do
+    render_func(b, funcs[i])
+    let i = i + 1
+  end
+end
+print(sb_str(b))

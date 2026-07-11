@@ -1,0 +1,204 @@
+<h1>patbuild: a goal-oriented build system</h1>
+<p>Driven by a manifest file (<code>self_hosting/patbuild.manifest</code>):<pre class='out'># patbuild manifest: name &lt;source or -&gt; [deps...]
+fib_bench self_hosting/examples/fib_bench.patlang
+echo_server self_hosting/examples/echo_server.patlang
+contracts_demo self_hosting/examples/contracts_demo.patlang
+pos_demo self_hosting/lib/pos.patlang+self_hosting/examples/pos_demo.patlang
+all - fib_bench echo_server contracts_demo pos_demo
+</pre>Targets are objects, dependencies are walked recursively, finished builds become <code>fact</code>s, progress is reported via events. By default each target is only lowered to IR and checked (no rustc at all, matching the in-browser playground); pass <code>--native</code> to also compile every target to a real executable via rustc &mdash; the transcript below was captured that way. <strong>Native transcript only, no &quot;run in browser&quot; button</strong>: unlike the demos above, patbuild genuinely needs real filesystem access it can't get in the WASI sandbox &mdash; it reads the manifest file plus every target's own source file from disk by path, and (with <code>--native</code>) invokes a real <code>rustc</code> subprocess per target, neither of which a browser sandbox can provide. This is a capability limit, not a performance one (compare the dynamic-syntax demo below, which CAN run in-browser, just impractically slowly for now).</p>
+<details><summary>PatLang source</summary><pre class='src'># =============================================================================
+# patbuild: a goal-oriented build system in PatLang (concatenate after the
+# compiler libs). Targets are OO objects, the dependency graph is walked
+# recursively, completed builds are recorded as facts, and progress is
+# reported through events. By default each target is lowered and executed
+# via run_ir (no rustc, matching how the in-browser playground works); pass
+# --native to compile targets to real .exe artifacts via rustc_build instead.
+# =============================================================================
+
+make a function called target takes name, src, deps returns done
+  new(&quot;Target&quot;, name)
+  send(name, &quot;set&quot;, &quot;src&quot;, src)
+  send(name, &quot;set&quot;, &quot;deps&quot;, deps)
+  send(name, &quot;set&quot;, &quot;built&quot;, &quot;no&quot;)
+  return true
+end
+
+make a function called split_ws takes s returns parts
+  let parts = []
+  let cur = sb_new()
+  let i = 0
+  while i &lt;= s.length do
+    let c = char_code(s, i)
+    if (c == 32) or (c == -1) then
+      let word = sb_str(cur)
+      if word != &quot;&quot; then
+        let parts = list_push(parts, word)
+      end
+      let cur = sb_new()
+    else
+      sb_push(cur, s[i])
+    end
+    let i = i + 1
+  end
+  return parts
+end
+
+# Splits a source spec on '+' so a target can bundle a library with its
+# driver without a module system, e.g. &quot;lib/pos.patlang+examples/pos_demo.patlang&quot;
+make a function called split_plus takes s returns parts
+  let parts = []
+  let cur = sb_new()
+  let i = 0
+  while i &lt;= s.length do
+    let c = char_code(s, i)
+    if (c == 43) or (c == -1) then
+      let piece = sb_str(cur)
+      let cur = sb_new()
+      if piece != &quot;&quot; then
+        let parts = list_push(parts, piece)
+      end
+    else
+      sb_push(cur, s[i])
+    end
+    let i = i + 1
+  end
+  return parts
+end
+
+make a function called read_bundle takes src returns source
+  let files = split_plus(src)
+  let b = sb_new()
+  let i = 0
+  while i &lt; files.length do
+    if i &gt; 0 then
+      sb_push(b, chr(10))
+    end
+    sb_push(b, read_file(files[i]))
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+make a function called build takes name returns ok
+  if get(name, &quot;built&quot;) == &quot;yes&quot; then
+    return true
+  end
+  let deps = split_ws(get(name, &quot;deps&quot;))
+  let i = 0
+  while i &lt; deps.length do
+    build(deps[i])
+    let i = i + 1
+  end
+  let src = get(name, &quot;src&quot;)
+  if src != &quot;&quot; then
+    let source = read_bundle(src)
+    let toks = tokenize(source)
+    let ast = parse_program(toks)
+    let ir = lower_program(ast)
+    if get(&quot;__vars&quot;, &quot;native_mode&quot;) == 1 then
+      let rs = emit_program_rs(ir)
+      let exe = rustc_build(rs, &quot;portfolio/build/&quot; + name + &quot;.exe&quot;)
+      fact(&quot;built&quot;, name, exe)
+    else
+      # Default: verify the self-hosted front end compiles this target to IR,
+      # with no rustc involved. Deliberately does not execute the IR here -
+      # some targets (e.g. echo_server) block on a real network connection
+      # and are meant to be run directly via `pat --ir-run`, not driven
+      # unattended by a build tool.
+      print(&quot;[patbuild] compiled &quot; + name + &quot; to IR (no rustc)&quot;)
+      fact(&quot;built&quot;, name, &quot;(ir-only)&quot;)
+    end
+  end
+  send(name, &quot;set&quot;, &quot;built&quot;, &quot;yes&quot;)
+  emit(&quot;built&quot;, name)
+  return true
+end
+
+when built do
+  print(&quot;[patbuild] built: &quot; + event_data)
+end
+
+# ---- manifest ----
+# Format, one target per line:  name &lt;source-path or -&gt; [dep ...]
+make a function called load_manifest takes path returns count
+  let count = 0
+  let text = read_file(path)
+  let h = str_intern(text)
+  let n = sc_len(h)
+  let i = 0
+  let line = sb_new()
+  while i &lt;= n do
+    let c = sc_code(h, i)
+    if (c == 10) or (c == -1) then
+      let raw = sb_str(line)
+      let line = sb_new()
+      let parts = split_ws(raw)
+      if parts.length &gt;= 2 then
+        if char_code(raw, 0) != 35 then
+          let src = parts[1]
+          if src == &quot;-&quot; then
+            let src = &quot;&quot;
+          end
+          let deps = sb_new()
+          let k = 2
+          while k &lt; parts.length do
+            if k &gt; 2 then
+              sb_push(deps, &quot; &quot;)
+            end
+            sb_push(deps, parts[k])
+            let k = k + 1
+          end
+          target(parts[0], src, sb_str(deps))
+          let count = count + 1
+        end
+      end
+      let i = i + 1
+    else
+      if c != 13 then
+        sb_push(line, sc_char(h, i))
+      end
+      let i = i + 1
+    end
+  end
+  return count
+end
+
+set_var(&quot;native_mode&quot;, 0)
+let raw_args = argv()
+let positional = []
+let i = 0
+while i &lt; raw_args.length do
+  if raw_args[i] == &quot;--native&quot; then
+    set_var(&quot;native_mode&quot;, 1)
+  else
+    let positional = list_push(positional, raw_args[i])
+  end
+  let i = i + 1
+end
+
+let manifest = &quot;self_hosting/patbuild.manifest&quot;
+let goal_target = &quot;all&quot;
+if positional.length &gt;= 1 then
+  let manifest = positional[0]
+end
+if positional.length &gt;= 2 then
+  let goal_target = positional[1]
+end
+let loaded = load_manifest(manifest)
+goal(&quot;ship&quot;, goal_target)
+if get(&quot;__vars&quot;, &quot;native_mode&quot;) == 1 then
+  print(&quot;[patbuild] manifest: &quot; + manifest + &quot; (&quot; + loaded + &quot; targets), goal: &quot; + goal_target + &quot; [native]&quot;)
+else
+  print(&quot;[patbuild] manifest: &quot; + manifest + &quot; (&quot; + loaded + &quot; targets), goal: &quot; + goal_target + &quot; [interpreted]&quot;)
+end
+build(goal_target)
+print(&quot;[patbuild] targets built: &quot; + (query(&quot;built&quot;, &quot;fib_bench&quot;, 0) + query(&quot;built&quot;, &quot;echo_server&quot;, 0) + query(&quot;built&quot;, &quot;contracts_demo&quot;, 0) + query(&quot;built&quot;, &quot;pos_demo&quot;, 0)))
+</pre></details><p class='label'>Native run on the build machine:</p><pre class='out native'>[patbuild] manifest: self_hosting/patbuild.manifest (5 targets), goal: all [native]
+[patbuild] built: fib_bench
+[patbuild] built: echo_server
+[patbuild] built: contracts_demo
+[patbuild] built: pos_demo
+[patbuild] built: all
+[patbuild] targets built: 4
+
+</pre>

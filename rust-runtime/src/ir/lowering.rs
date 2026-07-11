@@ -195,7 +195,8 @@ impl Lowerer {
             "fact"|"query"|"goal"|"new"|"set_var"|"apply"|
             "tcp_listen"|"tcp_connect"|"tcp_accept"|"tcp_accept_timeout"|"sleep_ms"|"tcp_read"|"tcp_write"|"tcp_close"|
             "sqrt"|"pow"|"sin"|"cos"|"tan"|"asin"|"acos"|"atan"|"atan2"|"log"|"exp"|
-            "floor"|"ceil"|"round"|"trunc"|"abs"|"numeric_kind"|"type_of"
+            "floor"|"ceil"|"round"|"trunc"|"abs"|"numeric_kind"|"type_of"|
+            "parallel_map"|"fiber_new"|"fiber_resume"|"fiber_yield"|"fiber_alive"
         )
     }
 

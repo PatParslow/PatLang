@@ -1,0 +1,218 @@
+# =============================================================================
+# General page/section templating library (Stage 1 compilable subset).
+#
+# A tagged-tuple page/section data model -- the same "tagged-tuple + one
+# recursive dispatch function" idiom already used by lib/reflect.patlang's
+# ast_node_to_json and lib/transpile_ruby.patlang's emit_ruby_expr, applied
+# to HTML page assembly instead of AST walking.
+#
+# Two render modes from the SAME page data:
+#   "fragment"   -- bare content (<style> blocks, then <h1>, then sections),
+#                   no <html>/<head>/<body> wrapper. This is the shape
+#                   parslow.net's own site pipeline expects for an ordinary
+#                   educational content page (see tools/site/build.py's
+#                   process_fragment: a raw fragment starting with <h1>,
+#                   with any leading <style>/<script> preserved).
+#   "standalone" -- a complete, self-contained HTML5 document (today's
+#                   behaviour, reusing lib/html.patlang's html_page()), for
+#                   local preview or any other non-site use.
+#
+# Page: ["Page", title, mode, sections]        mode: "fragment"|"standalone"
+# Section/content nodes (extend this list freely -- render_section is the
+# only place that needs a new arm):
+#   ["Heading", level, text]     <h2>/<h3>/... (level 1 is reserved for the
+#                                 page title itself, emitted by render_page)
+#   ["Para", html]                <p>html</p> (html is NOT escaped -- pass
+#                                 already-safe/escaped content, or wrap plain
+#                                 text through html_escape yourself first)
+#   ["Card", title, body_nodes]   a demo-card wrapper (reuses html.patlang's
+#                                 .card CSS class), title optional ("" to omit)
+#   ["CodeBlock", lang, text]     <pre class="src"><code>escaped text</code></pre>
+#   ["Style", css_text]           collected and hoisted to the top by
+#                                 render_page (both modes)
+#   ["Script", js_text]           collected and emitted at the end by
+#                                 render_page (both modes)
+#   ["Raw", html]                 escape hatch: emitted verbatim, unwrapped.
+#                                 Lets existing ad hoc sb_push-built HTML
+#                                 (e.g. build_portfolio.patlang's existing
+#                                 per-card builders) be adopted incrementally
+#                                 without a full rewrite of their internals.
+# =============================================================================
+
+include "html.patlang"
+
+make a function called tpl_page takes title, mode, sections returns page
+  return ["Page", title, mode, sections]
+end
+
+make a function called tpl_heading takes level, text returns node
+  return ["Heading", level, text]
+end
+
+make a function called tpl_para takes html returns node
+  return ["Para", html]
+end
+
+make a function called tpl_card takes title, body_nodes returns node
+  return ["Card", title, body_nodes]
+end
+
+make a function called tpl_code takes lang, text returns node
+  return ["CodeBlock", lang, text]
+end
+
+make a function called tpl_style takes css returns node
+  return ["Style", css]
+end
+
+make a function called tpl_script takes js returns node
+  return ["Script", js]
+end
+
+make a function called tpl_raw takes html returns node
+  return ["Raw", html]
+end
+
+# ---- rendering ----
+
+make a function called render_sections takes nodes returns s
+  let b = sb_new()
+  let i = 0
+  while i < nodes.length do
+    sb_push(b, render_section(nodes[i]))
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+make a function called render_section takes node returns s
+  let ty = node[0]
+  if ty == "Heading" then
+    let tag = "h" + node[1]
+    return "<" + tag + ">" + html_escape(node[2]) + "</" + tag + ">" + nl()
+  else
+    if ty == "Para" then
+      return "<p>" + node[1] + "</p>" + nl()
+    else
+      if ty == "Card" then
+        let b = sb_new()
+        sb_push(b, "<div class=" + q() + "card" + q() + ">" + nl())
+        if node[1].length > 0 then
+          sb_push(b, "<h2>" + html_escape(node[1]) + "</h2>" + nl())
+        end
+        sb_push(b, render_sections(node[2]))
+        sb_push(b, "</div>" + nl())
+        return sb_str(b)
+      else
+        if ty == "CodeBlock" then
+          return "<pre class=" + q() + "src" + q() + " data-lang=" + q() + node[1] + q() + "><code>" + html_escape(node[2]) + "</code></pre>" + nl()
+        else
+          if ty == "Raw" then
+            return node[1]
+          else
+            # "Style"/"Script" nodes are collected separately by render_page
+            # (see collect_styles/collect_scripts below) -- render_section
+            # only reaches them if a Style/Script is nested inside a Card,
+            # which still needs SOME text to emit; render nothing inline,
+            # since render_page already hoists every Style/Script it finds
+            # anywhere in the tree, nested or not.
+            return ""
+          end
+        end
+      end
+    end
+  end
+end
+
+# Collects every ["Style", css] node anywhere in the tree (including nested
+# inside Cards), so page authors can attach page-specific CSS from wherever
+# is most natural (e.g. right next to the Card that needs it) without having
+# to hoist it to the top-level sections list by hand.
+make a function called collect_styles takes nodes, acc returns acc2
+  let i = 0
+  while i < nodes.length do
+    let node = nodes[i]
+    if node[0] == "Style" then
+      let acc = list_push(acc, node[1])
+    else
+      if node[0] == "Card" then
+        let acc = collect_styles(node[2], acc)
+      end
+    end
+    let i = i + 1
+  end
+  return acc
+end
+
+make a function called collect_scripts takes nodes, acc returns acc2
+  let i = 0
+  while i < nodes.length do
+    let node = nodes[i]
+    if node[0] == "Script" then
+      let acc = list_push(acc, node[1])
+    else
+      if node[0] == "Card" then
+        let acc = collect_scripts(node[2], acc)
+      end
+    end
+    let i = i + 1
+  end
+  return acc
+end
+
+make a function called join_blocks takes items returns s
+  let b = sb_new()
+  let i = 0
+  while i < items.length do
+    sb_push(b, items[i])
+    sb_push(b, nl())
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+# Renders the page body (styles + h1 + sections, no Style/Script inline
+# duplication) shared by both modes.
+make a function called render_body takes page returns s
+  let title = page[1]
+  let sections = page[3]
+  let styles = collect_styles(sections, [])
+  let scripts = collect_scripts(sections, [])
+  let b = sb_new()
+  if styles.length > 0 then
+    sb_push(b, "<style>" + nl())
+    sb_push(b, join_blocks(styles))
+    sb_push(b, "</style>" + nl())
+  end
+  sb_push(b, "<h1>" + html_escape(title) + "</h1>" + nl())
+  sb_push(b, render_sections(sections))
+  if scripts.length > 0 then
+    sb_push(b, "<script>" + nl() + "'use strict';" + nl())
+    sb_push(b, join_blocks(scripts))
+    sb_push(b, "</script>" + nl())
+  end
+  return sb_str(b)
+end
+
+# render_page(page) -> HTML string, dispatching on page's mode.
+#
+# "fragment": exactly render_body's output -- no <html>/<head>/<body>
+# wrapper. This is what tools/site/build.py's process_fragment expects:
+# a raw fragment starting with (optionally) <style> then <h1>, which it
+# parses, hoists any leading <style>/<script> into <head>, auto-assigns
+# heading ids, and builds a TOC from <h2>/<h3> automatically.
+#
+# "standalone": the same body wrapped in a full HTML5 document via
+# lib/html.patlang's html_page(), for local preview / non-site use. Scripts
+# are already inlined into the body by render_body (rather than passed as
+# html_page's separate `script` parameter) so a Style/Script pair authored
+# next to the Card that needs it stays co-located in both modes.
+make a function called render_page takes page returns out
+  let mode = page[2]
+  let body = render_body(page)
+  if mode == "fragment" then
+    return body
+  else
+    return html_page(page[1], body, "")
+  end
+end

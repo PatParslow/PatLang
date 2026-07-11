@@ -119,6 +119,60 @@ impl Interpreter {
                             .ok_or_else(|| format!("apply: function '{}' not found", fname))?;
                         let ret = self.run_function(program, callee, &args[1..])?;
                         stack.push(ret);
+                    } else if name == "parallel_map" {
+                        // parallel_map(items, "func_name") -> list of
+                        // func_name(item) results, computed across REAL OS
+                        // threads (std::thread::scope -- each worker
+                        // borrows `program`/`self` directly, no cloning
+                        // needed, since Program/Interpreter are plain data
+                        // with no interior mutability). Genuine parallelism,
+                        // unlike fibers (see ir/fiber.rs), which are
+                        // cooperative and never actually run concurrently.
+                        let items = match args.get(0) {
+                            Some(Value::List(xs)) => xs.clone(),
+                            other => return Err(format!("parallel_map: expected a list as the first arg, got {:?}", other)),
+                        };
+                        let fname = match args.get(1) {
+                            Some(Value::String(s)) => s.clone(),
+                            other => return Err(format!("parallel_map: expected a function name string as the second arg, got {:?}", other)),
+                        };
+                        if !program.functions.contains_key(&fname) {
+                            return Err(format!("parallel_map: function '{}' not found", fname));
+                        }
+                        let results: Result<Vec<Value>, String> = std::thread::scope(|scope| {
+                            let handles: Vec<_> = items
+                                .iter()
+                                .map(|item| {
+                                    let fname = &fname;
+                                    scope.spawn(move || {
+                                        let mut interp = Interpreter::new();
+                                        super::hosts::register_stage0_shims(&mut interp);
+                                        interp.call_function(program, fname, std::slice::from_ref(item))
+                                    })
+                                })
+                                .collect();
+                            handles
+                                .into_iter()
+                                .map(|h| h.join().unwrap_or_else(|_| Err("parallel_map: a worker thread panicked".to_string())))
+                                .collect()
+                        });
+                        stack.push(Value::List(results?));
+                    } else if name == "fiber_new" {
+                        let fname = match args.get(0) {
+                            Some(Value::String(s)) => s.clone(),
+                            other => return Err(format!("fiber_new: expected a function name string, got {:?}", other)),
+                        };
+                        stack.push(super::fiber::fiber_new(program, fname)?);
+                    } else if name == "fiber_resume" {
+                        let id = args.get(0).cloned().unwrap_or(Value::Unit);
+                        let arg = args.get(1).cloned().unwrap_or(Value::Unit);
+                        stack.push(super::fiber::fiber_resume(&id, arg)?);
+                    } else if name == "fiber_yield" {
+                        let v = args.get(0).cloned().unwrap_or(Value::Unit);
+                        stack.push(super::fiber::fiber_yield(v)?);
+                    } else if name == "fiber_alive" {
+                        let id = args.get(0).cloned().unwrap_or(Value::Unit);
+                        stack.push(super::fiber::fiber_alive(&id)?);
                     } else {
                         let f = self.host.get(name).ok_or_else(|| format!("host fn '{}' not found", name))?;
                         let res = f(&args)?;
