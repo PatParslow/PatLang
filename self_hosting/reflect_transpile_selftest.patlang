@@ -1,0 +1,153 @@
+# Test suite for lib/reflect.patlang and lib/transpile_ruby.patlang.
+# Self-contained (includes its own dependencies, no separate library-under-
+# test file to concatenate first), so it's runnable standalone -- matching
+# self_hosting/regex_dsl_selftest.patlang / syntax_dsl_selftest.patlang's
+# placement and convention (both sit at self_hosting/ root, not examples/,
+# specifically so their own "lib/..." includes resolve without needing a
+# "../" prefix).
+#
+# Run from the repo root:
+#   rust-runtime/target/release/pat --ir-run self_hosting/reflect_transpile_selftest.patlang
+#
+# The integration check below shells out to a real `ruby` interpreter via
+# exec_capture -- if `ruby` isn't on PATH, that one check fails loudly
+# (exec_capture itself errors out) rather than silently skipping; the unit
+# checks above it still give useful signal on a machine without ruby.
+
+include "lib/lexer.patlang"
+include "lib/parser.patlang"
+include "lib/json.patlang"
+include "lib/reflect.patlang"
+include "lib/transpile_ruby.patlang"
+include "lib/test.patlang"
+
+t_init()
+
+print("unit: reflect_source AST/JSON shape")
+
+let j1 = reflect_source("let x = 1 + 2")
+let parsed1 = json_parse(j1)
+check("program has correct top-level type", json_str(json_get(parsed1, "type")), "Program")
+let body1 = json_arr(json_get(parsed1, "body"))
+check("program body has one statement", body1.length, 1)
+let let_node = body1[0]
+check("first statement is a Let", json_str(json_get(let_node, "type")), "Let")
+check("Let binds name x", json_str(json_get(let_node, "name")), "x")
+let bin_node = json_get(let_node, "value")
+check("Let value is a Bin node", json_str(json_get(bin_node, "type")), "Bin")
+check("Bin op is +", json_str(json_get(bin_node, "op")), "+")
+
+let j2 = reflect_source("if x < 2 then
+  print(x)
+end")
+let parsed2 = json_parse(j2)
+let if_node = json_arr(json_get(parsed2, "body"))[0]
+check("If node round-trips", json_str(json_get(if_node, "type")), "If")
+let then_body = json_arr(json_get(if_node, "then"))
+check("If then-branch has one statement", then_body.length, 1)
+
+print("unit: transpile_ruby.patlang emits recognizable, idiomatic Ruby")
+
+make a function called transpile_snippet takes src returns rb
+  let toks = tokenize(src)
+  let ast = parse_program(toks)
+  let result = transpile_program(ast)
+  if result[0] == "Err" then
+    return "TRANSPILE-ERROR: " + result[1]
+  end
+  return result[1]
+end
+
+let rb1 = transpile_snippet("print(1 + 2)")
+check("arithmetic transpiles to a real Ruby binop, not a VM call", contains_text(rb1, "(1 + 2)"), true)
+check("print transpiles to puts(PL.display(...))", contains_text(rb1, "puts(PL.display"), true)
+
+let rb2 = transpile_snippet("let i = 0
+while i < 3 do
+  let i = i + 1
+end")
+check("while transpiles to a real Ruby while, not jump-threaded VM state", contains_text(rb2, "while (i < 3)"), true)
+check("while loop closes with end", contains_text(rb2, "end"), true)
+
+let rb3 = transpile_snippet("make a function called sq takes n returns r
+  return n * n
+end")
+check("function transpiles to a real Ruby def", contains_text(rb3, "def sq(n)"), true)
+
+# An out-of-scope call used as an EXPRESSION (here: a bare call statement,
+# which still goes through the same expression emitter) degrades to a loud
+# Ruby `raise` naming the construct, rather than failing transpile_program's
+# own ["Ok"/"Err"] result -- propagating a hard error through arbitrarily
+# deep expression nesting isn't worth the complexity for a language with no
+# exceptions to thread it through. Still "not silently broken": the emitted
+# program fails immediately and loudly, with a message naming exactly
+# what's unsupported, the moment it actually runs.
+let rb4 = transpile_snippet("fact(\"a\", \"b\")")
+check("out-of-scope host call in expression position emits a named raise, not silent breakage", contains_text(rb4, "raise"), true)
+check("raise names the offending construct", contains_text(rb4, "'fact'"), true)
+check("raise explains it's a ruby-target limitation", contains_text(rb4, "not supported for the ruby target"), true)
+
+print("integration: transpiled output matches the interpreter, executed via a real ruby subprocess")
+
+# Strips \r bytes: on Windows, a child ruby process's stdout is text-mode
+# translated (\n -> \r\n) by the C runtime, unrelated to anything PatLang or
+# the transpiler does -- normalize before comparing against the
+# interpreter's own \n-only output rather than asserting on a platform
+# artifact.
+make a function called strip_cr takes s returns out
+  let out = ""
+  let i = 0
+  while i < s.length do
+    if char_code(s, i) != 13 then
+      let out = out + s[i]
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called transpile_and_run takes src, tag returns out
+  let toks = tokenize(src)
+  let ast = parse_program(toks)
+  let result = transpile_program(ast)
+  if result[0] == "Err" then
+    return "TRANSPILE-ERROR: " + result[1]
+  end
+  let out_path = "self_hosting/lib/_reflect_test_" + tag + ".rb"
+  write_file(out_path, result[1])
+  let captured = exec_capture("ruby", out_path)
+  return strip_cr(captured)
+end
+
+let src5 = "make a function called fib takes n returns r
+  if n < 2 then
+    return n
+  else
+    return fib(n - 1) + fib(n - 2)
+  end
+end
+let i = 0
+while i < 6 do
+  print(fib(i))
+  let i = i + 1
+end
+print(10 / 3)
+print(sqrt(-4))
+new(\"Counter\", \"c1\")
+send(\"c1\", \"set\", \"v\", 5)
+print(get(\"c1\", \"v\"))"
+
+let interpreted5 = "0
+1
+1
+2
+3
+5
+10/3
+0+2i
+5
+"
+let ruby_out5 = transpile_and_run(src5, "fib")
+check("transpiled-and-executed ruby output matches the interpreter exactly", ruby_out5, interpreted5)
+
+t_report()

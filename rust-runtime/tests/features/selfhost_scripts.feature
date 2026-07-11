@@ -31,6 +31,16 @@ Feature: Self-hosted (Stage 1) test suites run under cargo test
     And stdout contains "parse errors: 0"
     And stdout contains "AST.RegisterRoute"
 
+  # Covers reflection (source -> AST -> JSON, lib/reflect.patlang) and the
+  # self-hosted Ruby transpiler (lib/transpile_ruby.patlang) -- see
+  # optimized-zooming-snowglobe.md. Requires a `ruby` interpreter on PATH
+  # for its integration check (shells out via exec_capture to actually run
+  # the transpiled output); the unit-level AST/emission checks don't.
+  Scenario: the reflection and ruby-transpiler selftest passes
+    Given the self-hosted test suite "reflect_transpile"
+    When I run it interpreted
+    Then the self-hosted suite reports all tests passed
+
   # Regression case for the documented self-hosted-parser gap: parse_add /
   # parse_mul don't skip newlines before checking for a continuation
   # operator, unlike the native Rust frontend, so a leading `+` on the next

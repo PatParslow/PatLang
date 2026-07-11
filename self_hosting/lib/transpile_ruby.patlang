@@ -1,0 +1,572 @@
+# =============================================================================
+# Ruby transpiler: PatLang's self-hosted tagged-tuple AST (lib/parser.patlang)
+# -> idiomatic Ruby source text. Entirely self-hosted, mirroring the way
+# lib/codegen.patlang walks IR to build Rust text -- except this walks the
+# PRE-LOWERING AST directly (real if/while/def already present, unlike the
+# flattened jump-based IR lib/lower.patlang produces), so real Ruby `if`/
+# `while`/`def` come out, not a jump-threaded VM.
+#
+# Scope (v1): core arithmetic + numeric tower, string ops, list/vec ops,
+# print, control flow, functions/closures, and OO object-slots (new/send/
+# get/set_var). Networking, the facts/logic engine (fact/query/goal),
+# contracts (require/ensure/assert), and meta-compilation host calls are
+# OUT OF SCOPE for v1 -- transpile_program returns ["Err", msg] naming the
+# unsupported construct rather than emitting silently-broken Ruby.
+#
+# Depends on lib/patlang_runtime.rb (a hand-written Ruby runtime shim,
+# reusing PatLang's own internal representations where there's a natural
+# fair equivalent -- e.g. objects as a Hash of Hash, same as the Rust
+# runtime's own OBJECTS thread_local) being required by the emitted output.
+# =============================================================================
+
+make a function called nl returns s
+  return chr(10)
+end
+
+make a function called rb_escape takes s returns out
+  let out = ""
+  let i = 0
+  while i < s.length do
+    let c = char_code(s, i)
+    if c == 92 then
+      let out = out + chr(92) + chr(92)
+    else
+      if c == 34 then
+        let out = out + chr(92) + chr(34)
+      else
+        if c == 10 then
+          let out = out + chr(92) + "n"
+        else
+          if c == 9 then
+            let out = out + chr(92) + "t"
+          else
+            let out = out + s[i]
+          end
+        end
+      end
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called rb_str takes s returns out
+  return chr(34) + rb_escape(s) + chr(34)
+end
+
+# Host-function names explicitly out of scope for v1 (see file header).
+# Any Call node naming one of these fails the transpile with a clear error
+# instead of silently emitting a call to an undefined Ruby method.
+make a function called ruby_unsupported_host takes name returns yes
+  if name == "fact" then return true end
+  if name == "query" then return true end
+  if name == "goal" then return true end
+  if name == "infer_type_for" then return true end
+  if name == "tcp_listen" then return true end
+  if name == "tcp_connect" then return true end
+  if name == "tcp_accept" then return true end
+  if name == "tcp_accept_timeout" then return true end
+  if name == "tcp_read" then return true end
+  if name == "tcp_write" then return true end
+  if name == "tcp_close" then return true end
+  if name == "sleep_ms" then return true end
+  if name == "parse_tiny_source" then return true end
+  if name == "lower_and_compile" then return true end
+  if name == "emit_rust_for" then return true end
+  if name == "rustc_build" then return true end
+  if name == "run_ir" then return true end
+  if name == "patc_compile_from_argv" then return true end
+  if name == "get_argv" then return true end
+  if name == "copy_file" then return true end
+  return false
+end
+
+# ---- local-name tracking (Call("f", args) is ambiguous in the AST alone:
+# calling a top-level function and calling a closure held in a local look
+# identical until lowering. Ruby needs to know: `f(args)` for the former,
+# `f.call(args)` for the latter. Mirrors lowering.rs's known_locals idea,
+# scoped per function/top-level body -- recurses into If/While/When bodies
+# (same PatLang scope, no block-scoping) but NOT into nested Func or
+# Closure bodies (their own fresh scope). ----
+
+make a function called collect_locals_in_stmt takes node, acc returns acc2
+  let ty = node[0]
+  if ty == "Let" then
+    return list_push(acc, node[1])
+  else
+    if ty == "If" then
+      let acc = collect_locals_in_stmts(node[2], acc)
+      return collect_locals_in_stmts(node[3], acc)
+    else
+      if ty == "While" then
+        return collect_locals_in_stmts(node[2], acc)
+      else
+        if ty == "When" then
+          return collect_locals_in_stmts(node[2], acc)
+        else
+          return acc
+        end
+      end
+    end
+  end
+end
+
+make a function called collect_locals_in_stmts takes stmts, acc returns acc2
+  let i = 0
+  while i < stmts.length do
+    let acc = collect_locals_in_stmt(stmts[i], acc)
+    let i = i + 1
+  end
+  return acc
+end
+
+make a function called list_contains_str takes xs, v returns found
+  let i = 0
+  while i < xs.length do
+    if xs[i] == v then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# ---- expression emission ----
+# `locals` is the list of local names in scope (see above), threaded through
+# so Call nodes can tell a function call from a closure-call.
+
+make a function called ruby_binop takes op returns rb
+  if op == "and" then return "&&" end
+  if op == "or" then return "||" end
+  return op
+end
+
+make a function called ruby_unop takes op returns rb
+  if op == "not" then return "!" end
+  return op
+end
+
+make a function called emit_ruby_args takes args, locals returns s
+  let b = sb_new()
+  sb_push(b, "(")
+  let i = 0
+  while i < args.length do
+    if i > 0 then
+      sb_push(b, ", ")
+    end
+    sb_push(b, emit_ruby_expr(args[i], locals))
+    let i = i + 1
+  end
+  sb_push(b, ")")
+  return sb_str(b)
+end
+
+# name -> Ruby call text for the v1 host-function surface. `argtext` is the
+# already-emitted, comma-joined, parenthesised argument list (see
+# emit_ruby_args); args_raw is the raw AST arg list, needed for the handful
+# of shims (max/min) that read individual args rather than the whole list.
+make a function called emit_ruby_host_call takes name, args, locals returns s
+  let argtext = emit_ruby_args(args, locals)
+  if name == "print" then
+    return "puts(PL.display" + argtext + ")"
+  else
+    if name == "list_get" then return "PL.list_get" + argtext end
+    if name == "list_len" then return "PL.list_len" + argtext end
+    if name == "list_push" then return "PL.list_push" + argtext end
+    if name == "list_set" then return "PL.list_set" + argtext end
+    if name == "vec_new" then return "[]" end
+    if name == "vec_push" then return "PL.vec_push" + argtext end
+    if name == "vec_set" then return "PL.vec_set" + argtext end
+    if name == "vec_get" then return "PL.vec_get" + argtext end
+    if name == "vec_len" then return "PL.vec_len" + argtext end
+    if name == "vec_to_list" then return "PL.vec_to_list" + argtext end
+    if name == "sb_new" then return "PL::StrBuilder.new" end
+    if name == "sb_push" then return "PL.sb_push" + argtext end
+    if name == "sb_str" then return "PL.sb_str" + argtext end
+    if name == "str_intern" then return "PL.str_intern" + argtext end
+    if name == "sc_len" then return "PL.list_len" + argtext end
+    if name == "sc_code" then return "PL.char_code" + argtext end
+    if name == "sc_char" then return "PL.list_get" + argtext end
+    if name == "char_code" then return "PL.char_code" + argtext end
+    if name == "substr" then return "PL.substr" + argtext end
+    if name == "chr" then return "PL.chr" + argtext end
+    if name == "to_num" then return "PL.to_num" + argtext end
+    if name == "hash_string" then return "PL.hash_string" + argtext end
+    if name == "len" then return "PL.list_len" + argtext end
+    if name == "get" then return "PL.get_obj" + argtext end
+    if name == "set_var" then return "PL.set_var" + argtext end
+    if name == "new" then return "PL.new_obj" + argtext end
+    if name == "send" then return "PL.send_obj" + argtext end
+    if name == "emit" then return "PL.emit" + argtext end
+    if name == "add" then return "(" + emit_ruby_expr(args[0], locals) + " + " + emit_ruby_expr(args[1], locals) + ")" end
+    if name == "subtract" then return "(" + emit_ruby_expr(args[0], locals) + " - " + emit_ruby_expr(args[1], locals) + ")" end
+    if name == "multiply" then return "(" + emit_ruby_expr(args[0], locals) + " * " + emit_ruby_expr(args[1], locals) + ")" end
+    if name == "max" then return "[" + emit_ruby_expr(args[0], locals) + ", " + emit_ruby_expr(args[1], locals) + "].max" end
+    if name == "min" then return "[" + emit_ruby_expr(args[0], locals) + ", " + emit_ruby_expr(args[1], locals) + "].min" end
+    if name == "sqrt" then return "PL.sqrt" + argtext end
+    if name == "pow" then return "(" + emit_ruby_expr(args[0], locals) + " ** " + emit_ruby_expr(args[1], locals) + ")" end
+    if name == "sin" then return "Math.sin" + argtext end
+    if name == "cos" then return "Math.cos" + argtext end
+    if name == "tan" then return "Math.tan" + argtext end
+    if name == "asin" then return "Math.asin" + argtext end
+    if name == "acos" then return "Math.acos" + argtext end
+    if name == "atan" then return "Math.atan" + argtext end
+    if name == "atan2" then return "Math.atan2" + argtext end
+    if name == "log" then return "Math.log" + argtext end
+    if name == "exp" then return "Math.exp" + argtext end
+    if name == "floor" then return emit_ruby_expr(args[0], locals) + ".floor" end
+    if name == "ceil" then return emit_ruby_expr(args[0], locals) + ".ceil" end
+    if name == "round" then return emit_ruby_expr(args[0], locals) + ".round" end
+    if name == "trunc" then return emit_ruby_expr(args[0], locals) + ".truncate" end
+    if name == "abs" then return emit_ruby_expr(args[0], locals) + ".abs" end
+    if name == "numeric_kind" then return "PL.numeric_kind" + argtext end
+    if name == "type_of" then return "PL.type_of" + argtext end
+    if name == "now_ms" then return "PL.now_ms" end
+    if name == "read_file" then return "PL.read_file" + argtext end
+    if name == "write_file" then return "PL.write_file" + argtext end
+    if name == "file_exists" then return "PL.file_exists" + argtext end
+    # Not one of the explicitly out-of-scope names, and not a known v1
+    # shim either -- fall through to a generic PL.host("name", ...) call
+    # rather than aborting the whole transpile, so newly-added simple host
+    # functions degrade gracefully instead of hard-failing.
+    return "PL.host(" + rb_str(name) + ", [" + emit_ruby_args_bare(args, locals) + "])"
+  end
+end
+
+make a function called emit_ruby_args_bare takes args, locals returns s
+  let b = sb_new()
+  let i = 0
+  while i < args.length do
+    if i > 0 then
+      sb_push(b, ", ")
+    end
+    sb_push(b, emit_ruby_expr(args[i], locals))
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+make a function called emit_ruby_expr takes node, locals returns s
+  let ty = node[0]
+  if ty == "Num" then
+    return node[1]
+  else
+    if ty == "Str" then
+      return rb_str(node[1])
+    else
+      if ty == "Bool" then
+        return node[1]
+      else
+        if ty == "Var" then
+          return node[1]
+        else
+          if ty == "Bin" then
+            if node[1] == "/" then
+              # Ruby's native Integer#/ truncates (10/3 == 3); PatLang's `/`
+              # promotes to an exact Rational when the division isn't even.
+              # Routed through PL.div rather than emitting `/` directly so
+              # `10 / 3` transpiles to the same "10/3" PatLang itself prints.
+              return "PL.div(" + emit_ruby_expr(node[2], locals) + ", " + emit_ruby_expr(node[3], locals) + ")"
+            else
+              return "(" + emit_ruby_expr(node[2], locals) + " " + ruby_binop(node[1]) + " " + emit_ruby_expr(node[3], locals) + ")"
+            end
+          else
+            if ty == "Un" then
+              return "(" + ruby_unop(node[1]) + emit_ruby_expr(node[2], locals) + ")"
+            else
+              if ty == "List" then
+                return "[" + emit_ruby_args_bare(node[1], locals) + "]"
+              else
+                if ty == "Index" then
+                  return "PL.index(" + emit_ruby_expr(node[1], locals) + ", " + emit_ruby_expr(node[2], locals) + ")"
+                else
+                  if ty == "Member" then
+                    return "PL.get_obj(" + emit_ruby_expr(node[1], locals) + ", " + rb_str(node[2]) + ")"
+                  else
+                    if ty == "Closure" then
+                      return "lambda { |" + param_list_bare(node[1]) + "| " + emit_ruby_stmts_inline(node[2], list_concat(locals, node[1])) + " }"
+                    else
+                      if ty == "Call" then
+                        if ruby_unsupported_host(node[1]) then
+                          return "(raise " + rb_str("transpile: '" + node[1] + "' is not supported for the ruby target") + ")"
+                        else
+                          if list_contains_str(locals, node[1]) then
+                            return node[1] + ".call" + emit_ruby_args(node[2], locals)
+                          else
+                            return emit_ruby_host_or_user_call(node[1], node[2], locals)
+                          end
+                        end
+                      else
+                        # "Err" (parse error) or any unrecognized node
+                        return "(raise " + rb_str("transpile: cannot emit AST node: " + node[0]) + ")"
+                      end
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+# host_fn_names is the fixed v1 shim table's key set, checked by
+# emit_ruby_host_call already handling its own fallback -- user-defined
+# functions (anything not a recognized host name) become plain Ruby method
+# calls, exactly matching how the interpreter falls back to `Call` (a
+# program function) whenever a name isn't a registered host.
+make a function called emit_ruby_host_or_user_call takes name, args, locals returns s
+  if is_known_host_name(name) then
+    return emit_ruby_host_call(name, args, locals)
+  else
+    return name + emit_ruby_args(args, locals)
+  end
+end
+
+make a function called is_known_host_name takes name returns yes
+  if name == "print" then return true end
+  if name == "list_get" then return true end
+  if name == "list_len" then return true end
+  if name == "list_push" then return true end
+  if name == "list_set" then return true end
+  if name == "vec_new" then return true end
+  if name == "vec_push" then return true end
+  if name == "vec_set" then return true end
+  if name == "vec_get" then return true end
+  if name == "vec_len" then return true end
+  if name == "vec_to_list" then return true end
+  if name == "sb_new" then return true end
+  if name == "sb_push" then return true end
+  if name == "sb_str" then return true end
+  if name == "str_intern" then return true end
+  if name == "sc_len" then return true end
+  if name == "sc_code" then return true end
+  if name == "sc_char" then return true end
+  if name == "char_code" then return true end
+  if name == "substr" then return true end
+  if name == "chr" then return true end
+  if name == "to_num" then return true end
+  if name == "hash_string" then return true end
+  if name == "len" then return true end
+  if name == "get" then return true end
+  if name == "set_var" then return true end
+  if name == "new" then return true end
+  if name == "send" then return true end
+  if name == "emit" then return true end
+  if name == "add" then return true end
+  if name == "subtract" then return true end
+  if name == "multiply" then return true end
+  if name == "max" then return true end
+  if name == "min" then return true end
+  if name == "sqrt" then return true end
+  if name == "pow" then return true end
+  if name == "sin" then return true end
+  if name == "cos" then return true end
+  if name == "tan" then return true end
+  if name == "asin" then return true end
+  if name == "acos" then return true end
+  if name == "atan" then return true end
+  if name == "atan2" then return true end
+  if name == "log" then return true end
+  if name == "exp" then return true end
+  if name == "floor" then return true end
+  if name == "ceil" then return true end
+  if name == "round" then return true end
+  if name == "trunc" then return true end
+  if name == "abs" then return true end
+  if name == "numeric_kind" then return true end
+  if name == "type_of" then return true end
+  if name == "now_ms" then return true end
+  if name == "read_file" then return true end
+  if name == "write_file" then return true end
+  if name == "file_exists" then return true end
+  return ruby_unsupported_host(name)
+end
+
+make a function called list_concat takes a, b returns c
+  let out = a
+  let i = 0
+  while i < b.length do
+    let out = list_push(out, b[i])
+    let i = i + 1
+  end
+  return out
+end
+
+# Closure param list as bare comma-joined text (Ruby block-param syntax),
+# reusing the same list shape lib/reflect.patlang's ast_str_list_to_json
+# walks but emitting plain names instead of a JSON array.
+make a function called param_list_bare takes items returns s
+  let b = sb_new()
+  let i = 0
+  while i < items.length do
+    if i > 0 then
+      sb_push(b, ", ")
+    end
+    sb_push(b, items[i])
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+# A closure body as a single Ruby expression sequence (statements joined by
+# `;`, since Ruby lambda bodies are one brace-delimited block) -- the value
+# of the last statement is the lambda's implicit return, matching PatLang's
+# own "last expression is the closure's value" semantics closely enough for
+# v1 (explicit `return` inside a closure body is emitted as Ruby `return`,
+# which exits the *lambda*, matching PatLang's own closure-return
+# semantics -- Ruby lambdas, unlike bare blocks/procs, support this).
+make a function called emit_ruby_stmts_inline takes stmts, locals returns s
+  let b = sb_new()
+  let i = 0
+  while i < stmts.length do
+    if i > 0 then
+      sb_push(b, "; ")
+    end
+    sb_push(b, emit_ruby_stmt_expr(stmts[i], locals))
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+# Renders one statement as a Ruby expression fragment suitable for `;`-
+# joining inside a lambda body (used by emit_ruby_stmts_inline only --
+# top-level/def bodies use the indented emit_ruby_stmt instead).
+make a function called emit_ruby_stmt_expr takes node, locals returns s
+  let ty = node[0]
+  if ty == "Let" then
+    return node[1] + " = " + emit_ruby_expr(node[2], locals)
+  else
+    if ty == "Expr" then
+      return emit_ruby_expr(node[1], locals)
+    else
+      if ty == "Return" then
+        return "return " + emit_ruby_expr(node[1], locals)
+      else
+        if ty == "If" then
+          let elsepart = ""
+          if node[3].length > 0 then
+            let elsepart = " else " + emit_ruby_stmts_inline(node[3], locals)
+          end
+          return "if " + emit_ruby_expr(node[1], locals) + " then " + emit_ruby_stmts_inline(node[2], locals) + elsepart + " end"
+        else
+          if ty == "While" then
+            return "while " + emit_ruby_expr(node[1], locals) + " do " + emit_ruby_stmts_inline(node[2], locals) + " end"
+          else
+            return "(raise " + rb_str("transpile: '" + ty + "' is not supported inside a closure body") + ")"
+          end
+        end
+      end
+    end
+  end
+end
+
+# ---- indented statement emission (top-level program body and function/def
+# bodies) ----
+
+make a function called ruby_indent takes level returns s
+  let s = ""
+  let i = 0
+  while i < level do
+    let s = s + "  "
+    let i = i + 1
+  end
+  return s
+end
+
+make a function called emit_ruby_stmt takes node, locals, level returns s
+  let pad = ruby_indent(level)
+  let ty = node[0]
+  if ty == "Let" then
+    return pad + node[1] + " = " + emit_ruby_expr(node[2], locals) + nl()
+  else
+    if ty == "Expr" then
+      return pad + emit_ruby_expr(node[1], locals) + nl()
+    else
+      if ty == "Return" then
+        return pad + "return " + emit_ruby_expr(node[1], locals) + nl()
+      else
+        if ty == "If" then
+          let b = sb_new()
+          sb_push(b, pad + "if " + emit_ruby_expr(node[1], locals) + nl())
+          sb_push(b, emit_ruby_stmts(node[2], locals, level + 1))
+          if node[3].length > 0 then
+            sb_push(b, pad + "else" + nl())
+            sb_push(b, emit_ruby_stmts(node[3], locals, level + 1))
+          end
+          sb_push(b, pad + "end" + nl())
+          return sb_str(b)
+        else
+          if ty == "While" then
+            let b = sb_new()
+            sb_push(b, pad + "while " + emit_ruby_expr(node[1], locals) + nl())
+            sb_push(b, emit_ruby_stmts(node[2], locals, level + 1))
+            sb_push(b, pad + "end" + nl())
+            return sb_str(b)
+          else
+            if ty == "Func" then
+              return emit_ruby_func(node, level)
+            else
+              if ty == "Assert" then
+                # require/ensure/assert (design-by-contract) are the
+                # `contracts` chunk's own surface -- not in the out-of-scope
+                # list above since they lower to plain conditionals here,
+                # not a networking/logic/meta-compilation host call: emit a
+                # Ruby `raise` on violation, matching contract_check's own
+                # "abort with a descriptive error" behaviour.
+                return pad + "raise " + rb_str(node[1] + " failed") + " unless (" + emit_ruby_expr(node[2], locals) + ")" + nl()
+              else
+                if ty == "When" then
+                  return pad + "PL.on(" + rb_str(node[1]) + ") { |event_name, event_data| " + emit_ruby_stmts_inline(node[2], list_concat(locals, ["event_name", "event_data"])) + " }" + nl()
+                else
+                  return pad + "raise " + rb_str("transpile: '" + ty + "' is not supported for the ruby target") + nl()
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+make a function called emit_ruby_stmts takes stmts, locals, level returns s
+  let b = sb_new()
+  let i = 0
+  while i < stmts.length do
+    sb_push(b, emit_ruby_stmt(stmts[i], locals, level))
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+make a function called emit_ruby_func takes node, level returns s
+  let name = node[1]
+  let params = node[2]
+  let body = node[3]
+  let locals = collect_locals_in_stmts(body, params)
+  let pad = ruby_indent(level)
+  let b = sb_new()
+  sb_push(b, pad + "def " + name + "(" + param_list_bare(params) + ")" + nl())
+  sb_push(b, emit_ruby_stmts(body, locals, level + 1))
+  sb_push(b, pad + "end" + nl())
+  return sb_str(b)
+end
+
+# transpile_program(program): program is the ["Program", stmts] shape
+# lib/parser.patlang's parse_program returns. Returns ["Ok", rubySource] or
+# ["Err", message].
+make a function called transpile_program takes program returns result
+  let stmts = program[1]
+  let top_locals = collect_locals_in_stmts(stmts, [])
+  let b = sb_new()
+  sb_push(b, "#!/usr/bin/env ruby" + nl())
+  sb_push(b, "# Auto-generated by PatLang's self-hosted Ruby transpiler" + nl())
+  sb_push(b, "# (self_hosting/lib/transpile_ruby.patlang). Do not edit by hand." + nl())
+  sb_push(b, "require_relative " + rb_str("patlang_runtime") + nl())
+  sb_push(b, "" + nl())
+  sb_push(b, emit_ruby_stmts(stmts, top_locals, 0))
+  return ["Ok", sb_str(b)]
+end

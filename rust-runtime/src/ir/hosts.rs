@@ -1392,6 +1392,33 @@ pub fn host_numeric_kind(args: &[Value]) -> Result<Value, String> {
     Ok(Value::String(s.to_string()))
 }
 
+/// type_of(x) -> "unit"|"bool"|"int"|"float"|"bigint"|"rational"|"complex"|
+/// "string"|"list"|"object"|"closure": general runtime reflection over every
+/// `Value` variant (numeric_kind above only covers the numeric tower and
+/// falls back to "other" for everything else). Self-hosted PatLang code has
+/// no way to see into the actual in-memory `Value` representation, so this
+/// is necessarily a native host primitive -- it's the one piece of the
+/// reflection/transpilation work that can't be pushed into self-hosted
+/// PatLang the way ast-to-JSON and the Ruby emitter are.
+pub fn host_type_of(args: &[Value]) -> Result<Value, String> {
+    let v = args.get(0).ok_or("type_of: expected 1 arg")?;
+    let s = match v {
+        Value::Unit => "unit",
+        Value::Bool(_) => "bool",
+        Value::Int(_) => "int",
+        Value::Float(_) => "float",
+        Value::BigInt(_) => "bigint",
+        Value::Rational(_, _) => "rational",
+        Value::Complex(_, _) => "complex",
+        Value::String(_) => "string",
+        Value::List(_) => "list",
+        Value::HostFunction(_) => "closure",
+        Value::Object(_) => "object",
+        Value::Closure { .. } => "closure",
+    };
+    Ok(Value::String(s.to_string()))
+}
+
 /// Register the Stage 0 string/list/file shims on an interpreter.
 pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("len", host_len);
@@ -1468,4 +1495,5 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("trunc", host_trunc);
     interp.host.insert("abs", host_abs);
     interp.host.insert("numeric_kind", host_numeric_kind);
+    interp.host.insert("type_of", host_type_of);
 }

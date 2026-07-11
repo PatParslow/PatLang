@@ -80,6 +80,7 @@ const HOST_CHUNK_TABLE: &[(&str, ChunkId)] = &[
     ("list_len", ChunkId::Core),
     ("list_push", ChunkId::Core),
     ("list_set", ChunkId::Core),
+    ("type_of", ChunkId::Core),
     ("char_code", ChunkId::StringsExt),
     ("substr", ChunkId::StringsExt),
     ("chr", ChunkId::StringsExt),
@@ -330,6 +331,12 @@ fn host_coerce_arg(v: &Value) -> Value {
 
 impl Host {
     fn call(name: &str, args: &[Value]) -> Result<Value, String> {
+        // type_of needs to see the pre-coercion value (host_coerce_arg below
+        // flattens Int/Float down to Number for every other host call,
+        // which would make type_of(1) wrongly report "float" instead of
+        // "int" -- checked before the generic coercion, matching how the
+        // interpreter's own host_type_of (ir/hosts.rs) never coerces at all).
+        if name == "type_of" { return Ok(type_of_impl(args)); }
         let __coerced_args: Vec<Value> = args.iter().map(host_coerce_arg).collect();
         let args: &[Value] = &__coerced_args;
         match name {
@@ -653,6 +660,21 @@ fn cmp(k:&BinOpKind,a:&Value,b:&Value)->Result<Value,String>{
     Ok(Value::Bool(res))
 }
 fn to_s(v:&Value)->String{ match v { Value::Unit=>String::new(), Value::Bool(b)=>b.to_string(), Value::Number(n)=> if n.fract()==0.0 {format!("{}",*n as i64)} else {n.to_string()}, Value::Int(n)=>n.to_string(), Value::Float(n)=> if n.fract()==0.0 && n.is_finite() {format!("{}",*n as i64)} else {n.to_string()}, Value::String(s)=>s.clone(), Value::List(xs)=>{ let parts:Vec<String>=xs.iter().map(|x|to_s(x)).collect(); format!("[{}]", parts.join(", ")) }, Value::Object(map)=>{ let mut kvs:Vec<String>=map.iter().map(|(k,v)| format!("{}: {}",k,to_s(v))).collect(); kvs.sort(); format!("{{{}}}", kvs.join(", ")) }, Value::Closure{..} => "<closure>".to_string() } }
+fn type_of_impl(args: &[Value]) -> Value {
+    let v = match args.get(0) { Some(v) => v, None => return Value::String("unit".to_string()) };
+    let s = match v {
+        Value::Unit => "unit",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "float",
+        Value::Int(_) => "int",
+        Value::Float(_) => "float",
+        Value::String(_) => "string",
+        Value::List(_) => "list",
+        Value::Object(_) => "object",
+        Value::Closure{..} => "closure",
+    };
+    Value::String(s.to_string())
+}
 "##;
 
     // Stage 38 -- numeric tower value module. Selected instead of
@@ -1268,6 +1290,24 @@ fn cmp(k:&BinOpKind,a:&Value,b:&Value)->Result<Value,String>{
     }
     let res = match k { Eq=>a==b, Ne=>a!=b, _=>false };
     Ok(Value::Bool(res))
+}
+fn type_of_impl(args: &[Value]) -> Value {
+    let v = match args.get(0) { Some(v) => v, None => return Value::String("unit".to_string()) };
+    let s = match v {
+        Value::Unit => "unit",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "float",
+        Value::Int(_) => "int",
+        Value::Float(_) => "float",
+        Value::BigInt(_) => "bigint",
+        Value::Rational(_) => "rational",
+        Value::Complex(_) => "complex",
+        Value::String(_) => "string",
+        Value::List(_) => "list",
+        Value::Object(_) => "object",
+        Value::Closure{..} => "closure",
+    };
+    Value::String(s.to_string())
 }
 "##;
 

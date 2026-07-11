@@ -181,6 +181,7 @@ fn given_selftest_suite(world: &mut PatWorld, name: String) {
         // their own dependencies), so no concatenation is needed here.
         "regex_dsl" => read("self_hosting/regex_dsl_selftest.patlang"),
         "syntax_dsl" => read("self_hosting/syntax_dsl_selftest.patlang"),
+        "reflect_transpile" => read("self_hosting/reflect_transpile_selftest.patlang"),
         other => panic!("unknown self-hosted test suite: {other}"),
     };
 }
