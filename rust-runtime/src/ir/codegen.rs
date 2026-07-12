@@ -228,7 +228,42 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 thread_local! {
     static OBJECTS: RefCell<HashMap<String, HashMap<String, Value>>> = RefCell::new(HashMap::new());
+}
+
+// EVENT_HANDLERS is shared across OS threads (fiber threads, parallel_map
+// workers, WASI-threads Workers) rather than thread_local, so a `when`
+// handler registered on one thread is visible to `emit(...)` called from
+// any other -- otherwise every real OS thread this runtime spawns starts
+// with its own fresh, empty copy of the registry, and emit from inside a
+// fiber/parallel_map worker is a silent no-op (handlers registered but
+// never found). Gated on target_feature = "atomics" (not target_arch =
+// "wasm32") for the same reason as `mod fibers` below: that's the real
+// "can this target ever have more than one OS thread" signal -- ordinary
+// wasm32-wasip1 can't spawn a second thread at all, so a thread_local
+// there is already equivalent to a single shared instance, and Mutex/
+// OnceLock aren't even importable without atomics.
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+thread_local! {
     static EVENT_HANDLERS: RefCell<HashMap<String, Vec<String>>> = RefCell::new(HashMap::new());
+}
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+fn event_handlers_get(ev: &str) -> Vec<String> {
+    EVENT_HANDLERS.with(|m| m.borrow().get(ev).cloned().unwrap_or_default())
+}
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+fn event_handlers_register(ev: String, handler: String) {
+    EVENT_HANDLERS.with(|m| m.borrow_mut().entry(ev).or_insert_with(Vec::new).push(handler));
+}
+
+#[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+static EVENT_HANDLERS: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
+#[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+fn event_handlers_get(ev: &str) -> Vec<String> {
+    EVENT_HANDLERS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap().get(ev).cloned().unwrap_or_default()
+}
+#[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+fn event_handlers_register(ev: String, handler: String) {
+    EVENT_HANDLERS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap().entry(ev).or_insert_with(Vec::new).push(handler);
 }
 
 fn arg_usize(args: &[Value], i: usize, what: &str) -> Result<usize, String> {
@@ -669,7 +704,7 @@ fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Va
                     let ev = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => String::new() };
                     let payload = args.get(1).cloned().unwrap_or(Value::Unit);
                     let mut last = Value::Unit;
-                    let handlers: Vec<String> = EVENT_HANDLERS.with(|m| m.borrow().get(&ev).cloned().unwrap_or_default());
+                    let handlers: Vec<String> = event_handlers_get(&ev);
                     for h in handlers {
                         let callee = program.functions.get(&h).ok_or_else(|| format!("function '{}' not found", h))?;
                         // Expose event locals for interpolation via __vars as well
@@ -3356,7 +3391,7 @@ fn host_call_codegen_bootstrap_inner(name: &str, args: &[Value]) -> Result<Value
                 for ev in sl(xs.get(3).ok_or("run_ir: missing events")?)? {
                     let ex = sl(ev)?;
                     let event = st(ex, 1)?; let handler = st(ex, 2)?;
-                    EVENT_HANDLERS.with(|m| m.borrow_mut().entry(event).or_insert_with(Vec::new).push(handler));
+                    event_handlers_register(event, handler);
                 }
                 let f = program.functions.get(&program.entry).ok_or("run_ir: entry not found")?;
                 run_function(&program, f, &[])
@@ -3509,12 +3544,11 @@ fn host_call_codegen_bootstrap(name: &str, args: &[Value]) -> Option<Result<Valu
         // program builder: emit all functions with params and bodies
         out.push_str("fn build_program() -> Program {\n    let mut functions: HashMap<String, Function> = HashMap::new();\n");
         out.push_str("    // Seed event handlers registry from embedded Program\n");
-        out.push_str("    EVENT_HANDLERS.with(|m| { let mut mm = m.borrow_mut();\n");
         for (ev, hs) in program.event_handlers.iter() {
-            let handler_list = hs.iter().map(|h| format!("\"{}\".to_string()", rust_str(h))).collect::<Vec<_>>().join(", ");
-            out.push_str(&format!("        mm.insert(\"{}\".to_string(), vec![{}]);\n", rust_str(ev), handler_list));
+            for h in hs {
+                out.push_str(&format!("    event_handlers_register(\"{}\".to_string(), \"{}\".to_string());\n", rust_str(ev), rust_str(h)));
+            }
         }
-        out.push_str("    });\n");
         // Emit each function body and insert into map
         for (name, func) in program.functions.iter() {
             out.push_str(&format!("    // function {}\n", name));
