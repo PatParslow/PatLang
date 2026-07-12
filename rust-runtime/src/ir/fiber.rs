@@ -39,6 +39,16 @@ struct FiberBox {
     /// `None` for ordinary (non-budgeted) fibers, which `budget_check` can
     /// never observe anyway since it only runs on the current fiber's thread.
     budget_deadline_ms: Option<i64>,
+    /// Timestamp of the previous `budget_check` call on this fiber (`None`
+    /// on the very first call of a timeslice, since there's no prior point
+    /// to measure an interval from). Used to turn consecutive calls into
+    /// "how long did that iteration take" samples for `recent_durations`.
+    budget_last_check_ms: Option<i64>,
+    /// Fixed-size ring buffer (oldest evicted first) of recent per-iteration
+    /// durations in ms, used to predict whether the *next* iteration is
+    /// likely to blow the deadline and yield pre-emptively rather than only
+    /// reactively -- see `predict_next_duration_ms`.
+    recent_durations: Vec<i64>,
 }
 
 struct FiberHandle {
@@ -77,7 +87,10 @@ pub fn fiber_new(program: &Program, func_name: String) -> Result<Value, String> 
     }
     let id = next_id();
     let handle = Arc::new(FiberHandle {
-        state: Mutex::new(FiberBox { to_fiber: None, from_fiber: None, alive: true, budget_deadline_ms: None }),
+        state: Mutex::new(FiberBox {
+            to_fiber: None, from_fiber: None, alive: true,
+            budget_deadline_ms: None, budget_last_check_ms: None, recent_durations: Vec::new(),
+        }),
         cv: Condvar::new(),
     });
     registry().lock().unwrap().insert(id, Arc::clone(&handle));
@@ -219,6 +232,11 @@ pub fn budgeted_run(program: &Program, ms: i64, func_name: &str, captured: Value
         let handle = handle_for(id)?;
         let mut st = handle.state.lock().unwrap();
         st.budget_deadline_ms = Some(deadline);
+        // The gap between the last budget_check before this fiber paused and
+        // the first one after it resumes is however long the CALLER took to
+        // ask for another timeslice, not real loop-body work -- reset so
+        // that gap is never recorded as an iteration duration sample.
+        st.budget_last_check_ms = None;
     }
     let resume_arg = if first_call { captured } else { Value::Unit };
     let result = fiber_resume(&id_value, resume_arg)?;
@@ -234,13 +252,54 @@ pub fn budgeted_run(program: &Program, ms: i64, func_name: &str, captured: Value
     }
 }
 
+/// Ring-buffer capacity for `recent_durations` -- enough samples for the
+/// regression to see a real trend without weighting ancient iterations
+/// (from possibly a very different phase of the loop) too heavily.
+const DURATION_WINDOW: usize = 16;
+
+/// Predicts how long the *next* iteration is likely to take, from a window
+/// of recent per-iteration durations, favoring conservatism (never predict
+/// less than the most recent sample) so a loop that's trending slower gets
+/// caught before it overruns rather than after:
+///
+/// - Fewer than 2 samples: nothing to fit a trend to, predict the most
+///   recent sample verbatim (or 0 if there are none yet).
+/// - Otherwise: an ordinary-least-squares fit of duration against sample
+///   index, extrapolated one step past the last sample (`slope * n +
+///   intercept`), clamped to be at least the largest recent sample -- a
+///   flat or noisy-but-not-trending series still predicts its own recent
+///   worst case, not an average that could understate a spike.
+fn predict_next_duration_ms(samples: &[i64]) -> i64 {
+    let n = samples.len();
+    if n == 0 { return 0; }
+    if n < 2 { return samples[n - 1]; }
+    let n_f = n as f64;
+    let sum_x: f64 = (0..n).map(|i| i as f64).sum();
+    let sum_y: f64 = samples.iter().map(|&v| v as f64).sum();
+    let sum_xy: f64 = samples.iter().enumerate().map(|(i, &v)| i as f64 * v as f64).sum();
+    let sum_xx: f64 = (0..n).map(|i| (i as f64) * (i as f64)).sum();
+    let denom = n_f * sum_xx - sum_x * sum_x;
+    let (slope, intercept) = if denom.abs() < f64::EPSILON {
+        (0.0, sum_y / n_f) // all samples at the same x (shouldn't happen) or n too small
+    } else {
+        let slope = (n_f * sum_xy - sum_x * sum_y) / denom;
+        let intercept = (sum_y - slope * sum_x) / n_f;
+        (slope, intercept)
+    };
+    let regression_estimate = slope * n_f + intercept;
+    let recent_max = *samples.iter().max().unwrap_or(&0);
+    (regression_estimate.max(0.0) as i64).max(recent_max)
+}
+
 /// budget_check() -> Unit. Called at every while-loop back-edge lexically
 /// inside a `budgeted(ms) { ... }` block (injected at lowering time, see
 /// `Lowerer::in_budgeted_depth`). A no-op when not running inside any fiber
 /// (e.g. a plain top-level `while` accidentally sharing this instrumentation
 /// -- shouldn't happen given the lowering guard, but fails safe rather than
-/// erroring). When running inside a budgeted fiber whose deadline has
-/// passed, suspends via the ordinary `fiber_yield` -- from the loop's point
+/// erroring). Records the interval since the previous call as a duration
+/// sample, then yields (via the ordinary `fiber_yield`) either reactively
+/// (the deadline has already passed) or pre-emptively (the next iteration
+/// is predicted, from recent history, to blow it) -- from the loop's point
 /// of view this call simply returns (once resumed) and iteration continues,
 /// with the caller having observed a `["paused", id]` result in between.
 pub fn budget_check() -> Result<(), String> {
@@ -249,14 +308,70 @@ pub fn budget_check() -> Result<(), String> {
         None => return Ok(()),
     };
     let handle = handle_for(id)?;
-    let deadline = {
-        let st = handle.state.lock().unwrap();
-        st.budget_deadline_ms
+    let now = now_ms_i64();
+    let (deadline, predicted) = {
+        let mut st = handle.state.lock().unwrap();
+        if let Some(prev) = st.budget_last_check_ms {
+            let dur = (now - prev).max(0);
+            st.recent_durations.push(dur);
+            if st.recent_durations.len() > DURATION_WINDOW {
+                st.recent_durations.remove(0);
+            }
+        }
+        st.budget_last_check_ms = Some(now);
+        let predicted = predict_next_duration_ms(&st.recent_durations);
+        (st.budget_deadline_ms, predicted)
     };
     if let Some(dl) = deadline {
-        if now_ms_i64() >= dl {
+        if now + predicted >= dl {
             fiber_yield(Value::Unit)?;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::predict_next_duration_ms;
+
+    #[test]
+    fn empty_history_predicts_zero() {
+        assert_eq!(predict_next_duration_ms(&[]), 0);
+    }
+
+    #[test]
+    fn single_sample_predicts_itself() {
+        assert_eq!(predict_next_duration_ms(&[42]), 42);
+    }
+
+    #[test]
+    fn flat_history_predicts_the_flat_value() {
+        assert_eq!(predict_next_duration_ms(&[10, 10, 10, 10]), 10);
+    }
+
+    #[test]
+    fn upward_trend_extrapolates_forward_not_just_averages() {
+        // durations climbing 1ms per iteration: 1,2,3,4,5 -- a naive average
+        // (3) would understate the next iteration; the regression should
+        // predict roughly the next step in the trend (~6).
+        let predicted = predict_next_duration_ms(&[1, 2, 3, 4, 5]);
+        assert!(predicted >= 5, "predicted {} should be at least the most recent sample", predicted);
+        assert!(predicted <= 8, "predicted {} should extrapolate the trend, not overshoot wildly", predicted);
+    }
+
+    #[test]
+    fn downward_trend_never_predicts_below_the_recent_max() {
+        // durations easing off: 10,8,6,4,2 -- regression alone would predict
+        // ~0, but a stray future spike shouldn't be masked by a confident
+        // downward extrapolation, so the conservative floor is the recent
+        // max, not the regression's raw output.
+        let predicted = predict_next_duration_ms(&[10, 8, 6, 4, 2]);
+        assert!(predicted >= 10, "predicted {} should not undercut the recent max of 10", predicted);
+    }
+
+    #[test]
+    fn noisy_but_flat_history_stays_conservative() {
+        let predicted = predict_next_duration_ms(&[5, 7, 4, 8, 5, 6]);
+        assert!(predicted >= 8, "predicted {} should be at least the recent max (8) for noisy-but-flat data", predicted);
+    }
 }
