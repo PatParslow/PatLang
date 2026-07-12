@@ -221,9 +221,9 @@ impl RustCodegen {
 
 use std::collections::HashMap;
 use std::cell::RefCell;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 thread_local! {
@@ -416,10 +416,13 @@ fn run(program: &Program) -> Result<Value,String> {
 // ported directly from rust-runtime/src/ir/fiber.rs's interpreter-side
 // implementation -- same mutex+condvar design, just resolving/calling
 // program functions via this file's own `run_function`/`Program::clone()`
-// instead of `Interpreter::call_function`. Not available on wasm32: that
-// target has no std::thread support in a normal build (see the `main()`
-// split below for the same constraint already handled once).
-#[cfg(not(target_arch = "wasm32"))]
+// instead of `Interpreter::call_function`. Not available on an ordinary
+// wasm32 build: that target has no std::thread support (see the `main()`
+// split below for the same constraint already handled once). It IS
+// available on a wasm32 build compiled with atomics (e.g.
+// wasm32-wasip1-threads), where std::thread/Mutex/Condvar are real --
+// hence gating on target_feature = "atomics" rather than target_arch.
+#[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
 mod fibers {
     use super::{Program, Value, run_function};
     use std::collections::HashMap;
@@ -704,21 +707,26 @@ fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Va
                     if !program.functions.contains_key(&fname) {
                         return Err(format!("parallel_map: function '{}' not found", fname));
                     }
-                    let results: Result<Vec<Value>, String> = std::thread::scope(|scope| {
-                        let handles: Vec<_> = items.iter().map(|item| {
-                            let fname = &fname;
-                            scope.spawn(move || {
-                                let callee = program.functions.get(fname).unwrap();
-                                run_function(program, callee, std::slice::from_ref(item))
-                            })
-                        }).collect();
-                        handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("parallel_map: a worker thread panicked".to_string()))).collect()
-                    });
-                    stack.push(Value::List(results?));
+                    #[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+                    { return Err("parallel_map is not supported when compiled to an ordinary (non-threaded) wasm32 target".into()); }
+                    #[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+                    {
+                        let results: Result<Vec<Value>, String> = std::thread::scope(|scope| {
+                            let handles: Vec<_> = items.iter().map(|item| {
+                                let fname = &fname;
+                                scope.spawn(move || {
+                                    let callee = program.functions.get(fname).unwrap();
+                                    run_function(program, callee, std::slice::from_ref(item))
+                                })
+                            }).collect();
+                            handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("parallel_map: a worker thread panicked".to_string()))).collect()
+                        });
+                        stack.push(Value::List(results?));
+                    }
                 } else if n == "fiber_new" {
-                    #[cfg(target_arch = "wasm32")]
+                    #[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
                     { return Err("fibers are not supported when compiled to wasm32".into()); }
-                    #[cfg(not(target_arch = "wasm32"))]
+                    #[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
                     {
                         let fname = match args.get(0) {
                             Some(Value::String(s)) => s.clone(),
@@ -727,34 +735,34 @@ fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Va
                         stack.push(fibers::fiber_new(program, fname)?);
                     }
                 } else if n == "fiber_resume" {
-                    #[cfg(target_arch = "wasm32")]
+                    #[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
                     { return Err("fibers are not supported when compiled to wasm32".into()); }
-                    #[cfg(not(target_arch = "wasm32"))]
+                    #[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
                     {
                         let id = args.get(0).cloned().unwrap_or(Value::Unit);
                         let arg = args.get(1).cloned().unwrap_or(Value::Unit);
                         stack.push(fibers::fiber_resume(&id, arg)?);
                     }
                 } else if n == "fiber_yield" {
-                    #[cfg(target_arch = "wasm32")]
+                    #[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
                     { return Err("fibers are not supported when compiled to wasm32".into()); }
-                    #[cfg(not(target_arch = "wasm32"))]
+                    #[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
                     {
                         let v = args.get(0).cloned().unwrap_or(Value::Unit);
                         stack.push(fibers::fiber_yield(v)?);
                     }
                 } else if n == "fiber_alive" {
-                    #[cfg(target_arch = "wasm32")]
+                    #[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
                     { return Err("fibers are not supported when compiled to wasm32".into()); }
-                    #[cfg(not(target_arch = "wasm32"))]
+                    #[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
                     {
                         let id = args.get(0).cloned().unwrap_or(Value::Unit);
                         stack.push(fibers::fiber_alive(&id)?);
                     }
                 } else if n == "budgeted_run" {
-                    #[cfg(target_arch = "wasm32")]
+                    #[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
                     { return Err("budgeted(...) blocks are not supported when compiled to wasm32 (they run on fibers, which need real OS threads)".into()); }
-                    #[cfg(not(target_arch = "wasm32"))]
+                    #[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
                     {
                         let ms = match args.get(0) { Some(v) => v.as_number().map_err(|_| "budgeted_run: expected a number of ms".to_string())? as i64, None => return Err("budgeted_run: expected ms".into()) };
                         let fname = match args.get(1) {
@@ -766,9 +774,9 @@ fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Va
                         stack.push(fibers::budgeted_run(program, ms, &fname, captured, &existing)?);
                     }
                 } else if n == "budget_check" {
-                    #[cfg(target_arch = "wasm32")]
+                    #[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
                     { return Err("budgeted(...) blocks are not supported when compiled to wasm32 (they run on fibers, which need real OS threads)".into()); }
-                    #[cfg(not(target_arch = "wasm32"))]
+                    #[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
                     {
                         fibers::budget_check()?;
                         stack.push(Value::Unit);
@@ -3224,7 +3232,15 @@ fn host_call_codegen_bootstrap_inner(name: &str, args: &[Value]) -> Result<Value
                 std::fs::write(&src_path, &src).map_err(|e| format!("rustc_build: write {}: {}", src_path.display(), e))?;
                 if let Some(parent) = std::path::Path::new(&out).parent() { let _ = std::fs::create_dir_all(parent); }
                 let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+                // wasm32-wasip1-threads needs a nightly toolchain (its threaded
+                // stdlib is only prebuilt on nightly) plus atomics/shared-memory
+                // codegen flags -- neither applies to any other target, including
+                // the ordinary non-threaded wasm32-wasip1 build.
+                let is_threaded_wasm = target.as_deref() == Some("wasm32-wasip1-threads");
                 let mut cmd = std::process::Command::new(&rustc);
+                if is_threaded_wasm {
+                    cmd.arg("+nightly");
+                }
                 // Size-optimize + strip WASM builds (measured ~7x smaller, faster
                 // to compile, byte-identical stdout); native keeps full -O
                 // unless the caller explicitly overrides via opt_level.
@@ -3237,6 +3253,10 @@ fn host_call_codegen_bootstrap_inner(name: &str, args: &[Value]) -> Result<Value
                     cmd.arg("-O");
                 }
                 cmd.arg("-C").arg("strip=symbols");
+                if is_threaded_wasm {
+                    cmd.arg("-C").arg("target-feature=+atomics,+bulk-memory,+mutable-globals");
+                    cmd.arg("-C").arg("link-args=--shared-memory --max-memory=1073741824");
+                }
                 cmd.arg(&src_path).arg("-o").arg(&out);
                 if let Some(t) = &target { cmd.arg("--target").arg(t); }
                 let status = cmd.status().map_err(|e| format!("rustc_build: failed to run rustc: {}", e))?;

@@ -105,6 +105,23 @@ make a function called compile_wasm_only takes src, id returns wasmb64
   return read_file_b64(wasm_path)
 end
 
+make a function called compile_wasm_threaded_only takes src, id returns wasmb64
+  # Same shape as compile_wasm_only, but targets wasm32-wasip1-threads (real
+  # OS-thread-backed fibers/budgeted(...), via patc1.exe -> rustc_build's
+  # nightly+atomics+shared-memory flags for that one target string) instead
+  # of the ordinary non-threaded wasm32-wasip1 target. Opt-in per demo page
+  # rather than the default, since it needs a nightly toolchain and the
+  # WASI-threads JS shim (wasi_shim_js) to actually run in a browser.
+  let wasm_path = "portfolio/build/" + id + "_threaded.wasm"
+  if cache_valid(id, src) and (file_exists(wasm_path) == "1") then
+    print("[cache] " + id + " (threaded) unchanged, skipping rebuild")
+    return read_file_b64(wasm_path)
+  end
+  patc1_compile(src, id, wasm_path, "wasm32-wasip1-threads")
+  save_cache(id, src)
+  return read_file_b64(wasm_path)
+end
+
 make a function called compile_native takes src, id returns exe
   let exe_path = "portfolio/build/" + id + ".exe"
   if cache_valid(id, src) and (file_exists(exe_path) == "1") then
@@ -160,6 +177,20 @@ make a function called demo_page takes slug, title, blurb, src, transcript, pg_b
   let page = tpl_page(title, "fragment", sections)
   write_file("portfolio/demos/" + slug + ".html", render_page(page))
   print("wrote portfolio/demos/" + slug + ".html")
+  return true
+end
+
+make a function called b64bytes_only_js takes b returns done
+  # Just the base64-decode helper, for pages (like the threaded fiber demo)
+  # that need runWasmThreaded but not the rest of wasi_shim_js's playground/
+  # highlighting machinery (which assumes an #ed editor element that isn't
+  # present on those pages).
+  sb_push(b, "function b64bytes(s) {" + nl())
+  sb_push(b, "  const bin = atob(s);" + nl())
+  sb_push(b, "  const a = new Uint8Array(bin.length);" + nl())
+  sb_push(b, "  for (let i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i);" + nl())
+  sb_push(b, "  return a;" + nl())
+  sb_push(b, "}" + nl())
   return true
 end
 
@@ -257,6 +288,250 @@ make a function called wasi_shim_js takes b returns done
   sb_push(b, "function runPlayground() { return runWasm('playground', 'playground', [document.getElementById('ed').value]); }" + nl())
   sb_push(b, "function loadExample() { const id = document.getElementById('exsel').value; document.getElementById('ed').value = srcText(id); hlUpdate(); }" + nl())
   sb_push(b, "window.addEventListener('DOMContentLoaded', hlUpdate);" + nl())
+  return true
+end
+
+make a function called wasi_threads_worker_js takes b returns done
+  sb_push(b, "// Generic WASI-threads worker: handles either the program's own entrypoint" + nl())
+  sb_push(b, "// (_start) or a fiber-spawned thread (wasi_thread_start), both against the" + nl())
+  sb_push(b, "// same shared module + shared memory." + nl())
+  sb_push(b, "//" + nl())
+  sb_push(b, "// Key ordering constraint discovered empirically: `thread-spawn` gets called" + nl())
+  sb_push(b, "// SYNCHRONOUSLY from inside a running WASM call stack, and the calling" + nl())
+  sb_push(b, "// thread immediately blocks afterward via Condvar::wait() (a native" + nl())
+  sb_push(b, "// memory.atomic.wait32 instruction) once it hands back the new tid. A" + nl())
+  sb_push(b, "// worker constructed *at that point* (new Worker() issued from inside the" + nl())
+  sb_push(b, "// still-executing host import call) never finishes booting -- its startup" + nl())
+  sb_push(b, "// appears to need the spawning agent to reach an actual JS event-loop turn," + nl())
+  sb_push(b, "// which never happens once parked in a blocking atomic wait." + nl())
+  sb_push(b, "//" + nl())
+  sb_push(b, "// This isn't just an ordering nuance to work around opportunistically: a" + nl())
+  sb_push(b, "// WASM program's execution is ONE continuous synchronous call from" + nl())
+  sb_push(b, "// _start() to completion. The only points where the calling worker's" + nl())
+  sb_push(b, "// thread stops running WASM are real blocking waits (Atomics.wait," + nl())
+  sb_push(b, "// compiled from Condvar::wait()) -- and Atomics.wait does NOT drain the" + nl())
+  sb_push(b, "// microtask queue while parked, it's a genuine OS-level thread freeze. So" + nl())
+  sb_push(b, "// a burst of thread-spawn calls with no intervening blocking wait (e.g." + nl())
+  sb_push(b, "// several fiber_new() calls in a row before any fiber_resume()) gives" + nl())
+  sb_push(b, "// async pool replenishment zero opportunity to run: the pool can only ever" + nl())
+  sb_push(b, "// contain what was pre-warmed *before* _start() began. Verified directly:" + nl())
+  sb_push(b, "// a 20-fiber creation burst against a small pool that tried to grow" + nl())
+  sb_push(b, "// on-demand exhausted the pool by fiber #5 and the synchronous fallback" + nl())
+  sb_push(b, "// spawns for the rest never finished booting in time (same deadlock class" + nl())
+  sb_push(b, "// as the original problem, just delayed) -- because the owning worker was" + nl())
+  sb_push(b, "// itself about to block, or already had, with no event-loop turn free for" + nl())
+  sb_push(b, "// the fallback workers' boot handshake to complete." + nl())
+  sb_push(b, "//" + nl())
+  sb_push(b, "// So the real, honest design: pre-warm a generous fixed ceiling BEFORE" + nl())
+  sb_push(b, "// _start() runs (below), sized to comfortably cover realistic PatLang" + nl())
+  sb_push(b, "// fiber/budgeted usage. Async replenishment (maintainPool, still present" + nl())
+  sb_push(b, "// below) then keeps topping back up toward that ceiling as workers are" + nl())
+  sb_push(b, "// consumed -- genuinely useful for a long-running program with many" + nl())
+  sb_push(b, "// sequential (not all-at-once) fiber operations, since each consumed slot" + nl())
+  sb_push(b, "// gets a chance to refill during the *next* blocking wait's aftermath, not" + nl())
+  sb_push(b, "// useful for surviving a single burst bigger than the ceiling itself." + nl())
+  sb_push(b, "const POOL_CEILING = 64;" + nl())
+  sb_push(b, "let mem = null;" + nl())
+  sb_push(b, "let tidCounter = null;" + nl())
+  sb_push(b, "let pool = [];" + nl())
+  sb_push(b, "let refilling = false;" + nl())
+  sb_push(b, "" + nl())
+  sb_push(b, "function spawnIdleWorker() {" + nl())
+  sb_push(b, "  return new Promise((resolve) => {" + nl())
+  sb_push(b, "    const w = new Worker(self.location.href);" + nl())
+  sb_push(b, "    w.onmessage = (e) => {" + nl())
+  sb_push(b, "      if (e.data === 'ready') { resolve(w); return; }" + nl())
+  sb_push(b, "      // A job-result message from a worker that was handed a job earlier." + nl())
+  sb_push(b, "      self.postMessage(e.data);" + nl())
+  sb_push(b, "    };" + nl())
+  sb_push(b, "    w.onerror = (e) => self.postMessage({ ok: false, error: '[pool worker error] ' + e.message, type: 'thread' });" + nl())
+  sb_push(b, "    w.postMessage({ type: 'init' });" + nl())
+  sb_push(b, "  });" + nl())
+  sb_push(b, "}" + nl())
+  sb_push(b, "" + nl())
+  sb_push(b, "async function fillPool(n) {" + nl())
+  sb_push(b, "  const spawned = await Promise.all(Array.from({ length: n }, spawnIdleWorker));" + nl())
+  sb_push(b, "  pool.push(...spawned);" + nl())
+  sb_push(b, "}" + nl())
+  sb_push(b, "" + nl())
+  sb_push(b, "// Fire-and-forget: top the pool back up toward POOL_CEILING as consumed" + nl())
+  sb_push(b, "// slots free up between blocking waits. Can't help a single burst bigger" + nl())
+  sb_push(b, "// than the ceiling (see the note above `POOL_CEILING`), but does mean a" + nl())
+  sb_push(b, "// long-running program recovers its full pre-warmed headroom between" + nl())
+  sb_push(b, "// separate fiber operations rather than only ever getting it once." + nl())
+  sb_push(b, "function maintainPool() {" + nl())
+  sb_push(b, "  if (refilling) return;" + nl())
+  sb_push(b, "  const need = POOL_CEILING - pool.length;" + nl())
+  sb_push(b, "  if (need <= 0) return;" + nl())
+  sb_push(b, "  refilling = true;" + nl())
+  sb_push(b, "  fillPool(need).finally(() => { refilling = false; });" + nl())
+  sb_push(b, "}" + nl())
+  sb_push(b, "" + nl())
+  sb_push(b, "function makeImports(moduleForRespawn) {" + nl())
+  sb_push(b, "  let stdout = '';" + nl())
+  sb_push(b, "  const dec = new TextDecoder();" + nl())
+  sb_push(b, "" + nl())
+  sb_push(b, "  const wasi_snapshot_preview1 = {" + nl())
+  sb_push(b, "    fd_write(fd, iovs, len, nw) {" + nl())
+  sb_push(b, "      const dv = new DataView(mem.buffer);" + nl())
+  sb_push(b, "      let w = 0;" + nl())
+  sb_push(b, "      for (let i = 0; i < len; i++) {" + nl())
+  sb_push(b, "        const p = iovs + 8 * i;" + nl())
+  sb_push(b, "        const ptr = dv.getUint32(p, true), l = dv.getUint32(p + 4, true);" + nl())
+  sb_push(b, "        // TextDecoder, like crypto.getRandomValues, refuses a view backed" + nl())
+  sb_push(b, "        // by SharedArrayBuffer -- copy to a plain buffer first." + nl())
+  sb_push(b, "        stdout += dec.decode(new Uint8Array(mem.buffer, ptr, l).slice());" + nl())
+  sb_push(b, "        w += l;" + nl())
+  sb_push(b, "      }" + nl())
+  sb_push(b, "      dv.setUint32(nw, w, true);" + nl())
+  sb_push(b, "      return 0;" + nl())
+  sb_push(b, "    }," + nl())
+  sb_push(b, "    random_get(p, l) {" + nl())
+  sb_push(b, "      // crypto.getRandomValues refuses a view backed by SharedArrayBuffer;" + nl())
+  sb_push(b, "      // fill a plain scratch buffer and copy it in instead." + nl())
+  sb_push(b, "      const tmp = new Uint8Array(l);" + nl())
+  sb_push(b, "      crypto.getRandomValues(tmp);" + nl())
+  sb_push(b, "      new Uint8Array(mem.buffer, p, l).set(tmp);" + nl())
+  sb_push(b, "      return 0;" + nl())
+  sb_push(b, "    }," + nl())
+  sb_push(b, "    clock_time_get(cid, prec, tp) {" + nl())
+  sb_push(b, "      const dv = new DataView(mem.buffer);" + nl())
+  sb_push(b, "      const ns = BigInt(Math.round((performance.timeOrigin + performance.now()) * 1e6));" + nl())
+  sb_push(b, "      dv.setBigUint64(tp, ns, true);" + nl())
+  sb_push(b, "      return 0;" + nl())
+  sb_push(b, "    }," + nl())
+  sb_push(b, "    args_sizes_get(pc, ps) { const dv = new DataView(mem.buffer); dv.setUint32(pc, 0, true); dv.setUint32(ps, 0, true); return 0; }," + nl())
+  sb_push(b, "    args_get() { return 0; }," + nl())
+  sb_push(b, "    environ_sizes_get(pc, ps) { const dv = new DataView(mem.buffer); dv.setUint32(pc, 0, true); dv.setUint32(ps, 0, true); return 0; }," + nl())
+  sb_push(b, "    environ_get() { return 0; }," + nl())
+  sb_push(b, "    proc_exit(c) { const e = new Error('exit'); e.exitCode = c; throw e; }," + nl())
+  sb_push(b, "    fd_close() { return 0; }, fd_fdstat_get() { return 0; }, fd_seek() { return 70; }," + nl())
+  sb_push(b, "    fd_read() { return 8; }, fd_prestat_get() { return 8; }, fd_prestat_dir_name() { return 8; }," + nl())
+  sb_push(b, "    path_open() { return 76; }, sched_yield() { return 0; }, poll_oneoff() { return 52; }," + nl())
+  sb_push(b, "  };" + nl())
+  sb_push(b, "  const wasiNs = new Proxy(wasi_snapshot_preview1, { get(t, k) { return k in t ? t[k] : (() => 58); } });" + nl())
+  sb_push(b, "" + nl())
+  sb_push(b, "  const wasi = {" + nl())
+  sb_push(b, "    'thread-spawn': (startArg) => {" + nl())
+  sb_push(b, "      const tid = Atomics.add(tidCounter, 0, 1);" + nl())
+  sb_push(b, "      const w = pool.shift();" + nl())
+  sb_push(b, "      if (!w) {" + nl())
+  sb_push(b, "        // Pool exhausted -- best-effort synchronous spawn (may deadlock if" + nl())
+  sb_push(b, "        // this thread also blocks right after; the pool should be sized" + nl())
+  sb_push(b, "        // generously enough in practice that this path isn't hit)." + nl())
+  sb_push(b, "        console.log('[thread-worker] pool exhausted, spawning synchronously for tid=' + tid);" + nl())
+  sb_push(b, "        const w2 = new Worker(self.location.href);" + nl())
+  sb_push(b, "        w2.onmessage = (e) => { if (e.data !== 'ready') self.postMessage(e.data); };" + nl())
+  sb_push(b, "        w2.postMessage({ type: 'thread', module: moduleForRespawn, memory: mem, tidCounter, tid, startArg });" + nl())
+  sb_push(b, "        return tid;" + nl())
+  sb_push(b, "      }" + nl())
+  sb_push(b, "      w.onmessage = (e) => self.postMessage(e.data);" + nl())
+  sb_push(b, "      w.postMessage({ type: 'thread', module: moduleForRespawn, memory: mem, tidCounter, tid, startArg });" + nl())
+  sb_push(b, "      // Replenish asynchronously (and grow the target if demand is" + nl())
+  sb_push(b, "      // outpacing it) so later thread-spawn calls still have a ready" + nl())
+  sb_push(b, "      // worker even though this one won't help the current call." + nl())
+  sb_push(b, "      maintainPool();" + nl())
+  sb_push(b, "      return tid;" + nl())
+  sb_push(b, "    }," + nl())
+  sb_push(b, "  };" + nl())
+  sb_push(b, "" + nl())
+  sb_push(b, "  return { env: { memory: mem }, wasi_snapshot_preview1: wasiNs, wasi, getStdout: () => stdout };" + nl())
+  sb_push(b, "}" + nl())
+  sb_push(b, "" + nl())
+  sb_push(b, "self.onmessage = async (e) => {" + nl())
+  sb_push(b, "  const msg = e.data;" + nl())
+  sb_push(b, "  if (msg.type === 'init') {" + nl())
+  sb_push(b, "    // This worker is being prepared as an idle pool member -- just report" + nl())
+  sb_push(b, "    // ready and wait for a real job." + nl())
+  sb_push(b, "    self.postMessage('ready');" + nl())
+  sb_push(b, "    return;" + nl())
+  sb_push(b, "  }" + nl())
+  sb_push(b, "" + nl())
+  sb_push(b, "  mem = msg.memory;" + nl())
+  sb_push(b, "  tidCounter = msg.tidCounter;" + nl())
+  sb_push(b, "" + nl())
+  sb_push(b, "  if (msg.type === 'start') {" + nl())
+  sb_push(b, "    await fillPool(POOL_CEILING);" + nl())
+  sb_push(b, "  }" + nl())
+  sb_push(b, "" + nl())
+  sb_push(b, "  const imports = makeImports(msg.module);" + nl())
+  sb_push(b, "  const { env, wasi_snapshot_preview1, wasi } = imports;" + nl())
+  sb_push(b, "  const instance = await WebAssembly.instantiate(msg.module, { env, wasi_snapshot_preview1, wasi });" + nl())
+  sb_push(b, "" + nl())
+  sb_push(b, "  try {" + nl())
+  sb_push(b, "    if (msg.type === 'start') {" + nl())
+  sb_push(b, "      instance.exports._start();" + nl())
+  sb_push(b, "    } else {" + nl())
+  sb_push(b, "      instance.exports.wasi_thread_start(msg.tid, msg.startArg);" + nl())
+  sb_push(b, "    }" + nl())
+  sb_push(b, "    self.postMessage({ ok: true, stdout: imports.getStdout(), type: msg.type, tid: msg.tid });" + nl())
+  sb_push(b, "  } catch (err) {" + nl())
+  sb_push(b, "    const exitCode = (err && typeof err.exitCode === 'number') ? err.exitCode : null;" + nl())
+  sb_push(b, "    self.postMessage({ ok: exitCode === 0, stdout: imports.getStdout(), type: msg.type, tid: msg.tid, error: exitCode === null ? String(err) : null });" + nl())
+  sb_push(b, "  }" + nl())
+  sb_push(b, "};" + nl())
+  return true
+end
+
+
+# Real WASI-threads support: a hand-rolled implementation of the WASI
+# threads proposal ABI (env::memory shared import, wasi::thread-spawn
+# import, wasi_thread_start export) -- no wasm-bindgen, matching this
+# project's existing from-scratch WASI shim philosophy. Spike-verified
+# (standalone, headless-browser, single-fiber and 20-fiber-burst cases)
+# before folding in here; see wasi_threads_worker_js below for the pool
+# design and the hard constraint it exists to work around. Requires
+# Cross-Origin-Opener-Policy/Cross-Origin-Embedder-Policy response headers
+# (crossOriginIsolated) to unlock SharedArrayBuffer -- callers must check
+# self.crossOriginIsolated before offering a threaded run button.
+make a function called wasi_threads_worker_tag returns html
+  # The pool-based WASI-threads worker script, embedded as a *non-executing*
+  # <script type="text/plain"> tag rather than inlined into the page's own
+  # executing script -- it must run isolated inside real Worker instances
+  # (its own `self` is a WorkerGlobalScope, not the page's window), not as
+  # top-level statements in the main script's scope. <script> is a raw-text
+  # HTML element regardless of its type attribute, so this is embedded
+  # verbatim, unescaped -- entities do NOT get decoded inside it either.
+  let tw = sb_new()
+  wasi_threads_worker_js(tw)
+  return "<script type=" + q() + "text/plain" + q() + " id=" + q() + "thread-worker-src" + q() + ">" + sb_str(tw) + "</script>"
+end
+
+make a function called wasi_threads_shim_js takes b returns done
+  sb_push(b, "let THREAD_WORKER_URL = null;" + nl())
+  sb_push(b, "function threadWorkerUrl() {" + nl())
+  sb_push(b, "  if (!THREAD_WORKER_URL) {" + nl())
+  sb_push(b, "    THREAD_WORKER_URL = URL.createObjectURL(new Blob([document.getElementById('thread-worker-src').textContent], { type: " + q() + "application/javascript" + q() + " }));" + nl())
+  sb_push(b, "  }" + nl())
+  sb_push(b, "  return THREAD_WORKER_URL;" + nl())
+  sb_push(b, "}" + nl())
+  sb_push(b, "async function runWasmThreaded(outId, wasmId) {" + nl())
+  sb_push(b, "  const out = document.getElementById(" + q() + "out-" + q() + " + outId);" + nl())
+  sb_push(b, "  if (!self.crossOriginIsolated) {" + nl())
+  sb_push(b, "    if (out) out.textContent = " + q() + "requires cross-origin isolation (COOP/COEP headers) -- not available on this page load" + q() + ";" + nl())
+  sb_push(b, "    return;" + nl())
+  sb_push(b, "  }" + nl())
+  sb_push(b, "  if (out) out.textContent = " + q() + "running (real OS threads via WASI threads proposal)..." + q() + ";" + nl())
+  sb_push(b, "  const t0 = performance.now();" + nl())
+  sb_push(b, "  try {" + nl())
+  sb_push(b, "    const module = await WebAssembly.compile(b64bytes(WASMS[wasmId]));" + nl())
+  sb_push(b, "    const memory = new WebAssembly.Memory({ initial: 64, maximum: 2048, shared: true });" + nl())
+  sb_push(b, "    const tidCounter = new Int32Array(new SharedArrayBuffer(4));" + nl())
+  sb_push(b, "    tidCounter[0] = 1;" + nl())
+  sb_push(b, "    const mainWorker = new Worker(threadWorkerUrl());" + nl())
+  sb_push(b, "    const result = await new Promise((resolve, reject) => {" + nl())
+  sb_push(b, "      mainWorker.onmessage = (e) => resolve(e.data);" + nl())
+  sb_push(b, "      mainWorker.onerror = (e) => reject(new Error(e.message));" + nl())
+  sb_push(b, "      mainWorker.postMessage({ type: " + q() + "start" + q() + ", module, memory, tidCounter });" + nl())
+  sb_push(b, "    });" + nl())
+  sb_push(b, "    const ms = (performance.now() - t0).toFixed(1);" + nl())
+  sb_push(b, "    if (out) out.textContent = result.stdout + (result.ok ? " + q() + "" + q() + " : " + q() + " [error: " + q() + " + result.error + " + q() + "]" + q() + ");" + nl())
+  sb_push(b, "    const msEl = document.getElementById(" + q() + "ms-" + q() + " + outId);" + nl())
+  sb_push(b, "    if (msEl) msEl.textContent = ms + " + q() + " ms wall (compile+run, real OS threads, this browser)" + q() + ";" + nl())
+  sb_push(b, "  } catch (e) {" + nl())
+  sb_push(b, "    if (out) out.textContent = " + q() + "error: " + q() + " + e;" + nl())
+  sb_push(b, "  }" + nl())
+  sb_push(b, "}" + nl())
   return true
 end
 
@@ -843,27 +1118,28 @@ let threading_sections = list_push(threading_sections, tpl_script(sb_str(threadi
 write_file("portfolio/demos/threading.html", render_page(tpl_page("Real OS threads: parallel map-reduce", "fragment", threading_sections)))
 print("wrote portfolio/demos/threading.html")
 
-# Fiber demo: native (interpreted) transcript + a similarly honest,
-# non-functional mock -- same underlying reason (fiber_new spawns a real
-# OS thread too, see ir/fiber.rs), so no live execution is attempted.
+# Fiber demo: native (interpreted) transcript, PLUS a genuine live "run in
+# browser" button -- compiled to wasm32-wasip1-threads and executed for
+# real via the hand-rolled WASI-threads shim above (real OS threads via
+# real Web Workers, not a mock), requires cross-origin isolation (COOP/
+# COEP headers; runWasmThreaded checks self.crossOriginIsolated itself and
+# reports plainly if unavailable rather than pretending to run).
+let fiber_wasmb64 = compile_wasm_threaded_only(fiber_src, "fiber")
 let fiber_sections = [tpl_para("Ruby-style cooperative coroutines (<code>fiber_new</code>/<code>fiber_resume</code>/<code>fiber_yield</code>/<code>fiber_alive</code>), implemented on real OS threads under the hood but never actually running concurrently: a mutex+condvar pair (<code>ir/fiber.rs</code>) ensures only one fiber's thread is ever unparked at a time, so control passes back and forth explicitly, deterministic and effectively single-threaded &mdash; distinct from <code>parallel_map</code> above, which IS real parallelism. This demo is a classic fiber use case: a lazy, infinite Fibonacci generator the caller pulls values from one at a time, plus a second, independent fiber running the same generator function to show each fiber keeps its own state.")]
 let fiber_sections = list_push(fiber_sections, tpl_raw("<details><summary>PatLang source</summary><pre class='src'>" + html_escape(fiber_src) + "</pre></details>"))
-let fiber_sections = list_push(fiber_sections, tpl_raw("<p class='label'>Interpreted run on the build machine (<code>pat --ir-run</code> &mdash; compiled-native fiber support is a natural follow-up, not yet built):</p><pre class='out native'>" + html_escape(fiber_native) + "</pre>"))
-let fiber_sections = list_push(fiber_sections, tpl_para("<strong>No real \"run in browser\" button</strong>, for the same reason as the threading demo above: <code>fiber_new</code> spawns a real OS thread, unsupported in this WASM sandbox. The step-through below is a purely illustrative, non-functional mock &mdash; the sequence shown is the real transcript's own numbers, stepped through one at a time by a plain JS button, not a live fiber."))
+let fiber_sections = list_push(fiber_sections, tpl_raw("<p class='label'>Interpreted run on the build machine (<code>pat --ir-run</code>):</p><pre class='out native'>" + html_escape(fiber_native) + "</pre>"))
+let fiber_sections = list_push(fiber_sections, tpl_para("<strong>Real \"run in browser\" button</strong> below: this compiles to <code>wasm32-wasip1-threads</code> and runs via a hand-rolled implementation of the WASI threads proposal (real <code>Worker</code>s + <code>SharedArrayBuffer</code>-backed shared memory + a pre-warmed worker pool standing in for real thread creation) &mdash; no wasm-bindgen, no mock. Needs cross-origin isolation; the button reports plainly if that's unavailable on this page load rather than silently doing nothing."))
 let fiber_body = sb_new()
-sb_push(fiber_body, "<div class='card'><p class='label'>Simulated step-through (not live &mdash; see note above):</p>" + nl())
-sb_push(fiber_body, "<p><button onclick='fbStep()'>fiber_resume(gen, 0)</button> <span id='fb-out' class='ms'></span></p>" + nl())
+sb_push(fiber_body, "<div class='card'><p class='label'>Live run, real OS threads, compiled to threaded WASM:</p>" + nl())
+sb_push(fiber_body, "<p><button onclick=\"runWasmThreaded('fiber','fiber')\">Run in browser</button> <span id='ms-fiber' class='ms'></span></p>" + nl())
+sb_push(fiber_body, "<pre id='out-fiber' class='out'></pre>" + nl())
 sb_push(fiber_body, "</div>" + nl())
 let fiber_sections = list_push(fiber_sections, tpl_raw(sb_str(fiber_body)))
+let fiber_sections = list_push(fiber_sections, tpl_raw(wasi_threads_worker_tag()))
 let fiber_js = sb_new()
-sb_push(fiber_js, "const FB_SEQ = [0,1,1,2,3,5,8,13,21,34,55,89];" + nl())
-sb_push(fiber_js, "let fbIdx = 0;" + nl())
-sb_push(fiber_js, "function fbStep() {" + nl())
-sb_push(fiber_js, "  const out = document.getElementById('fb-out');" + nl())
-sb_push(fiber_js, "  if (fbIdx >= FB_SEQ.length) { out.textContent = 'generator still alive (simulated) -- resume again to keep going, sequence not extended in this mock'; return; }" + nl())
-sb_push(fiber_js, "  out.textContent = 'yielded: ' + FB_SEQ[fbIdx];" + nl())
-sb_push(fiber_js, "  fbIdx++;" + nl())
-sb_push(fiber_js, "}" + nl())
+sb_push(fiber_js, "const WASMS = { fiber: '" + fiber_wasmb64 + "' };" + nl())
+b64bytes_only_js(fiber_js)
+wasi_threads_shim_js(fiber_js)
 let fiber_sections = list_push(fiber_sections, tpl_script(sb_str(fiber_js)))
 write_file("portfolio/demos/fiber.html", render_page(tpl_page("Fibers: cooperative coroutines", "fragment", fiber_sections)))
 print("wrote portfolio/demos/fiber.html")
