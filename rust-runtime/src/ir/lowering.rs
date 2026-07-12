@@ -249,7 +249,9 @@ impl Lowerer {
             "sqrt"|"pow"|"sin"|"cos"|"tan"|"asin"|"acos"|"atan"|"atan2"|"log"|"exp"|
             "floor"|"ceil"|"round"|"trunc"|"abs"|"numeric_kind"|"type_of"|
             "parallel_map"|"fiber_new"|"fiber_resume"|"fiber_yield"|"fiber_alive"|
-            "budgeted_run"|"budget_check"
+            "budgeted_run"|"budget_check"|
+            "list_dir"|"rename_file"|
+            "rule_add"|"solve"|"action_add"|"plan"
         )
     }
 

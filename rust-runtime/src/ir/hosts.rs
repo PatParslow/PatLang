@@ -496,6 +496,8 @@ pub fn reset_world() {
     OBJECTS.with(|o| o.borrow_mut().clear());
     FACTS.with(|f| f.borrow_mut().clear());
     GOALS.with(|g| g.borrow_mut().clear());
+    RULES.with(|r| r.borrow_mut().clear());
+    ACTIONS.with(|a| a.borrow_mut().clear());
 }
 
 fn to_s(v: &Value) -> String { display_value(v) }
@@ -528,6 +530,273 @@ pub fn host_goal(args: &[Value]) -> Result<Value, String> {
     let items: Vec<String> = args[1..].iter().map(to_s).collect();
     GOALS.with(|g| g.borrow_mut().push((pred, items)));
     Ok(Value::Unit)
+}
+
+// ---- A1: real backward-chaining resolution (unification + rule chaining +
+// backtracking) -- what "goal-oriented programming" actually requires and
+// what the flat fact/query/goal trio above never provided. A ground fact is
+// modeled as a rule with an empty body (the standard Prolog trick), so
+// `rule_add(pred, args, [])` both declares a fact and a queryable predicate
+// with a single representation, of any arity -- unlike the legacy `fact`
+// above, which is hard-coded to exactly 2 args.
+//
+// Variable convention: an argument string matching `^[A-Z]` is a logic
+// variable (Prolog's own atom-vs-variable convention); anything else is a
+// ground constant. Chosen over adding a new `Value::Var` variant, which
+// would ripple through the entire runtime for a feature only this corner
+// needs.
+
+#[derive(Clone)]
+struct LogicRule {
+    head_pred: String,
+    head_args: Vec<String>,
+    body: Vec<(String, Vec<String>)>,
+}
+
+thread_local! {
+    static RULES: RefCell<Vec<LogicRule>> = RefCell::new(Vec::new());
+}
+
+fn is_logic_var(s: &str) -> bool {
+    s.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false)
+}
+
+type Subst = HashMap<String, String>;
+
+fn walk(term: &str, subst: &Subst) -> String {
+    let mut cur = term.to_string();
+    let mut hops = 0;
+    while is_logic_var(&cur) {
+        match subst.get(&cur) {
+            Some(next) if next != &cur => { cur = next.clone(); hops += 1; if hops > 1000 { break; } }
+            _ => break,
+        }
+    }
+    cur
+}
+
+fn unify_args(query_args: &[String], target_args: &[String], subst: &Subst) -> Option<Subst> {
+    if query_args.len() != target_args.len() { return None; }
+    let mut s = subst.clone();
+    for (qa, ta) in query_args.iter().zip(target_args.iter()) {
+        let qw = walk(qa, &s);
+        let tw = walk(ta, &s);
+        if is_logic_var(&qw) {
+            if qw != tw { s.insert(qw, tw); }
+        } else if is_logic_var(&tw) {
+            if tw != qw { s.insert(tw, qw); }
+        } else if qw != tw {
+            return None;
+        }
+    }
+    Some(s)
+}
+
+fn apply_subst(args: &[String], subst: &Subst) -> Vec<String> {
+    args.iter().map(|a| walk(a, subst)).collect()
+}
+
+const MAX_LOGIC_DEPTH: u32 = 200;
+static RULE_RENAME_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// Renames a rule's variables to fresh names on every use, so backtracking
+// into the same rule twice (e.g. via recursion) can't have one attempt's
+// bindings leak into another's.
+fn fresh_rename(rule: &LogicRule) -> LogicRule {
+    let suffix = RULE_RENAME_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut map: HashMap<String, String> = HashMap::new();
+    let mut rename = |s: &str, map: &mut HashMap<String, String>| -> String {
+        if is_logic_var(s) {
+            map.entry(s.to_string()).or_insert_with(|| format!("{}__{}", s, suffix)).clone()
+        } else {
+            s.to_string()
+        }
+    };
+    let head_args = rule.head_args.iter().map(|a| rename(a, &mut map)).collect();
+    let body = rule.body.iter().map(|(p, a)| (p.clone(), a.iter().map(|x| rename(x, &mut map)).collect())).collect();
+    LogicRule { head_pred: rule.head_pred.clone(), head_args, body }
+}
+
+fn solve_goal(pred: &str, args: &[String], subst: &Subst, depth: u32) -> Vec<Subst> {
+    if depth > MAX_LOGIC_DEPTH { return Vec::new(); }
+    let candidates: Vec<LogicRule> = RULES.with(|r| r.borrow().iter().filter(|ru| ru.head_pred == pred).cloned().collect());
+    let mut results = Vec::new();
+    for rule in candidates {
+        let rule = fresh_rename(&rule);
+        if let Some(s2) = unify_args(args, &rule.head_args, subst) {
+            results.extend(resolve_conjuncts(&rule.body, &s2, depth + 1));
+        }
+    }
+    results
+}
+
+fn resolve_conjuncts(body: &[(String, Vec<String>)], subst: &Subst, depth: u32) -> Vec<Subst> {
+    if body.is_empty() { return vec![subst.clone()]; }
+    let (pred, args) = &body[0];
+    let rest = &body[1..];
+    let applied_args = apply_subst(args, subst);
+    let mut out = Vec::new();
+    for s2 in solve_goal(pred, &applied_args, subst, depth) {
+        out.extend(resolve_conjuncts(rest, &s2, depth));
+    }
+    out
+}
+
+fn value_to_str_list(v: &Value) -> Vec<String> {
+    match v {
+        Value::List(xs) => xs.iter().map(to_s).collect(),
+        other => vec![to_s(other)],
+    }
+}
+
+pub fn host_rule_add(args: &[Value]) -> Result<Value, String> {
+    // rule_add(head_pred, head_args_list, body_list) -> Unit
+    // body_list: List of [pred, args_list] pairs; an empty body_list
+    // declares a ground (or partially-variable) fact under the same
+    // representation.
+    if args.len() != 3 { return Err("rule_add: expected 3 args (head_pred, head_args_list, body_list)".into()); }
+    let head_pred = match &args[0] { Value::String(s) => s.clone(), v => to_s(v) };
+    let head_args = value_to_str_list(&args[1]);
+    let body_items = match &args[2] { Value::List(xs) => xs.clone(), _ => Vec::new() };
+    let mut body = Vec::new();
+    for item in body_items {
+        if let Value::List(pair) = &item {
+            if pair.len() == 2 {
+                body.push((to_s(&pair[0]), value_to_str_list(&pair[1])));
+            }
+        }
+    }
+    RULES.with(|r| r.borrow_mut().push(LogicRule { head_pred, head_args, body }));
+    Ok(Value::Unit)
+}
+
+pub fn host_solve(args: &[Value]) -> Result<Value, String> {
+    // solve(pred, args_list) -> List of solutions; each solution is
+    // args_list with any variables replaced by their bound values, in the
+    // same shape/order as the input, one entry per way the goal can be
+    // proven true (real backtracking -- every rule/fact that unifies
+    // contributes a solution, not just the first).
+    if args.len() != 2 { return Err("solve: expected 2 args (pred, args_list)".into()); }
+    let pred = match &args[0] { Value::String(s) => s.clone(), v => to_s(v) };
+    let query_args = value_to_str_list(&args[1]);
+    let empty: Subst = HashMap::new();
+    let solutions = solve_goal(&pred, &query_args, &empty, 0);
+    let out: Vec<Value> = solutions.iter().map(|s| {
+        Value::List(query_args.iter().map(|a| Value::String(walk(a, s))).collect())
+    }).collect();
+    Ok(Value::List(out))
+}
+
+// ---- A2: GOAP planner -- forward state-space search over actions with
+// preconditions/effects/cost, distinct from A1's backward resolution.
+// Ground-only (no logic variables) for v1: GOAP world-state facts are
+// naturally propositional ("target_a built"), so the search space is a
+// plain hashable set of facts rather than needing unification mid-search.
+// Shares its fact substrate with A1: the "world state" is exactly the set
+// of ground, empty-body rules currently registered (i.e. facts declared via
+// `rule_add(pred, args, [])`), so contracts-as-facts and A1-declared facts
+// are automatically visible to planning too.
+
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct GroundFact { pred: String, args: Vec<String> }
+
+#[derive(Clone)]
+struct GoapAction {
+    name: String,
+    preconds: Vec<GroundFact>,
+    add_effects: Vec<GroundFact>,
+    del_effects: Vec<GroundFact>,
+    cost: i64,
+}
+
+thread_local! {
+    static ACTIONS: RefCell<Vec<GoapAction>> = RefCell::new(Vec::new());
+}
+
+fn parse_ground_facts(v: &Value) -> Vec<GroundFact> {
+    let items = match v { Value::List(xs) => xs.clone(), _ => Vec::new() };
+    let mut out = Vec::new();
+    for item in items {
+        if let Value::List(pair) = &item {
+            if pair.len() == 2 {
+                out.push(GroundFact { pred: to_s(&pair[0]), args: value_to_str_list(&pair[1]) });
+            }
+        }
+    }
+    out
+}
+
+fn current_ground_facts_as_state() -> std::collections::HashSet<GroundFact> {
+    RULES.with(|r| r.borrow().iter()
+        .filter(|ru| ru.body.is_empty() && !ru.head_args.iter().any(|a| is_logic_var(a)))
+        .map(|ru| GroundFact { pred: ru.head_pred.clone(), args: ru.head_args.clone() })
+        .collect())
+}
+
+pub fn host_action_add(args: &[Value]) -> Result<Value, String> {
+    // action_add(name, preconds_list, add_effects_list, del_effects_list, cost) -> Unit
+    if args.len() != 5 { return Err("action_add: expected 5 args (name, preconds, add_effects, del_effects, cost)".into()); }
+    let name = match &args[0] { Value::String(s) => s.clone(), v => to_s(v) };
+    let preconds = parse_ground_facts(&args[1]);
+    let add_effects = parse_ground_facts(&args[2]);
+    let del_effects = parse_ground_facts(&args[3]);
+    let cost = match &args[4] {
+        Value::Int(n) => *n,
+        Value::Float(n) => n.round() as i64,
+        Value::String(s) => s.parse::<f64>().unwrap_or(1.0).round() as i64,
+        _ => 1,
+    };
+    ACTIONS.with(|a| a.borrow_mut().push(GoapAction { name, preconds, add_effects, del_effects, cost }));
+    Ok(Value::Unit)
+}
+
+pub fn host_plan(args: &[Value]) -> Result<Value, String> {
+    // plan(goal_facts_list) -> List of action names in execution order, or
+    // an empty List if no plan is found within the search cap. Uniform-cost
+    // search (Dijkstra) over world-states so a cheaper multi-step plan is
+    // preferred over a pricier direct one.
+    if args.len() != 1 { return Err("plan: expected 1 arg (goal_facts_list)".into()); }
+    let goal_facts = parse_ground_facts(&args[0]);
+    let actions: Vec<GoapAction> = ACTIONS.with(|a| a.borrow().clone());
+
+    use std::collections::{BinaryHeap, HashSet};
+    use std::cmp::Reverse;
+
+    let start_state: HashSet<GroundFact> = current_ground_facts_as_state();
+    let mut nodes: Vec<(HashSet<GroundFact>, Vec<String>, i64)> = vec![(start_state, Vec::new(), 0)];
+    let mut frontier: BinaryHeap<Reverse<(i64, usize)>> = BinaryHeap::new();
+    frontier.push(Reverse((0, 0)));
+
+    let mut visited: HashSet<Vec<GroundFact>> = HashSet::new();
+    const NODE_CAP: usize = 5000;
+    let mut expansions = 0usize;
+
+    while let Some(Reverse((cost, idx))) = frontier.pop() {
+        if expansions >= NODE_CAP { break; }
+        let (state, path, node_cost) = nodes[idx].clone();
+        if node_cost != cost { continue; } // stale heap entry (no decrease-key; skip superseded ones)
+        expansions += 1;
+        if goal_facts.iter().all(|g| state.contains(g)) {
+            return Ok(Value::List(path.into_iter().map(Value::String).collect()));
+        }
+        let mut state_key: Vec<GroundFact> = state.iter().cloned().collect();
+        state_key.sort();
+        if !visited.insert(state_key) { continue; }
+
+        for action in &actions {
+            if action.preconds.iter().all(|p| state.contains(p)) {
+                let mut new_state = state.clone();
+                for d in &action.del_effects { new_state.remove(d); }
+                for a2 in &action.add_effects { new_state.insert(a2.clone()); }
+                let mut new_path = path.clone();
+                new_path.push(action.name.clone());
+                let new_cost = node_cost + action.cost;
+                nodes.push((new_state, new_path, new_cost));
+                frontier.push(Reverse((new_cost, nodes.len() - 1)));
+            }
+        }
+    }
+    Ok(Value::List(Vec::new()))
 }
 
 pub fn host_new(args: &[Value]) -> Result<Value, String> {
@@ -1202,6 +1471,15 @@ pub fn host_contract_check(args: &[Value]) -> Result<Value, String> {
     let text = match &args[2] { Value::String(s) => s.clone(), _ => String::new() };
     let ok = args[3].as_bool().unwrap_or(false);
     if ok {
+        // Record the successful check as a ground fact (an empty-body
+        // rule, same representation A1/A2 query) so DbC contracts become
+        // ordinary derivable data -- usable as a rule-body conjunct or a
+        // GOAP action precondition, not just a pass/fail side effect.
+        RULES.with(|r| r.borrow_mut().push(LogicRule {
+            head_pred: "contract_holds".to_string(),
+            head_args: vec![func.clone(), format!("{}:{}", kind, text)],
+            body: Vec::new(),
+        }));
         Ok(Value::Unit)
     } else {
         let label = match kind.as_str() {
@@ -1526,6 +1804,10 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("fact", host_fact);
     interp.host.insert("query", host_query);
     interp.host.insert("goal", host_goal);
+    interp.host.insert("rule_add", host_rule_add);
+    interp.host.insert("solve", host_solve);
+    interp.host.insert("action_add", host_action_add);
+    interp.host.insert("plan", host_plan);
     interp.host.insert("new", host_new);
     interp.host.insert("set_var", host_set_var);
     interp.host.insert("send", host_send);

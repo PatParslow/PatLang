@@ -131,6 +131,10 @@ const HOST_CHUNK_TABLE: &[(&str, ChunkId)] = &[
     ("fact", ChunkId::Logic),
     ("goal", ChunkId::Logic),
     ("query", ChunkId::Logic),
+    ("rule_add", ChunkId::Logic),
+    ("solve", ChunkId::Logic),
+    ("action_add", ChunkId::Logic),
+    ("plan", ChunkId::Logic),
     ("contract_check", ChunkId::Contracts),
     ("tcp_listen", ChunkId::Networking),
     ("tcp_connect", ChunkId::Networking),
@@ -192,6 +196,11 @@ const HOST_CHUNK_TABLE: &[(&str, ChunkId)] = &[
 const CROSS_CHUNK_EDGES: &[(ChunkId, ChunkId)] = &[
     (ChunkId::Math, ChunkId::NumericTower),
     (ChunkId::Oo, ChunkId::Logic),
+    // contract_check's success path now records a fact via `RULES`/`LogicRule`,
+    // both declared only in PRELUDE_LOGIC's text -- any program calling
+    // contract_check (via require/ensure/assert) needs Logic's declarations
+    // to compile, same rationale as the Oo -> Logic edge above.
+    (ChunkId::Contracts, ChunkId::Logic),
 ];
 
 pub struct RustCodegen;
@@ -2509,6 +2518,128 @@ fn host_call_oo(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     static FACTS: RefCell<HashMap<String, Vec<(String, String)>>> = RefCell::new(HashMap::new());
     static GOALS: RefCell<Vec<(String, Vec<String>)>> = RefCell::new(Vec::new());
     static TYPE_RULES: RefCell<HashMap<(String, usize), String>> = RefCell::new(HashMap::new());
+    static RULES: RefCell<Vec<LogicRule>> = RefCell::new(Vec::new());
+    static ACTIONS: RefCell<Vec<GoapAction>> = RefCell::new(Vec::new());
+}
+
+use std::collections::HashSet;
+
+#[derive(Clone)]
+struct LogicRule { head_pred: String, head_args: Vec<String>, body: Vec<(String, Vec<String>)> }
+
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct GroundFact { pred: String, args: Vec<String> }
+
+#[derive(Clone)]
+struct GoapAction { name: String, preconds: Vec<GroundFact>, add_effects: Vec<GroundFact>, del_effects: Vec<GroundFact>, cost: i64 }
+
+type LogicSubst = HashMap<String, String>;
+
+fn is_logic_var(s: &str) -> bool {
+    s.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false)
+}
+
+fn logic_walk(term: &str, subst: &LogicSubst) -> String {
+    let mut cur = term.to_string();
+    let mut hops = 0;
+    while is_logic_var(&cur) {
+        match subst.get(&cur) {
+            Some(next) if next != &cur => { cur = next.clone(); hops += 1; if hops > 1000 { break; } }
+            _ => break,
+        }
+    }
+    cur
+}
+
+fn unify_args(query_args: &[String], target_args: &[String], subst: &LogicSubst) -> Option<LogicSubst> {
+    if query_args.len() != target_args.len() { return None; }
+    let mut s = subst.clone();
+    for (qa, ta) in query_args.iter().zip(target_args.iter()) {
+        let qw = logic_walk(qa, &s);
+        let tw = logic_walk(ta, &s);
+        if is_logic_var(&qw) {
+            if qw != tw { s.insert(qw, tw); }
+        } else if is_logic_var(&tw) {
+            if tw != qw { s.insert(tw, qw); }
+        } else if qw != tw {
+            return None;
+        }
+    }
+    Some(s)
+}
+
+fn logic_apply_subst(args: &[String], subst: &LogicSubst) -> Vec<String> {
+    args.iter().map(|a| logic_walk(a, subst)).collect()
+}
+
+const MAX_LOGIC_DEPTH: u32 = 200;
+static RULE_RENAME_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn fresh_rename(rule: &LogicRule) -> LogicRule {
+    let suffix = RULE_RENAME_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut map: HashMap<String, String> = HashMap::new();
+    let mut rename = |s: &str, map: &mut HashMap<String, String>| -> String {
+        if is_logic_var(s) {
+            map.entry(s.to_string()).or_insert_with(|| format!("{}__{}", s, suffix)).clone()
+        } else {
+            s.to_string()
+        }
+    };
+    let head_args = rule.head_args.iter().map(|a| rename(a, &mut map)).collect();
+    let body = rule.body.iter().map(|(p, a)| (p.clone(), a.iter().map(|x| rename(x, &mut map)).collect())).collect();
+    LogicRule { head_pred: rule.head_pred.clone(), head_args, body }
+}
+
+fn solve_goal(pred: &str, args: &[String], subst: &LogicSubst, depth: u32) -> Vec<LogicSubst> {
+    if depth > MAX_LOGIC_DEPTH { return Vec::new(); }
+    let candidates: Vec<LogicRule> = RULES.with(|r| r.borrow().iter().filter(|ru| ru.head_pred == pred).cloned().collect());
+    let mut results = Vec::new();
+    for rule in candidates {
+        let rule = fresh_rename(&rule);
+        if let Some(s2) = unify_args(args, &rule.head_args, subst) {
+            results.extend(resolve_conjuncts(&rule.body, &s2, depth + 1));
+        }
+    }
+    results
+}
+
+fn resolve_conjuncts(body: &[(String, Vec<String>)], subst: &LogicSubst, depth: u32) -> Vec<LogicSubst> {
+    if body.is_empty() { return vec![subst.clone()]; }
+    let (pred, args) = &body[0];
+    let rest = &body[1..];
+    let applied_args = logic_apply_subst(args, subst);
+    let mut out = Vec::new();
+    for s2 in solve_goal(pred, &applied_args, subst, depth) {
+        out.extend(resolve_conjuncts(rest, &s2, depth));
+    }
+    out
+}
+
+fn value_to_str_list(v: &Value) -> Vec<String> {
+    match v {
+        Value::List(xs) => xs.iter().map(to_s).collect(),
+        other => vec![to_s(other)],
+    }
+}
+
+fn parse_ground_facts(v: &Value) -> Vec<GroundFact> {
+    let items = match v { Value::List(xs) => xs.clone(), _ => Vec::new() };
+    let mut out = Vec::new();
+    for item in items {
+        if let Value::List(pair) = &item {
+            if pair.len() == 2 {
+                out.push(GroundFact { pred: to_s(&pair[0]), args: value_to_str_list(&pair[1]) });
+            }
+        }
+    }
+    out
+}
+
+fn current_ground_facts_as_state() -> HashSet<GroundFact> {
+    RULES.with(|r| r.borrow().iter()
+        .filter(|ru| ru.body.is_empty() && !ru.head_args.iter().any(|a| is_logic_var(a)))
+        .map(|ru| GroundFact { pred: ru.head_pred.clone(), args: ru.head_args.clone() })
+        .collect())
 }
 
 fn host_call_logic_inner(name: &str, args: &[Value]) -> Result<Value, String> {
@@ -2564,13 +2695,92 @@ fn host_call_logic_inner(name: &str, args: &[Value]) -> Result<Value, String> {
                 });
                 Ok(Value::Number(count as f64))
             }
+"rule_add" => {
+                if args.len() != 3 { return Err("rule_add: expected 3 args (head_pred, head_args_list, body_list)".into()); }
+                let head_pred = match &args[0] { Value::String(s) => s.clone(), v => to_s(v) };
+                let head_args = value_to_str_list(&args[1]);
+                let body_items = match &args[2] { Value::List(xs) => xs.clone(), _ => Vec::new() };
+                let mut body = Vec::new();
+                for item in body_items {
+                    if let Value::List(pair) = &item {
+                        if pair.len() == 2 {
+                            body.push((to_s(&pair[0]), value_to_str_list(&pair[1])));
+                        }
+                    }
+                }
+                RULES.with(|r| r.borrow_mut().push(LogicRule { head_pred, head_args, body }));
+                Ok(Value::Unit)
+            }
+            "solve" => {
+                if args.len() != 2 { return Err("solve: expected 2 args (pred, args_list)".into()); }
+                let pred = match &args[0] { Value::String(s) => s.clone(), v => to_s(v) };
+                let query_args = value_to_str_list(&args[1]);
+                let empty: LogicSubst = HashMap::new();
+                let solutions = solve_goal(&pred, &query_args, &empty, 0);
+                let out: Vec<Value> = solutions.iter().map(|s| {
+                    Value::List(query_args.iter().map(|a| Value::String(logic_walk(a, s))).collect())
+                }).collect();
+                Ok(Value::List(out))
+            }
+            "action_add" => {
+                if args.len() != 5 { return Err("action_add: expected 5 args (name, preconds, add_effects, del_effects, cost)".into()); }
+                let action_name = match &args[0] { Value::String(s) => s.clone(), v => to_s(v) };
+                let preconds = parse_ground_facts(&args[1]);
+                let add_effects = parse_ground_facts(&args[2]);
+                let del_effects = parse_ground_facts(&args[3]);
+                let cost = match &args[4] {
+                    Value::Number(n) => n.round() as i64,
+                    Value::String(s) => s.parse::<f64>().unwrap_or(1.0).round() as i64,
+                    _ => 1,
+                };
+                ACTIONS.with(|a| a.borrow_mut().push(GoapAction { name: action_name, preconds, add_effects, del_effects, cost }));
+                Ok(Value::Unit)
+            }
+            "plan" => {
+                if args.len() != 1 { return Err("plan: expected 1 arg (goal_facts_list)".into()); }
+                let goal_facts = parse_ground_facts(&args[0]);
+                let actions: Vec<GoapAction> = ACTIONS.with(|a| a.borrow().clone());
+                use std::collections::BinaryHeap;
+                use std::cmp::Reverse;
+                let start_state: HashSet<GroundFact> = current_ground_facts_as_state();
+                let mut nodes: Vec<(HashSet<GroundFact>, Vec<String>, i64)> = vec![(start_state, Vec::new(), 0)];
+                let mut frontier: BinaryHeap<Reverse<(i64, usize)>> = BinaryHeap::new();
+                frontier.push(Reverse((0, 0)));
+                let mut visited: HashSet<Vec<GroundFact>> = HashSet::new();
+                const NODE_CAP: usize = 5000;
+                let mut expansions = 0usize;
+                let mut found: Option<Vec<String>> = None;
+                while let Some(Reverse((cost, idx))) = frontier.pop() {
+                    if expansions >= NODE_CAP { break; }
+                    let (state, path, node_cost) = nodes[idx].clone();
+                    if node_cost != cost { continue; }
+                    expansions += 1;
+                    if goal_facts.iter().all(|g| state.contains(g)) { found = Some(path); break; }
+                    let mut state_key: Vec<GroundFact> = state.iter().cloned().collect();
+                    state_key.sort();
+                    if !visited.insert(state_key) { continue; }
+                    for action in &actions {
+                        if action.preconds.iter().all(|p| state.contains(p)) {
+                            let mut new_state = state.clone();
+                            for d in &action.del_effects { new_state.remove(d); }
+                            for a2 in &action.add_effects { new_state.insert(a2.clone()); }
+                            let mut new_path = path.clone();
+                            new_path.push(action.name.clone());
+                            let new_cost = node_cost + action.cost;
+                            nodes.push((new_state, new_path, new_cost));
+                            frontier.push(Reverse((new_cost, nodes.len() - 1)));
+                        }
+                    }
+                }
+                Ok(Value::List(found.unwrap_or_default().into_iter().map(Value::String).collect()))
+            }
                     _ => Err(format!("host fn '{}' not found", name)),
     }
 }
 
 fn host_call_logic(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match name {
-        "infer_type_for" | "fact" | "goal" | "query" => Some(host_call_logic_inner(name, args)),
+        "infer_type_for" | "fact" | "goal" | "query" | "rule_add" | "solve" | "action_add" | "plan" => Some(host_call_logic_inner(name, args)),
         _ => None,
     }
 }
@@ -2588,6 +2798,15 @@ fn host_call_logic(name: &str, args: &[Value]) -> Option<Result<Value, String>> 
                 let text = match &args[2] { Value::String(s) => s.clone(), _ => String::new() };
                 let ok = args[3].as_bool()?;
                 if ok {
+                    // Record the successful check as a ground fact (empty-body
+                    // rule) so DbC contracts become ordinary derivable data --
+                    // usable as an A1 rule-body conjunct or an A2 GOAP
+                    // precondition, not just a pass/fail side effect.
+                    RULES.with(|r| r.borrow_mut().push(LogicRule {
+                        head_pred: "contract_holds".to_string(),
+                        head_args: vec![func.clone(), format!("{}:{}", kind, text)],
+                        body: Vec::new(),
+                    }));
                     Ok(Value::Unit)
                 } else {
                     let label = match kind.as_str() {
