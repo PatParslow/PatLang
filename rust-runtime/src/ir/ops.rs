@@ -260,6 +260,43 @@ pub fn as_index(v: &Value) -> Result<usize, String> {
     }
 }
 
+// Bitwise ops operate on Value::Int only -- unlike arithmetic, they don't
+// participate in the numeric-tower promotion rules (no BigInt/Rational/
+// Complex bitwise semantics defined), so no promote_pair here.
+fn as_int(v: &Value, ctx: &str) -> Result<i64, String> {
+    match v { Value::Int(n) => Ok(*n), _ => Err(format!("{}: expected an integer", ctx)) }
+}
+
+pub fn bitand(a: &Value, b: &Value) -> Result<Value, String> {
+    Ok(Value::Int(as_int(a, "band")? & as_int(b, "band")?))
+}
+
+pub fn bitor(a: &Value, b: &Value) -> Result<Value, String> {
+    Ok(Value::Int(as_int(a, "bor")? | as_int(b, "bor")?))
+}
+
+pub fn bitxor(a: &Value, b: &Value) -> Result<Value, String> {
+    Ok(Value::Int(as_int(a, "bxor")? ^ as_int(b, "bxor")?))
+}
+
+pub fn bitnot(v: &Value) -> Result<Value, String> {
+    Ok(Value::Int(!as_int(v, "bnot")?))
+}
+
+pub fn shl(a: &Value, b: &Value) -> Result<Value, String> {
+    let x = as_int(a, "shl")?;
+    let n = as_int(b, "shl")?;
+    if !(0..64).contains(&n) { return Err(format!("shl: shift amount {} out of range 0..63", n)); }
+    Ok(Value::Int(x << n))
+}
+
+pub fn shr(a: &Value, b: &Value) -> Result<Value, String> {
+    let x = as_int(a, "shr")?;
+    let n = as_int(b, "shr")?;
+    if !(0..64).contains(&n) { return Err(format!("shr: shift amount {} out of range 0..63", n)); }
+    Ok(Value::Int(x >> n))
+}
+
 /// Unary negation across every numeric kind in the tower.
 pub fn negate(v: &Value) -> Result<Value, String> {
     match v {

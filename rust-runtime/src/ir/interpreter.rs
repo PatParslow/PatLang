@@ -66,6 +66,7 @@ impl Interpreter {
                     let res = match kind {
                         UnOpKind::Neg => ops::negate(&a)?,
                         UnOpKind::Not => Value::Bool(!a.as_bool()?),
+                        UnOpKind::BitNot => ops::bitnot(&a)?,
                     };
                     stack.push(res);
                 }
@@ -82,6 +83,11 @@ impl Interpreter {
                         Eq | Ne | Lt | Le | Gt | Ge => ops::cmp(kind.clone(), &a, &b)?,
                         And => Value::Bool(a.as_bool()? && b.as_bool()?),
                         Or => Value::Bool(a.as_bool()? || b.as_bool()?),
+                        BitAnd => ops::bitand(&a, &b)?,
+                        BitOr => ops::bitor(&a, &b)?,
+                        BitXor => ops::bitxor(&a, &b)?,
+                        Shl => ops::shl(&a, &b)?,
+                        Shr => ops::shr(&a, &b)?,
                     };
                     stack.push(res);
                 }

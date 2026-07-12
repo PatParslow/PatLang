@@ -134,6 +134,14 @@ pub enum BinaryOperator {
     GreaterEqual,
     Less,
     LessEqual,
+    // Bitwise: operate on Value::Int only, distinct from Arithmetic since
+    // they don't participate in the numeric-tower promotion rules (see
+    // BinaryOpKind::Bitwise below).
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
     // Extend with more operators as needed
 }
 
@@ -142,6 +150,7 @@ pub enum BinaryOpKind {
     Arithmetic(BinaryOperator),
     Logical(BinaryOperator),
     Comparison(BinaryOperator),
+    Bitwise(BinaryOperator),
 }
 
 impl BinaryOpKind {
@@ -160,6 +169,11 @@ impl BinaryOpKind {
             | BinaryOperator::GreaterEqual
             | BinaryOperator::Less
             | BinaryOperator::LessEqual => BinaryOpKind::Comparison(op.clone()),
+            BinaryOperator::BitAnd
+            | BinaryOperator::BitOr
+            | BinaryOperator::BitXor
+            | BinaryOperator::Shl
+            | BinaryOperator::Shr => BinaryOpKind::Bitwise(op.clone()),
         }
     }
 }

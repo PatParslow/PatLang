@@ -43,6 +43,15 @@ pub enum Token {
     And,
     Or,
     Not,
+    // Bitwise keyword operators (word-form, matching and/or/not's own
+    // convention -- `|` and `&` are already taken by Pipe/PipeGreater and
+    // closure `|params|` syntax, so symbol-based bitwise ops would collide).
+    BAnd,
+    BOr,
+    BXor,
+    BNot,
+    Shl,
+    Shr,
     Newline,
     EOF,
     // Patlang-specific tokens
@@ -133,7 +142,8 @@ impl TokenExpectation {
             Token::Plus | Token::Minus | Token::Star | Token::Slash | Token::Percent
             | Token::Equal | Token::EqualEqual | Token::NotEqual
             | Token::Greater | Token::GreaterEqual | Token::Less | Token::LessEqual
-            | Token::And | Token::Or | Token::Not => TokenExpectation::Operator,
+            | Token::And | Token::Or | Token::Not
+            | Token::BAnd | Token::BOr | Token::BXor | Token::BNot | Token::Shl | Token::Shr => TokenExpectation::Operator,
             Token::Identifier(_) => TokenExpectation::Letter,
             Token::Newline | Token::EOF | Token::Semicolon | Token::Comma
             | Token::RParen | Token::RBracket | Token::BlockEnd => TokenExpectation::Terminator,
@@ -310,6 +320,12 @@ impl<'a> Lexer<'a> {
                     "and" => Token::And,
                     "or" => Token::Or,
                     "not" => Token::Not,
+                    "band" => Token::BAnd,
+                    "bor" => Token::BOr,
+                    "bxor" => Token::BXor,
+                    "bnot" => Token::BNot,
+                    "shl" => Token::Shl,
+                    "shr" => Token::Shr,
                     "true" | "false" => Token::Identifier(ident.to_string()), // treat as identifier for now
                     "print" => Token::Identifier(ident.to_string()),
                     _ => Token::Identifier(ident.to_string()),

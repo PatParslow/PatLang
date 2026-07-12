@@ -82,10 +82,10 @@ impl Value {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum BinOpKind { Add, Sub, Mul, Div, Mod, Eq, Ne, Lt, Le, Gt, Ge, And, Or }
+pub enum BinOpKind { Add, Sub, Mul, Div, Mod, Eq, Ne, Lt, Le, Gt, Ge, And, Or, BitAnd, BitOr, BitXor, Shl, Shr }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum UnOpKind { Neg, Not }
+pub enum UnOpKind { Neg, Not, BitNot }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Instr {

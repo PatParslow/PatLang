@@ -251,7 +251,8 @@ impl Lowerer {
             "parallel_map"|"fiber_new"|"fiber_resume"|"fiber_yield"|"fiber_alive"|
             "budgeted_run"|"budget_check"|
             "list_dir"|"rename_file"|
-            "rule_add"|"solve"|"action_add"|"plan"
+            "rule_add"|"solve"|"action_add"|"plan"|
+            "bit_get"|"bit_set"|"bit_slice"|"bit_set_slice"
         )
     }
 
@@ -381,6 +382,7 @@ impl Lowerer {
                 match op.as_str() {
                     "-" => f.body.push(Instr::UnOp(UnOpKind::Neg)),
                     "not" => f.body.push(Instr::UnOp(UnOpKind::Not)),
+                    "bnot" => f.body.push(Instr::UnOp(UnOpKind::BitNot)),
                     _ => {}
                 }
             }
@@ -441,6 +443,11 @@ impl Lowerer {
                             GreaterEqual => Instr::BinOp(BinOpKind::Ge),
                             Less => Instr::BinOp(BinOpKind::Lt),
                             LessEqual => Instr::BinOp(BinOpKind::Le),
+                            BitAnd => Instr::BinOp(BinOpKind::BitAnd),
+                            BitOr => Instr::BinOp(BinOpKind::BitOr),
+                            BitXor => Instr::BinOp(BinOpKind::BitXor),
+                            Shl => Instr::BinOp(BinOpKind::Shl),
+                            Shr => Instr::BinOp(BinOpKind::Shr),
                             And | Or => unreachable!(),
                         };
                         f.body.push(instr);
@@ -598,6 +605,8 @@ pub fn expr_to_text(e: &Expr) -> String {
                 BinaryOperator::Equal => "==", BinaryOperator::NotEqual => "!=",
                 BinaryOperator::Greater => ">", BinaryOperator::GreaterEqual => ">=",
                 BinaryOperator::Less => "<", BinaryOperator::LessEqual => "<=",
+                BinaryOperator::BitAnd => "band", BinaryOperator::BitOr => "bor", BinaryOperator::BitXor => "bxor",
+                BinaryOperator::Shl => "shl", BinaryOperator::Shr => "shr",
             };
             format!("{} {} {}", expr_to_text(left), sym, expr_to_text(right))
         }

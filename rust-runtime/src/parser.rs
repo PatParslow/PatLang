@@ -778,6 +778,9 @@ impl<'a> Parser<'a> {
                     Token::EqualEqual | Token::NotEqual | Token::Greater | Token::GreaterEqual | Token::Less | Token::LessEqual => {
                         self.advance()?;
                     }
+                    Token::BAnd | Token::BOr | Token::BXor | Token::Shl | Token::Shr => {
+                        self.advance()?;
+                    }
                     _ => { /* newline may separate statements; do not consume here */ }
                 }
             }
@@ -807,6 +810,17 @@ impl<'a> Parser<'a> {
                 Token::LessEqual => (BinaryOperator::LessEqual, 7, 8),
                 Token::And => (BinaryOperator::And, 3, 4),
                 Token::Or => (BinaryOperator::Or, 2, 3),
+                // Bitwise: shl/shr bind tighter than +/- but looser than
+                // */%, matching C's own placement. band/bxor/bor share a
+                // single combined tier (looser than +/-, tighter than
+                // comparisons) rather than three separate C-style tiers --
+                // parenthesize mixed band/bxor/bor expressions if a specific
+                // grouping matters, same advice as mixing `and`/`or` today.
+                Token::Shl => (BinaryOperator::Shl, 15, 16),
+                Token::Shr => (BinaryOperator::Shr, 15, 16),
+                Token::BAnd => (BinaryOperator::BitAnd, 9, 10),
+                Token::BXor => (BinaryOperator::BitXor, 9, 10),
+                Token::BOr => (BinaryOperator::BitOr, 9, 10),
                 _ => break,
             };
             if lbp < min_bp { break; }
@@ -828,6 +842,7 @@ impl<'a> Parser<'a> {
         // parse base
         let mut expr = match &self.curr {
             Token::Not => { self.advance()?; let inner = self.parse_primary()?; Expr::UnaryOp { op: "not".into(), expr: Box::new(inner) } }
+            Token::BNot => { self.advance()?; let inner = self.parse_primary()?; Expr::UnaryOp { op: "bnot".into(), expr: Box::new(inner) } }
             Token::Minus => { self.advance()?; let inner = self.parse_primary()?; Expr::UnaryOp { op: "-".into(), expr: Box::new(inner) } }
             Token::Number(n) => { let v = *n; self.advance()?; Expr::Number(v) }
             Token::Float(n) => { let v = *n; self.advance()?; Expr::Float(v) }

@@ -146,12 +146,14 @@ fn test_binary_operator_variants() {
         BinaryOperator::Add, BinaryOperator::Sub, BinaryOperator::Mul, BinaryOperator::Div, BinaryOperator::Mod,
         BinaryOperator::And, BinaryOperator::Or, BinaryOperator::Equal, BinaryOperator::NotEqual, BinaryOperator::Greater,
         BinaryOperator::GreaterEqual, BinaryOperator::Less, BinaryOperator::LessEqual,
+        BinaryOperator::BitAnd, BinaryOperator::BitOr, BinaryOperator::BitXor, BinaryOperator::Shl, BinaryOperator::Shr,
     ];
     for op in ops.iter() {
         match op {
             BinaryOperator::Add | BinaryOperator::Sub | BinaryOperator::Mul | BinaryOperator::Div | BinaryOperator::Mod |
             BinaryOperator::And | BinaryOperator::Or | BinaryOperator::Equal | BinaryOperator::NotEqual | BinaryOperator::Greater |
-            BinaryOperator::GreaterEqual | BinaryOperator::Less | BinaryOperator::LessEqual => {}
+            BinaryOperator::GreaterEqual | BinaryOperator::Less | BinaryOperator::LessEqual |
+            BinaryOperator::BitAnd | BinaryOperator::BitOr | BinaryOperator::BitXor | BinaryOperator::Shl | BinaryOperator::Shr => {}
         }
     }
 }

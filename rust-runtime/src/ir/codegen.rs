@@ -81,6 +81,10 @@ const HOST_CHUNK_TABLE: &[(&str, ChunkId)] = &[
     ("list_push", ChunkId::Core),
     ("list_set", ChunkId::Core),
     ("type_of", ChunkId::Core),
+    ("bit_get", ChunkId::Core),
+    ("bit_set", ChunkId::Core),
+    ("bit_slice", ChunkId::Core),
+    ("bit_set_slice", ChunkId::Core),
     ("char_code", ChunkId::StringsExt),
     ("substr", ChunkId::StringsExt),
     ("chr", ChunkId::StringsExt),
@@ -328,9 +332,9 @@ fn ensure_obj(name: &str, class: &str) {
 // for the full rationale (Stage 38, "risky shared-dependency edit").
 
 #[derive(Clone, Debug, PartialEq)]
-enum BinOpKind { Add, Sub, Mul, Div, Mod, Eq, Ne, Lt, Le, Gt, Ge, And, Or }
+enum BinOpKind { Add, Sub, Mul, Div, Mod, Eq, Ne, Lt, Le, Gt, Ge, And, Or, BitAnd, BitOr, BitXor, Shl, Shr }
 #[derive(Clone, Debug, PartialEq)]
-enum UnOpKind { Neg, Not }
+enum UnOpKind { Neg, Not, BitNot }
 
 #[derive(Clone, Debug, PartialEq)]
 enum Instr {
@@ -440,6 +444,46 @@ impl Host {
                 xs[idx] = args[2].clone();
                 Ok(Value::List(xs))
             }
+            "bit_get" => {
+                if args.len() != 2 { return Err("bit_get: expected 2 args (n, pos)".into()); }
+                let n = bits_of(&args[0])?;
+                let pos = bits_of(&args[1])?;
+                if !(0..64).contains(&pos) { return Err(format!("bit_get: pos {} out of range 0..63", pos)); }
+                Ok(Value::Int((n >> pos) & 1))
+            }
+            "bit_set" => {
+                if args.len() != 3 { return Err("bit_set: expected 3 args (n, pos, val)".into()); }
+                let n = bits_of(&args[0])?;
+                let pos = bits_of(&args[1])?;
+                let val = bits_of(&args[2])?;
+                if !(0..64).contains(&pos) { return Err(format!("bit_set: pos {} out of range 0..63", pos)); }
+                let mask = 1i64 << pos;
+                Ok(Value::Int(if val != 0 { n | mask } else { n & !mask }))
+            }
+            "bit_slice" => {
+                if args.len() != 3 { return Err("bit_slice: expected 3 args (n, start, width)".into()); }
+                let n = bits_of(&args[0])?;
+                let start = bits_of(&args[1])?;
+                let width = bits_of(&args[2])?;
+                if !(0..64).contains(&start) { return Err(format!("bit_slice: start {} out of range 0..63", start)); }
+                if !(0..=64).contains(&width) || start + width > 64 { return Err(format!("bit_slice: width {} at start {} out of range", width, start)); }
+                if width == 0 { return Ok(Value::Int(0)); }
+                let mask: i64 = if width == 64 { -1 } else { (1i64 << width) - 1 };
+                Ok(Value::Int((n >> start) & mask))
+            }
+            "bit_set_slice" => {
+                if args.len() != 4 { return Err("bit_set_slice: expected 4 args (n, start, width, val)".into()); }
+                let n = bits_of(&args[0])?;
+                let start = bits_of(&args[1])?;
+                let width = bits_of(&args[2])?;
+                let val = bits_of(&args[3])?;
+                if !(0..64).contains(&start) { return Err(format!("bit_set_slice: start {} out of range 0..63", start)); }
+                if !(0..=64).contains(&width) || start + width > 64 { return Err(format!("bit_set_slice: width {} at start {} out of range", width, start)); }
+                if width == 0 { return Ok(Value::Int(n)); }
+                let mask: i64 = if width == 64 { -1 } else { (1i64 << width) - 1 };
+                let cleared = n & !(mask << start);
+                Ok(Value::Int(cleared | ((val & mask) << start)))
+            }
                         _ => call_dispatch(name, args),
         }
     }
@@ -447,6 +491,14 @@ impl Host {
 
 // display_value now comes from whichever value-module is selected (see the
 // note above `enum BinOpKind`).
+
+// bit_get/bit_set/bit_slice/bit_set_slice (ChunkId::Core, always present)
+// need an integer extractor that works regardless of which Value-shape
+// chunk is paired alongside PRELUDE_CORE -- Value::Int exists in both, but
+// arithmetic results in the "fast" shape can come back as Value::Number.
+fn bits_of(v: &Value) -> Result<i64, String> {
+    match v { Value::Int(n) => Ok(*n), Value::Number(n) => Ok(*n as i64), _ => Err("expected an integer".into()) }
+}
 
 #[derive(Clone)]
 struct Function { name: String, params: Vec<String>, body: Vec<Instr> }
@@ -692,7 +744,7 @@ fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Va
             Instr::StoreLocal(n) => { let v = stack.pop().ok_or("stack underflow")?; locals.insert(n.clone(), v); },
             Instr::UnOp(k) => {
                 let a = stack.pop().ok_or("stack underflow")?;
-                let r = match k { UnOpKind::Neg => neg(&a)?, UnOpKind::Not => Value::Bool(!a.as_bool()?) };
+                let r = match k { UnOpKind::Neg => neg(&a)?, UnOpKind::Not => Value::Bool(!a.as_bool()?), UnOpKind::BitNot => bitnot(&a)? };
                 stack.push(r);
             }
             Instr::BinOp(k) => {
@@ -704,6 +756,8 @@ fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Va
                     Eq|Ne|Lt|Le|Gt|Ge => cmp(k, &a, &b)?,
                     And => Value::Bool(a.as_bool()? && b.as_bool()?),
                     Or => Value::Bool(a.as_bool()? || b.as_bool()?),
+                    BitAnd => bitand(&a,&b)?, BitOr => bitor(&a,&b)?, BitXor => bitxor(&a,&b)?,
+                    Shl => shl(&a,&b)?, Shr => shr(&a,&b)?,
                 };
                 stack.push(r);
             }
@@ -1016,6 +1070,23 @@ fn mul(a:&Value,b:&Value)->Result<Value,String>{ Ok(Value::Number(a.as_number()?
 fn div(a:&Value,b:&Value)->Result<Value,String>{ Ok(Value::Number(a.as_number()? / b.as_number()?)) }
 fn modu(a:&Value,b:&Value)->Result<Value,String>{ Ok(Value::Number(a.as_number()? % b.as_number()?)) }
 fn neg(a:&Value)->Result<Value,String>{ Ok(Value::Number(-a.as_number()?)) }
+fn as_bits(v:&Value)->Result<i64,String>{
+    match v { Value::Int(n) => Ok(*n), Value::Number(n) => Ok(*n as i64), _ => Err("expected an integer".into()) }
+}
+fn bitand(a:&Value,b:&Value)->Result<Value,String>{ Ok(Value::Int(as_bits(a)? & as_bits(b)?)) }
+fn bitor(a:&Value,b:&Value)->Result<Value,String>{ Ok(Value::Int(as_bits(a)? | as_bits(b)?)) }
+fn bitxor(a:&Value,b:&Value)->Result<Value,String>{ Ok(Value::Int(as_bits(a)? ^ as_bits(b)?)) }
+fn bitnot(a:&Value)->Result<Value,String>{ Ok(Value::Int(!as_bits(a)?)) }
+fn shl(a:&Value,b:&Value)->Result<Value,String>{
+    let x=as_bits(a)?; let n=as_bits(b)?;
+    if !(0..64).contains(&n) { return Err(format!("shl: shift amount {} out of range 0..63", n)); }
+    Ok(Value::Int(x<<n))
+}
+fn shr(a:&Value,b:&Value)->Result<Value,String>{
+    let x=as_bits(a)?; let n=as_bits(b)?;
+    if !(0..64).contains(&n) { return Err(format!("shr: shift amount {} out of range 0..63", n)); }
+    Ok(Value::Int(x>>n))
+}
 fn cmp(k:&BinOpKind,a:&Value,b:&Value)->Result<Value,String>{
     use BinOpKind::*;
     let res = match k {
@@ -1649,6 +1720,23 @@ fn neg(a:&Value)->Result<Value,String>{
         Value::Unit => Ok(Value::Int(0)),
         _ => Err("expected number".to_string()),
     }
+}
+fn as_bits(v:&Value)->Result<i64,String>{
+    match v { Value::Int(n) => Ok(*n), Value::Number(n) => Ok(*n as i64), _ => Err("expected an integer".into()) }
+}
+fn bitand(a:&Value,b:&Value)->Result<Value,String>{ Ok(Value::Int(as_bits(a)? & as_bits(b)?)) }
+fn bitor(a:&Value,b:&Value)->Result<Value,String>{ Ok(Value::Int(as_bits(a)? | as_bits(b)?)) }
+fn bitxor(a:&Value,b:&Value)->Result<Value,String>{ Ok(Value::Int(as_bits(a)? ^ as_bits(b)?)) }
+fn bitnot(a:&Value)->Result<Value,String>{ Ok(Value::Int(!as_bits(a)?)) }
+fn shl(a:&Value,b:&Value)->Result<Value,String>{
+    let x=as_bits(a)?; let n=as_bits(b)?;
+    if !(0..64).contains(&n) { return Err(format!("shl: shift amount {} out of range 0..63", n)); }
+    Ok(Value::Int(x<<n))
+}
+fn shr(a:&Value,b:&Value)->Result<Value,String>{
+    let x=as_bits(a)?; let n=as_bits(b)?;
+    if !(0..64).contains(&n) { return Err(format!("shr: shift amount {} out of range 0..63", n)); }
+    Ok(Value::Int(x>>n))
 }
 fn cmp(k:&BinOpKind,a:&Value,b:&Value)->Result<Value,String>{
     use BinOpKind::*;
@@ -3613,11 +3701,19 @@ fn host_call_codegen_bootstrap_inner(name: &str, args: &[Value]) -> Result<Value
                                 "==" => BinOpKind::Eq, "!=" => BinOpKind::Ne,
                                 "<" => BinOpKind::Lt, "<=" => BinOpKind::Le,
                                 ">" => BinOpKind::Gt, ">=" => BinOpKind::Ge,
-                                "and" => BinOpKind::And, _ => BinOpKind::Or,
+                                "and" => BinOpKind::And,
+                                "band" => BinOpKind::BitAnd, "bxor" => BinOpKind::BitXor, "bor" => BinOpKind::BitOr,
+                                "shl" => BinOpKind::Shl, "shr" => BinOpKind::Shr,
+                                _ => BinOpKind::Or,
                             };
                             Instr::BinOp(k)
                         }
-                        "Un" => { if st(xs, 1)? == "not" { Instr::UnOp(UnOpKind::Not) } else { Instr::UnOp(UnOpKind::Neg) } }
+                        "Un" => {
+                            let op = st(xs, 1)?;
+                            if op == "not" { Instr::UnOp(UnOpKind::Not) }
+                            else if op == "bnot" { Instr::UnOp(UnOpKind::BitNot) }
+                            else { Instr::UnOp(UnOpKind::Neg) }
+                        }
                         "Jump" => Instr::Jump(snum(xs, 1)? as usize),
                         "JumpIfFalse" => Instr::JumpIfFalse(snum(xs, 1)? as usize),
                         "CallHost" => Instr::CallHost(st(xs, 1)?, snum(xs, 2)? as usize),
@@ -3858,7 +3954,7 @@ fn host_call_codegen_bootstrap(name: &str, args: &[Value]) -> Option<Result<Valu
             }
             Instr::UnOp(k) => {
                 out.push_str("Instr::UnOp(");
-                match k { UnOpKind::Neg => out.push_str("UnOpKind::Neg"), UnOpKind::Not => out.push_str("UnOpKind::Not") }
+                match k { UnOpKind::Neg => out.push_str("UnOpKind::Neg"), UnOpKind::Not => out.push_str("UnOpKind::Not"), UnOpKind::BitNot => out.push_str("UnOpKind::BitNot") }
                 out.push(')');
             }
             Instr::Jump(t) => out.push_str(&format!("Instr::Jump({})", t)),
@@ -3881,7 +3977,7 @@ fn host_call_codegen_bootstrap(name: &str, args: &[Value]) -> Option<Result<Valu
 
     fn emit_binop(&self, k: &BinOpKind, out: &mut String) {
         use BinOpKind::*;
-        let s = match k { Add=>"Add", Sub=>"Sub", Mul=>"Mul", Div=>"Div", Mod=>"Mod", Eq=>"Eq", Ne=>"Ne", Lt=>"Lt", Le=>"Le", Gt=>"Gt", Ge=>"Ge", And=>"And", Or=>"Or" };
+        let s = match k { Add=>"Add", Sub=>"Sub", Mul=>"Mul", Div=>"Div", Mod=>"Mod", Eq=>"Eq", Ne=>"Ne", Lt=>"Lt", Le=>"Le", Gt=>"Gt", Ge=>"Ge", And=>"And", Or=>"Or", BitAnd=>"BitAnd", BitOr=>"BitOr", BitXor=>"BitXor", Shl=>"Shl", Shr=>"Shr" };
         out.push_str(&format!("BinOpKind::{}", s));
     }
 

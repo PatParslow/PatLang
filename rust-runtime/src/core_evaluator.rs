@@ -521,6 +521,23 @@ impl<'a> CoreEvaluator<'a> {
                         };
                         Ok(if b { "true".to_string() } else { "false".to_string() })
                     }
+                    crate::ast::BinaryOpKind::Bitwise(binop) => {
+                        // This legacy string/f64 evaluator predates the
+                        // bitwise operators; truncate to i64 for a
+                        // best-effort result, matching this function's own
+                        // existing "parse as f64" convention throughout.
+                        let l = left_val.unwrap_or(0.0) as i64;
+                        let r = right_val.unwrap_or(0.0) as i64;
+                        let result = match binop {
+                            crate::ast::BinaryOperator::BitAnd => l & r,
+                            crate::ast::BinaryOperator::BitOr => l | r,
+                            crate::ast::BinaryOperator::BitXor => l ^ r,
+                            crate::ast::BinaryOperator::Shl => if (0..64).contains(&r) { l << r } else { 0 },
+                            crate::ast::BinaryOperator::Shr => if (0..64).contains(&r) { l >> r } else { 0 },
+                            _ => 0,
+                        };
+                        Ok(result.to_string())
+                    }
                 }
             }
             AstKind::StringOp { op, left, right } => {

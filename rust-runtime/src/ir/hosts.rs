@@ -799,6 +799,65 @@ pub fn host_plan(args: &[Value]) -> Result<Value, String> {
     Ok(Value::List(Vec::new()))
 }
 
+// ---- bitfield helpers: plain-integer packed-field access, the practical
+// interpretation of "bitfields" given PatLang has no fixed-layout struct or
+// fixed-width integer type to hang a real bitfield type off of. Expressible
+// in terms of band/bor/shl/shr once those exist, but provided directly too
+// since (bit_slice n start width) reads far better at call sites than the
+// equivalent band/shr expression.
+
+fn bits_arg(v: &Value, ctx: &str) -> Result<i64, String> {
+    match v { Value::Int(n) => Ok(*n), v => v.as_number().map(|n| n as i64).map_err(|_| format!("{}: expected an integer", ctx)) }
+}
+
+pub fn host_bit_get(args: &[Value]) -> Result<Value, String> {
+    // bit_get(n, pos) -> 0 or 1
+    if args.len() != 2 { return Err("bit_get: expected 2 args (n, pos)".into()); }
+    let n = bits_arg(&args[0], "bit_get")?;
+    let pos = bits_arg(&args[1], "bit_get")?;
+    if !(0..64).contains(&pos) { return Err(format!("bit_get: pos {} out of range 0..63", pos)); }
+    Ok(Value::Int((n >> pos) & 1))
+}
+
+pub fn host_bit_set(args: &[Value]) -> Result<Value, String> {
+    // bit_set(n, pos, val) -> n with bit `pos` set to 0/1
+    if args.len() != 3 { return Err("bit_set: expected 3 args (n, pos, val)".into()); }
+    let n = bits_arg(&args[0], "bit_set")?;
+    let pos = bits_arg(&args[1], "bit_set")?;
+    let val = bits_arg(&args[2], "bit_set")?;
+    if !(0..64).contains(&pos) { return Err(format!("bit_set: pos {} out of range 0..63", pos)); }
+    let mask = 1i64 << pos;
+    Ok(Value::Int(if val != 0 { n | mask } else { n & !mask }))
+}
+
+pub fn host_bit_slice(args: &[Value]) -> Result<Value, String> {
+    // bit_slice(n, start, width) -> the width-bit unsigned value at [start, start+width)
+    if args.len() != 3 { return Err("bit_slice: expected 3 args (n, start, width)".into()); }
+    let n = bits_arg(&args[0], "bit_slice")?;
+    let start = bits_arg(&args[1], "bit_slice")?;
+    let width = bits_arg(&args[2], "bit_slice")?;
+    if !(0..64).contains(&start) { return Err(format!("bit_slice: start {} out of range 0..63", start)); }
+    if !(0..=64).contains(&width) || start + width > 64 { return Err(format!("bit_slice: width {} at start {} out of range", width, start)); }
+    if width == 0 { return Ok(Value::Int(0)); }
+    let mask: i64 = if width == 64 { -1 } else { (1i64 << width) - 1 };
+    Ok(Value::Int((n >> start) & mask))
+}
+
+pub fn host_bit_set_slice(args: &[Value]) -> Result<Value, String> {
+    // bit_set_slice(n, start, width, val) -> n with bits [start, start+width) replaced by val's low `width` bits
+    if args.len() != 4 { return Err("bit_set_slice: expected 4 args (n, start, width, val)".into()); }
+    let n = bits_arg(&args[0], "bit_set_slice")?;
+    let start = bits_arg(&args[1], "bit_set_slice")?;
+    let width = bits_arg(&args[2], "bit_set_slice")?;
+    let val = bits_arg(&args[3], "bit_set_slice")?;
+    if !(0..64).contains(&start) { return Err(format!("bit_set_slice: start {} out of range 0..63", start)); }
+    if !(0..=64).contains(&width) || start + width > 64 { return Err(format!("bit_set_slice: width {} at start {} out of range", width, start)); }
+    if width == 0 { return Ok(Value::Int(n)); }
+    let mask: i64 = if width == 64 { -1 } else { (1i64 << width) - 1 };
+    let cleared = n & !(mask << start);
+    Ok(Value::Int(cleared | ((val & mask) << start)))
+}
+
 pub fn host_new(args: &[Value]) -> Result<Value, String> {
     // new(class, name) -> name, registering the object
     if args.len() != 2 { return Ok(Value::Unit); }
@@ -1808,6 +1867,10 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("solve", host_solve);
     interp.host.insert("action_add", host_action_add);
     interp.host.insert("plan", host_plan);
+    interp.host.insert("bit_get", host_bit_get);
+    interp.host.insert("bit_set", host_bit_set);
+    interp.host.insert("bit_slice", host_bit_slice);
+    interp.host.insert("bit_set_slice", host_bit_set_slice);
     interp.host.insert("new", host_new);
     interp.host.insert("set_var", host_set_var);
     interp.host.insert("send", host_send);
