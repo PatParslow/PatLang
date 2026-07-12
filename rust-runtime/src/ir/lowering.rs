@@ -189,50 +189,6 @@ impl Lowerer {
                 let after = f.body.len();
                 if let Instr::JumpIfFalse(ref mut tgt) = f.body[jif_idx] { *tgt = after; }
             }
-            Stmt::Budgeted { ms, body } => {
-                self.budgeted_counter += 1;
-                let func_name = format!("__budgeted_{}", self.budgeted_counter);
-                // Over-capture the entire enclosing locals list (same
-                // approach lower_closure_literal uses) rather than precise
-                // free-variable analysis -- simpler, and still correct given
-                // the flat per-call locals model. fiber_new only ever passes
-                // ONE initial argument to the spawned function, so all
-                // captured values are bundled into a single List and the
-                // synthesized function's sole declared parameter unpacks
-                // them again in its own prologue.
-                let captured: Vec<(String, bool)> = self.known_locals.iter().map(|(k, v)| (k.clone(), *v)).collect();
-                let mut bf = Function { name: func_name.clone(), params: vec!["__captured".into()], ..Default::default() };
-                for (i, (name, _)) in captured.iter().enumerate() {
-                    bf.body.push(Instr::LoadLocal("__captured".into()));
-                    bf.body.push(Instr::Const(Value::Int(i as i64)));
-                    bf.body.push(Instr::CallHost("list_get".into(), 2));
-                    bf.body.push(Instr::StoreLocal(name.clone()));
-                }
-                let saved_locals = std::mem::take(&mut self.known_locals);
-                let saved_fname = std::mem::replace(&mut self.current_function, func_name.clone());
-                self.known_locals.insert("__captured".into(), true);
-                for (name, mutable) in &captured { self.known_locals.insert(name.clone(), *mutable); }
-                self.in_budgeted_depth += 1;
-                for st in body { self.lower_stmt(st, &mut bf); }
-                self.in_budgeted_depth -= 1;
-                bf.body.push(Instr::Return);
-                self.pending_closures.push(bf);
-                self.known_locals = saved_locals;
-                self.current_function = saved_fname;
-
-                // budgeted_run(ms, func_name, captured_list, Unit) -- Unit
-                // in the fourth slot means "no existing fiber, start a new
-                // one"; a real resume (passing back the ["paused", id]
-                // handle from this call's result) is the caller's job, not
-                // something the lowerer can synthesize, since only the
-                // caller knows whether/when to ask for another timeslice.
-                self.lower_expr(ms, f);
-                f.body.push(Instr::Const(Value::String(func_name)));
-                for (name, _) in &captured { f.body.push(Instr::LoadLocal(name.clone())); }
-                f.body.push(Instr::BuildList(captured.len()));
-                f.body.push(Instr::Const(Value::Unit));
-                f.body.push(Instr::CallHost("budgeted_run".into(), 4));
-            }
             Stmt::Assert { kind, expr } => {
                 // contract_check(func_name, kind, condition_text, ok) — pushed in
                 // that order so CallHost's arg order matches; ok is evaluated last.
@@ -273,6 +229,10 @@ impl Lowerer {
             }
             // Closure literals never fail to lower (MakeClosure is infallible)
             Expr::Closure { .. } => true,
+            // budgeted(...) always lowers to a valid CallHost sequence
+            // regardless of what's captured (over-capture, not precise
+            // analysis -- see the lowering code), so it's infallible too.
+            Expr::Budgeted { .. } => true,
             _ => false,
         }
     }
@@ -368,6 +328,51 @@ impl Lowerer {
             }
             Expr::Closure { params, body } => {
                 self.lower_closure_literal(params, body, f);
+            }
+            Expr::Budgeted { ms, existing, body } => {
+                self.budgeted_counter += 1;
+                let func_name = format!("__budgeted_{}", self.budgeted_counter);
+                // Over-capture the entire enclosing locals list (same
+                // approach lower_closure_literal uses) rather than precise
+                // free-variable analysis -- simpler, and still correct given
+                // the flat per-call locals model. fiber_new only ever passes
+                // ONE initial argument to the spawned function, so all
+                // captured values are bundled into a single List and the
+                // synthesized function's sole declared parameter unpacks
+                // them again in its own prologue.
+                let captured: Vec<(String, bool)> = self.known_locals.iter().map(|(k, v)| (k.clone(), *v)).collect();
+                let mut bf = Function { name: func_name.clone(), params: vec!["__captured".into()], ..Default::default() };
+                for (i, (name, _)) in captured.iter().enumerate() {
+                    bf.body.push(Instr::LoadLocal("__captured".into()));
+                    bf.body.push(Instr::Const(Value::Int(i as i64)));
+                    bf.body.push(Instr::CallHost("list_get".into(), 2));
+                    bf.body.push(Instr::StoreLocal(name.clone()));
+                }
+                let saved_locals = std::mem::take(&mut self.known_locals);
+                let saved_fname = std::mem::replace(&mut self.current_function, func_name.clone());
+                self.known_locals.insert("__captured".into(), true);
+                for (name, mutable) in &captured { self.known_locals.insert(name.clone(), *mutable); }
+                self.in_budgeted_depth += 1;
+                for st in body { self.lower_stmt(st, &mut bf); }
+                self.in_budgeted_depth -= 1;
+                bf.body.push(Instr::Return);
+                self.pending_closures.push(bf);
+                self.known_locals = saved_locals;
+                self.current_function = saved_fname;
+
+                // budgeted_run(ms, func_name, captured_list, existing) --
+                // `existing` is Unit for a first call (start a new fiber) or
+                // a previous ["paused", id] result's id to resume that same
+                // fiber with a freshly refreshed deadline.
+                self.lower_expr(ms, f);
+                f.body.push(Instr::Const(Value::String(func_name)));
+                for (name, _) in &captured { f.body.push(Instr::LoadLocal(name.clone())); }
+                f.body.push(Instr::BuildList(captured.len()));
+                match existing {
+                    Some(e) => self.lower_expr(e, f),
+                    None => f.body.push(Instr::Const(Value::Unit)),
+                }
+                f.body.push(Instr::CallHost("budgeted_run".into(), 4));
             }
             Expr::UnaryOp { op, expr } => {
                 self.lower_expr(expr, f);
@@ -525,7 +530,6 @@ fn collect_referenced_idents(stmts: &[Stmt], out: &mut Vec<String>, seen: &mut H
             Stmt::Fact { args, .. } | Stmt::Query { args, .. } => { for a in args { collect_ident_expr(a, out, seen); } }
             Stmt::When { body, .. } => collect_referenced_idents(body, out, seen),
             Stmt::Assert { expr, .. } => collect_ident_expr(expr, out, seen),
-            Stmt::Budgeted { ms, body } => { collect_ident_expr(ms, out, seen); collect_referenced_idents(body, out, seen); }
         }
     }
 }
@@ -558,6 +562,16 @@ fn collect_ident_expr(e: &Expr, out: &mut Vec<String>, seen: &mut HashSet<String
             }
         }
         Expr::Number(_) | Expr::Float(_) | Expr::String(_) => {}
+        Expr::Budgeted { ms, existing, body } => {
+            collect_ident_expr(ms, out, seen);
+            if let Some(e) = existing { collect_ident_expr(e, out, seen); }
+            let mut inner_out = Vec::new();
+            let mut inner_seen: HashSet<String> = HashSet::new();
+            collect_referenced_idents(body, &mut inner_out, &mut inner_seen);
+            for n in inner_out {
+                if seen.insert(n.clone()) { out.push(n); }
+            }
+        }
     }
 }
 
@@ -586,5 +600,6 @@ pub fn expr_to_text(e: &Expr) -> String {
             format!("{} {} {}", expr_to_text(left), sym, expr_to_text(right))
         }
         Expr::Call { function, args } => format!("{}({})", expr_to_text(function), args.iter().map(expr_to_text).collect::<Vec<_>>().join(", ")),
+        Expr::Budgeted { .. } => "<budgeted>".into(),
     }
 }

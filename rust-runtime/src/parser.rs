@@ -302,25 +302,6 @@ impl<'a> Parser<'a> {
                             return Ok(Stmt::ExprStmt(Expr::String(String::new())));
                         }
                     }
-                    // Cooperative time-budget block: budgeted(ms) { ... } / do ... end
-                    if curr_lc == "budgeted" {
-                        self.advance()?; // consume 'budgeted'
-                        self.expect(Token::LParen, "'(' after 'budgeted'", "Use budgeted(ms) { ... } or budgeted(ms) do ... end")?;
-                        let ms = self.parse_expression(0)?;
-                        self.expect(Token::RParen, "')' after budget expression", "Close the budget expression with ')'")?;
-                        self.consume_newlines()?;
-                        if matches!(self.curr, Token::BlockStart) {
-                            self.advance()?; // '{'
-                            let body = self.parse_block()?;
-                            return Ok(Stmt::Budgeted { ms, body });
-                        } else if matches!(&self.curr, Token::Identifier(s) if s == "do") {
-                            self.advance()?; // 'do'
-                            let (body, _) = self.parse_word_block(&["end"], false)?;
-                            return Ok(Stmt::Budgeted { ms, body });
-                        } else {
-                            return Err(ParserError::ExpectedToken { expected: "'{' or 'do' after budgeted(ms)", line: self.line_no, hint: "Use budgeted(ms) { ... } or budgeted(ms) do ... end" });
-                        }
-                    }
                     // Relationship declarations: skip until trailing '.'
                     if curr_lc == "relationship" {
                         // Consume tokens until we find a Dot immediately followed by Newline,
@@ -898,6 +879,28 @@ impl<'a> Parser<'a> {
                 }
                 self.expect(Token::RBracket, "] to close list", "Close list with ']'" )?;
                 Expr::List(items)
+            }
+            Token::Identifier(name) if name == "budgeted" && matches!(self.peek, Token::LParen) => {
+                self.advance()?; // 'budgeted'
+                self.advance()?; // '('
+                let ms = self.parse_expression(0)?;
+                let existing = if matches!(self.curr, Token::Comma) {
+                    self.advance()?;
+                    Some(Box::new(self.parse_expression(0)?))
+                } else { None };
+                self.expect(Token::RParen, "')' after budgeted(...) arguments", "Use budgeted(ms) or budgeted(ms, existing)")?;
+                self.consume_newlines()?;
+                if matches!(self.curr, Token::BlockStart) {
+                    self.advance()?; // '{'
+                    let body = self.parse_block()?;
+                    Expr::Budgeted { ms: Box::new(ms), existing, body }
+                } else if matches!(&self.curr, Token::Identifier(s) if s == "do") {
+                    self.advance()?; // 'do'
+                    let (body, _) = self.parse_word_block(&["end"], false)?;
+                    Expr::Budgeted { ms: Box::new(ms), existing, body }
+                } else {
+                    return Err(ParserError::ExpectedToken { expected: "'{' or 'do' after budgeted(...)", line: self.line_no, hint: "Use budgeted(ms) { ... } or budgeted(ms) do ... end" });
+                }
             }
             Token::Identifier(name) => { let id = name.clone(); self.advance()?; Expr::Identifier(id) }
             // Tolerance: brace block in expression position (e.g. object-literal DSL)

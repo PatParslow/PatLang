@@ -41,6 +41,22 @@ pub enum Expr {
         function: Box<Expr>,
         args: Vec<Expr>,
     },
+    // Cooperative time-budget block: budgeted(ms[, existing]) { body } /
+    // do...end. Evaluates to a tagged list, ["done", value] or
+    // ["paused", fiber_id]. Lowers to a synthesized function (like a
+    // closure/when-handler) run via an implicit fiber; while-loop
+    // back-edges lexically inside the body get a budget check injected
+    // that yields (fiber_yield) once the block's budget is exhausted.
+    // `existing` (None on a first call) is a paused fiber id from a
+    // previous ["paused", id] result -- passing it resumes that same
+    // fiber (with a freshly refreshed deadline) instead of starting a new
+    // one, which is how a caller-driven scheduling loop keeps a budgeted
+    // block moving across many timeslices.
+    Budgeted {
+        ms: Box<Expr>,
+        existing: Option<Box<Expr>>,
+        body: Vec<Stmt>,
+    },
     // Extend with more expression types as needed
 }
 
@@ -99,15 +115,6 @@ pub enum Stmt {
     Assert {
         kind: String,
         expr: Expr,
-    },
-    // Cooperative time-budget block: budgeted(ms) { body } / do...end.
-    // Lowers to a synthesized function (like a closure/when-handler) run via
-    // an implicit fiber; while-loop back-edges lexically inside the body get
-    // a budget check injected that yields (fiber_yield) once the block's
-    // budget is exhausted or predicted to be about to be.
-    Budgeted {
-        ms: Expr,
-        body: Vec<Stmt>,
     },
     // Extend with more statement types as needed
 }

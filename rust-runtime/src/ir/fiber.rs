@@ -201,8 +201,16 @@ fn now_ms_i64() -> i64 {
 /// locals are already live. Each call refreshes the deadline to now+ms, so
 /// a paused block gets a fresh timeslice each time its caller resumes it.
 pub fn budgeted_run(program: &Program, ms: i64, func_name: &str, captured: Value, existing_fiber_id: &Value) -> Result<Value, String> {
+    // Value::Unit is the natural "no handle yet" sentinel when `existing` is
+    // omitted from source entirely (budgeted(ms) with no second arg), but
+    // PatLang has no Unit literal, so a caller-side driver loop that
+    // initializes its own "handle" local before the first call (there being
+    // no way to conditionally omit an argument in this grammar) needs a
+    // sentinel it CAN write -- `false` is treated the same way for exactly
+    // that reason, matching the language's existing truthy/falsy
+    // conventions rather than inventing new literal syntax for this alone.
     let (id_value, first_call) = match existing_fiber_id {
-        Value::Unit => (fiber_new(program, func_name.to_string())?, true),
+        Value::Unit | Value::Bool(false) => (fiber_new(program, func_name.to_string())?, true),
         v => (v.clone(), false),
     };
     let id = id_from_value(&id_value)?;
