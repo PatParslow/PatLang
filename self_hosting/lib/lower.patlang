@@ -76,6 +76,40 @@ make a function called next_closure_name returns name
   return "__closure_" + n
 end
 
+make a function called next_budgeted_name returns name
+  let n = get("__vars", "__budgeted_seq")
+  if not n then
+    let n = 0
+  end
+  set_var("__budgeted_seq", n + 1)
+  return "__budgeted_" + n
+end
+
+# Nesting-depth counter (not a bool, so a budgeted block nested inside
+# another still counts as "inside") tracking whether the statement/body
+# currently being lowered is lexically inside a budgeted(...) { ... } block
+# -- while-loop back-edges check this to decide whether to inject a
+# budget_check() call. Stored via the same object-store convention as
+# __closure_seq/__budgeted_seq since lower_*'s functions are plain
+# functions, not methods on a stateful struct (unlike Stage 0's Lowerer).
+make a function called budgeted_depth_get returns n
+  let n = get("__vars", "__budgeted_depth")
+  if not n then
+    return 0
+  end
+  return n
+end
+
+make a function called budgeted_depth_inc returns done
+  set_var("__budgeted_depth", budgeted_depth_get() + 1)
+  return true
+end
+
+make a function called budgeted_depth_dec returns done
+  set_var("__budgeted_depth", budgeted_depth_get() - 1)
+  return true
+end
+
 # lower_expr(node, code, fns, locals, pending) -> code
 #   fns:     list of top-level function names (static call vs host call)
 #   locals:  vec of names currently bound in the enclosing scope (for
@@ -209,9 +243,13 @@ make a function called lower_expr takes node, code, fns, locals, pending returns
                       if ty == "Closure" then
                         return lower_closure_literal(node[1], node[2], code, fns, locals, pending)
                       else
-                        # unknown expression: lower as unit-ish empty string
-                        vec_push(code, ["Const", "str", ""])
-                        return code
+                        if ty == "Budgeted" then
+                          return lower_budgeted_literal(node[1], node[2], node[3], code, fns, locals, pending)
+                        else
+                          # unknown expression: lower as unit-ish empty string
+                          vec_push(code, ["Const", "str", ""])
+                          return code
+                        end
                       end
                     end
                   end
@@ -222,6 +260,7 @@ make a function called lower_expr takes node, code, fns, locals, pending returns
         end
       end
     end
+  end
   end
 end
 
@@ -263,6 +302,57 @@ make a function called lower_closure_literal takes params, body, code, fns, loca
     let i = i + 1
   end
   vec_push(code, ["MakeClosure", func_name, captured])
+  return code
+end
+
+# Lowers budgeted(ms[, existing]) { body }: synthesizes a function (like a
+# closure) run via an implicit fiber. Unlike closures, captured locals are
+# bundled into a SINGLE List argument rather than passed as leading params --
+# fiber_new only ever passes one initial argument to the spawned function --
+# and the synthesized function's own prologue unpacks them again via
+# list_get/Store. `existing` defaults to Bool(false) at parse time when
+# omitted from source (see parser.patlang), which budgeted_run treats the
+# same as Unit: "no handle yet, start a new fiber".
+make a function called lower_budgeted_literal takes msNode, existingNode, body, code, fns, locals, pending returns out
+  let captured = vec_to_list(locals)
+  let func_name = next_budgeted_name()
+
+  let inner_locals = vec_new()
+  let inner_mutables = vec_new()
+  vec_push(inner_locals, "__captured")
+  vec_push(inner_mutables, true)
+  let i = 0
+  while i < captured.length do
+    vec_push(inner_locals, captured[i])
+    vec_push(inner_mutables, true)
+    let i = i + 1
+  end
+  let inner_code = vec_new()
+  let i = 0
+  while i < captured.length do
+    vec_push(inner_code, ["Load", "__captured"])
+    vec_push(inner_code, ["Const", "num", "" + i])
+    vec_push(inner_code, ["CallHost", "list_get", 2])
+    vec_push(inner_code, ["Store", captured[i]])
+    let i = i + 1
+  end
+  budgeted_depth_inc()
+  let inner_code = lower_block(body, inner_code, fns, func_name, inner_locals, inner_mutables, pending)
+  budgeted_depth_dec()
+  vec_push(inner_code, ["Return"])
+  vec_push(pending, ["FuncIR", func_name, ["__captured"], vec_to_list(inner_code)])
+
+  # budgeted_run(ms, func_name, captured_list, existing)
+  let code = lower_expr(msNode, code, fns, locals, pending)
+  vec_push(code, ["Const", "str", func_name])
+  let i = 0
+  while i < captured.length do
+    vec_push(code, ["Load", captured[i]])
+    let i = i + 1
+  end
+  vec_push(code, ["BuildList", captured.length])
+  let code = lower_expr(existingNode, code, fns, locals, pending)
+  vec_push(code, ["CallHost", "budgeted_run", 4])
   return code
 end
 
@@ -341,6 +431,12 @@ make a function called lower_stmt takes node, code, fns, fname, locals, mutables
               let jif = vec_len(code)
               vec_push(code, ["JumpIfFalse", 0])
               let code = lower_block(node[2], code, fns, fname, locals, mutables, pending)
+              # Lexically inside a budgeted(ms) { ... } block: check the time
+              # budget just before looping back (mirrors lowering.rs's
+              # equivalent Stage 0 instrumentation).
+              if budgeted_depth_get() > 0 then
+                vec_push(code, ["CallHost", "budget_check", 0])
+              end
               vec_push(code, ["Jump", start])
               vec_set(code, jif, ["JumpIfFalse", vec_len(code)])
               return code
