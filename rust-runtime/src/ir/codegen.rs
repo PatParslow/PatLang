@@ -103,6 +103,9 @@ const HOST_CHUNK_TABLE: &[(&str, ChunkId)] = &[
     ("write_file", ChunkId::Files),
     ("touch_file", ChunkId::Files),
     ("file_exists", ChunkId::Files),
+    ("list_dir", ChunkId::Files),
+    ("rename_file", ChunkId::Files),
+    ("exec_capture", ChunkId::Files),
     ("now_ms", ChunkId::IoMisc),
     ("byte_length", ChunkId::IoMisc),
     ("read_line", ChunkId::IoMisc),
@@ -2165,13 +2168,54 @@ fn host_call_collections_handles(name: &str, args: &[Value]) -> Option<Result<Va
                 let exists = std::path::Path::new(&p).exists();
                 Ok(Value::String(if exists { "1".into() } else { "0".into() }))
             }
+            "list_dir" => {
+                // list_dir(path) -> List of entry names, directories suffixed "/"
+                let p = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
+                let mut names: Vec<String> = std::fs::read_dir(&p)
+                    .map_err(|e| format!("list_dir: {}: {}", p, e))?
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                        if is_dir { format!("{}/", name) } else { name }
+                    })
+                    .collect();
+                names.sort();
+                Ok(Value::List(names.into_iter().map(Value::String).collect()))
+            }
+            "rename_file" => {
+                // rename_file(from, to) -> Bool
+                let from = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
+                let to = match args.get(1) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
+                if let Some(parent) = std::path::Path::new(&to).parent() { let _ = std::fs::create_dir_all(parent); }
+                std::fs::rename(&from, &to).map(|_| Value::Bool(true)).map_err(|e| format!("rename_file: {} -> {}: {}", from, to, e))
+            }
+            "exec_capture" => {
+                // exec_capture(path, [arg1, arg2, ...]) -> stdout of running the
+                // program. Trailing string args are passed through as argv to
+                // the child. If the process exits with failure, stderr is
+                // appended too, so transcripts of failing invocations still
+                // show the error.
+                let p = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => return Err("exec_capture: expected program path".into()) };
+                let extra: Vec<String> = args[1..].iter().filter_map(|v| match v { Value::String(s) => Some(s.clone()), _ => None }).collect();
+                let out = std::process::Command::new(&p).args(&extra).output().map_err(|e| format!("exec_capture: {}: {}", p, e))?;
+                let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+                if !out.status.success() {
+                    let err = String::from_utf8_lossy(&out.stderr);
+                    if !err.trim().is_empty() {
+                        if !text.is_empty() && !text.ends_with('\n') { text.push('\n'); }
+                        text.push_str(&err);
+                    }
+                }
+                Ok(Value::String(text))
+            }
                     _ => Err(format!("host fn '{}' not found", name)),
     }
 }
 
 fn host_call_files(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match name {
-        "read_file" | "write_file" | "touch_file" | "file_exists" => Some(host_call_files_inner(name, args)),
+        "read_file" | "write_file" | "touch_file" | "file_exists" | "list_dir" | "rename_file" | "exec_capture" => Some(host_call_files_inner(name, args)),
         _ => None,
     }
 }

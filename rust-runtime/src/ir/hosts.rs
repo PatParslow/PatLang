@@ -315,6 +315,34 @@ pub fn host_write_file(args: &[Value]) -> Result<Value, String> {
     std::fs::write(&p, contents).map(|_| Value::Bool(true)).map_err(|e| format!("write_file: {}: {}", p, e))
 }
 
+pub fn host_list_dir(args: &[Value]) -> Result<Value, String> {
+    // list_dir(path) -> List of entry names; directories are suffixed with
+    // "/" so callers can tell them apart from files without a second host
+    // call. Non-recursive (one level), matching readdir semantics. Entries
+    // are sorted for deterministic output across platforms/filesystems.
+    let p = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
+    let mut names: Vec<String> = std::fs::read_dir(&p)
+        .map_err(|e| format!("list_dir: {}: {}", p, e))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if is_dir { format!("{}/", name) } else { name }
+        })
+        .collect();
+    names.sort();
+    Ok(Value::List(names.into_iter().map(Value::String).collect()))
+}
+
+pub fn host_rename_file(args: &[Value]) -> Result<Value, String> {
+    // rename_file(from, to) -> Bool. Creates the destination's parent
+    // directory if needed (matching write_file's own auto-mkdir behavior).
+    let from = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
+    let to = match args.get(1) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
+    if let Some(parent) = std::path::Path::new(&to).parent() { let _ = std::fs::create_dir_all(parent); }
+    std::fs::rename(&from, &to).map(|_| Value::Bool(true)).map_err(|e| format!("rename_file: {} -> {}: {}", from, to, e))
+}
+
 pub fn host_byte_length(args: &[Value]) -> Result<Value, String> {
     // byte_length(s) -> Number of UTF-8 bytes (unlike .length, which counts
     // chars) - needed for exact HTTP Content-Length framing of any non-ASCII
@@ -1478,6 +1506,8 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("read_file", host_read_file);
     interp.host.insert("write_file", host_write_file);
     interp.host.insert("file_exists", host_file_exists);
+    interp.host.insert("list_dir", host_list_dir);
+    interp.host.insert("rename_file", host_rename_file);
     interp.host.insert("hash_string", host_hash_string);
     interp.host.insert("argv", host_argv);
     interp.host.insert("now_ms", host_now_ms);
