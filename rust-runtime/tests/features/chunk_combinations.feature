@@ -84,6 +84,36 @@ Feature: Compiled-chunk combinations
     When I compile and run it natively
     Then it prints exactly "5"
 
+  # Native-compiled fibers (the mod fibers text ported into PRELUDE_CORE):
+  # a budgeted(ms, handle) block wrapping a loop with a tight enough budget
+  # that it's guaranteed to pause at least once, driven by a caller loop
+  # that repeatedly resumes it until "done". If resumption were silently
+  # restarting instead of genuinely continuing, this would never converge.
+  Scenario: budgeted(...) blocks (fiber-backed) compile and run natively, converging via resumption
+    Given a PatLang program:
+      """
+      let mut n = 0
+      let mut handle = false
+      let mut done = false
+      let mut rounds = 0
+      while not done do
+        rounds = rounds + 1
+        let r = budgeted(5, handle) do
+          while n < 200000 do
+            n = n + 1
+          end
+        end
+        if r[0] == "done" then
+          done = true
+        else
+          handle = r[1]
+        end
+      end
+      print(done)
+      """
+    When I compile and run it natively
+    Then it prints exactly "true"
+
   # Regression guard for the (Math, NumericTower) cross-chunk edge: no
   # ordinary arithmetic BinOp anywhere, so `required_chunks`'s BinOp-driven
   # rule alone would NOT select numeric_tower -- only the explicit edge does.

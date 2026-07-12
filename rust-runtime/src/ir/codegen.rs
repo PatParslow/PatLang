@@ -221,6 +221,10 @@ impl RustCodegen {
 
 use std::collections::HashMap;
 use std::cell::RefCell;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 thread_local! {
     static OBJECTS: RefCell<HashMap<String, HashMap<String, Value>>> = RefCell::new(HashMap::new());
@@ -400,11 +404,229 @@ impl Host {
 #[derive(Clone)]
 struct Function { name: String, params: Vec<String>, body: Vec<Instr> }
 
+#[derive(Clone)]
 struct Program { functions: HashMap<String, Function>, entry: String }
 
 fn run(program: &Program) -> Result<Value,String> {
     let entry = program.functions.get(&program.entry).ok_or("entry not found")?;
     run_function(program, entry, &[])
+}
+
+// Fibers: Ruby-style cooperative green threads on top of real OS threads,
+// ported directly from rust-runtime/src/ir/fiber.rs's interpreter-side
+// implementation -- same mutex+condvar design, just resolving/calling
+// program functions via this file's own `run_function`/`Program::clone()`
+// instead of `Interpreter::call_function`. Not available on wasm32: that
+// target has no std::thread support in a normal build (see the `main()`
+// split below for the same constraint already handled once).
+#[cfg(not(target_arch = "wasm32"))]
+mod fibers {
+    use super::{Program, Value, run_function};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+
+    enum FiberMsg {
+        Yielded(Value),
+        Done(Result<Value, String>),
+    }
+
+    struct FiberBox {
+        to_fiber: Option<Value>,
+        from_fiber: Option<FiberMsg>,
+        alive: bool,
+        budget_deadline_ms: Option<i64>,
+        budget_last_check_ms: Option<i64>,
+        recent_durations: Vec<i64>,
+    }
+
+    struct FiberHandle {
+        state: Mutex<FiberBox>,
+        cv: Condvar,
+    }
+
+    fn registry() -> &'static Mutex<HashMap<u64, Arc<FiberHandle>>> {
+        static REGISTRY: OnceLock<Mutex<HashMap<u64, Arc<FiberHandle>>>> = OnceLock::new();
+        REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn next_id() -> u64 {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
+
+    thread_local! {
+        static CURRENT_FIBER: std::cell::Cell<Option<u64>> = std::cell::Cell::new(None);
+    }
+
+    fn now_ms_i64() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    pub fn fiber_new(program: &Program, func_name: String) -> Result<Value, String> {
+        if !program.functions.contains_key(&func_name) {
+            return Err(format!("fiber_new: function '{}' not found", func_name));
+        }
+        let id = next_id();
+        let handle = Arc::new(FiberHandle {
+            state: Mutex::new(FiberBox {
+                to_fiber: None, from_fiber: None, alive: true,
+                budget_deadline_ms: None, budget_last_check_ms: None, recent_durations: Vec::new(),
+            }),
+            cv: Condvar::new(),
+        });
+        registry().lock().unwrap().insert(id, Arc::clone(&handle));
+
+        let program_owned = program.clone();
+        std::thread::spawn(move || {
+            CURRENT_FIBER.with(|c| c.set(Some(id)));
+            let first_arg = {
+                let mut st = handle.state.lock().unwrap();
+                while st.to_fiber.is_none() {
+                    st = handle.cv.wait(st).unwrap();
+                }
+                st.to_fiber.take().unwrap()
+            };
+            let callee = program_owned.functions.get(&func_name).unwrap().clone();
+            let result = run_function(&program_owned, &callee, &[first_arg]);
+            let mut st = handle.state.lock().unwrap();
+            st.alive = false;
+            st.from_fiber = Some(FiberMsg::Done(result));
+            handle.cv.notify_all();
+        });
+
+        Ok(Value::Int(id as i64))
+    }
+
+    fn handle_for(id: u64) -> Result<Arc<FiberHandle>, String> {
+        registry().lock().unwrap().get(&id).cloned().ok_or_else(|| format!("fiber: unknown fiber id {}", id))
+    }
+
+    fn id_from_value(v: &Value) -> Result<u64, String> {
+        match v {
+            Value::Int(n) if *n >= 0 => Ok(*n as u64),
+            other => Err(format!("fiber: expected a fiber id, got {:?}", other)),
+        }
+    }
+
+    pub fn fiber_resume(id_val: &Value, arg: Value) -> Result<Value, String> {
+        let id = id_from_value(id_val)?;
+        let handle = handle_for(id)?;
+        let mut st = handle.state.lock().unwrap();
+        if !st.alive {
+            return Err(format!("fiber_resume: fiber {} has already finished", id));
+        }
+        st.to_fiber = Some(arg);
+        handle.cv.notify_all();
+        while st.from_fiber.is_none() {
+            st = handle.cv.wait(st).unwrap();
+        }
+        match st.from_fiber.take().unwrap() {
+            FiberMsg::Yielded(v) => Ok(v),
+            FiberMsg::Done(r) => r,
+        }
+    }
+
+    pub fn fiber_yield(value: Value) -> Result<Value, String> {
+        let id = CURRENT_FIBER.with(|c| c.get()).ok_or_else(|| "fiber_yield: not running inside a fiber".to_string())?;
+        let handle = handle_for(id)?;
+        let mut st = handle.state.lock().unwrap();
+        st.from_fiber = Some(FiberMsg::Yielded(value));
+        handle.cv.notify_all();
+        while st.to_fiber.is_none() {
+            st = handle.cv.wait(st).unwrap();
+        }
+        Ok(st.to_fiber.take().unwrap())
+    }
+
+    pub fn fiber_alive(id_val: &Value) -> Result<Value, String> {
+        let id = id_from_value(id_val)?;
+        let handle = handle_for(id)?;
+        let st = handle.state.lock().unwrap();
+        Ok(Value::Bool(st.alive))
+    }
+
+    const DURATION_WINDOW: usize = 16;
+
+    fn predict_next_duration_ms(samples: &[i64]) -> i64 {
+        let n = samples.len();
+        if n == 0 { return 0; }
+        if n < 2 { return samples[n - 1]; }
+        let n_f = n as f64;
+        let sum_x: f64 = (0..n).map(|i| i as f64).sum();
+        let sum_y: f64 = samples.iter().map(|&v| v as f64).sum();
+        let sum_xy: f64 = samples.iter().enumerate().map(|(i, &v)| i as f64 * v as f64).sum();
+        let sum_xx: f64 = (0..n).map(|i| (i as f64) * (i as f64)).sum();
+        let denom = n_f * sum_xx - sum_x * sum_x;
+        let (slope, intercept) = if denom.abs() < f64::EPSILON {
+            (0.0, sum_y / n_f)
+        } else {
+            let slope = (n_f * sum_xy - sum_x * sum_y) / denom;
+            let intercept = (sum_y - slope * sum_x) / n_f;
+            (slope, intercept)
+        };
+        let regression_estimate = slope * n_f + intercept;
+        let recent_max = *samples.iter().max().unwrap_or(&0);
+        (regression_estimate.max(0.0) as i64).max(recent_max)
+    }
+
+    pub fn budgeted_run(program: &Program, ms: i64, func_name: &str, captured: Value, existing_fiber_id: &Value) -> Result<Value, String> {
+        let (id_value, first_call) = match existing_fiber_id {
+            Value::Unit | Value::Bool(false) => (fiber_new(program, func_name.to_string())?, true),
+            v => (v.clone(), false),
+        };
+        let id = id_from_value(&id_value)?;
+        let deadline = now_ms_i64() + ms;
+        {
+            let handle = handle_for(id)?;
+            let mut st = handle.state.lock().unwrap();
+            st.budget_deadline_ms = Some(deadline);
+            st.budget_last_check_ms = None;
+        }
+        let resume_arg = if first_call { captured } else { Value::Unit };
+        let result = fiber_resume(&id_value, resume_arg)?;
+        let still_alive = {
+            let handle = handle_for(id)?;
+            let st = handle.state.lock().unwrap();
+            st.alive
+        };
+        if still_alive {
+            Ok(Value::List(vec![Value::String("paused".into()), id_value]))
+        } else {
+            Ok(Value::List(vec![Value::String("done".into()), result]))
+        }
+    }
+
+    pub fn budget_check() -> Result<(), String> {
+        let id = match CURRENT_FIBER.with(|c| c.get()) {
+            Some(id) => id,
+            None => return Ok(()),
+        };
+        let handle = handle_for(id)?;
+        let now = now_ms_i64();
+        let (deadline, predicted) = {
+            let mut st = handle.state.lock().unwrap();
+            if let Some(prev) = st.budget_last_check_ms {
+                let dur = (now - prev).max(0);
+                st.recent_durations.push(dur);
+                if st.recent_durations.len() > DURATION_WINDOW {
+                    st.recent_durations.remove(0);
+                }
+            }
+            st.budget_last_check_ms = Some(now);
+            let predicted = predict_next_duration_ms(&st.recent_durations);
+            (st.budget_deadline_ms, predicted)
+        };
+        if let Some(dl) = deadline {
+            if now + predicted >= dl {
+                fiber_yield(Value::Unit)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Value,String> {
@@ -493,6 +715,64 @@ fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Va
                         handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("parallel_map: a worker thread panicked".to_string()))).collect()
                     });
                     stack.push(Value::List(results?));
+                } else if n == "fiber_new" {
+                    #[cfg(target_arch = "wasm32")]
+                    { return Err("fibers are not supported when compiled to wasm32".into()); }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let fname = match args.get(0) {
+                            Some(Value::String(s)) => s.clone(),
+                            other => return Err(format!("fiber_new: expected a function name string, got {:?}", other)),
+                        };
+                        stack.push(fibers::fiber_new(program, fname)?);
+                    }
+                } else if n == "fiber_resume" {
+                    #[cfg(target_arch = "wasm32")]
+                    { return Err("fibers are not supported when compiled to wasm32".into()); }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let id = args.get(0).cloned().unwrap_or(Value::Unit);
+                        let arg = args.get(1).cloned().unwrap_or(Value::Unit);
+                        stack.push(fibers::fiber_resume(&id, arg)?);
+                    }
+                } else if n == "fiber_yield" {
+                    #[cfg(target_arch = "wasm32")]
+                    { return Err("fibers are not supported when compiled to wasm32".into()); }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let v = args.get(0).cloned().unwrap_or(Value::Unit);
+                        stack.push(fibers::fiber_yield(v)?);
+                    }
+                } else if n == "fiber_alive" {
+                    #[cfg(target_arch = "wasm32")]
+                    { return Err("fibers are not supported when compiled to wasm32".into()); }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let id = args.get(0).cloned().unwrap_or(Value::Unit);
+                        stack.push(fibers::fiber_alive(&id)?);
+                    }
+                } else if n == "budgeted_run" {
+                    #[cfg(target_arch = "wasm32")]
+                    { return Err("budgeted(...) blocks are not supported when compiled to wasm32 (they run on fibers, which need real OS threads)".into()); }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let ms = match args.get(0) { Some(v) => v.as_number().map_err(|_| "budgeted_run: expected a number of ms".to_string())? as i64, None => return Err("budgeted_run: expected ms".into()) };
+                        let fname = match args.get(1) {
+                            Some(Value::String(s)) => s.clone(),
+                            other => return Err(format!("budgeted_run: expected a function name string, got {:?}", other)),
+                        };
+                        let captured = args.get(2).cloned().unwrap_or(Value::List(vec![]));
+                        let existing = args.get(3).cloned().unwrap_or(Value::Unit);
+                        stack.push(fibers::budgeted_run(program, ms, &fname, captured, &existing)?);
+                    }
+                } else if n == "budget_check" {
+                    #[cfg(target_arch = "wasm32")]
+                    { return Err("budgeted(...) blocks are not supported when compiled to wasm32 (they run on fibers, which need real OS threads)".into()); }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        fibers::budget_check()?;
+                        stack.push(Value::Unit);
+                    }
                 } else {
                     let r = Host::call(n, &args)?; stack.push(r);
                 }
