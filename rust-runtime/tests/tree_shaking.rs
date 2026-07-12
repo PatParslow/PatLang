@@ -146,8 +146,12 @@ fn required_chunks_reports_expected_set() {
     let tcp = RustCodegen::required_chunks(&program_calling("tcp_listen", 1));
     assert_eq!(tcp, BTreeSet::from([ChunkId::Core, ChunkId::Networking]));
 
+    // contract_check's success path now records a `contract_holds` fact via
+    // `RULES`/`LogicRule`, both declared only in PRELUDE_LOGIC's text -- so
+    // any program calling contract_check needs Logic too (the (Contracts,
+    // Logic) CROSS_CHUNK_EDGES entry), same rationale as (Oo, Logic) above.
     let contracts = RustCodegen::required_chunks(&program_calling("contract_check", 4));
-    assert_eq!(contracts, BTreeSet::from([ChunkId::Core, ChunkId::Contracts]));
+    assert_eq!(contracts, BTreeSet::from([ChunkId::Core, ChunkId::Contracts, ChunkId::Logic]));
 }
 
 #[test]
