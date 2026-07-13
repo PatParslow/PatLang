@@ -697,9 +697,21 @@ pub fn host_solve(args: &[Value]) -> Result<Value, String> {
 
 // ---- A2: GOAP planner -- forward state-space search over actions with
 // preconditions/effects/cost, distinct from A1's backward resolution.
-// Ground-only (no logic variables) for v1: GOAP world-state facts are
-// naturally propositional ("target_a built"), so the search space is a
-// plain hashable set of facts rather than needing unification mid-search.
+// Actions may be parameterized: a precondition/effect arg using the same
+// `^[A-Z]` logic-variable convention as A1's rule_add/solve (e.g.
+// `build(X)` with precond `dep(X, Y)`) is grounded lazily during search by
+// unifying the action's preconditions -- conjunctively, so a variable bound
+// by one precond carries into later ones -- against the current world
+// state's facts (ground_action_instances, below), reusing A1's own
+// unify_args/walk/apply_subst rather than a separate mechanism. A fully
+// ground action (no variables anywhere in its preconds, the only form v1
+// supported) always yields exactly zero or one instantiation -- the old
+// plain set-containment check -- so this is a strict superset of v1, not a
+// behavior change for existing ground-only usage. The search space is
+// still a plain hashable set of facts (grounding happens per-expansion,
+// not as an upfront domain-closure step), so an action with a loosely-
+// constrained precond can multiply the branching factor per node; NODE_CAP
+// below is the existing safety valve, not a new one added for this.
 // Shares its fact substrate with A1: the "world state" is exactly the set
 // of ground, empty-body rules currently registered (i.e. facts declared via
 // `rule_add(pred, args, [])`), so contracts-as-facts and A1-declared facts
@@ -739,6 +751,48 @@ fn current_ground_facts_as_state() -> std::collections::HashSet<GroundFact> {
         .filter(|ru| ru.body.is_empty() && !ru.head_args.iter().any(|a| is_logic_var(a)))
         .map(|ru| GroundFact { pred: ru.head_pred.clone(), args: ru.head_args.clone() })
         .collect())
+}
+
+fn apply_subst_to_fact(fact: &GroundFact, subst: &Subst) -> GroundFact {
+    GroundFact { pred: fact.pred.clone(), args: apply_subst(&fact.args, subst) }
+}
+
+// Conjunctively unify an action's (possibly parameterized) preconditions
+// against the current world state, returning one Subst per way they can
+// all hold simultaneously -- there may be several, if a variable could
+// bind to more than one matching fact (e.g. `dep(X, Y)` when several deps
+// exist, each producing its own instantiation/successor state).
+fn ground_action_instances(preconds: &[GroundFact], state: &std::collections::HashSet<GroundFact>) -> Vec<Subst> {
+    fn go(remaining: &[GroundFact], state: &std::collections::HashSet<GroundFact>, subst: Subst, out: &mut Vec<Subst>) {
+        if remaining.is_empty() { out.push(subst); return; }
+        let (first, rest) = (&remaining[0], &remaining[1..]);
+        let applied = apply_subst(&first.args, &subst);
+        for fact in state.iter().filter(|f| f.pred == first.pred) {
+            if let Some(s2) = unify_args(&applied, &fact.args, &subst) {
+                go(rest, state, s2, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    go(preconds, state, Subst::new(), &mut out);
+    out
+}
+
+// A parameterized action's plan step is reported with its bound values
+// (e.g. "build(X=target_a)") so two instantiations of the same action
+// template are distinguishable in the returned plan -- ground actions (no
+// variables in their preconds) report their bare name unchanged, matching
+// v1 output exactly.
+fn action_instance_label(name: &str, preconds: &[GroundFact], subst: &Subst) -> String {
+    let mut seen: Vec<String> = Vec::new();
+    for p in preconds {
+        for a in &p.args {
+            if is_logic_var(a) && !seen.contains(a) { seen.push(a.clone()); }
+        }
+    }
+    if seen.is_empty() { return name.to_string(); }
+    let parts: Vec<String> = seen.iter().map(|v| format!("{}={}", v, walk(v, subst))).collect();
+    format!("{}({})", name, parts.join(","))
 }
 
 pub fn host_action_add(args: &[Value]) -> Result<Value, String> {
@@ -792,12 +846,12 @@ pub fn host_plan(args: &[Value]) -> Result<Value, String> {
         if !visited.insert(state_key) { continue; }
 
         for action in &actions {
-            if action.preconds.iter().all(|p| state.contains(p)) {
+            for subst in ground_action_instances(&action.preconds, &state) {
                 let mut new_state = state.clone();
-                for d in &action.del_effects { new_state.remove(d); }
-                for a2 in &action.add_effects { new_state.insert(a2.clone()); }
+                for d in &action.del_effects { new_state.remove(&apply_subst_to_fact(d, &subst)); }
+                for a2 in &action.add_effects { new_state.insert(apply_subst_to_fact(a2, &subst)); }
                 let mut new_path = path.clone();
-                new_path.push(action.name.clone());
+                new_path.push(action_instance_label(&action.name, &action.preconds, &subst));
                 let new_cost = node_cost + action.cost;
                 nodes.push((new_state, new_path, new_cost));
                 frontier.push(Reverse((new_cost, nodes.len() - 1)));
@@ -1924,8 +1978,14 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     // 'print' not found", since this function never actually inserted it.
     // Found via build_portfolio.patlang's own precompile-progress `when`
     // handlers, the first real code to call print() from a parallel_map
-    // worker. Fixed here, matching the comment's original intent.
-    interp.host.insert("print", host_print);
+    // worker. Fixed here, matching the comment's original intent -- but
+    // only if the caller hasn't already registered their own "print" (e.g.
+    // a test installing a capture buffer before calling this function, or
+    // main.rs's top-level --ir-run interpreter installing its own), so this
+    // is a default, not an override.
+    if interp.host.get("print").is_none() {
+        interp.host.insert("print", host_print);
+    }
     interp.host.insert("len", host_len);
     interp.host.insert("get", host_get);
     interp.host.insert("list_get", host_list_get);

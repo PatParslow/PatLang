@@ -2840,6 +2840,38 @@ fn current_ground_facts_as_state() -> HashSet<GroundFact> {
         .collect())
 }
 
+fn apply_subst_to_fact(fact: &GroundFact, subst: &LogicSubst) -> GroundFact {
+    GroundFact { pred: fact.pred.clone(), args: logic_apply_subst(&fact.args, subst) }
+}
+
+fn ground_action_instances(preconds: &[GroundFact], state: &HashSet<GroundFact>) -> Vec<LogicSubst> {
+    fn go(remaining: &[GroundFact], state: &HashSet<GroundFact>, subst: LogicSubst, out: &mut Vec<LogicSubst>) {
+        if remaining.is_empty() { out.push(subst); return; }
+        let (first, rest) = (&remaining[0], &remaining[1..]);
+        let applied = logic_apply_subst(&first.args, &subst);
+        for fact in state.iter().filter(|f| f.pred == first.pred) {
+            if let Some(s2) = unify_args(&applied, &fact.args, &subst) {
+                go(rest, state, s2, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    go(preconds, state, HashMap::new(), &mut out);
+    out
+}
+
+fn action_instance_label(name: &str, preconds: &[GroundFact], subst: &LogicSubst) -> String {
+    let mut seen: Vec<String> = Vec::new();
+    for p in preconds {
+        for a in &p.args {
+            if is_logic_var(a) && !seen.contains(a) { seen.push(a.clone()); }
+        }
+    }
+    if seen.is_empty() { return name.to_string(); }
+    let parts: Vec<String> = seen.iter().map(|v| format!("{}={}", v, logic_walk(v, subst))).collect();
+    format!("{}({})", name, parts.join(","))
+}
+
 fn host_call_logic_inner(name: &str, args: &[Value]) -> Result<Value, String> {
     match name {
 "infer_type_for" => {
@@ -2958,12 +2990,12 @@ fn host_call_logic_inner(name: &str, args: &[Value]) -> Result<Value, String> {
                     state_key.sort();
                     if !visited.insert(state_key) { continue; }
                     for action in &actions {
-                        if action.preconds.iter().all(|p| state.contains(p)) {
+                        for subst in ground_action_instances(&action.preconds, &state) {
                             let mut new_state = state.clone();
-                            for d in &action.del_effects { new_state.remove(d); }
-                            for a2 in &action.add_effects { new_state.insert(a2.clone()); }
+                            for d in &action.del_effects { new_state.remove(&apply_subst_to_fact(d, &subst)); }
+                            for a2 in &action.add_effects { new_state.insert(apply_subst_to_fact(a2, &subst)); }
                             let mut new_path = path.clone();
-                            new_path.push(action.name.clone());
+                            new_path.push(action_instance_label(&action.name, &action.preconds, &subst));
                             let new_cost = node_cost + action.cost;
                             nodes.push((new_state, new_path, new_cost));
                             frontier.push(Reverse((new_cost, nodes.len() - 1)));

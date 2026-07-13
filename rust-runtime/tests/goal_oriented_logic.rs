@@ -85,6 +85,65 @@ fn a2_goap_plan_prefers_cheaper_multistep_over_pricier_direct_path() {
 }
 
 #[test]
+fn a2_parameterized_action_grounds_against_each_matching_fact() {
+    reset_world();
+    // Two targets, each independently "ready" -- a single parameterized
+    // `build(X)` action (precond ready(X), effect built(X)) should ground
+    // into two distinct instantiations, one per target, not just the first.
+    host_rule_add(&[s("ready"), list(vec![s("a")]), list(vec![])]).unwrap();
+    host_rule_add(&[s("ready"), list(vec![s("b")]), list(vec![])]).unwrap();
+    host_action_add(&[s("build"), list(vec![pair("ready", vec![s("X")])]), list(vec![pair("built", vec![s("X")])]), list(vec![]), Value::Int(1)]).unwrap();
+
+    let result = host_plan(&[list(vec![pair("built", vec![s("a")]), pair("built", vec![s("b")])])]).unwrap();
+    match result {
+        Value::List(steps) => {
+            let names: Vec<String> = steps.iter().map(|v| match v { Value::String(s) => s.clone(), _ => panic!() }).collect();
+            assert_eq!(names.len(), 2, "should take exactly two build(X) steps to reach both goal facts");
+            assert!(names.contains(&"build(X=a)".to_string()), "step names: {:?}", names);
+            assert!(names.contains(&"build(X=b)".to_string()), "step names: {:?}", names);
+        }
+        _ => panic!("expected List"),
+    }
+}
+
+#[test]
+fn a2_parameterized_action_binds_shared_variable_across_two_preconds() {
+    reset_world();
+    // dep(target, base). ready(base). A single `build(X)` action needs BOTH
+    // dep(X, Y) and ready(Y) to hold under the SAME binding of Y -- proving
+    // the conjunctive match threads one variable's binding from the first
+    // precond into the second, not just unifying each precond in isolation.
+    host_rule_add(&[s("dep"), list(vec![s("target"), s("base")]), list(vec![])]).unwrap();
+    host_rule_add(&[s("ready"), list(vec![s("base")]), list(vec![])]).unwrap();
+    host_action_add(&[s("build"), list(vec![pair("dep", vec![s("X"), s("Y")]), pair("ready", vec![s("Y")])]), list(vec![pair("built", vec![s("X")])]), list(vec![]), Value::Int(1)]).unwrap();
+
+    let result = host_plan(&[list(vec![pair("built", vec![s("target")])])]).unwrap();
+    match result {
+        Value::List(steps) => {
+            let names: Vec<String> = steps.iter().map(|v| match v { Value::String(s) => s.clone(), _ => panic!() }).collect();
+            assert_eq!(names, vec!["build(X=target,Y=base)"], "step names: {:?}", names);
+        }
+        _ => panic!("expected List"),
+    }
+}
+
+#[test]
+fn a2_ground_action_still_matches_via_the_single_empty_substitution() {
+    reset_world();
+    // A regression guard, not just relying on the pre-existing suite above:
+    // an action with zero variables anywhere in its preconds must ground to
+    // exactly one instantiation (the empty substitution) when its preconds
+    // hold, and zero when they don't -- the exact old plain-equality
+    // behavior, now expressed as a special case of the general matcher.
+    host_action_add(&[s("noop_ready"), list(vec![]), list(vec![pair("done", vec![])]), list(vec![]), Value::Int(1)]).unwrap();
+    let result = host_plan(&[list(vec![pair("done", vec![])])]).unwrap();
+    match result {
+        Value::List(steps) => assert_eq!(steps.len(), 1, "a zero-precond ground action should ground exactly once"),
+        _ => panic!("expected List"),
+    }
+}
+
+#[test]
 fn a2_reports_unreachable_goal_as_empty_plan() {
     reset_world();
     host_action_add(&[s("noop"), list(vec![]), list(vec![pair("irrelevant", vec![])]), list(vec![]), Value::Int(1)]).unwrap();
