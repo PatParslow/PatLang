@@ -1,0 +1,94 @@
+# Build-time transcript form of queue_recovery_demo.patlang, for the site
+# demo page. A real crash is a real fatal process exit (see the genuine,
+# actually-run-it-yourself form for that -- self_hosting/examples/
+# queue_recovery_demo.patlang, verified this session across four real,
+# separate OS processes: worker_1 and worker_2 completing normally,
+# worker_3 genuinely crashing mid-attempt on a real fatal read_file error,
+# and a fourth "recover" process finding and completing worker_3's
+# leftover checkpoint). A fatal error can't be captured mid-transcript
+# here without killing this whole build, so worker_3's crash is
+# represented directly: its intent is published (exactly what
+# queue_attempt does before calling the risky action) without ever
+# calling the action or the ack, which is precisely the on-disk state a
+# real crash between those two steps leaves behind.
+
+include "../lib/includes.patlang"
+include "../lib/queue.patlang"
+
+make a function called qrt_base returns b
+  return "qrt_jobs"
+end
+
+make a function called qrt_topics returns topics
+  return [
+    queue_writer_topic(qrt_base(), "worker_1"),
+    queue_writer_topic(qrt_base(), "worker_2"),
+    queue_writer_topic(qrt_base(), "worker_3")
+  ]
+end
+
+make a function called qrt_reset returns done
+  let topics = qrt_topics()
+  let i = 0
+  let n = to_num(list_len(topics))
+  while i < n do
+    let path = q_file(topics[i])
+    if file_exists(path) == "1" then
+      write_file(path, "")
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+make a function called run_queue_recovery_transcript returns done
+  qrt_reset()
+  print("=== phase 1: three independent workers, each with its own topic ===")
+
+  let ok1 = || do
+    print("worker_1: did the work successfully")
+    return true
+  end
+  queue_attempt(queue_writer_topic(qrt_base(), "worker_1"), "job for worker_1", ok1)
+  print("worker_1: job completed and acked")
+
+  let ok2 = || do
+    print("worker_2: did the work successfully")
+    return true
+  end
+  queue_attempt(queue_writer_topic(qrt_base(), "worker_2"), "job for worker_2", ok2)
+  print("worker_2: job completed and acked")
+
+  print("worker_3: starting risky work...")
+  print("worker_3: CRASH -- fatal host error mid-attempt (verified for real: a bad read_file call kills the process before it reaches queue_ack)")
+  queue_publish(queue_writer_topic(qrt_base(), "worker_3"), "job for worker_3")
+  print("(process exits here for real; only the intent message is left on disk)")
+
+  print("")
+  print("=== phase 2: a separate, later process recovers ===")
+  let topics = qrt_topics()
+  let pending = queue_pending_multi(topics)
+  let pn = to_num(list_len(pending))
+  print("RECOVERY: " + pn + " leftover pending message(s) across 3 worker topic(s)")
+  let i = 0
+  while i < pn do
+    let pair = pending[i]
+    let topic = pair[0]
+    let msg_id = pair[1]
+    let payload = queue_consume(topic)
+    print("RECOVERY: found interrupted job -- " + payload + " (topic " + topic + ")")
+    print("RECOVERY: completing it now...")
+    queue_ack(topic, msg_id)
+    print("RECOVERY: acked, done")
+    let i = i + 1
+  end
+
+  print("")
+  print("=== phase 3: recovery is idempotent -- run it again, nothing left ===")
+  let pending2 = queue_pending_multi(topics)
+  print("RECOVERY: " + to_num(list_len(pending2)) + " leftover pending message(s)")
+
+  return true
+end
+
+run_queue_recovery_transcript()

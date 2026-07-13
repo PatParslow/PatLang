@@ -1,0 +1,130 @@
+# Worked example: a message queue used as intended, end to end -- multiple
+# independent writers doing risky I/O work, one of them genuinely crashing
+# mid-attempt, and a separate recovery run finding and completing the
+# interrupted work. Run this yourself in two separate invocations:
+#
+#   pat --ir-run self_hosting/examples/queue_recovery_demo.patlang work worker_1
+#   pat --ir-run self_hosting/examples/queue_recovery_demo.patlang work worker_2
+#   pat --ir-run self_hosting/examples/queue_recovery_demo.patlang work worker_3 crash
+#   pat --ir-run self_hosting/examples/queue_recovery_demo.patlang recover worker_1 worker_2 worker_3
+#
+# Each "work" invocation is a genuinely separate OS process. worker_3's run
+# with the "crash" argument triggers a real, fatal host error (reading a
+# file that doesn't exist) partway through its risky action -- PatLang has
+# no try/catch, so that invocation dies outright, exactly like a real I/O
+# failure would. Its intent message is left "pending" on disk. The
+# "recover" invocation is a fourth, later, independent process: it finds
+# worker_3's leftover pending message via queue_pending_multi and completes
+# the work itself, proving the checkpoint genuinely survived the crash.
+#
+# Idiomatic race-avoidance note: each worker gets its OWN topic
+# (queue_writer_topic("qr_jobs", worker_id)) rather than all workers
+# sharing one topic file. PatLang's queue does whole-file read-modify-write
+# with no locking, so concurrent writers to the SAME topic can race --
+# giving each writer its own topic file avoids that by construction. The
+# recovery pass then reads across the whole family of topics at once via
+# queue_pending_multi/queue_consume_multi, so nothing about that per-writer
+# split is visible to the reader side.
+
+include "../lib/includes.patlang"
+include "../lib/queue.patlang"
+
+make a function called qr_base returns b
+  return "qr_jobs"
+end
+
+make a function called qr_known_workers returns ids
+  return ["worker_1", "worker_2", "worker_3"]
+end
+
+make a function called qr_topics returns topics
+  let ids = qr_known_workers()
+  let out = []
+  let i = 0
+  let n = to_num(list_len(ids))
+  while i < n do
+    let out = list_push(out, queue_writer_topic(qr_base(), ids[i]))
+    let i = i + 1
+  end
+  return out
+end
+
+# The actual "risky I/O work" a worker does. Reading a file that
+# genuinely doesn't exist is a real, fatal host error in PatLang (no
+# try/catch) -- this is not a simulated failure, it's the real thing.
+make a function called qr_do_work takes worker_id, should_crash returns done
+  if should_crash == "crash" then
+    print(worker_id + ": starting risky work...")
+    let doomed = read_file("this/path/does/not/exist.json")
+    print(worker_id + ": this line never runs")
+    return true
+  end
+  print(worker_id + ": did the work successfully")
+  return true
+end
+
+make a function called run_worker takes worker_id, should_crash returns done
+  let topic = queue_writer_topic(qr_base(), worker_id)
+  let work_action = || do
+    return qr_do_work(worker_id, should_crash)
+  end
+  queue_attempt(topic, "job for " + worker_id, work_action)
+  print(worker_id + ": job completed and acked")
+  return true
+end
+
+make a function called run_recovery takes worker_ids returns done
+  let topics = []
+  let i = 0
+  let n = to_num(list_len(worker_ids))
+  while i < n do
+    let topics = list_push(topics, queue_writer_topic(qr_base(), worker_ids[i]))
+    let i = i + 1
+  end
+  let pending = queue_pending_multi(topics)
+  let pn = to_num(list_len(pending))
+  print("RECOVERY: " + pn + " leftover pending message(s) across " + n + " worker topic(s)")
+  let i = 0
+  while i < pn do
+    let pair = pending[i]
+    let topic = pair[0]
+    let msg_id = pair[1]
+    let payload = queue_consume(topic)
+    print("RECOVERY: found interrupted job -- " + payload + " (topic " + topic + ")")
+    print("RECOVERY: completing it now...")
+    queue_ack(topic, msg_id)
+    print("RECOVERY: acked, done")
+    let i = i + 1
+  end
+  if pn == 0 then
+    print("RECOVERY: nothing to do, all workers completed cleanly")
+  end
+  return true
+end
+
+let cli_args = argv()
+if cli_args.length == 0 then
+  print("usage: work <worker_id> [crash]  |  recover <worker_id...>")
+else
+  let mode = cli_args[0]
+  if mode == "work" then
+    let worker_id = cli_args[1]
+    let should_crash = ""
+    if cli_args.length > 2 then
+      let should_crash = cli_args[2]
+    end
+    run_worker(worker_id, should_crash)
+  else
+    if mode == "recover" then
+      let worker_ids = []
+      let i = 1
+      while i < cli_args.length do
+        let worker_ids = list_push(worker_ids, cli_args[i])
+        let i = i + 1
+      end
+      run_recovery(worker_ids)
+    else
+      print("unknown mode: " + mode)
+    end
+  end
+end

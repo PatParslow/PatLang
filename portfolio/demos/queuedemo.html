@@ -1,0 +1,565 @@
+<h1>Durable message queue: a crash, and a real recovery</h1>
+<p>Three independent workers, each doing risky I/O work, each with its OWN topic (<code>queue_writer_topic(base, worker_id)</code>) rather than sharing one &mdash; the queue does whole-file read-modify-write with no locking, so giving every writer its own topic avoids a write race by construction, not by coordination. Two workers finish cleanly via <code>queue_attempt</code> (publish intent, do the work, ack the outcome). The third genuinely crashes mid-attempt &mdash; PatLang has no try/catch, so a real fatal host error (a bad <code>read_file</code> call, verified this session across four actually-separate OS processes) kills that worker outright, before it ever reaches <code>queue_ack</code>. A separate, later process then calls <code>queue_pending_multi</code> across all three workers' topics, finds the one leftover checkpoint, completes it, and acks it &mdash; proving the intent genuinely survived the crash on disk, not just in this transcript. Built entirely in <code>self_hosting/lib/queue.patlang</code>, no new Rust host functions. See the <a href='patlang-paradigms.html#heading-queue'>Paradigms Guide's Durable Message Queue section</a> for the full design. <strong>Native transcript only, no &quot;run in browser&quot; button</strong>: needs real file I/O and a real fatal process exit, neither available in the WASI sandbox. The transcript below represents the crash directly (publishing the intent without ever calling the action or the ack &mdash; exactly the on-disk state a real crash between those two steps leaves) since a genuine fatal error can't be captured mid-transcript without killing this whole build &mdash; see <code>self_hosting/examples/queue_recovery_demo.patlang</code> for the real, actually-run-it-yourself four-separate-process form.</p>
+<details><summary>PatLang source</summary><pre class='src'># Self-hosted mirror of rust-runtime/src/preprocess.rs's expand_includes:
+# expands `include &quot;relative/path.patlang&quot;` lines by splicing the
+# referenced file's contents in place, resolving paths relative to the
+# including file's own directory, recursively.
+#
+# Why this exists as PatLang, not just Rust: `expand_includes` was
+# previously a NATIVE-ONLY preprocessing step (main.rs, run before the
+# frontend ever sees the source) -- patc1.exe's own self-hosted lexer/
+# parser never learned to do this, so any .patlang file using `include`
+# could only be compiled via the native pat.exe frontend (`--ir-run`/
+# `--patc`), never handed directly to patc1.exe, which is why every
+# multi-file portfolio demo in build_portfolio.patlang manually
+# concatenates dependency files (read_file(lexer) + chr(10) + ...) instead
+# of using `include`. This closes that gap so `include` works identically
+# everywhere -- interpreted, natively compiled, and self-hosted-compiled --
+# matching this session's usual bar of &quot;verified across all three paths.&quot;
+#
+# Kept as its own small library (not folded directly into patc1_main.patlang)
+# so any self-hosted driver can `include &quot;lib/includes.patlang&quot;` and use it.
+
+# str_trim(s) -&gt; s with leading/trailing space/tab/\r stripped.
+make a function called str_trim takes s returns trimmed
+  let n = s.length
+  let start = 0
+  while (start &lt; n) and is_ws_char(char_code(s, start)) do
+    let start = start + 1
+  end
+  let end = n
+  while (end &gt; start) and is_ws_char(char_code(s, end - 1)) do
+    let end = end - 1
+  end
+  return substr(s, start, end - start)
+end
+
+make a function called is_ws_char takes code returns is_ws
+  return (code == 32) or (code == 9) or (code == 13)
+end
+
+# str_starts_with(s, prefix) -&gt; bool
+make a function called str_starts_with takes s, prefix returns matches
+  if prefix.length &gt; s.length then
+    return false
+  end
+  return substr(s, 0, prefix.length) == prefix
+end
+
+# split_lines(s) -&gt; list of lines, split on \n (a trailing \r on each line,
+# from CRLF source files, is stripped too).
+make a function called split_lines takes s returns lines
+  let out = []
+  let n = s.length
+  let start = 0
+  let i = 0
+  while i &lt; n do
+    if char_code(s, i) == 10 then
+      let raw = substr(s, start, i - start)
+      let out = list_push(out, strip_trailing_cr(raw))
+      let start = i + 1
+    end
+    let i = i + 1
+  end
+  if start &lt; n then
+    let out = list_push(out, strip_trailing_cr(substr(s, start, n - start)))
+  end
+  return out
+end
+
+make a function called strip_trailing_cr takes line returns stripped
+  let n = line.length
+  if (n &gt; 0) and (char_code(line, n - 1) == 13) then
+    return substr(line, 0, n - 1)
+  end
+  return line
+end
+
+# path_dirname(path) -&gt; everything before the last '/' or '\', or &quot;.&quot; if
+# the path has no directory component. Handles both separators since
+# build_portfolio.patlang and friends run on Windows but write forward
+# slashes in string literals.
+make a function called path_dirname takes path returns dir
+  let n = path.length
+  let i = n - 1
+  let last_sep = -1
+  while i &gt;= 0 do
+    let c = char_code(path, i)
+    if (c == 47) or (c == 92) then
+      let last_sep = i
+      let i = -1
+    else
+      let i = i - 1
+    end
+  end
+  if last_sep &lt; 0 then
+    return &quot;.&quot;
+  end
+  return substr(path, 0, last_sep)
+end
+
+# path_join(base, rel) -&gt; base + &quot;/&quot; + rel, tolerating a trailing slash on
+# base and an empty base (meaning &quot;current directory&quot;). If `rel` is itself
+# absolute (leading '/'/'\', or a Windows drive letter like &quot;C:&quot;), it's
+# returned unchanged, ignoring base -- matches Rust's PathBuf::join, which
+# preprocess.rs's native expand_includes relies on for the same case.
+make a function called path_join takes base, rel returns joined
+  if is_absolute_path(rel) then
+    return rel
+  end
+  if (base == &quot;&quot;) or (base == &quot;.&quot;) then
+    return rel
+  end
+  let n = base.length
+  if (n &gt; 0) and ((char_code(base, n - 1) == 47) or (char_code(base, n - 1) == 92)) then
+    return base + rel
+  end
+  return base + &quot;/&quot; + rel
+end
+
+make a function called is_absolute_path takes p returns is_abs
+  if p.length == 0 then
+    return false
+  end
+  let c0 = char_code(p, 0)
+  if (c0 == 47) or (c0 == 92) then
+    return true
+  end
+  if (p.length &gt;= 2) and (char_code(p, 1) == 58) then
+    return true
+  end
+  return false
+end
+
+# expand_includes(source, base_dir) -&gt; source with every `include &quot;path&quot;`
+# line recursively replaced by that file's own (recursively expanded)
+# contents, paths resolved relative to base_dir (the including file's own
+# directory) at each level, exactly matching preprocess.rs's semantics.
+#
+# The depth cap (16, matching preprocess.rs's MAX_DEPTH) is inlined as a
+# literal below rather than a top-level `let` constant referenced from
+# inside expand_includes_at_depth -- patc1.exe was found, while building
+# this, to NOT make top-level `let` constants visible inside function
+# bodies at all (confirmed via a minimal repro: the value silently reads
+# as empty/unset, not an error) even though both --ir-run and native
+# --patc handle this correctly. That's a real, previously-unknown
+# self-hosted-compiler bug, logged separately in the backlog for its own
+# dedicated fix -- this file just avoids relying on the broken behavior.
+make a function called expand_includes takes source, base_dir returns expanded
+  return expand_includes_at_depth(source, base_dir, 0)
+end
+
+make a function called expand_includes_at_depth takes source, base_dir, depth returns expanded
+  if depth &gt; 16 then
+    print(&quot;include: nesting deeper than 16 levels (cycle?)&quot;)
+    return source
+  end
+  let lines = split_lines(source)
+  let out = sb_new()
+  let i = 0
+  let n = to_num(list_len(lines))
+  while i &lt; n do
+    let line = lines[i]
+    let t = str_trim(line)
+    if str_starts_with(t, &quot;include &quot;) and (str_starts_with(t, &quot;#&quot;) == false) then
+      let rel = str_trim(substr(t, 8, t.length - 8))
+      let rel = strip_quotes(rel)
+      let path = path_join(base_dir, rel)
+      let inner = read_file(path)
+      let inner_base = path_dirname(path)
+      sb_push(out, expand_includes_at_depth(inner, inner_base, depth + 1))
+      sb_push(out, chr(10))
+    else
+      sb_push(out, line)
+      sb_push(out, chr(10))
+    end
+    let i = i + 1
+  end
+  return sb_str(out)
+end
+
+# strip_quotes(&quot;\&quot;path\&quot;&quot;) -&gt; &quot;path&quot; -- include lines are always written
+# with double-quoted paths, same as the native preprocessor expects.
+make a function called strip_quotes takes s returns unquoted
+  let n = s.length
+  if (n &gt;= 2) and (char_code(s, 0) == 34) and (char_code(s, n - 1) == 34) then
+    return substr(s, 1, n - 2)
+  end
+  return s
+end
+
+# A durable, file-backed message queue -- entirely PatLang, no new Rust host
+# functions. Built on read_file/write_file/file_exists (hosts.rs already
+# provides these), the same way build_daemon.patlang's history file works:
+# a plain text log, whole-file read-modify-write on every call.
+#
+# One log file per topic: q_dir()/&lt;topic&gt;.log, tab-separated lines
+#   id&lt;TAB&gt;status&lt;TAB&gt;payload
+# where status is &quot;pending&quot; or &quot;acked&quot;. Because every publish/ack writes
+# straight through to disk (no separate flush step), durability and
+# restart-resumption fall out for free: queue_pending(topic) after a crash
+# just reflects whatever was last written to the file. There is no locking
+# primitive in PatLang today, so concurrent writers to the SAME topic from
+# multiple processes at the same instant can race and clobber each other's
+# write -- same accepted caveat build_daemon.patlang's history file already
+# lives with. Don't rely on this for high-contention concurrent publishers
+# to one topic; separate topics are fully independent (separate files).
+#
+# The saga/contract-shaped wrapper (queue_attempt) realizes the pattern:
+# intent = require, attempt = do the risky thing, outcome = ensure. If the
+# wrapped function aborts (PatLang has no try/catch -- a host error is
+# still fatal, unchanged by this library), the intent message is simply
+# left &quot;pending&quot; on disk for a later run (or a dedicated recovery pass) to
+# find via queue_pending and decide whether to retry or compensate.
+#
+# NOTE on style: q_dir() is a function, not a top-level `let`, for the same
+# reason build_daemon.patlang's &quot;constants&quot; all are -- see that file's own
+# header comment and [[patlang-backlog]] item 10.
+
+
+
+make a function called q_dir returns path
+  return &quot;.patlang_queue&quot;
+end
+
+make a function called q_file takes topic returns path
+  return q_dir() + &quot;/&quot; + topic + &quot;.log&quot;
+end
+
+make a function called q_tab returns t
+  return chr(9)
+end
+
+# Split a log line into [id, status, payload]. Payload may itself contain
+# no tabs or newlines (callers should avoid them); this is a simple format,
+# not a general-purpose encoder.
+make a function called q_parse_line takes line returns fields
+  let t = q_tab()
+  let first = find_substr_queue(line, t)
+  if first &lt; 0 then
+    return [&quot;&quot;, &quot;&quot;, &quot;&quot;]
+  end
+  let rest = substr(line, first + 1, line.length - first - 1)
+  let second = find_substr_queue(rest, t)
+  if second &lt; 0 then
+    return [substr(line, 0, first), rest, &quot;&quot;]
+  end
+  let id = substr(line, 0, first)
+  let status = substr(rest, 0, second)
+  let payload = substr(rest, second + 1, rest.length - second - 1)
+  return [id, status, payload]
+end
+
+make a function called find_substr_queue takes hay, needle returns idx
+  let hn = hay.length
+  let nn = needle.length
+  if nn == 0 then
+    return 0
+  end
+  let i = 0
+  while i &lt;= hn - nn do
+    if substr(hay, i, nn) == needle then
+      return i
+    end
+    let i = i + 1
+  end
+  return -1
+end
+
+# Read a topic's log into a list of [id, status, payload] triples.
+# Returns [] if the topic has no log file yet.
+make a function called q_read takes topic returns rows
+  let path = q_file(topic)
+  if file_exists(path) != &quot;1&quot; then
+    return []
+  end
+  let raw = read_file(path)
+  let lines = split_lines(raw)
+  let out = []
+  let i = 0
+  let n = to_num(list_len(lines))
+  while i &lt; n do
+    let line = str_trim(lines[i])
+    if line.length &gt; 0 then
+      let out = list_push(out, q_parse_line(line))
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called q_write takes topic, rows returns done
+  let b = sb_new()
+  let t = q_tab()
+  let i = 0
+  let n = to_num(list_len(rows))
+  while i &lt; n do
+    let row = rows[i]
+    sb_push(b, row[0] + t + row[1] + t + row[2] + chr(10))
+    let i = i + 1
+  end
+  write_file(q_file(topic), sb_str(b))
+  return true
+end
+
+# queue_publish(topic, payload) -&gt; msg_id (as a string). Appends a new
+# &quot;pending&quot; row and writes the whole topic log back to disk.
+make a function called queue_publish takes topic, payload returns msg_id
+  let rows = q_read(topic)
+  let max_id = -1
+  let i = 0
+  let n = to_num(list_len(rows))
+  while i &lt; n do
+    let existing = to_num(rows[i][0])
+    if existing &gt; max_id then
+      let max_id = existing
+    end
+    let i = i + 1
+  end
+  let new_id = max_id + 1
+  let rows = list_push(rows, [new_id, &quot;pending&quot;, payload])
+  q_write(topic, rows)
+  return new_id
+end
+
+# queue_consume(topic) -&gt; payload of the oldest pending message, or &quot;&quot; if
+# none pending. Does NOT ack -- call queue_ack once the message has
+# genuinely been handled, so a crash between consume and ack leaves it
+# recoverable rather than silently lost.
+make a function called queue_consume takes topic returns payload
+  let rows = q_read(topic)
+  let i = 0
+  let n = to_num(list_len(rows))
+  while i &lt; n do
+    let row = rows[i]
+    if row[1] == &quot;pending&quot; then
+      return row[2]
+    end
+    let i = i + 1
+  end
+  return &quot;&quot;
+end
+
+# queue_ack(topic, msg_id) -&gt; marks the given message acked.
+make a function called queue_ack takes topic, msg_id returns done
+  let rows = q_read(topic)
+  let out = []
+  let i = 0
+  let n = to_num(list_len(rows))
+  while i &lt; n do
+    let row = rows[i]
+    if to_num(row[0]) == to_num(msg_id) then
+      let out = list_push(out, [row[0], &quot;acked&quot;, row[2]])
+    else
+      let out = list_push(out, row)
+    end
+    let i = i + 1
+  end
+  q_write(topic, out)
+  return true
+end
+
+# queue_pending(topic) -&gt; list of message ids still pending. What makes the
+# queue &quot;resumable&quot;: on a fresh process, this is simply whatever is still
+# unacked in the file -- no separate load/restore step needed.
+make a function called queue_pending takes topic returns ids
+  let rows = q_read(topic)
+  let out = []
+  let i = 0
+  let n = to_num(list_len(rows))
+  while i &lt; n do
+    let row = rows[i]
+    if row[1] == &quot;pending&quot; then
+      let out = list_push(out, row[0])
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# ---- multi-topic reads, for the &quot;give every writer its own topic&quot; idiom ----
+#
+# PatLang has no locking primitive, so a topic shared between multiple
+# concurrent writers can race (two whole-file read-modify-writes landing at
+# the same instant can clobber each other). The idiomatic fix isn't locking
+# -- it's giving each writer its own topic name (e.g. queue_writer_topic
+# below: a base name plus the writer's own identity) so no two writers ever
+# touch the same file, avoiding the race by construction rather than by
+# coordination. A reader that needs the combined stream then reads across
+# that whole family of topics with the functions below, rather than one
+# consumer trying to read one shared, contended file.
+
+# queue_writer_topic(base, writer_id) -&gt; a topic name namespaced to one
+# writer, e.g. queue_writer_topic(&quot;orders&quot;, &quot;worker_1&quot;) -&gt; &quot;orders__worker_1&quot;.
+# Purely a naming convention -- any unique-per-writer string works, this
+# just gives it one canonical shape so producers and consumers agree.
+make a function called queue_writer_topic takes base, writer_id returns topic
+  return base + &quot;__&quot; + writer_id
+end
+
+# queue_pending_multi(topics) -&gt; list of [topic, msg_id] pairs, one per
+# still-pending message across every topic in the given list, in the order
+# the topics were given (and id order within each topic).
+make a function called queue_pending_multi takes topics returns pairs
+  let out = []
+  let t = 0
+  let tn = to_num(list_len(topics))
+  while t &lt; tn do
+    let topic = topics[t]
+    let ids = queue_pending(topic)
+    let i = 0
+    let n = to_num(list_len(ids))
+    while i &lt; n do
+      let out = list_push(out, [topic, ids[i]])
+      let i = i + 1
+    end
+    let t = t + 1
+  end
+  return out
+end
+
+# queue_consume_multi(topics) -&gt; [topic, payload] for the oldest pending
+# message in the FIRST topic (in list order) that has one; [&quot;&quot;, &quot;&quot;] if none
+# of the given topics have anything pending. Simple &quot;check topics in order&quot;
+# semantics -- there's no id shared across topics, so no attempt is made to
+# merge them into one global time order.
+make a function called queue_consume_multi takes topics returns result
+  let t = 0
+  let tn = to_num(list_len(topics))
+  while t &lt; tn do
+    let topic = topics[t]
+    let payload = queue_consume(topic)
+    if payload != &quot;&quot; then
+      return [topic, payload]
+    end
+    let t = t + 1
+  end
+  return [&quot;&quot;, &quot;&quot;]
+end
+
+# queue_attempt(topic, payload, action) -&gt; result of action(). Publishes an
+# intent message before calling action, acks it once action returns
+# normally. If action aborts (fatal host error -- PatLang has no
+# try/catch, this doesn't change that), the intent message stays
+# &quot;pending&quot; on disk for a later run to find via queue_pending and retry
+# or compensate.
+make a function called queue_attempt takes topic, payload, action returns result
+  let msg_id = queue_publish(topic, payload)
+  let result = action()
+  queue_ack(topic, msg_id)
+  return result
+end
+
+# Build-time transcript form of queue_recovery_demo.patlang, for the site
+# demo page. A real crash is a real fatal process exit (see the genuine,
+# actually-run-it-yourself form for that -- self_hosting/examples/
+# queue_recovery_demo.patlang, verified this session across four real,
+# separate OS processes: worker_1 and worker_2 completing normally,
+# worker_3 genuinely crashing mid-attempt on a real fatal read_file error,
+# and a fourth &quot;recover&quot; process finding and completing worker_3's
+# leftover checkpoint). A fatal error can't be captured mid-transcript
+# here without killing this whole build, so worker_3's crash is
+# represented directly: its intent is published (exactly what
+# queue_attempt does before calling the risky action) without ever
+# calling the action or the ack, which is precisely the on-disk state a
+# real crash between those two steps leaves behind.
+
+
+
+
+make a function called qrt_base returns b
+  return &quot;qrt_jobs&quot;
+end
+
+make a function called qrt_topics returns topics
+  return [
+    queue_writer_topic(qrt_base(), &quot;worker_1&quot;),
+    queue_writer_topic(qrt_base(), &quot;worker_2&quot;),
+    queue_writer_topic(qrt_base(), &quot;worker_3&quot;)
+  ]
+end
+
+make a function called qrt_reset returns done
+  let topics = qrt_topics()
+  let i = 0
+  let n = to_num(list_len(topics))
+  while i &lt; n do
+    let path = q_file(topics[i])
+    if file_exists(path) == &quot;1&quot; then
+      write_file(path, &quot;&quot;)
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+make a function called run_queue_recovery_transcript returns done
+  qrt_reset()
+  print(&quot;=== phase 1: three independent workers, each with its own topic ===&quot;)
+
+  let ok1 = || do
+    print(&quot;worker_1: did the work successfully&quot;)
+    return true
+  end
+  queue_attempt(queue_writer_topic(qrt_base(), &quot;worker_1&quot;), &quot;job for worker_1&quot;, ok1)
+  print(&quot;worker_1: job completed and acked&quot;)
+
+  let ok2 = || do
+    print(&quot;worker_2: did the work successfully&quot;)
+    return true
+  end
+  queue_attempt(queue_writer_topic(qrt_base(), &quot;worker_2&quot;), &quot;job for worker_2&quot;, ok2)
+  print(&quot;worker_2: job completed and acked&quot;)
+
+  print(&quot;worker_3: starting risky work...&quot;)
+  print(&quot;worker_3: CRASH -- fatal host error mid-attempt (verified for real: a bad read_file call kills the process before it reaches queue_ack)&quot;)
+  queue_publish(queue_writer_topic(qrt_base(), &quot;worker_3&quot;), &quot;job for worker_3&quot;)
+  print(&quot;(process exits here for real; only the intent message is left on disk)&quot;)
+
+  print(&quot;&quot;)
+  print(&quot;=== phase 2: a separate, later process recovers ===&quot;)
+  let topics = qrt_topics()
+  let pending = queue_pending_multi(topics)
+  let pn = to_num(list_len(pending))
+  print(&quot;RECOVERY: &quot; + pn + &quot; leftover pending message(s) across 3 worker topic(s)&quot;)
+  let i = 0
+  while i &lt; pn do
+    let pair = pending[i]
+    let topic = pair[0]
+    let msg_id = pair[1]
+    let payload = queue_consume(topic)
+    print(&quot;RECOVERY: found interrupted job -- &quot; + payload + &quot; (topic &quot; + topic + &quot;)&quot;)
+    print(&quot;RECOVERY: completing it now...&quot;)
+    queue_ack(topic, msg_id)
+    print(&quot;RECOVERY: acked, done&quot;)
+    let i = i + 1
+  end
+
+  print(&quot;&quot;)
+  print(&quot;=== phase 3: recovery is idempotent -- run it again, nothing left ===&quot;)
+  let pending2 = queue_pending_multi(topics)
+  print(&quot;RECOVERY: &quot; + to_num(list_len(pending2)) + &quot; leftover pending message(s)&quot;)
+
+  return true
+end
+
+run_queue_recovery_transcript()
+</pre></details><p class='label'>Native run on the build machine:</p><pre class='out native'>=== phase 1: three independent workers, each with its own topic ===
+worker_1: did the work successfully
+worker_1: job completed and acked
+worker_2: did the work successfully
+worker_2: job completed and acked
+worker_3: starting risky work...
+worker_3: CRASH -- fatal host error mid-attempt (verified for real: a bad read_file call kills the process before it reaches queue_ack)
+(process exits here for real; only the intent message is left on disk)
+
+=== phase 2: a separate, later process recovers ===
+RECOVERY: 1 leftover pending message(s) across 3 worker topic(s)
+RECOVERY: found interrupted job -- job for worker_3 (topic qrt_jobs__worker_3)
+RECOVERY: completing it now...
+RECOVERY: acked, done
+
+=== phase 3: recovery is idempotent -- run it again, nothing left ===
+RECOVERY: 0 leftover pending message(s)
+true
+</pre>

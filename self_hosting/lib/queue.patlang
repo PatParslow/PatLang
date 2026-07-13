@@ -187,6 +187,66 @@ make a function called queue_pending takes topic returns ids
   return out
 end
 
+# ---- multi-topic reads, for the "give every writer its own topic" idiom ----
+#
+# PatLang has no locking primitive, so a topic shared between multiple
+# concurrent writers can race (two whole-file read-modify-writes landing at
+# the same instant can clobber each other). The idiomatic fix isn't locking
+# -- it's giving each writer its own topic name (e.g. queue_writer_topic
+# below: a base name plus the writer's own identity) so no two writers ever
+# touch the same file, avoiding the race by construction rather than by
+# coordination. A reader that needs the combined stream then reads across
+# that whole family of topics with the functions below, rather than one
+# consumer trying to read one shared, contended file.
+
+# queue_writer_topic(base, writer_id) -> a topic name namespaced to one
+# writer, e.g. queue_writer_topic("orders", "worker_1") -> "orders__worker_1".
+# Purely a naming convention -- any unique-per-writer string works, this
+# just gives it one canonical shape so producers and consumers agree.
+make a function called queue_writer_topic takes base, writer_id returns topic
+  return base + "__" + writer_id
+end
+
+# queue_pending_multi(topics) -> list of [topic, msg_id] pairs, one per
+# still-pending message across every topic in the given list, in the order
+# the topics were given (and id order within each topic).
+make a function called queue_pending_multi takes topics returns pairs
+  let out = []
+  let t = 0
+  let tn = to_num(list_len(topics))
+  while t < tn do
+    let topic = topics[t]
+    let ids = queue_pending(topic)
+    let i = 0
+    let n = to_num(list_len(ids))
+    while i < n do
+      let out = list_push(out, [topic, ids[i]])
+      let i = i + 1
+    end
+    let t = t + 1
+  end
+  return out
+end
+
+# queue_consume_multi(topics) -> [topic, payload] for the oldest pending
+# message in the FIRST topic (in list order) that has one; ["", ""] if none
+# of the given topics have anything pending. Simple "check topics in order"
+# semantics -- there's no id shared across topics, so no attempt is made to
+# merge them into one global time order.
+make a function called queue_consume_multi takes topics returns result
+  let t = 0
+  let tn = to_num(list_len(topics))
+  while t < tn do
+    let topic = topics[t]
+    let payload = queue_consume(topic)
+    if payload != "" then
+      return [topic, payload]
+    end
+    let t = t + 1
+  end
+  return ["", ""]
+end
+
 # queue_attempt(topic, payload, action) -> result of action(). Publishes an
 # intent message before calling action, acks it once action returns
 # normally. If action aborts (fatal host error -- PatLang has no
