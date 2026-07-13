@@ -198,6 +198,29 @@ impl Lowerer {
                 self.lower_expr(expr, f);
                 f.body.push(Instr::CallHost("contract_check".into(), 4));
             }
+            Stmt::RuleDecl { head_pred, head_args, body } => {
+                // Sugar: lowers to exactly the Instr sequence a hand-written
+                // rule_add(head_pred, [head_args...], [[pred,[args...]], ...])
+                // call already produces (see hosts.rs::host_rule_add). Args
+                // are compile-time string TOKENS, not ordinary expressions to
+                // evaluate -- a bare rule-head `X` has no local-variable
+                // binding to look up; it's a logic-variable name, not a value.
+                f.body.push(Instr::Const(Value::String(head_pred.clone())));
+                for a in head_args {
+                    f.body.push(Instr::Const(Value::String(rule_arg_text(a))));
+                }
+                f.body.push(Instr::BuildList(head_args.len()));
+                for (pred, args) in body {
+                    f.body.push(Instr::Const(Value::String(pred.clone())));
+                    for a in args {
+                        f.body.push(Instr::Const(Value::String(rule_arg_text(a))));
+                    }
+                    f.body.push(Instr::BuildList(args.len()));
+                    f.body.push(Instr::BuildList(2)); // [pred, args_list]
+                }
+                f.body.push(Instr::BuildList(body.len()));
+                f.body.push(Instr::CallHost("rule_add".into(), 3));
+            }
             _ => {
                 // unsupported yet: ignore safely
             }
@@ -539,6 +562,10 @@ fn collect_referenced_idents(stmts: &[Stmt], out: &mut Vec<String>, seen: &mut H
             Stmt::Fact { args, .. } | Stmt::Query { args, .. } => { for a in args { collect_ident_expr(a, out, seen); } }
             Stmt::When { body, .. } => collect_referenced_idents(body, out, seen),
             Stmt::Assert { expr, .. } => collect_ident_expr(expr, out, seen),
+            Stmt::RuleDecl { head_args, body, .. } => {
+                for a in head_args { collect_ident_expr(a, out, seen); }
+                for (_, args) in body { for a in args { collect_ident_expr(a, out, seen); } }
+            }
         }
     }
 }
@@ -581,6 +608,17 @@ fn collect_ident_expr(e: &Expr, out: &mut Vec<String>, seen: &mut HashSet<String
                 if seen.insert(n.clone()) { out.push(n); }
             }
         }
+    }
+}
+
+/// Render a rule head/body arg as the compile-time string token rule_add
+/// expects: a bare identifier/number renders the same as expr_to_text, but
+/// a string literal renders as its raw content, not source-quoted (unlike
+/// expr_to_text, which is for human-readable messages).
+pub fn rule_arg_text(e: &Expr) -> String {
+    match e {
+        Expr::String(s) => s.clone(),
+        other => expr_to_text(other),
     }
 }
 

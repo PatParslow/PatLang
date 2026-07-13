@@ -116,6 +116,18 @@ pub enum Stmt {
         kind: String,
         expr: Expr,
     },
+    // Real `rule Head(args) :- Body1, Body2.` / `rule Head(args).` (a fact:
+    // empty body) declarative syntax. Sugar only -- lowers to exactly the
+    // Instr sequence a hand-written `rule_add(head_pred, [args], [[pred,
+    // [args]], ...])` call already produces (see lower_stmt). Body goal
+    // args are ordinary Exprs (usually Expr::Identifier); the `^[A-Z]`-is-
+    // a-logic-variable convention is a pure runtime string convention
+    // applied at lowering time, not validated here.
+    RuleDecl {
+        head_pred: String,
+        head_args: Vec<Expr>,
+        body: Vec<(String, Vec<Expr>)>,
+    },
     // Extend with more statement types as needed
 }
 

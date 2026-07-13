@@ -21,6 +21,8 @@ pub enum Token {
     Semicolon,
     Dot, // Added for fact/query termination
     Colon,
+    // ':-' -- rule turnstile (`rule Head(...) :- Body1, Body2.`)
+    Turnstile,
     Pipe,
     // Combined pipeline operator '|>'
     PipeGreater,
@@ -210,10 +212,15 @@ impl<'a> Lexer<'a> {
                 self.position += 1;
                 return Ok(Token::Dot);
             }
-            // Recognize ':' as Colon token
+            // Recognize ':-' (rule turnstile) or standalone ':' (Colon)
             if c == ':' {
-                self.position += 1;
-                return Ok(Token::Colon);
+                if self.position + 1 < len && bytes[self.position + 1] as char == '-' {
+                    self.position += 2;
+                    return Ok(Token::Turnstile);
+                } else {
+                    self.position += 1;
+                    return Ok(Token::Colon);
+                }
             }
             // Recognize pipeline '|>' or standalone '|'
             if c == '|' {

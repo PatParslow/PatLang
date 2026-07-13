@@ -130,6 +130,49 @@ impl<'a> Parser<'a> {
         Ok(stmts)
     }
 
+    // Attempts a real `Head(args) :- Body1, Body2.` / `Head(args).` parse
+    // (the 'rule' keyword itself already consumed by the caller). Returns
+    // None -- rather than propagating a hard ParserError -- on anything
+    // that doesn't fit the Prolog-goal shape, so the caller can gracefully
+    // degrade to the legacy skip-to-terminator no-op instead of a fatal
+    // error on non-conforming `rule ...` uses in the wild.
+    fn try_parse_rule_decl(&mut self) -> Option<Stmt> {
+        let head_expr = self.parse_expression(0).ok()?;
+        let (head_pred, head_args) = match head_expr {
+            Expr::Call { function, args } => match *function {
+                Expr::Identifier(name) => (name, args),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let mut body: Vec<(String, Vec<Expr>)> = Vec::new();
+        if matches!(self.curr, Token::Turnstile) {
+            self.advance().ok()?;
+            loop {
+                while matches!(self.curr, Token::Newline) { self.advance().ok()?; }
+                let goal_expr = self.parse_expression(0).ok()?;
+                match goal_expr {
+                    Expr::Call { function, args } => match *function {
+                        Expr::Identifier(name) => body.push((name, args)),
+                        _ => return None,
+                    },
+                    _ => return None,
+                }
+                while matches!(self.curr, Token::Newline) { self.advance().ok()?; }
+                match self.curr {
+                    Token::Comma => { self.advance().ok()?; }
+                    Token::Dot => { self.advance().ok()?; break; }
+                    _ => return None,
+                }
+            }
+        } else if matches!(self.curr, Token::Dot) {
+            self.advance().ok()?;
+        } else {
+            return None;
+        }
+        Some(Stmt::RuleDecl { head_pred, head_args, body })
+    }
+
     fn parse_statement(&mut self) -> Result<Stmt, ParserError> {
         match self.curr {
             Token::Let => self.parse_let(),
@@ -162,19 +205,38 @@ impl<'a> Parser<'a> {
                     let expr = self.parse_expression(0)?;
                     return Ok(Stmt::ExprStmt(expr));
                 }
-                // Otherwise, skip DSL-style rule declaration until terminating '.'
-                // (a '.' only ends the clause when followed by newline/EOF, so member
-                // access dots inside the body do not terminate the skip early)
-                self.advance()?;
-                loop {
-                    match self.curr {
-                        Token::EOF => break,
-                        Token::Dot if matches!(self.peek, Token::Newline | Token::EOF) => { self.advance()?; break; },
-                        Token::BlockStart => { self.skip_brace_block()?; },
-                        _ => { self.advance()?; }
+                // Real declarative syntax: `rule Head(args) :- Body1, Body2.`
+                // (a rule) or `rule Head(args).` (a fact -- a rule with an
+                // empty body, the standard Prolog trick, matching how
+                // rule_add already treats an empty body_list). Sugar only --
+                // lowers to exactly the Instr sequence a hand-written
+                // rule_add(...) call already produces (see lower_stmt).
+                //
+                // Not every `rule NAME(...) :- ....` in the wild is actually
+                // Prolog-shaped (found the hard way: native_parser/
+                // native_parser.patlang uses the same surface syntax for an
+                // unrelated pseudo-code convention with arbitrary statement
+                // bodies, e.g. `rule f(x) :- x = { a: 1 }.`). Rather than a
+                // hard parse error on anything that isn't goal-shaped, fall
+                // back to the legacy skip-to-terminator no-op for backward
+                // compatibility -- exactly the old behavior for any `rule`
+                // statement, now scoped to only the non-conforming case.
+                self.advance()?; // consume 'rule'
+                let parsed = self.try_parse_rule_decl();
+                match parsed {
+                    Some(stmt) => Ok(stmt),
+                    None => {
+                        loop {
+                            match self.curr {
+                                Token::EOF => break,
+                                Token::Dot if matches!(self.peek, Token::Newline | Token::EOF) => { self.advance()?; break; },
+                                Token::BlockStart => { self.skip_brace_block()?; },
+                                _ => { self.advance()?; }
+                            }
+                        }
+                        Ok(Stmt::ExprStmt(Expr::String(String::new())))
                     }
                 }
-                Ok(Stmt::ExprStmt(Expr::String(String::new())))
             }
             // identifier assignment: name = expr (but not member assignment)
             Token::Identifier(_) if matches!(self.peek, Token::Equal) => self.parse_assignment(),
