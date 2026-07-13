@@ -85,6 +85,12 @@ const HOST_CHUNK_TABLE: &[(&str, ChunkId)] = &[
     ("bit_set", ChunkId::Core),
     ("bit_slice", ChunkId::Core),
     ("bit_set_slice", ChunkId::Core),
+    ("vfs_read", ChunkId::Core),
+    ("vfs_write", ChunkId::Core),
+    ("vfs_exists", ChunkId::Core),
+    ("vfs_list", ChunkId::Core),
+    ("vfs_delete", ChunkId::Core),
+    ("vfs_flush_to_disk", ChunkId::Core),
     ("char_code", ChunkId::StringsExt),
     ("substr", ChunkId::StringsExt),
     ("chr", ChunkId::StringsExt),
@@ -281,6 +287,36 @@ fn event_handlers_get(ev: &str) -> Vec<String> {
 fn event_handlers_register(ev: String, handler: String) {
     EVENT_HANDLERS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap().entry(ev).or_insert_with(Vec::new).push(handler);
 }
+
+// vfs_*: an always-available (including WASM) in-memory virtual
+// filesystem, distinct from read_file/write_file/etc (real std::fs,
+// native-only) -- deliberately different function names rather than the
+// same names silently switching behavior by target, which would be a
+// footgun. Shared across OS threads for the same parallel_map-worker-
+// visibility reason as EVENT_HANDLERS above, not thread_local.
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+thread_local! {
+    static VFS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+}
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+fn vfs_get(path: &str) -> Option<String> { VFS.with(|m| m.borrow().get(path).cloned()) }
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+fn vfs_set(path: String, contents: String) { VFS.with(|m| { m.borrow_mut().insert(path, contents); }); }
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+fn vfs_del(path: &str) -> bool { VFS.with(|m| m.borrow_mut().remove(path).is_some()) }
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+fn vfs_keys() -> Vec<String> { VFS.with(|m| m.borrow().keys().cloned().collect()) }
+
+#[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+static VFS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+#[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+fn vfs_get(path: &str) -> Option<String> { VFS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap().get(path).cloned() }
+#[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+fn vfs_set(path: String, contents: String) { VFS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap().insert(path, contents); }
+#[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+fn vfs_del(path: &str) -> bool { VFS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap().remove(path).is_some() }
+#[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+fn vfs_keys() -> Vec<String> { VFS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap().keys().cloned().collect() }
 
 fn arg_usize(args: &[Value], i: usize, what: &str) -> Result<usize, String> {
     match args.get(i) {
@@ -483,6 +519,63 @@ impl Host {
                 let mask: i64 = if width == 64 { -1 } else { (1i64 << width) - 1 };
                 let cleared = n & !(mask << start);
                 Ok(Value::Int(cleared | ((val & mask) << start)))
+            }
+            "vfs_read" => {
+                let path = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => String::new() };
+                vfs_get(&path).map(Value::String).ok_or_else(|| format!("vfs_read: not found: {}", path))
+            }
+            "vfs_write" => {
+                let path = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
+                let contents = match args.get(1) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
+                vfs_set(path, contents);
+                Ok(Value::Bool(true))
+            }
+            "vfs_exists" => {
+                let path = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => String::new() };
+                Ok(Value::String(if vfs_get(&path).is_some() { "1".into() } else { "0".into() }))
+            }
+            "vfs_list" => {
+                let prefix = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => String::new() };
+                let mut matching: Vec<String> = vfs_keys().into_iter().filter(|k| k.starts_with(&prefix)).collect();
+                matching.sort();
+                Ok(Value::List(matching.into_iter().map(Value::String).collect()))
+            }
+            "vfs_delete" => {
+                let path = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => String::new() };
+                Ok(Value::Bool(vfs_del(&path)))
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            "vfs_flush_to_disk" => {
+                let prefix = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => String::new() };
+                let real_dir = match args.get(1) { Some(Value::String(s)) => s.clone(), _ => return Err("vfs_flush_to_disk: expected real_dir as second arg".into()) };
+                let allowed_root = match std::env::var("PATLANG_VFS_ALLOWED_ROOT") {
+                    Ok(p) => std::path::PathBuf::from(p),
+                    Err(_) => std::env::current_dir().map_err(|e| format!("vfs_flush_to_disk: current_dir: {}", e))?,
+                };
+                let allowed_root = std::fs::canonicalize(&allowed_root)
+                    .map_err(|e| format!("vfs_flush_to_disk: canonicalize allowed root {}: {}", allowed_root.display(), e))?;
+                std::fs::create_dir_all(&real_dir).map_err(|e| format!("vfs_flush_to_disk: create_dir_all {}: {}", real_dir, e))?;
+                let target_canon = std::fs::canonicalize(&real_dir)
+                    .map_err(|e| format!("vfs_flush_to_disk: canonicalize {}: {}", real_dir, e))?;
+                if !target_canon.starts_with(&allowed_root) {
+                    return Err(format!("vfs_flush_to_disk: {} is outside the allowed root {} (set PATLANG_VFS_ALLOWED_ROOT to permit it)", target_canon.display(), allowed_root.display()));
+                }
+                let mut count: i64 = 0;
+                for key in vfs_keys() {
+                    if !key.starts_with(&prefix) { continue; }
+                    if let Some(contents) = vfs_get(&key) {
+                        let rel = key[prefix.len()..].trim_start_matches('/');
+                        let out_path = target_canon.join(rel);
+                        if let Some(parent) = out_path.parent() { let _ = std::fs::create_dir_all(parent); }
+                        std::fs::write(&out_path, contents).map_err(|e| format!("vfs_flush_to_disk: write {}: {}", out_path.display(), e))?;
+                        count += 1;
+                    }
+                }
+                Ok(Value::Int(count))
+            }
+            #[cfg(target_arch = "wasm32")]
+            "vfs_flush_to_disk" => {
+                Err("vfs_flush_to_disk: not available under WASM (no real filesystem access)".into())
             }
                         _ => call_dispatch(name, args),
         }

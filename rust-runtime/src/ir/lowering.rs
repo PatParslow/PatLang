@@ -275,7 +275,8 @@ impl Lowerer {
             "budgeted_run"|"budget_check"|
             "list_dir"|"rename_file"|
             "rule_add"|"solve"|"action_add"|"plan"|
-            "bit_get"|"bit_set"|"bit_slice"|"bit_set_slice"
+            "bit_get"|"bit_set"|"bit_slice"|"bit_set_slice"|
+            "vfs_read"|"vfs_write"|"vfs_exists"|"vfs_list"|"vfs_delete"|"vfs_flush_to_disk"
         )
     }
 

@@ -858,6 +858,97 @@ pub fn host_bit_set_slice(args: &[Value]) -> Result<Value, String> {
     Ok(Value::Int(cleared | ((val & mask) << start)))
 }
 
+// ---- vfs_*: an always-available (including WASM) in-memory virtual
+// filesystem, distinct from read_file/write_file/etc (real std::fs,
+// native-only) -- deliberately different function names rather than the
+// same names silently switching behavior by target, which would be a
+// footgun (identical source, different real-world effects per target).
+// This is the interpreter side, always native, so no cross-thread
+// cfg-split is needed here (unlike the codegen.rs text mirror, which
+// targets multiple platforms) -- but it's still a plain Mutex, not
+// thread_local, since parallel_map spawns real OS threads even natively.
+static VFS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, String>>> = std::sync::OnceLock::new();
+
+fn vfs_get(path: &str) -> Option<String> {
+    VFS.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap().get(path).cloned()
+}
+fn vfs_set(path: String, contents: String) {
+    VFS.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap().insert(path, contents);
+}
+fn vfs_del(path: &str) -> bool {
+    VFS.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap().remove(path).is_some()
+}
+fn vfs_keys() -> Vec<String> {
+    VFS.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap().keys().cloned().collect()
+}
+
+pub fn host_vfs_read(args: &[Value]) -> Result<Value, String> {
+    let path = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => String::new() };
+    vfs_get(&path).map(Value::String).ok_or_else(|| format!("vfs_read: not found: {}", path))
+}
+
+pub fn host_vfs_write(args: &[Value]) -> Result<Value, String> {
+    let path = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
+    let contents = match args.get(1) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
+    vfs_set(path, contents);
+    Ok(Value::Bool(true))
+}
+
+pub fn host_vfs_exists(args: &[Value]) -> Result<Value, String> {
+    let path = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => String::new() };
+    Ok(Value::String(if vfs_get(&path).is_some() { "1".into() } else { "0".into() }))
+}
+
+pub fn host_vfs_list(args: &[Value]) -> Result<Value, String> {
+    // vfs_list(prefix) -> List of stored paths starting with prefix.
+    let prefix = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => String::new() };
+    let mut matching: Vec<String> = vfs_keys().into_iter().filter(|k| k.starts_with(&prefix)).collect();
+    matching.sort();
+    Ok(Value::List(matching.into_iter().map(Value::String).collect()))
+}
+
+pub fn host_vfs_delete(args: &[Value]) -> Result<Value, String> {
+    let path = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => String::new() };
+    Ok(Value::Bool(vfs_del(&path)))
+}
+
+pub fn host_vfs_flush_to_disk(args: &[Value]) -> Result<Value, String> {
+    // vfs_flush_to_disk(vfs_path_prefix, real_dir) -> Int count of files
+    // written. Native-only write-through, deliberately a separate,
+    // explicit call (not automatic) -- security-gated: real_dir must
+    // canonicalize to somewhere inside an allowed root (PATLANG_VFS_ALLOWED_ROOT
+    // env var, defaulting to the current working directory).
+    let prefix = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => String::new() };
+    let real_dir = match args.get(1) { Some(Value::String(s)) => s.clone(), _ => return Err("vfs_flush_to_disk: expected real_dir as second arg".into()) };
+
+    let allowed_root = match std::env::var("PATLANG_VFS_ALLOWED_ROOT") {
+        Ok(p) => std::path::PathBuf::from(p),
+        Err(_) => std::env::current_dir().map_err(|e| format!("vfs_flush_to_disk: current_dir: {}", e))?,
+    };
+    let allowed_root = std::fs::canonicalize(&allowed_root)
+        .map_err(|e| format!("vfs_flush_to_disk: canonicalize allowed root {}: {}", allowed_root.display(), e))?;
+
+    std::fs::create_dir_all(&real_dir).map_err(|e| format!("vfs_flush_to_disk: create_dir_all {}: {}", real_dir, e))?;
+    let target_canon = std::fs::canonicalize(&real_dir)
+        .map_err(|e| format!("vfs_flush_to_disk: canonicalize {}: {}", real_dir, e))?;
+    if !target_canon.starts_with(&allowed_root) {
+        return Err(format!("vfs_flush_to_disk: {} is outside the allowed root {} (set PATLANG_VFS_ALLOWED_ROOT to permit it)", target_canon.display(), allowed_root.display()));
+    }
+
+    let mut count: i64 = 0;
+    for key in vfs_keys() {
+        if !key.starts_with(&prefix) { continue; }
+        if let Some(contents) = vfs_get(&key) {
+            let rel = key[prefix.len()..].trim_start_matches('/');
+            let out_path = target_canon.join(rel);
+            if let Some(parent) = out_path.parent() { let _ = std::fs::create_dir_all(parent); }
+            std::fs::write(&out_path, contents).map_err(|e| format!("vfs_flush_to_disk: write {}: {}", out_path.display(), e))?;
+            count += 1;
+        }
+    }
+    Ok(Value::Int(count))
+}
+
 pub fn host_new(args: &[Value]) -> Result<Value, String> {
     // new(class, name) -> name, registering the object
     if args.len() != 2 { return Ok(Value::Unit); }
@@ -1871,6 +1962,12 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("bit_set", host_bit_set);
     interp.host.insert("bit_slice", host_bit_slice);
     interp.host.insert("bit_set_slice", host_bit_set_slice);
+    interp.host.insert("vfs_read", host_vfs_read);
+    interp.host.insert("vfs_write", host_vfs_write);
+    interp.host.insert("vfs_exists", host_vfs_exists);
+    interp.host.insert("vfs_list", host_vfs_list);
+    interp.host.insert("vfs_delete", host_vfs_delete);
+    interp.host.insert("vfs_flush_to_disk", host_vfs_flush_to_disk);
     interp.host.insert("new", host_new);
     interp.host.insert("set_var", host_set_var);
     interp.host.insert("send", host_send);
