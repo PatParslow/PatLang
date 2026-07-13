@@ -1,0 +1,201 @@
+# A durable, file-backed message queue -- entirely PatLang, no new Rust host
+# functions. Built on read_file/write_file/file_exists (hosts.rs already
+# provides these), the same way build_daemon.patlang's history file works:
+# a plain text log, whole-file read-modify-write on every call.
+#
+# One log file per topic: q_dir()/<topic>.log, tab-separated lines
+#   id<TAB>status<TAB>payload
+# where status is "pending" or "acked". Because every publish/ack writes
+# straight through to disk (no separate flush step), durability and
+# restart-resumption fall out for free: queue_pending(topic) after a crash
+# just reflects whatever was last written to the file. There is no locking
+# primitive in PatLang today, so concurrent writers to the SAME topic from
+# multiple processes at the same instant can race and clobber each other's
+# write -- same accepted caveat build_daemon.patlang's history file already
+# lives with. Don't rely on this for high-contention concurrent publishers
+# to one topic; separate topics are fully independent (separate files).
+#
+# The saga/contract-shaped wrapper (queue_attempt) realizes the pattern:
+# intent = require, attempt = do the risky thing, outcome = ensure. If the
+# wrapped function aborts (PatLang has no try/catch -- a host error is
+# still fatal, unchanged by this library), the intent message is simply
+# left "pending" on disk for a later run (or a dedicated recovery pass) to
+# find via queue_pending and decide whether to retry or compensate.
+#
+# NOTE on style: q_dir() is a function, not a top-level `let`, for the same
+# reason build_daemon.patlang's "constants" all are -- see that file's own
+# header comment and [[patlang-backlog]] item 10.
+
+include "includes.patlang"
+
+make a function called q_dir returns path
+  return ".patlang_queue"
+end
+
+make a function called q_file takes topic returns path
+  return q_dir() + "/" + topic + ".log"
+end
+
+make a function called q_tab returns t
+  return chr(9)
+end
+
+# Split a log line into [id, status, payload]. Payload may itself contain
+# no tabs or newlines (callers should avoid them); this is a simple format,
+# not a general-purpose encoder.
+make a function called q_parse_line takes line returns fields
+  let t = q_tab()
+  let first = find_substr_queue(line, t)
+  if first < 0 then
+    return ["", "", ""]
+  end
+  let rest = substr(line, first + 1, line.length - first - 1)
+  let second = find_substr_queue(rest, t)
+  if second < 0 then
+    return [substr(line, 0, first), rest, ""]
+  end
+  let id = substr(line, 0, first)
+  let status = substr(rest, 0, second)
+  let payload = substr(rest, second + 1, rest.length - second - 1)
+  return [id, status, payload]
+end
+
+make a function called find_substr_queue takes hay, needle returns idx
+  let hn = hay.length
+  let nn = needle.length
+  if nn == 0 then
+    return 0
+  end
+  let i = 0
+  while i <= hn - nn do
+    if substr(hay, i, nn) == needle then
+      return i
+    end
+    let i = i + 1
+  end
+  return -1
+end
+
+# Read a topic's log into a list of [id, status, payload] triples.
+# Returns [] if the topic has no log file yet.
+make a function called q_read takes topic returns rows
+  let path = q_file(topic)
+  if file_exists(path) != "1" then
+    return []
+  end
+  let raw = read_file(path)
+  let lines = split_lines(raw)
+  let out = []
+  let i = 0
+  let n = to_num(list_len(lines))
+  while i < n do
+    let line = str_trim(lines[i])
+    if line.length > 0 then
+      let out = list_push(out, q_parse_line(line))
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called q_write takes topic, rows returns done
+  let b = sb_new()
+  let t = q_tab()
+  let i = 0
+  let n = to_num(list_len(rows))
+  while i < n do
+    let row = rows[i]
+    sb_push(b, row[0] + t + row[1] + t + row[2] + chr(10))
+    let i = i + 1
+  end
+  write_file(q_file(topic), sb_str(b))
+  return true
+end
+
+# queue_publish(topic, payload) -> msg_id (as a string). Appends a new
+# "pending" row and writes the whole topic log back to disk.
+make a function called queue_publish takes topic, payload returns msg_id
+  let rows = q_read(topic)
+  let max_id = -1
+  let i = 0
+  let n = to_num(list_len(rows))
+  while i < n do
+    let existing = to_num(rows[i][0])
+    if existing > max_id then
+      let max_id = existing
+    end
+    let i = i + 1
+  end
+  let new_id = max_id + 1
+  let rows = list_push(rows, [new_id, "pending", payload])
+  q_write(topic, rows)
+  return new_id
+end
+
+# queue_consume(topic) -> payload of the oldest pending message, or "" if
+# none pending. Does NOT ack -- call queue_ack once the message has
+# genuinely been handled, so a crash between consume and ack leaves it
+# recoverable rather than silently lost.
+make a function called queue_consume takes topic returns payload
+  let rows = q_read(topic)
+  let i = 0
+  let n = to_num(list_len(rows))
+  while i < n do
+    let row = rows[i]
+    if row[1] == "pending" then
+      return row[2]
+    end
+    let i = i + 1
+  end
+  return ""
+end
+
+# queue_ack(topic, msg_id) -> marks the given message acked.
+make a function called queue_ack takes topic, msg_id returns done
+  let rows = q_read(topic)
+  let out = []
+  let i = 0
+  let n = to_num(list_len(rows))
+  while i < n do
+    let row = rows[i]
+    if to_num(row[0]) == to_num(msg_id) then
+      let out = list_push(out, [row[0], "acked", row[2]])
+    else
+      let out = list_push(out, row)
+    end
+    let i = i + 1
+  end
+  q_write(topic, out)
+  return true
+end
+
+# queue_pending(topic) -> list of message ids still pending. What makes the
+# queue "resumable": on a fresh process, this is simply whatever is still
+# unacked in the file -- no separate load/restore step needed.
+make a function called queue_pending takes topic returns ids
+  let rows = q_read(topic)
+  let out = []
+  let i = 0
+  let n = to_num(list_len(rows))
+  while i < n do
+    let row = rows[i]
+    if row[1] == "pending" then
+      let out = list_push(out, row[0])
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# queue_attempt(topic, payload, action) -> result of action(). Publishes an
+# intent message before calling action, acks it once action returns
+# normally. If action aborts (fatal host error -- PatLang has no
+# try/catch, this doesn't change that), the intent message stays
+# "pending" on disk for a later run to find via queue_pending and retry
+# or compensate.
+make a function called queue_attempt takes topic, payload, action returns result
+  let msg_id = queue_publish(topic, payload)
+  let result = action()
+  queue_ack(topic, msg_id)
+  return result
+end

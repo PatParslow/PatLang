@@ -1,0 +1,78 @@
+# Verifies self_hosting/lib/queue.patlang: a durable, file-backed message
+# queue with no new Rust host functions. Exercises publish/consume/ack/
+# pending, and the queue_attempt saga wrapper.
+
+include "../lib/includes.patlang"
+include "../lib/queue.patlang"
+include "../lib/test.patlang"
+
+make a function called qd_topic returns t
+  return "queue_demo_topic"
+end
+
+# check() uses ==, which doesn't do deep list comparison -- render a list
+# of ids as a comma-joined string first so equality is meaningful.
+make a function called qd_ids_str takes ids returns s
+  let b = sb_new()
+  let i = 0
+  let n = to_num(list_len(ids))
+  while i < n do
+    if i > 0 then
+      sb_push(b, ",")
+    end
+    sb_push(b, "" + ids[i])
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+make a function called qd_cleanup returns done
+  let path = q_file(qd_topic())
+  if file_exists(path) == "1" then
+    write_file(path, "")
+  end
+  return true
+end
+
+make a function called run_queue_tests returns ok
+  t_init()
+  qd_cleanup()
+
+  let topic = qd_topic()
+
+  check("empty queue has no pending", qd_ids_str(queue_pending(topic)), "")
+  check("consume on empty queue is empty string", queue_consume(topic), "")
+
+  let id0 = queue_publish(topic, "first message")
+  let id1 = queue_publish(topic, "second message")
+  check("first id is 0", id0, 0)
+  check("second id is 1", id1, 1)
+  check("pending after two publishes", qd_ids_str(queue_pending(topic)), "0,1")
+  check("consume returns oldest pending", queue_consume(topic), "first message")
+
+  queue_ack(topic, id0)
+  check("pending after ack drops acked id", qd_ids_str(queue_pending(topic)), "1")
+  check("consume now returns second message", queue_consume(topic), "second message")
+
+  queue_ack(topic, id1)
+  check("pending empty after both acked", qd_ids_str(queue_pending(topic)), "")
+  check("consume empty after both acked", queue_consume(topic), "")
+
+  # queue_attempt: successful attempt acks automatically
+  let attempt_topic = "queue_demo_attempt"
+  let path2 = q_file(attempt_topic)
+  if file_exists(path2) == "1" then
+    write_file(path2, "")
+  end
+  let ok_fn = || do
+    return "did the thing"
+  end
+  let result = queue_attempt(attempt_topic, "risky op payload", ok_fn)
+  check("queue_attempt returns fn's result", result, "did the thing")
+  check("queue_attempt acks on success", qd_ids_str(queue_pending(attempt_topic)), "")
+
+  t_report()
+  return get("__vars", "t_fail") == 0
+end
+
+run_queue_tests()

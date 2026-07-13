@@ -1,0 +1,119 @@
+# BDD-style verification of self_hosting/lib/queue.patlang, using the
+# existing Gherkin runner in self_hosting/lib/test.patlang. Complements
+# queue_demo.patlang's plain assertions with scenario-shaped coverage of
+# the queue's actual selling point: a message published but not acked
+# survives being read back by a later, independent read (standing in for
+# a process restart -- proven for real, across two separate compiled
+# binaries sharing a queue file, during this feature's manual verification;
+# expressed here as steps so it's part of the regular test suite).
+
+include "../lib/includes.patlang"
+include "../lib/queue.patlang"
+include "../lib/test.patlang"
+
+make a function called bdd_topic returns t
+  return "bdd_recovery_topic"
+end
+
+make a function called bdd_attempt_topic returns t
+  return "bdd_attempt_topic"
+end
+
+make a function called bdd_reset takes topic returns done
+  let path = q_file(topic)
+  if file_exists(path) == "1" then
+    write_file(path, "")
+  end
+  return true
+end
+
+# ---- step definitions ----
+
+make a function called st_fresh_queue returns done
+  bdd_reset(bdd_topic())
+  return true
+end
+
+make a function called st_publish_unacked returns done
+  let id = queue_publish(bdd_topic(), "checkpointed state")
+  set_var("bdd_msg_id", id)
+  return true
+end
+
+make a function called st_reread_queue returns done
+  # Stands in for a fresh process reading the same queue file: q_read
+  # itself does a full read from disk on every call, so there's no
+  # in-memory state to reset here -- the file IS the state.
+  set_var("bdd_pending_after", queue_pending(bdd_topic()))
+  return true
+end
+
+make a function called st_message_still_pending returns done
+  let pending = get("__vars", "bdd_pending_after")
+  check("recovered message is still pending after restart", to_num(list_len(pending)), 1)
+  return true
+end
+
+make a function called st_recovered_payload_matches returns done
+  let payload = queue_consume(bdd_topic())
+  check("recovered payload matches what was checkpointed", payload, "checkpointed state")
+  return true
+end
+
+make a function called st_fresh_attempt_queue returns done
+  bdd_reset(bdd_attempt_topic())
+  return true
+end
+
+make a function called st_attempt_that_completes returns done
+  let ok = || do
+    return "completed"
+  end
+  queue_attempt(bdd_attempt_topic(), "attempt payload", ok)
+  return true
+end
+
+make a function called st_attempt_leaves_nothing_pending returns done
+  let pending = queue_pending(bdd_attempt_topic())
+  check("completed attempt has nothing pending", to_num(list_len(pending)), 0)
+  return true
+end
+
+make a function called register_queue_steps returns done
+  step("a fresh queue topic", "st_fresh_queue")
+  step("a message is published and not acked", "st_publish_unacked")
+  step("the queue is read again as if by a new process", "st_reread_queue")
+  step("the message is still pending", "st_message_still_pending")
+  step("the recovered payload matches what was checkpointed", "st_recovered_payload_matches")
+  step("a fresh attempt topic", "st_fresh_attempt_queue")
+  step("a queue_attempt wrapping a function that completes normally", "st_attempt_that_completes")
+  step("nothing is left pending", "st_attempt_leaves_nothing_pending")
+  return true
+end
+
+make a function called qd_feature returns text
+  return "Feature: durable message queue
+
+Scenario: an unacked message survives a simulated process restart
+  Given a fresh queue topic
+  And a message is published and not acked
+  When the queue is read again as if by a new process
+  Then the message is still pending
+  And the recovered payload matches what was checkpointed
+
+Scenario: queue_attempt acks automatically when the wrapped action succeeds
+  Given a fresh attempt topic
+  When a queue_attempt wrapping a function that completes normally
+  Then nothing is left pending
+"
+end
+
+make a function called run_queue_bdd returns ok
+  t_init()
+  register_queue_steps()
+  run_feature(qd_feature())
+  t_report()
+  return get("__vars", "t_fail") == 0
+end
+
+run_queue_bdd()
