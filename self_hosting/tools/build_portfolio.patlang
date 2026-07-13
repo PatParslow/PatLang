@@ -34,19 +34,120 @@ include "../lib/transpile_ruby.patlang"
 print("ensuring patc1.exe is up to date...")
 exec_capture("rust-runtime/target/release/pat.exe", "--ir-run", "self_hosting/build_patc1.patlang")
 
-# Build cache: skip recompiling a demo whose source hasn't changed since
-# the last build. The cache key covers BOTH the demo's own source AND a
-# fingerprint of the compiler pipeline itself (lexer+parser+lower+codegen+
-# runtime_rs) — so changing the compiler invalidates every cached artifact,
-# while editing one demo only rebuilds that one. Delete portfolio/build/ to
-# force a full rebuild. (Orthogonal to, and independent of, patc1.exe's OWN
-# staleness check above -- that one decides whether the compiler itself
-# needs rebuilding; this one decides whether a given demo needs recompiling
-# with whatever compiler is current.)
-let COMPILER_FINGERPRINT = read_file("self_hosting/lib/lexer.patlang") + read_file("self_hosting/lib/parser.patlang") + read_file("self_hosting/lib/lower.patlang") + read_file("self_hosting/lib/codegen.patlang") + read_file("self_hosting/lib/runtime_rs.patlang")
+# Build cache: skip recompiling a demo whose source hasn't changed since the
+# last build. The cache key covers the demo's own source PLUS a fingerprint
+# of only the compiler pieces this demo could plausibly be affected by --
+# NOT one blanket hash of the whole compiler pipeline. The old scheme (hash
+# of lexer+parser+lower+codegen+runtime_rs concatenated) meant ANY compiler
+# change, anywhere, invalidated EVERY cached demo -- e.g. a Logic-chunk-only
+# change (rule_add/solve) forcing a full recompile of the CGA classifier,
+# which never calls fact/query/goal/rule_add and takes ~30+ minutes to
+# recompile through the self-hosted pipeline for no reason.
+#
+# Front-end changes (lexer/parser/lowering) are still treated as universal --
+# shared infrastructure every program goes through, and attributing precise
+# per-construct impact there would need real dataflow analysis, not worth it.
+# But runtime_rs.patlang/codegen.rs's per-chunk PRELUDE_* text (see
+# self_hosting/lib/codegen.patlang's host_chunk_of for the canonical
+# name->chunk table) only gets folded into a demo's fingerprint if that
+# demo's own source actually looks like it uses that chunk.
+#
+# Detection is a plain substring scan over the demo's raw source for the
+# SOURCE-LEVEL syntax each chunk owns (keywords/call names as a demo author
+# actually types them -- contracts in particular are written as `require`/
+# `ensure`/`assert`, never a literal call to the `contract_check` host
+# function they lower to, so the marker has to be the keyword, not the
+# runtime name). Deliberately coarse and biased toward over-inclusion,
+# mirroring codegen.rs's required_chunks' own documented "conservative, not
+# proven" stance for numeric_tower: a false-positive marker match just costs
+# one unnecessary rebuild, never a stale one, so ambiguity always resolves
+# in favor of including a chunk. "core"/"numeric_tower"/"math" are treated as
+# unconditional -- virtually every real demo touches arithmetic or a list/
+# string op, not worth the detection cost.
+#
+# Hand-maintained and parallel to codegen.patlang's host_chunk_of table --
+# if that table gains a new host function, add its source-level spelling
+# here too (same discipline as .claude/skills/mirror-check, just for cache
+# hit-rate correctness rather than compiled-output correctness: getting this
+# wrong only costs an extra rebuild, it can never serve a stale artifact,
+# since the underlying src+frontend hash still gates everything).
+let FRONTEND_FINGERPRINT = read_file("self_hosting/lib/lexer.patlang") + read_file("self_hosting/lib/parser.patlang") + read_file("self_hosting/lib/lower.patlang") + read_file("self_hosting/lib/codegen.patlang")
+
+let CHUNK_MARKERS = [
+  ["strings_ext", ["char_code(", "substr(", "chr(", "to_num(", "hash_string("]],
+  ["collections_handles", ["vec_new(", "vec_push(", "vec_set(", "vec_get(", "vec_len(", "vec_to_list(", "str_intern(", "sc_len(", "sc_code(", "sc_char(", "sb_new(", "sb_push(", "sb_str("]],
+  ["files", ["read_file(", "write_file(", "touch_file(", "file_exists(", "list_dir(", "rename_file("]],
+  ["io_misc", ["now_ms(", "byte_length(", "read_line(", "argv(", "print("]],
+  ["oo", ["make a class", "new(", "set_var(", "send("]],
+  ["logic", ["fact(", "goal(", "query(", "rule_add(", "solve(", "action_add(", "plan(", "rule ", ":-"]],
+  ["contracts", ["require ", "ensure ", "assert "]],
+  ["networking", ["tcp_listen(", "tcp_connect(", "tcp_accept(", "tcp_read(", "tcp_write(", "tcp_close(", "sleep_ms("]],
+  ["codegen_bootstrap", ["exec_capture(", "compile_shape(", "compile_ir(", "run_ir(", "rustc_build(", "codegen_prelude("]]
+]
+
+make a function called str_contains takes haystack, needle returns found
+  let hlen = len(haystack)
+  let nlen = len(needle)
+  if nlen == 0 then
+    return true
+  end
+  if nlen > hlen then
+    return false
+  end
+  let limit = hlen - nlen
+  let i = 0
+  let found = false
+  while i <= limit do
+    if found == false then
+      if substr(haystack, i, nlen) == needle then
+        let found = true
+      end
+    end
+    let i = i + 1
+  end
+  return found
+end
+
+make a function called required_chunk_names takes src returns names
+  let names = ["core", "numeric_tower", "math"]
+  let ci = 0
+  while ci < CHUNK_MARKERS.length do
+    let entry = CHUNK_MARKERS[ci]
+    let chunk = entry[0]
+    let markers = entry[1]
+    let mi = 0
+    let hit = false
+    while mi < markers.length do
+      if hit == false then
+        if str_contains(src, markers[mi]) then
+          let hit = true
+        end
+      end
+      let mi = mi + 1
+    end
+    if hit then
+      if list_contains(names, chunk) == false then
+        let names = list_push(names, chunk)
+      end
+    end
+    let ci = ci + 1
+  end
+  return names
+end
+
+make a function called chunk_fingerprint takes names returns fp
+  let fp = ""
+  let i = 0
+  while i < names.length do
+    let fp = fp + codegen_prelude_chunk(names[i])
+    let i = i + 1
+  end
+  return fp
+end
 
 make a function called cache_key takes src returns key
-  return hash_string(src + COMPILER_FINGERPRINT)
+  let chunks = required_chunk_names(src)
+  return hash_string(src + FRONTEND_FINGERPRINT + chunk_fingerprint(chunks))
 end
 
 make a function called cache_valid takes id, src returns valid
@@ -81,6 +182,26 @@ make a function called patc1_compile takes src, id, out_path, target returns don
   return true
 end
 
+# The native and wasm targets for one demo are fully independent compiles
+# (same source, different out_path/target passed to patc1_compile, which
+# shells out to a fresh ./patc1.exe subprocess each time) -- so they run
+# concurrently via parallel_map's real OS threads instead of back-to-back,
+# roughly halving this demo's wall-clock compile time whenever both targets
+# are actually stale. "playground" (the shared WASM module behind every
+# demo_page's "run in this browser" button) is by far the biggest user of
+# compile_both, so this is where it matters most. Both threads write the
+# SAME scratch file (portfolio/build/<id>.patlang, identical content) --
+# harmless: it's the same bytes either way, and each thread only reads
+# ./patc1.exe's own out_path afterward, never the scratch file.
+make a function called compile_both_target takes job returns done
+  let src = job[0]
+  let id = job[1]
+  let out_path = job[2]
+  let target = job[3]
+  patc1_compile(src, id, out_path, target)
+  return true
+end
+
 make a function called compile_both takes src, id returns wasmb64
   let wasm_path = "portfolio/build/" + id + ".wasm"
   let exe_path = "portfolio/build/" + id + ".exe"
@@ -88,8 +209,8 @@ make a function called compile_both takes src, id returns wasmb64
     print("[cache] " + id + " unchanged, skipping rebuild")
     return read_file_b64(wasm_path)
   end
-  patc1_compile(src, id, exe_path, "")
-  patc1_compile(src, id, wasm_path, "wasm32-wasip1")
+  let jobs = [[src, id, exe_path, ""], [src, id, wasm_path, "wasm32-wasip1"]]
+  parallel_map(jobs, "compile_both_target")
   save_cache(id, src)
   return read_file_b64(wasm_path)
 end
@@ -656,6 +777,37 @@ compile_native(contracts_src, "contracts")
 let contracts_native = exec_capture("portfolio/build/contracts.exe")
 print("contracts done")
 
+# ---- goal-oriented paradigm: real backward-chaining (rule_add/solve) +
+# GOAP planning (action_add/plan) + contracts-as-facts, replacing the old
+# flat fact/goal/query trio.
+let goal_oriented_src = read_file("self_hosting/examples/goal_oriented_build_demo.patlang")
+compile_native(goal_oriented_src, "goaloriented")
+let goal_oriented_native = exec_capture("portfolio/build/goaloriented.exe")
+print("goal-oriented demo done")
+
+# ---- bitwise operators (band/bor/bxor/bnot/shl/shr) + bitfield helpers
+# (bit_get/bit_set/bit_slice/bit_set_slice).
+let bitwise_src = read_file("self_hosting/examples/bitwise_bitfield_demo.patlang")
+compile_native(bitwise_src, "bitwise")
+let bitwise_native = exec_capture("portfolio/build/bitwise.exe")
+print("bitwise demo done")
+
+# ---- real declarative `rule Head(args) :- Body1, Body2.` syntax, sugar
+# over the same rule_add/solve backend as the goal-oriented demo above.
+let rulesyntax_src = read_file("self_hosting/examples/rule_syntax_demo.patlang")
+compile_native(rulesyntax_src, "rulesyntax")
+let rulesyntax_native = exec_capture("portfolio/build/rulesyntax.exe")
+print("rule syntax demo done")
+
+# ---- virtual filesystem: vfs_read/write/exists/list/delete work on every
+# target including WASM (see this page's live "run in browser" button);
+# vfs_flush_to_disk (native-only, not exercised in this demo's main flow)
+# is the explicit, security-gated write-through to the real filesystem.
+let vfsdemo_src = read_file("self_hosting/examples/vfs_demo.patlang")
+compile_native(vfsdemo_src, "vfsdemo")
+let vfsdemo_native = exec_capture("portfolio/build/vfsdemo.exe")
+print("vfs demo done")
+
 # User-defined DSL demo: `syntax RouterDSL { ... }` + `routes { ... }` blocks
 # in self_hosting/examples/router_dsl_demo.patlang are expanded to plain
 # `register_route(...)` calls by self_hosting/lib/syntax_dsl.patlang (a
@@ -1153,6 +1305,14 @@ print("wrote portfolio/demos/playground.html")
 demo_page("pos", "Point of sale (events + OO + logic)", "A checkout session as a stream of <code>scan</code>/<code>pay</code> events: the product catalog lives in the object store, and a <code>dairy</code> fact drives the discount rule.", pos_src, pos_native, pg_b64)
 demo_page("postests", "BDD framework: unit, integration, Gherkin", "PatLang's own self-hosted Gherkin-style BDD framework (<code>lib/test.patlang</code>: <code>t_init</code>/<code>check</code>/<code>step</code>/<code>run_feature_tagged</code>), running against the point of sale: unit assertions, event-driven integration checks, and a Gherkin feature whose steps dispatch through <code>apply</code>. The same framework drives PatLang's own self-hosted regression suites (<code>self_hosting/reflect_transpile_selftest.patlang</code>, <code>self_hosting/examples/pos_tests.patlang</code>), each wired into <code>cargo test</code> via a thin Rust cucumber step that just asserts on this framework's own <code>ALL TESTS PASSED</code> output.", post_src, post_native, pg_b64)
 demo_page("contracts", "Design by contract: require / ensure / assert", "<code>require</code> checks a precondition, <code>ensure</code> a postcondition, and <code>assert</code> is the same primitive used standalone &mdash; all three lower to one <code>contract_check</code> host call, enforced identically whether interpreted, run here via WASM (no rustc at all), or compiled natively. The last line deliberately violates a precondition so you can see enforcement fire.", contracts_src, contracts_native, pg_b64)
+
+demo_page("goaloriented", "Goal-oriented programming: real backward chaining + GOAP planning", "PatLang's goal-oriented paradigm is genuinely real, not a facade: <code>rule_add</code>/<code>solve</code> do actual SLD-style backward-chaining resolution with backtracking (a ground fact is just a rule with an empty body &mdash; the standard Prolog trick), and <code>action_add</code>/<code>plan</code> is a real GOAP planner, doing uniform-cost forward search over actions with preconditions/effects/cost to find the cheapest ordered plan &mdash; not just picking the first path that works. A successful <code>require</code>/<code>ensure</code> check also asserts a <code>contract_holds</code> fact, so design-by-contract checks feed directly into either engine. This demo derives whether a build target is buildable via a genuine multi-hop dependency chain, and separately produces a real 3-step build plan that correctly prefers a cheaper path over a pricier shortcut.", goal_oriented_src, goal_oriented_native, pg_b64)
+
+demo_page("bitwise", "Bitwise operators & bitfields", "Word-form keyword operators &mdash; <code>band</code>/<code>bor</code>/<code>bxor</code>/<code>bnot</code>/<code>shl</code>/<code>shr</code> &mdash; rather than C-style symbols: <code>|</code> and <code>&amp;</code> are already taken by the <code>|&gt;</code> pipeline operator and <code>|params|</code> closure syntax, and PatLang already spells <code>and</code>/<code>or</code>/<code>not</code> as words, so this follows the language's own convention instead of importing symbols that don't fit. Plus four bitfield helpers &mdash; <code>bit_get</code>/<code>bit_set</code>/<code>bit_slice</code>/<code>bit_set_slice</code> &mdash; for packed-integer field access without needing a struct/type system. This demo packs four byte-sized fields into one integer two different ways (via <code>shl</code>/<code>bor</code> directly, and via <code>bit_set_slice</code>) and confirms they agree, then demonstrates flag set/clear/toggle/test.", bitwise_src, bitwise_native, pg_b64)
+
+demo_page("rulesyntax", "Declarative syntax: rule Head(args) :- Body1, Body2.", "The parser has recognized <code>rule ... :- ...</code> syntax for a long time &mdash; it just silently discarded it as a no-op. This makes it real: pure sugar over the same <code>rule_add</code>/<code>solve</code> backend as the goal-oriented demo above, so <code>rule buildable(X) :- unchanged(X).</code> and <code>rule buildable(X) :- dep(X, Y), buildable(Y).</code> now actually declare rules, not decoration. Verified byte-identical against the hand-written <code>rule_add(...)</code> function-call form it desugars to.", rulesyntax_src, rulesyntax_native, pg_b64)
+
+demo_page("vfsdemo", "Virtual filesystem: works in the browser too", "<code>vfs_read</code>/<code>vfs_write</code>/<code>vfs_exists</code>/<code>vfs_list</code>/<code>vfs_delete</code> are an in-memory filesystem available on every target &mdash; including WASM, unlike <code>read_file</code>/<code>write_file</code>, which are real (native-only) disk I/O. Try the <em>Compile and run in this browser</em> button below: this demo runs entirely inside the WASM sandbox with no real filesystem access at all. A separate, explicit, native-only <code>vfs_flush_to_disk</code> (not exercised here) write-throughs to real files, gated by an allowed-root check.", vfsdemo_src, vfsdemo_native, pg_b64)
 demo_page("towerdemo", "Numeric Tower: BigInt, Rational, Complex", "Ordinary <code>Int</code> arithmetic stays on the fast path until it can't: <code>factorial(30)</code> overflows a 64-bit integer partway through and the runtime silently promotes to an exact, arbitrary-precision <code>BigInt</code> &mdash; no annotation, no wraparound, no lost digits. <code>10 / 3</code> doesn't divide evenly, so instead of quietly rounding to a float it promotes to an exact <code>Rational</code> and prints <code>10/3</code>. <code>sqrt</code> of a negative number produces a <code>Complex</code> value. The last two lines call into <code>self_hosting/lib/math.patlang</code> (<code>hypot</code>, <code>is_prime</code>, <code>mean</code>), a small PatLang-authored library built entirely on top of a handful of <code>Host::</code> primitives (<code>sqrt</code>/<code>floor</code>/<code>abs</code>/<code>numeric_kind</code>) &mdash; the hybrid design that keeps the primitive surface small while still growing a real standard library. This card runs on the exact same in-browser WASM playground engine as the demos above (no rustc needed to try it live); the compiled path's arithmetic is exact because the emitted Rust program carries its own hand-rolled limb-based BigInt/Rational/Complex implementation rather than depending on a crate (compiled programs are single-file <code>rustc</code> invocations with no <code>Cargo.toml</code>), and a cross-implementation test in the Rust test suite verifies that hand-rolled bignum arithmetic is byte-identical, operation for operation, to the interpreter's own <code>num-bigint</code>-crate-based arithmetic &mdash; two independent implementations kept honest against each other.", tower_src, tower_native, pg_b64)
 demo_page("routerdsl", "User-defined DSL: routes { ... }", "A small grammar extension declared entirely in PatLang source (<code>syntax RouterDSL { trigger; tokens { ... }; rule { ... } }</code>), matching HTTP-verb/URL-path tokens with a general-purpose regex engine also written in PatLang (<code>lib/regex_dsl.patlang</code>). A source-to-source preprocessing pass (<code>lib/syntax_dsl.patlang</code>) expands every <code>routes { ... }</code> block into plain <code>register_route(...)</code> calls before the ordinary compiler ever sees them &mdash; run here via the same in-browser WASM playground engine as the demos above (no rustc at all), or compiled natively below.", router_raw, router_native, pg_b64)
 # Threading demo: real parallel_map + a purely-illustrative, honestly-
@@ -1627,6 +1787,10 @@ let demo_links = [
   ["pos", "Point of sale (events + OO + logic)"],
   ["postests", "BDD framework: unit, integration, Gherkin"],
   ["contracts", "Design by contract"],
+  ["goaloriented", "Goal-oriented: backward chaining + GOAP"],
+  ["bitwise", "Bitwise operators & bitfields"],
+  ["rulesyntax", "Declarative rule syntax"],
+  ["vfsdemo", "Virtual filesystem"],
   ["towerdemo", "Numeric Tower: BigInt, Rational, Complex"],
   ["routerdsl", "User-defined DSL: routes { ... }"],
   ["dynsyntax", "Dynamic syntax: grammar extensions as runtime data"],

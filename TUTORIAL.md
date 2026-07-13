@@ -83,6 +83,28 @@ Operators: `+ - * / %`, comparisons `== != < <= > >=` (strings compare
 lexicographically), boolean `and` / `or` / `not`, unary `-`. Statements are
 separated by newlines or `;`. Comments start with `#`.
 
+Bitwise operators are word-form keywords, not C-style symbols: `|` and `&`
+are already taken (the `|>` pipeline operator, `|params|` closure syntax),
+and PatLang already spells `and`/`or`/`not` as words rather than
+`&&`/`||`/`!`, so this follows that convention instead of importing symbols
+that don't fit.
+
+```patlang
+let flags = 0
+let flags = flags band bnot 4     # clear bit 2
+let flags = flags bor (1 shl 5)   # set bit 5
+print(bit_get(flags, 5))          # 1
+```
+
+`band`/`bor`/`bxor`/`bnot`/`shl`/`shr` operate on integers only. `shl`/`shr`
+bind tighter than `+`/`-` but looser than `*`/`/`/`%`; `band`/`bxor`/`bor`
+share a single combined precedence tier (parenthesize mixed expressions if
+a specific grouping matters). Four bitfield helpers give packed-integer
+field access without a struct/type system: `bit_get(n, pos)`,
+`bit_set(n, pos, val)`, `bit_slice(n, start, width)`,
+`bit_set_slice(n, start, width, val)`. See
+`self_hosting/examples/bitwise_bitfield_demo.patlang`.
+
 ### Control flow
 
 ```patlang
@@ -159,12 +181,61 @@ inside a handler, `event_name` and `event_data` are bound.
 
 ### Logic / goal-oriented
 
+The original `fact`/`query`/`goal` trio is a flat, count-only lookup table
+kept for backward compatibility. The real paradigm is two genuine engines
+underneath, plus design-by-contract feeding into both:
+
+**Backward chaining** (`rule_add`/`solve`) — real SLD-style resolution
+with backtracking, not a lookup. A ground fact is just a rule with an
+empty body (the standard Prolog trick), so any arity is supported:
+
 ```patlang
 fact("parent", "alice", "bob")
 fact("parent", "alice", "carol")
-print(query("parent", "alice", 0))   # 2 — counts matching facts
-goal("reunite", "alice")             # records a pending goal
+print(query("parent", "alice", 0))   # 2 — counts matching facts (legacy trio)
+goal("reunite", "alice")             # records a pending goal (legacy trio, unread)
+
+# rule_add/solve: the real thing. A rule with an empty body is a fact.
+rule_add("dep", ["a", "b"], [])
+rule_add("dep", ["b", "c"], [])
+rule_add("unchanged", ["c"], [])
+rule_add("buildable", ["X"], [["unchanged", ["X"]]])
+rule_add("buildable", ["X"], [["dep", ["X", "Y"]], ["buildable", ["Y"]]])
+let sols = solve("buildable", ["a"])   # [["a"]] -- resolves through a->b->c
 ```
+
+Real declarative syntax exists too, as pure sugar over the same
+`rule_add`/`solve` calls above:
+
+```patlang
+rule dep(a, b).
+rule dep(b, c).
+rule unchanged(c).
+rule buildable(X) :- unchanged(X).
+rule buildable(X) :- dep(X, Y), buildable(Y).
+let sols = solve("buildable", ["a"])
+```
+
+**GOAP planning** (`action_add`/`plan`) — forward search over actions with
+preconditions/effects/cost, producing a real cost-optimal ordered plan
+(not just the first path that works):
+
+```patlang
+action_add("compile_b", [], [["compiled", ["b"]]], [], 5)
+action_add("compile_a", [["compiled", ["b"]]], [["compiled", ["a"]]], [], 3)
+action_add("link", [["compiled", ["a"]], ["compiled", ["b"]]], [["shipped", []]], [], 2)
+let build_plan = plan([["shipped", []]])   # ["compile_b", "compile_a", "link"]
+```
+
+A successful `require`/`ensure`/`assert` check also asserts a
+`contract_holds` fact automatically, so verified contracts become
+ordinary derivable data usable as a rule-body conjunct or GOAP
+precondition. See `self_hosting/examples/goal_oriented_build_demo.patlang`
+and `self_hosting/examples/rule_syntax_demo.patlang`.
+
+Deliberately not (yet) real: `goal name { ... }` block syntax still
+silently no-ops — unlike `rule`, there's no unambiguous mapping onto
+`solve`/`plan` (named query? GOAP action? imperative body?).
 
 ### Object-oriented
 
@@ -313,7 +384,30 @@ two real requests then stops itself.
 
 ### Files
 
-`read_file(path)` returns a file's contents as a string.
+`read_file(path)` returns a file's contents as a string; `write_file`,
+`file_exists`, `list_dir`, `rename_file` round out real disk I/O. These are
+native-only (real `std::fs`) — not excluded from WASM builds outright, but
+not reliably usable there either.
+
+### Virtual filesystem
+
+`vfs_read(path)` / `vfs_write(path, contents)` / `vfs_exists(path)` /
+`vfs_list(prefix)` / `vfs_delete(path)` are an in-memory filesystem
+available on **every** target, including WASM — deliberately different
+function names from `read_file`/`write_file` rather than the same names
+silently switching behavior by target.
+
+```patlang
+vfs_write("notes/todo.txt", "write the vfs demo")
+print(vfs_exists("notes/todo.txt"))   # 1
+print(vfs_read("notes/todo.txt"))     # write the vfs demo
+```
+
+`vfs_flush_to_disk(vfs_path_prefix, real_dir)` is the one explicit,
+native-only write-through to real files — a hard error under WASM, and
+gated by an allowed-root check (`PATLANG_VFS_ALLOWED_ROOT` env var,
+defaulting to the current working directory) so it can't write outside a
+permitted tree. See `self_hosting/examples/vfs_demo.patlang`.
 
 ## 5. Design by contract
 
@@ -550,14 +644,26 @@ full rebuild. Delete `portfolio/build/` to force a clean rebuild regardless.
 - Functions are not yet first-class closures; pass function names and invoke
   with `apply(name, ...)`. Lexical closures are the next major IR feature
   (see `PATLANG_SELF_HOSTING_ROADMAP.md`).
-- Concurrency is cooperative: the event loop (section 4, Async) is
-  single-threaded like JavaScript's. There are no OS threads in the language
-  yet — which is also why the object/fact/event-handler stores being
-  per-thread is unobservable in practice.
+- `goal name { ... }` declarative block syntax still silently no-ops (unlike
+  `rule`, discussed in section 4, which is now real) — no unambiguous
+  mapping onto the `solve`/`plan` backend has been designed yet.
+- GOAP planning (`action_add`/`plan`) is ground-only for now — no logic
+  variables in actions/preconditions/effects. Parameterized actions
+  (instantiated per-target) are a natural follow-on, not needed for a
+  working planner today.
+- `vfs_flush_to_disk`'s write-through has not been exercised under a live
+  `wasmtime`/browser WASM run — only compile-time verified that the correct
+  target-specific code path is selected.
 - Compiling is fast; *self*-compiling takes minutes because rustc digests the
   ~1 MB emitted compiler. `patc` output is unoptimized for size (WASM modules
   ~2 MB); `strip`/`opt-level=s` support is on the roadmap.
 
 Fixed since earlier versions: string escapes (`\n \t \r \" \\`) now work in
 the Stage 1 dialect, and `and`/`or` short-circuit in Stage-1-compiled code
-exactly as in Stage 0.
+exactly as in Stage 0. Real OS threads now exist (fibers, `parallel_map`,
+and threaded WASM via `wasm32-wasip1-threads`) — the event/object/logic
+stores are shared across threads where correctness requires it (e.g.
+`rule_add`'s rule store, GOAP's action store, the virtual filesystem),
+not silently per-thread. `fact`/`query`/`goal` are now backed by real
+backward-chaining (`rule_add`/`solve`) and GOAP planning (`action_add`/
+`plan`), not just a flat lookup table (section 4).
