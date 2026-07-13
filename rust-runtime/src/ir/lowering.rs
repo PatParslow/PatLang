@@ -268,7 +268,7 @@ impl Lowerer {
             "vec_new"|"vec_push"|"vec_set"|"vec_get"|"vec_len"|"vec_to_list"|"sb_new"|"sb_push"|"sb_str"|
             "str_intern"|"sc_len"|"sc_code"|"sc_char"|"now_ms"|"read_line"|"byte_length"|"read_file_b64"|"exec_capture"|
             "fact"|"query"|"goal"|"new"|"set_var"|"apply"|
-            "tcp_listen"|"tcp_connect"|"tcp_accept"|"tcp_accept_timeout"|"sleep_ms"|"tcp_read"|"tcp_write"|"tcp_close"|
+            "tcp_listen"|"tcp_try_listen"|"tcp_connect"|"tcp_accept"|"tcp_accept_timeout"|"sleep_ms"|"tcp_read"|"tcp_write"|"tcp_close"|
             "sqrt"|"pow"|"sin"|"cos"|"tan"|"asin"|"acos"|"atan"|"atan2"|"log"|"exp"|
             "floor"|"ceil"|"round"|"trunc"|"abs"|"numeric_kind"|"type_of"|
             "parallel_map"|"fiber_new"|"fiber_resume"|"fiber_yield"|"fiber_alive"|

@@ -1570,6 +1570,30 @@ pub fn host_tcp_listen(args: &[Value]) -> Result<Value, String> {
     Ok(Value::Int(actual as i64))
 }
 
+// tcp_try_listen(port) -> port_id, or -1 specifically if the port is
+// already bound by another process. PatLang has no try/catch, so
+// tcp_listen's ordinary bind failure is fatal (an Err aborts the whole
+// program) -- there was no way for a program to gracefully ask "is
+// something already listening here" without this. Built for the signals
+// library (self_hosting/lib/signals.patlang): a second invocation trying
+// to claim the same port is exactly how it detects "a primary instance is
+// already running" and should send a signal instead of becoming primary
+// itself. Any OTHER bind failure (invalid port, permission denied, etc.)
+// still propagates as a fatal error, same as plain tcp_listen -- only
+// AddrInUse is treated as the graceful, expected case.
+pub fn host_tcp_try_listen(args: &[Value]) -> Result<Value, String> {
+    let port = arg_num(args, 0, "tcp_try_listen")? as u16;
+    match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(listener) => {
+            let actual = listener.local_addr().map_err(|e| format!("tcp_try_listen: {}", e))?.port();
+            LISTENERS.with(|l| l.borrow_mut().insert(actual, listener));
+            Ok(Value::Int(actual as i64))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Ok(Value::Int(-1)),
+        Err(e) => Err(format!("tcp_try_listen: bind {}: {}", port, e)),
+    }
+}
+
 pub fn host_tcp_connect(args: &[Value]) -> Result<Value, String> {
     // tcp_connect(host, port) -> Number connection id (blocks until connected)
     let host = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => return Err("tcp_connect: expected host string".into()) };
@@ -2051,6 +2075,7 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("send", host_send);
     // networking
     interp.host.insert("tcp_listen", host_tcp_listen);
+    interp.host.insert("tcp_try_listen", host_tcp_try_listen);
     interp.host.insert("tcp_connect", host_tcp_connect);
     interp.host.insert("tcp_accept", host_tcp_accept);
     interp.host.insert("tcp_accept_timeout", host_tcp_accept_timeout);

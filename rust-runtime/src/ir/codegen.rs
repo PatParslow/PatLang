@@ -147,6 +147,7 @@ const HOST_CHUNK_TABLE: &[(&str, ChunkId)] = &[
     ("plan", ChunkId::Logic),
     ("contract_check", ChunkId::Contracts),
     ("tcp_listen", ChunkId::Networking),
+    ("tcp_try_listen", ChunkId::Networking),
     ("tcp_connect", ChunkId::Networking),
     ("tcp_accept", ChunkId::Networking),
     ("sleep_ms", ChunkId::Networking),
@@ -3077,6 +3078,23 @@ fn host_call_networking_inner(name: &str, args: &[Value]) -> Result<Value, Strin
                 LISTENERS.with(|l| l.borrow_mut().insert(actual, listener));
                 Ok(Value::Number(actual as f64))
             }
+            "tcp_try_listen" => {
+                // tcp_try_listen(port) -> Number port_id, or -1 specifically
+                // if the port is already bound elsewhere -- see hosts.rs's
+                // host_tcp_try_listen for the full rationale (PatLang has no
+                // try/catch, so this is the only graceful way a program can
+                // ask "is something already listening here").
+                let port = arg_num(&args, 0, "tcp_try_listen")? as u16;
+                match std::net::TcpListener::bind(("127.0.0.1", port)) {
+                    Ok(listener) => {
+                        let actual = listener.local_addr().map_err(|e| format!("tcp_try_listen: {}", e))?.port();
+                        LISTENERS.with(|l| l.borrow_mut().insert(actual, listener));
+                        Ok(Value::Number(actual as f64))
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Ok(Value::Number(-1.0)),
+                    Err(e) => Err(format!("tcp_try_listen: bind {}: {}", port, e)),
+                }
+            }
             "tcp_connect" => {
                 // tcp_connect(host, port) -> Number connection id (blocks until connected)
                 let host = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => return Err("tcp_connect: expected host string".into()) };
@@ -3177,7 +3195,7 @@ fn host_call_networking_inner(name: &str, args: &[Value]) -> Result<Value, Strin
 
 fn host_call_networking(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match name {
-        "tcp_listen" | "tcp_connect" | "tcp_accept" | "sleep_ms" | "tcp_accept_timeout" | "tcp_read" | "tcp_write" | "tcp_close" => Some(host_call_networking_inner(name, args)),
+        "tcp_listen" | "tcp_try_listen" | "tcp_connect" | "tcp_accept" | "sleep_ms" | "tcp_accept_timeout" | "tcp_read" | "tcp_write" | "tcp_close" => Some(host_call_networking_inner(name, args)),
         _ => None,
     }
 }

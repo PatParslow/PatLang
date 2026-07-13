@@ -64,6 +64,32 @@ let conn = tcp_connect("127.0.0.1", 1)
 }
 
 #[test]
+fn tcp_try_listen_returns_the_port_when_free() {
+    let src = r#"
+let port_id = tcp_try_listen(0)
+print("" + (port_id >= 0))
+"#;
+    let out = run(src).expect("tcp_try_listen on a free (OS-assigned) port should succeed");
+    assert_eq!(out, vec!["true"]);
+}
+
+#[test]
+fn tcp_try_listen_returns_minus_one_when_already_bound() {
+    // The whole reason tcp_try_listen exists: PatLang has no try/catch, so
+    // plain tcp_listen's bind failure is fatal -- there was no way for a
+    // program to gracefully ask "is another process already listening
+    // here" (the primary-vs-secondary detection self_hosting/lib/
+    // signals.patlang relies on) without a non-panicking variant.
+    let src = r#"
+let held = tcp_listen(0)
+let second = tcp_try_listen(held)
+print("" + second)
+"#;
+    let out = run(src).expect("tcp_try_listen should not error when the port is already bound");
+    assert_eq!(out, vec!["-1"]);
+}
+
+#[test]
 fn byte_length_counts_utf8_bytes_not_chars() {
     // chr(233) builds the single Unicode character U+00E9 (e-acute), which
     // is 1 char but 2 UTF-8 bytes when the string is encoded - a controlled

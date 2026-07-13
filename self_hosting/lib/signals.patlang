@@ -1,0 +1,117 @@
+# Runtime signals for PatLang programs: a running process can receive a
+# named signal + optional payload from OUTSIDE itself -- a second CLI
+# invocation ("server.exe --quit" sent to an already-running server, not a
+# second server starting up), or a local network call. Delivery reuses
+# tcp_connect/tcp_read/tcp_write/tcp_close exactly as they already existed,
+# and dispatch reuses the existing when/emit event mechanism (see
+# self_hosting/examples/event_loop_server.patlang) -- a signal just becomes
+# an emit() call, so any `when <name> do ... end` handler already in the
+# receiving program fires normally, no new handler concept needed.
+#
+# The trick this relies on: tcp_listen binds 127.0.0.1 only (hosts.rs's
+# host_tcp_listen -- not configurable, not a new restriction added here),
+# and a second bind to the SAME port simply fails. That failure IS the "is
+# a primary already running" detector, for free -- no separate lockfile/
+# PID-file mechanism needed (PatLang has none today; this doesn't add one).
+# The one genuinely new host function this needed: tcp_try_listen(port) ->
+# port_id or -1 on AddrInUse specifically, rather than tcp_listen's fatal-
+# on-any-bind-failure behavior -- PatLang has no try/catch, so there was no
+# way to gracefully ask "is something already listening" without it. See
+# hosts.rs's host_tcp_try_listen for the full rationale.
+#
+# Usage shape (see self_hosting/examples/signals_demo.patlang for a full
+# worked example):
+#   let port_id = signal_claim(9401)
+#   if port_id >= 0 then
+#     # primary: hold the port, poll it inside your own event loop
+#     when quit do ... end
+#     while running do
+#       ... your own work ...
+#       signal_poll(port_id, 20)   # cheap, non-blocking; fires when/emit
+#     end
+#   else
+#     # secondary: someone else already owns this port -- deliver instead
+#     signal_send(9401, "quit", "")
+#   end
+#
+# Deliberately minimal wire format (one line: "name\npayload", a single
+# write + a single read, no length-prefix framing) -- matches this
+# codebase's existing pragmatic style for small local control messages
+# (see event_loop_server.patlang's own plain HTTP-ish read/write), not
+# meant for large payloads. Localhost-only by construction (see above), so
+# no separate auth story yet -- a real network-facing signal listener would
+# need one before ever binding beyond 127.0.0.1; out of scope here, same as
+# this feature's own backlog note said from the start.
+
+# signal_claim(port) -> port_id (>= 0) if this process is now the primary
+# holder of `port` for signal delivery, or -1 if another process already
+# holds it (the caller should treat that as "an instance is already
+# running" and typically call signal_send instead). Uses tcp_try_listen,
+# NOT plain tcp_listen -- PatLang has no try/catch, so tcp_listen's bind
+# failure is a FATAL error (would abort the whole program), not something
+# this function could catch and turn into a graceful -1. tcp_try_listen
+# was added specifically for this: -1 only for "already in use", any other
+# bind failure (invalid port, permission denied) still aborts, same as
+# plain tcp_listen would.
+make a function called signal_claim takes port returns port_id
+  return tcp_try_listen(port)
+end
+
+# signal_poll(port_id, timeout_ms) -> the signal name received this call,
+# or "" if none arrived within timeout_ms. On receipt, also calls
+# emit(name, payload) so any `when name do ... end` handler in the calling
+# program fires immediately -- callers that only need "did something
+# arrive" can ignore the return value and rely purely on their own `when`
+# handlers, matching event_loop_server.patlang's existing emit-driven style.
+make a function called signal_poll takes port_id, timeout_ms returns name
+  let conn = tcp_accept_timeout(port_id, timeout_ms)
+  if conn < 0 then
+    return ""
+  end
+  let msg = tcp_read(conn)
+  tcp_close(conn)
+  let nl = find_substr_signals(msg, chr(10))
+  let sig_name = msg
+  let payload = ""
+  if nl >= 0 then
+    let sig_name = substr(msg, 0, nl)
+    let payload = substr(msg, nl + 1, msg.length - nl - 1)
+  end
+  emit(sig_name, payload)
+  return sig_name
+end
+
+# signal_send(port, name, payload) -> true once delivered. Only call this
+# after signal_claim(port) has already told you a primary holds the port
+# (the intended usage shape above) -- PatLang has no try/catch, so unlike
+# signal_claim (which checks tcp_listen's own -1-on-failure return),
+# tcp_connect raises a FATAL host-function error if nothing is listening,
+# not a value this function could catch and turn into a graceful `false`.
+# In practice this only matters for the narrow race where the primary
+# exits between your signal_claim failing and this call running -- if that
+# happens the caller sees a clear "tcp_connect: ... connection refused"
+# error and the process aborts, which is an honest failure mode for a
+# fire-and-forget CLI signal, not a silent no-op.
+make a function called signal_send takes port, name, payload returns delivered
+  let conn = tcp_connect("127.0.0.1", port)
+  tcp_write(conn, name + chr(10) + payload)
+  tcp_close(conn)
+  return true
+end
+
+# Tiny local substring search -- self-contained rather than depending on
+# whichever example/tool happens to define one, since this is a shared
+# library other programs `include`.
+make a function called find_substr_signals takes hay, needle returns idx
+  if needle.length == 0 then
+    return 0
+  end
+  let i = 0
+  while i <= (hay.length - needle.length) do
+    if substr(hay, i, needle.length) == needle then
+      return i
+    end
+    let i = i + 1
+  end
+  return -1
+end
