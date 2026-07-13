@@ -801,6 +801,136 @@ make a function called hexrts_page takes hexrts_b64 returns done
   return true
 end
 
+# sql_console_page: a live SQL console with a tabbed data browser. Type a
+# statement, press Enter/Run; the RESULT section (OK/ERROR/row data) shows
+# in the output panel, and the tab bar (one tab per table that currently
+# exists) shows the FULL current contents of whichever table is selected --
+# parsed straight out of the compiled program's own STATE section
+# (self_hosting/lib/rdbms.patlang's rdb_serialize already emits every
+# table's full schema+rows every call, so no second query is needed just
+# to refresh the tab view). Same "carry the whole snapshot forward"
+# browser state model as the hex RTS -- see self_hosting/lib/rdbms.patlang
+# and self_hosting/examples/sql_console_main.patlang's own headers for why.
+# is_native is always '0' here: there's no real filesystem to flush a
+# COMMIT to inside the WASM sandbox -- self_hosting/examples/rdbms_demo.patlang
+# is where COMMIT's native disk-flush path is actually exercised.
+make a function called sql_console_page takes sql_console_b64 returns done
+  let sections = [tpl_para("A small transactional SQL database, running entirely in this tab. Type a statement and press Enter or Run -- try <code>CREATE TABLE people (id INT, name STRING, age INT)</code>, then <code>INSERT INTO people VALUES (1, 'alice', 30)</code>, then <code>SELECT * FROM people WHERE age &gt; 20</code>. <code>BEGIN</code>/<code>COMMIT</code>/<code>ROLLBACK</code> work too -- try inserting a row inside a transaction, then <code>ROLLBACK</code> and see it vanish. The tabs below always show a table's FULL current contents, independent of whatever your last SELECT filtered to. See the <a href='patlang-paradigms.html'>Paradigms Guide</a> and <code>self_hosting/lib/rdbms.patlang</code>/<code>sql.patlang</code> for the design: CSV-backed tables over the existing virtual filesystem, single-writer transactions (no real concurrency control exists to build on), and a hand-rolled SQL tokenizer/parser/executor -- all plain PatLang, no new Rust.")]
+  let sections = list_push(sections, tpl_raw("<input id='sql-input' type='text' style='width:100%;font-family:monospace' placeholder=\"CREATE TABLE people (id INT, name STRING, age INT)\" onkeydown='sqlKeydown(event)'>"))
+  let sections = list_push(sections, tpl_raw("<p><button onclick='sqlSubmit()'>Run</button></p>"))
+  let sections = list_push(sections, tpl_raw("<pre id='sql-result' class='out'>Ready.</pre>"))
+  let sections = list_push(sections, tpl_raw("<div id='sql-tabs'></div>"))
+  let sections = list_push(sections, tpl_raw("<div id='sql-table' class='out'></div>"))
+  let js = sb_new()
+  sb_push(js, "const WASMS = { sqlconsole: '" + sql_console_b64 + "' };" + nl())
+  runwasm_only_js(js)
+  sb_push(js, "let currentDbText = '';" + nl())
+  sb_push(js, "let tablesMap = {};" + nl())
+  sb_push(js, "let activeTable = null;" + nl())
+  sb_push(js, "function parseOutput(out) {" + nl())
+  sb_push(js, "  const parts = out.split('===STATE===');" + nl())
+  sb_push(js, "  const resultLines = parts[0].split(String.fromCharCode(10)).map(function(s) { return s.trim(); }).filter(function(s) { return s.length > 0; });" + nl())
+  sb_push(js, "  const stateText = parts.length > 1 ? parts[1] : '';" + nl())
+  sb_push(js, "  const result = { kind: 'error', message: 'no result', cols: [], rows: [] };" + nl())
+  sb_push(js, "  if (resultLines.length > 0) {" + nl())
+  sb_push(js, "    const first = resultLines[0];" + nl())
+  sb_push(js, "    if (first.indexOf('RESULT:OK:') === 0) { result.kind = 'ok'; result.message = first.slice(10); }" + nl())
+  sb_push(js, "    else if (first.indexOf('RESULT:ERROR:') === 0) { result.kind = 'error'; result.message = first.slice(13); }" + nl())
+  sb_push(js, "    else if (first.indexOf('RESULT:ROWS:') === 0) {" + nl())
+  sb_push(js, "      result.kind = 'rows';" + nl())
+  sb_push(js, "      for (const line of resultLines.slice(1)) {" + nl())
+  sb_push(js, "        if (line.indexOf('COL:') === 0) { result.cols.push(line.slice(4)); }" + nl())
+  sb_push(js, "        else if (line.indexOf('ROW:') === 0) { result.rows.push(line.slice(4).split(',')); }" + nl())
+  sb_push(js, "      }" + nl())
+  sb_push(js, "    }" + nl())
+  sb_push(js, "  }" + nl())
+  sb_push(js, "  const tables = {};" + nl())
+  sb_push(js, "  let curTable = null;" + nl())
+  sb_push(js, "  let curStaged = null;" + nl())
+  sb_push(js, "  for (const raw of stateText.split(String.fromCharCode(10))) {" + nl())
+  sb_push(js, "    const line = raw.trim();" + nl())
+  sb_push(js, "    if (!line) continue;" + nl())
+  sb_push(js, "    if (line.indexOf('STAGEDTABLE:') === 0) { curStaged = line.slice(12); tables[curStaged] = { cols: [], rows: [] }; }" + nl())
+  sb_push(js, "    else if (line.indexOf('STAGEDSCHEMA:') === 0 && curStaged) { tables[curStaged].cols = line.slice(13).split(',').map(function(p) { return p.split(':')[0]; }); }" + nl())
+  sb_push(js, "    else if (line.indexOf('STAGEDROW:') === 0 && curStaged) { tables[curStaged].rows.push(line.slice(10).split(',')); }" + nl())
+  sb_push(js, "    else if (line.indexOf('TABLE:') === 0) { curTable = line.slice(6); tables[curTable] = { cols: [], rows: [] }; }" + nl())
+  sb_push(js, "    else if (line.indexOf('SCHEMA:') === 0 && curTable) { tables[curTable].cols = line.slice(7).split(',').map(function(p) { return p.split(':')[0]; }); }" + nl())
+  sb_push(js, "    else if (line.indexOf('ROW:') === 0 && curTable) { tables[curTable].rows.push(line.slice(4).split(',')); }" + nl())
+  sb_push(js, "  }" + nl())
+  sb_push(js, "  return { result: result, tables: tables, stateText: stateText };" + nl())
+  sb_push(js, "}" + nl())
+  sb_push(js, "function escHtml(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;'); }" + nl())
+  sb_push(js, "function renderTabs() {" + nl())
+  sb_push(js, "  const names = Object.keys(tablesMap);" + nl())
+  sb_push(js, "  const tabsEl = document.getElementById('sql-tabs');" + nl())
+  sb_push(js, "  if (names.length === 0) { tabsEl.innerHTML = '<em>No tables yet -- try a CREATE TABLE statement.</em>'; return; }" + nl())
+  sb_push(js, "  if (!activeTable || names.indexOf(activeTable) < 0) { activeTable = names[0]; }" + nl())
+  sb_push(js, "  let html = '';" + nl())
+  sb_push(js, "  for (const name of names) {" + nl())
+  sb_push(js, "    const isActive = name === activeTable;" + nl())
+  sb_push(js, "    html += '<button onclick=\"selectTab(\\'' + name + '\\')\" style=\"font-weight:' + (isActive ? 'bold' : 'normal') + '\">' + escHtml(name) + '</button> ';" + nl())
+  sb_push(js, "  }" + nl())
+  sb_push(js, "  tabsEl.innerHTML = html;" + nl())
+  sb_push(js, "}" + nl())
+  sb_push(js, "function renderActiveTable() {" + nl())
+  sb_push(js, "  const el = document.getElementById('sql-table');" + nl())
+  sb_push(js, "  if (!activeTable || !tablesMap[activeTable]) { el.innerHTML = ''; return; }" + nl())
+  sb_push(js, "  const t = tablesMap[activeTable];" + nl())
+  sb_push(js, "  let html = \"<table style='border-collapse:collapse;width:100%'><tr>\";" + nl())
+  sb_push(js, "  for (const c of t.cols) { html += '<th style=\"border:1px solid #666;padding:4px;text-align:left\">' + escHtml(c) + '</th>'; }" + nl())
+  sb_push(js, "  html += '</tr>';" + nl())
+  sb_push(js, "  for (const row of t.rows) {" + nl())
+  sb_push(js, "    html += '<tr>';" + nl())
+  sb_push(js, "    for (const v of row) { html += '<td style=\"border:1px solid #666;padding:4px\">' + escHtml(v) + '</td>'; }" + nl())
+  sb_push(js, "    html += '</tr>';" + nl())
+  sb_push(js, "  }" + nl())
+  sb_push(js, "  html += '</table>';" + nl())
+  sb_push(js, "  if (t.rows.length === 0) { html += '<p><em>(no rows)</em></p>'; }" + nl())
+  sb_push(js, "  el.innerHTML = html;" + nl())
+  sb_push(js, "}" + nl())
+  sb_push(js, "function selectTab(name) { activeTable = name; renderTabs(); renderActiveTable(); }" + nl())
+  sb_push(js, "function renderResult(result) {" + nl())
+  sb_push(js, "  const el = document.getElementById('sql-result');" + nl())
+  sb_push(js, "  if (result.kind === 'ok') { el.textContent = 'OK: ' + result.message; }" + nl())
+  sb_push(js, "  else if (result.kind === 'error') { el.textContent = 'ERROR: ' + result.message; }" + nl())
+  sb_push(js, "  else {" + nl())
+  sb_push(js, "    let text = result.rows.length + ' row(s): ' + result.cols.join(', ') + String.fromCharCode(10);" + nl())
+  sb_push(js, "    for (const row of result.rows) { text += '  ' + row.join(', ') + String.fromCharCode(10); }" + nl())
+  sb_push(js, "    el.textContent = text;" + nl())
+  sb_push(js, "  }" + nl())
+  sb_push(js, "}" + nl())
+  sb_push(js, "async function sqlSubmit() {" + nl())
+  sb_push(js, "  const inp = document.getElementById('sql-input');" + nl())
+  sb_push(js, "  const stmt = inp.value.trim();" + nl())
+  sb_push(js, "  if (!stmt) return;" + nl())
+  sb_push(js, "  const out = await runWasm('sql-status', 'sqlconsole', [currentDbText, stmt, '0']);" + nl())
+  sb_push(js, "  const parsed = parseOutput(out);" + nl())
+  sb_push(js, "  currentDbText = parsed.stateText;" + nl())
+  sb_push(js, "  tablesMap = parsed.tables;" + nl())
+  sb_push(js, "  renderResult(parsed.result);" + nl())
+  sb_push(js, "  renderTabs();" + nl())
+  sb_push(js, "  renderActiveTable();" + nl())
+  sb_push(js, "  inp.value = '';" + nl())
+  sb_push(js, "  inp.focus();" + nl())
+  sb_push(js, "}" + nl())
+  sb_push(js, "function sqlKeydown(e) { if (e.key === 'Enter') { sqlSubmit(); } }" + nl())
+  sb_push(js, "async function sqlInit() {" + nl())
+  sb_push(js, "  const out = await runWasm('sql-status', 'sqlconsole', ['INIT', '', '0']);" + nl())
+  sb_push(js, "  const parsed = parseOutput(out);" + nl())
+  sb_push(js, "  currentDbText = parsed.stateText;" + nl())
+  sb_push(js, "  tablesMap = parsed.tables;" + nl())
+  sb_push(js, "  renderResult(parsed.result);" + nl())
+  sb_push(js, "  renderTabs();" + nl())
+  sb_push(js, "  renderActiveTable();" + nl())
+  sb_push(js, "}" + nl())
+  sb_push(js, "sqlInit();" + nl())
+  let sections = list_push(sections, tpl_script(sb_str(js)))
+  let page = tpl_page("PatLang SQL Console", "fragment", sections)
+  write_file("portfolio/demos/sqlconsole.html", render_page(page))
+  print("wrote portfolio/demos/sqlconsole.html")
+  return true
+end
+
 make a function called b64bytes_only_js takes b returns done
   # Just the base64-decode helper, for pages (like the threaded fiber demo)
   # that need runWasmThreaded but not the rest of wasi_shim_js's playground/
@@ -1481,6 +1611,20 @@ let hexrts_lib_body = strip_include_line(read_file("self_hosting/lib/hexrts.patl
 let hexrts_src = read_file("self_hosting/lib/includes.patlang") + chr(10) + hexrts_lib_body + chr(10) + hexrts_main_body
 let hexrts_b64 = compile_both(hexrts_src, "hexrts")
 print("hexrts done")
+
+# sql console: self_hosting/lib/rdbms.patlang (CSV-backed tables over the
+# VFS, single-writer transactions) + self_hosting/lib/sql.patlang (a
+# runtime SQL tokenizer/parser/executor) -- its own small wasm module, same
+# reasoning as hexrts above. Three-level include chain to strip: sql.patlang
+# includes both includes.patlang and rdbms.patlang; rdbms.patlang ALSO
+# includes includes.patlang (so it only gets concatenated once here); the
+# driver includes sql.patlang.
+let sql_console_main_body = strip_include_line(read_file("self_hosting/examples/sql_console_main.patlang"), "../lib/sql.patlang")
+let sql_lib_body = strip_include_line(strip_include_line(read_file("self_hosting/lib/sql.patlang"), "includes.patlang"), "rdbms.patlang")
+let rdbms_lib_body = strip_include_line(read_file("self_hosting/lib/rdbms.patlang"), "includes.patlang")
+let sql_console_src = read_file("self_hosting/lib/includes.patlang") + chr(10) + rdbms_lib_body + chr(10) + sql_lib_body + chr(10) + sql_console_main_body
+let sql_console_b64 = compile_both(sql_console_src, "sqlconsole")
+print("sql console done")
 
 # Dev tools: build them with the pipeline, capture their transcripts
 let clibs = read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + read_file("self_hosting/lib/lower.patlang") + chr(10) + read_file("self_hosting/lib/codegen.patlang") + chr(10) + read_file("self_hosting/lib/runtime_rs.patlang")
@@ -2284,6 +2428,7 @@ native_page("builddaemon", "Exemplar: a build daemon combining logic, GOAP, sign
 native_page("queuedemo", "Durable message queue: a crash, and a real recovery", "Three independent workers, each doing risky I/O work, each with its OWN topic (<code>queue_writer_topic(base, worker_id)</code>) rather than sharing one &mdash; the queue does whole-file read-modify-write with no locking, so giving every writer its own topic avoids a write race by construction, not by coordination. Two workers finish cleanly via <code>queue_attempt</code> (publish intent, do the work, ack the outcome). The third genuinely crashes mid-attempt &mdash; PatLang has no try/catch, so a real fatal host error (a bad <code>read_file</code> call, verified this session across four actually-separate OS processes) kills that worker outright, before it ever reaches <code>queue_ack</code>. A separate, later process then calls <code>queue_pending_multi</code> across all three workers' topics, finds the one leftover checkpoint, completes it, and acks it &mdash; proving the intent genuinely survived the crash on disk, not just in this transcript. Built entirely in <code>self_hosting/lib/queue.patlang</code>, no new Rust host functions. See the <a href='patlang-paradigms.html#heading-queue'>Paradigms Guide's Durable Message Queue section</a> for the full design. <strong>Native transcript only, no &quot;run in browser&quot; button</strong>: needs real file I/O and a real fatal process exit, neither available in the WASI sandbox. The transcript below represents the crash directly (publishing the intent without ever calling the action or the ack &mdash; exactly the on-disk state a real crash between those two steps leaves) since a genuine fatal error can't be captured mid-transcript without killing this whole build &mdash; see <code>self_hosting/examples/queue_recovery_demo.patlang</code> for the real, actually-run-it-yourself four-separate-process form.", queue_src, queue_native)
 repl_page(pg_b64)
 hexrts_page(hexrts_b64)
+sql_console_page(sql_console_b64)
 # flowgraph-demo: live in-browser variant (flowgraph_wasm_b64, built
 # above) with a paste-your-own-program editor, PLUS the CLI tool's own
 # source and native transcript of the curated multi-program set it renders

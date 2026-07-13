@@ -1,0 +1,53 @@
+# Engine-only smoke test for self_hosting/lib/rdbms.patlang -- verifies
+# create/save/read, autocommit, and transaction commit/rollback BEFORE the
+# SQL layer goes on top, so any bugs found are attributable to the storage
+# engine, not the parser.
+
+include "../lib/includes.patlang"
+include "../lib/rdbms.patlang"
+include "../lib/test.patlang"
+
+make a function called run_engine_tests returns ok
+  t_init()
+
+  let schema = [["id", "int"], ["name", "string"]]
+  let db = rdb_init()
+
+  # autocommit: no transaction open, writes go straight to committed storage
+  let db = rdb_save(db, "people", schema, [[1, "alice"], [2, "bob"]])
+  check("table registered in catalog", rdb_list_contains(db[0], "people"), true)
+  let rows = rdb_effective(db, "people")[1]
+  check("autocommit wrote 2 rows", to_num(list_len(rows)), 2)
+  check("committed rows readable straight from VFS", to_num(list_len(rdb_read_committed_rows("people"))), 2)
+
+  # transaction: staged writes are visible to the SAME db_state but not committed
+  let db = rdb_begin(db)
+  check("tx_open is now 1", db[1], "1")
+  let db = rdb_save(db, "people", schema, [[1, "alice"], [2, "bob"], [3, "carol"]])
+  let staged_rows = rdb_effective(db, "people")[1]
+  check("staged write visible within the same transaction", to_num(list_len(staged_rows)), 3)
+  check("committed storage NOT yet changed mid-transaction", to_num(list_len(rdb_read_committed_rows("people"))), 2)
+
+  # rollback discards the staged write entirely
+  let db = rdb_rollback(db)
+  check("tx_open is 0 after rollback", db[1], "0")
+  check("rollback left committed storage untouched", to_num(list_len(rdb_read_committed_rows("people"))), 2)
+
+  # commit makes a staged write real
+  let db = rdb_begin(db)
+  let db = rdb_save(db, "people", schema, [[1, "alice"], [2, "bob"], [3, "carol"]])
+  let db = rdb_commit(db, "0")
+  check("tx_open is 0 after commit", db[1], "0")
+  check("commit persisted the staged write", to_num(list_len(rdb_read_committed_rows("people"))), 3)
+
+  # serialization round-trip
+  let text = rdb_serialize(db)
+  let round_tripped = rdb_deserialize(text)
+  check("round-tripped table catalog matches", to_num(list_len(round_tripped[0])), to_num(list_len(db[0])))
+  check("round-tripped rows match", to_num(list_len(rdb_read_committed_rows("people"))), 3)
+
+  t_report()
+  return get("__vars", "t_fail") == 0
+end
+
+run_engine_tests()

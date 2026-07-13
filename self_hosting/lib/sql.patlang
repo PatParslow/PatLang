@@ -1,0 +1,939 @@
+# A small SQL interpreter over self_hosting/lib/rdbms.patlang: tokenize ->
+# parse -> execute, called at RUNTIME (not PatLang's compile-time
+# `syntax NAME { ... }` mechanism -- that's for embedding foreign syntax
+# inside PatLang source at compile time, a different problem from a live
+# console where the user types SQL and it needs interpreting on the spot,
+# the same way self_hosting/tools/repl.patlang interprets typed PatLang).
+#
+# Supported: CREATE TABLE, INSERT INTO ... VALUES (...), SELECT ... FROM
+# ... [JOIN ... ON ...] [WHERE ...], UPDATE ... SET ... [WHERE ...],
+# DELETE FROM ... [WHERE ...], BEGIN, COMMIT, ROLLBACK. WHERE supports
+# =, !=, <, >, <=, >=, combined with AND only (no OR, no parentheses).
+# At most one JOIN clause, inner join, simple nested-loop -- deliberately
+# not a query planner, just enough to make a real two-table demo possible.
+#
+# Errors are RECOVERABLE, same principle as the REPL: sql_execute returns
+# an ["error", message] result rather than raising a fatal PatLang error,
+# so a typo in the console doesn't kill the whole session.
+
+include "includes.patlang"
+include "rdbms.patlang"
+
+# ---- tokenizer ----
+
+make a function called sql_is_digit takes c returns yes
+  return (c >= 48) and (c <= 57)
+end
+
+make a function called sql_is_alpha takes c returns yes
+  return ((c >= 65) and (c <= 90)) or ((c >= 97) and (c <= 122)) or (c == 95)
+end
+
+make a function called sql_is_alnum takes c returns yes
+  return sql_is_alpha(c) or sql_is_digit(c)
+end
+
+make a function called sql_keywords returns kws
+  return ["CREATE", "TABLE", "INSERT", "INTO", "VALUES", "SELECT", "FROM", "WHERE", "JOIN", "ON", "UPDATE", "SET", "DELETE", "BEGIN", "COMMIT", "ROLLBACK", "AND"]
+end
+
+make a function called sql_upper takes s returns up
+  let b = sb_new()
+  let i = 0
+  let n = s.length
+  while i < n do
+    let c = char_code(s, i)
+    if (c >= 97) and (c <= 122) then
+      sb_push(b, chr(c - 32))
+    else
+      sb_push(b, chr(c))
+    end
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+make a function called sql_is_keyword takes word returns yes
+  let up = sql_upper(word)
+  let kws = sql_keywords()
+  let i = 0
+  let n = to_num(list_len(kws))
+  while i < n do
+    if kws[i] == up then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called sql_tokenize takes text returns tokens
+  let out = []
+  let i = 0
+  let n = text.length
+  while i < n do
+    let c = char_code(text, i)
+    if (c == 32) or (c == 9) or (c == 10) or (c == 13) then
+      let i = i + 1
+    else
+      if c == 39 then
+        let j = i + 1
+        while (j < n) and (char_code(text, j) != 39) do
+          let j = j + 1
+        end
+        let out = list_push(out, ["STR", substr(text, i + 1, j - i - 1)])
+        let i = j + 1
+      else
+        if sql_is_digit(c) then
+          let j = i
+          while (j < n) and sql_is_digit(char_code(text, j)) do
+            let j = j + 1
+          end
+          let out = list_push(out, ["NUM", substr(text, i, j - i)])
+          let i = j
+        else
+          if sql_is_alpha(c) then
+            let j = i
+            while (j < n) and sql_is_alnum(char_code(text, j)) do
+              let j = j + 1
+            end
+            let word = substr(text, i, j - i)
+            if sql_is_keyword(word) then
+              let out = list_push(out, ["KW", sql_upper(word)])
+            else
+              let out = list_push(out, ["IDENT", word])
+            end
+            let i = j
+          else
+            if (c == 33) and (i + 1 < n) and (char_code(text, i + 1) == 61) then
+              let out = list_push(out, ["PUNC", "!="])
+              let i = i + 2
+            else
+              if (c == 60) and (i + 1 < n) and (char_code(text, i + 1) == 61) then
+                let out = list_push(out, ["PUNC", "<="])
+                let i = i + 2
+              else
+                if (c == 62) and (i + 1 < n) and (char_code(text, i + 1) == 61) then
+                  let out = list_push(out, ["PUNC", ">="])
+                  let i = i + 2
+                else
+                  let out = list_push(out, ["PUNC", chr(c)])
+                  let i = i + 1
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  let out = list_push(out, ["EOF", ""])
+  return out
+end
+
+# ---- small parser helpers (pos threading, like PatLang's own parser.patlang) ----
+
+make a function called sql_peek takes tokens, pos returns tok
+  return tokens[pos]
+end
+
+make a function called sql_at_kw takes tokens, pos, kw returns yes
+  let t = tokens[pos]
+  return (t[0] == "KW") and (t[1] == kw)
+end
+
+make a function called sql_at_punc takes tokens, pos, p returns yes
+  let t = tokens[pos]
+  return (t[0] == "PUNC") and (t[1] == p)
+end
+
+# ---- shared fragments: identifiers, value literals, column lists, WHERE ----
+
+# a bare identifier, or a "table.col" compound -- returned as one string
+make a function called sql_parse_colref takes tokens, pos returns result
+  let t = tokens[pos]
+  if t[0] != "IDENT" then
+    return [["error", "expected a column or table name"], pos]
+  end
+  let name = t[1]
+  let pos = pos + 1
+  if sql_at_punc(tokens, pos, ".") then
+    let pos = pos + 1
+    let t2 = tokens[pos]
+    if t2[0] != "IDENT" then
+      return [["error", "expected a column name after '.'"], pos]
+    end
+    return [name + "." + t2[1], pos + 1]
+  end
+  return [name, pos]
+end
+
+# a literal value: number or string, typed
+make a function called sql_parse_value takes tokens, pos returns result
+  let t = tokens[pos]
+  if t[0] == "NUM" then
+    return [to_num(t[1]), pos + 1]
+  end
+  if t[0] == "STR" then
+    return [t[1], pos + 1]
+  end
+  return [["error", "expected a value"], pos]
+end
+
+# comma-separated identifier list, e.g. column names in CREATE TABLE/INSERT
+make a function called sql_parse_ident_list takes tokens, pos returns result
+  let out = []
+  let t = tokens[pos]
+  if t[0] != "IDENT" then
+    return [["error", "expected an identifier"], pos]
+  end
+  let out = list_push(out, t[1])
+  let pos = pos + 1
+  let looping = true
+  while looping do
+    if sql_at_punc(tokens, pos, ",") then
+      let pos = pos + 1
+      let t = tokens[pos]
+      if t[0] != "IDENT" then
+        return [["error", "expected an identifier after ','"], pos]
+      end
+      let out = list_push(out, t[1])
+      let pos = pos + 1
+    else
+      let looping = false
+    end
+  end
+  return [out, pos]
+end
+
+# comma-separated value list
+make a function called sql_parse_value_list takes tokens, pos returns result
+  let out = []
+  let r = sql_parse_value(tokens, pos)
+  if r[0][0] == "error" then
+    return r
+  end
+  let out = list_push(out, r[0])
+  let pos = r[1]
+  let looping = true
+  while looping do
+    if sql_at_punc(tokens, pos, ",") then
+      let pos = pos + 1
+      let r = sql_parse_value(tokens, pos)
+      if r[0][0] == "error" then
+        return r
+      end
+      let out = list_push(out, r[0])
+      let pos = r[1]
+    else
+      let looping = false
+    end
+  end
+  return [out, pos]
+end
+
+make a function called sql_op_token takes tokens, pos returns op
+  let t = tokens[pos]
+  if t[0] != "PUNC" then
+    return ""
+  end
+  let p = t[1]
+  if (p == "=") or (p == "!=") or (p == "<") or (p == ">") or (p == "<=") or (p == ">=") then
+    return p
+  end
+  return ""
+end
+
+# WHERE col op value [AND col op value]*
+make a function called sql_parse_where takes tokens, pos returns result
+  let conds = []
+  let looping = true
+  while looping do
+    let cr = sql_parse_colref(tokens, pos)
+    if cr[0][0] == "error" then
+      return cr
+    end
+    let col = cr[0]
+    let pos = cr[1]
+    let op = sql_op_token(tokens, pos)
+    if op == "" then
+      return [["error", "expected a comparison operator in WHERE"], pos]
+    end
+    let pos = pos + 1
+    let vr = sql_parse_value(tokens, pos)
+    if vr[0][0] == "error" then
+      return vr
+    end
+    let conds = list_push(conds, [col, op, vr[0]])
+    let pos = vr[1]
+    if sql_at_kw(tokens, pos, "AND") then
+      let pos = pos + 1
+    else
+      let looping = false
+    end
+  end
+  return [conds, pos]
+end
+
+# ---- statement parsers ----
+
+make a function called sql_parse_create_table takes tokens, pos returns result
+  let pos = pos + 2
+  let t = tokens[pos]
+  if t[0] != "IDENT" then
+    return [["error", "expected a table name after CREATE TABLE"], pos]
+  end
+  let name = t[1]
+  let pos = pos + 1
+  if sql_at_punc(tokens, pos, "(") == false then
+    return [["error", "expected '(' after table name"], pos]
+  end
+  let pos = pos + 1
+  let schema = []
+  let looping = true
+  while looping do
+    let t = tokens[pos]
+    if t[0] != "IDENT" then
+      return [["error", "expected a column name"], pos]
+    end
+    let col = t[1]
+    let pos = pos + 1
+    let t2 = tokens[pos]
+    if t2[0] != "IDENT" then
+      return [["error", "expected a column type after " + col], pos]
+    end
+    let ty = sql_upper(t2[1])
+    if ty == "INT" then
+      let ty = "int"
+    else
+      let ty = "string"
+    end
+    let pos = pos + 1
+    let schema = list_push(schema, [col, ty])
+    if sql_at_punc(tokens, pos, ",") then
+      let pos = pos + 1
+    else
+      let looping = false
+    end
+  end
+  if sql_at_punc(tokens, pos, ")") == false then
+    return [["error", "expected ')' to close column list"], pos]
+  end
+  let pos = pos + 1
+  return [["create_table", name, schema], pos]
+end
+
+make a function called sql_parse_insert takes tokens, pos returns result
+  let pos = pos + 2
+  let t = tokens[pos]
+  if t[0] != "IDENT" then
+    return [["error", "expected a table name after INSERT INTO"], pos]
+  end
+  let name = t[1]
+  let pos = pos + 1
+  let cols = []
+  if sql_at_punc(tokens, pos, "(") then
+    let pos = pos + 1
+    let r = sql_parse_ident_list(tokens, pos)
+    if r[0][0] == "error" then
+      return r
+    end
+    let cols = r[0]
+    let pos = r[1]
+    if sql_at_punc(tokens, pos, ")") == false then
+      return [["error", "expected ')' after column list"], pos]
+    end
+    let pos = pos + 1
+  end
+  if sql_at_kw(tokens, pos, "VALUES") == false then
+    return [["error", "expected VALUES"], pos]
+  end
+  let pos = pos + 1
+  if sql_at_punc(tokens, pos, "(") == false then
+    return [["error", "expected '(' after VALUES"], pos]
+  end
+  let pos = pos + 1
+  let r = sql_parse_value_list(tokens, pos)
+  if r[0][0] == "error" then
+    return r
+  end
+  let values = r[0]
+  let pos = r[1]
+  if sql_at_punc(tokens, pos, ")") == false then
+    return [["error", "expected ')' to close VALUES list"], pos]
+  end
+  let pos = pos + 1
+  return [["insert", name, cols, values], pos]
+end
+
+make a function called sql_parse_select takes tokens, pos returns result
+  let pos = pos + 1
+  let cols = []
+  if sql_at_punc(tokens, pos, "*") then
+    let cols = ["*"]
+    let pos = pos + 1
+  else
+    let looping = true
+    while looping do
+      let r = sql_parse_colref(tokens, pos)
+      if r[0][0] == "error" then
+        return r
+      end
+      let cols = list_push(cols, r[0])
+      let pos = r[1]
+      if sql_at_punc(tokens, pos, ",") then
+        let pos = pos + 1
+      else
+        let looping = false
+      end
+    end
+  end
+  if sql_at_kw(tokens, pos, "FROM") == false then
+    return [["error", "expected FROM"], pos]
+  end
+  let pos = pos + 1
+  let t = tokens[pos]
+  if t[0] != "IDENT" then
+    return [["error", "expected a table name after FROM"], pos]
+  end
+  let table = t[1]
+  let pos = pos + 1
+  let join = []
+  if sql_at_kw(tokens, pos, "JOIN") then
+    let pos = pos + 1
+    let t2 = tokens[pos]
+    if t2[0] != "IDENT" then
+      return [["error", "expected a table name after JOIN"], pos]
+    end
+    let right_table = t2[1]
+    let pos = pos + 1
+    if sql_at_kw(tokens, pos, "ON") == false then
+      return [["error", "expected ON after JOIN " + right_table], pos]
+    end
+    let pos = pos + 1
+    let lr = sql_parse_colref(tokens, pos)
+    if lr[0][0] == "error" then
+      return lr
+    end
+    let left_col = lr[0]
+    let pos = lr[1]
+    if sql_at_punc(tokens, pos, "=") == false then
+      return [["error", "expected '=' in ON clause"], pos]
+    end
+    let pos = pos + 1
+    let rr = sql_parse_colref(tokens, pos)
+    if rr[0][0] == "error" then
+      return rr
+    end
+    let right_col = rr[0]
+    let pos = rr[1]
+    let join = [right_table, left_col, right_col]
+  end
+  let where_conds = []
+  if sql_at_kw(tokens, pos, "WHERE") then
+    let pos = pos + 1
+    let r = sql_parse_where(tokens, pos)
+    if r[0][0] == "error" then
+      return r
+    end
+    let where_conds = r[0]
+    let pos = r[1]
+  end
+  return [["select", cols, table, join, where_conds], pos]
+end
+
+make a function called sql_parse_update takes tokens, pos returns result
+  let pos = pos + 1
+  let t = tokens[pos]
+  if t[0] != "IDENT" then
+    return [["error", "expected a table name after UPDATE"], pos]
+  end
+  let name = t[1]
+  let pos = pos + 1
+  if sql_at_kw(tokens, pos, "SET") == false then
+    return [["error", "expected SET"], pos]
+  end
+  let pos = pos + 1
+  let sets = []
+  let looping = true
+  while looping do
+    let t = tokens[pos]
+    if t[0] != "IDENT" then
+      return [["error", "expected a column name in SET"], pos]
+    end
+    let col = t[1]
+    let pos = pos + 1
+    if sql_at_punc(tokens, pos, "=") == false then
+      return [["error", "expected '=' after " + col + " in SET"], pos]
+    end
+    let pos = pos + 1
+    let r = sql_parse_value(tokens, pos)
+    if r[0][0] == "error" then
+      return r
+    end
+    let sets = list_push(sets, [col, r[0]])
+    let pos = r[1]
+    if sql_at_punc(tokens, pos, ",") then
+      let pos = pos + 1
+    else
+      let looping = false
+    end
+  end
+  let where_conds = []
+  if sql_at_kw(tokens, pos, "WHERE") then
+    let pos = pos + 1
+    let r = sql_parse_where(tokens, pos)
+    if r[0][0] == "error" then
+      return r
+    end
+    let where_conds = r[0]
+    let pos = r[1]
+  end
+  return [["update", name, sets, where_conds], pos]
+end
+
+make a function called sql_parse_delete takes tokens, pos returns result
+  let pos = pos + 1
+  if sql_at_kw(tokens, pos, "FROM") == false then
+    return [["error", "expected FROM after DELETE"], pos]
+  end
+  let pos = pos + 1
+  let t = tokens[pos]
+  if t[0] != "IDENT" then
+    return [["error", "expected a table name after DELETE FROM"], pos]
+  end
+  let name = t[1]
+  let pos = pos + 1
+  let where_conds = []
+  if sql_at_kw(tokens, pos, "WHERE") then
+    let pos = pos + 1
+    let r = sql_parse_where(tokens, pos)
+    if r[0][0] == "error" then
+      return r
+    end
+    let where_conds = r[0]
+    let pos = r[1]
+  end
+  return [["delete", name, where_conds], pos]
+end
+
+make a function called sql_parse takes text returns ast
+  let tokens = sql_tokenize(text)
+  let pos = 0
+  if sql_at_kw(tokens, pos, "CREATE") then
+    return sql_parse_create_table(tokens, pos)[0]
+  end
+  if sql_at_kw(tokens, pos, "INSERT") then
+    return sql_parse_insert(tokens, pos)[0]
+  end
+  if sql_at_kw(tokens, pos, "SELECT") then
+    return sql_parse_select(tokens, pos)[0]
+  end
+  if sql_at_kw(tokens, pos, "UPDATE") then
+    return sql_parse_update(tokens, pos)[0]
+  end
+  if sql_at_kw(tokens, pos, "DELETE") then
+    return sql_parse_delete(tokens, pos)[0]
+  end
+  if sql_at_kw(tokens, pos, "BEGIN") then
+    return ["begin"]
+  end
+  if sql_at_kw(tokens, pos, "COMMIT") then
+    return ["commit"]
+  end
+  if sql_at_kw(tokens, pos, "ROLLBACK") then
+    return ["rollback"]
+  end
+  return ["error", "unrecognized statement (expected CREATE/INSERT/SELECT/UPDATE/DELETE/BEGIN/COMMIT/ROLLBACK)"]
+end
+
+# ---- execution ----
+#
+# A "result" is either ["ok", message] (CREATE/INSERT/UPDATE/DELETE/BEGIN/
+# COMMIT/ROLLBACK), ["rows", col_labels, rows] (SELECT), or
+# ["error", message] (parse or execution failure -- recoverable, same
+# principle as the REPL: a bad statement never aborts the whole program).
+
+# col_labels for a single (non-join) table: just the schema's column names.
+make a function called sql_project_single takes schema, rows, cols returns result
+  let all_names = rdb_schema_col_names(schema)
+  if (to_num(list_len(cols)) == 1) and (cols[0] == "*") then
+    return [all_names, rows]
+  end
+  let indices = []
+  let i = 0
+  let cn = to_num(list_len(cols))
+  while i < cn do
+    let want = cols[i]
+    let dot = 0
+    let wn = want.length
+    while (dot < wn) and (char_code(want, dot) != 46) do
+      let dot = dot + 1
+    end
+    let bare = want
+    if dot < wn then
+      let bare = substr(want, dot + 1, wn - dot - 1)
+    end
+    let idx = rdb_index_of(all_names, bare)
+    let indices = list_push(indices, idx)
+    let i = i + 1
+  end
+  let out_rows = []
+  let r = 0
+  let rn = to_num(list_len(rows))
+  while r < rn do
+    let row = rows[r]
+    let out_row = []
+    let k = 0
+    let kn = to_num(list_len(indices))
+    while k < kn do
+      let out_row = list_push(out_row, row[indices[k]])
+      let k = k + 1
+    end
+    let out_rows = list_push(out_rows, out_row)
+    let r = r + 1
+  end
+  return [cols, out_rows]
+end
+
+make a function called sql_where_col_index takes names, colref returns idx
+  let dot = 0
+  let n = colref.length
+  while (dot < n) and (char_code(colref, dot) != 46) do
+    let dot = dot + 1
+  end
+  if dot < n then
+    return rdb_index_of(names, colref)
+  end
+  let i = 0
+  let nn = to_num(list_len(names))
+  while i < nn do
+    let name = names[i]
+    let ndot = 0
+    let nl = name.length
+    while (ndot < nl) and (char_code(name, ndot) != 46) do
+      let ndot = ndot + 1
+    end
+    let bare = name
+    if ndot < nl then
+      let bare = substr(name, ndot + 1, nl - ndot - 1)
+    end
+    if bare == colref then
+      return i
+    end
+    let i = i + 1
+  end
+  return -1
+end
+
+make a function called sql_value_cmp takes a, op, b returns yes
+  if op == "=" then
+    return a == b
+  end
+  if op == "!=" then
+    return a != b
+  end
+  if op == "<" then
+    return a < b
+  end
+  if op == ">" then
+    return a > b
+  end
+  if op == "<=" then
+    return a <= b
+  end
+  if op == ">=" then
+    return a >= b
+  end
+  return false
+end
+
+make a function called sql_row_matches_where takes names, row, conds returns yes
+  let i = 0
+  let n = to_num(list_len(conds))
+  while i < n do
+    let cond = conds[i]
+    let idx = sql_where_col_index(names, cond[0])
+    if idx < 0 then
+      return false
+    end
+    if sql_value_cmp(row[idx], cond[1], cond[2]) == false then
+      return false
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+make a function called sql_exec_select takes db, ast returns result
+  let cols = ast[1]
+  let table = ast[2]
+  let join = ast[3]
+  let where_conds = ast[4]
+
+  if rdb_table_exists(table) == false then
+    return ["error", "no such table: " + table]
+  end
+  let left = rdb_effective(db, table)
+  let left_schema = left[0]
+  let left_rows = left[1]
+  let left_names = rdb_schema_col_names(left_schema)
+
+  if to_num(list_len(join)) == 0 then
+    let filtered = []
+    let r = 0
+    let rn = to_num(list_len(left_rows))
+    while r < rn do
+      if sql_row_matches_where(left_names, left_rows[r], where_conds) then
+        let filtered = list_push(filtered, left_rows[r])
+      end
+      let r = r + 1
+    end
+    let proj = sql_project_single(left_schema, filtered, cols)
+    return ["rows", proj[0], proj[1]]
+  end
+
+  let right_table = join[0]
+  let left_join_col = join[1]
+  let right_join_col = join[2]
+  if rdb_table_exists(right_table) == false then
+    return ["error", "no such table: " + right_table]
+  end
+  let right = rdb_effective(db, right_table)
+  let right_schema = right[0]
+  let right_rows = right[1]
+  let right_names = rdb_schema_col_names(right_schema)
+
+  let qualified_names = []
+  let i = 0
+  let ln = to_num(list_len(left_names))
+  while i < ln do
+    let qualified_names = list_push(qualified_names, table + "." + left_names[i])
+    let i = i + 1
+  end
+  let i = 0
+  let rn2 = to_num(list_len(right_names))
+  while i < rn2 do
+    let qualified_names = list_push(qualified_names, right_table + "." + right_names[i])
+    let i = i + 1
+  end
+
+  let left_join_idx = sql_where_col_index(qualified_names, left_join_col)
+  let right_join_idx = sql_where_col_index(qualified_names, right_join_col)
+  if (left_join_idx < 0) or (right_join_idx < 0) then
+    return ["error", "join column not found"]
+  end
+
+  let joined_rows = []
+  let li = 0
+  let lln = to_num(list_len(left_rows))
+  while li < lln do
+    let lrow = left_rows[li]
+    let ri = 0
+    let rrn = to_num(list_len(right_rows))
+    while ri < rrn do
+      let rrow = right_rows[ri]
+      let combined = []
+      let k = 0
+      let kn = to_num(list_len(lrow))
+      while k < kn do
+        let combined = list_push(combined, lrow[k])
+        let k = k + 1
+      end
+      let k = 0
+      let kn2 = to_num(list_len(rrow))
+      while k < kn2 do
+        let combined = list_push(combined, rrow[k])
+        let k = k + 1
+      end
+      if combined[left_join_idx] == combined[right_join_idx] then
+        if sql_row_matches_where(qualified_names, combined, where_conds) then
+          let joined_rows = list_push(joined_rows, combined)
+        end
+      end
+      let ri = ri + 1
+    end
+    let li = li + 1
+  end
+
+  if (to_num(list_len(cols)) == 1) and (cols[0] == "*") then
+    return ["rows", qualified_names, joined_rows]
+  end
+  let out_rows = []
+  let r = 0
+  let rn3 = to_num(list_len(joined_rows))
+  let indices = []
+  let i = 0
+  let cn = to_num(list_len(cols))
+  while i < cn do
+    let idx = sql_where_col_index(qualified_names, cols[i])
+    let indices = list_push(indices, idx)
+    let i = i + 1
+  end
+  while r < rn3 do
+    let row = joined_rows[r]
+    let out_row = []
+    let k = 0
+    let kn3 = to_num(list_len(indices))
+    while k < kn3 do
+      let out_row = list_push(out_row, row[indices[k]])
+      let k = k + 1
+    end
+    let out_rows = list_push(out_rows, out_row)
+    let r = r + 1
+  end
+  return ["rows", cols, out_rows]
+end
+
+# sql_execute(db, ast, is_native) -> [new_db, result]
+make a function called sql_execute takes db, ast, is_native returns outcome
+  let kind = ast[0]
+
+  if kind == "error" then
+    return [db, ["error", ast[1]]]
+  end
+
+  if kind == "create_table" then
+    let name = ast[1]
+    let schema = ast[2]
+    if rdb_table_exists(name) then
+      return [db, ["error", "table already exists: " + name]]
+    end
+    let new_db = rdb_save(db, name, schema, [])
+    return [new_db, ["ok", "table " + name + " created"]]
+  end
+
+  if kind == "insert" then
+    let name = ast[1]
+    let cols = ast[2]
+    let values = ast[3]
+    if rdb_table_exists(name) == false then
+      return [db, ["error", "no such table: " + name]]
+    end
+    let effective = rdb_effective(db, name)
+    let schema = effective[0]
+    let rows = effective[1]
+    let all_names = rdb_schema_col_names(schema)
+    if to_num(list_len(cols)) == 0 then
+      if to_num(list_len(values)) != to_num(list_len(all_names)) then
+        return [db, ["error", "column count mismatch"]]
+      end
+      let rows = list_push(rows, values)
+    else
+      if to_num(list_len(cols)) != to_num(list_len(values)) then
+        return [db, ["error", "column count mismatch"]]
+      end
+      let row = []
+      let i = 0
+      let n = to_num(list_len(all_names))
+      while i < n do
+        let row = list_push(row, 0)
+        let i = i + 1
+      end
+      let i = 0
+      let cn = to_num(list_len(cols))
+      while i < cn do
+        let idx = rdb_index_of(all_names, cols[i])
+        if idx < 0 then
+          return [db, ["error", "no such column: " + cols[i]]]
+        end
+        let row = list_set(row, idx, values[i])
+        let i = i + 1
+      end
+      let rows = list_push(rows, row)
+    end
+    let new_db = rdb_save(db, name, schema, rows)
+    return [new_db, ["ok", "1 row inserted"]]
+  end
+
+  if kind == "select" then
+    return [db, sql_exec_select(db, ast)]
+  end
+
+  if kind == "update" then
+    let name = ast[1]
+    let sets = ast[2]
+    let where_conds = ast[3]
+    if rdb_table_exists(name) == false then
+      return [db, ["error", "no such table: " + name]]
+    end
+    let effective = rdb_effective(db, name)
+    let schema = effective[0]
+    let rows = effective[1]
+    let names = rdb_schema_col_names(schema)
+    let updated_count = 0
+    let out_rows = []
+    let r = 0
+    let rn = to_num(list_len(rows))
+    while r < rn do
+      let row = rows[r]
+      if sql_row_matches_where(names, row, where_conds) then
+        let updated_count = updated_count + 1
+        let s = 0
+        let sn = to_num(list_len(sets))
+        while s < sn do
+          let set_pair = sets[s]
+          let idx = rdb_index_of(names, set_pair[0])
+          if idx >= 0 then
+            let row = list_set(row, idx, set_pair[1])
+          end
+          let s = s + 1
+        end
+      end
+      let out_rows = list_push(out_rows, row)
+      let r = r + 1
+    end
+    let new_db = rdb_save(db, name, schema, out_rows)
+    return [new_db, ["ok", "" + updated_count + " row(s) updated"]]
+  end
+
+  if kind == "delete" then
+    let name = ast[1]
+    let where_conds = ast[2]
+    if rdb_table_exists(name) == false then
+      return [db, ["error", "no such table: " + name]]
+    end
+    let effective = rdb_effective(db, name)
+    let schema = effective[0]
+    let rows = effective[1]
+    let names = rdb_schema_col_names(schema)
+    let deleted_count = 0
+    let out_rows = []
+    let r = 0
+    let rn = to_num(list_len(rows))
+    while r < rn do
+      let row = rows[r]
+      if sql_row_matches_where(names, row, where_conds) then
+        let deleted_count = deleted_count + 1
+      else
+        let out_rows = list_push(out_rows, row)
+      end
+      let r = r + 1
+    end
+    let new_db = rdb_save(db, name, schema, out_rows)
+    return [new_db, ["ok", "" + deleted_count + " row(s) deleted"]]
+  end
+
+  if kind == "begin" then
+    if db[1] == "1" then
+      return [db, ["error", "a transaction is already open"]]
+    end
+    return [rdb_begin(db), ["ok", "transaction started"]]
+  end
+
+  if kind == "commit" then
+    if db[1] == "0" then
+      return [db, ["error", "no transaction is open"]]
+    end
+    return [rdb_commit(db, is_native), ["ok", "transaction committed"]]
+  end
+
+  if kind == "rollback" then
+    if db[1] == "0" then
+      return [db, ["error", "no transaction is open"]]
+    end
+    return [rdb_rollback(db), ["ok", "transaction rolled back"]]
+  end
+
+  return [db, ["error", "internal: unknown statement kind"]]
+end

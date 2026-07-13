@@ -1,0 +1,131 @@
+# Scripted verification of self_hosting/lib/sql.patlang (and, through it,
+# rdbms.patlang): CREATE/INSERT/SELECT/UPDATE/DELETE, a JOIN, WHERE, and
+# transaction commit/rollback -- all issued as real SQL text through
+# sql_parse/sql_execute, not by calling the engine functions directly (the
+# engine itself already has its own dedicated test in
+# self_hosting/examples/rdbms_engine_test.patlang).
+
+include "../lib/includes.patlang"
+include "../lib/sql.patlang"
+include "../lib/test.patlang"
+
+make a function called run takes db, sql returns new_db
+  let ast = sql_parse(sql)
+  let outcome = sql_execute(db, ast, "0")
+  return outcome[0]
+end
+
+make a function called run_and_get takes db, sql returns outcome
+  let ast = sql_parse(sql)
+  return sql_execute(db, ast, "0")
+end
+
+make a function called run_sql_tests returns ok
+  t_init()
+
+  let db = rdb_init()
+
+  # --- CREATE TABLE ---
+  let outcome = run_and_get(db, "CREATE TABLE people (id INT, name STRING, age INT)")
+  let db = outcome[0]
+  check("create table ok", outcome[1][0], "ok")
+  check("table exists after create", rdb_table_exists("people"), true)
+
+  let dup = run_and_get(db, "CREATE TABLE people (id INT)")
+  check("creating a duplicate table is a recoverable error", dup[1][0], "error")
+
+  # --- INSERT ---
+  let db = run(db, "INSERT INTO people VALUES (1, 'alice', 30)")
+  let db = run(db, "INSERT INTO people VALUES (2, 'bob', 25)")
+  let db = run(db, "INSERT INTO people (id, name, age) VALUES (3, 'carol', 40)")
+  check("3 rows present after inserts", to_num(list_len(rdb_read_committed_rows("people"))), 3)
+
+  # --- SELECT * ---
+  let sel = run_and_get(db, "SELECT * FROM people")
+  check("select * returns rows", sel[1][0], "rows")
+  check("select * returns 3 rows", to_num(list_len(sel[1][2])), 3)
+
+  # --- SELECT with WHERE ---
+  let sel = run_and_get(db, "SELECT name FROM people WHERE age > 28")
+  check("where age > 28 returns 2 rows", to_num(list_len(sel[1][2])), 2)
+
+  let sel = run_and_get(db, "SELECT name FROM people WHERE age > 28 AND age < 35")
+  check("compound AND where returns 1 row", to_num(list_len(sel[1][2])), 1)
+  check("compound AND where returns alice", sel[1][2][0][0], "alice")
+
+  # --- specific column projection ---
+  let sel = run_and_get(db, "SELECT name, age FROM people WHERE id = 2")
+  check("projected select returns bob", sel[1][2][0][0], "bob")
+  check("projected select returns bob's age", sel[1][2][0][1], 25)
+
+  # --- UPDATE ---
+  let db = run(db, "UPDATE people SET age = 31 WHERE name = 'alice'")
+  let sel = run_and_get(db, "SELECT age FROM people WHERE name = 'alice'")
+  check("update changed alice's age", sel[1][2][0][0], 31)
+
+  # --- DELETE ---
+  let db = run(db, "DELETE FROM people WHERE name = 'bob'")
+  check("2 rows remain after delete", to_num(list_len(rdb_read_committed_rows("people"))), 2)
+
+  # --- JOIN ---
+  let db = run(db, "CREATE TABLE depts (person_id INT, dept STRING)")
+  let db = run(db, "INSERT INTO depts VALUES (1, 'engineering')")
+  let db = run(db, "INSERT INTO depts VALUES (3, 'sales')")
+  let sel = run_and_get(db, "SELECT people.name, depts.dept FROM people JOIN depts ON people.id = depts.person_id")
+  check("join produces 2 matched rows", to_num(list_len(sel[1][2])), 2)
+  let names = [sel[1][2][0][0], sel[1][2][1][0]]
+  check("join includes alice", rdb_list_contains(names, "alice"), true)
+  check("join includes carol", rdb_list_contains(names, "carol"), true)
+
+  # --- transactions ---
+  let outcome = run_and_get(db, "BEGIN")
+  let db = outcome[0]
+  check("begin ok", outcome[1][0], "ok")
+  let db = run(db, "INSERT INTO people VALUES (4, 'dave', 22)")
+  check("insert inside tx not yet committed to storage", to_num(list_len(rdb_read_committed_rows("people"))), 2)
+  let outcome = run_and_get(db, "SELECT * FROM people")
+  check("but the SAME transaction sees its own uncommitted write", to_num(list_len(outcome[1][2])), 3)
+
+  # a genuine cross-call round-trip DURING the open transaction -- this is
+  # exactly the browser's per-statement pattern (each SQL submission is a
+  # separate runWasm call), and exactly the scenario a real bug slipped
+  # through in: an earlier rdb_serialize emitted only the staged view under
+  # the same "TABLE:" marker as committed data, so rdb_deserialize wrote it
+  # back as the new committed baseline -- meaning ROLLBACK on this next
+  # "call" would have had nothing correct left to roll back to.
+  let text = rdb_serialize(db)
+  let db = rdb_deserialize(text)
+  check("committed storage still 2 rows after a round-trip mid-transaction", to_num(list_len(rdb_read_committed_rows("people"))), 2)
+  check("tx_open survived the round-trip", db[1], "1")
+  let outcome = run_and_get(db, "SELECT * FROM people")
+  check("the re-hydrated transaction still sees its own uncommitted write", to_num(list_len(outcome[1][2])), 3)
+
+  let outcome = run_and_get(db, "ROLLBACK")
+  let db = outcome[0]
+  check("rollback ok", outcome[1][0], "ok")
+  check("rollback discarded the insert", to_num(list_len(rdb_read_committed_rows("people"))), 2)
+
+  let db = run(db, "BEGIN")
+  let db = run(db, "INSERT INTO people VALUES (4, 'dave', 22)")
+  let db = run(db, "COMMIT")
+  check("commit persisted the insert", to_num(list_len(rdb_read_committed_rows("people"))), 3)
+
+  # --- recoverable errors ---
+  let bad = run_and_get(db, "SELECT * FROM nosuchtable")
+  check("selecting from a missing table is a recoverable error", bad[1][0], "error")
+  let bad2 = sql_parse("SELECT FROM WHERE")
+  check("garbage SQL parses to a recoverable error, not a crash", bad2[0], "error")
+  let bad3 = run_and_get(db, "COMMIT")
+  check("commit with no open transaction is a recoverable error", bad3[1][0], "error")
+
+  # --- serialization round-trip through the SQL layer ---
+  let text = rdb_serialize(db)
+  let round_tripped = rdb_deserialize(text)
+  let sel = sql_execute(round_tripped, sql_parse("SELECT * FROM people"), "0")
+  check("round-tripped db still queryable", to_num(list_len(sel[1][2])), 3)
+
+  t_report()
+  return get("__vars", "t_fail") == 0
+end
+
+run_sql_tests()

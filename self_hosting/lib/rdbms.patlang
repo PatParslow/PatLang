@@ -1,0 +1,459 @@
+# A small transactional RDBMS: CSV-backed tables over PatLang's existing
+# virtual filesystem (vfs_read/vfs_write/vfs_exists -- already works on
+# every target including WASM), single-writer transactions (BEGIN stages
+# writes separately from committed data; COMMIT makes them visible and, on
+# native only, flushes to real files via the existing vfs_flush_to_disk;
+# ROLLBACK just discards the staged copy). See self_hosting/lib/sql.patlang
+# for the SQL tokenizer/parser/executor built on top of this, and
+# self_hosting/examples/rdbms_demo.patlang for a scripted CLI test suite.
+#
+# No real concurrency control exists to build on (PatLang has no locking
+# primitive), so this is deliberately single-writer: exactly one
+# transaction can be open at a time, tracked in `db_state`. That's an
+# honest match for what the language can actually guarantee, not a
+# shortcut hiding a harder problem.
+#
+# STORAGE: one CSV file per table, "tables/<name>.csv" (header row + data
+# rows, comma-separated, NO quoting/escaping -- a real limitation, not an
+# oversight: string values can't contain commas or newlines in v1). A
+# sibling schema file, "tables/<name>.schema", one "col:type" line per
+# column (type is "int" or "string").
+#
+# BROWSER STATE MODEL: same lesson as the hex RTS -- a fresh WASM instance
+# gets a fresh, empty VFS every call, so nothing persists on its own
+# between runWasm calls. db_serialize/db_deserialize round-trip the WHOLE
+# database (every table's schema+rows, which tables exist, whether a
+# transaction is open, and any staged-but-uncommitted table content) as one
+# text blob the caller carries forward and re-injects each call.
+
+include "includes.patlang"
+
+# Native-only: where COMMIT flushes real files to, when running natively.
+# vfs_flush_to_disk needs this to canonicalize inside PATLANG_VFS_ALLOWED_ROOT.
+make a function called rdb_data_dir returns path
+  return "portfolio/build/rdbms_data"
+end
+
+# ---- small helpers ----
+
+make a function called rdb_split_comma takes s returns fields
+  let out = []
+  let start = 0
+  let i = 0
+  let n = s.length
+  while i < n do
+    if char_code(s, i) == 44 then
+      let out = list_push(out, substr(s, start, i - start))
+      let start = i + 1
+    end
+    let i = i + 1
+  end
+  let out = list_push(out, substr(s, start, n - start))
+  return out
+end
+
+make a function called rdb_join_comma takes parts returns s
+  let b = sb_new()
+  let i = 0
+  let n = to_num(list_len(parts))
+  while i < n do
+    if i > 0 then
+      sb_push(b, ",")
+    end
+    sb_push(b, "" + parts[i])
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+make a function called rdb_list_contains takes items, target returns found
+  let i = 0
+  let n = to_num(list_len(items))
+  while i < n do
+    if items[i] == target then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called rdb_index_of takes items, target returns idx
+  let i = 0
+  let n = to_num(list_len(items))
+  while i < n do
+    if items[i] == target then
+      return i
+    end
+    let i = i + 1
+  end
+  return -1
+end
+
+# ---- paths ----
+
+make a function called rdb_csv_path takes name returns path
+  return "tables/" + name + ".csv"
+end
+
+make a function called rdb_schema_path takes name returns path
+  return "tables/" + name + ".schema"
+end
+
+# ---- schema: list of [col_name, col_type] ----
+
+make a function called rdb_schema_col_names takes schema returns names
+  let out = []
+  let i = 0
+  let n = to_num(list_len(schema))
+  while i < n do
+    let out = list_push(out, schema[i][0])
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called rdb_schema_col_type takes schema, col returns t
+  let i = 0
+  let n = to_num(list_len(schema))
+  while i < n do
+    if schema[i][0] == col then
+      return schema[i][1]
+    end
+    let i = i + 1
+  end
+  return "string"
+end
+
+make a function called rdb_schema_to_text takes schema returns text
+  let b = sb_new()
+  let i = 0
+  let n = to_num(list_len(schema))
+  while i < n do
+    if i > 0 then
+      sb_push(b, ",")
+    end
+    sb_push(b, schema[i][0] + ":" + schema[i][1])
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+make a function called rdb_schema_from_text takes text returns schema
+  let parts = rdb_split_comma(text)
+  let out = []
+  let i = 0
+  let n = to_num(list_len(parts))
+  while i < n do
+    let p = parts[i]
+    let colon = 0
+    let cn = p.length
+    while (colon < cn) and (char_code(p, colon) != 58) do
+      let colon = colon + 1
+    end
+    let col = substr(p, 0, colon)
+    let ty = substr(p, colon + 1, cn - colon - 1)
+    let out = list_push(out, [col, ty])
+    let i = i + 1
+  end
+  return out
+end
+
+# ---- row <-> text, using the schema's column types ----
+
+make a function called rdb_row_to_csv takes row returns line
+  return rdb_join_comma(row)
+end
+
+make a function called rdb_row_from_csv takes schema, line returns row
+  let fields = rdb_split_comma(line)
+  let out = []
+  let i = 0
+  let n = to_num(list_len(schema))
+  while i < n do
+    let ty = schema[i][1]
+    if ty == "int" then
+      let out = list_push(out, to_num(fields[i]))
+    else
+      let out = list_push(out, fields[i])
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# ---- reading/writing committed tables (VFS-backed) ----
+
+make a function called rdb_table_exists takes name returns yes
+  return vfs_exists(rdb_schema_path(name)) == "1"
+end
+
+make a function called rdb_read_committed_schema takes name returns schema
+  if rdb_table_exists(name) == false then
+    return []
+  end
+  return rdb_schema_from_text(vfs_read(rdb_schema_path(name)))
+end
+
+make a function called rdb_read_committed_rows takes name returns rows
+  if rdb_table_exists(name) == false then
+    return []
+  end
+  let schema = rdb_read_committed_schema(name)
+  let text = vfs_read(rdb_csv_path(name))
+  let lines = split_lines(text)
+  let out = []
+  let i = 1
+  let n = to_num(list_len(lines))
+  while i < n do
+    let line = str_trim(lines[i])
+    if line.length > 0 then
+      let out = list_push(out, rdb_row_from_csv(schema, line))
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called rdb_write_committed_table takes name, schema, rows returns done
+  vfs_write(rdb_schema_path(name), rdb_schema_to_text(schema))
+  let b = sb_new()
+  sb_push(b, rdb_join_comma(rdb_schema_col_names(schema)) + chr(10))
+  let i = 0
+  let n = to_num(list_len(rows))
+  while i < n do
+    sb_push(b, rdb_row_to_csv(rows[i]) + chr(10))
+    let i = i + 1
+  end
+  vfs_write(rdb_csv_path(name), sb_str(b))
+  return true
+end
+
+# ---- db_state: [table_names, tx_open, staged] ----
+#   table_names: list of strings (every table that exists, committed or
+#                created within the currently open transaction)
+#   tx_open:     "0" or "1"
+#   staged:      list of [name, schema, rows] for tables touched within
+#                the currently open transaction; empty when tx_open is "0"
+
+make a function called rdb_init returns db
+  return [[], "0", []]
+end
+
+make a function called rdb_find_staged takes staged, name returns idx
+  let i = 0
+  let n = to_num(list_len(staged))
+  while i < n do
+    if staged[i][0] == name then
+      return i
+    end
+    let i = i + 1
+  end
+  return -1
+end
+
+# The schema+rows a statement should actually see right now: the staged
+# version if this table has been touched within an open transaction,
+# otherwise whatever is committed.
+make a function called rdb_effective takes db, name returns schema_and_rows
+  let staged = db[2]
+  if db[1] == "1" then
+    let idx = rdb_find_staged(staged, name)
+    if idx >= 0 then
+      return [staged[idx][1], staged[idx][2]]
+    end
+  end
+  return [rdb_read_committed_schema(name), rdb_read_committed_rows(name)]
+end
+
+# Records a table's new schema+rows -- staged if a transaction is open,
+# written straight to committed storage (autocommit) otherwise. Either way
+# updates db_state's table catalog if this is a new table.
+make a function called rdb_save takes db, name, schema, rows returns new_db
+  let table_names = db[0]
+  if rdb_list_contains(table_names, name) == false then
+    let table_names = list_push(table_names, name)
+  end
+  if db[1] == "1" then
+    let staged = db[2]
+    let idx = rdb_find_staged(staged, name)
+    if idx >= 0 then
+      let staged = list_set(staged, idx, [name, schema, rows])
+    else
+      let staged = list_push(staged, [name, schema, rows])
+    end
+    return [table_names, db[1], staged]
+  end
+  rdb_write_committed_table(name, schema, rows)
+  return [table_names, db[1], db[2]]
+end
+
+# ---- transactions ----
+
+make a function called rdb_begin takes db returns new_db
+  return [db[0], "1", []]
+end
+
+# is_native: pass "1" when running natively (so committed writes should
+# also flush to real disk); "0" under WASM, where there's no real
+# filesystem to flush to.
+make a function called rdb_commit takes db, is_native returns new_db
+  let staged = db[2]
+  let i = 0
+  let n = to_num(list_len(staged))
+  while i < n do
+    let entry = staged[i]
+    rdb_write_committed_table(entry[0], entry[1], entry[2])
+    let i = i + 1
+  end
+  if (is_native == "1") and (n > 0) then
+    vfs_flush_to_disk("tables/", rdb_data_dir())
+  end
+  return [db[0], "0", []]
+end
+
+make a function called rdb_rollback takes db returns new_db
+  return [db[0], "0", []]
+end
+
+# ---- serialization (round-trips the whole database as one text blob) ----
+
+# Emits TWO layers per table: its COMMITTED content (TABLE:/SCHEMA:/ROW:,
+# always the true baseline, regardless of any open transaction) and, if a
+# transaction is open and this table has been touched within it, its
+# STAGED content too (STAGEDTABLE:/STAGEDSCHEMA:/STAGEDROW:). Bug found and
+# fixed 2026-07-13, caught by a browser functional-test harness, not by the
+# CLI test suite: an earlier version emitted only ONE layer -- whatever
+# rdb_effective() returned, staged-if-present -- under the TABLE: marker.
+# That looked right in isolation, but rdb_deserialize (below) writes
+# whatever it reads back as COMMITTED, so on the VERY NEXT call the staged,
+# uncommitted insert silently became the new baseline before ROLLBACK ever
+# ran, leaving nothing to roll back TO. The CLI suite never caught this
+# because it never round-tripped serialize/deserialize DURING an open
+# transaction (only afterward, once already committed). Keeping the two
+# layers genuinely separate on the wire is what makes ROLLBACK survive
+# across the browser's per-statement runWasm calls, not just within one.
+make a function called rdb_serialize takes db returns text
+  let b = sb_new()
+  let table_names = db[0]
+  let tx_open = db[1]
+  let staged = db[2]
+  sb_push(b, "TABLES:" + rdb_join_comma(table_names) + chr(10))
+  sb_push(b, "TX:" + tx_open + chr(10))
+  let i = 0
+  let n = to_num(list_len(table_names))
+  while i < n do
+    let name = table_names[i]
+    let schema = rdb_read_committed_schema(name)
+    let rows = rdb_read_committed_rows(name)
+    sb_push(b, "TABLE:" + name + chr(10))
+    sb_push(b, "SCHEMA:" + rdb_schema_to_text(schema) + chr(10))
+    let r = 0
+    let rn = to_num(list_len(rows))
+    while r < rn do
+      sb_push(b, "ROW:" + rdb_row_to_csv(rows[r]) + chr(10))
+      let r = r + 1
+    end
+    let i = i + 1
+  end
+  if tx_open == "1" then
+    let s = 0
+    let sn = to_num(list_len(staged))
+    while s < sn do
+      let entry = staged[s]
+      sb_push(b, "STAGEDTABLE:" + entry[0] + chr(10))
+      sb_push(b, "STAGEDSCHEMA:" + rdb_schema_to_text(entry[1]) + chr(10))
+      let r = 0
+      let rows = entry[2]
+      let rn = to_num(list_len(rows))
+      while r < rn do
+        sb_push(b, "STAGEDROW:" + rdb_row_to_csv(rows[r]) + chr(10))
+        let r = r + 1
+      end
+      let s = s + 1
+    end
+  end
+  return sb_str(b)
+end
+
+# Rebuilds db_state: TABLE:/SCHEMA:/ROW: blocks are written straight into
+# the VFS as the true committed baseline; STAGEDTABLE:/STAGEDSCHEMA:/
+# STAGEDROW: blocks are reconstructed into db.staged WITHOUT touching the
+# VFS, so a still-open transaction's uncommitted work survives across
+# calls as genuinely uncommitted -- ROLLBACK on a later call has the real
+# pre-transaction baseline to fall back to.
+make a function called rdb_deserialize takes text returns db
+  let lines = split_lines(text)
+  let table_names = []
+  let tx_open = "0"
+  let cur_name = ""
+  let cur_schema = []
+  let cur_rows = []
+  let have_cur = false
+  let i = 0
+  let n = to_num(list_len(lines))
+  let staged = []
+  let cur_staged_name = ""
+  let cur_staged_schema = []
+  let cur_staged_rows = []
+  let have_staged_cur = false
+  while i < n do
+    let line = str_trim(lines[i])
+    if line.length > 0 then
+      if str_starts_with(line, "TABLES:") then
+        let names_text = substr(line, 7, line.length - 7)
+        if names_text.length > 0 then
+          let table_names = rdb_split_comma(names_text)
+        end
+      else
+        if str_starts_with(line, "TX:") then
+          let tx_open = substr(line, 3, line.length - 3)
+        else
+          if str_starts_with(line, "STAGEDTABLE:") then
+            if have_staged_cur then
+              let staged = list_push(staged, [cur_staged_name, cur_staged_schema, cur_staged_rows])
+            end
+            let cur_staged_name = substr(line, 12, line.length - 12)
+            let cur_staged_schema = []
+            let cur_staged_rows = []
+            let have_staged_cur = true
+          else
+            if str_starts_with(line, "STAGEDSCHEMA:") then
+              let cur_staged_schema = rdb_schema_from_text(substr(line, 13, line.length - 13))
+            else
+              if str_starts_with(line, "STAGEDROW:") then
+                let cur_staged_rows = list_push(cur_staged_rows, rdb_row_from_csv(cur_staged_schema, substr(line, 10, line.length - 10)))
+              else
+                if str_starts_with(line, "TABLE:") then
+                  if have_cur then
+                    rdb_write_committed_table(cur_name, cur_schema, cur_rows)
+                  end
+                  let cur_name = substr(line, 6, line.length - 6)
+                  let cur_schema = []
+                  let cur_rows = []
+                  let have_cur = true
+                else
+                  if str_starts_with(line, "SCHEMA:") then
+                    let cur_schema = rdb_schema_from_text(substr(line, 7, line.length - 7))
+                  else
+                    if str_starts_with(line, "ROW:") then
+                      let cur_rows = list_push(cur_rows, rdb_row_from_csv(cur_schema, substr(line, 4, line.length - 4)))
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+    let i = i + 1
+  end
+  if have_cur then
+    rdb_write_committed_table(cur_name, cur_schema, cur_rows)
+  end
+  if have_staged_cur then
+    let staged = list_push(staged, [cur_staged_name, cur_staged_schema, cur_staged_rows])
+  end
+  return [table_names, tx_open, staged]
+end
