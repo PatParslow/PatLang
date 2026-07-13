@@ -1,0 +1,88 @@
+# A self-hosted build daemon: run this program once to start it as the
+# primary (it does an initial build cycle, then holds a signal port and
+# waits), then run it again from a separate invocation with "status",
+# "rebuild", or "quit" as an argument.
+#
+#   pat --ir-run self_hosting/examples/build_daemon_demo.patlang &
+#   pat --ir-run self_hosting/examples/build_daemon_demo.patlang status
+#   pat --ir-run self_hosting/examples/build_daemon_demo.patlang rebuild
+#   pat --ir-run self_hosting/examples/build_daemon_demo.patlang quit
+#
+# Five PatLang capabilities working together here, all in
+# self_hosting/lib/build_daemon.patlang (this file is just the driver):
+# logic (rule_add/solve, "which targets are stale"), goal-seeking
+# (action_add/plan, GOAP, "what order to build in, weighted by real
+# historical cost"), self-timing + persistence (now_ms(), a history file
+# that survives between runs), events (when/emit, driving the dashboard
+# below), and runtime signals (this file's own status/rebuild/quit
+# handling, via self_hosting/lib/signals.patlang).
+
+include "../lib/build_daemon.patlang"
+
+let BD_PORT = 9410
+
+when bd_job_started do
+  let colon = find_substr_signals(event_data, ":")
+  let target = substr(event_data, 0, colon)
+  let est = substr(event_data, colon + 1, event_data.length - colon - 1)
+  let done = get("__vars", "bd_done_count")
+  let total = get("__vars", "bd_plan_len")
+  print("[" + (done + 1) + "/" + total + "] " + target + ": building (est. " + est + "ms)")
+end
+
+when bd_job_finished do
+  let colon = find_substr_signals(event_data, ":")
+  let target = substr(event_data, 0, colon)
+  let actual = substr(event_data, colon + 1, event_data.length - colon - 1)
+  let done = get("__vars", "bd_done_count")
+  let total = get("__vars", "bd_plan_len")
+  print("[" + done + "/" + total + "] " + target + ": done (" + actual + "ms actual)")
+end
+
+when status do
+  let total = get("__vars", "bd_plan_len")
+  let done = get("__vars", "bd_done_count")
+  let eta = get("__vars", "bd_eta_total_ms")
+  signal_reply("build daemon: last cycle rebuilt " + done + "/" + total + " target(s), estimated " + eta + "ms total")
+end
+
+when rebuild do
+  print("DAEMON: rebuild requested")
+  set_var("bd_rebuild_requested", "1")
+end
+
+when quit do
+  print("DAEMON: quit requested, shutting down")
+  set_var("bd_should_stop", "1")
+end
+
+let cli_args = argv()
+
+let port_id = signal_claim(BD_PORT)
+if port_id >= 0 then
+  print("DAEMON: holding port " + BD_PORT + ", running initial build cycle")
+  bd_run_cycle()
+  print("DAEMON: initial cycle done, watching for signals (status / rebuild / quit)")
+  set_var("bd_should_stop", "0")
+  set_var("bd_rebuild_requested", "0")
+  while get("__vars", "bd_should_stop") == "0" do
+    signal_poll(port_id, 200)
+    if get("__vars", "bd_rebuild_requested") == "1" then
+      set_var("bd_rebuild_requested", "0")
+      bd_run_cycle()
+    end
+  end
+  print("DAEMON: exiting")
+else
+  let sig_name = "status"
+  if cli_args.length > 0 then
+    let sig_name = cli_args[0]
+  end
+  if sig_name == "status" then
+    let reply = signal_query(BD_PORT, "status", "")
+    print("CLIENT: " + reply)
+  else
+    signal_send(BD_PORT, sig_name, "")
+    print("CLIENT: sent '" + sig_name + "' to the daemon")
+  end
+end

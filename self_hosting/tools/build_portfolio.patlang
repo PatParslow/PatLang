@@ -385,6 +385,15 @@ make a function called build_precompile_jobs returns jobs
   end
   let jobs = add_job(jobs, "signalsdemo", read_file("self_hosting/lib/signals.patlang") + chr(10) + sig_demo_body, "")
 
+  # builddaemon: strip three include lines (its own include of
+  # build_daemon.patlang, plus that library's own includes of
+  # signals.patlang and includes.patlang) before concatenating all four
+  # files' real content in dependency order.
+  let bd_demo_body = strip_include_line(read_file("self_hosting/examples/build_daemon_demo_transcript.patlang"), "../lib/build_daemon.patlang")
+  let bd_lib_body = strip_include_line(strip_include_line(read_file("self_hosting/lib/build_daemon.patlang"), "signals.patlang"), "includes.patlang")
+  let bd_src = read_file("self_hosting/lib/signals.patlang") + chr(10) + read_file("self_hosting/lib/includes.patlang") + chr(10) + bd_lib_body + chr(10) + bd_demo_body
+  let jobs = add_job(jobs, "builddaemon", bd_src, "")
+
   # routerdsl needs its DSL-expansion side effect run first (writes
   # portfolio/build/router_dsl_expanded.patlang), duplicating the same
   # tokenize/parse_program/lower_program/run_ir pipeline used at its real
@@ -1022,6 +1031,21 @@ compile_native(signals_src, "signalsdemo")
 let signals_native = exec_capture("portfolio/build/signalsdemo.exe")
 print("signals demo done")
 
+# ---- build daemon: the exemplar system tying together logic (rule_add/
+# solve, "which targets are stale"), goal-seeking (action_add/plan, GOAP,
+# cost-weighted by real historical timing), self-timing + persistence
+# (now_ms(), a history file surviving between runs), events (when/emit
+# driving the dashboard), and runtime signals (status/rebuild/quit) --
+# see self_hosting/lib/build_daemon.patlang's own header for the full
+# rationale. Same three-include-lines-stripped concatenation as the
+# builddaemon precompile-job entry above.
+let builddaemon_demo_body = strip_include_line(read_file("self_hosting/examples/build_daemon_demo_transcript.patlang"), "../lib/build_daemon.patlang")
+let builddaemon_lib_body = strip_include_line(strip_include_line(read_file("self_hosting/lib/build_daemon.patlang"), "signals.patlang"), "includes.patlang")
+let builddaemon_src = read_file("self_hosting/lib/signals.patlang") + chr(10) + read_file("self_hosting/lib/includes.patlang") + chr(10) + builddaemon_lib_body + chr(10) + builddaemon_demo_body
+compile_native(builddaemon_src, "builddaemon")
+let builddaemon_native = exec_capture("portfolio/build/builddaemon.exe")
+print("build daemon demo done")
+
 # User-defined DSL demo: `syntax RouterDSL { ... }` + `routes { ... }` blocks
 # in self_hosting/examples/router_dsl_demo.patlang are expanded to plain
 # `register_route(...)` calls by self_hosting/lib/syntax_dsl.patlang (a
@@ -1159,6 +1183,26 @@ make a function called find_substr takes hay, needle returns idx
     let i = i + 1
   end
   return -1
+end
+
+# Removes one `include "path"` line from src, if present. Every demo whose
+# source is fed to patc1_compile via a scratch file (portfolio/build/<id>.
+# patlang) needs its include lines stripped and replaced by manually
+# concatenating the referenced file's own content first -- a relative
+# include path that's correct for the file's real location on disk
+# resolves to the wrong place once copied to that scratch path. See
+# signalsdemo's own comment (first demo to hit this) for the fuller
+# rationale; this is the generalized, reusable version of that same
+# one-off strip, since builddaemon needs it applied three times (its own
+# include of build_daemon.patlang, plus that library's own two includes of
+# signals.patlang and includes.patlang).
+make a function called strip_include_line takes src, path returns stripped
+  let line = "include " + q() + path + q()
+  let at = find_substr(src, line)
+  if at < 0 then
+    return src
+  end
+  return substr(src, 0, at) + substr(src, at + line.length, src.length - at - line.length)
 end
 
 let flow_doc = read_file("portfolio/flowgraph.html")
@@ -1889,6 +1933,8 @@ let manifest_text = read_file("self_hosting/patbuild.manifest")
 native_page("patbuild", "patbuild: a goal-oriented build system", "Driven by a manifest file (<code>self_hosting/patbuild.manifest</code>):<pre class='out'>" + html_escape(manifest_text) + "</pre>Targets are objects, dependencies are walked recursively, finished builds become <code>fact</code>s, progress is reported via events. By default each target is only lowered to IR and checked (no rustc at all, matching the in-browser playground); pass <code>--native</code> to also compile every target to a real executable via rustc &mdash; the transcript below was captured that way. <strong>Native transcript only, no &quot;run in browser&quot; button</strong>: unlike the demos above, patbuild genuinely needs real filesystem access it can't get in the WASI sandbox &mdash; it reads the manifest file plus every target's own source file from disk by path, and (with <code>--native</code>) invokes a real <code>rustc</code> subprocess per target, neither of which a browser sandbox can provide. This is a capability limit, not a performance one (compare the dynamic-syntax demo below, which CAN run in-browser, just impractically slowly for now).", patbuild_src, patbuild_native)
 
 native_page("signalsdemo", "Runtime signals: quit and status from outside the process", "A running PatLang program can receive a named signal + optional payload from OUTSIDE itself &mdash; a second CLI invocation (<code>server.exe --quit</code> sent to an already-running server, not a new one) or a local network call &mdash; dispatched through the same <code>when &lt;name&gt; do ... end</code> / <code>emit(...)</code> mechanism every other event in PatLang already uses, not a new handler concept. <code>signal_claim(port)</code> lets a process become the &quot;primary&quot; holder of a port (a second bind to the same port simply failing IS the &quot;is a primary already running&quot; detector, for free); a process that can't claim it instead calls <code>signal_send(port, name, payload)</code> for fire-and-forget signals like <code>quit</code>, or <code>signal_query(port, name, payload)</code> for request/response signals like <code>status</code>, which waits for and returns whatever the primary's handler passed to <code>signal_reply(text)</code>. This demo's real, live state (an uptime counter and a ping tally, both genuinely tracked while the process runs) is what <code>status</code> actually reports back &mdash; not a canned string. <strong>Native transcript only, no &quot;run in browser&quot; button</strong>: this needs real TCP sockets and real separate OS processes, neither available in the WASI sandbox. The transcript below simulates the primary/secondary roles as two real OS threads within one process (build-time transcripts need to run to completion, but a real primary only exits once it receives <code>quit</code>) &mdash; the source shown is the real <code>self_hosting/lib/signals.patlang</code> library plus that thread-based driver; see <code>self_hosting/examples/signals_demo.patlang</code> for the genuine two-separate-process form you'd actually run yourself: start it once in the background, then run it again with <code>quit</code>, <code>status</code>, or <code>ping &lt;message&gt;</code> as arguments.", signals_src, signals_native)
+
+native_page("builddaemon", "Exemplar: a build daemon combining logic, GOAP, signals, events, and self-timing", "A self-hosted build daemon showing five of PatLang's less-usual capabilities working together in one program. <strong>Logic</strong> (<code>rule_add</code>/<code>solve</code>) derives which of six synthetic build targets are stale from <code>dep(target, dependency)</code>/<code>changed(target)</code> facts, by real multi-hop backward chaining, not a hand-written graph walk. <strong>Goal-seeking</strong> (<code>action_add</code>/<code>plan</code>, GOAP) then produces the actual cost-optimal rebuild order &mdash; and the cost of each action is that target's own <em>real, historically measured</em> build duration, not a guess: the planner is reasoning about genuine past performance. <strong>Self-timing</strong> (<code>now_ms()</code>) records every build's real duration to a small history file that survives between runs, seeding both the GOAP costs above and an upfront ETA on the very next run. <strong>Events</strong> (<code>when</code>/<code>emit</code>) drive a live dashboard as each target builds. <strong>Signals</strong> (<code>self_hosting/lib/signals.patlang</code>, unchanged) let a separate CLI invocation query live <code>status</code> (rebuilt count, ETA) or trigger <code>rebuild</code>/<code>quit</code> against the running daemon. The build graph is deliberately synthetic (fake targets, <code>sleep_ms</code> standing in for real compile work) so these five features stay legible rather than the demo being coupled to a slow, real build pipeline. <strong>Native transcript only, no &quot;run in browser&quot; button</strong>: needs real TCP sockets, a real persisted file, and real separate OS processes. The transcript below simulates the primary/secondary roles as two real OS threads within one process, for the same build-time-capture reason the signals demo above does &mdash; see <code>self_hosting/examples/build_daemon_demo.patlang</code> for the genuine two-separate-process form you'd actually run yourself.", builddaemon_src, builddaemon_native)
 # flowgraph-demo: live in-browser variant (flowgraph_wasm_b64, built
 # above) with a paste-your-own-program editor, PLUS the CLI tool's own
 # source and native transcript of the curated multi-program set it renders
@@ -2020,6 +2066,7 @@ let demo_links = [
   ["rulesyntax", "Declarative rule syntax"],
   ["vfsdemo", "Virtual filesystem"],
   ["signalsdemo", "Runtime signals: quit and status"],
+  ["builddaemon", "Exemplar: logic + GOAP + signals + events + self-timing"],
   ["towerdemo", "Numeric Tower: BigInt, Rational, Complex"],
   ["routerdsl", "User-defined DSL: routes { ... }"],
   ["dynsyntax", "Dynamic syntax: grammar extensions as runtime data"],

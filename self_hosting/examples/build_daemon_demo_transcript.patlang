@@ -1,0 +1,110 @@
+# Build-transcript variant of build_daemon_demo.patlang: the real,
+# intended usage is two separate OS PROCESSES (see build_daemon_demo.patlang
+# and its own header comment) -- but a build script capturing a native
+# transcript via exec_capture can't demonstrate that directly, since
+# exec_capture blocks until its child exits, and the daemon only exits once
+# it receives a quit signal from somewhere else. So this variant simulates
+# the primary/secondary roles as two real OS threads (parallel_map) within
+# ONE process instead of two separate ones -- same build_daemon.patlang
+# functions, same TCP loopback signal delivery, same emit()-driven
+# dashboard, just both ends visible in a single captured transcript.
+#
+# Port and target literals below are inlined rather than read from a
+# top-level `let` constant referenced inside run_primary/run_secondary --
+# functions invoked via parallel_map were found this session to not see
+# top-level `let`s at all (each worker's fresh interpreter jumps straight
+# into the target function, skipping the top-level statements that would
+# normally set such a constant on the main thread); see
+# self_hosting/examples/signals_demo_transcript.patlang for the first
+# demo that hit this and self_hosting/lib/build_daemon.patlang's own
+# header comment for the related (broader) patc1.exe-specific version.
+
+include "../lib/build_daemon.patlang"
+
+when bd_job_started do
+  let colon = find_substr_signals(event_data, ":")
+  let target = substr(event_data, 0, colon)
+  let est = substr(event_data, colon + 1, event_data.length - colon - 1)
+  let done = get("__vars", "bd_done_count")
+  let total = get("__vars", "bd_plan_len")
+  print("PRIMARY: [" + (done + 1) + "/" + total + "] " + target + ": building (est. " + est + "ms)")
+end
+
+when bd_job_finished do
+  let colon = find_substr_signals(event_data, ":")
+  let target = substr(event_data, 0, colon)
+  let actual = substr(event_data, colon + 1, event_data.length - colon - 1)
+  let done = get("__vars", "bd_done_count")
+  let total = get("__vars", "bd_plan_len")
+  print("PRIMARY: [" + done + "/" + total + "] " + target + ": done (" + actual + "ms actual)")
+end
+
+when status do
+  let total = get("__vars", "bd_plan_len")
+  let done = get("__vars", "bd_done_count")
+  let eta = get("__vars", "bd_eta_total_ms")
+  signal_reply("build daemon: last cycle rebuilt " + done + "/" + total + " target(s), estimated " + eta + "ms total")
+end
+
+when rebuild do
+  print("PRIMARY: rebuild requested")
+  set_var("bd_rebuild_requested", "1")
+end
+
+when quit do
+  print("PRIMARY: quit requested, shutting down")
+  set_var("bd_should_stop", "1")
+end
+
+make a function called run_primary takes unused returns done
+  let port_id = signal_claim(9411)
+  print("PRIMARY: holding port 9411, running initial build cycle")
+  bd_run_cycle()
+  print("PRIMARY: initial cycle done, watching for signals")
+  set_var("bd_should_stop", "0")
+  set_var("bd_rebuild_requested", "0")
+  while get("__vars", "bd_should_stop") == "0" do
+    signal_poll(port_id, 50)
+    if get("__vars", "bd_rebuild_requested") == "1" then
+      set_var("bd_rebuild_requested", "0")
+      bd_run_cycle()
+    end
+  end
+  print("PRIMARY: exiting")
+  return true
+end
+
+make a function called run_secondary takes unused returns done
+  # The primary's initial cycle (6 fresh targets, default costs summing to
+  # ~1650ms worst case) needs to actually finish and reach its signal-
+  # polling loop before there's anything meaningful to query -- a signal
+  # sent earlier would just sit queued in the OS backlog, unprocessed,
+  # until the primary gets there anyway. 1900ms comfortably clears that.
+  sleep_ms(1900)
+  print("SECONDARY: querying status")
+  let reply1 = signal_query(9411, "status", "")
+  print("SECONDARY: " + reply1)
+  sleep_ms(100)
+  print("SECONDARY: requesting rebuild")
+  signal_send(9411, "rebuild", "")
+  sleep_ms(200)
+  print("SECONDARY: querying status again")
+  let reply2 = signal_query(9411, "status", "")
+  print("SECONDARY: " + reply2)
+  sleep_ms(100)
+  print("SECONDARY: sending quit")
+  signal_send(9411, "quit", "")
+  return true
+end
+
+make a function called run_thread takes kind returns done
+  if kind == "primary" then
+    return run_primary(0)
+  else
+    return run_secondary(0)
+  end
+end
+
+print("before parallel_map")
+parallel_map(["primary", "secondary"], "run_thread")
+print("DONE")

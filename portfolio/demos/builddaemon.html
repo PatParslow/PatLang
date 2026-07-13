@@ -1,0 +1,825 @@
+<h1>Exemplar: a build daemon combining logic, GOAP, signals, events, and self-timing</h1>
+<p>A self-hosted build daemon showing five of PatLang's less-usual capabilities working together in one program. <strong>Logic</strong> (<code>rule_add</code>/<code>solve</code>) derives which of six synthetic build targets are stale from <code>dep(target, dependency)</code>/<code>changed(target)</code> facts, by real multi-hop backward chaining, not a hand-written graph walk. <strong>Goal-seeking</strong> (<code>action_add</code>/<code>plan</code>, GOAP) then produces the actual cost-optimal rebuild order &mdash; and the cost of each action is that target's own <em>real, historically measured</em> build duration, not a guess: the planner is reasoning about genuine past performance. <strong>Self-timing</strong> (<code>now_ms()</code>) records every build's real duration to a small history file that survives between runs, seeding both the GOAP costs above and an upfront ETA on the very next run. <strong>Events</strong> (<code>when</code>/<code>emit</code>) drive a live dashboard as each target builds. <strong>Signals</strong> (<code>self_hosting/lib/signals.patlang</code>, unchanged) let a separate CLI invocation query live <code>status</code> (rebuilt count, ETA) or trigger <code>rebuild</code>/<code>quit</code> against the running daemon. The build graph is deliberately synthetic (fake targets, <code>sleep_ms</code> standing in for real compile work) so these five features stay legible rather than the demo being coupled to a slow, real build pipeline. <strong>Native transcript only, no &quot;run in browser&quot; button</strong>: needs real TCP sockets, a real persisted file, and real separate OS processes. The transcript below simulates the primary/secondary roles as two real OS threads within one process, for the same build-time-capture reason the signals demo above does &mdash; see <code>self_hosting/examples/build_daemon_demo.patlang</code> for the genuine two-separate-process form you'd actually run yourself.</p>
+<details><summary>PatLang source</summary><pre class='src'># Runtime signals for PatLang programs: a running process can receive a
+# named signal + optional payload from OUTSIDE itself -- a second CLI
+# invocation (&quot;server.exe --quit&quot; sent to an already-running server, not a
+# second server starting up), or a local network call. Delivery reuses
+# tcp_connect/tcp_read/tcp_write/tcp_close exactly as they already existed,
+# and dispatch reuses the existing when/emit event mechanism (see
+# self_hosting/examples/event_loop_server.patlang) -- a signal just becomes
+# an emit() call, so any `when &lt;name&gt; do ... end` handler already in the
+# receiving program fires normally, no new handler concept needed.
+#
+# The trick this relies on: tcp_listen binds 127.0.0.1 only (hosts.rs's
+# host_tcp_listen -- not configurable, not a new restriction added here),
+# and a second bind to the SAME port simply fails. That failure IS the &quot;is
+# a primary already running&quot; detector, for free -- no separate lockfile/
+# PID-file mechanism needed (PatLang has none today; this doesn't add one).
+# The one genuinely new host function this needed: tcp_try_listen(port) -&gt;
+# port_id or -1 on AddrInUse specifically, rather than tcp_listen's fatal-
+# on-any-bind-failure behavior -- PatLang has no try/catch, so there was no
+# way to gracefully ask &quot;is something already listening&quot; without it. See
+# hosts.rs's host_tcp_try_listen for the full rationale.
+#
+# Usage shape (see self_hosting/examples/signals_demo.patlang for a full
+# worked example, including a request/response &quot;status&quot; signal):
+#   let port_id = signal_claim(9401)
+#   if port_id &gt;= 0 then
+#     # primary: hold the port, poll it inside your own event loop
+#     when quit do set_var(&quot;should_stop&quot;, &quot;1&quot;) end
+#     when status do signal_reply(&quot;uptime: &quot; + get(&quot;__vars&quot;, &quot;uptime&quot;)) end
+#     while running do
+#       ... your own work ...
+#       signal_poll(port_id, 20)   # cheap, non-blocking; fires when/emit
+#     end
+#   else
+#     # secondary: someone else already owns this port
+#     signal_send(9401, &quot;quit&quot;, &quot;&quot;)           # fire-and-forget
+#     let reply = signal_query(9401, &quot;status&quot;, &quot;&quot;)  # request/response
+#     print(reply)
+#   end
+#
+# Deliberately minimal wire format (one line: &quot;name\npayload&quot;, a single
+# write + a single read, no length-prefix framing) -- matches this
+# codebase's existing pragmatic style for small local control messages
+# (see event_loop_server.patlang's own plain HTTP-ish read/write), not
+# meant for large payloads. Localhost-only by construction (see above), so
+# no separate auth story yet -- a real network-facing signal listener would
+# need one before ever binding beyond 127.0.0.1; out of scope here, same as
+# this feature's own backlog note said from the start.
+
+# signal_claim(port) -&gt; port_id (&gt;= 0) if this process is now the primary
+# holder of `port` for signal delivery, or -1 if another process already
+# holds it (the caller should treat that as &quot;an instance is already
+# running&quot; and typically call signal_send instead). Uses tcp_try_listen,
+# NOT plain tcp_listen -- PatLang has no try/catch, so tcp_listen's bind
+# failure is a FATAL error (would abort the whole program), not something
+# this function could catch and turn into a graceful -1. tcp_try_listen
+# was added specifically for this: -1 only for &quot;already in use&quot;, any other
+# bind failure (invalid port, permission denied) still aborts, same as
+# plain tcp_listen would.
+make a function called signal_claim takes port returns port_id
+  return tcp_try_listen(port)
+end
+
+# signal_poll(port_id, timeout_ms) -&gt; the signal name received this call,
+# or &quot;&quot; if none arrived within timeout_ms. On receipt, also calls
+# emit(name, payload) so any `when name do ... end` handler in the calling
+# program fires immediately -- callers that only need &quot;did something
+# arrive&quot; can ignore the return value and rely purely on their own `when`
+# handlers, matching event_loop_server.patlang's existing emit-driven style.
+#
+# Query-style signals (e.g. &quot;status&quot;) get a reply channel: any `when`
+# handler can call signal_reply(text) before returning, and that text is
+# written back on the SAME connection before it's closed -- the connection
+# is deliberately kept open across the emit() call rather than closed
+# immediately after reading, specifically so a handler has something to
+# reply on. Fire-and-forget signals (e.g. &quot;quit&quot;) simply never call
+# signal_reply, so an empty string is written back and the sender (using
+# plain signal_send, which never reads a reply) never notices either way.
+make a function called signal_poll takes port_id, timeout_ms returns name
+  let conn = tcp_accept_timeout(port_id, timeout_ms)
+  if conn &lt; 0 then
+    return &quot;&quot;
+  end
+  let msg = tcp_read(conn)
+  let nl = find_substr_signals(msg, chr(10))
+  let sig_name = msg
+  let payload = &quot;&quot;
+  if nl &gt;= 0 then
+    let sig_name = substr(msg, 0, nl)
+    let payload = substr(msg, nl + 1, msg.length - nl - 1)
+  end
+  set_var(&quot;__signal_reply&quot;, &quot;&quot;)
+  emit(sig_name, payload)
+  tcp_write(conn, get(&quot;__vars&quot;, &quot;__signal_reply&quot;))
+  tcp_close(conn)
+  return sig_name
+end
+
+# signal_reply(text) -- call from inside a `when &lt;name&gt; do ... end` handler
+# to send `text` back to whoever sent that signal via signal_query. Has no
+# effect (silently ignored) if the signal was delivered via signal_send
+# instead (fire-and-forget senders never read a reply anyway) or if this is
+# called outside of a signal-triggered handler at all.
+make a function called signal_reply takes text returns done
+  set_var(&quot;__signal_reply&quot;, text)
+  return true
+end
+
+# signal_send(port, name, payload) -&gt; true once delivered, discarding any
+# reply. Use this for fire-and-forget signals (e.g. &quot;quit&quot;) where you don't
+# need a response. Only call this after signal_claim(port) has already
+# told you a primary holds the port (the intended usage shape above) --
+# PatLang has no try/catch, so unlike signal_claim (which checks
+# tcp_listen's own -1-on-failure return), tcp_connect raises a FATAL
+# host-function error if nothing is listening, not a value this function
+# could catch and turn into a graceful `false`. In practice this only
+# matters for the narrow race where the primary exits between your
+# signal_claim failing and this call running -- if that happens the caller
+# sees a clear &quot;tcp_connect: ... connection refused&quot; error and the process
+# aborts, which is an honest failure mode for a fire-and-forget CLI
+# signal, not a silent no-op.
+make a function called signal_send takes port, name, payload returns delivered
+  signal_query(port, name, payload)
+  return true
+end
+
+# signal_query(port, name, payload) -&gt; whatever the primary's `when &lt;name&gt;
+# do ... end` handler passed to signal_reply(...), or &quot;&quot; if it didn't call
+# signal_reply at all. Use this for request/response signals (e.g.
+# &quot;status&quot;). Same fatal-on-nothing-listening caveat as signal_send (no
+# try/catch to catch tcp_connect's error gracefully).
+make a function called signal_query takes port, name, payload returns reply
+  let conn = tcp_connect(&quot;127.0.0.1&quot;, port)
+  tcp_write(conn, name + chr(10) + payload)
+  let reply = tcp_read(conn)
+  tcp_close(conn)
+  return reply
+end
+
+# Tiny local substring search -- self-contained rather than depending on
+# whichever example/tool happens to define one, since this is a shared
+# library other programs `include`.
+make a function called find_substr_signals takes hay, needle returns idx
+  if needle.length == 0 then
+    return 0
+  end
+  let i = 0
+  while i &lt;= (hay.length - needle.length) do
+    if substr(hay, i, needle.length) == needle then
+      return i
+    end
+    let i = i + 1
+  end
+  return -1
+end
+
+# Self-hosted mirror of rust-runtime/src/preprocess.rs's expand_includes:
+# expands `include &quot;relative/path.patlang&quot;` lines by splicing the
+# referenced file's contents in place, resolving paths relative to the
+# including file's own directory, recursively.
+#
+# Why this exists as PatLang, not just Rust: `expand_includes` was
+# previously a NATIVE-ONLY preprocessing step (main.rs, run before the
+# frontend ever sees the source) -- patc1.exe's own self-hosted lexer/
+# parser never learned to do this, so any .patlang file using `include`
+# could only be compiled via the native pat.exe frontend (`--ir-run`/
+# `--patc`), never handed directly to patc1.exe, which is why every
+# multi-file portfolio demo in build_portfolio.patlang manually
+# concatenates dependency files (read_file(lexer) + chr(10) + ...) instead
+# of using `include`. This closes that gap so `include` works identically
+# everywhere -- interpreted, natively compiled, and self-hosted-compiled --
+# matching this session's usual bar of &quot;verified across all three paths.&quot;
+#
+# Kept as its own small library (not folded directly into patc1_main.patlang)
+# so any self-hosted driver can `include &quot;lib/includes.patlang&quot;` and use it.
+
+# str_trim(s) -&gt; s with leading/trailing space/tab/\r stripped.
+make a function called str_trim takes s returns trimmed
+  let n = s.length
+  let start = 0
+  while (start &lt; n) and is_ws_char(char_code(s, start)) do
+    let start = start + 1
+  end
+  let end = n
+  while (end &gt; start) and is_ws_char(char_code(s, end - 1)) do
+    let end = end - 1
+  end
+  return substr(s, start, end - start)
+end
+
+make a function called is_ws_char takes code returns is_ws
+  return (code == 32) or (code == 9) or (code == 13)
+end
+
+# str_starts_with(s, prefix) -&gt; bool
+make a function called str_starts_with takes s, prefix returns matches
+  if prefix.length &gt; s.length then
+    return false
+  end
+  return substr(s, 0, prefix.length) == prefix
+end
+
+# split_lines(s) -&gt; list of lines, split on \n (a trailing \r on each line,
+# from CRLF source files, is stripped too).
+make a function called split_lines takes s returns lines
+  let out = []
+  let n = s.length
+  let start = 0
+  let i = 0
+  while i &lt; n do
+    if char_code(s, i) == 10 then
+      let raw = substr(s, start, i - start)
+      let out = list_push(out, strip_trailing_cr(raw))
+      let start = i + 1
+    end
+    let i = i + 1
+  end
+  if start &lt; n then
+    let out = list_push(out, strip_trailing_cr(substr(s, start, n - start)))
+  end
+  return out
+end
+
+make a function called strip_trailing_cr takes line returns stripped
+  let n = line.length
+  if (n &gt; 0) and (char_code(line, n - 1) == 13) then
+    return substr(line, 0, n - 1)
+  end
+  return line
+end
+
+# path_dirname(path) -&gt; everything before the last '/' or '\', or &quot;.&quot; if
+# the path has no directory component. Handles both separators since
+# build_portfolio.patlang and friends run on Windows but write forward
+# slashes in string literals.
+make a function called path_dirname takes path returns dir
+  let n = path.length
+  let i = n - 1
+  let last_sep = -1
+  while i &gt;= 0 do
+    let c = char_code(path, i)
+    if (c == 47) or (c == 92) then
+      let last_sep = i
+      let i = -1
+    else
+      let i = i - 1
+    end
+  end
+  if last_sep &lt; 0 then
+    return &quot;.&quot;
+  end
+  return substr(path, 0, last_sep)
+end
+
+# path_join(base, rel) -&gt; base + &quot;/&quot; + rel, tolerating a trailing slash on
+# base and an empty base (meaning &quot;current directory&quot;). If `rel` is itself
+# absolute (leading '/'/'\', or a Windows drive letter like &quot;C:&quot;), it's
+# returned unchanged, ignoring base -- matches Rust's PathBuf::join, which
+# preprocess.rs's native expand_includes relies on for the same case.
+make a function called path_join takes base, rel returns joined
+  if is_absolute_path(rel) then
+    return rel
+  end
+  if (base == &quot;&quot;) or (base == &quot;.&quot;) then
+    return rel
+  end
+  let n = base.length
+  if (n &gt; 0) and ((char_code(base, n - 1) == 47) or (char_code(base, n - 1) == 92)) then
+    return base + rel
+  end
+  return base + &quot;/&quot; + rel
+end
+
+make a function called is_absolute_path takes p returns is_abs
+  if p.length == 0 then
+    return false
+  end
+  let c0 = char_code(p, 0)
+  if (c0 == 47) or (c0 == 92) then
+    return true
+  end
+  if (p.length &gt;= 2) and (char_code(p, 1) == 58) then
+    return true
+  end
+  return false
+end
+
+# expand_includes(source, base_dir) -&gt; source with every `include &quot;path&quot;`
+# line recursively replaced by that file's own (recursively expanded)
+# contents, paths resolved relative to base_dir (the including file's own
+# directory) at each level, exactly matching preprocess.rs's semantics.
+#
+# The depth cap (16, matching preprocess.rs's MAX_DEPTH) is inlined as a
+# literal below rather than a top-level `let` constant referenced from
+# inside expand_includes_at_depth -- patc1.exe was found, while building
+# this, to NOT make top-level `let` constants visible inside function
+# bodies at all (confirmed via a minimal repro: the value silently reads
+# as empty/unset, not an error) even though both --ir-run and native
+# --patc handle this correctly. That's a real, previously-unknown
+# self-hosted-compiler bug, logged separately in the backlog for its own
+# dedicated fix -- this file just avoids relying on the broken behavior.
+make a function called expand_includes takes source, base_dir returns expanded
+  return expand_includes_at_depth(source, base_dir, 0)
+end
+
+make a function called expand_includes_at_depth takes source, base_dir, depth returns expanded
+  if depth &gt; 16 then
+    print(&quot;include: nesting deeper than 16 levels (cycle?)&quot;)
+    return source
+  end
+  let lines = split_lines(source)
+  let out = sb_new()
+  let i = 0
+  let n = to_num(list_len(lines))
+  while i &lt; n do
+    let line = lines[i]
+    let t = str_trim(line)
+    if str_starts_with(t, &quot;include &quot;) and (str_starts_with(t, &quot;#&quot;) == false) then
+      let rel = str_trim(substr(t, 8, t.length - 8))
+      let rel = strip_quotes(rel)
+      let path = path_join(base_dir, rel)
+      let inner = read_file(path)
+      let inner_base = path_dirname(path)
+      sb_push(out, expand_includes_at_depth(inner, inner_base, depth + 1))
+      sb_push(out, chr(10))
+    else
+      sb_push(out, line)
+      sb_push(out, chr(10))
+    end
+    let i = i + 1
+  end
+  return sb_str(out)
+end
+
+# strip_quotes(&quot;\&quot;path\&quot;&quot;) -&gt; &quot;path&quot; -- include lines are always written
+# with double-quoted paths, same as the native preprocessor expects.
+make a function called strip_quotes takes s returns unquoted
+  let n = s.length
+  if (n &gt;= 2) and (char_code(s, 0) == 34) and (char_code(s, n - 1) == 34) then
+    return substr(s, 1, n - 2)
+  end
+  return s
+end
+
+# A self-hosted build daemon -- the exemplar system tying together five of
+# PatLang's less-usual capabilities in one coherent program:
+#
+#   - LOGIC (rule_add/solve): &quot;which targets are stale&quot; is derived from
+#     dep(target, dependency) and changed(target) facts via real backward
+#     chaining, not a hand-written graph walk.
+#   - GOAL-SEEKING (action_add/plan, GOAP): &quot;what order should I build in&quot;
+#     is a real cost-optimal forward search over build actions, where each
+#     action's cost is that target's own PERSISTED HISTORICAL DURATION --
+#     the planner is reasoning about real measured time, not a guess.
+#   - SELF-TIMING (now_ms()) + PERSISTENCE: every build records its own
+#     duration to a small history file, read back on the next run to seed
+#     both the GOAP costs above and an upfront ETA.
+#   - EVENTS (when/emit): job_started/job_finished drive a live dashboard,
+#     reusing the exact pattern build_portfolio.patlang's own precompile
+#     pass uses to log concurrent progress.
+#   - SIGNALS (self_hosting/lib/signals.patlang): a running daemon answers
+#     `status` (live dashboard state + ETA) and `rebuild`/`quit` from a
+#     separate CLI invocation, without any new IPC mechanism of its own.
+#
+# The build graph itself is deliberately synthetic -- a handful of fake
+# targets &quot;compiled&quot; via sleep_ms standing in for real work -- rather than
+# wired into the real (and, as of this session, `patc1.exe`-performance-
+# anomaly-affected) build_portfolio.patlang pipeline. That keeps this
+# demo's runtime short and its five showcased features legible, which is
+# the actual point of an exemplar: see self_hosting/examples/
+# build_daemon_demo.patlang for the real, multi-process, run-it-yourself
+# form, and self_hosting/examples/goal_oriented_build_demo.patlang for the
+# original (non-daemon, non-timed) version of the logic/GOAP half alone.
+#
+# NOTE on style: every &quot;constant&quot; below (the target graph, the history
+# file path) is a FUNCTION returning a freshly-built literal, not a
+# top-level `let` read from inside other functions. That's not just
+# habit -- patc1.exe (the self-hosted compiler) was found this session to
+# make top-level `let` constants silently invisible inside ANY function
+# body when self-hosted-compiled (reads as empty, not an error; see
+# [[patlang-backlog]] item 10), so this library avoids the pattern
+# everywhere rather than risk it working under --ir-run/--patc and
+# silently breaking under patc1.exe.
+
+
+
+
+# ---- the build graph: targets and their dependency edges ----
+# A plain list of [target, [deps...]] pairs, rebuilt fresh on every call
+# (six tiny literal entries -- the cost of reconstructing it is
+# irrelevant) so both the fact-registration code below and the dashboard's
+# &quot;N targets total&quot; count can iterate it without depending on a top-level
+# constant.
+make a function called bd_targets returns targets
+  return [
+    [&quot;parse&quot;, []],
+    [&quot;typecheck&quot;, [&quot;parse&quot;]],
+    [&quot;compile_core&quot;, [&quot;typecheck&quot;]],
+    [&quot;compile_stdlib&quot;, [&quot;typecheck&quot;]],
+    [&quot;link&quot;, [&quot;compile_core&quot;, &quot;compile_stdlib&quot;]],
+    [&quot;docs&quot;, [&quot;parse&quot;]]
+  ]
+end
+
+make a function called bd_history_file returns path
+  return &quot;portfolio/build/build_daemon_history.txt&quot;
+end
+
+# Base &quot;compile time&quot; per target in ms, used only the very first time a
+# target has no recorded history yet -- after that, real measured
+# durations take over as the GOAP cost.
+make a function called bd_default_cost takes target returns ms
+  if target == &quot;parse&quot; then
+    return 180
+  end
+  if target == &quot;typecheck&quot; then
+    return 260
+  end
+  if target == &quot;compile_core&quot; then
+    return 340
+  end
+  if target == &quot;compile_stdlib&quot; then
+    return 300
+  end
+  if target == &quot;link&quot; then
+    return 420
+  end
+  return 150
+end
+
+# ---- timing history: target:duration_ms, one per line ----
+make a function called bd_load_history returns pairs
+  let out = []
+  let hfile = bd_history_file()
+  if file_exists(hfile) == &quot;1&quot; then
+    let raw = read_file(hfile)
+    let lines = split_lines(raw)
+    let i = 0
+    let n = to_num(list_len(lines))
+    while i &lt; n do
+      let line = str_trim(lines[i])
+      if line.length &gt; 0 then
+        let colon = find_substr_signals(line, &quot;:&quot;)
+        if colon &gt;= 0 then
+          let tgt = substr(line, 0, colon)
+          let ms = to_num(substr(line, colon + 1, line.length - colon - 1))
+          let out = list_push(out, [tgt, ms])
+        end
+      end
+      let i = i + 1
+    end
+  end
+  return out
+end
+
+make a function called bd_history_lookup takes history, target returns ms
+  let i = 0
+  let n = to_num(list_len(history))
+  while i &lt; n do
+    let pair = history[i]
+    if pair[0] == target then
+      return pair[1]
+    end
+    let i = i + 1
+  end
+  return -1
+end
+
+make a function called bd_save_history takes history returns done
+  let b = sb_new()
+  let i = 0
+  let n = to_num(list_len(history))
+  while i &lt; n do
+    let pair = history[i]
+    sb_push(b, pair[0] + &quot;:&quot; + pair[1] + chr(10))
+    let i = i + 1
+  end
+  write_file(bd_history_file(), sb_str(b))
+  return true
+end
+
+make a function called bd_history_record takes history, target, ms returns updated
+  let out = []
+  let found = false
+  let i = 0
+  let n = to_num(list_len(history))
+  while i &lt; n do
+    let pair = history[i]
+    if pair[0] == target then
+      let out = list_push(out, [target, ms])
+      let found = true
+    else
+      let out = list_push(out, pair)
+    end
+    let i = i + 1
+  end
+  if found == false then
+    let out = list_push(out, [target, ms])
+  end
+  return out
+end
+
+# ---- LOGIC: register the dependency graph + a per-run &quot;changed&quot; subset ----
+# rule_add has no retract -- a fact registered in one cycle stays in the
+# RULES store forever within this process. That's harmless for the static
+# &quot;dep&quot; edges (registered once, below), but &quot;changed&quot;/&quot;stale&quot;/&quot;built&quot; are
+# genuinely per-cycle state: a long-running daemon calls bd_run_cycle
+# repeatedly in the SAME process (on every &quot;rebuild&quot; signal), and without
+# something to distinguish cycles, a &quot;built(X)&quot; fact from cycle 1 would
+# still satisfy cycle 2's plan() goal even for a target cycle 2 just
+# marked changed -- GOAP would see the goal as already met from stale
+# leftover state and silently plan nothing. Fixed by suffixing these three
+# predicate names with the current cycle number, so each cycle gets a
+# fresh, disjoint set of facts; &quot;dep&quot; stays untagged since the dependency
+# graph itself never changes between cycles.
+make a function called bd_cycle_tag returns tag
+  let n = get(&quot;__vars&quot;, &quot;bd_cycle_num&quot;)
+  return &quot;&quot; + n
+end
+
+make a function called bd_register_graph returns done
+  if get(&quot;__vars&quot;, &quot;bd_graph_registered&quot;) == &quot;1&quot; then
+    return true
+  end
+  let targets = bd_targets()
+  let i = 0
+  let n = to_num(list_len(targets))
+  while i &lt; n do
+    let entry = targets[i]
+    let target = entry[0]
+    let deps = entry[1]
+    let j = 0
+    let dn = to_num(list_len(deps))
+    while j &lt; dn do
+      rule_add(&quot;dep&quot;, [target, deps[j]], [])
+      let j = j + 1
+    end
+    let i = i + 1
+  end
+  set_var(&quot;bd_graph_registered&quot;, &quot;1&quot;)
+  return true
+end
+
+make a function called bd_register_stale_rule takes tag returns done
+  rule_add(&quot;stale&quot; + tag, [&quot;X&quot;], [[&quot;changed&quot; + tag, [&quot;X&quot;]]])
+  rule_add(&quot;stale&quot; + tag, [&quot;X&quot;], [[&quot;dep&quot;, [&quot;X&quot;, &quot;Y&quot;]], [&quot;stale&quot; + tag, [&quot;Y&quot;]]])
+  return true
+end
+
+# A target is &quot;changed&quot; this run if now_ms() (used only for its low bits,
+# a cheap source of per-run variance) picks it out -- different targets go
+# stale on different runs, like a real build where different files get
+# edited each time. Deliberately picks exactly ONE target rather than
+# always including &quot;parse&quot;: every other target transitively depends on
+# &quot;parse&quot; in this graph, so if &quot;parse&quot; were always marked changed, staleness
+# would cascade to the whole graph on every single run, and the dashboard
+# would never show the incremental &quot;most targets already up to date&quot; case
+# this demo exists to illustrate.
+make a function called bd_mark_changed_this_run takes history, tag returns done
+  let targets = bd_targets()
+  let pick = to_num(now_ms()) % to_num(list_len(targets))
+  let entry = targets[pick]
+  rule_add(&quot;changed&quot; + tag, [entry[0]], [])
+  # A target with no recorded history has never actually been built, no
+  # matter what the dependency-derived staleness check would otherwise
+  # conclude -- &quot;no verified prior output&quot; counts as stale by definition,
+  # the same way a real build system treats a missing cache entry. Without
+  # this, a target that happens not to be the pseudo-random pick above
+  # (and isn't downstream of it) would be wrongly seeded as &quot;already
+  # built&quot; on the very first run, despite never having built at all.
+  let i = 0
+  let n = to_num(list_len(targets))
+  while i &lt; n do
+    let target = targets[i][0]
+    if bd_history_lookup(history, target) &lt; 0 then
+      rule_add(&quot;changed&quot; + tag, [target], [])
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+# ---- one build cycle: derive staleness, plan, execute, persist timing ----
+# Returns the number of targets actually rebuilt.
+make a function called bd_run_cycle returns rebuilt_count
+  set_var(&quot;bd_cycle_num&quot;, get(&quot;__vars&quot;, &quot;bd_cycle_num&quot;) + 1)
+  let tag = bd_cycle_tag()
+  bd_register_graph()
+  bd_register_stale_rule(tag)
+  let targets = bd_targets()
+  let history = bd_load_history()
+  bd_mark_changed_this_run(history, tag)
+
+  # Seed &quot;already built&quot; facts for everything NOT stale, so GOAP's search
+  # doesn't need to (re)build what's already up to date -- exactly the
+  # same &quot;world state = currently-registered ground facts&quot; mechanism
+  # goal_oriented_build_demo.patlang uses. Uses this cycle's tagged
+  # &quot;built&quot;/&quot;stale&quot; predicates throughout, not the bare names, so a fact
+  # left over from an earlier cycle in this same long-running process can
+  # never be mistaken for this cycle's state (see bd_cycle_tag's comment).
+  let i = 0
+  let n = to_num(list_len(targets))
+  while i &lt; n do
+    let target = targets[i][0]
+    let sols = solve(&quot;stale&quot; + tag, [target])
+    if to_num(list_len(sols)) == 0 then
+      rule_add(&quot;built&quot; + tag, [target], [])
+    end
+    let i = i + 1
+  end
+
+  # One GOAP action per target: preconditions are its deps being built,
+  # effect is itself being built, cost is its real historical duration
+  # (or the one-time default estimate if this is the first run).
+  let i = 0
+  while i &lt; n do
+    let entry = targets[i]
+    let target = entry[0]
+    let deps = entry[1]
+    let preconds = []
+    let j = 0
+    let dn = to_num(list_len(deps))
+    while j &lt; dn do
+      let preconds = list_push(preconds, [&quot;built&quot; + tag, [deps[j]]])
+      let j = j + 1
+    end
+    let cost = bd_history_lookup(history, target)
+    if cost &lt; 0 then
+      let cost = bd_default_cost(target)
+    end
+    action_add(target, preconds, [[&quot;built&quot; + tag, [target]]], [], cost)
+    let i = i + 1
+  end
+
+  let goal_facts = []
+  let i = 0
+  while i &lt; n do
+    let goal_facts = list_push(goal_facts, [&quot;built&quot; + tag, [targets[i][0]]])
+    let i = i + 1
+  end
+  let build_plan = plan(goal_facts)
+
+  let eta_total = 0
+  let i = 0
+  let plan_len = to_num(list_len(build_plan))
+  while i &lt; plan_len do
+    let target = build_plan[i]
+    let est = bd_history_lookup(history, target)
+    if est &lt; 0 then
+      let est = bd_default_cost(target)
+    end
+    let eta_total = eta_total + est
+    let i = i + 1
+  end
+  set_var(&quot;bd_plan_len&quot;, plan_len)
+  set_var(&quot;bd_eta_total_ms&quot;, eta_total)
+  set_var(&quot;bd_done_count&quot;, 0)
+
+  let i = 0
+  while i &lt; plan_len do
+    let target = build_plan[i]
+    let est = bd_history_lookup(history, target)
+    if est &lt; 0 then
+      let est = bd_default_cost(target)
+    end
+    emit(&quot;bd_job_started&quot;, target + &quot;:&quot; + est)
+    let t0 = now_ms()
+    sleep_ms(est)
+    let actual = now_ms() - t0
+    rule_add(&quot;built&quot; + tag, [target], [])
+    let history = bd_history_record(history, target, actual)
+    set_var(&quot;bd_done_count&quot;, get(&quot;__vars&quot;, &quot;bd_done_count&quot;) + 1)
+    emit(&quot;bd_job_finished&quot;, target + &quot;:&quot; + actual)
+    let i = i + 1
+  end
+  bd_save_history(history)
+  return plan_len
+end
+
+# Build-transcript variant of build_daemon_demo.patlang: the real,
+# intended usage is two separate OS PROCESSES (see build_daemon_demo.patlang
+# and its own header comment) -- but a build script capturing a native
+# transcript via exec_capture can't demonstrate that directly, since
+# exec_capture blocks until its child exits, and the daemon only exits once
+# it receives a quit signal from somewhere else. So this variant simulates
+# the primary/secondary roles as two real OS threads (parallel_map) within
+# ONE process instead of two separate ones -- same build_daemon.patlang
+# functions, same TCP loopback signal delivery, same emit()-driven
+# dashboard, just both ends visible in a single captured transcript.
+#
+# Port and target literals below are inlined rather than read from a
+# top-level `let` constant referenced inside run_primary/run_secondary --
+# functions invoked via parallel_map were found this session to not see
+# top-level `let`s at all (each worker's fresh interpreter jumps straight
+# into the target function, skipping the top-level statements that would
+# normally set such a constant on the main thread); see
+# self_hosting/examples/signals_demo_transcript.patlang for the first
+# demo that hit this and self_hosting/lib/build_daemon.patlang's own
+# header comment for the related (broader) patc1.exe-specific version.
+
+
+
+when bd_job_started do
+  let colon = find_substr_signals(event_data, &quot;:&quot;)
+  let target = substr(event_data, 0, colon)
+  let est = substr(event_data, colon + 1, event_data.length - colon - 1)
+  let done = get(&quot;__vars&quot;, &quot;bd_done_count&quot;)
+  let total = get(&quot;__vars&quot;, &quot;bd_plan_len&quot;)
+  print(&quot;PRIMARY: [&quot; + (done + 1) + &quot;/&quot; + total + &quot;] &quot; + target + &quot;: building (est. &quot; + est + &quot;ms)&quot;)
+end
+
+when bd_job_finished do
+  let colon = find_substr_signals(event_data, &quot;:&quot;)
+  let target = substr(event_data, 0, colon)
+  let actual = substr(event_data, colon + 1, event_data.length - colon - 1)
+  let done = get(&quot;__vars&quot;, &quot;bd_done_count&quot;)
+  let total = get(&quot;__vars&quot;, &quot;bd_plan_len&quot;)
+  print(&quot;PRIMARY: [&quot; + done + &quot;/&quot; + total + &quot;] &quot; + target + &quot;: done (&quot; + actual + &quot;ms actual)&quot;)
+end
+
+when status do
+  let total = get(&quot;__vars&quot;, &quot;bd_plan_len&quot;)
+  let done = get(&quot;__vars&quot;, &quot;bd_done_count&quot;)
+  let eta = get(&quot;__vars&quot;, &quot;bd_eta_total_ms&quot;)
+  signal_reply(&quot;build daemon: last cycle rebuilt &quot; + done + &quot;/&quot; + total + &quot; target(s), estimated &quot; + eta + &quot;ms total&quot;)
+end
+
+when rebuild do
+  print(&quot;PRIMARY: rebuild requested&quot;)
+  set_var(&quot;bd_rebuild_requested&quot;, &quot;1&quot;)
+end
+
+when quit do
+  print(&quot;PRIMARY: quit requested, shutting down&quot;)
+  set_var(&quot;bd_should_stop&quot;, &quot;1&quot;)
+end
+
+make a function called run_primary takes unused returns done
+  let port_id = signal_claim(9411)
+  print(&quot;PRIMARY: holding port 9411, running initial build cycle&quot;)
+  bd_run_cycle()
+  print(&quot;PRIMARY: initial cycle done, watching for signals&quot;)
+  set_var(&quot;bd_should_stop&quot;, &quot;0&quot;)
+  set_var(&quot;bd_rebuild_requested&quot;, &quot;0&quot;)
+  while get(&quot;__vars&quot;, &quot;bd_should_stop&quot;) == &quot;0&quot; do
+    signal_poll(port_id, 50)
+    if get(&quot;__vars&quot;, &quot;bd_rebuild_requested&quot;) == &quot;1&quot; then
+      set_var(&quot;bd_rebuild_requested&quot;, &quot;0&quot;)
+      bd_run_cycle()
+    end
+  end
+  print(&quot;PRIMARY: exiting&quot;)
+  return true
+end
+
+make a function called run_secondary takes unused returns done
+  # The primary's initial cycle (6 fresh targets, default costs summing to
+  # ~1650ms worst case) needs to actually finish and reach its signal-
+  # polling loop before there's anything meaningful to query -- a signal
+  # sent earlier would just sit queued in the OS backlog, unprocessed,
+  # until the primary gets there anyway. 1900ms comfortably clears that.
+  sleep_ms(1900)
+  print(&quot;SECONDARY: querying status&quot;)
+  let reply1 = signal_query(9411, &quot;status&quot;, &quot;&quot;)
+  print(&quot;SECONDARY: &quot; + reply1)
+  sleep_ms(100)
+  print(&quot;SECONDARY: requesting rebuild&quot;)
+  signal_send(9411, &quot;rebuild&quot;, &quot;&quot;)
+  sleep_ms(200)
+  print(&quot;SECONDARY: querying status again&quot;)
+  let reply2 = signal_query(9411, &quot;status&quot;, &quot;&quot;)
+  print(&quot;SECONDARY: &quot; + reply2)
+  sleep_ms(100)
+  print(&quot;SECONDARY: sending quit&quot;)
+  signal_send(9411, &quot;quit&quot;, &quot;&quot;)
+  return true
+end
+
+make a function called run_thread takes kind returns done
+  if kind == &quot;primary&quot; then
+    return run_primary(0)
+  else
+    return run_secondary(0)
+  end
+end
+
+print(&quot;before parallel_map&quot;)
+parallel_map([&quot;primary&quot;, &quot;secondary&quot;], &quot;run_thread&quot;)
+print(&quot;DONE&quot;)
+</pre></details><p class='label'>Native run on the build machine:</p><pre class='out native'>before parallel_map
+PRIMARY: holding port 9411, running initial build cycle
+PRIMARY: [1/6] parse: building (est. 180ms)
+PRIMARY: [1/6] parse: done (180ms actual)
+PRIMARY: [2/6] docs: building (est. 150ms)
+PRIMARY: [2/6] docs: done (151ms actual)
+PRIMARY: [3/6] typecheck: building (est. 260ms)
+PRIMARY: [3/6] typecheck: done (260ms actual)
+PRIMARY: [4/6] compile_stdlib: building (est. 300ms)
+PRIMARY: [4/6] compile_stdlib: done (301ms actual)
+PRIMARY: [5/6] compile_core: building (est. 340ms)
+PRIMARY: [5/6] compile_core: done (341ms actual)
+PRIMARY: [6/6] link: building (est. 420ms)
+PRIMARY: [6/6] link: done (420ms actual)
+PRIMARY: initial cycle done, watching for signals
+SECONDARY: querying status
+SECONDARY: build daemon: last cycle rebuilt 6/6 target(s), estimated 1650ms total
+SECONDARY: requesting rebuild
+PRIMARY: rebuild requested
+PRIMARY: [1/4] typecheck: building (est. 260ms)
+SECONDARY: querying status again
+PRIMARY: [1/4] typecheck: done (260ms actual)
+PRIMARY: [2/4] compile_stdlib: building (est. 301ms)
+PRIMARY: [2/4] compile_stdlib: done (302ms actual)
+PRIMARY: [3/4] compile_core: building (est. 341ms)
+PRIMARY: [3/4] compile_core: done (341ms actual)
+PRIMARY: [4/4] link: building (est. 420ms)
+PRIMARY: [4/4] link: done (421ms actual)
+SECONDARY: build daemon: last cycle rebuilt 4/4 target(s), estimated 1322ms total
+SECONDARY: sending quit
+PRIMARY: quit requested, shutting down
+PRIMARY: exiting
+DONE
+
+</pre>

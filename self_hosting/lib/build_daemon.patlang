@@ -1,0 +1,334 @@
+# A self-hosted build daemon -- the exemplar system tying together five of
+# PatLang's less-usual capabilities in one coherent program:
+#
+#   - LOGIC (rule_add/solve): "which targets are stale" is derived from
+#     dep(target, dependency) and changed(target) facts via real backward
+#     chaining, not a hand-written graph walk.
+#   - GOAL-SEEKING (action_add/plan, GOAP): "what order should I build in"
+#     is a real cost-optimal forward search over build actions, where each
+#     action's cost is that target's own PERSISTED HISTORICAL DURATION --
+#     the planner is reasoning about real measured time, not a guess.
+#   - SELF-TIMING (now_ms()) + PERSISTENCE: every build records its own
+#     duration to a small history file, read back on the next run to seed
+#     both the GOAP costs above and an upfront ETA.
+#   - EVENTS (when/emit): job_started/job_finished drive a live dashboard,
+#     reusing the exact pattern build_portfolio.patlang's own precompile
+#     pass uses to log concurrent progress.
+#   - SIGNALS (self_hosting/lib/signals.patlang): a running daemon answers
+#     `status` (live dashboard state + ETA) and `rebuild`/`quit` from a
+#     separate CLI invocation, without any new IPC mechanism of its own.
+#
+# The build graph itself is deliberately synthetic -- a handful of fake
+# targets "compiled" via sleep_ms standing in for real work -- rather than
+# wired into the real (and, as of this session, `patc1.exe`-performance-
+# anomaly-affected) build_portfolio.patlang pipeline. That keeps this
+# demo's runtime short and its five showcased features legible, which is
+# the actual point of an exemplar: see self_hosting/examples/
+# build_daemon_demo.patlang for the real, multi-process, run-it-yourself
+# form, and self_hosting/examples/goal_oriented_build_demo.patlang for the
+# original (non-daemon, non-timed) version of the logic/GOAP half alone.
+#
+# NOTE on style: every "constant" below (the target graph, the history
+# file path) is a FUNCTION returning a freshly-built literal, not a
+# top-level `let` read from inside other functions. That's not just
+# habit -- patc1.exe (the self-hosted compiler) was found this session to
+# make top-level `let` constants silently invisible inside ANY function
+# body when self-hosted-compiled (reads as empty, not an error; see
+# [[patlang-backlog]] item 10), so this library avoids the pattern
+# everywhere rather than risk it working under --ir-run/--patc and
+# silently breaking under patc1.exe.
+
+include "signals.patlang"
+include "includes.patlang"
+
+# ---- the build graph: targets and their dependency edges ----
+# A plain list of [target, [deps...]] pairs, rebuilt fresh on every call
+# (six tiny literal entries -- the cost of reconstructing it is
+# irrelevant) so both the fact-registration code below and the dashboard's
+# "N targets total" count can iterate it without depending on a top-level
+# constant.
+make a function called bd_targets returns targets
+  return [
+    ["parse", []],
+    ["typecheck", ["parse"]],
+    ["compile_core", ["typecheck"]],
+    ["compile_stdlib", ["typecheck"]],
+    ["link", ["compile_core", "compile_stdlib"]],
+    ["docs", ["parse"]]
+  ]
+end
+
+make a function called bd_history_file returns path
+  return "portfolio/build/build_daemon_history.txt"
+end
+
+# Base "compile time" per target in ms, used only the very first time a
+# target has no recorded history yet -- after that, real measured
+# durations take over as the GOAP cost.
+make a function called bd_default_cost takes target returns ms
+  if target == "parse" then
+    return 180
+  end
+  if target == "typecheck" then
+    return 260
+  end
+  if target == "compile_core" then
+    return 340
+  end
+  if target == "compile_stdlib" then
+    return 300
+  end
+  if target == "link" then
+    return 420
+  end
+  return 150
+end
+
+# ---- timing history: target:duration_ms, one per line ----
+make a function called bd_load_history returns pairs
+  let out = []
+  let hfile = bd_history_file()
+  if file_exists(hfile) == "1" then
+    let raw = read_file(hfile)
+    let lines = split_lines(raw)
+    let i = 0
+    let n = to_num(list_len(lines))
+    while i < n do
+      let line = str_trim(lines[i])
+      if line.length > 0 then
+        let colon = find_substr_signals(line, ":")
+        if colon >= 0 then
+          let tgt = substr(line, 0, colon)
+          let ms = to_num(substr(line, colon + 1, line.length - colon - 1))
+          let out = list_push(out, [tgt, ms])
+        end
+      end
+      let i = i + 1
+    end
+  end
+  return out
+end
+
+make a function called bd_history_lookup takes history, target returns ms
+  let i = 0
+  let n = to_num(list_len(history))
+  while i < n do
+    let pair = history[i]
+    if pair[0] == target then
+      return pair[1]
+    end
+    let i = i + 1
+  end
+  return -1
+end
+
+make a function called bd_save_history takes history returns done
+  let b = sb_new()
+  let i = 0
+  let n = to_num(list_len(history))
+  while i < n do
+    let pair = history[i]
+    sb_push(b, pair[0] + ":" + pair[1] + chr(10))
+    let i = i + 1
+  end
+  write_file(bd_history_file(), sb_str(b))
+  return true
+end
+
+make a function called bd_history_record takes history, target, ms returns updated
+  let out = []
+  let found = false
+  let i = 0
+  let n = to_num(list_len(history))
+  while i < n do
+    let pair = history[i]
+    if pair[0] == target then
+      let out = list_push(out, [target, ms])
+      let found = true
+    else
+      let out = list_push(out, pair)
+    end
+    let i = i + 1
+  end
+  if found == false then
+    let out = list_push(out, [target, ms])
+  end
+  return out
+end
+
+# ---- LOGIC: register the dependency graph + a per-run "changed" subset ----
+# rule_add has no retract -- a fact registered in one cycle stays in the
+# RULES store forever within this process. That's harmless for the static
+# "dep" edges (registered once, below), but "changed"/"stale"/"built" are
+# genuinely per-cycle state: a long-running daemon calls bd_run_cycle
+# repeatedly in the SAME process (on every "rebuild" signal), and without
+# something to distinguish cycles, a "built(X)" fact from cycle 1 would
+# still satisfy cycle 2's plan() goal even for a target cycle 2 just
+# marked changed -- GOAP would see the goal as already met from stale
+# leftover state and silently plan nothing. Fixed by suffixing these three
+# predicate names with the current cycle number, so each cycle gets a
+# fresh, disjoint set of facts; "dep" stays untagged since the dependency
+# graph itself never changes between cycles.
+make a function called bd_cycle_tag returns tag
+  let n = get("__vars", "bd_cycle_num")
+  return "" + n
+end
+
+make a function called bd_register_graph returns done
+  if get("__vars", "bd_graph_registered") == "1" then
+    return true
+  end
+  let targets = bd_targets()
+  let i = 0
+  let n = to_num(list_len(targets))
+  while i < n do
+    let entry = targets[i]
+    let target = entry[0]
+    let deps = entry[1]
+    let j = 0
+    let dn = to_num(list_len(deps))
+    while j < dn do
+      rule_add("dep", [target, deps[j]], [])
+      let j = j + 1
+    end
+    let i = i + 1
+  end
+  set_var("bd_graph_registered", "1")
+  return true
+end
+
+make a function called bd_register_stale_rule takes tag returns done
+  rule_add("stale" + tag, ["X"], [["changed" + tag, ["X"]]])
+  rule_add("stale" + tag, ["X"], [["dep", ["X", "Y"]], ["stale" + tag, ["Y"]]])
+  return true
+end
+
+# A target is "changed" this run if now_ms() (used only for its low bits,
+# a cheap source of per-run variance) picks it out -- different targets go
+# stale on different runs, like a real build where different files get
+# edited each time. Deliberately picks exactly ONE target rather than
+# always including "parse": every other target transitively depends on
+# "parse" in this graph, so if "parse" were always marked changed, staleness
+# would cascade to the whole graph on every single run, and the dashboard
+# would never show the incremental "most targets already up to date" case
+# this demo exists to illustrate.
+make a function called bd_mark_changed_this_run takes history, tag returns done
+  let targets = bd_targets()
+  let pick = to_num(now_ms()) % to_num(list_len(targets))
+  let entry = targets[pick]
+  rule_add("changed" + tag, [entry[0]], [])
+  # A target with no recorded history has never actually been built, no
+  # matter what the dependency-derived staleness check would otherwise
+  # conclude -- "no verified prior output" counts as stale by definition,
+  # the same way a real build system treats a missing cache entry. Without
+  # this, a target that happens not to be the pseudo-random pick above
+  # (and isn't downstream of it) would be wrongly seeded as "already
+  # built" on the very first run, despite never having built at all.
+  let i = 0
+  let n = to_num(list_len(targets))
+  while i < n do
+    let target = targets[i][0]
+    if bd_history_lookup(history, target) < 0 then
+      rule_add("changed" + tag, [target], [])
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+# ---- one build cycle: derive staleness, plan, execute, persist timing ----
+# Returns the number of targets actually rebuilt.
+make a function called bd_run_cycle returns rebuilt_count
+  set_var("bd_cycle_num", get("__vars", "bd_cycle_num") + 1)
+  let tag = bd_cycle_tag()
+  bd_register_graph()
+  bd_register_stale_rule(tag)
+  let targets = bd_targets()
+  let history = bd_load_history()
+  bd_mark_changed_this_run(history, tag)
+
+  # Seed "already built" facts for everything NOT stale, so GOAP's search
+  # doesn't need to (re)build what's already up to date -- exactly the
+  # same "world state = currently-registered ground facts" mechanism
+  # goal_oriented_build_demo.patlang uses. Uses this cycle's tagged
+  # "built"/"stale" predicates throughout, not the bare names, so a fact
+  # left over from an earlier cycle in this same long-running process can
+  # never be mistaken for this cycle's state (see bd_cycle_tag's comment).
+  let i = 0
+  let n = to_num(list_len(targets))
+  while i < n do
+    let target = targets[i][0]
+    let sols = solve("stale" + tag, [target])
+    if to_num(list_len(sols)) == 0 then
+      rule_add("built" + tag, [target], [])
+    end
+    let i = i + 1
+  end
+
+  # One GOAP action per target: preconditions are its deps being built,
+  # effect is itself being built, cost is its real historical duration
+  # (or the one-time default estimate if this is the first run).
+  let i = 0
+  while i < n do
+    let entry = targets[i]
+    let target = entry[0]
+    let deps = entry[1]
+    let preconds = []
+    let j = 0
+    let dn = to_num(list_len(deps))
+    while j < dn do
+      let preconds = list_push(preconds, ["built" + tag, [deps[j]]])
+      let j = j + 1
+    end
+    let cost = bd_history_lookup(history, target)
+    if cost < 0 then
+      let cost = bd_default_cost(target)
+    end
+    action_add(target, preconds, [["built" + tag, [target]]], [], cost)
+    let i = i + 1
+  end
+
+  let goal_facts = []
+  let i = 0
+  while i < n do
+    let goal_facts = list_push(goal_facts, ["built" + tag, [targets[i][0]]])
+    let i = i + 1
+  end
+  let build_plan = plan(goal_facts)
+
+  let eta_total = 0
+  let i = 0
+  let plan_len = to_num(list_len(build_plan))
+  while i < plan_len do
+    let target = build_plan[i]
+    let est = bd_history_lookup(history, target)
+    if est < 0 then
+      let est = bd_default_cost(target)
+    end
+    let eta_total = eta_total + est
+    let i = i + 1
+  end
+  set_var("bd_plan_len", plan_len)
+  set_var("bd_eta_total_ms", eta_total)
+  set_var("bd_done_count", 0)
+
+  let i = 0
+  while i < plan_len do
+    let target = build_plan[i]
+    let est = bd_history_lookup(history, target)
+    if est < 0 then
+      let est = bd_default_cost(target)
+    end
+    emit("bd_job_started", target + ":" + est)
+    let t0 = now_ms()
+    sleep_ms(est)
+    let actual = now_ms() - t0
+    rule_add("built" + tag, [target], [])
+    let history = bd_history_record(history, target, actual)
+    set_var("bd_done_count", get("__vars", "bd_done_count") + 1)
+    emit("bd_job_finished", target + ":" + actual)
+    let i = i + 1
+  end
+  bd_save_history(history)
+  return plan_len
+end
