@@ -470,20 +470,28 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 thread_local! {
-    static OBJECTS: RefCell<HashMap<String, HashMap<String, Value>>> = RefCell::new(HashMap::new());
     static FACTS: RefCell<HashMap<String, Vec<(String, String)>>> = RefCell::new(HashMap::new());
     static GOALS: RefCell<Vec<(String, Vec<String>)>> = RefCell::new(Vec::new());
 }
 
+// OBJECTS (new/send/get's backing store) is shared across OS threads
+// (parallel_map workers in particular), not thread_local -- otherwise an
+// object created via `new(...)` on one parallel_map worker thread is
+// silently invisible to `get`/`send` calls on any other thread, the same
+// visibility bug EVENT_HANDLERS/VFS/RULES were already fixed for. This is
+// the interpreter side, always native, so no cross-thread cfg-split is
+// needed here (unlike the codegen.rs text mirror, which targets multiple
+// platforms) -- but it's still a plain Mutex, not thread_local, since
+// parallel_map spawns real OS threads even natively.
+static OBJECTS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, HashMap<String, Value>>>> = std::sync::OnceLock::new();
+
 fn obj_get(name: &str, prop: &str) -> Option<Value> {
-    OBJECTS.with(|o| o.borrow().get(name).and_then(|m| m.get(prop)).cloned())
+    OBJECTS.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap().get(name).and_then(|m| m.get(prop)).cloned()
 }
 
 fn obj_set(name: &str, prop: &str, val: Value) {
-    OBJECTS.with(|o| {
-        let mut b = o.borrow_mut();
-        b.entry(name.to_string()).or_insert_with(HashMap::new).insert(prop.to_string(), val);
-    });
+    let mut b = OBJECTS.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap();
+    b.entry(name.to_string()).or_insert_with(HashMap::new).insert(prop.to_string(), val);
 }
 
 fn ensure_obj(name: &str, class: &str) {
@@ -493,7 +501,7 @@ fn ensure_obj(name: &str, class: &str) {
 
 /// Reset OO/logic state — call between independent runs (tests).
 pub fn reset_world() {
-    OBJECTS.with(|o| o.borrow_mut().clear());
+    OBJECTS.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap().clear();
     FACTS.with(|f| f.borrow_mut().clear());
     GOALS.with(|g| g.borrow_mut().clear());
     RULES.with(|r| r.borrow_mut().clear());
@@ -1908,6 +1916,16 @@ pub fn host_type_of(args: &[Value]) -> Result<Value, String> {
 
 /// Register the Stage 0 string/list/file shims on an interpreter.
 pub fn register_stage0_shims(interp: &mut Interpreter) {
+    // print wasn't actually here despite the claim in host_print's own doc
+    // comment above ("Registered here so every shims-only interpreter gets
+    // it too") -- a stale comment, not reality: any `when`/`emit` handler
+    // that calls print() when triggered from inside a fiber/parallel_map
+    // worker thread's fresh shims-only Interpreter got a confusing "host fn
+    // 'print' not found", since this function never actually inserted it.
+    // Found via build_portfolio.patlang's own precompile-progress `when`
+    // handlers, the first real code to call print() from a parallel_map
+    // worker. Fixed here, matching the comment's original intent.
+    interp.host.insert("print", host_print);
     interp.host.insert("len", host_len);
     interp.host.insert("get", host_get);
     interp.host.insert("list_get", host_list_get);

@@ -254,6 +254,175 @@ make a function called compile_native takes src, id returns exe
   return exe_path
 end
 
+make a function called out_path_for takes id, target returns path
+  if target == "wasm32-wasip1" then
+    return "portfolio/build/" + id + ".wasm"
+  end
+  if target == "wasm32-wasip1-threads" then
+    return "portfolio/build/" + id + "_threaded.wasm"
+  end
+  return "portfolio/build/" + id + ".exe"
+end
+
+# Cross-demo parallel pre-compile pass: every compile below this point
+# (compile_native/compile_wasm_only/compile_both/compile_wasm_threaded_only)
+# funnels through cache_valid + patc1_compile, and each patc1_compile call
+# is a fully independent subprocess (own scratch file keyed by id, own
+# out_path) -- so the actual stale-vs-cached compiles across ALL demos can
+# be dispatched together via parallel_map's real OS threads, instead of
+# happening one at a time as the script reaches each demo sequentially.
+# This block duplicates each demo's small src-assembly expression (mostly
+# one or two read_file/concat lines) rather than restructuring the ~1500
+# lines of per-demo page-building logic below -- deliberately: those blocks
+# stay exactly as they are today (still calling compile_native/etc in their
+# usual place), and will simply hit a warm cache by the time they run,
+# since this pass already did the real work. Duplication risk: if a demo's
+# src-assembly expression changes below, the copy here needs updating too,
+# or that demo silently won't get the parallel-precompile benefit (it will
+# still compile correctly, just back on the sequential path) -- not a
+# correctness risk, only a missed optimization, so this is a lower-stakes
+# drift than the CHUNK_MARKERS table above.
+# Each in-flight job is tracked as a real OO object (new/send/get,
+# ChunkId::Oo) rather than a plain value or hand-kept counter -- id/target/
+# status/timestamps live on the object, readable by anything (a `when`
+# handler, a future `status` signal handler) without threading extra
+# parameters through. Safe to mutate from inside a parallel_map worker
+# thread specifically because OBJECTS was moved off thread_local onto a
+# shared Mutex-backed store this session (see hosts.rs/codegen.rs) -- before
+# that fix, each worker thread would have seen its own empty, isolated
+# object store, and every send/get here would have silently gone nowhere.
+make a function called precompile_job takes job returns done
+  let src = job[0]
+  let id = job[1]
+  let target = job[2]
+  let job_name = new("job", id + ":" + target)
+  send(job_name, "set", "id", id)
+  send(job_name, "set", "target", target)
+  send(job_name, "set", "status", "compiling")
+  send(job_name, "set", "started_at", now_ms())
+  emit("job_started", job_name)
+  patc1_compile(src, id, out_path_for(id, target), target)
+  # Without this, the artifact exists on disk but its .srchash file doesn't
+  # get written, so the ordinary sequential compile_native/etc call further
+  # down the script would see cache_valid == false and recompile it AGAIN,
+  # silently defeating the whole point of this pass. save_cache is a plain
+  # single-file write, safe to call twice for the same id (e.g. playground,
+  # which has two targets/two jobs) -- both writes are identical content.
+  save_cache(id, src)
+  send(job_name, "set", "status", "done")
+  send(job_name, "set", "finished_at", now_ms())
+  emit("job_finished", job_name)
+  return true
+end
+
+# Live terminal progress, driven by the real `when`/`emit` event mechanism
+# (not a bolted-on print statement) -- already thread-safe across
+# parallel_map workers as of earlier this session (EVENT_HANDLERS is a
+# shared Mutex-backed registry, not thread_local, for exactly this reason).
+# Counters live in the shared __vars object (set_var/get), the same
+# mechanism self_hosting/examples/event_loop_server.patlang uses for its
+# own cross-handler state. Concurrent print() calls from multiple OS
+# threads may interleave at the line level -- acceptable for terminal
+# output, not a correctness issue.
+when job_started do
+  set_var("running", get("__vars", "running") + 1)
+  let id = get(event_data, "id")
+  let target = get(event_data, "target")
+  let label = id
+  if target != "" then
+    let label = id + " (" + target + ")"
+  end
+  print("[precompile] " + label + " starting (" + get("__vars", "running") + " running, " + get("__vars", "done") + "/" + get("__vars", "total") + " done)")
+end
+
+when job_finished do
+  set_var("running", get("__vars", "running") - 1)
+  set_var("done", get("__vars", "done") + 1)
+  let id = get(event_data, "id")
+  let target = get(event_data, "target")
+  let label = id
+  if target != "" then
+    let label = id + " (" + target + ")"
+  end
+  print("[precompile] " + label + " done (" + get("__vars", "running") + " running, " + get("__vars", "done") + "/" + get("__vars", "total") + " done)")
+end
+
+make a function called add_job takes jobs, id, src, target returns jobs2
+  let out_path = out_path_for(id, target)
+  if cache_valid(id, src) and (file_exists(out_path) == "1") then
+    return jobs
+  end
+  return list_push(jobs, [src, id, target])
+end
+
+make a function called build_precompile_jobs returns jobs
+  let jobs = []
+  let jobs = add_job(jobs, "feature", read_file("self_hosting/examples/feature_demo.patlang"), "")
+  let jobs = add_job(jobs, "bench", read_file("self_hosting/examples/fib_bench.patlang"), "")
+  let gui_src = read_file("self_hosting/lib/html.patlang") + chr(10) + read_file("self_hosting/examples/gui_demo.patlang")
+  let jobs = add_job(jobs, "gui", gui_src, "")
+  let gui_wasm_src = read_file("self_hosting/lib/html.patlang") + chr(10) + read_file("self_hosting/examples/gui_wasm_main.patlang")
+  let jobs = add_job(jobs, "guidemo", gui_wasm_src, "wasm32-wasip1")
+  let pos_src = read_file("self_hosting/lib/pos.patlang") + chr(10) + read_file("self_hosting/examples/pos_demo.patlang")
+  let jobs = add_job(jobs, "pos", pos_src, "")
+  let post_src = read_file("self_hosting/lib/test.patlang") + chr(10) + read_file("self_hosting/lib/pos.patlang") + chr(10) + read_file("self_hosting/examples/pos_tests.patlang")
+  let jobs = add_job(jobs, "postests", post_src, "")
+  let jobs = add_job(jobs, "contracts", read_file("self_hosting/examples/contracts_demo.patlang"), "")
+  let jobs = add_job(jobs, "goaloriented", read_file("self_hosting/examples/goal_oriented_build_demo.patlang"), "")
+  let jobs = add_job(jobs, "bitwise", read_file("self_hosting/examples/bitwise_bitfield_demo.patlang"), "")
+  let jobs = add_job(jobs, "rulesyntax", read_file("self_hosting/examples/rule_syntax_demo.patlang"), "")
+  let jobs = add_job(jobs, "vfsdemo", read_file("self_hosting/examples/vfs_demo.patlang"), "")
+
+  # routerdsl needs its DSL-expansion side effect run first (writes
+  # portfolio/build/router_dsl_expanded.patlang), duplicating the same
+  # tokenize/parse_program/lower_program/run_ir pipeline used at its real
+  # call site below -- cheap and idempotent, not the compile bottleneck.
+  let dsl_driver = read_file("self_hosting/lib/regex_dsl.patlang") + chr(10)
+    + read_file("self_hosting/lib/syntax_dsl.patlang") + chr(10)
+    + "let raw = read_file(\"self_hosting/examples/router_dsl_demo.patlang\")" + chr(10)
+    + "let expanded = expand_syntax_dsls(raw)" + chr(10)
+    + "write_file(\"portfolio/build/router_dsl_expanded.patlang\", expanded)" + chr(10)
+  run_ir(lower_program(parse_program(tokenize(dsl_driver))))
+  let router_src = read_file("portfolio/build/router_dsl_expanded.patlang")
+  let jobs = add_job(jobs, "routerdsl", router_src, "")
+
+  let tower_src = read_file("self_hosting/lib/math.patlang") + chr(10) + read_file("self_hosting/examples/numeric_tower_demo.patlang")
+  let jobs = add_job(jobs, "towerdemo", tower_src, "")
+  let dynsyntax_src = read_file("self_hosting/lib/lexer.patlang") + read_file("self_hosting/lib/parser.patlang") + read_file("self_hosting/lib/lower.patlang") + read_file("self_hosting/lib/regex_dsl.patlang") + read_file("self_hosting/lib/syntax_dsl.patlang") + read_file("self_hosting/examples/dynamic_syntax_demo.patlang")
+  let jobs = add_job(jobs, "dynsyntaxdemo", dynsyntax_src, "")
+  let jobs = add_job(jobs, "threadingdemo", read_file("self_hosting/examples/threading_demo.patlang"), "")
+  let report_lib_src = read_file("self_hosting/lib/report.patlang")
+  let report_src = report_lib_src + chr(10) + read_file("self_hosting/examples/report_demo.patlang")
+  let jobs = add_job(jobs, "report", report_src, "")
+  let report_wasm_src = read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + read_file("self_hosting/lib/lower.patlang") + chr(10) + report_lib_src + chr(10) + read_file("self_hosting/examples/report_wasm_main.patlang")
+  let jobs = add_job(jobs, "report_timeline", report_wasm_src, "wasm32-wasip1")
+  let pg_src = read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + read_file("self_hosting/lib/lower.patlang") + chr(10) + read_file("self_hosting/lib/regex_dsl.patlang") + chr(10) + read_file("self_hosting/lib/syntax_dsl.patlang") + chr(10) + read_file("self_hosting/examples/playground_main.patlang")
+  let jobs = add_job(jobs, "playground", pg_src, "")
+  let jobs = add_job(jobs, "playground", pg_src, "wasm32-wasip1")
+  let clibs = read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + read_file("self_hosting/lib/lower.patlang") + chr(10) + read_file("self_hosting/lib/codegen.patlang") + chr(10) + read_file("self_hosting/lib/runtime_rs.patlang")
+  let patbuild_src = read_file("self_hosting/tools/patbuild_main.patlang")
+  let jobs = add_job(jobs, "patbuild", clibs + chr(10) + patbuild_src, "")
+  let flow_full = read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + read_file("self_hosting/lib/lower.patlang") + chr(10) + read_file("self_hosting/lib/html.patlang") + chr(10) + read_file("self_hosting/tools/flowgraph_main.patlang")
+  let jobs = add_job(jobs, "flowgraph", flow_full, "")
+  let flowgraph_wasm_src = read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + read_file("self_hosting/lib/lower.patlang") + chr(10) + read_file("self_hosting/lib/html.patlang") + chr(10) + read_file("self_hosting/examples/flowgraph_wasm_main.patlang")
+  let jobs = add_job(jobs, "flowgraphdemo", flowgraph_wasm_src, "wasm32-wasip1")
+  let maze_wasm_src = read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + read_file("self_hosting/lib/lower.patlang") + chr(10) + read_file("self_hosting/lib/maze.patlang") + chr(10) + read_file("self_hosting/examples/maze_wasm_main.patlang")
+  let jobs = add_job(jobs, "maze", maze_wasm_src, "wasm32-wasip1")
+  let jobs = add_job(jobs, "fiber", read_file("self_hosting/examples/fiber_demo.patlang"), "wasm32-wasip1-threads")
+  let jobs = add_job(jobs, "robots", read_file("self_hosting/examples/robots_demo.patlang"), "wasm32-wasip1-threads")
+  let jobs = add_job(jobs, "cga", read_file("self_hosting/examples/cga_classifier.patlang"), "wasm32-wasip1")
+  return jobs
+end
+
+print("scanning for stale demos to precompile in parallel...")
+let precompile_jobs = build_precompile_jobs()
+set_var("total", precompile_jobs.length)
+set_var("running", 0)
+set_var("done", 0)
+print("precompiling " + precompile_jobs.length + " stale target(s) across real OS threads...")
+parallel_map(precompile_jobs, "precompile_job")
+print("precompile pass done")
+
 # Each demo/native card is now its own fragment-mode page (portfolio/demos/
 # <slug>.html), written via lib/template.patlang, instead of one section
 # appended into a single monolithic portfolio/index.html. Fragment mode

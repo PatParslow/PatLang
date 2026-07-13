@@ -248,9 +248,19 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 #[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// OBJECTS (new/send/get's backing store) is shared across OS threads
+// (fiber threads, parallel_map workers, WASI-threads Workers) rather than
+// thread_local, for the same visibility reason as EVENT_HANDLERS below --
+// an object created via `new(...)` on one parallel_map worker thread must
+// still be visible to `get`/`send` calls on any other thread. Gated on
+// target_feature = "atomics" (not target_arch = "wasm32") for the same
+// reason as EVENT_HANDLERS/VFS.
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
 thread_local! {
     static OBJECTS: RefCell<HashMap<String, HashMap<String, Value>>> = RefCell::new(HashMap::new());
 }
+#[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+static OBJECTS: OnceLock<Mutex<HashMap<String, HashMap<String, Value>>>> = OnceLock::new();
 
 // EVENT_HANDLERS is shared across OS threads (fiber threads, parallel_map
 // workers, WASI-threads Workers) rather than thread_local, so a `when`
@@ -334,19 +344,30 @@ fn arg_num(args: &[Value], i: usize, what: &str) -> Result<f64, String> {
     }
 }
 
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
 fn obj_get(name: &str, prop: &str) -> Option<Value> {
     OBJECTS.with(|o| {
         let b = o.borrow();
         b.get(name).and_then(|m| m.get(prop)).cloned()
     })
 }
-
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
 fn obj_set(name: &str, prop: &str, val: Value) {
     OBJECTS.with(|o| {
         let mut b = o.borrow_mut();
         let m = b.entry(name.to_string()).or_insert_with(HashMap::new);
         m.insert(prop.to_string(), val);
     });
+}
+
+#[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+fn obj_get(name: &str, prop: &str) -> Option<Value> {
+    OBJECTS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap().get(name).and_then(|m| m.get(prop)).cloned()
+}
+#[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+fn obj_set(name: &str, prop: &str, val: Value) {
+    let mut b = OBJECTS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    b.entry(name.to_string()).or_insert_with(HashMap::new).insert(prop.to_string(), val);
 }
 
 fn ensure_obj(name: &str, class: &str) {
@@ -2629,11 +2650,7 @@ fn host_call_io_misc(name: &str, args: &[Value]) -> Option<Result<Value, String>
                 let key = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
                 let val = args.get(1).cloned().unwrap_or(Value::Unit);
                 if !key.is_empty() {
-                    OBJECTS.with(|o| {
-                        let mut b = o.borrow_mut();
-                        let m = b.entry("__vars".to_string()).or_insert_with(HashMap::new);
-                        m.insert(key, val);
-                    });
+                    obj_set("__vars", &key, val);
                 }
                 Ok(Value::Unit)
             }

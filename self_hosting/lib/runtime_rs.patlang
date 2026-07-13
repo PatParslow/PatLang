@@ -819,11 +819,7 @@ make a function called emit_runtime_rs_oo_0 takes b returns done
   sb_push(b, "                let key = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };" + nl())
   sb_push(b, "                let val = args.get(1).cloned().unwrap_or(Value::Unit);" + nl())
   sb_push(b, "                if !key.is_empty() {" + nl())
-  sb_push(b, "                    OBJECTS.with(|o| {" + nl())
-  sb_push(b, "                        let mut b = o.borrow_mut();" + nl())
-  sb_push(b, "                        let m = b.entry(" + q() + "__vars" + q() + ".to_string()).or_insert_with(HashMap::new);" + nl())
-  sb_push(b, "                        m.insert(key, val);" + nl())
-  sb_push(b, "                    });" + nl())
+  sb_push(b, "                    obj_set(" + q() + "__vars" + q() + ", &key, val);" + nl())
   sb_push(b, "                }" + nl())
   sb_push(b, "                Ok(Value::Unit)" + nl())
   sb_push(b, "            }" + nl())
@@ -1393,9 +1389,19 @@ make a function called emit_runtime_rs_core_0 takes b returns done
   sb_push(b, "#[cfg(any(not(target_arch = \"wasm32\"), target_feature = \"atomics\"))]" + nl())
   sb_push(b, "use std::sync::atomic::{AtomicU64, Ordering};" + nl())
   sb_push(b, "" + nl())
+  sb_push(b, "// OBJECTS (new/send/get's backing store) is shared across OS threads" + nl())
+  sb_push(b, "// (fiber threads, parallel_map workers, WASI-threads Workers) rather than" + nl())
+  sb_push(b, "// thread_local, for the same visibility reason as EVENT_HANDLERS below --" + nl())
+  sb_push(b, "// an object created via `new(...)` on one parallel_map worker thread must" + nl())
+  sb_push(b, "// still be visible to `get`/`send` calls on any other thread. Gated on" + nl())
+  sb_push(b, "// target_feature = \"atomics\" (not target_arch = \"wasm32\") for the same" + nl())
+  sb_push(b, "// reason as EVENT_HANDLERS/VFS." + nl())
+  sb_push(b, "#[cfg(all(target_arch = \"wasm32\", not(target_feature = \"atomics\")))]" + nl())
   sb_push(b, "thread_local! {" + nl())
   sb_push(b, "    static OBJECTS: RefCell<HashMap<String, HashMap<String, Value>>> = RefCell::new(HashMap::new());" + nl())
   sb_push(b, "}" + nl())
+  sb_push(b, "#[cfg(any(not(target_arch = \"wasm32\"), target_feature = \"atomics\"))]" + nl())
+  sb_push(b, "static OBJECTS: OnceLock<Mutex<HashMap<String, HashMap<String, Value>>>> = OnceLock::new();" + nl())
   sb_push(b, "" + nl())
   sb_push(b, "// EVENT_HANDLERS is shared across OS threads (fiber threads, parallel_map" + nl())
   sb_push(b, "// workers, WASI-threads Workers) rather than thread_local, so a `when`" + nl())
@@ -1479,19 +1485,30 @@ make a function called emit_runtime_rs_core_0 takes b returns done
   sb_push(b, "    }" + nl())
   sb_push(b, "}" + nl())
   sb_push(b, "" + nl())
+  sb_push(b, "#[cfg(all(target_arch = \"wasm32\", not(target_feature = \"atomics\")))]" + nl())
   sb_push(b, "fn obj_get(name: &str, prop: &str) -> Option<Value> {" + nl())
   sb_push(b, "    OBJECTS.with(|o| {" + nl())
   sb_push(b, "        let b = o.borrow();" + nl())
   sb_push(b, "        b.get(name).and_then(|m| m.get(prop)).cloned()" + nl())
   sb_push(b, "    })" + nl())
   sb_push(b, "}" + nl())
-  sb_push(b, "" + nl())
+  sb_push(b, "#[cfg(all(target_arch = \"wasm32\", not(target_feature = \"atomics\")))]" + nl())
   sb_push(b, "fn obj_set(name: &str, prop: &str, val: Value) {" + nl())
   sb_push(b, "    OBJECTS.with(|o| {" + nl())
   sb_push(b, "        let mut b = o.borrow_mut();" + nl())
   sb_push(b, "        let m = b.entry(name.to_string()).or_insert_with(HashMap::new);" + nl())
   sb_push(b, "        m.insert(prop.to_string(), val);" + nl())
   sb_push(b, "    });" + nl())
+  sb_push(b, "}" + nl())
+  sb_push(b, "" + nl())
+  sb_push(b, "#[cfg(any(not(target_arch = \"wasm32\"), target_feature = \"atomics\"))]" + nl())
+  sb_push(b, "fn obj_get(name: &str, prop: &str) -> Option<Value> {" + nl())
+  sb_push(b, "    OBJECTS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap().get(name).and_then(|m| m.get(prop)).cloned()" + nl())
+  sb_push(b, "}" + nl())
+  sb_push(b, "#[cfg(any(not(target_arch = \"wasm32\"), target_feature = \"atomics\"))]" + nl())
+  sb_push(b, "fn obj_set(name: &str, prop: &str, val: Value) {" + nl())
+  sb_push(b, "    let mut b = OBJECTS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();" + nl())
+  sb_push(b, "    b.entry(name.to_string()).or_insert_with(HashMap::new).insert(prop.to_string(), val);" + nl())
   sb_push(b, "}" + nl())
   sb_push(b, "" + nl())
   sb_push(b, "fn ensure_obj(name: &str, class: &str) {" + nl())
@@ -1510,6 +1527,10 @@ make a function called emit_runtime_rs_core_0 takes b returns done
   sb_push(b, "// This split exists because `Value`'s definition is shared/monomorphic" + nl())
   sb_push(b, "// across every other chunk's text, so its variant set can't differ chunk by" + nl())
   sb_push(b, "// chunk within a single build -- see the doc comment on `PRELUDE_VALUE_FAST`" + nl())
+  return true
+end
+
+make a function called emit_runtime_rs_core_1 takes b returns done
   sb_push(b, "// for the full rationale (Stage 38, \"risky shared-dependency edit\")." + nl())
   sb_push(b, "" + nl())
   sb_push(b, "#[derive(Clone, Debug, PartialEq)]" + nl())
@@ -1531,10 +1552,6 @@ make a function called emit_runtime_rs_core_0 takes b returns done
   sb_push(b, "    MakeClosure(String, Vec<String>)," + nl())
   sb_push(b, "    CallValue(usize)," + nl())
   sb_push(b, "    BuildList(usize)," + nl())
-  return true
-end
-
-make a function called emit_runtime_rs_core_1 takes b returns done
   sb_push(b, "    Return," + nl())
   sb_push(b, "}" + nl())
   sb_push(b, "" + nl())
@@ -1664,6 +1681,10 @@ make a function called emit_runtime_rs_core_1 takes b returns done
   sb_push(b, "                let val = bits_of(&args[3])?;" + nl())
   sb_push(b, "                if !(0..64).contains(&start) { return Err(format!(\"bit_set_slice: start {} out of range 0..63\", start)); }" + nl())
   sb_push(b, "                if !(0..=64).contains(&width) || start + width > 64 { return Err(format!(\"bit_set_slice: width {} at start {} out of range\", width, start)); }" + nl())
+  return true
+end
+
+make a function called emit_runtime_rs_core_2 takes b returns done
   sb_push(b, "                if width == 0 { return Ok(Value::Int(n)); }" + nl())
   sb_push(b, "                let mask: i64 = if width == 64 { -1 } else { (1i64 << width) - 1 };" + nl())
   sb_push(b, "                let cleared = n & !(mask << start);" + nl())
@@ -1685,10 +1706,6 @@ make a function called emit_runtime_rs_core_1 takes b returns done
   sb_push(b, "            }" + nl())
   sb_push(b, "            \"vfs_list\" => {" + nl())
   sb_push(b, "                let prefix = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => String::new() };" + nl())
-  return true
-end
-
-make a function called emit_runtime_rs_core_2 takes b returns done
   sb_push(b, "                let mut matching: Vec<String> = vfs_keys().into_iter().filter(|k| k.starts_with(&prefix)).collect();" + nl())
   sb_push(b, "                matching.sort();" + nl())
   sb_push(b, "                Ok(Value::List(matching.into_iter().map(Value::String).collect()))" + nl())
@@ -1818,6 +1835,10 @@ make a function called emit_runtime_rs_core_2 takes b returns done
   sb_push(b, "        if !program.functions.contains_key(&func_name) {" + nl())
   sb_push(b, "            return Err(format!(\"fiber_new: function '{}' not found\", func_name));" + nl())
   sb_push(b, "        }" + nl())
+  return true
+end
+
+make a function called emit_runtime_rs_core_3 takes b returns done
   sb_push(b, "        let id = next_id();" + nl())
   sb_push(b, "        let handle = Arc::new(FiberHandle {" + nl())
   sb_push(b, "            state: Mutex::new(FiberBox {" + nl())
@@ -1839,10 +1860,6 @@ make a function called emit_runtime_rs_core_2 takes b returns done
   sb_push(b, "                st.to_fiber.take().unwrap()" + nl())
   sb_push(b, "            };" + nl())
   sb_push(b, "            let callee = program_owned.functions.get(&func_name).unwrap().clone();" + nl())
-  return true
-end
-
-make a function called emit_runtime_rs_core_3 takes b returns done
   sb_push(b, "            let result = run_function(&program_owned, &callee, &[first_arg]);" + nl())
   sb_push(b, "            let mut st = handle.state.lock().unwrap();" + nl())
   sb_push(b, "            st.alive = false;" + nl())
@@ -1972,6 +1989,10 @@ make a function called emit_runtime_rs_core_3 takes b returns done
   sb_push(b, "            let predicted = predict_next_duration_ms(&st.recent_durations);" + nl())
   sb_push(b, "            (st.budget_deadline_ms, predicted)" + nl())
   sb_push(b, "        };" + nl())
+  return true
+end
+
+make a function called emit_runtime_rs_core_4 takes b returns done
   sb_push(b, "        if let Some(dl) = deadline {" + nl())
   sb_push(b, "            if now + predicted >= dl {" + nl())
   sb_push(b, "                fiber_yield(Value::Unit)?;" + nl())
@@ -1993,10 +2014,6 @@ make a function called emit_runtime_rs_core_3 takes b returns done
   sb_push(b, "            Instr::LoadLocal(n) => stack.push(locals.get(n).cloned().unwrap_or(Value::Unit))," + nl())
   sb_push(b, "            Instr::StoreLocal(n) => { let v = stack.pop().ok_or(\"stack underflow\")?; locals.insert(n.clone(), v); }," + nl())
   sb_push(b, "            Instr::UnOp(k) => {" + nl())
-  return true
-end
-
-make a function called emit_runtime_rs_core_4 takes b returns done
   sb_push(b, "                let a = stack.pop().ok_or(\"stack underflow\")?;" + nl())
   sb_push(b, "                let r = match k { UnOpKind::Neg => neg(&a)?, UnOpKind::Not => Value::Bool(!a.as_bool()?), UnOpKind::BitNot => bitnot(&a)? };" + nl())
   sb_push(b, "                stack.push(r);" + nl())
@@ -2126,6 +2143,10 @@ make a function called emit_runtime_rs_core_4 takes b returns done
   sb_push(b, "                        };" + nl())
   sb_push(b, "                        let captured = args.get(2).cloned().unwrap_or(Value::List(vec![]));" + nl())
   sb_push(b, "                        let existing = args.get(3).cloned().unwrap_or(Value::Unit);" + nl())
+  return true
+end
+
+make a function called emit_runtime_rs_core_5 takes b returns done
   sb_push(b, "                        stack.push(fibers::budgeted_run(program, ms, &fname, captured, &existing)?);" + nl())
   sb_push(b, "                    }" + nl())
   sb_push(b, "                } else if n == \"budget_check\" {" + nl())
@@ -2147,10 +2168,6 @@ make a function called emit_runtime_rs_core_4 takes b returns done
   sb_push(b, "                let r = run_function(program, callee, &args)?; stack.push(r);" + nl())
   sb_push(b, "            }" + nl())
   sb_push(b, "            Instr::MakeClosure(func_name, captured_names) => {" + nl())
-  return true
-end
-
-make a function called emit_runtime_rs_core_5 takes b returns done
   sb_push(b, "                let n = captured_names.len();" + nl())
   sb_push(b, "                if stack.len() < n { return Err(\"stack underflow\".into()); }" + nl())
   sb_push(b, "                let start = stack.len() - n;" + nl())
