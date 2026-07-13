@@ -1,0 +1,97 @@
+# Scripted verification of self_hosting/lib/hexrts.patlang -- moves a unit
+# toward a resource tile, harvests it, watches it return and deposit, and
+# checks a trainer building spends resource and eventually spawns a new
+# worker. All via rts_step(state, orders), the same pure per-tick function
+# the browser page calls.
+
+include "../lib/includes.patlang"
+include "../lib/hexrts.patlang"
+include "../lib/test.patlang"
+
+make a function called run_ticks takes state, n returns final
+  let s = state
+  let i = 0
+  while i < n do
+    let s = rts_step(s, [])
+    let i = i + 1
+  end
+  return s
+end
+
+make a function called find_unit takes state, unit_id returns unit
+  let units = state[1]
+  let idx = rts_unit_index(units, unit_id)
+  return units[idx]
+end
+
+make a function called run_hexrts_tests returns ok
+  t_init()
+
+  # --- hex math sanity ---
+  check("distance to self is 0", rts_hex_distance(0, 0, 0, 0), 0)
+  check("distance one step east", rts_hex_distance(0, 0, 1, 0), 1)
+  check("distance across the map", rts_hex_distance(0, 0, 3, 0), 3)
+
+  # --- movement: a unit ordered to move should arrive after enough ticks ---
+  let state = rts_init()
+  let state = rts_apply_order(state, ["move", 1, 3, 0])
+  let state = run_ticks(state, 10)
+  let u = find_unit(state, 1)
+  check("unit 1 arrived at its move target (q)", u[1], 3)
+  check("unit 1 arrived at its move target (r)", u[2], 0)
+  check("unit 1 is idle after arriving", u[5], "idle")
+
+  # --- harvesting: send unit 2 to the resource tile at (3,0) ---
+  # Each order->order state transition (harvest_go->harvest_work,
+  # harvest_return->deposit) only fires on the tick AFTER the unit's
+  # position already satisfies it (the tick that moves onto the target
+  # doesn't also transition state that same tick) -- so a full round trip
+  # costs a few more ticks than the raw hex distances alone suggest.
+  # Generous margins below rather than exact tick-counting.
+  let state = rts_init()
+  let state = rts_apply_order(state, ["harvest", 2, 3, 0])
+  let state = run_ticks(state, 15)
+  let u = find_unit(state, 2)
+  check("harvester carrying is 0 after depositing", u[6], 0)
+  check("resource bank increased after a harvest run", state[0] > 0, true)
+  let bank_after_one_trip = state[0]
+
+  # it should have automatically turned around and gone back for more
+  let state = run_ticks(state, 15)
+  check("harvester keeps working automatically (bank grew again)", state[0] > bank_after_one_trip, true)
+
+  # --- building: a trainer costs resource and eventually spawns a worker ---
+  let state = rts_init()
+  let state = rts_apply_order(state, ["harvest", 1, 3, 0])
+  let state = rts_apply_order(state, ["harvest", 2, -3, 2])
+  let state = run_ticks(state, 40)
+  check("banked enough resource to afford a trainer", state[0] >= 10, true)
+  let units_before = to_num(list_len(state[1]))
+  let state = rts_apply_order(state, ["build", "trainer", 1, 1])
+  let builds = state[3]
+  check("a build entry was created", to_num(list_len(builds)), 1)
+  # build takes 5 ticks to finish, then needs a spawn interval + affordable cost
+  let state = run_ticks(state, 50)
+  let units_after = to_num(list_len(state[1]))
+  check("trainer eventually spawned at least one new unit", units_after > units_before, true)
+
+  # --- serialization round-trips ---
+  let state = rts_init()
+  let text = rts_render(state)
+  let round_tripped = rts_parse_state(text)
+  check("round-tripped resource total matches", round_tripped[0], state[0])
+  check("round-tripped unit count matches", to_num(list_len(round_tripped[1])), to_num(list_len(state[1])))
+  check("round-tripped tile count matches", to_num(list_len(round_tripped[2])), to_num(list_len(state[2])))
+
+  let orders_text = "move,1,2,2" + chr(10) + "harvest,2,-3,2" + chr(10) + "build,trainer,0,1"
+  let orders = rts_parse_orders(orders_text)
+  check("parsed 3 orders", to_num(list_len(orders)), 3)
+  check("first order is move", orders[0][0], "move")
+  check("second order is harvest", orders[1][0], "harvest")
+  check("third order is build", orders[2][0], "build")
+
+  t_report()
+  return get("__vars", "t_fail") == 0
+end
+
+run_hexrts_tests()

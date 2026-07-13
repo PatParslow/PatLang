@@ -1,0 +1,536 @@
+# A small hex-grid RTS-lite economy simulation: units gather ore from
+# resource tiles and haul it back to a base, and the base spends banked ore
+# to build a trainer structure that produces more workers over time. No
+# combat, one faction, built entirely in PatLang (no new Rust host
+# functions) -- see self_hosting/examples/hexrts_demo.patlang for a scripted
+# CLI test harness and self_hosting/tools/build_portfolio.patlang's
+# hexrts_page for the interactive browser form.
+#
+# STATE MODEL, deliberately different from the REPL/queue's "replay
+# everything" approach: replaying an ever-growing order log every tick
+# doesn't scale for a live game (a click every second for a few minutes
+# would mean re-simulating hundreds of ticks per frame). Instead this file
+# exposes a pure step function: rts_step(state, orders) -> new_state. The
+# CALLER (browser JS, or the CLI harness) carries the current snapshot
+# forward and only ever asks for ONE tick's worth of work per call --
+# bounded, not replayed, still zero incremental-interpreter state needed
+# inside the language itself.
+#
+# Internal representation of `state` (a plain PatLang list, only ever built
+# and consumed by the functions in this file -- callers only ever see the
+# serialized text form via rts_render/rts_parse_state):
+#   [resource_total, units, tiles, builds]
+#   units:  list of [id, q, r, target_q, target_r, order, carrying, home_q, home_r, res_q, res_r]
+#           order is one of "idle" / "move" / "harvest_go" / "harvest_work" / "harvest_return"
+#           target_q/target_r is wherever the unit is CURRENTLY walking to
+#           (swaps between the resource tile and home depending on phase);
+#           res_q/res_r separately remembers which resource tile a harvester
+#           is assigned to, so it can be re-targeted after every deposit
+#           without depending on target_q/target_r, which gets overwritten
+#           with the home coordinates during the return trip.
+#   tiles:  list of [q, r, terrain, amount]  -- terrain is "grass"/"resource"/"base"
+#   builds: list of [id, type, q, r, progress, done, ticks_since_spawn]
+
+include "includes.patlang"
+
+# ---- tunables (functions, not top-level lets -- see patlang-backlog's
+# top-level-let-invisible-inside-functions gotcha) ----
+
+make a function called rts_map_radius returns n
+  return 5
+end
+
+make a function called rts_carry_cap returns n
+  return 5
+end
+
+make a function called rts_harvest_per_tick returns n
+  return 1
+end
+
+make a function called rts_trainer_cost returns n
+  return 10
+end
+
+make a function called rts_trainer_build_ticks returns n
+  return 5
+end
+
+make a function called rts_spawn_cost returns n
+  return 5
+end
+
+make a function called rts_spawn_interval returns n
+  return 4
+end
+
+# ---- small string helpers (comma-split; split_lines/str_trim come from includes.patlang) ----
+
+make a function called rts_split_comma takes s returns fields
+  let out = []
+  let start = 0
+  let i = 0
+  let n = s.length
+  while i < n do
+    if char_code(s, i) == 44 then
+      let out = list_push(out, substr(s, start, i - start))
+      let start = i + 1
+    end
+    let i = i + 1
+  end
+  let out = list_push(out, substr(s, start, n - start))
+  return out
+end
+
+# ---- hex math (axial coordinates) ----
+
+make a function called rts_hex_neighbors returns offsets
+  return [[1, 0], [1, -1], [0, -1], [-1, 0], [-1, 1], [0, 1]]
+end
+
+make a function called rts_abs takes n returns a
+  if n < 0 then
+    return 0 - n
+  end
+  return n
+end
+
+make a function called rts_hex_distance takes q1, r1, q2, r2 returns d
+  let dq = q2 - q1
+  let dr = r2 - r1
+  return (rts_abs(dq) + rts_abs(dr) + rts_abs(dq + dr)) / 2
+end
+
+# Greedy one-step move: of the 6 neighbors, pick whichever gets closest to
+# the target. Good enough for an obstacle-free bounded hex field -- no
+# pathfinding needed for v1.
+make a function called rts_step_toward takes q, r, tq, tr returns pos
+  if (q == tq) and (r == tr) then
+    return [q, r]
+  end
+  let offsets = rts_hex_neighbors()
+  let best_q = q
+  let best_r = r
+  let best_d = rts_hex_distance(q, r, tq, tr)
+  let i = 0
+  while i < 6 do
+    let off = offsets[i]
+    let nq = q + off[0]
+    let nr = r + off[1]
+    let d = rts_hex_distance(nq, nr, tq, tr)
+    if d < best_d then
+      let best_d = d
+      let best_q = nq
+      let best_r = nr
+    end
+    let i = i + 1
+  end
+  return [best_q, best_r]
+end
+
+# ---- map / initial state ----
+
+make a function called rts_starting_resource_tiles returns tiles
+  return [[3, 0, 20], [-3, 2, 20], [0, -3, 20], [2, 2, 20]]
+end
+
+make a function called rts_build_map returns tiles
+  let radius = rts_map_radius()
+  let resources = rts_starting_resource_tiles()
+  let out = []
+  let q = 0 - radius
+  while q <= radius do
+    let r_lo = 0 - radius
+    if 0 - q - radius > r_lo then
+      let r_lo = 0 - q - radius
+    end
+    let r_hi = radius
+    if radius - q < r_hi then
+      let r_hi = radius - q
+    end
+    let r = r_lo
+    while r <= r_hi do
+      if (q == 0) and (r == 0) then
+        let out = list_push(out, [q, r, "base", 0])
+      else
+        let ri = 0
+        let matched = false
+        let rn = to_num(list_len(resources))
+        while ri < rn do
+          let res = resources[ri]
+          if (res[0] == q) and (res[1] == r) then
+            let out = list_push(out, [q, r, "resource", res[2]])
+            let matched = true
+          end
+          let ri = ri + 1
+        end
+        if matched == false then
+          let out = list_push(out, [q, r, "grass", 0])
+        end
+      end
+      let r = r + 1
+    end
+    let q = q + 1
+  end
+  return out
+end
+
+make a function called rts_init returns state
+  let tiles = rts_build_map()
+  let units = [
+    [1, 0, 1, 0, 1, "idle", 0, 0, 0, 0, 0],
+    [2, 1, 0, 1, 0, "idle", 0, 0, 0, 0, 0]
+  ]
+  return [0, units, tiles, []]
+end
+
+# ---- lookups ----
+
+make a function called rts_find_tile takes tiles, q, r returns tile
+  let i = 0
+  let n = to_num(list_len(tiles))
+  while i < n do
+    let t = tiles[i]
+    if (t[0] == q) and (t[1] == r) then
+      return t
+    end
+    let i = i + 1
+  end
+  return ["", "", "grass", 0]
+end
+
+make a function called rts_tile_index takes tiles, q, r returns idx
+  let i = 0
+  let n = to_num(list_len(tiles))
+  while i < n do
+    let t = tiles[i]
+    if (t[0] == q) and (t[1] == r) then
+      return i
+    end
+    let i = i + 1
+  end
+  return -1
+end
+
+make a function called rts_unit_index takes units, unit_id returns idx
+  let i = 0
+  let n = to_num(list_len(units))
+  while i < n do
+    let u = units[i]
+    if to_num(u[0]) == to_num(unit_id) then
+      return i
+    end
+    let i = i + 1
+  end
+  return -1
+end
+
+# ---- applying one order ----
+
+make a function called rts_apply_order takes state, order returns new_state
+  let resource_total = state[0]
+  let units = state[1]
+  let tiles = state[2]
+  let builds = state[3]
+  let kind = order[0]
+
+  if kind == "move" then
+    let unit_id = order[1]
+    let tq = order[2]
+    let tr = order[3]
+    let idx = rts_unit_index(units, unit_id)
+    if idx >= 0 then
+      let u = units[idx]
+      let updated = [u[0], u[1], u[2], tq, tr, "move", u[6], u[7], u[8], u[9], u[10]]
+      let units = list_set(units, idx, updated)
+    end
+  end
+
+  if kind == "harvest" then
+    let unit_id = order[1]
+    let tq = order[2]
+    let tr = order[3]
+    let idx = rts_unit_index(units, unit_id)
+    if idx >= 0 then
+      let u = units[idx]
+      let updated = [u[0], u[1], u[2], tq, tr, "harvest_go", u[6], u[7], u[8], tq, tr]
+      let units = list_set(units, idx, updated)
+    end
+  end
+
+  if kind == "build" then
+    let btype = order[1]
+    let bq = order[2]
+    let br = order[3]
+    if to_num(resource_total) >= rts_trainer_cost() then
+      let resource_total = to_num(resource_total) - rts_trainer_cost()
+      let new_id = to_num(list_len(builds)) + 1
+      let builds = list_push(builds, [new_id, btype, bq, br, 0, "0", 0])
+    end
+  end
+
+  return [resource_total, units, tiles, builds]
+end
+
+# ---- advancing one unit by one tick ----
+
+make a function called rts_advance_unit takes unit, tiles returns result
+  let id = unit[0]
+  let q = unit[1]
+  let r = unit[2]
+  let tq = unit[3]
+  let tr = unit[4]
+  let order = unit[5]
+  let carrying = to_num(unit[6])
+  let home_q = unit[7]
+  let home_r = unit[8]
+  let res_q = unit[9]
+  let res_r = unit[10]
+  let tiles_out = tiles
+  let deposited = 0
+
+  if order == "move" then
+    if (q == tq) and (r == tr) then
+      return [[id, q, r, tq, tr, "idle", carrying, home_q, home_r, res_q, res_r], tiles_out, deposited]
+    end
+    let pos = rts_step_toward(q, r, tq, tr)
+    return [[id, pos[0], pos[1], tq, tr, "move", carrying, home_q, home_r, res_q, res_r], tiles_out, deposited]
+  end
+
+  if order == "harvest_go" then
+    if (q == tq) and (r == tr) then
+      return [[id, q, r, tq, tr, "harvest_work", carrying, home_q, home_r, res_q, res_r], tiles_out, deposited]
+    end
+    let pos = rts_step_toward(q, r, tq, tr)
+    return [[id, pos[0], pos[1], tq, tr, "harvest_go", carrying, home_q, home_r, res_q, res_r], tiles_out, deposited]
+  end
+
+  if order == "harvest_work" then
+    let tile_idx = rts_tile_index(tiles, tq, tr)
+    if tile_idx < 0 then
+      return [[id, q, r, tq, tr, "idle", carrying, home_q, home_r, res_q, res_r], tiles_out, deposited]
+    end
+    let tile = tiles[tile_idx]
+    let amount = to_num(tile[3])
+    if (amount <= 0) or (carrying >= rts_carry_cap()) then
+      return [[id, q, r, home_q, home_r, "harvest_return", carrying, home_q, home_r, res_q, res_r], tiles_out, deposited]
+    end
+    let take = rts_harvest_per_tick()
+    if take > amount then
+      let take = amount
+    end
+    if take > (rts_carry_cap() - carrying) then
+      let take = rts_carry_cap() - carrying
+    end
+    let updated_tile = [tile[0], tile[1], tile[2], amount - take]
+    let tiles_out = list_set(tiles, tile_idx, updated_tile)
+    let carrying = carrying + take
+    return [[id, q, r, tq, tr, "harvest_work", carrying, home_q, home_r, res_q, res_r], tiles_out, deposited]
+  end
+
+  if order == "harvest_return" then
+    if (q == home_q) and (r == home_r) then
+      let deposited = carrying
+      let carrying = 0
+      let resource_tile = rts_find_tile(tiles, res_q, res_r)
+      if to_num(resource_tile[3]) > 0 then
+        return [[id, q, r, res_q, res_r, "harvest_go", carrying, home_q, home_r, res_q, res_r], tiles_out, deposited]
+      end
+      return [[id, q, r, q, r, "idle", carrying, home_q, home_r, res_q, res_r], tiles_out, deposited]
+    end
+    let pos = rts_step_toward(q, r, home_q, home_r)
+    return [[id, pos[0], pos[1], tq, tr, "harvest_return", carrying, home_q, home_r, res_q, res_r], tiles_out, deposited]
+  end
+
+  return [[id, q, r, tq, tr, order, carrying, home_q, home_r, res_q, res_r], tiles_out, deposited]
+end
+
+# ---- advancing all builds by one tick ----
+
+make a function called rts_advance_builds takes builds, resource_total, next_unit_id returns result
+  let out = []
+  let spawned = []
+  let resource_total = to_num(resource_total)
+  let next_unit_id = to_num(next_unit_id)
+  let i = 0
+  let n = to_num(list_len(builds))
+  while i < n do
+    let b = builds[i]
+    let id = b[0]
+    let btype = b[1]
+    let bq = b[2]
+    let br = b[3]
+    let progress = to_num(b[4])
+    let done = b[5]
+    let since_spawn = to_num(b[6])
+    if done == "0" then
+      let progress = progress + 1
+      if progress >= rts_trainer_build_ticks() then
+        let done = "1"
+      end
+      let out = list_push(out, [id, btype, bq, br, progress, done, since_spawn])
+    else
+      let since_spawn = since_spawn + 1
+      if (since_spawn >= rts_spawn_interval()) and (resource_total >= rts_spawn_cost()) then
+        let resource_total = resource_total - rts_spawn_cost()
+        let since_spawn = 0
+        let next_unit_id = next_unit_id + 1
+        let spawned = list_push(spawned, [next_unit_id, bq, br, bq, br, "idle", 0, bq, br, 0, 0])
+      end
+      let out = list_push(out, [id, btype, bq, br, progress, done, since_spawn])
+    end
+    let i = i + 1
+  end
+  return [out, resource_total, next_unit_id, spawned]
+end
+
+# ---- one full tick: advance every unit, then every build ----
+
+make a function called rts_tick takes state returns new_state
+  let resource_total = to_num(state[0])
+  let units = state[1]
+  let tiles = state[2]
+  let builds = state[3]
+
+  let new_units = []
+  let i = 0
+  let n = to_num(list_len(units))
+  while i < n do
+    let result = rts_advance_unit(units[i], tiles)
+    let new_units = list_push(new_units, result[0])
+    let tiles = result[1]
+    let resource_total = resource_total + to_num(result[2])
+    let i = i + 1
+  end
+
+  let max_id = 0
+  let i = 0
+  let n = to_num(list_len(new_units))
+  while i < n do
+    if to_num(new_units[i][0]) > max_id then
+      let max_id = to_num(new_units[i][0])
+    end
+    let i = i + 1
+  end
+
+  let build_result = rts_advance_builds(builds, resource_total, max_id)
+  let builds = build_result[0]
+  let resource_total = build_result[1]
+  let spawned = build_result[3]
+  let s = 0
+  let sn = to_num(list_len(spawned))
+  while s < sn do
+    let new_units = list_push(new_units, spawned[s])
+    let s = s + 1
+  end
+
+  return [resource_total, new_units, tiles, builds]
+end
+
+# ---- top-level entry point: apply every new order, then advance one tick ----
+
+make a function called rts_step takes state, orders returns new_state
+  let s = state
+  let i = 0
+  let n = to_num(list_len(orders))
+  while i < n do
+    let s = rts_apply_order(s, orders[i])
+    let i = i + 1
+  end
+  return rts_tick(s)
+end
+
+# ---- serialization ----
+
+make a function called rts_render takes state returns text
+  let b = sb_new()
+  sb_push(b, "RESOURCE:" + state[0] + chr(10))
+  let units = state[1]
+  let i = 0
+  let n = to_num(list_len(units))
+  while i < n do
+    let u = units[i]
+    sb_push(b, "UNIT:" + u[0] + "," + u[1] + "," + u[2] + "," + u[3] + "," + u[4] + "," + u[5] + "," + u[6] + "," + u[7] + "," + u[8] + "," + u[9] + "," + u[10] + chr(10))
+    let i = i + 1
+  end
+  let tiles = state[2]
+  let i = 0
+  let n = to_num(list_len(tiles))
+  while i < n do
+    let t = tiles[i]
+    sb_push(b, "TILE:" + t[0] + "," + t[1] + "," + t[2] + "," + t[3] + chr(10))
+    let i = i + 1
+  end
+  let builds = state[3]
+  let i = 0
+  let n = to_num(list_len(builds))
+  while i < n do
+    let bd = builds[i]
+    sb_push(b, "BUILD:" + bd[0] + "," + bd[1] + "," + bd[2] + "," + bd[3] + "," + bd[4] + "," + bd[5] + "," + bd[6] + chr(10))
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+make a function called rts_parse_state takes text returns state
+  let lines = split_lines(text)
+  let resource_total = 0
+  let units = []
+  let tiles = []
+  let builds = []
+  let i = 0
+  let n = to_num(list_len(lines))
+  while i < n do
+    let line = str_trim(lines[i])
+    if line.length > 0 then
+      if str_starts_with(line, "RESOURCE:") then
+        let resource_total = to_num(substr(line, 9, line.length - 9))
+      else
+        if str_starts_with(line, "UNIT:") then
+          let f = rts_split_comma(substr(line, 5, line.length - 5))
+          let units = list_push(units, [to_num(f[0]), to_num(f[1]), to_num(f[2]), to_num(f[3]), to_num(f[4]), f[5], to_num(f[6]), to_num(f[7]), to_num(f[8]), to_num(f[9]), to_num(f[10])])
+        else
+          if str_starts_with(line, "TILE:") then
+            let f = rts_split_comma(substr(line, 5, line.length - 5))
+            let tiles = list_push(tiles, [to_num(f[0]), to_num(f[1]), f[2], to_num(f[3])])
+          else
+            if str_starts_with(line, "BUILD:") then
+              let f = rts_split_comma(substr(line, 6, line.length - 6))
+              let builds = list_push(builds, [to_num(f[0]), f[1], to_num(f[2]), to_num(f[3]), to_num(f[4]), f[5], to_num(f[6])])
+            end
+          end
+        end
+      end
+    end
+    let i = i + 1
+  end
+  return [resource_total, units, tiles, builds]
+end
+
+# orders text: one per line, "move,<id>,<q>,<r>" / "harvest,<id>,<q>,<r>" / "build,<type>,<q>,<r>"
+make a function called rts_parse_orders takes text returns orders
+  let lines = split_lines(text)
+  let out = []
+  let i = 0
+  let n = to_num(list_len(lines))
+  while i < n do
+    let line = str_trim(lines[i])
+    if line.length > 0 then
+      let f = rts_split_comma(line)
+      let kind = f[0]
+      if kind == "move" then
+        let out = list_push(out, ["move", to_num(f[1]), to_num(f[2]), to_num(f[3])])
+      else
+        if kind == "harvest" then
+          let out = list_push(out, ["harvest", to_num(f[1]), to_num(f[2]), to_num(f[3])])
+        else
+          if kind == "build" then
+            let out = list_push(out, ["build", f[1], to_num(f[2]), to_num(f[3])])
+          end
+        end
+      end
+    end
+    let i = i + 1
+  end
+  return out
+end
