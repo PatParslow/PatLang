@@ -20,18 +20,21 @@
 # hosts.rs's host_tcp_try_listen for the full rationale.
 #
 # Usage shape (see self_hosting/examples/signals_demo.patlang for a full
-# worked example):
+# worked example, including a request/response "status" signal):
 #   let port_id = signal_claim(9401)
 #   if port_id >= 0 then
 #     # primary: hold the port, poll it inside your own event loop
-#     when quit do ... end
+#     when quit do set_var("should_stop", "1") end
+#     when status do signal_reply("uptime: " + get("__vars", "uptime")) end
 #     while running do
 #       ... your own work ...
 #       signal_poll(port_id, 20)   # cheap, non-blocking; fires when/emit
 #     end
 #   else
-#     # secondary: someone else already owns this port -- deliver instead
-#     signal_send(9401, "quit", "")
+#     # secondary: someone else already owns this port
+#     signal_send(9401, "quit", "")           # fire-and-forget
+#     let reply = signal_query(9401, "status", "")  # request/response
+#     print(reply)
 #   end
 #
 # Deliberately minimal wire format (one line: "name\npayload", a single
@@ -63,13 +66,21 @@ end
 # program fires immediately -- callers that only need "did something
 # arrive" can ignore the return value and rely purely on their own `when`
 # handlers, matching event_loop_server.patlang's existing emit-driven style.
+#
+# Query-style signals (e.g. "status") get a reply channel: any `when`
+# handler can call signal_reply(text) before returning, and that text is
+# written back on the SAME connection before it's closed -- the connection
+# is deliberately kept open across the emit() call rather than closed
+# immediately after reading, specifically so a handler has something to
+# reply on. Fire-and-forget signals (e.g. "quit") simply never call
+# signal_reply, so an empty string is written back and the sender (using
+# plain signal_send, which never reads a reply) never notices either way.
 make a function called signal_poll takes port_id, timeout_ms returns name
   let conn = tcp_accept_timeout(port_id, timeout_ms)
   if conn < 0 then
     return ""
   end
   let msg = tcp_read(conn)
-  tcp_close(conn)
   let nl = find_substr_signals(msg, chr(10))
   let sig_name = msg
   let payload = ""
@@ -77,26 +88,52 @@ make a function called signal_poll takes port_id, timeout_ms returns name
     let sig_name = substr(msg, 0, nl)
     let payload = substr(msg, nl + 1, msg.length - nl - 1)
   end
+  set_var("__signal_reply", "")
   emit(sig_name, payload)
+  tcp_write(conn, get("__vars", "__signal_reply"))
+  tcp_close(conn)
   return sig_name
 end
 
-# signal_send(port, name, payload) -> true once delivered. Only call this
-# after signal_claim(port) has already told you a primary holds the port
-# (the intended usage shape above) -- PatLang has no try/catch, so unlike
-# signal_claim (which checks tcp_listen's own -1-on-failure return),
-# tcp_connect raises a FATAL host-function error if nothing is listening,
-# not a value this function could catch and turn into a graceful `false`.
-# In practice this only matters for the narrow race where the primary
-# exits between your signal_claim failing and this call running -- if that
-# happens the caller sees a clear "tcp_connect: ... connection refused"
-# error and the process aborts, which is an honest failure mode for a
-# fire-and-forget CLI signal, not a silent no-op.
+# signal_reply(text) -- call from inside a `when <name> do ... end` handler
+# to send `text` back to whoever sent that signal via signal_query. Has no
+# effect (silently ignored) if the signal was delivered via signal_send
+# instead (fire-and-forget senders never read a reply anyway) or if this is
+# called outside of a signal-triggered handler at all.
+make a function called signal_reply takes text returns done
+  set_var("__signal_reply", text)
+  return true
+end
+
+# signal_send(port, name, payload) -> true once delivered, discarding any
+# reply. Use this for fire-and-forget signals (e.g. "quit") where you don't
+# need a response. Only call this after signal_claim(port) has already
+# told you a primary holds the port (the intended usage shape above) --
+# PatLang has no try/catch, so unlike signal_claim (which checks
+# tcp_listen's own -1-on-failure return), tcp_connect raises a FATAL
+# host-function error if nothing is listening, not a value this function
+# could catch and turn into a graceful `false`. In practice this only
+# matters for the narrow race where the primary exits between your
+# signal_claim failing and this call running -- if that happens the caller
+# sees a clear "tcp_connect: ... connection refused" error and the process
+# aborts, which is an honest failure mode for a fire-and-forget CLI
+# signal, not a silent no-op.
 make a function called signal_send takes port, name, payload returns delivered
+  signal_query(port, name, payload)
+  return true
+end
+
+# signal_query(port, name, payload) -> whatever the primary's `when <name>
+# do ... end` handler passed to signal_reply(...), or "" if it didn't call
+# signal_reply at all. Use this for request/response signals (e.g.
+# "status"). Same fatal-on-nothing-listening caveat as signal_send (no
+# try/catch to catch tcp_connect's error gracefully).
+make a function called signal_query takes port, name, payload returns reply
   let conn = tcp_connect("127.0.0.1", port)
   tcp_write(conn, name + chr(10) + payload)
+  let reply = tcp_read(conn)
   tcp_close(conn)
-  return true
+  return reply
 end
 
 # Tiny local substring search -- self-contained rather than depending on

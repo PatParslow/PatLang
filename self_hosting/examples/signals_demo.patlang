@@ -1,11 +1,20 @@
-# Runtime signals, worked example: run this program twice, concurrently.
-# The first invocation claims the signal port and becomes the "primary" --
-# it holds the port and waits, printing whatever signal arrives. Any later
-# invocation finds the port already claimed and becomes a "sender" instead,
-# delivering one signal to the primary, then exiting immediately.
+# Runtime signals, worked example: run this program multiple times,
+# concurrently. The first invocation claims the signal port and becomes
+# the "primary" -- it holds the port and waits, dispatching whatever
+# signal arrives to a `when <name> do ... end` handler, same as any other
+# PatLang event. Every later invocation finds the port already claimed and
+# becomes a "sender" instead, delivering one signal to the primary, then
+# exiting immediately.
+#
+# Three signals are demonstrated:
+#   ping   -- fire-and-forget, just proves delivery works
+#   status -- request/response: the primary reports live state back
+#   quit   -- fire-and-forget, triggers a graceful shutdown
 #
 #   pat --ir-run self_hosting/examples/signals_demo.patlang &
 #   pat --ir-run self_hosting/examples/signals_demo.patlang ping hello
+#   pat --ir-run self_hosting/examples/signals_demo.patlang status
+#   pat --ir-run self_hosting/examples/signals_demo.patlang quit
 #
 # See self_hosting/lib/signals.patlang for the mechanism itself.
 
@@ -14,7 +23,17 @@ include "../lib/signals.patlang"
 let SIGNAL_PORT = 9401
 
 when ping do
+  set_var("pings_received", get("__vars", "pings_received") + 1)
   print("PRIMARY: received signal 'ping' with payload: " + event_data)
+end
+
+# status is a request/response signal, not fire-and-forget: the sender
+# gets an actual reply back (via signal_query), built live from state this
+# process has been tracking the whole time it's been running as primary --
+# not just a static "I'm alive" string.
+when status do
+  let uptime_ms = now_ms() - get("__vars", "started_at")
+  signal_reply("PRIMARY status: alive for " + uptime_ms + "ms, received " + get("__vars", "pings_received") + " ping(s) so far")
 end
 
 when quit do
@@ -28,6 +47,8 @@ let port_id = signal_claim(SIGNAL_PORT)
 if port_id >= 0 then
   print("PRIMARY: holding port " + SIGNAL_PORT + ", waiting for signals (Ctrl-C to stop, or send 'quit')")
   set_var("should_stop", "0")
+  set_var("pings_received", 0)
+  set_var("started_at", now_ms())
   while get("__vars", "should_stop") == "0" do
     signal_poll(port_id, 200)
   end
@@ -35,7 +56,7 @@ if port_id >= 0 then
 else
   # SECONDARY: a primary already holds the port. Send whatever this
   # invocation's own argv said to send -- "ping" with a message by
-  # default, or "quit" if that's the first arg.
+  # default, "status" for a live reply, or "quit" to shut the primary down.
   let sig_name = "ping"
   let sig_payload = "hello from a second invocation"
   if cli_args.length > 0 then
@@ -44,6 +65,11 @@ else
   if cli_args.length > 1 then
     let sig_payload = cli_args[1]
   end
-  signal_send(SIGNAL_PORT, sig_name, sig_payload)
-  print("SECONDARY: sent signal '" + sig_name + "' to the primary, exiting")
+  if sig_name == "status" then
+    let reply = signal_query(SIGNAL_PORT, sig_name, sig_payload)
+    print("SECONDARY: queried 'status', primary replied: " + reply)
+  else
+    signal_send(SIGNAL_PORT, sig_name, sig_payload)
+    print("SECONDARY: sent signal '" + sig_name + "' to the primary, exiting")
+  end
 end

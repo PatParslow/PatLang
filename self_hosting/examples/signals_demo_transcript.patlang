@@ -1,0 +1,83 @@
+# Build-transcript variant of signals_demo.patlang: the real, intended
+# usage is two separate OS PROCESSES (see signals_demo.patlang and its own
+# header comment) -- but a build script capturing a native transcript via
+# exec_capture can't demonstrate that directly, since exec_capture blocks
+# until its child exits, and the "primary" role here only exits once it
+# receives a quit signal from somewhere else. So this variant simulates
+# the same primary/secondary roles as two real OS threads (parallel_map)
+# within ONE process instead of two separate ones -- same signals.patlang
+# functions, same TCP loopback delivery, same emit()-driven dispatch, just
+# both ends visible in a single captured transcript. Safe specifically
+# because OBJECTS (the set_var/get backing store signals relies on for
+# cross-call state) was made cross-thread-safe earlier this session --
+# before that fix, this exact demo would have silently gone wrong, each
+# thread seeing its own isolated, empty state.
+
+include "../lib/signals.patlang"
+
+# The port is inlined as a literal (9402) everywhere below, rather than a
+# top-level `let SIGNAL_PORT` referenced from inside run_primary/
+# run_secondary -- parallel_map's worker threads were found, while
+# building this demo, to NOT see top-level `let` constants at all (each
+# worker's fresh Interpreter jumps straight into the target function,
+# skipping the top-level statements that would normally set such a
+# constant on the main thread). That's a real, broader bug than the
+# already-logged patc1.exe-only one -- it affects plain --ir-run too, not
+# just self-hosted compilation. Logged in the backlog for a dedicated fix;
+# this file just avoids the pattern rather than depending on it.
+
+when ping do
+  set_var("pings_received", get("__vars", "pings_received") + 1)
+  print("PRIMARY: received signal 'ping' with payload: " + event_data)
+end
+
+when status do
+  let uptime_ms = now_ms() - get("__vars", "started_at")
+  signal_reply("PRIMARY status: alive for " + uptime_ms + "ms, received " + get("__vars", "pings_received") + " ping(s) so far")
+end
+
+when quit do
+  print("PRIMARY: received signal 'quit' -- shutting down")
+  set_var("should_stop", "1")
+end
+
+make a function called run_primary takes unused returns done
+  let port_id = signal_claim(9402)
+  set_var("pings_received", 0)
+  set_var("started_at", now_ms())
+  set_var("should_stop", "0")
+  print("PRIMARY: holding port " + 9402)
+  while get("__vars", "should_stop") == "0" do
+    signal_poll(port_id, 50)
+  end
+  print("PRIMARY: exiting")
+  return true
+end
+
+make a function called run_secondary takes unused returns done
+  sleep_ms(200)
+  signal_send(9402, "ping", "hello from a concurrent thread")
+  sleep_ms(50)
+  let reply1 = signal_query(9402, "status", "")
+  print("SECONDARY: queried status -> " + reply1)
+  sleep_ms(50)
+  signal_send(9402, "ping", "one more")
+  sleep_ms(50)
+  let reply2 = signal_query(9402, "status", "")
+  print("SECONDARY: queried status -> " + reply2)
+  sleep_ms(50)
+  print("SECONDARY: sending quit")
+  signal_send(9402, "quit", "")
+  return true
+end
+
+make a function called run_thread takes kind returns done
+  if kind == "primary" then
+    return run_primary(0)
+  else
+    return run_secondary(0)
+  end
+end
+
+parallel_map(["primary", "secondary"], "run_thread")
+print("DONE")

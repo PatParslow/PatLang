@@ -1,0 +1,251 @@
+<h1>Runtime signals: quit and status from outside the process</h1>
+<p>A running PatLang program can receive a named signal + optional payload from OUTSIDE itself &mdash; a second CLI invocation (<code>server.exe --quit</code> sent to an already-running server, not a new one) or a local network call &mdash; dispatched through the same <code>when &lt;name&gt; do ... end</code> / <code>emit(...)</code> mechanism every other event in PatLang already uses, not a new handler concept. <code>signal_claim(port)</code> lets a process become the &quot;primary&quot; holder of a port (a second bind to the same port simply failing IS the &quot;is a primary already running&quot; detector, for free); a process that can't claim it instead calls <code>signal_send(port, name, payload)</code> for fire-and-forget signals like <code>quit</code>, or <code>signal_query(port, name, payload)</code> for request/response signals like <code>status</code>, which waits for and returns whatever the primary's handler passed to <code>signal_reply(text)</code>. This demo's real, live state (an uptime counter and a ping tally, both genuinely tracked while the process runs) is what <code>status</code> actually reports back &mdash; not a canned string. <strong>Native transcript only, no &quot;run in browser&quot; button</strong>: this needs real TCP sockets and real separate OS processes, neither available in the WASI sandbox. The transcript below simulates the primary/secondary roles as two real OS threads within one process (build-time transcripts need to run to completion, but a real primary only exits once it receives <code>quit</code>) &mdash; the source shown is the real <code>self_hosting/lib/signals.patlang</code> library plus that thread-based driver; see <code>self_hosting/examples/signals_demo.patlang</code> for the genuine two-separate-process form you'd actually run yourself: start it once in the background, then run it again with <code>quit</code>, <code>status</code>, or <code>ping &lt;message&gt;</code> as arguments.</p>
+<details><summary>PatLang source</summary><pre class='src'># Runtime signals for PatLang programs: a running process can receive a
+# named signal + optional payload from OUTSIDE itself -- a second CLI
+# invocation (&quot;server.exe --quit&quot; sent to an already-running server, not a
+# second server starting up), or a local network call. Delivery reuses
+# tcp_connect/tcp_read/tcp_write/tcp_close exactly as they already existed,
+# and dispatch reuses the existing when/emit event mechanism (see
+# self_hosting/examples/event_loop_server.patlang) -- a signal just becomes
+# an emit() call, so any `when &lt;name&gt; do ... end` handler already in the
+# receiving program fires normally, no new handler concept needed.
+#
+# The trick this relies on: tcp_listen binds 127.0.0.1 only (hosts.rs's
+# host_tcp_listen -- not configurable, not a new restriction added here),
+# and a second bind to the SAME port simply fails. That failure IS the &quot;is
+# a primary already running&quot; detector, for free -- no separate lockfile/
+# PID-file mechanism needed (PatLang has none today; this doesn't add one).
+# The one genuinely new host function this needed: tcp_try_listen(port) -&gt;
+# port_id or -1 on AddrInUse specifically, rather than tcp_listen's fatal-
+# on-any-bind-failure behavior -- PatLang has no try/catch, so there was no
+# way to gracefully ask &quot;is something already listening&quot; without it. See
+# hosts.rs's host_tcp_try_listen for the full rationale.
+#
+# Usage shape (see self_hosting/examples/signals_demo.patlang for a full
+# worked example, including a request/response &quot;status&quot; signal):
+#   let port_id = signal_claim(9401)
+#   if port_id &gt;= 0 then
+#     # primary: hold the port, poll it inside your own event loop
+#     when quit do set_var(&quot;should_stop&quot;, &quot;1&quot;) end
+#     when status do signal_reply(&quot;uptime: &quot; + get(&quot;__vars&quot;, &quot;uptime&quot;)) end
+#     while running do
+#       ... your own work ...
+#       signal_poll(port_id, 20)   # cheap, non-blocking; fires when/emit
+#     end
+#   else
+#     # secondary: someone else already owns this port
+#     signal_send(9401, &quot;quit&quot;, &quot;&quot;)           # fire-and-forget
+#     let reply = signal_query(9401, &quot;status&quot;, &quot;&quot;)  # request/response
+#     print(reply)
+#   end
+#
+# Deliberately minimal wire format (one line: &quot;name\npayload&quot;, a single
+# write + a single read, no length-prefix framing) -- matches this
+# codebase's existing pragmatic style for small local control messages
+# (see event_loop_server.patlang's own plain HTTP-ish read/write), not
+# meant for large payloads. Localhost-only by construction (see above), so
+# no separate auth story yet -- a real network-facing signal listener would
+# need one before ever binding beyond 127.0.0.1; out of scope here, same as
+# this feature's own backlog note said from the start.
+
+# signal_claim(port) -&gt; port_id (&gt;= 0) if this process is now the primary
+# holder of `port` for signal delivery, or -1 if another process already
+# holds it (the caller should treat that as &quot;an instance is already
+# running&quot; and typically call signal_send instead). Uses tcp_try_listen,
+# NOT plain tcp_listen -- PatLang has no try/catch, so tcp_listen's bind
+# failure is a FATAL error (would abort the whole program), not something
+# this function could catch and turn into a graceful -1. tcp_try_listen
+# was added specifically for this: -1 only for &quot;already in use&quot;, any other
+# bind failure (invalid port, permission denied) still aborts, same as
+# plain tcp_listen would.
+make a function called signal_claim takes port returns port_id
+  return tcp_try_listen(port)
+end
+
+# signal_poll(port_id, timeout_ms) -&gt; the signal name received this call,
+# or &quot;&quot; if none arrived within timeout_ms. On receipt, also calls
+# emit(name, payload) so any `when name do ... end` handler in the calling
+# program fires immediately -- callers that only need &quot;did something
+# arrive&quot; can ignore the return value and rely purely on their own `when`
+# handlers, matching event_loop_server.patlang's existing emit-driven style.
+#
+# Query-style signals (e.g. &quot;status&quot;) get a reply channel: any `when`
+# handler can call signal_reply(text) before returning, and that text is
+# written back on the SAME connection before it's closed -- the connection
+# is deliberately kept open across the emit() call rather than closed
+# immediately after reading, specifically so a handler has something to
+# reply on. Fire-and-forget signals (e.g. &quot;quit&quot;) simply never call
+# signal_reply, so an empty string is written back and the sender (using
+# plain signal_send, which never reads a reply) never notices either way.
+make a function called signal_poll takes port_id, timeout_ms returns name
+  let conn = tcp_accept_timeout(port_id, timeout_ms)
+  if conn &lt; 0 then
+    return &quot;&quot;
+  end
+  let msg = tcp_read(conn)
+  let nl = find_substr_signals(msg, chr(10))
+  let sig_name = msg
+  let payload = &quot;&quot;
+  if nl &gt;= 0 then
+    let sig_name = substr(msg, 0, nl)
+    let payload = substr(msg, nl + 1, msg.length - nl - 1)
+  end
+  set_var(&quot;__signal_reply&quot;, &quot;&quot;)
+  emit(sig_name, payload)
+  tcp_write(conn, get(&quot;__vars&quot;, &quot;__signal_reply&quot;))
+  tcp_close(conn)
+  return sig_name
+end
+
+# signal_reply(text) -- call from inside a `when &lt;name&gt; do ... end` handler
+# to send `text` back to whoever sent that signal via signal_query. Has no
+# effect (silently ignored) if the signal was delivered via signal_send
+# instead (fire-and-forget senders never read a reply anyway) or if this is
+# called outside of a signal-triggered handler at all.
+make a function called signal_reply takes text returns done
+  set_var(&quot;__signal_reply&quot;, text)
+  return true
+end
+
+# signal_send(port, name, payload) -&gt; true once delivered, discarding any
+# reply. Use this for fire-and-forget signals (e.g. &quot;quit&quot;) where you don't
+# need a response. Only call this after signal_claim(port) has already
+# told you a primary holds the port (the intended usage shape above) --
+# PatLang has no try/catch, so unlike signal_claim (which checks
+# tcp_listen's own -1-on-failure return), tcp_connect raises a FATAL
+# host-function error if nothing is listening, not a value this function
+# could catch and turn into a graceful `false`. In practice this only
+# matters for the narrow race where the primary exits between your
+# signal_claim failing and this call running -- if that happens the caller
+# sees a clear &quot;tcp_connect: ... connection refused&quot; error and the process
+# aborts, which is an honest failure mode for a fire-and-forget CLI
+# signal, not a silent no-op.
+make a function called signal_send takes port, name, payload returns delivered
+  signal_query(port, name, payload)
+  return true
+end
+
+# signal_query(port, name, payload) -&gt; whatever the primary's `when &lt;name&gt;
+# do ... end` handler passed to signal_reply(...), or &quot;&quot; if it didn't call
+# signal_reply at all. Use this for request/response signals (e.g.
+# &quot;status&quot;). Same fatal-on-nothing-listening caveat as signal_send (no
+# try/catch to catch tcp_connect's error gracefully).
+make a function called signal_query takes port, name, payload returns reply
+  let conn = tcp_connect(&quot;127.0.0.1&quot;, port)
+  tcp_write(conn, name + chr(10) + payload)
+  let reply = tcp_read(conn)
+  tcp_close(conn)
+  return reply
+end
+
+# Tiny local substring search -- self-contained rather than depending on
+# whichever example/tool happens to define one, since this is a shared
+# library other programs `include`.
+make a function called find_substr_signals takes hay, needle returns idx
+  if needle.length == 0 then
+    return 0
+  end
+  let i = 0
+  while i &lt;= (hay.length - needle.length) do
+    if substr(hay, i, needle.length) == needle then
+      return i
+    end
+    let i = i + 1
+  end
+  return -1
+end
+
+# Build-transcript variant of signals_demo.patlang: the real, intended
+# usage is two separate OS PROCESSES (see signals_demo.patlang and its own
+# header comment) -- but a build script capturing a native transcript via
+# exec_capture can't demonstrate that directly, since exec_capture blocks
+# until its child exits, and the &quot;primary&quot; role here only exits once it
+# receives a quit signal from somewhere else. So this variant simulates
+# the same primary/secondary roles as two real OS threads (parallel_map)
+# within ONE process instead of two separate ones -- same signals.patlang
+# functions, same TCP loopback delivery, same emit()-driven dispatch, just
+# both ends visible in a single captured transcript. Safe specifically
+# because OBJECTS (the set_var/get backing store signals relies on for
+# cross-call state) was made cross-thread-safe earlier this session --
+# before that fix, this exact demo would have silently gone wrong, each
+# thread seeing its own isolated, empty state.
+
+
+
+# The port is inlined as a literal (9402) everywhere below, rather than a
+# top-level `let SIGNAL_PORT` referenced from inside run_primary/
+# run_secondary -- parallel_map's worker threads were found, while
+# building this demo, to NOT see top-level `let` constants at all (each
+# worker's fresh Interpreter jumps straight into the target function,
+# skipping the top-level statements that would normally set such a
+# constant on the main thread). That's a real, broader bug than the
+# already-logged patc1.exe-only one -- it affects plain --ir-run too, not
+# just self-hosted compilation. Logged in the backlog for a dedicated fix;
+# this file just avoids the pattern rather than depending on it.
+
+when ping do
+  set_var(&quot;pings_received&quot;, get(&quot;__vars&quot;, &quot;pings_received&quot;) + 1)
+  print(&quot;PRIMARY: received signal 'ping' with payload: &quot; + event_data)
+end
+
+when status do
+  let uptime_ms = now_ms() - get(&quot;__vars&quot;, &quot;started_at&quot;)
+  signal_reply(&quot;PRIMARY status: alive for &quot; + uptime_ms + &quot;ms, received &quot; + get(&quot;__vars&quot;, &quot;pings_received&quot;) + &quot; ping(s) so far&quot;)
+end
+
+when quit do
+  print(&quot;PRIMARY: received signal 'quit' -- shutting down&quot;)
+  set_var(&quot;should_stop&quot;, &quot;1&quot;)
+end
+
+make a function called run_primary takes unused returns done
+  let port_id = signal_claim(9402)
+  set_var(&quot;pings_received&quot;, 0)
+  set_var(&quot;started_at&quot;, now_ms())
+  set_var(&quot;should_stop&quot;, &quot;0&quot;)
+  print(&quot;PRIMARY: holding port &quot; + 9402)
+  while get(&quot;__vars&quot;, &quot;should_stop&quot;) == &quot;0&quot; do
+    signal_poll(port_id, 50)
+  end
+  print(&quot;PRIMARY: exiting&quot;)
+  return true
+end
+
+make a function called run_secondary takes unused returns done
+  sleep_ms(200)
+  signal_send(9402, &quot;ping&quot;, &quot;hello from a concurrent thread&quot;)
+  sleep_ms(50)
+  let reply1 = signal_query(9402, &quot;status&quot;, &quot;&quot;)
+  print(&quot;SECONDARY: queried status -&gt; &quot; + reply1)
+  sleep_ms(50)
+  signal_send(9402, &quot;ping&quot;, &quot;one more&quot;)
+  sleep_ms(50)
+  let reply2 = signal_query(9402, &quot;status&quot;, &quot;&quot;)
+  print(&quot;SECONDARY: queried status -&gt; &quot; + reply2)
+  sleep_ms(50)
+  print(&quot;SECONDARY: sending quit&quot;)
+  signal_send(9402, &quot;quit&quot;, &quot;&quot;)
+  return true
+end
+
+make a function called run_thread takes kind returns done
+  if kind == &quot;primary&quot; then
+    return run_primary(0)
+  else
+    return run_secondary(0)
+  end
+end
+
+parallel_map([&quot;primary&quot;, &quot;secondary&quot;], &quot;run_thread&quot;)
+print(&quot;DONE&quot;)
+</pre></details><p class='label'>Native run on the build machine:</p><pre class='out native'>PRIMARY: holding port 9402
+PRIMARY: received signal 'ping' with payload: hello from a concurrent thread
+SECONDARY: queried status -&gt; PRIMARY status: alive for 251ms, received 1 ping(s) so far
+PRIMARY: received signal 'ping' with payload: one more
+SECONDARY: queried status -&gt; PRIMARY status: alive for 356ms, received 2 ping(s) so far
+SECONDARY: sending quit
+PRIMARY: received signal 'quit' -- shutting down
+PRIMARY: exiting
+DONE
+
+</pre>

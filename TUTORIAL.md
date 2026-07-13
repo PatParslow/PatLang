@@ -227,6 +227,19 @@ action_add("link", [["compiled", ["a"]], ["compiled", ["b"]]], [["shipped", []]]
 let build_plan = plan([["shipped", []]])   # ["compile_b", "compile_a", "link"]
 ```
 
+Actions can be parameterized too, using the same `^[A-Z]` variable
+convention as `rule_add`/`solve` — one action template grounds into a
+separate instantiation per matching fact, instead of needing a
+hand-written action per target:
+
+```patlang
+rule_add("ready", ["target_a"], [])
+rule_add("ready", ["target_b"], [])
+action_add("build", [["ready", ["X"]]], [["built", ["X"]]], [], 1)
+let build_plan = plan([["built", ["target_a"]], ["built", ["target_b"]]])
+# ["build(X=target_a)", "build(X=target_b)"] -- one instantiation per target
+```
+
 A successful `require`/`ensure`/`assert` check also asserts a
 `contract_holds` fact automatically, so verified contracts become
 ordinary derivable data usable as a rule-body conjunct or GOAP
@@ -304,13 +317,71 @@ not yet in the self-hosted compiler).
 ### Networking
 
 Blocking TCP built-ins: `tcp_listen(port)` (0 = OS-assigned; returns the
-actual port), `tcp_accept(port)`, `tcp_read(conn)`, `tcp_write(conn, data)`,
-`tcp_close(conn)`. A complete HTTP echo server is
-`self_hosting/examples/echo_server.patlang` — compile it and hit it with curl:
+actual port; binds `127.0.0.1` only, not configurable), `tcp_accept(port)`,
+`tcp_read(conn)`, `tcp_write(conn, data)`, `tcp_close(conn)`. A complete HTTP
+echo server is `self_hosting/examples/echo_server.patlang` — compile it and
+hit it with curl:
 
 ```bash
 pat --ir-run self_hosting/pipeline_stage2.patlang   # or compile echo_server directly
 ```
+
+`tcp_try_listen(port)` is a non-panicking sibling of `tcp_listen`: returns
+`-1` specifically if the port is already bound elsewhere, instead of
+`tcp_listen`'s fatal-on-any-bind-failure behavior. PatLang has no
+try/catch, so there was no other way for a program to gracefully ask "is
+something already listening here" — any other bind failure (invalid port,
+permission denied) still fails fatally, same as plain `tcp_listen`. This is
+what the runtime signals library below uses to detect whether it's the
+first instance or not.
+
+### Runtime signals
+
+A running program can receive a named signal + optional payload from
+*outside itself* — a second CLI invocation (`server.exe --quit` sent to an
+already-running `server.exe`, not a new one) or a local network call —
+without any new dispatch mechanism: `self_hosting/lib/signals.patlang`
+builds entirely on the `when`/`emit` event system covered below, so a
+signal is just another event as far as your handlers are concerned.
+
+```patlang
+include "lib/signals.patlang"
+
+when quit do
+  set_var("should_stop", "1")
+end
+when status do
+  signal_reply("uptime: " + get("__vars", "uptime"))
+end
+
+let port_id = signal_claim(9401)
+if port_id >= 0 then
+  # this process is the primary -- hold the port, poll it in your loop
+  while get("__vars", "should_stop") == "0" do
+    # ... your own work ...
+    signal_poll(port_id, 20)
+  end
+else
+  # someone else already owns this port
+  signal_send(9401, "quit", "")               # fire-and-forget
+  print(signal_query(9401, "status", ""))     # request/response
+end
+```
+
+Two flavors: `signal_send` (fire-and-forget, e.g. `quit`) delivers and
+returns immediately without waiting for a reply; `signal_query`
+(request/response, e.g. `status`) blocks until the primary's handler calls
+`signal_reply(text)`, so a program can report genuine live state back to
+whoever asked, not just a canned string. `signal_claim(port)` relies on
+`tcp_listen` already being `127.0.0.1`-only and a second bind to the same
+port simply failing — that failure IS the "a primary is already running"
+detector, no separate lockfile or PID file needed (PatLang has neither).
+Localhost-only by construction, so there's no auth story yet — a real
+network-facing signal listener would need one before ever binding beyond
+`127.0.0.1`. See `self_hosting/examples/signals_demo.patlang` for a full
+worked example (run it twice, concurrently) and the [Paradigms
+Guide](https://parslow.net/topics/patlang/patlang-paradigms.html#heading-signals)
+for the fuller design writeup.
 
 ### Async: the event loop
 
@@ -647,23 +718,37 @@ full rebuild. Delete `portfolio/build/` to force a clean rebuild regardless.
 - `goal name { ... }` declarative block syntax still silently no-ops (unlike
   `rule`, discussed in section 4, which is now real) — no unambiguous
   mapping onto the `solve`/`plan` backend has been designed yet.
-- GOAP planning (`action_add`/`plan`) is ground-only for now — no logic
-  variables in actions/preconditions/effects. Parameterized actions
-  (instantiated per-target) are a natural follow-on, not needed for a
-  working planner today.
 - `vfs_flush_to_disk`'s write-through has not been exercised under a live
   `wasmtime`/browser WASM run — only compile-time verified that the correct
   target-specific code path is selected.
 - Compiling is fast; *self*-compiling takes minutes because rustc digests the
   ~1 MB emitted compiler. `patc` output is unoptimized for size (WASM modules
   ~2 MB); `strip`/`opt-level=s` support is on the roadmap.
+- A function invoked via `parallel_map` (or a fiber) runs on a worker
+  thread with its own fresh interpreter state that jumps straight into
+  that function — it never runs the program's top-level `let` statements
+  first, so a top-level constant referenced from inside such a function
+  silently doesn't resolve. Work around it by inlining literals or passing
+  values as explicit parameters instead of closing over a top-level `let`.
+  Also true, separately, of `patc1.exe`-compiled programs generally (not
+  just `parallel_map`-invoked functions there) — not yet root-caused.
+- `RULES`/`ACTIONS` (the backing stores for `rule_add`/`solve` and
+  `action_add`/`plan`) are still `thread_local!`, unlike `EVENT_HANDLERS`/
+  `OBJECTS`/the virtual filesystem, which were fixed to be cross-thread
+  safe this session — a rule or action registered on one thread isn't
+  visible to `solve`/`plan` called from another. Not yet fixed.
 
 Fixed since earlier versions: string escapes (`\n \t \r \" \\`) now work in
 the Stage 1 dialect, and `and`/`or` short-circuit in Stage-1-compiled code
 exactly as in Stage 0. Real OS threads now exist (fibers, `parallel_map`,
-and threaded WASM via `wasm32-wasip1-threads`) — the event/object/logic
-stores are shared across threads where correctness requires it (e.g.
-`rule_add`'s rule store, GOAP's action store, the virtual filesystem),
-not silently per-thread. `fact`/`query`/`goal` are now backed by real
-backward-chaining (`rule_add`/`solve`) and GOAP planning (`action_add`/
-`plan`), not just a flat lookup table (section 4).
+and threaded WASM via `wasm32-wasip1-threads`) — `EVENT_HANDLERS`, the
+object store (`new`/`get`/`set_var`, backing `send`), and the virtual
+filesystem are all shared across threads now, not silently per-thread
+(see the limitation above for the two stores that still are). `fact`/
+`query`/`goal` are now backed by real backward-chaining (`rule_add`/
+`solve`) and GOAP planning (`action_add`/`plan`), not just a flat lookup
+table (section 4) — and GOAP actions can now be parameterized with the
+same `^[A-Z]` logic-variable convention as `rule_add`/`solve` (e.g.
+`build(X)`), not ground-only. A running program can also now receive
+named signals from outside itself (a second CLI invocation, or a local
+network call) — see the Networking section above.

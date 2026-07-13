@@ -373,6 +373,18 @@ make a function called build_precompile_jobs returns jobs
   let jobs = add_job(jobs, "rulesyntax", read_file("self_hosting/examples/rule_syntax_demo.patlang"), "")
   let jobs = add_job(jobs, "vfsdemo", read_file("self_hosting/examples/vfs_demo.patlang"), "")
 
+  # signalsdemo: strip the demo's own include line before concatenating
+  # (same reason as the real compile site below -- a relative include path
+  # doesn't survive being copied to a scratch build path).
+  let sig_demo_raw = read_file("self_hosting/examples/signals_demo_transcript.patlang")
+  let sig_include_line = "include " + q() + "../lib/signals.patlang" + q()
+  let sig_include_at = find_substr(sig_demo_raw, sig_include_line)
+  let sig_demo_body = sig_demo_raw
+  if sig_include_at >= 0 then
+    let sig_demo_body = substr(sig_demo_raw, 0, sig_include_at) + substr(sig_demo_raw, sig_include_at + sig_include_line.length, sig_demo_raw.length - sig_include_at - sig_include_line.length)
+  end
+  let jobs = add_job(jobs, "signalsdemo", read_file("self_hosting/lib/signals.patlang") + chr(10) + sig_demo_body, "")
+
   # routerdsl needs its DSL-expansion side effect run first (writes
   # portfolio/build/router_dsl_expanded.patlang), duplicating the same
   # tokenize/parse_program/lower_program/run_ir pipeline used at its real
@@ -399,9 +411,10 @@ make a function called build_precompile_jobs returns jobs
   let pg_src = read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + read_file("self_hosting/lib/lower.patlang") + chr(10) + read_file("self_hosting/lib/regex_dsl.patlang") + chr(10) + read_file("self_hosting/lib/syntax_dsl.patlang") + chr(10) + read_file("self_hosting/examples/playground_main.patlang")
   let jobs = add_job(jobs, "playground", pg_src, "")
   let jobs = add_job(jobs, "playground", pg_src, "wasm32-wasip1")
-  let clibs = read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + read_file("self_hosting/lib/lower.patlang") + chr(10) + read_file("self_hosting/lib/codegen.patlang") + chr(10) + read_file("self_hosting/lib/runtime_rs.patlang")
-  let patbuild_src = read_file("self_hosting/tools/patbuild_main.patlang")
-  let jobs = add_job(jobs, "patbuild", clibs + chr(10) + patbuild_src, "")
+  # patbuild is deliberately NOT precompiled here for now -- see the real
+  # compile site further down for why (patc1.exe was found to take 45+
+  # minutes on this specific job, a ~40x anomaly vs the interpreter doing
+  # the identical pipeline in ~66s; logged in the backlog, not yet fixed).
   let flow_full = read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + read_file("self_hosting/lib/lower.patlang") + chr(10) + read_file("self_hosting/lib/html.patlang") + chr(10) + read_file("self_hosting/tools/flowgraph_main.patlang")
   let jobs = add_job(jobs, "flowgraph", flow_full, "")
   let flowgraph_wasm_src = read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + read_file("self_hosting/lib/lower.patlang") + chr(10) + read_file("self_hosting/lib/html.patlang") + chr(10) + read_file("self_hosting/examples/flowgraph_wasm_main.patlang")
@@ -977,6 +990,38 @@ compile_native(vfsdemo_src, "vfsdemo")
 let vfsdemo_native = exec_capture("portfolio/build/vfsdemo.exe")
 print("vfs demo done")
 
+# ---- runtime signals: a process can receive a named signal from OUTSIDE
+# itself (another CLI invocation, or a local network call) via signal_claim/
+# signal_poll/signal_send/signal_query, dispatched through the existing
+# when/emit mechanism. Native-only transcript, not a live "run in browser"
+# demo -- see the blurb below for why. This transcript variant simulates
+# the primary/secondary roles as two real OS threads instead of two
+# separate processes (exec_capture blocks until its child exits, so it
+# can't capture a long-running primary + separate signal-sending
+# invocations); self_hosting/examples/signals_demo.patlang is the real,
+# intended multi-process form a user would actually run.
+#
+# Manually concatenated (not `include`d) for the SAME reason every other
+# multi-file demo in this script is: patc1_compile writes the combined
+# source to a scratch path (portfolio/build/<id>.patlang), so a relative
+# `include "../lib/signals.patlang"` line -- correct when the file lives at
+# its real self_hosting/examples/ location -- would resolve to the WRONG
+# path once copied there. The demo file's own `include` line (needed for
+# real standalone use, e.g. `pat --patc self_hosting/examples/
+# signals_demo_transcript.patlang` directly) is stripped here before
+# concatenating, so signals.patlang's content isn't duplicated either.
+let signals_demo_raw = read_file("self_hosting/examples/signals_demo_transcript.patlang")
+let signals_include_line = "include " + q() + "../lib/signals.patlang" + q()
+let signals_include_at = find_substr(signals_demo_raw, signals_include_line)
+let signals_demo_body = signals_demo_raw
+if signals_include_at >= 0 then
+  let signals_demo_body = substr(signals_demo_raw, 0, signals_include_at) + substr(signals_demo_raw, signals_include_at + signals_include_line.length, signals_demo_raw.length - signals_include_at - signals_include_line.length)
+end
+let signals_src = read_file("self_hosting/lib/signals.patlang") + chr(10) + signals_demo_body
+compile_native(signals_src, "signalsdemo")
+let signals_native = exec_capture("portfolio/build/signalsdemo.exe")
+print("signals demo done")
+
 # User-defined DSL demo: `syntax RouterDSL { ... }` + `routes { ... }` blocks
 # in self_hosting/examples/router_dsl_demo.patlang are expanded to plain
 # `register_route(...)` calls by self_hosting/lib/syntax_dsl.patlang (a
@@ -1070,9 +1115,21 @@ print("playground done")
 # Dev tools: build them with the pipeline, capture their transcripts
 let clibs = read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + read_file("self_hosting/lib/lower.patlang") + chr(10) + read_file("self_hosting/lib/codegen.patlang") + chr(10) + read_file("self_hosting/lib/runtime_rs.patlang")
 let patbuild_src = read_file("self_hosting/tools/patbuild_main.patlang")
-compile_native(clibs + chr(10) + patbuild_src, "patbuild")
+# TEMPORARILY skipping recompilation (compile_native call removed, not just
+# cached): patc1.exe was found to take 45+ minutes compiling patbuild's
+# combined source (~385KB in, ~1.9MB of generated Rust out) -- the SAME
+# tokenize/parse/lower/emit_program_rs pipeline run directly under the
+# interpreter finishes in ~66 seconds, a ~40x anomaly, not just expected
+# self-hosted-compiler slowness. Likely O(n^2) string concatenation
+# somewhere in codegen.patlang's Rust-text emission for large outputs
+# specifically -- logged in the backlog for a proper StringBuilder-based
+# fix. Reusing the existing portfolio/build/patbuild.exe (built before
+# today's compiler changes; patbuild_main.patlang itself is unchanged, only
+# the shared lexer/parser/lower/codegen/runtime_rs it was compiled FROM
+# have moved on, which doesn't affect the already-compiled binary's own
+# behavior) so this demo isn't blocked on that fix.
 let patbuild_native = exec_capture("portfolio/build/patbuild.exe", "--native")
-print("patbuild done")
+print("patbuild done (compile skipped, reusing existing portfolio/build/patbuild.exe)")
 
 let flow_src = read_file("self_hosting/tools/flowgraph_main.patlang")
 let flow_full = read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + read_file("self_hosting/lib/lower.patlang") + chr(10) + read_file("self_hosting/lib/html.patlang") + chr(10) + flow_src
@@ -1830,6 +1887,8 @@ print("wrote portfolio/demos/cga.html")
 native_page("dynsyntax", "Dynamic syntax: grammar extensions as runtime data", "The DSL page above declares its <code>syntax { ... }</code> block as a literal, expanded once before the compiler ever runs &mdash; indistinguishable from a macro. This one instead computes its trigger keyword and rules from data at runtime, calls <code>expand_syntax_dsls_with(src, existing_defs)</code> itself to define the grammar extension, keeps only the returned <code>defs</code> list, then makes a SEPARATE, later call &mdash; on a string containing only the usage line, no syntax declaration anywhere in it &mdash; passing those <code>defs</code> forward. Two independent calls, composing through nothing but an ordinary list value, exactly like passing along any other piece of program state. The assembled result runs through the same <code>tokenize</code>/<code>parse_program</code>/<code>lower_program</code>/<code>run_ir</code> chain that already powers the playground (see <code>self_hosting/examples/playground_main.patlang</code>) &mdash; PatLang's compiler has always been callable from PatLang code; this demo is the first to close the loop and use that to synthesize a language construct that couldn't have existed until the program ran. <strong>Native transcript only, no &quot;run in browser&quot; button</strong>: because this demo calls the compiler pipeline from inside itself, running it live means the playground's own <code>run_ir</code> (a nested interpreter, isolated from the outer compiled binary's functions) has to tokenize/parse/lower the entire ~85KB pipeline-plus-demo bundle a second time, INSIDE that nested interpreter &mdash; measured at several orders of magnitude slower than the ~2.5 seconds the same bundle takes through the top-level interpreter directly. The underlying capability is proven correct (this transcript matches the interpreted result exactly, and a compiled-native build agrees too); the live-in-browser path for this specific self-referential case is simply not practical yet &mdash; an honest limitation of <code>run_ir</code>'s current performance on large inputs, not of the dynamic-syntax feature itself.", dynsyntax_src, dynsyntax_native)
 let manifest_text = read_file("self_hosting/patbuild.manifest")
 native_page("patbuild", "patbuild: a goal-oriented build system", "Driven by a manifest file (<code>self_hosting/patbuild.manifest</code>):<pre class='out'>" + html_escape(manifest_text) + "</pre>Targets are objects, dependencies are walked recursively, finished builds become <code>fact</code>s, progress is reported via events. By default each target is only lowered to IR and checked (no rustc at all, matching the in-browser playground); pass <code>--native</code> to also compile every target to a real executable via rustc &mdash; the transcript below was captured that way. <strong>Native transcript only, no &quot;run in browser&quot; button</strong>: unlike the demos above, patbuild genuinely needs real filesystem access it can't get in the WASI sandbox &mdash; it reads the manifest file plus every target's own source file from disk by path, and (with <code>--native</code>) invokes a real <code>rustc</code> subprocess per target, neither of which a browser sandbox can provide. This is a capability limit, not a performance one (compare the dynamic-syntax demo below, which CAN run in-browser, just impractically slowly for now).", patbuild_src, patbuild_native)
+
+native_page("signalsdemo", "Runtime signals: quit and status from outside the process", "A running PatLang program can receive a named signal + optional payload from OUTSIDE itself &mdash; a second CLI invocation (<code>server.exe --quit</code> sent to an already-running server, not a new one) or a local network call &mdash; dispatched through the same <code>when &lt;name&gt; do ... end</code> / <code>emit(...)</code> mechanism every other event in PatLang already uses, not a new handler concept. <code>signal_claim(port)</code> lets a process become the &quot;primary&quot; holder of a port (a second bind to the same port simply failing IS the &quot;is a primary already running&quot; detector, for free); a process that can't claim it instead calls <code>signal_send(port, name, payload)</code> for fire-and-forget signals like <code>quit</code>, or <code>signal_query(port, name, payload)</code> for request/response signals like <code>status</code>, which waits for and returns whatever the primary's handler passed to <code>signal_reply(text)</code>. This demo's real, live state (an uptime counter and a ping tally, both genuinely tracked while the process runs) is what <code>status</code> actually reports back &mdash; not a canned string. <strong>Native transcript only, no &quot;run in browser&quot; button</strong>: this needs real TCP sockets and real separate OS processes, neither available in the WASI sandbox. The transcript below simulates the primary/secondary roles as two real OS threads within one process (build-time transcripts need to run to completion, but a real primary only exits once it receives <code>quit</code>) &mdash; the source shown is the real <code>self_hosting/lib/signals.patlang</code> library plus that thread-based driver; see <code>self_hosting/examples/signals_demo.patlang</code> for the genuine two-separate-process form you'd actually run yourself: start it once in the background, then run it again with <code>quit</code>, <code>status</code>, or <code>ping &lt;message&gt;</code> as arguments.", signals_src, signals_native)
 # flowgraph-demo: live in-browser variant (flowgraph_wasm_b64, built
 # above) with a paste-your-own-program editor, PLUS the CLI tool's own
 # source and native transcript of the curated multi-program set it renders
@@ -1960,6 +2019,7 @@ let demo_links = [
   ["bitwise", "Bitwise operators & bitfields"],
   ["rulesyntax", "Declarative rule syntax"],
   ["vfsdemo", "Virtual filesystem"],
+  ["signalsdemo", "Runtime signals: quit and status"],
   ["towerdemo", "Numeric Tower: BigInt, Rational, Complex"],
   ["routerdsl", "User-defined DSL: routes { ... }"],
   ["dynsyntax", "Dynamic syntax: grammar extensions as runtime data"],
