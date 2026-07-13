@@ -19,7 +19,7 @@
 # Internal representation of `state` (a plain PatLang list, only ever built
 # and consumed by the functions in this file -- callers only ever see the
 # serialized text form via rts_render/rts_parse_state):
-#   [resource_total, units, tiles, builds]
+#   [resource_total, units, tiles, builds, events]
 #   units:  list of [id, q, r, target_q, target_r, order, carrying, home_q, home_r, res_q, res_r]
 #           order is one of "idle" / "move" / "harvest_go" / "harvest_work" / "harvest_return"
 #           target_q/target_r is wherever the unit is CURRENTLY walking to
@@ -30,6 +30,19 @@
 #           with the home coordinates during the return trip.
 #   tiles:  list of [q, r, terrain, amount]  -- terrain is "grass"/"resource"/"base"
 #   builds: list of [id, type, q, r, progress, done, ticks_since_spawn]
+#   events: list of plain human-readable strings describing THIS tick only
+#           (a deposit, a build order accepted/rejected, a trainer
+#           completing, a new unit spawning) -- reset to [] at the start of
+#           every rts_step call, never carried forward. Added 2026-07-13
+#           after real browser playtesting: a working simulation with no
+#           feedback is indistinguishable from a broken one -- the player
+#           genuinely could not tell whether the trainer had been built or
+#           how much ore was banked. rts_render emits these as EVENT: lines
+#           in the same text blob as everything else; rts_parse_state
+#           silently ignores lines it doesn't recognize (no explicit
+#           "EVENT:" case), so events never leak into the next tick's
+#           persisted state -- exactly the "transient, not replayed"
+#           behaviour the rest of this design already relies on.
 
 include "includes.patlang"
 
@@ -41,11 +54,11 @@ make a function called rts_map_radius returns n
 end
 
 make a function called rts_carry_cap returns n
-  return 5
+  return 8
 end
 
 make a function called rts_harvest_per_tick returns n
-  return 1
+  return 2
 end
 
 make a function called rts_trainer_cost returns n
@@ -131,7 +144,7 @@ end
 # ---- map / initial state ----
 
 make a function called rts_starting_resource_tiles returns tiles
-  return [[3, 0, 20], [-3, 2, 20], [0, -3, 20], [2, 2, 20]]
+  return [[3, 0, 30], [-3, 2, 30], [0, -3, 30], [2, 2, 30], [-2, -2, 30], [1, 3, 30]]
 end
 
 make a function called rts_build_map returns tiles
@@ -181,7 +194,7 @@ make a function called rts_init returns state
     [1, 0, 1, 0, 1, "idle", 0, 0, 0, 0, 0],
     [2, 1, 0, 1, 0, "idle", 0, 0, 0, 0, 0]
   ]
-  return [0, units, tiles, []]
+  return [0, units, tiles, [], []]
 end
 
 # ---- lookups ----
@@ -232,6 +245,7 @@ make a function called rts_apply_order takes state, order returns new_state
   let units = state[1]
   let tiles = state[2]
   let builds = state[3]
+  let events = state[4]
   let kind = order[0]
 
   if kind == "move" then
@@ -266,10 +280,13 @@ make a function called rts_apply_order takes state, order returns new_state
       let resource_total = to_num(resource_total) - rts_trainer_cost()
       let new_id = to_num(list_len(builds)) + 1
       let builds = list_push(builds, [new_id, btype, bq, br, 0, "0", 0])
+      let events = list_push(events, "Started building a trainer (" + rts_trainer_cost() + " ore spent, " + resource_total + " left)")
+    else
+      let events = list_push(events, "Not enough ore for a trainer -- need " + rts_trainer_cost() + ", have " + resource_total)
     end
   end
 
-  return [resource_total, units, tiles, builds]
+  return [resource_total, units, tiles, builds, events]
 end
 
 # ---- advancing one unit by one tick ----
@@ -350,6 +367,7 @@ end
 make a function called rts_advance_builds takes builds, resource_total, next_unit_id returns result
   let out = []
   let spawned = []
+  let events = []
   let resource_total = to_num(resource_total)
   let next_unit_id = to_num(next_unit_id)
   let i = 0
@@ -367,6 +385,7 @@ make a function called rts_advance_builds takes builds, resource_total, next_uni
       let progress = progress + 1
       if progress >= rts_trainer_build_ticks() then
         let done = "1"
+        let events = list_push(events, "Trainer construction complete")
       end
       let out = list_push(out, [id, btype, bq, br, progress, done, since_spawn])
     else
@@ -376,12 +395,13 @@ make a function called rts_advance_builds takes builds, resource_total, next_uni
         let since_spawn = 0
         let next_unit_id = next_unit_id + 1
         let spawned = list_push(spawned, [next_unit_id, bq, br, bq, br, "idle", 0, bq, br, 0, 0])
+        let events = list_push(events, "Trainer produced a new worker (unit " + next_unit_id + ", " + resource_total + " ore left)")
       end
       let out = list_push(out, [id, btype, bq, br, progress, done, since_spawn])
     end
     let i = i + 1
   end
-  return [out, resource_total, next_unit_id, spawned]
+  return [out, resource_total, next_unit_id, spawned, events]
 end
 
 # ---- one full tick: advance every unit, then every build ----
@@ -391,6 +411,7 @@ make a function called rts_tick takes state returns new_state
   let units = state[1]
   let tiles = state[2]
   let builds = state[3]
+  let events = state[4]
 
   let new_units = []
   let i = 0
@@ -399,7 +420,11 @@ make a function called rts_tick takes state returns new_state
     let result = rts_advance_unit(units[i], tiles)
     let new_units = list_push(new_units, result[0])
     let tiles = result[1]
-    let resource_total = resource_total + to_num(result[2])
+    let dep = to_num(result[2])
+    if dep > 0 then
+      let resource_total = resource_total + dep
+      let events = list_push(events, "Unit " + result[0][0] + " deposited " + dep + " ore (bank: " + resource_total + ")")
+    end
     let i = i + 1
   end
 
@@ -417,6 +442,13 @@ make a function called rts_tick takes state returns new_state
   let builds = build_result[0]
   let resource_total = build_result[1]
   let spawned = build_result[3]
+  let build_events = build_result[4]
+  let e = 0
+  let en = to_num(list_len(build_events))
+  while e < en do
+    let events = list_push(events, build_events[e])
+    let e = e + 1
+  end
   let s = 0
   let sn = to_num(list_len(spawned))
   while s < sn do
@@ -424,7 +456,7 @@ make a function called rts_tick takes state returns new_state
     let s = s + 1
   end
 
-  return [resource_total, new_units, tiles, builds]
+  return [resource_total, new_units, tiles, builds, events]
 end
 
 # ---- top-level entry point: apply every new order, then advance one tick ----
@@ -469,6 +501,13 @@ make a function called rts_render takes state returns text
     sb_push(b, "BUILD:" + bd[0] + "," + bd[1] + "," + bd[2] + "," + bd[3] + "," + bd[4] + "," + bd[5] + "," + bd[6] + chr(10))
     let i = i + 1
   end
+  let events = state[4]
+  let i = 0
+  let n = to_num(list_len(events))
+  while i < n do
+    sb_push(b, "EVENT:" + events[i] + chr(10))
+    let i = i + 1
+  end
   return sb_str(b)
 end
 
@@ -504,7 +543,7 @@ make a function called rts_parse_state takes text returns state
     end
     let i = i + 1
   end
-  return [resource_total, units, tiles, builds]
+  return [resource_total, units, tiles, builds, []]
 end
 
 # orders text: one per line, "move,<id>,<q>,<r>" / "harvest,<id>,<q>,<r>" / "build,<type>,<q>,<r>"
