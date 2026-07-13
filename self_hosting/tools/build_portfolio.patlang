@@ -492,6 +492,74 @@ make a function called demo_page takes slug, title, blurb, src, transcript, pg_b
   return true
 end
 
+# repl_page: a live, in-browser REPL reusing the SAME shared "playground"
+# wasm module every other demo card uses (self_hosting/examples/
+# playground_main.patlang, which already takes source text as argv()[0] and
+# already checks for parse errors before running -- exactly what a REPL
+# needs, no new wasm build required). All new code here is JS state
+# management on top of the existing wasi_shim_js runWasm/b64bytes bridge:
+# a growing declBuffer (persisted declarations only) plus a transcript,
+# mirroring self_hosting/lib/repl_core.patlang's design one-for-one --
+# declarations (let/make a function called/rule_add(/action_add(/when /
+# include /syntax ) are appended raw to declBuffer and never print
+# anything on success, so replaying the whole buffer every turn (the same
+# approach the CLI REPL uses, since there's no incremental-eval state to
+# carry between runWasm calls either) never re-echoes a past turn's
+# output; anything else is wrapped in print(...) and run transiently,
+# never persisted. See self_hosting/tools/repl.patlang's header for the
+# one shared honest limitation (a `let` with a side-effecting
+# right-hand side re-runs that side effect every subsequent turn).
+make a function called repl_page takes pg_b64 returns done
+  let sections = [tpl_para("A live PatLang session, running entirely in this tab -- no server involved. Each entry can span multiple lines (needed for <code>make a function called ... end</code>); press the Run button or Ctrl+Enter to evaluate. This reuses the exact same compiled playground module every other demo card on this site shares, and the exact same session-buffer design as the real, standalone CLI REPL (<code>self_hosting/tools/repl.patlang</code>, <code>pat --ir-run</code> it yourself) -- see the <a href='patlang-paradigms.html'>Paradigms Guide</a> for how PatLang's self-hosted compiler pipeline (tokenize/parse_program/lower_program/run_ir) makes this possible with no new Rust at all.")]
+  let sections = list_push(sections, tpl_raw("<pre id='repl-transcript' class='out' style='min-height:12em;white-space:pre-wrap'></pre>"))
+  let sections = list_push(sections, tpl_raw("<textarea id='repl-input' rows='3' style='width:100%;font-family:monospace' placeholder='let x = 10' onkeydown='replKeydown(event)'></textarea>"))
+  let sections = list_push(sections, tpl_raw("<p><button onclick='replSubmit()'>Run (Ctrl+Enter)</button> <button onclick='replReset()'>Reset session</button></p>"))
+  let js = sb_new()
+  sb_push(js, "const WASMS = { playground: '" + pg_b64 + "' };" + nl())
+  wasi_shim_js(js)
+  sb_push(js, "let replDeclBuffer = '';" + nl())
+  sb_push(js, "const REPL_DECL_PREFIXES = ['let ', 'make a function called', 'rule_add(', 'action_add(', 'when ', 'include ', 'syntax '];" + nl())
+  sb_push(js, "function replIsDeclaration(s) {" + nl())
+  sb_push(js, "  const t = s.replace(/^\\s+/, '');" + nl())
+  sb_push(js, "  return REPL_DECL_PREFIXES.some(function(p) { return t.indexOf(p) === 0; });" + nl())
+  sb_push(js, "}" + nl())
+  sb_push(js, "function replAppend(label, text) {" + nl())
+  sb_push(js, "  const tEl = document.getElementById('repl-transcript');" + nl())
+  sb_push(js, "  tEl.textContent += label + text + String.fromCharCode(10);" + nl())
+  sb_push(js, "  tEl.scrollTop = tEl.scrollHeight;" + nl())
+  sb_push(js, "}" + nl())
+  sb_push(js, "async function replSubmit() {" + nl())
+  sb_push(js, "  const inp = document.getElementById('repl-input');" + nl())
+  sb_push(js, "  const entry = inp.value.replace(/\\s+$/, '');" + nl())
+  sb_push(js, "  if (!entry) return;" + nl())
+  sb_push(js, "  const isDecl = replIsDeclaration(entry);" + nl())
+  sb_push(js, "  const candidate = replDeclBuffer + (isDecl ? entry + String.fromCharCode(10) : 'print(' + entry + ')' + String.fromCharCode(10));" + nl())
+  sb_push(js, "  replAppend('patlang> ', entry);" + nl())
+  sb_push(js, "  const output = await runWasm('repl', 'playground', [candidate]);" + nl())
+  sb_push(js, "  const hadError = output.indexOf('parse error:') >= 0;" + nl())
+  sb_push(js, "  if (isDecl && !hadError) {" + nl())
+  sb_push(js, "    replDeclBuffer += entry + String.fromCharCode(10);" + nl())
+  sb_push(js, "    replAppend('', output ? output : '(ok)');" + nl())
+  sb_push(js, "  } else {" + nl())
+  sb_push(js, "    replAppend('', output ? output : '(no output)');" + nl())
+  sb_push(js, "  }" + nl())
+  sb_push(js, "  inp.value = '';" + nl())
+  sb_push(js, "  inp.focus();" + nl())
+  sb_push(js, "}" + nl())
+  sb_push(js, "function replReset() {" + nl())
+  sb_push(js, "  replDeclBuffer = '';" + nl())
+  sb_push(js, "  document.getElementById('repl-transcript').textContent = '';" + nl())
+  sb_push(js, "}" + nl())
+  sb_push(js, "function replKeydown(e) {" + nl())
+  sb_push(js, "  if (e.ctrlKey && e.key === 'Enter') { e.preventDefault(); replSubmit(); }" + nl())
+  sb_push(js, "}" + nl())
+  let sections = list_push(sections, tpl_script(sb_str(js)))
+  let page = tpl_page("PatLang Live REPL", "fragment", sections)
+  write_file("portfolio/demos/repl.html", render_page(page))
+  print("wrote portfolio/demos/repl.html")
+  return true
+end
+
 make a function called b64bytes_only_js takes b returns done
   # Just the base64-decode helper, for pages (like the threaded fiber demo)
   # that need runWasmThreaded but not the rest of wasi_shim_js's playground/
@@ -1955,6 +2023,7 @@ native_page("signalsdemo", "Runtime signals: quit and status from outside the pr
 
 native_page("builddaemon", "Exemplar: a build daemon combining logic, GOAP, signals, events, and self-timing", "A self-hosted build daemon showing five of PatLang's less-usual capabilities working together in one program. <strong>Logic</strong> (<code>rule_add</code>/<code>solve</code>) derives which of six synthetic build targets are stale from <code>dep(target, dependency)</code>/<code>changed(target)</code> facts, by real multi-hop backward chaining, not a hand-written graph walk. <strong>Goal-seeking</strong> (<code>action_add</code>/<code>plan</code>, GOAP) then produces the actual cost-optimal rebuild order &mdash; and the cost of each action is that target's own <em>real, historically measured</em> build duration, not a guess: the planner is reasoning about genuine past performance. <strong>Self-timing</strong> (<code>now_ms()</code>) records every build's real duration to a small history file that survives between runs, seeding both the GOAP costs above and an upfront ETA on the very next run. <strong>Events</strong> (<code>when</code>/<code>emit</code>) drive a live dashboard as each target builds. <strong>Signals</strong> (<code>self_hosting/lib/signals.patlang</code>, unchanged) let a separate CLI invocation query live <code>status</code> (rebuilt count, ETA) or trigger <code>rebuild</code>/<code>quit</code> against the running daemon. The build graph is deliberately synthetic (fake targets, <code>sleep_ms</code> standing in for real compile work) so these five features stay legible rather than the demo being coupled to a slow, real build pipeline. <strong>Native transcript only, no &quot;run in browser&quot; button</strong>: needs real TCP sockets, a real persisted file, and real separate OS processes. The transcript below simulates the primary/secondary roles as two real OS threads within one process, for the same build-time-capture reason the signals demo above does &mdash; see <code>self_hosting/examples/build_daemon_demo.patlang</code> for the genuine two-separate-process form you'd actually run yourself.", builddaemon_src, builddaemon_native)
 native_page("queuedemo", "Durable message queue: a crash, and a real recovery", "Three independent workers, each doing risky I/O work, each with its OWN topic (<code>queue_writer_topic(base, worker_id)</code>) rather than sharing one &mdash; the queue does whole-file read-modify-write with no locking, so giving every writer its own topic avoids a write race by construction, not by coordination. Two workers finish cleanly via <code>queue_attempt</code> (publish intent, do the work, ack the outcome). The third genuinely crashes mid-attempt &mdash; PatLang has no try/catch, so a real fatal host error (a bad <code>read_file</code> call, verified this session across four actually-separate OS processes) kills that worker outright, before it ever reaches <code>queue_ack</code>. A separate, later process then calls <code>queue_pending_multi</code> across all three workers' topics, finds the one leftover checkpoint, completes it, and acks it &mdash; proving the intent genuinely survived the crash on disk, not just in this transcript. Built entirely in <code>self_hosting/lib/queue.patlang</code>, no new Rust host functions. See the <a href='patlang-paradigms.html#heading-queue'>Paradigms Guide's Durable Message Queue section</a> for the full design. <strong>Native transcript only, no &quot;run in browser&quot; button</strong>: needs real file I/O and a real fatal process exit, neither available in the WASI sandbox. The transcript below represents the crash directly (publishing the intent without ever calling the action or the ack &mdash; exactly the on-disk state a real crash between those two steps leaves) since a genuine fatal error can't be captured mid-transcript without killing this whole build &mdash; see <code>self_hosting/examples/queue_recovery_demo.patlang</code> for the real, actually-run-it-yourself four-separate-process form.", queue_src, queue_native)
+repl_page(pg_b64)
 # flowgraph-demo: live in-browser variant (flowgraph_wasm_b64, built
 # above) with a paste-your-own-program editor, PLUS the CLI tool's own
 # source and native transcript of the curated multi-program set it renders

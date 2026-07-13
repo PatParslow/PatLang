@@ -1,0 +1,113 @@
+# Core logic for a PatLang REPL -- shared by the CLI driver
+# (self_hosting/tools/repl.patlang) and, conceptually, the browser-based
+# live REPL card (which duplicates the tiny classification heuristic below
+# in JS rather than depending on this file, since the browser reuses the
+# existing shared "playground" wasm module and has no way to call a named
+# PatLang function from JS -- see build_portfolio.patlang's repl page for
+# that side).
+#
+# STATE MODEL, and its one real honest limitation: this REPL has no
+# incremental evaluator and adds none -- building one would mean making
+# `run_ir` (or a sibling) accept/return persistent interpreter state across
+# calls, a Rust-level change, which this feature deliberately avoids (PatLang
+# first, not Rust, unless absolutely required -- and it isn't). Instead,
+# each turn RE-RUNS THE WHOLE ACCUMULATED SESSION from scratch:
+# tokenize -> parse_program -> lower_program -> run_ir over (everything
+# persisted so far) + (this turn's input). That's only safe to repeat
+# without duplicated side effects because ONLY DECLARATIONS are persisted
+# into the session buffer (let/make a function called/rule_add/action_add/
+# when/include/syntax) -- none of those print anything on their own. A bare
+# expression is wrapped in print(...) and run TRANSIENTLY: it's never added
+# to the persisted buffer, so it can never be re-triggered by a later turn.
+# Net effect: replaying the whole buffer every turn never re-prints or
+# re-runs a past turn's side effects... UNLESS you write a `let` whose
+# right-hand side itself has a side effect (a file write, a queue_publish, a
+# network call) -- that specific expression WILL re-run every subsequent
+# turn, since it's now part of the persisted buffer. Worth knowing, not
+# worth solving here: keep top-level `let`s here to non-side-effecting
+# expressions, same habit as any REPL session, and reach for a real script
+# file instead of the REPL once side effects matter.
+
+# repl_is_declaration(line) -> true if this input should be PERSISTED into
+# the session buffer (a statement form with no output of its own), false if
+# it's a one-off expression to evaluate and print.
+make a function called repl_is_declaration takes line returns is_decl
+  let trimmed = str_trim(line)
+  if str_starts_with(trimmed, "let ") then
+    return true
+  end
+  if str_starts_with(trimmed, "make a function called") then
+    return true
+  end
+  if str_starts_with(trimmed, "rule_add(") then
+    return true
+  end
+  if str_starts_with(trimmed, "action_add(") then
+    return true
+  end
+  if str_starts_with(trimmed, "when ") then
+    return true
+  end
+  if str_starts_with(trimmed, "include ") then
+    return true
+  end
+  if str_starts_with(trimmed, "syntax ") then
+    return true
+  end
+  return false
+end
+
+# repl_find_parse_error(stmts) -> the error message of the first Err node
+# found anywhere in a parsed program's statement list -- top-level, or
+# nested inside a statement's own expressions (e.g. `let z = (((` produces
+# a top-level Let statement whose VALUE is the malformed node, not a
+# top-level Err itself). Rendering each statement with ast_to_str (which
+# has an explicit "Err(message)" case and recurses into every statement/
+# expression shape it knows) and scanning the rendered text for "Err(" is
+# a blunt but reliable way to catch both cases without needing a bespoke
+# recursive walker that has to know every current and future node shape.
+make a function called repl_find_parse_error takes stmts returns msg
+  let i = 0
+  let n = to_num(list_len(stmts))
+  while i < n do
+    let stmt = stmts[i]
+    let rendered = ast_to_str(stmt)
+    let at = find_substr_repl(rendered, "Err(")
+    if at >= 0 then
+      let inner = substr(rendered, at + 4, rendered.length - at - 4)
+      if (inner.length > 0) and (char_code(inner, inner.length - 1) == 41) then
+        let inner = substr(inner, 0, inner.length - 1)
+      end
+      return inner
+    end
+    let i = i + 1
+  end
+  return ""
+end
+
+make a function called find_substr_repl takes hay, needle returns idx
+  let hn = hay.length
+  let nn = needle.length
+  if nn == 0 then
+    return 0
+  end
+  let i = 0
+  while i <= hn - nn do
+    if substr(hay, i, nn) == needle then
+      return i
+    end
+    let i = i + 1
+  end
+  return -1
+end
+
+# repl_build_candidate(session_buffer, input, is_decl) -> the full source
+# text to actually run this turn: the persisted buffer, plus either the
+# raw input (if it's a declaration) or the input wrapped in print(...) (if
+# it's a one-off expression).
+make a function called repl_build_candidate takes session_buffer, input, is_decl returns src
+  if is_decl then
+    return session_buffer + input + chr(10)
+  end
+  return session_buffer + "print(" + input + ")" + chr(10)
+end
