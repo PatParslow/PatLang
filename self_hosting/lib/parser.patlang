@@ -484,8 +484,11 @@ make a function called parse_stmts_until takes toks, pos returns r
   return [stmts, p]
 end
 
-make a function called parse_if_then_tail takes toks, cond, pos returns r
+make a function called parse_if_then_tail takes toks, cond, pos, line returns r
   # pos points just after 'then'. Handles [elif cond then ...]* [else ...] end.
+  # `line` is the line of the 'if'/'elif' keyword that introduced THIS
+  # clause (each elif in a chain desugars to its own nested If node with
+  # its own line, not the original 'if''s).
   let thenPart = parse_stmts_until(toks, pos)
   let p2 = thenPart[1]
   let t2 = vec_get(toks, p2)
@@ -494,25 +497,26 @@ make a function called parse_if_then_tail takes toks, cond, pos returns r
     let p3 = elsePart[1]
     let t3 = vec_get(toks, p3)
     if tok_is(t3, "IDENT", "end") then
-      return [["If", cond, thenPart[0], elsePart[0]], p3 + 1]
+      return [["If", cond, thenPart[0], elsePart[0], line], p3 + 1]
     else
       return [["Err", "expected end after else block"], p3]
     end
   else
     if tok_is(t2, "IDENT", "elif") then
+      let elif_line = t2[2]
       let c2 = parse_expr(toks, p2 + 1)
       let cond2 = c2[0]
       let p3 = c2[1]
       let t3 = vec_get(toks, p3)
       if tok_is(t3, "IDENT", "then") then
-        let nested = parse_if_then_tail(toks, cond2, p3 + 1)
-        return [["If", cond, thenPart[0], [nested[0]]], nested[1]]
+        let nested = parse_if_then_tail(toks, cond2, p3 + 1, elif_line)
+        return [["If", cond, thenPart[0], [nested[0]], line], nested[1]]
       else
         return [["Err", "expected then after elif condition"], p3]
       end
     else
       if tok_is(t2, "IDENT", "end") then
-        return [["If", cond, thenPart[0], []], p2 + 1]
+        return [["If", cond, thenPart[0], [], line], p2 + 1]
       else
         return [["Err", "expected else, elif, or end after if block"], p2]
       end
@@ -520,7 +524,7 @@ make a function called parse_if_then_tail takes toks, cond, pos returns r
   end
 end
 
-make a function called parse_if_brace_tail takes toks, cond, pos returns r
+make a function called parse_if_brace_tail takes toks, cond, pos, line returns r
   # pos points just after '{'. Handles [elif cond { ... }]* [else { ... }] '}'.
   let thenPart = parse_stmts_until(toks, pos)
   let p2 = thenPart[1]
@@ -535,7 +539,7 @@ make a function called parse_if_brace_tail takes toks, cond, pos returns r
         let p5 = elsePart[1]
         let t5 = vec_get(toks, p5)
         if tok_is(t5, "OP", "}") then
-          return [["If", cond, thenPart[0], elsePart[0]], p5 + 1]
+          return [["If", cond, thenPart[0], elsePart[0], line], p5 + 1]
         else
           return [["Err", "expected } after else block"], p5]
         end
@@ -544,18 +548,19 @@ make a function called parse_if_brace_tail takes toks, cond, pos returns r
       end
     else
       if tok_is(t3, "IDENT", "elif") then
+        let elif_line = t3[2]
         let c2 = parse_expr(toks, p3 + 1)
         let cond2 = c2[0]
         let p4 = c2[1]
         let t4 = vec_get(toks, p4)
         if tok_is(t4, "OP", "{") then
-          let nested = parse_if_brace_tail(toks, cond2, p4 + 1)
-          return [["If", cond, thenPart[0], [nested[0]]], nested[1]]
+          let nested = parse_if_brace_tail(toks, cond2, p4 + 1, elif_line)
+          return [["If", cond, thenPart[0], [nested[0]], line], nested[1]]
         else
           return [["Err", "expected { after elif condition"], p4]
         end
       else
-        return [["If", cond, thenPart[0], []], p3]
+        return [["If", cond, thenPart[0], [], line], p3]
       end
     end
   else
@@ -566,15 +571,23 @@ end
 make a function called parse_if takes toks, pos returns r
   # pos points at 'if'. Supports both `if cond then ... end` and
   # `if cond { ... }`, with `elif` accepted in either form.
+  # Line-tracking note: tokens already carry [type, text, line]
+  # (lexer.patlang) but If/While AST nodes previously dropped it. The
+  # 'if'/'elif'/'while' keyword's own line is threaded through as the
+  # LAST element of the node (append-only, so every existing consumer
+  # that reads node[1]/node[2]/node[3] by fixed index is unaffected) --
+  # added for self_hosting/lib/coverage.patlang's branch catalog and
+  # source-line instrumentation, see that file's header for why.
+  let if_line = vec_get(toks, pos)[2]
   let c = parse_expr(toks, pos + 1)
   let cond = c[0]
   let p = c[1]
   let t = vec_get(toks, p)
   if tok_is(t, "IDENT", "then") then
-    return parse_if_then_tail(toks, cond, p + 1)
+    return parse_if_then_tail(toks, cond, p + 1, if_line)
   else
     if tok_is(t, "OP", "{") then
-      return parse_if_brace_tail(toks, cond, p + 1)
+      return parse_if_brace_tail(toks, cond, p + 1, if_line)
     else
       return [["Err", "expected then or { after if condition"], p]
     end
@@ -583,7 +596,9 @@ end
 
 make a function called parse_while takes toks, pos returns r
   # pos points at 'while'. Supports both `while cond do ... end` and
-  # `while cond { ... }`.
+  # `while cond { ... }`. See parse_if's comment for why the keyword's
+  # line is appended as the node's last element.
+  let while_line = vec_get(toks, pos)[2]
   let c = parse_expr(toks, pos + 1)
   let cond = c[0]
   let p = c[1]
@@ -593,7 +608,7 @@ make a function called parse_while takes toks, pos returns r
     let p2 = body[1]
     let t2 = vec_get(toks, p2)
     if tok_is(t2, "IDENT", "end") then
-      return [["While", cond, body[0]], p2 + 1]
+      return [["While", cond, body[0], while_line], p2 + 1]
     else
       return [["Err", "expected end after while body"], p2]
     end
@@ -603,7 +618,7 @@ make a function called parse_while takes toks, pos returns r
       let p2 = body[1]
       let t2 = vec_get(toks, p2)
       if tok_is(t2, "OP", "}") then
-        return [["While", cond, body[0]], p2 + 1]
+        return [["While", cond, body[0], while_line], p2 + 1]
       else
         return [["Err", "expected } after while body"], p2]
       end

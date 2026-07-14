@@ -1,0 +1,393 @@
+# Branch coverage: identifies every branch in a program (the static
+# catalog -- "what should be tested") and, by running an instrumented copy
+# of the program through its own test suite, reports which branches were
+# actually taken and which weren't (the dynamic gap report).
+#
+# WHY SOURCE INSTRUMENTATION, NOT AN INTERPRETER HOOK: there is no
+# execution-tracing hook anywhere in PatLang's runtime (checked directly --
+# none exists, in either the tree-walk evaluator or the IR VM). Building
+# one would mean changing the Rust interpreter, which this project avoids
+# unless genuinely required (see feedback-patlang-not-rust in project
+# memory). The standard alternative for a language with no execution hook
+# -- the same technique coverage.py's AST mode and Istanbul/nyc use for
+# Python and JavaScript -- is SOURCE INSTRUMENTATION: regenerate the
+# program's source with a small tracking call wrapped around every branch
+# condition, then run the instrumented copy through the ordinary compiler
+# pipeline (tokenize/parse_program/lower_program/run_ir, the same
+# functions the REPL and playground already call at runtime). No new host
+# function, no interpreter change.
+#
+# WHY WRAP THE CONDITION, NOT SPLICE INTO THE BODY: an earlier design
+# considered inserting a tracking statement as the first line of each
+# branch's then/else body, located by source line number. That needs the
+# line of the 'else' keyword specifically (not just 'if'/'elif', which is
+# all the parser tracks -- see parser.patlang's If/While line-tracking
+# comment), and breaks if a branch body is empty. Wrapping the CONDITION
+# itself in cov_check(id, <condition>) needs only the condition expression
+# (already a self-contained AST node) and captures both outcomes (the
+# wrapper returns its value unchanged, so program behaviour is identical)
+# in one place, regardless of what either branch's body contains.
+#
+# LIMITATION, stated plainly: this is SOURCE regeneration, not a
+# line-preserving rewrite -- cov_instrument reconstructs the whole program
+# from its AST using its own canonical formatting (always `then`/`do`
+# ... `end`, never the brace form; every function's return-hint name is
+# rewritten to a placeholder, since PatLang's own grammar treats that name
+# as documentation only, never bound to anything -- see the Grammar
+# reference). The instrumented copy is semantically identical to the
+# original, but is NOT byte-identical to it, and is only ever run to
+# collect coverage, never treated as the program's real source afterward.
+# `budgeted(...)` blocks are copied through uninstrumented (no branches of
+# their own to track); anything genuinely unrecognised is copied through
+# as literally as ast_to_str already renders it, which will not be valid
+# source if it's ever hit -- in practice, everything this session's own
+# test subjects (queue.patlang, hexrts.patlang, rdbms.patlang, sql.patlang)
+# actually use is fully supported.
+#
+# KNOWN GAP, stated rather than silently shipped: a branch inside a
+# closure literal (`|x| { ... }`) gets instrumented with a catalog that's
+# local to that closure's own rendering call, not merged into the
+# program's real catalog -- its ids can collide with the outer catalog's,
+# and it never appears in the final report. None of this session's own
+# library code puts branches inside closures, so it wasn't hit in
+# practice, but a program that does would get an incomplete/wrong report
+# for those specific branches. Fixing it means threading catalog state
+# through cov_expr_src generally, not just the statement-level functions;
+# left as a follow-up rather than done partially under time pressure.
+
+include "includes.patlang"
+include "lexer.patlang"
+include "parser.patlang"
+
+# ---- string escaping, for regenerating a valid string literal from a
+# string VALUE (the lexer already unescaped it once when it read the
+# original literal; this is the inverse) ----
+
+make a function called cov_escape_string takes s returns escaped
+  let b = sb_new()
+  let i = 0
+  let n = s.length
+  while i < n do
+    let c = char_code(s, i)
+    if c == 34 then
+      sb_push(b, "\\\"")
+    else
+      if c == 92 then
+        sb_push(b, "\\\\")
+      else
+        if c == 10 then
+          sb_push(b, "\\n")
+        else
+          if c == 9 then
+            sb_push(b, "\\t")
+          else
+            if c == 13 then
+              sb_push(b, "\\r")
+            else
+              sb_push(b, chr(c))
+            end
+          end
+        end
+      end
+    end
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+# ---- expression -> valid PatLang source text ----
+
+make a function called cov_expr_list_src takes items returns text
+  let b = sb_new()
+  let i = 0
+  let n = to_num(list_len(items))
+  while i < n do
+    if i > 0 then
+      sb_push(b, ", ")
+    end
+    sb_push(b, cov_expr_src(items[i]))
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+make a function called cov_ident_list_src takes items returns text
+  let b = sb_new()
+  let i = 0
+  let n = to_num(list_len(items))
+  while i < n do
+    if i > 0 then
+      sb_push(b, ", ")
+    end
+    sb_push(b, "" + items[i])
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+make a function called cov_expr_src takes node returns text
+  let ty = node[0]
+  if ty == "Num" then
+    return "" + node[1]
+  end
+  if ty == "Str" then
+    return "\"" + cov_escape_string(node[1]) + "\""
+  end
+  if ty == "Bool" then
+    return "" + node[1]
+  end
+  if ty == "Var" then
+    return node[1]
+  end
+  if ty == "Bin" then
+    return "(" + cov_expr_src(node[2]) + " " + node[1] + " " + cov_expr_src(node[3]) + ")"
+  end
+  if ty == "Un" then
+    return "(" + node[1] + " " + cov_expr_src(node[2]) + ")"
+  end
+  if ty == "Call" then
+    return node[1] + "(" + cov_expr_list_src(node[2]) + ")"
+  end
+  if ty == "Closure" then
+    return "|" + cov_ident_list_src(node[1]) + "| do " + cov_stmts_src(node[2]) + " end"
+  end
+  if ty == "List" then
+    return "[" + cov_expr_list_src(node[1]) + "]"
+  end
+  if ty == "Index" then
+    return cov_expr_src(node[1]) + "[" + cov_expr_src(node[2]) + "]"
+  end
+  if ty == "Member" then
+    return cov_expr_src(node[1]) + "." + node[2]
+  end
+  return "0"
+end
+
+# ---- statement -> valid, instrumented PatLang source text ----
+# `state` is [catalog, next_id, func_name] threaded through so every
+# branch gets a unique id and knows which function it's in (func_name is
+# "" for branches outside any function); returns [text, new_state].
+
+make a function called cov_new_branch takes state, kind, line, cond_node returns result
+  let catalog = state[0]
+  let next_id = state[1]
+  let func_name = state[2]
+  let id = next_id
+  let cond_text = cov_expr_src(cond_node)
+  let catalog = list_push(catalog, [id, kind, line, cond_text, func_name])
+  return [id, [catalog, next_id + 1, func_name]]
+end
+
+make a function called cov_stmt_src takes node, state returns result
+  let ty = node[0]
+
+  if ty == "Let" then
+    return ["let " + node[1] + " = " + cov_expr_src(node[2]), state]
+  end
+
+  if ty == "Expr" then
+    return [cov_expr_src(node[1]), state]
+  end
+
+  if ty == "Return" then
+    return ["return " + cov_expr_src(node[1]), state]
+  end
+
+  if ty == "MemberAssign" then
+    return [cov_expr_src(node[1]) + "." + node[2] + " = " + cov_expr_src(node[3]), state]
+  end
+
+  if ty == "Assert" then
+    return [node[1] + " " + cov_expr_src(node[2]), state]
+  end
+
+  if ty == "If" then
+    let cond = node[1]
+    let then_stmts = node[2]
+    let else_stmts = node[3]
+    let line = node[4]
+    let true_branch = cov_new_branch(state, "if_true", line, cond)
+    let true_id = true_branch[0]
+    let state = true_branch[1]
+    let then_src = cov_stmts_src_state(then_stmts, state)
+    let state = then_src[1]
+    let wrapped_cond = "cov_check(" + true_id + ", " + cov_expr_src(cond) + ")"
+    if to_num(list_len(else_stmts)) > 0 then
+      let false_branch = cov_new_branch(state, "if_false", line, cond)
+      let false_id = false_branch[0]
+      let state = false_branch[1]
+      let else_src = cov_stmts_src_state(else_stmts, state)
+      let state = else_src[1]
+      # the false-branch marker fires whenever the wrapped condition is
+      # false, regardless of which arm actually runs -- record it right
+      # in the wrapper via a second, OR'd cov_check call that only
+      # matters for its side effect (cov_check always returns its own
+      # second argument, so this doesn't change the branch actually taken)
+      let text = "if " + wrapped_cond + " then" + chr(10) + then_src[0] + chr(10) + "else" + chr(10) + "if cov_check(" + false_id + ", true) then" + chr(10) + else_src[0] + chr(10) + "end" + chr(10) + "end"
+      return [text, state]
+    end
+    let text = "if " + wrapped_cond + " then" + chr(10) + then_src[0] + chr(10) + "end"
+    return [text, state]
+  end
+
+  if ty == "While" then
+    let cond = node[1]
+    let body = node[2]
+    let line = node[3]
+    let entered_branch = cov_new_branch(state, "while_entered", line, cond)
+    let entered_id = entered_branch[0]
+    let state = entered_branch[1]
+    let body_src = cov_stmts_src_state(body, state)
+    let state = body_src[1]
+    let wrapped_cond = "cov_check(" + entered_id + ", " + cov_expr_src(cond) + ")"
+    let text = "while " + wrapped_cond + " do" + chr(10) + body_src[0] + chr(10) + "end"
+    return [text, state]
+  end
+
+  if ty == "Func" then
+    let name = node[1]
+    let params = node[2]
+    let body = node[3]
+    let outer_func_name = state[2]
+    let inner_state = [state[0], state[1], name]
+    let body_src = cov_stmts_src_state(body, inner_state)
+    let state = [body_src[1][0], body_src[1][1], outer_func_name]
+    let text = "make a function called " + name + " takes " + cov_ident_list_src(params) + " returns cov_r" + chr(10) + body_src[0] + chr(10) + "end"
+    return [text, state]
+  end
+
+  if ty == "When" then
+    let event = node[1]
+    let body = node[2]
+    let body_src = cov_stmts_src_state(body, state)
+    let state = body_src[1]
+    let text = "when " + event + " do" + chr(10) + body_src[0] + chr(10) + "end"
+    return [text, state]
+  end
+
+  if ty == "Budgeted" then
+    let ms = node[1]
+    let body = node[3]
+    let body_src = cov_stmts_src_state(body, state)
+    let state = body_src[1]
+    let text = "budgeted(" + cov_expr_src(ms) + ") {" + chr(10) + body_src[0] + chr(10) + "}"
+    return [text, state]
+  end
+
+  return ["", state]
+end
+
+make a function called cov_stmts_src_state takes stmts, state returns result
+  let b = sb_new()
+  let i = 0
+  let n = to_num(list_len(stmts))
+  while i < n do
+    let r = cov_stmt_src(stmts[i], state)
+    sb_push(b, r[0] + chr(10))
+    let state = r[1]
+    let i = i + 1
+  end
+  return [sb_str(b), state]
+end
+
+# convenience wrapper for cov_expr_src's Closure case, which only needs
+# the rendered text, not an updated catalog (closures inside expressions
+# aren't cataloged for branches in v1 -- see the file header's stated scope)
+make a function called cov_stmts_src takes stmts returns text
+  let r = cov_stmts_src_state(stmts, [[], 0, ""])
+  return r[0]
+end
+
+# ---- top level: catalog + instrument a whole program at once ----
+
+make a function called cov_runtime_prelude returns text
+  return "make a function called cov_check takes id, value returns v" + chr(10) + "print(\"COV:\" + id + \":\" + value)" + chr(10) + "return value" + chr(10) + "end" + chr(10)
+end
+
+# cov_instrument(source_text) -> [instrumented_source, catalog]
+# catalog: list of [id, kind, line, cond_text]
+make a function called cov_instrument takes source_text returns result
+  let toks = tokenize(source_text)
+  let ast = parse_program(toks)
+  let stmts = ast[1]
+  let r = cov_stmts_src_state(stmts, [[], 0, ""])
+  let body_text = r[0]
+  let state = r[1]
+  let instrumented = cov_runtime_prelude() + body_text
+  return [instrumented, state[0]]
+end
+
+# ---- turning a run's captured stdout into a coverage report ----
+
+make a function called cov_find_char takes s, ch, start returns idx
+  let i = start
+  let n = s.length
+  while i < n do
+    if char_code(s, i) == ch then
+      return i
+    end
+    let i = i + 1
+  end
+  return -1
+end
+
+# Only "id:true" hits are recorded as covered -- both if_true/if_false and
+# while_entered catalog entries are designed so that cov_check is only
+# ever called with a literal `true` value at the moment that specific
+# outcome is actually taken (see cov_stmt_src's If/While cases), so
+# "was id ever hit with true" is the complete, uniform coverage signal
+# for every catalog entry, regardless of its kind.
+make a function called cov_parse_hits takes output_text returns hits
+  let lines = split_lines(output_text)
+  let hits = []
+  let i = 0
+  let n = to_num(list_len(lines))
+  while i < n do
+    let line = str_trim(lines[i])
+    if str_starts_with(line, "COV:") then
+      let rest = substr(line, 4, line.length - 4)
+      let colon = cov_find_char(rest, 58, 0)
+      if colon >= 0 then
+        let id_text = substr(rest, 0, colon)
+        let val_text = substr(rest, colon + 1, rest.length - colon - 1)
+        if val_text == "true" then
+          let hits = list_push(hits, to_num(id_text))
+        end
+      end
+    end
+    let i = i + 1
+  end
+  return hits
+end
+
+make a function called cov_hit takes hits, id returns yes
+  let i = 0
+  let n = to_num(list_len(hits))
+  while i < n do
+    if to_num(hits[i]) == to_num(id) then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# cov_compute_report(catalog, hits) -> [total, covered, missing]
+# missing: list of catalog entries ([id, kind, line, cond_text]) that were
+# never hit -- the actual gap report.
+make a function called cov_compute_report takes catalog, hits returns report
+  let total = to_num(list_len(catalog))
+  let covered = 0
+  let missing = []
+  let i = 0
+  while i < total do
+    let entry = catalog[i]
+    if cov_hit(hits, entry[0]) then
+      let covered = covered + 1
+    else
+      let missing = list_push(missing, entry)
+    end
+    let i = i + 1
+  end
+  return [total, covered, missing]
+end

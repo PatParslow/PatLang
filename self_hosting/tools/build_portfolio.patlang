@@ -931,6 +931,115 @@ make a function called sql_console_page takes sql_console_b64 returns done
   return true
 end
 
+# coverage_page: paste (or use the preloaded sample) a self-contained
+# PatLang program, click Run, get a SimpleCov-style per-function summary
+# table plus tabs -- one per function -- listing that function's own
+# branches with their condition text and covered/missed status. Two wasm
+# calls per run: the small "coverage" module does ONLY the static
+# instrument step (self_hosting/examples/coverage_wasm_main.patlang,
+# printing the branch catalog then the instrumented source); the
+# instrumented source is then run through the SAME shared "playground"
+# module the REPL uses, to actually collect which branches were hit --
+# no separate execution path needed, reusing the compiler pipeline
+# that's already exposed at runtime.
+make a function called coverage_page takes pg_b64, coverage_b64 returns done
+  let sample = "make a function called classify takes n returns r" + chr(10) + "if n > 100 then" + chr(10) + "  return \"big\"" + chr(10) + "else" + chr(10) + "  if n > 10 then" + chr(10) + "    return \"medium\"" + chr(10) + "  else" + chr(10) + "    return \"small\"" + chr(10) + "  end" + chr(10) + "end" + chr(10) + "end" + chr(10) + "print(classify(5))" + chr(10) + "print(classify(50))"
+  let sections = [tpl_para("Paste a self-contained PatLang program (no <code>include</code> lines -- this instruments the text directly) and click Run. The summary table and per-function tabs below show which branches your program's own code actually took while it ran, and which it never did -- the same static-catalog-plus-dynamic-instrumentation technique as the CLI tool (<code>pat --ir-run self_hosting/tools/coverage_main.patlang &lt;test file&gt;</code>), which can report on a whole real test suite including files the browser can't read. See the <a href='patlang-paradigms.html'>Paradigms Guide</a> and <code>self_hosting/lib/coverage.patlang</code> for how instrumentation works and why it's built this way (there's no execution-tracing hook anywhere in PatLang's runtime, so this regenerates the source with a small tracking call wrapped around every branch condition, rather than changing the interpreter).")]
+  let sections = list_push(sections, tpl_raw("<textarea id='cov-input' rows='14' style='width:100%;font-family:monospace'>" + html_escape(sample) + "</textarea>"))
+  let sections = list_push(sections, tpl_raw("<p><button onclick='runCoverage()'>Run Coverage</button> <span id='cov-status'></span></p>"))
+  let sections = list_push(sections, tpl_raw("<div id='cov-summary'></div>"))
+  let sections = list_push(sections, tpl_raw("<div id='cov-tabs' style='margin-top:10px'></div>"))
+  let sections = list_push(sections, tpl_raw("<div id='cov-detail'></div>"))
+  let js = sb_new()
+  sb_push(js, "const WASMS = { playground: '" + pg_b64 + "', coverage: '" + coverage_b64 + "' };" + nl())
+  runwasm_only_js(js)
+  sb_push(js, "function covEsc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;'); }" + nl())
+  sb_push(js, "function covPercent(covered, total) { return total ? Math.floor(covered * 100 / total) : 100; }" + nl())
+  sb_push(js, "async function runCoverage() {" + nl())
+  sb_push(js, "  const src = document.getElementById('cov-input').value;" + nl())
+  sb_push(js, "  document.getElementById('cov-status').textContent = 'instrumenting...';" + nl())
+  sb_push(js, "  const out1 = await runWasm('cov-instrument', 'coverage', [src]);" + nl())
+  sb_push(js, "  const parts = out1.split('===INSTRUMENTED===');" + nl())
+  sb_push(js, "  const catalogText = parts[0];" + nl())
+  sb_push(js, "  const instrumented = parts.length > 1 ? parts[1] : '';" + nl())
+  sb_push(js, "  const catalog = [];" + nl())
+  sb_push(js, "  let pending = null;" + nl())
+  sb_push(js, "  for (const raw of catalogText.split(String.fromCharCode(10))) {" + nl())
+  sb_push(js, "    const line = raw.trim();" + nl())
+  sb_push(js, "    if (!line) continue;" + nl())
+  sb_push(js, "    if (line.indexOf('BRANCH:') === 0) {" + nl())
+  sb_push(js, "      const f = line.slice(7).split(',');" + nl())
+  sb_push(js, "      pending = { id: +f[0], kind: f[1], line: +f[2], func: f[3] || '(top level)' };" + nl())
+  sb_push(js, "    } else if (line.indexOf('COND:') === 0 && pending) {" + nl())
+  sb_push(js, "      pending.cond = line.slice(5);" + nl())
+  sb_push(js, "      catalog.push(pending);" + nl())
+  sb_push(js, "      pending = null;" + nl())
+  sb_push(js, "    }" + nl())
+  sb_push(js, "  }" + nl())
+  sb_push(js, "  document.getElementById('cov-status').textContent = 'running instrumented copy...';" + nl())
+  sb_push(js, "  const out2 = await runWasm('cov-run', 'playground', [instrumented]);" + nl())
+  sb_push(js, "  const hits = new Set();" + nl())
+  sb_push(js, "  for (const raw of out2.split(String.fromCharCode(10))) {" + nl())
+  sb_push(js, "    const line = raw.trim();" + nl())
+  sb_push(js, "    if (line.indexOf('COV:') === 0) {" + nl())
+  sb_push(js, "      const rest = line.slice(4);" + nl())
+  sb_push(js, "      const ci = rest.indexOf(':');" + nl())
+  sb_push(js, "      if (ci >= 0 && rest.slice(ci + 1) === 'true') { hits.add(+rest.slice(0, ci)); }" + nl())
+  sb_push(js, "    }" + nl())
+  sb_push(js, "  }" + nl())
+  sb_push(js, "  document.getElementById('cov-status').textContent = catalog.length + ' branch(es) tracked.';" + nl())
+  sb_push(js, "  renderCovReport(catalog, hits);" + nl())
+  sb_push(js, "}" + nl())
+  sb_push(js, "function renderCovReport(catalog, hits) {" + nl())
+  sb_push(js, "  const groups = {};" + nl())
+  sb_push(js, "  const order = [];" + nl())
+  sb_push(js, "  for (const b of catalog) {" + nl())
+  sb_push(js, "    const fn = b.func;" + nl())
+  sb_push(js, "    if (!groups[fn]) { groups[fn] = { total: 0, covered: 0, branches: [] }; order.push(fn); }" + nl())
+  sb_push(js, "    const g = groups[fn];" + nl())
+  sb_push(js, "    g.total++;" + nl())
+  sb_push(js, "    const hit = hits.has(b.id);" + nl())
+  sb_push(js, "    if (hit) { g.covered++; }" + nl())
+  sb_push(js, "    g.branches.push({ line: b.line, cond: b.cond, kind: b.kind, hit: hit });" + nl())
+  sb_push(js, "  }" + nl())
+  sb_push(js, "  let totalAll = 0, coveredAll = 0;" + nl())
+  sb_push(js, "  let html = \"<table style='border-collapse:collapse;width:100%'><tr><th style='text-align:left'>Function</th><th style='text-align:left'>Branches</th><th style='text-align:left'>Coverage</th></tr>\";" + nl())
+  sb_push(js, "  for (const fn of order) {" + nl())
+  sb_push(js, "    const g = groups[fn];" + nl())
+  sb_push(js, "    totalAll += g.total; coveredAll += g.covered;" + nl())
+  sb_push(js, "    html += '<tr><td>' + covEsc(fn) + '</td><td>' + g.covered + '/' + g.total + '</td><td>' + covPercent(g.covered, g.total) + '%</td></tr>';" + nl())
+  sb_push(js, "  }" + nl())
+  sb_push(js, "  html += '<tr style=\"font-weight:bold\"><td>TOTAL</td><td>' + coveredAll + '/' + totalAll + '</td><td>' + covPercent(coveredAll, totalAll) + '%</td></tr></table>';" + nl())
+  sb_push(js, "  document.getElementById('cov-summary').innerHTML = html;" + nl())
+  sb_push(js, "  let tabsHtml = '';" + nl())
+  sb_push(js, "  for (let idx = 0; idx < order.length; idx++) {" + nl())
+  sb_push(js, "    tabsHtml += '<button onclick=\"selectCovTab(' + idx + ')\">' + covEsc(order[idx]) + '</button> ';" + nl())
+  sb_push(js, "  }" + nl())
+  sb_push(js, "  document.getElementById('cov-tabs').innerHTML = tabsHtml;" + nl())
+  sb_push(js, "  window.__covGroups = groups;" + nl())
+  sb_push(js, "  window.__covOrder = order;" + nl())
+  sb_push(js, "  if (order.length) { selectCovTab(0); }" + nl())
+  sb_push(js, "  else { document.getElementById('cov-detail').innerHTML = '<p><em>No branches found -- this program has no if/while statements.</em></p>'; }" + nl())
+  sb_push(js, "}" + nl())
+  sb_push(js, "function selectCovTab(idx) {" + nl())
+  sb_push(js, "  const fn = window.__covOrder[idx];" + nl())
+  sb_push(js, "  const g = window.__covGroups[fn];" + nl())
+  sb_push(js, "  let html = '<h3>' + covEsc(fn) + '</h3><table style=\"border-collapse:collapse;width:100%\">';" + nl())
+  sb_push(js, "  for (const b of g.branches) {" + nl())
+  sb_push(js, "    const bg = b.hit ? '#1a3a1a' : '#3a1a1a';" + nl())
+  sb_push(js, "    const label = b.hit ? 'covered' : 'MISSED';" + nl())
+  sb_push(js, "    html += '<tr style=\"background:' + bg + '\"><td>line ' + b.line + '</td><td>' + covEsc(b.cond) + '</td><td>' + label + '</td></tr>';" + nl())
+  sb_push(js, "  }" + nl())
+  sb_push(js, "  html += '</table>';" + nl())
+  sb_push(js, "  document.getElementById('cov-detail').innerHTML = html;" + nl())
+  sb_push(js, "}" + nl())
+  let sections = list_push(sections, tpl_script(sb_str(js)))
+  let page = tpl_page("PatLang Branch Coverage", "fragment", sections)
+  write_file("portfolio/demos/coverage.html", render_page(page))
+  print("wrote portfolio/demos/coverage.html")
+  return true
+end
+
 make a function called b64bytes_only_js takes b returns done
   # Just the base64-decode helper, for pages (like the threaded fiber demo)
   # that need runWasmThreaded but not the rest of wasi_shim_js's playground/
@@ -1625,6 +1734,19 @@ let rdbms_lib_body = strip_include_line(read_file("self_hosting/lib/rdbms.patlan
 let sql_console_src = read_file("self_hosting/lib/includes.patlang") + chr(10) + rdbms_lib_body + chr(10) + sql_lib_body + chr(10) + sql_console_main_body
 let sql_console_b64 = compile_both(sql_console_src, "sqlconsole")
 print("sql console done")
+
+# coverage: self_hosting/lib/coverage.patlang's own small wasm module --
+# ONLY runs the static instrument step (tokenize/parse/regenerate with
+# cov_check wrapping); the browser then runs the INSTRUMENTED result
+# through the EXISTING shared "playground" module (pg_b64, already built
+# above) to actually collect hits, rather than needing its own execution
+# path. Four-level include chain: coverage.patlang includes includes.patlang,
+# lexer.patlang, and parser.patlang; the driver includes coverage.patlang.
+let coverage_main_body = strip_include_line(read_file("self_hosting/examples/coverage_wasm_main.patlang"), "../lib/coverage.patlang")
+let coverage_lib_body = strip_include_line(strip_include_line(strip_include_line(read_file("self_hosting/lib/coverage.patlang"), "includes.patlang"), "lexer.patlang"), "parser.patlang")
+let coverage_src = read_file("self_hosting/lib/includes.patlang") + chr(10) + read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + coverage_lib_body + chr(10) + coverage_main_body
+let coverage_b64 = compile_both(coverage_src, "coverage")
+print("coverage done")
 
 # Dev tools: build them with the pipeline, capture their transcripts
 let clibs = read_file("self_hosting/lib/lexer.patlang") + chr(10) + read_file("self_hosting/lib/parser.patlang") + chr(10) + read_file("self_hosting/lib/lower.patlang") + chr(10) + read_file("self_hosting/lib/codegen.patlang") + chr(10) + read_file("self_hosting/lib/runtime_rs.patlang")
@@ -2429,6 +2551,7 @@ native_page("queuedemo", "Durable message queue: a crash, and a real recovery", 
 repl_page(pg_b64)
 hexrts_page(hexrts_b64)
 sql_console_page(sql_console_b64)
+coverage_page(pg_b64, coverage_b64)
 # flowgraph-demo: live in-browser variant (flowgraph_wasm_b64, built
 # above) with a paste-your-own-program editor, PLUS the CLI tool's own
 # source and native transcript of the curated multi-program set it renders

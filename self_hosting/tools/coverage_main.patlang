@@ -1,0 +1,183 @@
+# Branch coverage CLI. Takes a test-driver file (one that `include`s the
+# library it exercises, same as any real PatLang test suite this session
+# built), instruments the whole expanded program, runs the instrumented
+# copy as a genuinely separate process, and reports which branches were
+# and weren't taken -- a SimpleCov-style summary plus a missed-branches
+# list. See self_hosting/lib/coverage.patlang for how instrumentation
+# actually works and why it's built this way.
+#
+# Usage:
+#   pat --ir-run self_hosting/tools/coverage_main.patlang <test_driver.patlang> [pat_exe_path]
+#
+# LIMITATION, stated plainly: the report covers every branch in the fully
+# expanded source -- the library under test AND any test-scaffolding
+# library it includes (e.g. lib/test.patlang's own check() function).
+# There's no clean per-file attribution once everything is spliced into
+# one expanded blob; branches are reported by their line number IN THE
+# EXPANDED TEXT, not the original file. For a report scoped tightly to
+# one library, pair it with a small, dedicated test snippet rather than a
+# large suite that pulls in a lot of shared test infrastructure.
+
+include "../lib/includes.patlang"
+include "../lib/coverage.patlang"
+
+make a function called cov_default_pat_exe returns path
+  return "rust-runtime/target/release/pat.exe"
+end
+
+make a function called cov_pad_right takes s, width returns padded
+  let out = s
+  while out.length < width do
+    let out = out + " "
+  end
+  return out
+end
+
+make a function called cov_percent takes covered, total returns pct
+  # "/" on integers that don't divide evenly returns an exact Rational in
+  # PatLang, not a truncated int (e.g. 71*100/150 -> the exact fraction
+  # 142/3, not 47) -- floor() explicitly, don't rely on "/" alone.
+  if total == 0 then
+    return 100
+  end
+  return floor((covered * 100) / total)
+end
+
+# ---- SimpleCov-style per-function grouping ----
+
+make a function called cov_find_group takes groups, fname returns idx
+  let i = 0
+  let n = to_num(list_len(groups))
+  while i < n do
+    if groups[i][0] == fname then
+      return i
+    end
+    let i = i + 1
+  end
+  return -1
+end
+
+# groups: list of [func_name, total, covered], in first-seen order (which
+# is source order, since the catalog is built by walking the AST top to
+# bottom)
+make a function called cov_group_by_function takes catalog, hits returns groups
+  let groups = []
+  let i = 0
+  let n = to_num(list_len(catalog))
+  while i < n do
+    let entry = catalog[i]
+    let fname = entry[4]
+    if fname == "" then
+      let fname = "(top level)"
+    end
+    let idx = cov_find_group(groups, fname)
+    if idx < 0 then
+      let groups = list_push(groups, [fname, 0, 0])
+      let idx = to_num(list_len(groups)) - 1
+    end
+    let g = groups[idx]
+    let total = g[1] + 1
+    let covered = g[2]
+    if cov_hit(hits, entry[0]) then
+      let covered = covered + 1
+    end
+    let groups = list_set(groups, idx, [fname, total, covered])
+    let i = i + 1
+  end
+  return groups
+end
+
+make a function called run_coverage returns done
+  let args = argv()
+  if args.length < 1 then
+    print("usage: coverage_main <test_driver.patlang> [pat_exe_path]")
+    return false
+  end
+  let test_path = args[0]
+  let pat_exe = cov_default_pat_exe()
+  if args.length >= 2 then
+    let pat_exe = args[1]
+  end
+
+  print("Instrumenting " + test_path + " ...")
+  let base_dir = path_dirname(test_path)
+  let combined = expand_includes(read_file(test_path), base_dir)
+  let result = cov_instrument(combined)
+  let instrumented_src = result[0]
+  let catalog = result[1]
+  print("Found " + to_num(list_len(catalog)) + " branch(es) to track.")
+
+  let scratch_path = "portfolio/build/coverage_instrumented.patlang"
+  write_file(scratch_path, instrumented_src)
+
+  print("Running instrumented copy (" + pat_exe + " --ir-run " + scratch_path + ") ...")
+  let output = exec_capture(pat_exe, "--ir-run", scratch_path)
+  let hits = cov_parse_hits(output)
+
+  let report = cov_compute_report(catalog, hits)
+  let total = report[0]
+  let covered = report[1]
+  let missing = report[2]
+  let pct = cov_percent(covered, total)
+
+  print("")
+  print("=== Branch Coverage Report: " + test_path + " ===")
+  print("")
+  print(cov_pad_right("Function", 42) + cov_pad_right("Branches", 12) + "Coverage")
+  print(cov_pad_right("--------", 42) + cov_pad_right("--------", 12) + "--------")
+  let groups = cov_group_by_function(catalog, hits)
+  let gi = 0
+  let gn = to_num(list_len(groups))
+  while gi < gn do
+    let g = groups[gi]
+    let gpct = cov_percent(g[2], g[1])
+    print(cov_pad_right(g[0], 42) + cov_pad_right("" + g[2] + "/" + g[1], 12) + gpct + "%")
+    let gi = gi + 1
+  end
+  print(cov_pad_right("--------", 42) + cov_pad_right("--------", 12) + "--------")
+  print(cov_pad_right("TOTAL", 42) + cov_pad_right("" + covered + "/" + total, 12) + pct + "%")
+  print("")
+
+  if to_num(list_len(missing)) == 0 then
+    print("No missed branches -- every branch outcome this tool tracks was taken at least once.")
+  else
+    print("Missed branches (" + to_num(list_len(missing)) + "), grouped by function:")
+    let gi = 0
+    while gi < gn do
+      let fname = groups[gi][0]
+      let printed_header = false
+      let i = 0
+      let n = to_num(list_len(missing))
+      while i < n do
+        let entry = missing[i]
+        let entry_fname = entry[4]
+        if entry_fname == "" then
+          let entry_fname = "(top level)"
+        end
+        if entry_fname == fname then
+          if printed_header == false then
+            print("  " + fname + ":")
+            let printed_header = true
+          end
+          let kind = entry[1]
+          let line = entry[2]
+          let cond = entry[3]
+          let label = "never true"
+          if kind == "if_false" then
+            let label = "else/elif never entered"
+          end
+          if kind == "while_entered" then
+            let label = "loop body never entered"
+          end
+          print("    line " + line + ": " + cond + "  (" + label + ")")
+        end
+        let i = i + 1
+      end
+      let gi = gi + 1
+    end
+  end
+
+  return true
+end
+
+run_coverage()
