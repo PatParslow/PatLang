@@ -182,17 +182,12 @@ fn given_selftest_suite(world: &mut PatWorld, name: String) {
         "regex_dsl" => read("self_hosting/regex_dsl_selftest.patlang"),
         "syntax_dsl" => read("self_hosting/syntax_dsl_selftest.patlang"),
         "reflect_transpile" => read("self_hosting/reflect_transpile_selftest.patlang"),
-        "synthesis" => read("self_hosting/synthesis_selftest.patlang"),
-        "synthesis_router" => read("self_hosting/synthesis_router_selftest.patlang"),
-        "synthesis_buildgraph" => read("self_hosting/synthesis_buildgraph_selftest.patlang"),
-        "synthesis_eligibility" => read("self_hosting/synthesis_eligibility_selftest.patlang"),
-        "synthesis_unsatisfiable" => read("self_hosting/synthesis_unsatisfiable_selftest.patlang"),
-        "synthesis_pos_dairy" => read("self_hosting/synthesis_pos_dairy_selftest.patlang"),
-        "synthesis_grandparent" => read("self_hosting/synthesis_grandparent_selftest.patlang"),
-        "synthesis_lgg" => read("self_hosting/synthesis_lgg_selftest.patlang"),
-        "synthesis_lgg_report" => read("self_hosting/synthesis_lgg_report_selftest.patlang"),
-        "synthesis_mentor" => read("self_hosting/synthesis_mentor_selftest.patlang"),
-        "synthesis_supplychain" => read("self_hosting/synthesis_supplychain_selftest.patlang"),
+        // The inductive-synthesis engine's selftest suite
+        // (self_hosting/synthesis_*_selftest.patlang) is deliberately NOT
+        // wired in here -- run via `pat --ir-run self_hosting/tools/
+        // run_synthesis_selftests.patlang` instead, a PatLang-native
+        // runner that needs no cargo/cucumber. See that tool's header
+        // comment and patlang-inductive-synthesis.html on parslow.net.
         other => panic!("unknown self-hosted test suite: {other}"),
     };
 }

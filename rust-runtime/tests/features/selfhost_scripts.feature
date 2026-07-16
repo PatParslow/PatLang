@@ -41,120 +41,15 @@ Feature: Self-hosted (Stage 1) test suites run under cargo test
     When I run it interpreted
     Then the self-hosted suite reports all tests passed
 
-  # Milestone 1 of the BDD-driven inductive synthesis engine
-  # (self_hosting/lib/synthesis.patlang): induces PatLang `rule` facts from
-  # toy Given/Then scenarios, verifies them via solve(), emits real PatLang
-  # source, and round-trips it through patc1.exe. See the plan
-  # "wondering-about-extending-patlang-modular-shore".
-  Scenario: the inductive synthesis engine parsimoniously generalizes toy BDD scenarios
-    Given the self-hosted test suite "synthesis"
-    When I run it interpreted
-    Then the self-hosted suite reports all tests passed
-
-  # Complexity step up from the toy digit classifier above: reproduces the
-  # routing table router_dsl_demo.patlang hand-writes via `routes { ... }`,
-  # induced instead from example requests. Also caught a real gotcha in
-  # the native A1 resolver (uppercase-first-letter argument strings, e.g.
-  # "GET /users", get treated as logic variables per hosts.rs's
-  # `is_logic_var` convention) that the toy digit corpus never exercised.
-  Scenario: the inductive synthesis engine reproduces router_dsl_demo's routing table
-    Given the self-hosted test suite "synthesis_router"
-    When I run it interpreted
-    Then the self-hosted suite reports all tests passed
-
-  # Milestone 2: self_hosting/lib/synthesis_recursive.patlang, a small
-  # Metagol-style metarule search (base/chain clause templates) layered on
-  # top of milestone 1's flat LGG-by-output-label, specifically to handle
-  # the RECURSIVE case milestone 1 could not: reproduces
-  # goal_oriented_build_demo.patlang's `buildable(X) :- unchanged(X).` /
-  # `buildable(X) :- dep(X, Y), buildable(Y).` rules from 3 example
-  # queries (2 positive, 1 negative) plus the same dep/unchanged
-  # background facts, instead of hand-writing the recursive rule.
-  Scenario: the inductive synthesis engine induces a recursive rule reproducing goal_oriented_build_demo
-    Given the self-hosted test suite "synthesis_buildgraph"
-    When I run it interpreted
-    Then the self-hosted suite reports all tests passed
-
-  # Milestone 3: self_hosting/lib/synthesis_conjunctive.patlang generalizes
-  # milestone 2's fixed base/chain template to arbitrary CONJUNCTIONS of
-  # background predicates, searched smallest-first (Occam's razor) so a
-  # distractor predicate merely correlated with the positive examples
-  # (is_student, true of one eligible person but not actually required)
-  # doesn't leak into the induced rule.
-  Scenario: the inductive synthesis engine induces a conjunctive rule and rejects a distractor predicate
-    Given the self-hosted test suite "synthesis_eligibility"
-    When I run it interpreted
-    Then the self-hosted suite reports all tests passed
-
-  # Robustness case: XOR-shaped examples have no separating conjunction of
-  # the offered background predicates. Confirms the search reports "no
-  # hypothesis found" honestly rather than overfitting to a wrong answer.
-  Scenario: the inductive synthesis engine reports unsatisfiable rather than overfitting on XOR-shaped examples
-    Given the self-hosted test suite "synthesis_unsatisfiable"
-    When I run it interpreted
-    Then the self-hosted suite reports all tests passed
-
-  # Reproduces the dairy-discount categorization from self_hosting/lib/
-  # pos.patlang's fact("dairy", "milk"/"cheese", "yes") declarations,
-  # induced from example scans instead of hand-declared facts.
-  Scenario: the inductive synthesis engine reproduces pos.patlang's dairy-discount classification
-    Given the self-hosted test suite "synthesis_pos_dairy"
-    When I run it interpreted
-    Then the self-hosted suite reports all tests passed
-
-  # Milestone 4: self_hosting/lib/synthesis_chain.patlang generalizes from
-  # conjunctions of unary predicates (milestone 3) to non-recursive
-  # multi-hop chains of BINARY predicates through existential variables --
-  # the classic ILP "grandparent(X) :- parent(X, Y), parent(Y, Z)."
-  # benchmark, searched by depth then predicate assignment, smallest
-  # first, correctly discriminating against a "colleague" distractor
-  # relation placed first in the candidate list.
-  Scenario: the inductive synthesis engine induces a two-hop relational join (the grandparent benchmark)
-    Given the self-hosted test suite "synthesis_grandparent"
-    When I run it interpreted
-    Then the self-hosted suite reports all tests passed
-
-  # Milestone 5: self_hosting/lib/synthesis_lgg.patlang replaces milestones
-  # 2-4's blind top-down template search with BOTTOM-UP witness search
-  # (walk the background-fact graph from each positive example) plus real
-  # anti-unification (longest-common-prefix over witnessed predicate
-  # chains) -- and, because it's evidence-driven, can diagnose WHY
-  # induction failed: a positive example with no witnessed chain at all
-  # (a genuine hole in the background knowledge) versus a negative example
-  # the generalized rule wrongly covers (insufficiently distinguishing
-  # background facts). Three scenarios in one suite: success, a
-  # no-witness gap, and a conflict.
-  Scenario: the inductive synthesis engine derives rules bottom-up via anti-unification and diagnoses gaps
-    Given the self-hosted test suite "synthesis_lgg"
-    When I run it interpreted
-    Then the self-hosted suite reports all tests passed
-
-  # Closes the gap identified after milestone 5: synth5_format_diagnosis/
-  # synth5_induce_and_ask (self_hosting/lib/synthesis_lgg.patlang) render
-  # a structured diagnosis into actual plain-English questions addressed
-  # to whoever wrote the BDD scenarios, instead of just a status tag.
-  Scenario: the inductive synthesis engine turns a gap diagnosis into an actual question
-    Given the self-hosted test suite "synthesis_lgg_report"
-    When I run it interpreted
-    Then the self-hosted suite reports all tests passed
-
-  # New domain (distinct from the grandparent benchmark): a DEPTH-1 chain
-  # (has_mentor(X) :- mentored_by(X, Y)), checking the bottom-up witness
-  # search and common-prefix LGG also work at the shallowest possible
-  # depth, plus the gap-diagnosis question path in a fresh domain.
-  Scenario: the inductive synthesis engine induces a single-hop relation and diagnoses a fresh-domain gap
-    Given the self-hosted test suite "synthesis_mentor"
-    When I run it interpreted
-    Then the self-hosted suite reports all tests passed
-
-  # Another new domain: a DEPTH-3 chain (origin_traceable(X) :-
-  # supplies(X,Y), supplies(Y,Z), supplies(Z,W)), checking bottom-up LGG
-  # scales past depth 2, plus a genuine conflict case (a negative example
-  # with the identical witnessed shape as the positives).
-  Scenario: the inductive synthesis engine induces a three-hop relational chain and catches a same-shape conflict
-    Given the self-hosted test suite "synthesis_supplychain"
-    When I run it interpreted
-    Then the self-hosted suite reports all tests passed
+  # The inductive-synthesis engine's selftest suite
+  # (self_hosting/synthesis_*_selftest.patlang, 11 suites covering
+  # milestones 1-5 of the BDD-driven synthesis system -- see the plan
+  # "wondering-about-extending-patlang-modular-shore") is deliberately NOT
+  # wired into cargo test/cucumber: it's run via a PatLang-native runner
+  # instead (`pat --ir-run self_hosting/tools/run_synthesis_selftests.
+  # patlang`), so exercising it needs nothing Rust-side beyond the base
+  # runtime that executes any PatLang program. See that tool and
+  # patlang-inductive-synthesis.html on parslow.net for the full writeup.
 
   # Regression case for the documented self-hosted-parser gap: parse_add /
   # parse_mul don't skip newlines before checking for a continuation
