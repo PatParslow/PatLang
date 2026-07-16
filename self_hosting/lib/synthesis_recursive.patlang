@@ -1,0 +1,144 @@
+# =============================================================================
+# Milestone 2 of the BDD-driven inductive synthesis system (see plan
+# "wondering-about-extending-patlang-modular-shore" and the memory note on
+# why milestone 1 couldn't attempt this: milestone 1's LGG-by-output-label
+# only groups flat ground facts under one predicate per category -- it has
+# no way to induce a RECURSIVE clause body like
+# `buildable(X) :- dep(X, Y), buildable(Y).` from buildable/unbuildable
+# examples alone.
+#
+# This module does that, using a small fixed metarule library (Metagol-
+# style meta-interpretive learning, not open-ended structural
+# anti-unification -- that's still future work): given background facts,
+# a target predicate name, and positive/negative example queries, it
+# searches over combinations of
+#   base:  target(X) :- Q(X).            -- Q a background unary predicate
+#   chain: target(X) :- Q(X, Y), target(Y).  -- Q a background binary predicate
+# and accepts the first (smallest) combination whose induced rule set
+# proves every positive example and fails every negative one.
+#
+# rule_add/RULES has no PatLang-exposed removal API (rust-runtime/src/ir/
+# hosts.rs's reset_world is Rust-internal only), so a wrong hypothesis
+# can't be un-registered from the current process without polluting later
+# hypotheses. Each hypothesis is therefore tested in its own fresh
+# subprocess (pat --ir-run on a generated temp script) rather than via
+# in-process rule_add/solve -- the same isolation trick the round-trip
+# check in synthesis.patlang already relies on (a fresh compiled process),
+# just applied at search time instead of after.
+# =============================================================================
+
+# ---- grounding (same ^[A-Z]-is-a-logic-variable gotcha as synthesis.patlang) ----
+
+make a function called synth2_ground takes term returns grounded
+  return "v:" + term
+end
+
+# ---- hypothesis construction ----
+
+# One example query: [predicate, arg, expect_provable (true/false)].
+make a function called synth2_query takes pred, arg, expect returns q
+  return [pred, arg, expect]
+end
+
+make a function called synth2_clauses_for takes target_pred, base_pred, chain_pred returns src
+  let sb = sb_new()
+  if base_pred != "" then
+    sb_push(sb, "rule " + target_pred + "(X) :- " + base_pred + "(X).\n")
+  end
+  if chain_pred != "" then
+    sb_push(sb, "rule " + target_pred + "(X) :- " + chain_pred + "(X, Y), " + target_pred + "(Y).\n")
+  end
+  return sb_str(sb)
+end
+
+# Build a full standalone PatLang script: background facts + candidate
+# clauses + one print per query, "1" if solve()'s result matches the
+# query's expectation (provable == expect), "0" otherwise.
+make a function called synth2_build_test_script takes background_src, clause_src, queries returns src
+  let sb = sb_new()
+  sb_push(sb, background_src)
+  sb_push(sb, "\n")
+  sb_push(sb, clause_src)
+  sb_push(sb, "\n")
+  let i = 0
+  let n = to_num(list_len(queries))
+  while i < n do
+    let q = queries[i]
+    let pred = q[0]
+    let arg = q[1]
+    let expect = q[2]
+    sb_push(sb, "let sols_" + to_str_i(i) + " = solve(\"" + pred + "\", [\"" + synth2_ground(arg) + "\"])\n")
+    sb_push(sb, "let provable_" + to_str_i(i) + " = to_num(list_len(sols_" + to_str_i(i) + ")) > 0\n")
+    if expect then
+      sb_push(sb, "print(provable_" + to_str_i(i) + ")\n")
+    else
+      sb_push(sb, "print(not provable_" + to_str_i(i) + ")\n")
+    end
+    let i = i + 1
+  end
+  return sb_str(sb)
+end
+
+# No int-to-string host function exists; build small labels by repeating a
+# marker character instead (only ever used for a handful of queries).
+make a function called to_str_i takes i returns s
+  let sb = sb_new()
+  let k = 0
+  while k <= i do
+    sb_push(sb, "x")
+    let k = k + 1
+  end
+  return sb_str(sb)
+end
+
+# Run one hypothesis (background + candidate clauses) against all queries
+# in a fresh subprocess; true only if every query's actual provability
+# matched its expectation.
+# Every query's print() prints "true" only when its actual provability
+# matched its expectation (see synth2_build_test_script), so a hypothesis
+# is accepted iff no query printed "false" -- one substring check across
+# the whole captured transcript, no per-line parsing needed.
+make a function called synth2_test_hypothesis takes background_src, clause_src, queries returns ok
+  let script = synth2_build_test_script(background_src, clause_src, queries)
+  let tmp_path = "self_hosting/build/_synth2_hypothesis.patlang"
+  write_file(tmp_path, script)
+  let out = exec_capture("rust-runtime/target/release/pat.exe", "--ir-run", tmp_path)
+  return not contains_text(out, "false")
+end
+
+# ---- metarule search ----
+
+# Try, in order: each base predicate alone, then each (base, chain)
+# predicate pair together (a chain clause alone can never terminate --
+# recursion needs a base case, so that combination isn't in the search
+# space). Returns [base_pred, chain_pred] of the first accepted
+# hypothesis (chain_pred is "" for a base-only accept), or [] if nothing
+# in the search space fits.
+make a function called synth2_induce_chain takes target_pred, base_preds, chain_preds, background_src, queries returns winner
+  let bi = 0
+  let bn = to_num(list_len(base_preds))
+  while bi < bn do
+    let base_pred = base_preds[bi]
+    let base_only = synth2_clauses_for(target_pred, base_pred, "")
+    if synth2_test_hypothesis(background_src, base_only, queries) then
+      return [base_pred, ""]
+    end
+    let bi = bi + 1
+  end
+  let ci = 0
+  let cn = to_num(list_len(chain_preds))
+  while ci < cn do
+    let bi2 = 0
+    while bi2 < bn do
+      let base_pred = base_preds[bi2]
+      let chain_pred = chain_preds[ci]
+      let both = synth2_clauses_for(target_pred, base_pred, chain_pred)
+      if synth2_test_hypothesis(background_src, both, queries) then
+        return [base_pred, chain_pred]
+      end
+      let bi2 = bi2 + 1
+    end
+    let ci = ci + 1
+  end
+  return []
+end

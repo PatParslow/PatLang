@@ -62,6 +62,19 @@ Feature: Self-hosted (Stage 1) test suites run under cargo test
     When I run it interpreted
     Then the self-hosted suite reports all tests passed
 
+  # Milestone 2: self_hosting/lib/synthesis_recursive.patlang, a small
+  # Metagol-style metarule search (base/chain clause templates) layered on
+  # top of milestone 1's flat LGG-by-output-label, specifically to handle
+  # the RECURSIVE case milestone 1 could not: reproduces
+  # goal_oriented_build_demo.patlang's `buildable(X) :- unchanged(X).` /
+  # `buildable(X) :- dep(X, Y), buildable(Y).` rules from 3 example
+  # queries (2 positive, 1 negative) plus the same dep/unchanged
+  # background facts, instead of hand-writing the recursive rule.
+  Scenario: the inductive synthesis engine induces a recursive rule reproducing goal_oriented_build_demo
+    Given the self-hosted test suite "synthesis_buildgraph"
+    When I run it interpreted
+    Then the self-hosted suite reports all tests passed
+
   # Regression case for the documented self-hosted-parser gap: parse_add /
   # parse_mul don't skip newlines before checking for a continuation
   # operator, unlike the native Rust frontend, so a leading `+` on the next
