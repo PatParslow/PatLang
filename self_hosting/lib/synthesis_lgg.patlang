@@ -31,6 +31,19 @@
 # text like milestones 2-4 required -- this module derives the rule
 # source itself (synth5_facts_to_src), so there's exactly one
 # representation of the background knowledge to keep consistent, not two.
+#
+# Milestone 6 (see plan "wondering-about-extending-patlang-modular-shore"):
+# the witness search originally took the FIRST matching background fact
+# at every hop (synth5_first_binary_hop/synth5_bfs_chain, kept below
+# unchanged as a baseline) -- fine for a simple chain-shaped fact graph,
+# wrong for a real one with actual branching (e.g. one parent with two
+# children only ever witnessed whichever child's fact happened to be
+# listed first). synth5_all_binary_hops/synth5_bfs_all_chains explore
+# every witnessed branch instead, and synth5_lgg_from_positive now
+# anti-unifies across each example's full chain SET rather than a single
+# greedily-chosen chain -- with a new "no_common_structure" diagnosis for
+# the case where every example has evidence, but that evidence never
+# converges on one shared shape.
 # =============================================================================
 
 include "synthesis_chain.patlang"
@@ -63,11 +76,17 @@ end
 
 # ---- bottom-up witness search ----
 
+# Milestone 6: was "first match only" (a real limitation for any fact
+# graph with actual branching -- e.g. alice `parent` of both bob and
+# carol would only ever witness whichever fact happened to be listed
+# first, silently ignoring the sibling). synth5_first_binary_hop is kept
+# below unchanged as a baseline/regression reference; synth5_bfs_chain
+# (which used it) is likewise kept unchanged for the same reason. Actual
+# induction now goes through synth5_all_binary_hops/
+# synth5_bfs_all_chains, which explore every witnessed branch.
+
 # The first binary fact's predicate+successor found with arg1 == cur, or
-# ["", ""] if none. Toy domains here are simple chains (no branching), so
-# "first found" is a reasonable witness; a fact graph with real branching
-# would need every match explored, not just the first -- noted as a
-# limitation, not handled.
+# ["", ""] if none.
 make a function called synth5_first_binary_hop takes facts, cur returns hop
   let i = 0
   let n = to_num(list_len(facts))
@@ -105,6 +124,161 @@ make a function called synth5_bfs_chain takes start, facts, max_depth returns pr
   return seq
 end
 
+# All binary facts' [predicate, successor] pairs with arg1 == cur, not
+# just the first -- the branching-aware replacement for
+# synth5_first_binary_hop.
+make a function called synth5_all_binary_hops takes facts, cur returns hops
+  let hops = []
+  let i = 0
+  let n = to_num(list_len(facts))
+  while i < n do
+    let f = facts[i]
+    if to_num(list_len(f)) == 3 then
+      if f[1] == cur then
+        let hops = list_push(hops, [f[0], f[2]])
+      end
+    end
+    let i = i + 1
+  end
+  return hops
+end
+
+make a function called synth5_list_contains takes xs, needle returns found
+  let i = 0
+  let n = to_num(list_len(xs))
+  let found = false
+  while i < n do
+    if xs[i] == needle then
+      let found = true
+    end
+    let i = i + 1
+  end
+  return found
+end
+
+# Safety cap on how many distinct witnessed chains one recursion level
+# keeps -- a highly-branching fact graph could otherwise blow up the
+# chain-set combinatorially depth over depth.
+make a function called synth5_cap_chains takes chains, cap returns out
+  let n = to_num(list_len(chains))
+  if n <= cap then
+    return chains
+  end
+  let out = []
+  let i = 0
+  while i < cap do
+    let out = list_push(out, chains[i])
+    let i = i + 1
+  end
+  return out
+end
+
+# Recursive helper: every witnessed continuation from `cur`, up to
+# `remaining_depth` further hops, as a list of predicate-sequences. A
+# dead end (no further hop) or hitting remaining_depth == 0 both
+# contribute the empty continuation []; a node already in `visited`
+# (this path's own history) is excluded, so a cyclic fact graph
+# terminates instead of looping forever.
+make a function called synth5_extend_chains takes cur, facts, remaining_depth, visited returns chains
+  if remaining_depth == 0 then
+    return [[]]
+  end
+  let all_hops = synth5_all_binary_hops(facts, cur)
+  let hops = []
+  let hi = 0
+  let hn = to_num(list_len(all_hops))
+  while hi < hn do
+    let hop = all_hops[hi]
+    if not synth5_list_contains(visited, hop[1]) then
+      let hops = list_push(hops, hop)
+    end
+    let hi = hi + 1
+  end
+  if to_num(list_len(hops)) == 0 then
+    return [[]]
+  end
+  let results = []
+  let sub_visited = list_push(visited, cur)
+  let i = 0
+  let n = to_num(list_len(hops))
+  while i < n do
+    let hop = hops[i]
+    let sub_chains = synth5_extend_chains(hop[1], facts, remaining_depth - 1, sub_visited)
+    let si = 0
+    let sn = to_num(list_len(sub_chains))
+    while si < sn do
+      let full = list_push([hop[0]], sub_chains[si])
+      let results = list_push(results, synth5_flatten_chain(full))
+      let si = si + 1
+    end
+    let i = i + 1
+  end
+  return synth5_cap_chains(results, 25)
+end
+
+# list_push([hop_pred], sub_chain) above nests sub_chain as a single
+# element rather than splicing its predicate names in -- flatten that one
+# level back into a plain predicate-sequence.
+make a function called synth5_flatten_chain takes nested returns flat
+  let flat = [nested[0]]
+  let rest = nested[1]
+  let i = 0
+  let n = to_num(list_len(rest))
+  while i < n do
+    let flat = list_push(flat, rest[i])
+    let i = i + 1
+  end
+  return flat
+end
+
+# Every distinct maximal witnessed predicate-sequence from `start`, up to
+# max_depth hops (branching-aware). Returns [] only if `start` has no
+# outgoing binary fact at all -- still the "no evidence for this example"
+# signal synth5_lgg_from_positive checks for.
+make a function called synth5_bfs_all_chains takes start, facts, max_depth returns chains
+  let raw = synth5_extend_chains(start, facts, max_depth, [])
+  let chains = []
+  let i = 0
+  let n = to_num(list_len(raw))
+  while i < n do
+    if to_num(list_len(raw[i])) > 0 then
+      let chains = list_push(chains, raw[i])
+    end
+    let i = i + 1
+  end
+  return chains
+end
+
+make a function called synth5_seq_eq takes a, b returns eq
+  let na = to_num(list_len(a))
+  let nb = to_num(list_len(b))
+  if na != nb then
+    return false
+  end
+  let i = 0
+  let eq = true
+  while i < na do
+    if a[i] != b[i] then
+      let eq = false
+    end
+    let i = i + 1
+  end
+  return eq
+end
+
+make a function called synth5_seq_list_contains takes seqs, needle returns found
+  let i = 0
+  let n = to_num(list_len(seqs))
+  let found = false
+  while i < n do
+    if synth5_seq_eq(seqs[i], needle) then
+      let found = true
+    end
+    let i = i + 1
+  end
+  return found
+end
+
 # Longest common prefix of two predicate-sequences -- anti-unification on
 # sequences: where they agree, keep; the first point they diverge is
 # where generalization has to stop being any more specific.
@@ -129,32 +303,84 @@ make a function called synth5_common_prefix takes a, b returns prefix
   return out
 end
 
-# Witness every positive example, then anti-unify (common-prefix) across
-# all of them. Returns [generalized_seq, missing_values] where
-# missing_values lists positive examples that had NO witnessed chain at
-# all (real evidence gaps, not search failures).
+# Witness every positive example (via the full branching chain SET, not
+# one greedily-chosen chain), then anti-unify (common-prefix) across all
+# of them. Since an example can now witness several distinct chains, the
+# running generalization is itself a SET of surviving candidate
+# sequences: each existing candidate is matched against every one of the
+# next example's chains and updated to whichever shared prefix is
+# longest, so an early example's arbitrary-order chain list can no longer
+# lock in the wrong branch the way a single greedy walk could.
+#
+# Returns [generalized_seq, missing_values, no_common_structure]:
+#   missing_values -- positive examples with NO witnessed chain at all
+#     (unchanged from before: a real evidence gap).
+#   no_common_structure -- true if every positive example DID have
+#     evidence, but their witnessed chains never converged on any shared
+#     structure at all (the candidate set emptied out mid-merge) -- a
+#     genuinely different situation from a missing fact: the evidence
+#     that exists doesn't agree with itself.
 make a function called synth5_lgg_from_positive takes pos_values, facts, max_depth returns result
   let missing = []
-  let seq = []
-  let have_seq = false
+  let candidates = []
+  let have_candidates = false
+  let no_common = false
   let i = 0
   let n = to_num(list_len(pos_values))
   while i < n do
     let v = pos_values[i]
-    let chain = synth5_bfs_chain(v, facts, max_depth)
-    if to_num(list_len(chain)) == 0 then
+    let chains = synth5_bfs_all_chains(v, facts, max_depth)
+    if to_num(list_len(chains)) == 0 then
       let missing = list_push(missing, v)
     else
-      if not have_seq then
-        let seq = chain
-        let have_seq = true
+      if not have_candidates then
+        let candidates = chains
+        let have_candidates = true
       else
-        let seq = synth5_common_prefix(seq, chain)
+        let merged = []
+        let ci = 0
+        let cn = to_num(list_len(candidates))
+        while ci < cn do
+          let cand = candidates[ci]
+          let best = []
+          let hi = 0
+          let hn = to_num(list_len(chains))
+          while hi < hn do
+            let p = synth5_common_prefix(cand, chains[hi])
+            if to_num(list_len(p)) > to_num(list_len(best)) then
+              let best = p
+            end
+            let hi = hi + 1
+          end
+          if to_num(list_len(best)) > 0 then
+            if not synth5_seq_list_contains(merged, best) then
+              let merged = list_push(merged, best)
+            end
+          end
+          let ci = ci + 1
+        end
+        let candidates = merged
+        if to_num(list_len(candidates)) == 0 then
+          let no_common = true
+        end
       end
     end
     let i = i + 1
   end
-  return [seq, missing]
+  let seq = []
+  if to_num(list_len(candidates)) > 0 then
+    let best_i = 0
+    let bi = 0
+    let bn = to_num(list_len(candidates))
+    while bi < bn do
+      if to_num(list_len(candidates[bi])) > to_num(list_len(candidates[best_i])) then
+        let best_i = bi
+      end
+      let bi = bi + 1
+    end
+    let seq = candidates[best_i]
+  end
+  return [seq, missing, no_common]
 end
 
 # ---- top-level induction with gap diagnosis ----
@@ -179,12 +405,22 @@ end
 #     distinguish this example from the positives -- suggests a missing
 #     fact that would rule it out, or a predicate the search wasn't told
 #     about).
+#   ["no_common_structure", pos_values] -- every positive example had
+#     witnessed evidence (unlike no_witness), but their witnessed chains
+#     never converged on any shared structure at all -- the evidence
+#     itself disagrees, not merely absent. Milestone 6: only reachable
+#     now that a positive example's full branching chain SET is
+#     considered rather than one greedily-picked chain.
 make a function called synth5_induce takes target_pred, pos_values, queries, facts, max_depth returns diagnosis
   let lgg_result = synth5_lgg_from_positive(pos_values, facts, max_depth)
   let seq = lgg_result[0]
   let missing = lgg_result[1]
+  let no_common = lgg_result[2]
   if to_num(list_len(missing)) > 0 then
     return ["no_witness", missing]
+  end
+  if no_common then
+    return ["no_common_structure", pos_values]
   end
   if to_num(list_len(seq)) == 0 then
     return ["no_witness", pos_values]
@@ -210,6 +446,20 @@ make a function called synth5_induce takes target_pred, pos_values, queries, fac
     return ["ok", seq]
   end
   return ["conflict", offending]
+end
+
+make a function called synth5_join_quoted takes values returns s
+  let sb = sb_new()
+  let i = 0
+  let n = to_num(list_len(values))
+  while i < n do
+    if i > 0 then
+      sb_push(sb, ", ")
+    end
+    sb_push(sb, "\"" + values[i] + "\"")
+    let i = i + 1
+  end
+  return sb_str(sb)
 end
 
 # ---- turning a diagnosis into an actual question, not just structured data ----
@@ -239,6 +489,12 @@ make a function called synth5_format_diagnosis takes target_pred, diagnosis retu
       let questions = list_push(questions, q)
       let i = i + 1
     end
+    return questions
+  end
+  if status == "no_common_structure" then
+    let values = diagnosis[1]
+    let q = "The positive examples (" + synth5_join_quoted(values) + ") all have background evidence, but their witnessed relation chains never agree on a shared structure. Do they really all belong in the same category, or is a background fact linking them to each other the same way missing?"
+    let questions = list_push(questions, q)
     return questions
   end
   # status == "conflict"

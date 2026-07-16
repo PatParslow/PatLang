@@ -1,0 +1,85 @@
+# Milestone 6 selftest for the bottom-up LGG engine (self_hosting/lib/
+# synthesis_lgg.patlang): branching fact graphs. Addresses the first of
+# the four "Current limits, honestly" gaps named on
+# patlang-inductive-synthesis.html -- the witness search used to take the
+# FIRST matching background fact at every hop, so a fact graph with real
+# branching (a parent with more than one child) only ever explored
+# whichever branch happened to be declared first.
+
+include "lib/test.patlang"
+include "lib/synthesis.patlang"
+include "lib/synthesis_lgg.patlang"
+
+t_init()
+
+# ---- scenario A: a genuinely branching family tree ----
+# alice has TWO children -- bob and carol. Only bob goes on to have a
+# child (dave); carol's branch dead-ends. Declared in an order where the
+# dead-end branch (carol) comes FIRST, specifically so a first-match-only
+# search would commit to the wrong branch and never recover.
+let facts_a = [
+  synth5_fact_binary("parent", "alice", "carol"),
+  synth5_fact_binary("parent", "alice", "bob"),
+  synth5_fact_binary("parent", "bob", "dave"),
+  synth5_fact_binary("parent", "dave2", "erin"),
+  synth5_fact_binary("parent", "erin", "frank")
+]
+let queries_a = [
+  synth2_query("grandparent", "alice", true),
+  synth2_query("grandparent", "dave2", true)
+]
+let result_a = synth5_induce("grandparent", ["alice", "dave2"], queries_a, facts_a, 2)
+check("finds the grandparent chain via the SECOND-declared (bob) branch, not stuck on carol's dead end", result_a[0], "ok")
+check("the induced chain is still the expected 2-hop parent/parent shape", to_num(list_len(result_a[1])), 2)
+
+# ---- scenario B: a cycle in the fact graph ----
+# A `reports_to` loop (x -> y -> z -> x) must not send the witness search
+# into infinite recursion; the visited-node guard should terminate it.
+let facts_b = [
+  synth5_fact_binary("reports_to", "x", "y"),
+  synth5_fact_binary("reports_to", "y", "z"),
+  synth5_fact_binary("reports_to", "z", "x"),
+  synth5_fact_binary("reports_to", "p", "q"),
+  synth5_fact_binary("reports_to", "q", "r")
+]
+let queries_b = [
+  synth2_query("skip_manager", "p", true)
+]
+let result_b = synth5_induce("skip_manager", ["p"], queries_b, facts_b, 3)
+check("a cyclic fact graph still terminates and induces correctly (not stuck looping)", result_b[0], "ok")
+
+# ---- scenario C: no_common_structure -- every positive example has evidence, but it never agrees ----
+# alice's only witnessed chain is a 1-hop "likes" fact; bob's only
+# witnessed chain is a 1-hop "dislikes" fact -- both have real evidence,
+# but nothing shared.
+let facts_c = [
+  synth5_fact_binary("likes", "alice", "chocolate"),
+  synth5_fact_binary("dislikes", "bob", "spinach")
+]
+let queries_c = [
+  synth2_query("has_opinion", "alice", true),
+  synth2_query("has_opinion", "bob", true)
+]
+let result_c = synth5_induce_and_ask("has_opinion", ["alice", "bob"], queries_c, facts_c, 2)
+check("evidence that never converges is reported as no_common_structure, not silently merged", result_c[0][0], "no_common_structure")
+check("a no_common_structure diagnosis still produces exactly one question", to_num(list_len(result_c[1])), 1)
+check("the question names both examples", contains_text(result_c[1][0], "alice") and contains_text(result_c[1][0], "bob"), true)
+
+# ---- scenario D: round-trip check on the branching grandparent case ----
+let seq = result_a[1]
+let clause_src = synth4_chain_clause("grandparent", seq)
+let background_src = synth5_facts_to_src(facts_a)
+let program_src = background_src + "\n" + clause_src +
+  "\nlet sols_alice = solve(\"grandparent\", [\"" + synth2_ground("alice") + "\"])\n" +
+  "print(to_num(list_len(sols_alice)) > 0)\n" +
+  "let sols_carol = solve(\"grandparent\", [\"" + synth2_ground("carol") + "\"])\n" +
+  "print(to_num(list_len(sols_carol)) > 0)\n"
+let out_path = "self_hosting/build/synth_branching_demo.patlang"
+write_file(out_path, program_src)
+let compiled_exe = "self_hosting/build/synth_branching_demo.exe"
+let build = exec_capture("./patc1.exe", out_path, compiled_exe)
+check("generated branching-chain source compiles via patc1.exe", contains_text(build, "error"), false)
+let run_out = exec_capture(compiled_exe)
+check("compiled program agrees: alice is a grandparent (via bob), carol has no children so is not", run_out, "true\nfalse\n\n")
+
+t_report()
