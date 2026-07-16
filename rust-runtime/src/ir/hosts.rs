@@ -940,6 +940,15 @@ fn vfs_set(path: String, contents: String) {
 fn vfs_del(path: &str) -> bool {
     VFS.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap().remove(path).is_some()
 }
+// True O(new content) amortized append -- push_str onto the existing
+// String entry in place, rather than vfs_write's read-modify-write of
+// the whole value (the pattern self_hosting/lib/rdbms.patlang's
+// whole-table CSV rewrite on every INSERT was built on, making N
+// sequential inserts O(n^2) total; found stress-testing fantpop-patlang
+// at a few thousand rows).
+fn vfs_append_text(path: String, text: &str) {
+    VFS.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap().entry(path).or_insert_with(String::new).push_str(text);
+}
 fn vfs_keys() -> Vec<String> {
     VFS.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap().keys().cloned().collect()
 }
@@ -953,6 +962,13 @@ pub fn host_vfs_write(args: &[Value]) -> Result<Value, String> {
     let path = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
     let contents = match args.get(1) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
     vfs_set(path, contents);
+    Ok(Value::Bool(true))
+}
+
+pub fn host_vfs_append(args: &[Value]) -> Result<Value, String> {
+    let path = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
+    let text = match args.get(1) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
+    vfs_append_text(path, &text);
     Ok(Value::Bool(true))
 }
 
@@ -2066,6 +2082,7 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("bit_set_slice", host_bit_set_slice);
     interp.host.insert("vfs_read", host_vfs_read);
     interp.host.insert("vfs_write", host_vfs_write);
+    interp.host.insert("vfs_append", host_vfs_append);
     interp.host.insert("vfs_exists", host_vfs_exists);
     interp.host.insert("vfs_list", host_vfs_list);
     interp.host.insert("vfs_delete", host_vfs_delete);

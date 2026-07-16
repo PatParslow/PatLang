@@ -87,6 +87,7 @@ const HOST_CHUNK_TABLE: &[(&str, ChunkId)] = &[
     ("bit_set_slice", ChunkId::Core),
     ("vfs_read", ChunkId::Core),
     ("vfs_write", ChunkId::Core),
+    ("vfs_append", ChunkId::Core),
     ("vfs_exists", ChunkId::Core),
     ("vfs_list", ChunkId::Core),
     ("vfs_delete", ChunkId::Core),
@@ -317,6 +318,8 @@ fn vfs_set(path: String, contents: String) { VFS.with(|m| { m.borrow_mut().inser
 fn vfs_del(path: &str) -> bool { VFS.with(|m| m.borrow_mut().remove(path).is_some()) }
 #[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
 fn vfs_keys() -> Vec<String> { VFS.with(|m| m.borrow().keys().cloned().collect()) }
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+fn vfs_append_text(path: String, text: &str) { VFS.with(|m| { m.borrow_mut().entry(path).or_insert_with(String::new).push_str(text); }); }
 
 #[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
 static VFS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
@@ -328,6 +331,8 @@ fn vfs_set(path: String, contents: String) { VFS.get_or_init(|| Mutex::new(HashM
 fn vfs_del(path: &str) -> bool { VFS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap().remove(path).is_some() }
 #[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
 fn vfs_keys() -> Vec<String> { VFS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap().keys().cloned().collect() }
+#[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+fn vfs_append_text(path: String, text: &str) { VFS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap().entry(path).or_insert_with(String::new).push_str(text); }
 
 fn arg_usize(args: &[Value], i: usize, what: &str) -> Result<usize, String> {
     match args.get(i) {
@@ -550,6 +555,12 @@ impl Host {
                 let path = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
                 let contents = match args.get(1) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
                 vfs_set(path, contents);
+                Ok(Value::Bool(true))
+            }
+            "vfs_append" => {
+                let path = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
+                let text = match args.get(1) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
+                vfs_append_text(path, &text);
                 Ok(Value::Bool(true))
             }
             "vfs_exists" => {

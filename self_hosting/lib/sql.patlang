@@ -810,15 +810,27 @@ make a function called sql_execute takes db, ast, is_native returns outcome
     if rdb_table_exists(name) == false then
       return [db, ["error", "no such table: " + name]]
     end
-    let effective = rdb_effective(db, name)
-    let schema = effective[0]
-    let rows = effective[1]
+    # Outside a transaction, only the SCHEMA is needed to validate and
+    # shape the new row (O(1), not proportional to table size) -- the
+    # existing rows are never read, and the new row is appended directly
+    # rather than the whole table being rewritten. Inside a transaction,
+    # staged writes still need the full current row set (to append to
+    # and re-stage as one unit for later commit/rollback), so that path
+    # is unchanged.
+    let in_tx = db[1] == "1"
+    let schema = rdb_read_committed_schema(name)
+    let rows = []
+    if in_tx then
+      let effective = rdb_effective(db, name)
+      let schema = effective[0]
+      let rows = effective[1]
+    end
     let all_names = rdb_schema_col_names(schema)
     if to_num(list_len(cols)) == 0 then
       if to_num(list_len(values)) != to_num(list_len(all_names)) then
         return [db, ["error", "column count mismatch"]]
       end
-      let rows = list_push(rows, values)
+      let row = values
     else
       if to_num(list_len(cols)) != to_num(list_len(values)) then
         return [db, ["error", "column count mismatch"]]
@@ -840,10 +852,15 @@ make a function called sql_execute takes db, ast, is_native returns outcome
         let row = list_set(row, idx, values[i])
         let i = i + 1
       end
-      let rows = list_push(rows, row)
     end
-    let new_db = rdb_save(db, name, schema, rows)
-    return [new_db, ["ok", "1 row inserted"]]
+    if in_tx then
+      let rows = list_push(rows, row)
+      let new_db = rdb_save(db, name, schema, rows)
+      return [new_db, ["ok", "1 row inserted"]]
+    else
+      rdb_append_row(name, row)
+      return [db, ["ok", "1 row inserted"]]
+    end
   end
 
   if kind == "select" then
