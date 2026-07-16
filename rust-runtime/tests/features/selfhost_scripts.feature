@@ -102,6 +102,18 @@ Feature: Self-hosted (Stage 1) test suites run under cargo test
     When I run it interpreted
     Then the self-hosted suite reports all tests passed
 
+  # Milestone 4: self_hosting/lib/synthesis_chain.patlang generalizes from
+  # conjunctions of unary predicates (milestone 3) to non-recursive
+  # multi-hop chains of BINARY predicates through existential variables --
+  # the classic ILP "grandparent(X) :- parent(X, Y), parent(Y, Z)."
+  # benchmark, searched by depth then predicate assignment, smallest
+  # first, correctly discriminating against a "colleague" distractor
+  # relation placed first in the candidate list.
+  Scenario: the inductive synthesis engine induces a two-hop relational join (the grandparent benchmark)
+    Given the self-hosted test suite "synthesis_grandparent"
+    When I run it interpreted
+    Then the self-hosted suite reports all tests passed
+
   # Regression case for the documented self-hosted-parser gap: parse_add /
   # parse_mul don't skip newlines before checking for a continuation
   # operator, unlike the native Rust frontend, so a leading `+` on the next
