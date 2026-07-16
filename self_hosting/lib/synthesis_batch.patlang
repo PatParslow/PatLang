@@ -1,0 +1,114 @@
+# =============================================================================
+# Milestone 9 of the BDD-driven inductive synthesis system (see plan
+# "wondering-about-extending-patlang-modular-shore"): batched hypothesis
+# testing, addressing the last of the original four "current limits" --
+# every candidate hypothesis (milestones 2-8) was tested in its own fresh
+# `pat --ir-run` subprocess, because `rule_add`/RULES has no PatLang-
+# exposed retract and can't be safely reused across trial hypotheses in
+# one process. That's still true. What this module changes: MULTIPLE
+# candidate hypotheses can share a single subprocess, as long as each
+# uses its own uniquely-renamed head predicate -- `rule_add`/`solve`
+# resolution only ever follows rules for the predicate actually queried,
+# so two unrelated candidate rule sets registered in the same process
+# under different head names never cross-contaminate each other's
+# results, even though they're both sitting in the same append-only
+# RULES store. Background facts are declared once and shared, since
+# they're meant to be identical across every candidate being compared.
+#
+# Turns out this is also the mechanism that connects "search cost
+# scaling" to "better clustering" (milestone 8's other named limit): once
+# comparing N candidate hypotheses costs one subprocess spawn instead of
+# N, it becomes affordable to generate more than one candidate SOLUTION
+# (not just more than one candidate hypothesis within a single search)
+# and pick the best-verified one -- see synth8_induce's use of this to
+# compare two different clustering strategies in one batched call.
+# =============================================================================
+
+include "synthesis_recursive.patlang"
+
+# Build `[pred, arg, expect]` queries pointed at a differently-named head
+# predicate -- used to test several candidate rule sets for what's
+# conceptually the "same" target predicate side by side in one process
+# without them resolving into each other.
+make a function called synth9_remap_queries takes queries, new_pred returns out
+  let out = []
+  let i = 0
+  let n = to_num(list_len(queries))
+  while i < n do
+    let q = queries[i]
+    let out = list_push(out, [new_pred, q[1], q[2]])
+    let i = i + 1
+  end
+  return out
+end
+
+# candidates: list of [label, clause_src, queries] -- clause_src and
+# queries must already agree on whatever (uniquely-renamed) head
+# predicate this candidate uses. Builds one script: background once, then
+# every candidate's clauses, then every candidate's queries in order,
+# each printing "true" only when that query's actual provability matched
+# its expectation (same convention as synth2_build_test_script).
+make a function called synth9_batch_build_script takes background_src, candidates returns src
+  let sb = sb_new()
+  sb_push(sb, background_src)
+  sb_push(sb, "\n")
+  let ci = 0
+  let cn = to_num(list_len(candidates))
+  while ci < cn do
+    sb_push(sb, candidates[ci][1])
+    let ci = ci + 1
+  end
+  sb_push(sb, "\n")
+  let ci2 = 0
+  while ci2 < cn do
+    let queries = candidates[ci2][2]
+    let qi = 0
+    let qn = to_num(list_len(queries))
+    while qi < qn do
+      let q = queries[qi]
+      let label = "c" + to_str_i(ci2) + "_q" + to_str_i(qi)
+      sb_push(sb, "let sols_" + label + " = solve(\"" + q[0] + "\", [\"" + synth2_ground(q[1]) + "\"])\n")
+      sb_push(sb, "let ok_" + label + " = to_num(list_len(sols_" + label + ")) > 0\n")
+      if q[2] then
+        sb_push(sb, "print(ok_" + label + ")\n")
+      else
+        sb_push(sb, "print(not ok_" + label + ")\n")
+      end
+      let qi = qi + 1
+    end
+    let ci2 = ci2 + 1
+  end
+  return sb_str(sb)
+end
+
+# Runs every candidate against the shared background in ONE subprocess,
+# and returns one bool per candidate -- true iff every one of that
+# candidate's queries matched its expectation. This is the whole point:
+# N candidates, one process spawn, not N.
+make a function called synth9_batch_test_hypotheses takes background_src, candidates returns results
+  let script = synth9_batch_build_script(background_src, candidates)
+  let tmp_path = "self_hosting/build/_synth9_batch.patlang"
+  write_file(tmp_path, script)
+  let out = exec_capture("rust-runtime/target/release/pat.exe", "--ir-run", tmp_path)
+  let lines = synth2_split_lines(out)
+  let results = []
+  let idx = 0
+  let ci = 0
+  let cn = to_num(list_len(candidates))
+  while ci < cn do
+    let queries = candidates[ci][2]
+    let qn = to_num(list_len(queries))
+    let all_ok = true
+    let qi = 0
+    while qi < qn do
+      if lines[idx] != "true" then
+        let all_ok = false
+      end
+      let idx = idx + 1
+      let qi = qi + 1
+    end
+    let results = list_push(results, all_ok)
+    let ci = ci + 1
+  end
+  return results
+end

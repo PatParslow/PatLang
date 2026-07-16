@@ -1,0 +1,86 @@
+# Milestone 9 selftest: batched hypothesis testing
+# (self_hosting/lib/synthesis_batch.patlang) and the two-strategy
+# clustering comparison it enables in milestone 8's engine
+# (self_hosting/lib/synthesis_disjunctive.patlang).
+#
+# Scenario A is the genuinely interesting case: a domain where the two
+# clustering strategies actually DISAGREE. e1/e2/e4 share predicate A;
+# e3 shares B+C with nobody else; e1 and e3 also happen to share C alone.
+# The forward-order strategy finds the clean, minimal split (target(X)
+# :- A(X). OR target(X) :- B(X), C(X). -- 2 clauses). The order-
+# insensitive best-first strategy, greedily maximizing per-step literal
+# richness without weighing the cost of extra clusters, actually does
+# WORSE here (4 clusters) -- a genuine, empirically-found case, not a
+# hand-picked one that happens to favor the new strategy. This proves
+# the "pick whichever strategy passes with fewer clauses" comparison in
+# synth8_induce is doing real, necessary work, not just picking between
+# two ties.
+
+include "lib/test.patlang"
+include "lib/synthesis.patlang"
+include "lib/synthesis_disjunctive.patlang"
+
+t_init()
+
+let facts_a = [
+  synth5_fact_unary("A", "e1"),
+  synth5_fact_unary("C", "e1"),
+  synth5_fact_unary("A", "e2"),
+  synth5_fact_unary("B", "e2"),
+  synth5_fact_unary("B", "e3"),
+  synth5_fact_unary("C", "e3"),
+  synth5_fact_unary("A", "e4"),
+  synth5_fact_unary("D", "e4")
+]
+
+# Confirm the raw strategies really do disagree before checking that
+# synth8_induce recovers the better one.
+let forward = synth8_cluster(["e1", "e2", "e3", "e4"], facts_a, 2)
+let best_first = synth8_cluster_best_first(["e1", "e2", "e3", "e4"], facts_a, 2)
+check("forward-order finds the minimal 2-cluster split", to_num(list_len(forward[0])), 2)
+check("best-first genuinely does worse here (4 clusters) -- a real divergence, not a contrived tie", to_num(list_len(best_first[0])), 4)
+
+let queries_a = [
+  synth2_query("target", "e1", true),
+  synth2_query("target", "e2", true),
+  synth2_query("target", "e3", true),
+  synth2_query("target", "e4", true),
+  synth2_query("target", "e5", false),
+  synth2_query("target", "e6", false)
+]
+let facts_a2 = list_push(facts_a, synth5_fact_unary("B", "e6"))
+let result_a = synth8_induce("target", ["e1", "e2", "e3", "e4"], queries_a, facts_a2, 2)
+check("synth8_induce recovers the better (fewer-cluster) strategy despite best-first doing worse", result_a[0], "ok")
+check("the chosen result has the minimal 2 clauses, not best-first's 4", to_num(list_len(result_a[1])), 2)
+
+# ---- round-trip: e6 (B only, no C) must not slip through the B+C clause ----
+let clause_src = synth8_emit_clauses("target", result_a[1])
+let background_src = synth5_facts_to_src(facts_a2)
+let program_src = background_src + "\n" + clause_src +
+  "\nlet sols_e1 = solve(\"target\", [\"" + synth2_ground("e1") + "\"])\n" +
+  "print(to_num(list_len(sols_e1)) > 0)\n" +
+  "let sols_e6 = solve(\"target\", [\"" + synth2_ground("e6") + "\"])\n" +
+  "print(to_num(list_len(sols_e6)) > 0)\n"
+let out_path = "self_hosting/build/synth_batching_demo.patlang"
+write_file(out_path, program_src)
+let compiled_exe = "self_hosting/build/synth_batching_demo.exe"
+let build = exec_capture("./patc1.exe", out_path, compiled_exe)
+check("generated source compiles via patc1.exe", contains_text(build, "error"), false)
+let run_out = exec_capture(compiled_exe)
+check("compiled program: e1 matches, e6 (partial match) does not", run_out, "true\nfalse\n\n")
+
+# ---- scenario B: the batching primitive itself, standalone ----
+# two independent hypotheses under different renamed head predicates,
+# tested in ONE subprocess call, confirming no cross-contamination.
+let bg = "rule dep(\"" + synth2_ground("x") + "\", \"" + synth2_ground("y") + "\").\n" +
+  "rule dep(\"" + synth2_ground("y") + "\", \"" + synth2_ground("z") + "\").\n"
+let cand0_clause = "rule reach2(X) :- dep(X, Y), dep(Y, Z).\n"
+let cand0_queries = [synth2_query("reach2", "x", true), synth2_query("reach2", "y", false)]
+let cand1_clause = "rule reach1(X) :- dep(X, Y).\n"
+let cand1_queries = [synth2_query("reach1", "x", true), synth2_query("reach1", "y", true)]
+let batch = [["0", cand0_clause, cand0_queries], ["1", cand1_clause, cand1_queries]]
+let batch_results = synth9_batch_test_hypotheses(bg, batch)
+check("batched candidate 0 (2-hop reachability) is correct", batch_results[0], true)
+check("batched candidate 1 (1-hop reachability), tested in the SAME subprocess call, is independently correct", batch_results[1], true)
+
+t_report()

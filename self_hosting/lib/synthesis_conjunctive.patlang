@@ -17,9 +17,18 @@
 # synth2_test_hypothesis) unchanged -- subprocess-per-hypothesis isolation
 # still applies for the same reason (rule_add/RULES has no PatLang-
 # exposed removal API), just with a different clause-body generator.
+#
+# Milestone 9: originally tested subsets one subprocess spawn at a time,
+# smallest-first, stopping at the first success -- worst case (nothing
+# smaller works) still meant up to 2^n spawns. synth3_induce_conjunction
+# now batches EVERY non-empty subset into a single subprocess via
+# synth9_batch_test_hypotheses (synthesis_batch.patlang), each under its
+# own uniquely-renamed head predicate, and picks the smallest PASSING one
+# from the results -- same Occam's-razor guarantee, one process spawn
+# instead of up to 2^n.
 # =============================================================================
 
-include "synthesis_recursive.patlang"
+include "synthesis_batch.patlang"
 
 make a function called synth3_list_tail takes xs returns tail
   let out = []
@@ -73,30 +82,79 @@ make a function called synth3_clauses_for takes target_pred, subset returns src
   return sb_str(sb)
 end
 
-# Search conjunctions in increasing size order (Occam's razor: the
-# smallest separating conjunction wins, so a distractor predicate that's
-# merely correlated with the positive examples -- true of all of them,
-# but not actually load-bearing -- never survives once a smaller
-# conjunction is found that already separates the examples). Returns the
-# winning subset, or [] if nothing in the search space fits.
+# Stable ascending sort by subset size -- small n (candidate_preds is
+# never large in practice), so a plain O(n^2) insertion sort is plenty.
+make a function called synth3_sort_by_size takes subsets returns sorted
+  let sorted = []
+  let i = 0
+  let n = to_num(list_len(subsets))
+  while i < n do
+    let item = subsets[i]
+    let item_len = to_num(list_len(item))
+    let sn = to_num(list_len(sorted))
+    let insert_at = sn
+    let j = 0
+    let placed = false
+    while (j < sn) and (not placed) do
+      if item_len < to_num(list_len(sorted[j])) then
+        let insert_at = j
+        let placed = true
+      end
+      let j = j + 1
+    end
+    let new_sorted = []
+    let k = 0
+    while k < insert_at do
+      let new_sorted = list_push(new_sorted, sorted[k])
+      let k = k + 1
+    end
+    let new_sorted = list_push(new_sorted, item)
+    while k < sn do
+      let new_sorted = list_push(new_sorted, sorted[k])
+      let k = k + 1
+    end
+    let sorted = new_sorted
+    let i = i + 1
+  end
+  return sorted
+end
+
+# Batch-test every non-empty conjunction in ONE subprocess spawn, sorted
+# smallest-first, and return the smallest one that passed (Occam's
+# razor: a distractor predicate that's merely correlated with the
+# positive examples -- true of all of them, but not actually load-
+# bearing -- never survives once a smaller conjunction is found that
+# already separates the examples). Returns [] if nothing in the search
+# space fits.
 make a function called synth3_induce_conjunction takes target_pred, candidate_preds, background_src, queries returns winner
   let subsets = synth3_all_subsets(candidate_preds)
-  let n_candidates = to_num(list_len(candidate_preds))
-  let size = 1
-  while size <= n_candidates do
-    let i = 0
-    let n = to_num(list_len(subsets))
-    while i < n do
-      let subset = subsets[i]
-      if to_num(list_len(subset)) == size then
-        let clause_src = synth3_clauses_for(target_pred, subset)
-        if synth2_test_hypothesis(background_src, clause_src, queries) then
-          return subset
-        end
-      end
-      let i = i + 1
+  let non_empty = []
+  let i = 0
+  let n = to_num(list_len(subsets))
+  while i < n do
+    if to_num(list_len(subsets[i])) > 0 then
+      let non_empty = list_push(non_empty, subsets[i])
     end
-    let size = size + 1
+    let i = i + 1
+  end
+  let sorted = synth3_sort_by_size(non_empty)
+  let sn = to_num(list_len(sorted))
+  let batch = []
+  let bi = 0
+  while bi < sn do
+    let subset = sorted[bi]
+    let label_pred = target_pred + "__s" + to_str_i(bi)
+    let clause_src = synth3_clauses_for(label_pred, subset)
+    let batch = list_push(batch, [to_str_i(bi), clause_src, synth9_remap_queries(queries, label_pred)])
+    let bi = bi + 1
+  end
+  let results = synth9_batch_test_hypotheses(background_src, batch)
+  let ri = 0
+  while ri < sn do
+    if results[ri] then
+      return sorted[ri]
+    end
+    let ri = ri + 1
   end
   return []
 end

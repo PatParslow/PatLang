@@ -24,16 +24,30 @@
 #
 # Clustering is deliberately greedy, not globally optimal (finding the
 # minimum number of clusters that anti-unify is a much harder combinato-
-# rial problem, out of scope): examples are processed in the order given,
-# each tried against every EXISTING cluster before a new one is opened,
-# so different example orderings can in principle produce different
-# (though still individually correct) cluster counts. A single shared
-# structure is always preferred when one exists, so this never disjoins
-# unnecessarily -- the milestone-7 single-clause behavior is exactly
-# what this module produces when no real disjunction is needed.
+# rial problem, out of scope). A single shared structure is always
+# preferred when one exists, so this never disjoins unnecessarily -- the
+# milestone-7 single-clause behavior is exactly what this module produces
+# when no real disjunction is needed.
+#
+# Milestone 9: the original single greedy pass (synth8_cluster, kept
+# below unchanged) processes examples in the CALLER'S given order, trying
+# each against every existing cluster before opening a new one -- so
+# different orderings can produce different (though still individually
+# correct) cluster counts. synth8_cluster_best_first is a second,
+# order-INsensitive strategy: at every step it looks at every remaining
+# unassigned example against every existing cluster (and the option of
+# seeding a new one) and commits to whichever single assignment scores
+# richest globally, not just the first example in list order. Neither
+# strategy is guaranteed optimal on its own, but synth8_induce now runs
+# BOTH and picks whichever produces fewer clauses (ties favor the
+# original), verified in one batched subprocess call via
+# synth9_batch_test_hypotheses (synthesis_batch.patlang) instead of
+# separate spawns -- the batching from milestone 9's other half is what
+# makes comparing two full strategies affordable in the first place.
 # =============================================================================
 
 include "synthesis_anti_unify.patlang"
+include "synthesis_batch.patlang"
 
 make a function called synth8_has_evidence takes candidates returns has_ev
   let i = 0
@@ -136,31 +150,139 @@ make a function called synth8_cluster takes pos_values, facts, max_depth returns
   return [clusters, missing]
 end
 
+# Order-insensitive alternative: at each step, commit to whichever single
+# (example, existing-cluster-or-new) assignment scores richest across
+# EVERY remaining unassigned example, not just the current one in caller
+# order. Same [clusters, missing] shape as synth8_cluster.
+make a function called synth8_cluster_best_first takes pos_values, facts, max_depth returns result
+  let missing = []
+  let items = []
+  let i = 0
+  let n = to_num(list_len(pos_values))
+  while i < n do
+    let v = pos_values[i]
+    let this_candidates = synth7_candidates_for(v, facts, max_depth)
+    if not synth8_has_evidence(this_candidates) then
+      let missing = list_push(missing, v)
+    else
+      let items = list_push(items, this_candidates)
+    end
+    let i = i + 1
+  end
+  let itn = to_num(list_len(items))
+  let assigned = []
+  let ai = 0
+  while ai < itn do
+    let assigned = list_push(assigned, false)
+    let ai = ai + 1
+  end
+  let clusters = []
+  let remaining = itn
+  while remaining > 0 do
+    let best_item = 0 - 1
+    let best_cluster = 0 - 1
+    let best_merge = []
+    let best_score = 0 - 1
+    let bi = 0
+    while bi < itn do
+      if not assigned[bi] then
+        let this_candidates = items[bi]
+        let cj = 0
+        let cn2 = to_num(list_len(clusters))
+        while cj < cn2 do
+          let m = synth8_best_join(this_candidates, clusters[cj])
+          if not synth7_candidate_empty(m) then
+            let score = synth7_literal_count(m)
+            if score > best_score then
+              let best_score = score
+              let best_item = bi
+              let best_cluster = cj
+              let best_merge = m
+            end
+          end
+          let cj = cj + 1
+        end
+        let seed = synth8_richest(this_candidates)
+        let seed_score = synth7_literal_count(seed)
+        if seed_score > best_score then
+          let best_score = seed_score
+          let best_item = bi
+          let best_cluster = 0 - 1
+          let best_merge = seed
+        end
+      end
+      let bi = bi + 1
+    end
+    if best_cluster >= 0 then
+      let clusters = list_set(clusters, best_cluster, best_merge)
+    else
+      let clusters = list_push(clusters, best_merge)
+    end
+    let assigned = list_set(assigned, best_item, true)
+    let remaining = remaining - 1
+  end
+  return [clusters, missing]
+end
+
 # ---- top-level induction: same diagnosis vocabulary as milestones 5-7
 # (no_witness / conflict / ok), plus the "ok" payload is now a LIST of
 # candidates (one per induced clause) instead of a single one -- length
 # 1 for the ordinary case, length > 1 only when real disjunction was
 # needed. synth5_format_diagnosis (synthesis_lgg.patlang) needs no
 # changes: its "ok" branch never inspects the payload. ----
+#
+# Milestone 9: runs BOTH clustering strategies (forward-order and
+# best-first) and verifies them TOGETHER in one batched subprocess call,
+# each under its own uniquely-renamed head predicate so they can't
+# cross-contaminate. Whichever strategy passes with fewer clauses wins
+# (ties favor the original forward-order strategy); if only one strategy
+# passes, that one is used regardless of clause count. If NEITHER passes
+# cleanly, falls back to the original single-strategy per-query
+# diagnosis against the forward-order clustering, to keep the same rich
+# conflict detail the earlier milestone-8 behavior gave -- "try two
+# strategies" only replaces the success path, not the diagnostic path.
 make a function called synth8_induce takes target_pred, pos_values, queries, facts, max_depth returns diagnosis
-  let cluster_result = synth8_cluster(pos_values, facts, max_depth)
-  let clusters = cluster_result[0]
-  let missing = cluster_result[1]
+  let cluster_result_a = synth8_cluster(pos_values, facts, max_depth)
+  let clusters_a = cluster_result_a[0]
+  let missing = cluster_result_a[1]
   if to_num(list_len(missing)) > 0 then
     return ["no_witness", missing]
   end
-  if to_num(list_len(clusters)) == 0 then
+  if to_num(list_len(clusters_a)) == 0 then
     return ["no_witness", pos_values]
   end
+  let cluster_result_b = synth8_cluster_best_first(pos_values, facts, max_depth)
+  let clusters_b = cluster_result_b[0]
+
   let background_src = synth5_facts_to_src(facts)
-  let clause_src = sb_new()
-  let ci = 0
-  let cn = to_num(list_len(clusters))
-  while ci < cn do
-    sb_push(clause_src, synth7_emit_clause(target_pred, clusters[ci]))
-    let ci = ci + 1
+  let pred_a = target_pred + "__stra"
+  let pred_b = target_pred + "__strb"
+  let batch = [
+    ["a", synth8_emit_clauses(pred_a, clusters_a), synth9_remap_queries(queries, pred_a)],
+    ["b", synth8_emit_clauses(pred_b, clusters_b), synth9_remap_queries(queries, pred_b)]
+  ]
+  let batch_results = synth9_batch_test_hypotheses(background_src, batch)
+  let a_ok = batch_results[0]
+  let b_ok = batch_results[1]
+
+  if a_ok or b_ok then
+    let chosen = clusters_a
+    if b_ok then
+      if not a_ok then
+        let chosen = clusters_b
+      else
+        if to_num(list_len(clusters_b)) < to_num(list_len(clusters_a)) then
+          let chosen = clusters_b
+        end
+      end
+    end
+    return ["ok", chosen]
   end
-  let results = synth2_diagnose_hypothesis(background_src, sb_str(clause_src), queries)
+
+  # neither batched strategy passed cleanly -- fall back to a detailed
+  # per-query diagnosis against the forward-order clustering.
+  let clause_src = synth8_emit_clauses(target_pred, clusters_a)
+  let results = synth2_diagnose_hypothesis(background_src, clause_src, queries)
   let offending = []
   let i = 0
   let n = to_num(list_len(queries))
@@ -174,9 +296,6 @@ make a function called synth8_induce takes target_pred, pos_values, queries, fac
       let offending = list_push(offending, [q[0], q[1], q[2], note])
     end
     let i = i + 1
-  end
-  if to_num(list_len(offending)) == 0 then
-    return ["ok", clusters]
   end
   return ["conflict", offending]
 end
