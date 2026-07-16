@@ -1,0 +1,213 @@
+# =============================================================================
+# Milestone 5 of the BDD-driven inductive synthesis system (see plan
+# "wondering-about-extending-patlang-modular-shore"). Milestones 2-4 are
+# all TOP-DOWN template search: guess a clause shape (base+chain, unary
+# conjunction, binary chain), enumerate every combination the template
+# allows, and test each one blindly against the examples. None of them
+# derive the shape FROM the examples -- they just brute-force a fixed
+# hypothesis space.
+#
+# This module is BOTTOM-UP instead, closer to how real ILP systems
+# (Aleph/Progol's "bottom clause" construction) actually work: for each
+# positive example, walk the background-fact graph outward from that
+# example's value to find a WITNESSED chain of relations connecting it to
+# something -- a real piece of evidence, not a guess -- then generalize
+# across examples by taking the longest common prefix of their witnessed
+# chains (this prefix-taking IS anti-unification/LGG: the "terms" being
+# generalized are predicate-sequences, and dropping the tail where they
+# diverge is exactly "replace what differs with nothing further
+# specified"). Only then is the generalized hypothesis verified against
+# ALL examples (reusing milestone 2/4's subprocess-isolation machinery).
+#
+# The payoff for going bottom-up: when induction fails, WHY is directly
+# visible from the evidence gathered along the way -- which positive
+# examples had no witness at all (a genuine hole in the background
+# knowledge, not just "search failed"), and which negative examples the
+# generalized-too-far hypothesis wrongly covers. See synth5_induce's
+# returned diagnosis.
+#
+# Background facts are taken here as real PatLang DATA (a list of
+# [pred, arg1] / [pred, arg1, arg2] tuples), not hand-written rule-source
+# text like milestones 2-4 required -- this module derives the rule
+# source itself (synth5_facts_to_src), so there's exactly one
+# representation of the background knowledge to keep consistent, not two.
+# =============================================================================
+
+include "synthesis_chain.patlang"
+
+# ---- background facts as data ----
+
+make a function called synth5_fact_unary takes pred, arg returns f
+  return [pred, arg]
+end
+
+make a function called synth5_fact_binary takes pred, arg1, arg2 returns f
+  return [pred, arg1, arg2]
+end
+
+make a function called synth5_facts_to_src takes facts returns src
+  let sb = sb_new()
+  let i = 0
+  let n = to_num(list_len(facts))
+  while i < n do
+    let f = facts[i]
+    if to_num(list_len(f)) == 2 then
+      sb_push(sb, "rule " + f[0] + "(\"" + synth2_ground(f[1]) + "\").\n")
+    else
+      sb_push(sb, "rule " + f[0] + "(\"" + synth2_ground(f[1]) + "\", \"" + synth2_ground(f[2]) + "\").\n")
+    end
+    let i = i + 1
+  end
+  return sb_str(sb)
+end
+
+# ---- bottom-up witness search ----
+
+# The first binary fact's predicate+successor found with arg1 == cur, or
+# ["", ""] if none. Toy domains here are simple chains (no branching), so
+# "first found" is a reasonable witness; a fact graph with real branching
+# would need every match explored, not just the first -- noted as a
+# limitation, not handled.
+make a function called synth5_first_binary_hop takes facts, cur returns hop
+  let i = 0
+  let n = to_num(list_len(facts))
+  while i < n do
+    let f = facts[i]
+    if to_num(list_len(f)) == 3 then
+      if f[1] == cur then
+        return [f[0], f[2]]
+      end
+    end
+    let i = i + 1
+  end
+  return ["", ""]
+end
+
+# Walk outward from `start` up to max_depth binary hops, recording the
+# predicate name used at each hop. Returns [] if not even one hop is
+# witnessed -- the "no evidence at all for this example" case that later
+# becomes a gap-diagnosis entry.
+make a function called synth5_bfs_chain takes start, facts, max_depth returns pred_seq
+  let seq = []
+  let cur = start
+  let depth = 0
+  let stuck = false
+  while (depth < max_depth) and (not stuck) do
+    let hop = synth5_first_binary_hop(facts, cur)
+    if hop[0] == "" then
+      let stuck = true
+    else
+      let seq = list_push(seq, hop[0])
+      let cur = hop[1]
+      let depth = depth + 1
+    end
+  end
+  return seq
+end
+
+# Longest common prefix of two predicate-sequences -- anti-unification on
+# sequences: where they agree, keep; the first point they diverge is
+# where generalization has to stop being any more specific.
+make a function called synth5_common_prefix takes a, b returns prefix
+  let out = []
+  let i = 0
+  let na = to_num(list_len(a))
+  let nb = to_num(list_len(b))
+  let lim = na
+  if nb < na then
+    let lim = nb
+  end
+  let stop = false
+  while (i < lim) and (not stop) do
+    if a[i] == b[i] then
+      let out = list_push(out, a[i])
+      let i = i + 1
+    else
+      let stop = true
+    end
+  end
+  return out
+end
+
+# Witness every positive example, then anti-unify (common-prefix) across
+# all of them. Returns [generalized_seq, missing_values] where
+# missing_values lists positive examples that had NO witnessed chain at
+# all (real evidence gaps, not search failures).
+make a function called synth5_lgg_from_positive takes pos_values, facts, max_depth returns result
+  let missing = []
+  let seq = []
+  let have_seq = false
+  let i = 0
+  let n = to_num(list_len(pos_values))
+  while i < n do
+    let v = pos_values[i]
+    let chain = synth5_bfs_chain(v, facts, max_depth)
+    if to_num(list_len(chain)) == 0 then
+      let missing = list_push(missing, v)
+    else
+      if not have_seq then
+        let seq = chain
+        let have_seq = true
+      else
+        let seq = synth5_common_prefix(seq, chain)
+      end
+    end
+    let i = i + 1
+  end
+  return [seq, missing]
+end
+
+# ---- top-level induction with gap diagnosis ----
+
+# queries: milestone 2's synth2_query list (mixes positive and negative
+# examples, [pred, arg, expect]).
+#
+# Returns one of:
+#   ["ok", pred_seq]
+#   ["no_witness", missing_values] -- one or more positive examples had no
+#     witnessed chain at all; the given background facts simply don't say
+#     anything connecting that example's value to anything else. This is
+#     the case worth surfacing back to the user as a targeted question:
+#     "scenario X expects <target>, but no background relation mentions X
+#     -- is a fact about X missing from the BDD scenarios/background?"
+#   ["conflict", offending] -- a generalized hypothesis was found and
+#     tested, but it mismatched one or more examples; `offending` is a
+#     list of [pred, arg, expect, note] entries, one per mismatch, with a
+#     human-readable note distinguishing "positive example not covered"
+#     (the LGG over-generalized away something this example needed) from
+#     "negative example wrongly covered" (the background facts don't yet
+#     distinguish this example from the positives -- suggests a missing
+#     fact that would rule it out, or a predicate the search wasn't told
+#     about).
+make a function called synth5_induce takes target_pred, pos_values, queries, facts, max_depth returns diagnosis
+  let lgg_result = synth5_lgg_from_positive(pos_values, facts, max_depth)
+  let seq = lgg_result[0]
+  let missing = lgg_result[1]
+  if to_num(list_len(missing)) > 0 then
+    return ["no_witness", missing]
+  end
+  if to_num(list_len(seq)) == 0 then
+    return ["no_witness", pos_values]
+  end
+  let background_src = synth5_facts_to_src(facts)
+  let clause_src = synth4_chain_clause(target_pred, seq)
+  let results = synth2_diagnose_hypothesis(background_src, clause_src, queries)
+  let offending = []
+  let i = 0
+  let n = to_num(list_len(queries))
+  while i < n do
+    if not results[i] then
+      let q = queries[i]
+      let note = "negative example wrongly covered by the induced rule -- background facts don't yet distinguish it from the positives"
+      if q[2] then
+        let note = "positive example not covered -- the generalized rule (from other examples' witnessed chains) dropped something this example needed"
+      end
+      let offending = list_push(offending, [q[0], q[1], q[2], note])
+    end
+    let i = i + 1
+  end
+  if to_num(list_len(offending)) == 0 then
+    return ["ok", seq]
+  end
+  return ["conflict", offending]
+end

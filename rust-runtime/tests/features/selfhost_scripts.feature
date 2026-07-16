@@ -114,6 +114,21 @@ Feature: Self-hosted (Stage 1) test suites run under cargo test
     When I run it interpreted
     Then the self-hosted suite reports all tests passed
 
+  # Milestone 5: self_hosting/lib/synthesis_lgg.patlang replaces milestones
+  # 2-4's blind top-down template search with BOTTOM-UP witness search
+  # (walk the background-fact graph from each positive example) plus real
+  # anti-unification (longest-common-prefix over witnessed predicate
+  # chains) -- and, because it's evidence-driven, can diagnose WHY
+  # induction failed: a positive example with no witnessed chain at all
+  # (a genuine hole in the background knowledge) versus a negative example
+  # the generalized rule wrongly covers (insufficiently distinguishing
+  # background facts). Three scenarios in one suite: success, a
+  # no-witness gap, and a conflict.
+  Scenario: the inductive synthesis engine derives rules bottom-up via anti-unification and diagnoses gaps
+    Given the self-hosted test suite "synthesis_lgg"
+    When I run it interpreted
+    Then the self-hosted suite reports all tests passed
+
   # Regression case for the documented self-hosted-parser gap: parse_add /
   # parse_mul don't skip newlines before checking for a continuation
   # operator, unlike the native Rust frontend, so a leading `+` on the next
