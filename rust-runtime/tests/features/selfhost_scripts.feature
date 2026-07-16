@@ -129,6 +129,33 @@ Feature: Self-hosted (Stage 1) test suites run under cargo test
     When I run it interpreted
     Then the self-hosted suite reports all tests passed
 
+  # Closes the gap identified after milestone 5: synth5_format_diagnosis/
+  # synth5_induce_and_ask (self_hosting/lib/synthesis_lgg.patlang) render
+  # a structured diagnosis into actual plain-English questions addressed
+  # to whoever wrote the BDD scenarios, instead of just a status tag.
+  Scenario: the inductive synthesis engine turns a gap diagnosis into an actual question
+    Given the self-hosted test suite "synthesis_lgg_report"
+    When I run it interpreted
+    Then the self-hosted suite reports all tests passed
+
+  # New domain (distinct from the grandparent benchmark): a DEPTH-1 chain
+  # (has_mentor(X) :- mentored_by(X, Y)), checking the bottom-up witness
+  # search and common-prefix LGG also work at the shallowest possible
+  # depth, plus the gap-diagnosis question path in a fresh domain.
+  Scenario: the inductive synthesis engine induces a single-hop relation and diagnoses a fresh-domain gap
+    Given the self-hosted test suite "synthesis_mentor"
+    When I run it interpreted
+    Then the self-hosted suite reports all tests passed
+
+  # Another new domain: a DEPTH-3 chain (origin_traceable(X) :-
+  # supplies(X,Y), supplies(Y,Z), supplies(Z,W)), checking bottom-up LGG
+  # scales past depth 2, plus a genuine conflict case (a negative example
+  # with the identical witnessed shape as the positives).
+  Scenario: the inductive synthesis engine induces a three-hop relational chain and catches a same-shape conflict
+    Given the self-hosted test suite "synthesis_supplychain"
+    When I run it interpreted
+    Then the self-hosted suite reports all tests passed
+
   # Regression case for the documented self-hosted-parser gap: parse_add /
   # parse_mul don't skip newlines before checking for a continuation
   # operator, unlike the native Rust frontend, so a leading `+` on the next
