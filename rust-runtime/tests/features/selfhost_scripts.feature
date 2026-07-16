@@ -41,6 +41,16 @@ Feature: Self-hosted (Stage 1) test suites run under cargo test
     When I run it interpreted
     Then the self-hosted suite reports all tests passed
 
+  # Milestone 1 of the BDD-driven inductive synthesis engine
+  # (self_hosting/lib/synthesis.patlang): induces PatLang `rule` facts from
+  # toy Given/Then scenarios, verifies them via solve(), emits real PatLang
+  # source, and round-trips it through patc1.exe. See the plan
+  # "wondering-about-extending-patlang-modular-shore".
+  Scenario: the inductive synthesis engine parsimoniously generalizes toy BDD scenarios
+    Given the self-hosted test suite "synthesis"
+    When I run it interpreted
+    Then the self-hosted suite reports all tests passed
+
   # Regression case for the documented self-hosted-parser gap: parse_add /
   # parse_mul don't skip newlines before checking for a continuation
   # operator, unlike the native Rust frontend, so a leading `+` on the next

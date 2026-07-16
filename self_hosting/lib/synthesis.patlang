@@ -1,0 +1,173 @@
+# =============================================================================
+# Milestone 1 of the BDD-driven inductive synthesis system (see plan
+# "wondering-about-extending-patlang-modular-shore"). Reads a toy feature
+# text of the form
+#
+#   Given the input is "1"
+#   Then the category is "low"
+#
+# scenario pairs, induces one PatLang `rule <category>(<input>).` fact per
+# example, groups examples that share a category under the same predicate
+# (LGG-by-output-label: the parsimony property under test is "branch count
+# == real category count, not example count"), verifies every example
+# against the induced rule set via the native solve() engine, then emits
+# literal PatLang source text for the induced rules plus a small dispatcher
+# function.
+#
+# No hand-rolled unification: induction/verification both go through the
+# existing rule_add/solve host functions (self_hosting/examples/
+# rule_syntax_demo.patlang), not a new resolution engine.
+# =============================================================================
+
+# ---- scenario extraction ----
+
+# Return the text between the first pair of double-quotes on `line`, or ""
+# if there isn't one.
+make a function called synth_extract_quoted takes line returns out
+  let h = str_intern(line)
+  let n = sc_len(h)
+  let i = 0
+  let start = -1
+  let result = ""
+  while i < n do
+    if sc_code(h, i) == 34 then
+      if start == -1 then
+        let start = i + 1
+      else
+        let result = substr(line, start, i - start)
+        let i = n
+      end
+    end
+    let i = i + 1
+  end
+  return result
+end
+
+# Parse a toy feature text into a list of [input, category] pairs. Only
+# understands the two step shapes this milestone's toy scenarios use
+# (`Given the input is "X"` / `Then the category is "Y"`) -- deliberately
+# narrow rather than a general Gherkin grammar; extend if a later example
+# needs more.
+make a function called synth_parse_examples takes feature returns examples
+  let h = str_intern(feature)
+  let n = sc_len(h)
+  let i = 0
+  let line = sb_new()
+  let pending_input = ""
+  let examples = []
+  while i <= n do
+    let c = sc_code(h, i)
+    if (c == 10) or (c == -1) then
+      let raw = sb_str(line)
+      let line = sb_new()
+      if contains_text(raw, "the input is") then
+        let pending_input = synth_extract_quoted(raw)
+      end
+      if contains_text(raw, "the category is") then
+        let category = synth_extract_quoted(raw)
+        if (pending_input != "") and (category != "") then
+          let examples = list_push(examples, [pending_input, category])
+        end
+      end
+      let i = i + 1
+    else
+      if c == 13 then
+        let i = i + 1
+      else
+        sb_push(line, sc_char(h, i))
+        let i = i + 1
+      end
+    end
+  end
+  return examples
+end
+
+# ---- induction ----
+
+# True if `needle` already occurs in list `xs` (linear scan, string equality).
+make a function called synth_list_contains takes xs, needle returns found
+  let i = 0
+  let n = to_num(list_len(xs))
+  let found = false
+  while i < n do
+    if xs[i] == needle then
+      let found = true
+    end
+    let i = i + 1
+  end
+  return found
+end
+
+# Register one ground fact rule (category(input) :- .) per example, and
+# return the list of distinct categories seen -- the induced branch set.
+# This is the LGG-by-output-label step: examples sharing a category become
+# extra facts under one predicate instead of one predicate per example.
+make a function called synth_induce takes examples returns categories
+  let i = 0
+  let n = to_num(list_len(examples))
+  let categories = []
+  while i < n do
+    let pair = examples[i]
+    let input = pair[0]
+    let category = pair[1]
+    rule_add(category, [input], [])
+    if not synth_list_contains(categories, category) then
+      let categories = list_push(categories, category)
+    end
+    let i = i + 1
+  end
+  return categories
+end
+
+# ---- verification (CEGIS-lite: check every example against the induced
+# rule set; return the count that fail) ----
+
+make a function called synth_verify takes examples returns fail_count
+  let i = 0
+  let n = to_num(list_len(examples))
+  let fail_count = 0
+  while i < n do
+    let pair = examples[i]
+    let input = pair[0]
+    let category = pair[1]
+    let sols = solve(category, [input])
+    if to_num(list_len(sols)) == 0 then
+      let fail_count = fail_count + 1
+    end
+    let i = i + 1
+  end
+  return fail_count
+end
+
+# ---- codegen: emit literal PatLang source for the induced rules plus a
+# dispatcher function that tries each known category via solve() ----
+
+make a function called synth_emit_rules takes examples returns src
+  let sb = sb_new()
+  let i = 0
+  let n = to_num(list_len(examples))
+  while i < n do
+    let pair = examples[i]
+    sb_push(sb, "rule " + pair[1] + "(\"" + pair[0] + "\").\n")
+    let i = i + 1
+  end
+  return sb_str(sb)
+end
+
+make a function called synth_emit_dispatcher takes categories, fn_name returns src
+  let sb = sb_new()
+  sb_push(sb, "make a function called " + fn_name + " takes x returns category\n")
+  let i = 0
+  let n = to_num(list_len(categories))
+  while i < n do
+    let cat = categories[i]
+    sb_push(sb, "  let sols_" + cat + " = solve(\"" + cat + "\", [x])\n")
+    sb_push(sb, "  if to_num(list_len(sols_" + cat + ")) > 0 then\n")
+    sb_push(sb, "    return \"" + cat + "\"\n")
+    sb_push(sb, "  end\n")
+    let i = i + 1
+  end
+  sb_push(sb, "  return \"unknown\"\n")
+  sb_push(sb, "end\n")
+  return sb_str(sb)
+end
