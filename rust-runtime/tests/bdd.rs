@@ -185,6 +185,7 @@ fn given_selftest_suite(world: &mut PatWorld, name: String) {
         "synthesis" => read("self_hosting/synthesis_selftest.patlang"),
         "synthesis_router" => read("self_hosting/synthesis_router_selftest.patlang"),
         "synthesis_buildgraph" => read("self_hosting/synthesis_buildgraph_selftest.patlang"),
+        "synthesis_eligibility" => read("self_hosting/synthesis_eligibility_selftest.patlang"),
         other => panic!("unknown self-hosted test suite: {other}"),
     };
 }

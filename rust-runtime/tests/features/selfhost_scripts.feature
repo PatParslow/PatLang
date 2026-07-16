@@ -75,6 +75,17 @@ Feature: Self-hosted (Stage 1) test suites run under cargo test
     When I run it interpreted
     Then the self-hosted suite reports all tests passed
 
+  # Milestone 3: self_hosting/lib/synthesis_conjunctive.patlang generalizes
+  # milestone 2's fixed base/chain template to arbitrary CONJUNCTIONS of
+  # background predicates, searched smallest-first (Occam's razor) so a
+  # distractor predicate merely correlated with the positive examples
+  # (is_student, true of one eligible person but not actually required)
+  # doesn't leak into the induced rule.
+  Scenario: the inductive synthesis engine induces a conjunctive rule and rejects a distractor predicate
+    Given the self-hosted test suite "synthesis_eligibility"
+    When I run it interpreted
+    Then the self-hosted suite reports all tests passed
+
   # Regression case for the documented self-hosted-parser gap: parse_add /
   # parse_mul don't skip newlines before checking for a continuation
   # operator, unlike the native Rust frontend, so a leading `+` on the next
