@@ -1,0 +1,96 @@
+# Milestone 1 stress test #2 for the BDD-driven inductive synthesis engine
+# (self_hosting/lib/synthesis.patlang): reproduces the routing table from
+# self_hosting/examples/router_dsl_demo.patlang -- but instead of hand
+# writing `routes { GET /users -> UserController.index ... }`, the handler
+# mapping is INDUCED from example requests. This is a larger, more
+# realistic complexity step up from the toy digit classifier
+# (self_hosting/synthesis_selftest.patlang): 8 examples, 4 real handlers,
+# and multiple distinct request strings genuinely mapping to the same
+# handler (index/update/logout each reached two different ways) -- so the
+# parsimony check (4 branches, not 8) is doing real work here, not just
+# collapsing exact duplicates.
+#
+# The three routes actually declared in router_dsl_demo.patlang's `routes {
+# ... }` block (GET /users -> UserController.index, POST /users/:id/edit
+# -> UserController.update, DELETE /sessions -> AuthController.logout) are
+# included verbatim among the examples below, so this doubles as a direct
+# reproduction check against that hand-written demo, not just a synthetic
+# exercise.
+
+include "lib/test.patlang"
+include "lib/synthesis.patlang"
+
+t_init()
+
+let router_feature = "Feature: Route an HTTP request to its handler\n" +
+  "\n" +
+  "Scenario: list users (exact route from router_dsl_demo)\n" +
+  "Given the input is \"GET /users\"\n" +
+  "Then the category is \"UserController_index\"\n" +
+  "\n" +
+  "Scenario: list users with a pagination query variant\n" +
+  "Given the input is \"GET /users?page=2\"\n" +
+  "Then the category is \"UserController_index\"\n" +
+  "\n" +
+  "Scenario: list users sorted\n" +
+  "Given the input is \"GET /users?sort=name\"\n" +
+  "Then the category is \"UserController_index\"\n" +
+  "\n" +
+  "Scenario: edit a user (exact route from router_dsl_demo)\n" +
+  "Given the input is \"POST /users/1/edit\"\n" +
+  "Then the category is \"UserController_update\"\n" +
+  "\n" +
+  "Scenario: edit a different user\n" +
+  "Given the input is \"POST /users/2/edit\"\n" +
+  "Then the category is \"UserController_update\"\n" +
+  "\n" +
+  "Scenario: log out (exact route from router_dsl_demo)\n" +
+  "Given the input is \"DELETE /sessions\"\n" +
+  "Then the category is \"AuthController_logout\"\n" +
+  "\n" +
+  "Scenario: log out of all sessions\n" +
+  "Given the input is \"DELETE /sessions/all\"\n" +
+  "Then the category is \"AuthController_logout\"\n" +
+  "\n" +
+  "Scenario: list posts\n" +
+  "Given the input is \"GET /posts\"\n" +
+  "Then the category is \"PostController_index\"\n"
+
+let examples = synth_parse_examples(router_feature)
+check("parses all eight example scenarios", to_num(list_len(examples)), 8)
+
+let categories = synth_induce(examples)
+check("induction finds exactly 4 real handlers, not 8", to_num(list_len(categories)), 4)
+
+let fail_count = synth_verify(examples)
+check("every example request resolves to its handler", fail_count, 0)
+
+# Direct reproduction check: query the three routes router_dsl_demo.patlang
+# itself declares, and confirm the induced rule set answers them the same
+# way its hand-written `register_route` calls would.
+let sols_index = solve("UserController_index", ["GET /users"])
+check("GET /users routes to UserController_index (matches router_dsl_demo)", to_num(list_len(sols_index)) > 0, true)
+let sols_update = solve("UserController_update", ["POST /users/1/edit"])
+check("POST /users/1/edit routes to UserController_update (matches router_dsl_demo)", to_num(list_len(sols_update)) > 0, true)
+let sols_logout = solve("AuthController_logout", ["DELETE /sessions"])
+check("DELETE /sessions routes to AuthController_logout (matches router_dsl_demo)", to_num(list_len(sols_logout)) > 0, true)
+
+let rules_src = synth_emit_rules(examples)
+let dispatcher_src = synth_emit_dispatcher(categories, "route_request")
+
+let out_path = "self_hosting/build/synth_router_demo.patlang"
+let program_src = rules_src + "\n" + dispatcher_src +
+  "\nprint(route_request(\"GET /users\"))\n" +
+  "print(route_request(\"POST /users/1/edit\"))\n" +
+  "print(route_request(\"DELETE /sessions\"))\n" +
+  "print(route_request(\"GET /posts\"))\n"
+write_file(out_path, program_src)
+
+let compiled_exe = "self_hosting/build/synth_router_demo.exe"
+let build = exec_capture("./patc1.exe", out_path, compiled_exe)
+check("generated router source compiles via patc1.exe", contains_text(build, "error"), false)
+
+let run_out = exec_capture(compiled_exe)
+check("compiled router reproduces router_dsl_demo's routing on round-trip", run_out, "UserController_index\nUserController_update\nAuthController_logout\nPostController_index\n\n")
+
+t_report()

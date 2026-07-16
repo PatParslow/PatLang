@@ -51,6 +51,17 @@ Feature: Self-hosted (Stage 1) test suites run under cargo test
     When I run it interpreted
     Then the self-hosted suite reports all tests passed
 
+  # Complexity step up from the toy digit classifier above: reproduces the
+  # routing table router_dsl_demo.patlang hand-writes via `routes { ... }`,
+  # induced instead from example requests. Also caught a real gotcha in
+  # the native A1 resolver (uppercase-first-letter argument strings, e.g.
+  # "GET /users", get treated as logic variables per hosts.rs's
+  # `is_logic_var` convention) that the toy digit corpus never exercised.
+  Scenario: the inductive synthesis engine reproduces router_dsl_demo's routing table
+    Given the self-hosted test suite "synthesis_router"
+    When I run it interpreted
+    Then the self-hosted suite reports all tests passed
+
   # Regression case for the documented self-hosted-parser gap: parse_add /
   # parse_mul don't skip newlines before checking for a continuation
   # operator, unlike the native Rust frontend, so a leading `+` on the next
