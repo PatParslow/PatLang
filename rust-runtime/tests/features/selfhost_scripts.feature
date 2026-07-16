@@ -86,6 +86,22 @@ Feature: Self-hosted (Stage 1) test suites run under cargo test
     When I run it interpreted
     Then the self-hosted suite reports all tests passed
 
+  # Robustness case: XOR-shaped examples have no separating conjunction of
+  # the offered background predicates. Confirms the search reports "no
+  # hypothesis found" honestly rather than overfitting to a wrong answer.
+  Scenario: the inductive synthesis engine reports unsatisfiable rather than overfitting on XOR-shaped examples
+    Given the self-hosted test suite "synthesis_unsatisfiable"
+    When I run it interpreted
+    Then the self-hosted suite reports all tests passed
+
+  # Reproduces the dairy-discount categorization from self_hosting/lib/
+  # pos.patlang's fact("dairy", "milk"/"cheese", "yes") declarations,
+  # induced from example scans instead of hand-declared facts.
+  Scenario: the inductive synthesis engine reproduces pos.patlang's dairy-discount classification
+    Given the self-hosted test suite "synthesis_pos_dairy"
+    When I run it interpreted
+    Then the self-hosted suite reports all tests passed
+
   # Regression case for the documented self-hosted-parser gap: parse_add /
   # parse_mul don't skip newlines before checking for a continuation
   # operator, unlike the native Rust frontend, so a leading `+` on the next
