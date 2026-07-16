@@ -1,0 +1,429 @@
+# =============================================================================
+# Milestone 7 of the BDD-driven inductive synthesis system (see plan
+# "wondering-about-extending-patlang-modular-shore"): a genuinely general
+# anti-unification engine over literal-list clause bodies, replacing (for
+# the cases it covers) the previously separate, hard-coded template
+# families:
+#   - milestone 3 (synthesis_conjunctive.patlang): conjunctions of unary
+#     predicates applied to the query argument X only.
+#   - milestones 4/5/6 (synthesis_chain/lgg.patlang): chains of binary
+#     relations through fresh existential variables, branching-aware.
+# Those two families could never COMPOSE -- a rule needing both a
+# relational chain AND a filter condition on where that chain ends (e.g.
+# "a grandparent whose grandchild is young") was outside what either
+# module could induce.
+#
+# This module unifies them: for each positive example, walk every
+# witnessed binary-relation chain (reusing milestone 6's branching-aware
+# synth5_all_binary_hops/synth5_bfs_all_chains unchanged) and, at EVERY
+# node visited along a chain -- including the query argument X itself,
+# node 0 -- record every unary fact true of that node. A "candidate" is
+# then a genuine (chain, per-node-unary-facts) pair, not just a
+# predicate-name sequence. Anti-unification (synth7_merge_candidates) is
+# real Plotkin-style LGG over this representation: the chain prefix is
+# generalized the same common-prefix way milestone 6 already does, and at
+# each surviving node position the two candidates' unary-fact SETS are
+# intersected -- a unary predicate survives into the induced rule only if
+# it was true at that same node position for every example merged so far.
+#
+# What this does NOT do (still not "fully general"): variables can only
+# be bound by the single chain walked from X (no joining two independent
+# chains, no re-using a variable across unrelated sub-chains), and there
+# is still no support for disjunctive target concepts (see the "current
+# limits" list on patlang-inductive-synthesis.html -- those two remain
+# open). Ambiguity when a single node has multiple facts of the SAME
+# binary predicate to different targets is resolved by taking the first
+# match deterministically once a specific chain (predicate sequence) has
+# already been chosen by the branching search -- a known, documented
+# simplification, not a claim of exhaustive disambiguation.
+# =============================================================================
+
+include "synthesis_lgg.patlang"
+
+# ---- per-example candidate construction: chain + per-node unary profile ----
+
+make a function called synth7_unary_facts_at takes facts, node returns preds
+  let preds = []
+  let i = 0
+  let n = to_num(list_len(facts))
+  while i < n do
+    let f = facts[i]
+    if to_num(list_len(f)) == 2 then
+      if f[1] == node then
+        let preds = list_push(preds, f[0])
+      end
+    end
+    let i = i + 1
+  end
+  return preds
+end
+
+# Deterministic first-match hop for a SPECIFIC predicate name -- used to
+# re-walk a chain whose predicate sequence is already fixed (from
+# synth5_bfs_all_chains) and recover the actual node values it visited.
+make a function called synth7_first_hop_for_pred takes facts, pred, cur returns next
+  let i = 0
+  let n = to_num(list_len(facts))
+  while i < n do
+    let f = facts[i]
+    if to_num(list_len(f)) == 3 then
+      if (f[0] == pred) and (f[1] == cur) then
+        return f[2]
+      end
+    end
+    let i = i + 1
+  end
+  return ""
+end
+
+make a function called synth7_walk_nodes takes chain_seq, start, facts returns nodes
+  let nodes = [start]
+  let cur = start
+  let i = 0
+  let n = to_num(list_len(chain_seq))
+  while i < n do
+    let next = synth7_first_hop_for_pred(facts, chain_seq[i], cur)
+    let nodes = list_push(nodes, next)
+    let cur = next
+    let i = i + 1
+  end
+  return nodes
+end
+
+# Per-node unary-predicate-name lists for every node visited by
+# chain_seq, node 0 first (the query argument itself).
+make a function called synth7_profile takes chain_seq, start, facts returns profile
+  let nodes = synth7_walk_nodes(chain_seq, start, facts)
+  let profile = []
+  let i = 0
+  let n = to_num(list_len(nodes))
+  while i < n do
+    let profile = list_push(profile, synth7_unary_facts_at(facts, nodes[i]))
+    let i = i + 1
+  end
+  return profile
+end
+
+# A candidate is [chain_seq, profile]. Always includes the depth-0
+# candidate (no chain at all, just X's own unary facts -- the pure
+# milestone-3-style case) alongside one candidate per witnessed chain.
+make a function called synth7_candidates_for takes start, facts, max_depth returns candidates
+  let chains = synth5_bfs_all_chains(start, facts, max_depth)
+  let candidates = [[[], [synth7_unary_facts_at(facts, start)]]]
+  let i = 0
+  let n = to_num(list_len(chains))
+  while i < n do
+    let seq = chains[i]
+    let candidates = list_push(candidates, [seq, synth7_profile(seq, start, facts)])
+    let i = i + 1
+  end
+  return candidates
+end
+
+make a function called synth7_candidate_empty takes cand returns empty
+  let seq = cand[0]
+  let profile = cand[1]
+  if to_num(list_len(seq)) > 0 then
+    return false
+  end
+  if to_num(list_len(profile[0])) > 0 then
+    return false
+  end
+  return true
+end
+
+make a function called synth7_literal_count takes cand returns count
+  let seq = cand[0]
+  let profile = cand[1]
+  let count = to_num(list_len(seq))
+  let i = 0
+  let n = to_num(list_len(profile))
+  while i < n do
+    let count = count + to_num(list_len(profile[i]))
+    let i = i + 1
+  end
+  return count
+end
+
+# ---- anti-unification (LGG) over candidates ----
+
+make a function called synth7_intersect_preds takes a, b returns out
+  let out = []
+  let i = 0
+  let n = to_num(list_len(a))
+  while i < n do
+    if synth5_list_contains(b, a[i]) then
+      let out = list_push(out, a[i])
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# Genuine Plotkin-style LGG: the chain prefix generalizes the same
+# common-prefix way milestone 6 already does; at every surviving node
+# position the two candidates' unary-fact sets are intersected, so a
+# predicate only survives if it held at that same node for both.
+make a function called synth7_merge_candidates takes cand_a, cand_b returns merged
+  let seq_a = cand_a[0]
+  let seq_b = cand_b[0]
+  let prof_a = cand_a[1]
+  let prof_b = cand_b[1]
+  let na = to_num(list_len(seq_a))
+  let nb = to_num(list_len(seq_b))
+  let lim = na
+  if nb < na then
+    let lim = nb
+  end
+  let common_len = 0
+  let stop = false
+  let i = 0
+  while (i < lim) and (not stop) do
+    if seq_a[i] == seq_b[i] then
+      let common_len = i + 1
+      let i = i + 1
+    else
+      let stop = true
+    end
+  end
+  let merged_seq = []
+  let i2 = 0
+  while i2 < common_len do
+    let merged_seq = list_push(merged_seq, seq_a[i2])
+    let i2 = i2 + 1
+  end
+  let merged_profile = []
+  let j = 0
+  while j <= common_len do
+    let merged_profile = list_push(merged_profile, synth7_intersect_preds(prof_a[j], prof_b[j]))
+    let j = j + 1
+  end
+  return [merged_seq, merged_profile]
+end
+
+make a function called synth7_list_subset takes a, b returns sub
+  let i = 0
+  let n = to_num(list_len(a))
+  let sub = true
+  while i < n do
+    if not synth5_list_contains(b, a[i]) then
+      let sub = false
+    end
+    let i = i + 1
+  end
+  return sub
+end
+
+make a function called synth7_pred_set_eq takes a, b returns eq
+  return synth7_list_subset(a, b) and synth7_list_subset(b, a)
+end
+
+make a function called synth7_candidate_eq takes cand_a, cand_b returns eq
+  if not synth5_seq_eq(cand_a[0], cand_b[0]) then
+    return false
+  end
+  let prof_a = cand_a[1]
+  let prof_b = cand_b[1]
+  if to_num(list_len(prof_a)) != to_num(list_len(prof_b)) then
+    return false
+  end
+  let i = 0
+  let n = to_num(list_len(prof_a))
+  let eq = true
+  while i < n do
+    if not synth7_pred_set_eq(prof_a[i], prof_b[i]) then
+      let eq = false
+    end
+    let i = i + 1
+  end
+  return eq
+end
+
+make a function called synth7_candidate_list_contains takes cands, needle returns found
+  let i = 0
+  let n = to_num(list_len(cands))
+  let found = false
+  while i < n do
+    if synth7_candidate_eq(cands[i], needle) then
+      let found = true
+    end
+    let i = i + 1
+  end
+  return found
+end
+
+# Witness every positive example's full candidate set, then fold
+# anti-unification across all of them (same running-candidate-set fold
+# milestone 6 uses for plain chains, now over the richer [chain, profile]
+# representation). Returns [best_candidate, missing_values,
+# no_common_structure] -- same three-part shape milestone 6 already
+# established, so synth5_format_diagnosis (below) needs no changes to
+# render this module's diagnoses too.
+make a function called synth7_lgg_from_positive takes pos_values, facts, max_depth returns result
+  let missing = []
+  let candidates = []
+  let have_candidates = false
+  let no_common = false
+  let i = 0
+  let n = to_num(list_len(pos_values))
+  while i < n do
+    let v = pos_values[i]
+    let this_candidates = synth7_candidates_for(v, facts, max_depth)
+    let has_evidence = false
+    let ci0 = 0
+    let cn0 = to_num(list_len(this_candidates))
+    while ci0 < cn0 do
+      if not synth7_candidate_empty(this_candidates[ci0]) then
+        let has_evidence = true
+      end
+      let ci0 = ci0 + 1
+    end
+    if not has_evidence then
+      let missing = list_push(missing, v)
+    else
+      if not have_candidates then
+        let candidates = this_candidates
+        let have_candidates = true
+      else
+        let merged_list = []
+        let ai = 0
+        let an = to_num(list_len(candidates))
+        while ai < an do
+          let bi = 0
+          let bn = to_num(list_len(this_candidates))
+          while bi < bn do
+            let m = synth7_merge_candidates(candidates[ai], this_candidates[bi])
+            if not synth7_candidate_empty(m) then
+              if not synth7_candidate_list_contains(merged_list, m) then
+                let merged_list = list_push(merged_list, m)
+              end
+            end
+            let bi = bi + 1
+          end
+          let ai = ai + 1
+        end
+        let candidates = merged_list
+        if to_num(list_len(candidates)) == 0 then
+          let no_common = true
+        end
+      end
+    end
+    let i = i + 1
+  end
+  let best = []
+  let best_score = 0 - 1
+  let bi2 = 0
+  let bn2 = to_num(list_len(candidates))
+  while bi2 < bn2 do
+    let score = synth7_literal_count(candidates[bi2])
+    if score > best_score then
+      let best_score = score
+      let best = candidates[bi2]
+    end
+    let bi2 = bi2 + 1
+  end
+  return [best, missing, no_common]
+end
+
+# ---- codegen ----
+
+make a function called synth7_var_name takes idx returns v
+  if idx == 0 then
+    return "X"
+  end
+  return "Y" + synth4_var_suffix(idx - 1)
+end
+
+# Emits `rule target(X) :- hop1, hop2, ..., unary-literals-per-node....\n`
+# -- chain hop literals first, in order, then every surviving unary
+# literal grouped by node (node 0 = X first). Conjunction order doesn't
+# change what the rule means, only its readability.
+make a function called synth7_emit_clause takes target_pred, candidate returns src
+  let seq = candidate[0]
+  let profile = candidate[1]
+  let sb = sb_new()
+  sb_push(sb, "rule " + target_pred + "(X) :- ")
+  let first = true
+  let i = 0
+  let n = to_num(list_len(seq))
+  let prev_var = "X"
+  while i < n do
+    if not first then
+      sb_push(sb, ", ")
+    end
+    let first = false
+    let next_var = synth7_var_name(i + 1)
+    sb_push(sb, seq[i] + "(" + prev_var + ", " + next_var + ")")
+    let prev_var = next_var
+    let i = i + 1
+  end
+  let j = 0
+  let nn = to_num(list_len(profile))
+  while j < nn do
+    let node_var = synth7_var_name(j)
+    let preds = profile[j]
+    let k = 0
+    let pn = to_num(list_len(preds))
+    while k < pn do
+      if not first then
+        sb_push(sb, ", ")
+      end
+      let first = false
+      sb_push(sb, preds[k] + "(" + node_var + ")")
+      let k = k + 1
+    end
+    let j = j + 1
+  end
+  sb_push(sb, ".\n")
+  return sb_str(sb)
+end
+
+# ---- top-level induction with gap diagnosis (same 3 diagnosis tags as
+# milestone 5/6: no_witness / conflict / no_common_structure / ok) ----
+
+make a function called synth7_induce takes target_pred, pos_values, queries, facts, max_depth returns diagnosis
+  let lgg_result = synth7_lgg_from_positive(pos_values, facts, max_depth)
+  let best = lgg_result[0]
+  let missing = lgg_result[1]
+  let no_common = lgg_result[2]
+  if to_num(list_len(missing)) > 0 then
+    return ["no_witness", missing]
+  end
+  if no_common then
+    return ["no_common_structure", pos_values]
+  end
+  if synth7_candidate_empty(best) then
+    return ["no_witness", pos_values]
+  end
+  let background_src = synth5_facts_to_src(facts)
+  let clause_src = synth7_emit_clause(target_pred, best)
+  let results = synth2_diagnose_hypothesis(background_src, clause_src, queries)
+  let offending = []
+  let i = 0
+  let n = to_num(list_len(queries))
+  while i < n do
+    if not results[i] then
+      let q = queries[i]
+      let note = "negative example wrongly covered by the induced rule -- background facts don't yet distinguish it from the positives"
+      if q[2] then
+        let note = "positive example not covered -- the generalized rule (from other examples' witnessed evidence) dropped something this example needed"
+      end
+      let offending = list_push(offending, [q[0], q[1], q[2], note])
+    end
+    let i = i + 1
+  end
+  if to_num(list_len(offending)) == 0 then
+    return ["ok", best]
+  end
+  return ["conflict", offending]
+end
+
+# Reuses synth5_format_diagnosis (synthesis_lgg.patlang) unchanged: the
+# diagnosis tuple shapes are identical (its "ok" branch never inspects
+# the payload), so this module needed no separate question-rendering
+# code.
+make a function called synth7_induce_and_ask takes target_pred, pos_values, queries, facts, max_depth returns outcome
+  let diagnosis = synth7_induce(target_pred, pos_values, queries, facts, max_depth)
+  let questions = synth5_format_diagnosis(target_pred, diagnosis)
+  return [diagnosis, questions]
+end
