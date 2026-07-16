@@ -1,0 +1,223 @@
+# =============================================================================
+# Milestone 10 of the BDD-driven inductive synthesis system (see plan
+# "wondering-about-extending-patlang-modular-shore"), and the first of
+# three capability gaps found stress-testing the engine against a real
+# domain (fantpop-patlang, D:\Projects_Organized\04-Worldbuilding-Games\
+# fantpop-patlang\docs\reverse_engineering_notes.md): every chain clause
+# emitted so far (synth4_chain_clause, synth7_emit_clause) has the shape
+#   rule target(X) :- R1(X,Y1), R2(Y1,Y2), ....
+# -- the intermediate AND FINAL variables are existentially quantified
+# inside the body, never exposed as a real second argument of the head.
+# So `is_grandparent(X)` ("X has *some* grandchild") was inducible;
+# `ancestor_of(X, Y)` ("X is specifically Y's ancestor," with Y a real,
+# queryable second argument) was not -- no genuine binary RELATION was
+# inducible, only existential unary predicates over chains.
+#
+# This module closes that gap: given example (X, Y) PAIRS (not just X
+# values), it searches for witnessed chains from X that land EXACTLY on
+# Y within max_depth, and emits the final chain variable literally as Y
+# -- a real second head argument -- instead of an existential Yk. This
+# is also the necessary building block for the second capability gap
+# (two-ended joins, e.g. sibling(X,Y) needing X and Y to independently
+# reach a SHARED node): you can't express "X and Y both reach Z" without
+# first being able to express "X reaches a specific, named Y" at all.
+# =============================================================================
+
+include "synthesis_anti_unify.patlang"
+
+# One example pair: [x, y, expect_provable].
+make a function called synth10_query takes pred, x, y, expect returns q
+  return [pred, x, y, expect]
+end
+
+# Every witnessed chain from `start` (via milestone 6's branching-aware
+# search) whose actual endpoint -- walked back out with synth7_walk_nodes
+# -- is exactly `target`. This is "reaches Y specifically," not "reaches
+# something."
+make a function called synth10_chains_to_target takes start, target, facts, max_depth returns chains
+  let all_chains = synth5_bfs_all_chains(start, facts, max_depth)
+  let matching = []
+  let i = 0
+  let n = to_num(list_len(all_chains))
+  while i < n do
+    let seq = all_chains[i]
+    let nodes = synth7_walk_nodes(seq, start, facts)
+    let last = nodes[to_num(list_len(nodes)) - 1]
+    if last == target then
+      let matching = list_push(matching, seq)
+    end
+    let i = i + 1
+  end
+  return matching
+end
+
+# Witness every positive (X, Y) pair's chain-shape set, then anti-unify
+# (common prefix, same fold as milestone 6) across all of them. Returns
+# [seq, missing_pairs] -- missing_pairs lists [x, y] pairs where no
+# witnessed chain from x reaches y at all within max_depth (a real
+# evidence gap, same meaning as every earlier milestone's no_witness).
+make a function called synth10_lgg_from_positive_pairs takes pos_pairs, facts, max_depth returns result
+  let missing = []
+  let candidates = []
+  let have_candidates = false
+  let i = 0
+  let n = to_num(list_len(pos_pairs))
+  while i < n do
+    let pair = pos_pairs[i]
+    let chains = synth10_chains_to_target(pair[0], pair[1], facts, max_depth)
+    if to_num(list_len(chains)) == 0 then
+      let missing = list_push(missing, pair)
+    else
+      if not have_candidates then
+        let candidates = chains
+        let have_candidates = true
+      else
+        let merged = []
+        let ci = 0
+        let cn = to_num(list_len(candidates))
+        while ci < cn do
+          let cand = candidates[ci]
+          let hi = 0
+          let hn = to_num(list_len(chains))
+          let best = []
+          while hi < hn do
+            let p = synth5_common_prefix(cand, chains[hi])
+            if to_num(list_len(p)) > to_num(list_len(best)) then
+              let best = p
+            end
+            let hi = hi + 1
+          end
+          if to_num(list_len(best)) > 0 then
+            if not synth5_seq_list_contains(merged, best) then
+              let merged = list_push(merged, best)
+            end
+          end
+          let ci = ci + 1
+        end
+        let candidates = merged
+      end
+    end
+    let i = i + 1
+  end
+  let seq = []
+  if to_num(list_len(candidates)) > 0 then
+    let best_i = 0
+    let bi = 0
+    let bn = to_num(list_len(candidates))
+    while bi < bn do
+      if to_num(list_len(candidates[bi])) > to_num(list_len(candidates[best_i])) then
+        let best_i = bi
+      end
+      let bi = bi + 1
+    end
+    let seq = candidates[best_i]
+  end
+  return [seq, missing]
+end
+
+# Emits `rule target(X, Y) :- R1(X,Y1), ..., Rk(Y(k-1), Y).` -- the
+# defining difference from synth4_chain_clause/synth7_emit_clause: the
+# FINAL hop's second argument is literally `Y`, the real second head
+# argument, not an existential.
+make a function called synth10_emit_relation takes target_pred, seq returns src
+  let sb = sb_new()
+  let n = to_num(list_len(seq))
+  sb_push(sb, "rule " + target_pred + "(X, Y) :- ")
+  let i = 0
+  let prev_var = "X"
+  while i < n do
+    if i > 0 then
+      sb_push(sb, ", ")
+    end
+    let next_var = "Y"
+    if i < (n - 1) then
+      let next_var = "Y" + synth4_var_suffix(i)
+    end
+    sb_push(sb, seq[i] + "(" + prev_var + ", " + next_var + ")")
+    let prev_var = next_var
+    let i = i + 1
+  end
+  sb_push(sb, ".\n")
+  return sb_str(sb)
+end
+
+# ---- verification: a 2-arg-aware analogue of synth2_build_test_script/
+# synth2_diagnose_hypothesis, since every earlier milestone's query
+# shape only ever had one argument. ----
+
+make a function called synth10_build_test_script takes background_src, clause_src, queries returns src
+  let sb = sb_new()
+  sb_push(sb, background_src)
+  sb_push(sb, "\n")
+  sb_push(sb, clause_src)
+  sb_push(sb, "\n")
+  let i = 0
+  let n = to_num(list_len(queries))
+  while i < n do
+    let q = queries[i]
+    let label = to_str_i(i)
+    sb_push(sb, "let sols_" + label + " = solve(\"" + q[0] + "\", [\"" + synth2_ground(q[1]) + "\", \"" + synth2_ground(q[2]) + "\"])\n")
+    sb_push(sb, "let ok_" + label + " = to_num(list_len(sols_" + label + ")) > 0\n")
+    if q[3] then
+      sb_push(sb, "print(ok_" + label + ")\n")
+    else
+      sb_push(sb, "print(not ok_" + label + ")\n")
+    end
+    let i = i + 1
+  end
+  return sb_str(sb)
+end
+
+make a function called synth10_diagnose_hypothesis takes background_src, clause_src, queries returns results
+  let script = synth10_build_test_script(background_src, clause_src, queries)
+  let tmp_path = "self_hosting/build/_synth10_hypothesis.patlang"
+  write_file(tmp_path, script)
+  let out = exec_capture("rust-runtime/target/release/pat.exe", "--ir-run", tmp_path)
+  let lines = synth2_split_lines(out)
+  let results = []
+  let i = 0
+  let n = to_num(list_len(lines))
+  while i < n do
+    let results = list_push(results, lines[i] == "true")
+    let i = i + 1
+  end
+  return results
+end
+
+# ---- top-level induction. Same diagnosis vocabulary as milestones 5-8:
+# ["ok", seq] / ["no_witness", missing_pairs] / ["conflict", offending].
+# `offending` entries are [pred, x, y, expect, note] -- one extra field
+# (y) versus every earlier milestone's unary-query offending shape,
+# since this is the first module with genuinely 2-arg queries. ----
+make a function called synth10_induce takes target_pred, pos_pairs, queries, facts, max_depth returns diagnosis
+  let lgg_result = synth10_lgg_from_positive_pairs(pos_pairs, facts, max_depth)
+  let seq = lgg_result[0]
+  let missing = lgg_result[1]
+  if to_num(list_len(missing)) > 0 then
+    return ["no_witness", missing]
+  end
+  if to_num(list_len(seq)) == 0 then
+    return ["no_witness", pos_pairs]
+  end
+  let background_src = synth5_facts_to_src(facts)
+  let clause_src = synth10_emit_relation(target_pred, seq)
+  let results = synth10_diagnose_hypothesis(background_src, clause_src, queries)
+  let offending = []
+  let i = 0
+  let n = to_num(list_len(queries))
+  while i < n do
+    if not results[i] then
+      let q = queries[i]
+      let note = "negative pair wrongly covered by the induced relation -- background facts don't yet distinguish it from the positives"
+      if q[3] then
+        let note = "positive pair not covered -- the generalized relation (from other pairs' witnessed chains) dropped something this pair needed"
+      end
+      let offending = list_push(offending, [q[0], q[1], q[2], q[3], note])
+    end
+    let i = i + 1
+  end
+  if to_num(list_len(offending)) == 0 then
+    return ["ok", seq]
+  end
+  return ["conflict", offending]
+end
