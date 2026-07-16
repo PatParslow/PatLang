@@ -1,0 +1,200 @@
+# =============================================================================
+# Milestone 8 of the BDD-driven inductive synthesis system (see plan
+# "wondering-about-extending-patlang-modular-shore"). Milestone 7's
+# anti-unification engine still picks exactly ONE best surviving
+# candidate for a target predicate -- forcing every positive example
+# through a single generalized clause. A genuinely DISJUNCTIVE concept
+# (a predicate true for two structurally unrelated reasons, e.g.
+# "eligible for a discount if a veteran, OR if an enrolled student" --
+# two facts that share nothing at all) has no single anti-unified
+# structure to converge on; milestone 7 would correctly report
+# `no_common_structure` and stop there, honestly but incompletely.
+#
+# This module doesn't replace milestone 7's engine -- it wraps it with a
+# CLUSTERING step: instead of forcing every positive example into one
+# fold, greedily group examples whose evidence DOES anti-unify into
+# non-empty shared structure, seed a new cluster only when an example
+# can't join any existing one, then induce one clause per cluster. Since
+# `rule head(...) :- body.` clauses for the same head predicate are
+# already ordinary Prolog disjunction (solve() tries every matching
+# rule), emitting N clauses instead of 1 is the entire mechanism -- no
+# new resolution logic needed, same as every earlier milestone's
+# discipline of routing everything through the native rule_add/solve
+# engine rather than hand-rolling one.
+#
+# Clustering is deliberately greedy, not globally optimal (finding the
+# minimum number of clusters that anti-unify is a much harder combinato-
+# rial problem, out of scope): examples are processed in the order given,
+# each tried against every EXISTING cluster before a new one is opened,
+# so different example orderings can in principle produce different
+# (though still individually correct) cluster counts. A single shared
+# structure is always preferred when one exists, so this never disjoins
+# unnecessarily -- the milestone-7 single-clause behavior is exactly
+# what this module produces when no real disjunction is needed.
+# =============================================================================
+
+include "synthesis_anti_unify.patlang"
+
+make a function called synth8_has_evidence takes candidates returns has_ev
+  let i = 0
+  let n = to_num(list_len(candidates))
+  let has_ev = false
+  while i < n do
+    if not synth7_candidate_empty(candidates[i]) then
+      let has_ev = true
+    end
+    let i = i + 1
+  end
+  return has_ev
+end
+
+# The richest (most-literals) candidate in a list -- used both to seed a
+# new cluster and, alongside synth7_merge_candidates, to find the best
+# way an example could join an existing one.
+make a function called synth8_richest takes candidates returns best
+  let best = candidates[0]
+  let best_score = synth7_literal_count(best)
+  let i = 1
+  let n = to_num(list_len(candidates))
+  while i < n do
+    let score = synth7_literal_count(candidates[i])
+    if score > best_score then
+      let best_score = score
+      let best = candidates[i]
+    end
+    let i = i + 1
+  end
+  return best
+end
+
+# Try every (this example's candidate) x (cluster's running candidate)
+# merge; return the richest non-empty result, or [] if none of them
+# produced anything shared at all (this example can't join this
+# cluster).
+make a function called synth8_best_join takes this_candidates, cluster_candidate returns merged
+  let best = []
+  let best_score = 0
+  let i = 0
+  let n = to_num(list_len(this_candidates))
+  while i < n do
+    let m = synth7_merge_candidates(this_candidates[i], cluster_candidate)
+    if not synth7_candidate_empty(m) then
+      let score = synth7_literal_count(m)
+      if score > best_score then
+        let best_score = score
+        let best = m
+      end
+    end
+    let i = i + 1
+  end
+  return best
+end
+
+# Greedy clustering + per-cluster anti-unification. Returns [clusters,
+# missing] where clusters is a list of candidate structures (one per
+# induced clause) and missing lists positive examples with no evidence
+# at all (same meaning as every earlier milestone's no_witness check).
+make a function called synth8_cluster takes pos_values, facts, max_depth returns result
+  let missing = []
+  let clusters = []
+  let i = 0
+  let n = to_num(list_len(pos_values))
+  while i < n do
+    let v = pos_values[i]
+    let this_candidates = synth7_candidates_for(v, facts, max_depth)
+    if not synth8_has_evidence(this_candidates) then
+      let missing = list_push(missing, v)
+    else
+      let joined = false
+      let best_ci = 0 - 1
+      let best_merge = []
+      let best_score = 0
+      let ci = 0
+      let cn = to_num(list_len(clusters))
+      while ci < cn do
+        let m = synth8_best_join(this_candidates, clusters[ci])
+        if not synth7_candidate_empty(m) then
+          let score = synth7_literal_count(m)
+          if score > best_score then
+            let best_score = score
+            let best_ci = ci
+            let best_merge = m
+          end
+        end
+        let ci = ci + 1
+      end
+      if best_ci >= 0 then
+        let clusters = list_set(clusters, best_ci, best_merge)
+        let joined = true
+      end
+      if not joined then
+        let clusters = list_push(clusters, synth8_richest(this_candidates))
+      end
+    end
+    let i = i + 1
+  end
+  return [clusters, missing]
+end
+
+# ---- top-level induction: same diagnosis vocabulary as milestones 5-7
+# (no_witness / conflict / ok), plus the "ok" payload is now a LIST of
+# candidates (one per induced clause) instead of a single one -- length
+# 1 for the ordinary case, length > 1 only when real disjunction was
+# needed. synth5_format_diagnosis (synthesis_lgg.patlang) needs no
+# changes: its "ok" branch never inspects the payload. ----
+make a function called synth8_induce takes target_pred, pos_values, queries, facts, max_depth returns diagnosis
+  let cluster_result = synth8_cluster(pos_values, facts, max_depth)
+  let clusters = cluster_result[0]
+  let missing = cluster_result[1]
+  if to_num(list_len(missing)) > 0 then
+    return ["no_witness", missing]
+  end
+  if to_num(list_len(clusters)) == 0 then
+    return ["no_witness", pos_values]
+  end
+  let background_src = synth5_facts_to_src(facts)
+  let clause_src = sb_new()
+  let ci = 0
+  let cn = to_num(list_len(clusters))
+  while ci < cn do
+    sb_push(clause_src, synth7_emit_clause(target_pred, clusters[ci]))
+    let ci = ci + 1
+  end
+  let results = synth2_diagnose_hypothesis(background_src, sb_str(clause_src), queries)
+  let offending = []
+  let i = 0
+  let n = to_num(list_len(queries))
+  while i < n do
+    if not results[i] then
+      let q = queries[i]
+      let note = "negative example wrongly covered by the induced rule set -- background facts don't yet distinguish it from the positives"
+      if q[2] then
+        let note = "positive example not covered by any induced clause -- its evidence didn't cluster with anything else, and its own richest candidate still doesn't hold"
+      end
+      let offending = list_push(offending, [q[0], q[1], q[2], note])
+    end
+    let i = i + 1
+  end
+  if to_num(list_len(offending)) == 0 then
+    return ["ok", clusters]
+  end
+  return ["conflict", offending]
+end
+
+make a function called synth8_induce_and_ask takes target_pred, pos_values, queries, facts, max_depth returns outcome
+  let diagnosis = synth8_induce(target_pred, pos_values, queries, facts, max_depth)
+  let questions = synth5_format_diagnosis(target_pred, diagnosis)
+  return [diagnosis, questions]
+end
+
+# Emits every induced clause, one `rule target(X) :- ....\n` per cluster.
+make a function called synth8_emit_clauses takes target_pred, clusters returns src
+  let sb = sb_new()
+  let i = 0
+  let n = to_num(list_len(clusters))
+  while i < n do
+    sb_push(sb, synth7_emit_clause(target_pred, clusters[i]))
+    let i = i + 1
+  end
+  return sb_str(sb)
+end
