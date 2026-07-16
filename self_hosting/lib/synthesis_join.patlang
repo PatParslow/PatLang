@@ -1,0 +1,174 @@
+# =============================================================================
+# Milestone 11 of the BDD-driven inductive synthesis system (see plan
+# "wondering-about-extending-patlang-modular-shore"): two-ended
+# relational joins, the second of the three capability gaps found
+# stress-testing the engine against fantpop-patlang. `sibling(X, Y)`
+# needs "does there exist a Z such that parent(Z, X) AND parent(Z, Y)"
+# -- X and Y each need their own independent evidence, meeting at a
+# shared node. Milestone 10 made X and Y real, bindable head arguments
+# possible at all; this module is what actually finds the shared node.
+#
+# Scoped to DIRECT joins (one hop from the shared node to each of X and
+# Y) -- the exact shape needed for sibling(X, Y) via a shared immediate
+# parent. Deeper joins (e.g. first cousins via a shared grandparent,
+# requiring a multi-hop walk on each side) are a further, still-open
+# extension of this same idea, not attempted here.
+#
+# A real, honestly-documented boundary: the induced rule has no way to
+# require X != Y (the engine has no inequality/equality operator between
+# two entities at all -- the third capability gap named in fantpop-
+# patlang's reverse-engineering notes). Querying the induced sibling
+# relation with the SAME individual for both arguments will incorrectly
+# succeed (any node with at least one parent trivially satisfies
+# "shares a parent with itself"). This module does not paper over that
+# with a hidden guard -- see synthesis_join_selftest.patlang's own check
+# proving the gap is real, not silently working around it.
+# =============================================================================
+
+include "synthesis_relation.patlang"
+
+# All [pred, z] pairs such that fact `pred(z, target)` exists -- the
+# reverse of synth7_all_binary_hops (which finds z such that a fact
+# exists FROM a given start; this finds z such that a fact exists TO a
+# given target).
+make a function called synth11_predecessors takes facts, target returns preds
+  let out = []
+  let i = 0
+  let n = to_num(list_len(facts))
+  while i < n do
+    let f = facts[i]
+    if to_num(list_len(f)) == 3 then
+      if f[2] == target then
+        let out = list_push(out, [f[0], f[1]])
+      end
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called synth11_pair_eq takes a, b returns eq
+  return (a[0] == b[0]) and (a[1] == b[1])
+end
+
+make a function called synth11_pair_list_contains takes pairs, needle returns found
+  let i = 0
+  let n = to_num(list_len(pairs))
+  let found = false
+  while i < n do
+    if synth11_pair_eq(pairs[i], needle) then
+      let found = true
+    end
+    let i = i + 1
+  end
+  return found
+end
+
+# Every [pred_to_x, pred_to_y] pair witnessed by a SHARED node z (not
+# just independently-matching predicates from different z's -- z must
+# be the same individual for both). A person is never their own
+# sibling, so x == y is refused outright regardless of shared evidence.
+make a function called synth11_join_candidates takes facts, x, y returns pairs
+  if x == y then
+    return []
+  end
+  let preds_x = synth11_predecessors(facts, x)
+  let preds_y = synth11_predecessors(facts, y)
+  let pairs = []
+  let i = 0
+  let nx = to_num(list_len(preds_x))
+  while i < nx do
+    let px = preds_x[i]
+    let j = 0
+    let ny = to_num(list_len(preds_y))
+    while j < ny do
+      let py = preds_y[j]
+      if px[1] == py[1] then
+        let pair = [px[0], py[0]]
+        if not synth11_pair_list_contains(pairs, pair) then
+          let pairs = list_push(pairs, pair)
+        end
+      end
+      let j = j + 1
+    end
+    let i = i + 1
+  end
+  return pairs
+end
+
+# Anti-unify (set intersection) the witnessed [pred_to_x, pred_to_y]
+# candidates across every positive pair -- a join shape only survives if
+# every example's evidence supports it. Returns [candidates, missing].
+make a function called synth11_lgg_join takes pos_pairs, facts returns result
+  let missing = []
+  let candidates = []
+  let have = false
+  let i = 0
+  let n = to_num(list_len(pos_pairs))
+  while i < n do
+    let pair = pos_pairs[i]
+    let this_candidates = synth11_join_candidates(facts, pair[0], pair[1])
+    if to_num(list_len(this_candidates)) == 0 then
+      let missing = list_push(missing, pair)
+    else
+      if not have then
+        let candidates = this_candidates
+        let have = true
+      else
+        let kept = []
+        let ci = 0
+        let cn = to_num(list_len(candidates))
+        while ci < cn do
+          if synth11_pair_list_contains(this_candidates, candidates[ci]) then
+            let kept = list_push(kept, candidates[ci])
+          end
+          let ci = ci + 1
+        end
+        let candidates = kept
+      end
+    end
+    let i = i + 1
+  end
+  return [candidates, missing]
+end
+
+make a function called synth11_emit_join takes target_pred, join_pair returns src
+  return "rule " + target_pred + "(X, Y) :- " + join_pair[0] + "(Z, X), " + join_pair[1] + "(Z, Y).\n"
+end
+
+# Same diagnosis vocabulary as milestones 5-10. `queries` are milestone
+# 10's 2-arg shape ([pred, x, y, expect]) -- reuses synth10_diagnose_
+# hypothesis unchanged for verification.
+make a function called synth11_induce takes target_pred, pos_pairs, queries, facts returns diagnosis
+  let r = synth11_lgg_join(pos_pairs, facts)
+  let candidates = r[0]
+  let missing = r[1]
+  if to_num(list_len(missing)) > 0 then
+    return ["no_witness", missing]
+  end
+  if to_num(list_len(candidates)) == 0 then
+    return ["no_witness", pos_pairs]
+  end
+  let join_pair = candidates[0]
+  let background_src = synth5_facts_to_src(facts)
+  let clause_src = synth11_emit_join(target_pred, join_pair)
+  let results = synth10_diagnose_hypothesis(background_src, clause_src, queries)
+  let offending = []
+  let i = 0
+  let n = to_num(list_len(queries))
+  while i < n do
+    if not results[i] then
+      let q = queries[i]
+      let note = "negative pair wrongly covered by the induced join -- background facts don't yet distinguish it from the positives"
+      if q[3] then
+        let note = "positive pair not covered -- the generalized join dropped something this pair needed"
+      end
+      let offending = list_push(offending, [q[0], q[1], q[2], q[3], note])
+    end
+    let i = i + 1
+  end
+  if to_num(list_len(offending)) == 0 then
+    return ["ok", join_pair]
+  end
+  return ["conflict", offending]
+end
