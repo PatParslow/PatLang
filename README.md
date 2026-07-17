@@ -1,209 +1,147 @@
-# Patlang Programming Language
+# PatLang
 
-Patlang is an innovative programming language designed with incremental development principles, focusing on clear syntax, strong pattern matching capabilities, and goal-oriented programming constructs.
+PatLang is a self-hosted programming language: its lexer, parser, lowerer,
+and code generator are written in PatLang itself, not just as a bootstrap
+exercise but as the actual, ongoing way PatLang programs get compiled.
+Alongside the usual imperative/functional core it has a built-in
+goal-oriented/logic-programming layer (facts, rules, `solve`, `plan`) and
+an inductive-synthesis (ILP) engine that can learn rules from BDD-style
+example scenarios.
 
-## Overview
+This README describes the system as it exists today. If you're looking at
+one of the many `*_REPORT.md` / `*_PLAN.md` files in the repo root and it
+disagrees with this file, trust this file — most of those documents
+describe an earlier, abandoned Ruby prototype and are kept only as
+historical record.
 
-Patlang introduces a unique approach to programming by combining:
-- **Pattern-based syntax** for intuitive code structure
-- **Goal-oriented constructs** that express intent clearly
-- **Incremental development** support built into the language design
-- **Strong type inference** with optional explicit typing
-- **Functional and procedural** programming paradigms
+## What actually works
 
-## ⚠️ Architecture Migration Notice
+- **A native Rust runtime** (`rust-runtime/`) — a real lexer, parser,
+  interpreter, and native code generator, built as the `pat` binary.
+- **A self-hosted compiler** (`self_hosting/lib/{lexer,parser,lower,codegen,
+  runtime_rs}.patlang`) — the same pipeline, written in PatLang, bootstrapped
+  into a standalone native binary (`patc1.exe`) that compiles ordinary
+  PatLang programs without going through the Rust-native path.
+- **Three execution paths, kept in parity on purpose**: interpreted
+  (`pat --ir-run`), natively compiled via the Rust codegen (`pat --patc`),
+  and compiled by the self-hosted compiler (`patc1.exe`). The test suite
+  checks that all three agree — this cross-checking is how most real bugs
+  in this project get found, including bugs in the self-hosted parser
+  itself.
+- **A numeric tower**: Int/Float/BigInt/Rational, auto-promoting on
+  overflow rather than wrapping or crashing.
+- **A goal-oriented/logic layer**: `fact`/`rule_add`/`solve`/`action_add`/
+  `plan` — Prolog-ish querying and STRIPS-ish planning available as
+  ordinary host functions, usable from otherwise-imperative code.
+- **An inductive synthesis engine** (`self_hosting/lib/synthesis*.patlang`):
+  least-general-generalization-based rule learning over BDD-authored
+  example scenarios.
+- **Contracts, a message queue, TCP sockets, non-blocking process spawn,
+  and a signal/task-discovery layer** built on top of the message queue —
+  enough to write small self-orchestrated multi-process demos entirely in
+  PatLang (see `self_hosting/examples/microservices_demo.patlang`).
+- **A real, if informal, test corpus**: 60+ Rust integration tests
+  (`rust-runtime/tests/`), a BDD feature suite, and 25+ self-hosted
+  PatLang selftests (`self_hosting/*_selftest.patlang`) exercising the
+  synthesis engine, regex DSL, reflection/transpilation, and more.
+- **A library of working example programs** (`self_hosting/examples/`,
+  `portfolio/demos/`) — a CSV-backed transactional RDBMS with a SQL
+  console, a hex-grid RTS economy sim, a build daemon, a maze solver, a
+  family-tree/demographic simulator, and others — each runnable and each
+  built to prove out a real language feature rather than as a toy.
 
-**Patlang has migrated to a new modular architecture!** If you're an existing user:
+## What it doesn't do
 
-- **New Entry Point**: `ruby ruby-host/bootstrap/patlang_bootstrap.rb` (was `ruby src/patlang.rb`)
-- **New Test Runner**: `ruby test/fixed_comprehensive_coverage_runner.rb`
-- **Migration Guide**: See [`ARCHITECTURE_MIGRATION_GUIDE.md`](ARCHITECTURE_MIGRATION_GUIDE.md) for complete migration instructions
+- **No package manager or module registry.** `include` is textual file
+  concatenation; there's no versioning or dependency resolution.
+- **No sandboxing.** Host functions give a PatLang program the same
+  privileges as the user running it: arbitrary process execution
+  (`exec_capture`), unrestricted filesystem read/write/delete, and raw TCP.
+  Fine for scripts you wrote yourself; do not run untrusted PatLang source
+  without wrapping it in an external sandbox (container, VM, restricted
+  user account) first.
+- **No editor tooling.** No LSP, no debugger, no formatter, no linter.
+- **No performance benchmarking against other languages.** The runtime is
+  Rust-backed and the self-hosted path produces real native binaries, but
+  there's no published data on how either compares to established
+  languages on non-trivial workloads.
+- **Single-maintainer, no external users yet.** Everything above is
+  proven against its own test suite and example programs, not against
+  outside use.
 
-## Current Development Status
+## Quick start
 
-**Current Status**: Active Development - Solid Foundation (June 2025)
-**Test Success Rate**: 40.7% (24/59 test files passing)
-**Core Infrastructure**: 56% passing - solid foundation established
-**Strategic Goal**: Building toward self-hosting capability
-
-### 📊 Current Test Status Summary (June 2025)
-Based on comprehensive test analysis ([`current-test-status.txt`](current-test-status.txt)):
-
-**✅ Strong Foundation Areas (Working Well)**:
-- **Core Infrastructure** (56% passing): Lexer, Parser, AST nodes, Facts database
-- **Branch Coverage Testing** (100% passing): Conditional logic and error handling
-- **Utility Components** (100% passing): Auto output, dependency mapping, performance analysis
-
-**🚧 Partially Working Features**:
-- **Language Features** (30% passing): Flexible function syntax, IS keyword implementation, basic evaluator
-- **Ruby Implementation** (20% passing): Object model foundation exists but needs stability improvements
-
-**🎯 Areas Under Development**:
-- Integration layer reliability (0% passing)
-- Helper components (errors need resolution)
-- Test coverage improvement (currently 9.38% line coverage)
-
-### ✅ Confirmed Working Features
-- **Arithmetic expressions** with proper operator precedence
-- **Lexer functionality** with comprehensive error handling
-- **Parser core operations** for syntax analysis
-- **AST node processing** for syntax tree manipulation
-- **Facts database operations** for reasoning foundation
-- **Flexible function syntax** (partial implementation)
-- **IS keyword implementation** (partial functionality)
-- **Branch coverage validation** (complete test suite)
-
-For detailed development tracking, see:
-- [`docs/development/v0.3.0-control-flow-plan.md`](docs/development/v0.3.0-control-flow-plan.md) - Complete implementation plan
-- [`docs/development/v0.3.0-development-status.md`](docs/development/v0.3.0-development-status.md) - Live development progress
-- [`docs/development/self-hosting-gap-analysis.md`](docs/development/self-hosting-gap-analysis.md) - Strategic self-hosting roadmap
-
-## Quick Start
-
-For a comprehensive introduction to Patlang, see:
-- [`TUTORIAL.md`](TUTORIAL.md) - **Start here**: tutorial for the working native runtime and self-hosted compiler (build, run, compile, all paradigms)
-- [`getting-started.md`](getting-started.md) - Older tutorial and examples (legacy evaluator)
-
-## Documentation Structure
-
-### Language Specification
-- [`docs/language/Patlang.md`](docs/language/Patlang.md) - Core language specification
-- [`docs/language/syntax.md`](docs/language/syntax.md) - Syntax reference and rules
-- [`docs/language/language-reference.md`](docs/language/language-reference.md) - Complete language reference
-
-### Development
-- [`docs/development/developer-guide.md`](docs/development/developer-guide.md) - Developer setup and contribution guide
-- [`docs/development/devplan.md`](docs/development/devplan.md) - Development roadmap
-- [`docs/development/interpreter-architecture.md`](docs/development/interpreter-architecture.md) - Interpreter design and architecture
-
-### Examples
-- [`docs/examples/`](docs/examples/) - Language examples and use cases
-  - Contract patterns, form handling, functional programming
-  - Goal-oriented programming examples
-  - Real-world application patterns
-
-### Testing
-- [`docs/testing/`](docs/testing/) - Comprehensive testing strategy
-  - Test plans, categories, and infrastructure
-  - Quality assurance processes
-
-## Development Approach
-
-Patlang is being developed using an **incremental approach**:
-
-1. **Language Design** - Core syntax and semantics definition
-2. **Parser Development** - Building the language parser
-3. **Interpreter Core** - Basic execution engine
-4. **Standard Library** - Essential language features
-5. **Advanced Features** - Pattern matching, goal constructs
-6. **Optimization** - Performance improvements
-
-## Current Capabilities
-
-### ✅ Working Now
-- **Basic arithmetic interpreter** with lexer, parser, and evaluator
-- **Interactive REPL** for arithmetic expressions
-- **Core infrastructure** components (lexer, parser, AST processing)
-- **Comprehensive error handling** and bounds checking
-- **Branch coverage testing** framework
-- **Performance analysis** and dependency mapping tools
-
-### 🚧 In Active Development
-- **Variable assignment** and lookup (IS keyword partially working)
-- **Function definitions** and calls (flexible syntax partially implemented)
-- **Object model integration** (foundation exists, needs stability)
-- **String operations** (architecture planned)
-- **Control flow** constructs (parser support exists)
-
-### 🎯 Architecture Completed
-- Language specification and syntax rules
-- Parser infrastructure and AST framework
-- Reasoning system foundation
-- Test infrastructure and coverage analysis
-- Error handling and diagnostic systems
-
-## Try the Current Interpreter
-
-The current interpreter supports basic arithmetic evaluation:
+You need a Rust toolchain for one bootstrap step only.
 
 ```bash
-# Run the interactive arithmetic REPL
-ruby ruby-host/bootstrap/patlang_bootstrap.rb
-
-# Try these working expressions in REPL:
-42                    # => 42
-3.14 + 2.86          # => 6.0
-2 + 3 * 4            # => 14 (operator precedence)
-(2 + 3) * 4          # => 20 (parentheses)
-10 - 5 / 2           # => 7.5 (mixed operations)
-
-# Exit the REPL
-exit                 # => Goodbye!
+cd rust-runtime
+cargo build --release
 ```
 
-### ✅ Currently Supported Features:
-- **Arithmetic Operations**: Integer and decimal number literals with operators `+`, `-`, `*`, `/`
-- **Expression Evaluation**: Parentheses for grouping with proper operator precedence
-- **Interactive REPL**: Live arithmetic expression evaluation
-- **Error Handling**: Comprehensive bounds checking and diagnostic messages
+This produces `pat` (`pat.exe` on Windows) — the runner and compiler
+driver. From the repo root:
 
-### 🚧 Partially Working (Under Development):
-- **Variable Assignment**: IS keyword implementation (foundation exists)
-- **Function Syntax**: Flexible function definitions (parser support exists)
-- **String Operations**: Architecture designed (not yet integrated)
-- **Control Flow**: Basic constructs (parser foundation exists)
-
-### 📊 Test Status
-Run the test suite to see current development progress:
 ```bash
-# Run comprehensive tests (see current-test-status.txt for latest results)
-ruby test/fixed_comprehensive_coverage_runner.rb
+# Interpret directly (recommended for everyday use)
+rust-runtime/target/release/pat --ir-run hello.patlang
 
-# Current status: 40.7% passing (24/59 test files)
-# Strong areas: Core infrastructure (56% passing), Branch coverage (100% passing)
-# Development areas: Integration layer, Ruby implementation stability
+# Compile via the native Rust codegen
+rust-runtime/target/release/pat --patc hello.patlang --out hello.exe
+
+# Compile via the self-hosted compiler (rebuild it first if it's stale)
+rust-runtime/target/release/pat --ir-run self_hosting/build_patc1.patlang
+./patc1.exe hello.patlang hello.exe
 ```
 
-## Getting Involved
+`hello.patlang`:
 
-1. **Migration**: Read the [Architecture Migration Guide](ARCHITECTURE_MIGRATION_GUIDE.md) for updated paths and commands
-2. **Development**: Read the [Developer Guide](docs/development/developer-guide.md) for contribution guidelines
-3. **Language**: Review the [Language Specification](docs/language/Patlang.md) for syntax and features
-4. **Architecture**: See the [Modular Architecture Overview](docs/architecture/MODULAR_ARCHITECTURE_OVERVIEW.md) for system design
-5. **Examples**: Try the [Examples](docs/examples/) to see Patlang in action
-6. **Planning**: Check the [Development Plan](docs/development/devplan.md) for roadmap
+```patlang
+let name = "world"
+print("hello, " + name)
+```
 
-## Project Structure
+See [`TUTORIAL.md`](TUTORIAL.md) for a fuller walkthrough of all three
+execution paths and the language's main paradigms, and
+[`CLAUDE.md`](CLAUDE.md) for the project's own working conventions
+(when to use `patc1.exe` vs the native pipeline, and the discipline for
+keeping the self-hosted mirror in sync with the Rust runtime).
+
+## Running the tests
+
+```bash
+cargo test --release --manifest-path rust-runtime/Cargo.toml
+```
+
+Self-hosted selftests are run directly as PatLang programs, e.g.:
+
+```bash
+rust-runtime/target/release/pat --ir-run self_hosting/synthesis_lgg_selftest.patlang
+```
+
+## Project layout
 
 ```
 /
-├── patlang-core/         # Core language implementation
-│   ├── ast/             # Abstract Syntax Tree nodes
-│   ├── evaluator/       # Expression and statement evaluation
-│   ├── lexer/           # Tokenization and lexical analysis
-│   ├── object_model/    # Object system and type infrastructure
-│   ├── parser/          # Syntax parsing and analysis
-│   └── reasoning/       # Logic programming and constraint solving
-├── ruby-host/           # Ruby bootstrap and runtime environment
-│   ├── bootstrap/       # Language bootstrap and entry points
-│   ├── interop/         # Ruby-Patlang interoperability
-│   └── runtime/         # Runtime support and utilities
-├── dev-tools/           # Development and build tools
-│   ├── analysis/        # Code analysis tools
-│   ├── build/           # Build scripts and VS Code extensions
-│   ├── coverage/        # Coverage analysis tools
-│   └── testing/         # Test runners and diagnostic tools
-├── docs/
-│   ├── language/        # Language specification and reference
-│   ├── development/     # Developer guides and processes
-│   ├── testing/         # Test plans and strategies
-│   └── examples/        # Language examples and use cases
-├── test/                # Comprehensive test suite
-├── examples/            # Example programs and tutorials
-├── getting-started.md   # Quick start guide
-└── README.md           # This file
+├── rust-runtime/          # The native Rust implementation: lexer, parser,
+│                           # interpreter, native codegen, host functions,
+│                           # and the Rust-side integration test suite.
+├── self_hosting/
+│   ├── lib/                # The self-hosted compiler and standard library,
+│   │                        # written in PatLang (lexer/parser/lower/codegen,
+│   │                        # synthesis engine, RDBMS, regex, math, etc.)
+│   ├── examples/            # Runnable demo programs.
+│   └── *_selftest.patlang   # Self-hosted test suites.
+├── portfolio/demos/        # Browser-facing HTML wrappers for demos.
+├── patc1.exe                # The bootstrapped self-hosted compiler binary
+│                            # (rebuild via self_hosting/build_patc1.patlang).
+├── TUTORIAL.md              # Start here for a hands-on introduction.
+└── CLAUDE.md                # Working conventions for this repo.
 ```
+
+Most of the other root-level `*.md` files predate the current
+architecture and are kept for historical reference only.
 
 ---
 
-**Patlang** - A language designed for clarity, built for growth.
+**PatLang** — a self-hosted language for exploring goal-oriented and
+logic-programming constructs alongside an ordinary imperative core.
