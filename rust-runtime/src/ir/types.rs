@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use num_bigint::BigInt;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -32,7 +33,20 @@ pub enum Value {
     // or a non-numeric kind); enforced by construction sites, not the type.
     Complex(Box<Value>, Box<Value>),
     String(String),
-    List(Vec<Value>),
+    // Arc-wrapped (not a bare Vec<Value>) so cloning a list -- which
+    // happens on every read of a list-valued variable in this tree-
+    // walking interpreter, not just explicit list_push/list_set calls
+    // -- is an O(1) refcount bump instead of an O(n) deep copy. This is
+    // the root fix for a bug class found (and worked around with ad-hoc
+    // vec_* handles) SIX separate times in one session: any code that
+    // builds up a large list via repeated list_push/list_set was
+    // O(n^2), because list_push's own clone-then-mutate was only ever
+    // part of the cost -- every OTHER read of that same list along the
+    // way was already paying a full deep copy too. Arc is Send+Sync
+    // (unlike Rc), so this also makes a list value safe to clone across
+    // a parallel_map worker-thread boundary, unlike the thread_local
+    // vec_* handles it's replacing for that use case.
+    List(Arc<Vec<Value>>),
     // Functions are closures with env; for Stage 0 keep them host-side only in the interpreter
     HostFunction(fn(&[Value]) -> Result<Value, String>),
     Object(HashMap<String, Value>),

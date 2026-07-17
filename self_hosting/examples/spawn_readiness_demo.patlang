@@ -1,0 +1,74 @@
+# Worked example of the readiness-confirmation pattern discussed when
+# scoping this primitive: a spawned child announces itself via the
+# existing task-registry beacon once it's actually listening, and the
+# parent polls BOTH is_alive(pid) (to catch an early crash) and
+# signal_discover_one (to catch a successful start) rather than either
+# alone -- polling only the beacon can't distinguish "still starting up"
+# from "already died before ever announcing".
+#
+# This is deliberately just ordinary PatLang code on top of spawn/
+# is_alive/kill/wait plus signal_discovery.patlang -- no new host
+# function was added for "confirm readiness" itself, see
+# self_hosting/lib/task_registry.patlang and signal_discovery.patlang's
+# own headers for why the beacon already solves "how does a caller learn
+# a task's port" and doesn't need a second, spawn-specific channel.
+#
+# spawn()'s child gets its OWN stdio, not the parent's -- stdout/stderr
+# are discarded (Stdio::null()), not inherited, specifically so a
+# spawned child's own prints (including `pat --ir-run`'s own auto-print
+# of a program's final top-level result, the trailing "true"/"false"
+# seen after every t_report()-based selftest all session) can never
+# land interleaved in the parent's own output. Confirmed directly: an
+# earlier version of this demo, before that fix, showed a stray "true"
+# mixed into the prints below, from spawn_readiness_child.patlang's own
+# exit value bleeding through inherited stdio. If you genuinely need a
+# spawned child's output, that's what exec_capture is for (blocking,
+# captures everything) -- spawn is for the non-blocking case, where
+# discarding by default is the safe choice (an unread pipe would
+# otherwise fill and block the child's writes forever once full).
+
+include "../lib/signal_discovery.patlang"
+
+make a function called wait_for_ready takes task_name, pid, timeout_ms returns result
+  # -> ["ready", port, actions] / ["crashed", ""] / ["timeout", ""]
+  let waited = 0
+  let poll_interval = 100
+  let looping = true
+  let outcome = ["timeout", ""]
+  while looping do
+    if not is_alive(pid) then
+      let outcome = ["crashed", ""]
+      let looping = false
+    else
+      let found = signal_discover_one(task_name, 60000)
+      if found[0] != "" then
+        let outcome = ["ready", found[0], found[1]]
+        let looping = false
+      else
+        if waited >= timeout_ms then
+          let looping = false
+        else
+          sleep_ms(poll_interval)
+          let waited = waited + poll_interval
+        end
+      end
+    end
+  end
+  return outcome
+end
+
+let child_path = "F:/PatLang/self_hosting/examples/spawn_readiness_child.patlang"
+let pid = spawn("F:/PatLang/rust-runtime/target/release/pat.exe", "--ir-run", child_path)
+print("parent: spawned pid " + pid)
+
+let result = wait_for_ready("readiness_demo_child", pid, 5000)
+print("parent: outcome = " + result[0])
+if result[0] == "ready" then
+  print("parent: child is ready on port " + result[1])
+  let obj = signal_wrap("child_obj", to_num(result[1]), result[2])
+  let reply = signal_call("child_obj", "ping", "")
+  print("parent: reply = " + reply)
+end
+
+kill(pid)
+print("parent: done")

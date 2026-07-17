@@ -1,0 +1,320 @@
+# Slice 1 of the signal-discovery/composition backlog item: capability
+# description folded directly into the presence beacon
+# (self_hosting/lib/task_registry.patlang) rather than a separate query
+# round-trip -- a task's beacon announcement already IS the answer to
+# "what are you and what do you offer", so discovering a task and
+# learning what it can do become the same single read, not two.
+#
+# Encoding is deliberately simple, not a general-purpose serializer --
+# same "simple format" caveat queue.patlang's own header already states
+# for its own tab-separated rows. Two multi-character markers (not
+# single characters -- see self_hosting/lib/parser.patlang's own
+# "@@ERR@@"/"@@ENDERR@@" lesson from earlier this session about why a
+# single-char delimiter can collide with real content) separate actions
+# from each other and an action's name from its description. Avoids
+# tab (already used by task_registry.patlang's own outer timestamp
+# split -- safe to nest more tabs inside a description, but simplest not
+# to) and newline entirely (queue.patlang's file format is one row per
+# line; a literal newline inside a description would corrupt the file).
+#
+# Same trust caveat as task_registry.patlang: an action list is exactly
+# as self-reported as the rest of the announcement. Nothing here
+# verifies a described action actually behaves as claimed.
+
+include "task_registry.patlang"
+include "signals.patlang"
+
+make a function called sd_action_sep returns s
+  return "~~"
+end
+
+make a function called sd_field_sep returns s
+  return "::"
+end
+
+make a function called sd_find_substr takes hay, needle returns idx
+  let hn = hay.length
+  let nn = needle.length
+  if nn == 0 then
+    return 0
+  end
+  let i = 0
+  while i <= hn - nn do
+    if substr(hay, i, nn) == needle then
+      return i
+    end
+    let i = i + 1
+  end
+  return -1
+end
+
+# Splits `s` on every occurrence of the (possibly multi-char) `sep`.
+make a function called sd_split takes s, sep returns parts
+  let out = []
+  let rest = s
+  let looping = true
+  while looping do
+    let at = sd_find_substr(rest, sep)
+    if at < 0 then
+      let out = list_push(out, rest)
+      let looping = false
+    else
+      let out = list_push(out, substr(rest, 0, at))
+      let rest = substr(rest, at + sep.length, rest.length - at - sep.length)
+    end
+  end
+  return out
+end
+
+# [[action_name, description], ...] -> one string.
+make a function called sd_encode_actions takes actions returns s
+  let sb = sb_new()
+  let i = 0
+  let n = to_num(list_len(actions))
+  while i < n do
+    if i > 0 then
+      sb_push(sb, sd_action_sep())
+    end
+    let a = actions[i]
+    sb_push(sb, a[0] + sd_field_sep() + a[1])
+    let i = i + 1
+  end
+  return sb_str(sb)
+end
+
+# The inverse of sd_encode_actions. "" decodes to [] (an empty action
+# list is a legitimate, expressible thing -- a task that's discoverable
+# but currently offers nothing).
+make a function called sd_decode_actions takes s returns actions
+  if s == "" then
+    return []
+  end
+  let records = sd_split(s, sd_action_sep())
+  let out = []
+  let i = 0
+  let n = to_num(list_len(records))
+  while i < n do
+    let rec = records[i]
+    let sep = sd_find_substr(rec, sd_field_sep())
+    if sep >= 0 then
+      let name = substr(rec, 0, sep)
+      let desc = substr(rec, sep + sd_field_sep().length, rec.length - sep - sd_field_sep().length)
+      let out = list_push(out, [name, desc])
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# signal_announce(task_name, port, actions) -> done. `port` is the
+# signals port (self_hosting/lib/signals.patlang's signal_claim) this
+# task actually answers requests on -- carried alongside the action list
+# so a discoverer has everything needed to call signal_query directly,
+# no separate lookup step.
+make a function called signal_announce takes task_name, port, actions returns done
+  let description = ("" + port) + sd_field_sep() + sd_encode_actions(actions)
+  return tr_announce(task_name, description)
+end
+
+# Decodes one tr_discover_all/tr_read_one description string back into
+# [port, actions]. Returns ["", []] if the description doesn't parse (a
+# beacon entry that was never written via signal_announce at all, e.g.
+# some other, unrelated use of task_registry.patlang).
+make a function called sd_decode_description takes description returns result
+  let sep = sd_find_substr(description, sd_field_sep())
+  if sep < 0 then
+    return ["", []]
+  end
+  let port = substr(description, 0, sep)
+  let actions_s = substr(description, sep + sd_field_sep().length, description.length - sep - sd_field_sep().length)
+  return [port, sd_decode_actions(actions_s)]
+end
+
+# signal_discover_all(max_age_ms) -> list of [task_name, port, actions],
+# one per currently-fresh (see task_registry.patlang) beacon.
+make a function called signal_discover_all takes max_age_ms returns tasks
+  let raw = tr_discover_all(max_age_ms)
+  let out = []
+  let i = 0
+  let n = to_num(list_len(raw))
+  while i < n do
+    let entry = raw[i]
+    let task_name = entry[0]
+    let decoded = sd_decode_description(entry[1])
+    let out = list_push(out, [task_name, decoded[0], decoded[1]])
+    let i = i + 1
+  end
+  return out
+end
+
+# signal_discover_one(task_name, max_age_ms) -> [port, actions], or
+# ["", []] if task_name hasn't announced (or its last announcement is
+# older than max_age_ms). Convenience wrapper over signal_discover_all
+# rather than a separate lookup path, so both share the exact same
+# staleness rule.
+make a function called signal_discover_one takes task_name, max_age_ms returns result
+  let all = signal_discover_all(max_age_ms)
+  let i = 0
+  let n = to_num(list_len(all))
+  while i < n do
+    if all[i][0] == task_name then
+      return [all[i][1], all[i][2]]
+    end
+    let i = i + 1
+  end
+  return ["", []]
+end
+
+# ---- Slice 2: wrap a discovered task as a callable PatLang object ----
+#
+# PatLang's `new`/`send`/`get` are a plain named property store, not real
+# user-extensible method dispatch (`send`'s only built-in verb is "set"
+# plus a handful of Ruby-style primitive methods -- see hosts.rs's
+# host_send). So "wrap it as an object you can call" means: `signal_wrap`
+# stores {port, actions} as ordinary properties on a named object (the
+# object IS the wrapper, holding just enough state to make calls), and
+# `signal_call` is a plain function -- not something hung off `send`
+# itself -- that reads those properties back out and does the actual
+# dispatch via signals.patlang's signal_query. This still gets you the
+# "call George like a local thing" ergonomics; it just isn't real method
+# dispatch under the hood, because PatLang doesn't have that.
+
+make a function called sd_action_names takes actions returns names
+  let out = []
+  let i = 0
+  let n = to_num(list_len(actions))
+  while i < n do
+    let out = list_push(out, actions[i][0])
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called sd_actions_contains takes actions, action_name returns found
+  let i = 0
+  let n = to_num(list_len(actions))
+  let found = false
+  while i < n do
+    if actions[i][0] == action_name then
+      let found = true
+    end
+    let i = i + 1
+  end
+  return found
+end
+
+make a function called sd_join_comma takes items returns s
+  let sb = sb_new()
+  let i = 0
+  let n = to_num(list_len(items))
+  while i < n do
+    if i > 0 then
+      sb_push(sb, ", ")
+    end
+    sb_push(sb, items[i])
+    let i = i + 1
+  end
+  return sb_str(sb)
+end
+
+# signal_wrap(object_name, port, actions) -> object_name. `object_name`
+# is the caller's own choice (the "call it George" step) -- this doesn't
+# invent a name, it just registers one. Typically called with whatever
+# signal_discover_one/signal_discover_all just returned for a task, but
+# takes port/actions directly rather than a task_name so a caller can
+# also wrap something it learned about some other way (not strictly
+# required to have gone through the beacon at all).
+make a function called signal_wrap takes object_name, port, actions returns wrapped_name
+  new("SignalProxy", object_name)
+  send(object_name, "set", "port", port)
+  send(object_name, "set", "actions", actions)
+  return object_name
+end
+
+# signal_call(object_name, action, payload) -> reply, or an "ERROR: ..."
+# string (PatLang has no try/catch -- a clear sentinel string is this
+# codebase's established way of signaling a recoverable problem without
+# aborting, e.g. patc_compile's own "ERR: ..." returns) if `action` isn't
+# one this object actually advertised. Deliberately checks against the
+# STORED action list from wrap time, not a fresh discovery -- calling
+# an object doesn't implicitly re-verify the remote task is still there
+# or still offers the same things; that staleness is signal_query's own
+# problem (it will fatally error if nothing answers, same as ever).
+make a function called signal_call takes object_name, action, payload returns reply
+  let port = to_num(get(object_name, "port"))
+  let actions = get(object_name, "actions")
+  if not sd_actions_contains(actions, action) then
+    return "ERROR: '" + object_name + "' has no action '" + action + "' -- it only advertised: " + sd_join_comma(sd_action_names(actions))
+  end
+  return signal_query(port, action, payload)
+end
+
+# ---- Slice 3: crude fit-matching ----
+#
+# "Does some discovered task offer something matching what I need" --
+# deliberately narrow: a case-sensitive substring match against each
+# action's name and description, nothing smarter. NOT semantic
+# reasoning, NOT fuzzy matching, NOT an LLM call -- matching this
+# codebase's algorithmic-only discipline everywhere else (the induction
+# engine, the compiler-error-reasoning suggestion table, etc. all reason
+# via direct pattern matching over known/closed vocabularies, never a
+# model call). A task advertising "forecast: get tomorrow's forecast for
+# a city" matches the keyword "forecast" or "city" or "tomorrow", but
+# NOT "weather" (never appears verbatim) even though a human would
+# obviously call that a match -- that gap is the honest, stated
+# boundary of this slice, not an oversight to quietly work around.
+# Remember also task_registry.patlang's own trust caveat: a match here
+# only means the description CLAIMS to do the thing, not that it does.
+
+make a function called sd_action_matches takes action, keyword returns found
+  return sd_find_substr(action[0], keyword) >= 0 or sd_find_substr(action[1], keyword) >= 0
+end
+
+# All of ONE task's actions whose name or description contains keyword.
+make a function called signal_actions_matching takes actions, keyword returns matching
+  let out = []
+  let i = 0
+  let n = to_num(list_len(actions))
+  while i < n do
+    if sd_action_matches(actions[i], keyword) then
+      let out = list_push(out, actions[i])
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# True if ANY of one task's actions match keyword -- the direct answer
+# to "can this specific, already-discovered task do X".
+make a function called signal_task_offers takes actions, keyword returns found
+  return to_num(list_len(signal_actions_matching(actions, keyword))) > 0
+end
+
+# signal_find_capable(keyword, max_age_ms) -> list of [task_name, port,
+# action_name] triples, one per matching action across every currently-
+# fresh discovered task (a task offering two matching actions appears
+# twice, once per action -- deliberately not deduplicated by task, since
+# the caller needs to know WHICH action matched to actually call it).
+# The "hey you there, task that answers this API... what can you do"
+# step from the original idea, automated: instead of asking one already-
+# known task, this asks everyone currently announced at once.
+make a function called signal_find_capable takes keyword, max_age_ms returns matches
+  let all = signal_discover_all(max_age_ms)
+  let out = []
+  let i = 0
+  let n = to_num(list_len(all))
+  while i < n do
+    let entry = all[i]
+    let task_name = entry[0]
+    let port = entry[1]
+    let matching = signal_actions_matching(entry[2], keyword)
+    let j = 0
+    let mn = to_num(list_len(matching))
+    while j < mn do
+      let out = list_push(out, [task_name, port, matching[j][0]])
+      let j = j + 1
+    end
+    let i = i + 1
+  end
+  return out
+end

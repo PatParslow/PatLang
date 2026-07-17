@@ -246,9 +246,9 @@ pub fn budgeted_run(program: &Program, ms: i64, func_name: &str, captured: Value
         st.alive
     };
     if still_alive {
-        Ok(Value::List(vec![Value::String("paused".into()), id_value]))
+        Ok(Value::List(Arc::new(vec![Value::String("paused".into()), id_value])))
     } else {
-        Ok(Value::List(vec![Value::String("done".into()), result]))
+        Ok(Value::List(Arc::new(vec![Value::String("done".into()), result])))
     }
 }
 

@@ -64,7 +64,7 @@ impl Lowerer {
     // Synthesize event handlers for when-blocks at top-level
         let mut handler_counter: usize = 0;
         for s in stmts {
-            if let Stmt::When { event, body } = s {
+            if let Stmt::When { event, body, .. } = s {
                 handler_counter += 1;
                 let hname = format!("__when_{}_{}", event, handler_counter);
                 // Lower body into a standalone function with params 'event_name', 'event_data'
@@ -269,8 +269,9 @@ impl Lowerer {
             "str_intern"|"sc_len"|"sc_code"|"sc_char"|"now_ms"|"read_line"|"byte_length"|"read_file_b64"|"exec_capture"|
             "fact"|"query"|"goal"|"new"|"set_var"|"apply"|
             "tcp_listen"|"tcp_try_listen"|"tcp_connect"|"tcp_accept"|"tcp_accept_timeout"|"sleep_ms"|"tcp_read"|"tcp_write"|"tcp_close"|
+            "spawn"|"is_alive"|"wait"|"kill"|
             "sqrt"|"pow"|"sin"|"cos"|"tan"|"asin"|"acos"|"atan"|"atan2"|"log"|"exp"|
-            "floor"|"ceil"|"round"|"trunc"|"abs"|"numeric_kind"|"type_of"|
+            "floor"|"ceil"|"round"|"trunc"|"abs"|"to_fixed"|"numeric_kind"|"type_of"|
             "parallel_map"|"fiber_new"|"fiber_resume"|"fiber_yield"|"fiber_alive"|
             "budgeted_run"|"budget_check"|
             "list_dir"|"rename_file"|

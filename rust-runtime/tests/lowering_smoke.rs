@@ -57,7 +57,7 @@ fn lower_and_run_list_literal() {
   let mut interp = Interpreter::new();
   register_test_hosts(&mut interp);
   let v = interp.run(&program).expect("run ok");
-  assert_eq!(v, Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]));
+  assert_eq!(v, Value::List(std::sync::Arc::new(vec![Value::Int(1), Value::Int(2), Value::Int(3)])));
 }
 
 #[test]

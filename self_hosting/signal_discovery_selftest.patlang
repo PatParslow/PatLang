@@ -1,0 +1,138 @@
+# Selftest for self_hosting/lib/signal_discovery.patlang (Slice 1 of the
+# signal-discovery/composition backlog item): capability description
+# folded into the presence beacon from task_registry.patlang (Slice 0).
+# Single-process, same reasoning as task_registry_selftest.patlang --
+# this is pure encode/decode + filesystem state, no need to spawn real
+# child processes.
+
+include "lib/test.patlang"
+include "lib/signal_discovery.patlang"
+
+t_init()
+
+# ---- encode/decode round-trip, in isolation from the beacon ----
+
+let actions = [["forecast", "get tomorrow's forecast for a city"], ["alert", "subscribe to severe weather alerts"]]
+let encoded = sd_encode_actions(actions)
+let decoded = sd_decode_actions(encoded)
+check("round-tripped action list has the right length", to_num(list_len(decoded)), 2)
+check("first action name survives round-trip", decoded[0][0], "forecast")
+check("first action description survives round-trip", decoded[0][1], "get tomorrow's forecast for a city")
+check("second action name survives round-trip", decoded[1][0], "alert")
+
+check("an empty action list round-trips to an empty list", to_num(list_len(sd_decode_actions(sd_encode_actions([])))), 0)
+
+# ---- announce + discover, through the real beacon ----
+
+signal_announce("test_weather_bot", 9500, actions)
+signal_announce("test_echo_bot", 9501, [["echo", "repeats whatever you send it"]])
+
+let weather = signal_discover_one("test_weather_bot", 60000)
+check("discovered weather bot's port", weather[0], "9500")
+check("discovered weather bot has 2 actions", to_num(list_len(weather[1])), 2)
+check("discovered weather bot's first action name", weather[1][0][0], "forecast")
+
+let echo = signal_discover_one("test_echo_bot", 60000)
+check("discovered echo bot's port", echo[0], "9501")
+check("discovered echo bot's single action", echo[1][0][0], "echo")
+
+let missing = signal_discover_one("test_task_that_never_announced", 60000)
+check("discovering an unknown task returns an empty action list, not an error", to_num(list_len(missing[1])), 0)
+
+# ---- discover_all sees both, doesn't cross-contaminate their actions ----
+
+let all = signal_discover_all(60000)
+let found_weather = false
+let found_echo = false
+let i = 0
+let n = to_num(list_len(all))
+while i < n do
+  let entry = all[i]
+  if entry[0] == "test_weather_bot" then
+    let found_weather = true
+    check("discover_all's weather bot entry has the right port", entry[1], "9500")
+  end
+  if entry[0] == "test_echo_bot" then
+    let found_echo = true
+    check("discover_all's echo bot entry did not pick up weather's actions", to_num(list_len(entry[2])), 1)
+  end
+  let i = i + 1
+end
+check("discover_all found the weather bot", found_weather, true)
+check("discover_all found the echo bot", found_echo, true)
+
+# ---- a beacon entry that was never written via signal_announce ----
+
+tr_announce("test_plain_beacon", "just a plain description with no field separator at all")
+let plain = signal_discover_one("test_plain_beacon", 60000)
+check("a non-signal_announce beacon entry decodes to an empty action list rather than erroring", to_num(list_len(plain[1])), 0)
+
+# ---- Slice 2: wrap as an object ----
+#
+# NOTE on what's NOT covered here: a genuinely live signal_call (one
+# that actually reaches signal_query and gets a real reply back) needs
+# a second, concurrently-running process holding the port -- PatLang has
+# no non-blocking process-spawn primitive (exec_capture blocks;
+# parallel_map/fibers can't run a live TCP server alongside code that
+# also needs to call it), so that can't be exercised from a single
+# selftest script the way task_registry_selftest.patlang's pure-
+# filesystem checks could be. Verified manually instead (two real
+# processes, one holding the port, one discovering/wrapping/calling it)
+# -- see the Slice 2 section of the memory checkpoint for that
+# transcript. What CAN be verified here, with no live process needed:
+# wrap correctly builds the object, and signal_call's own unknown-action
+# guard fires (and returns a clear error) BEFORE it would ever need to
+# reach signal_query at all.
+
+signal_wrap("george", 9600, [["greet", "says hello back"], ["farewell", "says goodbye"]])
+check("signal_wrap stores the port as a property", get("george", "port"), 9600)
+let george_actions = get("george", "actions")
+check("signal_wrap stores the action list as a property", to_num(list_len(george_actions)), 2)
+check("signal_wrap's stored actions keep their name", george_actions[0][0], "greet")
+
+let bad_call = signal_call("george", "nonexistent_action", "")
+check("calling an action the object never advertised returns a clear error, not a fatal connect attempt", contains_text(bad_call, "ERROR"), true)
+check("the error names the object", contains_text(bad_call, "george"), true)
+check("the error lists what WAS advertised, as an actionable hint", contains_text(bad_call, "greet"), true)
+
+# ---- Slice 3: crude fit-matching ----
+
+let found_forecast = signal_actions_matching(actions, "forecast")
+check("keyword matching an action NAME finds it", to_num(list_len(found_forecast)), 1)
+check("keyword-matched action is the right one", found_forecast[0][0], "forecast")
+
+let found_severe = signal_actions_matching(actions, "severe")
+check("keyword matching only in the DESCRIPTION still finds it", to_num(list_len(found_severe)), 1)
+check("description-matched action is the right one", found_severe[0][0], "alert")
+
+let found_nothing = signal_actions_matching(actions, "nonexistent_keyword_xyz")
+check("a keyword matching nothing returns an empty list", to_num(list_len(found_nothing)), 0)
+
+check("signal_task_offers is true for a real match", signal_task_offers(actions, "forecast"), true)
+check("signal_task_offers is false for a non-match", signal_task_offers(actions, "nonexistent_keyword_xyz"), false)
+
+# Honest boundary check: "meteorology" is a plausible synonym-ish term
+# for a weather-forecasting bot but never appears verbatim in either
+# announced action, so a crude substring matcher correctly (if
+# unhelpfully, by design) reports no match -- proving this is really
+# substring matching, not secretly smarter than advertised.
+check("a plausible-sounding but non-literal keyword correctly finds nothing (the stated honest boundary of this slice)", signal_task_offers(actions, "meteorology"), false)
+
+let capable = signal_find_capable("echo", 60000)
+let found_echo_capable = false
+let ci = 0
+let cn = to_num(list_len(capable))
+while ci < cn do
+  if capable[ci][0] == "test_echo_bot" then
+    let found_echo_capable = true
+    check("signal_find_capable's match carries the right port", capable[ci][1], "9501")
+    check("signal_find_capable's match carries the right action name", capable[ci][2], "echo")
+  end
+  let ci = ci + 1
+end
+check("signal_find_capable finds the echo bot across ALL discovered tasks, not just one", found_echo_capable, true)
+
+let capable_none = signal_find_capable("nonexistent_keyword_xyz", 60000)
+check("signal_find_capable across all tasks finds nothing for a non-matching keyword", to_num(list_len(capable_none)), 0)
+
+t_report()

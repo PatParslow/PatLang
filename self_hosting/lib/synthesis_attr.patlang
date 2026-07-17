@@ -1,0 +1,191 @@
+# =============================================================================
+# Milestone 12 of the BDD-driven inductive synthesis system (see plan
+# "wondering-about-extending-patlang-modular-shore"): cross-entity
+# attribute comparison -- the third and last of the three capability gaps
+# found stress-testing the engine against fantpop-patlang. Marriage
+# eligibility needs "X and Y are the SAME social class" and "X and Y are
+# DIFFERENT sexes" -- comparing two individuals' attribute VALUES against
+# each other, not just checking whether a predicate holds of one entity
+# in isolation (M3/M7) or two entities share an adjacent node (M11).
+#
+# Two comparisons, both over attribute facts of shape [pred, entity,
+# value] (via synth5_fact_binary(pred, entity, value)):
+#
+#   "same"  -- target(X, Y) :- P(X, V), P(Y, V).
+#     X and Y's values for P unify against the SAME shared variable V --
+#     an ordinary join, no new engine primitive needed.
+#   "diff"  -- target(X, Y) :- P(X, VX), P(Y, VY), neq(VX, VY).
+#     X and Y's values for P must be genuinely UNEQUAL -- this needed a
+#     real new engine primitive, since nothing in the resolver could
+#     previously express "these two already-bound terms must differ."
+#     `neq/2` is a built-in comparison predicate (rust-runtime/src/ir/
+#     hosts.rs's resolve_conjuncts, mirrored in codegen.rs's embedded
+#     PRELUDE_LOGIC and self_hosting/lib/runtime_rs.patlang), not a fact
+#     looked up in RULES -- it walks its two arguments through the
+#     current substitution and passes/fails on plain string inequality,
+#     the same "ground term identity" convention unify_args already uses
+#     for plain unification.
+# =============================================================================
+
+include "synthesis_relation.patlang"
+
+# The value bound to `pred(entity, V)` in facts, or "" if no such fact
+# exists (facts are ground -- at most one value per (pred, entity) pair
+# is the intended shape, same convention M11's synth11_predecessors
+# assumes of its own facts).
+make a function called synth12_attr_value takes facts, pred, entity returns value_or_empty
+  let i = 0
+  let n = to_num(list_len(facts))
+  let found = ""
+  while i < n do
+    let f = facts[i]
+    if to_num(list_len(f)) == 3 then
+      if (f[0] == pred) and (f[1] == entity) then
+        let found = f[2]
+      end
+    end
+    let i = i + 1
+  end
+  return found
+end
+
+make a function called synth12_str_list_contains takes xs, needle returns found
+  let i = 0
+  let n = to_num(list_len(xs))
+  let found = false
+  while i < n do
+    if xs[i] == needle then
+      let found = true
+    end
+    let i = i + 1
+  end
+  return found
+end
+
+# ---- "same value" comparisons ----
+
+make a function called synth12_same_candidates takes facts, candidate_preds, x, y returns preds
+  let out = []
+  let i = 0
+  let n = to_num(list_len(candidate_preds))
+  while i < n do
+    let p = candidate_preds[i]
+    let vx = synth12_attr_value(facts, p, x)
+    let vy = synth12_attr_value(facts, p, y)
+    if (vx != "") and (vy != "") and (vx == vy) then
+      let out = list_push(out, p)
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called synth12_emit_same takes target_pred, attr_pred returns src
+  return "rule " + target_pred + "(X, Y) :- " + attr_pred + "(X, V), " + attr_pred + "(Y, V).\n"
+end
+
+# ---- "different value" comparisons ----
+
+make a function called synth12_diff_candidates takes facts, candidate_preds, x, y returns preds
+  let out = []
+  let i = 0
+  let n = to_num(list_len(candidate_preds))
+  while i < n do
+    let p = candidate_preds[i]
+    let vx = synth12_attr_value(facts, p, x)
+    let vy = synth12_attr_value(facts, p, y)
+    if (vx != "") and (vy != "") and (vx != vy) then
+      let out = list_push(out, p)
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called synth12_emit_diff takes target_pred, attr_pred returns src
+  return "rule " + target_pred + "(X, Y) :- " + attr_pred + "(X, VX), " + attr_pred + "(Y, VY), neq(VX, VY).\n"
+end
+
+# ---- shared LGG scaffolding: witness every positive pair against the
+# candidate pool (via whichever of the two candidate functions above is
+# passed in), intersect across pairs (a candidate attribute predicate
+# only survives if EVERY positive pair witnesses it, same parsimony
+# discipline as every earlier milestone), and report missing pairs
+# (real evidence gaps) separately from a mismatched hypothesis. ----
+
+make a function called synth12_lgg takes pos_pairs, facts, candidate_preds, candidates_fn returns result
+  let missing = []
+  let candidates = []
+  let have = false
+  let i = 0
+  let n = to_num(list_len(pos_pairs))
+  while i < n do
+    let pair = pos_pairs[i]
+    let this_candidates = apply(candidates_fn, facts, candidate_preds, pair[0], pair[1])
+    if to_num(list_len(this_candidates)) == 0 then
+      let missing = list_push(missing, pair)
+    else
+      if not have then
+        let candidates = this_candidates
+        let have = true
+      else
+        let kept = []
+        let ci = 0
+        let cn = to_num(list_len(candidates))
+        while ci < cn do
+          if synth12_str_list_contains(this_candidates, candidates[ci]) then
+            let kept = list_push(kept, candidates[ci])
+          end
+          let ci = ci + 1
+        end
+        let candidates = kept
+      end
+    end
+    let i = i + 1
+  end
+  return [candidates, missing]
+end
+
+# Same diagnosis vocabulary as milestones 5-11: ["ok", attr_pred] /
+# ["no_witness", missing_pairs] / ["conflict", offending]. `mode` is
+# "same" or "diff"; `queries` are milestone 10's 2-arg shape ([pred, x,
+# y, expect]) -- reuses synth10_diagnose_hypothesis unchanged.
+make a function called synth12_induce takes target_pred, pos_pairs, queries, facts, candidate_preds, mode returns diagnosis
+  let candidates_fn = "synth12_same_candidates"
+  let emit_fn = "synth12_emit_same"
+  if mode == "diff" then
+    let candidates_fn = "synth12_diff_candidates"
+    let emit_fn = "synth12_emit_diff"
+  end
+  let r = synth12_lgg(pos_pairs, facts, candidate_preds, candidates_fn)
+  let candidates = r[0]
+  let missing = r[1]
+  if to_num(list_len(missing)) > 0 then
+    return ["no_witness", missing]
+  end
+  if to_num(list_len(candidates)) == 0 then
+    return ["no_witness", pos_pairs]
+  end
+  let attr_pred = candidates[0]
+  let background_src = synth5_facts_to_src(facts)
+  let clause_src = apply(emit_fn, target_pred, attr_pred)
+  let results = synth10_diagnose_hypothesis(background_src, clause_src, queries)
+  let offending = []
+  let i = 0
+  let n = to_num(list_len(queries))
+  while i < n do
+    if not results[i] then
+      let q = queries[i]
+      let note = "negative pair wrongly covered by the induced comparison -- background facts don't yet distinguish it from the positives"
+      if q[3] then
+        let note = "positive pair not covered -- the generalized comparison dropped something this pair needed"
+      end
+      let offending = list_push(offending, [q[0], q[1], q[2], q[3], note])
+    end
+    let i = i + 1
+  end
+  if to_num(list_len(offending)) == 0 then
+    return ["ok", attr_pred]
+  end
+  return ["conflict", offending]
+end

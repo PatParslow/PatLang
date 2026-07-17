@@ -14,6 +14,42 @@ thread_local! {
     static PRINTED: RefCell<Vec<String>> = RefCell::new(Vec::new());
 }
 
+/// Wraps a spawned `Child` so it's killed if this guard is dropped
+/// without `.wait()` having already reaped it -- e.g. an `assert!`
+/// between spawning a test server and the test's own final `child.wait()`
+/// panics. Plain `std::process::Child` is NOT killed on drop (a well-known
+/// std gotcha), so without this a panicking test leaks the server process,
+/// which then holds its own .exe file locked on Windows and breaks the
+/// NEXT run of the same test with an unrelated-looking compile/write
+/// failure -- confirmed as a real, reproduced failure mode this session
+/// (gui_server_serves_page_and_live_json), not a hypothetical concern.
+struct KillOnDrop(Option<std::process::Child>);
+
+impl KillOnDrop {
+    fn new(child: std::process::Child) -> Self { Self(Some(child)) }
+    fn wait(mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.0.take().expect("wait called once").wait()
+    }
+}
+
+impl std::ops::Deref for KillOnDrop {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target { self.0.as_ref().expect("not yet waited") }
+}
+
+impl std::ops::DerefMut for KillOnDrop {
+    fn deref_mut(&mut self) -> &mut Self::Target { self.0.as_mut().expect("not yet waited") }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 fn capture_print(args: &[Value]) -> Result<Value, String> {
     let s = match args.get(0) {
         Some(Value::String(s)) => s.clone(),
@@ -66,7 +102,7 @@ fn wasm_target_compiles_and_runs_feature_demo() {
 
     let manifest = env!("CARGO_MANIFEST_DIR");
     let demo_path = format!("{}/../self_hosting/examples/feature_demo.patlang", manifest).replace('\\', "/");
-    let out_dir = std::env::temp_dir().join("patlang_targets_test");
+    let out_dir = std::env::temp_dir().join("patlang_targets_test").join("wasm_target_compiles_and_runs_feature_demo");
     let _ = std::fs::create_dir_all(&out_dir);
     let wasm_path = out_dir.join("feature_demo.wasm");
 
@@ -109,7 +145,7 @@ fn wasm_target_compiles_and_runs_feature_demo() {
 fn gui_page_is_well_formed() {
     let manifest = env!("CARGO_MANIFEST_DIR");
     let read = |rel: &str| std::fs::read_to_string(format!("{}/../self_hosting/{}", manifest, rel)).expect("read");
-    let out_dir = std::env::temp_dir().join("patlang_targets_test");
+    let out_dir = std::env::temp_dir().join("patlang_targets_test").join("gui_page_is_well_formed");
     let _ = std::fs::create_dir_all(&out_dir);
 
     // Run the GUI generator (html lib + demo) under the interpreter, with
@@ -150,7 +186,7 @@ fn gui_server_serves_page_and_live_json() {
     }
     let manifest = env!("CARGO_MANIFEST_DIR");
     let read = |rel: &str| std::fs::read_to_string(format!("{}/../self_hosting/{}", manifest, rel)).expect("read");
-    let out_dir = std::env::temp_dir().join("patlang_targets_test");
+    let out_dir = std::env::temp_dir().join("patlang_targets_test").join("gui_server_serves_page_and_live_json");
     let _ = std::fs::create_dir_all(&out_dir);
     let exe_path = out_dir.join(if cfg!(windows) { "gui_server.exe" } else { "gui_server" });
 
@@ -173,9 +209,9 @@ fn gui_server_serves_page_and_live_json() {
 
     // Spawn, read port, fetch page + data
     use std::io::{BufRead, BufReader, Read, Write};
-    let mut child = std::process::Command::new(&exe_path)
+    let mut child = KillOnDrop::new(std::process::Command::new(&exe_path)
         .stdout(std::process::Stdio::piped())
-        .spawn().expect("spawn gui server");
+        .spawn().expect("spawn gui server"));
     let stdout = child.stdout.take().expect("child stdout");
     let mut reader = BufReader::new(stdout);
     let mut first = String::new();
@@ -209,7 +245,7 @@ fn stage1_escapes_and_short_circuit() {
         eprintln!("rustc not found; skipping");
         return;
     }
-    let out_dir = std::env::temp_dir().join("patlang_targets_test");
+    let out_dir = std::env::temp_dir().join("patlang_targets_test").join("stage1_escapes_and_short_circuit");
     let _ = std::fs::create_dir_all(&out_dir);
     let exe_path = out_dir.join(if cfg!(windows) { "sc_test.exe" } else { "sc_test" });
 
@@ -254,7 +290,7 @@ fn stage1_multiline_lists_and_calls() {
         eprintln!("rustc not found; skipping");
         return;
     }
-    let out_dir = std::env::temp_dir().join("patlang_targets_test");
+    let out_dir = std::env::temp_dir().join("patlang_targets_test").join("stage1_multiline_lists_and_calls");
     let _ = std::fs::create_dir_all(&out_dir);
     let exe_path = out_dir.join(if cfg!(windows) { "ml_test.exe" } else { "ml_test" });
 
@@ -296,7 +332,7 @@ fn stage1_closures_native() {
         eprintln!("rustc not found; skipping");
         return;
     }
-    let out_dir = std::env::temp_dir().join("patlang_targets_test");
+    let out_dir = std::env::temp_dir().join("patlang_targets_test").join("stage1_closures_native");
     let _ = std::fs::create_dir_all(&out_dir);
     let exe_path = out_dir.join(if cfg!(windows) { "closures_test.exe" } else { "closures_test" });
 
@@ -352,7 +388,7 @@ fn event_loop_closures_serve_and_stop() {
     }
     let manifest = env!("CARGO_MANIFEST_DIR");
     let read = |rel: &str| std::fs::read_to_string(format!("{}/../self_hosting/{}", manifest, rel)).expect("read");
-    let out_dir = std::env::temp_dir().join("patlang_targets_test");
+    let out_dir = std::env::temp_dir().join("patlang_targets_test").join("event_loop_closures_serve_and_stop");
     let _ = std::fs::create_dir_all(&out_dir);
     let exe_path = out_dir.join(if cfg!(windows) { "event_loop_demo.exe" } else { "event_loop_demo" });
 
@@ -373,9 +409,9 @@ fn event_loop_closures_serve_and_stop() {
     assert!(lines.iter().any(|l| l == "COMPILED"), "event loop demo did not compile: {:?}", lines);
 
     use std::io::{BufRead, BufReader, Read, Write};
-    let mut child = std::process::Command::new(&exe_path)
+    let mut child = KillOnDrop::new(std::process::Command::new(&exe_path)
         .stdout(std::process::Stdio::piped())
-        .spawn().expect("spawn event loop demo");
+        .spawn().expect("spawn event loop demo"));
     let stdout = child.stdout.take().expect("child stdout");
     let mut reader = BufReader::new(stdout);
     let mut first = String::new();

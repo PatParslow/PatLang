@@ -156,6 +156,10 @@ const HOST_CHUNK_TABLE: &[(&str, ChunkId)] = &[
     ("tcp_read", ChunkId::Networking),
     ("tcp_write", ChunkId::Networking),
     ("tcp_close", ChunkId::Networking),
+    ("spawn", ChunkId::Networking),
+    ("is_alive", ChunkId::Networking),
+    ("wait", ChunkId::Networking),
+    ("kill", ChunkId::Networking),
     ("parse_tiny_source", ChunkId::CodegenBootstrap),
     ("lower_and_compile", ChunkId::CodegenBootstrap),
     ("emit_rust_for", ChunkId::CodegenBootstrap),
@@ -180,6 +184,7 @@ const HOST_CHUNK_TABLE: &[(&str, ChunkId)] = &[
     ("round", ChunkId::Math),
     ("trunc", ChunkId::Math),
     ("abs", ChunkId::Math),
+    ("to_fixed", ChunkId::Math),
     ("numeric_kind", ChunkId::Math),
 ];
 
@@ -245,8 +250,13 @@ impl RustCodegen {
 
 use std::collections::HashMap;
 use std::cell::RefCell;
+// Arc is needed unconditionally -- Value::List(Arc<Vec<Value>>) is the
+// same on every target -- while Condvar/Mutex/OnceLock/the atomics below
+// are only meaningful when real threading exists (gated out for plain
+// wasm32 without the "atomics" target feature).
+use std::sync::Arc;
 #[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 #[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -489,10 +499,10 @@ impl Host {
                 if args.len() != 2 { return Err("list_push: expected 2 args".into()); }
                 let mut xs = match &args[0] {
                     Value::List(xs) => xs.clone(),
-                    Value::Unit => Vec::new(),
+                    Value::Unit => Arc::new(Vec::new()),
                     _ => return Err("list_push: expected list".into()),
                 };
-                xs.push(args[1].clone());
+                Arc::make_mut(&mut xs).push(args[1].clone());
                 Ok(Value::List(xs))
             }
             "list_set" => {
@@ -504,7 +514,7 @@ impl Host {
                 };
                 let idx = match &args[1] { Value::Number(n) => *n as usize, Value::String(s) => s.parse::<usize>().unwrap_or(usize::MAX), _ => usize::MAX };
                 if idx >= xs.len() { return Err(format!("list_set: index {} out of range (len {})", idx, xs.len())); }
-                xs[idx] = args[2].clone();
+                Arc::make_mut(&mut xs)[idx] = args[2].clone();
                 Ok(Value::List(xs))
             }
             "bit_get" => {
@@ -571,7 +581,7 @@ impl Host {
                 let prefix = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => String::new() };
                 let mut matching: Vec<String> = vfs_keys().into_iter().filter(|k| k.starts_with(&prefix)).collect();
                 matching.sort();
-                Ok(Value::List(matching.into_iter().map(Value::String).collect()))
+                Ok(Value::List(Arc::new(matching.into_iter().map(Value::String).collect())))
             }
             "vfs_delete" => {
                 let path = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => String::new() };
@@ -822,9 +832,9 @@ mod fibers {
             st.alive
         };
         if still_alive {
-            Ok(Value::List(vec![Value::String("paused".into()), id_value]))
+            Ok(Value::List(Arc::new(vec![Value::String("paused".into()), id_value])))
         } else {
-            Ok(Value::List(vec![Value::String("done".into()), result]))
+            Ok(Value::List(Arc::new(vec![Value::String("done".into()), result])))
         }
     }
 
@@ -948,7 +958,7 @@ fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Va
                             }).collect();
                             handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("parallel_map: a worker thread panicked".to_string()))).collect()
                         });
-                        stack.push(Value::List(results?));
+                        stack.push(Value::List(Arc::new(results?)));
                     }
                 } else if n == "fiber_new" {
                     #[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
@@ -996,7 +1006,7 @@ fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Va
                             Some(Value::String(s)) => s.clone(),
                             other => return Err(format!("budgeted_run: expected a function name string, got {:?}", other)),
                         };
-                        let captured = args.get(2).cloned().unwrap_or(Value::List(vec![]));
+                        let captured = args.get(2).cloned().unwrap_or(Value::List(Arc::new(vec![])));
                         let existing = args.get(3).cloned().unwrap_or(Value::Unit);
                         stack.push(fibers::budgeted_run(program, ms, &fname, captured, &existing)?);
                     }
@@ -1042,7 +1052,7 @@ fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Va
                     other => return Err(format!("cannot call non-closure value: {:?}", other)),
                 }
             }
-            Instr::BuildList(n) => { let n=*n; if stack.len()<n {return Err("stack underflow".into());} let start=stack.len()-n; let items: Vec<Value>=stack.drain(start..).collect(); stack.push(Value::List(items)); }
+            Instr::BuildList(n) => { let n=*n; if stack.len()<n {return Err("stack underflow".into());} let start=stack.len()-n; let items: Vec<Value>=stack.drain(start..).collect(); stack.push(Value::List(Arc::new(items))); }
             Instr::Return => { return Ok(stack.pop().unwrap_or(Value::Unit)); }
         }
         pc += 1;
@@ -1133,7 +1143,7 @@ enum Value {
     Int(i64),
     Float(f64),
     String(String),
-    List(Vec<Value>),
+    List(Arc<Vec<Value>>),
     Object(HashMap<String, Value>),
     Closure { func_name: String, captured: Vec<(String, Value)> },
 }
@@ -1288,7 +1298,7 @@ enum Value {
     Rational(RationalT),
     Complex(ComplexT),
     String(String),
-    List(Vec<Value>),
+    List(Arc<Vec<Value>>),
     Object(HashMap<String, Value>),
     Closure { func_name: String, captured: Vec<(String, Value)> },
 }
@@ -2145,6 +2155,21 @@ fn host_call_math_inner(name: &str, args: &[Value]) -> Result<Value, String> {
         "round" => math_round_like(args.get(0).ok_or("round: expected 1 arg")?, "round"),
         "trunc" => math_round_like(args.get(0).ok_or("trunc: expected 1 arg")?, "trunc"),
         "abs" => math_abs(args),
+        "to_fixed" => {
+            // arg_num only recognizes Value::Number/String -- host_coerce_arg
+            // (see the note above `impl Host`) deliberately leaves BigInt/
+            // Rational/Complex un-flattened so exactness-preserving callers
+            // like `print` still see them, which means arg_num would wrongly
+            // reject e.g. to_fixed(1/3, 4) with "expected number". Value::
+            // as_number() (defined just above, PRELUDE_NUMERIC_TOWER) already
+            // handles every numeric variant losslessly-where-possible, so use
+            // it directly instead, the same way math_sqrt/math_round_like/
+            // math_abs in this same chunk already pattern-match Value
+            // directly rather than going through arg_num.
+            let x = args.get(0).ok_or("to_fixed: expected 2 args")?.as_number().map_err(|_| "to_fixed: expected number".to_string())?;
+            let places = arg_num(args, 1, "to_fixed")?.max(0.0) as usize;
+            Ok(Value::String(format!("{:.*}", places, x)))
+        }
         "numeric_kind" => math_numeric_kind(args),
         _ => Err(format!("host fn '{}' not found", name)),
     }
@@ -2153,7 +2178,7 @@ fn host_call_math_inner(name: &str, args: &[Value]) -> Result<Value, String> {
 fn host_call_math(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match name {
         "sqrt" | "pow" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2" | "log" | "exp"
-        | "floor" | "ceil" | "round" | "trunc" | "abs" | "numeric_kind" => Some(host_call_math_inner(name, args)),
+        | "floor" | "ceil" | "round" | "trunc" | "abs" | "to_fixed" | "numeric_kind" => Some(host_call_math_inner(name, args)),
         _ => None,
     }
 }
@@ -2283,7 +2308,7 @@ fn host_call_collections_handles_inner(name: &str, args: &[Value]) -> Result<Val
                 let id = arg_usize(&args, 0, "vec_to_list")?;
                 VECS.with(|v| {
                     let b = v.borrow();
-                    b.get(id).ok_or_else(|| format!("vec_to_list: unknown vec {}", id)).map(|xs| Value::List(xs.clone()))
+                    b.get(id).ok_or_else(|| format!("vec_to_list: unknown vec {}", id)).map(|xs| Value::List(Arc::new(xs.clone())))
                 })
             }
             "str_intern" => {
@@ -2404,7 +2429,7 @@ fn host_call_collections_handles(name: &str, args: &[Value]) -> Option<Result<Va
                     })
                     .collect();
                 names.sort();
-                Ok(Value::List(names.into_iter().map(Value::String).collect()))
+                Ok(Value::List(Arc::new(names.into_iter().map(Value::String).collect())))
             }
             "rename_file" => {
                 // rename_file(from, to) -> Bool
@@ -2587,7 +2612,7 @@ fn host_call_io_misc_inner(name: &str, args: &[Value]) -> Result<Value, String> 
                 // argv() -> List of user arguments (program name stripped)
                 let mut rest: Vec<String> = std::env::args().collect();
                 if !rest.is_empty() { rest.remove(0); }
-                Ok(Value::List(rest.into_iter().map(Value::String).collect()))
+                Ok(Value::List(Arc::new(rest.into_iter().map(Value::String).collect())))
             }
             "print" => {
                 if let Some(x) = args.get(0) {
@@ -2818,6 +2843,12 @@ fn resolve_conjuncts(body: &[(String, Vec<String>)], subst: &LogicSubst, depth: 
     let (pred, args) = &body[0];
     let rest = &body[1..];
     let applied_args = logic_apply_subst(args, subst);
+    if pred == "neq" {
+        if applied_args.len() == 2 && applied_args[0] != applied_args[1] {
+            return resolve_conjuncts(rest, subst, depth);
+        }
+        return Vec::new();
+    }
     let mut out = Vec::new();
     for s2 in solve_goal(pred, &applied_args, subst, depth) {
         out.extend(resolve_conjuncts(rest, &s2, depth));
@@ -2833,7 +2864,7 @@ fn value_to_str_list(v: &Value) -> Vec<String> {
 }
 
 fn parse_ground_facts(v: &Value) -> Vec<GroundFact> {
-    let items = match v { Value::List(xs) => xs.clone(), _ => Vec::new() };
+    let items: Vec<Value> = match v { Value::List(xs) => (**xs).clone(), _ => Vec::new() };
     let mut out = Vec::new();
     for item in items {
         if let Value::List(pair) = &item {
@@ -2941,7 +2972,7 @@ fn host_call_logic_inner(name: &str, args: &[Value]) -> Result<Value, String> {
                 if args.len() != 3 { return Err("rule_add: expected 3 args (head_pred, head_args_list, body_list)".into()); }
                 let head_pred = match &args[0] { Value::String(s) => s.clone(), v => to_s(v) };
                 let head_args = value_to_str_list(&args[1]);
-                let body_items = match &args[2] { Value::List(xs) => xs.clone(), _ => Vec::new() };
+                let body_items: Vec<Value> = match &args[2] { Value::List(xs) => (**xs).clone(), _ => Vec::new() };
                 let mut body = Vec::new();
                 for item in body_items {
                     if let Value::List(pair) = &item {
@@ -2960,9 +2991,9 @@ fn host_call_logic_inner(name: &str, args: &[Value]) -> Result<Value, String> {
                 let empty: LogicSubst = HashMap::new();
                 let solutions = solve_goal(&pred, &query_args, &empty, 0);
                 let out: Vec<Value> = solutions.iter().map(|s| {
-                    Value::List(query_args.iter().map(|a| Value::String(logic_walk(a, s))).collect())
+                    Value::List(Arc::new(query_args.iter().map(|a| Value::String(logic_walk(a, s))).collect()))
                 }).collect();
-                Ok(Value::List(out))
+                Ok(Value::List(Arc::new(out)))
             }
             "action_add" => {
                 if args.len() != 5 { return Err("action_add: expected 5 args (name, preconds, add_effects, del_effects, cost)".into()); }
@@ -3014,7 +3045,7 @@ fn host_call_logic_inner(name: &str, args: &[Value]) -> Result<Value, String> {
                         }
                     }
                 }
-                Ok(Value::List(found.unwrap_or_default().into_iter().map(Value::String).collect()))
+                Ok(Value::List(Arc::new(found.unwrap_or_default().into_iter().map(Value::String).collect())))
             }
                     _ => Err(format!("host fn '{}' not found", name)),
     }
@@ -3076,6 +3107,7 @@ fn host_call_contracts(name: &str, args: &[Value]) -> Option<Result<Value, Strin
     static LISTENERS: RefCell<HashMap<u16, std::net::TcpListener>> = RefCell::new(HashMap::new());
     static CONNS: RefCell<HashMap<usize, std::net::TcpStream>> = RefCell::new(HashMap::new());
     static NEXT_CONN: RefCell<usize> = RefCell::new(1);
+    static CHILD_PROCS: RefCell<HashMap<u32, std::process::Child>> = RefCell::new(HashMap::new());
 }
 
 fn host_call_networking_inner(name: &str, args: &[Value]) -> Result<Value, String> {
@@ -3200,13 +3232,59 @@ fn host_call_networking_inner(name: &str, args: &[Value]) -> Result<Value, Strin
                 }
                 Ok(Value::Unit)
             }
+            "spawn" => {
+                let path = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => return Err("spawn: expected program path".into()) };
+                let extra: Vec<String> = args[1..].iter().filter_map(|v| match v { Value::String(s) => Some(s.clone()), _ => None }).collect();
+                let child = std::process::Command::new(&path).args(&extra)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn().map_err(|e| format!("spawn: {}: {}", path, e))?;
+                let pid = child.id();
+                CHILD_PROCS.with(|c| c.borrow_mut().insert(pid, child));
+                Ok(Value::Int(pid as i64))
+            }
+            "is_alive" => {
+                let pid = arg_num(&args, 0, "is_alive")? as u32;
+                let alive = CHILD_PROCS.with(|c| {
+                    let mut b = c.borrow_mut();
+                    match b.get_mut(&pid) {
+                        Some(child) => matches!(child.try_wait(), Ok(None)),
+                        None => false,
+                    }
+                });
+                Ok(Value::Bool(alive))
+            }
+            "wait" => {
+                let pid = arg_num(&args, 0, "wait")? as u32;
+                let child = CHILD_PROCS.with(|c| c.borrow_mut().remove(&pid));
+                match child {
+                    Some(mut child) => {
+                        let status = child.wait().map_err(|e| format!("wait: {}: {}", pid, e))?;
+                        Ok(Value::Int(status.code().unwrap_or(-1) as i64))
+                    }
+                    None => Err(format!("wait: unknown or already-reaped pid {}", pid)),
+                }
+            }
+            "kill" => {
+                let pid = arg_num(&args, 0, "kill")? as u32;
+                let child = CHILD_PROCS.with(|c| c.borrow_mut().remove(&pid));
+                match child {
+                    Some(mut child) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        Ok(Value::Bool(true))
+                    }
+                    None => Ok(Value::Bool(false)),
+                }
+            }
                     _ => Err(format!("host fn '{}' not found", name)),
     }
 }
 
 fn host_call_networking(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match name {
-        "tcp_listen" | "tcp_try_listen" | "tcp_connect" | "tcp_accept" | "sleep_ms" | "tcp_accept_timeout" | "tcp_read" | "tcp_write" | "tcp_close" => Some(host_call_networking_inner(name, args)),
+        "tcp_listen" | "tcp_try_listen" | "tcp_connect" | "tcp_accept" | "sleep_ms" | "tcp_accept_timeout" | "tcp_read" | "tcp_write" | "tcp_close"
+        | "spawn" | "is_alive" | "wait" | "kill" => Some(host_call_networking_inner(name, args)),
         _ => None,
     }
 }
@@ -3759,7 +3837,7 @@ fn host_call_codegen_bootstrap_inner(name: &str, args: &[Value]) -> Result<Value
                     .unwrap_or_else(|| "patc_native.patlang".to_string());
                 full.push(format!("./{}", fake0));
                 full.extend(rest);
-                Ok(Value::List(full.into_iter().map(Value::String).collect()))
+                Ok(Value::List(Arc::new(full.into_iter().map(Value::String).collect())))
             }
             "rustc_build" => {
                 // rustc_build(rust_source, out_path[, target_triple[, opt_level]]) -> artifact path.
@@ -3826,7 +3904,7 @@ fn host_call_codegen_bootstrap_inner(name: &str, args: &[Value]) -> Result<Value
                 // run_ir(ir_shape): decode a freshly lowered IR shape and run
                 // it on this runtime's VM (the browser-playground back end)
                 fn sl(v: &Value) -> Result<&Vec<Value>, String> {
-                    match v { Value::List(xs) => Ok(xs), _ => Err("run_ir: expected list node".into()) }
+                    match v { Value::List(xs) => Ok(xs.as_ref()), _ => Err("run_ir: expected list node".into()) }
                 }
                 fn st(xs: &[Value], i: usize) -> Result<String, String> {
                     match xs.get(i) { Some(Value::String(s)) => Ok(s.clone()), _ => Err("run_ir: expected string".into()) }

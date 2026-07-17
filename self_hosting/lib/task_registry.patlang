@@ -1,0 +1,121 @@
+# A live "who's out there" presence registry for PatLang tasks, built
+# entirely on top of self_hosting/lib/queue.patlang -- no new host
+# functions, no networking, no ports. A running task periodically
+# announces "I am here" (overwriting its own previous announcement, not
+# accumulating a log of them), and a discoverer reads every current
+# announcement, ignoring any whose timestamp is older than a caller-given
+# staleness threshold. A crashed task's last announcement simply stops
+# being refreshed and ages out on its own -- no explicit deregistration
+# step, no heartbeat-monitor process, no new failure mode to handle.
+#
+# Deliberately NOT the same shape as queue.patlang's own queue_publish/
+# queue_consume (an accumulating, acked work log) -- a presence beacon
+# only ever needs its LATEST state, so this writes a single-row file
+# directly via q_write on every announce, keeping each task's own
+# registry file at exactly one line forever regardless of how long the
+# process runs or how often it re-announces.
+#
+# One file per announcing task: reuses queue.patlang's own
+# queue_writer_topic("task_registry", name) naming convention (so no two
+# announcing tasks ever race on the same file -- the SAME reason
+# queue.patlang built that helper in the first place, for its own
+# multi-writer case), giving files like .patlang_queue/task_registry__george.log.
+#
+# Wire format inside that one row's payload field: "<timestamp_ms><TAB><description>".
+# q_parse_line (queue.patlang) already treats everything after the row's
+# own id/status fields as one opaque payload string, tabs and all -- so
+# embedding a second tab-separated field inside it needs no changes
+# there, just one more split on this module's own side.
+#
+# HONEST LIMITATION, not solved here: an announcement's description is
+# entirely self-reported. Nothing in this module verifies a task's
+# claimed capabilities are honest, or even that the announcing process
+# is who it says it is -- a bad actor can publish a false description
+# just as easily as a true one. Treat discovery as "here's what this
+# task CLAIMS to offer", not a verified guarantee -- any caller that
+# needs real assurance has to verify by actually trying the capability,
+# a separate, harder problem this module doesn't attempt.
+
+include "queue.patlang"
+
+make a function called tr_registry_base returns name
+  return "task_registry"
+end
+
+make a function called tr_topic_for takes task_name returns topic
+  return queue_writer_topic(tr_registry_base(), task_name)
+end
+
+# Strips the "<name>__" writer-topic prefix queue_writer_topic itself
+# adds, recovering the plain task name from a registry filename/topic.
+make a function called tr_name_from_topic takes topic returns task_name
+  let prefix = tr_registry_base() + "__"
+  if str_starts_with(topic, prefix) then
+    return substr(topic, prefix.length, topic.length - prefix.length)
+  end
+  return ""
+end
+
+# tr_announce(task_name, description) -> done. Call this once at startup
+# AND again on every heartbeat tick thereafter (the caller owns the
+# timing/interval -- this module has no timer of its own) to keep the
+# announcement fresh. Each call overwrites task_name's own registry file
+# with a fresh timestamp, "retracting" the previous announcement by
+# replacing it outright rather than appending a new one alongside it.
+make a function called tr_announce takes task_name, description returns done
+  let payload = ("" + now_ms()) + q_tab() + description
+  q_write(tr_topic_for(task_name), [[0, "pending", payload]])
+  return true
+end
+
+# tr_read_one(task_name) -> [timestamp_ms, description], or ["", ""] if
+# task_name has never announced (or its file was somehow removed).
+make a function called tr_read_one takes task_name returns result
+  let rows = q_read(tr_topic_for(task_name))
+  if to_num(list_len(rows)) == 0 then
+    return ["", ""]
+  end
+  let payload = rows[0][2]
+  let sep = find_substr_queue(payload, q_tab())
+  if sep < 0 then
+    return ["", ""]
+  end
+  let ts = substr(payload, 0, sep)
+  let description = substr(payload, sep + 1, payload.length - sep - 1)
+  return [ts, description]
+end
+
+# tr_discover_all(max_age_ms) -> list of [task_name, description] for
+# every task whose most recent announcement is no older than
+# max_age_ms. Never fatals even if nobody has ever announced anything
+# (the registry directory may not exist yet -- q_write/write_file only
+# create it on first use).
+make a function called tr_discover_all takes max_age_ms returns tasks
+  if file_exists(q_dir()) != "1" then
+    return []
+  end
+  let entries = list_dir(q_dir())
+  let prefix = tr_registry_base() + "__"
+  let suffix = ".log"
+  let now = now_ms()
+  let out = []
+  let i = 0
+  let n = to_num(list_len(entries))
+  while i < n do
+    let entry = entries[i]
+    if str_starts_with(entry, prefix) then
+      let topic = substr(entry, 0, entry.length - suffix.length)
+      let task_name = tr_name_from_topic(topic)
+      if task_name != "" then
+        let r = tr_read_one(task_name)
+        let ts = r[0]
+        let description = r[1]
+        if (ts != "") and ((now - to_num(ts)) <= max_age_ms) then
+          let out = list_push(out, [task_name, description])
+        end
+      end
+    end
+    let i = i + 1
+  end
+  return out
+end

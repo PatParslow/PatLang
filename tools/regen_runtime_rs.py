@@ -6,11 +6,28 @@ RUNTIME_RS = r"F:\PatLang\self_hosting\lib\runtime_rs.patlang"
 # chunk_name (as used in PARITY-* / codegen_prelude_chunk) -> PRELUDE_<X> const name
 CHUNKS = {
     "core": "PRELUDE_CORE",
+    "collections_handles": "PRELUDE_COLLECTIONS_HANDLES",
     "files": "PRELUDE_FILES",
+    "io_misc": "PRELUDE_IO_MISC",
+    "math": "PRELUDE_MATH",
     "logic": "PRELUDE_LOGIC",
     "contracts": "PRELUDE_CONTRACTS",
     "numeric_tower": "PRELUDE_NUMERIC_TOWER",
     "codegen_bootstrap": "PRELUDE_CODEGEN_BOOTSTRAP",
+    "networking": "PRELUDE_NETWORKING",
+    "oo": "PRELUDE_OO",
+    "strings_ext": "PRELUDE_STRINGS_EXT",
+    # NOTE: this dict has needed a new entry added reactively FOUR times
+    # in one session (collections_handles/io_misc, then math, then
+    # networking here) -- each time because a chunk existed in codegen.rs
+    # and was checked by selfhost_pipeline.rs's parity test, but simply
+    # hadn't been added here yet. oo/strings_ext are added now purely
+    # pre-emptively (both already PARITY-OK as of 2026-07-17, not because
+    # anything is currently broken) to stop this recurring a fifth time.
+    # PRELUDE_VALUE_FAST is the one real PRELUDE_* constant in codegen.rs
+    # NOT covered here -- it's also not part of selfhost_runtime_text_
+    # parity's own checked chunk list, so there's nothing to regenerate
+    # against; if that ever changes, add it here too.
 }
 
 LINES_PER_SUBFN = 150

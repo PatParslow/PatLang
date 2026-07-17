@@ -5,7 +5,7 @@ use patlang_runtime::ir::hosts::{host_action_add, host_contract_check, host_plan
 use patlang_runtime::ir::types::Value;
 
 fn s(x: &str) -> Value { Value::String(x.to_string()) }
-fn list(xs: Vec<Value>) -> Value { Value::List(xs) }
+fn list(xs: Vec<Value>) -> Value { Value::List(std::sync::Arc::new(xs)) }
 fn pair(pred: &str, args: Vec<Value>) -> Value { list(vec![s(pred), list(args)]) }
 
 #[test]

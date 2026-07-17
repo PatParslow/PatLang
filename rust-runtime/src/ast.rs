@@ -108,6 +108,10 @@ pub enum Stmt {
     When {
         event: String,
         body: Vec<Stmt>,
+        // Source line `when` appeared on -- used only for the top-level-
+        // placement check (check_when_placement in parser.rs), so a
+        // nested/misplaced `when` can be reported at the right line.
+        line: usize,
     },
     // Design-by-contract check: kind is "require" | "ensure" | "assert".
     // Lowers to a contract_check(func_name, kind, text, ok) host call that

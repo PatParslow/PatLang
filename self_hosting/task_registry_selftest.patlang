@@ -1,0 +1,76 @@
+# Selftest for self_hosting/lib/task_registry.patlang (the presence-
+# beacon "Slice 0" of the signal-discovery/composition backlog item):
+# announce, re-announce (retraction-by-replacement), discovery, and TTL-
+# based staleness filtering. Single-process -- the beacon is pure
+# filesystem state, so this doesn't need to spawn real child processes
+# the way the signals selftests do.
+
+include "lib/test.patlang"
+include "lib/task_registry.patlang"
+
+t_init()
+
+# ---- announce + discover ----
+
+tr_announce("test_beacon_alpha", "alpha: does test things")
+let all1 = tr_discover_all(60000)
+let found_alpha = false
+let i = 0
+let n = to_num(list_len(all1))
+while i < n do
+  if all1[i][0] == "test_beacon_alpha" then
+    let found_alpha = true
+    check("alpha's discovered description matches what it announced", all1[i][1], "alpha: does test things")
+  end
+  let i = i + 1
+end
+check("a fresh announcement is discoverable", found_alpha, true)
+
+# ---- re-announce overwrites, doesn't accumulate ----
+
+tr_announce("test_beacon_alpha", "alpha: updated description")
+let rows_after = q_read(tr_topic_for("test_beacon_alpha"))
+check("re-announcing keeps exactly one row (retraction-by-replacement, not an accumulating log)", to_num(list_len(rows_after)), 1)
+let r = tr_read_one("test_beacon_alpha")
+check("tr_read_one sees the UPDATED description after re-announce", r[1], "alpha: updated description")
+
+# ---- staleness / TTL filtering ----
+
+# Fabricate an entry with a timestamp far in the past, bypassing
+# tr_announce (which always stamps "now") specifically to test the age
+# check itself, not the clock.
+let stale_payload = "1" + q_tab() + "beta: long gone"
+q_write(tr_topic_for("test_beacon_beta"), [[0, "pending", stale_payload]])
+let all2 = tr_discover_all(60000)
+let found_beta = false
+let j = 0
+let n2 = to_num(list_len(all2))
+while j < n2 do
+  if all2[j][0] == "test_beacon_beta" then
+    let found_beta = true
+  end
+  let j = j + 1
+end
+check("an announcement older than max_age_ms is excluded from discovery", found_beta, false)
+
+# The same stale entry with a huge max_age_ms should be visible again --
+# proves the exclusion above is genuinely the age check, not some other
+# bug silently hiding beta.
+let all3 = tr_discover_all(now_ms() * 2)
+let found_beta_wide = false
+let k = 0
+let n3 = to_num(list_len(all3))
+while k < n3 do
+  if all3[k][0] == "test_beacon_beta" then
+    let found_beta_wide = true
+  end
+  let k = k + 1
+end
+check("the same entry IS visible with a wide enough max_age_ms", found_beta_wide, true)
+
+# ---- unknown task ----
+
+let unknown = tr_read_one("test_beacon_this_task_never_announced")
+check("reading a task that never announced returns empty, not an error", unknown[0], "")
+
+t_report()

@@ -14,6 +14,42 @@ thread_local! {
     static PRINTED: RefCell<Vec<String>> = RefCell::new(Vec::new());
 }
 
+/// Wraps a spawned `Child` so it's killed if this guard is dropped
+/// without `.wait()` having already reaped it -- e.g. an `assert!`
+/// between spawning a test server and the test's own final `child.wait()`
+/// panics. Plain `std::process::Child` is NOT killed on drop (a well-known
+/// std gotcha), so without this a panicking test leaks the server process,
+/// which then holds its own .exe file locked on Windows and breaks the
+/// NEXT run of the same test with an unrelated-looking compile/write
+/// failure -- confirmed as a real, reproduced failure mode this session
+/// (an identically-shaped test in selfhost_targets.rs).
+struct KillOnDrop(Option<std::process::Child>);
+
+impl KillOnDrop {
+    fn new(child: std::process::Child) -> Self { Self(Some(child)) }
+    fn wait(mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.0.take().expect("wait called once").wait()
+    }
+}
+
+impl std::ops::Deref for KillOnDrop {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target { self.0.as_ref().expect("not yet waited") }
+}
+
+impl std::ops::DerefMut for KillOnDrop {
+    fn deref_mut(&mut self) -> &mut Self::Target { self.0.as_mut().expect("not yet waited") }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 fn capture_print(args: &[Value]) -> Result<Value, String> {
     let s = match args.get(0) {
         Some(Value::String(s)) => s.clone(),
@@ -41,7 +77,7 @@ fn selfhost_pipeline_compiles_feature_demo() {
     let parser_lib = std::fs::read_to_string(format!("{}/../self_hosting/lib/parser.patlang", manifest)).expect("read parser lib");
     let demo_path = format!("{}/../self_hosting/examples/feature_demo.patlang", manifest).replace('\\', "/");
 
-    let out_dir = std::env::temp_dir().join("patlang_selfhost_pipeline_test");
+    let out_dir = std::env::temp_dir().join("patlang_selfhost_pipeline_test").join("selfhost_pipeline_compiles_feature_demo");
     let _ = std::fs::create_dir_all(&out_dir);
     let exe_path = out_dir.join(if cfg!(windows) { "feature_demo.exe" } else { "feature_demo" });
     let exe_str = exe_path.display().to_string().replace('\\', "/");
@@ -102,7 +138,7 @@ fn selfhost_stage3_lowering_in_patlang() {
     let lower_lib = std::fs::read_to_string(format!("{}/../self_hosting/lib/lower.patlang", manifest)).expect("read lower lib");
     let demo_path = format!("{}/../self_hosting/examples/feature_demo.patlang", manifest).replace('\\', "/");
 
-    let out_dir = std::env::temp_dir().join("patlang_selfhost_pipeline_test");
+    let out_dir = std::env::temp_dir().join("patlang_selfhost_pipeline_test").join("selfhost_stage3_lowering_in_patlang");
     let _ = std::fs::create_dir_all(&out_dir);
     let exe_path = out_dir.join(if cfg!(windows) { "stage3_demo.exe" } else { "stage3_demo" });
     let exe_str = exe_path.display().to_string().replace('\\', "/");
@@ -223,7 +259,7 @@ fn selfhost_stage4_codegen_in_patlang() {
     let runtime_lib = std::fs::read_to_string(format!("{}/../self_hosting/lib/runtime_rs.patlang", manifest)).expect("read runtime lib");
     let demo_path = format!("{}/../self_hosting/examples/feature_demo.patlang", manifest).replace('\\', "/");
 
-    let out_dir = std::env::temp_dir().join("patlang_selfhost_pipeline_test");
+    let out_dir = std::env::temp_dir().join("patlang_selfhost_pipeline_test").join("selfhost_stage4_codegen_in_patlang");
     let _ = std::fs::create_dir_all(&out_dir);
     let exe_path = out_dir.join(if cfg!(windows) { "stage4_demo.exe" } else { "stage4_demo" });
     let exe_str = exe_path.display().to_string().replace('\\', "/");
@@ -369,7 +405,7 @@ fn selfhost_pipeline_compiles_tcp_echo_server() {
     let parser_lib = std::fs::read_to_string(format!("{}/../self_hosting/lib/parser.patlang", manifest)).expect("read parser lib");
     let demo_path = format!("{}/../self_hosting/examples/echo_server.patlang", manifest).replace('\\', "/");
 
-    let out_dir = std::env::temp_dir().join("patlang_selfhost_pipeline_test");
+    let out_dir = std::env::temp_dir().join("patlang_selfhost_pipeline_test").join("selfhost_pipeline_compiles_tcp_echo_server");
     let _ = std::fs::create_dir_all(&out_dir);
     let exe_path = out_dir.join(if cfg!(windows) { "echo_server.exe" } else { "echo_server" });
     let exe_str = exe_path.display().to_string().replace('\\', "/");
@@ -398,10 +434,10 @@ fn selfhost_pipeline_compiles_tcp_echo_server() {
 
     // Spawn the server, read the bound port from its stdout, hit it twice
     use std::io::{BufRead, BufReader, Read, Write};
-    let mut child = std::process::Command::new(&exe_path)
+    let mut child = KillOnDrop::new(std::process::Command::new(&exe_path)
         .stdout(std::process::Stdio::piped())
         .spawn()
-        .expect("spawn echo server");
+        .expect("spawn echo server"));
     let stdout = child.stdout.take().expect("child stdout");
     let mut reader = BufReader::new(stdout);
     let mut first = String::new();
@@ -434,7 +470,7 @@ fn selfhost_pipeline_compiles_program_via_patlang_frontend() {
     let lexer_lib = std::fs::read_to_string(format!("{}/../self_hosting/lib/lexer.patlang", manifest)).expect("read lexer lib");
     let parser_lib = std::fs::read_to_string(format!("{}/../self_hosting/lib/parser.patlang", manifest)).expect("read parser lib");
 
-    let out_dir = std::env::temp_dir().join("patlang_selfhost_pipeline_test");
+    let out_dir = std::env::temp_dir().join("patlang_selfhost_pipeline_test").join("selfhost_pipeline_compiles_program_via_patlang_frontend");
     let _ = std::fs::create_dir_all(&out_dir);
     let exe_path = out_dir.join(if cfg!(windows) { "pipeline_out.exe" } else { "pipeline_out" });
     let exe_str = exe_path.display().to_string().replace('\\', "/");

@@ -854,7 +854,7 @@ fn stmt_to_astnode(stmt: &crate::ast::Stmt) -> AstNode {
             AstNode { kind: AstKind::While { cond: Box::new(cond_node), body: body_nodes }, children: vec![] }
         }
         // Extend for other Stmt variants as needed
-        crate::ast::Stmt::When { event, body } => {
+        crate::ast::Stmt::When { event, body, .. } => {
             let body_nodes: Vec<AstNode> = body.iter().map(|s| stmt_to_astnode(s)).collect();
             AstNode { kind: AstKind::WhenRegister { event: event.clone(), body: body_nodes }, children: vec![] }
         }

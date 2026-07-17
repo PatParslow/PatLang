@@ -2,6 +2,7 @@
 //! Kept in sync with the arms in the codegen template so interpreted and
 //! compiled programs observe the same host semantics.
 
+use std::sync::Arc;
 use super::interpreter::Interpreter;
 use super::types::Value;
 use super::ops::{self, v_to_string, as_index};
@@ -69,10 +70,17 @@ pub fn host_list_push(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 { return Err("list_push: expected 2 args".into()); }
     let mut xs = match &args[0] {
         Value::List(xs) => xs.clone(),
-        Value::Unit => Vec::new(),
+        Value::Unit => Arc::new(Vec::new()),
         _ => return Err("list_push: expected list".into()),
     };
-    xs.push(args[1].clone());
+    // Arc::make_mut: mutates in place if this Arc is uniquely held (the
+    // common case -- args[0] was already a fresh clone made just above,
+    // or the caller's own copy is about to be discarded/reassigned), only
+    // deep-clones if some OTHER live reference still shares this Arc.
+    // Still O(n) to grow one element at a time this way (same as before
+    // the Arc-wrap) -- the real win is every plain READ/pass-around of a
+    // list elsewhere in the interpreter no longer pays that cost too.
+    Arc::make_mut(&mut xs).push(args[1].clone());
     Ok(Value::List(xs))
 }
 
@@ -85,7 +93,7 @@ pub fn host_list_set(args: &[Value]) -> Result<Value, String> {
     };
     let idx = match &args[1] { Value::String(s) => s.parse::<usize>().unwrap_or(usize::MAX), v => number_or_max(v).unwrap_or(usize::MAX) };
     if idx >= xs.len() { return Err(format!("list_set: index {} out of range (len {})", idx, xs.len())); }
-    xs[idx] = args[2].clone();
+    Arc::make_mut(&mut xs)[idx] = args[2].clone();
     Ok(Value::List(xs))
 }
 
@@ -183,7 +191,7 @@ pub fn host_vec_to_list(args: &[Value]) -> Result<Value, String> {
     let id = arg_usize(args, 0, "vec_to_list")?;
     VECS.with(|v| {
         let b = v.borrow();
-        b.get(id).ok_or_else(|| format!("vec_to_list: unknown vec {}", id)).map(|xs| Value::List(xs.clone()))
+        b.get(id).ok_or_else(|| format!("vec_to_list: unknown vec {}", id)).map(|xs| Value::List(Arc::new(xs.clone())))
     })
 }
 
@@ -331,7 +339,7 @@ pub fn host_list_dir(args: &[Value]) -> Result<Value, String> {
         })
         .collect();
     names.sort();
-    Ok(Value::List(names.into_iter().map(Value::String).collect()))
+    Ok(Value::List(Arc::new(names.into_iter().map(Value::String).collect())))
 }
 
 pub fn host_rename_file(args: &[Value]) -> Result<Value, String> {
@@ -424,7 +432,7 @@ pub fn host_argv(args: &[Value]) -> Result<Value, String> {
         rest.remove(0);
         if !rest.is_empty() { rest.remove(0); } // script path
     }
-    Ok(Value::List(rest.into_iter().map(Value::String).collect()))
+    Ok(Value::List(Arc::new(rest.into_iter().map(Value::String).collect())))
 }
 
 pub fn host_len(args: &[Value]) -> Result<Value, String> {
@@ -638,11 +646,27 @@ fn solve_goal(pred: &str, args: &[String], subst: &Subst, depth: u32) -> Vec<Sub
     results
 }
 
+// `neq(A, B)` is a built-in comparison predicate, not a fact/rule looked
+// up in RULES -- it's the missing piece for cross-entity attribute
+// comparison (e.g. "same social class" is an ordinary shared-variable
+// join, already inducible; "different sex" needs a genuine inequality
+// check between two already-bound values, which no fact table can
+// express). By the time a body reaches neq(A, B), A and B are walked
+// through the current substitution first, so this only ever compares
+// already-resolved ground terms -- it does not attempt to unify or bind
+// anything itself, purely a pass/fail filter on the substitution as it
+// stands.
 fn resolve_conjuncts(body: &[(String, Vec<String>)], subst: &Subst, depth: u32) -> Vec<Subst> {
     if body.is_empty() { return vec![subst.clone()]; }
     let (pred, args) = &body[0];
     let rest = &body[1..];
     let applied_args = apply_subst(args, subst);
+    if pred == "neq" {
+        if applied_args.len() == 2 && applied_args[0] != applied_args[1] {
+            return resolve_conjuncts(rest, subst, depth);
+        }
+        return Vec::new();
+    }
     let mut out = Vec::new();
     for s2 in solve_goal(pred, &applied_args, subst, depth) {
         out.extend(resolve_conjuncts(rest, &s2, depth));
@@ -665,7 +689,7 @@ pub fn host_rule_add(args: &[Value]) -> Result<Value, String> {
     if args.len() != 3 { return Err("rule_add: expected 3 args (head_pred, head_args_list, body_list)".into()); }
     let head_pred = match &args[0] { Value::String(s) => s.clone(), v => to_s(v) };
     let head_args = value_to_str_list(&args[1]);
-    let body_items = match &args[2] { Value::List(xs) => xs.clone(), _ => Vec::new() };
+    let body_items: Vec<Value> = match &args[2] { Value::List(xs) => (**xs).clone(), _ => Vec::new() };
     let mut body = Vec::new();
     for item in body_items {
         if let Value::List(pair) = &item {
@@ -690,9 +714,9 @@ pub fn host_solve(args: &[Value]) -> Result<Value, String> {
     let empty: Subst = HashMap::new();
     let solutions = solve_goal(&pred, &query_args, &empty, 0);
     let out: Vec<Value> = solutions.iter().map(|s| {
-        Value::List(query_args.iter().map(|a| Value::String(walk(a, s))).collect())
+        Value::List(Arc::new(query_args.iter().map(|a| Value::String(walk(a, s))).collect()))
     }).collect();
-    Ok(Value::List(out))
+    Ok(Value::List(Arc::new(out)))
 }
 
 // ---- A2: GOAP planner -- forward state-space search over actions with
@@ -734,7 +758,7 @@ thread_local! {
 }
 
 fn parse_ground_facts(v: &Value) -> Vec<GroundFact> {
-    let items = match v { Value::List(xs) => xs.clone(), _ => Vec::new() };
+    let items: Vec<Value> = match v { Value::List(xs) => (**xs).clone(), _ => Vec::new() };
     let mut out = Vec::new();
     for item in items {
         if let Value::List(pair) = &item {
@@ -839,7 +863,7 @@ pub fn host_plan(args: &[Value]) -> Result<Value, String> {
         if node_cost != cost { continue; } // stale heap entry (no decrease-key; skip superseded ones)
         expansions += 1;
         if goal_facts.iter().all(|g| state.contains(g)) {
-            return Ok(Value::List(path.into_iter().map(Value::String).collect()));
+            return Ok(Value::List(Arc::new(path.into_iter().map(Value::String).collect())));
         }
         let mut state_key: Vec<GroundFact> = state.iter().cloned().collect();
         state_key.sort();
@@ -858,7 +882,7 @@ pub fn host_plan(args: &[Value]) -> Result<Value, String> {
             }
         }
     }
-    Ok(Value::List(Vec::new()))
+    Ok(Value::List(Arc::new(Vec::new())))
 }
 
 // ---- bitfield helpers: plain-integer packed-field access, the practical
@@ -982,7 +1006,7 @@ pub fn host_vfs_list(args: &[Value]) -> Result<Value, String> {
     let prefix = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => String::new() };
     let mut matching: Vec<String> = vfs_keys().into_iter().filter(|k| k.starts_with(&prefix)).collect();
     matching.sort();
-    Ok(Value::List(matching.into_iter().map(Value::String).collect()))
+    Ok(Value::List(Arc::new(matching.into_iter().map(Value::String).collect())))
 }
 
 pub fn host_vfs_delete(args: &[Value]) -> Result<Value, String> {
@@ -1264,7 +1288,7 @@ pub fn shape_to_program(v: &Value) -> Result<Program, String> {
 
     // Pass 1: collect user function names so calls lower to Call, not CallHost
     let mut ctx = ShapeCtx { user_fns: std::collections::HashSet::new() };
-    for s in stmts {
+    for s in stmts.iter() {
         if let Ok(nx) = shape_list(s) {
             if shape_tag(nx) == Ok("Func") {
                 ctx.user_fns.insert(shape_str(nx, 1, "function name")?);
@@ -1277,7 +1301,7 @@ pub fn shape_to_program(v: &Value) -> Result<Program, String> {
     let mut main_fn = Function { name: "main".into(), ..Default::default() };
     let mut handler_counter = 0usize;
 
-    for s in stmts {
+    for s in stmts.iter() {
         let nx = shape_list(s)?;
         match shape_tag(nx)? {
             "Func" => {
@@ -1710,6 +1734,104 @@ pub fn host_tcp_close(args: &[Value]) -> Result<Value, String> {
     Ok(Value::Unit)
 }
 
+// --- Process lifecycle (non-blocking spawn) ---
+// spawn(path, arg1, arg2, ...) -> Number (the real OS pid, used directly
+// as the handle -- no separate id-table indirection, so it's the same
+// number `Get-Process`/`ps`/Task Manager would show, not an opaque
+// counter). is_alive(pid) -> Bool. wait(pid) -> Number (exit code, or -1
+// if unknown/killed). kill(pid) -> Bool (best-effort; killing an
+// already-exited process is treated as success, not an error -- the
+// common case for cleanup code is "make sure this is dead," not "prove
+// it was alive first").
+//
+// Deliberately minimal: no stdout/stderr piping, no readiness-signaling
+// channel of its own. A spawned child that wants to tell its parent
+// "I'm up, here's my port" does so via the EXISTING signals/task-registry
+// mechanism (self_hosting/lib/signal_discovery.patlang's signal_announce)
+// -- the parent's own readiness check is then just "poll is_alive (to
+// catch an early crash) and signal_discover_one (to catch a successful
+// start) in a loop with a timeout," ordinary PatLang code, not a new
+// primitive. See that library's own header for why: it already solves
+// "how does a caller learn a task's port," spawn() doesn't need to
+// duplicate it with its own confirmation channel.
+//
+// HONEST LIMITATION, not solved here: PatLang has no try/catch and no
+// destructors/RAII at all. A spawned process a PatLang program forgets
+// to explicitly wait()/kill() leaks with NO possible automatic cleanup
+// -- not "harder to get right," genuinely unrecoverable at the language
+// level. This is a real, permanent risk of this primitive existing at
+// all, not a bug to fix later.
+thread_local! {
+    static CHILD_PROCS: RefCell<HashMap<u32, std::process::Child>> = RefCell::new(HashMap::new());
+}
+
+pub fn host_spawn(args: &[Value]) -> Result<Value, String> {
+    let path = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => return Err("spawn: expected program path".into()) };
+    let extra: Vec<String> = args[1..].iter().filter_map(|v| match v { Value::String(s) => Some(s.clone()), _ => None }).collect();
+    // Child's stdout/stderr are discarded, not inherited -- a spawned
+    // child otherwise shares the parent's own stdout/stderr by default
+    // (std::process::Command's own default), which interleaves the
+    // child's prints into the parent's output confusingly (confirmed
+    // directly: spawn_readiness_demo.patlang's child auto-printing its
+    // own final result, per pat --ir-run's usual behavior, showed up as
+    // a stray "true" mixed into the PARENT's own print output). Piping
+    // instead of discarding was considered and rejected: an unread pipe
+    // fills its OS buffer and then blocks the child's own writes forever
+    // once full, a real correctness risk for anything but trivially
+    // short output, and there's no read primitive yet to drain one
+    // anyway. A caller that genuinely needs a child's output has
+    // exec_capture (blocking, captures everything) for the case where
+    // that's an acceptable tradeoff; spawn is for the non-blocking case,
+    // where discarding is the safe default.
+    let child = std::process::Command::new(&path).args(&extra)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn().map_err(|e| format!("spawn: {}: {}", path, e))?;
+    let pid = child.id();
+    CHILD_PROCS.with(|c| c.borrow_mut().insert(pid, child));
+    Ok(Value::Int(pid as i64))
+}
+
+pub fn host_is_alive(args: &[Value]) -> Result<Value, String> {
+    let pid = arg_num(args, 0, "is_alive")? as u32;
+    let alive = CHILD_PROCS.with(|c| {
+        let mut b = c.borrow_mut();
+        match b.get_mut(&pid) {
+            Some(child) => match child.try_wait() {
+                Ok(None) => true,
+                _ => false, // exited, or the check itself failed -- either way, not alive
+            },
+            None => false, // never spawned by us, or already wait()ed/kill()ed away
+        }
+    });
+    Ok(Value::Bool(alive))
+}
+
+pub fn host_wait(args: &[Value]) -> Result<Value, String> {
+    let pid = arg_num(args, 0, "wait")? as u32;
+    let child = CHILD_PROCS.with(|c| c.borrow_mut().remove(&pid));
+    match child {
+        Some(mut child) => {
+            let status = child.wait().map_err(|e| format!("wait: {}: {}", pid, e))?;
+            Ok(Value::Int(status.code().unwrap_or(-1) as i64))
+        }
+        None => Err(format!("wait: unknown or already-reaped pid {}", pid)),
+    }
+}
+
+pub fn host_kill(args: &[Value]) -> Result<Value, String> {
+    let pid = arg_num(args, 0, "kill")? as u32;
+    let child = CHILD_PROCS.with(|c| c.borrow_mut().remove(&pid));
+    match child {
+        Some(mut child) => {
+            let _ = child.kill(); // ignore "already exited" -- that's success too, not an error
+            let _ = child.wait(); // reap
+            Ok(Value::Bool(true))
+        }
+        None => Ok(Value::Bool(false)), // never spawned by us, or already reaped
+    }
+}
+
 /// contract_check(func_name, kind, text, ok) — the shared design-by-contract
 /// enforcement primitive. `kind` is "require" | "ensure" | "assert". This is a
 /// VM-level semantic: it behaves identically whether the program is
@@ -1942,6 +2064,23 @@ pub fn host_ceil(args: &[Value]) -> Result<Value, String> { round_like(args, "ce
 pub fn host_round(args: &[Value]) -> Result<Value, String> { round_like(args, "round") }
 pub fn host_trunc(args: &[Value]) -> Result<Value, String> { round_like(args, "trunc") }
 
+/// to_fixed(x, places) -> String, exactly `places` decimal digits, always.
+/// Not the same problem `round` solves: `round`/floor/ceil/trunc return a
+/// NUMBER, so a Float result is still subject to `v_to_string`'s ordinary
+/// "shortest round-trippable representation" display -- rounding 2.1000...5
+/// to 2 decimal places numerically can still leave a binary value whose
+/// shortest exact decimal expansion isn't short (classic base-2/base-10
+/// float mismatch), so the ugly digits can survive a numeric round anyway.
+/// This formats directly to a fixed-width decimal STRING instead (Rust's
+/// `{:.N}` on f64, itself the standard fix for this exact class of
+/// problem), sidestepping binary representability entirely -- the right
+/// tool when the goal is display, not further arithmetic on the result.
+pub fn host_to_fixed(args: &[Value]) -> Result<Value, String> {
+    let x = arg_f64(args, 0, "to_fixed")?;
+    let places = arg_f64(args, 1, "to_fixed")?.max(0.0) as usize;
+    Ok(Value::String(format!("{:.*}", places, x)))
+}
+
 /// abs(x): exact for all real kinds (Int/BigInt/Rational — just clear the
 /// sign, reusing ops::negate so overflow of i64::MIN is handled the same way
 /// `-x` already is), complex modulus (sqrt(re^2+im^2), itself going through
@@ -2100,6 +2239,10 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("tcp_read", host_tcp_read);
     interp.host.insert("tcp_write", host_tcp_write);
     interp.host.insert("tcp_close", host_tcp_close);
+    interp.host.insert("spawn", host_spawn);
+    interp.host.insert("is_alive", host_is_alive);
+    interp.host.insert("wait", host_wait);
+    interp.host.insert("kill", host_kill);
     // math library primitives (Stage 39)
     interp.host.insert("sqrt", host_sqrt);
     interp.host.insert("pow", host_pow);
@@ -2116,6 +2259,7 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("ceil", host_ceil);
     interp.host.insert("round", host_round);
     interp.host.insert("trunc", host_trunc);
+    interp.host.insert("to_fixed", host_to_fixed);
     interp.host.insert("abs", host_abs);
     interp.host.insert("numeric_kind", host_numeric_kind);
     interp.host.insert("type_of", host_type_of);

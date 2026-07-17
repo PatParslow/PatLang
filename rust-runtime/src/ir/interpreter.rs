@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::types::*;
 use super::ops;
@@ -162,7 +163,7 @@ impl Interpreter {
                                 .map(|h| h.join().unwrap_or_else(|_| Err("parallel_map: a worker thread panicked".to_string())))
                                 .collect()
                         });
-                        stack.push(Value::List(results?));
+                        stack.push(Value::List(Arc::new(results?)));
                     } else if name == "fiber_new" {
                         let fname = match args.get(0) {
                             Some(Value::String(s)) => s.clone(),
@@ -185,7 +186,7 @@ impl Interpreter {
                             Some(Value::String(s)) => s.clone(),
                             other => return Err(format!("budgeted_run: expected a function name string, got {:?}", other)),
                         };
-                        let captured = args.get(2).cloned().unwrap_or(Value::List(vec![]));
+                        let captured = args.get(2).cloned().unwrap_or(Value::List(Arc::new(vec![])));
                         let existing = args.get(3).cloned().unwrap_or(Value::Unit);
                         stack.push(super::fiber::budgeted_run(program, ms, &fname, captured, &existing)?);
                     } else if name == "budget_check" {
@@ -236,9 +237,9 @@ impl Interpreter {
                     let n = *n;
                     if stack.len() < n { return Err("stack underflow".into()); }
                     let start = stack.len() - n;
-                    let mut items: Vec<Value> = stack.drain(start..).collect();
+                    let items: Vec<Value> = stack.drain(start..).collect();
                     // items are in evaluation order; keep order as-is
-                    stack.push(Value::List(items));
+                    stack.push(Value::List(Arc::new(items)));
                 }
                 Instr::Return => {
                     return Ok(stack.pop().unwrap_or(Value::Unit));

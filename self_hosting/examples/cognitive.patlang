@@ -1,0 +1,263 @@
+# PatLang Cognitive Agent Framework
+# Demonstrating: Sense -> Assimilate -> Imagine (on cloned state) -> Check -> Act
+
+include "../lib/json.patlang"
+include "../lib/ollama.patlang"
+
+# ---------------------------------------------------------------------
+# Math & Planning Helpers
+# ---------------------------------------------------------------------
+
+# Absolute value helper to calculate distance
+make a function called abs_val takes n returns v
+  if n < 0 then
+    return 0 - n
+  end
+  return n
+end
+
+# Trim leading/trailing whitespace
+make a function called trim_clean takes s returns clean
+  let mut i = 0
+  let mut start_idx = 0
+  let mut end_idx = s.length
+  
+  let mut finding_start = true
+  while (i < s.length) and finding_start do
+    let c = substr(s, i, 1)
+    if (c == " ") or (c == chr(13)) or (c == chr(10)) or (c == chr(9)) then
+      start_idx = i + 1
+      let i = i + 1
+    else
+      finding_start = false
+    end
+  end
+  
+  let mut j = s.length - 1
+  let mut finding_end = true
+  while (j >= start_idx) and finding_end do
+    let c = substr(s, j, 1)
+    if (c == " ") or (c == chr(13)) or (c == chr(10)) or (c == chr(9)) then
+      end_idx = j
+      let j = j - 1
+    else
+      finding_end = false
+    end
+  end
+  
+  if start_idx >= end_idx then
+    return ""
+  end
+  
+  return substr(s, start_idx, end_idx - start_idx)
+end
+
+# ---------------------------------------------------------------------
+# 1. World State & Sandboxing (Object-Oriented)
+# ---------------------------------------------------------------------
+
+make a function called world_init takes id, robot_x, robot_y, goal_x, goal_y returns done
+  new("WorldState", id)
+  send(id, "set", "x", robot_x)
+  send(id, "set", "y", robot_y)
+  send(id, "set", "goal_x", goal_x)
+  send(id, "set", "goal_y", goal_y)
+  # We store hazards as a space-separated string to bypass list-smashing bugs!
+  send(id, "set", "hazards", " 2,2  3,1 ") 
+  return true
+end
+
+make a function called world_clone takes src_id, dest_id returns done
+  new("WorldState", dest_id)
+  send(dest_id, "set", "x", get(src_id, "x"))
+  send(dest_id, "set", "y", get(src_id, "y"))
+  send(dest_id, "set", "goal_x", get(src_id, "goal_x"))
+  send(dest_id, "set", "goal_y", get(src_id, "goal_y"))
+  send(dest_id, "set", "hazards", get(src_id, "hazards"))
+  return true
+end
+
+# ---------------------------------------------------------------------
+# 2. Cognitive Actions (Actuators & State Mutators)
+# ---------------------------------------------------------------------
+
+make a function called apply_move takes world_id, direction returns success
+  let dir = trim_clean(direction)
+  
+  if find_substr(dir, "up") >= 0 then
+    send(world_id, "set", "y", get(world_id, "y") - 1)
+    return true
+  end
+  
+  if find_substr(dir, "down") >= 0 then
+    send(world_id, "set", "y", get(world_id, "y") + 1)
+    return true
+  end
+  
+  if find_substr(dir, "left") >= 0 then
+    send(world_id, "set", "x", get(world_id, "x") - 1)
+    return true
+  end
+  
+  if find_substr(dir, "right") >= 0 then
+    send(world_id, "set", "x", get(world_id, "x") + 1)
+    return true
+  end
+  
+  print("Invalid direction: [" + direction + "] (length: " + direction.length + ")")
+  return false
+end
+
+# ---------------------------------------------------------------------
+# 3. The "Imagine" Loop (Using Ollama LLM)
+# ---------------------------------------------------------------------
+
+make a function called LLM_imagine_consequences takes state_desc, action returns outcome
+  let model = "deepcoder:latest"
+  let system = "You are the imagination subsystem of a cognitive robot operating on a 3x3 grid where x ranges from 1 to 3, and y ranges from 1 to 3. " +
+               "Given a proposed new coordinate (X,Y), perform this exact step-by-step check: " +
+               "1. If X is less than 1 or greater than 3, return STATUS: HAZARD (out of bounds). " +
+               "2. If Y is less than 1 or greater than 3, return STATUS: HAZARD (out of bounds). " +
+               "3. If (X,Y) matches a known obstacle coordinate in the state, return STATUS: HAZARD. " +
+               "4. Otherwise, return STATUS: SAFE. " +
+               "Be highly systematic and mathematically precise. Do not guess."
+               
+  let user = "Current State: " + state_desc + "\nProposed Move: " + action
+  
+  # Invoke your raw TCP client!
+  let reply = ollama_chat_once(model, system, user)
+  return reply
+end
+
+# ---------------------------------------------------------------------
+# 4. Core Cognitive Loop with Dead-End Memory Integration
+# ---------------------------------------------------------------------
+
+make a function called cognitive_tick takes real_world_id returns completed
+  let rx = get(real_world_id, "x")
+  let ry = get(real_world_id, "y")
+  let gx = get(real_world_id, "goal_x")
+  let gy = get(real_world_id, "goal_y")
+  
+  if (rx == gx) and (ry == gy) then
+    print("SUCCESS: Goal reached at " + rx + "," + ry)
+    return true
+  end
+  
+  # --- SENSE & ASSIMILATE ---
+  let active_hazards = get(real_world_id, "hazards")
+  let current_state_str = "Robot position: (" + rx + "," + ry + "). " +
+                          "Goal position: (" + gx + "," + gy + "). " +
+                          "Known obstacles: " + active_hazards
+  
+  print("Real World State: " + current_state_str)
+  
+  # --- THE MENTAL REHEARSAL LOOP ---
+  let mut proposed_move = ""
+  let mut action_approved = false
+  let mut attempts = 0
+  
+  while (not action_approved) and (attempts < 4) do
+    # NAIVE PLANNER: Proposes moves based on current iteration attempts
+    if attempts == 0 then
+      if abs_val(rx - gx) >= abs_val(ry - gy) then
+        if rx < gx then proposed_move = "right" else proposed_move = "left" end
+      else
+        if ry < gy then proposed_move = "down" else proposed_move = "up" end
+      end
+    end
+    
+    if attempts == 1 then
+      if abs_val(rx - gx) >= abs_val(ry - gy) then
+        if ry < gy then proposed_move = "down" else proposed_move = "up" end
+      else
+        if rx < gx then proposed_move = "right" else proposed_move = "left" end
+      end
+    end
+    
+    if attempts == 2 then
+      if rx < gx then proposed_move = "up" else proposed_move = "down" end
+    end
+    
+    if attempts >= 3 then
+      proposed_move = "left"
+      
+      # COGNITIVE INFERENCE: We are being forced to backtrack because all forward
+      # steps were vetoed. Assimilate our CURRENT coordinate as a dead end!
+      let current_coord = " " + rx + "," + ry + " "
+      if find_substr(active_hazards, current_coord) < 0 then
+        print("DEAD END ASSIMILATION: Memory remembers (" + rx + "," + ry + ") is a dead end. Avoid in future ticks.")
+        let updated_hazards = active_hazards + rx + "," + ry + " "
+        send(real_world_id, "set", "hazards", updated_hazards)
+        let active_hazards = updated_hazards # Update local iteration context
+      end
+    end
+    
+    print("Planning (Attempt " + (attempts + 1) + "): Naive proposal is '" + proposed_move + "'")
+    
+    # 2. CLONE STATE & IMAGINE
+    world_clone(real_world_id, "sandbox_world")
+    apply_move("sandbox_world", proposed_move)
+    
+    let sx = get("sandbox_world", "x")
+    let sy = get("sandbox_world", "y")
+    let sandbox_desc = "Robot would be at (" + sx + "," + sy + ")"
+    let target_coord = " " + sx + "," + sy + " "
+    
+    # Pre-check: Has the robot ALREADY imagined this location is a hazard/dead-end?
+    if find_substr(active_hazards, target_coord) >= 0 then
+      print("MEMORIZED BLOCKED PATH: Instantly vetoing '" + proposed_move + "' to " + sandbox_desc + " based on episodic memory.")
+      attempts = attempts + 1
+    else
+      # If not in memory, ask the imagination engine!
+      print("Imagining future: " + sandbox_desc)
+      print("  (consulting imagination circuit...)")
+      
+      let prediction = LLM_imagine_consequences(current_state_str, "Move " + proposed_move + " to " + sandbox_desc)
+      print("Imagined Result: " + prediction)
+      
+      # 3. CHECK & ASSIMILATE
+      if find_substr(prediction, "HAZARD") >= 0 then
+        print("WARNING: Imagination detected danger! Vetoing action '" + proposed_move + "'")
+        
+        # Persist the new hazard to the real_world's active memory string permanently!
+        let updated_hazards = active_hazards + sx + "," + sy + " "
+        send(real_world_id, "set", "hazards", updated_hazards)
+        let active_hazards = updated_hazards # update local loop state
+        
+        attempts = attempts + 1
+      else
+        action_approved = true
+      end
+    end
+  end
+  
+  # --- ACT ---
+  if action_approved then
+    print("Action verified by Imagination. Executing move '" + proposed_move + "' in reality.")
+    apply_move(real_world_id, proposed_move)
+  else
+    print("CRITICAL: All planned actions vetoed. Robot paralyzed by fear!")
+  end
+  print("")
+  return false
+end
+
+# ---------------------------------------------------------------------
+# Execution Entry Point
+# ---------------------------------------------------------------------
+
+# Start robot at 1,1; Goal is at 3,3. (Note static hazards are at 2,2 and 3,1)
+world_init("real_world", 1, 1, 3, 3)
+
+let max_ticks = 10
+let tick = 0
+let finished = false
+
+while (tick < max_ticks) and (not finished) do
+  print("=== TICK " + (tick + 1) + " ===")
+  let finished = cognitive_tick("real_world")
+  let tick = tick + 1
+end
+
+print("Agent run complete.")

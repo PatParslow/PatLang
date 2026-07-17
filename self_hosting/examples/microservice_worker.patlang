@@ -1,0 +1,65 @@
+# One worker executable, three possible roles (picked via argv) -- a
+# small, honest stand-in for "several independent microservices," each
+# spawned as its own real OS process, each self-registering via the
+# presence beacon rather than being hardcoded into the orchestrator.
+#
+# Usage: pat --ir-run microservice_worker.patlang <role>
+# role is one of: greeter, calculator, clock
+
+include "../lib/signal_discovery.patlang"
+
+let args = argv()
+let role = args[0]
+let task_name = "svc_" + role
+
+# `when` handlers must be declared at genuine top level -- registering
+# one inside an `if` block (originally tried here, gated on `role`) was
+# confirmed NOT to work: it silently never fires at all, no error, just
+# a dead handler. (Real, reproduced finding -- minimal repro: `if true
+# then when x do print("fired") end end` followed by `emit("x", "")`
+# prints nothing.) So every handler is registered unconditionally here;
+# a given worker process only ever actually RECEIVES the signal that
+# matches its own role, since the orchestrator only ever asks a
+# discovered task for an action it actually advertised -- the other
+# roles' handlers exist in memory but are simply never triggered.
+when quit do
+  set_var("should_stop", "1")
+  signal_reply("bye")
+end
+
+when greet do
+  signal_reply("Hello, " + event_data + "! (from the greeter microservice)")
+end
+
+when add do
+  let parts = sd_split(event_data, ",")
+  signal_reply("" + (to_num(str_trim(parts[0])) + to_num(str_trim(parts[1]))))
+end
+
+when multiply do
+  let parts = sd_split(event_data, ",")
+  signal_reply("" + (to_num(str_trim(parts[0])) * to_num(str_trim(parts[1]))))
+end
+
+when time do
+  signal_reply("current server time: " + now_ms() + "ms since epoch")
+end
+
+let port_id = signal_claim(0)
+if port_id >= 0 then
+  if role == "greeter" then
+    signal_announce(task_name, port_id, [["greet", "greets whoever you send, payload = a name"]])
+  else
+    if role == "calculator" then
+      signal_announce(task_name, port_id, [["add", "adds two numbers, payload = 'a,b'"], ["multiply", "multiplies two numbers, payload = 'a,b'"]])
+    else
+      if role == "clock" then
+        signal_announce(task_name, port_id, [["time", "reports the current server time"]])
+      end
+    end
+  end
+  set_var("should_stop", "0")
+  while get("__vars", "should_stop") == "0" do
+    signal_poll(port_id, 300)
+  end
+end

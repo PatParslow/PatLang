@@ -1,0 +1,110 @@
+# A small, self-orchestrated "microservices" demo: one orchestrator
+# process spawns three independent PatLang service processes, waits for
+# each to confirm it's genuinely ready (not just "the OS process
+# started" -- its own presence beacon has to be live), discovers what
+# each one offers rather than hardcoding ports or capabilities, and
+# dispatches real requests purely by capability match. Every piece is
+# real infrastructure built earlier in the same arc, combined here for
+# the first time: spawn (self_hosting/lib/ hosts), the presence beacon
+# and capability description (task_registry.patlang/signal_discovery.
+# patlang), and fit-matching -- nothing new added for this demo itself.
+#
+# Deliberately native-only: spawning real OS processes has no browser/
+# WASM equivalent, so unlike most of this project's other demo pages,
+# this one cannot run live in a page -- see the site write-up for why,
+# and for the diagram + captured transcript that stand in for it there.
+
+include "../lib/signal_discovery.patlang"
+
+make a function called log_line takes msg returns done
+  print("[" + now_ms() + "] " + msg)
+  return true
+end
+
+make a function called worker_path returns path
+  return "F:/PatLang/self_hosting/examples/microservice_worker.patlang"
+end
+
+make a function called pat_path returns path
+  return "F:/PatLang/rust-runtime/target/release/pat.exe"
+end
+
+make a function called wait_for_ready takes task_name, pid, timeout_ms returns result
+  let waited = 0
+  let poll_interval = 100
+  let looping = true
+  let outcome = ["timeout", "", []]
+  while looping do
+    if not is_alive(pid) then
+      let outcome = ["crashed", "", []]
+      let looping = false
+    else
+      let found = signal_discover_one(task_name, 60000)
+      if found[0] != "" then
+        let outcome = ["ready", found[0], found[1]]
+        let looping = false
+      else
+        if waited >= timeout_ms then
+          let looping = false
+        else
+          sleep_ms(poll_interval)
+          let waited = waited + poll_interval
+        end
+      end
+    end
+  end
+  return outcome
+end
+
+make a function called spawn_service takes role returns pid_and_result
+  let pid = spawn(pat_path(), "--ir-run", worker_path(), role)
+  log_line("spawned '" + role + "' service (pid " + pid + ")")
+  let task_name = "svc_" + role
+  let result = wait_for_ready(task_name, pid, 5000)
+  if result[0] == "ready" then
+    log_line("'" + role + "' is ready on port " + result[1] + " -- offers: " + sd_join_comma(sd_action_names(result[2])))
+  else
+    log_line("'" + role + "' FAILED to start (" + result[0] + ")")
+  end
+  return [pid, result]
+end
+
+make a function called dispatch takes keyword, payload, description returns done
+  let candidates = signal_find_capable(keyword, 60000)
+  if to_num(list_len(candidates)) == 0 then
+    log_line(description + " -- no service currently offers '" + keyword + "'")
+    return true
+  end
+  let match = candidates[0]
+  let task_name = match[0]
+  let port = match[1]
+  let action = match[2]
+  log_line(description + " -- found '" + task_name + "' offers '" + action + "', calling it")
+  signal_wrap(task_name, port, [[action, ""]])
+  let reply = signal_call(task_name, action, payload)
+  log_line("  -> reply: " + reply)
+  return true
+end
+
+log_line("orchestrator: starting -- spawning 3 independent microservices")
+let greeter = spawn_service("greeter")
+let calculator = spawn_service("calculator")
+let clock = spawn_service("clock")
+
+log_line("orchestrator: dispatching real requests, purely by discovered capability")
+dispatch("greet", "Pat", "asked who can 'greet'")
+dispatch("add", "17,25", "asked who can 'add'")
+dispatch("multiply", "6,7", "asked who can 'multiply'")
+dispatch("time", "", "asked who can report 'time'")
+
+log_line("orchestrator: demonstrating an honest miss -- nobody offers this")
+dispatch("translate", "hello", "asked who can 'translate'")
+
+log_line("orchestrator: shutting down all services")
+signal_send(to_num(greeter[1][1]), "quit", "")
+signal_send(to_num(calculator[1][1]), "quit", "")
+signal_send(to_num(clock[1][1]), "quit", "")
+wait(greeter[0])
+wait(calculator[0])
+wait(clock[0])
+log_line("orchestrator: done -- all services exited cleanly")

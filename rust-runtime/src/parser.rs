@@ -9,6 +9,65 @@ pub enum ParserError {
     UnexpectedToken { token: Token, line: usize, hint: &'static str },
     ExpectedIdentifier { line: usize, hint: &'static str },
     ExpectedToken { expected: &'static str, line: usize, hint: &'static str },
+    // A syntactically valid identifier that's forbidden in this position --
+    // distinct from ExpectedIdentifier (no identifier found at all). Used
+    // for `main`, which collides with the native-compiled backend's own
+    // Rust `fn main()` entry point: a user function literally named this
+    // used to compile successfully via patc1.exe/pat --patc with no
+    // error, but the emitted call recursed into itself infinitely at
+    // runtime instead of dispatching to the real program entry,
+    // overflowing the stack.
+    //
+    // Genuinely only a native-compilation problem -- the tree-walking
+    // interpreter (--ir-run) has no Rust entry point to collide with,
+    // `main` there is just an ordinary function name. Rejected here
+    // anyway, for BOTH backends, since the parser can't know at parse
+    // time which backend the resulting AST will run on. A deliberate,
+    // known over-restriction chosen for simplicity over a heavier,
+    // backend-conditional check deferred to codegen time -- worth
+    // relaxing if it ever becomes a real nuisance for --ir-run-only
+    // code. The honest long-term fix is making native codegen emit an
+    // entry-point name that can't collide with any PatLang identifier
+    // at all, removing the need for this restriction entirely.
+    ReservedName { name: String, line: usize, hint: &'static str },
+    // `when` handlers are collected once, statically, at lowering time
+    // (ir/lowering.rs's own top-level-only scan for Stmt::When) -- a
+    // `when` nested inside an if/while/function body used to parse
+    // successfully and then simply never fire, ever, with no error
+    // anywhere. Deliberate, not just a simplicity shortcut: PatLang's
+    // capability-discovery system (self_hosting/lib/signal_discovery.
+    // patlang) treats a service's advertised actions as fixed for the
+    // life of the process; if handler registration could vary at
+    // runtime, an honest self-description could go stale without a new
+    // announcement ever being made. See check_when_placement below.
+    MisplacedWhen { line: usize, hint: &'static str },
+}
+
+// Walks the parsed statement tree looking for a `Stmt::When` at depth >
+// 0 (nested inside If/While/Function bodies, not genuine top level).
+// Mirrors self_hosting/lib/parser.patlang's parse_check_when_placement
+// exactly -- same rule, same rationale, kept in sync by hand since this
+// is a real grammar-level check, not just a host function (see the
+// mirror-check skill's "Part 2: grammar parity" distinction).
+fn check_when_placement(stmts: &[Stmt], depth: usize) -> Result<(), ParserError> {
+    for s in stmts {
+        match s {
+            Stmt::When { line, .. } if depth > 0 => {
+                return Err(ParserError::MisplacedWhen {
+                    line: *line,
+                    hint: "'when' can only be declared at the top level of a program -- it cannot be nested inside if/while blocks or function bodies, since handlers are registered once, statically, not conditionally at runtime",
+                });
+            }
+            Stmt::If { then_branch, else_branch, .. } => {
+                check_when_placement(then_branch, depth + 1)?;
+                if let Some(else_b) = else_branch { check_when_placement(else_b, depth + 1)?; }
+            }
+            Stmt::While { body, .. } => check_when_placement(body, depth + 1)?,
+            Stmt::Function { body, .. } => check_when_placement(body, depth + 1)?,
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -127,6 +186,7 @@ impl<'a> Parser<'a> {
 
             // Otherwise, continue; any non-statement-start here is an error (handled at next parse attempt)
         }
+        check_when_placement(&stmts, 0)?;
         Ok(stmts)
     }
 
@@ -344,6 +404,7 @@ impl<'a> Parser<'a> {
                     }
                     // DSL events: when <event> { ... } → capture as Stmt::When
                     if curr_lc == "when" {
+                        let when_line = self.line_no;
                         self.advance()?; // consume 'when'
                         // capture a simple identifier as event name; otherwise, fallback to skip
                         let event_name = match &self.curr { Token::Identifier(s) => { let n = s.clone(); self.advance()?; n }, _ => String::new() };
@@ -351,12 +412,12 @@ impl<'a> Parser<'a> {
                             // Parse the block body using normal rules
                             self.advance()?; // '{'
                             let body = self.parse_block()?;
-                            return Ok(Stmt::When { event: event_name, body });
+                            return Ok(Stmt::When { event: event_name, body, line: when_line });
                         } else if matches!(&self.curr, Token::Identifier(s) if s == "do") {
                             // Stage 1 form: when EVENT do ... end
                             self.advance()?; // 'do'
                             let (body, _) = self.parse_word_block(&["end"], false)?;
-                            return Ok(Stmt::When { event: event_name, body });
+                            return Ok(Stmt::When { event: event_name, body, line: when_line });
                         } else {
                             // Fallback: skip to next block to avoid breaking flow
                             while !matches!(self.curr, Token::BlockStart | Token::EOF) { self.advance()?; }
@@ -476,6 +537,9 @@ impl<'a> Parser<'a> {
             Token::Identifier(s) => s.clone(),
             _ => return Ok(None),
         };
+        if kind_is_function && name == "main" {
+            return Err(ParserError::ReservedName { name, line: self.line_no, hint: "'main' collides with the native-compiled backend's own program entry point -- rename this function" });
+        }
         self.advance()?;
         // Two forms supported:
         // 1) Curly form: { ... returns: { ... } }
@@ -646,6 +710,9 @@ impl<'a> Parser<'a> {
             Token::Identifier(s) => s.clone(),
             _ => return Err(ParserError::ExpectedIdentifier { line: self.line_no, hint: "Function name expected after 'fn'" }),
         };
+        if name == "main" {
+            return Err(ParserError::ReservedName { name, line: self.line_no, hint: "'main' collides with the native-compiled backend's own program entry point -- rename this function" });
+        }
         self.advance()?; // name
         // params
     self.expect(Token::LParen, "'(' after function name", "Define parameter list e.g. fn f(a, b)")?;
@@ -745,15 +812,7 @@ impl<'a> Parser<'a> {
                     Token::Elif => {
                         // elif -> else { if ... }
                         self.advance()?;
-                        let prev_flag2 = self.stop_trailing_block_for_condition;
-                        self.stop_trailing_block_for_condition = true;
-                        let cond2 = self.parse_expression(0)?;
-                        self.stop_trailing_block_for_condition = prev_flag2;
-                        // tolerate newline before '{'
-                        self.consume_newlines()?;
-                        self.expect(Token::BlockStart, "'{' to start 'elif' block", "Start the 'elif' block with '{'" )?;
-                        let then2 = self.parse_block()?;
-                        Some(vec![Stmt::If { cond: cond2, then_branch: then2, else_branch: None }])
+                        Some(vec![self.parse_if_brace_elif_tail()?])
                     }
                     _ => None,
                 }
@@ -772,6 +831,38 @@ impl<'a> Parser<'a> {
     self.expect(Token::BlockStart, "'{' to start 'if' block", "Start the 'if' block with '{'" )?;
         let then_branch = self.parse_block()?;
         Ok(Stmt::If { cond, then_branch, else_branch: None })
+    }
+
+    // Parses one `elif <cond> { ... }` clause of the brace form, assuming
+    // 'elif' has already been consumed: parses its condition and block,
+    // then recurses for a further `elif`/`else`/end, so chains of any
+    // length nest correctly (mirrors parse_if_then_tail for the `then` form).
+    fn parse_if_brace_elif_tail(&mut self) -> Result<Stmt, ParserError> {
+        let prev_flag2 = self.stop_trailing_block_for_condition;
+        self.stop_trailing_block_for_condition = true;
+        let cond2 = self.parse_expression(0)?;
+        self.stop_trailing_block_for_condition = prev_flag2;
+        // tolerate newline before '{'
+        self.consume_newlines()?;
+        self.expect(Token::BlockStart, "'{' to start 'elif' block", "Start the 'elif' block with '{'" )?;
+        let then2 = self.parse_block()?;
+        self.consume_newlines()?;
+        let else_branch = if matches!(self.curr, Token::Else | Token::Elif) {
+            match self.curr {
+                Token::Else => {
+                    self.advance()?;
+                    self.consume_newlines()?;
+                    self.expect(Token::BlockStart, "'{' to start 'else' block", "Start the 'else' block with '{'" )?;
+                    Some(self.parse_block()?)
+                }
+                Token::Elif => {
+                    self.advance()?;
+                    Some(vec![self.parse_if_brace_elif_tail()?])
+                }
+                _ => None,
+            }
+        } else { None };
+        Ok(Stmt::If { cond: cond2, then_branch: then2, else_branch })
     }
 
     // Parses the tail of a Ruby-like `if cond then ...` form, assuming
