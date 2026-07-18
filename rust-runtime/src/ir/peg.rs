@@ -323,8 +323,11 @@ fn match_class(toks: &[PTok], pos: usize, category: &str) -> (usize, bool) {
 /// peg_is_keyword's list EXACTLY -- this list IS the thing being kept in
 /// sync between the two engines; any drift here is exactly the class of
 /// bug this whole exercise exists to catch.
-const KEYWORDS: &[&str] =
-    &["let", "mut", "fn", "if", "elif", "else", "then", "do", "end", "while", "return", "or", "and", "not"];
+const KEYWORDS: &[&str] = &[
+    "let", "mut", "fn", "if", "elif", "else", "then", "do", "end", "while", "return", "or", "and",
+    "not", "budgeted", "when", "require", "ensure", "assert", "function", "band", "bor", "bxor",
+    "bnot", "shl", "shr",
+];
 
 fn is_keyword(text: &str) -> bool {
     KEYWORDS.contains(&text)
