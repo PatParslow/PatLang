@@ -561,11 +561,23 @@ impl<'a> Parser<'a> {
                 // print(x)'s whole point is a discarded Unit return, and that's
                 // the overwhelmingly common shape of a real, intentional bare
                 // expression statement.
+                //
+                // Exempt tail position: the last statement of a block (function/
+                // closure/if/while body, or top-level program) is PatLang's
+                // implicit return value, not a discarded one -- e.g. `|p| { p }`
+                // is a deliberate identity closure. Detected by peeking past any
+                // trailing newlines to see whether the block-terminating token
+                // (EOF, `}}`, or a stop word like `end`/`elif`/`else`) comes next.
                 if is_side_effect_free_expr(&expr) {
-                    eprintln!(
-                        "warning: line {}: this expression's value is computed and discarded -- did you mean to assign it, print it, or was an operator/statement missing?",
-                        start_line
-                    );
+                    self.consume_newlines()?;
+                    let is_tail = matches!(self.curr, Token::EOF | Token::BlockEnd | Token::Else)
+                        || matches!(&self.curr, Token::Identifier(t) if t == "end" || t == "elif");
+                    if !is_tail {
+                        eprintln!(
+                            "warning: line {}: this expression's value is computed and discarded -- did you mean to assign it, print it, or was an operator/statement missing?",
+                            start_line
+                        );
+                    }
                 }
                 Ok(Stmt::ExprStmt(expr))
             }
