@@ -1,0 +1,281 @@
+# =============================================================================
+# Grammar fuzzer: generates random-but-valid nested control-flow programs
+# and checks that the native parser (rust-runtime/src/parser.rs, via
+# `pat --ir-run`) and the self-hosted parser (lib/lexer.patlang +
+# lib/parser.patlang) agree on whether each one is valid.
+#
+# Deliberately a PARSE-ONLY check, not full 3-way execution parity (that's
+# what tools/parity_main.patlang is for, on one known file at a time) --
+# both compiled paths (--patc and patc1.exe) invoke rustc, and two rustc
+# invocations per fuzz iteration would cap iteration counts far too low to
+# be a useful fuzzer. Both checks here are pure interpretation instead:
+#   - native: exec_capture(pat_exe, "--ir-run", file) -- there's no
+#     parse-only mode (see rust-runtime/src/main.rs's 5 modes), so
+#     generation is made SEMANTICALLY SAFE BY CONSTRUCTION (only
+#     local-variable arithmetic and print -- see fuzz_gen_body) so any
+#     failure here reliably means a parse rejection, not an incidental
+#     runtime one.
+#   - self-hosted: tokenize + parse_program + parse_find_error
+#     (lib/parser.patlang's typed AST-walker error detector, fixed
+#     earlier this session), pure interpretation, no patc1.exe/rustc.
+#
+# ast_to_str (lib/parser.patlang) was investigated as a way to generate
+# text from AST nodes but is a debug-style printer ("Num(5)", "Let x = 5"),
+# not valid PatLang syntax -- not usable here. This generates source text
+# directly instead.
+# =============================================================================
+
+# ---- seeded PRNG: hash_string is deterministic FNV-1a, confirmed real
+# and stable (rust-runtime/src/ir/hosts.rs:304); no random/pseudo_rand
+# host function exists in this repo. ----
+
+make a function called fuzz_next takes state returns next_state
+  return hash_string(state)
+end
+
+make a function called fuzz_hex_digit_value takes c returns v
+  if (c >= 48) and (c <= 57) then
+    return c - 48
+  end
+  if (c >= 97) and (c <= 102) then
+    return c - 97 + 10
+  end
+  return 0
+end
+
+# Bounded int in [0, max), derived from ALL of state's hex digits summed
+# (not positionally weighted -- a positional base-16 reconstruction is
+# mathematically degenerate under mod of any power of 2: since 16^k mod 4
+# == 0 for k>=1, "acc mod 4" of a base-16-accumulated number depends ONLY
+# on its last hex digit, discarding every other digit's entropy entirely.
+# Caught exactly this way: fuzz_int(hash_of("seed1"), 4) and
+# fuzz_int(hash_of("seed2"), 4) both came out 0, not a coincidence -- both
+# hashes happened to end in a hex digit divisible by 4. Summing avoids the
+# degeneracy since it isn't a positional power-of-16 reconstruction.)
+make a function called fuzz_int takes state, max returns v
+  let acc = 0
+  let i = 0
+  let n = state.length
+  while i < n do
+    let acc = acc + fuzz_hex_digit_value(char_code(state, i))
+    let i = i + 1
+  end
+  if max <= 0 then
+    return 0
+  end
+  return acc - (floor(acc / max) * max)
+end
+
+# ---- generator: only ever declares/uses its own local variables, only
+# +/-/* arithmetic and comparisons -- "semantically safe by construction"
+# (see file header). Capped at max_depth so generation always terminates. ----
+
+make a function called fuzz_max_depth returns d
+  return 4
+end
+
+make a function called fuzz_var_name takes idx returns name
+  return "fz" + idx
+end
+
+# Returns [lines(list of text lines, no trailing newline chars), state,
+# next_var_idx].
+make a function called fuzz_gen_body takes state, depth, var_idx returns result
+  let choice_count = 4
+  if depth >= fuzz_max_depth() then
+    let choice_count = 2
+  end
+  let state = fuzz_next(state)
+  let choice = fuzz_int(state, choice_count)
+
+  if choice == 0 then
+    # plain let: fzN = <small int>
+    let state = fuzz_next(state)
+    let val = fuzz_int(state, 100)
+    let name = fuzz_var_name(var_idx)
+    return [["let " + name + " = " + val], state, var_idx + 1]
+  else
+    if choice == 1 then
+      # print an existing var if any exist, else a literal
+      if var_idx > 0 then
+        let state = fuzz_next(state)
+        let which = fuzz_int(state, var_idx)
+        return [["print(" + fuzz_var_name(which) + ")"], state, var_idx]
+      else
+        return [["print(0)"], state, var_idx]
+      end
+    else
+      if choice == 2 then
+        # if/then[/else]/end, or a same-line one-liner variant
+        let state = fuzz_next(state)
+        let oneliner = fuzz_int(state, 3) == 0
+        let cond = "1 > 0"
+        if var_idx > 0 then
+          let state = fuzz_next(state)
+          let which = fuzz_int(state, var_idx)
+          let cond = fuzz_var_name(which) + " >= 0"
+        end
+        if oneliner then
+          let state = fuzz_next(state)
+          let val = fuzz_int(state, 100)
+          # the one-liner introduces no new var (avoids a
+          # then-branch-only declaration going out of scope oddly) --
+          # a print is its sole effect instead, always safe.
+          let line = "if " + cond + " then print(" + val + ") end"
+          return [[line], state, var_idx]
+        else
+          let inner = fuzz_gen_body(state, depth + 1, var_idx)
+          let then_lines = inner[0]
+          let state = inner[1]
+          let var_idx = inner[2]
+          let state = fuzz_next(state)
+          let has_else = fuzz_int(state, 2) == 1
+          let lines = ["if " + cond + " then"]
+          let lines = fuzz_append_indented(lines, then_lines)
+          if has_else then
+            let inner2 = fuzz_gen_body(state, depth + 1, var_idx)
+            let else_lines = inner2[0]
+            let state = inner2[1]
+            let var_idx = inner2[2]
+            let lines = list_push(lines, "else")
+            let lines = fuzz_append_indented(lines, else_lines)
+          end
+          let lines = list_push(lines, "end")
+          return [lines, state, var_idx]
+        end
+      else
+        # while/do/end, bounded to run at most a couple times -- a fresh
+        # counter var, always safe.
+        let name = fuzz_var_name(var_idx)
+        let var_idx = var_idx + 1
+        let inner = fuzz_gen_body(state, depth + 1, var_idx)
+        let body_lines = inner[0]
+        let state = inner[1]
+        let var_idx = inner[2]
+        let lines = ["let " + name + " = 0"]
+        let lines = list_push(lines, "while " + name + " < 2 do")
+        let lines = fuzz_append_indented(lines, body_lines)
+        let lines = list_push(lines, "  let " + name + " = " + name + " + 1")
+        let lines = list_push(lines, "end")
+        return [lines, state, var_idx]
+      end
+    end
+  end
+end
+
+make a function called fuzz_append_indented takes lines, new_lines returns out
+  let out = lines
+  let i = 0
+  let n = to_num(list_len(new_lines))
+  while i < n do
+    let out = list_push(out, "  " + new_lines[i])
+    let i = i + 1
+  end
+  return out
+end
+
+# Wraps a generated body in a runnable program: a function + a top-level
+# call. Returns [source_text, next_state].
+make a function called fuzz_gen_program takes seed returns result
+  let state = fuzz_next(seed)
+  let gen = fuzz_gen_body(state, 0, 0)
+  let body_lines = gen[0]
+  let state = gen[1]
+  let lines = ["make a function called fuzz_test returns fz_result"]
+  let lines = fuzz_append_indented(lines, body_lines)
+  let lines = list_push(lines, "  let fz_result = 1")
+  let lines = list_push(lines, "  return fz_result")
+  let lines = list_push(lines, "end")
+  let lines = list_push(lines, "")
+  let lines = list_push(lines, "fuzz_test()")
+  let b = sb_new()
+  let i = 0
+  let n = to_num(list_len(lines))
+  while i < n do
+    sb_push(b, lines[i])
+    sb_push(b, chr(10))
+    let i = i + 1
+  end
+  return [sb_str(b), state]
+end
+
+# ---- self-consistency check: end-count matches block-opener count,
+# independent of invoking either parser (used by the selftest). ----
+make a function called fuzz_count_word takes source, word returns count
+  let lines = split_lines(source)
+  let count = 0
+  let i = 0
+  let n = to_num(list_len(lines))
+  while i < n do
+    let words = fmt_line_words(fmt_mask_line(lines[i]))
+    let j = 0
+    let jn = to_num(list_len(words))
+    while j < jn do
+      if words[j] == word then
+        let count = count + 1
+      end
+      let j = j + 1
+    end
+    let i = i + 1
+  end
+  return count
+end
+
+# ---- the two parse-only checks ----
+
+make a function called fuzz_check_native takes pat_exe, path returns ok
+  let out = exec_capture(pat_exe, "--ir-run", path)
+  # any error text ("IR runtime error"/"Parse error") means rejected --
+  # generation is semantically safe by construction, so this reliably
+  # signals a parse-level rejection.
+  if str_contains(out, "error") then
+    return false
+  end
+  return true
+end
+
+make a function called fuzz_check_selfhost takes source returns ok
+  let toks = tokenize(source)
+  let ast = parse_program(toks)
+  let stmts = ast[1]
+  let err = parse_find_error(stmts)
+  return err[0] == ""
+end
+
+make a function called str_contains takes hay, needle returns found
+  let hn = hay.length
+  let nn = needle.length
+  if nn > hn then
+    return false
+  end
+  let i = 0
+  while i <= (hn - nn) do
+    if substr(hay, i, nn) == needle then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# Generates `iterations` programs from `seed`, checks both sides, returns
+# [disagreements, final_state]. Each disagreement is
+# [source_text, native_ok, selfhost_ok].
+make a function called fuzz_run takes pat_exe, seed, iterations, scratch_path returns result
+  let state = seed
+  let disagreements = []
+  let i = 0
+  while i < iterations do
+    let gen = fuzz_gen_program(state)
+    let source = gen[0]
+    let state = gen[1]
+    write_file(scratch_path, source)
+    let native_ok = fuzz_check_native(pat_exe, scratch_path)
+    let selfhost_ok = fuzz_check_selfhost(source)
+    if native_ok != selfhost_ok then
+      let disagreements = list_push(disagreements, [source, native_ok, selfhost_ok])
+    end
+    let i = i + 1
+  end
+  return [disagreements, state]
+end
