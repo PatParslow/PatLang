@@ -9,6 +9,38 @@ use std::process;
 use std::fs;
 use patlang_runtime::{core_evaluator, parser::Parser, ir::{Lowerer, Interpreter, Value, RustCodegen}};
 
+// Reasoning over runtime (--ir-run) errors, mirroring the self-hosted
+// suggest_parse_fix's message-substring dispatch style
+// (self_hosting/lib/parser.patlang) -- direct, tailored suggestions per
+// message shape, not a generic catch-all. Can't be done as a pure
+// self-hosted layer the way parse-error reasoning is: the interpreter's
+// Result<Value, String> carries no line info and PatLang has no
+// try/catch, so a host-fn error simply terminates the process here
+// rather than ever becoming inspectable PatLang-side data. Categories
+// below were surveyed directly from every Err(...) string in
+// src/ir/hosts.rs and src/ir/interpreter.rs, not guessed.
+fn suggest_runtime_fix(message: &str) -> String {
+    if message.contains("not found") && (message.contains("function") || message.contains("host fn")) {
+        return "No function or host function by that name is visible here -- check for a typo in the name, or a missing `include` for the library that defines it.".into();
+    }
+    if message.contains("expected") && message.contains("arg") {
+        return "This call passed the wrong number of arguments -- check the function's `takes ...` parameter list (or, for a host function, its documented signature) against what was actually passed.".into();
+    }
+    if message.contains("expected numeric") || message.contains("expected string") || message.contains("expected a string") || message.contains("expected list") || message.contains("expected an integer") {
+        return "An argument was the wrong type for this operation -- check what value is actually being passed here; it may be a variable holding something other than what this call expects.".into();
+    }
+    if message.contains("out of range") {
+        return "A numeric argument fell outside the valid range for this operation (e.g. a bit position or slice width) -- check the value being passed against the operation's documented bounds.".into();
+    }
+    if message.contains("os error") {
+        return "This failed at the operating-system level (a file or process operation) -- check that the path exists and is spelled correctly, and that this program has permission to access it.".into();
+    }
+    if message.contains("unknown") && (message.contains("node") || message.contains("op") || message.contains("instruction")) {
+        return "This is an internal compiler error, not a mistake in your PatLang source -- the compiler's own code generation doesn't recognize a construct it produced. Worth reporting rather than trying to work around in source.".into();
+    }
+    "No specific suggestion for this message -- check the text above for the operation and value involved, and look for the corresponding host function or language construct in the docs.".into()
+}
+
 fn main() {
     // Run on a spawned thread with a much larger stack than the OS-default
     // main thread stack: deeply recursive-descent PatLang programs
@@ -295,6 +327,7 @@ fn real_main() {
             }
             Err(e) => {
                 eprintln!("IR runtime error: {}", e);
+                eprintln!("  Suggestion: {}", suggest_runtime_fix(&e));
                 process::exit(1);
             }
         }
