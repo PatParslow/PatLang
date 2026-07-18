@@ -1,0 +1,338 @@
+# =============================================================================
+# Self-hosted PatLang -> x64 NASM (win64) backend -- SLICE 1.
+#
+# Consumes the EXACT SAME flat IR lib/lower.patlang already produces
+# for the Rust-text backend (ir[1]=entry, ir[2]=[FuncIR...], ir[3]=
+# [EventIR...]) -- zero changes to lexer/parser/lower. Emits real NASM
+# `win64` assembly text, assembled+linked with the same toolchain
+# (nasm -f win64, then gcc -Wl,--subsystem,console -lkernel32 -luser32)
+# already proven working this session for the recovered Mandelbrot
+# double-double kernel driver (turbo_dd.asm).
+#
+# SLICE 1 SCOPE (see the plan file for the full reasoning): every value
+# is a plain 64-bit integer -- no tagged dynamic Value, no numeric
+# tower, no strings/lists/closures. `+ - * / % == != < <= > >=` on
+# ints, `if/else`, `while`, ordinary (non-closure) function calls.
+#
+# CALLING CONVENTION (this backend's own, NOT the win64 ABI -- only the
+# small OS-boundary primitive calls below need genuine win64 ABI
+# compliance): a call's arguments are simply the values already pushed
+# onto the real x64 stack by evaluating each argument expression
+# left-to-right (exactly matching lower.patlang's own Call-lowering
+# order) -- the callee copies them into its own local slots by reading
+# fixed offsets above its return address, and returns its single
+# result on the stack too (pop the result into rax, `leave`, `ret`;
+# the caller cleans up the argc*8 bytes of pushed args and re-pushes
+# rax as its own result). This keeps every instruction's stack effect
+# exactly "pop N values, push 1 value" throughout, matching the
+# CallHost/Call/Bin/Un instructions' own implicit contract in the IR.
+#
+# THE ONLY FIVE NAMES THIS BACKEND GIVES SPECIAL MEANING TO (everything
+# else reaching CallHost is a compile-time error -- see lib/x64_runtime.
+# patlang's own header for why the list is this short and what each
+# one does): mem_scratch_addr, mem_poke_byte, mem_peek_byte,
+# os_write_console_bytes, os_exit. Only the last two are genuine win64-
+# ABI calls into real OS DLL functions (GetStdHandle/WriteFile/
+# ExitProcess -- WriteFile, not WriteConsoleA: the latter only works
+# against a genuine interactive console handle and silently fails
+# whenever stdout is redirected/piped, which is exactly what happened
+# capturing this program's output during development) -- guarded by a
+# save-rsp/align/restore-rsp pattern
+# (register r15) so the surrounding operand-stack discipline is never
+# disturbed by the temporary 16-byte alignment a real ABI call needs.
+# =============================================================================
+
+make a function called nl returns s
+  return chr(10)
+end
+
+# ---- local-variable slot allocation ----
+
+make a function called x64_local_index takes names, name returns idx
+  let n = to_num(list_len(names))
+  let i = 0
+  while i < n do
+    if names[i] == name then
+      return i
+    end
+    let i = i + 1
+  end
+  return 0 - 1
+end
+
+# Params first (in order), then every OTHER name a Store instruction
+# targets, first-seen order. Slot k lives at [rbp - 8*(k+1)].
+make a function called x64_collect_locals takes func returns names
+  let params = func[2]
+  let instrs = func[3]
+  let names = []
+  let pn = to_num(list_len(params))
+  let i = 0
+  while i < pn do
+    let names = list_push(names, params[i])
+    let i = i + 1
+  end
+  let n = to_num(list_len(instrs))
+  let i = 0
+  while i < n do
+    let instr = instrs[i]
+    if instr[0] == "Store" then
+      if x64_local_index(names, instr[1]) < 0 then
+        let names = list_push(names, instr[1])
+      end
+    end
+    let i = i + 1
+  end
+  return names
+end
+
+# ---- one instruction -> nasm text ----
+
+make a function called x64_binop_asm takes op returns asm
+  let sb = sb_new()
+  sb_push(sb, "    pop rbx" + nl())
+  sb_push(sb, "    pop rax" + nl())
+  if op == "+" then
+    sb_push(sb, "    add rax, rbx" + nl())
+  else
+    if op == "-" then
+      sb_push(sb, "    sub rax, rbx" + nl())
+    else
+      if op == "*" then
+        sb_push(sb, "    imul rax, rbx" + nl())
+      else
+        if op == "/" then
+          sb_push(sb, "    cqo" + nl())
+          sb_push(sb, "    idiv rbx" + nl())
+        else
+          if op == "%" then
+            sb_push(sb, "    cqo" + nl())
+            sb_push(sb, "    idiv rbx" + nl())
+            sb_push(sb, "    mov rax, rdx" + nl())
+          else
+            sb_push(sb, "    cmp rax, rbx" + nl())
+            if op == "==" then
+              sb_push(sb, "    sete al" + nl())
+            else
+              if op == "!=" then
+                sb_push(sb, "    setne al" + nl())
+              else
+                if op == "<" then
+                  sb_push(sb, "    setl al" + nl())
+                else
+                  if op == "<=" then
+                    sb_push(sb, "    setle al" + nl())
+                  else
+                    if op == ">" then
+                      sb_push(sb, "    setg al" + nl())
+                    else
+                      if op == ">=" then
+                        sb_push(sb, "    setge al" + nl())
+                      else
+                        print("codegen_x64: unsupported binary operator: " + op)
+                        return "UNSUPPORTED_BINOP_ERROR"
+                      end
+                    end
+                  end
+                end
+              end
+            end
+            sb_push(sb, "    movzx rax, al" + nl())
+          end
+        end
+      end
+    end
+  end
+  sb_push(sb, "    push rax" + nl())
+  return sb_str(sb)
+end
+
+# CallHost -- only the five special primitive names are legal here.
+make a function called x64_callhost_asm takes name, argc returns asm
+  let sb = sb_new()
+  if name == "mem_scratch_addr" then
+    sb_push(sb, "    lea rax, [rel g_scratch]" + nl())
+    sb_push(sb, "    push rax" + nl())
+  else
+    if name == "mem_poke_byte" then
+      sb_push(sb, "    pop rcx" + nl())
+      sb_push(sb, "    pop rdx" + nl())
+      sb_push(sb, "    pop rax" + nl())
+      sb_push(sb, "    add rax, rdx" + nl())
+      sb_push(sb, "    mov byte [rax], cl" + nl())
+      sb_push(sb, "    push 0" + nl())
+    else
+      if name == "mem_peek_byte" then
+        sb_push(sb, "    pop rdx" + nl())
+        sb_push(sb, "    pop rax" + nl())
+        sb_push(sb, "    add rax, rdx" + nl())
+        sb_push(sb, "    movzx rax, byte [rax]" + nl())
+        sb_push(sb, "    push rax" + nl())
+      else
+        if name == "os_write_console_bytes" then
+          sb_push(sb, "    pop r13" + nl())
+          sb_push(sb, "    pop r14" + nl())
+          sb_push(sb, "    mov r15, rsp" + nl())
+          sb_push(sb, "    sub rsp, 48" + nl())
+          sb_push(sb, "    and rsp, -16" + nl())
+          sb_push(sb, "    mov rcx, -11" + nl())
+          sb_push(sb, "    call GetStdHandle" + nl())
+          sb_push(sb, "    mov rcx, rax" + nl())
+          sb_push(sb, "    mov rdx, r14" + nl())
+          sb_push(sb, "    mov r8, r13" + nl())
+          sb_push(sb, "    lea r9, [rel g_written]" + nl())
+          sb_push(sb, "    mov qword [rsp+32], 0" + nl())
+          sb_push(sb, "    call WriteFile" + nl())
+          sb_push(sb, "    mov rsp, r15" + nl())
+          sb_push(sb, "    push 0" + nl())
+        else
+          if name == "os_exit" then
+            sb_push(sb, "    pop rcx" + nl())
+            sb_push(sb, "    mov r15, rsp" + nl())
+            sb_push(sb, "    sub rsp, 32" + nl())
+            sb_push(sb, "    and rsp, -16" + nl())
+            sb_push(sb, "    call ExitProcess" + nl())
+          else
+            print("codegen_x64: unsupported primitive (not a real function and not in the OS-boundary allowlist): " + name)
+            return "UNSUPPORTED_PRIMITIVE_ERROR"
+          end
+        end
+      end
+    end
+  end
+  return sb_str(sb)
+end
+
+make a function called x64_emit_instr takes instr, func_name, locals, label returns asm
+  let sb = sb_new()
+  sb_push(sb, label + ":" + nl())
+  let ty = instr[0]
+  if ty == "Const" then
+    let kind = instr[1]
+    if kind == "bool" then
+      if instr[2] == "true" then
+        sb_push(sb, "    mov rax, 1" + nl())
+      else
+        sb_push(sb, "    mov rax, 0" + nl())
+      end
+    else
+      sb_push(sb, "    mov rax, " + instr[2] + nl())
+    end
+    sb_push(sb, "    push rax" + nl())
+  else
+    if ty == "Load" then
+      let slot = x64_local_index(locals, instr[1])
+      sb_push(sb, "    mov rax, [rbp-" + (8 * (slot + 1)) + "]" + nl())
+      sb_push(sb, "    push rax" + nl())
+    else
+      if ty == "Store" then
+        let slot = x64_local_index(locals, instr[1])
+        sb_push(sb, "    pop rax" + nl())
+        sb_push(sb, "    mov [rbp-" + (8 * (slot + 1)) + "], rax" + nl())
+      else
+        if ty == "Bin" then
+          sb_push(sb, x64_binop_asm(instr[1]))
+        else
+          if ty == "Jump" then
+            sb_push(sb, "    jmp L_" + func_name + "_" + instr[1] + nl())
+          else
+            if ty == "JumpIfFalse" then
+              sb_push(sb, "    pop rax" + nl())
+              sb_push(sb, "    cmp rax, 0" + nl())
+              sb_push(sb, "    je L_" + func_name + "_" + instr[1] + nl())
+            else
+              if ty == "CallHost" then
+                sb_push(sb, x64_callhost_asm(instr[1], instr[2]))
+              else
+                if ty == "Call" then
+                  sb_push(sb, "    call " + instr[1] + nl())
+                  let argc = to_num(instr[2])
+                  if argc > 0 then
+                    sb_push(sb, "    add rsp, " + (argc * 8) + nl())
+                  end
+                  sb_push(sb, "    push rax" + nl())
+                else
+                  if ty == "Return" then
+                    if func_name == "main" then
+                      sb_push(sb, "    mov rcx, 0" + nl())
+                      sb_push(sb, "    call ExitProcess" + nl())
+                    else
+                      sb_push(sb, "    pop rax" + nl())
+                      sb_push(sb, "    leave" + nl())
+                      sb_push(sb, "    ret" + nl())
+                    end
+                  else
+                    print("codegen_x64: unsupported IR instruction for Slice 1: " + ty)
+                    return "UNSUPPORTED_INSTR_ERROR"
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  return sb_str(sb)
+end
+
+# ---- one function -> nasm text ----
+
+make a function called x64_emit_func takes func returns asm
+  let func_name = func[1]
+  let params = func[2]
+  let instrs = func[3]
+  let locals = x64_collect_locals(func)
+  let frame_size = 8 * to_num(list_len(locals))
+  if frame_size < 8 then
+    let frame_size = 8
+  end
+  let sb = sb_new()
+  sb_push(sb, func_name + ":" + nl())
+  sb_push(sb, "    push rbp" + nl())
+  sb_push(sb, "    mov rbp, rsp" + nl())
+  sb_push(sb, "    sub rsp, " + frame_size + nl())
+  let argc = to_num(list_len(params))
+  let p = 0
+  while p < argc do
+    let src_offset = 16 + 8 * (argc - 1 - p)
+    sb_push(sb, "    mov rax, [rbp+" + src_offset + "]" + nl())
+    sb_push(sb, "    mov [rbp-" + (8 * (p + 1)) + "], rax" + nl())
+    let p = p + 1
+  end
+  let n = to_num(list_len(instrs))
+  let i = 0
+  while i < n do
+    let label = "L_" + func_name + "_" + i
+    sb_push(sb, x64_emit_instr(instrs[i], func_name, locals, label))
+    let i = i + 1
+  end
+  return sb_str(sb)
+end
+
+# ---- whole program -> nasm text ----
+
+make a function called emit_program_x64 takes ir returns asm
+  let funcs = ir[2]
+  let sb = sb_new()
+  sb_push(sb, "default rel" + nl())
+  sb_push(sb, "global main" + nl())
+  sb_push(sb, "extern GetStdHandle, WriteFile, ExitProcess" + nl())
+  sb_push(sb, nl())
+  sb_push(sb, "section .bss" + nl())
+  sb_push(sb, "    align 8" + nl())
+  sb_push(sb, "    g_written resd 1" + nl())
+  sb_push(sb, "    align 8" + nl())
+  sb_push(sb, "    g_scratch resb 256" + nl())
+  sb_push(sb, nl())
+  sb_push(sb, "section .text" + nl())
+  sb_push(sb, nl())
+  let n = to_num(list_len(funcs))
+  let i = 0
+  while i < n do
+    sb_push(sb, x64_emit_func(funcs[i]))
+    sb_push(sb, nl())
+    let i = i + 1
+  end
+  return sb_str(sb)
+end
