@@ -1,0 +1,82 @@
+# PatLang -> Triton GPU kernel plumbing.
+#
+# SLICE 1 (this file, so far): prove the ARCHITECTURE works end to end
+# using a single FIXED, hand-written Triton kernel (elementwise vector
+# add, Triton's own canonical "hello world" example) -- PatLang builds
+# a Python/Triton driver script as text, writes it to disk, runs it via
+# exec_capture (the same subprocess-and-capture-stdout pattern already
+# used elsewhere in this codebase -- patc1.exe shelling out to rustc,
+# ScriptCanvas-style JSON-over-stdout hosting), and parses the JSON
+# result back into ordinary PatLang values. This is NOT yet a lowerer
+# that translates a PatLang-authored kernel body into Triton syntax --
+# that's deliberately a separate, later slice, once this plumbing is
+# proven. Matches this project's own established discipline elsewhere
+# (e.g. sim_loop.patlang proving parallel_map+signals plumbing with toy
+# demographics before real rules were added).
+#
+# Requires a real CUDA GPU + PyTorch (CUDA build) + Triton installed
+# for the Python interpreter at PYTHON_EXE below -- confirmed present
+# and working on this machine (RTX 5070 Ti, torch 2.12.0+cu132, triton
+# 3.4.0) via a standalone sanity check before this file was written.
+
+include "json.patlang"
+
+# NOT top-level `let`s -- confirmed by direct test that a named function
+# (`make a function called X`) does NOT close over top-level `let`
+# bindings from its defining script at all (only anonymous closure
+# LITERALS, `|| { ... }`, do). A genuine, previously-undocumented
+# PatLang scoping gotcha, distinct from (though related to) the already-
+# known "bare references to named functions lower to a local-variable
+# load, only closures produce a real callable value" -- see regex.
+# patlang's own header. Zero-arg getter functions, matching the pattern
+# already used in fantpop-patlang's sim_max_new_locations_per_year, are
+# the safe way to give a named function access to a "constant".
+make a function called triton_python_exe returns path
+  return "D:/Program Files/Python313/python.exe"
+end
+
+make a function called triton_scratch_dir returns dir
+  return "F:/PatLang/self_hosting/build"
+end
+
+# Builds a JSON array literal string ("[1,2,3]") from a PatLang list of
+# numbers -- also valid Python list syntax, which is all this needs
+# (embedded directly into a generated driver script as a literal).
+make a function called triton_num_list_json takes xs returns s
+  let sb = sb_new()
+  sb_push(sb, "[")
+  let n = to_num(list_len(xs))
+  let i = 0
+  while i < n do
+    if i > 0 then
+      sb_push(sb, ",")
+    end
+    sb_push(sb, "" + xs[i])
+    let i = i + 1
+  end
+  sb_push(sb, "]")
+  return sb_str(sb)
+end
+
+# Runs a Triton elementwise vector-add kernel ON THE GPU for two equal-
+# length PatLang lists of numbers, returning their elementwise sum as a
+# new PatLang list. `a` and `b` must be the same length.
+make a function called triton_vector_add takes a, b returns sums
+  let n = to_num(list_len(a))
+  let a_json = triton_num_list_json(a)
+  let b_json = triton_num_list_json(b)
+  let script = "import torch\nimport triton\nimport triton.language as tl\nimport json\n\n@triton.jit\ndef add_kernel(x_ptr, y_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):\n    pid = tl.program_id(0)\n    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)\n    mask = offs < n\n    x = tl.load(x_ptr + offs, mask=mask)\n    y = tl.load(y_ptr + offs, mask=mask)\n    tl.store(out_ptr + offs, x + y, mask=mask)\n\nx = torch.tensor(" + a_json + ", device='cuda', dtype=torch.float32)\ny = torch.tensor(" + b_json + ", device='cuda', dtype=torch.float32)\nout = torch.empty_like(x)\nn = " + n + "\nBLOCK_SIZE = triton.next_power_of_2(n)\ngrid = (triton.cdiv(n, BLOCK_SIZE),)\nadd_kernel[grid](x, y, out, n, BLOCK_SIZE=BLOCK_SIZE)\nprint(json.dumps(out.cpu().tolist()))\n"
+  let script_path = triton_scratch_dir() + "/_triton_vector_add.py"
+  write_file(script_path, script)
+  let out = exec_capture(triton_python_exe(), script_path)
+  let parsed = json_parse(out)
+  let items = json_arr(parsed)
+  let result = []
+  let m = to_num(list_len(items))
+  let i = 0
+  while i < m do
+    let result = list_push(result, json_num(items[i]))
+    let i = i + 1
+  end
+  return result
+end
