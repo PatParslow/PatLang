@@ -1,0 +1,246 @@
+# =============================================================================
+# Include-dependency graph: scans `.patlang` files for `include "..."`
+# statements (same line-detection as lib/includes.patlang's
+# expand_includes -- reused, not reimplemented) and builds a directed graph
+# of file -> included-file, plus its reverse ("what includes me") and cycle
+# detection.
+#
+# Takes an explicit root-directory list rather than hardcoding real repo
+# paths, so a selftest can point it at a small scratch fixture directory
+# instead of only being testable against the live codebase.
+# =============================================================================
+
+make a function called depgraph_list_contains takes items, needle returns found
+  let i = 0
+  let n = to_num(list_len(items))
+  while i < n do
+    if items[i] == needle then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# Recursively collects every .patlang file under `roots` (a list of
+# directory paths). list_dir is confirmed non-recursive (one level,
+# directory entries suffixed "/"), so this walks itself.
+make a function called depgraph_collect_dir takes dir returns files
+  let files = []
+  let entries = list_dir(dir)
+  let i = 0
+  let n = to_num(list_len(entries))
+  while i < n do
+    let name = entries[i]
+    let is_dir = str_ends_with(name, "/")
+    if is_dir then
+      let subdir = path_join(dir, substr(name, 0, name.length - 1))
+      let sub = depgraph_collect_dir(subdir)
+      let files = depgraph_list_concat(files, sub)
+    else
+      if str_ends_with(name, ".patlang") then
+        let files = list_push(files, path_join(dir, name))
+      end
+    end
+    let i = i + 1
+  end
+  return files
+end
+
+make a function called depgraph_collect_files takes roots returns files
+  let files = []
+  let i = 0
+  let n = to_num(list_len(roots))
+  while i < n do
+    let sub = depgraph_collect_dir(roots[i])
+    let files = depgraph_list_concat(files, sub)
+    let i = i + 1
+  end
+  return files
+end
+
+# Scans one file's lines for `include "path"` statements (mirrors
+# lib/includes.patlang's expand_includes_at_depth line detection exactly:
+# a trimmed line starting with "include " and not "#") and resolves each
+# to a path relative to the including file's own directory. Does NOT
+# splice content (unlike expand_includes) -- this only records the edge.
+make a function called depgraph_scan_includes takes file returns included
+  let source = read_file(file)
+  let base_dir = path_dirname(file)
+  let lines = split_lines(source)
+  let included = []
+  let i = 0
+  let n = to_num(list_len(lines))
+  while i < n do
+    let line = lines[i]
+    let t = str_trim(line)
+    if str_starts_with(t, "include ") and (str_starts_with(t, "#") == false) then
+      let rel = str_trim(substr(t, 8, t.length - 8))
+      let rel = strip_quotes(rel)
+      let path = path_join(base_dir, rel)
+      let included = list_push(included, path)
+    end
+    let i = i + 1
+  end
+  return included
+end
+
+# Returns [files, direct_includes_map, included_by_map] where each map is
+# a list of [file, [...]] pairs (PatLang has no native dict literal in
+# this dialect; a small linear-scan association list is fine at this
+# scale -- tens of files, not thousands).
+make a function called depgraph_map_get takes m, key returns val
+  let i = 0
+  let n = to_num(list_len(m))
+  while i < n do
+    if m[i][0] == key then
+      return m[i][1]
+    end
+    let i = i + 1
+  end
+  return []
+end
+
+make a function called depgraph_map_append takes m, key, value returns m2
+  let i = 0
+  let n = to_num(list_len(m))
+  while i < n do
+    if m[i][0] == key then
+      let existing = m[i][1]
+      let updated = list_push(existing, value)
+      return list_set(m, i, [key, updated])
+    end
+    let i = i + 1
+  end
+  return list_push(m, [key, [value]])
+end
+
+# Builds the graph from an already-decided file list -- split out from
+# depgraph_build so a caller with a non-standard collection strategy (see
+# tools/depgraph_main.patlang's special-cased 4th root, which needs
+# self_hosting/'s own top-level *.patlang files without recursing into
+# self_hosting/build or self_hosting/runtime) can still reuse the same
+# graph-building logic instead of duplicating this loop.
+make a function called depgraph_build_from_files takes files returns graph
+  let direct = []
+  let reverse = []
+  let i = 0
+  let n = to_num(list_len(files))
+  while i < n do
+    let f = files[i]
+    let inc = depgraph_scan_includes(f)
+    let direct = depgraph_map_append_all(direct, f, inc)
+    let j = 0
+    let jn = to_num(list_len(inc))
+    while j < jn do
+      let reverse = depgraph_map_append(reverse, inc[j], f)
+      let j = j + 1
+    end
+    let i = i + 1
+  end
+  return [files, direct, reverse]
+end
+
+make a function called depgraph_build takes roots returns graph
+  let files = depgraph_collect_files(roots)
+  return depgraph_build_from_files(files)
+end
+
+make a function called depgraph_map_append_all takes m, key, values returns m2
+  let i = 0
+  let n = to_num(list_len(m))
+  while i < n do
+    if m[i][0] == key then
+      return list_set(m, i, [key, values])
+    end
+    let i = i + 1
+  end
+  return list_push(m, [key, values])
+end
+
+make a function called depgraph_direct_includes takes graph, file returns included
+  return depgraph_map_get(graph[1], file)
+end
+
+make a function called depgraph_included_by takes graph, file returns includers
+  return depgraph_map_get(graph[2], file)
+end
+
+# 3-color DFS cycle detection. Returns a list of cycles found, each cycle
+# itself a list of file paths in order, e.g. [a, b, c, a] -- the actual
+# path, not just "a cycle exists somewhere".
+make a function called depgraph_dfs_visit takes graph, node, state, path, cycles returns result
+  # state: list of [file, color] pairs; color "visiting" or "done"
+  let color = depgraph_map_get(state, node)
+  if depgraph_list_contains(color, "visiting") then
+    # found the start of the cycle within `path`
+    let idx = 0
+    let found = -1
+    let pn = to_num(list_len(path))
+    while idx < pn do
+      if path[idx] == node then
+        let found = idx
+      end
+      let idx = idx + 1
+    end
+    let cyc = []
+    let idx = found
+    while idx < pn do
+      let cyc = list_push(cyc, path[idx])
+      let idx = idx + 1
+    end
+    let cyc = list_push(cyc, node)
+    let cycles = list_push(cycles, cyc)
+    return [state, cycles]
+  end
+  if depgraph_list_contains(color, "done") then
+    return [state, cycles]
+  end
+  let state = depgraph_map_append_all(state, node, ["visiting"])
+  let path = list_push(path, node)
+  let deps = depgraph_direct_includes(graph, node)
+  let i = 0
+  let n = to_num(list_len(deps))
+  while i < n do
+    let result = depgraph_dfs_visit(graph, deps[i], state, path, cycles)
+    let state = result[0]
+    let cycles = result[1]
+    let i = i + 1
+  end
+  let state = depgraph_map_append_all(state, node, ["done"])
+  return [state, cycles]
+end
+
+make a function called depgraph_find_cycles takes graph returns cycles
+  let files = graph[0]
+  let state = []
+  let cycles = []
+  let i = 0
+  let n = to_num(list_len(files))
+  while i < n do
+    let result = depgraph_dfs_visit(graph, files[i], state, [], cycles)
+    let state = result[0]
+    let cycles = result[1]
+    let i = i + 1
+  end
+  return cycles
+end
+
+make a function called depgraph_list_concat takes a, b returns c
+  let out = a
+  let i = 0
+  let n = to_num(list_len(b))
+  while i < n do
+    let out = list_push(out, b[i])
+    let i = i + 1
+  end
+  return out
+end
+
+
+make a function called str_ends_with takes s, suffix returns matches
+  if suffix.length > s.length then
+    return false
+  end
+  return substr(s, s.length - suffix.length, suffix.length) == suffix
+end
