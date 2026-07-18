@@ -60,7 +60,14 @@ impl Interpreter {
                 }
                 Instr::StoreLocal(name) => {
                     let v = stack.pop().ok_or("stack underflow")?;
-                    locals.insert(name.clone(), v);
+                    // Reassigning an already-declared local (the common case
+                    // in any loop) needs no new key -- get_mut avoids the
+                    // String allocation `name.clone()` would otherwise pay
+                    // on every single store, not just the first declaration.
+                    match locals.get_mut(name) {
+                        Some(slot) => *slot = v,
+                        None => { locals.insert(name.clone(), v); }
+                    }
                 }
                 Instr::UnOp(kind) => {
                     let a = stack.pop().ok_or("stack underflow")?;

@@ -883,7 +883,7 @@ fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Va
         match &func.body[pc] {
             Instr::Const(v) => stack.push(v.clone()),
             Instr::LoadLocal(n) => stack.push(locals.get(n).cloned().unwrap_or(Value::Unit)),
-            Instr::StoreLocal(n) => { let v = stack.pop().ok_or("stack underflow")?; locals.insert(n.clone(), v); },
+            Instr::StoreLocal(n) => { let v = stack.pop().ok_or("stack underflow")?; match locals.get_mut(n) { Some(slot) => *slot = v, None => { locals.insert(n.clone(), v); } } },
             Instr::UnOp(k) => {
                 let a = stack.pop().ok_or("stack underflow")?;
                 let r = match k { UnOpKind::Neg => neg(&a)?, UnOpKind::Not => Value::Bool(!a.as_bool()?), UnOpKind::BitNot => bitnot(&a)? };
@@ -1786,6 +1786,13 @@ fn display_value(v: &Value) -> String { nt_value_to_string(v) }
 fn to_s(v: &Value) -> String { nt_value_to_string(v) }
 
 fn add(a:&Value,b:&Value)->Result<Value,String>{
+    // Fast path, mirroring ops.rs::add exactly (same rationale: Int/Int and
+    // Float/Float are the overwhelming common case, skipping the NumT
+    // conversion + promote_pair for them is a real, measured win).
+    if let (Value::Int(x), Value::Int(y)) = (a, b) {
+        return Ok(match x.checked_add(*y) { Some(v) => Value::Int(v), None => nt_to_value(NumT::Big(BigIntT::from_i64(*x).add(&BigIntT::from_i64(*y))).normalize()) });
+    }
+    if let (Value::Float(x), Value::Float(y)) = (a, b) { return Ok(Value::Float(x + y)); }
     match (a,b) {
         (Value::String(sa), _) => Ok(Value::String(format!("{}{}", sa, to_s(b)))),
         (_, Value::String(sb)) => Ok(Value::String(format!("{}{}", to_s(a), sb))),
@@ -1794,12 +1801,20 @@ fn add(a:&Value,b:&Value)->Result<Value,String>{
     }
 }
 fn sub(a:&Value,b:&Value)->Result<Value,String>{
+    if let (Value::Int(x), Value::Int(y)) = (a, b) {
+        return Ok(match x.checked_sub(*y) { Some(v) => Value::Int(v), None => nt_to_value(NumT::Big(BigIntT::from_i64(*x).sub(&BigIntT::from_i64(*y))).normalize()) });
+    }
+    if let (Value::Float(x), Value::Float(y)) = (a, b) { return Ok(Value::Float(x - y)); }
     match (a,b) {
         (Value::Complex(_), _) | (_, Value::Complex(_)) => Ok(nt_normalize_complex(nt_to_complex(a)?.sub(&nt_to_complex(b)?))),
         _ => Ok(nt_to_value(nt_from_value(a)?.sub(&nt_from_value(b)?))),
     }
 }
 fn mul(a:&Value,b:&Value)->Result<Value,String>{
+    if let (Value::Int(x), Value::Int(y)) = (a, b) {
+        return Ok(match x.checked_mul(*y) { Some(v) => Value::Int(v), None => nt_to_value(NumT::Big(BigIntT::from_i64(*x).mul(&BigIntT::from_i64(*y))).normalize()) });
+    }
+    if let (Value::Float(x), Value::Float(y)) = (a, b) { return Ok(Value::Float(x * y)); }
     match (a,b) {
         (Value::Complex(_), _) | (_, Value::Complex(_)) => Ok(nt_normalize_complex(nt_to_complex(a)?.mul(&nt_to_complex(b)?))),
         _ => Ok(nt_to_value(nt_from_value(a)?.mul(&nt_from_value(b)?))),
@@ -1883,6 +1898,14 @@ fn shr(a:&Value,b:&Value)->Result<Value,String>{
 fn cmp(k:&BinOpKind,a:&Value,b:&Value)->Result<Value,String>{
     use BinOpKind::*;
     if let (Value::String(x), Value::String(y)) = (a, b) {
+        let res = match k { Eq=>x==y, Ne=>x!=y, Lt=>x<y, Le=>x<=y, Gt=>x>y, Ge=>x>=y, _=>false };
+        return Ok(Value::Bool(res));
+    }
+    if let (Value::Int(x), Value::Int(y)) = (a, b) {
+        let res = match k { Eq=>x==y, Ne=>x!=y, Lt=>x<y, Le=>x<=y, Gt=>x>y, Ge=>x>=y, _=>false };
+        return Ok(Value::Bool(res));
+    }
+    if let (Value::Float(x), Value::Float(y)) = (a, b) {
         let res = match k { Eq=>x==y, Ne=>x!=y, Lt=>x<y, Le=>x<=y, Gt=>x>y, Ge=>x>=y, _=>false };
         return Ok(Value::Bool(res));
     }
