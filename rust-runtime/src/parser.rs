@@ -174,17 +174,19 @@ impl<'a> Parser<'a> {
                 break;
             }
 
-            // If the next token can start a statement but we didn't see any separator
-            // and there was no newline, require a separator on the same line.
-            if self.can_start_statement() && !saw_sep && !saw_nl {
-                return Err(ParserError::ExpectedToken {
-                    expected: "separator between statements",
-                    line: self.line_no,
-                    hint: "Insert ';' or a newline between statements",
-                });
-            }
-
-            // Otherwise, continue; any non-statement-start here is an error (handled at next parse attempt)
+            // A separator (';'/newline/etc, collected above) is welcome but no longer
+            // required: by the time a statement is fully parsed, its own expression
+            // parser has already resolved exactly how far it extends (operator
+            // lookahead, not newline significance -- see parse_expression's own
+            // continuation rule), so there's no remaining ambiguity for a separator
+            // to protect against here. The one case that WOULD have been ambiguous --
+            // a bare `{ ... }` sitting where it could be misread as either its own
+            // statement or a trailing-closure argument to whatever just finished --
+            // is handled by rejecting bare `{ ... }` as a statement outright (see
+            // parse_statement's Token::BlockStart arm), not by requiring a separator
+            // everywhere. `saw_sep`/`saw_nl` remain unused for gating now, kept only
+            // because the loop above still needs to consume the separator tokens.
+            let _ = (saw_sep, saw_nl);
         }
         check_when_placement(&stmts, 0)?;
         Ok(stmts)
@@ -235,6 +237,22 @@ impl<'a> Parser<'a> {
 
     fn parse_statement(&mut self) -> Result<Stmt, ParserError> {
         match self.curr {
+            // A bare `{ ... }` is only meaningful as a VALUE (parse_primary still
+            // turns it into a zero-param closure literal there, e.g. `let f = { ... }`
+            // -- a real, deliberate function literal, not a leftover tolerance) --
+            // never as its own free-standing statement. Rejecting it here, rather
+            // than letting it fall through to the general expression-statement path
+            // below, is what makes the statement separator above safe to drop: a
+            // bare block sitting right after something that could take a trailing-
+            // closure argument (`f(x)`) would otherwise be genuinely ambiguous
+            // between "f(x) followed by its own discarded closure statement" and
+            // "f(x) { ... }" sugar. With this rejected outright, that ambiguity
+            // can't arise.
+            Token::BlockStart => Err(ParserError::UnexpectedToken {
+                token: Token::BlockStart,
+                line: self.line_no,
+                hint: "A bare '{ ... }' isn't a statement on its own -- it's a function literal as a VALUE (e.g. `let f = { ... }`, then call it with `f()`), not something to write standalone",
+            }),
             Token::Let => self.parse_let(),
             Token::Fn => self.parse_function(),
             Token::Return => self.parse_return(),
@@ -517,6 +535,7 @@ impl<'a> Parser<'a> {
                         return Ok(Stmt::ExprStmt(Expr::String("".into())));
                     }
                 }
+                let start_line = self.line_no;
                 let expr = self.parse_expression(0)?;
                 // If we just parsed a Member expr and see '=', treat as member assignment
                 if matches!(self.curr, Token::Equal) {
@@ -533,6 +552,20 @@ impl<'a> Parser<'a> {
                     } else {
                         return Err(ParserError::UnexpectedToken { token: self.curr.clone(), line: self.line_no, hint: "Unexpected token; check for missing operators or delimiters" });
                     }
+                }
+                // "You computed a value and threw it away, sure you want to do
+                // that?" -- a soft warning, not an error: only for expressions
+                // that structurally cannot have a side effect (a literal,
+                // arithmetic/comparison over such, a bare variable read, a list
+                // literal of such). A Call is deliberately never flagged here --
+                // print(x)'s whole point is a discarded Unit return, and that's
+                // the overwhelmingly common shape of a real, intentional bare
+                // expression statement.
+                if is_side_effect_free_expr(&expr) {
+                    eprintln!(
+                        "warning: line {}: this expression's value is computed and discarded -- did you mean to assign it, print it, or was an operator/statement missing?",
+                        start_line
+                    );
                 }
                 Ok(Stmt::ExprStmt(expr))
             }
@@ -1229,5 +1262,21 @@ impl<'a> Parser<'a> {
         } else {
             Err(ParserError::ExpectedToken { expected: "mismatched token", line: self.line_no, hint })
         }
+    }
+}
+
+// Only true for expression shapes that structurally cannot perform a side
+// effect -- Call/Member/Index/Closure/Budgeted are all deliberately
+// excluded (a Call in particular is nearly always intentional, print(x)
+// being the paradigm case), so this only flags the cases genuinely likely
+// to be a mistake: a stray literal, a bare variable read, an arithmetic/
+// comparison expression, or a list built from such.
+fn is_side_effect_free_expr(e: &Expr) -> bool {
+    match e {
+        Expr::Number(_) | Expr::Float(_) | Expr::String(_) | Expr::Identifier(_) => true,
+        Expr::List(items) => items.iter().all(is_side_effect_free_expr),
+        Expr::UnaryOp { expr, .. } => is_side_effect_free_expr(expr),
+        Expr::BinaryOp { left, right, .. } => is_side_effect_free_expr(left) && is_side_effect_free_expr(right),
+        Expr::Member { .. } | Expr::Index { .. } | Expr::Closure { .. } | Expr::Call { .. } | Expr::Budgeted { .. } => false,
     }
 }
