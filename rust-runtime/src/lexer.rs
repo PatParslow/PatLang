@@ -165,6 +165,14 @@ macro_rules! lex_debug {
 impl<'a> Lexer<'a> {
     pub fn new(input: &'a str) -> Self {
         lex_debug!("[DEBUG] Lexer::new called with input:\n{}", input);
+        // Tolerate (strip) a leading UTF-8 byte-order mark -- common,
+        // harmless, and written by default by several widespread tools
+        // (e.g. .NET's `System.Text.Encoding.UTF8`/File.WriteAllText).
+        // Without this, since the lexer works over raw bytes rather than
+        // decoded chars for structural scanning, the BOM's first byte
+        // hit the "unrecognized character" fallback below -- see that
+        // fallback's own comment for what that used to silently do.
+        let input = input.strip_prefix('\u{FEFF}').unwrap_or(input);
         Lexer { input, position: 0 }
     }
 
@@ -428,7 +436,20 @@ impl<'a> Lexer<'a> {
                         Token::Not
                     }
                 },
-                _ => Token::EOF,
+                // A genuinely unrecognized byte (not matched by any case
+                // above) used to silently become Token::EOF -- meaning the
+                // lexer treated the REST OF THE FILE as if it didn't exist,
+                // with no error at all, rather than reporting what actually
+                // went wrong. Confirmed as a real, silent-failure bug: a
+                // leading UTF-8 BOM (bytes EF BB BF, e.g. written by
+                // `System.Text.Encoding.UTF8` in .NET's File.WriteAllText,
+                // the exact case that surfaced this) made an entire program
+                // silently execute as empty -- exit code 0, zero output, no
+                // error anywhere, for a file that visibly contained real
+                // code. `self.position` was already advanced past this byte
+                // above, so it's reported as the position that was actually
+                // consumed.
+                _ => return Err(LexerError::UnexpectedCharacter(c, self.position - 1)),
             };
             lex_debug!("[DEBUG][lexer] Returning {:?}", token);
             return Ok(token);
