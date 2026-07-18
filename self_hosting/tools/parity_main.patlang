@@ -1,0 +1,143 @@
+# Three-way parity checker: runs a PatLang file through all three execution
+# paths (interpreted, natively compiled, self-hosted compiled) and diffs
+# their output. Systematizes what was previously a repeated manual ritual
+# during debugging this session (the lib/lower.patlang stray-`end` hunt,
+# the parser self-reference bug, verifying the linter) -- and is literally
+# the documented verification step in CLAUDE.md's mirror-check discipline.
+#
+# Usage (run from the repo root):
+#   pat --ir-run self_hosting/tools/parity_main.patlang <file.patlang> [--quiet]
+#
+# --quiet   only print the final PASS/FAIL line (for scripting/hooks) --
+#           still exits with a message, just skips the full breakdown.
+#
+# Exits 0 on PASS, nonzero on FAIL or a compile-step failure.
+
+make a function called parity_default_pat_exe returns path
+  return "rust-runtime/target/release/pat.exe"
+end
+
+# Every exec_capture target MUST be invoked with a path containing a
+# separator ("./x", not bare "x") -- see CLAUDE.md: on Windows,
+# CreateProcess's bare-filename search (SafeProcessSearchMode) excludes
+# the current directory, so a bare "patc1.exe" fails with a misleading
+# "not found" even though the file exists and runs fine from a shell.
+make a function called parity_local_exe takes name returns path
+  return "./" + name
+end
+
+# [ok(bool), output(string)] -- ok is false if the compile step itself
+# failed (nonzero exit / missing output binary), which is reported as a
+# distinct failure mode from an output mismatch between paths that DID
+# all compile.
+make a function called parity_run_interpreted takes pat_exe, file returns result
+  let out = exec_capture(pat_exe, "--ir-run", file)
+  return [true, out]
+end
+
+make a function called parity_run_native takes pat_exe, file, run_tag returns result
+  # A unique-per-run filename, not a fixed shared one -- a fixed name that
+  # already exists from a previous run would let a SILENTLY FAILED compile
+  # here go undetected: file_exists would still see the old file and the
+  # tool would report stale output as if it were this run's, with no error
+  # at all. There's no delete_file host function to clear a fixed path
+  # first, so a fresh name that structurally cannot pre-exist is simpler
+  # and more robust than delete-then-recreate would be anyway.
+  let out_exe = "self_hosting/build/parity_native_" + run_tag + ".exe"
+  let compile_out = exec_capture(pat_exe, "--patc", file, "--out", out_exe)
+  if file_exists(out_exe) != "1" then
+    return [false, "Path B (native compile) failed to produce " + out_exe + ":\n" + compile_out]
+  end
+  let out = exec_capture(parity_local_exe(out_exe))
+  return [true, out]
+end
+
+make a function called parity_ensure_patc1 returns ok
+  if file_exists("patc1.exe") == "1" then
+    return true
+  end
+  let pat_exe = parity_default_pat_exe()
+  print("patc1.exe missing -- building it first (self_hosting/build_patc1.patlang) ...")
+  exec_capture(pat_exe, "--ir-run", "self_hosting/build_patc1.patlang")
+  return file_exists("patc1.exe") == "1"
+end
+
+make a function called parity_run_selfhost takes file, run_tag returns result
+  if parity_ensure_patc1() == false then
+    return [false, "Path C (self-hosted compile) failed: patc1.exe could not be built"]
+  end
+  # Unique-per-run filename -- see parity_run_native's comment; same reason.
+  let out_exe = "self_hosting/build/parity_selfhost_" + run_tag + ".exe"
+  let compile_out = exec_capture(parity_local_exe("patc1.exe"), file, out_exe)
+  if file_exists(out_exe) != "1" then
+    return [false, "Path C (self-hosted compile) failed to produce " + out_exe + ":\n" + compile_out]
+  end
+  let out = exec_capture(parity_local_exe(out_exe))
+  return [true, out]
+end
+
+make a function called parity_report takes file, quiet returns passed
+  let pat_exe = parity_default_pat_exe()
+  let run_tag = to_num(now_ms())
+  let a = parity_run_interpreted(pat_exe, file)
+  let b = parity_run_native(pat_exe, file, run_tag)
+  let c = parity_run_selfhost(file, run_tag)
+
+  let a_ok = a[0]
+  let b_ok = b[0]
+  let c_ok = c[0]
+
+  if (a_ok and b_ok and c_ok) == false then
+    print("FAIL: " + file + " (a compile step failed)")
+    if quiet == false then
+      if a_ok == false then
+        print(a[1])
+      end
+      if b_ok == false then
+        print(b[1])
+      end
+      if c_ok == false then
+        print(c[1])
+      end
+    end
+    return false
+  end
+
+  let out_a = a[1]
+  let out_b = b[1]
+  let out_c = c[1]
+
+  if (out_a == out_b) and (out_b == out_c) then
+    print("PASS: " + file + " (interpreted, native, and self-hosted all agree)")
+    return true
+  else
+    print("FAIL: " + file + " (outputs differ)")
+    if quiet == false then
+      print("--- interpreted (--ir-run) ---")
+      print(out_a)
+      print("--- native compiled (--patc) ---")
+      print(out_b)
+      print("--- self-hosted compiled (patc1.exe) ---")
+      print(out_c)
+    end
+    return false
+  end
+end
+
+make a function called parity_main_run returns done
+  let args = argv()
+  if args.length < 1 then
+    print("usage: parity_main <file.patlang> [--quiet]")
+    return false
+  end
+  let file = args[0]
+  let quiet = false
+  if args.length >= 2 then
+    if args[1] == "--quiet" then
+      let quiet = true
+    end
+  end
+  return parity_report(file, quiet)
+end
+
+parity_main_run()
