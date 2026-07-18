@@ -53,10 +53,102 @@
 # not baked into the native primitive" principle Slice 1's int-to-
 # string conversion already established -- growing the allocator later
 # means writing more PatLang, not touching this backend again.
+#
+# STRINGS (Slice 3): a string is a heap-allocated block laid out as
+# [8-byte length][raw bytes, not null-terminated] -- an ordinary
+# integer address, same as every other value in this backend's
+# monomorphic world, no new tag or runtime type. String LITERALS
+# become `.data` labels (an 8-byte length + the literal's raw bytes,
+# encoded as explicit byte VALUES via db, not a quoted NASM string, so
+# no escaping logic is needed for quotes/newlines/anything else) --
+# see x64_collect_string_data. Every string OPERATION (concat, length,
+# printing) is ordinary PatLang in lib/x64_runtime.patlang built from
+# the existing mem_peek/poke_byte/qword + rt_heap_alloc primitives --
+# NO new native primitives were needed for strings at all.
+#
+# DELIBERATE SCOPE LIMIT: `+` on the IR's `Bin` instruction is STILL
+# always integer addition -- this backend has no dynamic type tags, so
+# it cannot tell at codegen time whether a pushed value is an int or a
+# string pointer, and making `+` polymorphic would need real type
+# inference or runtime tagging (a much bigger, separate undertaking).
+# String concatenation is therefore its own explicitly-named function,
+# `rt_str_concat(a, b)`, not operator overloading -- a real, named
+# simplification, not an oversight.
 # =============================================================================
 
 make a function called nl returns s
   return chr(10)
+end
+
+# ---- string literal data (Slice 3) ----
+#
+# Two passes over the SAME ir[2] funcs list, in the SAME deterministic
+# order, each independently resetting and re-incrementing this counter
+# -- x64_collect_string_data (pass 1, builds the .data text) and the
+# ordinary x64_emit_func/x64_emit_instr codegen walk (pass 2) therefore
+# assign IDENTICAL S0/S1/S2/... labels to the same Const "str" nodes
+# without needing any lookup table between the two passes.
+make a function called x64_string_label_reset returns done
+  set_var("__x64_str_counter", 0)
+  return true
+end
+
+make a function called x64_string_label_next returns label
+  let n = to_num(get("__vars", "__x64_str_counter"))
+  set_var("__x64_str_counter", n + 1)
+  return "S" + n
+end
+
+# A string literal's raw bytes as NASM `db` byte-value text (e.g.
+# "72,101,108,108,111"), not a quoted NASM string -- sidesteps quoting/
+# escaping entirely, uniformly handles every character. An empty
+# string still needs at least one byte for `db` to accept, hence the
+# "0" placeholder (never read, since the stored length is 0).
+make a function called x64_bytes_of takes text returns s
+  let h = str_intern(text)
+  let n = to_num(sc_len(h))
+  if n == 0 then
+    return "0"
+  end
+  let sb = sb_new()
+  let i = 0
+  while i < n do
+    if i > 0 then
+      sb_push(sb, ",")
+    end
+    sb_push(sb, "" + sc_code(h, i))
+    let i = i + 1
+  end
+  return sb_str(sb)
+end
+
+# Walks every function's instructions once, emitting one .data label
+# per Const "str" node encountered, in encounter order.
+make a function called x64_collect_string_data takes ir returns asm
+  x64_string_label_reset()
+  let funcs = ir[2]
+  let sb = sb_new()
+  let fn_i = 0
+  let fn_n = to_num(list_len(funcs))
+  while fn_i < fn_n do
+    let instrs = funcs[fn_i][3]
+    let i = 0
+    let n = to_num(list_len(instrs))
+    while i < n do
+      let instr = instrs[i]
+      if instr[0] == "Const" then
+        if instr[1] == "str" then
+          let label = x64_string_label_next()
+          sb_push(sb, label + ":" + nl())
+          sb_push(sb, "    dq " + to_num(sc_len(str_intern(instr[2]))) + nl())
+          sb_push(sb, "    db " + x64_bytes_of(instr[2]) + nl())
+        end
+      end
+      let i = i + 1
+    end
+    let fn_i = fn_i + 1
+  end
+  return sb_str(sb)
 end
 
 # ---- local-variable slot allocation ----
@@ -255,10 +347,17 @@ make a function called x64_emit_instr takes instr, func_name, locals, label retu
       else
         sb_push(sb, "    mov rax, 0" + nl())
       end
+      sb_push(sb, "    push rax" + nl())
     else
-      sb_push(sb, "    mov rax, " + instr[2] + nl())
+      if kind == "str" then
+        let label = x64_string_label_next()
+        sb_push(sb, "    lea rax, [rel " + label + "]" + nl())
+        sb_push(sb, "    push rax" + nl())
+      else
+        sb_push(sb, "    mov rax, " + instr[2] + nl())
+        sb_push(sb, "    push rax" + nl())
+      end
     end
-    sb_push(sb, "    push rax" + nl())
   else
     if ty == "Load" then
       let slot = x64_local_index(locals, instr[1])
@@ -372,8 +471,13 @@ make a function called emit_program_x64 takes ir returns asm
   sb_push(sb, "    align 16" + nl())
   sb_push(sb, "    g_heap resb 16777216" + nl())
   sb_push(sb, nl())
+  sb_push(sb, "section .data" + nl())
+  sb_push(sb, "    align 8" + nl())
+  sb_push(sb, x64_collect_string_data(ir))
+  sb_push(sb, nl())
   sb_push(sb, "section .text" + nl())
   sb_push(sb, nl())
+  x64_string_label_reset()
   let n = to_num(list_len(funcs))
   let i = 0
   while i < n do
