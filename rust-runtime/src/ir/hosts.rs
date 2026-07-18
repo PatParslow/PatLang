@@ -514,6 +514,8 @@ pub fn reset_world() {
     GOALS.with(|g| g.borrow_mut().clear());
     RULES.with(|r| r.borrow_mut().clear());
     ACTIONS.with(|a| a.borrow_mut().clear());
+    GOAL_DEFS.with(|g| g.borrow_mut().clear());
+    ACTION_BODIES.with(|a| a.borrow_mut().clear());
 }
 
 fn to_s(v: &Value) -> String { display_value(v) }
@@ -836,13 +838,12 @@ pub fn host_action_add(args: &[Value]) -> Result<Value, String> {
     Ok(Value::Unit)
 }
 
-pub fn host_plan(args: &[Value]) -> Result<Value, String> {
-    // plan(goal_facts_list) -> List of action names in execution order, or
-    // an empty List if no plan is found within the search cap. Uniform-cost
-    // search (Dijkstra) over world-states so a cheaper multi-step plan is
-    // preferred over a pricier direct one.
-    if args.len() != 1 { return Err("plan: expected 1 arg (goal_facts_list)".into()); }
-    let goal_facts = parse_ground_facts(&args[0]);
+// Core of host_plan, factored out so host_pursue (which resolves a named
+// goal's stored dependency facts via GOAL_DEFS, then plans against them
+// exactly the same way) doesn't duplicate the search. Uniform-cost search
+// (Dijkstra) over world-states so a cheaper multi-step plan is preferred
+// over a pricier direct one.
+fn plan_facts(goal_facts: Vec<GroundFact>) -> Vec<String> {
     let actions: Vec<GoapAction> = ACTIONS.with(|a| a.borrow().clone());
 
     use std::collections::{BinaryHeap, HashSet};
@@ -863,7 +864,7 @@ pub fn host_plan(args: &[Value]) -> Result<Value, String> {
         if node_cost != cost { continue; } // stale heap entry (no decrease-key; skip superseded ones)
         expansions += 1;
         if goal_facts.iter().all(|g| state.contains(g)) {
-            return Ok(Value::List(Arc::new(path.into_iter().map(Value::String).collect())));
+            return path;
         }
         let mut state_key: Vec<GroundFact> = state.iter().cloned().collect();
         state_key.sort();
@@ -882,7 +883,98 @@ pub fn host_plan(args: &[Value]) -> Result<Value, String> {
             }
         }
     }
-    Ok(Value::List(Arc::new(Vec::new())))
+    Vec::new()
+}
+
+pub fn host_plan(args: &[Value]) -> Result<Value, String> {
+    // plan(goal_facts_list) -> List of action names in execution order, or
+    // an empty List if no plan is found within the search cap.
+    if args.len() != 1 { return Err("plan: expected 1 arg (goal_facts_list)".into()); }
+    let goal_facts = parse_ground_facts(&args[0]);
+    Ok(Value::List(Arc::new(plan_facts(goal_facts).into_iter().map(Value::String).collect())))
+}
+
+// ---- goal/pursue/activate surface syntax -- see ast.rs's Stmt::GoalDecl
+// doc comment and lowering.rs's lower_activate for the parse/lowering
+// side. `goal NAME { dep1(args), ... }` registers a named target state
+// (GOAL_DEFS); `pursue NAME` plans against it (same search as `plan`,
+// just resolving its goal-facts argument from the registration instead of
+// taking it directly); `action_bind`/`action_lookup` let a bound
+// PatLang closure be looked back up by action name for `activate` to
+// call (host fns can't call closures themselves -- see lower_activate's
+// doc comment for why dispatch happens in synthesized AST instead of
+// here); `action_base_name`/`action_label_args` split a plan-step label
+// like "build(X=house)" back into ("build", [values]) for that dispatch.
+thread_local! {
+    static GOAL_DEFS: RefCell<HashMap<String, Vec<GroundFact>>> = RefCell::new(HashMap::new());
+    static ACTION_BODIES: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
+}
+
+pub fn host_goal_def(args: &[Value]) -> Result<Value, String> {
+    // goal_def(name, deps_list) -> Unit; deps_list is [[pred,[args]], ...]
+    if args.len() != 2 { return Err("goal_def: expected 2 args (name, deps_list)".into()); }
+    let name = match &args[0] { Value::String(s) => s.clone(), v => to_s(v) };
+    let deps = parse_ground_facts(&args[1]);
+    GOAL_DEFS.with(|g| g.borrow_mut().insert(name, deps));
+    Ok(Value::Unit)
+}
+
+pub fn host_pursue(args: &[Value]) -> Result<Value, String> {
+    // pursue(name) -> List of action names in execution order (see
+    // host_plan) for a goal previously declared via `goal NAME { ... }`.
+    if args.len() != 1 { return Err("pursue: expected 1 arg (goal name)".into()); }
+    let name = match &args[0] { Value::String(s) => s.clone(), v => to_s(v) };
+    let goal_facts = GOAL_DEFS.with(|g| g.borrow().get(&name).cloned())
+        .ok_or_else(|| format!("pursue: unknown goal '{}' (declare it with `goal {} {{ ... }}` first)", name, name))?;
+    Ok(Value::List(Arc::new(plan_facts(goal_facts).into_iter().map(Value::String).collect())))
+}
+
+pub fn host_action_bind(args: &[Value]) -> Result<Value, String> {
+    // action_bind(name, closure) -> Unit; registers the closure that
+    // `activate` calls (with a List of the action's bound arg values as
+    // its single argument) for each plan step matching this action name.
+    if args.len() != 2 { return Err("action_bind: expected 2 args (name, closure)".into()); }
+    let name = match &args[0] { Value::String(s) => s.clone(), v => to_s(v) };
+    ACTION_BODIES.with(|a| a.borrow_mut().insert(name, args[1].clone()));
+    Ok(Value::Unit)
+}
+
+pub fn host_action_lookup(args: &[Value]) -> Result<Value, String> {
+    // action_lookup(name) -> the closure bound via action_bind, or an
+    // error if none was ever bound for this action name.
+    if args.len() != 1 { return Err("action_lookup: expected 1 arg (name)".into()); }
+    let name = match &args[0] { Value::String(s) => s.clone(), v => to_s(v) };
+    ACTION_BODIES.with(|a| a.borrow().get(&name).cloned())
+        .ok_or_else(|| format!("activate: no action bound to '{}' (call action_bind(\"{}\", ...) first)", name, name))
+}
+
+fn split_action_label(label: &str) -> (String, Vec<String>) {
+    // "build" -> ("build", []); "build(X=house,Y=2)" -> ("build", ["house","2"])
+    match label.find('(') {
+        None => (label.to_string(), Vec::new()),
+        Some(open) => {
+            let name = label[..open].to_string();
+            let inner = label[open + 1..label.len().saturating_sub(1).max(open + 1)].trim_end_matches(')');
+            if inner.is_empty() { return (name, Vec::new()); }
+            let vals = inner.split(',').map(|pair| {
+                match pair.split_once('=') { Some((_, v)) => v.to_string(), None => pair.to_string() }
+            }).collect();
+            (name, vals)
+        }
+    }
+}
+
+pub fn host_action_base_name(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 { return Err("action_base_name: expected 1 arg (label)".into()); }
+    let label = to_s(&args[0]);
+    Ok(Value::String(split_action_label(&label).0))
+}
+
+pub fn host_action_label_args(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 { return Err("action_label_args: expected 1 arg (label)".into()); }
+    let label = to_s(&args[0]);
+    let vals = split_action_label(&label).1;
+    Ok(Value::List(Arc::new(vals.into_iter().map(Value::String).collect())))
 }
 
 // ---- bitfield helpers: plain-integer packed-field access, the practical
@@ -2215,6 +2307,12 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("solve", host_solve);
     interp.host.insert("action_add", host_action_add);
     interp.host.insert("plan", host_plan);
+    interp.host.insert("goal_def", host_goal_def);
+    interp.host.insert("pursue", host_pursue);
+    interp.host.insert("action_bind", host_action_bind);
+    interp.host.insert("action_lookup", host_action_lookup);
+    interp.host.insert("action_base_name", host_action_base_name);
+    interp.host.insert("action_label_args", host_action_label_args);
     interp.host.insert("bit_get", host_bit_get);
     interp.host.insert("bit_set", host_bit_set);
     interp.host.insert("bit_slice", host_bit_slice);

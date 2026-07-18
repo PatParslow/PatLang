@@ -246,9 +246,40 @@ ordinary derivable data usable as a rule-body conjunct or GOAP
 precondition. See `self_hosting/examples/goal_oriented_build_demo.patlang`
 and `self_hosting/examples/rule_syntax_demo.patlang`.
 
-Deliberately not (yet) real: `goal name { ... }` block syntax still
-silently no-ops — unlike `rule`, there's no unambiguous mapping onto
-`solve`/`plan` (named query? GOAP action? imperative body?).
+**`goal`/`pursue`/`activate`** — real GOAP surface syntax over the same
+`action_add`/`plan` engine above. `goal NAME { dep1(args), ... }` names a
+target state as a list of fact-terms (sugar over a `goal_def` host call,
+mirroring how `rule Head(...) :- Body.` sugars over `rule_add`). `pursue
+NAME` is an expression that plans against a declared goal (the same
+search `plan(...)` does). `activate PLAN` actually runs the plan: each
+step's action must be bound to a real closure via `action_bind` first
+(receiving that step's bound argument values as a single List, since the
+real arg count is only known once the planner has run); `activate` calls
+each bound closure in order and stops immediately — reporting failure,
+not silently continuing — the moment one returns `false`, since a
+dependency being satisfiable by a function doesn't guarantee that
+function actually succeeds when run:
+
+```patlang
+rule_add("ready", ["a"], [])
+action_add("build", [["ready", ["X"]]], [["built", ["X"]]], [], 1)
+action_bind("build", |args| {
+  print("building " + args[0])
+  return true
+})
+goal need_a { built(a) }
+let p = pursue need_a          # ["build(X=a)"]
+let ok = activate p            # runs build's bound closure, prints "building a"
+```
+
+See `self_hosting/examples/goal_pursue_activate_demo.patlang` for a
+fuller example, including a plan step that fails partway through.
+
+Not yet mirrored into the self-hosted compiler (`patc1.exe` cannot
+compile programs using `goal`/`pursue`/`activate` yet — only the native
+`--ir-run`/`--patc` pipeline understands this syntax so far); `rule_add`/
+`action_add`/`plan`/`action_bind` themselves work everywhere already,
+since they're ordinary function calls, not new syntax.
 
 ### Object-oriented
 

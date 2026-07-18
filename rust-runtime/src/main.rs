@@ -116,7 +116,6 @@ fn real_main() {
         // Guardrail: quick scan for unsupported high-level constructs before parsing
         let unsupported_markers = [
             "reasoning mode",
-            "pursue ",
             "constrain ",
         ];
         if unsupported_markers.iter().any(|m| source.contains(m)) {

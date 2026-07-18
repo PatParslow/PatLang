@@ -249,14 +249,35 @@ impl<'a> Parser<'a> {
                     let expr = self.parse_expression(0)?;
                     return Ok(Stmt::ExprStmt(expr));
                 }
-                // Otherwise, skip DSL-style goal header/body.
+                // Real declarative syntax: `goal NAME { dep1(args), dep2(args) }`
+                // -- names a target state as a list of fact-terms. Sugar
+                // only, lowers to a single goal_def(...) call (see
+                // lower_stmt); see Stmt::GoalDecl's doc comment in ast.rs.
                 self.advance()?; // consume 'goal'
-                while !matches!(self.curr, Token::BlockStart | Token::Dot | Token::Newline | Token::EOF) {
-                    self.advance()?;
+                let name = match &self.curr {
+                    Token::Identifier(s) => { let n = s.clone(); self.advance()?; n }
+                    _ => return Err(ParserError::ExpectedToken { expected: "goal name", line: self.line_no, hint: "Use `goal NAME { dep1(args), dep2(args) }`" }),
+                };
+                self.expect(Token::BlockStart, "'{' after goal name", "Use `goal NAME { dep1(args), dep2(args) }`")?;
+                self.consume_newlines()?;
+                let mut deps: Vec<(String, Vec<Expr>)> = Vec::new();
+                while !matches!(self.curr, Token::BlockEnd | Token::EOF) {
+                    let dep_expr = self.parse_expression(0)?;
+                    match dep_expr {
+                        Expr::Call { function, args } => match *function {
+                            Expr::Identifier(n) => deps.push((n, args)),
+                            _ => return Err(ParserError::UnexpectedToken { token: self.curr.clone(), line: self.line_no, hint: "Each goal dependency must be a fact-term like pred(args)" }),
+                        },
+                        _ => return Err(ParserError::UnexpectedToken { token: self.curr.clone(), line: self.line_no, hint: "Each goal dependency must be a fact-term like pred(args)" }),
+                    }
+                    self.consume_newlines()?;
+                    if matches!(self.curr, Token::Comma) {
+                        self.advance()?;
+                        self.consume_newlines()?;
+                    }
                 }
-                if matches!(self.curr, Token::BlockStart) { self.skip_brace_block()?; }
-                if matches!(self.curr, Token::Dot) { self.advance()?; }
-                Ok(Stmt::ExprStmt(Expr::String(String::new())))
+                self.expect(Token::BlockEnd, "'}' to close goal block", "Close the goal block with '}'")?;
+                Ok(Stmt::GoalDecl { name, deps })
             }
             Token::Rule => {
                 // If followed by '(', treat as normal call: rule(...)
@@ -358,11 +379,12 @@ impl<'a> Parser<'a> {
                         if matches!(self.curr, Token::BlockStart) { self.skip_brace_block()?; }
                         return Ok(Stmt::ExprStmt(Expr::String(String::new())));
                     }
-                    // pursue ... : skip rest of line
-                    if curr_lc == "pursue" {
-                        while !matches!(self.curr, Token::Newline | Token::EOF) { self.advance()?; }
-                        return Ok(Stmt::ExprStmt(Expr::String(String::new())));
-                    }
+                    // `pursue GOAL` is an expression (see parse_primary's
+                    // "pursue" special case, mirroring "budgeted"'s
+                    // precedent) so it can be used as `let p = pursue GOAL`
+                    // -- at the statement level it just falls through to
+                    // ordinary expression-statement parsing below, no
+                    // special case needed here.
                     // Design-by-contract: require/ensure/assert EXPR
                     if curr_lc == "require" || curr_lc == "ensure" || curr_lc == "assert" {
                         self.advance()?; // consume the keyword
@@ -443,11 +465,11 @@ impl<'a> Parser<'a> {
                         }
                         return Ok(Stmt::ExprStmt(Expr::String(String::new())));
                     }
-                    // Activation statements: skip rest of line
-                    if curr_lc == "activate" {
-                        while !matches!(self.curr, Token::Newline | Token::EOF) { self.advance()?; }
-                        return Ok(Stmt::ExprStmt(Expr::String(String::new())));
-                    }
+                    // `activate PLAN` is an expression, see parse_primary's
+                    // "activate" special case (mirroring "pursue"/
+                    // "budgeted") -- at the statement level it just falls
+                    // through to ordinary expression-statement parsing
+                    // below, no special case needed here.
                     // Skip 'case ... end' constructs (Ruby-like)
                     if curr_lc == "case" {
                         self.skip_until_ident("end")?;
@@ -1047,6 +1069,38 @@ impl<'a> Parser<'a> {
                 }
                 self.expect(Token::RBracket, "] to close list", "Close list with ']'" )?;
                 Expr::List(items)
+            }
+            // `pursue GOAL` -- an expression (so `let p = pursue GOAL`
+            // works), desugared into a call against the `pursue` host fn,
+            // GOAL taken as a bare name (matching how goal/rule names are
+            // bare identifiers elsewhere, not general expressions). The
+            // parenthesized form `pursue(x)` is NOT special-cased here --
+            // it falls through to ordinary call parsing below and reaches
+            // the same host fn with whatever expression `x` evaluates to.
+            Token::Identifier(name) if name == "pursue" && !matches!(self.peek, Token::LParen) => {
+                self.advance()?; // consume 'pursue'
+                let goal_name = match &self.curr {
+                    Token::Identifier(s) => { let n = s.clone(); self.advance()?; n }
+                    _ => return Err(ParserError::ExpectedToken { expected: "goal name after 'pursue'", line: self.line_no, hint: "Use `pursue GOAL_NAME`" }),
+                };
+                Expr::Call {
+                    function: Box::new(Expr::Identifier("pursue".into())),
+                    args: vec![Expr::String(goal_name)],
+                }
+            }
+            // `activate PLAN` -- an expression (its value is the overall
+            // success boolean, see lowering.rs's lower_activate), desugared
+            // into a call against the `activate(...)` synthesized dispatch
+            // loop, PLAN taken as a general expression (unlike `pursue`'s
+            // bare goal-name, a plan is an ordinary value -- typically a
+            // variable holding a previous `pursue` result).
+            Token::Identifier(name) if name == "activate" && !matches!(self.peek, Token::LParen) => {
+                self.advance()?; // consume 'activate'
+                let plan = self.parse_expression(0)?;
+                Expr::Call {
+                    function: Box::new(Expr::Identifier("activate".into())),
+                    args: vec![plan],
+                }
             }
             Token::Identifier(name) if name == "budgeted" && matches!(self.peek, Token::LParen) => {
                 self.advance()?; // 'budgeted'
