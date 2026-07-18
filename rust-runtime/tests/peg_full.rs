@@ -175,3 +175,50 @@ fn unclosed_brace_block_is_rejected() {
 fn malformed_rule_decl_missing_closing_dot_is_rejected() {
     reject("rule parent(a, b) :- father(a, b)\n");
 }
+
+// ---- goal/pursue/activate (added when the real syntax landed) ----
+
+#[test]
+fn goal_declaration_with_dependencies() {
+    ok("goal need_house {\n  built(house), foo(bar)\n}\n");
+}
+
+#[test]
+fn goal_declaration_with_no_dependencies() {
+    ok("goal empty_goal {\n}\n");
+}
+
+#[test]
+fn pursue_as_an_expression() {
+    ok("let p = pursue need_house\n");
+}
+
+#[test]
+fn pursue_as_a_bare_statement() {
+    ok("pursue need_house\n");
+}
+
+#[test]
+fn pursue_goal_rule_as_ordinary_parenthesized_calls_not_declarations() {
+    ok("print(rule(1, 2))\nprint(goal(1, 2))\nprint(pursue(1))\n");
+}
+
+#[test]
+fn activate_as_an_expression() {
+    ok("let ok = activate p\n");
+}
+
+#[test]
+fn activate_as_a_bare_statement_both_call_forms() {
+    ok("activate p\nactivate(p)\n");
+}
+
+#[test]
+fn activate_call_inside_an_if_condition_does_not_swallow_the_body_block() {
+    ok("if activate(p) {\n  print(1)\n}\n");
+}
+
+#[test]
+fn malformed_goal_decl_missing_closing_brace_is_rejected() {
+    reject("goal need_house {\n  built(house)\n");
+}
