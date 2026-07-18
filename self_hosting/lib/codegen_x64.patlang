@@ -252,9 +252,33 @@ make a function called x64_binop_asm takes op returns asm
   return sb_str(sb)
 end
 
-# CallHost -- only the five special primitive names are legal here.
+# CallHost -- only the five special primitive names are legal here,
+# PLUS two safe aliases (Slice 4): `l[i]` index syntax always lowers to
+# CallHost("list_get", 2) regardless of backend (lib/lower.patlang's
+# own doing, not special-cased here), and `list_len(l)` is ordinary
+# unrecognized-call-becomes-CallHost the same as any host function
+# name. Both are pure reads with unambiguous semantics (a read is a
+# read regardless of the mutation model), so they're aliased straight
+# to `call rt_list_get`/`call rt_list_len` -- reusing the SAME PatLang
+# implementation, not a separate native primitive. Deliberately NOT
+# aliasing `list_set`/`list_push`: the interpreter's own list_set is
+# copy-on-write/functional, but this backend's rt_list_set (see lib/
+# x64_runtime.patlang) is in-place mutation -- aliasing the ambiguous
+# name would silently change PatLang's own observable semantics, so
+# list construction/mutation stays under its own explicit rt_list_*
+# names instead.
 make a function called x64_callhost_asm takes name, argc returns asm
   let sb = sb_new()
+  if name == "list_get" then
+    sb_push(sb, "    call rt_list_get" + nl())
+    sb_push(sb, "    add rsp, 16" + nl())
+    sb_push(sb, "    push rax" + nl())
+  else
+  if name == "list_len" then
+    sb_push(sb, "    call rt_list_len" + nl())
+    sb_push(sb, "    add rsp, 8" + nl())
+    sb_push(sb, "    push rax" + nl())
+  else
   if name == "mem_scratch_addr" then
     sb_push(sb, "    lea rax, [rel g_scratch]" + nl())
     sb_push(sb, "    push rax" + nl())
@@ -332,6 +356,37 @@ make a function called x64_callhost_asm takes name, argc returns asm
       end
     end
   end
+  end
+  end
+  return sb_str(sb)
+end
+
+# BuildList (Slice 4): the argc elements are already on the real stack
+# in left-to-right pushed order (leftmost/element[0] deepest). Same
+# [8-byte length][elements] block layout as strings, except each
+# element is a plain qword (no byte-packing needed -- every PatLang
+# value in this backend is already a qword, so a "list of anything" is
+# trivially a list of qwords, including string/list addresses
+# themselves). Allocates via an ordinary Call to rt_heap_alloc (same
+# internal calling convention as any other function call), using r12
+# (non-volatile, safe across that call) to hold the new list's address
+# while the pushed elements get popped into it in reverse order.
+make a function called x64_buildlist_asm takes argc returns asm
+  let n = to_num(argc)
+  let sb = sb_new()
+  sb_push(sb, "    mov rax, " + (8 + n * 8) + nl())
+  sb_push(sb, "    push rax" + nl())
+  sb_push(sb, "    call rt_heap_alloc" + nl())
+  sb_push(sb, "    add rsp, 8" + nl())
+  sb_push(sb, "    mov r12, rax" + nl())
+  sb_push(sb, "    mov qword [r12], " + n + nl())
+  let k = n - 1
+  while k >= 0 do
+    sb_push(sb, "    pop rbx" + nl())
+    sb_push(sb, "    mov [r12+" + (8 + k * 8) + "], rbx" + nl())
+    let k = k - 1
+  end
+  sb_push(sb, "    push r12" + nl())
   return sb_str(sb)
 end
 
@@ -391,6 +446,9 @@ make a function called x64_emit_instr takes instr, func_name, locals, label retu
                   end
                   sb_push(sb, "    push rax" + nl())
                 else
+                  if ty == "BuildList" then
+                    sb_push(sb, x64_buildlist_asm(instr[1]))
+                  else
                   if ty == "Return" then
                     if func_name == "main" then
                       sb_push(sb, "    mov r15, rsp" + nl())
@@ -406,6 +464,7 @@ make a function called x64_emit_instr takes instr, func_name, locals, label retu
                   else
                     print("codegen_x64: unsupported IR instruction for Slice 1: " + ty)
                     return "UNSUPPORTED_INSTR_ERROR"
+                  end
                   end
                 end
               end
