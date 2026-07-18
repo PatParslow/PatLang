@@ -1,0 +1,451 @@
+# =============================================================================
+# PEG grammar-file reader + interpreter (self-hosted side). See the "PEG
+# shared-grammar validator" plan for the full design rationale -- this is
+# a validation-only tool (accept/reject a token stream against a .peg
+# grammar file), NOT a parser replacement and NOT AST construction.
+#
+# Grammar node shapes (this file's own small AST, distinct from
+# lib/parser.patlang's PatLang-program AST):
+#   ["Lit", text]        terminal -- category inferred from text (alpha ->
+#                         IDENT, else -> OP), mirrors tok_is's own convention
+#   ["Ref", name]         rule reference
+#   ["Seq", [items]]      sequence
+#   ["Choice", [items]]   ordered choice
+#   ["Star", item]        zero or more
+#   ["Plus", item]        one or more
+#   ["Opt", item]         zero or one
+#   ["And", item]         positive lookahead (consumes nothing)
+#   ["Not", item]         negative lookahead (consumes nothing)
+#
+# A loaded grammar (a "ruleset") is a list of [name, expr] pairs.
+# =============================================================================
+
+# ---- .peg file tokenizer: a small, standalone lexer for the grammar
+# format itself, NOT lib/lexer.patlang (the grammar file's own syntax --
+# quoted literals, <-, / * + ? & ! ( ) -- is a fixed, tiny format that
+# doesn't need or want PatLang's own tokenization rules). ----
+
+make a function called peg_is_ident_char takes c returns r
+  return is_alpha_code(c) or is_digit_code(c)
+end
+
+make a function called peg_tokenize takes source returns toks
+  let toks = []
+  let n = source.length
+  let i = 0
+  while i < n do
+    let c = char_code(source, i)
+    if (c == 32) or (c == 9) or (c == 10) or (c == 13) then
+      let i = i + 1
+    else
+      if c == 35 then
+        while (i < n) and (char_code(source, i) != 10) do
+          let i = i + 1
+        end
+      else
+        if c == 34 then
+          let start = i + 1
+          let j = start
+          while (j < n) and (char_code(source, j) != 34) do
+            let j = j + 1
+          end
+          let toks = list_push(toks, ["LIT", substr(source, start, j - start)])
+          let i = j + 1
+        else
+          if peg_is_ident_char(c) then
+            let start = i
+            while (i < n) and peg_is_ident_char(char_code(source, i)) do
+              let i = i + 1
+            end
+            let toks = list_push(toks, ["NAME", substr(source, start, i - start)])
+          else
+            if (c == 60) and (char_code(source, i + 1) == 45) then
+              # '<-'
+              let toks = list_push(toks, ["ARROW", "<-"])
+              let i = i + 2
+            else
+              let toks = list_push(toks, ["SYM", source[i]])
+              let i = i + 1
+            end
+          end
+        end
+      end
+    end
+  end
+  let toks = list_push(toks, ["EOF", ""])
+  return toks
+end
+
+# ---- .peg file parser: builds grammar-node ASTs from the token stream
+# above. Standard PEG-of-PEG precedence: choice is loosest, then
+# sequence, then prefix (&/!), then postfix (* + ?), then atom. ----
+
+make a function called peg_tok_is takes t, ty, tx returns r
+  return (t[0] == ty) and (t[1] == tx)
+end
+
+make a function called peg_parse_atom takes toks, pos returns r
+  let t = toks[pos]
+  if t[0] == "LIT" then
+    return [["Lit", t[1]], pos + 1]
+  else
+    if t[0] == "NAME" then
+      return [["Ref", t[1]], pos + 1]
+    else
+      if peg_tok_is(t, "SYM", "(") then
+        let inner = peg_parse_choice(toks, pos + 1)
+        let p2 = inner[1]
+        if peg_tok_is(toks[p2], "SYM", ")") then
+          return [inner[0], p2 + 1]
+        else
+          return [["Err", "expected ) to close group"], p2]
+        end
+      else
+        return [["Err", "expected literal, rule name, or ("], pos]
+      end
+    end
+  end
+end
+
+make a function called peg_parse_postfix takes toks, pos returns r
+  let atom = peg_parse_atom(toks, pos)
+  let node = atom[0]
+  let p = atom[1]
+  let t = toks[p]
+  if peg_tok_is(t, "SYM", "*") then
+    return [["Star", node], p + 1]
+  else
+    if peg_tok_is(t, "SYM", "+") then
+      return [["Plus", node], p + 1]
+    else
+      if peg_tok_is(t, "SYM", "?") then
+        return [["Opt", node], p + 1]
+      else
+        return [node, p]
+      end
+    end
+  end
+end
+
+make a function called peg_parse_prefix takes toks, pos returns r
+  let t = toks[pos]
+  if peg_tok_is(t, "SYM", "&") then
+    let inner = peg_parse_postfix(toks, pos + 1)
+    return [["And", inner[0]], inner[1]]
+  else
+    if peg_tok_is(t, "SYM", "!") then
+      let inner = peg_parse_postfix(toks, pos + 1)
+      return [["Not", inner[0]], inner[1]]
+    else
+      return peg_parse_postfix(toks, pos)
+    end
+  end
+end
+
+make a function called peg_at_seq_stop takes toks, pos returns r
+  # A NAME immediately followed by ARROW is the NEXT rule's "Name <-"
+  # header, not a Ref inside the current rule's body -- must be checked
+  # with 2-token lookahead (not just "is the CURRENT token an ARROW"):
+  # by the time an ARROW is actually seen, the preceding NAME token
+  # (the next rule's own name) has already been wrongly consumed as a
+  # bare Ref one step earlier. Without this, a multi-rule grammar file
+  # hangs forever: the sequence parser overruns into the next rule,
+  # eventually gets stuck failing to parse a stray ARROW as an atom
+  # without ever advancing pos, looping infinitely. Caught by testing
+  # multi-rule grammar files, not single-rule fragments (which never
+  # exercise this at all).
+  let t = toks[pos]
+  if (t[0] == "NAME") and (toks[pos + 1][0] == "ARROW") then
+    return true
+  end
+  return (t[0] == "EOF") or peg_tok_is(t, "SYM", "/") or peg_tok_is(t, "SYM", ")")
+end
+
+make a function called peg_parse_seq takes toks, pos returns r
+  let items = []
+  let p = pos
+  while peg_at_seq_stop(toks, p) == false do
+    let one = peg_parse_prefix(toks, p)
+    let items = list_push(items, one[0])
+    let p = one[1]
+  end
+  if to_num(list_len(items)) == 1 then
+    return [items[0], p]
+  else
+    return [["Seq", items], p]
+  end
+end
+
+make a function called peg_parse_choice takes toks, pos returns r
+  let first = peg_parse_seq(toks, pos)
+  let items = [first[0]]
+  let p = first[1]
+  while peg_tok_is(toks[p], "SYM", "/") do
+    let next = peg_parse_seq(toks, p + 1)
+    let items = list_push(items, next[0])
+    let p = next[1]
+  end
+  if to_num(list_len(items)) == 1 then
+    return [items[0], p]
+  else
+    return [["Choice", items], p]
+  end
+end
+
+# Parses a full .peg file into a ruleset: [[name, expr], ...].
+make a function called peg_load_grammar takes source returns rules
+  let toks = peg_tokenize(source)
+  let rules = []
+  let pos = 0
+  while toks[pos][0] != "EOF" do
+    let nameTok = toks[pos]
+    let arrowTok = toks[pos + 1]
+    let body = peg_parse_choice(toks, pos + 2)
+    let rules = list_push(rules, [nameTok[1], body[0]])
+    let pos = body[1]
+  end
+  return rules
+end
+
+make a function called peg_find_rule takes rules, name returns expr
+  let i = 0
+  let n = to_num(list_len(rules))
+  while i < n do
+    if rules[i][0] == name then
+      return rules[i][1]
+    end
+    let i = i + 1
+  end
+  return ["Err", "unknown rule: " + name]
+end
+
+# ---- the interpreter: standard PEG match semantics over a token list.
+# Tokens here are already-unified [category, text] pairs (self-hosted's
+# own lexer already produces [type, text, line] triples in this exact
+# category vocabulary -- IDENT/OP/NUM/STR/NL/EOF -- so no adapter is
+# needed on this side; see rust-runtime/src/ir/peg.rs for the native
+# side's adapter, which DOES need one). Returns [new_pos, ok] -- ok is
+# false and new_pos == pos on failure (never partially consumes on a
+# failed match, standard PEG backtracking guarantee). ----
+
+make a function called peg_is_alpha_lit takes text returns r
+  if text.length == 0 then
+    return false
+  end
+  return is_alpha_code(char_code(text, 0))
+end
+
+# NL tokens are trivia -- skipped automatically before every terminal
+# match, same as every real parser.patlang function threads skip_nl()
+# calls through by hand. Keeping this in the two match primitives (not
+# spelled out in the .peg grammar itself) means the grammar file doesn't
+# need to mention newlines anywhere, matching how the real grammar
+# tolerates newlines almost everywhere without the .peg author needing to
+# reason about where.
+make a function called peg_skip_nl takes toks, pos returns p
+  let p = pos
+  while vec_get(toks, p)[0] == "NL" do
+    let p = p + 1
+  end
+  return p
+end
+
+make a function called peg_match_lit takes text, toks, pos returns r
+  # toks is the REAL PatLang token stream (from lib/lexer.patlang's
+  # tokenize()), which is a vec (built via vec_push), not a list --
+  # needs vec_get, not [] indexing. Distinct from this file's OWN grammar-
+  # file token stream (peg_tokenize's output, a genuine list), which is
+  # indexed with [] throughout the .peg-file parser above. Conflating the
+  # two doesn't error -- list_len/[] silently returns 0/wrong-but-plausible
+  # values for a vec rather than failing loudly -- so this was found by
+  # tokenize(...) mysteriously appearing empty while parse_program still
+  # worked on the same value, not by any error message.
+  let pos = peg_skip_nl(toks, pos)
+  let t = vec_get(toks, pos)
+  let category = "OP"
+  if peg_is_alpha_lit(text) then
+    let category = "IDENT"
+  end
+  if (t[0] == category) and (t[1] == text) then
+    return [pos + 1, true]
+  else
+    return [pos, false]
+  end
+end
+
+make a function called peg_match_class takes toks, pos, category returns r
+  let pos = peg_skip_nl(toks, pos)
+  let t = vec_get(toks, pos)
+  if t[0] == category then
+    return [pos + 1, true]
+  else
+    return [pos, false]
+  end
+end
+
+# The self-hosted lexer has no distinct keyword token type -- "end",
+# "then", "if", etc. are plain IDENT tokens, same category as any
+# variable name (confirmed by reading lib/lexer.patlang directly).
+# Without this exclusion, the built-in Identifier matcher happily
+# consumes a block terminator like "end" as an ordinary bare-identifier
+# expression statement, letting Stmt* run straight past it -- caught by
+# the selftest's "make a function called (word body)" case timing out
+# short of failing outright: Stmt* silently over-consumed all the way to
+# EOF looking for more statements, then the trailing "end" literal match
+# failed because Stmt* had already eaten it.
+#
+# Deliberately NARROW: only the words that are genuinely, globally
+# reserved in real PatLang (parser.patlang's parse_stmt only special-
+# cases let/if/while/make/return/when/rule/budgeted/require/ensure/
+# assert -- confirmed by reading it directly). "a"/"function"/"called"/
+# "takes"/"returns" are NOT globally reserved -- they're only consumed
+# literally within the make-a-function-called construct once "make" has
+# already matched; excluding them here too was a real bug, caught
+# immediately by "a + b" (an ordinary expression) failing to parse once
+# "a" was wrongly excluded as if it were a keyword everywhere.
+make a function called peg_is_keyword takes text returns r
+  let keywords = ["let", "mut", "fn", "if", "elif", "else", "then", "do", "end", "while", "return", "or", "and", "not", "budgeted", "when", "require", "ensure", "assert", "function", "band", "bor", "bxor", "bnot", "shl", "shr"]
+  let i = 0
+  let n = to_num(list_len(keywords))
+  while i < n do
+    if keywords[i] == text then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called peg_match_identifier takes toks, pos returns r
+  let pos = peg_skip_nl(toks, pos)
+  let t = vec_get(toks, pos)
+  if (t[0] == "IDENT") and (peg_is_keyword(t[1]) == false) then
+    return [pos + 1, true]
+  else
+    return [pos, false]
+  end
+end
+
+make a function called peg_match takes rules, expr, toks, pos returns r
+  let tag = expr[0]
+  if tag == "Lit" then
+    return peg_match_lit(expr[1], toks, pos)
+  else
+    if tag == "Ref" then
+      # Identifier/Number/String are built into the engine, not defined
+      # in the .peg file -- they match any token of that lexical
+      # category (arbitrary text), unlike a quoted "Lit" literal (exact
+      # text). There's no way to express "any IDENT regardless of text"
+      # via a quoted literal, so these three names are reserved and
+      # intercepted here before falling back to a user-defined rule.
+      if expr[1] == "Identifier" then
+        return peg_match_identifier(toks, pos)
+      else
+        if expr[1] == "Number" then
+          return peg_match_class(toks, pos, "NUM")
+        else
+          if expr[1] == "String" then
+            return peg_match_class(toks, pos, "STR")
+          else
+            return peg_match(rules, peg_find_rule(rules, expr[1]), toks, pos)
+          end
+        end
+      end
+    else
+      if tag == "Seq" then
+        return peg_match_seq(rules, expr[1], toks, pos)
+      else
+        if tag == "Choice" then
+          return peg_match_choice(rules, expr[1], toks, pos)
+        else
+          if tag == "Star" then
+            return peg_match_star(rules, expr[1], toks, pos)
+          else
+            if tag == "Plus" then
+              let first = peg_match(rules, expr[1], toks, pos)
+              if first[1] == false then
+                return [pos, false]
+              end
+              return peg_match_star(rules, expr[1], toks, first[0])
+            else
+              if tag == "Opt" then
+                let r = peg_match(rules, expr[1], toks, pos)
+                if r[1] then
+                  return r
+                else
+                  return [pos, true]
+                end
+              else
+                if tag == "And" then
+                  let r = peg_match(rules, expr[1], toks, pos)
+                  return [pos, r[1]]
+                else
+                  if tag == "Not" then
+                    let r = peg_match(rules, expr[1], toks, pos)
+                    return [pos, r[1] == false]
+                  else
+                    return [pos, false]
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+make a function called peg_match_seq takes rules, items, toks, pos returns r
+  let p = pos
+  let i = 0
+  let n = to_num(list_len(items))
+  while i < n do
+    let step = peg_match(rules, items[i], toks, p)
+    if step[1] == false then
+      return [pos, false]
+    end
+    let p = step[0]
+    let i = i + 1
+  end
+  return [p, true]
+end
+
+make a function called peg_match_choice takes rules, items, toks, pos returns r
+  let i = 0
+  let n = to_num(list_len(items))
+  while i < n do
+    let step = peg_match(rules, items[i], toks, pos)
+    if step[1] then
+      return step
+    end
+    let i = i + 1
+  end
+  return [pos, false]
+end
+
+make a function called peg_match_star takes rules, item, toks, pos returns r
+  let p = pos
+  let looping = true
+  while looping do
+    let step = peg_match(rules, item, toks, p)
+    if step[1] and (step[0] > p) then
+      let p = step[0]
+    else
+      let looping = false
+    end
+  end
+  return [p, true]
+end
+
+# Top-level: does the whole token stream (up to EOF) conform to `start`?
+make a function called peg_accepts takes rules, start, toks returns ok
+  let expr = peg_find_rule(rules, start)
+  let result = peg_match(rules, expr, toks, 0)
+  if result[1] == false then
+    return false
+  end
+  let final_pos = peg_skip_nl(toks, result[0])
+  let final_tok = vec_get(toks, final_pos)
+  return final_tok[0] == "EOF"
+end

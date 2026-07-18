@@ -146,6 +146,12 @@ const HOST_CHUNK_TABLE: &[(&str, ChunkId)] = &[
     ("solve", ChunkId::Logic),
     ("action_add", ChunkId::Logic),
     ("plan", ChunkId::Logic),
+    ("goal_def", ChunkId::Logic),
+    ("pursue", ChunkId::Logic),
+    ("action_bind", ChunkId::Logic),
+    ("action_lookup", ChunkId::Logic),
+    ("action_base_name", ChunkId::Logic),
+    ("action_label_args", ChunkId::Logic),
     ("contract_check", ChunkId::Contracts),
     ("tcp_listen", ChunkId::Networking),
     ("tcp_try_listen", ChunkId::Networking),
@@ -877,7 +883,7 @@ fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Va
         match &func.body[pc] {
             Instr::Const(v) => stack.push(v.clone()),
             Instr::LoadLocal(n) => stack.push(locals.get(n).cloned().unwrap_or(Value::Unit)),
-            Instr::StoreLocal(n) => { let v = stack.pop().ok_or("stack underflow")?; locals.insert(n.clone(), v); },
+            Instr::StoreLocal(n) => { let v = stack.pop().ok_or("stack underflow")?; match locals.get_mut(n) { Some(slot) => *slot = v, None => { locals.insert(n.clone(), v); } } },
             Instr::UnOp(k) => {
                 let a = stack.pop().ok_or("stack underflow")?;
                 let r = match k { UnOpKind::Neg => neg(&a)?, UnOpKind::Not => Value::Bool(!a.as_bool()?), UnOpKind::BitNot => bitnot(&a)? };
@@ -1780,6 +1786,13 @@ fn display_value(v: &Value) -> String { nt_value_to_string(v) }
 fn to_s(v: &Value) -> String { nt_value_to_string(v) }
 
 fn add(a:&Value,b:&Value)->Result<Value,String>{
+    // Fast path, mirroring ops.rs::add exactly (same rationale: Int/Int and
+    // Float/Float are the overwhelming common case, skipping the NumT
+    // conversion + promote_pair for them is a real, measured win).
+    if let (Value::Int(x), Value::Int(y)) = (a, b) {
+        return Ok(match x.checked_add(*y) { Some(v) => Value::Int(v), None => nt_to_value(NumT::Big(BigIntT::from_i64(*x).add(&BigIntT::from_i64(*y))).normalize()) });
+    }
+    if let (Value::Float(x), Value::Float(y)) = (a, b) { return Ok(Value::Float(x + y)); }
     match (a,b) {
         (Value::String(sa), _) => Ok(Value::String(format!("{}{}", sa, to_s(b)))),
         (_, Value::String(sb)) => Ok(Value::String(format!("{}{}", to_s(a), sb))),
@@ -1788,12 +1801,20 @@ fn add(a:&Value,b:&Value)->Result<Value,String>{
     }
 }
 fn sub(a:&Value,b:&Value)->Result<Value,String>{
+    if let (Value::Int(x), Value::Int(y)) = (a, b) {
+        return Ok(match x.checked_sub(*y) { Some(v) => Value::Int(v), None => nt_to_value(NumT::Big(BigIntT::from_i64(*x).sub(&BigIntT::from_i64(*y))).normalize()) });
+    }
+    if let (Value::Float(x), Value::Float(y)) = (a, b) { return Ok(Value::Float(x - y)); }
     match (a,b) {
         (Value::Complex(_), _) | (_, Value::Complex(_)) => Ok(nt_normalize_complex(nt_to_complex(a)?.sub(&nt_to_complex(b)?))),
         _ => Ok(nt_to_value(nt_from_value(a)?.sub(&nt_from_value(b)?))),
     }
 }
 fn mul(a:&Value,b:&Value)->Result<Value,String>{
+    if let (Value::Int(x), Value::Int(y)) = (a, b) {
+        return Ok(match x.checked_mul(*y) { Some(v) => Value::Int(v), None => nt_to_value(NumT::Big(BigIntT::from_i64(*x).mul(&BigIntT::from_i64(*y))).normalize()) });
+    }
+    if let (Value::Float(x), Value::Float(y)) = (a, b) { return Ok(Value::Float(x * y)); }
     match (a,b) {
         (Value::Complex(_), _) | (_, Value::Complex(_)) => Ok(nt_normalize_complex(nt_to_complex(a)?.mul(&nt_to_complex(b)?))),
         _ => Ok(nt_to_value(nt_from_value(a)?.mul(&nt_from_value(b)?))),
@@ -1877,6 +1898,14 @@ fn shr(a:&Value,b:&Value)->Result<Value,String>{
 fn cmp(k:&BinOpKind,a:&Value,b:&Value)->Result<Value,String>{
     use BinOpKind::*;
     if let (Value::String(x), Value::String(y)) = (a, b) {
+        let res = match k { Eq=>x==y, Ne=>x!=y, Lt=>x<y, Le=>x<=y, Gt=>x>y, Ge=>x>=y, _=>false };
+        return Ok(Value::Bool(res));
+    }
+    if let (Value::Int(x), Value::Int(y)) = (a, b) {
+        let res = match k { Eq=>x==y, Ne=>x!=y, Lt=>x<y, Le=>x<=y, Gt=>x>y, Ge=>x>=y, _=>false };
+        return Ok(Value::Bool(res));
+    }
+    if let (Value::Float(x), Value::Float(y)) = (a, b) {
         let res = match k { Eq=>x==y, Ne=>x!=y, Lt=>x<y, Le=>x<=y, Gt=>x>y, Ge=>x>=y, _=>false };
         return Ok(Value::Bool(res));
     }
@@ -2755,6 +2784,8 @@ fn host_call_oo(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     static TYPE_RULES: RefCell<HashMap<(String, usize), String>> = RefCell::new(HashMap::new());
     static RULES: RefCell<Vec<LogicRule>> = RefCell::new(Vec::new());
     static ACTIONS: RefCell<Vec<GoapAction>> = RefCell::new(Vec::new());
+    static GOAL_DEFS: RefCell<HashMap<String, Vec<GroundFact>>> = RefCell::new(HashMap::new());
+    static ACTION_BODIES: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
 }
 
 use std::collections::HashSet;
@@ -3047,13 +3078,102 @@ fn host_call_logic_inner(name: &str, args: &[Value]) -> Result<Value, String> {
                 }
                 Ok(Value::List(Arc::new(found.unwrap_or_default().into_iter().map(Value::String).collect())))
             }
+"goal_def" => {
+                if args.len() != 2 { return Err("goal_def: expected 2 args (name, deps_list)".into()); }
+                let goal_name = match &args[0] { Value::String(s) => s.clone(), v => to_s(v) };
+                let deps = parse_ground_facts(&args[1]);
+                GOAL_DEFS.with(|g| g.borrow_mut().insert(goal_name, deps));
+                Ok(Value::Unit)
+            }
+            "pursue" => {
+                if args.len() != 1 { return Err("pursue: expected 1 arg (goal name)".into()); }
+                let goal_name = match &args[0] { Value::String(s) => s.clone(), v => to_s(v) };
+                let goal_facts = GOAL_DEFS.with(|g| g.borrow().get(&goal_name).cloned())
+                    .ok_or_else(|| format!("pursue: unknown goal '{}' (declare it with `goal {} {{ ... }}` first)", goal_name, goal_name))?;
+                Ok(Value::List(Arc::new(plan_facts(goal_facts).into_iter().map(Value::String).collect())))
+            }
+            "action_bind" => {
+                if args.len() != 2 { return Err("action_bind: expected 2 args (name, closure)".into()); }
+                let action_name = match &args[0] { Value::String(s) => s.clone(), v => to_s(v) };
+                ACTION_BODIES.with(|a| a.borrow_mut().insert(action_name, args[1].clone()));
+                Ok(Value::Unit)
+            }
+            "action_lookup" => {
+                if args.len() != 1 { return Err("action_lookup: expected 1 arg (name)".into()); }
+                let action_name = match &args[0] { Value::String(s) => s.clone(), v => to_s(v) };
+                ACTION_BODIES.with(|a| a.borrow().get(&action_name).cloned())
+                    .ok_or_else(|| format!("activate: no action bound to '{}' (call action_bind(\"{}\", ...) first)", action_name, action_name))
+            }
+            "action_base_name" => {
+                if args.len() != 1 { return Err("action_base_name: expected 1 arg (label)".into()); }
+                let label = to_s(&args[0]);
+                Ok(Value::String(split_action_label(&label).0))
+            }
+            "action_label_args" => {
+                if args.len() != 1 { return Err("action_label_args: expected 1 arg (label)".into()); }
+                let label = to_s(&args[0]);
+                let vals = split_action_label(&label).1;
+                Ok(Value::List(Arc::new(vals.into_iter().map(Value::String).collect())))
+            }
                     _ => Err(format!("host fn '{}' not found", name)),
+    }
+}
+
+fn plan_facts(goal_facts: Vec<GroundFact>) -> Vec<String> {
+    let actions: Vec<GoapAction> = ACTIONS.with(|a| a.borrow().clone());
+    use std::collections::BinaryHeap;
+    use std::cmp::Reverse;
+    let start_state: HashSet<GroundFact> = current_ground_facts_as_state();
+    let mut nodes: Vec<(HashSet<GroundFact>, Vec<String>, i64)> = vec![(start_state, Vec::new(), 0)];
+    let mut frontier: BinaryHeap<Reverse<(i64, usize)>> = BinaryHeap::new();
+    frontier.push(Reverse((0, 0)));
+    let mut visited: HashSet<Vec<GroundFact>> = HashSet::new();
+    const NODE_CAP: usize = 5000;
+    let mut expansions = 0usize;
+    while let Some(Reverse((cost, idx))) = frontier.pop() {
+        if expansions >= NODE_CAP { break; }
+        let (state, path, node_cost) = nodes[idx].clone();
+        if node_cost != cost { continue; }
+        expansions += 1;
+        if goal_facts.iter().all(|g| state.contains(g)) { return path; }
+        let mut state_key: Vec<GroundFact> = state.iter().cloned().collect();
+        state_key.sort();
+        if !visited.insert(state_key) { continue; }
+        for action in &actions {
+            for subst in ground_action_instances(&action.preconds, &state) {
+                let mut new_state = state.clone();
+                for d in &action.del_effects { new_state.remove(&apply_subst_to_fact(d, &subst)); }
+                for a2 in &action.add_effects { new_state.insert(apply_subst_to_fact(a2, &subst)); }
+                let mut new_path = path.clone();
+                new_path.push(action_instance_label(&action.name, &action.preconds, &subst));
+                let new_cost = node_cost + action.cost;
+                nodes.push((new_state, new_path, new_cost));
+                frontier.push(Reverse((new_cost, nodes.len() - 1)));
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn split_action_label(label: &str) -> (String, Vec<String>) {
+    match label.find('(') {
+        None => (label.to_string(), Vec::new()),
+        Some(open) => {
+            let action_name = label[..open].to_string();
+            let inner = label[open + 1..label.len().saturating_sub(1).max(open + 1)].trim_end_matches(')');
+            if inner.is_empty() { return (action_name, Vec::new()); }
+            let vals = inner.split(',').map(|pair| {
+                match pair.split_once('=') { Some((_, v)) => v.to_string(), None => pair.to_string() }
+            }).collect();
+            (action_name, vals)
+        }
     }
 }
 
 fn host_call_logic(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match name {
-        "infer_type_for" | "fact" | "goal" | "query" | "rule_add" | "solve" | "action_add" | "plan" => Some(host_call_logic_inner(name, args)),
+        "infer_type_for" | "fact" | "goal" | "query" | "rule_add" | "solve" | "action_add" | "plan"
+        | "goal_def" | "pursue" | "action_bind" | "action_lookup" | "action_base_name" | "action_label_args" => Some(host_call_logic_inner(name, args)),
         _ => None,
     }
 }

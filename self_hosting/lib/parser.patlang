@@ -89,6 +89,26 @@ make a function called parse_primary takes toks, pos returns r
         if (tx == "true") or (tx == "false") then
           return [["Bool", tx], pos + 1]
         else
+          if (tx == "pursue") and (tok_is(vec_get(toks, pos + 1), "OP", "(") == false) then
+            # `pursue GOAL` -- GOAL is a bare name, taken as a string
+            # literal argument to the `pursue` host fn, mirroring native
+            # parser.rs's parse_primary special case exactly (the
+            # parenthesized form `pursue(x)` falls through to ordinary
+            # call parsing below instead).
+            let nameTok = vec_get(toks, pos + 1)
+            if nameTok[0] == "IDENT" then
+              return [["Call", "pursue", [["Str", nameTok[1]]]], pos + 2]
+            else
+              return [["Err", "expected goal name after 'pursue'", nameTok[2]], pos + 1]
+            end
+          else
+          if (tx == "activate") and (tok_is(vec_get(toks, pos + 1), "OP", "(") == false) then
+            # `activate PLAN` -- PLAN is a general expression (typically a
+            # variable holding a previous `pursue` result), unlike
+            # `pursue`'s bare goal-name.
+            let planR = parse_expr(toks, pos + 1)
+            return [["Call", "activate", [planR[0]]], planR[1]]
+          else
           if (tx == "budgeted") and tok_is(vec_get(toks, pos + 1), "OP", "(") then
             let msR = parse_expr(toks, pos + 2)
             let msNode = msR[0]
@@ -134,6 +154,8 @@ make a function called parse_primary takes toks, pos returns r
             return [["Call", tx, a[0]], a[1]]
           else
             return [["Var", tx], pos + 1]
+          end
+          end
           end
           end
         end
@@ -225,7 +247,25 @@ make a function called parse_primary takes toks, pos returns r
                 end
               end
             else
-              return [["Err", "unexpected " + ty + " '" + tx + "'", vec_get(toks, pos)[2]], pos + 1]
+              if tok_is(t, "OP", "{") then
+                # A bare `{ ... }` in expression position is a real,
+                # deliberate zero-param function literal -- the same
+                # value-position meaning `|params| { }` has with an empty
+                # param list, e.g. `let f = { return 42 }` then `f()`.
+                # Mirrors native parser.rs's parse_primary (Token::BlockStart)
+                # exactly. NOT legal as its own statement (see parse_stmt's
+                # dedicated rejection) -- only as a value.
+                let body = parse_stmts_until(toks, pos + 1)
+                let p2 = body[1]
+                let et = vec_get(toks, p2)
+                if tok_is(et, "OP", "}") then
+                  return [["Closure", [], body[0]], p2 + 1]
+                else
+                  return [["Err", "expected } after block body", vec_get(toks, p2)[2]], p2]
+                end
+              else
+                return [["Err", "unexpected " + ty + " '" + tx + "'", vec_get(toks, pos)[2]], pos + 1]
+              end
             end
           end
         end
@@ -885,10 +925,66 @@ make a function called parse_rule_decl takes toks, pos returns r
   end
 end
 
+# ---- goal declarations: `goal NAME { dep1(args), dep2(args) }` ----
+
+make a function called parse_goal_decl takes toks, pos returns r
+  # pos points at the goal's name (the 'goal' keyword itself already
+  # consumed by the caller). Returns [["GoalDecl", name, deps], next_pos]
+  # where deps is [[pred, [arg_expr_nodes]], ...] -- each dependency term
+  # is parsed via parse_rule_goal, the exact same fact-term shape a rule
+  # body's goals use.
+  let nameTok = vec_get(toks, pos)
+  let name = nameTok[1]
+  let p = pos + 1
+  let openTok = vec_get(toks, p)
+  if tok_is(openTok, "OP", "{") == false then
+    return [["Err", "expected { after goal name", openTok[2]], p]
+  else
+    let p = skip_nl(toks, p + 1)
+    let t = vec_get(toks, p)
+    if tok_is(t, "OP", "}") then
+      return [["GoalDecl", name, []], p + 1]
+    else
+      let deps = []
+      let looping = true
+      while looping do
+        let p = skip_nl(toks, p)
+        let g = parse_rule_goal(toks, p)
+        let deps = list_push(deps, g[0])
+        let p = skip_nl(toks, g[1])
+        let t2 = vec_get(toks, p)
+        if tok_is(t2, "OP", ",") then
+          let p = skip_nl(toks, p + 1)
+        else
+          let looping = false
+        end
+      end
+      let t3 = vec_get(toks, p)
+      if tok_is(t3, "OP", "}") then
+        return [["GoalDecl", name, deps], p + 1]
+      else
+        return [["Err", "expected } to close goal block", vec_get(toks, p)[2]], p]
+      end
+    end
+  end
+end
+
 make a function called parse_stmt takes toks, pos returns r
   let t = vec_get(toks, pos)
   let ty = t[0]
   let tx = t[1]
+  if tok_is(t, "OP", "{") then
+    # A bare `{ ... }` is only meaningful as a VALUE (parse_primary turns
+    # it into a zero-param closure literal, e.g. `let f = { ... }` -- a
+    # real function literal, not a leftover tolerance) -- never as its
+    # own free-standing statement. Rejecting it here is what makes
+    # dropping the statement-separator requirement safe: a bare block
+    # sitting right after something that could take a trailing-closure
+    # argument would otherwise be genuinely ambiguous between "two
+    # statements" and "one statement with sugar." Mirrors native
+    # parser.rs's parse_statement Token::BlockStart arm exactly.
+    return [["Err", "a bare '{ ... }' isn't a statement on its own -- it's a function literal as a VALUE (e.g. `let f = { ... }`, then call it with `f()`), not something to write standalone", t[2]], pos + 1]
+  else
   if ty == "IDENT" then
     if tx == "let" then
       let mutTok = vec_get(toks, pos + 1)
@@ -938,6 +1034,18 @@ make a function called parse_stmt takes toks, pos returns r
                   # matching the native parser's own `if peek==LParen` branch.
                   return parse_rule_decl(toks, pos + 1)
                 else
+                if (tx == "goal") and (tok_is(vec_get(toks, pos + 1), "OP", "(") == false) then
+                  # Real declarative syntax: `goal NAME { dep1(args), ... }`,
+                  # mirroring native parser.rs's Token::Goal branch exactly.
+                  return parse_goal_decl(toks, pos + 1)
+                else
+                if (tx == "pursue") or (tx == "activate") then
+                  # Both are expressions (see parse_primary), routed through
+                  # parse_expr/parse_primary at the statement level too --
+                  # same pattern budgeted(...) uses just below.
+                  let e = parse_expr(toks, pos)
+                  return [["Expr", e[0]], e[1]]
+                else
                 if (tx == "budgeted") and tok_is(vec_get(toks, pos + 1), "OP", "(") then
                   # Bare statement usage (result discarded): route through
                   # parse_expr/parse_primary, which is where budgeted(...)
@@ -978,6 +1086,8 @@ make a function called parse_stmt takes toks, pos returns r
                 end
                 end
                 end
+                end
+                end
               end
             end
             end
@@ -988,6 +1098,7 @@ make a function called parse_stmt takes toks, pos returns r
     end
   else
     return [["Err", "unexpected " + ty + " '" + tx + "'", vec_get(toks, pos)[2]], pos + 1]
+  end
   end
 end
 
@@ -1119,6 +1230,9 @@ make a function called ast_to_str takes node returns s
                                     if ty == "RuleDecl" then
                                       return "RuleDecl(" + node[1] + ", " + ast_list_to_str(node[2]) + ", " + rule_body_to_str(node[3]) + ")"
                                     else
+                                    if ty == "GoalDecl" then
+                                      return "GoalDecl(" + node[1] + ", " + rule_body_to_str(node[2]) + ")"
+                                    else
                                     if ty == "Assert" then
                                       return node[1] + " " + ast_to_str(node[2])
                                     else
@@ -1180,6 +1294,7 @@ make a function called ast_to_str takes node returns s
         end
       end
     end
+  end
   end
   end
   end
@@ -1322,6 +1437,17 @@ make a function called pf_walk_node takes node returns err
     while i < n do
       let r2 = pf_walk_list(body[i][1])
       if r2[0] != "" then return r2 end
+      let i = i + 1
+    end
+    return ["", -1]
+  end
+  if ty == "GoalDecl" then
+    let deps = node[2]
+    let i = 0
+    let n = to_num(list_len(deps))
+    while i < n do
+      let r = pf_walk_list(deps[i][1])
+      if r[0] != "" then return r end
       let i = i + 1
     end
     return ["", -1]

@@ -79,6 +79,11 @@ pub struct Parser<'a> {
     // When true, do not treat a trailing '{ ... }' after an expression as a closure argument.
     // This is used when parsing conditions like `if cond { ... }` to avoid consuming the block.
     stop_trailing_block_for_condition: bool,
+    // Label used in diagnostics (warnings/errors) to say which source this
+    // Parser is actually reading -- defaults to "<input>" for call sites
+    // that don't have a real filename (tests, embedded snippets). Set via
+    // `with_source_name`/`set_source_name`.
+    source_name: String,
 }
 
 impl<'a> Parser<'a> {
@@ -86,7 +91,16 @@ impl<'a> Parser<'a> {
         let mut lexer = Lexer::new(input);
         let curr = lexer.next_token().map_err(ParserError::Lexer)?;
         let peek = lexer.next_token().map_err(ParserError::Lexer)?;
-    Ok(Parser { lexer, curr, peek, line_no: 1, stop_trailing_block_for_condition: false })
+    Ok(Parser { lexer, curr, peek, line_no: 1, stop_trailing_block_for_condition: false, source_name: "<input>".to_string() })
+    }
+
+    pub fn with_source_name(mut self, name: impl Into<String>) -> Self {
+        self.source_name = name.into();
+        self
+    }
+
+    pub fn set_source_name(&mut self, name: impl Into<String>) {
+        self.source_name = name.into();
     }
 
     fn advance(&mut self) -> Result<(), ParserError> {
@@ -174,17 +188,19 @@ impl<'a> Parser<'a> {
                 break;
             }
 
-            // If the next token can start a statement but we didn't see any separator
-            // and there was no newline, require a separator on the same line.
-            if self.can_start_statement() && !saw_sep && !saw_nl {
-                return Err(ParserError::ExpectedToken {
-                    expected: "separator between statements",
-                    line: self.line_no,
-                    hint: "Insert ';' or a newline between statements",
-                });
-            }
-
-            // Otherwise, continue; any non-statement-start here is an error (handled at next parse attempt)
+            // A separator (';'/newline/etc, collected above) is welcome but no longer
+            // required: by the time a statement is fully parsed, its own expression
+            // parser has already resolved exactly how far it extends (operator
+            // lookahead, not newline significance -- see parse_expression's own
+            // continuation rule), so there's no remaining ambiguity for a separator
+            // to protect against here. The one case that WOULD have been ambiguous --
+            // a bare `{ ... }` sitting where it could be misread as either its own
+            // statement or a trailing-closure argument to whatever just finished --
+            // is handled by rejecting bare `{ ... }` as a statement outright (see
+            // parse_statement's Token::BlockStart arm), not by requiring a separator
+            // everywhere. `saw_sep`/`saw_nl` remain unused for gating now, kept only
+            // because the loop above still needs to consume the separator tokens.
+            let _ = (saw_sep, saw_nl);
         }
         check_when_placement(&stmts, 0)?;
         Ok(stmts)
@@ -235,6 +251,22 @@ impl<'a> Parser<'a> {
 
     fn parse_statement(&mut self) -> Result<Stmt, ParserError> {
         match self.curr {
+            // A bare `{ ... }` is only meaningful as a VALUE (parse_primary still
+            // turns it into a zero-param closure literal there, e.g. `let f = { ... }`
+            // -- a real, deliberate function literal, not a leftover tolerance) --
+            // never as its own free-standing statement. Rejecting it here, rather
+            // than letting it fall through to the general expression-statement path
+            // below, is what makes the statement separator above safe to drop: a
+            // bare block sitting right after something that could take a trailing-
+            // closure argument (`f(x)`) would otherwise be genuinely ambiguous
+            // between "f(x) followed by its own discarded closure statement" and
+            // "f(x) { ... }" sugar. With this rejected outright, that ambiguity
+            // can't arise.
+            Token::BlockStart => Err(ParserError::UnexpectedToken {
+                token: Token::BlockStart,
+                line: self.line_no,
+                hint: "A bare '{ ... }' isn't a statement on its own -- it's a function literal as a VALUE (e.g. `let f = { ... }`, then call it with `f()`), not something to write standalone",
+            }),
             Token::Let => self.parse_let(),
             Token::Fn => self.parse_function(),
             Token::Return => self.parse_return(),
@@ -249,14 +281,35 @@ impl<'a> Parser<'a> {
                     let expr = self.parse_expression(0)?;
                     return Ok(Stmt::ExprStmt(expr));
                 }
-                // Otherwise, skip DSL-style goal header/body.
+                // Real declarative syntax: `goal NAME { dep1(args), dep2(args) }`
+                // -- names a target state as a list of fact-terms. Sugar
+                // only, lowers to a single goal_def(...) call (see
+                // lower_stmt); see Stmt::GoalDecl's doc comment in ast.rs.
                 self.advance()?; // consume 'goal'
-                while !matches!(self.curr, Token::BlockStart | Token::Dot | Token::Newline | Token::EOF) {
-                    self.advance()?;
+                let name = match &self.curr {
+                    Token::Identifier(s) => { let n = s.clone(); self.advance()?; n }
+                    _ => return Err(ParserError::ExpectedToken { expected: "goal name", line: self.line_no, hint: "Use `goal NAME { dep1(args), dep2(args) }`" }),
+                };
+                self.expect(Token::BlockStart, "'{' after goal name", "Use `goal NAME { dep1(args), dep2(args) }`")?;
+                self.consume_newlines()?;
+                let mut deps: Vec<(String, Vec<Expr>)> = Vec::new();
+                while !matches!(self.curr, Token::BlockEnd | Token::EOF) {
+                    let dep_expr = self.parse_expression(0)?;
+                    match dep_expr {
+                        Expr::Call { function, args } => match *function {
+                            Expr::Identifier(n) => deps.push((n, args)),
+                            _ => return Err(ParserError::UnexpectedToken { token: self.curr.clone(), line: self.line_no, hint: "Each goal dependency must be a fact-term like pred(args)" }),
+                        },
+                        _ => return Err(ParserError::UnexpectedToken { token: self.curr.clone(), line: self.line_no, hint: "Each goal dependency must be a fact-term like pred(args)" }),
+                    }
+                    self.consume_newlines()?;
+                    if matches!(self.curr, Token::Comma) {
+                        self.advance()?;
+                        self.consume_newlines()?;
+                    }
                 }
-                if matches!(self.curr, Token::BlockStart) { self.skip_brace_block()?; }
-                if matches!(self.curr, Token::Dot) { self.advance()?; }
-                Ok(Stmt::ExprStmt(Expr::String(String::new())))
+                self.expect(Token::BlockEnd, "'}' to close goal block", "Close the goal block with '}'")?;
+                Ok(Stmt::GoalDecl { name, deps })
             }
             Token::Rule => {
                 // If followed by '(', treat as normal call: rule(...)
@@ -358,11 +411,12 @@ impl<'a> Parser<'a> {
                         if matches!(self.curr, Token::BlockStart) { self.skip_brace_block()?; }
                         return Ok(Stmt::ExprStmt(Expr::String(String::new())));
                     }
-                    // pursue ... : skip rest of line
-                    if curr_lc == "pursue" {
-                        while !matches!(self.curr, Token::Newline | Token::EOF) { self.advance()?; }
-                        return Ok(Stmt::ExprStmt(Expr::String(String::new())));
-                    }
+                    // `pursue GOAL` is an expression (see parse_primary's
+                    // "pursue" special case, mirroring "budgeted"'s
+                    // precedent) so it can be used as `let p = pursue GOAL`
+                    // -- at the statement level it just falls through to
+                    // ordinary expression-statement parsing below, no
+                    // special case needed here.
                     // Design-by-contract: require/ensure/assert EXPR
                     if curr_lc == "require" || curr_lc == "ensure" || curr_lc == "assert" {
                         self.advance()?; // consume the keyword
@@ -443,11 +497,11 @@ impl<'a> Parser<'a> {
                         }
                         return Ok(Stmt::ExprStmt(Expr::String(String::new())));
                     }
-                    // Activation statements: skip rest of line
-                    if curr_lc == "activate" {
-                        while !matches!(self.curr, Token::Newline | Token::EOF) { self.advance()?; }
-                        return Ok(Stmt::ExprStmt(Expr::String(String::new())));
-                    }
+                    // `activate PLAN` is an expression, see parse_primary's
+                    // "activate" special case (mirroring "pursue"/
+                    // "budgeted") -- at the statement level it just falls
+                    // through to ordinary expression-statement parsing
+                    // below, no special case needed here.
                     // Skip 'case ... end' constructs (Ruby-like)
                     if curr_lc == "case" {
                         self.skip_until_ident("end")?;
@@ -495,6 +549,7 @@ impl<'a> Parser<'a> {
                         return Ok(Stmt::ExprStmt(Expr::String("".into())));
                     }
                 }
+                let start_line = self.line_no;
                 let expr = self.parse_expression(0)?;
                 // If we just parsed a Member expr and see '=', treat as member assignment
                 if matches!(self.curr, Token::Equal) {
@@ -510,6 +565,32 @@ impl<'a> Parser<'a> {
                         return Ok(Stmt::Let { name, value, is_reassignment: true, mutable: false });
                     } else {
                         return Err(ParserError::UnexpectedToken { token: self.curr.clone(), line: self.line_no, hint: "Unexpected token; check for missing operators or delimiters" });
+                    }
+                }
+                // "You computed a value and threw it away, sure you want to do
+                // that?" -- a soft warning, not an error: only for expressions
+                // that structurally cannot have a side effect (a literal,
+                // arithmetic/comparison over such, a bare variable read, a list
+                // literal of such). A Call is deliberately never flagged here --
+                // print(x)'s whole point is a discarded Unit return, and that's
+                // the overwhelmingly common shape of a real, intentional bare
+                // expression statement.
+                //
+                // Exempt tail position: the last statement of a block (function/
+                // closure/if/while body, or top-level program) is PatLang's
+                // implicit return value, not a discarded one -- e.g. `|p| { p }`
+                // is a deliberate identity closure. Detected by peeking past any
+                // trailing newlines to see whether the block-terminating token
+                // (EOF, `}}`, or a stop word like `end`/`elif`/`else`) comes next.
+                if is_side_effect_free_expr(&expr) {
+                    self.consume_newlines()?;
+                    let is_tail = matches!(self.curr, Token::EOF | Token::BlockEnd | Token::Else)
+                        || matches!(&self.curr, Token::Identifier(t) if t == "end" || t == "elif");
+                    if !is_tail {
+                        eprintln!(
+                            "warning: {}:{}: this expression's value is computed and discarded -- did you mean to assign it, print it, or was an operator/statement missing?",
+                            self.source_name, start_line
+                        );
                     }
                 }
                 Ok(Stmt::ExprStmt(expr))
@@ -1048,6 +1129,38 @@ impl<'a> Parser<'a> {
                 self.expect(Token::RBracket, "] to close list", "Close list with ']'" )?;
                 Expr::List(items)
             }
+            // `pursue GOAL` -- an expression (so `let p = pursue GOAL`
+            // works), desugared into a call against the `pursue` host fn,
+            // GOAL taken as a bare name (matching how goal/rule names are
+            // bare identifiers elsewhere, not general expressions). The
+            // parenthesized form `pursue(x)` is NOT special-cased here --
+            // it falls through to ordinary call parsing below and reaches
+            // the same host fn with whatever expression `x` evaluates to.
+            Token::Identifier(name) if name == "pursue" && !matches!(self.peek, Token::LParen) => {
+                self.advance()?; // consume 'pursue'
+                let goal_name = match &self.curr {
+                    Token::Identifier(s) => { let n = s.clone(); self.advance()?; n }
+                    _ => return Err(ParserError::ExpectedToken { expected: "goal name after 'pursue'", line: self.line_no, hint: "Use `pursue GOAL_NAME`" }),
+                };
+                Expr::Call {
+                    function: Box::new(Expr::Identifier("pursue".into())),
+                    args: vec![Expr::String(goal_name)],
+                }
+            }
+            // `activate PLAN` -- an expression (its value is the overall
+            // success boolean, see lowering.rs's lower_activate), desugared
+            // into a call against the `activate(...)` synthesized dispatch
+            // loop, PLAN taken as a general expression (unlike `pursue`'s
+            // bare goal-name, a plan is an ordinary value -- typically a
+            // variable holding a previous `pursue` result).
+            Token::Identifier(name) if name == "activate" && !matches!(self.peek, Token::LParen) => {
+                self.advance()?; // consume 'activate'
+                let plan = self.parse_expression(0)?;
+                Expr::Call {
+                    function: Box::new(Expr::Identifier("activate".into())),
+                    args: vec![plan],
+                }
+            }
             Token::Identifier(name) if name == "budgeted" && matches!(self.peek, Token::LParen) => {
                 self.advance()?; // 'budgeted'
                 self.advance()?; // '('
@@ -1175,5 +1288,21 @@ impl<'a> Parser<'a> {
         } else {
             Err(ParserError::ExpectedToken { expected: "mismatched token", line: self.line_no, hint })
         }
+    }
+}
+
+// Only true for expression shapes that structurally cannot perform a side
+// effect -- Call/Member/Index/Closure/Budgeted are all deliberately
+// excluded (a Call in particular is nearly always intentional, print(x)
+// being the paradigm case), so this only flags the cases genuinely likely
+// to be a mistake: a stray literal, a bare variable read, an arithmetic/
+// comparison expression, or a list built from such.
+fn is_side_effect_free_expr(e: &Expr) -> bool {
+    match e {
+        Expr::Number(_) | Expr::Float(_) | Expr::String(_) | Expr::Identifier(_) => true,
+        Expr::List(items) => items.iter().all(is_side_effect_free_expr),
+        Expr::UnaryOp { expr, .. } => is_side_effect_free_expr(expr),
+        Expr::BinaryOp { left, right, .. } => is_side_effect_free_expr(left) && is_side_effect_free_expr(right),
+        Expr::Member { .. } | Expr::Index { .. } | Expr::Closure { .. } | Expr::Call { .. } | Expr::Budgeted { .. } => false,
     }
 }

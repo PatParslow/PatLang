@@ -62,7 +62,8 @@ pub struct RegexEngine {
 impl RegexEngine {
     pub fn load() -> Result<Self, String> {
         const SRC: &str = include_str!("../../self_hosting/lib/regex.patlang");
-        let mut p = Parser::new(SRC).map_err(|e| format!("regex engine parse init error: {:?}", e))?;
+        let mut p = Parser::new(SRC).map_err(|e| format!("regex engine parse init error: {:?}", e))?
+            .with_source_name("self_hosting/lib/regex.patlang (embedded regex engine)");
         let ast = p.parse().map_err(|e| format!("regex engine parse error: {:?}", e))?;
         let mut lower = Lowerer::new();
         let program = lower.lower_program_basic(&ast);

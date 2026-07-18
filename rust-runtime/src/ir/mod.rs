@@ -13,6 +13,7 @@ pub mod numeric;
 pub mod bignum_template;
 pub mod rational_complex_template;
 pub mod fiber;
+pub mod peg;
 
 pub use types::*;
 pub use ops::*;

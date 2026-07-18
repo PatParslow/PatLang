@@ -26,6 +26,8 @@ pub struct Lowerer {
     // still counts as "inside"): while-loop back-edges lowered in this state
     // get a budget_check() call injected just before the jump.
     in_budgeted_depth: usize,
+    // unique naming for synthesized `activate(...)` dispatch-loop locals
+    activate_counter: usize,
 }
 
 impl Lowerer {
@@ -95,6 +97,75 @@ impl Lowerer {
             program.functions.insert(f.name.clone(), f);
         }
         program
+    }
+
+    // Synthesizes, as ordinary AST fed through the normal lower_stmt/
+    // lower_expr path, a dispatch loop over a plan (a List<String> of
+    // action-name labels from `pursue`/`plan(...)`): for each label, split
+    // it into a base name + bound-arg-values list (host fns
+    // action_base_name/action_label_args, pure string parsing), look up
+    // the closure bound to that action name (action_lookup, hosts.rs), and
+    // call it with the WHOLE bound-args list as its single argument (not
+    // splatted positionally -- CallValue's argc is fixed at lowering time,
+    // but a plan step's real arg count is only known at runtime, so the
+    // bound closure receives one List and destructures it itself, e.g.
+    // `action_bind("build", |args| { let x = args[0] ... })`).
+    //
+    // A bound closure's return value is a success signal, per the user's
+    // explicit correction that a dependency "might be a function [that]
+    // might fail for some reason" -- any `false` return stops the loop
+    // immediately (remaining plan steps do NOT run) rather than assuming
+    // a found plan always completes. `activate(...)`'s own value is that
+    // overall success boolean.
+    fn lower_activate(&mut self, plan_expr: &Expr, f: &mut Function) {
+        self.activate_counter += 1;
+        let n = self.activate_counter;
+        let plan_var = format!("__act_plan_{}", n);
+        let i_var = format!("__act_i_{}", n);
+        let ok_var = format!("__act_ok_{}", n);
+        let label_var = format!("__act_label_{}", n);
+        let fn_var = format!("__act_fn_{}", n);
+        let args_var = format!("__act_args_{}", n);
+        let r_var = format!("__act_r_{}", n);
+
+        let ident = |s: &str| Expr::Identifier(s.to_string());
+        let call = |fname: &str, args: Vec<Expr>| Expr::Call { function: Box::new(ident(fname)), args };
+        let let_ = |name: &str, value: Expr, mutable: bool| Stmt::Let { name: name.to_string(), value, is_reassignment: false, mutable };
+        let reassign = |name: &str, value: Expr| Stmt::Let { name: name.to_string(), value, is_reassignment: true, mutable: false };
+
+        let synth: Vec<Stmt> = vec![
+            let_(&plan_var, plan_expr.clone(), false),
+            let_(&i_var, Expr::Number(0.0), true),
+            let_(&ok_var, ident("true"), true),
+            Stmt::While {
+                cond: Expr::BinaryOp {
+                    left: Box::new(ident(&ok_var)),
+                    op: BinaryOperator::And,
+                    right: Box::new(Expr::BinaryOp {
+                        left: Box::new(ident(&i_var)),
+                        op: BinaryOperator::Less,
+                        // list_len returns a String (an existing repo-wide
+                        // convention/quirk, not specific to this loop) --
+                        // must go through to_num before it's comparable.
+                        right: Box::new(call("to_num", vec![call("list_len", vec![ident(&plan_var)])])),
+                    }),
+                },
+                body: vec![
+                    let_(&label_var, Expr::Index { object: Box::new(ident(&plan_var)), index: Box::new(ident(&i_var)) }, false),
+                    let_(&fn_var, call("action_lookup", vec![call("action_base_name", vec![ident(&label_var)])]), false),
+                    let_(&args_var, call("action_label_args", vec![ident(&label_var)]), false),
+                    let_(&r_var, call(&fn_var, vec![ident(&args_var)]), false),
+                    Stmt::If {
+                        cond: Expr::BinaryOp { left: Box::new(ident(&r_var)), op: BinaryOperator::Equal, right: Box::new(ident("false")) },
+                        then_branch: vec![reassign(&ok_var, ident("false"))],
+                        else_branch: None,
+                    },
+                    reassign(&i_var, Expr::BinaryOp { left: Box::new(ident(&i_var)), op: BinaryOperator::Add, right: Box::new(Expr::Number(1.0)) }),
+                ],
+            },
+        ];
+        for s in &synth { self.lower_stmt(s, f); }
+        self.lower_expr(&ident(&ok_var), f);
     }
 
     fn lower_stmt(&mut self, s: &Stmt, f: &mut Function) {
@@ -221,6 +292,25 @@ impl Lowerer {
                 f.body.push(Instr::BuildList(body.len()));
                 f.body.push(Instr::CallHost("rule_add".into(), 3));
             }
+            Stmt::GoalDecl { name, deps } => {
+                // Sugar: lowers to exactly the Instr sequence a hand-written
+                // goal_def(NAME, [[pred,[args...]], ...]) call already
+                // produces (see hosts.rs::host_goal_def). Dep args are
+                // compile-time string tokens, same convention as RuleDecl
+                // body args just above -- a goal dependency is a fact-term,
+                // not an expression to evaluate.
+                f.body.push(Instr::Const(Value::String(name.clone())));
+                for (pred, args) in deps {
+                    f.body.push(Instr::Const(Value::String(pred.clone())));
+                    for a in args {
+                        f.body.push(Instr::Const(Value::String(rule_arg_text(a))));
+                    }
+                    f.body.push(Instr::BuildList(args.len()));
+                    f.body.push(Instr::BuildList(2)); // [pred, args_list]
+                }
+                f.body.push(Instr::BuildList(deps.len()));
+                f.body.push(Instr::CallHost("goal_def".into(), 2));
+            }
             _ => {
                 // unsupported yet: ignore safely
             }
@@ -276,6 +366,7 @@ impl Lowerer {
             "budgeted_run"|"budget_check"|
             "list_dir"|"rename_file"|
             "rule_add"|"solve"|"action_add"|"plan"|
+            "goal_def"|"pursue"|"action_bind"|"action_lookup"|"action_base_name"|"action_label_args"|"activate"|
             "bit_get"|"bit_set"|"bit_slice"|"bit_set_slice"|
             "vfs_read"|"vfs_write"|"vfs_append"|"vfs_exists"|"vfs_list"|"vfs_delete"|"vfs_flush_to_disk"
         )
@@ -319,6 +410,23 @@ impl Lowerer {
                 f.body.push(Instr::CallHost("list_get".into(), 2));
             }
             Expr::Call { function, args } => {
+                // `activate(PLAN)` (the desugared form of `activate PLAN`,
+                // see parser.rs) needs to CALL each planned action's bound
+                // closure -- host functions cannot call back into the
+                // interpreter (see hosts.rs's ACTION_BODIES doc comment),
+                // so this can't be a plain host call like `pursue` is.
+                // Instead it's synthesized here as ordinary control-flow
+                // AST (Let/While/If/Call), fed back through lower_stmt/
+                // lower_expr exactly like any nested block would be --
+                // see lower_activate. Intercepted at this level (not in
+                // lower_stmt) so it works whether `activate PLAN` appears
+                // as its own statement or as `let ok = activate PLAN`.
+                if let Expr::Identifier(name) = &**function {
+                    if name == "activate" && args.len() == 1 {
+                        self.lower_activate(&args[0], f);
+                        return;
+                    }
+                }
                 // Identifier calls: static function, closure-valued local, or host call.
                 // Member calls map to message send. Any other callee expression
                 // (e.g. an inline closure literal called immediately) evaluates to
@@ -567,6 +675,9 @@ fn collect_referenced_idents(stmts: &[Stmt], out: &mut Vec<String>, seen: &mut H
             Stmt::RuleDecl { head_args, body, .. } => {
                 for a in head_args { collect_ident_expr(a, out, seen); }
                 for (_, args) in body { for a in args { collect_ident_expr(a, out, seen); } }
+            }
+            Stmt::GoalDecl { deps, .. } => {
+                for (_, args) in deps { for a in args { collect_ident_expr(a, out, seen); } }
             }
         }
     }

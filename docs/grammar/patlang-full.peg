@@ -1,0 +1,117 @@
+Program    <- Stmt*
+
+Stmt       <- Let / Contract / When / RuleDecl / GoalDecl / FuncDef / If / While
+              / MemberAssign / Assign / Return / PrintStmt / ExprStmt
+
+Let        <- "let" "mut"? Identifier "=" Expr
+MemberAssign <- Identifier ("." Identifier)+ "=" Expr
+Assign     <- Identifier "=" Expr
+Contract   <- ("require" / "ensure" / "assert") Expr
+When       <- "when" Identifier Block
+Return     <- "return" Expr?
+PrintStmt  <- "print" Expr
+ExprStmt   <- Expr
+
+RuleDecl   <- "rule" Identifier "(" ArgList ")" (":-" RuleBody)? "."
+ArgList    <- (Identifier ("," Identifier)*)?
+RuleBody   <- RuleCall ("," RuleCall)*
+RuleCall   <- Identifier "(" ArgList ")"
+
+# goal NAME { dep1(args), dep2(args) } -- names a target state as a list
+# of fact-terms, reusing RuleCall's shape (same convention a rule body's
+# goals already use). "goal" deliberately stays non-reserved, exactly
+# like "rule": ordered choice tries this production first and falls
+# through to ExprStmt (an ordinary call) on failure, e.g. goal(x).
+GoalDecl   <- "goal" Identifier "{" (RuleCall ("," RuleCall)*)? "}"
+
+FuncDef    <- MakeForm / FnForm / FunctionForm
+FnForm     <- "fn" Identifier "(" ParamList ")" BraceBlock
+FunctionForm <- "function" Identifier "(" ParamList ")" BraceBlock
+MakeForm   <- "make" "a" "function" "called" Identifier
+              ("takes" ParamList)? ("returns" Identifier)?
+              FuncBlock
+ParamList  <- (Identifier ("," Identifier)*)?
+FuncBlock  <- BraceBlock / FuncWordBlock
+FuncWordBlock <- Stmt* "end"
+
+Block      <- BraceBlock / WordBlock
+BraceBlock <- "{" Stmt* "}"
+WordBlock  <- ("then" / "do") Stmt* "end"
+
+If            <- IfBrace / IfWord
+IfBrace       <- "if" CondExpr BraceBlock ElifBraceTail? ElseBraceTail?
+ElifBraceTail <- "elif" CondExpr BraceBlock ElifBraceTail?
+ElseBraceTail <- "else" BraceBlock
+IfWord        <- "if" CondExpr ("then" / "do") Stmt* ElifWordTail* ElseWordTail? "end"
+ElifWordTail  <- "elif" CondExpr ("then" / "do") Stmt*
+ElseWordTail  <- "else" Stmt*
+
+While      <- WhileBrace / WhileWord
+WhileBrace <- "while" CondExpr BraceBlock
+WhileWord  <- "while" CondExpr ("do" / "then") Stmt* "end"
+
+# General expression tower (allows a trailing '{ }' to attach to a call
+# as sugar for a closure argument, e.g. f(x) { ... }).
+Expr       <- Pipeline
+Pipeline   <- Or (PipeOp Or)*
+PipeOp     <- "|>" / ("|" ">")
+Or         <- And ("or" And)*
+And        <- Eq ("and" Eq)*
+Eq         <- Cmp (("==" / "!=" / "=") Cmp)*
+Cmp        <- Bitwise (("<=" / ">=" / "<" / ">") Bitwise)*
+Bitwise    <- Shift (("band" / "bxor" / "bor") Shift)*
+Shift      <- Add (("shl" / "shr") Add)*
+Add        <- Mul (("+" / "-") Mul)*
+Mul        <- Unary (("*" / "/" / "%") Unary)*
+Unary      <- ("not" / "bnot" / "-") Unary / Postfix
+Postfix    <- Primary PostfixOp*
+PostfixOp  <- Call / Index / Member / TrailingClosure
+Call       <- "(" (Expr ("," Expr)*)? ")"
+Index      <- "[" Expr "]"
+Member     <- "." Identifier
+TrailingClosure <- BraceBlock
+# PursueExpr/ActivateExpr must be tried before the bare Identifier
+# alternative below -- "pursue"/"activate" aren't reserved keywords
+# (same non-reservation as "rule"/"goal": pursue(x)/activate(x) fall
+# through to an ordinary call via Identifier+Call on failure here), so
+# without this ordering a bare Identifier match on "pursue" alone would
+# silently swallow just the keyword and leave the goal name/plan
+# expression as a dangling, separately-parsed statement -- accepting
+# some malformed input (e.g. `pursue 123`) that the real parser rejects.
+Primary    <- Number / String / PursueExpr / ActivateExpr / Identifier
+              / "(" Expr ")" / ListLit / ClosureLit / BudgetedExpr
+PursueExpr <- "pursue" Identifier
+ActivateExpr <- "activate" Expr
+
+# Condition expression tower -- structurally identical, but its Postfix
+# tier deliberately excludes TrailingClosure so `if cond { ... }` doesn't
+# swallow the block as a closure argument. Nested parens can freely use
+# the general Expr tower again since that ambiguity only applies to the
+# bare, unparenthesized condition itself.
+CondExpr     <- CondPipeline
+CondPipeline <- CondOr ("|>" CondOr)*
+CondOr       <- CondAnd ("or" CondAnd)*
+CondAnd      <- CondEq ("and" CondEq)*
+CondEq       <- CondCmp (("==" / "!=" / "=") CondCmp)*
+CondCmp      <- CondBitwise (("<=" / ">=" / "<" / ">") CondBitwise)*
+CondBitwise  <- CondShift (("band" / "bxor" / "bor") CondShift)*
+CondShift    <- CondAdd (("shl" / "shr") CondAdd)*
+CondAdd      <- CondMul (("+" / "-") CondMul)*
+CondMul      <- CondUnary (("*" / "/" / "%") CondUnary)*
+CondUnary    <- ("not" / "bnot" / "-") CondUnary / CondPostfix
+CondPostfix  <- CondPrimary CondPostfixOp*
+CondPostfixOp <- Call / Index / Member
+CondPrimary  <- Number / String / PursueExpr / CondActivateExpr / Identifier
+                / "(" Expr ")" / ListLit / ClosureLit / BudgetedExpr
+# A separate condition-tower activate production, using CondExpr (not
+# Expr) for its own inner argument -- reusing the general ActivateExpr
+# here would reintroduce exactly the trailing-block ambiguity the whole
+# Expr/CondExpr split exists to prevent: `if activate(p) { ... }`'s
+# general Expr tower would let TrailingClosure swallow the if's own
+# body block as a closure argument to activate(p), leaving nothing for
+# IfBrace's required BraceBlock afterward.
+CondActivateExpr <- "activate" CondExpr
+
+ListLit    <- "[" (Expr ("," Expr)*)? "]"
+ClosureLit <- "|" ParamList "|" Block
+BudgetedExpr <- "budgeted" "(" Expr ("," Expr)? ")" Block

@@ -3,6 +3,21 @@ use super::numeric::{promote_pair, normalize, make_rational};
 use num_bigint::BigInt;
 
 pub fn add(a: &Value, b: &Value) -> Result<Value, String> {
+    // Fast path: plain Int/Int and Float/Float are the overwhelming common
+    // case (any tight arithmetic loop), and skipping promote_pair's rank
+    // check + clone for them is a real, measured win -- see the self-timing
+    // benchmark page's 2026-07-18 update. Every other combination (mixed
+    // types, BigInt, Rational, Complex, String concat) falls through to the
+    // exact same general path as before, unchanged.
+    if let (Value::Int(x), Value::Int(y)) = (a, b) {
+        return Ok(match x.checked_add(*y) {
+            Some(v) => Value::Int(v),
+            None => normalize(Value::BigInt(BigInt::from(*x) + BigInt::from(*y))),
+        });
+    }
+    if let (Value::Float(x), Value::Float(y)) = (a, b) {
+        return Ok(Value::Float(x + y));
+    }
     match (a, b) {
         // String concatenation (including mixed types) — untouched per plan.
         (Value::String(x), Value::String(y)) => Ok(Value::String(format!("{}{}", x, y))),
@@ -18,6 +33,15 @@ pub fn add(a: &Value, b: &Value) -> Result<Value, String> {
 }
 
 pub fn sub(a: &Value, b: &Value) -> Result<Value, String> {
+    if let (Value::Int(x), Value::Int(y)) = (a, b) {
+        return Ok(match x.checked_sub(*y) {
+            Some(v) => Value::Int(v),
+            None => normalize(Value::BigInt(BigInt::from(*x) - BigInt::from(*y))),
+        });
+    }
+    if let (Value::Float(x), Value::Float(y)) = (a, b) {
+        return Ok(Value::Float(x - y));
+    }
     numeric_binop(a, b, "sub",
         |x, y| x.checked_sub(y),
         |x, y| x - y,
@@ -27,6 +51,15 @@ pub fn sub(a: &Value, b: &Value) -> Result<Value, String> {
 }
 
 pub fn mul(a: &Value, b: &Value) -> Result<Value, String> {
+    if let (Value::Int(x), Value::Int(y)) = (a, b) {
+        return Ok(match x.checked_mul(*y) {
+            Some(v) => Value::Int(v),
+            None => normalize(Value::BigInt(BigInt::from(*x) * BigInt::from(*y))),
+        });
+    }
+    if let (Value::Float(x), Value::Float(y)) = (a, b) {
+        return Ok(Value::Float(x * y));
+    }
     match (a, b) {
         (Value::Complex(_, _), _) | (_, Value::Complex(_, _)) => complex_mul(a, b),
         _ => numeric_binop(a, b, "mul",
@@ -112,6 +145,25 @@ pub fn cmp(kind: BinOpKind, a: &Value, b: &Value) -> Result<Value, String> {
             Le => x <= y,
             Gt => x > y,
             Ge => x >= y,
+            _ => return Err("invalid cmp op".into()),
+        }));
+    }
+
+    // Fast path: plain Int/Int and Float/Float, the same common-case
+    // shortcut as add/sub/mul above. Safe for every BinOpKind here (Eq/Ne
+    // included) -- same-rank Int/Int or Float/Float never hits the Unit- or
+    // cross-type structural-equality special-casing below, since
+    // promote_pair(Int,Int) is already a no-op and plain `==` on two Ints
+    // is exactly what structural_numeric_eq would also conclude.
+    if let (Value::Int(x), Value::Int(y)) = (a, b) {
+        return Ok(Value::Bool(match kind {
+            Eq => x == y, Ne => x != y, Lt => x < y, Le => x <= y, Gt => x > y, Ge => x >= y,
+            _ => return Err("invalid cmp op".into()),
+        }));
+    }
+    if let (Value::Float(x), Value::Float(y)) = (a, b) {
+        return Ok(Value::Bool(match kind {
+            Eq => x == y, Ne => x != y, Lt => x < y, Le => x <= y, Gt => x > y, Ge => x >= y,
             _ => return Err("invalid cmp op".into()),
         }));
     }

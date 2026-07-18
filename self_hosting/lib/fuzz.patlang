@@ -81,12 +81,24 @@ end
 # Returns [lines(list of text lines, no trailing newline chars), state,
 # next_var_idx].
 make a function called fuzz_gen_body takes state, depth, var_idx, brace_style returns result
-  let choice_count = 4
-  if depth >= fuzz_max_depth() then
-    let choice_count = 2
-  end
   let state = fuzz_next(state)
-  let choice = fuzz_int(state, choice_count)
+  if depth >= fuzz_max_depth() then
+    # leaf-only choices (no further recursion), so generation always
+    # terminates: let(0), print(1), bitwise-let(5), list-literal(6).
+    let leaf_pick = fuzz_int(state, 4)
+    let choice = 0
+    if leaf_pick == 1 then
+      let choice = 1
+    end
+    if leaf_pick == 2 then
+      let choice = 5
+    end
+    if leaf_pick == 3 then
+      let choice = 6
+    end
+  else
+    let choice = fuzz_int(state, 7)
+  end
 
   if choice == 0 then
     # plain let: fzN = <small int>
@@ -105,7 +117,47 @@ make a function called fuzz_gen_body takes state, depth, var_idx, brace_style re
         return [["print(0)"], state, var_idx]
       end
     else
-      if choice == 2 then
+      if choice == 5 then
+        # bitwise/shift let: fzN = <small int> <op> <small int> --
+        # always both-literal-operand to stay semantically safe
+        # regardless of what var_idx already holds.
+        let state = fuzz_next(state)
+        let a = fuzz_int(state, 16)
+        let state = fuzz_next(state)
+        let b = fuzz_int(state, 4)
+        let state = fuzz_next(state)
+        let op_idx = fuzz_int(state, 5)
+        let op = "band"
+        if op_idx == 1 then
+          let op = "bor"
+        end
+        if op_idx == 2 then
+          let op = "bxor"
+        end
+        if op_idx == 3 then
+          let op = "shl"
+        end
+        if op_idx == 4 then
+          let op = "shr"
+        end
+        let name = fuzz_var_name(var_idx)
+        return [["let " + name + " = " + a + " " + op + " " + b], state, var_idx + 1]
+      else
+        if choice == 6 then
+          # list literal + indexed print -- always its own fresh
+          # 3-element literal, safe regardless of existing vars.
+          let state = fuzz_next(state)
+          let a = fuzz_int(state, 100)
+          let state = fuzz_next(state)
+          let b = fuzz_int(state, 100)
+          let state = fuzz_next(state)
+          let c = fuzz_int(state, 100)
+          let state = fuzz_next(state)
+          let idx = fuzz_int(state, 3)
+          let name = fuzz_var_name(var_idx)
+          return [["let " + name + " = [" + a + ", " + b + ", " + c + "]", "print(" + name + "[" + idx + "])"], state, var_idx + 1]
+        else
+    if choice == 2 then
         # if/then[/else]/end (word style) or if cond { }[else { }]
         # (brace style), or a same-line one-liner variant of whichever
         # style was chosen -- exercises the self-hosted parser's fn/{}
@@ -186,6 +238,9 @@ make a function called fuzz_gen_body takes state, depth, var_idx, brace_style re
           let lines = list_push(lines, "end")
         end
         return [lines, state, var_idx]
+      end
+    end
+        end
       end
     end
   end
@@ -287,6 +342,17 @@ make a function called fuzz_check_selfhost takes source returns ok
   return err[0] == ""
 end
 
+# Third opinion: the shared .peg grammar file (docs/grammar/patlang-slice1.peg),
+# interpreted by lib/peg.patlang -- an independent third implementation
+# of "is this valid PatLang", not just native-vs-self-hosted. `peg_rules`
+# is loaded once by the caller (a fresh peg_load_grammar call per fuzz
+# iteration would be needlessly slow) and passed in explicitly -- PatLang
+# functions don't close over top-level bindings.
+make a function called fuzz_check_peg takes peg_rules, source returns ok
+  let toks = tokenize(source)
+  return peg_accepts(peg_rules, "Program", toks)
+end
+
 make a function called str_contains takes hay, needle returns found
   let hn = hay.length
   let nn = needle.length
@@ -303,10 +369,16 @@ make a function called str_contains takes hay, needle returns found
   return false
 end
 
-# Generates `iterations` programs from `seed`, checks both sides, returns
-# [disagreements, final_state]. Each disagreement is
-# [source_text, native_ok, selfhost_ok].
-make a function called fuzz_run takes pat_exe, seed, iterations, scratch_path returns result
+# Generates `iterations` programs from `seed`, checks all THREE
+# implementations (native, self-hosted, and the shared .peg grammar via
+# lib/peg.patlang), returns [disagreements, final_state]. Each
+# disagreement is [source_text, native_ok, selfhost_ok, peg_ok] --
+# reported whenever ANY pair of the three disagrees, not just native vs
+# self-hosted, so a bug specific to the PEG engine (or a real grammar-
+# file gap vs both real parsers) is caught too, not just parser-vs-parser
+# drift. `peg_rules` is loaded once by the caller (self_hosting/tools/
+# fuzz_main.patlang), not reloaded per iteration.
+make a function called fuzz_run takes pat_exe, peg_rules, seed, iterations, scratch_path returns result
   let state = seed
   let disagreements = []
   let i = 0
@@ -317,8 +389,9 @@ make a function called fuzz_run takes pat_exe, seed, iterations, scratch_path re
     write_file(scratch_path, source)
     let native_ok = fuzz_check_native(pat_exe, scratch_path)
     let selfhost_ok = fuzz_check_selfhost(source)
-    if native_ok != selfhost_ok then
-      let disagreements = list_push(disagreements, [source, native_ok, selfhost_ok])
+    let peg_ok = fuzz_check_peg(peg_rules, source)
+    if (native_ok != selfhost_ok) or (native_ok != peg_ok) or (selfhost_ok != peg_ok) then
+      let disagreements = list_push(disagreements, [source, native_ok, selfhost_ok, peg_ok])
     end
     let i = i + 1
   end

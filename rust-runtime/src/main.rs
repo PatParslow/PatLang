@@ -116,7 +116,6 @@ fn real_main() {
         // Guardrail: quick scan for unsupported high-level constructs before parsing
         let unsupported_markers = [
             "reasoning mode",
-            "pursue ",
             "constrain ",
         ];
         if unsupported_markers.iter().any(|m| source.contains(m)) {
@@ -125,7 +124,7 @@ fn real_main() {
         }
         // Parse → Lower to IR → Run interpreter
         let mut parser = match Parser::new(&source) {
-            Ok(p) => p,
+            Ok(p) => p.with_source_name(filename),
             Err(e) => { eprintln!("Parse error: {:?}", e); process::exit(1); }
         };
         let ast = match parser.parse() {

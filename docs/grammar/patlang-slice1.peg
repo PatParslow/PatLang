@@ -1,0 +1,88 @@
+# PatLang grammar, Slice 1 (proof-of-concept subset).
+#
+# Deliberately covers only what self_hosting/lib/fuzz.patlang already
+# generates -- let, print-style calls, if/elif/else and while (each in
+# both the brace and word/then-do-end styles), fn/make-a-function-called
+# (both styles), and the precedence-tiered expression grammar down
+# through comparison/add/mul/unary/primary. NOT full PatLang -- no
+# closures, budgeted, when, rule declarations. See docs/grammar/README
+# (if one gets added) or the "PEG shared-grammar validator" plan for why
+# this is intentionally a proof-of-concept slice, not full grammar
+# coverage, and not a parser replacement.
+#
+# Format: `Name <- Expression`. Expression is sequence (space-separated),
+# ordered choice (/), repetition (* +), optional (?), lookahead
+# predicates (& !), grouping (( )), quoted literals, and bare-identifier
+# rule references. A quoted literal's token category is inferred from its
+# own text: alphabetic -> IDENT, punctuation -> OP (mirrors parser.patlang's
+# own tok_is(t, "IDENT", "if") / tok_is(t, "OP", "{") convention).
+
+Program    <- Stmt*
+
+Stmt       <- Let / FuncDef / If / While / Return / ExprStmt
+
+Let        <- "let" "mut"? Identifier "=" Expr
+
+FuncDef    <- MakeForm / FnForm
+MakeForm   <- "make" "a" "function" "called" Identifier
+              ("takes" ParamListBare)? ("returns" Identifier)?
+              FuncBlock
+FnForm     <- "fn" Identifier "(" ParamListParen ")" BraceBlock
+
+ParamListBare  <- (Identifier ("," Identifier)*)?
+ParamListParen <- (Identifier ("," Identifier)*)?
+
+# Function bodies have NO opening keyword between the signature and the
+# body statements (unlike if/while, which need "then"/"do"/"{") -- just
+# straight into statements, closed by "end" or "}". A distinct rule from
+# Block below, not a reuse of it -- conflating the two was a real bug
+# caught by the selftest, not a hypothetical: WordBlock's leading
+# "then"/"do" requirement means Block never matches an ordinary
+# `make a function called` body at all.
+FuncBlock  <- BraceBlock / FuncWordBlock
+FuncWordBlock <- Stmt* "end"
+
+Block      <- BraceBlock / WordBlock
+BraceBlock <- "{" Stmt* "}"
+WordBlock  <- ("then" / "do") Stmt* "end"
+
+# if/else needs its own two rules, not a reuse of Block: brace-style
+# self-delimits each clause independently ("{ }" per branch, closed
+# separately), but word-style shares exactly ONE "end" across the
+# whole then/elif/else chain (matching the real parser's
+# parse_if_then_tail: "then-branch, optional elif..., optional else,
+# and the closing end" -- a single end, not one per branch). Reusing
+# Block/WordBlock uniformly for both was a real bug caught by the
+# selftest: WordBlock's own "end" swallowed the if's only terminator
+# before an else clause ever got a chance to attach to it. Elif is
+# NOT supported in word style for Slice 1 (the fuzzer itself never
+# generates it either) -- a deliberate, stated simplification, not an
+# oversight; elif's real desugaring (nested else-if, still sharing the
+# same single end) is more structure than this proof-of-concept slice
+# needs yet.
+If            <- IfBrace / IfWord
+IfBrace       <- "if" Cond BraceBlock ElifBraceTail? ElseBraceTail?
+ElifBraceTail <- "elif" Cond BraceBlock ElifBraceTail?
+ElseBraceTail <- "else" BraceBlock
+IfWord        <- "if" Cond ("then" / "do") Stmt* ElseWordTail? "end"
+ElseWordTail  <- "else" Stmt*
+
+While      <- "while" Cond Block
+
+Cond       <- Expr
+
+Return     <- "return" Expr
+
+ExprStmt   <- Expr
+
+# ---- precedence tiers ----
+Expr       <- Or
+Or         <- And ("or" And)*
+And        <- Cmp ("and" Cmp)*
+Cmp        <- Add (("==" / "!=" / "<=" / ">=" / "<" / ">") Add)*
+Add        <- Mul (("+" / "-") Mul)*
+Mul        <- Unary (("*" / "/" / "%") Unary)*
+Unary      <- ("not" / "-") Unary / Postfix
+Postfix    <- Primary Call*
+Call       <- "(" (Expr ("," Expr)*)? ")"
+Primary    <- Number / String / Identifier / "(" Expr ")"

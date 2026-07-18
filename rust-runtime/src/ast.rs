@@ -132,6 +132,16 @@ pub enum Stmt {
         head_args: Vec<Expr>,
         body: Vec<(String, Vec<Expr>)>,
     },
+    // `goal NAME { dep1(args), dep2(args), ... }` -- names a target state
+    // as a list of fact-terms ("dependencies"). Sugar only -- lowers to a
+    // single goal_def(NAME, [[pred, [args]], ...]) host call (see
+    // lower_stmt). `pursue NAME` (an expression, see Expr::Call desugaring
+    // in parser.rs) looks this registration up and plans against it;
+    // `activate PLAN` runs the resulting plan (see lowering.rs).
+    GoalDecl {
+        name: String,
+        deps: Vec<(String, Vec<Expr>)>,
+    },
     // Extend with more statement types as needed
 }
 

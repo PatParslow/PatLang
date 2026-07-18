@@ -85,6 +85,15 @@ make a function called next_budgeted_name returns name
   return "__budgeted_" + n
 end
 
+make a function called next_activate_name returns name
+  let n = get("__vars", "__activate_seq")
+  if not n then
+    let n = 0
+  end
+  set_var("__activate_seq", n + 1)
+  return "__act_" + n
+end
+
 # Nesting-depth counter (not a bool, so a budgeted block nested inside
 # another still counts as "inside") tracking whether the statement/body
 # currently being lowered is lexically inside a budgeted(...) { ... } block
@@ -355,6 +364,53 @@ make a function called lower_budgeted_literal takes msNode, existingNode, body, 
   return code
 end
 
+# Lowers `activate(PLAN)` (the desugared form of `activate PLAN`, see
+# parser.patlang's parse_primary) -- mirrors ir/lowering.rs's
+# lower_activate exactly: host functions can't call back into the
+# interpreter to invoke a closure, so this is synthesized as ordinary
+# control-flow AST (Let/While/If/Call) fed through the normal
+# lower_block/lower_stmt path, rather than a new IR instruction. Each
+# plan step's bound closure receives its bound argument values as a
+# single List (not positionally splatted -- a plan step's real arity is
+# only known once the planner has run), and the loop stops immediately,
+# reporting failure, the moment one returns false.
+make a function called lower_activate_stmt takes plan_node, code, fns, fname, locals, mutables, pending returns out
+  let n = next_activate_name()
+  let plan_var = "__act_plan_" + n
+  let i_var = "__act_i_" + n
+  let ok_var = "__act_ok_" + n
+  let label_var = "__act_label_" + n
+  let fn_var = "__act_fn_" + n
+  let args_var = "__act_args_" + n
+  let r_var = "__act_r_" + n
+
+  let synth = [
+    ["Let", plan_var, plan_node, false, false],
+    ["Let", i_var, ["Num", "0"], false, true],
+    ["Let", ok_var, ["Bool", "true"], false, true],
+    ["While",
+      ["Bin", "and",
+        ["Var", ok_var],
+        ["Bin", "<", ["Var", i_var], ["Call", "to_num", [["Call", "list_len", [["Var", plan_var]]]]]]
+      ],
+      [
+        ["Let", label_var, ["Index", ["Var", plan_var], ["Var", i_var]], false, false],
+        ["Let", fn_var, ["Call", "action_lookup", [["Call", "action_base_name", [["Var", label_var]]]]], false, false],
+        ["Let", args_var, ["Call", "action_label_args", [["Var", label_var]]], false, false],
+        ["Let", r_var, ["Call", fn_var, [["Var", args_var]]], false, false],
+        ["If", ["Bin", "==", ["Var", r_var], ["Bool", "false"]],
+          [["Let", ok_var, ["Bool", "false"], true, false]],
+          []
+        ],
+        ["Let", i_var, ["Bin", "+", ["Var", i_var], ["Num", "1"]], true, false]
+      ]
+    ]
+  ]
+
+  let code = lower_block(synth, code, fns, fname, locals, mutables, pending)
+  return lower_expr(["Var", ok_var], code, fns, locals, pending)
+end
+
 # Render a rule head/body arg as the compile-time string token rule_add
 # expects: a bare identifier/number renders as its own text, but a string
 # literal renders as its raw content, not source-quoted -- mirrors
@@ -366,7 +422,12 @@ end
 make a function called lower_stmt takes node, code, fns, fname, locals, mutables, pending returns out
   let ty = node[0]
   if ty == "Let" then
-    let code = lower_expr(node[2], code, fns, locals, pending)
+    let valNode = node[2]
+    if (valNode[0] == "Call") and (valNode[1] == "activate") and (to_num(valNode[2].length) == 1) then
+      let code = lower_activate_stmt(valNode[2][0], code, fns, fname, locals, mutables, pending)
+    else
+      let code = lower_expr(node[2], code, fns, locals, pending)
+    end
     let isReassign = node[3]
     let isMut = node[4]
     if isReassign then
@@ -408,7 +469,12 @@ make a function called lower_stmt takes node, code, fns, fname, locals, mutables
       return code
     else
     if ty == "Expr" then
-      return lower_expr(node[1], code, fns, locals, pending)
+      let exprNode = node[1]
+      if (exprNode[0] == "Call") and (exprNode[1] == "activate") and (to_num(exprNode[2].length) == 1) then
+        return lower_activate_stmt(exprNode[2][0], code, fns, fname, locals, mutables, pending)
+      else
+        return lower_expr(node[1], code, fns, locals, pending)
+      end
     else
       if ty == "Print" then
         let code = lower_expr(node[1], code, fns, locals, pending)
@@ -494,8 +560,38 @@ make a function called lower_stmt takes node, code, fns, fname, locals, mutables
                   vec_push(code, ["CallHost", "rule_add", 3])
                   return code
                 else
-                  # unknown statement: no code
-                  return code
+                  if ty == "GoalDecl" then
+                    # Sugar: lowers to exactly the Instr sequence a hand-
+                    # written goal_def(NAME, [[pred,[args...]], ...]) call
+                    # already produces -- mirrors ir/lowering.rs's
+                    # Stmt::GoalDecl arm and the RuleDecl arm just above
+                    # (dep args are compile-time string tokens too, same
+                    # convention as a rule body's goal args).
+                    let gname = node[1]
+                    let deps = node[2]
+                    vec_push(code, ["Const", "str", gname])
+                    let j = 0
+                    while j < deps.length do
+                      let depgoal = deps[j]
+                      let pred = depgoal[0]
+                      let args = depgoal[1]
+                      vec_push(code, ["Const", "str", pred])
+                      let k = 0
+                      while k < args.length do
+                        vec_push(code, ["Const", "str", rule_arg_str(args[k])])
+                        let k = k + 1
+                      end
+                      vec_push(code, ["BuildList", args.length])
+                      vec_push(code, ["BuildList", 2])
+                      let j = j + 1
+                    end
+                    vec_push(code, ["BuildList", deps.length])
+                    vec_push(code, ["CallHost", "goal_def", 2])
+                    return code
+                  else
+                    # unknown statement: no code
+                    return code
+                  end
                 end
               end
             end
