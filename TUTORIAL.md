@@ -709,6 +709,25 @@ full rebuild. Delete `portfolio/build/` to force a clean rebuild regardless.
   useful when a compiled binary misbehaves.
 - `pat --compare file.patlang` catches interpreter/compiled divergence.
 - The test suite is the ground truth: `cd rust-runtime && cargo test`.
+- `pat --ir-run self_hosting/tools/parity_main.patlang file.patlang`
+  compares a file's output across all three execution paths at once
+  (interpreted, natively compiled, self-hosted compiled) — the fastest
+  way to confirm the self-hosted compiler agrees with the native one on a
+  given file, and the tool of choice when bisecting a native-vs-self-hosted
+  divergence. `--quiet` for scripting; without it, a mismatch prints all
+  three outputs in full.
+- `pat --ir-run self_hosting/tools/depgraph_main.patlang [--html out.html]`
+  reports the include-dependency graph over `self_hosting/` and flags any
+  cycles.
+- `pat --ir-run self_hosting/tools/format_main.patlang file.patlang [--write]`
+  fixes indentation drift (a line-based re-indenter, not a full AST
+  formatter — the lexer discards comments, so this only ever adjusts
+  leading whitespace on existing lines rather than rebuilding text).
+- `pat --ir-run self_hosting/tools/fuzz_main.patlang [--seed S] [--iterations N]`
+  generates random nested control-flow programs and checks that the
+  native and self-hosted parsers agree on each one — useful after any
+  change to either parser, to catch a divergence before it's found the
+  hard way.
 
 ## 11. Current limitations
 

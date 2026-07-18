@@ -49,6 +49,21 @@ historical record.
   console, a hex-grid RTS economy sim, a build daemon, a maze solver, a
   family-tree/demographic simulator, and others — each runnable and each
   built to prove out a real language feature rather than as a toy.
+- **Developer tooling**, all self-hosted (`self_hosting/tools/`):
+  - `parity_main.patlang` — runs a file through all three execution paths
+    (interpreted, natively compiled, self-hosted compiled) and diffs the
+    output, to catch a divergence between the native and self-hosted
+    compiler in one command.
+  - `depgraph_main.patlang` — an include-dependency graph over
+    `self_hosting/` with cycle detection, text or `--html` report.
+  - `format_main.patlang` — a line-based re-indenter (deliberately not a
+    full AST pretty-printer, since the lexer discards comments entirely
+    and a parse-rebuild formatter would delete them).
+  - `fuzz_main.patlang` — generates random nested control-flow programs
+    and checks that the native and self-hosted parsers agree on each one.
+  - Runtime errors from `--ir-run` also get a plain-language suggestion
+    line alongside the raw message (`rust-runtime/src/main.rs`'s
+    `suggest_runtime_fix`), mirroring the existing parse-error reasoning.
 
 ## What it doesn't do
 
@@ -60,7 +75,10 @@ historical record.
   Fine for scripts you wrote yourself; do not run untrusted PatLang source
   without wrapping it in an external sandbox (container, VM, restricted
   user account) first.
-- **No editor tooling.** No LSP, no debugger, no formatter, no linter.
+- **No editor tooling.** No LSP, no debugger. A basic re-indenter exists
+  (see Developer tooling above) but there's no linter yet and no IDE
+  integration beyond the standalone `tools/vscode-patlang/` syntax
+  highlighter.
 - **No performance benchmarking against other languages.** The runtime is
   Rust-backed and the self-hosted path produces real native binaries, but
   there's no published data on how either compares to established
