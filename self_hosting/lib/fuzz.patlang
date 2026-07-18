@@ -80,7 +80,7 @@ end
 
 # Returns [lines(list of text lines, no trailing newline chars), state,
 # next_var_idx].
-make a function called fuzz_gen_body takes state, depth, var_idx returns result
+make a function called fuzz_gen_body takes state, depth, var_idx, brace_style returns result
   let choice_count = 4
   if depth >= fuzz_max_depth() then
     let choice_count = 2
@@ -106,7 +106,11 @@ make a function called fuzz_gen_body takes state, depth, var_idx returns result
       end
     else
       if choice == 2 then
-        # if/then[/else]/end, or a same-line one-liner variant
+        # if/then[/else]/end (word style) or if cond { }[else { }]
+        # (brace style), or a same-line one-liner variant of whichever
+        # style was chosen -- exercises the self-hosted parser's fn/{}
+        # support (self_hosting/lib/parser.patlang's parse_if_brace_tail)
+        # alongside the word form, not just word-style programs.
         let state = fuzz_next(state)
         let oneliner = fuzz_int(state, 3) == 0
         let cond = "1 > 0"
@@ -122,41 +126,65 @@ make a function called fuzz_gen_body takes state, depth, var_idx returns result
           # then-branch-only declaration going out of scope oddly) --
           # a print is its sole effect instead, always safe.
           let line = "if " + cond + " then print(" + val + ") end"
+          if brace_style then
+            let line = "if " + cond + " { print(" + val + ") }"
+          end
           return [[line], state, var_idx]
         else
-          let inner = fuzz_gen_body(state, depth + 1, var_idx)
+          let inner = fuzz_gen_body(state, depth + 1, var_idx, brace_style)
           let then_lines = inner[0]
           let state = inner[1]
           let var_idx = inner[2]
           let state = fuzz_next(state)
           let has_else = fuzz_int(state, 2) == 1
-          let lines = ["if " + cond + " then"]
+          if brace_style then
+            let lines = ["if " + cond + " {"]
+          else
+            let lines = ["if " + cond + " then"]
+          end
           let lines = fuzz_append_indented(lines, then_lines)
           if has_else then
-            let inner2 = fuzz_gen_body(state, depth + 1, var_idx)
+            let inner2 = fuzz_gen_body(state, depth + 1, var_idx, brace_style)
             let else_lines = inner2[0]
             let state = inner2[1]
             let var_idx = inner2[2]
-            let lines = list_push(lines, "else")
+            if brace_style then
+              let lines = list_push(lines, "} else {")
+            else
+              let lines = list_push(lines, "else")
+            end
             let lines = fuzz_append_indented(lines, else_lines)
           end
-          let lines = list_push(lines, "end")
+          if brace_style then
+            let lines = list_push(lines, "}")
+          else
+            let lines = list_push(lines, "end")
+          end
           return [lines, state, var_idx]
         end
       else
-        # while/do/end, bounded to run at most a couple times -- a fresh
-        # counter var, always safe.
+        # while/do/end (word style) or while cond { } (brace style),
+        # bounded to run at most a couple times -- a fresh counter var,
+        # always safe.
         let name = fuzz_var_name(var_idx)
         let var_idx = var_idx + 1
-        let inner = fuzz_gen_body(state, depth + 1, var_idx)
+        let inner = fuzz_gen_body(state, depth + 1, var_idx, brace_style)
         let body_lines = inner[0]
         let state = inner[1]
         let var_idx = inner[2]
         let lines = ["let " + name + " = 0"]
-        let lines = list_push(lines, "while " + name + " < 2 do")
+        if brace_style then
+          let lines = list_push(lines, "while " + name + " < 2 {")
+        else
+          let lines = list_push(lines, "while " + name + " < 2 do")
+        end
         let lines = fuzz_append_indented(lines, body_lines)
         let lines = list_push(lines, "  let " + name + " = " + name + " + 1")
-        let lines = list_push(lines, "end")
+        if brace_style then
+          let lines = list_push(lines, "}")
+        else
+          let lines = list_push(lines, "end")
+        end
         return [lines, state, var_idx]
       end
     end
@@ -175,17 +203,34 @@ make a function called fuzz_append_indented takes lines, new_lines returns out
 end
 
 # Wraps a generated body in a runnable program: a function + a top-level
-# call. Returns [source_text, next_state].
+# call. Returns [source_text, next_state]. A coin flip picks word style
+# (make a function called ... end) or brace style (fn name() { }) for
+# BOTH the outer function definition and every nested if/while inside
+# it -- one style per whole program, not independently randomized per
+# block (real PatLang allows mixing styles freely, but one-style-per-
+# program is simpler and still exercises the brace-style path for real,
+# which is the actual point: self_hosting/lib/parser.patlang's fn/{}
+# support had no fuzzer coverage at all before this).
 make a function called fuzz_gen_program takes seed returns result
   let state = fuzz_next(seed)
-  let gen = fuzz_gen_body(state, 0, 0)
+  let state = fuzz_next(state)
+  let brace_style = fuzz_int(state, 2) == 1
+  let gen = fuzz_gen_body(state, 0, 0, brace_style)
   let body_lines = gen[0]
   let state = gen[1]
-  let lines = ["make a function called fuzz_test returns fz_result"]
+  if brace_style then
+    let lines = ["fn fuzz_test() {"]
+  else
+    let lines = ["make a function called fuzz_test returns fz_result"]
+  end
   let lines = fuzz_append_indented(lines, body_lines)
   let lines = list_push(lines, "  let fz_result = 1")
   let lines = list_push(lines, "  return fz_result")
-  let lines = list_push(lines, "end")
+  if brace_style then
+    let lines = list_push(lines, "}")
+  else
+    let lines = list_push(lines, "end")
+  end
   let lines = list_push(lines, "")
   let lines = list_push(lines, "fuzz_test()")
   let b = sb_new()

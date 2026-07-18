@@ -628,6 +628,39 @@ make a function called parse_while takes toks, pos returns r
   end
 end
 
+# [message, line] -- message is "" if `nameTok` is fine to use as a
+# function name, else the reserved-name error text. Shared by both
+# function-definition surface syntaxes (`make a function called` and
+# `fn`) since the native-codegen collision this guards against applies
+# regardless of which one defined the function.
+make a function called pf_check_main_reserved takes nameTok returns r
+  if nameTok[1] == "main" then
+    # "main" collides with the native codegen backend's own Rust `fn
+    # main()` entry point -- a user function literally named this
+    # compiled successfully via patc1.exe with no error, but the
+    # emitted call recursed into itself infinitely at runtime instead
+    # of dispatching to the real program entry, overflowing the stack.
+    #
+    # This is genuinely ONLY a native-compilation problem (--patc /
+    # patc1.exe) -- the tree-walking interpreter (--ir-run) has no Rust
+    # entry point to collide with at all, `main` there is just an
+    # ordinary function name. But the parser has no idea, at parse
+    # time, which backend the resulting AST will end up running on --
+    # a single parsed program can be hand to either. Rejecting `main`
+    # unconditionally here, for BOTH backends, is a deliberate, known
+    # over-restriction chosen for simplicity (one check, one place,
+    # catchable with a clear message at parse time) over a more
+    # precise but architecturally heavier fix (deferring the check to
+    # codegen time, backend-conditional). Worth relaxing later if it
+    # ever becomes a real nuisance for --ir-run-only code, but the
+    # honest long-term fix is making native codegen emit a Rust entry
+    # point name that genuinely cannot collide with any PatLang
+    # identifier, removing the need for this restriction altogether.
+    return ["'main' is a reserved function name", nameTok[2]]
+  end
+  return ["", 0]
+end
+
 make a function called parse_function_def takes toks, pos returns r
   # pos points at 'make'; expect: make a function called NAME
   #   [takes a, b] [returns r] NL body end
@@ -646,29 +679,9 @@ make a function called parse_function_def takes toks, pos returns r
   let nameTok = vec_get(toks, p)
   if nameTok[0] == "IDENT" then
     let name = nameTok[1]
-    if name == "main" then
-      # "main" collides with the native codegen backend's own Rust `fn
-      # main()` entry point -- a user function literally named this
-      # compiled successfully via patc1.exe with no error, but the
-      # emitted call recursed into itself infinitely at runtime instead
-      # of dispatching to the real program entry, overflowing the stack.
-      #
-      # This is genuinely ONLY a native-compilation problem (--patc /
-      # patc1.exe) -- the tree-walking interpreter (--ir-run) has no Rust
-      # entry point to collide with at all, `main` there is just an
-      # ordinary function name. But the parser has no idea, at parse
-      # time, which backend the resulting AST will end up running on --
-      # a single parsed program can be hand to either. Rejecting `main`
-      # unconditionally here, for BOTH backends, is a deliberate, known
-      # over-restriction chosen for simplicity (one check, one place,
-      # catchable with a clear message at parse time) over a more
-      # precise but architecturally heavier fix (deferring the check to
-      # codegen time, backend-conditional). Worth relaxing later if it
-      # ever becomes a real nuisance for --ir-run-only code, but the
-      # honest long-term fix is making native codegen emit a Rust entry
-      # point name that genuinely cannot collide with any PatLang
-      # identifier, removing the need for this restriction altogether.
-      return [["Err", "'main' is a reserved function name", nameTok[2]], p]
+    let mainErr = pf_check_main_reserved(nameTok)
+    if mainErr[0] != "" then
+      return [["Err", mainErr[0], mainErr[1]], p]
     end
     let p = p + 1
     let params = []
@@ -717,6 +730,65 @@ make a function called parse_function_def takes toks, pos returns r
     end
   else
     return [["Err", "expected function name", vec_get(toks, p)[2]], p]
+  end
+end
+
+# `fn` form: fn NAME ( param, param, ... ) { body } -- shorter surface
+# syntax for the same ["Func", name, params, body] node
+# parse_function_def produces. No takes/returns keywords, and (unlike
+# parse_function_def, which accepts either `{ }` or `... end`) the body
+# is brace-only here -- matches native's parse_function
+# (rust-runtime/src/parser.rs:706), which unconditionally expects '{'
+# right after the parameter list, with no `end`-delimited alternative.
+make a function called parse_fn_def takes toks, pos returns r
+  # pos points at 'fn'
+  let p = pos + 1
+  let nameTok = vec_get(toks, p)
+  if nameTok[0] != "IDENT" then
+    return [["Err", "expected function name", nameTok[2]], p]
+  end
+  let name = nameTok[1]
+  let mainErr = pf_check_main_reserved(nameTok)
+  if mainErr[0] != "" then
+    return [["Err", mainErr[0], mainErr[1]], p]
+  end
+  let p = p + 1
+  if tok_is(vec_get(toks, p), "OP", "(") == false then
+    return [["Err", "expected ( after function name", vec_get(toks, p)[2]], p]
+  end
+  let p = p + 1
+  let params = []
+  if tok_is(vec_get(toks, p), "OP", ")") == false then
+    let looping = true
+    while looping do
+      let t = vec_get(toks, p)
+      if t[0] == "IDENT" then
+        let params = list_push(params, t[1])
+        let p = p + 1
+        let t2 = vec_get(toks, p)
+        if tok_is(t2, "OP", ",") then
+          let p = p + 1
+        else
+          let looping = false
+        end
+      else
+        return [["Err", "expected parameter name", t[2]], p]
+      end
+    end
+  end
+  if tok_is(vec_get(toks, p), "OP", ")") == false then
+    return [["Err", "expected ) to close parameter list", vec_get(toks, p)[2]], p]
+  end
+  let p = p + 1
+  if tok_is(vec_get(toks, p), "OP", "{") == false then
+    return [["Err", "expected { to start function body", vec_get(toks, p)[2]], p]
+  end
+  let body = parse_stmts_until(toks, p + 1)
+  let p2 = body[1]
+  if tok_is(vec_get(toks, p2), "OP", "}") then
+    return [["Func", name, params, body[0]], p2 + 1]
+  else
+    return [["Err", "expected } after function body", vec_get(toks, p2)[2]], p2]
   end
 end
 
@@ -852,6 +924,9 @@ make a function called parse_stmt takes toks, pos returns r
             if tx == "make" then
               return parse_function_def(toks, pos)
             else
+              if tx == "fn" then
+                return parse_fn_def(toks, pos)
+              else
               if tx == "when" then
                 return parse_when(toks, pos)
               else
@@ -904,6 +979,7 @@ make a function called parse_stmt takes toks, pos returns r
                 end
                 end
               end
+            end
             end
           end
           end
