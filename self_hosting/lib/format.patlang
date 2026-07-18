@@ -1,0 +1,187 @@
+# =============================================================================
+# Line-based re-indenter. Deliberately NOT a full AST pretty-printer: the
+# self-hosted lexer (lib/lexer.patlang:54) strips `#` comments entirely at
+# the token level, so a parse-then-rebuild-text formatter would silently
+# delete every comment in any file it touched -- and this codebase's
+# comments are extensive and load-bearing. This tool only ever adjusts
+# LEADING WHITESPACE on existing lines; it never discards or rebuilds line
+# content, so comments and blank lines are structurally impossible to lose.
+# (Teaching the lexer to preserve comments as trivia, so a true AST
+# pretty-printer becomes safe, is a separate future compiler-core change,
+# out of scope here.)
+#
+# Known limitation: fmt_mask_line's string-literal tracking is per-line
+# (in_str resets every call), so a string literal containing a literal,
+# unescaped newline (rather than a \n escape) would be mis-masked on its
+# continuation line. Not seen anywhere in this codebase's actual style
+# (string literals always use \n escapes, never raw embedded newlines),
+# so accepted as a documented edge case rather than adding full cross-line
+# lexer-style state tracking, which would work against this tool's whole
+# point of being simple and line-based.
+#
+# Algorithm: track a running indent depth over the lines of a file.
+# "make a function called ..." opens a block (function body). Elsewhere,
+# scan each line's whole words (not naive substrings -- a variable named
+# `domain` must not misfire on "do") for "then"/"do" (openers, +1 each),
+# "end" (closer, -1), and "else" (closer+reopener, net 0, but dedents its
+# own line). A same-line `if x then ... end` one-liner nets to zero and is
+# left alone, matching the general algorithm with no special case needed
+# (confirmed common in this codebase -- 87 occurrences in
+# lib/codegen.patlang alone, not a rare edge case).
+# =============================================================================
+
+make a function called fmt_indent_width returns w
+  return 2
+end
+
+# Blanks string-literal contents and any unquoted `#`-to-end-of-line span,
+# preserving the line's length -- used only for keyword-word scanning,
+# NEVER for output (output always uses the original, unmodified line).
+make a function called fmt_mask_line takes line returns masked
+  let out = sb_new()
+  let n = line.length
+  let i = 0
+  let in_str = false
+  while i < n do
+    let c = char_code(line, i)
+    if in_str then
+      if c == 34 then
+        let in_str = false
+        sb_push(out, " ")
+      else
+        sb_push(out, " ")
+      end
+      let i = i + 1
+    else
+      if c == 34 then
+        let in_str = true
+        sb_push(out, " ")
+        let i = i + 1
+      else
+        if c == 35 then
+          # unquoted '#': blank the rest of the line, scanning is done
+          while i < n do
+            sb_push(out, " ")
+            let i = i + 1
+          end
+        else
+          sb_push(out, line[i])
+          let i = i + 1
+        end
+      end
+    end
+  end
+  return sb_str(out)
+end
+
+make a function called fmt_is_ident_char takes c returns r
+  return is_alpha_code(c) or is_digit_code(c)
+end
+
+# Splits a masked line into whole identifier-like words, in order.
+make a function called fmt_line_words takes masked returns words
+  let words = []
+  let n = masked.length
+  let i = 0
+  while i < n do
+    let c = char_code(masked, i)
+    if fmt_is_ident_char(c) then
+      let start = i
+      while (i < n) and fmt_is_ident_char(char_code(masked, i)) do
+        let i = i + 1
+      end
+      let words = list_push(words, substr(masked, start, i - start))
+    else
+      let i = i + 1
+    end
+  end
+  return words
+end
+
+make a function called fmt_starts_with takes s, prefix returns matches
+  if prefix.length > s.length then
+    return false
+  end
+  return substr(s, 0, prefix.length) == prefix
+end
+
+# [print_depth, next_depth] for one line, given the running depth before it.
+make a function called fmt_line_depths takes masked_trimmed, words, depth_before returns result
+  if fmt_starts_with(masked_trimmed, "make a function called") then
+    return [depth_before, depth_before + 1]
+  end
+  let leading_dedent = 0
+  let still_leading = true
+  let net_delta = 0
+  let i = 0
+  let n = to_num(list_len(words))
+  while i < n do
+    let w = words[i]
+    if (w == "end") or (w == "else") then
+      if still_leading then
+        let leading_dedent = leading_dedent + 1
+      end
+      if w == "end" then
+        let net_delta = net_delta - 1
+      end
+    else
+      let still_leading = false
+      if (w == "then") or (w == "do") then
+        let net_delta = net_delta + 1
+      end
+    end
+    let i = i + 1
+  end
+  let print_depth = depth_before - leading_dedent
+  if print_depth < 0 then
+    let print_depth = 0
+  end
+  return [print_depth, depth_before + net_delta]
+end
+
+make a function called fmt_spaces takes n returns s
+  let s = ""
+  let i = 0
+  while i < n do
+    let s = s + " "
+    let i = i + 1
+  end
+  return s
+end
+
+# Reindents full source text, returning the reindented text. Blank lines
+# and comment-only lines are printed at the current depth like any other
+# line (their leading whitespace is normalized too), but their CONTENT
+# (everything after the original leading whitespace) is preserved exactly.
+make a function called fmt_reindent takes source returns out
+  let lines = split_lines(source)
+  let depth = 0
+  let out_lines = []
+  let i = 0
+  let n = to_num(list_len(lines))
+  while i < n do
+    let line = lines[i]
+    let trimmed = str_trim(line)
+    if trimmed == "" then
+      let out_lines = list_push(out_lines, "")
+    else
+      let masked = fmt_mask_line(line)
+      let masked_trimmed = str_trim(masked)
+      let words = fmt_line_words(masked)
+      let result = fmt_line_depths(masked_trimmed, words, depth)
+      let print_depth = result[0]
+      let depth = result[1]
+      let out_lines = list_push(out_lines, fmt_spaces(print_depth * fmt_indent_width()) + trimmed)
+    end
+    let i = i + 1
+  end
+  let out = sb_new()
+  let i = 0
+  let n = to_num(list_len(out_lines))
+  while i < n do
+    sb_push(out, out_lines[i])
+    sb_push(out, chr(10))
+    let i = i + 1
+  end
+  return sb_str(out)
+end
