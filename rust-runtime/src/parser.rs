@@ -79,6 +79,11 @@ pub struct Parser<'a> {
     // When true, do not treat a trailing '{ ... }' after an expression as a closure argument.
     // This is used when parsing conditions like `if cond { ... }` to avoid consuming the block.
     stop_trailing_block_for_condition: bool,
+    // Label used in diagnostics (warnings/errors) to say which source this
+    // Parser is actually reading -- defaults to "<input>" for call sites
+    // that don't have a real filename (tests, embedded snippets). Set via
+    // `with_source_name`/`set_source_name`.
+    source_name: String,
 }
 
 impl<'a> Parser<'a> {
@@ -86,7 +91,16 @@ impl<'a> Parser<'a> {
         let mut lexer = Lexer::new(input);
         let curr = lexer.next_token().map_err(ParserError::Lexer)?;
         let peek = lexer.next_token().map_err(ParserError::Lexer)?;
-    Ok(Parser { lexer, curr, peek, line_no: 1, stop_trailing_block_for_condition: false })
+    Ok(Parser { lexer, curr, peek, line_no: 1, stop_trailing_block_for_condition: false, source_name: "<input>".to_string() })
+    }
+
+    pub fn with_source_name(mut self, name: impl Into<String>) -> Self {
+        self.source_name = name.into();
+        self
+    }
+
+    pub fn set_source_name(&mut self, name: impl Into<String>) {
+        self.source_name = name.into();
     }
 
     fn advance(&mut self) -> Result<(), ParserError> {
@@ -574,8 +588,8 @@ impl<'a> Parser<'a> {
                         || matches!(&self.curr, Token::Identifier(t) if t == "end" || t == "elif");
                     if !is_tail {
                         eprintln!(
-                            "warning: line {}: this expression's value is computed and discarded -- did you mean to assign it, print it, or was an operator/statement missing?",
-                            start_line
+                            "warning: {}:{}: this expression's value is computed and discarded -- did you mean to assign it, print it, or was an operator/statement missing?",
+                            self.source_name, start_line
                         );
                     }
                 }
