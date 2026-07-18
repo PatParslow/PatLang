@@ -1,0 +1,127 @@
+# PatLang program starter template.
+#
+# Copy this file as the base of any new long-running PatLang program
+# that should be controllable from outside itself (pause/resume/quit/
+# status) rather than a fire-and-forget script -- promotes the same
+# event-registration shape across every program that needs it instead
+# of each one hand-copying (and subtly re-diverging from) self_hosting/
+# lib/signals.patlang's own documented "usage shape" comment. This file
+# IS runnable as-is (try it, see "Try it" below) -- delete what you
+# don't need, fill in the TODOs, keep the shape.
+#
+# WHAT TO CHANGE for a real program:
+#   1. Pick a real port number (below, both PORT constants).
+#   2. Replace do_one_unit_of_work()'s body with your actual per-
+#      iteration work.
+#   3. Add any extra `when NAME do ... end` handlers your program
+#      needs, alongside pause/resume/quit/status below -- same shape,
+#      same file, same place, so anyone reading a new program already
+#      knows where to look.
+#   4. If your program needs data visible to a `when` handler, use
+#      set_var/get (a genuinely shared, cross-thread-safe store) --
+#      NOT a top-level `let` (a `when` handler dispatches via global
+#      emit(), it cannot see the enclosing function's locals) and NOT
+#      a vec_* handle (thread-local, invisible outside the thread that
+#      created it -- see F:\PatLang\self_hosting\lib\signals.patlang's
+#      own header and D:\Projects_Organized\04-Worldbuilding-Games\
+#      fantpop-patlang\lib\sim_loop.patlang's header for both gotchas
+#      documented in more depth, if you're doing something more
+#      involved than this template covers).
+
+include "F:/PatLang/self_hosting/lib/signals.patlang"
+
+let PORT = 9700
+
+# ---- standard event registration ----
+# Every one of these is optional to KEEP, but this is the standard set
+# -- if your program is long-running, it should normally answer all
+# four the same way every other PatLang program does, so an operator
+# (or another PatLang program) can control it without first reading
+# ITS source to find out what it happens to support this time.
+
+when pause do
+  set_var("prog_should_pause", "1")
+end
+
+when resume do
+  set_var("prog_should_pause", "0")
+end
+
+when quit do
+  set_var("prog_should_stop", "1")
+end
+
+when status do
+  signal_reply("running=" + get("__vars", "prog_running") + " iterations=" + get("__vars", "prog_iterations"))
+end
+
+# ---- TODO: replace this with your program's actual work ----
+# Called once per iteration of the main loop below, only while not
+# paused. Keep this cheap-ish per call -- signal_poll (in the loop)
+# only gets a chance to run BETWEEN calls, so a very slow single
+# iteration delays how quickly pause/quit/status actually respond.
+make a function called do_one_unit_of_work takes iteration returns done
+  print("iteration " + iteration)
+  return true
+end
+
+# ---- the standard main loop shape ----
+# signal_claim(port) decides primary vs secondary. A primary runs the
+# loop and answers signals; a secondary talks to whichever process IS
+# primary instead of starting its own second copy of the work.
+#
+# `max_iterations`: 0 means unlimited (the normal case for a real
+# long-running program -- it stops only via a "quit" signal). Any
+# positive number stops the loop after that many iterations even
+# without a quit signal, purely so this file is safe to run directly
+# as a quick, finite demo (see "Try it" below) without a second
+# process needed to tell it to stop.
+#
+# set_var always initializes prog_should_pause/prog_should_stop BEFORE
+# the loop condition ever reads them -- get() on a var that was never
+# set_var'd returns "" (empty string), not "0", so a loop condition
+# checking `get(...) == "0"` without this initializing step first would
+# never even enter the loop, a real bug caught building this template.
+make a function called run_primary takes port_id, max_iterations returns done
+  set_var("prog_should_pause", "0")
+  set_var("prog_should_stop", "0")
+  set_var("prog_running", "1")
+  set_var("prog_iterations", "0")
+  let iteration = 0
+  while get("__vars", "prog_should_stop") == "0" and (max_iterations == 0 or iteration < max_iterations) do
+    if get("__vars", "prog_should_pause") == "0" then
+      do_one_unit_of_work(iteration)
+      set_var("prog_iterations", iteration + 1)
+      let iteration = iteration + 1
+    end
+    # Cheap, non-blocking; delivers any pending signal by firing the
+    # matching `when` handler above. 20ms is a reasonable default poll
+    # interval -- lower it if your program needs to react to pause/
+    # quit faster than that, at the cost of polling more often.
+    signal_poll(port_id, 20)
+  end
+  set_var("prog_running", "0")
+  return true
+end
+
+# ---- Try it ----
+#   Run this file directly: it claims the port, runs 5 quick
+#   iterations, then stops (the max_iterations=5 below) so it's safe to
+#   just try. For a REAL long-running program, call run_primary with
+#   max_iterations=0 (unlimited) and drive it externally instead:
+#     signal_send(PORT, "quit", "")               -- from another script/run
+#     signal_query(PORT, "status", "")             -- ask it how it's doing
+#   while this file's own run_primary loop is still going, from a
+#   SEPARATE PatLang process (see F:\PatLang\self_hosting\examples\
+#   signals_demo.patlang for a full two-process worked example).
+
+let port_id = signal_claim(PORT)
+if port_id >= 0 then
+  print("primary: claimed port " + PORT + ", running...")
+  run_primary(port_id, 5)
+  print("primary: done.")
+else
+  print("secondary: someone else already owns port " + PORT + ".")
+  let reply = signal_query(PORT, "status", "")
+  print("status reply: " + reply)
+end
