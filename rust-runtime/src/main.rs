@@ -130,8 +130,16 @@ fn real_main() {
         let ast = match parser.parse() {
             Ok(a) => a,
             Err(e) => {
+                // No longer paired with the old "IR/compare path currently
+                // supports expressions, let/return, if/else, lists, boolean
+                // ops..." hint -- that was accurate for an early, much more
+                // limited Stage-0 IR pipeline, but --ir-run has long since
+                // supported functions, reasoning, goals, and far more; the
+                // stale hint actively misled about current capability
+                // (found when a genuinely unrelated parse error surfaced it
+                // for the first time in a long while, prompting a "did we
+                // lose parity?" question it had no good answer to).
                 eprintln!("Parse error: {:?}", e);
-                eprintln!("Hint: The IR/compare path currently supports expressions, let/return, if/else, lists, boolean ops, and simple host calls. For reasoning/functions/goals, use the default evaluator or phase1 backend.");
                 process::exit(1);
             }
         };
