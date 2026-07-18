@@ -160,6 +160,7 @@ const HOST_CHUNK_TABLE: &[(&str, ChunkId)] = &[
     ("sleep_ms", ChunkId::Networking),
     ("tcp_accept_timeout", ChunkId::Networking),
     ("tcp_read", ChunkId::Networking),
+    ("tcp_read_or_empty", ChunkId::Networking),
     ("tcp_write", ChunkId::Networking),
     ("tcp_close", ChunkId::Networking),
     ("spawn", ChunkId::Networking),
@@ -3320,6 +3321,25 @@ fn host_call_networking_inner(name: &str, args: &[Value]) -> Result<Value, Strin
                 let n = stream.read(&mut buf).map_err(|e| format!("tcp_read: {}", e))?;
                 Ok(Value::String(String::from_utf8_lossy(&buf[..n]).to_string()))
             }
+            "tcp_read_or_empty" => {
+                // Same shape as tcp_read, except a connection-level I/O error
+                // (e.g. the remote end resetting the connection -- a normal,
+                // expected outcome for a short-lived client, not a programmer
+                // error) returns "" instead of raising a fatal host error.
+                // See hosts.rs's host_tcp_read_or_empty for the full
+                // rationale (built after a status query crashed a real,
+                // long-running primary process one tick before completion).
+                use std::io::Read;
+                let id = arg_num(&args, 0, "tcp_read_or_empty")? as usize;
+                let mut stream = CONNS.with(|c| c.borrow().get(&id).map(|s| s.try_clone()))
+                    .ok_or_else(|| format!("tcp_read_or_empty: unknown connection {}", id))?
+                    .map_err(|e| format!("tcp_read_or_empty: {}", e))?;
+                let mut buf = vec![0u8; 65536];
+                match stream.read(&mut buf) {
+                    Ok(n) => Ok(Value::String(String::from_utf8_lossy(&buf[..n]).to_string())),
+                    Err(_) => Ok(Value::String(String::new())),
+                }
+            }
             "tcp_write" => {
                 // tcp_write(conn, data) -> Bool
                 use std::io::Write;
@@ -3403,7 +3423,7 @@ fn host_call_networking_inner(name: &str, args: &[Value]) -> Result<Value, Strin
 
 fn host_call_networking(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match name {
-        "tcp_listen" | "tcp_try_listen" | "tcp_connect" | "tcp_accept" | "sleep_ms" | "tcp_accept_timeout" | "tcp_read" | "tcp_write" | "tcp_close"
+        "tcp_listen" | "tcp_try_listen" | "tcp_connect" | "tcp_accept" | "sleep_ms" | "tcp_accept_timeout" | "tcp_read" | "tcp_read_or_empty" | "tcp_write" | "tcp_close"
         | "spawn" | "is_alive" | "wait" | "kill" => Some(host_call_networking_inner(name, args)),
         _ => None,
     }

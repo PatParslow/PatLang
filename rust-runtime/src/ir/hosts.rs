@@ -1793,6 +1793,36 @@ pub fn host_tcp_read(args: &[Value]) -> Result<Value, String> {
     Ok(Value::String(String::from_utf8_lossy(&buf[..n]).to_string()))
 }
 
+// tcp_read_or_empty(conn) -> String, same single-read-up-to-64KiB shape
+// as tcp_read, EXCEPT a connection-level I/O error (e.g. "connection
+// forcibly closed by remote host" -- a normal, expected outcome for a
+// short-lived client connection that drops early, not a programmer
+// error) returns "" instead of raising PatLang's usual fatal host-
+// function error. Exists specifically for signal_poll (self_hosting/
+// lib/signals.patlang): that function runs on a long-lived PRIMARY
+// process, and using plain tcp_read there meant a single flaky/dropped
+// signal-sender connection could crash the ENTIRE primary (confirmed:
+// querying a fantpop-patlang simulation's live status crashed the
+// whole ~20-minute simulation one tick before it would have finished).
+// Only the READ itself is treated as recoverable -- an unknown
+// connection id (the caller's own bug, not a natural runtime
+// condition) still raises the ordinary fatal error, matching
+// tcp_try_listen's own precedent of turning exactly one specific,
+// expected failure mode non-fatal rather than becoming a general
+// try/catch escape hatch.
+pub fn host_tcp_read_or_empty(args: &[Value]) -> Result<Value, String> {
+    use std::io::Read;
+    let id = arg_num(args, 0, "tcp_read_or_empty")? as usize;
+    let mut stream = CONNS.with(|c| c.borrow().get(&id).map(|s| s.try_clone()))
+        .ok_or_else(|| format!("tcp_read_or_empty: unknown connection {}", id))?
+        .map_err(|e| format!("tcp_read_or_empty: {}", e))?;
+    let mut buf = vec![0u8; 65536];
+    match stream.read(&mut buf) {
+        Ok(n) => Ok(Value::String(String::from_utf8_lossy(&buf[..n]).to_string())),
+        Err(_) => Ok(Value::String(String::new())),
+    }
+}
+
 pub fn host_tcp_write(args: &[Value]) -> Result<Value, String> {
     use std::io::Write;
     let id = arg_num(args, 0, "tcp_write")? as usize;
@@ -2335,6 +2365,7 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("tcp_accept_timeout", host_tcp_accept_timeout);
     interp.host.insert("sleep_ms", host_sleep_ms);
     interp.host.insert("tcp_read", host_tcp_read);
+    interp.host.insert("tcp_read_or_empty", host_tcp_read_or_empty);
     interp.host.insert("tcp_write", host_tcp_write);
     interp.host.insert("tcp_close", host_tcp_close);
     interp.host.insert("spawn", host_spawn);
