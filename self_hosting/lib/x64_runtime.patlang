@@ -184,3 +184,324 @@ make a function called rt_list_set takes l, i, v returns done
   mem_poke_qword(l, 8 + i * 8, v)
   return true
 end
+
+# ---- numeric tower: BigInt (tagged values, DYNAMIC-MODE functions only) ----
+#
+# Scope, named explicitly (see the plan at wondering-about-extending-
+# patlang-modular-shore.md and memory patlang-x64-tower-design-
+# philosophy for the full three-round design negotiation this came
+# from): every value in a function codegen_x64.patlang classifies as
+# "dynamic" (currently: any function whose own body calls
+# rt_bigint_from_i64, directly -- a whole-function decision, exactly
+# mirroring Slice 7's float_mode scope limit, NOT yet per-value
+# specialization or cross-function propagation) is a TAGGED 64-bit
+# word: top 16 bits (48-63) = tag, low 48 bits = payload.
+#   tag all-zero  -> fixnum: payload is a signed 48-bit int (~+-140
+#                    trillion), recovered via `(w shl 16) shr 16`
+#                    (sign-extends from bit 47; `shr` in this backend
+#                    lowers to `sar`, an arithmetic shift).
+#   family 0x1
+#   (numeric),
+#   local bit0    -> BigInt: payload (masked) is a heap address.
+# Functions NOT classified dynamic (everything that doesn't touch
+# BigInt, including every existing demo/benchmark) get TODAY'S EXACT
+# untagged codegen, unchanged -- this is the property that keeps the
+# whole-int/whole-float speed advantage (see memory patlang-x64-
+# benchmarking) intact; verified, not just assumed, in this slice's
+# own testing.
+#
+# `+` on two dynamic-mode values therefore genuinely stays `+` in
+# source PatLang (see codegen_x64.patlang's x64_binop_asm_dynamic) --
+# no named-function workaround. Fixnum+fixnum that overflows 48 bits
+# promotes to BigInt automatically at the `+` site itself, mirroring
+# the interpreter's own checked_add-then-promote behavior.
+#
+# DELIBERATE SCOPE LIMITS, named honestly (this is a first working
+# cut of a very large design, not full parity):
+#   - Only `+` gets dynamic dispatch this pass; `-`/`*`/`/`/comparisons
+#     on genuinely dynamic (possibly-BigInt) values are NOT yet wired
+#     -- rt_bigint_add exists and is reachable, subtract/multiply/
+#     compare on the tower are real follow-up work.
+#   - Rational, Complex, Object: tag space reserved (families 0x2 List,
+#     0x3 String were already spoken for by existing types; Numeric's
+#     own family-local bits 1/2 for Rational/Float are reserved),
+#     nothing implemented.
+#   - String/List/Closure values are NOT tagged -- they keep today's
+#     exact raw-address representation, untouched by this pass. A
+#     BigInt value has never been stored into a List or passed through
+#     a Closure capture in this cut; doing so is unverified.
+#   - A NEGATIVE integer literal used DIRECTLY as an operand to `+`
+#     inside a dynamic-mode function is unverified/unsafe in this cut
+#     (Const codegen is intentionally unchanged in dynamic mode, so a
+#     literal like `-5` keeps its natural two's-complement top bits
+#     set, which the fixnum check would misread as a non-zero tag).
+#     Every value used this way in the demo is non-negative. Real fix
+#     is per-value analysis of "will this Const flow into a dynamic
+#     Bin or a plain function argument", deferred with everything else
+#     under "not yet per-value specialization" above.
+#   - BigInt division, and magnitudes large enough for a single
+#     schoolbook column's carry itself to overflow 64 bits: still out
+#     of scope, unchanged from the original floats-only Slice 7 notes.
+
+make a function called rt_tag_mask returns mask
+  return (1 shl 16 - 1) shl 48
+end
+
+make a function called rt_payload_mask returns mask
+  return 1 shl 48 - 1
+end
+
+make a function called rt_bigint_tag returns tag
+  return (1 shl 60) bor (1 shl 48)
+end
+
+make a function called rt_int_to_str takes n returns s
+  let buf = mem_scratch_addr()
+  let len = rt_int_to_string(n, buf)
+  let s = rt_heap_alloc(8 + len)
+  mem_poke_qword(s, 0, len)
+  let i = 0
+  while i < len do
+    mem_poke_byte(s, 8 + i, mem_peek_byte(buf, i))
+    let i = i + 1
+  end
+  return s
+end
+
+# Zero-padded to exactly 9 digits -- for every limb EXCEPT the most
+# significant one when printing a BigInt (base 10^9 per limb).
+make a function called rt_limb9_to_str takes n returns s
+  let s = rt_heap_alloc(8 + 9)
+  mem_poke_qword(s, 0, 9)
+  let v = n
+  let i = 8
+  while i >= 0 do
+    let d = v % 10
+    mem_poke_byte(s, 8 + i, d + 48)
+    let v = v / 10
+    let i = i - 1
+  end
+  return s
+end
+
+# Real bug found here: an earlier draft used list_push/list_len to
+# collect limbs before allocating the block. list_push is NOT one of
+# this backend's supported CallHost primitives (see x64_binop_asm's
+# neighbor x64_callhost_asm's own header: list_get/list_len are
+# aliased, list_push/list_set deliberately are not). Because
+# x64_runtime.patlang is unconditionally prepended to EVERY compiled
+# program, that one bad call silently poisoned every program's own
+# generated .asm with an "UNSUPPORTED_PRIMITIVE_ERROR" placeholder
+# function -- caught immediately (a printed compile-time error) the
+# first time ANY demo was rebuilt after this file changed, even
+# demos that never call rt_bigint_from_i64 at all. Fixed by counting
+# limbs with a plain integer loop first, then allocating once and
+# writing digits directly into the heap block -- no dynamic PatLang
+# list anywhere in this function.
+make a function called rt_bigint_from_i64 takes n returns tagged
+  let sign = 0
+  let v = n
+  if v < 0 then
+    let sign = 1
+    let v = 0 - v
+  end
+  let n_limbs = 1
+  if v > 0 then
+    let n_limbs = 0
+    let t = v
+    while t > 0 do
+      let n_limbs = n_limbs + 1
+      let t = t / 1000000000
+    end
+  end
+  let addr = rt_heap_alloc(16 + n_limbs * 8)
+  mem_poke_qword(addr, 0, sign)
+  mem_poke_qword(addr, 8, n_limbs)
+  if v == 0 then
+    mem_poke_qword(addr, 16, 0)
+  else
+    let i = 0
+    let t = v
+    while t > 0 do
+      mem_poke_qword(addr, 16 + i * 8, t % 1000000000)
+      let t = t / 1000000000
+      let i = i + 1
+    end
+  end
+  return addr bor rt_bigint_tag()
+end
+
+make a function called rt_bigint_to_string takes tagged returns s
+  let addr = tagged band rt_payload_mask()
+  let sign = mem_peek_qword(addr, 0)
+  let count = mem_peek_qword(addr, 8)
+  let result = ""
+  if sign == 1 then
+    let result = "-"
+  end
+  let top = mem_peek_qword(addr, 16 + (count - 1) * 8)
+  let result = rt_str_concat(result, rt_int_to_str(top))
+  let i = count - 2
+  while i >= 0 do
+    let limb = mem_peek_qword(addr, 16 + i * 8)
+    let result = rt_str_concat(result, rt_limb9_to_str(limb))
+    let i = i - 1
+  end
+  return result
+end
+
+# |a| vs |b|, ignoring sign: -1, 0, or 1.
+make a function called rt_bigint_mag_cmp takes addr_a, addr_b returns cmp
+  let na = mem_peek_qword(addr_a, 8)
+  let nb = mem_peek_qword(addr_b, 8)
+  if na != nb then
+    if na > nb then
+      return 1
+    else
+      return 0 - 1
+    end
+  end
+  let i = na - 1
+  let result = 0
+  let keep_going = true
+  while keep_going do
+    if i < 0 then
+      let keep_going = false
+    else
+      let la = mem_peek_qword(addr_a, 16 + i * 8)
+      let lb = mem_peek_qword(addr_b, 16 + i * 8)
+      if la != lb then
+        if la > lb then
+          let result = 1
+        else
+          let result = 0 - 1
+        end
+        let keep_going = false
+      else
+        let i = i - 1
+      end
+    end
+  end
+  return result
+end
+
+# |a| + |b| (sign-agnostic), a fresh heap block, sign left as 0 --
+# caller (rt_bigint_add) sets the real sign afterward.
+make a function called rt_bigint_mag_add takes addr_a, addr_b returns addr
+  let na = mem_peek_qword(addr_a, 8)
+  let nb = mem_peek_qword(addr_b, 8)
+  let n = na
+  if nb > n then
+    let n = nb
+  end
+  let addr = rt_heap_alloc(16 + (n + 1) * 8)
+  let carry = 0
+  let i = 0
+  let out_n = 0
+  while i < n do
+    let la = 0
+    if i < na then
+      let la = mem_peek_qword(addr_a, 16 + i * 8)
+    end
+    let lb = 0
+    if i < nb then
+      let lb = mem_peek_qword(addr_b, 16 + i * 8)
+    end
+    let s = la + lb + carry
+    if s >= 1000000000 then
+      let s = s - 1000000000
+      let carry = 1
+    else
+      let carry = 0
+    end
+    mem_poke_qword(addr, 16 + i * 8, s)
+    let out_n = i + 1
+    let i = i + 1
+  end
+  if carry > 0 then
+    mem_poke_qword(addr, 16 + out_n * 8, carry)
+    let out_n = out_n + 1
+  end
+  mem_poke_qword(addr, 0, 0)
+  mem_poke_qword(addr, 8, out_n)
+  return addr
+end
+
+# Drop leading (most-significant) zero limbs down to a minimum of 1.
+make a function called rt_bigint_trim takes addr returns addr2
+  let n = mem_peek_qword(addr, 8)
+  let keep_going = true
+  while keep_going do
+    if n <= 1 then
+      let keep_going = false
+    else
+      let top = mem_peek_qword(addr, 16 + (n - 1) * 8)
+      if top == 0 then
+        let n = n - 1
+      else
+        let keep_going = false
+      end
+    end
+  end
+  mem_poke_qword(addr, 8, n)
+  return addr
+end
+
+# |a| - |b| (sign-agnostic), REQUIRES |a| >= |b| (caller's job to pick
+# the larger-magnitude operand as addr_a via rt_bigint_mag_cmp first).
+make a function called rt_bigint_mag_sub takes addr_a, addr_b returns addr
+  let na = mem_peek_qword(addr_a, 8)
+  let nb = mem_peek_qword(addr_b, 8)
+  let addr = rt_heap_alloc(16 + na * 8)
+  let borrow = 0
+  let i = 0
+  while i < na do
+    let la = mem_peek_qword(addr_a, 16 + i * 8)
+    let lb = 0
+    if i < nb then
+      let lb = mem_peek_qword(addr_b, 16 + i * 8)
+    end
+    let d = la - lb - borrow
+    if d < 0 then
+      let d = d + 1000000000
+      let borrow = 1
+    else
+      let borrow = 0
+    end
+    mem_poke_qword(addr, 16 + i * 8, d)
+    let i = i + 1
+  end
+  mem_poke_qword(addr, 0, 0)
+  mem_poke_qword(addr, 8, na)
+  return rt_bigint_trim(addr)
+end
+
+# Real signed BigInt add: same-sign -> magnitude add, keep sign;
+# different-sign -> magnitude subtract (larger minus smaller), sign of
+# the larger-magnitude operand -- the standard schoolbook rule, not a
+# same-sign-only shortcut.
+make a function called rt_bigint_add takes tagged_a, tagged_b returns tagged
+  let addr_a = tagged_a band rt_payload_mask()
+  let addr_b = tagged_b band rt_payload_mask()
+  let sign_a = mem_peek_qword(addr_a, 0)
+  let sign_b = mem_peek_qword(addr_b, 0)
+  let result = 0
+  if sign_a == sign_b then
+    let result = rt_bigint_mag_add(addr_a, addr_b)
+    mem_poke_qword(result, 0, sign_a)
+  else
+    let c = rt_bigint_mag_cmp(addr_a, addr_b)
+    if c == 0 then
+      return rt_bigint_from_i64(0)
+    else
+      if c > 0 then
+        let result = rt_bigint_mag_sub(addr_a, addr_b)
+        mem_poke_qword(result, 0, sign_a)
+      else
+        let result = rt_bigint_mag_sub(addr_b, addr_a)
+        mem_poke_qword(result, 0, sign_b)
+      end
+    end
+  end
+  return result bor rt_bigint_tag()
+end
