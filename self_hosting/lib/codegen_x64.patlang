@@ -620,6 +620,113 @@ end
 
 # ---- one function -> nasm text ----
 
+# ---- Slice 6: a narrowly, safely scoped register-usage win ----
+#
+# NOT a general register allocator -- that needs real liveness
+# analysis with control-flow-merge-point consistency, a much larger
+# and riskier undertaking. Instead: recognize the single most common
+# wasteful pattern, `Const num` immediately followed by `Bin op`
+# (loop counters, comparisons against a fixed bound -- `i + 1`,
+# `i < 10`, extremely common in real code), and collapse the
+# push-then-pop round-trip into ONE instruction using the constant as
+# an immediate operand, which x86 supports directly for add/sub/imul/
+# cmp. `/` and `%` are excluded -- `idiv` has no immediate-operand
+# form, so fusing them would need to load the constant into a register
+# first anyway, defeating the point.
+#
+# SAFETY: this is only correct if nothing can jump directly into the
+# MIDDLE of the fused pair (skipping the Const's own contribution) --
+# so fusion only fires when the Bin instruction's own index is NOT a
+# jump target anywhere in the function. x64_collect_jump_targets scans
+# every Jump/JumpIfFalse in the function once per call to check this.
+
+make a function called x64_collect_jump_targets takes instrs returns targets
+  let targets = []
+  let n = to_num(list_len(instrs))
+  let i = 0
+  while i < n do
+    let instr = instrs[i]
+    if instr[0] == "Jump" then
+      let targets = list_push(targets, to_num(instr[1]))
+    else
+      if instr[0] == "JumpIfFalse" then
+        let targets = list_push(targets, to_num(instr[1]))
+      end
+    end
+    let i = i + 1
+  end
+  return targets
+end
+
+make a function called x64_is_jump_target takes targets, idx returns yes
+  let n = to_num(list_len(targets))
+  let i = 0
+  while i < n do
+    if targets[i] == idx then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called x64_fusable_binop takes op returns yes
+  if op == "/" then
+    return false
+  end
+  if op == "%" then
+    return false
+  end
+  return true
+end
+
+# The fused Const+Bin sequence: pop the LEFT operand (already on the
+# stack from whatever came before the Const), operate against the
+# constant as an immediate, push the result. Same result-in-rax/push
+# convention as x64_binop_asm, just without ever materializing the
+# constant to the stack at all.
+make a function called x64_fused_const_binop_asm takes const_text, op returns asm
+  let sb = sb_new()
+  sb_push(sb, "    pop rax" + nl())
+  if op == "+" then
+    sb_push(sb, "    add rax, " + const_text + nl())
+  else
+    if op == "-" then
+      sb_push(sb, "    sub rax, " + const_text + nl())
+    else
+      if op == "*" then
+        sb_push(sb, "    imul rax, rax, " + const_text + nl())
+      else
+        sb_push(sb, "    cmp rax, " + const_text + nl())
+        if op == "==" then
+          sb_push(sb, "    sete al" + nl())
+        else
+          if op == "!=" then
+            sb_push(sb, "    setne al" + nl())
+          else
+            if op == "<" then
+              sb_push(sb, "    setl al" + nl())
+            else
+              if op == "<=" then
+                sb_push(sb, "    setle al" + nl())
+              else
+                if op == ">" then
+                  sb_push(sb, "    setg al" + nl())
+                else
+                  sb_push(sb, "    setge al" + nl())
+                end
+              end
+            end
+          end
+        end
+        sb_push(sb, "    movzx rax, al" + nl())
+      end
+    end
+  end
+  sb_push(sb, "    push rax" + nl())
+  return sb_str(sb)
+end
+
 make a function called x64_emit_func takes func returns asm
   let func_name = func[1]
   let params = func[2]
@@ -651,11 +758,35 @@ make a function called x64_emit_func takes func returns asm
     let p = p + 1
   end
   let n = to_num(list_len(instrs))
+  let jump_targets = x64_collect_jump_targets(instrs)
   let i = 0
   while i < n do
-    let label = "L_" + func_name + "_" + i
-    sb_push(sb, x64_emit_instr(instrs[i], func_name, locals, label))
-    let i = i + 1
+    let instr = instrs[i]
+    let fused = false
+    if i + 1 < n then
+      let next = instrs[i + 1]
+      if instr[0] == "Const" then
+        if instr[1] == "num" then
+          if next[0] == "Bin" then
+            if x64_fusable_binop(next[1]) then
+              if not x64_is_jump_target(jump_targets, i + 1) then
+                let fused = true
+              end
+            end
+          end
+        end
+      end
+    end
+    if fused then
+      sb_push(sb, "L_" + func_name + "_" + i + ":" + nl())
+      sb_push(sb, "L_" + func_name + "_" + (i + 1) + ":" + nl())
+      sb_push(sb, x64_fused_const_binop_asm(instr[2], instrs[i + 1][1]))
+      let i = i + 2
+    else
+      let label = "L_" + func_name + "_" + i
+      sb_push(sb, x64_emit_instr(instr, func_name, locals, label))
+      let i = i + 1
+    end
   end
   return sb_str(sb)
 end
