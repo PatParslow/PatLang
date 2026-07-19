@@ -270,6 +270,142 @@ make a function called x64_collect_locals takes func returns names
   return names
 end
 
+# ---- locals register allocation (Slice 8) ----
+#
+# Deliberately simple, provably-correct allocator: eligible locals each
+# get a DEDICATED register for their WHOLE function lifetime -- no
+# interval-based SHARING of one register between two different locals
+# within a function (a real linear-scan allocator with spill-by-
+# furthest-end would pack more locals into the same 3 registers, but
+# adds real correctness risk -- a wrong overlap check silently corrupts
+# the self-hosted compiler's own output -- for marginal gain given the
+# pool is only 3 registers wide; named, deliberate scope limit).
+#
+# Eligibility is NOT just "first K locals" -- this backend's OWN calling
+# convention gives NO register-preservation guarantee across a `call`
+# (documented repeatedly elsewhere in this file, e.g. x64_callvalue_asm:
+# "r12/r13/r14 are not guaranteed to survive the call"). That's true not
+# only for calls to other PatLang functions (Call/CallValue) but for
+# every OTHER instruction kind that embeds an internal call under this
+# same convention: CallHost, BuildList/MakeClosure (both call
+# rt_heap_alloc), and Bin in dynamic_mode (may call rt_bigint_from_i64
+# etc). A local register-allocated across one of these would be
+# silently clobbered by the callee's own use of that register --
+# exactly the class of bug this whole freeing effort has been careful
+# to avoid. So a local is only eligible if NONE of these call-boundary
+# instruction kinds appear between the start of the function and its
+# last use (conservative: scans from index 0, not from the local's own
+# first def, so it may spill a few more locals than strictly necessary
+# -- correctness over optimality, matching this session's established
+# "over-estimate, never under-estimate" liveness approach).
+make a function called x64_reg_pool returns names
+  return ["rbx", "r13", "r14"]
+end
+
+make a function called x64_instr_is_call_boundary takes instr, dynamic_mode returns is_call
+  let ty = instr[0]
+  if ty == "Call" then
+    return true
+  end
+  if ty == "CallValue" then
+    return true
+  end
+  if ty == "CallHost" then
+    return true
+  end
+  if ty == "BuildList" then
+    return true
+  end
+  if ty == "MakeClosure" then
+    return true
+  end
+  if ty == "Bin" then
+    if dynamic_mode then
+      return true
+    end
+  end
+  return false
+end
+
+make a function called x64_local_register_eligible takes instrs, name, dynamic_mode returns ok
+  let n = to_num(list_len(instrs))
+  let last = 0 - 1
+  let i = 0
+  while i < n do
+    let instr = instrs[i]
+    if instr[0] == "Load" then
+      if instr[1] == name then
+        let last = i
+      end
+    else
+      if instr[0] == "Store" then
+        if instr[1] == name then
+          let last = i
+        end
+      end
+    end
+    let i = i + 1
+  end
+  if last < 0 then
+    return true
+  end
+  let i = 0
+  while i <= last do
+    if x64_instr_is_call_boundary(instrs[i], dynamic_mode) then
+      return false
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+# Register-assigned locals, in `locals`' own order, capped at the pool
+# size -- parallel to x64_reg_pool()'s own order (regmap[0] gets rbx,
+# regmap[1] gets r13, regmap[2] gets r14).
+make a function called x64_build_regmap takes locals, instrs, dynamic_mode returns names
+  let pool = x64_reg_pool()
+  let cap = to_num(list_len(pool))
+  let n = to_num(list_len(locals))
+  let out = []
+  let i = 0
+  while i < n do
+    if to_num(list_len(out)) < cap then
+      let name = locals[i]
+      if x64_local_register_eligible(instrs, name, dynamic_mode) then
+        let out = list_push(out, name)
+      end
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called x64_reg_for_name takes regmap, name returns reg
+  let idx = x64_local_index(regmap, name)
+  if idx < 0 then
+    return ""
+  end
+  let pool = x64_reg_pool()
+  return pool[idx]
+end
+
+# Every local NOT in regmap still needs a stack slot, renumbered among
+# themselves (own order, not original index in `locals`) so the frame
+# doesn't waste space reserving slots for register-resident locals.
+make a function called x64_spilled_locals takes locals, regmap returns names
+  let n = to_num(list_len(locals))
+  let out = []
+  let i = 0
+  while i < n do
+    let name = locals[i]
+    if x64_local_index(regmap, name) < 0 then
+      let out = list_push(out, name)
+    end
+    let i = i + 1
+  end
+  return out
+end
+
 # ---- one instruction -> nasm text ----
 
 # Float variant (Slice 7): operand bits already sit in plain GP
@@ -438,9 +574,9 @@ end
 # `locals`), not registers r13/r14 -- freed for the locals register
 # allocator (see memory patlang-x64-register-allocator-slice8). Clobbers
 # rax/r15/r10.
-make a function called x64_dynamic_promote_both_asm takes suffix, locals returns asm
-  let dyn_a = 8 * (to_num(list_len(locals)) + 2)
-  let dyn_b = 8 * (to_num(list_len(locals)) + 3)
+make a function called x64_dynamic_promote_both_asm takes suffix, spilled returns asm
+  let dyn_a = 8 * (to_num(list_len(spilled)) + 2)
+  let dyn_b = 8 * (to_num(list_len(spilled)) + 3)
   let sb = sb_new()
   sb_push(sb, "    mov r15, 18446462598732840960" + x64_nl_char())
   sb_push(sb, "    mov rax, [rbp-" + dyn_a + "]" + x64_nl_char())
@@ -479,9 +615,9 @@ end
 # recognizes "fixnum or not", same as the BigInt version) -- a real,
 # accepted gap (BigInt/Rational interop is out of scope by
 # representation, not merely unimplemented).
-make a function called x64_dynamic_promote_both_rational_asm takes suffix, locals returns asm
-  let dyn_a = 8 * (to_num(list_len(locals)) + 2)
-  let dyn_b = 8 * (to_num(list_len(locals)) + 3)
+make a function called x64_dynamic_promote_both_rational_asm takes suffix, spilled returns asm
+  let dyn_a = 8 * (to_num(list_len(spilled)) + 2)
+  let dyn_b = 8 * (to_num(list_len(spilled)) + 3)
   let sb = sb_new()
   sb_push(sb, "    mov r15, 18446462598732840960" + x64_nl_char())
   sb_push(sb, "    mov rax, [rbp-" + dyn_a + "]" + x64_nl_char())
@@ -519,9 +655,9 @@ end
 # tagged value as-is (rt_complex_from_num), no fixnum-specific
 # unpack/repack needed: the whole tagged word becomes the new
 # Complex's real part unchanged.
-make a function called x64_dynamic_promote_both_complex_asm takes suffix, locals returns asm
-  let dyn_a = 8 * (to_num(list_len(locals)) + 2)
-  let dyn_b = 8 * (to_num(list_len(locals)) + 3)
+make a function called x64_dynamic_promote_both_complex_asm takes suffix, spilled returns asm
+  let dyn_a = 8 * (to_num(list_len(spilled)) + 2)
+  let dyn_b = 8 * (to_num(list_len(spilled)) + 3)
   let sb = sb_new()
   sb_push(sb, "    mov r15, 18446462598732840960" + x64_nl_char())
   sb_push(sb, "    mov rax, [rbp-" + dyn_a + "]" + x64_nl_char())
@@ -551,9 +687,9 @@ end
 # Same shape again, promotes to INTERVAL (degenerate [v,v]) instead of
 # Complex -- see x64_dynamic_promote_both_complex_asm's own comment
 # for why this is simpler than the BigInt/Rational versions.
-make a function called x64_dynamic_promote_both_interval_asm takes suffix, locals returns asm
-  let dyn_a = 8 * (to_num(list_len(locals)) + 2)
-  let dyn_b = 8 * (to_num(list_len(locals)) + 3)
+make a function called x64_dynamic_promote_both_interval_asm takes suffix, spilled returns asm
+  let dyn_a = 8 * (to_num(list_len(spilled)) + 2)
+  let dyn_b = 8 * (to_num(list_len(spilled)) + 3)
   let sb = sb_new()
   sb_push(sb, "    mov r15, 18446462598732840960" + x64_nl_char())
   sb_push(sb, "    mov rax, [rbp-" + dyn_a + "]" + x64_nl_char())
@@ -589,9 +725,9 @@ end
 # path (either operand not fixnum) promotes both to Rational and
 # calls rt_rational_div -- see that promotion helper's own header for
 # the accepted BigInt/Rational-interop gap.
-make a function called x64_binop_asm_div_dynamic takes locals returns asm
-  let dyn_a = 8 * (to_num(list_len(locals)) + 2)
-  let dyn_b = 8 * (to_num(list_len(locals)) + 3)
+make a function called x64_binop_asm_div_dynamic takes spilled returns asm
+  let dyn_a = 8 * (to_num(list_len(spilled)) + 2)
+  let dyn_b = 8 * (to_num(list_len(spilled)) + 3)
   let suffix = label_asm_safe(0)
   let sb = sb_new()
   sb_push(sb, "    pop qword [rbp-" + dyn_b + "]" + x64_nl_char())
@@ -631,7 +767,7 @@ make a function called x64_binop_asm_div_dynamic takes locals returns asm
   sb_push(sb, "    add rsp, 16" + x64_nl_char())
   sb_push(sb, "    jmp .DIV_DONE_" + suffix + x64_nl_char())
   sb_push(sb, ".DIV_SLOW_" + suffix + ":" + x64_nl_char())
-  sb_push(sb, x64_dynamic_promote_both_rational_asm(suffix, locals))
+  sb_push(sb, x64_dynamic_promote_both_rational_asm(suffix, spilled))
   sb_push(sb, "    push qword [rbp-" + dyn_a + "]" + x64_nl_char())
   sb_push(sb, "    push qword [rbp-" + dyn_b + "]" + x64_nl_char())
   sb_push(sb, "    call rt_rational_div" + x64_nl_char())
@@ -667,9 +803,9 @@ end
 #
 # TAGMASK = top 16 bits set (0xFFFF shl 48) = 18446462598732840960.
 # PAYLOAD_MASK = low 48 bits set ((1 shl 48) - 1) = 281474976710655.
-make a function called x64_binop_asm_dynamic takes op, locals returns asm
-  let dyn_a = 8 * (to_num(list_len(locals)) + 2)
-  let dyn_b = 8 * (to_num(list_len(locals)) + 3)
+make a function called x64_binop_asm_dynamic takes op, spilled returns asm
+  let dyn_a = 8 * (to_num(list_len(spilled)) + 2)
+  let dyn_b = 8 * (to_num(list_len(spilled)) + 3)
   let suffix = label_asm_safe(0)
   let sb = sb_new()
   sb_push(sb, "    pop qword [rbp-" + dyn_b + "]" + x64_nl_char())
@@ -714,7 +850,7 @@ make a function called x64_binop_asm_dynamic takes op, locals returns asm
     sb_push(sb, "    and rax, r15" + x64_nl_char())
     sb_push(sb, "    jmp .DYN_DONE_" + suffix + x64_nl_char())
     sb_push(sb, ".DYN_OVERFLOW_" + suffix + ":" + x64_nl_char())
-    sb_push(sb, x64_dynamic_promote_both_asm(suffix + "O", locals))
+    sb_push(sb, x64_dynamic_promote_both_asm(suffix + "O", spilled))
     sb_push(sb, "    push qword [rbp-" + dyn_a + "]" + x64_nl_char())
     sb_push(sb, "    push qword [rbp-" + dyn_b + "]" + x64_nl_char())
     sb_push(sb, "    call " + x64_bigint_fn_for_op(op) + x64_nl_char())
@@ -795,7 +931,7 @@ make a function called x64_binop_asm_dynamic takes op, locals returns asm
   sb_push(sb, "    je .DYN_RAT_" + suffix + x64_nl_char())
   sb_push(sb, "    cmp r10, rcx" + x64_nl_char())
   sb_push(sb, "    je .DYN_RAT_" + suffix + x64_nl_char())
-  sb_push(sb, x64_dynamic_promote_both_asm(suffix + "N", locals))
+  sb_push(sb, x64_dynamic_promote_both_asm(suffix + "N", spilled))
   if x64_is_dynamic_cmp_op(op) then
     sb_push(sb, "    push qword [rbp-" + dyn_a + "]" + x64_nl_char())
     sb_push(sb, "    push qword [rbp-" + dyn_b + "]" + x64_nl_char())
@@ -812,7 +948,7 @@ make a function called x64_binop_asm_dynamic takes op, locals returns asm
   end
   sb_push(sb, "    jmp .DYN_DONE_" + suffix + x64_nl_char())
   sb_push(sb, ".DYN_RAT_" + suffix + ":" + x64_nl_char())
-  sb_push(sb, x64_dynamic_promote_both_rational_asm(suffix + "N", locals))
+  sb_push(sb, x64_dynamic_promote_both_rational_asm(suffix + "N", spilled))
   if x64_is_dynamic_cmp_op(op) then
     sb_push(sb, "    push qword [rbp-" + dyn_a + "]" + x64_nl_char())
     sb_push(sb, "    push qword [rbp-" + dyn_b + "]" + x64_nl_char())
@@ -829,7 +965,7 @@ make a function called x64_binop_asm_dynamic takes op, locals returns asm
   end
   sb_push(sb, "    jmp .DYN_DONE_" + suffix + x64_nl_char())
   sb_push(sb, ".DYN_CPLX_" + suffix + ":" + x64_nl_char())
-  sb_push(sb, x64_dynamic_promote_both_complex_asm(suffix + "N", locals))
+  sb_push(sb, x64_dynamic_promote_both_complex_asm(suffix + "N", spilled))
   if x64_is_dynamic_cmp_op(op) then
     sb_push(sb, "    push qword [rbp-" + dyn_a + "]" + x64_nl_char())
     sb_push(sb, "    push qword [rbp-" + dyn_b + "]" + x64_nl_char())
@@ -856,7 +992,7 @@ make a function called x64_binop_asm_dynamic takes op, locals returns asm
   end
   sb_push(sb, "    jmp .DYN_DONE_" + suffix + x64_nl_char())
   sb_push(sb, ".DYN_IVAL_" + suffix + ":" + x64_nl_char())
-  sb_push(sb, x64_dynamic_promote_both_interval_asm(suffix + "N", locals))
+  sb_push(sb, x64_dynamic_promote_both_interval_asm(suffix + "N", spilled))
   if x64_is_dynamic_cmp_op(op) then
     sb_push(sb, "    push qword [rbp-" + dyn_a + "]" + x64_nl_char())
     sb_push(sb, "    push qword [rbp-" + dyn_b + "]" + x64_nl_char())
@@ -1645,7 +1781,7 @@ end
 # value (read from the closure object itself), unlike everywhere else
 # in this backend where instruction operands are compile-time known --
 # see this file's own header for the full stack-shuffling explanation.
-make a function called x64_callvalue_asm takes argc, locals returns asm
+make a function called x64_callvalue_asm takes argc, spilled returns asm
   let n = to_num(argc)
   # The current function's own private scratch slot, one past its last
   # named local (see x64_emit_func's frame_size reservation) -- used to
@@ -1655,7 +1791,7 @@ make a function called x64_callvalue_asm takes argc, locals returns asm
   # be unsafe under recursion or a closure that itself calls another
   # closure before returning. Private to THIS activation's own rbp, so
   # every nested/recursive call gets its own independent copy for free.
-  let cv_slot_offset = 8 * (to_num(list_len(locals)) + 1)
+  let cv_slot_offset = 8 * (to_num(list_len(spilled)) + 1)
   let sb = sb_new()
   # 1. Pop the N already-pushed own-args into the scratch buffer, out
   #    of the way, so the closure's captured values can be pushed
@@ -1720,7 +1856,7 @@ make a function called label_asm_safe takes ignored returns label
   return "" + n
 end
 
-make a function called x64_emit_instr takes instr, func_name, locals, label, float_mode, dynamic_mode returns asm
+make a function called x64_emit_instr takes instr, func_name, regmap, spilled, label, float_mode, dynamic_mode returns asm
   let sb = sb_new()
   sb_push(sb, label + ":" + x64_nl_char())
   let ty = instr[0]
@@ -1751,14 +1887,24 @@ make a function called x64_emit_instr takes instr, func_name, locals, label, flo
     end
   else
     if ty == "Load" then
-      let slot = x64_local_index(locals, instr[1])
-      sb_push(sb, "    mov rax, [rbp-" + (8 * (slot + 1)) + "]" + x64_nl_char())
+      let reg = x64_reg_for_name(regmap, instr[1])
+      if reg == "" then
+        let slot = x64_local_index(spilled, instr[1])
+        sb_push(sb, "    mov rax, [rbp-" + (8 * (slot + 1)) + "]" + x64_nl_char())
+      else
+        sb_push(sb, "    mov rax, " + reg + x64_nl_char())
+      end
       sb_push(sb, "    push rax" + x64_nl_char())
     else
       if ty == "Store" then
-        let slot = x64_local_index(locals, instr[1])
+        let reg = x64_reg_for_name(regmap, instr[1])
         sb_push(sb, "    pop rax" + x64_nl_char())
-        sb_push(sb, "    mov [rbp-" + (8 * (slot + 1)) + "], rax" + x64_nl_char())
+        if reg == "" then
+          let slot = x64_local_index(spilled, instr[1])
+          sb_push(sb, "    mov [rbp-" + (8 * (slot + 1)) + "], rax" + x64_nl_char())
+        else
+          sb_push(sb, "    mov " + reg + ", rax" + x64_nl_char())
+        end
       else
         if ty == "Bin" then
           if float_mode then
@@ -1766,10 +1912,10 @@ make a function called x64_emit_instr takes instr, func_name, locals, label, flo
           else
             if dynamic_mode then
               if instr[1] == "/" then
-                sb_push(sb, x64_binop_asm_div_dynamic(locals))
+                sb_push(sb, x64_binop_asm_div_dynamic(spilled))
               else
                 if x64_dynamic_op_supported(instr[1]) then
-                  sb_push(sb, x64_binop_asm_dynamic(instr[1], locals))
+                  sb_push(sb, x64_binop_asm_dynamic(instr[1], spilled))
                 else
                   # Named scope limit: band/bor/bxor/shl/shr/% still
                   # aren't meaningful on the numeric tower (or aren't
@@ -1811,7 +1957,7 @@ make a function called x64_emit_instr takes instr, func_name, locals, label, flo
                     sb_push(sb, x64_makeclosure_asm(instr[1], instr[2]))
                   else
                   if ty == "CallValue" then
-                    sb_push(sb, x64_callvalue_asm(instr[1], locals))
+                    sb_push(sb, x64_callvalue_asm(instr[1], spilled))
                   else
                   if ty == "Return" then
                     if func_name == "main" then
@@ -2007,8 +2153,14 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode return
   let params = func[2]
   let instrs = func[3]
   let locals = x64_collect_locals(func)
-  # +1 extra slot beyond the named locals, ALWAYS reserved, for
-  # CallValue's own per-frame scratch (see x64_callvalue_asm) -- a
+  # Register allocation (Slice 8, see x64_reg_pool/x64_build_regmap):
+  # eligible locals get a dedicated rbx/r13/r14 for their whole function
+  # lifetime instead of a stack slot; everything else spills exactly as
+  # before this slice.
+  let regmap = x64_build_regmap(locals, instrs, dynamic_mode)
+  let spilled = x64_spilled_locals(locals, regmap)
+  # +1 extra slot beyond the (spilled) named locals, ALWAYS reserved,
+  # for CallValue's own per-frame scratch (see x64_callvalue_asm) -- a
   # value that must survive an opaque `call` this backend's own
   # calling convention gives no register-preservation guarantee
   # across. Using a private slot in the CURRENT function's own stack
@@ -2016,12 +2168,12 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode return
   # recursion/re-entrancy for free: every active call gets its own
   # rbp, so every active call's copy of this slot is independent.
   # +2 further slots (dyn_a/dyn_b, same offsets every dynamic-dispatch
-  # codegen function derives from `locals` -- see
+  # codegen function derives from `spilled` -- see
   # x64_dynamic_promote_both_asm and siblings) hold the dynamic Bin
   # operand pair, freeing r13/r14 for the locals register allocator
   # (patlang-x64-register-allocator-slice8). ALWAYS reserved, same
   # unconditional-reservation reasoning as the CallValue slot above.
-  let frame_size = 8 * (to_num(list_len(locals)) + 3)
+  let frame_size = 8 * (to_num(list_len(spilled)) + 3)
   if frame_size < 16 then
     let frame_size = 16
   end
@@ -2035,7 +2187,13 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode return
   while p < argc do
     let src_offset = 16 + 8 * (argc - 1 - p)
     sb_push(sb, "    mov rax, [rbp+" + src_offset + "]" + x64_nl_char())
-    sb_push(sb, "    mov [rbp-" + (8 * (p + 1)) + "], rax" + x64_nl_char())
+    let reg = x64_reg_for_name(regmap, params[p])
+    if reg == "" then
+      let slot = x64_local_index(spilled, params[p])
+      sb_push(sb, "    mov [rbp-" + (8 * (slot + 1)) + "], rax" + x64_nl_char())
+    else
+      sb_push(sb, "    mov " + reg + ", rax" + x64_nl_char())
+    end
     let p = p + 1
   end
   let n = to_num(list_len(instrs))
@@ -2069,7 +2227,7 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode return
       let i = i + 2
     else
       let label = "L_" + func_name + "_" + i
-      sb_push(sb, x64_emit_instr(instr, func_name, locals, label, float_mode, dynamic_mode))
+      sb_push(sb, x64_emit_instr(instr, func_name, regmap, spilled, label, float_mode, dynamic_mode))
       let i = i + 1
     end
   end
