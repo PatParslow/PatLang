@@ -381,6 +381,16 @@ make a function called x64_complex_fn_for_op takes op returns name
   return "rt_complex_mul"
 end
 
+make a function called x64_interval_fn_for_op takes op returns name
+  if op == "+" then
+    return "rt_interval_add"
+  end
+  if op == "-" then
+    return "rt_interval_sub"
+  end
+  return "rt_interval_mul"
+end
+
 make a function called x64_is_dynamic_cmp_op takes op returns yes
   if op == "==" then
     return true
@@ -523,6 +533,36 @@ make a function called x64_dynamic_promote_both_complex_asm takes suffix returns
   sb_push(sb, "    add rsp, 8" + nl())
   sb_push(sb, "    mov r14, rax" + nl())
   sb_push(sb, ".DYNPX_OP2OK_" + suffix + ":" + nl())
+  return sb_str(sb)
+end
+
+# Same shape again, promotes to INTERVAL (degenerate [v,v]) instead of
+# Complex -- see x64_dynamic_promote_both_complex_asm's own comment
+# for why this is simpler than the BigInt/Rational versions.
+make a function called x64_dynamic_promote_both_interval_asm takes suffix returns asm
+  let sb = sb_new()
+  sb_push(sb, "    mov r15, 18446462598732840960" + nl())
+  sb_push(sb, "    mov rax, r13" + nl())
+  sb_push(sb, "    and rax, r15" + nl())
+  sb_push(sb, "    mov rcx, 1157425104234217472" + nl())
+  sb_push(sb, "    cmp rax, rcx" + nl())
+  sb_push(sb, "    je .DYNPI_OP1OK_" + suffix + nl())
+  sb_push(sb, "    push r13" + nl())
+  sb_push(sb, "    call rt_interval_from_num" + nl())
+  sb_push(sb, "    add rsp, 8" + nl())
+  sb_push(sb, "    mov r13, rax" + nl())
+  sb_push(sb, ".DYNPI_OP1OK_" + suffix + ":" + nl())
+  sb_push(sb, "    mov r15, 18446462598732840960" + nl())
+  sb_push(sb, "    mov rax, r14" + nl())
+  sb_push(sb, "    and rax, r15" + nl())
+  sb_push(sb, "    mov rcx, 1157425104234217472" + nl())
+  sb_push(sb, "    cmp rax, rcx" + nl())
+  sb_push(sb, "    je .DYNPI_OP2OK_" + suffix + nl())
+  sb_push(sb, "    push r14" + nl())
+  sb_push(sb, "    call rt_interval_from_num" + nl())
+  sb_push(sb, "    add rsp, 8" + nl())
+  sb_push(sb, "    mov r14, rax" + nl())
+  sb_push(sb, ".DYNPI_OP2OK_" + suffix + ":" + nl())
   return sb_str(sb)
 end
 
@@ -678,6 +718,11 @@ make a function called x64_binop_asm_dynamic takes op returns asm
   sb_push(sb, "    and rax, r15" + nl())
   sb_push(sb, "    mov rbx, r14" + nl())
   sb_push(sb, "    and rbx, r15" + nl())
+  sb_push(sb, "    mov rcx, 1157425104234217472" + nl())
+  sb_push(sb, "    cmp rax, rcx" + nl())
+  sb_push(sb, "    je .DYN_IVAL_" + suffix + nl())
+  sb_push(sb, "    cmp rbx, rcx" + nl())
+  sb_push(sb, "    je .DYN_IVAL_" + suffix + nl())
   sb_push(sb, "    mov rcx, 1154891829443821568" + nl())
   sb_push(sb, "    cmp rax, rcx" + nl())
   sb_push(sb, "    je .DYN_CPLX_" + suffix + nl())
@@ -745,6 +790,33 @@ make a function called x64_binop_asm_dynamic takes op returns asm
     sb_push(sb, "    push r13" + nl())
     sb_push(sb, "    push r14" + nl())
     sb_push(sb, "    call " + x64_complex_fn_for_op(op) + nl())
+    sb_push(sb, "    add rsp, 16" + nl())
+  end
+  sb_push(sb, "    jmp .DYN_DONE_" + suffix + nl())
+  sb_push(sb, ".DYN_IVAL_" + suffix + ":" + nl())
+  sb_push(sb, x64_dynamic_promote_both_interval_asm(suffix + "N"))
+  if x64_is_dynamic_cmp_op(op) then
+    sb_push(sb, "    push r13" + nl())
+    sb_push(sb, "    push r14" + nl())
+    sb_push(sb, "    call rt_interval_eq" + nl())
+    sb_push(sb, "    add rsp, 16" + nl())
+    if op == "==" then
+      sb_push(sb, "    ; rax already 0/1 from rt_interval_eq" + nl())
+    else
+      if op == "!=" then
+        sb_push(sb, "    xor rax, 1" + nl())
+      else
+        # No agreed total order between intervals -- same
+        # deterministically-safe-but-not-meaningful treatment as
+        # Complex's ordering gap, see x64_runtime.patlang's own
+        # Interval header.
+        sb_push(sb, "    mov rax, 0" + nl())
+      end
+    end
+  else
+    sb_push(sb, "    push r13" + nl())
+    sb_push(sb, "    push r14" + nl())
+    sb_push(sb, "    call " + x64_interval_fn_for_op(op) + nl())
     sb_push(sb, "    add rsp, 16" + nl())
   end
   sb_push(sb, ".DYN_DONE_" + suffix + ":" + nl())
@@ -1527,6 +1599,10 @@ make a function called x64_func_is_dynamic takes func returns yes
   if func[1] == "rt_complex_eq" then
     return true
   end
+  # Same reasoning as rt_complex_eq, same fix.
+  if func[1] == "rt_interval_eq" then
+    return true
+  end
   let instrs = func[3]
   let i = 0
   let n = to_num(list_len(instrs))
@@ -1549,6 +1625,15 @@ make a function called x64_func_is_dynamic takes func returns yes
         return true
       end
       if instr[1] == "rt_complex_from_num" then
+        return true
+      end
+      if instr[1] == "rt_interval_new" then
+        return true
+      end
+      if instr[1] == "rt_interval_from_i64" then
+        return true
+      end
+      if instr[1] == "rt_interval_from_num" then
         return true
       end
     end

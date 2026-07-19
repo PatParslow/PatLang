@@ -934,3 +934,152 @@ make a function called rt_complex_eq takes a, b returns eq
   end
   return 0
 end
+
+# ---- numeric tower: Interval ----
+#
+# Interval's tag: family 0x1 (Numeric), but UNLIKE BigInt/Rational/
+# Float/Complex's thermometer bits (each implying the ones before it,
+# because that chain really is a linear "wider magnitude" ordering),
+# Interval is a SEPARATE extension axis -- an interval isn't "beyond"
+# Complex, it's a different kind of composite value entirely. So it
+# gets its own dedicated bit (bit4, i.e. local bits 0b10000) rather
+# than extending the thermometer chain further -- deliberately NOT
+# combined with the BigInt/Rational/Float/Complex bits, since an
+# interval's own container-ness says nothing about what TYPE its
+# endpoints are (those are separately tagged, stored inside).
+#
+# Same composite-value shape as Complex: [8-byte tagged lo][8-byte
+# tagged hi], each endpoint independently fixnum/BigInt/Rational
+# (never itself an Interval or Complex -- no nesting, same as
+# Complex). Same payoff: rt_interval_add/_sub/_mul are ordinary
+# PatLang using `+`/`-`/`*`/`<`/`>` on the extracted endpoints, which
+# -- since these functions call rt_interval_new and are therefore
+# classified dynamic-mode -- route through the EXISTING
+# x64_binop_asm_dynamic machinery. No new arithmetic primitives.
+#
+# DELIBERATE SCOPE LIMIT (same reasoning as Complex): only
+# `+`/`-`/`*`/`==`/`!=` supported for top-level Interval operands.
+# Ordering (`<`/`<=`/`>`/`>=`) between two intervals is genuinely
+# ambiguous (does [a,b] < [c,d] mean "definitely less" (b<c) or
+# "possibly less"? both are defensible, this cut picks neither) --
+# same safe-but-deterministically-false treatment as Complex's
+# ordering gap, not real support. `/` is unwired (same accepted-gap
+# class as Complex's).
+#
+# Complex intervals (an Interval of Complex endpoints, or a Complex
+# with Interval components) are NOT supported -- noted as a real
+# combination the user flagged as plausible future work once k-blades
+# (and therefore Object) exist, not attempted here.
+
+make a function called rt_interval_tag returns tag
+  return (1 shl 60) bor (1 shl 52)
+end
+
+make a function called rt_interval_new takes lo, hi returns tagged
+  let addr = rt_heap_alloc(16)
+  mem_poke_qword(addr, 0, lo)
+  mem_poke_qword(addr, 8, hi)
+  return addr bor rt_interval_tag()
+end
+
+# Degenerate interval [v,v] wrapping any already-tagged numeric value
+# -- used both for genuine construction and, in codegen_x64.patlang's
+# promote-to-interval helper, for lifting a lower-tier operand up when
+# mixed with a genuine Interval operand.
+make a function called rt_interval_from_num takes tagged returns result
+  return rt_interval_new(tagged, tagged)
+end
+
+make a function called rt_interval_from_i64 takes n returns tagged
+  return rt_interval_from_num(rt_fixnum_pack(n))
+end
+
+make a function called rt_interval_to_string takes tagged returns s
+  let addr = tagged band rt_payload_mask()
+  let lo = mem_peek_qword(addr, 0)
+  let hi = mem_peek_qword(addr, 8)
+  let s = "["
+  let s = rt_str_concat(s, rt_num_to_string(lo))
+  let s = rt_str_concat(s, ",")
+  let s = rt_str_concat(s, rt_num_to_string(hi))
+  let s = rt_str_concat(s, "]")
+  return s
+end
+
+make a function called rt_interval_add takes a, b returns tagged
+  let addr_a = a band rt_payload_mask()
+  let addr_b = b band rt_payload_mask()
+  let lo_a = mem_peek_qword(addr_a, 0)
+  let hi_a = mem_peek_qword(addr_a, 8)
+  let lo_b = mem_peek_qword(addr_b, 0)
+  let hi_b = mem_peek_qword(addr_b, 8)
+  return rt_interval_new(lo_a + lo_b, hi_a + hi_b)
+end
+
+# [lo_a,hi_a] - [lo_b,hi_b] = [lo_a-hi_b, hi_a-lo_b] (subtracting the
+# other interval's max from this min, and vice versa -- the standard
+# interval-subtraction rule, not a naive component-wise subtract).
+make a function called rt_interval_sub takes a, b returns tagged
+  let addr_a = a band rt_payload_mask()
+  let addr_b = b band rt_payload_mask()
+  let lo_a = mem_peek_qword(addr_a, 0)
+  let hi_a = mem_peek_qword(addr_a, 8)
+  let lo_b = mem_peek_qword(addr_b, 0)
+  let hi_b = mem_peek_qword(addr_b, 8)
+  return rt_interval_new(lo_a - hi_b, hi_a - lo_b)
+end
+
+# min/max of the four endpoint products -- the standard interval-
+# multiplication rule (needed because the sign of each endpoint isn't
+# known in general, so which product is smallest/largest isn't fixed).
+make a function called rt_interval_mul takes a, b returns tagged
+  let addr_a = a band rt_payload_mask()
+  let addr_b = b band rt_payload_mask()
+  let lo_a = mem_peek_qword(addr_a, 0)
+  let hi_a = mem_peek_qword(addr_a, 8)
+  let lo_b = mem_peek_qword(addr_b, 0)
+  let hi_b = mem_peek_qword(addr_b, 8)
+  let p1 = lo_a * lo_b
+  let p2 = lo_a * hi_b
+  let p3 = hi_a * lo_b
+  let p4 = hi_a * hi_b
+  let lo = p1
+  if p2 < lo then
+    let lo = p2
+  end
+  if p3 < lo then
+    let lo = p3
+  end
+  if p4 < lo then
+    let lo = p4
+  end
+  let hi = p1
+  if p2 > hi then
+    let hi = p2
+  end
+  if p3 > hi then
+    let hi = p3
+  end
+  if p4 > hi then
+    let hi = p4
+  end
+  return rt_interval_new(lo, hi)
+end
+
+# Returns a plain 0/1, same reasoning as rt_complex_eq -- forced
+# dynamic by name in codegen_x64.patlang since it calls no tower
+# constructor of its own.
+make a function called rt_interval_eq takes a, b returns eq
+  let addr_a = a band rt_payload_mask()
+  let addr_b = b band rt_payload_mask()
+  let lo_a = mem_peek_qword(addr_a, 0)
+  let hi_a = mem_peek_qword(addr_a, 8)
+  let lo_b = mem_peek_qword(addr_b, 0)
+  let hi_b = mem_peek_qword(addr_b, 8)
+  if lo_a == lo_b then
+    if hi_a == hi_b then
+      return 1
+    end
+  end
+  return 0
+end
