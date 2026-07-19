@@ -1149,6 +1149,252 @@ make a function called x64_os_write_file_asm returns asm
   return sb_str(sb)
 end
 
+# os_exec_run(cmdline_addr, cmdline_len) -> captured combined stdout+
+# stderr as a plain (untagged) address of a freshly rt_heap_alloc'd
+# [length][bytes] block -- caller (rt_os_exec_run wrapper, folded
+# directly into the CallHost site below) tags it. Real CreateProcessA
+# + CreatePipe process-creation-with-redirected-output sequence, the
+# standard MSDN pattern (create an inheritable pipe, clear inherit on
+# OUR copy of the read end via SetHandleInformation so only the
+# child's copy of the write end matters, redirect both hStdOutput and
+# hStdError to the write end, close our copy of the write end
+# immediately after CreateProcessA so ReadFile on the read end
+# terminates instead of blocking forever once the child exits).
+#
+# Stack layout for this one persistent aligned rsp (all offsets fixed
+# for the whole primitive): [0..31] shadow space, [32..79] scratch
+# reserved for whichever call's OWN stack-passed args need it that
+# moment (CreateProcessA's 6 stack args are the only ones that need
+# this much) -- NEVER used for persistent data, since a later call's
+# stack-arg write would clobber anything stored there. Persistent
+# structs live ABOVE that: SECURITY_ATTRIBUTES @80, read/write pipe
+# handle slots @104/@112, STARTUPINFOA @128 (104 bytes),
+# PROCESS_INFORMATION @240 (24 bytes), bytesRead scratch @272.
+# exec_capture(path, arg1, ..., argN) -- this call SITE's own argc is
+# compile-time known (every CallHost site's is), so the N tagged-
+# string args are popped (compile-time unrolled, same "pop N values
+# into a heap block" pattern x64_buildlist_asm already uses) into a
+# temp array, joined via the ordinary PatLang rt_exec_join_args, then
+# handed to the real OS-boundary os_exec_run primitive. Only the
+# process-creation/pipe part is raw assembly; the variadic-argument
+# handling stays in PatLang/this array-popping helper, not hand-
+# written asm, matching this backend's whole "runtime logic belongs
+# in PatLang, native primitives stay narrow" philosophy.
+make a function called x64_exec_capture_asm takes argc returns asm
+  let n = to_num(argc)
+  let sb = sb_new()
+  sb_push(sb, "    mov rax, " + (n * 8) + nl())
+  sb_push(sb, "    push rax" + nl())
+  sb_push(sb, "    call rt_heap_alloc" + nl())
+  sb_push(sb, "    add rsp, 8" + nl())
+  sb_push(sb, "    mov r12, rax" + nl())
+  let k = n - 1
+  while k >= 0 do
+    sb_push(sb, "    pop rbx" + nl())
+    sb_push(sb, "    mov [r12+" + (k * 8) + "], rbx" + nl())
+    let k = k - 1
+  end
+  sb_push(sb, "    push r12" + nl())
+  sb_push(sb, "    push " + n + nl())
+  sb_push(sb, "    call rt_exec_join_args" + nl())
+  sb_push(sb, "    add rsp, 16" + nl())
+  sb_push(sb, "    mov r13, rax" + nl())
+  sb_push(sb, "    mov r15, 281474976710655" + nl())
+  sb_push(sb, "    and r13, r15" + nl())
+  sb_push(sb, "    mov rax, [r13]" + nl())
+  sb_push(sb, "    lea rbx, [r13+8]" + nl())
+  sb_push(sb, "    push rbx" + nl())
+  sb_push(sb, "    push rax" + nl())
+  sb_push(sb, x64_os_exec_run_asm())
+  sb_push(sb, "    pop rax" + nl())
+  sb_push(sb, "    mov r15, 2305843009213693952" + nl())
+  sb_push(sb, "    or rax, r15" + nl())
+  sb_push(sb, "    push rax" + nl())
+  return sb_str(sb)
+end
+
+make a function called x64_os_exec_run_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  # Real bug caught before testing (this backend's OWN calling
+  # convention -- used by the upcoming rt_heap_alloc call below --
+  # gives NO register-preservation guarantee across calls, an already-
+  # established fact from the closures work). cmdline_addr/cmdline_len
+  # must survive that call, so they're saved on the REAL machine
+  # stack (genuine memory, unaffected by any register-clobbering
+  # callee) via push/pop, not left sitting in a register across the
+  # call.
+  sb_push(sb, "    pop rbx" + nl())
+  sb_push(sb, "    pop rax" + nl())
+  sb_push(sb, "    push rax" + nl())
+  sb_push(sb, "    push rbx" + nl())
+  sb_push(sb, "    mov rax, rbx" + nl())
+  sb_push(sb, "    add rax, 1" + nl())
+  sb_push(sb, "    push rax" + nl())
+  sb_push(sb, "    call rt_heap_alloc" + nl())
+  sb_push(sb, "    add rsp, 8" + nl())
+  sb_push(sb, "    mov r14, rax" + nl())
+  sb_push(sb, "    pop rbx" + nl())
+  sb_push(sb, "    pop rax" + nl())
+  # rax = cmdline_addr, rbx = cmdline_len, r14 = fresh buffer -- copy
+  # into it and null-terminate (CreateProcessA mutates its
+  # lpCommandLine argument in place, so it can never point directly at
+  # our own heap string's bytes). NOW set up the win64-ABI-call
+  # alignment window -- r14 (a genuine callee-saved register under the
+  # REAL Win32 ABI, unlike this backend's own convention) safely
+  # survives every call from here on.
+  sb_push(sb, "    mov r15, rsp" + nl())
+  sb_push(sb, "    sub rsp, 336" + nl())
+  sb_push(sb, "    and rsp, -16" + nl())
+  sb_push(sb, "    xor rsi, rsi" + nl())
+  sb_push(sb, "  .exec_cpy_loop_" + suffix + ":" + nl())
+  sb_push(sb, "    cmp rsi, rbx" + nl())
+  sb_push(sb, "    jge .exec_cpy_done_" + suffix + nl())
+  sb_push(sb, "    mov dl, [rax+rsi]" + nl())
+  sb_push(sb, "    mov [r14+rsi], dl" + nl())
+  sb_push(sb, "    inc rsi" + nl())
+  sb_push(sb, "    jmp .exec_cpy_loop_" + suffix + nl())
+  sb_push(sb, "  .exec_cpy_done_" + suffix + ":" + nl())
+  sb_push(sb, "    mov byte [r14+rsi], 0" + nl())
+  # SECURITY_ATTRIBUTES @80: nLength=24, lpSecurityDescriptor=0, bInheritHandle=1
+  sb_push(sb, "    mov qword [rsp+80], 24" + nl())
+  sb_push(sb, "    mov qword [rsp+88], 0" + nl())
+  sb_push(sb, "    mov qword [rsp+96], 1" + nl())
+  sb_push(sb, "    lea rcx, [rsp+104]" + nl())
+  sb_push(sb, "    lea rdx, [rsp+112]" + nl())
+  sb_push(sb, "    lea r8, [rsp+80]" + nl())
+  sb_push(sb, "    xor r9, r9" + nl())
+  sb_push(sb, "    call CreatePipe" + nl())
+  sb_push(sb, "    mov rcx, [rsp+104]" + nl())
+  sb_push(sb, "    mov rdx, 1" + nl())
+  sb_push(sb, "    xor r8, r8" + nl())
+  sb_push(sb, "    call SetHandleInformation" + nl())
+  # Zero the whole STARTUPINFOA (104 bytes = 13 qwords) before setting
+  # the specific fields we need.
+  sb_push(sb, "    mov rcx, 0" + nl())
+  sb_push(sb, "  .exec_zero_si_" + suffix + ":" + nl())
+  sb_push(sb, "    cmp rcx, 13" + nl())
+  sb_push(sb, "    jge .exec_zero_si_done_" + suffix + nl())
+  sb_push(sb, "    mov qword [rsp+128+rcx*8], 0" + nl())
+  sb_push(sb, "    inc rcx" + nl())
+  sb_push(sb, "    jmp .exec_zero_si_" + suffix + nl())
+  sb_push(sb, "  .exec_zero_si_done_" + suffix + ":" + nl())
+  sb_push(sb, "    mov qword [rsp+128], 104" + nl())
+  sb_push(sb, "    mov qword [rsp+188], 256" + nl())
+  sb_push(sb, "    mov rax, [rsp+112]" + nl())
+  sb_push(sb, "    mov [rsp+216], rax" + nl())
+  sb_push(sb, "    mov [rsp+224], rax" + nl())
+  sb_push(sb, "    mov rcx, 0" + nl())
+  sb_push(sb, "    lea rdx, [r14]" + nl())
+  sb_push(sb, "    xor r8, r8" + nl())
+  sb_push(sb, "    xor r9, r9" + nl())
+  sb_push(sb, "    mov qword [rsp+32], 1" + nl())
+  sb_push(sb, "    mov qword [rsp+40], 0" + nl())
+  sb_push(sb, "    mov qword [rsp+48], 0" + nl())
+  sb_push(sb, "    mov qword [rsp+56], 0" + nl())
+  sb_push(sb, "    lea rax, [rsp+128]" + nl())
+  sb_push(sb, "    mov qword [rsp+64], rax" + nl())
+  sb_push(sb, "    lea rax, [rsp+240]" + nl())
+  sb_push(sb, "    mov qword [rsp+72], rax" + nl())
+  sb_push(sb, "    call CreateProcessA" + nl())
+  # Real robustness gap closed here: nothing previously checked
+  # CreateProcessA's return value at all -- a genuine failure (bad
+  # path, etc, not just the quoting bug below) would fall through
+  # into WaitForSingleObject/CloseHandle on a garbage, uninitialized
+  # PROCESS_INFORMATION. Now bails out cleanly to an empty result.
+  sb_push(sb, "    cmp rax, 0" + nl())
+  sb_push(sb, "    je .exec_failed_" + suffix + nl())
+  sb_push(sb, "    mov rcx, [rsp+112]" + nl())
+  sb_push(sb, "    call CloseHandle" + nl())
+  # Output buffer allocated via ANOTHER call to rt_heap_alloc (this
+  # backend's own convention, no register-preservation guarantee) --
+  # readHandle deliberately stays in real STACK memory ([rsp+104],
+  # untouched by any call) rather than being cached into r12 before
+  # this call, same reasoning as the earlier cmdline-preservation fix.
+  # Only read it into r12 AFTER this call, right before the read loop
+  # that actually needs it.
+  sb_push(sb, "    mov rax, 65544" + nl())
+  sb_push(sb, "    push rax" + nl())
+  sb_push(sb, "    call rt_heap_alloc" + nl())
+  sb_push(sb, "    add rsp, 8" + nl())
+  sb_push(sb, "    mov rsi, rax" + nl())
+  sb_push(sb, "    lea r13, [rax+8]" + nl())
+  sb_push(sb, "    xor rbx, rbx" + nl())
+  sb_push(sb, "    mov r14, 65536" + nl())
+  # Read loop: r12=readHandle, r13=output data start, rbx=total STORED
+  # so far, r14=65536-byte cap.
+  #
+  # Real bug found and fixed here, caught by an actual hang (not
+  # review): once total reaches the cap, the ORIGINAL version simply
+  # stopped calling ReadFile at all -- but the child process (e.g.
+  # `dir` on a large directory) keeps trying to WRITE its remaining
+  # output into the pipe, and once nobody's reading, the pipe fills up
+  # and the child's own WriteFile call blocks. WaitForSingleObject
+  # then waits FOREVER for a process that will never finish writing.
+  # This is the classic Win32 "must keep draining the pipe or the
+  # child deadlocks" gotcha. Fixed: once the real buffer is full,
+  # KEEP calling ReadFile (so the child can keep writing and
+  # eventually finish/exit) but redirect those reads into a small
+  # THROWAWAY buffer (reusing g_scratch) instead of growing rbx/
+  # writing past the allocated output block -- draining without
+  # storing, until real EOF (ReadFile returns 0 bytes), only then
+  # falling through to WaitForSingleObject.
+  sb_push(sb, "    mov r12, [rsp+104]" + nl())
+  sb_push(sb, "  .exec_read_loop_" + suffix + ":" + nl())
+  sb_push(sb, "    cmp rbx, r14" + nl())
+  sb_push(sb, "    jl .exec_read_normal_" + suffix + nl())
+  sb_push(sb, "    lea rdx, [rel g_scratch]" + nl())
+  sb_push(sb, "    mov r8, 256" + nl())
+  sb_push(sb, "    jmp .exec_read_common_" + suffix + nl())
+  sb_push(sb, "  .exec_read_normal_" + suffix + ":" + nl())
+  sb_push(sb, "    lea rdx, [r13+rbx]" + nl())
+  sb_push(sb, "    mov r8, r14" + nl())
+  sb_push(sb, "    sub r8, rbx" + nl())
+  sb_push(sb, "  .exec_read_common_" + suffix + ":" + nl())
+  sb_push(sb, "    mov rcx, r12" + nl())
+  sb_push(sb, "    lea r9, [rsp+272]" + nl())
+  sb_push(sb, "    mov qword [rsp+32], 0" + nl())
+  sb_push(sb, "    call ReadFile" + nl())
+  sb_push(sb, "    cmp rax, 0" + nl())
+  sb_push(sb, "    je .exec_read_done_" + suffix + nl())
+  sb_push(sb, "    mov rax, [rsp+272]" + nl())
+  sb_push(sb, "    cmp rax, 0" + nl())
+  sb_push(sb, "    je .exec_read_done_" + suffix + nl())
+  sb_push(sb, "    cmp rbx, r14" + nl())
+  sb_push(sb, "    jge .exec_read_loop_" + suffix + nl())
+  sb_push(sb, "    add rbx, rax" + nl())
+  sb_push(sb, "    jmp .exec_read_loop_" + suffix + nl())
+  sb_push(sb, "  .exec_read_done_" + suffix + ":" + nl())
+  sb_push(sb, "    mov qword [rsi], rbx" + nl())
+  sb_push(sb, "    mov rcx, [rsp+240]" + nl())
+  sb_push(sb, "    mov rdx, -1" + nl())
+  sb_push(sb, "    call WaitForSingleObject" + nl())
+  sb_push(sb, "    mov rcx, r12" + nl())
+  sb_push(sb, "    call CloseHandle" + nl())
+  sb_push(sb, "    mov rcx, [rsp+240]" + nl())
+  sb_push(sb, "    call CloseHandle" + nl())
+  sb_push(sb, "    mov rcx, [rsp+248]" + nl())
+  sb_push(sb, "    call CloseHandle" + nl())
+  sb_push(sb, "    jmp .exec_all_done_" + suffix + nl())
+  sb_push(sb, "  .exec_failed_" + suffix + ":" + nl())
+  sb_push(sb, "    mov rcx, [rsp+104]" + nl())
+  sb_push(sb, "    call CloseHandle" + nl())
+  sb_push(sb, "    mov rcx, [rsp+112]" + nl())
+  sb_push(sb, "    call CloseHandle" + nl())
+  sb_push(sb, "    mov rax, 8" + nl())
+  sb_push(sb, "    push rax" + nl())
+  sb_push(sb, "    call rt_heap_alloc" + nl())
+  sb_push(sb, "    add rsp, 8" + nl())
+  sb_push(sb, "    mov qword [rax], 0" + nl())
+  sb_push(sb, "    mov rsi, rax" + nl())
+  sb_push(sb, "  .exec_all_done_" + suffix + ":" + nl())
+  sb_push(sb, "    mov rax, rsi" + nl())
+  sb_push(sb, "    mov rsp, r15" + nl())
+  sb_push(sb, "    add rsp, 16" + nl())
+  sb_push(sb, "    push rax" + nl())
+  return sb_str(sb)
+end
+
 # CallHost -- only the five special primitive names are legal here,
 # PLUS two safe aliases (Slice 4): `l[i]` index syntax always lowers to
 # CallHost("list_get", 2) regardless of backend (lib/lower.patlang's
@@ -1184,6 +1430,9 @@ make a function called x64_callhost_asm takes name, argc returns asm
   else
   if name == "os_write_file" then
     sb_push(sb, x64_os_write_file_asm())
+  else
+  if name == "exec_capture" then
+    sb_push(sb, x64_exec_capture_asm(argc))
   else
   if name == "list_len" then
     sb_push(sb, "    call rt_list_len" + nl())
@@ -1278,6 +1527,7 @@ make a function called x64_callhost_asm takes name, argc returns asm
       end
       end
     end
+  end
   end
   end
   end
@@ -1919,7 +2169,7 @@ make a function called emit_program_x64 takes ir returns asm
   let sb = sb_new()
   sb_push(sb, "default rel" + nl())
   sb_push(sb, "global main" + nl())
-  sb_push(sb, "extern GetStdHandle, WriteFile, ExitProcess, CreateFileA, GetFileSize, CloseHandle, ReadFile" + nl())
+  sb_push(sb, "extern GetStdHandle, WriteFile, ExitProcess, CreateFileA, GetFileSize, CloseHandle, ReadFile, CreateProcessA, CreatePipe, SetHandleInformation, WaitForSingleObject" + nl())
   sb_push(sb, nl())
   sb_push(sb, "section .bss" + nl())
   sb_push(sb, "    align 8" + nl())

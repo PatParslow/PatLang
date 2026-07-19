@@ -1274,3 +1274,77 @@ make a function called rt_file_exists takes path returns s
   end
   return "1"
 end
+
+# ---- exec (self-hosting-toward-x64, step 3 of 3) ----
+#
+# exec_capture(path, arg1, arg2, ...) matches the interpreter's own
+# call SHAPE (a variadic list of string args, not a single list
+# parameter -- confirmed against rust-runtime/src/ir/codegen.rs's own
+# "exec_capture" handler before implementing). codegen_x64.patlang's
+# CallHost handling for "exec_capture" already knows this call site's
+# argc at codegen time (every CallHost site does), so it pops all N
+# tagged-string args (compile-time unrolled, same pattern
+# x64_buildlist_asm already uses) into a temp heap array and calls
+# rt_exec_join_args (below) to build a single space-joined command
+# line -- ordinary PatLang, not raw assembly, since string-joining
+# has no reason to be hand-written asm once rt_str_concat already
+# exists. Only the GENUINE OS boundary (process creation + pipe
+# redirection) is a native primitive: os_exec_run(cmdline_addr,
+# cmdline_len) -> captured output as a plain string address (masked/
+# unmasked the same as every other OS-boundary primitive's contract).
+#
+# NAMED GAPS versus the interpreter's own exec_capture (real
+# scope limits, not oversights):
+#   - stdout AND stderr are redirected to the SAME pipe (combined
+#     output), not "stdout normally, stderr appended only on
+#     failure" -- simpler, and still shows errors from a failing
+#     invocation, just doesn't distinguish the two streams.
+#   - output is capped at a fixed 65536-byte buffer -- silently
+#     truncated beyond that, not truly unbounded.
+#   - no quoting/escaping of arguments containing spaces (the
+#     command line is a plain space-joined string) -- fine for this
+#     project's own actual invocations (nasm/gcc with plain paths),
+#     not general-purpose.
+#   - no error propagation if CreateProcessA itself fails (bad path,
+#     etc) -- returns an empty string, matching this backend's
+#     existing no-exceptions-anywhere convention.
+
+# Real bug found by an actual failed run (not review): the first
+# version joined args with plain spaces, no quoting. nasm.exe's own
+# real install path on Windows almost always contains a space
+# ("C:\Program Files\NASM\nasm.exe"), which CreateProcessA's command-
+# line parser then splits into two separate tokens -- CreateProcessA
+# silently fails (no such program as "C:\Program"), and since nothing
+# checked its return value, the primitive proceeded to read from a
+# pipe nothing was ever writing to, returning an empty string with no
+# indication anything went wrong. Fixed by wrapping every argument in
+# double quotes (ASCII 34, built via mem_poke_byte -- this backend
+# has no chr() primitive) -- the standard Windows command-line
+# quoting convention, sufficient for ordinary paths/flags even though
+# it doesn't handle a literal embedded quote character within an
+# argument (not needed for this project's own actual invocations).
+make a function called rt_dquote_str returns s
+  let s = rt_heap_alloc(9)
+  mem_poke_qword(s, 0, 1)
+  mem_poke_byte(s, 8, 34)
+  return s bor rt_string_tag()
+end
+
+make a function called rt_exec_join_args takes arr, count returns tagged
+  let q = rt_dquote_str()
+  let e = rt_heap_alloc(8)
+  mem_poke_qword(e, 0, 0)
+  let result = e bor rt_string_tag()
+  let i = 0
+  while i < count do
+    let item = mem_peek_qword(arr, i * 8)
+    if i > 0 then
+      let result = rt_str_concat(result, " ")
+    end
+    let result = rt_str_concat(result, q)
+    let result = rt_str_concat(result, item)
+    let result = rt_str_concat(result, q)
+    let i = i + 1
+  end
+  return result
+end
