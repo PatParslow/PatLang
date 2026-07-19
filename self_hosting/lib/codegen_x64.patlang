@@ -987,6 +987,168 @@ make a function called x64_binop_asm takes op returns asm
   return sb_str(sb)
 end
 
+# ---- file I/O (self-hosting-toward-x64, step 2 of 3: growable lists
+# already done, exec_capture still ahead) ----
+#
+# Three new OS-boundary primitives, same win64-ABI save-rsp/align/
+# restore-rsp pattern as the original os_write_console_bytes/os_exit,
+# just with real CreateFileA/GetFileSize/ReadFile/CloseHandle
+# sequences instead of GetStdHandle/WriteFile/ExitProcess. Contract:
+# path_addr/data_addr/buf_addr are ALREADY-MASKED plain addresses --
+# these primitives never see a tagged value, matching how
+# mem_peek_qword etc already only ever take raw addresses (the
+# PatLang WRAPPER functions below do all the tag-masking before
+# calling). CreateFileA needs a NULL-TERMINATED C string, but this
+# backend's strings are [length][bytes] (never null-terminated), so
+# every primitive here copies the path into g_scratch + a trailing
+# zero byte first -- reusing the existing 256-byte scratch buffer
+# (an implicit "paths must fit in 256 bytes" limit, acceptable for a
+# compiler's own source-file paths, not named as a hard guarantee for
+# arbitrary use).
+make a function called x64_os_null_terminate_path_asm takes suffix returns asm
+  let sb = sb_new()
+  sb_push(sb, "    lea rdi, [rel g_scratch]" + nl())
+  sb_push(sb, "    xor rsi, rsi" + nl())
+  sb_push(sb, "  .ntp_loop_" + suffix + ":" + nl())
+  sb_push(sb, "    cmp rsi, rbx" + nl())
+  sb_push(sb, "    jge .ntp_done_" + suffix + nl())
+  sb_push(sb, "    mov dl, [rax+rsi]" + nl())
+  sb_push(sb, "    mov [rdi+rsi], dl" + nl())
+  sb_push(sb, "    inc rsi" + nl())
+  sb_push(sb, "    jmp .ntp_loop_" + suffix + nl())
+  sb_push(sb, "  .ntp_done_" + suffix + ":" + nl())
+  sb_push(sb, "    mov byte [rdi+rsi], 0" + nl())
+  return sb_str(sb)
+end
+
+# os_file_size(path_addr, path_len) -> size, or -1 if the file doesn't
+# exist/can't be opened.
+make a function called x64_os_file_size_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "    pop rbx" + nl())
+  sb_push(sb, "    pop rax" + nl())
+  sb_push(sb, x64_os_null_terminate_path_asm(suffix))
+  sb_push(sb, "    mov r15, rsp" + nl())
+  sb_push(sb, "    sub rsp, 64" + nl())
+  sb_push(sb, "    and rsp, -16" + nl())
+  sb_push(sb, "    lea rcx, [rel g_scratch]" + nl())
+  sb_push(sb, "    mov rdx, 2147483648" + nl())
+  sb_push(sb, "    mov r8, 1" + nl())
+  sb_push(sb, "    xor r9, r9" + nl())
+  sb_push(sb, "    mov qword [rsp+32], 3" + nl())
+  sb_push(sb, "    mov qword [rsp+40], 128" + nl())
+  sb_push(sb, "    mov qword [rsp+48], 0" + nl())
+  sb_push(sb, "    call CreateFileA" + nl())
+  sb_push(sb, "    mov rbx, rax" + nl())
+  sb_push(sb, "    cmp rbx, -1" + nl())
+  sb_push(sb, "    je .ofs_invalid_" + suffix + nl())
+  sb_push(sb, "    mov rcx, rbx" + nl())
+  sb_push(sb, "    xor rdx, rdx" + nl())
+  sb_push(sb, "    call GetFileSize" + nl())
+  sb_push(sb, "    mov r12, rax" + nl())
+  sb_push(sb, "    mov rcx, rbx" + nl())
+  sb_push(sb, "    call CloseHandle" + nl())
+  sb_push(sb, "    mov rax, r12" + nl())
+  sb_push(sb, "    jmp .ofs_done_" + suffix + nl())
+  sb_push(sb, "  .ofs_invalid_" + suffix + ":" + nl())
+  sb_push(sb, "    mov rax, -1" + nl())
+  sb_push(sb, "  .ofs_done_" + suffix + ":" + nl())
+  sb_push(sb, "    mov rsp, r15" + nl())
+  sb_push(sb, "    push rax" + nl())
+  return sb_str(sb)
+end
+
+# os_read_file_into(path_addr, path_len, buf_addr, buf_len) -> actual
+# bytes read (0 if the file couldn't be opened).
+make a function called x64_os_read_file_into_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "    pop r12" + nl())
+  sb_push(sb, "    pop r13" + nl())
+  sb_push(sb, "    pop rbx" + nl())
+  sb_push(sb, "    pop rax" + nl())
+  sb_push(sb, x64_os_null_terminate_path_asm(suffix))
+  sb_push(sb, "    mov r15, rsp" + nl())
+  sb_push(sb, "    sub rsp, 80" + nl())
+  sb_push(sb, "    and rsp, -16" + nl())
+  sb_push(sb, "    lea rcx, [rel g_scratch]" + nl())
+  sb_push(sb, "    mov rdx, 2147483648" + nl())
+  sb_push(sb, "    mov r8, 1" + nl())
+  sb_push(sb, "    xor r9, r9" + nl())
+  sb_push(sb, "    mov qword [rsp+32], 3" + nl())
+  sb_push(sb, "    mov qword [rsp+40], 128" + nl())
+  sb_push(sb, "    mov qword [rsp+48], 0" + nl())
+  sb_push(sb, "    call CreateFileA" + nl())
+  sb_push(sb, "    cmp rax, -1" + nl())
+  sb_push(sb, "    je .orf_invalid_" + suffix + nl())
+  sb_push(sb, "    mov r14, rax" + nl())
+  sb_push(sb, "    mov qword [rsp+56], 0" + nl())
+  sb_push(sb, "    mov rcx, r14" + nl())
+  sb_push(sb, "    mov rdx, r13" + nl())
+  sb_push(sb, "    mov r8, r12" + nl())
+  sb_push(sb, "    lea r9, [rsp+56]" + nl())
+  sb_push(sb, "    mov qword [rsp+32], 0" + nl())
+  sb_push(sb, "    call ReadFile" + nl())
+  sb_push(sb, "    mov rbx, [rsp+56]" + nl())
+  sb_push(sb, "    mov rcx, r14" + nl())
+  sb_push(sb, "    call CloseHandle" + nl())
+  sb_push(sb, "    mov rax, rbx" + nl())
+  sb_push(sb, "    jmp .orf_done_" + suffix + nl())
+  sb_push(sb, "  .orf_invalid_" + suffix + ":" + nl())
+  sb_push(sb, "    mov rax, 0" + nl())
+  sb_push(sb, "  .orf_done_" + suffix + ":" + nl())
+  sb_push(sb, "    mov rsp, r15" + nl())
+  sb_push(sb, "    push rax" + nl())
+  return sb_str(sb)
+end
+
+# os_write_file(path_addr, path_len, data_addr, data_len) -> 1 on
+# success, 0 on failure. Creates/overwrites (CREATE_ALWAYS) -- unlike
+# the interpreter's own write_file, does NOT create parent
+# directories first, a real named gap (raw recursive mkdir via Win32
+# calls is real extra work, deferred).
+make a function called x64_os_write_file_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "    pop r12" + nl())
+  sb_push(sb, "    pop r13" + nl())
+  sb_push(sb, "    pop rbx" + nl())
+  sb_push(sb, "    pop rax" + nl())
+  sb_push(sb, x64_os_null_terminate_path_asm(suffix))
+  sb_push(sb, "    mov r15, rsp" + nl())
+  sb_push(sb, "    sub rsp, 80" + nl())
+  sb_push(sb, "    and rsp, -16" + nl())
+  sb_push(sb, "    lea rcx, [rel g_scratch]" + nl())
+  sb_push(sb, "    mov rdx, 1073741824" + nl())
+  sb_push(sb, "    xor r8, r8" + nl())
+  sb_push(sb, "    xor r9, r9" + nl())
+  sb_push(sb, "    mov qword [rsp+32], 2" + nl())
+  sb_push(sb, "    mov qword [rsp+40], 128" + nl())
+  sb_push(sb, "    mov qword [rsp+48], 0" + nl())
+  sb_push(sb, "    call CreateFileA" + nl())
+  sb_push(sb, "    cmp rax, -1" + nl())
+  sb_push(sb, "    je .owf_invalid_" + suffix + nl())
+  sb_push(sb, "    mov r14, rax" + nl())
+  sb_push(sb, "    mov qword [rsp+56], 0" + nl())
+  sb_push(sb, "    mov rcx, r14" + nl())
+  sb_push(sb, "    mov rdx, r13" + nl())
+  sb_push(sb, "    mov r8, r12" + nl())
+  sb_push(sb, "    lea r9, [rsp+56]" + nl())
+  sb_push(sb, "    mov qword [rsp+32], 0" + nl())
+  sb_push(sb, "    call WriteFile" + nl())
+  sb_push(sb, "    mov rcx, r14" + nl())
+  sb_push(sb, "    call CloseHandle" + nl())
+  sb_push(sb, "    mov rax, 1" + nl())
+  sb_push(sb, "    jmp .owf_done_" + suffix + nl())
+  sb_push(sb, "  .owf_invalid_" + suffix + ":" + nl())
+  sb_push(sb, "    mov rax, 0" + nl())
+  sb_push(sb, "  .owf_done_" + suffix + ":" + nl())
+  sb_push(sb, "    mov rsp, r15" + nl())
+  sb_push(sb, "    push rax" + nl())
+  return sb_str(sb)
+end
+
 # CallHost -- only the five special primitive names are legal here,
 # PLUS two safe aliases (Slice 4): `l[i]` index syntax always lowers to
 # CallHost("list_get", 2) regardless of backend (lib/lower.patlang's
@@ -1013,6 +1175,15 @@ make a function called x64_callhost_asm takes name, argc returns asm
     sb_push(sb, "    call rt_list_push" + nl())
     sb_push(sb, "    add rsp, 16" + nl())
     sb_push(sb, "    push rax" + nl())
+  else
+  if name == "os_file_size" then
+    sb_push(sb, x64_os_file_size_asm())
+  else
+  if name == "os_read_file_into" then
+    sb_push(sb, x64_os_read_file_into_asm())
+  else
+  if name == "os_write_file" then
+    sb_push(sb, x64_os_write_file_asm())
   else
   if name == "list_len" then
     sb_push(sb, "    call rt_list_len" + nl())
@@ -1107,6 +1278,9 @@ make a function called x64_callhost_asm takes name, argc returns asm
       end
       end
     end
+  end
+  end
+  end
   end
   end
   end
@@ -1745,7 +1919,7 @@ make a function called emit_program_x64 takes ir returns asm
   let sb = sb_new()
   sb_push(sb, "default rel" + nl())
   sb_push(sb, "global main" + nl())
-  sb_push(sb, "extern GetStdHandle, WriteFile, ExitProcess" + nl())
+  sb_push(sb, "extern GetStdHandle, WriteFile, ExitProcess, CreateFileA, GetFileSize, CloseHandle, ReadFile" + nl())
   sb_push(sb, nl())
   sb_push(sb, "section .bss" + nl())
   sb_push(sb, "    align 8" + nl())
