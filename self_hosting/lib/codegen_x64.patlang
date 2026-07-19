@@ -712,17 +712,56 @@ make a function called x64_binop_asm_dynamic takes op returns asm
   # block (same byte offsets, totally different meaning). Must
   # classify BigInt vs Rational at RUNTIME (both are only known at
   # runtime -- a variable could hold either) before dispatching.
+  #
+  # SECOND bug of the same class, found and fixed while tagging
+  # strings/lists/closures: the ORIGINAL fix above only handled
+  # Rational-vs-BigInt confusion within the Numeric family, but once
+  # String/List/Closure carry real tags too (not just Object), ANY
+  # non-Numeric-family operand reaching this chain would still fall
+  # through to the BigInt default -- e.g. comparing two strings inside
+  # a function that's ALSO dynamic-mode (because it uses BigInt
+  # elsewhere) would misread a string's [length][bytes] as a BigInt's
+  # [sign][limb count]. Fixed by checking the FAMILY NIBBLE first: if
+  # EITHER operand's family isn't 0x1 (Numeric), route straight to the
+  # generic identity/no-op branch (.DYN_OBJ_, handles Object/String/
+  # List/Closure/anything-mixed-with-a-fixnum uniformly) before ever
+  # considering the Numeric-specific Interval/Complex/Rational/BigInt
+  # chain at all.
+  # NOTE: a fixnum's family reads as 0 (no tag at all), which does NOT
+  # equal NUMERIC_FAMILY (1<<60) even though a fixnum genuinely IS
+  # numeric-compatible -- this is exactly the mixed fixnum+BigInt/
+  # Rational/Complex/Interval case every earlier promotion helper
+  # already handles. A real bug caught here before it shipped (found
+  # by re-running x64_bigint_demo's mixed bigint+fixnum case, which
+  # segfaulted): the first draft of this family check required an
+  # EXACT match to NUMERIC_FAMILY, which wrongly routed every mixed
+  # fixnum+Numeric-composite pair into the identity/no-op branch
+  # instead of the correct promotion chain. Fixed: an operand is
+  # "numeric-compatible" if its family is EITHER 0 (fixnum) OR exactly
+  # NUMERIC_FAMILY; only route to .DYN_OBJ_ if an operand's family is
+  # neither (i.e. genuinely String/List/Closure/Object).
   sb_push(sb, ".DYN_NOTFAST_" + suffix + ":" + nl())
+  sb_push(sb, "    mov r15, 17293822569102704640" + nl())
+  sb_push(sb, "    mov rax, r13" + nl())
+  sb_push(sb, "    and rax, r15" + nl())
+  sb_push(sb, "    mov rbx, r14" + nl())
+  sb_push(sb, "    and rbx, r15" + nl())
+  sb_push(sb, "    mov rcx, 1152921504606846976" + nl())
+  sb_push(sb, "    cmp rax, 0" + nl())
+  sb_push(sb, "    je .DYN_FAMOK1_" + suffix + nl())
+  sb_push(sb, "    cmp rax, rcx" + nl())
+  sb_push(sb, "    jne .DYN_OBJ_" + suffix + nl())
+  sb_push(sb, ".DYN_FAMOK1_" + suffix + ":" + nl())
+  sb_push(sb, "    cmp rbx, 0" + nl())
+  sb_push(sb, "    je .DYN_FAMOK2_" + suffix + nl())
+  sb_push(sb, "    cmp rbx, rcx" + nl())
+  sb_push(sb, "    jne .DYN_OBJ_" + suffix + nl())
+  sb_push(sb, ".DYN_FAMOK2_" + suffix + ":" + nl())
   sb_push(sb, "    mov r15, 18446462598732840960" + nl())
   sb_push(sb, "    mov rax, r13" + nl())
   sb_push(sb, "    and rax, r15" + nl())
   sb_push(sb, "    mov rbx, r14" + nl())
   sb_push(sb, "    and rbx, r15" + nl())
-  sb_push(sb, "    mov rcx, 5764607523034234880" + nl())
-  sb_push(sb, "    cmp rax, rcx" + nl())
-  sb_push(sb, "    je .DYN_OBJ_" + suffix + nl())
-  sb_push(sb, "    cmp rbx, rcx" + nl())
-  sb_push(sb, "    je .DYN_OBJ_" + suffix + nl())
   sb_push(sb, "    mov rcx, 1157425104234217472" + nl())
   sb_push(sb, "    cmp rax, rcx" + nl())
   sb_push(sb, "    je .DYN_IVAL_" + suffix + nl())
@@ -825,13 +864,21 @@ make a function called x64_binop_asm_dynamic takes op returns asm
     sb_push(sb, "    add rsp, 16" + nl())
   end
   sb_push(sb, "    jmp .DYN_DONE_" + suffix + nl())
-  # Object: no promotion helper, no runtime call at all -- object
-  # equality is raw tagged-word IDENTITY (see x64_runtime.patlang's
-  # own Object header for why this is simpler than Complex/Interval's
-  # value-based eq), and arithmetic on an Object operand is a
-  # deterministic no-op rather than the dangerous BigInt-family
-  # default (which would misread [type id][field count] as
-  # [sign][limb count]).
+  # Generic "not Numeric family" branch -- Object, String, List,
+  # Closure, or a fixnum mixed with any of those. No promotion helper,
+  # no runtime call at all: equality is raw tagged-word IDENTITY (same
+  # semantics as everywhere else in this backend already used for
+  # these values before they were tagged -- unchanged behavior, now
+  # enforced correctly instead of by the mere absence of a tag), which
+  # ALSO correctly reports "not equal" whenever the two operands are
+  # genuinely different types (different tag bits, different bit
+  # pattern, cmp already says not-equal) -- so this one branch is
+  # correct for every same-type AND every mixed-type comparison
+  # without needing to special-case "are these the same kind of
+  # composite" at all. Arithmetic on any of these is a deterministic
+  # no-op rather than the dangerous BigInt-family default (which would
+  # misread e.g. a String's [length][bytes] as a BigInt's [sign][limb
+  # count]).
   sb_push(sb, ".DYN_OBJ_" + suffix + ":" + nl())
   if x64_is_dynamic_cmp_op(op) then
     sb_push(sb, "    cmp r13, r14" + nl())
@@ -1086,7 +1133,10 @@ make a function called x64_buildlist_asm takes argc returns asm
     sb_push(sb, "    mov [r12+" + (8 + k * 8) + "], rbx" + nl())
     let k = k - 1
   end
-  sb_push(sb, "    push r12" + nl())
+  sb_push(sb, "    mov rax, r12" + nl())
+  sb_push(sb, "    mov rcx, 3458764513820540928" + nl())
+  sb_push(sb, "    or rax, rcx" + nl())
+  sb_push(sb, "    push rax" + nl())
   return sb_str(sb)
 end
 
@@ -1110,7 +1160,10 @@ make a function called x64_makeclosure_asm takes func_name, captured_names retur
     sb_push(sb, "    mov [r12+16+" + (8 * k) + "], rbx" + nl())
     let k = k - 1
   end
-  sb_push(sb, "    push r12" + nl())
+  sb_push(sb, "    mov rax, r12" + nl())
+  sb_push(sb, "    mov rcx, 4611686018427387904" + nl())
+  sb_push(sb, "    or rax, rcx" + nl())
+  sb_push(sb, "    push rax" + nl())
   return sb_str(sb)
 end
 
@@ -1140,8 +1193,13 @@ make a function called x64_callvalue_asm takes argc, locals returns asm
     sb_push(sb, "    mov [rbx+" + (8 * k) + "], rax" + nl())
     let k = k - 1
   end
-  # 2. Pop the closure value itself (now on top).
+  # 2. Pop the closure value itself (now on top) -- mask off the tag
+  #    (family 0x4, since closures are tagged now) before treating it
+  #    as a real address; every dereference below (code addr, captured
+  #    count, captured values) reads through this masked r14.
   sb_push(sb, "    pop r14" + nl())
+  sb_push(sb, "    mov rcx, 281474976710655" + nl())
+  sb_push(sb, "    and r14, rcx" + nl())
   sb_push(sb, "    mov r12, [r14]" + nl())
   sb_push(sb, "    mov r13, [r14+8]" + nl())
   sb_push(sb, "    mov [rbp-" + cv_slot_offset + "], r13" + nl())
@@ -1205,6 +1263,8 @@ make a function called x64_emit_instr takes instr, func_name, locals, label, flo
       if kind == "str" then
         let label = x64_string_label_next()
         sb_push(sb, "    lea rax, [rel " + label + "]" + nl())
+        sb_push(sb, "    mov rcx, 2305843009213693952" + nl())
+        sb_push(sb, "    or rax, rcx" + nl())
         sb_push(sb, "    push rax" + nl())
       else
         if float_mode then

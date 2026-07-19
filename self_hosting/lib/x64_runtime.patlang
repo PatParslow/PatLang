@@ -95,28 +95,41 @@ make a function called rt_print_i64 takes n returns done
   return true
 end
 
-# ---- strings (Slice 3) ----
+# ---- strings (Slice 3, TAGGED as of the closures/strings/lists
+# tagging migration) ----
 #
 # A string is a heap-allocated block: [8-byte length][raw bytes, not
-# null-terminated]. Its "value" (what gets pushed/stored/passed around
-# as an ordinary int, same as everything else in this backend) is
-# simply the block's own address. String LITERALS are built by
-# codegen_x64.patlang directly into .data (see that file's own
-# header) -- everything below is genuine PatLang using nothing but the
-# existing mem_peek/poke_byte/qword + rt_heap_alloc primitives; no new
-# native primitives were needed for strings at all.
+# null-terminated]. Now carries a real tag -- family 0x2, reserved for
+# exactly this since the original tag-layout design -- so a string
+# value is dynamically self-describing like every other tagged value
+# in this backend, not just an opaque raw address. String LITERALS
+# are built by codegen_x64.patlang directly into .data (see that
+# file's own header for where the tag gets OR'd onto the `lea`d
+# address) -- everything below is genuine PatLang, masking the tag off
+# before dereferencing (`s band rt_payload_mask()`) and OR'ing
+# `rt_string_tag()` back onto any NEWLY CONSTRUCTED string's address
+# before returning it.
 #
-# `+` on the IR's Bin instruction is STILL always integer addition --
-# this backend has no dynamic type tags to distinguish "this value is
-# an int" from "this value is a string pointer" at codegen time, so
-# string concatenation is this explicitly-named function, not operator
-# overloading. A real, deliberate scope limit, not an oversight.
+# `+` on the IR's Bin instruction is STILL always integer addition
+# (never string concatenation) even now that strings are tagged --
+# codegen_x64.patlang's dynamic dispatch treats String (like List/
+# Closure/Object) as identity-only, no arithmetic meaning, same
+# deliberate scope limit as before, just now enforced by the tag
+# scheme itself rather than by the complete absence of one. String
+# concatenation is still this explicitly-named function.
+
+make a function called rt_string_tag returns tag
+  return 2 shl 60
+end
 
 make a function called rt_str_len takes s returns len
-  return mem_peek_qword(s, 0)
+  let addr = s band rt_payload_mask()
+  return mem_peek_qword(addr, 0)
 end
 
 make a function called rt_str_concat takes a, b returns result
+  let addr_a = a band rt_payload_mask()
+  let addr_b = b band rt_payload_mask()
   let len_a = rt_str_len(a)
   let len_b = rt_str_len(b)
   let total = len_a + len_b
@@ -124,35 +137,40 @@ make a function called rt_str_concat takes a, b returns result
   mem_poke_qword(result, 0, total)
   let i = 0
   while i < len_a do
-    mem_poke_byte(result, 8 + i, mem_peek_byte(a, 8 + i))
+    mem_poke_byte(result, 8 + i, mem_peek_byte(addr_a, 8 + i))
     let i = i + 1
   end
   let j = 0
   while j < len_b do
-    mem_poke_byte(result, 8 + len_a + j, mem_peek_byte(b, 8 + j))
+    mem_poke_byte(result, 8 + len_a + j, mem_peek_byte(addr_b, 8 + j))
     let j = j + 1
   end
-  return result
+  return result bor rt_string_tag()
 end
 
 make a function called rt_print_str takes s returns done
+  let addr = s band rt_payload_mask()
   let len = rt_str_len(s)
-  os_write_console_bytes(s + 8, len)
+  os_write_console_bytes(addr + 8, len)
   mem_poke_byte(mem_scratch_addr(), 0, 10)
   os_write_console_bytes(mem_scratch_addr(), 1)
   return true
 end
 
-# ---- lists (Slice 4) ----
+# ---- lists (Slice 4, TAGGED as of the closures/strings/lists tagging
+# migration) ----
 #
 # Same [8-byte length][elements] block layout as strings, except each
-# element is a plain qword rather than a byte -- every PatLang value in
-# this backend is already a qword, so "a list of anything" (ints,
-# string addresses, other list addresses) is trivially a list of
-# qwords, no per-type handling needed anywhere. codegen_x64.patlang's
-# BuildList handling (PatLang's own `[e0, e1, ...]` literal syntax)
-# calls rt_heap_alloc directly and constructs this same layout inline
-# rather than calling rt_list_new -- both produce identical blocks.
+# element is a plain TAGGED qword rather than a byte -- every PatLang
+# value in this backend is already a qword, so "a list of anything"
+# (fixnums, BigInt/Rational/Complex/Interval, strings, other lists,
+# closures, objects) is trivially a list of tagged qwords, no
+# per-type handling needed anywhere. Now carries family 0x3's tag on
+# the list's own address, same masking/tagging discipline as strings.
+# codegen_x64.patlang's BuildList handling (PatLang's own `[e0, e1,
+# ...]` literal syntax) calls rt_heap_alloc directly and constructs
+# this same layout inline rather than calling rt_list_new -- both
+# produce identical (now tagged) blocks.
 #
 # `list_get`/`list_len` are aliased directly to rt_list_get/rt_list_len
 # by codegen_x64.patlang (so `l[i]` and `list_len(l)` work with
@@ -166,22 +184,29 @@ end
 # not-yet-built follow-up, same spirit as strings' `+`-stays-int-only
 # limit).
 
-make a function called rt_list_new takes n returns addr
+make a function called rt_list_tag returns tag
+  return 3 shl 60
+end
+
+make a function called rt_list_new takes n returns tagged
   let addr = rt_heap_alloc(8 + n * 8)
   mem_poke_qword(addr, 0, n)
-  return addr
+  return addr bor rt_list_tag()
 end
 
 make a function called rt_list_len takes l returns len
-  return mem_peek_qword(l, 0)
+  let addr = l band rt_payload_mask()
+  return mem_peek_qword(addr, 0)
 end
 
 make a function called rt_list_get takes l, i returns value
-  return mem_peek_qword(l, 8 + i * 8)
+  let addr = l band rt_payload_mask()
+  return mem_peek_qword(addr, 8 + i * 8)
 end
 
 make a function called rt_list_set takes l, i, v returns done
-  mem_poke_qword(l, 8 + i * 8, v)
+  let addr = l band rt_payload_mask()
+  mem_poke_qword(addr, 8 + i * 8, v)
   return true
 end
 
@@ -277,7 +302,7 @@ make a function called rt_int_to_str takes n returns s
     mem_poke_byte(s, 8 + i, mem_peek_byte(buf, i))
     let i = i + 1
   end
-  return s
+  return s bor rt_string_tag()
 end
 
 # Zero-padded to exactly 9 digits -- for every limb EXCEPT the most
@@ -293,7 +318,7 @@ make a function called rt_limb9_to_str takes n returns s
     let v = v / 10
     let i = i - 1
   end
-  return s
+  return s bor rt_string_tag()
 end
 
 # Real bug found here: an earlier draft used list_push/list_len to
