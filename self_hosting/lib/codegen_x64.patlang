@@ -74,6 +74,41 @@
 # String concatenation is therefore its own explicitly-named function,
 # `rt_str_concat(a, b)`, not operator overloading -- a real, named
 # simplification, not an oversight.
+#
+# CLOSURES (Slice 5): a closure is a heap block laid out as
+# [8-byte code address][8-byte captured count][captured values...] --
+# deliberately chosen to generalize toward "everything is a function,
+# everything is an object" rather than being a closure-only special
+# case: a code/behavior pointer plus a bag of values is already most
+# of the way to a general object (`[type/vtable pointer][field count]
+# [field values...]` is nearly the same shape), and once closures are
+# real callable values storable in lists (Slice 4), an event-handler
+# table is just a list of `[name_string, closure]` pairs, dispatched
+# by calling the matching closure through the exact same CallValue
+# mechanism this slice builds -- both are real, named future
+# directions, not built here, but the representation is chosen with
+# them in view rather than needing to be redesigned later.
+#
+# MakeClosure(func_name, captured_names) -- captured_names.length is
+# known at COMPILE time (it's a literal list baked into the IR at this
+# instruction), so this is unrolled exactly like BuildList: allocate,
+# store the code address (a compile-time label -- `lea`) and count,
+# then pop the already-pushed captured values into the block.
+#
+# CallValue(argc) -- the CLOSURE's own captured count is NOT known at
+# compile time here (a variable can hold different closures at
+# different times), so pushing its captured values onto the operand
+# stack before the real `call` needs a genuine runtime loop, unlike
+# every other instruction in this backend. argc (the call site's own
+# explicit arg count) IS compile-time-known, so those args are popped
+# into the .bss scratch buffer first (out of the way), the closure's
+# captured values are pushed via the runtime loop, then the scratch
+# args are pushed back on top in original order, then an INDIRECT call
+# (`call r12`, not a compile-time label) reaches the synthesized
+# function -- whose own params are exactly `captured ++ own_params`,
+# per lib/lower.patlang's own lower_closure_literal, so this lines up
+# with the ordinary Call calling convention automatically once the
+# stack is arranged correctly.
 # =============================================================================
 
 make a function called nl returns s
@@ -390,6 +425,104 @@ make a function called x64_buildlist_asm takes argc returns asm
   return sb_str(sb)
 end
 
+# MakeClosure(func_name, captured_names) -- captured_names.length is
+# compile-time known, so this unrolls exactly like x64_buildlist_asm.
+# Block layout: [code address][captured count][captured values...].
+make a function called x64_makeclosure_asm takes func_name, captured_names returns asm
+  let n = to_num(list_len(captured_names))
+  let sb = sb_new()
+  sb_push(sb, "    mov rax, " + (16 + n * 8) + nl())
+  sb_push(sb, "    push rax" + nl())
+  sb_push(sb, "    call rt_heap_alloc" + nl())
+  sb_push(sb, "    add rsp, 8" + nl())
+  sb_push(sb, "    mov r12, rax" + nl())
+  sb_push(sb, "    lea rax, [rel " + func_name + "]" + nl())
+  sb_push(sb, "    mov [r12], rax" + nl())
+  sb_push(sb, "    mov qword [r12+8], " + n + nl())
+  let k = n - 1
+  while k >= 0 do
+    sb_push(sb, "    pop rbx" + nl())
+    sb_push(sb, "    mov [r12+16+" + (8 * k) + "], rbx" + nl())
+    let k = k - 1
+  end
+  sb_push(sb, "    push r12" + nl())
+  return sb_str(sb)
+end
+
+# CallValue(argc) -- the closure's OWN captured count is a runtime
+# value (read from the closure object itself), unlike everywhere else
+# in this backend where instruction operands are compile-time known --
+# see this file's own header for the full stack-shuffling explanation.
+make a function called x64_callvalue_asm takes argc, locals returns asm
+  let n = to_num(argc)
+  # The current function's own private scratch slot, one past its last
+  # named local (see x64_emit_func's frame_size reservation) -- used to
+  # carry the closure's captured-count across the opaque `call` below,
+  # since nothing about this backend's calling convention guarantees
+  # any register survives a call, and a shared/global location would
+  # be unsafe under recursion or a closure that itself calls another
+  # closure before returning. Private to THIS activation's own rbp, so
+  # every nested/recursive call gets its own independent copy for free.
+  let cv_slot_offset = 8 * (to_num(list_len(locals)) + 1)
+  let sb = sb_new()
+  # 1. Pop the N already-pushed own-args into the scratch buffer, out
+  #    of the way, so the closure's captured values can be pushed
+  #    underneath where they belong first.
+  let k = n - 1
+  while k >= 0 do
+    sb_push(sb, "    pop rax" + nl())
+    sb_push(sb, "    lea rbx, [rel g_scratch]" + nl())
+    sb_push(sb, "    mov [rbx+" + (8 * k) + "], rax" + nl())
+    let k = k - 1
+  end
+  # 2. Pop the closure value itself (now on top).
+  sb_push(sb, "    pop r14" + nl())
+  sb_push(sb, "    mov r12, [r14]" + nl())
+  sb_push(sb, "    mov r13, [r14+8]" + nl())
+  sb_push(sb, "    mov [rbp-" + cv_slot_offset + "], r13" + nl())
+  # 3. Push the closure's captured values, in order -- a genuine
+  #    runtime loop, since r13 (captured count) isn't compile-time
+  #    known here.
+  let suffix = label_asm_safe(argc)
+  sb_push(sb, "    xor rbx, rbx" + nl())
+  sb_push(sb, "  .cv_loop_" + suffix + ":" + nl())
+  sb_push(sb, "    cmp rbx, r13" + nl())
+  sb_push(sb, "    jge .cv_done_" + suffix + nl())
+  sb_push(sb, "    mov rax, [r14+16+rbx*8]" + nl())
+  sb_push(sb, "    push rax" + nl())
+  sb_push(sb, "    inc rbx" + nl())
+  sb_push(sb, "    jmp .cv_loop_" + suffix + nl())
+  sb_push(sb, "  .cv_done_" + suffix + ":" + nl())
+  # 4. Push the own-args back on top, in original order.
+  let i = 0
+  while i < n do
+    sb_push(sb, "    lea rbx, [rel g_scratch]" + nl())
+    sb_push(sb, "    mov rax, [rbx+" + (8 * i) + "]" + nl())
+    sb_push(sb, "    push rax" + nl())
+    let i = i + 1
+  end
+  # 5. Indirect call, then clean up -- captured count is read back from
+  #    THIS frame's own private slot (step 2), not from any register,
+  #    since r12/r13/r14 are not guaranteed to survive the call.
+  sb_push(sb, "    call r12" + nl())
+  sb_push(sb, "    mov rdx, [rbp-" + cv_slot_offset + "]" + nl())
+  sb_push(sb, "    add rdx, " + n + nl())
+  sb_push(sb, "    shl rdx, 3" + nl())
+  sb_push(sb, "    add rsp, rdx" + nl())
+  sb_push(sb, "    push rax" + nl())
+  return sb_str(sb)
+end
+
+# CallValue call sites need locally-unique NASM labels for their
+# internal push-captured-values loop -- set_var-based counter, same
+# pattern as the string-literal labels, since a program can contain
+# more than one CallValue instruction.
+make a function called label_asm_safe takes ignored returns label
+  let n = to_num(get("__vars", "__x64_cv_counter"))
+  set_var("__x64_cv_counter", n + 1)
+  return "" + n
+end
+
 make a function called x64_emit_instr takes instr, func_name, locals, label returns asm
   let sb = sb_new()
   sb_push(sb, label + ":" + nl())
@@ -449,6 +582,12 @@ make a function called x64_emit_instr takes instr, func_name, locals, label retu
                   if ty == "BuildList" then
                     sb_push(sb, x64_buildlist_asm(instr[1]))
                   else
+                  if ty == "MakeClosure" then
+                    sb_push(sb, x64_makeclosure_asm(instr[1], instr[2]))
+                  else
+                  if ty == "CallValue" then
+                    sb_push(sb, x64_callvalue_asm(instr[1], locals))
+                  else
                   if ty == "Return" then
                     if func_name == "main" then
                       sb_push(sb, "    mov r15, rsp" + nl())
@@ -464,6 +603,8 @@ make a function called x64_emit_instr takes instr, func_name, locals, label retu
                   else
                     print("codegen_x64: unsupported IR instruction for Slice 1: " + ty)
                     return "UNSUPPORTED_INSTR_ERROR"
+                  end
+                  end
                   end
                   end
                 end
@@ -484,9 +625,17 @@ make a function called x64_emit_func takes func returns asm
   let params = func[2]
   let instrs = func[3]
   let locals = x64_collect_locals(func)
-  let frame_size = 8 * to_num(list_len(locals))
-  if frame_size < 8 then
-    let frame_size = 8
+  # +1 extra slot beyond the named locals, ALWAYS reserved, for
+  # CallValue's own per-frame scratch (see x64_callvalue_asm) -- a
+  # value that must survive an opaque `call` this backend's own
+  # calling convention gives no register-preservation guarantee
+  # across. Using a private slot in the CURRENT function's own stack
+  # frame (not a shared/global location) makes it safe under
+  # recursion/re-entrancy for free: every active call gets its own
+  # rbp, so every active call's copy of this slot is independent.
+  let frame_size = 8 * (to_num(list_len(locals)) + 1)
+  if frame_size < 16 then
+    let frame_size = 16
   end
   let sb = sb_new()
   sb_push(sb, func_name + ":" + nl())
