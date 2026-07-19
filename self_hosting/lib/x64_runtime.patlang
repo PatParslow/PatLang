@@ -1083,3 +1083,95 @@ make a function called rt_interval_eq takes a, b returns eq
   end
   return 0
 end
+
+# ---- Object (clean, closures-based direction -- NOT the existing
+# interpreter/rustc backend's oo system) ----
+#
+# The existing interpreter/rustc-backend Object (Value::Object, the
+# `oo` prelude chunk in rust-runtime/src/ir/codegen.rs) is a string-
+# keyed global-handle system tied to the older GOAP/logic-facts
+# subsystem (object_new/get/send against a global name table, plus
+# hardcoded methods like infer_is_adult). Per explicit user direction,
+# this backend's Object does NOT mirror that -- it follows the SAME
+# direction Slice 5's closures were deliberately shaped toward: a
+# first-class heap value, [8-byte type id][8-byte field count][tagged
+# field values...], reusing the SAME family-tag scheme every other
+# composite value in this backend already uses. Fields are accessed
+# by INDEX (no name->slot mapping in this first cut -- a real, named
+# simplification, not an oversight). type_id is caller-assigned and
+# opaque to this runtime (no built-in vtable/method dispatch yet --
+# that's exactly where the closures-as-proto-objects direction from
+# Slice 5 would connect, not built here).
+#
+# User's own explicit note, worth remembering for later: "The clean
+# [design] is preferred if we will be able to revisit the legacy to
+# keep it mirrored so the user experience remains the same whichever
+# path is being used. Consistency is key, but that should not prevent
+# us developing new implementations to improve things." -- i.e. the
+# EXISTING interpreter/rustc backend's Object semantics should
+# eventually migrate toward THIS model too, for cross-backend
+# consistency. Not attempted in this pass (a real, separate, larger
+# undertaking touching the Rust runtime itself, not just this
+# self-hosted x64 backend) -- named here so it isn't lost.
+#
+# Object tag: family 0x5 (reserved for exactly this since the
+# original tag-layout design), local bits 0 (type_id lives INSIDE the
+# heap block, not in the tag itself -- unlike BigInt/Rational/Complex/
+# Interval, Object needs an open-ended type space, not a fixed
+# thermometer position).
+#
+# Object equality is IDENTITY, not value equality (objects are
+# mutable heap references, mutated in place by rt_object_set --
+# matching rt_list_set's own in-place-mutation convention, not the
+# interpreter's copy-on-write list_set). This makes Object comparison
+# genuinely simpler than Complex/Interval's: raw tagged-word equality
+# (`cmp` on the whole 64-bit word) is ALREADY correct for "same
+# object" and ALREADY correctly reports "not equal" against any
+# differently-tagged value (different address low bits AND/OR
+# different tag high bits) -- no runtime function call needed at all,
+# unlike rt_complex_eq/rt_interval_eq.
+#
+# Arithmetic (+/-/*) on an Object operand is not meaningful and is
+# NOT implemented -- codegen_x64.patlang's dispatch treats this as a
+# safe, deterministic no-op (returns 0) rather than falling through
+# to the wrong BigInt-family default (which would misread an Object's
+# [type id][field count] header as BigInt's [sign][limb count]).
+
+make a function called rt_object_tag returns tag
+  return 5 shl 60
+end
+
+make a function called rt_object_new takes type_id, field_count returns tagged
+  let addr = rt_heap_alloc(16 + field_count * 8)
+  mem_poke_qword(addr, 0, type_id)
+  mem_poke_qword(addr, 8, field_count)
+  let i = 0
+  while i < field_count do
+    mem_poke_qword(addr, 16 + i * 8, rt_fixnum_pack(0))
+    let i = i + 1
+  end
+  return addr bor rt_object_tag()
+end
+
+make a function called rt_object_type takes obj returns type_id
+  let addr = obj band rt_payload_mask()
+  return mem_peek_qword(addr, 0)
+end
+
+make a function called rt_object_field_count takes obj returns n
+  let addr = obj band rt_payload_mask()
+  return mem_peek_qword(addr, 8)
+end
+
+make a function called rt_object_get takes obj, i returns tagged
+  let addr = obj band rt_payload_mask()
+  return mem_peek_qword(addr, 16 + i * 8)
+end
+
+# In-place mutation (same convention as rt_list_set, not the
+# interpreter's copy-on-write semantics).
+make a function called rt_object_set takes obj, i, v returns done
+  let addr = obj band rt_payload_mask()
+  mem_poke_qword(addr, 16 + i * 8, v)
+  return true
+end
