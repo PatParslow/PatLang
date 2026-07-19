@@ -371,6 +371,16 @@ make a function called x64_rational_fn_for_op takes op returns name
   return "rt_rational_mul"
 end
 
+make a function called x64_complex_fn_for_op takes op returns name
+  if op == "+" then
+    return "rt_complex_add"
+  end
+  if op == "-" then
+    return "rt_complex_sub"
+  end
+  return "rt_complex_mul"
+end
+
 make a function called x64_is_dynamic_cmp_op takes op returns yes
   if op == "==" then
     return true
@@ -481,6 +491,38 @@ make a function called x64_dynamic_promote_both_rational_asm takes suffix return
   sb_push(sb, "    add rsp, 8" + nl())
   sb_push(sb, "    mov r14, rax" + nl())
   sb_push(sb, ".DYNPR_OP2OK_" + suffix + ":" + nl())
+  return sb_str(sb)
+end
+
+# Promotes r13/r14 to COMPLEX if not already -- simpler than the
+# BigInt/Rational promote helpers since Complex wraps ANY lower-tier
+# tagged value as-is (rt_complex_from_num), no fixnum-specific
+# unpack/repack needed: the whole tagged word becomes the new
+# Complex's real part unchanged.
+make a function called x64_dynamic_promote_both_complex_asm takes suffix returns asm
+  let sb = sb_new()
+  sb_push(sb, "    mov r15, 18446462598732840960" + nl())
+  sb_push(sb, "    mov rax, r13" + nl())
+  sb_push(sb, "    and rax, r15" + nl())
+  sb_push(sb, "    mov rcx, 1154891829443821568" + nl())
+  sb_push(sb, "    cmp rax, rcx" + nl())
+  sb_push(sb, "    je .DYNPX_OP1OK_" + suffix + nl())
+  sb_push(sb, "    push r13" + nl())
+  sb_push(sb, "    call rt_complex_from_num" + nl())
+  sb_push(sb, "    add rsp, 8" + nl())
+  sb_push(sb, "    mov r13, rax" + nl())
+  sb_push(sb, ".DYNPX_OP1OK_" + suffix + ":" + nl())
+  sb_push(sb, "    mov r15, 18446462598732840960" + nl())
+  sb_push(sb, "    mov rax, r14" + nl())
+  sb_push(sb, "    and rax, r15" + nl())
+  sb_push(sb, "    mov rcx, 1154891829443821568" + nl())
+  sb_push(sb, "    cmp rax, rcx" + nl())
+  sb_push(sb, "    je .DYNPX_OP2OK_" + suffix + nl())
+  sb_push(sb, "    push r14" + nl())
+  sb_push(sb, "    call rt_complex_from_num" + nl())
+  sb_push(sb, "    add rsp, 8" + nl())
+  sb_push(sb, "    mov r14, rax" + nl())
+  sb_push(sb, ".DYNPX_OP2OK_" + suffix + ":" + nl())
   return sb_str(sb)
 end
 
@@ -636,6 +678,11 @@ make a function called x64_binop_asm_dynamic takes op returns asm
   sb_push(sb, "    and rax, r15" + nl())
   sb_push(sb, "    mov rbx, r14" + nl())
   sb_push(sb, "    and rbx, r15" + nl())
+  sb_push(sb, "    mov rcx, 1154891829443821568" + nl())
+  sb_push(sb, "    cmp rax, rcx" + nl())
+  sb_push(sb, "    je .DYN_CPLX_" + suffix + nl())
+  sb_push(sb, "    cmp rbx, rcx" + nl())
+  sb_push(sb, "    je .DYN_CPLX_" + suffix + nl())
   sb_push(sb, "    mov rcx, 1153765929536978944" + nl())
   sb_push(sb, "    cmp rax, rcx" + nl())
   sb_push(sb, "    je .DYN_RAT_" + suffix + nl())
@@ -671,6 +718,33 @@ make a function called x64_binop_asm_dynamic takes op returns asm
     sb_push(sb, "    push r13" + nl())
     sb_push(sb, "    push r14" + nl())
     sb_push(sb, "    call " + x64_rational_fn_for_op(op) + nl())
+    sb_push(sb, "    add rsp, 16" + nl())
+  end
+  sb_push(sb, "    jmp .DYN_DONE_" + suffix + nl())
+  sb_push(sb, ".DYN_CPLX_" + suffix + ":" + nl())
+  sb_push(sb, x64_dynamic_promote_both_complex_asm(suffix + "N"))
+  if x64_is_dynamic_cmp_op(op) then
+    sb_push(sb, "    push r13" + nl())
+    sb_push(sb, "    push r14" + nl())
+    sb_push(sb, "    call rt_complex_eq" + nl())
+    sb_push(sb, "    add rsp, 16" + nl())
+    if op == "==" then
+      sb_push(sb, "    ; rax already 0/1 from rt_complex_eq" + nl())
+    else
+      if op == "!=" then
+        sb_push(sb, "    xor rax, 1" + nl())
+      else
+        # No total order on complex numbers -- a real representation
+        # limit, not laziness (see x64_runtime.patlang's own Complex
+        # header). Deterministically false rather than a memory
+        # misread/crash.
+        sb_push(sb, "    mov rax, 0" + nl())
+      end
+    end
+  else
+    sb_push(sb, "    push r13" + nl())
+    sb_push(sb, "    push r14" + nl())
+    sb_push(sb, "    call " + x64_complex_fn_for_op(op) + nl())
     sb_push(sb, "    add rsp, 16" + nl())
   end
   sb_push(sb, ".DYN_DONE_" + suffix + ":" + nl())
@@ -1442,6 +1516,17 @@ make a function called x64_func_is_dynamic takes func returns yes
   if x64_func_is_tower_impl(func[1]) then
     return false
   end
+  # rt_complex_eq doesn't call any tower CONSTRUCTOR (it returns a
+  # plain 0/1, never builds a new Complex), so the syntactic "calls a
+  # constructor" heuristic below can't see that its own `==` on
+  # re/im components genuinely needs dynamic dispatch (those
+  # components can be fixnum/BigInt/Rational, and a naive bitwise `==`
+  # would wrongly say two equal-VALUE BigInts at different heap
+  # addresses are unequal). Forced dynamic by name instead -- see
+  # x64_runtime.patlang's own header on rt_complex_eq.
+  if func[1] == "rt_complex_eq" then
+    return true
+  end
   let instrs = func[3]
   let i = 0
   let n = to_num(list_len(instrs))
@@ -1455,6 +1540,15 @@ make a function called x64_func_is_dynamic takes func returns yes
         return true
       end
       if instr[1] == "rt_rational_from_i64" then
+        return true
+      end
+      if instr[1] == "rt_complex_new" then
+        return true
+      end
+      if instr[1] == "rt_complex_from_i64" then
+        return true
+      end
+      if instr[1] == "rt_complex_from_num" then
         return true
       end
     end

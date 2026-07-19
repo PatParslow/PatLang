@@ -779,3 +779,158 @@ make a function called rt_rational_cmp takes a, b returns cmp
   end
   return 0
 end
+
+# ---- numeric tower: Complex (tower level 3) ----
+#
+# Complex's tag: family 0x1 (Numeric), local bits 0b1111 (adds a
+# fourth thermometer bit ">=Complex" on top of BigInt/Rational/Float's
+# existing three -- see codegen_x64.patlang's own tag-layout header).
+#
+# UNLIKE BigInt/Rational, a Complex value is not a further extension
+# of int MAGNITUDE -- it's a genuinely composite value, a pair of
+# numbers (matching the real rustc-backend's own ComplexT, which wraps
+# two NumT). So its representation is a heap block of two ALREADY-
+# TAGGED numeric words: [8-byte tagged re][8-byte tagged im], where
+# each component can independently be a fixnum, BigInt, or Rational
+# (never itself Complex -- no nested complex-of-complex support).
+#
+# This representation choice is what lets rt_complex_add/_sub/_mul be
+# ORDINARY PatLang using plain `+`/`-`/`*` on the extracted re/im
+# components: since these functions call rt_complex_new, they're
+# classified dynamic-mode by codegen_x64.patlang's x64_func_is_dynamic
+# (same whole-function rule as everything else in this tower), and
+# their own `+`/`-`/`*` on re/im therefore go through the EXISTING
+# x64_binop_asm_dynamic machinery, which already correctly handles
+# fixnum/BigInt/Rational operands -- no new arithmetic primitives were
+# needed for Complex component math at all.
+#
+# DELIBERATE SCOPE LIMIT: only `+`/`-`/`*`/`==`/`!=` are meaningful
+# and supported for top-level Complex operands (via
+# x64_binop_asm_dynamic's own Complex classification branch).
+# `/`/`<`/`<=`/`>`/`>=` on Complex values are NOT implemented -- for
+# ordering specifically, there is no total order on complex numbers to
+# begin with, so this is a genuine representation limit, not laziness;
+# codegen_x64.patlang's comparison dispatch for Complex always calls
+# rt_complex_eq and reuses the usual setcc-against-0 pattern, which
+# gives a SAFE (no memory misread/crash) but not remotely meaningful
+# result for ordering ops -- named here so it's never mistaken for
+# real complex ordering support.
+
+make a function called rt_complex_tag returns tag
+  return (1 shl 60) bor (1 shl 48) bor (1 shl 49) bor (1 shl 50)
+end
+
+make a function called rt_fixnum_pack takes n returns tagged
+  return n band rt_payload_mask()
+end
+
+make a function called rt_complex_new takes re, im returns tagged
+  let addr = rt_heap_alloc(16)
+  mem_poke_qword(addr, 0, re)
+  mem_poke_qword(addr, 8, im)
+  return addr bor rt_complex_tag()
+end
+
+# Wraps ANY already-tagged numeric value (fixnum/BigInt/Rational) as
+# Complex(re=that value, im=0) -- used both for genuine "make a
+# complex from a real number" construction and, in codegen_x64.
+# patlang's promote-to-complex helper, for lifting a lower-tier
+# operand up to Complex when mixed with a genuine Complex operand.
+make a function called rt_complex_from_num takes tagged returns result
+  return rt_complex_new(tagged, rt_fixnum_pack(0))
+end
+
+make a function called rt_complex_from_i64 takes n returns tagged
+  return rt_complex_from_num(rt_fixnum_pack(n))
+end
+
+# Dispatches a single ALREADY-TAGGED numeric word (fixnum/BigInt/
+# Rational -- never Complex) to the right *_to_string. A genuinely
+# reusable "print any tower value" helper, not Complex-specific,
+# needed here so rt_complex_to_string can format its re/im components
+# whichever kind they happen to be.
+make a function called rt_num_to_string takes tagged returns s
+  let masked = tagged band rt_tag_mask()
+  if masked == 0 then
+    return rt_int_to_str(rt_fixnum_unpack(tagged))
+  end
+  if masked == rt_bigint_tag() then
+    return rt_bigint_to_string(tagged)
+  end
+  if masked == rt_rational_tag() then
+    return rt_rational_to_string(tagged)
+  end
+  return "?"
+end
+
+# "a+bi" -- deliberately not "a-bi" for negative im (rt_num_to_string
+# already emits the leading "-" itself, so this always reads as
+# "a+-bi" for a negative imaginary part). A real, named simplification
+# matching the project's usual "correct but not polished" first-cut
+# style, not an oversight.
+make a function called rt_complex_to_string takes tagged returns s
+  let addr = tagged band rt_payload_mask()
+  let re = mem_peek_qword(addr, 0)
+  let im = mem_peek_qword(addr, 8)
+  let s = rt_num_to_string(re)
+  let s = rt_str_concat(s, "+")
+  let s = rt_str_concat(s, rt_num_to_string(im))
+  let s = rt_str_concat(s, "i")
+  return s
+end
+
+make a function called rt_complex_add takes a, b returns tagged
+  let addr_a = a band rt_payload_mask()
+  let addr_b = b band rt_payload_mask()
+  let re_a = mem_peek_qword(addr_a, 0)
+  let im_a = mem_peek_qword(addr_a, 8)
+  let re_b = mem_peek_qword(addr_b, 0)
+  let im_b = mem_peek_qword(addr_b, 8)
+  return rt_complex_new(re_a + re_b, im_a + im_b)
+end
+
+make a function called rt_complex_sub takes a, b returns tagged
+  let addr_a = a band rt_payload_mask()
+  let addr_b = b band rt_payload_mask()
+  let re_a = mem_peek_qword(addr_a, 0)
+  let im_a = mem_peek_qword(addr_a, 8)
+  let re_b = mem_peek_qword(addr_b, 0)
+  let im_b = mem_peek_qword(addr_b, 8)
+  return rt_complex_new(re_a - re_b, im_a - im_b)
+end
+
+# (a+bi)(c+di) = (ac-bd) + (ad+bc)i
+make a function called rt_complex_mul takes a, b returns tagged
+  let addr_a = a band rt_payload_mask()
+  let addr_b = b band rt_payload_mask()
+  let re_a = mem_peek_qword(addr_a, 0)
+  let im_a = mem_peek_qword(addr_a, 8)
+  let re_b = mem_peek_qword(addr_b, 0)
+  let im_b = mem_peek_qword(addr_b, 8)
+  let ac = re_a * re_b
+  let bd = im_a * im_b
+  let ad = re_a * im_b
+  let bc = im_a * re_b
+  return rt_complex_new(ac - bd, ad + bc)
+end
+
+# Returns a plain 0/1 (not -1/0/1 like the other *_cmp functions) --
+# equality is the only well-defined comparison here. Compares
+# component-wise via `==`, which -- since this function itself calls
+# rt_complex_new nowhere, it needs to be explicitly forced into
+# dynamic mode by codegen_x64.patlang's classifier by name, see that
+# file's own x64_func_is_dynamic for why.
+make a function called rt_complex_eq takes a, b returns eq
+  let addr_a = a band rt_payload_mask()
+  let addr_b = b band rt_payload_mask()
+  let re_a = mem_peek_qword(addr_a, 0)
+  let im_a = mem_peek_qword(addr_a, 8)
+  let re_b = mem_peek_qword(addr_b, 0)
+  let im_b = mem_peek_qword(addr_b, 8)
+  if re_a == re_b then
+    if im_a == im_b then
+      return 1
+    end
+  end
+  return 0
+end
