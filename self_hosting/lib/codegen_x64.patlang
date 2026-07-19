@@ -109,6 +109,50 @@
 # per lib/lower.patlang's own lower_closure_literal, so this lines up
 # with the ordinary Call calling convention automatically once the
 # stack is arranged correctly.
+#
+# NUMERIC TOWER, Slice 7 -- floats only, NOT BigInt/Rational/Complex
+# (each is its own separate, much larger undertaking, deliberately not
+# started here): a genuine second numeric kind, using NASM's own
+# `__float64__(literal)` compile-time-constant operator for Const
+# (no .data label needed, unlike strings -- floats fit in the same
+# 8-byte slot ints already use) and SSE2 (`movq`/`addsd`/`ucomisd`+
+# setcc) for Bin arithmetic and comparisons.
+#
+# DELIBERATE, NAMED SCOPE LIMIT, the real one: float-mode is a WHOLE-
+# FUNCTION decision (any float literal anywhere in a given function's
+# own body -> every Bin instruction IN THAT FUNCTION becomes float
+# arithmetic), not a per-value decision -- this backend still has no
+# dynamic type tags, so it has no way to tell int bit patterns from
+# float bit patterns at any given Bin site. This means a single
+# function mixing float math with ordinary int loop counters/
+# arithmetic would be silently WRONG under this scheme (an int loop
+# counter's bits reinterpreted as a float). Real per-value tagging
+# (needed for BigInt/Rational too) is the actual fix, and is
+# deliberately deferred -- any one function compiled by this slice
+# must be either ALL-int or ALL-float, never mixed WITHIN that
+# function. Const+Bin fusion (Slice 6) is disabled entirely in float
+# mode for the same reason (it was designed around integer immediates
+# only).
+#
+# Scoped per-FUNCTION rather than per-program deliberately: an earlier
+# draft scanned the whole concatenated program (user source PLUS the
+# PatLang-authored runtime prelude every program gets prepended),
+# which meant a single float literal anywhere in the user's own code
+# forced the RUNTIME's own functions -- e.g. rt_print_i64's `%`/`/`
+# decimal-digit-extraction, genuine int arithmetic -- into float mode
+# too, silently breaking them. Caught immediately (compile-time
+# "unsupported float binary operator: %" from the runtime itself, not
+# a silent wrong answer) the first time a float demo was actually
+# compiled and run. Per-function scoping fixes this cleanly: each
+# function (including every runtime helper) is judged independently by
+# whether ITS OWN body contains a float literal.
+#
+# Float PRINTING (decimal formatting) is ALSO deliberately not built
+# here -- real float-to-string formatting is its own separate, fiddly
+# problem. This slice proves float ARITHMETIC is correct by truncating
+# results back to int (via the new f64_to_i64_trunc primitive) and
+# printing THAT with the existing rt_print_i64, not by building a
+# float formatter.
 # =============================================================================
 
 make a function called nl returns s
@@ -227,6 +271,72 @@ make a function called x64_collect_locals takes func returns names
 end
 
 # ---- one instruction -> nasm text ----
+
+# Float variant (Slice 7): operand bits already sit in plain GP
+# registers (same push/pop discipline as everywhere else in this
+# backend -- see this file's own header), shuttled into XMM registers
+# via `movq` only for the actual SSE2 arithmetic/comparison, then back.
+# ucomisd's flags are the UNSIGNED integer condition codes (setb/setbe/
+# seta/setae for </<=/>/>=, NOT setl/setle/setg/setge) -- a genuine,
+# easy-to-get-wrong difference from the integer comparison path, called
+# out explicitly here rather than silently copy-pasted wrong.
+make a function called x64_binop_asm_float takes op returns asm
+  let sb = sb_new()
+  sb_push(sb, "    pop rbx" + nl())
+  sb_push(sb, "    pop rax" + nl())
+  sb_push(sb, "    movq xmm0, rax" + nl())
+  sb_push(sb, "    movq xmm1, rbx" + nl())
+  if op == "+" then
+    sb_push(sb, "    addsd xmm0, xmm1" + nl())
+    sb_push(sb, "    movq rax, xmm0" + nl())
+  else
+    if op == "-" then
+      sb_push(sb, "    subsd xmm0, xmm1" + nl())
+      sb_push(sb, "    movq rax, xmm0" + nl())
+    else
+      if op == "*" then
+        sb_push(sb, "    mulsd xmm0, xmm1" + nl())
+        sb_push(sb, "    movq rax, xmm0" + nl())
+      else
+        if op == "/" then
+          sb_push(sb, "    divsd xmm0, xmm1" + nl())
+          sb_push(sb, "    movq rax, xmm0" + nl())
+        else
+          sb_push(sb, "    ucomisd xmm0, xmm1" + nl())
+          if op == "==" then
+            sb_push(sb, "    sete al" + nl())
+          else
+            if op == "!=" then
+              sb_push(sb, "    setne al" + nl())
+            else
+              if op == "<" then
+                sb_push(sb, "    setb al" + nl())
+              else
+                if op == "<=" then
+                  sb_push(sb, "    setbe al" + nl())
+                else
+                  if op == ">" then
+                    sb_push(sb, "    seta al" + nl())
+                  else
+                    if op == ">=" then
+                      sb_push(sb, "    setae al" + nl())
+                    else
+                      print("codegen_x64: unsupported float binary operator: " + op)
+                      return "UNSUPPORTED_BINOP_ERROR"
+                    end
+                  end
+                end
+              end
+            end
+          end
+          sb_push(sb, "    movzx rax, al" + nl())
+        end
+      end
+    end
+  end
+  sb_push(sb, "    push rax" + nl())
+  return sb_str(sb)
+end
 
 make a function called x64_binop_asm takes op returns asm
   let sb = sb_new()
@@ -356,6 +466,17 @@ make a function called x64_callhost_asm takes name, argc returns asm
         sb_push(sb, "    mov rax, [rax]" + nl())
         sb_push(sb, "    push rax" + nl())
       else
+      if name == "f64_to_i64_trunc" then
+        # Slice 7: the ONE conversion primitive genuinely needing a
+        # dedicated CPU instruction (cvttsd2si) -- ordinary arithmetic
+        # alone can't do a float-to-int truncating conversion. Takes a
+        # float BIT PATTERN (as pushed by float-mode Const/Bin), returns
+        # a plain int.
+        sb_push(sb, "    pop rax" + nl())
+        sb_push(sb, "    movq xmm0, rax" + nl())
+        sb_push(sb, "    cvttsd2si rax, xmm0" + nl())
+        sb_push(sb, "    push rax" + nl())
+      else
         if name == "os_write_console_bytes" then
           sb_push(sb, "    pop r13" + nl())
           sb_push(sb, "    pop r14" + nl())
@@ -384,6 +505,7 @@ make a function called x64_callhost_asm takes name, argc returns asm
             return "UNSUPPORTED_PRIMITIVE_ERROR"
           end
         end
+      end
       end
       end
       end
@@ -523,7 +645,7 @@ make a function called label_asm_safe takes ignored returns label
   return "" + n
 end
 
-make a function called x64_emit_instr takes instr, func_name, locals, label returns asm
+make a function called x64_emit_instr takes instr, func_name, locals, label, float_mode returns asm
   let sb = sb_new()
   sb_push(sb, label + ":" + nl())
   let ty = instr[0]
@@ -542,7 +664,11 @@ make a function called x64_emit_instr takes instr, func_name, locals, label retu
         sb_push(sb, "    lea rax, [rel " + label + "]" + nl())
         sb_push(sb, "    push rax" + nl())
       else
-        sb_push(sb, "    mov rax, " + instr[2] + nl())
+        if float_mode then
+          sb_push(sb, "    mov rax, __float64__(" + instr[2] + ")" + nl())
+        else
+          sb_push(sb, "    mov rax, " + instr[2] + nl())
+        end
         sb_push(sb, "    push rax" + nl())
       end
     end
@@ -558,7 +684,11 @@ make a function called x64_emit_instr takes instr, func_name, locals, label retu
         sb_push(sb, "    mov [rbp-" + (8 * (slot + 1)) + "], rax" + nl())
       else
         if ty == "Bin" then
-          sb_push(sb, x64_binop_asm(instr[1]))
+          if float_mode then
+            sb_push(sb, x64_binop_asm_float(instr[1]))
+          else
+            sb_push(sb, x64_binop_asm(instr[1]))
+          end
         else
           if ty == "Jump" then
             sb_push(sb, "    jmp L_" + func_name + "_" + instr[1] + nl())
@@ -727,7 +857,7 @@ make a function called x64_fused_const_binop_asm takes const_text, op returns as
   return sb_str(sb)
 end
 
-make a function called x64_emit_func takes func returns asm
+make a function called x64_emit_func takes func, float_mode returns asm
   let func_name = func[1]
   let params = func[2]
   let instrs = func[3]
@@ -763,14 +893,16 @@ make a function called x64_emit_func takes func returns asm
   while i < n do
     let instr = instrs[i]
     let fused = false
-    if i + 1 < n then
-      let next = instrs[i + 1]
-      if instr[0] == "Const" then
-        if instr[1] == "num" then
-          if next[0] == "Bin" then
-            if x64_fusable_binop(next[1]) then
-              if not x64_is_jump_target(jump_targets, i + 1) then
-                let fused = true
+    if not float_mode then
+      if i + 1 < n then
+        let next = instrs[i + 1]
+        if instr[0] == "Const" then
+          if instr[1] == "num" then
+            if next[0] == "Bin" then
+              if x64_fusable_binop(next[1]) then
+                if not x64_is_jump_target(jump_targets, i + 1) then
+                  let fused = true
+                end
               end
             end
           end
@@ -784,7 +916,7 @@ make a function called x64_emit_func takes func returns asm
       let i = i + 2
     else
       let label = "L_" + func_name + "_" + i
-      sb_push(sb, x64_emit_instr(instr, func_name, locals, label))
+      sb_push(sb, x64_emit_instr(instr, func_name, locals, label, float_mode))
       let i = i + 1
     end
   end
@@ -792,6 +924,57 @@ make a function called x64_emit_func takes func returns asm
 end
 
 # ---- whole program -> nasm text ----
+
+# A small local substring check -- NOT lib/x64_build.patlang's
+# x64_build_contains (a different file; this backend's own driver
+# scripts include only THIS file, so it needs its own copy, same
+# reasoning x64_build.patlang used for not depending on lib/
+# test.patlang's contains_text).
+make a function called x64_contains takes hay, needle returns r
+  let hn = to_num(sc_len(str_intern(hay)))
+  let nn = to_num(sc_len(str_intern(needle)))
+  if nn > hn then
+    return false
+  end
+  let i = 0
+  while i <= hn - nn do
+    if substr(hay, i, nn) == needle then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# Whole-program float-mode detection (Slice 7) -- see this file's own
+# header for why this is a WHOLE-PROGRAM decision, not per-value.
+# Scoped PER-FUNCTION, not whole-program: an earlier draft scanned the
+# entire program (including the PatLang-authored runtime prelude that
+# gets concatenated ahead of every user program), which silently broke
+# rt_print_i64's own digit-extraction `%`/`/` the moment ANY float
+# literal appeared anywhere in a program, since one shared flag forced
+# EVERY function's Bin instructions -- including the runtime's -- into
+# float mode. A function's own float-ness is still a whole-FUNCTION
+# decision (no per-value type tagging), just no longer a whole-program
+# one -- each function is independently plain-int or all-float based
+# on whether ITS OWN body contains a float literal.
+make a function called x64_func_is_float takes func returns yes
+  let instrs = func[3]
+  let i = 0
+  let n = to_num(list_len(instrs))
+  while i < n do
+    let instr = instrs[i]
+    if instr[0] == "Const" then
+      if instr[1] == "num" then
+        if x64_contains(instr[2], ".") then
+          return true
+        end
+      end
+    end
+    let i = i + 1
+  end
+  return false
+end
 
 make a function called emit_program_x64 takes ir returns asm
   let funcs = ir[2]
@@ -820,7 +1003,7 @@ make a function called emit_program_x64 takes ir returns asm
   let n = to_num(list_len(funcs))
   let i = 0
   while i < n do
-    sb_push(sb, x64_emit_func(funcs[i]))
+    sb_push(sb, x64_emit_func(funcs[i], x64_func_is_float(funcs[i])))
     sb_push(sb, nl())
     let i = i + 1
   end
