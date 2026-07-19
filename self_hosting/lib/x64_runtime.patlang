@@ -255,6 +255,18 @@ make a function called rt_bigint_tag returns tag
   return (1 shl 60) bor (1 shl 48)
 end
 
+# Recovers the true signed value of a fixnum-tagged word -- NEEDED
+# before handing a dynamic-mode arithmetic RESULT to a plain-int
+# function like rt_print_i64: a tagged fixnum's raw 64-bit bit pattern
+# is NOT numerically equal to the true value for negative numbers (the
+# top 16 tag bits are forced to zero, not sign-extended, so e.g. -95
+# stored this way reads as a huge POSITIVE 64-bit number if used
+# unpacked). Comparison results (always a plain 0/1) don't need this --
+# only genuine arithmetic results do.
+make a function called rt_fixnum_unpack takes tagged returns n
+  return (tagged shl 16) shr 16
+end
+
 make a function called rt_int_to_str takes n returns s
   let buf = mem_scratch_addr()
   let len = rt_int_to_string(n, buf)
@@ -504,4 +516,133 @@ make a function called rt_bigint_add takes tagged_a, tagged_b returns tagged
     end
   end
   return result bor rt_bigint_tag()
+end
+
+# Negation: flips the sign, EXCEPT for a zero-magnitude value, which
+# stays sign 0 either way (no such thing as -0 here, matching
+# rt_bigint_from_i64(0)'s own always-sign-0 convention). Builds a NEW
+# block rather than mutating in place -- this scheme doesn't yet share
+# BigInt blocks between values (nothing aliases one), but copying is
+# the safe default regardless.
+make a function called rt_bigint_negate takes tagged returns tagged2
+  let addr = tagged band rt_payload_mask()
+  let sign = mem_peek_qword(addr, 0)
+  let count = mem_peek_qword(addr, 8)
+  let is_zero = false
+  if count == 1 then
+    if mem_peek_qword(addr, 16) == 0 then
+      let is_zero = true
+    end
+  end
+  if is_zero then
+    return tagged
+  end
+  let new_sign = 1
+  if sign == 1 then
+    let new_sign = 0
+  end
+  let addr2 = rt_heap_alloc(16 + count * 8)
+  mem_poke_qword(addr2, 0, new_sign)
+  mem_poke_qword(addr2, 8, count)
+  let i = 0
+  while i < count do
+    mem_poke_qword(addr2, 16 + i * 8, mem_peek_qword(addr, 16 + i * 8))
+    let i = i + 1
+  end
+  return addr2 bor rt_bigint_tag()
+end
+
+make a function called rt_bigint_sub takes tagged_a, tagged_b returns tagged
+  return rt_bigint_add(tagged_a, rt_bigint_negate(tagged_b))
+end
+
+# |a| * |b| (sign-agnostic), plain schoolbook column multiply, base
+# 10^9 limbs. Each column product (up to (10^9-1)^2 ~ 1e18) plus
+# running carry stays comfortably within a signed 64-bit accumulator
+# for any magnitude this pass is scoped to handle (same "not truly
+# arbitrary precision yet" limit named in this file's own header).
+make a function called rt_bigint_mag_mul takes addr_a, addr_b returns addr
+  let na = mem_peek_qword(addr_a, 8)
+  let nb = mem_peek_qword(addr_b, 8)
+  let addr = rt_heap_alloc(16 + (na + nb) * 8)
+  let z = 0
+  while z < na + nb do
+    mem_poke_qword(addr, 16 + z * 8, 0)
+    let z = z + 1
+  end
+  let i = 0
+  while i < na do
+    let la = mem_peek_qword(addr_a, 16 + i * 8)
+    let carry = 0
+    let j = 0
+    while j < nb do
+      let lb = mem_peek_qword(addr_b, 16 + j * 8)
+      let cur = mem_peek_qword(addr, 16 + (i + j) * 8)
+      let prod = la * lb + cur + carry
+      let digit = prod % 1000000000
+      let carry = prod / 1000000000
+      mem_poke_qword(addr, 16 + (i + j) * 8, digit)
+      let j = j + 1
+    end
+    let k = i + nb
+    while carry > 0 do
+      let cur = mem_peek_qword(addr, 16 + k * 8)
+      let s = cur + carry
+      let digit = s % 1000000000
+      let carry = s / 1000000000
+      mem_poke_qword(addr, 16 + k * 8, digit)
+      let k = k + 1
+    end
+    let i = i + 1
+  end
+  mem_poke_qword(addr, 0, 0)
+  mem_poke_qword(addr, 8, na + nb)
+  return rt_bigint_trim(addr)
+end
+
+make a function called rt_bigint_mul takes tagged_a, tagged_b returns tagged
+  let addr_a = tagged_a band rt_payload_mask()
+  let addr_b = tagged_b band rt_payload_mask()
+  let sign_a = mem_peek_qword(addr_a, 0)
+  let sign_b = mem_peek_qword(addr_b, 0)
+  let mag = rt_bigint_mag_mul(addr_a, addr_b)
+  let count = mem_peek_qword(mag, 8)
+  let is_zero = false
+  if count == 1 then
+    if mem_peek_qword(mag, 16) == 0 then
+      let is_zero = true
+    end
+  end
+  let result_sign = 0
+  if is_zero == false then
+    if sign_a != sign_b then
+      let result_sign = 1
+    end
+  end
+  mem_poke_qword(mag, 0, result_sign)
+  return mag bor rt_bigint_tag()
+end
+
+# Full signed compare: -1/0/1. Differing signs resolve immediately;
+# same sign falls back to rt_bigint_mag_cmp, negated if both negative
+# (since for two negative numbers, the one with the LARGER magnitude
+# is actually the SMALLER value).
+make a function called rt_bigint_cmp takes tagged_a, tagged_b returns cmp
+  let addr_a = tagged_a band rt_payload_mask()
+  let addr_b = tagged_b band rt_payload_mask()
+  let sign_a = mem_peek_qword(addr_a, 0)
+  let sign_b = mem_peek_qword(addr_b, 0)
+  if sign_a != sign_b then
+    if sign_a == 1 then
+      return 0 - 1
+    else
+      return 1
+    end
+  end
+  let m = rt_bigint_mag_cmp(addr_a, addr_b)
+  if sign_a == 1 then
+    return 0 - m
+  else
+    return m
+  end
 end

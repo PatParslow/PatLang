@@ -338,20 +338,130 @@ make a function called x64_binop_asm_float takes op returns asm
   return sb_str(sb)
 end
 
-# Dynamic-mode `+` (first cut -- see x64_runtime.patlang's own header
-# above rt_bigint_from_i64 for the full scope). Both operands are
-# tagged words (fixnum: top 16 bits zero, low 48 bits a signed int;
-# BigInt: family 0x1 tag, low 48 bits a heap address). Fast path: both
-# fixnum, plain add, checked for 48-bit overflow (re-sign-extend and
-# compare) -- promotes to BigInt via rt_bigint_from_i64+rt_bigint_add
-# only on genuine overflow. Slow path: either operand already BigInt
-# -- promote the other (if it's a fixnum) and call rt_bigint_add.
+make a function called x64_dynamic_op_supported takes op returns yes
+  if op == "+" then
+    return true
+  end
+  if op == "-" then
+    return true
+  end
+  if op == "*" then
+    return true
+  end
+  return x64_is_dynamic_cmp_op(op)
+end
+
+make a function called x64_bigint_fn_for_op takes op returns name
+  if op == "+" then
+    return "rt_bigint_add"
+  end
+  if op == "-" then
+    return "rt_bigint_sub"
+  end
+  return "rt_bigint_mul"
+end
+
+make a function called x64_is_dynamic_cmp_op takes op returns yes
+  if op == "==" then
+    return true
+  end
+  if op == "!=" then
+    return true
+  end
+  if op == "<" then
+    return true
+  end
+  if op == "<=" then
+    return true
+  end
+  if op == ">" then
+    return true
+  end
+  if op == ">=" then
+    return true
+  end
+  return false
+end
+
+make a function called x64_setcc_for_op takes op returns mnemonic
+  if op == "==" then
+    return "sete"
+  end
+  if op == "!=" then
+    return "setne"
+  end
+  if op == "<" then
+    return "setl"
+  end
+  if op == "<=" then
+    return "setle"
+  end
+  if op == ">" then
+    return "setg"
+  end
+  return "setge"
+end
+
+# Promotes r13/r14 (if fixnum) into BigInt-tagged values in place --
+# shared by every dynamic op's slow path. Clobbers rax/r15.
+make a function called x64_dynamic_promote_both_asm takes suffix returns asm
+  let sb = sb_new()
+  sb_push(sb, "    mov r15, 18446462598732840960" + nl())
+  sb_push(sb, "    mov rax, r13" + nl())
+  sb_push(sb, "    and rax, r15" + nl())
+  sb_push(sb, "    cmp rax, 0" + nl())
+  sb_push(sb, "    jne .DYNP_OP1OK_" + suffix + nl())
+  sb_push(sb, "    mov rax, r13" + nl())
+  sb_push(sb, "    shl rax, 16" + nl())
+  sb_push(sb, "    sar rax, 16" + nl())
+  sb_push(sb, "    push rax" + nl())
+  sb_push(sb, "    call rt_bigint_from_i64" + nl())
+  sb_push(sb, "    add rsp, 8" + nl())
+  sb_push(sb, "    mov r13, rax" + nl())
+  sb_push(sb, ".DYNP_OP1OK_" + suffix + ":" + nl())
+  sb_push(sb, "    mov r15, 18446462598732840960" + nl())
+  sb_push(sb, "    mov rax, r14" + nl())
+  sb_push(sb, "    and rax, r15" + nl())
+  sb_push(sb, "    cmp rax, 0" + nl())
+  sb_push(sb, "    jne .DYNP_OP2OK_" + suffix + nl())
+  sb_push(sb, "    mov rax, r14" + nl())
+  sb_push(sb, "    shl rax, 16" + nl())
+  sb_push(sb, "    sar rax, 16" + nl())
+  sb_push(sb, "    push rax" + nl())
+  sb_push(sb, "    call rt_bigint_from_i64" + nl())
+  sb_push(sb, "    add rsp, 8" + nl())
+  sb_push(sb, "    mov r14, rax" + nl())
+  sb_push(sb, ".DYNP_OP2OK_" + suffix + ":" + nl())
+  return sb_str(sb)
+end
+
+# Dynamic-mode `+`/`-`/`*`/comparisons (widened from the +-only first
+# cut -- see x64_runtime.patlang's own header above rt_bigint_from_i64
+# for the full scope/history). Both operands are tagged words (fixnum:
+# top 16 bits zero, low 48 bits a signed int; BigInt: family 0x1 tag,
+# low 48 bits a heap address).
+#
+# Arithmetic (+/-/*): fast path is both-fixnum, checked for 48-bit
+# overflow, promoting to BigInt (via the shared promote-both helper)
+# only on genuine overflow. `*` needs the ONE-OPERAND `imul` form
+# (`imul rbx` computes rdx:rax = rax*rbx as a real 128-bit product and
+# sets OF/CF if the result doesn't fit in 64 bits) rather than the
+# two-operand form the plain int path uses -- a two-operand 64-bit
+# `imul` on two ~48-bit-range values can itself silently wrap well
+# before reaching our narrower 48-bit fixnum boundary, giving a wrong
+# overflow verdict. After confirming the product fits in 64 bits (OF
+# clear), the SAME sign-extend round-trip check as +/- narrows it to
+# the actual 48-bit fixnum range.
+#
+# Comparisons: fast path is both-fixnum, plain `cmp`+setcc (no
+# overflow concern). Slow path promotes both operands then calls
+# rt_bigint_cmp (-1/0/1), then reuses the SAME setcc mnemonic against
+# 0 -- rt_bigint_cmp's result sign already encodes the ordering
+# exactly like an integer subtraction would.
+#
 # TAGMASK = top 16 bits set (0xFFFF shl 48) = 18446462598732840960.
-# PAYLOAD_MASK = low 48 bits set ((1 shl 48) - 1) = 281474976710655 --
-# NOT used directly here (rt_bigint_from_i64/rt_bigint_add do their
-# own masking internally); this function only needs TAGMASK, to
-# classify each operand as fixnum-or-not.
-make a function called x64_binop_asm_dynamic returns asm
+# PAYLOAD_MASK = low 48 bits set ((1 shl 48) - 1) = 281474976710655.
+make a function called x64_binop_asm_dynamic takes op returns asm
   let suffix = label_asm_safe(0)
   let sb = sb_new()
   sb_push(sb, "    pop r14" + nl())
@@ -371,62 +481,54 @@ make a function called x64_binop_asm_dynamic returns asm
   sb_push(sb, "    mov rbx, r14" + nl())
   sb_push(sb, "    shl rbx, 16" + nl())
   sb_push(sb, "    sar rbx, 16" + nl())
-  sb_push(sb, "    add rax, rbx" + nl())
-  sb_push(sb, "    mov rcx, rax" + nl())
-  sb_push(sb, "    shl rcx, 16" + nl())
-  sb_push(sb, "    sar rcx, 16" + nl())
-  sb_push(sb, "    cmp rcx, rax" + nl())
-  sb_push(sb, "    jne .DYN_OVERFLOW_" + suffix + nl())
-  sb_push(sb, "    mov r15, 281474976710655" + nl())
-  sb_push(sb, "    and rax, r15" + nl())
-  sb_push(sb, "    jmp .DYN_DONE_" + suffix + nl())
-  sb_push(sb, ".DYN_OVERFLOW_" + suffix + ":" + nl())
-  sb_push(sb, "    mov rax, r13" + nl())
-  sb_push(sb, "    shl rax, 16" + nl())
-  sb_push(sb, "    sar rax, 16" + nl())
-  sb_push(sb, "    push rax" + nl())
-  sb_push(sb, "    call rt_bigint_from_i64" + nl())
-  sb_push(sb, "    add rsp, 8" + nl())
-  sb_push(sb, "    mov r13, rax" + nl())
-  sb_push(sb, "    mov rax, r14" + nl())
-  sb_push(sb, "    shl rax, 16" + nl())
-  sb_push(sb, "    sar rax, 16" + nl())
-  sb_push(sb, "    push rax" + nl())
-  sb_push(sb, "    call rt_bigint_from_i64" + nl())
-  sb_push(sb, "    add rsp, 8" + nl())
-  sb_push(sb, "    mov r14, rax" + nl())
-  sb_push(sb, "    jmp .DYN_BOTHBIG_" + suffix + nl())
+  if x64_is_dynamic_cmp_op(op) then
+    sb_push(sb, "    cmp rax, rbx" + nl())
+    sb_push(sb, "    " + x64_setcc_for_op(op) + " al" + nl())
+    sb_push(sb, "    movzx rax, al" + nl())
+    sb_push(sb, "    jmp .DYN_DONE_" + suffix + nl())
+  else
+    if op == "*" then
+      sb_push(sb, "    imul rbx" + nl())
+      sb_push(sb, "    jo .DYN_OVERFLOW_" + suffix + nl())
+    else
+      if op == "+" then
+        sb_push(sb, "    add rax, rbx" + nl())
+      else
+        sb_push(sb, "    sub rax, rbx" + nl())
+      end
+    end
+    sb_push(sb, "    mov rcx, rax" + nl())
+    sb_push(sb, "    shl rcx, 16" + nl())
+    sb_push(sb, "    sar rcx, 16" + nl())
+    sb_push(sb, "    cmp rcx, rax" + nl())
+    sb_push(sb, "    jne .DYN_OVERFLOW_" + suffix + nl())
+    sb_push(sb, "    mov r15, 281474976710655" + nl())
+    sb_push(sb, "    and rax, r15" + nl())
+    sb_push(sb, "    jmp .DYN_DONE_" + suffix + nl())
+    sb_push(sb, ".DYN_OVERFLOW_" + suffix + ":" + nl())
+    sb_push(sb, x64_dynamic_promote_both_asm(suffix + "O"))
+    sb_push(sb, "    push r13" + nl())
+    sb_push(sb, "    push r14" + nl())
+    sb_push(sb, "    call " + x64_bigint_fn_for_op(op) + nl())
+    sb_push(sb, "    add rsp, 16" + nl())
+    sb_push(sb, "    jmp .DYN_DONE_" + suffix + nl())
+  end
   sb_push(sb, ".DYN_NOTFAST_" + suffix + ":" + nl())
-  sb_push(sb, "    mov r15, 18446462598732840960" + nl())
-  sb_push(sb, "    mov rax, r13" + nl())
-  sb_push(sb, "    and rax, r15" + nl())
-  sb_push(sb, "    cmp rax, 0" + nl())
-  sb_push(sb, "    jne .DYN_OP1OK_" + suffix + nl())
-  sb_push(sb, "    mov rax, r13" + nl())
-  sb_push(sb, "    shl rax, 16" + nl())
-  sb_push(sb, "    sar rax, 16" + nl())
-  sb_push(sb, "    push rax" + nl())
-  sb_push(sb, "    call rt_bigint_from_i64" + nl())
-  sb_push(sb, "    add rsp, 8" + nl())
-  sb_push(sb, "    mov r13, rax" + nl())
-  sb_push(sb, ".DYN_OP1OK_" + suffix + ":" + nl())
-  sb_push(sb, "    mov r15, 18446462598732840960" + nl())
-  sb_push(sb, "    mov rax, r14" + nl())
-  sb_push(sb, "    and rax, r15" + nl())
-  sb_push(sb, "    cmp rax, 0" + nl())
-  sb_push(sb, "    jne .DYN_BOTHBIG_" + suffix + nl())
-  sb_push(sb, "    mov rax, r14" + nl())
-  sb_push(sb, "    shl rax, 16" + nl())
-  sb_push(sb, "    sar rax, 16" + nl())
-  sb_push(sb, "    push rax" + nl())
-  sb_push(sb, "    call rt_bigint_from_i64" + nl())
-  sb_push(sb, "    add rsp, 8" + nl())
-  sb_push(sb, "    mov r14, rax" + nl())
-  sb_push(sb, ".DYN_BOTHBIG_" + suffix + ":" + nl())
-  sb_push(sb, "    push r13" + nl())
-  sb_push(sb, "    push r14" + nl())
-  sb_push(sb, "    call rt_bigint_add" + nl())
-  sb_push(sb, "    add rsp, 16" + nl())
+  sb_push(sb, x64_dynamic_promote_both_asm(suffix + "N"))
+  if x64_is_dynamic_cmp_op(op) then
+    sb_push(sb, "    push r13" + nl())
+    sb_push(sb, "    push r14" + nl())
+    sb_push(sb, "    call rt_bigint_cmp" + nl())
+    sb_push(sb, "    add rsp, 16" + nl())
+    sb_push(sb, "    cmp rax, 0" + nl())
+    sb_push(sb, "    " + x64_setcc_for_op(op) + " al" + nl())
+    sb_push(sb, "    movzx rax, al" + nl())
+  else
+    sb_push(sb, "    push r13" + nl())
+    sb_push(sb, "    push r14" + nl())
+    sb_push(sb, "    call " + x64_bigint_fn_for_op(op) + nl())
+    sb_push(sb, "    add rsp, 16" + nl())
+  end
   sb_push(sb, ".DYN_DONE_" + suffix + ":" + nl())
   sb_push(sb, "    push rax" + nl())
   return sb_str(sb)
@@ -810,15 +912,15 @@ make a function called x64_emit_instr takes instr, func_name, locals, label, flo
             sb_push(sb, x64_binop_asm_float(instr[1]))
           else
             if dynamic_mode then
-              if instr[1] == "+" then
-                sb_push(sb, x64_binop_asm_dynamic())
+              if x64_dynamic_op_supported(instr[1]) then
+                sb_push(sb, x64_binop_asm_dynamic(instr[1]))
               else
-                # Named scope limit (first cut): only `+` gets dynamic
-                # (possibly-BigInt) dispatch this pass -- see
-                # x64_runtime.patlang's own header. Any other operator
-                # inside a dynamic-mode function still compiles as
-                # plain int arithmetic on the raw tagged word, which is
-                # only correct if that operand is actually a fixnum.
+                # Named scope limit: band/bor/bxor/shl/shr/%// still
+                # aren't meaningful on the numeric tower (or aren't
+                # wired up yet), so they compile as plain int
+                # arithmetic on the raw tagged word inside a dynamic-
+                # mode function -- only correct if that operand is
+                # actually a fixnum. See x64_runtime.patlang's header.
                 sb_push(sb, x64_binop_asm(instr[1]))
               end
             else
