@@ -188,9 +188,18 @@ make a function called rt_list_tag returns tag
   return 3 shl 60
 end
 
+# List block format, TWO qwords of header, not one: [length:8]
+# [capacity:8][elements: capacity*8 bytes]. Elements start at offset
+# 16, not 8 -- a real, deliberate format change from the original
+# Slice 4 layout (see rt_list_push's own header for why capacity
+# tracking is necessary, not cosmetic). rt_list_new/BuildList (in
+# codegen_x64.patlang) both allocate TIGHT (capacity == length, no
+# spare room) -- only rt_list_push ever creates a list with genuine
+# spare capacity.
 make a function called rt_list_new takes n returns tagged
-  let addr = rt_heap_alloc(8 + n * 8)
+  let addr = rt_heap_alloc(16 + n * 8)
   mem_poke_qword(addr, 0, n)
+  mem_poke_qword(addr, 8, n)
   return addr bor rt_list_tag()
 end
 
@@ -201,34 +210,76 @@ end
 
 make a function called rt_list_get takes l, i returns value
   let addr = l band rt_payload_mask()
-  return mem_peek_qword(addr, 8 + i * 8)
+  return mem_peek_qword(addr, 16 + i * 8)
 end
 
 make a function called rt_list_set takes l, i, v returns done
   let addr = l band rt_payload_mask()
-  mem_poke_qword(addr, 8 + i * 8, v)
+  mem_poke_qword(addr, 16 + i * 8, v)
   return true
 end
 
-# Growable lists: list_push(list, item) -> NEW list with item appended
-# (matches the interpreter's own list_push exactly -- functional,
-# not in-place, per rust-runtime/src/ir/codegen.rs's own
-# `Arc::make_mut(&mut xs).push(...)` semantics). Reallocate-and-copy,
-# entirely ordinary PatLang using the existing rt_heap_alloc bump
-# allocator -- no new native primitives needed at all, unlike file
-# I/O/exec below. This closes the "fixed-size only" gap named back in
-# Slice 4's own header and carried since.
+# Growable lists: list_push(list, item) -> a list with item appended.
+#
+# REAL PERFORMANCE BUG found and fixed here (not by review -- by an
+# actual self-compile attempt burning 20+ CPU-minutes on ~10K lines
+# of the compiler's own source before being killed): the original
+# version always reallocated a tightly-sized block and copied EVERY
+# existing element on EVERY push, an O(n) cost per call -- meaning a
+# loop that accumulates N items one push at a time (exactly how
+# lexer.patlang builds its token list, one token per push) costs
+# O(n^2) total. The interpreter's own list_push is O(1) amortized
+# (`Arc::make_mut(&mut xs).push(...)` -- Rust's Vec grows by
+# doubling, and Arc::make_mut only copies when the list is actually
+# SHARED, mutating in place otherwise). Fixed by tracking real spare
+# CAPACITY in the block header (see the format comment above) and
+# growing geometrically (doubling) only when capacity is exhausted,
+# mutating in place (bumping length, writing into already-reserved
+# space) whenever there's room.
+#
+# NAMED, DELIBERATE SEMANTIC DEVIATION from the interpreter's own
+# safety guarantee: Arc::make_mut only mutates in place when the
+# reference count is 1 (i.e. provably unshared), copying otherwise --
+# this backend has NO reference counting at all, so it cannot tell
+# whether an older list value still aliases the same block. The
+# in-place growth path here is therefore only PROBABLY safe, not
+# PROVABLY safe: it's correct for the dominant, realistic pattern
+# (`let xs = list_push(xs, item)` accumulated in a loop, where the
+# old binding is never read again), but a program that keeps an OLDER
+# list reference around, then pushes onto a chain descended from it
+# MULTIPLE times while that older reference still has spare capacity,
+# could observe the older reference's contents change underneath it.
+# This tradeoff is deliberate -- realistic performance for the
+# overwhelmingly common accumulation pattern (needed for self-hosting
+# at all) over perfect aliasing safety for a rarer divergent-branches
+# pattern. x64_growable_list_demo.patlang's own "the original list
+# stays length 0" check still passes (it never re-reads a list that
+# was later pushed onto), but is not a general proof of safety.
 make a function called rt_list_push takes l, v returns tagged
   let addr = l band rt_payload_mask()
   let n = mem_peek_qword(addr, 0)
-  let new_addr = rt_heap_alloc(8 + (n + 1) * 8)
+  let cap = mem_peek_qword(addr, 8)
+  if n < cap then
+    mem_poke_qword(addr, 16 + n * 8, v)
+    mem_poke_qword(addr, 0, n + 1)
+    return l
+  end
+  let new_cap = cap * 2
+  if new_cap < 1 then
+    let new_cap = 1
+  end
+  if new_cap < n + 1 then
+    let new_cap = n + 1
+  end
+  let new_addr = rt_heap_alloc(16 + new_cap * 8)
   mem_poke_qword(new_addr, 0, n + 1)
+  mem_poke_qword(new_addr, 8, new_cap)
   let i = 0
   while i < n do
-    mem_poke_qword(new_addr, 8 + i * 8, mem_peek_qword(addr, 8 + i * 8))
+    mem_poke_qword(new_addr, 16 + i * 8, mem_peek_qword(addr, 16 + i * 8))
     let i = i + 1
   end
-  mem_poke_qword(new_addr, 8 + n * 8, v)
+  mem_poke_qword(new_addr, 16 + n * 8, v)
   return new_addr bor rt_list_tag()
 end
 
