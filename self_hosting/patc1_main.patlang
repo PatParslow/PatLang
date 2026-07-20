@@ -33,11 +33,39 @@
 # closures, no numeric tower/BigInt/Rational/Object/facts-and-rules) is
 # supported -- anything outside that subset is a clear compile-time
 # error from codegen_x64.patlang itself, not silently wrong output.
-# lib/x64_runtime.patlang (the runtime, itself ordinary PatLang) is
-# automatically prepended to the input source, exactly mirroring how
-# the rustc path's own runtime prelude is always included -- callers
-# don't need to `include` it themselves.
+#
+# SEPARATE COMPILATION (chunk link, not textual concatenation): the
+# input program is compiled ALONE (never prepended with
+# x64_runtime.patlang's own source the way earlier revisions of this
+# file did), then linked against an ALREADY-BUILT, fingerprint-cached
+# self_hosting/build/x64_runtime.obj (see build_x64_runtime.patlang --
+# run that once, separately, before using --x64; this file does NOT
+# auto-rebuild it, matching how patc1.exe itself must already exist
+# before patc1_main.patlang can run at all). This is what keeps an
+# ordinary small program's own --x64 compile fast regardless of how
+# large x64_runtime.patlang grows: the runtime's own codegen only ever
+# happens once per source change, not once per program compiled
+# against it (the previous whole-source-concatenation design forced a
+# full re-codegen of the ENTIRE runtime on every single --x64 compile,
+# a real, measured slowdown once the runtime grew past a few hundred
+# lines -- see patlang-x64-chunk-linking memory for the full story).
+# The runtime's own function-name list (needed so the program chunk
+# knows what to `extern`, see emit_program_x64's own header) is
+# re-derived by lexing+parsing (NOT full codegen -- cheap) x64_runtime.
+# patlang fresh on every --x64 invocation.
 # =============================================================================
+
+make a function called x64_name_in_list takes names, name returns yes
+  let n = names.length
+  let i = 0
+  while i < n do
+    if names[i] == name then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
 
 let args = argv()
 if args.length < 2 then
@@ -54,22 +82,68 @@ else
       let use_x64 = true
     end
   end
+  let runtime_obj = "F:/PatLang/self_hosting/build/x64_runtime.obj"
+  let lower_source = source
   if use_x64 then
-    let rt_src = read_file("F:/PatLang/self_hosting/lib/x64_runtime.patlang")
-    let source = rt_src + chr(10) + source
+    if file_exists(runtime_obj) == "1" then
+      # The lowerer resolves Call vs CallHost by whether it sees a
+      # matching function DEFINITION in the SAME compilation unit --
+      # it has no notion of "resolved later via linking". So the
+      # combined (runtime + program) text still has to be lexed/
+      # parsed/lowered TOGETHER for correct call resolution, even
+      # though the runtime's own .obj is separately cached -- lexing/
+      # parsing is cheap (not the cost this split exists to avoid);
+      # only CODEGEN (below, x64_collect_runtime_names/the emit_
+      # program_x64 split) skips redoing the runtime's own work.
+      let rt_src = read_file("F:/PatLang/self_hosting/lib/x64_runtime.patlang")
+      let lower_source = rt_src + chr(10) + source
+    end
   end
-  let toks = tokenize(source)
+  let toks = tokenize(lower_source)
   let ast = parse_program(toks)
   let stmts = ast[1]
   let err = parse_find_error(stmts)
   if err[0] != "" then
-    print(format_parse_error(err[0], err[1], source))
+    print(format_parse_error(err[0], err[1], lower_source))
   else
     let ir = lower_program(ast)
     if use_x64 then
-      let asm = emit_program_x64(ir)
-      let exe = x64_build(asm, output)
-      print("patc1: " + exe)
+      let runtime_names_file = "F:/PatLang/self_hosting/build/x64_runtime.funcs"
+      if file_exists(runtime_obj) == "1" then
+        # Cached manifest (written by build_x64_runtime.patlang),
+        # NOT a second lex/parse/lower of x64_runtime.patlang -- doing
+        # that a second time here (on top of the COMBINED parse just
+        # above, unavoidable for correct Call/CallHost resolution) was
+        # pure redundant cost that turned out to dominate a small
+        # demo's whole compile time in testing.
+        let rt_names = split_lines(read_file(runtime_names_file))
+        # Split the COMBINED ir's funcs by name: anything the runtime
+        # itself defines (except "main" -- x64_runtime.patlang has no
+        # meaningful top-level code of its own, but lower_program
+        # synthesizes an empty main for every source unit regardless,
+        # which must never compete with the program's own real one)
+        # was already compiled into runtime_obj by
+        # build_x64_runtime.patlang; only the PROGRAM's own functions
+        # need fresh codegen here.
+        let all_funcs = ir[2]
+        let program_funcs = []
+        let pfi = 0
+        let pf_count = all_funcs.length
+        while pfi < pf_count do
+          let fname = all_funcs[pfi][1]
+          if not x64_name_in_list(rt_names, fname) then
+            let program_funcs = list_push(program_funcs, all_funcs[pfi])
+          end
+          let pfi = pfi + 1
+        end
+        let program_ir = [ir[0], ir[1], program_funcs, ir[3]]
+        let asm = emit_program_x64(program_ir, false, rt_names)
+        let exe = x64_build_linked(asm, runtime_obj, output)
+        print("patc1: " + exe)
+      else
+        print("patc1: --x64 needs self_hosting/build/x64_runtime.obj -- run:")
+        print("  pat --ir-run self_hosting/build_x64_runtime.patlang")
+      end
     else
       let rs = emit_program_rs(ir)
       if args.length >= 4 then

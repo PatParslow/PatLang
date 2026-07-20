@@ -1,0 +1,87 @@
+# build_x64_runtime.patlang -- compiles x64_runtime.patlang ALONE into
+# a cached runtime.obj, the "chunk link" fix for the demo-compile
+# slowdown that came from x64_runtime.patlang being textually
+# concatenated into EVERY --x64 compile and re-codegen'd from scratch
+# every time (see emit_program_x64's own header in codegen_x64.patlang
+# for the owns_globals/extern_names split this depends on, and
+# patlang-x64-primitive-gap-closure memory for the growth that made
+# this pay off). Mirrors build_patc1.patlang's own fingerprint-cache
+# pattern exactly: hash the runtime source, skip the whole lex/parse/
+# lower/codegen/nasm pass when unchanged and the cached .obj already
+# exists.
+#
+# Run from the repo root:
+#   rust-runtime/target/release/pat --ir-run self_hosting/build_x64_runtime.patlang
+# Produces self_hosting/build/x64_runtime.obj, which patc1_main.patlang's
+# --x64 path then links against every program chunk's own .obj.
+
+include "lib/lexer.patlang"
+include "lib/parser.patlang"
+include "lib/lower.patlang"
+include "lib/codegen_x64.patlang"
+include "lib/x64_build.patlang"
+
+let rt_src = read_file("self_hosting/lib/x64_runtime.patlang")
+let fingerprint_file = "self_hosting/build/x64_runtime.fingerprint"
+let obj_path = "self_hosting/build/x64_runtime.obj"
+let fingerprint = hash_string(rt_src)
+let up_to_date = false
+if (file_exists(fingerprint_file) == "1") and (file_exists(obj_path) == "1") then
+  if read_file(fingerprint_file) == fingerprint then
+    let up_to_date = true
+  end
+end
+
+if up_to_date then
+  print("[cache] x64_runtime.obj unchanged, skipping rebuild")
+else
+  let toks = tokenize(rt_src)
+  let ast = parse_program(toks)
+  let err = parse_find_error(ast[1])
+  if err[0] != "" then
+    print(format_parse_error(err[0], err[1], rt_src))
+  else
+    let ir = lower_program(ast)
+    # lower_program synthesizes an (empty, since x64_runtime.patlang
+    # has no top-level executable code of its own) "main" for every
+    # source unit regardless -- must be dropped here, since the
+    # PROGRAM chunk always defines the real one, and NASM/ld would
+    # reject two chunks both defining the same global symbol.
+    let all_funcs = ir[2]
+    let rt_funcs = []
+    let fi = 0
+    let f_count = all_funcs.length
+    while fi < f_count do
+      if all_funcs[fi][1] != "main" then
+        let rt_funcs = list_push(rt_funcs, all_funcs[fi])
+      end
+      let fi = fi + 1
+    end
+    let rt_ir = [ir[0], ir[1], rt_funcs, ir[3]]
+    let asm = emit_program_x64(rt_ir, true, [])
+    let asm_path = "self_hosting/build/x64_runtime.asm"
+    let result = x64_assemble(asm, asm_path, obj_path)
+    if x64_build_contains(result, "NASM ERROR:") then
+      print(result)
+    else
+      write_file(fingerprint_file, fingerprint)
+      # Cached function-name manifest, one per line -- lets
+      # patc1_main.patlang's --x64 path skip re-lexing/parsing/
+      # lowering x64_runtime.patlang a SECOND time (once combined with
+      # the program for correct Call/CallHost resolution is
+      # unavoidable, but a second standalone pass just to recover this
+      # same name list was pure redundant cost, and turned out to
+      # dominate a small demo's whole compile time).
+      let names_sb = sb_new()
+      let ni = 0
+      let n_count = rt_funcs.length
+      while ni < n_count do
+        sb_push(names_sb, rt_funcs[ni][1])
+        sb_push(names_sb, chr(10))
+        let ni = ni + 1
+      end
+      write_file("self_hosting/build/x64_runtime.funcs", sb_str(names_sb))
+      print("[build] x64_runtime.obj: " + obj_path)
+    end
+  end
+end
