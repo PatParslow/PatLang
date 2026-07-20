@@ -157,6 +157,505 @@ make a function called rt_print_str takes s returns done
   return true
 end
 
+# ---- shadowing host primitives (Slice 8 continued): sb_new/sb_push/
+# sb_str, to_num, chr, substr, str_intern/sc_len/sc_code/sc_char ----
+#
+# These are ORDINARY PatLang functions sharing their exact names with
+# Rust host primitives (rust-runtime/src/ir/hosts.rs) the x64 backend's
+# x64_callhost_asm never natively supported -- confirmed (a dedicated
+# shadow test, x64_shadow_test.patlang, compiled+run via --x64) that
+# the lowerer only emits a CallHost for a name with NO user-level
+# definition in scope, so defining these here (this file is ONLY ever
+# prepended for --x64 compiles, so this can't affect the rustc-text
+# backend or interpreter's own, correct, existing host functions) makes
+# ORDINARY function-call codegen handle them -- no new hand-assembled
+# asm needed for any of these (mem_sb_table_addr, added to
+# codegen_x64.patlang's x64_callhost_asm alongside this, is the one
+# genuinely new native primitive this whole batch needed). Each mirrors
+# its Rust counterpart's semantics as closely as makes sense for this
+# backend's actual tagged-value representation (fixnum-or-family-tag,
+# not Rust's richer Value enum) -- documented per-function below.
+
+# StringBuilder. Rust's host_sb_push has a fire-and-forget contract
+# (returns Unit; existing call sites everywhere in codegen_x64.patlang
+# do `sb_push(sb, "...")` as a bare statement, never `let sb =
+# sb_push(...)`) -- so a handle's IDENTITY must survive across pushes
+# even when its backing storage grows, unlike rt_list_push's own
+# "caller rebinds the return value" contract. Design: a persistent
+# global table (g_sb_table, an ordinary PatLang List value stored
+# through the one dedicated .bss slot mem_sb_table_addr() -- see that
+# primitive's own header in codegen_x64.patlang) holds each
+# StringBuilder's CURRENT entry address; sb_new appends a fresh entry
+# and returns its stable INDEX as the handle; sb_push looks the entry
+# up by index, grows it (same amortized-doubling discipline as
+# rt_list_push -- mutate in place when there's room, else reallocate),
+# and writes the new address back into the table via rt_list_set ONLY
+# when reallocation actually happened, so the handle (the table index)
+# never needs to change.
+make a function called sb_new returns handle
+  let table_addr = mem_sb_table_addr()
+  let table = mem_peek_qword(table_addr, 0)
+  if table == 0 then
+    let table = rt_list_new(0)
+    mem_poke_qword(table_addr, 0, table)
+  end
+  let cap = 64
+  let entry = rt_heap_alloc(16 + cap)
+  mem_poke_qword(entry, 0, 0)
+  mem_poke_qword(entry, 8, cap)
+  let new_table = rt_list_push(table, entry)
+  mem_poke_qword(table_addr, 0, new_table)
+  return rt_list_len(new_table) - 1
+end
+
+make a function called sb_push takes handle, text returns done
+  let table = mem_peek_qword(mem_sb_table_addr(), 0)
+  let entry = rt_list_get(table, handle)
+  let src = text band rt_payload_mask()
+  let n = mem_peek_qword(src, 0)
+  let len = mem_peek_qword(entry, 0)
+  let cap = mem_peek_qword(entry, 8)
+  if len + n <= cap then
+    let i = 0
+    while i < n do
+      mem_poke_byte(entry, 16 + len + i, mem_peek_byte(src, 8 + i))
+      let i = i + 1
+    end
+    mem_poke_qword(entry, 0, len + n)
+    return true
+  end
+  let new_cap = cap * 2
+  if new_cap < len + n then
+    let new_cap = len + n
+  end
+  let new_entry = rt_heap_alloc(16 + new_cap)
+  mem_poke_qword(new_entry, 0, len + n)
+  mem_poke_qword(new_entry, 8, new_cap)
+  let i = 0
+  while i < len do
+    mem_poke_byte(new_entry, 16 + i, mem_peek_byte(entry, 16 + i))
+    let i = i + 1
+  end
+  let j = 0
+  while j < n do
+    mem_poke_byte(new_entry, 16 + len + j, mem_peek_byte(src, 8 + j))
+    let j = j + 1
+  end
+  rt_list_set(table, handle, new_entry)
+  return true
+end
+
+# Clones the buffer's current content into a fresh tagged string
+# (matching Rust's `.clone()` sb_str -- safe to keep pushing to the same
+# handle afterward, even though no existing call site actually does).
+make a function called sb_str takes handle returns s
+  let table = mem_peek_qword(mem_sb_table_addr(), 0)
+  let entry = rt_list_get(table, handle)
+  let len = mem_peek_qword(entry, 0)
+  let result = rt_heap_alloc(8 + len)
+  mem_poke_qword(result, 0, len)
+  let i = 0
+  while i < len do
+    mem_poke_byte(result, 8 + i, mem_peek_byte(entry, 16 + i))
+    let i = i + 1
+  end
+  return result bor rt_string_tag()
+end
+
+# to_num(v): if v is already numeric (fixnum, or ANY Numeric-family
+# tagged value -- BigInt/Rational/Complex/Interval), returns it
+# unchanged, matching Rust's own "preserve the value's own numeric
+# kind" behaviour. If v is a String, parses it as an integer (ASCII
+# digits, optional leading '-'). Scope limit, named deliberately: no
+# float-string parsing -- every ACTUAL to_num call site in this
+# backend's own source (44 in codegen_x64.patlang) converts something
+# already integer-valued (list lengths, arg counts, IR field text), so
+# this is a real behavioural match for how it's actually used here, not
+# a full reimplementation of Rust's more general host_to_num.
+#
+# Classifies by the top NIBBLE (bits 60-63), not the whole 16-bit tag --
+# a REAL bug caught here (segfault in print(), same root cause):
+# negative fixnums computed by NON-dynamic-mode code (plain `sub`, never
+# masked back to the canonical "top 16 bits always zero" tagged form the
+# way dynamic-mode arithmetic explicitly does) are raw 64-bit two's-
+# complement, so their top 16 bits read as 0xFFFF (sign-extended), not
+# 0x0000. A 16-bit-tag check for "== 0" misses every negative plain-mode
+# fixnum. The top NIBBLE alone is unambiguous: real family selectors are
+# only 1 (Numeric)/2 (String)/3 (List)/4 (Closure)/5 (Object), so nibble
+# 0xF can ONLY be this sign-extension leak, never a genuine tagged
+# family -- safe to treat identically to nibble 0 (clean fixnum).
+make a function called to_num takes v returns n
+  let nibble = (v shr 60) band 15
+  if nibble == 0 then
+    return v
+  end
+  if nibble == 15 then
+    return v
+  end
+  if nibble == 1 then
+    return v
+  end
+  let addr = v band rt_payload_mask()
+  let len = mem_peek_qword(addr, 0)
+  let i = 0
+  let neg = false
+  if len > 0 then
+    if mem_peek_byte(addr, 8) == 45 then
+      let neg = true
+      let i = 1
+    end
+  end
+  let acc = 0
+  while i < len do
+    let d = mem_peek_byte(addr, 8 + i)
+    if d >= 48 then
+      if d <= 57 then
+        let acc = acc * 10 + (d - 48)
+      end
+    end
+    let i = i + 1
+  end
+  if neg then
+    return 0 - acc
+  end
+  return acc
+end
+
+# chr(n) -> 1-byte string (empty for n < 0). Single-byte only (this
+# backend's strings are plain bytes throughout, no UTF-8 handling
+# anywhere else either) -- matches the actual need everywhere this is
+# used (building single ASCII characters like quotes/newlines), not
+# Rust's fuller Unicode char support. Supersedes the "this backend has
+# no chr() primitive" workaround rt_dquote_str's own header used to
+# note; that function is left as-is (already correct), just no longer
+# the only way to build a 1-byte string.
+make a function called chr takes n returns s
+  if n < 0 then
+    let result = rt_heap_alloc(8)
+    mem_poke_qword(result, 0, 0)
+    return result bor rt_string_tag()
+  end
+  let result = rt_heap_alloc(9)
+  mem_poke_qword(result, 0, 1)
+  mem_poke_byte(result, 8, n)
+  return result bor rt_string_tag()
+end
+
+# substr(s, start, count) -> byte slice, clamped to the string's actual
+# length (matching Rust's ASCII-path clamping: `st = start.min(len)`,
+# `en = (st+count).min(len)`).
+make a function called substr takes s, start, count returns result
+  let addr = s band rt_payload_mask()
+  let len = mem_peek_qword(addr, 0)
+  let st = start
+  if st > len then
+    let st = len
+  end
+  let en = st + count
+  if en > len then
+    let en = len
+  end
+  let n = en - st
+  let result = rt_heap_alloc(8 + n)
+  mem_poke_qword(result, 0, n)
+  let i = 0
+  while i < n do
+    mem_poke_byte(result, 8 + i, mem_peek_byte(addr, 8 + st + i))
+    let i = i + 1
+  end
+  return result bor rt_string_tag()
+end
+
+# str_intern/sc_len/sc_code/sc_char: Rust's versions hand out a stable
+# integer id into a global interned-string TABLE so a hot scanning loop
+# (the lexer indexes the whole source per character) never re-clones a
+# Value::String local on every access. This backend has no such cloning
+# cost to avoid (strings are already heap blocks referenced by address,
+# not deep-copied per access) -- confirmed via lexer.patlang's own
+# usage (the ONLY call site in the whole self-hosted compiler source):
+# str_intern is called EXACTLY ONCE per tokenize() call, and the
+# returned handle is used only within that same call, never crossing
+# into another function or needing to persist. So the "handle" can just
+# BE the string's own masked address -- no table, no id-to-entry
+# lookup, nothing to grow or manage. A deliberately simpler, still
+# fully general, implementation (works correctly regardless of how many
+# strings are ever interned or how many times), not a scope-limited one.
+make a function called str_intern takes s returns handle
+  return s band rt_payload_mask()
+end
+
+make a function called sc_len takes handle returns len
+  return mem_peek_qword(handle, 0)
+end
+
+make a function called sc_code takes handle, i returns code
+  let len = mem_peek_qword(handle, 0)
+  if i < len then
+    return mem_peek_byte(handle, 8 + i)
+  end
+  return 0 - 1
+end
+
+make a function called sc_char takes handle, i returns s
+  let len = mem_peek_qword(handle, 0)
+  if i < len then
+    return chr(mem_peek_byte(handle, 8 + i))
+  end
+  let result = rt_heap_alloc(8)
+  mem_poke_qword(result, 0, 0)
+  return result bor rt_string_tag()
+end
+
+# vec_new/vec_push/vec_get/vec_set/vec_len/vec_to_list: Rust's
+# "handle-based builder" for O(1) push/index on large collections
+# (rust-runtime/src/ir/hosts.rs's VECS thread-local), used by
+# lexer.patlang to accumulate its token list (`vec_push(tokens,
+# item)`, called as a bare statement -- same fire-and-forget contract
+# as sb_push, so this needs the EXACT same "stable handle across
+# growth" design as sb_new/sb_push/sb_str above (see that block's own
+# header for the full reasoning: a naive address-as-handle design
+# breaks the moment growth reallocates, since existing call sites never
+# rebind the handle). Simpler than sb_* though: each entry here is an
+# ORDINARY PatLang List (not a hand-rolled byte buffer), so entry
+# growth just reuses the ALREADY O(1)-amortized rt_list_push directly
+# -- no byte-copying logic to write. vec_to_list needs no copy either:
+# a PatLang List IS already this backend's native list representation,
+# so returning the entry's current tagged value as-is is correct (same
+# "handle out, no more pushes expected afterward" idiom the ACTUAL
+# lexer.patlang call site follows: vec_to_list(tokens) is always the
+# LAST thing done with a given vec handle).
+make a function called vec_new returns handle
+  let table_addr = mem_vec_table_addr()
+  let table = mem_peek_qword(table_addr, 0)
+  if table == 0 then
+    let table = rt_list_new(0)
+    mem_poke_qword(table_addr, 0, table)
+  end
+  let entry = rt_list_new(0)
+  let new_table = rt_list_push(table, entry)
+  mem_poke_qword(table_addr, 0, new_table)
+  return rt_list_len(new_table) - 1
+end
+
+make a function called vec_push takes handle, item returns done
+  let table = mem_peek_qword(mem_vec_table_addr(), 0)
+  let entry = rt_list_get(table, handle)
+  let new_entry = rt_list_push(entry, item)
+  rt_list_set(table, handle, new_entry)
+  return true
+end
+
+make a function called vec_get takes handle, idx returns value
+  let table = mem_peek_qword(mem_vec_table_addr(), 0)
+  let entry = rt_list_get(table, handle)
+  return rt_list_get(entry, idx)
+end
+
+make a function called vec_set takes handle, idx, item returns done
+  let table = mem_peek_qword(mem_vec_table_addr(), 0)
+  let entry = rt_list_get(table, handle)
+  rt_list_set(entry, idx, item)
+  return true
+end
+
+make a function called vec_len takes handle returns n
+  let table = mem_peek_qword(mem_vec_table_addr(), 0)
+  let entry = rt_list_get(table, handle)
+  return rt_list_len(entry)
+end
+
+make a function called vec_to_list takes handle returns l
+  let table = mem_peek_qword(mem_vec_table_addr(), 0)
+  return rt_list_get(table, handle)
+end
+
+# char_code(s, idx) -> ASCII byte at idx, or -1 if out of range. Same
+# shape as sc_code, but takes a plain (tagged) string directly rather
+# than an interned handle.
+make a function called char_code takes s, idx returns code
+  let addr = s band rt_payload_mask()
+  let len = mem_peek_qword(addr, 0)
+  if idx < len then
+    return mem_peek_byte(addr, 8 + idx)
+  end
+  return 0 - 1
+end
+
+# print(v): genuinely value-polymorphic, NOT string-only. Real bug
+# caught here (segfault, not a compile-time warning): x64_runtime.
+# patlang is prepended to EVERY --x64 compile, not just the bundled
+# compiler source's own (all-string) print(...) call sites -- so a
+# string-only print silently became the print for every OTHER x64
+# program too, including ones that print plain numbers directly (e.g.
+# x64_codegen_demo_baseline.patlang's `print(total)`). Passing a raw
+# fixnum into rt_print_str (which treats its argument as a string's
+# masked HEAP ADDRESS) reads garbage memory as if it were a
+# [length][bytes] block -- an immediate segfault, not a graceful
+# failure. Dispatches on the family tag like x64_binop_asm_dynamic
+# does: fixnum -> rt_int_to_str, String -> print directly, BigInt/
+# Rational/Complex/Interval -> their own *_to_string helper (all
+# already exist, built for the numeric-tower demos). List/Object/
+# Closure fall back to a fixed placeholder rather than attempting real
+# pretty-printing (not exercised by any known caller; a placeholder is
+# safe, a crash is not).
+make a function called print takes v returns done
+  let family_mask = 17293822569102704640
+  let family = v band family_mask
+  if family == 0 then
+    return rt_print_str(rt_int_to_str(v))
+  end
+  # Sign-extension leak from non-dynamic-mode arithmetic (see to_num's
+  # own header for the full explanation) -- family_mask IS all four
+  # nibble bits, so a value that's genuinely all-ones there (rather than
+  # a real family selector, which only ever uses 1-5) is a raw negative
+  # fixnum that was never re-masked to the canonical zero-tag form.
+  if family == family_mask then
+    return rt_print_str(rt_int_to_str(v))
+  end
+  let string_family = 2305843009213693952
+  if family == string_family then
+    return rt_print_str(v)
+  end
+  let bigint_family = 1152921504606846976
+  if family == bigint_family then
+    return rt_print_str(rt_bigint_to_string(v))
+  end
+  let rational_family = 1153765929536978944
+  if family == rational_family then
+    return rt_print_str(rt_rational_to_string(v))
+  end
+  let complex_family = 1154891829443821568
+  if family == complex_family then
+    return rt_print_str(rt_complex_to_string(v))
+  end
+  let interval_family = 1157425104234217472
+  if family == interval_family then
+    return rt_print_str(rt_interval_to_string(v))
+  end
+  return rt_print_str("<value>")
+end
+
+# Byte-content string equality -- NOT the same as `==`, which on tagged
+# String values is raw ADDRESS identity (x64_binop_asm_dynamic's
+# .DYN_OBJ_ branch, deliberate scope limit documented there). Two
+# separately-interned or separately-allocated strings with identical
+# text are NOT `==` in this backend, so set_var/get's string-keyed
+# lookup below needs a real content comparison, not `==`.
+make a function called rt_str_eq takes a, b returns eq
+  let addr_a = a band rt_payload_mask()
+  let addr_b = b band rt_payload_mask()
+  let len_a = mem_peek_qword(addr_a, 0)
+  let len_b = mem_peek_qword(addr_b, 0)
+  if len_a != len_b then
+    return false
+  end
+  let i = 0
+  while i < len_a do
+    if mem_peek_byte(addr_a, 8 + i) != mem_peek_byte(addr_b, 8 + i) then
+      return false
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+# set_var(key, value) / get(store, key): the bundled compiler source
+# uses these ONLY as a small global named-counter store (checked every
+# call site: lower.patlang's closure/budgeted/activate sequence
+# counters, codegen_x64.patlang's string/CallValue label counters --
+# always numeric values, always `get("__vars", key)` with the literal
+# store name "__vars"). Genuinely general (any string key, any value,
+# any store name is accepted, just always compared by content not
+# identity) but scoped to what's actually needed: a single global
+# linear-scan key/value store (two parallel persistent-table entries,
+# same g_*_table/mem_*_table_addr pattern as sb_*/vec_*), not a
+# multi-namespace object system. `store` is accepted but not used to
+# select between namespaces -- every actual call site passes the same
+# "__vars" literal, so a second global for a different store name has
+# never been observed and isn't implemented; get on an unset key
+# returns 0 (matches how every actual key is initialized via set_var
+# before its first get, e.g. lower.patlang:629 `set_var("__closure_seq",
+# 0)`), not Rust's Unit/nil.
+make a function called set_var takes key, value returns done
+  let table_addr = mem_vars_table_addr()
+  let table = mem_peek_qword(table_addr, 0)
+  if table == 0 then
+    let keys = rt_list_new(0)
+    let vals = rt_list_new(0)
+    let table = rt_list_new(2)
+    rt_list_set(table, 0, keys)
+    rt_list_set(table, 1, vals)
+    mem_poke_qword(table_addr, 0, table)
+  end
+  let keys = rt_list_get(table, 0)
+  let vals = rt_list_get(table, 1)
+  let n = rt_list_len(keys)
+  let i = 0
+  while i < n do
+    if rt_str_eq(rt_list_get(keys, i), key) then
+      rt_list_set(vals, i, value)
+      return true
+    end
+    let i = i + 1
+  end
+  let new_keys = rt_list_push(keys, key)
+  let new_vals = rt_list_push(vals, value)
+  rt_list_set(table, 0, new_keys)
+  rt_list_set(table, 1, new_vals)
+  return true
+end
+
+make a function called get takes store, key returns value
+  let table = mem_peek_qword(mem_vars_table_addr(), 0)
+  if table == 0 then
+    return 0
+  end
+  let keys = rt_list_get(table, 0)
+  let vals = rt_list_get(table, 1)
+  let n = rt_list_len(keys)
+  let i = 0
+  while i < n do
+    if rt_str_eq(rt_list_get(keys, i), key) then
+      return rt_list_get(vals, i)
+    end
+    let i = i + 1
+  end
+  return 0
+end
+
+# floor(v): fixnum/BigInt pass through unchanged (already integers,
+# matching Rust's own `Value::Int(_) | Value::BigInt(_) => v.clone()`);
+# Rational computes real floor division on [numerator][denominator]
+# (matches Rust's exact BigInt-based floor, not a lossy float
+# round-trip): q = n/d truncated toward zero (this backend's `/` is
+# native idiv, truncating), then if there's a nonzero remainder AND n
+# is negative, subtract 1 (truncation rounds toward zero, i.e. UP for
+# negative operands, so it overshoots floor by exactly one in that
+# case). Named scope limit: Complex/Interval/Float have no floor
+# implemented here (this backend's only actual caller,
+# x64_codegen_demo_baseline.patlang, only ever floors a fixnum-or-
+# Rational division result) -- falls through to "unchanged" for
+# anything else rather than erroring, a safe default.
+make a function called floor takes v returns result
+  let family_mask = 17293822569102704640
+  let family = v band family_mask
+  let rational_family = 1153765929536978944
+  if family == rational_family then
+    let addr = v band rt_payload_mask()
+    let n = mem_peek_qword(addr, 0)
+    let d = mem_peek_qword(addr, 8)
+    let q = n / d
+    let r = n - q * d
+    if r != 0 then
+      if n < 0 then
+        return q - 1
+      end
+    end
+    return q
+  end
+  return v
+end
+
 # ---- lists (Slice 4, TAGGED as of the closures/strings/lists tagging
 # migration) ----
 #

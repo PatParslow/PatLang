@@ -1572,6 +1572,50 @@ end
 # name would silently change PatLang's own observable semantics, so
 # list construction/mutation stays under its own explicit rt_list_*
 # names instead.
+# .length property-access syntax lowers straight to CallHost("len", 1)
+# in the LOWERER itself, bypassing ordinary name resolution entirely --
+# unlike sb_push/to_num/chr/substr/str_intern/sc_len (all shadowable by
+# an ordinary same-named PatLang function, see x64_runtime.patlang's own
+# header on this), this one genuinely needs native codegen here. Matches
+# host_len's Rust semantics (rust-runtime/src/ir/hosts.rs:438): String ->
+# byte length (this backend's strings are byte-only, no separate char
+# count needed), List -> element count, Object -> field count, anything
+# else -> 0.
+make a function called x64_len_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    mov rcx, 17293822569102704640" + x64_nl_char())
+  sb_push(sb, "    mov rdx, rax" + x64_nl_char())
+  sb_push(sb, "    and rdx, rcx" + x64_nl_char())
+  sb_push(sb, "    mov rcx, 2305843009213693952" + x64_nl_char())
+  sb_push(sb, "    cmp rdx, rcx" + x64_nl_char())
+  sb_push(sb, "    je .LEN_STRLIST_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rcx, 3458764513820540928" + x64_nl_char())
+  sb_push(sb, "    cmp rdx, rcx" + x64_nl_char())
+  sb_push(sb, "    je .LEN_STRLIST_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rcx, 5764607523034234880" + x64_nl_char())
+  sb_push(sb, "    cmp rdx, rcx" + x64_nl_char())
+  sb_push(sb, "    je .LEN_OBJ_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rax, 0" + x64_nl_char())
+  sb_push(sb, "    jmp .LEN_DONE_" + suffix + x64_nl_char())
+  # String's length lives at [addr+0]; List's ALSO lives at [addr+0]
+  # (both formats start with an 8-byte length field -- see rt_str_len/
+  # rt_list_len's own layout comments) -- same masked-read either way.
+  sb_push(sb, ".LEN_STRLIST_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rcx, 281474976710655" + x64_nl_char())
+  sb_push(sb, "    and rax, rcx" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rax]" + x64_nl_char())
+  sb_push(sb, "    jmp .LEN_DONE_" + suffix + x64_nl_char())
+  sb_push(sb, ".LEN_OBJ_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    call rt_object_field_count" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, ".LEN_DONE_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
 make a function called x64_callhost_asm takes name, argc returns asm
   let sb = sb_new()
   if name == "list_get" then
@@ -1626,6 +1670,33 @@ make a function called x64_callhost_asm takes name, argc returns asm
       else
       if name == "mem_heap_state_addr" then
         sb_push(sb, "    lea rax, [rel g_heap_state]" + x64_nl_char())
+        sb_push(sb, "    push rax" + x64_nl_char())
+      else
+      if name == "len" then
+        sb_push(sb, x64_len_asm())
+      else
+      if name == "mem_sb_table_addr" then
+        # Persistent 8-byte global holding the CURRENT tagged-list value
+        # of sb_new/sb_push/sb_str's (self_hosting/lib/x64_runtime.patlang)
+        # StringBuilder-entries table -- same "fixed .bss slot, real
+        # PatLang list value stored through it" pattern as
+        # mem_heap_state_addr, needed because sb_push's handle (a stable
+        # index) must keep working even when its own entry reallocates.
+        sb_push(sb, "    lea rax, [rel g_sb_table]" + x64_nl_char())
+        sb_push(sb, "    push rax" + x64_nl_char())
+      else
+      if name == "mem_vec_table_addr" then
+        # Same pattern as mem_sb_table_addr, for vec_new/vec_push/
+        # vec_get/vec_set/vec_len/vec_to_list's own table of entries
+        # (each entry an ordinary PatLang List instead of a byte
+        # buffer -- see x64_runtime.patlang's own header on these).
+        sb_push(sb, "    lea rax, [rel g_vec_table]" + x64_nl_char())
+        sb_push(sb, "    push rax" + x64_nl_char())
+      else
+      if name == "mem_vars_table_addr" then
+        # Same pattern again, for set_var/get's global named-counter
+        # store (see x64_runtime.patlang's own header on these).
+        sb_push(sb, "    lea rax, [rel g_vars_table]" + x64_nl_char())
         sb_push(sb, "    push rax" + x64_nl_char())
       else
       if name == "mem_poke_qword" then
@@ -1702,6 +1773,10 @@ make a function called x64_callhost_asm takes name, argc returns asm
       end
       end
     end
+  end
+  end
+  end
+  end
   end
   end
   end
@@ -1931,6 +2006,28 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
             end
           end
         else
+          if ty == "Un" then
+            # Matches codegen.patlang's own three-way Un dispatch
+            # (UnOpKind::Not/BitNot/Neg) exactly -- "not" is boolean
+            # logical not (any nonzero -> 0, zero -> 1, not a bitwise
+            # complement), "bnot" is the real bitwise complement, and
+            # anything else (this IR only ever produces "-" here) is
+            # arithmetic negation. Never dynamic-dispatched -- no
+            # existing code path does that for Un either.
+            sb_push(sb, "    pop rax" + x64_nl_char())
+            if instr[1] == "not" then
+              sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+              sb_push(sb, "    sete al" + x64_nl_char())
+              sb_push(sb, "    movzx rax, al" + x64_nl_char())
+            else
+              if instr[1] == "bnot" then
+                sb_push(sb, "    not rax" + x64_nl_char())
+              else
+                sb_push(sb, "    neg rax" + x64_nl_char())
+              end
+            end
+            sb_push(sb, "    push rax" + x64_nl_char())
+          else
           if ty == "Jump" then
             sb_push(sb, "    jmp L_" + func_name + "_" + instr[1] + x64_nl_char())
           else
@@ -2000,6 +2097,7 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
                 end
               end
             end
+          end
           end
         end
       end
@@ -2405,6 +2503,12 @@ make a function called emit_program_x64 takes ir returns asm
   sb_push(sb, "    g_scratch resb 256" + x64_nl_char())
   sb_push(sb, "    align 8" + x64_nl_char())
   sb_push(sb, "    g_heap_state resq 1" + x64_nl_char())
+  sb_push(sb, "    align 8" + x64_nl_char())
+  sb_push(sb, "    g_sb_table resq 1" + x64_nl_char())
+  sb_push(sb, "    align 8" + x64_nl_char())
+  sb_push(sb, "    g_vec_table resq 1" + x64_nl_char())
+  sb_push(sb, "    align 8" + x64_nl_char())
+  sb_push(sb, "    g_vars_table resq 1" + x64_nl_char())
   sb_push(sb, "    align 16" + x64_nl_char())
   sb_push(sb, "    g_heap resb 16777216" + x64_nl_char())
   sb_push(sb, x64_nl_char())
