@@ -327,6 +327,64 @@ make a function called x64_instr_is_call_boundary takes instr, dynamic_mode retu
   return false
 end
 
+
+# REAL BUG FOUND AND FIXED HERE (2026-07-20, discovered implementing
+# argv() -- confirmed via a minimal repro before this fix, not just
+# argv()'s own complexity): a value read at the TOP of a loop is only
+# ONE occurrence in the flat instruction array (reused every iteration
+# via the loop's own backward jump), so its "last use" INDEX can sit
+# BEFORE a call-boundary instruction that appears LATER in that same
+# loop body -- even though, at RUNTIME, that value must survive from
+# one iteration's read to the next, spanning the call every single
+# time the loop repeats. The original "scan 0..last" design silently
+# missed this: a local like a loop-invariant bound variable (read only
+# at the top of a `while` condition, with a call somewhere in the body)
+# was wrongly judged call-free and register-allocated, then silently
+# corrupted the first time the loop's own call clobbered its register.
+# NONE of this session's demo regression suite happened to exercise
+# this exact shape (a loop-condition variable + a call later in the
+# same loop body) -- caught only by argv()'s own quote-aware tokenizer,
+# which does exactly that (the outer `while i < len` condition reads
+# `len`, and the loop body calls `char_code`/`rt_is_space`).
+#
+# Fix: before scanning for call-boundaries, extend a local's effective
+# "last used" index to cover the full body of any loop (backward jump,
+# Jump or JumpIfFalse with target <= its own index) that its raw last
+# use falls inside -- to a fixed point, so nested loops extend
+# correctly too.
+make a function called x64_extend_across_loops takes instrs, last returns effective
+  let n = to_num(list_len(instrs))
+  let effective = last
+  let changed = true
+  while changed do
+    let changed = false
+    let j = 0
+    while j < n do
+      let instr = instrs[j]
+      let is_edge = false
+      if instr[0] == "Jump" then
+        let is_edge = true
+      end
+      if instr[0] == "JumpIfFalse" then
+        let is_edge = true
+      end
+      if is_edge then
+        let target = to_num(instr[1])
+        if target <= j then
+          if effective >= target then
+            if effective < j then
+              let effective = j
+              let changed = true
+            end
+          end
+        end
+      end
+      let j = j + 1
+    end
+  end
+  return effective
+end
+
 make a function called x64_local_register_eligible takes instrs, name, dynamic_mode returns ok
   let n = to_num(list_len(instrs))
   let last = 0 - 1
@@ -349,6 +407,7 @@ make a function called x64_local_register_eligible takes instrs, name, dynamic_m
   if last < 0 then
     return true
   end
+  let last = x64_extend_across_loops(instrs, last)
   let i = 0
   while i <= last do
     if x64_instr_is_call_boundary(instrs[i], dynamic_mode) then
@@ -1616,6 +1675,69 @@ make a function called x64_len_asm returns asm
   return sb_str(sb)
 end
 
+# os_get_command_line() -> RAW (untagged) heap address of a fresh
+# [length:8][bytes...] block holding the process's own command line
+# (argv()'s own native boundary -- everything else, quote-aware
+# tokenization and dropping argv[0], is ordinary PatLang in
+# x64_runtime.patlang, matching this backend's "native primitives stay
+# narrow" convention throughout). GetCommandLineA returns a pointer to
+# a NUL-terminated C string, not this backend's own [length][bytes]
+# form, so this measures the length itself before copying -- the ONE
+# genuinely new native primitive the argv/read_file/write_file/
+# file_exists gap needed (the other three already had rt_* wrappers
+# built on existing os_file_size/os_read_file_into/os_write_file).
+make a function called x64_os_get_command_line_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    call GetCommandLineA" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    mov r13, rax" + x64_nl_char())
+  sb_push(sb, "    xor r14, r14" + x64_nl_char())
+  sb_push(sb, "  .argv_len_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    cmp byte [r13+r14], 0" + x64_nl_char())
+  sb_push(sb, "    je .argv_lendone_" + suffix + x64_nl_char())
+  sb_push(sb, "    inc r14" + x64_nl_char())
+  sb_push(sb, "    jmp .argv_len_" + suffix + x64_nl_char())
+  sb_push(sb, "  .argv_lendone_" + suffix + ":" + x64_nl_char())
+  # This backend's own calling convention gives NO register-
+  # preservation guarantee across a call (documented repeatedly
+  # elsewhere in this file) -- r13/r14 must be saved on the REAL
+  # machine stack across rt_heap_alloc, not just left sitting in
+  # registers.
+  sb_push(sb, "    push r13" + x64_nl_char())
+  sb_push(sb, "    push r14" + x64_nl_char())
+  # Real bug caught here (not by review -- the tail of the captured
+  # command line kept coming out corrupted/truncated by exactly ~8
+  # bytes in testing): allocated only `length` bytes, then wrote an
+  # 8-byte length HEADER plus `length` bytes of content into it -- an
+  # 8-byte overflow past the block's own end, clobbering whatever the
+  # bump allocator placed right after it. Must allocate length+8.
+  sb_push(sb, "    mov rax, r14" + x64_nl_char())
+  sb_push(sb, "    add rax, 8" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    call rt_heap_alloc" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, "    pop r14" + x64_nl_char())
+  sb_push(sb, "    pop r13" + x64_nl_char())
+  sb_push(sb, "    mov r12, rax" + x64_nl_char())
+  sb_push(sb, "    mov [r12], r14" + x64_nl_char())
+  sb_push(sb, "    xor rax, rax" + x64_nl_char())
+  sb_push(sb, "  .argv_copy_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    cmp rax, r14" + x64_nl_char())
+  sb_push(sb, "    jge .argv_copydone_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov cl, [r13+rax]" + x64_nl_char())
+  sb_push(sb, "    mov [r12+8+rax], cl" + x64_nl_char())
+  sb_push(sb, "    inc rax" + x64_nl_char())
+  sb_push(sb, "    jmp .argv_copy_" + suffix + x64_nl_char())
+  sb_push(sb, "  .argv_copydone_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rax, r12" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
 make a function called x64_callhost_asm takes name, argc returns asm
   let sb = sb_new()
   if name == "list_get" then
@@ -1742,6 +1864,9 @@ make a function called x64_callhost_asm takes name, argc returns asm
           sb_push(sb, "    mov rsp, r15" + x64_nl_char())
           sb_push(sb, "    push 0" + x64_nl_char())
         else
+          if name == "os_get_command_line" then
+            sb_push(sb, x64_os_get_command_line_asm())
+          else
           if name == "os_exit" then
             sb_push(sb, "    pop rcx" + x64_nl_char())
             sb_push(sb, "    mov r15, rsp" + x64_nl_char())
@@ -1773,6 +1898,7 @@ make a function called x64_callhost_asm takes name, argc returns asm
       end
       end
     end
+  end
   end
   end
   end
@@ -2532,7 +2658,7 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
     end
     sb_push(sb, sb_str(gl_line) + x64_nl_char())
   end
-  sb_push(sb, "extern GetStdHandle, WriteFile, ExitProcess, CreateFileA, GetFileSize, CloseHandle, ReadFile, CreateProcessA, CreatePipe, SetHandleInformation, WaitForSingleObject" + x64_nl_char())
+  sb_push(sb, "extern GetStdHandle, WriteFile, ExitProcess, CreateFileA, GetFileSize, CloseHandle, ReadFile, CreateProcessA, CreatePipe, SetHandleInformation, WaitForSingleObject, GetCommandLineA" + x64_nl_char())
   let en_count = to_num(list_len(extern_names))
   if en_count > 0 then
     let en_line = sb_new()
