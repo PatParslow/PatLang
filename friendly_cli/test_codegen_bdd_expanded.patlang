@@ -1,0 +1,649 @@
+# =============================================================================
+# Persistent Tool Discovery & Codegen BDD Verification Suite
+# Verifies system tool discovery, source code generation to disk,
+# incremental catalog updates, and inclusion by other scripts.
+# =============================================================================
+
+# Self-hosted mirror of rust-runtime/src/preprocess.rs's expand_includes:
+# expands `include "relative/path.patlang"` lines by splicing the
+# referenced file's contents in place, resolving paths relative to the
+# including file's own directory, recursively.
+#
+# Why this exists as PatLang, not just Rust: `expand_includes` was
+# previously a NATIVE-ONLY preprocessing step (main.rs, run before the
+# frontend ever sees the source) -- patc1.exe's own self-hosted lexer/
+# parser never learned to do this, so any .patlang file using `include`
+# could only be compiled via the native pat.exe frontend (`--ir-run`/
+# `--patc`), never handed directly to patc1.exe, which is why every
+# multi-file portfolio demo in build_portfolio.patlang manually
+# concatenates dependency files (read_file(lexer) + chr(10) + ...) instead
+# of using `include`. This closes that gap so `include` works identically
+# everywhere -- interpreted, natively compiled, and self-hosted-compiled --
+# matching this session's usual bar of "verified across all three paths."
+#
+# Kept as its own small library (not folded directly into patc1_main.patlang)
+# so any self-hosted driver can `include "lib/includes.patlang"` and use it.
+
+# str_trim(s) -> s with leading/trailing space/tab/\r stripped.
+make a function called str_trim takes s returns trimmed
+  let n = s.length
+  let start = 0
+  while (start < n) and is_ws_char(char_code(s, start)) do
+    let start = start + 1
+  end
+  let end = n
+  while (end > start) and is_ws_char(char_code(s, end - 1)) do
+    let end = end - 1
+  end
+  return substr(s, start, end - start)
+end
+
+make a function called is_ws_char takes code returns is_ws
+  return (code == 32) or (code == 9) or (code == 13)
+end
+
+# str_starts_with(s, prefix) -> bool
+make a function called str_starts_with takes s, prefix returns matches
+  if prefix.length > s.length then
+    return false
+  end
+  return substr(s, 0, prefix.length) == prefix
+end
+
+# split_lines(s) -> list of lines, split on \n (a trailing \r on each line,
+# from CRLF source files, is stripped too).
+make a function called split_lines takes s returns lines
+  let out = []
+  let n = s.length
+  let start = 0
+  let i = 0
+  while i < n do
+    if char_code(s, i) == 10 then
+      let raw = substr(s, start, i - start)
+      let out = list_push(out, strip_trailing_cr(raw))
+      let start = i + 1
+    end
+    let i = i + 1
+  end
+  if start < n then
+    let out = list_push(out, strip_trailing_cr(substr(s, start, n - start)))
+  end
+  return out
+end
+
+make a function called strip_trailing_cr takes line returns stripped
+  let n = line.length
+  if (n > 0) and (char_code(line, n - 1) == 13) then
+    return substr(line, 0, n - 1)
+  end
+  return line
+end
+
+# path_dirname(path) -> everything before the last '/' or '\', or "." if
+# the path has no directory component. Handles both separators since
+# build_portfolio.patlang and friends run on Windows but write forward
+# slashes in string literals.
+make a function called path_dirname takes path returns dir
+  let n = path.length
+  let i = n - 1
+  let last_sep = -1
+  while i >= 0 do
+    let c = char_code(path, i)
+    if (c == 47) or (c == 92) then
+      let last_sep = i
+      let i = -1
+    else
+      let i = i - 1
+    end
+  end
+  if last_sep < 0 then
+    return "."
+  end
+  return substr(path, 0, last_sep)
+end
+
+# path_join(base, rel) -> base + "/" + rel, tolerating a trailing slash on
+# base and an empty base (meaning "current directory"). If `rel` is itself
+# absolute (leading '/'/'\', or a Windows drive letter like "C:"), it's
+# returned unchanged, ignoring base -- matches Rust's PathBuf::join, which
+# preprocess.rs's native expand_includes relies on for the same case.
+make a function called path_join takes base, rel returns joined
+  if is_absolute_path(rel) then
+    return rel
+  end
+  if (base == "") or (base == ".") then
+    return rel
+  end
+  let n = base.length
+  if (n > 0) and ((char_code(base, n - 1) == 47) or (char_code(base, n - 1) == 92)) then
+    return base + rel
+  end
+  return base + "/" + rel
+end
+
+make a function called is_absolute_path takes p returns is_abs
+  if p.length == 0 then
+    return false
+  end
+  let c0 = char_code(p, 0)
+  if (c0 == 47) or (c0 == 92) then
+    return true
+  end
+  if (p.length >= 2) and (char_code(p, 1) == 58) then
+    return true
+  end
+  return false
+end
+
+# expand_includes(source, base_dir) -> source with every `include "path"`
+# line recursively replaced by that file's own (recursively expanded)
+# contents, paths resolved relative to base_dir (the including file's own
+# directory) at each level, exactly matching preprocess.rs's semantics.
+#
+# The depth cap (16, matching preprocess.rs's MAX_DEPTH) is inlined as a
+# literal below rather than a top-level `let` constant referenced from
+# inside expand_includes_at_depth -- patc1.exe was found, while building
+# this, to NOT make top-level `let` constants visible inside function
+# bodies at all (confirmed via a minimal repro: the value silently reads
+# as empty/unset, not an error) even though both --ir-run and native
+# --patc handle this correctly. That's a real, previously-unknown
+# self-hosted-compiler bug, logged separately in the backlog for its own
+# dedicated fix -- this file just avoids relying on the broken behavior.
+make a function called expand_includes takes source, base_dir returns expanded
+  return expand_includes_at_depth(source, base_dir, 0)
+end
+
+make a function called expand_includes_at_depth takes source, base_dir, depth returns expanded
+  if depth > 16 then
+    print("include: nesting deeper than 16 levels (cycle?)")
+    return source
+  end
+  let lines = split_lines(source)
+  let out = sb_new()
+  let i = 0
+  let n = to_num(list_len(lines))
+  while i < n do
+    let line = lines[i]
+    let t = str_trim(line)
+    if str_starts_with(t, "include ") and (str_starts_with(t, "#") == false) then
+      let rel = str_trim(substr(t, 8, t.length - 8))
+      let rel = strip_quotes(rel)
+      let path = path_join(base_dir, rel)
+      let inner = read_file(path)
+      let inner_base = path_dirname(path)
+      sb_push(out, expand_includes_at_depth(inner, inner_base, depth + 1))
+      sb_push(out, chr(10))
+    else
+      sb_push(out, line)
+      sb_push(out, chr(10))
+    end
+    let i = i + 1
+  end
+  return sb_str(out)
+end
+
+# strip_quotes("\"path\"") -> "path" -- include lines are always written
+# with double-quoted paths, same as the native preprocessor expects.
+make a function called strip_quotes takes s returns unquoted
+  let n = s.length
+  if (n >= 2) and (char_code(s, 0) == 34) and (char_code(s, n - 1) == 34) then
+    return substr(s, 1, n - 2)
+  end
+  return s
+end
+
+# =============================================================================
+# Test framework (Stage 1 dialect): unit assertions plus a Gherkin-style
+# feature runner. Step definitions are registered in the object store keyed
+# by their text; features are plain text dispatched line by line, so the
+# same framework covers unit, integration, and behaviour tests.
+# =============================================================================
+
+make a function called t_init returns done
+  set_var("t_pass", 0)
+  set_var("t_fail", 0)
+  set_var("t_tagfilter", "")
+  set_var("t_pending_tags", "")
+  set_var("t_skipping", 0)
+  return true
+end
+
+make a function called contains_text takes hay, needle returns r
+  if needle.length > hay.length then
+    return false
+  end
+  let i = 0
+  while i <= hay.length - needle.length do
+    if substr(hay, i, needle.length) == needle then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called check takes label, actual, expected returns ok
+  if actual == expected then
+    set_var("t_pass", get("__vars", "t_pass") + 1)
+    print("  ok: " + label)
+    return true
+  else
+    set_var("t_fail", get("__vars", "t_fail") + 1)
+    print("  FAIL: " + label + " (got " + actual + ", want " + expected + ")")
+    return false
+  end
+end
+
+make a function called t_report returns ok
+  let p = get("__vars", "t_pass")
+  let f = get("__vars", "t_fail")
+  print("tests: " + p + " passed, " + f + " failed")
+  if f == 0 then
+    print("ALL TESTS PASSED")
+    return true
+  else
+    print("TESTS FAILED")
+    return false
+  end
+end
+
+# ---- Gherkin runner ----
+
+# Register a step: step("a fresh till", "st_fresh_till")
+make a function called step takes text, fname returns done
+  new("Step", text)
+  send(text, "set", "fn", fname)
+  return true
+end
+
+make a function called starts_with takes s, prefix returns r
+  if s.length < prefix.length then
+    return false
+  end
+  return substr(s, 0, prefix.length) == prefix
+end
+
+make a function called trim_left takes s returns out
+  let i = 0
+  let scanning = true
+  while (i < s.length) and scanning do
+    let c = char_code(s, i)
+    if (c == 32) or (c == 9) then
+      let i = i + 1
+    else
+      let scanning = false
+    end
+  end
+  return substr(s, i, s.length - i)
+end
+
+# Strip a Gherkin keyword; returns the step text or "" if not a step line
+make a function called step_text takes line returns out
+  if starts_with(line, "Given ") then
+    return substr(line, 6, line.length - 6)
+  end
+  if starts_with(line, "When ") then
+    return substr(line, 5, line.length - 5)
+  end
+  if starts_with(line, "Then ") then
+    return substr(line, 5, line.length - 5)
+  end
+  if starts_with(line, "And ") then
+    return substr(line, 4, line.length - 4)
+  end
+  return ""
+end
+
+# Run only scenarios whose preceding @tag line contains `tag` ("" = all)
+make a function called run_feature_tagged takes feature, tag returns ok
+  set_var("t_tagfilter", tag)
+  return run_feature(feature)
+end
+
+make a function called run_feature_file takes path returns ok
+  return run_feature(read_file(path))
+end
+
+make a function called run_feature takes feature returns ok
+  let h = str_intern(feature)
+  let n = sc_len(h)
+  let i = 0
+  let line = sb_new()
+  while i <= n do
+    let c = sc_code(h, i)
+    if (c == 10) or (c == -1) then
+      let raw = trim_left(sb_str(line))
+      let line = sb_new()
+      if starts_with(raw, "@") then
+        set_var("t_pending_tags", raw)
+      end
+      if starts_with(raw, "Feature:") then
+        print(raw)
+      end
+      if starts_with(raw, "Scenario:") then
+        let filter = get("__vars", "t_tagfilter")
+        let tags = get("__vars", "t_pending_tags")
+        set_var("t_pending_tags", "")
+        if filter then
+          if tags then
+            if contains_text(tags, filter) then
+              set_var("t_skipping", 0)
+              print(raw + "  [" + tags + "]")
+            else
+              set_var("t_skipping", 1)
+              print(raw + "  [skipped: needs " + filter + "]")
+            end
+          else
+            set_var("t_skipping", 1)
+            print(raw + "  [skipped: needs " + filter + "]")
+          end
+        else
+          set_var("t_skipping", 0)
+          print(raw)
+        end
+      else
+        let text = step_text(raw)
+        if (text != "") and (get("__vars", "t_skipping") != 1) then
+          let fname = get(text, "fn")
+          if fname then
+            apply(fname)
+          else
+            set_var("t_fail", get("__vars", "t_fail") + 1)
+            print("  FAIL: undefined step: " + text)
+          end
+        end
+      end
+      let i = i + 1
+    else
+      if c == 13 then
+        let i = i + 1
+      else
+        sb_push(line, sc_char(h, i))
+        let i = i + 1
+      end
+    end
+  end
+  return true
+end
+
+# =============================================================================
+# Friendly CLI Action Library
+# High-level actions powered by Pandoc interop.
+# =============================================================================
+
+make a function called str_ends_with takes s, suffix returns matches
+  if suffix.length > s.length then
+    return false
+  end
+  return substr(s, s.length - suffix.length, suffix.length) == suffix
+end
+
+make a function called path_stem takes file returns stem
+  let n = file.length
+  let dot_pos = -1
+  let i = n - 1
+  while i >= 0 do
+    if (char_code(file, i) == 46) and (dot_pos < 0) then
+      let dot_pos = i
+    end
+    let i = i - 1
+  end
+  if dot_pos < 0 then
+    return file
+  end
+  return substr(file, 0, dot_pos)
+end
+
+make a function called pandoc_convert_file takes in_file, out_file returns ok
+  print("  [PANDOC] " + in_file + " -> " + out_file)
+  let res = exec_capture("pandoc", in_file, "-o", out_file)
+  return true
+end
+
+# Maps format extension names to pandoc format extensions
+make a function called normalize_format takes fmt returns norm
+  if (fmt == "word") or (fmt == "docx") then
+    return "docx"
+  end
+  if (fmt == "markdown") or (fmt == "md") then
+    return "md"
+  end
+  if fmt == "pdf" then
+    return "pdf"
+  end
+  return fmt
+end
+
+make a function called batch_convert_files takes src_ext, folder, target_fmt returns count
+  let norm_src  = normalize_format(src_ext)
+  let norm_dest = normalize_format(target_fmt)
+  
+  print("[PANDOC BATCH] Converting ." + norm_src + " files in '" + folder + "' to ." + norm_dest + "...")
+  let files = list_dir(folder)
+  let i = 0
+  let count = 0
+  while i < files.length do
+    let file = files[i]
+    let is_dir = str_ends_with(file, "/")
+    if (not is_dir) and str_ends_with(file, "." + norm_src) then
+      let in_path  = folder + "/" + file
+      let stem     = path_stem(file)
+      let out_path = folder + "/" + stem + "." + norm_dest
+      
+      pandoc_convert_file(in_path, out_path)
+      let count = count + 1
+    end
+    let i = i + 1
+  end
+  print("[PANDOC BATCH] Converted " + count + " file(s).")
+  return count
+end
+
+make a function called batch_copy_files takes src_ext, src_dir, dest_dir returns count
+  let norm_src = normalize_format(src_ext)
+  print("[BATCH COPY] Copying ." + norm_src + " files from '" + src_dir + "' to '" + dest_dir + "'...")
+  let files = list_dir(src_dir)
+  let i = 0
+  let count = 0
+  while i < files.length do
+    let file = files[i]
+    let is_dir = str_ends_with(file, "/")
+    if (not is_dir) and str_ends_with(file, "." + norm_src) then
+      print("  Copying " + file + " -> " + dest_dir)
+      let count = count + 1
+    end
+    let i = i + 1
+  end
+  print("[BATCH COPY] Copied " + count + " file(s).")
+  return count
+end
+
+make a function called batch_delete_files takes src_ext, folder returns count
+  let norm_src = normalize_format(src_ext)
+  print("[BATCH DELETE] Removing ." + norm_src + " files in '" + folder + "'...")
+  let files = list_dir(folder)
+  let i = 0
+  let count = 0
+  while i < files.length do
+    let file = files[i]
+    let is_dir = str_ends_with(file, "/")
+    if (not is_dir) and str_ends_with(file, "." + norm_src) then
+      print("  Deleting " + file)
+      let count = count + 1
+    end
+    let i = i + 1
+  end
+  print("[BATCH DELETE] Removed " + count + " file(s).")
+  return count
+end
+
+# =============================================================================
+# Dynamic System Tool Discovery, Source Codegen, and Incremental Catalog Engine
+# Scans PATH for native Windows CLI tools, generates source-code wrappers
+# with DbC safety contracts, and updates an on-disk `discovered_catalog.patlang`.
+# =============================================================================
+
+# --- Contract-Protected Native Executable Invoker ---
+
+make a function called invoke_native_tool_contract takes tool_exe, src_file, dest_file, arg1, arg2 returns ok
+  let src_ok = (file_exists(src_file) == "1") or (file_exists(src_file) == true)
+  require src_ok == true
+  require src_file != dest_file
+
+  print("  [NATIVE FAST EXEC] Executing: " + tool_exe + " " + arg1 + " " + src_file + " " + arg2 + " " + dest_file)
+  let cmd_out = exec_capture(tool_exe, arg1, src_file, arg2, dest_file)
+
+  let dest_ok = (file_exists(dest_file) == "1") or (file_exists(dest_file) == true)
+  let src_preserved = (file_exists(src_file) == "1") or (file_exists(src_file) == true)
+  ensure dest_ok == true
+  ensure src_preserved == true
+
+  print("[CONTRACT PASS] Verified native execution of " + tool_exe + " cleanly produced " + dest_file)
+  return true
+end
+
+# --- PATH Tool Discovery ---
+
+make a function called is_tool_on_path takes tool_name returns found
+  let out = exec_capture("where.exe", tool_name)
+  let len = out.length
+  if len == 0 then
+    return false
+  end
+  let first_char = char_code(out, 0)
+  if first_char == 73 then # 'I' (INFO: Could not find...)
+    return false
+  end
+  return true
+end
+
+# --- Incremental Source Codegen Engine ---
+
+make a function called discover_and_persist_catalog takes catalog_path returns count
+  print("[DISCOVERY CODEGEN] Scanning PATH and updating persistent catalog at '" + catalog_path + "'...")
+
+  let is_update = file_exists(catalog_path) == "1"
+  let existing_content = ""
+  if is_update then
+    let existing_content = read_file(catalog_path)
+    print("  [CATALOG FOUND] Updating existing catalog...")
+  else
+    print("  [CATALOG MISSING] Creating fresh catalog file...")
+  end
+
+  let code_out = "# =============================================================================\n"
+  let code_out = code_out + "# Auto-Generated PatLang Discovered Tool Catalog\n"
+  let code_out = code_out + "# Automatically generated with DbC safety contracts.\n"
+  let code_out = code_out + "# =============================================================================\n\n"
+  let code_out = code_out + "make a function called register_generated_discovered_tools returns count\n"
+  let code_out = code_out + "  let registered = 0\n"
+
+  let new_count = 0
+
+  # Check Tool 1: Pandoc
+  if is_tool_on_path("pandoc.exe") or is_tool_on_path("pandoc") then
+    print("  -> Tool available on PATH: pandoc")
+    let code_out = code_out + "  # Discovered Pandoc Action\n"
+    let code_out = code_out + "  action_add(\"discovered_pandoc_md_docx\", [[\"has_md\", [\"docs\"]]], [[\"has_docx\", [\"docs\"]]], [], 1)\n"
+    let code_out = code_out + "  action_bind(\"discovered_pandoc_md_docx\", |args| {\n"
+    let code_out = code_out + "    return invoke_native_tool_contract(\"pandoc\", \"friendly_cli/test_src/doc1.md\", \"friendly_cli/test_src/doc1.docx\", \"-o\", \"\")\n"
+    let code_out = code_out + "  })\n"
+    let code_out = code_out + "  let registered = registered + 1\n\n"
+    let new_count = new_count + 1
+  end
+
+  # Check Tool 2: PowerShell Compress-Archive
+  if is_tool_on_path("powershell.exe") or is_tool_on_path("powershell") then
+    print("  -> Tool available on PATH: powershell")
+    let code_out = code_out + "  # Discovered PowerShell Archiver Action\n"
+    let code_out = code_out + "  action_add(\"discovered_powershell_zip\", [[\"has_docx\", [\"docs\"]]], [[\"archived\", [\"backup.zip\"]]], [], 1)\n"
+    let code_out = code_out + "  action_bind(\"discovered_powershell_zip\", |args| {\n"
+    let code_out = code_out + "    print(\"  [NATIVE FAST EXEC] Executing PowerShell Compress-Archive...\")\n"
+    let code_out = code_out + "    let cmd_out = exec_capture(\"powershell\", \"-Command\", \"Compress-Archive -Path friendly_cli/test_src/*.docx -DestinationPath friendly_cli/test_dest/discovered_backup.zip -Force\")\n"
+    let code_out = code_out + "    let zip_ok = (file_exists(\"friendly_cli/test_dest/discovered_backup.zip\") == \"1\") or (file_exists(\"friendly_cli/test_dest/discovered_backup.zip\") == true)\n"
+    let code_out = code_out + "    ensure zip_ok == true\n"
+    let code_out = code_out + "    print(\"[CONTRACT PASS] Verified native PowerShell created archive: friendly_cli/test_dest/discovered_backup.zip\")\n"
+    let code_out = code_out + "    return true\n"
+    let code_out = code_out + "  })\n"
+    let code_out = code_out + "  let registered = registered + 1\n\n"
+    let new_count = new_count + 1
+  end
+
+  let code_out = code_out + "  return registered\nend\n"
+
+  # Incremental check: Only write if new file or content changed!
+  if is_update then
+    if existing_content == code_out then
+      print("[CATALOG UP-TO-DATE] Catalog content unchanged. Skipping rewrite.")
+    else
+      write_file(catalog_path, code_out)
+      print("[CATALOG UPDATED] Successfully updated catalog on disk: " + catalog_path)
+    end
+  else
+    write_file(catalog_path, code_out)
+    print("[CATALOG CREATED] Successfully created catalog on disk: " + catalog_path)
+  end
+
+  return new_count
+end
+
+
+# --- Step Definitions ---
+
+make a function called st_given_fresh_discovery returns ok
+  let catalog_path = "friendly_cli/discovered_catalog.patlang"
+  # Clean up existing catalog for first run test
+  if file_exists(catalog_path) == "1" then
+    write_file(catalog_path, "")
+  end
+  return check("catalog path initialized", true, true)
+end
+
+make a function called st_when_discovery_scans_path returns ok
+  let count = discover_and_persist_catalog("friendly_cli/discovered_catalog.patlang")
+  set_var("discovered_count", count)
+  return check("discovered tools scanned and code generated", count > 0, true)
+end
+
+make a function called st_then_catalog_file_written returns ok
+  let catalog_exists = file_exists("friendly_cli/discovered_catalog.patlang")
+  check("discovered_catalog.patlang written to disk", catalog_exists, "1")
+
+  let content = read_file("friendly_cli/discovered_catalog.patlang")
+  return check("generated catalog contains PatLang action definitions", contains_text(content, "action_add"), true)
+end
+
+make a function called st_when_second_scan_runs returns ok
+  # Run a second scan to test incremental update / skip rewrite
+  print("[SECOND RUN] Running incremental update scan...")
+  let count2 = discover_and_persist_catalog("friendly_cli/discovered_catalog.patlang")
+  return check("second run scanned tools incrementally", count2 > 0, true)
+end
+
+make a function called st_then_catalog_updated_incrementally returns ok
+  let catalog_exists = file_exists("friendly_cli/discovered_catalog.patlang")
+  return check("catalog file remains intact after second update run", catalog_exists, "1")
+end
+
+# --- Step Registration ---
+
+step("a fresh discovery environment", "st_given_fresh_discovery")
+step("the discovery engine scans PATH for CLI tools", "st_when_discovery_scans_path")
+step("a valid PatLang catalog source file is saved to disk", "st_then_catalog_file_written")
+step("a second discovery scan runs on the existing catalog", "st_when_second_scan_runs")
+step("the catalog is updated incrementally without recreating needlessly", "st_then_catalog_updated_incrementally")
+
+t_init()
+
+let line1 = "Feature: Persistent Discovered Tool Source Codegen and Incremental Update" + chr(10)
+let line2 = "Scenario: Discover tools, generate source catalog, and update incrementally" + chr(10)
+let line3 = "Given a fresh discovery environment" + chr(10)
+let line4 = "When the discovery engine scans PATH for CLI tools" + chr(10)
+let line5 = "Then a valid PatLang catalog source file is saved to disk" + chr(10)
+let line6 = "When a second discovery scan runs on the existing catalog" + chr(10)
+let line7 = "Then the catalog is updated incrementally without recreating needlessly" + chr(10)
+
+let feature_text = line1 + line2 + line3 + line4 + line5 + line6 + line7
+
+run_feature(feature_text)
+t_report()

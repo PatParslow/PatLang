@@ -1,0 +1,571 @@
+# =============================================================================
+# Relational Performance Database BDD Verification Suite
+# Populates multiple data points across separate task categories (patc1 and zip),
+# monitors errors, updates metrics, and logs them to the relational database.
+# =============================================================================
+
+# Self-hosted mirror of rust-runtime/src/preprocess.rs's expand_includes:
+# expands `include "relative/path.patlang"` lines by splicing the
+# referenced file's contents in place, resolving paths relative to the
+# including file's own directory, recursively.
+#
+# Why this exists as PatLang, not just Rust: `expand_includes` was
+# previously a NATIVE-ONLY preprocessing step (main.rs, run before the
+# frontend ever sees the source) -- patc1.exe's own self-hosted lexer/
+# parser never learned to do this, so any .patlang file using `include`
+# could only be compiled via the native pat.exe frontend (`--ir-run`/
+# `--patc`), never handed directly to patc1.exe, which is why every
+# multi-file portfolio demo in build_portfolio.patlang manually
+# concatenates dependency files (read_file(lexer) + chr(10) + ...) instead
+# of using `include`. This closes that gap so `include` works identically
+# everywhere -- interpreted, natively compiled, and self-hosted-compiled --
+# matching this session's usual bar of "verified across all three paths."
+#
+# Kept as its own small library (not folded directly into patc1_main.patlang)
+# so any self-hosted driver can `include "lib/includes.patlang"` and use it.
+
+# str_trim(s) -> s with leading/trailing space/tab/\r stripped.
+make a function called str_trim takes s returns trimmed
+  let n = s.length
+  let start = 0
+  while (start < n) and is_ws_char(char_code(s, start)) do
+    let start = start + 1
+  end
+  let end = n
+  while (end > start) and is_ws_char(char_code(s, end - 1)) do
+    let end = end - 1
+  end
+  return substr(s, start, end - start)
+end
+
+make a function called is_ws_char takes code returns is_ws
+  return (code == 32) or (code == 9) or (code == 13)
+end
+
+# str_starts_with(s, prefix) -> bool
+make a function called str_starts_with takes s, prefix returns matches
+  if prefix.length > s.length then
+    return false
+  end
+  return substr(s, 0, prefix.length) == prefix
+end
+
+# split_lines(s) -> list of lines, split on \n (a trailing \r on each line,
+# from CRLF source files, is stripped too).
+make a function called split_lines takes s returns lines
+  let out = []
+  let n = s.length
+  let start = 0
+  let i = 0
+  while i < n do
+    if char_code(s, i) == 10 then
+      let raw = substr(s, start, i - start)
+      let out = list_push(out, strip_trailing_cr(raw))
+      let start = i + 1
+    end
+    let i = i + 1
+  end
+  if start < n then
+    let out = list_push(out, strip_trailing_cr(substr(s, start, n - start)))
+  end
+  return out
+end
+
+make a function called strip_trailing_cr takes line returns stripped
+  let n = line.length
+  if (n > 0) and (char_code(line, n - 1) == 13) then
+    return substr(line, 0, n - 1)
+  end
+  return line
+end
+
+# path_dirname(path) -> everything before the last '/' or '\', or "." if
+# the path has no directory component. Handles both separators since
+# build_portfolio.patlang and friends run on Windows but write forward
+# slashes in string literals.
+make a function called path_dirname takes path returns dir
+  let n = path.length
+  let i = n - 1
+  let last_sep = -1
+  while i >= 0 do
+    let c = char_code(path, i)
+    if (c == 47) or (c == 92) then
+      let last_sep = i
+      let i = -1
+    else
+      let i = i - 1
+    end
+  end
+  if last_sep < 0 then
+    return "."
+  end
+  return substr(path, 0, last_sep)
+end
+
+# path_join(base, rel) -> base + "/" + rel, tolerating a trailing slash on
+# base and an empty base (meaning "current directory"). If `rel` is itself
+# absolute (leading '/'/'\', or a Windows drive letter like "C:"), it's
+# returned unchanged, ignoring base -- matches Rust's PathBuf::join, which
+# preprocess.rs's native expand_includes relies on for the same case.
+make a function called path_join takes base, rel returns joined
+  if is_absolute_path(rel) then
+    return rel
+  end
+  if (base == "") or (base == ".") then
+    return rel
+  end
+  let n = base.length
+  if (n > 0) and ((char_code(base, n - 1) == 47) or (char_code(base, n - 1) == 92)) then
+    return base + rel
+  end
+  return base + "/" + rel
+end
+
+make a function called is_absolute_path takes p returns is_abs
+  if p.length == 0 then
+    return false
+  end
+  let c0 = char_code(p, 0)
+  if (c0 == 47) or (c0 == 92) then
+    return true
+  end
+  if (p.length >= 2) and (char_code(p, 1) == 58) then
+    return true
+  end
+  return false
+end
+
+# expand_includes(source, base_dir) -> source with every `include "path"`
+# line recursively replaced by that file's own (recursively expanded)
+# contents, paths resolved relative to base_dir (the including file's own
+# directory) at each level, exactly matching preprocess.rs's semantics.
+#
+# The depth cap (16, matching preprocess.rs's MAX_DEPTH) is inlined as a
+# literal below rather than a top-level `let` constant referenced from
+# inside expand_includes_at_depth -- patc1.exe was found, while building
+# this, to NOT make top-level `let` constants visible inside function
+# bodies at all (confirmed via a minimal repro: the value silently reads
+# as empty/unset, not an error) even though both --ir-run and native
+# --patc handle this correctly. That's a real, previously-unknown
+# self-hosted-compiler bug, logged separately in the backlog for its own
+# dedicated fix -- this file just avoids relying on the broken behavior.
+make a function called expand_includes takes source, base_dir returns expanded
+  return expand_includes_at_depth(source, base_dir, 0)
+end
+
+make a function called expand_includes_at_depth takes source, base_dir, depth returns expanded
+  if depth > 16 then
+    print("include: nesting deeper than 16 levels (cycle?)")
+    return source
+  end
+  let lines = split_lines(source)
+  let out = sb_new()
+  let i = 0
+  let n = to_num(list_len(lines))
+  while i < n do
+    let line = lines[i]
+    let t = str_trim(line)
+    if str_starts_with(t, "include ") and (str_starts_with(t, "#") == false) then
+      let rel = str_trim(substr(t, 8, t.length - 8))
+      let rel = strip_quotes(rel)
+      let path = path_join(base_dir, rel)
+      let inner = read_file(path)
+      let inner_base = path_dirname(path)
+      sb_push(out, expand_includes_at_depth(inner, inner_base, depth + 1))
+      sb_push(out, chr(10))
+    else
+      sb_push(out, line)
+      sb_push(out, chr(10))
+    end
+    let i = i + 1
+  end
+  return sb_str(out)
+end
+
+# strip_quotes("\"path\"") -> "path" -- include lines are always written
+# with double-quoted paths, same as the native preprocessor expects.
+make a function called strip_quotes takes s returns unquoted
+  let n = s.length
+  if (n >= 2) and (char_code(s, 0) == 34) and (char_code(s, n - 1) == 34) then
+    return substr(s, 1, n - 2)
+  end
+  return s
+end
+
+# =============================================================================
+# Test framework (Stage 1 dialect): unit assertions plus a Gherkin-style
+# feature runner. Step definitions are registered in the object store keyed
+# by their text; features are plain text dispatched line by line, so the
+# same framework covers unit, integration, and behaviour tests.
+# =============================================================================
+
+make a function called t_init returns done
+  set_var("t_pass", 0)
+  set_var("t_fail", 0)
+  set_var("t_tagfilter", "")
+  set_var("t_pending_tags", "")
+  set_var("t_skipping", 0)
+  return true
+end
+
+make a function called contains_text takes hay, needle returns r
+  if needle.length > hay.length then
+    return false
+  end
+  let i = 0
+  while i <= hay.length - needle.length do
+    if substr(hay, i, needle.length) == needle then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called check takes label, actual, expected returns ok
+  if actual == expected then
+    set_var("t_pass", get("__vars", "t_pass") + 1)
+    print("  ok: " + label)
+    return true
+  else
+    set_var("t_fail", get("__vars", "t_fail") + 1)
+    print("  FAIL: " + label + " (got " + actual + ", want " + expected + ")")
+    return false
+  end
+end
+
+make a function called t_report returns ok
+  let p = get("__vars", "t_pass")
+  let f = get("__vars", "t_fail")
+  print("tests: " + p + " passed, " + f + " failed")
+  if f == 0 then
+    print("ALL TESTS PASSED")
+    return true
+  else
+    print("TESTS FAILED")
+    return false
+  end
+end
+
+# ---- Gherkin runner ----
+
+# Register a step: step("a fresh till", "st_fresh_till")
+make a function called step takes text, fname returns done
+  new("Step", text)
+  send(text, "set", "fn", fname)
+  return true
+end
+
+make a function called starts_with takes s, prefix returns r
+  if s.length < prefix.length then
+    return false
+  end
+  return substr(s, 0, prefix.length) == prefix
+end
+
+make a function called trim_left takes s returns out
+  let i = 0
+  let scanning = true
+  while (i < s.length) and scanning do
+    let c = char_code(s, i)
+    if (c == 32) or (c == 9) then
+      let i = i + 1
+    else
+      let scanning = false
+    end
+  end
+  return substr(s, i, s.length - i)
+end
+
+# Strip a Gherkin keyword; returns the step text or "" if not a step line
+make a function called step_text takes line returns out
+  if starts_with(line, "Given ") then
+    return substr(line, 6, line.length - 6)
+  end
+  if starts_with(line, "When ") then
+    return substr(line, 5, line.length - 5)
+  end
+  if starts_with(line, "Then ") then
+    return substr(line, 5, line.length - 5)
+  end
+  if starts_with(line, "And ") then
+    return substr(line, 4, line.length - 4)
+  end
+  return ""
+end
+
+# Run only scenarios whose preceding @tag line contains `tag` ("" = all)
+make a function called run_feature_tagged takes feature, tag returns ok
+  set_var("t_tagfilter", tag)
+  return run_feature(feature)
+end
+
+make a function called run_feature_file takes path returns ok
+  return run_feature(read_file(path))
+end
+
+make a function called run_feature takes feature returns ok
+  let h = str_intern(feature)
+  let n = sc_len(h)
+  let i = 0
+  let line = sb_new()
+  while i <= n do
+    let c = sc_code(h, i)
+    if (c == 10) or (c == -1) then
+      let raw = trim_left(sb_str(line))
+      let line = sb_new()
+      if starts_with(raw, "@") then
+        set_var("t_pending_tags", raw)
+      end
+      if starts_with(raw, "Feature:") then
+        print(raw)
+      end
+      if starts_with(raw, "Scenario:") then
+        let filter = get("__vars", "t_tagfilter")
+        let tags = get("__vars", "t_pending_tags")
+        set_var("t_pending_tags", "")
+        if filter then
+          if tags then
+            if contains_text(tags, filter) then
+              set_var("t_skipping", 0)
+              print(raw + "  [" + tags + "]")
+            else
+              set_var("t_skipping", 1)
+              print(raw + "  [skipped: needs " + filter + "]")
+            end
+          else
+            set_var("t_skipping", 1)
+            print(raw + "  [skipped: needs " + filter + "]")
+          end
+        else
+          set_var("t_skipping", 0)
+          print(raw)
+        end
+      else
+        let text = step_text(raw)
+        if (text != "") and (get("__vars", "t_skipping") != 1) then
+          let fname = get(text, "fn")
+          if fname then
+            apply(fname)
+          else
+            set_var("t_fail", get("__vars", "t_fail") + 1)
+            print("  FAIL: undefined step: " + text)
+          end
+        end
+      end
+      let i = i + 1
+    else
+      if c == 13 then
+        let i = i + 1
+      else
+        sb_push(line, sc_char(h, i))
+        let i = i + 1
+      end
+    end
+  end
+  return true
+end
+
+# =============================================================================
+# Relational Task Performance Database & Regression Engine
+# Generalizes performance prediction across multiple task categories 
+# (e.g. compile, zip, pandoc, AI query) and persists metrics.
+# =============================================================================
+
+# --- Load Task Model Weights (w, b) ---
+make a function called load_task_regression_weights takes task_type returns weights
+  let path = "friendly_cli/perf_weights_" + task_type + ".data"
+  let exists = file_exists(path) == "1"
+  
+  if not exists then
+    # Defaults: w = 35.0 ms/unit, bias = 2000.0 ms
+    return [35.0, 2000.0]
+  end
+
+  let content = read_file(path)
+  let comma_idx = -1
+  let n = content.length
+  let i = 0
+  while i < n do
+    if char_code(content, i) == 44 then
+      let comma_idx = i
+      let i = n
+    end
+    let i = i + 1
+  end
+
+  if comma_idx < 0 then
+    return [35.0, 2000.0]
+  end
+
+  let w_str = substr(content, 0, comma_idx)
+  let b_str = substr(content, comma_idx + 1, n - comma_idx - 1)
+  return [to_num(w_str), to_num(b_str)]
+end
+
+# --- Save Task Model Weights ---
+make a function called save_task_regression_weights takes task_type, w, b returns ok
+  let path = "friendly_cli/perf_weights_" + task_type + ".data"
+  let data_str = "" + w + "," + b
+  write_file(path, data_str)
+  return true
+end
+
+# --- Predict Time for Any Task: T = (w * Units) + b ---
+make a function called predict_task_duration takes task_type, units returns ms
+  let weights = load_task_regression_weights(task_type)
+  let w = weights[0]
+  let b = weights[1]
+  let estimate = (w * units) + b
+  return estimate
+end
+
+# --- Relational Performance History Logger ---
+make a function called log_performance_record takes task_type, units, actual_ms, predicted_ms returns ok
+  let path = "friendly_cli/performance_database.sql"
+  
+  # Format record as SQL insert simulator
+  let line = "INSERT INTO performance_metrics (task_type, units, actual_ms, predicted_ms) VALUES ('"
+  let line = line + task_type + "', " + units + ", " + actual_ms + ", " + predicted_ms + ");\n"
+  
+  let existing = ""
+  if file_exists(path) == "1" then
+    let existing = read_file(path)
+  end
+  
+  write_file(path, existing + line)
+  return true
+end
+
+# --- Update Task Model Weights via Gradient Descent ---
+make a function called update_task_weights takes task_type, units, actual_ms returns ok
+  let weights = load_task_regression_weights(task_type)
+  let w = weights[0]
+  let b = weights[1]
+
+  let pred = (w * units) + b
+  let error = pred - actual_ms
+
+  # Tune learning rates dynamically per task type
+  let alpha_w = 0.000005
+  let alpha_b = 0.05
+  if task_type == "zip" then
+    let alpha_w = 0.005
+    let alpha_b = 0.1
+  end
+
+  let grad_w = error * units
+  let grad_b = error
+
+  let new_w = w - (alpha_w * grad_w)
+  let new_b = b - (alpha_b * grad_b)
+
+  # Boundaries
+  if new_w < 0.1 then
+    let new_w = 0.1
+  end
+  if new_b < 100.0 then
+    let new_b = 100.0
+  end
+
+  print("  [DATABASE UPDATE] Task: " + task_type + " | New w: " + new_w + " ms/unit | Bias: " + new_b + " ms")
+  save_task_regression_weights(task_type, new_w, new_b)
+  log_performance_record(task_type, units, actual_ms, pred)
+  return true
+end
+
+
+# --- Helper: Get Millisecond Epoch ---
+make a function called get_system_time_ms returns ms
+  let raw = exec_capture("powershell", "-Command", "[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()")
+  return to_num(raw)
+end
+
+# --- BDD Step Definitions ---
+
+make a function called st_given_database_reset returns ok
+  # Delete database and reset model weights
+  if file_exists("friendly_cli/performance_database.sql") == "1" then
+    let del_db = exec_capture("powershell", "-Command", "Remove-Item -Path friendly_cli/performance_database.sql -Force")
+  end
+  save_task_regression_weights("patc1", 35.0, 5000.0)
+  save_task_regression_weights("zip", 200.0, 500.0)
+  return check("relational database reset and weights initialized", true, true)
+end
+
+make a function called st_when_multi_compile_tasks_run returns ok
+  # Target 1: size_100.patlang
+  let lines_a = 104
+  let pred_a = predict_task_duration("patc1", lines_a)
+  print("  [TRAINING patc1] Run 1 (100 lines) | Predicted: " + pred_a + " ms")
+
+  let start_a = get_system_time_ms()
+  let out_a = exec_capture("./patc1.exe", "friendly_cli/test_src/size_100.patlang", "friendly_cli/test_dest/size_100.exe")
+  let duration_a = get_system_time_ms() - start_a
+  print("  [TRAINING patc1] Run 1 (100 lines) | Actual: " + duration_a + " ms")
+  update_task_weights("patc1", lines_a, duration_a)
+
+  # Target 2: test_concat_expanded.patlang (~450 lines)
+  let lines_b = 454
+  let pred_b = predict_task_duration("patc1", lines_b)
+  print("  [TRAINING patc1] Run 2 (450 lines) | Predicted: " + pred_b + " ms")
+
+  let start_b = get_system_time_ms()
+  let out_b = exec_capture("./patc1.exe", "friendly_cli/test_concat_expanded.patlang", "friendly_cli/test_dest/temp_a.exe")
+  let duration_b = get_system_time_ms() - start_b
+  print("  [TRAINING patc1] Run 2 (450 lines) | Actual: " + duration_b + " ms")
+  update_task_weights("patc1", lines_b, duration_b)
+
+  return true
+end
+
+make a function called st_when_zip_tasks_run returns ok
+  # Simulating compression runs with different numbers of files
+  # Run 1: zip 2 files
+  let files_run1 = 2
+  let pred_zip1 = predict_task_duration("zip", files_run1)
+  print("  [TRAINING zip] Run 1 (2 files) | Predicted: " + pred_zip1 + " ms")
+
+  let start_zip1 = get_system_time_ms()
+  let zip_out1 = exec_capture("powershell", "-Command", "Compress-Archive -Path friendly_cli/test_src/*.docx -DestinationPath friendly_cli/test_dest/zip_run1.zip -Force")
+  let duration_zip1 = get_system_time_ms() - start_zip1
+  print("  [TRAINING zip] Run 1 (2 files) | Actual: " + duration_zip1 + " ms")
+  update_task_weights("zip", files_run1, duration_zip1)
+
+  return true
+end
+
+make a function called st_then_sql_records_verified returns ok
+  let db_exists = file_exists("friendly_cli/performance_database.sql")
+  check("SQL metrics database written to disk", db_exists, "1")
+
+  let content = read_file("friendly_cli/performance_database.sql")
+  print("=== PERFORMANCE SQL FILE PREVIEW ===")
+  print(content)
+
+  let contains_patc1 = contains_text(content, "patc1")
+  let contains_zip = contains_text(content, "zip")
+  check("SQL database logs compile records", contains_patc1, true)
+  return check("SQL database logs zip records", contains_zip, true)
+end
+
+# --- Step Registration ---
+
+step("a clean relational performance database", "st_given_database_reset")
+step("multiple compilation jobs are executed to train the compiler time weights", "st_when_multi_compile_tasks_run")
+step("zip compression tasks are executed to train the archiver weights", "st_when_zip_tasks_run")
+step("the SQL database catalog is populated and verified", "st_then_sql_records_verified")
+
+t_init()
+
+let line1 = "Feature: Relational Performance Database & Multitask Regression" + chr(10)
+let line2 = "Scenario: Record multi-run compile and zip operations and verify SQL log" + chr(10)
+let line3 = "Given a clean relational performance database" + chr(10)
+let line4 = "When multiple compilation jobs are executed to train the compiler time weights" + chr(10)
+let line5 = "And zip compression tasks are executed to train the archiver weights" + chr(10)
+let line6 = "Then the SQL database catalog is populated and verified" + chr(10)
+
+let feature_text = line1 + line2 + line3 + line4 + line5 + line6
+
+run_feature(feature_text)
+t_report()

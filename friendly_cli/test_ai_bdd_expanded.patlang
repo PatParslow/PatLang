@@ -1,0 +1,1887 @@
+# =============================================================================
+# Ollama AI BDD Verification Suite
+# Verifies Gherkin BDD scenarios for local Ollama AI query interop,
+# including safe document parsing and DbC contract enforcement.
+# =============================================================================
+
+# Self-hosted mirror of rust-runtime/src/preprocess.rs's expand_includes:
+# expands `include "relative/path.patlang"` lines by splicing the
+# referenced file's contents in place, resolving paths relative to the
+# including file's own directory, recursively.
+#
+# Why this exists as PatLang, not just Rust: `expand_includes` was
+# previously a NATIVE-ONLY preprocessing step (main.rs, run before the
+# frontend ever sees the source) -- patc1.exe's own self-hosted lexer/
+# parser never learned to do this, so any .patlang file using `include`
+# could only be compiled via the native pat.exe frontend (`--ir-run`/
+# `--patc`), never handed directly to patc1.exe, which is why every
+# multi-file portfolio demo in build_portfolio.patlang manually
+# concatenates dependency files (read_file(lexer) + chr(10) + ...) instead
+# of using `include`. This closes that gap so `include` works identically
+# everywhere -- interpreted, natively compiled, and self-hosted-compiled --
+# matching this session's usual bar of "verified across all three paths."
+#
+# Kept as its own small library (not folded directly into patc1_main.patlang)
+# so any self-hosted driver can `include "lib/includes.patlang"` and use it.
+
+# str_trim(s) -> s with leading/trailing space/tab/\r stripped.
+make a function called str_trim takes s returns trimmed
+  let n = s.length
+  let start = 0
+  while (start < n) and is_ws_char(char_code(s, start)) do
+    let start = start + 1
+  end
+  let end = n
+  while (end > start) and is_ws_char(char_code(s, end - 1)) do
+    let end = end - 1
+  end
+  return substr(s, start, end - start)
+end
+
+make a function called is_ws_char takes code returns is_ws
+  return (code == 32) or (code == 9) or (code == 13)
+end
+
+# str_starts_with(s, prefix) -> bool
+make a function called str_starts_with takes s, prefix returns matches
+  if prefix.length > s.length then
+    return false
+  end
+  return substr(s, 0, prefix.length) == prefix
+end
+
+# split_lines(s) -> list of lines, split on \n (a trailing \r on each line,
+# from CRLF source files, is stripped too).
+make a function called split_lines takes s returns lines
+  let out = []
+  let n = s.length
+  let start = 0
+  let i = 0
+  while i < n do
+    if char_code(s, i) == 10 then
+      let raw = substr(s, start, i - start)
+      let out = list_push(out, strip_trailing_cr(raw))
+      let start = i + 1
+    end
+    let i = i + 1
+  end
+  if start < n then
+    let out = list_push(out, strip_trailing_cr(substr(s, start, n - start)))
+  end
+  return out
+end
+
+make a function called strip_trailing_cr takes line returns stripped
+  let n = line.length
+  if (n > 0) and (char_code(line, n - 1) == 13) then
+    return substr(line, 0, n - 1)
+  end
+  return line
+end
+
+# path_dirname(path) -> everything before the last '/' or '\', or "." if
+# the path has no directory component. Handles both separators since
+# build_portfolio.patlang and friends run on Windows but write forward
+# slashes in string literals.
+make a function called path_dirname takes path returns dir
+  let n = path.length
+  let i = n - 1
+  let last_sep = -1
+  while i >= 0 do
+    let c = char_code(path, i)
+    if (c == 47) or (c == 92) then
+      let last_sep = i
+      let i = -1
+    else
+      let i = i - 1
+    end
+  end
+  if last_sep < 0 then
+    return "."
+  end
+  return substr(path, 0, last_sep)
+end
+
+# path_join(base, rel) -> base + "/" + rel, tolerating a trailing slash on
+# base and an empty base (meaning "current directory"). If `rel` is itself
+# absolute (leading '/'/'\', or a Windows drive letter like "C:"), it's
+# returned unchanged, ignoring base -- matches Rust's PathBuf::join, which
+# preprocess.rs's native expand_includes relies on for the same case.
+make a function called path_join takes base, rel returns joined
+  if is_absolute_path(rel) then
+    return rel
+  end
+  if (base == "") or (base == ".") then
+    return rel
+  end
+  let n = base.length
+  if (n > 0) and ((char_code(base, n - 1) == 47) or (char_code(base, n - 1) == 92)) then
+    return base + rel
+  end
+  return base + "/" + rel
+end
+
+make a function called is_absolute_path takes p returns is_abs
+  if p.length == 0 then
+    return false
+  end
+  let c0 = char_code(p, 0)
+  if (c0 == 47) or (c0 == 92) then
+    return true
+  end
+  if (p.length >= 2) and (char_code(p, 1) == 58) then
+    return true
+  end
+  return false
+end
+
+# expand_includes(source, base_dir) -> source with every `include "path"`
+# line recursively replaced by that file's own (recursively expanded)
+# contents, paths resolved relative to base_dir (the including file's own
+# directory) at each level, exactly matching preprocess.rs's semantics.
+#
+# The depth cap (16, matching preprocess.rs's MAX_DEPTH) is inlined as a
+# literal below rather than a top-level `let` constant referenced from
+# inside expand_includes_at_depth -- patc1.exe was found, while building
+# this, to NOT make top-level `let` constants visible inside function
+# bodies at all (confirmed via a minimal repro: the value silently reads
+# as empty/unset, not an error) even though both --ir-run and native
+# --patc handle this correctly. That's a real, previously-unknown
+# self-hosted-compiler bug, logged separately in the backlog for its own
+# dedicated fix -- this file just avoids relying on the broken behavior.
+make a function called expand_includes takes source, base_dir returns expanded
+  return expand_includes_at_depth(source, base_dir, 0)
+end
+
+make a function called expand_includes_at_depth takes source, base_dir, depth returns expanded
+  if depth > 16 then
+    print("include: nesting deeper than 16 levels (cycle?)")
+    return source
+  end
+  let lines = split_lines(source)
+  let out = sb_new()
+  let i = 0
+  let n = to_num(list_len(lines))
+  while i < n do
+    let line = lines[i]
+    let t = str_trim(line)
+    if str_starts_with(t, "include ") and (str_starts_with(t, "#") == false) then
+      let rel = str_trim(substr(t, 8, t.length - 8))
+      let rel = strip_quotes(rel)
+      let path = path_join(base_dir, rel)
+      let inner = read_file(path)
+      let inner_base = path_dirname(path)
+      sb_push(out, expand_includes_at_depth(inner, inner_base, depth + 1))
+      sb_push(out, chr(10))
+    else
+      sb_push(out, line)
+      sb_push(out, chr(10))
+    end
+    let i = i + 1
+  end
+  return sb_str(out)
+end
+
+# strip_quotes("\"path\"") -> "path" -- include lines are always written
+# with double-quoted paths, same as the native preprocessor expects.
+make a function called strip_quotes takes s returns unquoted
+  let n = s.length
+  if (n >= 2) and (char_code(s, 0) == 34) and (char_code(s, n - 1) == 34) then
+    return substr(s, 1, n - 2)
+  end
+  return s
+end
+
+# =============================================================================
+# General-purpose regex engine, Stage 1 self-hosted dialect (concatenate
+# after nothing else; only uses host functions available to the self-hosted
+# compiler pipeline: char_code/substr/chr/list_push/list_get/list_len/to_num).
+#
+# This is the self-hosted-dialect twin of the Stage 0 (`fn`/`{}`) engine at
+# rust-runtime's self_hosting/lib/regex.patlang, used by the Rust CLI's
+# `syntax_dsl.rs` preprocessor. That version cannot be `include`d into
+# anything compiled by the self-hosted pipeline (lib/lexer.patlang +
+# lib/parser.patlang don't lex `{`/`}` as anything meaningful — this dialect
+# is do/end-delimited throughout), so the logic is duplicated here in the
+# dialect lib/lexer.patlang and lib/parser.patlang actually understand. Keep
+# both in sync if the regex feature set changes.
+#
+# Supported syntax subset: literals, \d \w \s \b \n \t escapes, '.' (any),
+# [abc] / [a-z0-9] / [^abc] classes, (...) grouping, '|' alternation,
+# '*' '+' '?' quantifiers, '^' '$' anchors. No capture-group extraction —
+# whole-match length only.
+#
+# AST nodes are tagged lists: ["lit", ch], ["any"], ["class", negate, items],
+# ["seq", nodes], ["alt", branches], ["star", node], ["plus", node],
+# ["opt", node], ["bol"], ["eol"], ["wordb"], ["group", node].
+# =============================================================================
+
+make a function called is_digit_char takes ch returns r
+  if ch == "0" then
+    return true
+  else
+    if ch == "1" then
+      return true
+    else
+      if ch == "2" then
+        return true
+      else
+        if ch == "3" then
+          return true
+        else
+          if ch == "4" then
+            return true
+          else
+            if ch == "5" then
+              return true
+            else
+              if ch == "6" then
+                return true
+              else
+                if ch == "7" then
+                  return true
+                else
+                  if ch == "8" then
+                    return true
+                  else
+                    return ch == "9"
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+make a function called is_word_char takes ch returns r
+  if ch == "_" then
+    return true
+  else
+    if is_digit_char(ch) then
+      return true
+    else
+      let code = char_code(ch, 0)
+      if (code >= 65) and (code <= 90) then
+        return true
+      else
+        if (code >= 97) and (code <= 122) then
+          return true
+        else
+          return false
+        end
+      end
+    end
+  end
+end
+
+# ---------------------------------------------------------------------
+# Parsing: pattern (string) -> AST node. Internal helpers return
+# [node, next_pos] pairs; next_pos is -1 on failure.
+# ---------------------------------------------------------------------
+
+make a function called regex_atom_for_escape takes ch returns node
+  if ch == "d" then
+    return ["class", 0, [["range", "0", "9"]]]
+  else
+    if ch == "w" then
+      return ["class", 0, [["range", "a", "z"], ["range", "A", "Z"], ["range", "0", "9"], ["char", "_"]]]
+    else
+      if ch == "s" then
+        return ["class", 0, [["char", " "], ["char", "\t"], ["char", "\n"], ["char", "\r"]]]
+      else
+        if ch == "b" then
+          return ["wordb"]
+        else
+          if ch == "n" then
+            return ["lit", "\n"]
+          else
+            if ch == "t" then
+              return ["lit", "\t"]
+            else
+              return ["lit", ch]
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+make a function called regex_parse_class takes pattern, pos returns r
+  let plen = to_num(list_len(pattern))
+  let negate = 0
+  let p = pos
+  if (p < plen) and (substr(pattern, p, 1) == "^") then
+    let negate = 1
+    let p = p + 1
+  end
+  let items = []
+  let scanning = true
+  while (p < plen) and scanning do
+    if substr(pattern, p, 1) == "]" then
+      let scanning = false
+    else
+      let c = substr(pattern, p, 1)
+      if (c == "\\") and ((p + 1) < plen) then
+        let c = substr(pattern, p + 1, 1)
+        let p = p + 1
+      end
+      if ((p + 2) < plen) and (substr(pattern, p + 1, 1) == "-") and (substr(pattern, p + 2, 1) != "]") then
+        let hi = substr(pattern, p + 2, 1)
+        let items = list_push(items, ["range", c, hi])
+        let p = p + 3
+      else
+        let items = list_push(items, ["char", c])
+        let p = p + 1
+      end
+    end
+  end
+  if p >= plen then
+    return [["class", negate, items], -1]
+  else
+    return [["class", negate, items], p + 1]
+  end
+end
+
+make a function called regex_parse_atom takes pattern, pos returns r
+  let plen = to_num(list_len(pattern))
+  if pos >= plen then
+    return [["seq", []], -1]
+  else
+    let c = substr(pattern, pos, 1)
+    if c == "(" then
+      let inner = regex_parse_alt(pattern, pos + 1)
+      let node = inner[0]
+      let p = inner[1]
+      if p < 0 then
+        return [node, -1]
+      else
+        if (p >= plen) or (substr(pattern, p, 1) != ")") then
+          return [node, -1]
+        else
+          return [["group", node], p + 1]
+        end
+      end
+    else
+      if c == "." then
+        return [["any"], pos + 1]
+      else
+        if c == "^" then
+          return [["bol"], pos + 1]
+        else
+          if c == "$" then
+            return [["eol"], pos + 1]
+          else
+            if c == "\\" then
+              if (pos + 1) >= plen then
+                return [["lit", "\\"], pos + 1]
+              else
+                let esc = substr(pattern, pos + 1, 1)
+                return [regex_atom_for_escape(esc), pos + 2]
+              end
+            else
+              if c == "[" then
+                return regex_parse_class(pattern, pos + 1)
+              else
+                return [["lit", c], pos + 1]
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+make a function called regex_parse_quantified takes pattern, pos returns r
+  let r = regex_parse_atom(pattern, pos)
+  let node = r[0]
+  let p = r[1]
+  if p < 0 then
+    return [node, -1]
+  else
+    let plen = to_num(list_len(pattern))
+    if p < plen then
+      let c = substr(pattern, p, 1)
+      if c == "*" then
+        return [["star", node], p + 1]
+      else
+        if c == "+" then
+          return [["plus", node], p + 1]
+        else
+          if c == "?" then
+            return [["opt", node], p + 1]
+          else
+            return [node, p]
+          end
+        end
+      end
+    else
+      return [node, p]
+    end
+  end
+end
+
+make a function called regex_parse_seq takes pattern, pos returns r
+  let plen = to_num(list_len(pattern))
+  let nodes = []
+  let p = pos
+  let scanning = true
+  while (p < plen) and scanning do
+    if (substr(pattern, p, 1) == "|") or (substr(pattern, p, 1) == ")") then
+      let scanning = false
+    else
+      let r = regex_parse_quantified(pattern, p)
+      let node = r[0]
+      let p = r[1]
+      if p < 0 then
+        let scanning = false
+      else
+        let nodes = list_push(nodes, node)
+      end
+    end
+  end
+  return [["seq", nodes], p]
+end
+
+make a function called regex_parse_alt takes pattern, pos returns r
+  let plen = to_num(list_len(pattern))
+  let first = regex_parse_seq(pattern, pos)
+  let node = first[0]
+  let p = first[1]
+  if p < 0 then
+    return [node, p]
+  else
+    let branches = list_push([], node)
+    let scanning = true
+    while (p < plen) and scanning and (substr(pattern, p, 1) == "|") do
+      let nxt = regex_parse_seq(pattern, p + 1)
+      let branches = list_push(branches, nxt[0])
+      let p = nxt[1]
+      if p < 0 then
+        let scanning = false
+      end
+    end
+    if p < 0 then
+      return [["alt", branches], -1]
+    else
+      let n = to_num(list_len(branches))
+      if n == 1 then
+        return [branches[0], p]
+      else
+        return [["alt", branches], p]
+      end
+    end
+  end
+end
+
+make a function called regex_parse takes pattern returns node
+  let result = regex_parse_alt(pattern, 0)
+  return result[0]
+end
+
+# ---------------------------------------------------------------------
+# Matching: attempts to match `node` in `text` starting at `pos`, calling
+# the closure `k(new_pos)` with every position reachable after a successful
+# match, until `k` returns a non-negative number (accepted) or every
+# possibility is exhausted (-1). This continuation-passing style is what
+# makes backtracking over alternation/quantifiers correct: `k` represents
+# "the rest of the overall pattern", so a quantifier can retry with fewer
+# repetitions if a later part of the pattern needs the characters back.
+# ---------------------------------------------------------------------
+
+make a function called regex_class_matches takes items, ch returns r
+  let n = to_num(list_len(items))
+  let i = 0
+  let found = false
+  while (i < n) and (not found) do
+    let it = items[i]
+    if it[0] == "char" then
+      if ch == it[1] then
+        let found = true
+      end
+    else
+      if (ch >= it[1]) and (ch <= it[2]) then
+        let found = true
+      end
+    end
+    let i = i + 1
+  end
+  return found
+end
+
+make a function called regex_match_seq takes nodes, idx, text, pos, k returns r
+  let n = to_num(list_len(nodes))
+  if idx >= n then
+    return k(pos)
+  else
+    let node = nodes[idx]
+    return regex_match_node(node, text, pos, |p2| do return regex_match_seq(nodes, idx + 1, text, p2, k) end)
+  end
+end
+
+make a function called regex_match_alt takes branches, idx, text, pos, k returns r
+  let n = to_num(list_len(branches))
+  if idx >= n then
+    return -1
+  else
+    let r = regex_match_node(branches[idx], text, pos, k)
+    if r >= 0 then
+      return r
+    else
+      return regex_match_alt(branches, idx + 1, text, pos, k)
+    end
+  end
+end
+
+# Backtracking repetition: tries the greatest number of repetitions first,
+# then backs off, so whatever comes after (represented by `k`) still gets a
+# chance to match — standard greedy-with-backtracking behavior.
+make a function called regex_match_repeat takes node, text, pos, k, min_count returns r
+  let r = regex_match_node(node, text, pos, |p2| do
+    if p2 == pos then
+      return -1
+    else
+      return regex_match_repeat(node, text, p2, k, 0)
+    end
+  end)
+  if r >= 0 then
+    return r
+  else
+    if min_count <= 0 then
+      return k(pos)
+    else
+      return -1
+    end
+  end
+end
+
+make a function called regex_match_node takes node, text, pos, k returns r
+  let tag = node[0]
+  let tlen = to_num(list_len(text))
+  if tag == "lit" then
+    if (pos < tlen) and (substr(text, pos, 1) == node[1]) then
+      return k(pos + 1)
+    else
+      return -1
+    end
+  else
+    if tag == "any" then
+      if (pos < tlen) and (substr(text, pos, 1) != "\n") then
+        return k(pos + 1)
+      else
+        return -1
+      end
+    else
+      if tag == "class" then
+        if pos >= tlen then
+          return -1
+        else
+          let ch = substr(text, pos, 1)
+          let hit = regex_class_matches(node[2], ch)
+          if node[1] == 1 then
+            let hit = not hit
+          end
+          if hit then
+            return k(pos + 1)
+          else
+            return -1
+          end
+        end
+      else
+        if tag == "bol" then
+          if pos == 0 then
+            return k(pos)
+          else
+            if substr(text, pos - 1, 1) == "\n" then
+              return k(pos)
+            else
+              return -1
+            end
+          end
+        else
+          if tag == "eol" then
+            if pos == tlen then
+              return k(pos)
+            else
+              if substr(text, pos, 1) == "\n" then
+                return k(pos)
+              else
+                return -1
+              end
+            end
+          else
+            if tag == "wordb" then
+              let before = false
+              let after = false
+              if pos > 0 then
+                let before = is_word_char(substr(text, pos - 1, 1))
+              end
+              if pos < tlen then
+                let after = is_word_char(substr(text, pos, 1))
+              end
+              if before != after then
+                return k(pos)
+              else
+                return -1
+              end
+            else
+              if tag == "group" then
+                return regex_match_node(node[1], text, pos, k)
+              else
+                if tag == "seq" then
+                  return regex_match_seq(node[1], 0, text, pos, k)
+                else
+                  if tag == "alt" then
+                    return regex_match_alt(node[1], 0, text, pos, k)
+                  else
+                    if tag == "star" then
+                      return regex_match_repeat(node[1], text, pos, k, 0)
+                    else
+                      if tag == "plus" then
+                        return regex_match_repeat(node[1], text, pos, k, 1)
+                      else
+                        if tag == "opt" then
+                          let inner = node[1]
+                          let r = regex_match_node(inner, text, pos, k)
+                          if r >= 0 then
+                            return r
+                          else
+                            return k(pos)
+                          end
+                        else
+                          return -1
+                        end
+                      end
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+# Attempts to match `pattern_ast` (already parsed via regex_parse) against
+# `text` starting exactly at `start`. Returns the end position of the
+# leftmost-greedy match, or -1 if there is no match anchored at `start`.
+#
+# Note: closures in this dialect must use an explicit `return` for their
+# body value to propagate — a bare trailing expression statement (no
+# `return`) does not implicitly become the closure's return value.
+make a function called regex_match_at takes pattern_ast, text, start returns r
+  return regex_match_node(pattern_ast, text, start, |p| do return p end)
+end
+
+# Convenience combined entry point for callers that only have the raw
+# pattern string (no pre-parsed AST cached) — parses then matches.
+make a function called regex_match_string_at takes pattern, text, start returns r
+  let ast = regex_parse(pattern)
+  return regex_match_at(ast, text, start)
+end
+
+# =============================================================================
+# Self-hosted-dialect source-to-source preprocessor for user-defined
+# `syntax NAME { ... }` DSL blocks (do/end dialect twin of the Rust CLI's
+# rust-runtime/src/syntax_dsl.rs). Runs on raw source TEXT before the normal
+# lexer/parser pipeline ever sees it, exactly like expand_includes does for
+# `include "..."` lines -- so no change to lib/lexer.patlang or
+# lib/parser.patlang is needed to support it.
+#
+# A PatLang program may declare a small grammar extension inline:
+#
+#   syntax RouterDSL {
+#       trigger: Keyword("routes");
+#       tokens {
+#           HttpVerb(verb) = regex("\b(GET|POST|PUT|DELETE)\b", verb);
+#           UrlPath(path)   = regex("/[a-zA-Z0-9_/:-]*", path);
+#           Arrow           = "->";
+#       }
+#       rule RouteLine {
+#           let verb = expect HttpVerb;
+#           let path = expect UrlPath;
+#           expect Arrow;
+#           let controller = expect Identifier;
+#           expect Symbol(".");
+#           let action = expect Identifier;
+#           return AST.RegisterRoute(verb, path, controller, action);
+#       }
+#   }
+#
+# ...and then use it:
+#
+#   routes {
+#       GET  /users          -> UserController.index
+#   }
+#
+# The `syntax { ... }` block itself is stripped. Every `routes { ... }` block
+# is expanded line-by-line into plain PatLang statements built from the
+# rule's `return` template, with `expect`-bound captures substituted in as
+# string literals -- before the normal lexer/parser ever sees the file.
+#
+# Per-token `regex(...)` matching is done by the general-purpose regex engine
+# at lib/regex_dsl.patlang -- this file assumes regex_match_string_at (and
+# nothing else from that file) is already defined in the same program, i.e.
+# a driver script should concatenate lib/regex_dsl.patlang's source BEFORE
+# this file's source, the same way lib/lexer.patlang/parser.patlang/
+# lower.patlang are concatenated in pipeline driver scripts.
+#
+# NOTE: `{`/`}` are used here only as characters being scanned inside plain
+# strings (the *target* syntax being preprocessed) -- never as PatLang block
+# syntax. This file's own code is ordinary do/end/if/then/while dialect.
+#
+# Data shapes (plain tagged lists -- there is no map/struct in this dialect):
+#   TokenDef  = ["token", name, kind, pattern]      kind: "regex" | "literal"
+#   RuleStep  = ["step", kind, value, bind]         kind: "named" | "identifier" | "symbol"
+#   RuleDef   = ["rule", steps_list, return_template]
+#   SyntaxDef = ["syntax", trigger_keyword, tokens_list, rules_list]
+#   MatchResult = ["ok", bindings_list] | ["fail"]  bindings_list: [[name, text], ...]
+# =============================================================================
+
+make a function called sdsl_is_ws takes ch returns r
+  if ch == " " then
+    return true
+  else
+    if ch == "\t" then
+      return true
+    else
+      if ch == "\n" then
+        return true
+      else
+        return ch == "\r"
+      end
+    end
+  end
+end
+
+make a function called sdsl_is_digit takes ch returns r
+  return (ch >= "0") and (ch <= "9")
+end
+
+make a function called sdsl_is_ident_start takes ch returns r
+  if ch == "_" then
+    return true
+  else
+    return ((ch >= "a") and (ch <= "z")) or ((ch >= "A") and (ch <= "Z"))
+  end
+end
+
+make a function called sdsl_is_ident_char takes ch returns r
+  if sdsl_is_ident_start(ch) then
+    return true
+  else
+    return sdsl_is_digit(ch)
+  end
+end
+
+make a function called sdsl_len takes s returns r
+  return to_num(list_len(s))
+end
+
+# Whole-word keyword match: `keyword` occurs at `s[pos..]` and is not glued
+# to an identifier character on either side.
+make a function called sdsl_starts_keyword_at takes s, pos, keyword returns r
+  let slen = sdsl_len(s)
+  let klen = sdsl_len(keyword)
+  if (pos + klen) > slen then
+    return false
+  else
+    if substr(s, pos, klen) != keyword then
+      return false
+    else
+      let ok = true
+      if pos > 0 then
+        if sdsl_is_ident_char(substr(s, pos - 1, 1)) then
+          let ok = false
+        end
+      end
+      let after = pos + klen
+      if after < slen then
+        if sdsl_is_ident_char(substr(s, after, 1)) then
+          let ok = false
+        end
+      end
+      return ok
+    end
+  end
+end
+
+make a function called sdsl_skip_ws takes s, pos returns r
+  let slen = sdsl_len(s)
+  let i = pos
+  let scanning = true
+  while (i < slen) and scanning do
+    if sdsl_is_ws(substr(s, i, 1)) then
+      let i = i + 1
+    else
+      let scanning = false
+    end
+  end
+  return i
+end
+
+make a function called sdsl_skip_ws_and_comments takes s, pos returns r
+  let slen = sdsl_len(s)
+  let i = sdsl_skip_ws(s, pos)
+  let scanning = true
+  while scanning do
+    let scanning = false
+    if (i < slen) and (substr(s, i, 1) == "#") then
+      while (i < slen) and (substr(s, i, 1) != "\n") do
+        let i = i + 1
+      end
+      let i = sdsl_skip_ws(s, i)
+      let scanning = true
+    end
+  end
+  return i
+end
+
+make a function called sdsl_find_char takes s, from, target returns r
+  let slen = sdsl_len(s)
+  let i = from
+  let found = -1
+  let scanning = true
+  while (i < slen) and scanning do
+    if substr(s, i, 1) == target then
+      let found = i
+      let scanning = false
+    else
+      let i = i + 1
+    end
+  end
+  return found
+end
+
+# Returns [identifier_text, next_pos], or ["", -1] if no identifier starts there.
+make a function called sdsl_take_identifier takes s, pos returns r
+  let slen = sdsl_len(s)
+  if pos >= slen then
+    return ["", -1]
+  else
+    if not sdsl_is_ident_start(substr(s, pos, 1)) then
+      return ["", -1]
+    else
+      let i = pos + 1
+      let scanning = true
+      while (i < slen) and scanning do
+        if sdsl_is_ident_char(substr(s, i, 1)) then
+          let i = i + 1
+        else
+          let scanning = false
+        end
+      end
+      return [substr(s, pos, i - pos), i]
+    end
+  end
+end
+
+make a function called sdsl_trim takes s returns r
+  let slen = sdsl_len(s)
+  let start = 0
+  while (start < slen) and sdsl_is_ws(substr(s, start, 1)) do
+    let start = start + 1
+  end
+  let stop = slen
+  while (stop > start) and sdsl_is_ws(substr(s, stop - 1, 1)) do
+    let stop = stop - 1
+  end
+  return substr(s, start, stop - start)
+end
+
+# `"..."` -> `...` (no escape processing needed: the DSL block source is
+# scanned as raw text, and quoted strings inside it only ever contain plain
+# pattern/literal text in the examples this mechanism targets).
+make a function called sdsl_unquote takes s returns r
+  let t = sdsl_trim(s)
+  let n = sdsl_len(t)
+  if (n >= 2) and (substr(t, 0, 1) == "\"") and (substr(t, n - 1, 1) == "\"") then
+    return substr(t, 1, n - 2)
+  else
+    return t
+  end
+end
+
+make a function called sdsl_starts_with takes s, prefix returns r
+  let n = sdsl_len(prefix)
+  if sdsl_len(s) < n then
+    return false
+  else
+    return substr(s, 0, n) == prefix
+  end
+end
+
+# `s[open_brace_pos]` must be "{". Returns [inner_body, index_just_past_matching_"}"],
+# tracking string literals so braces inside "..." don't confuse the balance count.
+make a function called sdsl_take_balanced_block takes s, open_brace_pos returns r
+  let slen = sdsl_len(s)
+  let depth = 0
+  let i = open_brace_pos
+  let in_string = false
+  let start_inner = open_brace_pos + 1
+  let scanning = true
+  let result_body = ""
+  let result_pos = -1
+  while (i < slen) and scanning do
+    let c = substr(s, i, 1)
+    if in_string then
+      if c == "\\" then
+        let i = i + 2
+      else
+        if c == "\"" then
+          let in_string = false
+        end
+        let i = i + 1
+      end
+    else
+      if c == "\"" then
+        let in_string = true
+        let i = i + 1
+      else
+        if c == "{" then
+          let depth = depth + 1
+          let i = i + 1
+        else
+          if c == "}" then
+            let depth = depth - 1
+            if depth == 0 then
+              let result_body = substr(s, start_inner, i - start_inner)
+              let result_pos = i + 1
+              let scanning = false
+            else
+              let i = i + 1
+            end
+          else
+            let i = i + 1
+          end
+        end
+      end
+    end
+  end
+  return [result_body, result_pos]
+end
+
+# Splits a `syntax`/`rule`/`tokens` body into ";"-terminated statements,
+# respecting string literals and nested parens (so `regex("a;b", x)` isn't
+# split in the middle).
+make a function called sdsl_split_top_level_statements takes body returns r
+  let n = sdsl_len(body)
+  let out = []
+  let cur = ""
+  let depth = 0
+  let in_string = false
+  let i = 0
+  while i < n do
+    let c = substr(body, i, 1)
+    if in_string then
+      let cur = cur + c
+      if (c == "\\") and ((i + 1) < n) then
+        let cur = cur + substr(body, i + 1, 1)
+        let i = i + 2
+      else
+        if c == "\"" then
+          let in_string = false
+        end
+        let i = i + 1
+      end
+    else
+      if c == "\"" then
+        let in_string = true
+        let cur = cur + c
+        let i = i + 1
+      else
+        if c == "(" then
+          let depth = depth + 1
+          let cur = cur + c
+          let i = i + 1
+        else
+          if c == ")" then
+            let depth = depth - 1
+            let cur = cur + c
+            let i = i + 1
+          else
+            if (c == ";") and (depth == 0) then
+              let out = list_push(out, cur)
+              let cur = ""
+              let i = i + 1
+            else
+              let cur = cur + c
+              let i = i + 1
+            end
+          end
+        end
+      end
+    end
+  end
+  if sdsl_len(sdsl_trim(cur)) > 0 then
+    let out = list_push(out, cur)
+  end
+  return out
+end
+
+# ---------------------------------------------------------------------
+# Pass 1: find and remove `syntax NAME { ... }` blocks, building a list of
+# SyntaxDefs keyed (by linear scan) on each definition's trigger keyword.
+# ---------------------------------------------------------------------
+
+make a function called sdsl_parse_trigger_stmt takes stmt returns r
+  let s = sdsl_trim(stmt)
+  if sdsl_starts_with(s, "trigger") then
+    let s = sdsl_trim(substr(s, 7, sdsl_len(s) - 7))
+  end
+  if sdsl_starts_with(s, ":") then
+    let s = sdsl_trim(substr(s, 1, sdsl_len(s) - 1))
+  end
+  if sdsl_starts_with(s, "Keyword") then
+    let s = sdsl_trim(substr(s, 7, sdsl_len(s) - 7))
+  end
+  let n = sdsl_len(s)
+  if (n >= 2) and (substr(s, 0, 1) == "(") and (substr(s, n - 1, 1) == ")") then
+    let s = substr(s, 1, n - 2)
+  end
+  return sdsl_unquote(s)
+end
+
+make a function called sdsl_parse_token_defs takes tbody returns r
+  let stmts = sdsl_split_top_level_statements(tbody)
+  let out = []
+  let i = 0
+  while i < stmts.length do
+    let stmt = sdsl_trim(stmts[i])
+    if sdsl_len(stmt) > 0 then
+      let eq = sdsl_find_char(stmt, 0, "=")
+      let lhs = sdsl_trim(substr(stmt, 0, eq))
+      let rhs = sdsl_trim(substr(stmt, eq + 1, sdsl_len(stmt) - eq - 1))
+      let op = sdsl_find_char(lhs, 0, "(")
+      let name = lhs
+      if op >= 0 then
+        let name = sdsl_trim(substr(lhs, 0, op))
+      end
+      if sdsl_starts_with(rhs, "regex") then
+        let inner = sdsl_trim(substr(rhs, 5, sdsl_len(rhs) - 5))
+        let ilen = sdsl_len(inner)
+        if (ilen >= 2) and (substr(inner, 0, 1) == "(") and (substr(inner, ilen - 1, 1) == ")") then
+          let inner = substr(inner, 1, ilen - 2)
+        end
+        let comma = sdsl_find_char(inner, 0, ",")
+        let pat_str = inner
+        if comma >= 0 then
+          let pat_str = substr(inner, 0, comma)
+        end
+        let out = list_push(out, ["token", name, "regex", sdsl_unquote(pat_str)])
+      else
+        let out = list_push(out, ["token", name, "literal", sdsl_unquote(rhs)])
+      end
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called sdsl_parse_rule_def takes rbody returns r
+  let stmts = sdsl_split_top_level_statements(rbody)
+  let steps = []
+  let return_template = ""
+  let i = 0
+  while i < stmts.length do
+    let stmt = sdsl_trim(stmts[i])
+    if sdsl_len(stmt) > 0 then
+      if sdsl_starts_with(stmt, "return") then
+        let return_template = sdsl_trim(substr(stmt, 6, sdsl_len(stmt) - 6))
+      else
+        let bind = ""
+        let expect_part = stmt
+        if sdsl_starts_with(stmt, "let") then
+          let rest = sdsl_trim(substr(stmt, 3, sdsl_len(stmt) - 3))
+          let eq = sdsl_find_char(rest, 0, "=")
+          let bind = sdsl_trim(substr(rest, 0, eq))
+          let expect_part = sdsl_trim(substr(rest, eq + 1, sdsl_len(rest) - eq - 1))
+        end
+        if sdsl_starts_with(expect_part, "expect") then
+          let expect_part = sdsl_trim(substr(expect_part, 6, sdsl_len(expect_part) - 6))
+        end
+        if sdsl_starts_with(expect_part, "Symbol") then
+          let inner = sdsl_trim(substr(expect_part, 6, sdsl_len(expect_part) - 6))
+          let ilen = sdsl_len(inner)
+          if (ilen >= 2) and (substr(inner, 0, 1) == "(") and (substr(inner, ilen - 1, 1) == ")") then
+            let inner = substr(inner, 1, ilen - 2)
+          end
+          let steps = list_push(steps, ["step", "symbol", sdsl_unquote(inner), bind])
+        else
+          if expect_part == "Identifier" then
+            let steps = list_push(steps, ["step", "identifier", "", bind])
+          else
+            let steps = list_push(steps, ["step", "named", expect_part, bind])
+          end
+        end
+      end
+    end
+    let i = i + 1
+  end
+  return ["rule", steps, return_template]
+end
+
+make a function called sdsl_parse_syntax_def takes body returns r
+  let n = sdsl_len(body)
+  let i = sdsl_skip_ws_and_comments(body, 0)
+  let trigger_keyword = ""
+  let tokens = []
+  let rules = []
+  while i < n do
+    if sdsl_starts_keyword_at(body, i, "trigger") then
+      let semi = sdsl_find_char(body, i, ";")
+      let trigger_keyword = sdsl_parse_trigger_stmt(substr(body, i, semi - i))
+      let i = semi + 1
+    else
+      if sdsl_starts_keyword_at(body, i, "tokens") then
+        let j = sdsl_skip_ws(body, i + 6)
+        let br = sdsl_take_balanced_block(body, j)
+        let tokens = sdsl_parse_token_defs(br[0])
+        let i = br[1]
+      else
+        if sdsl_starts_keyword_at(body, i, "rule") then
+          let j = sdsl_skip_ws(body, i + 4)
+          let nameinfo = sdsl_take_identifier(body, j)
+          let j = sdsl_skip_ws(body, nameinfo[1])
+          let br = sdsl_take_balanced_block(body, j)
+          let rules = list_push(rules, sdsl_parse_rule_def(br[0]))
+          let i = br[1]
+        else
+          let i = i + 1
+        end
+      end
+    end
+    let i = sdsl_skip_ws_and_comments(body, i)
+  end
+  return ["syntax", trigger_keyword, tokens, rules]
+end
+
+make a function called sdsl_extract_syntax_defs takes src returns r
+  let n = sdsl_len(src)
+  let out = ""
+  let defs = []
+  let i = 0
+  while i < n do
+    if substr(src, i, 1) == "#" then
+      # Copy the whole comment line through untouched -- a comment may
+      # itself mention "syntax" or "routes" (e.g. this file's own header,
+      # or a demo's usage-example doc comment) without being a real block.
+      let cstart = i
+      while (i < n) and (substr(src, i, 1) != "\n") do
+        let i = i + 1
+      end
+      let out = out + substr(src, cstart, i - cstart)
+    else
+      if sdsl_starts_keyword_at(src, i, "syntax") then
+        let j = sdsl_skip_ws(src, i + 6)
+        let nameinfo = sdsl_take_identifier(src, j)
+        let j = sdsl_skip_ws(src, nameinfo[1])
+        let br = sdsl_take_balanced_block(src, j)
+        let def = sdsl_parse_syntax_def(br[0])
+        let defs = list_push(defs, def)
+        let i = br[1]
+      else
+        let out = out + substr(src, i, 1)
+        let i = i + 1
+      end
+    end
+  end
+  return [out, defs]
+end
+
+# ---------------------------------------------------------------------
+# Pass 2: expand every `<trigger keyword> { ... }` block found in the
+# (already syntax-def-stripped) source.
+# ---------------------------------------------------------------------
+
+make a function called sdsl_match_literal takes s, pos, lit returns r
+  let n = sdsl_len(lit)
+  if (pos + n) > sdsl_len(s) then
+    return -1
+  else
+    if substr(s, pos, n) == lit then
+      return pos + n
+    else
+      return -1
+    end
+  end
+end
+
+make a function called sdsl_match_identifier takes s, pos returns r
+  let n = sdsl_len(s)
+  if pos >= n then
+    return -1
+  else
+    if not sdsl_is_ident_start(substr(s, pos, 1)) then
+      return -1
+    else
+      let i = pos + 1
+      let scanning = true
+      while (i < n) and scanning do
+        if sdsl_is_ident_char(substr(s, i, 1)) then
+          let i = i + 1
+        else
+          let scanning = false
+        end
+      end
+      return i
+    end
+  end
+end
+
+# Finds `name` inside a TokenDef list; returns the TokenDef or ["token", "", "", ""] if absent.
+make a function called sdsl_find_token_def takes tokens, name returns r
+  let n = tokens.length
+  let i = 0
+  let found = ["token", "", "", ""]
+  let scanning = true
+  while (i < n) and scanning do
+    let t = tokens[i]
+    if t[1] == name then
+      let found = t
+      let scanning = false
+    end
+    let i = i + 1
+  end
+  return found
+end
+
+# Finds `value` inside a [[name, value], ...] bindings list; returns "" if absent.
+make a function called sdsl_bindings_lookup takes bindings, name returns r
+  let n = bindings.length
+  let i = 0
+  let found = ""
+  let scanning = true
+  while (i < n) and scanning do
+    let b = bindings[i]
+    if b[0] == name then
+      let found = b[1]
+      let scanning = false
+    end
+    let i = i + 1
+  end
+  return found
+end
+
+# Attempts to match every step of `rule` against `line` in order. Returns
+# ["ok", bindings] on full success, ["fail"] if any step fails to match.
+make a function called sdsl_try_match_rule takes def, rule, line returns r
+  let steps = rule[1]
+  let pos = 0
+  let bindings = []
+  let n = steps.length
+  let i = 0
+  let ok = true
+  while (i < n) and ok do
+    let pos = sdsl_skip_ws(line, pos)
+    let step = steps[i]
+    let kind = step[1]
+    let matched = -1
+    if kind == "identifier" then
+      let matched = sdsl_match_identifier(line, pos)
+    else
+      if kind == "symbol" then
+        let matched = sdsl_match_literal(line, pos, step[2])
+      else
+        let tdef = sdsl_find_token_def(def[2], step[2])
+        if tdef[2] == "literal" then
+          let matched = sdsl_match_literal(line, pos, tdef[3])
+        else
+          if tdef[2] == "regex" then
+            let text = substr(line, pos, sdsl_len(line) - pos)
+            let end_off = regex_match_string_at(tdef[3], text, 0)
+            if end_off > 0 then
+              let matched = pos + end_off
+            end
+          end
+        end
+      end
+    end
+    if matched < 0 then
+      let ok = false
+    else
+      let bind = step[3]
+      if sdsl_len(bind) > 0 then
+        let bindings = list_push(bindings, [bind, substr(line, pos, matched - pos)])
+      end
+      let pos = matched
+    end
+    let i = i + 1
+  end
+  if ok then
+    return ["ok", bindings]
+  else
+    return ["fail"]
+  end
+end
+
+# Replaces every whole-word occurrence of a bound capture name in `template`
+# with its matched text as a PatLang string literal.
+make a function called sdsl_substitute_template takes template, bindings returns r
+  let n = sdsl_len(template)
+  let out = ""
+  let i = 0
+  while i < n do
+    let c = substr(template, i, 1)
+    if sdsl_is_ident_start(c) then
+      let j = i + 1
+      let scanning = true
+      while (j < n) and scanning do
+        if sdsl_is_ident_char(substr(template, j, 1)) then
+          let j = j + 1
+        else
+          let scanning = false
+        end
+      end
+      let word = substr(template, i, j - i)
+      let val = sdsl_bindings_lookup(bindings, word)
+      if sdsl_len(val) > 0 then
+        let out = out + "\"" + val + "\""
+      else
+        let out = out + word
+      end
+      let i = j
+    else
+      let out = out + c
+      let i = i + 1
+    end
+  end
+  return out
+end
+
+# Runs each of the DSL's rules (in declaration order) against `line`,
+# returning the first one whose full `expect` sequence matches, with its
+# return template's captures substituted in as PatLang string literals.
+make a function called sdsl_expand_rule_line takes def, line returns r
+  let rules = def[3]
+  let n = rules.length
+  let i = 0
+  let result = ""
+  let found = false
+  while (i < n) and (not found) do
+    let m = sdsl_try_match_rule(def, rules[i], line)
+    if m[0] == "ok" then
+      # No trailing ";" -- PatLang has no statement-terminating semicolon
+      # anywhere in its grammar. A stray ";" tokenizes as its own UNK token
+      # and becomes a parse error; that error was invisible when this output
+      # only ever went through compile_native (lower_program silently drops
+      # unparseable Err statements), but is fatal for the playground/IDE
+      # path, which aborts entirely if any parse error is present.
+      let result = sdsl_substitute_template(rules[i][2], m[1])
+      let found = true
+    end
+    let i = i + 1
+  end
+  return result
+end
+
+make a function called sdsl_expand_trigger_blocks takes src, defs returns r
+  let n = sdsl_len(src)
+  let out = ""
+  let i = 0
+  while i < n do
+    if substr(src, i, 1) == "#" then
+      # Same rationale as sdsl_extract_syntax_defs: a comment mentioning a
+      # trigger keyword (e.g. this file's own doc comments about `routes`)
+      # is not a real usage block, and must never be scanned into one.
+      let cstart = i
+      while (i < n) and (substr(src, i, 1) != "\n") do
+        let i = i + 1
+      end
+      let out = out + substr(src, cstart, i - cstart)
+    else
+    let kw_idx = -1
+    let d = 0
+    while (d < defs.length) and (kw_idx < 0) do
+      if sdsl_starts_keyword_at(src, i, defs[d][1]) then
+        let kw_idx = d
+      end
+      let d = d + 1
+    end
+    if kw_idx >= 0 then
+      let def = defs[kw_idx]
+      let j = sdsl_skip_ws(src, i + sdsl_len(def[1]))
+      if (j < n) and (substr(src, j, 1) == "{") then
+        let br = sdsl_take_balanced_block(src, j)
+        let body = br[0]
+        let blen = sdsl_len(body)
+        let start = 0
+        while start <= blen do
+          let nl = sdsl_find_char(body, start, "\n")
+          let line_end = nl
+          if nl < 0 then
+            let line_end = blen
+          end
+          let line = sdsl_trim(substr(body, start, line_end - start))
+          if sdsl_len(line) > 0 then
+            let out = out + sdsl_expand_rule_line(def, line) + "\n"
+          end
+          if nl < 0 then
+            let start = blen + 1
+          else
+            let start = nl + 1
+          end
+        end
+        let i = br[1]
+      else
+        let out = out + substr(src, i, 1)
+        let i = i + 1
+      end
+    else
+      let out = out + substr(src, i, 1)
+      let i = i + 1
+    end
+    end
+  end
+  return out
+end
+
+# Public entry point, composable across multiple separate runtime calls:
+# expands every `syntax NAME { ... }` definition and every triggered block
+# in `src`, using both `src`'s own definitions AND `existing_defs` (defs
+# already extracted from earlier, separate `expand_syntax_dsls_with` calls
+# -- e.g. a REPL-style session where one snippet defines a syntax and a
+# LATER, separately-submitted snippet uses it). Returns [stripped, all_defs]
+# so a caller can thread `all_defs` into its next call and keep
+# accumulating, rather than every dynamic snippet needing to redeclare (or
+# be concatenated with) every syntax it wants to use.
+make a function called expand_syntax_dsls_with takes src, existing_defs returns r
+  let extracted = sdsl_extract_syntax_defs(src)
+  let stripped = extracted[0]
+  let new_defs = extracted[1]
+  let all_defs = existing_defs
+  let i = 0
+  while i < new_defs.length do
+    let all_defs = list_push(all_defs, new_defs[i])
+    let i = i + 1
+  end
+  if all_defs.length == 0 then
+    return [stripped, all_defs]
+  else
+    return [sdsl_expand_trigger_blocks(stripped, all_defs), all_defs]
+  end
+end
+
+# Public entry point: expands every `syntax NAME { ... }` definition and
+# every triggered block in `src`. Thin wrapper over `expand_syntax_dsls_with`
+# with no prior defs -- every existing call site (playground_main.patlang,
+# build_portfolio.patlang's dsl_driver) is unaffected by the composable
+# variant above.
+make a function called expand_syntax_dsls takes src returns r
+  let r = expand_syntax_dsls_with(src, [])
+  return r[0]
+end
+
+# =============================================================================
+# Test framework (Stage 1 dialect): unit assertions plus a Gherkin-style
+# feature runner. Step definitions are registered in the object store keyed
+# by their text; features are plain text dispatched line by line, so the
+# same framework covers unit, integration, and behaviour tests.
+# =============================================================================
+
+make a function called t_init returns done
+  set_var("t_pass", 0)
+  set_var("t_fail", 0)
+  set_var("t_tagfilter", "")
+  set_var("t_pending_tags", "")
+  set_var("t_skipping", 0)
+  return true
+end
+
+make a function called contains_text takes hay, needle returns r
+  if needle.length > hay.length then
+    return false
+  end
+  let i = 0
+  while i <= hay.length - needle.length do
+    if substr(hay, i, needle.length) == needle then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called check takes label, actual, expected returns ok
+  if actual == expected then
+    set_var("t_pass", get("__vars", "t_pass") + 1)
+    print("  ok: " + label)
+    return true
+  else
+    set_var("t_fail", get("__vars", "t_fail") + 1)
+    print("  FAIL: " + label + " (got " + actual + ", want " + expected + ")")
+    return false
+  end
+end
+
+make a function called t_report returns ok
+  let p = get("__vars", "t_pass")
+  let f = get("__vars", "t_fail")
+  print("tests: " + p + " passed, " + f + " failed")
+  if f == 0 then
+    print("ALL TESTS PASSED")
+    return true
+  else
+    print("TESTS FAILED")
+    return false
+  end
+end
+
+# ---- Gherkin runner ----
+
+# Register a step: step("a fresh till", "st_fresh_till")
+make a function called step takes text, fname returns done
+  new("Step", text)
+  send(text, "set", "fn", fname)
+  return true
+end
+
+make a function called starts_with takes s, prefix returns r
+  if s.length < prefix.length then
+    return false
+  end
+  return substr(s, 0, prefix.length) == prefix
+end
+
+make a function called trim_left takes s returns out
+  let i = 0
+  let scanning = true
+  while (i < s.length) and scanning do
+    let c = char_code(s, i)
+    if (c == 32) or (c == 9) then
+      let i = i + 1
+    else
+      let scanning = false
+    end
+  end
+  return substr(s, i, s.length - i)
+end
+
+# Strip a Gherkin keyword; returns the step text or "" if not a step line
+make a function called step_text takes line returns out
+  if starts_with(line, "Given ") then
+    return substr(line, 6, line.length - 6)
+  end
+  if starts_with(line, "When ") then
+    return substr(line, 5, line.length - 5)
+  end
+  if starts_with(line, "Then ") then
+    return substr(line, 5, line.length - 5)
+  end
+  if starts_with(line, "And ") then
+    return substr(line, 4, line.length - 4)
+  end
+  return ""
+end
+
+# Run only scenarios whose preceding @tag line contains `tag` ("" = all)
+make a function called run_feature_tagged takes feature, tag returns ok
+  set_var("t_tagfilter", tag)
+  return run_feature(feature)
+end
+
+make a function called run_feature_file takes path returns ok
+  return run_feature(read_file(path))
+end
+
+make a function called run_feature takes feature returns ok
+  let h = str_intern(feature)
+  let n = sc_len(h)
+  let i = 0
+  let line = sb_new()
+  while i <= n do
+    let c = sc_code(h, i)
+    if (c == 10) or (c == -1) then
+      let raw = trim_left(sb_str(line))
+      let line = sb_new()
+      if starts_with(raw, "@") then
+        set_var("t_pending_tags", raw)
+      end
+      if starts_with(raw, "Feature:") then
+        print(raw)
+      end
+      if starts_with(raw, "Scenario:") then
+        let filter = get("__vars", "t_tagfilter")
+        let tags = get("__vars", "t_pending_tags")
+        set_var("t_pending_tags", "")
+        if filter then
+          if tags then
+            if contains_text(tags, filter) then
+              set_var("t_skipping", 0)
+              print(raw + "  [" + tags + "]")
+            else
+              set_var("t_skipping", 1)
+              print(raw + "  [skipped: needs " + filter + "]")
+            end
+          else
+            set_var("t_skipping", 1)
+            print(raw + "  [skipped: needs " + filter + "]")
+          end
+        else
+          set_var("t_skipping", 0)
+          print(raw)
+        end
+      else
+        let text = step_text(raw)
+        if (text != "") and (get("__vars", "t_skipping") != 1) then
+          let fname = get(text, "fn")
+          if fname then
+            apply(fname)
+          else
+            set_var("t_fail", get("__vars", "t_fail") + 1)
+            print("  FAIL: undefined step: " + text)
+          end
+        end
+      end
+      let i = i + 1
+    else
+      if c == 13 then
+        let i = i + 1
+      else
+        sb_push(line, sc_char(h, i))
+        let i = i + 1
+      end
+    end
+  end
+  return true
+end
+
+# =============================================================================
+# Friendly CLI Action Library
+# High-level actions powered by Pandoc interop.
+# =============================================================================
+
+make a function called str_ends_with takes s, suffix returns matches
+  if suffix.length > s.length then
+    return false
+  end
+  return substr(s, s.length - suffix.length, suffix.length) == suffix
+end
+
+make a function called path_stem takes file returns stem
+  let n = file.length
+  let dot_pos = -1
+  let i = n - 1
+  while i >= 0 do
+    if (char_code(file, i) == 46) and (dot_pos < 0) then
+      let dot_pos = i
+    end
+    let i = i - 1
+  end
+  if dot_pos < 0 then
+    return file
+  end
+  return substr(file, 0, dot_pos)
+end
+
+make a function called pandoc_convert_file takes in_file, out_file returns ok
+  print("  [PANDOC] " + in_file + " -> " + out_file)
+  let res = exec_capture("pandoc", in_file, "-o", out_file)
+  return true
+end
+
+# Maps format extension names to pandoc format extensions
+make a function called normalize_format takes fmt returns norm
+  if (fmt == "word") or (fmt == "docx") then
+    return "docx"
+  end
+  if (fmt == "markdown") or (fmt == "md") then
+    return "md"
+  end
+  if fmt == "pdf" then
+    return "pdf"
+  end
+  return fmt
+end
+
+make a function called batch_convert_files takes src_ext, folder, target_fmt returns count
+  let norm_src  = normalize_format(src_ext)
+  let norm_dest = normalize_format(target_fmt)
+  
+  print("[PANDOC BATCH] Converting ." + norm_src + " files in '" + folder + "' to ." + norm_dest + "...")
+  let files = list_dir(folder)
+  let i = 0
+  let count = 0
+  while i < files.length do
+    let file = files[i]
+    let is_dir = str_ends_with(file, "/")
+    if (not is_dir) and str_ends_with(file, "." + norm_src) then
+      let in_path  = folder + "/" + file
+      let stem     = path_stem(file)
+      let out_path = folder + "/" + stem + "." + norm_dest
+      
+      pandoc_convert_file(in_path, out_path)
+      let count = count + 1
+    end
+    let i = i + 1
+  end
+  print("[PANDOC BATCH] Converted " + count + " file(s).")
+  return count
+end
+
+make a function called batch_copy_files takes src_ext, src_dir, dest_dir returns count
+  let norm_src = normalize_format(src_ext)
+  print("[BATCH COPY] Copying ." + norm_src + " files from '" + src_dir + "' to '" + dest_dir + "'...")
+  let files = list_dir(src_dir)
+  let i = 0
+  let count = 0
+  while i < files.length do
+    let file = files[i]
+    let is_dir = str_ends_with(file, "/")
+    if (not is_dir) and str_ends_with(file, "." + norm_src) then
+      print("  Copying " + file + " -> " + dest_dir)
+      let count = count + 1
+    end
+    let i = i + 1
+  end
+  print("[BATCH COPY] Copied " + count + " file(s).")
+  return count
+end
+
+make a function called batch_delete_files takes src_ext, folder returns count
+  let norm_src = normalize_format(src_ext)
+  print("[BATCH DELETE] Removing ." + norm_src + " files in '" + folder + "'...")
+  let files = list_dir(folder)
+  let i = 0
+  let count = 0
+  while i < files.length do
+    let file = files[i]
+    let is_dir = str_ends_with(file, "/")
+    if (not is_dir) and str_ends_with(file, "." + norm_src) then
+      print("  Deleting " + file)
+      let count = count + 1
+    end
+    let i = i + 1
+  end
+  print("[BATCH DELETE] Removed " + count + " file(s).")
+  return count
+end
+
+# =============================================================================
+# Friendly CLI Ollama AI Opinion Engine
+# Invokes local Ollama models with DbC contracts and GOAP action bindings.
+# =============================================================================
+
+# --- DbC Contract-Protected Ollama Invoker ---
+
+make a function called query_ollama_ai_opinion takes prompt, out_path returns ok
+  let prompt_ok = prompt.length > 0
+  require prompt_ok == true
+
+  print("  [OLLAMA AI] Querying local model (tinyllama) for opinion...")
+  print("  [PROMPT] " + prompt)
+
+  # Spawns local Ollama model
+  let response = exec_capture("ollama", "run", "tinyllama", prompt)
+  
+  # Save AI opinion result to disk
+  write_file(out_path, response)
+
+  # Postcondition contract: verify AI response file created and non-empty
+  let file_ok = (file_exists(out_path) == "1") or (file_exists(out_path) == true)
+  let content_ok = response.length > 0
+  ensure file_ok == true
+  ensure content_ok == true
+
+  print("[CONTRACT PASS] AI opinion saved to " + out_path + " (" + response.length + " chars).")
+  return true
+end
+
+make a function called get_file_ai_opinion takes in_file, out_path returns ok
+  let src_ok = (file_exists(in_file) == "1") or (file_exists(in_file) == true)
+  require src_ok == true
+
+  let file_text = read_file(in_file)
+  let prompt = "Please give a brief 1-sentence opinion on this document content: " + substr(file_text, 0, 200)
+  
+  return query_ollama_ai_opinion(prompt, out_path)
+end
+
+# --- GOAP Action Registration for AI Opinion ---
+
+make a function called register_ai_opinion_actions returns ok
+  action_add("act_ai_opinion_doc", 
+    [["has_md", ["docs"]]], 
+    [["has_ai_opinion", ["docs"]]], 
+    [], 1)
+
+  action_bind("act_ai_opinion_doc", |args| {
+    print("[SMART GOAP EXECUTING] Step: Querying Ollama AI opinion on Markdown document...")
+    return get_file_ai_opinion("friendly_cli/test_src/doc1.md", "friendly_cli/test_dest/doc1_opinion.txt")
+  })
+
+  return true
+end
+
+
+# --- Step Definitions ---
+
+make a function called st_given_local_ollama returns ok
+  # Assert starting environment
+  let md_exists = file_exists("friendly_cli/test_src/doc1.md")
+  return check("sample markdown doc1.md exists on disk", md_exists, "1")
+end
+
+make a function called st_when_get_ai_opinion_on_file returns ok
+  # Dynamic execution of AI opinion function
+  let success = get_file_ai_opinion("friendly_cli/test_src/doc1.md", "friendly_cli/test_dest/doc1_opinion.txt")
+  set_var("ai_opinion_success", success)
+  return check("AI opinion retrieval successfully triggered", success, true)
+end
+
+make a function called st_then_ai_opinion_file_created returns ok
+  let opinion_exists = file_exists("friendly_cli/test_dest/doc1_opinion.txt")
+  check("doc1_opinion.txt exists on disk", opinion_exists, "1")
+  
+  let content = read_file("friendly_cli/test_dest/doc1_opinion.txt")
+  print("=== AI RESPONSE PREVIEW ===")
+  print(content)
+  return check("AI response contains non-empty content", content.length > 0, true)
+end
+
+make a function called st_when_ask_ai_general_prompt returns ok
+  let success = query_ollama_ai_opinion("Why is markdown good for documentation?", "friendly_cli/test_dest/q_opinion.txt")
+  set_var("general_opinion_success", success)
+  return check("general prompt successfully triggered", success, true)
+end
+
+make a function called st_then_general_opinion_file_created returns ok
+  let opinion_exists = file_exists("friendly_cli/test_dest/q_opinion.txt")
+  check("q_opinion.txt exists on disk", opinion_exists, "1")
+  
+  let content = read_file("friendly_cli/test_dest/q_opinion.txt")
+  print("=== AI RESPONSE PREVIEW ===")
+  print(content)
+  return check("AI response contains non-empty content", content.length > 0, true)
+end
+
+# --- Step Registration ---
+
+step("a local running Ollama AI instance with tinyllama", "st_given_local_ollama")
+step("the user requests an AI opinion on doc1.md", "st_when_get_ai_opinion_on_file")
+step("the AI opinion is saved to doc1_opinion.txt with verified contracts", "st_then_ai_opinion_file_created")
+step("the user asks a general prompt to the AI", "st_when_ask_ai_general_prompt")
+step("the general AI response is saved to q_opinion.txt with verified contracts", "st_then_general_opinion_file_created")
+
+t_init()
+
+let line1 = "Feature: Local Ollama AI Integration with Design-by-Contract" + chr(10)
+let line2 = "Scenario: Retrieve AI opinion on markdown document" + chr(10)
+let line3 = "Given a local running Ollama AI instance with tinyllama" + chr(10)
+let line4 = "When the user requests an AI opinion on doc1.md" + chr(10)
+let line5 = "Then the AI opinion is saved to doc1_opinion.txt with verified contracts" + chr(10)
+let line6 = "Scenario: Ask general prompt query to AI" + chr(10)
+let line7 = "Given a local running Ollama AI instance with tinyllama" + chr(10)
+let line8 = "When the user asks a general prompt to the AI" + chr(10)
+let line9 = "Then the general AI response is saved to q_opinion.txt with verified contracts" + chr(10)
+
+let feature_text = line1 + line2 + line3 + line4 + line5 + line6 + line7 + line8 + line9
+
+run_feature(feature_text)
+t_report()

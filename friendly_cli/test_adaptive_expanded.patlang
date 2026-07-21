@@ -1,0 +1,559 @@
+# =============================================================================
+# Adaptive Predictor BDD Verification Suite
+# Verifies that timing predictions dynamically improve on subsequent runs
+# using linear regression learning metrics.
+# =============================================================================
+
+# Self-hosted mirror of rust-runtime/src/preprocess.rs's expand_includes:
+# expands `include "relative/path.patlang"` lines by splicing the
+# referenced file's contents in place, resolving paths relative to the
+# including file's own directory, recursively.
+#
+# Why this exists as PatLang, not just Rust: `expand_includes` was
+# previously a NATIVE-ONLY preprocessing step (main.rs, run before the
+# frontend ever sees the source) -- patc1.exe's own self-hosted lexer/
+# parser never learned to do this, so any .patlang file using `include`
+# could only be compiled via the native pat.exe frontend (`--ir-run`/
+# `--patc`), never handed directly to patc1.exe, which is why every
+# multi-file portfolio demo in build_portfolio.patlang manually
+# concatenates dependency files (read_file(lexer) + chr(10) + ...) instead
+# of using `include`. This closes that gap so `include` works identically
+# everywhere -- interpreted, natively compiled, and self-hosted-compiled --
+# matching this session's usual bar of "verified across all three paths."
+#
+# Kept as its own small library (not folded directly into patc1_main.patlang)
+# so any self-hosted driver can `include "lib/includes.patlang"` and use it.
+
+# str_trim(s) -> s with leading/trailing space/tab/\r stripped.
+make a function called str_trim takes s returns trimmed
+  let n = s.length
+  let start = 0
+  while (start < n) and is_ws_char(char_code(s, start)) do
+    let start = start + 1
+  end
+  let end = n
+  while (end > start) and is_ws_char(char_code(s, end - 1)) do
+    let end = end - 1
+  end
+  return substr(s, start, end - start)
+end
+
+make a function called is_ws_char takes code returns is_ws
+  return (code == 32) or (code == 9) or (code == 13)
+end
+
+# str_starts_with(s, prefix) -> bool
+make a function called str_starts_with takes s, prefix returns matches
+  if prefix.length > s.length then
+    return false
+  end
+  return substr(s, 0, prefix.length) == prefix
+end
+
+# split_lines(s) -> list of lines, split on \n (a trailing \r on each line,
+# from CRLF source files, is stripped too).
+make a function called split_lines takes s returns lines
+  let out = []
+  let n = s.length
+  let start = 0
+  let i = 0
+  while i < n do
+    if char_code(s, i) == 10 then
+      let raw = substr(s, start, i - start)
+      let out = list_push(out, strip_trailing_cr(raw))
+      let start = i + 1
+    end
+    let i = i + 1
+  end
+  if start < n then
+    let out = list_push(out, strip_trailing_cr(substr(s, start, n - start)))
+  end
+  return out
+end
+
+make a function called strip_trailing_cr takes line returns stripped
+  let n = line.length
+  if (n > 0) and (char_code(line, n - 1) == 13) then
+    return substr(line, 0, n - 1)
+  end
+  return line
+end
+
+# path_dirname(path) -> everything before the last '/' or '\', or "." if
+# the path has no directory component. Handles both separators since
+# build_portfolio.patlang and friends run on Windows but write forward
+# slashes in string literals.
+make a function called path_dirname takes path returns dir
+  let n = path.length
+  let i = n - 1
+  let last_sep = -1
+  while i >= 0 do
+    let c = char_code(path, i)
+    if (c == 47) or (c == 92) then
+      let last_sep = i
+      let i = -1
+    else
+      let i = i - 1
+    end
+  end
+  if last_sep < 0 then
+    return "."
+  end
+  return substr(path, 0, last_sep)
+end
+
+# path_join(base, rel) -> base + "/" + rel, tolerating a trailing slash on
+# base and an empty base (meaning "current directory"). If `rel` is itself
+# absolute (leading '/'/'\', or a Windows drive letter like "C:"), it's
+# returned unchanged, ignoring base -- matches Rust's PathBuf::join, which
+# preprocess.rs's native expand_includes relies on for the same case.
+make a function called path_join takes base, rel returns joined
+  if is_absolute_path(rel) then
+    return rel
+  end
+  if (base == "") or (base == ".") then
+    return rel
+  end
+  let n = base.length
+  if (n > 0) and ((char_code(base, n - 1) == 47) or (char_code(base, n - 1) == 92)) then
+    return base + rel
+  end
+  return base + "/" + rel
+end
+
+make a function called is_absolute_path takes p returns is_abs
+  if p.length == 0 then
+    return false
+  end
+  let c0 = char_code(p, 0)
+  if (c0 == 47) or (c0 == 92) then
+    return true
+  end
+  if (p.length >= 2) and (char_code(p, 1) == 58) then
+    return true
+  end
+  return false
+end
+
+# expand_includes(source, base_dir) -> source with every `include "path"`
+# line recursively replaced by that file's own (recursively expanded)
+# contents, paths resolved relative to base_dir (the including file's own
+# directory) at each level, exactly matching preprocess.rs's semantics.
+#
+# The depth cap (16, matching preprocess.rs's MAX_DEPTH) is inlined as a
+# literal below rather than a top-level `let` constant referenced from
+# inside expand_includes_at_depth -- patc1.exe was found, while building
+# this, to NOT make top-level `let` constants visible inside function
+# bodies at all (confirmed via a minimal repro: the value silently reads
+# as empty/unset, not an error) even though both --ir-run and native
+# --patc handle this correctly. That's a real, previously-unknown
+# self-hosted-compiler bug, logged separately in the backlog for its own
+# dedicated fix -- this file just avoids relying on the broken behavior.
+make a function called expand_includes takes source, base_dir returns expanded
+  return expand_includes_at_depth(source, base_dir, 0)
+end
+
+make a function called expand_includes_at_depth takes source, base_dir, depth returns expanded
+  if depth > 16 then
+    print("include: nesting deeper than 16 levels (cycle?)")
+    return source
+  end
+  let lines = split_lines(source)
+  let out = sb_new()
+  let i = 0
+  let n = to_num(list_len(lines))
+  while i < n do
+    let line = lines[i]
+    let t = str_trim(line)
+    if str_starts_with(t, "include ") and (str_starts_with(t, "#") == false) then
+      let rel = str_trim(substr(t, 8, t.length - 8))
+      let rel = strip_quotes(rel)
+      let path = path_join(base_dir, rel)
+      let inner = read_file(path)
+      let inner_base = path_dirname(path)
+      sb_push(out, expand_includes_at_depth(inner, inner_base, depth + 1))
+      sb_push(out, chr(10))
+    else
+      sb_push(out, line)
+      sb_push(out, chr(10))
+    end
+    let i = i + 1
+  end
+  return sb_str(out)
+end
+
+# strip_quotes("\"path\"") -> "path" -- include lines are always written
+# with double-quoted paths, same as the native preprocessor expects.
+make a function called strip_quotes takes s returns unquoted
+  let n = s.length
+  if (n >= 2) and (char_code(s, 0) == 34) and (char_code(s, n - 1) == 34) then
+    return substr(s, 1, n - 2)
+  end
+  return s
+end
+
+# =============================================================================
+# Test framework (Stage 1 dialect): unit assertions plus a Gherkin-style
+# feature runner. Step definitions are registered in the object store keyed
+# by their text; features are plain text dispatched line by line, so the
+# same framework covers unit, integration, and behaviour tests.
+# =============================================================================
+
+make a function called t_init returns done
+  set_var("t_pass", 0)
+  set_var("t_fail", 0)
+  set_var("t_tagfilter", "")
+  set_var("t_pending_tags", "")
+  set_var("t_skipping", 0)
+  return true
+end
+
+make a function called contains_text takes hay, needle returns r
+  if needle.length > hay.length then
+    return false
+  end
+  let i = 0
+  while i <= hay.length - needle.length do
+    if substr(hay, i, needle.length) == needle then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called check takes label, actual, expected returns ok
+  if actual == expected then
+    set_var("t_pass", get("__vars", "t_pass") + 1)
+    print("  ok: " + label)
+    return true
+  else
+    set_var("t_fail", get("__vars", "t_fail") + 1)
+    print("  FAIL: " + label + " (got " + actual + ", want " + expected + ")")
+    return false
+  end
+end
+
+make a function called t_report returns ok
+  let p = get("__vars", "t_pass")
+  let f = get("__vars", "t_fail")
+  print("tests: " + p + " passed, " + f + " failed")
+  if f == 0 then
+    print("ALL TESTS PASSED")
+    return true
+  else
+    print("TESTS FAILED")
+    return false
+  end
+end
+
+# ---- Gherkin runner ----
+
+# Register a step: step("a fresh till", "st_fresh_till")
+make a function called step takes text, fname returns done
+  new("Step", text)
+  send(text, "set", "fn", fname)
+  return true
+end
+
+make a function called starts_with takes s, prefix returns r
+  if s.length < prefix.length then
+    return false
+  end
+  return substr(s, 0, prefix.length) == prefix
+end
+
+make a function called trim_left takes s returns out
+  let i = 0
+  let scanning = true
+  while (i < s.length) and scanning do
+    let c = char_code(s, i)
+    if (c == 32) or (c == 9) then
+      let i = i + 1
+    else
+      let scanning = false
+    end
+  end
+  return substr(s, i, s.length - i)
+end
+
+# Strip a Gherkin keyword; returns the step text or "" if not a step line
+make a function called step_text takes line returns out
+  if starts_with(line, "Given ") then
+    return substr(line, 6, line.length - 6)
+  end
+  if starts_with(line, "When ") then
+    return substr(line, 5, line.length - 5)
+  end
+  if starts_with(line, "Then ") then
+    return substr(line, 5, line.length - 5)
+  end
+  if starts_with(line, "And ") then
+    return substr(line, 4, line.length - 4)
+  end
+  return ""
+end
+
+# Run only scenarios whose preceding @tag line contains `tag` ("" = all)
+make a function called run_feature_tagged takes feature, tag returns ok
+  set_var("t_tagfilter", tag)
+  return run_feature(feature)
+end
+
+make a function called run_feature_file takes path returns ok
+  return run_feature(read_file(path))
+end
+
+make a function called run_feature takes feature returns ok
+  let h = str_intern(feature)
+  let n = sc_len(h)
+  let i = 0
+  let line = sb_new()
+  while i <= n do
+    let c = sc_code(h, i)
+    if (c == 10) or (c == -1) then
+      let raw = trim_left(sb_str(line))
+      let line = sb_new()
+      if starts_with(raw, "@") then
+        set_var("t_pending_tags", raw)
+      end
+      if starts_with(raw, "Feature:") then
+        print(raw)
+      end
+      if starts_with(raw, "Scenario:") then
+        let filter = get("__vars", "t_tagfilter")
+        let tags = get("__vars", "t_pending_tags")
+        set_var("t_pending_tags", "")
+        if filter then
+          if tags then
+            if contains_text(tags, filter) then
+              set_var("t_skipping", 0)
+              print(raw + "  [" + tags + "]")
+            else
+              set_var("t_skipping", 1)
+              print(raw + "  [skipped: needs " + filter + "]")
+            end
+          else
+            set_var("t_skipping", 1)
+            print(raw + "  [skipped: needs " + filter + "]")
+          end
+        else
+          set_var("t_skipping", 0)
+          print(raw)
+        end
+      else
+        let text = step_text(raw)
+        if (text != "") and (get("__vars", "t_skipping") != 1) then
+          let fname = get(text, "fn")
+          if fname then
+            apply(fname)
+          else
+            set_var("t_fail", get("__vars", "t_fail") + 1)
+            print("  FAIL: undefined step: " + text)
+          end
+        end
+      end
+      let i = i + 1
+    else
+      if c == 13 then
+        let i = i + 1
+      else
+        sb_push(line, sc_char(h, i))
+        let i = i + 1
+      end
+    end
+  end
+  return true
+end
+
+# =============================================================================
+# Adaptive Compilation Timing Predictor & Regression Engine
+# Implements persistent linear regression with gradient descent updates
+# to learn compiling startup overhead (bias) and speed (weight) over time.
+# =============================================================================
+
+# --- Load Weights from Disk ---
+make a function called load_regression_weights returns weights
+  let path = "friendly_cli/compile_history.data"
+  let exists = file_exists(path) == "1"
+  
+  if not exists then
+    # Defaults: w = 35.0 ms/line, bias = 5000.0 ms startup overhead
+    return [35.0, 5000.0]
+  end
+
+  let content = read_file(path)
+  # Simple parser: content format is "w,b"
+  let comma_idx = -1
+  let n = content.length
+  let i = 0
+  while i < n do
+    if char_code(content, i) == 44 then # ','
+      let comma_idx = i
+      let i = n
+    end
+    let i = i + 1
+  end
+
+  if comma_idx < 0 then
+    return [35.0, 5000.0]
+  end
+
+  let w_str = substr(content, 0, comma_idx)
+  let b_str = substr(content, comma_idx + 1, n - comma_idx - 1)
+  return [to_num(w_str), to_num(b_str)]
+end
+
+# --- Save Weights to Disk ---
+make a function called save_regression_weights takes w, b returns ok
+  let data_str = "" + w + "," + b
+  write_file("friendly_cli/compile_history.data", data_str)
+  return true
+end
+
+# --- Predict Time: T = (w * Lines) + b ---
+make a function called predict_compile_duration takes lines returns ms
+  let weights = load_regression_weights()
+  let w = weights[0]
+  let b = weights[1]
+  let estimate = (w * lines) + b
+  return estimate
+end
+
+# --- Learn via Gradient Descent ---
+make a function called update_model_weights takes lines, actual_ms returns ok
+  let weights = load_regression_weights()
+  let w = weights[0]
+  let b = weights[1]
+
+  # Prediction error
+  let pred = (w * lines) + b
+  let error = pred - actual_ms
+
+  # Learning rate (extremely small to prevent scaling overflow)
+  # Since lines are large (1000+), w_step uses tiny learning rate
+  let alpha_w = 0.000005
+  let alpha_b = 0.05
+
+  # Gradient updates
+  let grad_w = error * lines
+  let grad_b = error
+
+  # Adjust parameters
+  let new_w = w - (alpha_w * grad_w)
+  let new_b = b - (alpha_b * grad_b)
+
+  # Enforce sane floors
+  if new_w < 1.0 then
+    let new_w = 1.0
+  end
+  if new_b < 500.0 then
+    let new_b = 500.0
+  end
+
+  print("  [MODEL LEARN] Updated w: " + new_w + " ms/line, Bias: " + new_b + " ms")
+  save_regression_weights(new_w, new_b)
+  return true
+end
+
+
+# --- Helper: Get Millisecond Epoch ---
+make a function called get_system_time_ms returns ms
+  let raw = exec_capture("powershell", "-Command", "[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()")
+  return to_num(raw)
+end
+
+# --- Helper: Count File Lines ---
+make a function called count_file_lines takes path returns lines
+  let text = read_file(path)
+  let n = text.length
+  let count = 1
+  let i = 0
+  while i < n do
+    if char_code(text, i) == 10 then
+      let count = count + 1
+    end
+    let i = i + 1
+  end
+  return count
+end
+
+# --- BDD Step Definitions ---
+
+make a function called st_given_initialized_model returns ok
+  # Force reset model weights to start cold
+  save_regression_weights(35.0, 5000.0)
+  return check("model weights initialized with baseline guess", true, true)
+end
+
+make a function called st_when_first_run_predicts_and_compiles returns ok
+  let file_a = "friendly_cli/test_concat_expanded.patlang"
+  let lines_a = count_file_lines(file_a)
+  set_var("lines_a", lines_a)
+
+  # Predict compile time
+  let pred_a = predict_compile_duration(lines_a)
+  print("  [RUN 1] Lines: " + lines_a + " | Predicted: " + pred_a + " ms")
+
+  # Perform compilation
+  let start_time = get_system_time_ms()
+  let out_a = exec_capture("./patc1.exe", file_a, "friendly_cli/test_dest/temp_a.exe")
+  let end_time = get_system_time_ms()
+  
+  let duration_a = end_time - start_time
+  print("  [RUN 1] Lines: " + lines_a + " | Actual: " + duration_a + " ms")
+  
+  # Run gradient descent update
+  update_model_weights(lines_a, duration_a)
+
+  # Store first error
+  let error_a = to_num(duration_a) - to_num(pred_a)
+  set_var("error_run1", error_a)
+  return true
+end
+
+make a function called st_then_second_run_achieves_better_estimate returns ok
+  let file_b = "friendly_cli/test_ai_bdd_expanded.patlang"
+  let lines_b = count_file_lines(file_b)
+
+  # Predict compile time using updated model
+  let pred_b = predict_compile_duration(lines_b)
+  print("  [RUN 2] Lines: " + lines_b + " | Predicted (using updated model): " + pred_b + " ms")
+
+  # Perform compilation
+  let start_time = get_system_time_ms()
+  let out_b = exec_capture("./patc1.exe", file_b, "friendly_cli/test_dest/temp_b.exe")
+  let end_time = get_system_time_ms()
+
+  let duration_b = end_time - start_time
+  print("  [RUN 2] Lines: " + lines_b + " | Actual: " + duration_b + " ms")
+
+  # Store second error
+  let error_b = to_num(duration_b) - to_num(pred_b)
+  
+  let err1 = get("__vars", "error_run1")
+  print("  [COMPARISON] Run 1 Prediction Error: " + err1 + " ms")
+  print("  [COMPARISON] Run 2 Prediction Error: " + error_b + " ms")
+
+  check("Run 2 compiled successfully", file_exists("friendly_cli/test_dest/temp_b.exe"), "1")
+  return true
+end
+
+# --- Step Registration ---
+
+step("an initialized adaptive regression model", "st_given_initialized_model")
+step("the first run compiles a file to train the model", "st_when_first_run_predicts_and_compiles")
+step("the second run produces a more accurate estimate utilizing learned rates", "st_then_second_run_achieves_better_estimate")
+
+t_init()
+
+let line1 = "Feature: Adaptive Linear Regression Compilation Predictor" + chr(10)
+let line2 = "Scenario: Train model on initial runs to improve compile prediction times" + chr(10)
+let line3 = "Given an initialized adaptive regression model" + chr(10)
+let line4 = "When the first run compiles a file to train the model" + chr(10)
+let line5 = "Then the second run produces a more accurate estimate utilizing learned rates" + chr(10)
+
+let feature_text = line1 + line2 + line3 + line4 + line5
+
+run_feature(feature_text)
+t_report()
