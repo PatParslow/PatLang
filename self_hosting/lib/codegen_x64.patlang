@@ -323,6 +323,35 @@ make a function called x64_instr_is_call_boundary takes instr, dynamic_mode retu
     if dynamic_mode then
       return true
     end
+    # REAL BUG FOUND AND FIXED HERE (2026-07-20, same session as the
+    # `+`/`==` string-aware codegen fixes): x64_str_aware_eq_asm and
+    # x64_str_aware_plus_asm can embed a REAL `call rt_str_eq`/`call
+    # rt_str_concat` even in a NON-dynamic-mode function (whenever an
+    # operand turns out to be a String at runtime) -- but this
+    # function is exactly what the register allocator (see
+    # x64_local_register_eligible below) uses to decide whether a
+    # local can safely live in a register across a given instruction.
+    # Before this fix, "Bin" was only a call boundary in dynamic_mode,
+    # so a NON-dynamic function's `+`/`==`/`!=` on strings could
+    # register-allocate a local straight across the embedded call,
+    # which then silently clobbers it (this backend gives ZERO
+    # register preservation across any call). Caught by the
+    # x64_exec_demo/x64_exec_bigoutput_demo/x64_exec_nasm_demo
+    # regression going from PASS to segfault the moment `+` started
+    # doing real string concatenation -- rt_exec_join_args (called by
+    # exec_capture) builds its joined command line with `+` on
+    # strings, and a caller-side local was register-allocated across
+    # that call without this fix.
+    let op = instr[1]
+    if op == "+" then
+      return true
+    end
+    if op == "==" then
+      return true
+    end
+    if op == "!=" then
+      return true
+    end
   end
   return false
 end
@@ -1284,12 +1313,154 @@ make a function called x64_binop_asm_dynamic takes op, spilled returns asm
   return sb_str(sb)
 end
 
+# `==`/`!=` on two String-family values must compare BYTE CONTENT, not
+# the raw tagged address -- unlike the dynamic-mode DYN_OBJ branch
+# above (deliberately identity-based for Object/List/Closure, matching
+# this backend's own established design, see x64_runtime.patlang's
+# rt_str_eq header), strings are a special case: the OTHER backends
+# (interpreter, rustc-text) give String `==` real content-equality
+# semantics (Rust's own String PartialEq), and patc1_main.patlang's
+# own driver code (`args[2] == "--x64"`) is compiled by BOTH backends
+# and relies on that -- a raw address compare here silently broke
+# every `--x64` flag check once patc1_main.patlang started being
+# compiled by ITS OWN backend for the patc2.exe self-compile (args[2]
+# is a freshly heap-copied string from argv()'s tokenizer, never
+# address-equal to the "--x64" literal even with identical bytes).
+# Used in the NON-dynamic-mode path only (x64_binop_asm below) --
+# dynamic-mode already has its own equivalent fix via
+# x64_binop_asm_dynamic's DYN_OBJ branch, left as address-identity
+# there deliberately (this function is scoped to fixing the ==/!=
+# CASE specifically, not changing that established Object/List/
+# Closure semantics). Family-nibble constants match the ones already
+# used throughout this file: 17293822569102704640 = 0xF000... (top
+# nibble mask), 2305843009213693952 = 0x2000... (String family tag).
+  # REAL BUG FOUND AND FIXED HERE (2026-07-20, discovered by patc2.exe
+  # crashing on EVEN ZERO ARGS after the first cut of this function --
+  # bisected via self_hosting/examples/x64_zeroarg_repro.patlang down
+  # to x64_runtime.patlang's own `print(v)`, specifically its `if
+  # family == string_family then` line). `family` there is `v band
+  # family_mask` -- a PLAIN INTEGER with every payload bit forced to
+  # zero by construction (family_mask is the top-nibble-only mask), so
+  # whenever v is genuinely a String, `family` ends up bit-for-bit
+  # IDENTICAL to the bare `string_family` tag constant (also
+  # payload-zero). The first cut of this function looked at the top
+  # nibble ALONE and couldn't tell that apart from a real string
+  # pointer -- it dispatched `family == string_family` to `rt_str_eq`,
+  # which then dereferenced these bare tag words as if they were heap
+  # addresses (reading a "length" from `payload_mask`-zero memory) --
+  # instant segfault, and MUCH easier to hit than the original bug
+  # (any tag-comparison idiom already used throughout
+  # x64_runtime.patlang, not just an occasional string-literal
+  # comparison). Fixed by ALSO requiring a nonzero payload (low 48
+  # bits, `rt_payload_mask()`'s own mask) before treating an operand as
+  # a real string -- a genuine heap-allocated string always has a
+  # nonzero address there; a bare extracted/compared tag CONSTANT
+  # (family_mask, string_family, bigint_family, etc, all computed via
+  # `band` with a mask that zeroes the low 48 bits) never does.
+make a function called x64_str_aware_eq_asm takes negate returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "    mov r15, 17293822569102704640" + x64_nl_char())
+  sb_push(sb, "    mov r9, 281474976710655" + x64_nl_char())
+  sb_push(sb, "    mov r8, 2305843009213693952" + x64_nl_char())
+  sb_push(sb, "    mov rcx, rax" + x64_nl_char())
+  sb_push(sb, "    and rcx, r15" + x64_nl_char())
+  sb_push(sb, "    cmp rcx, r8" + x64_nl_char())
+  sb_push(sb, "    jne .STRCHKB_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rcx, rax" + x64_nl_char())
+  sb_push(sb, "    and rcx, r9" + x64_nl_char())
+  sb_push(sb, "    cmp rcx, 0" + x64_nl_char())
+  sb_push(sb, "    je .STRCHKB_" + suffix + x64_nl_char())
+  sb_push(sb, "    jmp .STREQ_" + suffix + x64_nl_char())
+  sb_push(sb, ".STRCHKB_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rcx, r10" + x64_nl_char())
+  sb_push(sb, "    and rcx, r15" + x64_nl_char())
+  sb_push(sb, "    cmp rcx, r8" + x64_nl_char())
+  sb_push(sb, "    jne .STRSKIP_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rcx, r10" + x64_nl_char())
+  sb_push(sb, "    and rcx, r9" + x64_nl_char())
+  sb_push(sb, "    cmp rcx, 0" + x64_nl_char())
+  sb_push(sb, "    je .STRSKIP_" + suffix + x64_nl_char())
+  sb_push(sb, "    jmp .STREQ_" + suffix + x64_nl_char())
+  sb_push(sb, ".STRSKIP_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    cmp rax, r10" + x64_nl_char())
+  if negate then
+    sb_push(sb, "    setne al" + x64_nl_char())
+  else
+    sb_push(sb, "    sete al" + x64_nl_char())
+  end
+  sb_push(sb, "    movzx rax, al" + x64_nl_char())
+  sb_push(sb, "    jmp .STRDONE_" + suffix + x64_nl_char())
+  sb_push(sb, ".STREQ_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    push r10" + x64_nl_char())
+  sb_push(sb, "    call rt_str_eq" + x64_nl_char())
+  sb_push(sb, "    add rsp, 16" + x64_nl_char())
+  if negate then
+    sb_push(sb, "    xor rax, 1" + x64_nl_char())
+  end
+  sb_push(sb, ".STRDONE_" + suffix + ":" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# `+` on two String-family values must CONCATENATE (call rt_str_concat),
+# not raw-add the tagged words -- same backend-parity reasoning as
+# x64_str_aware_eq_asm above (interpreter/rustc give `+` real string
+# concatenation semantics, and self-hosted PatLang code throughout this
+# codebase -- INCLUDING patc1_main.patlang's own `rt_src + chr(10) +
+# source` and `"patc1: " + exe` -- relies on that). Found the SAME
+# session, one bisection layer deeper: after fixing `==` (twice), the
+# real fixpoint got further but `patc1_main.patlang`'s own
+# `lower_source = rt_src + chr(10) + source` silently produced a
+# ZERO-length string (raw `add` on two heap-pointer tagged words is
+# meaningless address arithmetic, not concatenation) -- confirmed via
+# a minimal repro (`"hello" + "world"` alone printed length 0) before
+# touching codegen. Same nonzero-payload guard as the `==` fix, for the
+# same reason (a bare extracted/compared tag CONSTANT must never be
+# mistaken for a real heap string pointer here either).
+make a function called x64_str_aware_plus_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "    mov r15, 17293822569102704640" + x64_nl_char())
+  sb_push(sb, "    mov r9, 281474976710655" + x64_nl_char())
+  sb_push(sb, "    mov r8, 2305843009213693952" + x64_nl_char())
+  sb_push(sb, "    mov rcx, rax" + x64_nl_char())
+  sb_push(sb, "    and rcx, r15" + x64_nl_char())
+  sb_push(sb, "    cmp rcx, r8" + x64_nl_char())
+  sb_push(sb, "    jne .PLUSCHKB_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rcx, rax" + x64_nl_char())
+  sb_push(sb, "    and rcx, r9" + x64_nl_char())
+  sb_push(sb, "    cmp rcx, 0" + x64_nl_char())
+  sb_push(sb, "    je .PLUSCHKB_" + suffix + x64_nl_char())
+  sb_push(sb, "    jmp .PLUSCAT_" + suffix + x64_nl_char())
+  sb_push(sb, ".PLUSCHKB_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rcx, r10" + x64_nl_char())
+  sb_push(sb, "    and rcx, r15" + x64_nl_char())
+  sb_push(sb, "    cmp rcx, r8" + x64_nl_char())
+  sb_push(sb, "    jne .PLUSSKIP_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rcx, r10" + x64_nl_char())
+  sb_push(sb, "    and rcx, r9" + x64_nl_char())
+  sb_push(sb, "    cmp rcx, 0" + x64_nl_char())
+  sb_push(sb, "    je .PLUSSKIP_" + suffix + x64_nl_char())
+  sb_push(sb, "    jmp .PLUSCAT_" + suffix + x64_nl_char())
+  sb_push(sb, ".PLUSSKIP_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    add rax, r10" + x64_nl_char())
+  sb_push(sb, "    jmp .PLUSDONE_" + suffix + x64_nl_char())
+  sb_push(sb, ".PLUSCAT_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    push r10" + x64_nl_char())
+  sb_push(sb, "    call rt_str_concat" + x64_nl_char())
+  sb_push(sb, "    add rsp, 16" + x64_nl_char())
+  sb_push(sb, ".PLUSDONE_" + suffix + ":" + x64_nl_char())
+  return sb_str(sb)
+end
+
 make a function called x64_binop_asm takes op returns asm
   let sb = sb_new()
   sb_push(sb, "    pop r10" + x64_nl_char())
   sb_push(sb, "    pop rax" + x64_nl_char())
   if op == "+" then
-    sb_push(sb, "    add rax, r10" + x64_nl_char())
+    sb_push(sb, x64_str_aware_plus_asm())
   else
     if op == "-" then
       sb_push(sb, "    sub rax, r10" + x64_nl_char())
@@ -1329,13 +1500,13 @@ make a function called x64_binop_asm takes op returns asm
                       sb_push(sb, "    mov rcx, r10" + x64_nl_char())
                       sb_push(sb, "    sar rax, cl" + x64_nl_char())
                     else
-                      sb_push(sb, "    cmp rax, r10" + x64_nl_char())
                       if op == "==" then
-                        sb_push(sb, "    sete al" + x64_nl_char())
+                        sb_push(sb, x64_str_aware_eq_asm(false))
                       else
                         if op == "!=" then
-                          sb_push(sb, "    setne al" + x64_nl_char())
+                          sb_push(sb, x64_str_aware_eq_asm(true))
                         else
+                          sb_push(sb, "    cmp rax, r10" + x64_nl_char())
                           if op == "<" then
                             sb_push(sb, "    setl al" + x64_nl_char())
                           else
@@ -1354,9 +1525,9 @@ make a function called x64_binop_asm takes op returns asm
                               end
                             end
                           end
+                          sb_push(sb, "    movzx rax, al" + x64_nl_char())
                         end
                       end
-                      sb_push(sb, "    movzx rax, al" + x64_nl_char())
                     end
                   end
                 end
