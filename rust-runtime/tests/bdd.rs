@@ -52,6 +52,23 @@ fn pat_exe() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_pat"))
 }
 
+/// Ensures `patc1.exe` exists at the repo root and is up to date, building
+/// it via `build_patc1.patlang` if needed -- cheap when nothing changed
+/// (fingerprint-cached, see build_patc1.patlang's own header comment), so
+/// safe to call from every scenario that needs the self-hosted compiler's
+/// own compiled binary (as opposed to the native `pat` binary under test
+/// everywhere else in this file).
+fn ensure_patc1_exe(root: &Path) -> PathBuf {
+    let exe = if cfg!(windows) { root.join("patc1.exe") } else { root.join("patc1") };
+    let build = run(&pat_exe(), &["--ir-run", "self_hosting/build_patc1.patlang"], root);
+    assert!(
+        build.success && exe.exists(),
+        "failed to build patc1.exe via build_patc1.patlang:\nstdout:\n{}\nstderr:\n{}",
+        build.stdout, build.stderr
+    );
+    exe
+}
+
 static SCENARIO_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn fresh_scratch_dir(n: usize) -> PathBuf {
@@ -74,6 +91,7 @@ struct PatWorld {
     compile_ok: Option<bool>,
     compile_stderr: String,
     compiled: Option<RunResult>,
+    selfhost_interp: Option<RunResult>,
 }
 
 impl PatWorld {
@@ -88,6 +106,7 @@ impl PatWorld {
             compile_ok: None,
             compile_stderr: String::new(),
             compiled: None,
+            selfhost_interp: None,
         }
     }
 
@@ -244,6 +263,31 @@ fn when_run_both(world: &mut PatWorld) {
     when_compile_and_run(world);
 }
 
+/// Runs the scenario's source through patc1.exe's `lower` + `interpret`
+/// subcommands -- the self-hosted meta-circular interpreter
+/// (`self_hosting/lib/interp.patlang`), NOT the native `--ir-run` path.
+/// `interpret` prints only the program's final RETURN value (it has no
+/// notion of "run to completion and let CallHost print() calls happen
+/// mid-program the way --ir-run's own main() does" beyond the print calls
+/// the program itself makes) -- scenarios written for this step should end
+/// with an explicit `return <expr>` and compare against that, mirroring
+/// the pattern already used by patc1_main.patlang's own `interpret`
+/// subcommand and its manual smoke tests.
+#[when("I run it through the self-hosted meta-circular interpreter")]
+fn when_run_selfhost_interp(world: &mut PatWorld) {
+    let path = world.write_source();
+    let root = world.repo_root.clone();
+    let patc1 = ensure_patc1_exe(&root);
+    let ir_path = world.scratch_dir.join(format!("scenario_{}.ir", world.scenario_id));
+    let lower = run(&patc1, &["lower", path.to_str().unwrap(), ir_path.to_str().unwrap()], &root);
+    assert!(
+        ir_path.exists(),
+        "patc1.exe lower did not produce an .ir file:\nstdout:\n{}\nstderr:\n{}",
+        lower.stdout, lower.stderr
+    );
+    world.selfhost_interp = Some(run(&patc1, &["interpret", ir_path.to_str().unwrap()], &root));
+}
+
 // ===== Then =====
 
 #[then("it exits successfully")]
@@ -322,6 +366,31 @@ fn then_both_succeed(world: &mut PatWorld) {
     let compiled = world.compiled.as_ref().expect("compiled run not performed");
     assert!(interp.success, "interpreted run failed:\n{}", interp.stderr);
     assert!(compiled.success, "compiled run failed:\n{}", compiled.stderr);
+}
+
+#[then("the self-hosted interpreter's output matches the expected value")]
+fn then_selfhost_interp_matches_expected(world: &mut PatWorld, step: &Step) {
+    let expected = step
+        .docstring
+        .clone()
+        .expect("expected a docstring attached to this step")
+        .trim()
+        .to_string();
+    let got = world
+        .selfhost_interp
+        .as_ref()
+        .expect("self-hosted interpreter run not performed");
+    assert!(
+        got.success,
+        "patc1.exe interpret failed:\nstdout:\n{}\nstderr:\n{}",
+        got.stdout, got.stderr
+    );
+    assert_eq!(
+        got.stdout.trim(),
+        expected,
+        "self-hosted interpreter's output didn't match -- full stdout:\n{}\nstderr:\n{}",
+        got.stdout, got.stderr
+    );
 }
 
 #[then(regex = r"^the reported Value size is at most (\d+) bytes$")]
