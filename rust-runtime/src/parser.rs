@@ -1029,6 +1029,24 @@ impl<'a> Parser<'a> {
                 lhs = Expr::Call { function: Box::new(rhs), args: vec![lhs] };
                 continue;
             }
+            // `obj.prop = value` disambiguation: bare '=' is ALSO a valid binary
+            // equality operator (kept for tolerated DSL forms like `if 1 = 1
+            // then ...`, see native_compat_parser.rs's accepts_single_equals_
+            // as_equality test) -- Token::Equal and Token::EqualEqual both
+            // collapse to the same BinaryOperator::Equal AST node, so this must
+            // be decided HERE, at the token level, before that distinction is
+            // lost; reinterpreting the completed AST afterward (tried first)
+            // can't tell a real `p.age == "30"` (double equals, unaffected by
+            // this check) apart from `p1.name = "alice"` once both are just
+            // BinaryOp{Equal}. Only single '=' directly after a Member expr,
+            // outside a condition (stop_trailing_block_for_condition is true
+            // during if/while conditions specifically, where single '=' must
+            // keep meaning equality), is reinterpreted -- by breaking here
+            // without consuming '=', leaving it for parse_statement's existing
+            // Member+pending-Equal check to turn into a MemberAssign.
+            if matches!(self.curr, Token::Equal) && !self.stop_trailing_block_for_condition && matches!(lhs, Expr::Member { .. }) {
+                break;
+            }
             let (op, lbp, rbp) = match self.curr {
                 Token::Plus => (BinaryOperator::Add, 10, 11),
                 Token::Minus => (BinaryOperator::Sub, 10, 11),

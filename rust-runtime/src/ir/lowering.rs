@@ -292,6 +292,23 @@ impl Lowerer {
                 f.body.push(Instr::BuildList(body.len()));
                 f.body.push(Instr::CallHost("rule_add".into(), 3));
             }
+            Stmt::MemberAssign { object, property, value } => {
+                // obj.prop = value -- lowers to the same send(obj, "set",
+                // prop, value) host call the object system already uses
+                // for explicit send("obj","set","prop",value) calls; mirrors
+                // Expr::Member's get(obj,"prop") on the read side. Previously
+                // unhandled here (fell through to the "unsupported yet:
+                // ignore safely" catch-all below), even though the legacy
+                // core_evaluator.rs path already supported it -- a real gap
+                // in the IR pipeline that --ir-run/--patc actually use.
+                self.lower_expr(object, f);
+                f.body.push(Instr::Const(Value::String("set".to_string().into())));
+                f.body.push(Instr::Const(Value::String((property.clone()).into())));
+                self.lower_expr(value, f);
+                // 4 stack args just pushed: object, "set", property, value.
+                let send_arity = 4;
+                f.body.push(Instr::CallHost("send".into(), send_arity));
+            }
             Stmt::GoalDecl { name, deps } => {
                 // Sugar: lowers to exactly the Instr sequence a hand-written
                 // goal_def(NAME, [[pred,[args...]], ...]) call already
