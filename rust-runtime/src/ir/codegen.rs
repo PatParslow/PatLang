@@ -439,6 +439,18 @@ fn ensure_obj(name: &str, class: &str) {
 // Lives in PRELUDE_CORE (not PRELUDE_OO) since it's a shared primitive
 // used by the "class_def"/"new" match arms in PRELUDE_OO's text, the
 // same relationship OBJECTS/ensure_obj already has to those arms.
+//
+// CLASSES itself needs the SAME thread_local-vs-OnceLock<Mutex> split
+// OBJECTS/EVENT_HANDLERS use above (gated on target_feature = "atomics",
+// not target_arch = "wasm32", for the identical reason) -- this was
+// missing for Slice 1 through Slice 4 (only caught when
+// wasm_target_compiles_and_runs_feature_demo started failing with real
+// `OnceLock`/`Mutex` "undeclared type" errors: those two imports are
+// themselves gated the same way in COMMON_USE_HEADER, so any program
+// using `class`/`new` failed to compile at all for wasm32 without
+// atomics). `classes_get`/`classes_insert` hide the target-specific
+// access so resolve_class_field_defaults/resolve_class_method and the
+// "new"/"class_def" match arms in PRELUDE_OO stay target-agnostic.
 #[derive(Clone, Default)]
 struct ClassDef {
     parent: Option<String>,
@@ -446,10 +458,41 @@ struct ClassDef {
     methods: HashMap<String, Value>,
     traits: Vec<String>,
 }
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+thread_local! {
+    static CLASSES: RefCell<HashMap<String, ClassDef>> = RefCell::new(HashMap::new());
+}
+#[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
 static CLASSES: OnceLock<Mutex<HashMap<String, ClassDef>>> = OnceLock::new();
 
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+fn classes_get(name: &str) -> Option<ClassDef> {
+    CLASSES.with(|c| c.borrow().get(name).cloned())
+}
+#[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+fn classes_get(name: &str) -> Option<ClassDef> {
+    CLASSES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap().get(name).cloned()
+}
+
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+fn classes_insert(name: String, def: ClassDef) {
+    CLASSES.with(|c| { c.borrow_mut().insert(name, def); });
+}
+#[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+fn classes_insert(name: String, def: ClassDef) {
+    CLASSES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap().insert(name, def);
+}
+
+// Slice 4 (inline `new(...)` inheritance): fetch-or-default, mutate, then
+// reinsert -- merges onto an existing ClassDef without clobbering fields
+// the caller didn't ask to change.
+fn classes_update(name: &str, f: impl FnOnce(&mut ClassDef)) {
+    let mut def = classes_get(name).unwrap_or_default();
+    f(&mut def);
+    classes_insert(name.to_string(), def);
+}
+
 fn resolve_class_field_defaults(class: &str) -> Vec<(String, Value)> {
-    let classes = CLASSES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
     let mut chain: Vec<String> = Vec::new();
     let mut cur = Some(class.to_string());
     let mut guard = 0;
@@ -457,15 +500,15 @@ fn resolve_class_field_defaults(class: &str) -> Vec<(String, Value)> {
         if guard > 64 { break; }
         guard += 1;
         if chain.contains(&c) { break; }
-        let def = match classes.get(&c) { Some(d) => d.clone(), None => break };
-        chain.push(c);
+        let def = match classes_get(&c) { Some(d) => d, None => break };
         cur = def.parent.clone();
+        chain.push(c);
     }
     let mut out: Vec<(String, Value)> = Vec::new();
     for c in chain.iter().rev() {
-        if let Some(def) = classes.get(c) {
+        if let Some(def) = classes_get(c) {
             for t in &def.traits {
-                if let Some(tdef) = classes.get(t) {
+                if let Some(tdef) = classes_get(t) {
                     out.extend(tdef.field_defaults.iter().cloned());
                 }
             }
@@ -476,7 +519,6 @@ fn resolve_class_field_defaults(class: &str) -> Vec<(String, Value)> {
 }
 
 fn resolve_class_method(class: &str, method: &str) -> Option<Value> {
-    let classes = CLASSES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
     let mut cur = Some(class.to_string());
     let mut guard = 0;
     let mut visited: Vec<String> = Vec::new();
@@ -484,15 +526,15 @@ fn resolve_class_method(class: &str, method: &str) -> Option<Value> {
         if guard > 64 { break; }
         guard += 1;
         if visited.contains(&c) { break; }
-        let def = classes.get(&c)?;
+        let def = classes_get(&c)?;
         if let Some(m) = def.methods.get(method) { return Some(m.clone()); }
         for t in def.traits.iter().rev() {
-            if let Some(tdef) = classes.get(t) {
+            if let Some(tdef) = classes_get(t) {
                 if let Some(m) = tdef.methods.get(method) { return Some(m.clone()); }
             }
         }
-        visited.push(c);
         cur = def.parent.clone();
+        visited.push(c);
     }
     None
 }
@@ -2903,10 +2945,10 @@ fn host_call_io_misc(name: &str, args: &[Value]) -> Option<Result<Value, String>
                         i += 2;
                     }
                     if inherits.is_some() || traits.is_some() {
-                        let mut classes = CLASSES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
-                        let def = classes.entry(class.clone()).or_insert_with(ClassDef::default);
-                        if let Some(p) = inherits { def.parent = Some(p); }
-                        if let Some(t) = traits { def.traits = t; }
+                        classes_update(&class, |def| {
+                            if let Some(p) = inherits { def.parent = Some(p); }
+                            if let Some(t) = traits { def.traits = t; }
+                        });
                     }
                 }
                 if !name.is_empty() {
@@ -2945,8 +2987,7 @@ fn host_call_io_misc(name: &str, args: &[Value]) -> Option<Result<Value, String>
                     Some(Value::List(xs)) => xs.iter().map(|v| match v { Value::String(s) => s.as_ref().clone(), v => to_s(v) }).collect(),
                     _ => Vec::new(),
                 };
-                CLASSES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap()
-                    .insert(name, ClassDef { parent, field_defaults, methods, traits });
+                classes_insert(name, ClassDef { parent, field_defaults, methods, traits });
                 Ok(Value::Unit)
             }
             "set_var" => {

@@ -544,6 +544,18 @@ make a function called emit_runtime_rs_core_1 takes b returns done
   sb_push(b, "// Lives in PRELUDE_CORE (not PRELUDE_OO) since it's a shared primitive" + nl())
   sb_push(b, "// used by the \"class_def\"/\"new\" match arms in PRELUDE_OO's text, the" + nl())
   sb_push(b, "// same relationship OBJECTS/ensure_obj already has to those arms." + nl())
+  sb_push(b, "//" + nl())
+  sb_push(b, "// CLASSES itself needs the SAME thread_local-vs-OnceLock<Mutex> split" + nl())
+  sb_push(b, "// OBJECTS/EVENT_HANDLERS use above (gated on target_feature = \"atomics\"," + nl())
+  sb_push(b, "// not target_arch = \"wasm32\", for the identical reason) -- this was" + nl())
+  sb_push(b, "// missing for Slice 1 through Slice 4 (only caught when" + nl())
+  sb_push(b, "// wasm_target_compiles_and_runs_feature_demo started failing with real" + nl())
+  sb_push(b, "// `OnceLock`/`Mutex` \"undeclared type\" errors: those two imports are" + nl())
+  sb_push(b, "// themselves gated the same way in COMMON_USE_HEADER, so any program" + nl())
+  sb_push(b, "// using `class`/`new` failed to compile at all for wasm32 without" + nl())
+  sb_push(b, "// atomics). `classes_get`/`classes_insert` hide the target-specific" + nl())
+  sb_push(b, "// access so resolve_class_field_defaults/resolve_class_method and the" + nl())
+  sb_push(b, "// \"new\"/\"class_def\" match arms in PRELUDE_OO stay target-agnostic." + nl())
   sb_push(b, "#[derive(Clone, Default)]" + nl())
   sb_push(b, "struct ClassDef {" + nl())
   sb_push(b, "    parent: Option<String>," + nl())
@@ -551,10 +563,41 @@ make a function called emit_runtime_rs_core_1 takes b returns done
   sb_push(b, "    methods: HashMap<String, Value>," + nl())
   sb_push(b, "    traits: Vec<String>," + nl())
   sb_push(b, "}" + nl())
+  sb_push(b, "#[cfg(all(target_arch = \"wasm32\", not(target_feature = \"atomics\")))]" + nl())
+  sb_push(b, "thread_local! {" + nl())
+  sb_push(b, "    static CLASSES: RefCell<HashMap<String, ClassDef>> = RefCell::new(HashMap::new());" + nl())
+  sb_push(b, "}" + nl())
+  sb_push(b, "#[cfg(any(not(target_arch = \"wasm32\"), target_feature = \"atomics\"))]" + nl())
   sb_push(b, "static CLASSES: OnceLock<Mutex<HashMap<String, ClassDef>>> = OnceLock::new();" + nl())
   sb_push(b, "" + nl())
+  sb_push(b, "#[cfg(all(target_arch = \"wasm32\", not(target_feature = \"atomics\")))]" + nl())
+  sb_push(b, "fn classes_get(name: &str) -> Option<ClassDef> {" + nl())
+  sb_push(b, "    CLASSES.with(|c| c.borrow().get(name).cloned())" + nl())
+  sb_push(b, "}" + nl())
+  sb_push(b, "#[cfg(any(not(target_arch = \"wasm32\"), target_feature = \"atomics\"))]" + nl())
+  sb_push(b, "fn classes_get(name: &str) -> Option<ClassDef> {" + nl())
+  sb_push(b, "    CLASSES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap().get(name).cloned()" + nl())
+  sb_push(b, "}" + nl())
+  sb_push(b, "" + nl())
+  sb_push(b, "#[cfg(all(target_arch = \"wasm32\", not(target_feature = \"atomics\")))]" + nl())
+  sb_push(b, "fn classes_insert(name: String, def: ClassDef) {" + nl())
+  sb_push(b, "    CLASSES.with(|c| { c.borrow_mut().insert(name, def); });" + nl())
+  sb_push(b, "}" + nl())
+  sb_push(b, "#[cfg(any(not(target_arch = \"wasm32\"), target_feature = \"atomics\"))]" + nl())
+  sb_push(b, "fn classes_insert(name: String, def: ClassDef) {" + nl())
+  sb_push(b, "    CLASSES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap().insert(name, def);" + nl())
+  sb_push(b, "}" + nl())
+  sb_push(b, "" + nl())
+  sb_push(b, "// Slice 4 (inline `new(...)` inheritance): fetch-or-default, mutate, then" + nl())
+  sb_push(b, "// reinsert -- merges onto an existing ClassDef without clobbering fields" + nl())
+  sb_push(b, "// the caller didn't ask to change." + nl())
+  sb_push(b, "fn classes_update(name: &str, f: impl FnOnce(&mut ClassDef)) {" + nl())
+  sb_push(b, "    let mut def = classes_get(name).unwrap_or_default();" + nl())
+  sb_push(b, "    f(&mut def);" + nl())
+  sb_push(b, "    classes_insert(name.to_string(), def);" + nl())
+  sb_push(b, "}" + nl())
+  sb_push(b, "" + nl())
   sb_push(b, "fn resolve_class_field_defaults(class: &str) -> Vec<(String, Value)> {" + nl())
-  sb_push(b, "    let classes = CLASSES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();" + nl())
   sb_push(b, "    let mut chain: Vec<String> = Vec::new();" + nl())
   sb_push(b, "    let mut cur = Some(class.to_string());" + nl())
   sb_push(b, "    let mut guard = 0;" + nl())
@@ -562,15 +605,15 @@ make a function called emit_runtime_rs_core_1 takes b returns done
   sb_push(b, "        if guard > 64 { break; }" + nl())
   sb_push(b, "        guard += 1;" + nl())
   sb_push(b, "        if chain.contains(&c) { break; }" + nl())
-  sb_push(b, "        let def = match classes.get(&c) { Some(d) => d.clone(), None => break };" + nl())
-  sb_push(b, "        chain.push(c);" + nl())
+  sb_push(b, "        let def = match classes_get(&c) { Some(d) => d, None => break };" + nl())
   sb_push(b, "        cur = def.parent.clone();" + nl())
+  sb_push(b, "        chain.push(c);" + nl())
   sb_push(b, "    }" + nl())
   sb_push(b, "    let mut out: Vec<(String, Value)> = Vec::new();" + nl())
   sb_push(b, "    for c in chain.iter().rev() {" + nl())
-  sb_push(b, "        if let Some(def) = classes.get(c) {" + nl())
+  sb_push(b, "        if let Some(def) = classes_get(c) {" + nl())
   sb_push(b, "            for t in &def.traits {" + nl())
-  sb_push(b, "                if let Some(tdef) = classes.get(t) {" + nl())
+  sb_push(b, "                if let Some(tdef) = classes_get(t) {" + nl())
   sb_push(b, "                    out.extend(tdef.field_defaults.iter().cloned());" + nl())
   sb_push(b, "                }" + nl())
   sb_push(b, "            }" + nl())
@@ -581,7 +624,6 @@ make a function called emit_runtime_rs_core_1 takes b returns done
   sb_push(b, "}" + nl())
   sb_push(b, "" + nl())
   sb_push(b, "fn resolve_class_method(class: &str, method: &str) -> Option<Value> {" + nl())
-  sb_push(b, "    let classes = CLASSES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();" + nl())
   sb_push(b, "    let mut cur = Some(class.to_string());" + nl())
   sb_push(b, "    let mut guard = 0;" + nl())
   sb_push(b, "    let mut visited: Vec<String> = Vec::new();" + nl())
@@ -589,15 +631,15 @@ make a function called emit_runtime_rs_core_1 takes b returns done
   sb_push(b, "        if guard > 64 { break; }" + nl())
   sb_push(b, "        guard += 1;" + nl())
   sb_push(b, "        if visited.contains(&c) { break; }" + nl())
-  sb_push(b, "        let def = classes.get(&c)?;" + nl())
+  sb_push(b, "        let def = classes_get(&c)?;" + nl())
   sb_push(b, "        if let Some(m) = def.methods.get(method) { return Some(m.clone()); }" + nl())
   sb_push(b, "        for t in def.traits.iter().rev() {" + nl())
-  sb_push(b, "            if let Some(tdef) = classes.get(t) {" + nl())
+  sb_push(b, "            if let Some(tdef) = classes_get(t) {" + nl())
   sb_push(b, "                if let Some(m) = tdef.methods.get(method) { return Some(m.clone()); }" + nl())
   sb_push(b, "            }" + nl())
   sb_push(b, "        }" + nl())
-  sb_push(b, "        visited.push(c);" + nl())
   sb_push(b, "        cur = def.parent.clone();" + nl())
+  sb_push(b, "        visited.push(c);" + nl())
   sb_push(b, "    }" + nl())
   sb_push(b, "    None" + nl())
   sb_push(b, "}" + nl())
@@ -615,6 +657,10 @@ make a function called emit_runtime_rs_core_1 takes b returns done
   sb_push(b, "// chunk within a single build -- see the doc comment on `PRELUDE_VALUE_FAST`" + nl())
   sb_push(b, "// for the full rationale (Stage 38, \"risky shared-dependency edit\")." + nl())
   sb_push(b, "" + nl())
+  return true
+end
+
+make a function called emit_runtime_rs_core_2 takes b returns done
   sb_push(b, "#[derive(Clone, Debug, PartialEq)]" + nl())
   sb_push(b, "enum BinOpKind { Add, Sub, Mul, Div, Mod, Eq, Ne, Lt, Le, Gt, Ge, And, Or, BitAnd, BitOr, BitXor, Shl, Shr }" + nl())
   sb_push(b, "#[derive(Clone, Debug, PartialEq)]" + nl())
@@ -657,10 +703,6 @@ make a function called emit_runtime_rs_core_1 takes b returns done
   sb_push(b, "        // BigInt/Rational/Complex are passed through UNCHANGED, not lossily" + nl())
   sb_push(b, "        // flattened: `print`/`display_value` (and anything else that just" + nl())
   sb_push(b, "        // consumes a `Value` generically rather than pattern-matching" + nl())
-  return true
-end
-
-make a function called emit_runtime_rs_core_2 takes b returns done
   sb_push(b, "        // `Value::Number` for an index/count) must see the exact tower value," + nl())
   sb_push(b, "        // or e.g. `print(10 / 3)` would silently lose exactness at this" + nl())
   sb_push(b, "        // boundary and print a lossy float instead of \"10/3\". Any" + nl())
@@ -769,6 +811,10 @@ make a function called emit_runtime_rs_core_2 takes b returns done
   sb_push(b, "                if !(0..=64).contains(&width) || start + width > 64 { return Err(format!(\"bit_set_slice: width {} at start {} out of range\", width, start)); }" + nl())
   sb_push(b, "                if width == 0 { return Ok(Value::Int(n)); }" + nl())
   sb_push(b, "                let mask: i64 = if width == 64 { -1 } else { (1i64 << width) - 1 };" + nl())
+  return true
+end
+
+make a function called emit_runtime_rs_core_3 takes b returns done
   sb_push(b, "                let cleared = n & !(mask << start);" + nl())
   sb_push(b, "                Ok(Value::Int(cleared | ((val & mask) << start)))" + nl())
   sb_push(b, "            }" + nl())
@@ -811,10 +857,6 @@ make a function called emit_runtime_rs_core_2 takes b returns done
   sb_push(b, "                    Err(_) => std::env::current_dir().map_err(|e| format!(\"vfs_flush_to_disk: current_dir: {}\", e))?," + nl())
   sb_push(b, "                };" + nl())
   sb_push(b, "                let allowed_root = std::fs::canonicalize(&allowed_root)" + nl())
-  return true
-end
-
-make a function called emit_runtime_rs_core_3 takes b returns done
   sb_push(b, "                    .map_err(|e| format!(\"vfs_flush_to_disk: canonicalize allowed root {}: {}\", allowed_root.display(), e))?;" + nl())
   sb_push(b, "                std::fs::create_dir_all(&real_dir).map_err(|e| format!(\"vfs_flush_to_disk: create_dir_all {}: {}\", real_dir, e))?;" + nl())
   sb_push(b, "                let target_canon = std::fs::canonicalize(&real_dir)" + nl())
@@ -923,6 +965,10 @@ make a function called emit_runtime_rs_core_3 takes b returns done
   sb_push(b, "            .unwrap_or(0)" + nl())
   sb_push(b, "    }" + nl())
   sb_push(b, "" + nl())
+  return true
+end
+
+make a function called emit_runtime_rs_core_4 takes b returns done
   sb_push(b, "    pub fn fiber_new(program: &Program, func_name: String) -> Result<Value, String> {" + nl())
   sb_push(b, "        if !program.functions.contains_key(&func_name) {" + nl())
   sb_push(b, "            return Err(format!(\"fiber_new: function '{}' not found\", func_name));" + nl())
@@ -965,10 +1011,6 @@ make a function called emit_runtime_rs_core_3 takes b returns done
   sb_push(b, "    fn id_from_value(v: &Value) -> Result<u64, String> {" + nl())
   sb_push(b, "        match v {" + nl())
   sb_push(b, "            Value::Int(n) if *n >= 0 => Ok(*n as u64)," + nl())
-  return true
-end
-
-make a function called emit_runtime_rs_core_4 takes b returns done
   sb_push(b, "            other => Err(format!(\"fiber: expected a fiber id, got {:?}\", other))," + nl())
   sb_push(b, "        }" + nl())
   sb_push(b, "    }" + nl())
@@ -1077,6 +1119,10 @@ make a function called emit_runtime_rs_core_4 takes b returns done
   sb_push(b, "                    st.recent_durations.remove(0);" + nl())
   sb_push(b, "                }" + nl())
   sb_push(b, "            }" + nl())
+  return true
+end
+
+make a function called emit_runtime_rs_core_5 takes b returns done
   sb_push(b, "            st.budget_last_check_ms = Some(now);" + nl())
   sb_push(b, "            let predicted = predict_next_duration_ms(&st.recent_durations);" + nl())
   sb_push(b, "            (st.budget_deadline_ms, predicted)" + nl())
@@ -1119,10 +1165,6 @@ make a function called emit_runtime_rs_core_4 takes b returns done
   sb_push(b, "                    Shl => shl(&a,&b)?, Shr => shr(&a,&b)?," + nl())
   sb_push(b, "                };" + nl())
   sb_push(b, "                stack.push(r);" + nl())
-  return true
-end
-
-make a function called emit_runtime_rs_core_5 takes b returns done
   sb_push(b, "            }" + nl())
   sb_push(b, "            Instr::Jump(t) => { pc = *t; continue; }" + nl())
   sb_push(b, "            Instr::JumpIfFalse(t) => { let c = stack.pop().ok_or(\"stack underflow\")?; if !c.as_bool()? { pc = *t; continue; } }" + nl())
@@ -1231,6 +1273,10 @@ make a function called emit_runtime_rs_core_5 takes b returns done
   sb_push(b, "                        Some(Value::String(s)) => s.as_ref().clone()," + nl())
   sb_push(b, "                        other => return Err(format!(\"parallel_map: expected a function name string as the second arg, got {:?}\", other))," + nl())
   sb_push(b, "                    };" + nl())
+  return true
+end
+
+make a function called emit_runtime_rs_core_6 takes b returns done
   sb_push(b, "                    if !program.functions.contains_key(&fname) {" + nl())
   sb_push(b, "                        return Err(format!(\"parallel_map: function '{}' not found\", fname));" + nl())
   sb_push(b, "                    }" + nl())
@@ -1273,10 +1319,6 @@ make a function called emit_runtime_rs_core_5 takes b returns done
   sb_push(b, "                } else if n == \"fiber_yield\" {" + nl())
   sb_push(b, "                    #[cfg(all(target_arch = \"wasm32\", not(target_feature = \"atomics\")))]" + nl())
   sb_push(b, "                    { return Err(\"fibers are not supported when compiled to wasm32\".into()); }" + nl())
-  return true
-end
-
-make a function called emit_runtime_rs_core_6 takes b returns done
   sb_push(b, "                    #[cfg(any(not(target_arch = \"wasm32\"), target_feature = \"atomics\"))]" + nl())
   sb_push(b, "                    {" + nl())
   sb_push(b, "                        let v = args.get(0).cloned().unwrap_or(Value::Unit);" + nl())
@@ -1385,6 +1427,10 @@ make a function called emit_runtime_rs_core_6 takes b returns done
   sb_push(b, "fn dispatch_fallback(name: &str, args: &[Value]) -> Result<Value, String> {" + nl())
   sb_push(b, "    DISPATCH_FALLBACK.with(|d| {" + nl())
   sb_push(b, "        match *d.borrow() {" + nl())
+  return true
+end
+
+make a function called emit_runtime_rs_core_7 takes b returns done
   sb_push(b, "            Some(f) => f(name, args)," + nl())
   sb_push(b, "            None => Err(format!(\"host fn '{}' not found (dispatch fallback not set -- did main() call set_dispatch_fallback?)\", name))," + nl())
   sb_push(b, "        }" + nl())
@@ -1403,6 +1449,7 @@ make a function called emit_chunk_core returns s
   emit_runtime_rs_core_4(b)
   emit_runtime_rs_core_5(b)
   emit_runtime_rs_core_6(b)
+  emit_runtime_rs_core_7(b)
   return sb_str(b)
 end
 
@@ -4648,10 +4695,10 @@ make a function called emit_runtime_rs_oo_0 takes b returns done
   sb_push(b, "                        i += 2;" + nl())
   sb_push(b, "                    }" + nl())
   sb_push(b, "                    if inherits.is_some() || traits.is_some() {" + nl())
-  sb_push(b, "                        let mut classes = CLASSES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();" + nl())
-  sb_push(b, "                        let def = classes.entry(class.clone()).or_insert_with(ClassDef::default);" + nl())
-  sb_push(b, "                        if let Some(p) = inherits { def.parent = Some(p); }" + nl())
-  sb_push(b, "                        if let Some(t) = traits { def.traits = t; }" + nl())
+  sb_push(b, "                        classes_update(&class, |def| {" + nl())
+  sb_push(b, "                            if let Some(p) = inherits { def.parent = Some(p); }" + nl())
+  sb_push(b, "                            if let Some(t) = traits { def.traits = t; }" + nl())
+  sb_push(b, "                        });" + nl())
   sb_push(b, "                    }" + nl())
   sb_push(b, "                }" + nl())
   sb_push(b, "                if !name.is_empty() {" + nl())
@@ -4690,8 +4737,7 @@ make a function called emit_runtime_rs_oo_0 takes b returns done
   sb_push(b, "                    Some(Value::List(xs)) => xs.iter().map(|v| match v { Value::String(s) => s.as_ref().clone(), v => to_s(v) }).collect()," + nl())
   sb_push(b, "                    _ => Vec::new()," + nl())
   sb_push(b, "                };" + nl())
-  sb_push(b, "                CLASSES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap()" + nl())
-  sb_push(b, "                    .insert(name, ClassDef { parent, field_defaults, methods, traits });" + nl())
+  sb_push(b, "                classes_insert(name, ClassDef { parent, field_defaults, methods, traits });" + nl())
   sb_push(b, "                Ok(Value::Unit)" + nl())
   sb_push(b, "            }" + nl())
   sb_push(b, "            \"set_var\" => {" + nl())

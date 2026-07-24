@@ -340,12 +340,30 @@ impl<'a> Parser<'a> {
                         }
                     }
                 }
-                self.expect(Token::BlockStart, "'{' after class header", "Use `class NAME [inherits PARENT] { field NAME = EXPR ... }`")?;
+                // Slice 5: `class NAME { ... }` or `class NAME do ... end`
+                // (`begin` also accepted as a synonym for `do`, matching
+                // every other dual-form block site in this parser --
+                // while-loops, closures, budgeted(...)). `word_form`
+                // tracks which delimiter opened the block so the same
+                // body-parsing loop below knows whether to stop at `}` or
+                // at the word `end`.
+                let word_form = if matches!(self.curr, Token::BlockStart) {
+                    self.advance()?;
+                    false
+                } else if matches!(&self.curr, Token::Identifier(s) if s == "do" || s == "begin") {
+                    self.advance()?;
+                    true
+                } else {
+                    return Err(ParserError::ExpectedToken { expected: "'{' or 'do'/'begin' after class header", line: self.line_no, hint: "Use `class NAME [inherits PARENT] { field NAME = EXPR ... }` or `class NAME [inherits PARENT] do field NAME = EXPR ... end`" });
+                };
                 self.consume_newlines()?;
                 let mut fields: Vec<(String, Expr)> = Vec::new();
                 let mut methods: Vec<(String, Vec<String>, Vec<Stmt>)> = Vec::new();
                 let mut traits: Vec<String> = Vec::new();
-                while !matches!(self.curr, Token::BlockEnd | Token::EOF) {
+                let is_class_block_end = |tok: &Token, word_form: bool| -> bool {
+                    if word_form { matches!(tok, Token::Identifier(s) if s == "end") } else { matches!(tok, Token::BlockEnd) }
+                };
+                while !is_class_block_end(&self.curr, word_form) && !matches!(self.curr, Token::EOF) {
                     match &self.curr {
                         // Slice 3: `traits A, B` -- comma-separated trait
                         // (class) names to compose in, last-listed wins
@@ -387,7 +405,14 @@ impl<'a> Parser<'a> {
                     }
                     self.consume_newlines()?;
                 }
-                self.expect(Token::BlockEnd, "'}' to close class block", "Close the class block with '}'")?;
+                if word_form {
+                    match &self.curr {
+                        Token::Identifier(s) if s == "end" => { self.advance()?; }
+                        _ => return Err(ParserError::ExpectedToken { expected: "'end' to close class block", line: self.line_no, hint: "Close the class block with 'end'" }),
+                    }
+                } else {
+                    self.expect(Token::BlockEnd, "'}' to close class block", "Close the class block with '}'")?;
+                }
                 Ok(Stmt::ClassDecl { name, parent, fields, methods, traits })
             }
             Token::Rule => {
@@ -546,9 +571,11 @@ impl<'a> Parser<'a> {
                             self.advance()?; // '{'
                             let body = self.parse_block()?;
                             return Ok(Stmt::When { event: event_name, body, line: when_line });
-                        } else if matches!(&self.curr, Token::Identifier(s) if s == "do") {
-                            // Stage 1 form: when EVENT do ... end
-                            self.advance()?; // 'do'
+                        } else if matches!(&self.curr, Token::Identifier(s) if s == "do" || s == "begin") {
+                            // Stage 1 form: when EVENT do ... end (or `begin
+                            // ... end`, an accepted synonym for `do` at every
+                            // dual-form block site in this parser).
+                            self.advance()?; // 'do'/'begin'
                             let (body, _) = self.parse_word_block(&["end"], false)?;
                             return Ok(Stmt::When { event: event_name, body, line: when_line });
                         } else {
@@ -1087,7 +1114,7 @@ impl<'a> Parser<'a> {
             return Ok(Stmt::While { cond, body });
         }
         if let Token::Identifier(ref s) = self.curr {
-            if s == "do" {
+            if s == "do" || s == "begin" {
                 self.advance()?;
                 let (body, _) = self.parse_word_block(&["end"], false)?;
                 return Ok(Stmt::While { cond, body });
@@ -1222,8 +1249,8 @@ impl<'a> Parser<'a> {
                     let body = if matches!(self.curr, Token::BlockStart) {
                         self.advance()?; // '{'
                         self.parse_block()?
-                    } else if matches!(&self.curr, Token::Identifier(s) if s == "do") {
-                        self.advance()?; // 'do'
+                    } else if matches!(&self.curr, Token::Identifier(s) if s == "do" || s == "begin") {
+                        self.advance()?; // 'do'/'begin'
                         let (b, _) = self.parse_word_block(&["end"], false)?;
                         b
                     } else { vec![] };
@@ -1295,8 +1322,8 @@ impl<'a> Parser<'a> {
                     self.advance()?; // '{'
                     let body = self.parse_block()?;
                     Expr::Budgeted { ms: Box::new(ms), existing, body }
-                } else if matches!(&self.curr, Token::Identifier(s) if s == "do") {
-                    self.advance()?; // 'do'
+                } else if matches!(&self.curr, Token::Identifier(s) if s == "do" || s == "begin") {
+                    self.advance()?; // 'do'/'begin'
                     let (body, _) = self.parse_word_block(&["end"], false)?;
                     Expr::Budgeted { ms: Box::new(ms), existing, body }
                 } else {
