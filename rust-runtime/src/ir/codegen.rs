@@ -2881,9 +2881,34 @@ fn host_call_io_misc(name: &str, args: &[Value]) -> Option<Result<Value, String>
     const PRELUDE_OO: &'static str = r##"fn host_call_oo_inner(name: &str, args: &[Value]) -> Result<Value, String> {
     match name {
 "new" => {
-                if args.len() != 2 { return Ok(Value::Unit); }
+                if args.len() < 2 { return Ok(Value::Unit); }
                 let class = match &args[0] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
                 let name = match &args[1] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
+                if args.len() > 2 {
+                    let mut inherits: Option<String> = None;
+                    let mut traits: Option<Vec<String>> = None;
+                    let mut i = 2;
+                    while i + 1 < args.len() {
+                        let key = match &args[i] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
+                        match key.as_str() {
+                            "inherits" => { inherits = match &args[i + 1] { Value::String(s) => Some(s.as_ref().clone()), _ => None }; }
+                            "traits" => {
+                                traits = match &args[i + 1] {
+                                    Value::List(xs) => Some(xs.iter().map(|v| match v { Value::String(s) => s.as_ref().clone(), v => to_s(v) }).collect()),
+                                    _ => None,
+                                };
+                            }
+                            _ => {}
+                        }
+                        i += 2;
+                    }
+                    if inherits.is_some() || traits.is_some() {
+                        let mut classes = CLASSES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+                        let def = classes.entry(class.clone()).or_insert_with(ClassDef::default);
+                        if let Some(p) = inherits { def.parent = Some(p); }
+                        if let Some(t) = traits { def.traits = t; }
+                    }
+                }
                 if !name.is_empty() {
                     ensure_obj(&name, &class);
                     for (field, default) in resolve_class_field_defaults(&class) {

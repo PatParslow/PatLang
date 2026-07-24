@@ -1351,15 +1351,51 @@ pub fn host_vfs_flush_to_disk(args: &[Value]) -> Result<Value, String> {
 }
 
 pub fn host_new(args: &[Value]) -> Result<Value, String> {
-    // new(class, name) -> name, registering the object. If `class` matches
-    // a class registered via `class_def` (a real `class NAME { ... }`
-    // block, see lowering.rs's ClassDecl handling), auto-populates field
-    // defaults resolved root-to-leaf up the (single) inheritance chain --
-    // an unregistered class name (the ad hoc, no-class-required case)
-    // resolves to zero defaults and behaves exactly as before.
-    if args.len() != 2 { return Ok(Value::Unit); }
+    // new(class, name[, "inherits", PARENT][, "traits", [T, ...]]) -> name,
+    // registering the object. If `class` matches a class registered via
+    // `class_def` (a real `class NAME { ... }` block, see lowering.rs's
+    // ClassDecl handling), auto-populates field defaults resolved
+    // root-to-leaf up the (single) inheritance chain -- an unregistered
+    // class name (the ad hoc, no-class-required case) resolves to zero
+    // defaults and behaves exactly as before.
+    //
+    // Slice 4 of the classes/traits/inheritance feature: optional
+    // trailing keyword-style pairs (positional, since this language has
+    // no named-argument syntax) let a caller register/extend a
+    // lightweight ClassDef inline, without ever writing a `class { ... }`
+    // block -- e.g. `new("Person", "p1", "inherits", "Animal", "traits",
+    // ["Nameable"])`. This merges onto whatever ClassDef already exists
+    // for `class` (creating an empty one if none), updating only
+    // parent/traits -- any existing field_defaults/methods from a real
+    // `class NAME { ... }` declaration are left untouched.
+    if args.len() < 2 { return Ok(Value::Unit); }
     let class = match &args[0] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
     let name = match &args[1] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
+    if args.len() > 2 {
+        let mut inherits: Option<String> = None;
+        let mut traits: Option<Vec<String>> = None;
+        let mut i = 2;
+        while i + 1 < args.len() {
+            let key = match &args[i] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
+            match key.as_str() {
+                "inherits" => { inherits = match &args[i + 1] { Value::String(s) => Some(s.as_ref().clone()), _ => None }; }
+                "traits" => {
+                    traits = match &args[i + 1] {
+                        Value::List(xs) => Some(xs.iter().map(|v| match v { Value::String(s) => s.as_ref().clone(), v => to_s(v) }).collect()),
+                        _ => None,
+                    };
+                }
+                _ => {}
+            }
+            i += 2;
+        }
+        if inherits.is_some() || traits.is_some() {
+            let mut classes = CLASSES.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap();
+            let def = classes.entry(class.clone()).or_insert_with(ClassDef::default);
+            if let Some(p) = inherits { def.parent = Some(p); }
+            if let Some(t) = traits { def.traits = t; }
+        }
+    }
     if !name.is_empty() {
         ensure_obj(&name, &class);
         for (field, default) in resolve_class_field_defaults(&class) {
