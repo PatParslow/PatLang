@@ -28,6 +28,20 @@ pub struct Lowerer {
     in_budgeted_depth: usize,
     // unique naming for synthesized `activate(...)` dispatch-loop locals
     activate_counter: usize,
+    // Names whose most recent non-reassignment `let` bound them to a
+    // string literal -- used only to reduce false positives in the
+    // string-concat-in-a-loop warning below (a bare `let x = x + 1`
+    // loop counter has the identical AST shape as `let out = out + c`,
+    // so without this we'd warn on every ordinary numeric accumulator
+    // too). Never removed once added -- reusing a name for a number
+    // after a string-literal init is rare enough that a stale flag is
+    // an acceptable false-negative, and simpler than full type tracking.
+    string_literal_locals: HashSet<String>,
+    // Warned-once guard so a self-append inside a loop that runs a
+    // million times doesn't print a million identical warnings -- the
+    // interesting fact is WHICH VARIABLE, not how many times the loop
+    // executed it.
+    warned_string_concat: HashSet<String>,
 }
 
 impl Lowerer {
@@ -210,6 +224,9 @@ impl Lowerer {
                 } else {
                     // `let` / `let mut`: always allowed to introduce or shadow.
                     self.known_locals.insert(name.clone(), *mutable);
+                    if matches!(value, Expr::String(_)) {
+                        self.string_literal_locals.insert(name.clone());
+                    }
                 }
                 f.body.push(Instr::StoreLocal(name.clone()));
             }
@@ -239,6 +256,7 @@ impl Lowerer {
                 if let Instr::Jump(ref mut tgt) = f.body[jmp_over_idx] { *tgt = after_else; }
             }
             Stmt::While { cond, body } => {
+                self.warn_string_concat_in_loop(body);
                 // loop_start:
                 let loop_start = f.body.len();
                 // evaluate condition
@@ -654,6 +672,58 @@ impl Lowerer {
             f.body.push(Instr::LoadLocal(name.clone()));
         }
         f.body.push(Instr::MakeClosure(func_name, captured_names));
+    }
+
+    // Warns (to stderr, non-fatal) on `let x = x + <expr>` reassignments
+    // found anywhere inside a while-loop's body (recursing into nested
+    // if/while blocks, since the append is often guarded by a condition)
+    // when `x` was last bound to a string literal -- the exact pattern
+    // that made an O(n) char-by-char scan silently O(n^2) in
+    // self_hosting/lib/syntax_dsl.patlang (30+ minutes on a ~700K-char
+    // file that should have taken seconds), found only because the user
+    // asked "didn't recent changes make this slower?" rather than
+    // treating the slowdown as expected. String values here are
+    // immutable (Arc<String>) -- every `x = x + ...` copies the WHOLE
+    // accumulated string again, turning an n-iteration loop into O(n^2)
+    // total work. Restricted to string-literal-initialized names (not
+    // every self-referential `+`) specifically so this doesn't fire on
+    // an ordinary `let i = i + 1` counter or `let total = total + n`
+    // numeric accumulator, which share the identical AST shape.
+    fn warn_string_concat_in_loop(&mut self, stmts: &[Stmt]) {
+        for s in stmts {
+            match s {
+                Stmt::Let { name, value, .. } => {
+                    // Note: this codebase's own idiom writes `let x = x +
+                    // ...` (WITH the `let` keyword) for what is really a
+                    // reassignment inside a loop, not the bare `x = x +
+                    // ...` form -- parse_let always sets is_reassignment:
+                    // false regardless of whether `x` already exists, so
+                    // this check can't restrict to is_reassignment: true
+                    // (confirmed by testing: that version never fired on
+                    // this repo's own real code, only on the bare form).
+                    if self.string_literal_locals.contains(name) {
+                        if let Expr::BinaryOp { left, op: BinaryOperator::Add, .. } = value {
+                            if matches!(&**left, Expr::Identifier(n) if n == name) {
+                                if self.warned_string_concat.insert(name.clone()) {
+                                    eprintln!(
+                                        "warning: `{name} = {name} + ...` inside a loop copies the whole string on every iteration (O(n^2) total, not O(n)) -- use sb_new()/sb_push({name}, ...)/sb_str({name}) instead",
+                                        name = name
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                Stmt::If { then_branch, else_branch, .. } => {
+                    self.warn_string_concat_in_loop(then_branch);
+                    if let Some(else_branch) = else_branch {
+                        self.warn_string_concat_in_loop(else_branch);
+                    }
+                }
+                Stmt::While { body, .. } => self.warn_string_concat_in_loop(body),
+                _ => {}
+            }
+        }
     }
 }
 

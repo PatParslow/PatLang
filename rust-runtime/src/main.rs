@@ -48,12 +48,29 @@ fn main() {
     // lexer/parser/lowerer running over large sources) can exceed the
     // default stack. Any `process::exit()` call inside `real_main` still
     // terminates the whole process regardless of which thread calls it.
-    std::thread::Builder::new()
+    let result = std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
         .spawn(real_main)
         .expect("failed to spawn worker thread")
-        .join()
-        .unwrap_or(());
+        .join();
+    // `.join()`'s Err case (real_main panicked) used to be silently
+    // swallowed by `.unwrap_or(())`, which let the whole process exit 0
+    // with ZERO output -- no panic message, no error, nothing -- even
+    // though something genuinely crashed inside the interpreter thread.
+    // Found the hard way: a malformed Program (from an unrelated parser
+    // bug -- a reserved keyword used as a plain parameter name silently
+    // truncated a function's param list and corrupted its body) reached
+    // the interpreter, which panicked internally on the corrupted
+    // instruction stream; that panic vanished completely, and diagnosing
+    // it required manually bisecting the input file and adding temporary
+    // eprintln! calls at every step just to find where execution actually
+    // stopped. Rust's default panic hook already prints the panic message
+    // to stderr before unwinding, so this only needs to make sure the
+    // PROCESS exit code reflects the failure too, rather than reporting
+    // success for a run that never completed.
+    if result.is_err() {
+        process::exit(101); // matches the exit code an unhandled panic on the main thread would produce
+    }
 }
 
 fn real_main() {

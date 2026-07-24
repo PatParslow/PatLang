@@ -96,26 +96,64 @@ make a function called sdsl_len takes s returns r
   return to_num(list_len(s))
 end
 
-# Whole-word keyword match: `keyword` occurs at `s[pos..]` and is not glued
-# to an identifier character on either side.
-make a function called sdsl_starts_keyword_at takes s, pos, keyword returns r
-  let slen = sdsl_len(s)
+# NOTE on `h` params below (sdsl_starts_keyword_at/sdsl_skip_ws/
+# sdsl_skip_ws_and_comments/sdsl_find_char/sdsl_take_identifier/
+# sdsl_take_balanced_block): `h` is a HANDLE from str_intern(s), not a
+# plain string -- accessed via sc_char/sc_len, not substr/sdsl_len.
+# `substr` (and sdsl_len, which goes through list_len) calls the plain
+# Rust `str::is_ascii()`/`.chars().count()` FRESH on every single call,
+# an O(n) full-string scan -- calling that once per character in a
+# whole-file scan is exactly what turned this preprocessor's O(n) scan
+# into O(n^2) (confirmed: patc1.exe took 30+ minutes on its own
+# ~700K-char combined source, which never even contains a real `syntax`
+# block, just because "syntax " appears in doc comments and triggers
+# the scan at all). `str_intern` caches the is-ascii check ONCE, at
+# intern time, and sc_char/sc_len read that cached flag -- the
+# established idiom this codebase already uses elsewhere for exactly
+# this reason (see hosts.rs's ISTRINGS comment / patlang-ascii-fastpath-
+# cache-fix). `sc_char` returns the same 1-char-string shape `substr(s,
+# i,1)` did, so callers otherwise read identically to before.
+#
+# Whole-word keyword match: `keyword` occurs at `h[pos..]` and is not
+# glued to an identifier character on either side.
+make a function called sdsl_starts_keyword_at takes h, pos, keyword returns r
+  # Compares character-by-character directly against `keyword` (always a
+  # short literal like "syntax") instead of building a substring via
+  # sdsl_sc_substr first -- this function is called once per NON-comment
+  # character position across the whole file (see sdsl_extract_syntax_
+  # defs/sdsl_expand_trigger_blocks), so building a fresh sb_new/sb_push
+  # x N/sb_str-allocated string just to immediately discard it after one
+  # comparison was the real remaining cost after the O(n^2)->O(n)
+  # complexity fix: ~8 host calls per character for a ~700K-character
+  # file that's mostly non-comment code, none of which the comparison
+  # itself actually needs. `keyword` itself stays a plain substr() call
+  # (not interned) -- it's a handful of characters, so its own
+  # uncached is-ascii check is negligible, unlike scanning the whole file.
+  let slen = sc_len(h)
   let klen = sdsl_len(keyword)
   if (pos + klen) > slen then
     return false
   else
-    if substr(s, pos, klen) != keyword then
+    let matched = true
+    let k = 0
+    while (k < klen) and matched do
+      if sc_char(h, pos + k) != substr(keyword, k, 1) then
+        let matched = false
+      end
+      let k = k + 1
+    end
+    if not matched then
       return false
     else
       let ok = true
       if pos > 0 then
-        if sdsl_is_ident_char(substr(s, pos - 1, 1)) then
+        if sdsl_is_ident_char(sc_char(h, pos - 1)) then
           let ok = false
         end
       end
       let after = pos + klen
       if after < slen then
-        if sdsl_is_ident_char(substr(s, after, 1)) then
+        if sdsl_is_ident_char(sc_char(h, after)) then
           let ok = false
         end
       end
@@ -124,12 +162,27 @@ make a function called sdsl_starts_keyword_at takes s, pos, keyword returns r
   end
 end
 
-make a function called sdsl_skip_ws takes s, pos returns r
-  let slen = sdsl_len(s)
+# sc_char/sc_len only give O(1) single-character access -- there's no
+# sc_substr, so a short multi-character slice (keyword-length compares,
+# almost always just a few chars) is built by concatenating individual
+# sc_char results via a string builder rather than substr(h,...), which
+# would need a plain string, not a handle.
+make a function called sdsl_sc_substr takes h, pos, count returns r
+  let b = sb_new()
+  let k = 0
+  while k < count do
+    sb_push(b, sc_char(h, pos + k))
+    let k = k + 1
+  end
+  return sb_str(b)
+end
+
+make a function called sdsl_skip_ws takes h, pos returns r
+  let slen = sc_len(h)
   let i = pos
   let scanning = true
   while (i < slen) and scanning do
-    if sdsl_is_ws(substr(s, i, 1)) then
+    if sdsl_is_ws(sc_char(h, i)) then
       let i = i + 1
     else
       let scanning = false
@@ -138,30 +191,30 @@ make a function called sdsl_skip_ws takes s, pos returns r
   return i
 end
 
-make a function called sdsl_skip_ws_and_comments takes s, pos returns r
-  let slen = sdsl_len(s)
-  let i = sdsl_skip_ws(s, pos)
+make a function called sdsl_skip_ws_and_comments takes h, pos returns r
+  let slen = sc_len(h)
+  let i = sdsl_skip_ws(h, pos)
   let scanning = true
   while scanning do
     let scanning = false
-    if (i < slen) and (substr(s, i, 1) == "#") then
-      while (i < slen) and (substr(s, i, 1) != "\n") do
+    if (i < slen) and (sc_char(h, i) == "#") then
+      while (i < slen) and (sc_char(h, i) != "\n") do
         let i = i + 1
       end
-      let i = sdsl_skip_ws(s, i)
+      let i = sdsl_skip_ws(h, i)
       let scanning = true
     end
   end
   return i
 end
 
-make a function called sdsl_find_char takes s, from, target returns r
-  let slen = sdsl_len(s)
+make a function called sdsl_find_char takes h, from, target returns r
+  let slen = sc_len(h)
   let i = from
   let found = -1
   let scanning = true
   while (i < slen) and scanning do
-    if substr(s, i, 1) == target then
+    if sc_char(h, i) == target then
       let found = i
       let scanning = false
     else
@@ -172,24 +225,24 @@ make a function called sdsl_find_char takes s, from, target returns r
 end
 
 # Returns [identifier_text, next_pos], or ["", -1] if no identifier starts there.
-make a function called sdsl_take_identifier takes s, pos returns r
-  let slen = sdsl_len(s)
+make a function called sdsl_take_identifier takes h, pos returns r
+  let slen = sc_len(h)
   if pos >= slen then
     return ["", -1]
   else
-    if not sdsl_is_ident_start(substr(s, pos, 1)) then
+    if not sdsl_is_ident_start(sc_char(h, pos)) then
       return ["", -1]
     else
       let i = pos + 1
       let scanning = true
       while (i < slen) and scanning do
-        if sdsl_is_ident_char(substr(s, i, 1)) then
+        if sdsl_is_ident_char(sc_char(h, i)) then
           let i = i + 1
         else
           let scanning = false
         end
       end
-      return [substr(s, pos, i - pos), i]
+      return [sdsl_sc_substr(h, pos, i - pos), i]
     end
   end
 end
@@ -231,8 +284,8 @@ end
 
 # `s[open_brace_pos]` must be "{". Returns [inner_body, index_just_past_matching_"}"],
 # tracking string literals so braces inside "..." don't confuse the balance count.
-make a function called sdsl_take_balanced_block takes s, open_brace_pos returns r
-  let slen = sdsl_len(s)
+make a function called sdsl_take_balanced_block takes h, open_brace_pos returns r
+  let slen = sc_len(h)
   let depth = 0
   let i = open_brace_pos
   let in_string = false
@@ -241,7 +294,7 @@ make a function called sdsl_take_balanced_block takes s, open_brace_pos returns 
   let result_body = ""
   let result_pos = -1
   while (i < slen) and scanning do
-    let c = substr(s, i, 1)
+    let c = sc_char(h, i)
     if in_string then
       if c == "\\" then
         let i = i + 2
@@ -263,7 +316,10 @@ make a function called sdsl_take_balanced_block takes s, open_brace_pos returns 
           if c == "}" then
             let depth = depth - 1
             if depth == 0 then
-              let result_body = substr(s, start_inner, i - start_inner)
+              # a single sdsl_sc_substr call here (not per outer-loop-
+              # iteration), so its own internal O(body-length) builder
+              # loop is fine -- this only runs once per matched block.
+              let result_body = sdsl_sc_substr(h, start_inner, i - start_inner)
               let result_pos = i + 1
               let scanning = false
             else
@@ -283,18 +339,22 @@ end
 # respecting string literals and nested parens (so `regex("a;b", x)` isn't
 # split in the middle).
 make a function called sdsl_split_top_level_statements takes body returns r
+  # sb_new/sb_push/sb_str for `cur`, same O(n^2)-avoidance reason as
+  # sdsl_extract_syntax_defs/sdsl_expand_trigger_blocks -- lower stakes
+  # here (bounded by the longest single DSL statement, not the whole
+  # file) but fixed for consistency once the anti-pattern was found.
   let n = sdsl_len(body)
   let out = []
-  let cur = ""
+  let cur = sb_new()
   let depth = 0
   let in_string = false
   let i = 0
   while i < n do
     let c = substr(body, i, 1)
     if in_string then
-      let cur = cur + c
+      sb_push(cur, c)
       if (c == "\\") and ((i + 1) < n) then
-        let cur = cur + substr(body, i + 1, 1)
+        sb_push(cur, substr(body, i + 1, 1))
         let i = i + 2
       else
         if c == "\"" then
@@ -305,25 +365,25 @@ make a function called sdsl_split_top_level_statements takes body returns r
     else
       if c == "\"" then
         let in_string = true
-        let cur = cur + c
+        sb_push(cur, c)
         let i = i + 1
       else
         if c == "(" then
           let depth = depth + 1
-          let cur = cur + c
+          sb_push(cur, c)
           let i = i + 1
         else
           if c == ")" then
             let depth = depth - 1
-            let cur = cur + c
+            sb_push(cur, c)
             let i = i + 1
           else
             if (c == ";") and (depth == 0) then
-              let out = list_push(out, cur)
-              let cur = ""
+              let out = list_push(out, sb_str(cur))
+              let cur = sb_new()
               let i = i + 1
             else
-              let cur = cur + c
+              sb_push(cur, c)
               let i = i + 1
             end
           end
@@ -331,8 +391,8 @@ make a function called sdsl_split_top_level_statements takes body returns r
       end
     end
   end
-  if sdsl_len(sdsl_trim(cur)) > 0 then
-    let out = list_push(out, cur)
+  if sdsl_len(sdsl_trim(sb_str(cur))) > 0 then
+    let out = list_push(out, sb_str(cur))
   end
   return out
 end
@@ -367,10 +427,10 @@ make a function called sdsl_parse_token_defs takes tbody returns r
   while i < stmts.length do
     let stmt = sdsl_trim(stmts[i])
     if sdsl_len(stmt) > 0 then
-      let eq = sdsl_find_char(stmt, 0, "=")
+      let eq = sdsl_find_char(str_intern(stmt), 0, "=")
       let lhs = sdsl_trim(substr(stmt, 0, eq))
       let rhs = sdsl_trim(substr(stmt, eq + 1, sdsl_len(stmt) - eq - 1))
-      let op = sdsl_find_char(lhs, 0, "(")
+      let op = sdsl_find_char(str_intern(lhs), 0, "(")
       let name = lhs
       if op >= 0 then
         let name = sdsl_trim(substr(lhs, 0, op))
@@ -381,7 +441,7 @@ make a function called sdsl_parse_token_defs takes tbody returns r
         if (ilen >= 2) and (substr(inner, 0, 1) == "(") and (substr(inner, ilen - 1, 1) == ")") then
           let inner = substr(inner, 1, ilen - 2)
         end
-        let comma = sdsl_find_char(inner, 0, ",")
+        let comma = sdsl_find_char(str_intern(inner), 0, ",")
         let pat_str = inner
         if comma >= 0 then
           let pat_str = substr(inner, 0, comma)
@@ -411,7 +471,7 @@ make a function called sdsl_parse_rule_def takes rbody returns r
         let expect_part = stmt
         if sdsl_starts_with(stmt, "let") then
           let rest = sdsl_trim(substr(stmt, 3, sdsl_len(stmt) - 3))
-          let eq = sdsl_find_char(rest, 0, "=")
+          let eq = sdsl_find_char(str_intern(rest), 0, "=")
           let bind = sdsl_trim(substr(rest, 0, eq))
           let expect_part = sdsl_trim(substr(rest, eq + 1, sdsl_len(rest) - eq - 1))
         end
@@ -440,28 +500,34 @@ make a function called sdsl_parse_rule_def takes rbody returns r
 end
 
 make a function called sdsl_parse_syntax_def takes body returns r
-  let n = sdsl_len(body)
-  let i = sdsl_skip_ws_and_comments(body, 0)
+  # Interns `body` ONCE and threads the handle through the (now
+  # handle-based) scanning helpers -- see the note above
+  # sdsl_starts_keyword_at for why (substr/sdsl_len recompute an O(n)
+  # is-ascii/char-count check on every call; sc_char/sc_len read a
+  # cached flag from str_intern instead).
+  let h = str_intern(body)
+  let n = sc_len(h)
+  let i = sdsl_skip_ws_and_comments(h, 0)
   let trigger_keyword = ""
   let tokens = []
   let rules = []
   while i < n do
-    if sdsl_starts_keyword_at(body, i, "trigger") then
-      let semi = sdsl_find_char(body, i, ";")
-      let trigger_keyword = sdsl_parse_trigger_stmt(substr(body, i, semi - i))
+    if sdsl_starts_keyword_at(h, i, "trigger") then
+      let semi = sdsl_find_char(h, i, ";")
+      let trigger_keyword = sdsl_parse_trigger_stmt(sdsl_sc_substr(h, i, semi - i))
       let i = semi + 1
     else
-      if sdsl_starts_keyword_at(body, i, "tokens") then
-        let j = sdsl_skip_ws(body, i + 6)
-        let br = sdsl_take_balanced_block(body, j)
+      if sdsl_starts_keyword_at(h, i, "tokens") then
+        let j = sdsl_skip_ws(h, i + 6)
+        let br = sdsl_take_balanced_block(h, j)
         let tokens = sdsl_parse_token_defs(br[0])
         let i = br[1]
       else
-        if sdsl_starts_keyword_at(body, i, "rule") then
-          let j = sdsl_skip_ws(body, i + 4)
-          let nameinfo = sdsl_take_identifier(body, j)
-          let j = sdsl_skip_ws(body, nameinfo[1])
-          let br = sdsl_take_balanced_block(body, j)
+        if sdsl_starts_keyword_at(h, i, "rule") then
+          let j = sdsl_skip_ws(h, i + 4)
+          let nameinfo = sdsl_take_identifier(h, j)
+          let j = sdsl_skip_ws(h, nameinfo[1])
+          let br = sdsl_take_balanced_block(h, j)
           let rules = list_push(rules, sdsl_parse_rule_def(br[0]))
           let i = br[1]
         else
@@ -469,42 +535,96 @@ make a function called sdsl_parse_syntax_def takes body returns r
         end
       end
     end
-    let i = sdsl_skip_ws_and_comments(body, i)
+    let i = sdsl_skip_ws_and_comments(h, i)
   end
   return ["syntax", trigger_keyword, tokens, rules]
 end
 
 make a function called sdsl_extract_syntax_defs takes src returns r
-  let n = sdsl_len(src)
-  let out = ""
+  # Two separate O(n^2)-avoidance fixes, both needed:
+  # (1) Builds the stripped-of-real-defs output via sb_new/sb_push/
+  #     sb_str, NOT `out = out + substr(...)` -- string concatenation in
+  #     a loop copies the WHOLE accumulated string on every append
+  #     (PatLang strings are immutable).
+  # (2) Reads `src` via an str_intern HANDLE (sc_char/sc_len), NOT plain
+  #     substr/sdsl_len -- substr calls Rust's `str::is_ascii()` (an
+  #     O(n) full-string scan) fresh on EVERY call, so calling it once
+  #     per character in a whole-file scan was actually the DOMINANT
+  #     cost here, not the string-concat alone: fixing (1) alone barely
+  #     moved the needle (8x input still took ~8x longer, i.e. still
+  #     O(n^2)) until this handle-based fix was added too.
+  # Found the hard way: this made `expand_syntax_dsls` (called
+  # unconditionally on EVERY source patc1.exe compiles, including
+  # compiling itself) take 30+ minutes on patc1_all.patlang's own
+  # ~700K-character combined source, even though it never contains a
+  # real `syntax NAME {` block -- confirmed via a direct scaling test
+  # (8x input length took ~64x longer, the signature of O(n^2)) before
+  # touching anything, exactly the same anti-pattern already fixed
+  # several times elsewhere in this codebase (see best-practices' sb_*
+  # and str_intern/sc_* guidance).
+  # NOTE: also tracks in_string, matching native syntax_dsl.rs's
+  # extract_syntax_defs exactly -- a real, separate, pre-existing
+  # correctness gap found while diagnosing performance on a real
+  # ~700K-character file: without this, a STRING LITERAL anywhere in the
+  # file that happens to contain text shaped like "syntax NAME {" (very
+  # plausible here -- self_hosting/lib/runtime_rs.patlang embeds large
+  # chunks of literal Rust source AS PatLang string literals, and Rust
+  # source plausibly mentions the word "syntax" somewhere, e.g. in an
+  # error message) gets misread as a real definition, corrupting parsing
+  # of everything downstream. Never manifested before because nothing
+  # had ever actually run this preprocessor's whole-file scan against a
+  # large real file with lots of string literals until now.
+  let h = str_intern(src)
+  let n = sc_len(h)
+  let out = sb_new()
   let defs = []
   let i = 0
+  let in_string = false
   while i < n do
-    if substr(src, i, 1) == "#" then
+    if in_string then
+      sb_push(out, sc_char(h, i))
+      if (sc_char(h, i) == "\\") and ((i + 1) < n) then
+        sb_push(out, sc_char(h, i + 1))
+        let i = i + 2
+      else
+        if sc_char(h, i) == "\"" then
+          let in_string = false
+        end
+        let i = i + 1
+      end
+    else
+      if sc_char(h, i) == "\"" then
+        let in_string = true
+        sb_push(out, sc_char(h, i))
+        let i = i + 1
+      else
+      if sc_char(h, i) == "#" then
       # Copy the whole comment line through untouched -- a comment may
       # itself mention "syntax" or "routes" (e.g. this file's own header,
       # or a demo's usage-example doc comment) without being a real block.
       let cstart = i
-      while (i < n) and (substr(src, i, 1) != "\n") do
+      while (i < n) and (sc_char(h, i) != "\n") do
         let i = i + 1
       end
-      let out = out + substr(src, cstart, i - cstart)
+      sb_push(out, sdsl_sc_substr(h, cstart, i - cstart))
     else
-      if sdsl_starts_keyword_at(src, i, "syntax") then
-        let j = sdsl_skip_ws(src, i + 6)
-        let nameinfo = sdsl_take_identifier(src, j)
-        let j = sdsl_skip_ws(src, nameinfo[1])
-        let br = sdsl_take_balanced_block(src, j)
+      if sdsl_starts_keyword_at(h, i, "syntax") then
+        let j = sdsl_skip_ws(h, i + 6)
+        let nameinfo = sdsl_take_identifier(h, j)
+        let j = sdsl_skip_ws(h, nameinfo[1])
+        let br = sdsl_take_balanced_block(h, j)
         let def = sdsl_parse_syntax_def(br[0])
         let defs = list_push(defs, def)
         let i = br[1]
       else
-        let out = out + substr(src, i, 1)
+        sb_push(out, sc_char(h, i))
         let i = i + 1
       end
     end
+    end
+    end
   end
-  return [out, defs]
+  return [sb_str(out), defs]
 end
 
 # ---------------------------------------------------------------------
@@ -583,15 +703,27 @@ end
 
 # Attempts to match every step of `rule` against `line` in order. Returns
 # ["ok", bindings] on full success, ["fail"] if any step fails to match.
-make a function called sdsl_try_match_rule takes def, rule, line returns r
-  let steps = rule[1]
+make a function called sdsl_try_match_rule takes def, the_rule, line returns r
+  # NOTE: param renamed from `rule` -- a bare reserved keyword used as a
+  # plain parameter name silently truncates the params list instead of
+  # erroring (the parser's "takes NAME, NAME, ..." list expects
+  # Token::Identifier, but `rule` lexes as its own dedicated Token::Rule) --
+  # found via a genuinely confusing silent crash: this function ended up
+  # with params=["def"] only and a corrupted 2-instruction body, which the
+  # interpreter then panicked on internally, and that panic was silently
+  # swallowed by main()'s `.join().unwrap_or(())` thread-join wrapper,
+  # producing a totally silent "successful" exit with zero output and no
+  # error message at all. Same class of bug as the earlier `fn`-as-a-
+  # param-name collision found in the paradigm gallery work.
+  let steps = the_rule[1]
+  let line_h = str_intern(line)
   let pos = 0
   let bindings = []
   let n = steps.length
   let i = 0
   let ok = true
   while (i < n) and ok do
-    let pos = sdsl_skip_ws(line, pos)
+    let pos = sdsl_skip_ws(line_h, pos)
     let step = steps[i]
     let kind = step[1]
     let matched = -1
@@ -637,7 +769,7 @@ end
 # with its matched text as a PatLang string literal.
 make a function called sdsl_substitute_template takes template, bindings returns r
   let n = sdsl_len(template)
-  let out = ""
+  let out = sb_new()
   let i = 0
   while i < n do
     let c = substr(template, i, 1)
@@ -654,17 +786,17 @@ make a function called sdsl_substitute_template takes template, bindings returns
       let word = substr(template, i, j - i)
       let val = sdsl_bindings_lookup(bindings, word)
       if sdsl_len(val) > 0 then
-        let out = out + "\"" + val + "\""
+        sb_push(out, "\"" + val + "\"")
       else
-        let out = out + word
+        sb_push(out, word)
       end
       let i = j
     else
-      let out = out + c
+      sb_push(out, c)
       let i = i + 1
     end
   end
-  return out
+  return sb_str(out)
 end
 
 # Runs each of the DSL's rules (in declaration order) against `line`,
@@ -694,45 +826,56 @@ make a function called sdsl_expand_rule_line takes def, line returns r
 end
 
 make a function called sdsl_expand_trigger_blocks takes src, defs returns r
-  let n = sdsl_len(src)
-  let out = ""
+  # sb_new/sb_push/sb_str + str_intern/sc_char/sc_len throughout, same
+  # two-part reason as sdsl_extract_syntax_defs (string-concat AND
+  # substr's per-call O(n) is-ascii check both turn this into O(n^2)
+  # otherwise). This function only actually runs when defs is non-empty
+  # (see expand_syntax_dsls_with's early-return), i.e. only when a real
+  # `syntax NAME {}` block was found -- lower-traffic than
+  # sdsl_extract_syntax_defs (called on every compile unconditionally)
+  # but fixed the same way for the same reason and for real syntax-DSL
+  # users on large files.
+  let h = str_intern(src)
+  let n = sc_len(h)
+  let out = sb_new()
   let i = 0
   while i < n do
-    if substr(src, i, 1) == "#" then
+    if sc_char(h, i) == "#" then
       # Same rationale as sdsl_extract_syntax_defs: a comment mentioning a
       # trigger keyword (e.g. this file's own doc comments about `routes`)
       # is not a real usage block, and must never be scanned into one.
       let cstart = i
-      while (i < n) and (substr(src, i, 1) != "\n") do
+      while (i < n) and (sc_char(h, i) != "\n") do
         let i = i + 1
       end
-      let out = out + substr(src, cstart, i - cstart)
+      sb_push(out, sdsl_sc_substr(h, cstart, i - cstart))
     else
     let kw_idx = -1
     let d = 0
     while (d < defs.length) and (kw_idx < 0) do
-      if sdsl_starts_keyword_at(src, i, defs[d][1]) then
+      if sdsl_starts_keyword_at(h, i, defs[d][1]) then
         let kw_idx = d
       end
       let d = d + 1
     end
     if kw_idx >= 0 then
       let def = defs[kw_idx]
-      let j = sdsl_skip_ws(src, i + sdsl_len(def[1]))
-      if (j < n) and (substr(src, j, 1) == "{") then
-        let br = sdsl_take_balanced_block(src, j)
+      let j = sdsl_skip_ws(h, i + sdsl_len(def[1]))
+      if (j < n) and (sc_char(h, j) == "{") then
+        let br = sdsl_take_balanced_block(h, j)
         let body = br[0]
-        let blen = sdsl_len(body)
+        let bh = str_intern(body)
+        let blen = sc_len(bh)
         let start = 0
         while start <= blen do
-          let nl = sdsl_find_char(body, start, "\n")
+          let nl = sdsl_find_char(bh, start, "\n")
           let line_end = nl
           if nl < 0 then
             let line_end = blen
           end
-          let line = sdsl_trim(substr(body, start, line_end - start))
+          let line = sdsl_trim(sdsl_sc_substr(bh, start, line_end - start))
           if sdsl_len(line) > 0 then
-            let out = out + sdsl_expand_rule_line(def, line) + "\n"
+            sb_push(out, sdsl_expand_rule_line(def, line) + "\n")
           end
           if nl < 0 then
             let start = blen + 1
@@ -742,16 +885,16 @@ make a function called sdsl_expand_trigger_blocks takes src, defs returns r
         end
         let i = br[1]
       else
-        let out = out + substr(src, i, 1)
+        sb_push(out, sc_char(h, i))
         let i = i + 1
       end
     else
-      let out = out + substr(src, i, 1)
+      sb_push(out, sc_char(h, i))
       let i = i + 1
     end
     end
   end
-  return out
+  return sb_str(out)
 end
 
 # Public entry point, composable across multiple separate runtime calls:

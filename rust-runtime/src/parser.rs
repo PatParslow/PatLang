@@ -646,6 +646,29 @@ impl<'a> Parser<'a> {
                     Token::Identifier(s) => { params.push(s.clone()); self.advance()?; },
                     Token::Comma => { self.advance()?; },
                     Token::Newline => { self.advance()?; },
+                    // A reserved keyword here (e.g. `rule`, `goal`, `fn`, `let`,
+                    // `if`) is almost always the user trying to name a
+                    // parameter after an ordinary English word that happens
+                    // to also be a language keyword -- silently falling
+                    // through to `_ => break` here used to truncate the
+                    // params list right at that point with no error at all,
+                    // corrupting the rest of the function's parsing
+                    // (found via self_hosting/lib/syntax_dsl.patlang's own
+                    // `takes def, rule, line`, which ended up with a
+                    // 1-param, 2-instruction function body and no
+                    // indication anything had gone wrong until the
+                    // corrupted Program later crashed the interpreter).
+                    Token::Rule | Token::Goal | Token::Fn | Token::Let | Token::Return
+                    | Token::If | Token::While | Token::Else | Token::Elif
+                    | Token::And | Token::Or | Token::Not
+                    | Token::BAnd | Token::BOr | Token::BXor | Token::BNot
+                    | Token::Shl | Token::Shr => {
+                        return Err(ParserError::UnexpectedToken {
+                            token: self.curr.clone(),
+                            line: self.line_no,
+                            hint: "This is a reserved keyword, not a valid parameter name -- rename this parameter to something else (e.g. `the_rule` instead of `rule`)",
+                        });
+                    }
                     _ => break,
                 }
             }
