@@ -332,19 +332,20 @@ impl Lowerer {
                 f.body.push(Instr::BuildList(deps.len()));
                 f.body.push(Instr::CallHost("goal_def".into(), 2));
             }
-            Stmt::ClassDecl { name, parent, fields } => {
-                // Slice 1 of the classes/traits/inheritance feature (see
+            Stmt::ClassDecl { name, parent, fields, methods } => {
+                // Slice 1+2 of the classes/traits/inheritance feature (see
                 // the "synchronous-questing-metcalfe" plan): sugar for a
                 // single class_def(name, parent_or_empty, [[field,
-                // default_value], ...]) host call (see hosts.rs::
-                // host_class_def). Unlike RuleDecl/GoalDecl's dep args
-                // (compile-time string TOKENS, never evaluated), each
-                // field's default IS an ordinary expression, evaluated
-                // once here at class-def time via the normal lower_expr
-                // path -- ClassDecl always appears at top level (parsed
-                // only at the statement level, same as GoalDecl), so
-                // there's no enclosing-scope capture concern the way
-                // closures/`when` have.
+                // default_value], ...], [[method_name, closure], ...]) host
+                // call (see hosts.rs::host_class_def). Field defaults are
+                // ordinary expressions, evaluated once here at class-def
+                // time via the normal lower_expr path. Methods (Slice 2)
+                // become genuine closures built via lower_closure_literal
+                // (each gets an implicit leading "self" param, bound to the
+                // receiver id at `send`-dispatch time -- see interpreter.rs/
+                // codegen.rs's CallHost("send", ...) handling), same
+                // "declarative sugar wrapping real closure values" shape as
+                // `when` blocks (lower_when).
                 f.body.push(Instr::Const(Value::String((name.clone()).into())));
                 f.body.push(Instr::Const(Value::String(parent.clone().unwrap_or_default().into())));
                 for (fname, default_expr) in fields {
@@ -353,7 +354,15 @@ impl Lowerer {
                     f.body.push(Instr::BuildList(2)); // [field_name, default_value]
                 }
                 f.body.push(Instr::BuildList(fields.len()));
-                f.body.push(Instr::CallHost("class_def".into(), 3));
+                for (mname, params, body) in methods {
+                    f.body.push(Instr::Const(Value::String((mname.clone()).into())));
+                    let mut full_params = vec!["self".to_string()];
+                    full_params.extend(params.iter().cloned());
+                    self.lower_closure_literal(&full_params, body, f);
+                    f.body.push(Instr::BuildList(2)); // [method_name, closure]
+                }
+                f.body.push(Instr::BuildList(methods.len()));
+                f.body.push(Instr::CallHost("class_def".into(), 4));
             }
             Stmt::When { event, body, .. } => {
                 self.lower_when(event, body, f);

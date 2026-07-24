@@ -343,6 +343,7 @@ impl<'a> Parser<'a> {
                 self.expect(Token::BlockStart, "'{' after class header", "Use `class NAME [inherits PARENT] { field NAME = EXPR ... }`")?;
                 self.consume_newlines()?;
                 let mut fields: Vec<(String, Expr)> = Vec::new();
+                let mut methods: Vec<(String, Vec<String>, Vec<Stmt>)> = Vec::new();
                 while !matches!(self.curr, Token::BlockEnd | Token::EOF) {
                     match &self.curr {
                         Token::Identifier(s) if s == "field" => {
@@ -355,12 +356,25 @@ impl<'a> Parser<'a> {
                             let default_expr = self.parse_expression(0)?;
                             fields.push((fname, default_expr));
                         }
-                        _ => return Err(ParserError::UnexpectedToken { token: self.curr.clone(), line: self.line_no, hint: "Expected `field NAME = EXPR` inside a class block (Slice 1 supports only field defaults -- no methods/traits yet)" }),
+                        // Slice 2: a method is just an ordinary `make a
+                        // function called NAME ... end` body declared
+                        // inside the class block -- reuse the existing
+                        // parser exactly (both curly and inline
+                        // takes/returns/end forms), then capture its
+                        // (name, params, body) rather than registering it
+                        // as a top-level Stmt::Function.
+                        Token::Identifier(s) if s == "make" => {
+                            match self.parse_make_construct()? {
+                                Some(Stmt::Function { name: mname, params, body }) => methods.push((mname, params, body)),
+                                _ => return Err(ParserError::UnexpectedToken { token: self.curr.clone(), line: self.line_no, hint: "Expected `make a function called NAME ... end` inside a class block" }),
+                            }
+                        }
+                        _ => return Err(ParserError::UnexpectedToken { token: self.curr.clone(), line: self.line_no, hint: "Expected `field NAME = EXPR` or `make a function called NAME ... end` inside a class block" }),
                     }
                     self.consume_newlines()?;
                 }
                 self.expect(Token::BlockEnd, "'}' to close class block", "Close the class block with '}'")?;
-                Ok(Stmt::ClassDecl { name, parent, fields })
+                Ok(Stmt::ClassDecl { name, parent, fields, methods })
             }
             Token::Rule => {
                 // If followed by '(', treat as normal call: rule(...)

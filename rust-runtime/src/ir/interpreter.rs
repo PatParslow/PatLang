@@ -150,6 +150,42 @@ impl Interpreter {
                             }
                         }
                         stack.push(last);
+                    } else if name == "send" {
+                        // Slice 2 of classes/traits/inheritance: send(recv,
+                        // method, args...) first checks for a genuine
+                        // user-defined method (registered via `class_def`,
+                        // see hosts.rs::resolve_class_method) on recv's
+                        // class, walking the parent chain -- this needs to
+                        // live HERE, not in host_send, since host fns can't
+                        // invoke closures themselves (same reason `emit`'s
+                        // closure-invocation logic lives here too). Falls
+                        // back to today's host_send behavior ("set" etc.)
+                        // when no matching method exists anywhere in the
+                        // chain, so ad hoc `new("Literal","id")` objects
+                        // with no class ever declared keep working exactly
+                        // as before.
+                        let recv = args.get(0).cloned().unwrap_or(Value::Unit);
+                        let method = match args.get(1) { Some(Value::String(s)) => s.as_ref().clone(), _ => String::new() };
+                        let recv_class = match &recv {
+                            Value::String(s) => super::hosts::obj_get(s.as_ref(), "type"),
+                            _ => None,
+                        };
+                        let resolved = match recv_class {
+                            Some(Value::String(cls)) => super::hosts::resolve_class_method(cls.as_ref(), &method),
+                            _ => None,
+                        };
+                        if let Some(Value::Closure { func_name, captured }) = resolved {
+                            let mut full_args: Vec<Value> = captured.into_iter().map(|(_, v)| v).collect();
+                            full_args.push(recv);
+                            full_args.extend(args[2..].iter().cloned());
+                            let callee = program.functions.get(&func_name).ok_or_else(|| format!("function '{}' not found", func_name))?;
+                            let ret = self.run_function(program, callee, &full_args)?;
+                            stack.push(ret);
+                        } else {
+                            let f = self.host.get(name).ok_or_else(|| format!("host fn '{}' not found", name))?;
+                            let res = f(&args)?;
+                            stack.push(res);
+                        }
                     } else if name == "apply" {
                         // apply(fname, args...): call a program function by name,
                         // enabling higher-order style (map/filter over named fns)

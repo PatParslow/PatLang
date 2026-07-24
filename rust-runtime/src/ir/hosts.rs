@@ -539,7 +539,7 @@ thread_local! {
 // parallel_map spawns real OS threads even natively.
 static OBJECTS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, HashMap<String, Value>>>> = std::sync::OnceLock::new();
 
-fn obj_get(name: &str, prop: &str) -> Option<Value> {
+pub(crate) fn obj_get(name: &str, prop: &str) -> Option<Value> {
     OBJECTS.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap().get(name).and_then(|m| m.get(prop)).cloned()
 }
 
@@ -565,13 +565,18 @@ fn ensure_obj(name: &str, class: &str) {
 struct ClassDef {
     parent: Option<String>,
     field_defaults: Vec<(String, Value)>,
+    // Slice 2: methods declared inside the class block, each already a
+    // built `Value::Closure` (built at class_def-call time via
+    // lower_closure_literal -- see lowering.rs's ClassDecl handling).
+    methods: HashMap<String, Value>,
 }
 static CLASSES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, ClassDef>>> = std::sync::OnceLock::new();
 
 pub fn host_class_def(args: &[Value]) -> Result<Value, String> {
-    // class_def(name, parent, field_defaults_list) -> Unit; field_defaults_list
-    // is [[field_name, default_value], ...].
-    if args.len() != 3 { return Err("class_def: expected 3 args (name, parent, field_defaults)".into()); }
+    // class_def(name, parent, field_defaults_list, methods_list) -> Unit;
+    // field_defaults_list is [[field_name, default_value], ...], methods_list
+    // is [[method_name, closure], ...] (Slice 2; empty for Slice-1-only callers).
+    if args.len() != 3 && args.len() != 4 { return Err("class_def: expected 3 or 4 args (name, parent, field_defaults, [methods])".into()); }
     let name = match &args[0] { Value::String(s) => s.as_ref().clone(), v => to_s(v) };
     let parent = match &args[1] { Value::String(s) if !s.is_empty() => Some(s.as_ref().clone()), _ => None };
     let field_defaults: Vec<(String, Value)> = match &args[2] {
@@ -584,9 +589,42 @@ pub fn host_class_def(args: &[Value]) -> Result<Value, String> {
         }).collect(),
         _ => Vec::new(),
     };
+    let methods: HashMap<String, Value> = match args.get(3) {
+        Some(Value::List(xs)) => xs.iter().filter_map(|item| match item {
+            Value::List(pair) if pair.len() == 2 => {
+                let mname = match &pair[0] { Value::String(s) => s.as_ref().clone(), v => to_s(v) };
+                Some((mname, pair[1].clone()))
+            }
+            _ => None,
+        }).collect(),
+        _ => HashMap::new(),
+    };
     CLASSES.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap()
-        .insert(name, ClassDef { parent, field_defaults });
+        .insert(name, ClassDef { parent, field_defaults, methods });
     Ok(Value::Unit)
+}
+
+// Resolves method `method` for `class`, walking own class first then up the
+// (single) parent chain -- own class's own method always wins over an
+// inherited one of the same name (Slice 2 has no traits yet, so this is the
+// full resolution order for now; Slice 3 will insert a trait-scan step
+// between these two). Returns None for an unregistered class or a class/
+// chain with no matching method.
+pub(crate) fn resolve_class_method(class: &str, method: &str) -> Option<Value> {
+    let classes = CLASSES.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap();
+    let mut cur = Some(class.to_string());
+    let mut guard = 0;
+    let mut visited: Vec<String> = Vec::new();
+    while let Some(c) = cur {
+        if guard > 64 { break; }
+        guard += 1;
+        if visited.contains(&c) { break; }
+        let def = classes.get(&c)?;
+        if let Some(m) = def.methods.get(method) { return Some(m.clone()); }
+        visited.push(c);
+        cur = def.parent.clone();
+    }
+    None
 }
 
 // Resolves the full, root-to-leaf-ordered chain of field defaults for

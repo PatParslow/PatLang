@@ -443,6 +443,7 @@ fn ensure_obj(name: &str, class: &str) {
 struct ClassDef {
     parent: Option<String>,
     field_defaults: Vec<(String, Value)>,
+    methods: HashMap<String, Value>,
 }
 static CLASSES: OnceLock<Mutex<HashMap<String, ClassDef>>> = OnceLock::new();
 
@@ -466,6 +467,23 @@ fn resolve_class_field_defaults(class: &str) -> Vec<(String, Value)> {
         }
     }
     out
+}
+
+fn resolve_class_method(class: &str, method: &str) -> Option<Value> {
+    let classes = CLASSES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    let mut cur = Some(class.to_string());
+    let mut guard = 0;
+    let mut visited: Vec<String> = Vec::new();
+    while let Some(c) = cur {
+        if guard > 64 { break; }
+        guard += 1;
+        if visited.contains(&c) { break; }
+        let def = classes.get(&c)?;
+        if let Some(m) = def.methods.get(method) { return Some(m.clone()); }
+        visited.push(c);
+        cur = def.parent.clone();
+    }
+    None
 }
 
 // NOTE: `enum Value` and its `impl` (as_number/as_bool), plus display_value,
@@ -1022,6 +1040,40 @@ fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Va
                     let closure = args.get(1).cloned().unwrap_or(Value::Unit);
                     runtime_event_handlers_register(ev, closure);
                     stack.push(Value::Unit);
+                } else if n == "send" {
+                    // Slice 2 of classes/traits/inheritance -- mirrors
+                    // interpreter.rs's own CallHost("send", ...) handling
+                    // exactly: check for a real user-defined method first
+                    // (host fns can't invoke closures themselves), falling
+                    // back to the oo chunk's own plain "send" behavior
+                    // when none is found anywhere in the parent chain.
+                    // (deliberately not spelling out the oo dispatcher
+                    // fn's full name here -- it's substring-matched by
+                    // tree_shaking.rs's tests to detect whether the oo
+                    // chunk got pulled in, and this text lives in
+                    // PRELUDE_CORE, which every compiled program always
+                    // includes.)
+                    let recv = args.get(0).cloned().unwrap_or(Value::Unit);
+                    let method = match args.get(1) { Some(Value::String(s)) => s.as_ref().clone(), _ => String::new() };
+                    let recv_class = match &recv {
+                        Value::String(s) => obj_get(s.as_ref(), "type"),
+                        _ => None,
+                    };
+                    let resolved = match recv_class {
+                        Some(Value::String(cls)) => resolve_class_method(cls.as_ref(), &method),
+                        _ => None,
+                    };
+                    if let Some(Value::Closure { func_name, captured }) = resolved {
+                        let mut full_args: Vec<Value> = captured.into_iter().map(|(_, v)| v).collect();
+                        full_args.push(recv);
+                        full_args.extend(args[2..].iter().cloned());
+                        let callee = program.functions.get(&func_name).ok_or_else(|| format!("function '{}' not found", func_name))?;
+                        let ret = run_function(program, callee, &full_args)?;
+                        stack.push(ret);
+                    } else {
+                        let r = Host::call(n, &args)?;
+                        stack.push(r);
+                    }
                 } else if n == "apply" {
                     // apply(fname, args...): call a program function by name
                     let fname = match args.get(0) {
@@ -2830,7 +2882,7 @@ fn host_call_io_misc(name: &str, args: &[Value]) -> Option<Result<Value, String>
                 Ok(Value::String(name.into()))
             }
             "class_def" => {
-                if args.len() != 3 { return Err("class_def: expected 3 args (name, parent, field_defaults)".into()); }
+                if args.len() != 3 && args.len() != 4 { return Err("class_def: expected 3 or 4 args (name, parent, field_defaults, [methods])".into()); }
                 let name = match &args[0] { Value::String(s) => s.as_ref().clone(), v => to_s(v) };
                 let parent = match &args[1] { Value::String(s) if !s.is_empty() => Some(s.as_ref().clone()), _ => None };
                 let field_defaults: Vec<(String, Value)> = match &args[2] {
@@ -2843,8 +2895,18 @@ fn host_call_io_misc(name: &str, args: &[Value]) -> Option<Result<Value, String>
                     }).collect(),
                     _ => Vec::new(),
                 };
+                let methods: HashMap<String, Value> = match args.get(3) {
+                    Some(Value::List(xs)) => xs.iter().filter_map(|item| match item {
+                        Value::List(pair) if pair.len() == 2 => {
+                            let mname = match &pair[0] { Value::String(s) => s.as_ref().clone(), v => to_s(v) };
+                            Some((mname, pair[1].clone()))
+                        }
+                        _ => None,
+                    }).collect(),
+                    _ => HashMap::new(),
+                };
                 CLASSES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap()
-                    .insert(name, ClassDef { parent, field_defaults });
+                    .insert(name, ClassDef { parent, field_defaults, methods });
                 Ok(Value::Unit)
             }
             "set_var" => {

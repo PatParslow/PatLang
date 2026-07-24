@@ -149,11 +149,19 @@ pub enum Stmt {
     // -- lowers to a single class_def(name, parent_or_empty, [[field,
     // default_expr]...]) host call (see lowering.rs), mirroring
     // RuleDecl/GoalDecl's own "declarative block -> one host call" shape.
-    // Traits and methods are NOT part of Slice 1 -- added in later slices.
+    // Traits are NOT part of Slice 1/2 -- added in a later slice.
+    // Slice 2 adds `methods`: each is a real `make a function called NAME
+    // ... end` body declared inside the class block (name, params, body),
+    // lowered to a genuine closure at class_def time (see lowering.rs) so
+    // `send(obj, "method", args...)` can invoke real user code -- host
+    // fns can't call closures themselves, so dispatch lives in the
+    // interpreter's/compiled backend's own CallHost("send", ...) handling,
+    // same pattern as `emit`/`when` closures.
     ClassDecl {
         name: String,
         parent: Option<String>,
         fields: Vec<(String, Expr)>,
+        methods: Vec<(String, Vec<String>, Vec<Stmt>)>,
     },
     // Extend with more statement types as needed
 }
