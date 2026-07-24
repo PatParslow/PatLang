@@ -59,6 +59,7 @@ pub enum Token {
     // Patlang-specific tokens
     Goal,
     Rule,
+    Class,
     BlockStart, // e.g. '{'
     BlockEnd,   // e.g. '}'
     // Extend with more tokens as needed
@@ -332,6 +333,7 @@ impl<'a> Lexer<'a> {
                     "elif" => Token::Elif,
                     "goal" => Token::Goal,
                     "rule" => Token::Rule,
+                    "class" => Token::Class,
                     "and" => Token::And,
                     "or" => Token::Or,
                     "not" => Token::Not,

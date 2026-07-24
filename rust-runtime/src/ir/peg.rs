@@ -249,6 +249,7 @@ fn adapt_token(t: &Token) -> PTok {
         Token::EOF => ("EOF", String::new()),
         Token::Goal => ("IDENT", "goal".into()),
         Token::Rule => ("IDENT", "rule".into()),
+        Token::Class => ("IDENT", "class".into()),
         Token::BlockStart => ("OP", "{".into()),
         Token::BlockEnd => ("OP", "}".into()),
     };

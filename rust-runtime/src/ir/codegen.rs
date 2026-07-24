@@ -133,6 +133,7 @@ const HOST_CHUNK_TABLE: &[(&str, ChunkId)] = &[
     ("validate", ChunkId::IoMisc),
     ("len", ChunkId::IoMisc),
     ("new", ChunkId::Oo),
+    ("class_def", ChunkId::Oo),
     ("set_var", ChunkId::Oo),
     ("get", ChunkId::Oo),
     ("send", ChunkId::Oo),
@@ -430,6 +431,41 @@ fn obj_set(name: &str, prop: &str, val: Value) {
 fn ensure_obj(name: &str, class: &str) {
     obj_set(name, "type", Value::String(class.to_string().into()));
     obj_set(name, "name", Value::String(name.to_string().into()));
+}
+
+// Slice 1 of the classes/traits/inheritance feature (see the
+// "synchronous-questing-metcalfe" plan) -- mirrors ir/hosts.rs's own
+// CLASSES/ClassDef/host_class_def/resolve_class_field_defaults exactly.
+// Lives in PRELUDE_CORE (not PRELUDE_OO) since it's a shared primitive
+// used by the "class_def"/"new" match arms in PRELUDE_OO's text, the
+// same relationship OBJECTS/ensure_obj already has to those arms.
+#[derive(Clone, Default)]
+struct ClassDef {
+    parent: Option<String>,
+    field_defaults: Vec<(String, Value)>,
+}
+static CLASSES: OnceLock<Mutex<HashMap<String, ClassDef>>> = OnceLock::new();
+
+fn resolve_class_field_defaults(class: &str) -> Vec<(String, Value)> {
+    let classes = CLASSES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    let mut chain: Vec<String> = Vec::new();
+    let mut cur = Some(class.to_string());
+    let mut guard = 0;
+    while let Some(c) = cur {
+        if guard > 64 { break; }
+        guard += 1;
+        if chain.contains(&c) { break; }
+        let def = match classes.get(&c) { Some(d) => d.clone(), None => break };
+        chain.push(c);
+        cur = def.parent.clone();
+    }
+    let mut out: Vec<(String, Value)> = Vec::new();
+    for c in chain.iter().rev() {
+        if let Some(def) = classes.get(c) {
+            out.extend(def.field_defaults.iter().cloned());
+        }
+    }
+    out
 }
 
 // NOTE: `enum Value` and its `impl` (as_number/as_bool), plus display_value,
@@ -2785,8 +2821,31 @@ fn host_call_io_misc(name: &str, args: &[Value]) -> Option<Result<Value, String>
                 if args.len() != 2 { return Ok(Value::Unit); }
                 let class = match &args[0] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
                 let name = match &args[1] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
-                if !name.is_empty() { ensure_obj(&name, &class); }
+                if !name.is_empty() {
+                    ensure_obj(&name, &class);
+                    for (field, default) in resolve_class_field_defaults(&class) {
+                        obj_set(&name, &field, default);
+                    }
+                }
                 Ok(Value::String(name.into()))
+            }
+            "class_def" => {
+                if args.len() != 3 { return Err("class_def: expected 3 args (name, parent, field_defaults)".into()); }
+                let name = match &args[0] { Value::String(s) => s.as_ref().clone(), v => to_s(v) };
+                let parent = match &args[1] { Value::String(s) if !s.is_empty() => Some(s.as_ref().clone()), _ => None };
+                let field_defaults: Vec<(String, Value)> = match &args[2] {
+                    Value::List(xs) => xs.iter().filter_map(|item| match item {
+                        Value::List(pair) if pair.len() == 2 => {
+                            let fname = match &pair[0] { Value::String(s) => s.as_ref().clone(), v => to_s(v) };
+                            Some((fname, pair[1].clone()))
+                        }
+                        _ => None,
+                    }).collect(),
+                    _ => Vec::new(),
+                };
+                CLASSES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap()
+                    .insert(name, ClassDef { parent, field_defaults });
+                Ok(Value::Unit)
             }
             "set_var" => {
                 if args.len() != 2 { return Ok(Value::Unit); }
@@ -2848,7 +2907,7 @@ fn host_call_io_misc(name: &str, args: &[Value]) -> Option<Result<Value, String>
 
 fn host_call_oo(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match name {
-        "new" | "set_var" | "get" | "send" => Some(host_call_oo_inner(name, args)),
+        "new" | "set_var" | "get" | "send" | "class_def" => Some(host_call_oo_inner(name, args)),
         _ => None,
     }
 }

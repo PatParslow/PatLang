@@ -311,6 +311,57 @@ impl<'a> Parser<'a> {
                 self.expect(Token::BlockEnd, "'}' to close goal block", "Close the goal block with '}'")?;
                 Ok(Stmt::GoalDecl { name, deps })
             }
+            Token::Class => {
+                // If followed by '(', treat as normal call: class(...)
+                if matches!(self.peek, Token::LParen) {
+                    self.curr = Token::Identifier("class".into());
+                    let expr = self.parse_expression(0)?;
+                    return Ok(Stmt::ExprStmt(expr));
+                }
+                // Slice 1 of the classes/traits/inheritance feature (see
+                // the "synchronous-questing-metcalfe" plan): `class NAME
+                // [inherits PARENT] { field NAME = EXPR ... }` -- sugar
+                // only, lowers to a single class_def(...) call (see
+                // lowering.rs; mirrors Token::Goal's own "declarative
+                // block -> one host call" shape exactly). Traits and
+                // methods are NOT part of Slice 1.
+                self.advance()?; // consume 'class'
+                let name = match &self.curr {
+                    Token::Identifier(s) => { let n = s.clone(); self.advance()?; n }
+                    _ => return Err(ParserError::ExpectedToken { expected: "class name", line: self.line_no, hint: "Use `class NAME [inherits PARENT] { field NAME = EXPR ... }`" }),
+                };
+                let mut parent: Option<String> = None;
+                if let Token::Identifier(ref s) = self.curr {
+                    if s == "inherits" {
+                        self.advance()?; // consume 'inherits'
+                        match &self.curr {
+                            Token::Identifier(p) => { parent = Some(p.clone()); self.advance()?; }
+                            _ => return Err(ParserError::ExpectedToken { expected: "parent class name", line: self.line_no, hint: "Use `class NAME inherits PARENT { ... }`" }),
+                        }
+                    }
+                }
+                self.expect(Token::BlockStart, "'{' after class header", "Use `class NAME [inherits PARENT] { field NAME = EXPR ... }`")?;
+                self.consume_newlines()?;
+                let mut fields: Vec<(String, Expr)> = Vec::new();
+                while !matches!(self.curr, Token::BlockEnd | Token::EOF) {
+                    match &self.curr {
+                        Token::Identifier(s) if s == "field" => {
+                            self.advance()?; // consume 'field'
+                            let fname = match &self.curr {
+                                Token::Identifier(n) => { let n = n.clone(); self.advance()?; n }
+                                _ => return Err(ParserError::ExpectedToken { expected: "field name", line: self.line_no, hint: "Use `field NAME = EXPR`" }),
+                            };
+                            self.expect(Token::Equal, "'=' after field name", "Use `field NAME = EXPR`")?;
+                            let default_expr = self.parse_expression(0)?;
+                            fields.push((fname, default_expr));
+                        }
+                        _ => return Err(ParserError::UnexpectedToken { token: self.curr.clone(), line: self.line_no, hint: "Expected `field NAME = EXPR` inside a class block (Slice 1 supports only field defaults -- no methods/traits yet)" }),
+                    }
+                    self.consume_newlines()?;
+                }
+                self.expect(Token::BlockEnd, "'}' to close class block", "Close the class block with '}'")?;
+                Ok(Stmt::ClassDecl { name, parent, fields })
+            }
             Token::Rule => {
                 // If followed by '(', treat as normal call: rule(...)
                 if matches!(self.peek, Token::LParen) {
@@ -658,7 +709,7 @@ impl<'a> Parser<'a> {
                     // 1-param, 2-instruction function body and no
                     // indication anything had gone wrong until the
                     // corrupted Program later crashed the interpreter).
-                    Token::Rule | Token::Goal | Token::Fn | Token::Let | Token::Return
+                    Token::Rule | Token::Goal | Token::Class | Token::Fn | Token::Let | Token::Return
                     | Token::If | Token::While | Token::Else | Token::Elif
                     | Token::And | Token::Or | Token::Not
                     | Token::BAnd | Token::BOr | Token::BXor | Token::BNot

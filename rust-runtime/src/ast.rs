@@ -142,6 +142,19 @@ pub enum Stmt {
         name: String,
         deps: Vec<(String, Vec<Expr>)>,
     },
+    // `class NAME [inherits PARENT] { field NAME = EXPR ... }` -- Slice 1
+    // of the classes/traits/inheritance feature (see the
+    // "synchronous-questing-metcalfe" plan): declares a named class with
+    // a single optional parent and a list of field defaults. Sugar only
+    // -- lowers to a single class_def(name, parent_or_empty, [[field,
+    // default_expr]...]) host call (see lowering.rs), mirroring
+    // RuleDecl/GoalDecl's own "declarative block -> one host call" shape.
+    // Traits and methods are NOT part of Slice 1 -- added in later slices.
+    ClassDecl {
+        name: String,
+        parent: Option<String>,
+        fields: Vec<(String, Expr)>,
+    },
     // Extend with more statement types as needed
 }
 

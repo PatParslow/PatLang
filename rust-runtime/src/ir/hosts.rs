@@ -553,6 +553,69 @@ fn ensure_obj(name: &str, class: &str) {
     obj_set(name, "name", Value::String((name.to_string()).into()));
 }
 
+// Slice 1 of the classes/traits/inheritance feature (see the
+// "synchronous-questing-metcalfe" plan): a class is just a name, an
+// optional single parent, and a set of field defaults (already-evaluated
+// Values, evaluated once at class_def-call time -- Slice 1 has no
+// methods/traits yet, so this needs no closure-calling capability, unlike
+// `when`/`emit`). `new(class, id)` (extended below) resolves the parent
+// chain root-to-leaf so a more specific class's own default always wins
+// over an inherited one on the same field name.
+#[derive(Clone, Default)]
+struct ClassDef {
+    parent: Option<String>,
+    field_defaults: Vec<(String, Value)>,
+}
+static CLASSES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, ClassDef>>> = std::sync::OnceLock::new();
+
+pub fn host_class_def(args: &[Value]) -> Result<Value, String> {
+    // class_def(name, parent, field_defaults_list) -> Unit; field_defaults_list
+    // is [[field_name, default_value], ...].
+    if args.len() != 3 { return Err("class_def: expected 3 args (name, parent, field_defaults)".into()); }
+    let name = match &args[0] { Value::String(s) => s.as_ref().clone(), v => to_s(v) };
+    let parent = match &args[1] { Value::String(s) if !s.is_empty() => Some(s.as_ref().clone()), _ => None };
+    let field_defaults: Vec<(String, Value)> = match &args[2] {
+        Value::List(xs) => xs.iter().filter_map(|item| match item {
+            Value::List(pair) if pair.len() == 2 => {
+                let fname = match &pair[0] { Value::String(s) => s.as_ref().clone(), v => to_s(v) };
+                Some((fname, pair[1].clone()))
+            }
+            _ => None,
+        }).collect(),
+        _ => Vec::new(),
+    };
+    CLASSES.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap()
+        .insert(name, ClassDef { parent, field_defaults });
+    Ok(Value::Unit)
+}
+
+// Resolves the full, root-to-leaf-ordered chain of field defaults for
+// `class` (itself last, so its own defaults override any inherited ones
+// applied earlier in the same walk). Returns an empty Vec for an
+// unregistered class name -- ad hoc `new("Literal","id")` with no
+// matching `class` block stays exactly as permissive as it's always been.
+fn resolve_class_field_defaults(class: &str) -> Vec<(String, Value)> {
+    let classes = CLASSES.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap();
+    let mut chain: Vec<String> = Vec::new();
+    let mut cur = Some(class.to_string());
+    let mut guard = 0;
+    while let Some(c) = cur {
+        if guard > 64 { break; } // cycle guard, matches other depth caps in this codebase
+        guard += 1;
+        if chain.contains(&c) { break; } // defensive: a cyclic `inherits` chain shouldn't hang
+        let def = match classes.get(&c) { Some(d) => d.clone(), None => break };
+        chain.push(c);
+        cur = def.parent.clone();
+    }
+    let mut out: Vec<(String, Value)> = Vec::new();
+    for c in chain.iter().rev() {
+        if let Some(def) = classes.get(c) {
+            out.extend(def.field_defaults.iter().cloned());
+        }
+    }
+    out
+}
+
 /// Reset OO/logic state — call between independent runs (tests).
 pub fn reset_world() {
     OBJECTS.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap().clear();
@@ -563,6 +626,7 @@ pub fn reset_world() {
     GOAL_DEFS.with(|g| g.borrow_mut().clear());
     ACTION_BODIES.with(|a| a.borrow_mut().clear());
     RUNTIME_EVENT_HANDLERS.with(|h| h.borrow_mut().clear());
+    CLASSES.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap().clear();
 }
 
 fn to_s(v: &Value) -> String { display_value(v) }
@@ -1225,11 +1289,21 @@ pub fn host_vfs_flush_to_disk(args: &[Value]) -> Result<Value, String> {
 }
 
 pub fn host_new(args: &[Value]) -> Result<Value, String> {
-    // new(class, name) -> name, registering the object
+    // new(class, name) -> name, registering the object. If `class` matches
+    // a class registered via `class_def` (a real `class NAME { ... }`
+    // block, see lowering.rs's ClassDecl handling), auto-populates field
+    // defaults resolved root-to-leaf up the (single) inheritance chain --
+    // an unregistered class name (the ad hoc, no-class-required case)
+    // resolves to zero defaults and behaves exactly as before.
     if args.len() != 2 { return Ok(Value::Unit); }
     let class = match &args[0] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
     let name = match &args[1] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
-    if !name.is_empty() { ensure_obj(&name, &class); }
+    if !name.is_empty() {
+        ensure_obj(&name, &class);
+        for (field, default) in resolve_class_field_defaults(&class) {
+            obj_set(&name, &field, default);
+        }
+    }
     Ok(Value::String(name.into()))
 }
 
@@ -2503,6 +2577,7 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("vfs_delete", host_vfs_delete);
     interp.host.insert("vfs_flush_to_disk", host_vfs_flush_to_disk);
     interp.host.insert("new", host_new);
+    interp.host.insert("class_def", host_class_def);
     interp.host.insert("set_var", host_set_var);
     interp.host.insert("send", host_send);
     // networking

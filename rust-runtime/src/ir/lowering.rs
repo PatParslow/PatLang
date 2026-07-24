@@ -332,6 +332,29 @@ impl Lowerer {
                 f.body.push(Instr::BuildList(deps.len()));
                 f.body.push(Instr::CallHost("goal_def".into(), 2));
             }
+            Stmt::ClassDecl { name, parent, fields } => {
+                // Slice 1 of the classes/traits/inheritance feature (see
+                // the "synchronous-questing-metcalfe" plan): sugar for a
+                // single class_def(name, parent_or_empty, [[field,
+                // default_value], ...]) host call (see hosts.rs::
+                // host_class_def). Unlike RuleDecl/GoalDecl's dep args
+                // (compile-time string TOKENS, never evaluated), each
+                // field's default IS an ordinary expression, evaluated
+                // once here at class-def time via the normal lower_expr
+                // path -- ClassDecl always appears at top level (parsed
+                // only at the statement level, same as GoalDecl), so
+                // there's no enclosing-scope capture concern the way
+                // closures/`when` have.
+                f.body.push(Instr::Const(Value::String((name.clone()).into())));
+                f.body.push(Instr::Const(Value::String(parent.clone().unwrap_or_default().into())));
+                for (fname, default_expr) in fields {
+                    f.body.push(Instr::Const(Value::String((fname.clone()).into())));
+                    self.lower_expr(default_expr, f);
+                    f.body.push(Instr::BuildList(2)); // [field_name, default_value]
+                }
+                f.body.push(Instr::BuildList(fields.len()));
+                f.body.push(Instr::CallHost("class_def".into(), 3));
+            }
             Stmt::When { event, body, .. } => {
                 self.lower_when(event, body, f);
             }
@@ -813,6 +836,9 @@ fn collect_referenced_idents(stmts: &[Stmt], out: &mut Vec<String>, seen: &mut H
             }
             Stmt::GoalDecl { deps, .. } => {
                 for (_, args) in deps { for a in args { collect_ident_expr(a, out, seen); } }
+            }
+            Stmt::ClassDecl { fields, .. } => {
+                for (_, default_expr) in fields { collect_ident_expr(default_expr, out, seen); }
             }
         }
     }
