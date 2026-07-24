@@ -114,11 +114,39 @@ impl Interpreter {
                         let ev = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => String::new().into() };
                         let payload = args.get(1).cloned().unwrap_or(Value::Unit);
                         let mut last = Value::Unit;
+                        // Legacy path: bare-named handlers registered at compile
+                        // time (still used by compile_shape/compile_ir's IR-shape
+                        // based "When"/EventIR handling, hosts.rs -- those build a
+                        // Program from an already-lowered shape, not source-level
+                        // `when` blocks, so they're unaffected by lower_when's
+                        // move to real closures and still register by name).
                         if let Some(handlers) = program.event_handlers.get(ev.as_str()) {
                             for h in handlers {
                                 let callee = program.functions.get(h).ok_or_else(|| format!("function '{}' not found", h))?;
                                 // Handlers take (event_name, event_data)
                                 last = self.run_function(program, callee, &[Value::String(ev.clone()), payload.clone()])?;
+                            }
+                        }
+                        // Real path: `when EVENT { ... }` source blocks now lower
+                        // to a genuine closure, registered at RUNTIME (via
+                        // register_event_handler, called from wherever the `when`
+                        // statement actually executes) rather than a bare function
+                        // name -- see lowering.rs's lower_when doc comment for why
+                        // (it's what lets a handler see an enclosing `let`). Called
+                        // exactly like Instr::CallValue calls any other closure,
+                        // since this IS the interpreter, not a host-fn boundary
+                        // (host fns can't call closures themselves).
+                        for h in super::hosts::runtime_event_handlers_for(ev.as_str()) {
+                            match h {
+                                Value::Closure { func_name, captured } => {
+                                    let mut full_args: Vec<Value> = captured.into_iter().map(|(_, v)| v).collect();
+                                    full_args.push(Value::String(ev.clone()));
+                                    full_args.push(payload.clone());
+                                    let callee = program.functions.get(&func_name)
+                                        .ok_or_else(|| format!("function '{}' not found", func_name))?;
+                                    last = self.run_function(program, callee, &full_args)?;
+                                }
+                                other => return Err(format!("emit: registered event handler is not a closure: {:?}", other)),
                             }
                         }
                         stack.push(last);

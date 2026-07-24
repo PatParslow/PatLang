@@ -562,6 +562,7 @@ pub fn reset_world() {
     ACTIONS.with(|a| a.borrow_mut().clear());
     GOAL_DEFS.with(|g| g.borrow_mut().clear());
     ACTION_BODIES.with(|a| a.borrow_mut().clear());
+    RUNTIME_EVENT_HANDLERS.with(|h| h.borrow_mut().clear());
 }
 
 fn to_s(v: &Value) -> String { display_value(v) }
@@ -954,6 +955,40 @@ pub fn host_plan(args: &[Value]) -> Result<Value, String> {
 thread_local! {
     static GOAL_DEFS: RefCell<HashMap<String, Vec<GroundFact>>> = RefCell::new(HashMap::new());
     static ACTION_BODIES: RefCell<HashMap<String, Value>> = RefCell::new(HashMap::new());
+}
+
+// Runtime (not compile-time) event-handler registry, storing genuine
+// closure Values rather than bare function names -- see lowering.rs's
+// Stmt::When handling doc comment for why: a `when NAME { ... }` block's
+// body used to be synthesized as an ISOLATED standalone function with no
+// access to anything outer-scope (a real, previously-known gotcha: a
+// top-level `let` was invisible from inside a handler, worked around by
+// re-declaring the same name fresh inside every handler body). Each
+// `when` block now lowers to an ordinary closure literal (the SAME
+// free-variable capture lower_closure_literal already does for `|x| {
+// ... }`) at the exact point it appears in program order, registered
+// here via register_event_handler -- so it genuinely captures whatever
+// was in scope when it was declared, the same as any other closure.
+// Just storing the Value here is enough: host fns can't call closures
+// themselves (see host_action_bind's doc comment for the same
+// limitation), so emit()'s own handling inside interpreter.rs -- which
+// IS the interpreter, not a host-fn boundary -- does the actual
+// invocation, the same way Instr::CallValue already does for any other
+// closure call.
+thread_local! {
+    static RUNTIME_EVENT_HANDLERS: RefCell<HashMap<String, Vec<Value>>> = RefCell::new(HashMap::new());
+}
+
+pub fn host_register_event_handler(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 { return Err("register_event_handler: expected 2 args (event_name, closure)".into()); }
+    let name = match &args[0] { Value::String(s) => s.as_ref().clone(), v => to_s(v) };
+    let closure = args[1].clone();
+    RUNTIME_EVENT_HANDLERS.with(|h| h.borrow_mut().entry(name).or_default().push(closure));
+    Ok(Value::Unit)
+}
+
+pub fn runtime_event_handlers_for(event: &str) -> Vec<Value> {
+    RUNTIME_EVENT_HANDLERS.with(|h| h.borrow().get(event).cloned().unwrap_or_default())
 }
 
 pub fn host_goal_def(args: &[Value]) -> Result<Value, String> {
@@ -2455,6 +2490,7 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("action_lookup", host_action_lookup);
     interp.host.insert("action_base_name", host_action_base_name);
     interp.host.insert("action_label_args", host_action_label_args);
+    interp.host.insert("register_event_handler", host_register_event_handler);
     interp.host.insert("bit_get", host_bit_get);
     interp.host.insert("bit_set", host_bit_set);
     interp.host.insert("bit_slice", host_bit_slice);

@@ -318,6 +318,39 @@ fn event_handlers_register(ev: String, handler: String) {
     EVENT_HANDLERS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap().entry(ev).or_insert_with(Vec::new).push(handler);
 }
 
+// RUNTIME_EVENT_HANDLERS: the compiled-program counterpart of
+// ir/hosts.rs's RUNTIME_EVENT_HANDLERS -- stores genuine closure Values
+// (not bare function names) for `when NAME { ... }` blocks, which now
+// lower to real closures (see lowering.rs's lower_when) captured at the
+// point they're declared, registered here at RUNTIME via
+// register_event_handler(event, closure) rather than the compile-time
+// EVENT_HANDLERS table above (which is kept only for the IR-shape-based
+// compile_shape/compile_ir tooling, unaffected by this). Same cross-
+// thread-visibility rationale as EVENT_HANDLERS/OBJECTS above.
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+thread_local! {
+    static RUNTIME_EVENT_HANDLERS: RefCell<HashMap<String, Vec<Value>>> = RefCell::new(HashMap::new());
+}
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+fn runtime_event_handlers_get(ev: &str) -> Vec<Value> {
+    RUNTIME_EVENT_HANDLERS.with(|m| m.borrow().get(ev).cloned().unwrap_or_default())
+}
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+fn runtime_event_handlers_register(ev: String, closure: Value) {
+    RUNTIME_EVENT_HANDLERS.with(|m| m.borrow_mut().entry(ev).or_insert_with(Vec::new).push(closure));
+}
+
+#[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+static RUNTIME_EVENT_HANDLERS: OnceLock<Mutex<HashMap<String, Vec<Value>>>> = OnceLock::new();
+#[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+fn runtime_event_handlers_get(ev: &str) -> Vec<Value> {
+    RUNTIME_EVENT_HANDLERS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap().get(ev).cloned().unwrap_or_default()
+}
+#[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+fn runtime_event_handlers_register(ev: String, closure: Value) {
+    RUNTIME_EVENT_HANDLERS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap().entry(ev).or_insert_with(Vec::new).push(closure);
+}
+
 // vfs_*: an always-available (including WASM) in-memory virtual
 // filesystem, distinct from read_file/write_file/etc (real std::fs,
 // native-only) -- deliberately different function names rather than the
@@ -914,6 +947,10 @@ fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Va
                     let ev = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), _ => String::new() };
                     let payload = args.get(1).cloned().unwrap_or(Value::Unit);
                     let mut last = Value::Unit;
+                    // Legacy path: bare-named handlers registered at compile
+                    // time (compile_shape/compile_ir's IR-shape based "When"/
+                    // EventIR handling only -- unaffected by lower_when's move
+                    // to real closures for source-level `when` blocks).
                     let handlers: Vec<String> = event_handlers_get(&ev);
                     for h in handlers {
                         let callee = program.functions.get(&h).ok_or_else(|| format!("function '{}' not found", h))?;
@@ -923,7 +960,32 @@ fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Va
                         // Handlers are synthesized with parameters (event_name, event_data)
                         last = run_function(program, callee, &[Value::String(ev.clone().into()), payload.clone()])?;
                     }
+                    // Real path: `when EVENT { ... }` source blocks now lower to
+                    // a genuine closure, registered at RUNTIME via
+                    // register_event_handler -- see lowering.rs's lower_when
+                    // doc comment for why (it's what lets a handler see an
+                    // enclosing `let`). Invoked the same way Instr::CallValue
+                    // calls any other closure.
+                    for h in runtime_event_handlers_get(&ev) {
+                        match h {
+                            Value::Closure { func_name, captured } => {
+                                let mut full_args: Vec<Value> = captured.into_iter().map(|(_, v)| v).collect();
+                                obj_set("__vars", "event_name", Value::String(ev.clone().into()));
+                                obj_set("__vars", "event_data", payload.clone());
+                                full_args.push(Value::String(ev.clone().into()));
+                                full_args.push(payload.clone());
+                                let callee = program.functions.get(&func_name).ok_or_else(|| format!("function '{}' not found", func_name))?;
+                                last = run_function(program, callee, &full_args)?;
+                            }
+                            other => return Err(format!("emit: registered event handler is not a closure: {:?}", other)),
+                        }
+                    }
                     stack.push(last);
+                } else if n == "register_event_handler" {
+                    let ev = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), v => format!("{:?}", v) };
+                    let closure = args.get(1).cloned().unwrap_or(Value::Unit);
+                    runtime_event_handlers_register(ev, closure);
+                    stack.push(Value::Unit);
                 } else if n == "apply" {
                     // apply(fname, args...): call a program function by name
                     let fname = match args.get(0) {

@@ -77,28 +77,14 @@ impl Lowerer {
                 self.current_function = saved_fname;
             }
         }
-    // Synthesize event handlers for when-blocks at top-level
-        let mut handler_counter: usize = 0;
-        for s in stmts {
-            if let Stmt::When { event, body, .. } = s {
-                handler_counter += 1;
-                let hname = format!("__when_{}_{}", event, handler_counter);
-                // Lower body into a standalone function with params 'event_name', 'event_data'
-                let mut hf = Function { name: hname.clone(), params: vec!["event_name".into(), "event_data".into()], ..Default::default() };
-                // Use a fresh locals set and seed with param names so they can be referenced safely
-                let saved = std::mem::take(&mut self.known_locals);
-                let saved_fname = std::mem::replace(&mut self.current_function, hname.clone());
-                self.known_locals.insert("event_name".into(), true);
-                self.known_locals.insert("event_data".into(), true);
-                for st in body { self.lower_stmt(st, &mut hf); }
-                hf.body.push(Instr::Return);
-                program.functions.insert(hname.clone(), hf);
-                program.event_handlers.entry(event.clone()).or_default().push(hname);
-                self.known_locals = saved;
-                self.current_function = saved_fname;
-            }
-        }
-        // Second pass: lower top-level statements into main
+        // Second pass: lower top-level statements into main. `when`
+        // blocks are handled by lower_stmt's own Stmt::When arm (see
+        // lower_when below) now, in sequence with everything else here
+        // -- NOT a separate pre-pass that ran before any top-level `let`
+        // had been lowered, which is exactly why a handler could never
+        // see an enclosing `let` before (a real, previously-known
+        // gotcha, worked around by re-declaring the same name fresh
+        // inside every handler body instead of fixing the root cause).
         self.current_function = "main".into();
         for s in stmts {
             if !matches!(s, Stmt::Function { .. }) {
@@ -346,10 +332,72 @@ impl Lowerer {
                 f.body.push(Instr::BuildList(deps.len()));
                 f.body.push(Instr::CallHost("goal_def".into(), 2));
             }
+            Stmt::When { event, body, .. } => {
+                self.lower_when(event, body, f);
+            }
             _ => {
                 // unsupported yet: ignore safely
             }
         }
+    }
+
+    // Lowers `when EVENT { ... }` as a genuine closure literal (the same
+    // free-variable capture lower_closure_literal does for `|x| { ... }`),
+    // with fixed params ["event_name", "event_data"] (auto-bound by
+    // emit(), never user-written) instead of a user-supplied param list.
+    // Registers the resulting closure VALUE at runtime via
+    // register_event_handler(event, closure) -- a real host call emitted
+    // right here, at the point the `when` statement actually appears in
+    // program order -- rather than the previous design, where every
+    // `when` block was found by a separate pre-pass that ran BEFORE any
+    // top-level `let` had been lowered at all, synthesizing an ISOLATED
+    // standalone function with no access to anything outer-scope. That's
+    // exactly why a handler could never see an enclosing `let` before (a
+    // real, previously-known gotcha, worked around by re-declaring the
+    // same name fresh inside every handler body instead of fixing the
+    // root cause) -- this closes it: a `when` block declared after a
+    // `let` now captures that `let` correctly, the same as any ordinary
+    // closure would.
+    fn lower_when(&mut self, event: &str, body: &[Stmt], f: &mut Function) {
+        let params: Vec<String> = vec!["event_name".to_string(), "event_data".to_string()];
+        let mut own: HashSet<String> = params.iter().cloned().collect();
+        collect_let_bound_names(body, &mut own);
+
+        let mut referenced: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        collect_referenced_idents(body, &mut referenced, &mut seen);
+
+        let captured_names: Vec<String> = referenced.into_iter()
+            .filter(|n| !own.contains(n) && self.known_locals.contains_key(n))
+            .collect();
+
+        self.closure_counter += 1;
+        let func_name = format!("__when_{}_{}", event, self.closure_counter);
+        let mut hf = Function {
+            name: func_name.clone(),
+            params: captured_names.iter().cloned().chain(params.iter().cloned()).collect(),
+            ..Default::default()
+        };
+        let saved_locals = std::mem::take(&mut self.known_locals);
+        let saved_fname = std::mem::replace(&mut self.current_function, func_name.clone());
+        self.known_locals = hf.params.iter().map(|p| (p.clone(), true)).collect();
+        for st in body { self.lower_stmt(st, &mut hf); }
+        hf.body.push(Instr::Return);
+        self.known_locals = saved_locals;
+        self.current_function = saved_fname;
+        self.pending_closures.push(hf);
+
+        // event name first, so CallHost's drained args land as
+        // (event_name, closure) in that order -- MakeClosure must
+        // immediately follow its own LoadLocal sequence, so the Const
+        // for the event name has to come before all of that, not
+        // between the loads and MakeClosure.
+        f.body.push(Instr::Const(Value::String(event.to_string().into())));
+        for name in &captured_names {
+            f.body.push(Instr::LoadLocal(name.clone()));
+        }
+        f.body.push(Instr::MakeClosure(func_name, captured_names));
+        f.body.push(Instr::CallHost("register_event_handler".into(), 2));
     }
 
     fn expr_is_safe(&self, e: &Expr) -> bool {
