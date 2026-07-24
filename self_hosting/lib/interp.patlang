@@ -1,5 +1,7 @@
 # =============================================================================
-# Meta-circular PatLang interpreter -- through SLICE 2.
+# Meta-circular PatLang interpreter -- through SLICE 4 (full IR instruction
+# set) plus proper error propagation and a "feature complete" host-function
+# surface for the stateless utility chunks.
 #
 # Walks the same list-shaped IR lower_program() produces (see lower.patlang's
 # header comment for the instr shapes) directly, with no codegen step at
@@ -7,19 +9,56 @@
 # backend) and emit_x64 (NASM backend), sharing the exact same lexer/
 # parser/lowerer those two already share.
 #
+# Every function that can fail returns a RESULT VALUE, not a bare value:
+# ["Ok", value] on success, ["Err", message] on failure. PatLang has no
+# try/catch (see patlang-best-practices.html's gotchas section) -- a real
+# host-call failure inside a CallHost this interpreter invokes is still
+# genuinely fatal to the whole process, same as it always was, but every
+# INTERNAL interpreter error (unknown instruction, missing user function,
+# unsupported operator, unsupported host function name) now propagates as
+# an explicit Err up through recursive Call/CallValue chains instead of
+# printing and silently returning 0 -- the caller (patc1_main.patlang's
+# `interpret` subcommand) reports it as a clear, distinct error rather than
+# a puzzling wrong answer.
+#
 # SLICE 1: core arithmetic, locals, and control flow -- Const/Load/Store/
 # Bin/Un/Jump/JumpIfFalse/Return.
-# SLICE 2 (this addition): CallHost (a curated, deliberately bounded set
-# of common host functions -- see interp_call_host) and BuildList (list
-# literals).
-# NOT YET supported: Call (user-defined function calls -- interpret_ir
-# only ever runs "main" right now, doesn't recurse into other funcs
-# entries yet), CallValue/MakeClosure (closures). Hitting one of those is
-# a clear, named error, not silently wrong behaviour. Runtime VALUES are
-# just plain PatLang numbers/strings/lists/booleans -- no separate tagged
-# Value type is needed, since the self-hosted interpreter runs AS a
-# PatLang program and can already compute with PatLang's own native
-# values directly.
+# SLICE 2: CallHost and BuildList (list literals). Host-function coverage
+# spans essentially the whole real host surface -- core, strings_ext,
+# collections_handles, files, io_misc, math, oo, logic, contracts,
+# networking -- by delegating each name straight to the SAME real host
+# function any other PatLang program (interpreted or compiled) already
+# calls. oo/logic/contracts's OBJECTS/FACTS/RULES/ACTIONS registries live
+# in the native process itself, not in anything this interpreter needs to
+# reimplement -- there was never an architectural barrier to supporting
+# them, just an initial, narrower scoping choice later widened once asked
+# ("we should try to get the whole of the language supported"). Still
+# EXCLUDED, deliberately: codegen_bootstrap's legacy compiler-meta tools
+# (parse_tiny_source/lower_and_compile/emit_rust_for/copy_file/remove_
+# file/patc_compile_from_argv/get_argv -- half debug-scaffolding, not a
+# clean API) and bare rustc_build/rustc_build_chunked*/run_ir. In their
+# place: two NEW, purpose-built primitives, `compile_patlang(source,
+# out_path)` and `interpret_patlang(source)` -- `interp.patlang` is
+# compiled into the SAME combined source as the compiler itself, so it
+# can call `tokenize`/`parse_program`/`lower_program`/`required_chunks`/
+# `chunk_texts_for`/`emit_program_rs_chunked`/`rustc_build_chunked_texts`
+# directly as ordinary functions, exactly like `patc1_main.patlang`'s own
+# `lower`/`emit_rust`/`interpret` subcommands do -- these two just make
+# that same pipeline callable BY a running interpreted program, not only
+# from the CLI. Built for the natural next step this enables: a REPL/
+# friendly-cli session that can compile, not just interpret, what the
+# user typed.
+#
+# One real consequence worth knowing: since interp.patlang ITSELF now
+# calls oo/logic/contracts/networking host functions directly, any build
+# that includes this file (patc1_all.patlang, i.e. patc1.exe/patc2.exe/
+# patc3.exe) now unconditionally requires those chunks too, regardless of
+# what the INTERPRETED program actually uses -- the same principle
+# `required_chunks` already applies to `run_ir` (a program that can run
+# arbitrary future IR can't statically know what chunks that IR will
+# need, so it takes the superset), just now also true of `interpret_ir`.
+# SLICE 3: Call (recursive user-defined function calls).
+# SLICE 4: MakeClosure/CallValue (closures).
 # =============================================================================
 
 make a function called interp_const takes kind, text returns v
@@ -99,79 +138,218 @@ make a function called stack_pop_n takes stack, n returns pair
   return [args, cur]
 end
 
-# interp_call_host(name, args) -- SLICE 2 scope: a curated, deliberately
-# bounded set of the most commonly-needed host functions, not a mirror of
-# the full HOST_CHUNK_TABLE (that would mean duplicating dozens of Rust
-# host-function bodies as PatLang here, for a benefit no test program has
-# demonstrated yet). Anything outside this set is a clear, named error --
-# widen the set only once a real program actually needs the next one, per
-# this project's own standing guidance against building general capacity
-# before a specific need is shown.
+# interp_call_host(name, args) -> ["Ok", value] | ["Err", message].
+# "Feature complete" for every STATELESS utility chunk (core, strings_ext,
+# collections_handles, files, io_misc, math) -- see this file's header
+# comment for why oo/logic/contracts/networking/codegen_bootstrap are
+# deliberately excluded. Written as a flat sequence of early returns (no
+# nesting) -- each host function is a genuinely independent case, not a
+# decision tree, so there's nothing for nested if/else to express here
+# that a flat "if this one, handle it and return" chain doesn't already
+# say more plainly.
 make a function called interp_call_host takes name, args returns result
+  # --- core ---
+  if name == "list_get" then return ["Ok", args[0][args[1]]] end
+  if name == "list_len" then return ["Ok", args[0].length] end
+  if name == "list_push" then return ["Ok", list_push(args[0], args[1])] end
+  if name == "list_set" then return ["Ok", list_set(args[0], args[1], args[2])] end
+  if name == "type_of" then return ["Ok", type_of(args[0])] end
+  if name == "bit_get" then return ["Ok", bit_get(args[0], args[1])] end
+  if name == "bit_set" then return ["Ok", bit_set(args[0], args[1], args[2])] end
+  if name == "bit_slice" then return ["Ok", bit_slice(args[0], args[1], args[2])] end
+  if name == "bit_set_slice" then return ["Ok", bit_set_slice(args[0], args[1], args[2], args[3])] end
+  if name == "vfs_read" then return ["Ok", vfs_read(args[0])] end
+  if name == "vfs_write" then return ["Ok", vfs_write(args[0], args[1])] end
+  if name == "vfs_append" then return ["Ok", vfs_append(args[0], args[1])] end
+  if name == "vfs_exists" then return ["Ok", vfs_exists(args[0])] end
+  if name == "vfs_list" then return ["Ok", vfs_list(args[0])] end
+  if name == "vfs_delete" then return ["Ok", vfs_delete(args[0])] end
+  if name == "vfs_flush_to_disk" then return ["Ok", vfs_flush_to_disk(args[0], args[1])] end
+  # --- strings_ext ---
+  if name == "char_code" then return ["Ok", char_code(args[0], args[1])] end
+  if name == "substr" then return ["Ok", substr(args[0], args[1], args[2])] end
+  if name == "chr" then return ["Ok", chr(args[0])] end
+  if name == "to_num" then return ["Ok", to_num(args[0])] end
+  if name == "hash_string" then return ["Ok", hash_string(args[0])] end
+  # --- collections_handles ---
+  if name == "vec_new" then return ["Ok", vec_new()] end
+  if name == "vec_push" then return ["Ok", vec_push(args[0], args[1])] end
+  if name == "vec_set" then return ["Ok", vec_set(args[0], args[1], args[2])] end
+  if name == "vec_get" then return ["Ok", vec_get(args[0], args[1])] end
+  if name == "vec_len" then return ["Ok", vec_len(args[0])] end
+  if name == "vec_to_list" then return ["Ok", vec_to_list(args[0])] end
+  if name == "str_intern" then return ["Ok", str_intern(args[0])] end
+  if name == "sc_len" then return ["Ok", sc_len(args[0])] end
+  if name == "sc_code" then return ["Ok", sc_code(args[0], args[1])] end
+  if name == "sc_char" then return ["Ok", sc_char(args[0], args[1])] end
+  if name == "sb_new" then return ["Ok", sb_new()] end
+  if name == "sb_push" then return ["Ok", sb_push(args[0], args[1])] end
+  if name == "sb_str" then return ["Ok", sb_str(args[0])] end
+  # --- files ---
+  if name == "read_file" then return ["Ok", read_file(args[0])] end
+  if name == "write_file" then return ["Ok", write_file(args[0], args[1])] end
+  if name == "touch_file" then return ["Ok", touch_file(args[0])] end
+  if name == "file_exists" then return ["Ok", file_exists(args[0])] end
+  if name == "list_dir" then return ["Ok", list_dir(args[0])] end
+  if name == "rename_file" then return ["Ok", rename_file(args[0], args[1])] end
+  if name == "exec_capture" then
+    if args.length == 2 then return ["Ok", exec_capture(args[0], args[1])] end
+    if args.length == 3 then return ["Ok", exec_capture(args[0], args[1], args[2])] end
+    if args.length == 4 then return ["Ok", exec_capture(args[0], args[1], args[2], args[3])] end
+    return ["Err", "exec_capture: " + args.length + " args not supported (expected 2-4)"]
+  end
+  # --- io_misc ---
+  if name == "now_ms" then return ["Ok", now_ms()] end
+  if name == "byte_length" then return ["Ok", byte_length(args[0])] end
+  if name == "read_line" then return ["Ok", read_line()] end
+  if name == "argv" then return ["Ok", argv()] end
   if name == "print" then
     print(args[0])
-    return 0
+    return ["Ok", 0]
   end
-  if name == "list_push" then
-    return list_push(args[0], args[1])
+  if name == "len" then return ["Ok", args[0].length] end
+  # --- math ---
+  if name == "sqrt" then return ["Ok", sqrt(args[0])] end
+  if name == "pow" then return ["Ok", pow(args[0], args[1])] end
+  if name == "sin" then return ["Ok", sin(args[0])] end
+  if name == "cos" then return ["Ok", cos(args[0])] end
+  if name == "tan" then return ["Ok", tan(args[0])] end
+  if name == "asin" then return ["Ok", asin(args[0])] end
+  if name == "acos" then return ["Ok", acos(args[0])] end
+  if name == "atan" then return ["Ok", atan(args[0])] end
+  if name == "atan2" then return ["Ok", atan2(args[0], args[1])] end
+  if name == "log" then return ["Ok", log(args[0])] end
+  if name == "exp" then return ["Ok", exp(args[0])] end
+  if name == "floor" then return ["Ok", floor(args[0])] end
+  if name == "ceil" then return ["Ok", ceil(args[0])] end
+  if name == "round" then return ["Ok", round(args[0])] end
+  if name == "trunc" then return ["Ok", trunc(args[0])] end
+  if name == "abs" then return ["Ok", abs(args[0])] end
+  if name == "to_fixed" then return ["Ok", to_fixed(args[0], args[1])] end
+  if name == "numeric_kind" then return ["Ok", numeric_kind(args[0])] end
+  # --- oo ---
+  # These delegate straight to the SAME real host functions any other
+  # PatLang program (interpreted or compiled) already calls -- the
+  # OBJECTS/FACTS/RULES/ACTIONS registries they read/write live in the
+  # native process itself, not in anything this interpreter would need
+  # to reimplement in PatLang. There was never an architectural barrier
+  # here, just an earlier, narrower scoping choice (see the "1 feature
+  # complete" pass's memory notes) -- these are exactly as easy to
+  # delegate as `sqrt`/`list_push` above.
+  if name == "new" then return ["Ok", new(args[0], args[1])] end
+  if name == "set_var" then return ["Ok", set_var(args[0], args[1])] end
+  if name == "get" then return ["Ok", get(args[0], args[1])] end
+  if name == "send" then
+    if args.length == 2 then return ["Ok", send(args[0], args[1])] end
+    if args.length == 3 then return ["Ok", send(args[0], args[1], args[2])] end
+    if args.length == 4 then return ["Ok", send(args[0], args[1], args[2], args[3])] end
+    if args.length == 5 then return ["Ok", send(args[0], args[1], args[2], args[3], args[4])] end
+    return ["Err", "send: " + args.length + " args not supported (expected 2-5)"]
   end
-  if name == "list_get" then
-    return args[0][args[1]]
+  # --- logic ---
+  if name == "fact" then return ["Ok", fact(args[0], args[1], args[2])] end
+  if name == "query" then return ["Ok", query(args[0], args[1], args[2])] end
+  if name == "goal" then
+    if args.length == 1 then return ["Ok", goal(args[0])] end
+    if args.length == 2 then return ["Ok", goal(args[0], args[1])] end
+    if args.length == 3 then return ["Ok", goal(args[0], args[1], args[2])] end
+    if args.length == 4 then return ["Ok", goal(args[0], args[1], args[2], args[3])] end
+    return ["Err", "goal: " + args.length + " args not supported (expected 1-4)"]
   end
-  if name == "list_len" then
-    return args[0].length
+  if name == "rule_add" then return ["Ok", rule_add(args[0], args[1], args[2])] end
+  if name == "solve" then return ["Ok", solve(args[0], args[1])] end
+  if name == "action_add" then return ["Ok", action_add(args[0], args[1], args[2], args[3], args[4])] end
+  if name == "plan" then return ["Ok", plan(args[0])] end
+  if name == "goal_def" then return ["Ok", goal_def(args[0], args[1])] end
+  if name == "pursue" then return ["Ok", pursue(args[0])] end
+  if name == "action_bind" then return ["Ok", action_bind(args[0], args[1])] end
+  if name == "action_lookup" then return ["Ok", action_lookup(args[0])] end
+  if name == "action_base_name" then return ["Ok", action_base_name(args[0])] end
+  if name == "action_label_args" then return ["Ok", action_label_args(args[0])] end
+  # --- contracts ---
+  if name == "contract_check" then return ["Ok", contract_check(args[0], args[1], args[2], args[3])] end
+  # --- networking ---
+  if name == "tcp_listen" then return ["Ok", tcp_listen(args[0])] end
+  if name == "tcp_try_listen" then return ["Ok", tcp_try_listen(args[0])] end
+  if name == "tcp_connect" then return ["Ok", tcp_connect(args[0], args[1])] end
+  if name == "tcp_accept" then return ["Ok", tcp_accept(args[0])] end
+  if name == "sleep_ms" then return ["Ok", sleep_ms(args[0])] end
+  if name == "tcp_accept_timeout" then return ["Ok", tcp_accept_timeout(args[0], args[1])] end
+  if name == "tcp_read" then return ["Ok", tcp_read(args[0])] end
+  if name == "tcp_read_or_empty" then return ["Ok", tcp_read_or_empty(args[0])] end
+  if name == "tcp_write" then return ["Ok", tcp_write(args[0], args[1])] end
+  if name == "tcp_close" then return ["Ok", tcp_close(args[0])] end
+  if name == "spawn" then
+    if args.length == 1 then return ["Ok", spawn(args[0])] end
+    if args.length == 2 then return ["Ok", spawn(args[0], args[1])] end
+    if args.length == 3 then return ["Ok", spawn(args[0], args[1], args[2])] end
+    if args.length == 4 then return ["Ok", spawn(args[0], args[1], args[2], args[3])] end
+    return ["Err", "spawn: " + args.length + " args not supported (expected 1-4)"]
   end
-  if name == "list_set" then
-    return list_set(args[0], args[1], args[2])
+  if name == "is_alive" then return ["Ok", is_alive(args[0])] end
+  if name == "wait" then return ["Ok", wait(args[0])] end
+  if name == "kill" then return ["Ok", kill(args[0])] end
+  # --- meta: compile/interpret PatLang source from WITHIN a running
+  # interpreted program. Not a mirror of any single existing host
+  # function -- `interp.patlang` is compiled into the SAME combined
+  # source as the compiler itself (lexer/parser/lower/codegen.patlang),
+  # so it can call `tokenize`/`parse_program`/`lower_program`/
+  # `required_chunks`/`chunk_texts_for`/`emit_program_rs_chunked`/
+  # `rustc_build_chunked_texts` directly as ordinary function calls,
+  # exactly like `patc1_main.patlang`'s own `lower`/`emit_rust`/
+  # `interpret` subcommands already do -- these two just package that
+  # SAME pipeline as callable primitives for a running program, rather
+  # than only being reachable from the CLI. Built for the natural next
+  # step this enables: an interactive REPL/friendly-cli session that can
+  # compile (not just interpret) whatever the user typed.
+  if name == "compile_patlang" then
+    let toks = tokenize(args[0])
+    let ast = parse_program(toks)
+    let stmts = ast[1]
+    let err = parse_find_error(stmts)
+    if err[0] != "" then
+      return ["Err", format_parse_error(err[0], err[1], args[0])]
+    end
+    let compiled_ir = lower_program(ast)
+    let chunks = required_chunks(compiled_ir)
+    let base_and_pairs = chunk_texts_for(chunks)
+    let rs = emit_program_rs_chunked(compiled_ir)
+    return ["Ok", rustc_build_chunked_texts(rs, base_and_pairs[0], base_and_pairs[1], args[1])]
   end
-  if name == "len" then
-    return args[0].length
+  if name == "interpret_patlang" then
+    let toks = tokenize(args[0])
+    let ast = parse_program(toks)
+    let stmts = ast[1]
+    let err = parse_find_error(stmts)
+    if err[0] != "" then
+      return ["Err", format_parse_error(err[0], err[1], args[0])]
+    end
+    return interpret_ir(lower_program(ast))
   end
-  if name == "to_num" then
-    return to_num(args[0])
-  end
-  if name == "chr" then
-    return chr(args[0])
-  end
-  if name == "char_code" then
-    return char_code(args[0], args[1])
-  end
-  if name == "substr" then
-    return substr(args[0], args[1], args[2])
-  end
-  if name == "type_of" then
-    return type_of(args[0])
-  end
-  if name == "hash_string" then
-    return hash_string(args[0])
-  end
-  print("interp_call_host: host function '" + name + "' not yet supported by interpret_ir (slice 2)")
-  return 0
+  return ["Err", "host function '" + name + "' not supported by interpret_ir (codegen_bootstrap's legacy compiler-meta tools -- parse_tiny_source/lower_and_compile/emit_rust_for/copy_file/remove_file/patc_compile_from_argv/get_argv -- are deliberately out of scope: half debug-scaffolding, superseded here by the cleaner compile_patlang/interpret_patlang pair above; bare rustc_build/rustc_build_chunked*/run_ir are likewise out of scope, since compile_patlang/interpret_patlang already cover the same need in one call)"]
 end
 
 make a function called interp_bin takes op, a, b returns v
-  if op == "+" then return a + b end
-  if op == "-" then return a - b end
-  if op == "*" then return a * b end
-  if op == "/" then return a / b end
-  if op == "%" then return a % b end
-  if op == "==" then return a == b end
-  if op == "!=" then return a != b end
-  if op == "<" then return a < b end
-  if op == ">" then return a > b end
-  if op == "<=" then return a <= b end
-  if op == ">=" then return a >= b end
-  if op == "and" then return a and b end
-  if op == "or" then return a or b end
-  print("interp_bin: unsupported operator '" + op + "'")
-  return 0
+  if op == "+" then return ["Ok", a + b] end
+  if op == "-" then return ["Ok", a - b] end
+  if op == "*" then return ["Ok", a * b] end
+  if op == "/" then return ["Ok", a / b] end
+  if op == "%" then return ["Ok", a % b] end
+  if op == "==" then return ["Ok", a == b] end
+  if op == "!=" then return ["Ok", a != b] end
+  if op == "<" then return ["Ok", a < b] end
+  if op == ">" then return ["Ok", a > b] end
+  if op == "<=" then return ["Ok", a <= b] end
+  if op == ">=" then return ["Ok", a >= b] end
+  if op == "and" then return ["Ok", a and b] end
+  if op == "or" then return ["Ok", a or b] end
+  return ["Err", "unsupported binary operator '" + op + "'"]
 end
 
 make a function called interp_un takes op, a returns v
-  if op == "-" then return 0 - a end
-  if op == "not" then return not a end
-  print("interp_un: unsupported operator '" + op + "'")
-  return 0
+  if op == "-" then return ["Ok", 0 - a] end
+  if op == "not" then return ["Ok", not a] end
+  return ["Err", "unsupported unary operator '" + op + "'"]
 end
 
 # find_func(funcs, name) -> the ["FuncIR", name, params, instrs] entry
@@ -188,13 +366,14 @@ make a function called find_func takes funcs, name returns f
   return 0
 end
 
-# interp_run_function(funcs, func, arg_values) -> the function's return
-# value. `func` is a ["FuncIR", name, params, instrs] entry (see
-# lower.patlang); `funcs` is the WHOLE program's function list, threaded
-# through so a "Call" instruction can look up and recurse into any OTHER
-# function by name (slice 3) -- ordinary PatLang function calls become
-# ordinary recursive calls into this same interpreter, using PatLang's
-# own call stack, no separate call-stack bookkeeping needed here.
+# interp_run_function(funcs, func, arg_values) -> ["Ok", value] |
+# ["Err", message]. `func` is a ["FuncIR", name, params, instrs] entry
+# (see lower.patlang); `funcs` is the WHOLE program's function list,
+# threaded through so a "Call"/"CallValue" instruction can look up and
+# recurse into any other function by name -- ordinary PatLang function
+# calls become ordinary recursive calls into this same interpreter, using
+# PatLang's own call stack, no separate call-stack bookkeeping needed
+# here.
 make a function called interp_run_function takes funcs, func, arg_values returns result
   let params = func[2]
   let instrs = func[3]
@@ -206,7 +385,9 @@ make a function called interp_run_function takes funcs, func, arg_values returns
   end
   let stack = []
   let pc = 0
-  let result = 0
+  let final_result = 0
+  let error_msg = ""
+  let has_error = false
   let running = true
   while running do
     if pc >= instrs.length then
@@ -233,13 +414,27 @@ make a function called interp_run_function takes funcs, func, arg_values returns
               let b = popped_b[0]
               let popped_a = stack_pop(popped_b[1])
               let a = popped_a[0]
-              let stack = list_push(popped_a[1], interp_bin(instr[1], a, b))
-              let pc = pc + 1
+              let bin_result = interp_bin(instr[1], a, b)
+              if bin_result[0] == "Err" then
+                let error_msg = bin_result[1]
+                let has_error = true
+                let running = false
+              else
+                let stack = list_push(popped_a[1], bin_result[1])
+                let pc = pc + 1
+              end
             else
               if op == "Un" then
                 let popped = stack_pop(stack)
-                let stack = list_push(popped[1], interp_un(instr[1], popped[0]))
-                let pc = pc + 1
+                let un_result = interp_un(instr[1], popped[0])
+                if un_result[0] == "Err" then
+                  let error_msg = un_result[1]
+                  let has_error = true
+                  let running = false
+                else
+                  let stack = list_push(popped[1], un_result[1])
+                  let pc = pc + 1
+                end
               else
                 if op == "Jump" then
                   let pc = instr[1]
@@ -255,14 +450,21 @@ make a function called interp_run_function takes funcs, func, arg_values returns
                   else
                     if op == "Return" then
                       if stack.length > 0 then
-                        let result = stack[stack.length - 1]
+                        let final_result = stack[stack.length - 1]
                       end
                       let running = false
                     else
                       if op == "CallHost" then
                         let popped = stack_pop_n(stack, instr[2])
-                        let stack = list_push(popped[1], interp_call_host(instr[1], popped[0]))
-                        let pc = pc + 1
+                        let call_result = interp_call_host(instr[1], popped[0])
+                        if call_result[0] == "Err" then
+                          let error_msg = call_result[1]
+                          let has_error = true
+                          let running = false
+                        else
+                          let stack = list_push(popped[1], call_result[1])
+                          let pc = pc + 1
+                        end
                       else
                         if op == "BuildList" then
                           let popped = stack_pop_n(stack, instr[1])
@@ -273,12 +475,19 @@ make a function called interp_run_function takes funcs, func, arg_values returns
                             let popped = stack_pop_n(stack, instr[2])
                             let callee = find_func(funcs, instr[1])
                             if callee == 0 then
-                              print("interp_run_function: user function '" + instr[1] + "' not found")
+                              let error_msg = "user function '" + instr[1] + "' not found"
+                              let has_error = true
                               let running = false
                             else
                               let call_result = interp_run_function(funcs, callee, popped[0])
-                              let stack = list_push(popped[1], call_result)
-                              let pc = pc + 1
+                              if call_result[0] == "Err" then
+                                let error_msg = call_result[1]
+                                let has_error = true
+                                let running = false
+                              else
+                                let stack = list_push(popped[1], call_result[1])
+                                let pc = pc + 1
+                              end
                             end
                           else
                             if op == "MakeClosure" then
@@ -301,15 +510,23 @@ make a function called interp_run_function takes funcs, func, arg_values returns
                                 end
                                 let callee = find_func(funcs, func_name)
                                 if callee == 0 then
-                                  print("interp_run_function: closure target function '" + func_name + "' not found")
+                                  let error_msg = "closure target function '" + func_name + "' not found"
+                                  let has_error = true
                                   let running = false
                                 else
                                   let call_result = interp_run_function(funcs, callee, all_args)
-                                  let stack = list_push(popped_closure[1], call_result)
-                                  let pc = pc + 1
+                                  if call_result[0] == "Err" then
+                                    let error_msg = call_result[1]
+                                    let has_error = true
+                                    let running = false
+                                  else
+                                    let stack = list_push(popped_closure[1], call_result[1])
+                                    let pc = pc + 1
+                                  end
                                 end
                               else
-                                print("interp_run_function: '" + op + "' not recognized (not part of the current IR instruction set)")
+                                let error_msg = "'" + op + "' not recognized (not part of the current IR instruction set)"
+                                let has_error = true
                                 let running = false
                               end
                             end
@@ -326,22 +543,24 @@ make a function called interp_run_function takes funcs, func, arg_values returns
       end
     end
   end
-  return result
+  if has_error then
+    return ["Err", error_msg]
+  end
+  return ["Ok", final_result]
 end
 
-# interpret_ir(ir) -- runs `ir`'s "main" function with no arguments and
-# returns its result. `ir` is the ["ProgramIR", entry_name, funcs, events]
-# shape lower_program() produces (or load_ir() reads back from a saved
-# .ir file) -- exactly the same shape emit_program_rs/emit_program_x64
-# already consume, so this is a genuine third final stage, not a parallel
-# reimplementation of the front end.
+# interpret_ir(ir) -> ["Ok", value] | ["Err", message]. Runs `ir`'s "main"
+# function with no arguments. `ir` is the ["ProgramIR", entry_name, funcs,
+# events] shape lower_program() produces (or load_ir() reads back from a
+# saved .ir file) -- exactly the same shape emit_program_rs/emit_program_
+# x64 already consume, so this is a genuine third final stage, not a
+# parallel reimplementation of the front end.
 make a function called interpret_ir takes ir returns result
   let entry = ir[1]
   let funcs = ir[2]
   let main_func = find_func(funcs, entry)
   if main_func == 0 then
-    print("interpret_ir: entry function '" + entry + "' not found")
-    return 0
+    return ["Err", "entry function '" + entry + "' not found"]
   end
   return interp_run_function(funcs, main_func, [])
 end
