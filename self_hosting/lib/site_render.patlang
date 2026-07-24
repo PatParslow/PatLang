@@ -1,0 +1,354 @@
+# Port of the Parslow site's tools/site/build.py transformation logic
+# (BeautifulSoup-based) onto html_scan.patlang's token-list model.
+# "Eating the dogfood": the site that documents PatLang is built BY
+# PatLang, not a Python script calling out to lxml.
+
+include "html_scan.patlang"
+
+# slugify(text) -- matches build.py's
+# `re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "section"`:
+# any run of non-alphanumeric characters collapses to a single "-",
+# leading/trailing "-" trimmed, empty result falls back to "section".
+make a function called slugify takes text returns slug
+  let lower = html_lower(text)
+  let b = sb_new()
+  let i = 0
+  let n = lower.length
+  let in_run = false
+  while i < n do
+    let code = char_code(lower, i)
+    let is_alnum = ((code >= 97) and (code <= 122)) or ((code >= 48) and (code <= 57))
+    if is_alnum then
+      sb_push(b, lower[i])
+      let in_run = false
+    else
+      if not in_run then
+        sb_push(b, "-")
+        let in_run = true
+      end
+    end
+    let i = i + 1
+  end
+  let out = html_trim_dashes(sb_str(b))
+  if out.length == 0 then
+    return "section"
+  end
+  return out
+end
+
+make a function called html_trim_dashes takes s returns out
+  let a = 0
+  while (a < s.length) and (s[a] == "-") do
+    let a = a + 1
+  end
+  let z = s.length
+  while (z > a) and (s[z - 1] == "-") do
+    let z = z - 1
+  end
+  return substr(s, a, z - a)
+end
+
+# ensure_heading_ids(tokens) -- mutates (returns a NEW tokens list)
+# every h2/h3/h4 to have a unique `id`, slugifying its text when one
+# isn't already present, de-duplicating via a "-2", "-3", ... suffix
+# exactly like build.py's own `seen` set + `while hid in seen` loop.
+make a function called ensure_heading_ids takes tokens returns new_tokens
+  let out = tokens
+  let seen = []
+  let heads = html_find_all(tokens, ["h2", "h3", "h4"])
+  let i = 0
+  while i < heads.length do
+    let idx = heads[i]
+    let attrs = out[idx][2]
+    let hid = html_attr_get(attrs, "id")
+    if hid.length == 0 then
+      let hid = slugify(html_get_text(out, idx))
+    end
+    let base = hid
+    let n = 2
+    while html_name_in_list(seen, hid) do
+      let hid = base + "-" + n
+      let n = n + 1
+    end
+    let seen = list_push(seen, hid)
+    let new_attrs = html_attr_set(attrs, "id", hid)
+    let new_token = [out[idx][0], out[idx][1], new_attrs]
+    let out = list_set(out, idx, new_token)
+    let i = i + 1
+  end
+  return out
+end
+
+# build_toc(tokens) -- returns the <ul>...</ul> TOC markup. h3s nest
+# under the preceding h2 (an h3 before any h2 is treated as top-level,
+# matching build.py's own `if tag.name == "h2" or not entries`).
+# Assumes ensure_heading_ids has already run (reads `id`, doesn't set
+# it).
+make a function called build_toc takes tokens returns html
+  let entries = []
+  let heads = html_find_all(tokens, ["h2", "h3"])
+  let i = 0
+  while i < heads.length do
+    let idx = heads[i]
+    let title = html_get_text(tokens, idx)
+    let hid = html_attr_get(tokens[idx][2], "id")
+    if (title.length > 0) and (hid.length > 0) then
+      if (tokens[idx][1] == "h2") or (entries.length == 0) then
+        let entries = list_push(entries, [title, hid, []])
+      else
+        let last = entries[entries.length - 1]
+        let new_last = [last[0], last[1], list_push(last[2], [title, hid])]
+        let entries = list_set(entries, entries.length - 1, new_last)
+      end
+    end
+    let i = i + 1
+  end
+  if entries.length == 0 then
+    return ""
+  end
+  let b = sb_new()
+  sb_push(b, "<ul>")
+  let n = 1
+  let ei = 0
+  while ei < entries.length do
+    let title = entries[ei][0]
+    let hid = entries[ei][1]
+    let children = entries[ei][2]
+    let link = "<a href=\"#" + html_escape(hid) + "\">" + html_escape(title) + "</a>"
+    if children.length > 0 then
+      let sub_id = "toc-sub-" + n
+      sb_push(b, "<li class=\"toc-section\"><div class=\"toc-row\">")
+      sb_push(b, link)
+      sb_push(b, "<button class=\"toc-toggle\" data-target=\"#" + sub_id + "\" aria-expanded=\"false\" aria-controls=\"" + sub_id + "\" aria-label=\"Show subsections of " + html_escape(title) + "\">")
+      sb_push(b, "&#9654;</button></div>")
+      sb_push(b, "<ul class=\"toc-sub\" id=\"" + sub_id + "\" hidden>")
+      let ci = 0
+      while ci < children.length do
+        sb_push(b, "<li><a href=\"#" + html_escape(children[ci][1]) + "\">" + html_escape(children[ci][0]) + "</a></li>")
+        let ci = ci + 1
+      end
+      sb_push(b, "</ul></li>")
+    else
+      sb_push(b, "<li>" + link + "</li>")
+    end
+    let n = n + 1
+    let ei = ei + 1
+  end
+  sb_push(b, "</ul>")
+  return sb_str(b)
+end
+
+# first_paragraph_summary(html, limit) -- the first <p> whose text
+# doesn't start with "authors:"/"title:" (case-insensitive), truncated
+# at `limit` chars on a word boundary with a trailing ellipsis.
+make a function called html_starts_with_ci takes s, prefix returns yes
+  if prefix.length > s.length then
+    return false
+  end
+  return html_lower(substr(s, 0, prefix.length)) == prefix
+end
+
+make a function called first_paragraph_summary takes html, limit returns summary
+  let tokens = html_tokenize(html)
+  let paras = html_find_all(tokens, ["p"])
+  let i = 0
+  while i < paras.length do
+    let text = html_get_text(tokens, paras[i])
+    if text.length > 0 then
+      if not (html_starts_with_ci(text, "authors:") or html_starts_with_ci(text, "title:")) then
+        if text.length > limit then
+          let cut = substr(text, 0, limit)
+          let last_space = -1
+          let j = 0
+          while j < cut.length do
+            if cut[j] == " " then
+              let last_space = j
+            end
+            let j = j + 1
+          end
+          if last_space >= 0 then
+            let cut = substr(cut, 0, last_space)
+          end
+          let cut = html_rstrip_punct(cut)
+          return cut + chr(8230)
+        end
+        return text
+      end
+    end
+    let i = i + 1
+  end
+  return ""
+end
+
+make a function called html_rstrip_punct takes s returns out
+  let z = s.length
+  while (z > 0) and ((s[z - 1] == ",") or (s[z - 1] == ";") or (s[z - 1] == ":")) do
+    let z = z - 1
+  end
+  return substr(s, 0, z)
+end
+
+# normalise_references(tokens) -- finds the "References" h2/h3, forces
+# it to h2 with id="references", numbers the following ol/ul's direct
+# <li> children ref-1/ref-2/... (only if they don't already have an
+# id), and retargets external-link [N] markers elsewhere in the
+# document to local #ref-N anchors. Returns a NEW tokens list; if there
+# is no References heading, returns `tokens` unchanged.
+make a function called normalise_references takes tokens returns new_tokens
+  let out = tokens
+  let heads = html_find_all(out, ["h2", "h3"])
+  let ref_idx = -1
+  let i = 0
+  while (i < heads.length) and (ref_idx == -1) do
+    if html_lower(html_get_text(out, heads[i])) == "references" then
+      let ref_idx = heads[i]
+    end
+    let i = i + 1
+  end
+  if ref_idx == -1 then
+    return out
+  end
+  let ref_attrs = html_attr_set(out[ref_idx][2], "id", "references")
+  let out = list_set(out, ref_idx, ["open", "h2", ref_attrs])
+  let close_idx = html_find_close(tokens, ref_idx)
+  if close_idx != -1 then
+    let old_close_name = out[close_idx][1]
+    if old_close_name == "h3" then
+      let out = list_set(out, close_idx, ["close", "h2"])
+    end
+  end
+
+  let list_idx = html_find_next(out, ref_idx, ["ol", "ul"])
+  if list_idx == -1 then
+    return out
+  end
+  let list_attrs = out[list_idx][2]
+  let existing_class = html_attr_get(list_attrs, "class")
+  let new_class = "references"
+  if existing_class.length > 0 then
+    let new_class = existing_class + " references"
+  end
+  let list_attrs = html_attr_set(list_attrs, "class", new_class)
+  let out = list_set(out, list_idx, [out[list_idx][0], out[list_idx][1], list_attrs])
+
+  let lis = html_direct_li_children(out, list_idx)
+  let max_ref = lis.length
+  let li_i = 0
+  while li_i < lis.length do
+    let li_idx = lis[li_i]
+    let li_attrs = out[li_idx][2]
+    if not html_attr_has(li_attrs, "id") then
+      let new_li_attrs = html_attr_set(li_attrs, "id", "ref-" + (li_i + 1))
+      let out = list_set(out, li_idx, [out[li_idx][0], out[li_idx][1], new_li_attrs])
+    end
+    let li_i = li_i + 1
+  end
+
+  let list_close_idx = html_find_close(out, list_idx)
+  let links = html_find_all(out, ["a"])
+  let a_i = 0
+  while a_i < links.length do
+    let a_idx = links[a_i]
+    let inside_ref_list = (a_idx > list_idx) and (a_idx < list_close_idx)
+    if not inside_ref_list then
+      let href = html_attr_get(out[a_idx][2], "href")
+      if html_starts_with_ci(href, "http") then
+        let text = html_get_text(out, a_idx)
+        let n = html_bracket_marker(text)
+        if n >= 1 then
+          if n <= max_ref then
+            let new_attrs = html_attr_set(out[a_idx][2], "href", "#ref-" + n)
+            let new_attrs = html_attr_set(new_attrs, "class", "citation")
+            let new_attrs = html_attr_set(new_attrs, "title", "Reference " + n + ": " + href)
+            let out = list_set(out, a_idx, [out[a_idx][0], out[a_idx][1], new_attrs])
+          end
+        end
+      end
+    end
+    let a_i = a_i + 1
+  end
+  return out
+end
+
+# Matches build.py's `re.compile(r"^\[(\d{1,3})\]$")`: text that is
+# EXACTLY "[" + 1-3 digits + "]", nothing else. Returns the number, or
+# -1 if the text doesn't match.
+make a function called html_bracket_marker takes text returns n
+  if text.length < 3 then
+    return -1
+  end
+  if text[0] != "[" then
+    return -1
+  end
+  if text[text.length - 1] != "]" then
+    return -1
+  end
+  let digits = substr(text, 1, text.length - 2)
+  if (digits.length < 1) or (digits.length > 3) then
+    return -1
+  end
+  let i = 0
+  while i < digits.length do
+    let code = char_code(digits, i)
+    if (code < 48) or (code > 57) then
+      return -1
+    end
+    let i = i + 1
+  end
+  return to_num(digits)
+end
+
+# rewrite_internal_links(tokens, prefix, canonical_get) -- points
+# in-body links at each target's canonical hierarchical path.
+# `canonical_get` is a function taking a basename and returning either
+# the canonical path or "" if unmapped (mirrors CANONICAL_PATHS.get).
+make a function called rewrite_internal_links takes tokens, prefix, canonical_map returns new_tokens
+  let out = tokens
+  let links = html_find_all(out, ["a"])
+  let i = 0
+  while i < links.length do
+    let a_idx = links[i]
+    let href = html_attr_get(out[a_idx][2], "href")
+    if href.length > 0 then
+      if not (html_starts_with_ci(href, "#") or html_starts_with_ci(href, "http://") or html_starts_with_ci(href, "https://") or html_starts_with_ci(href, "mailto:")) then
+        let hash_pos = -1
+        let j = 0
+        while j < href.length do
+          if href[j] == "#" then
+            let hash_pos = j
+          end
+          let j = j + 1
+        end
+        let base = href
+        let frag = ""
+        if hash_pos >= 0 then
+          let base = substr(href, 0, hash_pos)
+          let frag = substr(href, hash_pos + 1, href.length - (hash_pos + 1))
+        end
+        let slash_pos = -1
+        let k = 0
+        while k < base.length do
+          if base[k] == "/" then
+            let slash_pos = k
+          end
+          let k = k + 1
+        end
+        let basename = base
+        if slash_pos >= 0 then
+          let basename = substr(base, slash_pos + 1, base.length - (slash_pos + 1))
+        end
+        let target = json_get(canonical_map, basename)
+        if target[0] != "null" then
+          let new_href = prefix + json_str(target)
+          if frag.length > 0 then
+            let new_href = new_href + "#" + frag
+          end
+          let new_attrs = html_attr_set(out[a_idx][2], "href", new_href)
+          let out = list_set(out, a_idx, [out[a_idx][0], out[a_idx][1], new_attrs])
+        end
+      end
+    end
+    let i = i + 1
+  end
+  return out
+end

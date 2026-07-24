@@ -4,7 +4,7 @@ use patlang_runtime::ir::*;
 fn codegen_build_and_run_matches_interpreter_output() {
     // Build a small program: let s = "hi"; let a=[1,2,3]; return s.length + a.len
     let mut f = Function { name: "main".into(), ..Default::default() };
-    f.body.push(Instr::Const(Value::String("hi".into())));
+    f.body.push(Instr::Const(Value::String("hi".to_string().into())));
     f.body.push(Instr::StoreLocal("s".into()));
     f.body.push(Instr::Const(Value::Int(1)));
     f.body.push(Instr::Const(Value::Int(2)));

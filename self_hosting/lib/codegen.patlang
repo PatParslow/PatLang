@@ -155,7 +155,7 @@ make a function called emit_instr_rs takes instr returns out
       end
     else
       if kind == "str" then
-        return "Instr::Const(Value::String(" + rs_str(instr[2]) + "))"
+        return "Instr::Const(Value::String(" + rs_str(instr[2]) + ".into()))"
       else
         return "Instr::Const(Value::Bool(" + instr[2] + "))"
       end
@@ -272,12 +272,50 @@ make a function called emit_build_program takes ir returns out
   return sb_str(b)
 end
 
+# main() used to come for free as part of emit_runtime_rs()'s output
+# (embedded statically in PRELUDE_CORE's mirrored text); it had to move
+# here once main() itself moved out of PRELUDE_CORE in codegen.rs (Stage
+# 40, the --patc prelude chunk-precompile-and-link investigation) --
+# main() calls build_program() and needs to register call_dispatch via
+# set_dispatch_fallback, both genuinely per-program, so a shared/
+# precompiled runtime library can no longer provide it. Byte-for-byte
+# mirror of the Rust text codegen.rs's emit_rust now generates in the
+# same spot -- see the patlang-patc-prelude-chunk-linking-investigation
+# memory for the reasoning on both sides.
+make a function called emit_main_rs returns out
+  let b = sb_new()
+  sb_push(b, "#[cfg(not(target_arch = \"wasm32\"))]" + nl())
+  sb_push(b, "fn main(){" + nl())
+  sb_push(b, "    let child = std::thread::Builder::new()" + nl())
+  sb_push(b, "        .stack_size(256 * 1024 * 1024)" + nl())
+  sb_push(b, "        .spawn(|| {" + nl())
+  sb_push(b, "            set_dispatch_fallback(call_dispatch);" + nl())
+  sb_push(b, "            let program = build_program();" + nl())
+  sb_push(b, "            match run(&program) {" + nl())
+  sb_push(b, "                Ok(v) => { println!(\"{}\", display_value(&v)); 0 }" + nl())
+  sb_push(b, "                Err(e) => { eprintln!(\"IR runtime error: {}\", e); 1 }" + nl())
+  sb_push(b, "            }" + nl())
+  sb_push(b, "        })" + nl())
+  sb_push(b, "        .expect(\"failed to spawn worker thread\");" + nl())
+  sb_push(b, "    let code = child.join().unwrap_or(1);" + nl())
+  sb_push(b, "    std::process::exit(code);" + nl())
+  sb_push(b, "}" + nl())
+  sb_push(b, nl())
+  sb_push(b, "#[cfg(target_arch = \"wasm32\")]" + nl())
+  sb_push(b, "fn main(){" + nl())
+  sb_push(b, "    set_dispatch_fallback(call_dispatch);" + nl())
+  sb_push(b, "    let program = build_program();" + nl())
+  sb_push(b, "    match run(&program) { Ok(v) => println!(\"{}\", display_value(&v)), Err(e) => { eprintln!(\"IR runtime error: {}\", e); std::process::exit(1); } }" + nl())
+  sb_push(b, "}" + nl())
+  return sb_str(b)
+end
+
 # Full emitted program: runtime library text + generated builder section.
 # emit_runtime_rs lives in lib/runtime_rs.patlang — the runtime is PatLang
 # source too, so every byte of the emitted program originates from .patlang
 # files processed by this toolchain.
 make a function called emit_program_rs takes ir returns out
-  return emit_runtime_rs() + emit_build_program(ir)
+  return emit_runtime_rs() + emit_build_program(ir) + emit_main_rs()
 end
 
 # =============================================================================
@@ -370,6 +408,8 @@ make a function called host_chunk_of takes name returns chunk
   if name == "patc_compile_from_argv" then return "codegen_bootstrap" end
   if name == "get_argv" then return "codegen_bootstrap" end
   if name == "rustc_build" then return "codegen_bootstrap" end
+  if name == "rustc_build_chunked" then return "codegen_bootstrap" end
+  if name == "rustc_build_chunked_texts" then return "codegen_bootstrap" end
   if name == "run_ir" then return "codegen_bootstrap" end
   if name == "sqrt" then return "math" end
   if name == "pow" then return "math" end
@@ -504,5 +544,98 @@ end
 # Tree-shaken emitted program: only the chunks this program's host calls
 # actually need, instead of the full prelude.
 make a function called emit_program_rs_shaken takes ir returns out
-  return emit_runtime_rs_for(required_chunks(ir)) + emit_build_program(ir)
+  return emit_runtime_rs_for(required_chunks(ir)) + emit_build_program(ir) + emit_main_rs()
+end
+
+# Comma-separated chunk names, for handing to the `rustc_build_chunked`
+# host function's `chunk_names_csv` parameter (mirrors how
+# rust-runtime/src/main.rs's own `--patc` mode joins the same set on the
+# Rust side before calling `build_chunked_native`).
+make a function called join_csv takes names returns out
+  let b = sb_new()
+  let i = 0
+  while i < names.length do
+    if i > 0 then
+      sb_push(b, ",")
+    end
+    sb_push(b, names[i])
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+# chunk_texts_for(names) -> [base_name, pairs] where `pairs` is a list of
+# [name, text] 2-element lists, one entry per chunk in `names` (with "core"
+# and whichever Value variant merged into a single entry named
+# `base_name`, matching the native side's own base/tier1/tier2 split --
+# see build_chunked_native_opt's caller-side merge in codegen.rs). This is
+# the self-hosted counterpart of that merge: since a standalone compiled
+# patc-generated program (patc1.exe, patc2.exe, ...) has no access to
+# ChunkId/PRELUDE_* at all, it must supply chunk TEXT explicitly to
+# `rustc_build_chunked_texts` -- sourced here via the ALREADY-EXISTING
+# emit_chunk_* mirror functions (runtime_rs.patlang), each proven
+# byte-for-byte identical to codegen.rs's own PRELUDE_* constants by
+# `selfhost_runtime_text_parity`.
+make a function called chunk_texts_for takes names returns result
+  let wants_tower = list_contains(names, "numeric_tower")
+  let base_name = "patlang_base_fast"
+  if wants_tower then
+    let base_name = "patlang_base_tower"
+  end
+  let base_text = emit_chunk_core()
+  if wants_tower then
+    let base_text = base_text + emit_chunk_numeric_tower()
+  else
+    let base_text = base_text + emit_chunk_value_fast()
+  end
+  let pairs = [[base_name, base_text]]
+  if list_contains(names, "strings_ext") then
+    let pairs = list_push(pairs, ["strings_ext", emit_chunk_strings_ext()])
+  end
+  if list_contains(names, "collections_handles") then
+    let pairs = list_push(pairs, ["collections_handles", emit_chunk_collections_handles()])
+  end
+  if list_contains(names, "files") then
+    let pairs = list_push(pairs, ["files", emit_chunk_files()])
+  end
+  if list_contains(names, "io_misc") then
+    let pairs = list_push(pairs, ["io_misc", emit_chunk_io_misc()])
+  end
+  if list_contains(names, "networking") then
+    let pairs = list_push(pairs, ["networking", emit_chunk_networking()])
+  end
+  if list_contains(names, "codegen_bootstrap") then
+    let pairs = list_push(pairs, ["codegen_bootstrap", emit_chunk_codegen_bootstrap()])
+  end
+  if list_contains(names, "math") then
+    let pairs = list_push(pairs, ["math", emit_chunk_math()])
+  end
+  # "logic" must be added before "oo"/"contracts" -- both of THOSE need a
+  # "logic" entry already present in `pairs` (embedded_build_chunked looks
+  # it up by name at Tier 2), same CROSS_CHUNK_EDGES-driven ordering the
+  # native side's own tiering already relies on.
+  if list_contains(names, "logic") then
+    let pairs = list_push(pairs, ["logic", emit_chunk_logic()])
+  end
+  if list_contains(names, "oo") then
+    let pairs = list_push(pairs, ["oo", emit_chunk_oo()])
+  end
+  if list_contains(names, "contracts") then
+    let pairs = list_push(pairs, ["contracts", emit_chunk_contracts()])
+  end
+  return [base_name, pairs]
+end
+
+# Chunked emitted program: per-program text ONLY (call_dispatch +
+# build_program + main), no PRELUDE_* runtime text at all -- mirrors
+# rust-runtime/src/ir/codegen.rs's `emit_rust_chunked`. Meant to be handed
+# to the `rustc_build_chunked` host function together with
+# `join_csv(required_chunks(ir))`, which supplies the actual chunk TEXT
+# itself (from codegen.rs's own PRELUDE_* constants, precompiled once into
+# cached rlibs) -- this function only needs to generate the small, always-
+# different-per-program part and pick the right chunk NAMES, exactly like
+# the monolithic `emit_program_rs_shaken` already does for text selection,
+# just without inlining the chosen chunks' TEXT into the output at all.
+make a function called emit_program_rs_chunked takes ir returns out
+  return emit_dispatch_for(required_chunks(ir)) + emit_build_program(ir) + emit_main_rs()
 end

@@ -11,18 +11,18 @@ use std::sync::Mutex;
 // touch it to avoid cross-test interference.
 static VFS_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-fn s(x: &str) -> Value { Value::String(x.to_string()) }
+fn s(x: &str) -> Value { Value::String(x.to_string().into()) }
 
 #[test]
 fn read_write_exists_delete_roundtrip() {
     let _guard = VFS_TEST_LOCK.lock().unwrap();
     let path = "vfs_test/roundtrip.txt";
-    assert_eq!(host_vfs_exists(&[s(path)]).unwrap(), Value::String("0".into()));
+    assert_eq!(host_vfs_exists(&[s(path)]).unwrap(), Value::String("0".to_string().into()));
     host_vfs_write(&[s(path), s("hello")]).unwrap();
-    assert_eq!(host_vfs_exists(&[s(path)]).unwrap(), Value::String("1".into()));
-    assert_eq!(host_vfs_read(&[s(path)]).unwrap(), Value::String("hello".into()));
+    assert_eq!(host_vfs_exists(&[s(path)]).unwrap(), Value::String("1".to_string().into()));
+    assert_eq!(host_vfs_read(&[s(path)]).unwrap(), Value::String("hello".to_string().into()));
     assert_eq!(host_vfs_delete(&[s(path)]).unwrap(), Value::Bool(true));
-    assert_eq!(host_vfs_exists(&[s(path)]).unwrap(), Value::String("0".into()));
+    assert_eq!(host_vfs_exists(&[s(path)]).unwrap(), Value::String("0".to_string().into()));
     // Deleting again returns false, not an error.
     assert_eq!(host_vfs_delete(&[s(path)]).unwrap(), Value::Bool(false));
 }
@@ -60,9 +60,9 @@ fn writes_from_other_os_threads_are_visible_to_the_main_thread() {
     let path = "vfs_test/cross_thread.txt";
     host_vfs_delete(&[s(path)]).unwrap();
     std::thread::spawn(move || {
-        host_vfs_write(&[Value::String(path.to_string()), Value::String("written from another thread".to_string())]).unwrap();
+        host_vfs_write(&[Value::String(path.to_string().into()), Value::String("written from another thread".to_string().into())]).unwrap();
     }).join().unwrap();
-    assert_eq!(host_vfs_read(&[s(path)]).unwrap(), Value::String("written from another thread".into()), "a write from a spawned OS thread must be visible from the main thread");
+    assert_eq!(host_vfs_read(&[s(path)]).unwrap(), Value::String("written from another thread".to_string().into()), "a write from a spawned OS thread must be visible from the main thread");
     host_vfs_delete(&[s(path)]).unwrap();
 }
 

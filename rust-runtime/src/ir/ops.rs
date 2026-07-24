@@ -20,9 +20,9 @@ pub fn add(a: &Value, b: &Value) -> Result<Value, String> {
     }
     match (a, b) {
         // String concatenation (including mixed types) — untouched per plan.
-        (Value::String(x), Value::String(y)) => Ok(Value::String(format!("{}{}", x, y))),
-        (Value::String(x), other) => Ok(Value::String(format!("{}{}", x, v_to_string(other)))),
-        (other, Value::String(y)) => Ok(Value::String(format!("{}{}", v_to_string(other), y))),
+        (Value::String(x), Value::String(y)) => Ok(Value::String(format!("{}{}", x, y).into())),
+        (Value::String(x), other) => Ok(Value::String(format!("{}{}", x, v_to_string(other)).into())),
+        (other, Value::String(y)) => Ok(Value::String(format!("{}{}", v_to_string(other), y).into())),
         _ => numeric_binop(a, b, "add",
             |x, y| x.checked_add(y),
             |x, y| x + y,
@@ -390,7 +390,7 @@ pub fn v_to_string(v: &Value) -> String {
         Value::BigInt(b) => b.to_string(),
         Value::Rational(n, d) => format!("{}/{}", n, d),
         Value::Complex(re, im) => format!("{}+{}i", v_to_string(re), v_to_string(im)),
-        Value::String(s) => s.clone(),
+        Value::String(s) => s.as_ref().clone(),
         Value::List(xs) => {
             let parts: Vec<String> = xs.iter().map(v_to_string).collect();
             format!("[{}]", parts.join(", "))

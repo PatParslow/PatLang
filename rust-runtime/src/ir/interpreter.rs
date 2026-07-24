@@ -111,10 +111,10 @@ impl Interpreter {
                     let args: Vec<Value> = stack.drain(args_index..).collect();
                     if name == "emit" {
                         // args: event name (string), optional payload (any)
-                        let ev = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => String::new() };
+                        let ev = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => String::new().into() };
                         let payload = args.get(1).cloned().unwrap_or(Value::Unit);
                         let mut last = Value::Unit;
-                        if let Some(handlers) = program.event_handlers.get(&ev) {
+                        if let Some(handlers) = program.event_handlers.get(ev.as_str()) {
                             for h in handlers {
                                 let callee = program.functions.get(h).ok_or_else(|| format!("function '{}' not found", h))?;
                                 // Handlers take (event_name, event_data)
@@ -129,7 +129,7 @@ impl Interpreter {
                             Some(Value::String(s)) => s.clone(),
                             other => return Err(format!("apply: expected function name string, got {:?}", other)),
                         };
-                        let callee = program.functions.get(&fname)
+                        let callee = program.functions.get(fname.as_str())
                             .ok_or_else(|| format!("apply: function '{}' not found", fname))?;
                         let ret = self.run_function(program, callee, &args[1..])?;
                         stack.push(ret);
@@ -150,7 +150,7 @@ impl Interpreter {
                             Some(Value::String(s)) => s.clone(),
                             other => return Err(format!("parallel_map: expected a function name string as the second arg, got {:?}", other)),
                         };
-                        if !program.functions.contains_key(&fname) {
+                        if !program.functions.contains_key(fname.as_str()) {
                             return Err(format!("parallel_map: function '{}' not found", fname));
                         }
                         let results: Result<Vec<Value>, String> = std::thread::scope(|scope| {
@@ -176,7 +176,7 @@ impl Interpreter {
                             Some(Value::String(s)) => s.clone(),
                             other => return Err(format!("fiber_new: expected a function name string, got {:?}", other)),
                         };
-                        stack.push(super::fiber::fiber_new(program, fname)?);
+                        stack.push(super::fiber::fiber_new(program, (*fname).clone())?);
                     } else if name == "fiber_resume" {
                         let id = args.get(0).cloned().unwrap_or(Value::Unit);
                         let arg = args.get(1).cloned().unwrap_or(Value::Unit);

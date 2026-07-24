@@ -18,10 +18,10 @@ thread_local! {
 fn capture_print(args: &[Value]) -> Result<Value, String> {
     let s = match args.get(0) {
         Some(Value::String(s)) => s.clone(),
-        Some(v) => patlang_runtime::ir::ops::v_to_string(v),
-        None => String::new(),
+        Some(v) => patlang_runtime::ir::ops::v_to_string(v).into(),
+        None => String::new().into(),
     };
-    PRINTED.with(|p| p.borrow_mut().push(s));
+    PRINTED.with(|p| p.borrow_mut().push(s.to_string()));
     Ok(Value::Unit)
 }
 

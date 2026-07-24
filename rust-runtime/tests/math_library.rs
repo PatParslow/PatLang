@@ -123,16 +123,16 @@ fn abs_on_reals_is_exact() {
 
 #[test]
 fn numeric_kind_reports_all_five_tags() {
-    assert_eq!(call_host("numeric_kind", vec![Value::Int(1)]), Value::String("int".into()));
-    assert_eq!(call_host("numeric_kind", vec![Value::Float(1.5)]), Value::String("float".into()));
+    assert_eq!(call_host("numeric_kind", vec![Value::Int(1)]), Value::String("int".to_string().into()));
+    assert_eq!(call_host("numeric_kind", vec![Value::Float(1.5)]), Value::String("float".to_string().into()));
     assert_eq!(
         call_host("numeric_kind", vec![Value::BigInt(num_bigint::BigInt::from(1))]),
-        Value::String("bigint".into())
+        Value::String("bigint".to_string().into())
     );
     assert_eq!(
         call_host("numeric_kind", vec![Value::Rational(num_bigint::BigInt::from(1), num_bigint::BigInt::from(2))]),
-        Value::String("rational".into())
+        Value::String("rational".to_string().into())
     );
     let c = Value::Complex(Box::new(Value::Int(0)), Box::new(Value::Int(1)));
-    assert_eq!(call_host("numeric_kind", vec![c]), Value::String("complex".into()));
+    assert_eq!(call_host("numeric_kind", vec![c]), Value::String("complex".to_string().into()));
 }

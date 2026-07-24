@@ -1,0 +1,456 @@
+# =============================================================================
+# Standalone Spreadsheet Engine in PatLang
+# =============================================================================
+
+include "../self_hosting/lib/json.patlang"
+include "../self_hosting/lib/markdown.patlang"
+
+# Object store to hold cells and evaluation cache/stack
+# Cells are represented as string properties on the global object "sheet"
+# E.g. get("sheet", "A1") -> formula/raw input
+# Evaluated cell values are cached: get("cache", "A1") -> evaluated value
+# Active evaluation stack: get("stack", "A1") -> "1" if currently evaluating (detects cycles)
+
+make a function called init_sheet returns done
+  new("Sheet", "sheet")
+  new("Cache", "cache")
+  new("Stack", "stack")
+  return true
+end
+
+make a function called clear_sheet returns done
+  init_sheet()
+  # Clear cache and stack by recreating them
+  return true
+end
+
+# Cell name parsing: "A1" -> [col_idx, row_idx]
+# A = 0, B = 1, ... Z = 25
+make a function called parse_cell_ref takes ref returns coords
+  if ref.length < 2 then
+    return [-1, -1]
+  end
+  let col_char = ref[0]
+  let col_code = char_code(col_char, 0)
+  let col = -1
+  if (col_code >= 65) and (col_code <= 90) then
+    let col = col_code - 65
+  else
+    if (col_code >= 97) and (col_code <= 122) then
+      let col = col_code - 97
+    end
+  end
+  let row_str = substr(ref, 1, ref.length - 1)
+  let row = to_num(row_str) - 1
+  return [col, row]
+end
+
+# Format coords back to cell name: [0, 0] -> "A1"
+make a function called format_cell_ref takes coords returns ref
+  let col = coords[0]
+  let row = coords[1]
+  let col_char = chr(65 + col)
+  return col_char + (row + 1)
+end
+
+# Formula parser and evaluator.
+# Supports numbers, cell references (A1, B2), simple arithmetic (+ - * /),
+# and SUM/AVERAGE functions over ranges (e.g. SUM(A1:B3)).
+#
+# Expressions:
+#   Expr = Term (('+' | '-') Term)*
+#   Term = Factor (('*' | '/') Factor)*
+#   Factor = Number | CellRef | Function | '(' Expr ')'
+#   Function = ('SUM' | 'AVERAGE') '(' CellRef ':' CellRef ')'
+
+# Simple lexer for formula evaluation
+# Returns a list of tokens: [type, value]
+# E.g. [["num", 10], ["op", "+"], ["ref", "A1"], ["func", "SUM"], ["range", "A1:B3"]]
+make a function called lex_formula takes s returns tokens
+  let tokens = []
+  let i = 0
+  while i < s.length do
+    let c = s[i]
+    let code = char_code(s, i)
+    if (code == 32) or (code == 9) or (code == 10) or (code == 13) then
+      # Skip whitespace
+      let i = i + 1
+    else
+      if (code == 43) or (code == 45) or (code == 42) or (code == 47) or (code == 40) or (code == 41) or (code == 58) then
+        # Operators and parens: + - * / ( ) :
+        let tokens = list_push(tokens, ["op", c])
+        let i = i + 1
+      else
+        if (code >= 48) and (code <= 57) then
+          # Number
+          let start = i
+          while (i < s.length) and (((char_code(s, i) >= 48) and (char_code(s, i) <= 57)) or (s[i] == ".")) do
+            let i = i + 1
+          end
+          let num_val = to_num(substr(s, start, i - start))
+          let tokens = list_push(tokens, ["num", num_val])
+        else
+          if ((code >= 65) and (code <= 90)) or ((code >= 97) and (code <= 122)) then
+            # Identifier (cell ref, function, or range)
+            let start = i
+            while (i < s.length) and (((char_code(s, i) >= 65) and (char_code(s, i) <= 90)) or ((char_code(s, i) >= 97) and (char_code(s, i) <= 122)) or ((char_code(s, i) >= 48) and (char_code(s, i) <= 57)) or (s[i] == ":")) do
+              let i = i + 1
+            end
+            let word = substr(s, start, i - start)
+            # Check if it contains a range colon
+            let is_range = false
+            let k = 0
+            while k < word.length do
+              if word[k] == ":" then
+                let is_range = true
+              end
+              let k = k + 1
+            end
+            if is_range then
+              let tokens = list_push(tokens, ["range", word])
+            else
+              if (word == "SUM") or (word == "AVERAGE") or (word == "sum") or (word == "average") then
+                let tokens = list_push(tokens, ["func", word])
+              else
+                let tokens = list_push(tokens, ["ref", word])
+              end
+            end
+          else
+            # Unknown character
+            let tokens = list_push(tokens, ["unknown", c])
+            let i = i + 1
+          end
+        end
+      end
+    end
+  end
+  return tokens
+end
+
+# eval_cell forward ref not needed
+
+# Function to parse ranges: "A1:B3" -> list of cell names
+make a function called expand_range takes range_str returns list
+  let colon_idx = -1
+  let k = 0
+  while k < range_str.length do
+    if range_str[k] == ":" then
+      let colon_idx = k
+    end
+    let k = k + 1
+  end
+  if colon_idx == -1 then
+    return [range_str]
+  end
+  let start_ref = substr(range_str, 0, colon_idx)
+  let end_ref = substr(range_str, colon_idx + 1, range_str.length - colon_idx - 1)
+  let start_coords = parse_cell_ref(start_ref)
+  let end_coords = parse_cell_ref(end_ref)
+  let sc = start_coords[0]
+  let sr = start_coords[1]
+  let ec = end_coords[0]
+  let er = end_coords[1]
+
+  # Normalize min/max
+  let min_c = sc
+  let max_c = ec
+  if sc > ec then
+    let min_c = ec
+    let max_c = sc
+  end
+  let min_r = sr
+  let max_r = er
+  if sr > er then
+    let min_r = er
+    let max_r = sr
+  end
+
+  let out = []
+  let c = min_c
+  while c <= max_c do
+    let r = min_r
+    while r <= max_r do
+      let out = list_push(out, format_cell_ref([c, r]))
+      let r = r + 1
+    end
+    let c = c + 1
+  end
+  return out
+end
+
+# Parser state helper object
+# Property "pos" tracks index in tokens list
+make a function called parse_factor takes tokens, state returns val
+  let pos = to_num(get(state, "pos"))
+  let tok = list_get(tokens, pos)
+  if tok == "" then
+    return 0
+  end
+  let type = tok[0]
+  let value = tok[1]
+
+  if type == "num" then
+    send(state, "set", "pos", pos + 1)
+    return value
+  end
+
+  if type == "ref" then
+    send(state, "set", "pos", pos + 1)
+    let cell_val = eval_cell(value)
+    let num_val = to_num(cell_val)
+    if (num_val == 0) and (cell_val != "0") and (cell_val != "0.0") then
+      return cell_val
+    end
+    return num_val
+  end
+
+  if type == "func" then
+    # e.g., SUM(A1:B3)
+    let func_name = value
+    send(state, "set", "pos", pos + 2) # Skip function name and '('
+    let range_tok = list_get(tokens, pos + 2)
+    let range_str = range_tok[1]
+    send(state, "set", "pos", pos + 4) # Skip range and ')'
+    
+    let cells = expand_range(range_str)
+    let sum = 0
+    let count = 0
+    let idx = 0
+    while idx < cells.length do
+      let cell_val = to_num(eval_cell(cells[idx]))
+      let sum = sum + cell_val
+      let count = count + 1
+      let idx = idx + 1
+    end
+    
+    if (func_name == "SUM") or (func_name == "sum") then
+      return sum
+    end
+    if (func_name == "AVERAGE") or (func_name == "average") then
+      if count == 0 then
+        return 0
+      end
+      return sum / count
+    end
+    return 0
+  end
+
+  if (type == "op") and (value == "(") then
+    send(state, "set", "pos", pos + 1)
+    let val = parse_expr(tokens, state)
+    send(state, "set", "pos", to_num(get(state, "pos")) + 1) # Skip ')'
+    return val
+  end
+
+  return 0
+end
+
+make a function called parse_term takes tokens, state returns val
+  let val = parse_factor(tokens, state)
+  let looping = true
+  while looping do
+    let pos = to_num(get(state, "pos"))
+    let tok = list_get(tokens, pos)
+    if tok == "" then
+      let looping = false
+    else
+      let type = tok[0]
+      let op = tok[1]
+      if (type == "op") and ((op == "*") or (op == "/")) then
+        send(state, "set", "pos", pos + 1)
+        let next_val = parse_factor(tokens, state)
+        if op == "*" then
+          let val = val * next_val
+        else
+          if next_val == 0 then
+            let val = "#DIV/0!"
+            let looping = false
+          else
+            let val = val / next_val
+          end
+        end
+      else
+        let looping = false
+      end
+    end
+  end
+  return val
+end
+
+make a function called parse_expr takes tokens, state returns val
+  let val = parse_term(tokens, state)
+  let looping = true
+  while looping do
+    let pos = to_num(get(state, "pos"))
+    let tok = list_get(tokens, pos)
+    if tok == "" then
+      let looping = false
+    else
+      let type = tok[0]
+      let op = tok[1]
+      if (type == "op") and ((op == "+") or (op == "-")) then
+        send(state, "set", "pos", pos + 1)
+        let next_val = parse_term(tokens, state)
+        if op == "+" then
+          let val = val + next_val
+        else
+          let val = val - next_val
+        end
+      else
+        let looping = false
+      end
+    end
+  end
+  return val
+end
+
+make a function called eval_formula takes s returns val
+  let tokens = lex_formula(s)
+  let state = new("ParseState", "pstate_" + now_ms())
+  send(state, "set", "pos", 0)
+  let val = parse_expr(tokens, state)
+  return val
+end
+
+# Evaluate cell with cycle detection and caching
+make a function called eval_cell takes cell_name returns val
+  let empty_val = get("cache", "__nonexistent_key_for_unit_comparison__")
+
+  # Check cache
+  let cached = get("cache", cell_name)
+  if (cached != "") and (cached != empty_val) then
+    return cached
+  end
+
+  # Check stack (cycle detection)
+  if get("stack", cell_name) == "1" then
+    return "#REF!"
+  end
+
+  # Mark stack
+  send("stack", "set", cell_name, "1")
+
+  let raw = get("sheet", cell_name)
+  let val = ""
+  if (raw == "") or (raw == empty_val) then
+    let val = 0
+  else
+    if raw[0] == "=" then
+      let val = eval_formula(substr(raw, 1, raw.length - 1))
+    else
+      # Check if it's a number
+      let val = to_num(raw)
+      if (val == 0) and (raw != "0") and (raw != "0.0") then
+        # String value
+        let val = raw
+      end
+    end
+  end
+
+  # Unmark stack
+  send("stack", "set", cell_name, "")
+
+  # Cache and return
+  send("cache", "set", cell_name, "" + val)
+  return val
+end
+
+# Export helper to convert current cells to a Markdown Table
+make a function called export_markdown takes max_col, max_row returns md
+  let b = sb_new()
+  
+  # Headers
+  sb_push(b, "| ")
+  let c = 0
+  while c <= max_col do
+    sb_push(b, chr(65 + c) + " | ")
+    let c = c + 1
+  end
+  sb_push(b, nl() + "|")
+  let c = 0
+  while c <= max_col do
+    sb_push(b, "---|")
+    let c = c + 1
+  end
+  sb_push(b, nl())
+
+  # Rows
+  let r = 0
+  while r <= max_row do
+    sb_push(b, "| ")
+    let c = 0
+    while c <= max_col do
+      let cell = format_cell_ref([c, r])
+      let val = get("cache", cell)
+      sb_push(b, val + " | ")
+      let c = c + 1
+    end
+    sb_push(b, nl())
+    let r = r + 1
+  end
+  return sb_str(b)
+end
+
+# Main entry point for stdin processing
+# Reads JSON representation of the cell inputs:
+# { "cells": { "A1": "10", "B1": "=A1+5" }, "max_col": 5, "max_row": 10 }
+# Evaluates and prints JSON output of cached values:
+# { "values": { "A1": "10", "B1": "15" }, "markdown": "...md..." }
+make a function called run_spreadsheet returns done
+  let args_list = argv()
+  let input = ""
+  if args_list.length > 0 then
+    let input = list_get(args_list, 0)
+  end
+  if input == "" then
+    let input = read_line()
+  end
+  if input == "" then
+    return false
+  end
+  
+  clear_sheet()
+  
+  let root = json_parse(input)
+  let cells_obj = json_get(root, "cells")
+  let cells_pairs = cells_obj[1]
+  
+  # Load cell definitions into the sheet object
+  let i = 0
+  while i < cells_pairs.length do
+    let pair = cells_pairs[i]
+    let name = pair[0]
+    let val_node = pair[1]
+    let val = json_str(val_node)
+    send("sheet", "set", name, val)
+    let i = i + 1
+  end
+  
+  # Trigger evaluation for all defined cells
+  let values_b = sb_new()
+  sb_push(values_b, "{")
+  let first = true
+  let i = 0
+  while i < cells_pairs.length do
+    let pair = cells_pairs[i]
+    let name = pair[0]
+    let val = eval_cell(name)
+    if not first then
+      sb_push(values_b, ", ")
+    end
+    let first = false
+    sb_push(values_b, json_quote(name) + ": " + json_quote("" + val))
+    let i = i + 1
+  end
+  sb_push(values_b, "}")
+  
+  let max_col = json_num(json_get(root, "max_col"))
+  let max_row = json_num(json_get(root, "max_row"))
+  let md_table = export_markdown(max_col, max_row)
+  
+  print("{ \"values\": " + sb_str(values_b) + ", \"markdown\": " + json_quote(md_table) + " }")
+  return true
+end
+
+run_spreadsheet()
+

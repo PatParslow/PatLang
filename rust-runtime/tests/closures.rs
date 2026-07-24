@@ -13,11 +13,11 @@ thread_local! {
 fn capture_print(args: &[Value]) -> Result<Value, String> {
     let s = match args.get(0) {
         Some(Value::String(s)) => s.clone(),
-        Some(v @ (Value::Int(_)|Value::Float(_)|Value::BigInt(_)|Value::Rational(_,_))) => patlang_runtime::ir::ops::v_to_string(v),
-        Some(Value::Bool(b)) => b.to_string(),
-        _ => String::new(),
+        Some(v @ (Value::Int(_)|Value::Float(_)|Value::BigInt(_)|Value::Rational(_,_))) => patlang_runtime::ir::ops::v_to_string(v).into(),
+        Some(Value::Bool(b)) => b.to_string().into(),
+        _ => String::new().into(),
     };
-    PRINTED.with(|p| p.borrow_mut().push(s));
+    PRINTED.with(|p| p.borrow_mut().push(s.to_string()));
     Ok(Value::Unit)
 }
 

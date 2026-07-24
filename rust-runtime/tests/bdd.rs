@@ -144,19 +144,20 @@ fn given_value_module(world: &mut PatWorld, which: String) {
         set.insert(ChunkId::NumericTower);
     }
     let prelude = RustCodegen::prelude_for(&set);
-    // `prelude_for` always includes PRELUDE_CORE's own `fn main` (which
-    // calls `build_program()`, only defined by the real codegen pipeline for
-    // an actual compiled program) -- replace that literal, known main body
-    // with a probe that just reports `size_of::<Value>()` instead of
-    // appending a second `main` (which wouldn't compile) or trying to
-    // provide a fake `build_program()`.
-    let real_main = "#[cfg(not(target_arch = \"wasm32\"))]\nfn main(){\n    let child = std::thread::Builder::new()\n        .stack_size(256 * 1024 * 1024)\n        .spawn(|| {\n            let program = build_program();\n            match run(&program) {\n                Ok(v) => { println!(\"{}\", display_value(&v)); 0 }\n                Err(e) => { eprintln!(\"IR runtime error: {}\", e); 1 }\n            }\n        })\n        .expect(\"failed to spawn worker thread\");\n    let code = child.join().unwrap_or(1);\n    std::process::exit(code);\n}\n";
+    // `main()` used to live statically inside PRELUDE_CORE's text (and this
+    // test replaced its literal body with a probe); it now lives only in
+    // the per-program text `emit_rust` generates (see the patlang-patc-
+    // prelude-chunk-linking-investigation memory -- `main()` calls
+    // `build_program()`/`call_dispatch`, both genuinely per-program, so it
+    // can no longer be part of the shared prelude text once that's meant to
+    // be precompiled once and reused). `prelude_for`'s output now has NO
+    // `main()` at all, so the probe is simply appended, not swapped in.
     let probe_main = "fn main() { println!(\"{}\", std::mem::size_of::<Value>()); }\n";
     assert!(
-        prelude.contains(real_main),
-        "PRELUDE_CORE's main() text changed shape -- update the literal match in given_value_module"
+        !prelude.contains("fn main("),
+        "prelude_for's output unexpectedly contains a main() again -- update given_value_module, which now appends its own probe main() assuming there isn't one already"
     );
-    world.source = prelude.replacen(real_main, probe_main, 1);
+    world.source = prelude + probe_main;
 }
 
 #[given(regex = r#"^the self-hosted test suite "([a-z_]+)"$"#)]

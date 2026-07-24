@@ -32,7 +32,21 @@ pub enum Value {
     // Real/imaginary parts are each Int|Float|BigInt|Rational (never Complex
     // or a non-numeric kind); enforced by construction sites, not the type.
     Complex(Box<Value>, Box<Value>),
-    String(String),
+    // Arc-wrapped for exactly the same reason Value::List is (see its
+    // own comment just below, written first): reading a string-valued
+    // LOCAL VARIABLE clones the Value on every single read (interpreter.
+    // rs's `Instr::LoadLocal` does `locals.get(name).cloned()`) -- before
+    // this fix, that was a full O(n) String deep-copy, turning any per-
+    // character scanning loop (a lexer/tokenizer, the single most common
+    // thing to write over a large string) into O(n^2). Confirmed via a
+    // 1.2MB real site-content fragment (found while porting the Parslow
+    // site builder to PatLang) that never finished tokenizing; a 200K-
+    // char isolated per-character scan took 5.4s before this fix (should
+    // be near-instant). Same fix shape as List: Arc clone is an O(1)
+    // refcount bump; Arc::make_mut only deep-copies if some OTHER live
+    // reference still shares this Arc, which is the uncommon case for a
+    // local reassigned in a loop.
+    String(Arc<String>),
     // Arc-wrapped (not a bare Vec<Value>) so cloning a list -- which
     // happens on every read of a list-valued variable in this tree-
     // walking interpreter, not just explicit list_push/list_set calls

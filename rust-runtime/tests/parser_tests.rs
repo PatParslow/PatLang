@@ -1,6 +1,5 @@
 //! Tests for Patlang Rust parser and lexer
 
-use patlang_runtime::lexer::{Lexer, Token};
 use patlang_runtime::parser::{Parser, ParserError};
 use patlang_runtime::ast::Stmt;
 

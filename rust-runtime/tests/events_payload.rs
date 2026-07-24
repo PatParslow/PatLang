@@ -31,7 +31,7 @@ emit("foo", "P")
     let program = lower.lower_program_basic(&ast);
 
     // Create an interpreter and register minimal hosts including print to capture output
-    let mut interp = Interpreter::new();
+    let interp = Interpreter::new();
     // For this smoke test, override the synthesized handler to echo event_data param
     // Find handler function name
     let handler_name = program.event_handlers.get("foo").unwrap()[0].clone();

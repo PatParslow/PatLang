@@ -18,7 +18,7 @@ fn run_regex_match(pattern: &str, text: &str, start: f64) -> f64 {
     // builds; use the public re-export path instead.
     let mut interp = interp;
     patlang_runtime::ir::hosts::register_stage0_shims(&mut interp);
-    let args = vec![Value::String(pattern.to_string()), Value::String(text.to_string()), Value::Int(start as i64)];
+    let args = vec![Value::String(pattern.to_string().into()), Value::String(text.to_string().into()), Value::Int(start as i64)];
     let v = interp.call_function(&program, "regex_match_string_at", &args).expect("call regex_match_string_at");
     v.as_number().unwrap_or_else(|_| panic!("expected Number, got {:?}", v))
 }

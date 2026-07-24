@@ -4,7 +4,7 @@
 use patlang_runtime::ir::hosts::{host_action_add, host_contract_check, host_plan, host_rule_add, host_solve, reset_world};
 use patlang_runtime::ir::types::Value;
 
-fn s(x: &str) -> Value { Value::String(x.to_string()) }
+fn s(x: &str) -> Value { Value::String(x.to_string().into()) }
 fn list(xs: Vec<Value>) -> Value { Value::List(std::sync::Arc::new(xs)) }
 fn pair(pred: &str, args: Vec<Value>) -> Value { list(vec![s(pred), list(args)]) }
 
@@ -46,7 +46,7 @@ fn a1_backtracking_returns_all_matching_facts() {
         Value::List(xs) => {
             assert_eq!(xs.len(), 2, "should backtrack across both matching facts, not stop at the first");
             let bound: Vec<String> = xs.iter().map(|sol| match sol {
-                Value::List(pair) => match &pair[1] { Value::String(v) => v.clone(), _ => panic!() },
+                Value::List(pair) => match &pair[1] { Value::String(v) => v.as_ref().clone(), _ => panic!() },
                 _ => panic!(),
             }).collect();
             assert!(bound.contains(&"bob".to_string()));
@@ -77,7 +77,7 @@ fn a2_goap_plan_prefers_cheaper_multistep_over_pricier_direct_path() {
     let result = host_plan(&[list(vec![pair("shipped", vec![])])]).unwrap();
     match result {
         Value::List(steps) => {
-            let names: Vec<String> = steps.iter().map(|v| match v { Value::String(s) => s.clone(), _ => panic!() }).collect();
+            let names: Vec<String> = steps.iter().map(|v| match v { Value::String(s) => s.as_ref().clone(), _ => panic!() }).collect();
             assert_eq!(names, vec!["compile_b", "compile_a", "link"], "should pick the cost-10 path, not the cost-105 shortcut");
         }
         _ => panic!("expected List"),
@@ -97,7 +97,7 @@ fn a2_parameterized_action_grounds_against_each_matching_fact() {
     let result = host_plan(&[list(vec![pair("built", vec![s("a")]), pair("built", vec![s("b")])])]).unwrap();
     match result {
         Value::List(steps) => {
-            let names: Vec<String> = steps.iter().map(|v| match v { Value::String(s) => s.clone(), _ => panic!() }).collect();
+            let names: Vec<String> = steps.iter().map(|v| match v { Value::String(s) => s.as_ref().clone(), _ => panic!() }).collect();
             assert_eq!(names.len(), 2, "should take exactly two build(X) steps to reach both goal facts");
             assert!(names.contains(&"build(X=a)".to_string()), "step names: {:?}", names);
             assert!(names.contains(&"build(X=b)".to_string()), "step names: {:?}", names);
@@ -120,7 +120,7 @@ fn a2_parameterized_action_binds_shared_variable_across_two_preconds() {
     let result = host_plan(&[list(vec![pair("built", vec![s("target")])])]).unwrap();
     match result {
         Value::List(steps) => {
-            let names: Vec<String> = steps.iter().map(|v| match v { Value::String(s) => s.clone(), _ => panic!() }).collect();
+            let names: Vec<String> = steps.iter().map(|v| match v { Value::String(s) => s.as_ref().clone(), _ => panic!() }).collect();
             assert_eq!(names, vec!["build(X=target,Y=base)"], "step names: {:?}", names);
         }
         _ => panic!("expected List"),

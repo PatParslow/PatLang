@@ -8,7 +8,7 @@ use std::sync::Mutex;
 // touch it to avoid cross-test interference.
 static OO_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-fn s(x: &str) -> Value { Value::String(x.to_string()) }
+fn s(x: &str) -> Value { Value::String(x.to_string().into()) }
 
 #[test]
 fn new_send_set_get_roundtrip() {

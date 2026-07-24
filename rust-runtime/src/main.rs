@@ -58,6 +58,28 @@ fn main() {
 
 fn real_main() {
     let args: Vec<String> = env::args().collect();
+    // --dump-chunk NAME OUTFILE: exploratory dev tool for the prelude
+    // chunk-precompile-and-link investigation (2026-07-24) -- writes a
+    // named PRELUDE_* chunk's raw Rust text to a file, so the rlib-
+    // linking mechanism can be prototyped in a shell without touching
+    // rust-runtime again per iteration. Not part of the ordinary CLI
+    // surface; remove once the chunk-linking work either lands or is
+    // shelved.
+    if args.len() >= 4 && args[1] == "--dump-chunk" {
+        let name = &args[2];
+        let outfile = &args[3];
+        match RustCodegen::chunk_text_by_name(name) {
+            Some(text) => {
+                fs::write(outfile, text).expect("write chunk dump");
+                println!("wrote {} ({})", outfile, name);
+            }
+            None => {
+                eprintln!("unknown chunk: {}", name);
+                process::exit(1);
+            }
+        }
+        return;
+    }
     // Modes:
     //   --ir-run <file.pat>
     //   --emit-rust <file.pat> [--out <file.rs>]
@@ -146,7 +168,41 @@ fn real_main() {
     let mut lower = Lowerer::new();
     let program = lower.lower_program_basic(&ast);
 
-    if mode == "emit-rust" || mode == "build-run" || mode == "compare" || mode == "patc" {
+    if mode == "patc" {
+        // Route ordinary `--patc` compiles through the chunk-precompile-
+        // and-link mechanism (Stage 40) instead of `emit_rust`'s single
+        // monolithic ~2.5MB prelude-concatenation + one-shot rustc call --
+        // this is the actual repeated-compile cost the chunking work was
+        // built to eliminate (each ordinary small-program compile no
+        // longer re-parses/re-`-O`-optimizes the byte-identical prelude
+        // text from scratch; only chunks whose SOURCE actually changed,
+        // or that haven't been built for the active base variant yet,
+        // get rebuilt -- see ensure_chunk_rlib's fingerprint cache).
+        let cg = RustCodegen::new();
+        let program_src = cg.emit_rust_chunked(&program);
+        let chunks: Vec<String> = RustCodegen::required_chunks(&program).iter().map(|c| c.name().to_string()).collect();
+        let in_path = std::path::Path::new(filename);
+        let stem = in_path.file_stem().and_then(|s| s.to_str()).unwrap_or("a");
+        let parent = in_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let mut default_out = parent.join(stem);
+        if cfg!(windows) { default_out.set_extension("exe"); }
+        let dest = out_file.map(std::path::PathBuf::from).unwrap_or(default_out);
+        if let Some(p) = dest.parent() { let _ = std::fs::create_dir_all(p); }
+        eprintln!("[patc] Compiling via chunked rlib cache (chunks: {:?}) -> {}", chunks, dest.display());
+        match patlang_runtime::ir::codegen::build_chunked_native(&program_src, &chunks, dest.to_str().unwrap_or("a.exe")) {
+            Ok(exe) => {
+                let abs = std::fs::canonicalize(&exe).unwrap_or(std::path::PathBuf::from(&exe));
+                println!("Wrote {}", abs.display());
+                return;
+            }
+            Err(e) => {
+                eprintln!("[patc] chunked build failed: {}", e);
+                process::exit(1);
+            }
+        }
+    }
+
+    if mode == "emit-rust" || mode == "build-run" || mode == "compare" {
         let cg = RustCodegen::new();
         let rust_src = cg.emit_rust(&program);
         if mode == "emit-rust" {
@@ -253,7 +309,7 @@ fn real_main() {
                         interp.host.insert("get", |args| {
                             if args.len() != 2 { return Err("expected 2 args".into()); }
                             let key = match &args[1] { Value::String(s) => s.clone(), _ => return Err("expected string key".into()) };
-                            match &args[0] { Value::Object(map) => Ok(map.get(&key).cloned().unwrap_or(Value::Unit)), _ => Ok(Value::Unit), }
+                            match &args[0] { Value::Object(map) => Ok(map.get(key.as_str()).cloned().unwrap_or(Value::Unit)), _ => Ok(Value::Unit), }
                         });
                         register_stage0_shims(&mut interp);
                         interp.run(&program).unwrap_or(Value::Unit)
@@ -323,7 +379,7 @@ fn real_main() {
         let obj = &args[0];
         let key = match &args[1] { Value::String(s) => s.clone(), _ => return Err("expected string key".into()) };
         match obj {
-            Value::Object(map) => Ok(map.get(&key).cloned().unwrap_or(Value::Unit)),
+            Value::Object(map) => Ok(map.get(key.as_str()).cloned().unwrap_or(Value::Unit)),
             _ => Ok(Value::Unit),
         }
     });
@@ -384,7 +440,7 @@ fn ir_host_print_ret(args: &[Value]) -> Result<Value, String> {
         String::new()
     };
     println!("{}", s);
-    Ok(Value::String(s))
+    Ok(Value::String(s.into()))
 }
 
 fn ir_host_sed(args: &[Value]) -> Result<Value, String> {
@@ -397,7 +453,7 @@ fn ir_host_sed(args: &[Value]) -> Result<Value, String> {
         None => "",
     };
     let out = sed_command(cmd, input);
-    Ok(Value::String(out))
+    Ok(Value::String(out.into()))
 }
 
 fn sed_command(cmd: &str, input: &str) -> String {

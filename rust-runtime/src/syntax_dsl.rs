@@ -76,8 +76,8 @@ impl RegexEngine {
     /// `None` if the pattern does not match there.
     pub fn match_at(&self, pattern: &str, text: &str, start: usize) -> Result<Option<usize>, String> {
         let args = [
-            Value::String(pattern.to_string()),
-            Value::String(text.to_string()),
+            Value::String((pattern.to_string()).into()),
+            Value::String((text.to_string()).into()),
             Value::Int(start as i64),
         ];
         match self.interp.call_function(&self.program, "regex_match_string_at", &args)? {

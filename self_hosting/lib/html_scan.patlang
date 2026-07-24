@@ -1,0 +1,808 @@
+# Minimal HTML token-list model: enough to support the Parslow site
+# builder's actual needs (find tags by name, read/edit attributes,
+# rename a tag, extract plain text, re-serialize) WITHOUT a full DOM
+# tree. Not a general HTML parser -- assumes well-formed, hand-written
+# or previously-generated markup (double-quoted attributes, correctly
+# nested tags), matching every real fragment in this site's content/
+# tree. Tokens: ["text", s] | ["open", name, attrs] | ["close", name] |
+# ["void", name, attrs] (self-closing/no-close-tag elements). attrs is
+# a list of [key, value] pairs, value already entity-decoded for the
+# few escapes that appear in real attribute values here (&amp; &quot;).
+
+include "json.patlang"
+
+make a function called html_void_tags returns names
+  return ["br", "img", "hr", "meta", "link", "input", "col", "area", "base", "embed", "source", "track", "wbr"]
+end
+
+make a function called html_name_in_list takes names, name returns yes
+  let i = 0
+  while i < names.length do
+    if names[i] == name then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called html_is_name_char takes c returns yes
+  let code = char_code(c, 0)
+  if (code >= 97) and (code <= 122) then
+    return true
+  end
+  if (code >= 65) and (code <= 90) then
+    return true
+  end
+  if (code >= 48) and (code <= 57) then
+    return true
+  end
+  if c == "-" then
+    return true
+  end
+  return false
+end
+
+# All of html_lower/html_trim/html_unescape below intern `s` once and
+# scan via sc_code/sc_char rather than char_code(s,i)/s[i] -- see the
+# patlang-ascii-fastpath-cache-fix memory: char_code/list_get's own
+# "ASCII fast path" calls str::is_ascii() FRESH on every single call
+# (an O(n) full-string scan, not cached), turning any per-character loop
+# over these into O(n^2). str_intern caches is_ascii ONCE; sc_code/
+# sc_char just read the cached flag. These functions are general-purpose
+# utilities that can be called on whole-document-sized strings (that's
+# literally how this bug was originally found), not just short fragments.
+make a function called html_lower takes s returns out
+  let b = sb_new()
+  let i = 0
+  let hid = str_intern(s)
+  let n = sc_len(hid)
+  while i < n do
+    let code = sc_code(hid, i)
+    if (code >= 65) and (code <= 90) then
+      sb_push(b, chr(code + 32))
+    else
+      sb_push(b, sc_char(hid, i))
+    end
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+make a function called html_trim takes s returns out
+  let hid = str_intern(s)
+  let n = sc_len(hid)
+  let a = 0
+  while (a < n) and ((sc_code(hid, a) == 32) or (sc_code(hid, a) == 9) or (sc_code(hid, a) == 10) or (sc_code(hid, a) == 13)) do
+    let a = a + 1
+  end
+  let z = n
+  while (z > a) and ((sc_code(hid, z - 1) == 32) or (sc_code(hid, z - 1) == 9) or (sc_code(hid, z - 1) == 10) or (sc_code(hid, z - 1) == 13)) do
+    let z = z - 1
+  end
+  return substr(s, a, z - a)
+end
+
+# Covers the entities that actually appear in this site's content
+# (named dashes/quotes/nbsp plus the four XML-standard ones, and
+# numeric character references &#NNN;/&#xHEX;) -- not the full HTML5
+# named-entity table, which is enormous and unnecessary for hand-
+# written article prose.
+# REAL PERFORMANCE BUG FOUND AND FIXED HERE: the original version
+# called `substr(s, i, K)` up to 8 TIMES at every single character
+# position, regardless of whether that character had anything to do
+# with an entity -- for real article prose, where a literal `&` is
+# rare, that meant paying for 6-8 host-function calls (each with a
+# real per-call constant cost, confirmed via isolated testing: 500K
+# calls of a single host function took ~20s even AFTER the Value::
+# String Arc-wrap fix removed the O(n) clone-per-call cost) on every
+# ordinary character. A synthetic 500K-character string with ZERO
+# entities anywhere in it still never finished within 30 seconds
+# under the OLD version, compiled -- confirming the cost scaled with
+# character count times host-call count, not with entity count. Fixed
+# by gating the whole substr cascade behind a single cheap char_code
+# check for '&' (ASCII 38) first -- the substr comparisons (and their
+# cost) now only ever run at an ACTUAL '&', which is rare relative to
+# total text length in real prose.
+make a function called html_unescape takes s returns out
+  let b = sb_new()
+  let i = 0
+  let hid = str_intern(s)
+  let n = sc_len(hid)
+  while i < n do
+    let c0 = sc_code(hid, i)
+    if c0 != 38 then
+      sb_push(b, sc_char(hid, i))
+      let i = i + 1
+    else
+    if substr(s, i, 5) == "&amp;" then
+      sb_push(b, "&")
+      let i = i + 5
+    else
+      if substr(s, i, 6) == "&quot;" then
+        sb_push(b, "\"")
+        let i = i + 6
+      else
+        if substr(s, i, 4) == "&lt;" then
+          sb_push(b, "<")
+          let i = i + 4
+        else
+          if substr(s, i, 4) == "&gt;" then
+            sb_push(b, ">")
+            let i = i + 4
+          else
+            if substr(s, i, 7) == "&mdash;" then
+              sb_push(b, chr(8212))
+              let i = i + 7
+            else
+              if substr(s, i, 7) == "&ndash;" then
+                sb_push(b, chr(8211))
+                let i = i + 7
+              else
+                if substr(s, i, 6) == "&nbsp;" then
+                  sb_push(b, chr(160))
+                  let i = i + 6
+                else
+                  if substr(s, i, 6) == "&apos;" then
+                    sb_push(b, "'")
+                    let i = i + 6
+                  else
+                    if substr(s, i, 5) == "&#39;" then
+                      sb_push(b, "'")
+                      let i = i + 5
+                    else
+                      if (substr(s, i, 2) == "&#") and (i + 2 < n) then
+                        let j = i + 2
+                        let is_hex = false
+                        if (j < n) and ((sc_code(hid, j) == 120) or (sc_code(hid, j) == 88)) then
+                          let is_hex = true
+                          let j = j + 1
+                        end
+                        let digit_start = j
+                        while (j < n) and (sc_code(hid, j) != 59) do
+                          let j = j + 1
+                        end
+                        if (j < n) and (j > digit_start) then
+                          let digits = substr(s, digit_start, j - digit_start)
+                          let code = 0
+                          if is_hex then
+                            let code = json_hex_to_num(digits)
+                          else
+                            let code = to_num(digits)
+                          end
+                          sb_push(b, chr(code))
+                          let i = j + 1
+                        else
+                          sb_push(b, sc_char(hid, i))
+                          let i = i + 1
+                        end
+                      else
+                        sb_push(b, sc_char(hid, i))
+                        let i = i + 1
+                      end
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+    end
+  end
+  return sb_str(b)
+end
+
+# Parses the attribute text between a tag's name and its closing '>'
+# (or the '/' before a self-closing '>'). Handles `key="value"`,
+# `key='value'`, and bare boolean attrs (`hidden`).
+make a function called html_parse_attrs takes s returns attrs
+  let attrs = []
+  let i = 0
+  let n = s.length
+  while i < n do
+    while (i < n) and (not html_is_name_char(s[i])) do
+      let i = i + 1
+    end
+    if i >= n then
+      return attrs
+    end
+    let key_start = i
+    while (i < n) and html_is_name_char(s[i]) do
+      let i = i + 1
+    end
+    let key = substr(s, key_start, i - key_start)
+    while (i < n) and (s[i] == " ") do
+      let i = i + 1
+    end
+    if (i < n) and (s[i] == "=") then
+      let i = i + 1
+      while (i < n) and (s[i] == " ") do
+        let i = i + 1
+      end
+      if (i < n) and ((s[i] == "\"") or (s[i] == "'")) then
+        let quote = s[i]
+        let i = i + 1
+        let val_start = i
+        while (i < n) and (s[i] != quote) do
+          let i = i + 1
+        end
+        let value = html_unescape(substr(s, val_start, i - val_start))
+        let attrs = list_push(attrs, [key, value])
+        let i = i + 1
+      end
+    else
+      let attrs = list_push(attrs, [key, ""])
+    end
+  end
+  return attrs
+end
+
+# extract_raw_blocks(html) -> [stripped_html, blocks]
+#
+# Pulls the CONTENT of every <script>...</script> and <style>...</style>
+# element out of `html` BEFORE any tokenizing/processing happens, and
+# replaces it with a short opaque placeholder marker, leaving the
+# surrounding tags intact. `blocks` is a list of [placeholder, real_
+# content] pairs to splice back in later via splice_raw_blocks, once
+# all HTML-level processing (tokenize, heading-id assignment, citation
+# renumbering, internal-link rewriting, head_extras' contains_substr
+# checks, etc.) is done.
+#
+# Why this exists (architectural fix, not another point patch): this
+# session found the SAME bug shape four separate times in four separate
+# functions, each only exposed by a page with an unusually large
+# embedded <script>/WASM blob -- html_tokenize's own scan, its <script>-
+# closing-tag search, contains_substr in head_extras, and (very likely,
+# not yet root-caused) whatever patlang-ide.html hits for its 198-second
+# outlier. Patching each call site as it's discovered doesn't scale --
+# every future function that scans page text is exposed to the same
+# risk. Extracting large opaque blobs upfront means NOTHING downstream
+# ever has to scan them at all: every stage of the pipeline operates on
+# a document that's back to its real (small) visible-content size,
+# regardless of how large the embedded payload is. See the
+# patlang-site-wide-perf-scaling-investigation memory for the full
+# chain of findings this fixes at the root instead of chasing further.
+make a function called extract_raw_blocks takes html returns result
+  let hid = str_intern(html)
+  let n = sc_len(hid)
+  let out = sb_new()
+  let blocks = vec_new()
+  let block_n = 0
+  let i = 0
+  let text_start = 0
+  while i < n do
+    if sc_code(hid, i) == 60 then
+      let close_gt = i
+      let in_quote = 0
+      let j = i + 1
+      while (j < n) and (not ((sc_code(hid, j) == 62) and (in_quote == 0))) do
+        if in_quote == 0 then
+          if (sc_code(hid, j) == 34) or (sc_code(hid, j) == 39) then
+            let in_quote = sc_code(hid, j)
+          end
+        else
+          if sc_code(hid, j) == in_quote then
+            let in_quote = 0
+          end
+        end
+        let j = j + 1
+      end
+      let close_gt = j
+      let inner = substr(html, i + 1, close_gt - (i + 1))
+      let is_tag = (inner.length > 0) and (inner[0] != "/") and (inner[inner.length - 1] != "/")
+      let name_end = 0
+      while is_tag and (name_end < inner.length) and html_is_name_char(inner[name_end]) do
+        let name_end = name_end + 1
+      end
+      let lname = html_lower(substr(inner, 0, name_end))
+      if is_tag and ((lname == "script") or (lname == "style")) then
+        let end_tag = "</" + lname
+        let end_len = end_tag.length
+        let end_codes = vec_new()
+        let ec_i = 0
+        while ec_i < end_len do
+          vec_push(end_codes, char_code(end_tag, ec_i))
+          let ec_i = ec_i + 1
+        end
+        let raw_start = close_gt + 1
+        let k = raw_start
+        let found = false
+        while (k < n) and (not found) do
+          let matches = true
+          let mi = 0
+          while matches and (mi < end_len) do
+            let code = sc_code(hid, k + mi)
+            if (code >= 65) and (code <= 90) then
+              let code = code + 32
+            end
+            if code != vec_get(end_codes, mi) then
+              let matches = false
+            end
+            let mi = mi + 1
+          end
+          if matches then
+            let found = true
+          else
+            let k = k + 1
+          end
+        end
+        if found then
+          let m = k + end_len
+          while (m < n) and (sc_code(hid, m) != 62) do
+            let m = m + 1
+          end
+          sb_push(out, substr(html, text_start, close_gt + 1 - text_start))
+          if k > raw_start then
+            let placeholder = "@@PATLANG_BLOB_" + block_n + "@@"
+            vec_push(blocks, [placeholder, substr(html, raw_start, k - raw_start)])
+            sb_push(out, placeholder)
+            let block_n = block_n + 1
+          end
+          sb_push(out, substr(html, k, m + 1 - k))
+          let i = m + 1
+          let text_start = i
+        else
+          let i = close_gt + 1
+        end
+      else
+        let i = close_gt + 1
+      end
+    else
+      let i = i + 1
+    end
+  end
+  if n > text_start then
+    sb_push(out, substr(html, text_start, n - text_start))
+  end
+  return [sb_str(out), vec_to_list(blocks)]
+end
+
+# splice_raw_blocks(html, blocks) -> html with each placeholder replaced
+# by its real stored content (single forward scan; `blocks` is always a
+# handful of entries per page, so this is cheap regardless of how large
+# the real content being spliced back in is).
+make a function called splice_raw_blocks takes html, blocks returns out
+  let result = html
+  let bi = 0
+  while bi < blocks.length do
+    let placeholder = blocks[bi][0]
+    let content = blocks[bi][1]
+    let hid = str_intern(result)
+    let n = sc_len(hid)
+    let plen = placeholder.length
+    let pcodes = vec_new()
+    let pc_i = 0
+    while pc_i < plen do
+      vec_push(pcodes, char_code(placeholder, pc_i))
+      let pc_i = pc_i + 1
+    end
+    let out = sb_new()
+    let i = 0
+    let found_at = -1
+    while (i <= n - plen) and (found_at == -1) do
+      let matches = true
+      let mi = 0
+      while matches and (mi < plen) do
+        if sc_code(hid, i + mi) != vec_get(pcodes, mi) then
+          let matches = false
+        end
+        let mi = mi + 1
+      end
+      if matches then
+        let found_at = i
+      else
+        let i = i + 1
+      end
+    end
+    if found_at >= 0 then
+      sb_push(out, substr(result, 0, found_at))
+      sb_push(out, content)
+      sb_push(out, substr(result, found_at + plen, n - (found_at + plen)))
+      let result = sb_str(out)
+    end
+    let bi = bi + 1
+  end
+  return result
+end
+
+make a function called html_tokenize takes html returns tokens
+  # tokbuf is a vec_* handle, not a plain list: list_push deep-clones the
+  # whole token list on every single call (Arc::make_mut can never find it
+  # uniquely-owned because the caller's own read of `tokens` keeps a live
+  # reference alive for the whole call) -- O(n) per push, O(n^2) to tokenize
+  # one document. vec_push mutates a real Vec behind an opaque handle, no
+  # aliasing possible, true O(1) amortized. See patlang-perf-ladder-findings
+  # memory: list_push(300000) measured at ~29 minutes vs vec_push's 123ms.
+  let tokbuf = vec_new()
+  # hid is an interned-string handle: sc_code(hid, i) is genuinely O(1) per
+  # call (is_ascii is cached once at intern time -- see hosts.rs/codegen.rs
+  # ISTRINGS). Plain `html[i]` indexing lowers to list_get, whose own
+  # ASCII-fastpath check re-scans the WHOLE string on every single call
+  # (str::is_ascii() is O(n), not O(1)) -- fine once, catastrophic in a
+  # per-character loop over a multi-megabyte document. Measured: 62.6s for
+  # a 1.2MB real article via raw indexing vs milliseconds via sc_code.
+  let hid = str_intern(html)
+  let n = sc_len(hid)
+  let i = 0
+  let text_start = 0
+  while i < n do
+    if sc_code(hid, i) == 60 then
+      if i > text_start then
+        vec_push(tokbuf, ["text", substr(html, text_start, i - text_start)])
+      end
+      let close_gt = i
+      let in_quote = 0
+      let j = i + 1
+      while (j < n) and (not ((sc_code(hid, j) == 62) and (in_quote == 0))) do
+        if in_quote == 0 then
+          if (sc_code(hid, j) == 34) or (sc_code(hid, j) == 39) then
+            let in_quote = sc_code(hid, j)
+          end
+        else
+          if sc_code(hid, j) == in_quote then
+            let in_quote = 0
+          end
+        end
+        let j = j + 1
+      end
+      let close_gt = j
+      let inner = substr(html, i + 1, close_gt - (i + 1))
+      let is_close = false
+      let is_void_slash = false
+      if inner.length > 0 then
+        if inner[0] == "/" then
+          let is_close = true
+          let inner = substr(inner, 1, inner.length - 1)
+        end
+        if inner[inner.length - 1] == "/" then
+          let is_void_slash = true
+          let inner = substr(inner, 0, inner.length - 1)
+        end
+      end
+      let name_end = 0
+      while (name_end < inner.length) and html_is_name_char(inner[name_end]) do
+        let name_end = name_end + 1
+      end
+      let name = substr(inner, 0, name_end)
+      let lname = html_lower(name)
+      let rest = substr(inner, name_end, inner.length - name_end)
+      if is_close then
+        vec_push(tokbuf, ["close", lname])
+        let i = close_gt + 1
+        let text_start = i
+      else
+        let attrs = html_parse_attrs(rest)
+        if is_void_slash or html_name_in_list(html_void_tags(), lname) then
+          vec_push(tokbuf, ["void", lname, attrs])
+          let i = close_gt + 1
+          let text_start = i
+        else
+          vec_push(tokbuf, ["open", lname, attrs])
+          if (lname == "script") or (lname == "style") then
+            # Raw-text elements: per HTML parsing rules, everything up to
+            # the matching literal closing tag is opaque text, not markup --
+            # a naive `<`/`>` scan here would tokenize JS/CSS comparison
+            # operators (e.g. `i < bin.length`) as real tag delimiters and
+            # corrupt the content. Scan for the literal "</name" case-
+            # insensitively instead of resuming normal tag scanning.
+            let raw_start = close_gt + 1
+            let end_tag = "</" + lname
+            let end_len = end_tag.length
+            # Precompute the target char codes ONCE (end_tag is short --
+            # ordinary char_code is fine here). The k-loop below must NOT
+            # call substr/html_lower per position: <script> content can be
+            # (and in real pages, is) hundreds of KB, and substr's own
+            # is_ascii() check rescans the WHOLE document on every call --
+            # that reintroduced the exact O(n^2) bug this file already got
+            # fixed once (see patlang-ascii-fastpath-cache-fix memory: a
+            # real 1.2MB article's lone <script> block was 1.25M chars,
+            # turning this search alone into ~53s).
+            let end_codes = vec_new()
+            let ec_i = 0
+            while ec_i < end_len do
+              vec_push(end_codes, char_code(end_tag, ec_i))
+              let ec_i = ec_i + 1
+            end
+            let k = raw_start
+            let found = false
+            while (k < n) and (not found) do
+              let matches = true
+              let mi = 0
+              while matches and (mi < end_len) do
+                let code = sc_code(hid, k + mi)
+                if (code >= 65) and (code <= 90) then
+                  let code = code + 32
+                end
+                if code != vec_get(end_codes, mi) then
+                  let matches = false
+                end
+                let mi = mi + 1
+              end
+              if matches then
+                let found = true
+              else
+                let k = k + 1
+              end
+            end
+            if found then
+              if k > raw_start then
+                vec_push(tokbuf, ["text", substr(html, raw_start, k - raw_start)])
+              end
+              let m = k + end_len
+              while (m < n) and (sc_code(hid, m) != 62) do
+                let m = m + 1
+              end
+              vec_push(tokbuf, ["close", lname])
+              let i = m + 1
+              let text_start = i
+            else
+              if n > raw_start then
+                vec_push(tokbuf, ["text", substr(html, raw_start, n - raw_start)])
+              end
+              vec_push(tokbuf, ["close", lname])
+              let i = n
+              let text_start = i
+            end
+          else
+            let i = close_gt + 1
+            let text_start = i
+          end
+        end
+      end
+    else
+      let i = i + 1
+    end
+  end
+  if n > text_start then
+    vec_push(tokbuf, ["text", substr(html, text_start, n - text_start)])
+  end
+  let tokens = vec_to_list(tokbuf)
+  return tokens
+end
+
+# ---- attribute helpers (operate on an `attrs` list, [[key,value],...]) ----
+
+make a function called html_attr_get takes attrs, key returns value
+  let i = 0
+  while i < attrs.length do
+    if attrs[i][0] == key then
+      return attrs[i][1]
+    end
+    let i = i + 1
+  end
+  return ""
+end
+
+make a function called html_attr_has takes attrs, key returns yes
+  let i = 0
+  while i < attrs.length do
+    if attrs[i][0] == key then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# Returns a NEW attrs list with key set to value (added if absent,
+# replaced in place if present) -- attrs lists are treated as
+# immutable values throughout this library, matching PatLang's own
+# list semantics; callers replace the token in the `tokens` list via
+# list_set rather than mutating in place.
+make a function called html_attr_set takes attrs, key, value returns new_attrs
+  let out = []
+  let found = false
+  let i = 0
+  while i < attrs.length do
+    if attrs[i][0] == key then
+      let out = list_push(out, [key, value])
+      let found = true
+    else
+      let out = list_push(out, attrs[i])
+    end
+    let i = i + 1
+  end
+  if not found then
+    let out = list_push(out, [key, value])
+  end
+  return out
+end
+
+make a function called html_escape takes s returns out
+  let b = sb_new()
+  let i = 0
+  let hid = str_intern(s)
+  let n = sc_len(hid)
+  while i < n do
+    let code = sc_code(hid, i)
+    if code == 38 then
+      sb_push(b, "&amp;")
+    else
+      if code == 60 then
+        sb_push(b, "&lt;")
+      else
+        if code == 62 then
+          sb_push(b, "&gt;")
+        else
+          sb_push(b, sc_char(hid, i))
+        end
+      end
+    end
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+make a function called html_attr_escape takes s returns out
+  let b = sb_new()
+  let i = 0
+  let hid = str_intern(s)
+  let n = sc_len(hid)
+  while i < n do
+    let code = sc_code(hid, i)
+    if code == 38 then
+      sb_push(b, "&amp;")
+    else
+      if code == 34 then
+        sb_push(b, "&quot;")
+      else
+        sb_push(b, sc_char(hid, i))
+      end
+    end
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+make a function called html_attrs_to_string takes attrs returns s
+  let b = sb_new()
+  let i = 0
+  while i < attrs.length do
+    sb_push(b, " ")
+    sb_push(b, attrs[i][0])
+    sb_push(b, "=\"")
+    sb_push(b, html_attr_escape(attrs[i][1]))
+    sb_push(b, "\"")
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+# ---- serialization (the reverse of html_tokenize) ----
+
+make a function called html_token_to_string takes token returns s
+  let kind = token[0]
+  if kind == "text" then
+    return token[1]
+  end
+  if kind == "close" then
+    return "</" + token[1] + ">"
+  end
+  if kind == "void" then
+    return "<" + token[1] + html_attrs_to_string(token[2]) + ">"
+  end
+  return "<" + token[1] + html_attrs_to_string(token[2]) + ">"
+end
+
+make a function called html_serialize takes tokens returns html
+  let b = sb_new()
+  let i = 0
+  while i < tokens.length do
+    sb_push(b, html_token_to_string(tokens[i]))
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+# ---- finding tags / matching close tags / extracting text ----
+
+# Indices of "open" (or "void") tokens whose name is in `names`.
+make a function called html_find_all takes tokens, names returns indices
+  let out = []
+  let i = 0
+  while i < tokens.length do
+    let t = tokens[i]
+    if (t[0] == "open") or (t[0] == "void") then
+      if html_name_in_list(names, t[1]) then
+        let out = list_push(out, i)
+      end
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# Index of the "close" token matching the "open" token at open_idx
+# (tracks nesting depth of the SAME tag name), or -1 if malformed/void.
+make a function called html_find_close takes tokens, open_idx returns close_idx
+  let name = tokens[open_idx][1]
+  let depth = 1
+  let i = open_idx + 1
+  while i < tokens.length do
+    let t = tokens[i]
+    if t[0] == "open" then
+      if t[1] == name then
+        let depth = depth + 1
+      end
+    end
+    if t[0] == "close" then
+      if t[1] == name then
+        let depth = depth - 1
+        if depth == 0 then
+          return i
+        end
+      end
+    end
+    let i = i + 1
+  end
+  return -1
+end
+
+# Plain text content between an open tag and its matching close (all
+# nested tags stripped, matching BeautifulSoup's get_text(" ", strip)
+# closely enough for slugify/TOC/summary purposes: text runs are
+# joined with single spaces and the result is trimmed).
+make a function called html_get_text takes tokens, open_idx returns text
+  let close_idx = html_find_close(tokens, open_idx)
+  if close_idx == -1 then
+    return ""
+  end
+  let b = sb_new()
+  let i = open_idx + 1
+  while i < close_idx do
+    if tokens[i][0] == "text" then
+      sb_push(b, html_unescape(tokens[i][1]))
+      sb_push(b, " ")
+    end
+    let i = i + 1
+  end
+  return html_trim(sb_str(b))
+end
+
+# First index >= from_idx (exclusive of from_idx itself) of an "open"
+# or "void" token whose name is in `names` -- mirrors BeautifulSoup's
+# find_next(names). Returns -1 if none.
+make a function called html_find_next takes tokens, from_idx, names returns idx
+  let i = from_idx + 1
+  while i < tokens.length do
+    let t = tokens[i]
+    if (t[0] == "open") or (t[0] == "void") then
+      if html_name_in_list(names, t[1]) then
+        return i
+      end
+    end
+    let i = i + 1
+  end
+  return -1
+end
+
+# Direct <li> children of the "open" token at parent_open_idx (NOT
+# recursive into nested ol/ul -- mirrors find_all("li",
+# recursive=False)).
+make a function called html_direct_li_children takes tokens, parent_open_idx returns indices
+  let close_idx = html_find_close(tokens, parent_open_idx)
+  let out = []
+  if close_idx == -1 then
+    return out
+  end
+  let depth = 0
+  let i = parent_open_idx + 1
+  while i < close_idx do
+    let t = tokens[i]
+    if t[0] == "open" then
+      if depth == 0 then
+        if t[1] == "li" then
+          let out = list_push(out, i)
+        end
+      end
+      let depth = depth + 1
+    end
+    if t[0] == "close" then
+      let depth = depth - 1
+    end
+    let i = i + 1
+  end
+  return out
+end

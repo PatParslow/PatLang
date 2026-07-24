@@ -16,7 +16,7 @@ fn register_test_hosts(interp: &mut Interpreter) {
     if args.len() != 2 { return Err("expected 2 args".into()); }
     let key = match &args[1] { Value::String(s) => s.clone(), _ => return Err("expected string key".into()) };
     match &args[0] {
-      Value::Object(map) => Ok(map.get(&key).cloned().unwrap_or(Value::Unit)),
+      Value::Object(map) => Ok(map.get(key.as_str()).cloned().unwrap_or(Value::Unit)),
       _ => Ok(Value::Unit),
     }
   });

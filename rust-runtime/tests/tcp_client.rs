@@ -15,8 +15,8 @@ thread_local! {
 
 fn capture_print(args: &[Value]) -> Result<Value, String> {
     if let Some(v) = args.get(0) {
-        let s = match v { Value::String(s) => s.clone(), other => format!("{:?}", other) };
-        OUTPUT.with(|o| o.borrow_mut().push(s));
+        let s = match v { Value::String(s) => s.clone(), other => format!("{:?}", other).into() };
+        OUTPUT.with(|o| o.borrow_mut().push(s.to_string()));
     }
     Ok(Value::Unit)
 }

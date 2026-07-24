@@ -1,10 +1,10 @@
 //! Tests for MemoryManager core module
 
-use patlang_runtime::memory_manager::{MemoryManager, MemoryManagerError, MemoryHandle};
+use patlang_runtime::memory_manager::MemoryManager;
 use patlang_runtime::core_evaluator::CoreEvaluator;
 use patlang_runtime::event_system::EventSystem;
 use patlang_runtime::message_queue::MessageQueue;
-use patlang_runtime::error_handler::{ErrorHandler, DefaultErrorHandler};
+use patlang_runtime::error_handler::DefaultErrorHandler;
 use patlang_runtime::secure_distributed_code_support::SecureDistributedCodeSupport;
 
 

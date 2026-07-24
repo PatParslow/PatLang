@@ -199,8 +199,8 @@ impl<'a> CoreEvaluator<'a> {
 
     /// Execute a single AST node (stub).
     pub fn execute_node(&mut self, node: &AstNode) -> Result<String, RuntimeError> {
-        use crate::arithmetic::{eval_arithmetic, ArithmeticOp};
-        use crate::string::{eval_string, StringOp};
+        
+        use crate::string::eval_string;
 
         // Optional debug logging
         if std::env::var("PATLANG_DEBUG").is_ok() {
@@ -740,7 +740,7 @@ pub struct EvalError {
 /// This stub "parses" the source into a dummy AST node and evaluates it.
 pub fn evaluate_patlang_source(source: &str) -> Result<EvalResult, EvalError> {
     use crate::parser::Parser;
-    use crate::ast::{Stmt, Expr};
+    
     // Parse the source into statements
     let mut parser = Parser::new(source).map_err(|e| EvalError { message: format!("Parse error: {:?}", e) })?;
     if std::env::var("PATLANG_DEBUG").is_ok() {

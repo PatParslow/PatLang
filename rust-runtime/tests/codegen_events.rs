@@ -4,11 +4,11 @@ use patlang_runtime::ir::*;
 fn compiled_emit_invokes_when_handlers() {
     // Build Program with a synthesized handler and a main that calls emit("foo")
     let mut handler = Function { name: "__when_foo_1".into(), ..Default::default() };
-    handler.body.push(Instr::Const(Value::String("ok".into())));
+    handler.body.push(Instr::Const(Value::String("ok".to_string().into())));
     handler.body.push(Instr::Return);
 
     let mut mainf = Function { name: "main".into(), ..Default::default() };
-    mainf.body.push(Instr::Const(Value::String("foo".into())));
+    mainf.body.push(Instr::Const(Value::String("foo".to_string().into())));
     mainf.body.push(Instr::CallHost("emit".into(), 1));
     mainf.body.push(Instr::Return);
 

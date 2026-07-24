@@ -73,8 +73,8 @@ fn ir_interpreter_truthiness_and_or() {
     // (false) or (true) -> true
     f.body.push(Instr::BinOp(BinOpKind::Or));
     // "" or "x" -> true
-    f.body.push(Instr::Const(Value::String(String::new())));
-    f.body.push(Instr::Const(Value::String("x".into())));
+    f.body.push(Instr::Const(Value::String(String::new().into())));
+    f.body.push(Instr::Const(Value::String("x".to_string().into())));
     f.body.push(Instr::BinOp(BinOpKind::Or));
     // (true) or (true) -> true
     f.body.push(Instr::BinOp(BinOpKind::Or));

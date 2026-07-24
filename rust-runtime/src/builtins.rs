@@ -837,7 +837,7 @@ fn parse_tiny_source_impl(ctx: &mut ExecutionContext, path: &str) -> Result<Stri
             if let Some(then_pos) = rest.find(" then") {
                 let cond_src = rest[..then_pos].trim();
                 let cond_id = parse_tiny_expr(ctx, cond_src)?;
-                let mut then_id = format!("__list_{}", ctx.lists.len()+1);
+                let then_id = format!("__list_{}", ctx.lists.len()+1);
                 ctx.lists.insert(then_id.clone(), Vec::new());
                 let mut else_id: Option<String> = None;
                 let after_then = &rest[then_pos+5..];

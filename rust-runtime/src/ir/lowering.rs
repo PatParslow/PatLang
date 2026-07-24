@@ -49,7 +49,7 @@ impl Lowerer {
             if let Stmt::Function { name, params, body } = s.clone() {
                 let mut f = Function { name: name.clone(), params: params.clone(), ..Default::default() };
                 // Lower the function body
-                let mut saved_locals = std::mem::take(&mut self.known_locals);
+                let saved_locals = std::mem::take(&mut self.known_locals);
                 let saved_fname = std::mem::replace(&mut self.current_function, name.clone());
                 // params are considered known locals; always reassignable
                 // (Phase 1 does not require `mut` on parameters).
@@ -190,12 +190,12 @@ impl Lowerer {
                             // lower_program_basic is infallible today, so this
                             // is enforced as a guaranteed-fail assertion at the
                             // reassignment site instead of a hard compile error.
-                            f.body.push(Instr::Const(Value::String(self.current_function.clone())));
-                            f.body.push(Instr::Const(Value::String("assert".into())));
+                            f.body.push(Instr::Const(Value::String((self.current_function.clone()).into())));
+                            f.body.push(Instr::Const(Value::String("assert".to_string().into())));
                             f.body.push(Instr::Const(Value::String(format!(
                                 "cannot assign twice to immutable variable `{}` (declare it `let mut {}` to allow reassignment)",
                                 name, name
-                            ))));
+                            ).into())));
                             f.body.push(Instr::Const(Value::Bool(false)));
                             f.body.push(Instr::CallHost("contract_check".into(), 4));
                         }
@@ -263,9 +263,9 @@ impl Lowerer {
             Stmt::Assert { kind, expr } => {
                 // contract_check(func_name, kind, condition_text, ok) — pushed in
                 // that order so CallHost's arg order matches; ok is evaluated last.
-                f.body.push(Instr::Const(Value::String(self.current_function.clone())));
-                f.body.push(Instr::Const(Value::String(kind.clone())));
-                f.body.push(Instr::Const(Value::String(expr_to_text(expr))));
+                f.body.push(Instr::Const(Value::String((self.current_function.clone()).into())));
+                f.body.push(Instr::Const(Value::String((kind.clone()).into())));
+                f.body.push(Instr::Const(Value::String((expr_to_text(expr)).into())));
                 self.lower_expr(expr, f);
                 f.body.push(Instr::CallHost("contract_check".into(), 4));
             }
@@ -276,15 +276,15 @@ impl Lowerer {
                 // are compile-time string TOKENS, not ordinary expressions to
                 // evaluate -- a bare rule-head `X` has no local-variable
                 // binding to look up; it's a logic-variable name, not a value.
-                f.body.push(Instr::Const(Value::String(head_pred.clone())));
+                f.body.push(Instr::Const(Value::String((head_pred.clone()).into())));
                 for a in head_args {
-                    f.body.push(Instr::Const(Value::String(rule_arg_text(a))));
+                    f.body.push(Instr::Const(Value::String((rule_arg_text(a)).into())));
                 }
                 f.body.push(Instr::BuildList(head_args.len()));
                 for (pred, args) in body {
-                    f.body.push(Instr::Const(Value::String(pred.clone())));
+                    f.body.push(Instr::Const(Value::String((pred.clone()).into())));
                     for a in args {
-                        f.body.push(Instr::Const(Value::String(rule_arg_text(a))));
+                        f.body.push(Instr::Const(Value::String((rule_arg_text(a)).into())));
                     }
                     f.body.push(Instr::BuildList(args.len()));
                     f.body.push(Instr::BuildList(2)); // [pred, args_list]
@@ -299,11 +299,11 @@ impl Lowerer {
                 // compile-time string tokens, same convention as RuleDecl
                 // body args just above -- a goal dependency is a fact-term,
                 // not an expression to evaluate.
-                f.body.push(Instr::Const(Value::String(name.clone())));
+                f.body.push(Instr::Const(Value::String((name.clone()).into())));
                 for (pred, args) in deps {
-                    f.body.push(Instr::Const(Value::String(pred.clone())));
+                    f.body.push(Instr::Const(Value::String((pred.clone()).into())));
                     for a in args {
-                        f.body.push(Instr::Const(Value::String(rule_arg_text(a))));
+                        f.body.push(Instr::Const(Value::String((rule_arg_text(a)).into())));
                     }
                     f.body.push(Instr::BuildList(args.len()));
                     f.body.push(Instr::BuildList(2)); // [pred, args_list]
@@ -378,7 +378,7 @@ impl Lowerer {
             // the fast Int path by default (Stage 36 numeric tower).
             Expr::Number(n) => f.body.push(Instr::Const(Value::Int(*n as i64))),
             Expr::Float(n) => f.body.push(Instr::Const(Value::Float(*n))),
-            Expr::String(s) => f.body.push(Instr::Const(Value::String(s.clone()))),
+            Expr::String(s) => f.body.push(Instr::Const(Value::String((s.clone()).into()))),
             Expr::Identifier(name) => {
                 // Treat 'true' and 'false' as boolean literals in Stage 0
                 if name == "true" {
@@ -399,7 +399,7 @@ impl Lowerer {
                 if property == "length" || property == "len" {
                     f.body.push(Instr::CallHost("len".into(), 1));
                 } else {
-                    f.body.push(Instr::Const(Value::String(property.clone())));
+                    f.body.push(Instr::Const(Value::String((property.clone()).into())));
                     f.body.push(Instr::CallHost("get".into(), 2));
                 }
             }
@@ -449,7 +449,7 @@ impl Lowerer {
                     Expr::Member { object, property } => {
                         // send(object, "method", ...args)
                         self.lower_expr(object, f);
-                        f.body.push(Instr::Const(Value::String(property.clone())));
+                        f.body.push(Instr::Const(Value::String((property.clone()).into())));
                         for arg in args { self.lower_expr(arg, f); }
                         f.body.push(Instr::CallHost("send".into(), 2 + args.len()));
                     }
@@ -501,7 +501,7 @@ impl Lowerer {
                 // a previous ["paused", id] result's id to resume that same
                 // fiber with a freshly refreshed deadline.
                 self.lower_expr(ms, f);
-                f.body.push(Instr::Const(Value::String(func_name)));
+                f.body.push(Instr::Const(Value::String((func_name).into())));
                 for (name, _) in &captured { f.body.push(Instr::LoadLocal(name.clone())); }
                 f.body.push(Instr::BuildList(captured.len()));
                 match existing {

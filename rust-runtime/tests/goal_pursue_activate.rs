@@ -20,7 +20,7 @@ thread_local! {
 
 fn capture_print(args: &[Value]) -> Result<Value, String> {
     let s = match args.get(0) {
-        Some(Value::String(s)) => s.clone(),
+        Some(Value::String(s)) => s.as_ref().clone(),
         Some(v @ (Value::Int(_) | Value::Float(_) | Value::BigInt(_) | Value::Rational(_, _))) => patlang_runtime::ir::ops::v_to_string(v),
         Some(Value::Bool(b)) => b.to_string(),
         Some(other) => format!("{:?}", other),

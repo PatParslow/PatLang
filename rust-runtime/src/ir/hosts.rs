@@ -47,9 +47,9 @@ pub fn host_list_get(args: &[Value]) -> Result<Value, String> {
         Value::String(s) => {
             // O(1) byte indexing for ASCII strings; chars().nth for the rest
             if s.is_ascii() {
-                Ok(match s.as_bytes().get(idx) { Some(b) => Value::String((*b as char).to_string()), None => Value::String(String::new()) })
+                Ok(match s.as_bytes().get(idx) { Some(b) => Value::String(((*b as char).to_string()).into()), None => Value::String((String::new()).into()) })
             } else {
-                Ok(match s.chars().nth(idx) { Some(c) => Value::String(c.to_string()), None => Value::String(String::new()) })
+                Ok(match s.chars().nth(idx) { Some(c) => Value::String((c.to_string()).into()), None => Value::String((String::new()).into()) })
             }
         }
         _ => Ok(Value::Unit),
@@ -63,7 +63,7 @@ pub fn host_list_len(args: &[Value]) -> Result<Value, String> {
         Value::String(s) => s.chars().count(),
         _ => 0,
     };
-    Ok(Value::String(n.to_string()))
+    Ok(Value::String((n.to_string()).into()))
 }
 
 pub fn host_list_push(args: &[Value]) -> Result<Value, String> {
@@ -99,7 +99,8 @@ pub fn host_list_set(args: &[Value]) -> Result<Value, String> {
 
 pub fn host_char_code(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 { return Err("char_code: expected 2 args".into()); }
-    let s = match &args[0] { Value::String(s) => s.clone(), v => display_value(v) };
+    let owned;
+    let s: &str = match &args[0] { Value::String(s) => s.as_str(), v => { owned = display_value(v); owned.as_str() } };
     let idx = match &args[1] { Value::String(t) => t.parse::<usize>().unwrap_or(usize::MAX), v => number_or_max(v).unwrap_or(usize::MAX) };
     if s.is_ascii() {
         return Ok(Value::Int(match s.as_bytes().get(idx) { Some(b) => *b as i64, None => -1 }));
@@ -112,16 +113,17 @@ pub fn host_char_code(args: &[Value]) -> Result<Value, String> {
 
 pub fn host_substr(args: &[Value]) -> Result<Value, String> {
     if args.len() != 3 { return Err("substr: expected 3 args".into()); }
-    let s = match &args[0] { Value::String(s) => s.clone(), v => display_value(v) };
+    let owned;
+    let s: &str = match &args[0] { Value::String(s) => s.as_str(), v => { owned = display_value(v); owned.as_str() } };
     let start = match &args[1] { Value::String(t) => t.parse::<usize>().unwrap_or(0), v => number_or_max(v).unwrap_or(0) };
     let count = match &args[2] { Value::String(t) => t.parse::<usize>().unwrap_or(0), v => number_or_max(v).unwrap_or(0) };
     if s.is_ascii() {
         let b = s.as_bytes();
         let st = start.min(b.len());
         let en = st.saturating_add(count).min(b.len());
-        return Ok(Value::String(String::from_utf8_lossy(&b[st..en]).to_string()));
+        return Ok(Value::String(String::from_utf8_lossy(&b[st..en]).to_string().into()));
     }
-    Ok(Value::String(s.chars().skip(start).take(count).collect()))
+    Ok(Value::String(s.chars().skip(start).take(count).collect::<String>().into()))
 }
 
 // --- Handle-based builders: O(1) push/index for large collections, avoiding
@@ -197,14 +199,24 @@ pub fn host_vec_to_list(args: &[Value]) -> Result<Value, String> {
 
 // Interned read-only strings: O(1) handle passing for hot loops (the
 // tokenizer indexes the whole source per character; a Value::String local
-// would be cloned on every access)
+// would be cloned on every access).
+//
+// `is_ascii` is cached ONCE here, at intern time -- not recomputed on every
+// sc_code/sc_char/sc_len call. `str::is_ascii()` is itself an O(n) full-
+// string scan (not O(1)), so calling it inside a per-character loop's hot
+// path silently turns an intended O(1)-per-call primitive back into
+// O(n) per call, i.e. O(n^2) total for a loop that scans the whole
+// string -- exactly the bug this handle mechanism exists to avoid. See
+// patlang-perf-ladder-findings / patlang-ascii-fastpath-cache-fix memory:
+// html_tokenize on a real 1.2MB article took 62.6s from this alone.
 thread_local! {
-    static ISTRINGS: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    static ISTRINGS: RefCell<Vec<(String, bool)>> = RefCell::new(Vec::new());
 }
 
 pub fn host_str_intern(args: &[Value]) -> Result<Value, String> {
-    let s = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
-    let id = ISTRINGS.with(|v| { let mut b = v.borrow_mut(); b.push(s); b.len() - 1 });
+    let s: String = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => display_value(v).into(), None => String::new() };
+    let is_ascii = s.is_ascii();
+    let id = ISTRINGS.with(|v| { let mut b = v.borrow_mut(); b.push((s, is_ascii)); b.len() - 1 });
     Ok(Value::Int(id as i64))
 }
 
@@ -213,7 +225,7 @@ pub fn host_sc_len(args: &[Value]) -> Result<Value, String> {
     ISTRINGS.with(|v| {
         let b = v.borrow();
         b.get(id).ok_or_else(|| format!("sc_len: unknown string {}", id))
-            .map(|s| Value::Int(if s.is_ascii() { s.len() as i64 } else { s.chars().count() as i64 }))
+            .map(|(s, is_ascii)| Value::Int(if *is_ascii { s.len() as i64 } else { s.chars().count() as i64 }))
     })
 }
 
@@ -222,8 +234,8 @@ pub fn host_sc_code(args: &[Value]) -> Result<Value, String> {
     let idx = arg_usize(args, 1, "sc_code")?;
     ISTRINGS.with(|v| {
         let b = v.borrow();
-        let s = b.get(id).ok_or_else(|| format!("sc_code: unknown string {}", id))?;
-        if s.is_ascii() {
+        let (s, is_ascii) = b.get(id).ok_or_else(|| format!("sc_code: unknown string {}", id))?;
+        if *is_ascii {
             return Ok(Value::Int(match s.as_bytes().get(idx) { Some(c) => *c as i64, None => -1 }));
         }
         Ok(Value::Int(match s.chars().nth(idx) { Some(c) => c as u32 as i64, None => -1 }))
@@ -235,11 +247,11 @@ pub fn host_sc_char(args: &[Value]) -> Result<Value, String> {
     let idx = arg_usize(args, 1, "sc_char")?;
     ISTRINGS.with(|v| {
         let b = v.borrow();
-        let s = b.get(id).ok_or_else(|| format!("sc_char: unknown string {}", id))?;
-        if s.is_ascii() {
-            return Ok(match s.as_bytes().get(idx) { Some(c) => Value::String((*c as char).to_string()), None => Value::String(String::new()) });
+        let (s, is_ascii) = b.get(id).ok_or_else(|| format!("sc_char: unknown string {}", id))?;
+        if *is_ascii {
+            return Ok(match s.as_bytes().get(idx) { Some(c) => Value::String(((*c as char).to_string()).into()), None => Value::String((String::new()).into()) });
         }
-        Ok(match s.chars().nth(idx) { Some(c) => Value::String(c.to_string()), None => Value::String(String::new()) })
+        Ok(match s.chars().nth(idx) { Some(c) => Value::String((c.to_string()).into()), None => Value::String((String::new()).into()) })
     })
 }
 
@@ -250,7 +262,7 @@ pub fn host_sb_new(_args: &[Value]) -> Result<Value, String> {
 
 pub fn host_sb_push(args: &[Value]) -> Result<Value, String> {
     let id = arg_usize(args, 0, "sb_push")?;
-    let text = match args.get(1) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
+    let text = match args.get(1) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => display_value(v).into(), None => String::new().into() };
     SBUFS.with(|v| {
         let mut b = v.borrow_mut();
         b.get_mut(id).ok_or_else(|| format!("sb_push: unknown buffer {}", id)).map(|s| s.push_str(&text))
@@ -262,15 +274,15 @@ pub fn host_sb_str(args: &[Value]) -> Result<Value, String> {
     let id = arg_usize(args, 0, "sb_str")?;
     SBUFS.with(|v| {
         let b = v.borrow();
-        b.get(id).ok_or_else(|| format!("sb_str: unknown buffer {}", id)).map(|s| Value::String(s.clone()))
+        b.get(id).ok_or_else(|| format!("sb_str: unknown buffer {}", id)).map(|s| Value::String((s.clone()).into()))
     })
 }
 
 pub fn host_chr(args: &[Value]) -> Result<Value, String> {
     // chr(code) -> 1-char string (empty for invalid code points)
     let n = match args.get(0) { Some(Value::String(s)) => s.trim().parse::<f64>().unwrap_or(-1.0), Some(v) => v.as_number().unwrap_or(-1.0), _ => -1.0 };
-    if n < 0.0 { return Ok(Value::String(String::new())); }
-    Ok(Value::String(char::from_u32(n as u32).map(|c| c.to_string()).unwrap_or_default()))
+    if n < 0.0 { return Ok(Value::String((String::new()).into())); }
+    Ok(Value::String((char::from_u32(n as u32).map(|c| c.to_string()).unwrap_or_default()).into()))
 }
 
 pub fn host_to_num(args: &[Value]) -> Result<Value, String> {
@@ -289,16 +301,16 @@ pub fn host_to_num(args: &[Value]) -> Result<Value, String> {
 }
 
 pub fn host_read_file(args: &[Value]) -> Result<Value, String> {
-    let p = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
-    std::fs::read_to_string(&p).map(Value::String).map_err(|e| format!("read_file: {}: {}", p, e))
+    let p = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => display_value(v).into(), None => String::new().into() };
+    std::fs::read_to_string(&p).map(|s| Value::String(s.into())).map_err(|e| format!("read_file: {}: {}", p, e))
 }
 
 pub fn host_file_exists(args: &[Value]) -> Result<Value, String> {
     // file_exists(path) -> "1" or "0" (legacy string-bool convention, kept
     // consistent with the codegen template's arm of the same name)
-    let p = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
+    let p = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => display_value(v).into(), None => String::new().into() };
     let exists = std::path::Path::new(&p).exists();
-    Ok(Value::String(if exists { "1".into() } else { "0".into() }))
+    Ok(Value::String(if exists { "1".to_string().into() } else { "0".to_string().into() }))
 }
 
 pub fn host_hash_string(args: &[Value]) -> Result<Value, String> {
@@ -306,19 +318,19 @@ pub fn host_hash_string(args: &[Value]) -> Result<Value, String> {
     // and stable across runs/platforms; used for build-cache invalidation
     // (compare a source's hash against a previously recorded one to skip
     // an unchanged rustc invocation).
-    let s = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
+    let s = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => display_value(v).into(), None => String::new().into() };
     let mut hash: u64 = 0xcbf29ce484222325;
     for b in s.as_bytes() {
         hash ^= *b as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    Ok(Value::String(format!("{:016x}", hash)))
+    Ok(Value::String(format!("{:016x}", hash).into()))
 }
 
 pub fn host_write_file(args: &[Value]) -> Result<Value, String> {
     // write_file(path, contents) -> Bool
-    let p = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
-    let contents = match args.get(1) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
+    let p = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => display_value(v).into(), None => String::new().into() };
+    let contents = match args.get(1) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => display_value(v).into(), None => String::new().into() };
     if let Some(parent) = std::path::Path::new(&p).parent() { let _ = std::fs::create_dir_all(parent); }
     std::fs::write(&p, contents).map(|_| Value::Bool(true)).map_err(|e| format!("write_file: {}: {}", p, e))
 }
@@ -328,7 +340,7 @@ pub fn host_list_dir(args: &[Value]) -> Result<Value, String> {
     // "/" so callers can tell them apart from files without a second host
     // call. Non-recursive (one level), matching readdir semantics. Entries
     // are sorted for deterministic output across platforms/filesystems.
-    let p = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
+    let p = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => display_value(v).into(), None => String::new().into() };
     let mut names: Vec<String> = std::fs::read_dir(&p)
         .map_err(|e| format!("list_dir: {}: {}", p, e))?
         .filter_map(|entry| entry.ok())
@@ -339,23 +351,58 @@ pub fn host_list_dir(args: &[Value]) -> Result<Value, String> {
         })
         .collect();
     names.sort();
-    Ok(Value::List(Arc::new(names.into_iter().map(Value::String).collect())))
+    Ok(Value::List(Arc::new(names.into_iter().map(|s| Value::String(s.into())).collect())))
 }
 
 pub fn host_rename_file(args: &[Value]) -> Result<Value, String> {
     // rename_file(from, to) -> Bool. Creates the destination's parent
     // directory if needed (matching write_file's own auto-mkdir behavior).
-    let from = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
-    let to = match args.get(1) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
+    let from = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => display_value(v).into(), None => String::new().into() };
+    let to = match args.get(1) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => display_value(v).into(), None => String::new().into() };
     if let Some(parent) = std::path::Path::new(&to).parent() { let _ = std::fs::create_dir_all(parent); }
     std::fs::rename(&from, &to).map(|_| Value::Bool(true)).map_err(|e| format!("rename_file: {} -> {}: {}", from, to, e))
+}
+
+pub fn host_copy_file(args: &[Value]) -> Result<Value, String> {
+    // copy_file(from, to) -> "OK <abs>" or "ERR: msg". Creates the
+    // destination's parent directory if needed (matching write_file's own
+    // auto-mkdir behavior). Was previously only implemented in codegen.rs
+    // (the --patc/rustc-text emission backend), silently missing under
+    // --ir-run -- a real gap found while scoping the PatLang site-builder
+    // port (which needs it to copy static assets into publish/).
+    let from = match args.get(0) { Some(Value::String(s)) => s.to_string(), Some(v) => display_value(v), None => String::new() };
+    let to = match args.get(1) { Some(Value::String(s)) => s.to_string(), Some(v) => display_value(v), None => String::new() };
+    let from_p = std::path::Path::new(&from);
+    let to_p = std::path::Path::new(&to);
+    if let Some(parent) = to_p.parent() { let _ = std::fs::create_dir_all(parent); }
+    match std::fs::copy(from_p, to_p) {
+        Ok(_) => {
+            let abs = std::fs::canonicalize(to_p).unwrap_or_else(|_| to_p.to_path_buf());
+            Ok(Value::String(format!("OK {}", abs.display()).into()))
+        }
+        Err(e) => Ok(Value::String(format!("ERR: {}", e).into())),
+    }
+}
+
+pub fn host_remove_file(args: &[Value]) -> Result<Value, String> {
+    // remove_file(path) -> "OK" or "ERR: msg" -- a plain file or an EMPTY
+    // directory. Deliberately NOT recursive (no remove_dir_all): a stale-
+    // file sweep should remove individual files itself, not risk an
+    // accidental whole-tree deletion via one bad path.
+    let p = match args.get(0) { Some(Value::String(s)) => s.to_string(), Some(v) => display_value(v), None => String::new() };
+    let path = std::path::Path::new(&p);
+    let result = if path.is_dir() { std::fs::remove_dir(path) } else { std::fs::remove_file(path) };
+    match result {
+        Ok(_) => Ok(Value::String("OK".to_string().into())),
+        Err(e) => Ok(Value::String(format!("ERR: {}", e).into())),
+    }
 }
 
 pub fn host_byte_length(args: &[Value]) -> Result<Value, String> {
     // byte_length(s) -> Number of UTF-8 bytes (unlike .length, which counts
     // chars) - needed for exact HTTP Content-Length framing of any non-ASCII
     // text.
-    let s = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
+    let s = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => display_value(v).into(), None => String::new().into() };
     Ok(Value::Int(s.len() as i64))
 }
 
@@ -365,9 +412,9 @@ pub fn host_read_line(_args: &[Value]) -> Result<Value, String> {
     use std::io::BufRead;
     let mut line = String::new();
     let n = std::io::stdin().lock().read_line(&mut line).map_err(|e| format!("read_line: {}", e))?;
-    if n == 0 { return Ok(Value::String(String::new())); }
+    if n == 0 { return Ok(Value::String((String::new()).into())); }
     while line.ends_with('\n') || line.ends_with('\r') { line.pop(); }
-    Ok(Value::String(line))
+    Ok(Value::String((line).into()))
 }
 
 pub fn host_now_ms(_args: &[Value]) -> Result<Value, String> {
@@ -383,7 +430,7 @@ pub fn host_now_ms(_args: &[Value]) -> Result<Value, String> {
 pub fn host_read_file_b64(args: &[Value]) -> Result<Value, String> {
     // read_file_b64(path) -> base64 of the raw bytes (for embedding binary
     // artifacts like .wasm in generated HTML). Builder-side host.
-    let p = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
+    let p = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => display_value(v).into(), None => String::new().into() };
     let data = std::fs::read(&p).map_err(|e| format!("read_file_b64: {}: {}", p, e))?;
     const TBL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
@@ -395,7 +442,7 @@ pub fn host_read_file_b64(args: &[Value]) -> Result<Value, String> {
         out.push(if chunk.len() > 1 { TBL[(n >> 6) as usize & 63] as char } else { '=' });
         out.push(if chunk.len() > 2 { TBL[n as usize & 63] as char } else { '=' });
     }
-    Ok(Value::String(out))
+    Ok(Value::String((out).into()))
 }
 
 pub fn host_exec_capture(args: &[Value]) -> Result<Value, String> {
@@ -406,8 +453,8 @@ pub fn host_exec_capture(args: &[Value]) -> Result<Value, String> {
     // violation), stderr is appended too, so transcripts of intentionally
     // failing demos still show the violation message.
     let p = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => return Err("exec_capture: expected program path".into()) };
-    let extra: Vec<String> = args[1..].iter().filter_map(|v| match v { Value::String(s) => Some(s.clone()), _ => None }).collect();
-    let out = std::process::Command::new(&p).args(&extra).output().map_err(|e| format!("exec_capture: {}: {}", p, e))?;
+    let extra: Vec<String> = args[1..].iter().filter_map(|v| match v { Value::String(s) => Some(s.as_ref().clone()), _ => None }).collect();
+    let out = std::process::Command::new(&*p).args(&extra).output().map_err(|e| format!("exec_capture: {}: {}", p, e))?;
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
@@ -416,7 +463,7 @@ pub fn host_exec_capture(args: &[Value]) -> Result<Value, String> {
             text.push_str(&err);
         }
     }
-    Ok(Value::String(text))
+    Ok(Value::String((text).into()))
 }
 
 pub fn host_argv(args: &[Value]) -> Result<Value, String> {
@@ -432,15 +479,14 @@ pub fn host_argv(args: &[Value]) -> Result<Value, String> {
         rest.remove(0);
         if !rest.is_empty() { rest.remove(0); } // script path
     }
-    Ok(Value::List(Arc::new(rest.into_iter().map(Value::String).collect())))
+    Ok(Value::List(Arc::new(rest.into_iter().map(|s| Value::String(s.into())).collect())))
 }
 
 pub fn host_len(args: &[Value]) -> Result<Value, String> {
-    let v = args.get(0).cloned().unwrap_or(Value::Unit);
-    let n = match v {
-        Value::String(ref s) => s.chars().count() as i64,
-        Value::List(ref xs) => xs.len() as i64,
-        Value::Object(ref m) => m.len() as i64,
+    let n = match args.get(0) {
+        Some(Value::String(s)) => s.chars().count() as i64,
+        Some(Value::List(xs)) => xs.len() as i64,
+        Some(Value::Object(m)) => m.len() as i64,
         _ => 0,
     };
     Ok(Value::Int(n))
@@ -453,7 +499,7 @@ pub fn host_get(args: &[Value]) -> Result<Value, String> {
         // String receiver reads from the named-object store (OO style), matching
         // the codegen template's `get` arm
         Value::String(name) => Ok(obj_get(name, &key).unwrap_or(Value::Unit)),
-        Value::Object(map) => Ok(map.get(&key).cloned().unwrap_or(Value::Unit)),
+        Value::Object(map) => Ok(map.get(key.as_str()).cloned().unwrap_or(Value::Unit)),
         // Primitive receivers (Number/Bool/List) have no property store, but do
         // support a small set of Ruby-style built-in methods called without
         // parens (e.g. `2.34.to_s`), lowered here since a paren-less `Member`
@@ -467,7 +513,7 @@ pub fn host_get(args: &[Value]) -> Result<Value, String> {
 /// callers can fall back to their own "unknown property/method" behavior.
 fn builtin_primitive_method(recv: &Value, method: &str) -> Option<Value> {
     match method {
-        "to_s" => Some(Value::String(display_value(recv))),
+        "to_s" => Some(Value::String((display_value(recv)).into())),
         _ => None,
     }
 }
@@ -503,8 +549,8 @@ fn obj_set(name: &str, prop: &str, val: Value) {
 }
 
 fn ensure_obj(name: &str, class: &str) {
-    obj_set(name, "type", Value::String(class.to_string()));
-    obj_set(name, "name", Value::String(name.to_string()));
+    obj_set(name, "type", Value::String((class.to_string()).into()));
+    obj_set(name, "name", Value::String((name.to_string()).into()));
 }
 
 /// Reset OO/logic state — call between independent runs (tests).
@@ -523,7 +569,7 @@ fn to_s(v: &Value) -> String { display_value(v) }
 pub fn host_fact(args: &[Value]) -> Result<Value, String> {
     // fact(pred, a, b) records a binary fact
     if args.len() != 3 { return Ok(Value::Unit); }
-    let pred = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
+    let pred = match &args[0] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
     let a = to_s(&args[1]);
     let b = to_s(&args[2]);
     FACTS.with(|f| f.borrow_mut().entry(pred).or_insert_with(Vec::new).push((a, b)));
@@ -533,7 +579,7 @@ pub fn host_fact(args: &[Value]) -> Result<Value, String> {
 pub fn host_query(args: &[Value]) -> Result<Value, String> {
     // query(pred, a, _) -> Number of facts matching (pred, a, *)
     if args.len() != 3 { return Ok(Value::Int(0)); }
-    let pred = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
+    let pred = match &args[0] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
     let a = to_s(&args[1]);
     let count = FACTS.with(|f| {
         f.borrow().get(&pred).map(|v| v.iter().filter(|(x, _)| x == &a).count()).unwrap_or(0)
@@ -544,7 +590,7 @@ pub fn host_query(args: &[Value]) -> Result<Value, String> {
 pub fn host_goal(args: &[Value]) -> Result<Value, String> {
     // goal(pred, items...) records a pending goal
     if args.is_empty() { return Ok(Value::Unit); }
-    let pred = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
+    let pred = match &args[0] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
     let items: Vec<String> = args[1..].iter().map(to_s).collect();
     GOALS.with(|g| g.borrow_mut().push((pred, items)));
     Ok(Value::Unit)
@@ -623,7 +669,7 @@ static RULE_RENAME_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 fn fresh_rename(rule: &LogicRule) -> LogicRule {
     let suffix = RULE_RENAME_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut map: HashMap<String, String> = HashMap::new();
-    let mut rename = |s: &str, map: &mut HashMap<String, String>| -> String {
+    let rename = |s: &str, map: &mut HashMap<String, String>| -> String {
         if is_logic_var(s) {
             map.entry(s.to_string()).or_insert_with(|| format!("{}__{}", s, suffix)).clone()
         } else {
@@ -689,7 +735,7 @@ pub fn host_rule_add(args: &[Value]) -> Result<Value, String> {
     // declares a ground (or partially-variable) fact under the same
     // representation.
     if args.len() != 3 { return Err("rule_add: expected 3 args (head_pred, head_args_list, body_list)".into()); }
-    let head_pred = match &args[0] { Value::String(s) => s.clone(), v => to_s(v) };
+    let head_pred = match &args[0] { Value::String(s) => s.as_ref().clone(), v => to_s(v) };
     let head_args = value_to_str_list(&args[1]);
     let body_items: Vec<Value> = match &args[2] { Value::List(xs) => (**xs).clone(), _ => Vec::new() };
     let mut body = Vec::new();
@@ -711,12 +757,12 @@ pub fn host_solve(args: &[Value]) -> Result<Value, String> {
     // proven true (real backtracking -- every rule/fact that unifies
     // contributes a solution, not just the first).
     if args.len() != 2 { return Err("solve: expected 2 args (pred, args_list)".into()); }
-    let pred = match &args[0] { Value::String(s) => s.clone(), v => to_s(v) };
+    let pred = match &args[0] { Value::String(s) => s.as_ref().clone(), v => to_s(v) };
     let query_args = value_to_str_list(&args[1]);
     let empty: Subst = HashMap::new();
     let solutions = solve_goal(&pred, &query_args, &empty, 0);
     let out: Vec<Value> = solutions.iter().map(|s| {
-        Value::List(Arc::new(query_args.iter().map(|a| Value::String(walk(a, s))).collect()))
+        Value::List(Arc::new(query_args.iter().map(|a| Value::String((walk(a, s)).into())).collect()))
     }).collect();
     Ok(Value::List(Arc::new(out)))
 }
@@ -824,7 +870,7 @@ fn action_instance_label(name: &str, preconds: &[GroundFact], subst: &Subst) -> 
 pub fn host_action_add(args: &[Value]) -> Result<Value, String> {
     // action_add(name, preconds_list, add_effects_list, del_effects_list, cost) -> Unit
     if args.len() != 5 { return Err("action_add: expected 5 args (name, preconds, add_effects, del_effects, cost)".into()); }
-    let name = match &args[0] { Value::String(s) => s.clone(), v => to_s(v) };
+    let name = match &args[0] { Value::String(s) => s.as_ref().clone(), v => to_s(v) };
     let preconds = parse_ground_facts(&args[1]);
     let add_effects = parse_ground_facts(&args[2]);
     let del_effects = parse_ground_facts(&args[3]);
@@ -891,7 +937,7 @@ pub fn host_plan(args: &[Value]) -> Result<Value, String> {
     // an empty List if no plan is found within the search cap.
     if args.len() != 1 { return Err("plan: expected 1 arg (goal_facts_list)".into()); }
     let goal_facts = parse_ground_facts(&args[0]);
-    Ok(Value::List(Arc::new(plan_facts(goal_facts).into_iter().map(Value::String).collect())))
+    Ok(Value::List(Arc::new(plan_facts(goal_facts).into_iter().map(|s| Value::String(s.into())).collect())))
 }
 
 // ---- goal/pursue/activate surface syntax -- see ast.rs's Stmt::GoalDecl
@@ -913,7 +959,7 @@ thread_local! {
 pub fn host_goal_def(args: &[Value]) -> Result<Value, String> {
     // goal_def(name, deps_list) -> Unit; deps_list is [[pred,[args]], ...]
     if args.len() != 2 { return Err("goal_def: expected 2 args (name, deps_list)".into()); }
-    let name = match &args[0] { Value::String(s) => s.clone(), v => to_s(v) };
+    let name = match &args[0] { Value::String(s) => s.as_ref().clone(), v => to_s(v) };
     let deps = parse_ground_facts(&args[1]);
     GOAL_DEFS.with(|g| g.borrow_mut().insert(name, deps));
     Ok(Value::Unit)
@@ -923,10 +969,10 @@ pub fn host_pursue(args: &[Value]) -> Result<Value, String> {
     // pursue(name) -> List of action names in execution order (see
     // host_plan) for a goal previously declared via `goal NAME { ... }`.
     if args.len() != 1 { return Err("pursue: expected 1 arg (goal name)".into()); }
-    let name = match &args[0] { Value::String(s) => s.clone(), v => to_s(v) };
+    let name = match &args[0] { Value::String(s) => s.as_ref().clone(), v => to_s(v) };
     let goal_facts = GOAL_DEFS.with(|g| g.borrow().get(&name).cloned())
         .ok_or_else(|| format!("pursue: unknown goal '{}' (declare it with `goal {} {{ ... }}` first)", name, name))?;
-    Ok(Value::List(Arc::new(plan_facts(goal_facts).into_iter().map(Value::String).collect())))
+    Ok(Value::List(Arc::new(plan_facts(goal_facts).into_iter().map(|s| Value::String(s.into())).collect())))
 }
 
 pub fn host_action_bind(args: &[Value]) -> Result<Value, String> {
@@ -934,7 +980,7 @@ pub fn host_action_bind(args: &[Value]) -> Result<Value, String> {
     // `activate` calls (with a List of the action's bound arg values as
     // its single argument) for each plan step matching this action name.
     if args.len() != 2 { return Err("action_bind: expected 2 args (name, closure)".into()); }
-    let name = match &args[0] { Value::String(s) => s.clone(), v => to_s(v) };
+    let name = match &args[0] { Value::String(s) => s.as_ref().clone(), v => to_s(v) };
     ACTION_BODIES.with(|a| a.borrow_mut().insert(name, args[1].clone()));
     Ok(Value::Unit)
 }
@@ -943,7 +989,7 @@ pub fn host_action_lookup(args: &[Value]) -> Result<Value, String> {
     // action_lookup(name) -> the closure bound via action_bind, or an
     // error if none was ever bound for this action name.
     if args.len() != 1 { return Err("action_lookup: expected 1 arg (name)".into()); }
-    let name = match &args[0] { Value::String(s) => s.clone(), v => to_s(v) };
+    let name = match &args[0] { Value::String(s) => s.as_ref().clone(), v => to_s(v) };
     ACTION_BODIES.with(|a| a.borrow().get(&name).cloned())
         .ok_or_else(|| format!("activate: no action bound to '{}' (call action_bind(\"{}\", ...) first)", name, name))
 }
@@ -967,14 +1013,14 @@ fn split_action_label(label: &str) -> (String, Vec<String>) {
 pub fn host_action_base_name(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 { return Err("action_base_name: expected 1 arg (label)".into()); }
     let label = to_s(&args[0]);
-    Ok(Value::String(split_action_label(&label).0))
+    Ok(Value::String((split_action_label(&label).0).into()))
 }
 
 pub fn host_action_label_args(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 { return Err("action_label_args: expected 1 arg (label)".into()); }
     let label = to_s(&args[0]);
     let vals = split_action_label(&label).1;
-    Ok(Value::List(Arc::new(vals.into_iter().map(Value::String).collect())))
+    Ok(Value::List(Arc::new(vals.into_iter().map(|s| Value::String(s.into())).collect())))
 }
 
 // ---- bitfield helpers: plain-integer packed-field access, the practical
@@ -1070,39 +1116,39 @@ fn vfs_keys() -> Vec<String> {
 }
 
 pub fn host_vfs_read(args: &[Value]) -> Result<Value, String> {
-    let path = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => String::new() };
-    vfs_get(&path).map(Value::String).ok_or_else(|| format!("vfs_read: not found: {}", path))
+    let path = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), _ => String::new() };
+    vfs_get(&path).map(|s| Value::String(s.into())).ok_or_else(|| format!("vfs_read: not found: {}", path))
 }
 
 pub fn host_vfs_write(args: &[Value]) -> Result<Value, String> {
-    let path = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
-    let contents = match args.get(1) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
+    let path = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => to_s(v), None => String::new() };
+    let contents = match args.get(1) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => to_s(v), None => String::new() };
     vfs_set(path, contents);
     Ok(Value::Bool(true))
 }
 
 pub fn host_vfs_append(args: &[Value]) -> Result<Value, String> {
-    let path = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
-    let text = match args.get(1) { Some(Value::String(s)) => s.clone(), Some(v) => to_s(v), None => String::new() };
+    let path = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => to_s(v), None => String::new() };
+    let text = match args.get(1) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => to_s(v), None => String::new() };
     vfs_append_text(path, &text);
     Ok(Value::Bool(true))
 }
 
 pub fn host_vfs_exists(args: &[Value]) -> Result<Value, String> {
-    let path = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => String::new() };
-    Ok(Value::String(if vfs_get(&path).is_some() { "1".into() } else { "0".into() }))
+    let path = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), _ => String::new() };
+    Ok(Value::String(if vfs_get(&path).is_some() { "1".to_string().into() } else { "0".to_string().into() }))
 }
 
 pub fn host_vfs_list(args: &[Value]) -> Result<Value, String> {
     // vfs_list(prefix) -> List of stored paths starting with prefix.
-    let prefix = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => String::new() };
+    let prefix = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), _ => String::new() };
     let mut matching: Vec<String> = vfs_keys().into_iter().filter(|k| k.starts_with(&prefix)).collect();
     matching.sort();
-    Ok(Value::List(Arc::new(matching.into_iter().map(Value::String).collect())))
+    Ok(Value::List(Arc::new(matching.into_iter().map(|s| Value::String(s.into())).collect())))
 }
 
 pub fn host_vfs_delete(args: &[Value]) -> Result<Value, String> {
-    let path = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => String::new() };
+    let path = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), _ => String::new() };
     Ok(Value::Bool(vfs_del(&path)))
 }
 
@@ -1112,7 +1158,7 @@ pub fn host_vfs_flush_to_disk(args: &[Value]) -> Result<Value, String> {
     // explicit call (not automatic) -- security-gated: real_dir must
     // canonicalize to somewhere inside an allowed root (PATLANG_VFS_ALLOWED_ROOT
     // env var, defaulting to the current working directory).
-    let prefix = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => String::new() };
+    let prefix = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), _ => String::new() };
     let real_dir = match args.get(1) { Some(Value::String(s)) => s.clone(), _ => return Err("vfs_flush_to_disk: expected real_dir as second arg".into()) };
 
     let allowed_root = match std::env::var("PATLANG_VFS_ALLOWED_ROOT") {
@@ -1122,8 +1168,8 @@ pub fn host_vfs_flush_to_disk(args: &[Value]) -> Result<Value, String> {
     let allowed_root = std::fs::canonicalize(&allowed_root)
         .map_err(|e| format!("vfs_flush_to_disk: canonicalize allowed root {}: {}", allowed_root.display(), e))?;
 
-    std::fs::create_dir_all(&real_dir).map_err(|e| format!("vfs_flush_to_disk: create_dir_all {}: {}", real_dir, e))?;
-    let target_canon = std::fs::canonicalize(&real_dir)
+    std::fs::create_dir_all(&*real_dir).map_err(|e| format!("vfs_flush_to_disk: create_dir_all {}: {}", real_dir, e))?;
+    let target_canon = std::fs::canonicalize(&*real_dir)
         .map_err(|e| format!("vfs_flush_to_disk: canonicalize {}: {}", real_dir, e))?;
     if !target_canon.starts_with(&allowed_root) {
         return Err(format!("vfs_flush_to_disk: {} is outside the allowed root {} (set PATLANG_VFS_ALLOWED_ROOT to permit it)", target_canon.display(), allowed_root.display()));
@@ -1146,16 +1192,16 @@ pub fn host_vfs_flush_to_disk(args: &[Value]) -> Result<Value, String> {
 pub fn host_new(args: &[Value]) -> Result<Value, String> {
     // new(class, name) -> name, registering the object
     if args.len() != 2 { return Ok(Value::Unit); }
-    let class = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
-    let name = match &args[1] { Value::String(s) => s.clone(), _ => String::new() };
+    let class = match &args[0] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
+    let name = match &args[1] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
     if !name.is_empty() { ensure_obj(&name, &class); }
-    Ok(Value::String(name))
+    Ok(Value::String(name.into()))
 }
 
 pub fn host_set_var(args: &[Value]) -> Result<Value, String> {
     // set_var(key, val) stores into the shared __vars object
     if args.len() != 2 { return Ok(Value::Unit); }
-    let key = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
+    let key = match &args[0] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
     if !key.is_empty() { obj_set("__vars", &key, args[1].clone()); }
     Ok(Value::Unit)
 }
@@ -1164,13 +1210,13 @@ pub fn host_send(args: &[Value]) -> Result<Value, String> {
     // send(recv, method, args...) — supports "set" like the template arm
     if args.len() < 2 { return Ok(Value::Unit); }
     let recv = &args[0];
-    let method = match &args[1] { Value::String(s) => s.clone(), _ => String::new() };
+    let method = match &args[1] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
     let rest = &args[2..];
     match method.as_str() {
         "set" => {
-            let recv_name = match recv { Value::String(s) => s.clone(), _ => String::new() };
+            let recv_name = match recv { Value::String(s) => s.as_ref().clone(), _ => String::new() };
             if rest.len() != 2 { return Ok(Value::Unit); }
-            let prop = match &rest[0] { Value::String(s) => s.clone(), _ => String::new() };
+            let prop = match &rest[0] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
             if !recv_name.is_empty() && !prop.is_empty() { obj_set(&recv_name, &prop, rest[1].clone()); }
             Ok(Value::Unit)
         }
@@ -1198,7 +1244,7 @@ fn shape_tag(xs: &[Value]) -> Result<&str, String> {
 }
 
 fn shape_str(xs: &[Value], i: usize, what: &str) -> Result<String, String> {
-    match xs.get(i) { Some(Value::String(s)) => Ok(s.clone()), _ => Err(format!("compile_shape: expected string {} in node", what)) }
+    match xs.get(i) { Some(Value::String(s)) => Ok((*s.clone()).clone()), _ => Err(format!("compile_shape: expected string {} in node", what)) }
 }
 
 fn shape_stmt_list<'a>(xs: &'a [Value], i: usize, what: &str) -> Result<&'a Vec<Value>, String> {
@@ -1227,7 +1273,7 @@ fn lower_shape_expr(v: &Value, f: &mut Function, ctx: &ShapeCtx) -> Result<(), S
         }
         "Str" => {
             let text = shape_str(xs, 1, "string text")?;
-            f.body.push(Instr::Const(Value::String(text)));
+            f.body.push(Instr::Const(Value::String((text).into())));
         }
         "Bool" => {
             let text = shape_str(xs, 1, "bool text")?;
@@ -1302,7 +1348,7 @@ fn lower_shape_expr(v: &Value, f: &mut Function, ctx: &ShapeCtx) -> Result<(), S
             if prop == "length" || prop == "len" {
                 f.body.push(Instr::CallHost("len".into(), 1));
             } else {
-                f.body.push(Instr::Const(Value::String(prop)));
+                f.body.push(Instr::Const(Value::String((prop).into())));
                 f.body.push(Instr::CallHost("get".into(), 2));
             }
         }
@@ -1400,7 +1446,7 @@ pub fn shape_to_program(v: &Value) -> Result<Program, String> {
                 let name = shape_str(nx, 1, "function name")?;
                 let params: Vec<String> = match nx.get(2) {
                     Some(Value::List(ps)) => ps.iter().map(|p| match p {
-                        Value::String(s) => Ok(s.clone()),
+                        Value::String(s) => Ok(s.as_ref().clone()),
                         _ => Err("compile_shape: function param must be a string".to_string()),
                     }).collect::<Result<_, _>>()?,
                     _ => return Err("compile_shape: Func missing params".into()),
@@ -1479,7 +1525,7 @@ fn compile_source_to_exe(rust_src: &str, out: &str, what: &str, target: Option<&
     if !status.success() { return Err(format!("{}: rustc failed with status {}", what, status)); }
     let p = std::path::Path::new(out);
     let abs = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    Ok(Value::String(abs.display().to_string()))
+    Ok(Value::String((abs.display().to_string()).into()))
 }
 
 /// Shared back half: emit Rust for a Program and compile it with rustc.
@@ -1493,7 +1539,7 @@ fn compile_program_to_exe(program: &Program, out: &str, what: &str) -> Result<Va
 /// emitted program. Self-hosted codegen concatenates this with its own
 /// generated build_program section.
 pub fn host_codegen_prelude(_args: &[Value]) -> Result<Value, String> {
-    Ok(Value::String(super::codegen::RustCodegen::prelude().to_string()))
+    Ok(Value::String((super::codegen::RustCodegen::prelude().to_string()).into()))
 }
 
 /// codegen_prelude_chunk(name) -> the raw text of a single named prelude
@@ -1507,7 +1553,7 @@ pub fn host_codegen_prelude_chunk(args: &[Value]) -> Result<Value, String> {
         _ => return Err("codegen_prelude_chunk: expected chunk name string".into()),
     };
     super::codegen::RustCodegen::chunk_text_by_name(&name)
-        .map(Value::String)
+        .map(|s| Value::String(s.into()))
         .ok_or_else(|| format!("codegen_prelude_chunk: unknown chunk '{}'", name))
 }
 
@@ -1524,7 +1570,69 @@ pub fn host_rustc_build(args: &[Value]) -> Result<Value, String> {
     };
     let target = match args.get(2) { Some(Value::String(s)) if !s.trim().is_empty() => Some(s.clone()), _ => None };
     let opt_level = match args.get(3) { Some(Value::String(s)) if !s.trim().is_empty() => Some(s.clone()), _ => None };
-    compile_source_to_exe(&src, &out, "rustc_build", target.as_deref(), opt_level.as_deref())
+    compile_source_to_exe(&src, &out, "rustc_build", target.as_deref().map(|x| x.as_str()), opt_level.as_deref().map(|x| x.as_str()))
+}
+
+/// rustc_build_chunked(rust_source_no_prelude, chunk_names_csv, out_path[, opt_level])
+/// -> compiled artifact path. Interpreter-path counterpart to the
+/// compiled-dispatch `"rustc_build_chunked"` arm in codegen.rs's
+/// `host_call_codegen_bootstrap_inner` -- needed separately because
+/// `--ir-run` (the tree-walking interpreter, what `self_hosting/
+/// build_patc1.patlang` actually runs under) looks up host functions via
+/// this crate's own `interp.host` table, not through the compiled-program
+/// dispatch path at all. Missing this exact registration is what made the
+/// self-hosted Gen A build fail with "host fn 'rustc_build_chunked' not
+/// found" the first time `build_patc1.patlang` was switched to the chunked
+/// path (Stage 40 self-hosting wiring).
+pub fn host_rustc_build_chunked(args: &[Value]) -> Result<Value, String> {
+    let src = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => return Err("rustc_build_chunked: expected Rust source string".into()) };
+    let chunk_names_csv = match args.get(1) { Some(Value::String(s)) => s.clone(), _ => return Err("rustc_build_chunked: expected chunk names csv".into()) };
+    let out = match args.get(2) {
+        Some(Value::String(s)) if !s.trim().is_empty() => s.clone(),
+        _ => return Err("rustc_build_chunked: expected output path as third argument".into()),
+    };
+    let opt_level = match args.get(3) { Some(Value::String(s)) if !s.trim().is_empty() => Some(s.clone()), _ => None };
+    let names: Vec<String> = chunk_names_csv.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    let out_path = super::codegen::build_chunked_native_opt(&src, &names, &out, opt_level.as_deref().map(|s| s.as_str()))?;
+    Ok(Value::String(out_path.into()))
+}
+
+/// rustc_build_chunked_texts(rust_source_no_prelude, base_name, chunk_texts,
+/// out_path[, opt_level]) -> compiled artifact path. `chunk_texts` is a
+/// PatLang list of `[name, text]` 2-element lists (one entry named exactly
+/// `base_name`, the merged "core"+Value-variant text, plus one per other
+/// required chunk) -- the generalized entry point used when the CALLER
+/// supplies chunk TEXT explicitly instead of relying on this crate's own
+/// `ChunkId`/`PRELUDE_*` constants. Exists so a genuinely self-hosted
+/// caller (build_patc1.patlang, sourcing chunk text via the
+/// `codegen_prelude_chunk` host function instead of any Rust-side lookup)
+/// can drive the exact same rlib-precompile-and-link mechanism
+/// `rustc_build_chunked` uses, staying consistent with how the SAME
+/// mechanism must also work when embedded standalone inside a compiled
+/// `patc`-generated binary (see the matching self-contained arm added to
+/// `PRELUDE_CODEGEN_BOOTSTRAP` in codegen.rs).
+pub fn host_rustc_build_chunked_texts(args: &[Value]) -> Result<Value, String> {
+    let src = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => return Err("rustc_build_chunked_texts: expected Rust source string".into()) };
+    let base_name = match args.get(1) { Some(Value::String(s)) => s.clone(), _ => return Err("rustc_build_chunked_texts: expected base chunk name string".into()) };
+    let pairs = match args.get(2) { Some(Value::List(xs)) => xs.clone(), _ => return Err("rustc_build_chunked_texts: expected chunk_texts list".into()) };
+    let out = match args.get(3) {
+        Some(Value::String(s)) if !s.trim().is_empty() => s.clone(),
+        _ => return Err("rustc_build_chunked_texts: expected output path as fourth argument".into()),
+    };
+    let opt_level = match args.get(4) { Some(Value::String(s)) if !s.trim().is_empty() => Some(s.clone()), _ => None };
+    let mut chunk_texts: Vec<(String, String)> = Vec::with_capacity(pairs.len());
+    for p in pairs.iter() {
+        match p {
+            Value::List(pair) if pair.len() == 2 => {
+                let name = match &pair[0] { Value::String(s) => s.as_ref().clone(), _ => return Err("rustc_build_chunked_texts: chunk_texts entry name must be a string".into()) };
+                let text = match &pair[1] { Value::String(s) => s.as_ref().clone(), _ => return Err("rustc_build_chunked_texts: chunk_texts entry text must be a string".into()) };
+                chunk_texts.push((name, text));
+            }
+            _ => return Err("rustc_build_chunked_texts: expected chunk_texts entries to be [name, text] pairs".into()),
+        }
+    }
+    let out_path = super::codegen::build_chunked_native_from_texts(&src, &base_name, &chunk_texts, &out, opt_level.as_deref().map(|s| s.as_str()))?;
+    Ok(Value::String(out_path.into()))
 }
 
 /// compile_shape(ast_shape, out_path) -> compiled exe path.
@@ -1573,7 +1681,7 @@ fn decode_ir_instr(v: &Value) -> Result<Instr, String> {
                         Value::Int(t.parse::<i64>().map_err(|_| format!("compile_ir: bad number '{}'", text))?)
                     }
                 }
-                "str" => Value::String(text),
+                "str" => Value::String((text).into()),
                 "bool" => Value::Bool(text == "true"),
                 other => return Err(format!("compile_ir: unknown const kind '{}'", other)),
             };
@@ -1611,7 +1719,7 @@ fn decode_ir_instr(v: &Value) -> Result<Instr, String> {
             let names_list = shape_stmt_list(xs, 2, "in MakeClosure")?;
             let mut captured_names = Vec::with_capacity(names_list.len());
             for nv in names_list {
-                captured_names.push(match nv { Value::String(s) => s.clone(), _ => return Err("compile_ir: captured name must be a string".into()) });
+                captured_names.push(match nv { Value::String(s) => s.as_ref().clone(), _ => return Err("compile_ir: captured name must be a string".into()) });
             }
             Instr::MakeClosure(func_name, captured_names)
         }
@@ -1639,7 +1747,7 @@ pub fn ir_shape_to_program(v: &Value) -> Result<Program, String> {
         let name = shape_str(fx, 1, "function name")?;
         let params: Vec<String> = match fx.get(2) {
             Some(Value::List(ps)) => ps.iter().map(|p| match p {
-                Value::String(s) => Ok(s.clone()),
+                Value::String(s) => Ok(s.as_ref().clone()),
                 _ => Err("compile_ir: param must be a string".to_string()),
             }).collect::<Result<_, _>>()?,
             _ => return Err("compile_ir: FuncIR missing params".into()),
@@ -1790,7 +1898,7 @@ pub fn host_tcp_read(args: &[Value]) -> Result<Value, String> {
         .map_err(|e| format!("tcp_read: {}", e))?;
     let mut buf = vec![0u8; 65536];
     let n = stream.read(&mut buf).map_err(|e| format!("tcp_read: {}", e))?;
-    Ok(Value::String(String::from_utf8_lossy(&buf[..n]).to_string()))
+    Ok(Value::String((String::from_utf8_lossy(&buf[..n]).to_string()).into()))
 }
 
 // tcp_read_or_empty(conn) -> String, same single-read-up-to-64KiB shape
@@ -1818,15 +1926,15 @@ pub fn host_tcp_read_or_empty(args: &[Value]) -> Result<Value, String> {
         .map_err(|e| format!("tcp_read_or_empty: {}", e))?;
     let mut buf = vec![0u8; 65536];
     match stream.read(&mut buf) {
-        Ok(n) => Ok(Value::String(String::from_utf8_lossy(&buf[..n]).to_string())),
-        Err(_) => Ok(Value::String(String::new())),
+        Ok(n) => Ok(Value::String((String::from_utf8_lossy(&buf[..n]).to_string()).into())),
+        Err(_) => Ok(Value::String((String::new()).into())),
     }
 }
 
 pub fn host_tcp_write(args: &[Value]) -> Result<Value, String> {
     use std::io::Write;
     let id = arg_num(args, 0, "tcp_write")? as usize;
-    let data = match args.get(1) { Some(Value::String(s)) => s.clone(), Some(v) => display_value(v), None => String::new() };
+    let data = match args.get(1) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => display_value(v).into(), None => String::new().into() };
     let mut stream = CONNS.with(|c| c.borrow().get(&id).map(|s| s.try_clone()))
         .ok_or_else(|| format!("tcp_write: unknown connection {}", id))?
         .map_err(|e| format!("tcp_write: {}", e))?;
@@ -1889,7 +1997,7 @@ thread_local! {
 
 pub fn host_spawn(args: &[Value]) -> Result<Value, String> {
     let path = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => return Err("spawn: expected program path".into()) };
-    let extra: Vec<String> = args[1..].iter().filter_map(|v| match v { Value::String(s) => Some(s.clone()), _ => None }).collect();
+    let extra: Vec<String> = args[1..].iter().filter_map(|v| match v { Value::String(s) => Some(s.as_ref().clone()), _ => None }).collect();
     // Child's stdout/stderr are discarded, not inherited -- a spawned
     // child otherwise shares the parent's own stdout/stderr by default
     // (std::process::Command's own default), which interleaves the
@@ -1905,7 +2013,7 @@ pub fn host_spawn(args: &[Value]) -> Result<Value, String> {
     // exec_capture (blocking, captures everything) for the case where
     // that's an acceptable tradeoff; spawn is for the non-blocking case,
     // where discarding is the safe default.
-    let child = std::process::Command::new(&path).args(&extra)
+    let child = std::process::Command::new(&*path).args(&extra)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn().map_err(|e| format!("spawn: {}: {}", path, e))?;
@@ -1962,9 +2070,9 @@ pub fn host_kill(args: &[Value]) -> Result<Value, String> {
 /// the codegen template's host arm.
 pub fn host_contract_check(args: &[Value]) -> Result<Value, String> {
     if args.len() != 4 { return Err("contract_check: expected 4 args".into()); }
-    let func = match &args[0] { Value::String(s) => s.clone(), _ => String::new() };
-    let kind = match &args[1] { Value::String(s) => s.clone(), _ => String::new() };
-    let text = match &args[2] { Value::String(s) => s.clone(), _ => String::new() };
+    let func = match &args[0] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
+    let kind = match &args[1] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
+    let text = match &args[2] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
     let ok = args[3].as_bool().unwrap_or(false);
     if ok {
         // Record the successful check as a ground fact (an empty-body
@@ -2200,7 +2308,7 @@ pub fn host_trunc(args: &[Value]) -> Result<Value, String> { round_like(args, "t
 pub fn host_to_fixed(args: &[Value]) -> Result<Value, String> {
     let x = arg_f64(args, 0, "to_fixed")?;
     let places = arg_f64(args, 1, "to_fixed")?.max(0.0) as usize;
-    Ok(Value::String(format!("{:.*}", places, x)))
+    Ok(Value::String(format!("{:.*}", places, x).into()))
 }
 
 /// abs(x): exact for all real kinds (Int/BigInt/Rational — just clear the
@@ -2239,7 +2347,7 @@ pub fn host_numeric_kind(args: &[Value]) -> Result<Value, String> {
         Value::Complex(_, _) => "complex",
         _ => "other",
     };
-    Ok(Value::String(s.to_string()))
+    Ok(Value::String((s.to_string()).into()))
 }
 
 /// type_of(x) -> "unit"|"bool"|"int"|"float"|"bigint"|"rational"|"complex"|
@@ -2266,7 +2374,7 @@ pub fn host_type_of(args: &[Value]) -> Result<Value, String> {
         Value::Object(_) => "object",
         Value::Closure { .. } => "closure",
     };
-    Ok(Value::String(s.to_string()))
+    Ok(Value::String((s.to_string()).into()))
 }
 
 /// Register the Stage 0 string/list/file shims on an interpreter.
@@ -2315,6 +2423,8 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("file_exists", host_file_exists);
     interp.host.insert("list_dir", host_list_dir);
     interp.host.insert("rename_file", host_rename_file);
+    interp.host.insert("copy_file", host_copy_file);
+    interp.host.insert("remove_file", host_remove_file);
     interp.host.insert("hash_string", host_hash_string);
     interp.host.insert("argv", host_argv);
     interp.host.insert("now_ms", host_now_ms);
@@ -2329,6 +2439,8 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("codegen_prelude", host_codegen_prelude);
     interp.host.insert("codegen_prelude_chunk", host_codegen_prelude_chunk);
     interp.host.insert("rustc_build", host_rustc_build);
+    interp.host.insert("rustc_build_chunked", host_rustc_build_chunked);
+    interp.host.insert("rustc_build_chunked_texts", host_rustc_build_chunked_texts);
     // OO + logic hosts (state shared per thread, matching compiled semantics)
     interp.host.insert("fact", host_fact);
     interp.host.insert("query", host_query);

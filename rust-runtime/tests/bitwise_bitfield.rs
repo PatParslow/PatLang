@@ -28,7 +28,7 @@ fn shift_boundary_cases() {
 
 #[test]
 fn non_integer_operand_errors_instead_of_silently_coercing() {
-    assert!(bitand(&Value::String("x".into()), &i(1)).is_err());
+    assert!(bitand(&Value::String("x".to_string().into()), &i(1)).is_err());
 }
 
 #[test]

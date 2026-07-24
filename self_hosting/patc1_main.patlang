@@ -145,17 +145,70 @@ else
         print("  pat --ir-run self_hosting/build_x64_runtime.patlang")
       end
     else
-      let rs = emit_program_rs(ir)
-      if args.length >= 4 then
-        let exe = rustc_build(rs, output, args[2], args[3])
-      else
-        if args.length >= 3 then
-          let exe = rustc_build(rs, output, args[2])
-        else
-          let exe = rustc_build(rs, output)
+      # Stage 40 (patlang-patc-prelude-chunk-linking-investigation):
+      # `patc1_main.patlang` gets compiled INTO patc1.exe itself -- the
+      # driver logic that runs for EVERY compile patc1.exe performs,
+      # including Gen B/C (patc1.exe compiling its own combined source
+      # into patc2.exe/patc3.exe). As a STANDALONE compiled program it has
+      # no direct access to ChunkId/PRELUDE_*/build_chunked_native (only
+      # the native `pat` process has those) -- but it DOES have its own
+      # compiled-in self-hosted mirror functions (`emit_chunk_core()` etc,
+      # from runtime_rs.patlang, part of the same combined source), so it
+      # can supply chunk TEXT explicitly via `chunk_texts_for` and drive
+      # the self-contained `rustc_build_chunked_texts` host function
+      # (embedded, std-library-only implementation in codegen.rs's
+      # PRELUDE_CODEGEN_BOOTSTRAP text) instead of falling back to the
+      # old monolithic path. This is what makes Gen B/C genuinely use
+      # chunking too, not just Gen A.
+      #
+      # Cross-compilation (a non-empty, non-"--x64" target-triple arg,
+      # e.g. "wasm32-wasip1") is rare and has no chunked equivalent --
+      # still falls back to the monolithic `emit_program_rs`+`rustc_build`
+      # path in that case.
+      let has_target_triple = false
+      if args.length >= 3 then
+        if args[2] != "--x64" then
+          if args[2] != "" then
+            let has_target_triple = true
+          end
         end
       end
-      print("patc1: " + exe)
+      if has_target_triple then
+        let rs = emit_program_rs(ir)
+        if args.length >= 4 then
+          let exe = rustc_build(rs, output, args[2], args[3])
+        else
+          let exe = rustc_build(rs, output, args[2])
+        end
+        print("patc1: " + exe)
+      else
+        let chunks = required_chunks(ir)
+        let base_and_pairs = chunk_texts_for(chunks)
+        let base_name = base_and_pairs[0]
+        let pairs = base_and_pairs[1]
+        let rs = emit_program_rs_chunked(ir)
+        # Default the FINAL LINK step's opt-level to "0" when the caller
+        # doesn't specify one, rather than leaving it at rustc's own
+        # default (-O/opt-level 2). Two hung, 1GB+-and-climbing rustc.exe
+        # processes were found and killed the first time Gen B
+        # (./patc1.exe compiling its own combined ~2.3MB-per-program-text
+        # source into patc2.exe) was tried WITHOUT an explicit opt-level
+        # arg -- the exact memory-blowup/hang pathology `rustc_build`'s
+        # own opt-level override exists for, just newly reachable via the
+        # chunked path's final link instead of the old monolithic one.
+        # The precompiled CHUNK rlibs are UNAFFECTED (still always built
+        # at the real -O, proven safe there) -- only the small, always-
+        # regenerated per-program glue text is affected, where the
+        # optimization loss is a minor, worthwhile trade against a real
+        # crash risk for any caller (like Gen B/C) compiling something
+        # this large.
+        if args.length >= 4 then
+          let exe = rustc_build_chunked_texts(rs, base_name, pairs, output, args[3])
+        else
+          let exe = rustc_build_chunked_texts(rs, base_name, pairs, output, "0")
+        end
+        print("patc1: " + exe)
+      end
     end
   end
 end
