@@ -157,11 +157,18 @@ pub enum Stmt {
     // fns can't call closures themselves, so dispatch lives in the
     // interpreter's/compiled backend's own CallHost("send", ...) handling,
     // same pattern as `emit`/`when` closures.
+    // Slice 3 adds `traits`: a class block may list `traits A, B` --
+    // composable mixins, resolved own class > traits (LAST-listed wins on
+    // collision) > parent, per the confirmed design. A trait is just an
+    // ordinary `class NAME { ... }` with no parent of its own; nothing
+    // marks a class as "a trait" specifically, it's purely how it's USED
+    // (listed in another class's `traits` line) that matters.
     ClassDecl {
         name: String,
         parent: Option<String>,
         fields: Vec<(String, Expr)>,
         methods: Vec<(String, Vec<String>, Vec<Stmt>)>,
+        traits: Vec<String>,
     },
     // Extend with more statement types as needed
 }

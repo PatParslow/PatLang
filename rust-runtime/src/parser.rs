@@ -344,8 +344,22 @@ impl<'a> Parser<'a> {
                 self.consume_newlines()?;
                 let mut fields: Vec<(String, Expr)> = Vec::new();
                 let mut methods: Vec<(String, Vec<String>, Vec<Stmt>)> = Vec::new();
+                let mut traits: Vec<String> = Vec::new();
                 while !matches!(self.curr, Token::BlockEnd | Token::EOF) {
                     match &self.curr {
+                        // Slice 3: `traits A, B` -- comma-separated trait
+                        // (class) names to compose in, last-listed wins
+                        // on a field/method collision between traits.
+                        Token::Identifier(s) if s == "traits" => {
+                            self.advance()?; // consume 'traits'
+                            loop {
+                                match &self.curr {
+                                    Token::Identifier(t) => { traits.push(t.clone()); self.advance()?; }
+                                    _ => return Err(ParserError::ExpectedToken { expected: "trait name", line: self.line_no, hint: "Use `traits A, B` (comma-separated class names)" }),
+                                }
+                                if matches!(self.curr, Token::Comma) { self.advance()?; } else { break; }
+                            }
+                        }
                         Token::Identifier(s) if s == "field" => {
                             self.advance()?; // consume 'field'
                             let fname = match &self.curr {
@@ -369,12 +383,12 @@ impl<'a> Parser<'a> {
                                 _ => return Err(ParserError::UnexpectedToken { token: self.curr.clone(), line: self.line_no, hint: "Expected `make a function called NAME ... end` inside a class block" }),
                             }
                         }
-                        _ => return Err(ParserError::UnexpectedToken { token: self.curr.clone(), line: self.line_no, hint: "Expected `field NAME = EXPR` or `make a function called NAME ... end` inside a class block" }),
+                        _ => return Err(ParserError::UnexpectedToken { token: self.curr.clone(), line: self.line_no, hint: "Expected `field NAME = EXPR`, `make a function called NAME ... end`, or `traits A, B` inside a class block" }),
                     }
                     self.consume_newlines()?;
                 }
                 self.expect(Token::BlockEnd, "'}' to close class block", "Close the class block with '}'")?;
-                Ok(Stmt::ClassDecl { name, parent, fields, methods })
+                Ok(Stmt::ClassDecl { name, parent, fields, methods, traits })
             }
             Token::Rule => {
                 // If followed by '(', treat as normal call: rule(...)

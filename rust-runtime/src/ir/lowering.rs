@@ -332,20 +332,25 @@ impl Lowerer {
                 f.body.push(Instr::BuildList(deps.len()));
                 f.body.push(Instr::CallHost("goal_def".into(), 2));
             }
-            Stmt::ClassDecl { name, parent, fields, methods } => {
-                // Slice 1+2 of the classes/traits/inheritance feature (see
-                // the "synchronous-questing-metcalfe" plan): sugar for a
-                // single class_def(name, parent_or_empty, [[field,
-                // default_value], ...], [[method_name, closure], ...]) host
-                // call (see hosts.rs::host_class_def). Field defaults are
-                // ordinary expressions, evaluated once here at class-def
-                // time via the normal lower_expr path. Methods (Slice 2)
-                // become genuine closures built via lower_closure_literal
-                // (each gets an implicit leading "self" param, bound to the
-                // receiver id at `send`-dispatch time -- see interpreter.rs/
-                // codegen.rs's CallHost("send", ...) handling), same
-                // "declarative sugar wrapping real closure values" shape as
-                // `when` blocks (lower_when).
+            Stmt::ClassDecl { name, parent, fields, methods, traits } => {
+                // Slice 1+2+3 of the classes/traits/inheritance feature
+                // (see the "synchronous-questing-metcalfe" plan): sugar
+                // for a single class_def(name, parent_or_empty, [[field,
+                // default_value], ...], [[method_name, closure], ...],
+                // [trait_name, ...]) host call (see hosts.rs::
+                // host_class_def). Field defaults are ordinary
+                // expressions, evaluated once here at class-def time via
+                // the normal lower_expr path. Methods (Slice 2) become
+                // genuine closures built via lower_closure_literal (each
+                // gets an implicit leading "self" param, bound to the
+                // receiver id at `send`-dispatch time -- see
+                // interpreter.rs/codegen.rs's CallHost("send", ...)
+                // handling), same "declarative sugar wrapping real
+                // closure values" shape as `when` blocks (lower_when).
+                // Trait names (Slice 3) are compile-time string TOKENS,
+                // same convention as RuleDecl/GoalDecl's own dep args --
+                // a trait reference is a class-registry lookup key, not
+                // an expression to evaluate.
                 f.body.push(Instr::Const(Value::String((name.clone()).into())));
                 f.body.push(Instr::Const(Value::String(parent.clone().unwrap_or_default().into())));
                 for (fname, default_expr) in fields {
@@ -362,7 +367,11 @@ impl Lowerer {
                     f.body.push(Instr::BuildList(2)); // [method_name, closure]
                 }
                 f.body.push(Instr::BuildList(methods.len()));
-                f.body.push(Instr::CallHost("class_def".into(), 4));
+                for tname in traits {
+                    f.body.push(Instr::Const(Value::String((tname.clone()).into())));
+                }
+                f.body.push(Instr::BuildList(traits.len()));
+                f.body.push(Instr::CallHost("class_def".into(), 5));
             }
             Stmt::When { event, body, .. } => {
                 self.lower_when(event, body, f);

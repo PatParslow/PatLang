@@ -444,6 +444,7 @@ struct ClassDef {
     parent: Option<String>,
     field_defaults: Vec<(String, Value)>,
     methods: HashMap<String, Value>,
+    traits: Vec<String>,
 }
 static CLASSES: OnceLock<Mutex<HashMap<String, ClassDef>>> = OnceLock::new();
 
@@ -463,6 +464,11 @@ fn resolve_class_field_defaults(class: &str) -> Vec<(String, Value)> {
     let mut out: Vec<(String, Value)> = Vec::new();
     for c in chain.iter().rev() {
         if let Some(def) = classes.get(c) {
+            for t in &def.traits {
+                if let Some(tdef) = classes.get(t) {
+                    out.extend(tdef.field_defaults.iter().cloned());
+                }
+            }
             out.extend(def.field_defaults.iter().cloned());
         }
     }
@@ -480,6 +486,11 @@ fn resolve_class_method(class: &str, method: &str) -> Option<Value> {
         if visited.contains(&c) { break; }
         let def = classes.get(&c)?;
         if let Some(m) = def.methods.get(method) { return Some(m.clone()); }
+        for t in def.traits.iter().rev() {
+            if let Some(tdef) = classes.get(t) {
+                if let Some(m) = tdef.methods.get(method) { return Some(m.clone()); }
+            }
+        }
         visited.push(c);
         cur = def.parent.clone();
     }
@@ -2882,7 +2893,7 @@ fn host_call_io_misc(name: &str, args: &[Value]) -> Option<Result<Value, String>
                 Ok(Value::String(name.into()))
             }
             "class_def" => {
-                if args.len() != 3 && args.len() != 4 { return Err("class_def: expected 3 or 4 args (name, parent, field_defaults, [methods])".into()); }
+                if args.len() < 3 || args.len() > 5 { return Err("class_def: expected 3-5 args (name, parent, field_defaults, [methods], [traits])".into()); }
                 let name = match &args[0] { Value::String(s) => s.as_ref().clone(), v => to_s(v) };
                 let parent = match &args[1] { Value::String(s) if !s.is_empty() => Some(s.as_ref().clone()), _ => None };
                 let field_defaults: Vec<(String, Value)> = match &args[2] {
@@ -2905,8 +2916,12 @@ fn host_call_io_misc(name: &str, args: &[Value]) -> Option<Result<Value, String>
                     }).collect(),
                     _ => HashMap::new(),
                 };
+                let traits: Vec<String> = match args.get(4) {
+                    Some(Value::List(xs)) => xs.iter().map(|v| match v { Value::String(s) => s.as_ref().clone(), v => to_s(v) }).collect(),
+                    _ => Vec::new(),
+                };
                 CLASSES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap()
-                    .insert(name, ClassDef { parent, field_defaults, methods });
+                    .insert(name, ClassDef { parent, field_defaults, methods, traits });
                 Ok(Value::Unit)
             }
             "set_var" => {

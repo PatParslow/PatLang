@@ -569,14 +569,24 @@ struct ClassDef {
     // built `Value::Closure` (built at class_def-call time via
     // lower_closure_literal -- see lowering.rs's ClassDecl handling).
     methods: HashMap<String, Value>,
+    // Slice 3: composable mixins (`traits A, B` inside the class block),
+    // listed in source order. A trait is just an ordinary registered
+    // `ClassDef` (usually one with no parent of its own) -- nothing
+    // marks it as "a trait" specifically, only how it's referenced here.
+    // Resolution order everywhere below is own class > traits (LAST-
+    // listed wins on a collision between traits) > parent, confirmed
+    // with the user before Slice 1 started.
+    traits: Vec<String>,
 }
 static CLASSES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, ClassDef>>> = std::sync::OnceLock::new();
 
 pub fn host_class_def(args: &[Value]) -> Result<Value, String> {
-    // class_def(name, parent, field_defaults_list, methods_list) -> Unit;
-    // field_defaults_list is [[field_name, default_value], ...], methods_list
-    // is [[method_name, closure], ...] (Slice 2; empty for Slice-1-only callers).
-    if args.len() != 3 && args.len() != 4 { return Err("class_def: expected 3 or 4 args (name, parent, field_defaults, [methods])".into()); }
+    // class_def(name, parent, field_defaults_list, methods_list, traits_list)
+    // -> Unit; field_defaults_list is [[field_name, default_value], ...],
+    // methods_list is [[method_name, closure], ...] (Slice 2), traits_list
+    // is [trait_name, ...] (Slice 3) -- all three trailing args optional
+    // for backward compat with Slice-1/2-only callers.
+    if args.len() < 3 || args.len() > 5 { return Err("class_def: expected 3-5 args (name, parent, field_defaults, [methods], [traits])".into()); }
     let name = match &args[0] { Value::String(s) => s.as_ref().clone(), v => to_s(v) };
     let parent = match &args[1] { Value::String(s) if !s.is_empty() => Some(s.as_ref().clone()), _ => None };
     let field_defaults: Vec<(String, Value)> = match &args[2] {
@@ -599,17 +609,19 @@ pub fn host_class_def(args: &[Value]) -> Result<Value, String> {
         }).collect(),
         _ => HashMap::new(),
     };
+    let traits: Vec<String> = match args.get(4) {
+        Some(Value::List(xs)) => xs.iter().map(|v| match v { Value::String(s) => s.as_ref().clone(), v => to_s(v) }).collect(),
+        _ => Vec::new(),
+    };
     CLASSES.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap()
-        .insert(name, ClassDef { parent, field_defaults, methods });
+        .insert(name, ClassDef { parent, field_defaults, methods, traits });
     Ok(Value::Unit)
 }
 
-// Resolves method `method` for `class`, walking own class first then up the
-// (single) parent chain -- own class's own method always wins over an
-// inherited one of the same name (Slice 2 has no traits yet, so this is the
-// full resolution order for now; Slice 3 will insert a trait-scan step
-// between these two). Returns None for an unregistered class or a class/
-// chain with no matching method.
+// Resolves method `method` for `class`, walking own class > traits (LAST-
+// listed wins) > parent at each level up the (single) inheritance chain.
+// Returns None for an unregistered class or a class/chain with no
+// matching method anywhere.
 pub(crate) fn resolve_class_method(class: &str, method: &str) -> Option<Value> {
     let classes = CLASSES.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap();
     let mut cur = Some(class.to_string());
@@ -621,6 +633,11 @@ pub(crate) fn resolve_class_method(class: &str, method: &str) -> Option<Value> {
         if visited.contains(&c) { break; }
         let def = classes.get(&c)?;
         if let Some(m) = def.methods.get(method) { return Some(m.clone()); }
+        for t in def.traits.iter().rev() {
+            if let Some(tdef) = classes.get(t) {
+                if let Some(m) = tdef.methods.get(method) { return Some(m.clone()); }
+            }
+        }
         visited.push(c);
         cur = def.parent.clone();
     }
@@ -628,9 +645,11 @@ pub(crate) fn resolve_class_method(class: &str, method: &str) -> Option<Value> {
 }
 
 // Resolves the full, root-to-leaf-ordered chain of field defaults for
-// `class` (itself last, so its own defaults override any inherited ones
-// applied earlier in the same walk). Returns an empty Vec for an
-// unregistered class name -- ad hoc `new("Literal","id")` with no
+// `class` (own defaults applied last at each level, after that level's
+// traits in listed order, so a later trait overrides an earlier one and
+// the class's own field always overrides both -- see resolve_class_method's
+// doc comment for the same order applied to methods). Returns an empty Vec
+// for an unregistered class name -- ad hoc `new("Literal","id")` with no
 // matching `class` block stays exactly as permissive as it's always been.
 fn resolve_class_field_defaults(class: &str) -> Vec<(String, Value)> {
     let classes = CLASSES.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap();
@@ -648,6 +667,11 @@ fn resolve_class_field_defaults(class: &str) -> Vec<(String, Value)> {
     let mut out: Vec<(String, Value)> = Vec::new();
     for c in chain.iter().rev() {
         if let Some(def) = classes.get(c) {
+            for t in &def.traits {
+                if let Some(tdef) = classes.get(t) {
+                    out.extend(tdef.field_defaults.iter().cloned());
+                }
+            }
             out.extend(def.field_defaults.iter().cloned());
         }
     }
