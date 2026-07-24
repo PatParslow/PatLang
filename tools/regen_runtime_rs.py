@@ -24,10 +24,14 @@ CHUNKS = {
     # hadn't been added here yet. oo/strings_ext are added now purely
     # pre-emptively (both already PARITY-OK as of 2026-07-17, not because
     # anything is currently broken) to stop this recurring a fifth time.
-    # PRELUDE_VALUE_FAST is the one real PRELUDE_* constant in codegen.rs
-    # NOT covered here -- it's also not part of selfhost_runtime_text_
-    # parity's own checked chunk list, so there's nothing to regenerate
-    # against; if that ever changes, add it here too.
+    # PRELUDE_VALUE_FAST WAS the one real PRELUDE_* constant in codegen.rs
+    # not covered here (also not part of selfhost_runtime_text_parity's own
+    # checked chunk list) -- added now: found genuinely stale (still
+    # String(String)/List(Vec<Value>), years behind codegen.rs's real
+    # Arc<String>/Arc<Vec<Value>>) via a manual codegen_prelude_chunk(
+    # "__value_fast__") check while rebuilding patc1.exe, since
+    # selfhost_pipeline.rs's tracked chunk list still doesn't include it.
+    "value_fast": "PRELUDE_VALUE_FAST",
 }
 
 LINES_PER_SUBFN = 150
