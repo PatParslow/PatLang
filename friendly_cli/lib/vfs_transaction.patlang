@@ -1,0 +1,168 @@
+# PROTOTYPE VFS-backed transaction/backtracking mechanism, per: "Could do
+# a prototype version of the VFS transaction by having a function that
+# moves any existing content on the VFS into a temporary archive... it
+# would be OK, I think, for a prototype to test that the program state
+# backtracking transactions work in theory."
+#
+# Mechanism: txn_begin snapshots every current VFS path (except other
+# transactions' own backup entries) into a backup namespace
+# (__vfs_txn__/<id>/...), plus a manifest of exactly which paths existed
+# at that moment. txn_rollback restores every manifested path's original
+# content AND deletes any path that didn't exist in the manifest (a file
+# created during the failed attempt), then discards the backup.
+# txn_commit just discards the backup -- the live VFS state IS the
+# result, nothing to copy back.
+#
+# Built entirely in PatLang, no Rust/host changes -- vfs_read/vfs_write/
+# vfs_list/vfs_delete/vfs_exists already give everything needed (see
+# rust-runtime/src/ir/hosts.rs's VFS, a single global Mutex<HashMap<path,
+# content>>).
+#
+# TWO DELIBERATE, NAMED LIMITATIONS OF THIS PROTOTYPE (per the user's own
+# framing, not silently ignored):
+#
+# 1. THREADING/FIBERS: this is a prototype specifically to test whether
+#    the begin/attempt/commit-or-rollback SHAPE works, not a
+#    concurrency-safe implementation. The underlying VFS is one global
+#    mutex-protected map; if another OS thread or fiber writes to a path
+#    this transaction is watching WHILE it's open, that write could be
+#    silently clobbered by a later rollback (restored back to the
+#    pre-transaction snapshot) or silently kept by a commit, depending on
+#    timing -- neither is a real isolation guarantee. Fine for a
+#    single-threaded "try one candidate at a time" use (exactly the GOAP/
+#    synthesis use case this was motivated by), not safe yet for
+#    concurrent transactions touching overlapping paths.
+#
+# 2. FACTS/RULES ARE NOT COVERED: rule_add has no retract -- there is no
+#    way to revoke a fact or rule once registered (RULES is
+#    accumulate-only, a known standing limitation -- see
+#    patlang-objects-as-facts-design-idea memory). A candidate solution
+#    that calls rule_add/action_add during a transaction that later rolls
+#    back will still leave those facts/actions registered. Worked around
+#    by scope, not solved: for now, transactions here cover FILE state
+#    only, exactly as the user said -- "we will at some point need to
+#    have a way of revoking facts, but for now we can work around that."
+
+include "../../self_hosting/lib/includes.patlang"
+include "../../self_hosting/lib/test.patlang"
+include "../../self_hosting/lib/synthesis_recursive.patlang"
+
+make a function called txn_backup_prefix takes txn_id returns prefix
+  return "__vfs_txn__/" + txn_id + "/"
+end
+
+make a function called txn_manifest_path takes txn_id returns p
+  return txn_backup_prefix(txn_id) + "__manifest__"
+end
+
+# Snapshots every current live path (excluding other transactions' own
+# backup namespaces) into this transaction's backup area, plus a
+# manifest listing exactly which paths existed at begin-time.
+make a function called txn_begin takes txn_id returns unused
+  let all_paths = vfs_list("")
+  let live_paths = []
+  let i = 0
+  while i < to_num(list_len(all_paths)) do
+    let p = all_paths[i]
+    if not contains_text(p, "__vfs_txn__/") then
+      let live_paths = list_push(live_paths, p)
+      let content = vfs_read(p)
+      vfs_write(txn_backup_prefix(txn_id) + p, content)
+    end
+    let i = i + 1
+  end
+  let manifest_sb = sb_new()
+  let j = 0
+  while j < to_num(list_len(live_paths)) do
+    sb_push(manifest_sb, live_paths[j])
+    sb_push(manifest_sb, "\n")
+    let j = j + 1
+  end
+  vfs_write(txn_manifest_path(txn_id), sb_str(manifest_sb))
+  return 0
+end
+
+make a function called txn_manifest_paths takes txn_id returns paths
+  let raw = vfs_read(txn_manifest_path(txn_id))
+  let lines = synth2_split_lines(raw)
+  let result = []
+  let i = 0
+  while i < to_num(list_len(lines)) do
+    if lines[i] != "" then
+      let result = list_push(result, lines[i])
+    end
+    let i = i + 1
+  end
+  return result
+end
+
+# Restores every manifested path to its pre-transaction content, deletes
+# any path that didn't exist at begin-time (created during the failed
+# attempt), then discards the backup. After this, live VFS state is
+# byte-for-byte what it was before txn_begin.
+make a function called txn_rollback takes txn_id returns unused
+  let manifest = txn_manifest_paths(txn_id)
+  let manifest_set = manifest
+  let current = vfs_list("")
+  let ci = 0
+  while ci < to_num(list_len(current)) do
+    let p = current[ci]
+    if not contains_text(p, "__vfs_txn__/") then
+      let was_present = false
+      let mi = 0
+      while mi < to_num(list_len(manifest_set)) do
+        if manifest_set[mi] == p then
+          let was_present = true
+        end
+        let mi = mi + 1
+      end
+      if not was_present then
+        vfs_delete(p)
+      end
+    end
+    let ci = ci + 1
+  end
+  let ri = 0
+  while ri < to_num(list_len(manifest)) do
+    let p = manifest[ri]
+    let backed_up = vfs_read(txn_backup_prefix(txn_id) + p)
+    vfs_write(p, backed_up)
+    let ri = ri + 1
+  end
+  txn_discard_backup(txn_id)
+  return 0
+end
+
+# Commit: the live VFS state already IS the result of a successful
+# attempt -- nothing to copy back, just discard the snapshot.
+make a function called txn_commit takes txn_id returns unused
+  txn_discard_backup(txn_id)
+  return 0
+end
+
+make a function called txn_discard_backup takes txn_id returns unused
+  let prefix = txn_backup_prefix(txn_id)
+  let backup_paths = vfs_list(prefix)
+  let i = 0
+  while i < to_num(list_len(backup_paths)) do
+    vfs_delete(backup_paths[i])
+    let i = i + 1
+  end
+  vfs_delete(txn_manifest_path(txn_id))
+  return 0
+end
+
+# The actual "try a candidate solution" wrapper: begin, run the given
+# closure (taking no arguments, returning true for success / false for
+# failure), commit on success or rollback on failure, and return the
+# closure's own result unchanged either way.
+make a function called txn_try takes txn_id, candidate returns ok
+  txn_begin(txn_id)
+  let ok = candidate()
+  if ok then
+    txn_commit(txn_id)
+  else
+    txn_rollback(txn_id)
+  end
+  return ok
+end
