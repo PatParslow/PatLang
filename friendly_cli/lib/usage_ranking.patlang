@@ -1,0 +1,158 @@
+# =============================================================================
+# Usage-frequency ranking for the Slice 2 (PatLang function specs)
+# discovery list -- per the user's own reasoning: "prioritise by how
+# frequently each function is used elsewhere; after all those are the
+# ones most likely to have been tested in real life scenarios and also
+# the ones that would benefit most from having a proper BDD test
+# suite." A single tokenizing pass over the whole real source corpus
+# (not 850 separate substring scans -- at ~2.5MB across 338 files, that
+# naive approach would be genuinely slow; one pass extracting every
+# `IDENTIFIER(` call-site occurrence into a count table, then a cheap
+# lookup against the known function names, is the same shape of fix as
+# this project's own O(n^2) list_push lesson from earlier sessions --
+# uses vec_*/vec_set (real handle-based mutable list), never plain
+# list_push in the hot loop, for exactly that reason.
+# =============================================================================
+
+make a function called is_ident_start_code takes code returns yes
+  return ((code >= 65) and (code <= 90)) or ((code >= 97) and (code <= 122)) or (code == 95)
+end
+
+make a function called is_ident_char_code takes code returns yes
+  return is_ident_start_code(code) or ((code >= 48) and (code <= 57))
+end
+
+# Recursively walks a directory (list_dir is one-level only) collecting
+# every .patlang file path, skipping generated/build/output directories
+# that would otherwise inflate call counts with regenerated copies of
+# the same source rather than genuine distinct usage.
+make a function called collect_patlang_files takes dir_path, out_vec returns done
+  if file_exists(dir_path) != "1" then
+    return true
+  end
+  let entries = list_dir(dir_path)
+  let i = 0
+  while i < to_num(list_len(entries)) do
+    let entry = entries[i]
+    if ends_with_ci(entry, "/") then
+      let subname = substr(entry, 0, entry.length - 1)
+      if (subname != "build") and (subname != "synthesized") and (subname != "spec_scratch") and (subname != "quarantine") then
+        collect_patlang_files(dir_path + "/" + subname, out_vec)
+      end
+    else
+      if ends_with_ci(entry, ".patlang") then
+        vec_push(out_vec, dir_path + "/" + entry)
+      end
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+make a function called usage_corpus_files returns files
+  let out = vec_new()
+  collect_patlang_files("self_hosting", out)
+  collect_patlang_files("friendly_cli", out)
+  return vec_to_list(out)
+end
+
+# One-pass tokenizer: for each file, walks the content once, and for
+# every identifier immediately followed by "(" (a call site, not a
+# declaration -- `make a function called NAME takes ...` never has
+# "NAME(" immediately, so declarations don't self-count), records it in
+# a handle-based (vec_*) names/counts table -- linear lookup-by-name
+# per call site against the GROWING distinct-name list, which is still
+# far cheaper than re-scanning the whole corpus per candidate function.
+make a function called build_usage_counts takes files returns names_and_counts_vecs
+  let names = vec_new()
+  let counts = vec_new()
+  let f = 0
+  while f < to_num(list_len(files)) do
+    let content = read_file(files[f])
+    let n = content.length
+    let i = 0
+    while i < n do
+      let c = char_code(content, i)
+      if is_ident_start_code(c) then
+        let start = i
+        let j = i + 1
+        while (j < n) and is_ident_char_code(char_code(content, j)) do
+          let j = j + 1
+        end
+        if (j < n) and (char_code(content, j) == 40) then
+          let ident = substr(content, start, j - start)
+          let found_idx = -1
+          let k = 0
+          let name_count = vec_len(names)
+          while (k < name_count) and (found_idx == -1) do
+            if vec_get(names, k) == ident then
+              let found_idx = k
+            end
+            let k = k + 1
+          end
+          if found_idx == -1 then
+            vec_push(names, ident)
+            vec_push(counts, 1)
+          else
+            vec_set(counts, found_idx, vec_get(counts, found_idx) + 1)
+          end
+        end
+        let i = j
+      else
+        let i = i + 1
+      end
+    end
+    let f = f + 1
+  end
+  return [names, counts]
+end
+
+make a function called lookup_usage_count takes names_vec, counts_vec, target_name returns count
+  let n = vec_len(names_vec)
+  let i = 0
+  while i < n do
+    if vec_get(names_vec, i) == target_name then
+      return vec_get(counts_vec, i)
+    end
+    let i = i + 1
+  end
+  return 0
+end
+
+# Sorts `functions` (the [name, params, file, risk] list from
+# patlang_function_discovery.patlang) by real usage count, descending --
+# insertion sort into a vec_* accumulator (functions lists here are in
+# the hundreds, not the tens of thousands the raw corpus scan handles,
+# so O(n^2) insertion is genuinely fine at this size, unlike the
+# corpus-scanning loop above).
+make a function called rank_functions_by_usage takes functions, names_vec, counts_vec returns ranked
+  let out = vec_new()
+  let i = 0
+  while i < to_num(list_len(functions)) do
+    let entry = functions[i]
+    let usage = lookup_usage_count(names_vec, counts_vec, entry[0])
+    let ranked_entry = [entry[0], entry[1], entry[2], entry[3], usage]
+    let inserted = false
+    let out_len = vec_len(out)
+    let j = 0
+    while (j < out_len) and (not inserted) do
+      let existing = vec_get(out, j)
+      if usage > existing[4] then
+        vec_push(out, ranked_entry)
+        let k = out_len
+        while k > j do
+          vec_set(out, k, vec_get(out, k - 1))
+          let k = k - 1
+        end
+        vec_set(out, j, ranked_entry)
+        let inserted = true
+      end
+      let j = j + 1
+    end
+    if not inserted then
+      vec_push(out, ranked_entry)
+    end
+    let i = i + 1
+  end
+  return vec_to_list(out)
+end

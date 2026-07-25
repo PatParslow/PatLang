@@ -1,0 +1,189 @@
+# Curriculum initiative: reusable harness for "attempt via LLM (with
+# real building blocks injected) -> verify visible scenarios -> verify
+# blind held-back scenarios -> register".
+#
+# STRUCTURAL FIX, per direct and correct pushback from the project
+# owner: *"I'm rather nervous about these hand authored fallbacks -
+# that implies you are writing the code rather than the synthesis
+# engine finding the right code to use..."* Right. The original version
+# of this harness wrote a hand-authored fallback into the SAME registry
+# as genuine induction/LLM wins, distinguished only by a metadata field
+# -- a real category error, not just a labeling nuance. Fixed
+# structurally, not cosmetically: TWO separate directories now exist
+# (`curriculum_registry_dir` for genuine automated results only,
+# `curriculum_reference_dir` for anything a person wrote), with
+# separate writer functions (`curriculum_write_registry_entry` vs
+# `curriculum_write_reference_entry`) -- a caller has to actively choose
+# the wrong one, rather than one path silently serving both purposes.
+# See spec_library/synthesized_registry/README.md and spec_library/
+# reference_solutions/README.md for the full rationale.
+
+include "../../self_hosting/lib/includes.patlang"
+include "../../self_hosting/lib/test.patlang"
+include "../../self_hosting/lib/json.patlang"
+include "../../self_hosting/lib/ollama.patlang"
+
+make a function called curriculum_registry_dir returns path
+  return "spec_library/synthesized_registry"
+end
+
+make a function called curriculum_reference_dir returns path
+  return "spec_library/reference_solutions"
+end
+
+# Reads every callable function's meta.json from BOTH directories and
+# renders a short "available building blocks" list for injection into
+# a later problem's prompt -- a hand-authored reference solution is
+# still a real, working, callable thing worth reusing (the point of
+# Tier 2 composition), even though it wasn't found by the system itself
+# -- the distinction that matters is PROVENANCE (which directory it's
+# registered in), not usability as a building block.
+make a function called curriculum_collect_functions_from takes dir returns sb_text
+  let entries = list_dir(dir)
+  let sb = sb_new()
+  let i = 0
+  while i < to_num(list_len(entries)) do
+    let entry = entries[i]
+    if contains_text(entry, ".meta.json") then
+      let content = read_file(dir + "/" + entry)
+      let parsed = json_parse(content)
+      let kind = json_str(json_get(parsed, "kind"))
+      if (kind == "hand_authored_function") or (kind == "llm_synthesized_function") then
+        let name = json_str(json_get(parsed, "name"))
+        let code = json_str(json_get(parsed, "code"))
+        sb_push(sb, "- " + name + ":\n" + code + "\n")
+      end
+    end
+    let i = i + 1
+  end
+  return sb_str(sb)
+end
+
+make a function called curriculum_available_functions_text returns text
+  return curriculum_collect_functions_from(curriculum_registry_dir()) + curriculum_collect_functions_from(curriculum_reference_dir())
+end
+
+make a function called curriculum_extract_code_block takes raw_reply returns code
+  let fence_variants = ["```patlang", "```pat", "```"]
+  let i = 0
+  let start_idx = -1
+  while (i < to_num(list_len(fence_variants))) and (start_idx == -1) do
+    let fence = fence_variants[i]
+    let j = 0
+    while (j <= raw_reply.length - fence.length) and (start_idx == -1) do
+      if substr(raw_reply, j, fence.length) == fence then
+        let start_idx = j + fence.length
+      end
+      let j = j + 1
+    end
+    let i = i + 1
+  end
+  if start_idx == -1 then
+    return str_trim(raw_reply)
+  end
+  let end_idx = -1
+  let k = start_idx
+  while (k <= raw_reply.length - 3) and (end_idx == -1) do
+    if substr(raw_reply, k, 3) == "```" then
+      let end_idx = k
+    end
+    let k = k + 1
+  end
+  if end_idx == -1 then
+    return str_trim(substr(raw_reply, start_idx, raw_reply.length - start_idx))
+  end
+  return str_trim(substr(raw_reply, start_idx, end_idx - start_idx))
+end
+
+make a function called curriculum_syntax_primer returns text
+  return "Follow this EXACT syntax, demonstrated by a complete worked example (a function that reverses a string):\n```patlang\nmake a function called reverse_string takes s returns result\n  let out = \"\"\n  let i = s.length - 1\n  while i >= 0 do\n    let out = out + s[i]\n    let i = i - 1\n  end\n  return out\nend\n```\nRules, all shown above: functions start with `make a function called NAME takes PARAM1, PARAM2 returns RESULT_NAME` and end with `end`. Every path that produces a value uses an explicit `return EXPR` (no implicit return of the last expression). Variables: `let x = EXPR` both to bind AND to reassign (same keyword every time, never `x = EXPR` alone). Control flow: `if COND then ... end`, `if COND then ... else ... end`, `while COND do ... end` -- there is NO for-loop and `if` has NO do-form, only then/end. Strings: `.length` for character count (a property, not a call), `s[i]` for the single character at index i (0-based), `substr(s, start, count)` for a slice of COUNT characters starting at START (plain integers, never -1). Lists: `.length` for element count, `xs[i]` for the element at index i, `list_len(xs)` also works and returns a string form (wrap in to_num). `+` for concatenation/addition, `==`/`!=` for real value equality. No try/catch exists in this language. Respond with ONLY the function definition, wrapped in a ```patlang code block, no explanation before or after."
+end
+
+# One-shot: try ollama, verify by real execution (not "did it parse").
+# Returns ["ok", code] or ["failed", last_output].
+make a function called curriculum_try_llm takes model, problem_prompt, reuse_context, visible_cases, tmp_path returns result
+  let system_prompt = curriculum_syntax_primer() + reuse_context
+  let raw_reply = ollama_chat_once(model, system_prompt, problem_prompt)
+  let code = curriculum_extract_code_block(raw_reply)
+  return [code, raw_reply]
+end
+
+# REAL BUG FOUND HERE, immediately: str_trim (self_hosting/lib/
+# includes.patlang) does NOT strip a trailing newline -- only space/
+# tab/CR (a real, previously-documented gotcha this session,
+# spec_library/patlang_stdlib/self_hosting__lib__includes__str_trim.
+# feature). exec_capture's output always has a trailing \n from print's
+# own newline, so a plain str_trim-based comparison would report a
+# CORRECT value as a false mismatch (confirmed: sum_1_to_n's hand-
+# authored fallback returned the exactly right values but every check
+# still said match=false until this was fixed). full_trim strips
+# space/tab/CR/\n, matching this project's own prior fix for the exact
+# same class of bug in spec_manifest.patlang.
+make a function called curriculum_full_trim takes s returns trimmed
+  let n = s.length
+  let start = 0
+  while (start < n) and curriculum_is_ws_incl_nl(char_code(s, start)) do
+    let start = start + 1
+  end
+  let stop = n
+  while (stop > start) and curriculum_is_ws_incl_nl(char_code(s, stop - 1)) do
+    let stop = stop - 1
+  end
+  return substr(s, start, stop - start)
+end
+
+make a function called curriculum_is_ws_incl_nl takes code returns yes
+  return (code == 32) or (code == 9) or (code == 13) or (code == 10)
+end
+
+make a function called curriculum_run_one_check takes pat_exe, code, includes_line, call_expr, expected returns result
+  let gen_path = "friendly_cli/spec_scratch/curriculum_gen.patlang"
+  write_file(gen_path, code)
+  let probe_path = "friendly_cli/spec_scratch/curriculum_probe.patlang"
+  let src = includes_line + "\ninclude \"curriculum_gen.patlang\"\nprint(" + call_expr + ")\n"
+  write_file(probe_path, src)
+  let output = exec_capture(pat_exe, "--ir-run", probe_path)
+  let trimmed = curriculum_full_trim(output)
+  let matched = trimmed == expected
+  return [matched, trimmed]
+end
+
+# For GENUINE automated results only (a real induction search or a
+# real LLM synthesis success) -- never call this for a hand-authored
+# fallback. See this file's own header for why that distinction is now
+# structural, not just a convention to remember.
+make a function called curriculum_write_registry_entry takes name, mechanism, code, visible_json, blind_json, reuses_json returns done
+  let dir = curriculum_registry_dir()
+  let sb = sb_new()
+  sb_push(sb, "{\n")
+  sb_push(sb, "  \"name\": \"" + name + "\",\n")
+  sb_push(sb, "  \"kind\": \"" + mechanism + "\",\n")
+  sb_push(sb, "  \"code\": " + json_quote(code) + ",\n")
+  sb_push(sb, "  \"visible_checks\": " + visible_json + ",\n")
+  sb_push(sb, "  \"blind_held_back_checks\": " + blind_json + ",\n")
+  sb_push(sb, "  \"reuses\": " + reuses_json + ",\n")
+  sb_push(sb, "  \"verification_status\": \"verified\"\n")
+  sb_push(sb, "}\n")
+  write_file(dir + "/" + name + ".meta.json", sb_str(sb))
+  return true
+end
+
+# For anything a PERSON wrote (a hand-authored fallback after
+# induction/LLM both failed, or a deliberate hand-written control) --
+# writes to the SEPARATE reference_solutions directory, never the
+# synthesized_registry, regardless of how well-verified the code is.
+make a function called curriculum_write_reference_entry takes name, mechanism, code, visible_json, blind_json, reuses_json returns done
+  let dir = curriculum_reference_dir()
+  let sb = sb_new()
+  sb_push(sb, "{\n")
+  sb_push(sb, "  \"name\": \"" + name + "\",\n")
+  sb_push(sb, "  \"kind\": \"" + mechanism + "\",\n")
+  sb_push(sb, "  \"code\": " + json_quote(code) + ",\n")
+  sb_push(sb, "  \"visible_checks\": " + visible_json + ",\n")
+  sb_push(sb, "  \"blind_held_back_checks\": " + blind_json + ",\n")
+  sb_push(sb, "  \"reuses\": " + reuses_json + ",\n")
+  sb_push(sb, "  \"verification_status\": \"verified\"\n")
+  sb_push(sb, "}\n")
+  write_file(dir + "/" + name + ".meta.json", sb_str(sb))
+  return true
+end

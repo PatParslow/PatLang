@@ -1,0 +1,150 @@
+# Tier B synthesis experiment (LLM-assisted, self-healing-style):
+# ask an LLM to write a real PatLang function satisfying a BDD spec's
+# VISIBLE scenarios only, verify those via real execution, then check
+# BLIND held-back scenarios (never shown to the LLM) against the SAME
+# generated code with no re-prompting -- the direct anti-vacuity
+# discipline the user asked for, now applied to genuinely LLM-written
+# code rather than induced logic rules or GOAP plans.
+#
+# Deliberate scenario design: every VISIBLE example is an ODD-length
+# string ("", "a", "racecar" (7), "hello" (5)) -- the classic off-by-one
+# risk for a hand-rolled palindrome check is the EVEN-length case
+# (middle-pair comparison, not a single middle character), so the BLIND
+# scenarios ("abba"=true, "abca"=false, both length 4) specifically
+# probe a boundary the visible examples never exercise.
+
+include "../self_hosting/lib/includes.patlang"
+include "../self_hosting/lib/test.patlang"
+include "../self_hosting/lib/json.patlang"
+include "../self_hosting/lib/ollama.patlang"
+
+make a function called extract_code_block takes raw_reply returns code
+  let fence_variants = ["```patlang", "```pat", "```"]
+  let i = 0
+  let start_idx = -1
+  let fence_len = 0
+  while (i < to_num(list_len(fence_variants))) and (start_idx == -1) do
+    let fence = fence_variants[i]
+    let j = 0
+    while (j <= raw_reply.length - fence.length) and (start_idx == -1) do
+      if substr(raw_reply, j, fence.length) == fence then
+        let start_idx = j + fence.length
+        let fence_len = fence.length
+      end
+      let j = j + 1
+    end
+    let i = i + 1
+  end
+  if start_idx == -1 then
+    return str_trim(raw_reply)
+  end
+  let end_idx = -1
+  let k = start_idx
+  while (k <= raw_reply.length - 3) and (end_idx == -1) do
+    if substr(raw_reply, k, 3) == "```" then
+      let end_idx = k
+    end
+    let k = k + 1
+  end
+  if end_idx == -1 then
+    return str_trim(substr(raw_reply, start_idx, raw_reply.length - start_idx))
+  end
+  return str_trim(substr(raw_reply, start_idx, end_idx - start_idx))
+end
+
+let model = "llama3.2"
+let system_prompt = "You write PatLang functions. Follow this EXACT syntax, demonstrated by a complete worked example (a function that reverses a string):\n```patlang\nmake a function called reverse_string takes s returns result\n  let out = \"\"\n  let i = s.length - 1\n  while i >= 0 do\n    let out = out + s[i]\n    let i = i - 1\n  end\n  return out\nend\n```\nRules, all shown above: functions start with `make a function called NAME takes PARAM1, PARAM2 returns RESULT_NAME` and end with `end`. Every path that produces a value uses an explicit `return EXPR` (no implicit return of the last expression, no expression-statement values). Variables: `let x = EXPR` both to bind AND to reassign (same keyword every time, never `x = EXPR` alone). Control flow: `if COND then ... end`, `if COND then ... else ... end`, `while COND do ... end`. Strings: `.length` for character count (a property, not a function call), `s[i]` for the single character at index i (0-based, a slice not a call), `substr(s, start, count)` for a slice of COUNT characters starting at START (both plain integers, never -1 for 'rest of string' -- compute the real remaining length instead), `+` for concatenation, `==` for real value equality. No try/catch exists in this language. Respond with ONLY the function definition, wrapped in a ```patlang code block, no explanation before or after."
+let user_prompt = "Write a PatLang function `is_palindrome` that takes one parameter `s` (a string) and returns a boolean: true if the string reads the same forwards and backwards, false otherwise. It must satisfy these examples: is_palindrome(\"\") is true (an empty string). is_palindrome(\"a\") is true (a single character). is_palindrome(\"racecar\") is true. is_palindrome(\"hello\") is false."
+
+print("=== Tier B: asking " + model + " to synthesize is_palindrome ===")
+let raw_reply = ollama_chat_once(model, system_prompt, user_prompt)
+print("--- raw LLM reply (ollama/" + model + ") ---")
+print(raw_reply)
+print("--- extracted code ---")
+let code = extract_code_block(raw_reply)
+print(code)
+
+# Bounded, ONE-SHOT escalation only (matching the established ollama->
+# hermes pattern already used elsewhere this session,
+# spec_discovery_engine.patlang's llm_generate_gherkin_via_hermes) -- a
+# DIFFERENT, larger model tried once, never an unbounded retry loop
+# re-prompting the same small model repeatedly for every new syntax
+# mistake it makes.
+make a function called ollama_attempt_is_valid takes pat_exe, code returns yes
+  let check_path = "friendly_cli/spec_scratch/synth_is_palindrome_synchk.patlang"
+  write_file(check_path, code + "\nprint(is_palindrome(\"a\"))\n")
+  let output = exec_capture(pat_exe, "--ir-run", check_path)
+  return not contains_text(output, "Parse error")
+end
+
+let pat_exe_for_check = "rust-runtime/target/release/pat.exe"
+if not ollama_attempt_is_valid(pat_exe_for_check, code) then
+  print("=== ollama's attempt didn't even PARSE -- escalating ONCE to hermes (a larger, more capable model), not retrying ollama again ===")
+  let hermes_model = "poolside/laguna-xs-2.1:free"
+  let hermes_prompt = system_prompt + "\n\n" + user_prompt
+  let hermes_reply = exec_capture("hermes", "-z", hermes_prompt, "-m", hermes_model)
+  print("--- raw LLM reply (hermes/" + hermes_model + ") ---")
+  print(hermes_reply)
+  let hermes_code = extract_code_block(hermes_reply)
+  print("--- extracted code (hermes) ---")
+  print(hermes_code)
+  if ollama_attempt_is_valid(pat_exe_for_check, hermes_code) then
+    let code = hermes_code
+    print("=== hermes's attempt at least PARSES -- proceeding with it ===")
+  else
+    print("=== hermes's attempt ALSO doesn't parse -- proceeding with ollama's original anyway, so the real scenario checks below report the true failure mode, not silently give up ===")
+  end
+end
+
+let gen_path = "friendly_cli/spec_scratch/synth_is_palindrome_gen.patlang"
+write_file(gen_path, code)
+
+let pat_exe = "rust-runtime/target/release/pat.exe"
+
+make a function called run_check takes pat_exe, gen_path, input_str, expected returns result
+  let probe_path = "friendly_cli/spec_scratch/synth_is_palindrome_probe.patlang"
+  let src = "include \"synth_is_palindrome_gen.patlang\"\nprint(is_palindrome(" + json_quote(input_str) + "))\n"
+  write_file(probe_path, src)
+  let output = exec_capture(pat_exe, "--ir-run", probe_path)
+  let trimmed = str_trim(output)
+  let matched = trimmed == ("" + expected)
+  return [matched, trimmed]
+end
+
+print("=== VISIBLE scenario checks (shown to the LLM) ===")
+let visible_cases = [["", true], ["a", true], ["racecar", true], ["hello", false]]
+let all_visible_ok = true
+let vi = 0
+while vi < to_num(list_len(visible_cases)) do
+  let case = visible_cases[vi]
+  let r = run_check(pat_exe, gen_path, case[0], case[1])
+  print("is_palindrome(\"" + case[0] + "\") expected=" + ("" + case[1]) + " got=[" + r[1] + "] match=" + ("" + r[0]))
+  if not r[0] then
+    let all_visible_ok = false
+  end
+  let vi = vi + 1
+end
+
+if all_visible_ok then
+  print("=== BLIND held-back checks (NEVER shown to the LLM -- even-length boundary) ===")
+  let blind_cases = [["abba", true], ["abca", false]]
+  let all_blind_ok = true
+  let bi = 0
+  while bi < to_num(list_len(blind_cases)) do
+    let case = blind_cases[bi]
+    let r = run_check(pat_exe, gen_path, case[0], case[1])
+    print("BLIND is_palindrome(\"" + case[0] + "\") expected=" + ("" + case[1]) + " got=[" + r[1] + "] match=" + ("" + r[0]))
+    if not r[0] then
+      let all_blind_ok = false
+    end
+    let bi = bi + 1
+  end
+
+  if all_blind_ok then
+    print("=== RESULT: LLM-synthesized is_palindrome passes ALL visible AND blind checks -- genuinely generalizes ===")
+  else
+    print("=== RESULT: visible checks passed but BLIND checks FAILED -- would have been a vacuous pass on visible tests alone ===")
+  end
+else
+  print("=== RESULT: FAILED at the visible-scenario stage -- not proceeding to blind checks ===")
+end

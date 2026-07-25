@@ -1,0 +1,716 @@
+# =============================================================================
+# Shell Command Spec Discovery Engine (Slice 1 of the spec-library
+# initiative: a searchable, publishable library of Gherkin BDD specs for
+# PatLang itself, its own libraries, and shell/utility commands on the
+# machine's PATH -- built by a program that systematically discovers and
+# generates the contracts, not ad hoc one-off work).
+#
+# WHAT THIS LIBRARY IS FOR (read this before treating a spec as a
+# requirement): every Gherkin scenario this tool writes is a DESCRIPTIVE
+# record of what a component actually, observably does -- never a
+# PRESCRIPTIVE statement of what it's supposed to or intended to do.
+# This is not conformance testing; there is no external standard a
+# command is being checked against, and a "verified" status means only
+# "this scenario's Then-clause was independently confirmed to match the
+# component's real, observed behaviour" -- not "this command is
+# correctly implemented" (a command could be verified AND buggy AND
+# still get documented accurately, warts included). The purpose is to
+# build a body of GROUND-TRUTH FACTS this project's own inference and
+# goal-seeking systems (the inductive synthesis engine, GOAP planning,
+# self_healing_engine.patlang) can safely reason and build on top of --
+# knowing exactly what a component really does is what makes it safe to
+# compose into a larger plan; knowing what it was merely intended to do
+# is not. Keep this distinction explicit in every spec's own wording,
+# not just in this comment.
+#
+# This slice covers shell commands only. A local LLM (Ollama) writes the
+# human-readable Gherkin spec, using exactly the prompt shape already
+# proven to work: "provide BDD style specs for the windows <cmd> command,
+# only write the gherkin no preamble, put the gherkin in backtick code
+# block". That text is pure documentation -- it is NEVER executed as-is.
+#
+# SAFETY (hard requirement, not a guideline):
+#   - Only commands listed in the allowlist below are EVER actually
+#     executed by this tool, and only via the exact, hand-written
+#     invocation shape given for each -- never with LLM-suggested or
+#     otherwise unsanitized arguments.
+#   - Every verification probe builds its OWN fixture files inside
+#     spec_scratch_dir(), a directory this tool creates and fully
+#     controls, and only ever reads/searches within it. No allowlist
+#     entry mutates, deletes, formats, or writes anything outside that
+#     one scratch directory -- read-only, query-only commands only.
+#   - A command NOT in the allowlist still gets its Gherkin spec
+#     generated (pure text generation, no execution involved) but is
+#     explicitly marked "unverified -- not executed" in its metadata
+#     sidecar, never silently treated as tested.
+#
+# VACUOUSNESS GUARD (the other hard requirement): a spec is only ever
+# marked "verified" after this tool's OWN positive/negative probe pair
+# shows the real command's output genuinely DIFFERS between a case where
+# the condition holds and a mutated case where it deliberately does not
+# -- the same "a check that can't tell right from wrong proves nothing"
+# lesson already learned the hard way in this project's self-healing
+# engine (see friendly_cli/lib/self_healing_engine.patlang's own history:
+# a "CONTRACT PASS" string that printed unconditionally, regardless of
+# correctness). A probe where positive and negative behave identically is
+# reported as "vacuous", not silently accepted as green.
+# =============================================================================
+
+make a function called spec_scratch_dir returns path
+  return "friendly_cli/spec_scratch"
+end
+
+# Windows console tools (findstr, find, ...) treat a bare "/" in an
+# argument as an OPTION PREFIX, not a path separator -- a forward-slash
+# path like "friendly_cli/spec_scratch/dbg.txt" gets misparsed as a run
+# of bogus switches, silently truncating down to just the last segment
+# ("dbg.txt"), which then fails to open. PatLang's own file host
+# functions (write_file/read_file) handle forward slashes fine, so
+# fixtures are created/read with them as usual -- only the ARGUMENT text
+# handed to a native console utility needs backslashes. Found via a
+# direct probe: `findstr PATLANG_MARKER_PRESENT friendly_cli/spec_scratch/dbg.txt`
+# failed with "Cannot open dbg.txt"; the same file opened fine once the
+# path was backslash-separated.
+make a function called to_windows_arg_path takes p returns windows_path
+  let sb = sb_new()
+  let i = 0
+  while i < p.length do
+    if substr(p, i, 1) == "/" then
+      sb_push(sb, "\\")
+    else
+      sb_push(sb, substr(p, i, 1))
+    end
+    let i = i + 1
+  end
+  return sb_str(sb)
+end
+
+make a function called shell_spec_dir returns path
+  return "spec_library/shell"
+end
+
+# --- LLM-generated Gherkin (documentation only -- never executed as-is) ---
+#
+# Uses self_hosting/lib/ollama.patlang's ollama_chat_once -- Ollama's
+# non-streaming REST API (raw sockets, "stream":false) -- rather than
+# shelling out to `ollama run` via exec_capture. Two real, independent
+# advantages this matters for: (1) `ollama run`'s interactive CLI writes
+# a continuous stream of ANSI spinner/cursor-control escape codes to
+# stdout while the model loads, which exec_capture faithfully captures
+# right alongside the real reply -- noise extract_gherkin_block then has
+# to parse through (harmless once it finds the fence, but wasteful);
+# "stream":false gets back one clean JSON response with no such noise at
+# all. (2) A cold model load can take well over a minute with no partial
+# output via the CLI path either way -- the API path doesn't make that
+# faster, but it does mean there's nothing to strip once the real reply
+# does arrive.
+# Fallback text-generation source when the primary (ollama, local, fast,
+# free) engine's reply is unusable -- no fence found at all, or the
+# extracted text is too short to plausibly be a real spec. Uses hermes
+# (an already-installed AI-agent CLI with real web/tool-calling
+# capability, `hermes -z PROMPT -m MODEL`), pinned to a FREE model
+# tier rather than the paid default, per the user's own listed options:
+#   poolside/laguna-xs-2.1:free, tencent/hy3:free,
+#   poolside/laguna-s-2.1:free, inclusionai/ling-3.0-flash:free,
+#   stepfun/step-3.7-flash:free
+# `poolside/laguna-xs-2.1:free` is the default here (confirmed working
+# via a direct manual probe, ~25s for a real Gherkin spec, and notably
+# MORE accurate than the local model on findstr's real flag set). This
+# is a genuine fallback tier, not a loop: called at most once per
+# command, only when the primary source's output already looks
+# unusable, mirroring the same "one bounded, hand-reviewed fallback,
+# never open-ended retrying" discipline as verify_find's self-heal.
+make a function called llm_generate_gherkin_via_hermes takes command_name, model_name returns result
+  let prompt = "provide BDD style specs for the windows " + command_name + " command, only write the gherkin no preamble, put the gherkin in backtick code block"
+  print("[SPEC DISCOVERY] Falling back to hermes (" + model_name + ") for '" + command_name + "'...")
+  let reply = exec_capture("hermes", "-z", prompt, "-m", model_name)
+  return extract_gherkin_block(reply)
+end
+
+make a function called llm_generate_gherkin_for_command takes command_name, model_name returns gherkin_text
+  # A one-shot example of the exact expected shape, not just an
+  # instruction to follow it -- small local models in particular follow
+  # a worked example far more reliably than a prose rule alone. The
+  # goal here is narrower than "always use backticks": what actually
+  # matters is getting real Gherkin content back, not chit-chat/
+  # preamble/refusal fluff -- the fence is a strong hint the model
+  # usually follows when shown one, not a hard requirement enforced on
+  # the receiving end (see the "looks_like_gherkin" relaxation below).
+  let system_prompt = "You write BDD-style Gherkin specifications for command-line tools. Respond with ONLY the Gherkin, no preamble or explanation, wrapped in a ```gherkin code block. Example, for a hypothetical 'greet' command:\n```gherkin\nFeature: Greet Command\n\n  Scenario: Print a greeting\n    Given the user runs greet\n    When the command executes\n    Then it should print \"Hello\"\n```"
+  let user_prompt = "Provide BDD style specs for the windows " + command_name + " command."
+  print("[SPEC DISCOVERY] Querying LLM for '" + command_name + "' Gherkin spec via " + model_name + " (non-streaming API)...")
+  let reply = ollama_chat_once(model_name, system_prompt, user_prompt)
+  if str_starts_with(reply, "ERROR:") then
+    print("[SPEC DISCOVERY] LLM query failed: " + reply)
+    return [reply, false]
+  end
+  return extract_gherkin_block(reply)
+end
+
+# Content-based usability check -- deliberately NOT "was there a fence".
+# LLM replies are non-deterministic across calls: the same prompt to
+# the same model can come back properly fenced one time and not the
+# next, even though the actual Gherkin content is equally good either
+# way (confirmed via a direct repro -- a fresh call for a command that
+# had escalated to hermes in an earlier run came back perfectly fenced
+# on retry, same prompt, same model). Requiring the fence specifically
+# was rejecting perfectly good content and escalating needlessly. What
+# actually matters is "is this real Gherkin, not chit-chat/preamble/
+# refusal fluff" -- checked here by looking for the two structural
+# markers every real scenario has, regardless of whether backticks
+# happened to survive.
+make a function called looks_like_gherkin takes text returns yes
+  return contains_text(text, "Feature:") and contains_text(text, "Scenario")
+end
+
+# Extracts the text between a ```gherkin fence and the next ``` fence.
+# Falls back to the raw trimmed reply if no fence is found at all, so a
+# differently-formatted reply is still captured (flagged via the
+# "fenced" return value) rather than silently discarded -- fenced=false
+# no longer means "discard this", see looks_like_gherkin above for the
+# check that actually decides usability.
+make a function called extract_gherkin_block takes raw_reply returns result
+  let fence = "```gherkin"
+  let start_idx = -1
+  let i = 0
+  while (i <= raw_reply.length - fence.length) and (start_idx == -1) do
+    if substr(raw_reply, i, fence.length) == fence then
+      let start_idx = i + fence.length
+    end
+    let i = i + 1
+  end
+  if start_idx == -1 then
+    return [str_trim(raw_reply), false]
+  end
+  let end_idx = -1
+  let j = start_idx
+  while (j <= raw_reply.length - 3) and (end_idx == -1) do
+    if substr(raw_reply, j, 3) == "```" then
+      let end_idx = j
+    end
+    let j = j + 1
+  end
+  if end_idx == -1 then
+    return [str_trim(substr(raw_reply, start_idx, raw_reply.length - start_idx)), true]
+  end
+  return [str_trim(substr(raw_reply, start_idx, end_idx - start_idx)), true]
+end
+
+make a function called verify_diff returns result
+  # diff is a GNU/MSYS tool (unlike findstr/find/where, native Windows
+  # console tools that misparse "/" as an option prefix) -- forward
+  # slashes work fine as path arguments here, no to_windows_arg_path
+  # needed. Positive: two genuinely IDENTICAL files -> real diff
+  # behaviour is empty output. Negative: two files differing by one
+  # line -> output must contain that line's actual new content, not
+  # just "some output" (which could be a usage error or crash message
+  # just as easily as a real diff).
+  let dir = spec_scratch_dir()
+  let file_a = dir + "/diff_a.txt"
+  let file_same = dir + "/diff_same.txt"
+  let file_diff = dir + "/diff_diff.txt"
+  write_file(file_a, "line one\nline two\nline three\n")
+  write_file(file_same, "line one\nline two\nline three\n")
+  write_file(file_diff, "line one\nPATLANG_CHANGED_LINE\nline three\n")
+
+  let same_out = exec_capture("diff", file_a, file_same)
+  let same_ok = str_trim(same_out) == ""
+
+  let diff_out = exec_capture("diff", file_a, file_diff)
+  let diff_ok = contains_text(diff_out, "PATLANG_CHANGED_LINE")
+
+  remove_file(file_a)
+  remove_file(file_same)
+  remove_file(file_diff)
+
+  if same_ok and diff_ok then
+    return ["verified", "identical files produced empty output; files differing by one line produced output containing that line's real new content -- genuinely distinguishes same from different, not just 'produced some output'"]
+  end
+  if (not same_ok) and (not diff_ok) then
+    return ["vacuous", "identical files did NOT produce empty output, and different files did NOT show the real changed content -- this check cannot distinguish same from different"]
+  end
+  return ["inconsistent", "same_ok=" + ("" + same_ok) + " diff_ok=" + ("" + diff_ok) + " -- diff's real behavior did not match the contract this probe assumed"]
+end
+
+# --- Safety allowlist: ONLY these commands are ever actually executed ---
+#
+# Each verify_* function below is a hand-written, self-contained
+# verification probe: it builds its own fixture file inside
+# spec_scratch_dir(), runs the real command in a fixed, read-only
+# invocation shape (never LLM-supplied arguments), and confirms a
+# POSITIVE case (the searched-for text really is in the fixture) and a
+# MUTATED NEGATIVE case (searching for text that genuinely is NOT)
+# produce different, correctly-shaped output -- specifically, that the
+# positive run's raw output contains the real matched line VERBATIM and
+# the negative run's does not. A weaker check (e.g. "the search term
+# itself doesn't appear in the output") would be vacuous -- neither
+# findstr nor find echoes the search term back, so that check would
+# trivially "pass" even if the command were never actually invoked at
+# all. Returns ["verified", note] / ["vacuous", note] / ["inconsistent", note].
+
+make a function called verify_findstr returns result
+  let dir = spec_scratch_dir()
+  let fixture = dir + "/findstr_fixture.txt"
+  let marker_line = "PATLANG_MARKER_PRESENT here"
+  write_file(fixture, "alpha line\n" + marker_line + "\nbravo line\n")
+  let fixture_arg = to_windows_arg_path(fixture)
+
+  let positive_out = exec_capture("findstr", "PATLANG_MARKER_PRESENT", fixture_arg)
+  let positive_ok = contains_text(positive_out, marker_line)
+
+  let negative_out = exec_capture("findstr", "PATLANG_MARKER_ABSENT_XYZ", fixture_arg)
+  let negative_ok = not contains_text(negative_out, marker_line)
+
+  remove_file(fixture)
+
+  if positive_ok and negative_ok then
+    return ["verified", "positive probe's raw output contained the real matched line verbatim; negative probe's did not -- the check genuinely distinguishes match from no-match"]
+  end
+  if (not positive_ok) and (not negative_ok) then
+    return ["vacuous", "neither probe's output contained the matched line -- this check cannot distinguish a real match from no match, so it proves nothing and must not be trusted as a passing spec"]
+  end
+  return ["inconsistent", "positive_ok=" + ("" + positive_ok) + " negative_ok=" + ("" + negative_ok) + " -- findstr's real behavior did not match the simple substring-search contract this probe assumed"]
+end
+
+make a function called verify_which returns result
+  # Positive: resolve a command genuinely on PATH (findstr, confirmed
+  # present earlier). Negative: a deliberately-bogus name.
+  #
+  # REAL BUG FOUND HERE: this originally checked for "findstr.exe" in
+  # the positive output, assuming a Windows-style path -- but this
+  # `which` is Git's own MSYS build, whose POSIX-style output
+  # (`/c/WINDOWS/system32/findstr`, confirmed via a direct manual probe)
+  # has NO extension at all. Checking for "/findstr" (the resolved path
+  # fragment) instead, and for Git which's own specific "not found"
+  # error prefix ("no <name> in (") on the negative side -- checking
+  # merely "the bogus name doesn't appear in the output" would be
+  # vacuous, since that error message literally echoes the name it
+  # failed to find as part of its own text.
+  let positive_out = exec_capture("which", "findstr")
+  let positive_ok = contains_text(positive_out, "/findstr")
+
+  let negative_out = exec_capture("which", "patlang_definitely_absent_cmd_xyz")
+  let negative_ok = contains_text(negative_out, "no patlang_definitely_absent_cmd_xyz in (")
+
+  if positive_ok and negative_ok then
+    return ["verified", "positive probe resolved a real path fragment (/findstr); negative probe's output matched which's own specific not-found error prefix -- genuinely distinguishes found from not-found"]
+  end
+  if (not positive_ok) and (not negative_ok) then
+    return ["vacuous", "neither probe's output had the expected shape -- this check cannot distinguish found from not-found"]
+  end
+  return ["inconsistent", "positive_ok=" + ("" + positive_ok) + " negative_ok=" + ("" + negative_ok) + " -- which's real behavior did not match the contract this probe assumed"]
+end
+
+make a function called verify_where returns result
+  # Same shape as verify_which, against native Windows where.exe, whose
+  # own "not found" message ("INFO: Could not find files for the given
+  # pattern(s).") is confirmed (via a direct manual probe) to contain no
+  # ".exe" either.
+  let positive_out = exec_capture("where", "findstr")
+  let positive_ok = contains_text(positive_out, "findstr.exe")
+
+  let negative_out = exec_capture("where", "patlang_definitely_absent_cmd_xyz")
+  let negative_ok = not contains_text(negative_out, ".exe")
+
+  if positive_ok and negative_ok then
+    return ["verified", "positive probe resolved a real path ending in findstr.exe; negative probe's output contained no .exe at all"]
+  end
+  if (not positive_ok) and (not negative_ok) then
+    return ["vacuous", "neither probe's output had the expected shape -- this check cannot distinguish found from not-found"]
+  end
+  return ["inconsistent", "positive_ok=" + ("" + positive_ok) + " negative_ok=" + ("" + negative_ok) + " -- where's real behavior did not match the contract this probe assumed"]
+end
+
+# --- Self-healing, bounded to exactly ONE fallback attempt, never a loop ---
+#
+# find.exe requires its search-string argument to literally CONTAIN a
+# surrounding pair of double-quote characters as part of find's OWN
+# parsing (confirmed via `find /?` and a direct manual probe -- `find
+# PATLANG_MARKER_PRESENT file` fails with "Parameter format not
+# correct"). exec_capture's underlying std::process::Command::args,
+# though, builds each Windows argument following the platform's own
+# quoting rules and ESCAPES any embedded `"` rather than passing it
+# through raw -- so find.exe never receives the bare quote it requires,
+# no matter how the PatLang-side argument string is written. That's a
+# real, environment-specific limitation of the direct-exec_capture
+# invocation shape, not a PatLang bug and not something retrying the
+# SAME invocation differently can fix.
+#
+# The self-heal here is a SECOND, DIFFERENT, hand-authored strategy --
+# not a retry of the first, and not LLM-improvised: write a tiny,
+# throwaway .bat file (a real file this tool creates, controls, and
+# deletes afterward) containing the find.exe invocation as STATIC TEXT,
+# with a fully-qualified path to the real system find.exe (side effect
+# of the same investigation: bypasses a second, unrelated problem --
+# some PATH orderings on this machine resolve a bare "find"/"cmd" to a
+# different tool of the same name entirely, e.g. Git's own GNU find,
+# well before Windows' System32\find.exe is ever reached), then
+# exec_capture's the .bat file itself with ZERO arguments -- Rust's own
+# argument-escaping never touches the quote characters at all, because
+# they're baked into the script file's own bytes, not passed as a
+# runtime argument. Verified working via a direct manual probe before
+# writing this into the tool.
+#
+# BOUNDED ON PURPOSE: this fallback is tried EXACTLY ONCE, only for
+# find specifically (not a generic "try harder" loop any command could
+# trigger), and if it also fails the result is reported honestly as
+# still unverified -- there is no third strategy, no recursive retry,
+# and no attempt to have an LLM invent a new invocation shape on the
+# fly. A self-healing mechanism that keeps trying novel strategies
+# against a fundamentally broken assumption is exactly the infinite-loop
+# risk this design avoids by construction: one known root cause, one
+# specific, hand-reviewed, pre-written countermeasure, tried once.
+make a function called verify_find_via_batch_fallback takes fixture returns result
+  let bat_path = spec_scratch_dir() + "/find_probe.bat"
+  let marker_line = "PATLANG_MARKER_PRESENT here"
+  let fixture_arg = to_windows_arg_path(fixture)
+
+  let positive_bat = "@echo off\r\n\"C:\\Windows\\System32\\find.exe\" \"PATLANG_MARKER_PRESENT\" \"" + fixture_arg + "\"\r\n"
+  write_file(bat_path, positive_bat)
+  let positive_out = exec_capture(bat_path)
+  let positive_ok = contains_text(positive_out, marker_line)
+
+  let negative_bat = "@echo off\r\n\"C:\\Windows\\System32\\find.exe\" \"PATLANG_MARKER_ABSENT_XYZ\" \"" + fixture_arg + "\"\r\n"
+  write_file(bat_path, negative_bat)
+  let negative_out = exec_capture(bat_path)
+  let negative_ok = not contains_text(negative_out, marker_line)
+
+  remove_file(bat_path)
+
+  if positive_ok and negative_ok then
+    return ["verified", "direct exec_capture invocation failed due to a known argument-quoting limitation (find.exe needs a literal embedded quote character that Rust's own argument escaping never passes through raw) -- self-healed via a single, pre-written, fully-qualified batch-file fallback (not a retry loop, not LLM-improvised); the batch file's own static text supplied the quoting directly, and the positive/negative probe still genuinely distinguishes match from no-match"]
+  end
+  if (not positive_ok) and (not negative_ok) then
+    return ["vacuous", "the batch-file fallback also could not distinguish a real match from no match -- self-healing attempted once and did not resolve the problem; needs manual review, not further automatic retries"]
+  end
+  return ["inconsistent", "positive_ok=" + ("" + positive_ok) + " negative_ok=" + ("" + negative_ok) + " -- the batch-file fallback ran but find's real behavior still did not match the simple substring-search contract assumed here"]
+end
+
+make a function called verify_find returns result
+  let dir = spec_scratch_dir()
+  let fixture = dir + "/find_fixture.txt"
+  let marker_line = "PATLANG_MARKER_PRESENT here"
+  write_file(fixture, "alpha line\n" + marker_line + "\nbravo line\n")
+  let fixture_arg = to_windows_arg_path(fixture)
+
+  let positive_out = exec_capture("find", "\"PATLANG_MARKER_PRESENT\"", fixture_arg)
+  let positive_ok = contains_text(positive_out, marker_line)
+  # REAL BUG FOUND HERE: this originally checked for the string
+  # "Parameter format not correct", find.exe's error for a BARE,
+  # unquoted search term -- but the actual failure this tool triggers
+  # (confirmed via a direct debug probe of the real code path) is
+  # different: "Access denied - \", produced once Rust's own argument
+  # escaping has already mangled the intended `"..."` into malformed
+  # text. Checking for the string this code path genuinely produces,
+  # not the one from an earlier, differently-shaped manual test.
+  let looks_like_quoting_failure = contains_text(positive_out, "Access denied")
+
+  if positive_ok then
+    let negative_out = exec_capture("find", "\"PATLANG_MARKER_ABSENT_XYZ\"", fixture_arg)
+    let negative_ok = not contains_text(negative_out, marker_line)
+    remove_file(fixture)
+    if negative_ok then
+      return ["verified", "positive probe's raw output contained the real matched line verbatim; negative probe's did not"]
+    end
+    return ["inconsistent", "positive_ok=true negative_ok=false -- find's real behavior did not match the simple substring-search contract this probe assumed"]
+  end
+
+  if looks_like_quoting_failure then
+    print("[PLAN PHASE] Direct find.exe invocation failed with the known quoting-limitation signature -- attempting the ONE hand-written self-heal fallback (not a retry loop)...")
+    let healed = verify_find_via_batch_fallback(fixture)
+    remove_file(fixture)
+    return healed
+  end
+
+  remove_file(fixture)
+  return ["vacuous", "positive probe's output did not contain the matched line, and did not show the known quoting-failure signature either -- no self-heal attempted, this needs manual review"]
+end
+
+# The allowlist itself -- the ONLY names this tool will ever pass to
+# verify_shell_command's dispatch below. Adding a new command here means
+# writing a new hand-authored verify_* probe for it FIRST; there is
+# deliberately no generic/automatic path that would execute an arbitrary
+# discovered command with arbitrary arguments.
+# =============================================================================
+# ROOT-CAUSE FIX for a real, confirmed process failure: discover_shell_
+# command_spec used to persist the LLM's freeform gherkin_text as the
+# final .feature content whenever verify_shell_command's UNRELATED,
+# hand-written probe happened to pass -- with nothing anywhere cross-
+# checking that the LLM's specific claims (flags, described behaviour)
+# had anything to do with what the probe actually verified. Found for
+# real: findstr/find/which/where all shipped as "verified" while
+# describing nonexistent flags or, for which/where, an entirely
+# different, imaginary command (a GUI window manager). See
+# spec_library/NEEDS_ATTENTION.md's "LLM-content vs probe mismatch"
+# section for the full incident.
+#
+# Fix: for any command with a hand-written verify_* probe (i.e.
+# is_shell_command_allowlisted), the PERSISTED .feature text must come
+# from a hand-authored Gherkin block tied to that SAME probe -- added
+# here, in this same table, at the point someone writes the probe --
+# never from the LLM call, which stays useful only as a first-draft
+# aid for genuinely new, not-yet-allowlisted commands (where
+# verification_status honestly stays "not_allowlisted"/unverified).
+make a function called hand_gherkin_for_command takes command_name returns gherkin
+  if command_name == "findstr" then
+    return "Feature: Windows findstr Command (native, literal substring search within a file)\n\n  Scenario: A line containing the literal search string is printed\n    Given a file containing the line \"PATLANG_MARKER_PRESENT here\" among other lines\n    When the user runs findstr \"PATLANG_MARKER_PRESENT\" on that file\n    Then the matching line is printed verbatim\n\n  Scenario: No match produces no matching line in the output\n    Given the same file, with a search string that appears nowhere in it\n    When the user runs findstr with that absent string on the same file\n    Then the output does not contain the absent marker text\n"
+  end
+  if command_name == "find" then
+    return "Feature: Windows find.exe (System32) -- literal string search within text files\n\n  Scenario: A line containing the literal search string is printed\n    Given a file containing the line \"PATLANG_MARKER_PRESENT here\" among other lines\n    When the user runs find \"PATLANG_MARKER_PRESENT\" on that file\n    Then a \"---------- <FILENAME>\" header line is printed first, followed by the matching line verbatim (confirmed by direct fresh execution, not just this probe's own internal check)\n\n  Scenario: No match prints only the header, no matching line\n    Given the same file, with a search string that appears nowhere in it\n    When the user runs find on that file\n    Then only the \"---------- <FILENAME>\" header is printed; the output does not contain the absent marker text\n"
+  end
+  if command_name == "which" then
+    return "Feature: which Command (Git/MSYS, resolves an executable's path via PATH)\n\n  Scenario: Resolve a command that exists on PATH\n    Given \"findstr\" is a real command available on PATH\n    When the user runs `which findstr`\n    Then it prints a POSIX-style path containing \"/findstr\" (no \".exe\" suffix -- this is Git's MSYS which, not native Windows)\n\n  Scenario: A nonexistent command name\n    Given a command name that does not exist anywhere on PATH\n    When the user runs `which <bogus-name>`\n    Then it prints \"no <bogus-name> in (...)\" -- this MSYS build's own specific not-found message, which echoes the searched-for name as part of the error text\n"
+  end
+  if command_name == "where" then
+    return "Feature: Windows where Command (native, resolves an executable's path via PATH)\n\n  Scenario: Resolve a command that exists on PATH\n    Given \"findstr\" is a real command available on PATH\n    When the user runs `where findstr`\n    Then it prints a path ending in \"findstr.exe\"\n\n  Scenario: A nonexistent command name\n    Given a command name that does not exist anywhere on PATH\n    When the user runs `where <bogus-name>`\n    Then it prints an error, and the output contains no \".exe\" path\n"
+  end
+  if command_name == "curl" then
+    return "Feature: curl (real HTTPS fetching -- closes the TLS gap PatLang's own networking has)\n\n  Scenario: Fetching a real HTTPS page returns its actual content\n    Given a real, live page (https://parslow.net/teaching/learning/se/bdd-retrofitting.html)\n    When `curl -s <url>` is run\n    Then the real page's actual HTML is returned verbatim (confirmed by checking for its real DOCTYPE and known content), NOT PatLang's own tcp_connect/tcp_read (no TLS support -- would only ever see a 301 redirect to this same HTTPS url, never real content)\n\n  Scenario: The real HTTP status code is reported\n    Given the same real page and a deliberately nonexistent one\n    When `curl -s -o NUL -w \"%{http_code}\" <url>` is run on each\n    Then the real page reports 200 and the nonexistent one reports 404\n\n  Note: this spec's own probe is deliberately coupled to one specific\n  real external page (rather than a neutral/generic test target) --\n  a deliberate choice, since the whole point of adding this spec was to\n  prove real HTTPS content from THIS SITE is actually fetchable via\n  curl, closing a real, named gap ([[patlang-synthesis-registry-experiments]])\n  found in PatLang's own native networking.\n"
+  end
+  return ""
+end
+
+make a function called is_shell_command_allowlisted takes command_name returns yes
+  if command_name == "findstr" then
+    return true
+  end
+  if command_name == "find" then
+    return true
+  end
+  if command_name == "which" then
+    return true
+  end
+  if command_name == "where" then
+    return true
+  end
+  if command_name == "diff" then
+    return true
+  end
+  if command_name == "curl" then
+    return true
+  end
+  return false
+end
+
+# Real HTTPS fetch, added specifically to close the TLS gap
+# [[patlang-synthesis-registry-experiments]] found: PatLang's own
+# networking (tcp_connect/tcp_read/tcp_write) has no TLS support at
+# all, so it can only ever reach an HTTPS-only site's plain-HTTP
+# redirect, never real page content. curl (a real command-line tool
+# already on this machine's PATH, confirmed via `where curl`) has real
+# TLS built in -- shelling out to it is a legitimate way to get actual
+# HTTPS content without PatLang needing its own TLS implementation.
+make a function called verify_curl returns result
+  let real_page = "https://parslow.net/teaching/learning/se/bdd-retrofitting.html"
+  let missing_page = "https://parslow.net/definitely_not_a_real_page_xyz.html"
+
+  let positive_out = exec_capture("curl", "-s", real_page)
+  let positive_ok = contains_text(positive_out, "<!DOCTYPE html>") and contains_text(positive_out, "bdd")
+
+  let status_out = exec_capture("curl", "-s", "-o", "NUL", "-w", "%{http_code}", real_page)
+  let status_ok = contains_text(status_out, "200")
+
+  let missing_status_out = exec_capture("curl", "-s", "-o", "NUL", "-w", "%{http_code}", missing_page)
+  let missing_status_ok = contains_text(missing_status_out, "404")
+
+  if positive_ok and status_ok and missing_status_ok then
+    return ["verified", "curl fetches real HTTPS content -- a real, live page's actual HTML was retrieved verbatim (confirmed by checking for its real DOCTYPE and known content, not just 'some output happened'); curl's own -w \"%{http_code}\" reports the real HTTP status: 200 for a page that exists, 404 for one that doesn't -- genuine TLS-backed fetching PatLang's own networking cannot do natively"]
+  end
+  return ["inconsistent", "positive_ok=" + ("" + positive_ok) + " status_ok=" + ("" + status_ok) + " missing_status_ok=" + ("" + missing_status_ok)]
+end
+
+make a function called verify_shell_command takes command_name returns result
+  if command_name == "findstr" then
+    return verify_findstr()
+  end
+  if command_name == "find" then
+    return verify_find()
+  end
+  if command_name == "which" then
+    return verify_which()
+  end
+  if command_name == "where" then
+    return verify_where()
+  end
+  if command_name == "diff" then
+    return verify_diff()
+  end
+  if command_name == "curl" then
+    return verify_curl()
+  end
+  return ["not_allowlisted", "no hand-written verification probe exists for '" + command_name + "' -- refusing to execute an unreviewed command"]
+end
+
+# --- Persisting a spec + its provenance/verification sidecar ---
+
+make a function called json_escape takes s returns escaped
+  let sb = sb_new()
+  let i = 0
+  while i < s.length do
+    let c = char_code(s, i)
+    if c == 34 then
+      sb_push(sb, "\\\"")
+    else
+      if c == 92 then
+        sb_push(sb, "\\\\")
+      else
+        if c == 10 then
+          sb_push(sb, "\\n")
+        else
+          sb_push(sb, substr(s, i, 1))
+        end
+      end
+    end
+    let i = i + 1
+  end
+  return sb_str(sb)
+end
+
+make a function called write_shell_spec takes command_name, gherkin_text, source, model_name, fenced, verify_status, verify_note returns done
+  let dir = shell_spec_dir()
+  let feature_file = dir + "/" + command_name + ".feature"
+  write_file(feature_file, gherkin_text + "\n")
+
+  let sb = sb_new()
+  sb_push(sb, "{\n")
+  sb_push(sb, "  \"command\": \"" + json_escape(command_name) + "\",\n")
+  sb_push(sb, "  \"category\": \"shell\",\n")
+  sb_push(sb, "  \"feature_file\": \"" + command_name + ".feature\",\n")
+  sb_push(sb, "  \"source\": \"" + json_escape(source) + "\",\n")
+  sb_push(sb, "  \"model\": \"" + json_escape(model_name) + "\",\n")
+  sb_push(sb, "  \"gherkin_fence_found\": " + ("" + fenced) + ",\n")
+  sb_push(sb, "  \"gherkin_looks_valid\": " + ("" + looks_like_gherkin(gherkin_text)) + ",\n")
+  sb_push(sb, "  \"verification_status\": \"" + json_escape(verify_status) + "\",\n")
+  sb_push(sb, "  \"verification_note\": \"" + json_escape(verify_note) + "\"\n")
+  sb_push(sb, "}\n")
+  write_file(dir + "/" + command_name + ".meta.json", sb_str(sb))
+  return true
+end
+
+# Resolves a bare command name to a real file path via `where` (native
+# Windows, verified above) -- needed because exec_capture itself relies
+# on the OS's own PATH search internally and never surfaces the
+# resolved path back to the caller, but the GUI-detection gate below
+# needs a real file to read PE header bytes from. Returns "" if `where`
+# can't resolve it at all (treated as "can't confirm it's safe", not
+# "assume it's fine").
+make a function called resolve_command_path takes command_name returns path
+  let raw = exec_capture("where", command_name)
+  if contains_text(raw, "Could not find") then
+    return ""
+  end
+  let lines = split_lines(raw)
+  if to_num(list_len(lines)) == 0 then
+    return ""
+  end
+  return full_trim_spec_discovery(lines[0])
+end
+
+make a function called full_trim_spec_discovery takes s returns trimmed
+  let a = 0
+  while (a < s.length) and ((char_code(s, a) == 32) or (char_code(s, a) == 9) or (char_code(s, a) == 13) or (char_code(s, a) == 10)) do
+    let a = a + 1
+  end
+  let z = s.length
+  while (z > a) and ((char_code(s, z - 1) == 32) or (char_code(s, z - 1) == 9) or (char_code(s, z - 1) == 13) or (char_code(s, z - 1) == 10)) do
+    let z = z - 1
+  end
+  return substr(s, a, z - a)
+end
+
+# --- Orchestrator ---
+
+make a function called discover_shell_command_spec takes command_name, model_name, hermes_model_name returns status_and_source
+  print("[SPEC DISCOVERY] Processing shell command '" + command_name + "'...")
+
+  let gherkin_result = llm_generate_gherkin_for_command(command_name, model_name)
+  let gherkin_text = gherkin_result[0]
+  let fenced = gherkin_result[1]
+  let source = "ollama"
+  let used_model = model_name
+
+  # Escalate to hermes AT MOST ONCE per command -- not a retry loop --
+  # only when the primary reply doesn't actually contain real Gherkin
+  # content (checked via looks_like_gherkin, NOT via whether the
+  # backtick fence happened to survive -- see that function's own
+  # comment for why: fence presence is inconsistent across otherwise-
+  # identical calls, content quality generally isn't). The length check
+  # stays as a cheap pre-filter -- genuine fluff/refusal replies are
+  # usually short, and it's a free check before the substring scan.
+  if (gherkin_text.length < 60) or (not looks_like_gherkin(gherkin_text)) then
+    print("[SPEC DISCOVERY] Primary (ollama) reply for '" + command_name + "' doesn't look like real Gherkin (length=" + ("" + gherkin_text.length) + ", looks_like_gherkin=" + ("" + looks_like_gherkin(gherkin_text)) + ") -- escalating to hermes once.")
+    let hermes_result = llm_generate_gherkin_via_hermes(command_name, hermes_model_name)
+    let hermes_text = hermes_result[0]
+    let hermes_fenced = hermes_result[1]
+    if (hermes_text.length >= 60) and looks_like_gherkin(hermes_text) then
+      let gherkin_text = hermes_text
+      let fenced = hermes_fenced
+      let source = "hermes"
+      let used_model = hermes_model_name
+      print("[SPEC DISCOVERY] hermes fallback produced a usable spec for '" + command_name + "'.")
+    else
+      print("[SPEC DISCOVERY] hermes fallback ALSO didn't look like real Gherkin -- keeping the ollama reply as-is, flagged in metadata; no further escalation attempted.")
+    end
+  end
+
+  if not looks_like_gherkin(gherkin_text) then
+    print("[SPEC DISCOVERY] WARNING: '" + command_name + "'s final spec text doesn't look like real Gherkin (no Feature:/Scenario found) -- using it anyway, flagged in metadata.")
+  end
+
+  # Hard gate, checked BEFORE the allowlist even matters: a GUI
+  # application launched via exec_capture never exits on its own (it
+  # waits for user interaction), so probing one would hang the whole
+  # discovery pipeline indefinitely -- this has to be ruled out before
+  # anything else, not discovered by timing out. Resolves the command
+  # to a real file path via `where` (a verified, allowlisted command in
+  # its own right) and reads the PE header's own Subsystem field
+  # directly, WITHOUT ever running the candidate executable.
+  let verify_status = "not_allowlisted"
+  let verify_note = "no hand-written verification probe exists for '" + command_name + "' -- refusing to execute an unreviewed command"
+  let resolved_path = resolve_command_path(command_name)
+  let pe_class = "not_pe"
+  if resolved_path != "" then
+    let pe_class = pe_subsystem_classify(resolved_path)
+  end
+
+  if (pe_class == "gui") or (pe_class == "other") then
+    let verify_status = "gui_skipped"
+    let verify_note = "'" + command_name + "' resolved to '" + resolved_path + "', whose PE header Subsystem field marks it as " + pe_class + ", not a console application -- never executed, since it would hang waiting for user interaction rather than exit on its own"
+    print("[SPEC DISCOVERY] '" + command_name + "' is a GUI application (PE subsystem: " + pe_class + ") -- skipping execution entirely.")
+  else
+    if is_shell_command_allowlisted(command_name) then
+      let probe = verify_shell_command(command_name)
+      let verify_status = probe[0]
+      let verify_note = probe[1]
+      print("[SPEC DISCOVERY] Verification for '" + command_name + "': " + verify_status + " -- " + verify_note)
+    else
+      print("[SPEC DISCOVERY] '" + command_name + "' is not on the safety allowlist -- spec written as UNVERIFIED (not executed).")
+    end
+  end
+
+  # See hand_gherkin_for_command's own header for why this exists: a
+  # verified probe result must never be used to stamp "verified" onto
+  # the LLM's independently-imagined content -- if a hand-authored
+  # Gherkin block exists for this command (added alongside its verify_*
+  # probe), that's what gets persisted, not gherkin_text.
+  let hand_gherkin = hand_gherkin_for_command(command_name)
+  if (verify_status == "verified") and (hand_gherkin != "") then
+    let gherkin_text = hand_gherkin
+    let source = "hand-authored"
+    let used_model = ""
+    let fenced = true
+  else
+    if (verify_status == "verified") and (hand_gherkin == "") then
+      # A probe passed but nobody has yet written the matching
+      # hand-authored Gherkin for it -- exactly the gap that let the
+      # original bug happen. Flag it loudly rather than silently
+      # trusting the LLM's unrelated text.
+      let verify_note = verify_note + " -- WARNING: no hand_gherkin_for_command entry exists for '" + command_name + "' yet; the persisted .feature below is the LLM's own text, NOT cross-checked against this probe's actual behaviour -- add a hand_gherkin_for_command entry before trusting this spec as verified."
+      print("[SPEC DISCOVERY] WARNING: '" + command_name + "' verified by probe but has no hand_gherkin_for_command entry -- persisting LLM content unchecked, flagged in metadata.")
+    end
+  end
+
+  write_shell_spec(command_name, gherkin_text, source, used_model, fenced, verify_status, verify_note)
+  print("[SPEC DISCOVERY] Wrote " + shell_spec_dir() + "/" + command_name + ".feature (+ .meta.json)")
+  return [verify_status, source]
+end

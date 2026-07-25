@@ -81,3 +81,51 @@ Before ending any task that touched `hosts.rs`/`codegen.rs`:
 3. If deferring anyway (e.g. genuinely out of scope for the current task), say so explicitly to the user rather than letting it pass silently — "the self-hosted mirror is now N chunks behind" is a fact worth surfacing, not burying.
 
 A `/mirror-check` skill (`.claude/skills/mirror-check/SKILL.md`) automates step 1 and reports exactly what's out of sync — run it before considering any `hosts.rs`/`codegen.rs` change complete.
+
+## Full RED → GREEN BDD for every function, no matter how small
+
+A real bug in the spec-library initiative (`spec_library/shell/where.
+feature` and 3 others marked `"verification_status": "verified"` while
+describing an entirely different, nonexistent command — see `spec_
+library/NEEDS_ATTENTION.md`'s incident writeup) came from treating
+"write a spec" and "run some check that happens to pass" as if they
+were the same claim. They aren't. The failure mode generalizes past
+that one pipeline: **it is not safe to write a scenario, an
+implementation, and a passing check in any order that lets them drift
+apart — the only reliable discipline is genuine RED → GREEN, every
+time, including for a function that looks too small to bother.**
+
+Concretely, for any new function or host capability, no matter how
+small ("small" is exactly where this discipline gets skipped, and
+exactly where it's cheapest to do right):
+
+1. **RED first**: write the Given/When/Then scenario(s) *before* the
+   implementation exists (or before trusting an existing one), and
+   confirm they actually fail (or that the target genuinely doesn't
+   exist yet) — a scenario that has never been seen to fail is not
+   trustworthy evidence it's testing anything real.
+2. **GREEN via the SAME artifact**: the check that flips RED to GREEN
+   must be evaluating the *literal claims written in the scenario* —
+   not a differently-scoped, differently-authored probe that happens to
+   also return true. If a scenario says a function handles case X, the
+   thing that goes GREEN must actually exercise case X, not something
+   adjacent to it. Never let a spec's prose and its verification logic
+   be authored independently and reconciled only by both "looking
+   plausible" or both "usually agreeing."
+3. **A passing check is not evidence for content you didn't write it
+   to check.** If an LLM (or any generator) produces the scenario text,
+   the verification step must confirm THAT TEXT's specific claims
+   against a real observation — not run an unrelated hand-written
+   assertion and stamp the generated text "verified" by association.
+   When in doubt, prefer to keep the spec's prose and its check in the
+   same hand-authored place, generated or reviewed together.
+4. **State the verification chain explicitly when reporting a
+   scenario as passing** — what specifically was run, what output was
+   observed, and how that maps to the scenario's own wording. "It's
+   marked verified" and "I just watched it happen" are different
+   claims; don't let the former stand in for the latter.
+
+This applies uniformly — a one-line utility function deserves the same
+RED → GREEN discipline as a large feature; skipping it for "small"
+code is exactly the gap that let four specs ship as "verified" while
+describing a different program entirely.

@@ -1,0 +1,197 @@
+# =============================================================================
+# Mechanized, SUBPROCESS-ISOLATED probing for the wide 850-candidate
+# likely_pure pool (patlang_function_discovery.patlang's own discovery
+# pass), to avoid hand-authoring a verify_* function per candidate the
+# way the top-40-by-usage batch did (see spec_library/NEEDS_ATTENTION.md
+# -- that discipline doesn't scale to hundreds of candidates without
+# spending a huge amount of session effort per function).
+#
+# WHY SUBPROCESS ISOLATION, NOT try/catch: PatLang has no try/catch, so
+# calling a discovered function with a guessed argument that turns out
+# wrong is FATAL to whatever process makes the call. exec_capture
+# itself never propagates a child crash as a PatLang-level error --
+# host_exec_capture (rust-runtime/src/ir/hosts.rs) always returns
+# Ok(...), appending the child's stderr text to its captured output on
+# a nonzero exit -- so running each guess as `pat --ir-run <tmp file>`
+# via exec_capture is safe by construction: a bad guess kills the CHILD
+# process, never this one. This is the same isolation trick fuzz.patlang
+# already uses (exec_capture(pat_exe, "--ir-run", file)) and the same
+# one self_healing_engine.patlang's shell-command probing relies on.
+#
+# WHAT THIS PRODUCES, AND WHAT IT DOESN'T: a genuine, real, OBSERVED
+# fact -- "called with this specific guessed input, this exact output
+# came back, no error" -- for whichever guess (if any) happened not to
+# crash. This is NOT the same claim as a hand-authored spec's "verified
+# against known-correct expected behaviour, including edge cases" --
+# there is no contract knowledge here, just one example that happened
+# to run. Written to spec_library/patlang_stdlib_auto/ (a SEPARATE
+# directory from the hand-verified spec_library/patlang_stdlib/),
+# tagged verification_status "auto_probed_single_example", so a reader
+# never mistakes one for the other by directory location alone.
+# =============================================================================
+
+make a function called auto_probe_dir returns path
+  return "spec_library/patlang_stdlib_auto"
+end
+
+# A small, deliberately bounded set of guessed literal VALUES, expressed
+# as PatLang SOURCE TEXT fragments (not real values -- these get spliced
+# directly into generated probe source), covering the three most common
+# real parameter shapes seen across this codebase's own functions:
+# a string, an integer, an empty list. Repeated across ALL of a
+# candidate's parameters (not a full cartesian product across mixed
+# types) -- a real scope limit, not an oversight: this keeps the total
+# probe count bounded (candidates * 3, not candidates * 3^params) at the
+# cost of never trying a genuinely mixed-type signature like (string,
+# int). Good enough to triage hundreds of candidates cheaply; anything
+# that needs a mixed-type guess to succeed will show up as
+# "no_guess_worked" and can get a real hand-authored probe later.
+make a function called auto_probe_guess_literals returns literals
+  return ["\"test\"", "0", "[]"]
+end
+
+# Builds one small, self-contained probe program: include the
+# candidate's own source file (relative to friendly_cli/spec_scratch/,
+# where this gets written), call the function with `guess_literal`
+# repeated `param_count` times, print a distinguishable marker plus the
+# result if the call returns at all.
+make a function called auto_probe_build_source takes func_name, param_count, file_path, guess_literal returns src
+  let sb = sb_new()
+  sb_push(sb, "include \"../../" + file_path + "\"\n")
+  sb_push(sb, "let args_ok = true\n")
+  let call_sb = sb_new()
+  sb_push(call_sb, func_name + "(")
+  let i = 0
+  while i < param_count do
+    if i > 0 then
+      sb_push(call_sb, ", ")
+    end
+    sb_push(call_sb, guess_literal)
+    let i = i + 1
+  end
+  sb_push(call_sb, ")")
+  sb_push(sb, "let r = " + sb_str(call_sb) + "\n")
+  sb_push(sb, "print(\"AUTO_PROBE_OK:\" + (\"\" + r))\n")
+  return sb_str(sb)
+end
+
+make a function called auto_probe_looks_like_error takes output returns yes
+  if contains_text(output, "IR runtime error") then
+    return true
+  end
+  if contains_text(output, "Include error") then
+    return true
+  end
+  if contains_text(output, "Parse error") then
+    return true
+  end
+  if contains_text(output, "panicked") then
+    return true
+  end
+  # Real incident: a guessed candidate call hung `pat --ir-run`
+  # indefinitely -- exec_capture has NO timeout at all (host_exec_
+  # capture's std::process::Command::output() blocks forever), so this
+  # silently froze the whole batch for 2+ hours with no error and no
+  # further progress, with zombie processes still alive and consuming
+  # CPU when finally found. auto_probe_try_guess below no longer calls
+  # exec_capture directly -- it shells through auto_probe_runner.ps1,
+  # a hard-timeout wrapper that force-kills the child and emits this
+  # marker if it had to.
+  if contains_text(output, "AUTO_PROBE_TIMEOUT") then
+    return true
+  end
+  return not contains_text(output, "AUTO_PROBE_OK:")
+end
+
+make a function called auto_probe_runner_script returns path
+  return "friendly_cli/auto_probe_runner.ps1"
+end
+
+# Default wall-clock timeout per guess, in milliseconds. Chosen from
+# the real batch's own observed pace (250 successful candidates in
+# roughly 2 hours before the hang, averaging well under 10s per call
+# even accounting for process startup) -- anything genuinely taking
+# longer than this is far more likely hung than doing real, slow work.
+make a function called auto_probe_timeout_ms returns ms
+  return 10000
+end
+
+# Runs ONE guess for ONE candidate, via a real isolated subprocess,
+# now with a HARD TIMEOUT (see auto_probe_looks_like_error's own
+# comment for the incident this fixes). pat_exe should be the real
+# interpreter binary path, passed in by the caller rather than
+# hardcoded here.
+make a function called auto_probe_try_guess takes pat_exe, func_name, param_count, file_path, guess_literal, tmp_path returns result
+  let src = auto_probe_build_source(func_name, param_count, file_path, guess_literal)
+  write_file(tmp_path, src)
+  let output = exec_capture("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", auto_probe_runner_script(), pat_exe, tmp_path, "" + auto_probe_timeout_ms())
+  if auto_probe_looks_like_error(output) then
+    return ["fail", output]
+  end
+  return ["ok", output]
+end
+
+# Tries each guess literal in turn (each its OWN isolated subprocess),
+# stopping at the first one that runs cleanly. param_count > 3 is
+# skipped outright -- deliberately not guessed at all, flagged
+# "needs_manual_fixture" -- the same call this project already made for
+# tokenize/parse_program/the synthesis-engine functions during the
+# hand-authored batch: a real, non-trivial input shape deserves a real,
+# hand-built fixture, not a blind guess.
+make a function called auto_probe_function takes pat_exe, func_name, param_count, file_path, tmp_path returns result
+  if param_count > 3 then
+    return ["needs_manual_fixture", "more than 3 parameters -- not guessed automatically"]
+  end
+  let literals = auto_probe_guess_literals()
+  let n = to_num(list_len(literals))
+  let i = 0
+  let found = false
+  let found_literal = ""
+  let found_output = ""
+  while (i < n) and (not found) do
+    let lit = literals[i]
+    let r = auto_probe_try_guess(pat_exe, func_name, param_count, file_path, lit, tmp_path)
+    if r[0] == "ok" then
+      let found = true
+      let found_literal = lit
+      let found_output = r[1]
+    end
+    let i = i + 1
+  end
+  if found then
+    return ["probed_ok", [found_literal, found_output]]
+  end
+  return ["no_guess_worked", "none of the " + ("" + n) + " bounded guesses (repeated across all " + ("" + param_count) + " parameter(s)) ran without error -- needs a hand-authored probe with a real, type-appropriate input"]
+end
+
+make a function called auto_probe_already_has_spec takes qualified_id returns yes
+  return file_exists(auto_probe_dir() + "/" + qualified_id + ".feature") == "1"
+end
+
+make a function called auto_probe_write_spec takes qualified_id, func_name, source_file, param_count, found_literal, found_output returns done
+  let dir = auto_probe_dir()
+  let gherkin_sb = sb_new()
+  sb_push(gherkin_sb, "Feature: " + func_name + " (" + source_file + ", AUTO-PROBED)\n\n")
+  sb_push(gherkin_sb, "  Background:\n    This spec was generated by MECHANIZED probing, not hand-authored.\n    It records ONE observed input/output example -- the first of a\n    small bounded set of guessed literal values that ran without\n    error, tried in an isolated subprocess. It is NOT a claim that\n    this covers edge cases, error paths, or the function's full\n    contract -- only that this exact call, with this exact input,\n    produced this exact output, with no error, at the time this was\n    generated.\n\n")
+  sb_push(gherkin_sb, "  Scenario: One example call succeeds\n")
+  sb_push(gherkin_sb, "    Given " + ("" + param_count) + " argument(s), each the literal " + found_literal + "\n")
+  sb_push(gherkin_sb, "    When " + func_name + " is called\n")
+  sb_push(gherkin_sb, "    Then it returns without error (see the recorded output in this spec's own .meta.json)\n")
+
+  write_file(dir + "/" + qualified_id + ".feature", sb_str(gherkin_sb) + "\n")
+
+  let meta_sb = sb_new()
+  sb_push(meta_sb, "{\n")
+  sb_push(meta_sb, "  \"function\": \"" + func_name + "\",\n")
+  sb_push(meta_sb, "  \"source_file\": \"" + source_file + "\",\n")
+  sb_push(meta_sb, "  \"qualified_id\": \"" + qualified_id + "\",\n")
+  sb_push(meta_sb, "  \"category\": \"patlang_stdlib_auto\",\n")
+  sb_push(meta_sb, "  \"feature_file\": \"" + qualified_id + ".feature\",\n")
+  sb_push(meta_sb, "  \"source\": \"auto_probed\",\n")
+  sb_push(meta_sb, "  \"verification_status\": \"auto_probed_single_example\",\n")
+  sb_push(meta_sb, "  \"probe_argument_literal\": " + json_quote(found_literal) + ",\n")
+  sb_push(meta_sb, "  \"observed_output\": " + json_quote(found_output) + "\n")
+  sb_push(meta_sb, "}\n")
+  write_file(dir + "/" + qualified_id + ".meta.json", sb_str(meta_sb))
+  return true
+end

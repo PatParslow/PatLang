@@ -8,6 +8,14 @@ goal-oriented/logic-programming layer (facts, rules, `solve`, `plan`) and
 an inductive-synthesis (ILP) engine that can learn rules from BDD-style
 example scenarios.
 
+Importantly, it is basically an experiment in developing a programming 
+language that covers all of the major paradigms of programming: imperative,
+functional, goal-oriented, logic-programming, OO, design by contract, and
+so on.  But it is also an experiment in doing so without writing a single 
+line of code, nor any of the formalised BDD specs, by hand - the
+human-in-the-loop designed the concept, directs the development, and
+AI agents developed the code, and the documentation.
+
 This README describes the system as it exists today. If you're looking at
 one of the many `*_REPORT.md` / `*_PLAN.md` files in the repo root and it
 disagrees with this file, trust this file — most of those documents

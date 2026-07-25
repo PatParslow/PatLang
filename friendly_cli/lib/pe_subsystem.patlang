@@ -1,0 +1,84 @@
+# =============================================================================
+# GUI-vs-console executable detection, WITHOUT running the executable --
+# reads the PE (Portable Executable) header's own Subsystem field
+# directly. Needed because a GUI application launched via exec_capture
+# never exits on its own (it waits for user interaction), so the
+# spec-discovery pipeline probing it would simply hang forever -- this
+# check runs BEFORE any candidate is ever passed to exec_capture at all.
+#
+# PE format (all offsets confirmed against a real findstr.exe, a known
+# console executable, before trusting this):
+#   offset 0x3C (60), 4 bytes, little-endian: "e_lfanew" -- the file
+#     offset of the real PE header ("PE\0\0" signature).
+#   e_lfanew + 4 (past the "PE\0\0" signature) + 20 (the fixed-size
+#     COFF file header) + 68 (into the Optional Header): the 2-byte
+#     Subsystem field. This +68 offset is the SAME in both the 32-bit
+#     (PE32) and 64-bit (PE32+) Optional Header layouts -- Microsoft
+#     compensates the field-size differences earlier in the structure
+#     (ImageBase width, presence of BaseOfData) specifically so common
+#     fields like Subsystem land at a stable offset either way.
+#   Subsystem values that matter here: 2 = IMAGE_SUBSYSTEM_WINDOWS_GUI,
+#     3 = IMAGE_SUBSYSTEM_WINDOWS_CUI (console). Others (native driver,
+#     EFI, etc.) are treated as "not a normal console tool" too, i.e.
+#     also avoided -- this check answers "is it safe to assume this
+#     behaves like an ordinary CLI tool", not just "is it GUI".
+# =============================================================================
+
+make a function called le_u16 takes bytes, offset returns n
+  return bytes[offset] + (bytes[offset + 1] * 256)
+end
+
+make a function called le_u32 takes bytes, offset returns n
+  return bytes[offset] + (bytes[offset + 1] * 256) + (bytes[offset + 2] * 65536) + (bytes[offset + 3] * 16777216)
+end
+
+# Returns one of: "console" (safe to probe normally), "gui" (never
+# probe -- would hang waiting for user interaction), "other" (not a
+# recognised console subsystem either -- also never probed, treated the
+# same as "gui" for safety purposes), "not_pe" (not a valid PE file at
+# all, e.g. a .bat/.cmd script or something read_file_bytes couldn't
+# make sense of -- also never probed automatically).
+make a function called pe_subsystem_classify takes exe_path returns classification
+  # Guard first: read_file_bytes is a host function, and this language
+  # has no try/catch -- a host-function error is fatal to the whole
+  # program, so calling it on a path that doesn't exist would crash the
+  # entire discovery driver, not just fail this one check. Checked here
+  # rather than trusting every caller to check first.
+  if file_exists(exe_path) != "1" then
+    return "not_pe"
+  end
+  let header = read_file_bytes(exe_path, 0, 64)
+  if to_num(list_len(header)) < 64 then
+    return "not_pe"
+  end
+  if (header[0] != 77) or (header[1] != 90) then
+    return "not_pe"
+  end
+  let e_lfanew = le_u32(header, 60)
+  # Sanity bound: a legitimate e_lfanew is always small (a few hundred
+  # bytes at most, in every real PE file this project will encounter) --
+  # a wildly large value here means this isn't a real PE file, not a
+  # signal to go read gigabytes at an attacker-controlled offset.
+  if (e_lfanew < 0) or (e_lfanew > 4096) then
+    return "not_pe"
+  end
+  let pe_header = read_file_bytes(exe_path, e_lfanew, 96)
+  if to_num(list_len(pe_header)) < 96 then
+    return "not_pe"
+  end
+  if (pe_header[0] != 80) or (pe_header[1] != 69) or (pe_header[2] != 0) or (pe_header[3] != 0) then
+    return "not_pe"
+  end
+  let subsystem = le_u16(pe_header, 4 + 20 + 68)
+  if subsystem == 3 then
+    return "console"
+  end
+  if subsystem == 2 then
+    return "gui"
+  end
+  return "other"
+end
+
+make a function called is_safe_to_probe_automatically takes exe_path returns yes
+  return pe_subsystem_classify(exe_path) == "console"
+end

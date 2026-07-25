@@ -1,0 +1,111 @@
+# Tier 2: the actual test of whether registering things pays off. The
+# natural solution CALLS the already-registered is_even rather than
+# reimplementing "% 2 == 0" itself -- the registry's real contents
+# (not a hand-picked summary) get injected into the prompt via
+# curriculum_available_functions_text(), the concrete mechanism for
+# "building on earlier proven steps" the user asked for.
+
+include "../self_hosting/lib/includes.patlang"
+include "../self_hosting/lib/test.patlang"
+include "lib/curriculum_engine.patlang"
+
+let pat_exe = "rust-runtime/target/release/pat.exe"
+let model = "llama3.2"
+
+let available = curriculum_available_functions_text()
+print("=== Available registered functions injected into the prompt ===")
+print(available)
+
+let reuse_context = "\n\nYou may call any of these ALREADY-PROVEN, already-defined functions directly (do not redefine them, just call them):\n" + available
+let problem_prompt = "Write a PatLang function `sum_of_evens` that takes one parameter `xs` (a list of integers) and returns the sum of only the even numbers in the list. sum_of_evens([1,2,3,4]) is 6. sum_of_evens([]) is 0."
+
+print("=== Tier 2: sum_of_evens (should reuse is_even) ===")
+let attempt = curriculum_try_llm(model, problem_prompt, reuse_context, [], "")
+let code = attempt[0]
+print("--- LLM code ---")
+print(code)
+
+let reused_is_even = contains_text(code, "is_even(")
+print("Did the generated code actually call is_even()? " + reused_is_even)
+
+let includes_line = "include \"curriculum_gen_is_even.patlang\""
+let is_even_code = "make a function called is_even takes n returns result\n  return (n % 2) == 0\nend\n"
+write_file("friendly_cli/spec_scratch/curriculum_gen_is_even.patlang", is_even_code)
+
+let visible_cases = [["[1,2,3,4]", "6"], ["[]", "0"]]
+let all_visible_ok = true
+let i = 0
+while i < to_num(list_len(visible_cases)) do
+  let case = visible_cases[i]
+  let r = curriculum_run_one_check(pat_exe, code, includes_line, "sum_of_evens(" + case[0] + ")", case[1])
+  print("sum_of_evens(" + case[0] + ") expected=" + case[1] + " got=[" + r[1] + "] match=" + ("" + r[0]))
+  if not r[0] then
+    let all_visible_ok = false
+  end
+  let i = i + 1
+end
+
+let all_blind_ok = false
+if all_visible_ok then
+  # BLIND: negative numbers (a real edge case the visible examples
+  # never exercise -- whether the correct, registered is_even's own
+  # negative-number handling gets exercised transitively) and an
+  # all-odd list (sum is 0, not "no evens found" as an error).
+  let blind_cases = [["[-2,-3,-4]", "-6"], ["[1,3,5]", "0"]]
+  let all_blind_ok = true
+  let bi = 0
+  while bi < to_num(list_len(blind_cases)) do
+    let case = blind_cases[bi]
+    let r = curriculum_run_one_check(pat_exe, code, includes_line, "sum_of_evens(" + case[0] + ")", case[1])
+    print("BLIND sum_of_evens(" + case[0] + ") expected=" + case[1] + " got=[" + r[1] + "] match=" + ("" + r[0]))
+    if not r[0] then
+      let all_blind_ok = false
+    end
+    let bi = bi + 1
+  end
+end
+
+if all_visible_ok and all_blind_ok then
+  print("=== sum_of_evens: LLM SUCCESS (reused is_even: " + reused_is_even + ") -- registering ===")
+  let reuses_json = "[]"
+  if reused_is_even then
+    let reuses_json = "[\"is_even\"]"
+  end
+  curriculum_write_registry_entry("sum_of_evens", "llm_synthesized_function", code,
+    "{\"[1,2,3,4]\": \"6\", \"[]\": \"0\"}",
+    "{\"[-2,-3,-4]\": \"-6\", \"[1,3,5]\": \"0\"}", reuses_json)
+else
+  print("=== sum_of_evens: LLM attempt FAILED -- falling back to hand-authored, EXPLICITLY calling the registered is_even ===")
+  let hand_code = "make a function called sum_of_evens takes xs returns result\n  let total = 0\n  let i = 0\n  while i < to_num(list_len(xs)) do\n    if is_even(xs[i]) then\n      let total = total + xs[i]\n    end\n    let i = i + 1\n  end\n  return total\nend\n"
+  let hi = 0
+  let hand_visible_ok = true
+  while hi < to_num(list_len(visible_cases)) do
+    let case = visible_cases[hi]
+    let r = curriculum_run_one_check(pat_exe, hand_code, includes_line, "sum_of_evens(" + case[0] + ")", case[1])
+    print("HAND sum_of_evens(" + case[0] + ") expected=" + case[1] + " got=[" + r[1] + "] match=" + ("" + r[0]))
+    if not r[0] then
+      let hand_visible_ok = false
+    end
+    let hi = hi + 1
+  end
+  let blind_cases2 = [["[-2,-3,-4]", "-6"], ["[1,3,5]", "0"]]
+  let hand_blind_ok = true
+  let hbi = 0
+  while hbi < to_num(list_len(blind_cases2)) do
+    let case = blind_cases2[hbi]
+    let r = curriculum_run_one_check(pat_exe, hand_code, includes_line, "sum_of_evens(" + case[0] + ")", case[1])
+    print("HAND BLIND sum_of_evens(" + case[0] + ") expected=" + case[1] + " got=[" + r[1] + "] match=" + ("" + r[0]))
+    if not r[0] then
+      let hand_blind_ok = false
+    end
+    let hbi = hbi + 1
+  end
+  if hand_visible_ok and hand_blind_ok then
+    print("=== sum_of_evens: hand-authored fallback verified, genuinely reuses is_even -- writing to reference_solutions (NOT the synthesis registry) ===")
+    curriculum_write_reference_entry("sum_of_evens", "hand_authored_function", hand_code,
+      "{\"[1,2,3,4]\": \"6\", \"[]\": \"0\"}",
+      "{\"[-2,-3,-4]\": \"-6\", \"[1,3,5]\": \"0\"}", "[\"is_even\"]")
+  else
+    print("=== sum_of_evens: even hand-authored failed?! -- not registering ===")
+  end
+end

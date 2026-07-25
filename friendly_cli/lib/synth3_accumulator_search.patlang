@@ -1,0 +1,118 @@
+# GENERIC extension to the induction engine's search space -- NOT a
+# solution to any specific curriculum problem. synth2_induce_chain's
+# own clause template (self_hosting/lib/synthesis_recursive.patlang) is
+# fixed to a UNARY classifier: target(X) :- chain(X,Y), target(Y). That
+# genuinely cannot express an ACCUMULATOR-threading relation like
+# sum_1_to_n (target(X,Y) where Y accumulates a running total as X
+# counts down) -- not a limitation of any one problem, a limitation of
+# the SEARCH SPACE itself.
+#
+# This adds ONE more generic metarule shape to search over:
+#   rule target(X, Y) :- zero(X), zero(Y).
+#   rule target(X, Y) :- chain(X, X2), target(X2, Y2), combine(Y2, X, Y).
+# -- searching over (chain_pred, combine_pred) candidate PAIRS drawn
+# from a small set of ALREADY-VERIFIED background relations (pred1,
+# plus -- both proven correct independently, in
+# spec_library/synthesized_registry & reference_solutions), never
+# hand-specifying which pair is "the answer" for any particular target
+# predicate. The SEARCH decides that, from real/blind examples, exactly
+# like synth2_induce_chain already does for the simpler unary case.
+#
+# Per the user's explicit instruction: "you can avoid writing any code
+# for these curriculum solutions unless it is to verify the machine
+# produced one is correct or not" -- this file writes SEARCH
+# infrastructure (generic, reusable, not sum_1_to_n-specific), never a
+# target predicate's own clause body.
+
+include "../../self_hosting/lib/includes.patlang"
+include "../../self_hosting/lib/test.patlang"
+include "../../self_hosting/lib/synthesis_recursive.patlang"
+
+make a function called synth3_clauses_for takes target_pred, chain_pred, combine_pred returns src
+  let sb = sb_new()
+  sb_push(sb, "rule " + target_pred + "(X, Y) :- zero(X), zero(Y).\n")
+  sb_push(sb, "rule " + target_pred + "(X, Y) :- " + chain_pred + "(X, X2), " + target_pred + "(X2, Y2), " + combine_pred + "(Y2, X, Y).\n")
+  return sb_str(sb)
+end
+
+# queries here are [pred, [arg1, arg2], expect] (2-argument target,
+# unlike synth2_query's single-argument shape) -- builds a real test
+# script and runs it via a real subprocess, same discipline as synth2_
+# test_hypothesis, just for a 2-argument target relation.
+make a function called synth3_query takes pred, arg1, arg2, expect returns q
+  return [pred, arg1, arg2, expect]
+end
+
+make a function called synth3_build_test_script takes background_src, clause_src, queries returns src
+  let sb = sb_new()
+  sb_push(sb, background_src)
+  sb_push(sb, "\n")
+  sb_push(sb, clause_src)
+  sb_push(sb, "\n")
+  let i = 0
+  let n = to_num(list_len(queries))
+  while i < n do
+    let q = queries[i]
+    let pred = q[0]
+    let arg1 = q[1]
+    let arg2 = q[2]
+    let expect = q[3]
+    sb_push(sb, "let sols_" + to_str_i(i) + " = solve(\"" + pred + "\", [\"" + synth2_ground(arg1) + "\", \"" + synth2_ground(arg2) + "\"])\n")
+    sb_push(sb, "let provable_" + to_str_i(i) + " = to_num(list_len(sols_" + to_str_i(i) + ")) > 0\n")
+    if expect then
+      sb_push(sb, "print(provable_" + to_str_i(i) + ")\n")
+    else
+      sb_push(sb, "print(not provable_" + to_str_i(i) + ")\n")
+    end
+    let i = i + 1
+  end
+  return sb_str(sb)
+end
+
+make a function called synth3_test_hypothesis takes background_src, clause_src, queries returns ok
+  let script = synth3_build_test_script(background_src, clause_src, queries)
+  let tmp_path = "friendly_cli/spec_scratch/_synth3_hypothesis.patlang"
+  write_file(tmp_path, script)
+  let out = exec_capture("rust-runtime/target/release/pat.exe", "--ir-run", tmp_path)
+  return not contains_text(out, "false")
+end
+
+make a function called synth3_diagnose_hypothesis takes background_src, clause_src, queries returns results
+  let script = synth3_build_test_script(background_src, clause_src, queries)
+  let tmp_path = "friendly_cli/spec_scratch/_synth3_diagnose.patlang"
+  write_file(tmp_path, script)
+  let out = exec_capture("rust-runtime/target/release/pat.exe", "--ir-run", tmp_path)
+  let lines = synth2_split_lines(out)
+  let results = []
+  let i = 0
+  while i < to_num(list_len(lines)) do
+    let results = list_push(results, lines[i] == "true")
+    let i = i + 1
+  end
+  return results
+end
+
+# The actual SEARCH: tries each (chain_pred, combine_pred) candidate
+# pair against the VISIBLE queries, returns the first that fits, or []
+# if nothing in the given candidate space works -- exactly mirroring
+# synth2_induce_chain's own "first accepted hypothesis wins" search
+# discipline, just over a richer (2-predicate-pair) space.
+make a function called synth3_induce_accumulator takes target_pred, chain_preds, combine_preds, background_src, queries returns winner
+  let ci = 0
+  let cn = to_num(list_len(chain_preds))
+  while ci < cn do
+    let mi = 0
+    let mn = to_num(list_len(combine_preds))
+    while mi < mn do
+      let chain_pred = chain_preds[ci]
+      let combine_pred = combine_preds[mi]
+      let clause_src = synth3_clauses_for(target_pred, chain_pred, combine_pred)
+      if synth3_test_hypothesis(background_src, clause_src, queries) then
+        return [chain_pred, combine_pred]
+      end
+      let mi = mi + 1
+    end
+    let ci = ci + 1
+  end
+  return []
+end

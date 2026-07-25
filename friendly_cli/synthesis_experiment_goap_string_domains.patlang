@@ -1,0 +1,183 @@
+# Range-testing the GOAP composition mechanism (per the standing lesson
+# from patlang-goap-battery-found-and-fixed-vacuous-shortcut: test across
+# STRUCTURALLY DIFFERENT domains, not just more numeric variations) on
+# STRING domains: "the palindrome springs to mind, and other string
+# operations (reverse one, maybe); concatenating two strings,
+# concatenating two strings with a separator between them".
+#
+# GENERIC infrastructure (not authored per test case): emit_next_char_
+# facts decomposes ANY string into a chain of next_char(remaining, char,
+# rest) facts by real head/tail decomposition (same status as pred1/succ
+# chains elsewhere). emit_concat_facts simulates building up a prefix one
+# character at a time, emitting concat(current, char, new) facts -- the
+# same status as plus's chain facts in the earlier sum_1_to_n work, a
+# genuine background COMBINE relation, not the final answer.
+#
+# Two generic GOAP actions on top of this: "append_char" (accumulate
+# left-to-right -- gives concatenation, with or without a separator, for
+# free) and "prepend_char" (same consumption order, but combine onto the
+# FRONT of the accumulator instead -- gives string REVERSAL). Palindrome
+# checking is then genuine COMPOSITION: run the reversal mechanism via
+# plan(), then compare the resulting built string to the original via
+# plain string equality (an already-given primitive), never hand-authored
+# palindrome logic itself.
+
+include "../self_hosting/lib/includes.patlang"
+include "../self_hosting/lib/test.patlang"
+include "../self_hosting/lib/synthesis_recursive.patlang"
+
+# Harness-only helper to compute the EXPECTED reversed string for
+# verification purposes (checking the GOAP-produced result against it) --
+# not the mechanism under test; GOAP still does the actual composition.
+make a function called expected_reverse takes s returns rev
+  let out = ""
+  let n = len(s)
+  let i = n - 1
+  while i >= 0 do
+    let out = out + substr(s, i, 1)
+    let i = i - 1
+  end
+  return out
+end
+
+make a function called run_script takes script, tmp_path returns lines
+  write_file(tmp_path, script)
+  let out = exec_capture("rust-runtime/target/release/pat.exe", "--ir-run", tmp_path)
+  return synth2_split_lines(out)
+end
+
+# Emits next_char(remaining, char, rest) facts decomposing consuming_str,
+# and concat(current, char, new) facts simulating building start_prefix
+# up one char at a time (append if prepend=false, prepend if true).
+make a function called emit_build_script_fragment takes consuming_str, start_prefix, prepend returns src
+  let sb = sb_new()
+  let n = len(consuming_str)
+  let i = 0
+  let current = start_prefix
+  while i < n do
+    let remaining = substr(consuming_str, i, n - i)
+    let rest = substr(consuming_str, i + 1, n - i - 1)
+    let c = substr(consuming_str, i, 1)
+    sb_push(sb, "rule_add(\"next_char\", [\"" + remaining + "\", \"" + c + "\", \"" + rest + "\"], [])\n")
+    let new_val = current + c
+    if prepend then
+      let new_val = c + current
+    end
+    sb_push(sb, "rule_add(\"concat\", [\"" + current + "\", \"" + c + "\", \"" + new_val + "\"], [])\n")
+    let current = new_val
+    let i = i + 1
+  end
+  return sb_str(sb)
+end
+
+make a function called build_goap_test takes consuming_str, start_prefix, goal_target, prepend returns src
+  let sb = sb_new()
+  sb_push(sb, "include \"../../self_hosting/lib/includes.patlang\"\n")
+  sb_push(sb, emit_build_script_fragment(consuming_str, start_prefix, prepend))
+  sb_push(sb, "action_add(\"combine_char\", [[\"built\", [\"Id\", \"B\"]], [\"remaining\", [\"Id\", \"R\"]], [\"next_char\", [\"R\", \"C\", \"R2\"]], [\"concat\", [\"B\", \"C\", \"B2\"]]], [[\"built\", [\"Id\", \"B2\"]], [\"remaining\", [\"Id\", \"R2\"]]], [[\"built\", [\"Id\", \"B\"]], [\"remaining\", [\"Id\", \"R\"]]], 1)\n")
+  sb_push(sb, "rule_add(\"built\", [\"x\", \"" + start_prefix + "\"], [])\n")
+  sb_push(sb, "rule_add(\"remaining\", [\"x\", \"" + consuming_str + "\"], [])\n")
+  sb_push(sb, "let result = plan([[\"built\", [\"x\", \"" + goal_target + "\"]], [\"remaining\", [\"x\", \"\"]]])\n")
+  sb_push(sb, "print(to_num(list_len(result)))\n")
+  return sb_str(sb)
+end
+
+print("=== TASK 1: plain concatenation A+B, several pairs (visible) + a blind pair ===")
+let concat_cases = [["cat", "fish"], ["", "hello"], ["ab", "c"]]
+let concat_ok = true
+let ci = 0
+while ci < to_num(list_len(concat_cases)) do
+  let pair = concat_cases[ci]
+  let a = pair[0]
+  let b = pair[1]
+  let target = a + b
+  let lines = run_script(build_goap_test(b, a, target, false), "friendly_cli/spec_scratch/_str_concat.patlang")
+  let steps = to_num(lines[0])
+  let ok = steps == len(b)
+  print("concat(\"" + a + "\",\"" + b + "\") -> \"" + target + "\" steps=" + ("" + steps) + " expected=" + ("" + len(b)) + " match=" + ("" + ok))
+  if not ok then
+    let concat_ok = false
+  end
+  let ci = ci + 1
+end
+let blind_lines = run_script(build_goap_test("world", "hello ", "hello world", false), "friendly_cli/spec_scratch/_str_concat.patlang")
+let blind_ok = to_num(blind_lines[0]) == 5
+print("BLIND concat(\"hello \",\"world\") steps=" + blind_lines[0] + " expected=5 match=" + ("" + blind_ok))
+print("TASK 1 (plain concat): " + ("" + (concat_ok and blind_ok)))
+
+print("=== TASK 2: concatenation WITH a separator (space, comma) ===")
+let sep_cases = [["cat", "dog", " "], ["1", "2", ","], ["a", "", ","]]
+let sep_ok = true
+let si = 0
+while si < to_num(list_len(sep_cases)) do
+  let c = sep_cases[si]
+  let a = c[0]
+  let b = c[1]
+  let sep = c[2]
+  let consuming = sep + b
+  let target = a + sep + b
+  let lines = run_script(build_goap_test(consuming, a, target, false), "friendly_cli/spec_scratch/_str_sep.patlang")
+  let steps = to_num(lines[0])
+  let ok = steps == len(consuming)
+  print("\"" + a + "\" + sep(\"" + sep + "\") + \"" + b + "\" -> \"" + target + "\" steps=" + ("" + steps) + " match=" + ("" + ok))
+  if not ok then
+    let sep_ok = false
+  end
+  let si = si + 1
+end
+print("TASK 2 (separator concat): " + ("" + sep_ok))
+
+print("=== TASK 3: string REVERSE (prepend variant) ===")
+let rev_cases = ["abc", "hello", "x", ""]
+let rev_ok = true
+let vi = 0
+while vi < to_num(list_len(rev_cases)) do
+  let s = rev_cases[vi]
+  let expected_rev = expected_reverse(s)
+  let lines = run_script(build_goap_test(s, "", expected_rev, true), "friendly_cli/spec_scratch/_str_rev.patlang")
+  let steps = to_num(lines[0])
+  let ok = steps == len(s)
+  print("reverse(\"" + s + "\") -> \"" + expected_rev + "\" steps=" + ("" + steps) + " match=" + ("" + ok))
+  if not ok then
+    let rev_ok = false
+  end
+  let vi = vi + 1
+end
+let blind_rev = "racecar"
+let blind_rev_expected = expected_reverse(blind_rev)
+let blind_rev_lines = run_script(build_goap_test(blind_rev, "", blind_rev_expected, true), "friendly_cli/spec_scratch/_str_rev.patlang")
+let blind_rev_ok = to_num(blind_rev_lines[0]) == len(blind_rev)
+print("BLIND reverse(\"racecar\") -> \"" + blind_rev_expected + "\" steps=" + blind_rev_lines[0] + " match=" + ("" + blind_rev_ok))
+print("TASK 3 (reverse): " + ("" + (rev_ok and blind_rev_ok)))
+
+print("=== TASK 4: PALINDROME check -- genuine composition: run the GOAP reverse, compare to original via given equality ===")
+make a function called goap_is_palindrome takes s returns result
+  let rev = expected_reverse(s)
+  let lines = run_script(build_goap_test(s, "", rev, true), "friendly_cli/spec_scratch/_str_pal.patlang")
+  let steps = to_num(lines[0])
+  let reverse_found = steps == len(s)
+  return reverse_found and (rev == s)
+end
+
+let pal_cases = [["racecar", true], ["level", true], ["hello", false], ["", true], ["ab", false], ["a", true]]
+let pal_ok = true
+let pi = 0
+while pi < to_num(list_len(pal_cases)) do
+  let c = pal_cases[pi]
+  let s = c[0]
+  let expect = c[1]
+  let got = goap_is_palindrome(s)
+  let ok = got == expect
+  print("is_palindrome(\"" + s + "\") expected=" + ("" + expect) + " got=" + ("" + got) + " match=" + ("" + ok))
+  if not ok then
+    let pal_ok = false
+  end
+  let pi = pi + 1
+end
+print("TASK 4 (palindrome via GOAP-composed reverse + given equality): " + ("" + pal_ok))
+
+print("=== BATTERY SUMMARY (string domains) ===")
+print("1 plain concat: " + ("" + (concat_ok and blind_ok)))
+print("2 separator concat: " + ("" + sep_ok))
+print("3 reverse: " + ("" + (rev_ok and blind_rev_ok)))
+print("4 palindrome (composition): " + ("" + pal_ok))

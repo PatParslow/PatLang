@@ -1,0 +1,204 @@
+# =============================================================================
+# Command safety classification (spec-library initiative). Every command
+# name this project might ever consider executing gets classified into
+# exactly one of four tiers BEFORE anything about invocation shape or
+# an LLM's own claims about safety is considered:
+#
+#   "no_workaround"  -- genuinely dangerous, no safe substitute exists.
+#                        Never executed, ever, under any circumstances,
+#                        by any mechanism in this codebase. No promotion
+#                        path, no audit can change this.
+#   "safe_alias"      -- the command's DESTRUCTIVE effect has a safe,
+#                        non-destructive substitute this tool can run
+#                        instead (a rename-to-quarantine rather than a
+#                        real delete) -- the real command is still never
+#                        executed, but the apparent intent (get this out
+#                        of the way) can be honoured safely and
+#                        automatically, recoverably.
+#   "human_confirm"   -- the command can be legitimately necessary, but
+#                        only a human should decide to actually run it,
+#                        with full, specific information in front of
+#                        them. This tool can gather and present that
+#                        information (via a genuinely read-only
+#                        diagnostic command), never execute the
+#                        mutating command itself.
+#   "unclassified"    -- not on any blacklist tier -- subject to the
+#                        normal allowlist/greylist process elsewhere
+#                        (spec_discovery_engine.patlang), which still
+#                        requires its own hand-written or mechanically-
+#                        audited verification before ANY execution.
+#
+# This classification is checked FIRST, before anything else, by any
+# code in this project that is about to construct a real command
+# invocation from an LLM suggestion or a discovered command name.
+# =============================================================================
+
+# Genuinely dangerous, no safe workaround exists -- per the user's own
+# framing, most destructive commands don't have a safe substitute the
+# way delete does. Refused outright, unconditionally.
+make a function called is_no_workaround_command takes cmd returns yes
+  if cmd == "format" then
+    return true
+  end
+  if cmd == "diskpart" then
+    return true
+  end
+  if cmd == "sdelete" then
+    return true
+  end
+  if cmd == "cipher" then
+    return true
+  end
+  if cmd == "net" then
+    return true
+  end
+  if cmd == "shutdown" then
+    return true
+  end
+  if cmd == "restart" then
+    return true
+  end
+  if cmd == "reg" then
+    return true
+  end
+  if cmd == "vssadmin" then
+    return true
+  end
+  if cmd == "bcdedit" then
+    return true
+  end
+  if cmd == "fsutil" then
+    return true
+  end
+  if cmd == "wmic" then
+    return true
+  end
+  if cmd == "powercfg" then
+    return true
+  end
+  return false
+end
+
+# Delete-shaped commands: the DESTRUCTIVE command itself never runs, but
+# "get this file/directory out of the way" can be honoured safely via
+# safe_delete_alias below -- a rename into a quarantine directory,
+# fully recoverable, not a real delete at all.
+make a function called is_safe_alias_command takes cmd returns yes
+  if cmd == "del" then
+    return true
+  end
+  if cmd == "erase" then
+    return true
+  end
+  if cmd == "rm" then
+    return true
+  end
+  if cmd == "rmdir" then
+    return true
+  end
+  if cmd == "rd" then
+    return true
+  end
+  return false
+end
+
+# Can be legitimately necessary, but only a human should pull the
+# trigger, with full specifics in front of them -- this tool's job is
+# to gather and present that information via a genuinely read-only
+# diagnostic command, never to execute the mutating one itself.
+make a function called is_human_confirm_command takes cmd returns yes
+  if cmd == "taskkill" then
+    return true
+  end
+  return false
+end
+
+make a function called classify_command takes cmd returns tier
+  if is_no_workaround_command(cmd) then
+    return "no_workaround"
+  end
+  if is_safe_alias_command(cmd) then
+    return "safe_alias"
+  end
+  if is_human_confirm_command(cmd) then
+    return "human_confirm"
+  end
+  return "unclassified"
+end
+
+make a function called quarantine_dir returns path
+  return "friendly_cli/quarantine"
+end
+
+# The safe-alias substitute for any delete-shaped command: renames the
+# target into a timestamped quarantine directory instead of deleting it
+# -- fully recoverable (a human can move it back), and safe enough to
+# run automatically since nothing is actually destroyed. Refuses (rather
+# than silently doing something else) if the target doesn't exist, so a
+# caller can tell a genuine no-op from an attempted-and-failed
+# quarantine.
+make a function called safe_delete_alias takes target_path, reason returns result
+  if file_exists(target_path) != "1" then
+    return ["error", "target '" + target_path + "' does not exist -- nothing to quarantine"]
+  end
+  let ts = "" + now_ms()
+  let base = target_path
+  let last_slash = -1
+  let i = 0
+  while i < base.length do
+    if (substr(base, i, 1) == "/") or (substr(base, i, 1) == "\\") then
+      let last_slash = i
+    end
+    let i = i + 1
+  end
+  if last_slash >= 0 then
+    let base = substr(base, last_slash + 1, base.length - (last_slash + 1))
+  end
+  let dest = quarantine_dir() + "/" + ts + "_" + base
+  let moved = rename_file(target_path, dest)
+  if moved then
+    print("[SAFE DELETE] '" + target_path + "' was NOT deleted -- moved to '" + dest + "' instead (reason: " + reason + "). Recoverable: move it back manually if this was a mistake.")
+    return ["quarantined", dest]
+  end
+  return ["error", "rename_file failed moving '" + target_path + "' to '" + dest + "'"]
+end
+
+# Gathers a specific, human-facing report on what a taskkill invocation
+# WOULD target -- via `tasklist`, a genuinely read-only diagnostic
+# command -- without ever running taskkill itself. Returns the report
+# text; the actual decision to kill anything, and the actual command to
+# do it, is left entirely to the human reading it.
+make a function called gather_taskkill_report takes process_name returns report
+  let filter = "IMAGENAME eq " + process_name
+  let raw = exec_capture("tasklist", "/FI", filter, "/FO", "CSV", "/NH")
+  if contains_text(raw, "No tasks are running") then
+    return "No running process matches '" + process_name + "' -- there is nothing to kill. taskkill was NOT run."
+  end
+  let lines = split_lines(raw)
+  let sb = sb_new()
+  sb_push(sb, "The following process(es) named '" + process_name + "' are currently running. taskkill was NOT run -- this is diagnostic information only. Review it and, if you genuinely want to end one of these, run taskkill yourself with the specific PID shown:\n")
+  let count = 0
+  let i = 0
+  while i < to_num(list_len(lines)) do
+    let ln = full_trim_command_safety(lines[i])
+    if ln.length > 0 then
+      sb_push(sb, "  " + ln + "\n")
+      let count = count + 1
+    end
+    let i = i + 1
+  end
+  sb_push(sb, "(" + ("" + count) + " matching process(es) found.)\n")
+  return sb_str(sb)
+end
+
+make a function called full_trim_command_safety takes s returns trimmed
+  let a = 0
+  while (a < s.length) and ((char_code(s, a) == 32) or (char_code(s, a) == 9) or (char_code(s, a) == 13) or (char_code(s, a) == 10)) do
+    let a = a + 1
+  end
+  let z = s.length
+  while (z > a) and ((char_code(s, z - 1) == 32) or (char_code(s, z - 1) == 9) or (char_code(s, z - 1) == 13) or (char_code(s, z - 1) == 10)) do
+    let z = z - 1
+  end
+  return substr(s, a, z - a)
+end

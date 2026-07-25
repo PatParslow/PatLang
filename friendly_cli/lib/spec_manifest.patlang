@@ -1,0 +1,128 @@
+# =============================================================================
+# Spec library manifest builder -- maintains spec_library/manifest.json,
+# the single index a later web-publishing pass (slice 3) will read to
+# generate a searchable, browsable set of pages. Kept as its own small
+# file so slice 2 (PatLang stdlib/library specs) can reuse it unchanged.
+# =============================================================================
+
+make a function called manifest_path returns path
+  return "spec_library/manifest.json"
+end
+
+# Full whitespace trim (space/tab/CR/LF), unlike self_hosting/lib/
+# includes.patlang's str_trim which leaves a trailing "\n" untouched --
+# that gap caused a real bug here once already (see manifest_upsert_
+# entry's history below).
+make a function called full_trim takes s returns trimmed
+  let a = 0
+  while (a < s.length) and ((char_code(s, a) == 32) or (char_code(s, a) == 9) or (char_code(s, a) == 13) or (char_code(s, a) == 10)) do
+    let a = a + 1
+  end
+  let z = s.length
+  while (z > a) and ((char_code(s, z - 1) == 32) or (char_code(s, z - 1) == 9) or (char_code(s, z - 1) == 13) or (char_code(s, z - 1) == 10)) do
+    let z = z - 1
+  end
+  return substr(s, a, z - a)
+end
+
+make a function called manifest_json_escape takes s returns escaped
+  let sb = sb_new()
+  let i = 0
+  while i < s.length do
+    let c = char_code(s, i)
+    if c == 34 then
+      sb_push(sb, "\\\"")
+    else
+      if c == 92 then
+        sb_push(sb, "\\\\")
+      else
+        sb_push(sb, substr(s, i, 1))
+      end
+    end
+    let i = i + 1
+  end
+  return sb_str(sb)
+end
+
+# Appends (or, if command+category already present, replaces) one entry.
+# The manifest is a plain JSON array of objects, kept small and
+# hand-parseable rather than reusing the full json.patlang machinery,
+# since this file is meant to be simple enough to read by eye too.
+make a function called manifest_upsert_entry takes command_name, category, feature_file, source, verification_status returns done
+  let path = manifest_path()
+  # "[\n]\n" (bracket lines separate), not the compact "[]\n" -- the
+  # line-based parser below assumes "[" and "]" each own their own
+  # line, matching the shape every real write_file call in this
+  # function produces. A combined "[]" on one line isn't a real entry
+  # line OR the empty-array sentinel to that parser, so it fell through
+  # and got treated as a bogus first "entry" -- caught via a direct
+  # round-trip JSON-parse check, not just eyeballing the output.
+  let existing = "[\n]\n"
+  if file_exists(path) == "1" then
+    let existing = read_file(path)
+  end
+
+  let key = "\"command\": \"" + manifest_json_escape(command_name) + "\", \"category\": \"" + manifest_json_escape(category) + "\""
+  let already_present = contains_text(existing, key)
+
+  let entry = "  { " + key + ", \"feature_file\": \"" + manifest_json_escape(feature_file) + "\", \"source\": \"" + manifest_json_escape(source) + "\", \"verification_status\": \"" + manifest_json_escape(verification_status) + "\" }"
+
+  # Parses the existing array into one raw entry-string per line (each
+  # a bare `{ ... }`, any trailing comma stripped), replacing the
+  # matching entry if already_present or appending the new one at the
+  # end otherwise, then re-emits the whole array with commas placed
+  # correctly between entries and none after the last.
+  #
+  # REAL BUGS FOUND AND FIXED HERE (both via a direct round-trip test
+  # parsed with Python's json module, not just eyeballing the output):
+  # the previous version (1) checked `str_trim(existing) == "[]"` to
+  # detect an empty array, but str_trim (self_hosting/lib/includes.
+  # patlang) only strips space/tab/CR, NOT a trailing "\n", so a
+  # freshly-initialized "[]\n" never matched and every manifest got a
+  # stray leading "[,\n"; and (2) the "already present" branch filtered
+  # out the old entry's line and appended the replacement at the very
+  # END of the array with no trailing comma added to the entry that used
+  # to be last -- producing two entries with no comma between them at
+  # all, invalid JSON. Rebuilding via one shared entries list, joined
+  # with ",\n" and no trailing comma, fixes both at once and also
+  # preserves each entry's original position on update instead of moving
+  # it to the end.
+  let lines = split_lines(existing)
+  let raw_entries = []
+  let i = 0
+  while i < to_num(list_len(lines)) do
+    let ln = full_trim(lines[i])
+    if (ln != "[") and (ln != "]") and (ln != "") then
+      let ln_no_comma = ln
+      if (ln.length > 0) and (substr(ln, ln.length - 1, 1) == ",") then
+        let ln_no_comma = substr(ln, 0, ln.length - 1)
+      end
+      if contains_text(ln_no_comma, key) then
+        let raw_entries = list_push(raw_entries, entry)
+      else
+        let raw_entries = list_push(raw_entries, ln_no_comma)
+      end
+    end
+    let i = i + 1
+  end
+  if not already_present then
+    let raw_entries = list_push(raw_entries, entry)
+  end
+
+  let sb = sb_new()
+  sb_push(sb, "[\n")
+  let j = 0
+  let n = to_num(list_len(raw_entries))
+  while j < n do
+    sb_push(sb, raw_entries[j])
+    if j < n - 1 then
+      sb_push(sb, ",\n")
+    else
+      sb_push(sb, "\n")
+    end
+    let j = j + 1
+  end
+  sb_push(sb, "]\n")
+  write_file(path, sb_str(sb))
+  return true
+end

@@ -1,0 +1,201 @@
+# Contract-based action-set reduction for GOAP, per the user's own
+# request: "we do also need a way of reducing the entire action pool
+# to the relevant action set (via input/output contracts)". Confirmed
+# first (rust-runtime/src/ir/hosts.rs's plan_facts) that the REAL
+# planner already searches EVERY registered action at EVERY search
+# node -- there is no pre-filtering today. As the registry of proven-
+# correct actions grows (this session's own synthesized_registry is the
+# start of exactly that), every plan() call gets slower for no benefit
+# if most registered actions are irrelevant to a given goal.
+#
+# This is a standard technique from classical planning ("relaxed
+# reachability" / relevance pruning): given a full CATALOG of candidate
+# actions (each action's own INPUT contract = preconds, OUTPUT contract
+# = add_effects) and a goal, work BACKWARD from the goal's own
+# predicate names, keeping only actions whose effects could possibly
+# help reach it, then recursively keeping whatever THEIR preconditions
+# need too, until no new action gets pulled in (a fixpoint) -- never
+# forward-searching the whole catalog blindly.
+
+make a function called goap_fact_pred takes fact returns pred
+  return fact[0]
+end
+
+make a function called contains_text_list_goap takes items, target returns yes
+  let i = 0
+  while i < to_num(list_len(items)) do
+    if items[i] == target then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# Real, ARGUMENT-AWARE fact matching, not predicate-name-only. Same
+# uppercase-first-letter-is-a-variable convention the real logic engine
+# (rule_add/solve) uses -- a variable in either fact matches ANYTHING at
+# that position; two ground (non-variable) values must match EXACTLY.
+#
+# REAL BUG FOUND AND FIXED HERE: an earlier version of this filter only
+# compared predicate NAMES, so `have_response(parslow_net)` and
+# `have_response(parslow_page)` were treated as the same relevant thing
+# -- two GENUINELY DIFFERENT targets sharing a predicate name got
+# conflated, over-including irrelevant actions (confirmed empirically:
+# a goal for "parslow_page" wrongly pulled in the raw-TCP actions meant
+# for "parslow_net"). The final plan() result was still correct by luck
+# (the real planner's own matching IS argument-aware), but the
+# REDUCTION itself failed to reduce as much as it should have --
+# exactly the kind of silent precision loss that would compound as the
+# catalog grows, which is the whole point of building this filter.
+make a function called goap_is_var takes s returns yes
+  if s.length == 0 then
+    return false
+  end
+  let c = char_code(s, 0)
+  return (c >= 65) and (c <= 90)
+end
+
+make a function called goap_facts_match takes needed_fact, effect_fact returns yes
+  if needed_fact[0] != effect_fact[0] then
+    return false
+  end
+  let needed_args = needed_fact[1]
+  let effect_args = effect_fact[1]
+  if to_num(list_len(needed_args)) != to_num(list_len(effect_args)) then
+    return false
+  end
+  let i = 0
+  while i < to_num(list_len(needed_args)) do
+    let na = needed_args[i]
+    let ea = effect_args[i]
+    if (not goap_is_var(na)) and (not goap_is_var(ea)) and (na != ea) then
+      return false
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+make a function called goap_any_match takes needed_list, candidate_fact returns yes
+  let i = 0
+  while i < to_num(list_len(needed_list)) do
+    if goap_facts_match(needed_list[i], candidate_fact) then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called goap_contains_fact takes fact_list, fact returns yes
+  let i = 0
+  while i < to_num(list_len(fact_list)) do
+    if (fact_list[i][0] == fact[0]) and (fact_list[i][1] == fact[1]) then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# Full-action identity check (name + preconds + effects), NOT name
+# alone -- catches the exact same action tuple appearing twice in the
+# catalog (harmless, skip re-adding it), while correctly treating two
+# DIFFERENT actions that happen to share a NAME as genuinely distinct
+# entries the fixpoint loop must consider separately.
+#
+# REAL BUG FOUND AND FIXED HERE, at real registry scale (23 actions
+# from 8 real files, not a small synthetic catalog): the earlier
+# name-only dedup (`kept_names`) silently dropped one of two real,
+# genuinely different, same-named actions
+# (self_hosting/examples/paradigm_gallery/functional_goal.patlang's
+# parameterless `build_house` vs friendly_cli/lib/language_spec_
+# discovery.patlang's wood-requiring `build_house`) whenever a goal
+# needed BOTH of their effects simultaneously -- confirmed directly: a
+# goal requiring both have(house) and built(house_fg) only got ONE of
+# the two build_house actions registered, silently leaving the other
+# goal fact unreachable. Fixed by keying on the full action tuple, not
+# the bare name.
+make a function called goap_action_identity takes action returns key
+  return ("" + action[0]) + "|" + ("" + action[1]) + "|" + ("" + action[2])
+end
+
+make a function called goap_contains_identity takes kept_identities, action returns yes
+  let target = goap_action_identity(action)
+  let i = 0
+  while i < to_num(list_len(kept_identities)) do
+    if kept_identities[i] == target then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# goap_relevant_actions(catalog, goal_facts) -> [relevant_actions,
+# relevant_action_names] -- `needed` starts as the goal's own facts
+# (full predicate+args, not just names); any action in the catalog with
+# an effect that FACT-MATCHES (real argument-aware matching, variables
+# in either side matching anything) something needed gets pulled in,
+# and its own preconditions become newly-needed facts for the next
+# pass -- repeats until a full pass adds nothing new (fixpoint), so a
+# chain of any depth is found, not just one hop.
+make a function called goap_relevant_actions takes catalog, goal_facts returns result
+  let needed = goal_facts
+  let kept = []
+  let kept_names = []
+  let kept_identities = []
+  let changed = true
+  while changed do
+    let changed = false
+    let i = 0
+    while i < to_num(list_len(catalog)) do
+      let action = catalog[i]
+      let name = action[0]
+      if not goap_contains_identity(kept_identities, action) then
+        let effects = action[2]
+        let is_relevant = false
+        let j = 0
+        while j < to_num(list_len(effects)) do
+          if goap_any_match(needed, effects[j]) then
+            let is_relevant = true
+          end
+          let j = j + 1
+        end
+        if is_relevant then
+          let kept = list_push(kept, action)
+          let kept_names = list_push(kept_names, name)
+          let kept_identities = list_push(kept_identities, goap_action_identity(action))
+          let changed = true
+          let preconds = action[1]
+          let k = 0
+          while k < to_num(list_len(preconds)) do
+            if not goap_contains_fact(needed, preconds[k]) then
+              let needed = list_push(needed, preconds[k])
+            end
+            let k = k + 1
+          end
+        end
+      end
+      let i = i + 1
+    end
+  end
+  return [kept, kept_names]
+end
+
+# Registers only the RELEVANT subset (never the full catalog) --
+# actual automated reduction happening before action_add, not a hand-
+# picked subset chosen by whoever wrote the driver script.
+make a function called goap_register_relevant_only takes catalog, goal_facts returns kept_names
+  let reduced = goap_relevant_actions(catalog, goal_facts)
+  let kept = reduced[0]
+  let kept_names = reduced[1]
+  let i = 0
+  while i < to_num(list_len(kept)) do
+    let action = kept[i]
+    action_add(action[0], action[1], action[2], action[3], action[4])
+    let i = i + 1
+  end
+  return kept_names
+end

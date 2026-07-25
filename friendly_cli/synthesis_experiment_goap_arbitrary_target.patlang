@@ -1,0 +1,93 @@
+# Tests option 2A from the user's own proposal: bind Target via an
+# explicit target_goal(Id,Target) FACT in the world state, so Target
+# genuinely appears in a precondition (this engine's actual binding
+# mechanism -- see hosts.rs's ground_action_instances, which only binds
+# via precond-vs-world-state unification, never via the goal directly).
+# No engine changes; this is a pure PatLang-level domain-modeling fix.
+#
+# If this works, "increment_to_target" becomes a single action handling
+# ANY (start,target) pair -- not one action per fixed target the way
+# increment_to_ten was.
+
+include "../self_hosting/lib/includes.patlang"
+include "../self_hosting/lib/test.patlang"
+include "../self_hosting/lib/synthesis_recursive.patlang"
+
+make a function called goap_arb_build_script takes start, target, use_shortcut returns src
+  let sb = sb_new()
+  sb_push(sb, "include \"../../self_hosting/lib/includes.patlang\"\n")
+  let i = 0
+  while i < 25 do
+    sb_push(sb, "rule_add(\"succ\", [\"" + ("" + i) + "\", \"" + ("" + (i + 1)) + "\"], [])\n")
+    let i = i + 1
+  end
+  sb_push(sb, "action_add(\"increment\", [[\"counter\", [\"Id\", \"X\"]], [\"succ\", [\"X\", \"X2\"]]], [[\"counter\", [\"Id\", \"X2\"]]], [[\"counter\", [\"Id\", \"X\"]]], 1)\n")
+  if use_shortcut then
+    sb_push(sb, "action_add(\"increment_to_target\", [[\"counter\", [\"Id\", \"X\"]], [\"target_goal\", [\"Id\", \"Target\"]]], [[\"counter\", [\"Id\", \"Target\"]]], [[\"counter\", [\"Id\", \"X\"]]], 1)\n")
+    sb_push(sb, "rule_add(\"target_goal\", [\"t\", \"" + target + "\"], [])\n")
+  end
+  sb_push(sb, "rule_add(\"counter\", [\"t\", \"" + start + "\"], [])\n")
+  sb_push(sb, "let result = plan([[\"counter\", [\"t\", \"" + target + "\"]]])\n")
+  sb_push(sb, "print(to_num(list_len(result)))\n")
+  sb_push(sb, "print(result)\n")
+  return sb_str(sb)
+end
+
+make a function called goap_arb_run takes start, target, use_shortcut returns lines
+  let script = goap_arb_build_script(start, target, use_shortcut)
+  let tmp_path = "friendly_cli/spec_scratch/_goap_arb_test.patlang"
+  write_file(tmp_path, script)
+  let out = exec_capture("rust-runtime/target/release/pat.exe", "--ir-run", tmp_path)
+  return synth2_split_lines(out)
+end
+
+print("=== Phase 1: verify raw 'increment' generalizes across VARYING (start,target) pairs, no shortcut yet (visible) ===")
+let visible_pairs = [[0, 5], [2, 8], [3, 3], [1, 10]]
+let all_visible_ok = true
+let vi = 0
+while vi < to_num(list_len(visible_pairs)) do
+  let pair = visible_pairs[vi]
+  let s = pair[0]
+  let t = pair[1]
+  let expected = t - s
+  let lines = goap_arb_run(("" + s), ("" + t), false)
+  let steps = to_num(lines[0])
+  let ok = steps == expected
+  print("start=" + ("" + s) + " target=" + ("" + t) + " steps=" + ("" + steps) + " expected=" + ("" + expected) + " match=" + ("" + ok))
+  if not ok then
+    let all_visible_ok = false
+  end
+  let vi = vi + 1
+end
+
+print("=== Phase 2: BLIND held-back (start,target) pair ===")
+let blind_lines = goap_arb_run("4", "12", false)
+let blind_steps = to_num(blind_lines[0])
+let blind_ok = blind_steps == 8
+print("start=4 target=12 (blind) steps=" + ("" + blind_steps) + " expected=8 match=" + ("" + blind_ok))
+
+if all_visible_ok and blind_ok then
+  print("=== Phase 3: genuinely varying (start,target) pairs work -- ACID TEST with the target_goal-bound shortcut ===")
+  let novel_lines = goap_arb_run("2", "9", true)
+  let novel_len = to_num(novel_lines[0])
+  let novel_plan_text = novel_lines[1]
+  print("novel start=2 target=9 plan: " + novel_plan_text)
+  let used_shortcut = (novel_len == 1) and contains_text(novel_plan_text, "increment_to_target(")
+  print("plan length=" + ("" + novel_len) + " used arbitrary-target shortcut=" + ("" + used_shortcut))
+
+  print("=== Phase 4: a SECOND novel (start,target) pair never seen, different target ===")
+  let novel2_lines = goap_arb_run("6", "15", true)
+  let novel2_len = to_num(novel2_lines[0])
+  let novel2_plan_text = novel2_lines[1]
+  print("novel start=6 target=15 plan: " + novel2_plan_text)
+  let used_shortcut2 = (novel2_len == 1) and contains_text(novel2_plan_text, "increment_to_target(")
+  print("plan length=" + ("" + novel2_len) + " used arbitrary-target shortcut=" + ("" + used_shortcut2))
+
+  if used_shortcut and used_shortcut2 then
+    print("=== RESULT: arbitrary-target loop genuinely achieved via target_goal precondition binding -- confirms user's proposed fix (2A) works, no engine change needed ===")
+  else
+    print("=== RESULT: target_goal binding did not work as hoped ===")
+  end
+else
+  print("=== RESULT: raw mechanism did not generalize across varying (start,target) pairs ===")
+end

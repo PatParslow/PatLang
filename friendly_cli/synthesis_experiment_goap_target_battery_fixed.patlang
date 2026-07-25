@@ -1,0 +1,120 @@
+# Corrected version of the arbitrary-target packaging, after the
+# unreachable-doubling counter-example exposed that a bare target_goal
+# precondition doesn't verify reachability. Fix: compute reaches(X,Y)
+# as the REAL transitive closure of the base chain relation (a generic
+# graph-reachability algorithm -- infrastructure, not a hand-solved
+# answer to any specific target), and require it as a precondition on
+# the packaged action, so the shortcut can only ever fire for genuinely
+# reachable (X,Target) pairs.
+
+include "../self_hosting/lib/includes.patlang"
+include "../self_hosting/lib/test.patlang"
+include "../self_hosting/lib/synthesis_recursive.patlang"
+
+make a function called run_script takes script, tmp_path returns lines
+  write_file(tmp_path, script)
+  let out = exec_capture("rust-runtime/target/release/pat.exe", "--ir-run", tmp_path)
+  return synth2_split_lines(out)
+end
+
+# GENERIC: given chain edges (from,to) pairs as a list of [from,to]
+# strings, compute the full transitive closure (all (from,to) pairs
+# reachable via zero or more chain steps) via simple BFS per source node.
+# This is a real, reusable graph algorithm -- not specific to counters,
+# doubling, or any one problem.
+make a function called reach_closure takes edges, nodes returns pairs
+  let pairs = []
+  let ni = 0
+  let nn = to_num(list_len(nodes))
+  while ni < nn do
+    let src = nodes[ni]
+    let frontier = [src]
+    let seen = [src]
+    let pairs = list_push(pairs, [src, src])
+    while to_num(list_len(frontier)) > 0 do
+      let next_frontier = []
+      let fi = 0
+      while fi < to_num(list_len(frontier)) do
+        let cur = frontier[fi]
+        let ei = 0
+        while ei < to_num(list_len(edges)) do
+          let e = edges[ei]
+          if e[0] == cur then
+            let dst = e[1]
+            if not contains_text_list(seen, dst) then
+              let seen = list_push(seen, dst)
+              let next_frontier = list_push(next_frontier, dst)
+              let pairs = list_push(pairs, [src, dst])
+            end
+          end
+          let ei = ei + 1
+        end
+        let fi = fi + 1
+      end
+      let frontier = next_frontier
+    end
+    let ni = ni + 1
+  end
+  return pairs
+end
+
+make a function called contains_text_list takes xs, target returns found
+  let i = 0
+  let n = to_num(list_len(xs))
+  while i < n do
+    if xs[i] == target then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+print("=== Computing REAL transitive closure of doubling chain 1,2,4,8,16,32 ===")
+let double_edges = [["1", "2"], ["2", "4"], ["4", "8"], ["8", "16"], ["16", "32"]]
+let double_nodes = ["1", "2", "4", "8", "16", "32"]
+let reaches = reach_closure(double_edges, double_nodes)
+print("computed " + ("" + to_num(list_len(reaches))) + " reachable (from,to) pairs")
+
+let reach_facts = sb_new()
+let ri = 0
+while ri < to_num(list_len(reaches)) do
+  let p = reaches[ri]
+  sb_push(reach_facts, "rule_add(\"reaches\", [\"" + p[0] + "\", \"" + p[1] + "\"], [])\n")
+  let ri = ri + 1
+end
+let reach_facts_src = sb_str(reach_facts)
+
+let c_script = sb_new()
+sb_push(c_script, "include \"../../self_hosting/lib/includes.patlang\"\n")
+sb_push(c_script, "rule_add(\"double\", [\"1\", \"2\"], [])\n")
+sb_push(c_script, "rule_add(\"double\", [\"2\", \"4\"], [])\n")
+sb_push(c_script, "rule_add(\"double\", [\"4\", \"8\"], [])\n")
+sb_push(c_script, "rule_add(\"double\", [\"8\", \"16\"], [])\n")
+sb_push(c_script, "rule_add(\"double\", [\"16\", \"32\"], [])\n")
+sb_push(c_script, reach_facts_src)
+sb_push(c_script, "action_add(\"apply_double\", [[\"counter\", [\"Id\", \"X\"]], [\"double\", [\"X\", \"X2\"]]], [[\"counter\", [\"Id\", \"X2\"]]], [[\"counter\", [\"Id\", \"X\"]]], 1)\n")
+sb_push(c_script, "action_add(\"double_to_target_FIXED\", [[\"counter\", [\"Id\", \"X\"]], [\"target_goal\", [\"Id\", \"Target\"]], [\"reaches\", [\"X\", \"Target\"]]], [[\"counter\", [\"Id\", \"Target\"]]], [[\"counter\", [\"Id\", \"X\"]]], 1)\n")
+sb_push(c_script, "rule_add(\"target_goal\", [\"reachable\", \"16\"], [])\n")
+sb_push(c_script, "rule_add(\"counter\", [\"reachable\", \"1\"], [])\n")
+sb_push(c_script, "rule_add(\"target_goal\", [\"unreachable\", \"6\"], [])\n")
+sb_push(c_script, "rule_add(\"counter\", [\"unreachable\", \"1\"], [])\n")
+sb_push(c_script, "let ok_plan = plan([[\"counter\", [\"reachable\", \"16\"]]])\n")
+sb_push(c_script, "print(to_num(list_len(ok_plan)))\n")
+sb_push(c_script, "print(ok_plan)\n")
+sb_push(c_script, "let bad_plan = plan([[\"counter\", [\"unreachable\", \"6\"]]])\n")
+sb_push(c_script, "print(to_num(list_len(bad_plan)))\n")
+sb_push(c_script, "print(bad_plan)\n")
+
+let c_lines = run_script(sb_str(c_script), "friendly_cli/spec_scratch/_battery_c_fixed.patlang")
+print("reachable (1->16) plan: " + c_lines[1] + " steps=" + c_lines[0])
+print("unreachable (1->6) plan: " + c_lines[3] + " steps=" + c_lines[2])
+let c_reachable_ok = to_num(c_lines[0]) == 1
+let c_unreachable_ok = to_num(c_lines[2]) == 0
+print("FIXED reachable case still solved in 1 step: " + ("" + c_reachable_ok))
+print("FIXED unreachable case now correctly returns NO plan: " + ("" + c_unreachable_ok))
+if c_reachable_ok and c_unreachable_ok then
+  print("=== RESULT: reaches-precondition fix genuinely closes the false-positive gap -- reachable case still fast, unreachable case correctly rejected ===")
+else
+  print("=== RESULT: fix did not work as intended ===")
+end

@@ -1,0 +1,291 @@
+# =============================================================================
+# PatLang function enumeration + risk classification (Slice 2 of the
+# spec-library initiative, the actual "discovery" step -- purely
+# mechanical text scanning, NO execution of any discovered function at
+# all). Mirrors path_discovery.patlang's own split: discovery+
+# classification is free and safe; writing a spec (and, for a function,
+# actually CALLING it to verify the spec) is a deliberately separate,
+# bounded, hand-reviewed step -- see spec_discovery_patlang.patlang's
+# lower_case as the one example built that way so far.
+#
+# WHY THIS PASS NEVER CALLS ANY DISCOVERED FUNCTION: unlike a shell
+# command (whose real argument shape is knowable in advance and whose
+# process boundary limits the blast radius of a bad guess), a PatLang
+# function's expected argument TYPES aren't visible from its
+# declaration at all (the language is dynamically typed -- only
+# parameter NAMES are known), and this language has no try/catch -- a
+# wrong guess at what to pass a discovered function doesn't fail
+# gracefully, it's fatal to the whole interpreter process. Calling
+# hundreds of discovered functions with guessed arguments is exactly
+# the kind of "blindly execute anything found" the shell-command
+# allowlist was built to avoid; the same discipline applies here.
+# =============================================================================
+
+# Text-based risk heuristic, not a real parser: any of these substrings
+# appearing ANYWHERE in a function's body window means "assume this has
+# real side effects, don't consider it for automatic verification
+# without a hand-authored probe" -- deliberately biased toward FALSE
+# POSITIVES (flagging a function as side-effecting when it's actually
+# fine) rather than false negatives, since nothing in this pass executes
+# anything either way; a function landing in the wrong bucket here only
+# affects which list a human looks at first; consequences are exactly
+# as GOAP action names are: fully determined by convention.
+make a function called risky_primitive_names returns names
+  return ["exec_capture", "write_file", "remove_file", "rename_file",
+          "tcp_connect", "tcp_write", "tcp_close", "http_post", "http_get",
+          "vfs_delete", "vfs_flush_to_disk", "set_var", "rule_add",
+          "action_add", "fact(", "goal_def", "register_synthesized",
+          "unregister_synthesized", "getenv"]
+end
+
+make a function called body_looks_side_effecting takes body_text returns yes
+  let names = risky_primitive_names()
+  let i = 0
+  while i < to_num(list_len(names)) do
+    if contains_text(body_text, names[i]) then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# Parses one `make a function called NAME takes P1, P2 returns R` line
+# (or the `takes` clause omitted entirely, for a zero-arg function) --
+# returns ["", []] if the line doesn't actually start with the expected
+# prefix (defensive, since this is called on every line of every file).
+make a function called parse_function_decl_line takes line returns name_and_params
+  let prefix = "make a function called "
+  if not str_starts_with(line, prefix) then
+    return ["", []]
+  end
+  let rest = substr(line, prefix.length, line.length - prefix.length)
+  # name is everything up to the next space
+  let sp = -1
+  let i = 0
+  while (i < rest.length) and (sp == -1) do
+    if substr(rest, i, 1) == " " then
+      let sp = i
+    end
+    let i = i + 1
+  end
+  if sp == -1 then
+    return [str_trim(rest), []]
+  end
+  let name = substr(rest, 0, sp)
+  let after_name = substr(rest, sp + 1, rest.length - (sp + 1))
+  let params = []
+  if str_starts_with(after_name, "takes ") then
+    let params_and_rest = substr(after_name, 6, after_name.length - 6)
+    let returns_idx = find_substr_pfd(params_and_rest, " returns ")
+    let params_text = params_and_rest
+    if returns_idx >= 0 then
+      let params_text = substr(params_and_rest, 0, returns_idx)
+    end
+    let params = split_on_comma_trim(params_text)
+  end
+  return [name, params]
+end
+
+make a function called find_substr_pfd takes hay, needle returns idx
+  if needle.length > hay.length then
+    return -1
+  end
+  let i = 0
+  while i <= (hay.length - needle.length) do
+    if substr(hay, i, needle.length) == needle then
+      return i
+    end
+    let i = i + 1
+  end
+  return -1
+end
+
+make a function called split_on_comma_trim takes s returns parts
+  let parts = []
+  let start = 0
+  let i = 0
+  while i <= s.length do
+    if (i == s.length) or (substr(s, i, 1) == ",") then
+      let piece = str_trim(substr(s, start, i - start))
+      if piece.length > 0 then
+        let parts = list_push(parts, piece)
+      end
+      let start = i + 1
+    end
+    let i = i + 1
+  end
+  return parts
+end
+
+# Enumerates every `make a function called ...` declaration across every
+# .patlang file directly inside the given directory (non-recursive per
+# call -- callers pass each real lib directory explicitly, matching
+# list_dir's own one-level semantics elsewhere in this codebase).
+# Returns a list of [name, params, file_path, risk] -- "risk" is
+# "likely_pure" or "likely_side_effecting", from a body-window scan
+# ending at the NEXT declaration in the same file (or end of file for
+# the last one) -- an approximation, not a real block-depth parser, but
+# sufficient for a pre-filter that never itself executes anything.
+make a function called discover_patlang_functions_in_dir takes dir_path returns functions
+  let out = []
+  if file_exists(dir_path) != "1" then
+    return out
+  end
+  let entries = list_dir(dir_path)
+  let e = 0
+  while e < to_num(list_len(entries)) do
+    let entry = entries[e]
+    if not str_ends_with_pfd(entry, "/") then
+      if str_ends_with_pfd(entry, ".patlang") then
+        let file_path = dir_path + "/" + entry
+        let content = read_file(file_path)
+        let lines = split_lines(content)
+        let decl_indices = []
+        let names_params = []
+        let li = 0
+        while li < to_num(list_len(lines)) do
+          let parsed = parse_function_decl_line(lines[li])
+          if parsed[0] != "" then
+            let decl_indices = list_push(decl_indices, li)
+            let names_params = list_push(names_params, parsed)
+          end
+          let li = li + 1
+        end
+        let k = 0
+        while k < to_num(list_len(decl_indices)) do
+          let start_line = decl_indices[k]
+          let end_line = to_num(list_len(lines))
+          if (k + 1) < to_num(list_len(decl_indices)) then
+            let end_line = decl_indices[k + 1]
+          end
+          let body_sb = sb_new()
+          let bi = start_line
+          while bi < end_line do
+            sb_push(body_sb, lines[bi] + "\n")
+            let bi = bi + 1
+          end
+          let risk = "likely_pure"
+          if body_looks_side_effecting(sb_str(body_sb)) then
+            let risk = "likely_side_effecting"
+          end
+          let np = names_params[k]
+          let out = list_push(out, [np[0], np[1], file_path, risk])
+          let k = k + 1
+        end
+      end
+    end
+    let e = e + 1
+  end
+  return out
+end
+
+make a function called str_ends_with_pfd takes s, suffix returns yes
+  if suffix.length > s.length then
+    return false
+  end
+  return substr(s, s.length - suffix.length, suffix.length) == suffix
+end
+
+# Same directories the discover_shell_specs/self-healing drivers already
+# `include` from -- the actual PatLang standard/project libraries.
+make a function called patlang_lib_directories returns dirs
+  return ["self_hosting/lib", "friendly_cli/lib"]
+end
+
+make a function called discover_all_patlang_functions returns functions
+  let out = []
+  let dirs = patlang_lib_directories()
+  let d = 0
+  while d < to_num(list_len(dirs)) do
+    let found = discover_patlang_functions_in_dir(dirs[d])
+    let f = 0
+    while f < to_num(list_len(found)) do
+      let out = list_push(out, found[f])
+      let f = f + 1
+    end
+    let d = d + 1
+  end
+  return out
+end
+
+# PatLang has no real namespacing (flat, global scope -- a standing,
+# deliberately back-burnered language limitation, not something this
+# spec-library work is trying to fix). Two functions can share a bare
+# name across different files (confirmed for real: `nl` in three
+# separate files, `q`/`starts_with`/`html_escape` in two each, found via
+# the usage-ranking pass) -- keying specs by bare name alone would
+# silently let the second one's spec overwrite the first's. Until real
+# namespacing exists, a function's FILE PATH is its de facto namespace
+# for this project's own purposes -- qualify every spec identifier by
+# it. This also sets up the real payoff the user named directly: once
+# TWO same-named functions each have their own independently-verified
+# spec, comparing those two specs is what actually establishes whether
+# they're genuinely the same behaviour (candidates for real
+# unification later) or just a coincidental name collision -- something
+# no amount of just reading bare source side by side reliably settles.
+make a function called qualify_function_id takes file_path, func_name returns qualified_id
+  let sb = sb_new()
+  let base = file_path
+  if ends_with_ci(base, ".patlang") then
+    let base = substr(base, 0, base.length - 8)
+  end
+  let i = 0
+  while i < base.length do
+    let c = substr(base, i, 1)
+    if (c == "/") or (c == "\\") then
+      sb_push(sb, "__")
+    else
+      sb_push(sb, c)
+    end
+    let i = i + 1
+  end
+  sb_push(sb, "__" + func_name)
+  return sb_str(sb)
+end
+
+# Cross-references against spec_library/patlang_stdlib/*.feature so the
+# report distinguishes "already documented" from "not yet" -- avoids
+# implying lower_case (already done) is still an open gap. Keyed by the
+# qualified id (file + name), not bare name, per qualify_function_id's
+# own reasoning above.
+make a function called already_has_patlang_spec takes qualified_id returns yes
+  return file_exists("spec_library/patlang_stdlib/" + qualified_id + ".feature") == "1"
+end
+
+make a function called patlang_function_report takes functions returns report
+  let total = to_num(list_len(functions))
+  let pure_undocumented = 0
+  let side_effecting_undocumented = 0
+  let already_documented = 0
+  let pure_examples = []
+
+  let i = 0
+  while i < total do
+    let entry = functions[i]
+    let name = entry[0]
+    let file = entry[2]
+    let risk = entry[3]
+    if already_has_patlang_spec(qualify_function_id(file, name)) then
+      let already_documented = already_documented + 1
+    else
+      if risk == "likely_pure" then
+        let pure_undocumented = pure_undocumented + 1
+        if to_num(list_len(pure_examples)) < 30 then
+          let pure_examples = list_push(pure_examples, entry)
+        end
+      else
+        let side_effecting_undocumented = side_effecting_undocumented + 1
+      end
+    end
+    let i = i + 1
+  end
+
+  let sb = sb_new()
+  sb_push(sb, "PatLang function discovery report:\n")
+  sb_push(sb, "  total function declarations found: " + ("" + total) + "\n")
+  sb_push(sb, "  already documented (spec_library/patlang_stdlib): " + ("" + already_documented) + "\n")
+  sb_push(sb, "  likely_pure, undocumented (candidates for spec generation): " + ("" + pure_undocumented) + "\n")
+  sb_push(sb, "  likely_side_effecting, undocumented (need hand-authored probes, one at a time): " + ("" + side_effecting_undocumented) + "\n")
+  return [sb_str(sb), pure_examples]
+end
