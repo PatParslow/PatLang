@@ -6,11 +6,155 @@
 #
 # Follows RED-GREEN-REFACTOR:
 #   RED:   Write BDD spec first, verify implementation does not exist yet.
-#   PLAN:  Use GOAP to find existing actions that satisfy the BDD spec.
+#   PLAN:  Try known, LLM-free solutions first -- a pure-PatLang
+#          implementation using functions already known to exist, then a
+#          known shell-command pattern whose input->output contract is
+#          verified directly against the real test data. Only when
+#          NEITHER establishes the contract does this fall back to
+#          asking an LLM -- previously the LLM was consulted unconditionally,
+#          since this step was a bare `# TODO: Integrate GOAP planning
+#          here` with `plan_found` hardcoded false. The LLM is a genuine
+#          last resort now, not the default path, and even its own
+#          suggestion gets the same direct, LLM-free contract check
+#          (probe_shell_command) before any wrapper is written or
+#          compiled around it.
 #   GREEN: Write implementation, compile and run BDD spec, verify it passes.
 # =============================================================================
 
-# --- 1. Query Ollama for Solution ---
+# --- 0. Establishing contracts/conditions without the LLM, where feasible ---
+
+# Exact whitespace set the generated shell-wrapper's own trim loop uses
+# (space/tab/CR/LF) -- kept as its own function, rather than reusing
+# self_hosting/lib/includes.patlang's str_trim, because str_trim does NOT
+# strip a trailing \n (only space/tab/\r), and PowerShell output is
+# CRLF-terminated. Probing here has to trim EXACTLY the way the eventual
+# compiled wrapper will, or a probe that "passes" could still disagree
+# with what the compiled function actually returns.
+make a function called trim_shell_output takes raw_out returns trimmed
+  let a = 0
+  while (a < raw_out.length) and ((char_code(raw_out, a) == 32) or (char_code(raw_out, a) == 9) or (char_code(raw_out, a) == 13) or (char_code(raw_out, a) == 10)) do
+    let a = a + 1
+  end
+  let z = raw_out.length
+  while (z > a) and ((char_code(raw_out, z - 1) == 32) or (char_code(raw_out, z - 1) == 9) or (char_code(raw_out, z - 1) == 13) or (char_code(raw_out, z - 1) == 10)) do
+    let z = z - 1
+  end
+  return substr(raw_out, a, z - a)
+end
+
+# Splices a literal path into a `{FILE}`-templated command RIGHT NOW, for
+# direct probing -- as opposed to splice_file_placeholder_for_codegen
+# below, which splices in a PatLang expression (`" + file_path + "`) to
+# be embedded in GENERATED source text evaluated later, at a call the
+# compiled wrapper hasn't made yet. Two different substitution targets,
+# so two different functions -- conflating them was the source of a real
+# bug once already (see green_phase's history below).
+make a function called splice_file_placeholder_literal takes template, literal_path returns cmd
+  if not contains_text(template, "{FILE}") then
+    return template
+  end
+  let idx = 0
+  let found = -1
+  while (idx <= template.length - 6) and (found == -1) do
+    if substr(template, idx, 6) == "{FILE}" then
+      let found = idx
+    end
+    let idx = idx + 1
+  end
+  if found < 0 then
+    return template
+  end
+  let left = substr(template, 0, found)
+  let right = substr(template, found + 6, template.length - (found + 6))
+  return left + literal_path + right
+end
+
+# Splices `{FILE}` into a PatLang string-concatenation expression instead
+# of a literal path -- for embedding a command template into GENERATED
+# wrapper source, where the real path is only known once the compiled
+# function actually runs (as its own `file_path` parameter), not at
+# generation time. Shared by both the known-shell-solution path and the
+# LLM path, so a fix here (like the quoting bug in the history below)
+# only has to be made once.
+make a function called splice_file_placeholder_for_codegen takes template returns spliced
+  if not contains_text(template, "{FILE}") then
+    return template
+  end
+  let idx = 0
+  let found = -1
+  while (idx <= template.length - 6) and (found == -1) do
+    if substr(template, idx, 6) == "{FILE}" then
+      let found = idx
+    end
+    let idx = idx + 1
+  end
+  if found < 0 then
+    return template
+  end
+  let left = substr(template, 0, found)
+  let right = substr(template, found + 6, template.length - (found + 6))
+  return left + "\" + file_path + \"" + right
+end
+
+# Establishes a candidate shell command's real input->output contract
+# EMPIRICALLY -- runs it directly, right now, against the actual test
+# file, and compares its trimmed output to the expected result. This is
+# the mechanism that lets both a known command pattern and an LLM's own
+# suggestion be verified without trusting either one's description of
+# itself -- "finding the data on input->output contract" by actually
+# producing the data, not by asking anyone (human, LLM, or a docstring)
+# what the contract is supposed to be. Cheap relative to a full
+# write-wrapper/compile/run BDD cycle, so it's worth doing BEFORE
+# committing to that heavier path.
+make a function called probe_shell_command takes cmd_template, test_file, expected_result returns matches
+  let cmd = splice_file_placeholder_literal(cmd_template, test_file)
+  print("[PLAN PHASE] Probing candidate command directly (no LLM): " + cmd)
+  let raw_out = exec_capture("powershell", "-Command", cmd)
+  let trimmed = trim_shell_output(raw_out)
+  print("[PLAN PHASE] Candidate produced '" + trimmed + "' (expected '" + expected_result + "')")
+  return trimmed == expected_result
+end
+
+# A small table of ALREADY-KNOWN, deterministic PatLang implementations
+# for common capability names -- pure PatLang, built entirely from
+# functions this codebase already has (read_file/split_lines/list_len
+# come from self_hosting/lib/includes.patlang, already `include`d by
+# every driver that includes this engine). Tried before anything
+# shell-based or LLM-based: if a capability can be built entirely from
+# functions already known to exist, there is nothing left to establish
+# empirically OR ask an LLM about -- the contract IS the composition of
+# those functions' own known behavior. Returns "" when func_name isn't
+# in the table.
+make a function called known_patlang_solution takes func_name returns impl_code
+  if func_name == "line_count" then
+    let code = "make a function called line_count takes file_path returns result\n"
+    let code = code + "  let content = read_file(file_path)\n"
+    let code = code + "  let lines = split_lines(content)\n"
+    let code = code + "  return \"\" + list_len(lines)\n"
+    let code = code + "end\n"
+    return code
+  end
+  return ""
+end
+
+# A small table of ALREADY-KNOWN, deterministic shell command patterns
+# for common capability names one PatLang doesn't have a native
+# equivalent for -- these are well-known, unambiguous idioms (not an
+# LLM's guess), so their CORRECTNESS still gets verified empirically via
+# probe_shell_command before being trusted, but their CONTENT never
+# needs an LLM to produce. Returns "" (with {FILE} as the substitution
+# placeholder) when func_name isn't in the table.
+make a function called known_shell_solution takes func_name returns cmd_template
+  if func_name == "file_size" then
+    return "(Get-Item '{FILE}').Length"
+  end
+  if func_name == "get_file_extension" then
+    return "[System.IO.Path]::GetExtension('{FILE}')"
+  end
+  return ""
+end
+
+# --- 1. Query Ollama for Solution (genuine last resort -- see PLAN phase) ---
 
 make a function called ask_llm_for_solution takes missing_func_name, engine_type, model_name returns solution
   let prompt = "You are a Windows PowerShell expert. Given a missing host function named '" + missing_func_name + "', provide ONLY the raw Windows PowerShell expression needed to implement it. No explanations, no code blocks, no markdown. Use {FILE} as placeholder for file paths, {OLD} for old text, {NEW} for new text. Example output: (Get-Item '{FILE}').Length"
@@ -247,6 +391,58 @@ make a function called green_phase takes func_name, impl_code returns ok
   return false
 end
 
+# Generates the wrapper function body for a `{FILE}`-templated shell
+# command -- shared by the known-shell-solution path and the LLM path,
+# so a fix here only has to be made once.
+#
+# REAL BUG FOUND AND FIXED HERE (LLM path history, now applies equally
+# to the known-solution path since both share this function): the
+# LLM's prompt documents {FILE} as already appearing INSIDE quotes in
+# its own suggestion (example output: `(Get-Item '{FILE}').Length` --
+# note the surrounding single quotes are the LLM's own). Splicing used
+# to ALSO wrap the interpolated file_path in a fresh pair of single
+# quotes, producing DOUBLED quotes end to end (`''` + path + `''`),
+# which PowerShell parses as an EMPTY string literal immediately
+# followed by garbage -- Get-Item then fails with "Cannot bind argument
+# ... because it is an empty string", and to_num() of that error text
+# silently becomes 0. Confirmed via a direct repro (heal_missing_
+# function("file_size", ...) expecting "70" for a genuinely-70-byte
+# file returned 0, not 70). Fixed by NOT adding extra quotes --
+# {FILE}'s surrounding quotes in the template are relied on as-is.
+#
+# REAL GENERALIZABILITY GAP FIXED HERE: this used to unconditionally
+# `to_num(raw_out)` the captured output, assuming every synthesized
+# function's real result is numeric (true for file_size/word-count,
+# false for e.g. "get file extension" -- to_num() on a non-numeric
+# string silently returns something wrong rather than an error, so a
+# string-result target would corrupt silently). Trims raw_out's
+# surrounding whitespace/CRLF and returns/compares it as a plain STRING
+# throughout instead -- a numeric-looking result ("70") compares equal
+# to a numeric-looking expected_result string exactly as before, but a
+# genuinely string-shaped result (".md") now works too.
+make a function called build_shell_wrapper_code takes func_name, cmd_template returns impl_code
+  let formatted_cmd = splice_file_placeholder_for_codegen(cmd_template)
+  let code = "# =============================================================================\n"
+  let code = code + "# Auto-Synthesized PatLang Host Function Wrapper: " + func_name + "\n"
+  let code = code + "# =============================================================================\n\n"
+  let code = code + "make a function called " + func_name + " takes file_path returns result\n"
+  let code = code + "  print(\"  [SYNTHESIZED EXEC] " + func_name + "...\")\n"
+  let code = code + "  let raw_out = exec_capture(\"powershell\", \"-Command\", \"" + formatted_cmd + "\")\n"
+  let code = code + "  let a = 0\n"
+  let code = code + "  while (a < raw_out.length) and ((char_code(raw_out, a) == 32) or (char_code(raw_out, a) == 9) or (char_code(raw_out, a) == 13) or (char_code(raw_out, a) == 10)) do\n"
+  let code = code + "    let a = a + 1\n"
+  let code = code + "  end\n"
+  let code = code + "  let z = raw_out.length\n"
+  let code = code + "  while (z > a) and ((char_code(raw_out, z - 1) == 32) or (char_code(raw_out, z - 1) == 9) or (char_code(raw_out, z - 1) == 13) or (char_code(raw_out, z - 1) == 10)) do\n"
+  let code = code + "    let z = z - 1\n"
+  let code = code + "  end\n"
+  let code = code + "  let trimmed = substr(raw_out, a, z - a)\n"
+  let code = code + "  print(\"[CONTRACT PASS] Synthesized function " + func_name + " returned: \" + trimmed)\n"
+  let code = code + "  return trimmed\n"
+  let code = code + "end\n"
+  return code
+end
+
 # --- 5. Main Self-Healing Workflow Entry Point (RED-GREEN-REFACTOR) ---
 
 make a function called heal_missing_function takes func_name, engine_type, model_name, test_file, test_arg, expected_result returns success
@@ -259,106 +455,68 @@ make a function called heal_missing_function takes func_name, engine_type, model
   # ever having been verified, and such an attempt must be retried, not
   # silently treated as already handled.
   if is_registered(func_name) then
-    print("[SELF-HEALING ENGINE] Function '" + func_name + "' already verified and registered in synthesized_tools.patlang. Skipping LLM query.")
+    print("[SELF-HEALING ENGINE] Function '" + func_name + "' already verified and registered in synthesized_tools.patlang. Skipping synthesis entirely.")
     return true
   end
 
   # Step A: RED Phase - Write BDD spec, verify implementation doesn't exist
   red_phase(func_name, test_file, test_arg, expected_result)
 
-  # Step B: PLAN - Try GOAP planning with existing actions
-  print("[PLAN PHASE] Checking if existing actions can satisfy BDD spec...")
-  let plan_found = false
-  # TODO: Integrate GOAP planning here
-
-  # Step C: If no GOAP plan, consult LLM
-  if not plan_found then
-    print("[PLAN PHASE] No GOAP plan found. Consulting LLM...")
-    let solution = ask_llm_for_solution(func_name, engine_type, model_name)
-
-    # Step D: Generate implementation using LLM solution
-    # Translate {FILE} to PatLang concatenation syntax for file_path
-    # Example: (Get-Item '{FILE}').Length -> (Get-Item '\" + file_path + \"').Length
-    #
-    # REAL BUG FOUND AND FIXED HERE: the LLM's prompt (ask_llm_for_
-    # solution) documents {FILE} as already appearing INSIDE quotes in
-    # its own suggestion (example output: `(Get-Item '{FILE}').Length`
-    # -- note the surrounding single quotes are the LLM's own). This
-    # substitution used to ALSO wrap the interpolated file_path in a
-    # fresh pair of single quotes, producing DOUBLED quotes end to end
-    # (`''` + path + `''`), which PowerShell parses as an EMPTY string
-    # literal immediately followed by garbage -- Get-Item then fails
-    # with "Cannot bind argument ... because it is an empty string",
-    # and to_num() of that error text silently becomes 0. Confirmed via
-    # a direct repro (heal_missing_function("file_size", ...) expecting
-    # "70" for a genuinely-70-byte file returned 0, not 70) -- this bug
-    # was invisible before the vacuous-check fix above, since the old
-    # "CONTRACT PASS" substring check couldn't tell 0 from 70. Fixed by
-    # NOT adding extra quotes here -- {FILE}'s surrounding quotes in the
-    # LLM's own suggestion are relied on as-is.
-    let formatted_solution = solution
-    if contains_text(solution, "{FILE}") then
-      # Manual split and join to emulate text replace in pure PatLang
-      let idx = 0
-      let found = -1
-      while (idx <= solution.length - 6) and (found == -1) do
-        if substr(solution, idx, 6) == "{FILE}" then
-          let found = idx
-        end
-        let idx = idx + 1
-      end
-      if found >= 0 then
-        let left = substr(solution, 0, found)
-        let right = substr(solution, found + 6, solution.length - (found + 6))
-        let formatted_solution = left + "\" + file_path + \"" + right
-      end
-    end
-
-    # Build PowerShell command with file_path variable properly interpolated
-    #
-    # REAL GENERALIZABILITY GAP FIXED HERE: this used to unconditionally
-    # `to_num(raw_out)` the captured output, assuming every synthesized
-    # function's real result is numeric (true for file_size/word-count,
-    # false for e.g. "get file extension" -- to_num() on a non-numeric
-    # string silently returns something wrong rather than an error, so
-    # a string-result target would corrupt silently, invisible before
-    # the vacuous-check fix). Switched to trimming raw_out's surrounding
-    # whitespace/CRLF and returning/comparing it as a plain STRING
-    # throughout -- a numeric-looking result ("70") compares equal to a
-    # numeric-looking expected_result string exactly as before, but a
-    # genuinely string-shaped result (".md") now works too, with no
-    # separate numeric/string code path needed.
-    let code = "# =============================================================================\n"
-    let code = code + "# Auto-Synthesized PatLang Host Function Wrapper: " + func_name + "\n"
-    let code = code + "# =============================================================================\n\n"
-    let code = code + "make a function called " + func_name + " takes file_path returns result\n"
-    let code = code + "  print(\"  [SYNTHESIZED EXEC] " + func_name + "...\")\n"
-    let code = code + "  let raw_out = exec_capture(\"powershell\", \"-Command\", \"" + formatted_solution + "\")\n"
-    let code = code + "  let a = 0\n"
-    let code = code + "  while (a < raw_out.length) and ((char_code(raw_out, a) == 32) or (char_code(raw_out, a) == 9) or (char_code(raw_out, a) == 13) or (char_code(raw_out, a) == 10)) do\n"
-    let code = code + "    let a = a + 1\n"
-    let code = code + "  end\n"
-    let code = code + "  let z = raw_out.length\n"
-    let code = code + "  while (z > a) and ((char_code(raw_out, z - 1) == 32) or (char_code(raw_out, z - 1) == 9) or (char_code(raw_out, z - 1) == 13) or (char_code(raw_out, z - 1) == 10)) do\n"
-    let code = code + "    let z = z - 1\n"
-    let code = code + "  end\n"
-    let code = code + "  let trimmed = substr(raw_out, a, z - a)\n"
-    let code = code + "  print(\"[CONTRACT PASS] Synthesized function " + func_name + " returned: \" + trimmed)\n"
-    let code = code + "  return trimmed\n"
-    let code = code + "end\n"
-    let impl_code = code
-
-    # Step E: GREEN Phase - Write implementation, compile, run BDD spec.
-    # REAL BUG FIXED HERE: this used to be a bare `green_phase(...)`
-    # call with the result discarded, followed by an unconditional
-    # `return true` below -- so heal_missing_function could NEVER
-    # report failure, no matter what green_phase's own checks found.
-    # Confirmed via a direct repro: a deliberately wrong expected_result
-    # still came back `healed = true`. Now the real pass/fail result
-    # propagates all the way out.
-    let green_ok = green_phase(func_name, impl_code)
+  # Step B1: PLAN - a pure-PatLang solution built entirely from functions
+  # already known to exist needs no empirical probe at all: the contract
+  # IS the composition of those functions' own already-known behavior,
+  # so there's nothing left to establish and nothing to ask an LLM about.
+  print("[PLAN PHASE] Checking for a known, pure-PatLang solution (no LLM, no shell)...")
+  let known_impl = known_patlang_solution(func_name)
+  if known_impl != "" then
+    print("[PLAN PHASE] Found a known PatLang-native implementation for '" + func_name + "'.")
+    let green_ok = green_phase(func_name, known_impl)
     return green_ok
   end
 
-  return true
+  # Step B2: PLAN - a known shell-command pattern (a well-known,
+  # deterministic idiom, not a guess) still gets its actual input->output
+  # contract established empirically, by running it directly against the
+  # real test data, before any wrapper is written or compiled around it.
+  print("[PLAN PHASE] Checking for a known shell-command solution...")
+  let known_cmd = known_shell_solution(func_name)
+  if known_cmd != "" then
+    if probe_shell_command(known_cmd, test_file, expected_result) then
+      print("[PLAN PHASE] Known command's output matches the expected contract -- proceeding without the LLM.")
+      let impl_code = build_shell_wrapper_code(func_name, known_cmd)
+      let green_ok = green_phase(func_name, impl_code)
+      return green_ok
+    else
+      print("[PLAN PHASE] Known command pattern did not satisfy the contract for this input -- falling back to the LLM.")
+    end
+  end
+
+  # Step C: Neither a known PatLang solution nor a known shell pattern
+  # established the contract -- consult the LLM as a genuine last
+  # resort, not the default path. Its suggestion gets the exact same
+  # empirical, LLM-free contract check (probe_shell_command) any known
+  # pattern would, before a wrapper is ever written or compiled around
+  # it -- the LLM proposes a candidate; it does not get to also decide
+  # whether that candidate is correct.
+  print("[PLAN PHASE] No known solution satisfies the contract. Consulting LLM as a last resort...")
+  let solution = ask_llm_for_solution(func_name, engine_type, model_name)
+
+  if not probe_shell_command(solution, test_file, expected_result) then
+    print("[PLAN PHASE] LLM's suggestion did not satisfy the expected contract when probed directly.")
+    return false
+  end
+  print("[PLAN PHASE] LLM's suggestion matches the expected contract -- proceeding to GREEN phase.")
+
+  let impl_code = build_shell_wrapper_code(func_name, solution)
+
+  # Step E: GREEN Phase - Write implementation, compile, run BDD spec.
+  # REAL BUG FIXED HERE: this used to be a bare `green_phase(...)` call
+  # with the result discarded, followed by an unconditional `return
+  # true` below -- so heal_missing_function could NEVER report failure,
+  # no matter what green_phase's own checks found. Confirmed via a
+  # direct repro: a deliberately wrong expected_result still came back
+  # `healed = true`. Now the real pass/fail result propagates all the
+  # way out.
+  let green_ok = green_phase(func_name, impl_code)
+  return green_ok
 end
