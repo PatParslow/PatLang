@@ -1,0 +1,137 @@
+# A combined worked example (adapted from a suggestion, with several
+# real syntax/API corrections applied and verified by actual execution --
+# PatLang has no {"key": value} dict-literal syntax; objects are
+# id-keyed and mutated via dot notation (new(...) + obj.field = value,
+# see self_hosting/examples/paradigm_gallery/oo.patlang), `if` needs
+# `then`/`end` or `{ }`, not `do`/`end` (that's only for while/closures/
+# class), and fibers are created via fiber_new("function_name_string")
+# with the actual argument delivered by the FIRST fiber_resume call, not
+# via a fiber_create(fn_value, arg) call -- there is no such function):
+# a GOAP plan evaluator, run inside a worker fiber that wraps its VFS
+# writes in a transaction, with two workers interleaved on separate
+# fibers -- one with a valid plan (commits), one without enough energy
+# (rolls back).
+
+include "../self_hosting/lib/includes.patlang"
+include "lib/vfs_transaction.patlang"
+
+# -------------------------------------------------------------
+# 1. GOAP Planner & Action Definitions
+# -------------------------------------------------------------
+
+make a function called goap_evaluate_plan takes state, plan returns success
+  let i = 0
+  while i < to_num(list_len(plan)) do
+    let action = plan[i]
+    if action == "mine_ore" then
+      state.has_ore = true
+      state.energy = state.energy - 20
+    end
+    if action == "refine_ingot" then
+      if state.has_ore == true and state.energy >= 30 then
+        state.has_ore = false
+        state.has_ingot = true
+        state.energy = state.energy - 30
+      else
+        return false
+      end
+    end
+    if action == "craft_gear" then
+      if state.has_ingot == true then
+        state.has_ingot = false
+        state.has_gear = true
+      else
+        return false
+      end
+    end
+    let i = i + 1
+  end
+  return (state.has_gear == true) and (state.energy >= 0)
+end
+
+# -------------------------------------------------------------
+# 2. Transactional Fiber Worker
+# -------------------------------------------------------------
+
+make a function called worker_fiber_body takes cfg returns status
+  let worker_id = cfg[0]
+  let state = cfg[1]
+  let plan = cfg[2]
+  let prefix = "/workers/" + worker_id + "/"
+
+  print("Worker " + worker_id + ": starting GOAP execution fiber...")
+  fiber_yield("READY")
+
+  txn_begin(worker_id)
+  vfs_write(prefix + "state.txt", "INITIAL_ENERGY:" + ("" + state.energy))
+
+  let plan_valid = goap_evaluate_plan(state, plan)
+
+  if plan_valid == false then
+    print("Worker " + worker_id + ": GOAP plan failed validation! Rolling back...")
+    fiber_yield("PLAN_FAILED")
+    txn_rollback(worker_id)
+    # Written AFTER txn_rollback returns, so it's OUTSIDE the
+    # transaction's scope and survives -- a diagnostic reason the
+    # caller can actually inspect, unlike a log written inside the
+    # transaction (which rollback would correctly, but unhelpfully,
+    # erase along with everything else the failed attempt touched).
+    vfs_write(prefix + "log.txt", "FAIL: plan evaluation invalid -- final energy=" + ("" + state.energy) + ", has_ore=" + ("" + state.has_ore) + ", has_ingot=" + ("" + state.has_ingot) + ", has_gear=" + ("" + state.has_gear))
+    return "ROLLED_BACK"
+  end
+
+  vfs_write(prefix + "inventory/ore.txt", "QTY: 1")
+  fiber_yield("MINED_ORE")
+
+  vfs_write(prefix + "inventory/ingot.txt", "QTY: 1")
+  vfs_write(prefix + "inventory/ore.txt", "QTY: 0")
+  fiber_yield("REFINED_INGOT")
+
+  vfs_write(prefix + "inventory/gear.txt", "QTY: 1")
+  vfs_write(prefix + "inventory/ingot.txt", "QTY: 0")
+
+  txn_commit(worker_id)
+  print("Worker " + worker_id + ": transaction committed successfully!")
+  return "COMMITTED"
+end
+
+# -------------------------------------------------------------
+# 3. Main Scheduler Interleaving Multiple Fibers
+# -------------------------------------------------------------
+
+let w1_state = new("WorkerState", "w1_state")
+w1_state.has_ore = false
+w1_state.has_ingot = false
+w1_state.has_gear = false
+w1_state.energy = 100
+
+let w2_state = new("WorkerState", "w2_state")
+w2_state.has_ore = false
+w2_state.has_ingot = false
+w2_state.has_gear = false
+w2_state.energy = 20
+
+let f1 = fiber_new("worker_fiber_body")
+let f2 = fiber_new("worker_fiber_body")
+
+print(fiber_resume(f1, ["w1", w1_state, ["mine_ore", "refine_ingot", "craft_gear"]]))
+print(fiber_resume(f2, ["w2", w2_state, ["mine_ore", "refine_ingot", "craft_gear"]]))
+
+print(fiber_resume(f1, 0))
+print(fiber_resume(f2, 0))
+
+print(fiber_resume(f1, 0))
+print(fiber_resume(f2, 0))
+
+print(fiber_resume(f1, 0))
+
+print("=== Final check ===")
+print("w1 gear.txt exists (expected 1): " + vfs_exists("/workers/w1/inventory/gear.txt"))
+# log.txt is now written AFTER txn_rollback returns, so it correctly
+# survives -- unlike a log written inside the transaction (which
+# rollback would erase along with everything else the failed attempt
+# touched, since it has no way to distinguish "diagnostic record" from
+# "part of the candidate's own work").
+print("w2 log.txt exists (expected 1 -- written after rollback, so it survives): " + vfs_exists("/workers/w2/log.txt"))
+print("w2 log.txt content: " + vfs_read("/workers/w2/log.txt"))
+print("w2 inventory dir entries (expected 0 -- the candidate's own work is still fully undone): " + ("" + to_num(list_len(vfs_list("/workers/w2/inventory/")))))
