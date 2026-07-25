@@ -358,32 +358,57 @@ impl<'a> Lexer<'a> {
                 return Ok(Token::BlockEnd);
             }
             // String literals with standard escapes: \" \\ \n \t \r
+            //
+            // Decodes real UTF-8 characters here (via `str::chars()` on the
+            // remaining slice), advancing `self.position` by each
+            // character's actual UTF-8 byte length -- rather than reading
+            // one raw byte and casting it to `char`, which used to corrupt
+            // any multi-byte UTF-8 sequence (anything outside ASCII): each
+            // byte of e.g. an accented or CJK character got reinterpreted
+            // as its own wrong single-byte codepoint, then re-encoded as
+            // UTF-8 on output, producing mojibake ("café" became 5
+            // corrupted characters instead of 4). Confirmed via direct
+            // byte-level inspection that the source file itself was
+            // correctly UTF-8 encoded on disk -- the corruption was purely
+            // this read-side bug. The rest of the lexer's structural
+            // scanning (keywords/operators/numbers/identifiers) stays
+            // ASCII-only by design and is unaffected by this fix.
             if c == '"' {
                 self.position += 1;
                 let mut s = String::new();
-                while self.position < len && bytes[self.position] as char != '"' {
-                    let ch = bytes[self.position] as char;
-                    if ch == '\\' && self.position + 1 < len {
-                        let esc = bytes[self.position + 1] as char;
-                        let decoded = match esc {
-                            'n' => Some('\n'),
-                            't' => Some('\t'),
-                            'r' => Some('\r'),
-                            '"' => Some('"'),
-                            '\\' => Some('\\'),
-                            _ => None,
-                        };
-                        if let Some(d) = decoded {
-                            s.push(d);
-                            self.position += 2;
-                            continue;
+                let mut terminated = false;
+                while self.position < len {
+                    let ch = match self.input[self.position..].chars().next() {
+                        Some(c) => c,
+                        None => break,
+                    };
+                    if ch == '"' {
+                        self.position += 1;
+                        terminated = true;
+                        break;
+                    }
+                    if ch == '\\' {
+                        let esc_start = self.position + ch.len_utf8();
+                        if let Some(esc) = self.input[esc_start..].chars().next() {
+                            let decoded = match esc {
+                                'n' => Some('\n'),
+                                't' => Some('\t'),
+                                'r' => Some('\r'),
+                                '"' => Some('"'),
+                                '\\' => Some('\\'),
+                                _ => None,
+                            };
+                            if let Some(d) = decoded {
+                                s.push(d);
+                                self.position = esc_start + esc.len_utf8();
+                                continue;
+                            }
                         }
                     }
                     s.push(ch);
-                    self.position += 1;
+                    self.position += ch.len_utf8();
                 }
-                if self.position < len && bytes[self.position] as char == '"' {
-                    self.position += 1;
+                if terminated {
                     lex_debug!("[DEBUG][lexer] Returning Token::String({})", s);
                     return Ok(Token::String(s));
                 } else {

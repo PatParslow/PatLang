@@ -62,6 +62,23 @@ assert!(matches!(tokens[0], Err(LexerError::UnterminatedString(_))));
 }
 
 #[test]
+fn test_unicode_string_literal() {
+    // Regression test: the lexer used to read string-literal bytes one at a
+    // time via `bytes[pos] as char`, never decoding multi-byte UTF-8
+    // sequences -- so "café" (4 real characters, the last a 2-byte UTF-8
+    // sequence) came back as 5 corrupted characters. Covers a precomposed
+    // accented Latin character (2-byte UTF-8) and a CJK character (3-byte
+    // UTF-8), both inside an otherwise-ordinary string literal.
+    let tokens = lex_all("\"café\"");
+    assert_eq!(tokens[0], Ok(Token::String("café".to_string())));
+    assert_eq!(tokens[1], Ok(Token::EOF));
+
+    let tokens = lex_all("\"你好\"");
+    assert_eq!(tokens[0], Ok(Token::String("你好".to_string())));
+    assert_eq!(tokens[1], Ok(Token::EOF));
+}
+
+#[test]
 fn test_dot_and_newline() {
 let tokens = lex_all("foo.\nbar");
 assert_eq!(tokens[0], Ok(Token::Identifier("foo".to_string())));
