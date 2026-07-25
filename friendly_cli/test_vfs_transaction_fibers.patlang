@@ -1,0 +1,90 @@
+# Tests running VFS transactions on separate fibers, per: "worth seeing
+# if we can run multiple transactions on separate fibres, of course,
+# although then we'd have to decide what to keep if more than one
+# succeeds". Two cases:
+#
+# 1. DISJOINT files -- each fiber's transaction only touches its own
+#    path. Interleaved via fiber_yield/fiber_resume exactly like the
+#    fib_generator demo. Expected: no interference at all.
+# 2. THE SAME shared file -- deliberately construct the interleaving the
+#    prototype's own documented limitation warned about, and observe
+#    exactly what goes wrong, rather than just asserting it theoretically.
+
+include "../self_hosting/lib/includes.patlang"
+include "../self_hosting/lib/test.patlang"
+include "lib/vfs_transaction.patlang"
+
+print("=== Case A: disjoint files, two fibers, interleaved ===")
+
+make a function called txn_fiber_disjoint takes cfg returns result
+  let txn_id = cfg[0]
+  let path = cfg[1]
+  let value = cfg[2]
+  txn_begin(txn_id)
+  vfs_write(path, value)
+  fiber_yield(0)
+  txn_commit(txn_id)
+  return vfs_read(path)
+end
+
+vfs_write("fa.txt", "fa-original")
+vfs_write("fb.txt", "fb-original")
+
+let fiberA = fiber_new("txn_fiber_disjoint")
+let fiberB = fiber_new("txn_fiber_disjoint")
+fiber_resume(fiberA, ["fiberA", "fa.txt", "fa-new"])
+fiber_resume(fiberB, ["fiberB", "fb.txt", "fb-new"])
+let resultA = fiber_resume(fiberA, 0)
+let resultB = fiber_resume(fiberB, 0)
+print("fiberA final result: " + resultA + " (expected fa-new)")
+print("fiberB final result: " + resultB + " (expected fb-new)")
+let caseA_ok = (resultA == "fa-new") and (resultB == "fb-new")
+print("CASE A (disjoint files, no interference): " + ("" + caseA_ok))
+
+print("=== Case B: SAME shared file, two fibers -- the documented hazard, demonstrated ===")
+
+make a function called txn_fiber_shared takes cfg returns result
+  let txn_id = cfg[0]
+  let path = cfg[1]
+  let value = cfg[2]
+  let should_commit = cfg[3]
+  txn_begin(txn_id)
+  vfs_write(path, value)
+  fiber_yield(0)
+  if should_commit then
+    txn_commit(txn_id)
+  else
+    txn_rollback(txn_id)
+  end
+  return [should_commit, vfs_read(path)]
+end
+
+print("--- B1: both fibers COMMIT (a lost-update hazard) ---")
+vfs_write("shared.txt", "shared-original")
+let fc1 = fiber_new("txn_fiber_shared")
+let fc2 = fiber_new("txn_fiber_shared")
+fiber_resume(fc1, ["c1", "shared.txt", "value-from-fiber1", true])
+fiber_resume(fc2, ["c2", "shared.txt", "value-from-fiber2", true])
+let r1 = fiber_resume(fc1, 0)
+let r2 = fiber_resume(fc2, 0)
+print("fiber1 believed it committed: " + ("" + r1[0]) + ", saw its own write as: " + r1[1])
+print("fiber2 believed it committed: " + ("" + r2[0]) + ", saw its own write as: " + r2[1])
+print("ACTUAL final shared.txt: " + vfs_read("shared.txt") + " -- whichever committed LAST silently wins; neither transaction is told about the other")
+
+print("--- B2: fiber1 ROLLS BACK after fiber2 already wrote -- fiber2's committed write is silently destroyed ---")
+vfs_write("shared2.txt", "shared2-original")
+let fd1 = fiber_new("txn_fiber_shared")
+let fd2 = fiber_new("txn_fiber_shared")
+fiber_resume(fd1, ["d1", "shared2.txt", "fiber1-attempt", false])
+fiber_resume(fd2, ["d2", "shared2.txt", "fiber2-attempt", true])
+let rd1 = fiber_resume(fd1, 0)
+let rd2 = fiber_resume(fd2, 0)
+print("fiber1 (rolled back) saw: " + rd1[1])
+print("fiber2 believed it committed: " + ("" + rd2[0]) + ", saw its own write as: " + rd2[1])
+print("ACTUAL final shared2.txt: " + vfs_read("shared2.txt"))
+let data_loss = vfs_read("shared2.txt") != "fiber2-attempt"
+print("DATA LOSS -- fiber2's own successful, committed write was silently overwritten by fiber1's rollback: " + ("" + data_loss))
+
+print("=== SUMMARY ===")
+print("Disjoint-path transactions across fibers: safe, no interference.")
+print("Overlapping-path transactions across fibers: NOT safe -- confirmed concretely, not just theorized. A rollback can silently destroy another fiber's already-committed write, with no error raised anywhere.")

@@ -1,0 +1,41 @@
+# Tests composability with the SQL/RDBMS layer, per: "need to also check
+# how well this works with the SQL side of things..." The RDBMS layer
+# (self_hosting/lib/rdbms.patlang) has its OWN transaction concept
+# (rdb_begin/rdb_commit/rdb_rollback), but it's purely in-memory staged
+# rows -- nothing touches the VFS until rdb_commit calls
+# rdb_write_committed_table, which calls vfs_write. That means the
+# generic VFS transaction can wrap AROUND an already-rdb-committed
+# change and still undo it -- useful for "the SQL write itself succeeded,
+# but some other later check in the same attempt failed, undo everything
+# including the SQL part."
+
+include "../self_hosting/lib/includes.patlang"
+include "../self_hosting/lib/test.patlang"
+include "../self_hosting/lib/rdbms.patlang"
+include "lib/vfs_transaction.patlang"
+
+let db = rdb_init()
+let schema = [["id", "int"], ["name", "text"]]
+let db = rdb_begin(db)
+let db = rdb_save(db, "people", schema, [["1", "alice"]])
+let db = rdb_commit(db, "0")
+print("before candidate attempt: " + rdb_join_comma(rdb_row_from_csv(schema, rdb_row_to_csv(rdb_read_committed_rows("people")[0]))))
+
+txn_begin("sql_txn")
+
+let db2 = rdb_begin(db)
+let db2 = rdb_save(db2, "people", schema, [["1", "alice"], ["2", "bob"]])
+let db2 = rdb_commit(db2, "0")
+let rows_after_sql_commit = rdb_read_committed_rows("people")
+print("SQL layer's own view immediately after its own commit: " + ("" + to_num(list_len(rows_after_sql_commit))) + " rows (expected 2)")
+
+# Now the OUTER attempt decides, for some reason unrelated to the SQL
+# write itself, that the whole thing must be undone -- the generic VFS
+# transaction rolls back the table file that rdb_commit already wrote.
+txn_rollback("sql_txn")
+
+let rows_after_outer_rollback = rdb_read_committed_rows("people")
+print("SQL layer's view after the OUTER (non-SQL) transaction rolled back: " + ("" + to_num(list_len(rows_after_outer_rollback))) + " rows (expected 1 -- back to just alice)")
+
+let ok = (to_num(list_len(rows_after_sql_commit)) == 2) and (to_num(list_len(rows_after_outer_rollback)) == 1)
+print("RESULT: generic VFS transaction correctly undid an already-committed SQL write: " + ("" + ok))
