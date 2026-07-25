@@ -406,6 +406,16 @@ pub fn host_byte_length(args: &[Value]) -> Result<Value, String> {
     Ok(Value::Int(s.len() as i64))
 }
 
+pub fn host_getenv(args: &[Value]) -> Result<Value, String> {
+    // getenv(name) -> the real OS environment variable's value, or ""
+    // if unset -- distinct from set_var/get's own __vars object store,
+    // which is an internal PatLang convention with no connection to
+    // actual process environment variables. Needed for things like
+    // walking PATH to discover installed commands.
+    let name = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => display_value(v).into(), None => String::new().into() };
+    Ok(Value::String((std::env::var(&*name).unwrap_or_default()).into()))
+}
+
 pub fn host_read_line(_args: &[Value]) -> Result<Value, String> {
     // read_line() -> String: one line from stdin, without the trailing
     // newline, or "" at EOF.
@@ -425,6 +435,46 @@ pub fn host_now_ms(_args: &[Value]) -> Result<Value, String> {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
     Ok(Value::Int(ms))
+}
+
+pub fn host_read_file_bytes(args: &[Value]) -> Result<Value, String> {
+    // read_file_bytes(path, offset, length) -> List of Int (0-255), the
+    // raw bytes at [offset, offset+length) -- for binary-format
+    // inspection (e.g. a PE header's Subsystem field) where reading and
+    // base64-encoding an entire multi-megabyte executable just to look
+    // at a handful of bytes near the start would be real, avoidable
+    // waste. Uses Seek rather than reading the whole file into memory.
+    // Silently clamps to what's actually available if the file is
+    // shorter than offset+length (returns fewer bytes, never errors),
+    // so a caller can't be crashed by probing a file smaller than
+    // expected -- it just gets back less than it asked for.
+    //
+    // FAIL-SOFT ON PURPOSE (this language has no try/catch, so a
+    // Result::Err here is FATAL to the entire program, not just this
+    // one call): confirmed via a real crash walking a live PATH that
+    // Windows "App Execution Alias" reparse-point files (e.g.
+    // WindowsApps\ActionsMcpHost.exe) fail to even open with a
+    // Windows-specific error ("os error 1920", not a generic not-found/
+    // permission-denied), and this function's whole purpose is
+    // speculative, best-effort binary inspection across a large,
+    // uncontrolled set of files where some genuinely can't be read for
+    // reasons that have nothing to do with the caller's own logic. Any
+    // open/seek/read failure here returns an empty list rather than
+    // erroring -- callers already handle "fewer bytes than expected"
+    // (e.g. pe_subsystem_classify's own length checks), so this reuses
+    // that same path rather than requiring every caller to also guard
+    // against a fatal host error.
+    use std::io::{Read, Seek, SeekFrom};
+    let p = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => display_value(v).into(), None => String::new().into() };
+    let offset = match args.get(1) { Some(v) => v.as_number().map_err(|_| "read_file_bytes: expected a numeric offset".to_string())? as u64, None => 0 };
+    let length = match args.get(2) { Some(v) => v.as_number().map_err(|_| "read_file_bytes: expected a numeric length".to_string())? as usize, None => 0 };
+    let empty = || Ok(Value::List(std::sync::Arc::new(Vec::new())));
+    let mut f = match std::fs::File::open(&p) { Ok(f) => f, Err(_) => return empty() };
+    if f.seek(SeekFrom::Start(offset)).is_err() { return empty(); }
+    let mut buf = vec![0u8; length];
+    let n = match f.read(&mut buf) { Ok(n) => n, Err(_) => return empty() };
+    buf.truncate(n);
+    Ok(Value::List(std::sync::Arc::new(buf.into_iter().map(|b| Value::Int(b as i64)).collect())))
 }
 
 pub fn host_read_file_b64(args: &[Value]) -> Result<Value, String> {
@@ -2638,6 +2688,8 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("read_line", host_read_line);
     interp.host.insert("byte_length", host_byte_length);
     interp.host.insert("read_file_b64", host_read_file_b64);
+    interp.host.insert("read_file_bytes", host_read_file_bytes);
+    interp.host.insert("getenv", host_getenv);
     interp.host.insert("exec_capture", host_exec_capture);
     interp.host.insert("compile_shape", host_compile_shape);
     interp.host.insert("compile_ir", host_compile_ir);
