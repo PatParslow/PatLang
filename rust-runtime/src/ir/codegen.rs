@@ -867,7 +867,26 @@ mod fibers {
         registry().lock().unwrap().insert(id, Arc::clone(&handle));
 
         let program_owned = program.clone();
+        // DISPATCH_FALLBACK is thread_local (set by main()'s own worker
+        // thread, or by whichever thread spawned this one) -- a fiber runs
+        // on its own separate OS thread, so without forwarding this it
+        // starts with no fallback registered at all, and any ordinary host
+        // function call from inside the fiber (anything not one of this
+        // program's own inlined match arms) fails with "host fn '...' not
+        // found (dispatch fallback not set...)". Confirmed via a real
+        // repro: a minimal fiber that does nothing but call to_num() after
+        // a single fiber_yield failed exactly this way under `pat --patc`,
+        // while the same program worked fine under the interpreter
+        // (--ir-run uses a separate, non-thread_local fiber implementation
+        // entirely -- see ir/fiber.rs -- so it never hit this). Captured
+        // from the PARENT thread (not re-derived as `call_dispatch`
+        // directly, which this chunk can't name once precompiled and
+        // linked against multiple different programs).
+        let parent_fallback = crate::get_dispatch_fallback();
         std::thread::spawn(move || {
+            if let Some(f) = parent_fallback {
+                crate::set_dispatch_fallback(f);
+            }
             CURRENT_FIBER.with(|c| c.set(Some(id)));
             let first_arg = {
                 let mut st = handle.state.lock().unwrap();
@@ -1297,6 +1316,16 @@ thread_local! {
 
 pub fn set_dispatch_fallback(f: fn(&str, &[Value]) -> Result<Value, String>) {
     DISPATCH_FALLBACK.with(|d| *d.borrow_mut() = Some(f));
+}
+
+// Reads back whatever this THREAD's own set_dispatch_fallback last set --
+// used by fiber_new (below) to forward the parent thread's already-
+// registered fallback into a newly-spawned fiber thread, without needing
+// to name `call_dispatch` directly (impossible from this chunk once
+// precompiled and linked against multiple different programs -- see the
+// comment above DISPATCH_FALLBACK's declaration).
+pub fn get_dispatch_fallback() -> Option<fn(&str, &[Value]) -> Result<Value, String>> {
+    DISPATCH_FALLBACK.with(|d| *d.borrow())
 }
 
 fn dispatch_fallback(name: &str, args: &[Value]) -> Result<Value, String> {
