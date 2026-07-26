@@ -614,8 +614,25 @@ impl Host {
         // "int" -- checked before the generic coercion, matching how the
         // interpreter's own host_type_of (ir/hosts.rs) never coerces at all).
         if name == "type_of" { return Ok(type_of_impl(args)); }
-        let __coerced_args: Vec<Value> = args.iter().map(host_coerce_arg).collect();
-        let args: &[Value] = &__coerced_args;
+        // Coerce into a small STACK-allocated buffer for the common case
+        // (the overwhelming majority of host calls pass a handful of
+        // args), avoiding a heap Vec allocation on every single host call
+        // -- a real, measured cost found investigating fantgame's
+        // PHASE0_SPIKE_RESULTS.md: this Vec used to be allocated fresh
+        // even for e.g. a 2-arg vec_get call, adding an avoidable
+        // malloc/free pair to every host call in a compiled program.
+        // Falls back to a real heap Vec only for calls with more than
+        // INLINE_CAP arguments (rare in practice).
+        const INLINE_CAP: usize = 6;
+        let mut inline_buf: [Value; INLINE_CAP] = [Value::Unit, Value::Unit, Value::Unit, Value::Unit, Value::Unit, Value::Unit];
+        let heap_buf: Vec<Value>;
+        let args: &[Value] = if args.len() <= INLINE_CAP {
+            for (i, a) in args.iter().enumerate() { inline_buf[i] = host_coerce_arg(a); }
+            &inline_buf[..args.len()]
+        } else {
+            heap_buf = args.iter().map(host_coerce_arg).collect();
+            &heap_buf
+        };
         match name {
 "list_get" => {
                 // list_get(list, index)
@@ -2599,7 +2616,16 @@ fn host_call_strings_ext(name: &str, args: &[Value]) -> Option<Result<Value, Str
 fn host_call_collections_handles_inner(name: &str, args: &[Value]) -> Result<Value, String> {
     match name {
 "vec_new" => {
-                let id = VECS.with(|v| { let mut b = v.borrow_mut(); b.push(Vec::new()); b.len() - 1 });
+                // Optional capacity hint -- see hosts.rs's matching host_
+                // vec_new comment: pre-reserves storage via Vec::with_
+                // capacity so a caller who knows the eventual size avoids
+                // the reallocate-and-copy cycles Vec::new()+repeated push
+                // would otherwise pay. Correctness-identical either way.
+                let capacity = match args.get(0) {
+                    Some(v) => v.as_number().ok().map(|n| n.max(0.0) as usize).unwrap_or(0),
+                    None => 0,
+                };
+                let id = VECS.with(|v| { let mut b = v.borrow_mut(); b.push(Vec::with_capacity(capacity)); b.len() - 1 });
                 Ok(Value::Number(id as f64))
             }
             "vec_push" => {

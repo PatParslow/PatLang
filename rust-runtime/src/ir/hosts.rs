@@ -142,8 +142,21 @@ fn arg_usize(args: &[Value], i: usize, what: &str) -> Result<usize, String> {
     }
 }
 
-pub fn host_vec_new(_args: &[Value]) -> Result<Value, String> {
-    let id = VECS.with(|v| { let mut b = v.borrow_mut(); b.push(Vec::new()); b.len() - 1 });
+pub fn host_vec_new(args: &[Value]) -> Result<Value, String> {
+    // Optional capacity hint (vec_new() still works, defaulting to 0/
+    // Vec::new()): pre-reserves the backing Vec's storage up front via
+    // Vec::with_capacity, so a caller who knows the eventual size (e.g.
+    // width*height tiles) avoids the O(log n) sequence of reallocate-
+    // and-copy cycles Vec::new()+repeated push would otherwise pay while
+    // growing. Correctness is identical either way -- push still grows
+    // past the hint automatically if needed -- this only ever changes
+    // real-world speed, never behavior, so no new capability exists to
+    // gate/validate here beyond the number being non-negative.
+    let capacity = match args.get(0) {
+        Some(v) => v.as_number().ok().map(|n| n.max(0.0) as usize).unwrap_or(0),
+        None => 0,
+    };
+    let id = VECS.with(|v| { let mut b = v.borrow_mut(); b.push(Vec::with_capacity(capacity)); b.len() - 1 });
     Ok(Value::Int(id as i64))
 }
 
