@@ -45,29 +45,55 @@ impl Interpreter {
     fn run_function(&self, program: &Program, func: &Function, args: &[Value]) -> Result<Value, String> {
         let mut pc: usize = 0;
         let mut stack: Vec<Value> = Vec::new();
-        let mut locals: HashMap<String, Value> = HashMap::new();
-        // Bind parameters as locals if present
+
+        // Slot table, precomputed ONCE per call (not once per instruction):
+        // every distinct local name referenced by this function (params
+        // plus every LoadLocal/StoreLocal target in the body) gets a fixed
+        // integer slot, and `locals` becomes a plain Vec<Value> indexed by
+        // that slot instead of a HashMap<String,Value> re-hashed on every
+        // single read/write. Real, measured bottleneck this fixes: a bare
+        // loop with NO arithmetic at all (`while i < N do let i = i + 1
+        // end`) cost ~240ns/iteration natively compiled -- confirmed via
+        // fantgame's PHASE0_SPIKE_RESULTS.md (a Ruby-to-PatLang port
+        // reporting ~21x slower than Ruby, originally misattributed to the
+        // numeric tower) that the dominant cost was this per-name hashmap
+        // lookup, uniform across int/float workloads. Function.locals:
+        // Vec<String> exists but is never populated by lowering.rs, so
+        // this resolves names fresh per call rather than relying on it --
+        // still a strict win (one linear pass over the body vs. rehashing
+        // a string on every one of potentially millions of iterations).
+        let mut slot_of: HashMap<&str, usize> = HashMap::new();
+        for name in &func.params {
+            let next = slot_of.len();
+            slot_of.entry(name.as_str()).or_insert(next);
+        }
+        for instr in &func.body {
+            match instr {
+                Instr::LoadLocal(name) | Instr::StoreLocal(name) => {
+                    let next = slot_of.len();
+                    slot_of.entry(name.as_str()).or_insert(next);
+                }
+                _ => {}
+            }
+        }
+        let resolved: Vec<usize> = func.body.iter().map(|instr| match instr {
+            Instr::LoadLocal(name) | Instr::StoreLocal(name) => slot_of[name.as_str()],
+            _ => usize::MAX, // never read for any other instruction kind
+        }).collect();
+        let mut locals: Vec<Value> = vec![Value::Unit; slot_of.len()];
         for (i, name) in func.params.iter().enumerate() {
-            if let Some(v) = args.get(i) { locals.insert(name.clone(), v.clone()); }
+            if let Some(v) = args.get(i) { locals[slot_of[name.as_str()]] = v.clone(); }
         }
 
         while pc < func.body.len() {
             match &func.body[pc] {
                 Instr::Const(v) => stack.push(v.clone()),
-                Instr::LoadLocal(name) => {
-                    let v = locals.get(name).cloned().unwrap_or(Value::Unit);
-                    stack.push(v);
+                Instr::LoadLocal(_) => {
+                    stack.push(locals[resolved[pc]].clone());
                 }
-                Instr::StoreLocal(name) => {
+                Instr::StoreLocal(_) => {
                     let v = stack.pop().ok_or("stack underflow")?;
-                    // Reassigning an already-declared local (the common case
-                    // in any loop) needs no new key -- get_mut avoids the
-                    // String allocation `name.clone()` would otherwise pay
-                    // on every single store, not just the first declaration.
-                    match locals.get_mut(name) {
-                        Some(slot) => *slot = v,
-                        None => { locals.insert(name.clone(), v); }
-                    }
+                    locals[resolved[pc]] = v;
                 }
                 Instr::UnOp(kind) => {
                     let a = stack.pop().ok_or("stack underflow")?;

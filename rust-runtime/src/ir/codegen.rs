@@ -1037,14 +1037,29 @@ mod fibers {
 fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Value,String> {
     let mut pc: usize = 0;
     let mut stack: Vec<Value> = Vec::new();
-    let mut locals: HashMap<String, Value> = HashMap::new();
-    // bind params
-    for (i, p) in func.params.iter().enumerate() { if let Some(v) = args.get(i) { locals.insert(p.clone(), v.clone()); } }
+    // Slot table, precomputed ONCE per call rather than re-hashing a
+    // variable's name string on every single LoadLocal/StoreLocal -- see
+    // the matching fix + full explanation in ir/interpreter.rs's
+    // run_function (mirrored here byte-for-byte in spirit, since this is
+    // the compiled-program embedded VM's own copy of the same loop).
+    let mut slot_of: HashMap<&str, usize> = HashMap::new();
+    for p in &func.params { let next = slot_of.len(); slot_of.entry(p.as_str()).or_insert(next); }
+    for instr in &func.body {
+        if let Instr::LoadLocal(n) | Instr::StoreLocal(n) = instr {
+            let next = slot_of.len(); slot_of.entry(n.as_str()).or_insert(next);
+        }
+    }
+    let resolved: Vec<usize> = func.body.iter().map(|instr| match instr {
+        Instr::LoadLocal(n) | Instr::StoreLocal(n) => slot_of[n.as_str()],
+        _ => usize::MAX,
+    }).collect();
+    let mut locals: Vec<Value> = vec![Value::Unit; slot_of.len()];
+    for (i, p) in func.params.iter().enumerate() { if let Some(v) = args.get(i) { locals[slot_of[p.as_str()]] = v.clone(); } }
     while pc < func.body.len() {
         match &func.body[pc] {
             Instr::Const(v) => stack.push(v.clone()),
-            Instr::LoadLocal(n) => stack.push(locals.get(n).cloned().unwrap_or(Value::Unit)),
-            Instr::StoreLocal(n) => { let v = stack.pop().ok_or("stack underflow")?; match locals.get_mut(n) { Some(slot) => *slot = v, None => { locals.insert(n.clone(), v); } } },
+            Instr::LoadLocal(_) => stack.push(locals[resolved[pc]].clone()),
+            Instr::StoreLocal(_) => { let v = stack.pop().ok_or("stack underflow")?; locals[resolved[pc]] = v; },
             Instr::UnOp(k) => {
                 let a = stack.pop().ok_or("stack underflow")?;
                 let r = match k { UnOpKind::Neg => neg(&a)?, UnOpKind::Not => Value::Bool(!a.as_bool()?), UnOpKind::BitNot => bitnot(&a)? };
@@ -2060,6 +2075,12 @@ fn mul(a:&Value,b:&Value)->Result<Value,String>{
     }
 }
 fn div(a:&Value,b:&Value)->Result<Value,String>{
+    // Fast path, mirroring add/sub/mul above: Float/Float is the overwhelming
+    // common case (no exact-Rational promotion possible or wanted for it
+    // anyway), so skip the NumT conversion + promote_pair machinery for it.
+    // Missing here was a real, measured gap (see fantgame's PHASE0_SPIKE_
+    // RESULTS.md, a ~12-21x slowdown on plain float arithmetic loops).
+    if let (Value::Float(x), Value::Float(y)) = (a, b) { return Ok(Value::Float(x / y)); }
     if matches!(a, Value::Complex(_)) || matches!(b, Value::Complex(_)) {
         return Ok(nt_normalize_complex(nt_to_complex(a)?.div(&nt_to_complex(b)?)));
     }
