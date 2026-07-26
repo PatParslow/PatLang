@@ -259,6 +259,7 @@ impl RustCodegen {
 
 use std::collections::HashMap;
 use std::cell::RefCell;
+use std::rc::Rc;
 // Arc is needed unconditionally -- Value::List(Arc<Vec<Value>>) is the
 // same on every target -- while Condvar/Mutex/OnceLock/the atomics below
 // are only meaningful when real threading exists (gated out for plain
@@ -792,7 +793,8 @@ struct Program { functions: HashMap<String, Function>, entry: String }
 
 fn run(program: &Program) -> Result<Value,String> {
     let entry = program.functions.get(&program.entry).ok_or("entry not found")?;
-    run_function(program, entry, &[])
+    let cache = PrecomputeCache::default();
+    run_function(program, entry, &[], &cache)
 }
 
 // Fibers: Ruby-style cooperative green threads on top of real OS threads,
@@ -807,7 +809,7 @@ fn run(program: &Program) -> Result<Value,String> {
 // hence gating on target_feature = "atomics" rather than target_arch.
 #[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
 mod fibers {
-    use super::{Program, Value, run_function};
+    use super::{Program, Value, run_function, PrecomputeCache};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -896,7 +898,11 @@ mod fibers {
                 st.to_fiber.take().unwrap()
             };
             let callee = program_owned.functions.get(&func_name).unwrap().clone();
-            let result = run_function(&program_owned, &callee, &[first_arg]);
+            // Fresh cache: this is its own thread with its own cloned
+            // Program, a genuine call-tree root distinct from whatever
+            // spawned it -- never shares a cache across threads.
+            let cache = PrecomputeCache::default();
+            let result = run_function(&program_owned, &callee, &[first_arg], &cache);
             let mut st = handle.state.lock().unwrap();
             st.alive = false;
             st.from_fiber = Some(FiberMsg::Done(result));
@@ -1034,32 +1040,60 @@ mod fibers {
     }
 }
 
-fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Value,String> {
+// Per-function precomputed dispatch info, cached ONCE PER FUNCTION (keyed by
+// the function's own stable address) rather than once per CALL -- see
+// ir/interpreter.rs's matching type for the full explanation, including why
+// an earlier once-per-CALL version of this was a measured regression for
+// fantgame's real ecosystem_bench.patlang (short-body, many-call functions
+// paying a fresh Vec-allocation-and-body-scan cost on every single call).
+// Safe to cache because a Function's body and the Program's function table
+// are both immutable after construction.
+pub struct FnPrecomputed<'p> {
+    resolved: Vec<usize>,
+    slot_count: usize,
+    // Instr::Call only -- Instr::CallValue's target is a dynamic
+    // Value::Closure read off the stack and is deliberately NOT cached here,
+    // since it can genuinely differ across calls from the same instruction.
+    resolved_call: Vec<Option<&'p Function>>,
+}
+pub type PrecomputeCache<'p> = RefCell<HashMap<usize, Rc<FnPrecomputed<'p>>>>;
+
+fn run_function<'p>(program: &'p Program, func: &'p Function, args: &[Value], cache: &PrecomputeCache<'p>) -> Result<Value,String> {
     let mut pc: usize = 0;
     let mut stack: Vec<Value> = Vec::new();
-    // Slot table, precomputed ONCE per call rather than re-hashing a
-    // variable's name string on every single LoadLocal/StoreLocal -- see
-    // the matching fix + full explanation in ir/interpreter.rs's
-    // run_function (mirrored here byte-for-byte in spirit, since this is
-    // the compiled-program embedded VM's own copy of the same loop).
-    let mut slot_of: HashMap<&str, usize> = HashMap::new();
-    for p in &func.params { let next = slot_of.len(); slot_of.entry(p.as_str()).or_insert(next); }
-    for instr in &func.body {
-        if let Instr::LoadLocal(n) | Instr::StoreLocal(n) = instr {
-            let next = slot_of.len(); slot_of.entry(n.as_str()).or_insert(next);
+    let key = func as *const Function as usize;
+    let existing = cache.borrow().get(&key).cloned();
+    let precomp = match existing {
+        Some(p) => p,
+        None => {
+            let mut slot_of: HashMap<&str, usize> = HashMap::new();
+            for p in &func.params { let next = slot_of.len(); slot_of.entry(p.as_str()).or_insert(next); }
+            for instr in &func.body {
+                if let Instr::LoadLocal(n) | Instr::StoreLocal(n) = instr {
+                    let next = slot_of.len(); slot_of.entry(n.as_str()).or_insert(next);
+                }
+            }
+            let resolved: Vec<usize> = func.body.iter().map(|instr| match instr {
+                Instr::LoadLocal(n) | Instr::StoreLocal(n) => slot_of[n.as_str()],
+                _ => usize::MAX,
+            }).collect();
+            let resolved_call: Vec<Option<&'p Function>> = func.body.iter().map(|instr| match instr {
+                Instr::Call(fname, _) => program.functions.get(fname),
+                _ => None,
+            }).collect();
+            let slot_count = slot_of.len();
+            let p = Rc::new(FnPrecomputed { resolved, slot_count, resolved_call });
+            cache.borrow_mut().insert(key, Rc::clone(&p));
+            p
         }
-    }
-    let resolved: Vec<usize> = func.body.iter().map(|instr| match instr {
-        Instr::LoadLocal(n) | Instr::StoreLocal(n) => slot_of[n.as_str()],
-        _ => usize::MAX,
-    }).collect();
-    let mut locals: Vec<Value> = vec![Value::Unit; slot_of.len()];
-    for (i, p) in func.params.iter().enumerate() { if let Some(v) = args.get(i) { locals[slot_of[p.as_str()]] = v.clone(); } }
+    };
+    let mut locals: Vec<Value> = vec![Value::Unit; precomp.slot_count];
+    for (i, v) in args.iter().enumerate().take(func.params.len()) { locals[i] = v.clone(); }
     while pc < func.body.len() {
         match &func.body[pc] {
             Instr::Const(v) => stack.push(v.clone()),
-            Instr::LoadLocal(_) => stack.push(locals[resolved[pc]].clone()),
-            Instr::StoreLocal(_) => { let v = stack.pop().ok_or("stack underflow")?; locals[resolved[pc]] = v; },
+            Instr::LoadLocal(_) => stack.push(locals[precomp.resolved[pc]].clone()),
+            Instr::StoreLocal(_) => { let v = stack.pop().ok_or("stack underflow")?; locals[precomp.resolved[pc]] = v; },
             Instr::UnOp(k) => {
                 let a = stack.pop().ok_or("stack underflow")?;
                 let r = match k { UnOpKind::Neg => neg(&a)?, UnOpKind::Not => Value::Bool(!a.as_bool()?), UnOpKind::BitNot => bitnot(&a)? };
@@ -1099,7 +1133,7 @@ fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Va
                         obj_set("__vars", "event_name", Value::String(ev.clone().into()));
                         obj_set("__vars", "event_data", payload.clone());
                         // Handlers are synthesized with parameters (event_name, event_data)
-                        last = run_function(program, callee, &[Value::String(ev.clone().into()), payload.clone()])?;
+                        last = run_function(program, callee, &[Value::String(ev.clone().into()), payload.clone()], cache)?;
                     }
                     // Real path: `when EVENT { ... }` source blocks now lower to
                     // a genuine closure, registered at RUNTIME via
@@ -1116,7 +1150,7 @@ fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Va
                                 full_args.push(Value::String(ev.clone().into()));
                                 full_args.push(payload.clone());
                                 let callee = program.functions.get(&func_name).ok_or_else(|| format!("function '{}' not found", func_name))?;
-                                last = run_function(program, callee, &full_args)?;
+                                last = run_function(program, callee, &full_args, cache)?;
                             }
                             other => return Err(format!("emit: registered event handler is not a closure: {:?}", other)),
                         }
@@ -1155,7 +1189,7 @@ fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Va
                         full_args.push(recv);
                         full_args.extend(args[2..].iter().cloned());
                         let callee = program.functions.get(&func_name).ok_or_else(|| format!("function '{}' not found", func_name))?;
-                        let ret = run_function(program, callee, &full_args)?;
+                        let ret = run_function(program, callee, &full_args, cache)?;
                         stack.push(ret);
                     } else {
                         let r = Host::call(n, &args)?;
@@ -1169,7 +1203,7 @@ fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Va
                     };
                     let callee = program.functions.get(&fname)
                         .ok_or_else(|| format!("apply: function '{}' not found", fname))?;
-                    let r = run_function(program, callee, &args[1..])?;
+                    let r = run_function(program, callee, &args[1..], cache)?;
                     stack.push(r);
                 } else if n == "parallel_map" {
                     // parallel_map(items, "func_name") -> list, computed
@@ -1198,7 +1232,13 @@ fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Va
                                 let fname = &fname;
                                 scope.spawn(move || {
                                     let callee = program.functions.get(fname).unwrap();
-                                    run_function(program, callee, std::slice::from_ref(item))
+                                    // Fresh cache per worker thread -- these
+                                    // threads share the SAME Program
+                                    // (borrowed via thread::scope), but each
+                                    // gets its own cache rather than trying
+                                    // to synchronize one across threads.
+                                    let cache = PrecomputeCache::default();
+                                    run_function(program, callee, std::slice::from_ref(item), &cache)
                                 })
                             }).collect();
                             handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("parallel_map: a worker thread panicked".to_string()))).collect()
@@ -1270,8 +1310,8 @@ fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Va
             Instr::Call(n, argc) => {
                 let argc = *argc; if stack.len() < argc { return Err("stack underflow".into()); }
                 let args_index = stack.len() - argc; let args: Vec<Value> = stack.drain(args_index..).collect();
-                let callee = program.functions.get(n).ok_or_else(|| format!("function '{}' not found", n))?;
-                let r = run_function(program, callee, &args)?; stack.push(r);
+                let callee = precomp.resolved_call[pc].ok_or_else(|| format!("function '{}' not found", n))?;
+                let r = run_function(program, callee, &args, cache)?; stack.push(r);
             }
             Instr::MakeClosure(func_name, captured_names) => {
                 let n = captured_names.len();
@@ -1291,7 +1331,7 @@ fn run_function(program: &Program, func: &Function, args: &[Value]) -> Result<Va
                         let mut full_args: Vec<Value> = captured.into_iter().map(|(_, v)| v).collect();
                         full_args.extend(call_args);
                         let callee = program.functions.get(&func_name).ok_or_else(|| format!("function '{}' not found", func_name))?;
-                        let r = run_function(program, callee, &full_args)?;
+                        let r = run_function(program, callee, &full_args, cache)?;
                         stack.push(r);
                     }
                     other => return Err(format!("cannot call non-closure value: {:?}", other)),
@@ -4843,7 +4883,8 @@ fn host_call_codegen_bootstrap_inner(name: &str, args: &[Value]) -> Result<Value
                     event_handlers_register(event, handler);
                 }
                 let f = program.functions.get(&program.entry).ok_or("run_ir: entry not found")?;
-                run_function(&program, f, &[])
+                let cache = PrecomputeCache::default();
+                run_function(&program, f, &[], &cache)
             }
                     _ => Err(format!("host fn '{}' not found", name)),
     }

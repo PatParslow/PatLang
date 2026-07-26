@@ -1,8 +1,52 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use super::types::*;
 use super::ops;
+
+// Per-function precomputed dispatch info, cached ONCE PER FUNCTION (keyed by
+// the function's own stable address) rather than once per CALL -- see
+// run_function's own doc comment for the full story of why a per-CALL
+// precompute (an earlier version of this fix) was actually a regression for
+// fantgame's real ecosystem_bench.patlang: functions with short bodies but
+// millions of calls (update_prey/update_predator/regen_vegetation) were
+// paying a fresh Vec-allocation-and-body-scan cost on every single call,
+// outweighing the hashing it replaced. Caching per function (safe because a
+// Function's body and the Program's function table are both immutable after
+// construction -- confirmed, nothing in this codebase ever mutates either
+// post-lowering, so a given function's slot/call-target resolution can never
+// change mid-run) means that cost is now paid at most once per DISTINCT
+// function, ever, not once per call.
+struct FnPrecomputed<'p> {
+    // Per-instruction resolved local-variable slot index (for LoadLocal/
+    // StoreLocal positions; usize::MAX/unused elsewhere). Parameter i always
+    // occupies slot i (guaranteed by construction order below), so binding
+    // args needs no separate lookup table.
+    resolved: Vec<usize>,
+    slot_count: usize,
+    // Per-instruction resolved callee (for Instr::Call positions only --
+    // deliberately NOT extended to Instr::CallValue, whose target is a
+    // dynamic Value::Closure read off the stack at runtime and can genuinely
+    // differ across calls from the very same instruction position; caching
+    // that would be a real correctness bug, not just a missed optimization).
+    resolved_call: Vec<Option<&'p Function>>,
+}
+
+// Keyed by the calling function's own address (stable for as long as the
+// Program that owns it isn't dropped) -- created FRESH at every genuine
+// call-tree root (Interpreter::run, Interpreter::call_function) and passed
+// down through every recursive run_function call within that SAME call
+// tree/thread, never shared across threads or across distinct Program
+// instances. This is what makes it safe with no synchronization at all:
+// each fiber gets its own freshly-cloned Program and would need its own
+// fresh cache at its own root (native compiled path only -- this
+// interpreter doesn't run fibers itself, see ir/fiber.rs); this
+// interpreter's own parallel_map (below) spawns real OS threads sharing
+// the SAME Program via std::thread::scope, so each worker closure creates
+// its own fresh cache too, rather than trying to share one across threads.
+type PrecomputeCache<'p> = RefCell<HashMap<usize, Rc<FnPrecomputed<'p>>>>;
 
 #[derive(Default)]
 pub struct HostFuncs {
@@ -28,7 +72,8 @@ impl Interpreter {
     pub fn run(&self, program: &Program) -> Result<Value, String> {
         let entry = program.functions.get(&program.entry)
             .ok_or_else(|| format!("entry function '{}' not found", program.entry))?;
-        self.run_function(program, entry, &[])
+        let cache = PrecomputeCache::default();
+        self.run_function(program, entry, &[], &cache)
     }
 
     /// Call an arbitrary named function in `program` with explicit argument
@@ -39,61 +84,79 @@ impl Interpreter {
     pub fn call_function(&self, program: &Program, name: &str, args: &[Value]) -> Result<Value, String> {
         let func = program.functions.get(name)
             .ok_or_else(|| format!("function '{}' not found", name))?;
-        self.run_function(program, func, args)
+        let cache = PrecomputeCache::default();
+        self.run_function(program, func, args, &cache)
     }
 
-    fn run_function(&self, program: &Program, func: &Function, args: &[Value]) -> Result<Value, String> {
+    fn run_function<'p>(&self, program: &'p Program, func: &'p Function, args: &[Value], cache: &PrecomputeCache<'p>) -> Result<Value, String> {
         let mut pc: usize = 0;
         let mut stack: Vec<Value> = Vec::new();
 
-        // Slot table, precomputed ONCE per call (not once per instruction):
-        // every distinct local name referenced by this function (params
-        // plus every LoadLocal/StoreLocal target in the body) gets a fixed
-        // integer slot, and `locals` becomes a plain Vec<Value> indexed by
-        // that slot instead of a HashMap<String,Value> re-hashed on every
-        // single read/write. Real, measured bottleneck this fixes: a bare
-        // loop with NO arithmetic at all (`while i < N do let i = i + 1
-        // end`) cost ~240ns/iteration natively compiled -- confirmed via
-        // fantgame's PHASE0_SPIKE_RESULTS.md (a Ruby-to-PatLang port
-        // reporting ~21x slower than Ruby, originally misattributed to the
-        // numeric tower) that the dominant cost was this per-name hashmap
-        // lookup, uniform across int/float workloads. Function.locals:
-        // Vec<String> exists but is never populated by lowering.rs, so
-        // this resolves names fresh per call rather than relying on it --
-        // still a strict win (one linear pass over the body vs. rehashing
-        // a string on every one of potentially millions of iterations).
-        let mut slot_of: HashMap<&str, usize> = HashMap::new();
-        for name in &func.params {
-            let next = slot_of.len();
-            slot_of.entry(name.as_str()).or_insert(next);
-        }
-        for instr in &func.body {
-            match instr {
-                Instr::LoadLocal(name) | Instr::StoreLocal(name) => {
+        // Precomputed dispatch table, cached ONCE PER FUNCTION (keyed by this
+        // function's own address) rather than rebuilt on every call -- see
+        // FnPrecomputed's doc comment above for the full story, including why
+        // an earlier once-per-CALL version of this was actually a measured
+        // regression for fantgame's real ecosystem_bench.patlang (short-body,
+        // many-call functions like update_prey/update_predator/
+        // regen_vegetation were paying a fresh Vec-allocation-and-body-scan
+        // cost on every one of their 1.6M+ calls). Safe to cache for the
+        // whole cache's lifetime because a Function's body and the Program's
+        // function table are both immutable after construction -- nothing in
+        // this codebase mutates either post-lowering, so this can never go
+        // stale mid-run.
+        let key = func as *const Function as usize;
+        let existing = cache.borrow().get(&key).cloned();
+        let precomp = match existing {
+            Some(p) => p,
+            None => {
+                let mut slot_of: HashMap<&str, usize> = HashMap::new();
+                for name in &func.params {
                     let next = slot_of.len();
                     slot_of.entry(name.as_str()).or_insert(next);
                 }
-                _ => {}
+                for instr in &func.body {
+                    if let Instr::LoadLocal(name) | Instr::StoreLocal(name) = instr {
+                        let next = slot_of.len();
+                        slot_of.entry(name.as_str()).or_insert(next);
+                    }
+                }
+                let resolved: Vec<usize> = func.body.iter().map(|instr| match instr {
+                    Instr::LoadLocal(name) | Instr::StoreLocal(name) => slot_of[name.as_str()],
+                    _ => usize::MAX,
+                }).collect();
+                // Instr::Call's target name is fixed at lowering time, so
+                // it always resolves to the same function -- safe to cache.
+                // Instr::CallValue is deliberately NOT precomputed here (see
+                // FnPrecomputed's doc comment): its target is a dynamic
+                // Value::Closure read off the stack, which genuinely can
+                // differ across calls from the same instruction position.
+                let resolved_call: Vec<Option<&'p Function>> = func.body.iter().map(|instr| match instr {
+                    Instr::Call(fname, _) => program.functions.get(fname),
+                    _ => None,
+                }).collect();
+                let slot_count = slot_of.len();
+                let p = Rc::new(FnPrecomputed { resolved, slot_count, resolved_call });
+                cache.borrow_mut().insert(key, Rc::clone(&p));
+                p
             }
-        }
-        let resolved: Vec<usize> = func.body.iter().map(|instr| match instr {
-            Instr::LoadLocal(name) | Instr::StoreLocal(name) => slot_of[name.as_str()],
-            _ => usize::MAX, // never read for any other instruction kind
-        }).collect();
-        let mut locals: Vec<Value> = vec![Value::Unit; slot_of.len()];
-        for (i, name) in func.params.iter().enumerate() {
-            if let Some(v) = args.get(i) { locals[slot_of[name.as_str()]] = v.clone(); }
+        };
+        // Parameter i always occupies slot i, guaranteed by the slot-
+        // assignment order above (params inserted first, in order) --
+        // no separate name->slot lookup needed to bind args.
+        let mut locals: Vec<Value> = vec![Value::Unit; precomp.slot_count];
+        for (i, v) in args.iter().enumerate().take(func.params.len()) {
+            locals[i] = v.clone();
         }
 
         while pc < func.body.len() {
             match &func.body[pc] {
                 Instr::Const(v) => stack.push(v.clone()),
                 Instr::LoadLocal(_) => {
-                    stack.push(locals[resolved[pc]].clone());
+                    stack.push(locals[precomp.resolved[pc]].clone());
                 }
                 Instr::StoreLocal(_) => {
                     let v = stack.pop().ok_or("stack underflow")?;
-                    locals[resolved[pc]] = v;
+                    locals[precomp.resolved[pc]] = v;
                 }
                 Instr::UnOp(kind) => {
                     let a = stack.pop().ok_or("stack underflow")?;
@@ -150,7 +213,7 @@ impl Interpreter {
                             for h in handlers {
                                 let callee = program.functions.get(h).ok_or_else(|| format!("function '{}' not found", h))?;
                                 // Handlers take (event_name, event_data)
-                                last = self.run_function(program, callee, &[Value::String(ev.clone()), payload.clone()])?;
+                                last = self.run_function(program, callee, &[Value::String(ev.clone()), payload.clone()], cache)?;
                             }
                         }
                         // Real path: `when EVENT { ... }` source blocks now lower
@@ -170,7 +233,7 @@ impl Interpreter {
                                     full_args.push(payload.clone());
                                     let callee = program.functions.get(&func_name)
                                         .ok_or_else(|| format!("function '{}' not found", func_name))?;
-                                    last = self.run_function(program, callee, &full_args)?;
+                                    last = self.run_function(program, callee, &full_args, cache)?;
                                 }
                                 other => return Err(format!("emit: registered event handler is not a closure: {:?}", other)),
                             }
@@ -205,7 +268,7 @@ impl Interpreter {
                             full_args.push(recv);
                             full_args.extend(args[2..].iter().cloned());
                             let callee = program.functions.get(&func_name).ok_or_else(|| format!("function '{}' not found", func_name))?;
-                            let ret = self.run_function(program, callee, &full_args)?;
+                            let ret = self.run_function(program, callee, &full_args, cache)?;
                             stack.push(ret);
                         } else {
                             let f = self.host.get(name).ok_or_else(|| format!("host fn '{}' not found", name))?;
@@ -221,7 +284,7 @@ impl Interpreter {
                         };
                         let callee = program.functions.get(fname.as_str())
                             .ok_or_else(|| format!("apply: function '{}' not found", fname))?;
-                        let ret = self.run_function(program, callee, &args[1..])?;
+                        let ret = self.run_function(program, callee, &args[1..], cache)?;
                         stack.push(ret);
                     } else if name == "parallel_map" {
                         // parallel_map(items, "func_name") -> list of
@@ -300,8 +363,8 @@ impl Interpreter {
                     if stack.len() < argc { return Err("stack underflow".into()); }
                     let args_index = stack.len() - argc;
                     let argsv: Vec<Value> = stack.drain(args_index..).collect();
-                    let callee = program.functions.get(fname).ok_or_else(|| format!("function '{}' not found", fname))?;
-                    let ret = self.run_function(program, callee, &argsv)?;
+                    let callee = precomp.resolved_call[pc].ok_or_else(|| format!("function '{}' not found", fname))?;
+                    let ret = self.run_function(program, callee, &argsv, cache)?;
                     stack.push(ret);
                 }
                 Instr::MakeClosure(func_name, captured_names) => {
@@ -324,7 +387,7 @@ impl Interpreter {
                             full_args.extend(call_args);
                             let callee = program.functions.get(&func_name)
                                 .ok_or_else(|| format!("function '{}' not found", func_name))?;
-                            let ret = self.run_function(program, callee, &full_args)?;
+                            let ret = self.run_function(program, callee, &full_args, cache)?;
                             stack.push(ret);
                         }
                         other => return Err(format!("cannot call non-closure value: {:?}", other)),

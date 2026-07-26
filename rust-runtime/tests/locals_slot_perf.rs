@@ -1,17 +1,32 @@
-//! Regression safety net for the locals-storage optimization: replacing
-//! run_function's per-instruction HashMap<String,Value> local-variable
-//! lookup with a slot table precomputed once per call (Vec<Value>
-//! indexed by a resolved slot number instead of re-hashing the variable's
-//! name string on every single LoadLocal/StoreLocal). Written and
-//! confirmed passing BEFORE that refactor (establishing a correctness
-//! baseline under the old HashMap-based implementation), then re-run
-//! after the refactor to confirm no regression -- see
-//! patlang-fantgame-perf-root-cause-found memory / PHASE0_SPIKE_RESULTS.md
-//! for the real workload (fantgame's Ruby-to-PatLang port) that motivated
-//! this: a bare loop with zero arithmetic cost ~240ns/iteration natively
-//! compiled, traced to per-name HashMap lookups dominating cost uniformly
-//! across int/float workloads (not the numeric tower, as first
-//! hypothesized).
+//! Regression safety net for the locals/call-target precomputation
+//! optimization: run_function's per-instruction HashMap<String,Value>
+//! local-variable lookup (and, separately, program.functions.get(name)
+//! per Instr::Call) replaced with a per-FUNCTION cached dispatch table
+//! (Vec<Value> locals indexed by a resolved slot number; resolved callee
+//! references for Call sites), computed once per distinct function ever
+//! called rather than once per call or once per instruction.
+//!
+//! History, for anyone touching this again: a first version precomputed
+//! this table once per CALL rather than once per function. That fixed a
+//! pure-loop microbenchmark (~30% faster) but was a measured REGRESSION
+//! on fantgame's real ecosystem_bench.patlang (24.77s -> 26.58s locals-
+//! only -> 29-31s once Call was added too) -- functions with short bodies
+//! called millions of times (update_prey/update_predator/regen_vegetation)
+//! paid a fresh Vec-allocation-and-body-scan cost on every single call,
+//! outweighing the hashing it replaced. The per-FUNCTION cache here (keyed
+//! by the function's own stable address, safe because a Function's body
+//! and the Program's function table are both immutable after construction)
+//! fixes that: the real ecosystem_bench.patlang benchmark went from
+//! 24.77s to ~11.4-12.4s, roughly 2x, with the checksum unchanged. See
+//! patlang-call-fix-regression-found / patlang-locals-percall-fix-superseded
+//! memory entries and PHASE0_SPIKE_RESULTS.md for the full story, including
+//! the earlier, wrong hypothesis (the numeric tower) this eventually
+//! disproved.
+//!
+//! Tests below were written and confirmed passing BEFORE the per-function
+//! refactor (baseline, under the per-call and, before that, the original
+//! HashMap implementation), then re-confirmed passing after -- correctness
+//! never regressed even though an earlier PERFORMANCE attempt did.
 
 use patlang_runtime::parser::Parser;
 use patlang_runtime::ir::{Interpreter, Lowerer, Value};
@@ -91,6 +106,28 @@ fn closure_capture_ordering_survives_slot_resolution() {
         "let a = 100\nlet b = 7\nlet make_it = || do\n  return a - b\nend\nprint(make_it())\n"
     );
     assert_eq!(out, vec!["93"]);
+}
+
+#[test]
+fn hot_loop_calling_several_named_functions_repeatedly() {
+    // Same bug shape as Instr::LoadLocal/StoreLocal, but for Instr::Call:
+    // program.functions.get(fname) re-hashes the CALLEE's name on every
+    // single call. A loop that calls several different user-defined
+    // functions many times (the exact shape of fantgame's
+    // ecosystem_bench.patlang, which calls update_prey/update_predator/
+    // regen_vegetation once per tile-day, each themselves calling
+    // max2/min2 repeatedly, from inside ONE outer run_benchmark loop)
+    // exercises this directly. Correctness-focused: verifies repeated
+    // calls to several different functions from the same loop body,
+    // including one calling another, produce the right accumulated
+    // result -- guards against any slot/resolution mixup a per-call-site
+    // Call-target cache could introduce.
+    let out = run_capture(
+        "make a function called sq takes x returns r\n  return x * x\nend\nmake a function called combine takes a, b returns r\n  return sq(a) + sq(b)\nend\nlet total = 0\nlet i = 0\nwhile i < 1000 do\n  let total = total + combine(i, i + 1)\n  let i = i + 1\nend\nprint(total)\n"
+    );
+    // sum over i=0..999 of (i^2 + (i+1)^2)
+    let expected: i64 = (0..1000i64).map(|i| i*i + (i+1)*(i+1)).sum();
+    assert_eq!(out, vec![expected.to_string()]);
 }
 
 #[test]
