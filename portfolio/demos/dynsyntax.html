@@ -28,7 +28,7 @@ make a function called is_op_code takes c returns r
     if (c == 61) or (c == 60) or (c == 62) or (c == 33) then
       return true
     else
-      if (c == 40) or (c == 41) or (c == 91) or (c == 93) or (c == 44) or (c == 46) or (c == 124) or (c == 123) or (c == 125) or (c == 58) then
+      if (c == 40) or (c == 41) or (c == 91) or (c == 93) or (c == 44) or (c == 46) or (c == 124) or (c == 123) or (c == 125) or (c == 58) or (c == 59) then
         return true
       else
         return false
@@ -59,43 +59,59 @@ make a function called tokenize takes src returns tokens
           end
         else
           if is_digit_code(c) then
-            let txt = &quot;&quot;
+            # sb_new/sb_push/sb_str, NOT `txt = txt + ...` -- string
+            # concatenation in a loop copies the whole accumulated string
+            # on every append (PatLang strings are immutable), turning an
+            # O(n) scan into O(n^2). Numbers/identifiers are usually
+            # short so this rarely mattered in practice, but STRING
+            # literals (the branch below) can be arbitrarily long --
+            # self_hosting/lib/runtime_rs.patlang embeds large chunks of
+            # literal Rust source as single PatLang string literals,
+            # tens of thousands of characters each -- so this loop is a
+            # real, not just theoretical, O(n^2) risk on every compile
+            # that includes that file. Found via a new compiler warning
+            # (ir/lowering.rs) added specifically to catch this shape,
+            # while investigating an unrelated 30+-minute self-compile
+            # regression in a different file (self_hosting/lib/
+            # syntax_dsl.patlang) that turned out to have the identical
+            # anti-pattern.
+            let txt_b = sb_new()
             let dots = 0
             let scanning = true
             while (i &lt; n) and scanning do
               let d = sc_code(h, i)
               if is_digit_code(d) then
-                let txt = txt + sc_char(h, i)
+                sb_push(txt_b, sc_char(h, i))
                 let i = i + 1
               else
                 if (d == 46) and (dots == 0) then
                   let dots = 1
-                  let txt = txt + sc_char(h, i)
+                  sb_push(txt_b, sc_char(h, i))
                   let i = i + 1
                 else
                   let scanning = false
                 end
               end
             end
-            vec_push(tokens, [&quot;NUM&quot;, txt, line])
+            vec_push(tokens, [&quot;NUM&quot;, sb_str(txt_b), line])
           else
             if is_alpha_code(c) then
-              let txt = &quot;&quot;
+              let txt_b = sb_new()
               let scanning = true
               while (i &lt; n) and scanning do
                 let d = sc_code(h, i)
                 if is_alpha_code(d) or is_digit_code(d) then
-                  let txt = txt + sc_char(h, i)
+                  sb_push(txt_b, sc_char(h, i))
                   let i = i + 1
                 else
                   let scanning = false
                 end
               end
-              vec_push(tokens, [&quot;IDENT&quot;, txt, line])
+              vec_push(tokens, [&quot;IDENT&quot;, sb_str(txt_b), line])
             else
               if c == 34 then
                 let i = i + 1
-                let txt = &quot;&quot;
+                let txt_b = sb_new()
                 let scanning = true
                 while (i &lt; n) and scanning do
                   let d = sc_code(h, i)
@@ -107,26 +123,26 @@ make a function called tokenize takes src returns tokens
                       # escape sequences: n t r quote backslash (unknown kept raw)
                       let e = sc_code(h, i + 1)
                       if e == 110 then
-                        let txt = txt + chr(10)
+                        sb_push(txt_b, chr(10))
                         let i = i + 2
                       else
                         if e == 116 then
-                          let txt = txt + chr(9)
+                          sb_push(txt_b, chr(9))
                           let i = i + 2
                         else
                           if e == 114 then
-                            let txt = txt + chr(13)
+                            sb_push(txt_b, chr(13))
                             let i = i + 2
                           else
                             if e == 34 then
-                              let txt = txt + chr(34)
+                              sb_push(txt_b, chr(34))
                               let i = i + 2
                             else
                               if e == 92 then
-                                let txt = txt + chr(92)
+                                sb_push(txt_b, chr(92))
                                 let i = i + 2
                               else
-                                let txt = txt + sc_char(h, i)
+                                sb_push(txt_b, sc_char(h, i))
                                 let i = i + 1
                               end
                             end
@@ -134,12 +150,12 @@ make a function called tokenize takes src returns tokens
                         end
                       end
                     else
-                      let txt = txt + sc_char(h, i)
+                      sb_push(txt_b, sc_char(h, i))
                       let i = i + 1
                     end
                   end
                 end
-                vec_push(tokens, [&quot;STR&quot;, txt, line])
+                vec_push(tokens, [&quot;STR&quot;, sb_str(txt_b), line])
               else
                 if is_op_code(c) then
                   let txt = sc_char(h, i)
@@ -216,6 +232,12 @@ make a function called tok_is takes t, ty, tx returns r
 end
 
 make a function called skip_nl takes toks, pos returns p
+  # Skips newlines AND a bare ';' -- native parser.rs treats Semicolon as
+  # a fully optional statement separator right alongside Newline (never
+  # required; see its &quot;while matches!(self.curr, Token::Semicolon |
+  # Token::Newline | ...)&quot; loop), so this self-hosted mirror needs to
+  # tolerate the same already-existing, already-optional token, not
+  # introduce any new requirement into the grammar.
   let p = pos
   let looping = true
   while looping do
@@ -223,7 +245,11 @@ make a function called skip_nl takes toks, pos returns p
     if t[0] == &quot;NL&quot; then
       let p = p + 1
     else
-      let looping = false
+      if tok_is(t, &quot;OP&quot;, &quot;;&quot;) then
+        let p = p + 1
+      else
+        let looping = false
+      end
     end
   end
   return p
@@ -489,7 +515,25 @@ make a function called parse_postfix takes toks, pos returns r
           let looping = false
         end
       else
-        let looping = false
+        # obj.method(args) -- a call whose callee is a Member expression,
+        # e.g. AST.RegisterRoute(...) (the RouterDSL example's own return
+        # template). The existing &quot;Call&quot; AST shape (used for bare
+        # NAME(args)) always treats its callee as a plain STRING, resolved
+        # by name against known functions/locals in lower.patlang -- there
+        # was no way to compose a Call around an arbitrary expression the
+        # way native parser.rs's Expr::Call{function: Box&lt;Expr&gt;, args}
+        # does. A dedicated MethodCall node (object expr + method name +
+        # args) sidesteps that rather than overloading &quot;Call&quot;'s callee
+        # slot with two different shapes; lower.patlang routes it to
+        # send(object, &quot;method&quot;, ...args), the same host call obj.prop =
+        # value already uses on the write side.
+        if (node[0] == &quot;Member&quot;) and tok_is(t, &quot;OP&quot;, &quot;(&quot;) then
+          let a = parse_args(toks, p + 1)
+          let node = [&quot;MethodCall&quot;, node[1], node[2], a[0]]
+          let p = a[1]
+        else
+          let looping = false
+        end
       end
     end
   end
@@ -829,7 +873,7 @@ make a function called parse_while takes toks, pos returns r
   let cond = c[0]
   let p = c[1]
   let t = vec_get(toks, p)
-  if tok_is(t, &quot;IDENT&quot;, &quot;do&quot;) then
+  if tok_is(t, &quot;IDENT&quot;, &quot;do&quot;) or tok_is(t, &quot;IDENT&quot;, &quot;begin&quot;) then
     let body = parse_stmts_until(toks, p + 1)
     let p2 = body[1]
     let t2 = vec_get(toks, p2)
@@ -1029,7 +1073,7 @@ make a function called parse_when takes toks, pos returns r
   if nameTok[0] == &quot;IDENT&quot; then
     let ev = nameTok[1]
     let p = pos + 2
-    if tok_is(vec_get(toks, p), &quot;IDENT&quot;, &quot;do&quot;) then
+    if tok_is(vec_get(toks, p), &quot;IDENT&quot;, &quot;do&quot;) or tok_is(vec_get(toks, p), &quot;IDENT&quot;, &quot;begin&quot;) then
       let body = parse_stmts_until(toks, p + 1)
       let p2 = body[1]
       if tok_is(vec_get(toks, p2), &quot;IDENT&quot;, &quot;end&quot;) then
@@ -1155,6 +1199,116 @@ make a function called parse_goal_decl takes toks, pos returns r
   end
 end
 
+# Slice 1+2+3 of the classes/traits/inheritance feature (see the
+# &quot;synchronous-questing-metcalfe&quot; plan) -- mirrors native parser.rs's
+# Token::Class handling exactly. pos points at the class's name (the
+# 'class' keyword itself already consumed by the caller). Returns
+# [[&quot;ClassDecl&quot;, name, parent_or_empty_string, fields, methods, traits],
+# next_pos] where fields is [[field_name, default_expr_node], ...],
+# methods (Slice 2) is [[method_name, params, body], ...] -- a method is
+# just an ordinary `make a function called NAME ... end`/`{ }` body
+# declared inside the class block, reusing parse_function_def exactly --
+# and traits (Slice 3) is [trait_name, ...] from a `traits A, B` line.
+make a function called parse_class_decl takes toks, pos returns r
+  let nameTok = vec_get(toks, pos)
+  let name = nameTok[1]
+  let p = pos + 1
+  let parent = &quot;&quot;
+  let nt = vec_get(toks, p)
+  if (nt[0] == &quot;IDENT&quot;) and (nt[1] == &quot;inherits&quot;) then
+    let p = p + 1
+    let parentTok = vec_get(toks, p)
+    if parentTok[0] != &quot;IDENT&quot; then
+      return [[&quot;Err&quot;, &quot;expected parent class name after 'inherits'&quot;, parentTok[2]], p]
+    else
+      let parent = parentTok[1]
+      let p = p + 1
+    end
+  end
+  let openTok = vec_get(toks, p)
+  # Slice 5: `{ ... }` or `do ... end` (`begin` accepted as a synonym for
+  # `do`, matching every other dual-form block in this parser -- see
+  # parse_while/parse_when above). `word_form` remembers which delimiter
+  # opened the block so the loop below knows whether to stop at `}` or at
+  # the word `end`.
+  if (tok_is(openTok, &quot;OP&quot;, &quot;{&quot;) == false) and (tok_is(openTok, &quot;IDENT&quot;, &quot;do&quot;) == false) and (tok_is(openTok, &quot;IDENT&quot;, &quot;begin&quot;) == false) then
+    return [[&quot;Err&quot;, &quot;expected '{' or 'do'/'begin' after class header&quot;, openTok[2]], p]
+  else
+    let word_form = tok_is(openTok, &quot;OP&quot;, &quot;{&quot;) == false
+    let p = skip_nl(toks, p + 1)
+    let fields = []
+    let methods = []
+    let traits = []
+    let looping = true
+    while looping do
+      let t = vec_get(toks, p)
+      let at_block_end = false
+      if word_form then
+        if tok_is(t, &quot;IDENT&quot;, &quot;end&quot;) then
+          let at_block_end = true
+        end
+      else
+        if tok_is(t, &quot;OP&quot;, &quot;}&quot;) then
+          let at_block_end = true
+        end
+      end
+      if at_block_end then
+        let looping = false
+      else
+        if (t[0] == &quot;IDENT&quot;) and (t[1] == &quot;traits&quot;) then
+          let p = p + 1
+          let tlooping = true
+          while tlooping do
+            let tt = vec_get(toks, p)
+            if tt[0] != &quot;IDENT&quot; then
+              return [[&quot;Err&quot;, &quot;expected trait name&quot;, tt[2]], p]
+            else
+              let traits = list_push(traits, tt[1])
+              let p = p + 1
+              if tok_is(vec_get(toks, p), &quot;OP&quot;, &quot;,&quot;) then
+                let p = p + 1
+              else
+                let tlooping = false
+              end
+            end
+          end
+          let p = skip_nl(toks, p)
+        else
+        if (t[0] == &quot;IDENT&quot;) and (t[1] == &quot;field&quot;) then
+          let fnameTok = vec_get(toks, p + 1)
+          if fnameTok[0] != &quot;IDENT&quot; then
+            return [[&quot;Err&quot;, &quot;expected field name after 'field'&quot;, fnameTok[2]], p + 1]
+          else
+            let eqTok = vec_get(toks, p + 2)
+            if tok_is(eqTok, &quot;OP&quot;, &quot;=&quot;) == false then
+              return [[&quot;Err&quot;, &quot;expected '=' after field name&quot;, eqTok[2]], p + 2]
+            else
+              let e = parse_expr(toks, p + 3)
+              let fields = list_push(fields, [fnameTok[1], e[0]])
+              let p = skip_nl(toks, e[1])
+            end
+          end
+        else
+          if (t[0] == &quot;IDENT&quot;) and (t[1] == &quot;make&quot;) then
+            let fr = parse_function_def(toks, p)
+            let fnode = fr[0]
+            if fnode[0] == &quot;Err&quot; then
+              return [fnode, fr[1]]
+            else
+              let methods = list_push(methods, [fnode[1], fnode[2], fnode[3]])
+              let p = skip_nl(toks, fr[1])
+            end
+          else
+            return [[&quot;Err&quot;, &quot;expected 'field NAME = EXPR', 'make a function called NAME ... end', or 'traits A, B' inside a class block&quot;, t[2]], p]
+          end
+        end
+        end
+      end
+    end
+    return [[&quot;ClassDecl&quot;, name, parent, fields, methods, traits], p + 1]
+  end
+end
+
 make a function called parse_stmt takes toks, pos returns r
   let t = vec_get(toks, pos)
   let ty = t[0]
@@ -1225,6 +1379,14 @@ make a function called parse_stmt takes toks, pos returns r
                   # mirroring native parser.rs's Token::Goal branch exactly.
                   return parse_goal_decl(toks, pos + 1)
                 else
+                if (tx == &quot;class&quot;) and (tok_is(vec_get(toks, pos + 1), &quot;OP&quot;, &quot;(&quot;) == false) then
+                  # Slice 1 of the classes/traits/inheritance feature (see
+                  # the &quot;synchronous-questing-metcalfe&quot; plan): `class NAME
+                  # [inherits PARENT] { field NAME = EXPR ... }`,
+                  # mirroring native parser.rs's Token::Class branch
+                  # exactly.
+                  return parse_class_decl(toks, pos + 1)
+                else
                 if (tx == &quot;pursue&quot;) or (tx == &quot;activate&quot;) then
                   # Both are expressions (see parse_primary), routed through
                   # parse_expr/parse_primary at the statement level too --
@@ -1242,33 +1404,44 @@ make a function called parse_stmt takes toks, pos returns r
                   let e = parse_expr(toks, pos)
                   return [[&quot;Expr&quot;, e[0]], e[1]]
                 else
-                # bare identifier statement: call NAME(args), bare
-                # reassignment NAME = value, or member assignment
-                # obj.prop = value.
-                let nx = vec_get(toks, pos + 1)
-                if tok_is(nx, &quot;OP&quot;, &quot;(&quot;) then
-                  let a = parse_args(toks, pos + 2)
-                  return [[&quot;Expr&quot;, [&quot;Call&quot;, tx, a[0]]], a[1]]
-                else
-                  if tok_is(nx, &quot;OP&quot;, &quot;=&quot;) then
-                    let vr = parse_expr(toks, pos + 2)
-                    return [[&quot;Let&quot;, tx, vr[0], true, false], vr[1]]
+                # General fallback: parse a full expression (this already
+                # covers bare calls NAME(args), member/index chains
+                # obj.prop / obj.prop.sub / list[i], and full binary
+                # expressions like classify(x) == &quot;adult&quot; via the same
+                # parse_expr/parse_postfix/parse_primary path used
+                # everywhere else -- unlike native parser.rs, this
+                # self-hosted lexer/parser never treats a bare '=' as an
+                # equality operator (only '==' is recognized as a
+                # comparison, see the OP-token check just above this
+                # function), so parse_expr always stops cleanly BEFORE a
+                # pending assignment '=', with no risk of the ambiguity
+                # the native side has to guard against with its
+                # stop_trailing_block_for_condition flag. Previously this
+                # branch hand-rolled only 3 narrow shapes (bare call,
+                # bare reassignment, obj.prop[ = value]) and errored on
+                # anything else -- found via `pair[0]` (a bare index
+                # expression) and `classify(x) == &quot;adult&quot;` (a bare call
+                # followed by a comparison) both failing to parse as a
+                # closure body's implicit-return statement.
+                let e = parse_expr(toks, pos)
+                let node = e[0]
+                let p2 = e[1]
+                let eqTok = vec_get(toks, p2)
+                if tok_is(eqTok, &quot;OP&quot;, &quot;=&quot;) then
+                  if node[0] == &quot;Member&quot; then
+                    let vr = parse_expr(toks, p2 + 1)
+                    return [[&quot;MemberAssign&quot;, node[1], node[2], vr[0]], vr[1]]
                   else
-                    if tok_is(nx, &quot;OP&quot;, &quot;.&quot;) then
-                      let r = parse_postfix(toks, pos)
-                      let node = r[0]
-                      let p2 = r[1]
-                      let eqTok = vec_get(toks, p2)
-                      if (node[0] == &quot;Member&quot;) and tok_is(eqTok, &quot;OP&quot;, &quot;=&quot;) then
-                        let vr = parse_expr(toks, p2 + 1)
-                        return [[&quot;MemberAssign&quot;, node[1], node[2], vr[0]], vr[1]]
-                      else
-                        return [[&quot;Expr&quot;, node], p2]
-                      end
+                    if node[0] == &quot;Var&quot; then
+                      let vr = parse_expr(toks, p2 + 1)
+                      return [[&quot;Let&quot;, node[1], vr[0], true, false], vr[1]]
                     else
-                      return [[&quot;Err&quot;, &quot;unexpected token '&quot; + tx + &quot;'&quot;, vec_get(toks, pos)[2]], pos + 1]
+                      return [[&quot;Err&quot;, &quot;cannot assign to this expression&quot;, eqTok[2]], p2]
                     end
                   end
+                else
+                  return [[&quot;Expr&quot;, node], p2]
+                end
                 end
                 end
                 end
@@ -1308,30 +1481,34 @@ end
 # ---- AST pretty printer ----
 
 make a function called ast_list_to_str takes nodes returns s
-  let s = &quot;&quot;
+  # sb_new/sb_push/sb_str -- low real-world risk (this is a debug/error-
+  # message pretty printer, not part of the ordinary compile path), but
+  # fixed for consistency once the anti-pattern was found and a compiler
+  # warning added to catch it elsewhere.
+  let b = sb_new()
   let i = 0
   while i &lt; nodes.length do
     if i &gt; 0 then
-      let s = s + &quot;; &quot;
+      sb_push(b, &quot;; &quot;)
     end
-    let s = s + ast_to_str(nodes[i])
+    sb_push(b, ast_to_str(nodes[i]))
     let i = i + 1
   end
-  return s
+  return sb_str(b)
 end
 
 # Joins a list of plain strings (e.g. closure param names), not AST nodes
 make a function called ast_list_to_str_plain takes items returns s
-  let s = &quot;&quot;
+  let b = sb_new()
   let i = 0
   while i &lt; items.length do
     if i &gt; 0 then
-      let s = s + &quot;, &quot;
+      sb_push(b, &quot;, &quot;)
     end
-    let s = s + items[i]
+    sb_push(b, items[i])
     let i = i + 1
   end
-  return s
+  return sb_str(b)
 end
 
 # Renders a RuleDecl body: a list of [pred, arg_expr_nodes] pairs (not
@@ -2062,6 +2239,23 @@ make a function called lower_expr takes node, code, fns, locals, pending returns
                         return code
                       end
                     else
+                      if ty == &quot;MethodCall&quot; then
+                        # obj.method(args) -- send(obj, &quot;method&quot;, ...args),
+                        # the same host call obj.prop = value already uses
+                        # on the write side (see Stmt::MemberAssign below).
+                        let object = node[1]
+                        let method = node[2]
+                        let args = node[3]
+                        let code = lower_expr(object, code, fns, locals, pending)
+                        vec_push(code, [&quot;Const&quot;, &quot;str&quot;, method])
+                        let i = 0
+                        while i &lt; args.length do
+                          let code = lower_expr(args[i], code, fns, locals, pending)
+                          let i = i + 1
+                        end
+                        vec_push(code, [&quot;CallHost&quot;, &quot;send&quot;, 2 + args.length])
+                        return code
+                      else
                       if ty == &quot;Closure&quot; then
                         return lower_closure_literal(node[1], node[2], code, fns, locals, pending)
                       else
@@ -2072,6 +2266,7 @@ make a function called lower_expr takes node, code, fns, locals, pending returns
                           vec_push(code, [&quot;Const&quot;, &quot;str&quot;, &quot;&quot;])
                           return code
                         end
+                      end
                       end
                     end
                   end
@@ -2275,10 +2470,20 @@ make a function called lower_stmt takes node, code, fns, fname, locals, mutables
     return code
   else
     if ty == &quot;MemberAssign&quot; then
+      # obj.prop = value -- lowers to send(obj, &quot;set&quot;, prop, value), the
+      # same host call the object system already uses for explicit
+      # send(&quot;obj&quot;,&quot;set&quot;,&quot;prop&quot;,value) calls (matches ir/lowering.rs's
+      # native Stmt::MemberAssign arm). Previously called a nonexistent
+      # host fn &quot;set&quot; (3 args) instead -- never caught because
+      # MemberAssign was itself dead code in the native parser.rs until
+      # a real parser bug (bare '=' always consumed as equality before
+      # this ever got a chance) was fixed; nothing had ever exercised
+      # this lowering path before.
       let code = lower_expr(node[1], code, fns, locals, pending)
+      vec_push(code, [&quot;Const&quot;, &quot;str&quot;, &quot;set&quot;])
       vec_push(code, [&quot;Const&quot;, &quot;str&quot;, node[2]])
       let code = lower_expr(node[3], code, fns, locals, pending)
-      vec_push(code, [&quot;CallHost&quot;, &quot;set&quot;, 3])
+      vec_push(code, [&quot;CallHost&quot;, &quot;send&quot;, 4])
       return code
     else
     if ty == &quot;Expr&quot; then
@@ -2402,8 +2607,65 @@ make a function called lower_stmt takes node, code, fns, fname, locals, mutables
                     vec_push(code, [&quot;CallHost&quot;, &quot;goal_def&quot;, 2])
                     return code
                   else
-                    # unknown statement: no code
-                    return code
+                    if ty == &quot;ClassDecl&quot; then
+                      # Slice 1+2+3 of the classes/traits/inheritance
+                      # feature (see the &quot;synchronous-questing-metcalfe&quot;
+                      # plan) -- mirrors ir/lowering.rs's Stmt::ClassDecl
+                      # arm exactly. Field defaults are real expressions,
+                      # evaluated via the normal lower_expr path. Methods
+                      # (Slice 2) become genuine closures via
+                      # lower_closure_literal, each with an implicit
+                      # leading &quot;self&quot; param, same shape as `when` blocks.
+                      # Trait names (Slice 3) are compile-time string
+                      # tokens, same convention as RuleDecl/GoalDecl dep
+                      # args -- a trait reference is a registry lookup
+                      # key, not an expression to evaluate.
+                      let cname = node[1]
+                      let cparent = node[2]
+                      let cfields = node[3]
+                      let cmethods = node[4]
+                      let ctraits = node[5]
+                      vec_push(code, [&quot;Const&quot;, &quot;str&quot;, cname])
+                      vec_push(code, [&quot;Const&quot;, &quot;str&quot;, cparent])
+                      let j = 0
+                      while j &lt; cfields.length do
+                        let fld = cfields[j]
+                        vec_push(code, [&quot;Const&quot;, &quot;str&quot;, fld[0]])
+                        let code = lower_expr(fld[1], code, fns, locals, pending)
+                        vec_push(code, [&quot;BuildList&quot;, 2])
+                        let j = j + 1
+                      end
+                      vec_push(code, [&quot;BuildList&quot;, cfields.length])
+                      let j = 0
+                      while j &lt; cmethods.length do
+                        let mth = cmethods[j]
+                        let mname = mth[0]
+                        let mparams = mth[1]
+                        let mbody = mth[2]
+                        vec_push(code, [&quot;Const&quot;, &quot;str&quot;, mname])
+                        let full_params = [&quot;self&quot;]
+                        let k = 0
+                        while k &lt; mparams.length do
+                          let full_params = list_push(full_params, mparams[k])
+                          let k = k + 1
+                        end
+                        let code = lower_closure_literal(full_params, mbody, code, fns, locals, pending)
+                        vec_push(code, [&quot;BuildList&quot;, 2])
+                        let j = j + 1
+                      end
+                      vec_push(code, [&quot;BuildList&quot;, cmethods.length])
+                      let j = 0
+                      while j &lt; ctraits.length do
+                        vec_push(code, [&quot;Const&quot;, &quot;str&quot;, ctraits[j]])
+                        let j = j + 1
+                      end
+                      vec_push(code, [&quot;BuildList&quot;, ctraits.length])
+                      vec_push(code, [&quot;CallHost&quot;, &quot;class_def&quot;, 5])
+                      return code
+                    else
+                      # unknown statement: no code
+                      return code
+                    end
                   end
                 end
               end
@@ -2466,18 +2728,24 @@ make a function called lower_program takes ast returns ir
       let funcs = list_push(funcs, [&quot;FuncIR&quot;, s[1], s[2], vec_to_list(code)])
     else
       if s[0] == &quot;When&quot; then
-        let handlerCount = handlerCount + 1
-        let hname = &quot;__when_&quot; + s[1] + &quot;_&quot; + handlerCount
-        let hlocals = vec_new()
-        let hmutables = vec_new()
-        vec_push(hlocals, &quot;event_name&quot;)
-        vec_push(hmutables, true)
-        vec_push(hlocals, &quot;event_data&quot;)
-        vec_push(hmutables, true)
-        let code = lower_block(s[2], vec_new(), fns, hname, hlocals, hmutables, pending)
-        vec_push(code, [&quot;Return&quot;])
-        let funcs = list_push(funcs, [&quot;FuncIR&quot;, hname, [&quot;event_name&quot;, &quot;event_data&quot;], vec_to_list(code)])
-        let events = list_push(events, [&quot;EventIR&quot;, s[1], hname])
+        # `when EVENT { ... }` now lowers to a genuine closure (reusing
+        # lower_closure_literal exactly, just with fixed auto-bound
+        # params [&quot;event_name&quot;,&quot;event_data&quot;] instead of user-supplied
+        # ones), registered at RUNTIME via register_event_handler --
+        # mirroring native lowering.rs's lower_when. Previously
+        # synthesized as an ISOLATED standalone function (no access to
+        # anything outer-scope) registered in a compile-time EventIR
+        # list, exactly the same gotcha found and fixed natively: a
+        # handler could never see an enclosing `let` (worked around by
+        # re-declaring the same name fresh inside every handler body).
+        # `mainLocals` (the CURRENT accumulated set at this exact point
+        # in program order, since this &quot;When&quot; case is handled inline in
+        # the SAME single sequential pass as everything else, not a
+        # separate pre-pass) is what lower_closure_literal captures --
+        # so this genuinely sees whatever's been declared before it.
+        vec_push(mainCode, [&quot;Const&quot;, &quot;str&quot;, s[1]])
+        let mainCode = lower_closure_literal([&quot;event_name&quot;, &quot;event_data&quot;], s[2], mainCode, fns, mainLocals, pending)
+        vec_push(mainCode, [&quot;CallHost&quot;, &quot;register_event_handler&quot;, 2])
       else
         let mainCode = lower_stmt(s, mainCode, fns, &quot;main&quot;, mainLocals, mainMutables, pending)
       end
@@ -3087,26 +3355,64 @@ make a function called sdsl_len takes s returns r
   return to_num(list_len(s))
 end
 
-# Whole-word keyword match: `keyword` occurs at `s[pos..]` and is not glued
-# to an identifier character on either side.
-make a function called sdsl_starts_keyword_at takes s, pos, keyword returns r
-  let slen = sdsl_len(s)
+# NOTE on `h` params below (sdsl_starts_keyword_at/sdsl_skip_ws/
+# sdsl_skip_ws_and_comments/sdsl_find_char/sdsl_take_identifier/
+# sdsl_take_balanced_block): `h` is a HANDLE from str_intern(s), not a
+# plain string -- accessed via sc_char/sc_len, not substr/sdsl_len.
+# `substr` (and sdsl_len, which goes through list_len) calls the plain
+# Rust `str::is_ascii()`/`.chars().count()` FRESH on every single call,
+# an O(n) full-string scan -- calling that once per character in a
+# whole-file scan is exactly what turned this preprocessor's O(n) scan
+# into O(n^2) (confirmed: patc1.exe took 30+ minutes on its own
+# ~700K-char combined source, which never even contains a real `syntax`
+# block, just because &quot;syntax &quot; appears in doc comments and triggers
+# the scan at all). `str_intern` caches the is-ascii check ONCE, at
+# intern time, and sc_char/sc_len read that cached flag -- the
+# established idiom this codebase already uses elsewhere for exactly
+# this reason (see hosts.rs's ISTRINGS comment / patlang-ascii-fastpath-
+# cache-fix). `sc_char` returns the same 1-char-string shape `substr(s,
+# i,1)` did, so callers otherwise read identically to before.
+#
+# Whole-word keyword match: `keyword` occurs at `h[pos..]` and is not
+# glued to an identifier character on either side.
+make a function called sdsl_starts_keyword_at takes h, pos, keyword returns r
+  # Compares character-by-character directly against `keyword` (always a
+  # short literal like &quot;syntax&quot;) instead of building a substring via
+  # sdsl_sc_substr first -- this function is called once per NON-comment
+  # character position across the whole file (see sdsl_extract_syntax_
+  # defs/sdsl_expand_trigger_blocks), so building a fresh sb_new/sb_push
+  # x N/sb_str-allocated string just to immediately discard it after one
+  # comparison was the real remaining cost after the O(n^2)-&gt;O(n)
+  # complexity fix: ~8 host calls per character for a ~700K-character
+  # file that's mostly non-comment code, none of which the comparison
+  # itself actually needs. `keyword` itself stays a plain substr() call
+  # (not interned) -- it's a handful of characters, so its own
+  # uncached is-ascii check is negligible, unlike scanning the whole file.
+  let slen = sc_len(h)
   let klen = sdsl_len(keyword)
   if (pos + klen) &gt; slen then
     return false
   else
-    if substr(s, pos, klen) != keyword then
+    let matched = true
+    let k = 0
+    while (k &lt; klen) and matched do
+      if sc_char(h, pos + k) != substr(keyword, k, 1) then
+        let matched = false
+      end
+      let k = k + 1
+    end
+    if not matched then
       return false
     else
       let ok = true
       if pos &gt; 0 then
-        if sdsl_is_ident_char(substr(s, pos - 1, 1)) then
+        if sdsl_is_ident_char(sc_char(h, pos - 1)) then
           let ok = false
         end
       end
       let after = pos + klen
       if after &lt; slen then
-        if sdsl_is_ident_char(substr(s, after, 1)) then
+        if sdsl_is_ident_char(sc_char(h, after)) then
           let ok = false
         end
       end
@@ -3115,12 +3421,27 @@ make a function called sdsl_starts_keyword_at takes s, pos, keyword returns r
   end
 end
 
-make a function called sdsl_skip_ws takes s, pos returns r
-  let slen = sdsl_len(s)
+# sc_char/sc_len only give O(1) single-character access -- there's no
+# sc_substr, so a short multi-character slice (keyword-length compares,
+# almost always just a few chars) is built by concatenating individual
+# sc_char results via a string builder rather than substr(h,...), which
+# would need a plain string, not a handle.
+make a function called sdsl_sc_substr takes h, pos, count returns r
+  let b = sb_new()
+  let k = 0
+  while k &lt; count do
+    sb_push(b, sc_char(h, pos + k))
+    let k = k + 1
+  end
+  return sb_str(b)
+end
+
+make a function called sdsl_skip_ws takes h, pos returns r
+  let slen = sc_len(h)
   let i = pos
   let scanning = true
   while (i &lt; slen) and scanning do
-    if sdsl_is_ws(substr(s, i, 1)) then
+    if sdsl_is_ws(sc_char(h, i)) then
       let i = i + 1
     else
       let scanning = false
@@ -3129,30 +3450,30 @@ make a function called sdsl_skip_ws takes s, pos returns r
   return i
 end
 
-make a function called sdsl_skip_ws_and_comments takes s, pos returns r
-  let slen = sdsl_len(s)
-  let i = sdsl_skip_ws(s, pos)
+make a function called sdsl_skip_ws_and_comments takes h, pos returns r
+  let slen = sc_len(h)
+  let i = sdsl_skip_ws(h, pos)
   let scanning = true
   while scanning do
     let scanning = false
-    if (i &lt; slen) and (substr(s, i, 1) == &quot;#&quot;) then
-      while (i &lt; slen) and (substr(s, i, 1) != &quot;\n&quot;) do
+    if (i &lt; slen) and (sc_char(h, i) == &quot;#&quot;) then
+      while (i &lt; slen) and (sc_char(h, i) != &quot;\n&quot;) do
         let i = i + 1
       end
-      let i = sdsl_skip_ws(s, i)
+      let i = sdsl_skip_ws(h, i)
       let scanning = true
     end
   end
   return i
 end
 
-make a function called sdsl_find_char takes s, from, target returns r
-  let slen = sdsl_len(s)
+make a function called sdsl_find_char takes h, from, target returns r
+  let slen = sc_len(h)
   let i = from
   let found = -1
   let scanning = true
   while (i &lt; slen) and scanning do
-    if substr(s, i, 1) == target then
+    if sc_char(h, i) == target then
       let found = i
       let scanning = false
     else
@@ -3163,24 +3484,24 @@ make a function called sdsl_find_char takes s, from, target returns r
 end
 
 # Returns [identifier_text, next_pos], or [&quot;&quot;, -1] if no identifier starts there.
-make a function called sdsl_take_identifier takes s, pos returns r
-  let slen = sdsl_len(s)
+make a function called sdsl_take_identifier takes h, pos returns r
+  let slen = sc_len(h)
   if pos &gt;= slen then
     return [&quot;&quot;, -1]
   else
-    if not sdsl_is_ident_start(substr(s, pos, 1)) then
+    if not sdsl_is_ident_start(sc_char(h, pos)) then
       return [&quot;&quot;, -1]
     else
       let i = pos + 1
       let scanning = true
       while (i &lt; slen) and scanning do
-        if sdsl_is_ident_char(substr(s, i, 1)) then
+        if sdsl_is_ident_char(sc_char(h, i)) then
           let i = i + 1
         else
           let scanning = false
         end
       end
-      return [substr(s, pos, i - pos), i]
+      return [sdsl_sc_substr(h, pos, i - pos), i]
     end
   end
 end
@@ -3222,8 +3543,8 @@ end
 
 # `s[open_brace_pos]` must be &quot;{&quot;. Returns [inner_body, index_just_past_matching_&quot;}&quot;],
 # tracking string literals so braces inside &quot;...&quot; don't confuse the balance count.
-make a function called sdsl_take_balanced_block takes s, open_brace_pos returns r
-  let slen = sdsl_len(s)
+make a function called sdsl_take_balanced_block takes h, open_brace_pos returns r
+  let slen = sc_len(h)
   let depth = 0
   let i = open_brace_pos
   let in_string = false
@@ -3232,7 +3553,7 @@ make a function called sdsl_take_balanced_block takes s, open_brace_pos returns 
   let result_body = &quot;&quot;
   let result_pos = -1
   while (i &lt; slen) and scanning do
-    let c = substr(s, i, 1)
+    let c = sc_char(h, i)
     if in_string then
       if c == &quot;\\&quot; then
         let i = i + 2
@@ -3254,7 +3575,10 @@ make a function called sdsl_take_balanced_block takes s, open_brace_pos returns 
           if c == &quot;}&quot; then
             let depth = depth - 1
             if depth == 0 then
-              let result_body = substr(s, start_inner, i - start_inner)
+              # a single sdsl_sc_substr call here (not per outer-loop-
+              # iteration), so its own internal O(body-length) builder
+              # loop is fine -- this only runs once per matched block.
+              let result_body = sdsl_sc_substr(h, start_inner, i - start_inner)
               let result_pos = i + 1
               let scanning = false
             else
@@ -3274,18 +3598,22 @@ end
 # respecting string literals and nested parens (so `regex(&quot;a;b&quot;, x)` isn't
 # split in the middle).
 make a function called sdsl_split_top_level_statements takes body returns r
+  # sb_new/sb_push/sb_str for `cur`, same O(n^2)-avoidance reason as
+  # sdsl_extract_syntax_defs/sdsl_expand_trigger_blocks -- lower stakes
+  # here (bounded by the longest single DSL statement, not the whole
+  # file) but fixed for consistency once the anti-pattern was found.
   let n = sdsl_len(body)
   let out = []
-  let cur = &quot;&quot;
+  let cur = sb_new()
   let depth = 0
   let in_string = false
   let i = 0
   while i &lt; n do
     let c = substr(body, i, 1)
     if in_string then
-      let cur = cur + c
+      sb_push(cur, c)
       if (c == &quot;\\&quot;) and ((i + 1) &lt; n) then
-        let cur = cur + substr(body, i + 1, 1)
+        sb_push(cur, substr(body, i + 1, 1))
         let i = i + 2
       else
         if c == &quot;\&quot;&quot; then
@@ -3296,25 +3624,25 @@ make a function called sdsl_split_top_level_statements takes body returns r
     else
       if c == &quot;\&quot;&quot; then
         let in_string = true
-        let cur = cur + c
+        sb_push(cur, c)
         let i = i + 1
       else
         if c == &quot;(&quot; then
           let depth = depth + 1
-          let cur = cur + c
+          sb_push(cur, c)
           let i = i + 1
         else
           if c == &quot;)&quot; then
             let depth = depth - 1
-            let cur = cur + c
+            sb_push(cur, c)
             let i = i + 1
           else
             if (c == &quot;;&quot;) and (depth == 0) then
-              let out = list_push(out, cur)
-              let cur = &quot;&quot;
+              let out = list_push(out, sb_str(cur))
+              let cur = sb_new()
               let i = i + 1
             else
-              let cur = cur + c
+              sb_push(cur, c)
               let i = i + 1
             end
           end
@@ -3322,8 +3650,8 @@ make a function called sdsl_split_top_level_statements takes body returns r
       end
     end
   end
-  if sdsl_len(sdsl_trim(cur)) &gt; 0 then
-    let out = list_push(out, cur)
+  if sdsl_len(sdsl_trim(sb_str(cur))) &gt; 0 then
+    let out = list_push(out, sb_str(cur))
   end
   return out
 end
@@ -3358,10 +3686,10 @@ make a function called sdsl_parse_token_defs takes tbody returns r
   while i &lt; stmts.length do
     let stmt = sdsl_trim(stmts[i])
     if sdsl_len(stmt) &gt; 0 then
-      let eq = sdsl_find_char(stmt, 0, &quot;=&quot;)
+      let eq = sdsl_find_char(str_intern(stmt), 0, &quot;=&quot;)
       let lhs = sdsl_trim(substr(stmt, 0, eq))
       let rhs = sdsl_trim(substr(stmt, eq + 1, sdsl_len(stmt) - eq - 1))
-      let op = sdsl_find_char(lhs, 0, &quot;(&quot;)
+      let op = sdsl_find_char(str_intern(lhs), 0, &quot;(&quot;)
       let name = lhs
       if op &gt;= 0 then
         let name = sdsl_trim(substr(lhs, 0, op))
@@ -3372,7 +3700,7 @@ make a function called sdsl_parse_token_defs takes tbody returns r
         if (ilen &gt;= 2) and (substr(inner, 0, 1) == &quot;(&quot;) and (substr(inner, ilen - 1, 1) == &quot;)&quot;) then
           let inner = substr(inner, 1, ilen - 2)
         end
-        let comma = sdsl_find_char(inner, 0, &quot;,&quot;)
+        let comma = sdsl_find_char(str_intern(inner), 0, &quot;,&quot;)
         let pat_str = inner
         if comma &gt;= 0 then
           let pat_str = substr(inner, 0, comma)
@@ -3402,7 +3730,7 @@ make a function called sdsl_parse_rule_def takes rbody returns r
         let expect_part = stmt
         if sdsl_starts_with(stmt, &quot;let&quot;) then
           let rest = sdsl_trim(substr(stmt, 3, sdsl_len(stmt) - 3))
-          let eq = sdsl_find_char(rest, 0, &quot;=&quot;)
+          let eq = sdsl_find_char(str_intern(rest), 0, &quot;=&quot;)
           let bind = sdsl_trim(substr(rest, 0, eq))
           let expect_part = sdsl_trim(substr(rest, eq + 1, sdsl_len(rest) - eq - 1))
         end
@@ -3431,28 +3759,34 @@ make a function called sdsl_parse_rule_def takes rbody returns r
 end
 
 make a function called sdsl_parse_syntax_def takes body returns r
-  let n = sdsl_len(body)
-  let i = sdsl_skip_ws_and_comments(body, 0)
+  # Interns `body` ONCE and threads the handle through the (now
+  # handle-based) scanning helpers -- see the note above
+  # sdsl_starts_keyword_at for why (substr/sdsl_len recompute an O(n)
+  # is-ascii/char-count check on every call; sc_char/sc_len read a
+  # cached flag from str_intern instead).
+  let h = str_intern(body)
+  let n = sc_len(h)
+  let i = sdsl_skip_ws_and_comments(h, 0)
   let trigger_keyword = &quot;&quot;
   let tokens = []
   let rules = []
   while i &lt; n do
-    if sdsl_starts_keyword_at(body, i, &quot;trigger&quot;) then
-      let semi = sdsl_find_char(body, i, &quot;;&quot;)
-      let trigger_keyword = sdsl_parse_trigger_stmt(substr(body, i, semi - i))
+    if sdsl_starts_keyword_at(h, i, &quot;trigger&quot;) then
+      let semi = sdsl_find_char(h, i, &quot;;&quot;)
+      let trigger_keyword = sdsl_parse_trigger_stmt(sdsl_sc_substr(h, i, semi - i))
       let i = semi + 1
     else
-      if sdsl_starts_keyword_at(body, i, &quot;tokens&quot;) then
-        let j = sdsl_skip_ws(body, i + 6)
-        let br = sdsl_take_balanced_block(body, j)
+      if sdsl_starts_keyword_at(h, i, &quot;tokens&quot;) then
+        let j = sdsl_skip_ws(h, i + 6)
+        let br = sdsl_take_balanced_block(h, j)
         let tokens = sdsl_parse_token_defs(br[0])
         let i = br[1]
       else
-        if sdsl_starts_keyword_at(body, i, &quot;rule&quot;) then
-          let j = sdsl_skip_ws(body, i + 4)
-          let nameinfo = sdsl_take_identifier(body, j)
-          let j = sdsl_skip_ws(body, nameinfo[1])
-          let br = sdsl_take_balanced_block(body, j)
+        if sdsl_starts_keyword_at(h, i, &quot;rule&quot;) then
+          let j = sdsl_skip_ws(h, i + 4)
+          let nameinfo = sdsl_take_identifier(h, j)
+          let j = sdsl_skip_ws(h, nameinfo[1])
+          let br = sdsl_take_balanced_block(h, j)
           let rules = list_push(rules, sdsl_parse_rule_def(br[0]))
           let i = br[1]
         else
@@ -3460,42 +3794,96 @@ make a function called sdsl_parse_syntax_def takes body returns r
         end
       end
     end
-    let i = sdsl_skip_ws_and_comments(body, i)
+    let i = sdsl_skip_ws_and_comments(h, i)
   end
   return [&quot;syntax&quot;, trigger_keyword, tokens, rules]
 end
 
 make a function called sdsl_extract_syntax_defs takes src returns r
-  let n = sdsl_len(src)
-  let out = &quot;&quot;
+  # Two separate O(n^2)-avoidance fixes, both needed:
+  # (1) Builds the stripped-of-real-defs output via sb_new/sb_push/
+  #     sb_str, NOT `out = out + substr(...)` -- string concatenation in
+  #     a loop copies the WHOLE accumulated string on every append
+  #     (PatLang strings are immutable).
+  # (2) Reads `src` via an str_intern HANDLE (sc_char/sc_len), NOT plain
+  #     substr/sdsl_len -- substr calls Rust's `str::is_ascii()` (an
+  #     O(n) full-string scan) fresh on EVERY call, so calling it once
+  #     per character in a whole-file scan was actually the DOMINANT
+  #     cost here, not the string-concat alone: fixing (1) alone barely
+  #     moved the needle (8x input still took ~8x longer, i.e. still
+  #     O(n^2)) until this handle-based fix was added too.
+  # Found the hard way: this made `expand_syntax_dsls` (called
+  # unconditionally on EVERY source patc1.exe compiles, including
+  # compiling itself) take 30+ minutes on patc1_all.patlang's own
+  # ~700K-character combined source, even though it never contains a
+  # real `syntax NAME {` block -- confirmed via a direct scaling test
+  # (8x input length took ~64x longer, the signature of O(n^2)) before
+  # touching anything, exactly the same anti-pattern already fixed
+  # several times elsewhere in this codebase (see best-practices' sb_*
+  # and str_intern/sc_* guidance).
+  # NOTE: also tracks in_string, matching native syntax_dsl.rs's
+  # extract_syntax_defs exactly -- a real, separate, pre-existing
+  # correctness gap found while diagnosing performance on a real
+  # ~700K-character file: without this, a STRING LITERAL anywhere in the
+  # file that happens to contain text shaped like &quot;syntax NAME {&quot; (very
+  # plausible here -- self_hosting/lib/runtime_rs.patlang embeds large
+  # chunks of literal Rust source AS PatLang string literals, and Rust
+  # source plausibly mentions the word &quot;syntax&quot; somewhere, e.g. in an
+  # error message) gets misread as a real definition, corrupting parsing
+  # of everything downstream. Never manifested before because nothing
+  # had ever actually run this preprocessor's whole-file scan against a
+  # large real file with lots of string literals until now.
+  let h = str_intern(src)
+  let n = sc_len(h)
+  let out = sb_new()
   let defs = []
   let i = 0
+  let in_string = false
   while i &lt; n do
-    if substr(src, i, 1) == &quot;#&quot; then
+    if in_string then
+      sb_push(out, sc_char(h, i))
+      if (sc_char(h, i) == &quot;\\&quot;) and ((i + 1) &lt; n) then
+        sb_push(out, sc_char(h, i + 1))
+        let i = i + 2
+      else
+        if sc_char(h, i) == &quot;\&quot;&quot; then
+          let in_string = false
+        end
+        let i = i + 1
+      end
+    else
+      if sc_char(h, i) == &quot;\&quot;&quot; then
+        let in_string = true
+        sb_push(out, sc_char(h, i))
+        let i = i + 1
+      else
+      if sc_char(h, i) == &quot;#&quot; then
       # Copy the whole comment line through untouched -- a comment may
       # itself mention &quot;syntax&quot; or &quot;routes&quot; (e.g. this file's own header,
       # or a demo's usage-example doc comment) without being a real block.
       let cstart = i
-      while (i &lt; n) and (substr(src, i, 1) != &quot;\n&quot;) do
+      while (i &lt; n) and (sc_char(h, i) != &quot;\n&quot;) do
         let i = i + 1
       end
-      let out = out + substr(src, cstart, i - cstart)
+      sb_push(out, sdsl_sc_substr(h, cstart, i - cstart))
     else
-      if sdsl_starts_keyword_at(src, i, &quot;syntax&quot;) then
-        let j = sdsl_skip_ws(src, i + 6)
-        let nameinfo = sdsl_take_identifier(src, j)
-        let j = sdsl_skip_ws(src, nameinfo[1])
-        let br = sdsl_take_balanced_block(src, j)
+      if sdsl_starts_keyword_at(h, i, &quot;syntax&quot;) then
+        let j = sdsl_skip_ws(h, i + 6)
+        let nameinfo = sdsl_take_identifier(h, j)
+        let j = sdsl_skip_ws(h, nameinfo[1])
+        let br = sdsl_take_balanced_block(h, j)
         let def = sdsl_parse_syntax_def(br[0])
         let defs = list_push(defs, def)
         let i = br[1]
       else
-        let out = out + substr(src, i, 1)
+        sb_push(out, sc_char(h, i))
         let i = i + 1
       end
     end
+    end
+    end
   end
-  return [out, defs]
+  return [sb_str(out), defs]
 end
 
 # ---------------------------------------------------------------------
@@ -3574,15 +3962,27 @@ end
 
 # Attempts to match every step of `rule` against `line` in order. Returns
 # [&quot;ok&quot;, bindings] on full success, [&quot;fail&quot;] if any step fails to match.
-make a function called sdsl_try_match_rule takes def, rule, line returns r
-  let steps = rule[1]
+make a function called sdsl_try_match_rule takes def, the_rule, line returns r
+  # NOTE: param renamed from `rule` -- a bare reserved keyword used as a
+  # plain parameter name silently truncates the params list instead of
+  # erroring (the parser's &quot;takes NAME, NAME, ...&quot; list expects
+  # Token::Identifier, but `rule` lexes as its own dedicated Token::Rule) --
+  # found via a genuinely confusing silent crash: this function ended up
+  # with params=[&quot;def&quot;] only and a corrupted 2-instruction body, which the
+  # interpreter then panicked on internally, and that panic was silently
+  # swallowed by main()'s `.join().unwrap_or(())` thread-join wrapper,
+  # producing a totally silent &quot;successful&quot; exit with zero output and no
+  # error message at all. Same class of bug as the earlier `fn`-as-a-
+  # param-name collision found in the paradigm gallery work.
+  let steps = the_rule[1]
+  let line_h = str_intern(line)
   let pos = 0
   let bindings = []
   let n = steps.length
   let i = 0
   let ok = true
   while (i &lt; n) and ok do
-    let pos = sdsl_skip_ws(line, pos)
+    let pos = sdsl_skip_ws(line_h, pos)
     let step = steps[i]
     let kind = step[1]
     let matched = -1
@@ -3628,7 +4028,7 @@ end
 # with its matched text as a PatLang string literal.
 make a function called sdsl_substitute_template takes template, bindings returns r
   let n = sdsl_len(template)
-  let out = &quot;&quot;
+  let out = sb_new()
   let i = 0
   while i &lt; n do
     let c = substr(template, i, 1)
@@ -3645,17 +4045,17 @@ make a function called sdsl_substitute_template takes template, bindings returns
       let word = substr(template, i, j - i)
       let val = sdsl_bindings_lookup(bindings, word)
       if sdsl_len(val) &gt; 0 then
-        let out = out + &quot;\&quot;&quot; + val + &quot;\&quot;&quot;
+        sb_push(out, &quot;\&quot;&quot; + val + &quot;\&quot;&quot;)
       else
-        let out = out + word
+        sb_push(out, word)
       end
       let i = j
     else
-      let out = out + c
+      sb_push(out, c)
       let i = i + 1
     end
   end
-  return out
+  return sb_str(out)
 end
 
 # Runs each of the DSL's rules (in declaration order) against `line`,
@@ -3685,45 +4085,56 @@ make a function called sdsl_expand_rule_line takes def, line returns r
 end
 
 make a function called sdsl_expand_trigger_blocks takes src, defs returns r
-  let n = sdsl_len(src)
-  let out = &quot;&quot;
+  # sb_new/sb_push/sb_str + str_intern/sc_char/sc_len throughout, same
+  # two-part reason as sdsl_extract_syntax_defs (string-concat AND
+  # substr's per-call O(n) is-ascii check both turn this into O(n^2)
+  # otherwise). This function only actually runs when defs is non-empty
+  # (see expand_syntax_dsls_with's early-return), i.e. only when a real
+  # `syntax NAME {}` block was found -- lower-traffic than
+  # sdsl_extract_syntax_defs (called on every compile unconditionally)
+  # but fixed the same way for the same reason and for real syntax-DSL
+  # users on large files.
+  let h = str_intern(src)
+  let n = sc_len(h)
+  let out = sb_new()
   let i = 0
   while i &lt; n do
-    if substr(src, i, 1) == &quot;#&quot; then
+    if sc_char(h, i) == &quot;#&quot; then
       # Same rationale as sdsl_extract_syntax_defs: a comment mentioning a
       # trigger keyword (e.g. this file's own doc comments about `routes`)
       # is not a real usage block, and must never be scanned into one.
       let cstart = i
-      while (i &lt; n) and (substr(src, i, 1) != &quot;\n&quot;) do
+      while (i &lt; n) and (sc_char(h, i) != &quot;\n&quot;) do
         let i = i + 1
       end
-      let out = out + substr(src, cstart, i - cstart)
+      sb_push(out, sdsl_sc_substr(h, cstart, i - cstart))
     else
     let kw_idx = -1
     let d = 0
     while (d &lt; defs.length) and (kw_idx &lt; 0) do
-      if sdsl_starts_keyword_at(src, i, defs[d][1]) then
+      if sdsl_starts_keyword_at(h, i, defs[d][1]) then
         let kw_idx = d
       end
       let d = d + 1
     end
     if kw_idx &gt;= 0 then
       let def = defs[kw_idx]
-      let j = sdsl_skip_ws(src, i + sdsl_len(def[1]))
-      if (j &lt; n) and (substr(src, j, 1) == &quot;{&quot;) then
-        let br = sdsl_take_balanced_block(src, j)
+      let j = sdsl_skip_ws(h, i + sdsl_len(def[1]))
+      if (j &lt; n) and (sc_char(h, j) == &quot;{&quot;) then
+        let br = sdsl_take_balanced_block(h, j)
         let body = br[0]
-        let blen = sdsl_len(body)
+        let bh = str_intern(body)
+        let blen = sc_len(bh)
         let start = 0
         while start &lt;= blen do
-          let nl = sdsl_find_char(body, start, &quot;\n&quot;)
+          let nl = sdsl_find_char(bh, start, &quot;\n&quot;)
           let line_end = nl
           if nl &lt; 0 then
             let line_end = blen
           end
-          let line = sdsl_trim(substr(body, start, line_end - start))
+          let line = sdsl_trim(sdsl_sc_substr(bh, start, line_end - start))
           if sdsl_len(line) &gt; 0 then
-            let out = out + sdsl_expand_rule_line(def, line) + &quot;\n&quot;
+            sb_push(out, sdsl_expand_rule_line(def, line) + &quot;\n&quot;)
           end
           if nl &lt; 0 then
             let start = blen + 1
@@ -3733,16 +4144,16 @@ make a function called sdsl_expand_trigger_blocks takes src, defs returns r
         end
         let i = br[1]
       else
-        let out = out + substr(src, i, 1)
+        sb_push(out, sc_char(h, i))
         let i = i + 1
       end
     else
-      let out = out + substr(src, i, 1)
+      sb_push(out, sc_char(h, i))
       let i = i + 1
     end
     end
   end
-  return out
+  return sb_str(out)
 end
 
 # Public entry point, composable across multiple separate runtime calls:
