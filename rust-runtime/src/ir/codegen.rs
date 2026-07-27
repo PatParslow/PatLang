@@ -3107,13 +3107,26 @@ fn host_call_io_misc(name: &str, args: &[Value]) -> Option<Result<Value, String>
                 Ok(Value::Unit)
             }
             "set_var" => {
-                if args.len() != 2 { return Ok(Value::Unit); }
-                let key = match &args[0] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
-                let val = args.get(1).cloned().unwrap_or(Value::Unit);
-                if !key.is_empty() {
-                    obj_set("__vars", &key, val);
+                match args.len() {
+                    2 => {
+                        let key = match &args[0] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
+                        let val = args.get(1).cloned().unwrap_or(Value::Unit);
+                        if !key.is_empty() {
+                            obj_set("__vars", &key, val);
+                        }
+                        Ok(Value::Unit)
+                    }
+                    3 => {
+                        let recv_name = match &args[0] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
+                        let key = match &args[1] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
+                        let val = args.get(2).cloned().unwrap_or(Value::Unit);
+                        if !recv_name.is_empty() && !key.is_empty() {
+                            obj_set(&recv_name, &key, val);
+                        }
+                        Ok(Value::Unit)
+                    }
+                    _ => Ok(Value::Unit),
                 }
-                Ok(Value::Unit)
             }
             "get" => {
                 if args.len() != 2 { return Err("expected 2 args".into()); }

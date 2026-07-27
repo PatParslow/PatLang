@@ -1469,11 +1469,26 @@ pub fn host_new(args: &[Value]) -> Result<Value, String> {
 }
 
 pub fn host_set_var(args: &[Value]) -> Result<Value, String> {
-    // set_var(key, val) stores into the shared __vars object
-    if args.len() != 2 { return Ok(Value::Unit); }
-    let key = match &args[0] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
-    if !key.is_empty() { obj_set("__vars", &key, args[1].clone()); }
-    Ok(Value::Unit)
+    // set_var(key, val) -- 2 args -- stores into the shared __vars object.
+    // set_var(obj, key, val) -- 3 args -- sets a named object's own field,
+    // matching every worked example on the Paradigms Guide/Standard Library
+    // reference (e.g. `set_var(acct, "balance", 100)`): this form was
+    // documented site-wide but never actually implemented here, so it
+    // silently no-op'd (args.len() != 2) instead of mutating the object.
+    match args.len() {
+        2 => {
+            let key = match &args[0] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
+            if !key.is_empty() { obj_set("__vars", &key, args[1].clone()); }
+            Ok(Value::Unit)
+        }
+        3 => {
+            let recv_name = match &args[0] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
+            let key = match &args[1] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
+            if !recv_name.is_empty() && !key.is_empty() { obj_set(&recv_name, &key, args[2].clone()); }
+            Ok(Value::Unit)
+        }
+        _ => Ok(Value::Unit),
+    }
 }
 
 pub fn host_send(args: &[Value]) -> Result<Value, String> {
