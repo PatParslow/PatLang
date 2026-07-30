@@ -3198,3 +3198,187 @@ make a function called sleep_ms takes ms returns done
   os_sleep_ms(ms)
   return true
 end
+
+# Stage B, part 1 of the interp.patlang-compilation roadmap (#25): real
+# TCP networking. g_listeners_table stores [port, socket] pairs,
+# g_conns_table stores [conn_id, socket] pairs (conn_id assigned from
+# an incrementing counter, same set_var/get global-counter idiom as
+# logic_next_rename_id above) -- same assoc-list-over-a-persistent-
+# .bss-slot pattern as logic_procs_list. Exit code 96 is this stage's
+# distinctive fatal-runtime-trap code (see 97/98/99's own precedent
+# from dynamic-mode `%`/contract_check/action_lookup).
+make a function called logic_listeners_list returns l
+  let addr = mem_listeners_table_addr()
+  let l = mem_peek_qword(addr, 0)
+  if l == 0 then
+    let l = rt_list_new(0)
+    mem_poke_qword(addr, 0, l)
+  end
+  return l
+end
+
+make a function called logic_listeners_list_set takes l returns done
+  mem_poke_qword(mem_listeners_table_addr(), 0, l)
+  return true
+end
+
+make a function called listeners_table_add takes port, sock returns done
+  let listeners = logic_listeners_list()
+  let listeners = rt_list_push(listeners, [port, sock])
+  logic_listeners_list_set(listeners)
+  return true
+end
+
+make a function called listeners_table_lookup takes port returns sock
+  let listeners = logic_listeners_list()
+  let n = listeners.length
+  let i = 0
+  while i < n do
+    if listeners[i][0] == port then
+      return listeners[i][1]
+    end
+    let i = i + 1
+  end
+  return 0 - 1
+end
+
+make a function called logic_conns_list returns l
+  let addr = mem_conns_table_addr()
+  let l = mem_peek_qword(addr, 0)
+  if l == 0 then
+    let l = rt_list_new(0)
+    mem_poke_qword(addr, 0, l)
+  end
+  return l
+end
+
+make a function called logic_conns_list_set takes l returns done
+  mem_poke_qword(mem_conns_table_addr(), 0, l)
+  return true
+end
+
+make a function called logic_next_conn_id returns id
+  let cur = to_num(get("__vars", "__tcp_conn_ctr"))
+  let next = cur + 1
+  set_var("__tcp_conn_ctr", next)
+  return next
+end
+
+make a function called conns_table_add takes sock returns id
+  let id = logic_next_conn_id()
+  let conns = logic_conns_list()
+  let conns = rt_list_push(conns, [id, sock])
+  logic_conns_list_set(conns)
+  return id
+end
+
+make a function called conns_table_lookup takes conn returns sock
+  let conns = logic_conns_list()
+  let n = conns.length
+  let i = 0
+  while i < n do
+    if conns[i][0] == conn then
+      return conns[i][1]
+    end
+    let i = i + 1
+  end
+  return 0 - 1
+end
+
+make a function called conns_table_remove takes conn returns done
+  let conns = logic_conns_list()
+  let n = conns.length
+  let out = []
+  let i = 0
+  while i < n do
+    if not (conns[i][0] == conn) then
+      let out = rt_list_push(out, conns[i])
+    end
+    let i = i + 1
+  end
+  logic_conns_list_set(out)
+  return true
+end
+
+make a function called tcp_listen takes port returns actual
+  os_wsa_startup()
+  let sock = os_socket_tcp()
+  let actual = os_bind_listen(sock, port)
+  if actual == 0 - 1 then
+    print("tcp_listen: bind " + port + ": address already in use")
+    os_exit(96)
+  end
+  if actual == 0 - 2 then
+    print("tcp_listen: bind " + port + ": failed")
+    os_exit(96)
+  end
+  listeners_table_add(actual, sock)
+  return actual
+end
+
+make a function called tcp_try_listen takes port returns actual
+  os_wsa_startup()
+  let sock = os_socket_tcp()
+  let actual = os_bind_listen(sock, port)
+  if actual == 0 - 1 then
+    os_closesocket(sock)
+    return 0 - 1
+  end
+  if actual == 0 - 2 then
+    print("tcp_try_listen: bind " + port + ": failed")
+    os_exit(96)
+  end
+  listeners_table_add(actual, sock)
+  return actual
+end
+
+make a function called tcp_connect takes host, port returns id
+  os_wsa_startup()
+  let sock = os_connect(host, port)
+  if sock == 0 - 1 then
+    print("tcp_connect: " + host + ":" + port + ": failed")
+    os_exit(96)
+  end
+  let id = conns_table_add(sock)
+  return id
+end
+
+make a function called tcp_accept takes port returns id
+  let sock = listeners_table_lookup(port)
+  if sock == 0 - 1 then
+    print("tcp_accept: no listener on port " + port)
+    os_exit(96)
+  end
+  let newsock = os_accept(sock)
+  let id = conns_table_add(newsock)
+  return id
+end
+
+make a function called tcp_read takes conn returns data
+  let sock = conns_table_lookup(conn)
+  let data = os_recv(sock)
+  if os_recv_had_error() then
+    print("tcp_read: connection " + conn + ": recv failed")
+    os_exit(96)
+  end
+  return data
+end
+
+make a function called tcp_read_or_empty takes conn returns data
+  let sock = conns_table_lookup(conn)
+  let data = os_recv(sock)
+  return data
+end
+
+make a function called tcp_write takes conn, data returns result
+  let sock = conns_table_lookup(conn)
+  os_send(sock, data)
+  return true
+end
+
+make a function called tcp_close takes conn returns done
+  let sock = conns_table_lookup(conn)
+  os_closesocket(sock)
+  conns_table_remove(conn)
+  return true
+end

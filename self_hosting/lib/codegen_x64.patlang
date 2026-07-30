@@ -1055,8 +1055,21 @@ make a function called x64_binop_asm_dynamic takes op, spilled returns asm
     sb_push(sb, "    sar rcx, 16" + x64_nl_char())
     sb_push(sb, "    cmp rcx, rax" + x64_nl_char())
     sb_push(sb, "    jne .DYN_OVERFLOW_" + suffix + x64_nl_char())
-    sb_push(sb, "    mov r15, 281474976710655" + x64_nl_char())
-    sb_push(sb, "    and rax, r15" + x64_nl_char())
+    # Real bug found (Stage B of the interp.patlang-compilation roadmap,
+    # #25): this used to `and rax, PAYLOAD_MASK` (48-bit mask) here --
+    # correct for TAGGING a real heap address, but WRONG for a plain
+    # fixnum result, since masking strips the sign-extension bits off
+    # any NEGATIVE result (e.g. 0-1 = -1 = 0xFFFF...FFFF masked to 48
+    # bits becomes 0x0000FFFFFFFFFFFF, a huge POSITIVE number instead of
+    # -1). Confirmed exactly: `busy == 0 - 1` inside a dynamic-mode
+    # function evaluated false even though busy's own (CallHost-sourced,
+    # correctly sign-extended) value truly was -1 -- the RHS `0 - 1`
+    # went through this exact masking and came out corrupted. rcx
+    # already holds the correct value (the shl16/sar16 round-trip test
+    # just above IS the correct fixnum normalization -- no masking
+    # needed at all), so just use it directly instead of re-deriving a
+    # broken one from rax.
+    sb_push(sb, "    mov rax, rcx" + x64_nl_char())
     sb_push(sb, "    jmp .DYN_DONE_" + suffix + x64_nl_char())
     sb_push(sb, ".DYN_OVERFLOW_" + suffix + ":" + x64_nl_char())
     sb_push(sb, x64_dynamic_promote_both_asm(suffix + "O", spilled))
@@ -2284,6 +2297,272 @@ make a function called x64_os_spawn_run_asm returns asm
   return sb_str(sb)
 end
 
+# ---- Stage B, part 1 of the interp.patlang-compilation roadmap (#25):
+# real TCP networking via Winsock2. These are deliberately narrow raw
+# primitives (a single socket op each) -- ALL bookkeeping (the
+# g_listeners_table/g_conns_table [id, socket] assoc-lists, the
+# tcp_try_listen AddrInUse carve-out, the tcp_read-vs-tcp_read_or_empty
+# fatal/non-fatal split) lives in ordinary PatLang wrapper functions in
+# x64_runtime.patlang, matching this backend's established "runtime
+# logic belongs in PatLang, native primitives stay narrow" philosophy
+# (see x64_exec_capture_asm's own header for the precedent). r12/r13/
+# r14/rbx are all safe scratch here: none of them is ever assigned to a
+# PatLang local across a CallHost instruction (x64_reg_pool is
+# rbx/r13/r14 only, and the register allocator treats CallHost as a
+# call boundary -- see x64_instr_is_call_boundary -- so no local can be
+# live in ANY of them at this exact point); Win32/Winsock DLL calls
+# follow the real Win64 ABI and preserve rbx/rsi/rdi/rbp/r12-r15
+# themselves, so (unlike calls to this backend's OWN rt_heap_alloc,
+# which has no such guarantee) values kept in those registers safely
+# survive back-to-back winsock calls within one primitive.
+
+make a function called x64_os_wsa_startup_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 480" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    mov rcx, 514" + x64_nl_char())
+  sb_push(sb, "    lea rdx, [rsp+32]" + x64_nl_char())
+  sb_push(sb, "    call WSAStartup" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# os_bind_listen(sock, port) -> actual bound port (>=0) on success, -1
+# if the port is already in use (WSAEADDRINUSE, 10048 -- the ONE
+# specific carve-out tcp_try_listen needs), -2 for any other failure.
+# Binds to 127.0.0.1 specifically (matching host_tcp_listen's own
+# TcpListener::bind(("127.0.0.1", port)), not 0.0.0.0), and reads back
+# the ACTUAL bound port via getsockname so port=0 (OS-assigned) works
+# the same as a real port number.
+make a function called x64_os_bind_listen_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "    pop rdx" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    mov r12, rax" + x64_nl_char())
+  sb_push(sb, "    mov r13, rdx" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 96" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  # sockaddr_in @ [rsp+32..47]: sin_family=AF_INET, sin_port=htons(port),
+  # sin_addr=127.0.0.1 (bytes 127,0,0,1 read back as the little-endian
+  # dword 16777343), sin_zero=0.
+  sb_push(sb, "    mov word [rsp+32], 2" + x64_nl_char())
+  sb_push(sb, "    mov cx, r13w" + x64_nl_char())
+  sb_push(sb, "    call htons" + x64_nl_char())
+  sb_push(sb, "    mov [rsp+34], ax" + x64_nl_char())
+  sb_push(sb, "    mov dword [rsp+36], 16777343" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+40], 0" + x64_nl_char())
+  sb_push(sb, "    mov rcx, r12" + x64_nl_char())
+  sb_push(sb, "    lea rdx, [rsp+32]" + x64_nl_char())
+  sb_push(sb, "    mov r8, 16" + x64_nl_char())
+  sb_push(sb, "    call bind" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+  sb_push(sb, "    jne .bl_bind_failed_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rcx, r12" + x64_nl_char())
+  sb_push(sb, "    mov rdx, 128" + x64_nl_char())
+  sb_push(sb, "    call listen" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+  sb_push(sb, "    jne .bl_listen_failed_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rcx, r12" + x64_nl_char())
+  sb_push(sb, "    lea rdx, [rsp+32]" + x64_nl_char())
+  sb_push(sb, "    mov dword [rsp+56], 16" + x64_nl_char())
+  sb_push(sb, "    lea r8, [rsp+56]" + x64_nl_char())
+  sb_push(sb, "    call getsockname" + x64_nl_char())
+  sb_push(sb, "    movzx rax, word [rsp+34]" + x64_nl_char())
+  sb_push(sb, "    mov cx, ax" + x64_nl_char())
+  sb_push(sb, "    call ntohs" + x64_nl_char())
+  sb_push(sb, "    movzx rax, ax" + x64_nl_char())
+  sb_push(sb, "    jmp .bl_done_" + suffix + x64_nl_char())
+  sb_push(sb, ".bl_bind_failed_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    call WSAGetLastError" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 10048" + x64_nl_char())
+  sb_push(sb, "    je .bl_addrinuse_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rax, 0 - 2" + x64_nl_char())
+  sb_push(sb, "    jmp .bl_done_" + suffix + x64_nl_char())
+  sb_push(sb, ".bl_addrinuse_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rax, 0 - 1" + x64_nl_char())
+  sb_push(sb, "    jmp .bl_done_" + suffix + x64_nl_char())
+  sb_push(sb, ".bl_listen_failed_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rax, 0 - 2" + x64_nl_char())
+  sb_push(sb, ".bl_done_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
+make a function called x64_os_accept_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    pop rcx" + x64_nl_char())
+  sb_push(sb, "    mov r12, rcx" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    mov rcx, r12" + x64_nl_char())
+  sb_push(sb, "    xor rdx, rdx" + x64_nl_char())
+  sb_push(sb, "    xor r8, r8" + x64_nl_char())
+  sb_push(sb, "    call accept" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# os_connect(host_string, port) -> SOCKET on success, -1 on failure.
+# Resolves host via getaddrinfo (AF_UNSPEC/SOCK_STREAM/IPPROTO_TCP
+# hints, arbitrary hostname or numeric IP -- not a numeric-IP-only
+# shortcut), patches the resolved sockaddr's port field directly
+# (sin_port/sin6_port share the same offset+2 in both sockaddr_in and
+# sockaddr_in6, so one patch covers both families) since getaddrinfo's
+# own pServiceName mechanism would need a decimal-string port this
+# backend has no ready int-to-string routine for, then creates the
+# socket using the family/socktype/protocol getaddrinfo itself
+# resolved (so it's never wrong for the family actually returned).
+make a function called x64_os_connect_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  # Real bug found and fixed here: this used to pop THREE stack values
+  # (host_addr, host_len, port), as if the caller pre-split the host
+  # string into a raw address/length pair -- but the actual CallHost
+  # site (os_connect(host_string, port), called from tcp_connect) only
+  # ever pushes TWO values, the tagged host STRING and the port. Popping
+  # an extra value read one slot too far down the real value stack,
+  # corrupting whatever the caller's own earlier expression had there
+  # (confirmed directly: segfaulted on the very next real call). Fixed
+  # to unmask the tagged string itself, same [len][bytes] convention
+  # os_send's own r13/r14 unmasking already uses.
+  sb_push(sb, "    pop rdx" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    mov r12, rdx" + x64_nl_char())
+  sb_push(sb, "    mov r15, 281474976710655" + x64_nl_char())
+  sb_push(sb, "    and rax, r15" + x64_nl_char())
+  sb_push(sb, "    mov r10, [rax]" + x64_nl_char())
+  sb_push(sb, "    add rax, 8" + x64_nl_char())
+  sb_push(sb, x64_os_null_terminate_path_asm(suffix))
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 128" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+32], 0" + x64_nl_char())
+  sb_push(sb, "    mov dword [rsp+40], 1" + x64_nl_char())
+  sb_push(sb, "    mov dword [rsp+44], 6" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+48], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+56], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+64], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+72], 0" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [rel g_scratch]" + x64_nl_char())
+  sb_push(sb, "    xor rdx, rdx" + x64_nl_char())
+  sb_push(sb, "    lea r8, [rsp+32]" + x64_nl_char())
+  sb_push(sb, "    lea r9, [rsp+88]" + x64_nl_char())
+  sb_push(sb, "    call getaddrinfo" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+  sb_push(sb, "    jne .conn_fail_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov r13, [rsp+88]" + x64_nl_char())
+  sb_push(sb, "    mov cx, r12w" + x64_nl_char())
+  sb_push(sb, "    call htons" + x64_nl_char())
+  sb_push(sb, "    mov r14, [r13+32]" + x64_nl_char())
+  sb_push(sb, "    mov [r14+2], ax" + x64_nl_char())
+  sb_push(sb, "    mov ecx, [r13+4]" + x64_nl_char())
+  sb_push(sb, "    mov edx, [r13+8]" + x64_nl_char())
+  sb_push(sb, "    mov r8d, [r13+12]" + x64_nl_char())
+  sb_push(sb, "    call socket" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 0 - 1" + x64_nl_char())
+  sb_push(sb, "    je .conn_fail_freeaddr_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rbx, rax" + x64_nl_char())
+  sb_push(sb, "    mov rcx, rbx" + x64_nl_char())
+  sb_push(sb, "    mov rdx, r14" + x64_nl_char())
+  sb_push(sb, "    mov r8d, dword [r13+16]" + x64_nl_char())
+  sb_push(sb, "    call connect" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+  sb_push(sb, "    jne .conn_fail_closesock_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rcx, r13" + x64_nl_char())
+  sb_push(sb, "    call freeaddrinfo" + x64_nl_char())
+  sb_push(sb, "    mov rax, rbx" + x64_nl_char())
+  sb_push(sb, "    jmp .conn_done_" + suffix + x64_nl_char())
+  sb_push(sb, ".conn_fail_closesock_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rcx, rbx" + x64_nl_char())
+  sb_push(sb, "    call closesocket" + x64_nl_char())
+  sb_push(sb, ".conn_fail_freeaddr_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rcx, r13" + x64_nl_char())
+  sb_push(sb, "    call freeaddrinfo" + x64_nl_char())
+  sb_push(sb, "    mov rax, 0 - 1" + x64_nl_char())
+  sb_push(sb, "    jmp .conn_done_" + suffix + x64_nl_char())
+  sb_push(sb, ".conn_fail_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rax, 0 - 1" + x64_nl_char())
+  sb_push(sb, ".conn_done_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# os_recv(sock) -> tagged string (0..65536 bytes read). Also records
+# whether the recv itself failed into g_last_recv_error (read
+# separately by os_recv_had_error) -- tcp_read (fatal on a genuine
+# error) and tcp_read_or_empty (never fatal) share this ONE raw
+# primitive and diverge purely in the ordinary-PatLang wrapper, per
+# this backend's usual split of responsibility.
+make a function called x64_os_recv_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    mov rax, 65544" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    call rt_heap_alloc" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, "    mov r13, rax" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    mov r12, rax" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    mov rcx, r12" + x64_nl_char())
+  sb_push(sb, "    lea rdx, [r13+8]" + x64_nl_char())
+  sb_push(sb, "    mov r8, 65536" + x64_nl_char())
+  sb_push(sb, "    xor r9, r9" + x64_nl_char())
+  sb_push(sb, "    call recv" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 0 - 1" + x64_nl_char())
+  sb_push(sb, "    jne .recv_ok_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov qword [rel g_last_recv_error], 1" + x64_nl_char())
+  sb_push(sb, "    mov qword [r13], 0" + x64_nl_char())
+  sb_push(sb, "    jmp .recv_done_" + suffix + x64_nl_char())
+  sb_push(sb, ".recv_ok_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov qword [rel g_last_recv_error], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [r13], rax" + x64_nl_char())
+  sb_push(sb, ".recv_done_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rax, r13" + x64_nl_char())
+  sb_push(sb, "    mov rcx, 2305843009213693952" + x64_nl_char())
+  sb_push(sb, "    or rax, rcx" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# os_send(sock, data_string) -> bytes sent, or -1. Unmasks the tagged
+# string itself (same [len][bytes] layout/masking as rt_exec_join_args's
+# own r13 pattern) rather than requiring the PatLang caller to pre-split
+# it into a raw address/length pair.
+make a function called x64_os_send_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    pop rdx" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    mov r12, rax" + x64_nl_char())
+  sb_push(sb, "    mov r15, 281474976710655" + x64_nl_char())
+  sb_push(sb, "    and rdx, r15" + x64_nl_char())
+  sb_push(sb, "    mov r13, [rdx]" + x64_nl_char())
+  sb_push(sb, "    lea r14, [rdx+8]" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    mov rcx, r12" + x64_nl_char())
+  sb_push(sb, "    mov rdx, r14" + x64_nl_char())
+  sb_push(sb, "    mov r8, r13" + x64_nl_char())
+  sb_push(sb, "    xor r9, r9" + x64_nl_char())
+  sb_push(sb, "    call send" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
 # CallHost -- only the five special primitive names are legal here,
 # PLUS two safe aliases (Slice 4): `l[i]` index syntax always lowers to
 # CallHost("list_get", 2) regardless of backend (lib/lower.patlang's
@@ -2469,42 +2748,106 @@ make a function called x64_callhost_asm takes name, argc returns asm
     # by is_alive/wait (both ordinary PatLang functions in x64_runtime.
     # patlang) rather than exposing raw GetExitCodeProcess plumbing there.
     sb_push(sb, "    pop rcx" + x64_nl_char())
-    sb_push(sb, "    sub rsp, 40" + x64_nl_char())
+    sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+    sb_push(sb, "    sub rsp, 48" + x64_nl_char())
+    sb_push(sb, "    and rsp, -16" + x64_nl_char())
     sb_push(sb, "    lea rdx, [rsp+32]" + x64_nl_char())
     sb_push(sb, "    call GetExitCodeProcess" + x64_nl_char())
     sb_push(sb, "    mov eax, [rsp+32]" + x64_nl_char())
-    sb_push(sb, "    add rsp, 40" + x64_nl_char())
+    sb_push(sb, "    mov rsp, r15" + x64_nl_char())
     sb_push(sb, "    push rax" + x64_nl_char())
   elif name == "os_terminate_process" then
     # TerminateProcess(handle) -- best-effort, failure (already-exited)
     # is not surfaced as an error, matching the real host's `let _ =
     # child.kill()` semantics (rust-runtime/src/ir/hosts.rs).
+    #
+    # Real bug found and fixed here: a plain `sub rsp, N`/`add rsp, N`
+    # (no `and rsp, -16`) silently ASSUMES the incoming rsp is already
+    # 16-aligned -- but this backend's own value-stack pushes/pops use
+    # the real machine rsp directly for expression evaluation, and a
+    # function's post-prologue baseline alignment depends on that
+    # function's own frame_size (8 * (spilled_count + 3)) mod 16, which
+    # varies function to function. Confirmed directly: os_socket_tcp
+    # with a bare `sub rsp, 32` crashed in some call sites but not
+    # others, purely depending on which enclosing function's frame_size
+    # parity happened to leave rsp already aligned. Every one of these
+    # thin OS-primitive wrappers now self-aligns via the same
+    # save-rsp/and/restore dance x64_os_write_file_asm/x64_os_exec_run_
+    # asm/x64_os_wsa_startup_asm already used, matching this file's own
+    # established (if not universally followed) precedent.
     sb_push(sb, "    pop rcx" + x64_nl_char())
     sb_push(sb, "    mov rdx, 1" + x64_nl_char())
+    sb_push(sb, "    mov r15, rsp" + x64_nl_char())
     sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+    sb_push(sb, "    and rsp, -16" + x64_nl_char())
     sb_push(sb, "    call TerminateProcess" + x64_nl_char())
-    sb_push(sb, "    add rsp, 32" + x64_nl_char())
+    sb_push(sb, "    mov rsp, r15" + x64_nl_char())
     sb_push(sb, "    push 0" + x64_nl_char())
   elif name == "os_wait_for_single_object" then
     # WaitForSingleObject(handle, INFINITE) -- blocking wait used by
     # wait()'s reap-to-completion semantics.
     sb_push(sb, "    pop rcx" + x64_nl_char())
     sb_push(sb, "    mov rdx, -1" + x64_nl_char())
+    sb_push(sb, "    mov r15, rsp" + x64_nl_char())
     sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+    sb_push(sb, "    and rsp, -16" + x64_nl_char())
     sb_push(sb, "    call WaitForSingleObject" + x64_nl_char())
-    sb_push(sb, "    add rsp, 32" + x64_nl_char())
+    sb_push(sb, "    mov rsp, r15" + x64_nl_char())
     sb_push(sb, "    push 0" + x64_nl_char())
   elif name == "os_close_handle" then
     sb_push(sb, "    pop rcx" + x64_nl_char())
+    sb_push(sb, "    mov r15, rsp" + x64_nl_char())
     sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+    sb_push(sb, "    and rsp, -16" + x64_nl_char())
     sb_push(sb, "    call CloseHandle" + x64_nl_char())
-    sb_push(sb, "    add rsp, 32" + x64_nl_char())
+    sb_push(sb, "    mov rsp, r15" + x64_nl_char())
     sb_push(sb, "    push 0" + x64_nl_char())
   elif name == "os_sleep_ms" then
     sb_push(sb, "    pop rcx" + x64_nl_char())
+    sb_push(sb, "    mov r15, rsp" + x64_nl_char())
     sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+    sb_push(sb, "    and rsp, -16" + x64_nl_char())
     sb_push(sb, "    call Sleep" + x64_nl_char())
-    sb_push(sb, "    add rsp, 32" + x64_nl_char())
+    sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+    sb_push(sb, "    push 0" + x64_nl_char())
+  elif name == "os_wsa_startup" then
+    # Idempotent (Winsock reference-counts WSAStartup internally, and
+    # this process never calls WSACleanup) -- called unconditionally at
+    # the top of tcp_listen/tcp_try_listen/tcp_connect rather than
+    # gated behind g_wsa_init, since the g_wsa_init check itself would
+    # need the exact same save/restore-rsp dance this already does.
+    sb_push(sb, x64_os_wsa_startup_asm())
+    sb_push(sb, "    push 0" + x64_nl_char())
+  elif name == "os_socket_tcp" then
+    sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+    sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+    sb_push(sb, "    and rsp, -16" + x64_nl_char())
+    sb_push(sb, "    mov ecx, 2" + x64_nl_char())
+    sb_push(sb, "    mov edx, 1" + x64_nl_char())
+    sb_push(sb, "    mov r8d, 6" + x64_nl_char())
+    sb_push(sb, "    call socket" + x64_nl_char())
+    sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
+  elif name == "os_bind_listen" then
+    sb_push(sb, x64_os_bind_listen_asm())
+  elif name == "os_accept" then
+    sb_push(sb, x64_os_accept_asm())
+  elif name == "os_connect" then
+    sb_push(sb, x64_os_connect_asm())
+  elif name == "os_recv" then
+    sb_push(sb, x64_os_recv_asm())
+  elif name == "os_recv_had_error" then
+    sb_push(sb, "    mov rax, [rel g_last_recv_error]" + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
+  elif name == "os_send" then
+    sb_push(sb, x64_os_send_asm())
+  elif name == "os_closesocket" then
+    sb_push(sb, "    pop rcx" + x64_nl_char())
+    sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+    sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+    sb_push(sb, "    and rsp, -16" + x64_nl_char())
+    sb_push(sb, "    call closesocket" + x64_nl_char())
+    sb_push(sb, "    mov rsp, r15" + x64_nl_char())
     sb_push(sb, "    push 0" + x64_nl_char())
   else
   if name == "list_len" then
@@ -3777,7 +4120,7 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
     end
     sb_push(sb, sb_str(gl_line) + x64_nl_char())
   end
-  sb_push(sb, "extern GetStdHandle, WriteFile, ExitProcess, CreateFileA, GetFileSize, CloseHandle, ReadFile, CreateProcessA, CreatePipe, SetHandleInformation, WaitForSingleObject, GetCommandLineA, GetExitCodeProcess, TerminateProcess, WSAStartup, WSAGetLastError, socket, bind, listen, accept, connect, send, recv, closesocket, shutdown, getaddrinfo, freeaddrinfo, ioctlsocket, htons, Sleep" + x64_nl_char())
+  sb_push(sb, "extern GetStdHandle, WriteFile, ExitProcess, CreateFileA, GetFileSize, CloseHandle, ReadFile, CreateProcessA, CreatePipe, SetHandleInformation, WaitForSingleObject, GetCommandLineA, GetExitCodeProcess, TerminateProcess, WSAStartup, WSAGetLastError, socket, bind, listen, accept, connect, send, recv, closesocket, shutdown, getaddrinfo, freeaddrinfo, getsockname, ioctlsocket, htons, ntohs, Sleep" + x64_nl_char())
   let en_count = to_num(list_len(extern_names))
   if en_count > 0 then
     let en_line = sb_new()
@@ -3795,7 +4138,7 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
   sb_push(sb, x64_nl_char())
   sb_push(sb, "section .bss" + x64_nl_char())
   if owns_globals then
-    sb_push(sb, "    global g_written, g_scratch, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init" + x64_nl_char())
+    sb_push(sb, "    global g_written, g_scratch, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init, g_last_recv_error" + x64_nl_char())
     sb_push(sb, "    align 8" + x64_nl_char())
     sb_push(sb, "    g_written resd 1" + x64_nl_char())
     sb_push(sb, "    align 8" + x64_nl_char())
@@ -3825,10 +4168,11 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
     # the first networking call in the program, matching the same
     # lazy-init-on-first-use convention every other table here uses.
     sb_push(sb, "    g_wsa_init resq 1" + x64_nl_char())
+    sb_push(sb, "    g_last_recv_error resq 1" + x64_nl_char())
     sb_push(sb, "    align 16" + x64_nl_char())
     sb_push(sb, "    g_heap resb 16777216" + x64_nl_char())
   else
-    sb_push(sb, "extern g_written, g_scratch, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init" + x64_nl_char())
+    sb_push(sb, "extern g_written, g_scratch, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init, g_last_recv_error" + x64_nl_char())
   end
   sb_push(sb, x64_nl_char())
   sb_push(sb, "section .data" + x64_nl_char())
