@@ -1,0 +1,150 @@
+# BDD-style verification of the Gherkin-driven contract-clause feature
+# (GitHub issue #12): "And require <expr>" / "And ensure <expr>" steps in
+# a .feature scenario, checked against a concrete bound value rather than
+# encoded as a GOAP GroundFact (see self_hosting/lib/gherkin_contracts.
+# patlang for why: a scalar comparison like `x < 10` isn't a unifiable
+# ground predicate, so it's verified as a boolean guard evaluated directly
+# against the scenario's own bound value(s), not shoehorned into GOAP's
+# unification-based precondition matching).
+#
+# Slice 1 (first scenario): a hand-written "brilliant" transformation,
+# isolating the new require/ensure step grammar from the GOAP-synthesis
+# bridge. Slice 2 (second/third scenarios): the same clauses now checked
+# against a GENUINELY GOAP-synthesized action -- one scenario whose
+# synthesized candidate satisfies its contract, and one where it's
+# deliberately made to violate it, to prove goap_verify_contracts
+# actually rejects a bad candidate rather than always reporting success.
+
+include "../lib/includes.patlang"
+include "../lib/test.patlang"
+include "../lib/gherkin_contracts.patlang"
+
+# One action template, registered once: scale(X) requires input(X),
+# produces scaled(X) -- the same parameterized-action shape as
+# self_hosting/examples/goap_parameterized_demo.patlang's build(X).
+action_add("scale", [["input", ["X"]]], [["scaled", ["X"]]], [], 1)
+
+# ---- step definitions ----
+
+make a function called st_given_integer_x returns done
+  set_var("x", 5)
+  return true
+end
+
+make a function called st_do_something_brilliant returns done
+  let x = get("__vars", "x")
+  set_var("gc_result", x * 2)
+  return true
+end
+
+make a function called st_returns_2x returns done
+  let x = get("__vars", "x")
+  let result = get("__vars", "gc_result")
+  check("brilliant scaling returns 2*x", result, x * 2)
+  return true
+end
+
+make a function called st_given_input_5 returns done
+  rule_add("input", ["5"], [])
+  set_var("gc_target", "5")
+  return true
+end
+
+make a function called st_given_input_15 returns done
+  rule_add("input", ["15"], [])
+  set_var("gc_target", "15")
+  return true
+end
+
+make a function called st_scale_synthesized returns done
+  let target = get("__vars", "gc_target")
+  let labels = plan([["scaled", [target]]])
+  set_var("gc_plan_labels", labels)
+  return true
+end
+
+make a function called st_plan_satisfies_contracts returns done
+  let labels = get("__vars", "gc_plan_labels")
+  let pending = get("__vars", "t_pending_contracts")
+  let ok = goap_verify_contracts(pending, labels)
+  set_var("t_pending_contracts", [])
+  check("goap-synthesized plan satisfies its Gherkin contract clauses", ok, true)
+  return true
+end
+
+make a function called st_gherkin_contracts_lib_is_assertion_free returns done
+  # The whole point of this feature (GitHub issue #12): a require/ensure
+  # clause checked via handle_contract_step/goap_verify_contracts must
+  # never itself be, or emit, a runtime contract_check(...) call -- that
+  # would just be a differently-spelled ordinary assertion, not a
+  # verification that happens separately from (and before) the checked
+  # code. Confirmed directly by inspecting the actual library source text
+  # for the host call that "require"/"ensure"/"assert" always lower to
+  # (contract_check, self_hosting/lib/parser.patlang:~1150,
+  # rust-runtime/src/ir/lowering.rs:~267) -- not by trusting the design
+  # note's own claim about itself.
+  let src = read_file("self_hosting/lib/gherkin_contracts.patlang")
+  let has_contract_check = gc_find_substr(src, "contract_check(") >= 0
+  check("gherkin_contracts.patlang never calls the runtime contract_check(...) primitive", has_contract_check, false)
+  return true
+end
+
+make a function called st_plan_violates_contracts returns done
+  let labels = get("__vars", "gc_plan_labels")
+  let pending = get("__vars", "t_pending_contracts")
+  let ok = goap_verify_contracts(pending, labels)
+  set_var("t_pending_contracts", [])
+  check("a contract-violating synthesized candidate is correctly rejected", ok, false)
+  return true
+end
+
+make a function called register_contract_steps returns done
+  step("an integer x", "st_given_integer_x")
+  step("I do something brilliant", "st_do_something_brilliant")
+  step("it returns 2*x", "st_returns_2x")
+  step("a scalable input of 5", "st_given_input_5")
+  step("a scalable input of 15", "st_given_input_15")
+  step("a scale action is synthesized for that input", "st_scale_synthesized")
+  step("the plan satisfies its contract clauses", "st_plan_satisfies_contracts")
+  step("the plan violates its contract clauses", "st_plan_violates_contracts")
+  step("the contract library is assertion-free", "st_gherkin_contracts_lib_is_assertion_free")
+  return true
+end
+
+make a function called gc_feature returns text
+  return "Feature: Mathematical Transformations
+
+Scenario: Brilliant integer scaling with bounds
+  Given an integer x
+  And require x < 10
+  When I do something brilliant
+  Then it returns 2*x
+  And ensure x < 20
+
+Scenario: GOAP-synthesized scaling respects its contract clauses
+  Given a scalable input of 5
+  And require X < 10
+  When a scale action is synthesized for that input
+  And ensure X < 20
+  Then the plan satisfies its contract clauses
+
+Scenario: a synthesized candidate violating its contract is correctly rejected
+  Given a scalable input of 15
+  And require X < 10
+  When a scale action is synthesized for that input
+  Then the plan violates its contract clauses
+
+Scenario: the contract-checking mechanism is genuinely separate from runtime assertions
+  Then the contract library is assertion-free
+"
+end
+
+make a function called run_goap_contract_bdd returns ok
+  t_init()
+  register_contract_steps()
+  run_feature(gc_feature())
+  t_report()
+  return get("__vars", "t_fail") == 0
+end
+
+run_goap_contract_bdd()

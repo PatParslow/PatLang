@@ -1,0 +1,226 @@
+# Gherkin-driven contract clauses for GOAP synthesis (GitHub issue #12).
+#
+# Adds "And require <expr>" / "And ensure <expr>" as real, checked steps
+# in a .feature scenario, WITHOUT encoding them as GOAP GroundFacts: a
+# scalar comparison like `x < 10` isn't a unifiable ground predicate the
+# way action_add's preconditions/effects are (see hosts.rs's
+# parse_ground_facts/ground_action_instances) -- inventing an infinite
+# family of numeric facts to represent every possible comparison isn't
+# how the search space works, and isn't what require/ensure mean
+# elsewhere in the language either (a runtime-evaluated boolean over live
+# values, not a search-time predicate).
+#
+# Instead: a require/ensure clause is parsed into [var, op, literal],
+# looked up against the SAME global __vars store set_var/get already use
+# (get("__vars", var) -- the convention a Given step establishes: "Given
+# an integer x" binds the global variable named exactly "x"), and
+# evaluated as a plain boolean guard. Convention, not coincidence: this
+# mirrors how ordinary require/ensure statements in hand-written PatLang
+# functions are evaluated against real bound values, just triggered from
+# a Gherkin step instead of a function body.
+#
+# Deliberately narrow grammar (see the design discussion in GitHub issue
+# #12 and the plan that shipped this): <ident> <op> <literal>, exactly
+# three space-separated tokens, <op> one of < <= > >= == !=, <literal> an
+# integer. This does NOT reuse parser.patlang's full expression grammar --
+# that would be a large, unwarranted dependency from the Gherkin runner
+# onto the compiler's own parser internals for a single binary comparison.
+
+include "includes.patlang"
+
+make a function called gc_split_ws takes s returns parts
+  let parts = []
+  let cur = sb_new()
+  let i = 0
+  while i < s.length do
+    let c = char_code(s, i)
+    if c == 32 then
+      if sb_str(cur).length > 0 then
+        let parts = list_push(parts, sb_str(cur))
+        let cur = sb_new()
+      end
+    else
+      sb_push(cur, s[i])
+    end
+    let i = i + 1
+  end
+  if sb_str(cur).length > 0 then
+    let parts = list_push(parts, sb_str(cur))
+  end
+  return parts
+end
+
+# parse_contract_clause("x < 10") -> ["x", "<", "10"]
+# On malformed input (not exactly 3 tokens), returns ["ERR", message].
+make a function called parse_contract_clause takes text returns clause
+  let tokens = gc_split_ws(text)
+  if to_num(list_len(tokens)) != 3 then
+    return ["ERR", "malformed contract clause (expected '<ident> <op> <literal>'): " + text]
+  end
+  return tokens
+end
+
+make a function called eval_cmp takes op, lhs, rhs returns ok
+  if op == "<" then
+    return lhs < rhs
+  end
+  if op == "<=" then
+    return lhs <= rhs
+  end
+  if op == ">" then
+    return lhs > rhs
+  end
+  if op == ">=" then
+    return lhs >= rhs
+  end
+  if op == "==" then
+    return lhs == rhs
+  end
+  if op == "!=" then
+    return lhs != rhs
+  end
+  return false
+end
+
+# handle_contract_step(kind, clause_text): kind is "require" or "ensure",
+# clause_text is the raw text after that keyword (e.g. "x < 10").
+#
+# Two modes, chosen automatically by whether the clause's variable is
+# already bound:
+#  - IMMEDIATE: a prior Given step already set_var'd this exact variable
+#    name (the hand-written-function case, Slice 1) -- evaluated right
+#    away against that bound value, exactly like an ordinary require/
+#    ensure statement would be. A violation here records a real t_fail,
+#    same convention as an undefined step.
+#  - DEFERRED: the variable isn't bound yet (a GOAP synthesis hasn't run
+#    yet -- Slice 2's case, where the value only becomes known from the
+#    winning plan's own bindings). The parsed clause is stashed onto
+#    "t_pending_contracts" for a later goap_verify_contracts call to
+#    consume, once real bindings exist. Deliberately does NOT touch
+#    t_fail here -- whether a deferred clause holding or not is itself
+#    the very thing a scenario may be testing (see goap_verify_contracts),
+#    so recording pass/fail is left to the scenario's own explicit check.
+make a function called handle_contract_step takes kind, clause_text returns done
+  let clause = parse_contract_clause(clause_text)
+  if list_get(clause, 0) == "ERR" then
+    set_var("t_fail", get("__vars", "t_fail") + 1)
+    print("  FAIL: " + list_get(clause, 1))
+    return true
+  end
+  let var_name = list_get(clause, 0)
+  let op = list_get(clause, 1)
+  let literal = list_get(clause, 2)
+  let already_bound = get("__vars", var_name)
+  if already_bound then
+    let bound = to_num(already_bound)
+    let ok = eval_cmp(op, bound, to_num(literal))
+    if ok then
+      print("  ok: " + kind + " " + clause_text)
+    else
+      set_var("t_fail", get("__vars", "t_fail") + 1)
+      print("  FAIL: " + kind + " violated: " + clause_text)
+    end
+  else
+    let pending = get("__vars", "t_pending_contracts")
+    if pending then
+      let pending = list_push(pending, [kind, var_name, op, literal])
+    else
+      let pending = [[kind, var_name, op, literal]]
+    end
+    set_var("t_pending_contracts", pending)
+    print("  (deferred) " + kind + " " + clause_text)
+  end
+  return true
+end
+
+make a function called gc_find_substr takes hay, needle returns idx
+  if needle.length == 0 then
+    return 0
+  end
+  let i = 0
+  while i <= (hay.length - needle.length) do
+    if substr(hay, i, needle.length) == needle then
+      return i
+    end
+    let i = i + 1
+  end
+  return -1
+end
+
+# Extract the bound value of `var_name` from a GOAP plan-step label like
+# "scale(X=5)" or "assemble(X=final,Y=base)" (see action_instance_label,
+# rust-runtime/src/ir/hosts.rs). Returns "" if that label doesn't bind
+# this variable at all.
+make a function called gc_extract_binding takes label, var_name returns value
+  let needle = var_name + "="
+  let idx = gc_find_substr(label, needle)
+  if idx < 0 then
+    return ""
+  end
+  let start = idx + needle.length
+  let i = start
+  let scanning = true
+  while (i < label.length) and scanning do
+    let c = label[i]
+    if (c == ",") or (c == ")") then
+      let scanning = false
+    else
+      let i = i + 1
+    end
+  end
+  return substr(label, start, i - start)
+end
+
+# goap_verify_contracts(clauses, plan_labels) -> ok
+#
+# clauses: a list of ["require"|"ensure", var, op, literal] tuples, e.g.
+# what handle_contract_step stashes onto "t_pending_contracts" while
+# deferred. plan_labels: the list of strings plan() returns.
+#
+# Evaluates each clause against whichever plan step's label actually
+# binds that variable -- the guard is checked once against the concrete
+# value GOAP's search settled on, BEFORE that candidate is accepted or
+# any code is generated for it (see the design note at the top of this
+# file). A clause referencing a variable no step binds at all is treated
+# as a failure (there is nothing real to check it against). Prints an
+# ok/FAIL diagnostic per clause but deliberately does NOT touch t_fail
+# itself -- the caller decides, via its own check(...), whether the
+# returned boolean was the outcome that scenario expected (a deliberately
+# violating candidate being correctly rejected is itself a PASSING test).
+make a function called goap_verify_contracts takes clauses, plan_labels returns ok
+  let all_ok = true
+  let ci = 0
+  let cn = to_num(list_len(clauses))
+  while ci < cn do
+    let clause = list_get(clauses, ci)
+    let kind = list_get(clause, 0)
+    let var_name = list_get(clause, 1)
+    let op = list_get(clause, 2)
+    let literal = to_num(list_get(clause, 3))
+    let found = false
+    let li = 0
+    let ln = to_num(list_len(plan_labels))
+    while (li < ln) and (found == false) do
+      let label = list_get(plan_labels, li)
+      let raw = gc_extract_binding(label, var_name)
+      if raw != "" then
+        let found = true
+        let bound = to_num(raw)
+        let ok = eval_cmp(op, bound, literal)
+        if ok then
+          print("  ok: " + kind + " " + var_name + " " + op + " " + list_get(clause, 3) + " (from " + label + ")")
+        else
+          print("  FAIL: " + kind + " violated by synthesized plan: " + label)
+          let all_ok = false
+        end
+      end
+      let li = li + 1
+    end
+    if found == false then
+      print("  FAIL: " + kind + " references a variable no plan step binds: " + var_name)
+      let all_ok = false
+    end
+    let ci = ci + 1
+  end
+  return all_ok
+end
