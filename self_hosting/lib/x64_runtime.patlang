@@ -2495,3 +2495,452 @@ make a function called solve takes pred, query_args returns solutions
   end
   return out
 end
+
+# =============================================================================
+# GOAP planner (GitHub #27, Stage 2 of the #25 Rust-free-toolchain
+# roadmap): action_add/plan, uniform-cost search over world-states.
+# Ground truth: rust-runtime/src/ir/hosts.rs lines ~960-1131. Shares its
+# fact substrate with Stage 1 above: the world state is exactly the set
+# of ground, empty-body rules currently registered.
+#
+# Real programs in this repo use PARAMETERIZED actions with logic
+# variables in preconditions (e.g. action_add("build_from_dep",
+# [["dep",["X","Y"]],["built",["Y"]]], [["built",["X"]]], [], 1)),
+# genuinely requiring ground_action_instances to bind X/Y per-expansion
+# against the current state -- not a ground-only subset.
+#
+# No hashmap or priority-queue structure exists in this backend --
+# two DELIBERATE, DOCUMENTED simplifications instead of hidden
+# approximations, both explicitly named in the planning discussion for
+# this feature:
+#   - Frontier: a growable list of [cost, state, path] nodes, linear-
+#     scan "pop minimum" instead of a real binary heap.
+#   - Visited: canonicalize each state as a sorted, joined string of
+#     "pred(args)" facts, checked via linear scan instead of a hashset.
+# Both bounded by the same NODE_CAP (5000) the Rust host uses either
+# way.
+# =============================================================================
+
+make a function called logic_actions_list returns l
+  let addr = mem_actions_table_addr()
+  let l = mem_peek_qword(addr, 0)
+  if l == 0 then
+    let l = rt_list_new(0)
+    mem_poke_qword(addr, 0, l)
+  end
+  return l
+end
+
+make a function called logic_actions_list_set takes l returns done
+  mem_poke_qword(mem_actions_table_addr(), 0, l)
+  return true
+end
+
+# action_add(name, preconds_list, add_effects_list, del_effects_list,
+# cost) -> Unit. preconds/add_effects/del_effects are lists of
+# [pred, args_list] pairs -- the SAME shape as a rule's body items.
+make a function called action_add takes name, preconds, add_effects, del_effects, cost returns done
+  let actions = logic_actions_list()
+  let actions = rt_list_push(actions, [name, preconds, add_effects, del_effects, cost])
+  logic_actions_list_set(actions)
+  return true
+end
+
+make a function called logic_is_ground_args takes args returns yes
+  let n = args.length
+  let i = 0
+  while i < n do
+    if is_logic_var(args[i]) then
+      return false
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+# World state = every rule with an empty body AND no variable in its
+# head args (a genuine ground fact, not a general rule).
+make a function called current_ground_facts_as_state returns state
+  let rules = logic_rules_list()
+  let n = rules.length
+  let out = rt_list_new(0)
+  let i = 0
+  while i < n do
+    let rule = rules[i]
+    if rule[2].length == 0 then
+      if logic_is_ground_args(rule[1]) then
+        let out = rt_list_push(out, [rule[0], rule[1]])
+      end
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called logic_fact_eq takes a, b returns yes
+  if not rt_str_eq(a[0], b[0]) then
+    return false
+  end
+  let aa = a[1]
+  let ba = b[1]
+  if aa.length != ba.length then
+    return false
+  end
+  let n = aa.length
+  let i = 0
+  while i < n do
+    if not rt_str_eq(aa[i], ba[i]) then
+      return false
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+make a function called logic_state_contains takes state, fact returns yes
+  let n = state.length
+  let i = 0
+  while i < n do
+    if logic_fact_eq(state[i], fact) then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# Conjunctively unify an action's (possibly parameterized)
+# preconditions against the current world state, returning one Subst
+# per way they can all hold simultaneously (matching
+# ground_action_instances in the Rust host exactly -- reuses Stage 1's
+# unify_args/apply_subst directly, just matching against STATE facts
+# instead of the rules store).
+make a function called logic_ground_action_instances_go takes remaining, state, subst, out returns out2
+  if remaining.length == 0 then
+    return rt_list_push(out, subst)
+  end
+  let first = remaining[0]
+  let pred = first[0]
+  let fargs = first[1]
+  let applied = apply_subst(fargs, subst)
+  let rest_n = remaining.length - 1
+  let rest = rt_list_new(rest_n)
+  let ri = 0
+  while ri < rest_n do
+    rt_list_set(rest, ri, remaining[ri + 1])
+    let ri = ri + 1
+  end
+  let sn = state.length
+  let si = 0
+  let cur_out = out
+  while si < sn do
+    let fact = state[si]
+    if rt_str_eq(fact[0], pred) then
+      let u = unify_args(applied, fact[1], subst)
+      if u[0] == "Ok" then
+        let cur_out = logic_ground_action_instances_go(rest, state, u[1], cur_out)
+      end
+    end
+    let si = si + 1
+  end
+  return cur_out
+end
+
+make a function called ground_action_instances takes preconds, state returns substs
+  return logic_ground_action_instances_go(preconds, state, [], rt_list_new(0))
+end
+
+# A parameterized action's plan step is reported with its bound values
+# (e.g. "build(X=target_a)") so two instantiations of the same action
+# template are distinguishable in the returned plan -- ground actions
+# report their bare name unchanged, matching the Rust host exactly.
+make a function called logic_collect_vars_in_args takes args, seen returns out
+  let n = args.length
+  let i = 0
+  let cur = seen
+  while i < n do
+    let a = args[i]
+    if is_logic_var(a) then
+      let found = false
+      let sj = 0
+      let sn = cur.length
+      while sj < sn do
+        if rt_str_eq(cur[sj], a) then
+          let found = true
+        end
+        let sj = sj + 1
+      end
+      if not found then
+        let cur = rt_list_push(cur, a)
+      end
+    end
+    let i = i + 1
+  end
+  return cur
+end
+
+make a function called action_instance_label takes name, preconds, subst returns label
+  let seen = rt_list_new(0)
+  let n = preconds.length
+  let i = 0
+  while i < n do
+    let seen = logic_collect_vars_in_args(preconds[i][1], seen)
+    let i = i + 1
+  end
+  if seen.length == 0 then
+    return name
+  end
+  let parts = ""
+  let j = 0
+  let jn = seen.length
+  while j < jn do
+    if j > 0 then
+      let parts = parts + ","
+    end
+    let parts = parts + seen[j] + "=" + logic_walk(seen[j], subst)
+    let j = j + 1
+  end
+  return name + "(" + parts + ")"
+end
+
+# Real correctness hazard avoided here, same class as
+# logic_subst_extend above: `path` is the SAME starting list extended
+# independently by every sibling action-instance found at one search
+# node, so rt_list_push's mutate-in-place-when-possible growth would
+# let one sibling's appended step leak into another's path. Always
+# copies fresh.
+make a function called logic_path_extend takes path, label returns out
+  let n = path.length
+  let out = rt_list_new(n + 1)
+  let i = 0
+  while i < n do
+    rt_list_set(out, i, path[i])
+    let i = i + 1
+  end
+  rt_list_set(out, n, label)
+  return out
+end
+
+make a function called logic_frontier_pop_min takes frontier returns result
+  let n = frontier.length
+  let best_i = 0
+  let best_cost = frontier[0][0]
+  let i = 1
+  while i < n do
+    let c = frontier[i][0]
+    if c < best_cost then
+      let best_cost = c
+      let best_i = i
+    end
+    let i = i + 1
+  end
+  let node = frontier[best_i]
+  let rest_n = n - 1
+  let rest = rt_list_new(rest_n)
+  let ri = 0
+  let j = 0
+  while j < n do
+    if j != best_i then
+      rt_list_set(rest, ri, frontier[j])
+      let ri = ri + 1
+    end
+    let j = j + 1
+  end
+  return [node, rest]
+end
+
+make a function called logic_fact_to_str takes fact returns s
+  let out = fact[0] + "("
+  let args = fact[1]
+  let n = args.length
+  let i = 0
+  while i < n do
+    if i > 0 then
+      let out = out + ","
+    end
+    let out = out + args[i]
+    let i = i + 1
+  end
+  return out + ")"
+end
+
+# Canonicalizes a state (a value SET, order-independent) into one
+# comparable string: format every fact, sort the fragments (a simple
+# selection sort -- state sizes here are small and NODE_CAP already
+# bounds total work), join. Two states with the same facts in any
+# order canonicalize identically.
+make a function called logic_state_canonical takes state returns s
+  let n = state.length
+  let strs = rt_list_new(n)
+  let i = 0
+  while i < n do
+    rt_list_set(strs, i, logic_fact_to_str(state[i]))
+    let i = i + 1
+  end
+  let a = 0
+  while a < n do
+    let min_i = a
+    let b = a + 1
+    while b < n do
+      if rt_str_cmp(strs[b], strs[min_i]) < 0 then
+        let min_i = b
+      end
+      let b = b + 1
+    end
+    if min_i != a then
+      let tmp = strs[a]
+      rt_list_set(strs, a, strs[min_i])
+      rt_list_set(strs, min_i, tmp)
+    end
+    let a = a + 1
+  end
+  let out = ""
+  let j = 0
+  while j < n do
+    let out = out + strs[j] + "|"
+    let j = j + 1
+  end
+  return out
+end
+
+make a function called logic_visited_contains takes visited, key returns yes
+  let n = visited.length
+  let i = 0
+  while i < n do
+    if rt_str_eq(visited[i], key) then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called logic_state_remove takes state, fact returns out
+  let n = state.length
+  let out = rt_list_new(0)
+  let i = 0
+  while i < n do
+    if not logic_fact_eq(state[i], fact) then
+      let out = rt_list_push(out, state[i])
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# Real bug found via a Stage 2 regression test (GitHub #27): rt_list_
+# push mutates in place when capacity allows, and multiple sibling
+# actions considered at the SAME search node all start from the SAME
+# "state" reference -- mutating it in place here let one action's
+# added fact leak into a SIBLING action's own, supposedly-independent
+# precondition check at that same node (confirmed exactly: a 2-fact
+# extra state caused "link" to wrongly appear satisfied immediately
+# after "compile_b", because "compile_a"'s own state-add call, tried
+# moments earlier at the SAME node, had mutated the shared buffer
+# in place). Same class of hazard as logic_subst_extend/
+# logic_path_extend above; always copies fresh instead.
+make a function called logic_state_add takes state, fact returns out
+  if logic_state_contains(state, fact) then
+    return state
+  end
+  let n = state.length
+  let out = rt_list_new(n + 1)
+  let i = 0
+  while i < n do
+    rt_list_set(out, i, state[i])
+    let i = i + 1
+  end
+  rt_list_set(out, n, fact)
+  return out
+end
+
+make a function called logic_apply_effects takes state, effects, subst, is_add returns out
+  let n = effects.length
+  let cur = state
+  let i = 0
+  while i < n do
+    let eff = effects[i]
+    let grounded = [eff[0], apply_subst(eff[1], subst)]
+    if is_add then
+      let cur = logic_state_add(cur, grounded)
+    else
+      let cur = logic_state_remove(cur, grounded)
+    end
+    let i = i + 1
+  end
+  return cur
+end
+
+make a function called logic_state_satisfies_goal takes state, goal_facts returns yes
+  let n = goal_facts.length
+  let i = 0
+  while i < n do
+    if not logic_state_contains(state, goal_facts[i]) then
+      return false
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+# plan(goal_facts_list) -> List of action names/labels in execution
+# order, or an empty List if no plan is found within NODE_CAP.
+# Uniform-cost (Dijkstra) search: see this section's own header for
+# the linear-scan frontier/visited substitutions used in place of a
+# real heap/hashset.
+make a function called plan_facts takes goal_facts returns path
+  let actions = logic_actions_list()
+  let start_state = current_ground_facts_as_state()
+  let frontier = [[0, start_state, []]]
+  let visited = rt_list_new(0)
+  let node_cap = 5000
+  let expansions = 0
+  while frontier.length > 0 do
+    if expansions >= node_cap then
+      return []
+    end
+    let popped = logic_frontier_pop_min(frontier)
+    let node = popped[0]
+    let frontier = popped[1]
+    let cost = node[0]
+    let state = node[1]
+    let path = node[2]
+    let expansions = expansions + 1
+    if logic_state_satisfies_goal(state, goal_facts) then
+      return path
+    end
+    let key = logic_state_canonical(state)
+    if not logic_visited_contains(visited, key) then
+      let visited = rt_list_push(visited, key)
+      let an = actions.length
+      let ai = 0
+      while ai < an do
+        let action = actions[ai]
+        let aname = action[0]
+        let preconds = action[1]
+        let add_eff = action[2]
+        let del_eff = action[3]
+        let acost = action[4]
+        let insts = ground_action_instances(preconds, state)
+        let ii = 0
+        let in_n = insts.length
+        while ii < in_n do
+          let subst = insts[ii]
+          let new_state = logic_apply_effects(state, del_eff, subst, false)
+          let new_state = logic_apply_effects(new_state, add_eff, subst, true)
+          let label = action_instance_label(aname, preconds, subst)
+          let new_path = logic_path_extend(path, label)
+          let new_cost = cost + acost
+          let frontier = rt_list_push(frontier, [new_cost, new_state, new_path])
+          let ii = ii + 1
+        end
+        let ai = ai + 1
+      end
+    end
+  end
+  return []
+end
+
+make a function called plan takes goal_facts returns path
+  return plan_facts(goal_facts)
+end

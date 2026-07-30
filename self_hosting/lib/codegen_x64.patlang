@@ -2287,6 +2287,11 @@ make a function called x64_callhost_asm takes name, argc returns asm
         # store (see x64_runtime.patlang's own header on these).
         sb_push(sb, "    lea rax, [rel g_vars_table]" + x64_nl_char())
         sb_push(sb, "    push rax" + x64_nl_char())
+      elif name == "mem_actions_table_addr" then
+        # Same pattern again, for action_add/plan's global actions
+        # store (GitHub #27 -- the GOAP planner, Stage 2 of #25).
+        sb_push(sb, "    lea rax, [rel g_actions_table]" + x64_nl_char())
+        sb_push(sb, "    push rax" + x64_nl_char())
       elif name == "mem_rules_table_addr" then
         # Same pattern again, for rule_add/solve's global rules store
         # (GitHub #26/#25 -- the Prolog-like logic engine) -- a single
@@ -2387,7 +2392,36 @@ make a function called x64_callhost_asm takes name, argc returns asm
             # own newline, so it can never corrupt whatever follows it
             # regardless of how many unsupported-primitive calls a
             # program makes.
-            return "    ; UNSUPPORTED_PRIMITIVE_ERROR" + x64_nl_char()
+            #
+            # SECOND, much more serious bug found and fixed here
+            # (GitHub #27, Stage 2 regression testing): this comment
+            # line was the ONLY thing emitted at the call site -- the
+            # `argc` arguments already pushed onto the real stack by
+            # the preceding Const/Load instructions were never
+            # reclaimed, and no replacement result was ever pushed.
+            # Every subsequent instruction in the function still
+            # expects the stack machine's usual "N args consumed, 1
+            # result produced" discipline, so this silently desynced
+            # the REAL x64 stack pointer for everything downstream in
+            # the function -- not a wrong VALUE, an actually corrupted
+            # stack. Confirmed exactly: a test program calling an
+            # unrelated unsupported primitive (contract_check) twice,
+            # followed by a genuinely correct GOAP action_add/plan
+            # sequence, produced a wrong plan purely because of this
+            # upstream corruption -- the GOAP logic itself was fine in
+            # isolation. Fixed to reclaim the pushed arguments and push
+            # a harmless placeholder (0), matching the stack discipline
+            # every other primitive already follows -- still silently
+            # WRONG (an unsupported primitive's real behavior is still
+            # not implemented), but no longer stack-corrupting.
+            let asm = sb_new()
+            sb_push(asm, "    ; UNSUPPORTED_PRIMITIVE_ERROR" + x64_nl_char())
+            if argc > 0 then
+              sb_push(asm, "    add rsp, " + (argc * 8) + x64_nl_char())
+            end
+            sb_push(asm, "    mov rax, 0" + x64_nl_char())
+            sb_push(asm, "    push rax" + x64_nl_char())
+            return sb_str(asm)
           end
         end
       end
@@ -3457,7 +3491,7 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
   sb_push(sb, x64_nl_char())
   sb_push(sb, "section .bss" + x64_nl_char())
   if owns_globals then
-    sb_push(sb, "    global g_written, g_scratch, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap, g_rules_table" + x64_nl_char())
+    sb_push(sb, "    global g_written, g_scratch, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap, g_rules_table, g_actions_table" + x64_nl_char())
     sb_push(sb, "    align 8" + x64_nl_char())
     sb_push(sb, "    g_written resd 1" + x64_nl_char())
     sb_push(sb, "    align 8" + x64_nl_char())
@@ -3472,10 +3506,12 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
     sb_push(sb, "    g_vars_table resq 1" + x64_nl_char())
     sb_push(sb, "    align 8" + x64_nl_char())
     sb_push(sb, "    g_rules_table resq 1" + x64_nl_char())
+    sb_push(sb, "    align 8" + x64_nl_char())
+    sb_push(sb, "    g_actions_table resq 1" + x64_nl_char())
     sb_push(sb, "    align 16" + x64_nl_char())
     sb_push(sb, "    g_heap resb 16777216" + x64_nl_char())
   else
-    sb_push(sb, "extern g_written, g_scratch, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap, g_rules_table" + x64_nl_char())
+    sb_push(sb, "extern g_written, g_scratch, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap, g_rules_table, g_actions_table" + x64_nl_char())
   end
   sb_push(sb, x64_nl_char())
   sb_push(sb, "section .data" + x64_nl_char())
