@@ -3414,3 +3414,170 @@ make a function called tcp_accept_timeout takes port, ms returns id
   end
   return result
 end
+
+# VFS layer (interp.patlang-compilation roadmap #25, continuing past
+# the math library/bitfield ops): purely an in-memory [path, contents]
+# assoc list, same pattern as every other table above -- the real host
+# (rust-runtime/src/ir/hosts.rs) is ALSO just a process-local HashMap,
+# no actual disk I/O except vfs_flush_to_disk's own explicit write-
+# through, so this needs no new raw asm primitives at all beyond the
+# existing write_file. Exit code 95 is this layer's distinctive fatal-
+# runtime-trap code (see 96/97/98/99's own precedent).
+make a function called logic_vfs_list returns l
+  let addr = mem_vfs_table_addr()
+  let l = mem_peek_qword(addr, 0)
+  if l == 0 then
+    let l = rt_list_new(0)
+    mem_poke_qword(addr, 0, l)
+  end
+  return l
+end
+
+make a function called logic_vfs_list_set takes l returns done
+  mem_poke_qword(mem_vfs_table_addr(), 0, l)
+  return true
+end
+
+make a function called vfs_table_lookup takes path returns contents
+  let entries = logic_vfs_list()
+  let n = entries.length
+  let i = 0
+  while i < n do
+    if rt_str_eq(entries[i][0], path) then
+      return entries[i][1]
+    end
+    let i = i + 1
+  end
+  return 0 - 1
+end
+
+make a function called vfs_table_set takes path, contents returns done
+  let entries = logic_vfs_list()
+  let n = entries.length
+  let i = 0
+  let found = false
+  while i < n do
+    if rt_str_eq(entries[i][0], path) then
+      rt_list_set(entries, i, [path, contents])
+      let found = true
+    end
+    let i = i + 1
+  end
+  if not found then
+    let entries = rt_list_push(entries, [path, contents])
+    logic_vfs_list_set(entries)
+  end
+  return true
+end
+
+make a function called vfs_table_remove takes path returns existed
+  let entries = logic_vfs_list()
+  let n = entries.length
+  let out = []
+  let existed = false
+  let i = 0
+  while i < n do
+    if rt_str_eq(entries[i][0], path) then
+      let existed = true
+    else
+      let out = rt_list_push(out, entries[i])
+    end
+    let i = i + 1
+  end
+  logic_vfs_list_set(out)
+  return existed
+end
+
+make a function called vfs_str_starts_with takes s, prefix returns result
+  if prefix.length > s.length then
+    return false
+  end
+  return substr(s, 0, prefix.length) == prefix
+end
+
+make a function called vfs_read takes path returns contents
+  let contents = vfs_table_lookup(path)
+  if contents == 0 - 1 then
+    print("vfs_read: not found: " + path)
+    os_exit(95)
+  end
+  return contents
+end
+
+make a function called vfs_write takes path, contents returns result
+  vfs_table_set(path, contents)
+  return true
+end
+
+make a function called vfs_append takes path, text returns result
+  let existing = vfs_table_lookup(path)
+  if existing == 0 - 1 then
+    vfs_table_set(path, text)
+  else
+    vfs_table_set(path, existing + text)
+  end
+  return true
+end
+
+make a function called vfs_exists takes path returns result
+  let contents = vfs_table_lookup(path)
+  if contents == 0 - 1 then
+    return "0"
+  end
+  return "1"
+end
+
+make a function called vfs_delete takes path returns result
+  return vfs_table_remove(path)
+end
+
+# vfs_list(prefix) -> sorted List of matching paths. Simple bubble sort
+# (this table is never large enough in practice for the O(n^2) cost to
+# matter -- matches the real host's `matching.sort()`, which is also
+# just a plain lexicographic string sort).
+make a function called vfs_list takes prefix returns result
+  let entries = logic_vfs_list()
+  let n = entries.length
+  let matches = []
+  let i = 0
+  while i < n do
+    if vfs_str_starts_with(entries[i][0], prefix) then
+      let matches = rt_list_push(matches, entries[i][0])
+    end
+    let i = i + 1
+  end
+  let m = matches.length
+  let a = 0
+  while a < m do
+    let b = 0
+    while b < m - a - 1 do
+      if matches[b] > matches[b + 1] then
+        let tmp = matches[b]
+        rt_list_set(matches, b, matches[b + 1])
+        rt_list_set(matches, b + 1, tmp)
+      end
+      let b = b + 1
+    end
+    let a = a + 1
+  end
+  return matches
+end
+
+# vfs_flush_to_disk(prefix, real_dir) -> Int count written. Real
+# host's own allowed-root security gate (PATLANG_VFS_ALLOWED_ROOT) is
+# NOT replicated here -- a real but scoped-down implementation, matching
+# this session's established practice for primitives unlikely to be
+# exercised by the compiler-compiling-itself workload.
+make a function called vfs_flush_to_disk takes prefix, real_dir returns count
+  let matches = vfs_list(prefix)
+  let n = matches.length
+  let i = 0
+  let count = 0
+  while i < n do
+    let contents = vfs_table_lookup(matches[i])
+    write_file(real_dir + "/" + matches[i], contents)
+    let count = count + 1
+    let i = i + 1
+  end
+  return count
+end

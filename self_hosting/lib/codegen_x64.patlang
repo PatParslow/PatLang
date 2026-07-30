@@ -1547,19 +1547,33 @@ end
 make a function called x64_str_aware_eq_asm takes negate returns asm
   let suffix = label_asm_safe(0)
   let sb = sb_new()
+  # Real bug found (interp.patlang-compilation roadmap, Stage past
+  # math/bitfield/VFS): this used to jump straight to .STREQ_ (treating
+  # the pair as a string comparison) as soon as EITHER operand alone
+  # looked like a genuine string, without ever checking that the OTHER
+  # operand was ALSO a string -- the exact same bug class already found
+  # and fixed in x64_binop_asm_dynamic's DYN_OBJ branch this session,
+  # just in this separate NON-dynamic-mode "string-aware ==" path
+  # instead. Confirmed exactly: `existing == 0 - 1` inside vfs_append
+  # (existing a genuine String, -1 a plain fixnum) jumped to STREQ_ the
+  # moment `existing`'s check passed, then called rt_str_eq(existing,
+  # -1) -- masking -1 to the 48-bit payload gives a bogus ~281 trillion
+  # "address" nowhere near the real 16MB heap, and dereferencing it to
+  # read a "length" field segfaulted. Fixed to a straight-line AND
+  # chain: only reach .STREQ_ once BOTH operands independently pass the
+  # string-family-and-nonzero-payload check; either one failing falls
+  # through to the plain identity compare.
   sb_push(sb, "    mov r15, 17293822569102704640" + x64_nl_char())
   sb_push(sb, "    mov r9, 281474976710655" + x64_nl_char())
   sb_push(sb, "    mov r8, 2305843009213693952" + x64_nl_char())
   sb_push(sb, "    mov rcx, rax" + x64_nl_char())
   sb_push(sb, "    and rcx, r15" + x64_nl_char())
   sb_push(sb, "    cmp rcx, r8" + x64_nl_char())
-  sb_push(sb, "    jne .STRCHKB_" + suffix + x64_nl_char())
+  sb_push(sb, "    jne .STRSKIP_" + suffix + x64_nl_char())
   sb_push(sb, "    mov rcx, rax" + x64_nl_char())
   sb_push(sb, "    and rcx, r9" + x64_nl_char())
   sb_push(sb, "    cmp rcx, 0" + x64_nl_char())
-  sb_push(sb, "    je .STRCHKB_" + suffix + x64_nl_char())
-  sb_push(sb, "    jmp .STREQ_" + suffix + x64_nl_char())
-  sb_push(sb, ".STRCHKB_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    je .STRSKIP_" + suffix + x64_nl_char())
   sb_push(sb, "    mov rcx, r10" + x64_nl_char())
   sb_push(sb, "    and rcx, r15" + x64_nl_char())
   sb_push(sb, "    cmp rcx, r8" + x64_nl_char())
@@ -1608,19 +1622,21 @@ end
 make a function called x64_str_aware_plus_asm returns asm
   let suffix = label_asm_safe(0)
   let sb = sb_new()
+  # Same bug class as x64_str_aware_eq_asm just above, same fix: only
+  # concatenate once BOTH operands independently pass the string-
+  # family-and-nonzero-payload check (a straight-line AND chain), not
+  # as soon as EITHER one alone looks like a string.
   sb_push(sb, "    mov r15, 17293822569102704640" + x64_nl_char())
   sb_push(sb, "    mov r9, 281474976710655" + x64_nl_char())
   sb_push(sb, "    mov r8, 2305843009213693952" + x64_nl_char())
   sb_push(sb, "    mov rcx, rax" + x64_nl_char())
   sb_push(sb, "    and rcx, r15" + x64_nl_char())
   sb_push(sb, "    cmp rcx, r8" + x64_nl_char())
-  sb_push(sb, "    jne .PLUSCHKB_" + suffix + x64_nl_char())
+  sb_push(sb, "    jne .PLUSSKIP_" + suffix + x64_nl_char())
   sb_push(sb, "    mov rcx, rax" + x64_nl_char())
   sb_push(sb, "    and rcx, r9" + x64_nl_char())
   sb_push(sb, "    cmp rcx, 0" + x64_nl_char())
-  sb_push(sb, "    je .PLUSCHKB_" + suffix + x64_nl_char())
-  sb_push(sb, "    jmp .PLUSCAT_" + suffix + x64_nl_char())
-  sb_push(sb, ".PLUSCHKB_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    je .PLUSSKIP_" + suffix + x64_nl_char())
   sb_push(sb, "    mov rcx, r10" + x64_nl_char())
   sb_push(sb, "    and rcx, r15" + x64_nl_char())
   sb_push(sb, "    cmp rcx, r8" + x64_nl_char())
@@ -1639,6 +1655,54 @@ make a function called x64_str_aware_plus_asm returns asm
   sb_push(sb, "    call rt_str_concat" + x64_nl_char())
   sb_push(sb, "    add rsp, 16" + x64_nl_char())
   sb_push(sb, ".PLUSDONE_" + suffix + ":" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# `<`/`<=`/`>`/`>=` in the plain (non-dynamic-mode, non-float-mode)
+# path used raw pointer `cmp rax, r10` unconditionally -- meaningless
+# ALLOCATION-ORDER comparison for two String values, not lexicographic
+# ordering. Found via vfs_list's own bubble sort (a non-dynamic,
+# non-float function operating on already-string values, so it never
+# hit x64_binop_asm_dynamic's own correct rt_str_cmp path): entries
+# came back in raw insertion order, not alphabetical, because `>`
+# silently compared heap addresses instead of content. Same AND-chain
+# guard as x64_str_aware_eq_asm/x64_str_aware_plus_asm above: only
+# route to rt_str_cmp once BOTH operands independently pass the
+# string-family-and-nonzero-payload check, falling back to the
+# original plain address `cmp` otherwise.
+make a function called x64_str_aware_ord_asm takes setcc returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "    mov r15, 17293822569102704640" + x64_nl_char())
+  sb_push(sb, "    mov r9, 281474976710655" + x64_nl_char())
+  sb_push(sb, "    mov r8, 2305843009213693952" + x64_nl_char())
+  sb_push(sb, "    mov rcx, rax" + x64_nl_char())
+  sb_push(sb, "    and rcx, r15" + x64_nl_char())
+  sb_push(sb, "    cmp rcx, r8" + x64_nl_char())
+  sb_push(sb, "    jne .ORDSKIP_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rcx, rax" + x64_nl_char())
+  sb_push(sb, "    and rcx, r9" + x64_nl_char())
+  sb_push(sb, "    cmp rcx, 0" + x64_nl_char())
+  sb_push(sb, "    je .ORDSKIP_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rcx, r10" + x64_nl_char())
+  sb_push(sb, "    and rcx, r15" + x64_nl_char())
+  sb_push(sb, "    cmp rcx, r8" + x64_nl_char())
+  sb_push(sb, "    jne .ORDSKIP_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rcx, r10" + x64_nl_char())
+  sb_push(sb, "    and rcx, r9" + x64_nl_char())
+  sb_push(sb, "    cmp rcx, 0" + x64_nl_char())
+  sb_push(sb, "    je .ORDSKIP_" + suffix + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    push r10" + x64_nl_char())
+  sb_push(sb, "    call rt_str_cmp" + x64_nl_char())
+  sb_push(sb, "    add rsp, 16" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+  sb_push(sb, "    jmp .ORDDONE_" + suffix + x64_nl_char())
+  sb_push(sb, ".ORDSKIP_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    cmp rax, r10" + x64_nl_char())
+  sb_push(sb, ".ORDDONE_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    " + setcc + " al" + x64_nl_char())
+  sb_push(sb, "    movzx rax, al" + x64_nl_char())
   return sb_str(sb)
 end
 
@@ -1693,18 +1757,17 @@ make a function called x64_binop_asm takes op returns asm
                         if op == "!=" then
                           sb_push(sb, x64_str_aware_eq_asm(true))
                         else
-                          sb_push(sb, "    cmp rax, r10" + x64_nl_char())
                           if op == "<" then
-                            sb_push(sb, "    setl al" + x64_nl_char())
+                            sb_push(sb, x64_str_aware_ord_asm("setl"))
                           else
                             if op == "<=" then
-                              sb_push(sb, "    setle al" + x64_nl_char())
+                              sb_push(sb, x64_str_aware_ord_asm("setle"))
                             else
                               if op == ">" then
-                                sb_push(sb, "    setg al" + x64_nl_char())
+                                sb_push(sb, x64_str_aware_ord_asm("setg"))
                               else
                                 if op == ">=" then
-                                  sb_push(sb, "    setge al" + x64_nl_char())
+                                  sb_push(sb, x64_str_aware_ord_asm("setge"))
                                 else
                                   print("codegen_x64: unsupported binary operator: " + op)
                                   return "    ; UNSUPPORTED_BINOP_ERROR" + x64_nl_char()
@@ -1712,7 +1775,6 @@ make a function called x64_binop_asm takes op returns asm
                               end
                             end
                           end
-                          sb_push(sb, "    movzx rax, al" + x64_nl_char())
                         end
                       end
                     end
@@ -3210,6 +3272,11 @@ make a function called x64_callhost_asm takes name, argc returns asm
         # convention as every other table's own .bss slot here.
         sb_push(sb, "    lea rax, [rel g_wsa_init]" + x64_nl_char())
         sb_push(sb, "    push rax" + x64_nl_char())
+      elif name == "mem_vfs_table_addr" then
+        # vfs_read/vfs_write/vfs_append/vfs_exists/vfs_list/vfs_delete's
+        # global [path, contents] in-memory store -- same pattern again.
+        sb_push(sb, "    lea rax, [rel g_vfs_table]" + x64_nl_char())
+        sb_push(sb, "    push rax" + x64_nl_char())
       elif name == "mem_rules_table_addr" then
         # Same pattern again, for rule_add/solve's global rules store
         # (GitHub #26/#25 -- the Prolog-like logic engine) -- a single
@@ -4415,7 +4482,7 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
   sb_push(sb, x64_nl_char())
   sb_push(sb, "section .bss" + x64_nl_char())
   if owns_globals then
-    sb_push(sb, "    global g_written, g_scratch, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init, g_last_recv_error" + x64_nl_char())
+    sb_push(sb, "    global g_written, g_scratch, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init, g_last_recv_error, g_vfs_table" + x64_nl_char())
     sb_push(sb, "    align 8" + x64_nl_char())
     sb_push(sb, "    g_written resd 1" + x64_nl_char())
     sb_push(sb, "    align 8" + x64_nl_char())
@@ -4446,10 +4513,11 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
     # lazy-init-on-first-use convention every other table here uses.
     sb_push(sb, "    g_wsa_init resq 1" + x64_nl_char())
     sb_push(sb, "    g_last_recv_error resq 1" + x64_nl_char())
+    sb_push(sb, "    g_vfs_table resq 1" + x64_nl_char())
     sb_push(sb, "    align 16" + x64_nl_char())
     sb_push(sb, "    g_heap resb 16777216" + x64_nl_char())
   else
-    sb_push(sb, "extern g_written, g_scratch, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init, g_last_recv_error" + x64_nl_char())
+    sb_push(sb, "extern g_written, g_scratch, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init, g_last_recv_error, g_vfs_table" + x64_nl_char())
   end
   sb_push(sb, x64_nl_char())
   sb_push(sb, "section .data" + x64_nl_char())
