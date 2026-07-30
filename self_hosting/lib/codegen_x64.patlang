@@ -1205,7 +1205,35 @@ make a function called x64_binop_asm_dynamic takes op, spilled returns asm
     end
     sb_push(sb, "    movzx rax, al" + x64_nl_char())
   else
-    sb_push(sb, "    mov rax, 0" + x64_nl_char())
+    if op == "+" then
+      # Real fix (GitHub #19): this used to be an unconditional
+      # `mov rax, 0` for ANY non-numeric operand pair -- a silent
+      # no-op, not a crash. Two STRING-family operands specifically
+      # now concatenate via rt_str_concat (which already tags its own
+      # result correctly); any other combination (List/Object/Closure,
+      # or a String mixed with one of those) keeps the old placeholder
+      # -- no meaningful `+` is defined for those yet.
+      sb_push(sb, "    mov r15, 17293822569102704640" + x64_nl_char())
+      sb_push(sb, "    mov rax, [rbp-" + dyn_a + "]" + x64_nl_char())
+      sb_push(sb, "    and rax, r15" + x64_nl_char())
+      sb_push(sb, "    mov r10, [rbp-" + dyn_b + "]" + x64_nl_char())
+      sb_push(sb, "    and r10, r15" + x64_nl_char())
+      sb_push(sb, "    mov rcx, 2305843009213693952" + x64_nl_char())
+      sb_push(sb, "    cmp rax, rcx" + x64_nl_char())
+      sb_push(sb, "    jne .DYN_OBJPLUS_NOTSTR_" + suffix + x64_nl_char())
+      sb_push(sb, "    cmp r10, rcx" + x64_nl_char())
+      sb_push(sb, "    jne .DYN_OBJPLUS_NOTSTR_" + suffix + x64_nl_char())
+      sb_push(sb, "    push qword [rbp-" + dyn_a + "]" + x64_nl_char())
+      sb_push(sb, "    push qword [rbp-" + dyn_b + "]" + x64_nl_char())
+      sb_push(sb, "    call rt_str_concat" + x64_nl_char())
+      sb_push(sb, "    add rsp, 16" + x64_nl_char())
+      sb_push(sb, "    jmp .DYN_OBJPLUS_DONE_" + suffix + x64_nl_char())
+      sb_push(sb, ".DYN_OBJPLUS_NOTSTR_" + suffix + ":" + x64_nl_char())
+      sb_push(sb, "    mov rax, 0" + x64_nl_char())
+      sb_push(sb, ".DYN_OBJPLUS_DONE_" + suffix + ":" + x64_nl_char())
+    else
+      sb_push(sb, "    mov rax, 0" + x64_nl_char())
+    end
   end
   sb_push(sb, ".DYN_DONE_" + suffix + ":" + x64_nl_char())
   sb_push(sb, "    push rax" + x64_nl_char())
@@ -2858,6 +2886,32 @@ make a function called x64_func_is_dynamic takes func returns yes
         return true
       end
       if instr[1] == "rt_object_new" then
+        return true
+      end
+    end
+    # Real bug found (GitHub #19) while chasing what looked like a
+    # print regression: a function that builds a string via `+`
+    # (ordinary user syntax, e.g. `"hello" + " " + "world"`) was NEVER
+    # classified dynamic just for containing a string literal -- so
+    # its `+` went through the plain x64_binop_asm path, which does a
+    # raw integer `add` on the two TAGGED string addresses. Two
+    # String-family (0x2 in the top nibble) pointers added together
+    # produce a bit pattern with a DIFFERENT, often unrelated family
+    # nibble (confirmed: 0x2+0x2 in the top nibble carries to 0x4,
+    # which happens to collide with the CLOSURE tag) -- silently wrong,
+    # not even a crash, and print()'s own family dispatch then falls
+    # through to its "<value>" default since the result doesn't match
+    # any real family it knows. Any function touching a string literal
+    # needs the tag-aware dynamic dispatch to have a chance at correct
+    # behavior for ALL its ops involving that string, same reasoning as
+    # rt_bigint_from_i64 above forcing dynamic mode for BigInt. (Same
+    # blind spot as every other syntactic trigger here: a function that
+    # ONLY ever receives strings via parameters, with no string literal
+    # or forced-dynamic call of its own, still won't be detected --
+    # full type inference is out of scope, matching this file's other
+    # heuristics.)
+    if instr[0] == "Const" then
+      if instr[1] == "str" then
         return true
       end
     end
