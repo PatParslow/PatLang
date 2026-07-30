@@ -2670,6 +2670,96 @@ make a function called x64_roundlike_asm takes cfunc returns asm
   return sb_str(sb)
 end
 
+# ---- Bitfield ops (interp.patlang-compilation roadmap #25, continuing
+# past the math library above): bit_get/bit_set/bit_slice/
+# bit_set_slice, operating on the raw 64-bit register value directly --
+# no fixnum/BigInt classification needed here, unlike the math
+# functions above, since these are pure bitwise ops on whatever pattern
+# `n` already is (and a legitimately-set high bit, e.g. bit_set(0,63,1),
+# is meant to produce a genuine negative i64, consistent with this
+# backend's own sign-extended fixnum scheme). `>>` on n uses SAR (
+# arithmetic, sign-extending), matching Rust's own `>>` on i64 in
+# host_bit_get/host_bit_slice. Real host range-checks (0..64 etc.) are
+# NOT replicated -- out-of-range args are undefined here rather than a
+# clean error, a real but scoped-down implementation, matching this
+# session's established practice for primitives unlikely to be
+# exercised by the compiler-compiling-itself workload.
+
+make a function called x64_bit_set_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "    pop rdx" + x64_nl_char())
+  sb_push(sb, "    pop rcx" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    mov r8, 1" + x64_nl_char())
+  sb_push(sb, "    shl r8, cl" + x64_nl_char())
+  sb_push(sb, "    cmp rdx, 0" + x64_nl_char())
+  sb_push(sb, "    je .bs_clear_" + suffix + x64_nl_char())
+  sb_push(sb, "    or rax, r8" + x64_nl_char())
+  sb_push(sb, "    jmp .bs_done_" + suffix + x64_nl_char())
+  sb_push(sb, ".bs_clear_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    not r8" + x64_nl_char())
+  sb_push(sb, "    and rax, r8" + x64_nl_char())
+  sb_push(sb, ".bs_done_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# Shared by bit_slice/bit_set_slice: builds mask = (1<<width)-1 in r10
+# (or -1 when width==64), given width already in r8. Needs its own cl
+# (shift count), so callers must read start into a NON-rcx register
+# (r9) beforehand -- start's own shift happens AFTER this, once mask is
+# safely parked in r10.
+make a function called x64_bit_mask_asm takes suffix returns asm
+  let sb = sb_new()
+  sb_push(sb, "    cmp r8, 64" + x64_nl_char())
+  sb_push(sb, "    je .bm_full_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rcx, r8" + x64_nl_char())
+  sb_push(sb, "    mov r10, 1" + x64_nl_char())
+  sb_push(sb, "    shl r10, cl" + x64_nl_char())
+  sb_push(sb, "    dec r10" + x64_nl_char())
+  sb_push(sb, "    jmp .bm_done_" + suffix + x64_nl_char())
+  sb_push(sb, ".bm_full_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov r10, 0 - 1" + x64_nl_char())
+  sb_push(sb, ".bm_done_" + suffix + ":" + x64_nl_char())
+  return sb_str(sb)
+end
+
+make a function called x64_bit_slice_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "    pop r8" + x64_nl_char())
+  sb_push(sb, "    pop r9" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, x64_bit_mask_asm(suffix))
+  sb_push(sb, "    mov rcx, r9" + x64_nl_char())
+  sb_push(sb, "    sar rax, cl" + x64_nl_char())
+  sb_push(sb, "    and rax, r10" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
+make a function called x64_bit_set_slice_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "    pop rdx" + x64_nl_char())
+  sb_push(sb, "    pop r8" + x64_nl_char())
+  sb_push(sb, "    pop r9" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, x64_bit_mask_asm(suffix))
+  sb_push(sb, "    mov rcx, r9" + x64_nl_char())
+  sb_push(sb, "    mov r11, r10" + x64_nl_char())
+  sb_push(sb, "    shl r11, cl" + x64_nl_char())
+  sb_push(sb, "    not r11" + x64_nl_char())
+  sb_push(sb, "    and rax, r11" + x64_nl_char())
+  sb_push(sb, "    and rdx, r10" + x64_nl_char())
+  sb_push(sb, "    mov rcx, r9" + x64_nl_char())
+  sb_push(sb, "    shl rdx, cl" + x64_nl_char())
+  sb_push(sb, "    or rax, rdx" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
 # CallHost -- only the five special primitive names are legal here,
 # PLUS two safe aliases (Slice 4): `l[i]` index syntax always lowers to
 # CallHost("list_get", 2) regardless of backend (lib/lower.patlang's
@@ -3018,6 +3108,18 @@ make a function called x64_callhost_asm takes name, argc returns asm
     sb_push(sb, x64_roundlike_asm("round"))
   elif name == "trunc" then
     sb_push(sb, x64_roundlike_asm("trunc"))
+  elif name == "bit_get" then
+    sb_push(sb, "    pop rcx" + x64_nl_char())
+    sb_push(sb, "    pop rax" + x64_nl_char())
+    sb_push(sb, "    sar rax, cl" + x64_nl_char())
+    sb_push(sb, "    and rax, 1" + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
+  elif name == "bit_set" then
+    sb_push(sb, x64_bit_set_asm())
+  elif name == "bit_slice" then
+    sb_push(sb, x64_bit_slice_asm())
+  elif name == "bit_set_slice" then
+    sb_push(sb, x64_bit_set_slice_asm())
   else
   if name == "list_len" then
     sb_push(sb, "    call rt_list_len" + x64_nl_char())
