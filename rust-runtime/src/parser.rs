@@ -788,12 +788,25 @@ impl<'a> Parser<'a> {
             }
             // Parse statements until we encounter Identifier("end")
             let (mut body, _) = self.parse_word_block(&["end"], false)?;
-            // If a return hint was provided and no explicit return found, append it as final return
+            // If a return hint was provided, unconditionally append a
+            // trailing `return NAME` -- reached only via genuine fall-
+            // through (any earlier explicit `return`, including one
+            // nested inside an if/while branch, already exits before this
+            // point is ever reached). Previously this was gated on
+            // `!body.iter().any(|s| matches!(s, Stmt::Return(_)))`, a
+            // TOP-LEVEL-ONLY scan that doesn't see returns nested inside
+            // if/while branches at all (Stmt::If's branches are their own
+            // nested Vec<Stmt>) -- so an ordinary guard-clause function
+            // (an early `if cond then return X end` followed by a
+            // fall-through body) was never actually affected by that scan
+            // either way. Removed as an unconditional simplification, not
+            // a behavior change: a top-level Stmt::Return element, if
+            // ever actually present, either always fires (making the scan
+            // irrelevant) or is unreachable dead code after another
+            // top-level return (also irrelevant) -- so this can't change
+            // any well-formed program's observable behavior.
             if let Some(var) = return_hint {
-                let has_return = body.iter().any(|s| matches!(s, Stmt::Return(_)));
-                if !has_return {
-                    body.push(Stmt::Return(Some(Expr::Identifier(var))));
-                }
+                body.push(Stmt::Return(Some(Expr::Identifier(var))));
             }
             return Ok(Some(Stmt::Function { name, params, body }));
         } else if kind_is_template {
