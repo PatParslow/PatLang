@@ -2563,6 +2563,113 @@ make a function called x64_os_send_asm returns asm
   return sb_str(sb)
 end
 
+# ---- Math library (interp.patlang-compilation roadmap #25, the layer
+# past Stage 0/A/B's networking/process gaps): sqrt/sin/cos/tan/asin/
+# acos/atan/log/exp/pow/atan2/abs/ceil/round/trunc, all real calls into
+# the C runtime math library (msvcrt/ucrtbase, already linked by gcc's
+# own default libs) -- the SAME underlying libm every real host_sin/
+# host_sqrt/etc (rust-runtime/src/ir/hosts.rs) delegates to via Rust's
+# f64 methods, so results are bit-for-bit comparable, not an
+# approximation of our own.
+#
+# Deliberately narrower than the real hosts: this backend represents
+# floats as a raw f64 bit pattern with NO separate tag (float_mode is a
+# per-FUNCTION classification, "ALL int or ALL float", not a per-value
+# tag -- see this file's own float_mode header) -- x64_math1_asm/
+# x64_math2_asm assume their operand(s) are genuine float bit patterns
+# already (the realistic case: calling sin/sqrt/etc. usefully already
+# requires being in a float_mode function). x64_abs_asm/
+# x64_roundlike_asm are the exception: abs/ceil/round/trunc are
+# genuinely common on PLAIN INTS too (real host_abs/round_like return
+# Int/BigInt input UNCHANGED, only actually computing for Float/
+# Rational), so those two classify their operand at runtime via the
+# same round-trip-through-48-bit-sign-extension test used throughout
+# this file, and take the int-identity fast path when it's a genuine
+# fixnum. BigInt/Rational/Complex inputs to any of these are NOT
+# handled (the real hosts' exact-arithmetic branches for those aren't
+# replicated here) -- a real, honest, but scoped-down implementation,
+# not a stub.
+
+make a function called x64_math1_asm takes cfunc returns asm
+  let sb = sb_new()
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    movq xmm0, rax" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    call " + cfunc + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    movq rax, xmm0" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# 2-arg: args pushed in written order (pow(base,exp) -> base pushed
+# first, exp on top; atan2(y,x) -> y pushed first, x on top), matching
+# each C function's own (arg1, arg2) parameter order (xmm0, xmm1).
+make a function called x64_math2_asm takes cfunc returns asm
+  let sb = sb_new()
+  sb_push(sb, "    pop rdx" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    movq xmm0, rax" + x64_nl_char())
+  sb_push(sb, "    movq xmm1, rdx" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    call " + cfunc + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    movq rax, xmm0" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
+make a function called x64_abs_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    mov rcx, rax" + x64_nl_char())
+  sb_push(sb, "    shl rcx, 16" + x64_nl_char())
+  sb_push(sb, "    sar rcx, 16" + x64_nl_char())
+  sb_push(sb, "    cmp rcx, rax" + x64_nl_char())
+  sb_push(sb, "    jne .abs_float_" + suffix + x64_nl_char())
+  sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+  sb_push(sb, "    jge .abs_done_" + suffix + x64_nl_char())
+  sb_push(sb, "    neg rax" + x64_nl_char())
+  sb_push(sb, "    jmp .abs_done_" + suffix + x64_nl_char())
+  sb_push(sb, ".abs_float_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    movq xmm0, rax" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    call fabs" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    movq rax, xmm0" + x64_nl_char())
+  sb_push(sb, ".abs_done_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
+make a function called x64_roundlike_asm takes cfunc returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    mov rcx, rax" + x64_nl_char())
+  sb_push(sb, "    shl rcx, 16" + x64_nl_char())
+  sb_push(sb, "    sar rcx, 16" + x64_nl_char())
+  sb_push(sb, "    cmp rcx, rax" + x64_nl_char())
+  sb_push(sb, "    je .rl_done_" + suffix + x64_nl_char())
+  sb_push(sb, "    movq xmm0, rax" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    call " + cfunc + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    movq rax, xmm0" + x64_nl_char())
+  sb_push(sb, ".rl_done_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
 # CallHost -- only the five special primitive names are legal here,
 # PLUS two safe aliases (Slice 4): `l[i]` index syntax always lowers to
 # CallHost("list_get", 2) regardless of backend (lib/lower.patlang's
@@ -2881,6 +2988,36 @@ make a function called x64_callhost_asm takes name, argc returns asm
     sb_push(sb, "    call GetTickCount64" + x64_nl_char())
     sb_push(sb, "    mov rsp, r15" + x64_nl_char())
     sb_push(sb, "    push rax" + x64_nl_char())
+  elif name == "sqrt" then
+    sb_push(sb, x64_math1_asm("sqrt"))
+  elif name == "sin" then
+    sb_push(sb, x64_math1_asm("sin"))
+  elif name == "cos" then
+    sb_push(sb, x64_math1_asm("cos"))
+  elif name == "tan" then
+    sb_push(sb, x64_math1_asm("tan"))
+  elif name == "asin" then
+    sb_push(sb, x64_math1_asm("asin"))
+  elif name == "acos" then
+    sb_push(sb, x64_math1_asm("acos"))
+  elif name == "atan" then
+    sb_push(sb, x64_math1_asm("atan"))
+  elif name == "log" then
+    sb_push(sb, x64_math1_asm("log"))
+  elif name == "exp" then
+    sb_push(sb, x64_math1_asm("exp"))
+  elif name == "pow" then
+    sb_push(sb, x64_math2_asm("pow"))
+  elif name == "atan2" then
+    sb_push(sb, x64_math2_asm("atan2"))
+  elif name == "abs" then
+    sb_push(sb, x64_abs_asm())
+  elif name == "ceil" then
+    sb_push(sb, x64_roundlike_asm("ceil"))
+  elif name == "round" then
+    sb_push(sb, x64_roundlike_asm("round"))
+  elif name == "trunc" then
+    sb_push(sb, x64_roundlike_asm("trunc"))
   else
   if name == "list_len" then
     sb_push(sb, "    call rt_list_len" + x64_nl_char())
@@ -4153,6 +4290,12 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
     sb_push(sb, sb_str(gl_line) + x64_nl_char())
   end
   sb_push(sb, "extern GetStdHandle, WriteFile, ExitProcess, CreateFileA, GetFileSize, CloseHandle, ReadFile, CreateProcessA, CreatePipe, SetHandleInformation, WaitForSingleObject, GetCommandLineA, GetExitCodeProcess, TerminateProcess, WSAStartup, WSAGetLastError, socket, bind, listen, accept, connect, send, recv, closesocket, shutdown, getaddrinfo, freeaddrinfo, getsockname, ioctlsocket, htons, ntohs, Sleep, GetTickCount64" + x64_nl_char())
+  # Real C runtime math library (msvcrt/ucrtbase, already linked by
+  # gcc's own default libs -- see x64_build.patlang) -- matches the
+  # SAME underlying libm every real_host_sin/cos/sqrt/etc (rust-runtime/
+  # src/ir/hosts.rs) delegates to via Rust's f64 methods, so results are
+  # bit-for-bit comparable, not an approximation of our own.
+  sb_push(sb, "extern sqrt, pow, sin, cos, tan, asin, acos, atan, atan2, log, exp, ceil, floor, round, trunc, fabs" + x64_nl_char())
   let en_count = to_num(list_len(extern_names))
   if en_count > 0 then
     let en_line = sb_new()
