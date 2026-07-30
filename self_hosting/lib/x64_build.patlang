@@ -36,7 +36,7 @@ make a function called x64_build takes asm_source, out_path returns result
   let asm_path = out_path + ".asm"
   let obj_path = out_path + ".obj"
   write_file(asm_path, asm_source)
-  let nasm_out = exec_capture(x64_nasm_exe(), "-f", "win64", "-o", obj_path, asm_path)
+  let nasm_out = exec_capture(x64_nasm_exe(), "-Ox", "-f", "win64", "-o", obj_path, asm_path)
   if x64_build_contains(nasm_out, "error") then
     return "NASM ERROR:\n" + nasm_out
   end
@@ -54,7 +54,14 @@ end
 # failure, same convention as x64_build.
 make a function called x64_assemble takes asm_source, asm_path, obj_path returns result
   write_file(asm_path, asm_source)
-  let nasm_out = exec_capture(x64_nasm_exe(), "-f", "win64", "-o", obj_path, asm_path)
+  # -Ox: iterate jump-size optimization to a fixed point instead of NASM's
+  # default (bounded) pass count -- without this, a large generated file
+  # with many labels can hit "label ... changed during code generation"
+  # (a genuine short-vs-near jump-size oscillation NASM's default pass
+  # limit doesn't have enough iterations to resolve), confirmed directly
+  # on interp.patlang's own interp_call_host during the interp.patlang-
+  # compilation roadmap (#25)'s chunk-splitting work.
+  let nasm_out = exec_capture(x64_nasm_exe(), "-Ox", "-f", "win64", "-o", obj_path, asm_path)
   if x64_build_contains(nasm_out, "error") then
     return "NASM ERROR:\n" + nasm_out
   end
@@ -80,6 +87,55 @@ make a function called x64_build_linked takes program_asm, runtime_obj_path, out
     return asm_result
   end
   let gcc_out = exec_capture("gcc", "-o", out_path, obj_path, runtime_obj_path, "-Wl,--subsystem,console", "-lkernel32", "-luser32", "-lgdi32", "-lws2_32")
+  if x64_build_contains(gcc_out, "error") then
+    return "LINK ERROR:\n" + gcc_out
+  end
+  return out_path
+end
+
+# x64_build_linked_multi(program_asm_chunks, runtime_obj_path, out_path)
+# -- the fix for the NASM memory-blowout on the full self-hosted-
+# compiler bundle (see x64_partition_funcs's own header in codegen_x64.
+# patlang): program_asm_chunks is a LIST of separately-generated asm
+# texts (each already small, well under the pathological label-count
+# threshold that made one giant combined asm balloon nasm.exe to
+# 12-14GB), assembled here into their own numbered .obj files and
+# linked together with runtime_obj_path in ONE final gcc invocation --
+# ordinary separate compilation, exactly what C does routinely.
+#
+# The final gcc call needs a VARIABLE number of object-file arguments
+# (one per chunk, however many that turns out to be) -- PatLang has no
+# variadic call syntax (exec_capture's own argc is fixed per call site,
+# same reasoning x64_spawn_asm's own header already documents for a
+# DIFFERENT variadic case), so instead of exec_capture(...) with a
+# fixed arg list, the whole gcc command line is built as ONE string and
+# handed to cmd.exe's own `/c` (which does the argv splitting), rather
+# than adding a new Rust host function just for this.
+make a function called x64_build_linked_multi takes program_asm_chunks, runtime_obj_path, out_path returns result
+  let n = to_num(list_len(program_asm_chunks))
+  let objs = []
+  let i = 0
+  while i < n do
+    let chunk_asm_path = out_path + ".chunk" + i + ".asm"
+    let chunk_obj_path = out_path + ".chunk" + i + ".obj"
+    let asm_result = x64_assemble(program_asm_chunks[i], chunk_asm_path, chunk_obj_path)
+    if x64_build_contains(asm_result, "NASM ERROR:") then
+      return "NASM ERROR (chunk " + i + "):\n" + asm_result
+    end
+    let objs = list_push(objs, chunk_obj_path)
+    let i = i + 1
+  end
+  let cmd = sb_new()
+  sb_push(cmd, "gcc -o \"" + out_path + "\"")
+  let oi = 0
+  let ocount = to_num(list_len(objs))
+  while oi < ocount do
+    sb_push(cmd, " \"" + objs[oi] + "\"")
+    let oi = oi + 1
+  end
+  sb_push(cmd, " \"" + runtime_obj_path + "\"")
+  sb_push(cmd, " -Wl,--subsystem,console -lkernel32 -luser32 -lgdi32 -lws2_32")
+  let gcc_out = exec_capture("cmd.exe", "/c", sb_str(cmd))
   if x64_build_contains(gcc_out, "error") then
     return "LINK ERROR:\n" + gcc_out
   end

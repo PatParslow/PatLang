@@ -4567,6 +4567,82 @@ end
 # about a symbol that's BOTH referenced and undefined, never about an
 # unused `extern` declaration. The runtime chunk itself passes an empty
 # list (self-contained, no cross-chunk calls of its own).
+# ---- multi-chunk program codegen (interp.patlang-compilation roadmap
+# #25: fixing the NASM memory blowout on the full self-hosted-compiler
+# bundle) ----
+#
+# Confirmed directly (self_hosting/build/measure_asm.patlang, run
+# entirely under --ir-run so it never touches NASM): compiling the
+# whole ~328-function patc1_all.patlang bundle as ONE emit_program_x64
+# call produces 63MB / 2.9M lines / 288,700 labels (this codegen emits
+# a label before literally every IR instruction, as a jump-target
+# anchor -- see x64_emit_instr's own leading `label + ":"`). Assembling
+# that in one nasm invocation was observed ballooning to 12-14GB of
+# RAM (confirmed LINEAR, not exponential, growth via a live memory-
+# capped monitor before killing it) -- an unusual label-per-instruction
+# density real hand-written asm essentially never has, hitting a scaling
+# edge case in NASM's own symbol-table handling.
+#
+# Fix: extend the SAME chunk-linking split already used for x64_
+# runtime.obj (a separately-assembled, separately-linked chunk) one
+# level deeper -- partition the "program" itself into several smaller
+# groups of functions, each independently codegen'd/assembled into its
+# own small .obj (each far below the pathological label-count
+# threshold), then link ALL the resulting objects together in one
+# final gcc invocation (ordinary separate compilation, exactly what C
+# does routinely). This does NOT touch lowering at all: Call-vs-
+# CallHost resolution already happened correctly during the ONE
+# combined lex/parse/lower pass (see patc1_main.patlang's own header on
+# why that step, unlike codegen, genuinely can't be split) -- codegen
+# only needs to know, per function, whether it's defined HERE or
+# reached via `extern`, which is exactly what partitioning the
+# ALREADY-lowered func list preserves.
+#
+# Partitions by cumulative INSTRUCTION count, not a fixed function
+# count -- a handful of functions (parse_program, lower_program, the
+# lexer/parser's own large dispatch chains) are drastically bigger than
+# most, so chunking by raw function count risks one wildly oversized
+# chunk while others sit nearly empty. target_instrs is a soft cap: a
+# single function larger than target_instrs on its own still gets its
+# own whole chunk (never split mid-function -- codegen has no notion of
+# a partial function body).
+make a function called x64_partition_funcs takes funcs, target_instrs returns chunks
+  let chunks = []
+  let current = []
+  let current_count = 0
+  let n = to_num(list_len(funcs))
+  let i = 0
+  while i < n do
+    let f = funcs[i]
+    let fsize = to_num(list_len(f[3]))
+    if current_count > 0 then
+      if current_count + fsize > target_instrs then
+        let chunks = list_push(chunks, current)
+        let current = []
+        let current_count = 0
+      end
+    end
+    let current = list_push(current, f)
+    let current_count = current_count + fsize
+    let i = i + 1
+  end
+  if list_len(current) > 0 then
+    let chunks = list_push(chunks, current)
+  end
+  return chunks
+end
+
+make a function called x64_func_names_of takes funcs returns names
+  let names = []
+  let n = to_num(list_len(funcs))
+  let i = 0
+  while i < n do
+    let names = list_push(names, funcs[i][1])
+    let i = i + 1
+  end
+  return names
+end
+
 make a function called emit_program_x64 takes ir, owns_globals, extern_names returns asm
   let funcs = ir[2]
   let sb = sb_new()
