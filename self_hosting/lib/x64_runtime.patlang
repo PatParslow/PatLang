@@ -2155,3 +2155,343 @@ make a function called rt_exec_join_args takes arr, count returns tagged
   end
   return result
 end
+
+# =============================================================================
+# Prolog-like logic engine (GitHub #26, Stage 1 of the #25 Rust-free-
+# toolchain roadmap): rule_add/solve, real unification with backtracking.
+# Ground truth: rust-runtime/src/ir/hosts.rs lines ~780-958 (`is_logic_var`/
+# `walk`/`unify_args`/`apply_subst`/`fresh_rename`/`solve_goal`/
+# `resolve_conjuncts`/`host_rule_add`/`host_solve`). Deliberately NOT a
+# ground-only subset -- real programs in this repo (goal_oriented_build_
+# demo.patlang, synthesis_grandparent_selftest.patlang, paradigm_gallery/
+# functional_logic.patlang, etc) genuinely rely on variable unification and
+# multi-solution backtracking, not just fact lookup.
+#
+# Variable convention (matches the Rust host exactly): an arg string is a
+# logic variable iff its first character is ASCII uppercase.
+#
+# Substitution representation: a Subst is a plain PatLang List of
+# [var, value] pairs -- no hashmap exists in this backend (there is
+# genuinely nothing to key one by; see rt_runtime's own set_var/get, which
+# is a linear-scan assoc list for exactly the same reason). Looked up via
+# linear scan + rt_str_eq.
+# =============================================================================
+
+make a function called is_logic_var takes s returns yes
+  if s.length == 0 then
+    return false
+  end
+  let c = char_code(s, 0)
+  return (c >= 65) and (c <= 90)
+end
+
+make a function called logic_subst_lookup takes subst, var returns result
+  let n = subst.length
+  let i = 0
+  while i < n do
+    let pair = subst[i]
+    if rt_str_eq(pair[0], var) then
+      return ["Ok", pair[1]]
+    end
+    let i = i + 1
+  end
+  return ["Err", ""]
+end
+
+# Real correctness hazard avoided here, not just a style choice:
+# rt_list_push (above) mutates in place when capacity allows, and its
+# own header comment explicitly names the exact failure mode this
+# would hit -- "a rarer divergent-branches pattern" where an older
+# reference gets silently mutated underneath it. Backtracking IS
+# exactly that pattern: solve_goal below tries every matching rule
+# against the SAME incoming subst, so multiple sibling branches must
+# extend it independently. logic_subst_extend therefore always
+# allocates and copies fresh rather than ever calling rt_list_push on
+# a Subst.
+make a function called logic_subst_extend takes subst, var, value returns out
+  let n = subst.length
+  let out = rt_list_new(n + 1)
+  let i = 0
+  while i < n do
+    rt_list_set(out, i, subst[i])
+    let i = i + 1
+  end
+  rt_list_set(out, n, [var, value])
+  return out
+end
+
+# Follows `term` through `subst` while it's still bound to another
+# variable, up to 1000 hops (cycle guard, matching the Rust host
+# exactly), returning the final ground/unbound term.
+make a function called logic_walk takes term, subst returns out
+  let cur = term
+  let hops = 0
+  while is_logic_var(cur) and (hops < 1000) do
+    let found = logic_subst_lookup(subst, cur)
+    if found[0] == "Err" then
+      return cur
+    end
+    let next = found[1]
+    if rt_str_eq(next, cur) then
+      return cur
+    end
+    let cur = next
+    let hops = hops + 1
+  end
+  return cur
+end
+
+# unify_args(query_args, target_args, subst) -> ["Ok", new_subst] on
+# success, ["Err", ""] on failure -- pairwise walk both sides; if one
+# side is an unbound variable, bind it; if both are ground and differ,
+# fail. Matches the Rust host's unify_args exactly (hosts.rs ~832-847).
+make a function called unify_args takes query_args, target_args, subst returns result
+  if query_args.length != target_args.length then
+    return ["Err", ""]
+  end
+  let s = subst
+  let n = query_args.length
+  let i = 0
+  while i < n do
+    let qw = logic_walk(query_args[i], s)
+    let tw = logic_walk(target_args[i], s)
+    if is_logic_var(qw) then
+      if not rt_str_eq(qw, tw) then
+        let s = logic_subst_extend(s, qw, tw)
+      end
+    else
+      if is_logic_var(tw) then
+        if not rt_str_eq(tw, qw) then
+          let s = logic_subst_extend(s, tw, qw)
+        end
+      else
+        if not rt_str_eq(qw, tw) then
+          return ["Err", ""]
+        end
+      end
+    end
+    let i = i + 1
+  end
+  return ["Ok", s]
+end
+
+make a function called apply_subst takes args, subst returns out
+  let n = args.length
+  let out = rt_list_new(n)
+  let i = 0
+  while i < n do
+    rt_list_set(out, i, logic_walk(args[i], subst))
+    let i = i + 1
+  end
+  return out
+end
+
+# Global rules store, same lazy-init-on-first-use pattern as vec_new/
+# sb_new's own tables (a real tagged rt_list is never bit-for-bit zero,
+# so 0 in the .bss slot unambiguously means "not yet created"). Each
+# entry: [head_pred, head_args_list, body_list] -- a ground fact is
+# exactly a rule with an empty body_list, matching the Rust host's own
+# "ground fact = rule with empty body" representation.
+make a function called logic_rules_list returns l
+  let addr = mem_rules_table_addr()
+  let l = mem_peek_qword(addr, 0)
+  if l == 0 then
+    let l = rt_list_new(0)
+    mem_poke_qword(addr, 0, l)
+  end
+  return l
+end
+
+make a function called logic_rules_list_set takes l returns done
+  mem_poke_qword(mem_rules_table_addr(), 0, l)
+  return true
+end
+
+# fresh_rename: renames every logic variable in a rule to a fresh,
+# globally-unique name on every use (hosts.rs ~856-872), so recursive
+# backtracking into the same rule twice can't leak one attempt's
+# bindings into another's. Counter reuses the existing set_var/get
+# global-named-counter pattern (same idiom codegen_x64.patlang's own
+# label counters already use).
+make a function called logic_next_rename_id returns id
+  let cur = to_num(get("__vars", "__logic_rename_ctr"))
+  let next = cur + 1
+  set_var("__logic_rename_ctr", next)
+  return next
+end
+
+make a function called logic_rename_lookup takes map, var returns result
+  let n = map.length
+  let i = 0
+  while i < n do
+    let pair = map[i]
+    if rt_str_eq(pair[0], var) then
+      return ["Ok", pair[1]]
+    end
+    let i = i + 1
+  end
+  return ["Err", ""]
+end
+
+# Renames one term (a no-op if it's not a variable), returning
+# [new_term, updated_map] so repeated occurrences of the SAME variable
+# within one fresh_rename call consistently get the SAME new name.
+make a function called logic_rename_term takes term, suffix, map returns result
+  if not is_logic_var(term) then
+    return [term, map]
+  end
+  let found = logic_rename_lookup(map, term)
+  if found[0] == "Ok" then
+    return [found[1], map]
+  end
+  let renamed = term + "__" + suffix
+  let new_map = logic_subst_extend(map, term, renamed)
+  return [renamed, new_map]
+end
+
+make a function called logic_rename_args takes args, suffix, map returns result
+  let n = args.length
+  let out = rt_list_new(n)
+  let cur_map = map
+  let i = 0
+  while i < n do
+    let r = logic_rename_term(args[i], suffix, cur_map)
+    rt_list_set(out, i, r[0])
+    let cur_map = r[1]
+    let i = i + 1
+  end
+  return [out, cur_map]
+end
+
+make a function called logic_fresh_rename takes rule returns renamed
+  let suffix = rt_int_to_str(logic_next_rename_id())
+  let head_pred = rule[0]
+  let head_args = rule[1]
+  let body = rule[2]
+  let r1 = logic_rename_args(head_args, suffix, [])
+  let new_head_args = r1[0]
+  let body_n = body.length
+  let new_body = rt_list_new(body_n)
+  let cur_map = r1[1]
+  let bi = 0
+  while bi < body_n do
+    let item = body[bi]
+    let r2 = logic_rename_args(item[1], suffix, cur_map)
+    rt_list_set(new_body, bi, [item[0], r2[0]])
+    let cur_map = r2[1]
+    let bi = bi + 1
+  end
+  return [head_pred, new_head_args, new_body]
+end
+
+make a function called logic_candidates_for_pred takes pred returns matches
+  let rules = logic_rules_list()
+  let n = rules.length
+  let out = rt_list_new(0)
+  let i = 0
+  while i < n do
+    let rule = rules[i]
+    if rt_str_eq(rule[0], pred) then
+      let out = rt_list_push(out, rule)
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# Depth-capped (200, matching MAX_LOGIC_DEPTH in the Rust host)
+# recursive search: for every stored rule whose head predicate
+# matches, fresh-rename it, try to unify args against its head, and if
+# it unifies, recurse into resolve_conjuncts on its body; concatenate
+# all resulting substs across all matching rules.
+make a function called solve_goal takes pred, args, subst, depth returns results
+  if depth > 200 then
+    return []
+  end
+  let candidates = logic_candidates_for_pred(pred)
+  let out = rt_list_new(0)
+  let n = candidates.length
+  let i = 0
+  while i < n do
+    let rule = logic_fresh_rename(candidates[i])
+    let u = unify_args(args, rule[1], subst)
+    if u[0] == "Ok" then
+      let sub_results = resolve_conjuncts(rule[2], u[1], depth + 1)
+      let sj = 0
+      let sn = sub_results.length
+      while sj < sn do
+        let out = rt_list_push(out, sub_results[sj])
+        let sj = sj + 1
+      end
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# Empty body -> proven, [subst]. Otherwise resolve the first conjunct
+# (neq(A,B) is a built-in inequality FILTER on already-walked terms,
+# not a rule lookup -- matches hosts.rs's own resolve_conjuncts
+# exactly) and, for each resulting subst, recursively resolve the
+# rest, concatenating.
+make a function called resolve_conjuncts takes body, subst, depth returns results
+  if body.length == 0 then
+    return [subst]
+  end
+  let first = body[0]
+  let pred = first[0]
+  let cargs = first[1]
+  let rest_n = body.length - 1
+  let rest = rt_list_new(rest_n)
+  let ri = 0
+  while ri < rest_n do
+    rt_list_set(rest, ri, body[ri + 1])
+    let ri = ri + 1
+  end
+  if pred == "neq" then
+    let a0 = logic_walk(cargs[0], subst)
+    let a1 = logic_walk(cargs[1], subst)
+    if not rt_str_eq(a0, a1) then
+      return resolve_conjuncts(rest, subst, depth)
+    end
+    return []
+  end
+  let applied = apply_subst(cargs, subst)
+  let sub_results = solve_goal(pred, applied, subst, depth)
+  let out = rt_list_new(0)
+  let i = 0
+  let n = sub_results.length
+  while i < n do
+    let more = resolve_conjuncts(rest, sub_results[i], depth)
+    let j = 0
+    let mn = more.length
+    while j < mn do
+      let out = rt_list_push(out, more[j])
+      let j = j + 1
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called rule_add takes head_pred, head_args, body returns done
+  let rules = logic_rules_list()
+  let rules = rt_list_push(rules, [head_pred, head_args, body])
+  logic_rules_list_set(rules)
+  return true
+end
+
+# solve(pred, args_list) -> List of solutions; each solution is
+# args_list with any variables replaced by their bound values, one
+# entry per way the goal can be proven true (real backtracking).
+make a function called solve takes pred, query_args returns solutions
+  let results = solve_goal(pred, query_args, [], 0)
+  let out = rt_list_new(0)
+  let n = results.length
+  let i = 0
+  while i < n do
+    let out = rt_list_push(out, apply_subst(query_args, results[i]))
+    let i = i + 1
+  end
+  return out
+end
