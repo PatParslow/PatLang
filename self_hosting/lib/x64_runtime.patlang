@@ -2944,3 +2944,161 @@ end
 make a function called plan takes goal_facts returns path
   return plan_facts(goal_facts)
 end
+
+# =============================================================================
+# goal/pursue/activate extension + design-by-contract (continuing the
+# interp.patlang-compilation roadmap past #26/#27): action_bind/
+# action_lookup (bind a real closure to an action name, looked up again
+# when a plan step for that action is `activate`d) and action_base_name/
+# action_label_args (split a plan-step label like "build(X=house,Y=2)"
+# back into its base name and bound-value list -- exactly the reverse
+# of action_instance_label above, so the two round-trip), plus
+# contract_check (require/ensure/assert enforcement).
+# Ground truth: rust-runtime/src/ir/hosts.rs lines ~1202-1248, ~2356-2380.
+# =============================================================================
+
+make a function called logic_action_bodies_list returns l
+  let addr = mem_action_bodies_table_addr()
+  let l = mem_peek_qword(addr, 0)
+  if l == 0 then
+    let l = rt_list_new(0)
+    mem_poke_qword(addr, 0, l)
+  end
+  return l
+end
+
+make a function called logic_action_bodies_list_set takes l returns done
+  mem_poke_qword(mem_action_bodies_table_addr(), 0, l)
+  return true
+end
+
+# action_bind(name, closure) -> Unit. A single global sequential store
+# (not a divergent-branches/backtracking context like Subst/state
+# above), so mutate-in-place via rt_list_set (for a replace) or
+# rt_list_push (for a fresh append) is safe here -- there is only ever
+# one canonical binding table, never multiple independent extensions
+# of a shared starting point.
+make a function called action_bind takes name, closure returns done
+  let bodies = logic_action_bodies_list()
+  let n = bodies.length
+  let i = 0
+  let found = false
+  while i < n do
+    if rt_str_eq(bodies[i][0], name) then
+      rt_list_set(bodies, i, [name, closure])
+      let found = true
+    end
+    let i = i + 1
+  end
+  if not found then
+    let bodies = rt_list_push(bodies, [name, closure])
+    logic_action_bodies_list_set(bodies)
+  end
+  return true
+end
+
+# action_lookup(name) -> the bound closure, or a fatal runtime trap if
+# none was ever bound -- matches the real host's own fatal Err here
+# (PatLang has no try/catch for either backend to recover via anyway).
+# Distinctive exit code 99, same documented-trap convention as the
+# dynamic-mode % trap (97) and contract_check's own trap (98) below.
+make a function called action_lookup takes name returns closure
+  let bodies = logic_action_bodies_list()
+  let n = bodies.length
+  let i = 0
+  while i < n do
+    if rt_str_eq(bodies[i][0], name) then
+      return bodies[i][1]
+    end
+    let i = i + 1
+  end
+  print("activate: no action bound to '" + name + "' (call action_bind(\"" + name + "\", ...) first)")
+  os_exit(99)
+  return 0
+end
+
+make a function called logic_str_index_of takes s, ch returns idx
+  let n = s.length
+  let i = 0
+  while i < n do
+    if substr(s, i, 1) == ch then
+      return i
+    end
+    let i = i + 1
+  end
+  return 0 - 1
+end
+
+# Splits a plan-step label back into [base_name, bound_values_list] --
+# the exact reverse of action_instance_label above ("build" -> ("build",
+# []), "build(X=house,Y=2)" -> ("build", ["house","2"])), so the two
+# round-trip. Assumes the label was genuinely produced by
+# action_instance_label (always well-formed: an open paren, if any, is
+# always eventually closed by the label's own final character).
+make a function called logic_split_action_label takes label returns result
+  let open_i = logic_str_index_of(label, "(")
+  if open_i < 0 then
+    return [label, []]
+  end
+  let name = substr(label, 0, open_i)
+  let inner_len = label.length - open_i - 2
+  if inner_len <= 0 then
+    return [name, []]
+  end
+  let inner = substr(label, open_i + 1, inner_len)
+  let vals = []
+  let start = 0
+  let n = inner.length
+  let i = 0
+  while i <= n do
+    if (i == n) or (substr(inner, i, 1) == ",") then
+      let part = substr(inner, start, i - start)
+      let eq_i = logic_str_index_of(part, "=")
+      if eq_i >= 0 then
+        let vals = rt_list_push(vals, substr(part, eq_i + 1, part.length - eq_i - 1))
+      else
+        let vals = rt_list_push(vals, part)
+      end
+      let start = i + 1
+    end
+    let i = i + 1
+  end
+  return [name, vals]
+end
+
+make a function called action_base_name takes label returns name
+  let r = logic_split_action_label(label)
+  return r[0]
+end
+
+make a function called action_label_args takes label returns vals
+  let r = logic_split_action_label(label)
+  return r[1]
+end
+
+# contract_check(func, kind, text, ok) -- require/ensure/assert
+# enforcement, the shared design-by-contract primitive. A successful
+# check becomes an ordinary derivable fact (reuses #26's own rule_add
+# infrastructure directly, exactly matching the real host's own
+# "record as a ground fact" behavior) so contracts compose with the
+# logic engine/GOAP planner, not just a pass/fail side effect. A
+# failing check is fatal -- distinctive exit code 98, same trap
+# convention as action_lookup's miss case above.
+make a function called contract_check takes func, kind, text, ok returns done
+  if ok then
+    let combined = kind + ":" + text
+    rule_add("contract_holds", [func, combined], [])
+    return true
+  end
+  let label = "assertion"
+  if kind == "require" then
+    let label = "precondition"
+  else
+    if kind == "ensure" then
+      let label = "postcondition"
+    end
+  end
+  print("contract violation: " + label + " failed in " + func + "(): " + text)
+  os_exit(98)
+  return false
+end
