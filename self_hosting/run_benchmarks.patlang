@@ -1,0 +1,197 @@
+# run_benchmarks.patlang -- runs every self_hosting/cross_backend_benchmarks/*.patlang
+# program through all three PatLang backends (interpreter, --patc
+# rustc-backed native, --x64 self-hosted native), timing each and
+# cross-checking correctness against the interpreter's own output
+# (the one backend with no known partial-feature gaps).
+#
+# --patc is a FULLY-supported backend: any mismatch against the
+# interpreter there is a genuine regression and fails this script
+# (nonzero exit, via run_benchmarks.sh's wrapper -- see its own header).
+#
+# --x64 is still a partial/experimental backend (some numeric-tower
+# paths trap by design, float printing isn't implemented at all yet,
+# etc.) -- per its own documented scope, a compile error, a runtime
+# fault, or an output mismatch there is LOGGED clearly but never
+# aborts the run; the suite always continues to the next benchmark.
+# That's the whole point of running this regularly: it turns "does
+# the native backend still work" into a repeatable, visible signal
+# instead of something only found by accident.
+#
+# Run from the repo root:
+#   rust-runtime/target/release/pat --ir-run self_hosting/run_benchmarks.patlang
+#
+# Requires (built once, separately, same as any other --x64 work):
+#   rust-runtime/target/release/pat.exe   (cargo build --release)
+#   ./patc1.exe                            (pat --ir-run self_hosting/build_patc1.patlang)
+#   self_hosting/build/x64_runtime.obj     (pat --ir-run self_hosting/build_x64_runtime.patlang)
+# If x64_runtime.obj is missing, --x64 rows are skipped with a clear
+# message rather than failing the whole run.
+#
+# NOTE: exec_capture(path, arg1, arg2, ...) is VARIADIC -- each argv
+# entry is its OWN positional argument to exec_capture, NOT a single
+# list value (confirmed against every other caller in this codebase,
+# e.g. lib/x64_build.patlang's own nasm/gcc invocations) -- so each
+# backend below gets its own explicit exec_capture call rather than a
+# generic "run with this list of args" helper.
+#
+# NOTE: `pat --ir-run`'s own transcript ends with one extra trailing
+# newline that a standalone compiled .exe's stdout doesn't have --
+# real bug hunt led here (bench_closures showed a "MISMATCH" with
+# byte-identical visible text; `diff`/`xxd` traced it to exactly one
+# trailing "\n" difference, nothing else). lib/includes.patlang's own
+# str_trim doesn't help here -- its is_ws_char only treats space/tab/CR
+# as whitespace, deliberately not "\n" (not this script's business to
+# change a shared utility's semantics for everyone just for this one
+# local need) -- so trim_trailing_newlines below is a small, scoped-to-
+# this-script helper that also strips trailing "\n" before comparing.
+
+include "lib/includes.patlang"
+
+make a function called trim_trailing_newlines takes s returns out
+  let trimmed = str_trim(s)
+  let n = trimmed.length
+  while (n > 0) and (char_code(trimmed, n - 1) == 10) do
+    let n = n - 1
+  end
+  return substr(trimmed, 0, n)
+end
+
+let pat_exe = "rust-runtime/target/release/pat.exe"
+let patc1_exe = "./patc1.exe"
+let runtime_obj = "self_hosting/build/x64_runtime.obj"
+let bench_dir = "self_hosting/cross_backend_benchmarks"
+let tmp_dir = "self_hosting/build/bench_tmp"
+
+make a function called ends_with takes s, suffix returns yes
+  let sl = s.length
+  let xl = suffix.length
+  if xl > sl then
+    return false
+  end
+  return substr(s, sl - xl, xl) == suffix
+end
+
+make a function called discover_benchmarks takes dir returns names
+  let entries = list_dir(dir)
+  let out = []
+  let i = 0
+  let n = entries.length
+  while i < n do
+    let e = entries[i]
+    if ends_with(e, ".patlang") then
+      let out = list_push(out, substr(e, 0, e.length - 8))
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+let benchmarks = discover_benchmarks(bench_dir)
+print("Discovered " + benchmarks.length + " benchmark(s) in " + bench_dir)
+print("")
+
+let x64_available = file_exists(runtime_obj) == "1"
+if not x64_available then
+  print("[x64] " + runtime_obj + " not found -- x64 rows will be skipped.")
+  print("      Build it first: pat --ir-run self_hosting/build_x64_runtime.patlang")
+  print("")
+end
+
+let report = sb_new()
+sb_push(report, "PatLang cross-backend benchmark report" + chr(10))
+sb_push(report, "========================================" + chr(10) + chr(10))
+
+let any_patc_mismatch = false
+let bi = 0
+let bn = benchmarks.length
+while bi < bn do
+  let name = benchmarks[bi]
+  let src = bench_dir + "/" + name + ".patlang"
+  print("=== " + name + " ===")
+  sb_push(report, "=== " + name + " ===" + chr(10))
+
+  let t0 = now_ms()
+  let interp_out = exec_capture(pat_exe, "--ir-run", src)
+  let interp_ms = now_ms() - t0
+  print("  interpreter:  " + interp_ms + "ms")
+  sb_push(report, "  interpreter:  " + interp_ms + "ms" + chr(10))
+
+  let patc_exe_path = tmp_dir + "/" + name + "_patc.exe"
+  let t1 = now_ms()
+  let patc_build_out = exec_capture(pat_exe, "--patc", src, "--out", patc_exe_path)
+  let patc_build_ms = now_ms() - t1
+  if file_exists(patc_exe_path) == "1" then
+    let t2 = now_ms()
+    let patc_out = exec_capture(patc_exe_path)
+    let patc_run_ms = now_ms() - t2
+    let patc_match = trim_trailing_newlines(patc_out) == trim_trailing_newlines(interp_out)
+    let patc_word = "MISMATCH"
+    if patc_match then
+      let patc_word = "MATCHES"
+    end
+    print("  --patc:       compile " + patc_build_ms + "ms, run " + patc_run_ms + "ms, output " + patc_word)
+    sb_push(report, "  --patc:       compile " + patc_build_ms + "ms, run " + patc_run_ms + "ms, output " + patc_word + chr(10))
+    if not patc_match then
+      let any_patc_mismatch = true
+      print("    *** GENUINE REGRESSION -- --patc is a fully-supported backend ***")
+      print("    interpreter output: " + interp_out)
+      print("    --patc output:      " + patc_out)
+      sb_push(report, "    *** GENUINE REGRESSION ***" + chr(10))
+      sb_push(report, "    interpreter output: " + interp_out + chr(10))
+      sb_push(report, "    --patc output:      " + patc_out + chr(10))
+    end
+  else
+    print("  --patc:       COMPILE FAILED (" + patc_build_ms + "ms) -- treated as a genuine regression")
+    print("    " + patc_build_out)
+    sb_push(report, "  --patc:       COMPILE FAILED (" + patc_build_ms + "ms)" + chr(10))
+    sb_push(report, "    " + patc_build_out + chr(10))
+    let any_patc_mismatch = true
+  end
+
+  if x64_available then
+    let x64_exe_path = tmp_dir + "/" + name + "_x64.exe"
+    let t3 = now_ms()
+    let x64_build_out = exec_capture(patc1_exe, src, x64_exe_path, "--x64")
+    let x64_build_ms = now_ms() - t3
+    if file_exists(x64_exe_path) == "1" then
+      let t4 = now_ms()
+      let x64_out = exec_capture(x64_exe_path)
+      let x64_run_ms = now_ms() - t4
+      let x64_match = trim_trailing_newlines(x64_out) == trim_trailing_newlines(interp_out)
+      let x64_word = "MISMATCH (logged, not fatal)"
+      if x64_match then
+        let x64_word = "MATCHES"
+      end
+      print("  --x64:        compile " + x64_build_ms + "ms, run " + x64_run_ms + "ms, output " + x64_word)
+      sb_push(report, "  --x64:        compile " + x64_build_ms + "ms, run " + x64_run_ms + "ms, output " + x64_word + chr(10))
+      if not x64_match then
+        print("    interpreter output: " + interp_out)
+        print("    --x64 output:       " + x64_out)
+        sb_push(report, "    interpreter output: " + interp_out + chr(10))
+        sb_push(report, "    --x64 output:       " + x64_out + chr(10))
+      end
+    else
+      print("  --x64:        COMPILE FAULT (logged, not fatal): " + x64_build_out)
+      sb_push(report, "  --x64:        COMPILE FAULT: " + x64_build_out + chr(10))
+    end
+  end
+
+  print("")
+  sb_push(report, chr(10))
+  let bi = bi + 1
+end
+
+write_file("self_hosting/build/benchmark_report.txt", sb_str(report))
+print("Full report written to self_hosting/build/benchmark_report.txt")
+
+print("")
+if any_patc_mismatch then
+  # os_exit is an x64-codegen-only intrinsic, not a host function this
+  # ordinary interpreted script can call -- the FAILED/OK marker on its
+  # own line is what run_benchmarks.sh's wrapper greps for to turn this
+  # into a real nonzero process exit code (same pattern verify_patc2.sh
+  # already uses for the same reason).
+  print("FAILED: at least one --patc mismatch/compile-failure found above (genuine regression).")
+else
+  print("OK: --patc matched the interpreter on every benchmark. (x64 results are informational -- see above/report for any logged faults.)")
+end
