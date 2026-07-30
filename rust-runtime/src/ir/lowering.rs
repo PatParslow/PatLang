@@ -408,8 +408,10 @@ impl Lowerer {
         let mut seen: HashSet<String> = HashSet::new();
         collect_referenced_idents(body, &mut referenced, &mut seen);
 
+        let mut self_ref_lets: HashSet<String> = HashSet::new();
+        collect_self_referential_let_names(body, &mut self_ref_lets);
         let captured_names: Vec<String> = referenced.into_iter()
-            .filter(|n| !own.contains(n) && self.known_locals.contains_key(n))
+            .filter(|n| (!own.contains(n) || self_ref_lets.contains(n)) && self.known_locals.contains_key(n))
             .collect();
 
         self.closure_counter += 1;
@@ -735,8 +737,10 @@ impl Lowerer {
         // Capture only names that are (a) free in the closure and (b) actually
         // present in the enclosing scope right now (anything else is presumably
         // a host/global function name, not a variable to snapshot).
+        let mut self_ref_lets: HashSet<String> = HashSet::new();
+        collect_self_referential_let_names(body, &mut self_ref_lets);
         let captured_names: Vec<String> = referenced.into_iter()
-            .filter(|n| !own.contains(n) && self.known_locals.contains_key(n))
+            .filter(|n| (!own.contains(n) || self_ref_lets.contains(n)) && self.known_locals.contains_key(n))
             .collect();
 
         self.closure_counter += 1;
@@ -826,6 +830,52 @@ fn collect_let_bound_names(stmts: &[Stmt], out: &mut HashSet<String>) {
             }
             Stmt::While { body, .. } => collect_let_bound_names(body, out),
             Stmt::When { body, .. } => collect_let_bound_names(body, out),
+            _ => {}
+        }
+    }
+}
+
+/// Real bug found while testing the x64 backend's numeric-tower `%` support
+/// (unrelated to x64 itself -- reproduces identically under plain
+/// `--ir-run`): `collect_let_bound_names`/`captured_names` treat every name
+/// EVER `let`-bound anywhere in a closure's body as "owned" by the closure,
+/// unconditionally excluding it from capture -- including the very
+/// declaration statement that reads the OUTER value on its own right-hand
+/// side, e.g. `let n = n + 1` as a closure's first (and only) mention of
+/// `n`. That RHS `n` needs the captured outer value; the flat "own" set
+/// wrongly hides it, so the closure silently reads an uninitialized/default
+/// local instead (e.g. a captured `n = 100` reads back as 0, giving `1`
+/// instead of `101`) -- no crash, no diagnostic, just a silently wrong
+/// closure.
+///
+/// This finds every name whose OWN `let name = <expr>` has `name` appearing
+/// inside `<expr>` itself, anywhere in the body (same flat, no-block-scoping
+/// traversal `collect_let_bound_names` already uses) -- such a name must
+/// still be considered for capture despite also being let-bound, since its
+/// very first mention needs the enclosing scope's value. A closure that
+/// instead establishes its own value first (`let n = 5` with no self-
+/// reference) and only later does `let n = n + 1` also gets flagged here,
+/// but harmlessly: the wrongly-captured value is simply overwritten by the
+/// unrelated first `let` before ever being read, since this language has no
+/// block scoping (a captured leading param and a same-named later `let` are
+/// the same flat local slot) -- extra safety, not a correctness bug.
+fn collect_self_referential_let_names(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Let { name, value, .. } => {
+                let mut ids = Vec::new();
+                let mut seen = HashSet::new();
+                collect_ident_expr(value, &mut ids, &mut seen);
+                if ids.iter().any(|n| n == name) {
+                    out.insert(name.clone());
+                }
+            }
+            Stmt::If { then_branch, else_branch, .. } => {
+                collect_self_referential_let_names(then_branch, out);
+                if let Some(eb) = else_branch { collect_self_referential_let_names(eb, out); }
+            }
+            Stmt::While { body, .. } => collect_self_referential_let_names(body, out),
+            Stmt::When { body, .. } => collect_self_referential_let_names(body, out),
             _ => {}
         }
     }
