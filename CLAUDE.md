@@ -129,3 +129,59 @@ This applies uniformly — a one-line utility function deserves the same
 RED → GREEN discipline as a large feature; skipping it for "small"
 code is exactly the gap that let four specs ship as "verified" while
 describing a different program entirely.
+
+## Prefer `elif`/early-return over `else` + nested `if` with deferred `end`s
+
+A real bug (found and fixed 2026-07-30, `self_hosting/lib/codegen_x64.
+patlang`'s `x64_callhost_asm`) came from this pattern:
+
+```
+if name == "a" then
+  ...
+else
+  if name == "b" then
+    ...
+  else
+    if name == "c" then
+      ...
+    end
+  end
+end
+```
+
+Adding one more branch to a chain like this means adding one more
+`if`/`else` pair — which means the matching `end` has to be added
+too, but it's *deferred* to a shared stack, often dozens of lines and
+several nesting levels away from the `if` it closes. Forgetting the
+one extra `end` does **not** produce a parse error — the file still
+parses, but the whole surrounding function's structure silently shifts,
+and depending on what follows, the visible symptom can be as
+extreme as **the entire program producing zero output and exiting 0**,
+with nothing to indicate where — or even that — something broke. This
+is exactly what happened: one new branch added to `x64_callhost_asm`'s
+existing (112-deep, in that one file) chain, one missing `end`, and
+every script that so much as `include`d the file went silent.
+
+**Going forward, for a chain of mutually-exclusive string/value
+comparisons, prefer real `elif`** (this grammar supports it — the
+Rust parser's own `elif` handling was itself fixed this session,
+GitHub #23 — confirmed working correctly): the branch count and the
+`end` count can never drift apart, because there's only ever one `end`
+for the whole chain regardless of how many `elif`s it has.
+
+**For a function that's really just "check each condition, return the
+answer for whichever one matches"** (e.g. this file's own
+`x64_is_bool_producing_instr`), prefer early-return guard clauses
+instead — PatLang has no `continue`/`break`, but a `return` inside an
+`if` that closes immediately is exactly as safe as `elif` for this
+same reason: each `if`'s `end` is right next to its own `if`, never
+deferred to a shared stack elsewhere.
+
+Not a mandate to mass-refactor existing deferred-`end` chains (the
+codebase has many, `x64_callhost_asm` alone has ~20 levels) — but any
+*new* branch added to one is worth converting the surrounding chain to
+`elif` while you're there, and any *new* chain should use `elif`/early-
+return from the start. If you do add to an existing deferred-stack
+chain anyway, count the `end`s in the closing stack very carefully and
+verify immediately by running anything that includes the file — silent
+zero-output-exit-0 is the actual failure mode, not a helpful error.
