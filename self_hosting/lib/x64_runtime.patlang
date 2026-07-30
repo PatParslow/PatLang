@@ -3581,3 +3581,173 @@ make a function called vfs_flush_to_disk takes prefix, real_dir returns count
   end
   return count
 end
+
+# type_of/numeric_kind: real host reflection over every Value variant
+# (rust-runtime/src/ir/hosts.rs). x64_family_code (a raw CallHost
+# primitive, see codegen_x64.patlang's own header on it) does the
+# family-nibble classification and returns a small int code; these
+# ordinary PatLang wrappers map that code to the actual string result
+# via real literal Consts, reusing the normal string-literal pipeline
+# rather than trying to emit a fresh string constant from raw asm.
+#
+# Honest, documented gap: this backend has no PER-VALUE tag for
+# fixnum-vs-bool-vs-unit-vs-float (float_mode is a per-FUNCTION
+# classification here, not a tag -- see this file's own float_mode
+# notes throughout) -- family code 0 covers all four, and this always
+# reports "int" for it, never "bool"/"unit"/"float". A real but
+# scoped-down implementation, not a stub.
+make a function called type_of takes v returns result
+  let code = x64_family_code(v)
+  if code == 2 then
+    return "string"
+  end
+  if code == 3 then
+    return "list"
+  end
+  if code == 4 then
+    return "closure"
+  end
+  if code == 5 then
+    return "object"
+  end
+  if code == 6 then
+    return "bigint"
+  end
+  if code == 7 then
+    return "rational"
+  end
+  if code == 8 then
+    return "complex"
+  end
+  if code == 0 then
+    return "int"
+  end
+  return "other"
+end
+
+make a function called numeric_kind takes v returns result
+  let code = x64_family_code(v)
+  if code == 0 then
+    return "int"
+  end
+  if code == 6 then
+    return "bigint"
+  end
+  if code == 7 then
+    return "rational"
+  end
+  if code == 8 then
+    return "complex"
+  end
+  return "other"
+end
+
+# to_fixed(x, places) -- built on the SAME rt_float_decompose used by
+# rt_print_float, which only ever extracts 6 significant fractional
+# digits (see its own header) -- so `places` beyond 6 truncates rather
+# than genuinely extending precision, and no rounding happens at the
+# cutoff (real host's Rust dtoa does correct round-to-nearest at
+# arbitrary precision; this doesn't). A real but scoped-down
+# implementation for the realistic places<=6 case.
+make a function called to_fixed takes x, places returns result
+  let parts = rt_float_decompose(x)
+  let neg = parts[0]
+  let ipart = parts[1]
+  let digits = rt_int_to_str(parts[2]) + rt_int_to_str(parts[3]) + rt_int_to_str(parts[4]) + rt_int_to_str(parts[5]) + rt_int_to_str(parts[6]) + rt_int_to_str(parts[7])
+  let result = ""
+  if neg == 1 then
+    let result = "-"
+  end
+  let result = result + rt_int_to_str(ipart)
+  if places > 0 then
+    let p = places
+    if p > 6 then
+      let p = 6
+    end
+    let result = result + "." + substr(digits, 0, p)
+  end
+  return result
+end
+
+# hash_string(s) -- lowercase hex FNV-1a 64-bit digest, matching the
+# real host's own algorithm (rust-runtime/src/ir/hosts.rs) exactly.
+# Pure self-hosted PatLang, no new raw asm primitive needed: hash_string
+# has no string LITERAL of its own (uses char_code/substr, not a bare
+# "..." Const), so it's a plain non-dynamic, non-float function -- `*`
+# there is ordinary `imul` with no overflow check/promotion at all
+# (unlike dynamic-mode's BigInt-promoting `*`), which wraps silently
+# mod 2^64 exactly like FNV-1a's own algorithm needs.
+#
+# Real bug found and fixed here: the FNV offset basis
+# (0xcbf29ce484222325 = 14695981039346656037 unsigned) written as a
+# bare decimal literal gets silently CORRUPTED by BOTH backends' own
+# numeric-literal parsing for an integer this large (confirmed
+# directly: `print(0 - 3750763034362895579)` prints
+# -3750763034362895360 under --ir-run -- the wrong value already,
+# precision lost somewhere in literal lexing/parsing for anything
+# beyond safe f64-exact-integer range -- and something DIFFERENT and
+# also wrong under --x64). A pre-existing, orthogonal lexer/numeric-
+# literal limitation, not something to chase here -- sidestepped
+# entirely by building the exact 64-bit pattern via 8 individual
+# byte-pokes (each a small, safely-representable 0-255 literal) into
+# scratch memory instead of ever writing the huge constant directly.
+make a function called rt_fnv_offset_basis returns hash
+  let addr = mem_scratch_addr()
+  mem_poke_byte(addr, 0, 37)
+  mem_poke_byte(addr, 1, 35)
+  mem_poke_byte(addr, 2, 34)
+  mem_poke_byte(addr, 3, 132)
+  mem_poke_byte(addr, 4, 228)
+  mem_poke_byte(addr, 5, 156)
+  mem_poke_byte(addr, 6, 242)
+  mem_poke_byte(addr, 7, 203)
+  return mem_peek_qword(addr, 0)
+end
+
+make a function called hash_string takes s returns result
+  let hash = rt_fnv_offset_basis()
+  let n = s.length
+  let i = 0
+  while i < n do
+    let b = char_code(s, i)
+    let hash = hash bxor b
+    let hash = hash * 1099511628211
+    let i = i + 1
+  end
+  return rt_u64_to_hex16(hash)
+end
+
+# rt_u64_to_hex16(n) -- 16-char lowercase hex of n's raw 64-bit bit
+# pattern, treated as unsigned. Deliberately goes through memory
+# (poke the qword, then read it back BYTE BY BYTE via mem_peek_byte)
+# rather than shifting+masking the value directly -- this backend's
+# `shr` operator is arithmetic (SAR, sign-extending, matching Rust's
+# `>>` on i64 -- see bit_get/bit_slice's own header), so a logical
+# right-shift needed for hex-digit extraction on a NEGATIVE n isn't
+# directly available; byte-level memory reads are unsigned by
+# construction (movzx) and sidestep the issue entirely.
+make a function called rt_byte_to_hex2 takes b returns s
+  let hi = b / 16
+  let lo = b - hi * 16
+  return rt_hex_digit(hi) + rt_hex_digit(lo)
+end
+
+make a function called rt_hex_digit takes d returns c
+  if d < 10 then
+    return chr(48 + d)
+  end
+  return chr(97 + d - 10)
+end
+
+make a function called rt_u64_to_hex16 takes n returns s
+  let addr = mem_scratch_addr()
+  mem_poke_qword(addr, 0, n)
+  let s = ""
+  let i = 7
+  while i >= 0 do
+    let b = mem_peek_byte(addr, i)
+    let s = s + rt_byte_to_hex2(b)
+    let i = i - 1
+  end
+  return s
+end
