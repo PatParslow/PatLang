@@ -475,6 +475,33 @@ end
 # seta/setae for </<=/>/>=, NOT setl/setle/setg/setge) -- a genuine,
 # easy-to-get-wrong difference from the integer comparison path, called
 # out explicitly here rather than silently copy-pasted wrong.
+# Real bug found while exercising the float/int-mixed-in-one-function
+# case: a bare integer Const (e.g. a plain `0` argument at a call site)
+# living in a function this backend has otherwise classified as
+# float_mode (see this file's own header on the ALL-int-or-ALL-float
+# per-function scoping) still gets routed through __float64__(...) --
+# and NASM's __float64__ macro requires actual floating-point syntax
+# (a decimal point), rejecting bare "0"/"5" with "expecting floating-
+# point number" and cascading into a wall of unrelated-looking parse
+# errors on every later line, exactly the failure mode already fixed
+# once for missing trailing newlines (see the UNSUPPORTED_*_ERROR
+# comments elsewhere in this file). Ensures the literal text always
+# has a decimal point before handing it to __float64__, so an integer
+# constant in a float-mode function still assembles (as the float
+# value it's being treated as, consistent with this slice's documented
+# all-or-nothing per-function typing) instead of hard-failing NASM.
+make a function called x64_float_literal_text takes text returns out
+  let i = 0
+  let n = text.length
+  while i < n do
+    if substr(text, i, 1) == "." then
+      return text
+    end
+    let i = i + 1
+  end
+  return text + ".0"
+end
+
 make a function called x64_binop_asm_float takes op returns asm
   let sb = sb_new()
   sb_push(sb, "    pop r10" + x64_nl_char())
@@ -497,6 +524,19 @@ make a function called x64_binop_asm_float takes op returns asm
           sb_push(sb, "    divsd xmm0, xmm1" + x64_nl_char())
           sb_push(sb, "    movq rax, xmm0" + x64_nl_char())
         else
+          if op == "%" then
+            # fmod via truncated division, matching C's fmod / this
+            # backend's own truncate-toward-zero integer % semantics:
+            # xmm2 keeps the original numerator since xmm0 gets
+            # overwritten by the quotient below.
+            sb_push(sb, "    movq xmm2, xmm0" + x64_nl_char())
+            sb_push(sb, "    divsd xmm0, xmm1" + x64_nl_char())
+            sb_push(sb, "    cvttsd2si rax, xmm0" + x64_nl_char())
+            sb_push(sb, "    cvtsi2sd xmm0, rax" + x64_nl_char())
+            sb_push(sb, "    mulsd xmm0, xmm1" + x64_nl_char())
+            sb_push(sb, "    subsd xmm2, xmm0" + x64_nl_char())
+            sb_push(sb, "    movq rax, xmm2" + x64_nl_char())
+          else
           sb_push(sb, "    ucomisd xmm0, xmm1" + x64_nl_char())
           if op == "==" then
             sb_push(sb, "    sete al" + x64_nl_char())
@@ -525,6 +565,7 @@ make a function called x64_binop_asm_float takes op returns asm
             end
           end
           sb_push(sb, "    movzx rax, al" + x64_nl_char())
+          end
         end
       end
     end
@@ -832,6 +873,63 @@ make a function called x64_binop_asm_div_dynamic takes spilled returns asm
   sb_push(sb, "    call rt_rational_div" + x64_nl_char())
   sb_push(sb, "    add rsp, 16" + x64_nl_char())
   sb_push(sb, ".DIV_DONE_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# Dynamic-mode `%`, dispatched separately like `/` (not through
+# x64_dynamic_op_supported's generic table). Fast path (both operands
+# genuine fixnums) is exact and correct: `idiv`'s remainder, truncated
+# toward zero, matching the plain-int `%` path used outside dynamic-
+# mode functions. Slow path (either operand is BigInt/Rational/Complex/
+# Interval) has NO runtime implementation to fall back to yet -- unlike
+# `/`, which can always promote to Rational, `%` on an arbitrary-
+# precision BigInt genuinely needs bigint long-division (rt_bigint_div
+# doesn't exist at all yet, only add/sub/mul/cmp), and Rational/Complex/
+# Interval modulo isn't a meaningful defined operation in this tower at
+# all. Deliberately a hard, distinctive-exit-code runtime trap here
+# rather than silently falling through to plain int semantics on a
+# raw tagged pointer (the previous behavior for ALL non-`/` ops
+# outside x64_dynamic_op_supported's table) -- this is exactly the
+# "clear error, not silently wrong output" invariant patc1_main.patlang
+# documents for the whole backend; fixnum `%` (the overwhelmingly
+# common case, including plain-int `%` inside a function that merely
+# also happens to touch BigInt elsewhere) still works correctly.
+make a function called x64_binop_asm_mod_dynamic takes spilled returns asm
+  let dyn_a = 8 * (to_num(list_len(spilled)) + 2)
+  let dyn_b = 8 * (to_num(list_len(spilled)) + 3)
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "    pop qword [rbp-" + dyn_b + "]" + x64_nl_char())
+  sb_push(sb, "    pop qword [rbp-" + dyn_a + "]" + x64_nl_char())
+  sb_push(sb, "    mov r15, 18446462598732840960" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rbp-" + dyn_a + "]" + x64_nl_char())
+  sb_push(sb, "    and rax, r15" + x64_nl_char())
+  sb_push(sb, "    mov r10, [rbp-" + dyn_b + "]" + x64_nl_char())
+  sb_push(sb, "    and r10, r15" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+  sb_push(sb, "    jne .MOD_UNSUPPORTED_" + suffix + x64_nl_char())
+  sb_push(sb, "    cmp r10, 0" + x64_nl_char())
+  sb_push(sb, "    jne .MOD_UNSUPPORTED_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rax, [rbp-" + dyn_a + "]" + x64_nl_char())
+  sb_push(sb, "    shl rax, 16" + x64_nl_char())
+  sb_push(sb, "    sar rax, 16" + x64_nl_char())
+  sb_push(sb, "    mov r10, [rbp-" + dyn_b + "]" + x64_nl_char())
+  sb_push(sb, "    shl r10, 16" + x64_nl_char())
+  sb_push(sb, "    sar r10, 16" + x64_nl_char())
+  sb_push(sb, "    cqo" + x64_nl_char())
+  sb_push(sb, "    idiv r10" + x64_nl_char())
+  sb_push(sb, "    mov rax, rdx" + x64_nl_char())
+  sb_push(sb, "    mov r15, 281474976710655" + x64_nl_char())
+  sb_push(sb, "    and rax, r15" + x64_nl_char())
+  sb_push(sb, "    jmp .MOD_DONE_" + suffix + x64_nl_char())
+  sb_push(sb, ".MOD_UNSUPPORTED_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rcx, 97" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    call ExitProcess" + x64_nl_char())
+  sb_push(sb, ".MOD_DONE_" + suffix + ":" + x64_nl_char())
   sb_push(sb, "    push rax" + x64_nl_char())
   return sb_str(sb)
 end
@@ -2079,7 +2177,7 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
         sb_push(sb, "    push rax" + x64_nl_char())
       else
         if float_mode then
-          sb_push(sb, "    mov rax, __float64__(" + instr[2] + ")" + x64_nl_char())
+          sb_push(sb, "    mov rax, __float64__(" + x64_float_literal_text(instr[2]) + ")" + x64_nl_char())
         else
           sb_push(sb, "    mov rax, " + instr[2] + x64_nl_char())
         end
@@ -2115,16 +2213,20 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
               if instr[1] == "/" then
                 sb_push(sb, x64_binop_asm_div_dynamic(spilled))
               else
-                if x64_dynamic_op_supported(instr[1]) then
-                  sb_push(sb, x64_binop_asm_dynamic(instr[1], spilled))
+                if instr[1] == "%" then
+                  sb_push(sb, x64_binop_asm_mod_dynamic(spilled))
                 else
-                  # Named scope limit: band/bor/bxor/shl/shr/% still
-                  # aren't meaningful on the numeric tower (or aren't
-                  # wired up yet), so they compile as plain int
-                  # arithmetic on the raw tagged word inside a dynamic-
-                  # mode function -- only correct if that operand is
-                  # actually a fixnum. See x64_runtime.patlang's header.
-                  sb_push(sb, x64_binop_asm(instr[1]))
+                  if x64_dynamic_op_supported(instr[1]) then
+                    sb_push(sb, x64_binop_asm_dynamic(instr[1], spilled))
+                  else
+                    # Named scope limit: band/bor/bxor/shl/shr still
+                    # aren't meaningful on the numeric tower (or aren't
+                    # wired up yet), so they compile as plain int
+                    # arithmetic on the raw tagged word inside a dynamic-
+                    # mode function -- only correct if that operand is
+                    # actually a fixnum. See x64_runtime.patlang's header.
+                    sb_push(sb, x64_binop_asm(instr[1]))
+                  end
                 end
               end
             else
@@ -2149,7 +2251,27 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
               if instr[1] == "bnot" then
                 sb_push(sb, "    not rax" + x64_nl_char())
               else
-                sb_push(sb, "    neg rax" + x64_nl_char())
+                if float_mode then
+                  # Real bug found alongside the modulo/float-literal
+                  # fixes: `neg` is a two's-complement INTEGER negation
+                  # on the raw 64-bit register -- applied to a double's
+                  # raw bit pattern, this is NOT a sign flip in general
+                  # (the NOT+1 carry chain can propagate into the
+                  # exponent field), e.g. -1.5's bit pattern
+                  # (0x3FF8000000000000) two's-complement-negates to
+                  # 0xC008000000000000, which is -3.0, not -1.5 --
+                  # silently wrong by exactly 2x for this literal, not
+                  # a crash, so easy to miss without a direct
+                  # arithmetic check. Correct float negation only
+                  # toggles the sign bit (bit 63), done here as a plain
+                  # GPR XOR against the sign mask -- no SSE round-trip
+                  # needed since the value's bits are already sitting
+                  # in rax.
+                  sb_push(sb, "    mov r10, 9223372036854775808" + x64_nl_char())
+                  sb_push(sb, "    xor rax, r10" + x64_nl_char())
+                else
+                  sb_push(sb, "    neg rax" + x64_nl_char())
+                end
               end
             end
             sb_push(sb, "    push rax" + x64_nl_char())
