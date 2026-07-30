@@ -147,6 +147,27 @@ impl<'a> Parser<'a> {
             if stop_on_else && matches!(self.curr, Token::Else) {
                 return Ok((body, "else".to_string()));
             }
+            // Real bug found via the new cross-backend benchmark suite's
+            // bench_control_flow (elif chain double-counting its final
+            // else branch): "elif" lexes as a dedicated Token::Elif, not
+            // Token::Identifier("elif") -- so the stop_words check below
+            // (which only matches Token::Identifier) could never actually
+            // recognize "elif" as a stopper, even though parse_if_then_tail
+            // passes stop_words=["end", "elif"] expecting exactly that.
+            // The elif token was silently skipped (can_start_statement()
+            // is false for it, falling to the bare self.advance() below),
+            // and its condition expression then got parsed as an ordinary
+            // (discarded) statement folded into the CURRENT branch's body
+            // instead of stopping it -- so the else branch's statements
+            // ended up executing on every iteration that reached this
+            // point, silently doubling its count in a 3-way if/elif/else
+            // chain. Mirrors the stop_on_else special case above: a
+            // dedicated token can't be matched by the Token::Identifier
+            // stop_words check, so it needs its own explicit check.
+            if stop_words.contains(&"elif") && matches!(self.curr, Token::Elif) {
+                self.advance()?;
+                return Ok((body, "elif".to_string()));
+            }
             if let Token::Identifier(ref t) = self.curr {
                 if stop_words.contains(&t.as_str()) {
                     let found = t.clone();
