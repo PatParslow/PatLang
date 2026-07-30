@@ -166,6 +166,106 @@ end
 # was originally a bool is NOT covered (the static check can't see
 # through a variable), matching this backend's existing "syntactic
 # heuristic, not full type inference" precedent elsewhere.
+# Real float formatter (not just a truncate-to-int proof, per this
+# file's own earlier header on float PRINTING being "deliberately not
+# built"). Deliberately APPROXIMATE, not a byte-exact shortest-round-
+# trip formatter like Rust's own f64 Display: fixed 6-digit fractional
+# precision via repeated *10/truncate digit extraction, trailing zeros
+# trimmed, decimal point omitted entirely for a whole number (matching
+# Rust's own "15" not "15.0" for an exact integer value). "Nice" binary
+# fractions (halves/quarters/eighths, e.g. 1.5, 3.75, -3.25) round
+# perfectly through this and match exactly; a value with no exact
+# binary representation (e.g. 0.1) may show trailing rounding noise
+# this simple loop doesn't correct for -- an honest, documented scope
+# limit, not a claim of full precision.
+#
+# Split into TWO functions deliberately, not one: this backend's
+# per-FUNCTION (not per-value) float/int-or-dynamic classification
+# means a single function can't do both real float arithmetic (needs
+# float_mode) AND string building (needs dynamic_mode for the string
+# literals/rt_str_concat calls) -- float_mode takes unconditional
+# priority in x64_emit_instr's Bin dispatch, so a string comparison
+# living in a float_mode function would be silently miscompiled as a
+# float comparison instead. rt_float_decompose does ONLY float math,
+# returning its results as a plain List of already-extracted integers
+# (BuildList's own codegen isn't float/dynamic-mode-conditioned at
+# all, so this is a safe bridge between the two); rt_format_float_parts
+# does ONLY string work on those already-int values. Also deliberately
+# avoids ANY bare (non-decimal) integer Const inside the float-mode
+# half -- even `let neg = 0` would get silently miscoded via this
+# backend's own float-mode Const-wrapping (see the GitHub #18 fix's
+# own header) since it's a fresh literal, not a Bin/Call result;
+# `neg` is instead derived directly from a comparison expression
+# (already safely integer-typed regardless of the surrounding
+# function's float_mode, since comparisons always produce a plain
+# setcc/movzx 0/1, never a float-encoded one).
+make a function called rt_float_decompose takes v returns parts
+  let neg = v < 0.0
+  let av = v
+  if neg then
+    let av = 0.0 - v
+  end
+  let ipart = f64_to_i64_trunc(av)
+  # Real bug found (and fixed via the new i64_to_f64 primitive above):
+  # f64_to_i64_trunc's result is a PLAIN INTEGER, not a float bit
+  # pattern -- subtracting it directly here (`av - ipart`) would
+  # reinterpret its raw integer bits as if they were a double via the
+  # float Bin path (this whole function is float_mode), giving
+  # complete garbage rather than the intended fractional remainder.
+  # Every digit-extraction step below has the identical shape, same
+  # fix needed each time.
+  let cur = av - i64_to_f64(ipart)
+  let cur = cur * 10.0
+  let d0 = f64_to_i64_trunc(cur)
+  let cur = cur - i64_to_f64(d0)
+  let cur = cur * 10.0
+  let d1 = f64_to_i64_trunc(cur)
+  let cur = cur - i64_to_f64(d1)
+  let cur = cur * 10.0
+  let d2 = f64_to_i64_trunc(cur)
+  let cur = cur - i64_to_f64(d2)
+  let cur = cur * 10.0
+  let d3 = f64_to_i64_trunc(cur)
+  let cur = cur - i64_to_f64(d3)
+  let cur = cur * 10.0
+  let d4 = f64_to_i64_trunc(cur)
+  let cur = cur - i64_to_f64(d4)
+  let cur = cur * 10.0
+  let d5 = f64_to_i64_trunc(cur)
+  return [neg, ipart, d0, d1, d2, d3, d4, d5]
+end
+
+make a function called rt_format_float_parts takes parts returns s
+  let neg = parts[0]
+  let ipart = parts[1]
+  let result = ""
+  if neg == 1 then
+    let result = "-"
+  end
+  let result = rt_str_concat(result, rt_int_to_str(ipart))
+  let digits = ""
+  let digits = rt_str_concat(digits, rt_int_to_str(parts[2]))
+  let digits = rt_str_concat(digits, rt_int_to_str(parts[3]))
+  let digits = rt_str_concat(digits, rt_int_to_str(parts[4]))
+  let digits = rt_str_concat(digits, rt_int_to_str(parts[5]))
+  let digits = rt_str_concat(digits, rt_int_to_str(parts[6]))
+  let digits = rt_str_concat(digits, rt_int_to_str(parts[7]))
+  let dl = digits.length
+  while (dl > 0) and (substr(digits, dl - 1, 1) == "0") do
+    let dl = dl - 1
+  end
+  if dl > 0 then
+    let result = rt_str_concat(result, ".")
+    let result = rt_str_concat(result, substr(digits, 0, dl))
+  end
+  return result
+end
+
+make a function called rt_print_float takes v returns done
+  let parts = rt_float_decompose(v)
+  return rt_print_str(rt_format_float_parts(parts))
+end
+
 make a function called rt_print_bool takes v returns done
   if v == 0 then
     return rt_print_str("false")

@@ -2222,6 +2222,26 @@ make a function called x64_callhost_asm takes name, argc returns asm
         sb_push(sb, "    cvttsd2si rax, xmm0" + x64_nl_char())
         sb_push(sb, "    push rax" + x64_nl_char())
       else
+      if name == "i64_to_f64" then
+        # The reverse of f64_to_i64_trunc, added while building
+        # rt_float_decompose (real float-printing support): a genuine
+        # bug was caught here directly by a segfault before this
+        # existed -- f64_to_i64_trunc's result is a PLAIN INTEGER, not
+        # a float bit pattern, so subtracting it directly from a real
+        # float (`av - ipart`) via the float Bin path reinterpreted the
+        # integer's raw bits AS IF they were a double (e.g. integer 1's
+        # bit pattern 0x0...01 read as a double is a vanishingly small
+        # denormalized number, not 1.0) -- silently wrong arithmetic,
+        # not a type error, exactly the kind of bug that's easy to miss
+        # without directly comparing against the interpreter's own
+        # output. cvtsi2sd is the same instruction the `%` float-mode
+        # path already uses inline (x64_binop_asm_float) but had no
+        # PatLang-callable name of its own until now.
+        sb_push(sb, "    pop rax" + x64_nl_char())
+        sb_push(sb, "    cvtsi2sd xmm0, rax" + x64_nl_char())
+        sb_push(sb, "    movq rax, xmm0" + x64_nl_char())
+        sb_push(sb, "    push rax" + x64_nl_char())
+      else
         if name == "os_write_console_bytes" then
           sb_push(sb, "    pop r13" + x64_nl_char())
           sb_push(sb, "    pop r14" + x64_nl_char())
@@ -2273,6 +2293,7 @@ make a function called x64_callhost_asm takes name, argc returns asm
       end
       end
     end
+  end
   end
   end
   end
@@ -2432,7 +2453,7 @@ make a function called label_asm_safe takes ignored returns label
   return "" + n
 end
 
-make a function called x64_emit_instr takes instr, func_name, regmap, spilled, label, float_mode, dynamic_mode, int_override, bool_print_override returns asm
+make a function called x64_emit_instr takes instr, func_name, regmap, spilled, label, float_mode, dynamic_mode, int_override, bool_print_override, float_print_override returns asm
   let sb = sb_new()
   sb_push(sb, label + ":" + x64_nl_char())
   let ty = instr[0]
@@ -2601,7 +2622,11 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
                   if bool_print_override then
                     sb_push(sb, "    call rt_print_bool" + x64_nl_char())
                   else
-                    sb_push(sb, "    call " + instr[1] + x64_nl_char())
+                    if float_print_override then
+                      sb_push(sb, "    call rt_print_float" + x64_nl_char())
+                    else
+                      sb_push(sb, "    call " + instr[1] + x64_nl_char())
+                    end
                   end
                   let argc = to_num(instr[2])
                   if argc > 0 then
@@ -2863,6 +2888,7 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
     let int_overrides = x64_call_arg_int_overrides(instrs, float_func_names)
   end
   let bool_print_overrides = x64_bool_print_call_indices(instrs)
+  let float_print_overrides = x64_float_print_call_indices(instrs, float_mode, int_overrides, bool_print_overrides)
   let i = 0
   while i < n do
     let instr = instrs[i]
@@ -2894,7 +2920,8 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
       let label = "L_" + func_name + "_" + i
       let is_override = x64_str_in_list(int_overrides, i)
       let is_bool_print = x64_str_in_list(bool_print_overrides, i)
-      sb_push(sb, x64_emit_instr(instr, func_name, regmap, spilled, label, float_mode, dynamic_mode, is_override, is_bool_print))
+      let is_float_print = x64_str_in_list(float_print_overrides, i)
+      sb_push(sb, x64_emit_instr(instr, func_name, regmap, spilled, label, float_mode, dynamic_mode, is_override, is_bool_print, is_float_print))
       let i = i + 1
     end
   end
@@ -3035,6 +3062,51 @@ make a function called x64_bool_print_call_indices takes instrs returns override
     let i = i + 1
   end
   return overrides
+end
+
+# Real float-printing fix: a print(v) call inside a float_mode function
+# whose argument wasn't already claimed by the bool-print override
+# (#24) or the int-Call-arg override (#18, meaning it's a deliberately
+# plain-int value despite the surrounding function's float_mode) or a
+# string literal is, by elimination, a genuine float value -- reroute
+# it to rt_print_float instead of the generic print(), which has no
+# way to distinguish a float's raw bit pattern from any other family
+# (see print()'s own header in x64_runtime.patlang: it's why floats
+# fell through to the "<value>" placeholder in the first place).
+make a function called x64_float_print_call_indices takes instrs, float_mode, int_overrides, bool_print_overrides returns overrides
+  let out = []
+  if not float_mode then
+    return out
+  end
+  let n = to_num(list_len(instrs))
+  let i = 0
+  while i < n do
+    let instr = instrs[i]
+    if instr[0] == "Call" then
+      if instr[1] == "print" then
+        if to_num(instr[2]) == 1 then
+          if i > 0 then
+            if not x64_str_in_list(bool_print_overrides, i) then
+              if not x64_str_in_list(int_overrides, i - 1) then
+                let prev = instrs[i - 1]
+                let is_str_const = false
+                if prev[0] == "Const" then
+                  if prev[1] == "str" then
+                    let is_str_const = true
+                  end
+                end
+                if not is_str_const then
+                  let out = list_push(out, i)
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+    let i = i + 1
+  end
+  return out
 end
 
 # ---- whole program -> nasm text ----
