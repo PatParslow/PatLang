@@ -2155,7 +2155,7 @@ make a function called label_asm_safe takes ignored returns label
   return "" + n
 end
 
-make a function called x64_emit_instr takes instr, func_name, regmap, spilled, label, float_mode, dynamic_mode returns asm
+make a function called x64_emit_instr takes instr, func_name, regmap, spilled, label, float_mode, dynamic_mode, int_override returns asm
   let sb = sb_new()
   sb_push(sb, label + ":" + x64_nl_char())
   let ty = instr[0]
@@ -2199,10 +2199,18 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
           # rather than pretending the coercion below makes this safe
           # in general; it only reliably helps the case where the bare
           # int stays within THIS function's own float arithmetic.
-          if not x64_contains(instr[2], ".") then
-            print("codegen_x64: warning -- integer literal '" + instr[2] + "' in a float-mode function; if it crosses a call boundary into a plain-int function/closure, the result is silently wrong (see x64_emit_instr's Const/float_mode comment)")
+          if int_override then
+            # GitHub #18's real fix: this specific Const is a bare int
+            # literal feeding a Call to a known non-float-mode callee --
+            # encode as plain int, not the float bit pattern, despite
+            # this function's own blanket float_mode classification.
+            sb_push(sb, "    mov rax, " + instr[2] + x64_nl_char())
+          else
+            if not x64_contains(instr[2], ".") then
+              print("codegen_x64: warning -- integer literal '" + instr[2] + "' in a float-mode function; if it crosses a call boundary into a plain-int function/closure, the result is silently wrong (see x64_emit_instr's Const/float_mode comment)")
+            end
+            sb_push(sb, "    mov rax, __float64__(" + x64_float_literal_text(instr[2]) + ")" + x64_nl_char())
           end
-          sb_push(sb, "    mov rax, __float64__(" + x64_float_literal_text(instr[2]) + ")" + x64_nl_char())
         else
           sb_push(sb, "    mov rax, " + instr[2] + x64_nl_char())
         end
@@ -2519,7 +2527,7 @@ make a function called x64_fused_const_binop_asm takes const_text, op returns as
   return sb_str(sb)
 end
 
-make a function called x64_emit_func takes func, float_mode, dynamic_mode returns asm
+make a function called x64_emit_func takes func, float_mode, dynamic_mode, float_func_names returns asm
   let func_name = func[1]
   let params = func[2]
   let instrs = func[3]
@@ -2569,6 +2577,10 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode return
   end
   let n = to_num(list_len(instrs))
   let jump_targets = x64_collect_jump_targets(instrs)
+  let int_overrides = []
+  if float_mode then
+    let int_overrides = x64_call_arg_int_overrides(instrs, float_func_names)
+  end
   let i = 0
   while i < n do
     let instr = instrs[i]
@@ -2598,11 +2610,103 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode return
       let i = i + 2
     else
       let label = "L_" + func_name + "_" + i
-      sb_push(sb, x64_emit_instr(instr, func_name, regmap, spilled, label, float_mode, dynamic_mode))
+      let is_override = x64_str_in_list(int_overrides, i)
+      sb_push(sb, x64_emit_instr(instr, func_name, regmap, spilled, label, float_mode, dynamic_mode, is_override))
       let i = i + 1
     end
   end
   return sb_str(sb)
+end
+
+# ---- narrow real fix for GitHub #18: a bare int Const pushed directly
+# as one of a Call's arguments (straight-line Const/Load pushes, no
+# intervening Bin/Un) to a NAMED, statically-known callee that is
+# itself NOT float-mode must be encoded as plain int, regardless of
+# the CALLER's own blanket float_mode -- the caller's classification is
+# a whole-FUNCTION decision (x64_func_is_float), but a Call's argument
+# types are dictated by the CALLEE, which is staticness-known here
+# (unlike a dynamically-dispatched closure CallValue, genuinely out of
+# scope -- see #18's own text). Deliberately narrow: only bare literal/
+# variable arguments in a straight run right before the Call are
+# covered; a computed expression argument (any Bin/Un in that run)
+# falls back to the existing warning-only behavior, since disentangling
+# "was this float arithmetic genuinely intended" from "did an untyped
+# literal just pass through" needs the full per-value tagging this
+# file's header already names as deliberately deferred.
+
+make a function called x64_str_in_list takes items, target returns yes
+  let n = to_num(list_len(items))
+  let i = 0
+  while i < n do
+    if items[i] == target then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called x64_collect_float_func_names takes funcs returns names
+  let out = []
+  let i = 0
+  let n = to_num(list_len(funcs))
+  while i < n do
+    if x64_func_is_float(funcs[i]) then
+      let out = list_push(out, funcs[i][1])
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# Returns the set (as a plain list) of instruction indices, within ONE
+# function's own `instrs`, that are bare-int Consts safe to encode as
+# plain int despite the function being float_mode -- because they sit
+# in a straight-line Const/Load run immediately preceding a Call to a
+# named, non-float-mode callee.
+make a function called x64_call_arg_int_overrides takes instrs, float_func_names returns overrides
+  let overrides = []
+  let n = to_num(list_len(instrs))
+  let i = 0
+  while i < n do
+    let instr = instrs[i]
+    if instr[0] == "Call" then
+      let argc = to_num(instr[2])
+      if argc > 0 then
+        let start = i - argc
+        if start >= 0 then
+          let straight_line = true
+          let j = start
+          while j < i do
+            let jty = instrs[j][0]
+            if (jty != "Const") and (jty != "Load") then
+              let straight_line = false
+            end
+            let j = j + 1
+          end
+          if straight_line then
+            let callee_is_float = x64_str_in_list(float_func_names, instr[1])
+            if not callee_is_float then
+              let j = start
+              while j < i do
+                let cur = instrs[j]
+                if cur[0] == "Const" then
+                  if cur[1] == "num" then
+                    if not x64_contains(cur[2], ".") then
+                      let overrides = list_push(overrides, j)
+                    end
+                  end
+                end
+                let j = j + 1
+              end
+            end
+          end
+        end
+      end
+    end
+    let i = i + 1
+  end
+  return overrides
 end
 
 # ---- whole program -> nasm text ----
@@ -2850,9 +2954,10 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
   sb_push(sb, x64_nl_char())
   x64_string_label_reset()
   let n = to_num(list_len(funcs))
+  let float_func_names = x64_collect_float_func_names(funcs)
   let i = 0
   while i < n do
-    sb_push(sb, x64_emit_func(funcs[i], x64_func_is_float(funcs[i]), x64_func_is_dynamic(funcs[i])))
+    sb_push(sb, x64_emit_func(funcs[i], x64_func_is_float(funcs[i]), x64_func_is_dynamic(funcs[i]), float_func_names))
     sb_push(sb, x64_nl_char())
     let i = i + 1
   end
