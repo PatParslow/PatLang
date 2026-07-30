@@ -302,6 +302,22 @@ make a function called x64_reg_pool returns names
   return ["rbx", "r13", "r14"]
 end
 
+# A handful of legal PatLang function names collide with reserved x86
+# instruction mnemonics that NASM refuses to accept as a label even with
+# a trailing colon (confirmed directly: `wait:` alone errors "instruction
+# expected, found `:'"). `wait` surfaced this when Stage A of the
+# interp.patlang-compilation roadmap (#25) added a `wait(pid)` function
+# matching the real host's process-lifecycle name. Every place a
+# PatLang function name becomes an asm label OR a `call`/`global`/
+# `extern` target must route through this so the mangled name is used
+# consistently everywhere that name appears.
+make a function called x64_asm_label_for_func takes name returns label
+  if name == "wait" then
+    return "pw_wait"
+  end
+  return name
+end
+
 make a function called x64_instr_is_call_boundary takes instr, dynamic_mode returns is_call
   let ty = instr[0]
   if ty == "Call" then
@@ -2115,6 +2131,159 @@ make a function called x64_os_exec_run_asm returns asm
   return sb_str(sb)
 end
 
+# spawn(path, arg1, ..., argN) -- Stage A of the interp.patlang roadmap
+# (#25). Same variadic-argument-collection-then-join pattern as
+# x64_exec_capture_asm above (this call SITE's argc is compile-time
+# known), handing the joined command-line string to the non-blocking
+# process-creation primitive below. Returns a genuine tagged 2-element
+# list [pid, handle] (NOT a string) -- handle is the real Win32 HANDLE,
+# opaque to PatLang code but needed later by is_alive/wait/kill to
+# recover it from just the pid the caller holds (see g_procs_table).
+make a function called x64_spawn_asm takes argc returns asm
+  let n = to_num(argc)
+  let sb = sb_new()
+  sb_push(sb, "    mov rax, " + (n * 8) + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    call rt_heap_alloc" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, "    mov r12, rax" + x64_nl_char())
+  let k = n - 1
+  while k >= 0 do
+    sb_push(sb, "    pop r10" + x64_nl_char())
+    sb_push(sb, "    mov [r12+" + (k * 8) + "], r10" + x64_nl_char())
+    let k = k - 1
+  end
+  sb_push(sb, "    push r12" + x64_nl_char())
+  sb_push(sb, "    push " + n + x64_nl_char())
+  sb_push(sb, "    call rt_exec_join_args" + x64_nl_char())
+  sb_push(sb, "    add rsp, 16" + x64_nl_char())
+  sb_push(sb, "    mov r13, rax" + x64_nl_char())
+  sb_push(sb, "    mov r15, 281474976710655" + x64_nl_char())
+  sb_push(sb, "    and r13, r15" + x64_nl_char())
+  sb_push(sb, "    mov rax, [r13]" + x64_nl_char())
+  sb_push(sb, "    lea r10, [r13+8]" + x64_nl_char())
+  sb_push(sb, "    push r10" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, x64_os_spawn_run_asm())
+  return sb_str(sb)
+end
+
+# The non-blocking process-creation primitive itself. Directly modeled
+# on x64_os_exec_run_asm above (SAME cmdline-preserve-across-heap-alloc
+# dance, SAME SECURITY_ATTRIBUTES/STARTUPINFOA field offsets, SAME
+# CreateProcessA stack-argument layout -- all already proven correct
+# there) but deliberately simpler in two ways: (1) stdout/stderr are
+# discarded via a CreateFileA("NUL") handle instead of a real pipe --
+# no read loop, no pipe-fill deadlock concern, since nobody ever reads
+# this output; (2) does NOT call WaitForSingleObject -- spawn is
+# non-blocking by design, that's what is_alive/wait exist for. Returns
+# [pid, handle] as a genuine tagged list so the caller can recover the
+# real HANDLE later purely from the pid it was given.
+make a function called x64_os_spawn_run_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "    pop r10" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    push r10" + x64_nl_char())
+  sb_push(sb, "    mov rax, r10" + x64_nl_char())
+  sb_push(sb, "    add rax, 1" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    call rt_heap_alloc" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, "    mov r14, rax" + x64_nl_char())
+  sb_push(sb, "    pop r10" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 336" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    xor rsi, rsi" + x64_nl_char())
+  sb_push(sb, "  .spawn_cpy_loop_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    cmp rsi, r10" + x64_nl_char())
+  sb_push(sb, "    jge .spawn_cpy_done_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov dl, [rax+rsi]" + x64_nl_char())
+  sb_push(sb, "    mov [r14+rsi], dl" + x64_nl_char())
+  sb_push(sb, "    inc rsi" + x64_nl_char())
+  sb_push(sb, "    jmp .spawn_cpy_loop_" + suffix + x64_nl_char())
+  sb_push(sb, "  .spawn_cpy_done_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov byte [r14+rsi], 0" + x64_nl_char())
+  # "NUL\0" written directly into g_scratch -- no existing mechanism to
+  # embed a literal ASCII filename constant in generated asm text, so
+  # the bytes are just poked in at runtime instead ('N'=78,'U'=85,'L'=76).
+  sb_push(sb, "    mov word [rel g_scratch], 21838" + x64_nl_char())
+  sb_push(sb, "    mov byte [rel g_scratch+2], 76" + x64_nl_char())
+  sb_push(sb, "    mov byte [rel g_scratch+3], 0" + x64_nl_char())
+  # SECURITY_ATTRIBUTES @80: nLength=24, lpSecurityDescriptor=0, bInheritHandle=1
+  sb_push(sb, "    mov qword [rsp+80], 24" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+88], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+96], 1" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [rel g_scratch]" + x64_nl_char())
+  sb_push(sb, "    mov rdx, 1073741824" + x64_nl_char())
+  sb_push(sb, "    mov r8, 3" + x64_nl_char())
+  sb_push(sb, "    lea r9, [rsp+80]" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+32], 3" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+40], 128" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+48], 0" + x64_nl_char())
+  sb_push(sb, "    call CreateFileA" + x64_nl_char())
+  sb_push(sb, "    mov [rsp+104], rax" + x64_nl_char())
+  # Zero the whole STARTUPINFOA (104 bytes = 13 qwords) before setting
+  # the specific fields we need.
+  sb_push(sb, "    mov rcx, 0" + x64_nl_char())
+  sb_push(sb, "  .spawn_zero_si_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    cmp rcx, 13" + x64_nl_char())
+  sb_push(sb, "    jge .spawn_zero_si_done_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+128+rcx*8], 0" + x64_nl_char())
+  sb_push(sb, "    inc rcx" + x64_nl_char())
+  sb_push(sb, "    jmp .spawn_zero_si_" + suffix + x64_nl_char())
+  sb_push(sb, "  .spawn_zero_si_done_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+128], 104" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+188], 256" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rsp+104]" + x64_nl_char())
+  sb_push(sb, "    mov [rsp+216], rax" + x64_nl_char())
+  sb_push(sb, "    mov [rsp+224], rax" + x64_nl_char())
+  sb_push(sb, "    mov rcx, 0" + x64_nl_char())
+  sb_push(sb, "    lea rdx, [r14]" + x64_nl_char())
+  sb_push(sb, "    xor r8, r8" + x64_nl_char())
+  sb_push(sb, "    xor r9, r9" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+32], 1" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+40], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+48], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+56], 0" + x64_nl_char())
+  sb_push(sb, "    lea rax, [rsp+128]" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+64], rax" + x64_nl_char())
+  sb_push(sb, "    lea rax, [rsp+240]" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+72], rax" + x64_nl_char())
+  sb_push(sb, "    call CreateProcessA" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+  sb_push(sb, "    je .spawn_failed_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rsp+248]" + x64_nl_char())
+  sb_push(sb, "    call CloseHandle" + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rsp+104]" + x64_nl_char())
+  sb_push(sb, "    call CloseHandle" + x64_nl_char())
+  sb_push(sb, "    mov r12, [rsp+240]" + x64_nl_char())
+  sb_push(sb, "    mov eax, [rsp+256]" + x64_nl_char())
+  sb_push(sb, "    mov r13, rax" + x64_nl_char())
+  sb_push(sb, "    jmp .spawn_all_done_" + suffix + x64_nl_char())
+  sb_push(sb, "  .spawn_failed_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rsp+104]" + x64_nl_char())
+  sb_push(sb, "    call CloseHandle" + x64_nl_char())
+  sb_push(sb, "    mov r12, 0" + x64_nl_char())
+  sb_push(sb, "    mov r13, 0" + x64_nl_char())
+  sb_push(sb, "  .spawn_all_done_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    add rsp, 16" + x64_nl_char())
+  # Record [pid, handle] in g_procs_table (so is_alive/wait/kill can
+  # recover the real HANDLE later from just the pid) via the ordinary
+  # PatLang helper procs_table_add, then return just the pid -- matching
+  # the real host's spawn() semantics (Int PID, not a pair).
+  sb_push(sb, "    push r13" + x64_nl_char())
+  sb_push(sb, "    push r12" + x64_nl_char())
+  sb_push(sb, "    call procs_table_add" + x64_nl_char())
+  sb_push(sb, "    add rsp, 16" + x64_nl_char())
+  sb_push(sb, "    push r13" + x64_nl_char())
+  return sb_str(sb)
+end
+
 # CallHost -- only the five special primitive names are legal here,
 # PLUS two safe aliases (Slice 4): `l[i]` index syntax always lowers to
 # CallHost("list_get", 2) regardless of backend (lib/lower.patlang's
@@ -2285,6 +2454,58 @@ make a function called x64_callhost_asm takes name, argc returns asm
   else
   if name == "exec_capture" then
     sb_push(sb, x64_exec_capture_asm(argc))
+  elif name == "spawn" then
+    # Stage A of the interp.patlang-compilation roadmap (#25, past
+    # #26/#27): spawn(path, arg1, arg2, ...) -> Int PID, non-blocking.
+    # Deliberately a CallHost primitive (like exec_capture, not an
+    # ordinary PatLang function) since real callers (interp.patlang's
+    # own dispatch) invoke it with a VARYING argument count (1-4) --
+    # PatLang has no variadic function definitions, so an ordinary
+    # fixed-arity function couldn't serve every call site.
+    sb_push(sb, x64_spawn_asm(argc))
+  elif name == "os_get_exit_code_process" then
+    # Thin wrapper: GetExitCodeProcess(handle) -> exit code Int, or the
+    # STILL_ACTIVE (259) sentinel if the process hasn't finished. Used
+    # by is_alive/wait (both ordinary PatLang functions in x64_runtime.
+    # patlang) rather than exposing raw GetExitCodeProcess plumbing there.
+    sb_push(sb, "    pop rcx" + x64_nl_char())
+    sb_push(sb, "    sub rsp, 40" + x64_nl_char())
+    sb_push(sb, "    lea rdx, [rsp+32]" + x64_nl_char())
+    sb_push(sb, "    call GetExitCodeProcess" + x64_nl_char())
+    sb_push(sb, "    mov eax, [rsp+32]" + x64_nl_char())
+    sb_push(sb, "    add rsp, 40" + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
+  elif name == "os_terminate_process" then
+    # TerminateProcess(handle) -- best-effort, failure (already-exited)
+    # is not surfaced as an error, matching the real host's `let _ =
+    # child.kill()` semantics (rust-runtime/src/ir/hosts.rs).
+    sb_push(sb, "    pop rcx" + x64_nl_char())
+    sb_push(sb, "    mov rdx, 1" + x64_nl_char())
+    sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+    sb_push(sb, "    call TerminateProcess" + x64_nl_char())
+    sb_push(sb, "    add rsp, 32" + x64_nl_char())
+    sb_push(sb, "    push 0" + x64_nl_char())
+  elif name == "os_wait_for_single_object" then
+    # WaitForSingleObject(handle, INFINITE) -- blocking wait used by
+    # wait()'s reap-to-completion semantics.
+    sb_push(sb, "    pop rcx" + x64_nl_char())
+    sb_push(sb, "    mov rdx, -1" + x64_nl_char())
+    sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+    sb_push(sb, "    call WaitForSingleObject" + x64_nl_char())
+    sb_push(sb, "    add rsp, 32" + x64_nl_char())
+    sb_push(sb, "    push 0" + x64_nl_char())
+  elif name == "os_close_handle" then
+    sb_push(sb, "    pop rcx" + x64_nl_char())
+    sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+    sb_push(sb, "    call CloseHandle" + x64_nl_char())
+    sb_push(sb, "    add rsp, 32" + x64_nl_char())
+    sb_push(sb, "    push 0" + x64_nl_char())
+  elif name == "os_sleep_ms" then
+    sb_push(sb, "    pop rcx" + x64_nl_char())
+    sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+    sb_push(sb, "    call Sleep" + x64_nl_char())
+    sb_push(sb, "    add rsp, 32" + x64_nl_char())
+    sb_push(sb, "    push 0" + x64_nl_char())
   else
   if name == "list_len" then
     sb_push(sb, "    call rt_list_len" + x64_nl_char())
@@ -2846,7 +3067,7 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
                     if float_print_override then
                       sb_push(sb, "    call rt_print_float" + x64_nl_char())
                     else
-                      sb_push(sb, "    call " + instr[1] + x64_nl_char())
+                      sb_push(sb, "    call " + x64_asm_label_for_func(instr[1]) + x64_nl_char())
                     end
                   end
                   let argc = to_num(instr[2])
@@ -3084,7 +3305,7 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
     let frame_size = 16
   end
   let sb = sb_new()
-  sb_push(sb, func_name + ":" + x64_nl_char())
+  sb_push(sb, x64_asm_label_for_func(func_name) + ":" + x64_nl_char())
   sb_push(sb, "    push rbp" + x64_nl_char())
   sb_push(sb, "    mov rbp, rsp" + x64_nl_char())
   sb_push(sb, "    sub rsp, " + frame_size + x64_nl_char())
@@ -3551,12 +3772,12 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
       if gi > 0 then
         sb_push(gl_line, ", ")
       end
-      sb_push(gl_line, funcs[gi][1])
+      sb_push(gl_line, x64_asm_label_for_func(funcs[gi][1]))
       let gi = gi + 1
     end
     sb_push(sb, sb_str(gl_line) + x64_nl_char())
   end
-  sb_push(sb, "extern GetStdHandle, WriteFile, ExitProcess, CreateFileA, GetFileSize, CloseHandle, ReadFile, CreateProcessA, CreatePipe, SetHandleInformation, WaitForSingleObject, GetCommandLineA" + x64_nl_char())
+  sb_push(sb, "extern GetStdHandle, WriteFile, ExitProcess, CreateFileA, GetFileSize, CloseHandle, ReadFile, CreateProcessA, CreatePipe, SetHandleInformation, WaitForSingleObject, GetCommandLineA, GetExitCodeProcess, TerminateProcess, WSAStartup, WSAGetLastError, socket, bind, listen, accept, connect, send, recv, closesocket, shutdown, getaddrinfo, freeaddrinfo, ioctlsocket, htons, Sleep" + x64_nl_char())
   let en_count = to_num(list_len(extern_names))
   if en_count > 0 then
     let en_line = sb_new()
@@ -3566,7 +3787,7 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
       if ei > 0 then
         sb_push(en_line, ", ")
       end
-      sb_push(en_line, extern_names[ei])
+      sb_push(en_line, x64_asm_label_for_func(extern_names[ei]))
       let ei = ei + 1
     end
     sb_push(sb, sb_str(en_line) + x64_nl_char())
