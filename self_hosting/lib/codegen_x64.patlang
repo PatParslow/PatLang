@@ -318,7 +318,303 @@ make a function called x64_asm_label_for_func takes name returns label
   return name
 end
 
-make a function called x64_instr_is_call_boundary takes instr, dynamic_mode returns is_call
+# ---- GitHub #29: per-instruction (not per-function) dynamic-mode
+# classification ----
+#
+# x64_func_is_dynamic (below) flags an entire FUNCTION as dynamic the
+# moment it contains a string literal or a tower-constructor call
+# ANYWHERE in its body -- which then routed EVERY "Bin" instruction in
+# that whole function through the slow tag-checking dynamic dispatch
+# path (x64_binop_asm_dynamic), including totally unrelated plain-int
+# ops (a loop counter's `i = i + 1` sitting next to one small string
+# build). Measured directly via self_hosting/run_benchmarks.patlang:
+# bench_string_ops and bench_bigint_arith both ran SLOWER on --x64 than
+# the plain interpreter because of this, while bench_list_ops (no
+# string/tower content anywhere) got an 80x win from the exact same
+# native backend. Filed as GitHub #29.
+#
+# x64_analyze_dynamic_bins below computes, once per function, the
+# actual SET of "Bin" instruction indices whose operand(s) could
+# plausibly be a non-fixnum (String/BigInt/Rational/Complex/Interval/
+# Object) at runtime -- only THOSE need the dynamic dispatch path.
+# Every other "Bin" in the same function gets the plain native op it
+# would if the function had no string/tower content at all.
+#
+# This is a stack-simulated TAINT analysis, not full type inference --
+# consistent with this file's own existing scope limit (x64_func_is_
+# dynamic's own comment already accepts an analogous blind spot: a
+# function that only receives strings via parameters, with no literal
+# or constructor of its own, isn't detected either way -- not solved
+# here either). Since the IR is a flat stack machine, a virtual "taint
+# stack" mirrors the real value stack through one linear pass:
+#   Const "str"            -> push tainted; any other Const -> push clean
+#   Load name               -> push locals_taint[name] (default clean)
+#   Store name               -> pop, set locals_taint[name] to it
+#   Bin op                   -> pop a, b; if EITHER tainted, record this
+#                               instruction's own index; push (a or b)
+#   Un op                    -> pass the one operand's taint straight
+#                               through (never dynamic-dispatched today,
+#                               not touched by this analysis)
+#   Call/CallValue/CallHost/
+#   BuildList/MakeClosure    -> pop N argument taints, push TAINTED
+#                               unconditionally (conservative: unknown
+#                               return type -- same blind spot x64_func_
+#                               is_dynamic already has for arbitrary
+#                               calls today, no regression, and doesn't
+#                               affect either measured benchmark's real
+#                               bottleneck: a plain loop counter that
+#                               never touches a call result)
+#   Return                    -> pop 1 (no push, function exits)
+#   Jump                      -> no stack effect
+#   JumpIfFalse                -> pop 1 (no push)
+#   anything else (shouldn't happen -- this is the exact same
+#   instruction set x64_emit_instr itself supports, see its own
+#   "unsupported IR instruction" fallback) -> bail out; caller falls
+#   back to marking the WHOLE function dynamic (today's exact
+#   behavior), never trusting an incomplete analysis.
+#
+# LOOP FIXED POINT: a local reassigned inside a loop body can affect a
+# taint read at the TOP of that same loop on the next iteration -- the
+# exact same backward-jump subtlety already documented and fixed once
+# for the register allocator's own liveness scan (see the "REAL BUG
+# FOUND AND FIXED HERE" comment above x64_extend_across_loops). Taint
+# only ever grows (monotonic: once tainted, always tainted), so
+# re-running the whole linear pass against the accumulating locals-
+# taint map is guaranteed to converge within at most (distinct local
+# count) + 1 passes; capped at a generous fixed bound as a named safety
+# valve -- if that's somehow hit without converging, fall back to
+# marking the whole function dynamic rather than trust a non-converged
+# result. Correctness over optimality, same philosophy as everywhere
+# else in this file.
+
+make a function called x64_taint_get takes map, name returns tainted
+  let n = to_num(list_len(map))
+  let i = 0
+  while i < n do
+    if map[i][0] == name then
+      return map[i][1]
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called x64_taint_set takes map, name, tainted returns out
+  let n = to_num(list_len(map))
+  let out = []
+  let found = false
+  let i = 0
+  while i < n do
+    if map[i][0] == name then
+      let out = list_push(out, [name, tainted])
+      let found = true
+    else
+      let out = list_push(out, map[i])
+    end
+    let i = i + 1
+  end
+  if not found then
+    let out = list_push(out, [name, tainted])
+  end
+  return out
+end
+
+make a function called x64_taint_maps_equal takes m1, m2 returns yes
+  let n = to_num(list_len(m2))
+  let i = 0
+  while i < n do
+    let name = m2[i][0]
+    if x64_taint_get(m1, name) != m2[i][1] then
+      return false
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+make a function called x64_all_bin_indices takes instrs returns indices
+  let out = []
+  let n = to_num(list_len(instrs))
+  let i = 0
+  while i < n do
+    if instrs[i][0] == "Bin" then
+      let out = list_push(out, i)
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# Virtual-stack push/pop over a plain PatLang list: reuses storage via
+# list_set once the backing list is already long enough (from an
+# earlier push at this same depth in an earlier iteration/pop-then-
+# push cycle) instead of only ever growing -- otherwise a pop followed
+# by a later push at the same depth would read stale data one slot
+# further down. Returns [new_stack, new_sp] / [value, new_sp].
+make a function called x64_vstack_push takes stack, sp, val returns pair
+  if sp < to_num(list_len(stack)) then
+    let stack = list_set(stack, sp, val)
+  else
+    let stack = list_push(stack, val)
+  end
+  return [stack, sp + 1]
+end
+
+make a function called x64_vstack_pop takes stack, sp returns pair
+  return [stack[sp - 1], sp - 1]
+end
+
+# One linear taint-simulation pass over a whole function's flat instrs,
+# given the current (possibly still-converging) locals taint map.
+# Returns [new_map, dyn_bin_indices, bailed].
+make a function called x64_taint_one_pass takes instrs, locals_taint returns result
+  let n = to_num(list_len(instrs))
+  let stack = []
+  let sp = 0
+  let map = locals_taint
+  let dyn_bin_indices = []
+  let bailed = false
+  let i = 0
+  while (i < n) and (not bailed) do
+    let instr = instrs[i]
+    let ty = instr[0]
+    if ty == "Const" then
+      let tainted = instr[1] == "str"
+      let pr = x64_vstack_push(stack, sp, tainted)
+      let stack = pr[0]
+      let sp = pr[1]
+    elif ty == "Load" then
+      let pr = x64_vstack_push(stack, sp, x64_taint_get(map, instr[1]))
+      let stack = pr[0]
+      let sp = pr[1]
+    elif ty == "Store" then
+      let pr = x64_vstack_pop(stack, sp)
+      let sp = pr[1]
+      # Monotonic OR, not overwrite: a clean re-store must NOT erase
+      # taint a loop-carried store elsewhere already proved possible for
+      # this name (fixed-point convergence relies on this -- see the
+      # loop-carried-taint case in x64_dynamic_bin_analysis_selftest.
+      # patlang, GitHub #29). Safe over-approximation, same "taint only
+      # grows" philosophy stated in this analysis's own header comment.
+      let map = x64_taint_set(map, instr[1], x64_taint_get(map, instr[1]) or pr[0])
+    elif ty == "Bin" then
+      let pr1 = x64_vstack_pop(stack, sp)
+      let sp = pr1[1]
+      let pr2 = x64_vstack_pop(stack, sp)
+      let sp = pr2[1]
+      let result_taint = pr1[0] or pr2[0]
+      if result_taint then
+        let dyn_bin_indices = list_push(dyn_bin_indices, i)
+      end
+      let pr3 = x64_vstack_push(stack, sp, result_taint)
+      let stack = pr3[0]
+      let sp = pr3[1]
+    elif ty == "Un" then
+      let pr = x64_vstack_pop(stack, sp)
+      let sp = pr[1]
+      let pr2 = x64_vstack_push(stack, sp, pr[0])
+      let stack = pr2[0]
+      let sp = pr2[1]
+    elif ty == "Jump" then
+      let sp = sp
+    elif ty == "JumpIfFalse" then
+      let pr = x64_vstack_pop(stack, sp)
+      let sp = pr[1]
+    elif ty == "Return" then
+      let pr = x64_vstack_pop(stack, sp)
+      let sp = pr[1]
+    elif ty == "CallHost" then
+      let argc = to_num(instr[2])
+      let k = 0
+      while k < argc do
+        let pr = x64_vstack_pop(stack, sp)
+        let sp = pr[1]
+        let k = k + 1
+      end
+      let pr2 = x64_vstack_push(stack, sp, true)
+      let stack = pr2[0]
+      let sp = pr2[1]
+    elif ty == "Call" then
+      let argc = to_num(instr[2])
+      let k = 0
+      while k < argc do
+        let pr = x64_vstack_pop(stack, sp)
+        let sp = pr[1]
+        let k = k + 1
+      end
+      let pr2 = x64_vstack_push(stack, sp, true)
+      let stack = pr2[0]
+      let sp = pr2[1]
+    elif ty == "BuildList" then
+      let argc = to_num(instr[1])
+      let k = 0
+      while k < argc do
+        let pr = x64_vstack_pop(stack, sp)
+        let sp = pr[1]
+        let k = k + 1
+      end
+      let pr2 = x64_vstack_push(stack, sp, true)
+      let stack = pr2[0]
+      let sp = pr2[1]
+    elif ty == "MakeClosure" then
+      let argc = to_num(list_len(instr[2]))
+      let k = 0
+      while k < argc do
+        let pr = x64_vstack_pop(stack, sp)
+        let sp = pr[1]
+        let k = k + 1
+      end
+      let pr2 = x64_vstack_push(stack, sp, true)
+      let stack = pr2[0]
+      let sp = pr2[1]
+    elif ty == "CallValue" then
+      let argc = to_num(instr[1]) + 1
+      let k = 0
+      while k < argc do
+        let pr = x64_vstack_pop(stack, sp)
+        let sp = pr[1]
+        let k = k + 1
+      end
+      let pr2 = x64_vstack_push(stack, sp, true)
+      let stack = pr2[0]
+      let sp = pr2[1]
+    else
+      let bailed = true
+    end
+    let i = i + 1
+  end
+  return [map, dyn_bin_indices, bailed]
+end
+
+make a function called x64_analyze_dynamic_bins takes instrs returns dyn_bin_indices
+  let n = to_num(list_len(instrs))
+  let max_passes = n + 10
+  let map = []
+  let dyn_bin_indices = []
+  let pass = 0
+  let bailed = false
+  let stable = false
+  while (pass < max_passes) and (not stable) and (not bailed) do
+    let result = x64_taint_one_pass(instrs, map)
+    let new_map = result[0]
+    let dyn_bin_indices = result[1]
+    let bailed = result[2]
+    if x64_taint_maps_equal(map, new_map) then
+      let stable = true
+    end
+    let map = new_map
+    let pass = pass + 1
+  end
+  if bailed then
+    return x64_all_bin_indices(instrs)
+  end
+  if not stable then
+    return x64_all_bin_indices(instrs)
+  end
+  return dyn_bin_indices
+end
+
+make a function called x64_instr_is_call_boundary takes instr, idx, dyn_bin_indices returns is_call
   let ty = instr[0]
   if ty == "Call" then
     return true
@@ -336,7 +632,7 @@ make a function called x64_instr_is_call_boundary takes instr, dynamic_mode retu
     return true
   end
   if ty == "Bin" then
-    if dynamic_mode then
+    if x64_is_jump_target(dyn_bin_indices, idx) then
       return true
     end
     # REAL BUG FOUND AND FIXED HERE (2026-07-20, same session as the
@@ -357,7 +653,10 @@ make a function called x64_instr_is_call_boundary takes instr, dynamic_mode retu
     # doing real string concatenation -- rt_exec_join_args (called by
     # exec_capture) builds its joined command line with `+` on
     # strings, and a caller-side local was register-allocated across
-    # that call without this fix.
+    # that call without this fix. (GitHub #29: this carve-out stays
+    # regardless of dyn_bin_indices, since it's about a call embedded
+    # in the NON-dynamic string-aware codegen path itself, not about
+    # whether the op was classified dynamic.)
     let op = instr[1]
     if op == "+" then
       return true
@@ -430,7 +729,7 @@ make a function called x64_extend_across_loops takes instrs, last returns effect
   return effective
 end
 
-make a function called x64_local_register_eligible takes instrs, name, dynamic_mode returns ok
+make a function called x64_local_register_eligible takes instrs, name, dyn_bin_indices returns ok
   let n = to_num(list_len(instrs))
   let last = 0 - 1
   let i = 0
@@ -455,7 +754,7 @@ make a function called x64_local_register_eligible takes instrs, name, dynamic_m
   let last = x64_extend_across_loops(instrs, last)
   let i = 0
   while i <= last do
-    if x64_instr_is_call_boundary(instrs[i], dynamic_mode) then
+    if x64_instr_is_call_boundary(instrs[i], i, dyn_bin_indices) then
       return false
     end
     let i = i + 1
@@ -466,7 +765,7 @@ end
 # Register-assigned locals, in `locals`' own order, capped at the pool
 # size -- parallel to x64_reg_pool()'s own order (regmap[0] gets rbx,
 # regmap[1] gets r13, regmap[2] gets r14).
-make a function called x64_build_regmap takes locals, instrs, dynamic_mode returns names
+make a function called x64_build_regmap takes locals, instrs, dyn_bin_indices returns names
   let pool = x64_reg_pool()
   let cap = to_num(list_len(pool))
   let n = to_num(list_len(locals))
@@ -475,7 +774,7 @@ make a function called x64_build_regmap takes locals, instrs, dynamic_mode retur
   while i < n do
     if to_num(list_len(out)) < cap then
       let name = locals[i]
-      if x64_local_register_eligible(instrs, name, dynamic_mode) then
+      if x64_local_register_eligible(instrs, name, dyn_bin_indices) then
         let out = list_push(out, name)
       end
     end
@@ -2925,20 +3224,27 @@ make a function called x64_family_code_asm returns asm
 end
 
 # CallHost -- only the five special primitive names are legal here,
-# PLUS two safe aliases (Slice 4): `l[i]` index syntax always lowers to
+# PLUS several safe aliases: `l[i]` index syntax always lowers to
 # CallHost("list_get", 2) regardless of backend (lib/lower.patlang's
 # own doing, not special-cased here), and `list_len(l)` is ordinary
 # unrecognized-call-becomes-CallHost the same as any host function
 # name. Both are pure reads with unambiguous semantics (a read is a
 # read regardless of the mutation model), so they're aliased straight
 # to `call rt_list_get`/`call rt_list_len` -- reusing the SAME PatLang
-# implementation, not a separate native primitive. Deliberately NOT
-# aliasing `list_set`/`list_push`: the interpreter's own list_set is
-# copy-on-write/functional, but this backend's rt_list_set (see lib/
-# x64_runtime.patlang) is in-place mutation -- aliasing the ambiguous
-# name would silently change PatLang's own observable semantics, so
-# list construction/mutation stays under its own explicit rt_list_*
-# names instead.
+# implementation, not a separate native primitive. `list_push` stays
+# under its own explicit `rt_list_*` name (in-place-when-possible
+# growable-list semantics, deliberately distinct from the interpreter's
+# copy-on-write list_push -- see rt_list_push's own header). `list_set`
+# WAS deliberately unaliased for the same reason (this backend's
+# rt_list_set is in-place mutation, not copy-on-write) -- until GitHub
+# #29's x64_analyze_dynamic_bins needed a genuine copy-on-write
+# list_set for its own virtual-stack simulation, the first real caller
+# of PLAIN list_set anywhere in this codebase. Aliased to a NEW,
+# separate function (`rt_list_set_functional`, see x64_runtime.patlang)
+# that actually implements the copy-on-write contract, rather than
+# reusing the mutating `rt_list_set` under the ambiguous name -- keeps
+# PatLang's own observable list_set semantics intact for any other
+# caller.
 # .length property-access syntax lowers straight to CallHost("len", 1)
 # in the LOWERER itself, bypassing ordinary name resolution entirely --
 # unlike sb_push/to_num/chr/substr/str_intern/sc_len (all shadowable by
@@ -3051,6 +3357,10 @@ make a function called x64_callhost_asm takes name, argc returns asm
   if name == "list_get" then
     sb_push(sb, "    call rt_list_get" + x64_nl_char())
     sb_push(sb, "    add rsp, 16" + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
+  elif name == "list_set" then
+    sb_push(sb, "    call rt_list_set_functional" + x64_nl_char())
+    sb_push(sb, "    add rsp, 24" + x64_nl_char())
     sb_push(sb, "    push rax" + x64_nl_char())
   elif name == "contract_check" then
     # Same class of gap as rule_add just below: `require`/`ensure`
@@ -3695,7 +4005,7 @@ make a function called label_asm_safe takes ignored returns label
   return "" + n
 end
 
-make a function called x64_emit_instr takes instr, func_name, regmap, spilled, label, float_mode, dynamic_mode, int_override, bool_print_override, float_print_override returns asm
+make a function called x64_emit_instr takes instr, func_name, regmap, spilled, label, float_mode, is_dynamic_bin, int_override, bool_print_override, float_print_override returns asm
   let sb = sb_new()
   sb_push(sb, label + ":" + x64_nl_char())
   let ty = instr[0]
@@ -3782,7 +4092,7 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
           if float_mode then
             sb_push(sb, x64_binop_asm_float(instr[1]))
           else
-            if dynamic_mode then
+            if is_dynamic_bin then
               if instr[1] == "/" then
                 sb_push(sb, x64_binop_asm_div_dynamic(spilled))
               else
@@ -4119,11 +4429,21 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
   let params = func[2]
   let instrs = func[3]
   let locals = x64_collect_locals(func)
+  # GitHub #29: per-instruction, not whole-function, dynamic dispatch --
+  # see x64_analyze_dynamic_bins's own header comment. A function with
+  # zero string/tower content anywhere (dynamic_mode false) skips the
+  # analysis entirely and gets dyn_bin_indices=[] for free, matching
+  # today's fast path for the common all-int case at no extra compile
+  # cost.
+  let dyn_bin_indices = []
+  if dynamic_mode then
+    let dyn_bin_indices = x64_analyze_dynamic_bins(instrs)
+  end
   # Register allocation (Slice 8, see x64_reg_pool/x64_build_regmap):
   # eligible locals get a dedicated rbx/r13/r14 for their whole function
   # lifetime instead of a stack slot; everything else spills exactly as
   # before this slice.
-  let regmap = x64_build_regmap(locals, instrs, dynamic_mode)
+  let regmap = x64_build_regmap(locals, instrs, dyn_bin_indices)
   let spilled = x64_spilled_locals(locals, regmap)
   # +1 extra slot beyond the (spilled) named locals, ALWAYS reserved,
   # for CallValue's own per-frame scratch (see x64_callvalue_asm) -- a
@@ -4175,7 +4495,12 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
     let instr = instrs[i]
     let fused = false
     if not float_mode then
-      if not dynamic_mode then
+      # GitHub #29: the compact fused form assumes a plain native op --
+      # only safe for a Bin at i+1 that this function's OWN per-
+      # instruction analysis says is NOT dynamic (not "not dynamic_mode"
+      # whole-function anymore, so a mixed function can still fuse its
+      # provably-plain Bin ops).
+      if not x64_str_in_list(dyn_bin_indices, i + 1) then
       if i + 1 < n then
         let next = instrs[i + 1]
         if instr[0] == "Const" then
@@ -4202,7 +4527,8 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
       let is_override = x64_str_in_list(int_overrides, i)
       let is_bool_print = x64_str_in_list(bool_print_overrides, i)
       let is_float_print = x64_str_in_list(float_print_overrides, i)
-      sb_push(sb, x64_emit_instr(instr, func_name, regmap, spilled, label, float_mode, dynamic_mode, is_override, is_bool_print, is_float_print))
+      let is_dynamic_bin = x64_str_in_list(dyn_bin_indices, i)
+      sb_push(sb, x64_emit_instr(instr, func_name, regmap, spilled, label, float_mode, is_dynamic_bin, is_override, is_bool_print, is_float_print))
       let i = i + 1
     end
   end

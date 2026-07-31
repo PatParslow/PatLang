@@ -1,0 +1,166 @@
+# RED test for GitHub #29 (self_hosting/lib/codegen_x64.patlang's new
+# x64_analyze_dynamic_bins): hand-worked synthetic IR instruction lists
+# with by-hand-computed expected dyn_bin_indices, run through the plain
+# interpreter -- confirms the taint analysis itself is correct BEFORE it
+# touches any real codegen wiring (Slice 1 of the plan, see GitHub #29).
+
+include "lib/codegen_x64.patlang"
+
+make a function called check takes label, expected, actual returns done
+  if expected == actual then
+    print("PASS: " + label)
+  else
+    print("FAIL: " + label + " expected=" + expected + " actual=" + actual)
+  end
+  return 0
+end
+
+# Case 1: plain int loop, no strings/towers anywhere -- e.g.
+#   let i = 0
+#   while i < 5 do
+#     let i = i + 1
+#   end
+# Flattened IR (indices):
+#  0 Const num 0
+#  1 Store i
+#  2 (loop top, target of Jump at 6) Load i
+#  3 Const num 5
+#  4 Bin <
+#  5 JumpIfFalse 7
+#  6 Load i
+#  7 Const num 1
+#  8 Bin +
+#  9 Store i
+# 10 Jump 2
+# 11 (after loop)
+# Expect: NO Bin index tainted (empty dyn_bin_indices).
+let case1 = [
+  ["Const", "num", "0"],
+  ["Store", "i"],
+  ["Load", "i"],
+  ["Const", "num", "5"],
+  ["Bin", "<"],
+  ["JumpIfFalse", "11"],
+  ["Load", "i"],
+  ["Const", "num", "1"],
+  ["Bin", "+"],
+  ["Store", "i"],
+  ["Jump", "2"]
+]
+let r1 = x64_analyze_dynamic_bins(case1)
+check("case1: plain int loop has zero dynamic Bin", "0", "" + to_num(list_len(r1)))
+
+# Case 2: bench_string_ops' actual shape -- one string literal used
+# once, PLUS an entirely unrelated int loop counter in the same
+# function:
+#  0 Const str "x"
+#  1 Store s          (s is tainted)
+#  2 Const num 0
+#  3 Store i          (i is NOT tainted)
+#  4 (loop top) Load i
+#  5 Const num 5
+#  6 Bin <            <- should NOT be dynamic (both operands clean)
+#  7 JumpIfFalse 13
+#  8 Load i
+#  9 Const num 1
+# 10 Bin +            <- should NOT be dynamic (both operands clean)
+# 11 Store i
+# 12 Jump 4
+# Expect: dyn_bin_indices == [] (the string never reaches a Bin here
+# at all -- this isolates "does an unrelated string literal elsewhere
+# in the function wrongly taint the loop's own arithmetic", which is
+# exactly the GitHub #29 bug).
+let case2 = [
+  ["Const", "str", "x"],
+  ["Store", "s"],
+  ["Const", "num", "0"],
+  ["Store", "i"],
+  ["Load", "i"],
+  ["Const", "num", "5"],
+  ["Bin", "<"],
+  ["JumpIfFalse", "13"],
+  ["Load", "i"],
+  ["Const", "num", "1"],
+  ["Bin", "+"],
+  ["Store", "i"],
+  ["Jump", "4"]
+]
+let r2 = x64_analyze_dynamic_bins(case2)
+check("case2: string literal doesn't taint unrelated loop counter", "0", "" + to_num(list_len(r2)))
+
+# Case 3: a Bin that DOES touch the tainted string -- `s + s`:
+#  0 Const str "x"
+#  1 Store s
+#  2 Load s
+#  3 Load s
+#  4 Bin +            <- SHOULD be dynamic (index 4)
+let case3 = [
+  ["Const", "str", "x"],
+  ["Store", "s"],
+  ["Load", "s"],
+  ["Load", "s"],
+  ["Bin", "+"]
+]
+let r3 = x64_analyze_dynamic_bins(case3)
+check("case3: Bin directly on a tainted local IS flagged", "[4]", "" + r3)
+
+# Case 4: fixed-point convergence -- a local reassigned to a tainted
+# value INSIDE a loop body must taint a Bin at the TOP of that same
+# loop on the (conceptual) next iteration, exactly the same
+# backward-jump subtlety already fixed once for the register
+# allocator's own liveness scan.
+#  0 Const num 0
+#  1 Store x           (x starts clean)
+#  2 (loop top) Load x
+#  3 Const num 0
+#  4 Bin ==            <- x is tainted by the STORE at index 8 below,
+#                         via the loop-back-edge; must be flagged
+#  5 JumpIfFalse 9
+#  6 Const str "y"
+#  7 Store x           (x becomes tainted here)
+#  8 Jump 2
+# Expect: index 4 flagged (loop-carried taint), so dyn_bin_indices == [4].
+let case4 = [
+  ["Const", "num", "0"],
+  ["Store", "x"],
+  ["Load", "x"],
+  ["Const", "num", "0"],
+  ["Bin", "=="],
+  ["JumpIfFalse", "9"],
+  ["Const", "str", "y"],
+  ["Store", "x"],
+  ["Jump", "2"]
+]
+let r4 = x64_analyze_dynamic_bins(case4)
+check("case4: loop-carried taint reaches earlier Bin via fixed point", "[4]", "" + r4)
+
+# Case 5: BigInt-promotion shape (bench_bigint_arith's actual pattern)
+# -- a Call to rt_bigint_from_i64 taints its result, but an unrelated
+# loop counter elsewhere must stay untainted.
+#  0 Const num 20000000
+#  1 Const num 20000000
+#  2 Call rt_bigint_from_i64 (argc irrelevant here, use 1 for shape)
+#     -- modeled directly as a Call with argc=1 producing a tainted
+#        result, consumed by a Bin at index 4:
+#  3 Load big (irrelevant placeholder)
+#  4 Bin *             <- tainted, since operand came from the Call
+#  5 Const num 0
+#  6 Store i
+#  7 (loop top) Load i
+#  8 Const num 20
+#  9 Bin <             <- NOT tainted
+let case5 = [
+  ["Const", "num", "20000000"],
+  ["Call", "rt_bigint_from_i64", "1"],
+  ["Store", "big"],
+  ["Load", "big"],
+  ["Const", "num", "3"],
+  ["Bin", "*"],
+  ["Const", "num", "0"],
+  ["Store", "i"],
+  ["Load", "i"],
+  ["Const", "num", "20"],
+  ["Bin", "<"]
+]
+let r5 = x64_analyze_dynamic_bins(case5)
+check("case5: BigInt-derived Bin flagged, unrelated loop counter Bin not", "[5]", "" + r5)
