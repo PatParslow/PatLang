@@ -3359,7 +3359,7 @@ make a function called x64_os_get_command_line_asm returns asm
   return sb_str(sb)
 end
 
-make a function called x64_callhost_asm takes name, argc returns asm
+make a function called x64_callhost_asm takes name, argc, spilled returns asm
   let sb = sb_new()
   if name == "list_get" then
     sb_push(sb, "    call rt_list_get" + x64_nl_char())
@@ -3369,6 +3369,111 @@ make a function called x64_callhost_asm takes name, argc returns asm
     sb_push(sb, "    call rt_list_set_functional" + x64_nl_char())
     sb_push(sb, "    add rsp, 24" + x64_nl_char())
     sb_push(sb, "    push rax" + x64_nl_char())
+  elif name == "class_def" then
+    # `class X { ... }` lowers to a HARDCODED CallHost("class_def", 5)
+    # (see lowering.rs's ClassDecl handling) -- bypasses ordinary
+    # Call-vs-CallHost same-name-function resolution entirely, same
+    # class of gap as rule_add above, so defining class_def_register as
+    # an ordinary function in x64_runtime.patlang isn't enough on its
+    # own; this CallHost name needs explicit routing too.
+    sb_push(sb, "    call class_def_register" + x64_nl_char())
+    sb_push(sb, "    add rsp, 40" + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
+  elif name == "send" then
+    # send(recv, method, arg1, ...) is genuinely variadic (PatLang has
+    # no variadic function syntax, same reason exec_capture/spawn need
+    # their own CallHost cases -- see x64_exec_capture_asm's own
+    # header) -- argc IS a compile-time constant per call site though
+    # (the source's own literal arg count), so this whole thing is a
+    # compile-time-unrolled sequence, no runtime loop needed beyond
+    # what x64_buildlist_asm/x64_callvalue_asm already do internally.
+    #
+    # Real invocation ("call whatever function a resolved closure
+    # wraps") needs x64_callvalue_asm's own generated-code mechanism --
+    # an ordinary PatLang function body can't do that (same reason
+    # rust-runtime's interpreter.rs handles `send`'s closure-invocation
+    # HERE rather than in hosts.rs's host_send, see interpreter.rs's own
+    # comment on this). rt_send_prepare (x64_runtime.patlang) does
+    # everything else: the "set" special-case and method/class
+    # resolution, returning the closure to invoke or 0 if there's
+    # nothing left to invoke.
+    let k = to_num(argc) - 2
+    let suffix = label_asm_safe(0)
+    # 1. Collect all argc pushed values into a heap array (exact idiom
+    #    as x64_exec_capture_asm's own arg collection): arr[0]=recv,
+    #    arr[1]=method, arr[2..]=rest args.
+    sb_push(sb, "    mov rax, " + (to_num(argc) * 8) + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
+    sb_push(sb, "    call rt_heap_alloc" + x64_nl_char())
+    sb_push(sb, "    add rsp, 8" + x64_nl_char())
+    sb_push(sb, "    mov r12, rax" + x64_nl_char())
+    let ai = to_num(argc) - 1
+    while ai >= 0 do
+      sb_push(sb, "    pop r10" + x64_nl_char())
+      sb_push(sb, "    mov [r12+" + (ai * 8) + "], r10" + x64_nl_char())
+      let ai = ai - 1
+    end
+    # 2. Re-push recv, method, then rest-args (building rest_list),
+    #    for rt_send_prepare(recv, method, rest_list). Real bug found
+    #    and fixed here via WinDbg (genuine null-pointer segfault, rax=0
+    #    reading a bogus "recv"): x64_buildlist_asm's OWN generated code
+    #    freely reassigns r12 for its own list-header bookkeeping (see
+    #    its own header -- this backend gives no register-preservation
+    #    guarantee across an embedded call/block any more than a real
+    #    `call`), clobbering `arr`'s pointer out from under this
+    #    function the moment it's invoked. `arr` must survive it (and
+    #    the real `call rt_send_prepare` right after, which clobbers
+    #    every register too) -- preserved on the real machine stack via
+    #    push/pop, same idiom x64_os_exec_run_asm already uses for its
+    #    own cmdline_addr/cmdline_len across an internal rt_heap_alloc
+    #    call.
+    sb_push(sb, "    push r12" + x64_nl_char())
+    sb_push(sb, "    mov rax, [r12+0]" + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
+    sb_push(sb, "    mov rax, [r12+8]" + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
+    let ri = 0
+    while ri < k do
+      sb_push(sb, "    mov rax, [r12+" + ((2 + ri) * 8) + "]" + x64_nl_char())
+      sb_push(sb, "    push rax" + x64_nl_char())
+      let ri = ri + 1
+    end
+    sb_push(sb, x64_buildlist_asm(k))
+    sb_push(sb, "    call rt_send_prepare" + x64_nl_char())
+    sb_push(sb, "    add rsp, 24" + x64_nl_char())
+    sb_push(sb, "    mov r13, rax" + x64_nl_char())
+    sb_push(sb, "    pop r12" + x64_nl_char())
+    sb_push(sb, "    cmp r13, 0" + x64_nl_char())
+    sb_push(sb, "    je .SEND_DONE_" + suffix + x64_nl_char())
+    # 3. Real method found -- invoke via x64_callvalue_asm: push recv,
+    #    then rest-args (in order, matching the real interpreter's own
+    #    `full_args = captured(none) + [recv] + rest`) -- x64_callvalue_
+    #    asm's OWN calling convention (see its own header/step comments)
+    #    expects the CLOSURE pushed FIRST, then the own-args pushed on
+    #    top (it pops the top N as own-args, THEN pops what's left as
+    #    the closure) -- opposite of the naive "closure last" order a
+    #    first pass at this got wrong, caught by a genuine WinDbg-traced
+    #    null-pointer segfault (r14=0 inside x64_callvalue_asm's own
+    #    closure-deref, once the wrong value got popped as "the
+    #    closure").
+    sb_push(sb, "    push r13" + x64_nl_char())
+    sb_push(sb, "    mov rax, [r12+0]" + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
+    let ri = 0
+    while ri < k do
+      sb_push(sb, "    mov rax, [r12+" + ((2 + ri) * 8) + "]" + x64_nl_char())
+      sb_push(sb, "    push rax" + x64_nl_char())
+      let ri = ri + 1
+    end
+    sb_push(sb, x64_callvalue_asm(k + 1, spilled))
+    sb_push(sb, "    jmp .SEND_ALLDONE_" + suffix + x64_nl_char())
+    sb_push(sb, ".SEND_DONE_" + suffix + ":" + x64_nl_char())
+    # "set" (or, out of this slice's scope, a genuinely unresolvable
+    # method -- see rt_send_prepare's own header) already handled with
+    # nothing further to invoke; push a placeholder so CallHost's own
+    # "push exactly 1 result" contract still holds.
+    sb_push(sb, "    push 0" + x64_nl_char())
+    sb_push(sb, ".SEND_ALLDONE_" + suffix + ":" + x64_nl_char())
   elif name == "contract_check" then
     # Same class of gap as rule_add just below: `require`/`ensure`
     # statements lower to a HARDCODED CallHost("contract_check", 4)
@@ -3724,6 +3829,11 @@ make a function called x64_callhost_asm takes name, argc returns asm
         # `end` stack this whole function's chain still uses for its
         # OTHER, pre-existing branches -- elif adds zero new nesting.
         sb_push(sb, "    lea rax, [rel g_rules_table]" + x64_nl_char())
+        sb_push(sb, "    push rax" + x64_nl_char())
+      elif name == "mem_classes_table_addr" then
+        # Real classes for x64 (non-inheriting subset) -- class_def's own
+        # registry (class name -> [field_defaults, methods]).
+        sb_push(sb, "    lea rax, [rel g_classes_table]" + x64_nl_char())
         sb_push(sb, "    push rax" + x64_nl_char())
       else
       if name == "mem_poke_qword" then
@@ -4175,7 +4285,7 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
               sb_push(sb, "    je L_" + func_name + "_" + instr[1] + x64_nl_char())
             else
               if ty == "CallHost" then
-                sb_push(sb, x64_callhost_asm(instr[1], instr[2]))
+                sb_push(sb, x64_callhost_asm(instr[1], instr[2], spilled))
               else
                 if ty == "Call" then
                   if bool_print_override then
@@ -5049,7 +5159,7 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
   sb_push(sb, x64_nl_char())
   sb_push(sb, "section .bss" + x64_nl_char())
   if owns_globals then
-    sb_push(sb, "    global g_written, g_scratch, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init, g_last_recv_error, g_vfs_table" + x64_nl_char())
+    sb_push(sb, "    global g_written, g_scratch, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init, g_last_recv_error, g_vfs_table, g_classes_table" + x64_nl_char())
     sb_push(sb, "    align 8" + x64_nl_char())
     sb_push(sb, "    g_written resd 1" + x64_nl_char())
     sb_push(sb, "    align 8" + x64_nl_char())
@@ -5081,10 +5191,15 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
     sb_push(sb, "    g_wsa_init resq 1" + x64_nl_char())
     sb_push(sb, "    g_last_recv_error resq 1" + x64_nl_char())
     sb_push(sb, "    g_vfs_table resq 1" + x64_nl_char())
+    sb_push(sb, "    align 8" + x64_nl_char())
+    # Real classes for x64 (non-inheriting subset) -- class registry,
+    # keyed by class name; see class_def_register's own header in
+    # x64_runtime.patlang for exactly what this holds.
+    sb_push(sb, "    g_classes_table resq 1" + x64_nl_char())
     sb_push(sb, "    align 16" + x64_nl_char())
     sb_push(sb, "    g_heap resb 16777216" + x64_nl_char())
   else
-    sb_push(sb, "extern g_written, g_scratch, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init, g_last_recv_error, g_vfs_table" + x64_nl_char())
+    sb_push(sb, "extern g_written, g_scratch, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init, g_last_recv_error, g_vfs_table, g_classes_table" + x64_nl_char())
   end
   sb_push(sb, x64_nl_char())
   sb_push(sb, "section .data" + x64_nl_char())

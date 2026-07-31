@@ -728,36 +728,60 @@ make a function called rt_str_cmp takes a, b returns result
   return 0
 end
 
-# set_var(key, value) / get(store, key): the bundled compiler source
-# uses these ONLY as a small global named-counter store (checked every
-# call site: lower.patlang's closure/budgeted/activate sequence
-# counters, codegen_x64.patlang's string/CallValue label counters --
-# always numeric values, always `get("__vars", key)` with the literal
-# store name "__vars"). Genuinely general (any string key, any value,
-# any store name is accepted, just always compared by content not
-# identity) but scoped to what's actually needed: a single global
-# linear-scan key/value store (two parallel persistent-table entries,
-# same g_*_table/mem_*_table_addr pattern as sb_*/vec_*), not a
-# multi-namespace object system. `store` is accepted but not used to
-# select between namespaces -- every actual call site passes the same
-# "__vars" literal, so a second global for a different store name has
-# never been observed and isn't implemented; get on an unset key
-# returns 0 (matches how every actual key is initialized via set_var
-# before its first get, e.g. lower.patlang:629 `set_var("__closure_seq",
-# 0)`), not Rust's Unit/nil.
-make a function called set_var takes key, value returns done
+# set_var(key, value) / get(store, key): GENUINELY per-namespace, matching
+# the real interpreter's own actual design (rust-runtime/src/ir/hosts.rs's
+# host_get/host_set_var/ensure_obj/obj_get/obj_set all read and write ONE
+# shared per-name field store -- "__vars" is just the one conventional
+# namespace name every existing call site here happens to use, not a
+# special case the real host treats differently from any other object
+# handle). The PREVIOUS version of this function ignored `store` entirely
+# and always read/wrote a single flat table -- harmless as long as every
+# caller passed literal "__vars" (true of every pre-existing call site:
+# lower.patlang's closure/budgeted/activate sequence counters,
+# codegen_x64.patlang's string/CallValue label counters), but WRONG the
+# moment real class support (GitHub classes-for-x64-caching plan) needed
+# `get(self, "field")`/`obj.field = value` to read/write a DIFFERENT
+# object's own namespace -- every object would have silently aliased the
+# same global "__vars" table instead of its own fields. Fixed by making
+# the underlying table a list of [namespace_name, keys, vals] triples,
+# looked up by `store`/`key` together -- `rt_ns_get`/`rt_ns_set` below do
+# the real work; `get`/`set_var` are now thin, backward-compatible
+# wrappers (every existing 2-arg `set_var(key,value)` call site is
+# unaffected, since it's just sugar for `rt_ns_set("__vars",key,value)`).
+make a function called rt_ns_find takes table, store returns idx
+  let n = rt_list_len(table)
+  let i = 0
+  while i < n do
+    if rt_str_eq(rt_list_get(rt_list_get(table, i), 0), store) then
+      return i
+    end
+    let i = i + 1
+  end
+  return 0 - 1
+end
+
+make a function called rt_ns_set takes store, key, value returns done
   let table_addr = mem_vars_table_addr()
   let table = mem_peek_qword(table_addr, 0)
   if table == 0 then
-    let keys = rt_list_new(0)
-    let vals = rt_list_new(0)
-    let table = rt_list_new(2)
-    rt_list_set(table, 0, keys)
-    rt_list_set(table, 1, vals)
+    let table = rt_list_new(0)
     mem_poke_qword(table_addr, 0, table)
   end
-  let keys = rt_list_get(table, 0)
-  let vals = rt_list_get(table, 1)
+  let ns_idx = rt_ns_find(table, store)
+  if ns_idx < 0 then
+    let keys = rt_list_new(0)
+    let vals = rt_list_new(0)
+    let ns = rt_list_new(3)
+    rt_list_set(ns, 0, store)
+    rt_list_set(ns, 1, keys)
+    rt_list_set(ns, 2, vals)
+    let table = rt_list_push(table, ns)
+    mem_poke_qword(table_addr, 0, table)
+    let ns_idx = rt_list_len(table) - 1
+  end
+  let ns = rt_list_get(table, ns_idx)
+  let keys = rt_list_get(ns, 1)
+  let vals = rt_list_get(ns, 2)
   let n = rt_list_len(keys)
   let i = 0
   while i < n do
@@ -769,18 +793,25 @@ make a function called set_var takes key, value returns done
   end
   let new_keys = rt_list_push(keys, key)
   let new_vals = rt_list_push(vals, value)
-  rt_list_set(table, 0, new_keys)
-  rt_list_set(table, 1, new_vals)
+  rt_list_set(ns, 1, new_keys)
+  rt_list_set(ns, 2, new_vals)
   return true
 end
 
-make a function called get takes store, key returns value
+# Returns 0 on an unset key -- matches this function's own pre-existing
+# convention (documented below on `get`), not Rust's Unit/nil.
+make a function called rt_ns_get takes store, key returns value
   let table = mem_peek_qword(mem_vars_table_addr(), 0)
   if table == 0 then
     return 0
   end
-  let keys = rt_list_get(table, 0)
-  let vals = rt_list_get(table, 1)
+  let ns_idx = rt_ns_find(table, store)
+  if ns_idx < 0 then
+    return 0
+  end
+  let ns = rt_list_get(table, ns_idx)
+  let keys = rt_list_get(ns, 1)
+  let vals = rt_list_get(ns, 2)
   let n = rt_list_len(keys)
   let i = 0
   while i < n do
@@ -790,6 +821,158 @@ make a function called get takes store, key returns value
     let i = i + 1
   end
   return 0
+end
+
+# The bundled compiler source's OWN pre-existing usage (checked every call
+# site) always passes "__vars" as `store`/never uses a second namespace --
+# kept as a thin wrapper so those call sites are untouched. get on an
+# unset key returns 0 (matches how every actual key is initialized via
+# set_var before its first get, e.g. lower.patlang:629
+# `set_var("__closure_seq", 0)`), not Rust's Unit/nil.
+make a function called set_var takes key, value returns done
+  return rt_ns_set("__vars", key, value)
+end
+
+make a function called get takes store, key returns value
+  return rt_ns_get(store, key)
+end
+
+# ---- real classes for x64 (non-inheriting subset) ----
+#
+# Mirrors rust-runtime/src/ir/hosts.rs's real class_def/new/send
+# semantics (host_class_def/host_new/host_send/resolve_class_method),
+# narrowed to a named, explicit scope limit: single classes with plain
+# fields + methods only -- NO `inherits`/traits support (the real host's
+# own parent-chain walk in resolve_class_method/
+# resolve_class_field_defaults is real extra work this narrower x64 cut
+# doesn't need yet; add it later if something else genuinely needs
+# inheritance on this backend, same "named scope limit, not an
+# oversight" convention as every other deliberately-narrower cut in this
+# file). A class registered with a non-empty parent/traits list here
+# still works -- those args are simply ignored, matching how an
+# unregistered class already behaves in the real host (zero defaults,
+# no methods) rather than raising an error.
+#
+# g_classes_table: assoc list, class name -> [field_defaults, methods]
+# (both themselves assoc lists: field_defaults is [[name,default],...],
+# methods is [[name,closure],...] -- exactly the shape class_def's own
+# 5 real args already arrive in, see lowering.rs's ClassDecl handling).
+make a function called class_def_register takes name, parent, field_defaults, methods, traits returns done
+  let table = mem_peek_qword(mem_classes_table_addr(), 0)
+  if table == 0 then
+    let table = rt_list_new(0)
+  end
+  let n = rt_list_len(table)
+  let i = 0
+  while i < n do
+    if rt_str_eq(rt_list_get(rt_list_get(table, i), 0), name) then
+      let entry = rt_list_get(table, i)
+      rt_list_set(entry, 1, field_defaults)
+      rt_list_set(entry, 2, methods)
+      mem_poke_qword(mem_classes_table_addr(), 0, table)
+      return true
+    end
+    let i = i + 1
+  end
+  let entry = rt_list_new(3)
+  rt_list_set(entry, 0, name)
+  rt_list_set(entry, 1, field_defaults)
+  rt_list_set(entry, 2, methods)
+  let table = rt_list_push(table, entry)
+  mem_poke_qword(mem_classes_table_addr(), 0, table)
+  return true
+end
+
+# Returns the registered [field_defaults, methods] entry, or an empty
+# list if `name` was never registered (matches the real host's own
+# "unregistered class -> zero defaults, no methods" fallback, not an
+# error).
+make a function called class_def_lookup takes name returns entry
+  let table = mem_peek_qword(mem_classes_table_addr(), 0)
+  if table == 0 then
+    return []
+  end
+  let n = rt_list_len(table)
+  let i = 0
+  while i < n do
+    if rt_str_eq(rt_list_get(rt_list_get(table, i), 0), name) then
+      return rt_list_get(table, i)
+    end
+    let i = i + 1
+  end
+  return []
+end
+
+# Resolves `method` on `class` (single-class only, per this file's own
+# documented scope limit above -- no parent-chain walk). Returns the
+# closure value, or 0 if unregistered/not found.
+make a function called class_method_lookup takes class, method returns closure_or_zero
+  let entry = class_def_lookup(class)
+  if rt_list_len(entry) == 0 then
+    return 0
+  end
+  let methods = rt_list_get(entry, 2)
+  let n = rt_list_len(methods)
+  let i = 0
+  while i < n do
+    let pair = rt_list_get(methods, i)
+    if rt_str_eq(rt_list_get(pair, 0), method) then
+      return rt_list_get(pair, 1)
+    end
+    let i = i + 1
+  end
+  return 0
+end
+
+# new(class, name): populates `name`'s own namespace (the SAME per-name
+# store get/set_var/send("set",...) already share, see rt_ns_get/
+# rt_ns_set's own header above -- there is no separate "object table" in
+# the real design this mirrors) with `class`'s field defaults, plus a
+# "type" entry so send() can later resolve which class's methods to
+# dispatch to. Real host's own optional trailing "inherits"/"traits"
+# keyword-pairs are out of scope here (2-arg new only, see this file's
+# class-support header above) -- `new` isn't a reserved word, so
+# (unlike "class_def" and "send", both hardcoded at the lowering/
+# CallHost level) an ordinary same-named PatLang function definition
+# shadows it directly, same convention as get/set_var above.
+make a function called new takes class, name returns tagged_name
+  let entry = class_def_lookup(class)
+  if rt_list_len(entry) > 0 then
+    let field_defaults = rt_list_get(entry, 1)
+    let n = rt_list_len(field_defaults)
+    let i = 0
+    while i < n do
+      let pair = rt_list_get(field_defaults, i)
+      rt_ns_set(name, rt_list_get(pair, 0), rt_list_get(pair, 1))
+      let i = i + 1
+    end
+  end
+  rt_ns_set(name, "type", class)
+  return name
+end
+
+# send(recv, method, arg1, ...) is variadic (CallHost, real codegen-level
+# handling in x64_callhost_asm below -- PatLang has no variadic function
+# syntax, same reason exec_capture/spawn need their own CallHost cases
+# too). This helper does everything EXCEPT the actual closure invocation
+# (a real `call` to whatever function the resolved closure wraps, which
+# needs x64_callvalue_asm's own generated-code mechanism, not something
+# an ordinary PatLang function body can do) -- mirrors host_send's own
+# "set" special-case (rust-runtime/src/ir/hosts.rs) plus interpreter.rs's
+# own class-method resolution, minus the actual call. Returns the
+# resolved method closure to invoke, or 0 if there's nothing left to
+# invoke (either the "set" case, already handled here directly, or a
+# genuinely unresolvable method -- this narrower x64 cut doesn't
+# distinguish the two, since every method this backend's OWN classes
+# ever call is expected to resolve; a real "unknown method" error path
+# is out of scope, matching this file's other named scope limits).
+make a function called rt_send_prepare takes recv, method, rest_args returns closure_or_zero
+  if rt_str_eq(method, "set") then
+    rt_ns_set(recv, rt_list_get(rest_args, 0), rt_list_get(rest_args, 1))
+    return 0
+  end
+  let class = rt_ns_get(recv, "type")
+  return class_method_lookup(class, method)
 end
 
 # read_file/write_file/file_exists: thin shadows over the rt_* wrappers
