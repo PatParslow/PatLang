@@ -1,0 +1,125 @@
+# CompileUnit -- one function's own compilation unit: its IR, a stable
+# content hash (the ObjCache lookup key), and the logic to produce its
+# own .obj, either from cache or by running the exact same codegen/
+# assemble steps this whole backend already used per-chunk (just with a
+# ONE-function chunk now).
+#
+# x64_content_hash is a deliberately SIMPLE polynomial (djb2-style) hash
+# over the function's own canonical JSON serialization
+# (json_stringify(to_json_value(func_ir)), reusing lib/ir_io.patlang's
+# existing to_json_value + lib/json.patlang's existing json_stringify --
+# no new serialization code needed). NOT the same algorithm as the real
+# `hash_string` host function (FNV-1a) -- deliberately: hash_string has
+# NO x64 native codegen support (confirmed on the "unsupported
+# primitive" list during the self-hosting-fixpoint work), and this
+# cache doesn't need to match hash_string's own digest values anyway,
+# only to be deterministic and collision-resistant enough for a few
+# hundred functions -- a plain modular polynomial computed via ordinary
+# PatLang int arithmetic (kept well under the 48-bit fixnum range via
+# an explicit modulus, no BigInt promotion risk) works on every backend
+# uniformly with zero new primitive dependencies.
+make a function called x64_content_hash takes s returns digest
+  let h = 5381
+  let n = s.length
+  let i = 0
+  while i < n do
+    let c = char_code(s, i)
+    let h = (h * 33 + c) % 999999937
+    let i = i + 1
+  end
+  return "" + h
+end
+
+class CompileUnit {
+  field func_ir = []
+  field name = ""
+  field content_hash = ""
+
+  # ensure_obj(self, cache, extern_names) -> obj_path, or an error
+  # string starting with "NASM ERROR:" on a genuine assembly failure
+  # (same convention as x64_assemble/x64_build), matching every other
+  # fallible build-step function in this codebase (no exceptions to
+  # raise). Cache hit skips codegen/assembly entirely.
+  make a function called ensure_obj takes self, cache, extern_names returns obj_path
+    let h = get(self, "content_hash")
+    if send(cache, "has", h) then
+      return send(cache, "path_for", h)
+    end
+    let func_ir = get(self, "func_ir")
+    let name = get(self, "name")
+    let asm = emit_program_x64(["ProgramIR", "main", [func_ir], []], false, extern_names)
+    let out_path = "self_hosting/build/unit_" + name + "." + h
+    let asm_path = out_path + ".asm"
+    let obj_path = out_path + ".obj"
+    let result = x64_assemble(asm, asm_path, obj_path)
+    if x64_build_contains(result, "NASM ERROR:") then
+      return result
+    end
+    send(cache, "store", h, obj_path)
+    return send(cache, "path_for", h)
+  end
+}
+
+# Builds a CompileUnit for one function's IR -- the "constructor" step
+# (this backend's own new(class,name) only initializes fields to the
+# class's static defaults, see x64_runtime.patlang's own class-support
+# header, so real per-instance construction is new()-then-assign, an
+# established, simple pattern rather than a gap).
+make a function called x64_make_compile_unit takes func_ir returns unit
+  let name = func_ir[1]
+  let unit = new("CompileUnit", "cu_" + name)
+  unit.func_ir = func_ir
+  unit.name = name
+  unit.content_hash = name + "_" + x64_content_hash(json_stringify(to_json_value(func_ir)))
+  return unit
+end
+
+# Every OTHER function in `funcs` (all except index `self_idx`) plus
+# rt_names -- exactly the extern list a per-function .obj needs to link
+# against everything else, same computation patc1_main.patlang's own
+# per-chunk path already did (just per-function now instead of per
+# size-bucketed chunk).
+make a function called x64_extern_names_for takes funcs, self_idx, rt_names returns names
+  let names = rt_names
+  let n = funcs.length
+  let i = 0
+  while i < n do
+    if i != self_idx then
+      let names = list_push(names, funcs[i][1])
+    end
+    let i = i + 1
+  end
+  return names
+end
+
+# X64UnitLinker -- orchestrates the whole per-function-cached build:
+# one CompileUnit per function (cache hit or fresh assemble, see
+# CompileUnit.ensure_obj's own header), then ONE final link
+# (x64_link_objs, self_hosting/lib/x64_build.patlang) against all of
+# them plus the runtime object. Replaces x64_partition_funcs's arbitrary
+# size-based chunking entirely for the program side -- every function
+# is its own real, separately-compiled, separately-cached unit, exactly
+# what "genuine separation of concerns" (this whole feature's own
+# starting brief) means: no more magic instruction-count threshold
+# deciding whether a program even GETS chunked.
+class X64UnitLinker {
+  field cache = 0
+
+  make a function called build takes self, funcs, rt_names, runtime_obj_path, out_path returns result
+    let cache = get(self, "cache")
+    let n = funcs.length
+    let objs = []
+    let i = 0
+    while i < n do
+      let unit = x64_make_compile_unit(funcs[i])
+      let extern_names = x64_extern_names_for(funcs, i, rt_names)
+      let obj_or_err = send(unit, "ensure_obj", cache, extern_names)
+      if x64_build_contains(obj_or_err, "NASM ERROR:") then
+        return obj_or_err
+      end
+      let objs = list_push(objs, obj_or_err)
+      let i = i + 1
+    end
+    return x64_link_objs(objs, runtime_obj_path, out_path)
+  end
+}
