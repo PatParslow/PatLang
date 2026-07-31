@@ -2124,6 +2124,85 @@ make a function called x64_os_null_terminate_path_asm takes suffix returns asm
   return sb_str(sb)
 end
 
+# Same as x64_os_null_terminate_path_asm but targets g_scratch2 and
+# reads from rbx/r11 instead of rax/r10 -- copy_file/rename_file (see
+# x64_os_copy_file_asm/x64_os_rename_file_asm) need BOTH paths null-
+# terminated and live at once, unlike every other OS-boundary
+# primitive here which only ever needs one path at a time.
+make a function called x64_os_null_terminate_path2_asm takes suffix returns asm
+  let sb = sb_new()
+  sb_push(sb, "    lea rdi, [rel g_scratch2]" + x64_nl_char())
+  sb_push(sb, "    xor rsi, rsi" + x64_nl_char())
+  sb_push(sb, "  .ntp2_loop_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    cmp rsi, r11" + x64_nl_char())
+  sb_push(sb, "    jge .ntp2_done_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov dl, [rbx+rsi]" + x64_nl_char())
+  sb_push(sb, "    mov [rdi+rsi], dl" + x64_nl_char())
+  sb_push(sb, "    inc rsi" + x64_nl_char())
+  sb_push(sb, "    jmp .ntp2_loop_" + suffix + x64_nl_char())
+  sb_push(sb, "  .ntp2_done_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov byte [rdi+rsi], 0" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# os_copy_file(from_addr, from_len, to_addr, to_len) -> 1/0, via a real
+# CopyFileA call (bFailIfExists=0, i.e. overwrite -- matches
+# hosts.rs's own std::fs::copy semantics). Primitive-gap fill (GitHub
+# #31 follow-up): the PatLang-level copy_file wrapper (x64_runtime.
+# patlang) previously tried shelling out to cmd.exe's `copy` builtin
+# via exec_capture, but cmd.exe's own /C quoting quirk (and what
+# turned out to be a separate, pre-existing exec_capture output-buffer
+# issue surfaced while chasing it) made that unreliable -- a genuine
+# WinAPI call sidesteps the whole shell-quoting problem entirely.
+make a function called x64_os_copy_file_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  # Args pushed by the caller in order (from_addr, from_len, to_addr,
+  # to_len) -- LIFO pop order is therefore the reverse.
+  sb_push(sb, "    pop r11" + x64_nl_char())
+  sb_push(sb, "    pop rbx" + x64_nl_char())
+  sb_push(sb, "    pop r10" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, x64_os_null_terminate_path_asm(suffix))
+  sb_push(sb, x64_os_null_terminate_path2_asm(suffix))
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [rel g_scratch]" + x64_nl_char())
+  sb_push(sb, "    lea rdx, [rel g_scratch2]" + x64_nl_char())
+  sb_push(sb, "    xor r8, r8" + x64_nl_char())
+  sb_push(sb, "    call CopyFileA" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# os_rename_file(from_addr, from_len, to_addr, to_len) -> 1/0, via
+# MoveFileExA with MOVEFILE_REPLACE_EXISTING (1) -- matches hosts.rs's
+# own std::fs::rename, which overwrites an existing destination.
+make a function called x64_os_rename_file_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  # Args pushed by the caller in order (from_addr, from_len, to_addr,
+  # to_len) -- LIFO pop order is therefore the reverse.
+  sb_push(sb, "    pop r11" + x64_nl_char())
+  sb_push(sb, "    pop rbx" + x64_nl_char())
+  sb_push(sb, "    pop r10" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, x64_os_null_terminate_path_asm(suffix))
+  sb_push(sb, x64_os_null_terminate_path2_asm(suffix))
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [rel g_scratch]" + x64_nl_char())
+  sb_push(sb, "    lea rdx, [rel g_scratch2]" + x64_nl_char())
+  sb_push(sb, "    mov r8, 1" + x64_nl_char())
+  sb_push(sb, "    call MoveFileExA" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
 # os_file_size(path_addr, path_len) -> size, or -1 if the file doesn't
 # exist/can't be opened.
 make a function called x64_os_file_size_asm returns asm
@@ -3513,6 +3592,14 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
   else
   if name == "os_write_file" then
     sb_push(sb, x64_os_write_file_asm())
+  elif name == "os_copy_file" then
+    # Deliberately `elif`, not another "else\nif...end" nesting level
+    # -- per this session's own CLAUDE.md convention (added after a
+    # real bug from exactly that pattern), a new branch on an existing
+    # deferred-end chain should use elif so the end-count can't drift.
+    sb_push(sb, x64_os_copy_file_asm())
+  elif name == "os_rename_file" then
+    sb_push(sb, x64_os_rename_file_asm())
   else
   if name == "exec_capture" then
     sb_push(sb, x64_exec_capture_asm(argc))
@@ -3745,6 +3832,13 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
       if name == "mem_heap_base" then
         sb_push(sb, "    lea rax, [rel g_heap]" + x64_nl_char())
         sb_push(sb, "    push rax" + x64_nl_char())
+      elif name == "mem_heap_size" then
+        # MUST match g_heap's own `resb <N>` size below byte-for-byte --
+        # rt_heap_alloc's own bounds check (x64_runtime.patlang) relies
+        # on this to detect exhaustion instead of silently overflowing
+        # into unmapped memory (GitHub #31 follow-up, patc2->patc3 crash).
+        sb_push(sb, "    mov rax, 536870912" + x64_nl_char())
+        sb_push(sb, "    push rax" + x64_nl_char())
       else
       if name == "mem_heap_state_addr" then
         sb_push(sb, "    lea rax, [rel g_heap_state]" + x64_nl_char())
@@ -3834,6 +3928,14 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
         # Real classes for x64 (non-inheriting subset) -- class_def's own
         # registry (class name -> [field_defaults, methods]).
         sb_push(sb, "    lea rax, [rel g_classes_table]" + x64_nl_char())
+        sb_push(sb, "    push rax" + x64_nl_char())
+      elif name == "mem_goal_defs_table_addr" then
+        # goal_def/pursue's own registry (goal name -> deps ground-fact
+        # list), same assoc-list-of-[key, value] pattern as
+        # g_classes_table just above -- primitive-gap fill (GitHub #31
+        # follow-up), reuses the already-ported `plan_facts` for pursue's
+        # actual search.
+        sb_push(sb, "    lea rax, [rel g_goal_defs_table]" + x64_nl_char())
         sb_push(sb, "    push rax" + x64_nl_char())
       else
       if name == "mem_poke_qword" then
@@ -5135,7 +5237,7 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
     end
     sb_push(sb, sb_str(gl_line) + x64_nl_char())
   end
-  sb_push(sb, "extern GetStdHandle, WriteFile, ExitProcess, CreateFileA, GetFileSize, CloseHandle, ReadFile, CreateProcessA, CreatePipe, SetHandleInformation, WaitForSingleObject, GetCommandLineA, GetExitCodeProcess, TerminateProcess, WSAStartup, WSAGetLastError, socket, bind, listen, accept, connect, send, recv, closesocket, shutdown, getaddrinfo, freeaddrinfo, getsockname, ioctlsocket, htons, ntohs, Sleep, GetTickCount64" + x64_nl_char())
+  sb_push(sb, "extern GetStdHandle, WriteFile, ExitProcess, CreateFileA, GetFileSize, CloseHandle, ReadFile, CreateProcessA, CreatePipe, SetHandleInformation, WaitForSingleObject, GetCommandLineA, GetExitCodeProcess, TerminateProcess, WSAStartup, WSAGetLastError, socket, bind, listen, accept, connect, send, recv, closesocket, shutdown, getaddrinfo, freeaddrinfo, getsockname, ioctlsocket, htons, ntohs, Sleep, GetTickCount64, CopyFileA, MoveFileExA" + x64_nl_char())
   # Real C runtime math library (msvcrt/ucrtbase, already linked by
   # gcc's own default libs -- see x64_build.patlang) -- matches the
   # SAME underlying libm every real_host_sin/cos/sqrt/etc (rust-runtime/
@@ -5159,11 +5261,17 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
   sb_push(sb, x64_nl_char())
   sb_push(sb, "section .bss" + x64_nl_char())
   if owns_globals then
-    sb_push(sb, "    global g_written, g_scratch, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init, g_last_recv_error, g_vfs_table, g_classes_table" + x64_nl_char())
+    sb_push(sb, "    global g_written, g_scratch, g_scratch2, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init, g_last_recv_error, g_vfs_table, g_classes_table, g_goal_defs_table" + x64_nl_char())
     sb_push(sb, "    align 8" + x64_nl_char())
     sb_push(sb, "    g_written resd 1" + x64_nl_char())
     sb_push(sb, "    align 8" + x64_nl_char())
     sb_push(sb, "    g_scratch resb 256" + x64_nl_char())
+    sb_push(sb, "    align 8" + x64_nl_char())
+    # copy_file/rename_file's "to" path -- CopyFileA/MoveFileExA need
+    # TWO null-terminated C strings live simultaneously, unlike every
+    # other OS-boundary primitive here which only ever needs one at a
+    # time (hence its own separate buffer, not sharing g_scratch).
+    sb_push(sb, "    g_scratch2 resb 256" + x64_nl_char())
     sb_push(sb, "    align 8" + x64_nl_char())
     sb_push(sb, "    g_heap_state resq 1" + x64_nl_char())
     sb_push(sb, "    align 8" + x64_nl_char())
@@ -5196,10 +5304,23 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
     # keyed by class name; see class_def_register's own header in
     # x64_runtime.patlang for exactly what this holds.
     sb_push(sb, "    g_classes_table resq 1" + x64_nl_char())
+    sb_push(sb, "    align 8" + x64_nl_char())
+    # goal_def/pursue's registry (goal name -> deps ground-fact list),
+    # same single-persistent-rt_list convention as g_classes_table.
+    sb_push(sb, "    g_goal_defs_table resq 1" + x64_nl_char())
     sb_push(sb, "    align 16" + x64_nl_char())
-    sb_push(sb, "    g_heap resb 16777216" + x64_nl_char())
+    # Bumped from 16MB to 512MB after GitHub #31's follow-up crash
+    # (patc2.exe -> patc3.exe: the bump allocator ran past the original
+    # 16MB reservation, which was the LAST .bss entry, and walked into
+    # unmapped memory). MUST match mem_heap_size()'s literal above --
+    # cheap on 64-bit Windows specifically because .bss pages are
+    # zero-fill-on-demand (reserving 512MB costs nothing in actual RAM
+    # until touched), not a claim this is unbounded -- see
+    # rt_heap_alloc's own header in x64_runtime.patlang for the real
+    # fix still outstanding (genuine dynamic growth/free-list).
+    sb_push(sb, "    g_heap resb 536870912" + x64_nl_char())
   else
-    sb_push(sb, "extern g_written, g_scratch, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init, g_last_recv_error, g_vfs_table, g_classes_table" + x64_nl_char())
+    sb_push(sb, "extern g_written, g_scratch, g_scratch2, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init, g_last_recv_error, g_vfs_table, g_classes_table, g_goal_defs_table" + x64_nl_char())
   end
   sb_push(sb, x64_nl_char())
   sb_push(sb, "section .data" + x64_nl_char())

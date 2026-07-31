@@ -74,6 +74,31 @@ make a function called rt_int_to_string takes n, buf_addr returns len
   return count
 end
 
+# Real bug found (GitHub #31 follow-up) via WinDbg on the patc2.exe ->
+# patc3.exe self-hosting fixpoint: rt_heap_alloc never checked `used`
+# against g_heap's actual reserved size (codegen_x64.patlang's
+# `g_heap resb <N>` -- see mem_heap_size() below, which MUST be kept
+# in sync with that literal by hand, no shared constant exists between
+# the two files). Once a compile touched enough heap to run past the
+# end of g_heap -- g_heap is declared LAST in the .bss section, so
+# there's nothing but unmapped memory beyond it -- every subsequent
+# "allocation" kept silently handing out addresses past the reserved
+# region, and the first write through one of them (inside rt_list_get's
+# string branch, in this case) hit an unmapped page and crashed with a
+# generic access violation, giving zero indication the real cause was
+# heap exhaustion. User's explicit correction after this was found:
+# "the heap alloc should grow our heap, and we should definitely not
+# fail silently AND we might want to consider the size first" -- so
+# this now (1) fails LOUDLY via a diagnostic print + os_exit rather
+# than silently corrupting memory, and (2) the reservation itself
+# (mem_heap_size()) was sized generously rather than left at the
+# original 16MB. Real dynamic growth (a second VirtualAlloc'd region
+# once this one fills, or a proper segmented heap) is a bigger, still-
+# undone follow-up -- deliberately NOT attempted here; a large-but-
+# still-fixed reservation is a legitimate, cheap mitigation on 64-bit
+# Windows specifically because `.bss` pages are zero-fill-on-demand
+# (reserving 512MB costs nothing in actual RAM until touched), not a
+# claim that this is unbounded.
 make a function called rt_heap_alloc takes size returns addr
   let state = mem_heap_state_addr()
   let used = mem_peek_qword(state, 0)
@@ -81,6 +106,10 @@ make a function called rt_heap_alloc takes size returns addr
   let rem = aligned_size % 8
   if rem != 0 then
     let aligned_size = aligned_size + (8 - rem)
+  end
+  if used + aligned_size > mem_heap_size() then
+    print("rt_heap_alloc: heap exhausted (" + (used + aligned_size) + " bytes requested, " + mem_heap_size() + " reserved) -- see rt_heap_alloc's own header in x64_runtime.patlang")
+    os_exit(97)
   end
   let addr = mem_heap_base() + used
   mem_poke_qword(state, 0, used + aligned_size)
@@ -3993,4 +4022,196 @@ make a function called rt_u64_to_hex16 takes n returns s
     let i = i - 1
   end
   return s
+end
+
+# =============================================================================
+# Primitive-gap fill (GitHub #31 follow-up): touch_file/list_dir/
+# rename_file/copy_file/now_ms/fact/query/goal/goal_def/pursue --
+# surfaced as "codegen_x64: unsupported primitive" warnings when the
+# self-hosting-fixpoint compile (patc1.exe recompiling the WHOLE
+# self-hosted-compiler bundle, including its own caching feature's
+# ObjCache.store, via --x64) was finally reached without crashing for
+# the first time. Deliberately implemented here as ORDINARY shadowing
+# PatLang functions (matching this file's own established sb_new/
+# sb_push/chr convention -- "no new hand-assembled asm needed for any
+# of these") rather than new native CallHost cases, wherever an
+# existing supported primitive (exec_capture, os_get_tick_count,
+# rule_add/solve/plan) already covers the real work.
+#
+# read_line and rustc_build*/rustc_build_chunked_texts remain
+# UNSUPPORTED after this batch -- read_line needs genuine new stdin-
+# read asm (no shortcut via an existing primitive), and rustc_build*
+# invokes the rustc-text backend, which the x64 pipeline itself never
+# needs to call for its own operation. Named, deliberate scope limit
+# for this batch, not an oversight.
+
+# copy_file(from, to) -> "OK <to>"/"ERR: <msg>", matching hosts.rs's
+# host_copy_file contract closely enough for this backend's own actual
+# callers (ObjCache.store just checks the return isn't an error
+# prefix). Not a fully faithful mirror (no canonicalized absolute path
+# in the OK message, "to" as given instead), a named simplification.
+#
+# Real bug found and fixed here: an EARLIER version of this function
+# shelled out to cmd.exe's `copy` builtin via exec_capture -- broke in
+# two separate, confirmed ways: (1) exec_capture's rt_exec_join_args
+# quotes EVERY arg unconditionally (including "cmd.exe" itself), and
+# cmd.exe's own /c switch has a documented quoting quirk that garbles
+# multiple separately-quoted tokens (confirmed: `cmd /c "copy" "/Y"
+# "a.txt" "b.txt"` prints `'"copy"' is not recognized`); (2) even after
+# combining the whole sub-command into ONE joined string (the standard
+# workaround for that quirk), a SEPARATE, pre-existing exec_capture
+# output-buffer issue surfaced (confirmed: a 2-token `cmd /c echo hi`
+# via separate args works, but combining tokens or going through `dir`
+# produced garbled/truncated captured output) -- not this session's
+# bug to chase down further, just avoided entirely by using a genuine
+# WinAPI call (os_copy_file, CopyFileA under the hood) instead of a
+# shell round-trip.
+make a function called copy_file takes from, to returns result
+  let from_addr = from band rt_payload_mask()
+  let from_len = mem_peek_qword(from_addr, 0)
+  let to_addr = to band rt_payload_mask()
+  let to_len = mem_peek_qword(to_addr, 0)
+  let ok = os_copy_file(from_addr + 8, from_len, to_addr + 8, to_len)
+  if ok == 0 then
+    return "ERR: CopyFileA failed for " + from + " -> " + to
+  end
+  return "OK " + to
+end
+
+# touch_file(path) -> "OK <path>"/"ERR: <msg>" -- creates an empty file
+# (truncating an existing one, matching hosts.rs's own
+# OpenOptions::create+write+truncate semantics) via the already-
+# supported write_file, not new asm.
+make a function called touch_file takes path returns result
+  write_file(path, "")
+  if file_exists(path) == "1" then
+    return "OK " + path
+  end
+  return "ERR: touch_file failed for " + path
+end
+
+# rename_file(from, to) -> Bool, matching hosts.rs's own Bool return
+# (unlike copy_file/touch_file's "OK"/"ERR:" string convention) via a
+# genuine WinAPI call (os_rename_file, MoveFileExA under the hood) --
+# see copy_file's own header for why this isn't shelled out to cmd.exe.
+make a function called rename_file takes from, to returns ok
+  let from_addr = from band rt_payload_mask()
+  let from_len = mem_peek_qword(from_addr, 0)
+  let to_addr = to band rt_payload_mask()
+  let to_len = mem_peek_qword(to_addr, 0)
+  let ok = os_rename_file(from_addr + 8, from_len, to_addr + 8, to_len)
+  return ok != 0
+end
+
+# list_dir(path) -- NOT implemented this batch. An earlier attempt
+# shelled out to cmd.exe's `dir /b` via exec_capture, but hit a
+# separate, pre-existing exec_capture output-buffer issue (confirmed
+# directly: a 2-token `cmd /c echo hi` via separate args returns clean
+# output, but going through `dir` produced visibly garbled/truncated
+# captured text) unrelated to the cmd.exe quoting quirk copy_file/
+# rename_file above ran into -- not this session's bug to chase down.
+# A correct fix belongs in a real WinAPI-based primitive (FindFirstFileA/
+# FindNextFileA), same approach as os_copy_file/os_rename_file above,
+# not attempted here (a struct-based API, more work than the other
+# primitives in this batch) -- named, deliberate deferral, not a
+# silent gap: list_dir remains on the "unsupported primitive" list.
+
+# now_ms() -> ms since system boot (os_get_tick_count is an already-
+# supported native primitive, GetTickCount64 under the hood) --
+# "monotonic-enough for self-timing" per hosts.rs::host_now_ms's own
+# header, even though it isn't true Unix-epoch time (a named, honest
+# gap, not a silent one).
+make a function called now_ms returns ms
+  return os_get_tick_count()
+end
+
+# fact/query/goal -- the legacy flat 2-arg fact-store trio (superseded
+# by, but still a documented part of the public API alongside,
+# rule_add/solve's real backward-chaining engine -- see hosts.rs's own
+# "A1: real backward-chaining resolution... what the flat fact/query/
+# goal trio above never provided" comment). Implemented here by
+# reusing rule_add/solve directly (a ground fact IS a rule with an
+# empty body, the same Prolog trick hosts.rs's own comment names) --
+# no separate storage table needed.
+make a function called fact takes pred, a, b returns done
+  rule_add(pred, [a, b], [])
+  return true
+end
+
+make a function called query takes pred, a, ignored_wildcard returns count
+  # "Q" (not "__Q") -- is_logic_var's own convention (hosts.rs/
+  # x64_runtime.patlang's solve engine) is "starts with an uppercase
+  # letter"; "__Q" starts with "_" and was therefore treated as a
+  # GROUND constant, not a variable, so this silently searched for
+  # literal matches on "__Q" and always returned 0. Real bug found via
+  # a direct RED check (fact/query round-trip printed 0 instead of the
+  # expected count) before this was ever assumed correct.
+  let solutions = solve(pred, [a, "Q"])
+  return solutions.length
+end
+
+# goal(pred, items...) -- the legacy pending-goal recorder. Confirmed
+# (grepped hosts.rs's own GOALS thread-local) that NOTHING ever reads
+# GOALS back -- host_goal only pushes into it, and the only other
+# reference clears it on a full facts/goals reset. A genuinely
+# unread bookkeeping call, so a faithful mirror is simply a no-op that
+# returns done, matching every OBSERVABLE behavior of the real host
+# function exactly.
+make a function called goal takes pred returns done
+  return true
+end
+
+# goal_def(name, deps) -> stores a named goal's dependency ground-fact
+# list (deps: [[pred,[args...]], ...], same shape a RuleDecl body
+# already builds) for pursue(name) to look up later. g_goal_defs_table:
+# assoc list, goal name -> deps -- same single-persistent-rt_list
+# pattern as g_classes_table (class_def_register's own header above).
+make a function called goal_def takes name, deps returns done
+  let table = mem_peek_qword(mem_goal_defs_table_addr(), 0)
+  if table == 0 then
+    let table = rt_list_new(0)
+  end
+  let n = rt_list_len(table)
+  let i = 0
+  while i < n do
+    if rt_str_eq(rt_list_get(rt_list_get(table, i), 0), name) then
+      let entry = rt_list_get(table, i)
+      rt_list_set(entry, 1, deps)
+      mem_poke_qword(mem_goal_defs_table_addr(), 0, table)
+      return true
+    end
+    let i = i + 1
+  end
+  let entry = rt_list_new(2)
+  rt_list_set(entry, 0, name)
+  rt_list_set(entry, 1, deps)
+  let table = rt_list_push(table, entry)
+  mem_poke_qword(mem_goal_defs_table_addr(), 0, table)
+  return true
+end
+
+# pursue(name) -> List of action-name labels in execution order for a
+# goal previously declared via goal_def -- looks up the stored deps and
+# hands off to the already-ported plan_facts (via `plan`), same as
+# hosts.rs's own host_pursue. An unknown name returns an empty plan
+# (a named simplification versus the real host's hard error -- this
+# backend's own established convention throughout is to return an
+# empty/zero fallback rather than raise where a hard error isn't
+# already plumbed through, e.g. class_def_lookup's own unregistered-
+# class fallback just above).
+make a function called pursue takes name returns steps
+  let table = mem_peek_qword(mem_goal_defs_table_addr(), 0)
+  if table == 0 then
+    return []
+  end
+  let n = rt_list_len(table)
+  let i = 0
+  while i < n do
+    if rt_str_eq(rt_list_get(rt_list_get(table, i), 0), name) then
+      let deps = rt_list_get(rt_list_get(table, i), 1)
+      return plan(deps)
+    end
+    let i = i + 1
+  end
+  return []
 end
