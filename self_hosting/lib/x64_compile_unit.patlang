@@ -34,16 +34,42 @@ class CompileUnit {
   field func_ir = []
   field name = ""
   field content_hash = ""
+  field state = "unstarted"
+  field pending_obj_path = ""
+  field pending_pid = 0
 
-  # ensure_obj(self, cache, extern_names) -> obj_path, or an error
-  # string starting with "NASM ERROR:" on a genuine assembly failure
-  # (same convention as x64_assemble/x64_build), matching every other
-  # fallible build-step function in this codebase (no exceptions to
-  # raise). Cache hit skips codegen/assembly entirely.
+  # ensure_obj(self, cache, extern_names) -> obj_path, or an error string
+  # starting with "NASM ERROR:" on a genuine assembly failure (same
+  # convention as x64_assemble/x64_build). Cache hit skips codegen/
+  # assembly entirely. Sequential convenience wrapper around prepare+
+  # finish below -- equivalent to calling them back to back for exactly
+  # this one unit, kept for callers (like the earlier standalone
+  # integration test) that don't need cross-unit parallelism.
   make a function called ensure_obj takes self, cache, extern_names returns obj_path
+    send(self, "prepare", cache, extern_names)
+    return send(self, "finish", cache)
+  end
+
+  # prepare(self, cache, extern_names): cache hit -> records the cached
+  # path directly, nothing to wait for. Cache miss -> emits this unit's
+  # own asm, writes it, and launches nasm via the REAL, ALREADY-
+  # SUPPORTED non-blocking spawn() primitive (Stage A process-lifecycle
+  # work) instead of the blocking exec_capture x64_assemble normally
+  # uses -- returns immediately with the child PID still running, so a
+  # caller building many CompileUnits can call prepare() on ALL of them
+  # first (launching every cache-miss's own nasm concurrently) before
+  # calling finish() on any of them, rather than serializing one
+  # assemble-and-wait per function. Real object-file separate
+  # compilation already has zero runtime cost (see this whole feature's
+  # own design discussion); this is the natural next step for its
+  # BUILD-time cost -- unique per-unit filenames (name+content_hash,
+  # already how ensure_obj names its own output) mean concurrent nasm
+  # invocations can never clash on the same file.
+  make a function called prepare takes self, cache, extern_names returns done
     let h = get(self, "content_hash")
     if send(cache, "has", h) then
-      return send(cache, "path_for", h)
+      self.state = "cached"
+      return true
     end
     let func_ir = get(self, "func_ir")
     let name = get(self, "name")
@@ -51,10 +77,41 @@ class CompileUnit {
     let out_path = "self_hosting/build/unit_" + name + "." + h
     let asm_path = out_path + ".asm"
     let obj_path = out_path + ".obj"
-    let result = x64_assemble(asm, asm_path, obj_path)
-    if x64_build_contains(result, "NASM ERROR:") then
-      return result
+    write_file(asm_path, asm)
+    let pid = spawn(x64_nasm_exe(), "-Ox", "-f", "win64", "-o", obj_path, asm_path)
+    self.pending_obj_path = obj_path
+    self.pending_pid = pid
+    self.state = "spawned"
+    return true
+  end
+
+  # finish(self, cache) -> obj_path, or an error string starting with
+  # "NASM ERROR:". For a cache hit, returns the cached path immediately
+  # (no wait). For a spawned unit, waits for THIS unit's own nasm to
+  # finish -- but since every other unit's nasm was already launched
+  # concurrently back in prepare(), the total wall time across many
+  # finish() calls is bounded by the SLOWEST individual assemble, not
+  # their sum. spawn()'s own real semantics discard stdout/stderr (see
+  # its header in x64_runtime.patlang -- Stage A scope, non-blocking by
+  # design), so a failure here can only report nasm's exit code, not
+  # the detailed error text exec_capture-based x64_assemble gives --
+  # a real, named diagnostic-quality tradeoff for the parallelism, not
+  # something papered over.
+  make a function called finish takes self, cache returns obj_path
+    let st = get(self, "state")
+    if st == "cached" then
+      return send(cache, "path_for", get(self, "content_hash"))
     end
+    let pid = get(self, "pending_pid")
+    let code = wait(pid)
+    let obj_path = get(self, "pending_obj_path")
+    if code != 0 then
+      return "NASM ERROR: nasm exited " + code + " assembling " + obj_path + " (run x64_assemble directly on this unit for full diagnostic text)"
+    end
+    if file_exists(obj_path) == "0" then
+      return "NASM ERROR: nasm exited 0 but " + obj_path + " was never created"
+    end
+    let h = get(self, "content_hash")
     send(cache, "store", h, obj_path)
     return send(cache, "path_for", h)
   end
@@ -105,15 +162,28 @@ end
 class X64UnitLinker {
   field cache = 0
 
+  # Two passes, not one: EVERY unit's prepare() (cache check, or a
+  # non-blocking nasm spawn) runs first, so every cache-miss's own nasm
+  # is already running concurrently by the time ANY unit's finish()
+  # (which waits) is called -- real parallel assembly, not one-at-a-
+  # time. Cache hits cost nothing extra in either pass (prepare just
+  # records the path, finish just returns it).
   make a function called build takes self, funcs, rt_names, runtime_obj_path, out_path returns result
     let cache = get(self, "cache")
     let n = funcs.length
-    let objs = []
+    let units = []
     let i = 0
     while i < n do
       let unit = x64_make_compile_unit(funcs[i])
       let extern_names = x64_extern_names_for(funcs, i, rt_names)
-      let obj_or_err = send(unit, "ensure_obj", cache, extern_names)
+      send(unit, "prepare", cache, extern_names)
+      let units = list_push(units, unit)
+      let i = i + 1
+    end
+    let objs = []
+    let i = 0
+    while i < n do
+      let obj_or_err = send(units[i], "finish", cache)
       if x64_build_contains(obj_or_err, "NASM ERROR:") then
         return obj_or_err
       end
