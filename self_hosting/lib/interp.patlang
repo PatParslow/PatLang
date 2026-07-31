@@ -236,6 +236,30 @@ make a function called interp_call_host takes name, args returns result
   # here, just an earlier, narrower scoping choice (see the "1 feature
   # complete" pass's memory notes) -- these are exactly as easy to
   # delegate as `sqrt`/`list_push` above.
+  #
+  # KNOWN LIMITATION found via broad-coverage testing, NOT fixed here:
+  # a class's FIELDS work correctly through this interpreter (new/get/
+  # set_var all genuinely delegate to the real native object store), but
+  # a class's METHODS do not. `send(recv, method, ...)` is a real host
+  # function that invokes the resolved method as a genuine NATIVE
+  # closure value -- but when the class (and its methods) are declared
+  # BY THE PROGRAM BEING INTERPRETED HERE, each method's "closure" is
+  # actually this interpreter's own MakeClosure representation (see
+  # interp_run_function's MakeClosure/CallValue handling below: a plain
+  # list `["__closure__", func_name, captured_values]`, pure PatLang
+  # data, not a real tagged closure value). The real native `send()` has
+  # no way to know about that representation, so invoking a method
+  # defined by the interpreted program silently does nothing useful
+  # (confirmed directly: `type_of(send(obj, "method"))` reports "unit"
+  # rather than running the method body or raising any error). Fixing
+  # this properly would mean interp.patlang implementing its OWN method
+  # dispatch (walking the class's method table itself and calling
+  # interp_run_function on the closure data directly, rather than
+  # delegating to the real `send`) -- a genuinely separate, larger piece
+  # of work, not attempted in this pass. Field-only class usage (no
+  # methods) works correctly today; method calls on an interpreter-
+  # defined class do not.
+  if name == "class_def" then return ["Ok", class_def(args[0], args[1], args[2], args[3], args[4])] end
   if name == "new" then return ["Ok", new(args[0], args[1])] end
   if name == "set_var" then return ["Ok", set_var(args[0], args[1])] end
   if name == "get" then return ["Ok", get(args[0], args[1])] end
@@ -376,6 +400,195 @@ end
 # calls become ordinary recursive calls into this same interpreter, using
 # PatLang's own call stack, no separate call-stack bookkeeping needed
 # here.
+# Interpreter -- the same OO treatment given to the compiler's own
+# ObjCache/CompileUnit/X64UnitLinker classes this session: what used to
+# be five loose local variables threaded through a giant while-loop via
+# "let x = new_value" reassignment (locals/stack/pc/error_msg/has_error)
+# are now real fields on a genuine PatLang object, mutated in place the
+# same way any other class's state works (obj.field = value sugar).
+#
+# Deliberately NOT taken further into per-operation method dispatch
+# (e.g. a "push"/"pop" method called via `send` for every single stack
+# operation) -- this interpreter is about to be benchmarked, and dynamic
+# dispatch (a class/method-table lookup) on every push/pop inside the
+# hottest loop in the whole file would be a real, measurable performance
+# regression for no architectural benefit; `run` below is the single
+# coarse-grained method (one per function invocation, not one per
+# instruction), matching the same granularity ObjCache/CompileUnit's own
+# methods already use. The elif chain replaces the original deeply-
+# nested if/else/if/else instruction dispatch (12 levels deep) per this
+# session's own established CLAUDE.md convention: a new branch on a
+# chain like that can no longer desync the deferred `end` stack, since
+# there's only ever the one `end` for the whole chain regardless of how
+# many elifs it has.
+class Interpreter {
+  field funcs = []
+  field instrs = []
+  field locals = []
+  field stack = []
+  field pc = 0
+  field final_result = 0
+  field error_msg = ""
+  field has_error = false
+  field running = true
+
+  make a function called run takes self returns result
+    while get(self, "running") do
+      let instrs = get(self, "instrs")
+      let pc = get(self, "pc")
+      if pc >= instrs.length then
+        self.running = false
+      else
+        let instr = instrs[pc]
+        let op = instr[0]
+        if op == "Const" then
+          self.stack = list_push(get(self, "stack"), interp_const(instr[1], instr[2]))
+          self.pc = pc + 1
+        elif op == "Load" then
+          self.stack = list_push(get(self, "stack"), locals_get(get(self, "locals"), instr[1]))
+          self.pc = pc + 1
+        elif op == "Store" then
+          let popped = stack_pop(get(self, "stack"))
+          self.locals = locals_set(get(self, "locals"), instr[1], popped[0])
+          self.stack = popped[1]
+          self.pc = pc + 1
+        elif op == "Bin" then
+          let popped_b = stack_pop(get(self, "stack"))
+          let b = popped_b[0]
+          let popped_a = stack_pop(popped_b[1])
+          let a = popped_a[0]
+          let bin_result = interp_bin(instr[1], a, b)
+          if bin_result[0] == "Err" then
+            self.error_msg = bin_result[1]
+            self.has_error = true
+            self.running = false
+          else
+            self.stack = list_push(popped_a[1], bin_result[1])
+            self.pc = pc + 1
+          end
+        elif op == "Un" then
+          let popped = stack_pop(get(self, "stack"))
+          let un_result = interp_un(instr[1], popped[0])
+          if un_result[0] == "Err" then
+            self.error_msg = un_result[1]
+            self.has_error = true
+            self.running = false
+          else
+            self.stack = list_push(popped[1], un_result[1])
+            self.pc = pc + 1
+          end
+        elif op == "Jump" then
+          self.pc = instr[1]
+        elif op == "JumpIfFalse" then
+          let popped = stack_pop(get(self, "stack"))
+          self.stack = popped[1]
+          if popped[0] then
+            self.pc = pc + 1
+          else
+            self.pc = instr[1]
+          end
+        elif op == "Return" then
+          let stack = get(self, "stack")
+          if stack.length > 0 then
+            self.final_result = stack[stack.length - 1]
+          end
+          self.running = false
+        elif op == "CallHost" then
+          let popped = stack_pop_n(get(self, "stack"), instr[2])
+          let call_result = interp_call_host(instr[1], popped[0])
+          if call_result[0] == "Err" then
+            self.error_msg = call_result[1]
+            self.has_error = true
+            self.running = false
+          else
+            self.stack = list_push(popped[1], call_result[1])
+            self.pc = pc + 1
+          end
+        elif op == "BuildList" then
+          let popped = stack_pop_n(get(self, "stack"), instr[1])
+          self.stack = list_push(popped[1], popped[0])
+          self.pc = pc + 1
+        elif op == "Call" then
+          let popped = stack_pop_n(get(self, "stack"), instr[2])
+          let callee = find_func(get(self, "funcs"), instr[1])
+          if callee == 0 then
+            self.error_msg = "user function '" + instr[1] + "' not found"
+            self.has_error = true
+            self.running = false
+          else
+            let call_result = interp_run_function(get(self, "funcs"), callee, popped[0])
+            if call_result[0] == "Err" then
+              self.error_msg = call_result[1]
+              self.has_error = true
+              self.running = false
+            else
+              self.stack = list_push(popped[1], call_result[1])
+              self.pc = pc + 1
+            end
+          end
+        elif op == "MakeClosure" then
+          let captured_names = instr[2]
+          let popped = stack_pop_n(get(self, "stack"), captured_names.length)
+          self.stack = list_push(popped[1], ["__closure__", instr[1], popped[0]])
+          self.pc = pc + 1
+        elif op == "CallValue" then
+          let popped_args = stack_pop_n(get(self, "stack"), instr[1])
+          let popped_closure = stack_pop(popped_args[1])
+          let closure = popped_closure[0]
+          let func_name = closure[1]
+          let captured_values = closure[2]
+          let all_args = captured_values
+          let k = 0
+          while k < popped_args[0].length do
+            let all_args = list_push(all_args, popped_args[0][k])
+            let k = k + 1
+          end
+          let callee = find_func(get(self, "funcs"), func_name)
+          if callee == 0 then
+            self.error_msg = "closure target function '" + func_name + "' not found"
+            self.has_error = true
+            self.running = false
+          else
+            let call_result = interp_run_function(get(self, "funcs"), callee, all_args)
+            if call_result[0] == "Err" then
+              self.error_msg = call_result[1]
+              self.has_error = true
+              self.running = false
+            else
+              self.stack = list_push(popped_closure[1], call_result[1])
+              self.pc = pc + 1
+            end
+          end
+        else
+          self.error_msg = "'" + op + "' not recognized (not part of the current IR instruction set)"
+          self.has_error = true
+          self.running = false
+        end
+      end
+    end
+    if get(self, "has_error") then
+      return ["Err", get(self, "error_msg")]
+    end
+    return ["Ok", get(self, "final_result")]
+  end
+}
+
+# Unique per-call object-store name -- recursion (a Call/CallValue
+# instruction recursing back into interp_run_function) means many
+# Interpreter instances can be live at once, each its own stack frame;
+# the object store is a single global namespace keyed by this name, so
+# reusing a fixed name across recursive calls would alias and corrupt
+# an outer frame's own live state. Same counter idiom lower.patlang
+# already uses for next_closure_name/next_budgeted_name/next_activate_name.
+make a function called next_interp_name returns name
+  let n = get("__vars", "__interp_seq")
+  if not n then
+    let n = 0
+  end
+  set_var("__interp_seq", n + 1)
+  return "__interp_" + n
+end
+
 make a function called interp_run_function takes funcs, func, arg_values returns result
   let params = func[2]
   let instrs = func[3]
@@ -385,170 +598,11 @@ make a function called interp_run_function takes funcs, func, arg_values returns
     let locals = locals_set(locals, params[pi], arg_values[pi])
     let pi = pi + 1
   end
-  let stack = []
-  let pc = 0
-  let final_result = 0
-  let error_msg = ""
-  let has_error = false
-  let running = true
-  while running do
-    if pc >= instrs.length then
-      let running = false
-    else
-      let instr = instrs[pc]
-      let op = instr[0]
-      if op == "Const" then
-        let stack = list_push(stack, interp_const(instr[1], instr[2]))
-        let pc = pc + 1
-      else
-        if op == "Load" then
-          let stack = list_push(stack, locals_get(locals, instr[1]))
-          let pc = pc + 1
-        else
-          if op == "Store" then
-            let popped = stack_pop(stack)
-            let locals = locals_set(locals, instr[1], popped[0])
-            let stack = popped[1]
-            let pc = pc + 1
-          else
-            if op == "Bin" then
-              let popped_b = stack_pop(stack)
-              let b = popped_b[0]
-              let popped_a = stack_pop(popped_b[1])
-              let a = popped_a[0]
-              let bin_result = interp_bin(instr[1], a, b)
-              if bin_result[0] == "Err" then
-                let error_msg = bin_result[1]
-                let has_error = true
-                let running = false
-              else
-                let stack = list_push(popped_a[1], bin_result[1])
-                let pc = pc + 1
-              end
-            else
-              if op == "Un" then
-                let popped = stack_pop(stack)
-                let un_result = interp_un(instr[1], popped[0])
-                if un_result[0] == "Err" then
-                  let error_msg = un_result[1]
-                  let has_error = true
-                  let running = false
-                else
-                  let stack = list_push(popped[1], un_result[1])
-                  let pc = pc + 1
-                end
-              else
-                if op == "Jump" then
-                  let pc = instr[1]
-                else
-                  if op == "JumpIfFalse" then
-                    let popped = stack_pop(stack)
-                    let stack = popped[1]
-                    if popped[0] then
-                      let pc = pc + 1
-                    else
-                      let pc = instr[1]
-                    end
-                  else
-                    if op == "Return" then
-                      if stack.length > 0 then
-                        let final_result = stack[stack.length - 1]
-                      end
-                      let running = false
-                    else
-                      if op == "CallHost" then
-                        let popped = stack_pop_n(stack, instr[2])
-                        let call_result = interp_call_host(instr[1], popped[0])
-                        if call_result[0] == "Err" then
-                          let error_msg = call_result[1]
-                          let has_error = true
-                          let running = false
-                        else
-                          let stack = list_push(popped[1], call_result[1])
-                          let pc = pc + 1
-                        end
-                      else
-                        if op == "BuildList" then
-                          let popped = stack_pop_n(stack, instr[1])
-                          let stack = list_push(popped[1], popped[0])
-                          let pc = pc + 1
-                        else
-                          if op == "Call" then
-                            let popped = stack_pop_n(stack, instr[2])
-                            let callee = find_func(funcs, instr[1])
-                            if callee == 0 then
-                              let error_msg = "user function '" + instr[1] + "' not found"
-                              let has_error = true
-                              let running = false
-                            else
-                              let call_result = interp_run_function(funcs, callee, popped[0])
-                              if call_result[0] == "Err" then
-                                let error_msg = call_result[1]
-                                let has_error = true
-                                let running = false
-                              else
-                                let stack = list_push(popped[1], call_result[1])
-                                let pc = pc + 1
-                              end
-                            end
-                          else
-                            if op == "MakeClosure" then
-                              let captured_names = instr[2]
-                              let popped = stack_pop_n(stack, captured_names.length)
-                              let stack = list_push(popped[1], ["__closure__", instr[1], popped[0]])
-                              let pc = pc + 1
-                            else
-                              if op == "CallValue" then
-                                let popped_args = stack_pop_n(stack, instr[1])
-                                let popped_closure = stack_pop(popped_args[1])
-                                let closure = popped_closure[0]
-                                let func_name = closure[1]
-                                let captured_values = closure[2]
-                                let all_args = captured_values
-                                let k = 0
-                                while k < popped_args[0].length do
-                                  let all_args = list_push(all_args, popped_args[0][k])
-                                  let k = k + 1
-                                end
-                                let callee = find_func(funcs, func_name)
-                                if callee == 0 then
-                                  let error_msg = "closure target function '" + func_name + "' not found"
-                                  let has_error = true
-                                  let running = false
-                                else
-                                  let call_result = interp_run_function(funcs, callee, all_args)
-                                  if call_result[0] == "Err" then
-                                    let error_msg = call_result[1]
-                                    let has_error = true
-                                    let running = false
-                                  else
-                                    let stack = list_push(popped_closure[1], call_result[1])
-                                    let pc = pc + 1
-                                  end
-                                end
-                              else
-                                let error_msg = "'" + op + "' not recognized (not part of the current IR instruction set)"
-                                let has_error = true
-                                let running = false
-                              end
-                            end
-                          end
-                        end
-                      end
-                    end
-                  end
-                end
-              end
-            end
-          end
-        end
-      end
-    end
-  end
-  if has_error then
-    return ["Err", error_msg]
-  end
-  return ["Ok", final_result]
+  let interp = new("Interpreter", next_interp_name())
+  interp.funcs = funcs
+  interp.instrs = instrs
+  interp.locals = locals
+  return send(interp, "run")
 end
 
 # interpret_ir(ir) -> ["Ok", value] | ["Err", message]. Runs `ir`'s "main"
