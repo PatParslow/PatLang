@@ -1147,7 +1147,36 @@ make a function called rt_list_len takes l returns len
   return mem_peek_qword(addr, 0)
 end
 
+# Real bug found (GitHub incremental-compile-caching plan, self-hosting
+# fixpoint investigation): `s[i]` index syntax ALWAYS lowers to
+# CallHost("list_get", 2) regardless of whether the receiver is a
+# String or a List (see x64_callhost_asm's own header on this, lower.
+# patlang's own doing) -- this function used to unconditionally apply
+# the LIST layout (8-byte-per-element, data starting at offset 16),
+# which is simply the wrong byte offsets for a String (1-byte-per-char,
+# data starting at offset 8). Confirmed directly: `let s = "abc";
+# print(s[1])` printed 256 instead of "b" under --x64 (matches the
+# interpreter exactly for --ir-run/--patc, only --x64 was wrong) --
+# never caught before because nothing in the self-hosted compiler's own
+# internals happened to index into a STRING via `[i]` syntax under
+# --x64 until lib/json.patlang's json_escape (newly exercised by this
+# feature's own content-hashing, not something json.patlang did
+# differently -- it was always broken, just never reached). Fixed by
+# checking the family tag first: a String receiver returns a genuine
+# new one-character tagged String (matching the interpreter's own
+# `s[i]` semantics exactly), a List receiver keeps the original
+# qword-element behavior.
 make a function called rt_list_get takes l, i returns value
+  let family_mask = 17293822569102704640
+  let family = l band family_mask
+  if family == rt_string_tag() then
+    let addr = l band rt_payload_mask()
+    let ch = mem_peek_byte(addr, 8 + i)
+    let out = rt_heap_alloc(9)
+    mem_poke_qword(out, 0, 1)
+    mem_poke_byte(out, 8, ch)
+    return out bor rt_string_tag()
+  end
   let addr = l band rt_payload_mask()
   return mem_peek_qword(addr, 16 + i * 8)
 end

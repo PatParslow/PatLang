@@ -173,10 +173,32 @@ impl Lowerer {
             Stmt::ExprStmt(e) => {
                 if self.expr_is_safe(e) {
                     self.lower_expr(e, f);
+                    // Every function body ends with an explicit Instr::Return
+                    // (pushed at every function-emission site in this file) --
+                    // an ExprStmt's value is NEVER the function's real return
+                    // value, so it must be discarded here. A tree-walking
+                    // interpreter with a heap-allocated Vec<Value> operand
+                    // stack tolerates leaving it (unbounded growth, no crash),
+                    // but a native machine-stack-based backend (the x64
+                    // self-hosted backend) uses the real `rsp` for this same
+                    // operand stack -- capped at ~1MB by the OS -- so a bare
+                    // statement call (e.g. `sb_push(sb, x)` with its result
+                    // never assigned) inside a large loop leaks one stack slot
+                    // per iteration and genuinely overflows the native stack.
+                    // Real bug (GitHub #31): traced via WinDbg to a stack
+                    // overflow in `expand_includes_at_depth`'s ~30,000-line
+                    // loop; confirmed with a minimal repro (a bare `sb_push`
+                    // statement in a 30,000-iteration loop segfaults with
+                    // STATUS_STACK_OVERFLOW under --x64, but not when its
+                    // result is assigned to a `let`). Fixed by discarding via
+                    // StoreLocal into a dedicated, never-read local -- reuses
+                    // the existing Store/StoreLocal instruction everywhere
+                    // (interpreter, native codegen, x64 codegen) rather than
+                    // adding a new IR opcode.
+                    f.body.push(Instr::StoreLocal("__discard".to_string()));
                 } else {
                     // skip unsafe expression statements (unknown identifiers / members)
                 }
-                // leave value on stack (caller may Return at end)
             }
             Stmt::Let { name, value, is_reassignment, mutable } => {
                 self.lower_expr(value, f);
@@ -272,6 +294,7 @@ impl Lowerer {
                 f.body.push(Instr::Const(Value::String((expr_to_text(expr)).into())));
                 self.lower_expr(expr, f);
                 f.body.push(Instr::CallHost("contract_check".into(), 4));
+                f.body.push(Instr::StoreLocal("__discard".to_string()));
             }
             Stmt::RuleDecl { head_pred, head_args, body } => {
                 // Sugar: lowers to exactly the Instr sequence a hand-written
@@ -295,6 +318,7 @@ impl Lowerer {
                 }
                 f.body.push(Instr::BuildList(body.len()));
                 f.body.push(Instr::CallHost("rule_add".into(), 3));
+                f.body.push(Instr::StoreLocal("__discard".to_string()));
             }
             Stmt::MemberAssign { object, property, value } => {
                 // obj.prop = value -- lowers to the same send(obj, "set",
@@ -312,6 +336,10 @@ impl Lowerer {
                 // 4 stack args just pushed: object, "set", property, value.
                 let send_arity = 4;
                 f.body.push(Instr::CallHost("send".into(), send_arity));
+                // Statement-level call result, never consumed -- see the
+                // GitHub #31 fix in the Stmt::ExprStmt arm above for why
+                // this must be discarded rather than left on the stack.
+                f.body.push(Instr::StoreLocal("__discard".to_string()));
             }
             Stmt::GoalDecl { name, deps } => {
                 // Sugar: lowers to exactly the Instr sequence a hand-written
@@ -331,6 +359,7 @@ impl Lowerer {
                 }
                 f.body.push(Instr::BuildList(deps.len()));
                 f.body.push(Instr::CallHost("goal_def".into(), 2));
+                f.body.push(Instr::StoreLocal("__discard".to_string()));
             }
             Stmt::ClassDecl { name, parent, fields, methods, traits } => {
                 // Slice 1+2+3 of the classes/traits/inheritance feature
@@ -372,6 +401,7 @@ impl Lowerer {
                 }
                 f.body.push(Instr::BuildList(traits.len()));
                 f.body.push(Instr::CallHost("class_def".into(), 5));
+                f.body.push(Instr::StoreLocal("__discard".to_string()));
             }
             Stmt::When { event, body, .. } => {
                 self.lower_when(event, body, f);
@@ -441,6 +471,7 @@ impl Lowerer {
         }
         f.body.push(Instr::MakeClosure(func_name, captured_names));
         f.body.push(Instr::CallHost("register_event_handler".into(), 2));
+        f.body.push(Instr::StoreLocal("__discard".to_string()));
     }
 
     fn expr_is_safe(&self, e: &Expr) -> bool {
