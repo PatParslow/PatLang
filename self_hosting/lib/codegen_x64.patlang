@@ -4250,6 +4250,22 @@ make a function called x64_family_code_asm returns asm
   sb_push(sb, "    mov rax, 0" + x64_nl_char())
   sb_push(sb, "    jmp .fc_done_" + suffix + x64_nl_char())
   sb_push(sb, ".fc_notfix_" + suffix + ":" + x64_nl_char())
+  # GitHub #47-adjacent fix: String/List/Closure/Object/BigInt/
+  # Rational/Complex/Interval are ALL real heap pointers, which
+  # rt_heap_alloc never returns as 0 -- so a zero PAYLOAD can never be
+  # one of these 8 tags genuinely, only a coincidental bit-pattern
+  # match (e.g. `1 shl 60` exactly equals the bare BigInt tag with zero
+  # payload, and would otherwise misclassify as "bigint" instead of
+  # "int"). Skip straight past all 8 payload-requiring checks when the
+  # payload is zero -- Bool is the ONE tag below that legitimately has
+  # a zero payload (false), so this jumps to right before that check,
+  # not past it. Same reasoning as the identical fix just added to
+  # print()'s own dispatch in x64_runtime.patlang.
+  sb_push(sb, "    mov r14, rax" + x64_nl_char())
+  sb_push(sb, "    mov r13, 281474976710655" + x64_nl_char())
+  sb_push(sb, "    and r14, r13" + x64_nl_char())
+  sb_push(sb, "    cmp r14, 0" + x64_nl_char())
+  sb_push(sb, "    je .fc_notinterval_" + suffix + x64_nl_char())
   sb_push(sb, "    mov r15, 18446462598732840960" + x64_nl_char())
   sb_push(sb, "    and rax, r15" + x64_nl_char())
   sb_push(sb, "    mov rcx, 2305843009213693952" + x64_nl_char())
@@ -4310,6 +4326,23 @@ make a function called x64_family_code_asm returns asm
   sb_push(sb, "    mov rax, 11" + x64_nl_char())
   sb_push(sb, "    jmp .fc_done_" + suffix + x64_nl_char())
   sb_push(sb, ".fc_notbool_" + suffix + ":" + x64_nl_char())
+  # GitHub #48 follow-up: r14 (the payload, computed once right after
+  # fc_notfix_ and never touched by any comparison branch above -- all
+  # of them use only rax/rcx/r15) distinguishes the two ways execution
+  # can reach here. Zero payload + no tag matched (not even Bool) means
+  # this is a plain, unpromoted value too large for the 48-bit fixnum
+  # window -- exactly the same case print()'s own fallback already
+  # treats as a plain int (GitHub #34's established "safest available
+  # default"), so this now agrees with print() instead of contradicting
+  # it (a value could otherwise print as one thing and type_of() as
+  # something else for the exact same value). A NONZERO payload that
+  # matched none of the 8 real tags is a genuinely unrecognized/corrupt
+  # value -- "other" remains the right answer there, unchanged.
+  sb_push(sb, "    cmp r14, 0" + x64_nl_char())
+  sb_push(sb, "    jne .fc_other_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rax, 0" + x64_nl_char())
+  sb_push(sb, "    jmp .fc_done_" + suffix + x64_nl_char())
+  sb_push(sb, ".fc_other_" + suffix + ":" + x64_nl_char())
   sb_push(sb, "    mov rax, 10" + x64_nl_char())
   sb_push(sb, ".fc_done_" + suffix + ":" + x64_nl_char())
   sb_push(sb, "    push rax" + x64_nl_char())
@@ -6263,6 +6296,30 @@ make a function called x64_func_is_tower_impl takes name returns yes
     return true
   end
   if x64_contains(name, "mem_") then
+    return true
+  end
+  # Real bug found (GitHub #24-adjacent investigation): hash_string's
+  # own FNV-1a loop (`hash bxor b; hash * 1099511628211`) works with a
+  # DELIBERATELY wraparound raw 64-bit accumulator -- the huge
+  # intermediate values it produces were never meant to participate in
+  # the numeric tower at all (a hash digest is not a "number" a user
+  # program does arithmetic ON, it's an opaque bit pattern by design).
+  # Once such a value's magnitude exceeds the 48-bit fixnum window
+  # (which it does almost immediately, since the FNV offset basis
+  # itself is ~1.4e19), this backend's per-function dynamic-dispatch
+  # analysis (added for the fixnum-overflow-to-BigInt fix) treats it as
+  # "not a valid fixnum" -- and since it's ALSO not one of the 5
+  # explicitly-tagged families, it falls into the catch-all "opaque
+  # object" branch, silently returning 0 instead of the real product
+  # (confirmed: `print(hash_string("hello"))` under --x64 crashed
+  # further down the chain; a minimal 2-line repro isolated it to
+  # `h2 * 1099511628211` alone silently giving 0). This is the SAME
+  # class of gap as rt_/mem_'s own exclusion just above -- raw bit
+  # manipulation that must never be promoted -- just under a name that
+  # doesn't match either prefix. Excluded by exact name rather than
+  # broadening the prefix rule, matching this session's own established
+  # "narrow, well-justified exclusion, not a blanket carve-out" stance.
+  if name == "hash_string" then
     return true
   end
   return false
