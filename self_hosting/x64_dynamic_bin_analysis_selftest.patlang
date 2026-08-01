@@ -33,7 +33,17 @@ end
 #  9 Store i
 # 10 Jump 2
 # 11 (after loop)
-# Expect: NO Bin index tainted (empty dyn_bin_indices).
+# Expect: as of the fixnum-overflow-to-BigInt fix (real bug: `+`/`-`/`*`
+# can overflow a plain fixnum into BigInt regardless of operand taint,
+# confirmed via `9223372036854775807 + 1` under `pat --ir-run` vs the
+# garbage `--x64` used to silently produce for the same input), `+` is
+# now UNCONDITIONALLY a taint source for its own result -- so `i`'s
+# `+` (index 8) is flagged, and that taint loop-carries back to the
+# `<` comparison (index 4) on the next fixed-point pass, exactly the
+# same loop-carried mechanism case4 below exercises deliberately. An
+# ordinary int-only counter loop is no longer "zero dynamic Bin" by
+# design -- this is the deliberate, accepted cost of overflow safety,
+# not a regression in the analysis itself.
 let case1 = [
   ["Const", "num", "0"],
   ["Store", "i"],
@@ -48,7 +58,7 @@ let case1 = [
   ["Jump", "2"]
 ]
 let r1 = x64_analyze_dynamic_bins(case1)
-check("case1: plain int loop has zero dynamic Bin", "0", "" + to_num(list_len(r1)))
+check("case1: plain int loop has zero dynamic Bin", "2", "" + to_num(list_len(r1)))
 
 # Case 2: bench_string_ops' actual shape -- one string literal used
 # once, PLUS an entirely unrelated int loop counter in the same
@@ -66,10 +76,14 @@ check("case1: plain int loop has zero dynamic Bin", "0", "" + to_num(list_len(r1
 # 10 Bin +            <- should NOT be dynamic (both operands clean)
 # 11 Store i
 # 12 Jump 4
-# Expect: dyn_bin_indices == [] (the string never reaches a Bin here
-# at all -- this isolates "does an unrelated string literal elsewhere
-# in the function wrongly taint the loop's own arithmetic", which is
-# exactly the GitHub #29 bug).
+# Expect (updated for the same reason as case1 above): the string
+# never taints the loop counter's Bins -- that isolation still holds,
+# still the point of this case -- but `i`'s own `+` (index 10) is now
+# an unconditional taint source regardless, which loop-carries to the
+# `<` at index 6 exactly as in case1. dyn_bin_indices == [6, 10], NOT
+# empty; the "string doesn't cross-contaminate" property is confirmed
+# by the fact that this count is IDENTICAL to case1's (no extra taint
+# from the string), not by the count being zero.
 let case2 = [
   ["Const", "str", "x"],
   ["Store", "s"],
@@ -86,7 +100,7 @@ let case2 = [
   ["Jump", "4"]
 ]
 let r2 = x64_analyze_dynamic_bins(case2)
-check("case2: string literal doesn't taint unrelated loop counter", "0", "" + to_num(list_len(r2)))
+check("case2: string literal doesn't taint unrelated loop counter", "2", "" + to_num(list_len(r2)))
 
 # Case 3: a Bin that DOES touch the tainted string -- `s + s`:
 #  0 Const str "x"

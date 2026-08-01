@@ -502,7 +502,30 @@ make a function called x64_taint_one_pass takes instrs, locals_taint returns res
       let sp = pr1[1]
       let pr2 = x64_vstack_pop(stack, sp)
       let sp = pr2[1]
-      let result_taint = pr1[0] or pr2[0]
+      # Real gap found via direct testing (mirroring pat --ir-run's own
+      # behavior, not inventing new semantics -- confirmed the real
+      # interpreter genuinely auto-promotes `9223372036854775807 + 1`
+      # to a true BigInt, while --x64 silently wrapped/corrupted the
+      # same expression to garbage): +/-/* can ALWAYS overflow a plain
+      # fixnum into BigInt, regardless of whether either OPERAND was
+      # already known non-fixnum -- unlike every other Bin op (==, <,
+      # etc), where a clean-input result genuinely stays clean, the
+      # *arithmetic itself* is the taint source here, not just its
+      # inputs. x64_binop_asm_dynamic already implements the correct
+      # overflow-check-then-promote sequence in full (a fast-path
+      # register-mask test, `jo` on the real op, and a call to the
+      # matching rt_bigint_* function on overflow) -- it just was never
+      # being REACHED for two already-clean fixnum operands, since nothing
+      # upstream ever tainted them. So: unconditionally treat these three
+      # ops as both a dynamic-dispatch SITE and a taint SOURCE for their
+      # own result, rather than only forwarding existing input taint.
+      # This does mean more Bins take the (cheap: one register-mask
+      # check plus a predictable-not-taken branch) dynamic path than
+      # before -- an accepted, deliberate cost for genuine correctness,
+      # not a "test on every access" tax (only arithmetic operations
+      # themselves pay it, not every subsequent load/use of a value).
+      let op_can_overflow = (instr[1] == "+") or (instr[1] == "-") or (instr[1] == "*")
+      let result_taint = pr1[0] or pr2[0] or op_can_overflow
       if result_taint then
         let dyn_bin_indices = list_push(dyn_bin_indices, i)
       end
@@ -1183,15 +1206,32 @@ make a function called x64_binop_asm_div_dynamic takes spilled returns asm
   let sb = sb_new()
   sb_push(sb, "    pop qword [rbp-" + dyn_b + "]" + x64_nl_char())
   sb_push(sb, "    pop qword [rbp-" + dyn_a + "]" + x64_nl_char())
-  sb_push(sb, "    mov r15, 18446462598732840960" + x64_nl_char())
+  # Same class of bug fixed in x64_binop_asm_mod_dynamic just above (see
+  # its own header comment): "top-16-bits-all-zero" wrongly excludes
+  # genuine negative fixnums from the fast path (sign extension sets
+  # those bits legitimately too), routing them into DIV_SLOW's Rational
+  # promotion instead -- confirmed via `acc / 2` inside a loop that also
+  # does `acc - 1` producing garbled output (`0000000001` instead of a
+  # plain int). Fixed to the same round-trip-through-48-bit-sign-
+  # extension test used throughout this file.
   sb_push(sb, "    mov rax, [rbp-" + dyn_a + "]" + x64_nl_char())
-  sb_push(sb, "    and rax, r15" + x64_nl_char())
-  sb_push(sb, "    mov r10, [rbp-" + dyn_b + "]" + x64_nl_char())
-  sb_push(sb, "    and r10, r15" + x64_nl_char())
   sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+  sb_push(sb, "    je .DIV_FAMOK1_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rcx, rax" + x64_nl_char())
+  sb_push(sb, "    shl rcx, 16" + x64_nl_char())
+  sb_push(sb, "    sar rcx, 16" + x64_nl_char())
+  sb_push(sb, "    cmp rcx, rax" + x64_nl_char())
   sb_push(sb, "    jne .DIV_SLOW_" + suffix + x64_nl_char())
+  sb_push(sb, ".DIV_FAMOK1_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov r10, [rbp-" + dyn_b + "]" + x64_nl_char())
   sb_push(sb, "    cmp r10, 0" + x64_nl_char())
+  sb_push(sb, "    je .DIV_FAMOK2_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rcx, r10" + x64_nl_char())
+  sb_push(sb, "    shl rcx, 16" + x64_nl_char())
+  sb_push(sb, "    sar rcx, 16" + x64_nl_char())
+  sb_push(sb, "    cmp rcx, r10" + x64_nl_char())
   sb_push(sb, "    jne .DIV_SLOW_" + suffix + x64_nl_char())
+  sb_push(sb, ".DIV_FAMOK2_" + suffix + ":" + x64_nl_char())
   sb_push(sb, "    mov rax, [rbp-" + dyn_a + "]" + x64_nl_char())
   sb_push(sb, "    shl rax, 16" + x64_nl_char())
   sb_push(sb, "    sar rax, 16" + x64_nl_char())
@@ -1202,8 +1242,9 @@ make a function called x64_binop_asm_div_dynamic takes spilled returns asm
   sb_push(sb, "    idiv r10" + x64_nl_char())
   sb_push(sb, "    cmp rdx, 0" + x64_nl_char())
   sb_push(sb, "    jne .DIV_INEXACT_" + suffix + x64_nl_char())
-  sb_push(sb, "    mov r15, 281474976710655" + x64_nl_char())
-  sb_push(sb, "    and rax, r15" + x64_nl_char())
+  # Same masking bug as the mod path: `and rax, PAYLOAD_MASK` strips
+  # sign-extension off a NEGATIVE exact quotient. rax is already the
+  # correctly sign-extended plain-int result, no masking needed.
   sb_push(sb, "    jmp .DIV_DONE_" + suffix + x64_nl_char())
   sb_push(sb, ".DIV_INEXACT_" + suffix + ":" + x64_nl_char())
   sb_push(sb, "    mov rax, [rbp-" + dyn_a + "]" + x64_nl_char())
@@ -1253,15 +1294,38 @@ make a function called x64_binop_asm_mod_dynamic takes spilled returns asm
   let sb = sb_new()
   sb_push(sb, "    pop qword [rbp-" + dyn_b + "]" + x64_nl_char())
   sb_push(sb, "    pop qword [rbp-" + dyn_a + "]" + x64_nl_char())
-  sb_push(sb, "    mov r15, 18446462598732840960" + x64_nl_char())
+  # Real bug found (exposed once the fixnum-overflow-to-BigInt fix made
+  # an ordinary int loop's own `+`/`-`/`*` unconditional taint sources,
+  # routing a ONCE-dormant plain `acc % N` through this dynamic path for
+  # the first time on real programs): this used to test "is this operand
+  # a plausible fixnum" via `top-16-bits-all-zero`, which is WRONG for a
+  # genuine NEGATIVE fixnum (sign extension legitimately sets those bits
+  # too) -- any negative intermediate value (e.g. `0 - 1`) wrongly fell
+  # to `.MOD_UNSUPPORTED_`'s `os_exit(97)` trap, exhausting nothing but
+  # exiting hard on perfectly ordinary arithmetic. Fixed to the SAME
+  # "does it round-trip through a real 48-bit sign extension" test
+  # `x64_binop_asm_dynamic`'s own NOTFAST branch already uses -- true for
+  # a genuine fixnum (positive or negative), false only for an actually-
+  # tagged (BigInt/Rational/...) value, which is the real "unsupported"
+  # case this trap is meant to catch.
   sb_push(sb, "    mov rax, [rbp-" + dyn_a + "]" + x64_nl_char())
-  sb_push(sb, "    and rax, r15" + x64_nl_char())
-  sb_push(sb, "    mov r10, [rbp-" + dyn_b + "]" + x64_nl_char())
-  sb_push(sb, "    and r10, r15" + x64_nl_char())
   sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+  sb_push(sb, "    je .MOD_FAMOK1_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rcx, rax" + x64_nl_char())
+  sb_push(sb, "    shl rcx, 16" + x64_nl_char())
+  sb_push(sb, "    sar rcx, 16" + x64_nl_char())
+  sb_push(sb, "    cmp rcx, rax" + x64_nl_char())
   sb_push(sb, "    jne .MOD_UNSUPPORTED_" + suffix + x64_nl_char())
+  sb_push(sb, ".MOD_FAMOK1_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov r10, [rbp-" + dyn_b + "]" + x64_nl_char())
   sb_push(sb, "    cmp r10, 0" + x64_nl_char())
+  sb_push(sb, "    je .MOD_FAMOK2_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rcx, r10" + x64_nl_char())
+  sb_push(sb, "    shl rcx, 16" + x64_nl_char())
+  sb_push(sb, "    sar rcx, 16" + x64_nl_char())
+  sb_push(sb, "    cmp rcx, r10" + x64_nl_char())
   sb_push(sb, "    jne .MOD_UNSUPPORTED_" + suffix + x64_nl_char())
+  sb_push(sb, ".MOD_FAMOK2_" + suffix + ":" + x64_nl_char())
   sb_push(sb, "    mov rax, [rbp-" + dyn_a + "]" + x64_nl_char())
   sb_push(sb, "    shl rax, 16" + x64_nl_char())
   sb_push(sb, "    sar rax, 16" + x64_nl_char())
@@ -1270,9 +1334,14 @@ make a function called x64_binop_asm_mod_dynamic takes spilled returns asm
   sb_push(sb, "    sar r10, 16" + x64_nl_char())
   sb_push(sb, "    cqo" + x64_nl_char())
   sb_push(sb, "    idiv r10" + x64_nl_char())
+  # Same class of bug as the +/-/* masking fix documented above (in
+  # x64_binop_asm_dynamic): this used to `and rdx, PAYLOAD_MASK` here,
+  # which strips the sign-extension bits off a NEGATIVE remainder
+  # (idiv's remainder can be negative for a negative dividend) --
+  # correct for tagging a real heap address, wrong for a plain signed
+  # int result. rdx is already the correctly sign-extended remainder,
+  # no masking needed.
   sb_push(sb, "    mov rax, rdx" + x64_nl_char())
-  sb_push(sb, "    mov r15, 281474976710655" + x64_nl_char())
-  sb_push(sb, "    and rax, r15" + x64_nl_char())
   sb_push(sb, "    jmp .MOD_DONE_" + suffix + x64_nl_char())
   sb_push(sb, ".MOD_UNSUPPORTED_" + suffix + ":" + x64_nl_char())
   sb_push(sb, "    mov rcx, 97" + x64_nl_char())
@@ -1472,6 +1541,79 @@ make a function called x64_binop_asm_dynamic takes op, spilled returns asm
   sb_push(sb, "    cmp r10, rcx" + x64_nl_char())
   sb_push(sb, "    jne .DYN_OBJ_" + suffix + x64_nl_char())
   sb_push(sb, ".DYN_FAMOK2_" + suffix + ":" + x64_nl_char())
+  # Real bug found (exposed by the fixnum-overflow-to-BigInt fix, once
+  # ordinary arithmetic inside an int-only loop first started reaching
+  # this dynamic dispatch at all): reaching here only proves BOTH
+  # operands are "numeric-compatible" -- EITHER a genuine fixnum
+  # (positive or negative, confirmed via the round-trip test just
+  # above) OR an actual Numeric-family-tagged value (BigInt/Rational/
+  # Complex/Interval). The code below never distinguished those two
+  # cases -- it always fell through Interval/Complex/Rational to the
+  # generic "promote both via rt_bigint_from_i64, call rt_bigint_*"
+  # path, even when BOTH operands were plain fixnums that merely failed
+  # the cheap top-16-bits fast-path check for being negative. Confirmed
+  # exactly: `-1 * 2` inside a dynamic-mode function called
+  # rt_bigint_from_i64 on a perfectly ordinary -1, producing a REAL
+  # heap-allocated BigInt for what should have stayed a plain int
+  # (`numeric_kind` reported "bigint" for a value that was still
+  # numerically correct, `-2`, since rt_bigint_mul computes the right
+  # answer -- just via the wrong, permanently-heap-tagged
+  # representation, which then made every later dynamic-dispatched op
+  # on it also take slow/wrong paths, e.g. `%`'s deliberate
+  # BigInt-unsupported trap). Fixed: check each operand's FAMILY
+  # NIBBLE explicitly here -- if NEITHER operand is actually tagged
+  # Numeric-family (both are plain fixnums, family 0), jump straight to
+  # a redo of the ordinary ONE-FAST-PATH arithmetic (same imul/add/sub
+  # + overflow-check sequence as the top of this function), instead of
+  # ever reaching the promotion chain below.
+  # A NEGATIVE fixnum's family nibble reads as 0xF (sign extension), NOT
+  # 0 -- "is the masked nibble nonzero" is the WRONG test (it was the
+  # exact mistake this whole fix is undoing at a different layer); the
+  # right test is "does the nibble equal EXACTLY the Numeric family
+  # (0x1)", which only a genuinely-tagged BigInt/Rational/Complex/
+  # Interval value satisfies (they all share nibble=1, per
+  # x64_family_code_asm's own bigint_tag/rational_tag/etc constants).
+  sb_push(sb, "    mov r15, 17293822569102704640" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rbp-" + dyn_a + "]" + x64_nl_char())
+  sb_push(sb, "    and rax, r15" + x64_nl_char())
+  sb_push(sb, "    mov r10, [rbp-" + dyn_b + "]" + x64_nl_char())
+  sb_push(sb, "    and r10, r15" + x64_nl_char())
+  sb_push(sb, "    mov rcx, 1152921504606846976" + x64_nl_char())
+  sb_push(sb, "    cmp rax, rcx" + x64_nl_char())
+  sb_push(sb, "    je .DYN_HASTAG_" + suffix + x64_nl_char())
+  sb_push(sb, "    cmp r10, rcx" + x64_nl_char())
+  sb_push(sb, "    je .DYN_HASTAG_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rax, [rbp-" + dyn_a + "]" + x64_nl_char())
+  sb_push(sb, "    shl rax, 16" + x64_nl_char())
+  sb_push(sb, "    sar rax, 16" + x64_nl_char())
+  sb_push(sb, "    mov r10, [rbp-" + dyn_b + "]" + x64_nl_char())
+  sb_push(sb, "    shl r10, 16" + x64_nl_char())
+  sb_push(sb, "    sar r10, 16" + x64_nl_char())
+  if x64_is_dynamic_cmp_op(op) then
+    sb_push(sb, "    cmp rax, r10" + x64_nl_char())
+    sb_push(sb, "    " + x64_setcc_for_op(op) + " al" + x64_nl_char())
+    sb_push(sb, "    movzx rax, al" + x64_nl_char())
+    sb_push(sb, "    jmp .DYN_DONE_" + suffix + x64_nl_char())
+  else
+    if op == "*" then
+      sb_push(sb, "    imul r10" + x64_nl_char())
+      sb_push(sb, "    jo .DYN_OVERFLOW_" + suffix + x64_nl_char())
+    else
+      if op == "+" then
+        sb_push(sb, "    add rax, r10" + x64_nl_char())
+      else
+        sb_push(sb, "    sub rax, r10" + x64_nl_char())
+      end
+    end
+    sb_push(sb, "    mov rcx, rax" + x64_nl_char())
+    sb_push(sb, "    shl rcx, 16" + x64_nl_char())
+    sb_push(sb, "    sar rcx, 16" + x64_nl_char())
+    sb_push(sb, "    cmp rcx, rax" + x64_nl_char())
+    sb_push(sb, "    jne .DYN_OVERFLOW_" + suffix + x64_nl_char())
+    sb_push(sb, "    mov rax, rcx" + x64_nl_char())
+    sb_push(sb, "    jmp .DYN_DONE_" + suffix + x64_nl_char())
+  end
+  sb_push(sb, ".DYN_HASTAG_" + suffix + ":" + x64_nl_char())
   sb_push(sb, "    mov r15, 18446462598732840960" + x64_nl_char())
   sb_push(sb, "    mov rax, [rbp-" + dyn_a + "]" + x64_nl_char())
   sb_push(sb, "    and rax, r15" + x64_nl_char())
@@ -4923,6 +5065,13 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
   # analysis entirely and gets dyn_bin_indices=[] for free, matching
   # today's fast path for the common all-int case at no extra compile
   # cost.
+  # GitHub #29: per-instruction, not whole-function, dynamic dispatch --
+  # see x64_analyze_dynamic_bins's own header comment. A function with
+  # zero string/tower/arithmetic content anywhere (dynamic_mode false)
+  # skips the analysis entirely and gets dyn_bin_indices=[] for free,
+  # matching today's fast path for the common all-int case at no extra
+  # compile cost. (x64_func_is_dynamic itself now also covers "contains
+  # a +/-/* anywhere" -- see its own header for why.)
   let dyn_bin_indices = []
   if dynamic_mode then
     let dyn_bin_indices = x64_analyze_dynamic_bins(instrs)
@@ -5285,16 +5434,25 @@ end
 # ordinary Bin arithmetic, so they must never be classified dynamic
 # regardless of what they call.
 make a function called x64_func_is_tower_impl takes name returns yes
-  if x64_contains(name, "rt_bigint_") then
+  # Broadened after a real crash was root-caused: rt_payload_mask()'s own
+  # body computes `(1 shl 48) - 1` -- but `1 shl 48` (0x1000000000000000)
+  # is bit-for-bit the BigInt family tag with a zero payload. Once the
+  # arithmetic-implies-dynamic rule (added for the fixnum-overflow fix)
+  # started sweeping in rt_payload_mask (its name matched none of the
+  # four substrings below), that "-" got compiled through the tag-aware
+  # dynamic dispatch, whose fast-path check reads the tag-shaped
+  # intermediate value as "not a plausible fixnum" and takes the
+  # (wrong, for this case) promotion path -- corrupting the runtime's
+  # own mask constant, and through it every family-tag check downstream.
+  # ALL of x64_runtime.patlang's own functions (the "rt_"/"mem_" naming
+  # convention it uses throughout) work with raw, untagged bits/addresses
+  # by design -- none of them should ever have user-level numeric-tower
+  # promotion semantics applied to their own internal arithmetic, so the
+  # whole prefix is excluded now, not just the bigint/rational subset.
+  if x64_contains(name, "rt_") then
     return true
   end
-  if x64_contains(name, "rt_rational_") then
-    return true
-  end
-  if name == "rt_gcd" then
-    return true
-  end
-  if name == "rt_fixnum_unpack" then
+  if x64_contains(name, "mem_") then
     return true
   end
   return false
@@ -5379,6 +5537,30 @@ make a function called x64_func_is_dynamic takes func returns yes
     # heuristics.)
     if instr[0] == "Const" then
       if instr[1] == "str" then
+        return true
+      end
+    end
+    # Integer-overflow-to-BigInt fix, mirroring pat --ir-run's own
+    # behavior (confirmed directly: `9223372036854775807 + 1` silently
+    # produced garbage under --x64 while the real interpreter correctly
+    # auto-promotes to a genuine BigInt) -- plain "+"/"-"/"*" can ALWAYS
+    # overflow a fixnum, regardless of whether the function otherwise
+    # looks dynamic, so any function containing one needs the per-
+    # instruction analysis below to run (x64_analyze_dynamic_bins's own
+    # taint rule then routes just those specific Bin ops through the
+    # already-correct overflow-check-and-promote dynamic dispatch --
+    # see its own header). The x64_func_is_tower_impl exclusion at the
+    # top of this function already protects rt_bigint_add and friends
+    # (which use plain "+"/"-"/"*" on raw limbs internally and must
+    # never recursively dynamic-dispatch on themselves) from this.
+    if instr[0] == "Bin" then
+      if instr[1] == "+" then
+        return true
+      end
+      if instr[1] == "-" then
+        return true
+      end
+      if instr[1] == "*" then
         return true
       end
     end
