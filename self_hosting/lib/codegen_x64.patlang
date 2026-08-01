@@ -637,6 +637,392 @@ make a function called x64_analyze_dynamic_bins takes instrs returns dyn_bin_ind
   return dyn_bin_indices
 end
 
+# GitHub #37: replaces the old whole-FUNCTION float_mode boolean
+# (x64_func_is_float) with genuine per-INSTRUCTION classification, the
+# same architectural move already made for BigInt dynamic-dispatch
+# (#29) and reusing the identical taint-analysis machinery
+# (x64_vstack_push/pop, x64_taint_get/set, x64_taint_maps_equal) --
+# see x64_analyze_dynamic_bins's own header for the established
+# pattern this mirrors.
+#
+# THE BUG THIS FIXES: mixing a bare float literal with a bare int
+# literal (or plain-int arithmetic) in the SAME function silently
+# corrupted the int value whenever it crossed a call boundary --
+# confirmed directly: `let places = 0; let places = places + 10;
+# run(sqrt(2.0), places)` produced garbage, because the WHOLE
+# function was classified float_mode purely for containing
+# `sqrt(2.0)`, and `x64_binop_asm_float` was blindly applied to
+# `places + 10` too, treating both raw ints as SSE2 float bit
+# patterns. #18's own `x64_call_arg_int_overrides` only rescued a
+# bare literal used DIRECTLY as a Call argument -- it couldn't help
+# an arithmetic expression like `places + 10`, since THAT requires
+# the Bin instruction ITSELF to be classified correctly, not just the
+# literal's encoding.
+#
+# TWO-STAGE DESIGN:
+# Stage 1 (x64_taint_one_pass_float/x64_analyze_float_bins) computes,
+# via the SAME fixed-point forward taint propagation as the BigInt
+# pass, which specific Bin/Un instructions actually combine a
+# known-float value (a dotted literal, or the result of a known
+# float-returning call) -- NOT "does this function contain a float
+# literal ANYWHERE" but "does THIS SPECIFIC instruction's own operand
+# chain ever touch one". A local variable's own taint is the OR of
+# every value ever Stored into it (monotonic, loop-carried, identical
+# reasoning to the BigInt pass's Store handling) -- `places` above is
+# NEVER assigned from a float-tainted value anywhere, so its `+ 10`
+# correctly stays plain-int arithmetic even though `sqrt(2.0)` lives
+# in the same function.
+#
+# Stage 2 (x64_analyze_float_consts) answers the complementary
+# question stage 1 can't: which specific bare, DOTLESS "Const num"
+# instructions must be RE-ENCODED as a float bit pattern (rather than
+# a plain int), because their own value is later consumed by an
+# instruction stage 1 proved float. This needs its own pass (not just
+# stage 1's forward taint) because a Const's own encoding decision
+# depends on FUTURE use, not just its own literal text -- e.g. in
+# `sqrt(2.0) + 5`, the bare `5` must be encoded as 5.0's bit pattern
+# the moment it's pushed, which stage 1 alone can't tell it (stage 1
+# only determines the RESULT of combining it is float, not that the
+# literal itself needs re-encoding before that combination happens).
+# Scoped to the two realistic patterns this session's own bugs
+# actually hit: (a) a bare literal used DIRECTLY as one operand of a
+# Bin/Un stage 1 already proved float, and (b) a bare literal
+# immediately preceding a `Store x` where x's OWN final taint (from
+# stage 1) is float -- i.e. `let x = 5` followed eventually by `x`
+# meeting a real float somewhere. Does NOT trace origin through
+# arbitrary multi-hop chains (`let x = 5; let y = x; y + 2.0` doesn't
+# need it: y has no literal of its own to mark, and x's OWN Store
+# already gets caught by rule (b) since x's final taint is float
+# regardless of how far downstream that gets discovered) -- covers
+# the common, realistic cases without a full general-dataflow origin
+# tracker, matching this file's own established "named scope limit,
+# not an oversight" convention.
+make a function called x64_float_producing_host_names returns names
+  return ["sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "log", "exp", "pow", "fabs"]
+end
+
+make a function called x64_taint_one_pass_float takes instrs, locals_taint, float_func_names returns result
+  let n = to_num(list_len(instrs))
+  let stack = []
+  let sp = 0
+  let map = locals_taint
+  let float_instr_indices = []
+  let produces_float = []
+  let bailed = false
+  let i = 0
+  while i < n do
+    let produces_float = list_push(produces_float, false)
+    let i = i + 1
+  end
+  let i = 0
+  while (i < n) and (not bailed) do
+    let instr = instrs[i]
+    let ty = instr[0]
+    if ty == "Const" then
+      let tainted = false
+      if instr[1] == "num" then
+        let tainted = x64_contains(instr[2], ".")
+      end
+      let produces_float = list_set(produces_float, i, tainted)
+      let pr = x64_vstack_push(stack, sp, tainted)
+      let stack = pr[0]
+      let sp = pr[1]
+    elif ty == "Load" then
+      let tainted = x64_taint_get(map, instr[1])
+      let produces_float = list_set(produces_float, i, tainted)
+      let pr = x64_vstack_push(stack, sp, tainted)
+      let stack = pr[0]
+      let sp = pr[1]
+    elif ty == "Store" then
+      let pr = x64_vstack_pop(stack, sp)
+      let sp = pr[1]
+      let map = x64_taint_set(map, instr[1], x64_taint_get(map, instr[1]) or pr[0])
+    elif ty == "Bin" then
+      let pr1 = x64_vstack_pop(stack, sp)
+      let sp = pr1[1]
+      let pr2 = x64_vstack_pop(stack, sp)
+      let sp = pr2[1]
+      let result_taint = pr1[0] or pr2[0]
+      if result_taint then
+        let float_instr_indices = list_push(float_instr_indices, i)
+      end
+      let produces_float = list_set(produces_float, i, result_taint)
+      let pr3 = x64_vstack_push(stack, sp, result_taint)
+      let stack = pr3[0]
+      let sp = pr3[1]
+    elif ty == "Un" then
+      let pr = x64_vstack_pop(stack, sp)
+      let sp = pr[1]
+      if pr[0] then
+        let float_instr_indices = list_push(float_instr_indices, i)
+      end
+      let produces_float = list_set(produces_float, i, pr[0])
+      let pr2 = x64_vstack_push(stack, sp, pr[0])
+      let stack = pr2[0]
+      let sp = pr2[1]
+    elif ty == "Jump" then
+      let sp = sp
+    elif ty == "JumpIfFalse" then
+      let pr = x64_vstack_pop(stack, sp)
+      let sp = pr[1]
+    elif ty == "Return" then
+      let pr = x64_vstack_pop(stack, sp)
+      let sp = pr[1]
+    elif ty == "CallHost" then
+      let argc = to_num(instr[2])
+      let last_arg_taint = false
+      let k = 0
+      while k < argc do
+        let pr = x64_vstack_pop(stack, sp)
+        let sp = pr[1]
+        let last_arg_taint = pr[0]
+        let k = k + 1
+      end
+      # abs/ceil/round/trunc are runtime-adaptive (x64_abs_asm/
+      # x64_roundlike_asm both check the ACTUAL value at runtime: an
+      # int argument passes through unchanged, only a genuine float
+      # gets the real float instruction) -- their result classification
+      # must follow their OWN argument's taint, not a fixed answer.
+      # Real bug found testing this fix: hardcoding these as
+      # "always float" broke x64_math_abs_int_selftest's whole point
+      # (abs of a plain int argument, which must stay plain int).
+      let is_float_result = last_arg_taint
+      if instr[1] != "abs" then
+        if instr[1] != "ceil" then
+          if instr[1] != "round" then
+            if instr[1] != "trunc" then
+              let is_float_result = x64_str_in_list(x64_float_producing_host_names(), instr[1])
+            end
+          end
+        end
+      end
+      let produces_float = list_set(produces_float, i, is_float_result)
+      let pr2 = x64_vstack_push(stack, sp, is_float_result)
+      let stack = pr2[0]
+      let sp = pr2[1]
+    elif ty == "Call" then
+      let argc = to_num(instr[2])
+      let k = 0
+      while k < argc do
+        let pr = x64_vstack_pop(stack, sp)
+        let sp = pr[1]
+        let k = k + 1
+      end
+      let is_float_result = x64_str_in_list(float_func_names, instr[1])
+      let produces_float = list_set(produces_float, i, is_float_result)
+      let pr2 = x64_vstack_push(stack, sp, is_float_result)
+      let stack = pr2[0]
+      let sp = pr2[1]
+    elif ty == "BuildList" then
+      let argc = to_num(instr[1])
+      let k = 0
+      while k < argc do
+        let pr = x64_vstack_pop(stack, sp)
+        let sp = pr[1]
+        let k = k + 1
+      end
+      let pr2 = x64_vstack_push(stack, sp, false)
+      let stack = pr2[0]
+      let sp = pr2[1]
+    elif ty == "MakeClosure" then
+      let argc = to_num(list_len(instr[2]))
+      let k = 0
+      while k < argc do
+        let pr = x64_vstack_pop(stack, sp)
+        let sp = pr[1]
+        let k = k + 1
+      end
+      let pr2 = x64_vstack_push(stack, sp, false)
+      let stack = pr2[0]
+      let sp = pr2[1]
+    elif ty == "CallValue" then
+      let argc = to_num(instr[1]) + 1
+      let k = 0
+      while k < argc do
+        let pr = x64_vstack_pop(stack, sp)
+        let sp = pr[1]
+        let k = k + 1
+      end
+      let pr2 = x64_vstack_push(stack, sp, false)
+      let stack = pr2[0]
+      let sp = pr2[1]
+    else
+      let bailed = true
+    end
+    let i = i + 1
+  end
+  return [map, float_instr_indices, produces_float, bailed]
+end
+
+# Stage 1 wrapper (fixed-point loop), mirroring x64_analyze_dynamic_bins
+# exactly. On bail (an instruction type this pass doesn't recognize --
+# should be rare), falls back to the OLD whole-function behavior
+# (every Bin/Un floats, matching legacy x64_func_is_float semantics)
+# rather than silently under-classifying.
+make a function called x64_analyze_float_bins takes instrs, float_func_names returns result
+  let n = to_num(list_len(instrs))
+  let max_passes = n + 10
+  let map = []
+  let float_instr_indices = []
+  let produces_float = []
+  let pass = 0
+  let bailed = false
+  let stable = false
+  while (pass < max_passes) and (not stable) and (not bailed) do
+    let result = x64_taint_one_pass_float(instrs, map, float_func_names)
+    let new_map = result[0]
+    let float_instr_indices = result[1]
+    let produces_float = result[2]
+    let bailed = result[3]
+    if x64_taint_maps_equal(map, new_map) then
+      let stable = true
+    end
+    let map = new_map
+    let pass = pass + 1
+  end
+  if bailed then
+    let float_instr_indices = x64_all_bin_indices(instrs)
+    let produces_float = []
+    let i = 0
+    while i < n do
+      let produces_float = list_push(produces_float, true)
+      let i = i + 1
+    end
+  end
+  return [float_instr_indices, produces_float, map]
+end
+
+# Stage 2: which bare dotless "Const num" instructions must be
+# re-encoded as a float bit pattern. See this section's own header
+# comment above for the two rules implemented (direct Bin/Un operand;
+# immediately-preceding a Store into an eventually-float local).
+make a function called x64_analyze_float_consts takes instrs, final_map, float_instr_indices returns float_const_indices
+  let n = to_num(list_len(instrs))
+  let out = []
+  let stack = []
+  let sp = 0
+  let i = 0
+  while i < n do
+    let instr = instrs[i]
+    let ty = instr[0]
+    if ty == "Const" then
+      let origin = 0 - 1
+      if instr[1] == "num" then
+        if not x64_contains(instr[2], ".") then
+          let origin = i
+        end
+      end
+      let pr = x64_vstack_push(stack, sp, origin)
+      let stack = pr[0]
+      let sp = pr[1]
+    elif ty == "Load" then
+      let pr = x64_vstack_push(stack, sp, 0 - 1)
+      let stack = pr[0]
+      let sp = pr[1]
+    elif ty == "Store" then
+      let pr = x64_vstack_pop(stack, sp)
+      let sp = pr[1]
+      if pr[0] >= 0 then
+        if x64_taint_get(final_map, instr[1]) then
+          let out = list_push(out, pr[0])
+        end
+      end
+    elif ty == "Bin" then
+      let pr1 = x64_vstack_pop(stack, sp)
+      let sp = pr1[1]
+      let pr2 = x64_vstack_pop(stack, sp)
+      let sp = pr2[1]
+      if x64_str_in_list(float_instr_indices, i) then
+        if pr1[0] >= 0 then
+          let out = list_push(out, pr1[0])
+        end
+        if pr2[0] >= 0 then
+          let out = list_push(out, pr2[0])
+        end
+      end
+      let pr3 = x64_vstack_push(stack, sp, 0 - 1)
+      let stack = pr3[0]
+      let sp = pr3[1]
+    elif ty == "Un" then
+      let pr = x64_vstack_pop(stack, sp)
+      let sp = pr[1]
+      if x64_str_in_list(float_instr_indices, i) then
+        if pr[0] >= 0 then
+          let out = list_push(out, pr[0])
+        end
+      end
+      let pr2 = x64_vstack_push(stack, sp, 0 - 1)
+      let stack = pr2[0]
+      let sp = pr2[1]
+    elif ty == "Jump" then
+      let sp = sp
+    elif ty == "JumpIfFalse" then
+      let pr = x64_vstack_pop(stack, sp)
+      let sp = pr[1]
+    elif ty == "Return" then
+      let pr = x64_vstack_pop(stack, sp)
+      let sp = pr[1]
+    elif ty == "CallHost" then
+      let argc = to_num(instr[2])
+      let k = 0
+      while k < argc do
+        let pr = x64_vstack_pop(stack, sp)
+        let sp = pr[1]
+        let k = k + 1
+      end
+      let pr2 = x64_vstack_push(stack, sp, 0 - 1)
+      let stack = pr2[0]
+      let sp = pr2[1]
+    elif ty == "Call" then
+      let argc = to_num(instr[2])
+      let k = 0
+      while k < argc do
+        let pr = x64_vstack_pop(stack, sp)
+        let sp = pr[1]
+        let k = k + 1
+      end
+      let pr2 = x64_vstack_push(stack, sp, 0 - 1)
+      let stack = pr2[0]
+      let sp = pr2[1]
+    elif ty == "BuildList" then
+      let argc = to_num(instr[1])
+      let k = 0
+      while k < argc do
+        let pr = x64_vstack_pop(stack, sp)
+        let sp = pr[1]
+        let k = k + 1
+      end
+      let pr2 = x64_vstack_push(stack, sp, 0 - 1)
+      let stack = pr2[0]
+      let sp = pr2[1]
+    elif ty == "MakeClosure" then
+      let argc = to_num(list_len(instr[2]))
+      let k = 0
+      while k < argc do
+        let pr = x64_vstack_pop(stack, sp)
+        let sp = pr[1]
+        let k = k + 1
+      end
+      let pr2 = x64_vstack_push(stack, sp, 0 - 1)
+      let stack = pr2[0]
+      let sp = pr2[1]
+    elif ty == "CallValue" then
+      let argc = to_num(instr[1]) + 1
+      let k = 0
+      while k < argc do
+        let pr = x64_vstack_pop(stack, sp)
+        let sp = pr[1]
+        let k = k + 1
+      end
+      let pr2 = x64_vstack_push(stack, sp, 0 - 1)
+      let stack = pr2[0]
+      let sp = pr2[1]
+    end
+    let i = i + 1
+  end
+  return out
+end
+
 make a function called x64_instr_is_call_boundary takes instr, idx, dyn_bin_indices returns is_call
   let ty = instr[0]
   if ty == "Call" then
@@ -4707,7 +5093,7 @@ make a function called label_asm_safe takes ignored returns label
   return "" + n
 end
 
-make a function called x64_emit_instr takes instr, func_name, regmap, spilled, label, float_mode, is_dynamic_bin, int_override, bool_print_override, float_print_override returns asm
+make a function called x64_emit_instr takes instr, func_name, regmap, spilled, label, is_float_bin, is_float_const, is_dynamic_bin, bool_print_override, float_print_override returns asm
   let sb = sb_new()
   sb_push(sb, label + ":" + x64_nl_char())
   let ty = instr[0]
@@ -4728,41 +5114,20 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
         sb_push(sb, "    or rax, rcx" + x64_nl_char())
         sb_push(sb, "    push rax" + x64_nl_char())
       else
-        if float_mode then
-          # Real bug found (and only partially fixable here) while
-          # testing closures alongside floats: this per-FUNCTION float/
-          # int either-or classification (see x64_func_is_float's own
-          # header) means a bare integer literal like a plain `5` passed
-          # as a Call argument gets encoded as the FLOAT bit pattern for
-          # 5.0 whenever it shares a function with any unrelated float
-          # literal -- e.g. `print(apply_twice(double, 5))` sitting next
-          # to an unrelated `let z = 1.5` in the same top-level script.
-          # x64_float_literal_text (below) keeps this from hard-crashing
-          # NASM, but the RESULT is silently wrong once that mis-typed
-          # value reaches a plain-int function/closure: confirmed by
-          # hand -- 5.0's bit pattern (4617315517961601024), doubled
-          # twice by `double`'s genuine integer `imul`, wraps mod 2^64
-          # to exactly 22517998136852480, the garbage this file's own
-          # commit history first observed. No real fix without the
-          # per-value tagging this file's OWN header already names as
-          # deliberately deferred (this is a whole-function, not
-          # whole-program OR whole-value, type decision) -- flagging
-          # loudly here (not silently) is the honest interim stance
-          # rather than pretending the coercion below makes this safe
-          # in general; it only reliably helps the case where the bare
-          # int stays within THIS function's own float arithmetic.
-          if int_override then
-            # GitHub #18's real fix: this specific Const is a bare int
-            # literal feeding a Call to a known non-float-mode callee --
-            # encode as plain int, not the float bit pattern, despite
-            # this function's own blanket float_mode classification.
-            sb_push(sb, "    mov rax, " + instr[2] + x64_nl_char())
-          else
-            if not x64_contains(instr[2], ".") then
-              print("codegen_x64: warning -- integer literal '" + instr[2] + "' in a float-mode function; if it crosses a call boundary into a plain-int function/closure, the result is silently wrong (see x64_emit_instr's Const/float_mode comment)")
-            end
-            sb_push(sb, "    mov rax, __float64__(" + x64_float_literal_text(instr[2]) + ")" + x64_nl_char())
-          end
+        # GitHub #37: this Const's own encoding is now decided per-
+        # INSTRUCTION (`is_float_const`, from x64_analyze_float_consts)
+        # instead of the old whole-function `float_mode` blanket --
+        # see that analysis's own header comment for the full
+        # reasoning and the real bug this replaced (a bare int literal
+        # anywhere in a function containing an UNRELATED float literal
+        # used to always get encoded as a float bit pattern, corrupting
+        # it the moment it reached real plain-int arithmetic).
+        # `is_float_const` only tracks dotless literals stage 2 proved
+        # need float re-encoding -- a literal that ALREADY has a dot
+        # (a genuine float literal like 10.0) always needs the
+        # __float64__ wrapper regardless, so check both.
+        if is_float_const or x64_contains(instr[2], ".") then
+          sb_push(sb, "    mov rax, __float64__(" + x64_float_literal_text(instr[2]) + ")" + x64_nl_char())
         else
           sb_push(sb, "    mov rax, " + instr[2] + x64_nl_char())
         end
@@ -4791,7 +5156,8 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
         end
       else
         if ty == "Bin" then
-          if float_mode then
+          # GitHub #37: per-instruction, not whole-function.
+          if is_float_bin then
             sb_push(sb, x64_binop_asm_float(instr[1]))
           else
             if is_dynamic_bin then
@@ -4836,7 +5202,8 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
               if instr[1] == "bnot" then
                 sb_push(sb, "    not rax" + x64_nl_char())
               else
-                if float_mode then
+                # GitHub #37: per-instruction, not whole-function.
+                if is_float_bin then
                   # Real bug found alongside the modulo/float-literal
                   # fixes: `neg` is a two's-complement INTEGER negation
                   # on the raw 64-bit register -- applied to a double's
@@ -5193,38 +5560,53 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
   end
   let n = to_num(list_len(instrs))
   let jump_targets = x64_collect_jump_targets(instrs)
-  let int_overrides = []
+  # GitHub #37: per-INSTRUCTION float classification replaces the old
+  # whole-function `float_mode` blanket (see this analysis's own
+  # header comment above x64_taint_one_pass_float for the full
+  # reasoning). `float_mode` here still gates whether to bother
+  # running the analysis at all -- a function with zero float literals
+  # anywhere (x64_func_is_float false) skips it entirely and gets
+  # empty results for free, matching today's fast path for the common
+  # all-int case at no extra compile cost, same "gate the analysis,
+  # not the per-instruction decision" pattern #29 already established
+  # for dynamic_mode/dyn_bin_indices.
+  let float_instr_indices = []
+  let produces_float = []
+  let float_const_indices = []
   if float_mode then
-    let int_overrides = x64_call_arg_int_overrides(instrs, float_func_names)
+    let float_result = x64_analyze_float_bins(instrs, float_func_names)
+    let float_instr_indices = float_result[0]
+    let produces_float = float_result[1]
+    let float_const_indices = x64_analyze_float_consts(instrs, float_result[2], float_instr_indices)
   end
   let bool_print_overrides = x64_bool_print_call_indices(instrs)
-  let float_print_overrides = x64_float_print_call_indices(instrs, float_mode, int_overrides, bool_print_overrides)
   let i = 0
   while i < n do
     let instr = instrs[i]
     let fused = false
-    if not float_mode then
-      # GitHub #29: the compact fused form assumes a plain native op --
-      # only safe for a Bin at i+1 that this function's OWN per-
-      # instruction analysis says is NOT dynamic (not "not dynamic_mode"
-      # whole-function anymore, so a mixed function can still fuse its
-      # provably-plain Bin ops).
-      if not x64_str_in_list(dyn_bin_indices, i + 1) then
-      if i + 1 < n then
-        let next = instrs[i + 1]
-        if instr[0] == "Const" then
-          if instr[1] == "num" then
-            if next[0] == "Bin" then
-              if x64_fusable_binop(next[1]) then
-                if not x64_is_jump_target(jump_targets, i + 1) then
-                  let fused = true
-                end
+    # GitHub #29/#37: the compact fused form assumes a plain native op
+    # -- only safe when NEITHER the current Const nor the upcoming Bin
+    # is dynamic OR float per their own per-instruction analyses (a
+    # mixed function can still fuse its provably-plain-int Bin ops).
+    if not x64_str_in_list(dyn_bin_indices, i + 1) then
+    if not x64_str_in_list(float_instr_indices, i + 1) then
+    if not x64_str_in_list(float_const_indices, i) then
+    if i + 1 < n then
+      let next = instrs[i + 1]
+      if instr[0] == "Const" then
+        if instr[1] == "num" then
+          if next[0] == "Bin" then
+            if x64_fusable_binop(next[1]) then
+              if not x64_is_jump_target(jump_targets, i + 1) then
+                let fused = true
               end
             end
           end
         end
       end
-      end
+    end
+    end
+    end
     end
     if fused then
       sb_push(sb, "L_" + func_name + "_" + i + ":" + x64_nl_char())
@@ -5233,11 +5615,23 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
       let i = i + 2
     else
       let label = "L_" + func_name + "_" + i
-      let is_override = x64_str_in_list(int_overrides, i)
       let is_bool_print = x64_str_in_list(bool_print_overrides, i)
-      let is_float_print = x64_str_in_list(float_print_overrides, i)
+      let is_float_print = false
+      if instr[0] == "Call" then
+        if instr[1] == "print" then
+          if to_num(instr[2]) == 1 then
+            if not is_bool_print then
+              if i > 0 then
+                let is_float_print = produces_float[i - 1]
+              end
+            end
+          end
+        end
+      end
       let is_dynamic_bin = x64_str_in_list(dyn_bin_indices, i)
-      sb_push(sb, x64_emit_instr(instr, func_name, regmap, spilled, label, float_mode, is_dynamic_bin, is_override, is_bool_print, is_float_print))
+      let is_float_bin = x64_str_in_list(float_instr_indices, i)
+      let is_float_const = x64_str_in_list(float_const_indices, i)
+      sb_push(sb, x64_emit_instr(instr, func_name, regmap, spilled, label, is_float_bin, is_float_const, is_dynamic_bin, is_bool_print, is_float_print))
       let i = i + 1
     end
   end
