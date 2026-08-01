@@ -326,8 +326,79 @@ make a function called rt_float_decompose takes v returns parts
   let cur = cur - i64_to_f64(d14)
   let cur = cur * 10.0
   let d15 = f64_to_i64_trunc(cur)
-  let raw = [neg, ipart, d0, d1, d2, d3, d4, d5, d6, d7, d8, d9, d10, d11, d12, d13, d14, d15]
-  return rt_round_digits(raw)
+  # GitHub #41-adjacent fix: extended from 15 to 16 KEPT fractional
+  # digits (17 raw, d16 as the new rounding peek) -- confirmed via
+  # x64_math_selftest that 15 kept digits was one short of Rust's own
+  # f64 Display round-trip precision for ordinary values like sqrt(2)
+  # (1.4142135623730951 needs 16 fractional digits; the previous 15-
+  # digit cutoff gave 1.414213562373095, silently missing the last
+  # digit). 16 doesn't guarantee matching Rust's shortest-round-trip
+  # algorithm (Grisu/Ryu) for EVERY double -- that's a materially
+  # bigger undertaking, out of scope here -- but it closes the specific
+  # gap this session's regression suite caught and moves this backend
+  # from "one short of round-trip" to "matches round-trip for values
+  # whose shortest representation needs <=16 significant digits",
+  # which covers the overwhelming majority of real values (worst case
+  # for an IEEE double is 17).
+  let cur = cur - i64_to_f64(d15)
+  let cur = cur * 10.0
+  let d16 = f64_to_i64_trunc(cur)
+  let raw = [neg, ipart, d0, d1, d2, d3, d4, d5, d6, d7, d8, d9, d10, d11, d12, d13, d14, d15, d16]
+  let parts16 = rt_round_digits(raw)
+  # Real regression caught by re-running the full selftest, not just the
+  # single case that motivated the 15->16 change: a FIXED 16-digit
+  # cutoff also broke exp(1.0) (2.718281828459045, whose Rust round-trip
+  # form needs only 15 digits) by showing a spurious extra digit
+  # (...4590451). Rust's actual float Display uses the SHORTEST decimal
+  # that round-trips back to the exact same f64 bits, which varies per
+  # value (15 digits here, 16 for sqrt(2)/atan2(1,1)) -- a fixed cutoff
+  # can never match this for every value. Rather than implement the
+  # real algorithm (Grisu/Ryu), this checks the ONE boundary this
+  # regression suite actually exercises: try rounding down to 15 kept
+  # digits, RECONSTRUCT the resulting float value from those digits,
+  # and use the 15-digit form only if it reconstructs back to the exact
+  # same value -- otherwise keep the 16-digit form. Still not a general
+  # shortest-round-trip implementation (doesn't try 14, 13, ... or 17),
+  # but covers the real 15-vs-16 boundary this backend's own tests hit.
+  let ipart16 = parts16[1]
+  let digits16 = [parts16[2], parts16[3], parts16[4], parts16[5], parts16[6], parts16[7], parts16[8], parts16[9], parts16[10], parts16[11], parts16[12], parts16[13], parts16[14], parts16[15], parts16[16], parts16[17]]
+  let cand = rt_round_digits_at(digits16, 15, ipart16)
+  let ipart15 = cand[0]
+  let digits15 = cand[1]
+  let folded15 = rt_digits_fold(digits15, 15)
+  let recon15 = i64_to_f64(ipart15) + (i64_to_f64(folded15) / rt_pow10(15))
+  if recon15 == av then
+    let digits15 = list_set(digits15, 15, 0)
+    return [neg, ipart15, digits15[0], digits15[1], digits15[2], digits15[3], digits15[4], digits15[5], digits15[6], digits15[7], digits15[8], digits15[9], digits15[10], digits15[11], digits15[12], digits15[13], digits15[14], digits15[15]]
+  end
+  return parts16
+end
+
+# Float helper (called only from rt_float_decompose's own float-mode
+# body): 10.0^n via a plain multiply loop -- n is always a small kept-
+# digit count (<=16) here, so this is cheap and exact for every value
+# it's actually called with.
+make a function called rt_pow10 takes n returns v
+  let v = 1.0
+  let i = 0
+  while i < n do
+    let v = v * 10.0
+    let i = i + 1
+  end
+  return v
+end
+
+# Plain-int helper (see rt_round_digits's own header for why digit
+# folding stays int-mode, not float): folds digits[0..count-1] into a
+# single integer, most-significant digit first.
+make a function called rt_digits_fold takes digits, count returns v
+  let v = 0
+  let i = 0
+  while i < count do
+    let v = v * 10 + digits[i]
+    let i = i + 1
+  end
+  return v
 end
 
 # General round-half-up-with-carry: rounds `digits[0..cutoff-1]` using
@@ -375,11 +446,11 @@ end
 make a function called rt_round_digits takes raw returns parts
   let neg = raw[0]
   let ipart = raw[1]
-  let digits = [raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15], raw[16], raw[17]]
-  let rounded = rt_round_digits_at(digits, 15, ipart)
+  let digits = [raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15], raw[16], raw[17], raw[18]]
+  let rounded = rt_round_digits_at(digits, 16, ipart)
   let ipart = rounded[0]
   let digits = rounded[1]
-  return [neg, ipart, digits[0], digits[1], digits[2], digits[3], digits[4], digits[5], digits[6], digits[7], digits[8], digits[9], digits[10], digits[11], digits[12], digits[13], digits[14]]
+  return [neg, ipart, digits[0], digits[1], digits[2], digits[3], digits[4], digits[5], digits[6], digits[7], digits[8], digits[9], digits[10], digits[11], digits[12], digits[13], digits[14], digits[15]]
 end
 
 make a function called rt_format_float_parts takes parts returns s
@@ -392,7 +463,7 @@ make a function called rt_format_float_parts takes parts returns s
   let result = rt_str_concat(result, rt_int_to_str(ipart))
   let digits = ""
   let i = 2
-  while i < 17 do
+  while i < 18 do
     let digits = rt_str_concat(digits, rt_int_to_str(parts[i]))
     let i = i + 1
   end
@@ -2673,6 +2744,45 @@ make a function called rt_dquote_str returns s
   return s bor rt_string_tag()
 end
 
+# A token needs quoting only if an UNQUOTED copy of it would be split
+# into more than one argv entry by CreateProcessA's own tokenizer --
+# i.e. it contains a space, or is empty (0-length args would otherwise
+# vanish entirely from the joined command line). Matches Rust's own
+# std::process::Command::args, which quotes only when necessary rather
+# than wrapping every token unconditionally.
+make a function called rt_exec_arg_needs_quoting takes item returns needed
+  let len = rt_str_len(item)
+  if len == 0 then
+    return true
+  end
+  let i = 0
+  while i < len do
+    if char_code(item, i) == 32 then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# GitHub #40-adjacent selftest gap: quoting EVERY argument unconditionally
+# (the previous behavior) is what fixed nasm.exe's own space-containing
+# install path, but it also changed how cmd.exe's `/c` re-parses its own
+# tail for any OTHER argument that does NOT need quoting -- an argv
+# token that is quoted from its very first to very last character has
+# those quotes cleanly stripped during normal argv tokenization, but
+# cmd.exe's `/c` handling re-parses its tail with its OWN, weaker rules,
+# so a token quoted ONLY because this function used to quote everything
+# (not because it actually contained a space) could end up echoed
+# without its surrounding quotes even though the SAME multi-word
+# argument, quoted by a strictly-necessary quoter (this is what Rust's
+# own Command::args does), keeps its quotes through cmd.exe's tail
+# re-parsing -- confirmed directly: x64_exec_capture_r15_selftest.patlang's
+# `echo "hello from exec_capture"` case differed from the interpreter
+# (which uses Rust's own quote-only-when-needed Command::args) purely
+# because of this. Quoting only when actually needed (this fix) matches
+# the interpreter's real, already-correct behavior exactly, rather than
+# chasing cmd.exe's own idiosyncratic /c re-parsing rules directly.
 make a function called rt_exec_join_args takes arr, count returns tagged
   let q = rt_dquote_str()
   let e = rt_heap_alloc(8)
@@ -2684,9 +2794,14 @@ make a function called rt_exec_join_args takes arr, count returns tagged
     if i > 0 then
       let result = rt_str_concat(result, " ")
     end
-    let result = rt_str_concat(result, q)
+    let needs_q = rt_exec_arg_needs_quoting(item)
+    if needs_q then
+      let result = rt_str_concat(result, q)
+    end
     let result = rt_str_concat(result, item)
-    let result = rt_str_concat(result, q)
+    if needs_q then
+      let result = rt_str_concat(result, q)
+    end
     let i = i + 1
   end
   return result
@@ -4193,12 +4308,12 @@ make a function called to_fixed takes x, places returns result
   let parts = rt_float_decompose(x)
   let neg = parts[0]
   let ipart = parts[1]
-  let digits = [parts[2], parts[3], parts[4], parts[5], parts[6], parts[7], parts[8], parts[9], parts[10], parts[11], parts[12], parts[13], parts[14], parts[15], parts[16]]
+  let digits = [parts[2], parts[3], parts[4], parts[5], parts[6], parts[7], parts[8], parts[9], parts[10], parts[11], parts[12], parts[13], parts[14], parts[15], parts[16], parts[17]]
   let p = places
-  if p > 15 then
-    let p = 15
+  if p > 16 then
+    let p = 16
   end
-  if p < 15 then
+  if p < 16 then
     let rounded = rt_round_digits_at(digits, p, ipart)
     let ipart = rounded[0]
     let digits = rounded[1]
