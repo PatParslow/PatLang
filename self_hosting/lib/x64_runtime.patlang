@@ -38,6 +38,28 @@
 # change to THIS function alone, not to codegen_x64.patlang.
 
 make a function called rt_int_to_string takes n, buf_addr returns len
+  # GitHub #34 (found via bit_set(0,63,1), which legitimately produces
+  # this exact value): i64::MIN's own negation OVERFLOWS in two's
+  # complement (there's no positive i64 counterpart to
+  # -9223372036854775808 -- negating it wraps back to itself), so `0 -
+  # v` below left `v` still negative, the `while v > 0` digit loop
+  # below never ran, and this returned just "-" with zero digits.
+  # Special-cased here rather than fixed generically, since it's the
+  # ONE value where naive negate-then-extract-digits fails -- every
+  # other i64 negates safely. `1 shl 63` (not a bare `-9223372036854775808`
+  # literal) sidesteps a SEPARATE overflow: parsing that literal would
+  # first parse the unsigned digits "9223372036854775808" (one more
+  # than i64::MAX) before negating, overflowing during PARSING itself.
+  if n == (1 shl 63) then
+    let digits = "9223372036854775808"
+    mem_poke_byte(buf_addr, 0, 45)
+    let i = 0
+    while i < 19 do
+      mem_poke_byte(buf_addr, 1 + i, char_code(digits, i))
+      let i = i + 1
+    end
+    return 20
+  end
   let is_neg = n < 0
   let v = n
   if is_neg then
@@ -791,7 +813,22 @@ make a function called print takes v returns done
   if family == list_family then
     return rt_print_str(rt_list_to_display_string(v))
   end
-  return rt_print_str("<value>")
+  # GitHub #34: a raw int64 result from bit manipulation (e.g.
+  # bit_set(0, 63, 1) = 0x8000000000000000, the most negative i64) can
+  # land on a family-nibble pattern this dispatch doesn't recognize --
+  # NEITHER 0 (fixnum) NOR family_mask (the all-ones negative-fixnum
+  # sign-leak case above) NOR any of the five real tags checked above
+  # (String/BigInt/Rational/Complex/Interval/List, the ONLY tags this
+  # whole system ever assigns). Reaching this point means `v` is, by
+  # construction, not a recognized tagged value at all -- printing it
+  # as a raw signed int is the safest available default (previously an
+  # unconditional "<value>" placeholder, which silently discarded a
+  # perfectly real, meaningful integer result). A genuinely corrupt/
+  # garbage pointer reaching here was ALSO not usefully served by
+  # "<value>" -- neither choice is "safe" for that case, so this
+  # trades a rare corrupt-pointer misprint for the far more common
+  # real-int-with-an-unusual-bit-pattern case actually being usable.
+  return rt_print_str(rt_int_to_str(v))
 end
 
 # rt_list_to_display_string(v) -> "[elem, elem, ...]", recursively
