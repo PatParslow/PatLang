@@ -15,6 +15,10 @@
 
 include "includes.patlang"
 include "gherkin_contracts.patlang"
+include "signals.patlang"
+include "sql.patlang"
+include "queue.patlang"
+include "task_registry.patlang"
 
 make a function called st_noop returns done
   return true
@@ -947,6 +951,264 @@ make a function called register_language_logic_goap_contracts_steps returns done
   step("the library that implements require/ensure clause checking (self_hosting/lib/gherkin_contracts.patlang)", "st_noop")
   step("its own source text is inspected directly", "st_noop")
   step("it contains no call to contract_check(...) -- the host primitive require/ensure/assert always lower to elsewhere in the language -- confirming the guard is genuinely separate from (and happens before) any code that would run the checked action for real", "st_gc_never_calls_contract_check_itself")
+  return true
+end
+
+# ---- tcp_networking_round_trip.feature ----
+
+make a function called st_tcp_connect_before_accept returns ok
+  let port = tcp_listen(0)
+  set_var("tcp_spec_port", port)
+  let a = check("require port > 0", port > 0, true)
+  let client = tcp_connect("127.0.0.1", port)
+  let b = check("it succeeds (the OS backlog queues it) -- confirmed via a passing require, not assumed", client >= 0, true)
+  set_var("tcp_spec_client", client)
+  return a and b
+end
+
+make a function called st_tcp_round_trip_both_directions returns ok
+  let port = get("__vars", "tcp_spec_port")
+  let client = get("__vars", "tcp_spec_client")
+  let server_conn = tcp_accept(port)
+  tcp_write(client, "hello from client")
+  tcp_write(server_conn, "hello from server")
+  let a = check("the server's tcp_read returns exactly the client's message", tcp_read(server_conn), "hello from client")
+  let b = check("the client's tcp_read returns exactly the server's message", tcp_read(client), "hello from server")
+  tcp_close(client)
+  tcp_close(server_conn)
+  return a and b
+end
+
+# ---- tcp_close_teardown.feature ----
+
+make a function called st_tcp_close_teardown returns ok
+  let port = tcp_listen(0)
+  let client = tcp_connect("127.0.0.1", port)
+  let server_conn = tcp_accept(port)
+  tcp_close(client)
+  return check("it returns \"\" (an ensure guard on this exact fact passes) -- confirming the close was a real, graceful teardown the peer can observe, not just a local no-op", tcp_read(server_conn), "")
+end
+
+# ---- signals_claim_and_poll.feature ----
+
+make a function called st_signal_first_claim_becomes_primary returns ok
+  let port_id = signal_claim(9601)
+  set_var("signal_spec_port_id", port_id)
+  return check("it is >= 0 (a real port_id)", port_id >= 0, true)
+end
+
+make a function called st_signal_second_claim_rejected returns ok
+  return check("it returns -1 -- the free single-instance-detection this subsystem relies on", signal_claim(9601), -1)
+end
+
+make a function called st_signal_poll_idle_times_out_empty returns ok
+  let port_id = get("__vars", "signal_spec_port_id")
+  return check("it returns \"\" within the timeout, not an error or a hang", signal_poll(port_id, 20), "")
+end
+
+# ---- sql_engine_end_to_end.feature ----
+
+make a function called sql_spec_run takes db, sql returns new_db
+  let ast = sql_parse(sql)
+  let outcome = sql_execute(db, ast, "0")
+  return outcome[0]
+end
+
+make a function called sql_spec_run_and_get takes db, sql returns outcome
+  let ast = sql_parse(sql)
+  return sql_execute(db, ast, "0")
+end
+
+make a function called st_sql_create_table_guarded returns ok
+  let a = check("require not rdb_table_exists(\"spec_people\")", rdb_table_exists("spec_people"), false)
+  let db = rdb_init()
+  let db = sql_spec_run(db, "CREATE TABLE spec_people (name STRING, age INT)")
+  set_var("sql_spec_db_marker", "created")
+  let b = check("ensure rdb_table_exists(\"spec_people\") afterward passes -- the contract itself proves the table was actually created, not assumed", rdb_table_exists("spec_people"), true)
+  return a and b
+end
+
+make a function called st_sql_insert_select_where returns ok
+  let db = rdb_init()
+  let db = sql_spec_run(db, "INSERT INTO spec_people VALUES ('alice', 30)")
+  let db = sql_spec_run(db, "INSERT INTO spec_people VALUES ('bob', 25)")
+  let sel = sql_spec_run_and_get(db, "SELECT name FROM spec_people WHERE age > 28")
+  let a = check("exactly 1 row is returned", sel[1][2].length, 1)
+  let b = check("it is alice", sel[1][2][0][0], "alice")
+  return a and b
+end
+
+# ---- sql_test_environment_isolation.feature ----
+
+make a function called st_sql_table_left_existing_this_process returns ok
+  return check("a table created and left existing at the end of one process's run", rdb_table_exists("spec_isolated_table"), false)
+end
+
+make a function called st_sql_isolation_across_processes returns ok
+  let db = rdb_init()
+  let db = sql_spec_run(db, "CREATE TABLE spec_isolated_table (x INT)")
+  let out = exec_capture("rust-runtime/target/release/pat.exe", "--ir-run", "self_hosting/tools/spec_fixtures/sql_isolation_check.patlang")
+  return check("it reports false -- each --ir-run invocation starts with a genuinely clean table namespace, confirmed empirically rather than assumed from the implementation", contains_text(out, "false"), true)
+end
+
+# ---- message_queue.feature ----
+
+make a function called mq_spec_topic returns t
+  return "spec_scratch_mq_topic"
+end
+
+make a function called mq_spec_reset returns done
+  let path = q_file(mq_spec_topic())
+  if file_exists(path) == "1" then
+    write_file(path, "")
+  end
+  return true
+end
+
+make a function called st_mq_fresh_topic_empty returns done
+  mq_spec_reset()
+  require to_num(list_len(queue_pending(mq_spec_topic()))) == 0
+  return true
+end
+
+make a function called st_mq_consume_fifo_unacked returns ok
+  let id1 = queue_publish(mq_spec_topic(), "first message")
+  let id2 = queue_publish(mq_spec_topic(), "second message")
+  set_var("mq_spec_id1", id1)
+  set_var("mq_spec_id2", id2)
+  let payload = queue_consume(mq_spec_topic())
+  return check("it returns \"first message\" -- FIFO order, and it remains pending until explicitly acked", payload, "first message")
+end
+
+make a function called st_mq_ack_removes_only_that_message returns ok
+  let id1 = get("__vars", "mq_spec_id1")
+  let id2 = get("__vars", "mq_spec_id2")
+  queue_ack(mq_spec_topic(), id1)
+  let pending = queue_pending(mq_spec_topic())
+  ensure pending.length == 1
+  return check("only the SECOND message's id remains", "" + pending[0], "" + id2)
+end
+
+# ---- task_registry_beacon.feature ----
+
+make a function called tr_spec_task_name returns t
+  return "spec_scratch_beacon_task"
+end
+
+make a function called tr_spec_reset returns done
+  let path = q_file(tr_topic_for(tr_spec_task_name()))
+  if file_exists(path) == "1" then
+    write_file(path, "")
+  end
+  return true
+end
+
+make a function called st_tr_announce_readable_back returns ok
+  tr_spec_reset()
+  tr_announce(tr_spec_task_name(), "does spec work")
+  let result = tr_read_one(tr_spec_task_name())
+  return check("it returns the announced description", result[1], "does spec work")
+end
+
+make a function called st_tr_discover_finds_fresh returns ok
+  let all = tr_discover_all(60000)
+  let found = false
+  let i = 0
+  let n = to_num(list_len(all))
+  while i < n do
+    if all[i][0] == tr_spec_task_name() then
+      let found = true
+    end
+    let i = i + 1
+  end
+  return check("the task appears in the results", found, true)
+end
+
+make a function called tr_spec_count_lines takes content returns n
+  let count = 0
+  let cur_len = 0
+  let i = 0
+  while i < content.length do
+    let c = char_code(content, i)
+    if c == 10 then
+      if cur_len > 0 then
+        let count = count + 1
+      end
+      let cur_len = 0
+    else
+      if c != 13 then
+        let cur_len = cur_len + 1
+      end
+    end
+    let i = i + 1
+  end
+  if cur_len > 0 then
+    let count = count + 1
+  end
+  return count
+end
+
+make a function called st_tr_reannounce_overwrites returns ok
+  tr_announce(tr_spec_task_name(), "a different description")
+  let path = q_file(tr_topic_for(tr_spec_task_name()))
+  let content = read_file(path)
+  let nonempty = tr_spec_count_lines(content)
+  ensure nonempty == 1
+  return check("exactly 1 row exists, not 2 -- confirming this beacon keeps only its LATEST state, unlike queue_publish's own accumulating log", nonempty, 1)
+end
+
+make a function called register_language_host_primitives_steps returns done
+  step("`require port > 0` after tcp_listen(0)", "st_tcp_connect_before_accept")
+  step("tcp_connect is called immediately, with no tcp_accept having run yet", "st_noop")
+  step("it succeeds (the OS backlog queues it) -- confirmed via a passing require, not assumed", "st_noop")
+  step("a connected client/server pair", "st_noop")
+  step("the client writes \"hello from client\" and the server writes \"hello from server\"", "st_noop")
+  step("the server's tcp_read returns exactly the client's message, and the client's tcp_read returns exactly the server's message", "st_tcp_round_trip_both_directions")
+
+  step("a connected pair, then `tcp_close(client)`", "st_noop")
+  step("the server side calls tcp_read on its end of the connection", "st_noop")
+  step("it returns \"\" (an ensure guard on this exact fact passes) -- confirming the close was a real, graceful teardown the peer can observe, not just a local no-op", "st_tcp_close_teardown")
+
+  step("signal_claim(9601) called for the first time", "st_noop")
+  step("the result is checked", "st_noop")
+  step("it is >= 0 (a real port_id)", "st_signal_first_claim_becomes_primary")
+  step("the same process still holds the port from the first claim", "st_noop")
+  step("signal_claim(9601) is called again", "st_noop")
+  step("it returns -1 -- the free single-instance-detection this subsystem relies on", "st_signal_second_claim_rejected")
+  step("a claimed port with nothing sent to it", "st_noop")
+  step("signal_poll(port_id, 20) is called", "st_noop")
+  step("it returns \"\" within the timeout, not an error or a hang", "st_signal_poll_idle_times_out_empty")
+
+  step("`require not rdb_table_exists(\"spec_people\")` beforehand", "st_noop")
+  step("`CREATE TABLE spec_people (...)` is executed via sql_parse+sql_execute", "st_noop")
+  step("`ensure rdb_table_exists(\"spec_people\")` afterward passes -- the contract itself proves the table was actually created, not assumed", "st_sql_create_table_guarded")
+  step("two inserted rows (alice age 30, bob age 25)", "st_noop")
+  step("`SELECT name FROM spec_people WHERE age > 28` is executed", "st_noop")
+  step("exactly 1 row is returned, and it is alice", "st_sql_insert_select_where")
+
+  step("a table created and left existing at the end of one process's run", "st_sql_table_left_existing_this_process")
+  step("a SEPARATE, later process checks whether that table exists", "st_noop")
+  step("it reports false -- each --ir-run invocation starts with a genuinely clean table namespace, confirmed empirically rather than assumed from the implementation", "st_sql_isolation_across_processes")
+
+  step("a scratch-only topic name never used elsewhere", "st_noop")
+  step("`require to_num(list_len(queue_pending(topic))) == 0` runs first", "st_noop")
+  step("it passes -- confirming this is genuinely a clean start, not a leftover from a previous failed run", "st_mq_fresh_topic_empty")
+  step("two published messages (\"first message\", \"second message\")", "st_noop")
+  step("queue_consume is called", "st_noop")
+  step("it returns \"first message\" -- FIFO order, and it remains pending until explicitly acked", "st_mq_consume_fifo_unacked")
+  step("the first message is acked by its id", "st_noop")
+  step("queue_pending is read afterward", "st_noop")
+  step("only the SECOND message's id remains -- confirmed via an ensure guard on the exact remaining id, not just a count", "st_mq_ack_removes_only_that_message")
+
+  step("tr_announce(\"spec_scratch_beacon_task\", \"does spec work\")", "st_noop")
+  step("tr_read_one is called for that task", "st_noop")
+  step("it returns the announced description", "st_tr_announce_readable_back")
+  step("the same recent announcement", "st_noop")
+  step("tr_discover_all(60000) is called", "st_noop")
+  step("the task appears in the results", "st_tr_discover_finds_fresh")
+  step("a second tr_announce call for the same task, with a different description", "st_noop")
+  step("the underlying row count is checked via an ensure guard", "st_noop")
+  step("exactly 1 row exists, not 2 -- confirming this beacon keeps only its LATEST state, unlike queue_publish's own accumulating log", "st_tr_reannounce_overwrites")
   return true
 end
 
