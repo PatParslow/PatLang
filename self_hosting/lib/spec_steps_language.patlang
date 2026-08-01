@@ -401,6 +401,27 @@ class SpecWidget {
   field kind = "widget"
 }
 
+when we_tick do
+  set_var("we_tick_count", get("__vars", "we_tick_count") + 1)
+end
+
+when we_ping do
+  set_var("we_seen_name", event_name)
+  set_var("we_seen_data", event_data)
+end
+
+let we_base = 100
+
+when we_combine do
+  let calls = get("__vars", "we_combined_calls")
+  if calls == 0 then
+    set_var("we_combined_first", we_base + to_num(event_data))
+  else
+    set_var("we_combined_second", we_base + to_num(event_data))
+  end
+  set_var("we_combined_calls", calls + 1)
+end
+
 # ---- function_definition_and_return.feature ----
 
 make a function called fd_guarded takes n returns msg
@@ -554,6 +575,158 @@ make a function called register_language_fn_obj_list_print_steps returns done
   step("an expression that evaluates to Unit (e.g. a function with no return statement, or set_var's own return value)", "st_noop")
   step("printed", "st_noop")
   step("exactly one blank line is written, not nothing at all", "st_print_unit_returns_unit")
+  return true
+end
+
+# ---- require_ensure_assert.feature ----
+# Uses exec_capture on dedicated driver scripts (self_hosting/tools/
+# spec_fixtures/) rather than in-process calls, since a real contract
+# violation is fatal (aborts the process) -- matching the pattern
+# run_synthesis_selftests.patlang already uses for out-of-process checks.
+
+make a function called st_contract_pass_no_effect returns ok
+  let out = exec_capture("rust-runtime/target/release/pat.exe", "--ir-run", "self_hosting/tools/spec_fixtures/require_ensure_pass.patlang")
+  return check("it returns 5 normally, as if no contract were present", contains_text(out, "result=5"), true)
+end
+
+make a function called st_require_violation_fatal returns ok
+  let out = exec_capture("rust-runtime/target/release/pat.exe", "--ir-run", "self_hosting/tools/spec_fixtures/require_violation.patlang")
+  let a = check("names \"precondition\" and the exact source condition text \"b != 0\"", contains_text(out, "precondition") and contains_text(out, "b != 0"), true)
+  let b = check("does not reach the unreachable line after the violation", contains_text(out, "unreachable"), false)
+  return a and b
+end
+
+make a function called st_contract_kind_labels returns ok
+  let require_out = exec_capture("rust-runtime/target/release/pat.exe", "--ir-run", "self_hosting/tools/spec_fixtures/require_violation.patlang")
+  let ensure_out = exec_capture("rust-runtime/target/release/pat.exe", "--ir-run", "self_hosting/tools/spec_fixtures/ensure_violation.patlang")
+  let assert_out = exec_capture("rust-runtime/target/release/pat.exe", "--ir-run", "self_hosting/tools/spec_fixtures/assert_violation.patlang")
+  let a = check("require violation is labeled \"precondition\"", contains_text(require_out, "precondition"), true)
+  let b = check("ensure violation is labeled \"postcondition\"", contains_text(ensure_out, "postcondition"), true)
+  let c = check("assert violation is labeled \"assertion\"", contains_text(assert_out, "assertion"), true)
+  return a and b and c
+end
+
+# ---- include_directive.feature ----
+
+make a function called st_include_transitive_splice returns ok
+  let out = exec_capture("rust-runtime/target/release/pat.exe", "--ir-run", "self_hosting/tools/spec_fixtures/include_entry.patlang")
+  return check("it works -- confirming both the direct splice and the transitive one resolved correctly", contains_text(out, "result=21"), true)
+end
+
+# ---- alternate_block_delimiters.feature ----
+
+make a function called st_while_do_end_matches_brace returns ok
+  let i = 0
+  let sum = 0
+  while i < 2 do
+    let sum = sum + i
+    let i = i + 1
+  end
+  return check("it behaves identically to the brace form", sum, 1)
+end
+
+make a function called st_closure_do_end_matches_brace returns ok
+  let f_do = |x| do return x * 2 end
+  let f_brace = |x| { return x * 2 }
+  return check("it behaves identically to `|x| { return x * 2 }`", f_do(5), f_brace(5))
+end
+
+make a function called st_if_do_end_is_parse_error returns ok
+  let out = exec_capture("rust-runtime/target/release/pat.exe", "--ir-run", "self_hosting/tools/spec_fixtures/if_do_end_parse_error.patlang")
+  return check("it is a PARSE ERROR (\"Start the 'if' block with '{'\")", contains_text(out, "should not parse"), false)
+end
+
+make a function called st_if_then_end_parses_ok returns ok
+  let ran = false
+  if true then
+    let ran = true
+  end
+  return check("it works -- if's Ruby-style alternate form is then/elif/else/end, never do/end", ran, true)
+end
+
+# ---- when_emit.feature ----
+# `when` handlers must be declared at the TOP LEVEL of the program (a
+# parse error otherwise: "'when' can only be declared at the top level...
+# handlers are registered once, statically, not conditionally at
+# runtime") -- so, unlike every other step here, these are declared as
+# module-level `when` blocks below (near the SpecWidget etc. class decls),
+# with the step functions only calling set_var/emit.
+
+make a function called st_when_emit_runs_once_per_call returns done
+  set_var("we_tick_count", 0)
+  emit("we_tick", 5)
+  emit("we_tick", 7)
+  return true
+end
+
+make a function called st_when_emit_counter_is_two returns ok
+  return check("the counter is 2 -- the handler ran once per emit", get("__vars", "we_tick_count"), 2)
+end
+
+make a function called st_when_emit_implicit_params returns done
+  set_var("we_seen_name", "")
+  set_var("we_seen_data", "")
+  emit("we_ping", "payload42")
+  return true
+end
+
+make a function called st_when_emit_implicit_params_check returns ok
+  let a = check("event_name is the string passed as emit's first argument", get("__vars", "we_seen_name"), "we_ping")
+  let b = check("event_data is the payload (second argument)", get("__vars", "we_seen_data"), "payload42")
+  return a and b
+end
+
+make a function called st_when_emit_captures_enclosing_let returns done
+  set_var("we_combined_first", -1)
+  set_var("we_combined_second", -1)
+  set_var("we_combined_calls", 0)
+  emit("we_combine", "5")
+  emit("we_combine", "7")
+  return true
+end
+
+make a function called st_when_emit_captures_enclosing_let_check returns ok
+  let a = check("it sees the real captured value of base (100+5=105 on the first call)", get("__vars", "we_combined_first"), 105)
+  let b = check("100+7=107 on the second -- not a stale or hardcoded value", get("__vars", "we_combined_second"), 107)
+  return a and b
+end
+
+
+make a function called register_language_contracts_include_delims_events_steps returns done
+  step("`safe_divide(10, 2)` with `require b != 0` and `ensure (r*b)==a`", "st_noop")
+  step("called", "st_noop")
+  step("it returns 5 normally, as if no contract were present", "st_contract_pass_no_effect")
+  step("`safe_divide(0, 0)`", "st_noop")
+  step("it fails with \"contract violation: precondition failed in safe_divide(): b != 0\" -- the exact source condition text, not a generic message", "st_require_violation_fatal")
+  step("the three different keywords", "st_noop")
+  step("any one fails", "st_noop")
+  step("the error names the correct kind label (\"precondition\" for require, \"postcondition\" for ensure, \"assertion\" for assert) -- distinguished by a string tag on ONE shared host call, not three separate mechanisms", "st_contract_kind_labels")
+
+  step("an entry script that includes includer.patlang, which itself includes a SIBLING file helper.patlang by bare filename", "st_noop")
+  step("the entry script calls a function from includer.patlang that itself calls a function from helper.patlang", "st_noop")
+  step("it works -- confirming both the direct splice and the transitive one resolved correctly", "st_include_transitive_splice")
+
+  step("`while i < 2 do ... end`", "st_noop")
+  step("evaluated", "st_noop")
+  step("it behaves identically to the brace form", "st_while_do_end_matches_brace")
+  step("`|x| do return x * 2 end`", "st_noop")
+  step("called", "st_noop")
+  step("it behaves identically to `|x| { return x * 2 }`", "st_closure_do_end_matches_brace")
+  step("`if true do ... end`", "st_noop")
+  step("parsed", "st_noop")
+  step("it is a PARSE ERROR (\"Start the 'if' block with '{'\")", "st_if_do_end_is_parse_error")
+  step("`if true then ... end` instead", "st_noop")
+  step("it works -- if's Ruby-style alternate form is then/elif/else/end, never do/end", "st_if_then_end_parses_ok")
+
+  step("`when tick do ... end` incrementing a counter", "st_when_emit_runs_once_per_call")
+  step("emit(\"tick\", 5) then emit(\"tick\", 7) are both called", "st_noop")
+  step("the counter is 2 -- the handler ran once per emit", "st_when_emit_counter_is_two")
+  step("the handler body reads `event_name` and `event_data` directly, with no declaration", "st_when_emit_implicit_params")
+  step("an event fires", "st_noop")
+  step("event_name is the string passed as emit's first argument, event_data is the payload (second argument)", "st_when_emit_implicit_params_check")
+  step("`let base = 100` declared before the when-block, referenced inside it", "st_when_emit_captures_enclosing_let")
+  step("the handler runs", "st_noop")
+  step("it sees the real captured value of base (100), combined correctly with the live event_data each time (100+5=105 on the first call, 100+7=107 on the second) -- not a stale or hardcoded value", "st_when_emit_captures_enclosing_let_check")
   return true
 end
 
