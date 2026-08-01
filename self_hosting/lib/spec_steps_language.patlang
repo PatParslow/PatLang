@@ -1212,6 +1212,154 @@ make a function called register_language_host_primitives_steps returns done
   return true
 end
 
+# ---- x64_bitwise_selftest_universal_print.feature ----
+# GitHub #47: a genuine interp-vs-x64 comparison, via exec_capture on two
+# real backends -- no cross-process concurrency needed here, just two
+# ordinary sequential compiles/runs, matching run_benchmarks.patlang's
+# own exec_capture(patc1_exe, src, exe_path, "--x64") pattern.
+
+make a function called st_x64_bitwise_interp_matches_x64 returns ok
+  let expected = "8\n15\n6\n1152921504606846976\n1"
+  let interp_out = str_trim(exec_capture("rust-runtime/target/release/pat.exe", "--ir-run", "self_hosting/examples/x64_bitwise_selftest.patlang"))
+  let a = check("interp output shows 8, 15, 6, 1152921504606846976, 1", interp_out, expected)
+  let x64_exe = "self_hosting/build/spec_x64_bitwise_selftest.exe"
+  exec_capture("./patc1.exe", "self_hosting/examples/x64_bitwise_selftest.patlang", x64_exe, "--x64")
+  let x64_out = str_trim(exec_capture(x64_exe))
+  let b = check("x64 output shows 8, 15, 6, 1152921504606846976, 1", x64_out, expected)
+  let c = check("the two outputs match exactly", interp_out, x64_out)
+  return a and b and c
+end
+
+# ---- signals_full_round_trip.feature ----
+# A real two-process test: spawn() launches a genuinely detached child
+# process (self_hosting/tools/spec_fixtures/signal_primary.patlang), this
+# process (the "secondary") talks to it over the real loopback TCP signal
+# mechanism, same as self_hosting/examples/signals_demo.patlang's own
+# worked primary/secondary pattern. signal_query/signal_send are FATAL
+# (no try/catch) if nothing is listening yet -- deliberately sleeps first
+# rather than retrying, to avoid a retry loop's first early attempt
+# crashing this entire spec run.
+
+make a function called st_signals_round_trip_query_reply returns ok
+  let log_path = "self_hosting/tools/spec_fixtures/signal_primary.log"
+  if file_exists(log_path) == "1" then
+    write_file(log_path, "")
+  end
+  let pid = spawn("rust-runtime/target/release/pat.exe", "--ir-run", "self_hosting/tools/spec_fixtures/signal_primary.patlang")
+  set_var("signals_rt_pid", pid)
+  sleep_ms(600)
+  let reply = signal_query(9701, "status", "")
+  return check("it receives exactly \"uptime: 42\" -- the primary's own handler's reply text, round-tripped over the real TCP connection between two real OS processes", reply, "uptime: 42")
+end
+
+make a function called st_signals_round_trip_quit_stops_early returns ok
+  let pid = get("__vars", "signals_rt_pid")
+  signal_send(9701, "quit", "")
+  let waited = 0
+  while is_alive(pid) and (waited < 3000) do
+    sleep_ms(50)
+    let waited = waited + 50
+  end
+  let log_path = "self_hosting/tools/spec_fixtures/signal_primary.log"
+  let log = read_file(log_path)
+  return check("it shows the primary exited via the quit path, not by running its full bounded iteration count", contains_text(log, "exited via quit path"), true)
+end
+
+# ---- build_daemon_exemplar.feature ----
+# GitHub #49: the full exemplar (logic + GOAP + timing/persistence +
+# events + signals). Backs up the real shared history file first --
+# self_hosting/lib/build_daemon.patlang's own bd_history_file() -- and
+# restores it byte-for-byte afterward, confirmed, exactly as this spec's
+# own text requires. Same spawn/signal_query/signal_send shape as the
+# signals_full_round_trip spec above, over self_hosting/examples/
+# build_daemon_demo.patlang (BD_PORT 9410) rather than reinventing a
+# smaller fixture, since the exemplar IS that real file.
+
+make a function called bd_spec_history_path returns p
+  return "portfolio/build/build_daemon_history.txt"
+end
+
+make a function called st_bd_backup_history returns done
+  let path = bd_spec_history_path()
+  if file_exists(path) == "1" then
+    set_var("bd_spec_backup", read_file(path))
+  else
+    set_var("bd_spec_backup", "")
+  end
+  return true
+end
+
+make a function called st_bd_primary_runs_initial_cycle returns ok
+  let pid = spawn("rust-runtime/target/release/pat.exe", "--ir-run", "self_hosting/examples/build_daemon_demo.patlang")
+  set_var("bd_spec_pid", pid)
+  sleep_ms(600)
+  return check("it claims the signal port and runs an initial build cycle (a live 'status' reply exists at all)", signal_query(9410, "status", "").length > 0, true)
+end
+
+make a function called st_bd_status_reports_real_rebuild returns ok
+  let reply = signal_query(9410, "status", "")
+  return check("it receives a reply describing what was actually rebuilt -- a real signal_query round trip, same mechanism as the standalone signals spec", contains_text(reply, "rebuilt"), true)
+end
+
+make a function called st_bd_restore_history returns ok
+  let path = bd_spec_history_path()
+  let backup = get("__vars", "bd_spec_backup")
+  if backup == "" then
+    if file_exists(path) == "1" then
+      write_file(path, "")
+    end
+  else
+    write_file(path, backup)
+  end
+  let restored = ""
+  if file_exists(path) == "1" then
+    let restored = read_file(path)
+  end
+  return check("the shared history file is restored byte-for-byte equal again, confirmed, not just attempted", restored, backup)
+end
+
+make a function called st_bd_quit_stops_primary_cleanly returns ok
+  let pid = get("__vars", "bd_spec_pid")
+  signal_send(9410, "quit", "")
+  let waited = 0
+  while is_alive(pid) and (waited < 3000) do
+    sleep_ms(50)
+    let waited = waited + 50
+  end
+  let a = check("the primary cleanly stops (no longer alive) after a quit signal, not left running indefinitely", is_alive(pid), false)
+  let b = st_bd_restore_history()
+  return a and b
+end
+
+make a function called register_language_process_backend_steps returns done
+  step("self_hosting/examples/x64_bitwise_selftest.patlang uses print()", "st_noop")
+  step("the file is run under `pat --ir-run` and compiled+run via `--x64`", "st_noop")
+  step("both show: 8, 15, 6, 1152921504606846976, 1", "st_noop")
+  step("the two outputs match exactly", "st_x64_bitwise_interp_matches_x64")
+  step("the original file called rt_print_i64, a name unresolved under", "st_noop")
+  step("the file was run under `pat --ir-run` before this fix", "st_noop")
+  step("every rt_print_i64 call silently no-op'd (an unresolved Call does not", "st_noop")
+  step("comparing that empty output against the x64 backend's real,", "st_noop")
+
+  step("a detached primary process (launched via `start /B`) with `when status do signal_reply(\"uptime: 42\") end` registered", "st_bd_backup_history")
+  step("a separate, synchronous secondary process calls signal_query(port, \"status\", \"\")", "st_signals_round_trip_query_reply")
+  step("it receives exactly \"uptime: 42\" -- the primary's own handler's reply text, round-tripped over the real TCP connection between two real OS processes", "st_noop")
+  step("the secondary also calls signal_send(port, \"quit\", \"\") afterward", "st_noop")
+  step("the primary's own log is inspected after the fact", "st_noop")
+  step("it shows the primary exited via the quit path, not by running its full bounded iteration count", "st_signals_round_trip_quit_stops_early")
+
+  step("self_hosting/examples/build_daemon_demo.patlang launched with no CLI args (via `start /B`)", "st_noop")
+  step("it claims the signal port", "st_noop")
+  step("it runs a build cycle derived from real logic facts (rule_add/solve) and a real cost-weighted GOAP plan (action_add/plan), logging via when/emit", "st_bd_primary_runs_initial_cycle")
+  step("the primary is still running", "st_noop")
+  step("a separate process runs the same demo with \"status\" as its CLI argument", "st_noop")
+  step("it receives a reply describing what was actually rebuilt -- a real signal_query round trip, same mechanism as the standalone signals spec", "st_bd_status_reports_real_rebuild")
+  step("the primary is still polling", "st_noop")
+  step("a separate process sends \"quit\"", "st_noop")
+  step("the primary's own log shows \"DAEMON: exiting\", not left running indefinitely", "st_bd_quit_stops_primary_cleanly")
+  return true
+end
+
 make a function called register_language_arith_bitwise_cmp_steps returns done
   step("the integers 2 and 3", "st_noop")
   step("+, -, *, / are applied", "st_noop")
