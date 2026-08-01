@@ -201,8 +201,64 @@ make a function called x64_bytes_of takes text returns s
   return sb_str(sb)
 end
 
+# GitHub #38's known tag/mask-constant exclusion list plus the 48-bit
+# fixnum-range magnitude check, factored out of x64_emit_instr's Const
+# branch so x64_collect_string_data (pass 1) and x64_emit_instr (pass
+# 2) can't drift out of sync on which literals get BigInt-promoted --
+# see GitHub #40: pass 2 now needs to know this BEFORE reaching the
+# Const branch, to decide whether to reserve a .data string label for
+# the literal's own decimal text (see rt_bigint_from_decimal_str).
+make a function called x64_num_const_needs_bigint_promotion takes text returns needed
+  let is_excluded = false
+  if text == "1152921504606846976" then
+    let is_excluded = true
+  end
+  if text == "1153765929536978944" then
+    let is_excluded = true
+  end
+  if text == "1154891829443821568" then
+    let is_excluded = true
+  end
+  if text == "1157425104234217472" then
+    let is_excluded = true
+  end
+  if text == "2305843009213693952" then
+    let is_excluded = true
+  end
+  if text == "3458764513820540928" then
+    let is_excluded = true
+  end
+  if text == "4611686018427387904" then
+    let is_excluded = true
+  end
+  if text == "5764607523034234880" then
+    let is_excluded = true
+  end
+  if text == "17293822569102704640" then
+    let is_excluded = true
+  end
+  if text == "281474976710655" then
+    let is_excluded = true
+  end
+  if is_excluded then
+    return false
+  end
+  let val = to_num(text)
+  if (val > 140737488355327) or (val < 0 - 140737488355327) then
+    return true
+  end
+  return false
+end
+
 # Walks every function's instructions once, emitting one .data label
-# per Const "str" node encountered, in encounter order.
+# per Const "str" node encountered, in encounter order. GitHub #40:
+# also emits one for each oversized Const "num" literal that pass 2
+# will promote to a real BigInt via rt_bigint_from_decimal_str -- MUST
+# stay in the same encounter order and use the SAME tower-ctor-arg
+# exclusion as x64_emit_instr's own Const branch, or the two passes'
+# label counters (both driven by the same shared x64_string_label_next
+# counter) desync and every subsequent string label in the function
+# points at the wrong .data block.
 make a function called x64_collect_string_data takes ir returns asm
   x64_string_label_reset()
   let funcs = ir[2]
@@ -211,6 +267,7 @@ make a function called x64_collect_string_data takes ir returns asm
   let fn_n = to_num(list_len(funcs))
   while fn_i < fn_n do
     let instrs = funcs[fn_i][3]
+    let tower_ctor_arg_indices = x64_tower_ctor_arg_indices(instrs)
     let i = 0
     let n = to_num(list_len(instrs))
     while i < n do
@@ -221,6 +278,19 @@ make a function called x64_collect_string_data takes ir returns asm
           sb_push(sb, label + ":" + x64_nl_char())
           sb_push(sb, "    dq " + to_num(sc_len(str_intern(instr[2]))) + x64_nl_char())
           sb_push(sb, "    db " + x64_bytes_of(instr[2]) + x64_nl_char())
+        else
+          if instr[1] == "num" then
+            if not x64_contains(instr[2], ".") then
+              if not x64_str_in_list(tower_ctor_arg_indices, i) then
+                if x64_num_const_needs_bigint_promotion(instr[2]) then
+                  let label = x64_string_label_next()
+                  sb_push(sb, label + ":" + x64_nl_char())
+                  sb_push(sb, "    dq " + to_num(sc_len(str_intern(instr[2]))) + x64_nl_char())
+                  sb_push(sb, "    db " + x64_bytes_of(instr[2]) + x64_nl_char())
+                end
+              end
+            end
+          end
         end
       end
       let i = i + 1
@@ -5217,48 +5287,30 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
           # silently never matched. Fixed by comparing the literal's
           # own RAW SOURCE TEXT instead of its parsed numeric value --
           # sidesteps this parser bug entirely, and is simpler besides.
-          let is_excluded = false
-          if instr[2] == "1152921504606846976" then
-            let is_excluded = true
-          end
-          if instr[2] == "1153765929536978944" then
-            let is_excluded = true
-          end
-          if instr[2] == "1154891829443821568" then
-            let is_excluded = true
-          end
-          if instr[2] == "1157425104234217472" then
-            let is_excluded = true
-          end
-          if instr[2] == "2305843009213693952" then
-            let is_excluded = true
-          end
-          if instr[2] == "3458764513820540928" then
-            let is_excluded = true
-          end
-          if instr[2] == "4611686018427387904" then
-            let is_excluded = true
-          end
-          if instr[2] == "5764607523034234880" then
-            let is_excluded = true
-          end
-          if instr[2] == "17293822569102704640" then
-            let is_excluded = true
-          end
-          if instr[2] == "281474976710655" then
-            let is_excluded = true
-          end
-          let val = to_num(instr[2])
-          if is_excluded then
-            let val = 0
-          end
+          # (Exclusion list + magnitude check now shared with pass 1's
+          # x64_collect_string_data via x64_num_const_needs_bigint_
+          # promotion -- see GitHub #40.)
+          let needs_promotion = x64_num_const_needs_bigint_promotion(instr[2])
           if is_tower_ctor_arg then
-            let val = 0
+            let needs_promotion = false
           end
-          if (val > 140737488355327) or (val < 0 - 140737488355327) then
-            sb_push(sb, "    mov rax, " + instr[2] + x64_nl_char())
+          if needs_promotion then
+            # GitHub #40: a bare `mov rax, <text>` + rt_bigint_from_i64
+            # silently corrupted any literal whose bit pattern's top
+            # bit is set (e.g. 18446744073709551615, u64::MAX, encodes
+            # to the same 64 bits as -1) since rt_bigint_from_i64
+            # sign-extends its single register argument -- and could
+            # never represent a literal larger than 2^64-1 at all
+            # (no register holds it). Fixed: parse the literal's own
+            # decimal TEXT directly via rt_bigint_from_decimal_str,
+            # loaded from the .data label x64_collect_string_data (pass
+            # 1) already reserved for this exact instruction.
+            let label = x64_string_label_next()
+            sb_push(sb, "    lea rax, [rel " + label + "]" + x64_nl_char())
+            sb_push(sb, "    mov rcx, 2305843009213693952" + x64_nl_char())
+            sb_push(sb, "    or rax, rcx" + x64_nl_char())
             sb_push(sb, "    push rax" + x64_nl_char())
-            sb_push(sb, "    call rt_bigint_from_i64" + x64_nl_char())
+            sb_push(sb, "    call rt_bigint_from_decimal_str" + x64_nl_char())
             sb_push(sb, "    add rsp, 8" + x64_nl_char())
             sb_push(sb, "    push rax" + x64_nl_char())
           else

@@ -3,6 +3,19 @@
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     Number(f64),
+    // GitHub #39: an integer literal whose decimal TEXT doesn't fit in an
+    // i64 (e.g. `17293822569102704640`). Number(f64) is lossy/saturating
+    // for such literals -- the lexer used to always emit Number(f64) for
+    // any digit-only literal, converting to f64 immediately and losing
+    // the exact value; downstream `as i64` casts then SATURATE to
+    // i64::MAX/MIN instead of erroring or promoting to a real BigInt, a
+    // silent-corruption bug confirmed directly (`print(17293822569102704640)`
+    // gave `9223372036854775807`). Kept as a SEPARATE variant (not a
+    // change to Number's own shape) so every existing Number(f64)
+    // consumer is completely unaffected for the overwhelmingly common
+    // in-range case -- only code that needs to handle a literal this
+    // large has to do anything new at all.
+    BigNumber(String),
     // Stage 36: a literal written with a decimal point (`42.5`), distinct
     // from `Number` (`42`) so the IR lowering step can pick the fast `Int`
     // path by default and only pay for `Float` when the source explicitly
@@ -140,7 +153,7 @@ impl TokenExpectation {
     /// lookahead buffer) against an expected set using the same names.
     pub fn classify_token(tok: &Token) -> TokenExpectation {
         match tok {
-            Token::Number(_) | Token::Float(_) => TokenExpectation::Digit,
+            Token::Number(_) | Token::Float(_) | Token::BigNumber(_) => TokenExpectation::Digit,
             Token::Dot => TokenExpectation::Dot,
             Token::Plus | Token::Minus | Token::Star | Token::Slash | Token::Percent
             | Token::Equal | Token::EqualEqual | Token::NotEqual
@@ -301,13 +314,23 @@ impl<'a> Lexer<'a> {
                 // Operator, Terminator) is not a valid numeric continuation —
                 // stop here and let the next `next_token` call classify it.
                 let num_str = &self.input[start..self.position];
-                let num = num_str.parse::<f64>().unwrap_or(0.0);
                 if is_float {
+                    let num = num_str.parse::<f64>().unwrap_or(0.0);
                     lex_debug!("[DEBUG][lexer] Returning Token::Float({})", num);
                     return Ok(Token::Float(num));
                 }
-                lex_debug!("[DEBUG][lexer] Returning Token::Number({})", num);
-                return Ok(Token::Number(num));
+                // GitHub #39: try the exact i64 parse first -- if the
+                // literal's decimal text doesn't fit i64, emit BigNumber
+                // (preserving the exact text) instead of silently losing
+                // precision through an f64 round-trip. Only integer
+                // literals reach this branch (is_float is false here).
+                if let Ok(_) = num_str.parse::<i64>() {
+                    let num = num_str.parse::<f64>().unwrap_or(0.0);
+                    lex_debug!("[DEBUG][lexer] Returning Token::Number({})", num);
+                    return Ok(Token::Number(num));
+                }
+                lex_debug!("[DEBUG][lexer] Returning Token::BigNumber({})", num_str);
+                return Ok(Token::BigNumber(num_str.to_string()));
             }
             // Identifiers and keywords (allow trailing '?' like any?)
         if c.is_ascii_alphabetic() || c == '_' {

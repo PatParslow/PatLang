@@ -7,6 +7,11 @@ pub enum Expr {
     // Written without a decimal point in source (`42`) — lowers to the fast
     // Value::Int path (Stage 36 numeric tower).
     Number(f64),
+    // GitHub #39: an integer literal whose exact decimal text doesn't fit
+    // an i64 (see lexer.rs's own Token::BigNumber header for the full
+    // reasoning) -- lowers to a real Value::BigInt built from this exact
+    // text, never through a lossy f64/i64 round-trip.
+    BigNumber(String),
     // Written with a decimal point in source (`42.5`) — lowers to
     // Value::Float, standard IEEE double semantics.
     Float(f64),

@@ -476,7 +476,7 @@ impl Lowerer {
 
     fn expr_is_safe(&self, e: &Expr) -> bool {
         match e {
-            Expr::Number(_) | Expr::Float(_) | Expr::String(_) => true,
+            Expr::Number(_) | Expr::BigNumber(_) | Expr::Float(_) | Expr::String(_) => true,
             Expr::Identifier(name) => name == "true" || name == "false" || self.known_locals.contains_key(name),
             Expr::List(items) => items.iter().all(|it| self.expr_is_safe(it)),
             // Member reads lower to len/get host calls; safe when the object expr is safe
@@ -534,6 +534,18 @@ impl Lowerer {
             // Whole-number literal source syntax (no decimal point) stays on
             // the fast Int path by default (Stage 36 numeric tower).
             Expr::Number(n) => f.body.push(Instr::Const(Value::Int(*n as i64))),
+            // GitHub #39: a literal whose exact text doesn't fit i64 (see
+            // lexer.rs's Token::BigNumber header) -- parse the ORIGINAL
+            // decimal text directly into a real, exact BigInt, never
+            // through the lossy f64 Expr::Number(n) path above (whose
+            // `*n as i64` cast SATURATES to i64::MAX/MIN for anything
+            // this large, silently corrupting the value -- confirmed
+            // exactly: `print(17293822569102704640)` gave
+            // `9223372036854775807` before this fix).
+            Expr::BigNumber(s) => {
+                let b: num_bigint::BigInt = s.parse().unwrap_or_else(|_| num_bigint::BigInt::from(0));
+                f.body.push(Instr::Const(Value::BigInt(b)));
+            }
             Expr::Float(n) => f.body.push(Instr::Const(Value::Float(*n))),
             Expr::String(s) => f.body.push(Instr::Const(Value::String((s.clone()).into()))),
             Expr::Identifier(name) => {
@@ -970,7 +982,7 @@ fn collect_ident_expr(e: &Expr, out: &mut Vec<String>, seen: &mut HashSet<String
                 if seen.insert(n.clone()) { out.push(n); }
             }
         }
-        Expr::Number(_) | Expr::Float(_) | Expr::String(_) => {}
+        Expr::Number(_) | Expr::BigNumber(_) | Expr::Float(_) | Expr::String(_) => {}
         Expr::Budgeted { ms, existing, body } => {
             collect_ident_expr(ms, out, seen);
             if let Some(e) = existing { collect_ident_expr(e, out, seen); }
@@ -1000,6 +1012,7 @@ pub fn rule_arg_text(e: &Expr) -> String {
 pub fn expr_to_text(e: &Expr) -> String {
     match e {
         Expr::Number(n) => format!("{}", *n as i64),
+        Expr::BigNumber(s) => s.clone(),
         Expr::Float(n) => n.to_string(),
         Expr::String(s) => format!("\"{}\"", s),
         Expr::Identifier(name) => name.clone(),

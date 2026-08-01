@@ -127,7 +127,7 @@ impl<'a> Parser<'a> {
     fn can_start_statement(&self) -> bool {
         match self.curr {
             Token::Let | Token::Fn | Token::If | Token::While | Token::Return | Token::Goal | Token::Rule => true,
-            Token::Identifier(_) | Token::Number(_) | Token::Float(_) | Token::String(_) | Token::LParen | Token::BlockStart => true, // expression stmt
+            Token::Identifier(_) | Token::Number(_) | Token::BigNumber(_) | Token::Float(_) | Token::String(_) | Token::LParen | Token::BlockStart => true, // expression stmt
             _ => false,
         }
     }
@@ -1260,6 +1260,7 @@ impl<'a> Parser<'a> {
             Token::BNot => { self.advance()?; let inner = self.parse_primary()?; Expr::UnaryOp { op: "bnot".into(), expr: Box::new(inner) } }
             Token::Minus => { self.advance()?; let inner = self.parse_primary()?; Expr::UnaryOp { op: "-".into(), expr: Box::new(inner) } }
             Token::Number(n) => { let v = *n; self.advance()?; Expr::Number(v) }
+            Token::BigNumber(s) => { let v = s.clone(); self.advance()?; Expr::BigNumber(v) }
             Token::Float(n) => { let v = *n; self.advance()?; Expr::Float(v) }
             Token::String(s) => { let v = s.clone(); self.advance()?; Expr::String(v) }
             Token::Goal => { self.advance()?; Expr::Identifier("goal".to_string()) }
@@ -1480,7 +1481,7 @@ impl<'a> Parser<'a> {
 // comparison expression, or a list built from such.
 fn is_side_effect_free_expr(e: &Expr) -> bool {
     match e {
-        Expr::Number(_) | Expr::Float(_) | Expr::String(_) | Expr::Identifier(_) => true,
+        Expr::Number(_) | Expr::BigNumber(_) | Expr::Float(_) | Expr::String(_) | Expr::Identifier(_) => true,
         Expr::List(items) => items.iter().all(is_side_effect_free_expr),
         Expr::UnaryOp { expr, .. } => is_side_effect_free_expr(expr),
         Expr::BinaryOp { left, right, .. } => is_side_effect_free_expr(left) && is_side_effect_free_expr(right),

@@ -1663,6 +1663,76 @@ make a function called rt_bigint_from_i64 takes n returns tagged
   return addr bor rt_bigint_tag()
 end
 
+# GitHub #40: rt_bigint_from_i64 only ever received a single i64
+# register value, sign-extended -- correct for arithmetic-overflow
+# promotion (the value genuinely started as a real i64/f64 computation)
+# but WRONG for an oversized integer LITERAL whose bit pattern exceeds
+# i64's signed range: a literal like 18446744073709551615 (u64::MAX)
+# encodes, as a bare 64-bit register value, to the same bit pattern as
+# -1 -- passing that through rt_bigint_from_i64 silently built BigInt
+# "-1" instead of the real magnitude. Worse, a literal genuinely LARGER
+# than 2^64-1 can't even be expressed as a single register value at
+# all, so no i64-based constructor could ever cover it. Fixed by
+# parsing the literal's own DECIMAL TEXT directly into base-10^9 limbs
+# (exploiting that 9 decimal digits always fit in one limb) --
+# handles both the u64-range sign bug and arbitrary-length literals in
+# one general mechanism, with no register-width ceiling at all.
+make a function called rt_bigint_from_decimal_str takes s returns tagged
+  let len = rt_str_len(s)
+  let sign = 0
+  let start = 0
+  if len > 0 then
+    if char_code(s, 0) == 45 then
+      let sign = 1
+      let start = 1
+    end
+  end
+  let i = start
+  while (i < len - 1) and (char_code(s, i) == 48) do
+    let i = i + 1
+  end
+  let start = i
+  let digit_len = len - start
+  let n_limbs = (digit_len + 8) / 9
+  if n_limbs < 1 then
+    let n_limbs = 1
+  end
+  let first_chunk_len = digit_len - (n_limbs - 1) * 9
+  let addr = rt_heap_alloc(16 + n_limbs * 8)
+  mem_poke_qword(addr, 8, n_limbs)
+  let pos = start
+  let val = 0
+  let k = 0
+  while k < first_chunk_len do
+    let val = val * 10 + (char_code(s, pos) - 48)
+    let pos = pos + 1
+    let k = k + 1
+  end
+  mem_poke_qword(addr, 16 + (n_limbs - 1) * 8, val)
+  let limb_idx = n_limbs - 2
+  while limb_idx >= 0 do
+    let val = 0
+    let k = 0
+    while k < 9 do
+      let val = val * 10 + (char_code(s, pos) - 48)
+      let pos = pos + 1
+      let k = k + 1
+    end
+    mem_poke_qword(addr, 16 + limb_idx * 8, val)
+    let limb_idx = limb_idx - 1
+  end
+  # A literal that's all zero digits (e.g. "-0", never written by a
+  # real user but cheap to guard) must not carry a stray sign bit --
+  # matches rt_bigint_from_i64(0)'s own always-sign-0 convention.
+  if n_limbs == 1 then
+    if mem_peek_qword(addr, 16) == 0 then
+      let sign = 0
+    end
+  end
+  mem_poke_qword(addr, 0, sign)
+  return addr bor rt_bigint_tag()
+end
+
 make a function called rt_bigint_to_string takes tagged returns s
   let addr = tagged band rt_payload_mask()
   let sign = mem_peek_qword(addr, 0)

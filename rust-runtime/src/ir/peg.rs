@@ -203,7 +203,7 @@ struct PTok {
 
 fn adapt_token(t: &Token) -> PTok {
     let (category, text): (&'static str, String) = match t {
-        Token::Number(_) | Token::Float(_) => ("NUM", String::new()),
+        Token::Number(_) | Token::BigNumber(_) | Token::Float(_) => ("NUM", String::new()),
         Token::String(s) => ("STR", s.clone()),
         Token::Identifier(s) => ("IDENT", s.clone()),
         Token::Plus => ("OP", "+".into()),
