@@ -1,0 +1,234 @@
+# =============================================================================
+# patmake: a general-purpose, GOAP-based build-dependency orchestrator.
+#
+# Targets and their dependency edges live in a manifest file, not in this
+# tool -- the SAME orchestrator serves any project's build graph, and this
+# repo's own patc1.exe/x64_runtime.obj bootstrap is just the first real
+# config for it (self_hosting/patmake.manifest), not a special case baked
+# into the tool itself. General case first, configure for the specific
+# one second.
+#
+# Deliberately does NOT reimplement per-target staleness detection (no
+# content hashing here). Every target's own build command is REQUIRED to
+# already be idempotent/cheap-when-unchanged -- exactly the pattern
+# build_patc1.patlang and build_x64_runtime.patlang already follow (each
+# hashes its own real inputs against a stored fingerprint and skips the
+# expensive rebuild when nothing changed). patmake's only real job is
+# correct DEPENDENCY ORDER: a genuine GOAP forward-search plan (action_add/
+# plan), the exact mechanism self_hosting/lib/build_daemon.patlang already
+# proved out for a synthetic graph, here wired to a manifest-driven real
+# one instead. Every target's command then runs UNCONDITIONALLY in that
+# order -- each one's own internal staleness check decides whether real
+# work happens, so invoking patmake costs almost nothing when nothing
+# changed, and structurally can't leave a stale artifact behind the way a
+# human forgetting to run one of two separate scripts can.
+#
+# This tool exists because of a real, several-hour incident: GitHub #40's
+# fix silently gave wrong output on EVERY --x64 compile because
+# self_hosting/build/x64_runtime.obj was stale (its own build script,
+# build_x64_runtime.patlang, was simply never re-invoked after editing
+# x64_runtime.patlang) -- the individual build script's own staleness
+# check was correct throughout; the missing piece was something to make
+# sure ALL of a multi-step build's scripts get run, in the right order,
+# every time, without relying on a human remembering the full list.
+#
+# Manifest format, one target per line, '#'-prefixed lines and blank
+# lines ignored:
+#   name : command : dep1,dep2,...
+# `command` may be empty (a pure grouping target, e.g. "all" that just
+# names a set of dependencies with no work of its own). Up to 5
+# whitespace-separated words in `command` are supported (program path
+# plus up to 4 arguments) -- generous headroom for this project's own
+# targets, which are all short `pat --ir-run <script>` invocations.
+#
+# Usage: patmake <manifest> <goal-target>
+# =============================================================================
+
+include "../lib/includes.patlang"
+
+make a function called pm_split_ws takes s returns parts
+  let parts = []
+  let cur = sb_new()
+  let i = 0
+  while i <= s.length do
+    let c = char_code(s, i)
+    if (c == 32) or (c == -1) then
+      let word = sb_str(cur)
+      if word != "" then
+        let parts = list_push(parts, word)
+      end
+      let cur = sb_new()
+    else
+      sb_push(cur, s[i])
+    end
+    let i = i + 1
+  end
+  return parts
+end
+
+# Splits on ':' into up to 3 pieces (name, command, deps) -- a command
+# never itself contains a colon (this project's targets are plain
+# `program arg arg` invocations), so a simple left-to-right split is
+# sufficient; the third piece is everything after the SECOND colon,
+# unsplit further.
+make a function called pm_split_colon takes s returns parts
+  let out = []
+  let cur = sb_new()
+  let i = 0
+  let n = s.length
+  while (i < n) and (out.length < 2) do
+    let c = char_code(s, i)
+    if c == 58 then
+      let out = list_push(out, str_trim(sb_str(cur)))
+      let cur = sb_new()
+    else
+      sb_push(cur, s[i])
+    end
+    let i = i + 1
+  end
+  let rest = sb_str(cur)
+  if i < n then
+    let rest = rest + substr(s, i, n - i)
+  end
+  let out = list_push(out, str_trim(rest))
+  while out.length < 3 do
+    let out = list_push(out, "")
+  end
+  return out
+end
+
+make a function called pm_split_commas takes s returns items
+  let out = []
+  let cur = sb_new()
+  let i = 0
+  let n = s.length
+  while i <= n do
+    let c = char_code(s, i)
+    if (c == 44) or (c == -1) then
+      let piece = str_trim(sb_str(cur))
+      if piece != "" then
+        let out = list_push(out, piece)
+      end
+      let cur = sb_new()
+    else
+      sb_push(cur, s[i])
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# Returns [[name, command, [deps...]], ...].
+make a function called pm_load_manifest takes path returns targets
+  let out = []
+  let text = read_file(path)
+  let lines = split_lines(text)
+  let i = 0
+  let n = lines.length
+  while i < n do
+    let raw = str_trim(lines[i])
+    if raw != "" then
+      if char_code(raw, 0) != 35 then
+        let fields = pm_split_colon(raw)
+        let name = fields[0]
+        let command = fields[1]
+        let deps = pm_split_commas(fields[2])
+        if name != "" then
+          let out = list_push(out, [name, command, deps])
+        end
+      end
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called pm_find takes targets, name returns entry
+  let i = 0
+  let n = targets.length
+  while i < n do
+    if targets[i][0] == name then
+      return targets[i]
+    end
+    let i = i + 1
+  end
+  return ["", "", []]
+end
+
+# Runs `command` (up to 5 whitespace-separated words) via exec_capture,
+# printing its combined stdout/stderr. Unused argument slots are passed
+# as `false` -- host_exec_capture's own arg filter keeps only String
+# values from its variadic tail, so non-string padding is silently
+# dropped rather than becoming a spurious empty-string argv entry.
+make a function called pm_run_command takes command returns done
+  let words = pm_split_ws(command)
+  let w0 = ""
+  let w1 = false
+  let w2 = false
+  let w3 = false
+  let w4 = false
+  if words.length >= 1 then
+    let w0 = words[0]
+  end
+  if words.length >= 2 then
+    let w1 = words[1]
+  end
+  if words.length >= 3 then
+    let w2 = words[2]
+  end
+  if words.length >= 4 then
+    let w3 = words[3]
+  end
+  if words.length >= 5 then
+    let w4 = words[4]
+  end
+  let out = exec_capture(w0, w1, w2, w3, w4)
+  print(out)
+  return true
+end
+
+make a function called pm_run takes manifest_path, goal_name returns done
+  let targets = pm_load_manifest(manifest_path)
+  let i = 0
+  let n = targets.length
+  while i < n do
+    let entry = targets[i]
+    let name = entry[0]
+    let deps = entry[2]
+    let preconds = []
+    let j = 0
+    let dn = deps.length
+    while j < dn do
+      let preconds = list_push(preconds, ["built", [deps[j]]])
+      let j = j + 1
+    end
+    action_add(name, preconds, [["built", [name]]], [], 1)
+    let i = i + 1
+  end
+  let build_plan = plan([["built", [goal_name]]])
+  if build_plan.length == 0 then
+    print("[patmake] nothing to build for goal: " + goal_name + " (unknown target, or it and its deps are all grouping-only)")
+  end
+  let i = 0
+  let plan_len = build_plan.length
+  while i < plan_len do
+    let name = build_plan[i]
+    let entry = pm_find(targets, name)
+    let command = entry[1]
+    if (command == "") or (command == "-") then
+      print("[patmake] " + name + ": (grouping target, no command)")
+    else
+      print("[patmake] " + name + ": " + command)
+      pm_run_command(command)
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+let raw_args = argv()
+if raw_args.length < 2 then
+  print("usage: patmake <manifest> <goal-target>")
+else
+  pm_run(raw_args[0], raw_args[1])
+end
