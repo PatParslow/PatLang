@@ -1773,15 +1773,39 @@ make a function called x64_binop_asm_dynamic takes op, spilled returns asm
   let sb = sb_new()
   sb_push(sb, "    pop qword [rbp-" + dyn_b + "]" + x64_nl_char())
   sb_push(sb, "    pop qword [rbp-" + dyn_a + "]" + x64_nl_char())
-  sb_push(sb, "    mov r15, 18446462598732840960" + x64_nl_char())
+  # GitHub #38: this fast-path gate used to test "are this operand's
+  # top 16 bits zero" (TAGMASK) as a stand-in for "does it genuinely
+  # fit this backend's 48-bit SIGNED fixnum range" -- but those aren't
+  # the same test. A value between 2^47 and 2^48 (e.g. 987654321098765)
+  # has zero top-16-bits (passes the old check) but bit 47 -- the sign
+  # position for a 48-bit signed value -- IS set, so the very next
+  # `shl 16; sar 16` normalization below wrongly sign-extends it as
+  # negative, corrupting it before the real add/sub/mul even runs
+  # (confirmed exactly: `123456789012345 + 987654321098765` silently
+  # gave `0`). Fixed to the SAME round-trip-through-48-bit-sign-
+  # extension test already used correctly everywhere else in this
+  # file (the DYN_NOTFAST branch's own FAMOK1/FAMOK2 checks, and the
+  # mod/div dynamic fast-paths) -- true only for a genuine fixnum
+  # (positive or negative), false for anything else, including this
+  # exact "looks small but exceeds the signed range" case.
   sb_push(sb, "    mov rax, [rbp-" + dyn_a + "]" + x64_nl_char())
-  sb_push(sb, "    and rax, r15" + x64_nl_char())
-  sb_push(sb, "    mov r10, [rbp-" + dyn_b + "]" + x64_nl_char())
-  sb_push(sb, "    and r10, r15" + x64_nl_char())
   sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+  sb_push(sb, "    je .DYN_FASTOK1_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rcx, rax" + x64_nl_char())
+  sb_push(sb, "    shl rcx, 16" + x64_nl_char())
+  sb_push(sb, "    sar rcx, 16" + x64_nl_char())
+  sb_push(sb, "    cmp rcx, rax" + x64_nl_char())
   sb_push(sb, "    jne .DYN_NOTFAST_" + suffix + x64_nl_char())
+  sb_push(sb, ".DYN_FASTOK1_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov r10, [rbp-" + dyn_b + "]" + x64_nl_char())
   sb_push(sb, "    cmp r10, 0" + x64_nl_char())
+  sb_push(sb, "    je .DYN_FASTOK2_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rcx, r10" + x64_nl_char())
+  sb_push(sb, "    shl rcx, 16" + x64_nl_char())
+  sb_push(sb, "    sar rcx, 16" + x64_nl_char())
+  sb_push(sb, "    cmp rcx, r10" + x64_nl_char())
   sb_push(sb, "    jne .DYN_NOTFAST_" + suffix + x64_nl_char())
+  sb_push(sb, ".DYN_FASTOK2_" + suffix + ":" + x64_nl_char())
   sb_push(sb, "    mov rax, [rbp-" + dyn_a + "]" + x64_nl_char())
   sb_push(sb, "    shl rax, 16" + x64_nl_char())
   sb_push(sb, "    sar rax, 16" + x64_nl_char())
@@ -5093,7 +5117,7 @@ make a function called label_asm_safe takes ignored returns label
   return "" + n
 end
 
-make a function called x64_emit_instr takes instr, func_name, regmap, spilled, label, is_float_bin, is_float_const, is_dynamic_bin, bool_print_override, float_print_override returns asm
+make a function called x64_emit_instr takes instr, func_name, regmap, spilled, label, is_float_bin, is_float_const, is_dynamic_bin, bool_print_override, float_print_override, is_tower_ctor_arg returns asm
   let sb = sb_new()
   sb_push(sb, label + ":" + x64_nl_char())
   let ty = instr[0]
@@ -5128,10 +5152,120 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
         # __float64__ wrapper regardless, so check both.
         if is_float_const or x64_contains(instr[2], ".") then
           sb_push(sb, "    mov rax, __float64__(" + x64_float_literal_text(instr[2]) + ")" + x64_nl_char())
+          sb_push(sb, "    push rax" + x64_nl_char())
         else
-          sb_push(sb, "    mov rax, " + instr[2] + x64_nl_char())
+          # GitHub #38 investigation, second and deeper bug found: a
+          # bare integer LITERAL exceeding this backend's 48-bit signed
+          # fixnum range (+-140737488355327) was ALWAYS emitted as a
+          # raw untagged `mov rax, <literal>` regardless of magnitude
+          # -- no promotion ever happens for a literal that's already
+          # "too big" from the moment it's created (promotion only
+          # ever triggers on ARITHMETIC overflow, detected after an
+          # operation). Such a value then matches NEITHER "genuine
+          # fixnum" (fails the round-trip test) NOR "real tagged
+          # BigInt" (its family nibble is 0, since it was never
+          # actually tagged) in any downstream dynamic dispatch --
+          # confirmed exactly: `123456789012345 + 987654321098765`
+          # (987654321098765 needs 50 bits, already past the 48-bit
+          # boundary as a bare literal) silently gave `0`, having
+          # fallen through `x64_binop_asm_dynamic`'s `DYN_OBJ_` catch-
+          # all (neither a valid fixnum nor a recognized tag) to its
+          # generic GIVEUP default. Fixed at the source: a literal
+          # this large is promoted to a genuine BigInt (tagged via
+          # `rt_bigint_from_i64`) the moment it's constructed, so every
+          # value reaching arithmetic is either a genuine <=48-bit
+          # fixnum or a properly tagged BigInt -- restoring the
+          # invariant the rest of this backend's tagging scheme already
+          # assumes. `to_num` here parses on the COMPILER's own host
+          # side (a real, full-precision number), not the TARGET
+          # program's constrained 48-bit representation, so this
+          # comparison itself can't overflow.
+          # Real bug found and fixed here (same CLASS as the
+          # rt_payload_mask fix earlier this session, but a name-prefix
+          # exclusion doesn't cover it): x64_runtime.patlang's OWN
+          # functions embed large literal constants as RAW BIT
+          # PATTERNS (family/tag masks like 1152921504606846976,
+          # 17293822569102704640) -- NOT user-facing numbers -- and
+          # unconditionally promoting THOSE via rt_bigint_from_i64
+          # corrupted the runtime's own tagging scheme wholesale
+          # (confirmed: even `20000000 * 20000000` broke, since
+          # rt_bigint_from_i64/print themselves stopped working once
+          # their own tag constants got mis-promoted). An `x64_func_
+          # is_tower_impl`-style rt_/mem_-prefix exclusion does NOT
+          # cover this: `print()` itself uses these exact constants as
+          # bare comparison literals in its OWN body and isn't rt_/
+          # mem_-prefixed -- and as the user pointed out mid-fix,
+          # there's no principled way to call ANY PatLang function
+          # "not user code", since x64_runtime.patlang is itself
+          # ordinary PatLang compiled by this same pipeline. A real fix
+          # (a function declaring "my literals are raw bits, exempt me
+          # from numeric-tower semantics") is GitHub #33-adjacent
+          # scope, not done here. Interim, narrower mitigation instead:
+          # never promote a literal whose value EXACTLY matches one of
+          # this backend's own known tag/mask constants -- a real
+          # user-facing number essentially never coincidentally equals
+          # one of these specific values.
+          # Real bug found while testing THIS exclusion list itself:
+          # PatLang's own literal parser silently CLAMPS an integer
+          # literal exceeding i64::MAX to i64::MAX at parse time,
+          # rather than promoting it to a real BigInt the way
+          # arithmetic OVERFLOW correctly does -- confirmed directly
+          # (`print(17293822569102704640)` gives `9223372036854775807`,
+          # not the real value). This meant `to_num(instr[2])` could
+          # never equal the numerically-correct comparison value for
+          # family_mask (which exceeds i64::MAX), so the exclusion
+          # silently never matched. Fixed by comparing the literal's
+          # own RAW SOURCE TEXT instead of its parsed numeric value --
+          # sidesteps this parser bug entirely, and is simpler besides.
+          let is_excluded = false
+          if instr[2] == "1152921504606846976" then
+            let is_excluded = true
+          end
+          if instr[2] == "1153765929536978944" then
+            let is_excluded = true
+          end
+          if instr[2] == "1154891829443821568" then
+            let is_excluded = true
+          end
+          if instr[2] == "1157425104234217472" then
+            let is_excluded = true
+          end
+          if instr[2] == "2305843009213693952" then
+            let is_excluded = true
+          end
+          if instr[2] == "3458764513820540928" then
+            let is_excluded = true
+          end
+          if instr[2] == "4611686018427387904" then
+            let is_excluded = true
+          end
+          if instr[2] == "5764607523034234880" then
+            let is_excluded = true
+          end
+          if instr[2] == "17293822569102704640" then
+            let is_excluded = true
+          end
+          if instr[2] == "281474976710655" then
+            let is_excluded = true
+          end
+          let val = to_num(instr[2])
+          if is_excluded then
+            let val = 0
+          end
+          if is_tower_ctor_arg then
+            let val = 0
+          end
+          if (val > 140737488355327) or (val < 0 - 140737488355327) then
+            sb_push(sb, "    mov rax, " + instr[2] + x64_nl_char())
+            sb_push(sb, "    push rax" + x64_nl_char())
+            sb_push(sb, "    call rt_bigint_from_i64" + x64_nl_char())
+            sb_push(sb, "    add rsp, 8" + x64_nl_char())
+            sb_push(sb, "    push rax" + x64_nl_char())
+          else
+            sb_push(sb, "    mov rax, " + instr[2] + x64_nl_char())
+            sb_push(sb, "    push rax" + x64_nl_char())
+          end
         end
-        sb_push(sb, "    push rax" + x64_nl_char())
       end
     end
   else
@@ -5515,6 +5649,11 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
   if dynamic_mode then
     let dyn_bin_indices = x64_analyze_dynamic_bins(instrs)
   end
+  # GitHub #38 follow-up: see x64_tower_ctor_arg_indices's own header --
+  # a bare oversized literal passed directly to a tower-constructor
+  # call must skip the new Const auto-promotion, since the constructor
+  # already promotes its own raw argument.
+  let tower_ctor_arg_indices = x64_tower_ctor_arg_indices(instrs)
   # Register allocation (Slice 8, see x64_reg_pool/x64_build_regmap):
   # eligible locals get a dedicated rbx/r13/r14 for their whole function
   # lifetime instead of a stack slot; everything else spills exactly as
@@ -5631,7 +5770,8 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
       let is_dynamic_bin = x64_str_in_list(dyn_bin_indices, i)
       let is_float_bin = x64_str_in_list(float_instr_indices, i)
       let is_float_const = x64_str_in_list(float_const_indices, i)
-      sb_push(sb, x64_emit_instr(instr, func_name, regmap, spilled, label, is_float_bin, is_float_const, is_dynamic_bin, is_bool_print, is_float_print))
+      let is_tower_ctor_arg = x64_str_in_list(tower_ctor_arg_indices, i)
+      sb_push(sb, x64_emit_instr(instr, func_name, regmap, spilled, label, is_float_bin, is_float_const, is_dynamic_bin, is_bool_print, is_float_print, is_tower_ctor_arg))
       let i = i + 1
     end
   end
@@ -5684,6 +5824,69 @@ end
 # plain int despite the function being float_mode -- because they sit
 # in a straight-line Const/Load run immediately preceding a Call to a
 # named, non-float-mode callee.
+# GitHub #38 follow-up, real bug found and fixed: a bare oversized
+# literal used DIRECTLY as the argument to a tower-CONSTRUCTOR call
+# (e.g. `rt_bigint_from_i64(987654321098765)`, exactly
+# x64_bigint_demo.patlang's own explicit-construction pattern) must
+# NOT be auto-promoted by x64_emit_instr's new Const-promotion logic
+# -- that logic exists so a bare literal reaching ARITHMETIC directly
+# (with no explicit constructor call at all, e.g. bench_bigint_arith's
+# `c + d`) still ends up correctly tagged; but rt_bigint_from_i64
+# itself already expects and promotes a PLAIN raw i64 argument. Pre-
+# promoting it first hands the constructor an already-tagged POINTER
+# instead of the raw int it decomposes into limbs, corrupting the
+# result. Mirrors #18's own `x64_call_arg_int_overrides` structure
+# exactly (straight-line Const/Load run immediately before a Call),
+# just checking against the fixed set of tower-constructor names
+# instead of "callee isn't float_mode".
+make a function called x64_tower_ctor_names returns names
+  return ["rt_bigint_from_i64", "rt_rational_from_i64", "rt_complex_from_i64", "rt_interval_from_i64", "rt_complex_from_num", "rt_interval_from_num"]
+end
+
+make a function called x64_tower_ctor_arg_indices takes instrs returns indices
+  let out = []
+  let n = to_num(list_len(instrs))
+  let i = 0
+  while i < n do
+    let instr = instrs[i]
+    if instr[0] == "Call" then
+      let argc = to_num(instr[2])
+      if argc > 0 then
+        let start = i - argc
+        if start >= 0 then
+          let straight_line = true
+          let j = start
+          while j < i do
+            let jty = instrs[j][0]
+            if (jty != "Const") and (jty != "Load") then
+              let straight_line = false
+            end
+            let j = j + 1
+          end
+          if straight_line then
+            if x64_str_in_list(x64_tower_ctor_names(), instr[1]) then
+              let j = start
+              while j < i do
+                let cur = instrs[j]
+                if cur[0] == "Const" then
+                  if cur[1] == "num" then
+                    if not x64_contains(cur[2], ".") then
+                      let out = list_push(out, j)
+                    end
+                  end
+                end
+                let j = j + 1
+              end
+            end
+          end
+        end
+      end
+    end
+    let i = i + 1
+  end
+  return out
+end
+
 make a function called x64_call_arg_int_overrides takes instrs, float_func_names returns overrides
   let overrides = []
   let n = to_num(list_len(instrs))
