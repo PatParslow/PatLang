@@ -15,6 +15,11 @@ Feature: arithmetic operators + - * / % (plain integers)
     When evaluated
     Then the result is -1, matching truncating division convention (like Rust/C, unlike Python's floored modulo)
 
+  Scenario: Ordinary int arithmetic stays int (representation invariant, GitHub #49)
+    Given x = 2 + 3 * 4
+    When numeric_kind(x) is captured
+    Then ensure x_kind == int
+
   Note: this spec covers PLAIN INTEGER arithmetic only. Cross-type
   behaviour (Int+Float, Rational, BigInt overflow promotion, Complex)
   is real and already covered by a separate, previously-verified

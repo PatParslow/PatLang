@@ -57,6 +57,10 @@ PatLang was deliberately pushed to self-host: the lexer, parser, lowerer, and co
 
 4. **Report**: State command, output, and exact spec alignment.
 
+5. **Standing language-spec gate** (GitHub #49): `spec_library/language/*.feature` is executable, not prose — wired via `self_hosting/lib/spec_steps_language.patlang`'s `step()` registrations onto `self_hosting/lib/test.patlang`'s real Gherkin runner. Run it with:
+   `rust-runtime/target/release/pat.exe --ir-run self_hosting/tools/run_language_spec_suite.patlang`
+   Any language-semantics change (new operator, control-flow form, numeric-tower/tagging behavior) needs a scenario added/updated here as part of the change, RED before / GREEN after — not deferred to a one-off investigation. For representation/type invariants (e.g. "this op's result stays `int`, doesn't silently misclassify as `bigint`" — the root pattern behind #24/#46/#48), use `And ensure <var> == <literal>` (`self_hosting/lib/gherkin_contracts.patlang`) against a var set from `numeric_kind(x)`/`type_of(x)`; unquoted literal, `==`/`!=` also compare as strings when non-numeric. Currently wired: arithmetic, bitwise, comparison operators. Remaining `spec_library/language/*.feature` files are backlog — wire the next batch's steps into `spec_steps_language.patlang` (or a sibling file) and add its path to the runner's `features` list.
+
 
 
 ---

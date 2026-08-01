@@ -15,3 +15,8 @@ Feature: comparison operators == != < <= > >=
     When == is applied
     Then the result is true
 
+  Scenario: comparison results are always bool, never leak the operand type (representation invariant, GitHub #49)
+    Given x = 3 < 4
+    When type_of(x) is captured
+    Then ensure x_kind == bool
+
