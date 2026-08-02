@@ -612,7 +612,17 @@ make a function called x64_taint_one_pass takes instrs, locals_taint returns res
       # before -- an accepted, deliberate cost for genuine correctness,
       # not a "test on every access" tax (only arithmetic operations
       # themselves pay it, not every subsequent load/use of a value).
-      let op_can_overflow = (instr[1] == "+") or (instr[1] == "-") or (instr[1] == "*")
+      # GitHub #53: `/` joins +/-/* here for the same reason -- it can
+      # ALWAYS need to promote to Rational on inexact division,
+      # regardless of whether either operand was already known
+      # non-fixnum (confirmed against the real interpreter's own
+      # semantics: `pat --ir-run` auto-promotes `7 / 2` on two bare int
+      # literals, no numeric-tower operand in sight). Safe now that
+      # every internal x64_runtime.patlang caller needing genuine
+      # truncating division uses the dedicated rt_trunc_div primitive
+      # instead of the "/" operator (a `Call`, not a `Bin`, so it's
+      # untouched by this taint analysis).
+      let op_can_overflow = (instr[1] == "+") or (instr[1] == "-") or (instr[1] == "*") or (instr[1] == "/")
       let result_taint = pr1[0] or pr2[0] or op_can_overflow
       if result_taint then
         let dyn_bin_indices = list_push(dyn_bin_indices, i)
@@ -2310,6 +2320,22 @@ make a function called x64_binop_asm takes op returns asm
         sb_push(sb, "    imul rax, r10" + x64_nl_char())
       else
         if op == "/" then
+          # GitHub #53 investigation: a REAL, but DIFFERENT bug from
+          # what was first assumed here -- this genuinely-static "/"
+          # path (reached only for a function that is NOT dynamic_mode
+          # at all, or a per-instruction-provable-fixnum "/" within
+          # one) is used throughout this codebase's own runtime for
+          # ordinary TRUNCATING integer division with no numeric-tower
+          # meaning at all (e.g. rt_bigint_from_i64's own digit-
+          # counting loop, `t / 1000000000`) -- NOT every "/" should
+          # promote to Rational, only one that's genuinely part of
+          # dynamic-mode numeric-tower code. A first attempt made this
+          # path ALSO promote-on-inexact, which broke rt_bigint_from_i64
+          # itself (confirmed: plain bigint construction segfaulted).
+          # Reverted to plain truncating division, unchanged from
+          # before -- the real fix belongs in ROUTING ("/" inside a
+          # genuinely dynamic_mode function should never reach this
+          # static path in the first place), not in this function.
           sb_push(sb, "    cqo" + x64_nl_char())
           sb_push(sb, "    idiv r10" + x64_nl_char())
         else
@@ -4097,6 +4123,31 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
     sb_push(rweq_sb, "    or rax, rcx" + x64_nl_char())
     sb_push(rweq_sb, "    push rax" + x64_nl_char())
     return sb_str(rweq_sb)
+  end
+  # GitHub #53: a fixed-size, ALWAYS-inline PLAIN TRUNCATING integer
+  # division primitive. `/` at the language level auto-promotes to a
+  # Rational on inexact division (confirmed: this matches the real
+  # interpreter's own semantics, `pat --ir-run`, not just this backend's
+  # choice) -- but this runtime library's OWN internal arithmetic
+  # (digit-extraction loops, bigint limb/carry math, GCD reduction) has
+  # always relied on genuine truncating division with no tower meaning
+  # at all. A first attempt made ALL "/" (including this static,
+  # per-instruction-provable-fixnum path) promote-on-inexact to match
+  # the language-level operator -- broke rt_bigint_from_i64 itself
+  # (its own `t / 1000000000` digit-counting loop expects truncation,
+  # not promotion). This primitive exists so that internal callers can
+  # ask for truncating division explicitly and unambiguously, leaving
+  # the "/" OPERATOR itself free to eventually be fixed to always
+  # promote (a separate, not-yet-done change -- see the "/" case in
+  # x64_binop_asm below, which still reverts to plain idiv here).
+  if name == "rt_trunc_div" then
+    let td_sb = sb_new()
+    sb_push(td_sb, "    pop rcx" + x64_nl_char())
+    sb_push(td_sb, "    pop rax" + x64_nl_char())
+    sb_push(td_sb, "    cqo" + x64_nl_char())
+    sb_push(td_sb, "    idiv rcx" + x64_nl_char())
+    sb_push(td_sb, "    push rax" + x64_nl_char())
+    return sb_str(td_sb)
   end
   let sb = sb_new()
   if name == "list_get" then
@@ -6047,6 +6098,15 @@ make a function called x64_func_is_dynamic takes func returns yes
         return true
       end
       if instr[1] == "*" then
+        return true
+      end
+      # GitHub #53: same reasoning as +/-/* above -- a bare "/" can
+      # ALWAYS need to promote to Rational on inexact division,
+      # regardless of whether the function otherwise looks dynamic.
+      # Safe now that every x64_runtime.patlang caller needing genuine
+      # truncating division uses the dedicated rt_trunc_div primitive
+      # (a Call, invisible to this scan) instead of the "/" operator.
+      if instr[1] == "/" then
         return true
       end
     end
