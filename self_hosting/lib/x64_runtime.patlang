@@ -857,97 +857,49 @@ end
 # need a field-enumeration primitive this backend doesn't expose yet,
 # a separate, larger piece of work not attempted here.
 make a function called print takes v returns done
-  let family_mask = 17293822569102704640
-  let family = v band family_mask
-  if family == 0 then
+  # GitHub #55: this used to hand-roll its OWN family-tag classification
+  # via raw `band` masking, duplicating (and, for BigInt/Rational/
+  # Complex/Interval specifically, getting WRONG -- see #55's own
+  # findings) logic that x64_family_code_asm already implements
+  # correctly as type_of/numeric_kind's native classifier, including
+  # #51's heap-bounds guard against a coincidental tag-bit collision.
+  # Several attempts to fix the hand-rolled version in place (a wide
+  # combined mask, its bit-identical negative-literal form, individual
+  # small sub-family bit checks) all produced confidently wrong results
+  # for reasons never root-caused, despite the identical classification
+  # already working correctly via type_of. Simplest real fix: stop
+  # duplicating the classifier at all, just ask it.
+  let kind = type_of(v)
+  if kind == "int" then
     return rt_print_str(rt_int_to_str(v))
   end
-  # Sign-extension leak from non-dynamic-mode arithmetic (see to_num's
-  # own header for the full explanation) -- family_mask IS all four
-  # nibble bits, so a value that's genuinely all-ones there (rather than
-  # a real family selector, which only ever uses 1-5) is a raw negative
-  # fixnum that was never re-masked to the canonical zero-tag form.
-  if family == family_mask then
-    return rt_print_str(rt_int_to_str(v))
+  if kind == "string" then
+    return rt_print_str(v)
   end
-  # GitHub #47-adjacent fix: a genuinely tagged String/BigInt/Rational/
-  # Complex/Interval/List value's payload is ALWAYS a real heap address
-  # from rt_heap_alloc, which never returns 0 (the first-ever
-  # allocation is mem_heap_base() + 0, and mem_heap_base() is a real,
-  # nonzero linker-assigned .bss address) -- so a zero payload can
-  # NEVER be a genuine tagged pointer. Without this guard, a plain
-  # runtime-computed integer whose bits happen to EXACTLY match one of
-  # these tags with a zero payload (e.g. `1 shl 60` ==
-  # bigint_family exactly) gets wrongly treated as a real tagged
-  # pointer, masked to address 0, and dereferenced -- a segfault
-  # (confirmed exactly: `let d = 1 shl 60; print(d)` crashed). This is
-  # the SAME "require nonzero payload before trusting a family match"
-  # guard x64_str_aware_eq_asm/x64_binop_asm_dynamic's DYN_OBJ checks
-  # already use in codegen_x64.patlang (added for the #35 string/list
-  # dynamic-dispatch fix) -- extended here to print()'s own PatLang-
-  # level dispatch, which never had it. GitHub #34's own fallback
-  # (further below) already covers the COMPLEMENTARY case (a pattern
-  # matching NONE of the five tags); this covers the case a pattern
-  # matches one of them exactly but couldn't possibly be real.
-  let payload_mask = 281474976710655
-  let payload = v band payload_mask
-  let string_family = 2305843009213693952
-  if family == string_family then
-    if payload != 0 then
-      return rt_print_str(v)
-    end
+  if kind == "bigint" then
+    return rt_print_str(rt_bigint_to_string(v))
   end
-  let bigint_family = 1152921504606846976
-  if family == bigint_family then
-    if payload != 0 then
-      return rt_print_str(rt_bigint_to_string(v))
-    end
+  if kind == "rational" then
+    return rt_print_str(rt_rational_to_string(v))
   end
-  let rational_family = 1153765929536978944
-  if family == rational_family then
-    if payload != 0 then
-      return rt_print_str(rt_rational_to_string(v))
-    end
+  if kind == "complex" then
+    return rt_print_str(rt_complex_to_string(v))
   end
-  let complex_family = 1154891829443821568
-  if family == complex_family then
-    if payload != 0 then
-      return rt_print_str(rt_complex_to_string(v))
-    end
+  if kind == "interval" then
+    return rt_print_str(rt_interval_to_string(v))
   end
-  let interval_family = 1157425104234217472
-  if family == interval_family then
-    if payload != 0 then
-      return rt_print_str(rt_interval_to_string(v))
-    end
+  if kind == "list" then
+    return rt_print_str(rt_list_to_display_string(v))
   end
-  let list_family = 3458764513820540928
-  if family == list_family then
-    if payload != 0 then
-      return rt_print_str(rt_list_to_display_string(v))
-    end
-  end
-  # GitHub #24: dedicated Bool family, distinguishing a genuine
-  # true/false from a fixnum that happens to be 0/1.
-  let bool_family = 6917529027641081856
-  if family == bool_family then
+  if kind == "bool" then
     return rt_print_bool(v)
   end
-  # GitHub #34: a raw int64 result from bit manipulation (e.g.
-  # bit_set(0, 63, 1) = 0x8000000000000000, the most negative i64) can
-  # land on a family-nibble pattern this dispatch doesn't recognize --
-  # NEITHER 0 (fixnum) NOR family_mask (the all-ones negative-fixnum
-  # sign-leak case above) NOR any of the five real tags checked above
-  # (String/BigInt/Rational/Complex/Interval/List, the ONLY tags this
-  # whole system ever assigns). Reaching this point means `v` is, by
-  # construction, not a recognized tagged value at all -- printing it
-  # as a raw signed int is the safest available default (previously an
+  # GitHub #34: anything type_of doesn't recognize as one of the above
+  # (object/closure/unit, or a genuinely corrupt/garbage value) prints
+  # as a raw signed int -- the safest available default (previously an
   # unconditional "<value>" placeholder, which silently discarded a
-  # perfectly real, meaningful integer result). A genuinely corrupt/
-  # garbage pointer reaching here was ALSO not usefully served by
-  # "<value>" -- neither choice is "safe" for that case, so this
-  # trades a rare corrupt-pointer misprint for the far more common
-  # real-int-with-an-unusual-bit-pattern case actually being usable.
+  # perfectly real, meaningful integer result for the far more common
+  # "unusual bit pattern that's still a real int" case).
   return rt_print_str(rt_int_to_str(v))
 end
 
@@ -4620,6 +4572,9 @@ make a function called type_of takes v returns result
   if code == 8 then
     return "complex"
   end
+  if code == 9 then
+    return "interval"
+  end
   if code == 11 then
     return "bool"
   end
@@ -4642,6 +4597,9 @@ make a function called numeric_kind takes v returns result
   end
   if code == 8 then
     return "complex"
+  end
+  if code == 9 then
+    return "interval"
   end
   return "other"
 end
