@@ -2606,6 +2606,279 @@ make a function called rt_interval_eq takes a, b returns eq
   return 0
 end
 
+# ---- Dynamic-mode binop dispatch (GitHub #52) ----
+#
+# x64_binop_asm_dynamic (codegen_x64.patlang) used to hand-assemble this
+# ENTIRE family-check/promote/dispatch chain INLINE at every single "+"/
+# "-"/"*"/comparison call site in dynamic-mode code -- ~500 lines,
+# repeated per call site, not per program. Compiling a function that
+# itself has many such operators (this codegen library's own functions,
+# which build asm text via heavy string concatenation) could produce a
+# single compiled unit with thousands of near-identical local labels,
+# which NASM assembles at roughly QUADRATIC cost in label density (see
+# GitHub #52's own investigation: 150 vs 300 repetitions of this exact
+# shape went from 15.8s to un-finished-in-60s; moving the SAME logic
+# out-of-line and calling it instead measured 0.04s for the same work,
+# a ~400x difference). This is that out-of-line home: ordinary PatLang,
+# compiled ONCE as part of this cached runtime chunk, reached via a
+# plain `call` from every operator site instead of being re-emitted.
+#
+# op_code convention (x64_op_code_for in codegen_x64.patlang is the
+# single source of truth this must stay in sync with): 0=+ 1=- 2=*
+# 3=== 4=!= 5=< 6=<= 7=> 8=>=
+#
+# CAUTION for future maintainers: this function (and everything it
+# calls transitively within this file) must NEVER use PatLang's own
+# "+"/"-"/"*"/comparison OPERATORS on values whose type isn't already
+# proven by a preceding `type_of` check in THIS SAME function -- doing
+# so would recompile through x64_binop_asm_dynamic's own dynamic
+# dispatch, which calls back into THIS function for non-fixnum
+# operands, infinitely recursing. Every branch below either (a) has
+# already confirmed both operands are genuine ints via type_of before
+# using a bare operator on them (safe -- takes the cheap fixnum fast
+# path, never re-enters this function), or (b) calls a leaf rt_*
+# function directly (rt_bigint_add etc, or the dedicated
+# rt_raw_word_eq primitive for raw identity comparison -- NOT a bare
+# "==", which would recurse for non-numeric operands).
+
+make a function called rt_dynamic_numeric_binop takes a, b, op_code returns result
+  let ka = type_of(a)
+  let kb = type_of(b)
+  if (ka == "int") and (kb == "int") then
+    if op_code == 0 then
+      return a + b
+    end
+    if op_code == 1 then
+      return a - b
+    end
+    if op_code == 2 then
+      return a * b
+    end
+    if op_code == 3 then
+      return a == b
+    end
+    if op_code == 4 then
+      return a != b
+    end
+    if op_code == 5 then
+      return a < b
+    end
+    if op_code == 6 then
+      return a <= b
+    end
+    if op_code == 7 then
+      return a > b
+    end
+    return a >= b
+  end
+  if (ka == "interval") or (kb == "interval") then
+    let pa = a
+    let pb = b
+    if ka != "interval" then
+      let pa = rt_interval_from_num(a)
+    end
+    if kb != "interval" then
+      let pb = rt_interval_from_num(b)
+    end
+    if op_code == 3 then
+      return rt_interval_eq(pa, pb) == 1
+    end
+    if op_code == 4 then
+      return rt_interval_eq(pa, pb) != 1
+    end
+    if op_code >= 5 then
+      return false
+    end
+    if op_code == 0 then
+      return rt_interval_add(pa, pb)
+    end
+    if op_code == 1 then
+      return rt_interval_sub(pa, pb)
+    end
+    return rt_interval_mul(pa, pb)
+  end
+  if (ka == "complex") or (kb == "complex") then
+    let pa = a
+    let pb = b
+    if ka != "complex" then
+      let pa = rt_complex_from_num(a)
+    end
+    if kb != "complex" then
+      let pb = rt_complex_from_num(b)
+    end
+    if op_code == 3 then
+      return rt_complex_eq(pa, pb) == 1
+    end
+    if op_code == 4 then
+      return rt_complex_eq(pa, pb) != 1
+    end
+    if op_code >= 5 then
+      return false
+    end
+    if op_code == 0 then
+      return rt_complex_add(pa, pb)
+    end
+    if op_code == 1 then
+      return rt_complex_sub(pa, pb)
+    end
+    return rt_complex_mul(pa, pb)
+  end
+  if (ka == "rational") or (kb == "rational") then
+    let pa = a
+    let pb = b
+    if ka != "rational" then
+      let pa = rt_rational_from_i64(a)
+    end
+    if kb != "rational" then
+      let pb = rt_rational_from_i64(b)
+    end
+    if op_code >= 3 then
+      let c = rt_rational_cmp(pa, pb)
+      if op_code == 3 then
+        return c == 0
+      end
+      if op_code == 4 then
+        return c != 0
+      end
+      if op_code == 5 then
+        return c < 0
+      end
+      if op_code == 6 then
+        return c <= 0
+      end
+      if op_code == 7 then
+        return c > 0
+      end
+      return c >= 0
+    end
+    if op_code == 0 then
+      return rt_rational_add(pa, pb)
+    end
+    if op_code == 1 then
+      return rt_rational_sub(pa, pb)
+    end
+    return rt_rational_mul(pa, pb)
+  end
+  # Default: BigInt (matches the original DYN_HASTAG fallthrough --
+  # any remaining Numeric-family pair that isn't Interval/Complex/
+  # Rational is BigInt, or a fixnum mixed with one).
+  let pa = a
+  let pb = b
+  if ka == "int" then
+    let pa = rt_bigint_from_i64(a)
+  end
+  if kb == "int" then
+    let pb = rt_bigint_from_i64(b)
+  end
+  if op_code >= 3 then
+    let c = rt_bigint_cmp(pa, pb)
+    if op_code == 3 then
+      return c == 0
+    end
+    if op_code == 4 then
+      return c != 0
+    end
+    if op_code == 5 then
+      return c < 0
+    end
+    if op_code == 6 then
+      return c <= 0
+    end
+    if op_code == 7 then
+      return c > 0
+    end
+    return c >= 0
+  end
+  if op_code == 0 then
+    return rt_bigint_add(pa, pb)
+  end
+  if op_code == 1 then
+    return rt_bigint_sub(pa, pb)
+  end
+  return rt_bigint_mul(pa, pb)
+end
+
+# "+" on at least one non-Numeric-family operand -- string concat,
+# auto-stringify a fixnum against a string, or list-to-display-string
+# first. Mirrors the original DYN_OBJPLUS chain exactly (GitHub #19/
+# #35's own fixes, now expressed as ordinary type_of checks instead of
+# hand-rolled family-tag bit twiddling).
+make a function called rt_dynamic_plus_obj takes a, b returns result
+  let pa = a
+  let pb = b
+  if type_of(pa) == "list" then
+    let pa = rt_list_to_display_string(pa)
+  end
+  if type_of(pb) == "list" then
+    let pb = rt_list_to_display_string(pb)
+  end
+  let ka = type_of(pa)
+  let kb = type_of(pb)
+  if (ka == "string") and (kb == "string") then
+    return rt_str_concat(pa, pb)
+  end
+  if (ka == "string") and (kb == "int") then
+    return rt_str_concat(pa, rt_int_to_str(pb))
+  end
+  if (ka == "int") and (kb == "string") then
+    return rt_str_concat(rt_int_to_str(pa), pb)
+  end
+  return 0
+end
+
+# Comparison on at least one non-Numeric-family operand -- real content
+# comparison for two genuine strings (GitHub #20), raw identity
+# otherwise (Object/List/Closure, or any mixed-type pair -- mirrors the
+# original DYN_OBJCMP_NOTSTR fallback exactly).
+make a function called rt_dynamic_cmp_obj takes a, b, op_code returns result
+  if (type_of(a) == "string") and (type_of(b) == "string") then
+    if op_code == 3 then
+      return rt_str_eq(a, b) == 1
+    end
+    if op_code == 4 then
+      return rt_str_eq(a, b) != 1
+    end
+    let c = rt_str_cmp(a, b)
+    if op_code == 5 then
+      return c < 0
+    end
+    if op_code == 6 then
+      return c <= 0
+    end
+    if op_code == 7 then
+      return c > 0
+    end
+    return c >= 0
+  end
+  if op_code == 3 then
+    return rt_raw_word_eq(a, b)
+  end
+  if op_code == 4 then
+    return not rt_raw_word_eq(a, b)
+  end
+  return false
+end
+
+# Top-level dynamic-mode dispatcher -- x64_binop_asm_dynamic's own
+# DYN_NOTFAST path calls straight into this (push a, push b, push
+# op_code, call) instead of hand-assembling the whole chain inline.
+make a function called rt_dynamic_binop takes a, b, op_code returns result
+  let ka = type_of(a)
+  let kb = type_of(b)
+  let ka_numeric = (ka == "int") or (ka == "bigint") or (ka == "rational") or (ka == "complex") or (ka == "interval")
+  let kb_numeric = (kb == "int") or (kb == "bigint") or (kb == "rational") or (kb == "complex") or (kb == "interval")
+  if ka_numeric and kb_numeric then
+    return rt_dynamic_numeric_binop(a, b, op_code)
+  end
+  if op_code == 0 then
+    return rt_dynamic_plus_obj(a, b)
+  end
+  if op_code >= 3 then
+    return rt_dynamic_cmp_obj(a, b, op_code)
+  end
+  return 0
+end
+
 # ---- Object (clean, closures-based direction -- NOT the existing
 # interpreter/rustc backend's oo system) ----
 #

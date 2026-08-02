@@ -1497,6 +1497,39 @@ make a function called x64_is_dynamic_cmp_op takes op returns yes
   return false
 end
 
+# GitHub #52: op_code convention passed at RUNTIME to rt_dynamic_binop
+# (x64_runtime.patlang) -- that function's own header must stay in sync
+# with this mapping. Compile-time string -> runtime int, since a bare
+# string constant isn't cheap to pass/compare from hand-assembled asm,
+# unlike a plain integer push.
+make a function called x64_op_code_for takes op returns code
+  if op == "+" then
+    return 0
+  end
+  if op == "-" then
+    return 1
+  end
+  if op == "*" then
+    return 2
+  end
+  if op == "==" then
+    return 3
+  end
+  if op == "!=" then
+    return 4
+  end
+  if op == "<" then
+    return 5
+  end
+  if op == "<=" then
+    return 6
+  end
+  if op == ">" then
+    return 7
+  end
+  return 8
+end
+
 make a function called x64_setcc_for_op takes op returns mnemonic
   if op == "==" then
     return "sete"
@@ -1990,493 +2023,21 @@ make a function called x64_binop_asm_dynamic takes op, spilled returns asm
   # NUMERIC_FAMILY; only route to .DYN_OBJ_ if an operand's family is
   # neither (i.e. genuinely String/List/Closure/Object).
   sb_push(sb, ".DYN_NOTFAST_" + suffix + ":" + x64_nl_char())
-  # Real bug found (Stage 0 of the interp.patlang-compilation roadmap,
-  # continuing past #26/#27): a NEGATIVE fixnum reaching this slow path
-  # (it already failed the fast path's top-16-bit check above, since a
-  # negative fixnum's sign-extension sets those bits) has a FAMILY
-  # NIBBLE of all-ones (0xF) here -- matching NEITHER 0 (the ordinary
-  # fixnum case) NOR NUMERIC_FAMILY (BigInt, 0x1) below, so it fell
-  # through to .DYN_OBJ_'s generic identity-only dispatch, where
-  # ordering comparisons (`<`/`<=`/`>`/`>=`) are hardcoded to always
-  # return false. Confirmed exactly: `open_i < 0` with open_i = -1,
-  # inside a dynamic-mode function, silently evaluated to false.
-  #
-  # A first fix here (checking only whether the family NIBBLE was
-  # all-ones) was too loose and caused a genuine SEGFAULT: a bare
-  # integer CONSTANT that happens to equal exactly the family-nibble
-  # mask itself (0xF000000000000000 -- e.g. print()'s own internal
-  # `family_mask` comparison constant, reached because print() is
-  # dynamic_mode purely for an unrelated "<value>" string literal
-  # elsewhere in its body) matches the nibble-only test too, but is
-  # NOT a genuine negative fixnum (a real one needs its FULL top 16
-  # bits sign-extended to all-ones, 0xFFFF..., not just the top 4).
-  # That non-fixnum 0xF000... value then failed the BigInt-family
-  # exact-match check below and got handed to rt_bigint_cmp, which
-  # dereferenced it as a heap address -- address 0 after payload-
-  # masking, a null-pointer dereference. Fixed to the SAME "does it
-  # round-trip through a real 48-bit sign extension" test the promote
-  # helpers above already use -- true only for a genuine fixnum
-  # (positive or negative), false for both a real tagged pointer AND
-  # an incidental nibble-matching constant like family_mask.
-  sb_push(sb, "    mov rax, [rbp-" + dyn_a + "]" + x64_nl_char())
-  sb_push(sb, "    cmp rax, 0" + x64_nl_char())
-  sb_push(sb, "    je .DYN_FAMOK1_" + suffix + x64_nl_char())
-  sb_push(sb, "    mov rcx, rax" + x64_nl_char())
-  sb_push(sb, "    shl rcx, 16" + x64_nl_char())
-  sb_push(sb, "    sar rcx, 16" + x64_nl_char())
-  sb_push(sb, "    cmp rcx, rax" + x64_nl_char())
-  sb_push(sb, "    je .DYN_FAMOK1_" + suffix + x64_nl_char())
-  sb_push(sb, "    mov r15, 17293822569102704640" + x64_nl_char())
-  sb_push(sb, "    and rax, r15" + x64_nl_char())
-  sb_push(sb, "    mov rcx, 1152921504606846976" + x64_nl_char())
-  sb_push(sb, "    cmp rax, rcx" + x64_nl_char())
-  sb_push(sb, "    jne .DYN_OBJ_" + suffix + x64_nl_char())
-  sb_push(sb, ".DYN_FAMOK1_" + suffix + ":" + x64_nl_char())
-  sb_push(sb, "    mov r10, [rbp-" + dyn_b + "]" + x64_nl_char())
-  sb_push(sb, "    cmp r10, 0" + x64_nl_char())
-  sb_push(sb, "    je .DYN_FAMOK2_" + suffix + x64_nl_char())
-  sb_push(sb, "    mov rcx, r10" + x64_nl_char())
-  sb_push(sb, "    shl rcx, 16" + x64_nl_char())
-  sb_push(sb, "    sar rcx, 16" + x64_nl_char())
-  sb_push(sb, "    cmp rcx, r10" + x64_nl_char())
-  sb_push(sb, "    je .DYN_FAMOK2_" + suffix + x64_nl_char())
-  sb_push(sb, "    mov r15, 17293822569102704640" + x64_nl_char())
-  sb_push(sb, "    and r10, r15" + x64_nl_char())
-  sb_push(sb, "    mov rcx, 1152921504606846976" + x64_nl_char())
-  sb_push(sb, "    cmp r10, rcx" + x64_nl_char())
-  sb_push(sb, "    jne .DYN_OBJ_" + suffix + x64_nl_char())
-  sb_push(sb, ".DYN_FAMOK2_" + suffix + ":" + x64_nl_char())
-  # Real bug found (exposed by the fixnum-overflow-to-BigInt fix, once
-  # ordinary arithmetic inside an int-only loop first started reaching
-  # this dynamic dispatch at all): reaching here only proves BOTH
-  # operands are "numeric-compatible" -- EITHER a genuine fixnum
-  # (positive or negative, confirmed via the round-trip test just
-  # above) OR an actual Numeric-family-tagged value (BigInt/Rational/
-  # Complex/Interval). The code below never distinguished those two
-  # cases -- it always fell through Interval/Complex/Rational to the
-  # generic "promote both via rt_bigint_from_i64, call rt_bigint_*"
-  # path, even when BOTH operands were plain fixnums that merely failed
-  # the cheap top-16-bits fast-path check for being negative. Confirmed
-  # exactly: `-1 * 2` inside a dynamic-mode function called
-  # rt_bigint_from_i64 on a perfectly ordinary -1, producing a REAL
-  # heap-allocated BigInt for what should have stayed a plain int
-  # (`numeric_kind` reported "bigint" for a value that was still
-  # numerically correct, `-2`, since rt_bigint_mul computes the right
-  # answer -- just via the wrong, permanently-heap-tagged
-  # representation, which then made every later dynamic-dispatched op
-  # on it also take slow/wrong paths, e.g. `%`'s deliberate
-  # BigInt-unsupported trap). Fixed: check each operand's FAMILY
-  # NIBBLE explicitly here -- if NEITHER operand is actually tagged
-  # Numeric-family (both are plain fixnums, family 0), jump straight to
-  # a redo of the ordinary ONE-FAST-PATH arithmetic (same imul/add/sub
-  # + overflow-check sequence as the top of this function), instead of
-  # ever reaching the promotion chain below.
-  # A NEGATIVE fixnum's family nibble reads as 0xF (sign extension), NOT
-  # 0 -- "is the masked nibble nonzero" is the WRONG test (it was the
-  # exact mistake this whole fix is undoing at a different layer); the
-  # right test is "does the nibble equal EXACTLY the Numeric family
-  # (0x1)", which only a genuinely-tagged BigInt/Rational/Complex/
-  # Interval value satisfies (they all share nibble=1, per
-  # x64_family_code_asm's own bigint_tag/rational_tag/etc constants).
-  sb_push(sb, "    mov r15, 17293822569102704640" + x64_nl_char())
-  sb_push(sb, "    mov rax, [rbp-" + dyn_a + "]" + x64_nl_char())
-  sb_push(sb, "    and rax, r15" + x64_nl_char())
-  sb_push(sb, "    mov r10, [rbp-" + dyn_b + "]" + x64_nl_char())
-  sb_push(sb, "    and r10, r15" + x64_nl_char())
-  sb_push(sb, "    mov rcx, 1152921504606846976" + x64_nl_char())
-  sb_push(sb, "    cmp rax, rcx" + x64_nl_char())
-  sb_push(sb, "    je .DYN_HASTAG_" + suffix + x64_nl_char())
-  sb_push(sb, "    cmp r10, rcx" + x64_nl_char())
-  sb_push(sb, "    je .DYN_HASTAG_" + suffix + x64_nl_char())
-  sb_push(sb, "    mov rax, [rbp-" + dyn_a + "]" + x64_nl_char())
-  sb_push(sb, "    shl rax, 16" + x64_nl_char())
-  sb_push(sb, "    sar rax, 16" + x64_nl_char())
-  sb_push(sb, "    mov r10, [rbp-" + dyn_b + "]" + x64_nl_char())
-  sb_push(sb, "    shl r10, 16" + x64_nl_char())
-  sb_push(sb, "    sar r10, 16" + x64_nl_char())
-  if x64_is_dynamic_cmp_op(op) then
-    sb_push(sb, "    cmp rax, r10" + x64_nl_char())
-    sb_push(sb, "    " + x64_setcc_for_op(op) + " al" + x64_nl_char())
-    sb_push(sb, "    movzx rax, al" + x64_nl_char())
-    sb_push(sb, "    jmp .DYN_DONE_" + suffix + x64_nl_char())
-  else
-    if op == "*" then
-      sb_push(sb, "    imul r10" + x64_nl_char())
-      sb_push(sb, "    jo .DYN_OVERFLOW_" + suffix + x64_nl_char())
-    else
-      if op == "+" then
-        sb_push(sb, "    add rax, r10" + x64_nl_char())
-      else
-        sb_push(sb, "    sub rax, r10" + x64_nl_char())
-      end
-    end
-    sb_push(sb, "    mov rcx, rax" + x64_nl_char())
-    sb_push(sb, "    shl rcx, 16" + x64_nl_char())
-    sb_push(sb, "    sar rcx, 16" + x64_nl_char())
-    sb_push(sb, "    cmp rcx, rax" + x64_nl_char())
-    sb_push(sb, "    jne .DYN_OVERFLOW_" + suffix + x64_nl_char())
-    sb_push(sb, "    mov rax, rcx" + x64_nl_char())
-    sb_push(sb, "    jmp .DYN_DONE_" + suffix + x64_nl_char())
-  end
-  sb_push(sb, ".DYN_HASTAG_" + suffix + ":" + x64_nl_char())
-  sb_push(sb, "    mov r15, 18446462598732840960" + x64_nl_char())
-  sb_push(sb, "    mov rax, [rbp-" + dyn_a + "]" + x64_nl_char())
-  sb_push(sb, "    and rax, r15" + x64_nl_char())
-  sb_push(sb, "    mov r10, [rbp-" + dyn_b + "]" + x64_nl_char())
-  sb_push(sb, "    and r10, r15" + x64_nl_char())
-  sb_push(sb, "    mov rcx, 1157425104234217472" + x64_nl_char())
-  sb_push(sb, "    cmp rax, rcx" + x64_nl_char())
-  sb_push(sb, "    je .DYN_IVAL_" + suffix + x64_nl_char())
-  sb_push(sb, "    cmp r10, rcx" + x64_nl_char())
-  sb_push(sb, "    je .DYN_IVAL_" + suffix + x64_nl_char())
-  sb_push(sb, "    mov rcx, 1154891829443821568" + x64_nl_char())
-  sb_push(sb, "    cmp rax, rcx" + x64_nl_char())
-  sb_push(sb, "    je .DYN_CPLX_" + suffix + x64_nl_char())
-  sb_push(sb, "    cmp r10, rcx" + x64_nl_char())
-  sb_push(sb, "    je .DYN_CPLX_" + suffix + x64_nl_char())
-  sb_push(sb, "    mov rcx, 1153765929536978944" + x64_nl_char())
-  sb_push(sb, "    cmp rax, rcx" + x64_nl_char())
-  sb_push(sb, "    je .DYN_RAT_" + suffix + x64_nl_char())
-  sb_push(sb, "    cmp r10, rcx" + x64_nl_char())
-  sb_push(sb, "    je .DYN_RAT_" + suffix + x64_nl_char())
-  sb_push(sb, x64_dynamic_promote_both_asm(suffix + "N", spilled))
-  if x64_is_dynamic_cmp_op(op) then
-    sb_push(sb, "    push qword [rbp-" + dyn_a + "]" + x64_nl_char())
-    sb_push(sb, "    push qword [rbp-" + dyn_b + "]" + x64_nl_char())
-    sb_push(sb, "    call rt_bigint_cmp" + x64_nl_char())
-    sb_push(sb, "    add rsp, 16" + x64_nl_char())
-    sb_push(sb, "    cmp rax, 0" + x64_nl_char())
-    sb_push(sb, "    " + x64_setcc_for_op(op) + " al" + x64_nl_char())
-    sb_push(sb, "    movzx rax, al" + x64_nl_char())
-  else
-    sb_push(sb, "    push qword [rbp-" + dyn_a + "]" + x64_nl_char())
-    sb_push(sb, "    push qword [rbp-" + dyn_b + "]" + x64_nl_char())
-    sb_push(sb, "    call " + x64_bigint_fn_for_op(op) + x64_nl_char())
-    sb_push(sb, "    add rsp, 16" + x64_nl_char())
-  end
-  sb_push(sb, "    jmp .DYN_DONE_" + suffix + x64_nl_char())
-  sb_push(sb, ".DYN_RAT_" + suffix + ":" + x64_nl_char())
-  sb_push(sb, x64_dynamic_promote_both_rational_asm(suffix + "N", spilled))
-  if x64_is_dynamic_cmp_op(op) then
-    sb_push(sb, "    push qword [rbp-" + dyn_a + "]" + x64_nl_char())
-    sb_push(sb, "    push qword [rbp-" + dyn_b + "]" + x64_nl_char())
-    sb_push(sb, "    call rt_rational_cmp" + x64_nl_char())
-    sb_push(sb, "    add rsp, 16" + x64_nl_char())
-    sb_push(sb, "    cmp rax, 0" + x64_nl_char())
-    sb_push(sb, "    " + x64_setcc_for_op(op) + " al" + x64_nl_char())
-    sb_push(sb, "    movzx rax, al" + x64_nl_char())
-  else
-    sb_push(sb, "    push qword [rbp-" + dyn_a + "]" + x64_nl_char())
-    sb_push(sb, "    push qword [rbp-" + dyn_b + "]" + x64_nl_char())
-    sb_push(sb, "    call " + x64_rational_fn_for_op(op) + x64_nl_char())
-    sb_push(sb, "    add rsp, 16" + x64_nl_char())
-  end
-  sb_push(sb, "    jmp .DYN_DONE_" + suffix + x64_nl_char())
-  sb_push(sb, ".DYN_CPLX_" + suffix + ":" + x64_nl_char())
-  sb_push(sb, x64_dynamic_promote_both_complex_asm(suffix + "N", spilled))
-  if x64_is_dynamic_cmp_op(op) then
-    sb_push(sb, "    push qword [rbp-" + dyn_a + "]" + x64_nl_char())
-    sb_push(sb, "    push qword [rbp-" + dyn_b + "]" + x64_nl_char())
-    sb_push(sb, "    call rt_complex_eq" + x64_nl_char())
-    sb_push(sb, "    add rsp, 16" + x64_nl_char())
-    if op == "==" then
-      sb_push(sb, "    ; rax already 0/1 from rt_complex_eq" + x64_nl_char())
-    else
-      if op == "!=" then
-        sb_push(sb, "    xor rax, 1" + x64_nl_char())
-      else
-        # No total order on complex numbers -- a real representation
-        # limit, not laziness (see x64_runtime.patlang's own Complex
-        # header). Deterministically false rather than a memory
-        # misread/crash.
-        sb_push(sb, "    mov rax, 0" + x64_nl_char())
-      end
-    end
-  else
-    sb_push(sb, "    push qword [rbp-" + dyn_a + "]" + x64_nl_char())
-    sb_push(sb, "    push qword [rbp-" + dyn_b + "]" + x64_nl_char())
-    sb_push(sb, "    call " + x64_complex_fn_for_op(op) + x64_nl_char())
-    sb_push(sb, "    add rsp, 16" + x64_nl_char())
-  end
-  sb_push(sb, "    jmp .DYN_DONE_" + suffix + x64_nl_char())
-  sb_push(sb, ".DYN_IVAL_" + suffix + ":" + x64_nl_char())
-  sb_push(sb, x64_dynamic_promote_both_interval_asm(suffix + "N", spilled))
-  if x64_is_dynamic_cmp_op(op) then
-    sb_push(sb, "    push qword [rbp-" + dyn_a + "]" + x64_nl_char())
-    sb_push(sb, "    push qword [rbp-" + dyn_b + "]" + x64_nl_char())
-    sb_push(sb, "    call rt_interval_eq" + x64_nl_char())
-    sb_push(sb, "    add rsp, 16" + x64_nl_char())
-    if op == "==" then
-      sb_push(sb, "    ; rax already 0/1 from rt_interval_eq" + x64_nl_char())
-    else
-      if op == "!=" then
-        sb_push(sb, "    xor rax, 1" + x64_nl_char())
-      else
-        # No agreed total order between intervals -- same
-        # deterministically-safe-but-not-meaningful treatment as
-        # Complex's ordering gap, see x64_runtime.patlang's own
-        # Interval header.
-        sb_push(sb, "    mov rax, 0" + x64_nl_char())
-      end
-    end
-  else
-    sb_push(sb, "    push qword [rbp-" + dyn_a + "]" + x64_nl_char())
-    sb_push(sb, "    push qword [rbp-" + dyn_b + "]" + x64_nl_char())
-    sb_push(sb, "    call " + x64_interval_fn_for_op(op) + x64_nl_char())
-    sb_push(sb, "    add rsp, 16" + x64_nl_char())
-  end
-  sb_push(sb, "    jmp .DYN_DONE_" + suffix + x64_nl_char())
-  # Generic "not Numeric family" branch -- Object, String, List,
-  # Closure, or a fixnum mixed with any of those. No promotion helper,
-  # no runtime call at all: equality is raw tagged-word IDENTITY (same
-  # semantics as everywhere else in this backend already used for
-  # these values before they were tagged -- unchanged behavior, now
-  # enforced correctly instead of by the mere absence of a tag), which
-  # ALSO correctly reports "not equal" whenever the two operands are
-  # genuinely different types (different tag bits, different bit
-  # pattern, cmp already says not-equal) -- so this one branch is
-  # correct for every same-type AND every mixed-type comparison
-  # without needing to special-case "are these the same kind of
-  # composite" at all. Arithmetic on any of these is a deterministic
-  # no-op rather than the dangerous BigInt-family default (which would
-  # misread e.g. a String's [length][bytes] as a BigInt's [sign][limb
-  # count]).
-  sb_push(sb, ".DYN_OBJ_" + suffix + ":" + x64_nl_char())
-  if x64_is_dynamic_cmp_op(op) then
-    # Real bug found (GitHub #20) alongside #19's string-concat fix:
-    # this used raw ADDRESS comparison for ALL six comparison ops on
-    # String-family operands -- contradicting the real interpreter
-    # (rust-runtime/src/ir/ops.rs `cmp`), which defines string
-    # comparison as genuine lexicographic content comparison, same as
-    # `strcmp`, not identity. Two separately-allocated strings with
-    # identical text compared as unequal, and `<`/`<=`/`>`/`>=` compared
-    # meaningless heap addresses instead of any real ordering. Check for
-    # a String-family pair first and route to rt_str_eq (==/!=) or
-    # rt_str_cmp (ordering, reusing the same setcc-against-0 convention
-    # rt_bigint_cmp's result already uses above); any other object
-    # combination (List/Object/Closure) keeps the old identity
-    # comparison -- no better definition exists for those yet.
-    sb_push(sb, "    mov r15, 17293822569102704640" + x64_nl_char())
-    sb_push(sb, "    mov rax, [rbp-" + dyn_a + "]" + x64_nl_char())
-    sb_push(sb, "    and rax, r15" + x64_nl_char())
-    sb_push(sb, "    mov r10, [rbp-" + dyn_b + "]" + x64_nl_char())
-    sb_push(sb, "    and r10, r15" + x64_nl_char())
-    sb_push(sb, "    mov rcx, 2305843009213693952" + x64_nl_char())
-    sb_push(sb, "    cmp rax, rcx" + x64_nl_char())
-    sb_push(sb, "    jne .DYN_OBJCMP_NOTSTR_" + suffix + x64_nl_char())
-    sb_push(sb, "    cmp r10, rcx" + x64_nl_char())
-    sb_push(sb, "    jne .DYN_OBJCMP_NOTSTR_" + suffix + x64_nl_char())
-    # Real bug found (and already fixed once, independently, on the
-    # feature branch this was cherry-picked from -- see
-    # x64_str_aware_eq_asm's own header): the top-nibble family check
-    # ALONE can't tell a genuine String pointer apart from a bare
-    # extracted TAG CONSTANT that happens to share the same bits with
-    # zero payload (e.g. `v band family_mask` compared against
-    # `string_family` elsewhere in this same runtime) -- both have
-    # family bits equal to the String tag, but a bare constant's low 48
-    # bits are always zero by construction, while a real heap-allocated
-    # string's never are. Require a nonzero payload on BOTH operands
-    # before treating this as a real string comparison, closing the
-    # same segfault class the cherry-picked non-dynamic-path fix found.
-    sb_push(sb, "    mov r15, 281474976710655" + x64_nl_char())
-    sb_push(sb, "    mov rax, [rbp-" + dyn_a + "]" + x64_nl_char())
-    sb_push(sb, "    and rax, r15" + x64_nl_char())
-    sb_push(sb, "    cmp rax, 0" + x64_nl_char())
-    sb_push(sb, "    je .DYN_OBJCMP_NOTSTR_" + suffix + x64_nl_char())
-    sb_push(sb, "    mov r10, [rbp-" + dyn_b + "]" + x64_nl_char())
-    sb_push(sb, "    and r10, r15" + x64_nl_char())
-    sb_push(sb, "    cmp r10, 0" + x64_nl_char())
-    sb_push(sb, "    je .DYN_OBJCMP_NOTSTR_" + suffix + x64_nl_char())
-    sb_push(sb, "    push qword [rbp-" + dyn_a + "]" + x64_nl_char())
-    sb_push(sb, "    push qword [rbp-" + dyn_b + "]" + x64_nl_char())
-    if op == "==" then
-      sb_push(sb, "    call rt_str_eq" + x64_nl_char())
-      sb_push(sb, "    add rsp, 16" + x64_nl_char())
-    else
-      if op == "!=" then
-        sb_push(sb, "    call rt_str_eq" + x64_nl_char())
-        sb_push(sb, "    add rsp, 16" + x64_nl_char())
-        sb_push(sb, "    xor rax, 1" + x64_nl_char())
-      else
-        sb_push(sb, "    call rt_str_cmp" + x64_nl_char())
-        sb_push(sb, "    add rsp, 16" + x64_nl_char())
-        sb_push(sb, "    cmp rax, 0" + x64_nl_char())
-        sb_push(sb, "    " + x64_setcc_for_op(op) + " al" + x64_nl_char())
-        sb_push(sb, "    movzx rax, al" + x64_nl_char())
-      end
-    end
-    sb_push(sb, "    jmp .DYN_OBJCMP_DONE_" + suffix + x64_nl_char())
-    sb_push(sb, ".DYN_OBJCMP_NOTSTR_" + suffix + ":" + x64_nl_char())
-    sb_push(sb, "    mov rax, [rbp-" + dyn_a + "]" + x64_nl_char())
-    sb_push(sb, "    cmp rax, [rbp-" + dyn_b + "]" + x64_nl_char())
-    if op == "==" then
-      sb_push(sb, "    sete al" + x64_nl_char())
-    else
-      if op == "!=" then
-        sb_push(sb, "    setne al" + x64_nl_char())
-      else
-        sb_push(sb, "    mov al, 0" + x64_nl_char())
-      end
-    end
-    sb_push(sb, "    movzx rax, al" + x64_nl_char())
-    sb_push(sb, ".DYN_OBJCMP_DONE_" + suffix + ":" + x64_nl_char())
-  else
-    if op == "+" then
-      # Real bug found (GitHub #35 investigation): this whole dynamic-
-      # mode `+` chain below already auto-stringifies a fixnum against a
-      # string operand, but never a LIST -- `"" + [4]` silently fell all
-      # the way through the string/string and string/fixnum checks below
-      # into the final GIVEUP placeholder (`mov rax, 0`), completely
-      # separate from `x64_str_aware_plus_asm` (the NON-dynamic-mode
-      # `+` path, which has its OWN equivalent fix) since dynamic-mode
-      # functions never call that function at all. Convert either
-      # operand up front, in place (writing the converted string back
-      # into its OWN [rbp-dyn_a]/[rbp-dyn_b] stack slot, since every
-      # check below re-reads from there) via the SAME
-      # `rt_list_to_display_string` print() itself already uses -- then
-      # every existing string/fixnum case below picks it up
-      # transparently, no other change needed.
-      sb_push(sb, "    mov r15, 17293822569102704640" + x64_nl_char())
-      sb_push(sb, "    mov rax, [rbp-" + dyn_a + "]" + x64_nl_char())
-      sb_push(sb, "    and rax, r15" + x64_nl_char())
-      sb_push(sb, "    mov rcx, 3458764513820540928" + x64_nl_char())
-      sb_push(sb, "    cmp rax, rcx" + x64_nl_char())
-      sb_push(sb, "    jne .DYN_OBJPLUS_NOTLISTA_" + suffix + x64_nl_char())
-      sb_push(sb, "    push qword [rbp-" + dyn_a + "]" + x64_nl_char())
-      sb_push(sb, "    call rt_list_to_display_string" + x64_nl_char())
-      sb_push(sb, "    add rsp, 8" + x64_nl_char())
-      sb_push(sb, "    mov [rbp-" + dyn_a + "], rax" + x64_nl_char())
-      sb_push(sb, ".DYN_OBJPLUS_NOTLISTA_" + suffix + ":" + x64_nl_char())
-      sb_push(sb, "    mov r15, 17293822569102704640" + x64_nl_char())
-      sb_push(sb, "    mov rax, [rbp-" + dyn_b + "]" + x64_nl_char())
-      sb_push(sb, "    and rax, r15" + x64_nl_char())
-      sb_push(sb, "    mov rcx, 3458764513820540928" + x64_nl_char())
-      sb_push(sb, "    cmp rax, rcx" + x64_nl_char())
-      sb_push(sb, "    jne .DYN_OBJPLUS_NOTLISTB_" + suffix + x64_nl_char())
-      sb_push(sb, "    push qword [rbp-" + dyn_b + "]" + x64_nl_char())
-      sb_push(sb, "    call rt_list_to_display_string" + x64_nl_char())
-      sb_push(sb, "    add rsp, 8" + x64_nl_char())
-      sb_push(sb, "    mov [rbp-" + dyn_b + "], rax" + x64_nl_char())
-      sb_push(sb, ".DYN_OBJPLUS_NOTLISTB_" + suffix + ":" + x64_nl_char())
-      # Real fix (GitHub #19): this used to be an unconditional
-      # `mov rax, 0` for ANY non-numeric operand pair -- a silent
-      # no-op, not a crash. Two STRING-family operands specifically
-      # now concatenate via rt_str_concat (which already tags its own
-      # result correctly); any other combination (List/Object/Closure,
-      # or a String mixed with one of those) keeps the old placeholder
-      # -- no meaningful `+` is defined for those yet.
-      sb_push(sb, "    mov r15, 17293822569102704640" + x64_nl_char())
-      sb_push(sb, "    mov rax, [rbp-" + dyn_a + "]" + x64_nl_char())
-      sb_push(sb, "    and rax, r15" + x64_nl_char())
-      sb_push(sb, "    mov r10, [rbp-" + dyn_b + "]" + x64_nl_char())
-      sb_push(sb, "    and r10, r15" + x64_nl_char())
-      sb_push(sb, "    mov rcx, 2305843009213693952" + x64_nl_char())
-      sb_push(sb, "    cmp rax, rcx" + x64_nl_char())
-      sb_push(sb, "    jne .DYN_OBJPLUS_NOTSTR_" + suffix + x64_nl_char())
-      sb_push(sb, "    cmp r10, rcx" + x64_nl_char())
-      sb_push(sb, "    jne .DYN_OBJPLUS_NOTSTR_" + suffix + x64_nl_char())
-      # Same payload-nonzero guard as .DYN_OBJCMP_ above -- a bare tag
-      # constant with zero payload can otherwise be mistaken for a real
-      # string pointer and handed to rt_str_concat, which would then
-      # dereference it as a heap address.
-      sb_push(sb, "    mov r15, 281474976710655" + x64_nl_char())
-      sb_push(sb, "    mov rax, [rbp-" + dyn_a + "]" + x64_nl_char())
-      sb_push(sb, "    and rax, r15" + x64_nl_char())
-      sb_push(sb, "    cmp rax, 0" + x64_nl_char())
-      sb_push(sb, "    je .DYN_OBJPLUS_NOTSTR_" + suffix + x64_nl_char())
-      sb_push(sb, "    mov r10, [rbp-" + dyn_b + "]" + x64_nl_char())
-      sb_push(sb, "    and r10, r15" + x64_nl_char())
-      sb_push(sb, "    cmp r10, 0" + x64_nl_char())
-      sb_push(sb, "    je .DYN_OBJPLUS_NOTSTR_" + suffix + x64_nl_char())
-      sb_push(sb, "    push qword [rbp-" + dyn_a + "]" + x64_nl_char())
-      sb_push(sb, "    push qword [rbp-" + dyn_b + "]" + x64_nl_char())
-      sb_push(sb, "    call rt_str_concat" + x64_nl_char())
-      sb_push(sb, "    add rsp, 16" + x64_nl_char())
-      sb_push(sb, "    jmp .DYN_OBJPLUS_DONE_" + suffix + x64_nl_char())
-      sb_push(sb, ".DYN_OBJPLUS_NOTSTR_" + suffix + ":" + x64_nl_char())
-      # Real bug found via a Stage 1 (#26) regression test:
-      # "label: " + some_int_result + " end" -- string+fixnum
-      # auto-stringify concatenation, the single most common shape of
-      # `+` involving a string in ordinary PatLang code -- silently
-      # gave 0 here, since the ONLY case handled above is two genuine
-      # strings. Real interpreter semantics auto-convert a non-string
-      # operand to its string form when the OTHER operand is a string.
-      # Handle exactly one operand being a fixnum (family 0, or the
-      # all-ones sign-extension-leak representation a negative fixnum
-      # can carry -- print()'s own dispatch treats both identically)
-      # and the other a genuine string: convert the fixnum via
-      # rt_int_to_str (already the exact function print() itself calls
-      # for a fixnum, so no unpacking needed -- the raw tagged bits are
-      # already print()'s own convention for what to hand it) and
-      # concatenate in the correct order. Any other combination (List/
-      # Object/Closure/BigInt+string etc) still keeps the placeholder
-      # -- not attempted here, a separate, later gap.
-      sb_push(sb, "    mov r15, 17293822569102704640" + x64_nl_char())
-      sb_push(sb, "    mov rax, [rbp-" + dyn_a + "]" + x64_nl_char())
-      sb_push(sb, "    and rax, r15" + x64_nl_char())
-      sb_push(sb, "    mov rcx, 2305843009213693952" + x64_nl_char())
-      sb_push(sb, "    cmp rax, rcx" + x64_nl_char())
-      sb_push(sb, "    jne .DYN_OBJPLUS_TRYB_" + suffix + x64_nl_char())
-      sb_push(sb, "    mov r15, 281474976710655" + x64_nl_char())
-      sb_push(sb, "    mov rax, [rbp-" + dyn_a + "]" + x64_nl_char())
-      sb_push(sb, "    and rax, r15" + x64_nl_char())
-      sb_push(sb, "    cmp rax, 0" + x64_nl_char())
-      sb_push(sb, "    je .DYN_OBJPLUS_TRYB_" + suffix + x64_nl_char())
-      sb_push(sb, "    mov r15, 17293822569102704640" + x64_nl_char())
-      sb_push(sb, "    mov r10, [rbp-" + dyn_b + "]" + x64_nl_char())
-      sb_push(sb, "    and r10, r15" + x64_nl_char())
-      sb_push(sb, "    cmp r10, 0" + x64_nl_char())
-      sb_push(sb, "    je .DYN_OBJPLUS_ASTR_BFIX_" + suffix + x64_nl_char())
-      sb_push(sb, "    cmp r10, r15" + x64_nl_char())
-      sb_push(sb, "    je .DYN_OBJPLUS_ASTR_BFIX_" + suffix + x64_nl_char())
-      sb_push(sb, "    jmp .DYN_OBJPLUS_TRYB_" + suffix + x64_nl_char())
-      sb_push(sb, ".DYN_OBJPLUS_ASTR_BFIX_" + suffix + ":" + x64_nl_char())
-      sb_push(sb, "    push qword [rbp-" + dyn_b + "]" + x64_nl_char())
-      sb_push(sb, "    call rt_int_to_str" + x64_nl_char())
-      sb_push(sb, "    add rsp, 8" + x64_nl_char())
-      sb_push(sb, "    mov r10, rax" + x64_nl_char())
-      sb_push(sb, "    push qword [rbp-" + dyn_a + "]" + x64_nl_char())
-      sb_push(sb, "    push r10" + x64_nl_char())
-      sb_push(sb, "    call rt_str_concat" + x64_nl_char())
-      sb_push(sb, "    add rsp, 16" + x64_nl_char())
-      sb_push(sb, "    jmp .DYN_OBJPLUS_DONE_" + suffix + x64_nl_char())
-      sb_push(sb, ".DYN_OBJPLUS_TRYB_" + suffix + ":" + x64_nl_char())
-      sb_push(sb, "    mov r15, 17293822569102704640" + x64_nl_char())
-      sb_push(sb, "    mov rax, [rbp-" + dyn_b + "]" + x64_nl_char())
-      sb_push(sb, "    and rax, r15" + x64_nl_char())
-      sb_push(sb, "    mov rcx, 2305843009213693952" + x64_nl_char())
-      sb_push(sb, "    cmp rax, rcx" + x64_nl_char())
-      sb_push(sb, "    jne .DYN_OBJPLUS_GIVEUP_" + suffix + x64_nl_char())
-      sb_push(sb, "    mov r15, 281474976710655" + x64_nl_char())
-      sb_push(sb, "    mov rax, [rbp-" + dyn_b + "]" + x64_nl_char())
-      sb_push(sb, "    and rax, r15" + x64_nl_char())
-      sb_push(sb, "    cmp rax, 0" + x64_nl_char())
-      sb_push(sb, "    je .DYN_OBJPLUS_GIVEUP_" + suffix + x64_nl_char())
-      sb_push(sb, "    mov r15, 17293822569102704640" + x64_nl_char())
-      sb_push(sb, "    mov r10, [rbp-" + dyn_a + "]" + x64_nl_char())
-      sb_push(sb, "    and r10, r15" + x64_nl_char())
-      sb_push(sb, "    cmp r10, 0" + x64_nl_char())
-      sb_push(sb, "    je .DYN_OBJPLUS_AFIX_BSTR_" + suffix + x64_nl_char())
-      sb_push(sb, "    cmp r10, r15" + x64_nl_char())
-      sb_push(sb, "    je .DYN_OBJPLUS_AFIX_BSTR_" + suffix + x64_nl_char())
-      sb_push(sb, "    jmp .DYN_OBJPLUS_GIVEUP_" + suffix + x64_nl_char())
-      sb_push(sb, ".DYN_OBJPLUS_AFIX_BSTR_" + suffix + ":" + x64_nl_char())
-      sb_push(sb, "    push qword [rbp-" + dyn_a + "]" + x64_nl_char())
-      sb_push(sb, "    call rt_int_to_str" + x64_nl_char())
-      sb_push(sb, "    add rsp, 8" + x64_nl_char())
-      sb_push(sb, "    mov r10, rax" + x64_nl_char())
-      sb_push(sb, "    push r10" + x64_nl_char())
-      sb_push(sb, "    push qword [rbp-" + dyn_b + "]" + x64_nl_char())
-      sb_push(sb, "    call rt_str_concat" + x64_nl_char())
-      sb_push(sb, "    add rsp, 16" + x64_nl_char())
-      sb_push(sb, "    jmp .DYN_OBJPLUS_DONE_" + suffix + x64_nl_char())
-      sb_push(sb, ".DYN_OBJPLUS_GIVEUP_" + suffix + ":" + x64_nl_char())
-      sb_push(sb, "    mov rax, 0" + x64_nl_char())
-      sb_push(sb, ".DYN_OBJPLUS_DONE_" + suffix + ":" + x64_nl_char())
-    else
-      sb_push(sb, "    mov rax, 0" + x64_nl_char())
-    end
-  end
+  # GitHub #52: this used to hand-assemble the ENTIRE family-check/
+  # promote/dispatch chain inline here (~490 lines) -- moved out-of-line
+  # to rt_dynamic_binop (x64_runtime.patlang), compiled ONCE as part of
+  # the cached runtime chunk, reached via a plain call instead of being
+  # re-emitted at every "+"/"-"/"*"/comparison call site. See that
+  # function's own header for the full investigation (root-caused: NASM
+  # assembly time scales ~quadratically with local-label density within
+  # one compiled unit -- 400x speedup measured moving this exact shape
+  # out-of-line). x64_op_code_for below is op_code's single source of
+  # truth; rt_dynamic_binop's own header documents the same convention.
+  sb_push(sb, "    push qword [rbp-" + dyn_a + "]" + x64_nl_char())
+  sb_push(sb, "    push qword [rbp-" + dyn_b + "]" + x64_nl_char())
+  sb_push(sb, "    push " + x64_op_code_for(op) + x64_nl_char())
+  sb_push(sb, "    call rt_dynamic_binop" + x64_nl_char())
+  sb_push(sb, "    add rsp, 24" + x64_nl_char())
   sb_push(sb, ".DYN_DONE_" + suffix + ":" + x64_nl_char())
   # GitHub #24: same Bool-tagging as x64_binop_asm's own comparison
   # branches -- every branch through this whole dynamic-dispatch tree
@@ -4513,6 +4074,30 @@ make a function called x64_os_get_command_line_asm returns asm
 end
 
 make a function called x64_callhost_asm takes name, argc, spilled returns asm
+  # GitHub #52: a fixed-size, ALWAYS-inline raw machine-word equality
+  # primitive, deliberately NOT going through x64_binop_asm_dynamic's
+  # own "==" dispatch -- rt_dynamic_cmp_obj (x64_runtime.patlang) needs
+  # genuine identity comparison for the Object/List/Closure fallback
+  # case, but calling PatLang's own "==" operator there would recompile
+  # through THIS SAME dynamic dispatch for non-numeric operands,
+  # recursing back into the very out-of-line helper it's being called
+  # from. A self-contained early return, deliberately NOT inserted into
+  # the long if/else chain below (which nests without `elif` past a
+  # certain point -- a single extra branch there needs a matching `end`
+  # added at the FAR end of that chain, easy to get wrong; an early
+  # return here needs nothing else to stay balanced).
+  if name == "rt_raw_word_eq" then
+    let rweq_sb = sb_new()
+    sb_push(rweq_sb, "    pop rcx" + x64_nl_char())
+    sb_push(rweq_sb, "    pop rax" + x64_nl_char())
+    sb_push(rweq_sb, "    cmp rax, rcx" + x64_nl_char())
+    sb_push(rweq_sb, "    sete al" + x64_nl_char())
+    sb_push(rweq_sb, "    movzx rax, al" + x64_nl_char())
+    sb_push(rweq_sb, "    mov rcx, 6917529027641081856" + x64_nl_char())
+    sb_push(rweq_sb, "    or rax, rcx" + x64_nl_char())
+    sb_push(rweq_sb, "    push rax" + x64_nl_char())
+    return sb_str(rweq_sb)
+  end
   let sb = sb_new()
   if name == "list_get" then
     sb_push(sb, "    call rt_list_get" + x64_nl_char())
