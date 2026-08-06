@@ -1,0 +1,233 @@
+# GitHub #21 quick-win #2: declared step interfaces via classes+traits,
+# wired with REAL formal parameters/return values -- NOT name matching.
+#
+# The original snippet-synthesis machinery (goap_snippet_synthesis.
+# patlang) concatenates flat template strings that all share one scope,
+# so a later step's snippet only works because it happens to reference
+# an earlier step's `let`-bound name by the SAME spelling (build_house's
+# template blindly writes `wood`, trusting gather_wood's template also
+# called it `wood`). That is exactly the "declared snippet interfaces"
+# gap the issue left open, and per [[patlang-issue-status-audit-and-21-
+# quickwins]] the user explicitly steered AWAY from a provides/requires
+# name-matching scheme (which tends to force near-duplicate snippets
+# just to satisfy a predecessor's/successor's independently-chosen
+# variable name) and TOWARD "steps as functions with real formal
+# interfaces", exploring classes+traits as one way to express that.
+#
+# Design here:
+#   - Each action becomes its own CLASS implementing the `GoapStep`
+#     trait's `run` method with its OWN formal parameter list -- only
+#     the values it actually needs, named however its author likes.
+#     Nothing about a class's `run` signature has to match any other
+#     class's parameter or local-variable spelling.
+#   - The assembler below decides which earlier step's return value
+#     gets threaded into a later step's parameter STRUCTURALLY: it
+#     replays the same precondition/effect matching the real GOAP
+#     planner used to build the plan in the first place (does this
+#     step's (bound) precondition fact exactly equal an earlier step's
+#     (bound) add_effect fact?), and if so wires that earlier step's
+#     actual return value in as a real call argument. A precondition
+#     satisfied by a plain ground fact (not any step's effect) is
+#     wired in as a literal value instead. Either way, the wiring is
+#     never done by scanning generated source text for a matching
+#     identifier.
+
+include "gherkin_contracts.patlang"
+
+# ---- the trait ----
+# A concrete action class lists `traits GoapStep` and overrides `run`
+# with its own real parameter list; this base implementation is only
+# a safety net for a class that forgot to.
+class GoapStep {
+  make a function called run takes self returns result
+    return ["ERR", "GoapStep.run not implemented for this class"]
+  end
+}
+
+# ---- helpers over the SAME [name, preconds, add_effects, del_effects,
+# cost] shape already passed to action_add, since PatLang code that
+# calls action_add already has this structure on hand (there is no host
+# getter to read it back out of the registered planner state) ----
+
+make a function called fact_key takes pred, args returns key
+  let key = pred
+  let i = 0
+  let n = to_num(list_len(args))
+  while i < n do
+    let key = key + "|" + args[i]
+    let i = i + 1
+  end
+  return key
+end
+
+# Mirrors the real planner's own is_logic_var: an arg starting with an
+# uppercase letter is a logic variable to unify/bind, anything else is
+# already a ground literal and is never substituted.
+make a function called is_logic_var_pat takes s returns result
+  if s.length == 0 then
+    return false
+  end
+  let c = substr(s, 0, 1)
+  return (c >= "A") and (c <= "Z")
+end
+
+# First-seen order of a LOGIC-VARIABLE (uppercase-first) arg across an
+# action's own preconds, matching the exact order the real planner's
+# action_instance_label uses to build a plan step's bound-args list --
+# so positional lookups against action_label_args(label) line up.
+# Ground literals (lowercase-first) are never bound this way; they pass
+# through subst_fact_args unchanged instead.
+make a function called collect_precond_vars takes preconds returns vars
+  let vars = []
+  let i = 0
+  let n = to_num(list_len(preconds))
+  while i < n do
+    let pargs = preconds[i][1]
+    let j = 0
+    let m = to_num(list_len(pargs))
+    while j < m do
+      let v = pargs[j]
+      if is_logic_var_pat(v) and (index_of_str(vars, v) < 0) then
+        let vars = list_push(vars, v)
+      end
+      let j = j + 1
+    end
+    let i = i + 1
+  end
+  return vars
+end
+
+# Substitute an action's own precond/effect var names for their bound
+# values (from action_label_args) inside one fact's arg list, producing
+# the concrete ground fact this step instance actually saw.
+make a function called index_of_str takes items, needle returns idx
+  let idx = -1
+  let i = 0
+  let n = to_num(list_len(items))
+  while i < n do
+    if items[i] == needle then
+      return i
+    end
+    let i = i + 1
+  end
+  return idx
+end
+
+make a function called subst_fact_args takes fact_args, var_names, bound_values returns out
+  let out = []
+  let i = 0
+  let n = to_num(list_len(fact_args))
+  while i < n do
+    let a = fact_args[i]
+    let idx = index_of_str(var_names, a)
+    if idx >= 0 then
+      let out = list_push(out, bound_values[idx])
+    else
+      let out = list_push(out, a)
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called action_defs_lookup takes action_defs, base returns def
+  let i = 0
+  let n = to_num(list_len(action_defs))
+  while i < n do
+    if action_defs[i][0] == base then
+      return action_defs[i]
+    end
+    let i = i + 1
+  end
+  return ["ERR"]
+end
+
+# ---- the assembler ----
+# synthesize_program_structural(plan_labels, action_defs, class_registry,
+# contract_clauses) -> ["OK", source_text] or ["ERR", message].
+#
+# class_registry: Dict base_name -> class_name (each class must
+# implement GoapStep's `run` with its own real parameters).
+# action_defs: list of [base_name, preconds, add_effects] -- the SAME
+# preconds/add_effects lists already passed to this action's own
+# action_add call.
+make a function called synthesize_program_structural takes plan_labels, action_defs, class_registry, contract_clauses returns result
+  if to_num(list_len(contract_clauses)) > 0 then
+    let ok = goap_verify_contracts(contract_clauses, plan_labels)
+    if ok == false then
+      return ["ERR", "a plan step violated a contract clause -- rejected before any code was generated"]
+    end
+  end
+
+  let produced = new("Dict", "goap_step_produced")
+  let out = sb_new()
+  let i = 0
+  let n = to_num(list_len(plan_labels))
+  while i < n do
+    let label = plan_labels[i]
+    let base = action_base_name(label)
+    let bound_values = action_label_args(label)
+    let class_name = "" + get(class_registry, base)
+    if class_name == "" then
+      return ["ERR", "no step class registered for action \"" + base + "\""]
+    end
+    let def = action_defs_lookup(action_defs, base)
+    if def[0] == "ERR" then
+      return ["ERR", "no action definition supplied for \"" + base + "\" -- can't derive its real parameters structurally"]
+    end
+    let preconds = def[1]
+    let add_effects = def[2]
+    let var_names = collect_precond_vars(preconds)
+
+    # Structural wiring: for each of this step's own preconditions,
+    # find which earlier step's add_effect produced the exact same
+    # ground fact -- if none, the precond was already true in the
+    # world (a literal), not a wired step output.
+    let call_args = []
+    let p = 0
+    let pn = to_num(list_len(preconds))
+    while p < pn do
+      let pred = preconds[p][0]
+      let ground_args = subst_fact_args(preconds[p][1], var_names, bound_values)
+      let key = fact_key(pred, ground_args)
+      let producer_var = "" + get(produced, key)
+      if producer_var == "" then
+        # No earlier step produced this fact -- wire in its own bound
+        # literal values (the fact's own concrete args) as real,
+        # quoted string-literal arguments (not bare identifiers).
+        let g = 0
+        let gn = to_num(list_len(ground_args))
+        while g < gn do
+          let call_args = list_push(call_args, "\"" + ground_args[g] + "\"")
+          let g = g + 1
+        end
+      else
+        let call_args = list_push(call_args, producer_var)
+      end
+      let p = p + 1
+    end
+
+    let out_var = "step" + i + "_out"
+    sb_push(out, "let " + out_var + " = send(new(\"" + class_name + "\", \"" + base + i + "\"), \"run\"")
+    let a = 0
+    let an = to_num(list_len(call_args))
+    while a < an do
+      sb_push(out, ", " + call_args[a])
+      let a = a + 1
+    end
+    sb_push(out, ")\n")
+
+    # Register this step's produced facts for later steps to wire against.
+    let e = 0
+    let en = to_num(list_len(add_effects))
+    while e < en do
+      let epred = add_effects[e][0]
+      let eground = subst_fact_args(add_effects[e][1], var_names, bound_values)
+      send(produced, "set", fact_key(epred, eground), out_var)
+      let e = e + 1
+    end
+
+    let i = i + 1
+  end
+  return ["OK", sb_str(out)]
+end
