@@ -5699,6 +5699,74 @@ make a function called x64_tower_ctor_names returns names
   return ["rt_bigint_from_i64", "rt_rational_from_i64", "rt_complex_from_i64", "rt_interval_from_i64", "rt_complex_from_num", "rt_interval_from_num"]
 end
 
+# GitHub #58 investigation follow-up: the four `_from_i64` tower
+# constructors below all expect a literal that ALREADY fits a genuine
+# i64 -- their entire job is to promote an in-range i64 into the
+# numeric tower's own representation, the same way arithmetic overflow
+# does. A literal that does NOT fit i64 (e.g. rt_bigint_from_i64(
+# 99999999999999999999)) is API misuse the compiler can catch
+# statically: x64_tower_ctor_arg_indices deliberately EXEMPTS these
+# call sites' own literal arguments from the general BigInt-promotion
+# logic (x64_num_const_needs_bigint_promotion) specifically so a
+# genuinely small literal here stays a raw fixnum -- but that same
+# exemption previously let an out-of-range literal through unchecked
+# too, silently truncated by NASM's own `mov reg64, imm` wraparound
+# with no error at all. `rt_complex_from_num`/`rt_interval_from_num`
+# take a raw f64 instead (a much wider representable range in
+# practice) and are deliberately not covered here.
+make a function called x64_i64_ctor_names returns names
+  return ["rt_bigint_from_i64", "rt_rational_from_i64", "rt_complex_from_i64", "rt_interval_from_i64"]
+end
+
+# Text-based (not to_num-parsed) i64-range check -- GitHub #40 already
+# found that PatLang's own literal parser silently CLAMPS a literal
+# exceeding i64::MAX to i64::MAX at parse time, which would make a
+# to_num-based comparison useless here for exactly the out-of-range
+# literals this needs to catch. Comparing the literal's own decimal
+# source text sidesteps that parser bug entirely.
+make a function called x64_literal_exceeds_i64_range takes text returns exceeds
+  let neg = false
+  let digits = text
+  if (digits.length > 0) and (substr(digits, 0, 1) == "-") then
+    let neg = true
+    let digits = substr(digits, 1, digits.length - 1)
+  end
+  let limit = "9223372036854775807"
+  if neg then
+    let limit = "9223372036854775808"
+  end
+  if digits.length > limit.length then
+    return true
+  end
+  if digits.length < limit.length then
+    return false
+  end
+  return digits > limit
+end
+
+make a function called x64_check_i64_ctor_literal_range takes ctor_name, text returns unused
+  if x64_str_in_list(x64_i64_ctor_names(), ctor_name) then
+    if x64_literal_exceeds_i64_range(text) then
+      print("COMPILE ERROR: literal " + text + " passed directly to " + ctor_name + "() does not fit in a 64-bit integer (range -9223372036854775808..9223372036854775807).")
+      print("  " + ctor_name + "() expects an already-in-range i64 to promote into the numeric tower -- it can't itself represent a literal this large (no register holds it, and it would otherwise silently wrap).")
+      print("  Fix: build this value through ordinary arithmetic instead, e.g. write it as a plain literal/expression elsewhere in your program -- the compiler promotes an out-of-range literal to a real BigInt automatically outside a tower-constructor call.")
+      # There is no real "halt the process" primitive callable from
+      # PatLang source (no `os_exit`/`abort`/`panic` host function
+      # exists, and a bare discarded-value Call to an unresolved name
+      # is silently skipped rather than erroring -- confirmed directly:
+      # only a CAPTURED unresolved call actually raises "host fn ...
+      # not found" and stops the interpreter). Deliberately triggering
+      # that existing, real halt path is the only reliable way to make
+      # sure this compile never proceeds to emit a corrupted immediate
+      # -- the message above is the one a user should actually read;
+      # the interpreter's own "not found" text after it is expected
+      # and can be ignored.
+      let halt = x64_fatal_compile_error_halt(text)
+    end
+  end
+  return 0
+end
+
 make a function called x64_tower_ctor_arg_indices takes instrs returns indices
   let out = []
   let n = to_num(list_len(instrs))
@@ -5727,6 +5795,7 @@ make a function called x64_tower_ctor_arg_indices takes instrs returns indices
                 if cur[0] == "Const" then
                   if cur[1] == "num" then
                     if not x64_contains(cur[2], ".") then
+                      x64_check_i64_ctor_literal_range(instr[1], cur[2])
                       let out = list_push(out, j)
                     end
                   end
