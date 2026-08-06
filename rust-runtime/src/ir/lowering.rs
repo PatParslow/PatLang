@@ -485,14 +485,33 @@ impl Lowerer {
             Expr::UnaryOp { expr, .. } => self.expr_is_safe(expr),
             Expr::BinaryOp { left, right, .. } => self.expr_is_safe(left) && self.expr_is_safe(right),
             Expr::Call { function, args } => {
+                // GitHub #32: an identifier callee used to be gated on
+                // `is_allowed_host`/`known_functions`/`known_locals` here --
+                // any call whose name wasn't on that hand-maintained
+                // allowlist (e.g. `copy_file`, which was simply missing
+                // from it) was judged "unsafe" and its ENTIRE ExprStmt was
+                // dropped by lower_stmt's ExprStmt arm below, silently
+                // skipping the call altogether when its result wasn't
+                // assigned -- not a runtime error, not even an attempt,
+                // just gone. But lower_expr's own Expr::Call arm (see
+                // below) never actually panics for an unresolved
+                // identifier callee regardless of allowlist membership --
+                // an unknown name simply falls through to a plain
+                // CallHost, which the interpreter already resolves (or
+                // correctly errors on) at RUNTIME, exactly as it does for
+                // a captured call like `let x = foo(...)`. This safety
+                // gate dates to stage-0 ("safe ExprStmt lowering", commit
+                // 0230fed) from before that runtime-resolution behavior
+                // existed; keeping it any longer only serves to make a
+                // real function call with real side effects vanish
+                // silently for any host function someone forgot to also
+                // add to `is_allowed_host`. An identifier callee is
+                // therefore always safe to lower now; only a genuinely
+                // arbitrary callee expression (e.g. an inline closure
+                // literal, which dispatches through CallValue) still
+                // needs its own recursive safety check.
                 let callee_safe = match &**function {
-                    Expr::Identifier(name) => {
-                        self.is_allowed_host(name) || self.known_functions.contains(name) || self.known_locals.contains_key(name)
-                    }
-                    // Any other safe callee expression (e.g. an inline closure
-                    // literal) dispatches through CallValue, which cannot
-                    // corrupt lowering state even if the runtime value turns
-                    // out not to be callable.
+                    Expr::Identifier(_) => true,
                     other => self.expr_is_safe(other),
                 };
                 callee_safe && args.iter().all(|a| self.expr_is_safe(a))
@@ -505,28 +524,6 @@ impl Lowerer {
             Expr::Budgeted { .. } => true,
             _ => false,
         }
-    }
-
-    fn is_allowed_host(&self, name: &str) -> bool {
-        matches!(name,
-            "print"|"add"|"multiply"|"subtract"|"max"|"min"|"calculate"|"calculate_result"|
-            "get_value"|"process"|"validate"|"len"|"get"|"send"|"emit"|"sed"|
-            "list_get"|"list_len"|"list_push"|"list_set"|"char_code"|"substr"|"chr"|"to_num"|"read_file"|"write_file"|"file_exists"|"hash_string"|"argv"|"compile_shape"|"compile_ir"|"run_ir"|"codegen_prelude"|"codegen_prelude_chunk"|"rustc_build"|
-            "vec_new"|"vec_push"|"vec_set"|"vec_get"|"vec_len"|"vec_to_list"|"sb_new"|"sb_push"|"sb_str"|
-            "str_intern"|"sc_len"|"sc_code"|"sc_char"|"now_ms"|"read_line"|"byte_length"|"read_file_b64"|"exec_capture"|
-            "fact"|"query"|"goal"|"new"|"set_var"|"apply"|
-            "tcp_listen"|"tcp_try_listen"|"tcp_connect"|"tcp_accept"|"tcp_accept_timeout"|"sleep_ms"|"tcp_read"|"tcp_read_or_empty"|"tcp_write"|"tcp_close"|
-            "spawn"|"is_alive"|"wait"|"kill"|
-            "sqrt"|"pow"|"sin"|"cos"|"tan"|"asin"|"acos"|"atan"|"atan2"|"log"|"exp"|
-            "floor"|"ceil"|"round"|"trunc"|"abs"|"to_fixed"|"numeric_kind"|"type_of"|
-            "parallel_map"|"fiber_new"|"fiber_resume"|"fiber_yield"|"fiber_alive"|
-            "budgeted_run"|"budget_check"|
-            "list_dir"|"rename_file"|
-            "rule_add"|"solve"|"action_add"|"plan"|
-            "goal_def"|"pursue"|"action_bind"|"action_lookup"|"action_base_name"|"action_label_args"|"activate"|
-            "bit_get"|"bit_set"|"bit_slice"|"bit_set_slice"|
-            "vfs_read"|"vfs_write"|"vfs_append"|"vfs_exists"|"vfs_list"|"vfs_delete"|"vfs_flush_to_disk"
-        )
     }
 
     fn lower_expr(&mut self, e: &Expr, f: &mut Function) {
