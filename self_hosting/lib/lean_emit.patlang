@@ -1,0 +1,713 @@
+# =============================================================================
+# Lean 4 Pretty-printer / Writer  (self_hosting/lib/lean_emit.patlang)
+#
+# lean_emit(node) → string
+#
+# Serialises an AST produced by lean_parser.patlang back to valid Lean 4
+# source text.  Uses sb_new()/sb_push()/sb_str() throughout (never string
+# concatenation in a loop) for O(n) output.
+#
+# Depends on: lib/lean_parser.patlang (AST node shapes).
+# =============================================================================
+
+# Emit helpers
+
+make a function called lean_indent takes depth returns s
+  let b = sb_new()
+  let i = 0
+  while i < depth do
+    sb_push(b, "  ")
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+# Emit a list of items separated by sep.
+make a function called lean_emit_list takes items, sep, depth returns s
+  let b = sb_new()
+  let i = 0
+  while i < items.length do
+    if i > 0 then
+      sb_push(b, sep)
+    end
+    sb_push(b, lean_emit_node(items[i], depth))
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+# Emit a binder.
+make a function called lean_emit_binder takes binder, depth returns s
+  let kind = binder[0]
+  if kind == "binder_exp" then
+    let names = binder[1]
+    let type_expr = binder[2]
+    let b = sb_new()
+    sb_push(b, "(")
+    let ni = 0
+    while ni < names.length do
+      if ni > 0 then sb_push(b, " ") end
+      sb_push(b, names[ni])
+      let ni = ni + 1
+    end
+    sb_push(b, " : ")
+    sb_push(b, lean_emit_node(type_expr, depth))
+    sb_push(b, ")")
+    return sb_str(b)
+  end
+  if kind == "binder_imp" then
+    let names = binder[1]
+    let type_expr = binder[2]
+    let b = sb_new()
+    sb_push(b, "{")
+    let ni = 0
+    while ni < names.length do
+      if ni > 0 then sb_push(b, " ") end
+      sb_push(b, names[ni])
+      let ni = ni + 1
+    end
+    sb_push(b, " : ")
+    sb_push(b, lean_emit_node(type_expr, depth))
+    sb_push(b, "}")
+    return sb_str(b)
+  end
+  if kind == "binder_strict" then
+    let names = binder[1]
+    let type_expr = binder[2]
+    let b = sb_new()
+    sb_push(b, "{{")
+    let ni = 0
+    while ni < names.length do
+      if ni > 0 then sb_push(b, " ") end
+      sb_push(b, names[ni])
+      let ni = ni + 1
+    end
+    sb_push(b, " : ")
+    sb_push(b, lean_emit_node(type_expr, depth))
+    sb_push(b, "}}")
+    return sb_str(b)
+  end
+  if kind == "binder_inst" then
+    let inst_name = binder[1]
+    let type_expr = binder[2]
+    let b = sb_new()
+    sb_push(b, "[")
+    if inst_name != "" then
+      sb_push(b, inst_name)
+      sb_push(b, " : ")
+    end
+    sb_push(b, lean_emit_node(type_expr, depth))
+    sb_push(b, "]")
+    return sb_str(b)
+  end
+  if kind == "binder_name" then
+    return binder[1]
+  end
+  return "(?binder)"
+end
+
+# Emit a tactic.
+make a function called lean_emit_tactic takes tac, depth returns s
+  let kind = tac[0]
+  let ind = lean_indent(depth)
+  if kind == "tactic_block" then
+    let tactics = tac[1]
+    let b = sb_new()
+    let i = 0
+    while i < tactics.length do
+      sb_push(b, "\n")
+      sb_push(b, lean_indent(depth + 1))
+      sb_push(b, lean_emit_tactic(tactics[i], depth + 1))
+      let i = i + 1
+    end
+    return sb_str(b)
+  end
+  if kind == "tactic_focus" then
+    let tactics = tac[1]
+    let b = sb_new()
+    sb_push(b, "\xc2\xb7 ")
+    let i = 0
+    while i < tactics.length do
+      if i > 0 then
+        sb_push(b, "\n")
+        sb_push(b, lean_indent(depth + 1))
+      end
+      sb_push(b, lean_emit_tactic(tactics[i], depth + 1))
+      let i = i + 1
+    end
+    return sb_str(b)
+  end
+  if kind == "tactic" then
+    let name = tac[1]
+    let args = tac[2]
+    let b = sb_new()
+    sb_push(b, name)
+    let ai = 0
+    while ai < args.length do
+      let arg = args[ai]
+      let argtxt = lean_emit_node(arg, depth)
+      if argtxt != "" then
+        sb_push(b, " ")
+        sb_push(b, argtxt)
+      end
+      let ai = ai + 1
+    end
+    return sb_str(b)
+  end
+  return lean_emit_node(tac, depth)
+end
+
+# Main emit dispatcher.
+make a function called lean_emit_node takes node, depth returns s
+  if node == null then
+    return ""
+  end
+  let kind = node[0]
+
+  if kind == "file" then
+    let cmds = node[1]
+    let b = sb_new()
+    let i = 0
+    while i < cmds.length do
+      let text = lean_emit_node(cmds[i], 0)
+      sb_push(b, text)
+      if text != "" then
+        sb_push(b, "\n")
+      end
+      let i = i + 1
+    end
+    return sb_str(b)
+  end
+
+  if kind == "import" then
+    return "import " + node[1]
+  end
+
+  if kind == "set_option" then
+    return "set_option " + node[1] + " " + node[2]
+  end
+
+  if kind == "open" then
+    let names = node[1]
+    let is_scoped = node[2]
+    let b = sb_new()
+    sb_push(b, "open ")
+    if is_scoped then
+      sb_push(b, "scoped ")
+    end
+    let ni = 0
+    while ni < names.length do
+      if ni > 0 then sb_push(b, " ") end
+      sb_push(b, names[ni])
+      let ni = ni + 1
+    end
+    return sb_str(b)
+  end
+
+  if kind == "namespace" then
+    let b = sb_new()
+    sb_push(b, "namespace ")
+    sb_push(b, node[1])
+    sb_push(b, "\n\n")
+    let cmds = node[2]
+    let i = 0
+    while i < cmds.length do
+      let text = lean_emit_node(cmds[i], depth + 1)
+      sb_push(b, lean_indent(depth + 1))
+      sb_push(b, text)
+      sb_push(b, "\n")
+      let i = i + 1
+    end
+    sb_push(b, "\nend ")
+    sb_push(b, node[1])
+    return sb_str(b)
+  end
+
+  if kind == "section" then
+    let b = sb_new()
+    sb_push(b, "section")
+    if node[1] != "" then
+      sb_push(b, " ")
+      sb_push(b, node[1])
+    end
+    sb_push(b, "\n\n")
+    let cmds = node[2]
+    let i = 0
+    while i < cmds.length do
+      let text = lean_emit_node(cmds[i], depth + 1)
+      sb_push(b, lean_indent(depth + 1))
+      sb_push(b, text)
+      sb_push(b, "\n")
+      let i = i + 1
+    end
+    sb_push(b, "\nend")
+    if node[1] != "" then
+      sb_push(b, " ")
+      sb_push(b, node[1])
+    end
+    return sb_str(b)
+  end
+
+  if kind == "noncomputable" then
+    let inner = lean_emit_node(node[1], depth)
+    if node[1] != null then
+      if (node[1])[0] == "section" then
+        return "noncomputable section\n\n" + inner + "\n\nend"
+      end
+    end
+    return "noncomputable " + inner
+  end
+
+  # def / theorem / lemma / abbrev
+  if (kind == "def") or (kind == "theorem") or (kind == "lemma") or (kind == "abbrev") then
+    let mods = node[1]
+    let name = node[2]
+    let params = node[3]
+    let type_node = node[4]
+    let body = node[5]
+    let b = sb_new()
+    let mi = 0
+    while mi < mods.length do
+      sb_push(b, mods[mi])
+      sb_push(b, " ")
+      let mi = mi + 1
+    end
+    sb_push(b, kind)
+    sb_push(b, " ")
+    sb_push(b, name)
+    if params != null then
+      let pi = 0
+      while pi < params.length do
+        sb_push(b, " ")
+        sb_push(b, lean_emit_binder(params[pi], depth))
+        let pi = pi + 1
+      end
+    end
+    if type_node != null then
+      sb_push(b, " : ")
+      sb_push(b, lean_emit_node(type_node, depth))
+    end
+    if body != null then
+      let bkind = body[0]
+      if bkind == "by" then
+        sb_push(b, " := by")
+        sb_push(b, lean_emit_tactic(body[1], depth))
+      elif bkind == "where_clause" then
+        sb_push(b, " where\n")
+        let sub = body[1]
+        let si = 0
+        while si < sub.length do
+          sb_push(b, lean_indent(depth + 1))
+          sb_push(b, lean_emit_node(sub[si], depth + 1))
+          sb_push(b, "\n")
+          let si = si + 1
+        end
+      elif bkind == "hole" then
+        sb_push(b, " := sorry")
+      else
+        sb_push(b, " :=\n")
+        sb_push(b, lean_indent(depth + 1))
+        sb_push(b, lean_emit_node(body, depth + 1))
+      end
+    end
+    return sb_str(b)
+  end
+
+  if (kind == "structure") or (kind == "class") then
+    let mods = node[1]
+    let name = node[2]
+    let params = node[3]
+    let type_node = node[5]
+    let body = node[6]
+    let b = sb_new()
+    let mi = 0
+    while mi < mods.length do
+      sb_push(b, mods[mi])
+      sb_push(b, " ")
+      let mi = mi + 1
+    end
+    sb_push(b, kind)
+    sb_push(b, " ")
+    sb_push(b, name)
+    if params != null then
+      let pi = 0
+      while pi < params.length do
+        sb_push(b, " ")
+        sb_push(b, lean_emit_binder(params[pi], depth))
+        let pi = pi + 1
+      end
+    end
+    if type_node != null then
+      sb_push(b, " : ")
+      sb_push(b, lean_emit_node(type_node, depth))
+    end
+    sb_push(b, " where\n")
+    let bi = 0
+    while bi < body.length do
+      sb_push(b, lean_indent(depth + 1))
+      sb_push(b, lean_emit_node(body[bi], depth + 1))
+      sb_push(b, "\n")
+      let bi = bi + 1
+    end
+    return sb_str(b)
+  end
+
+  if kind == "instance" then
+    let mods = node[1]
+    let name = node[2]
+    let params = node[3]
+    let type_node = node[4]
+    let body = node[5]
+    let b = sb_new()
+    let mi = 0
+    while mi < mods.length do
+      sb_push(b, mods[mi])
+      sb_push(b, " ")
+      let mi = mi + 1
+    end
+    sb_push(b, "instance")
+    if name != "" then
+      sb_push(b, " ")
+      sb_push(b, name)
+    end
+    if params != null then
+      let pi = 0
+      while pi < params.length do
+        sb_push(b, " ")
+        sb_push(b, lean_emit_binder(params[pi], depth))
+        let pi = pi + 1
+      end
+    end
+    if type_node != null then
+      sb_push(b, " : ")
+      sb_push(b, lean_emit_node(type_node, depth))
+    end
+    if body != null then
+      sb_push(b, " :=\n")
+      sb_push(b, lean_indent(depth + 1))
+      sb_push(b, lean_emit_node(body, depth + 1))
+    end
+    return sb_str(b)
+  end
+
+  if kind == "inductive" then
+    let name = node[2]
+    let params = node[3]
+    let type_node = node[4]
+    let body = node[5]
+    let b = sb_new()
+    sb_push(b, "inductive ")
+    sb_push(b, name)
+    if params != null then
+      let pi = 0
+      while pi < params.length do
+        sb_push(b, " ")
+        sb_push(b, lean_emit_binder(params[pi], depth))
+        let pi = pi + 1
+      end
+    end
+    if type_node != null then
+      sb_push(b, " : ")
+      sb_push(b, lean_emit_node(type_node, depth))
+    end
+    sb_push(b, " where\n")
+    let bi = 0
+    while bi < body.length do
+      sb_push(b, lean_indent(depth + 1))
+      sb_push(b, lean_emit_node(body[bi], depth + 1))
+      sb_push(b, "\n")
+      let bi = bi + 1
+    end
+    return sb_str(b)
+  end
+
+  if kind == "mutual" then
+    let b = sb_new()
+    sb_push(b, "mutual\n\n")
+    let items = node[1]
+    let i = 0
+    while i < items.length do
+      sb_push(b, lean_indent(depth + 1))
+      sb_push(b, lean_emit_node(items[i], depth + 1))
+      sb_push(b, "\n\n")
+      let i = i + 1
+    end
+    sb_push(b, "end")
+    return sb_str(b)
+  end
+
+  if kind == "example" then
+    let params = node[1]
+    let type_node = node[2]
+    let body = node[3]
+    let b = sb_new()
+    sb_push(b, "example")
+    if params != null then
+      let pi = 0
+      while pi < params.length do
+        sb_push(b, " ")
+        sb_push(b, lean_emit_binder(params[pi], depth))
+        let pi = pi + 1
+      end
+    end
+    if type_node != null then
+      sb_push(b, " : ")
+      sb_push(b, lean_emit_node(type_node, depth))
+    end
+    if body != null then
+      sb_push(b, " := ")
+      sb_push(b, lean_emit_node(body, depth))
+    end
+    return sb_str(b)
+  end
+
+  if kind == "hash_cmd" then
+    let b = sb_new()
+    sb_push(b, node[1])
+    if node[2] != null then
+      sb_push(b, " ")
+      sb_push(b, lean_emit_node(node[2], depth))
+    end
+    return sb_str(b)
+  end
+
+  if kind == "doc_comment" then
+    return node[1]
+  end
+
+  if kind == "line_comment" then
+    return node[1]
+  end
+
+  if kind == "block_comment" then
+    return node[1]
+  end
+
+  # Expressions
+
+  if kind == "ident" then
+    return node[1]
+  end
+
+  if kind == "num" then
+    return node[1]
+  end
+
+  if kind == "str" then
+    return node[1]
+  end
+
+  if kind == "bool" then
+    return node[1]
+  end
+
+  if kind == "hole" then
+    return "_"
+  end
+
+  if kind == "cdot" then
+    return "\xc2\xb7"
+  end
+
+  if kind == "raw" then
+    return node[1]
+  end
+
+  if kind == "app" then
+    let b = sb_new()
+    sb_push(b, lean_emit_node(node[1], depth))
+    let args = node[2]
+    let i = 0
+    while i < args.length do
+      sb_push(b, " ")
+      sb_push(b, lean_emit_node(args[i], depth))
+      let i = i + 1
+    end
+    return sb_str(b)
+  end
+
+  if kind == "fun" then
+    let b = sb_new()
+    sb_push(b, "fun ")
+    let binders = node[1]
+    let bi = 0
+    while bi < binders.length do
+      if bi > 0 then sb_push(b, " ") end
+      sb_push(b, lean_emit_binder(binders[bi], depth))
+      let bi = bi + 1
+    end
+    sb_push(b, " => ")
+    sb_push(b, lean_emit_node(node[2], depth))
+    return sb_str(b)
+  end
+
+  if kind == "forall" then
+    let b = sb_new()
+    sb_push(b, "\xe2\x88\x80 ")
+    let binders = node[1]
+    let bi = 0
+    while bi < binders.length do
+      if bi > 0 then sb_push(b, " ") end
+      sb_push(b, lean_emit_binder(binders[bi], depth))
+      let bi = bi + 1
+    end
+    sb_push(b, ", ")
+    sb_push(b, lean_emit_node(node[2], depth))
+    return sb_str(b)
+  end
+
+  if kind == "let" then
+    let b = sb_new()
+    sb_push(b, "let ")
+    sb_push(b, node[1])
+    if node[2] != null then
+      sb_push(b, " : ")
+      sb_push(b, lean_emit_node(node[2], depth))
+    end
+    sb_push(b, " := ")
+    sb_push(b, lean_emit_node(node[3], depth))
+    sb_push(b, "\n")
+    sb_push(b, lean_indent(depth))
+    sb_push(b, lean_emit_node(node[4], depth))
+    return sb_str(b)
+  end
+
+  if kind == "have" then
+    let b = sb_new()
+    sb_push(b, "have ")
+    if node[1] != "" then
+      sb_push(b, node[1])
+      sb_push(b, " : ")
+    end
+    sb_push(b, lean_emit_node(node[2], depth))
+    sb_push(b, " := ")
+    sb_push(b, lean_emit_node(node[3], depth))
+    sb_push(b, "\n")
+    sb_push(b, lean_indent(depth))
+    sb_push(b, lean_emit_node(node[4], depth))
+    return sb_str(b)
+  end
+
+  if kind == "show" then
+    return "show " + lean_emit_node(node[1], depth) + " from " + lean_emit_node(node[2], depth)
+  end
+
+  if kind == "match" then
+    let b = sb_new()
+    sb_push(b, "match ")
+    let scrutinees = node[1]
+    let si = 0
+    while si < scrutinees.length do
+      if si > 0 then sb_push(b, ", ") end
+      sb_push(b, lean_emit_node(scrutinees[si], depth))
+      let si = si + 1
+    end
+    if node[2] != null then
+      sb_push(b, " : ")
+      sb_push(b, lean_emit_node(node[2], depth))
+    end
+    sb_push(b, " with")
+    let arms = node[3]
+    let ai = 0
+    while ai < arms.length do
+      sb_push(b, "\n")
+      sb_push(b, lean_indent(depth + 1))
+      sb_push(b, lean_emit_node(arms[ai], depth + 1))
+      let ai = ai + 1
+    end
+    return sb_str(b)
+  end
+
+  if kind == "arm" then
+    return "| " + lean_emit_node(node[1], depth)
+  end
+
+  if kind == "if" then
+    return "if " + lean_emit_node(node[1], depth) + " then " + lean_emit_node(node[2], depth) + " else " + lean_emit_node(node[3], depth)
+  end
+
+  if kind == "calc" then
+    let b = sb_new()
+    sb_push(b, "calc")
+    let steps = node[1]
+    let i = 0
+    while i < steps.length do
+      sb_push(b, "\n")
+      sb_push(b, lean_indent(depth + 1))
+      sb_push(b, lean_emit_node(steps[i], depth + 1))
+      let i = i + 1
+    end
+    return sb_str(b)
+  end
+
+  if kind == "by" then
+    return "by" + lean_emit_tactic(node[1], depth)
+  end
+
+  if kind == "anon_ctor" then
+    let b = sb_new()
+    sb_push(b, "\xe2\x9f\xa8")
+    let args = node[1]
+    let i = 0
+    while i < args.length do
+      if i > 0 then sb_push(b, ", ") end
+      sb_push(b, lean_emit_node(args[i], depth))
+      let i = i + 1
+    end
+    sb_push(b, "\xe2\x9f\xa9")
+    return sb_str(b)
+  end
+
+  if kind == "type_asc" then
+    return "(" + lean_emit_node(node[1], depth) + " : " + lean_emit_node(node[2], depth) + ")"
+  end
+
+  if kind == "named_arg" then
+    return "(" + node[1] + " := " + lean_emit_node(node[2], depth) + ")"
+  end
+
+  if kind == "field" then
+    return lean_emit_node(node[1], depth) + "." + node[2]
+  end
+
+  if kind == "do" then
+    let b = sb_new()
+    sb_push(b, "do\n")
+    let stmts = node[1]
+    let i = 0
+    while i < stmts.length do
+      sb_push(b, lean_indent(depth + 1))
+      sb_push(b, lean_emit_node(stmts[i], depth + 1))
+      sb_push(b, "\n")
+      let i = i + 1
+    end
+    return sb_str(b)
+  end
+
+  if kind == "where_clause" then
+    let b = sb_new()
+    sb_push(b, "where\n")
+    let sub = node[1]
+    let i = 0
+    while i < sub.length do
+      sb_push(b, lean_indent(depth + 1))
+      sb_push(b, lean_emit_node(sub[i], depth + 1))
+      sb_push(b, "\n")
+      let i = i + 1
+    end
+    return sb_str(b)
+  end
+
+  # Tactic nodes
+  if (kind == "tactic") or (kind == "tactic_block") or (kind == "tactic_focus") then
+    return lean_emit_tactic(node, depth)
+  end
+
+  # Fallback
+  return "(?lean_emit kind=" + kind + ")"
+end
+
+# Top-level API: emit a Lean 4 file AST to a string.
+make a function called lean_emit takes ast returns s
+  return lean_emit_node(ast, 0)
+end
