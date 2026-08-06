@@ -894,6 +894,13 @@ make a function called print takes v returns done
   if kind == "bool" then
     return rt_print_bool(v)
   end
+  if kind == "bool_array" then
+    let sb = sb_new()
+    sb_push(sb, "<bool_array len=")
+    sb_push(sb, rt_int_to_str(bool_array_len(v)))
+    sb_push(sb, ">")
+    return rt_print_str(sb_str(sb))
+  end
   # GitHub #34: anything type_of doesn't recognize as one of the above
   # (object/closure/unit, or a genuinely corrupt/garbage value) prints
   # as a raw signed int -- the safest available default (previously an
@@ -1587,6 +1594,116 @@ make a function called rt_list_set_functional takes l, i, v returns tagged
   end
   mem_poke_qword(new_addr, 16 + i * 8, v)
   return new_addr bor rt_list_tag()
+end
+
+# ---- bool_array (Slice 1, GitHub #45) ----
+#
+# A plain List of Bool values costs one full 8-byte tagged word PER
+# BOOL -- wasteful for a large bool array. This is a genuinely
+# separate container, not another List variant: a real bit-packed
+# backing store (64 bools per qword), growable via the same doubling
+# strategy rt_list_push already uses, deliberately NOT capped at a
+# single word's worth of bits (per the issue's own explicit ask). Kept
+# as its own small, explicit API (bool_array_new/get/set/len/push)
+# rather than folded into the generic list_* family-dispatch machinery
+# -- overloading that pervasive dispatch is exactly the kind of change
+# that cost #38 a multi-hour ripple chase; this stays a self-contained
+# addition instead.
+#
+# Block format: [length:8][capacity_words:8][words: capacity_words*8
+# bytes] -- same two-qword-header shape as rt_list's own [length]
+# [capacity][elements], just reinterpreting "elements" as 64 packed
+# bits per word instead of one qword per element. Bit i of the array
+# lives at word (i shr 6), bit position (i band 63) of that word.
+# Fresh heap memory is zero-filled (rt_heap_alloc's own .bss backing),
+# so any not-yet-written bits within an allocated word are already
+# false -- no explicit zeroing needed on growth.
+#
+# Family tag 7 (7 shl 60): the first genuinely new family since Bool's
+# 6 (#24) -- confirmed unused via the same repo-wide-grep check #24's
+# own comment already flagged doing before picking 6.
+make a function called rt_bool_array_tag returns tag
+  return 7 shl 60
+end
+
+make a function called bool_array_new takes n returns tagged
+  let cap_words = n shr 6
+  if (n band 63) != 0 then
+    let cap_words = cap_words + 1
+  end
+  let addr = rt_heap_alloc(16 + cap_words * 8)
+  mem_poke_qword(addr, 0, n)
+  mem_poke_qword(addr, 8, cap_words)
+  return addr bor rt_bool_array_tag()
+end
+
+make a function called bool_array_len takes arr returns len
+  let addr = arr band rt_payload_mask()
+  return mem_peek_qword(addr, 0)
+end
+
+make a function called bool_array_get takes arr, i returns value
+  let addr = arr band rt_payload_mask()
+  let word_idx = i shr 6
+  let bit_idx = i band 63
+  let word = mem_peek_qword(addr, 16 + word_idx * 8)
+  let bit = (word shr bit_idx) band 1
+  return 6917529027641081856 bor bit
+end
+
+make a function called bool_array_set takes arr, i, v returns done
+  let addr = arr band rt_payload_mask()
+  let word_idx = i shr 6
+  let bit_idx = i band 63
+  let word = mem_peek_qword(addr, 16 + word_idx * 8)
+  let mask = 1 shl bit_idx
+  if v then
+    let word = word bor mask
+  else
+    let word = word band (bnot mask)
+  end
+  mem_poke_qword(addr, 16 + word_idx * 8, word)
+  return true
+end
+
+# Growable, same doubling-by-words strategy as rt_list_push: mutates
+# in place (bumping length, writing into already-reserved spare
+# capacity) whenever the pushed bit's own word already exists;
+# reallocates+copies (doubling capacity_words, or growing to exactly
+# fit if doubling still wouldn't cover the new bit) only when it
+# doesn't. Same named, deliberate aliasing tradeoff as rt_list_push
+# (no reference counting in this backend, so in-place growth is only
+# PROBABLY safe against an older alias, not provably so) -- see that
+# function's own header comment for the full reasoning, unchanged
+# here.
+make a function called bool_array_push takes arr, v returns tagged
+  let addr = arr band rt_payload_mask()
+  let n = mem_peek_qword(addr, 0)
+  let cap_words = mem_peek_qword(addr, 8)
+  let needed_word = n shr 6
+  if needed_word < cap_words then
+    mem_poke_qword(addr, 0, n + 1)
+    bool_array_set(arr, n, v)
+    return arr
+  end
+  let new_cap_words = cap_words * 2
+  if new_cap_words < 1 then
+    let new_cap_words = 1
+  end
+  if new_cap_words <= needed_word then
+    let new_cap_words = needed_word + 1
+  end
+  let new_addr = rt_heap_alloc(16 + new_cap_words * 8)
+  mem_poke_qword(new_addr, 0, n + 1)
+  mem_poke_qword(new_addr, 8, new_cap_words)
+  let i = 0
+  while i < cap_words do
+    mem_poke_qword(new_addr, 16 + i * 8, mem_peek_qword(addr, 16 + i * 8))
+    let i = i + 1
+  end
+  let new_tagged = new_addr bor rt_bool_array_tag()
+  bool_array_set(new_tagged, n, v)
+  return new_tagged
 end
 
 # ---- numeric tower: BigInt (tagged values, DYNAMIC-MODE functions only) ----
@@ -4600,6 +4717,9 @@ make a function called type_of takes v returns result
   end
   if code == 11 then
     return "bool"
+  end
+  if code == 12 then
+    return "bool_array"
   end
   if code == 0 then
     return "int"
