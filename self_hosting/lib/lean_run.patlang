@@ -3,18 +3,60 @@
 #
 # Bridges PatLang code with the real `lean` / `lake` toolchain installed in
 # the environment.  All functions return tagged result lists:
-#   ["ok",  stdout_text]
-#   ["err", stderr_text, exit_code_as_str]
+#   ["ok",  combined_output_text]
+#   ["err", combined_output_text]
+#
+# GitHub #60 follow-up: exec_capture only ever returns ONE combined String
+# (stdout, with stderr appended when the process failed) -- there is no
+# exit-code-returning exec primitive in this codebase at all, so success/
+# failure here is detected the same text-based way lib/x64_build.patlang
+# already does (a substring check on the output), not a real exit code.
 #
 # As the in-PatLang kernel (lean_kernel.patlang) matures this file becomes a
 # thin router: try native kernel first, fall back to the real binary.
 #
 # API:
-#   lean_run_file(path)        → ["ok", stdout] | ["err", stderr, code]
-#   lean_check_file(path)      → ["ok"] | ["err", messages]
-#   lean_eval_expr(src_text)   → ["ok", stdout] | ["err", stderr, code]
+#   lean_run_file(path)        → ["ok", output] | ["err", output]
+#   lean_check_file(path)      → ["ok"] | ["err", output]
+#   lean_eval_expr(src_text)   → ["ok", output] | ["err", output]
 #   lean_run_or_check(path)    → auto-detect lake vs. bare lean
 # =============================================================================
+
+# GitHub #60 follow-up: exec_capture(program, args...) returns a single
+# String (stdout, with stderr appended only when the process exited
+# non-zero -- see rust-runtime/src/ir/hosts.rs's host_exec_capture) --
+# there is no exit-code-returning exec primitive anywhere in this
+# codebase, and every OTHER caller of exec_capture already treats its
+# result as plain text (e.g. lib/x64_build.patlang's own
+# x64_build_contains(out, "error")). This file's four runner functions
+# were originally written indexing the result as a 3-element tuple
+# (out[0]/out[1]/out[2], assuming [stdout, stderr, exit_code]) -- since
+# a String indexed with `[i]` returns its i-th CHARACTER, not a tuple
+# element, `out[2] == "0"` could never be true, so every call always
+# fell through to the "err" branch regardless of whether `lean` itself
+# actually succeeded. Never caught before because nothing in the
+# existing selftest suite (self_hosting/lean_selftest.patlang) actually
+# invokes the real lean binary -- confirmed directly: found immediately
+# once lean was actually available on PATH and these functions were
+# exercised for the first time. Fixed by detecting success/failure the
+# same text-based way x64_build.patlang already does: Lean's own
+# diagnostic format always includes the literal "error:" marker on any
+# real failure (a bare successful #eval/compile never does), so a
+# substring check stands in for the exit code this API doesn't expose.
+make a function called lean_contains_error takes text returns r
+  let needle = "error:"
+  if needle.length > text.length then
+    return false
+  end
+  let i = 0
+  while i <= text.length - needle.length do
+    if substr(text, i, needle.length) == needle then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
 
 # Detect whether a lake project exists near path (a lakefile.lean/lean4
 # in the same dir or its parent).
@@ -46,13 +88,13 @@ make a function called lean_dir_of takes path returns dir
 end
 
 # Run a Lean 4 file with the real lean binary.
-# Returns ["ok", stdout] or ["err", stderr, code].
+# Returns ["ok", stdout] or ["err", combined_output].
 make a function called lean_run_file takes path returns result
   let out = exec_capture("lean", "--run", path)
-  if out[2] == "0" then
-    return ["ok", out[0]]
+  if lean_contains_error(out) then
+    return ["err", out]
   end
-  return ["err", out[1], out[2]]
+  return ["ok", out]
 end
 
 # Type-check a Lean 4 file (no run) using --only-typecheck when available,
@@ -61,10 +103,10 @@ end
 make a function called lean_check_file takes path returns result
   # Try lean --stdin (or plain lean): lean elaborates + type-checks
   let out = exec_capture("lean", path)
-  if out[2] == "0" then
-    return ["ok"]
+  if lean_contains_error(out) then
+    return ["err", out]
   end
-  return ["err", out[1]]
+  return ["ok"]
 end
 
 # Run an expression by writing a temporary file with a #eval directive and
@@ -74,10 +116,10 @@ make a function called lean_eval_expr takes src_text returns result
   let content = "-- lean_eval_expr temp file\n#eval " + src_text + "\n"
   write_file(tmp_path, content)
   let out = exec_capture("lean", "--run", tmp_path)
-  if out[2] == "0" then
-    return ["ok", out[0]]
+  if lean_contains_error(out) then
+    return ["err", out]
   end
-  return ["err", out[1], out[2]]
+  return ["ok", out]
 end
 
 # Auto-detect lake vs. bare lean and run appropriately.
@@ -85,10 +127,10 @@ make a function called lean_run_or_check takes path returns result
   if lean_has_lakefile(path) then
     let dir = lean_dir_of(path)
     let out = exec_capture("lake", "build")
-    if out[2] == "0" then
-      return ["ok", out[0]]
+    if lean_contains_error(out) then
+      return ["err", out]
     end
-    return ["err", out[1], out[2]]
+    return ["ok", out]
   end
   return lean_run_file(path)
 end
