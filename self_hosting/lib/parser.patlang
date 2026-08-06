@@ -358,150 +358,128 @@ make a function called parse_unary takes toks, pos returns r
   end
 end
 
-make a function called parse_mul takes toks, pos returns r
+# GitHub #28: the binary-operator precedence chain used to be seven
+# hand-cascaded functions (parse_mul -> parse_shift -> parse_add ->
+# parse_bitwise -> parse_cmp -> parse_and -> parse_expr's own `or`
+# tier), each re-implementing its OWN copy of "peek for a continuation
+# operator, optionally past a newline, recurse." Every one of those
+# seven copies was a separate place to forget the fix, which is
+# exactly what happened (`let x =\n "a"` and several tiers were still
+# missing it even after `+`/`-`/`*`/`/`/`%` had already been patched).
+# Replaced with ONE table-driven precedence-climbing (Pratt) loop,
+# `parse_binary`, so there is only one place left where "does this
+# expression continue" is decided at all -- matching the native Rust
+# frontend's own architecture (a single unified `parse_expression`,
+# not a cascade), not just its behavior.
+#
+# binop_info(t) -> ["", 0, false] if t isn't a binary operator at all,
+# else [canonical_op_name, precedence (1=loosest .. 7=tightest),
+# continues_across_a_newline]. Precedence numbers match the OLD
+# cascade's own nesting exactly (parse_expr=or=1 was outermost/
+# loosest, parse_mul=7 was innermost/tightest) so existing precedence
+# stays identical; only the MECHANISM collapsed to one function.
+# `continues_across_a_newline` mirrors the native frontend's own
+# whitelist (parser.rs's parse_expression) exactly: every arithmetic/
+# comparison/bitwise/shift operator continues across a newline: `and`/
+# `or` deliberately do NOT (matching that this is a real, general
+# design DECISION already made by the reference implementation, not
+# an oversight to "complete" -- `let ok = a\nand b` stays two separate
+# things, same as it always has been in both frontends).
+make a function called binop_info takes t returns info
+  if t[0] == "OP" then
+    if t[1] == "*" then
+      return ["*", 7, true]
+    end
+    if t[1] == "/" then
+      return ["/", 7, true]
+    end
+    if t[1] == "%" then
+      return ["%", 7, true]
+    end
+    if t[1] == "+" then
+      return ["+", 5, true]
+    end
+    if t[1] == "-" then
+      return ["-", 5, true]
+    end
+    if t[1] == "==" then
+      return ["==", 3, true]
+    end
+    if t[1] == "!=" then
+      return ["!=", 3, true]
+    end
+    if t[1] == "<" then
+      return ["<", 3, true]
+    end
+    if t[1] == "<=" then
+      return ["<=", 3, true]
+    end
+    if t[1] == ">" then
+      return [">", 3, true]
+    end
+    if t[1] == ">=" then
+      return [">=", 3, true]
+    end
+    return ["", 0, false]
+  else
+    if t[0] == "IDENT" then
+      if t[1] == "shl" then
+        return ["shl", 6, true]
+      end
+      if t[1] == "shr" then
+        return ["shr", 6, true]
+      end
+      if t[1] == "band" then
+        return ["band", 4, true]
+      end
+      if t[1] == "bxor" then
+        return ["bxor", 4, true]
+      end
+      if t[1] == "bor" then
+        return ["bor", 4, true]
+      end
+      if t[1] == "and" then
+        return ["and", 2, false]
+      end
+      if t[1] == "or" then
+        return ["or", 1, false]
+      end
+      return ["", 0, false]
+    else
+      return ["", 0, false]
+    end
+  end
+end
+
+make a function called parse_binary takes toks, pos, min_prec returns r
   let r1 = parse_unary(toks, pos)
   let node = r1[0]
   let p = r1[1]
   let looping = true
   while looping do
-    # Peek past any newlines for a continuation operator (mirrors the
-    # native Rust frontend, and parse_args's own newline tolerance below)
-    # -- without this, a leading `*`/`/`/`%` on the next line is invisible
-    # here because the token right after `p` is an NL, not an OP, and the
-    # expression silently truncates instead of continuing.
-    let p2 = skip_nl(toks, p)
-    let t = vec_get(toks, p2)
-    if (t[0] == "OP") and ((t[1] == "*") or (t[1] == "/") or (t[1] == "%")) then
-      # GitHub #28: also skip newlines AFTER the operator itself -- the
-      # operator can be the last token on ITS line too (e.g. `a *\n b`),
-      # leaving a second, unrelated NL right before the RHS operand.
-      let r2 = parse_unary(toks, skip_nl(toks, p2 + 1))
-      let node = ["Bin", t[1], node, r2[0]]
-      let p = r2[1]
-    else
-      let looping = false
-    end
-  end
-  return [node, p]
-end
-
-make a function called parse_shift takes toks, pos returns r
-  # shl/shr: bind tighter than +/- but looser than */%,  matching the
-  # native Rust frontend's precedence table (parser.rs).
-  let r1 = parse_mul(toks, pos)
-  let node = r1[0]
-  let p = r1[1]
-  let looping = true
-  while looping do
-    # GitHub #28: peek past newlines for a continuation `shl`/`shr`,
-    # same pattern as parse_add/parse_mul below.
-    let p2 = skip_nl(toks, p)
-    let t = vec_get(toks, p2)
-    if tok_is(t, "IDENT", "shl") then
-      let r2 = parse_mul(toks, skip_nl(toks, p2 + 1))
-      let node = ["Bin", "shl", node, r2[0]]
-      let p = r2[1]
-    else
-      if tok_is(t, "IDENT", "shr") then
-        let r2 = parse_mul(toks, skip_nl(toks, p2 + 1))
-        let node = ["Bin", "shr", node, r2[0]]
-        let p = r2[1]
-      else
-        let looping = false
+    # Same-line operator first (the common case, no newline involved
+    # at all); only if that's absent do we look PAST any newlines to
+    # see whether a continuation-eligible operator starts the next
+    # line -- this order is what keeps `let x = 5\n-3` two separate
+    # things: a leading `-` past a newline IS eligible in principle,
+    # but only actually taken if `binop_info`'s continues flag says so
+    # (true for `-`, matching the native frontend's own choice; this
+    # is an intentional, documented tradeoff shared with every C-like
+    # language that allows optional statement separators, not a bug).
+    let info = binop_info(vec_get(toks, p))
+    let oppos = p
+    if info[0] == "" then
+      let p2 = skip_nl(toks, p)
+      let info2 = binop_info(vec_get(toks, p2))
+      if info2[2] then
+        let info = info2
+        let oppos = p2
       end
     end
-  end
-  return [node, p]
-end
-
-make a function called parse_add takes toks, pos returns r
-  let r1 = parse_shift(toks, pos)
-  let node = r1[0]
-  let p = r1[1]
-  let looping = true
-  while looping do
-    # See parse_mul's comment: peek past newlines for a continuation `+`/`-`.
-    let p2 = skip_nl(toks, p)
-    let t = vec_get(toks, p2)
-    if (t[0] == "OP") and ((t[1] == "+") or (t[1] == "-")) then
-      let r2 = parse_shift(toks, skip_nl(toks, p2 + 1))
-      let node = ["Bin", t[1], node, r2[0]]
-      let p = r2[1]
-    else
-      let looping = false
-    end
-  end
-  return [node, p]
-end
-
-make a function called parse_bitwise takes toks, pos returns r
-  # band/bxor/bor: a single combined tier (looser than +/-, tighter than
-  # comparisons), matching the native Rust frontend -- mixed band/bxor/bor
-  # expressions evaluate left-to-right; parenthesize if a specific grouping
-  # matters, same advice as mixing and/or.
-  let r1 = parse_add(toks, pos)
-  let node = r1[0]
-  let p = r1[1]
-  let looping = true
-  while looping do
-    # GitHub #28: peek past newlines for a continuation `band`/`bxor`/
-    # `bor`, same pattern as parse_add/parse_mul above.
-    let p2 = skip_nl(toks, p)
-    let t = vec_get(toks, p2)
-    if tok_is(t, "IDENT", "band") then
-      let r2 = parse_add(toks, skip_nl(toks, p2 + 1))
-      let node = ["Bin", "band", node, r2[0]]
-      let p = r2[1]
-    else
-      if tok_is(t, "IDENT", "bxor") then
-        let r2 = parse_add(toks, skip_nl(toks, p2 + 1))
-        let node = ["Bin", "bxor", node, r2[0]]
-        let p = r2[1]
-      else
-        if tok_is(t, "IDENT", "bor") then
-          let r2 = parse_add(toks, skip_nl(toks, p2 + 1))
-          let node = ["Bin", "bor", node, r2[0]]
-          let p = r2[1]
-        else
-          let looping = false
-        end
-      end
-    end
-  end
-  return [node, p]
-end
-
-make a function called parse_cmp takes toks, pos returns r
-  let r1 = parse_bitwise(toks, pos)
-  let node = r1[0]
-  let p = r1[1]
-  let looping = true
-  while looping do
-    # GitHub #28: peek past newlines for a continuation comparison op,
-    # same pattern as parse_add/parse_mul above.
-    let p2 = skip_nl(toks, p)
-    let t = vec_get(toks, p2)
-    if (t[0] == "OP") and ((t[1] == "==") or (t[1] == "!=") or (t[1] == "<") or (t[1] == "<=") or (t[1] == ">") or (t[1] == ">=")) then
-      let r2 = parse_bitwise(toks, skip_nl(toks, p2 + 1))
-      let node = ["Bin", t[1], node, r2[0]]
-      let p = r2[1]
-    else
-      let looping = false
-    end
-  end
-  return [node, p]
-end
-
-make a function called parse_and takes toks, pos returns r
-  let r1 = parse_cmp(toks, pos)
-  let node = r1[0]
-  let p = r1[1]
-  let looping = true
-  while looping do
-    let t = vec_get(toks, p)
-    if tok_is(t, "IDENT", "and") then
-      let r2 = parse_cmp(toks, p + 1)
-      let node = ["Bin", "and", node, r2[0]]
+    if (info[0] != "") and (info[1] >= min_prec) then
+      let rhs_start = skip_nl(toks, oppos + 1)
+      let r2 = parse_binary(toks, rhs_start, info[1] + 1)
+      let node = ["Bin", info[0], node, r2[0]]
       let p = r2[1]
     else
       let looping = false
@@ -518,28 +496,8 @@ make a function called parse_expr takes toks, pos returns r
   # every one of its call sites gets this for free, matching the
   # native Rust frontend's own parse_expression (skips newlines before
   # parsing its first primary, unconditionally, before the Pratt loop
-  # even starts). This is distinct from (and doesn't replace) the
-  # separate, narrower "is a following newline+operator a MID-
-  # expression continuation" check further down each precedence tier
-  # -- that one must stay conditional on the specific operator found,
-  # or a genuine two-statement sequence like `let x = 5\n-3` would get
-  # wrongly glued into one expression.
-  let p0 = skip_nl(toks, pos)
-  let r1 = parse_and(toks, p0)
-  let node = r1[0]
-  let p = r1[1]
-  let looping = true
-  while looping do
-    let t = vec_get(toks, p)
-    if tok_is(t, "IDENT", "or") then
-      let r2 = parse_and(toks, p + 1)
-      let node = ["Bin", "or", node, r2[0]]
-      let p = r2[1]
-    else
-      let looping = false
-    end
-  end
-  return [node, p]
+  # even starts).
+  return parse_binary(toks, skip_nl(toks, pos), 1)
 end
 
 # ---- statements ----
