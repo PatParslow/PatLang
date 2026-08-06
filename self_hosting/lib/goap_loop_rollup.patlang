@@ -1,0 +1,146 @@
+# GOAP loop-rollup pass (follow-up to #21's polyglot snippet-synthesis
+# machinery, goap_snippet_synthesis.patlang).
+#
+# plan() never returns anything but a flat list of ground action
+# labels -- there is no loop/repeat AST node anywhere in its output
+# vocabulary. But the underlying search places NO restriction on
+# reusing the same action TEMPLATE multiple times with different
+# bindings across a search -- a "count down to zero" domain (a
+# decrementing relation pre-enumerated as ground facts, e.g. dec(3,2),
+# dec(2,1), dec(1,0)) is discovered as a genuine, correct, flat plan
+# that just happens to repeat the same base action name several times
+# in a row with a monotonically changing bound argument -- an
+# "unrolled loop," found by ordinary STRIPS search, not a loop
+# construct.
+#
+# This pass sits between plan()'s flat output and synthesize_program's
+# per-step snippet assembly: it detects a RUN of consecutive plan
+# steps sharing the same base action name, and -- if the caller
+# supplies a loop-shaped template for that base name -- collapses the
+# whole run into ONE emitted loop instead of K separately unrolled
+# snippets. Falls back to ordinary flat per-step assembly (reusing
+# goap_snippet_synthesis's own machinery unchanged) for any step not
+# part of a detected run, or where no loop template exists for its
+# base name.
+#
+# Deliberately NOT a general induction/pattern-matching pass: it only
+# asks "are there >=2 CONSECUTIVE steps with the same base name," not
+# "is there some clever interleaved repeating substructure." That
+# narrower, honest scope is enough to prove the core claim (a
+# discovered flat repeated-action plan can be mechanically re-expressed
+# as a real loop, and the two are behaviorally equivalent) without
+# overclaiming general loop discovery.
+
+include "goap_snippet_synthesis.patlang"
+
+# goap_find_runs(plan_labels) -> list of [start_index, end_index_excl,
+# base_name, count] describing each maximal run of >=2 consecutive
+# steps sharing the same base action name. Steps not covered by any
+# returned run are singletons (handled individually by the caller).
+make a function called goap_find_runs takes plan_labels returns runs
+  let runs = []
+  let n = to_num(list_len(plan_labels))
+  let i = 0
+  while i < n do
+    let base = action_base_name(plan_labels[i])
+    let j = i + 1
+    while (j < n) and (action_base_name(plan_labels[j]) == base) do
+      let j = j + 1
+    end
+    if (j - i) >= 2 then
+      let runs = list_push(runs, [i, j, base, j - i])
+    end
+    let i = j
+  end
+  return runs
+end
+
+# Is index i covered by any run in `runs`? Returns the covering run
+# (same 4-element [start_index, end_index_excl, base_name, count]
+# shape as goap_find_runs' own entries -- kept consistent with the
+# "found" shape deliberately, so callers can always index run[2] for
+# the base name without a separate found/not-found shape to track),
+# or [-1, -1, "", 0] if i falls outside every run.
+make a function called goap_run_covering takes runs, i returns r
+  let k = 0
+  let n = to_num(list_len(runs))
+  while k < n do
+    let run = runs[k]
+    if (i >= run[0]) and (i < run[1]) then
+      return run
+    end
+    let k = k + 1
+  end
+  return [-1, -1, "", 0]
+end
+
+# synthesize_program_with_rollup(plan_labels, flat_dict, loop_dict,
+# contract_clauses) -> ["OK", source_text] | ["ERR", message].
+#
+# flat_dict: same per-step template dictionary synthesize_program
+# already uses (base_name -> template with {ARG0}/{ARG1}/... filled
+# from that ONE step's own bound args).
+# loop_dict: base_name -> a template filled via the SAME
+# snippet_substitute this file reuses unchanged from goap_snippet_
+# synthesis.patlang (positional {ARG0}/{ARG1}/{ARG2} placeholders,
+# not new named ones) -- {ARG0} = the run's first step's own first
+# bound arg, {ARG1} = the run's LAST step's own SECOND bound arg
+# ("where the countdown lands"), {ARG2} = the run's length (for a
+# target language that would rather loop a fixed number of times than
+# test an end condition). A base name present in loop_dict
+# is only actually treated as a loop if it appears in a genuine run
+# (>=2 consecutive steps); a single, isolated occurrence still falls
+# back to flat_dict.
+make a function called synthesize_program_with_rollup takes plan_labels, flat_dict, loop_dict, contract_clauses returns result
+  if to_num(list_len(contract_clauses)) > 0 then
+    let ok = goap_verify_contracts(contract_clauses, plan_labels)
+    if ok == false then
+      return ["ERR", "a plan step violated a contract clause -- rejected before any code was generated"]
+    end
+  end
+  let runs = goap_find_runs(plan_labels)
+  let out = sb_new()
+  let i = 0
+  let n = to_num(list_len(plan_labels))
+  while i < n do
+    let run = goap_run_covering(runs, i)
+    let base = run[2]
+    if base != "" then
+      let loop_template = "" + get(loop_dict, base)
+      if loop_template == "" then
+        # No loop template for this base -- fall back to emitting
+        # every step in the run individually, flat.
+        let flat_template = "" + get(flat_dict, base)
+        if flat_template == "" then
+          return ["ERR", "no snippet registered for action \"" + base + "\""]
+        end
+        let j = run[0]
+        while j < run[1] do
+          let args = action_label_args(plan_labels[j])
+          sb_push(out, snippet_substitute(flat_template, args))
+          let j = j + 1
+        end
+        let i = run[1]
+      else
+        let first_args = action_label_args(plan_labels[run[0]])
+        let last_args = action_label_args(plan_labels[run[1] - 1])
+        let loop_start = first_args[0]
+        let loop_end = last_args[1]
+        let loop_count = "" + run[3]
+        let filled = snippet_substitute(loop_template, [loop_start, loop_end, loop_count])
+        sb_push(out, filled)
+        let i = run[1]
+      end
+    else
+      let base_single = action_base_name(plan_labels[i])
+      let flat_template = "" + get(flat_dict, base_single)
+      if flat_template == "" then
+        return ["ERR", "no snippet registered for action \"" + base_single + "\""]
+      end
+      let args = action_label_args(plan_labels[i])
+      sb_push(out, snippet_substitute(flat_template, args))
+      let i = i + 1
+    end
+  end
+  return ["OK", sb_str(out)]
+end

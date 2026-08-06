@@ -1,0 +1,61 @@
+# check()/t_report() regression coverage for self_hosting/lib/
+# goap_loop_rollup.patlang and self_hosting/examples/goap_loop_
+# rollup_demo.patlang -- proves a GOAP-discovered flat, repeated-
+# action plan (an "unrolled loop," found by ordinary STRIPS search
+# over a pre-enumerated decrementing fact table) can be mechanically
+# rolled up into a REAL loop construct, and that the rolled-up version
+# is behaviorally IDENTICAL to the flat one -- verified by actually
+# running both, not by inspection.
+
+include "lib/test.patlang"
+include "lib/goap_loop_rollup.patlang"
+
+t_init()
+
+rule_add("count", ["3"], [])
+rule_add("dec", ["3", "2"], [])
+rule_add("dec", ["2", "1"], [])
+rule_add("dec", ["1", "0"], [])
+action_add("chop_wood", [["count", ["N"]], ["dec", ["N", "N1"]]], [["count", ["N1"]], ["chopped", ["N"]]], [["count", ["N"]]], 1)
+
+let plan1 = plan([["count", ["0"]]])
+check("the planner discovers a genuine flat, repeated-action plan (3 chop_wood steps) -- an unrolled loop found by ordinary search, contra the claim that GOAP+synthesis can't discover loop-shaped solutions", to_num(list_len(plan1)), 3)
+check("all 3 steps share the same base action name (this IS the repeated-action shape)", action_base_name(plan1[0]) == action_base_name(plan1[1]) and action_base_name(plan1[1]) == action_base_name(plan1[2]), true)
+
+let flat_dict = new("Dict", "flat_chop")
+send(flat_dict, "set", "chop_wood", "print(\"chop wood #\" + \"{ARG0}\")\n")
+
+let loop_dict = new("Dict", "loop_chop")
+send(loop_dict, "set", "chop_wood", "let n = {ARG0}\nwhile n > {ARG1} do\n  print(\"chop wood #\" + n)\n  let n = n - 1\nend\n")
+
+let flat_synth = synthesize_program(plan1, flat_dict, [])
+check("flat (unrolled) synthesis succeeds", flat_synth[0], "OK")
+
+let rollup_synth = synthesize_program_with_rollup(plan1, flat_dict, loop_dict, [])
+check("rollup synthesis succeeds", rollup_synth[0], "OK")
+check("the rolled-up source contains a REAL loop, not another unrolled sequence", contains_text(rollup_synth[1], "while"), true)
+check("the rolled-up source is genuinely ONE loop, not three separate prints", contains_text(rollup_synth[1], "chop wood #\" + n"), true)
+
+let flat_path = "self_hosting/build/goap_loop_rollup_selftest_flat.patlang"
+let rollup_path = "self_hosting/build/goap_loop_rollup_selftest_rolled.patlang"
+write_file(flat_path, flat_synth[1])
+write_file(rollup_path, rollup_synth[1])
+
+let flat_out = exec_capture("rust-runtime/target/release/pat.exe", "--ir-run", flat_path)
+let rollup_out = exec_capture("rust-runtime/target/release/pat.exe", "--ir-run", rollup_path)
+check("flat program's real output is exactly the expected countdown", flat_out, "chop wood #3\nchop wood #2\nchop wood #1\n\n")
+check("rolled-up program's real output is IDENTICAL to the flat program's -- the loop is behaviorally equivalent to the unrolled sequence, not just superficially similar", rollup_out, flat_out)
+
+# ---- error paths / scope limits, named honestly ----
+
+let empty_loop_dict = new("Dict", "empty_loop")
+let fallback_synth = synthesize_program_with_rollup(plan1, flat_dict, empty_loop_dict, [])
+check("a base name with no loop template falls back to flat assembly for its whole run, not an error", fallback_synth[0], "OK")
+check("the fallback's output matches the pure-flat synthesis exactly", fallback_synth[1], flat_synth[1])
+
+action_add("gather_wood", [], [["have", ["wood"]]], [], 1)
+let plan2 = plan([["have", ["wood"]]])
+let single_synth = synthesize_program_with_rollup(plan2, flat_dict, loop_dict, [])
+check("an isolated single-occurrence action (no run) is reported as a missing-snippet error, not silently treated as a loop", single_synth[0], "ERR")
+
+t_report()
