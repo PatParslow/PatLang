@@ -9,12 +9,20 @@
 # plumbing -- so a regression in the CLI wiring is caught here too, not just
 # a regression in `interp.patlang` itself.
 #
-# Scope note: `interpret` only reports the program's final RETURN value (it
-# has no notion of running to completion the way `--ir-run`'s own main()
-# does beyond whatever the program's own `print()` calls produce as a
-# side effect) -- every scenario here ends with an explicit `return <expr>`
-# and asserts against that, matching how patc1_main.patlang's `interpret`
-# subcommand and its own manual smoke tests were verified.
+# Scope note, corrected 2026-08-06 (see [issue: 5 scenarios silently
+# failing since 86e4fef]): `interpret` used to always echo the program's
+# own final return value on success -- these scenarios were originally
+# written against THAT behavior. 86e4fef (2026-07-31) deliberately changed
+# `interpret` to stay silent on success, matching `--ir-run`'s own
+# convention exactly (only the program's own explicit `print()` calls
+# produce output; the implicit final return value is never echoed) -- a
+# real, reasoned fix for a genuine cosmetic bug, not a regression to
+# revert. But every scenario here was never updated to match, so all 5
+# started failing identically the moment that commit landed, and stayed
+# broken for a week because nothing had run this exact feature file since.
+# Fixed here by making each scenario `print()` the value under test
+# explicitly, the same way any real PatLang program would, instead of
+# relying on an implicit return-value echo that no longer exists.
 
 Feature: Self-hosted meta-circular interpreter (interpret_ir)
   As a maintainer of the self-hosted PatLang compiler
@@ -27,7 +35,7 @@ Feature: Self-hosted meta-circular interpreter (interpret_ir)
     Given a PatLang program:
       """
       let x = 3 + 4 * 2
-      return x
+      print(x)
       """
     When I run it through the self-hosted meta-circular interpreter
     Then the self-hosted interpreter's output matches the expected value
@@ -40,9 +48,9 @@ Feature: Self-hosted meta-circular interpreter (interpret_ir)
       """
       let x = 10
       if x > 5 then
-        return 100
+        print(100)
       else
-        return 200
+        print(200)
       end
       """
     When I run it through the self-hosted meta-circular interpreter
@@ -56,7 +64,7 @@ Feature: Self-hosted meta-circular interpreter (interpret_ir)
       """
       let xs = [1, 2, 3]
       print(list_len(xs))
-      return list_get(xs, 1)
+      print(list_get(xs, 1))
       """
     When I run it through the self-hosted meta-circular interpreter
     Then the self-hosted interpreter's output matches the expected value
@@ -74,7 +82,7 @@ Feature: Self-hosted meta-circular interpreter (interpret_ir)
         end
         return n * fact(n - 1)
       end
-      return fact(5)
+      print(fact(5))
       """
     When I run it through the self-hosted meta-circular interpreter
     Then the self-hosted interpreter's output matches the expected value
@@ -89,7 +97,7 @@ Feature: Self-hosted meta-circular interpreter (interpret_ir)
         return |x| { return x + n }
       end
       let add_three = make_adder(3)
-      return add_three(7)
+      print(add_three(7))
       """
     When I run it through the self-hosted meta-circular interpreter
     Then the self-hosted interpreter's output matches the expected value
