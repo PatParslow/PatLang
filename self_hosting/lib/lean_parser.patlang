@@ -1,0 +1,1182 @@
+# =============================================================================
+# Lean 4 AST-building Parser  (self_hosting/lib/lean_parser.patlang)
+#
+# Recursive-descent parser that turns a lean_tokenize() token vector into a
+# nested tagged-list AST.  AST node shapes:
+#
+#   ["file",     [commands]]
+#   ["import",   module_path_str]
+#   ["namespace",name, [commands]]
+#   ["section",  name_or_null, [commands]]
+#   ["open",     [names], is_scoped_bool]
+#   ["set_option",name, value_str]
+#   ["def",      modifiers, name, params_or_null, type_or_null, body]
+#   ["theorem",  modifiers, name, params_or_null, type_or_null, body]
+#   ["lemma",    modifiers, name, params_or_null, type_or_null, body]
+#   ["abbrev",   modifiers, name, params_or_null, type_or_null, body]
+#   ["structure",modifiers, name, params_or_null, extends_list, type_or_null, fields]
+#   ["class",    modifiers, name, params_or_null, extends_list, type_or_null, fields]
+#   ["instance", modifiers, name_or_null, params_or_null, type_or_null, body]
+#   ["inductive",modifiers, name, params_or_null, type_or_null, [ctors]]
+#   ["ctor",     name, type_expr]
+#   ["mutual",   [defs]]
+#   ["example",  params_or_null, type_or_null, body]
+#   ["attr_cmd", attr_list, inner_command]
+#   ["hash_cmd", cmd, expr_or_null]
+#   ["doc_comment", text]
+#   ["line_comment",text]
+#   ["block_comment",text]
+#   ["where_clause", [local_defs]]
+#
+#   Expressions:
+#   ["ident",    name_str]
+#   ["app",      fn_expr, [args]]
+#   ["fun",      [binders], body_expr]
+#   ["forall",   [binders], body_expr]
+#   ["let",      name, type_or_null, val, body]
+#   ["have",     name_or_null, type, val, body]
+#   ["show",     type, proof]
+#   ["match",    [scrutinees], motive_or_null, [arms]]
+#   ["arm",      [patterns], body]
+#   ["if",       cond, then_br, else_br]
+#   ["calc",     [steps]]
+#   ["calc_step",lhs, op, rhs]
+#   ["type_asc", expr, type]
+#   ["num",      text]
+#   ["str",      text]
+#   ["bool",     val]
+#   ["anon_ctor",[args]]
+#   ["struct_lit",[assigns], base_or_null]
+#   ["field",    expr, name]
+#   ["by",       tactic_block]
+#   ["do",       [stmts]]
+#   ["hole"]
+#   ["cdot"]   -- · anonymous placeholder
+#   ["named_arg", name, expr]
+#   ["inst_arg", expr]
+#   ["raw",      text]  -- unparsed fallback
+#
+#   Tactics:
+#   ["tactic", name, [args_as_exprs_or_raw]]
+#   ["tactic_block", [tactics]]
+#   ["tactic_focus", [tactics]]   -- · focused block
+#
+#   Binders:
+#   ["binder_exp",  [names], type]       -- (x y : T)
+#   ["binder_imp",  [names], type]       -- {x : T}
+#   ["binder_strict",[names], type]      -- {{x : T}}
+#   ["binder_inst", name_or_null, type]  -- [Foo]
+#   ["binder_name", name]                -- bare name in def head
+#
+# Depends on: lib/lean_lexer.patlang (lean_tokenize).
+# =============================================================================
+
+# ---- Token accessors ----
+
+make a function called lp_tok_type takes toks, i returns t
+  return (vec_get(toks, i))[0]
+end
+
+make a function called lp_tok_text takes toks, i returns t
+  return (vec_get(toks, i))[1]
+end
+
+make a function called lp_tok_line takes toks, i returns l
+  return (vec_get(toks, i))[2]
+end
+
+make a function called lp_is_eof takes toks, i returns r
+  return lp_tok_type(toks, i) == "EOF"
+end
+
+# Skip newlines and comment tokens; return next meaningful position.
+make a function called lp_skip takes toks, i returns pos
+  let pos = i
+  let going = true
+  while going do
+    let ty = lp_tok_type(toks, pos)
+    if ty == "NL" then
+      let pos = pos + 1
+    elif ty == "LINE_COMMENT" then
+      let pos = pos + 1
+    elif ty == "BLOCK_COMMENT" then
+      let pos = pos + 1
+    else
+      let going = false
+    end
+  end
+  return pos
+end
+
+# Peek at the meaningful (non-NL/non-comment) token at/after pos.
+make a function called lp_peek_type takes toks, i returns t
+  return lp_tok_type(toks, lp_skip(toks, i))
+end
+
+make a function called lp_peek_text takes toks, i returns t
+  return lp_tok_text(toks, lp_skip(toks, i))
+end
+
+# Check if the next meaningful token matches type+text.
+make a function called lp_at takes toks, i, ty, tx returns r
+  let p = lp_skip(toks, i)
+  let t = vec_get(toks, p)
+  return (t[0] == ty) and (t[1] == tx)
+end
+
+make a function called lp_at_kw takes toks, i, kw returns r
+  let p = lp_skip(toks, i)
+  let t = vec_get(toks, p)
+  return (t[0] == "KEYWORD") and (t[1] == kw)
+end
+
+make a function called lp_at_op takes toks, i, op returns r
+  let p = lp_skip(toks, i)
+  let t = vec_get(toks, p)
+  return (t[0] == "OP") and (t[1] == op)
+end
+
+make a function called lp_at_ident takes toks, i returns r
+  let p = lp_skip(toks, i)
+  return lp_tok_type(toks, p) == "IDENT"
+end
+
+# Consume (skip past) the next meaningful token, return new pos.
+make a function called lp_consume takes toks, i returns pos
+  return lp_skip(toks, i) + 1
+end
+
+# ---- Identifier / qualified name parsing ----
+
+# Parse a qualified identifier (A.B.C). Returns [name_string, next_pos].
+make a function called lp_parse_qualname takes toks, i returns pair
+  let p = lp_skip(toks, i)
+  let b = sb_new()
+  let going = true
+  while going do
+    let ty = lp_tok_type(toks, p)
+    if ty == "IDENT" then
+      sb_push(b, lp_tok_text(toks, p))
+      let p = p + 1
+      # check for .Name continuation
+      if (lp_tok_type(toks, p) == "OP") and (lp_tok_text(toks, p) == ".") then
+        let next_ty = lp_tok_type(toks, p + 1)
+        if (next_ty == "IDENT") or (next_ty == "KEYWORD") or (next_ty == "NUM") then
+          sb_push(b, ".")
+          let p = p + 1
+        else
+          let going = false
+        end
+      else
+        let going = false
+      end
+    elif ty == "KEYWORD" then
+      # Keywords can appear as name segments (e.g. open scoped)
+      sb_push(b, lp_tok_text(toks, p))
+      let p = p + 1
+      let going = false
+    else
+      let going = false
+    end
+  end
+  return [sb_str(b), p]
+end
+
+# ---- Modifiers ----
+
+make a function called lp_parse_modifiers takes toks, i returns pair
+  let mods = []
+  let p = lp_skip(toks, i)
+  let going = true
+  while going do
+    let ty = lp_tok_type(toks, p)
+    let tx = lp_tok_text(toks, p)
+    if ty == "KEYWORD" then
+      if (tx == "noncomputable") or (tx == "private") or (tx == "protected") or (tx == "partial") or (tx == "unsafe") then
+        let mods = list_push(mods, tx)
+        let p = lp_skip(toks, p + 1)
+      else
+        let going = false
+      end
+    elif (ty == "OP") and (tx == "@[") then
+      # attribute block @[...]
+      let p = p + 1
+      let attr_b = sb_new()
+      sb_push(attr_b, "@[")
+      let depth = 1
+      while (depth > 0) and (not lp_is_eof(toks, p)) do
+        let c = lp_tok_text(toks, p)
+        if c == "[" then
+          let depth = depth + 1
+        elif c == "]" then
+          let depth = depth - 1
+        end
+        if depth > 0 then
+          sb_push(attr_b, c)
+        end
+        let p = p + 1
+      end
+      sb_push(attr_b, "]")
+      let mods = list_push(mods, sb_str(attr_b))
+      let p = lp_skip(toks, p)
+    else
+      let going = false
+    end
+  end
+  return [mods, p]
+end
+
+# ---- Expression parsing ----
+
+# Forward-declare a stub for the expression parser (called recursively).
+# The real implementation follows below.  PatLang has no forward decls; we
+# handle mutual recursion by calling lp_parse_expr from all sub-parsers
+# and defining it after them.
+
+# Parse a binder list (zero or more binders).
+make a function called lp_parse_binders takes toks, i returns pair
+  let binders = []
+  let p = lp_skip(toks, i)
+  let going = true
+  while going do
+    let ty = lp_tok_type(toks, p)
+    let tx = lp_tok_text(toks, p)
+    if (ty == "OP") and (tx == "(") then
+      # Explicit binder
+      let p2 = lp_skip(toks, p + 1)
+      let names = []
+      let going2 = true
+      while going2 do
+        if lp_tok_type(toks, p2) == "IDENT" then
+          let names = list_push(names, lp_tok_text(toks, p2))
+          let p2 = lp_skip(toks, p2 + 1)
+        elif (lp_tok_type(toks, p2) == "OP") and (lp_tok_text(toks, p2) == "_") then
+          let names = list_push(names, "_")
+          let p2 = lp_skip(toks, p2 + 1)
+        elif (lp_tok_type(toks, p2) == "KEYWORD") and (lp_tok_text(toks, p2) == "_") then
+          let names = list_push(names, "_")
+          let p2 = lp_skip(toks, p2 + 1)
+        else
+          let going2 = false
+        end
+      end
+      if (lp_tok_type(toks, p2) == "OP") and (lp_tok_text(toks, p2) == ":") then
+        let type_res = lp_parse_expr(toks, p2 + 1)
+        let type_expr = type_res[0]
+        let p3 = lp_skip(toks, type_res[1])
+        # optional default := value
+        if (lp_tok_type(toks, p3) == "OP") and (lp_tok_text(toks, p3) == ":=") then
+          let _def_res = lp_parse_expr(toks, p3 + 1)
+          let p3 = lp_skip(toks, _def_res[1])
+        end
+        if (lp_tok_type(toks, p3) == "OP") and (lp_tok_text(toks, p3) == ")") then
+          let binders = list_push(binders, ["binder_exp", names, type_expr])
+          let p = lp_skip(toks, p3 + 1)
+        else
+          let going = false
+        end
+      else
+        # bare (name) – treat as named binder
+        if (to_num(list_len(names)) == 1) and (lp_tok_type(toks, p2) == "OP") and (lp_tok_text(toks, p2) == ")") then
+          let binders = list_push(binders, ["binder_name", names[0]])
+          let p = lp_skip(toks, p2 + 1)
+        else
+          let going = false
+        end
+      end
+    elif (ty == "OP") and (tx == "{") then
+      # Implicit binder
+      let p2 = lp_skip(toks, p + 1)
+      let names = []
+      let going2 = true
+      while going2 do
+        if lp_tok_type(toks, p2) == "IDENT" then
+          let names = list_push(names, lp_tok_text(toks, p2))
+          let p2 = lp_skip(toks, p2 + 1)
+        else
+          let going2 = false
+        end
+      end
+      if (lp_tok_type(toks, p2) == "OP") and (lp_tok_text(toks, p2) == ":") then
+        let type_res = lp_parse_expr(toks, p2 + 1)
+        let p3 = lp_skip(toks, type_res[1])
+        if (lp_tok_type(toks, p3) == "OP") and (lp_tok_text(toks, p3) == "}") then
+          let binders = list_push(binders, ["binder_imp", names, type_res[0]])
+          let p = lp_skip(toks, p3 + 1)
+        else
+          let going = false
+        end
+      else
+        let going = false
+      end
+    elif (ty == "OP") and (tx == "[") then
+      # Instance binder [T] or [h : T]
+      let p2 = lp_skip(toks, p + 1)
+      let inst_name = ""
+      if lp_at_op(toks, p2 + 1, ":") then
+        let inst_name = lp_tok_text(toks, p2)
+        let p2 = lp_skip(toks, p2 + 2)
+      end
+      let type_res = lp_parse_expr(toks, p2)
+      let p3 = lp_skip(toks, type_res[1])
+      if (lp_tok_type(toks, p3) == "OP") and (lp_tok_text(toks, p3) == "]") then
+        let binders = list_push(binders, ["binder_inst", inst_name, type_res[0]])
+        let p = lp_skip(toks, p3 + 1)
+      else
+        let going = false
+      end
+    elif (ty == "IDENT") or ((ty == "OP") and (tx == "_")) then
+      # bare name binder
+      let binders = list_push(binders, ["binder_name", tx])
+      let p = lp_skip(toks, p + 1)
+    else
+      let going = false
+    end
+  end
+  return [binders, p]
+end
+
+# Parse a sequence of tokens raw until balanced depth or stopping conditions.
+# Used for tactic bodies and complex expressions we don't fully descend into.
+# stop_kws is a list of keyword strings that stop parsing at depth 0.
+make a function called lp_parse_raw_until takes toks, i, stop_kws returns pair
+  let b = sb_new()
+  let p = lp_skip(toks, i)
+  let depth = 0
+  let going = true
+  while going and (not lp_is_eof(toks, p)) do
+    let ty = lp_tok_type(toks, p)
+    let tx = lp_tok_text(toks, p)
+    # track bracket depth
+    if ty == "OP" then
+      if (tx == "(") or (tx == "[") or (tx == "{") or (tx == "@[") or (tx == "{{") then
+        let depth = depth + 1
+      elif (tx == ")") or (tx == "]") or (tx == "}") or (tx == "}}") then
+        if depth > 0 then
+          let depth = depth - 1
+        else
+          let going = false
+        end
+      end
+    end
+    if going then
+      if ty == "KEYWORD" then
+        if depth == 0 then
+          let ki = 0
+          let found = false
+          while ki < stop_kws.length do
+            if tx == stop_kws[ki] then
+              let found = true
+            end
+            let ki = ki + 1
+          end
+          if found then
+            let going = false
+          else
+            if b.length > 0 then
+              sb_push(b, " ")
+            end
+            sb_push(b, tx)
+            let p = p + 1
+          end
+        else
+          if b.length > 0 then
+            sb_push(b, " ")
+          end
+          sb_push(b, tx)
+          let p = p + 1
+        end
+      elif ty == "NL" then
+        let p = p + 1
+      else
+        if b.length > 0 then
+          sb_push(b, " ")
+        end
+        sb_push(b, tx)
+        let p = p + 1
+      end
+    end
+  end
+  return [["raw", sb_str(b)], p]
+end
+
+# Parse a tactic block (after "by").
+make a function called lp_parse_tactic_block takes toks, i returns pair
+  let tactics = []
+  let p = lp_skip(toks, i)
+  # Collect tactics until we hit a token that ends the block
+  let going = true
+  while going and (not lp_is_eof(toks, p)) do
+    let ty = lp_tok_type(toks, p)
+    let tx = lp_tok_text(toks, p)
+    # These tokens end the tactic block at the top level
+    if ty == "KEYWORD" then
+      if (tx == "def") or (tx == "theorem") or (tx == "lemma") or (tx == "abbrev") or (tx == "structure") or (tx == "class") or (tx == "instance") or (tx == "inductive") or (tx == "end") or (tx == "namespace") or (tx == "section") or (tx == "where") or (tx == "import") or (tx == "open") then
+        let going = false
+      else
+        # Parse one tactic
+        let tac_res = lp_parse_one_tactic(toks, p)
+        let tactics = list_push(tactics, tac_res[0])
+        let p = lp_skip(toks, tac_res[1])
+      end
+    elif (ty == "OP") and ((tx == ")") or (tx == "]") or (tx == "}") or (tx == ":=")) then
+      let going = false
+    else
+      let tac_res = lp_parse_one_tactic(toks, p)
+      let tactics = list_push(tactics, tac_res[0])
+      let p = lp_skip(toks, tac_res[1])
+    end
+  end
+  return [["tactic_block", tactics], p]
+end
+
+# Parse one tactic.
+make a function called lp_parse_one_tactic takes toks, i returns pair
+  let p = lp_skip(toks, i)
+  let ty = lp_tok_type(toks, p)
+  let tx = lp_tok_text(toks, p)
+  # · focused block
+  if tx == "\xc2\xb7" then
+    let p2 = lp_skip(toks, p + 1)
+    let inner = lp_parse_tactic_block(toks, p2)
+    return [["tactic_focus", (inner[0])[1]], inner[1]]
+  end
+  # calc tactic
+  if (ty == "KEYWORD") and (tx == "calc") then
+    let raw = lp_parse_raw_until(toks, p + 1, ["theorem", "lemma", "def", "abbrev", "end", "where"])
+    return [["tactic", "calc", [(raw[0])]], raw[1]]
+  end
+  # conv tactic
+  if (ty == "KEYWORD") and (tx == "conv") then
+    let raw = lp_parse_raw_until(toks, p + 1, ["theorem", "lemma", "def", "abbrev", "end", "where"])
+    return [["tactic", "conv", [(raw[0])]], raw[1]]
+  end
+  # All other tactics: collect until next tactic or block end
+  # (raw approach – avoids having to parse every tactic's argument structure)
+  let stop = ["apply", "exact", "refine", "intro", "intros", "rintro",
+              "simp", "ring", "norm_num", "linarith", "nlinarith",
+              "positivity", "aesop", "decide", "native_decide", "rfl",
+              "assumption", "contradiction", "trivial", "sorry", "skip",
+              "done", "constructor", "left", "right", "cases", "induction",
+              "rw", "rewrite", "unfold", "have", "obtain", "rcases", "use",
+              "push_neg", "contrapose", "exfalso", "absurd", "norm_cast",
+              "push_cast", "field_simp", "conv", "show", "suffices",
+              "calc", "omega", "ext", "funext", "congr", "gcongr",
+              "trans", "symm", "ac_rfl", "simp_all", "ring_nf",
+              "all_goals", "try", "repeat", "first", "case", "focus",
+              "specialize", "generalize", "lift", "fin_cases",
+              "interval_cases", "iterate", "def", "theorem", "lemma",
+              "abbrev", "structure", "class", "instance", "inductive",
+              "end", "namespace", "section", "where", "import", "open"]
+  let name = tx
+  let p2 = p + 1
+  let raw = lp_parse_raw_until(toks, p2, stop)
+  return [["tactic", name, [(raw[0])]], raw[1]]
+end
+
+# Parse an expression.  This is a recursive-descent parser for Lean 4
+# expressions.  For complex sub-expressions (especially inside tactic blocks),
+# we fall back to raw text capture to keep the parser from growing unboundedly
+# for features we don't need to structurally represent yet.
+make a function called lp_parse_expr takes toks, i returns pair
+  let p = lp_skip(toks, i)
+  let ty = lp_tok_type(toks, p)
+  let tx = lp_tok_text(toks, p)
+
+  # fun / λ
+  if (ty == "KEYWORD") and ((tx == "fun") or (tx == "\xce\xbb")) then
+    let binder_res = lp_parse_binders(toks, p + 1)
+    let binders = binder_res[0]
+    let p2 = lp_skip(toks, binder_res[1])
+    # expect =>
+    if (lp_tok_type(toks, p2) == "OP") and ((lp_tok_text(toks, p2) == "=>") or (lp_tok_text(toks, p2) == "\xe2\x87\x92")) then
+      let body_res = lp_parse_expr(toks, p2 + 1)
+      return [["fun", binders, body_res[0]], body_res[1]]
+    else
+      return [["fun", binders, ["hole"]], p2]
+    end
+  end
+
+  # ∀ / forall
+  if (ty == "KEYWORD") and ((tx == "forall") or (tx == "\xe2\x88\x80")) then
+    let binder_res = lp_parse_binders(toks, p + 1)
+    let p2 = lp_skip(toks, binder_res[1])
+    if (lp_tok_type(toks, p2) == "OP") and (lp_tok_text(toks, p2) == ",") then
+      let body_res = lp_parse_expr(toks, p2 + 1)
+      return [["forall", binder_res[0], body_res[0]], body_res[1]]
+    else
+      return [["forall", binder_res[0], ["hole"]], p2]
+    end
+  end
+
+  # let binding
+  if (ty == "KEYWORD") and (tx == "let") then
+    let p2 = lp_skip(toks, p + 1)
+    let name = lp_tok_text(toks, p2)
+    let p3 = lp_skip(toks, p2 + 1)
+    let type_node = null
+    if (lp_tok_type(toks, p3) == "OP") and (lp_tok_text(toks, p3) == ":") then
+      let type_res = lp_parse_expr(toks, p3 + 1)
+      let type_node = type_res[0]
+      let p3 = lp_skip(toks, type_res[1])
+    end
+    let op = lp_tok_text(toks, p3)
+    let p4 = lp_skip(toks, p3 + 1)
+    let val_res = lp_parse_expr(toks, p4)
+    let p5 = lp_skip(toks, val_res[1])
+    let body_res = lp_parse_expr(toks, p5)
+    return [["let", name, type_node, val_res[0], body_res[0]], body_res[1]]
+  end
+
+  # have
+  if (ty == "KEYWORD") and (tx == "have") then
+    let p2 = lp_skip(toks, p + 1)
+    let hname = ""
+    if lp_at_op(toks, p2 + 1, ":") then
+      let hname = lp_tok_text(toks, p2)
+      let p2 = lp_skip(toks, p2 + 2)
+    end
+    let type_res = lp_parse_expr(toks, p2)
+    let p3 = lp_skip(toks, type_res[1])
+    let val_res = lp_parse_expr(toks, p3 + 1)
+    let p4 = lp_skip(toks, val_res[1])
+    let body_res = lp_parse_expr(toks, p4)
+    return [["have", hname, type_res[0], val_res[0], body_res[0]], body_res[1]]
+  end
+
+  # show
+  if (ty == "KEYWORD") and (tx == "show") then
+    let type_res = lp_parse_expr(toks, p + 1)
+    let p2 = lp_skip(toks, type_res[1])
+    let body_res = lp_parse_expr(toks, p2 + 1)
+    return [["show", type_res[0], body_res[0]], body_res[1]]
+  end
+
+  # match
+  if (ty == "KEYWORD") and (tx == "match") then
+    return lp_parse_match(toks, p)
+  end
+
+  # if/then/else
+  if (ty == "KEYWORD") and (tx == "if") then
+    return lp_parse_if(toks, p)
+  end
+
+  # do notation
+  if (ty == "KEYWORD") and (tx == "do") then
+    return lp_parse_do(toks, p + 1)
+  end
+
+  # by tactic block
+  if (ty == "KEYWORD") and (tx == "by") then
+    let block = lp_parse_tactic_block(toks, p + 1)
+    return [["by", block[0]], block[1]]
+  end
+
+  # calc
+  if (ty == "KEYWORD") and (tx == "calc") then
+    let raw = lp_parse_raw_until(toks, p + 1, ["theorem", "lemma", "def", "abbrev", "end", "where"])
+    return [["calc", [(raw[0])]], raw[1]]
+  end
+
+  # Application and atoms
+  return lp_parse_app(toks, p)
+end
+
+# Parse function application: atom atom atom ...
+make a function called lp_parse_app takes toks, i returns pair
+  let atom_res = lp_parse_atom(toks, i)
+  if atom_res == null then
+    return [["hole"], i]
+  end
+  let fn_expr = atom_res[0]
+  let p = lp_skip(toks, atom_res[1])
+  let args = []
+  let going = true
+  while going do
+    let atom2 = lp_parse_atom(toks, p)
+    if atom2 == null then
+      let going = false
+    else
+      let args = list_push(args, atom2[0])
+      let p = lp_skip(toks, atom2[1])
+    end
+  end
+  if args.length == 0 then
+    return [fn_expr, p]
+  end
+  return [["app", fn_expr, args], p]
+end
+
+# Parse a single atom.  Returns null if no atom can be parsed here.
+make a function called lp_parse_atom takes toks, i returns maybe
+  let p = lp_skip(toks, i)
+  if lp_is_eof(toks, p) then
+    return null
+  end
+  let ty = lp_tok_type(toks, p)
+  let tx = lp_tok_text(toks, p)
+
+  # Numeric literal
+  if ty == "NUM" then
+    return [["num", tx], p + 1]
+  end
+
+  # String literal
+  if ty == "STR" then
+    return [["str", tx], p + 1]
+  end
+
+  # true / false
+  if (ty == "KEYWORD") and ((tx == "true") or (tx == "false")) then
+    return [["bool", tx], p + 1]
+  end
+
+  # Parenthesised expression
+  if (ty == "OP") and (tx == "(") then
+    let inner = lp_parse_expr(toks, p + 1)
+    let p2 = lp_skip(toks, inner[1])
+    if (lp_tok_type(toks, p2) == "OP") and (lp_tok_text(toks, p2) == ")") then
+      return [inner[0], p2 + 1]
+    else
+      return [inner[0], p2]
+    end
+  end
+
+  # Anonymous constructor ⟨ ... ⟩
+  if (ty == "OP") and (tx == "\xe2\x9f\xa8") then
+    let args = []
+    let p2 = lp_skip(toks, p + 1)
+    while (not lp_is_eof(toks, p2)) and (not ((lp_tok_type(toks, p2) == "OP") and (lp_tok_text(toks, p2) == "\xe2\x9f\xa9"))) do
+      let arg_res = lp_parse_expr(toks, p2)
+      let args = list_push(args, arg_res[0])
+      let p2 = lp_skip(toks, arg_res[1])
+      if (lp_tok_type(toks, p2) == "OP") and (lp_tok_text(toks, p2) == ",") then
+        let p2 = lp_skip(toks, p2 + 1)
+      end
+    end
+    let p2 = p2 + 1
+    return [["anon_ctor", args], p2]
+  end
+
+  # · (cdot placeholder)
+  if tx == "\xc2\xb7" then
+    return [["cdot"], p + 1]
+  end
+
+  # _ hole
+  if (ty == "OP") and (tx == "_") then
+    return [["hole"], p + 1]
+  end
+
+  # @explicit application
+  if (ty == "OP") and (tx == "@") then
+    let name_res = lp_parse_qualname(toks, p + 1)
+    return [["app", ["ident", "@" + name_res[0]], []], name_res[1]]
+  end
+
+  # by tactic block (when used as an atom)
+  if (ty == "KEYWORD") and (tx == "by") then
+    let block = lp_parse_tactic_block(toks, p + 1)
+    return [["by", block[0]], block[1]]
+  end
+
+  # Identifier / qualified name – but only if it doesn't start a new command
+  if ty == "IDENT" then
+    let name_res = lp_parse_qualname(toks, p)
+    let name = name_res[0]
+    let p2 = lp_skip(toks, name_res[1])
+    # named argument (ident :=)
+    if (lp_tok_type(toks, p2) == "OP") and (lp_tok_text(toks, p2) == ":=") then
+      let val_res = lp_parse_expr(toks, p2 + 1)
+      return [["named_arg", name, val_res[0]], val_res[1]]
+    end
+    return [["ident", name], p2]
+  end
+
+  # Type/Sort/Prop keywords used as expressions
+  if ty == "KEYWORD" then
+    if (tx == "Type") or (tx == "Sort") or (tx == "Prop") then
+      return [["ident", tx], p + 1]
+    end
+  end
+
+  return null
+end
+
+make a function called lp_parse_match takes toks, i returns pair
+  let p = lp_skip(toks, i + 1)
+  let scrutinees = []
+  let going = true
+  while going do
+    let e_res = lp_parse_expr(toks, p)
+    let scrutinees = list_push(scrutinees, e_res[0])
+    let p = lp_skip(toks, e_res[1])
+    if (lp_tok_type(toks, p) == "OP") and (lp_tok_text(toks, p) == ",") then
+      let p = lp_skip(toks, p + 1)
+    else
+      let going = false
+    end
+  end
+  let motive = null
+  if (lp_tok_type(toks, p) == "OP") and (lp_tok_text(toks, p) == ":") then
+    let m_res = lp_parse_expr(toks, p + 1)
+    let motive = m_res[0]
+    let p = lp_skip(toks, m_res[1])
+  end
+  if lp_at_kw(toks, p, "with") then
+    let p = lp_skip(toks, p + 1)
+  end
+  let arms = []
+  while (not lp_is_eof(toks, p)) and (lp_tok_text(toks, lp_skip(toks, p)) == "|") do
+    let p = lp_skip(toks, p) + 1
+    let raw = lp_parse_raw_until(toks, p, ["theorem", "lemma", "def", "abbrev", "end", "where"])
+    let arms = list_push(arms, ["arm", ["raw", (raw[0])[1]]])
+    let p = raw[1]
+  end
+  return [["match", scrutinees, motive, arms], p]
+end
+
+make a function called lp_parse_if takes toks, i returns pair
+  let cond_res = lp_parse_expr(toks, i + 1)
+  let p = lp_skip(toks, cond_res[1])
+  if lp_at_kw(toks, p, "then") then
+    let p = lp_skip(toks, p + 1)
+  end
+  let then_res = lp_parse_expr(toks, p)
+  let p = lp_skip(toks, then_res[1])
+  if lp_at_kw(toks, p, "else") then
+    let p = lp_skip(toks, p + 1)
+  end
+  let else_res = lp_parse_expr(toks, p)
+  return [["if", cond_res[0], then_res[0], else_res[0]], else_res[1]]
+end
+
+make a function called lp_parse_do takes toks, i returns pair
+  let stmts = []
+  let p = lp_skip(toks, i)
+  let going = true
+  while going and (not lp_is_eof(toks, p)) do
+    let ty = lp_tok_type(toks, p)
+    let tx = lp_tok_text(toks, p)
+    if (ty == "KEYWORD") and ((tx == "def") or (tx == "theorem") or (tx == "end") or (tx == "where")) then
+      let going = false
+    else
+      let raw = lp_parse_raw_until(toks, p, ["let", "return", "for", "if", "def", "theorem", "end", "where"])
+      let stmts = list_push(stmts, raw[0])
+      let p = raw[1]
+      if p == i then
+        let going = false
+      end
+    end
+  end
+  return [["do", stmts], p]
+end
+
+# ---- Command parsers ----
+
+make a function called lp_parse_def_head takes toks, i returns result
+  let name_res = lp_parse_qualname(toks, i)
+  let name = name_res[0]
+  let p = lp_skip(toks, name_res[1])
+  # universe params .{u, v}
+  if (lp_tok_type(toks, p) == "OP") and (lp_tok_text(toks, p) == ".") then
+    if (lp_tok_type(toks, p + 1) == "OP") and (lp_tok_text(toks, p + 1) == "{") then
+      while (not lp_is_eof(toks, p)) and (not ((lp_tok_type(toks, p) == "OP") and (lp_tok_text(toks, p) == "}"))) do
+        let p = p + 1
+      end
+      let p = p + 1
+    end
+  end
+  let p = lp_skip(toks, p)
+  let binder_res = lp_parse_binders(toks, p)
+  let params = binder_res[0]
+  let p = lp_skip(toks, binder_res[1])
+  let type_node = null
+  if (lp_tok_type(toks, p) == "OP") and (lp_tok_text(toks, p) == ":") then
+    let type_res = lp_parse_expr(toks, p + 1)
+    let type_node = type_res[0]
+    let p = lp_skip(toks, type_res[1])
+  end
+  return [name, params, type_node, p]
+end
+
+make a function called lp_parse_body takes toks, i returns pair
+  let p = lp_skip(toks, i)
+  # := body
+  if (lp_tok_type(toks, p) == "OP") and (lp_tok_text(toks, p) == ":=") then
+    let p = lp_skip(toks, p + 1)
+    let body_res = lp_parse_expr(toks, p)
+    return body_res
+  end
+  # where block
+  if lp_at_kw(toks, p, "where") then
+    let raw = lp_parse_raw_until(toks, p + 1, ["theorem", "lemma", "def", "abbrev", "structure", "class", "instance", "inductive", "end", "namespace", "section", "import", "open"])
+    return [["where_clause", [(raw[0])]], raw[1]]
+  end
+  return [["hole"], p]
+end
+
+# ---- Top-level command list ----
+
+make a function called lp_parse_command takes toks, i returns pair
+  let p = lp_skip(toks, i)
+  if lp_is_eof(toks, p) then
+    return null
+  end
+  let ty = lp_tok_type(toks, p)
+  let tx = lp_tok_text(toks, p)
+
+  # doc comment
+  if ty == "DOC_COMMENT" then
+    return [["doc_comment", tx], p + 1]
+  end
+
+  # line / block comment passthrough
+  if ty == "LINE_COMMENT" then
+    return [["line_comment", tx], p + 1]
+  end
+
+  if ty == "BLOCK_COMMENT" then
+    return [["block_comment", tx], p + 1]
+  end
+
+  # import
+  if (ty == "KEYWORD") and (tx == "import") then
+    let p2 = lp_skip(toks, p + 1)
+    let path_b = sb_new()
+    let going = true
+    while going do
+      let tt = lp_tok_type(toks, p2)
+      let tv = lp_tok_text(toks, p2)
+      if (tt == "IDENT") or (tt == "KEYWORD") then
+        sb_push(path_b, tv)
+        let p2 = p2 + 1
+        if (lp_tok_type(toks, p2) == "OP") and (lp_tok_text(toks, p2) == ".") then
+          sb_push(path_b, ".")
+          let p2 = p2 + 1
+        else
+          let going = false
+        end
+      else
+        let going = false
+      end
+    end
+    return [["import", sb_str(path_b)], p2]
+  end
+
+  # set_option
+  if (ty == "KEYWORD") and (tx == "set_option") then
+    let p2 = lp_skip(toks, p + 1)
+    let name_res = lp_parse_qualname(toks, p2)
+    let opt_name = name_res[0]
+    let p3 = lp_skip(toks, name_res[1])
+    let val_text = lp_tok_text(toks, p3)
+    return [["set_option", opt_name, val_text], p3 + 1]
+  end
+
+  # open
+  if (ty == "KEYWORD") and (tx == "open") then
+    let p2 = lp_skip(toks, p + 1)
+    let is_scoped = false
+    if lp_at_kw(toks, p2, "scoped") then
+      let is_scoped = true
+      let p2 = lp_skip(toks, p2 + 1)
+    end
+    let names = []
+    let going = true
+    while going do
+      let tt = lp_tok_type(toks, p2)
+      if (tt == "IDENT") or (tt == "KEYWORD") then
+        let name_res = lp_parse_qualname(toks, p2)
+        let names = list_push(names, name_res[0])
+        let p2 = lp_skip(toks, name_res[1])
+      else
+        let going = false
+      end
+    end
+    return [["open", names, is_scoped], p2]
+  end
+
+  # namespace
+  if (ty == "KEYWORD") and (tx == "namespace") then
+    let p2 = lp_skip(toks, p + 1)
+    let name_res = lp_parse_qualname(toks, p2)
+    let ns_name = name_res[0]
+    let p3 = lp_skip(toks, name_res[1])
+    let cmds = []
+    while (not lp_is_eof(toks, p3)) and (not lp_at_kw(toks, p3, "end")) do
+      let cmd_res = lp_parse_command(toks, p3)
+      if cmd_res == null then
+        let p3 = p3 + 1
+      else
+        let cmds = list_push(cmds, cmd_res[0])
+        let p3 = lp_skip(toks, cmd_res[1])
+      end
+    end
+    if lp_at_kw(toks, p3, "end") then
+      let p3 = lp_skip(toks, p3 + 1)
+      # consume optional name after end
+      if lp_at_ident(toks, p3) then
+        let p3 = lp_skip(toks, p3 + 1)
+      end
+    end
+    return [["namespace", ns_name, cmds], p3]
+  end
+
+  # section
+  if (ty == "KEYWORD") and (tx == "section") then
+    let p2 = lp_skip(toks, p + 1)
+    let sec_name = ""
+    if lp_at_ident(toks, p2) then
+      let sec_name = lp_tok_text(toks, p2)
+      let p2 = lp_skip(toks, p2 + 1)
+    end
+    let cmds = []
+    while (not lp_is_eof(toks, p2)) and (not lp_at_kw(toks, p2, "end")) do
+      let cmd_res = lp_parse_command(toks, p2)
+      if cmd_res == null then
+        let p2 = p2 + 1
+      else
+        let cmds = list_push(cmds, cmd_res[0])
+        let p2 = lp_skip(toks, cmd_res[1])
+      end
+    end
+    if lp_at_kw(toks, p2, "end") then
+      let p2 = lp_skip(toks, p2 + 1)
+      if lp_at_ident(toks, p2) then
+        let p2 = lp_skip(toks, p2 + 1)
+      end
+    end
+    return [["section", sec_name, cmds], p2]
+  end
+
+  # noncomputable section
+  if (ty == "KEYWORD") and (tx == "noncomputable") then
+    let p2 = lp_skip(toks, p + 1)
+    if lp_at_kw(toks, p2, "section") then
+      let sec_res = lp_parse_command(toks, p2)
+      if sec_res != null then
+        let inner = sec_res[0]
+        return [["noncomputable", inner], sec_res[1]]
+      end
+    end
+  end
+
+  # hash commands #check #eval etc.
+  if ty == "KEYWORD" then
+    if (tx == "#check") or (tx == "#eval") or (tx == "#print") or (tx == "#check_failure") or (tx == "#reduce") or (tx == "#assert") or (tx == "#norm_num") or (tx == "#simp") then
+      let expr_res = lp_parse_expr(toks, p + 1)
+      return [["hash_cmd", tx, expr_res[0]], expr_res[1]]
+    end
+  end
+
+  # Modifiers + def-like
+  let mod_res = lp_parse_modifiers(toks, p)
+  let mods = mod_res[0]
+  let p2 = lp_skip(toks, mod_res[1])
+  let ty2 = lp_tok_type(toks, p2)
+  let tx2 = lp_tok_text(toks, p2)
+
+  if ty2 == "KEYWORD" then
+    if (tx2 == "def") or (tx2 == "theorem") or (tx2 == "lemma") or (tx2 == "abbrev") then
+      let kw = tx2
+      let head = lp_parse_def_head(toks, p2 + 1)
+      let name = head[0]
+      let params = head[1]
+      let type_node = head[2]
+      let p3 = head[3]
+      let body_res = lp_parse_body(toks, p3)
+      return [[kw, mods, name, params, type_node, body_res[0]], body_res[1]]
+    end
+
+    if tx2 == "structure" then
+      let head = lp_parse_def_head(toks, p2 + 1)
+      let name = head[0]
+      let params = head[1]
+      let type_node = head[2]
+      let p3 = head[3]
+      let raw = lp_parse_raw_until(toks, p3, ["def", "theorem", "lemma", "abbrev", "structure", "class", "instance", "inductive", "end", "namespace", "section", "import", "open"])
+      return [["structure", mods, name, params, [], type_node, [(raw[0])]], raw[1]]
+    end
+
+    if tx2 == "class" then
+      let head = lp_parse_def_head(toks, p2 + 1)
+      let name = head[0]
+      let params = head[1]
+      let type_node = head[2]
+      let p3 = head[3]
+      let raw = lp_parse_raw_until(toks, p3, ["def", "theorem", "lemma", "abbrev", "structure", "class", "instance", "inductive", "end", "namespace", "section", "import", "open"])
+      return [["class", mods, name, params, [], type_node, [(raw[0])]], raw[1]]
+    end
+
+    if tx2 == "instance" then
+      let p3 = lp_skip(toks, p2 + 1)
+      let inst_name = ""
+      if lp_at_ident(toks, p3) then
+        let inst_name = lp_tok_text(toks, p3)
+        let p3 = lp_skip(toks, p3 + 1)
+      end
+      let binder_res = lp_parse_binders(toks, p3)
+      let params = binder_res[0]
+      let p4 = lp_skip(toks, binder_res[1])
+      let type_node = null
+      if (lp_tok_type(toks, p4) == "OP") and (lp_tok_text(toks, p4) == ":") then
+        let t_res = lp_parse_expr(toks, p4 + 1)
+        let type_node = t_res[0]
+        let p4 = lp_skip(toks, t_res[1])
+      end
+      let body_res = lp_parse_body(toks, p4)
+      return [["instance", mods, inst_name, params, type_node, body_res[0]], body_res[1]]
+    end
+
+    if tx2 == "inductive" then
+      let head = lp_parse_def_head(toks, p2 + 1)
+      let name = head[0]
+      let params = head[1]
+      let type_node = head[2]
+      let p3 = head[3]
+      let raw = lp_parse_raw_until(toks, p3, ["def", "theorem", "lemma", "abbrev", "structure", "class", "instance", "inductive", "end", "namespace", "section", "import", "open"])
+      return [["inductive", mods, name, params, type_node, [(raw[0])]], raw[1]]
+    end
+
+    if tx2 == "mutual" then
+      let p3 = lp_skip(toks, p2 + 1)
+      let inner = []
+      while (not lp_is_eof(toks, p3)) and (not lp_at_kw(toks, p3, "end")) do
+        let cmd_res = lp_parse_command(toks, p3)
+        if cmd_res == null then
+          let p3 = p3 + 1
+        else
+          let inner = list_push(inner, cmd_res[0])
+          let p3 = lp_skip(toks, cmd_res[1])
+        end
+      end
+      if lp_at_kw(toks, p3, "end") then
+        let p3 = lp_skip(toks, p3 + 1)
+      end
+      return [["mutual", inner], p3]
+    end
+
+    if tx2 == "example" then
+      let binder_res = lp_parse_binders(toks, p2 + 1)
+      let params = binder_res[0]
+      let p3 = lp_skip(toks, binder_res[1])
+      let type_node = null
+      if (lp_tok_type(toks, p3) == "OP") and (lp_tok_text(toks, p3) == ":") then
+        let t_res = lp_parse_expr(toks, p3 + 1)
+        let type_node = t_res[0]
+        let p3 = lp_skip(toks, t_res[1])
+      end
+      let body_res = lp_parse_body(toks, p3)
+      return [["example", params, type_node, body_res[0]], body_res[1]]
+    end
+  end
+
+  # Fallback: skip one token
+  return [["raw", tx], p + 1]
+end
+
+# Parse a full Lean 4 file.
+make a function called lean_parse takes toks returns ast
+  let cmds = []
+  let i = 0
+  let max = vec_len(toks)
+  while i < max do
+    let ty = lp_tok_type(toks, i)
+    if ty == "EOF" then
+      let i = max
+    else
+      let cmd_res = lp_parse_command(toks, i)
+      if cmd_res == null then
+        let i = i + 1
+      else
+        let cmds = list_push(cmds, cmd_res[0])
+        let i = lp_skip(toks, cmd_res[1])
+      end
+    end
+  end
+  return ["file", cmds]
+end
+
+# ---- AST query helpers ----
+
+make a function called lean_file_imports takes ast returns names
+  let names = []
+  let cmds = ast[1]
+  let i = 0
+  while i < cmds.length do
+    let cmd = cmds[i]
+    if cmd[0] == "import" then
+      let names = list_push(names, cmd[1])
+    end
+    let i = i + 1
+  end
+  return names
+end
+
+make a function called lean_file_theorems takes ast returns pairs
+  let pairs = []
+  let cmds = ast[1]
+  let i = 0
+  while i < cmds.length do
+    let cmd = cmds[i]
+    if (cmd[0] == "theorem") or (cmd[0] == "lemma") then
+      let pairs = list_push(pairs, [cmd[2], cmd[4]])
+    end
+    let i = i + 1
+  end
+  return pairs
+end
+
+make a function called lean_file_defs takes ast returns pairs
+  let pairs = []
+  let cmds = ast[1]
+  let i = 0
+  while i < cmds.length do
+    let cmd = cmds[i]
+    if (cmd[0] == "def") or (cmd[0] == "abbrev") then
+      let pairs = list_push(pairs, [cmd[2], cmd[4]])
+    end
+    let i = i + 1
+  end
+  return pairs
+end
+
+make a function called lean_find_command takes ast, kind returns found
+  let cmds = ast[1]
+  let i = 0
+  while i < cmds.length do
+    if cmds[i][0] == kind then
+      return cmds[i]
+    end
+    let i = i + 1
+  end
+  return null
+end
+
+make a function called lean_command_name takes cmd returns name
+  let kind = cmd[0]
+  if (kind == "def") or (kind == "theorem") or (kind == "lemma") or (kind == "abbrev") or (kind == "structure") or (kind == "class") or (kind == "inductive") then
+    return cmd[2]
+  end
+  if kind == "instance" then
+    return cmd[2]
+  end
+  return ""
+end
+
+make a function called lean_set_option_val takes ast, option_name returns val
+  let cmds = ast[1]
+  let i = 0
+  while i < cmds.length do
+    let cmd = cmds[i]
+    if cmd[0] == "set_option" then
+      if cmd[1] == option_name then
+        return cmd[2]
+      end
+    end
+    let i = i + 1
+  end
+  return null
+end

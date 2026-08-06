@@ -1,0 +1,108 @@
+# =============================================================================
+# Lean 4 Shell-out Runner  (self_hosting/lib/lean_run.patlang)
+#
+# Bridges PatLang code with the real `lean` / `lake` toolchain installed in
+# the environment.  All functions return tagged result lists:
+#   ["ok",  stdout_text]
+#   ["err", stderr_text, exit_code_as_str]
+#
+# As the in-PatLang kernel (lean_kernel.patlang) matures this file becomes a
+# thin router: try native kernel first, fall back to the real binary.
+#
+# API:
+#   lean_run_file(path)        → ["ok", stdout] | ["err", stderr, code]
+#   lean_check_file(path)      → ["ok"] | ["err", messages]
+#   lean_eval_expr(src_text)   → ["ok", stdout] | ["err", stderr, code]
+#   lean_run_or_check(path)    → auto-detect lake vs. bare lean
+# =============================================================================
+
+# Detect whether a lake project exists near path (a lakefile.lean/lean4
+# in the same dir or its parent).
+make a function called lean_has_lakefile takes path returns r
+  let dir = lean_dir_of(path)
+  if file_exists(dir + "/lakefile.lean") then
+    return true
+  end
+  if file_exists(dir + "/lakefile.toml") then
+    return true
+  end
+  return false
+end
+
+# Minimal dirname: return everything before the last "/" in path.
+# Falls back to "." if no slash found.
+make a function called lean_dir_of takes path returns dir
+  let i = path.length - 1
+  while i >= 0 do
+    if path[i] == "/" then
+      return substr(path, 0, i)
+    end
+    if path[i] == "\\" then
+      return substr(path, 0, i)
+    end
+    let i = i - 1
+  end
+  return "."
+end
+
+# Run a Lean 4 file with the real lean binary.
+# Returns ["ok", stdout] or ["err", stderr, code].
+make a function called lean_run_file takes path returns result
+  let out = exec_capture("lean", "--run", path)
+  if out[2] == "0" then
+    return ["ok", out[0]]
+  end
+  return ["err", out[1], out[2]]
+end
+
+# Type-check a Lean 4 file (no run) using --only-typecheck when available,
+# falling back to a plain lean invocation (which type-checks as part of
+# compilation).
+make a function called lean_check_file takes path returns result
+  # Try lean --stdin (or plain lean): lean elaborates + type-checks
+  let out = exec_capture("lean", path)
+  if out[2] == "0" then
+    return ["ok"]
+  end
+  return ["err", out[1]]
+end
+
+# Run an expression by writing a temporary file with a #eval directive and
+# invoking the real lean binary.  The temp file is written under /tmp.
+make a function called lean_eval_expr takes src_text returns result
+  let tmp_path = "/tmp/_lean_eval_" + to_str(random_int(0, 999999)) + ".lean"
+  let content = "-- lean_eval_expr temp file\n#eval " + src_text + "\n"
+  write_file(tmp_path, content)
+  let out = exec_capture("lean", "--run", tmp_path)
+  if out[2] == "0" then
+    return ["ok", out[0]]
+  end
+  return ["err", out[1], out[2]]
+end
+
+# Auto-detect lake vs. bare lean and run appropriately.
+make a function called lean_run_or_check takes path returns result
+  if lean_has_lakefile(path) then
+    let dir = lean_dir_of(path)
+    let out = exec_capture("lake", "build")
+    if out[2] == "0" then
+      return ["ok", out[0]]
+    end
+    return ["err", out[1], out[2]]
+  end
+  return lean_run_file(path)
+end
+
+# Convenience: read + parse + run a Lean file, returning the full result.
+# Requires lib/lean_lexer.patlang and lib/lean_parser.patlang to be included.
+make a function called lean_read_parse takes path returns ast
+  let src = read_file(path)
+  let toks = lean_tokenize(src)
+  return lean_parse(toks)
+end
+
+# Write an AST back to a file (requires lib/lean_emit.patlang).
+make a function called lean_write_ast takes path, ast returns ok
+  let src = lean_emit(ast)
+  return write_file(path, src)
+end

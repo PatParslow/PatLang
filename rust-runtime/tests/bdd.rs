@@ -202,6 +202,10 @@ fn given_selftest_suite(world: &mut PatWorld, name: String) {
         "regex_dsl" => read("self_hosting/regex_dsl_selftest.patlang"),
         "syntax_dsl" => read("self_hosting/syntax_dsl_selftest.patlang"),
         "reflect_transpile" => read("self_hosting/reflect_transpile_selftest.patlang"),
+        // utf8_selftest.patlang and lean_selftest.patlang are self-contained
+        // scripts that `include` their own library dependencies.
+        "utf8" => read("self_hosting/utf8_selftest.patlang"),
+        "lean" => read("self_hosting/lean_selftest.patlang"),
         // The inductive-synthesis engine's selftest suite
         // (self_hosting/synthesis_*_selftest.patlang) is deliberately NOT
         // wired in here -- run via `pat --ir-run self_hosting/tools/
