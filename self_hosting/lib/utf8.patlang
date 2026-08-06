@@ -1,0 +1,237 @@
+# =============================================================================
+# UTF-8 core stdlib library.
+#
+# PatLang strings are byte strings internally.  These functions let a program
+# work with Unicode scalar values (codepoints) rather than raw bytes, and are
+# the foundation for any library that processes source text containing non-
+# ASCII characters (e.g. the Lean 4 lexer, which uses Greek letters, math
+# symbols and subscripts as identifier characters).
+#
+# All index arguments are BYTE indices into the string (what PatLang's own
+# `s[i]` and `char_code(s, i)` accept), not logical character indices.
+# Use utf8_char_at / utf8_codepoints for logical-character access.
+#
+# API summary
+# -----------
+#   utf8_next(src, byte_i)           -> [codepoint, next_byte_i]
+#   utf8_encode(codepoint)           -> 1-4 byte string
+#   utf8_codepoints(src)             -> list of [codepoint, byte_offset]
+#   utf8_len(src)                    -> number of Unicode scalar values
+#   utf8_char_at(src, char_i)        -> codepoint (O(n) walk)
+#   utf8_is_alpha(cp)                -> bool
+#   utf8_is_digit(cp)                -> bool
+#   utf8_is_ident_start(cp)          -> bool  (Lean 4 rules)
+#   utf8_is_ident_part(cp)           -> bool  (Lean 4 rules)
+#   utf8_is_ws(cp)                   -> bool
+# =============================================================================
+
+# Decode one UTF-8 scalar value starting at byte_i in src.
+# Returns [codepoint, next_byte_i].
+# Invalid lead bytes are returned as the raw byte value with next_byte_i
+# advanced by 1 (best-effort, no exception).
+make a function called utf8_next takes src, byte_i returns pair
+  let b0 = char_code(src, byte_i)
+  # 1-byte (ASCII): 0xxxxxxx
+  if b0 < 128 then
+    return [b0, byte_i + 1]
+  end
+  # 2-byte: 110xxxxx 10xxxxxx
+  if (b0 >= 192) and (b0 <= 223) then
+    let b1 = char_code(src, byte_i + 1)
+    let cp = ((b0 - 192) * 64) + (b1 - 128)
+    return [cp, byte_i + 2]
+  end
+  # 3-byte: 1110xxxx 10xxxxxx 10xxxxxx
+  if (b0 >= 224) and (b0 <= 239) then
+    let b1 = char_code(src, byte_i + 1)
+    let b2 = char_code(src, byte_i + 2)
+    let cp = ((b0 - 224) * 4096) + ((b1 - 128) * 64) + (b2 - 128)
+    return [cp, byte_i + 3]
+  end
+  # 4-byte: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+  if (b0 >= 240) and (b0 <= 247) then
+    let b1 = char_code(src, byte_i + 1)
+    let b2 = char_code(src, byte_i + 2)
+    let b3 = char_code(src, byte_i + 3)
+    let cp = ((b0 - 240) * 262144) + ((b1 - 128) * 4096) + ((b2 - 128) * 64) + (b3 - 128)
+    return [cp, byte_i + 4]
+  end
+  # Continuation byte or invalid lead: skip one byte
+  return [b0, byte_i + 1]
+end
+
+# Encode a Unicode codepoint as a UTF-8 byte string (1-4 bytes).
+make a function called utf8_encode takes cp returns s
+  if cp < 128 then
+    return chr(cp)
+  end
+  if cp < 2048 then
+    let b0 = 192 + (cp / 64)
+    let b1 = 128 + (cp % 64)
+    return chr(b0) + chr(b1)
+  end
+  if cp < 65536 then
+    let b0 = 224 + (cp / 4096)
+    let b1 = 128 + ((cp / 64) % 64)
+    let b2 = 128 + (cp % 64)
+    return chr(b0) + chr(b1) + chr(b2)
+  end
+  let b0 = 240 + (cp / 262144)
+  let b1 = 128 + ((cp / 4096) % 64)
+  let b2 = 128 + ((cp / 64) % 64)
+  let b3 = 128 + (cp % 64)
+  return chr(b0) + chr(b1) + chr(b2) + chr(b3)
+end
+
+# Walk the whole string and return a list of [codepoint, byte_offset] pairs.
+make a function called utf8_codepoints takes src returns pairs
+  let pairs = []
+  let n = src.length
+  let i = 0
+  while i < n do
+    # Skip continuation bytes (10xxxxxx) -- utf8_next handles them, but here
+    # we only start decoding at lead bytes to avoid double-counting.
+    let b = char_code(src, i)
+    if (b < 128) or (b >= 192) then
+      let decoded = utf8_next(src, i)
+      let pairs = list_push(pairs, [decoded[0], i])
+      let i = decoded[1]
+    else
+      let i = i + 1
+    end
+  end
+  return pairs
+end
+
+# Number of Unicode scalar values in src (not bytes).
+make a function called utf8_len takes src returns n
+  let cps = utf8_codepoints(src)
+  return to_num(list_len(cps))
+end
+
+# Codepoint at logical character index char_i (0-based).  O(n) walk.
+# Returns -1 if out of range.
+make a function called utf8_char_at takes src, char_i returns cp
+  let cps = utf8_codepoints(src)
+  let n = to_num(list_len(cps))
+  if (char_i < 0) or (char_i >= n) then
+    return -1
+  end
+  return cps[char_i][0]
+end
+
+# ---- Category predicates ----
+
+# Basic Latin letters (A-Z, a-z) + Unicode letter ranges used in Lean 4
+# identifiers: Greek (0x0370-0x03FF), Letterlike/Math Symbols (0x2100-0x214F,
+# 0x1D400-0x1D7FF), Hebrew (0x05D0-0x05EA), Arabic (0x0600-0x06FF), CJK
+# unified ideographs (0x4E00-0x9FFF), and the most common math/logic symbols.
+make a function called utf8_is_alpha takes cp returns r
+  # Basic Latin letters
+  if ((cp >= 65) and (cp <= 90)) or ((cp >= 97) and (cp <= 122)) then
+    return true
+  end
+  # Greek and Coptic
+  if (cp >= 880) and (cp <= 1023) then
+    return true
+  end
+  # Hebrew
+  if (cp >= 1488) and (cp <= 1514) then
+    return true
+  end
+  # Arabic
+  if (cp >= 1536) and (cp <= 1791) then
+    return true
+  end
+  # Letterlike Symbols (ℕ ℝ ℂ 𝓢 𝓕 etc.) 0x2100-0x214F
+  if (cp >= 8448) and (cp <= 8527) then
+    return true
+  end
+  # Mathematical Operators range 0x2200-0x22FF (∀ ∃ ∧ ∨ ¬ ⊢ etc.)
+  if (cp >= 8704) and (cp <= 8959) then
+    return true
+  end
+  # Miscellaneous Mathematical Symbols-A 0x27C0-0x27EF
+  if (cp >= 10176) and (cp <= 10223) then
+    return true
+  end
+  # CJK Unified Ideographs 0x4E00-0x9FFF
+  if (cp >= 19968) and (cp <= 40959) then
+    return true
+  end
+  # Mathematical Alphanumeric Symbols 0x1D400-0x1D7FF
+  if (cp >= 119808) and (cp <= 120831) then
+    return true
+  end
+  return false
+end
+
+# ASCII digits 0-9.
+make a function called utf8_is_digit takes cp returns r
+  return (cp >= 48) and (cp <= 57)
+end
+
+# Subscript digits 0-9: U+2080-U+2089.
+make a function called utf8_is_subscript_digit takes cp returns r
+  return (cp >= 8320) and (cp <= 8329)
+end
+
+# Lean 4 identifier-start: letter, underscore, or any non-ASCII codepoint
+# that is a letter or symbol (conservative: accept everything >= 128 that
+# is not pure whitespace or pure ASCII punctuation, since Lean 4's actual
+# rule is "any Unicode codepoint that is a letter").
+make a function called utf8_is_ident_start takes cp returns r
+  if (cp >= 65) and (cp <= 90) then
+    return true
+  end
+  if (cp >= 97) and (cp <= 122) then
+    return true
+  end
+  if cp == 95 then
+    return true
+  end
+  if cp >= 128 then
+    return utf8_is_alpha(cp)
+  end
+  return false
+end
+
+# Lean 4 identifier continuation: ident-start | digit | ' | subscript digit.
+make a function called utf8_is_ident_part takes cp returns r
+  if utf8_is_ident_start(cp) then
+    return true
+  end
+  if utf8_is_digit(cp) then
+    return true
+  end
+  # apostrophe / prime (common in Lean names: h', n')
+  if cp == 39 then
+    return true
+  end
+  if utf8_is_subscript_digit(cp) then
+    return true
+  end
+  return false
+end
+
+# Whitespace: space, tab, CR, LF, and Unicode general category Zs.
+make a function called utf8_is_ws takes cp returns r
+  if (cp == 32) or (cp == 9) or (cp == 13) or (cp == 10) then
+    return true
+  end
+  # Unicode Zs (non-breaking space etc.) 0x00A0, 0x1680, 0x2000-0x200A,
+  # 0x202F, 0x205F, 0x3000
+  if cp == 160 then
+    return true
+  end
+  if cp == 5760 then
+    return true
+  end
+  if (cp >= 8192) and (cp <= 8202) then
+    return true
+  end
+  if (cp == 8239) or (cp == 8287) or (cp == 12288) then
+    return true
+  end
+  return false
+end
