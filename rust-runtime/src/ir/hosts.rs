@@ -748,6 +748,7 @@ pub fn reset_world() {
     GOALS.with(|g| g.borrow_mut().clear());
     RULES.with(|r| r.borrow_mut().clear());
     ACTIONS.with(|a| a.borrow_mut().clear());
+    FLUENTS.with(|f| f.borrow_mut().clear());
     GOAL_DEFS.with(|g| g.borrow_mut().clear());
     ACTION_BODIES.with(|a| a.borrow_mut().clear());
     RUNTIME_EVENT_HANDLERS.with(|h| h.borrow_mut().clear());
@@ -982,6 +983,25 @@ pub fn host_solve(args: &[Value]) -> Result<Value, String> {
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct GroundFact { pred: String, args: Vec<String> }
 
+// PDDL 2.1-style numeric fluents, additive alongside GroundFact -- see
+// this session's own design conversation: the planner's existing
+// preconditions/effects are pure Prolog-style fact unification, no
+// arithmetic anywhere, which meant a "count down to zero" domain only
+// worked if the decrementing relation was pre-enumerated as a ground
+// fact table (dec(3,2), dec(2,1), dec(1,0), ...). NumCond/NumEffect
+// give an action real numeric preconditions/effects instead -- `rhs`
+// is either a decimal literal or a logic-variable name (already bound
+// by the action's own PROPOSITIONAL preconditions), resolved via the
+// same `walk` used everywhere else in this file. i64 only, deliberately
+// -- avoids float Eq/Hash entirely in the search's own dedup step, and
+// the motivating use case (a counter) never needed non-integer values;
+// a stated, explicit scope limit, not an oversight.
+#[derive(Clone)]
+struct NumCond { fluent: String, op: String, rhs: String } // op: < <= > >= == !=
+
+#[derive(Clone)]
+struct NumEffect { fluent: String, op: String, rhs: String } // op: = += -= *= /=
+
 #[derive(Clone)]
 struct GoapAction {
     name: String,
@@ -989,10 +1009,13 @@ struct GoapAction {
     add_effects: Vec<GroundFact>,
     del_effects: Vec<GroundFact>,
     cost: i64,
+    numeric_preconds: Vec<NumCond>,
+    numeric_effects: Vec<NumEffect>,
 }
 
 thread_local! {
     static ACTIONS: RefCell<Vec<GoapAction>> = RefCell::new(Vec::new());
+    static FLUENTS: RefCell<HashMap<String, i64>> = RefCell::new(HashMap::new());
 }
 
 fn parse_ground_facts(v: &Value) -> Vec<GroundFact> {
@@ -1057,6 +1080,40 @@ fn action_instance_label(name: &str, preconds: &[GroundFact], subst: &Subst) -> 
     format!("{}({})", name, parts.join(","))
 }
 
+fn parse_cost(v: &Value) -> i64 {
+    match v {
+        Value::Int(n) => *n,
+        Value::Float(n) => n.round() as i64,
+        Value::String(s) => s.parse::<f64>().unwrap_or(1.0).round() as i64,
+        _ => 1,
+    }
+}
+
+// [fluent, op, rhs] triples -- shared shape for both NumCond (op: < <=
+// > >= == !=) and NumEffect (op: = += -= *= /=); which one a caller
+// wants is determined entirely by which list it's parsed into, not by
+// anything in the triple itself.
+fn parse_num_triples(v: &Value) -> Vec<(String, String, String)> {
+    let items: Vec<Value> = match v { Value::List(xs) => (**xs).clone(), _ => Vec::new() };
+    let mut out = Vec::new();
+    for item in items {
+        if let Value::List(triple) = &item {
+            if triple.len() == 3 {
+                out.push((to_s(&triple[0]), to_s(&triple[1]), to_s(&triple[2])));
+            }
+        }
+    }
+    out
+}
+
+fn parse_num_conds(v: &Value) -> Vec<NumCond> {
+    parse_num_triples(v).into_iter().map(|(fluent, op, rhs)| NumCond { fluent, op, rhs }).collect()
+}
+
+fn parse_num_effects(v: &Value) -> Vec<NumEffect> {
+    parse_num_triples(v).into_iter().map(|(fluent, op, rhs)| NumEffect { fluent, op, rhs }).collect()
+}
+
 pub fn host_action_add(args: &[Value]) -> Result<Value, String> {
     // action_add(name, preconds_list, add_effects_list, del_effects_list, cost) -> Unit
     if args.len() != 5 { return Err("action_add: expected 5 args (name, preconds, add_effects, del_effects, cost)".into()); }
@@ -1064,14 +1121,100 @@ pub fn host_action_add(args: &[Value]) -> Result<Value, String> {
     let preconds = parse_ground_facts(&args[1]);
     let add_effects = parse_ground_facts(&args[2]);
     let del_effects = parse_ground_facts(&args[3]);
-    let cost = match &args[4] {
+    let cost = parse_cost(&args[4]);
+    ACTIONS.with(|a| a.borrow_mut().push(GoapAction { name, preconds, add_effects, del_effects, cost, numeric_preconds: Vec::new(), numeric_effects: Vec::new() }));
+    Ok(Value::Unit)
+}
+
+// GitHub follow-up (this session's own "PDDL 2.1-style numeric
+// fluents" design conversation): action_add_numeric(name, preconds,
+// numeric_preconds, add_effects, del_effects, numeric_effects, cost)
+// -> Unit -- same as action_add, plus real numeric preconditions/
+// effects on top of the ordinary propositional ones. Pushes into the
+// SAME `ACTIONS` vec as action_add (just populating the two fields
+// action_add itself always leaves empty), so plan_facts only ever
+// needs one search loop regardless of which constructor an action
+// came from.
+pub fn host_action_add_numeric(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 7 { return Err("action_add_numeric: expected 7 args (name, preconds, numeric_preconds, add_effects, del_effects, numeric_effects, cost)".into()); }
+    let name = match &args[0] { Value::String(s) => s.as_ref().clone(), v => to_s(v) };
+    let preconds = parse_ground_facts(&args[1]);
+    let numeric_preconds = parse_num_conds(&args[2]);
+    let add_effects = parse_ground_facts(&args[3]);
+    let del_effects = parse_ground_facts(&args[4]);
+    let numeric_effects = parse_num_effects(&args[5]);
+    let cost = parse_cost(&args[6]);
+    ACTIONS.with(|a| a.borrow_mut().push(GoapAction { name, preconds, add_effects, del_effects, cost, numeric_preconds, numeric_effects }));
+    Ok(Value::Unit)
+}
+
+// fluent_set(name, value) -> Unit -- establishes/overwrites a numeric
+// fluent's current value, the numeric-fluent equivalent of rule_add's
+// role for establishing an initial ground fact. i64 only (see NumCond/
+// NumEffect's own header comment for why).
+pub fn host_fluent_set(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 { return Err("fluent_set: expected 2 args (name, value)".into()); }
+    let name = match &args[0] { Value::String(s) => s.as_ref().clone(), v => to_s(v) };
+    let value = match &args[1] {
         Value::Int(n) => *n,
         Value::Float(n) => n.round() as i64,
-        Value::String(s) => s.parse::<f64>().unwrap_or(1.0).round() as i64,
-        _ => 1,
+        Value::String(s) => s.parse::<f64>().map(|f| f.round() as i64).map_err(|_| format!("fluent_set: expected a numeric value, got {:?}", s))?,
+        v => return Err(format!("fluent_set: expected a numeric value, got {:?}", v)),
     };
-    ACTIONS.with(|a| a.borrow_mut().push(GoapAction { name, preconds, add_effects, del_effects, cost }));
+    FLUENTS.with(|f| f.borrow_mut().insert(name, value));
     Ok(Value::Unit)
+}
+
+fn current_fluents_as_state() -> std::collections::BTreeMap<String, i64> {
+    FLUENTS.with(|f| f.borrow().iter().map(|(k, v)| (k.clone(), *v)).collect())
+}
+
+// Resolves a NumCond/NumEffect's own `rhs` -- either a bound logic
+// variable (walked against the candidate substitution, same as every
+// other term in this file) or a plain decimal literal -- to a real
+// i64. Returns None if it's neither (an unbound variable, or text that
+// doesn't parse), which callers treat as "this condition/effect can't
+// be evaluated here" rather than guessing.
+fn resolve_num_rhs(rhs: &str, subst: &Subst) -> Option<i64> {
+    walk(rhs, subst).parse::<i64>().ok()
+}
+
+// A missing fluent makes a numeric PRECONDITION fail (never "any value
+// passes") -- the same safe-default philosophy #51's own heap-bounds
+// guard established for tag classification: an absent value is never
+// silently treated as satisfying an arbitrary comparison.
+fn eval_num_cond(nc: &NumCond, fluents: &std::collections::BTreeMap<String, i64>, subst: &Subst) -> bool {
+    let lhs = match fluents.get(&nc.fluent) { Some(v) => *v, None => return false };
+    let rhs = match resolve_num_rhs(&nc.rhs, subst) { Some(v) => v, None => return false };
+    match nc.op.as_str() {
+        "<" => lhs < rhs,
+        "<=" => lhs <= rhs,
+        ">" => lhs > rhs,
+        ">=" => lhs >= rhs,
+        "==" => lhs == rhs,
+        "!=" => lhs != rhs,
+        _ => false,
+    }
+}
+
+// A missing fluent defaults to 0 before a numeric EFFECT applies --
+// the documented, stated default (distinct from eval_num_cond's own
+// "missing fluent fails the check" default for preconditions): an
+// effect is establishing/updating a value, so starting from 0 is the
+// same "hasn't been set yet" convention fluent_set's own absence
+// already implies, not a silent gap.
+fn apply_num_effect(effect: &NumEffect, fluents: &mut std::collections::BTreeMap<String, i64>, subst: &Subst) {
+    let rhs = match resolve_num_rhs(&effect.rhs, subst) { Some(v) => v, None => return };
+    let cur = fluents.get(&effect.fluent).copied().unwrap_or(0);
+    let new_val = match effect.op.as_str() {
+        "=" => rhs,
+        "+=" => cur + rhs,
+        "-=" => cur - rhs,
+        "*=" => cur * rhs,
+        "/=" => if rhs != 0 { cur / rhs } else { cur },
+        _ => cur,
+    };
+    fluents.insert(effect.fluent.clone(), new_val);
 }
 
 // Core of host_plan, factored out so host_pursue (which resolves a named
@@ -1079,42 +1222,58 @@ pub fn host_action_add(args: &[Value]) -> Result<Value, String> {
 // exactly the same way) doesn't duplicate the search. Uniform-cost search
 // (Dijkstra) over world-states so a cheaper multi-step plan is preferred
 // over a pricier direct one.
-fn plan_facts(goal_facts: Vec<GroundFact>) -> Vec<String> {
+//
+// `goal_numeric` (empty from host_plan/host_pursue, both otherwise
+// unchanged) is the numeric-fluent half of PDDL 2.1-style planning --
+// evaluated with an EMPTY Subst since goals are always fully ground,
+// no variables to resolve. This is what makes a genuine INEQUALITY
+// goal possible (`count <= 0` reached by counting down from above
+// zero) -- the propositional-fact encoding this planner already had
+// can only ever match one exact literal value, never a range.
+fn plan_facts(goal_facts: Vec<GroundFact>, goal_numeric: Vec<NumCond>) -> Vec<String> {
     let actions: Vec<GoapAction> = ACTIONS.with(|a| a.borrow().clone());
 
-    use std::collections::{BinaryHeap, HashSet};
+    use std::collections::{BTreeMap, BinaryHeap, HashSet};
     use std::cmp::Reverse;
 
     let start_state: HashSet<GroundFact> = current_ground_facts_as_state();
-    let mut nodes: Vec<(HashSet<GroundFact>, Vec<String>, i64)> = vec![(start_state, Vec::new(), 0)];
+    let start_fluents: BTreeMap<String, i64> = current_fluents_as_state();
+    let mut nodes: Vec<(HashSet<GroundFact>, BTreeMap<String, i64>, Vec<String>, i64)> = vec![(start_state, start_fluents, Vec::new(), 0)];
     let mut frontier: BinaryHeap<Reverse<(i64, usize)>> = BinaryHeap::new();
     frontier.push(Reverse((0, 0)));
 
-    let mut visited: HashSet<Vec<GroundFact>> = HashSet::new();
+    let mut visited: HashSet<(Vec<GroundFact>, Vec<(String, i64)>)> = HashSet::new();
     const NODE_CAP: usize = 5000;
     let mut expansions = 0usize;
+    let empty_subst: Subst = Subst::new();
 
     while let Some(Reverse((cost, idx))) = frontier.pop() {
         if expansions >= NODE_CAP { break; }
-        let (state, path, node_cost) = nodes[idx].clone();
+        let (state, fluents, path, node_cost) = nodes[idx].clone();
         if node_cost != cost { continue; } // stale heap entry (no decrease-key; skip superseded ones)
         expansions += 1;
-        if goal_facts.iter().all(|g| state.contains(g)) {
+        if goal_facts.iter().all(|g| state.contains(g))
+            && goal_numeric.iter().all(|nc| eval_num_cond(nc, &fluents, &empty_subst))
+        {
             return path;
         }
         let mut state_key: Vec<GroundFact> = state.iter().cloned().collect();
         state_key.sort();
-        if !visited.insert(state_key) { continue; }
+        let fluent_key: Vec<(String, i64)> = fluents.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        if !visited.insert((state_key, fluent_key)) { continue; }
 
         for action in &actions {
             for subst in ground_action_instances(&action.preconds, &state) {
+                if !action.numeric_preconds.iter().all(|nc| eval_num_cond(nc, &fluents, &subst)) { continue; }
                 let mut new_state = state.clone();
                 for d in &action.del_effects { new_state.remove(&apply_subst_to_fact(d, &subst)); }
                 for a2 in &action.add_effects { new_state.insert(apply_subst_to_fact(a2, &subst)); }
+                let mut new_fluents = fluents.clone();
+                for ne in &action.numeric_effects { apply_num_effect(ne, &mut new_fluents, &subst); }
                 let mut new_path = path.clone();
                 new_path.push(action_instance_label(&action.name, &action.preconds, &subst));
                 let new_cost = node_cost + action.cost;
-                nodes.push((new_state, new_path, new_cost));
+                nodes.push((new_state, new_fluents, new_path, new_cost));
                 frontier.push(Reverse((new_cost, nodes.len() - 1)));
             }
         }
@@ -1127,7 +1286,18 @@ pub fn host_plan(args: &[Value]) -> Result<Value, String> {
     // an empty List if no plan is found within the search cap.
     if args.len() != 1 { return Err("plan: expected 1 arg (goal_facts_list)".into()); }
     let goal_facts = parse_ground_facts(&args[0]);
-    Ok(Value::List(Arc::new(plan_facts(goal_facts).into_iter().map(|s| Value::String(s.into())).collect())))
+    Ok(Value::List(Arc::new(plan_facts(goal_facts, Vec::new()).into_iter().map(|s| Value::String(s.into())).collect())))
+}
+
+// plan_numeric(goal_facts_list, goal_numeric_conditions_list) -> List,
+// same as plan but the goal may also require numeric fluent
+// conditions (e.g. `[["count", "<=", "0"]]`) -- see plan_facts's own
+// header for why this is what actually unlocks an inequality goal.
+pub fn host_plan_numeric(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 { return Err("plan_numeric: expected 2 args (goal_facts_list, goal_numeric_conditions_list)".into()); }
+    let goal_facts = parse_ground_facts(&args[0]);
+    let goal_numeric = parse_num_conds(&args[1]);
+    Ok(Value::List(Arc::new(plan_facts(goal_facts, goal_numeric).into_iter().map(|s| Value::String(s.into())).collect())))
 }
 
 // ---- goal/pursue/activate surface syntax -- see ast.rs's Stmt::GoalDecl
@@ -1196,7 +1366,7 @@ pub fn host_pursue(args: &[Value]) -> Result<Value, String> {
     let name = match &args[0] { Value::String(s) => s.as_ref().clone(), v => to_s(v) };
     let goal_facts = GOAL_DEFS.with(|g| g.borrow().get(&name).cloned())
         .ok_or_else(|| format!("pursue: unknown goal '{}' (declare it with `goal {} {{ ... }}` first)", name, name))?;
-    Ok(Value::List(Arc::new(plan_facts(goal_facts).into_iter().map(|s| Value::String(s.into())).collect())))
+    Ok(Value::List(Arc::new(plan_facts(goal_facts, Vec::new()).into_iter().map(|s| Value::String(s.into())).collect())))
 }
 
 pub fn host_action_bind(args: &[Value]) -> Result<Value, String> {
@@ -2736,6 +2906,9 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("solve", host_solve);
     interp.host.insert("action_add", host_action_add);
     interp.host.insert("plan", host_plan);
+    interp.host.insert("fluent_set", host_fluent_set);
+    interp.host.insert("action_add_numeric", host_action_add_numeric);
+    interp.host.insert("plan_numeric", host_plan_numeric);
     interp.host.insert("goal_def", host_goal_def);
     interp.host.insert("pursue", host_pursue);
     interp.host.insert("action_bind", host_action_bind);
