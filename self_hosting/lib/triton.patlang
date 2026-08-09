@@ -42,6 +42,56 @@
 include "json.patlang"
 include "lower_triton.patlang"
 
+# True if `src` (kernel SOURCE text, before lowering) calls a reduction
+# builtin. A reduction (sum/reduce_max/reduce_min/argmax/argmin) computes
+# ONE result over the WHOLE input in a single Triton program -- splitting
+# it across multiple grid blocks would make each block compute its own
+# PARTIAL reduction and race to overwrite the same output slot (no
+# combining/atomic step exists for this shape). Real bug-avoidance found
+# while adding real multi-block launches: a reduction kernel MUST stay
+# single-block (the whole array as one program, Slice 2's original
+# strategy); only elementwise-style kernels (store keyed by `offs`, one
+# independent output per input element) are safe to split across blocks.
+# Text-level substring scan over the SOURCE (not the lowered Python) --
+# matches this file's own tokenize-at-a-different-layer style elsewhere;
+# a false positive here (a name that merely contains "sum(" etc as a
+# substring) is harmless -- it only means an eligible kernel stays on the
+# safe, already-proven single-block path instead of the faster one.
+make a function called triton_src_has_reduction takes src returns has_it
+  if str_contains(src, "sum(") then
+    return true
+  elif str_contains(src, "reduce_max(") then
+    return true
+  elif str_contains(src, "reduce_min(") then
+    return true
+  elif str_contains(src, "argmax(") then
+    return true
+  elif str_contains(src, "argmin(") then
+    return true
+  else
+    return false
+  end
+end
+
+make a function called str_contains takes hay, needle returns found
+  let hn = hay.length
+  let nn = needle.length
+  if nn == 0 then
+    return true
+  end
+  if nn > hn then
+    return false
+  end
+  let i = 0
+  while i <= (hn - nn) do
+    if substr(hay, i, nn) == needle then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
 # NOT top-level `let`s -- confirmed by direct test that a named function
 # (`make a function called X`) does NOT close over top-level `let`
 # bindings from its defining script at all (only anonymous closure
@@ -134,7 +184,11 @@ make a function called triton_run_kernel_source takes kernel_src, kernel_name, i
     let i = i + 1
   end
   sb_push(sb, "n = " + n + "\n")
-  sb_push(sb, "BLOCK_SIZE = triton.next_power_of_2(n)\n")
+  if triton_src_has_reduction(kernel_src) then
+    sb_push(sb, "BLOCK_SIZE = triton.next_power_of_2(n)\n")
+  else
+    sb_push(sb, "BLOCK_SIZE = 1024\n")
+  end
   sb_push(sb, "grid = (triton.cdiv(n, BLOCK_SIZE),)\n")
   sb_push(sb, kernel_name + "[grid](")
   let j = 0
@@ -173,9 +227,8 @@ end
 # per_call_ms are ONLY the `reps` launches+syncs, still not counting
 # process/import startup (that's still real, still paid once per
 # exec_capture call -- this isolates the OTHER number, not eliminates
-# this one). Same single-block launch strategy as triton_run_kernel_source
-# (unchanged here on purpose, to measure ONE variable -- repeated-launch
-# amortization -- before also changing the block/grid strategy).
+# this one). Same reduction-aware block/grid strategy as
+# triton_run_kernel_source (see triton_src_has_reduction).
 make a function called triton_run_kernel_source_timed takes kernel_src, kernel_name, inputs, reps returns r
   let lowered = triton_lower_kernel_source(kernel_src, kernel_name)
   if lowered[1][0] == "Err" then
@@ -200,7 +253,11 @@ make a function called triton_run_kernel_source_timed takes kernel_src, kernel_n
     let i = i + 1
   end
   sb_push(sb, "n = " + n + "\n")
-  sb_push(sb, "BLOCK_SIZE = triton.next_power_of_2(n)\n")
+  if triton_src_has_reduction(kernel_src) then
+    sb_push(sb, "BLOCK_SIZE = triton.next_power_of_2(n)\n")
+  else
+    sb_push(sb, "BLOCK_SIZE = 1024\n")
+  end
   sb_push(sb, "grid = (triton.cdiv(n, BLOCK_SIZE),)\n")
   let launchExpr = kernel_name + "[grid]("
   let j = 0
@@ -267,8 +324,13 @@ make a function called triton_run_kernel_source_2d takes kernel_src, kernel_name
   end
   sb_push(sb, "n_rows = " + to_num(rows) + "\n")
   sb_push(sb, "n_cols = " + to_num(cols) + "\n")
-  sb_push(sb, "BLOCK_R = triton.next_power_of_2(n_rows)\n")
-  sb_push(sb, "BLOCK_C = triton.next_power_of_2(n_cols)\n")
+  if triton_src_has_reduction(kernel_src) then
+    sb_push(sb, "BLOCK_R = triton.next_power_of_2(n_rows)\n")
+    sb_push(sb, "BLOCK_C = triton.next_power_of_2(n_cols)\n")
+  else
+    sb_push(sb, "BLOCK_R = 32\n")
+    sb_push(sb, "BLOCK_C = 32\n")
+  end
   sb_push(sb, "grid = (triton.cdiv(n_rows, BLOCK_R), triton.cdiv(n_cols, BLOCK_C))\n")
   sb_push(sb, kernel_name + "[grid](")
   let j = 0
