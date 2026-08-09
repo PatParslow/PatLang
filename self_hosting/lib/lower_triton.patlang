@@ -593,6 +593,74 @@ make a function called triton_lower_kernel_source takes src, kernel_name returns
   return [sb_str(sb), ["Ok", ""]]
 end
 
+# Autotune-aware variant of triton_lower_kernel_source: prepends an
+# @triton.autotune decorator listing several candidate BLOCK_SIZE
+# `triton.Config`s, so Triton benchmarks each at first launch and
+# picks the fastest for the actual input size -- instead of this
+# lowerer guessing one fixed BLOCK_SIZE up front. Rejects reduction
+# kernels outright (same triton_src_has_reduction guard the multi-block
+# launch-strategy fix uses): a reduction assumes the WHOLE input is one
+# block, so varying BLOCK_SIZE across autotune candidates would silently
+# change which elements a given launch actually reduces over -- unsafe,
+# not just untuned.
+make a function called triton_lower_kernel_source_autotune takes src, kernel_name, block_candidates returns r
+  if triton_src_has_reduction(src) then
+    return ["", ["Err", "autotune is unsafe for a reduction kernel (BLOCK_SIZE must cover the whole input exactly, not vary) -- use triton_lower_kernel_source instead"]]
+  end
+  if to_num(list_len(block_candidates)) == 0 then
+    return ["", ["Err", "triton_lower_kernel_source_autotune needs at least one BLOCK_SIZE candidate"]]
+  end
+  let toks = tokenize(src)
+  let program = parse_program(toks)
+  let stmts = program[1]
+  let n = to_num(list_len(stmts))
+  if n == 0 then
+    return ["", ["Err", "empty kernel source"]]
+  end
+  let fnNode = stmts[0]
+  if fnNode[0] != "Func" then
+    return ["", ["Err", "kernel source must be a single function definition"]]
+  end
+  let params = fnNode[2]
+  let body = fnNode[3]
+  let shapeCheck = triton_check_block_shapes(body, [])
+  if shapeCheck[1][0] == "Err" then
+    return ["", shapeCheck[1]]
+  end
+  let sb = sb_new()
+  sb_push(sb, "@triton.autotune(configs=[\n")
+  let nc = to_num(list_len(block_candidates))
+  let c = 0
+  while c < nc do
+    sb_push(sb, "    triton.Config({'BLOCK_SIZE': " + to_num(block_candidates[c]) + "}, num_warps=4),\n")
+    let c = c + 1
+  end
+  sb_push(sb, "], key=['n'])\n")
+  sb_push(sb, "@triton.jit\n")
+  sb_push(sb, "def " + kernel_name + "(")
+  let np = to_num(list_len(params))
+  let i = 0
+  while i < np do
+    if i > 0 then
+      sb_push(sb, ", ")
+    end
+    sb_push(sb, params[i] + "_ptr")
+    let i = i + 1
+  end
+  if np > 0 then
+    sb_push(sb, ", ")
+  end
+  sb_push(sb, "n, BLOCK_SIZE: tl.constexpr):\n")
+  sb_push(sb, "    pid = tl.program_id(0)\n")
+  sb_push(sb, "    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)\n")
+  sb_push(sb, "    mask = offs < n\n")
+  let status = triton_lower_block(body, params, 4, sb)
+  if status[0] == "Err" then
+    return ["", status]
+  end
+  return [sb_str(sb), ["Ok", ""]]
+end
+
 # ============================================================================
 # SLICE 3: multi-dim grids + block pointers + matmul.
 # ============================================================================

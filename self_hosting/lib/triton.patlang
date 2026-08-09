@@ -215,6 +215,66 @@ make a function called triton_run_kernel_source takes kernel_src, kernel_name, i
   return [result, ["Ok", ""]]
 end
 
+# Autotune variant of triton_run_kernel_source: `block_candidates` is a
+# list of BLOCK_SIZE values (e.g. [256, 512, 1024, 2048]) Triton will
+# actually BENCHMARK at first launch, picking the fastest for this input
+# size -- BLOCK_SIZE is deliberately NOT passed at the call site (the
+# @triton.autotune wrapper supplies it internally once it's chosen), and
+# `grid` is a lambda over Triton's own `meta` dict rather than a fixed
+# tuple, since the grid size depends on whichever BLOCK_SIZE ends up
+# selected. Rejected outright for reduction kernels by
+# triton_lower_kernel_source_autotune itself (unsafe to vary block size
+# there, see its own header) -- this driver just surfaces that rejection.
+make a function called triton_run_kernel_source_autotune takes kernel_src, kernel_name, inputs, block_candidates returns r
+  let lowered = triton_lower_kernel_source_autotune(kernel_src, kernel_name, block_candidates)
+  if lowered[1][0] == "Err" then
+    return [[], lowered[1]]
+  end
+  let kernel_py = lowered[0]
+  let nInputs = to_num(list_len(inputs))
+  if nInputs == 0 then
+    return [[], ["Err", "triton_run_kernel_source_autotune needs at least one input buffer"]]
+  end
+  let n = to_num(list_len(inputs[0]))
+  let sb = sb_new()
+  sb_push(sb, "import torch\nimport triton\nimport triton.language as tl\nimport json\n\n")
+  sb_push(sb, kernel_py)
+  sb_push(sb, "\n")
+  let argNames = []
+  let i = 0
+  while i < nInputs do
+    let varName = "buf" + i
+    sb_push(sb, varName + " = torch.tensor(" + triton_num_list_json(inputs[i]) + ", device='cuda', dtype=torch.float32)\n")
+    let argNames = list_push(argNames, varName)
+    let i = i + 1
+  end
+  sb_push(sb, "n = " + n + "\n")
+  sb_push(sb, "grid = lambda meta: (triton.cdiv(n, meta['BLOCK_SIZE']),)\n")
+  sb_push(sb, kernel_name + "[grid](")
+  let j = 0
+  while j < nInputs do
+    sb_push(sb, argNames[j] + ", ")
+    let j = j + 1
+  end
+  sb_push(sb, "n)\n")
+  let outVar = argNames[nInputs - 1]
+  sb_push(sb, "print(json.dumps(" + outVar + ".cpu().tolist()))\n")
+  let script = sb_str(sb)
+  let script_path = triton_scratch_dir() + "/_triton_run_kernel_autotune.py"
+  write_file(script_path, script)
+  let out = exec_capture(triton_python_exe(), script_path)
+  let parsed = json_parse(out)
+  let items = json_arr(parsed)
+  let result = []
+  let m = to_num(list_len(items))
+  let k = 0
+  while k < m do
+    let result = list_push(result, json_num(items[k]))
+    let k = k + 1
+  end
+  return [result, ["Ok", ""]]
+end
+
 # Timed variant of triton_run_kernel_source: runs the SAME lowered kernel
 # `reps` times inside ONE spawned Python process, isolating real kernel
 # compute time from the fixed per-spawn cost (script write + process
