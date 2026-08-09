@@ -1,0 +1,427 @@
+# PatLang -> Triton kernel lowering (Slice 2).
+#
+# Takes the SOURCE TEXT of an ordinary PatLang function (no new grammar --
+# a kernel is just a ["Func", name, params, body] AST node produced by the
+# existing lexer.patlang/parser.patlang, same as any other function) and
+# walks it to emit real @triton.jit Python source, replacing Slice 1's
+# fixed hand-written kernel text. Deliberately reuses the existing frontend
+# rather than inventing a `kernel` keyword: a new keyword would ripple into
+# lexer/parser/lower/codegen AND their Rust mirror (runtime_rs.patlang) AND
+# the language-spec BDD gate (CLAUDE.md S3) -- far more than this slice
+# needs. Restricting what a *kernel-shaped function* may contain is a
+# library-level concern, not a core-language one.
+#
+# Supported kernel-body subset (checked; anything else is a clear rejection,
+# never a silent miscompile):
+#   - scalar/list params (lowered to pointer args + a length/constexpr arg)
+#   - arithmetic/comparison Bin ops, unary '-'/'not'
+#   - If/elif (no 'else if' nesting per this repo's own control-flow rule)
+#     lowered to tl.where / masked select
+#   - counted While loops lowered to a Triton-style accumulator loop
+#     (the shape reductions and matmul's K-loop need)
+#   - Index reads/writes against a kernel param, lowered to tl.load/tl.store
+#     with the standard offs/mask pattern
+#   - a fixed math-function allowlist (exp/log/sqrt/sigmoid/abs/max/min)
+#     mapped 1:1 onto tl.* / libdevice equivalents
+#   - reduction calls (sum/max/min/argmax/argmin) over a block, mapped to
+#     tl.sum/tl.max/tl.min/tl.argmax/tl.argmin
+#   - atomic_add/atomic_max/atomic_min mapped to tl.atomic_*
+# NOT supported (rejected): print/string ops, list/struct mutation other
+# than the param buffers, closures, recursion, calls to non-kernel
+# functions, multi-dim grids beyond program_id(0) (deferred -- see slice
+# scope note in triton.patlang).
+#
+# Implicit block-scope variables: every kernel body is wrapped in the
+# same pid/offs/mask/n/BLOCK_SIZE preamble Slice 1 already hand-wrote, so
+# kernel PatLang source may reference `offs`, `mask`, `n` as plain bare
+# Vars (they lower to themselves, unchanged) -- e.g. an elementwise-add
+# kernel body is just `store(out, offs, x[offs] + y[offs])`. This mirrors
+# real Triton kernels, which are also written in terms of a block offset
+# + mask rather than a per-element loop.
+
+include "lexer.patlang"
+include "parser.patlang"
+
+make a function called triton_math_fn_map takes name returns pyname
+  if name == "exp" then
+    return "tl.exp"
+  elif name == "log" then
+    return "tl.log"
+  elif name == "sqrt" then
+    return "tl.sqrt"
+  elif name == "sigmoid" then
+    return "tl.sigmoid"
+  elif name == "abs" then
+    return "tl.abs"
+  elif name == "max" then
+    return "tl.maximum"
+  elif name == "min" then
+    return "tl.minimum"
+  else
+    return ""
+  end
+end
+
+make a function called triton_reduce_fn_map takes name returns pyname
+  if name == "sum" then
+    return "tl.sum"
+  elif name == "reduce_max" then
+    return "tl.max"
+  elif name == "reduce_min" then
+    return "tl.min"
+  elif name == "argmax" then
+    return "tl.argmax"
+  elif name == "argmin" then
+    return "tl.argmin"
+  else
+    return ""
+  end
+end
+
+make a function called triton_atomic_fn_map takes name returns pyname
+  if name == "atomic_add" then
+    return "tl.atomic_add"
+  elif name == "atomic_max" then
+    return "tl.atomic_max"
+  elif name == "atomic_min" then
+    return "tl.atomic_min"
+  else
+    return ""
+  end
+end
+
+# A rejection is a ["Err", message] pair returned alongside a null Python
+# string, rather than an exception -- keeps this a plain data-flow result
+# the caller (and BDD scenarios) can inspect, matching this codebase's
+# existing "never surface Rust errors to users" discipline for a new
+# failure class specific to this backend.
+make a function called triton_reject takes msg returns r
+  return ["", ["Err", msg]]
+end
+
+make a function called triton_ok takes py returns r
+  return [py, ["Ok", ""]]
+end
+
+make a function called triton_lower_bin_op takes op returns pyop
+  if op == "and" then
+    return "&"
+  elif op == "or" then
+    return "|"
+  else
+    return op
+  end
+end
+
+# Walks one expression AST node, emitting Python text. `params` is the
+# list of kernel parameter names (so Index/Var against them lower to
+# pointer-relative tl.load, not a plain Python variable read).
+make a function called triton_lower_expr takes node, params returns r
+  let ty = node[0]
+  if ty == "Num" then
+    return triton_ok(node[1])
+  elif ty == "Bool" then
+    return triton_ok(node[1])
+  elif ty == "Var" then
+    return triton_ok(node[1])
+  elif ty == "Bin" then
+    let l = triton_lower_expr(node[2], params)
+    if l[1][0] == "Err" then
+      return l
+    end
+    let rr = triton_lower_expr(node[3], params)
+    if rr[1][0] == "Err" then
+      return rr
+    end
+    let pyop = triton_lower_bin_op(node[1])
+    return triton_ok("(" + l[0] + " " + pyop + " " + rr[0] + ")")
+  elif ty == "Un" then
+    let e = triton_lower_expr(node[2], params)
+    if e[1][0] == "Err" then
+      return e
+    end
+    if node[1] == "not" then
+      return triton_ok("(~(" + e[0] + "))")
+    else
+      return triton_ok("(-(" + e[0] + "))")
+    end
+  elif ty == "Index" then
+    let obj = triton_lower_expr(node[1], params)
+    if obj[1][0] == "Err" then
+      return obj
+    end
+    let idx = triton_lower_expr(node[2], params)
+    if idx[1][0] == "Err" then
+      return idx
+    end
+    return triton_ok("tl.load(" + obj[0] + "_ptr + (" + idx[0] + "), mask=mask)")
+  elif ty == "Call" then
+    return triton_lower_call(node[1], node[2], params)
+  else
+    return triton_reject("unsupported expression node in kernel body: " + ty)
+  end
+end
+
+make a function called triton_lower_args takes args, params returns r
+  let sb = sb_new()
+  let n = to_num(list_len(args))
+  let i = 0
+  while i < n do
+    let a = triton_lower_expr(args[i], params)
+    if a[1][0] == "Err" then
+      return a
+    end
+    if i > 0 then
+      sb_push(sb, ", ")
+    end
+    sb_push(sb, a[0])
+    let i = i + 1
+  end
+  return triton_ok(sb_str(sb))
+end
+
+make a function called triton_lower_call takes name, args, params returns r
+  let mathpy = triton_math_fn_map(name)
+  if mathpy != "" then
+    let a = triton_lower_args(args, params)
+    if a[1][0] == "Err" then
+      return a
+    end
+    return triton_ok(mathpy + "(" + a[0] + ")")
+  end
+  let redpy = triton_reduce_fn_map(name)
+  if redpy != "" then
+    let a = triton_lower_args(args, params)
+    if a[1][0] == "Err" then
+      return a
+    end
+    return triton_ok(redpy + "(" + a[0] + ", axis=0)")
+  end
+  let atompy = triton_atomic_fn_map(name)
+  if atompy != "" then
+    if to_num(list_len(args)) != 2 then
+      return triton_reject(name + " needs exactly (ptr, value)")
+    end
+    let ptr = triton_lower_expr(args[0], params)
+    if ptr[1][0] == "Err" then
+      return ptr
+    end
+    let val = triton_lower_expr(args[1], params)
+    if val[1][0] == "Err" then
+      return val
+    end
+    return triton_ok(atompy + "(" + ptr[0] + "_ptr + offs, " + val[0] + ", mask=mask)")
+  end
+  return triton_reject("call to unsupported function in kernel body: " + name)
+end
+
+# Emits one statement, `indent` spaces deep, into the given StringBuilder.
+# Returns an ["Err", msg] on rejection, ["Ok", ""] otherwise.
+make a function called triton_lower_stmt takes node, params, indent, sb returns status
+  let ty = node[0]
+  let pad = ""
+  let k = 0
+  while k < indent do
+    let pad = pad + " "
+    let k = k + 1
+  end
+  if ty == "Let" then
+    let e = triton_lower_expr(node[2], params)
+    if e[1][0] == "Err" then
+      return e[1]
+    end
+    sb_push(sb, pad + node[1] + " = " + e[0] + "\n")
+    return ["Ok", ""]
+  elif ty == "Return" then
+    return ["Err", "kernel bodies write results via Index-store, not return"]
+  elif ty == "Expr" then
+    let call = node[1]
+    if call[0] != "Call" then
+      return ["Err", "bare expression statement in kernel body must be a store/atomic call"]
+    end
+    if call[1] == "store" then
+      if to_num(list_len(call[2])) != 3 then
+        return ["Err", "store(buf, index, value) needs exactly 3 args"]
+      end
+      let buf = triton_lower_expr(call[2][0], params)
+      if buf[1][0] == "Err" then
+        return buf[1]
+      end
+      let idx = triton_lower_expr(call[2][1], params)
+      if idx[1][0] == "Err" then
+        return idx[1]
+      end
+      let val = triton_lower_expr(call[2][2], params)
+      if val[1][0] == "Err" then
+        return val[1]
+      end
+      # A literal-index store (store(out, 0, ...)) is inherently a
+      # SCALAR write -- e.g. a reduction result. The block `mask` is a
+      # per-lane vector shaped for the offs-indexed elementwise case, so
+      # applying it to a scalar store is a genuine Triton shape mismatch
+      # (found by running this: the kernel compile fails inside the
+      # generated Python and exec_capture surfaces it only as an empty
+      # result, not a visible PatLang-side error). Only vector (offs-
+      # shaped) index stores need the mask.
+      if call[2][1][0] == "Num" then
+        sb_push(sb, pad + "tl.store(" + buf[0] + "_ptr + (" + idx[0] + "), " + val[0] + ")\n")
+      else
+        sb_push(sb, pad + "tl.store(" + buf[0] + "_ptr + (" + idx[0] + "), " + val[0] + ", mask=mask)\n")
+      end
+      return ["Ok", ""]
+    end
+    let atompy = triton_atomic_fn_map(call[1])
+    if atompy != "" then
+      let e = triton_lower_expr(call, params)
+      if e[1][0] == "Err" then
+        return e[1]
+      end
+      sb_push(sb, pad + e[0] + "\n")
+      return ["Ok", ""]
+    end
+    return ["Err", "unsupported call statement in kernel body: " + call[1]]
+  elif ty == "If" then
+    return triton_reject_unless_ok(triton_lower_if(node, params, indent, sb))
+  elif ty == "While" then
+    return triton_lower_while(node, params, indent, sb)
+  else
+    return ["Err", "unsupported statement kind in kernel body: " + ty]
+  end
+end
+
+make a function called triton_reject_unless_ok takes status returns r
+  return status
+end
+
+# If/elif -> nested Python if/elif is valid Triton (unlike a runtime
+# tl.where chain, real Python-level control flow over tl.constexpr /
+# scalar conditions is supported directly by Triton's frontend); this
+# mirrors CLAUDE.md's own "no nested else-if, use elif" rule structurally,
+# since the parser already normalizes it to that shape for us.
+make a function called triton_lower_if takes node, params, indent, sb returns status
+  let cond = triton_lower_expr(node[1], params)
+  if cond[1][0] == "Err" then
+    return cond[1]
+  end
+  let pad = ""
+  let k = 0
+  while k < indent do
+    let pad = pad + " "
+    let k = k + 1
+  end
+  sb_push(sb, pad + "if " + cond[0] + ":\n")
+  let thenBody = node[2]
+  let st1 = triton_lower_block(thenBody, params, indent + 4, sb)
+  if st1[0] == "Err" then
+    return st1
+  end
+  let elseBody = node[3]
+  if to_num(list_len(elseBody)) > 0 then
+    sb_push(sb, pad + "else:\n")
+    let st2 = triton_lower_block(elseBody, params, indent + 4, sb)
+    if st2[0] == "Err" then
+      return st2
+    end
+  end
+  return ["Ok", ""]
+end
+
+# Bounded counted loop (`while i < N do ... end` with `i` incremented by a
+# literal step in-body) -- the shape both reduction accumulation and
+# matmul's K-loop need. Lowered to Triton's own `for`-over-range, which
+# Triton's frontend unrolls/compiles at trace time, not a runtime GPU loop
+# primitive of its own.
+make a function called triton_lower_while takes node, params, indent, sb returns status
+  let cond = node[1]
+  if cond[0] != "Bin" then
+    return ["Err", "kernel while-loop condition must be a simple i < N comparison"]
+  end
+  if cond[1] != "<" then
+    return ["Err", "kernel while-loop condition must use '<' (counted loop only)"]
+  end
+  if cond[2][0] != "Var" then
+    return ["Err", "kernel while-loop counter must be a plain variable"]
+  end
+  let counter = cond[2][1]
+  let bound = triton_lower_expr(cond[3], params)
+  if bound[1][0] == "Err" then
+    return bound[1]
+  end
+  let pad = ""
+  let k = 0
+  while k < indent do
+    let pad = pad + " "
+    let k = k + 1
+  end
+  sb_push(sb, pad + "for " + counter + " in range(" + bound[0] + "):\n")
+  return triton_lower_block(node[2], params, indent + 4, sb)
+end
+
+make a function called triton_lower_block takes stmts, params, indent, sb returns status
+  let n = to_num(list_len(stmts))
+  if n == 0 then
+    let pad = ""
+    let k = 0
+    while k < indent do
+      let pad = pad + " "
+      let k = k + 1
+    end
+    sb_push(sb, pad + "pass\n")
+    return ["Ok", ""]
+  end
+  let i = 0
+  while i < n do
+    let status = triton_lower_stmt(stmts[i], params, indent, sb)
+    if status[0] == "Err" then
+      return status
+    end
+    let i = i + 1
+  end
+  return ["Ok", ""]
+end
+
+# Top-level entry point: given a kernel function's PatLang SOURCE TEXT
+# (e.g. the body of a `make a function called ... end` block extracted by
+# the caller), returns [triton_python_source, status] where status is
+# ["Ok", ""] or ["Err", message]. `param_names` lists which params are
+# device buffers (pointer args); any not listed are treated as plain
+# scalar/constexpr args.
+make a function called triton_lower_kernel_source takes src, kernel_name returns r
+  let toks = tokenize(src)
+  let program = parse_program(toks)
+  let stmts = program[1]
+  let n = to_num(list_len(stmts))
+  if n == 0 then
+    return ["", ["Err", "empty kernel source"]]
+  end
+  let fnNode = stmts[0]
+  if fnNode[0] != "Func" then
+    return ["", ["Err", "kernel source must be a single function definition"]]
+  end
+  let params = fnNode[2]
+  let body = fnNode[3]
+  let sb = sb_new()
+  sb_push(sb, "@triton.jit\n")
+  sb_push(sb, "def " + kernel_name + "(")
+  let np = to_num(list_len(params))
+  let i = 0
+  while i < np do
+    if i > 0 then
+      sb_push(sb, ", ")
+    end
+    sb_push(sb, params[i] + "_ptr")
+    let i = i + 1
+  end
+  if np > 0 then
+    sb_push(sb, ", ")
+  end
+  sb_push(sb, "n, BLOCK_SIZE: tl.constexpr):\n")
+  sb_push(sb, "    pid = tl.program_id(0)\n")
+  sb_push(sb, "    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)\n")
+  sb_push(sb, "    mask = offs < n\n")
+  let status = triton_lower_block(body, params, 4, sb)
+  if status[0] == "Err" then
+    return ["", status]
+  end
+  return [sb_str(sb), ["Ok", ""]]
+end

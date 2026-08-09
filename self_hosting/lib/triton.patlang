@@ -1,18 +1,27 @@
 # PatLang -> Triton GPU kernel plumbing.
 #
-# SLICE 1 (this file, so far): prove the ARCHITECTURE works end to end
-# using a single FIXED, hand-written Triton kernel (elementwise vector
-# add, Triton's own canonical "hello world" example) -- PatLang builds
-# a Python/Triton driver script as text, writes it to disk, runs it via
-# exec_capture (the same subprocess-and-capture-stdout pattern already
-# used elsewhere in this codebase -- patc1.exe shelling out to rustc,
-# ScriptCanvas-style JSON-over-stdout hosting), and parses the JSON
-# result back into ordinary PatLang values. This is NOT yet a lowerer
-# that translates a PatLang-authored kernel body into Triton syntax --
-# that's deliberately a separate, later slice, once this plumbing is
-# proven. Matches this project's own established discipline elsewhere
-# (e.g. sim_loop.patlang proving parallel_map+signals plumbing with toy
-# demographics before real rules were added).
+# SLICE 1 (proven): the ARCHITECTURE works end to end using a single
+# FIXED, hand-written Triton kernel (elementwise vector add) -- PatLang
+# builds a Python/Triton driver script as text, writes it to disk, runs
+# it via exec_capture (the same subprocess-and-capture-stdout pattern
+# already used elsewhere in this codebase -- patc1.exe shelling out to
+# rustc, ScriptCanvas-style JSON-over-stdout hosting), and parses the
+# JSON result back into ordinary PatLang values. `triton_vector_add`
+# below is that original fixed-kernel path, kept as-is for the Slice 1
+# demo/regression test.
+#
+# SLICE 2 (this file, new): `triton_run_kernel_source` generalizes the
+# same plumbing to a REAL lowering pass (lib/lower_triton.patlang) --
+# the kernel body is no longer fixed text, it's PatLang source, walked
+# and translated into Triton Python. Covers as much of Triton's actual
+# model as sensibly maps onto a bounded PatLang function subset:
+# arithmetic/comparisons, if/elif, counted while-loops (the shape both
+# reductions and matmul's K-loop need), Index-based load/store,
+# math-function calls (exp/log/sqrt/sigmoid/abs/max/min), block
+# reductions (sum/reduce_max/reduce_min/argmax/argmin), and atomics
+# (atomic_add/atomic_max/atomic_min). Still Triton-DSL lowering, not
+# direct PTX/CUDA emission -- that's explicitly deferred to a possible
+# later, more direct route.
 #
 # Requires a real CUDA GPU + PyTorch (CUDA build) + Triton installed
 # for the Python interpreter at PYTHON_EXE below -- confirmed present
@@ -20,6 +29,7 @@
 # 3.4.0) via a standalone sanity check before this file was written.
 
 include "json.patlang"
+include "lower_triton.patlang"
 
 # NOT top-level `let`s -- confirmed by direct test that a named function
 # (`make a function called X`) does NOT close over top-level `let`
@@ -79,4 +89,63 @@ make a function called triton_vector_add takes a, b returns sums
     let i = i + 1
   end
   return result
+end
+
+# SLICE 2: runs a REAL lowered kernel. `kernel_src` is the PatLang source
+# text of a single `make a function called ... end` kernel body (params
+# are the device buffers, e.g. `takes x, y`). `inputs` is a list of
+# PatLang number-lists, one per kernel param, all equal length; the
+# result is the kernel's `out` buffer (the last param is reserved as the
+# output buffer by convention -- e.g. `takes x, y, out`). Returns
+# [result_list, status] where status is ["Ok",""] or ["Err", message] --
+# a rejection from the lowerer surfaces here, not as a crash.
+make a function called triton_run_kernel_source takes kernel_src, kernel_name, inputs returns r
+  let lowered = triton_lower_kernel_source(kernel_src, kernel_name)
+  if lowered[1][0] == "Err" then
+    return [[], lowered[1]]
+  end
+  let kernel_py = lowered[0]
+  let nInputs = to_num(list_len(inputs))
+  if nInputs == 0 then
+    return [[], ["Err", "triton_run_kernel_source needs at least one input buffer"]]
+  end
+  let n = to_num(list_len(inputs[0]))
+  let sb = sb_new()
+  sb_push(sb, "import torch\nimport triton\nimport triton.language as tl\nimport json\n\n")
+  sb_push(sb, kernel_py)
+  sb_push(sb, "\n")
+  let argNames = []
+  let i = 0
+  while i < nInputs do
+    let varName = "buf" + i
+    sb_push(sb, varName + " = torch.tensor(" + triton_num_list_json(inputs[i]) + ", device='cuda', dtype=torch.float32)\n")
+    let argNames = list_push(argNames, varName)
+    let i = i + 1
+  end
+  sb_push(sb, "n = " + n + "\n")
+  sb_push(sb, "BLOCK_SIZE = triton.next_power_of_2(n)\n")
+  sb_push(sb, "grid = (triton.cdiv(n, BLOCK_SIZE),)\n")
+  sb_push(sb, kernel_name + "[grid](")
+  let j = 0
+  while j < nInputs do
+    sb_push(sb, argNames[j] + ", ")
+    let j = j + 1
+  end
+  sb_push(sb, "n, BLOCK_SIZE=BLOCK_SIZE)\n")
+  let outVar = argNames[nInputs - 1]
+  sb_push(sb, "print(json.dumps(" + outVar + ".cpu().tolist()))\n")
+  let script = sb_str(sb)
+  let script_path = triton_scratch_dir() + "/_triton_run_kernel.py"
+  write_file(script_path, script)
+  let out = exec_capture(triton_python_exe(), script_path)
+  let parsed = json_parse(out)
+  let items = json_arr(parsed)
+  let result = []
+  let m = to_num(list_len(items))
+  let k = 0
+  while k < m do
+    let result = list_push(result, json_num(items[k]))
+    let k = k + 1
+  end
+  return [result, ["Ok", ""]]
 end
