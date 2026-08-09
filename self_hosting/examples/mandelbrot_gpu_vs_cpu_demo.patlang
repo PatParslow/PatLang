@@ -38,9 +38,23 @@ let HEIGHT = 64
 
 # @gpu_kernel
 make a function called mandel_kernel takes cr, ci, out
-  let zr = 0.0
-  let zi = 0.0
-  let count = 0.0
+  # Seeded as VECTORS (not the bare scalar 0.0) on purpose: Triton
+  # requires a loop-carried variable's type to stay consistent across
+  # iterations, and this loop's body reassigns zr/zi/count via select()
+  # (a per-lane vector op) every pass -- a scalar initial value there is
+  # a genuine Triton compile-time rejection ("Loop-carried variable zr
+  # has initial type fp32 but is re-assigned to <[BLOCK], fp32> in
+  # loop!"), found the hard way: it passed this lowerer's own subset-
+  # checker AND wrote a syntactically valid Python file, but Triton's
+  # own compiler rejected it -- exec_capture only surfaced this as an
+  # empty result, not a visible error, so an earlier version of this
+  # exact kernel silently produced a false "it worked" reading. `cr[offs]
+  # * 0.0` is any already-loaded float32 BLOCK-shaped vector multiplied
+  # by zero -- a plain, already-supported expression that forces the
+  # right shape/dtype with no lowering changes needed.
+  let zr = cr[offs] * 0.0
+  let zi = ci[offs] * 0.0
+  let count = cr[offs] * 0.0
   let i = 0
   while i < 100 do
     let zr2 = zr * zr
@@ -68,12 +82,23 @@ end
 # above (freeze zr/zi once escaped, keep counting only while alive) so
 # the two are comparing the same algorithm, not two different ones that
 # happen to often agree.
+#
+# Literal `100`, NOT the top-level `MAX_ITER` -- a named function does
+# NOT close over top-level `let` bindings from its defining script at all
+# (see gpu_kernels.patlang's own header, and
+# [[patlang-triton-lowering-slice1]]). Got this wrong on the first pass
+# of this very file: `while i < MAX_ITER do` silently resolved to "i < 0"
+# (or similar), so the loop body never ran and mandel_cpu returned 0 for
+# EVERY pixel -- no crash, no error, just a uniformly wrong CPU reference
+# that happened to look plausible at a glance. Caught only by directly
+# comparing individual GPU/CPU values side by side, not by trusting the
+# check()-reported pass/fail summary alone.
 make a function called mandel_cpu takes cr, ci returns count
   let zr = 0.0
   let zi = 0.0
   let count = 0.0
   let i = 0
-  while i < MAX_ITER do
+  while i < 100 do
     let zr2 = zr * zr
     let zi2 = zi * zi
     let mag2 = zr2 + zi2
@@ -156,10 +181,20 @@ let exact_rate = to_num(exact_matches) / to_num(n_pixels)
 check("at least 95% of pixels match exactly between CPU and GPU", exact_rate >= 0.95, true)
 check("no pixel differs by more than 1 iteration between CPU and GPU", max_diff <= 1.0, true)
 
+# --- GPU path, repeated in ONE spawn (isolates real kernel compute time
+# from the one-off subprocess+torch/triton import cost that dominated the
+# single-call GPU number above) --------------------------------------------
+let REPS = 100
+let timed = gpu_call_1d_timed(registry, "mandel_kernel", [cr_list, ci_list, dummy_out], REPS)
+check("timed GPU mandelbrot kernel runs without error", timed[3][0], "Ok")
+let gpu_total_ms = timed[1]
+let gpu_per_call_ms = timed[2]
+
 # --- Report -----------------------------------------------------------------
 print("Mandelbrot " + WIDTH + "x" + HEIGHT + ", " + MAX_ITER + " max iterations, " + n_pixels + " pixels")
-print("CPU (native x64):        " + cpu_ms + " ms")
-print("GPU (Triton, end-to-end): " + gpu_ms + " ms  [includes subprocess+torch/triton import overhead]")
+print("CPU (native x64):              " + cpu_ms + " ms")
+print("GPU (Triton, single call, end-to-end): " + gpu_ms + " ms  [includes subprocess+torch/triton import overhead]")
+print("GPU (Triton, " + REPS + " calls in one spawn): " + gpu_total_ms + " ms total, " + gpu_per_call_ms + " ms/call  [isolates real kernel compute cost]")
 print("exact-match rate: " + (exact_rate * 100.0) + "%, max per-pixel diff: " + max_diff + " iterations")
 
 t_report()

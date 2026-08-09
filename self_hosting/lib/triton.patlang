@@ -161,6 +161,82 @@ make a function called triton_run_kernel_source takes kernel_src, kernel_name, i
   return [result, ["Ok", ""]]
 end
 
+# Timed variant of triton_run_kernel_source: runs the SAME lowered kernel
+# `reps` times inside ONE spawned Python process, isolating real kernel
+# compute time from the fixed per-spawn cost (script write + process
+# start + torch/triton import) that dominated the Mandelbrot demo's
+# single-call timing ([[patlang-triton-lowering-mandelbrot-timing-demo]]:
+# ~2.2s end-to-end for a kernel that's a tiny fraction of that). One
+# warmup call (pays Triton's JIT-compile cost, excluded from the timed
+# region) precedes `reps` synchronized launches; returns
+# [result, total_kernel_ms, per_call_ms, status] -- total_kernel_ms/
+# per_call_ms are ONLY the `reps` launches+syncs, still not counting
+# process/import startup (that's still real, still paid once per
+# exec_capture call -- this isolates the OTHER number, not eliminates
+# this one). Same single-block launch strategy as triton_run_kernel_source
+# (unchanged here on purpose, to measure ONE variable -- repeated-launch
+# amortization -- before also changing the block/grid strategy).
+make a function called triton_run_kernel_source_timed takes kernel_src, kernel_name, inputs, reps returns r
+  let lowered = triton_lower_kernel_source(kernel_src, kernel_name)
+  if lowered[1][0] == "Err" then
+    return [[], 0.0, 0.0, lowered[1]]
+  end
+  let kernel_py = lowered[0]
+  let nInputs = to_num(list_len(inputs))
+  if nInputs == 0 then
+    return [[], 0.0, 0.0, ["Err", "triton_run_kernel_source_timed needs at least one input buffer"]]
+  end
+  let n = to_num(list_len(inputs[0]))
+  let sb = sb_new()
+  sb_push(sb, "import torch\nimport triton\nimport triton.language as tl\nimport json\nimport time\n\n")
+  sb_push(sb, kernel_py)
+  sb_push(sb, "\n")
+  let argNames = []
+  let i = 0
+  while i < nInputs do
+    let varName = "buf" + i
+    sb_push(sb, varName + " = torch.tensor(" + triton_num_list_json(inputs[i]) + ", device='cuda', dtype=torch.float32)\n")
+    let argNames = list_push(argNames, varName)
+    let i = i + 1
+  end
+  sb_push(sb, "n = " + n + "\n")
+  sb_push(sb, "BLOCK_SIZE = triton.next_power_of_2(n)\n")
+  sb_push(sb, "grid = (triton.cdiv(n, BLOCK_SIZE),)\n")
+  let launchExpr = kernel_name + "[grid]("
+  let j = 0
+  while j < nInputs do
+    let launchExpr = launchExpr + argNames[j] + ", "
+    let j = j + 1
+  end
+  let launchExpr = launchExpr + "n, BLOCK_SIZE=BLOCK_SIZE)"
+  sb_push(sb, launchExpr + "\n")
+  sb_push(sb, "torch.cuda.synchronize()\n")
+  sb_push(sb, "reps = " + to_num(reps) + "\n")
+  sb_push(sb, "t0 = time.perf_counter()\n")
+  sb_push(sb, "for _rep in range(reps):\n")
+  sb_push(sb, "    " + launchExpr + "\n")
+  sb_push(sb, "torch.cuda.synchronize()\n")
+  sb_push(sb, "t1 = time.perf_counter()\n")
+  let outVar = argNames[nInputs - 1]
+  sb_push(sb, "print(json.dumps({\"result\": " + outVar + ".cpu().tolist(), \"total_ms\": (t1 - t0) * 1000.0, \"per_call_ms\": (t1 - t0) * 1000.0 / reps}))\n")
+  let script = sb_str(sb)
+  let script_path = triton_scratch_dir() + "/_triton_run_kernel_timed.py"
+  write_file(script_path, script)
+  let out = exec_capture(triton_python_exe(), script_path)
+  let parsed = json_parse(out)
+  let items = json_arr(json_get(parsed, "result"))
+  let result = []
+  let m = to_num(list_len(items))
+  let k = 0
+  while k < m do
+    let result = list_push(result, json_num(items[k]))
+    let k = k + 1
+  end
+  let total_ms = json_num(json_get(parsed, "total_ms"))
+  let per_call_ms = json_num(json_get(parsed, "per_call_ms"))
+  return [result, total_ms, per_call_ms, ["Ok", ""]]
+end
+
 # SLICE 3a: multi-dim-grid variant of triton_run_kernel_source. `inputs`
 # are flattened row-major number-lists, all `rows * cols` long (e.g. a 2D
 # elementwise add over two matrices); result is the last buffer, same
