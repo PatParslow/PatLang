@@ -180,7 +180,25 @@ make a function called triton_lower_args takes args, params returns r
   return triton_ok(sb_str(sb))
 end
 
+# select(cond, a, b) -> tl.where(cond, a, b). This is the ONLY way to
+# branch on a per-lane VECTOR condition in a kernel body -- Triton
+# requires Python-level `if`/`elif` (this file's triton_lower_if) to have
+# a SCALAR/constexpr condition; a vector condition there is a genuine
+# Triton compile-time error, not something this lowerer's subset-checker
+# currently catches (found while designing a Mandelbrot escape-count
+# kernel, which inherently needs a per-pixel vector condition -- "has
+# this pixel escaped yet" -- and so cannot use if/elif for it at all).
 make a function called triton_lower_call takes name, args, params returns r
+  if name == "select" then
+    if to_num(list_len(args)) != 3 then
+      return triton_reject("select(cond, a, b) needs exactly 3 args")
+    end
+    let a = triton_lower_args(args, params)
+    if a[1][0] == "Err" then
+      return a
+    end
+    return triton_ok("tl.where(" + a[0] + ")")
+  end
   let mathpy = triton_math_fn_map(name)
   if mathpy != "" then
     let a = triton_lower_args(args, params)
@@ -293,11 +311,17 @@ make a function called triton_reject_unless_ok takes status returns r
   return status
 end
 
-# If/elif -> nested Python if/elif is valid Triton (unlike a runtime
-# tl.where chain, real Python-level control flow over tl.constexpr /
-# scalar conditions is supported directly by Triton's frontend); this
-# mirrors CLAUDE.md's own "no nested else-if, use elif" rule structurally,
-# since the parser already normalizes it to that shape for us.
+# If/elif -> nested Python if/elif is valid Triton for a SCALAR/constexpr
+# condition (this file's own "no nested else-if, use elif" mirrors
+# CLAUDE.md's structural rule, since the parser already normalizes it to
+# that shape). CAUTION, not yet enforced by this lowerer: if `cond`
+# involves a per-lane buffer read (e.g. `x[offs] > 0`), it is a VECTOR
+# condition, and real Triton will reject a Python `if` on it at kernel-
+# compile time -- exactly the class of failure the scalar-store/mask bug
+# from Slice 2 was ([[patlang-triton-lowering-slice2-scoped]]): a real
+# Triton-side error, surfaced through exec_capture only as an empty
+# result, not a PatLang-visible rejection. Use `select(cond, a, b)`
+# (-> tl.where) for any PER-PIXEL branching instead of if/elif.
 make a function called triton_lower_if takes node, params, indent, sb returns status
   let cond = triton_lower_expr(node[1], params)
   if cond[1][0] == "Err" then

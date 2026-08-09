@@ -1,0 +1,165 @@
+# Mandelbrot escape-time render, computed BOTH natively on CPU (ordinary
+# PatLang, compiled to native x64 by patc1.exe) and via the @gpu_kernel
+# pipeline (Slices 2-4), timed with now_ms() so the two paths can be
+# compared directly -- same pixel grid, same iteration count, same
+# escape-radius test, one CPU implementation and one GPU kernel that are
+# deliberately algorithmically identical (not just "close").
+#
+# Precision/comparison caveat, stated up front rather than silently
+# glossed over: the CPU path runs in PatLang's native numeric tower, the
+# GPU path runs in Triton/PyTorch float32 -- boundary pixels (where the
+# escape count flips between two values one iteration apart) can
+# legitimately differ between the two by +/-1 due to ordinary float
+# rounding differences, the same way any two independently-rounded
+# implementations of an iterated fractal do. Correctness is checked as
+# "the vast majority of pixels match exactly, and none differ by more
+# than 1", not exact equality across all pixels -- exact equality would
+# be the wrong bar here, not a stronger one.
+#
+# Timing caveat, also stated up front: the GPU path's elapsed time
+# includes writing a Python driver script to disk, spawning a whole
+# Python process, and importing torch/triton (exec_capture's subprocess
+# round-trip, unavoidable in this architecture -- see triton.patlang's
+# header) -- NOT just kernel execution time. For a small grid like this
+# demo's, that fixed subprocess overhead can dominate and make the GPU
+# path look slower than native CPU despite the actual kernel running in
+# microseconds; this is an honest report of the current architecture's
+# real end-to-end cost, not a kernel-only microbenchmark. A much larger
+# grid would be needed to see the GPU kernel's own compute time dominate.
+
+include "F:/PatLang/self_hosting/lib/test.patlang"
+include "F:/PatLang/self_hosting/lib/gpu_kernels.patlang"
+
+t_init()
+
+let MAX_ITER = 100
+let WIDTH = 64
+let HEIGHT = 64
+
+# @gpu_kernel
+make a function called mandel_kernel takes cr, ci, out
+  let zr = 0.0
+  let zi = 0.0
+  let count = 0.0
+  let i = 0
+  while i < 100 do
+    let zr2 = zr * zr
+    let zi2 = zi * zi
+    let mag2 = zr2 + zi2
+    let alive = mag2 <= 4.0
+    let count = count + select(alive, 1.0, 0.0)
+    let new_zi = zr * zi * 2.0 + ci[offs]
+    let new_zr = zr2 - zi2 + cr[offs]
+    let zr = select(alive, new_zr, zr)
+    let zi = select(alive, new_zi, zi)
+    # Incremented even though this shape's Triton lowering (a counted
+    # while -> Python for-range) doesn't itself depend on it -- kept so
+    # this function stays a genuinely safe, non-infinite-looping ordinary
+    # PatLang function if ever called natively, matching @gpu_kernel's
+    # advertised "also fully valid PatLang" guarantee.
+    let i = i + 1
+  end
+  store(out, offs, count)
+end
+
+# Algorithmically identical CPU version -- ordinary PatLang, real
+# per-pixel branching allowed here (no vector-condition constraint on the
+# CPU side), but written to do the SAME work per iteration as the kernel
+# above (freeze zr/zi once escaped, keep counting only while alive) so
+# the two are comparing the same algorithm, not two different ones that
+# happen to often agree.
+make a function called mandel_cpu takes cr, ci returns count
+  let zr = 0.0
+  let zi = 0.0
+  let count = 0.0
+  let i = 0
+  while i < MAX_ITER do
+    let zr2 = zr * zr
+    let zi2 = zi * zi
+    let mag2 = zr2 + zi2
+    if mag2 <= 4.0 then
+      let count = count + 1.0
+      let new_zi = zr * zi * 2.0 + ci
+      let new_zr = zr2 - zi2 + cr
+      let zr = new_zr
+      let zi = new_zi
+    end
+    let i = i + 1
+  end
+  return count
+end
+
+# Build the pixel grid's complex-plane coordinates once, shared by both
+# paths -- same coordinate mapping is what makes the comparison fair.
+let cr_list = []
+let ci_list = []
+let row = 0
+while row < HEIGHT do
+  let col = 0
+  while col < WIDTH do
+    let re = -2.0 + (to_num(col) / to_num(WIDTH)) * 3.0
+    let im = -1.5 + (to_num(row) / to_num(HEIGHT)) * 3.0
+    let cr_list = list_push(cr_list, re)
+    let ci_list = list_push(ci_list, im)
+    let col = col + 1
+  end
+  let row = row + 1
+end
+let n_pixels = to_num(list_len(cr_list))
+check("pixel grid built at the expected size", n_pixels, WIDTH * HEIGHT)
+
+# --- CPU path -------------------------------------------------------------
+let t0 = now_ms()
+let cpu_counts = []
+let p = 0
+while p < n_pixels do
+  let cpu_counts = list_push(cpu_counts, mandel_cpu(cr_list[p], ci_list[p]))
+  let p = p + 1
+end
+let t1 = now_ms()
+let cpu_ms = t1 - t0
+
+# --- GPU path --------------------------------------------------------------
+let self_path = "F:/PatLang/self_hosting/examples/mandelbrot_gpu_vs_cpu_demo.patlang"
+let registry = gpu_load_own_kernels(self_path)
+let dummy_out = []
+let z = 0
+while z < n_pixels do
+  let dummy_out = list_push(dummy_out, 0.0)
+  let z = z + 1
+end
+let t2 = now_ms()
+let gpu_result = gpu_call_1d(registry, "mandel_kernel", [cr_list, ci_list, dummy_out])
+let t3 = now_ms()
+let gpu_ms = t3 - t2
+check("GPU mandelbrot kernel runs without error", gpu_result[1][0], "Ok")
+let gpu_counts = gpu_result[0]
+
+# --- Correctness: exact-match rate + max per-pixel difference -------------
+let exact_matches = 0
+let max_diff = 0.0
+let q = 0
+while q < n_pixels do
+  let diff = cpu_counts[q] - gpu_counts[q]
+  if diff < 0.0 then
+    let diff = 0.0 - diff
+  end
+  if diff > max_diff then
+    let max_diff = diff
+  end
+  if diff < 0.5 then
+    let exact_matches = exact_matches + 1
+  end
+  let q = q + 1
+end
+let exact_rate = to_num(exact_matches) / to_num(n_pixels)
+check("at least 95% of pixels match exactly between CPU and GPU", exact_rate >= 0.95, true)
+check("no pixel differs by more than 1 iteration between CPU and GPU", max_diff <= 1.0, true)
+
+# --- Report -----------------------------------------------------------------
+print("Mandelbrot " + WIDTH + "x" + HEIGHT + ", " + MAX_ITER + " max iterations, " + n_pixels + " pixels")
+print("CPU (native x64):        " + cpu_ms + " ms")
+print("GPU (Triton, end-to-end): " + gpu_ms + " ms  [includes subprocess+torch/triton import overhead]")
+print("exact-match rate: " + (exact_rate * 100.0) + "%, max per-pixel diff: " + max_diff + " iterations")
+
+t_report()
