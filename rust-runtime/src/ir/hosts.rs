@@ -2300,6 +2300,34 @@ pub fn host_tcp_connect(args: &[Value]) -> Result<Value, String> {
     Ok(Value::Int(id as i64))
 }
 
+// tcp_try_connect(host, port) -> connection id, or -1 specifically if
+// nothing is listening yet (ConnectionRefused). Exact mirror of
+// tcp_try_listen's own rationale, on the other side of the same problem:
+// plain tcp_connect's ordinary failure is fatal (an Err aborts the whole
+// program), so there was no way for a caller to gracefully POLL "is a
+// listener ready yet" -- a caller that wants that today has to fake a
+// readiness signal some other way (a ready-file, a beacon) instead of
+// just retrying tcp_connect. GitHub #62, found building a persistent GPU
+// worker session (lib/triton_session.patlang): the natural "poll until
+// the spawned worker is listening" loop wasn't expressible without this.
+// Any OTHER connect failure (invalid host, network unreachable, etc.)
+// still propagates as a fatal error, same as plain tcp_connect -- only
+// ConnectionRefused (the "nobody's listening on that port yet" case) is
+// treated as the graceful, expected-while-polling outcome.
+pub fn host_tcp_try_connect(args: &[Value]) -> Result<Value, String> {
+    let host = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => return Err("tcp_try_connect: expected host string".into()) };
+    let port = arg_num(args, 1, "tcp_try_connect")? as u16;
+    match std::net::TcpStream::connect((host.as_str(), port)) {
+        Ok(stream) => {
+            let id = NEXT_CONN.with(|n| { let mut b = n.borrow_mut(); let v = *b; *b += 1; v });
+            CONNS.with(|c| c.borrow_mut().insert(id, stream));
+            Ok(Value::Int(id as i64))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => Ok(Value::Int(-1)),
+        Err(e) => Err(format!("tcp_try_connect: {}:{}: {}", host, port, e)),
+    }
+}
+
 pub fn host_tcp_accept(args: &[Value]) -> Result<Value, String> {
     let port = arg_num(args, 0, "tcp_accept")? as u16;
     let listener = LISTENERS.with(|l| {
@@ -2935,6 +2963,7 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("tcp_listen", host_tcp_listen);
     interp.host.insert("tcp_try_listen", host_tcp_try_listen);
     interp.host.insert("tcp_connect", host_tcp_connect);
+    interp.host.insert("tcp_try_connect", host_tcp_try_connect);
     interp.host.insert("tcp_accept", host_tcp_accept);
     interp.host.insert("tcp_accept_timeout", host_tcp_accept_timeout);
     interp.host.insert("sleep_ms", host_sleep_ms);

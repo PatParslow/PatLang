@@ -155,6 +155,7 @@ const HOST_CHUNK_TABLE: &[(&str, ChunkId)] = &[
     ("tcp_listen", ChunkId::Networking),
     ("tcp_try_listen", ChunkId::Networking),
     ("tcp_connect", ChunkId::Networking),
+    ("tcp_try_connect", ChunkId::Networking),
     ("tcp_accept", ChunkId::Networking),
     ("sleep_ms", ChunkId::Networking),
     ("tcp_accept_timeout", ChunkId::Networking),
@@ -3768,6 +3769,26 @@ fn host_call_networking_inner(name: &str, args: &[Value]) -> Result<Value, Strin
                 CONNS.with(|c| c.borrow_mut().insert(id, stream));
                 Ok(Value::Number(id as f64))
             }
+            "tcp_try_connect" => {
+                // tcp_try_connect(host, port) -> Number connection id, or -1
+                // specifically if nothing is listening yet (ConnectionRefused)
+                // -- see hosts.rs's host_tcp_try_connect for the full
+                // rationale (GitHub #62): exact mirror of tcp_try_listen on
+                // the other side of the same problem, letting a caller poll
+                // "is a listener ready yet" without a fatal abort on each
+                // attempt before it is.
+                let host = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), _ => return Err("tcp_try_connect: expected host string".into()) };
+                let port = arg_num(&args, 1, "tcp_try_connect")? as u16;
+                match std::net::TcpStream::connect((host.as_str(), port)) {
+                    Ok(stream) => {
+                        let id = NEXT_CONN.with(|n| { let mut b = n.borrow_mut(); let v = *b; *b += 1; v });
+                        CONNS.with(|c| c.borrow_mut().insert(id, stream));
+                        Ok(Value::Number(id as f64))
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => Ok(Value::Number(-1.0)),
+                    Err(e) => Err(format!("tcp_try_connect: {}:{}: {}", host, port, e)),
+                }
+            }
             "tcp_accept" => {
                 // tcp_accept(port) -> Number connection id (blocks)
                 let port = arg_num(&args, 0, "tcp_accept")? as u16;
@@ -3922,7 +3943,7 @@ fn host_call_networking_inner(name: &str, args: &[Value]) -> Result<Value, Strin
 
 fn host_call_networking(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match name {
-        "tcp_listen" | "tcp_try_listen" | "tcp_connect" | "tcp_accept" | "sleep_ms" | "tcp_accept_timeout" | "tcp_read" | "tcp_read_or_empty" | "tcp_write" | "tcp_close"
+        "tcp_listen" | "tcp_try_listen" | "tcp_connect" | "tcp_try_connect" | "tcp_accept" | "sleep_ms" | "tcp_accept_timeout" | "tcp_read" | "tcp_read_or_empty" | "tcp_write" | "tcp_close"
         | "spawn" | "is_alive" | "wait" | "kill" => Some(host_call_networking_inner(name, args)),
         _ => None,
     }
