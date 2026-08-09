@@ -32,6 +32,16 @@ struct FnPrecomputed<'p> {
     // differ across calls from the very same instruction position; caching
     // that would be a real correctness bug, not just a missed optimization).
     resolved_call: Vec<Option<&'p Function>>,
+    // Per-LoadLocal-instruction "safe to MOVE instead of clone" flag -- see
+    // codegen.rs's FnPrecomputed (the compiled-binary counterpart of this
+    // same interpreter, which has the identical field with the full
+    // rationale) for the complete explanation: LoadLocal always cloning the
+    // Arc means `let x = list_push(x, v)` NEVER lets Arc::make_mut see a
+    // uniquely-held Arc, forcing a full deep-clone on every call (a real,
+    // measured O(n^2): 8192 elems ~521ms, 32768 ~17.4s). This flags the
+    // common `let x = f(..., x, ...)` reassignment idiom as move-safe under
+    // the same conservative straight-line/no-jump-target-inside conditions.
+    move_ok: Vec<bool>,
 }
 
 // Keyed by the calling function's own address (stable for as long as the
@@ -134,8 +144,30 @@ impl Interpreter {
                     Instr::Call(fname, _) => program.functions.get(fname),
                     _ => None,
                 }).collect();
+                let move_ok: Vec<bool> = (0..func.body.len()).map(|pc0| {
+                    if !matches!(func.body[pc0], Instr::LoadLocal(_)) { return false; }
+                    let slot = resolved[pc0];
+                    let mut store_pc: Option<usize> = None;
+                    for pc1 in (pc0 + 1)..func.body.len() {
+                        match &func.body[pc1] {
+                            Instr::LoadLocal(_) if resolved[pc1] == slot => break,
+                            Instr::StoreLocal(_) if resolved[pc1] == slot => { store_pc = Some(pc1); break; }
+                            _ => {}
+                        }
+                    }
+                    let store_pc = match store_pc { Some(q) => q, None => return false };
+                    for pc1 in (pc0 + 1)..store_pc {
+                        if matches!(func.body[pc1], Instr::Jump(_) | Instr::JumpIfFalse(_)) { return false; }
+                    }
+                    for instr in &func.body {
+                        if let Instr::Jump(t) | Instr::JumpIfFalse(t) = instr {
+                            if *t > pc0 && *t <= store_pc { return false; }
+                        }
+                    }
+                    true
+                }).collect();
                 let slot_count = slot_of.len();
-                let p = Rc::new(FnPrecomputed { resolved, slot_count, resolved_call });
+                let p = Rc::new(FnPrecomputed { resolved, slot_count, resolved_call, move_ok });
                 cache.borrow_mut().insert(key, Rc::clone(&p));
                 p
             }
@@ -152,7 +184,12 @@ impl Interpreter {
             match &func.body[pc] {
                 Instr::Const(v) => stack.push(v.clone()),
                 Instr::LoadLocal(_) => {
-                    stack.push(locals[precomp.resolved[pc]].clone());
+                    let slot = precomp.resolved[pc];
+                    if precomp.move_ok[pc] {
+                        stack.push(std::mem::replace(&mut locals[slot], Value::Unit));
+                    } else {
+                        stack.push(locals[slot].clone());
+                    }
                 }
                 Instr::StoreLocal(_) => {
                     let v = stack.pop().ok_or("stack underflow")?;
@@ -352,6 +389,38 @@ impl Interpreter {
                     } else if name == "budget_check" {
                         super::fiber::budget_check()?;
                         stack.push(Value::Unit);
+                    } else if name == "list_push" && args.len() == 2 {
+                        // See codegen.rs's matching special-case (the
+                        // compiled-binary counterpart of this same
+                        // interpreter) for the full explanation: routing
+                        // through the generic `self.host.get(name)` ->
+                        // `host_list_push(&[Value])` path always sees
+                        // strong_count > 1 (that function's own borrowed
+                        // `args` slice keeps its own Arc reference alive
+                        // alongside the clone it makes internally), forcing
+                        // Arc::make_mut to deep-clone on every call
+                        // regardless of caller uniqueness. Using owned
+                        // `args` here (already moved off the stack) avoids
+                        // that extra reference entirely.
+                        let mut it = args.into_iter();
+                        let first = it.next().unwrap();
+                        let item = it.next().unwrap();
+                        let result = match first {
+                            Value::List(mut xs) => { Arc::make_mut(&mut xs).push(item); Value::List(xs) }
+                            Value::Unit => Value::List(Arc::new(vec![item])),
+                            _ => return Err("list_push: expected list".into()),
+                        };
+                        stack.push(result);
+                    } else if name == "list_set" && args.len() == 3 {
+                        let mut it = args.into_iter();
+                        let first = it.next().unwrap();
+                        let idxv = it.next().unwrap();
+                        let value = it.next().unwrap();
+                        let idx = match &idxv { Value::String(s) => s.parse::<usize>().unwrap_or(usize::MAX), v => super::ops::as_index(v).unwrap_or(usize::MAX) };
+                        let mut xs = match first { Value::List(xs) => xs, _ => return Err("list_set: expected list".into()) };
+                        if idx >= xs.len() { return Err(format!("list_set: index {} out of range (len {})", idx, xs.len())); }
+                        Arc::make_mut(&mut xs)[idx] = value;
+                        stack.push(Value::List(xs));
                     } else {
                         let f = self.host.get(name).ok_or_else(|| format!("host fn '{}' not found", name))?;
                         let res = f(&args)?;
