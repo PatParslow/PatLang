@@ -425,3 +425,99 @@ make a function called triton_lower_kernel_source takes src, kernel_name returns
   end
   return [sb_str(sb), ["Ok", ""]]
 end
+
+# ============================================================================
+# SLICE 3: multi-dim grids + block pointers + matmul.
+# ============================================================================
+#
+# `triton_lower_kernel_source_2d` generalizes the entry point above from a
+# 1D offs/mask domain to a 2D row/col domain over a flattened row-major
+# buffer -- a REAL second axis (tl.program_id(1), a second constexpr block
+# size, a 2D offs_r/offs_c/mask_r/mask_c/mask preamble), still walking
+# arbitrary PatLang kernel source via the same AST walker above (no new
+# grammar, same op-table). This is the generic "multi-dim grid" capability:
+# any kernel body written against this preamble's `offs`/`mask` sees the
+# SAME names as the 1D case (a single flattened per-element offset/mask),
+# so existing kernel bodies (elementwise add, etc) port to 2D unchanged --
+# only the *launch* geometry changes to a 2D grid, and the row/col identity
+# is available to a kernel body that wants it via `row`/`col` if needed for
+# strided (non-flattened) access patterns.
+make a function called triton_lower_kernel_source_2d takes src, kernel_name returns r
+  let toks = tokenize(src)
+  let program = parse_program(toks)
+  let stmts = program[1]
+  let n = to_num(list_len(stmts))
+  if n == 0 then
+    return ["", ["Err", "empty kernel source"]]
+  end
+  let fnNode = stmts[0]
+  if fnNode[0] != "Func" then
+    return ["", ["Err", "kernel source must be a single function definition"]]
+  end
+  let params = fnNode[2]
+  let body = fnNode[3]
+  let sb = sb_new()
+  sb_push(sb, "@triton.jit\n")
+  sb_push(sb, "def " + kernel_name + "(")
+  let np = to_num(list_len(params))
+  let i = 0
+  while i < np do
+    if i > 0 then
+      sb_push(sb, ", ")
+    end
+    sb_push(sb, params[i] + "_ptr")
+    let i = i + 1
+  end
+  if np > 0 then
+    sb_push(sb, ", ")
+  end
+  sb_push(sb, "n_rows, n_cols, BLOCK_R: tl.constexpr, BLOCK_C: tl.constexpr):\n")
+  sb_push(sb, "    pid_r = tl.program_id(0)\n")
+  sb_push(sb, "    pid_c = tl.program_id(1)\n")
+  sb_push(sb, "    row = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)\n")
+  sb_push(sb, "    col = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)\n")
+  sb_push(sb, "    mask_r = row < n_rows\n")
+  sb_push(sb, "    mask_c = col < n_cols\n")
+  sb_push(sb, "    row2 = row[:, None]\n")
+  sb_push(sb, "    col2 = col[None, :]\n")
+  sb_push(sb, "    mask = mask_r[:, None] & mask_c[None, :]\n")
+  sb_push(sb, "    offs = row2 * n_cols + col2\n")
+  let status = triton_lower_block(body, params, 4, sb)
+  if status[0] == "Err" then
+    return ["", status]
+  end
+  return [sb_str(sb), ["Ok", ""]]
+end
+
+# Canonical block-pointer matmul kernel (Triton's own tutorial shape,
+# generated rather than AST-lowered from PatLang source -- matmul's
+# tiled-accumulator-over-K structure with 2D block pointers is a
+# recognized SHAPE here, the same "prove the architecture with a fixed
+# kernel first" discipline this codebase already used for Slice 1's
+# vector-add before any lowering existed at all, not a retreat from
+# lowering in general. A fully generic AST-driven block-pointer lowering
+# (arbitrary strided 2D access patterns from arbitrary PatLang source) is
+# real future work, not attempted here.) Computes C[M,N] = A[M,K] @ B[K,N],
+# all row-major. Uses tl.make_block_ptr + tl.advance + tl.dot, a 2D grid
+# (pid_m, pid_n) -- no L2-cache-swizzle grouping (a known further
+# optimization in Triton's real matmul tutorial, left out here since it
+# doesn't change correctness, only performance).
+make a function called triton_matmul_kernel_source takes kernel_name, m, n, k, block_m, block_n, block_k returns py
+  let sb = sb_new()
+  sb_push(sb, "@triton.jit\n")
+  sb_push(sb, "def " + kernel_name + "(a_ptr, b_ptr, c_ptr, M, N, K, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):\n")
+  sb_push(sb, "    pid_m = tl.program_id(0)\n")
+  sb_push(sb, "    pid_n = tl.program_id(1)\n")
+  sb_push(sb, "    a_block_ptr = tl.make_block_ptr(base=a_ptr, shape=(M, K), strides=(K, 1), offsets=(pid_m * BLOCK_M, 0), block_shape=(BLOCK_M, BLOCK_K), order=(1, 0))\n")
+  sb_push(sb, "    b_block_ptr = tl.make_block_ptr(base=b_ptr, shape=(K, N), strides=(N, 1), offsets=(0, pid_n * BLOCK_N), block_shape=(BLOCK_K, BLOCK_N), order=(1, 0))\n")
+  sb_push(sb, "    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)\n")
+  sb_push(sb, "    for k0 in range(0, K, BLOCK_K):\n")
+  sb_push(sb, "        a_tile = tl.load(a_block_ptr, boundary_check=(0, 1), padding_option='zero')\n")
+  sb_push(sb, "        b_tile = tl.load(b_block_ptr, boundary_check=(0, 1), padding_option='zero')\n")
+  sb_push(sb, "        acc = tl.dot(a_tile, b_tile, acc)\n")
+  sb_push(sb, "        a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_K))\n")
+  sb_push(sb, "        b_block_ptr = tl.advance(b_block_ptr, (BLOCK_K, 0))\n")
+  sb_push(sb, "    c_block_ptr = tl.make_block_ptr(base=c_ptr, shape=(M, N), strides=(N, 1), offsets=(pid_m * BLOCK_M, pid_n * BLOCK_N), block_shape=(BLOCK_M, BLOCK_N), order=(1, 0))\n")
+  sb_push(sb, "    tl.store(c_block_ptr, acc, boundary_check=(0, 1))\n")
+  return sb_str(sb)
+end
