@@ -316,7 +316,7 @@ make a function called lower_closure_literal takes params, body, code, fns, loca
     vec_push(inner_mutables, true)
     let i = i + 1
   end
-  let inner_code = lower_block(body, vec_new(), fns, func_name, inner_locals, inner_mutables, pending)
+  let inner_code = lower_block(body, vec_new(), fns, func_name, inner_locals, inner_mutables, pending, true)
   vec_push(inner_code, ["Return"])
   vec_push(pending, ["FuncIR", func_name, all_params, vec_to_list(inner_code)])
 
@@ -363,7 +363,7 @@ make a function called lower_budgeted_literal takes msNode, existingNode, body, 
     let i = i + 1
   end
   budgeted_depth_inc()
-  let inner_code = lower_block(body, inner_code, fns, func_name, inner_locals, inner_mutables, pending)
+  let inner_code = lower_block(body, inner_code, fns, func_name, inner_locals, inner_mutables, pending, true)
   budgeted_depth_dec()
   vec_push(inner_code, ["Return"])
   vec_push(pending, ["FuncIR", func_name, ["__captured"], vec_to_list(inner_code)])
@@ -425,7 +425,7 @@ make a function called lower_activate_stmt takes plan_node, code, fns, fname, lo
     ]
   ]
 
-  let code = lower_block(synth, code, fns, fname, locals, mutables, pending)
+  let code = lower_block(synth, code, fns, fname, locals, mutables, pending, false)
   return lower_expr(["Var", ok_var], code, fns, locals, pending)
 end
 
@@ -437,7 +437,50 @@ make a function called rule_arg_str takes node returns s
   return node[1]
 end
 
-make a function called lower_stmt takes node, code, fns, fname, locals, mutables, pending returns out
+# is_side_effect_free_node(node) -> mirrors ir/lowering.rs's own
+# is_side_effect_free_expr exactly, on this file's list-shaped AST instead
+# of the native Expr enum: true for a shape that structurally CANNOT have a
+# side effect of its own (a literal, arithmetic/comparison over such, a
+# bare variable read, a list literal of such) -- everything that dispatches
+# through a host/function call, a message send, or a closure creation is
+# false, since those already speak for themselves via whatever they do; see
+# lower_stmt's "Expr" arm below for why this distinction matters (auto-
+# printing a Call's own incidental return value, e.g. print(x)'s Unit,
+# would be noise, not the intended feature).
+make a function called is_side_effect_free_node takes node returns r
+  let ty = node[0]
+  if (ty == "Num") or (ty == "Str") or (ty == "Bool") or (ty == "Var") then
+    return true
+  end
+  if ty == "Un" then
+    return is_side_effect_free_node(node[2])
+  end
+  if ty == "Bin" then
+    return is_side_effect_free_node(node[2]) and is_side_effect_free_node(node[3])
+  end
+  if ty == "List" then
+    let items = node[1]
+    let i = 0
+    let all_free = true
+    while i < items.length do
+      if is_side_effect_free_node(items[i]) == false then
+        let all_free = false
+      end
+      let i = i + 1
+    end
+    return all_free
+  end
+  return false
+end
+
+# wants_value: mirrors ir/lowering.rs's own `wants_value` thread exactly --
+# true when this statement is in TAIL POSITION of a block/function that
+# itself wants a value (the "blocks and functions return their last value"
+# feature), meaning its own computed value should be left on the stack for
+# the caller instead of discarded/auto-printed. See lower_block below for
+# how a statement LIST decides which single statement (if any) gets
+# wants_value=true.
+make a function called lower_stmt takes node, code, fns, fname, locals, mutables, pending, wants_value returns out
   let ty = node[0]
   if ty == "Let" then
     let valNode = node[2]
@@ -477,6 +520,13 @@ make a function called lower_stmt takes node, code, fns, fname, locals, mutables
       vec_push(locals, node[1])
       vec_push(mutables, isMut)
     end
+    # Ruby-style assignment-as-expression (mirrors ir/lowering.rs's own
+    # Stmt::Let arm): Store already consumed the value off the stack, so
+    # when this `let` is in tail position of a block that wants a value,
+    # reload it -- the assigned value IS the block's value.
+    if wants_value then
+      vec_push(code, ["Load", node[1]])
+    end
     return code
   else
     if ty == "MemberAssign" then
@@ -494,32 +544,49 @@ make a function called lower_stmt takes node, code, fns, fname, locals, mutables
       vec_push(code, ["Const", "str", node[2]])
       let code = lower_expr(node[3], code, fns, locals, pending)
       vec_push(code, ["CallHost", "send", 4])
-      vec_push(code, ["Store", "__discard"])
+      if wants_value == false then
+        vec_push(code, ["Store", "__discard"])
+      end
       return code
     else
     if ty == "Expr" then
       let exprNode = node[1]
       if (exprNode[0] == "Call") and (exprNode[1] == "activate") and (to_num(exprNode[2].length) == 1) then
-        return lower_activate_stmt(exprNode[2][0], code, fns, fname, locals, mutables, pending)
+        let code = lower_activate_stmt(exprNode[2][0], code, fns, fname, locals, mutables, pending)
       else
-        # GitHub #31 fix (mirrors ir/lowering.rs's Stmt::ExprStmt): every
-        # function body ends with an explicit Return, so a bare expression
-        # statement's pushed value is never actually consumed. The
-        # interpreter's heap Vec-based operand stack tolerates leaving it,
-        # but the x64 backend's real rsp-based stack overflows once a large
-        # loop repeats an unassigned call statement enough times (traced via
-        # WinDbg to expand_includes_at_depth's ~30,000-line loop). Discard it
-        # via Store into a dedicated, never-read local -- reuses the
-        # existing Store instruction everywhere, no new IR opcode needed.
         let code = lower_expr(node[1], code, fns, locals, pending)
-        vec_push(code, ["Store", "__discard"])
+      end
+      # GitHub #31 fix (mirrors ir/lowering.rs's Stmt::ExprStmt): every
+      # function body ends with an explicit Return, so a bare expression
+      # statement's pushed value is never actually consumed UNLESS this
+      # statement is in tail position of a block/function that wants it
+      # (wants_value) -- the interpreter's heap Vec-based operand stack
+      # tolerates leaving it regardless, but the x64 backend's real
+      # rsp-based stack overflows once a large loop repeats an unassigned
+      # call statement enough times (traced via WinDbg to
+      # expand_includes_at_depth's ~30,000-line loop). When unconsumed:
+      # auto-print (the "echoed only if not consumed" feature) ONLY for a
+      # structurally side-effect-free shape -- a Call (e.g. `activate PLAN`
+      # itself, or an ordinary print(x)) already speaks for itself via its
+      # own side effect, so it's silently discarded instead, exactly as
+      # before this feature existed (mirrors ir/lowering.rs's own
+      # discard_or_use / is_side_effect_free_expr split).
+      if wants_value then
         return code
       end
+      if is_side_effect_free_node(exprNode) then
+        vec_push(code, ["CallHost", "print", 1])
+        return code
+      end
+      vec_push(code, ["Store", "__discard"])
+      return code
     else
       if ty == "Print" then
         let code = lower_expr(node[1], code, fns, locals, pending)
         vec_push(code, ["CallHost", "print", 1])
-        vec_push(code, ["Store", "__discard"])
+        if wants_value == false then
+          vec_push(code, ["Store", "__discard"])
+        end
         return code
       else
         if ty == "Return" then
@@ -531,29 +598,56 @@ make a function called lower_stmt takes node, code, fns, fname, locals, mutables
             let code = lower_expr(node[1], code, fns, locals, pending)
             let jif = vec_len(code)
             vec_push(code, ["JumpIfFalse", 0])
-            let code = lower_block(node[2], code, fns, fname, locals, mutables, pending)
+            let code = lower_block(node[2], code, fns, fname, locals, mutables, pending, wants_value)
             let jmp = vec_len(code)
             vec_push(code, ["Jump", 0])
             vec_set(code, jif, ["JumpIfFalse", vec_len(code)])
-            let code = lower_block(node[3], code, fns, fname, locals, mutables, pending)
+            # node[3] (the else branch) is always a list, `[]` when the
+            # source had no `else` -- lower_block's own empty-list handling
+            # already pushes Unit when wants_value, so the "no else but the
+            # false path needs a value too" case falls out for free.
+            let code = lower_block(node[3], code, fns, fname, locals, mutables, pending, wants_value)
             vec_set(code, jmp, ["Jump", vec_len(code)])
             return code
           else
             if ty == "While" then
-              let start = vec_len(code)
-              let code = lower_expr(node[1], code, fns, locals, pending)
-              let jif = vec_len(code)
-              vec_push(code, ["JumpIfFalse", 0])
-              let code = lower_block(node[2], code, fns, fname, locals, mutables, pending)
-              # Lexically inside a budgeted(ms) { ... } block: check the time
-              # budget just before looping back (mirrors lowering.rs's
-              # equivalent Stage 0 instrumentation).
-              if budgeted_depth_get() > 0 then
-                vec_push(code, ["CallHost", "budget_check", 0])
+              if wants_value then
+                # A while loop's value is Unit on zero iterations, otherwise
+                # its last-run iteration's tail value -- mirrors
+                # ir/lowering.rs's While arm exactly: push the zero-
+                # iteration default up front, then each iteration that
+                # actually runs pops the previous placeholder/prior value
+                # before pushing its own, so exactly one "current result"
+                # slot exists on the stack the whole time.
+                vec_push(code, ["Const", "unit", ""])
+                let start = vec_len(code)
+                let code = lower_expr(node[1], code, fns, locals, pending)
+                let jif = vec_len(code)
+                vec_push(code, ["JumpIfFalse", 0])
+                vec_push(code, ["Store", "__discard"])
+                let code = lower_block(node[2], code, fns, fname, locals, mutables, pending, true)
+                if budgeted_depth_get() > 0 then
+                  vec_push(code, ["CallHost", "budget_check", 0])
+                end
+                vec_push(code, ["Jump", start])
+                vec_set(code, jif, ["JumpIfFalse", vec_len(code)])
+                return code
+              else
+                let start = vec_len(code)
+                let code = lower_expr(node[1], code, fns, locals, pending)
+                let jif = vec_len(code)
+                vec_push(code, ["JumpIfFalse", 0])
+                let code = lower_block(node[2], code, fns, fname, locals, mutables, pending, false)
+                # Lexically inside a budgeted(ms) { ... } block: check the time
+                # budget just before looping back (mirrors lowering.rs's
+                # equivalent Stage 0 instrumentation).
+                if budgeted_depth_get() > 0 then
+                  vec_push(code, ["CallHost", "budget_check", 0])
+                end
+                vec_push(code, ["Jump", start])
+                vec_set(code, jif, ["JumpIfFalse", vec_len(code)])
+                return code
               end
-              vec_push(code, ["Jump", start])
-              vec_set(code, jif, ["JumpIfFalse", vec_len(code)])
-              return code
             else
               if ty == "Assert" then
                 # contract_check(func_name, kind, text, ok) — args pushed in
@@ -563,7 +657,9 @@ make a function called lower_stmt takes node, code, fns, fname, locals, mutables
                 vec_push(code, ["Const", "str", ast_to_str(node[2])])
                 let code = lower_expr(node[2], code, fns, locals, pending)
                 vec_push(code, ["CallHost", "contract_check", 4])
-                vec_push(code, ["Store", "__discard"])
+                if wants_value == false then
+                  vec_push(code, ["Store", "__discard"])
+                end
                 return code
               else
                 if ty == "RuleDecl" then
@@ -600,7 +696,9 @@ make a function called lower_stmt takes node, code, fns, fname, locals, mutables
                   end
                   vec_push(code, ["BuildList", body.length])
                   vec_push(code, ["CallHost", "rule_add", 3])
-                  vec_push(code, ["Store", "__discard"])
+                  if wants_value == false then
+                    vec_push(code, ["Store", "__discard"])
+                  end
                   return code
                 else
                   if ty == "GoalDecl" then
@@ -630,7 +728,9 @@ make a function called lower_stmt takes node, code, fns, fname, locals, mutables
                     end
                     vec_push(code, ["BuildList", deps.length])
                     vec_push(code, ["CallHost", "goal_def", 2])
-                    vec_push(code, ["Store", "__discard"])
+                    if wants_value == false then
+                      vec_push(code, ["Store", "__discard"])
+                    end
                     return code
                   else
                     if ty == "ClassDecl" then
@@ -687,10 +787,17 @@ make a function called lower_stmt takes node, code, fns, fname, locals, mutables
                       end
                       vec_push(code, ["BuildList", ctraits.length])
                       vec_push(code, ["CallHost", "class_def", 5])
-                      vec_push(code, ["Store", "__discard"])
+                      if wants_value == false then
+                        vec_push(code, ["Store", "__discard"])
+                      end
                       return code
                     else
-                      # unknown statement: no code
+                      # unknown statement: no code -- but a tail position
+                      # that wants a value still needs something on the
+                      # stack (mirrors ir/lowering.rs's own catch-all arm).
+                      if wants_value then
+                        vec_push(code, ["Const", "unit", ""])
+                      end
                       return code
                     end
                   end
@@ -705,10 +812,23 @@ make a function called lower_stmt takes node, code, fns, fname, locals, mutables
   end
 end
 
-make a function called lower_block takes stmts, code, fns, fname, locals, mutables, pending returns out
+# Mirrors ir/lowering.rs's own lower_stmt_list exactly: lowers a statement
+# LIST as a unit. Every statement but the last gets wants_value=false; the
+# last inherits the list's own wants_value, so a value genuinely flows out
+# of the block only from its tail position. An empty list that wants a
+# value produces Unit (the block's value when it has no statements at all).
+make a function called lower_block takes stmts, code, fns, fname, locals, mutables, pending, wants_value returns out
+  if stmts.length == 0 then
+    if wants_value then
+      vec_push(code, ["Const", "unit", ""])
+    end
+    return code
+  end
+  let last = stmts.length - 1
   let i = 0
   while i < stmts.length do
-    let code = lower_stmt(stmts[i], code, fns, fname, locals, mutables, pending)
+    let stmt_wants_value = (i == last) and wants_value
+    let code = lower_stmt(stmts[i], code, fns, fname, locals, mutables, pending, stmt_wants_value)
     let i = i + 1
   end
   return code
@@ -727,6 +847,59 @@ make a function called collect_fns takes stmts returns fns
   return fns
 end
 
+# body_assigns_name(stmts, name) -> mirrors rust-runtime/src/parser.rs's
+# own body_assigns_name exactly, on this file's list-shaped statement AST:
+# true if `name` is `let`-assigned anywhere in `stmts`, at any nesting
+# depth inside if/while branches (a shallow top-level-only scan would miss
+# the common `if cond then let r = X else let r = Y end` shape). Used below
+# to decide whether the `returns NAME` hint's synthesized trailing return
+# should fire -- see that call site's own comment for why unconditionally
+# synthesizing it would silently defeat implicit-last-value-return for any
+# function that never touches NAME at all.
+make a function called body_assigns_name takes stmts, name returns r
+  let i = 0
+  while i < stmts.length do
+    let s = stmts[i]
+    if (s[0] == "Let") and (s[1] == name) then
+      return true
+    end
+    if s[0] == "If" then
+      if body_assigns_name(s[2], name) then
+        return true
+      end
+      if body_assigns_name(s[3], name) then
+        return true
+      end
+    end
+    if s[0] == "While" then
+      if body_assigns_name(s[2], name) then
+        return true
+      end
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# Index of the LAST non-"Func" top-level statement, or -1 if there are
+# none -- mirrors ir/lowering.rs's own `top_level`/`last_idx` computation
+# in lower_program_basic: main's own tail statement wants a value too (the
+# whole program's own implicit last-value return, restoring the pre-
+# 86e4fef patc1_main echo behaviour as a consequence of this design rather
+# than a separate code path), so its position needs to be known before the
+# main loop below decides each statement's own wants_value.
+make a function called last_nonfunc_index takes stmts returns idx
+  let last = -1
+  let i = 0
+  while i < stmts.length do
+    if stmts[i][0] != "Func" then
+      let last = i
+    end
+    let i = i + 1
+  end
+  return last
+end
+
 make a function called lower_program takes ast returns ir
   set_var("__closure_seq", 0)
   let stmts = ast[1]
@@ -738,6 +911,7 @@ make a function called lower_program takes ast returns ir
   let mainMutables = vec_new()
   let pending = vec_new()
   let handlerCount = 0
+  let last_top_level = last_nonfunc_index(stmts)
   let i = 0
   while i < stmts.length do
     let s = stmts[i]
@@ -758,16 +932,20 @@ make a function called lower_program takes ast returns ir
       # lowering time), so both backends' synthesis point stays
       # structurally analogous. Reached only via genuine fall-through:
       # any earlier explicit `return` already exits before this point.
-      # Bringing Stage 1 to parity with Stage 0 -- previously the hint
-      # was parsed and unconditionally discarded (self_hosting/lib/
-      # parser.patlang), so Stage 1 always required an explicit return.
+      # Only synthesized when the body actually assigns the hint name
+      # somewhere (see body_assigns_name above) -- unconditionally
+      # appending this for EVERY `returns NAME` declaration would
+      # silently steal the tail position from a function relying on
+      # implicit-last-value-return instead, returning an unassigned NAME.
       let fbody = s[3]
       if s.length > 4 then
         if s[4] != "" then
-          let fbody = list_push(s[3], ["Return", ["Var", s[4]]])
+          if body_assigns_name(s[3], s[4]) then
+            let fbody = list_push(s[3], ["Return", ["Var", s[4]]])
+          end
         end
       end
-      let code = lower_block(fbody, vec_new(), fns, s[1], flocals, fmutables, pending)
+      let code = lower_block(fbody, vec_new(), fns, s[1], flocals, fmutables, pending, true)
       vec_push(code, ["Return"])
       let funcs = list_push(funcs, ["FuncIR", s[1], s[2], vec_to_list(code)])
     else
@@ -790,12 +968,17 @@ make a function called lower_program takes ast returns ir
         vec_push(mainCode, ["Const", "str", s[1]])
         let mainCode = lower_closure_literal(["event_name", "event_data"], s[2], mainCode, fns, mainLocals, pending)
         vec_push(mainCode, ["CallHost", "register_event_handler", 2])
-        vec_push(mainCode, ["Store", "__discard"])
+        if i != last_top_level then
+          vec_push(mainCode, ["Store", "__discard"])
+        end
       else
-        let mainCode = lower_stmt(s, mainCode, fns, "main", mainLocals, mainMutables, pending)
+        let mainCode = lower_stmt(s, mainCode, fns, "main", mainLocals, mainMutables, pending, i == last_top_level)
       end
     end
     let i = i + 1
+  end
+  if last_top_level == -1 then
+    vec_push(mainCode, ["Const", "unit", ""])
   end
   vec_push(mainCode, ["Return"])
   let funcs = list_push(funcs, ["FuncIR", "main", [], vec_to_list(mainCode)])

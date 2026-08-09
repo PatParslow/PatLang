@@ -1,4 +1,5 @@
 use crate::ast::{Expr, Stmt, BinaryOperator};
+use crate::parser::is_side_effect_free_expr;
 use std::collections::HashSet;
 use super::types::*;
 
@@ -68,9 +69,7 @@ impl Lowerer {
                 // params are considered known locals; always reassignable
                 // (Phase 1 does not require `mut` on parameters).
                 self.known_locals = params.iter().map(|p| (p.clone(), true)).collect();
-                for st in body {
-                    self.lower_stmt(&st, &mut f);
-                }
+                self.lower_stmt_list(&body, true, &mut f);
                 f.body.push(Instr::Return);
                 program.functions.insert(name.clone(), f);
                 self.known_locals = saved_locals; // restore
@@ -86,11 +85,12 @@ impl Lowerer {
         // gotcha, worked around by re-declaring the same name fresh
         // inside every handler body instead of fixing the root cause).
         self.current_function = "main".into();
-        for s in stmts {
-            if !matches!(s, Stmt::Function { .. }) {
-                self.lower_stmt(s, &mut main_fn);
-            }
+        let top_level: Vec<&Stmt> = stmts.iter().filter(|s| !matches!(s, Stmt::Function { .. })).collect();
+        let last_idx = top_level.len().checked_sub(1);
+        for (i, s) in top_level.iter().enumerate() {
+            self.lower_stmt(s, Some(i) == last_idx, &mut main_fn);
         }
+        if top_level.is_empty() { main_fn.body.push(Instr::Const(Value::Unit)); }
         main_fn.body.push(Instr::Return);
         program.functions.insert("main".into(), main_fn);
         for f in self.pending_closures.drain(..) {
@@ -164,40 +164,78 @@ impl Lowerer {
                 ],
             },
         ];
-        for s in &synth { self.lower_stmt(s, f); }
+        for s in &synth { self.lower_stmt(s, false, f); }
         self.lower_expr(&ident(&ok_var), f);
     }
 
-    fn lower_stmt(&mut self, s: &Stmt, f: &mut Function) {
+    // Lowers a statement LIST (a function body, an if/else branch, a while
+    // body) as a unit: every statement but the last is lowered with
+    // wants_value=false (its value, if any, is either consumed as a side
+    // effect's own concern or auto-printed -- see discard_or_use below);
+    // the LAST statement inherits the list's own `wants_value`, so a value
+    // genuinely flows out of the block only from its tail position. An
+    // empty list that wants a value produces Unit (the block's value when
+    // it has no statements at all) -- keeps every caller's stack balance
+    // uniform regardless of body length.
+    fn lower_stmt_list(&mut self, stmts: &[Stmt], wants_value: bool, f: &mut Function) {
+        if stmts.is_empty() {
+            if wants_value { f.body.push(Instr::Const(Value::Unit)); }
+            return;
+        }
+        let last = stmts.len() - 1;
+        for (i, s) in stmts.iter().enumerate() {
+            self.lower_stmt(s, i == last && wants_value, f);
+        }
+    }
+
+    // Every call-host/host-effect statement site below (Assert, RuleDecl,
+    // MemberAssign, GoalDecl, ClassDecl, register_event_handler) computes a
+    // value it used to unconditionally discard via StoreLocal("__discard")
+    // (the GitHub #31 stack-safety fix -- see the ExprStmt arm's own
+    // comment for why an operand-stack leak matters on the x64 native
+    // backend). These are all inherently side-effecting DECLARATIONS, not
+    // "just a value" expressions -- same category the parser's own
+    // discarded-value note already exempts a bare Call from (its host-call
+    // result speaks for itself via its side effect; auto-printing e.g. a
+    // class_def's or rule_add's incidental boolean would be noise, not
+    // useful output). So unlike ExprStmt below, these never auto-print:
+    // consumed (wants_value: leave it on the stack for the caller) or
+    // unconsumed (silently discard, exactly as before).
+    fn discard_or_use(&mut self, wants_value: bool, f: &mut Function) {
+        if !wants_value {
+            f.body.push(Instr::StoreLocal("__discard".to_string()));
+        }
+    }
+
+    fn lower_stmt(&mut self, s: &Stmt, wants_value: bool, f: &mut Function) {
         match s {
             Stmt::ExprStmt(e) => {
                 if self.expr_is_safe(e) {
                     self.lower_expr(e, f);
-                    // Every function body ends with an explicit Instr::Return
-                    // (pushed at every function-emission site in this file) --
-                    // an ExprStmt's value is NEVER the function's real return
-                    // value, so it must be discarded here. A tree-walking
-                    // interpreter with a heap-allocated Vec<Value> operand
-                    // stack tolerates leaving it (unbounded growth, no crash),
-                    // but a native machine-stack-based backend (the x64
-                    // self-hosted backend) uses the real `rsp` for this same
-                    // operand stack -- capped at ~1MB by the OS -- so a bare
-                    // statement call (e.g. `sb_push(sb, x)` with its result
-                    // never assigned) inside a large loop leaks one stack slot
-                    // per iteration and genuinely overflows the native stack.
-                    // Real bug (GitHub #31): traced via WinDbg to a stack
-                    // overflow in `expand_includes_at_depth`'s ~30,000-line
-                    // loop; confirmed with a minimal repro (a bare `sb_push`
-                    // statement in a 30,000-iteration loop segfaults with
-                    // STATUS_STACK_OVERFLOW under --x64, but not when its
-                    // result is assigned to a `let`). Fixed by discarding via
-                    // StoreLocal into a dedicated, never-read local -- reuses
-                    // the existing Store/StoreLocal instruction everywhere
-                    // (interpreter, native codegen, x64 codegen) rather than
-                    // adding a new IR opcode.
-                    f.body.push(Instr::StoreLocal("__discard".to_string()));
+                    if wants_value {
+                        // consumed by the enclosing block/function's tail
+                    } else if is_side_effect_free_expr(e) {
+                        // Unconsumed AND structurally can't have a side
+                        // effect of its own (a literal, arithmetic, a bare
+                        // variable read, ...) -- the "echoed only if not
+                        // consumed" rule: auto-print instead of silently
+                        // dropping it. Printing preserves the exact same
+                        // stack-safety property StoreLocal had (GitHub
+                        // #31): the value is popped immediately either way.
+                        f.body.push(Instr::CallHost("print".to_string(), 1));
+                    } else {
+                        // A Call (or Member/Index/Closure/Budgeted) already
+                        // has -- or IS -- its own side effect; auto-printing
+                        // its incidental return value too (e.g. print(x)'s
+                        // own Unit) would be noise, not the intended
+                        // feature. Silently discard, exactly as before.
+                        f.body.push(Instr::StoreLocal("__discard".to_string()));
+                    }
                 } else {
-                    // skip unsafe expression statements (unknown identifiers / members)
+                    // skip unsafe expression statements (unknown identifiers / members) --
+                    // nothing was pushed, so a tail position that wants a value still
+                    // needs something on the stack.
+                    if wants_value { f.body.push(Instr::Const(Value::Unit)); }
                 }
             }
             Stmt::Let { name, value, is_reassignment, mutable } => {
@@ -237,9 +275,17 @@ impl Lowerer {
                     }
                 }
                 f.body.push(Instr::StoreLocal(name.clone()));
+                // Ruby-style assignment-as-expression: when this `let` is in
+                // tail position of a block/function that wants a value,
+                // reload what was just stored so the assigned value IS the
+                // block's value (matches `if`/function tail-value semantics
+                // uniformly -- a `let` isn't a special case that can't
+                // participate in implicit return, it just needs its value
+                // read back since Store already consumed it off the stack).
+                if wants_value { f.body.push(Instr::LoadLocal(name.clone())); }
             }
             Stmt::Return(opt) => {
-                if let Some(e) = opt { self.lower_expr(e, f); }
+                if let Some(e) = opt { self.lower_expr(e, f); } else { f.body.push(Instr::Const(Value::Unit)); }
                 f.body.push(Instr::Return);
             }
             Stmt::If { cond, then_branch, else_branch } => {
@@ -248,7 +294,7 @@ impl Lowerer {
                 let jif_idx = f.body.len();
                 f.body.push(Instr::JumpIfFalse(usize::MAX)); // patch later
                 // then
-                for s in then_branch { self.lower_stmt(s, f); }
+                self.lower_stmt_list(then_branch, wants_value, f);
                 // Jump over else
                 let jmp_over_idx = f.body.len();
                 f.body.push(Instr::Jump(usize::MAX)); // patch later
@@ -257,7 +303,13 @@ impl Lowerer {
                 // patch JumpIfFalse
                 if let Instr::JumpIfFalse(ref mut tgt) = f.body[jif_idx] { *tgt = else_pc; }
                 if let Some(else_branch) = else_branch {
-                    for s in else_branch { self.lower_stmt(s, f); }
+                    self.lower_stmt_list(else_branch, wants_value, f);
+                } else if wants_value {
+                    // No else branch, but the enclosing block wants this
+                    // if's value: the false-condition path has nothing to
+                    // give it, so it's Unit -- same rule as a block with no
+                    // statements at all.
+                    f.body.push(Instr::Const(Value::Unit));
                 }
                 // patch jump over else to here
                 let after_else = f.body.len();
@@ -265,26 +317,50 @@ impl Lowerer {
             }
             Stmt::While { cond, body } => {
                 self.warn_string_concat_in_loop(body);
-                // loop_start:
-                let loop_start = f.body.len();
-                // evaluate condition
-                self.lower_expr(cond, f);
-                // if false -> jump to after loop
-                let jif_idx = f.body.len();
-                f.body.push(Instr::JumpIfFalse(usize::MAX));
-                // body
-                for s in body { self.lower_stmt(s, f); }
-                // Lexically inside a budgeted(ms) { ... } block: check the
-                // time budget just before looping back, suspending (via
-                // fiber_yield inside budget_check) once it's exhausted.
-                if self.in_budgeted_depth > 0 {
-                    f.body.push(Instr::CallHost("budget_check".into(), 0));
+                if wants_value {
+                    // A while loop's value is Unit on zero iterations,
+                    // otherwise its last-run iteration's tail value --
+                    // push the zero-iteration default up front, then each
+                    // iteration that actually runs pops the previous
+                    // placeholder/prior value before pushing its own, so
+                    // exactly one "current result" slot exists on the
+                    // stack the whole time (never grows, matching the same
+                    // stack-safety property as ordinary discard).
+                    f.body.push(Instr::Const(Value::Unit));
+                    let loop_start = f.body.len();
+                    self.lower_expr(cond, f);
+                    let jif_idx = f.body.len();
+                    f.body.push(Instr::JumpIfFalse(usize::MAX));
+                    f.body.push(Instr::StoreLocal("__discard".to_string()));
+                    self.lower_stmt_list(body, true, f);
+                    if self.in_budgeted_depth > 0 {
+                        f.body.push(Instr::CallHost("budget_check".into(), 0));
+                    }
+                    f.body.push(Instr::Jump(loop_start));
+                    let after = f.body.len();
+                    if let Instr::JumpIfFalse(ref mut tgt) = f.body[jif_idx] { *tgt = after; }
+                } else {
+                    // loop_start:
+                    let loop_start = f.body.len();
+                    // evaluate condition
+                    self.lower_expr(cond, f);
+                    // if false -> jump to after loop
+                    let jif_idx = f.body.len();
+                    f.body.push(Instr::JumpIfFalse(usize::MAX));
+                    // body
+                    self.lower_stmt_list(body, false, f);
+                    // Lexically inside a budgeted(ms) { ... } block: check the
+                    // time budget just before looping back, suspending (via
+                    // fiber_yield inside budget_check) once it's exhausted.
+                    if self.in_budgeted_depth > 0 {
+                        f.body.push(Instr::CallHost("budget_check".into(), 0));
+                    }
+                    // jump back to loop_start
+                    f.body.push(Instr::Jump(loop_start));
+                    // patch JumpIfFalse to after body
+                    let after = f.body.len();
+                    if let Instr::JumpIfFalse(ref mut tgt) = f.body[jif_idx] { *tgt = after; }
                 }
-                // jump back to loop_start
-                f.body.push(Instr::Jump(loop_start));
-                // patch JumpIfFalse to after body
-                let after = f.body.len();
-                if let Instr::JumpIfFalse(ref mut tgt) = f.body[jif_idx] { *tgt = after; }
             }
             Stmt::Assert { kind, expr } => {
                 // contract_check(func_name, kind, condition_text, ok) — pushed in
@@ -294,7 +370,7 @@ impl Lowerer {
                 f.body.push(Instr::Const(Value::String((expr_to_text(expr)).into())));
                 self.lower_expr(expr, f);
                 f.body.push(Instr::CallHost("contract_check".into(), 4));
-                f.body.push(Instr::StoreLocal("__discard".to_string()));
+                self.discard_or_use(wants_value, f);
             }
             Stmt::RuleDecl { head_pred, head_args, body } => {
                 // Sugar: lowers to exactly the Instr sequence a hand-written
@@ -318,7 +394,7 @@ impl Lowerer {
                 }
                 f.body.push(Instr::BuildList(body.len()));
                 f.body.push(Instr::CallHost("rule_add".into(), 3));
-                f.body.push(Instr::StoreLocal("__discard".to_string()));
+                self.discard_or_use(wants_value, f);
             }
             Stmt::MemberAssign { object, property, value } => {
                 // obj.prop = value -- lowers to the same send(obj, "set",
@@ -336,10 +412,7 @@ impl Lowerer {
                 // 4 stack args just pushed: object, "set", property, value.
                 let send_arity = 4;
                 f.body.push(Instr::CallHost("send".into(), send_arity));
-                // Statement-level call result, never consumed -- see the
-                // GitHub #31 fix in the Stmt::ExprStmt arm above for why
-                // this must be discarded rather than left on the stack.
-                f.body.push(Instr::StoreLocal("__discard".to_string()));
+                self.discard_or_use(wants_value, f);
             }
             Stmt::GoalDecl { name, deps } => {
                 // Sugar: lowers to exactly the Instr sequence a hand-written
@@ -359,7 +432,7 @@ impl Lowerer {
                 }
                 f.body.push(Instr::BuildList(deps.len()));
                 f.body.push(Instr::CallHost("goal_def".into(), 2));
-                f.body.push(Instr::StoreLocal("__discard".to_string()));
+                self.discard_or_use(wants_value, f);
             }
             Stmt::ClassDecl { name, parent, fields, methods, traits } => {
                 // Slice 1+2+3 of the classes/traits/inheritance feature
@@ -401,13 +474,15 @@ impl Lowerer {
                 }
                 f.body.push(Instr::BuildList(traits.len()));
                 f.body.push(Instr::CallHost("class_def".into(), 5));
-                f.body.push(Instr::StoreLocal("__discard".to_string()));
+                self.discard_or_use(wants_value, f);
             }
             Stmt::When { event, body, .. } => {
-                self.lower_when(event, body, f);
+                self.lower_when(event, body, wants_value, f);
             }
             _ => {
-                // unsupported yet: ignore safely
+                // unsupported yet: ignore safely -- but a tail position that
+                // wants a value still needs something on the stack.
+                if wants_value { f.body.push(Instr::Const(Value::Unit)); }
             }
         }
     }
@@ -429,7 +504,7 @@ impl Lowerer {
     // root cause) -- this closes it: a `when` block declared after a
     // `let` now captures that `let` correctly, the same as any ordinary
     // closure would.
-    fn lower_when(&mut self, event: &str, body: &[Stmt], f: &mut Function) {
+    fn lower_when(&mut self, event: &str, body: &[Stmt], wants_value: bool, f: &mut Function) {
         let params: Vec<String> = vec!["event_name".to_string(), "event_data".to_string()];
         let mut own: HashSet<String> = params.iter().cloned().collect();
         collect_let_bound_names(body, &mut own);
@@ -454,7 +529,7 @@ impl Lowerer {
         let saved_locals = std::mem::take(&mut self.known_locals);
         let saved_fname = std::mem::replace(&mut self.current_function, func_name.clone());
         self.known_locals = hf.params.iter().map(|p| (p.clone(), true)).collect();
-        for st in body { self.lower_stmt(st, &mut hf); }
+        self.lower_stmt_list(body, true, &mut hf);
         hf.body.push(Instr::Return);
         self.known_locals = saved_locals;
         self.current_function = saved_fname;
@@ -471,13 +546,13 @@ impl Lowerer {
         }
         f.body.push(Instr::MakeClosure(func_name, captured_names));
         f.body.push(Instr::CallHost("register_event_handler".into(), 2));
-        f.body.push(Instr::StoreLocal("__discard".to_string()));
+        self.discard_or_use(wants_value, f);
     }
 
     fn expr_is_safe(&self, e: &Expr) -> bool {
         match e {
             Expr::Number(_) | Expr::BigNumber(_) | Expr::Float(_) | Expr::String(_) => true,
-            Expr::Identifier(name) => name == "true" || name == "false" || self.known_locals.contains_key(name),
+            Expr::Identifier(name) => name == "true" || name == "false" || name == "unit" || self.known_locals.contains_key(name),
             Expr::List(items) => items.iter().all(|it| self.expr_is_safe(it)),
             // Member reads lower to len/get host calls; safe when the object expr is safe
             Expr::Member { object, .. } => self.expr_is_safe(object),
@@ -546,11 +621,21 @@ impl Lowerer {
             Expr::Float(n) => f.body.push(Instr::Const(Value::Float(*n))),
             Expr::String(s) => f.body.push(Instr::Const(Value::String((s.clone()).into()))),
             Expr::Identifier(name) => {
-                // Treat 'true' and 'false' as boolean literals in Stage 0
+                // Treat 'true' and 'false' as boolean literals in Stage 0.
+                // 'unit' likewise (added for the implicit-last-value-return/
+                // auto-print feature): until now Value::Unit was ONLY ever
+                // producible implicitly by lowering itself (an empty block,
+                // a no-else `if`, a zero-iteration `while`) -- no PatLang
+                // program could write a literal Unit value directly, which
+                // became a real, concrete gap once a runtime function
+                // (x64_runtime.patlang's rt_print_str) needed to explicitly
+                // return one instead of a stand-in `true`.
                 if name == "true" {
                     f.body.push(Instr::Const(Value::Bool(true)));
                 } else if name == "false" {
                     f.body.push(Instr::Const(Value::Bool(false)));
+                } else if name == "unit" {
+                    f.body.push(Instr::Const(Value::Unit));
                 } else {
                     f.body.push(Instr::LoadLocal(name.clone()));
                 }
@@ -655,7 +740,7 @@ impl Lowerer {
                 self.known_locals.insert("__captured".into(), true);
                 for (name, mutable) in &captured { self.known_locals.insert(name.clone(), *mutable); }
                 self.in_budgeted_depth += 1;
-                for st in body { self.lower_stmt(st, &mut bf); }
+                self.lower_stmt_list(body, true, &mut bf);
                 self.in_budgeted_depth -= 1;
                 bf.body.push(Instr::Return);
                 self.pending_closures.push(bf);
@@ -793,7 +878,7 @@ impl Lowerer {
         let saved_locals = std::mem::take(&mut self.known_locals);
         let saved_fname = std::mem::replace(&mut self.current_function, func_name.clone());
         self.known_locals = cf.params.iter().map(|p| (p.clone(), true)).collect();
-        for st in body { self.lower_stmt(st, &mut cf); }
+        self.lower_stmt_list(body, true, &mut cf);
         cf.body.push(Instr::Return);
         self.known_locals = saved_locals;
         self.current_function = saved_fname;

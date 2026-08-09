@@ -324,16 +324,43 @@ fn selfhost_fixpoint_patc_compiles_itself() {
     let repo_root = std::path::Path::new(manifest).parent().unwrap().to_path_buf();
     let read = |rel: &str| std::fs::read_to_string(repo_root.join(rel)).unwrap_or_else(|e| panic!("read {}: {}", rel, e));
 
-    // Concatenate the compiler's own source (same as build_patc1.patlang)
-    let compiler_src = format!(
-        "{}\n{}\n{}\n{}\n{}\n{}",
+    // Concatenate the compiler's own source -- the minimal subset of
+    // build_patc1.patlang's own include list that patc1_main.patlang
+    // actually needs to run (x64/json/interp/etc are extra backends this
+    // test doesn't exercise). MUST include includes.patlang: patc1_main.
+    // patlang's compile path calls path_dirname(input) UNCONDITIONALLY on
+    // every single compile (not just when the input uses `include`), and
+    // path_dirname is defined only there -- omitting it isn't a "missing
+    // feature the test doesn't need," it's a hard runtime failure the
+    // moment ANY of Gen B/Gen C's `run_patc` calls actually run patc1's
+    // compiled main() (confirmed directly: "IR runtime error: host fn
+    // 'path_dirname' not found", reproduced identically against a clean
+    // pre-existing checkout via `git stash` -- this bundle had silently
+    // drifted out of sync with build_patc1.patlang's own list, not
+    // something introduced by any single change).
+    //
+    // Kept SEPARATE from patc1_main.patlang's own source (see
+    // `compiler_libs` vs `compiler_src` below): patc1_main.patlang isn't
+    // just function definitions, it has real top-level CLI-dispatch code
+    // (`let args = argv() ...`) that runs unconditionally the instant its
+    // source is executed, not just when compiled into a standalone exe.
+    // Also needs syntax_dsl.patlang: patc1_main.patlang's compile path
+    // calls expand_syntax_dsls(source) unconditionally too, same
+    // "not gated behind whether the input actually uses the feature"
+    // shape as path_dirname/expand_includes above -- found by actually
+    // running Gen B (patc1 compiling a real demo) after fixing the first
+    // missing dependency, not by auditing the whole call graph up front.
+    let compiler_libs = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}",
         read("self_hosting/lib/lexer.patlang"),
         read("self_hosting/lib/parser.patlang"),
         read("self_hosting/lib/lower.patlang"),
         read("self_hosting/lib/codegen.patlang"),
         read("self_hosting/lib/runtime_rs.patlang"),
-        read("self_hosting/patc1_main.patlang"),
+        read("self_hosting/lib/includes.patlang"),
+        read("self_hosting/lib/syntax_dsl.patlang"),
     );
+    let compiler_src = format!("{}\n{}", compiler_libs, read("self_hosting/patc1_main.patlang"));
 
     let out_dir = std::env::temp_dir().join("patlang_fixpoint_test");
     let _ = std::fs::create_dir_all(&out_dir);
@@ -344,17 +371,39 @@ fn selfhost_fixpoint_patc_compiles_itself() {
     let fwd = |p: &std::path::Path| p.display().to_string().replace('\\', "/");
 
     // --- Gen A: interpreter runs the PatLang compiler on its own source ---
+    // rustc_build's 4th arg (opt-level) is explicitly "0" here, matching
+    // patc1_main.patlang's OWN documented reasoning for why its final-link
+    // step defaults to "0" instead of rustc's real -O: compiling a program
+    // this large (the whole self-hosted compiler's own source, several MB
+    // of generated Rust) at full optimization is exactly the "1GB+-and-
+    // climbing rustc.exe, hung" pathology that comment describes -- this
+    // driver was the ONE remaining caller still hitting the monolithic
+    // emit_program_rs/rustc_build path with no override at all, unlike
+    // build_patc1.patlang's own chunked path which already defaults safely.
     let driver = format!(
         "let source = read_file(\"{}\")\n\
          let toks = tokenize(source)\n\
          let ast = parse_program(toks)\n\
          let ir = lower_program(ast)\n\
          let rs = emit_program_rs(ir)\n\
-         let exe = rustc_build(rs, \"{}\")\n\
+         let exe = rustc_build(rs, \"{}\", \"\", \"0\")\n\
          print(\"GEN A OK\")\n",
         fwd(&all_src_path), fwd(&patc1)
     );
-    let gen_a_src = format!("{}\n{}", compiler_src, driver);
+    // compiler_libs, NOT compiler_src -- the driver only ever calls
+    // tokenize/parse_program/lower_program/emit_program_rs/rustc_build,
+    // all defined in the libs; patc1_main.patlang's own top-level CLI
+    // dispatch has no business running here at all (see the comment
+    // where compiler_libs/compiler_src are built) -- it was executing
+    // unconditionally as an unwanted side effect of this concatenation,
+    // sharing THIS TEST PROCESS's own real argv (whatever cargo/libtest
+    // flags happened to be on the command line) with patc1_main.patlang's
+    // `let args = argv()` dispatch, and crashing on a filter string like
+    // "--include-ignored" misread as an input file path. Confirmed by
+    // reproducing "read_file: <cargo flag>: file not found" for every
+    // invocation that passes ANY extra test-harness args -- i.e. every
+    // realistic way of actually running an `#[ignore]`d test at all.
+    let gen_a_src = format!("{}\n{}", compiler_libs, driver);
     let mut parser = Stage0Parser::new(&gen_a_src).expect("lexer init");
     let ast = parser.parse().expect("gen A source should parse");
     let mut lower = Lowerer::new();

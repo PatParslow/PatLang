@@ -694,18 +694,24 @@ impl<'a> Parser<'a> {
                         return Err(ParserError::UnexpectedToken { token: self.curr.clone(), line: self.line_no, hint: "Unexpected token; check for missing operators or delimiters" });
                     }
                 }
-                // "You computed a value and threw it away, sure you want to do
-                // that?" -- a soft warning, not an error: only for expressions
-                // that structurally cannot have a side effect (a literal,
-                // arithmetic/comparison over such, a bare variable read, a list
-                // literal of such). A Call is deliberately never flagged here --
-                // print(x)'s whole point is a discarded Unit return, and that's
-                // the overwhelmingly common shape of a real, intentional bare
-                // expression statement.
+                // "You computed a value here" -- an informational note, not a
+                // warning: lowering now auto-prints any non-tail bare
+                // expression-statement's value rather than silently
+                // discarding it (the "echoed only if not consumed" rule --
+                // see rust-runtime/src/ir/lowering.rs's discard_or_use), so
+                // this is no longer a probable mistake to flag defensively,
+                // just a heads-up about what will show up in the program's
+                // output. Only for expressions that structurally cannot have
+                // a side effect (a literal, arithmetic/comparison over such,
+                // a bare variable read, a list literal of such). A Call is
+                // deliberately never flagged here -- print(x)'s whole point
+                // is an explicit, already-visible print, and that's the
+                // overwhelmingly common shape of a real bare expression
+                // statement.
                 //
                 // Exempt tail position: the last statement of a block (function/
                 // closure/if/while body, or top-level program) is PatLang's
-                // implicit return value, not a discarded one -- e.g. `|p| { p }`
+                // implicit return value, not a printed one -- e.g. `|p| { p }`
                 // is a deliberate identity closure. Detected by peeking past any
                 // trailing newlines to see whether the block-terminating token
                 // (EOF, `}}`, or a stop word like `end`/`elif`/`else`) comes next.
@@ -715,7 +721,7 @@ impl<'a> Parser<'a> {
                         || matches!(&self.curr, Token::Identifier(t) if t == "end" || t == "elif");
                     if !is_tail {
                         eprintln!(
-                            "warning: {}:{}: this expression's value is computed and discarded -- did you mean to assign it, print it, or was an operator/statement missing?",
+                            "note: {}:{}: this expression's value is not consumed by anything, so it will be auto-printed here",
                             self.source_name, start_line
                         );
                     }
@@ -826,8 +832,26 @@ impl<'a> Parser<'a> {
             // irrelevant) or is unreachable dead code after another
             // top-level return (also irrelevant) -- so this can't change
             // any well-formed program's observable behavior.
+            // Only synthesize the trailing `return NAME` when the body
+            // actually assigns NAME somewhere (any nesting depth, since an
+            // early-exit-style `if cond then let r = X else let r = Y end`
+            // is a common shape) -- i.e. the user is deliberately using the
+            // "formal return-name" convention. Since lowering.rs now gives
+            // a function's body its own implicit last-value return (the
+            // "blocks/functions return their last value" feature), blindly
+            // appending this for EVERY `returns NAME` declaration would
+            // silently steal that tail position from a function that never
+            // touches NAME at all -- its real bare tail expression would
+            // stop being the last statement, breaking implicit return AND
+            // returning an unassigned NAME instead. Composes as three
+            // independent ways to set a return value (explicit `return`,
+            // assign the declared NAME, or fall through to the last
+            // statement's value), matching the design already floated for
+            // this grammar rather than one silently overriding another.
             if let Some(var) = return_hint {
-                body.push(Stmt::Return(Some(Expr::Identifier(var))));
+                if body_assigns_name(&body, &var) {
+                    body.push(Stmt::Return(Some(Expr::Identifier(var))));
+                }
             }
             return Ok(Some(Stmt::Function { name, params, body }));
         } else if kind_is_template {
@@ -1479,7 +1503,31 @@ impl<'a> Parser<'a> {
 // being the paradigm case), so this only flags the cases genuinely likely
 // to be a mistake: a stray literal, a bare variable read, an arithmetic/
 // comparison expression, or a list built from such.
-fn is_side_effect_free_expr(e: &Expr) -> bool {
+// True if `name` is `let`-assigned anywhere in `stmts`, at any nesting
+// depth inside if/while branches -- a shallow top-level-only scan would
+// miss the common `if cond then let r = X else let r = Y end` shape (this
+// codebase already has one documented lesson about that exact mistake, see
+// this file's own comment above where the old top-level-only Return scan
+// was removed).
+fn body_assigns_name(stmts: &[Stmt], name: &str) -> bool {
+    stmts.iter().any(|s| match s {
+        Stmt::Let { name: n, .. } => n == name,
+        Stmt::If { then_branch, else_branch, .. } => {
+            body_assigns_name(then_branch, name)
+                || else_branch.as_ref().is_some_and(|eb| body_assigns_name(eb, name))
+        }
+        Stmt::While { body, .. } => body_assigns_name(body, name),
+        _ => false,
+    })
+}
+
+// pub(crate): also used by lowering.rs's discard_or_use to decide whether
+// an unconsumed statement's value is safe/meaningful to auto-print (a bare
+// Call is presumed to already speak for itself via its own side effects --
+// print(x)'s whole point is a discarded Unit return -- so it's silently
+// discarded there exactly as it's exempted from this warning here; only
+// side-effect-free "just a value" shapes get auto-printed).
+pub(crate) fn is_side_effect_free_expr(e: &Expr) -> bool {
     match e {
         Expr::Number(_) | Expr::BigNumber(_) | Expr::Float(_) | Expr::String(_) | Expr::Identifier(_) => true,
         Expr::List(items) => items.iter().all(is_side_effect_free_expr),

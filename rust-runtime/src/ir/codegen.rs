@@ -115,6 +115,7 @@ const HOST_CHUNK_TABLE: &[(&str, ChunkId)] = &[
     ("list_dir", ChunkId::Files),
     ("rename_file", ChunkId::Files),
     ("exec_capture", ChunkId::Files),
+    ("exec_capture_io", ChunkId::Files),
     ("now_ms", ChunkId::IoMisc),
     ("byte_length", ChunkId::IoMisc),
     ("read_line", ChunkId::IoMisc),
@@ -2913,13 +2914,37 @@ fn host_call_collections_handles(name: &str, args: &[Value]) -> Option<Result<Va
                 }
                 Ok(Value::String(text.into()))
             }
+            "exec_capture_io" => {
+                // exec_capture_io(path, [arg1, ...], stdin_text) -> [stdout, stderr, success]
+                // Keeps stdout/stderr separate (unlike exec_capture) and feeds
+                // stdin_text to the child -- used by the markdown doc-runner.
+                use std::io::Write;
+                let p = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), _ => return Err("exec_capture_io: expected program path".into()) };
+                let extra: Vec<String> = match args.get(1) {
+                    Some(Value::List(xs)) => xs.iter().filter_map(|v| match v { Value::String(s) => Some(s.as_ref().clone()), _ => None }).collect(),
+                    _ => Vec::new(),
+                };
+                let stdin_text = match args.get(2) { Some(Value::String(s)) => s.as_ref().clone(), _ => String::new() };
+                let mut child = std::process::Command::new(&p).args(&extra)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn().map_err(|e| format!("exec_capture_io: {}: {}", p, e))?;
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(stdin_text.as_bytes());
+                }
+                let out = child.wait_with_output().map_err(|e| format!("exec_capture_io: {}: {}", p, e))?;
+                let stdout_text = String::from_utf8_lossy(&out.stdout).to_string();
+                let stderr_text = String::from_utf8_lossy(&out.stderr).to_string();
+                Ok(Value::List(Arc::new(vec![Value::String(stdout_text.into()), Value::String(stderr_text.into()), Value::Bool(out.status.success())])))
+            }
                     _ => Err(format!("host fn '{}' not found", name)),
     }
 }
 
 fn host_call_files(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match name {
-        "read_file" | "write_file" | "touch_file" | "file_exists" | "list_dir" | "rename_file" | "exec_capture" => Some(host_call_files_inner(name, args)),
+        "read_file" | "write_file" | "touch_file" | "file_exists" | "list_dir" | "rename_file" | "exec_capture" | "exec_capture_io" => Some(host_call_files_inner(name, args)),
         _ => None,
     }
 }
@@ -4969,6 +4994,7 @@ fn host_call_codegen_bootstrap_inner(name: &str, args: &[Value]) -> Result<Value
                                     }
                                 }
                                 "str" => Value::String(text.into()),
+                                "unit" => Value::Unit,
                                 _ => Value::Bool(text == "true"),
                             };
                             Instr::Const(val)

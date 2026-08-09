@@ -529,6 +529,38 @@ pub fn host_exec_capture(args: &[Value]) -> Result<Value, String> {
     Ok(Value::String((text).into()))
 }
 
+pub fn host_exec_capture_io(args: &[Value]) -> Result<Value, String> {
+    // exec_capture_io(path, [arg1, ...], stdin_text) -> [stdout, stderr, success]
+    // Unlike exec_capture (which merges stderr into stdout on failure and
+    // has no stdin support), this keeps the two streams separate and
+    // feeds stdin_text to the child -- built for the markdown doc-runner,
+    // which needs to inject captured output into distinct ```stdout /
+    // ```stderr blocks and needs a way to feed a block's ```stdin input.
+    // `success` (the child's exit status) matters to that caller because
+    // `pat --ir-run` only auto-prints its guaranteed trailing blank line
+    // on a successful exit, never on an error exit -- the caller needs to
+    // know which case it's in to strip that baseline line correctly.
+    use std::io::Write;
+    let p = match args.get(0) { Some(Value::String(s)) => s.clone(), _ => return Err("exec_capture_io: expected program path".into()) };
+    let extra: Vec<String> = match args.get(1) {
+        Some(Value::List(xs)) => xs.iter().filter_map(|v| match v { Value::String(s) => Some(s.as_ref().clone()), _ => None }).collect(),
+        _ => Vec::new(),
+    };
+    let stdin_text = match args.get(2) { Some(Value::String(s)) => s.as_ref().clone(), _ => String::new() };
+    let mut child = std::process::Command::new(&*p).args(&extra)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn().map_err(|e| format!("exec_capture_io: {}: {}", p, e))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(stdin_text.as_bytes());
+    }
+    let out = child.wait_with_output().map_err(|e| format!("exec_capture_io: {}: {}", p, e))?;
+    let stdout_text = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr_text = String::from_utf8_lossy(&out.stderr).to_string();
+    Ok(Value::List(Arc::new(vec![Value::String(stdout_text.into()), Value::String(stderr_text.into()), Value::Bool(out.status.success())])))
+}
+
 pub fn host_argv(args: &[Value]) -> Result<Value, String> {
     // argv() -> List of program arguments, normalized so the same PatLang code
     // works interpreted (`pat --ir-run script.patlang a b`) and compiled
@@ -2138,6 +2170,14 @@ fn decode_ir_instr(v: &Value) -> Result<Instr, String> {
                 }
                 "str" => Value::String((text).into()),
                 "bool" => Value::Bool(text == "true"),
+                // "unit": added for the self-hosted lowerer's own implicit-
+                // return/auto-print mirror (self_hosting/lib/lower.patlang)
+                // -- an empty block, a no-else `if` branch, or a while loop
+                // that ran zero iterations needs to push a real Value::Unit
+                // when its tail value is wanted, and this list-shaped IR
+                // had no way to express that constant before (only
+                // num/str/bool). `text` is ignored (always "").
+                "unit" => Value::Unit,
                 other => return Err(format!("compile_ir: unknown const kind '{}'", other)),
             };
             Instr::Const(val)
@@ -2917,6 +2957,7 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("read_file_bytes", host_read_file_bytes);
     interp.host.insert("getenv", host_getenv);
     interp.host.insert("exec_capture", host_exec_capture);
+    interp.host.insert("exec_capture_io", host_exec_capture_io);
     interp.host.insert("compile_shape", host_compile_shape);
     interp.host.insert("compile_ir", host_compile_ir);
     interp.host.insert("run_ir", host_run_ir);
