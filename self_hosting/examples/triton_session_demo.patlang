@@ -1,0 +1,88 @@
+# Persistent GPU session proof (lib/triton_session.patlang): a single
+# Python/torch/triton process stays alive across multiple kernel
+# launches, with tensors resident on the GPU between them -- unlike every
+# one-shot triton_run_* function in triton.patlang, which pays a fresh
+# subprocess spawn + torch/triton import (~2-3s, per
+# [[patlang-triton-lowering-mandelbrot-timing-demo]]) on EVERY call.
+
+include "F:/PatLang/self_hosting/lib/test.patlang"
+include "F:/PatLang/self_hosting/lib/triton_session.patlang"
+
+t_init()
+
+let started = triton_session_start(5000)
+check("session starts within timeout", started[1][0], "Ok")
+let session = started[0]
+
+# --- Scenario 1: define once, launch, fetch, matches plain PatLang -----
+let add_src = "make a function called session_add takes x, y, out\n  store(out, offs, x[offs] + y[offs])\nend\n"
+check("define kernel", triton_session_define(session, add_src, "session_add")[0], "Ok")
+
+let a = [1, 2, 3, 4, 5, 6, 7, 8]
+let b = [10, 20, 30, 40, 50, 60, 70, 80]
+check("store a", triton_session_store(session, "a", a)[0], "Ok")
+check("store b", triton_session_store(session, "b", b)[0], "Ok")
+check("store out", triton_session_store(session, "out", [0, 0, 0, 0, 0, 0, 0, 0])[0], "Ok")
+check("launch", triton_session_launch(session, "session_add", ["a", "b", "out"])[0], "Ok")
+
+let fetched = triton_session_fetch(session, "out")
+check("fetch succeeds", fetched[1][0], "Ok")
+let expected = []
+let i = 0
+while i < to_num(list_len(a)) do
+  let expected = list_push(expected, to_num(a[i] + b[i]) + 0.0)
+  let i = i + 1
+end
+check("session result matches plain PatLang computation", fetched[0], expected)
+
+# --- Scenario 2: chain two kernels WITHOUT fetching the intermediate
+# result back to host -- this is the actual point of a session. stage1_out
+# stays resident on the GPU as stage2's input.
+let double_src = "make a function called session_double takes x, out\n  store(out, offs, x[offs] * 2.0)\nend\n"
+check("define second kernel", triton_session_define(session, double_src, "session_double")[0], "Ok")
+check("store stage1_out", triton_session_store(session, "stage1_out", [0, 0, 0, 0])[0], "Ok")
+check("store stage2_out", triton_session_store(session, "stage2_out", [0, 0, 0, 0])[0], "Ok")
+let c = [1, 2, 3, 4]
+let d = [10, 20, 30, 40]
+check("store c", triton_session_store(session, "c", c)[0], "Ok")
+check("store d", triton_session_store(session, "d", d)[0], "Ok")
+check("launch stage 1 (add)", triton_session_launch(session, "session_add", ["c", "d", "stage1_out"])[0], "Ok")
+check("launch stage 2 (double, consumes stage1_out directly)", triton_session_launch(session, "session_double", ["stage1_out", "stage2_out"])[0], "Ok")
+
+let chained = triton_session_fetch(session, "stage2_out")
+check("fetch chained result", chained[1][0], "Ok")
+let chainedExpected = []
+let j = 0
+while j < to_num(list_len(c)) do
+  let chainedExpected = list_push(chainedExpected, (to_num(c[j] + d[j]) + 0.0) * 2.0)
+  let j = j + 1
+end
+check("chained (a+b)*2 result matches plain PatLang, no host round-trip in between", chained[0], chainedExpected)
+
+# --- Timing: repeated launches inside a session vs repeated one-shot
+# calls -- the actual, measured benefit, not just "should be faster".
+let t0 = now_ms()
+let n = 0
+while n < 5 do
+  let dummy = [0, 0, 0, 0, 0, 0, 0, 0]
+  let r = triton_run_kernel_source(add_src, "session_add", [a, b, dummy])
+  let n = n + 1
+end
+let t1 = now_ms()
+let oneshot_ms = t1 - t0
+
+let t2 = now_ms()
+let m = 0
+while m < 5 do
+  let launchR = triton_session_launch(session, "session_add", ["a", "b", "out"])
+  let m = m + 1
+end
+let t3 = now_ms()
+let session_ms = t3 - t2
+
+triton_session_stop(session)
+
+print("5x one-shot triton_run_kernel_source: " + oneshot_ms + " ms total  [subprocess+import paid EVERY call]")
+print("5x session launch (after 1-time setup): " + session_ms + " ms total  [subprocess+import paid ONCE]")
+
+t_report()

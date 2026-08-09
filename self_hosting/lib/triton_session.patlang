@@ -1,0 +1,301 @@
+# Persistent GPU session: keeps ONE Python/torch/triton process alive
+# across multiple kernel launches, with tensors staying resident on the
+# GPU between them -- unlike every triton_run_* function in triton.patlang
+# (all one-shot: write a script, exec_capture it, torch/triton import
+# paid EVERY call, ~2-3s dominated by that alone per
+# [[patlang-triton-lowering-mandelbrot-timing-demo]]). Fixes the thing
+# that actually matters for a multi-stage pipeline (matmul -> bias-add ->
+# activation, the shape any real DL-ish computation takes): intermediate
+# results stay on-device between launches instead of round-tripping
+# through host JSON after every single kernel.
+#
+# Modeled directly on lib/signals.patlang's own IPC pattern (spawn a
+# process, connect over a local TCP port, one-line-JSON request ->
+# one-line-JSON reply, one fresh connection per call) -- NOT on lib/
+# queue.patlang's durable SQLite-backed message queue. The queue model is
+# for cross-restart durability and multiple consumers; a synchronous
+# "launch this kernel, get this result back" call wants a live TCP round
+# trip, not a polled, persisted row -- the queue's own durability is
+# actively unhelpful overhead here (extra DB round trips) for something
+# that's naturally request/response and lives only as long as the
+# session does.
+#
+# Readiness signal is deliberately simpler than lib/signal_discovery.
+# patlang's beacon (task_registry.patlang, itself queue.patlang-backed):
+# that beacon's row format is PatLang-specific machinery a Python process
+# has no easy way to write into correctly. Instead, the worker script
+# picks its own ephemeral port (bind to port 0) and writes JUST that port
+# number to a plain ready-file once it's actually listening; the PatLang
+# side polls for that file (bounded retries, also checking is_alive(pid)
+# each iteration to distinguish "still starting" from "already crashed"
+# -- same two-condition polling shape spawn_readiness_demo.patlang
+# already established, just swapping the beacon lookup for a file read).
+
+include "triton.patlang"
+
+make a function called triton_session_python_exe returns path
+  return "D:/Program Files/Python313/python.exe"
+end
+
+make a function called triton_session_scratch_dir returns dir
+  return "F:/PatLang/self_hosting/build"
+end
+
+# Generates the persistent worker's Python source. `ready_file` is where
+# it reports its bound port once listening. Request/reply wire format:
+# one JSON object per line, socket closed after each reply (fresh
+# connection per call, matching signal_query's own per-call-connect
+# style -- simpler than multiplexing one long-lived connection, and TCP
+# handshake cost is negligible locally compared to what this is actually
+# saving, which is torch/triton import + kernel JIT-compile time).
+#
+# Server-side state: `tensors` (name -> torch.Tensor, stays resident
+# across calls) and `kernels` (name -> (compiled fn, block_strategy)) --
+# a kernel's Python source is exec'd into `kernels` exactly ONCE per
+# "define" call, then reused for every subsequent "launch", instead of
+# being re-written-to-disk-and-reimported on every single call the way
+# every one-shot triton_run_* function in triton.patlang does.
+make a function called triton_session_worker_script takes ready_file returns py
+  let sb = sb_new()
+  sb_push(sb, "import torch\n")
+  sb_push(sb, "import triton\n")
+  sb_push(sb, "import triton.language as tl\n")
+  sb_push(sb, "import json\n")
+  sb_push(sb, "import socket\n")
+  sb_push(sb, "\n")
+  sb_push(sb, "import os\n")
+  sb_push(sb, "\n")
+  sb_push(sb, "tensors = {}\n")
+  sb_push(sb, "kernels = {}\n")
+  sb_push(sb, "kernel_dir = " + json_quote(triton_session_scratch_dir()) + "\n")
+  sb_push(sb, "\n")
+  sb_push(sb, "srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n")
+  sb_push(sb, "srv.bind(('127.0.0.1', 0))\n")
+  sb_push(sb, "srv.listen(8)\n")
+  sb_push(sb, "port = srv.getsockname()[1]\n")
+  sb_push(sb, "# Write-then-rename, not a direct write to the final path: a\n")
+  sb_push(sb, "# poller on the PatLang side could otherwise observe the file\n")
+  sb_push(sb, "# mid-write (created but still empty/partial), reading port 0\n")
+  sb_push(sb, "# -- confirmed directly (a real 'address not valid: :0' connect\n")
+  sb_push(sb, "# failure). os.replace is atomic on the same filesystem, so the\n")
+  sb_push(sb, "# poller only ever sees 'no file yet' or 'the fully-written file'.\n")
+  sb_push(sb, "ready_tmp = " + json_quote(ready_file + ".tmp") + "\n")
+  sb_push(sb, "ready_final = " + json_quote(ready_file) + "\n")
+  sb_push(sb, "with open(ready_tmp, 'w') as f:\n")
+  sb_push(sb, "    f.write(str(port))\n")
+  sb_push(sb, "os.replace(ready_tmp, ready_final)\n")
+  sb_push(sb, "\n")
+  sb_push(sb, "def handle(req):\n")
+  sb_push(sb, "    cmd = req.get('cmd')\n")
+  sb_push(sb, "    if cmd == 'define':\n")
+  sb_push(sb, "        # @triton.jit needs REAL file-backed source (it uses\n")
+  sb_push(sb, "        # inspect.getsource/linecache internally) -- a bare\n")
+  sb_push(sb, "        # exec() of a string has no file behind it and fails\n")
+  sb_push(sb, "        # with 'could not get source code'. Write it to a real\n")
+  sb_push(sb, "        # .py file first, then compile() against THAT path.\n")
+  sb_push(sb, "        kfile = os.path.join(kernel_dir, '_session_kernel_' + req['name'] + '.py')\n")
+  sb_push(sb, "        with open(kfile, 'w') as kf:\n")
+  sb_push(sb, "            kf.write(req['source'])\n")
+  sb_push(sb, "        ns = {'torch': torch, 'triton': triton, 'tl': tl}\n")
+  sb_push(sb, "        code = compile(open(kfile).read(), kfile, 'exec')\n")
+  sb_push(sb, "        exec(code, ns)\n")
+  sb_push(sb, "        kernels[req['name']] = (ns[req['name']], req['block_strategy'])\n")
+  sb_push(sb, "        return {'status': 'ok'}\n")
+  sb_push(sb, "    if cmd == 'store':\n")
+  sb_push(sb, "        tensors[req['name']] = torch.tensor(req['data'], device='cuda', dtype=torch.float32)\n")
+  sb_push(sb, "        return {'status': 'ok'}\n")
+  sb_push(sb, "    if cmd == 'fetch':\n")
+  sb_push(sb, "        t = tensors.get(req['name'])\n")
+  sb_push(sb, "        if t is None:\n")
+  sb_push(sb, "            return {'status': 'error', 'message': 'no such tensor: ' + req['name']}\n")
+  sb_push(sb, "        return {'status': 'ok', 'data': t.cpu().tolist()}\n")
+  sb_push(sb, "    if cmd == 'launch':\n")
+  sb_push(sb, "        entry = kernels.get(req['kernel'])\n")
+  sb_push(sb, "        if entry is None:\n")
+  sb_push(sb, "            return {'status': 'error', 'message': 'no such kernel: ' + req['kernel']}\n")
+  sb_push(sb, "        fn, block_strategy = entry\n")
+  sb_push(sb, "        arg_tensors = []\n")
+  sb_push(sb, "        for name in req['args']:\n")
+  sb_push(sb, "            t = tensors.get(name)\n")
+  sb_push(sb, "            if t is None:\n")
+  sb_push(sb, "                return {'status': 'error', 'message': 'no such tensor: ' + name}\n")
+  sb_push(sb, "            arg_tensors.append(t)\n")
+  sb_push(sb, "        n = arg_tensors[0].numel()\n")
+  sb_push(sb, "        if block_strategy == 'reduction':\n")
+  sb_push(sb, "            block_size = triton.next_power_of_2(n)\n")
+  sb_push(sb, "        else:\n")
+  sb_push(sb, "            block_size = 1024\n")
+  sb_push(sb, "        grid = (triton.cdiv(n, block_size),)\n")
+  sb_push(sb, "        fn[grid](*arg_tensors, n, BLOCK_SIZE=block_size)\n")
+  sb_push(sb, "        return {'status': 'ok'}\n")
+  sb_push(sb, "    return {'status': 'error', 'message': 'unknown cmd: ' + str(cmd)}\n")
+  sb_push(sb, "\n")
+  sb_push(sb, "running = True\n")
+  sb_push(sb, "while running:\n")
+  sb_push(sb, "    conn, _ = srv.accept()\n")
+  sb_push(sb, "    buf = b''\n")
+  sb_push(sb, "    while b'\\n' not in buf:\n")
+  sb_push(sb, "        chunk = conn.recv(65536)\n")
+  sb_push(sb, "        if not chunk:\n")
+  sb_push(sb, "            break\n")
+  sb_push(sb, "        buf += chunk\n")
+  sb_push(sb, "    line = buf.split(b'\\n', 1)[0].decode('utf-8')\n")
+  sb_push(sb, "    try:\n")
+  sb_push(sb, "        req = json.loads(line)\n")
+  sb_push(sb, "        if req.get('cmd') == 'shutdown':\n")
+  sb_push(sb, "            running = False\n")
+  sb_push(sb, "            reply = {'status': 'ok'}\n")
+  sb_push(sb, "        else:\n")
+  sb_push(sb, "            reply = handle(req)\n")
+  sb_push(sb, "    except Exception as e:\n")
+  sb_push(sb, "        reply = {'status': 'error', 'message': str(e)}\n")
+  sb_push(sb, "    conn.sendall((json.dumps(reply) + '\\n').encode('utf-8'))\n")
+  sb_push(sb, "    conn.close()\n")
+  sb_push(sb, "srv.close()\n")
+  return sb_str(sb)
+end
+
+# Starts a persistent worker, blocking (bounded retries) until it's
+# actually listening. Returns [session, status] -- session is
+# [pid, port, ready_file] on success.
+make a function called triton_session_start takes timeout_ms returns r
+  let session_id = to_num(now_ms())
+  let ready_file = triton_session_scratch_dir() + "/_triton_session_" + session_id + ".ready"
+  let script_path = triton_session_scratch_dir() + "/_triton_session_" + session_id + "_worker.py"
+  let script = triton_session_worker_script(ready_file)
+  write_file(script_path, script)
+  let pid = spawn(triton_session_python_exe(), script_path)
+  let waited = 0
+  let poll_interval = 100
+  let looping = true
+  let outcome = ["", ["Err", "timed out waiting for GPU session to become ready"]]
+  while looping do
+    if not is_alive(pid) then
+      let outcome = ["", ["Err", "GPU session worker process exited before becoming ready"]]
+      let looping = false
+    elif file_exists(ready_file) == "1" then
+      let contents = read_file(ready_file)
+      let port = to_num(contents)
+      let outcome = [[pid, port, ready_file], ["Ok", ""]]
+      let looping = false
+    elif waited >= to_num(timeout_ms) then
+      let looping = false
+    else
+      sleep_ms(poll_interval)
+      let waited = waited + poll_interval
+    end
+  end
+  return outcome
+end
+
+# One request/reply round trip: `req_obj` is a PatLang value already
+# shaped to become the JSON request body (via json_make_obj/json_make_
+# str/etc from json.patlang); returns the parsed JSON reply value.
+make a function called triton_session_call takes session, req_json_text returns reply
+  let port = session[1]
+  let conn = tcp_connect("127.0.0.1", port)
+  tcp_write(conn, req_json_text + "\n")
+  let line = tcp_read(conn)
+  tcp_close(conn)
+  return json_parse(line)
+end
+
+# Defines a kernel once (lowered via lib/lower_triton.patlang exactly
+# like every one-shot triton_run_* function), reusable across many
+# subsequent triton_session_launch calls without re-lowering or
+# re-exec'ing its Python source. Returns ["Ok",""] or ["Err", message].
+make a function called triton_session_define takes session, kernel_src, kernel_name returns status
+  let lowered = triton_lower_kernel_source(kernel_src, kernel_name)
+  if lowered[1][0] == "Err" then
+    return lowered[1]
+  end
+  let strategy = "elementwise"
+  if triton_src_has_reduction(kernel_src) then
+    let strategy = "reduction"
+  end
+  let req = "{\"cmd\": \"define\", \"name\": " + json_quote(kernel_name) + ", \"source\": " + json_quote(lowered[0]) + ", \"block_strategy\": " + json_quote(strategy) + "}"
+  let reply = triton_session_call(session, req)
+  let st = json_str(json_get(reply, "status"))
+  if st == "ok" then
+    return ["Ok", ""]
+  end
+  return ["Err", json_str(json_get(reply, "message"))]
+end
+
+# Uploads `data` (a PatLang number-list) to the GPU as a named, resident
+# tensor -- stays there across launches until overwritten or the session
+# stops. Returns ["Ok",""] or ["Err", message].
+make a function called triton_session_store takes session, tensor_name, data returns status
+  let req = "{\"cmd\": \"store\", \"name\": " + json_quote(tensor_name) + ", \"data\": " + triton_num_list_json(data) + "}"
+  let reply = triton_session_call(session, req)
+  let st = json_str(json_get(reply, "status"))
+  if st == "ok" then
+    return ["Ok", ""]
+  end
+  return ["Err", json_str(json_get(reply, "message"))]
+end
+
+# Launches an already-defined kernel against already-stored tensor names
+# -- NO array data crosses the wire for this call, only names; this is
+# the actual point of a session (chaining kernel B's input directly off
+# kernel A's output tensor name, entirely on-device). Returns
+# ["Ok",""] or ["Err", message].
+make a function called triton_session_launch takes session, kernel_name, arg_tensor_names returns status
+  let sb = sb_new()
+  sb_push(sb, "[")
+  let n = to_num(list_len(arg_tensor_names))
+  let i = 0
+  while i < n do
+    if i > 0 then
+      sb_push(sb, ", ")
+    end
+    sb_push(sb, json_quote(arg_tensor_names[i]))
+    let i = i + 1
+  end
+  sb_push(sb, "]")
+  let req = "{\"cmd\": \"launch\", \"kernel\": " + json_quote(kernel_name) + ", \"args\": " + sb_str(sb) + "}"
+  let reply = triton_session_call(session, req)
+  let st = json_str(json_get(reply, "status"))
+  if st == "ok" then
+    return ["Ok", ""]
+  end
+  return ["Err", json_str(json_get(reply, "message"))]
+end
+
+# Downloads a named resident tensor back to a PatLang number-list.
+# Returns [result_list, status].
+make a function called triton_session_fetch takes session, tensor_name returns r
+  let req = "{\"cmd\": \"fetch\", \"name\": " + json_quote(tensor_name) + "}"
+  let reply = triton_session_call(session, req)
+  let st = json_str(json_get(reply, "status"))
+  if st != "ok" then
+    return [[], ["Err", json_str(json_get(reply, "message"))]]
+  end
+  let items = json_arr(json_get(reply, "data"))
+  let result = []
+  let m = to_num(list_len(items))
+  let k = 0
+  while k < m do
+    let result = list_push(result, json_num(items[k]))
+    let k = k + 1
+  end
+  return [result, ["Ok", ""]]
+end
+
+# Cleanly stops the worker process (sends "shutdown", lets it exit on its
+# own rather than kill()ing it). Deliberately does NOT remove the
+# ready-file: remove_file is legacy compiler-meta tooling (interp.
+# patlang's own header groups it with patc_compile_from_argv/rustc_build
+# as "half debug-scaffolding", not a general-purpose primitive every
+# compiled program can rely on) -- leaving a tiny leftover text file in
+# the scratch dir is a harmless, already-established tolerance elsewhere
+# in this codebase (every triton_run_* function's generated .py scripts
+# are left in self_hosting/build/ too, not auto-cleaned).
+make a function called triton_session_stop takes session returns done
+  let port = session[1]
+  let conn = tcp_connect("127.0.0.1", port)
+  tcp_write(conn, "{\"cmd\": \"shutdown\"}\n")
+  tcp_read_or_empty(conn)
+  tcp_close(conn)
+  return true
+end
