@@ -1,0 +1,179 @@
+# Marks ordinary PatLang functions as GPU-lowerable, so a single source
+# file can hold "normal" CPU-running code alongside GPU-lowered kernels,
+# with NO new grammar and NO change to patc1.exe's compile path.
+#
+# A kernel is marked by a plain comment pragma directly above its
+# definition:
+#
+#   # @gpu_kernel
+#   make a function called add_kernel takes x, y, out
+#     store(out, offs, x[offs] + y[offs])
+#   end
+#
+#   # @gpu_kernel_2d
+#   make a function called add2d_kernel takes x, y, out
+#     store(out, offs, x[offs] + y[offs])
+#   end
+#
+# The marked function is ALSO ordinary, fully valid PatLang -- patc1.exe
+# compiles and can call it as real CPU code with zero special handling.
+# The marker only matters to THIS file's scanner, which is a TEXT-level
+# pass over source lines (not an AST pass), matching this codebase's own
+# include-expansion style (lib/includes.patlang's expand_includes is
+# likewise line-based). One source of truth serves both the CPU-native
+# and GPU-lowered execution paths -- no duplicated kernel logic.
+#
+# Self-source lookup (chosen for now, deliberately kept swappable): a
+# running program reads ITS OWN .patlang source via read_file and a
+# zero-arg getter naming its own path (same pattern as triton.patlang's
+# triton_python_exe()/triton_scratch_dir()), then builds a registry via
+# gpu_extract_marked_kernels. If a program later wants to avoid self-
+# reading its own source (e.g. once compiled, or reading from multiple
+# files), swap ONLY the outer glue (gpu_load_own_kernels) for an explicit
+# per-kernel registration call -- gpu_extract_marked_kernels itself
+# (source text -> registry) does not need to change either way, since it
+# is expressed purely in terms of already-in-hand source text.
+
+include "includes.patlang"
+include "triton.patlang"
+
+make a function called gpu_kernel_marker_mode takes line returns mode
+  let t = str_trim(line)
+  if t == "# @gpu_kernel" then
+    return "1d"
+  elif t == "# @gpu_kernel_2d" then
+    return "2d"
+  else
+    return ""
+  end
+end
+
+# Extracts the function name from a `make a function called NAME takes
+# ...` line (also handles a bare `make a function called NAME returns
+# ...` with no params).
+make a function called gpu_kernel_def_name takes line returns name
+  let prefix = "make a function called "
+  let rest = substr(line, prefix.length, line.length - prefix.length)
+  let sb = sb_new()
+  let n = rest.length
+  let i = 0
+  let done = false
+  while (i < n) and (not done) do
+    if char_code(rest, i) == 32 then
+      let done = true
+    else
+      sb_push(sb, substr(rest, i, 1))
+    end
+    let i = i + 1
+  end
+  return sb_str(sb)
+end
+
+# Scans SOURCE TEXT for @gpu_kernel/@gpu_kernel_2d-marked function
+# definitions and returns a list of [name, mode, source_text] triples.
+# Depth tracking is deliberately simple (if/while open a block, end
+# closes one) since the supported kernel-body subset (lib/lower_triton.
+# patlang's header) never contains nested function defs/closures --
+# exactly the constructs that would need a real parser to track correctly.
+make a function called gpu_extract_marked_kernels takes src returns kernels
+  let lines = split_lines(src)
+  let n = to_num(list_len(lines))
+  let kernels = []
+  let i = 0
+  while i < n do
+    let mode = gpu_kernel_marker_mode(lines[i])
+    if mode != "" then
+      let defLineIdx = i + 1
+      if defLineIdx < n then
+        let defLine = lines[defLineIdx]
+        if str_starts_with(str_trim(defLine), "make a function called ") then
+          let name = gpu_kernel_def_name(str_trim(defLine))
+          let bodySb = sb_new()
+          sb_push(bodySb, defLine)
+          sb_push(bodySb, "\n")
+          let depth = 1
+          let j = defLineIdx + 1
+          let closed = false
+          while (j < n) and (not closed) do
+            let t = str_trim(lines[j])
+            sb_push(bodySb, lines[j])
+            sb_push(bodySb, "\n")
+            if str_starts_with(t, "if ") then
+              let depth = depth + 1
+            elif str_starts_with(t, "while ") then
+              let depth = depth + 1
+            elif t == "end" then
+              let depth = depth - 1
+              if depth == 0 then
+                let closed = true
+              end
+            end
+            let j = j + 1
+          end
+          if closed then
+            let kernels = list_push(kernels, [name, mode, sb_str(bodySb)])
+          end
+          let i = j
+        else
+          let i = i + 1
+        end
+      else
+        let i = i + 1
+      end
+    else
+      let i = i + 1
+    end
+  end
+  return kernels
+end
+
+make a function called gpu_kernel_lookup takes registry, name returns entry
+  let n = to_num(list_len(registry))
+  let i = 0
+  while i < n do
+    if registry[i][0] == name then
+      return registry[i]
+    end
+    let i = i + 1
+  end
+  return []
+end
+
+# Self-source loading, per this session's chosen (swappable) approach:
+# `path` is the running program's own .patlang source path, supplied by
+# the caller (a compiled patc1.exe binary does not retain its own source
+# path, so this can't be fully automatic -- matches the existing
+# triton_python_exe()-style zero-arg-getter convention for "constants" a
+# named function needs, rather than a new native introspection primitive).
+make a function called gpu_load_own_kernels takes path returns registry
+  let src = read_file(path)
+  return gpu_extract_marked_kernels(src)
+end
+
+# Dispatches a 1D-marked kernel by name against `inputs` (see
+# triton_run_kernel_source for the input/output-buffer convention).
+# Returns [result, status] -- ["Err", ...] if the name isn't registered
+# or isn't a 1d kernel, not a crash.
+make a function called gpu_call_1d takes registry, name, inputs returns r
+  let entry = gpu_kernel_lookup(registry, name)
+  if to_num(list_len(entry)) == 0 then
+    return [[], ["Err", "no @gpu_kernel registered under name: " + name]]
+  end
+  if entry[1] != "1d" then
+    return [[], ["Err", name + " is registered as a " + entry[1] + " kernel, not 1d"]]
+  end
+  return triton_run_kernel_source(entry[2], name, inputs)
+end
+
+# Dispatches a 2D-marked kernel by name against `inputs` (flattened
+# row-major, `rows`/`cols` shaped -- see triton_run_kernel_source_2d).
+make a function called gpu_call_2d takes registry, name, rows, cols, inputs returns r
+  let entry = gpu_kernel_lookup(registry, name)
+  if to_num(list_len(entry)) == 0 then
+    return [[], ["Err", "no @gpu_kernel_2d registered under name: " + name]]
+  end
+  if entry[1] != "2d" then
+    return [[], ["Err", name + " is registered as a " + entry[1] + " kernel, not 2d"]]
+  end
+  return triton_run_kernel_source_2d(entry[2], name, rows, cols, inputs)
+end
