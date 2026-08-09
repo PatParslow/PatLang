@@ -404,6 +404,145 @@ make a function called triton_lower_block takes stmts, params, indent, sb return
   return ["Ok", ""]
 end
 
+# ============================================================================
+# Vector-vs-scalar shape checker (closes a real, previously-undocumented
+# gap): Triton requires a Python-level `if`/`elif` condition to be
+# SCALAR/constexpr -- a per-lane VECTOR condition (e.g. `mag2 <= 4.0`
+# where `mag2` was computed from a buffer load) is a genuine Triton
+# compile-time rejection, but until now this lowerer's own subset-checker
+# never caught it: it would happily emit syntactically valid Python that
+# Triton's compiler then rejected, surfaced only as an empty result via
+# exec_capture, not a visible PatLang-side error (exactly the class of
+# bug that shipped silently in the first version of the Mandelbrot demo,
+# see [[patlang-triton-lowering-mandelbrot-timing-demo]] in project
+# memory). `select(cond, a, b)` (-> tl.where) is the correct primitive for
+# any PER-LANE branch; this checker makes an unsupported vector `if`/
+# `elif` a clear rejection at lowering time instead of a silent runtime
+# failure discovered later, if at all.
+#
+# Deliberately conservative in ONE direction only: anything not PROVEN
+# scalar is treated as vector. A false rejection (flagging an actually-
+# safe condition) just means the kernel author uses select() instead --
+# mildly annoying, never wrong. A false ACCEPTANCE (letting a genuinely
+# unsafe vector condition through) is the bug class this exists to
+# prevent, so it is never the default.
+make a function called triton_reduce_fn_is_scalar takes name returns r
+  return triton_reduce_fn_map(name) != ""
+end
+
+make a function called triton_name_in_list takes name, names returns r
+  let n = to_num(list_len(names))
+  let i = 0
+  while i < n do
+    if names[i] == name then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# Walks one expression node, returning true if it is per-lane VECTOR-
+# shaped (unsafe as a bare if/elif condition), false if proven SCALAR.
+# `scalarLocals` is the list of local variable names proven scalar so
+# far (by the top-to-bottom statement walk in triton_check_kernel_shapes)
+# -- any Var not in this list is conservatively treated as vector,
+# including kernel params (always buffers/pointers when dereferenced)
+# and the implicit `offs`/`mask`/`row`/`col` block-scope vars (always
+# genuinely vector-shaped by construction).
+make a function called triton_expr_is_vector takes node, scalarLocals returns is_vec
+  let ty = node[0]
+  if ty == "Num" then
+    return false
+  elif ty == "Bool" then
+    return false
+  elif ty == "Var" then
+    return not triton_name_in_list(node[1], scalarLocals)
+  elif ty == "Index" then
+    return true
+  elif ty == "Bin" then
+    if triton_expr_is_vector(node[2], scalarLocals) then
+      return true
+    end
+    return triton_expr_is_vector(node[3], scalarLocals)
+  elif ty == "Un" then
+    return triton_expr_is_vector(node[2], scalarLocals)
+  elif ty == "Call" then
+    let name = node[1]
+    let args = node[2]
+    if triton_reduce_fn_is_scalar(name) then
+      return false
+    end
+    if name == "select" then
+      if to_num(list_len(args)) < 3 then
+        return true
+      end
+      if triton_expr_is_vector(args[1], scalarLocals) then
+        return true
+      end
+      return triton_expr_is_vector(args[2], scalarLocals)
+    end
+    if triton_math_fn_map(name) != "" then
+      if to_num(list_len(args)) == 0 then
+        return true
+      end
+      return triton_expr_is_vector(args[0], scalarLocals)
+    end
+    return true
+  else
+    return true
+  end
+end
+
+# Single shared-state, top-to-bottom walk of the kernel body tracking
+# which locals are proven scalar so far, rejecting the first vector-
+# conditioned if/elif found. Recurses into If/While bodies updating the
+# SAME shared scalarLocals state (not scope-isolated) -- correct for the
+# flat, single-function-body shape every real kernel here has; a local
+# assigned differently across branches just stays conservatively
+# vector-classified past that point, which is safe (see file header).
+make a function called triton_check_stmt_shapes takes node, scalarLocals returns r
+  let ty = node[0]
+  if ty == "Let" then
+    let isVec = triton_expr_is_vector(node[2], scalarLocals)
+    if not isVec then
+      let scalarLocals = list_push(scalarLocals, node[1])
+    end
+    return [scalarLocals, ["Ok", ""]]
+  elif ty == "If" then
+    if triton_expr_is_vector(node[1], scalarLocals) then
+      return [scalarLocals, ["Err", "if/elif condition is per-lane (vector) shaped -- Triton only allows a scalar/constexpr condition here; use select(cond, a, b) instead"]]
+    end
+    let r1 = triton_check_block_shapes(node[2], scalarLocals)
+    if r1[1][0] == "Err" then
+      return r1
+    end
+    let scalarLocals = r1[0]
+    let r2 = triton_check_block_shapes(node[3], scalarLocals)
+    return r2
+  elif ty == "While" then
+    return triton_check_block_shapes(node[2], scalarLocals)
+  else
+    return [scalarLocals, ["Ok", ""]]
+  end
+end
+
+make a function called triton_check_block_shapes takes stmts, scalarLocals returns r
+  let n = to_num(list_len(stmts))
+  let i = 0
+  while i < n do
+    let step = triton_check_stmt_shapes(stmts[i], scalarLocals)
+    if step[1][0] == "Err" then
+      return step
+    end
+    let scalarLocals = step[0]
+    let i = i + 1
+  end
+  return [scalarLocals, ["Ok", ""]]
+end
+
+# ============================================================================
+
 # Top-level entry point: given a kernel function's PatLang SOURCE TEXT
 # (e.g. the body of a `make a function called ... end` block extracted by
 # the caller), returns [triton_python_source, status] where status is
@@ -424,6 +563,10 @@ make a function called triton_lower_kernel_source takes src, kernel_name returns
   end
   let params = fnNode[2]
   let body = fnNode[3]
+  let shapeCheck = triton_check_block_shapes(body, [])
+  if shapeCheck[1][0] == "Err" then
+    return ["", shapeCheck[1]]
+  end
   let sb = sb_new()
   sb_push(sb, "@triton.jit\n")
   sb_push(sb, "def " + kernel_name + "(")
@@ -480,6 +623,10 @@ make a function called triton_lower_kernel_source_2d takes src, kernel_name retu
   end
   let params = fnNode[2]
   let body = fnNode[3]
+  let shapeCheck = triton_check_block_shapes(body, [])
+  if shapeCheck[1][0] == "Err" then
+    return ["", shapeCheck[1]]
+  end
   let sb = sb_new()
   sb_push(sb, "@triton.jit\n")
   sb_push(sb, "def " + kernel_name + "(")
