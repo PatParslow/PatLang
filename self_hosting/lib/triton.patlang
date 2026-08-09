@@ -275,6 +275,53 @@ make a function called triton_run_kernel_source_autotune takes kernel_src, kerne
   return [result, ["Ok", ""]]
 end
 
+# AST-driven counterpart to triton_run_matmul: `kernel_src` is real
+# PatLang source using the block-pointer primitives (see
+# triton_lower_kernel_source_matmul's own header for the exact shape
+# expected -- `takes a, b, c`, two inputs one output), lowered via
+# lib/lower_triton.patlang instead of the fixed hand-generated kernel.
+# `a`/`b` are flattened row-major number-lists (a: M*K, b: K*N); returns
+# C (M*N, row-major) as [result, status].
+make a function called triton_run_matmul_from_source takes kernel_src, kernel_name, a, b, m, k, n, block_m, block_n, block_k returns r
+  let lowered = triton_lower_kernel_source_matmul(kernel_src, kernel_name)
+  if lowered[1][0] == "Err" then
+    return [[], lowered[1]]
+  end
+  let kernel_py = lowered[0]
+  let mm = to_num(m)
+  let kk = to_num(k)
+  let nn = to_num(n)
+  let bm = to_num(block_m)
+  let bn = to_num(block_n)
+  let bk = to_num(block_k)
+  let sb = sb_new()
+  sb_push(sb, "import torch\nimport triton\nimport triton.language as tl\nimport json\n\n")
+  sb_push(sb, kernel_py)
+  sb_push(sb, "\n")
+  sb_push(sb, "a = torch.tensor(" + triton_num_list_json(a) + ", device='cuda', dtype=torch.float32).reshape(" + mm + ", " + kk + ")\n")
+  sb_push(sb, "b = torch.tensor(" + triton_num_list_json(b) + ", device='cuda', dtype=torch.float32).reshape(" + kk + ", " + nn + ")\n")
+  sb_push(sb, "c = torch.empty((" + mm + ", " + nn + "), device='cuda', dtype=torch.float32)\n")
+  sb_push(sb, "M, K, N = " + mm + ", " + kk + ", " + nn + "\n")
+  sb_push(sb, "BLOCK_M, BLOCK_N, BLOCK_K = " + bm + ", " + bn + ", " + bk + "\n")
+  sb_push(sb, "grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))\n")
+  sb_push(sb, kernel_name + "[grid](a, b, c, M, N, K, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K)\n")
+  sb_push(sb, "print(json.dumps(c.cpu().flatten().tolist()))\n")
+  let script = sb_str(sb)
+  let script_path = triton_scratch_dir() + "/_triton_matmul_from_source.py"
+  write_file(script_path, script)
+  let out = exec_capture(triton_python_exe(), script_path)
+  let parsed = json_parse(out)
+  let items = json_arr(parsed)
+  let result = []
+  let total = to_num(list_len(items))
+  let idx = 0
+  while idx < total do
+    let result = list_push(result, json_num(items[idx]))
+    let idx = idx + 1
+  end
+  return [result, ["Ok", ""]]
+end
+
 # Timed variant of triton_run_kernel_source: runs the SAME lowered kernel
 # `reps` times inside ONE spawned Python process, isolating real kernel
 # compute time from the fixed per-spawn cost (script write + process

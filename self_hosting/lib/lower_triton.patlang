@@ -199,6 +199,97 @@ make a function called triton_lower_call takes name, args, params returns r
     end
     return triton_ok("tl.where(" + a[0] + ")")
   end
+  # Block-pointer primitives: the AST-driven analogue of Slice 3's fixed,
+  # hand-generated matmul kernel -- these let a kernel author write a
+  # real tiled/matmul-shaped kernel as PatLang source (make_block_ptr/
+  # load_block/advance_block/dot/zeros_2d), rather than only ever getting
+  # the ONE canonical matmul shape triton_matmul_kernel_source generates.
+  # Fully generic strided/2D access from arbitrary PatLang, still not
+  # attempted -- this is a fixed, small vocabulary of block-pointer
+  # operations recognized by name, matching every other builtin in this
+  # op-table, not a general block-pointer TYPE the lowerer reasons about.
+  if name == "make_block_ptr" then
+    if to_num(list_len(args)) != 7 then
+      return triton_reject("make_block_ptr(buf, total_rows, total_cols, base_row, base_col, block_rows, block_cols) needs exactly 7 args")
+    end
+    if args[0][0] != "Var" then
+      return triton_reject("make_block_ptr's first arg must be a bare buffer parameter name")
+    end
+    let bufName = args[0][1]
+    let totalRows = triton_lower_expr(args[1], params)
+    if totalRows[1][0] == "Err" then
+      return totalRows
+    end
+    let totalCols = triton_lower_expr(args[2], params)
+    if totalCols[1][0] == "Err" then
+      return totalCols
+    end
+    let baseRow = triton_lower_expr(args[3], params)
+    if baseRow[1][0] == "Err" then
+      return baseRow
+    end
+    let baseCol = triton_lower_expr(args[4], params)
+    if baseCol[1][0] == "Err" then
+      return baseCol
+    end
+    let blockRows = triton_lower_expr(args[5], params)
+    if blockRows[1][0] == "Err" then
+      return blockRows
+    end
+    let blockCols = triton_lower_expr(args[6], params)
+    if blockCols[1][0] == "Err" then
+      return blockCols
+    end
+    return triton_ok("tl.make_block_ptr(base=" + bufName + "_ptr, shape=(" + totalRows[0] + ", " + totalCols[0] + "), strides=(" + totalCols[0] + ", 1), offsets=(" + baseRow[0] + ", " + baseCol[0] + "), block_shape=(" + blockRows[0] + ", " + blockCols[0] + "), order=(1, 0))")
+  end
+  if name == "load_block" then
+    if to_num(list_len(args)) != 1 then
+      return triton_reject("load_block(ptr) needs exactly 1 arg")
+    end
+    let a = triton_lower_expr(args[0], params)
+    if a[1][0] == "Err" then
+      return a
+    end
+    return triton_ok("tl.load(" + a[0] + ", boundary_check=(0, 1), padding_option='zero')")
+  end
+  if name == "advance_block" then
+    if to_num(list_len(args)) != 3 then
+      return triton_reject("advance_block(ptr, delta_row, delta_col) needs exactly 3 args")
+    end
+    let ptr = triton_lower_expr(args[0], params)
+    if ptr[1][0] == "Err" then
+      return ptr
+    end
+    let deltaRow = triton_lower_expr(args[1], params)
+    if deltaRow[1][0] == "Err" then
+      return deltaRow
+    end
+    let deltaCol = triton_lower_expr(args[2], params)
+    if deltaCol[1][0] == "Err" then
+      return deltaCol
+    end
+    return triton_ok("tl.advance(" + ptr[0] + ", (" + deltaRow[0] + ", " + deltaCol[0] + "))")
+  end
+  if name == "dot" then
+    if to_num(list_len(args)) != 3 then
+      return triton_reject("dot(a, b, acc) needs exactly 3 args")
+    end
+    let a = triton_lower_args(args, params)
+    if a[1][0] == "Err" then
+      return a
+    end
+    return triton_ok("tl.dot(" + a[0] + ")")
+  end
+  if name == "zeros_2d" then
+    if to_num(list_len(args)) != 2 then
+      return triton_reject("zeros_2d(rows, cols) needs exactly 2 args")
+    end
+    let a = triton_lower_args(args, params)
+    if a[1][0] == "Err" then
+      return a
+    end
+    return triton_ok("tl.zeros((" + a[0] + "), dtype=tl.float32)")
+  end
   let mathpy = triton_math_fn_map(name)
   if mathpy != "" then
     let a = triton_lower_args(args, params)
@@ -297,6 +388,21 @@ make a function called triton_lower_stmt takes node, params, indent, sb returns 
       sb_push(sb, pad + e[0] + "\n")
       return ["Ok", ""]
     end
+    if call[1] == "store_block" then
+      if to_num(list_len(call[2])) != 2 then
+        return ["Err", "store_block(ptr, value) needs exactly 2 args"]
+      end
+      let ptr = triton_lower_expr(call[2][0], params)
+      if ptr[1][0] == "Err" then
+        return ptr[1]
+      end
+      let val = triton_lower_expr(call[2][1], params)
+      if val[1][0] == "Err" then
+        return val[1]
+      end
+      sb_push(sb, pad + "tl.store(" + ptr[0] + ", " + val[0] + ", boundary_check=(0, 1))\n")
+      return ["Ok", ""]
+    end
     return ["Err", "unsupported call statement in kernel body: " + call[1]]
   elif ty == "If" then
     return triton_reject_unless_ok(triton_lower_if(node, params, indent, sb))
@@ -377,7 +483,42 @@ make a function called triton_lower_while takes node, params, indent, sb returns
     let pad = pad + " "
     let k = k + 1
   end
-  sb_push(sb, pad + "for " + counter + " in range(" + bound[0] + "):\n")
+  # Step detection: a plain `while i < N do ... end` (no trailing
+  # increment, or a trailing `let i = i + 1`) lowers to `range(bound)`,
+  # step 1, unchanged from before. A non-unit step -- e.g. matmul's
+  # `while k0 < K do ... let k0 = k0 + BLOCK_K end` K-loop -- is detected
+  # by inspecting the body's LAST statement for `let COUNTER = COUNTER +
+  # STEP` and lowered to `range(0, bound, step)` instead. Assumes the
+  # counter always starts at 0 (true of every kernel body written so far,
+  # matching the existing `let i = 0` convention right before the while)
+  # -- not re-derived from that statement, kept simple on purpose.
+  let bodyLen = to_num(list_len(node[2]))
+  let step = ""
+  if bodyLen > 0 then
+    let lastStmt = node[2][bodyLen - 1]
+    if lastStmt[0] == "Let" then
+      if lastStmt[1] == counter then
+        let rhs = lastStmt[2]
+        if rhs[0] == "Bin" then
+          if rhs[1] == "+" then
+            if rhs[2][0] == "Var" then
+              if rhs[2][1] == counter then
+                let stepLowered = triton_lower_expr(rhs[3], params)
+                if stepLowered[1][0] == "Ok" then
+                  let step = stepLowered[0]
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  if step == "" then
+    sb_push(sb, pad + "for " + counter + " in range(" + bound[0] + "):\n")
+  else
+    sb_push(sb, pad + "for " + counter + " in range(0, " + bound[0] + ", " + step + "):\n")
+  end
   return triton_lower_block(node[2], params, indent + 4, sb)
 end
 
@@ -759,4 +900,74 @@ make a function called triton_matmul_kernel_source takes kernel_name, m, n, k, b
   sb_push(sb, "    c_block_ptr = tl.make_block_ptr(base=c_ptr, shape=(M, N), strides=(N, 1), offsets=(pid_m * BLOCK_M, pid_n * BLOCK_N), block_shape=(BLOCK_M, BLOCK_N), order=(1, 0))\n")
   sb_push(sb, "    tl.store(c_block_ptr, acc, boundary_check=(0, 1))\n")
   return sb_str(sb)
+end
+
+# AST-driven counterpart to triton_matmul_kernel_source above: a kernel
+# body written in real PatLang source using the block-pointer primitives
+# (make_block_ptr/load_block/advance_block/dot/zeros_2d/store_block) is
+# walked and lowered, instead of only ever getting the one fixed,
+# hand-generated matmul shape. Implicit block-scope vars available to the
+# kernel body: `M`, `N`, `K` (runtime sizes), `BLOCK_M`/`BLOCK_N`/
+# `BLOCK_K` (constexpr tile sizes), `pid_m`/`pid_n` (this program's tile
+# coordinates) -- same "implicit preamble variables" convention as
+# `offs`/`mask` for the elementwise 1D/2D entry points. A genuinely
+# generic PatLang matmul kernel now looks like:
+#   make a function called my_matmul takes a, b, c
+#     let a_tile_ptr = make_block_ptr(a, M, K, pid_m * BLOCK_M, 0, BLOCK_M, BLOCK_K)
+#     let b_tile_ptr = make_block_ptr(b, K, N, 0, pid_n * BLOCK_N, BLOCK_K, BLOCK_N)
+#     let acc = zeros_2d(BLOCK_M, BLOCK_N)
+#     let k0 = 0
+#     while k0 < K do
+#       let acc = dot(load_block(a_tile_ptr), load_block(b_tile_ptr), acc)
+#       let a_tile_ptr = advance_block(a_tile_ptr, 0, BLOCK_K)
+#       let b_tile_ptr = advance_block(b_tile_ptr, BLOCK_K, 0)
+#       let k0 = k0 + BLOCK_K
+#     end
+#     let c_tile_ptr = make_block_ptr(c, M, N, pid_m * BLOCK_M, pid_n * BLOCK_N, BLOCK_M, BLOCK_N)
+#     store_block(c_tile_ptr, acc)
+#   end
+# Reuses triton_lower_while's non-unit-step detection (added alongside
+# this) for the `let k0 = k0 + BLOCK_K` K-loop -- a plain range(bound)
+# assumption (step 1) would silently iterate BLOCK_K times too many.
+make a function called triton_lower_kernel_source_matmul takes src, kernel_name returns r
+  let toks = tokenize(src)
+  let program = parse_program(toks)
+  let stmts = program[1]
+  let n = to_num(list_len(stmts))
+  if n == 0 then
+    return ["", ["Err", "empty kernel source"]]
+  end
+  let fnNode = stmts[0]
+  if fnNode[0] != "Func" then
+    return ["", ["Err", "kernel source must be a single function definition"]]
+  end
+  let params = fnNode[2]
+  let body = fnNode[3]
+  let shapeCheck = triton_check_block_shapes(body, [])
+  if shapeCheck[1][0] == "Err" then
+    return ["", shapeCheck[1]]
+  end
+  let sb = sb_new()
+  sb_push(sb, "@triton.jit\n")
+  sb_push(sb, "def " + kernel_name + "(")
+  let np = to_num(list_len(params))
+  let i = 0
+  while i < np do
+    if i > 0 then
+      sb_push(sb, ", ")
+    end
+    sb_push(sb, params[i] + "_ptr")
+    let i = i + 1
+  end
+  if np > 0 then
+    sb_push(sb, ", ")
+  end
+  sb_push(sb, "M, N, K, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):\n")
+  sb_push(sb, "    pid_m = tl.program_id(0)\n")
+  sb_push(sb, "    pid_n = tl.program_id(1)\n")
+  let status = triton_lower_block(body, params, 4, sb)
+  if status[0] == "Err" then
+    return ["", status]
+  end
+  return [sb_str(sb), ["Ok", ""]]
 end
