@@ -1,0 +1,141 @@
+# friendly_cli's own top-level binary: a thin, standalone consumer of
+# self_hosting/lib/console.patlang's embeddable core. This file owns only
+# what's genuinely specific to running as a standalone process -- a
+# blocking stdin loop and the small set of built-in meta-commands
+# (help/status/history/heal-config, per routemap.md) -- everything else
+# (command dispatch, self-healing hand-off, dual-mode output) lives in
+# the shared stdlib modules and is exercised identically by any other
+# PatLang program that embeds console.patlang directly instead (see
+# friendly_cli/embed_demo.patlang for a real, separate proof of that).
+#
+# Self-healing hand-off is deliberately left UNCONFIGURED here (heal_fn
+# stays ""), not wired to self_healing_engine.patlang's
+# heal_missing_function. That's a real, considered choice, not an
+# oversight: heal_missing_function's RED/GREEN cycle needs a concrete
+# test fixture (test_file, test_arg, expected_result) to write a BDD spec
+# against and verify a candidate implementation with -- a bare command
+# name the user typed at the prompt doesn't supply one. Wiring it up
+# anyway would either fabricate a fixture from nothing (dishonest -- the
+# engine would be "verifying" against a guess of what the command should
+# do) or silently do nothing useful. A real terminal-command synthesis
+# flow -- draft a candidate implementation AND a test fixture for it,
+# THEN hand both to heal_missing_function -- is real, separate future
+# work; `heal-config` (below) explains this to whoever asks. The
+# pluggable hand-off mechanism itself is proven working, independent of
+# this gap, by self_hosting/examples/console_bdd_demo.patlang's fake
+# heal_fn scenarios.
+
+include "../self_hosting/lib/includes.patlang"
+include "../self_hosting/lib/console.patlang"
+include "../self_hosting/lib/proc.patlang"
+include "../self_hosting/lib/output.patlang"
+include "lib/command_safety.patlang"
+include "dsl/shell_ops.patlang"
+
+# ---- built-in meta-commands ----
+
+make a function called tm_help returns ok
+  print("friendly_cli -- a terminal you can also embed.")
+  print("Built-in commands: help, status, history, heal-config, exit, quit.")
+  print("Anything else is tried as a real command, gated by command_safety.patlang's classification.")
+  return true
+end
+
+make a function called tm_status returns ok
+  let heal_fn = get("__vars", "terminal_heal_fn")
+  if heal_fn == "" then
+    print("self-healing hand-off: not configured (see 'heal-config')")
+  else
+    print("self-healing hand-off: " + heal_fn)
+  end
+  let hist = get("__vars", "terminal_history")
+  print("" + hist.length + " command(s) run this session")
+  return true
+end
+
+make a function called tm_history returns ok
+  let hist = get("__vars", "terminal_history")
+  let i = 0
+  while i < hist.length do
+    print("" + (i + 1) + ": " + hist[i])
+    let i = i + 1
+  end
+  return true
+end
+
+make a function called tm_heal_config returns ok
+  print("Self-healing hand-off is pluggable (self_hosting/lib/console.patlang, console_with_heal_fn).")
+  print("friendly_cli does not wire it to self_healing_engine.patlang's heal_missing_function for arbitrary")
+  print("typed commands: that engine's RED/GREEN cycle needs a concrete test fixture to verify a synthesized")
+  print("implementation against, which a bare command typo does not supply. Not configured in this session.")
+  return true
+end
+
+make a function called tm_builtin_table returns table
+  return [
+    ["help", "tm_help"],
+    ["status", "tm_status"],
+    ["history", "tm_history"],
+    ["heal-config", "tm_heal_config"]
+  ]
+end
+
+# tm_dispatch_table_for(trimmed_line) -> the built-ins, plus (if the
+# typed command isn't one of them) a dynamic entry routing it to
+# shell_ops_run -- built fresh per line, exactly as console.patlang's
+# own HANDLER CONTRACT comment describes dispatch_table being caller-
+# owned and swappable per call.
+make a function called tm_dispatch_table_for takes trimmed_line returns table
+  let table = tm_builtin_table()
+  let tokens = console_tokenize(trimmed_line)
+  if tokens.length > 0 then
+    let cmd_name = tokens[0]
+    if console_lookup_handler(table, cmd_name) == "" then
+      let table = list_push(table, [cmd_name, "shell_ops_run"])
+    end
+  end
+  return table
+end
+
+# ---- the blocking stdin loop ----
+
+make a function called tm_run returns done
+  set_var("terminal_history", [])
+  set_var("terminal_heal_fn", "")
+  let state = console_new_state("interactive")
+  print("friendly_cli terminal. Type 'help' for built-in commands, 'exit' to quit.")
+  let running = true
+  while running do
+    # No no-newline print host function exists yet, so the prompt
+    # lands on its own line rather than inline before input -- a real,
+    # cosmetic gap, not worth a Rust-level change for.
+    print("friendly_cli>")
+    let line = read_line()
+    # read_line() itself can't tell an EOF (piped/closed stdin) apart
+    # from the user pressing Enter on a blank line -- both return "" --
+    # so an empty line is treated as exit too, not just "exit"/"quit".
+    # A real gap in read_line's own signature, not fabricated here: this
+    # is the pragmatic call so a piped/scripted session terminates
+    # instead of looping forever re-processing "" as a no-op step.
+    if (line == "exit") or (line == "quit") or (line == "") then
+      let running = false
+    else
+      let trimmed = str_trim(line)
+      if trimmed != "" then
+        let hist = get("__vars", "terminal_history")
+        set_var("terminal_history", list_push(hist, trimmed))
+      end
+      let table = tm_dispatch_table_for(trimmed)
+      let result = console_step(state, line, table)
+      let state = cs_result_state(result)
+      let output = cs_result_output(result)
+      if output != "" then
+        print(output)
+      end
+    end
+  end
+  print("goodbye.")
+  return true
+end
+
+tm_run()

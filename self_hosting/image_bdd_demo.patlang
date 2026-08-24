@@ -1,0 +1,412 @@
+# BDD regression coverage for the image-decoding/Sixel-rendering
+# pipeline (image.patlang + image_bmp.patlang). Native --x64 ONLY --
+# image.patlang itself uses raw heap memory (mem_peek_byte/
+# rt_heap_alloc), which has no interpreter-backend equivalent, so this
+# spec must be compiled and run as a real .exe, not run via
+# `pat --ir-run`:
+#
+#   patc1 self_hosting/image_bdd_demo.patlang self_hosting/build/image_bdd_demo.exe --x64
+#   self_hosting/build/image_bdd_demo.exe
+#
+# Exercises the exact real bug found building this feature: PatLang's
+# `/` is exact-rational division, not truncating, which silently
+# corrupted padded-row-stride math without ever crashing on its own
+# (fixed via floor(), see image.patlang/x64_runtime.patlang's own
+# headers) -- checked here via full-image pixel comparison against
+# known-correct fixtures, not just "did it crash."
+
+include "lib/includes.patlang"
+include "lib/test.patlang"
+include "lib/image.patlang"
+include "lib/image_bmp.patlang"
+include "lib/image_png.patlang"
+include "lib/inflate.patlang"
+
+# ---- fixtures ----
+#
+# _probe_test.bmp: 4x4, 32-bit direct-color, top row red/green/blue/
+# yellow, rows 1-3 uniform (128,64,32) -- built via .NET
+# System.Drawing.Bitmap, confirmed 32bpp not 24bpp.
+#
+# _probe_test_1bpp.bmp: 4x4, 1-bit palette-indexed (2-color: black/
+# white), hand-crafted byte-for-byte (not via a library, to guarantee
+# an exact known pixel layout with no dithering/conversion surprises)
+# with a diagonal pattern (white where x==y, black elsewhere) --
+# deliberately asymmetric row-to-row so a row-order/bit-order bug would
+# show up as a mismatch, unlike a checkerboard which some such bugs
+# would pass by coincidence. Added directly from a live user report:
+# a real screenshot BMP turned out to be 1bpp, which the decoder
+# originally rejected outright (see image_bmp.patlang's own header).
+
+make a function called ibd_direct_bmp_path returns path
+  return "self_hosting/build/_probe_test.bmp"
+end
+
+make a function called ibd_indexed_bmp_path returns path
+  return "self_hosting/build/_probe_test_1bpp.bmp"
+end
+
+# _probe_test.png / _probe_test_alpha.png: real PNGs written by .NET's
+# System.Drawing PNG encoder (an independent implementation from this
+# module's own decoder -- a real cross-implementation check, not
+# self-consistency). _probe_test.png mirrors _probe_test.bmp's own
+# layout (red/green/blue/yellow top row, uniform (128,64,32) below) so
+# both decoders are checked against the exact same expected pixel
+# values. _probe_test_alpha.png is a 2x2 RGBA image with four different
+# alpha levels (255/128/0/64) specifically to exercise this decoder's
+# alpha-onto-black compositing math (see image_png.patlang's own
+# header for why black).
+# _probe_test_manycolors.bmp: 20x20, 281 distinct colors -- a 20x14
+# noisy top region (280 near-unique colors, at most a couple pixels
+# each) plus a 20x6 solid bottom block (120 pixels of one color). This
+# is the exact shape of the live-reported "colours get slightly
+# corrupted" bug: with a 256-color budget and the OLD first-seen-scan-
+# order palette, the noisy top region alone would exhaust the entire
+# budget before the scan ever reached the solid block, leaving it
+# nearest-matched against noise instead of its own real color. The
+# solid block's 120-pixel count makes it by far the single most
+# popular color in the image (every noise pixel is otherwise unique or
+# near-unique) -- the new popularity-weighted quantizer MUST include
+# it in the final palette regardless of scan position, which is
+# exactly what this fixture checks.
+make a function called ibd_manycolors_bmp_path returns path
+  return "self_hosting/build/_probe_test_manycolors.bmp"
+end
+
+# _probe_test_toonoisy.bmp: 200x200 uniform-random noise (guaranteed
+# by construction to have close to one distinct color per pixel) --
+# small enough to process quickly, but with a worst-case total-run
+# count (up to 34 bands * up to 1200 max colors/band = 40800) safely
+# over img_truecolor_feasible's 20000 cap regardless of RNG luck. This
+# is the real bug's shape (img_to_sixel_truecolor crashing on a real
+# photo via millions of throwaway per-pixel allocations, see image.
+# patlang's own header on img_to_sixel_truecolor) shrunk down to
+# something a regression suite can run in well under a second, instead
+# of needing the actual multi-second real photo that crashed it.
+make a function called ibd_toonoisy_bmp_path returns path
+  return "self_hosting/build/_probe_test_toonoisy.bmp"
+end
+
+make a function called ibd_png_path returns path
+  return "self_hosting/build/_probe_test.png"
+end
+
+make a function called ibd_png_alpha_path returns path
+  return "self_hosting/build/_probe_test_alpha.png"
+end
+
+# _probe_zlib_input.bin / _probe_zlib_expected.bin: a real zlib stream
+# (942 bytes of repetitive text, compressed to 78 bytes by .NET's
+# ZLibStream -- an independent DEFLATE encoder from this module's own
+# decoder) and its known-correct decompressed content, specifically
+# exercising DYNAMIC Huffman blocks with real LZ77 back-references
+# (the highly repetitive input all but guarantees at least one match).
+# _probe_zlib_input2.bin / _probe_zlib_expected2.bin: 50 random bytes
+# compressed at NoCompression level, exercising DEFLATE's stored
+# (uncompressed) block path instead.
+make a function called ibd_zlib_dynamic_input_path returns path
+  return "self_hosting/build/_probe_zlib_input.bin"
+end
+
+make a function called ibd_zlib_dynamic_expected_path returns path
+  return "self_hosting/build/_probe_zlib_expected.bin"
+end
+
+make a function called ibd_zlib_stored_input_path returns path
+  return "self_hosting/build/_probe_zlib_input2.bin"
+end
+
+make a function called ibd_zlib_stored_expected_path returns path
+  return "self_hosting/build/_probe_zlib_expected2.bin"
+end
+
+# ---- step definitions ----
+
+make a function called st_ibd_decode_direct_bmp returns done
+  let bytes = read_file(ibd_direct_bmp_path())
+  set_var("ibd_direct_img", bmp_decode(bytes))
+  return true
+end
+
+make a function called st_ibd_direct_bmp_pixels_match returns done
+  let img = get("__vars", "ibd_direct_img")
+  check("32-bit BMP decodes to a real image, not a failure", img.length == 0, false)
+  check("decoded dimensions match the real file (4x4)", (img_width(img) == 4) and (img_height(img) == 4), true)
+  let expect = [[255,0,0], [0,255,0], [0,0,255], [255,255,0]]
+  let x = 0
+  let top_row_ok = true
+  while x < 4 do
+    let px = img_get_pixel(img, x, 0)
+    let want = expect[x]
+    if (px[0] != want[0]) or (px[1] != want[1]) or (px[2] != want[2]) then
+      let top_row_ok = false
+    end
+    let x = x + 1
+  end
+  check("top row is exactly red, green, blue, yellow", top_row_ok, true)
+  let bg = img_get_pixel(img, 0, 1)
+  check("background rows are exactly (128,64,32)", (bg[0] == 128) and (bg[1] == 64) and (bg[2] == 32), true)
+  return true
+end
+
+make a function called st_ibd_decode_indexed_bmp returns done
+  let bytes = read_file(ibd_indexed_bmp_path())
+  set_var("ibd_indexed_img", bmp_decode(bytes))
+  return true
+end
+
+make a function called st_ibd_indexed_bmp_pixels_match returns done
+  let img = get("__vars", "ibd_indexed_img")
+  check("1-bit indexed BMP decodes to a real image, not a failure", img.length == 0, false)
+  check("decoded dimensions match the real file (4x4)", (img_width(img) == 4) and (img_height(img) == 4), true)
+  let all_ok = true
+  let y = 0
+  while y < 4 do
+    let x = 0
+    while x < 4 do
+      let px = img_get_pixel(img, x, y)
+      let want = 0
+      if x == y then
+        let want = 255
+      end
+      if (px[0] != want) or (px[1] != want) or (px[2] != want) then
+        let all_ok = false
+      end
+      let x = x + 1
+    end
+    let y = y + 1
+  end
+  check("the diagonal pattern decodes exactly right, palette resolved and row order correct", all_ok, true)
+  return true
+end
+
+# ---- inflate (raw DEFLATE/zlib decompression) ----
+
+make a function called ibd_inflate_check takes label, compressed_path, expected_path returns ok
+  let compressed = read_file(compressed_path)
+  let expected = read_file(expected_path)
+  let out_buf = rt_heap_alloc(expected.length + 16)
+  let n = zlib_inflate_to_buffer(compressed, out_buf, expected.length)
+  check(label + ": decompressed length matches", n == expected.length, true)
+  if n != expected.length then
+    return false
+  end
+  let i = 0
+  let all_match = true
+  while i < expected.length do
+    if mem_peek_byte(out_buf, i) != char_code(expected, i) then
+      let all_match = false
+    end
+    let i = i + 1
+  end
+  check(label + ": every decompressed byte matches the real, independently-compressed original", all_match, true)
+  return true
+end
+
+make a function called st_ibd_inflate_dynamic_huffman returns done
+  ibd_inflate_check("dynamic-huffman zlib stream", ibd_zlib_dynamic_input_path(), ibd_zlib_dynamic_expected_path())
+  return true
+end
+
+make a function called st_ibd_inflate_stored_block returns done
+  ibd_inflate_check("stored-block zlib stream", ibd_zlib_stored_input_path(), ibd_zlib_stored_expected_path())
+  return true
+end
+
+# ---- PNG ----
+
+make a function called st_ibd_decode_png returns done
+  let bytes = read_file(ibd_png_path())
+  set_var("ibd_png_img", png_decode(bytes))
+  return true
+end
+
+make a function called st_ibd_png_pixels_match returns done
+  let img = get("__vars", "ibd_png_img")
+  check("PNG decodes to a real image, not a failure", img.length == 0, false)
+  check("decoded dimensions match the real file (4x4)", (img_width(img) == 4) and (img_height(img) == 4), true)
+  let expect = [[255,0,0], [0,255,0], [0,0,255], [255,255,0]]
+  let x = 0
+  let top_row_ok = true
+  while x < 4 do
+    let px = img_get_pixel(img, x, 0)
+    let want = expect[x]
+    if (px[0] != want[0]) or (px[1] != want[1]) or (px[2] != want[2]) then
+      let top_row_ok = false
+    end
+    let x = x + 1
+  end
+  check("top row is exactly red, green, blue, yellow (real DEFLATE + filter-reconstruction round trip)", top_row_ok, true)
+  let bg = img_get_pixel(img, 0, 1)
+  check("background rows are exactly (128,64,32)", (bg[0] == 128) and (bg[1] == 64) and (bg[2] == 32), true)
+  return true
+end
+
+make a function called st_ibd_decode_png_alpha returns done
+  let bytes = read_file(ibd_png_alpha_path())
+  set_var("ibd_png_alpha_img", png_decode(bytes))
+  return true
+end
+
+make a function called st_ibd_png_alpha_composited_correctly returns done
+  let img = get("__vars", "ibd_png_alpha_img")
+  check("RGBA PNG decodes to a real image, not a failure", img.length == 0, false)
+  let p_opaque = img_get_pixel(img, 0, 0)
+  check("alpha=255 composites to the exact original color", (p_opaque[0] == 200) and (p_opaque[1] == 0) and (p_opaque[2] == 0), true)
+  let p_half = img_get_pixel(img, 1, 0)
+  check("alpha=128 composites to floor(200*128/255)=100 on the red channel", p_half[0] == 100, true)
+  let p_transparent = img_get_pixel(img, 0, 1)
+  check("alpha=0 composites to pure black", (p_transparent[0] == 0) and (p_transparent[1] == 0) and (p_transparent[2] == 0), true)
+  return true
+end
+
+# ---- popularity-weighted palette (the real "colours get slightly
+# corrupted" bug fix) ----
+
+make a function called st_ibd_decode_manycolors returns done
+  let bytes = read_file(ibd_manycolors_bmp_path())
+  set_var("ibd_manycolors_img", bmp_decode(bytes))
+  return true
+end
+
+make a function called st_ibd_manycolors_palette_keeps_popular_color returns done
+  let img = get("__vars", "ibd_manycolors_img")
+  check("the 281-distinct-color fixture decodes to a real image", img.length == 0, false)
+  let px = img_get_pixel(img, 0, 19)
+  check("the solid block's real color is exactly (10,200,30) as decoded (sanity check on the fixture itself)", (px[0] == 10) and (px[1] == 200) and (px[2] == 30), true)
+  let sixel = img_to_sixel(img)
+  let rp = floor((px[0] * 100) / 255)
+  let gp = floor((px[1] * 100) / 255)
+  let bp = floor((px[2] * 100) / 255)
+  check("the 120-pixel solid block, by far the most popular color, survives quantization exactly despite 280 competing noise colors (the exact bug: it used to lose to whatever noise the scan saw first)", contains_text(sixel, ";2;" + rp + ";" + gp + ";" + bp), true)
+  return true
+end
+
+# ---- true color (no quantization at all) ----
+
+make a function called st_ibd_truecolor_exact_on_busy_image returns done
+  let img = get("__vars", "ibd_manycolors_img")
+  let sixel = img_to_sixel_truecolor(img)
+  let all_exact = true
+  let y = 0
+  while y < 14 do
+    let x = 0
+    while x < 20 do
+      let px = img_get_pixel(img, x, y)
+      let rp = floor((px[0] * 100) / 255)
+      let gp = floor((px[1] * 100) / 255)
+      let bp = floor((px[2] * 100) / 255)
+      if contains_text(sixel, ";2;" + rp + ";" + gp + ";" + bp) == false then
+        let all_exact = false
+      end
+      let x = x + 1
+    end
+    let y = y + 1
+  end
+  check("true-color mode preserves every one of the 280 noise-region colors exactly, with no 256-color cap to lose any of them to", all_exact, true)
+  return true
+end
+
+# ---- true-color feasibility guard (the actual crash fix) ----
+
+make a function called st_ibd_truecolor_rejects_infeasible_image returns done
+  let bytes = read_file(ibd_toonoisy_bmp_path())
+  let img = bmp_decode(bytes)
+  check("the 200x200 random-noise fixture decodes to a real image", img.length == 0, false)
+  check("img_truecolor_feasible correctly refuses a genuinely high-entropy image", img_truecolor_feasible(img), false)
+  check("img_show_truecolor refuses to render it (returns false, does not attempt the expensive encode)", img_show_truecolor(img, 640, 400), false)
+  return true
+end
+
+make a function called st_ibd_reject_malformed returns done
+  # Native x64 list `==` is address identity, not structural equality
+  # (unlike the interpreter backend) -- checking `.length == 0` matches
+  # the idiom bmp_decode's own real callers already use, and sidesteps
+  # that difference entirely.
+  let too_short = bmp_decode("BM")
+  check("a too-short buffer is rejected, not crashed on", too_short.length == 0, true)
+  let bad_sig = bmp_decode("PNGxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+  check("a non-BMP signature is rejected", bad_sig.length == 0, true)
+  let bad_png = png_decode("BMxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+  check("a non-PNG signature is rejected by png_decode too", bad_png.length == 0, true)
+  return true
+end
+
+make a function called st_ibd_sixel_output_matches returns done
+  let img = get("__vars", "ibd_direct_img")
+  let sixel = img_to_sixel(img)
+  check("sixel output starts with the DCS q introducer and correct raster size", contains_text(sixel, chr(27) + "Pq\"1;1;4;4"), true)
+  check("sixel output ends with the ST terminator", contains_text(sixel, chr(27) + "\\"), true)
+  # Palette entries are now ordered by the popularity-quantizer's own
+  # bucket-key order (see image.patlang's img_build_palette header),
+  # not first-seen scan order -- so these check for the "N;2;R;G;B"
+  # color definition itself, not a specific "#<index>" prefix.
+  check("red palette percentage is exact (255 -> 100%)", contains_text(sixel, ";2;100;0;0"), true)
+  check("background palette percentage is correctly floored (128,64,32 -> 50%,25%,12%, not the rational-division bug's wrong value)", contains_text(sixel, ";2;50;25;12"), true)
+  return true
+end
+
+make a function called register_ibd_steps returns done
+  step("a 32-bit direct-color BMP is decoded", "st_ibd_decode_direct_bmp")
+  step("the decoded direct-color pixels match the real file exactly", "st_ibd_direct_bmp_pixels_match")
+  step("a 1-bit palette-indexed BMP is decoded", "st_ibd_decode_indexed_bmp")
+  step("the decoded indexed pixels match the real file exactly", "st_ibd_indexed_bmp_pixels_match")
+  step("malformed input is rejected cleanly", "st_ibd_reject_malformed")
+  step("the sixel encoding of the direct-color image is exactly correct", "st_ibd_sixel_output_matches")
+  step("a real zlib stream using dynamic Huffman blocks is inflated", "st_ibd_inflate_dynamic_huffman")
+  step("a real zlib stream using a stored block is inflated", "st_ibd_inflate_stored_block")
+  step("an RGB PNG is decoded", "st_ibd_decode_png")
+  step("the decoded PNG pixels match the real file exactly", "st_ibd_png_pixels_match")
+  step("an RGBA PNG with partial transparency is decoded", "st_ibd_decode_png_alpha")
+  step("the alpha channel is composited onto black correctly", "st_ibd_png_alpha_composited_correctly")
+  step("a 281-distinct-color image is decoded", "st_ibd_decode_manycolors")
+  step("the popularity-weighted palette keeps the dominant color despite many competing colors", "st_ibd_manycolors_palette_keeps_popular_color")
+  step("true-color mode preserves every color exactly on the same busy image", "st_ibd_truecolor_exact_on_busy_image")
+  step("true-color mode refuses a genuinely infeasible image instead of crashing", "st_ibd_truecolor_rejects_infeasible_image")
+  return true
+end
+
+make a function called ibd_feature returns text
+  return "Feature: image decoding and Sixel rendering
+
+Scenario: 32-bit direct-color BMP decodes correctly
+  Given a 32-bit direct-color BMP is decoded
+  Then the decoded direct-color pixels match the real file exactly
+  And the sixel encoding of the direct-color image is exactly correct
+
+Scenario: 1-bit palette-indexed BMP decodes correctly
+  Given a 1-bit palette-indexed BMP is decoded
+  Then the decoded indexed pixels match the real file exactly
+
+Scenario: malformed BMP input is rejected, not crashed on
+  Then malformed input is rejected cleanly
+
+Scenario: raw DEFLATE/zlib decompression is byte-exact against real, independently-compressed data
+  Then a real zlib stream using dynamic Huffman blocks is inflated
+  And a real zlib stream using a stored block is inflated
+
+Scenario: RGB PNG decodes correctly (real DEFLATE + filter reconstruction)
+  Given an RGB PNG is decoded
+  Then the decoded PNG pixels match the real file exactly
+
+Scenario: RGBA PNG alpha compositing is correct
+  Given an RGBA PNG with partial transparency is decoded
+  Then the alpha channel is composited onto black correctly
+
+Scenario: the popularity-weighted quantizer fixes the real color-corruption bug
+  Given a 281-distinct-color image is decoded
+  Then the popularity-weighted palette keeps the dominant color despite many competing colors
+  And true-color mode preserves every color exactly on the same busy image
+  And true-color mode refuses a genuinely infeasible image instead of crashing
+"
+end
+
+make a function called run_ibd_bdd returns ok
+  t_init()
+  register_ibd_steps()
+  run_feature(ibd_feature())
+  t_report()
+  return get("__vars", "t_fail") == 0
+end
+
+run_ibd_bdd()

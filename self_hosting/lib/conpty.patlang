@@ -1,0 +1,75 @@
+# Canvas host, Phase 2: PatLang-level wrappers around the new ConPTY
+# primitives (x64_conpty_*_asm, self_hosting/lib/codegen_x64.patlang).
+# Native --x64 ONLY -- these primitives call raw WinAPI functions with
+# no interpreter-backend equivalent, same scope limit as win32_window.
+# patlang's own primitives.
+#
+# Confirmed 100% greenfield before starting (grepped self_hosting for
+# CreatePseudoConsole/STARTUPINFOEX/InitializeProcThreadAttributeList/
+# UpdateProcThreadAttribute -- zero matches anywhere before this).
+#
+# Single-instance (one pane) for now -- every primitive here operates
+# on ONE persistent ConPTY session (g_conpty_hpc/g_conpty_in_write/
+# g_conpty_out_read/g_conpty_process in codegen_x64.patlang's own
+# .bss), matching win32_window.patlang's own single-window scope.
+# Multi-pane is a Phase 6 concern.
+
+include "includes.patlang"
+
+# str_to_wide(s) -> a fresh UTF-16LE, null-terminated raw heap buffer
+# (untagged address, NOT a PatLang string) holding `s`'s bytes zero-
+# extended one-per-code-unit. ASCII-only scope (Basic Latin code
+# points are numerically identical between ASCII and UTF-16, matching
+# win32_window.patlang's own g_win_class_name/g_win_title scope limit)
+# -- adequate for command lines (program names, file paths, flags),
+# not a general Unicode conversion. Pure byte manipulation, no WinAPI
+# call needed, hence plain PatLang rather than a new asm primitive --
+# matches this whole project's "build in PatLang, not Rust/asm, unless
+# an OS boundary genuinely requires it" discipline. A FRESH buffer
+# every call is deliberate, not incidental: CreateProcessW may mutate
+# its lpCommandLine argument in place (same real constraint
+# x64_os_exec_run_asm's own CreateProcessA call already documented),
+# so a shared/reused buffer would be unsafe here.
+make a function called str_to_wide takes s returns wide_addr
+  let n = s.length
+  let buf = rt_heap_alloc((n + 1) * 2)
+  let i = 0
+  while i < n do
+    let c = char_code(s, i)
+    mem_poke_byte(buf, i * 2, c)
+    mem_poke_byte(buf, i * 2 + 1, 0)
+    let i = i + 1
+  end
+  mem_poke_byte(buf, n * 2, 0)
+  mem_poke_byte(buf, n * 2 + 1, 0)
+  return buf
+end
+
+# conpty_spawn_cmdline(cmdline) -> hProcess (0 on failure). Thin
+# wrapper: converts the command line to wide once, then calls the raw
+# primitive -- callers should use THIS, not conpty_spawn directly,
+# unless they already have a wide buffer of their own for some reason.
+make a function called conpty_spawn_cmdline takes cmdline returns hprocess
+  let wide = str_to_wide(cmdline)
+  return conpty_spawn(wide)
+end
+
+# conpty_write(text) -> done. Extracts the raw address/length from a
+# real PatLang string (the same `[8-byte length][bytes]` layout every
+# string in this backend uses) and forwards it to the raw primitive.
+make a function called conpty_write takes text returns done
+  let addr = text band rt_payload_mask()
+  let len = mem_peek_qword(addr, 0)
+  let data_addr = addr + 8
+  conpty_write_raw(data_addr, len)
+  return true
+end
+
+# conpty_read(max_len) -> a real PatLang string (possibly empty, never
+# blocks) -- tags conpty_read_nonblocking's own raw buffer address,
+# same layered convention x64_runtime.patlang's own exec_capture_io
+# already uses for os_exec_run's raw result.
+make a function called conpty_read takes max_len returns text
+  let raw = conpty_read_nonblocking(max_len)
+  return raw bor rt_string_tag()
+end

@@ -3754,6 +3754,7 @@ fn host_call_contracts(name: &str, args: &[Value]) -> Option<Result<Value, Strin
     static CONNS: RefCell<HashMap<usize, std::net::TcpStream>> = RefCell::new(HashMap::new());
     static NEXT_CONN: RefCell<usize> = RefCell::new(1);
     static CHILD_PROCS: RefCell<HashMap<u32, std::process::Child>> = RefCell::new(HashMap::new());
+    static NEXT_PROC_ID: RefCell<u32> = RefCell::new(1);
 }
 
 fn host_call_networking_inner(name: &str, args: &[Value]) -> Result<Value, String> {
@@ -3924,15 +3925,30 @@ fn host_call_networking_inner(name: &str, args: &[Value]) -> Result<Value, Strin
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .spawn().map_err(|e| format!("spawn: {}: {}", path, e))?;
-                let pid = child.id();
-                CHILD_PROCS.with(|c| c.borrow_mut().insert(pid, child));
-                Ok(Value::Int(pid as i64))
+                // Keyed by a synthetic, monotonically-increasing id, NOT the
+                // real OS pid (child.id()) -- found and fixed during the
+                // friendly_cli tab-completion/native-compile work: a batch
+                // of many short-lived child processes (nasm.exe, one per
+                // function in x64_compile_unit.patlang's per-function
+                // ObjCache) reproducibly hit "wait: unknown or already-
+                // reaped pid" once enough of them ran concurrently -- Windows
+                // reusing a just-freed OS pid for a newly spawned process
+                // before this map's own earlier entry for that pid had been
+                // removed, so a later insert silently overwrote it and a
+                // still-pending wait() for the original process found nothing
+                // (or waited on the wrong child). A synthetic id can never
+                // collide within one process's lifetime, matching the same
+                // fix already used for connection ids just above (NEXT_CONN)
+                // for the identical class of problem.
+                let id = NEXT_PROC_ID.with(|n| { let mut b = n.borrow_mut(); let v = *b; *b += 1; v });
+                CHILD_PROCS.with(|c| c.borrow_mut().insert(id, child));
+                Ok(Value::Int(id as i64))
             }
             "is_alive" => {
-                let pid = arg_num(&args, 0, "is_alive")? as u32;
+                let id = arg_num(&args, 0, "is_alive")? as u32;
                 let alive = CHILD_PROCS.with(|c| {
                     let mut b = c.borrow_mut();
-                    match b.get_mut(&pid) {
+                    match b.get_mut(&id) {
                         Some(child) => matches!(child.try_wait(), Ok(None)),
                         None => false,
                     }
@@ -3940,19 +3956,19 @@ fn host_call_networking_inner(name: &str, args: &[Value]) -> Result<Value, Strin
                 Ok(Value::Bool(alive))
             }
             "wait" => {
-                let pid = arg_num(&args, 0, "wait")? as u32;
-                let child = CHILD_PROCS.with(|c| c.borrow_mut().remove(&pid));
+                let id = arg_num(&args, 0, "wait")? as u32;
+                let child = CHILD_PROCS.with(|c| c.borrow_mut().remove(&id));
                 match child {
                     Some(mut child) => {
-                        let status = child.wait().map_err(|e| format!("wait: {}: {}", pid, e))?;
+                        let status = child.wait().map_err(|e| format!("wait: {}: {}", id, e))?;
                         Ok(Value::Int(status.code().unwrap_or(-1) as i64))
                     }
-                    None => Err(format!("wait: unknown or already-reaped pid {}", pid)),
+                    None => Err(format!("wait: unknown or already-reaped pid {}", id)),
                 }
             }
             "kill" => {
-                let pid = arg_num(&args, 0, "kill")? as u32;
-                let child = CHILD_PROCS.with(|c| c.borrow_mut().remove(&pid));
+                let id = arg_num(&args, 0, "kill")? as u32;
+                let child = CHILD_PROCS.with(|c| c.borrow_mut().remove(&id));
                 match child {
                     Some(mut child) => {
                         let _ = child.kill();

@@ -1,0 +1,162 @@
+# Canvas host, Phase 1: PatLang-level wrappers around the new Win32
+# window/GDI primitives (x64_win_*_asm, self_hosting/lib/codegen_x64.
+# patlang). Native --x64 ONLY -- these primitives call raw WinAPI
+# functions with no interpreter-backend equivalent, same scope limit
+# as line_edit.patlang's raw-mode console primitives.
+#
+# Confirmed 100% greenfield before starting: grepping self_hosting for
+# CreateWindowEx/RegisterClassEx/BitBlt/StretchDIBits/GetMessage/
+# WndProc/CreatePseudoConsole found zero matches anywhere.
+#
+# The canvas's own pixel surface is 32bpp BGRX, row-major, top-down,
+# no row padding -- see x64_win_peek_message_asm's own header for why
+# (matches image.patlang's RGB24 buffers' own top-down/no-padding
+# layout exactly, just with an extra byte per pixel and B/R swapped,
+# to sidestep DIB row-padding math entirely). canvas_set_pixel below
+# mirrors image.patlang's img_set_pixel shape exactly, so drawing code
+# written for one translates directly to the other.
+
+include "includes.patlang"
+
+# ---- message code constants (Win32's own numeric values) ----
+
+make a function called wm_paint returns code
+  return 15
+end
+
+make a function called wm_close returns code
+  return 16
+end
+
+make a function called wm_destroy returns code
+  return 2
+end
+
+make a function called wm_char returns code
+  return 258
+end
+
+make a function called wm_size returns code
+  return 5
+end
+
+make a function called wm_keydown returns code
+  return 256
+end
+
+# ---- window + canvas lifecycle ----
+
+# canvas_open(width, height) -> hwnd. Creates the window AND sets up
+# the DIB-section-backed canvas surface (win_canvas_init_dib, Phase 3
+# -- a real GDI bitmap selected into a memory DC, not just a bare heap
+# buffer, so GDI text drawing and direct mem_poke_byte pixel access
+# both target the SAME memory) together -- the common case for a
+# first-cut caller; win_canvas_init_dib/win_canvas_set_size stay
+# separately callable for Phase 6's own resize handling, which needs
+# to reallocate the surface without recreating the window.
+make a function called canvas_open takes width, height returns hwnd
+  let hwnd = win_create_window(width, height)
+  win_canvas_init_dib(width, height)
+  win_canvas_set_size(width, height)
+  return hwnd
+end
+
+# canvas_fill(r, g, b) -- thin passthrough, named for symmetry with
+# the rest of this file's own naming.
+make a function called canvas_fill takes r, g, b returns done
+  return win_canvas_fill(r, g, b)
+end
+
+# canvas_text(x, y, text) -- draws `text` (a real PatLang string) at
+# pixel position (x, y) via GDI TextOutA, extracting the raw address/
+# length the same layered convention conpty_write already uses for
+# the `[8-byte length][bytes]` string layout every string in this
+# backend shares.
+make a function called canvas_text takes x, y, text returns done
+  let addr = text band rt_payload_mask()
+  let len = mem_peek_qword(addr, 0)
+  let data_addr = addr + 8
+  win_text_out(x, y, data_addr, len)
+  return true
+end
+
+# canvas_set_title(text) -- sets the real window title bar text (e.g.
+# so a caller can surface a listening network port -- "discoverable at
+# a glance" beats requiring a user to already know/remember it). Same
+# tag-masking convention as canvas_text above.
+make a function called canvas_set_title takes text returns done
+  let addr = text band rt_payload_mask()
+  let len = mem_peek_qword(addr, 0)
+  let data_addr = addr + 8
+  win_set_title(data_addr, len)
+  return true
+end
+
+# canvas_set_pixel(buf, x, y, r, g, b) -- writes one BGRX pixel
+# directly into the canvas surface (mem_poke_byte, no allocation, same
+# convention as image.patlang's img_set_pixel). Reads g_canvas_w via
+# win_canvas_alloc/win_canvas_set_size having already been called --
+# callers pass buf explicitly (the address win_canvas_alloc returned)
+# rather than this function reaching into a global itself, keeping it
+# usable even if a caller is drawing into a buffer that isn't (yet)
+# the live canvas surface.
+make a function called canvas_set_pixel takes buf, canvas_w, x, y, r, g, b returns done
+  let offset = (y * canvas_w + x) * 4
+  mem_poke_byte(buf, offset, b)
+  mem_poke_byte(buf, offset + 1, g)
+  mem_poke_byte(buf, offset + 2, r)
+  mem_poke_byte(buf, offset + 3, 0)
+  return true
+end
+
+# canvas_blit_image(image, dest_x, dest_y) -- Phase 5: draws a real
+# decoded image (an image.patlang-shaped [width, height, buf_addr]
+# value -- RGB24, row-major, no padding, see that module's own header)
+# straight onto the canvas surface at pixel position (dest_x, dest_y),
+# bypassing Sixel entirely. Indexes `image` directly (image[0]/[1]/[2])
+# rather than calling img_width/img_height/img_buf, so this file has
+# no hard include-order dependency on image.patlang -- any caller that
+# already has an image value in this exact shape can use it.
+make a function called canvas_blit_image takes image, dest_x, dest_y returns done
+  let w = image[0]
+  let h = image[1]
+  let buf = image[2]
+  return win_canvas_blit(buf, w, h, dest_x, dest_y)
+end
+
+# canvas_pump_once() -> the raw message code from win_peek_message (0
+# if nothing was pending). Thin passthrough, named for symmetry with
+# the rest of this file's own naming (canvas_open, canvas_set_pixel)
+# rather than exposing the raw win_* primitive name directly to
+# canvas_host.patlang's own main loop. WM_SIZE (see wm_size's own
+# comment) is handled at the primitive level (the DIB surface itself
+# is already reallocated by the time this returns) -- callers still
+# get the code back so they know to redraw their OWN content (text/
+# whatever else) into the freshly-resized buffer.
+make a function called canvas_pump_once returns msg_code
+  return win_peek_message()
+end
+
+# canvas_ctrl_down() -> 1/0, whether Ctrl is CURRENTLY held -- meant to
+# be checked right after a WM_KEYDOWN for a different key (e.g. 'C' or
+# 'V'), to distinguish "Ctrl+C" from a bare "C" keypress.
+make a function called canvas_ctrl_down returns down
+  return win_ctrl_down()
+end
+
+# canvas_clipboard_copy(text) -- puts `text` (a real PatLang string) on
+# the system clipboard as plain text, replacing whatever was there.
+make a function called canvas_clipboard_copy takes text returns done
+  let addr = text band rt_payload_mask()
+  let len = mem_peek_qword(addr, 0)
+  let data_addr = addr + 8
+  win_clipboard_set_text(data_addr, len)
+  return true
+end
+
+# canvas_clipboard_paste() -> the clipboard's own current plain-text
+# content as a real PatLang string ("" if there is none, or it isn't
+# plain text).
+make a function called canvas_clipboard_paste returns text
+  return win_clipboard_get_text()
+end

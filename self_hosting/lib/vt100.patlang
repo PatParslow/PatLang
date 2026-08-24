@@ -1,0 +1,599 @@
+# Canvas host, Phase 4: a minimal VT100/xterm character-grid model and
+# escape-sequence state machine, scoped to what real-world vim/bash/git
+# actually emit -- not general xterm compliance. Deliberately pure
+# PatLang with NO Win32/canvas dependency (see win32_window.patlang for
+# that layer) so this whole module is testable headless against known
+# byte sequences, independent of whatever ConPTY/canvas plumbing sits
+# on top of it.
+#
+# Explicitly OUT of scope unless a real program is observed needing it
+# (per the approved plan): mouse reporting, bracketed paste, 24-bit
+# color, scroll regions. Handled but otherwise ignored: the win32-
+# input-mode/focus-reporting escapes conhost sends on every ConPTY
+# session start (`ESC[?9001h` / `ESC[?1004h`, confirmed via a live
+# capture this session) -- these are just DECSET/DECRST private modes
+# with unrecognized numbers, which the state machine already treats as
+# a harmless no-op, not a special case.
+#
+# State representation: a single flat list (tuple), matching this
+# codebase's own established convention (console_step's own
+# [new_state, output_text, ok, healed_command] tuple, with
+# cs_result_state/cs_result_output-style accessors) rather than a
+# class -- avoids any uncertainty around this backend's still-young
+# class support for something this performance- and correctness-
+# sensitive. Every field is updated via rt_list_set (raw in-place
+# mutation into the SAME heap block, not list_push's "returns a new
+# list" convention) so vt100_feed can process a whole byte stream
+# without reallocating the state tuple or either cell buffer per byte.
+#
+# Cells are ONE packed int per cell (not four parallel lists): bits
+# 0-7 = char code, 8-15 = fg (0-15 ANSI index, 16 = default), 16-23 =
+# bg (same range), 24-31 = attrs bitmask (1=bold, 2=underline,
+# 4=reverse). vt100_cell_char/_fg/_bg/_attrs unpack this for callers.
+#
+# REAL BUG FOUND AND FIXED while writing this file's own first test
+# pass (every write-then-read test failed silently, no crash, nothing
+# visibly wrong): the header comment below describing the state tuple
+# layout was wrong from "alt_screen" onward (off by one -- it omitted
+# cur_fg as its own slot), and the CODE was written to match that
+# wrong comment instead of vt100_new's own actual construction order.
+# The most consequential instance: vt100_feed_byte read parse_state
+# from state[9], but slot 9 actually holds saved_cursor (a number) --
+# so `ps == "ground"` (a string compare) was NEVER true, meaning every
+# byte fed through vt100_feed matched no branch at all and silently
+# did nothing. Caught by a unit test asserting on ACTUAL cell content
+# after a feed, not just "did it crash" -- fixed by making the layout
+# below the single source of truth and re-deriving every access
+# against it directly, index by index, rather than trusting the
+# original comment a second time.
+
+# ---- state tuple layout (verified against vt100_new's own
+# construction order -- this comment IS the layout, not a summary of
+# it written separately) ----
+#   0  cols                8  alt_screen (0/1)
+#   1  rows                9  saved_cursor (packed x|y<<16)
+#   2  cells (list)       10  parse_state ("ground"/"esc"/"osc"/"csi")
+#   3  cursor_x           11  csi_params (list of ints)
+#   4  cursor_y           12  csi_cur_param (string, in-progress digits)
+#   5  cur_bg             13  csi_private (bool, '?' seen)
+#   6  cur_fg             14  alt_cells (list)
+#   7  cur_attrs          15  pending_wrap (bool, deferred DECAWM)
+
+make a function called vt100_default_fg returns fg
+  return 16
+end
+
+make a function called vt100_default_bg returns bg
+  return 16
+end
+
+make a function called vt100_blank_cell takes fg, bg returns packed
+  return 32 bor (fg shl 8) bor (bg shl 16)
+end
+
+make a function called vt100_make_cells takes cols, rows, fg, bg returns cells
+  let n = cols * rows
+  let blank = vt100_blank_cell(fg, bg)
+  let cells = []
+  let i = 0
+  while i < n do
+    let cells = list_push(cells, blank)
+    let i = i + 1
+  end
+  return cells
+end
+
+make a function called vt100_new takes cols, rows returns state
+  let fg = vt100_default_fg()
+  let bg = vt100_default_bg()
+  let cells = vt100_make_cells(cols, rows, fg, bg)
+  let alt_cells = vt100_make_cells(cols, rows, fg, bg)
+  return [cols, rows, cells, 0, 0, bg, fg, 0, 0, 0, "ground", [], "", false, alt_cells, false]
+end
+
+# ---- accessors the canvas renderer (win32_window.patlang / a future
+# canvas_host pane) uses -- everything it needs to draw a frame,
+# nothing about how the state machine got there. ----
+
+make a function called vt100_cols takes state returns cols
+  return state[0]
+end
+
+make a function called vt100_rows takes state returns rows
+  return state[1]
+end
+
+make a function called vt100_cursor_x takes state returns x
+  return state[3]
+end
+
+make a function called vt100_cursor_y takes state returns y
+  return state[4]
+end
+
+make a function called vt100_cell_at takes state, x, y returns packed
+  let cols = state[0]
+  let cells = state[2]
+  return cells[y * cols + x]
+end
+
+make a function called vt100_cell_char takes state, x, y returns code
+  return vt100_cell_at(state, x, y) band 255
+end
+
+make a function called vt100_cell_fg takes state, x, y returns fg
+  return (vt100_cell_at(state, x, y) shr 8) band 255
+end
+
+make a function called vt100_cell_bg takes state, x, y returns bg
+  return (vt100_cell_at(state, x, y) shr 16) band 255
+end
+
+make a function called vt100_cell_attrs takes state, x, y returns attrs
+  return (vt100_cell_at(state, x, y) shr 24) band 255
+end
+
+# ---- internal cell/cursor mutation (in place, via rt_list_set) ----
+
+make a function called vt100_set_cell takes state, x, y, ch, fg, bg, attrs returns done
+  let cols = state[0]
+  let rows = state[1]
+  if (x >= 0) and (x < cols) and (y >= 0) and (y < rows) then
+    let cells = state[2]
+    let packed = ch bor (fg shl 8) bor (bg shl 16) bor (attrs shl 24)
+    rt_list_set(cells, y * cols + x, packed)
+  end
+  return true
+end
+
+make a function called vt100_clear_row takes state, y, fg, bg returns done
+  let cols = state[0]
+  let blank = vt100_blank_cell(fg, bg)
+  let cells = state[2]
+  let x = 0
+  while x < cols do
+    rt_list_set(cells, y * cols + x, blank)
+    let x = x + 1
+  end
+  return true
+end
+
+make a function called vt100_clear_all takes state returns done
+  let rows = state[1]
+  let fg = state[6]
+  let bg = state[5]
+  let y = 0
+  while y < rows do
+    vt100_clear_row(state, y, fg, bg)
+    let y = y + 1
+  end
+  return true
+end
+
+# Scrolls every row up by one (row 1 becomes row 0, ...), clearing the
+# new bottom row -- real terminal semantics for a linefeed at the last
+# row, not literal cell-by-cell reflow (moves whole rows via
+# rt_list_set, cols cells at a time).
+make a function called vt100_scroll_up takes state returns done
+  let cols = state[0]
+  let rows = state[1]
+  let cells = state[2]
+  let y = 1
+  while y < rows do
+    let x = 0
+    while x < cols do
+      let v = cells[y * cols + x]
+      rt_list_set(cells, (y - 1) * cols + x, v)
+      let x = x + 1
+    end
+    let y = y + 1
+  end
+  vt100_clear_row(state, rows - 1, state[6], state[5])
+  return true
+end
+
+# ---- cursor movement helpers (clamped to the grid, matching real
+# terminal behavior -- movement past an edge just stops at the edge,
+# it never wraps or scrolls except via explicit linefeed handling). ----
+
+make a function called vt100_clamp takes v, lo, hi returns out
+  if v < lo then
+    return lo
+  end
+  if v > hi then
+    return hi
+  end
+  return v
+end
+
+make a function called vt100_move_cursor takes state, x, y returns done
+  let cols = state[0]
+  let rows = state[1]
+  rt_list_set(state, 15, false)
+  rt_list_set(state, 3, vt100_clamp(x, 0, cols - 1))
+  rt_list_set(state, 4, vt100_clamp(y, 0, rows - 1))
+  return true
+end
+
+# Real terminals defer wrapping past the right margin until the NEXT
+# character actually arrives ("deferred wrap"/DECAWM) -- writing
+# exactly `cols` characters on a line must NOT scroll by itself; only
+# a character written AFTER that should trigger the wrap. Modeled as
+# a pending_wrap flag: vt100_advance_cursor, when it would move past
+# the last column, sets the flag and leaves the cursor AT the last
+# column instead of moving it; vt100_resolve_pending_wrap performs the
+# deferred move (and scrolls if needed) right before the next
+# printable character is actually written. Any EXPLICIT cursor move
+# (vt100_move_cursor, linefeed, CR, backspace) cancels a pending wrap,
+# matching real terminal behavior.
+#
+# REAL BUG FOUND (via this file's own unit test): the original
+# immediate-wrap version scrolled after the LAST character of an
+# exactly-`cols`-wide line, corrupting a still-very-common case (any
+# line that happens to exactly fill the terminal width) -- caught by
+# a test asserting on grid content after writing a 5-char line to a
+# 5-column grid, not something a "just don't crash" smoke test would
+# have found.
+make a function called vt100_resolve_pending_wrap takes state returns done
+  if state[15] then
+    rt_list_set(state, 15, false)
+    let rows = state[1]
+    let y = state[4] + 1
+    if y >= rows then
+      vt100_scroll_up(state)
+      let y = rows - 1
+    end
+    rt_list_set(state, 3, 0)
+    rt_list_set(state, 4, y)
+  end
+  return true
+end
+
+make a function called vt100_advance_cursor takes state returns done
+  let cols = state[0]
+  let x = state[3] + 1
+  if x >= cols then
+    rt_list_set(state, 15, true)
+  else
+    rt_list_set(state, 3, x)
+  end
+  return true
+end
+
+make a function called vt100_linefeed takes state returns done
+  let rows = state[1]
+  rt_list_set(state, 15, false)
+  let y = state[4] + 1
+  if y >= rows then
+    vt100_scroll_up(state)
+    let y = rows - 1
+  end
+  rt_list_set(state, 4, y)
+  return true
+end
+
+# ---- SGR (m) parameter application ----
+
+make a function called vt100_sgr_apply_one takes state, p returns done
+  if p == 0 then
+    rt_list_set(state, 5, vt100_default_bg())
+    rt_list_set(state, 6, vt100_default_fg())
+    rt_list_set(state, 7, 0)
+  elif p == 1 then
+    rt_list_set(state, 7, state[7] bor 1)
+  elif p == 4 then
+    rt_list_set(state, 7, state[7] bor 2)
+  elif p == 7 then
+    rt_list_set(state, 7, state[7] bor 4)
+  elif p == 22 then
+    rt_list_set(state, 7, state[7] band (bnot 1))
+  elif p == 24 then
+    rt_list_set(state, 7, state[7] band (bnot 2))
+  elif p == 27 then
+    rt_list_set(state, 7, state[7] band (bnot 4))
+  elif p == 39 then
+    rt_list_set(state, 6, vt100_default_fg())
+  elif p == 49 then
+    rt_list_set(state, 5, vt100_default_bg())
+  elif (p >= 30) and (p <= 37) then
+    rt_list_set(state, 6, p - 30)
+  elif (p >= 40) and (p <= 47) then
+    rt_list_set(state, 5, p - 40)
+  elif (p >= 90) and (p <= 97) then
+    rt_list_set(state, 6, p - 90 + 8)
+  elif (p >= 100) and (p <= 107) then
+    rt_list_set(state, 5, p - 100 + 8)
+  end
+  # Any other SGR param (38/48 extended color, dim/italic/blink/strike,
+  # etc.) is a named, accepted no-op -- not observed as load-bearing
+  # for vim/bash/git's own OWN typical output; extend here if a real
+  # program is found needing it.
+  return true
+end
+
+make a function called vt100_apply_sgr takes state, params returns done
+  if params.length == 0 then
+    vt100_sgr_apply_one(state, 0)
+    return true
+  end
+  let i = 0
+  while i < params.length do
+    vt100_sgr_apply_one(state, params[i])
+    let i = i + 1
+  end
+  return true
+end
+
+# ---- CSI final-byte dispatch ----
+
+make a function called vt100_csi_param takes params, idx, default_val returns v
+  if idx < params.length then
+    if params[idx] == 0 then
+      # A present-but-zero param (e.g. explicit "0") is a REAL zero for
+      # most CSI commands EXCEPT the movement/position ones below,
+      # which always treat 0 as "1" (xterm's own documented behavior:
+      # "a parameter of 0 or 1 moves the cursor 1 line/column").
+      return 0
+    end
+    return params[idx]
+  end
+  return default_val
+end
+
+make a function called vt100_dispatch_csi takes state, final_byte, params, private returns done
+  let cols = state[0]
+  let rows = state[1]
+  let x = state[3]
+  let y = state[4]
+  if final_byte == 65 then
+    # A (CUU) -- cursor up
+    let n = vt100_csi_param(params, 0, 1)
+    if n == 0 then
+      let n = 1
+    end
+    vt100_move_cursor(state, x, y - n)
+  elif final_byte == 66 then
+    # B (CUD) -- cursor down
+    let n = vt100_csi_param(params, 0, 1)
+    if n == 0 then
+      let n = 1
+    end
+    vt100_move_cursor(state, x, y + n)
+  elif final_byte == 67 then
+    # C (CUF) -- cursor forward
+    let n = vt100_csi_param(params, 0, 1)
+    if n == 0 then
+      let n = 1
+    end
+    vt100_move_cursor(state, x + n, y)
+  elif final_byte == 68 then
+    # D (CUB) -- cursor back
+    let n = vt100_csi_param(params, 0, 1)
+    if n == 0 then
+      let n = 1
+    end
+    vt100_move_cursor(state, x - n, y)
+  elif (final_byte == 72) or (final_byte == 102) then
+    # H/f (CUP/HVP) -- cursor position, 1-indexed row;col
+    let row = vt100_csi_param(params, 0, 1)
+    if row == 0 then
+      let row = 1
+    end
+    let col = vt100_csi_param(params, 1, 1)
+    if col == 0 then
+      let col = 1
+    end
+    vt100_move_cursor(state, col - 1, row - 1)
+  elif final_byte == 74 then
+    # J (ED) -- erase in display
+    let mode = vt100_csi_param(params, 0, 0)
+    if mode == 2 then
+      vt100_clear_all(state)
+    elif mode == 1 then
+      let yy = 0
+      while yy < y do
+        vt100_clear_row(state, yy, state[6], state[5])
+        let yy = yy + 1
+      end
+      let xx = 0
+      while xx <= x do
+        vt100_set_cell(state, xx, y, 32, state[6], state[5], state[7])
+        let xx = xx + 1
+      end
+    else
+      let xx = x
+      while xx < cols do
+        vt100_set_cell(state, xx, y, 32, state[6], state[5], state[7])
+        let xx = xx + 1
+      end
+      let yy = y + 1
+      while yy < rows do
+        vt100_clear_row(state, yy, state[6], state[5])
+        let yy = yy + 1
+      end
+    end
+  elif final_byte == 75 then
+    # K (EL) -- erase in line
+    let mode = vt100_csi_param(params, 0, 0)
+    if mode == 2 then
+      vt100_clear_row(state, y, state[6], state[5])
+    elif mode == 1 then
+      let xx = 0
+      while xx <= x do
+        vt100_set_cell(state, xx, y, 32, state[6], state[5], state[7])
+        let xx = xx + 1
+      end
+    else
+      let xx = x
+      while xx < cols do
+        vt100_set_cell(state, xx, y, 32, state[6], state[5], state[7])
+        let xx = xx + 1
+      end
+    end
+  elif final_byte == 109 then
+    # m (SGR)
+    vt100_apply_sgr(state, params)
+  elif (final_byte == 104) or (final_byte == 108) then
+    # h/l (DECSET/DECRST), only meaningful with the private '?' marker
+    # here -- non-private h/l (ANSI modes like IRM) aren't in scope.
+    if private then
+      let mode = vt100_csi_param(params, 0, 0)
+      if mode == 1049 then
+        # Alternate screen buffer, matching xterm's own combined
+        # "1049" behavior (save cursor + switch + clear on enter,
+        # restore + switch back on exit) -- the two behaviors vim
+        # actually relies on (a clean full-screen redraw entering, the
+        # original scrollback content reappearing on exit).
+        if final_byte == 104 then
+          if state[8] == 0 then
+            rt_list_set(state, 9, x bor (y shl 16))
+            let tmp = state[2]
+            rt_list_set(state, 2, state[14])
+            rt_list_set(state, 14, tmp)
+            rt_list_set(state, 8, 1)
+            vt100_clear_all(state)
+            vt100_move_cursor(state, 0, 0)
+          end
+        else
+          if state[8] == 1 then
+            let tmp = state[2]
+            rt_list_set(state, 2, state[14])
+            rt_list_set(state, 14, tmp)
+            rt_list_set(state, 8, 0)
+            let saved = state[9]
+            vt100_move_cursor(state, saved band 65535, saved shr 16)
+          end
+        end
+      end
+      # Other private modes (?25 cursor visibility, ?1000/1002/1003
+      # mouse reporting, ?2004 bracketed paste, ...) are named,
+      # accepted no-ops -- out of scope per this phase's own plan
+      # unless a real program is observed needing them.
+    end
+  end
+  # Any other final byte (an unrecognized CSI command) is a no-op --
+  # matches every real terminal's own "ignore what you don't
+  # understand" tolerance, needed for forward-compatibility with
+  # sequences this scope deliberately doesn't implement.
+  return true
+end
+
+# ---- the byte-at-a-time state machine ----
+
+make a function called vt100_csi_reset takes state returns done
+  rt_list_set(state, 11, [])
+  rt_list_set(state, 12, "")
+  rt_list_set(state, 13, false)
+  return true
+end
+
+make a function called vt100_csi_push_param takes state returns done
+  let cur = state[12]
+  if cur == "" then
+    rt_list_set(state, 11, list_push(state[11], 0))
+  else
+    rt_list_set(state, 11, list_push(state[11], to_num(cur)))
+  end
+  rt_list_set(state, 12, "")
+  return true
+end
+
+make a function called vt100_feed_byte takes state, b returns done
+  let ps = state[10]
+  if ps == "ground" then
+    if b == 27 then
+      rt_list_set(state, 10, "esc")
+    elif b == 13 then
+      rt_list_set(state, 15, false)
+      rt_list_set(state, 3, 0)
+    elif b == 10 then
+      vt100_linefeed(state)
+    elif b == 8 then
+      rt_list_set(state, 15, false)
+      let x = state[3]
+      if x > 0 then
+        rt_list_set(state, 3, x - 1)
+      end
+    elif b == 9 then
+      # Tab -- advance to the next multiple-of-8 column, clamped to
+      # the right margin (no real tab-stop tracking, a named
+      # simplification -- vim/bash never rely on custom tab stops).
+      let cols = state[0]
+      let x = state[3]
+      let next_stop = ((x / 8) + 1) * 8
+      vt100_move_cursor(state, vt100_clamp(next_stop, 0, cols - 1), state[4])
+    elif b == 7 then
+      # BEL -- no audible/visual bell support, a deliberate no-op.
+    elif (b >= 32) and (b <= 126) then
+      vt100_resolve_pending_wrap(state)
+      vt100_set_cell(state, state[3], state[4], b, state[6], state[5], state[7])
+      vt100_advance_cursor(state)
+    end
+    # Bytes outside 32-126 that aren't one of the control codes above
+    # (other C0 controls, raw UTF-8 continuation/lead bytes) are a
+    # named scope cut -- ASCII-only, matching every other primitive
+    # this backend's own strings already assume (win32_window.patlang's
+    # own header makes the same call for canvas_text).
+  elif ps == "esc" then
+    if b == 91 then
+      vt100_csi_reset(state)
+      rt_list_set(state, 10, "csi")
+    elif b == 93 then
+      # OSC (]) -- window title / color-palette sets, terminated by
+      # BEL or ST (ESC \\). Not rendered (no title bar text target
+      # yet), but MUST still be consumed byte-for-byte so its own
+      # payload text never leaks into the grid as literal characters --
+      # reuses "csi" state's own generic terminator handling with a
+      # distinct start marker isn't worth a whole new state for this
+      # phase's scope, so OSC content is simply skipped via "osc".
+      rt_list_set(state, 10, "osc")
+    elif b == 55 then
+      # ESC 7 (DECSC) -- save cursor position.
+      rt_list_set(state, 9, state[3] bor (state[4] shl 16))
+      rt_list_set(state, 10, "ground")
+    elif b == 56 then
+      # ESC 8 (DECRC) -- restore cursor position.
+      let saved = state[9]
+      vt100_move_cursor(state, saved band 65535, saved shr 16)
+      rt_list_set(state, 10, "ground")
+    else
+      # Any other single-char escape (charset selection ESC(B, RI
+      # ESC M, ...) -- named no-op, back to ground.
+      rt_list_set(state, 10, "ground")
+    end
+  elif ps == "osc" then
+    if (b == 7) or (b == 27) then
+      rt_list_set(state, 10, "ground")
+    end
+  elif ps == "csi" then
+    if (b >= 48) and (b <= 57) then
+      rt_list_set(state, 12, state[12] + chr(b))
+    elif b == 59 then
+      vt100_csi_push_param(state)
+    elif b == 63 then
+      rt_list_set(state, 13, true)
+    elif (b >= 32) and (b <= 63) then
+      # Other intermediate/parameter bytes (space..?, e.g. ' ' before
+      # some final bytes) -- accepted no-op, still consumed so the
+      # sequence doesn't leak into the grid.
+    else
+      vt100_csi_push_param(state)
+      vt100_dispatch_csi(state, b, state[11], state[13])
+      rt_list_set(state, 10, "ground")
+    end
+  end
+  return true
+end
+
+# vt100_feed(state, text) -> feeds every byte of a real PatLang string
+# through the state machine in order. The one entry point a ConPTY-
+# reading main loop calls per chunk of `conpty_read`'s own output.
+make a function called vt100_feed takes state, text returns done
+  let n = text.length
+  let i = 0
+  while i < n do
+    vt100_feed_byte(state, char_code(text, i))
+    let i = i + 1
+  end
+  return true
+end

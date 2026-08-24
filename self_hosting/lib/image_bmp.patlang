@@ -1,0 +1,181 @@
+# BMP raster decoder. Supports uncompressed (BI_RGB) 1/4/8-bit
+# palette-indexed AND 24/32-bit direct-color BITMAPINFOHEADER-format
+# BMP, both row orders (bottom-up via a positive height, the
+# traditional default, and top-down via a negative height, common from
+# screenshot tools). Deliberately does NOT support BI_BITFIELDS/BI_RLE4/
+# BI_RLE8 compression -- a real, named scope limit, added only if a
+# real file actually needs it (1-bit palette support was added exactly
+# this way: a real user screenshot turned out to be BI_RGB 1bpp, not
+# the 24/32-bit direct-color this decoder originally assumed every real
+# BMP would be -- confirmed by reading that exact file's own header
+# fields directly rather than guessing).
+#
+# Confirmed before writing this: read_file (x64_runtime.patlang's
+# rt_read_file) reads exactly the real file size into a proper
+# length-prefixed buffer (mem_poke_qword(buf, 0, size) then a raw byte
+# copy) -- NOT null-terminated, NOT text-interpreted -- so arbitrary
+# binary bytes (including embedded zero bytes, which every one of
+# these formats' file headers genuinely contains) round-trip correctly
+# through char_code/substr the same way ASCII text does elsewhere in
+# this codebase.
+
+include "includes.patlang"
+include "image.patlang"
+
+make a function called bmp_u16 takes bytes, offset returns v
+  let b0 = char_code(bytes, offset)
+  let b1 = char_code(bytes, offset + 1)
+  return b0 + (b1 * 256)
+end
+
+make a function called bmp_u32 takes bytes, offset returns v
+  let b0 = char_code(bytes, offset)
+  let b1 = char_code(bytes, offset + 1)
+  let b2 = char_code(bytes, offset + 2)
+  let b3 = char_code(bytes, offset + 3)
+  return b0 + (b1 * 256) + (b2 * 65536) + (b3 * 16777216)
+end
+
+make a function called bmp_i32 takes bytes, offset returns v
+  let u = bmp_u32(bytes, offset)
+  if u >= 2147483648 then
+    return u - 4294967296
+  end
+  return u
+end
+
+# bmp_indexed_pixel(bytes, row_offset, x, bpp) -> the palette index for
+# pixel x within a row that starts at row_offset, for bpp in {1,4,8}.
+# 1-bit and 4-bit pack multiple pixels per byte, MSB-first (the BMP
+# spec's own bit order, same as PBM/PGM-family formats).
+make a function called bmp_indexed_pixel takes bytes, row_offset, x, bpp returns idx
+  if bpp == 8 then
+    return char_code(bytes, row_offset + x)
+  end
+  if bpp == 4 then
+    let byte_offset = row_offset + floor(x / 2)
+    let byte_val = char_code(bytes, byte_offset)
+    if (x band 1) == 0 then
+      return (byte_val shr 4) band 15
+    end
+    return byte_val band 15
+  end
+  let byte_offset = row_offset + floor(x / 8)
+  let byte_val = char_code(bytes, byte_offset)
+  let bit_index = 7 - (x band 7)
+  return (byte_val shr bit_index) band 1
+end
+
+# bmp_decode_indexed: the 1/4/8-bit palette path. Palette entries are
+# 4 bytes each (B, G, R, reserved), starting right after the info
+# header (14 + header_size); biClrUsed (info-header offset 32, i.e.
+# absolute offset 46 for the standard 40-byte BITMAPINFOHEADER this
+# decoder requires) gives the real palette size when nonzero, otherwise
+# it's the full 2^bpp table.
+make a function called bmp_decode_indexed takes bytes, data_offset, header_size, width, height, top_down, bpp returns image
+  let clr_used = bmp_u32(bytes, 46)
+  let palette_count = clr_used
+  if palette_count == 0 then
+    let palette_count = 1 shl bpp
+  end
+  let palette_offset = 14 + header_size
+  let bits_per_row = width * bpp
+  let row_size = floor((bits_per_row + 7) / 8)
+  let padded_row_size = floor((row_size + 3) / 4) * 4
+  let out = img_new(width, height)
+  let y = 0
+  while y < height do
+    let src_row = y
+    if top_down == false then
+      let src_row = height - 1 - y
+    end
+    let row_offset = data_offset + (src_row * padded_row_size)
+    let x = 0
+    while x < width do
+      let idx = bmp_indexed_pixel(bytes, row_offset, x, bpp)
+      if idx >= palette_count then
+        let idx = palette_count - 1
+      end
+      let pal_offset = palette_offset + (idx * 4)
+      let b = char_code(bytes, pal_offset)
+      let g = char_code(bytes, pal_offset + 1)
+      let r = char_code(bytes, pal_offset + 2)
+      img_set_pixel(out, x, y, r, g, b)
+      let x = x + 1
+    end
+    let y = y + 1
+  end
+  return out
+end
+
+# bmp_decode_direct: the 24/32-bit direct-color path (no palette,
+# B-G-R byte order per pixel, alpha byte in the 32-bit case ignored --
+# this decoder has no compositing background, same scope limit
+# image.patlang's own header notes for PNG's eventual alpha handling).
+make a function called bmp_decode_direct takes bytes, data_offset, width, height, top_down, bpp returns image
+  let bytes_per_pixel = floor(bpp / 8)
+  let row_size = width * bytes_per_pixel
+  let padded_row_size = floor((row_size + 3) / 4) * 4
+  let out = img_new(width, height)
+  let y = 0
+  while y < height do
+    let src_row = y
+    if top_down == false then
+      let src_row = height - 1 - y
+    end
+    let row_offset = data_offset + (src_row * padded_row_size)
+    let x = 0
+    while x < width do
+      let px_offset = row_offset + (x * bytes_per_pixel)
+      let b = char_code(bytes, px_offset)
+      let g = char_code(bytes, px_offset + 1)
+      let r = char_code(bytes, px_offset + 2)
+      img_set_pixel(out, x, y, r, g, b)
+      let x = x + 1
+    end
+    let y = y + 1
+  end
+  return out
+end
+
+# bmp_decode(bytes) -> an image.patlang "image" value, or [] on any
+# unsupported/malformed input. [] as the failure signal matches this
+# backend's own established convention elsewhere (rt_read_file returns
+# an empty string on a missing file, for the same reason: no exception
+# mechanism exists in this backend at all) -- callers check for it.
+make a function called bmp_decode takes bytes returns image
+  if bytes.length < 54 then
+    return []
+  end
+  if (substr(bytes, 0, 1) != "B") or (substr(bytes, 1, 1) != "M") then
+    return []
+  end
+  let data_offset = bmp_u32(bytes, 10)
+  let header_size = bmp_u32(bytes, 14)
+  if header_size < 40 then
+    return []
+  end
+  let width = bmp_i32(bytes, 18)
+  let raw_height = bmp_i32(bytes, 22)
+  let bpp = bmp_u16(bytes, 28)
+  let compression = bmp_u32(bytes, 30)
+  if compression != 0 then
+    return []
+  end
+  if (bpp != 1) and (bpp != 4) and (bpp != 8) and (bpp != 24) and (bpp != 32) then
+    return []
+  end
+  let top_down = false
+  let height = raw_height
+  if raw_height < 0 then
+    let top_down = true
+    let height = 0 - raw_height
+  end
+  if (width <= 0) or (height <= 0) then
+    return []
+  end
+  if bpp <= 8 then
+    return bmp_decode_indexed(bytes, data_offset, header_size, width, height, top_down, bpp)
+  end
+  return bmp_decode_direct(bytes, data_offset, width, height, top_down, bpp)
+end

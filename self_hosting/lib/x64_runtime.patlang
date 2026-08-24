@@ -121,20 +121,31 @@ end
 # Windows specifically because `.bss` pages are zero-fill-on-demand
 # (reserving 512MB costs nothing in actual RAM until touched), not a
 # claim that this is unbounded.
+# REAL BUG FOUND (not yet triggered by any pre-existing single-
+# threaded caller, but a genuine one once thread_spawn/real OS threads
+# exist -- see rt_atomic_fetch_add's own header in codegen_x64.patlang):
+# the original body did `let used = mem_peek_qword(state, 0)` then
+# later `mem_poke_qword(state, 0, used + aligned_size)` -- a plain
+# read-then-write, not atomic. Two threads calling rt_heap_alloc at
+# the same moment could both read the SAME `used` value before either
+# writes back, handing out the SAME address range to both -- silent
+# heap corruption, not a crash, and the two allocations don't need to
+# be on different threads' own paths for damage: ANY string/list
+# operation anywhere goes through this. Fixed with a single atomic
+# fetch-and-add (`lock xadd`) claiming the range, rather than a
+# separate read+write.
 make a function called rt_heap_alloc takes size returns addr
-  let state = mem_heap_state_addr()
-  let used = mem_peek_qword(state, 0)
   let aligned_size = size
   let rem = aligned_size % 8
   if rem != 0 then
     let aligned_size = aligned_size + (8 - rem)
   end
+  let used = rt_atomic_fetch_add(mem_heap_state_addr(), aligned_size)
   if used + aligned_size > mem_heap_size() then
     print("rt_heap_alloc: heap exhausted (" + (used + aligned_size) + " bytes requested, " + mem_heap_size() + " reserved) -- see rt_heap_alloc's own header in x64_runtime.patlang")
     os_exit(97)
   end
   let addr = mem_heap_base() + used
-  mem_poke_qword(state, 0, used + aligned_size)
   return addr
 end
 
@@ -506,6 +517,28 @@ make a function called rt_print_str takes s returns done
   os_write_console_bytes(addr + 8, len)
   mem_poke_byte(mem_scratch_addr(), 0, 10)
   os_write_console_bytes(mem_scratch_addr(), 1)
+  return true
+end
+
+# console_echo_byte(b) -> writes exactly one raw byte to stdout, no
+# newline. Needed because raw-mode input (console_raw_enable) turns off
+# the console's own local echo -- a caller doing its own keystroke-by-
+# keystroke line editing (self_hosting/lib/line_edit.patlang) must echo
+# each byte itself, and rt_print_str always appends a newline, which a
+# single echoed keystroke must not do.
+make a function called console_echo_byte takes b returns done
+  mem_poke_byte(mem_scratch_addr(), 0, b)
+  os_write_console_bytes(mem_scratch_addr(), 1)
+  return true
+end
+
+# console_echo_str(s) -> writes s to stdout with NO trailing newline
+# (unlike rt_print_str/print) -- same string layout rt_print_str already
+# relies on (an 8-byte length prefix ahead of the raw bytes).
+make a function called console_echo_str takes s returns done
+  let addr = s band rt_payload_mask()
+  let len = rt_str_len(s)
+  os_write_console_bytes(addr + 8, len)
   return true
 end
 
@@ -1400,11 +1433,24 @@ end
 # x64_codegen_demo_baseline.patlang, only ever floors a fixnum-or-
 # Rational division result) -- falls through to "unchanged" for
 # anything else rather than erroring, a safe default.
+#
+# REAL BUG FOUND AND FIXED (image/BMP-decoder work): this used to
+# extract `family` via a hand-rolled top-nibble-only mask
+# (17293822569102704640 = 0xF000000000000000) and compare it against a
+# hand-rolled `rational_family` constant (1153765929536978944) that
+# does NOT fit in that mask -- Rational's real tag (rt_rational_tag(),
+# see its own header a few hundred lines below: family nibble 0x1 PLUS
+# thermometer bits 48 and 49 both set) has bits set below bit 60, which
+# a top-nibble-only mask discards, so the comparison could never
+# succeed and floor() silently fell through to "unchanged" for every
+# real Rational input -- confirmed directly: floor(19/4) returned 19/4
+# untouched. Fixed to use the two already-established, already-correct
+# accessors for exactly this (rt_tag_mask(), the real top-16-bits mask,
+# and rt_rational_tag(), the real tag value) instead of re-deriving
+# both by hand a second time.
 make a function called floor takes v returns result
-  let family_mask = 17293822569102704640
-  let family = v band family_mask
-  let rational_family = 1153765929536978944
-  if family == rational_family then
+  let tag = v band rt_tag_mask()
+  if tag == rt_rational_tag() then
     let addr = v band rt_payload_mask()
     let n = mem_peek_qword(addr, 0)
     let d = mem_peek_qword(addr, 8)
@@ -3259,6 +3305,59 @@ make a function called rt_exec_join_args takes arr, count returns tagged
   return result
 end
 
+# exec_capture_io(program, args, stdin_text) -> [stdout, stderr, success],
+# shadowing hosts.rs's own exec_capture_io (list-based args, not
+# variadic) so code written against it -- self_hosting/lib/proc.patlang,
+# in particular -- works UNCHANGED under this native --x64 backend, not
+# just the interpreter. Built entirely from already-proven primitives:
+# rt_exec_join_args (the same quoting logic exec_capture/spawn already
+# use) feeding the newly-exposed os_exec_run primitive (the same
+# CreateProcessA+pipe machinery exec_capture's own CallHost handling
+# already wraps) -- no new process-creation assembly.
+#
+# Real, deliberately-documented differences from the interpreter's own
+# exec_capture_io, found while building this, not discovered later:
+#   1. stdout and stderr are NOT captured on separate pipes -- the
+#      shared os_exec_run primitive uses one pipe for both streams (same
+#      as exec_capture itself already does on both backends). The
+#      combined text is returned in BOTH slots, so a caller reading
+#      either one -- including proc.patlang's classify_failure, which
+#      only ever reads stderr -- still sees everything.
+#   2. stdin_text is ignored: no stdin redirection exists in the shared
+#      os_exec_run primitive. Fine for every current caller
+#      (proc.patlang always passes "") -- a real gap for a future one
+#      that needs it.
+#   3. `success` IS a real process exit code check (exit code == 0),
+#      via os_last_exec_exit_code -- x64_os_exec_run_asm was extended to
+#      call GetExitCodeProcess and stash the result in a shared global
+#      right after WaitForSingleObject, additively (its own existing
+#      single-value return convention, relied on by exec_capture's
+#      already-proven callers, is untouched). An earlier version of this
+#      wrapper approximated success as "the captured output is
+#      non-empty" -- found wrong directly, via terminal_native.patlang:
+#      a genuinely FAILING command (cmd.exe's "not recognized" message)
+#      still produces non-empty output, so that heuristic misreported
+#      almost every real failure as success. Fixed for real, not just
+#      documented as a gap.
+make a function called exec_capture_io takes program, args, stdin_text returns result
+  let n = args.length
+  let arr = rt_heap_alloc((n + 1) * 8)
+  mem_poke_qword(arr, 0, program)
+  let i = 0
+  while i < n do
+    mem_poke_qword(arr, (i + 1) * 8, args[i])
+    let i = i + 1
+  end
+  let cmdline = rt_exec_join_args(arr, n + 1)
+  let addr = (cmdline band rt_payload_mask()) + 8
+  let len = rt_str_len(cmdline)
+  let raw = os_exec_run(addr, len)
+  let combined = raw bor rt_string_tag()
+  let exit_code = os_last_exec_exit_code()
+  let success = exit_code == 0
+  return [combined, combined, success]
+end
+
 # =============================================================================
 # Prolog-like logic engine (GitHub #26, Stage 1 of the #25 Rust-free-
 # toolchain roadmap): rule_add/solve, real unification with backtracking.
@@ -4403,6 +4502,101 @@ make a function called conns_table_remove takes conn returns done
   return true
 end
 
+# Real OS threads (thread_spawn/thread_poll/thread_result). Same
+# [id, opaque-value] table pattern as conns_table just above -- thread
+# handles are exposed to PatLang code as small ids, never as bare heap
+# addresses (see mem_threads_table_addr's own header in codegen_x64.
+# patlang for why). thread_spawn/thread_poll/thread_result themselves
+# only ever run on the MAIN thread (they're what CREATES/polls a
+# background thread, called from ordinary command handling) -- the
+# set_var/get calls here are exactly as safe as every other main-
+# thread-only use of them elsewhere in this codebase. The constraint
+# is on the SPAWNED closure's OWN body, which runs on the new
+# background thread: it must NOT call set_var/get, or anything that
+# does internally (conns_table_add, tcp_connect/tcp_write/tcp_read/
+# tcp_read_or_empty, event_loop.patlang's own when/emit) -- g_vars_
+# table (what set_var/get share) is process-wide shared mutable state
+# with no lock protecting it, unlike g_scratch/g_scratch2 (see
+# x64_lock_acquire_asm's own header) and the atomically-bumped heap
+# (rt_heap_alloc, safe). A spawned closure needing network I/O must
+# use the RAW primitives directly (os_connect/os_send/os_recv/
+# os_closesocket), never the table-backed tcp_* wrappers -- named,
+# deliberate scope limit, not an oversight: auditing g_vars_table
+# itself for thread-safety is real, separate, larger work this pass
+# doesn't attempt.
+make a function called logic_threads_list returns l
+  let addr = mem_threads_table_addr()
+  let l = mem_peek_qword(addr, 0)
+  if l == 0 then
+    let l = rt_list_new(0)
+    mem_poke_qword(addr, 0, l)
+  end
+  return l
+end
+
+make a function called logic_threads_list_set takes l returns done
+  mem_poke_qword(mem_threads_table_addr(), 0, l)
+  return true
+end
+
+make a function called logic_next_thread_id returns id
+  let cur = to_num(get("__vars", "__thread_id_ctr"))
+  let next = cur + 1
+  set_var("__thread_id_ctr", next)
+  return next
+end
+
+make a function called threads_table_add takes ctx_addr returns id
+  let id = logic_next_thread_id()
+  let threads = logic_threads_list()
+  let threads = rt_list_push(threads, [id, ctx_addr])
+  logic_threads_list_set(threads)
+  return id
+end
+
+make a function called threads_table_lookup takes id returns ctx_addr
+  let threads = logic_threads_list()
+  let n = threads.length
+  let i = 0
+  while i < n do
+    if threads[i][0] == id then
+      return threads[i][1]
+    end
+    let i = i + 1
+  end
+  return 0 - 1
+end
+
+# thread_spawn(closure) -> id. `closure` is an ordinary closure value
+# (`|| { ... }` / `|x, y| { ... }` literal syntax) -- see
+# os_thread_spawn_raw's own header in codegen_x64.patlang for why a
+# closure, not a function-name string, and the same file's
+# patlang_thread_trampoline for the real CreateThread mechanics.
+make a function called thread_spawn takes closure returns id
+  let ctx_addr = os_thread_spawn_raw(closure)
+  return threads_table_add(ctx_addr)
+end
+
+# thread_poll(id) -> true once the spawned closure has returned (its
+# own result is then available via thread_result). Never blocks --
+# reads the context block's own done_flag directly (mem_peek_qword),
+# matching the read side of patlang_thread_trampoline's own store-
+# result-then-store-done_flag ordering.
+make a function called thread_poll takes id returns is_done
+  let ctx_addr = threads_table_lookup(id)
+  return mem_peek_qword(ctx_addr, 16) == 1
+end
+
+# thread_result(id) -> the spawned closure's own return value. Only
+# meaningful after thread_poll(id) has returned true -- reads whatever
+# is in the context block's result slot regardless, so calling this
+# before the thread is actually done returns stale/zero data, not an
+# error (this backend has no exceptions to raise one with).
+make a function called thread_result takes id returns value
+  let ctx_addr = threads_table_lookup(id)
+  return mem_peek_qword(ctx_addr, 24)
+end
+
 make a function called tcp_listen takes port returns actual
   os_wsa_startup()
   let sock = os_socket_tcp()
@@ -5017,6 +5211,92 @@ end
 # header in codegen_x64.patlang for the real ReadFile-loop logic).
 make a function called read_line returns line
   return os_read_line()
+end
+
+# console_raw_enable() -> the console's previous mode as a plain int, or
+# -1 if stdin isn't a real console (a pipe, a redirected file) -- see
+# os_enable_raw_mode's own header in codegen_x64.patlang. Callers MUST
+# check for -1 and skip raw-mode reading entirely in that case (fall
+# back to read_line) -- there is no keystroke-level input available on
+# a non-console stdin, full stop, not something to fake.
+make a function called console_raw_enable returns old_mode
+  return os_enable_raw_mode()
+end
+
+# console_raw_disable(old_mode) -> restores the mode console_raw_enable
+# reported. A no-op guard against old_mode == -1 lives here (not in the
+# native primitive) so ordinary PatLang callers never need to remember
+# to skip it themselves.
+make a function called console_raw_disable takes old_mode returns done
+  if old_mode == -1 then
+    return true
+  end
+  return os_disable_raw_mode(old_mode)
+end
+
+# console_read_raw_byte() -> the next raw byte from stdin as a plain int
+# (0-255), or -1 at EOF/error. Only meaningful after a successful
+# console_raw_enable() -- see os_read_raw_byte's own header.
+make a function called console_read_raw_byte returns byte
+  return os_read_raw_byte()
+end
+
+# console_set_utf8() -> sets the console's input and output code pages
+# to UTF-8. See os_set_console_utf8's own header for why this is
+# needed: WriteFile writes raw bytes with no encoding awareness of its
+# own, and a Windows console's default output code page is a legacy
+# OEM page, not UTF-8 -- without this, any UTF-8 multi-byte character
+# this codebase's own source (or a captured command's own output)
+# contains renders as mojibake. Safe to call even on a non-console
+# stdout/stdin (redirected/piped) -- SetConsoleOutputCP/SetConsoleCP
+# simply fail harmlessly in that case, same as SetConsoleMode already
+# does elsewhere in this file.
+make a function called console_set_utf8 returns done
+  return os_set_console_utf8()
+end
+
+# cwd() -> the process's current working directory, as a tagged string.
+make a function called cwd returns path
+  return os_get_cwd()
+end
+
+# set_cwd(path) -> true/false (SetCurrentDirectoryA). A real, in-process
+# working-directory change -- see os_set_cwd's own header for why this
+# is required for `cd` to work at all (a subprocess's own directory
+# change can never propagate back to this process, no matter how it's
+# spawned).
+make a function called set_cwd takes path returns ok
+  let addr = (path band rt_payload_mask()) + 8
+  let len = rt_str_len(path)
+  return os_set_cwd(addr, len) == 1
+end
+
+# console_enable_colors() -> true if the console now honors ANSI escape
+# sequences, false otherwise (redirected/piped stdout, where this is
+# not applicable at all -- see os_enable_ansi_colors's own header).
+# Callers must check this before emitting any color codes.
+make a function called console_enable_colors returns ok
+  return os_enable_ansi_colors() == 1
+end
+
+# apply(fname) -- invoke a PatLang function by NAME, with zero explicit
+# args, matching the interpreter's own apply() exactly (used throughout
+# self_hosting/lib/console.patlang and self_hosting/lib/test.patlang's
+# step() dispatcher). See codegen_x64.patlang's "apply(fname): dynamic
+# dispatch-by-name" section for the full design -- the actual name-
+# matching scan lives here, in ordinary PatLang (reusing the already-
+# proven rt_str_eq), with only the table lookup and the indirect call
+# itself as native primitives.
+make a function called apply takes fname returns result
+  let count = os_apply_table_count()
+  let i = 0
+  while i < count do
+    if rt_str_eq(fname, os_apply_table_name_at(i)) then
+      return os_call_indirect(os_apply_table_func_at(i))
+    end
+    let i = i + 1
+  end
+  return false
 end
 
 # fact/query/goal -- the legacy flat 2-arg fact-store trio (superseded

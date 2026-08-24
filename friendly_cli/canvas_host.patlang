@@ -1,0 +1,722 @@
+# Canvas host: embeds friendly_cli's console core (console_step,
+# self_hosting/lib/console.patlang) directly in-process -- both
+# compiled into this ONE binary, no subprocess/IPC involved -- and
+# renders its output as scrolling text on a real Win32 canvas this
+# program owns (self_hosting/lib/win32_window.patlang), instead of
+# terminal_native.patlang's own blocking stdin loop against a real
+# terminal. terminal_native.patlang itself is untouched and keeps
+# working standalone; this is a peer, not a replacement.
+#
+# Deliberately independent of ConPTY (Phase 2) here -- console_step
+# only ever returns plain strings, no VT100/ANSI at all, so embedding
+# it needs nothing from the ConPTY work. A real external-program pane
+# (vim/bash via ConPTY) is Phase 4's job, once the VT100 interpreter
+# exists to render its output correctly; wiring it in before that would
+# just mean a second copy of Phase 2's own "unprocessed dump" problem.
+#
+# Uses "interactive" mode (plain "[event_kind] message -- detail"
+# text), not "agent"/JSON -- a deliberate scope cut: JSON parsing to
+# drive per-field styling is real, additional work over "typing help,
+# seeing correct scrolling output," the original success criterion.
+# Color/richer styling (matching terminal_native.patlang's own
+# tmn_colorize_event, or the cleaner JSON-driven approach console.
+# patlang's own research already recommends) stays future polish, not
+# required to prove embedding works.
+#
+# Since Phase 3: WM_KEYDOWN is now also handled (Ctrl+C/Ctrl+V for
+# clipboard copy/paste of the scrollback -- canvas_clipboard_copy/
+# _paste, win32_window.patlang), alongside the original WM_CHAR path
+# for Enter/Backspace/printable keys (win_peek_message already calls
+# TranslateMessage before DispatchMessageW for anything that isn't
+# WM_PAINT, so those still need no extra plumbing). WM_SIZE triggers a
+# DIB reallocation + redraw (win_canvas_resize, spliced from win_peek_
+# message itself -- see that function's own header for why WM_SIZE
+# can't be caught via the ordinary queued-message path). No cursor
+# movement, no history recall -- still real, named scope cuts, not
+# oversights.
+#
+# `send <host[:port]> <command...>` and `ask <model> <question...>`
+# (ch_builtin_send/ch_builtin_ask below) run their network I/O on a
+# real OS thread (thread_spawn, x64_runtime.patlang) so the UI keeps
+# responding while a reply is in flight -- only one such async command
+# may be outstanding at a time (ch_async_id), and the main loop polls
+# thread_poll/thread_result once per tick to know when to append the
+# result and redraw. Background worker closures must never touch
+# set_var/get-backed helpers (see thread_spawn's own header in x64_
+# runtime.patlang) -- ch_send_worker/ch_ask_worker use raw os_connect/
+# os_send/os_recv/os_closesocket for exactly that reason.
+
+include "../self_hosting/lib/console.patlang"
+include "../self_hosting/lib/win32_window.patlang"
+include "../self_hosting/lib/image.patlang"
+include "../self_hosting/lib/image_load.patlang"
+# json.patlang, ollama.patlang's own declared dependency (see its
+# header: "concatenate after lib/json.patlang"), is ALREADY pulled in
+# transitively via console.patlang -> output.patlang -- adding it again
+# here directly would duplicate every function it defines (include has
+# no de-duplication, self_hosting/lib/includes.patlang splices
+# unconditionally), so only ollama.patlang itself is added.
+include "../self_hosting/lib/ollama.patlang"
+
+# Deliberately no top-level `let` constants for width/height/line
+# height/max lines: a top-level `let` is only a local of the
+# synthesized `main` function, with no automatic sharing into OTHER
+# functions (ch_run, ch_redraw) that would need it -- referencing one
+# cross-function used to silently miscompile to reading the caller's
+# saved frame pointer as if it were the variable's value (found and
+# fixed in codegen_x64.patlang's x64_local_index call sites this
+# session). Inlining the literals below sidesteps the pattern
+# entirely rather than relying on the compiler to reject it correctly.
+
+# ch_print(text) -- the canvas-host equivalent of terminal_native.
+# patlang's built-in handlers calling print() directly: console_step's
+# own generic "[ok] <cmd> completed" rendering has no room for a
+# handler's own custom text, so a handler that wants to show something
+# richer (like help's own command list) appends it here instead, into
+# a per-command-tick buffer ch_run drains into the scrollback right
+# after each console_step call (see ch_run's own "Given ... When
+# Enter" handling).
+make a function called ch_print takes text returns done
+  let lines = get("__vars", "ch_pending_lines")
+  set_var("ch_pending_lines", list_push(lines, text))
+  return true
+end
+
+make a function called ch_builtin_help returns ok
+  ch_print("canvas_host (native, embedded friendly_cli).")
+  ch_print("Built-in commands: help, status, exit, quit.")
+  return true
+end
+
+make a function called ch_builtin_status returns ok
+  ch_print("embedded friendly_cli console -- Phase 3 canvas host, no ConPTY pane wired in yet (Phase 4).")
+  return true
+end
+
+# Local copy of terminal_native.patlang's own tmn_joined_path_arg --
+# canvas_host.patlang deliberately doesn't include terminal_native.
+# patlang (that would pull in ConPTY/raw-mode console code this host
+# doesn't use), so a small duplicate here is the right call over a
+# shared-library extraction that isn't otherwise justified yet.
+make a function called ch_joined_path_arg takes args returns path
+  let joined = ""
+  let i = 0
+  while i < args.length do
+    if i > 0 then
+      let joined = joined + " "
+    end
+    let joined = joined + args[i]
+    let i = i + 1
+  end
+  if (joined.length >= 2) and (substr(joined, 0, 1) == "\"") and (substr(joined, joined.length - 1, 1) == "\"") then
+    return substr(joined, 1, joined.length - 2)
+  end
+  return joined
+end
+
+# ch_builtin_img -- Phase 5: draws a real image straight onto the
+# canvas via canvas_blit_image, bypassing Sixel entirely (unlike
+# terminal_native.patlang's own tmn_img, which Sixel-encodes for a
+# real terminal -- this host owns its own canvas, so it just blits).
+# Drawn at a fixed position in the canvas's right-hand margin (x=520)
+# rather than computed from the current scrollback length -- a named
+# scope cut, not an oversight: the text area's own max 28 lines can
+# reach close to the full canvas height, so a truly dynamic layout
+# would need real space negotiation between the two; fixed placement
+# proves the blit pipeline works without that extra design work. The
+# shown image is remembered (ch_last_image) so ch_redraw's own per-
+# keystroke canvas_fill(0,0,0) doesn't erase it until a new image (or
+# none) replaces it.
+make a function called ch_builtin_img returns ok
+  let args = get("__vars", "console_args")
+  if args.length == 0 then
+    ch_print("usage: img <path>")
+    return false
+  end
+  let path = ch_joined_path_arg(args)
+  let image = img_load_file(path)
+  if image.length == 0 then
+    ch_print("'" + path + "' could not be read/decoded -- check the path, and that it's a supported format (currently: BMP, PNG).")
+    return false
+  end
+  set_var("ch_last_image", image)
+  canvas_blit_image(image, 520, 40)
+  ch_print("loaded " + path + " (" + img_width(image) + "x" + img_height(image) + ")")
+  return true
+end
+
+# ---- bash-like builtins ----
+#
+# Real, in-process implementations (list_dir/read_file/cwd/set_cwd,
+# self_hosting/lib/x64_runtime.patlang) -- NOT `cmd.exe /c dir` under
+# the hood. `cd` in particular could never work via a subprocess at
+# all (a subprocess's own directory change can never propagate back to
+# this process, the same reason terminal_native.patlang's own tmn_cd
+# is native, not shelled out -- see that function's own header).
+
+make a function called ch_builtin_pwd returns ok
+  ch_print(cwd())
+  return true
+end
+
+make a function called ch_builtin_ls returns ok
+  let args = get("__vars", "console_args")
+  let path = "."
+  if args.length > 0 then
+    let path = ch_joined_path_arg(args)
+  end
+  let entries = list_dir(path)
+  if entries.length == 0 then
+    ch_print("(empty, or '" + path + "' is not a directory)")
+    return true
+  end
+  let i = 0
+  while i < entries.length do
+    ch_print(entries[i])
+    let i = i + 1
+  end
+  return true
+end
+
+# ch_split_lines(text) -- splits on \n, and (for a CRLF file, the
+# common case on Windows) trims a trailing \r off each line too. No
+# general split() primitive exists in this codebase yet -- a small
+# local helper here rather than adding one to x64_runtime.patlang for
+# a single caller.
+make a function called ch_split_lines takes text returns lines
+  let lines = []
+  let cur = ""
+  let i = 0
+  while i < text.length do
+    let c = char_code(text, i)
+    if c == 10 then
+      let lines = list_push(lines, cur)
+      let cur = ""
+    elif c != 13 then
+      let cur = cur + chr(c)
+    end
+    let i = i + 1
+  end
+  if cur != "" then
+    let lines = list_push(lines, cur)
+  end
+  return lines
+end
+
+make a function called ch_builtin_cat returns ok
+  let args = get("__vars", "console_args")
+  if args.length == 0 then
+    ch_print("usage: cat <path>")
+    return false
+  end
+  let path = ch_joined_path_arg(args)
+  let content = read_file(path)
+  if content == "" then
+    ch_print("'" + path + "' could not be read (missing, or not valid UTF-8).")
+    return false
+  end
+  let lines = ch_split_lines(content)
+  let i = 0
+  while i < lines.length do
+    ch_print(lines[i])
+    let i = i + 1
+  end
+  return true
+end
+
+make a function called ch_builtin_cd returns ok
+  let args = get("__vars", "console_args")
+  if args.length == 0 then
+    ch_print(cwd())
+    return true
+  end
+  let path = ch_joined_path_arg(args)
+  if set_cwd(path) then
+    return true
+  end
+  ch_print("'" + path + "' could not be resolved as a directory.")
+  return false
+end
+
+# ch_builtin_cls -- clears the on-screen scrollback. A builtin has no
+# direct access to ch_run's own `history` local (it only sees
+# console_args/ch_print, same as every other builtin here), so this
+# sets a side-channel flag (ch_clear_screen) the SAME way ch_print
+# itself uses ch_pending_lines -- ch_run_command reads it back after
+# running the command and reports it to its own caller, which resets
+# history before appending this command's own output lines.
+make a function called ch_builtin_cls returns ok
+  set_var("ch_clear_screen", true)
+  return true
+end
+
+# ch_builtin_wc -- "wc <path>": real line/word/character counts (read_
+# file + a plain PatLang count, not a shelled-out `wc.exe` -- matches
+# every other builtin here being a genuine in-process implementation).
+# Lines counted the same way ch_split_lines already does (a line is
+# whatever's between \n's, \r stripped) so `cat`'s own line numbering
+# and this agree on what a "line" is for the same file.
+make a function called ch_builtin_wc returns ok
+  let args = get("__vars", "console_args")
+  if args.length == 0 then
+    ch_print("usage: wc <path>")
+    return false
+  end
+  let path = ch_joined_path_arg(args)
+  let content = read_file(path)
+  if content == "" then
+    ch_print("'" + path + "' could not be read (missing, or not valid UTF-8).")
+    return false
+  end
+  let lines = ch_split_lines(content)
+  let line_count = lines.length
+  let word_count = 0
+  let in_word = false
+  let i = 0
+  while i < content.length do
+    let c = char_code(content, i)
+    let is_space = (c == 32) or (c == 9) or (c == 10) or (c == 13)
+    if is_space then
+      let in_word = false
+    elif not in_word then
+      let word_count = word_count + 1
+      let in_word = true
+    end
+    let i = i + 1
+  end
+  ch_print(line_count + " " + word_count + " " + content.length + " " + path)
+  return true
+end
+
+# ch_list_tail(l) -- every element after the first. No general list-
+# tail primitive exists in this codebase (mirrors ch_split_lines's own
+# "small local helper" call for the same reason).
+make a function called ch_list_tail takes l returns tail
+  let out = []
+  let i = 1
+  while i < l.length do
+    let out = list_push(out, l[i])
+    let i = i + 1
+  end
+  return out
+end
+
+# ch_parse_host_port("4747") -> ["127.0.0.1", 4747]
+# ch_parse_host_port("192.168.1.5:4747") -> ["192.168.1.5", 4747]
+make a function called ch_parse_host_port takes spec returns result
+  let colon = logic_str_index_of(spec, ":")
+  if colon < 0 then
+    return ["127.0.0.1", to_num(spec)]
+  end
+  let host = substr(spec, 0, colon)
+  let port_str = substr(spec, colon + 1, spec.length - colon - 1)
+  return [host, to_num(port_str)]
+end
+
+# ---- background workers (run on a SEPARATE OS thread via
+# thread_spawn -- see thread_spawn's own header in x64_runtime.patlang
+# for the hard constraint this whole section exists to satisfy: a
+# spawned closure must never call set_var/get or anything that does
+# internally (conns_table_add, tcp_connect/tcp_write/tcp_read/
+# tcp_read_or_empty), since g_vars_table has no lock protecting it
+# from a second thread. Every function below uses ONLY raw primitives
+# (os_connect/os_send/os_recv/os_closesocket/os_set_nonblocking) for
+# exactly this reason -- NOT the table-backed tcp_* wrappers, and NOT
+# ollama.patlang's own ollama_chat_once (its http_roundtrip uses
+# tcp_connect/tcp_write/tcp_read internally). String building
+# (json_quote, "+") and json_parse/json_get/json_str are all safe here
+# -- pure computation through rt_heap_alloc, which real OS threads made
+# atomic this session (see rt_heap_alloc's own header). ----
+
+make a function called ch_send_worker takes host, port, cmd_text returns reply
+  let sock = os_connect(host, port)
+  if sock == (0 - 1) then
+    return ""
+  end
+  os_set_nonblocking(sock)
+  os_send(sock, cmd_text + "\n")
+  let reply = ""
+  let quiet_ticks = 0
+  let total_ticks = 0
+  while (quiet_ticks < 8) and (total_ticks < 150) do
+    let chunk = os_recv(sock)
+    if chunk != "" then
+      let reply = reply + chunk
+      let quiet_ticks = 0
+    elif reply != "" then
+      let quiet_ticks = quiet_ticks + 1
+    end
+    sleep_ms(20)
+    let total_ticks = total_ticks + 1
+  end
+  os_closesocket(sock)
+  return reply
+end
+
+# Mirrors ollama.patlang's own ollama_chat_once/http_roundtrip logic
+# exactly (same request shape, same dechunk/http_body parsing, both
+# pure and safe to reuse here) but with os_connect/os_send/os_recv/
+# os_closesocket in place of tcp_connect/tcp_write/tcp_read/tcp_close.
+make a function called ch_ask_worker takes model, question returns reply
+  let sock = os_connect("127.0.0.1", 11434)
+  if sock == (0 - 1) then
+    return "ERROR: can't reach Ollama at 127.0.0.1:11434 (is it running?)"
+  end
+  let messages = "[{\"role\":\"system\",\"content\":" + json_quote("You are a helpful assistant embedded in a terminal window. Keep answers concise.") + "},{\"role\":\"user\",\"content\":" + json_quote(question) + "}]"
+  let body = "{\"model\":" + json_quote(model) + ",\"think\":false,\"messages\":" + messages + ",\"stream\":false}"
+  let req = "POST /api/chat HTTP/1.1" + crlf() + "Host: 127.0.0.1" + crlf() + "Content-Type: application/json" + crlf() + "Content-Length: " + byte_length(body) + crlf() + "Connection: close" + crlf() + crlf() + body
+  os_send(sock, req)
+  let raw = ""
+  let chunk = os_recv(sock)
+  while chunk != "" do
+    let raw = raw + chunk
+    let chunk = os_recv(sock)
+  end
+  os_closesocket(sock)
+  let resp = http_body(raw)
+  let v = json_parse(resp)
+  let err = json_get(v, "error")
+  if err[0] == "str" then
+    return "ERROR: " + json_str(err)
+  end
+  return json_str(json_get(json_get(v, "message"), "content"))
+end
+
+# ---- async command dispatch: ch_builtin_send/ch_builtin_ask (run on
+# the MAIN thread, as ordinary console_step handlers) only ever
+# thread_spawn a worker and return immediately with an interim
+# "waiting" line -- the real reply is picked up later by
+# ch_poll_async, called once per ch_run main-loop iteration (same
+# shape as the network-server poll already there). Single-pending-op
+# at a time (ch_async_id/ch_async_label), matching this whole file's
+# existing "one thing in flight" scope (one net_conn, one image) --
+# a second async command while one is already running is rejected
+# with a clear message rather than silently queued or clobbering the
+# first. ----
+
+make a function called ch_builtin_send returns ok
+  if get("__vars", "ch_async_id") != 0 then
+    ch_print("send: another async command is still running -- wait for it first.")
+    return false
+  end
+  let args = get("__vars", "console_args")
+  if args.length < 2 then
+    ch_print("usage: send <port|host:port> <command text...>")
+    return false
+  end
+  let hp = ch_parse_host_port(args[0])
+  let host = hp[0]
+  let port = hp[1]
+  let cmd_text = ch_joined_path_arg(ch_list_tail(args))
+  let id = thread_spawn(|| { ch_send_worker(host, port, cmd_text) })
+  set_var("ch_async_id", id)
+  set_var("ch_async_label", "send " + args[0])
+  ch_print("send: waiting for reply from " + host + ":" + port + "...")
+  return true
+end
+
+make a function called ch_builtin_ask returns ok
+  if get("__vars", "ch_async_id") != 0 then
+    ch_print("ask: another async command is still running -- wait for it first.")
+    return false
+  end
+  let args = get("__vars", "console_args")
+  if args.length < 2 then
+    ch_print("usage: ask <model> <question...>")
+    return false
+  end
+  let model = args[0]
+  let question = ch_joined_path_arg(ch_list_tail(args))
+  let id = thread_spawn(|| { ch_ask_worker(model, question) })
+  set_var("ch_async_id", id)
+  set_var("ch_async_label", "ask " + model)
+  ch_print("ask: waiting for " + model + "...")
+  return true
+end
+
+make a function called ch_dispatch_table returns table
+  return [
+    ["help", "ch_builtin_help"],
+    ["status", "ch_builtin_status"],
+    ["img", "ch_builtin_img"],
+    ["pwd", "ch_builtin_pwd"],
+    ["ls", "ch_builtin_ls"],
+    ["cat", "ch_builtin_cat"],
+    ["cd", "ch_builtin_cd"],
+    ["send", "ch_builtin_send"],
+    ["ask", "ch_builtin_ask"],
+    ["cls", "ch_builtin_cls"],
+    ["wc", "ch_builtin_wc"]
+  ]
+end
+
+# ch_redraw(history, input_line) -- clears the canvas and redraws
+# every visible history line plus the current input line with a
+# prompt prefix. A full redraw on every change, not real GDI scrolling/
+# bitmap-shifting -- deliberately simple for this phase; a text
+# console's own redraw cost is negligible done this way, even every
+# keystroke.
+make a function called ch_redraw takes history, input_line returns done
+  canvas_fill(0, 0, 0)
+  let max_lines = 28
+  let start = 0
+  if history.length > max_lines then
+    let start = history.length - max_lines
+  end
+  let y = 4
+  let i = start
+  while i < history.length do
+    canvas_text(4, y, history[i])
+    let y = y + 16
+    let i = i + 1
+  end
+  canvas_text(4, y, "> " + input_line)
+  let last_image = get("__vars", "ch_last_image")
+  if last_image != 0 then
+    canvas_blit_image(last_image, 520, 40)
+  end
+  win_invalidate()
+  return true
+end
+
+# ch_run_command(state, input_text) -> [new_state, lines, clear_screen].
+# Runs one command through console_step and collects every line of its
+# output (ch_print's own side-channel lines, THEN console_step's
+# generic "[ok] .../[error] ..." status line last) as a plain list --
+# shared by BOTH the keyboard path (each line pushed into the on-
+# screen scrollback) and the network path (same lines, joined with \n,
+# written back over the socket) so the two input sources can never
+# drift out of sync with each other. clear_screen mirrors ch_
+# pending_lines' own side-channel pattern -- ch_builtin_cls has no
+# direct access to ch_run's own `history` local, so it sets a flag
+# here instead, read back and cleared on every call so a stale true
+# from an earlier command can never leak into a later, unrelated one.
+make a function called ch_run_command takes state, input_text returns result
+  set_var("ch_pending_lines", [])
+  set_var("ch_clear_screen", false)
+  let table = ch_dispatch_table()
+  let step_result = console_step(state, input_text, table)
+  let new_state = cs_result_state(step_result)
+  let lines = get("__vars", "ch_pending_lines")
+  let output = cs_result_output(step_result)
+  if output != "" then
+    let lines = list_push(lines, output)
+  end
+  let clear_screen = get("__vars", "ch_clear_screen")
+  return [new_state, lines, clear_screen]
+end
+
+# ch_net_port() -- the TCP port canvas_host listens on for remote
+# commands (see ch_run's own header on the listen-with-retry loop for
+# why this needs to be a small range, not a single fixed port).
+make a function called ch_net_port_base returns port
+  return 4747
+end
+
+make a function called ch_run returns done
+  canvas_open(800, 500)
+  set_var("ch_pending_lines", [])
+  set_var("ch_async_id", 0)
+  let history = []
+  let history = list_push(history, "canvas_host: embedded friendly_cli. Type 'help', 'exit' to quit.")
+  let input_line = ""
+  let state = console_new_state("interactive")
+
+  let net_port = 0 - 1
+  let try_port = ch_net_port_base()
+  let tries = 0
+  while (net_port == (0 - 1)) and (tries < 8) do
+    let attempt = tcp_try_listen(try_port)
+    if attempt != (0 - 1) then
+      let net_port = try_port
+    end
+    let try_port = try_port + 1
+    let tries = tries + 1
+  end
+  if net_port != (0 - 1) then
+    canvas_set_title("PatLang Canvas (net :" + net_port + ")")
+  else
+    canvas_set_title("PatLang Canvas (net: unavailable)")
+  end
+  let net_conn = 0 - 1
+  let net_buf = ""
+
+  ch_redraw(history, input_line)
+  let running = true
+  while running do
+    let msg = canvas_pump_once()
+    if (msg == wm_close()) or (msg == wm_destroy()) then
+      let running = false
+    elif msg == wm_char() then
+      let ch = win_last_wparam()
+      if ch == 13 then
+        if (input_line == "exit") or (input_line == "quit") then
+          let running = false
+        else
+          let history2 = history
+          if input_line != "" then
+            let history2 = list_push(history, "> " + input_line)
+          end
+          let cmd_result = ch_run_command(state, input_line)
+          let state = cmd_result[0]
+          let lines = cmd_result[1]
+          if cmd_result[2] then
+            let history2 = []
+          end
+          let li = 0
+          while li < lines.length do
+            let history2 = list_push(history2, lines[li])
+            let li = li + 1
+          end
+          let history = history2
+          let input_line = ""
+          ch_redraw(history, input_line)
+        end
+      elif ch == 8 then
+        if input_line.length > 0 then
+          let input_line = substr(input_line, 0, input_line.length - 1)
+          ch_redraw(history, input_line)
+        end
+      elif (ch >= 32) and (ch < 127) then
+        let input_line = input_line + chr(ch)
+        ch_redraw(history, input_line)
+      end
+    elif msg == wm_size() then
+      # The DIB surface itself is already reallocated by the time
+      # canvas_pump_once returns this code (see win_peek_message's own
+      # header) -- this just repaints OUR content (text) into the
+      # freshly-resized buffer, the same full-redraw-on-any-change
+      # approach ch_redraw already uses everywhere else.
+      ch_redraw(history, input_line)
+    elif msg == wm_keydown() then
+      # Ctrl+C copies the WHOLE visible scrollback (not a mouse-drag
+      # selection -- there's no cell-level selection model here, this
+      # is plain scrolling text lines, unlike vt100.patlang's real
+      # character grid; copying everything currently on screen is the
+      # simplest genuinely useful version). Ctrl+V inserts clipboard
+      # text at the END of the current input line (no cursor-position
+      # tracking exists in this input model at all, matching this
+      # file's own established "no cursor movement" scope note) --
+      # \r/\n are stripped so a multi-line paste can't corrupt the
+      # single-line input display.
+      let vk = win_last_wparam()
+      if canvas_ctrl_down() and (vk == 67) then
+        let clip_text = ""
+        let hi = 0
+        while hi < history.length do
+          if hi > 0 then
+            let clip_text = clip_text + "\n"
+          end
+          let clip_text = clip_text + history[hi]
+          let hi = hi + 1
+        end
+        canvas_clipboard_copy(clip_text)
+      elif canvas_ctrl_down() and (vk == 86) then
+        let pasted = canvas_clipboard_paste()
+        let clean = ""
+        let pi = 0
+        while pi < pasted.length do
+          let pc = char_code(pasted, pi)
+          if (pc != 10) and (pc != 13) then
+            let clean = clean + chr(pc)
+          end
+          let pi = pi + 1
+        end
+        let input_line = input_line + clean
+        ch_redraw(history, input_line)
+      end
+    end
+    # Async command poll -- one thread_poll check per iteration (never
+    # blocks, see thread_poll's own header). ch_async_id/ch_async_label
+    # are the ONLY things ch_builtin_send/ch_builtin_ask themselves
+    # touch on the main thread (thread_spawn's own worker closure runs
+    # separately, on the new thread -- see its own header for why it
+    # must avoid set_var/get, unlike this poll code here, which is
+    # main-thread-only and safe).
+    let async_id = get("__vars", "ch_async_id")
+    if async_id != 0 then
+      if thread_poll(async_id) then
+        let result = thread_result(async_id)
+        let label = get("__vars", "ch_async_label")
+        let history2 = list_push(history, "[" + label + "]")
+        let lines = ch_split_lines(result)
+        let li = 0
+        while li < lines.length do
+          let history2 = list_push(history2, lines[li])
+          let li = li + 1
+        end
+        let history = history2
+        set_var("ch_async_id", 0)
+        ch_redraw(history, input_line)
+      end
+    end
+    # Network poll -- ONE non-blocking accept check per loop iteration
+    # (tcp_accept_timeout(port, 0) returns immediately either way, see
+    # its own header in x64_runtime.patlang) so a client connecting (or
+    # not) never stalls the UI. A freshly-accepted connection socket
+    # does NOT inherit the listener's own non-blocking mode on Windows
+    # -- os_set_nonblocking must be applied to it explicitly too, or
+    # the very first tcp_read_or_empty on a quiet connection would
+    # block this whole thread indefinitely.
+    #
+    # REAL BUG FOUND AND FIXED this session (root-caused via this exact
+    # loop -- see x64_os_recv_asm's own header in codegen_x64.patlang):
+    # recv()'s 32-bit SOCKET_ERROR return was compared against a 64-bit
+    # -1 sentinel, so an empty non-blocking socket's WSAEWOULDBLOCK
+    # failure was silently read as a ~4 billion-byte successful read.
+    # Fixed at the source (the recv() primitive itself), not worked
+    # around here.
+    if (net_port != (0 - 1)) and (net_conn == (0 - 1)) then
+      let accepted = tcp_accept_timeout(net_port, 0)
+      if accepted != (0 - 1) then
+        let net_conn = accepted
+        let net_buf = ""
+        os_set_nonblocking(conns_table_lookup(net_conn))
+      end
+    end
+    if net_conn != (0 - 1) then
+      let chunk = tcp_read_or_empty(net_conn)
+      if chunk != "" then
+        let net_buf = net_buf + chunk
+      end
+      let nl = logic_str_index_of(net_buf, "\n")
+      while nl >= 0 do
+        let cmd = substr(net_buf, 0, nl)
+        if (cmd.length > 0) and (char_code(cmd, cmd.length - 1) == 13) then
+          let cmd = substr(cmd, 0, cmd.length - 1)
+        end
+        let net_buf = substr(net_buf, nl + 1, net_buf.length - nl - 1)
+        if cmd == "exit" then
+          let running = false
+        elif cmd != "" then
+          let history2 = history
+          let history2 = list_push(history, "[net] " + cmd)
+          let cmd_result = ch_run_command(state, cmd)
+          let state = cmd_result[0]
+          let lines = cmd_result[1]
+          if cmd_result[2] then
+            let history2 = []
+          end
+          let reply = ""
+          let li = 0
+          while li < lines.length do
+            let history2 = list_push(history2, lines[li])
+            if li > 0 then
+              let reply = reply + "\n"
+            end
+            let reply = reply + lines[li]
+            let li = li + 1
+          end
+          let history = history2
+          tcp_write(net_conn, reply + "\n")
+          ch_redraw(history, input_line)
+        end
+        let nl = logic_str_index_of(net_buf, "\n")
+      end
+    end
+    sleep_ms(1)
+  end
+  return true
+end
+
+ch_run()

@@ -1,0 +1,83 @@
+# Generic external-command handler for friendly_cli's terminal driver
+# (terminal.patlang). Registered dynamically as the handler for whatever
+# command name the user actually typed, whenever it isn't one of
+# friendly_cli's own built-in meta-commands -- this is what makes the
+# terminal usable for everyday commands (dir, git, pandoc, ...), not just
+# a fixed DSL vocabulary.
+#
+# Every invocation is routed through command_safety.patlang's
+# classify_command FIRST, per that file's own header comment marking
+# this mandatory before any real command invocation is constructed. The
+# three non-"unclassified" tiers are honoured EXACTLY as
+# command_safety.patlang already defines them, not reinterpreted here:
+# "no_workaround" is refused outright with no fallback; "safe_alias"
+# commands are redirected to their existing safe substitute
+# (safe_delete_alias); "human_confirm" commands NEVER actually run --
+# command_safety.patlang's own header comment is explicit that only a
+# human running the real command directly, outside this tool, is
+# acceptable for that tier, so this handler surfaces the existing
+# read-only diagnostic (gather_taskkill_report) and stops there. There
+# is deliberately no "prompt y/N then run it anyway" path -- that would
+# contradict the safety model command_safety.patlang was built to
+# enforce.
+
+include "../lib/command_safety.patlang"
+include "../../self_hosting/lib/cli.patlang"
+include "../../self_hosting/lib/proc.patlang"
+
+make a function called shell_ops_run returns ok
+  let cmd = get("__vars", "console_cmd_name")
+  let args = get("__vars", "console_args")
+  let tier = classify_command(cmd)
+  if tier == "no_workaround" then
+    return shell_ops_refuse(cmd, "'" + cmd + "' is permanently blocked -- no safe workaround exists for it.")
+  end
+  if tier == "safe_alias" then
+    return shell_ops_run_safe_alias(cmd, args)
+  end
+  if tier == "human_confirm" then
+    return shell_ops_run_human_confirm(cmd, args)
+  end
+  return shell_ops_run_direct(cmd, args)
+end
+
+make a function called shell_ops_refuse takes cmd, hint returns ok
+  set_var("console_last_proc_result", ["1", "", "", "PermissionDenied", hint])
+  set_var("console_last_proc_result_set", true)
+  return false
+end
+
+make a function called shell_ops_run_direct takes cmd, args returns ok
+  let result = run_classified(cmd, args)
+  if pr_classification(result) == "Ok" then
+    print(pr_stdout(result))
+    return true
+  end
+  set_var("console_last_proc_result", result)
+  set_var("console_last_proc_result_set", true)
+  return false
+end
+
+make a function called shell_ops_run_safe_alias takes cmd, args returns ok
+  let target = arg_or_default(args, 0, "")
+  if target == "" then
+    return shell_ops_refuse(cmd, "'" + cmd + "' needs a target path to quarantine.")
+  end
+  let result = safe_delete_alias(target, "requested via friendly_cli terminal")
+  let status = result[0]
+  let message = result[1]
+  if status == "quarantined" then
+    return true
+  end
+  return shell_ops_refuse(cmd, message)
+end
+
+make a function called shell_ops_run_human_confirm takes cmd, args returns ok
+  if cmd == "taskkill" then
+    let process_name = arg_or_default(args, 0, "")
+    let report = gather_taskkill_report(process_name)
+    print(report)
+    return shell_ops_refuse(cmd, "taskkill was not run -- review the diagnostic above and run it yourself if appropriate.")
+  end
+  return shell_ops_refuse(cmd, "'" + cmd + "' requires a human to run it directly, outside this tool -- it is never auto-executed here.")
+end

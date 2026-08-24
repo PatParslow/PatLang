@@ -1,0 +1,672 @@
+# Core RGB pixel-buffer representation + Sixel terminal rendering.
+# Native --x64 ONLY: uses raw heap memory (rt_heap_alloc/mem_poke_byte/
+# mem_peek_byte) for pixel data rather than PatLang lists, matching this
+# codebase's existing convention for large binary buffers (a modest
+# 200x100 preview image is already 60,000 bytes -- far cheaper as a raw
+# buffer than as a PatLang list of lists). Format DECODERS (image_bmp.
+# patlang, image_png.patlang, etc) build an "image" value from raw file
+# bytes; this module turns an "image" into terminal output, and back.
+#
+# An "image" value is the plain 3-element list [width, height,
+# buf_addr] -- buf_addr is a RAW (untagged) heap address holding
+# width*height*3 bytes, row-major, 3 bytes (R,G,B) per pixel, no
+# padding, no alpha (alpha is composited onto a fixed background by
+# whichever decoder needs it -- see image_png.patlang's own notes for
+# why PNG specifically needs this).
+#
+# Verified directly, via a live user report confirming the rendering:
+# Sixel graphics genuinely display in Windows Terminal on this setup
+# (a hand-built red/green/blue test block, seen live) -- this was
+# checked BEFORE writing any of the decoder work below it, the same
+# "verify the foundation before building on it" discipline this whole
+# session's terminal work has followed throughout.
+
+# REAL BUG FOUND AND FIXED, found empirically (not caught by review):
+# PatLang's `/` operator performs EXACT RATIONAL division, not
+# truncating integer division -- `19 / 4` evaluates to the exact
+# fraction 19/4, not 4. Every division in this file that's meant to be
+# integer arithmetic (pixel offsets, palette percentages, band counts,
+# resize scaling) is wrapped in floor() (self_hosting/lib/x64_runtime.
+# patlang's own floor(), which already exists specifically to convert a
+# Rational division result to a real integer -- confirmed via its own
+# header comment: "this backend's only actual caller... only ever
+# floors a fixnum-or-Rational division result", i.e. this is the
+# established idiom for exactly this, not something invented here).
+# Confirmed directly: an unguarded `((row_size + 3) / 4) * 4` (the
+# classic "round up to a multiple of 4" C idiom, needed for BMP row
+# padding) algebraically simplifies straight back to `row_size + 3`
+# under exact rational arithmetic -- silently WRONG, not a crash, which
+# is why this needed a real decode-and-compare test against known pixel
+# values to catch, not just "it compiled and ran without error."
+
+include "includes.patlang"
+
+make a function called img_new takes width, height returns image
+  let buf = rt_heap_alloc(width * height * 3)
+  return [width, height, buf]
+end
+
+make a function called img_width takes image returns w
+  return image[0]
+end
+
+make a function called img_height takes image returns h
+  return image[1]
+end
+
+make a function called img_buf takes image returns addr
+  return image[2]
+end
+
+make a function called img_set_pixel takes image, x, y, r, g, b returns done
+  let w = img_width(image)
+  let buf = img_buf(image)
+  let offset = (y * w + x) * 3
+  mem_poke_byte(buf, offset, r)
+  mem_poke_byte(buf, offset + 1, g)
+  mem_poke_byte(buf, offset + 2, b)
+  return true
+end
+
+make a function called img_get_pixel takes image, x, y returns rgb
+  let w = img_width(image)
+  let buf = img_buf(image)
+  let offset = (y * w + x) * 3
+  let r = mem_peek_byte(buf, offset)
+  let g = mem_peek_byte(buf, offset + 1)
+  let b = mem_peek_byte(buf, offset + 2)
+  return [r, g, b]
+end
+
+# img_resize(image, new_w, new_h) -> a fresh image, nearest-neighbor
+# sampled. Deliberately not box-average/bilinear -- a real, acceptable
+# quality tradeoff for a terminal preview tool, not a photo editor;
+# nearest-neighbor is enough simpler to get right that it's the correct
+# choice for a first version of this feature.
+make a function called img_resize takes image, new_w, new_h returns resized
+  let src_w = img_width(image)
+  let src_h = img_height(image)
+  let out = img_new(new_w, new_h)
+  let y = 0
+  while y < new_h do
+    let src_y = floor((y * src_h) / new_h)
+    let x = 0
+    while x < new_w do
+      let src_x = floor((x * src_w) / new_w)
+      let px = img_get_pixel(image, src_x, src_y)
+      img_set_pixel(out, x, y, px[0], px[1], px[2])
+      let x = x + 1
+    end
+    let y = y + 1
+  end
+  return out
+end
+
+# img_fit(image, max_w, max_h) -> image resized to fit within max_w x
+# max_h (preserving aspect ratio), or the SAME image unchanged if it
+# already fits. Fixed-point (x1000) scale factor -- avoids needing
+# float math for what's fundamentally an integer-pixel operation.
+make a function called img_fit takes image, max_w, max_h returns fitted
+  let w = img_width(image)
+  let h = img_height(image)
+  if (w <= max_w) and (h <= max_h) then
+    return image
+  end
+  let scale_w = floor((max_w * 1000) / w)
+  let scale_h = floor((max_h * 1000) / h)
+  let scale = scale_w
+  if scale_h < scale then
+    let scale = scale_h
+  end
+  let new_w = floor((w * scale) / 1000)
+  let new_h = floor((h * scale) / 1000)
+  if new_w < 1 then
+    let new_w = 1
+  end
+  if new_h < 1 then
+    let new_h = 1
+  end
+  return img_resize(image, new_w, new_h)
+end
+
+# ---- palette / Sixel encoding ----
+
+make a function called img_palette_index takes palette, r, g, b returns idx
+  let i = 0
+  while i < palette.length do
+    if (palette[i][0] == r) and (palette[i][1] == g) and (palette[i][2] == b) then
+      return i
+    end
+    let i = i + 1
+  end
+  return -1
+end
+
+make a function called img_nearest_index takes palette, r, g, b returns idx
+  let best = 0
+  let best_dist = -1
+  let i = 0
+  while i < palette.length do
+    let dr = palette[i][0] - r
+    let dg = palette[i][1] - g
+    let db = palette[i][2] - b
+    let dist = (dr * dr) + (dg * dg) + (db * db)
+    if (best_dist == -1) or (dist < best_dist) then
+      let best_dist = dist
+      let best = i
+    end
+    let i = i + 1
+  end
+  return best
+end
+
+# img_build_palette(image, max_colors) -> up to max_colors [r,g,b]
+# triples. A real, named simplification, not a proper median-cut/
+# octree quantizer -- Sixel's own traditional register limit is 256
+# anyway, so SOME quantization is unavoidable regardless of algorithm
+# choice -- but weighted by actual pixel POPULARITY, not scan order.
+#
+# REAL BUG FOUND AND FIXED (live user report: "colours get slightly
+# corrupted" on real screenshots/photos, visible as color banding/
+# discoloration): the original version took the first max_colors
+# DISTINCT colors it happened to see, in raster-scan order, and
+# silently stopped adding new ones once the budget filled -- on a
+# busy photo/gradient image, a colorful top-left corner alone could
+# exhaust the entire 256-color budget before the scan ever reached the
+# rest of the image, leaving everything past that point nearest-
+# matched against a palette that had nothing to do with its actual
+# colors. Flat-fill vector art (icons, image_svg.patlang's own output)
+# never hit this, which is exactly why it went unnoticed until a real
+# photographic screenshot was tried.
+#
+# Fixed via a bucketed-histogram "popularity algorithm": quantize each
+# channel to 5 bits (32768 buckets total) for O(1) per-pixel histogram
+# indexing (no linear scan needed, unlike the old first-seen-dedup
+# check) -- accumulating both a count AND a running R/G/B sum per
+# bucket, so the final color is a genuine average of everything that
+# fell in it, not a coarse bucket corner. If every populated bucket
+# fits in max_colors, all of them are used directly (exact, same as
+# the old behavior for a naturally limited palette). Otherwise, the
+# max_colors MOST POPULOUS buckets are kept -- weighted by real pixel
+# frequency, so a small but locally dense region of the image can no
+# longer starve the rest of the palette budget.
+make a function called img_quantize_bucket_key takes r, g, b returns key
+  let rq = r shr 3
+  let gq = g shr 3
+  let bq = b shr 3
+  return (rq shl 10) bor (gq shl 5) bor bq
+end
+
+# img_populated_bucket_count(image) -> the number of distinct 5-bit-
+# per-channel-quantized (32768-bucket) colors actually present -- a
+# FAST (O(w*h), single pass, one array index per pixel, no linear scan
+# or per-pixel list growth) proxy for "how visually complex is this
+# image." Added directly from a live crash report: img_to_sixel_
+# truecolor has no bound on distinct colors, and a real photographic
+# screenshot (20,000+ distinct colors even after downscaling to a
+# 640x400 preview, confirmed directly against the exact file that
+# crashed) drove it to try to emit thousands of full-width color runs
+# per 6-row band -- enough string-builder growth and per-pixel
+# rescanning to exhaust the heap or simply take too long, with no
+# error, which is worse than just refusing. See img_truecolor_feasible
+# for the actual gate built on top of this.
+make a function called img_populated_bucket_count takes image returns count
+  let w = img_width(image)
+  let h = img_height(image)
+  let bucket_count = 32768
+  let seen = rt_list_new(bucket_count)
+  let i = 0
+  while i < bucket_count do
+    rt_list_set(seen, i, false)
+    let i = i + 1
+  end
+  let distinct = 0
+  let y = 0
+  while y < h do
+    let x = 0
+    while x < w do
+      let px = img_get_pixel(image, x, y)
+      let key = img_quantize_bucket_key(px[0], px[1], px[2])
+      if seen[key] == false then
+        rt_list_set(seen, key, true)
+        let distinct = distinct + 1
+      end
+      let x = x + 1
+    end
+    let y = y + 1
+  end
+  return distinct
+end
+
+# img_truecolor_feasible(image) -> true if img_to_sixel_truecolor is
+# safe to run on `image` without risking excessive output size/time.
+#
+# REAL BUG FOUND AND FIXED: this originally checked
+# img_populated_bucket_count (a GLOBAL, coarsely-quantized proxy)
+# against a threshold that looked generous (8192) -- but the real cost
+# driver is PER-BAND distinct exact colors, not a global coarse count,
+# and those can diverge sharply: the actual photo that crashed
+# img_to_sixel_truecolor had only 4918 populated global buckets (well
+# under 8192, so this check said "feasible") while one single 6-row
+# band alone had 1888 distinct EXACT colors in it -- the bucket count
+# simply doesn't see that kind of local concentration. Fixed to check
+# img_truecolor_total_runs directly instead: the literal count of
+# "#0;2;r;g;b + run" groups the real encode will emit, summed across
+# every band -- the actual thing that determines output size and
+# encode cost, not a proxy for it. 20000 total runs is comfortably
+# above any diagram/UI/game-board content this feature has actually
+# been tested against (the 281-distinct-color fixture totals far
+# fewer), and rejects the real photo that crashed it (which totals
+# tens of thousands across its bands).
+make a function called img_truecolor_feasible takes image returns ok
+  return img_truecolor_total_runs(image) <= 20000
+end
+
+make a function called img_build_palette takes image, max_colors returns palette
+  let w = img_width(image)
+  let h = img_height(image)
+  let bucket_count = 32768
+  let hist = rt_list_new(bucket_count)
+  let sum_r = rt_list_new(bucket_count)
+  let sum_g = rt_list_new(bucket_count)
+  let sum_b = rt_list_new(bucket_count)
+  let i = 0
+  while i < bucket_count do
+    rt_list_set(hist, i, 0)
+    rt_list_set(sum_r, i, 0)
+    rt_list_set(sum_g, i, 0)
+    rt_list_set(sum_b, i, 0)
+    let i = i + 1
+  end
+  let y = 0
+  while y < h do
+    let x = 0
+    while x < w do
+      let px = img_get_pixel(image, x, y)
+      let key = img_quantize_bucket_key(px[0], px[1], px[2])
+      rt_list_set(hist, key, hist[key] + 1)
+      rt_list_set(sum_r, key, sum_r[key] + px[0])
+      rt_list_set(sum_g, key, sum_g[key] + px[1])
+      rt_list_set(sum_b, key, sum_b[key] + px[2])
+      let x = x + 1
+    end
+    let y = y + 1
+  end
+
+  let distinct = 0
+  let k = 0
+  while k < bucket_count do
+    if hist[k] > 0 then
+      let distinct = distinct + 1
+    end
+    let k = k + 1
+  end
+
+  let palette = []
+  if distinct <= max_colors then
+    let k2 = 0
+    while k2 < bucket_count do
+      let cnt = hist[k2]
+      if cnt > 0 then
+        let avg_r = floor(sum_r[k2] / cnt)
+        let avg_g = floor(sum_g[k2] / cnt)
+        let avg_b = floor(sum_b[k2] / cnt)
+        let palette = list_push(palette, [avg_r, avg_g, avg_b])
+      end
+      let k2 = k2 + 1
+    end
+    return palette
+  end
+
+  let used = rt_list_new(bucket_count)
+  let u = 0
+  while u < bucket_count do
+    rt_list_set(used, u, false)
+    let u = u + 1
+  end
+  let picked = 0
+  let scanning = true
+  while scanning do
+    if picked >= max_colors then
+      let scanning = false
+    else
+      let best_key = 0 - 1
+      let best_count = 0
+      let m = 0
+      while m < bucket_count do
+        if (used[m] == false) and (hist[m] > best_count) then
+          let best_key = m
+          let best_count = hist[m]
+        end
+        let m = m + 1
+      end
+      if best_key < 0 then
+        let scanning = false
+      else
+        rt_list_set(used, best_key, true)
+        let avg_r = floor(sum_r[best_key] / best_count)
+        let avg_g = floor(sum_g[best_key] / best_count)
+        let avg_b = floor(sum_b[best_key] / best_count)
+        let palette = list_push(palette, [avg_r, avg_g, avg_b])
+        let picked = picked + 1
+      end
+    end
+  end
+  return palette
+end
+
+# img_build_index_buffer(image, palette) -> a RAW heap buffer, one byte
+# per pixel, holding each pixel's palette index (exact match, or
+# nearest-color match once the palette itself is full). Precomputed
+# ONCE here rather than re-matched on every access during Sixel
+# encoding (which revisits each pixel up to 6 times per band pass) --
+# a real, deliberate performance choice, not just tidiness.
+make a function called img_build_index_buffer takes image, palette returns idx_buf
+  let w = img_width(image)
+  let h = img_height(image)
+  let buf = rt_heap_alloc(w * h)
+  let y = 0
+  while y < h do
+    let x = 0
+    while x < w do
+      let px = img_get_pixel(image, x, y)
+      let idx = img_palette_index(palette, px[0], px[1], px[2])
+      if idx == -1 then
+        let idx = img_nearest_index(palette, px[0], px[1], px[2])
+      end
+      mem_poke_byte(buf, y * w + x, idx)
+      let x = x + 1
+    end
+    let y = y + 1
+  end
+  return buf
+end
+
+make a function called img_list_contains_int takes lst, val returns found
+  let i = 0
+  while i < lst.length do
+    if lst[i] == val then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# img_to_sixel(image) -> a full Sixel escape sequence (DCS ... ST),
+# ready to print/echo directly, rendering `image` in any Sixel-capable
+# terminal. Standard "raster attributes, then color table, then one
+# 6-pixel-tall band at a time, one full-width pass per color used in
+# that band" Sixel encoding -- see this file's own header for the
+# pixel-buffer/palette pieces this builds on.
+make a function called img_to_sixel takes image returns sixel_text
+  let w = img_width(image)
+  let h = img_height(image)
+  let palette = img_build_palette(image, 256)
+  let idx_buf = img_build_index_buffer(image, palette)
+  let sb = sb_new()
+  sb_push(sb, chr(27) + "Pq")
+  sb_push(sb, "\"1;1;" + w + ";" + h)
+  let ci = 0
+  while ci < palette.length do
+    let rp = floor((palette[ci][0] * 100) / 255)
+    let gp = floor((palette[ci][1] * 100) / 255)
+    let bp = floor((palette[ci][2] * 100) / 255)
+    sb_push(sb, "#" + ci + ";2;" + rp + ";" + gp + ";" + bp)
+    let ci = ci + 1
+  end
+  let band_count = floor((h + 5) / 6)
+  let band = 0
+  while band < band_count do
+    let y0 = band * 6
+    let used = []
+    let x = 0
+    while x < w do
+      let dy = 0
+      while dy < 6 do
+        let y = y0 + dy
+        if y < h then
+          let idx = mem_peek_byte(idx_buf, y * w + x)
+          if img_list_contains_int(used, idx) == false then
+            let used = list_push(used, idx)
+          end
+        end
+        let dy = dy + 1
+      end
+      let x = x + 1
+    end
+    let ui = 0
+    while ui < used.length do
+      let color_idx = used[ui]
+      sb_push(sb, "#" + color_idx)
+      let x2 = 0
+      while x2 < w do
+        let bits = 0
+        let dy2 = 0
+        while dy2 < 6 do
+          let y2 = y0 + dy2
+          if y2 < h then
+            let idx2 = mem_peek_byte(idx_buf, y2 * w + x2)
+            if idx2 == color_idx then
+              let bits = bits bor (1 shl dy2)
+            end
+          end
+          let dy2 = dy2 + 1
+        end
+        sb_push(sb, chr(63 + bits))
+        let x2 = x2 + 1
+      end
+      if ui < used.length - 1 then
+        sb_push(sb, "$")
+      end
+      let ui = ui + 1
+    end
+    sb_push(sb, "-")
+    let band = band + 1
+  end
+  sb_push(sb, chr(27) + "\\")
+  return sb_str(sb)
+end
+
+# img_show(image, max_w, max_h) -> fits `image` to max_w x max_h,
+# renders it as Sixel, and writes it straight to the console (raw
+# bytes, not through print()/rt_print_str -- a Sixel sequence can be
+# very long, and this avoids that path's own newline-appending).
+make a function called img_show takes image, max_w, max_h returns done
+  let fitted = img_fit(image, max_w, max_h)
+  console_echo_str(img_to_sixel(fitted))
+  return true
+end
+
+make a function called img_colors_equal takes a, b returns eq
+  return (a[0] == b[0]) and (a[1] == b[1]) and (a[2] == b[2])
+end
+
+make a function called img_color_list_index takes lst, c returns idx
+  let i = 0
+  while i < lst.length do
+    if img_colors_equal(lst[i], c) then
+      return i
+    end
+    let i = i + 1
+  end
+  return 0 - 1
+end
+
+# img_rgb_list_index(lst, r, g, b) -> same search as img_color_list_
+# index, but the query is 3 raw scalars, not a [r,g,b] list -- avoids
+# allocating a throwaway wrapper list for every pixel just to ask "is
+# this color already in `used`," which is exactly what made the ORIGINAL
+# img_to_sixel_truecolor crash on a real photo (see this file's own
+# `used` collection loop, and img_truecolor_feasible's header, for the
+# real incident this was found from).
+make a function called img_rgb_list_index takes lst, r, g, b returns idx
+  let i = 0
+  while i < lst.length do
+    let c = lst[i]
+    if (c[0] == r) and (c[1] == g) and (c[2] == b) then
+      return i
+    end
+    let i = i + 1
+  end
+  return 0 - 1
+end
+
+# img_band_used_colors(buf, w, h, y0) -> every distinct exact [r,g,b]
+# color appearing in the 6-row band starting at y0, read directly from
+# the raw pixel buffer (mem_peek_byte, no img_get_pixel/no throwaway
+# list allocation per pixel) -- a NEW color triple is only allocated
+# the `used.length` times it's actually needed, not once per pixel
+# scanned. Shared by both img_truecolor_total_runs (the cheap pre-
+# check) and img_to_sixel_truecolor itself (the real encode), so the
+# two can never disagree about what "used colors in this band" means.
+make a function called img_band_used_colors takes buf, w, h, y0 returns used
+  let used = []
+  let x = 0
+  while x < w do
+    let dy = 0
+    while dy < 6 do
+      let y = y0 + dy
+      if y < h then
+        let offset = (y * w + x) * 3
+        let r = mem_peek_byte(buf, offset)
+        let g = mem_peek_byte(buf, offset + 1)
+        let b = mem_peek_byte(buf, offset + 2)
+        if img_rgb_list_index(used, r, g, b) < 0 then
+          let used = list_push(used, [r, g, b])
+        end
+      end
+      let dy = dy + 1
+    end
+    let x = x + 1
+  end
+  return used
+end
+
+# img_truecolor_total_runs(image) -> the total number of "#0;2;r;g;b +
+# full-width run" groups img_to_sixel_truecolor would emit across every
+# band -- the real, direct cost driver for both output size and encode
+# time (each group costs roughly O(width) bytes/work), used by
+# img_truecolor_feasible as the actual feasibility measure. Cheap to
+# compute up front: img_band_used_colors itself no longer allocates per
+# pixel (see its own header), so running it once per band just to count
+# is a small fraction of the real encode's own cost.
+make a function called img_truecolor_total_runs takes image returns total
+  let w = img_width(image)
+  let h = img_height(image)
+  let buf = img_buf(image)
+  let band_count = floor((h + 5) / 6)
+  let total = 0
+  let band = 0
+  while band < band_count do
+    let y0 = band * 6
+    let used = img_band_used_colors(buf, w, h, y0)
+    let total = total + used.length
+    let band = band + 1
+  end
+  return total
+end
+
+# img_to_sixel_truecolor(image) -> a Sixel sequence with NO
+# quantization at all: every pixel's own exact color is used,
+# redefining Sixel color register 0 right before each run instead of
+# selecting from a pre-declared palette. Real answer to "can this be
+# true color": classic Sixel has no per-pixel-RGB mode -- a sixel
+# character always draws using whatever color is CURRENTLY SELECTED in
+# a numbered register -- but nothing requires declaring registers
+# upfront or reusing them; redefining the same register (`#0;2;r;g;b`)
+# immediately before the run that needs it gets exact 24-bit fidelity
+# per color-run, at the cost of losing the "declare once, reuse by
+# index" compactness img_to_sixel's quantized-palette version relies
+# on. Real, named tradeoff: output size and encode time scale with how
+# many DISTINCT exact colors actually appear per 6-row band, not with
+# a fixed palette cap -- fine for diagrams/UI screenshots/game boards
+# (this feature's own real test cases so far), but a genuine high-
+# entropy photo can have close to one distinct color per pixel, which
+# would make this both slow to generate and large to transmit/render;
+# img_to_sixel's quantized version is the bounded-cost default for a
+# reason, this is the opt-in for exactness. See img_truecolor_feasible
+# for the guard that keeps this from being called on an image where
+# that tradeoff has actually gone bad.
+#
+# REAL BUG FOUND AND FIXED (live crash report on a real photo): the
+# original version called img_get_pixel -- which allocates a fresh
+# 3-element list -- for EVERY pixel of EVERY used color's full-width
+# bitmask-building pass (O(band_pixels * used_colors_in_band), not
+# O(band_pixels)). On a real screenshot, one 6-row band alone had 1888
+# distinct colors in a 408-pixel-wide band -- ~4.6 million throwaway
+# list allocations for that ONE band, on a bump allocator that never
+# frees anything. That exhausted the 512MB heap, and the exhaustion-
+# reporting path itself needs to allocate (string concatenation) to
+# print its own error message, which explains the raw segfault instead
+# of a clean "heap exhausted" message: the error path had no heap left
+# to report the error with either. Fixed by reading raw R/G/B bytes
+# directly from the pixel buffer in the hot second-pass loop (zero
+# allocation) and only building a `used` list entry the `used.length`
+# times a genuinely NEW color is found (img_band_used_colors), not
+# once per pixel scanned.
+make a function called img_to_sixel_truecolor takes image returns sixel_text
+  let w = img_width(image)
+  let h = img_height(image)
+  let buf = img_buf(image)
+  let sb = sb_new()
+  sb_push(sb, chr(27) + "Pq")
+  sb_push(sb, "\"1;1;" + w + ";" + h)
+  let band_count = floor((h + 5) / 6)
+  let band = 0
+  while band < band_count do
+    let y0 = band * 6
+    let used = img_band_used_colors(buf, w, h, y0)
+    let ui = 0
+    while ui < used.length do
+      let color = used[ui]
+      let rp = floor((color[0] * 100) / 255)
+      let gp = floor((color[1] * 100) / 255)
+      let bp = floor((color[2] * 100) / 255)
+      sb_push(sb, "#0;2;" + rp + ";" + gp + ";" + bp)
+      let x2 = 0
+      while x2 < w do
+        let bits = 0
+        let dy2 = 0
+        while dy2 < 6 do
+          let y2 = y0 + dy2
+          if y2 < h then
+            let offset2 = (y2 * w + x2) * 3
+            let r2 = mem_peek_byte(buf, offset2)
+            let g2 = mem_peek_byte(buf, offset2 + 1)
+            let b2 = mem_peek_byte(buf, offset2 + 2)
+            if (r2 == color[0]) and (g2 == color[1]) and (b2 == color[2]) then
+              let bits = bits bor (1 shl dy2)
+            end
+          end
+          let dy2 = dy2 + 1
+        end
+        sb_push(sb, chr(63 + bits))
+        let x2 = x2 + 1
+      end
+      if ui < used.length - 1 then
+        sb_push(sb, "$")
+      end
+      let ui = ui + 1
+    end
+    sb_push(sb, "-")
+    let band = band + 1
+  end
+  sb_push(sb, chr(27) + "\\")
+  return sb_str(sb)
+end
+
+# img_show_truecolor(image, max_w, max_h) -> false (does NOT render)
+# if the fitted image fails img_truecolor_feasible -- callers should
+# check this return value and report a real error, not just call it
+# and hope; see img_populated_bucket_count's own header for exactly
+# why this check exists (a real crash on a real photo, with no
+# guardrail at all, before this was added).
+make a function called img_show_truecolor takes image, max_w, max_h returns done
+  let fitted = img_fit(image, max_w, max_h)
+  if img_truecolor_feasible(fitted) == false then
+    return false
+  end
+  console_echo_str(img_to_sixel_truecolor(fitted))
+  return true
+end

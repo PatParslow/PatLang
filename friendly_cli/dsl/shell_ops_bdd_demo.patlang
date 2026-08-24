@@ -1,0 +1,169 @@
+# BDD-style verification of friendly_cli/dsl/shell_ops.patlang, using the
+# existing Gherkin runner in self_hosting/lib/test.patlang. Exercises the
+# real command_safety.patlang classification tiers end to end (a real
+# quarantine, a real read-only taskkill diagnostic, a real subprocess
+# run) rather than mocking classify_command's decisions.
+
+include "../../self_hosting/lib/includes.patlang"
+include "../../self_hosting/lib/test.patlang"
+include "shell_ops.patlang"
+
+# ---- fixtures ----
+
+make a function called sh_scratch_file returns path
+  return "friendly_cli/dsl/_shell_ops_bdd_scratch.txt"
+end
+
+make a function called sh_invoke takes cmd, args returns ok
+  set_var("console_cmd_name", cmd)
+  set_var("console_args", args)
+  set_var("console_last_proc_result_set", false)
+  return shell_ops_run()
+end
+
+# ---- step definitions ----
+
+make a function called st_sh_no_workaround_command returns done
+  set_var("sh_ok", sh_invoke("format", []))
+  return true
+end
+
+make a function called st_sh_no_workaround_is_refused returns done
+  check("a no_workaround command is refused", get("__vars", "sh_ok"), false)
+  let result = get("__vars", "console_last_proc_result")
+  check("the refusal classifies as PermissionDenied", pr_classification(result), "PermissionDenied")
+  return true
+end
+
+make a function called st_sh_existing_scratch_file returns done
+  write_file(sh_scratch_file(), "shell_ops bdd scratch content")
+  set_var("sh_ok", sh_invoke("del", [sh_scratch_file()]))
+  return true
+end
+
+make a function called st_sh_delete_is_quarantined_not_deleted returns done
+  check("del on a real file reports success", get("__vars", "sh_ok"), true)
+  check("the original path no longer exists (moved, not left in place)", file_exists(sh_scratch_file()) == "1", false)
+  return true
+end
+
+make a function called st_sh_missing_delete_target returns done
+  set_var("sh_ok", sh_invoke("rm", ["friendly_cli/dsl/_definitely_not_a_real_file.txt"]))
+  return true
+end
+
+make a function called st_sh_missing_delete_target_refused returns done
+  check("rm on a nonexistent file reports failure, not a crash", get("__vars", "sh_ok"), false)
+  return true
+end
+
+make a function called st_sh_taskkill_on_missing_process returns done
+  set_var("sh_ok", sh_invoke("taskkill", ["definitely_not_a_real_process_xyz123.exe"]))
+  return true
+end
+
+make a function called st_sh_taskkill_never_actually_runs returns done
+  check("taskkill on a process that isn't running still reports failure (never auto-executed)", get("__vars", "sh_ok"), false)
+  let result = get("__vars", "console_last_proc_result")
+  check("the diagnostic hint says taskkill was not run", contains_text(pr_hint(result), "taskkill was not run"), true)
+  return true
+end
+
+# A real, always-running Windows process, used to exercise
+# gather_taskkill_report's "matches found" branch (the multi-line CSV
+# parse via cs_split_lines) for real -- read-only (tasklist), taskkill
+# itself is still never invoked.
+make a function called st_sh_taskkill_on_real_process returns done
+  set_var("sh_ok", sh_invoke("taskkill", ["explorer.exe"]))
+  return true
+end
+
+make a function called st_sh_taskkill_real_process_report_parses returns done
+  check("taskkill on a real running process still reports failure (never auto-executed)", get("__vars", "sh_ok"), false)
+  let result = get("__vars", "console_last_proc_result")
+  check("the diagnostic hint again confirms taskkill was not run", contains_text(pr_hint(result), "taskkill was not run"), true)
+  return true
+end
+
+make a function called st_sh_real_unclassified_command returns done
+  set_var("sh_ok", sh_invoke("echo", ["shell_ops", "direct", "passthrough"]))
+  return true
+end
+
+make a function called st_sh_real_command_succeeds returns done
+  check("an ordinary command runs directly and succeeds", get("__vars", "sh_ok"), true)
+  return true
+end
+
+make a function called st_sh_missing_unclassified_command returns done
+  set_var("sh_ok", sh_invoke("definitely_not_a_real_command_xyz123", []))
+  return true
+end
+
+make a function called st_sh_missing_command_fails_gracefully returns done
+  check("a missing external command fails gracefully, not fatally", get("__vars", "sh_ok"), false)
+  let result = get("__vars", "console_last_proc_result")
+  check("it classifies as CommandNotFound", pr_classification(result), "CommandNotFound")
+  return true
+end
+
+make a function called register_shell_ops_steps returns done
+  step("a command on the no_workaround list", "st_sh_no_workaround_command")
+  step("it is refused with a PermissionDenied classification", "st_sh_no_workaround_is_refused")
+  step("a real scratch file and a del command targeting it", "st_sh_existing_scratch_file")
+  step("the file is quarantined instead of deleted", "st_sh_delete_is_quarantined_not_deleted")
+  step("a delete command targeting a file that does not exist", "st_sh_missing_delete_target")
+  step("it is refused, not crashed", "st_sh_missing_delete_target_refused")
+  step("a taskkill command targeting a process that is not running", "st_sh_taskkill_on_missing_process")
+  step("it reports the diagnostic and never runs taskkill", "st_sh_taskkill_never_actually_runs")
+  step("a taskkill command targeting a real running process", "st_sh_taskkill_on_real_process")
+  step("the multi-line report parses and taskkill still never runs", "st_sh_taskkill_real_process_report_parses")
+  step("an ordinary unclassified command that really exists", "st_sh_real_unclassified_command")
+  step("it runs directly and succeeds", "st_sh_real_command_succeeds")
+  step("an ordinary unclassified command that does not exist", "st_sh_missing_unclassified_command")
+  step("it fails gracefully with a CommandNotFound classification", "st_sh_missing_command_fails_gracefully")
+  return true
+end
+
+make a function called shell_ops_feature returns text
+  return "Feature: friendly_cli shell command safety routing
+
+Scenario: a no_workaround command is always refused
+  Given a command on the no_workaround list
+  Then it is refused with a PermissionDenied classification
+
+Scenario: a safe_alias delete quarantines instead of deleting
+  Given a real scratch file and a del command targeting it
+  Then the file is quarantined instead of deleted
+
+Scenario: a safe_alias delete on a missing target fails gracefully
+  Given a delete command targeting a file that does not exist
+  Then it is refused, not crashed
+
+Scenario: a human_confirm command never actually runs
+  Given a taskkill command targeting a process that is not running
+  Then it reports the diagnostic and never runs taskkill
+
+Scenario: a human_confirm command parses a real multi-process report without crashing
+  Given a taskkill command targeting a real running process
+  Then the multi-line report parses and taskkill still never runs
+
+Scenario: an unclassified command runs directly when it exists
+  Given an ordinary unclassified command that really exists
+  Then it runs directly and succeeds
+
+Scenario: an unclassified command fails gracefully when it does not exist
+  Given an ordinary unclassified command that does not exist
+  Then it fails gracefully with a CommandNotFound classification
+"
+end
+
+make a function called run_shell_ops_bdd returns ok
+  t_init()
+  register_shell_ops_steps()
+  run_feature(shell_ops_feature())
+  t_report()
+  return get("__vars", "t_fail") == 0
+end
+
+run_shell_ops_bdd()

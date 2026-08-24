@@ -1,0 +1,326 @@
+# BDD-style verification of the COMPILED friendly_cli/terminal_native.exe,
+# using the existing Gherkin runner in self_hosting/lib/test.patlang.
+# Run as a real black-box subprocess (same approach as
+# friendly_cli/terminal_bdd_demo.patlang for the interpreted terminal),
+# with piped stdin standing in for the graceful non-console fallback path
+# (real Tab-key capture needs a genuine console handle this sandboxed
+# session cannot provide -- see terminal_native.patlang's own header for
+# what that means and doesn't mean).
+#
+# Notably exercises two real bugs found via live user reports while
+# building this feature, both fixed in codegen_x64.patlang's
+# x64_os_exec_run_asm: (1) a genuinely failing shelled-out command must
+# be reported as failed, not "ok" (the real-exit-code fix); (2) captured
+# output must be complete and correctly ordered, not corrupted -- the
+# deeper bug: the read loop's running byte total was accumulated in r10,
+# a VOLATILE (caller-saved) register under the real win64 ABI, silently
+# clobbered by ReadFile itself between calls, producing correct bytes at
+# correct offsets but a garbage total (a captured `echo hello`, 7 real
+# bytes, consistently reported length 105) -- fixed by moving the
+# accumulator to rbx (genuinely callee-saved). This spec would have
+# caught both, had it existed at the time.
+
+include "../self_hosting/lib/includes.patlang"
+include "../self_hosting/lib/proc.patlang"
+include "../self_hosting/lib/test.patlang"
+
+make a function called tmn_bdd_exe returns path
+  return "friendly_cli/terminal_native.exe"
+end
+
+make a function called tmn_bdd_scripted_session returns text
+  return "echo genuine success
+frobnicate
+type CLAUDE.md
+exit
+"
+end
+
+# Real regression guard for a live-reported bug: `cd` used to be routed
+# through shell_ops_run like any other unrecognized command (`cmd.exe
+# /c cd ...`), which can NEVER work -- a subprocess's own working-
+# directory change never reaches the parent process. `cd` is now a real
+# built-in (tmn_cd) calling SetCurrentDirectoryA directly, in-process.
+# `pwd` (a real external command, genuinely shelled out) is the
+# independent witness here: if `cd` only pretended to work, `pwd`
+# would keep reporting the original directory.
+# Real regression guard for the image-rendering feature: decodes a
+# known 4x4 test BMP (self_hosting/build/_probe_test.bmp, checked-in
+# fixture -- see image_bmp.patlang's own header for its exact pixel
+# layout: red/green/blue/yellow top row, uniform (128,64,32) below) and
+# checks the emitted Sixel sequence's raster size, palette entries, and
+# per-pixel bit pattern against hand-verified expected values -- not
+# just "did it crash," since the underlying bug this session (PatLang's
+# `/` being exact-rational, not truncating, division) produced WRONG
+# pixel data without ever crashing on its own; a bad-path case checks
+# the failure path reports cleanly instead of silently doing nothing.
+make a function called tmn_bdd_img_session returns text
+  return "img self_hosting/build/_probe_test.bmp
+img self_hosting/build/nonexistent.bmp
+exit
+"
+end
+
+# Real regression guard for a live-reported bug: a quoted path
+# containing spaces (console_tokenize has no quote-awareness, so
+# `\"self_hosting/build/_probe_test space.bmp\"` arrives as TWO
+# separate tokens) was being truncated at the first space -- `img`
+# only read args[0], silently dropping everything after the space and
+# the closing quote. Fixed by routing `img`'s path argument through
+# the same tmn_joined_path_arg helper `cd` already used for this.
+make a function called tmn_bdd_img_space_session returns text
+  return "img \"self_hosting/build/_probe_test space.bmp\"
+exit
+"
+end
+
+# Real regression guard: `img` dispatches by file extension (image_load.
+# patlang), so a real PNG must go through png_decode, not bmp_decode --
+# checked against the same known 4x4 red/green/blue/yellow fixture used
+# for the BMP case, so a wrong-decoder dispatch would show up as a
+# decode failure or wrong pixel data, not just "some sixel came out."
+make a function called tmn_bdd_img_png_session returns text
+  return "img self_hosting/build/_probe_test.png
+exit
+"
+end
+
+# Real regression guard for a live-reported crash: --truecolor on a
+# genuinely high-entropy image (200x200 uniform random noise here --
+# see image_bdd_demo.patlang's own header on the same fixture) used to
+# exhaust the heap via millions of throwaway per-pixel allocations and
+# crash with no error message at all. It must now report a clean
+# ImageTooComplexError instead.
+make a function called tmn_bdd_img_truecolor_infeasible_session returns text
+  return "img --truecolor self_hosting/build/_probe_test_toonoisy.bmp
+exit
+"
+end
+
+make a function called tmn_bdd_cd_session returns text
+  return "pwd
+cd ..
+pwd
+cd F:\\PatLang
+pwd
+exit
+"
+end
+
+# ---- step definitions ----
+
+make a function called st_tmn_scripted_session_run returns done
+  let out = exec_capture_io(tmn_bdd_exe(), [], tmn_bdd_scripted_session())
+  set_var("tmn_stdout", out[0])
+  return true
+end
+
+make a function called st_tmn_img_session_run returns done
+  let out = exec_capture_io(tmn_bdd_exe(), [], tmn_bdd_img_session())
+  set_var("tmn_img_stdout", out[0])
+  return true
+end
+
+make a function called st_tmn_img_renders_correct_sixel returns done
+  let out = get("__vars", "tmn_img_stdout")
+  check("sixel sequence starts with DCS q and the right raster size (4x4)", contains_text(out, chr(27) + "Pq\"1;1;4;4"), true)
+  # Palette index order depends on img_build_palette's bucket-key
+  # ordering now (a popularity quantizer, not first-seen order -- see
+  # image.patlang's own header), so these check the "N;2;R;G;B" color
+  # definition, not a specific "#<index>" prefix.
+  check("red palette entry (255,0,0 -> 100%,0%,0%) is present", contains_text(out, ";2;100;0;0"), true)
+  check("green palette entry (0,255,0 -> 0%,100%,0%) is present", contains_text(out, ";2;0;100;0"), true)
+  check("blue palette entry (0,0,255 -> 0%,0%,100%) is present", contains_text(out, ";2;0;0;100"), true)
+  check("yellow palette entry (255,255,0 -> 100%,100%,0%) is present", contains_text(out, ";2;100;100;0"), true)
+  check("background fill (128,64,32 -> floor'd 50%,25%,12%) is present -- this is the exact value the rational-division bug corrupted", contains_text(out, ";2;50;25;12"), true)
+  check("the sequence is properly terminated (ST, ESC \\)", contains_text(out, chr(27) + "\\"), true)
+  check("img is reported as ok for a real, decodable file", contains_text(out, "[ok] img completed"), true)
+  return true
+end
+
+make a function called st_tmn_img_reports_bad_path returns done
+  let out = get("__vars", "tmn_img_stdout")
+  check("a nonexistent/undecodable path is reported as a failure, not silently ignored", contains_text(out, "[error] img failed"), true)
+  check("the failure carries an actionable hint naming the bad path", contains_text(out, "nonexistent.bmp' could not be read/decoded"), true)
+  return true
+end
+
+make a function called st_tmn_img_space_session_run returns done
+  let out = exec_capture_io(tmn_bdd_exe(), [], tmn_bdd_img_space_session())
+  set_var("tmn_img_space_stdout", out[0])
+  return true
+end
+
+make a function called st_tmn_img_handles_quoted_space_path returns done
+  let out = get("__vars", "tmn_img_space_stdout")
+  check("a quoted path containing spaces decodes correctly (not truncated at the first space)", contains_text(out, chr(27) + "Pq\"1;1;4;4"), true)
+  check("img is reported as ok for the quoted space-containing path", contains_text(out, "[ok] img completed"), true)
+  return true
+end
+
+make a function called st_tmn_img_png_session_run returns done
+  let out = exec_capture_io(tmn_bdd_exe(), [], tmn_bdd_img_png_session())
+  set_var("tmn_img_png_stdout", out[0])
+  return true
+end
+
+make a function called st_tmn_img_png_renders_correct_sixel returns done
+  let out = get("__vars", "tmn_img_png_stdout")
+  check("PNG raster size (4x4) is correct", contains_text(out, chr(27) + "Pq\"1;1;4;4"), true)
+  check("red palette entry is present (real DEFLATE decode, not garbage)", contains_text(out, ";2;100;0;0"), true)
+  check("img is reported as ok for a real PNG file", contains_text(out, "[ok] img completed"), true)
+  return true
+end
+
+make a function called st_tmn_img_truecolor_infeasible_session_run returns done
+  let out = exec_capture_io(tmn_bdd_exe(), [], tmn_bdd_img_truecolor_infeasible_session())
+  set_var("tmn_img_truecolor_infeasible_stdout", out[0])
+  return true
+end
+
+make a function called st_tmn_img_truecolor_reports_clean_error returns done
+  let out = get("__vars", "tmn_img_truecolor_infeasible_stdout")
+  check("a too-complex image is reported as a clean failure, not a crash", contains_text(out, "[error] img failed"), true)
+  check("the failure names the real reason (too many colors for --truecolor)", contains_text(out, "too many distinct colors for --truecolor"), true)
+  check("the session still exits cleanly afterward (the process survived)", contains_text(out, "goodbye."), true)
+  return true
+end
+
+make a function called st_tmn_cd_session_run returns done
+  let out = exec_capture_io(tmn_bdd_exe(), [], tmn_bdd_cd_session())
+  set_var("tmn_cd_stdout", out[0])
+  return true
+end
+
+make a function called st_tmn_cd_actually_changes_directory returns done
+  let out = get("__vars", "tmn_cd_stdout")
+  # "/f\n\n[ok] pwd completed" (pwd's own real bare-root output,
+  # immediately followed by the blank line + "[ok] pwd completed" this
+  # terminal always prints after a command) can only appear if `cd ..`
+  # genuinely moved off of F:\PatLang -- if cd were a no-op (the
+  # original bug: routed through a doomed `cmd.exe /c cd ..`
+  # subprocess), every pwd in this session would show "/f/PatLang" and
+  # this exact substring would never appear.
+  check("pwd sees the real directory change after cd .. (bare drive root)", contains_text(out, "/f\n\n[ok] pwd completed"), true)
+  check("cd back to F:\\PatLang, then pwd, shows F:\\PatLang again", contains_text(out, "/f/PatLang"), true)
+  check("both cd calls are reported as ok, not routed through a failing shell-out", contains_text(out, "[ok] cd completed"), true)
+  return true
+end
+
+make a function called st_tmn_real_command_succeeds returns done
+  check("a real command's output reaches the transcript", contains_text(get("__vars", "tmn_stdout"), "genuine success"), true)
+  check("a real successful command is reported as ok, not failed", contains_text(get("__vars", "tmn_stdout"), "[ok] echo completed"), true)
+  return true
+end
+
+make a function called st_tmn_failing_command_reported returns done
+  check("a genuinely failing command is reported as failed, not ok", contains_text(get("__vars", "tmn_stdout"), "[error] frobnicate failed"), true)
+  check("the failure carries a real diagnostic hint", contains_text(get("__vars", "tmn_stdout"), "was not found on PATH"), true)
+  check("a successful command is never misreported for the failing one", contains_text(get("__vars", "tmn_stdout"), "[ok] frobnicate completed"), false)
+  return true
+end
+
+make a function called st_tmn_exits_cleanly returns done
+  check("the compiled terminal exits cleanly after 'exit'", contains_text(get("__vars", "tmn_stdout"), "goodbye."), true)
+  return true
+end
+
+# Real regression guard: colors must NEVER leak into a redirected/piped
+# run (console_enable_colors() correctly reports false there, per
+# os_enable_ansi_colors's own header) -- a raw ESC byte (chr(27)) in
+# this transcript would mean that gating broke.
+make a function called st_tmn_no_ansi_leak returns done
+  check("no raw ANSI escape byte appears in non-console output", contains_text(get("__vars", "tmn_stdout"), chr(27)), false)
+  return true
+end
+
+# Real regression guard: the prompt carries a cwd hint (this suite
+# always runs from F:\PatLang, so "PatLang" is the expected basename --
+# same cwd assumption every relative path in this whole suite already
+# makes).
+make a function called st_tmn_prompt_has_cwd_hint returns done
+  check("the prompt includes a cwd hint (this repo's own directory name)", contains_text(get("__vars", "tmn_stdout"), "PatLang>"), true)
+  return true
+end
+
+# Real regression guard for the r10-vs-rbx accumulator bug (see
+# tmn_claude_md_real_length's own comment): checks BOTH the real start
+# AND the real end of CLAUDE.md's content appear in the transcript, with
+# nothing missing in between -- the actual bug produced correct start
+# bytes directly followed by real END-of-file bytes with the entire
+# middle silently dropped, which a start-only or end-only check would
+# have missed.
+make a function called st_tmn_type_captures_full_file returns done
+  let out = get("__vars", "tmn_stdout")
+  check("the real start of CLAUDE.md appears in the transcript", contains_text(out, "# PatLang: conventions for working in this repo"), true)
+  check("real content from the middle of CLAUDE.md appears (not skipped)", contains_text(out, "Standing language-spec gate"), true)
+  check("the real end of CLAUDE.md appears in the transcript", contains_text(out, "trust an explicit count command"), true)
+  return true
+end
+
+make a function called register_tmn_steps returns done
+  step("a scripted session against the compiled terminal covering a real command and a failing one", "st_tmn_scripted_session_run")
+  step("the real command's success is reported accurately", "st_tmn_real_command_succeeds")
+  step("the failing command's failure is reported accurately, not silently reported as success", "st_tmn_failing_command_reported")
+  step("a typed file's full content is captured, start to end", "st_tmn_type_captures_full_file")
+  step("no ansi color codes leak into the piped transcript", "st_tmn_no_ansi_leak")
+  step("the prompt carries a cwd hint", "st_tmn_prompt_has_cwd_hint")
+  step("the session exits cleanly", "st_tmn_exits_cleanly")
+  step("a scripted session against the compiled terminal covering cd and pwd", "st_tmn_cd_session_run")
+  step("cd genuinely changes the process's own working directory", "st_tmn_cd_actually_changes_directory")
+  step("a scripted session against the compiled terminal covering img", "st_tmn_img_session_run")
+  step("img renders a known test image as the exact expected sixel sequence", "st_tmn_img_renders_correct_sixel")
+  step("img reports a clean failure for a bad path", "st_tmn_img_reports_bad_path")
+  step("a scripted session against the compiled terminal covering img with a quoted, space-containing path", "st_tmn_img_space_session_run")
+  step("img handles a quoted path containing spaces correctly", "st_tmn_img_handles_quoted_space_path")
+  step("a scripted session against the compiled terminal covering img with a PNG file", "st_tmn_img_png_session_run")
+  step("img renders a PNG file via the png decoder correctly", "st_tmn_img_png_renders_correct_sixel")
+  step("a scripted session against the compiled terminal covering --truecolor on a too-complex image", "st_tmn_img_truecolor_infeasible_session_run")
+  step("img --truecolor reports a clean error instead of crashing", "st_tmn_img_truecolor_reports_clean_error")
+  return true
+end
+
+make a function called tmn_feature returns text
+  return "Feature: the compiled (native x64) friendly_cli terminal reports real success/failure
+
+Scenario: a scripted session distinguishes a real success from a real failure
+  Given a scripted session against the compiled terminal covering a real command and a failing one
+  Then the real command's success is reported accurately
+  And the failing command's failure is reported accurately, not silently reported as success
+  And a typed file's full content is captured, start to end
+  And no ansi color codes leak into the piped transcript
+  And the prompt carries a cwd hint
+  And the session exits cleanly
+
+Scenario: cd is a real built-in, not a doomed shell-out
+  Given a scripted session against the compiled terminal covering cd and pwd
+  Then cd genuinely changes the process's own working directory
+
+Scenario: img renders a known image correctly, and reports failure cleanly
+  Given a scripted session against the compiled terminal covering img
+  Then img renders a known test image as the exact expected sixel sequence
+  And img reports a clean failure for a bad path
+
+Scenario: img handles a quoted path containing spaces
+  Given a scripted session against the compiled terminal covering img with a quoted, space-containing path
+  Then img handles a quoted path containing spaces correctly
+
+Scenario: img renders a PNG file through the same command
+  Given a scripted session against the compiled terminal covering img with a PNG file
+  Then img renders a PNG file via the png decoder correctly
+
+Scenario: img --truecolor fails cleanly on a too-complex image instead of crashing
+  Given a scripted session against the compiled terminal covering --truecolor on a too-complex image
+  Then img --truecolor reports a clean error instead of crashing
+"
+end
+
+make a function called run_tmn_bdd returns ok
+  t_init()
+  register_tmn_steps()
+  run_feature(tmn_feature())
+  t_report()
+  return get("__vars", "t_fail") == 0
+end
+
+run_tmn_bdd()

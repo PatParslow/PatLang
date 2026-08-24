@@ -1,0 +1,320 @@
+# Raw-mode line editor with Tab completion, built on the
+# console_raw_enable/console_read_raw_byte/console_raw_disable/
+# console_echo_byte/console_echo_str primitives (x64_runtime.patlang,
+# native --x64 backend ONLY -- see that file's own header comment).
+# This module only works in a program COMPILED via
+# `patc1.exe <src> <out> --x64`; it will crash with an undefined-
+# host-function error if `include`d and run under the interpreter
+# (`pat.exe --ir-run`), because those primitives have no Rust
+# host-function equivalent -- a deliberate choice, kept entirely in
+# PatLang/x64 with no new Rust surface added. Callers that need to
+# support BOTH the interpreter and --x64 (like
+# friendly_cli/terminal.patlang itself) should NOT include this module
+# directly -- see friendly_cli/terminal_native.patlang for the
+# --x64-only variant that does.
+#
+# SCOPE: no cursor movement (left/right arrows, Home/End), no history
+# recall, no multi-match menu beyond printing candidates once and
+# continuing to edit -- a real line editor (readline/linenoise-grade)
+# is a much bigger undertaking; this covers the specific ask (Tab
+# completes the current word) plus the minimum editing (backspace,
+# Enter) needed to make that usable, not a full reimplementation of
+# GNU readline.
+
+include "includes.patlang"
+
+# le_matches(candidates, prefix) -> the subset of candidates that start
+# with prefix.
+make a function called le_matches takes candidates, prefix returns matches
+  let out = []
+  let i = 0
+  while i < candidates.length do
+    if str_starts_with(candidates[i], prefix) then
+      let out = list_push(out, candidates[i])
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called le_pairwise_common_prefix takes a, b returns prefix
+  let n = a.length
+  if b.length < n then
+    let n = b.length
+  end
+  let i = 0
+  while (i < n) and (substr(a, i, 1) == substr(b, i, 1)) do
+    let i = i + 1
+  end
+  return substr(a, 0, i)
+end
+
+# le_common_prefix(strings) -> the longest string every entry starts
+# with -- used when Tab has multiple matches that still share a longer
+# prefix than what's typed so far (completes as far as it unambiguously
+# can, same behavior as a real shell).
+make a function called le_common_prefix takes strings returns prefix
+  if strings.length == 0 then
+    return ""
+  end
+  let best = strings[0]
+  let i = 1
+  while i < strings.length do
+    let best = le_pairwise_common_prefix(best, strings[i])
+    let i = i + 1
+  end
+  return best
+end
+
+# le_last_word_start(buf) -> the index in buf where the CURRENT word
+# (the one Tab should complete) begins -- everything after the last
+# space, or 0 if there is none. Deliberately simple: completes the word
+# under the cursor assuming the cursor is always at the end of buf (this
+# editor has no left/right cursor movement -- see this file's own scope
+# note above).
+make a function called le_last_word_start takes buf returns idx
+  let i = buf.length
+  while (i > 0) and (substr(buf, i - 1, 1) != " ") do
+    let i = i - 1
+  end
+  return i
+end
+
+make a function called le_backspace_n takes n returns done
+  let i = 0
+  while i < n do
+    console_echo_byte(8)
+    console_echo_byte(32)
+    console_echo_byte(8)
+    let i = i + 1
+  end
+  return true
+end
+
+# le_utf8_backspace_len(buf) -> how many BYTES a single Backspace press
+# should remove from the end of buf. 1 for an ordinary ASCII byte
+# (unchanged from before); for a UTF-8 continuation byte (0x80-0xBF,
+# meaning buf's last byte is in the middle of a multi-byte character),
+# walks back to the sequence's own lead byte (0xC0+) and removes the
+# WHOLE character in one keystroke, matching how backspace behaves in
+# any real Unicode-aware editor rather than leaving a broken partial
+# UTF-8 sequence in the buffer. A malformed/truncated sequence (hits
+# plain ASCII, or the start of the buffer, before finding a real lead
+# byte) falls back to removing just the continuation bytes actually
+# seen -- never removes MORE than what's really there.
+make a function called le_utf8_backspace_len takes buf returns n
+  let len = buf.length
+  if len == 0 then
+    return 0
+  end
+  let last = char_code(buf, len - 1)
+  if (last < 128) or (last >= 192) then
+    return 1
+  end
+  let i = len - 2
+  let count = 1
+  while (i >= 0) and (char_code(buf, i) >= 128) and (char_code(buf, i) < 192) do
+    let count = count + 1
+    let i = i - 1
+  end
+  if (i >= 0) and (char_code(buf, i) >= 192) then
+    let count = count + 1
+  end
+  return count
+end
+
+# le_path_split(prefix) -> [dir, name]: the directory part (everything
+# up to and including the last separator, separator stripped) and the
+# partial filename being typed (everything after). No separator at all
+# -> ["." , prefix] (complete against the current directory). Pure
+# string logic, no filesystem access -- portable, unlike everything
+# below it in this file.
+make a function called le_path_split takes prefix returns pair
+  let n = prefix.length
+  let i = n - 1
+  let last_sep = -1
+  while i >= 0 do
+    let c = char_code(prefix, i)
+    if (c == 47) or (c == 92) then
+      let last_sep = i
+      let i = -1
+    else
+      let i = i - 1
+    end
+  end
+  if last_sep < 0 then
+    return [".", prefix]
+  end
+  return [substr(prefix, 0, last_sep), substr(prefix, last_sep + 1, n - last_sep - 1)]
+end
+
+# le_join_dir_name(dir, name) -> dir+"/"+name, except dir=="." (no real
+# directory prefix) returns just name, and a dir already ending in a
+# separator isn't given a second one.
+make a function called le_join_dir_name takes dir, name returns joined
+  if dir == "." then
+    return name
+  end
+  if (dir.length > 0) and (substr(dir, dir.length - 1, 1) == "/") then
+    return dir + name
+  end
+  if (dir.length > 0) and (substr(dir, dir.length - 1, 1) == "\\") then
+    return dir + name
+  end
+  return dir + "/" + name
+end
+
+# le_filename_candidates(prefix) -> real filesystem entries (from
+# self_hosting/lib/x64_runtime.patlang's list_dir, real WinAPI
+# FindFirstFile/FindNextFile) whose name starts with prefix's own
+# partial-filename part, reconstructed as full dir+name strings so they
+# slot directly into le_matches/le_common_prefix alongside the static
+# candidate list without any special-casing there. Directories keep
+# list_dir's own trailing "/" (so completing into one, then pressing Tab
+# again, naturally lists ITS contents next). A nonexistent/inaccessible
+# directory just yields no candidates (list_dir's own documented
+# behavior), not an error.
+make a function called le_filename_candidates takes prefix returns names
+  let split = le_path_split(prefix)
+  let dir = split[0]
+  let name_prefix = split[1]
+  let entries = list_dir(dir)
+  let out = []
+  let i = 0
+  while i < entries.length do
+    if str_starts_with(entries[i], name_prefix) then
+      let out = list_push(out, le_join_dir_name(dir, entries[i]))
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# le_all_candidates(candidates, prefix) -> candidates plus every
+# filesystem match for prefix, merged into one list for le_matches.
+make a function called le_all_candidates takes candidates, prefix returns merged
+  let out = candidates
+  let file_matches = le_filename_candidates(prefix)
+  let i = 0
+  while i < file_matches.length do
+    let out = list_push(out, file_matches[i])
+    let i = i + 1
+  end
+  return out
+end
+
+# le_apply_tab(buf, candidates, prompt) -> buf, possibly extended by a
+# completion. Matches the word after the last space in buf against
+# `candidates` (static: built-ins/history) UNION real filesystem
+# entries for that word (le_all_candidates); zero matches does nothing
+# (audible bell); one match completes it plus a trailing space UNLESS
+# it's a directory (trailing "/" -- no space, so Tab can keep completing
+# deeper into it, matching a real shell); several matches complete as
+# far as their shared prefix goes and print the full candidate list
+# below the line, then redraw prompt+buf so editing can continue.
+make a function called le_apply_tab takes buf, candidates, prompt returns new_buf
+  let word_start = le_last_word_start(buf)
+  let prefix = substr(buf, word_start, buf.length - word_start)
+  let matches = le_matches(le_all_candidates(candidates, prefix), prefix)
+  if matches.length == 0 then
+    # Audible feedback (BEL, byte 7 -- the standard terminal-bell
+    # convention) so a Tab press that genuinely has nothing to complete
+    # against is visibly distinguishable from Tab silently not working
+    # at all -- found worth adding directly from a live user report
+    # ("tab does nothing"): the most likely real cause is that
+    # `candidates` (a fixed, small list -- built-in command names) has
+    # no entry starting with whatever the user typed, e.g. a real shell
+    # command like `dir`, which this completion was never scoped to
+    # cover. A silent no-op in that case is indistinguishable from a
+    # genuine bug; a bell tells the user "received, nothing to offer."
+    console_echo_byte(7)
+    return buf
+  end
+  let completion = le_common_prefix(matches)
+  if completion.length <= prefix.length then
+    if matches.length > 1 then
+      console_echo_byte(10)
+      let i = 0
+      while i < matches.length do
+        console_echo_str(matches[i])
+        console_echo_byte(32)
+        let i = i + 1
+      end
+      console_echo_byte(10)
+      console_echo_str(prompt)
+      console_echo_str(buf)
+    end
+    return buf
+  end
+  let suffix = substr(completion, prefix.length, completion.length - prefix.length)
+  console_echo_str(suffix)
+  let new_buf = buf + suffix
+  if matches.length == 1 then
+    # No trailing space when the completion is a directory (ends in
+    # "/") -- leaves the cursor right there so a second Tab press lists
+    # ITS contents next, matching a real shell instead of terminating
+    # the path with a space the user would have to delete.
+    if substr(new_buf, new_buf.length - 1, 1) == "/" then
+      return new_buf
+    end
+    console_echo_byte(32)
+    return new_buf + " "
+  end
+  return new_buf
+end
+
+# line_edit_read(candidates, prompt) -> one line of input, with Tab
+# completion against `candidates` (a plain list of strings, e.g.
+# built-in command names) on the CURRENT WORD. Falls back to plain
+# read_line() -- unchanged behavior, no raw mode, no completion --
+# whenever stdin isn't a real console (a pipe or redirected file), so
+# piped/scripted use of a program built with this module keeps working
+# exactly like before. prompt is echoed by this function either way
+# (raw mode or fallback), so callers should NOT also print it themselves.
+make a function called line_edit_read takes candidates, prompt returns line
+  let old_mode = console_raw_enable()
+  if old_mode == -1 then
+    print(prompt)
+    return read_line()
+  end
+  console_echo_str(prompt)
+  let buf = ""
+  let finished = false
+  while finished == false do
+    let b = console_read_raw_byte()
+    if (b == -1) or (b == 13) or (b == 10) then
+      let finished = true
+    else
+      if b == 9 then
+        let buf = le_apply_tab(buf, candidates, prompt)
+      else
+        if (b == 8) or (b == 127) then
+          if buf.length > 0 then
+            let n = le_utf8_backspace_len(buf)
+            let buf = substr(buf, 0, buf.length - n)
+            le_backspace_n(1)
+          end
+        else
+          # (b >= 32) and (b != 127): ordinary ASCII printable (32-126)
+          # AND, unicode-aware, any UTF-8 lead/continuation byte
+          # (0x80-0xFF) -- passed through opaquely (no decoding needed:
+          # PatLang strings are plain byte arrays, and the console's
+          # own code page is set to UTF-8 by console_set_utf8() at
+          # startup, so raw bytes typed/pasted at the keyboard really
+          # are UTF-8 and round-trip correctly just by not being
+          # dropped). Previously this range stopped at 126, silently
+          # discarding every non-ASCII byte -- any pasted or typed
+          # multi-byte character (an em-dash, accented letters, CJK
+          # text) never reached the buffer at all.
+          if (b >= 32) and (b != 127) then
+            let buf = buf + chr(b)
+            console_echo_byte(b)
+          end
+        end
+      end
+    end
+  end
+  console_echo_byte(10)
+  console_raw_disable(old_mode)
+  return buf
+end

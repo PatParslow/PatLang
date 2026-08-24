@@ -1,0 +1,223 @@
+# Run a subprocess, capture its result, and classify what happened --
+# routemap.md section 2.B's self-healing pipeline (intercept -> classify
+# -> diagnose), built on the real `exec_capture_io` host function.
+#
+# Real, deliberately-documented limitation #1: `exec_capture_io` reports
+# only a success boolean, not the child's actual numeric exit code.
+# `exit_code` below is therefore a PSEUDO-CODE (0 on success, 1 on any
+# failure), not a real process exit status. That's enough for
+# classify_failure's own logic (which never inspects the number, only
+# stderr text) -- a real numeric exit code isn't exposed to PatLang today.
+#
+# Real, deliberately-documented limitation #2, found empirically while
+# building this module (not assumed): calling `exec_capture_io` directly
+# with a program that doesn't exist at all doesn't return gracefully --
+# it raises a FATAL, UNCATCHABLE PatLang runtime error (PatLang has no
+# try/catch) that aborts the whole script. Confirmed directly:
+# `exec_capture_io("definitely_not_a_real_command", [], "")` crashes with
+# "IR runtime error: ...: program not found" instead of returning
+# `[stdout, stderr, false]`. That's fatal for a self-healing terminal,
+# whose entire point is to survive exactly this case (a command typo)
+# gracefully. Fix: run_classified below routes every invocation through
+# `cmd.exe /c`, so a missing program becomes CMD's problem to report as
+# ordinary stderr text ("'x' is not recognized as an internal or external
+# command...", exit failure) instead of an unrecoverable crash -- verified
+# directly against both a real success and a real not-found case before
+# relying on it. Windows-only for now: there's no way yet, from PatLang,
+# to tell at runtime which OS it's running on, so this module only
+# targets the platform this codebase actually runs and tests on. A
+# PatLang-native process launcher (compiled, not shelling out to `cmd.exe`
+# at all) would be a better long-term answer than routing through the
+# host OS's own shell -- flagged as real future work, not attempted here.
+
+include "includes.patlang"
+
+# pr_contains_text(hay, needle) -> true if needle occurs anywhere in
+# hay. Deliberately a PRIVATE local copy, not a call to the
+# similarly-named `contains_text` in self_hosting/lib/test.patlang --
+# found empirically while building this module: test.patlang's
+# contains_text is a real host-visible PatLang function, but it's only
+# ever reachable by whatever happens to also `include "test.patlang"`
+# in the same file (the BDD framework, not a general string-utils
+# module). Every one of this module's own BDD-spec files does include
+# test.patlang, which masked the gap completely during development --
+# the crash only showed up when running proc.patlang for real, outside
+# a BDD spec, via terminal.patlang. Fixed by not depending on it at all.
+make a function called pr_contains_text takes hay, needle returns found
+  if needle.length > hay.length then
+    return false
+  end
+  let i = 0
+  while i <= hay.length - needle.length do
+    if substr(hay, i, needle.length) == needle then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# ---- result accessors (result is [exit_code, stdout, stderr,
+# classification, diagnostic_hint] -- positional, matching this
+# codebase's existing convention for small structured returns, e.g.
+# queue.patlang's queue_consume_multi -- these accessors exist so callers
+# never have to remember which index is which) ----
+
+make a function called pr_exit_code takes result returns code
+  return result[0]
+end
+
+make a function called pr_stdout takes result returns text
+  return result[1]
+end
+
+make a function called pr_stderr takes result returns text
+  return result[2]
+end
+
+make a function called pr_classification takes result returns tier
+  return result[3]
+end
+
+make a function called pr_hint takes result returns hint
+  return result[4]
+end
+
+# pr_build_shell_args(program, args) -> ["/c", program, arg1, arg2, ...],
+# the argv cmd.exe /c expects. Private to this module.
+make a function called pr_build_shell_args takes program, args returns shell_args
+  let out = ["/c", program]
+  let i = 0
+  while i < args.length do
+    let out = list_push(out, args[i])
+    let i = i + 1
+  end
+  return out
+end
+
+# run_classified(program, args) -> a result carrying exit_code, stdout,
+# stderr, classification, and a diagnostic_hint, all in one call. args is
+# a list of string arguments. Routed through `cmd.exe /c` -- see this
+# module's header comment for why that's required, not optional, for
+# graceful (non-crashing) handling of a nonexistent program.
+make a function called run_classified takes program, args returns result
+  let out = exec_capture_io("cmd.exe", pr_build_shell_args(program, args), "")
+  let stdout_text = out[0]
+  let stderr_text = out[1]
+  let success = out[2]
+  let exit_code = 0
+  if success == false then
+    let exit_code = 1
+  end
+  let tier = classify_failure(exit_code, stderr_text, false)
+  let hint = suggest_fix(tier, program, args)
+  return [exit_code, stdout_text, stderr_text, tier, hint]
+end
+
+# classify_failure(exit_code, stderr_text, was_patlang_call) -> one of:
+# "Ok", "MissingCapability", "CommandNotFound", "PermissionDenied",
+# "SyntaxError", "PathResolutionError", "ArgumentMismatch", "Unknown".
+#
+# was_patlang_call distinguishes a failed attempt to invoke a PatLang
+# capability (a dispatch_table lookup miss, or an apply(fname) call for
+# a name that doesn't exist -- console.patlang's job, not run_classified's,
+# since exec_capture_io only ever launches external processes) from a
+# failed attempt to run an external shell command. Both can present the
+# same "not found" stderr shape; was_patlang_call is what lets the two be
+# told apart so console.patlang knows whether there's anything for
+# self_healing_engine.patlang's heal_missing_function to synthesize
+# (MissingCapability) or not (CommandNotFound -- nothing to synthesize,
+# suggest an alternative or ask the human).
+make a function called classify_failure takes exit_code, stderr_text, was_patlang_call returns tier
+  if exit_code == 0 then
+    return "Ok"
+  end
+  if pr_looks_not_found(stderr_text) then
+    if was_patlang_call then
+      return "MissingCapability"
+    end
+    return "CommandNotFound"
+  end
+  if pr_contains_text(stderr_text, "unknown command") then
+    return "MissingCapability"
+  end
+  if pr_contains_text(stderr_text, "unknown function") then
+    return "MissingCapability"
+  end
+  if pr_contains_text(stderr_text, "Access is denied") then
+    return "PermissionDenied"
+  end
+  if pr_contains_text(stderr_text, "Permission denied") then
+    return "PermissionDenied"
+  end
+  if pr_contains_text(stderr_text, "cannot find the path") then
+    return "PathResolutionError"
+  end
+  if pr_contains_text(stderr_text, "No such file or directory") then
+    return "PathResolutionError"
+  end
+  if pr_contains_text(stderr_text, "syntax error") then
+    return "SyntaxError"
+  end
+  if pr_contains_text(stderr_text, "usage:") then
+    return "ArgumentMismatch"
+  end
+  return "Unknown"
+end
+
+# pr_looks_not_found(stderr_text) -> true for the Windows and
+# cross-platform "no such command/program" stderr shapes classify_failure
+# treats as either MissingCapability or CommandNotFound depending on
+# was_patlang_call.
+make a function called pr_looks_not_found takes stderr_text returns matches
+  if pr_contains_text(stderr_text, "is not recognized as an internal or external command") then
+    return true
+  end
+  if pr_contains_text(stderr_text, "command not found") then
+    return true
+  end
+  return false
+end
+
+# suggest_fix(tier, program, args) -> a short, actionable hint per
+# classification tier -- routemap.md section 2.B's "Diagnose & Suggest".
+make a function called suggest_fix takes tier, program, args returns hint
+  if tier == "Ok" then
+    return ""
+  end
+  if tier == "MissingCapability" then
+    return "'" + program + "' is not a known capability yet -- it can be synthesized automatically."
+  end
+  if tier == "CommandNotFound" then
+    return "'" + program + "' was not found on PATH -- check the spelling, or install it."
+  end
+  if tier == "PermissionDenied" then
+    return "Permission denied running '" + program + "' -- check file permissions or try an elevated shell."
+  end
+  if tier == "PathResolutionError" then
+    return "A path used by '" + program + "' could not be resolved -- check that it exists and is spelled correctly."
+  end
+  if tier == "SyntaxError" then
+    return "'" + program + "' reported a syntax error in its input -- check the arguments passed: " + pr_join_args(args)
+  end
+  if tier == "ArgumentMismatch" then
+    return "'" + program + "' rejected its arguments -- check its usage/help output."
+  end
+  return "'" + program + "' failed for an unrecognized reason -- check its stderr output directly."
+end
+
+# pr_join_args(args) -> args joined with a single space, for embedding
+# in a diagnostic hint. Minimal, private to this module -- not a general
+# list-join utility (no other caller needs one yet).
+make a function called pr_join_args takes args returns joined
+  let b = sb_new()
+  let i = 0
+  while i < args.length do
+    if i > 0 then
+      sb_push(b, " ")
+    end
+    sb_push(b, args[i])
+    let i = i + 1
+  end
+  return sb_str(b)
+end

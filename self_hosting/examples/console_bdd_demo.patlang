@@ -1,0 +1,245 @@
+# BDD-style verification of self_hosting/lib/console.patlang, using the
+# existing Gherkin runner in self_hosting/lib/test.patlang.
+#
+# Covers: empty input is a no-op, a registered handler's success/failure
+# paths (plain bool vs. a handler-supplied rich proc.patlang result), an
+# unrecognized command with no self-healing configured, and the pluggable
+# self-healing hand-off itself (both a synthesis success and a synthesis
+# failure) -- using fake heal_fn step functions standing in for
+# friendly_cli's own adapter, proving the hand-off is genuinely pluggable
+# (this spec never includes self_healing_engine.patlang at all).
+
+include "../lib/includes.patlang"
+include "../lib/console.patlang"
+include "../lib/test.patlang"
+
+# ---- fake handlers under test ----
+
+make a function called ts_handler_ok returns ok
+  let args = get("__vars", "console_args")
+  set_var("ts_seen_args", args)
+  return true
+end
+
+make a function called ts_handler_fail_plain returns ok
+  return false
+end
+
+make a function called ts_handler_fail_rich returns ok
+  set_var("console_last_proc_result", ["1", "", "boom", "CommandNotFound", "try installing boom"])
+  set_var("console_last_proc_result_set", true)
+  return false
+end
+
+# ---- fake heal_fn adapters under test ----
+
+make a function called ts_heal_success returns healed
+  set_var("ts_heal_was_called_with", get("__vars", "console_heal_command_name"))
+  return true
+end
+
+make a function called ts_heal_failure returns healed
+  set_var("ts_heal_was_called_with", get("__vars", "console_heal_command_name"))
+  return false
+end
+
+# ---- shared fixture ----
+
+make a function called ts_dispatch_table returns table
+  return [
+    ["greet", "ts_handler_ok"],
+    ["breakplain", "ts_handler_fail_plain"],
+    ["breakrich", "ts_handler_fail_rich"]
+  ]
+end
+
+# ---- step definitions ----
+
+make a function called st_console_empty_input returns done
+  let state = console_new_state("interactive")
+  let result = console_step(state, "   ", ts_dispatch_table())
+  set_var("console_result", result)
+  return true
+end
+
+make a function called st_console_empty_is_noop returns done
+  let result = get("__vars", "console_result")
+  check("empty input reports ok", cs_result_ok(result), true)
+  check("empty input produces no output event", cs_result_output(result), "")
+  return true
+end
+
+make a function called st_console_known_command returns done
+  let state = console_new_state("interactive")
+  let result = console_step(state, "greet world again", ts_dispatch_table())
+  set_var("console_result", result)
+  return true
+end
+
+make a function called st_console_known_command_succeeds returns done
+  let result = get("__vars", "console_result")
+  check("a known command reports ok", cs_result_ok(result), true)
+  check("the handler saw the args after the command name", get("__vars", "ts_seen_args"), ["world", "again"])
+  return true
+end
+
+make a function called st_console_plain_failure returns done
+  let state = console_new_state("interactive")
+  let result = console_step(state, "breakplain", ts_dispatch_table())
+  set_var("console_result", result)
+  return true
+end
+
+make a function called st_console_plain_failure_is_generic returns done
+  let result = get("__vars", "console_result")
+  check("a plain handler failure reports not-ok", cs_result_ok(result), false)
+  check("a plain handler failure is not treated as healed", cs_result_healed_command(result), "")
+  return true
+end
+
+make a function called st_console_rich_failure returns done
+  let state = console_new_state("interactive")
+  let result = console_step(state, "breakrich extra", ts_dispatch_table())
+  set_var("console_result", result)
+  return true
+end
+
+make a function called st_console_rich_failure_carries_hint returns done
+  let result = get("__vars", "console_result")
+  check("a rich handler failure reports not-ok", cs_result_ok(result), false)
+  check("a rich handler failure's diagnostic hint reaches the output event", contains_text(cs_result_output(result), "try installing boom"), true)
+  return true
+end
+
+make a function called st_console_unknown_no_healer returns done
+  let state = console_new_state("interactive")
+  let result = console_step(state, "frobnicate", ts_dispatch_table())
+  set_var("console_result", result)
+  return true
+end
+
+make a function called st_console_unknown_no_healer_reports_error returns done
+  let result = get("__vars", "console_result")
+  check("an unrecognized command with no healer reports not-ok", cs_result_ok(result), false)
+  check("an unrecognized command with no healer is not marked healed", cs_result_healed_command(result), "")
+  check("an unrecognized command's diagnostic mentions the command name", contains_text(cs_result_output(result), "frobnicate"), true)
+  return true
+end
+
+make a function called st_console_unknown_with_successful_healer returns done
+  let state = console_with_heal_fn(console_new_state("interactive"), "ts_heal_success")
+  let result = console_step(state, "frobnicate now", ts_dispatch_table())
+  set_var("console_result", result)
+  return true
+end
+
+make a function called st_console_healed_command_reported returns done
+  let result = get("__vars", "console_result")
+  check("a successfully healed command reports ok", cs_result_ok(result), true)
+  check("a successfully healed command names itself as healed_command", cs_result_healed_command(result), "frobnicate")
+  check("the heal_fn was handed the unrecognized command name", get("__vars", "ts_heal_was_called_with"), "frobnicate")
+  return true
+end
+
+make a function called st_console_unknown_with_failing_healer returns done
+  let state = console_with_heal_fn(console_new_state("interactive"), "ts_heal_failure")
+  let result = console_step(state, "wobblenate", ts_dispatch_table())
+  set_var("console_result", result)
+  return true
+end
+
+make a function called st_console_failed_heal_falls_back_to_diagnostic returns done
+  let result = get("__vars", "console_result")
+  check("a failed heal attempt still reports not-ok", cs_result_ok(result), false)
+  check("a failed heal attempt is not marked healed", cs_result_healed_command(result), "")
+  return true
+end
+
+make a function called st_console_agent_mode_command returns done
+  let state = console_new_state("agent")
+  let result = console_step(state, "breakrich", ts_dispatch_table())
+  set_var("console_result", result)
+  return true
+end
+
+make a function called st_console_agent_mode_output_is_json returns done
+  let result = get("__vars", "console_result")
+  check("agent mode renders the output event starting with a json brace", str_starts_with(cs_result_output(result), "{"), true)
+  check("agent mode json carries the command name", contains_text(cs_result_output(result), "\"message\":\"breakrich failed\""), true)
+  return true
+end
+
+make a function called register_console_steps returns done
+  step("an empty (whitespace-only) input line", "st_console_empty_input")
+  step("it is stepped through the console core", "st_console_empty_is_noop")
+  step("a line invoking a known, successful command with arguments", "st_console_known_command")
+  step("the handler runs successfully", "st_console_known_command_succeeds")
+  step("a line invoking a command whose handler fails plainly", "st_console_plain_failure")
+  step("it reports a generic failure", "st_console_plain_failure_is_generic")
+  step("a line invoking a command whose handler fails with a rich proc result", "st_console_rich_failure")
+  step("the diagnostic hint from that result reaches the output", "st_console_rich_failure_carries_hint")
+  step("a line invoking an unrecognized command with no healer configured", "st_console_unknown_no_healer")
+  step("it reports an unknown-command error naming the command", "st_console_unknown_no_healer_reports_error")
+  step("a line invoking an unrecognized command with a healer that succeeds", "st_console_unknown_with_successful_healer")
+  step("it reports the command as healed", "st_console_healed_command_reported")
+  step("a line invoking an unrecognized command with a healer that fails", "st_console_unknown_with_failing_healer")
+  step("it falls back to an ordinary diagnostic, not marked healed", "st_console_failed_heal_falls_back_to_diagnostic")
+  step("a line invoking a failing command in agent mode", "st_console_agent_mode_command")
+  step("the output event is rendered as json", "st_console_agent_mode_output_is_json")
+  return true
+end
+
+make a function called console_feature returns text
+  return "Feature: embeddable console core
+
+Scenario: empty input is a no-op
+  Given an empty (whitespace-only) input line
+  When it is stepped through the console core
+  Then it is stepped through the console core
+
+Scenario: a known command dispatches with its arguments
+  Given a line invoking a known, successful command with arguments
+  When the handler runs successfully
+  Then the handler runs successfully
+
+Scenario: a plain handler failure reports a generic error
+  Given a line invoking a command whose handler fails plainly
+  When it reports a generic failure
+  Then it reports a generic failure
+
+Scenario: a rich handler failure surfaces its diagnostic hint
+  Given a line invoking a command whose handler fails with a rich proc result
+  When the diagnostic hint from that result reaches the output
+  Then the diagnostic hint from that result reaches the output
+
+Scenario: an unrecognized command with no healer reports an error
+  Given a line invoking an unrecognized command with no healer configured
+  When it reports an unknown-command error naming the command
+  Then it reports an unknown-command error naming the command
+
+Scenario: an unrecognized command is healed when a healer succeeds
+  Given a line invoking an unrecognized command with a healer that succeeds
+  When it reports the command as healed
+  Then it reports the command as healed
+
+Scenario: a failed healing attempt falls back to an ordinary diagnostic
+  Given a line invoking an unrecognized command with a healer that fails
+  When it falls back to an ordinary diagnostic, not marked healed
+  Then it falls back to an ordinary diagnostic, not marked healed
+
+Scenario: agent mode renders output events as json
+  Given a line invoking a failing command in agent mode
+  When the output event is rendered as json
+  Then the output event is rendered as json
+"
+end
+
+make a function called run_console_bdd returns ok
+  t_init()
+  register_console_steps()
+  run_feature(console_feature())
+  t_report()
+  return get("__vars", "t_fail") == 0
+end
+
+run_console_bdd()

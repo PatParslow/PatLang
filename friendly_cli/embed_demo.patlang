@@ -1,0 +1,166 @@
+# Phase 3 embeddability proof, per IMPLEMENTATION_PLAN.md: a small,
+# SEPARATE PatLang program that embeds self_hosting/lib/console.patlang
+# directly -- no include of anything under friendly_cli/ (not
+# terminal.patlang, not dsl/shell_ops.patlang, not
+# lib/command_safety.patlang) -- proving the console core is genuinely
+# embeddable, not just structured to look that way.
+#
+# Two things this demo deliberately does differently from
+# friendly_cli/terminal.patlang, to prove the point rather than just
+# re-running the same shape of program under a different name:
+#
+#   1. Its own command set (add/list/done/help) has nothing to do with
+#      running shell commands -- console_step's dispatch/self-healing
+#      machinery doesn't know or care what a "command" means to its
+#      embedder.
+#   2. Its own loop isn't a blocking stdin read at all -- it drives
+#      console_step over a fixed batch of commands (standing in for
+#      "wherever the embedding program's own event loop already lives":
+#      a config file, a queued job list, anything), and COLLECTS each
+#      step_result's output_event into its own transcript rather than
+#      printing live -- console_step returns rendered text for the
+#      caller to display "however it wants" (its own doc comment), and
+#      batch-collecting instead of live-printing is exercised here as a
+#      genuinely different consumption pattern than terminal.patlang's.
+#
+# Run directly: pat.exe --ir-run friendly_cli/embed_demo.patlang
+
+include "../self_hosting/lib/console.patlang"
+
+# ---- a tiny embedded task tracker -- the embedding program's own
+# domain logic, unrelated to consoles, shells, or friendly_cli ----
+
+make a function called em_join takes tokens returns joined
+  let b = sb_new()
+  let i = 0
+  while i < tokens.length do
+    if i > 0 then
+      sb_push(b, " ")
+    end
+    sb_push(b, tokens[i])
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+make a function called em_add returns ok
+  let args = get("__vars", "console_args")
+  let tasks = get("__vars", "em_tasks")
+  set_var("em_tasks", list_push(tasks, em_join(args)))
+  return true
+end
+
+make a function called em_list returns ok
+  let tasks = get("__vars", "em_tasks")
+  let i = 0
+  while i < tasks.length do
+    print("  " + i + ": " + tasks[i])
+    let i = i + 1
+  end
+  return true
+end
+
+# em_mark_done(tasks, idx) -> tasks with a "[done] " prefix on entry idx.
+make a function called em_mark_done takes tasks, idx returns updated
+  let out = []
+  let i = 0
+  while i < tasks.length do
+    if i == idx then
+      let out = list_push(out, "[done] " + tasks[i])
+    else
+      let out = list_push(out, tasks[i])
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# em_done demonstrates the rich-failure path (console_last_proc_result)
+# is a general primitive, not shell-specific -- proc.patlang's own
+# accessors (pr_classification, pr_hint) are reused here even though
+# nothing was ever run as a subprocess.
+make a function called em_done returns ok
+  let args = get("__vars", "console_args")
+  let idx_str = arg_or_default(args, 0, "")
+  let idx = to_num(idx_str)
+  let tasks = get("__vars", "em_tasks")
+  if (idx < 0) or (idx >= tasks.length) then
+    set_var("console_last_proc_result", ["1", "", "", "ArgumentMismatch", "no task at index " + idx_str + " -- there are " + tasks.length + " task(s), indexed from 0."])
+    set_var("console_last_proc_result_set", true)
+    return false
+  end
+  set_var("em_tasks", em_mark_done(tasks, idx))
+  return true
+end
+
+make a function called em_help returns ok
+  print("commands: add <text>, list, done <index>, help")
+  return true
+end
+
+# arg_or_default is small enough to keep local rather than pull in
+# self_hosting/lib/cli.patlang for one call -- this demo's whole point
+# is minimal dependencies beyond console.patlang itself.
+make a function called arg_or_default takes args, index, default_val returns value
+  if args.length > index then
+    return args[index]
+  end
+  return default_val
+end
+
+make a function called em_dispatch_table returns table
+  return [
+    ["add", "em_add"],
+    ["list", "em_list"],
+    ["done", "em_done"],
+    ["help", "em_help"]
+  ]
+end
+
+# ---- the embedding "loop": a fixed batch, not stdin ----
+
+make a function called em_command_batch returns lines
+  return [
+    "help",
+    "add write the embeddability demo",
+    "add verify pluggable healing works outside a shell context",
+    "list",
+    "done 0",
+    "list",
+    "done 99",
+    "list"
+  ]
+end
+
+make a function called em_run returns transcript
+  set_var("em_tasks", [])
+  let state = console_new_state("agent")
+  let table = em_dispatch_table()
+  let batch = em_command_batch()
+  let transcript = []
+  let i = 0
+  while i < batch.length do
+    let result = console_step(state, batch[i], table)
+    let state = cs_result_state(result)
+    let output = cs_result_output(result)
+    if output != "" then
+      let transcript = list_push(transcript, output)
+    end
+    let i = i + 1
+  end
+  return transcript
+end
+
+make a function called em_main returns done
+  print("embed_demo: driving console.patlang from a fixed command batch, no friendly_cli dependency, agent-mode output collected below.")
+  let transcript = em_run()
+  print("--- collected step_result output events (" + transcript.length + ") ---")
+  let i = 0
+  while i < transcript.length do
+    print(transcript[i])
+    let i = i + 1
+  end
+  return true
+end
+
+em_main()

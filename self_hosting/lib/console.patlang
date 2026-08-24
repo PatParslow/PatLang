@@ -1,0 +1,259 @@
+# The embeddable console core: a single, drivable REPL step, so both a
+# standalone blocking terminal loop (friendly_cli's own binary) and any
+# other PatLang program's own event loop can drive the exact same
+# command-dispatch/self-healing behavior identically, by calling
+# console_step once per input line from wherever their own loop already
+# lives. This module owns none of the terminal-IO concerns (line editing,
+# history, completion) -- those are genuinely specific to a standalone
+# process and belong in friendly_cli's own binary, not here.
+#
+# Design resolution worth stating explicitly: this module does NOT
+# `include` or call into friendly_cli/lib/self_healing_engine.patlang
+# directly. Hand-off to capability synthesis is PLUGGABLE -- a caller
+# supplies a heal_fn (a function name string, invoked the same
+# zero-argument way self_hosting/lib/test.patlang's `step()` dispatcher
+# calls step functions: via apply(fname), with data threaded through the
+# global var store, not passed as arguments). A hard dependency on
+# self_healing_engine.patlang here would force every embedder -- including
+# ones that just want command dispatch with no synthesis at all -- to
+# carry friendly_cli-specific code, directly undermining the point of an
+# embeddable core. friendly_cli's own driver supplies a small adapter
+# function (registered as its heal_fn) that reads console_heal_command_name/
+# console_heal_args from the var store and calls
+# self_healing_engine.patlang's heal_missing_function with whatever extra
+# config (engine_type, model_name, test fixtures) friendly_cli itself
+# wants -- that adapter lives in friendly_cli, not here.
+#
+# HANDLER CONTRACT: dispatch_table is a list of [command_name,
+# handler_fn_name] pairs, supplied fresh by the caller on every
+# console_step call (not a global registry -- an embedder can swap its
+# whole command set between calls if it wants to, including registering
+# the SAME handler under a name built dynamically from the input line
+# itself -- see friendly_cli/dsl/shell_ops.patlang for a handler that
+# runs whatever command name it's invoked under). Each handler_fn is an
+# existing PatLang function taking zero arguments (apply()'s calling
+# convention), which reads console_cmd_name (the matched command name)
+# and console_args (a list of whitespace-split tokens after it) from the
+# global var store, and returns a bool: true for success, false for
+# failure. A handler that wants richer failure classification than a
+# bare bool -- so console_step can offer a diagnostic hint, or hand off
+# to self-healing for a MissingCapability failure -- sets
+# console_last_proc_result (a proc.patlang-shaped result list, typically
+# from calling run_classified or classify_failure itself) and
+# console_last_proc_result_set (true) before returning false. A handler
+# that skips this still works; it just gets a generic "failed" event
+# with no hint.
+#
+# HEALING HAND-OFF CONTRACT: heal_fn (if set on state, via
+# console_with_heal_fn) is called via apply(heal_fn) whenever a failure
+# classifies as MissingCapability -- either an unrecognized command name
+# (no dispatch_table entry at all) or a handler-reported one. Before
+# calling it, console_step sets console_heal_command_name (the command
+# that needs synthesizing) and console_heal_args (its arguments). heal_fn
+# returns a bool: true if synthesis succeeded (console_step reports a
+# "healed" event, and returns the command name as healed_command in its
+# step_result so the EMBEDDING CALLER can add it to the dispatch_table it
+# passes on the next call -- console_step has no way to mutate the
+# caller's own dispatch_table, by design, since it's caller-owned data,
+# not something this module manages), false otherwise (falls through to
+# an ordinary diagnostic).
+
+include "includes.patlang"
+include "output.patlang"
+include "proc.patlang"
+
+# ---- state (state is [mode, heal_fn_name] -- positional, matching this
+# codebase's convention for small structured values) ----
+
+# console_new_state(mode) -> a fresh state for mode "interactive" or
+# "agent", with no self-healing hand-off configured (heal_fn = "").
+make a function called console_new_state takes mode returns state
+  return [mode, ""]
+end
+
+# console_with_heal_fn(state, heal_fn_name) -> state with the pluggable
+# self-healing hand-off configured. Pass "" to explicitly disable it
+# again (equivalent to never calling this).
+make a function called console_with_heal_fn takes state, heal_fn_name returns new_state
+  return [cs_mode(state), heal_fn_name]
+end
+
+make a function called cs_mode takes state returns mode
+  return state[0]
+end
+
+make a function called cs_heal_fn takes state returns heal_fn
+  return state[1]
+end
+
+# ---- step_result accessors (step_result is [new_state, output_event,
+# ok, healed_command]) ----
+
+make a function called cs_result_state takes step_result returns new_state
+  return step_result[0]
+end
+
+# cs_result_output(step_result) -> the rendered event text (already
+# picked human vs. json per the state's mode) for the caller to display
+# however it wants -- print it, append it to a log, forward it over a
+# socket to a remote embedder, whatever fits that caller.
+make a function called cs_result_output takes step_result returns output_event
+  return step_result[1]
+end
+
+make a function called cs_result_ok takes step_result returns ok
+  return step_result[2]
+end
+
+# cs_result_healed_command(step_result) -> the command name that was just
+# synthesized, if this step triggered a successful self-heal, else "".
+# The embedding caller should add this to its own dispatch_table before
+# the same command is tried again.
+make a function called cs_result_healed_command takes step_result returns healed_command
+  return step_result[3]
+end
+
+# ---- tokenizing ----
+
+# console_tokenize(line) -> line split on runs of spaces/tabs, with no
+# empty tokens (collapses consecutive whitespace, trims both ends).
+# Deliberately minimal: no quoting, no escaping -- a real shell-grade
+# tokenizer is a separate, bigger primitive this console core doesn't
+# need yet.
+make a function called console_tokenize takes line returns tokens
+  let out = []
+  let n = line.length
+  let i = 0
+  let start = -1
+  while i < n do
+    let c = char_code(line, i)
+    let is_sep = (c == 32) or (c == 9)
+    if is_sep then
+      if start >= 0 then
+        let out = list_push(out, substr(line, start, i - start))
+        let start = -1
+      end
+    else
+      if start < 0 then
+        let start = i
+      end
+    end
+    let i = i + 1
+  end
+  if start >= 0 then
+    let out = list_push(out, substr(line, start, n - start))
+  end
+  return out
+end
+
+# console_tail(tokens) -> every token after the first (the command's
+# arguments, once tokens[0] has been taken as the command name).
+make a function called console_tail takes tokens returns rest
+  let out = []
+  let i = 1
+  while i < tokens.length do
+    let out = list_push(out, tokens[i])
+    let i = i + 1
+  end
+  return out
+end
+
+# console_lookup_handler(dispatch_table, cmd_name) -> the registered
+# handler_fn_name for cmd_name, or "" if none is registered.
+make a function called console_lookup_handler takes dispatch_table, cmd_name returns handler_fn
+  let i = 0
+  while i < dispatch_table.length do
+    if dispatch_table[i][0] == cmd_name then
+      return dispatch_table[i][1]
+    end
+    let i = i + 1
+  end
+  return ""
+end
+
+# console_render(mode, event_kind, message, detail) -> the rendered
+# event text for `mode`, via output.patlang, WITHOUT printing it --
+# console_step returns events for the caller to display, it never prints
+# directly (an embedder may not want stdout output at all).
+make a function called console_render takes mode, event_kind, message, detail returns text
+  if mode == "interactive" then
+    return render_human(event_kind, message, detail)
+  end
+  return render_json(event_kind, message, detail)
+end
+
+# ---- the step itself ----
+
+# console_step(state, input_line, dispatch_table) -> step_result. Reads
+# one input line, dispatches it via dispatch_table, and on failure
+# either hands off to state's pluggable heal_fn (MissingCapability) or
+# returns a diagnostic event -- a single callable unit any loop, standalone
+# or embedded, can drive identically.
+make a function called console_step takes state, input_line, dispatch_table returns step_result
+  let mode = cs_mode(state)
+  let tokens = console_tokenize(input_line)
+  if tokens.length == 0 then
+    return [state, "", true, ""]
+  end
+  let cmd_name = tokens[0]
+  let rest = console_tail(tokens)
+  let handler_fn = console_lookup_handler(dispatch_table, cmd_name)
+  if handler_fn == "" then
+    return console_handle_unknown_command(state, cmd_name, rest, mode)
+  end
+  return console_handle_dispatch(state, handler_fn, cmd_name, rest, mode)
+end
+
+# console_handle_unknown_command: no dispatch_table entry at all for
+# cmd_name -- classified with was_patlang_call = true, since this is a
+# gap in the console's own recognized vocabulary, not a missing external
+# program (nothing has been run yet).
+make a function called console_handle_unknown_command takes state, cmd_name, rest, mode returns step_result
+  let tier = classify_failure(1, "unknown command: " + cmd_name, true)
+  let heal_fn = cs_heal_fn(state)
+  if (tier == "MissingCapability") and (heal_fn != "") then
+    set_var("console_heal_command_name", cmd_name)
+    set_var("console_heal_args", rest)
+    let healed = apply(heal_fn)
+    if healed then
+      let text = console_render(mode, "healed", "learned a new capability: " + cmd_name, "")
+      return [state, text, true, cmd_name]
+    end
+  end
+  let hint = suggest_fix(tier, cmd_name, rest)
+  let text = console_render(mode, "error", "unknown command: " + cmd_name, hint)
+  return [state, text, false, ""]
+end
+
+# console_handle_dispatch: cmd_name has a registered handler -- run it,
+# per the HANDLER CONTRACT documented at the top of this file.
+make a function called console_handle_dispatch takes state, handler_fn, cmd_name, rest, mode returns step_result
+  set_var("console_cmd_name", cmd_name)
+  set_var("console_args", rest)
+  set_var("console_last_proc_result_set", false)
+  let ok = apply(handler_fn)
+  if ok then
+    let text = console_render(mode, "ok", cmd_name + " completed", "")
+    return [state, text, true, ""]
+  end
+  let has_proc_result = get("__vars", "console_last_proc_result_set")
+  if has_proc_result == false then
+    let text = console_render(mode, "error", cmd_name + " failed", "")
+    return [state, text, false, ""]
+  end
+  let result = get("__vars", "console_last_proc_result")
+  let tier = pr_classification(result)
+  let hint = pr_hint(result)
+  let heal_fn = cs_heal_fn(state)
+  if (tier == "MissingCapability") and (heal_fn != "") then
+    set_var("console_heal_command_name", cmd_name)
+    set_var("console_heal_args", rest)
+    let healed = apply(heal_fn)
+    if healed then
+      let text = console_render(mode, "healed", "learned a new capability: " + cmd_name, "")
+      return [state, text, true, cmd_name]
+    end
+  end
+  let text = console_render(mode, "error", cmd_name + " failed", hint)
+  return [state, text, false, ""]
+end

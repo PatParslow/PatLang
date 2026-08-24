@@ -1,0 +1,221 @@
+# PNG raster decoder. Supports the common baseline case: 8-bit-depth,
+# non-interlaced, color type 2 (RGB) or 6 (RGBA) -- covers the
+# overwhelming majority of real-world PNGs (screenshots, exported
+# images, anything written by a modern tool). Deliberately does NOT
+# support palette/indexed (color type 3), grayscale (0/4), bit depths
+# other than 8, or Adam7 interlacing -- a real, named scope limit, the
+# same staged approach image_bmp.patlang's own header describes (BMP
+# started 24/32-bit-only, then grew 1/4/8-bit palette support once a
+# real file needed it -- PNG can grow the same way if a real file ever
+# needs a mode outside this list).
+#
+# PNG's compressed data (one or more IDAT chunks, concatenated) is
+# always zlib-wrapped DEFLATE -- see inflate.patlang for that decoder.
+# After inflating, PNG applies one of 5 per-scanline filters (None/
+# Sub/Up/Average/Paeth, RFC 2083 section 6.3); this module reverses
+# that filtering in place on the raw decompressed buffer before
+# extracting final RGB pixels.
+#
+# RGBA input (color type 6) has no natural "no pixel here" concept in
+# image.patlang's own RGB-only buffer (see its own header on this) --
+# composited onto a fixed BLACK background here via straight alpha
+# blending (out = fg * a / 255), matching a Sixel terminal's own
+# typical dark background so a partially-transparent PNG still looks
+# reasonable without a real compositing target to blend against.
+
+include "includes.patlang"
+include "image.patlang"
+include "inflate.patlang"
+
+make a function called png_u32 takes bytes, offset returns v
+  let b0 = char_code(bytes, offset)
+  let b1 = char_code(bytes, offset + 1)
+  let b2 = char_code(bytes, offset + 2)
+  let b3 = char_code(bytes, offset + 3)
+  return (b0 * 16777216) + (b1 * 65536) + (b2 * 256) + b3
+end
+
+make a function called png_paeth takes a, b, c returns predictor
+  let p = a + b - c
+  let pa = p - a
+  if pa < 0 then
+    let pa = 0 - pa
+  end
+  let pb = p - b
+  if pb < 0 then
+    let pb = 0 - pb
+  end
+  let pc = p - c
+  if pc < 0 then
+    let pc = 0 - pc
+  end
+  if (pa <= pb) and (pa <= pc) then
+    return a
+  end
+  if pb <= pc then
+    return b
+  end
+  return c
+end
+
+# png_parse_chunks(bytes) -> [width, height, bit_depth, color_type,
+# interlace, idat_bytes], or [] if the PNG signature is missing/
+# truncated. Concatenates every IDAT chunk's payload in file order
+# (the zlib stream spans all of them together, not chunk-by-chunk).
+make a function called png_parse_chunks takes bytes returns info
+  if bytes.length < 8 then
+    return []
+  end
+  if char_code(bytes, 0) != 137 then
+    return []
+  end
+  if (substr(bytes, 1, 3) != "PNG") then
+    return []
+  end
+  let pos = 8
+  let idat = ""
+  let width = 0
+  let height = 0
+  let bit_depth = 0
+  let color_type = 0
+  let interlace = 0
+  let saw_ihdr = false
+  let done = false
+  while (pos + 8 <= bytes.length) and (done == false) do
+    let clen = png_u32(bytes, pos)
+    let ctype = substr(bytes, pos + 4, 4)
+    let cdata_offset = pos + 8
+    if (cdata_offset + clen) > bytes.length then
+      let done = true
+    else
+      if ctype == "IHDR" then
+        let width = png_u32(bytes, cdata_offset)
+        let height = png_u32(bytes, cdata_offset + 4)
+        let bit_depth = char_code(bytes, cdata_offset + 8)
+        let color_type = char_code(bytes, cdata_offset + 9)
+        let interlace = char_code(bytes, cdata_offset + 12)
+        let saw_ihdr = true
+      elif ctype == "IDAT" then
+        let idat = idat + substr(bytes, cdata_offset, clen)
+      elif ctype == "IEND" then
+        let done = true
+      end
+      let pos = cdata_offset + clen + 4
+    end
+  end
+  if saw_ihdr == false then
+    return []
+  end
+  return [width, height, bit_depth, color_type, interlace, idat]
+end
+
+# png_unfilter(buf, width, height, channels) -> reverses the per-
+# scanline filter in place (RFC 2083 section 6.3), so `buf` afterward
+# holds plain [filter_byte=0-ish, then raw pixel bytes] rows -- callers
+# still skip the (now-irrelevant) leading filter byte per row when
+# reading pixels, same layout, just already-reconstructed values.
+make a function called png_unfilter takes buf, width, height, channels returns done
+  let bytes_per_row = width * channels
+  let row_stride = 1 + bytes_per_row
+  let y = 0
+  while y < height do
+    let row_offset = y * row_stride
+    let filter_type = mem_peek_byte(buf, row_offset)
+    let data_offset = row_offset + 1
+    let prior_offset = data_offset - row_stride
+    let x = 0
+    while x < bytes_per_row do
+      let raw_offset = data_offset + x
+      let filt_val = mem_peek_byte(buf, raw_offset)
+      let a = 0
+      if x >= channels then
+        let a = mem_peek_byte(buf, raw_offset - channels)
+      end
+      let b = 0
+      if y > 0 then
+        let b = mem_peek_byte(buf, prior_offset + x)
+      end
+      let c = 0
+      if (y > 0) and (x >= channels) then
+        let c = mem_peek_byte(buf, prior_offset + x - channels)
+      end
+      let recon = filt_val
+      if filter_type == 1 then
+        let recon = (filt_val + a) % 256
+      elif filter_type == 2 then
+        let recon = (filt_val + b) % 256
+      elif filter_type == 3 then
+        let recon = (filt_val + floor((a + b) / 2)) % 256
+      elif filter_type == 4 then
+        let recon = (filt_val + png_paeth(a, b, c)) % 256
+      end
+      mem_poke_byte(buf, raw_offset, recon)
+      let x = x + 1
+    end
+    let y = y + 1
+  end
+  return true
+end
+
+# png_decode(bytes) -> an image.patlang "image" value, or [] on any
+# unsupported/malformed/undecodable input -- matches every other
+# decoder's own established failure convention here.
+make a function called png_decode takes bytes returns image
+  let info = png_parse_chunks(bytes)
+  if info.length == 0 then
+    return []
+  end
+  let width = info[0]
+  let height = info[1]
+  let bit_depth = info[2]
+  let color_type = info[3]
+  let interlace = info[4]
+  let idat = info[5]
+  if (width <= 0) or (height <= 0) then
+    return []
+  end
+  if bit_depth != 8 then
+    return []
+  end
+  if interlace != 0 then
+    return []
+  end
+  if (color_type != 2) and (color_type != 6) then
+    return []
+  end
+  let channels = 3
+  if color_type == 6 then
+    let channels = 4
+  end
+  let bytes_per_row = width * channels
+  let decompressed_size = height * (1 + bytes_per_row)
+  let raw_buf = rt_heap_alloc(decompressed_size)
+  let n = zlib_inflate_to_buffer(idat, raw_buf, decompressed_size)
+  if n != decompressed_size then
+    return []
+  end
+  png_unfilter(raw_buf, width, height, channels)
+  let out = img_new(width, height)
+  let row_stride = 1 + bytes_per_row
+  let y = 0
+  while y < height do
+    let row_offset = (y * row_stride) + 1
+    let x = 0
+    while x < width do
+      let px_offset = row_offset + (x * channels)
+      let r = mem_peek_byte(raw_buf, px_offset)
+      let g = mem_peek_byte(raw_buf, px_offset + 1)
+      let b = mem_peek_byte(raw_buf, px_offset + 2)
+      if channels == 4 then
+        let alpha = mem_peek_byte(raw_buf, px_offset + 3)
+        let r = floor((r * alpha) / 255)
+        let g = floor((g * alpha) / 255)
+        let b = floor((b * alpha) / 255)
+      end
+      img_set_pixel(out, x, y, r, g, b)
+      let x = x + 1
+    end
+    let y = y + 1
+  end
+  return out
+end

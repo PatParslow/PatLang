@@ -2417,6 +2417,77 @@ make a function called x64_binop_asm takes op returns asm
   return sb_str(sb)
 end
 
+# ---- g_scratch/g_scratch2 lock (real OS threads make these process-
+# wide shared, mutable state -- see g_scratch_cs's own .bss header) ----
+#
+# x64_lock_acquire_asm(suffix)/x64_lock_release_asm() are INLINED
+# directly into another primitive's own asm sequence (same convention
+# as x64_os_null_terminate_path_asm, called from inside x64_os_set_cwd_
+# asm etc, not a standalone CallHost primitive). Each is SELF-aligning
+# (its own mov r15,rsp/sub rsp,N/and rsp,-16/restore) rather than
+# requiring the caller to have already set one up -- both make real
+# WinAPI calls (InitializeCriticalSection/EnterCriticalSection/
+# LeaveCriticalSection), and every existing caller in this file wraps
+# g_scratch usage that happens BEFORE its own frame setup (the null-
+# terminate call always comes first, the self-aligned WinAPI section
+# second) -- self-aligning here means acquire/release can simply be
+# placed at the very top/bottom of a function without re-deriving each
+# caller's own register liveness. Per this file's own universal rule,
+# no register survives a call unless explicitly preserved -- callers
+# must not rely on rax/rcx/rdx/r8-r11 surviving acquire or release
+# (which is exactly why every caller below places acquire as the FIRST
+# instruction, before any arg is popped into a register, and release
+# right before the final result is pushed -- nothing needing
+# protection is ever live across either call).
+#
+# g_scratch_cs_ready's lazy init (0=never started, 1=another thread is
+# initializing right now, 2=ready) uses a real `lock cmpxchg` race, not
+# an eager startup hook -- the ONE thread that wins the 0->1
+# transition calls InitializeCriticalSection and sets 2 itself; every
+# other thread (this one's own 0->1 attempt failing, OR simply seeing
+# 1 or 2 already) spins on `pause` until it sees 2. This keeps
+# correctness independent of whether the program ever calls
+# thread_spawn at all -- a single-threaded program's first lock_acquire
+# just wins the race trivially and pays a few extra instructions, not a
+# risk of ever touching an uninitialized CRITICAL_SECTION.
+make a function called x64_lock_acquire_asm takes suffix returns asm
+  let sb = sb_new()
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "  .lock_check_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rel g_scratch_cs_ready]" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 2" + x64_nl_char())
+  sb_push(sb, "    je .lock_ready_" + suffix + x64_nl_char())
+  sb_push(sb, "    xor rax, rax" + x64_nl_char())
+  sb_push(sb, "    mov rcx, 1" + x64_nl_char())
+  sb_push(sb, "    lock cmpxchg [rel g_scratch_cs_ready], rcx" + x64_nl_char())
+  sb_push(sb, "    jne .lock_spin_" + suffix + x64_nl_char())
+  sb_push(sb, "    lea rcx, [rel g_scratch_cs]" + x64_nl_char())
+  sb_push(sb, "    call InitializeCriticalSection" + x64_nl_char())
+  sb_push(sb, "    mov qword [rel g_scratch_cs_ready], 2" + x64_nl_char())
+  sb_push(sb, "    jmp .lock_ready_" + suffix + x64_nl_char())
+  sb_push(sb, "  .lock_spin_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    pause" + x64_nl_char())
+  sb_push(sb, "    jmp .lock_check_" + suffix + x64_nl_char())
+  sb_push(sb, "  .lock_ready_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [rel g_scratch_cs]" + x64_nl_char())
+  sb_push(sb, "    call EnterCriticalSection" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  return sb_str(sb)
+end
+
+make a function called x64_lock_release_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [rel g_scratch_cs]" + x64_nl_char())
+  sb_push(sb, "    call LeaveCriticalSection" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  return sb_str(sb)
+end
+
 # ---- file I/O (self-hosting-toward-x64, step 2 of 3: growable lists
 # already done, exec_capture still ahead) ----
 #
@@ -2484,6 +2555,10 @@ end
 make a function called x64_os_copy_file_asm returns asm
   let suffix = label_asm_safe(0)
   let sb = sb_new()
+  # lock_acquire FIRST, before any arg is popped into a register it
+  # would clobber (see x64_lock_acquire_asm's own header) -- protects
+  # BOTH scratch buffers (from/to paths) for this whole call.
+  sb_push(sb, x64_lock_acquire_asm(suffix))
   # Args pushed by the caller in order (from_addr, from_len, to_addr,
   # to_len) -- LIFO pop order is therefore the reverse.
   sb_push(sb, "    pop r11" + x64_nl_char())
@@ -2500,7 +2575,9 @@ make a function called x64_os_copy_file_asm returns asm
   sb_push(sb, "    xor r8, r8" + x64_nl_char())
   sb_push(sb, "    call CopyFileA" + x64_nl_char())
   sb_push(sb, "    mov rsp, r15" + x64_nl_char())
-  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    mov r14, rax" + x64_nl_char())
+  sb_push(sb, x64_lock_release_asm())
+  sb_push(sb, "    push r14" + x64_nl_char())
   return sb_str(sb)
 end
 
@@ -2510,6 +2587,7 @@ end
 make a function called x64_os_rename_file_asm returns asm
   let suffix = label_asm_safe(0)
   let sb = sb_new()
+  sb_push(sb, x64_lock_acquire_asm(suffix))
   # Args pushed by the caller in order (from_addr, from_len, to_addr,
   # to_len) -- LIFO pop order is therefore the reverse.
   sb_push(sb, "    pop r11" + x64_nl_char())
@@ -2526,7 +2604,9 @@ make a function called x64_os_rename_file_asm returns asm
   sb_push(sb, "    mov r8, 1" + x64_nl_char())
   sb_push(sb, "    call MoveFileExA" + x64_nl_char())
   sb_push(sb, "    mov rsp, r15" + x64_nl_char())
-  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    mov r14, rax" + x64_nl_char())
+  sb_push(sb, x64_lock_release_asm())
+  sb_push(sb, "    push r14" + x64_nl_char())
   return sb_str(sb)
 end
 
@@ -2547,7 +2627,9 @@ end
 # this backend, which give no such guarantee) -- safe to hold the
 # running byte count in r12 across the read loop's own ReadFile calls.
 make a function called x64_os_read_line_asm returns asm
+  let suffix = label_asm_safe(0)
   let sb = sb_new()
+  sb_push(sb, x64_lock_acquire_asm(suffix))
   sb_push(sb, "    mov r15, rsp" + x64_nl_char())
   sb_push(sb, "    sub rsp, 64" + x64_nl_char())
   sb_push(sb, "    and rsp, -16" + x64_nl_char())
@@ -2618,9 +2700,459 @@ make a function called x64_os_read_line_asm returns asm
   sb_push(sb, "    inc r14" + x64_nl_char())
   sb_push(sb, "    jmp .rl_copy" + x64_nl_char())
   sb_push(sb, "  .rl_copy_done:" + x64_nl_char())
-  sb_push(sb, "    mov rax, r13" + x64_nl_char())
+  sb_push(sb, "    mov r14, r13" + x64_nl_char())
+  sb_push(sb, x64_lock_release_asm())
+  sb_push(sb, "    mov rax, r14" + x64_nl_char())
   sb_push(sb, "    mov rcx, 2305843009213693952" + x64_nl_char())
   sb_push(sb, "    or rax, rcx" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# ---- raw-mode console input (tab-completion primitive-gap fill) ----
+#
+# os_enable_raw_mode() -> the console's PREVIOUS mode as a plain int, or
+# -1 if GetConsoleMode itself failed -- which it genuinely does when
+# stdin isn't a real console (a redirected file or a piped subprocess,
+# exactly how every BDD spec in this codebase drives a compiled program
+# under test). -1 is the caller's signal to skip raw-mode line editing
+# entirely and fall back to plain os_read_line, so piped/scripted use
+# keeps working unchanged -- this was verified directly: SetConsoleMode
+# on a pipe handle does not crash, it just reports failure via the
+# return value, exactly like any other WinAPI call this backend already
+# checks (GetConsoleMode here, same as the existing MoveFileExA-style
+# calls elsewhere in this file that check rax against 0).
+#
+# On success, clears ENABLE_LINE_INPUT (0x0002) and ENABLE_ECHO_INPUT
+# (0x0004) only -- so a byte arrives per keystroke instead of per line,
+# with no OS-drawn echo (the caller must draw its own). ENABLE_PROCESSED_
+# INPUT (0x0001) is deliberately left SET: Ctrl+C still terminates the
+# process the normal way. A raw-mode reader that also wants to treat
+# Ctrl+C as an editable keystroke (to cancel-in-place rather than exit)
+# would need to clear that bit too and wire its own signal handling --
+# real, separate future work, not attempted here; this is the safer
+# default for a first cut.
+make a function called x64_os_enable_raw_mode_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 64" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    mov rcx, -10" + x64_nl_char())
+  sb_push(sb, "    call GetStdHandle" + x64_nl_char())
+  sb_push(sb, "    mov [rsp+56], rax" + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rsp+56]" + x64_nl_char())
+  sb_push(sb, "    lea rdx, [rsp+48]" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+48], 0" + x64_nl_char())
+  sb_push(sb, "    call GetConsoleMode" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+  sb_push(sb, "    je .raw_en_fail" + x64_nl_char())
+  sb_push(sb, "    mov eax, [rsp+48]" + x64_nl_char())
+  sb_push(sb, "    mov r13d, eax" + x64_nl_char())
+  sb_push(sb, "    and eax, -7" + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rsp+56]" + x64_nl_char())
+  sb_push(sb, "    mov edx, eax" + x64_nl_char())
+  sb_push(sb, "    call SetConsoleMode" + x64_nl_char())
+  sb_push(sb, "    mov rax, r13" + x64_nl_char())
+  sb_push(sb, "    jmp .raw_en_done" + x64_nl_char())
+  sb_push(sb, "  .raw_en_fail:" + x64_nl_char())
+  sb_push(sb, "    mov rax, -1" + x64_nl_char())
+  sb_push(sb, "  .raw_en_done:" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# os_disable_raw_mode(old_mode) -> restores whatever mode
+# os_enable_raw_mode reported before it changed anything. Called with
+# old_mode == -1 (raw mode was never actually entered, e.g. non-console
+# stdin) this still issues a SetConsoleMode call with -1 as the mode
+# value -- harmless (it just fails, same as GetConsoleMode already did
+# on that same non-console handle) but callers should still guard the
+# call site on old_mode != -1 to avoid it, matching x64_runtime.patlang's
+# wrapper below.
+make a function called x64_os_disable_raw_mode_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    pop rcx" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 48" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    mov r13d, ecx" + x64_nl_char())
+  sb_push(sb, "    mov rcx, -10" + x64_nl_char())
+  sb_push(sb, "    call GetStdHandle" + x64_nl_char())
+  sb_push(sb, "    mov rcx, rax" + x64_nl_char())
+  sb_push(sb, "    mov edx, r13d" + x64_nl_char())
+  sb_push(sb, "    call SetConsoleMode" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    push 0" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# os_read_raw_byte() -> the next single byte from stdin as a plain int
+# (0-255), or -1 at EOF/error. Same ReadFile-one-byte call
+# os_read_line's own loop body already makes (see its header comment),
+# extracted here as a standalone single read with no newline-scanning or
+# accumulation -- the caller (a PatLang-level line editor) decides what
+# to do with each byte, including recognizing Tab (9), Backspace (8),
+# Enter (13 or 10 depending on how the byte arrives), and Escape (27,
+# the lead byte of an arrow-key sequence on Windows consoles) itself.
+make a function called x64_os_read_raw_byte_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, x64_lock_acquire_asm(suffix))
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 64" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    mov rcx, -10" + x64_nl_char())
+  sb_push(sb, "    call GetStdHandle" + x64_nl_char())
+  sb_push(sb, "    mov rcx, rax" + x64_nl_char())
+  sb_push(sb, "    lea rdx, [rel g_scratch]" + x64_nl_char())
+  sb_push(sb, "    mov r8, 1" + x64_nl_char())
+  sb_push(sb, "    lea r9, [rsp+40]" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+32], 0" + x64_nl_char())
+  sb_push(sb, "    call ReadFile" + x64_nl_char())
+  # Same class of bug as x64_os_exec_run_asm's own read loop (found and
+  # fixed there first, via a live user report): ReadFile's
+  # lpNumberOfBytesRead is a DWORD, but this read [rsp+40] as a full
+  # 64-bit qword -- if its never-zeroed upper 32 bits happen to be
+  # nonzero garbage, a genuine EOF (bytesRead == 0) could be missed by
+  # the `cmp rax, 0` check below. This module's own automated tests
+  # never exercised this path (they all hit the non-console fallback,
+  # never console_raw_enable's real branch), so it went unverified until
+  # a live user report of raw-mode input trouble prompted re-checking
+  # every ReadFile call in this file for the same mistake.
+  sb_push(sb, "    mov eax, [rsp+40]" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+  sb_push(sb, "    je .rrb_eof" + x64_nl_char())
+  sb_push(sb, "    lea rax, [rel g_scratch]" + x64_nl_char())
+  sb_push(sb, "    movzx rax, byte [rax]" + x64_nl_char())
+  sb_push(sb, "    jmp .rrb_done" + x64_nl_char())
+  sb_push(sb, "  .rrb_eof:" + x64_nl_char())
+  sb_push(sb, "    mov rax, -1" + x64_nl_char())
+  sb_push(sb, "  .rrb_done:" + x64_nl_char())
+  # rsp restored (via r15) BEFORE lock_release, not after -- lock_
+  # release uses r15 internally for its OWN self-alignment, which would
+  # clobber THIS function's own saved entry rsp if release ran first.
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    mov r14, rax" + x64_nl_char())
+  sb_push(sb, x64_lock_release_asm())
+  sb_push(sb, "    mov rax, r14" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# os_set_console_utf8() -> sets BOTH the console's input and output code
+# pages to UTF-8 (65001). Fixes a real, live-reported bug: PatLang
+# string literals in this codebase's own source are UTF-8 (e.g. the
+# em-dashes in this very file's comments), and os_write_console_bytes
+# writes those raw bytes straight to the console handle via WriteFile --
+# but a Windows console's OUTPUT code page defaults to a legacy OEM
+# page (commonly CP437 or CP850), not UTF-8, so any multi-byte UTF-8
+# character gets reinterpreted byte-by-byte under that DIFFERENT
+# encoding (an em-dash's 3 UTF-8 bytes 0xE2 0x80 0x94 rendering as
+# "ÔÇö" is exactly this). SetConsoleOutputCP(65001) fixes rendering;
+# SetConsoleCP(65001) does the matching fix for INPUT, so typed/pasted
+# multi-byte characters round-trip correctly too (paired with
+# line_edit.patlang's own byte-passthrough for the 0x80-0xFF range).
+# No handle parameter needed -- unlike SetConsoleMode, these two APIs
+# operate on the current process's console directly.
+make a function called x64_os_set_console_utf8_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    mov rcx, 65001" + x64_nl_char())
+  sb_push(sb, "    call SetConsoleOutputCP" + x64_nl_char())
+  sb_push(sb, "    mov rcx, 65001" + x64_nl_char())
+  sb_push(sb, "    call SetConsoleCP" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    push 0" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# os_get_cwd() -> the process's current working directory as a tagged
+# string, via GetCurrentDirectoryA. 1024 bytes is generous for a prompt
+# hint (real Windows paths can exceed this with the \\?\ long-path
+# prefix, but that's out of scope for what this is used for). Same
+# push-r15-around-rt_heap_alloc protection as every other primitive here
+# that allocates before doing OS work (rt_heap_alloc, an ORDINARY
+# compiled PatLang function, gives no register-preservation guarantee).
+# GetCurrentDirectoryA's DWORD return arrives via EAX, which the x64
+# architecture itself zero-extends into the full RAX on any 32-bit
+# register write -- unlike an OUT PARAMETER written via a pointer (the
+# real gotcha fixed elsewhere in this file, e.g. ReadFile's
+# lpNumberOfBytesRead), a function's own REGISTER return value needs no
+# extra care reading it as a full qword.
+make a function called x64_os_get_cwd_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    push r15" + x64_nl_char())
+  sb_push(sb, "    mov rax, 1032" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    call rt_heap_alloc" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, "    pop r15" + x64_nl_char())
+  sb_push(sb, "    mov r14, rax" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    mov rcx, 1024" + x64_nl_char())
+  sb_push(sb, "    lea rdx, [r14+8]" + x64_nl_char())
+  sb_push(sb, "    call GetCurrentDirectoryA" + x64_nl_char())
+  sb_push(sb, "    mov qword [r14], rax" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    mov rax, r14" + x64_nl_char())
+  sb_push(sb, "    mov rcx, 2305843009213693952" + x64_nl_char())
+  sb_push(sb, "    or rax, rcx" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# os_set_cwd(addr, len) -> 1/0 (SetCurrentDirectoryA's own BOOL,
+# normalized). Real fix for a live-reported bug: `cd` can NEVER work by
+# shelling out to `cmd.exe /c cd ...` (this terminal's own default
+# fallback for any command it doesn't recognize as a built-in) --
+# a child process's own working-directory change is entirely local to
+# that child and is discarded the instant it exits; the PARENT (this
+# terminal's own process) never sees it, no matter how the shelling-out
+# is done. `cd` needs a real built-in calling SetCurrentDirectoryA
+# directly, in-process -- see friendly_cli/terminal_native.patlang's own
+# tmn_cd. addr/len follow the SAME null-terminate-into-a-fresh-buffer
+# pattern os_exec_run already uses for its own cmdline argument, for the
+# same reason (SetCurrentDirectoryA needs a real C string, and this
+# caller's tagged-string bytes are never null-terminated on their own).
+make a function called x64_os_set_cwd_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  # REWRITTEN: the first version called rt_heap_alloc to get a fresh
+  # null-terminated buffer, holding addr/len in r12/r13 across that
+  # call -- a real bug (caught by an actual crash, not review): r12-r15
+  # are only guaranteed to survive REAL WinAPI calls; rt_heap_alloc is
+  # an ORDINARY COMPILED PATLANG FUNCTION, which this backend's own
+  # calling convention gives NO register-preservation guarantee across
+  # AT ALL (the same established rule this file documents repeatedly
+  # elsewhere, e.g. x64_os_exec_run_asm's own r15-across-rt_heap_alloc
+  # fix) -- this primitive just never applied it to r12/r13. On top of
+  # that, r15 was never actually set to the entry rsp before being
+  # pushed, so the eventual `mov rsp, r15` restored garbage. Both fixed
+  # by dropping rt_heap_alloc entirely and reusing
+  # x64_os_null_terminate_path_asm (g_scratch, no allocation, no
+  # register-preservation problem to have) -- the exact same helper
+  # os_write_file/os_copy_file/os_rename_file already use for a
+  # null-terminated path, proven correct there.
+  sb_push(sb, x64_lock_acquire_asm(suffix))
+  sb_push(sb, "    pop r10" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, x64_os_null_terminate_path_asm(suffix))
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [rel g_scratch]" + x64_nl_char())
+  sb_push(sb, "    call SetCurrentDirectoryA" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+  sb_push(sb, "    je .scwd_fail_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rax, 1" + x64_nl_char())
+  sb_push(sb, "    jmp .scwd_done_" + suffix + x64_nl_char())
+  sb_push(sb, "  .scwd_fail_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rax, 0" + x64_nl_char())
+  sb_push(sb, "  .scwd_done_" + suffix + ":" + x64_nl_char())
+  # r15 already restored above (mov rsp, r15) -- safe for lock_release
+  # to use it internally now.
+  sb_push(sb, "    mov r14, rax" + x64_nl_char())
+  sb_push(sb, x64_lock_release_asm())
+  sb_push(sb, "    push r14" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# os_enable_ansi_colors() -> 1 if the console now honors ANSI escape
+# sequences (ENABLE_VIRTUAL_TERMINAL_PROCESSING, 0x0004, set on the
+# STDOUT handle), 0 if this isn't a real console (redirected/piped
+# output, where GetConsoleMode itself fails, same non-console detection
+# already used by os_enable_raw_mode) -- callers must check this and
+# skip emitting color codes entirely when it's 0, not just print them
+# unconditionally (raw escape bytes in a piped/logged/redirected output
+# would be visible garbage, not color).
+make a function called x64_os_enable_ansi_colors_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 64" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    mov rcx, -11" + x64_nl_char())
+  sb_push(sb, "    call GetStdHandle" + x64_nl_char())
+  sb_push(sb, "    mov [rsp+56], rax" + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rsp+56]" + x64_nl_char())
+  sb_push(sb, "    lea rdx, [rsp+48]" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+48], 0" + x64_nl_char())
+  sb_push(sb, "    call GetConsoleMode" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+  sb_push(sb, "    je .ansi_fail_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov eax, [rsp+48]" + x64_nl_char())
+  sb_push(sb, "    or eax, 4" + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rsp+56]" + x64_nl_char())
+  sb_push(sb, "    mov edx, eax" + x64_nl_char())
+  sb_push(sb, "    call SetConsoleMode" + x64_nl_char())
+  sb_push(sb, "    mov rax, 1" + x64_nl_char())
+  sb_push(sb, "    jmp .ansi_done_" + suffix + x64_nl_char())
+  sb_push(sb, "  .ansi_fail_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rax, 0" + x64_nl_char())
+  sb_push(sb, "  .ansi_done_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# os_last_exec_exit_code() -> the real exit code (or -1) x64_os_exec_run_asm's
+# most recent run left in g_last_exec_exit_code -- see that function's
+# own comment. A shared global, not a return value threaded through
+# exec_capture's own existing single-string return convention (which
+# this deliberately does not change, to avoid risking its already-proven
+# callers) -- exec_capture_io (x64_runtime.patlang) reads it right after
+# calling os_exec_run.
+make a function called x64_os_last_exec_exit_code_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    mov rax, [rel g_last_exec_exit_code]" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# ---- apply(fname): dynamic dispatch-by-name ----
+#
+# apply(fname) invokes a PatLang function by NAME (a runtime string),
+# with zero explicit args -- used throughout self_hosting/lib/
+# console.patlang and self_hosting/lib/test.patlang's own step()
+# dispatcher for exactly this "look up a handler by name, call it"
+# pattern. No whole-program flow analysis exists to know in advance
+# which names any given apply() call site might be asked to resolve at
+# runtime (fname is a genuine runtime value, not a compile-time
+# constant), so this needs a real name -> callable-address table built
+# into the binary, resolved at runtime -- there is real precedent for
+# exactly this shape already in this backend: CallValue (this file's own
+# closures work, see its header comment above: "an event-handler table
+# is just a list of [name_string, closure] pairs, dispatched... through
+# the exact same CallValue mechanism") already proves an INDIRECT call
+# to a runtime-resolved PatLang function address works correctly under
+# this backend's own (non-win64-ABI) calling convention -- no shadow
+# space/16-byte-alignment dance needed for it, unlike a call to a real
+# external WinAPI/CRT function; see x64_callvalue_asm's own `call r12`
+# for the proven precedent this reuses.
+#
+# Deliberately kept mostly OUT of hand-written assembly: only the truly
+# native operations (four primitives below) are asm; the actual name-
+# matching scan is ORDINARY PATLANG (x64_runtime.patlang's own `apply`
+# function, using the already-proven rt_str_eq), matching this file's
+# own stated philosophy ("runtime logic belongs in PatLang, native
+# primitives stay narrow" -- x64_exec_capture_asm's own header).
+#
+# The table itself (name -> function-pointer pairs, one entry per
+# function in the WHOLE program except "main") is generated by
+# x64_emit_apply_table_asm below as its own small, separately-linked
+# object -- see x64_compile_unit.patlang's X64UnitLinker.build, which
+# generates and links it on EVERY --x64 build unconditionally (a program
+# that never calls apply() still gets a tiny unused table -- negligible
+# cost, and avoids needing "does this program use apply()" detection at
+# all). Table layout, 16 bytes per entry: [name_ptr:8][func_ptr:8],
+# where name_ptr points at an ALREADY-VALID PatLang tagged-string
+# payload ([8-byte length][raw bytes], the exact layout every other
+# string in this backend uses -- see rt_print_str) so os_apply_table_
+# name_at can hand back a real, usable tagged string just by OR-ing in
+# the string-family tag bit, no copying needed.
+
+make a function called x64_emit_apply_table_asm takes funcs returns asm
+  let names = []
+  let n_all = funcs.length
+  let fi = 0
+  while fi < n_all do
+    let fname = funcs[fi][1]
+    if fname != "main" then
+      let names = list_push(names, fname)
+    end
+    let fi = fi + 1
+  end
+  let n = names.length
+  let sb = sb_new()
+  sb_push(sb, "default rel" + x64_nl_char())
+  sb_push(sb, "global g_apply_table" + x64_nl_char())
+  sb_push(sb, "global g_apply_table_count" + x64_nl_char())
+  if n > 0 then
+    let extern_line = sb_new()
+    sb_push(extern_line, "extern ")
+    let i = 0
+    while i < n do
+      if i > 0 then
+        sb_push(extern_line, ", ")
+      end
+      sb_push(extern_line, x64_asm_label_for_func(names[i]))
+      let i = i + 1
+    end
+    sb_push(sb, sb_str(extern_line) + x64_nl_char())
+  end
+  sb_push(sb, "section .data" + x64_nl_char())
+  sb_push(sb, "g_apply_table_count: dq " + n + x64_nl_char())
+  sb_push(sb, "g_apply_table:" + x64_nl_char())
+  let i = 0
+  while i < n do
+    sb_push(sb, "  dq g_apply_name_" + i + x64_nl_char())
+    sb_push(sb, "  dq " + x64_asm_label_for_func(names[i]) + x64_nl_char())
+    let i = i + 1
+  end
+  let i = 0
+  while i < n do
+    sb_push(sb, "g_apply_name_" + i + ": dq " + names[i].length + x64_nl_char())
+    sb_push(sb, "  db '" + names[i] + "'" + x64_nl_char())
+    let i = i + 1
+  end
+  return sb_str(sb)
+end
+
+# os_apply_table_count() -> plain int, the table's entry count.
+make a function called x64_os_apply_table_count_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    mov rax, [rel g_apply_table_count]" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# os_apply_table_name_at(i) -> the i'th entry's name, already a valid
+# tagged PatLang string (see this section's own header for why no copy
+# is needed).
+make a function called x64_os_apply_table_name_at_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    lea r10, [rel g_apply_table]" + x64_nl_char())
+  sb_push(sb, "    mov r11, rax" + x64_nl_char())
+  sb_push(sb, "    shl r11, 4" + x64_nl_char())
+  sb_push(sb, "    add r10, r11" + x64_nl_char())
+  sb_push(sb, "    mov rax, [r10]" + x64_nl_char())
+  sb_push(sb, "    mov r15, 2305843009213693952" + x64_nl_char())
+  sb_push(sb, "    or rax, r15" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# os_apply_table_func_at(i) -> the i'th entry's RAW (untagged) callable
+# code address, for os_call_indirect below.
+make a function called x64_os_apply_table_func_at_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    lea r10, [rel g_apply_table]" + x64_nl_char())
+  sb_push(sb, "    mov r11, rax" + x64_nl_char())
+  sb_push(sb, "    shl r11, 4" + x64_nl_char())
+  sb_push(sb, "    add r10, r11" + x64_nl_char())
+  sb_push(sb, "    mov rax, [r10+8]" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# os_call_indirect(addr) -> calls the function at addr with ZERO args
+# (apply()'s own contract), returns its result. The zero-capture,
+# zero-own-arg special case of x64_callvalue_asm's proven `call r12`
+# mechanism -- nothing to push before the call, nothing to clean up
+# after (0 args popped means the stack-cleanup add would be `add rsp,
+# 0`, so it's omitted rather than emitted as a no-op).
+make a function called x64_os_call_indirect_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    pop r12" + x64_nl_char())
+  sb_push(sb, "    call r12" + x64_nl_char())
   sb_push(sb, "    push rax" + x64_nl_char())
   return sb_str(sb)
 end
@@ -2654,8 +3186,21 @@ end
 # were required -- see the copy_file/rename_file history above), so
 # the search pattern is built as `path + "/*"`, no path translation
 # needed.
+# NOTE (thread-safety scope limit, named not silent): this locks its
+# OWN g_scratch usage only. g_finddata (below, shared by find_first/
+# find_next/find_data_name/find_data_is_dir across a WHOLE list_dir
+# loop, not just one call) is NOT covered by that -- a real concurrent
+# list_dir from two threads would still race on it. Deferred: nothing
+# in this codebase currently calls list_dir from a background thread
+# (canvas_host's own ls/cd/cat all run on the main thread only), and
+# protecting a value that's shared across several SEPARATE primitive
+# calls needs the CALLER (list_dir, x64_runtime.patlang) to hold the
+# lock across all of them, not something an individual primitive here
+# can self-contain the way g_scratch's single-call usage allows.
 make a function called x64_os_find_first_asm returns asm
+  let suffix = label_asm_safe(0)
   let sb = sb_new()
+  sb_push(sb, x64_lock_acquire_asm(suffix))
   sb_push(sb, "    pop r10" + x64_nl_char())
   sb_push(sb, "    pop rax" + x64_nl_char())
   sb_push(sb, "    lea rdi, [rel g_scratch]" + x64_nl_char())
@@ -2680,7 +3225,9 @@ make a function called x64_os_find_first_asm returns asm
   sb_push(sb, "    lea rdx, [rel g_finddata]" + x64_nl_char())
   sb_push(sb, "    call FindFirstFileA" + x64_nl_char())
   sb_push(sb, "    mov rsp, r15" + x64_nl_char())
-  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    mov r14, rax" + x64_nl_char())
+  sb_push(sb, x64_lock_release_asm())
+  sb_push(sb, "    push r14" + x64_nl_char())
   return sb_str(sb)
 end
 
@@ -2792,6 +3339,7 @@ end
 make a function called x64_os_file_size_asm returns asm
   let suffix = label_asm_safe(0)
   let sb = sb_new()
+  sb_push(sb, x64_lock_acquire_asm(suffix))
   sb_push(sb, "    pop r10" + x64_nl_char())
   sb_push(sb, "    pop rax" + x64_nl_char())
   sb_push(sb, x64_os_null_terminate_path_asm(suffix))
@@ -2825,6 +3373,9 @@ make a function called x64_os_file_size_asm returns asm
   sb_push(sb, "    mov rax, -1" + x64_nl_char())
   sb_push(sb, "  .ofs_done_" + suffix + ":" + x64_nl_char())
   sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    mov r14, rax" + x64_nl_char())
+  sb_push(sb, x64_lock_release_asm())
+  sb_push(sb, "    mov rax, r14" + x64_nl_char())
   sb_push(sb, "    push rax" + x64_nl_char())
   return sb_str(sb)
 end
@@ -2834,6 +3385,7 @@ end
 make a function called x64_os_read_file_into_asm returns asm
   let suffix = label_asm_safe(0)
   let sb = sb_new()
+  sb_push(sb, x64_lock_acquire_asm(suffix))
   sb_push(sb, "    pop r12" + x64_nl_char())
   sb_push(sb, "    pop r13" + x64_nl_char())
   sb_push(sb, "    pop r10" + x64_nl_char())
@@ -2872,6 +3424,9 @@ make a function called x64_os_read_file_into_asm returns asm
   sb_push(sb, "    mov rax, 0" + x64_nl_char())
   sb_push(sb, "  .orf_done_" + suffix + ":" + x64_nl_char())
   sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    mov r14, rax" + x64_nl_char())
+  sb_push(sb, x64_lock_release_asm())
+  sb_push(sb, "    mov rax, r14" + x64_nl_char())
   sb_push(sb, "    push rax" + x64_nl_char())
   return sb_str(sb)
 end
@@ -2884,6 +3439,7 @@ end
 make a function called x64_os_write_file_asm returns asm
   let suffix = label_asm_safe(0)
   let sb = sb_new()
+  sb_push(sb, x64_lock_acquire_asm(suffix))
   sb_push(sb, "    pop r12" + x64_nl_char())
   sb_push(sb, "    pop r13" + x64_nl_char())
   sb_push(sb, "    pop r10" + x64_nl_char())
@@ -2918,6 +3474,9 @@ make a function called x64_os_write_file_asm returns asm
   sb_push(sb, "    mov rax, 0" + x64_nl_char())
   sb_push(sb, "  .owf_done_" + suffix + ":" + x64_nl_char())
   sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    mov r14, rax" + x64_nl_char())
+  sb_push(sb, x64_lock_release_asm())
+  sb_push(sb, "    mov rax, r14" + x64_nl_char())
   sb_push(sb, "    push rax" + x64_nl_char())
   return sb_str(sb)
 end
@@ -3017,8 +3576,14 @@ make a function called x64_os_exec_run_asm returns asm
   # REAL Win32 ABI, unlike this backend's own convention) safely
   # survives every call from here on.
   sb_push(sb, "    mov r15, rsp" + x64_nl_char())
-  sb_push(sb, "    sub rsp, 336" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 344" + x64_nl_char())
   sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  # [rsp+280]: a dedicated save slot for the CALLER's rbx (see the read
+  # loop's own header comment below for why this function needs rbx at
+  # all now). A fixed memory slot within this function's own already-
+  # established frame, not a push/pop -- avoids shifting every other
+  # already-correct [rsp+N] offset used throughout this function by 8.
+  sb_push(sb, "    mov [rsp+280], rbx" + x64_nl_char())
   sb_push(sb, "    xor rsi, rsi" + x64_nl_char())
   sb_push(sb, "  .exec_cpy_loop_" + suffix + ":" + x64_nl_char())
   sb_push(sb, "    cmp rsi, r10" + x64_nl_char())
@@ -3115,10 +3680,36 @@ make a function called x64_os_exec_run_asm returns asm
   sb_push(sb, "    pop r15" + x64_nl_char())
   sb_push(sb, "    mov rsi, rax" + x64_nl_char())
   sb_push(sb, "    lea r13, [rax+8]" + x64_nl_char())
-  sb_push(sb, "    xor r10, r10" + x64_nl_char())
+  sb_push(sb, "    xor rbx, rbx" + x64_nl_char())
   sb_push(sb, "    mov r14, 65536" + x64_nl_char())
-  # Read loop: r12=readHandle, r13=output data start, r10=total STORED
+  # Read loop: r12=readHandle, r13=output data start, rbx=total STORED
   # so far, r14=65536-byte cap.
+  #
+  # ROOT CAUSE FOUND AND FIXED HERE, via a live user report
+  # (terminal_native.exe capturing garbled/wrong-length output for
+  # `type`/`dir`/`ls`, reproduced down to `echo hello`: 7 real bytes,
+  # consistently reported as a captured length of 105, with the real
+  # "hello\r\n" bytes correctly written at the start and everything past
+  # them genuinely zero, not garbage): the running total used to be
+  # accumulated in r10 across MULTIPLE ReadFile calls (`add r10, rax`
+  # each iteration, re-read at the top of the next). r10 is NOT a
+  # callee-saved register under the real win64 ABI -- only rbx, rbp,
+  # rdi, rsi, rsp, r12, r13, r14, r15 are (confirmed against the ABI
+  # spec, not assumed by analogy to r12-r15's own correctly-documented
+  # safety elsewhere in this file). ReadFile is free to clobber r10
+  # internally (Windows' own syscall trampolines commonly use r10/r11
+  # as scratch), and empirically does: within a single iteration r10 is
+  # used correctly for addressing BEFORE the ReadFile call, but the
+  # NEXT iteration's cap-check and accumulation read back whatever
+  # ReadFile left in r10, not the real running total -- explaining
+  # exactly the observed shape (correct bytes at the correct addresses,
+  # wrong bookkeeping). Fixed by moving the accumulator to rbx, a
+  # genuinely callee-saved register not otherwise used in this function
+  # -- its own pre-call value is saved/restored via a dedicated stack
+  # slot (see this function's own prologue, [rsp+280]) since it may be
+  # live in the CALLER's own code (this primitive is inlined directly
+  # into whatever PatLang function calls os_exec_run/exec_capture, not
+  # a real function-call boundary that would otherwise imply this).
   #
   # Real bug found and fixed here, caught by an actual hang (not
   # review): once total reaches the cap, the ORIGINAL version simply
@@ -3131,40 +3722,62 @@ make a function called x64_os_exec_run_asm returns asm
   # child deadlocks" gotcha. Fixed: once the real buffer is full,
   # KEEP calling ReadFile (so the child can keep writing and
   # eventually finish/exit) but redirect those reads into a small
-  # THROWAWAY buffer (reusing g_scratch) instead of growing r10/
+  # THROWAWAY buffer (reusing g_scratch) instead of growing rbx/
   # writing past the allocated output block -- draining without
   # storing, until real EOF (ReadFile returns 0 bytes), only then
   # falling through to WaitForSingleObject.
   sb_push(sb, "    mov r12, [rsp+104]" + x64_nl_char())
   sb_push(sb, "  .exec_read_loop_" + suffix + ":" + x64_nl_char())
-  sb_push(sb, "    cmp r10, r14" + x64_nl_char())
+  sb_push(sb, "    cmp rbx, r14" + x64_nl_char())
   sb_push(sb, "    jl .exec_read_normal_" + suffix + x64_nl_char())
   sb_push(sb, "    lea rdx, [rel g_scratch]" + x64_nl_char())
   sb_push(sb, "    mov r8, 256" + x64_nl_char())
   sb_push(sb, "    jmp .exec_read_common_" + suffix + x64_nl_char())
   sb_push(sb, "  .exec_read_normal_" + suffix + ":" + x64_nl_char())
-  sb_push(sb, "    lea rdx, [r13+r10]" + x64_nl_char())
+  sb_push(sb, "    lea rdx, [r13+rbx]" + x64_nl_char())
   sb_push(sb, "    mov r8, r14" + x64_nl_char())
-  sb_push(sb, "    sub r8, r10" + x64_nl_char())
+  sb_push(sb, "    sub r8, rbx" + x64_nl_char())
   sb_push(sb, "  .exec_read_common_" + suffix + ":" + x64_nl_char())
+  # [rsp+272] (lpNumberOfBytesRead's target) is explicitly zeroed
+  # immediately before EVERY ReadFile call, not just once outside the
+  # loop -- defensive, in case some other edge case leaves it stale
+  # without the rbx fix above already being what matters here.
+  sb_push(sb, "    mov qword [rsp+272], 0" + x64_nl_char())
   sb_push(sb, "    mov rcx, r12" + x64_nl_char())
   sb_push(sb, "    lea r9, [rsp+272]" + x64_nl_char())
   sb_push(sb, "    mov qword [rsp+32], 0" + x64_nl_char())
   sb_push(sb, "    call ReadFile" + x64_nl_char())
   sb_push(sb, "    cmp rax, 0" + x64_nl_char())
   sb_push(sb, "    je .exec_read_done_" + suffix + x64_nl_char())
-  sb_push(sb, "    mov rax, [rsp+272]" + x64_nl_char())
+  sb_push(sb, "    mov eax, [rsp+272]" + x64_nl_char())
   sb_push(sb, "    cmp rax, 0" + x64_nl_char())
   sb_push(sb, "    je .exec_read_done_" + suffix + x64_nl_char())
-  sb_push(sb, "    cmp r10, r14" + x64_nl_char())
+  sb_push(sb, "    cmp rbx, r14" + x64_nl_char())
   sb_push(sb, "    jge .exec_read_loop_" + suffix + x64_nl_char())
-  sb_push(sb, "    add r10, rax" + x64_nl_char())
+  sb_push(sb, "    add rbx, rax" + x64_nl_char())
   sb_push(sb, "    jmp .exec_read_loop_" + suffix + x64_nl_char())
   sb_push(sb, "  .exec_read_done_" + suffix + ":" + x64_nl_char())
-  sb_push(sb, "    mov qword [rsi], r10" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsi], rbx" + x64_nl_char())
   sb_push(sb, "    mov rcx, [rsp+240]" + x64_nl_char())
   sb_push(sb, "    mov rdx, -1" + x64_nl_char())
   sb_push(sb, "    call WaitForSingleObject" + x64_nl_char())
+  # Real exit code, not the length-of-output heuristic run_classified's
+  # own PatLang-level caller (exec_capture_io, x64_runtime.patlang) used
+  # to rely on -- found and fixed directly, via terminal_native.patlang
+  # itself: a genuinely FAILING command (cmd.exe reporting "not
+  # recognized") still produces non-empty output (the error text
+  # itself), so a length-based "success" check misreported almost every
+  # real failure as success. [rsp+272] is free to reuse here -- its
+  # earlier use for the read loop's own bytesRead scratch is long done
+  # by this point (the loop already exited into .exec_read_done_
+  # above). rcx must be RELOADED (not assumed to survive
+  # WaitForSingleObject -- it's a volatile/caller-saved register under
+  # the real win64 ABI, unlike rbx/rbp/rdi/rsi/r12-r15/rsp).
+  sb_push(sb, "    mov rcx, [rsp+240]" + x64_nl_char())
+  sb_push(sb, "    lea rdx, [rsp+272]" + x64_nl_char())
+  sb_push(sb, "    call GetExitCodeProcess" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rsp+272]" + x64_nl_char())
+  sb_push(sb, "    mov [rel g_last_exec_exit_code], rax" + x64_nl_char())
   sb_push(sb, "    mov rcx, r12" + x64_nl_char())
   sb_push(sb, "    call CloseHandle" + x64_nl_char())
   sb_push(sb, "    mov rcx, [rsp+240]" + x64_nl_char())
@@ -3173,6 +3786,10 @@ make a function called x64_os_exec_run_asm returns asm
   sb_push(sb, "    call CloseHandle" + x64_nl_char())
   sb_push(sb, "    jmp .exec_all_done_" + suffix + x64_nl_char())
   sb_push(sb, "  .exec_failed_" + suffix + ":" + x64_nl_char())
+  # -1: distinguishable from every real process exit code (0-255) --
+  # CreateProcessA never even started the child, so there is no real
+  # exit code to report.
+  sb_push(sb, "    mov qword [rel g_last_exec_exit_code], -1" + x64_nl_char())
   sb_push(sb, "    mov rcx, [rsp+104]" + x64_nl_char())
   sb_push(sb, "    call CloseHandle" + x64_nl_char())
   sb_push(sb, "    mov rcx, [rsp+112]" + x64_nl_char())
@@ -3188,6 +3805,13 @@ make a function called x64_os_exec_run_asm returns asm
   sb_push(sb, "    mov rsi, rax" + x64_nl_char())
   sb_push(sb, "  .exec_all_done_" + suffix + ":" + x64_nl_char())
   sb_push(sb, "    mov rax, rsi" + x64_nl_char())
+  # Restore the CALLER's rbx (saved at [rsp+280] in this function's own
+  # prologue) BEFORE collapsing the stack below -- once `mov rsp, r15`
+  # runs, [rsp+280] no longer refers to this function's own frame at
+  # all. Reached from both the success path (falls through from
+  # .exec_read_done_ above) and the .exec_failed_ path (jumps here
+  # directly) -- both must restore it the same way.
+  sb_push(sb, "    mov rbx, [rsp+280]" + x64_nl_char())
   # GitHub #30/#31 investigation: this used to be "mov rsp,r15; add rsp,
   # 16" -- but r15 (saved right after the caller's cmdline_len/cmdline_
   # addr pair was already popped into registers, see the comment above
@@ -3198,6 +3822,1376 @@ make a function called x64_os_exec_run_asm returns asm
   # exact "+16" being spurious. Removed.
   sb_push(sb, "    mov rsp, r15" + x64_nl_char())
   sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# ============================================================
+# Canvas host, Phase 1: Win32 window + GDI pixel blit primitives.
+# ============================================================
+#
+# Confirmed 100% greenfield before starting (grepped across
+# self_hosting for CreateWindowEx/RegisterClassEx/BitBlt/StretchDIBits/
+# GetMessage/WndProc/CreatePseudoConsole -- zero matches anywhere).
+# user32.dll/gdi32.dll are already linked by x64_build.patlang
+# (-luser32 -lgdi32) but had zero actual calls into either before this.
+#
+# WndProc problem: Win32 invokes a window procedure using the REAL
+# Win64 ABI (register args rcx/rdx/r8/r9), but this backend's own
+# compiled-function calling convention pushes args onto the stack -- a
+# compiled PatLang function cannot be registered as lpfnWndProc
+# directly and correctly receive Win32's call. Resolved by registering
+# a single FIXED trampoline (emitted once as literal asm text directly
+# in emit_program_x64, see x64_win_data_and_trampoline_asm below, NOT
+# compiled from any IR function) that tail-jumps straight to
+# DefWindowProcW -- Win32 already places (hwnd,msg,wParam,lParam) in
+# rcx/rdx/r8/r9 exactly as DefWindowProcW itself expects, so the
+# trampoline needs no prologue at all. ALL real message handling
+# happens by inspecting the peeked MSG inside win_peek_message's own
+# polling loop (ordinary PatLang-driven control flow, a plain call/
+# return this backend already supports), BEFORE DispatchMessageW is
+# even invoked for anything WM_PAINT itself doesn't already fully
+# service inline. Win32 never actually calls into PatLang-compiled
+# logic anywhere in this design.
+#
+# Canvas surface is 32bpp BGRX (not RGB24, matching image.patlang's
+# own buffers) -- every row is already 4-byte aligned with zero
+# padding math, sidestepping the DIB row-padding pitfall entirely for
+# the canvas's own primary surface. image.patlang's RGB24 buffers get
+# converted at blit time only (Phase 5, canvas_blit_image), not here.
+
+make a function called x64_win_data_and_trampoline_asm returns asm
+  let sb = sb_new()
+  # REAL BUG FOUND AND FIXED (caught by an actual linker error, not
+  # review): NASM labels are file-local by default -- these two data
+  # labels were correctly DEFINED in this unit's own .data section but
+  # never marked `global`, so the linker genuinely could not see them
+  # from any other unit's `extern` declaration, even though both sides
+  # otherwise agreed on the symbol names.
+  sb_push(sb, "global g_win_class_name, g_win_title" + x64_nl_char())
+  sb_push(sb, "    align 2" + x64_nl_char())
+  # Fixed window-class name and title, UTF-16LE (Basic Latin code
+  # points are numerically identical to ASCII, so plain NASM character
+  # constants are valid UTF-16 code units here). One fixed class/title
+  # is enough for Phase 1's own goal (prove painting works at all) --
+  # a general string-to-wide conversion helper can be added later
+  # (plain PatLang, not asm -- pure byte manipulation, no WinAPI call
+  # needed) once a real caller needs a runtime-variable title.
+  sb_push(sb, "    g_win_class_name: dw 'P','a','t','L','a','n','g','C','a','n','v','a','s',0" + x64_nl_char())
+  sb_push(sb, "    align 2" + x64_nl_char())
+  sb_push(sb, "    g_win_title: dw 'P','a','t','L','a','n','g',' ','C','a','n','v','a','s',0" + x64_nl_char())
+  sb_push(sb, x64_nl_char())
+  # Explicit section switch, even though the caller's own next line
+  # already re-declares "section .text" right after this whole block
+  # is inserted -- NASM allows repeated section directives (they just
+  # resume appending to that section), so the caller's own redundant
+  # declaration is harmless. Switching HERE, rather than relying on
+  # insertion-point ordering alone, keeps this function correct
+  # regardless of exactly where its output gets spliced in.
+  sb_push(sb, "section .text" + x64_nl_char())
+  sb_push(sb, "global patlang_wndproc_trampoline" + x64_nl_char())
+  sb_push(sb, "patlang_wndproc_trampoline:" + x64_nl_char())
+  # REAL BUG FOUND AND FIXED (a real resize produced no visible effect
+  # at all, not even a crash -- the DIB buffer was simply never
+  # reallocated): the ORIGINAL version of this trampoline was a bare
+  # tail-jump, on the assumption every message worth reacting to
+  # (WM_CLOSE, WM_CHAR, ...) arrives via the QUEUE win_peek_message's
+  # own PeekMessageW polls. WM_SIZE doesn't -- Windows delivers it via
+  # SendMessage, a direct synchronous CALL into the window procedure
+  # (this label) from inside whatever triggered the resize (SetWindowPos,
+  # dragging the window border, ...), never touching the queue at all.
+  # This trampoline is the ONLY code that ever sees it, so it now
+  # checks for it here and records the new size for win_peek_message to
+  # pick up on its next poll (see g_resize_pending's own .bss header),
+  # rather than trying to catch something that was never queued.
+  #
+  # WNDPROC's real Win64 ABI args: hwnd=rcx, msg=rdx, wParam=r8,
+  # lParam=r9 -- ALL FOUR must reach the final `jmp DefWindowProcW`
+  # completely unmodified (a tail-jump reuses the caller's own argument
+  # registers), so only rax/r10/r11 (not part of that 4-arg contract)
+  # are used as scratch here, and r9 (lParam) is only ever READ, never
+  # written.
+  sb_push(sb, "    cmp edx, 5" + x64_nl_char())
+  sb_push(sb, "    jne .wndproc_notsize_" + x64_nl_char())
+  sb_push(sb, "    mov eax, r9d" + x64_nl_char())
+  sb_push(sb, "    movzx r10, ax" + x64_nl_char())
+  sb_push(sb, "    shr eax, 16" + x64_nl_char())
+  sb_push(sb, "    movzx r11, ax" + x64_nl_char())
+  sb_push(sb, "    mov [rel g_resize_w], r10" + x64_nl_char())
+  sb_push(sb, "    mov [rel g_resize_h], r11" + x64_nl_char())
+  sb_push(sb, "    mov qword [rel g_resize_pending], 1" + x64_nl_char())
+  sb_push(sb, "  .wndproc_notsize_:" + x64_nl_char())
+  sb_push(sb, "    jmp DefWindowProcW" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# patlang_thread_trampoline -- the fixed LPTHREAD_START_ROUTINE
+# (DWORD WINAPI (LPVOID lpParam)) every thread_spawn call passes to
+# CreateThread, same "one real global label, gated behind owns_globals"
+# pattern as patlang_wndproc_trampoline just above (see its own header
+# for why this MUST be gated -- a real link failure the first time this
+# codebase hit it).
+#
+# lpParam (rcx) points at a context block thread_spawn built by copying
+# a real closure value's own fields (same layout MakeClosure/CallValue
+# already use, see x64_thread_spawn_asm's own header):
+#   [0]  code_addr    -- the target PatLang function's entry label
+#   [8]  argc         -- number of captured/passed values
+#   [16] done_flag    -- 0 until this trampoline finishes, then 1
+#   [24] result       -- the target function's own return value
+#   [32..] arg0..argN-1
+#
+# Pushes args in the SAME order a normal call site would (arg0 pushed
+# first/deepest -- see x64_callvalue_asm's own captured-value loop,
+# identical shape), then calls the target function via its OWN
+# ordinary PatLang calling convention on THIS thread's own (Windows-
+# allocated) stack -- no manual stack setup needed here, unlike a real
+# fiber, since CreateThread already gives every thread a full, real OS
+# stack of its own.
+#
+# result then done_flag, in that order: x86 doesn't reorder store-store
+# (a genuine architectural guarantee on this target, not an assumption)
+# -- a caller polling done_flag then reading result is real, roughly
+# correct, memory-ordering-first inter-thread handoff.
+#
+# REAL BUG FOUND AND FIXED (caught by re-deriving the calling
+# convention from x64_callvalue_asm's own real code, not from a
+# recalled/assumed description of it): PatLang's compiled-function
+# convention is CALLER-cleans, not callee-pops -- x64_callvalue_asm's
+# own post-call cleanup (`add rsp, (n+captured)*8` AFTER `call r12`,
+# comment: "captured count is read back from THIS frame's own private
+# slot... not from any register") proves the callee does a plain `ret`
+# with the result in rax and does NOT itself remove its own pushed
+# args; the CALLER always does that. The first version of this
+# trampoline held the context pointer in rbx across `call r12`,
+# assuming a register could survive an opaque PatLang-function call --
+# it can't (this file's own universal rule, restated in that exact
+# function's own comment). Fixed the same way x64_callvalue_asm fixes
+# it: a real rbp-relative local frame slot, immune to whatever the
+# callee does to registers, holding both the context pointer AND argc
+# (needed again after the call, to know how many pushed arg slots to
+# reclaim) across the call.
+make a function called x64_thread_trampoline_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "global patlang_thread_trampoline" + x64_nl_char())
+  sb_push(sb, "patlang_thread_trampoline:" + x64_nl_char())
+  sb_push(sb, "    push rbp" + x64_nl_char())
+  sb_push(sb, "    mov rbp, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 16" + x64_nl_char())
+  sb_push(sb, "    mov [rbp-8], rcx" + x64_nl_char())
+  sb_push(sb, "    mov r12, [rcx]" + x64_nl_char())
+  sb_push(sb, "    mov r13, [rcx+8]" + x64_nl_char())
+  sb_push(sb, "    mov [rbp-16], r13" + x64_nl_char())
+  sb_push(sb, "    xor r10, r10" + x64_nl_char())
+  sb_push(sb, "  .tt_push_loop:" + x64_nl_char())
+  sb_push(sb, "    cmp r10, r13" + x64_nl_char())
+  sb_push(sb, "    jge .tt_push_done" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rcx+32+r10*8]" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    inc r10" + x64_nl_char())
+  sb_push(sb, "    jmp .tt_push_loop" + x64_nl_char())
+  sb_push(sb, "  .tt_push_done:" + x64_nl_char())
+  sb_push(sb, "    call r12" + x64_nl_char())
+  # rax = result. Reclaim the N pushed arg slots (caller-cleans) using
+  # the STABLE [rbp-16] copy of argc, not r13 (not guaranteed to have
+  # survived the call).
+  sb_push(sb, "    mov r10, [rbp-16]" + x64_nl_char())
+  sb_push(sb, "    shl r10, 3" + x64_nl_char())
+  sb_push(sb, "    add rsp, r10" + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rbp-8]" + x64_nl_char())
+  sb_push(sb, "    mov [rcx+24], rax" + x64_nl_char())
+  sb_push(sb, "    mov qword [rcx+16], 1" + x64_nl_char())
+  sb_push(sb, "    mov rsp, rbp" + x64_nl_char())
+  sb_push(sb, "    pop rbp" + x64_nl_char())
+  sb_push(sb, "    xor eax, eax" + x64_nl_char())
+  sb_push(sb, "    ret" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# win_create_window(width, height) -> hwnd. Registers a fixed window
+# class (lpfnWndProc = the trampoline above) and creates a visible
+# top-level window of the given client-adjacent size. Stores the
+# result in g_hwnd (every later primitive here reads that global
+# rather than taking hwnd as an explicit arg, matching g_last_exec_
+# exit_code's own single-persistent-value convention) and also returns
+# it directly.
+make a function called x64_win_create_window_asm returns asm
+  let sb = sb_new()
+  # Args: width, height (pushed in that order by the caller -- pop in
+  # reverse, matching x64_os_exec_run_asm's own established 2-arg
+  # convention: last-pushed is popped first).
+  sb_push(sb, "    pop r10" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  # r10=height, rax=width. Saved on the REAL machine stack (not left
+  # in a register) across every call below -- this backend's own
+  # PatLang-function calls give no register-preservation guarantee at
+  # all (already-established rule, see x64_os_exec_run_asm's own
+  # header), and even genuine WinAPI calls only preserve rbx/rbp/rdi/
+  # rsi/rsp/r12-r15 under the real Win64 ABI, not rax/r10. Peeked via
+  # r15-relative addressing (not popped a second time) since both
+  # values are needed again, at a fixed known offset, well after
+  # several other calls have happened.
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    push r10" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 256" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  # GetModuleHandleW(NULL) -> hInstance, saved at [rsp+176] (a scratch
+  # slot outside the WNDCLASSEXW struct's own [rsp+96,rsp+176) range
+  # below, and outside [rsp+32,rsp+96) which CreateWindowExW's own
+  # stack args reuse later in this same aligned frame).
+  sb_push(sb, "    xor rcx, rcx" + x64_nl_char())
+  sb_push(sb, "    call GetModuleHandleW" + x64_nl_char())
+  sb_push(sb, "    mov [rsp+176], rax" + x64_nl_char())
+  # WNDCLASSEXW at [rsp+96], 80 bytes total: cbSize@0 style@4
+  # lpfnWndProc@8 cbClsExtra@16 cbWndExtra@20 hInstance@24 hIcon@32
+  # hCursor@40 hbrBackground@48 lpszMenuName@56 lpszClassName@64
+  # hIconSm@72 (struct offsets, added to the base rsp+96). style=3 =
+  # CS_HREDRAW|CS_VREDRAW so resizing correctly triggers WM_PAINT.
+  # hIcon/hCursor/hbrBackground left NULL -- deliberately: this window
+  # never wants Win32's own background erase (we repaint the whole
+  # client area ourselves on every WM_PAINT), and a missing cursor/
+  # icon is a cosmetic gap acceptable for Phase 1's own proof-of-
+  # painting goal, not a correctness blocker.
+  sb_push(sb, "    mov dword [rsp+96], 80" + x64_nl_char())
+  sb_push(sb, "    mov dword [rsp+100], 3" + x64_nl_char())
+  sb_push(sb, "    lea rax, [rel patlang_wndproc_trampoline]" + x64_nl_char())
+  sb_push(sb, "    mov [rsp+104], rax" + x64_nl_char())
+  sb_push(sb, "    mov dword [rsp+112], 0" + x64_nl_char())
+  sb_push(sb, "    mov dword [rsp+116], 0" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rsp+176]" + x64_nl_char())
+  sb_push(sb, "    mov [rsp+120], rax" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+128], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+136], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+144], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+152], 0" + x64_nl_char())
+  sb_push(sb, "    lea rax, [rel g_win_class_name]" + x64_nl_char())
+  sb_push(sb, "    mov [rsp+160], rax" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+168], 0" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [rsp+96]" + x64_nl_char())
+  sb_push(sb, "    call RegisterClassExW" + x64_nl_char())
+  # CreateWindowExW(0, className, title, WS_OVERLAPPEDWINDOW=0x00CF0000,
+  #   CW_USEDEFAULT, CW_USEDEFAULT, width, height, NULL, NULL,
+  #   hInstance, NULL). 12 args: 4 in registers (rcx/rdx/r8/r9), 8 on
+  # the stack at [rsp+32..96) -- the SAME bytes RegisterClassExW's own
+  # call just used for ITS shadow space, reused here now that call is
+  # done, matching x64_os_exec_run_asm's established pattern of
+  # reusing one fixed stack region across sequential (never
+  # simultaneous) calls within one aligned frame. width is [r15+8]
+  # (pushed first, so deeper/second-from-top), height is [r15+0]
+  # (pushed second, so on top) -- read via r15, NOT rsp, since rsp now
+  # points into this frame's own scratch area, not the saved-args pair.
+  sb_push(sb, "    xor rcx, rcx" + x64_nl_char())
+  sb_push(sb, "    lea rdx, [rel g_win_class_name]" + x64_nl_char())
+  sb_push(sb, "    lea r8, [rel g_win_title]" + x64_nl_char())
+  sb_push(sb, "    mov r9, 13565952" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+32], -2147483648" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+40], -2147483648" + x64_nl_char())
+  sb_push(sb, "    mov rax, [r15+8]" + x64_nl_char())
+  sb_push(sb, "    mov [rsp+48], rax" + x64_nl_char())
+  sb_push(sb, "    mov rax, [r15]" + x64_nl_char())
+  sb_push(sb, "    mov [rsp+56], rax" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+64], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+72], 0" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rsp+176]" + x64_nl_char())
+  sb_push(sb, "    mov [rsp+80], rax" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+88], 0" + x64_nl_char())
+  sb_push(sb, "    call CreateWindowExW" + x64_nl_char())
+  sb_push(sb, "    mov [rel g_hwnd], rax" + x64_nl_char())
+  sb_push(sb, "    mov rcx, rax" + x64_nl_char())
+  sb_push(sb, "    mov rdx, 1" + x64_nl_char())
+  sb_push(sb, "    call ShowWindow" + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rel g_hwnd]" + x64_nl_char())
+  sb_push(sb, "    call UpdateWindow" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rel g_hwnd]" + x64_nl_char())
+  # Restore rsp past BOTH the aligned scratch frame AND the two
+  # peeked-not-popped saved args ([r15,r15+16)) -- r15 alone would
+  # leave those 16 bytes still logically "on the stack" from the
+  # caller's perspective; +16 actually consumes them, so the net
+  # effect of this whole inlined primitive is "pop 2 args, push 1
+  # return value" as expected.
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    add rsp, 16" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# win_canvas_alloc(width, height) -> raw buf address. (Re)allocates
+# the canvas pixel surface via rt_heap_alloc (an ordinary PatLang-
+# convention call -- r15 must be saved/restored around it, same
+# already-established rule/bug class as x64_os_exec_run_asm's own two
+# rt_heap_alloc call sites). 32bpp BGRX, width*height*4 bytes, no row
+# padding. Returns the raw untagged address directly so PatLang-level
+# test/drawing code can mem_poke_byte into it exactly like image.
+# patlang's own buffers.
+make a function called x64_win_canvas_alloc_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    pop r10" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  # r10=height, rax=width.
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    imul rax, r10" + x64_nl_char())
+  sb_push(sb, "    imul rax, 4" + x64_nl_char())
+  sb_push(sb, "    push r15" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    call rt_heap_alloc" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, "    pop r15" + x64_nl_char())
+  sb_push(sb, "    mov [rel g_canvas_buf], rax" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# win_canvas_init_dib(width, height) -> raw buf address. Phase 3
+# upgrade of win_canvas_alloc: instead of a bare rt_heap_alloc buffer,
+# builds a real GDI DIB-section bitmap (CreateDIBSection) selected
+# into a memory DC (g_mem_dc) -- ppvBits (the raw pixel pointer
+# CreateDIBSection hands back) becomes g_canvas_buf exactly as before,
+# so every existing mem_poke_byte-based caller (canvas_set_pixel, the
+# Phase 1 gradient test) keeps working unchanged, while GDI text
+# drawing (win_text_out) now ALSO writes into that same memory via
+# TextOutA against g_mem_dc. win_canvas_alloc itself is left in place,
+# unused -- superseded, not deleted, in case a future need for a bare
+# non-GDI buffer resurfaces.
+make a function called x64_win_canvas_init_dib_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    pop r10" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  # r10=height, rax=width -- saved via push/peek-via-r15, same
+  # established pattern as win_create_window's own 2-arg handling.
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    push r10" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 128" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  # BITMAPINFOHEADER in g_bmih_scratch (persistent .bss, shared with
+  # win_peek_message's OWN prior use of it -- safe, since that use is
+  # now replaced by a plain BitBlt below and no longer touches it).
+  # Negative biHeight = top-down, matching image.patlang's own layout.
+  sb_push(sb, "    mov dword [rel g_bmih_scratch+0], 40" + x64_nl_char())
+  sb_push(sb, "    mov rax, [r15+8]" + x64_nl_char())
+  sb_push(sb, "    mov [rel g_bmih_scratch+4], eax" + x64_nl_char())
+  sb_push(sb, "    mov rax, [r15]" + x64_nl_char())
+  sb_push(sb, "    neg rax" + x64_nl_char())
+  sb_push(sb, "    mov [rel g_bmih_scratch+8], eax" + x64_nl_char())
+  sb_push(sb, "    mov word [rel g_bmih_scratch+12], 1" + x64_nl_char())
+  sb_push(sb, "    mov word [rel g_bmih_scratch+14], 32" + x64_nl_char())
+  sb_push(sb, "    mov dword [rel g_bmih_scratch+16], 0" + x64_nl_char())
+  sb_push(sb, "    mov dword [rel g_bmih_scratch+20], 0" + x64_nl_char())
+  sb_push(sb, "    mov dword [rel g_bmih_scratch+24], 0" + x64_nl_char())
+  sb_push(sb, "    mov dword [rel g_bmih_scratch+28], 0" + x64_nl_char())
+  sb_push(sb, "    mov dword [rel g_bmih_scratch+32], 0" + x64_nl_char())
+  # GetDC(g_hwnd) -> a temporary screen DC, only needed as a reference
+  # for CreateCompatibleDC; released again right after.
+  sb_push(sb, "    mov rcx, [rel g_hwnd]" + x64_nl_char())
+  sb_push(sb, "    call GetDC" + x64_nl_char())
+  sb_push(sb, "    mov r12, rax" + x64_nl_char())
+  sb_push(sb, "    mov rcx, r12" + x64_nl_char())
+  sb_push(sb, "    call CreateCompatibleDC" + x64_nl_char())
+  sb_push(sb, "    mov [rel g_mem_dc], rax" + x64_nl_char())
+  # CreateDIBSection(g_mem_dc, &bmih, DIB_RGB_COLORS=0, &ppvBits, NULL, 0).
+  sb_push(sb, "    mov rcx, [rel g_mem_dc]" + x64_nl_char())
+  sb_push(sb, "    lea rdx, [rel g_bmih_scratch]" + x64_nl_char())
+  sb_push(sb, "    xor r8, r8" + x64_nl_char())
+  sb_push(sb, "    lea r9, [rsp+96]" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+32], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+40], 0" + x64_nl_char())
+  sb_push(sb, "    call CreateDIBSection" + x64_nl_char())
+  sb_push(sb, "    mov r13, rax" + x64_nl_char())
+  # REAL BUG FOUND AND FIXED (canvas_host.exe non-deterministic
+  # segfault, root-caused via a diagnostic read of g_canvas_buf that
+  # showed it reading 0 on every run): ppvBits (CreateDIBSection's own
+  # out-param, written to [rsp+96]) was being re-read from that SAME
+  # stack slot only at the very end of this function, AFTER four more
+  # WinAPI calls (SelectObject/ReleaseDC/SetBkMode/SetTextColor) had
+  # already run -- any of which is free to reuse its own callee's
+  # shallow stack space (only 96 bytes below THIS frame's own rsp) and
+  # silently clobber it before the delayed read. Exactly the same
+  # stack-aliasing bug class as the MSG/PAINTSTRUCT/StretchDIBits fix
+  # above (g_msg_scratch's own header) -- fixed the same way: capture
+  # the value immediately, before anything else can touch that slot,
+  # into the persistent g_canvas_buf global rather than leaving it on
+  # the stack across further calls.
+  sb_push(sb, "    mov rax, [rsp+96]" + x64_nl_char())
+  sb_push(sb, "    mov [rel g_canvas_buf], rax" + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rel g_mem_dc]" + x64_nl_char())
+  sb_push(sb, "    mov rdx, r13" + x64_nl_char())
+  sb_push(sb, "    call SelectObject" + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rel g_hwnd]" + x64_nl_char())
+  sb_push(sb, "    mov rdx, r12" + x64_nl_char())
+  sb_push(sb, "    call ReleaseDC" + x64_nl_char())
+  # SetBkMode(g_mem_dc, TRANSPARENT=1) + SetTextColor(g_mem_dc, green)
+  # once here, so win_text_out itself needs no per-call state setup.
+  # COLORREF is 0x00BBGGRR -- pure green (r=0,g=255,b=0) = 0x0000FF00.
+  sb_push(sb, "    mov rcx, [rel g_mem_dc]" + x64_nl_char())
+  sb_push(sb, "    mov rdx, 1" + x64_nl_char())
+  sb_push(sb, "    call SetBkMode" + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rel g_mem_dc]" + x64_nl_char())
+  sb_push(sb, "    mov rdx, 65280" + x64_nl_char())
+  sb_push(sb, "    call SetTextColor" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rel g_canvas_buf]" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    add rsp, 16" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# win_canvas_resize(width, height) -> done. Rebuilds the DIB surface
+# at a new size, called from win_peek_message's own WM_SIZE handling
+# (see that function's own header). Reuses the EXISTING g_mem_dc
+# (unlike win_canvas_init_dib's first-time GetDC/CreateCompatibleDC --
+# there's already a memory DC to resize into, no need for a fresh one,
+# and creating one every resize would leak a DC per resize event).
+# SelectObject's own return value on this second-and-later select is
+# the bitmap it's REPLACING (real GDI semantics: SelectObject always
+# returns whatever was selected before the call) -- exactly the old
+# canvas bitmap this call is retiring, so it's the right, and only,
+# handle to DeleteObject afterward. SetBkMode/SetTextColor are DC-
+# level state, not bitmap-level -- they're NOT reset by selecting a
+# new bitmap into the same DC, so (unlike win_canvas_init_dib) this
+# doesn't need to reapply them.
+make a function called x64_win_canvas_resize_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    pop r10" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    push r10" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 128" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    mov dword [rel g_bmih_scratch+0], 40" + x64_nl_char())
+  sb_push(sb, "    mov rax, [r15+8]" + x64_nl_char())
+  sb_push(sb, "    mov [rel g_bmih_scratch+4], eax" + x64_nl_char())
+  sb_push(sb, "    mov rax, [r15]" + x64_nl_char())
+  sb_push(sb, "    neg rax" + x64_nl_char())
+  sb_push(sb, "    mov [rel g_bmih_scratch+8], eax" + x64_nl_char())
+  sb_push(sb, "    mov word [rel g_bmih_scratch+12], 1" + x64_nl_char())
+  sb_push(sb, "    mov word [rel g_bmih_scratch+14], 32" + x64_nl_char())
+  sb_push(sb, "    mov dword [rel g_bmih_scratch+16], 0" + x64_nl_char())
+  sb_push(sb, "    mov dword [rel g_bmih_scratch+20], 0" + x64_nl_char())
+  sb_push(sb, "    mov dword [rel g_bmih_scratch+24], 0" + x64_nl_char())
+  sb_push(sb, "    mov dword [rel g_bmih_scratch+28], 0" + x64_nl_char())
+  sb_push(sb, "    mov dword [rel g_bmih_scratch+32], 0" + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rel g_mem_dc]" + x64_nl_char())
+  sb_push(sb, "    lea rdx, [rel g_bmih_scratch]" + x64_nl_char())
+  sb_push(sb, "    xor r8, r8" + x64_nl_char())
+  sb_push(sb, "    lea r9, [rsp+96]" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+32], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+40], 0" + x64_nl_char())
+  sb_push(sb, "    call CreateDIBSection" + x64_nl_char())
+  sb_push(sb, "    mov r13, rax" + x64_nl_char())
+  # Same stack-aliasing lesson as win_canvas_init_dib's own header --
+  # capture ppvBits immediately, before SelectObject/DeleteObject get
+  # any chance to reuse this shallow stack slot.
+  sb_push(sb, "    mov rax, [rsp+96]" + x64_nl_char())
+  sb_push(sb, "    mov [rel g_canvas_buf], rax" + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rel g_mem_dc]" + x64_nl_char())
+  sb_push(sb, "    mov rdx, r13" + x64_nl_char())
+  sb_push(sb, "    call SelectObject" + x64_nl_char())
+  sb_push(sb, "    mov rcx, rax" + x64_nl_char())
+  sb_push(sb, "    call DeleteObject" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rel g_canvas_buf]" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    add rsp, 16" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# win_text_out(x, y, addr, len) -> done. TextOutA(g_mem_dc, x, y,
+# addr, len) -- draws ASCII text (this backend's own strings are
+# ASCII, matching TextOutA not TextOutW) directly into the shared
+# canvas surface.
+make a function called x64_win_text_out_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    pop r11" + x64_nl_char())
+  sb_push(sb, "    pop r10" + x64_nl_char())
+  sb_push(sb, "    pop r9" + x64_nl_char())
+  sb_push(sb, "    pop r8" + x64_nl_char())
+  # r8=x, r9=y, r10=addr, r11=len (pushed in that order, popped in
+  # reverse -- established 4-arg convention).
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 48" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rel g_mem_dc]" + x64_nl_char())
+  sb_push(sb, "    mov rdx, r8" + x64_nl_char())
+  sb_push(sb, "    mov r8, r9" + x64_nl_char())
+  sb_push(sb, "    mov r9, r10" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+32], r11" + x64_nl_char())
+  sb_push(sb, "    call TextOutA" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    push 0" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# win_canvas_fill(r, g, b) -> done. Fills the whole canvas surface
+# with a solid BGRX color -- used to clear the background before a
+# redraw (canvas_host.patlang's own full-redraw-per-line-added
+# approach, simpler than real GDI scrolling/bitmap-shifting). Pure
+# register/memory work, no WinAPI call at all, so no self-aligned
+# frame is needed here (that dance only matters immediately before a
+# real WinAPI call).
+make a function called x64_win_canvas_fill_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    pop r10" + x64_nl_char())
+  sb_push(sb, "    pop r11" + x64_nl_char())
+  # r11=r, r10=g, rax=b (pushed r,g,b in that order -- popped b,g,r).
+  sb_push(sb, "    mov r8, rax" + x64_nl_char())
+  sb_push(sb, "    mov r9, r10" + x64_nl_char())
+  sb_push(sb, "    shl r9, 8" + x64_nl_char())
+  sb_push(sb, "    or r8, r9" + x64_nl_char())
+  sb_push(sb, "    mov r9, r11" + x64_nl_char())
+  sb_push(sb, "    shl r9, 16" + x64_nl_char())
+  sb_push(sb, "    or r8, r9" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rel g_canvas_w]" + x64_nl_char())
+  sb_push(sb, "    imul rax, [rel g_canvas_h]" + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rel g_canvas_buf]" + x64_nl_char())
+  sb_push(sb, "    xor rdx, rdx" + x64_nl_char())
+  sb_push(sb, "  .win_fill_loop_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    cmp rdx, rax" + x64_nl_char())
+  sb_push(sb, "    jge .win_fill_done_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov [rcx + rdx*4], r8d" + x64_nl_char())
+  sb_push(sb, "    inc rdx" + x64_nl_char())
+  sb_push(sb, "    jmp .win_fill_loop_" + suffix + x64_nl_char())
+  sb_push(sb, "  .win_fill_done_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    push 0" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# win_canvas_blit(src_buf, src_w, src_h, dest_x, dest_y) -> done. Phase
+# 5: copies an image.patlang-shaped RGB24 buffer (row-major, 3 bytes/
+# pixel, no padding -- image.patlang's own header) straight into the
+# canvas surface at (dest_x, dest_y), converting RGB24->BGRX per pixel
+# (same packing win_canvas_fill/canvas_set_pixel already use: byte0=B,
+# byte1=G, byte2=R, byte3=0). Clips against the canvas's own current
+# g_canvas_w/g_canvas_h -- a source pixel whose DESTINATION position
+# would land outside the canvas is silently skipped, not written,
+# rather than corrupting an adjacent row (an unclipped write at
+# dest_x+src_w > canvas_w would otherwise wrap into the START of the
+# NEXT row instead of just being cut off, corrupting a whole strip of
+# already-drawn content one row below the image -- a real bug caught
+# by reasoning through the row-major layout before writing this loop,
+# not after finding it broken).
+#
+# Pure register/memory work, no WinAPI call at all -- same "no self-
+# aligned frame needed" reasoning as win_canvas_fill above (that dance
+# only matters immediately before a real WinAPI `call`).
+make a function called x64_win_canvas_blit_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "    pop r9" + x64_nl_char())
+  sb_push(sb, "    pop r8" + x64_nl_char())
+  sb_push(sb, "    pop rdx" + x64_nl_char())
+  sb_push(sb, "    pop rcx" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  # Pushed src_buf, src_w, src_h, dest_x, dest_y in that order -- popped
+  # dest_y(r9), dest_x(r8), src_h(rdx), src_w(rcx), src_buf(rax).
+  sb_push(sb, "    mov r15, rax" + x64_nl_char())
+  sb_push(sb, "    mov r14, rcx" + x64_nl_char())
+  sb_push(sb, "    mov r13, rdx" + x64_nl_char())
+  sb_push(sb, "    mov r12, r8" + x64_nl_char())
+  sb_push(sb, "    mov r11, r9" + x64_nl_char())
+  sb_push(sb, "    mov r10, [rel g_canvas_w]" + x64_nl_char())
+  sb_push(sb, "    mov r9, [rel g_canvas_h]" + x64_nl_char())
+  sb_push(sb, "    mov r8, [rel g_canvas_buf]" + x64_nl_char())
+  # r15=src_buf r14=src_w r13=src_h r12=dest_x r11=dest_y r10=canvas_w
+  # r9=canvas_h r8=canvas_buf rbx=y rcx=x (inner loop counters).
+  sb_push(sb, "    xor rbx, rbx" + x64_nl_char())
+  sb_push(sb, "  .blit_y_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    cmp rbx, r13" + x64_nl_char())
+  sb_push(sb, "    jge .blit_done_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rax, r11" + x64_nl_char())
+  sb_push(sb, "    add rax, rbx" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+  sb_push(sb, "    jl .blit_y_next_" + suffix + x64_nl_char())
+  sb_push(sb, "    cmp rax, r9" + x64_nl_char())
+  sb_push(sb, "    jge .blit_y_next_" + suffix + x64_nl_char())
+  sb_push(sb, "    xor rcx, rcx" + x64_nl_char())
+  sb_push(sb, "  .blit_x_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    cmp rcx, r14" + x64_nl_char())
+  sb_push(sb, "    jge .blit_y_next_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rdx, r12" + x64_nl_char())
+  sb_push(sb, "    add rdx, rcx" + x64_nl_char())
+  sb_push(sb, "    cmp rdx, 0" + x64_nl_char())
+  sb_push(sb, "    jl .blit_x_next_" + suffix + x64_nl_char())
+  sb_push(sb, "    cmp rdx, r10" + x64_nl_char())
+  sb_push(sb, "    jge .blit_x_next_" + suffix + x64_nl_char())
+  # Source byte offset = (y*src_w + x) * 3.
+  sb_push(sb, "    mov rsi, rbx" + x64_nl_char())
+  sb_push(sb, "    imul rsi, r14" + x64_nl_char())
+  sb_push(sb, "    add rsi, rcx" + x64_nl_char())
+  sb_push(sb, "    imul rsi, 3" + x64_nl_char())
+  sb_push(sb, "    add rsi, r15" + x64_nl_char())
+  # Dest byte offset = ((dest_y+y)*canvas_w + (dest_x+x)) * 4. Recomputes
+  # dest_row from r11+rbx (both stable across the whole x-loop) rather
+  # than reusing rax from the row-bounds check above -- REAL BUG FOUND
+  # AND FIXED: rax only holds dest_row on the FIRST x-loop iteration;
+  # every iteration's own pixel-packing step below (`movzx eax, ...`)
+  # clobbers it, so iteration 2+ silently used the wrong row (last
+  # iteration's packed pixel color, not a row number), computing a wild
+  # dest offset and segfaulting on write. rdx still safely holds
+  # dest_col here (computed fresh THIS iteration, not yet clobbered).
+  sb_push(sb, "    mov rdi, r11" + x64_nl_char())
+  sb_push(sb, "    add rdi, rbx" + x64_nl_char())
+  sb_push(sb, "    imul rdi, r10" + x64_nl_char())
+  sb_push(sb, "    add rdi, rdx" + x64_nl_char())
+  sb_push(sb, "    imul rdi, 4" + x64_nl_char())
+  sb_push(sb, "    add rdi, r8" + x64_nl_char())
+  sb_push(sb, "    movzx eax, byte [rsi+2]" + x64_nl_char())
+  sb_push(sb, "    movzx edx, byte [rsi+1]" + x64_nl_char())
+  sb_push(sb, "    shl edx, 8" + x64_nl_char())
+  sb_push(sb, "    or eax, edx" + x64_nl_char())
+  sb_push(sb, "    movzx edx, byte [rsi]" + x64_nl_char())
+  sb_push(sb, "    shl edx, 16" + x64_nl_char())
+  sb_push(sb, "    or eax, edx" + x64_nl_char())
+  sb_push(sb, "    mov [rdi], eax" + x64_nl_char())
+  sb_push(sb, "  .blit_x_next_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    inc rcx" + x64_nl_char())
+  sb_push(sb, "    jmp .blit_x_" + suffix + x64_nl_char())
+  sb_push(sb, "  .blit_y_next_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    inc rbx" + x64_nl_char())
+  sb_push(sb, "    jmp .blit_y_" + suffix + x64_nl_char())
+  sb_push(sb, "  .blit_done_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    push 0" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# win_canvas_set_size(width, height) -> done. Records the canvas
+# surface's own current width/height (used by win_peek_message's own
+# WM_PAINT servicing to build the right-sized BITMAPINFOHEADER) --
+# kept as a SEPARATE primitive from win_canvas_alloc rather than
+# folded into it, since Phase 6's resize handling will want to update
+# these two independently of a fresh allocation in some cases.
+make a function called x64_win_canvas_set_size_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    pop r10" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    mov [rel g_canvas_w], rax" + x64_nl_char())
+  sb_push(sb, "    mov [rel g_canvas_h], r10" + x64_nl_char())
+  sb_push(sb, "    push 0" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# win_invalidate() -> done. InvalidateRect(g_hwnd, NULL, TRUE) --
+# requests a WM_PAINT; without this, modifying g_canvas_buf alone
+# never triggers a repaint (Win32 only repaints on invalidation, not
+# automatically after arbitrary memory writes).
+make a function called x64_win_invalidate_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rel g_hwnd]" + x64_nl_char())
+  sb_push(sb, "    xor rdx, rdx" + x64_nl_char())
+  sb_push(sb, "    mov r8, 1" + x64_nl_char())
+  sb_push(sb, "    call InvalidateRect" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    push 0" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# win_set_title(data_addr, len) -> done. SetWindowTextA(g_hwnd, ...) --
+# data_addr/len are the RAW (already-masked, past-the-length-prefix)
+# address/length of a real PatLang string, same convention win_text_out
+# already takes (its own caller, canvas_text, does the tag-masking).
+# SetWindowTextA needs a null-terminated C string; reuses g_scratch +
+# x64_os_null_terminate_path_asm, the exact same established helper
+# os_set_cwd/os_copy_file/etc already use for this, not a fresh
+# allocation (own header on x64_os_null_terminate_path_asm explains
+# why: no register-preservation problem to have, since g_scratch is a
+# fixed .bss slot, not a heap call).
+# win_ctrl_down() -> 1/0. GetKeyState(VK_CONTROL=17) -- the high bit
+# of the returned SHORT means "currently pressed" (this is CURRENT
+# physical state, unlike GetAsyncKeyState's own edge-triggered
+# semantics -- fine here, only ever called right after a WM_KEYDOWN
+# for the OTHER key, so Ctrl's own current state is exactly what's
+# needed). `test ax, 32768` (not `test eax`/`rax`) -- GetKeyState
+# returns a 16-bit SHORT; the SAME class of bug already found and
+# fixed this session for recv()'s 32-bit int (see x64_os_recv_asm's
+# own header) could recur here if the upper bits of rax/eax aren't
+# reliably zero, so this only ever examines the real 16-bit ax.
+make a function called x64_win_ctrl_down_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    mov rcx, 17" + x64_nl_char())
+  sb_push(sb, "    call GetKeyState" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    test ax, 32768" + x64_nl_char())
+  sb_push(sb, "    jz .ctrl_up_" + suffix + x64_nl_char())
+  sb_push(sb, "    push 1" + x64_nl_char())
+  sb_push(sb, "    jmp .ctrl_done_" + suffix + x64_nl_char())
+  sb_push(sb, "  .ctrl_up_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    push 0" + x64_nl_char())
+  sb_push(sb, "  .ctrl_done_" + suffix + ":" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# win_clipboard_set_text(addr, len) -> done. OpenClipboard/
+# EmptyClipboard/GlobalAlloc(GMEM_MOVEABLE)/GlobalLock/memcpy/
+# GlobalUnlock/SetClipboardData(CF_TEXT)/CloseClipboard -- the
+# standard, real Windows text-copy sequence (see MSDN's own
+# SetClipboardData sample; this is genuinely how every Windows app
+# does it, not a shortcut). addr/len are the RAW (already-masked)
+# address/length of a real PatLang string, same convention canvas_text
+# and win_set_title's own wrappers already use.
+#
+# GlobalAlloc's own memory becomes CLIPBOARD-OWNED the moment
+# SetClipboardData succeeds -- MUST NOT be freed here (a real, easy-
+# to-get-wrong Windows clipboard rule, called out explicitly since
+# there's no automated test that would catch "did you accidentally
+# free clipboard-owned memory" -- it just corrupts whatever the next
+# paste anywhere on the system reads).
+make a function called x64_win_clipboard_set_text_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "    pop r10" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    push r10" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rel g_hwnd]" + x64_nl_char())
+  sb_push(sb, "    call OpenClipboard" + x64_nl_char())
+  sb_push(sb, "    call EmptyClipboard" + x64_nl_char())
+  # REAL BUG FOUND AND FIXED (caught by a real crash, not review): the
+  # caller pushed addr FIRST then len SECOND (`push rax` / `push r10`),
+  # so per this file's own established convention (see e.g. x64_win_
+  # canvas_resize_asm's own [r15+8]=first-arg/[r15]=second-arg
+  # reads) [r15+8] is addr and [r15] is len -- this had them swapped,
+  # reading addr as the GlobalAlloc size and len as the copy source
+  # pointer, an immediate wild-pointer dereference.
+  sb_push(sb, "    mov rcx, 2" + x64_nl_char())
+  sb_push(sb, "    mov rdx, [r15]" + x64_nl_char())
+  sb_push(sb, "    inc rdx" + x64_nl_char())
+  sb_push(sb, "    call GlobalAlloc" + x64_nl_char())
+  sb_push(sb, "    mov r13, rax" + x64_nl_char())
+  sb_push(sb, "    mov rcx, r13" + x64_nl_char())
+  sb_push(sb, "    call GlobalLock" + x64_nl_char())
+  sb_push(sb, "    mov r14, rax" + x64_nl_char())
+  # Byte-copy loop: r14=dest, [r15+8]=source addr, [r15]=len.
+  sb_push(sb, "    mov r12, [r15+8]" + x64_nl_char())
+  sb_push(sb, "    mov r11, [r15]" + x64_nl_char())
+  sb_push(sb, "    xor r10, r10" + x64_nl_char())
+  sb_push(sb, "  .cbset_copy_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    cmp r10, r11" + x64_nl_char())
+  sb_push(sb, "    jge .cbset_copy_done_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov al, [r12+r10]" + x64_nl_char())
+  sb_push(sb, "    mov [r14+r10], al" + x64_nl_char())
+  sb_push(sb, "    inc r10" + x64_nl_char())
+  sb_push(sb, "    jmp .cbset_copy_" + suffix + x64_nl_char())
+  sb_push(sb, "  .cbset_copy_done_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov byte [r14+r10], 0" + x64_nl_char())
+  sb_push(sb, "    mov rcx, r13" + x64_nl_char())
+  sb_push(sb, "    call GlobalUnlock" + x64_nl_char())
+  sb_push(sb, "    mov rcx, 1" + x64_nl_char())
+  sb_push(sb, "    mov rdx, r13" + x64_nl_char())
+  sb_push(sb, "    call SetClipboardData" + x64_nl_char())
+  sb_push(sb, "    call CloseClipboard" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    add rsp, 16" + x64_nl_char())
+  sb_push(sb, "    push 0" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# win_clipboard_get_text() -> tagged String, "" if the clipboard has
+# no CF_TEXT data. GlobalLock's own pointer is a plain null-terminated
+# C string (CF_TEXT's own real contract) -- length found via a plain
+# strlen loop, then copied into a FRESH real PatLang string (rt_heap_
+# alloc) rather than exposing the clipboard's own memory directly
+# (which stays valid only between GlobalLock/GlobalUnlock -- a real
+# PatLang string must outlive that window).
+make a function called x64_win_clipboard_get_text_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rel g_hwnd]" + x64_nl_char())
+  sb_push(sb, "    call OpenClipboard" + x64_nl_char())
+  sb_push(sb, "    mov rcx, 1" + x64_nl_char())
+  sb_push(sb, "    call GetClipboardData" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+  sb_push(sb, "    je .cbget_empty_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov r13, rax" + x64_nl_char())
+  sb_push(sb, "    mov rcx, r13" + x64_nl_char())
+  sb_push(sb, "    call GlobalLock" + x64_nl_char())
+  sb_push(sb, "    mov r14, rax" + x64_nl_char())
+  # strlen(r14) -> r12.
+  sb_push(sb, "    xor r12, r12" + x64_nl_char())
+  sb_push(sb, "  .cbget_len_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    cmp byte [r14+r12], 0" + x64_nl_char())
+  sb_push(sb, "    je .cbget_len_done_" + suffix + x64_nl_char())
+  sb_push(sb, "    inc r12" + x64_nl_char())
+  sb_push(sb, "    jmp .cbget_len_" + suffix + x64_nl_char())
+  sb_push(sb, "  .cbget_len_done_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  # rt_heap_alloc(8+len) -- an ordinary PatLang-convention call, no
+  # register-preservation guarantee, so r13/r14/r12 (hMem/clip ptr/len)
+  # are pushed across it, same established pattern as every other
+  # rt_heap_alloc call site in this file.
+  sb_push(sb, "    push r13" + x64_nl_char())
+  sb_push(sb, "    push r14" + x64_nl_char())
+  sb_push(sb, "    push r12" + x64_nl_char())
+  sb_push(sb, "    mov rax, r12" + x64_nl_char())
+  sb_push(sb, "    add rax, 8" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    call rt_heap_alloc" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, "    mov r11, rax" + x64_nl_char())
+  sb_push(sb, "    pop r12" + x64_nl_char())
+  sb_push(sb, "    pop r14" + x64_nl_char())
+  sb_push(sb, "    pop r13" + x64_nl_char())
+  sb_push(sb, "    mov [r11], r12" + x64_nl_char())
+  sb_push(sb, "    xor r10, r10" + x64_nl_char())
+  sb_push(sb, "  .cbget_copy_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    cmp r10, r12" + x64_nl_char())
+  sb_push(sb, "    jge .cbget_copy_done_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov al, [r14+r10]" + x64_nl_char())
+  sb_push(sb, "    mov [r11+8+r10], al" + x64_nl_char())
+  sb_push(sb, "    inc r10" + x64_nl_char())
+  sb_push(sb, "    jmp .cbget_copy_" + suffix + x64_nl_char())
+  sb_push(sb, "  .cbget_copy_done_" + suffix + ":" + x64_nl_char())
+  # REAL BUG FOUND AND FIXED (caught by a real crash, not review): r11
+  # held the new string buffer pointer across the TWO real WinAPI
+  # calls below (GlobalUnlock/CloseClipboard) -- but r11, unlike r12-
+  # r15, is volatile even across a genuine Win64 ABI call (only r12-
+  # r15/rbx/rbp/rsi/rdi are callee-saved; this file's own established
+  # "r12-r15 survive a real WinAPI call" rule never covered r11).
+  # Moved into r12 instead (free from here on -- len, its only other
+  # use, was already consumed by the copy loop's own bound check
+  # above).
+  sb_push(sb, "    mov r12, r11" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    mov rcx, r13" + x64_nl_char())
+  sb_push(sb, "    call GlobalUnlock" + x64_nl_char())
+  sb_push(sb, "    call CloseClipboard" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    mov rax, r12" + x64_nl_char())
+  sb_push(sb, "    mov rcx, 2305843009213693952" + x64_nl_char())
+  sb_push(sb, "    or rax, rcx" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    jmp .cbget_ret_" + suffix + x64_nl_char())
+  sb_push(sb, "  .cbget_empty_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    call CloseClipboard" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    mov rax, 9" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    call rt_heap_alloc" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, "    mov qword [rax], 0" + x64_nl_char())
+  sb_push(sb, "    mov rcx, 2305843009213693952" + x64_nl_char())
+  sb_push(sb, "    or rax, rcx" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "  .cbget_ret_" + suffix + ":" + x64_nl_char())
+  return sb_str(sb)
+end
+
+make a function called x64_win_set_title_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, x64_lock_acquire_asm(suffix))
+  sb_push(sb, "    pop r10" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, x64_os_null_terminate_path_asm(suffix))
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rel g_hwnd]" + x64_nl_char())
+  sb_push(sb, "    lea rdx, [rel g_scratch]" + x64_nl_char())
+  sb_push(sb, "    call SetWindowTextA" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, x64_lock_release_asm())
+  sb_push(sb, "    push 0" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# win_peek_message() -> the raw Win32 message code if one was pending
+# (0 if the queue was empty -- WM_NULL, never a real message a caller
+# needs to act on, so doubles safely as the "nothing happened" idle
+# sentinel). WM_PAINT is fully serviced HERE (BeginPaint/StretchDIBits/
+# EndPaint against the current g_canvas_buf/g_canvas_w/g_canvas_h) and
+# never reaches DispatchMessageW at all. Every other message is
+# Translate+Dispatch'd normally (reaching the trampoline ->
+# DefWindowProcW for default handling, e.g. WM_CLOSE's default already
+# calls DestroyWindow for us) -- the caller inspects the returned code
+# (WM_CLOSE=16, WM_DESTROY=2) to decide whether to stop its own main
+# loop; this primitive never decides that itself.
+#
+# Checks g_resize_pending FIRST, before even calling PeekMessageW --
+# see patlang_wndproc_trampoline's own header for why a real resize
+# never shows up in that queue at all. When set, does the actual DIB
+# reallocation right here (main-thread, not from inside the
+# trampoline -- CreateDIBSection etc are real, possibly slow WinAPI
+# calls, not something to run from a window-procedure callback that
+# could itself be re-entered), clears the flag, and returns wm_size()'s
+# own code so the caller knows to redraw its OWN content into the
+# freshly-resized buffer.
+make a function called x64_win_peek_message_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "    cmp qword [rel g_resize_pending], 0" + x64_nl_char())
+  sb_push(sb, "    je .winmsg_noresize_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov qword [rel g_resize_pending], 0" + x64_nl_char())
+  sb_push(sb, "    mov r14, [rel g_resize_w]" + x64_nl_char())
+  sb_push(sb, "    mov rbx, [rel g_resize_h]" + x64_nl_char())
+  sb_push(sb, "    push r14" + x64_nl_char())
+  sb_push(sb, "    push rbx" + x64_nl_char())
+  sb_push(sb, x64_win_canvas_resize_asm())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    mov [rel g_canvas_w], r14" + x64_nl_char())
+  sb_push(sb, "    mov [rel g_canvas_h], rbx" + x64_nl_char())
+  sb_push(sb, "    push 5" + x64_nl_char())
+  sb_push(sb, "    jmp .winmsg_ret_" + x64_nl_char())
+  sb_push(sb, "  .winmsg_noresize_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  # 96 bytes: BitBlt's own stack args need [rsp+32..72), the rest is
+  # the usual generic call-shadow-space margin.
+  sb_push(sb, "    sub rsp, 96" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  # MSG lives in PERSISTENT .bss scratch (g_msg_scratch, 48 bytes:
+  # hwnd@0 message@8 wParam@16 lParam@24 time@32 pt.x@36 pt.y@40) --
+  # NOT a stack offset. See g_msg_scratch/g_paintstruct_scratch/
+  # g_bmih_scratch's own .bss declaration comment for why: a fixed
+  # address can never alias any call's own stack-argument window,
+  # unlike a stack-relative offset within this same frame.
+  sb_push(sb, "    lea rcx, [rel g_msg_scratch]" + x64_nl_char())
+  sb_push(sb, "    xor rdx, rdx" + x64_nl_char())
+  sb_push(sb, "    xor r8, r8" + x64_nl_char())
+  sb_push(sb, "    xor r9, r9" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+32], 1" + x64_nl_char())
+  sb_push(sb, "    call PeekMessageW" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+  sb_push(sb, "    jne .winmsg_have_" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    push 0" + x64_nl_char())
+  sb_push(sb, "    jmp .winmsg_ret_" + x64_nl_char())
+  sb_push(sb, "  .winmsg_have_:" + x64_nl_char())
+  sb_push(sb, "    mov eax, [rel g_msg_scratch+8]" + x64_nl_char())
+  sb_push(sb, "    mov r12, rax" + x64_nl_char())
+  sb_push(sb, "    cmp r12, 15" + x64_nl_char())
+  sb_push(sb, "    jne .winmsg_notpaint_" + x64_nl_char())
+  # WM_PAINT: BeginPaint into g_paintstruct_scratch (72 bytes) -> hdc,
+  # then a plain BitBlt from g_mem_dc (Phase 3's DIB-section-backed
+  # memory DC -- see g_mem_dc's own .bss declaration comment) onto the
+  # window's own paint DC. Replaces the original StretchDIBits/hand-
+  # built-BITMAPINFOHEADER approach entirely now that the canvas
+  # surface itself is a real GDI bitmap rather than a bare heap
+  # buffer -- BitBlt needs no pixel-format struct at all, GDI already
+  # knows the source bitmap's own format.
+  sb_push(sb, "    mov rcx, [rel g_hwnd]" + x64_nl_char())
+  sb_push(sb, "    lea rdx, [rel g_paintstruct_scratch]" + x64_nl_char())
+  sb_push(sb, "    call BeginPaint" + x64_nl_char())
+  sb_push(sb, "    mov r13, rax" + x64_nl_char())
+  # BitBlt(hdcPaint, 0, 0, canvas_w, canvas_h, g_mem_dc, 0, 0,
+  #   SRCCOPY=0x00CC0020) -- 9 params, 4 register + 5 stack
+  # ([rsp+32..72)).
+  sb_push(sb, "    mov rcx, r13" + x64_nl_char())
+  sb_push(sb, "    xor rdx, rdx" + x64_nl_char())
+  sb_push(sb, "    xor r8, r8" + x64_nl_char())
+  sb_push(sb, "    mov r9, [rel g_canvas_w]" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rel g_canvas_h]" + x64_nl_char())
+  sb_push(sb, "    mov [rsp+32], rax" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rel g_mem_dc]" + x64_nl_char())
+  sb_push(sb, "    mov [rsp+40], rax" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+48], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+56], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+64], 13369376" + x64_nl_char())
+  sb_push(sb, "    call BitBlt" + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rel g_hwnd]" + x64_nl_char())
+  sb_push(sb, "    lea rdx, [rel g_paintstruct_scratch]" + x64_nl_char())
+  sb_push(sb, "    call EndPaint" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    push r12" + x64_nl_char())
+  sb_push(sb, "    jmp .winmsg_ret_" + x64_nl_char())
+  sb_push(sb, "  .winmsg_notpaint_:" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [rel g_msg_scratch]" + x64_nl_char())
+  sb_push(sb, "    call TranslateMessage" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [rel g_msg_scratch]" + x64_nl_char())
+  sb_push(sb, "    call DispatchMessageW" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    push r12" + x64_nl_char())
+  sb_push(sb, "  .winmsg_ret_:" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# ============================================================
+# Canvas host, Phase 2: ConPTY -- hosting a real, unmodified child
+# process (vim/bash/cmd/git/anything) with a genuine terminal
+# contract, no cooperation needed from the child at all.
+# ============================================================
+#
+# Confirmed 100% greenfield before starting (same grep as Phase 1's own
+# header -- CreatePseudoConsole/STARTUPINFOEX/InitializeProcThreadAttr
+# ributeList/UpdateProcThreadAttribute: zero matches anywhere before
+# this). All in kernel32.dll, already linked.
+#
+# Every struct that must survive across more than one WinAPI call
+# within the same primitive lives in PERSISTENT .bss scratch (see
+# g_conpty_hpc's own .bss declaration comment) from the very start
+# here -- a direct, deliberate lesson from Phase 1's real stack-offset-
+# overlap crash, not repeated.
+#
+# Single-instance (one pane) for now -- g_conpty_hpc/in_write/out_read/
+# process are bare globals, not a table. Multi-pane is Phase 6.
+
+# conpty_create(cols, rows) -> hpc. Creates two pipes (one for our
+# keystrokes INTO the child, one for the child's own output back OUT
+# to us) and a pseudoconsole wired to them. Stores hpc/our own pipe
+# ends in g_conpty_hpc/g_conpty_in_write/g_conpty_out_read. The ends
+# handed TO the pseudoconsole are closed once CreatePseudoConsole
+# returns (it duplicates its own references internally, per MSDN) --
+# only OUR OWN opposite ends survive past this function.
+make a function called x64_conpty_create_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    pop r10" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  # r10=rows, rax=cols. Saved on the real stack, peeked (not popped
+  # again) via r15 -- r15 itself is never clobbered by a real WinAPI
+  # call (genuinely callee-saved under the real Win64 ABI), so it's
+  # safe to keep reading [r15]/[r15+8] any time this function needs
+  # cols/rows again, well after several other calls.
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    push r10" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 176" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  # SECURITY_ATTRIBUTES at [rsp+80] (24 bytes), bInheritHandle=TRUE --
+  # reused for both CreatePipe calls below (sequential, never
+  # simultaneous, same established reuse pattern as x64_os_exec_run_
+  # asm's own single SECURITY_ATTRIBUTES).
+  sb_push(sb, "    mov qword [rsp+80], 24" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+88], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+96], 1" + x64_nl_char())
+  # Pipe 1 (input TO the child): [rsp+104]=ConPTY's own read end,
+  # [rsp+112]=OUR write end (kept, becomes g_conpty_in_write).
+  sb_push(sb, "    lea rcx, [rsp+104]" + x64_nl_char())
+  sb_push(sb, "    lea rdx, [rsp+112]" + x64_nl_char())
+  sb_push(sb, "    lea r8, [rsp+80]" + x64_nl_char())
+  sb_push(sb, "    xor r9, r9" + x64_nl_char())
+  sb_push(sb, "    call CreatePipe" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rsp+112]" + x64_nl_char())
+  sb_push(sb, "    mov [rel g_conpty_in_write], rax" + x64_nl_char())
+  # Pipe 2 (output FROM the child): [rsp+120]=OUR read end (kept,
+  # becomes g_conpty_out_read), [rsp+128]=ConPTY's own write end.
+  sb_push(sb, "    lea rcx, [rsp+120]" + x64_nl_char())
+  sb_push(sb, "    lea rdx, [rsp+128]" + x64_nl_char())
+  sb_push(sb, "    lea r8, [rsp+80]" + x64_nl_char())
+  sb_push(sb, "    xor r9, r9" + x64_nl_char())
+  sb_push(sb, "    call CreatePipe" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rsp+120]" + x64_nl_char())
+  sb_push(sb, "    mov [rel g_conpty_out_read], rax" + x64_nl_char())
+  # CreatePseudoConsole(size, hInput, hOutput, dwFlags=0, &hpc). size
+  # is a COORD (2 packed SHORTs) passed BY VALUE in ECX: cols in the
+  # low 16 bits, rows in the high 16 bits.
+  sb_push(sb, "    xor ecx, ecx" + x64_nl_char())
+  sb_push(sb, "    mov cx, [r15+8]" + x64_nl_char())
+  sb_push(sb, "    xor eax, eax" + x64_nl_char())
+  sb_push(sb, "    mov ax, [r15]" + x64_nl_char())
+  sb_push(sb, "    shl eax, 16" + x64_nl_char())
+  sb_push(sb, "    or ecx, eax" + x64_nl_char())
+  sb_push(sb, "    mov rdx, [rsp+104]" + x64_nl_char())
+  sb_push(sb, "    mov r8, [rsp+128]" + x64_nl_char())
+  sb_push(sb, "    xor r9, r9" + x64_nl_char())
+  sb_push(sb, "    lea rax, [rsp+136]" + x64_nl_char())
+  sb_push(sb, "    mov [rsp+32], rax" + x64_nl_char())
+  sb_push(sb, "    call CreatePseudoConsole" + x64_nl_char())
+  # HRESULT: S_OK=0. Not fully robust yet (no cleanup path on
+  # failure) -- an accepted, named gap for this phase's own "prove the
+  # plumbing" scope, matching x64_os_exec_run_asm's own incremental
+  # history (robustness layered on AFTER the happy path was proven).
+  sb_push(sb, "    mov rax, [rsp+136]" + x64_nl_char())
+  sb_push(sb, "    mov [rel g_conpty_hpc], rax" + x64_nl_char())
+  # Close OUR copies of the ends we just handed to ConPTY -- it keeps
+  # its own internal references (MSDN), so this doesn't tear down the
+  # underlying pipes, just releases handles we no longer need. (Tested
+  # removing this as a diagnostic during a real STATUS_DLL_INIT_FAILED
+  # investigation -- made no difference, restored to the correct/
+  # recommended form.)
+  sb_push(sb, "    mov rcx, [rsp+104]" + x64_nl_char())
+  sb_push(sb, "    call CloseHandle" + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rsp+128]" + x64_nl_char())
+  sb_push(sb, "    call CloseHandle" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rel g_conpty_hpc]" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    add rsp, 16" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# conpty_spawn(wide_cmdline_addr) -> hProcess (0 on failure). Runs the
+# STARTUPINFOEX/attribute-list dance (size-query, allocate, real init,
+# attach g_conpty_hpc as the PSEUDOCONSOLE attribute) then
+# CreateProcessW. wide_cmdline_addr must point to a FRESH, mutable
+# UTF-16LE null-terminated buffer (str_to_wide, conpty.patlang -- a
+# plain PatLang function, not asm, matching x64_os_exec_run_asm's own
+# "CreateProcess mutates lpCommandLine in place" precaution: a fresh
+# rt_heap_alloc buffer per call is automatically safe here, same as
+# there).
+make a function called x64_conpty_spawn_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 96" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  # Step 1: size query (deliberately "fails" -- only g_pta_size matters).
+  sb_push(sb, "    xor rcx, rcx" + x64_nl_char())
+  sb_push(sb, "    mov rdx, 1" + x64_nl_char())
+  sb_push(sb, "    xor r8, r8" + x64_nl_char())
+  sb_push(sb, "    lea r9, [rel g_pta_size]" + x64_nl_char())
+  sb_push(sb, "    call InitializeProcThreadAttributeList" + x64_nl_char())
+  # Step 2: allocate the list buffer (rt_heap_alloc: ordinary PatLang-
+  # convention call, no register-preservation guarantee -- r15 saved/
+  # restored around it, same rule as every other rt_heap_alloc call
+  # site in this file). Tested swapping this for GetProcessHeap/
+  # HeapAlloc as a diagnostic during a real STATUS_DLL_INIT_FAILED
+  # investigation -- made no difference, restored to rt_heap_alloc.
+  sb_push(sb, "    push r15" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rel g_pta_size]" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    call rt_heap_alloc" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, "    pop r15" + x64_nl_char())
+  sb_push(sb, "    mov [rel g_pta_list], rax" + x64_nl_char())
+  # Step 3: real init.
+  sb_push(sb, "    mov rcx, [rel g_pta_list]" + x64_nl_char())
+  sb_push(sb, "    mov rdx, 1" + x64_nl_char())
+  sb_push(sb, "    xor r8, r8" + x64_nl_char())
+  sb_push(sb, "    lea r9, [rel g_pta_size]" + x64_nl_char())
+  sb_push(sb, "    call InitializeProcThreadAttributeList" + x64_nl_char())
+  # Step 4: UpdateProcThreadAttribute(list, 0,
+  #   PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE=131094, hpc (the handle
+  #   VALUE itself, not its address), sizeof(HPCON)=8, NULL, NULL).
+  #
+  # REAL BUG FOUND AND FIXED (root cause of the STATUS_DLL_INIT_FAILED
+  # child crash, isolated by disassembling a known-working minimal C
+  # reference implementation of this exact sequence and diffing it
+  # instruction-by-instruction against this function): lpValue was
+  # `lea r9, [rel g_conpty_hpc]` -- the ADDRESS of the .bss slot
+  # holding hpc -- not the hpc VALUE itself. Despite MSDN's generic
+  # "lpValue: a pointer to the attribute value" wording (which reads
+  # as "pass &variable" for most attributes), PROC_THREAD_ATTRIBUTE_
+  # PSEUDOCONSOLE is a special case confirmed via a real, independent,
+  # working C reference: lpValue is the HPCON handle value itself,
+  # passed directly (matching Microsoft's own official ConPTY sample).
+  # Passing our .bss address instead meant UpdateProcThreadAttribute
+  # copied a harmless-looking but WRONG "handle" (really just a local
+  # memory address) into the attribute list -- every call up to and
+  # including CreateProcessW succeeded regardless, since none of them
+  # validate the pseudoconsole handle's authenticity, only the CHILD
+  # process crashed, when it actually tried to attach to a "pseudo-
+  # console" that was never a real one.
+  sb_push(sb, "    mov rcx, [rel g_pta_list]" + x64_nl_char())
+  sb_push(sb, "    xor rdx, rdx" + x64_nl_char())
+  sb_push(sb, "    mov r8, 131094" + x64_nl_char())
+  sb_push(sb, "    mov r9, [rel g_conpty_hpc]" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+32], 8" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+40], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+48], 0" + x64_nl_char())
+  sb_push(sb, "    call UpdateProcThreadAttribute" + x64_nl_char())
+  # Step 5: STARTUPINFOEXW in g_startupinfoex (112 bytes: STARTUPINFOW
+  # 104 bytes + lpAttributeList@104). Zeroed field-by-field (no index
+  # register -- RIP-relative `[rel label+N]` only accepts a constant
+  # displacement, never label+reg*scale, unlike a plain-register base
+  # like [rsp+reg*8]), then cb=112 and lpAttributeList set.
+  sb_push(sb, "    mov qword [rel g_startupinfoex+0], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rel g_startupinfoex+8], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rel g_startupinfoex+16], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rel g_startupinfoex+24], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rel g_startupinfoex+32], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rel g_startupinfoex+40], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rel g_startupinfoex+48], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rel g_startupinfoex+56], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rel g_startupinfoex+64], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rel g_startupinfoex+72], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rel g_startupinfoex+80], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rel g_startupinfoex+88], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rel g_startupinfoex+96], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rel g_startupinfoex+104], 0" + x64_nl_char())
+  sb_push(sb, "    mov dword [rel g_startupinfoex+0], 112" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rel g_pta_list]" + x64_nl_char())
+  sb_push(sb, "    mov [rel g_startupinfoex+104], rax" + x64_nl_char())
+  # Step 6: CreateProcessW(NULL, wide_cmdline, NULL, NULL,
+  #   bInheritHandles=FALSE, EXTENDED_STARTUPINFO_PRESENT=524288, NULL,
+  #   NULL, &g_startupinfoex, &g_process_info). bInheritHandles=FALSE
+  #   deliberately -- the child's I/O comes through the pseudoconsole
+  #   attribute, not inherited handles, so there's nothing to inherit.
+  sb_push(sb, "    xor rcx, rcx" + x64_nl_char())
+  sb_push(sb, "    mov rdx, [r15]" + x64_nl_char())
+  sb_push(sb, "    xor r8, r8" + x64_nl_char())
+  sb_push(sb, "    xor r9, r9" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+32], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+40], 524288" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+48], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+56], 0" + x64_nl_char())
+  sb_push(sb, "    lea rax, [rel g_startupinfoex]" + x64_nl_char())
+  sb_push(sb, "    mov [rsp+64], rax" + x64_nl_char())
+  sb_push(sb, "    lea rax, [rel g_process_info]" + x64_nl_char())
+  sb_push(sb, "    mov [rsp+72], rax" + x64_nl_char())
+  sb_push(sb, "    call CreateProcessW" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+  sb_push(sb, "    je .conpty_spawn_failed_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rax, [rel g_process_info]" + x64_nl_char())
+  sb_push(sb, "    mov [rel g_conpty_process], rax" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    jmp .conpty_spawn_done_" + suffix + x64_nl_char())
+  sb_push(sb, "  .conpty_spawn_failed_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, "    push 0" + x64_nl_char())
+  sb_push(sb, "  .conpty_spawn_done_" + suffix + ":" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# conpty_read_nonblocking(max_len) -> raw untagged buffer address
+# (length-prefixed, matching os_exec_run's own raw-output convention
+# -- the PatLang wrapper, conpty.patlang's own conpty_read, applies
+# `bor rt_string_tag()`, same layered convention exec_capture_io
+# already uses for os_exec_run's result). Empty (length 0) buffer if
+# nothing is pending. PeekNamedPipe FIRST, exactly mirroring why
+# win_peek_message is non-blocking -- ReadFile on an empty ConPTY pipe
+# blocks, which would freeze the whole polled main loop.
+make a function called x64_conpty_read_nonblocking_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 64" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rel g_conpty_out_read]" + x64_nl_char())
+  sb_push(sb, "    xor rdx, rdx" + x64_nl_char())
+  sb_push(sb, "    xor r8, r8" + x64_nl_char())
+  sb_push(sb, "    xor r9, r9" + x64_nl_char())
+  sb_push(sb, "    lea rax, [rsp+48]" + x64_nl_char())
+  sb_push(sb, "    mov [rsp+32], rax" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+40], 0" + x64_nl_char())
+  sb_push(sb, "    call PeekNamedPipe" + x64_nl_char())
+  sb_push(sb, "    mov eax, [rsp+48]" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+  sb_push(sb, "    jne .conpty_read_have_" + suffix + x64_nl_char())
+  # Nothing pending: return an empty (length-0) buffer.
+  sb_push(sb, "    push r15" + x64_nl_char())
+  sb_push(sb, "    mov rax, 8" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    call rt_heap_alloc" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, "    pop r15" + x64_nl_char())
+  sb_push(sb, "    mov qword [rax], 0" + x64_nl_char())
+  sb_push(sb, "    mov rsi, rax" + x64_nl_char())
+  sb_push(sb, "    jmp .conpty_read_done_" + suffix + x64_nl_char())
+  sb_push(sb, "  .conpty_read_have_" + suffix + ":" + x64_nl_char())
+  # Cap the real available byte count to the caller's own max_len
+  # (peeked via [r15], the original arg -- never popped a second
+  # time).
+  sb_push(sb, "    mov r12, rax" + x64_nl_char())
+  sb_push(sb, "    mov r13, [r15]" + x64_nl_char())
+  sb_push(sb, "    cmp r12, r13" + x64_nl_char())
+  sb_push(sb, "    jle .conpty_read_capped_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov r12, r13" + x64_nl_char())
+  sb_push(sb, "  .conpty_read_capped_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    push r15" + x64_nl_char())
+  sb_push(sb, "    push r12" + x64_nl_char())
+  sb_push(sb, "    mov rax, r12" + x64_nl_char())
+  sb_push(sb, "    add rax, 8" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    call rt_heap_alloc" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, "    pop r12" + x64_nl_char())
+  sb_push(sb, "    pop r15" + x64_nl_char())
+  sb_push(sb, "    mov rsi, rax" + x64_nl_char())
+  sb_push(sb, "    mov [rsi], r12" + x64_nl_char())
+  sb_push(sb, "    lea r13, [rsi+8]" + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rel g_conpty_out_read]" + x64_nl_char())
+  sb_push(sb, "    mov rdx, r13" + x64_nl_char())
+  sb_push(sb, "    mov r8, r12" + x64_nl_char())
+  sb_push(sb, "    lea r9, [rsp+40]" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+32], 0" + x64_nl_char())
+  sb_push(sb, "    call ReadFile" + x64_nl_char())
+  sb_push(sb, "  .conpty_read_done_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, "    push rsi" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# conpty_write_raw(addr, len) -> done. WriteFile straight to
+# g_conpty_in_write -- forwards keystrokes/text to whatever's running
+# in the pane.
+make a function called x64_conpty_write_raw_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    pop r10" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 48" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rel g_conpty_in_write]" + x64_nl_char())
+  sb_push(sb, "    mov rdx, rax" + x64_nl_char())
+  sb_push(sb, "    mov r8, r10" + x64_nl_char())
+  sb_push(sb, "    lea r9, [rsp+40]" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+32], 0" + x64_nl_char())
+  sb_push(sb, "    call WriteFile" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    push 0" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# conpty_resize(cols, rows) -> done. ResizePseudoConsole(hpc, size) --
+# same packed-COORD convention as conpty_create.
+make a function called x64_conpty_resize_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    pop r10" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    xor ecx, ecx" + x64_nl_char())
+  sb_push(sb, "    mov cx, ax" + x64_nl_char())
+  sb_push(sb, "    xor edx, edx" + x64_nl_char())
+  sb_push(sb, "    mov dx, r10w" + x64_nl_char())
+  sb_push(sb, "    shl edx, 16" + x64_nl_char())
+  sb_push(sb, "    or ecx, edx" + x64_nl_char())
+  sb_push(sb, "    mov rdx, rcx" + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rel g_conpty_hpc]" + x64_nl_char())
+  sb_push(sb, "    call ResizePseudoConsole" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    push 0" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# conpty_close() -> done. Tears down the pseudoconsole, both of our
+# own pipe ends, and the child process handle. Does NOT call
+# DeleteProcThreadAttributeList or free g_pta_list's heap block --
+# this backend has no heap-free mechanism at all (bump allocator only,
+# an already-established, accepted limitation elsewhere in this
+# codebase, not a new gap introduced here).
+make a function called x64_conpty_close_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rel g_conpty_hpc]" + x64_nl_char())
+  sb_push(sb, "    call ClosePseudoConsole" + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rel g_conpty_in_write]" + x64_nl_char())
+  sb_push(sb, "    call CloseHandle" + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rel g_conpty_out_read]" + x64_nl_char())
+  sb_push(sb, "    call CloseHandle" + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rel g_conpty_process]" + x64_nl_char())
+  sb_push(sb, "    call CloseHandle" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    push 0" + x64_nl_char())
   return sb_str(sb)
 end
 
@@ -3488,6 +5482,7 @@ make a function called x64_os_connect_asm returns asm
   # (confirmed directly: segfaulted on the very next real call). Fixed
   # to unmask the tagged string itself, same [len][bytes] convention
   # os_send's own r13/r14 unmasking already uses.
+  sb_push(sb, x64_lock_acquire_asm(suffix))
   sb_push(sb, "    pop rdx" + x64_nl_char())
   sb_push(sb, "    pop rax" + x64_nl_char())
   sb_push(sb, "    mov r12, rdx" + x64_nl_char())
@@ -3547,6 +5542,9 @@ make a function called x64_os_connect_asm returns asm
   sb_push(sb, "    mov rax, 0 - 1" + x64_nl_char())
   sb_push(sb, ".conn_done_" + suffix + ":" + x64_nl_char())
   sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    mov r14, rax" + x64_nl_char())
+  sb_push(sb, x64_lock_release_asm())
+  sb_push(sb, "    mov rax, r14" + x64_nl_char())
   sb_push(sb, "    push rax" + x64_nl_char())
   return sb_str(sb)
 end
@@ -3578,13 +5576,30 @@ make a function called x64_os_recv_asm returns asm
   sb_push(sb, "    xor r9, r9" + x64_nl_char())
   sb_push(sb, "    call recv" + x64_nl_char())
   sb_push(sb, "    mov rsp, r15" + x64_nl_char())
-  sb_push(sb, "    cmp rax, 0 - 1" + x64_nl_char())
+  # REAL BUG FOUND AND FIXED (canvas_host's networking feature: a real
+  # client's recv on an empty non-blocking socket was silently treated
+  # as a SUCCESSFUL 4294967295-byte read instead of "no data yet"):
+  # recv() returns a 32-bit `int` (SOCKET_ERROR = -1 as a 32-bit
+  # value), but this compared the FULL 64-bit rax against a 64-bit-
+  # sign-extended -1 (0xFFFFFFFFFFFFFFFF). When the upper 32 bits of
+  # rax come back zero (recv()'s own actual, observed behavior on this
+  # system), a genuine WSAEWOULDBLOCK failure left rax holding
+  # 0x00000000FFFFFFFF, which is NOT equal to the 64-bit sentinel --
+  # so the "ok" branch ran, storing that same 0xFFFFFFFF as the read
+  # length. The very next real-client test hit this exact path (an
+  # empty poll immediately after accept, before the client had sent
+  # anything) and the server tried to process a ~4GB "chunk", crashing.
+  # Fixed by comparing/storing via eax (the real 32-bit return value),
+  # not rax -- movzx additionally guards the SUCCESS path against any
+  # future callee that doesn't zero-extend its own upper bits.
+  sb_push(sb, "    cmp eax, 0 - 1" + x64_nl_char())
   sb_push(sb, "    jne .recv_ok_" + suffix + x64_nl_char())
   sb_push(sb, "    mov qword [rel g_last_recv_error], 1" + x64_nl_char())
   sb_push(sb, "    mov qword [r13], 0" + x64_nl_char())
   sb_push(sb, "    jmp .recv_done_" + suffix + x64_nl_char())
   sb_push(sb, ".recv_ok_" + suffix + ":" + x64_nl_char())
   sb_push(sb, "    mov qword [rel g_last_recv_error], 0" + x64_nl_char())
+  sb_push(sb, "    movzx rax, eax" + x64_nl_char())
   sb_push(sb, "    mov qword [r13], rax" + x64_nl_char())
   sb_push(sb, ".recv_done_" + suffix + ":" + x64_nl_char())
   sb_push(sb, "    mov rax, r13" + x64_nl_char())
@@ -4378,6 +6393,28 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
     sb_push(sb, x64_os_rename_file_asm())
   elif name == "os_read_line" then
     sb_push(sb, x64_os_read_line_asm())
+  elif name == "os_enable_raw_mode" then
+    sb_push(sb, x64_os_enable_raw_mode_asm())
+  elif name == "os_disable_raw_mode" then
+    sb_push(sb, x64_os_disable_raw_mode_asm())
+  elif name == "os_read_raw_byte" then
+    sb_push(sb, x64_os_read_raw_byte_asm())
+  elif name == "os_set_console_utf8" then
+    sb_push(sb, x64_os_set_console_utf8_asm())
+  elif name == "os_get_cwd" then
+    sb_push(sb, x64_os_get_cwd_asm())
+  elif name == "os_set_cwd" then
+    sb_push(sb, x64_os_set_cwd_asm())
+  elif name == "os_enable_ansi_colors" then
+    sb_push(sb, x64_os_enable_ansi_colors_asm())
+  elif name == "os_apply_table_count" then
+    sb_push(sb, x64_os_apply_table_count_asm())
+  elif name == "os_apply_table_name_at" then
+    sb_push(sb, x64_os_apply_table_name_at_asm())
+  elif name == "os_apply_table_func_at" then
+    sb_push(sb, x64_os_apply_table_func_at_asm())
+  elif name == "os_call_indirect" then
+    sb_push(sb, x64_os_call_indirect_asm())
   elif name == "os_find_first" then
     sb_push(sb, x64_os_find_first_asm())
   elif name == "os_find_next" then
@@ -4388,9 +6425,73 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
     sb_push(sb, x64_os_find_data_is_dir_asm())
   elif name == "os_find_close" then
     sb_push(sb, x64_os_find_close_asm())
+  elif name == "win_create_window" then
+    sb_push(sb, x64_win_create_window_asm())
+  elif name == "win_canvas_alloc" then
+    sb_push(sb, x64_win_canvas_alloc_asm())
+  elif name == "win_canvas_init_dib" then
+    sb_push(sb, x64_win_canvas_init_dib_asm())
+  elif name == "win_text_out" then
+    sb_push(sb, x64_win_text_out_asm())
+  elif name == "win_canvas_fill" then
+    sb_push(sb, x64_win_canvas_fill_asm())
+  elif name == "win_canvas_blit" then
+    sb_push(sb, x64_win_canvas_blit_asm())
+  elif name == "win_last_wparam" then
+    # wParam is WPARAM (UINT_PTR), a full 8-byte field at MSG offset
+    # 16 on x64 -- NOT 4 bytes (unlike `message`, an actual DWORD).
+    sb_push(sb, "    mov rax, [rel g_msg_scratch+16]" + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
+  elif name == "win_canvas_set_size" then
+    sb_push(sb, x64_win_canvas_set_size_asm())
+  elif name == "win_invalidate" then
+    sb_push(sb, x64_win_invalidate_asm())
+  elif name == "win_set_title" then
+    sb_push(sb, x64_win_set_title_asm())
+  elif name == "win_ctrl_down" then
+    sb_push(sb, x64_win_ctrl_down_asm())
+  elif name == "win_clipboard_set_text" then
+    sb_push(sb, x64_win_clipboard_set_text_asm())
+  elif name == "win_clipboard_get_text" then
+    sb_push(sb, x64_win_clipboard_get_text_asm())
+  elif name == "os_thread_spawn_raw" then
+    sb_push(sb, x64_os_thread_spawn_raw_asm())
+  elif name == "win_canvas_resize" then
+    sb_push(sb, x64_win_canvas_resize_asm())
+  elif name == "win_peek_message" then
+    sb_push(sb, x64_win_peek_message_asm())
+  elif name == "conpty_create" then
+    sb_push(sb, x64_conpty_create_asm())
+  elif name == "conpty_spawn" then
+    sb_push(sb, x64_conpty_spawn_asm())
+  elif name == "conpty_read_nonblocking" then
+    sb_push(sb, x64_conpty_read_nonblocking_asm())
+  elif name == "conpty_write_raw" then
+    sb_push(sb, x64_conpty_write_raw_asm())
+  elif name == "conpty_resize" then
+    sb_push(sb, x64_conpty_resize_asm())
+  elif name == "conpty_close" then
+    sb_push(sb, x64_conpty_close_asm())
   else
   if name == "exec_capture" then
     sb_push(sb, x64_exec_capture_asm(argc))
+  elif name == "os_last_exec_exit_code" then
+    sb_push(sb, x64_os_last_exec_exit_code_asm())
+  elif name == "os_exec_run" then
+    # Exposes the SAME primitive x64_exec_capture_asm's CallHost handling
+    # already wraps (CreateProcessA + pipe capture, cmdline_addr/
+    # cmdline_len args, RAW untagged output address returned) as an
+    # independently name-dispatchable 2-arg primitive, so ordinary
+    # PatLang code (x64_runtime.patlang's exec_capture_io wrapper) can
+    # call it directly with a RUNTIME-VARIABLE argument count already
+    # joined into one string -- exec_capture's own variadic CallHost
+    # form requires a compile-time-fixed arg count at every call site,
+    # which can't express "however many args a runtime list happens to
+    # hold." No new assembly: x64_os_exec_run_asm's own calling
+    # convention (pop cmdline_len then cmdline_addr) already matches an
+    # ordinary 2-arg call (cmdline_addr, cmdline_len) pushed in that
+    # order, unchanged.
+    sb_push(sb, x64_os_exec_run_asm())
   elif name == "spawn" then
     # Stage A of the interp.patlang-compilation roadmap (#25, past
     # #26/#27): spawn(path, arg1, arg2, ...) -> Int PID, non-blocking.
@@ -4631,6 +6732,22 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
       if name == "mem_heap_state_addr" then
         sb_push(sb, "    lea rax, [rel g_heap_state]" + x64_nl_char())
         sb_push(sb, "    push rax" + x64_nl_char())
+      elif name == "rt_atomic_fetch_add" then
+        # rt_atomic_fetch_add(addr, delta) -> the value at addr BEFORE
+        # adding delta, with the add itself happening atomically (a
+        # real `lock xadd`, a genuine locked hardware read-modify-
+        # write, not a peek/poke pair) -- the thread-safety primitive
+        # rt_heap_alloc's own bump-pointer update needs once real OS
+        # threads exist (thread_spawn/codegen_x64.patlang's own header
+        # on CRITICAL_SECTION locking has the fuller rationale: this
+        # backend's .bss globals are process-wide, shared by every
+        # thread, and a plain read-then-write here would let two
+        # threads' allocations silently overlap under real concurrency).
+        sb_push(sb, "    pop rdx" + x64_nl_char())
+        sb_push(sb, "    pop rcx" + x64_nl_char())
+        sb_push(sb, "    mov rax, rdx" + x64_nl_char())
+        sb_push(sb, "    lock xadd [rcx], rax" + x64_nl_char())
+        sb_push(sb, "    push rax" + x64_nl_char())
       else
       if name == "len" then
         sb_push(sb, x64_len_asm())
@@ -4689,6 +6806,14 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
         # tcp_connect/tcp_accept*/tcp_read*/tcp_write/tcp_close's global
         # [conn_id, socket] connection table.
         sb_push(sb, "    lea rax, [rel g_conns_table]" + x64_nl_char())
+        sb_push(sb, "    push rax" + x64_nl_char())
+      elif name == "mem_threads_table_addr" then
+        # thread_spawn/thread_poll/thread_result's global [thread_id,
+        # ctx_addr] table -- same [id, opaque-value] shape as
+        # g_conns_table just above, same reason (a bare heap address
+        # exposed directly as a PatLang value risks colliding with this
+        # backend's own tag-bit scheme).
+        sb_push(sb, "    lea rax, [rel g_threads_table]" + x64_nl_char())
         sb_push(sb, "    push rax" + x64_nl_char())
       elif name == "mem_wsa_init_addr" then
         # Lazy WSAStartup-done flag -- same lazy-init-on-first-use
@@ -4773,6 +6898,33 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
         sb_push(sb, "    push rax" + x64_nl_char())
       else
         if name == "os_write_console_bytes" then
+          # Real bug found and fixed here directly from a live user
+          # report (terminal_native.exe garbling `type CLAUDE.md`/`dir`/
+          # `ls -al` output -- correct start, a large chunk missing or
+          # spliced in the middle, on files well under any buffer cap):
+          # a SINGLE WriteFile call, with g_written (the actual bytes-
+          # written count) never even read back afterward. WriteFile to
+          # a real CONSOLE handle (unlike a file or pipe) can perform a
+          # genuine SHORT WRITE -- return success having written FEWER
+          # bytes than requested -- and the caller is responsible for
+          # looping to write the remainder. Every prior test this
+          # session only ever printed short strings (a status line, a
+          # diagnostic message), never a multi-KB captured command
+          # output, so this never surfaced until real interactive use.
+          # Fixed with a real write-loop, checking g_written (a DWORD --
+          # `mov eax, ...` to correctly zero-extend, not `mov rax`) each
+          # iteration and advancing the pointer/remaining-count by
+          # however much ACTUALLY got written, same shape as the read
+          # loop's own already-correct handling of partial ReadFile
+          # results just above. r12 holds the console handle across the
+          # loop (a real WinAPI call away from being clobbered -- r12 is
+          # genuinely callee-saved under the win64 ABI, same reasoning
+          # already established throughout this file for r12-r15 in
+          # exactly this role); label_asm_safe(0) gives a real per-call-
+          # site-unique suffix, matching the established convention used
+          # everywhere else a loop needs local labels inside inline
+          # dispatch code (not a dedicated per-instruction function).
+          let wsuf = label_asm_safe(0)
           sb_push(sb, "    pop r13" + x64_nl_char())
           sb_push(sb, "    pop r14" + x64_nl_char())
           sb_push(sb, "    mov r15, rsp" + x64_nl_char())
@@ -4780,12 +6932,25 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
           sb_push(sb, "    and rsp, -16" + x64_nl_char())
           sb_push(sb, "    mov rcx, -11" + x64_nl_char())
           sb_push(sb, "    call GetStdHandle" + x64_nl_char())
-          sb_push(sb, "    mov rcx, rax" + x64_nl_char())
+          sb_push(sb, "    mov r12, rax" + x64_nl_char())
+          sb_push(sb, "  .owcb_loop_" + wsuf + ":" + x64_nl_char())
+          sb_push(sb, "    cmp r13, 0" + x64_nl_char())
+          sb_push(sb, "    jle .owcb_done_" + wsuf + x64_nl_char())
+          sb_push(sb, "    mov rcx, r12" + x64_nl_char())
           sb_push(sb, "    mov rdx, r14" + x64_nl_char())
           sb_push(sb, "    mov r8, r13" + x64_nl_char())
           sb_push(sb, "    lea r9, [rel g_written]" + x64_nl_char())
           sb_push(sb, "    mov qword [rsp+32], 0" + x64_nl_char())
           sb_push(sb, "    call WriteFile" + x64_nl_char())
+          sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+          sb_push(sb, "    je .owcb_done_" + wsuf + x64_nl_char())
+          sb_push(sb, "    mov eax, [rel g_written]" + x64_nl_char())
+          sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+          sb_push(sb, "    je .owcb_done_" + wsuf + x64_nl_char())
+          sb_push(sb, "    add r14, rax" + x64_nl_char())
+          sb_push(sb, "    sub r13, rax" + x64_nl_char())
+          sb_push(sb, "    jmp .owcb_loop_" + wsuf + x64_nl_char())
+          sb_push(sb, "  .owcb_done_" + wsuf + ":" + x64_nl_char())
           sb_push(sb, "    mov rsp, r15" + x64_nl_char())
           sb_push(sb, "    push 0" + x64_nl_char())
         else
@@ -4906,6 +7071,83 @@ make a function called x64_buildlist_asm takes argc returns asm
   return sb_str(sb)
 end
 
+# os_thread_spawn_raw(closure) -> raw context-block address (untagged
+# -- threads_table_add, x64_runtime.patlang, wraps it into a small
+# int id, the same pattern conns_table_add already uses for socket
+# handles, since a bare heap address risks colliding with this
+# backend's own tag-bit scheme if ever exposed directly as a PatLang
+# value). Takes an ORDINARY closure value (built via normal closure-
+# literal syntax at the call site, e.g. `thread_spawn(|| { ... })`) --
+# deliberately NOT a function-name string + separate args list: a
+# function's own code address is only ever resolvable as a NASM label
+# at COMPILE time (see x64_makeclosure_asm's own `lea rax, [rel
+# func_name]` just below -- func_name there is a compile-time PatLang
+# string the LOWERING pass embedded into the IR, never a runtime
+# value), so a genuinely dynamic "spawn a thread running THIS function
+# name" primitive isn't buildable as an ordinary CallHost primitive at
+# all without new parser/lowering work. Reusing the closure value
+# instead needs none of that: MakeClosure has ALREADY done the real
+# compile-time-name-to-runtime-code-address binding, correctly, and
+# this primitive just copies that closure's own [code_addr][captured_
+# count][captured_values] fields into a slightly larger context block
+# (see patlang_thread_trampoline's own header for the block layout)
+# and hands it to CreateThread.
+make a function called x64_os_thread_spawn_raw_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    mov rdx, 281474976710655" + x64_nl_char())
+  sb_push(sb, "    and rax, rdx" + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rax]" + x64_nl_char())
+  sb_push(sb, "    mov rdx, [rax+8]" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    push rcx" + x64_nl_char())
+  sb_push(sb, "    push rdx" + x64_nl_char())
+  sb_push(sb, "    mov r10, rdx" + x64_nl_char())
+  sb_push(sb, "    shl r10, 3" + x64_nl_char())
+  sb_push(sb, "    add r10, 32" + x64_nl_char())
+  sb_push(sb, "    push r10" + x64_nl_char())
+  sb_push(sb, "    call rt_heap_alloc" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, "    pop rdx" + x64_nl_char())
+  sb_push(sb, "    pop rcx" + x64_nl_char())
+  sb_push(sb, "    pop r10" + x64_nl_char())
+  # rax = new context block. rcx=code_addr rdx=captured_count
+  # r10=original closure addr (source of captured values to copy).
+  sb_push(sb, "    mov [rax], rcx" + x64_nl_char())
+  sb_push(sb, "    mov [rax+8], rdx" + x64_nl_char())
+  sb_push(sb, "    mov qword [rax+16], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rax+24], 0" + x64_nl_char())
+  sb_push(sb, "    xor r8, r8" + x64_nl_char())
+  sb_push(sb, "  .ts_copy_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    cmp r8, rdx" + x64_nl_char())
+  sb_push(sb, "    jge .ts_copy_done_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov r9, [r10+16+r8*8]" + x64_nl_char())
+  sb_push(sb, "    mov [rax+32+r8*8], r9" + x64_nl_char())
+  sb_push(sb, "    inc r8" + x64_nl_char())
+  sb_push(sb, "    jmp .ts_copy_" + suffix + x64_nl_char())
+  sb_push(sb, "  .ts_copy_done_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov r12, rax" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 48" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    xor rcx, rcx" + x64_nl_char())
+  sb_push(sb, "    xor rdx, rdx" + x64_nl_char())
+  sb_push(sb, "    lea r8, [rel patlang_thread_trampoline]" + x64_nl_char())
+  sb_push(sb, "    mov r9, r12" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+32], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+40], 0" + x64_nl_char())
+  sb_push(sb, "    call CreateThread" + x64_nl_char())
+  # Real thread HANDLE not needed afterward -- polling the context
+  # block's own done_flag (see patlang_thread_trampoline) rather than
+  # WaitForSingleObject, so it's closed immediately rather than leaked.
+  sb_push(sb, "    mov rcx, rax" + x64_nl_char())
+  sb_push(sb, "    call CloseHandle" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    push r12" + x64_nl_char())
+  return sb_str(sb)
+end
+
 # MakeClosure(func_name, captured_names) -- captured_names.length is
 # compile-time known, so this unrolls exactly like x64_buildlist_asm.
 # Block layout: [code address][captured count][captured values...].
@@ -4948,7 +7190,19 @@ make a function called x64_callvalue_asm takes argc, spilled returns asm
   # closure before returning. Private to THIS activation's own rbp, so
   # every nested/recursive call gets its own independent copy for free.
   let cv_slot_offset = 8 * (to_num(list_len(spilled)) + 1)
+  let cv_lock_suffix = label_asm_safe(argc)
   let sb = sb_new()
+  # g_scratch here is a temporary arg-shuffle buffer (NOT a path
+  # string), but it's the SAME process-wide shared buffer every other
+  # g_scratch user needs protection from now that real OS threads
+  # exist -- lock_acquire before step 1's writes, lock_release right
+  # after step 4's LAST read (below), deliberately BEFORE `call r12`:
+  # that call invokes arbitrary closure body code, and holding the
+  # lock across an unbounded nested call (even though CRITICAL_SECTION
+  # is safely reentrant for the same thread, so it wouldn't deadlock)
+  # would serialize far more than this function's own brief buffer
+  # usage actually needs.
+  sb_push(sb, x64_lock_acquire_asm(cv_lock_suffix))
   # 1. Pop the N already-pushed own-args into the scratch buffer, out
   #    of the way, so the closure's captured values can be pushed
   #    underneath where they belong first.
@@ -4982,7 +7236,10 @@ make a function called x64_callvalue_asm takes argc, spilled returns asm
   sb_push(sb, "    inc r10" + x64_nl_char())
   sb_push(sb, "    jmp .cv_loop_" + suffix + x64_nl_char())
   sb_push(sb, "  .cv_done_" + suffix + ":" + x64_nl_char())
-  # 4. Push the own-args back on top, in original order.
+  # 4. Push the own-args back on top, in original order. Last actual
+  #    read of g_scratch in this function -- lock_release right after,
+  #    before the nested call in step 5 (see this function's own
+  #    header for why release happens here, not after the call).
   let i = 0
   while i < n do
     sb_push(sb, "    lea r10, [rel g_scratch]" + x64_nl_char())
@@ -4990,6 +7247,7 @@ make a function called x64_callvalue_asm takes argc, spilled returns asm
     sb_push(sb, "    push rax" + x64_nl_char())
     let i = i + 1
   end
+  sb_push(sb, x64_lock_release_asm())
   # 5. Indirect call, then clean up -- captured count is read back from
   #    THIS frame's own private slot (step 2), not from any register,
   #    since r12/r13/r14 are not guaranteed to survive the call.
@@ -5164,6 +7422,30 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
       let reg = x64_reg_for_name(regmap, instr[1])
       if reg == "" then
         let slot = x64_local_index(spilled, instr[1])
+        # REAL BUG FOUND AND FIXED (canvas_host.exe's non-deterministic
+        # segfault, ultimately root-caused here): x64_local_index
+        # returns -1 for a name that isn't a param/local of THIS
+        # function -- e.g. a top-level `let` referenced from a
+        # DIFFERENT function than the one that declared it (PatLang
+        # has no automatic global-sharing for top-level lets; that's a
+        # genuinely unsupported pattern, not a compiler feature this
+        # silently degrades). The old code computed `[rbp-8*(slot+1)]`
+        # unconditionally, so slot=-1 silently became `[rbp-0]` ==
+        # `[rbp]` -- the CALLER's saved frame pointer, not any real
+        # variable -- read as if it were valid data. Two DIFFERENT
+        # undefined names in the same function both hit this same
+        # `[rbp]` slot and silently read the SAME garbage value, which
+        # is exactly what made canvas_host.patlang's ch_width/ch_height
+        # (referenced inside ch_run, declared only at top level) always
+        # compare equal and non-deterministically crash depending on
+        # what garbage stack address happened to be sitting there.
+        # Failing loudly here, matching rt_heap_alloc's own "fail loud
+        # rather than silently corrupt" convention, so this bug class
+        # can never silently miscompile again.
+        if slot < 0 then
+          print("codegen_x64: undefined variable '" + instr[1] + "' referenced (not a parameter or local of the enclosing function -- PatLang has no automatic cross-function sharing for top-level `let` bindings; pass it as a parameter instead)")
+          os_exit(98)
+        end
         sb_push(sb, "    mov rax, [rbp-" + (8 * (slot + 1)) + "]" + x64_nl_char())
       else
         sb_push(sb, "    mov rax, " + reg + x64_nl_char())
@@ -5175,6 +7457,10 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
         sb_push(sb, "    pop rax" + x64_nl_char())
         if reg == "" then
           let slot = x64_local_index(spilled, instr[1])
+          if slot < 0 then
+            print("codegen_x64: undefined variable '" + instr[1] + "' referenced (not a parameter or local of the enclosing function -- PatLang has no automatic cross-function sharing for top-level `let` bindings; pass it as a parameter instead)")
+            os_exit(98)
+          end
           sb_push(sb, "    mov [rbp-" + (8 * (slot + 1)) + "], rax" + x64_nl_char())
         else
           sb_push(sb, "    mov " + reg + ", rax" + x64_nl_char())
@@ -6410,7 +8696,30 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
     end
     sb_push(sb, sb_str(gl_line) + x64_nl_char())
   end
-  sb_push(sb, "extern GetStdHandle, WriteFile, ExitProcess, CreateFileA, GetFileSize, CloseHandle, ReadFile, CreateProcessA, CreatePipe, SetHandleInformation, WaitForSingleObject, GetCommandLineA, GetExitCodeProcess, TerminateProcess, WSAStartup, WSAGetLastError, socket, bind, listen, accept, connect, send, recv, closesocket, shutdown, getaddrinfo, freeaddrinfo, getsockname, ioctlsocket, htons, ntohs, Sleep, GetTickCount64, CopyFileA, MoveFileExA, FindFirstFileA, FindNextFileA, FindClose" + x64_nl_char())
+  sb_push(sb, "extern GetStdHandle, WriteFile, ExitProcess, CreateFileA, GetFileSize, CloseHandle, ReadFile, CreateProcessA, CreatePipe, SetHandleInformation, WaitForSingleObject, GetCommandLineA, GetExitCodeProcess, TerminateProcess, WSAStartup, WSAGetLastError, socket, bind, listen, accept, connect, send, recv, closesocket, shutdown, getaddrinfo, freeaddrinfo, getsockname, ioctlsocket, htons, ntohs, Sleep, GetTickCount64, CopyFileA, MoveFileExA, FindFirstFileA, FindNextFileA, FindClose, GetConsoleMode, SetConsoleMode, SetConsoleOutputCP, SetConsoleCP, GetCurrentDirectoryA, SetCurrentDirectoryA" + x64_nl_char())
+  # Canvas host, Phase 1 (win32_window.patlang's own backing
+  # primitives): window creation, message pump, GDI pixel blit.
+  # user32.dll/gdi32.dll are already linked (x64_build.patlang) but
+  # these are the first actual calls into either.
+  sb_push(sb, "extern GetModuleHandleW, RegisterClassExW, CreateWindowExW, ShowWindow, UpdateWindow, DefWindowProcW, PeekMessageW, TranslateMessage, DispatchMessageW, BeginPaint, EndPaint, StretchDIBits, InvalidateRect, GetClientRect, DestroyWindow" + x64_nl_char())
+  # Canvas host, Phase 3: GDI text rendering onto a DIB-section-backed
+  # memory DC (see g_mem_dc's own .bss declaration comment for why).
+  sb_push(sb, "extern GetDC, ReleaseDC, CreateCompatibleDC, CreateDIBSection, SelectObject, BitBlt, TextOutA, SetTextColor, SetBkMode, SetWindowTextA, DeleteObject, GetKeyState, OpenClipboard, CloseClipboard, EmptyClipboard, SetClipboardData, GetClipboardData, GlobalAlloc, GlobalLock, GlobalUnlock, GlobalSize" + x64_nl_char())
+  # Canvas host, Phase 2: ConPTY hosting a real child process. All in
+  # kernel32.dll (already linked, no new -l flag needed).
+  sb_push(sb, "extern CreatePseudoConsole, ResizePseudoConsole, ClosePseudoConsole, InitializeProcThreadAttributeList, UpdateProcThreadAttribute, CreateProcessW, PeekNamedPipe, GetLastError" + x64_nl_char())
+  # Real OS threads (thread_spawn/thread_poll/thread_result) + the
+  # CRITICAL_SECTION lock every g_scratch/g_scratch2-touching primitive
+  # now acquires around its own usage -- see g_scratch_cs's own .bss
+  # header for why a lock is needed at all (those buffers are process-
+  # wide, shared by every thread, not per-thread). InitializeCriticalSection
+  # itself is void-returning (no failure path on modern Windows -- MSDN:
+  # "In low memory situations... raises a STATUS_NO_MEMORY exception",
+  # not a return-value failure this code needs to check).
+  sb_push(sb, "extern CreateThread, ExitThread, InitializeCriticalSection, EnterCriticalSection, LeaveCriticalSection" + x64_nl_char())
+  # (GetExitCodeProcess was already externed above, for kill()'s own
+  # unrelated use elsewhere -- x64_os_exec_run_asm's new use of it,
+  # right above, needed no new extern entry.)
   # Real C runtime math library (msvcrt/ucrtbase, already linked by
   # gcc's own default libs -- see x64_build.patlang) -- matches the
   # SAME underlying libm every real_host_sin/cos/sqrt/etc (rust-runtime/
@@ -6434,7 +8743,7 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
   sb_push(sb, x64_nl_char())
   sb_push(sb, "section .bss" + x64_nl_char())
   if owns_globals then
-    sb_push(sb, "    global g_written, g_scratch, g_scratch2, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init, g_last_recv_error, g_vfs_table, g_classes_table, g_goal_defs_table, g_finddata" + x64_nl_char())
+    sb_push(sb, "    global g_written, g_scratch, g_scratch2, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init, g_last_recv_error, g_vfs_table, g_classes_table, g_goal_defs_table, g_finddata, g_last_exec_exit_code, g_hwnd, g_canvas_buf, g_canvas_w, g_canvas_h, g_mem_dc, g_msg_scratch, g_paintstruct_scratch, g_bmih_scratch, g_conpty_hpc, g_conpty_in_write, g_conpty_out_read, g_conpty_process, g_pta_list, g_pta_size, g_startupinfoex, g_process_info, g_scratch_cs, g_scratch_cs_ready, g_threads_table, g_resize_pending, g_resize_w, g_resize_h" + x64_nl_char())
     sb_push(sb, "    align 8" + x64_nl_char())
     sb_push(sb, "    g_written resd 1" + x64_nl_char())
     sb_push(sb, "    align 8" + x64_nl_char())
@@ -6498,14 +8807,142 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
     # rt_heap_alloc's own header in x64_runtime.patlang for the real
     # fix still outstanding (genuine dynamic growth/free-list).
     sb_push(sb, "    g_heap resb 536870912" + x64_nl_char())
+    sb_push(sb, "    align 8" + x64_nl_char())
+    # x64_os_exec_run_asm's real GetExitCodeProcess result, replacing
+    # the earlier "non-empty output = success" heuristic -- see that
+    # function's own comment for why the heuristic was wrong (a real
+    # failure's own error TEXT is non-empty output too). -1 means
+    # CreateProcessA never started the child at all (no real exit code
+    # exists), distinct from any genuine 0-255 process exit code.
+    sb_push(sb, "    g_last_exec_exit_code resq 1" + x64_nl_char())
+    sb_push(sb, "    align 8" + x64_nl_char())
+    # Canvas host, Phase 1: window handle + pixel-surface state.
+    # Persistent globals (unlike STARTUPINFOA/MSG/WNDCLASSEXW/
+    # BITMAPINFOHEADER, which are rebuilt fresh on the real machine
+    # stack for every call, same convention x64_os_exec_run_asm's own
+    # STARTUPINFOA already established) since every later primitive
+    # here (win_peek_message, win_invalidate, ...) needs to read them
+    # across many separate calls, not just within one call's own frame.
+    sb_push(sb, "    g_hwnd resq 1" + x64_nl_char())
+    sb_push(sb, "    g_canvas_buf resq 1" + x64_nl_char())
+    sb_push(sb, "    g_canvas_w resq 1" + x64_nl_char())
+    sb_push(sb, "    g_canvas_h resq 1" + x64_nl_char())
+    # Phase 3: a memory DC holding a DIB-section bitmap, so GDI text
+    # drawing (TextOutA) writes DIRECTLY into the same pixel memory
+    # g_canvas_buf already points at (CreateDIBSection hands back both
+    # an HBITMAP for GDI use AND a raw pointer for mem_poke_byte use,
+    # backed by the SAME memory) -- unifies "GDI can draw text/lines"
+    # with "PatLang can blit decoded image pixels directly" (Phase 5)
+    # onto one shared surface, rather than needing a separate copy/
+    # blit step between two different buffers.
+    sb_push(sb, "    g_mem_dc resq 1" + x64_nl_char())
+    sb_push(sb, "    align 8" + x64_nl_char())
+    # REAL BUG FOUND AND FIXED (caught by two live crashes): MSG/
+    # PAINTSTRUCT/BITMAPINFOHEADER were originally laid out at fixed
+    # STACK offsets within win_peek_message's own aligned frame -- but
+    # a Win64 call's OWN stack-passed arguments (StretchDIBits needs
+    # 9 of them) are architecturally required to land at [rsp+32..)
+    # AT THE MOMENT of that specific call, a fixed ABI position, not
+    # something relocatable. PAINTSTRUCT's stack offset overlapped
+    # that exact window, so writing StretchDIBits's own args silently
+    # corrupted PAINTSTRUCT's already-BeginPaint-populated content
+    # before EndPaint read it back. Fixed by moving every struct that
+    # must survive across more than one WinAPI call in the same
+    # primitive into PERSISTENT .bss scratch instead -- a fixed
+    # address can never alias any call's own stack-argument window,
+    # eliminating this entire bug class rather than just this one
+    # instance of it (the same risk applies to every future multi-call
+    # primitive here, e.g. ConPTY's STARTUPINFOEX dance).
+    sb_push(sb, "    g_msg_scratch resb 48" + x64_nl_char())
+    sb_push(sb, "    align 8" + x64_nl_char())
+    sb_push(sb, "    g_paintstruct_scratch resb 72" + x64_nl_char())
+    sb_push(sb, "    align 8" + x64_nl_char())
+    sb_push(sb, "    g_bmih_scratch resb 40" + x64_nl_char())
+    sb_push(sb, "    align 8" + x64_nl_char())
+    # Canvas host, Phase 2: ConPTY hosting state. Single-instance
+    # (one pane) for now, matching g_hwnd's own single-window scope --
+    # multi-pane is a Phase 6 concern. Every struct that must survive
+    # across more than one WinAPI call within the same primitive lives
+    # here from the start (g_pta_list/g_pta_size/g_startupinfoex/
+    # g_process_info), learning directly from Phase 1's own stack-
+    # offset-overlap bug -- see g_msg_scratch's own header above for
+    # the incident this lesson comes from.
+    sb_push(sb, "    g_conpty_hpc resq 1" + x64_nl_char())
+    sb_push(sb, "    g_conpty_in_write resq 1" + x64_nl_char())
+    sb_push(sb, "    g_conpty_out_read resq 1" + x64_nl_char())
+    sb_push(sb, "    g_conpty_process resq 1" + x64_nl_char())
+    sb_push(sb, "    g_pta_list resq 1" + x64_nl_char())
+    sb_push(sb, "    g_pta_size resq 1" + x64_nl_char())
+    sb_push(sb, "    align 8" + x64_nl_char())
+    sb_push(sb, "    g_startupinfoex resb 112" + x64_nl_char())
+    sb_push(sb, "    align 8" + x64_nl_char())
+    sb_push(sb, "    g_process_info resb 24" + x64_nl_char())
+    sb_push(sb, "    align 8" + x64_nl_char())
+    # Real OS threads (thread_spawn) make g_scratch/g_scratch2 process-
+    # wide shared, mutable state -- every primitive that writes-then-
+    # reads them (path null-termination, CallValue's own argument-
+    # shuffle buffer, see x64_os_null_terminate_path_asm's own header)
+    # now wraps that usage in g_scratch_cs (a real CRITICAL_SECTION,
+    # not a hand-rolled spinlock -- Windows' own tested implementation,
+    # matching this whole project's preference for real OS primitives
+    # over reinventing one). g_scratch_cs_ready: 0=uninitialized,
+    # 1=another thread is initializing right now, 2=ready to use --
+    # lazily initialized on first lock_acquire via a real `lock cmpxchg`
+    # race (see x64_lock_acquire_asm's own header), not an eager
+    # startup hook, so this stays correct regardless of whether the
+    # program ever calls thread_spawn at all.
+    sb_push(sb, "    g_scratch_cs_ready resq 1" + x64_nl_char())
+    sb_push(sb, "    align 8" + x64_nl_char())
+    sb_push(sb, "    g_scratch_cs resb 40" + x64_nl_char())
+    sb_push(sb, "    align 8" + x64_nl_char())
+    # thread_spawn/thread_poll/thread_result's [thread_id, ctx_addr]
+    # table -- same shape/convention as g_conns_table just above.
+    sb_push(sb, "    g_threads_table resq 1" + x64_nl_char())
+    sb_push(sb, "    align 8" + x64_nl_char())
+    # WM_SIZE arrives via SendMessage (a direct, synchronous call into
+    # the window procedure), NOT posted to the queue PeekMessageW
+    # polls -- patlang_wndproc_trampoline (its own header explains why
+    # it's otherwise just a bare tail-jump to DefWindowProcW) is the
+    # ONLY code that ever actually sees it. It records the new size
+    # here; win_peek_message polls this flag itself (see its own
+    # header) and does the real DIB reallocation from there, on the
+    # main thread, not from inside the trampoline.
+    sb_push(sb, "    g_resize_pending resq 1" + x64_nl_char())
+    sb_push(sb, "    g_resize_w resq 1" + x64_nl_char())
+    sb_push(sb, "    g_resize_h resq 1" + x64_nl_char())
   else
-    sb_push(sb, "extern g_written, g_scratch, g_scratch2, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init, g_last_recv_error, g_vfs_table, g_classes_table, g_goal_defs_table, g_finddata" + x64_nl_char())
+    sb_push(sb, "extern g_written, g_scratch, g_scratch2, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init, g_last_recv_error, g_vfs_table, g_classes_table, g_goal_defs_table, g_finddata, g_last_exec_exit_code, g_hwnd, g_canvas_buf, g_canvas_w, g_canvas_h, g_mem_dc, g_msg_scratch, g_paintstruct_scratch, g_bmih_scratch, g_conpty_hpc, g_conpty_in_write, g_conpty_out_read, g_conpty_process, g_pta_list, g_pta_size, g_startupinfoex, g_process_info, g_scratch_cs, g_scratch_cs_ready, g_threads_table, g_resize_pending, g_resize_w, g_resize_h" + x64_nl_char())
+    # patlang_wndproc_trampoline AND the two fixed wide-string data
+    # labels are only DEFINED by the owns_globals unit (see x64_win_
+    # data_and_trampoline_asm, only emitted there) -- every other unit
+    # that references them (x64_win_create_window_asm's own `lea rax,
+    # [rel patlang_wndproc_trampoline]` / `lea rdx, [rel g_win_class_
+    # name]` / `lea r8, [rel g_win_title]`) needs them as externs, same
+    # singleton-symbol pattern as g_hwnd etc just above. (First cut of
+    # this missed g_win_class_name/g_win_title specifically -- caught
+    # by a real NASM "symbol not defined" error, not by review.)
+    sb_push(sb, "extern patlang_wndproc_trampoline, g_win_class_name, g_win_title, patlang_thread_trampoline" + x64_nl_char())
   end
   sb_push(sb, x64_nl_char())
   sb_push(sb, "section .data" + x64_nl_char())
   sb_push(sb, "    align 8" + x64_nl_char())
   sb_push(sb, x64_collect_string_data(ir))
   sb_push(sb, x64_nl_char())
+  # Gated behind owns_globals, matching g_hwnd/g_canvas_*'s own .bss
+  # declarations just above -- REAL BUG FOUND AND FIXED: this used to
+  # run unconditionally, but emit_program_x64 runs once PER COMPILED
+  # UNIT under the x64_obj_cache per-function object model (confirmed
+  # via a real link failure: "multiple definition of
+  # `patlang_wndproc_trampoline`" across dozens of unrelated .obj
+  # files, e.g. str_trim's own). A single global label/data block must
+  # only ever be emitted by the one unit that owns globals, same as
+  # every other genuinely-global symbol here.
+  if owns_globals then
+    sb_push(sb, x64_win_data_and_trampoline_asm())
+    sb_push(sb, x64_nl_char())
+    sb_push(sb, x64_thread_trampoline_asm())
+    sb_push(sb, x64_nl_char())
+  end
   sb_push(sb, "section .text" + x64_nl_char())
   sb_push(sb, x64_nl_char())
   x64_string_label_reset()

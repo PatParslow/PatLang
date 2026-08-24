@@ -1,0 +1,328 @@
+# friendly_cli's Tab-completion-capable terminal. Same command dispatch
+# as terminal.patlang (built-ins + dynamic shell_ops_run fallback via
+# console.patlang), but reads input through
+# self_hosting/lib/line_edit.patlang's raw-mode editor instead of plain
+# read_line() -- Tab completes the current word against the known
+# command names.
+#
+# MUST be compiled via patc1.exe --x64 -- it will NOT run under
+# `pat.exe --ir-run`. line_edit.patlang's raw-mode primitives
+# (console_raw_enable/console_read_raw_byte/console_raw_disable, defined
+# in self_hosting/lib/x64_runtime.patlang) exist only as hand-written x64
+# assembly in the native --x64 backend (codegen_x64.patlang); they have
+# no Rust host-function equivalent in hosts.rs, by deliberate choice
+# (kept entirely in PatLang/x64, no new Rust surface added -- see this
+# session's own notes). terminal.patlang stays the portable,
+# interpreter-and-compiler-both default; this file is the native-only
+# variant for whoever wants real Tab completion and is willing to build
+# it once:
+#
+#   pat --ir-run self_hosting/build_x64_runtime.patlang    (once, if
+#     self_hosting/build/x64_runtime.obj doesn't exist yet)
+#   patc1 friendly_cli/terminal_native.patlang friendly_cli/terminal_native.exe --x64
+#   friendly_cli/terminal_native.exe
+#
+# Verified by automation: it compiles, and the graceful fallback to
+# plain read_line() when stdin isn't a real console (see
+# friendly_cli/terminal_native_bdd_demo.patlang, run as a black-box
+# subprocess with piped stdin, same as terminal.patlang's own spec).
+# NOT verified by automation, and needing a human at a real terminal:
+# that Tab actually completes live, mid-keystroke, with no local echo
+# glitches -- SetConsoleMode only succeeds against a genuine console
+# handle, which this sandboxed session cannot provide itself.
+#
+# Kept manually in sync with terminal.patlang's built-in commands
+# (help/status/history/heal-config) and dynamic dispatch-table
+# construction -- a deliberate small duplication rather than a fragile
+# include-then-suppress-the-trailing-call refactor of the already
+# tested, portable terminal.patlang.
+
+include "../self_hosting/lib/console.patlang"
+include "../self_hosting/lib/proc.patlang"
+include "../self_hosting/lib/output.patlang"
+include "../self_hosting/lib/line_edit.patlang"
+include "lib/command_safety.patlang"
+include "dsl/shell_ops.patlang"
+include "../self_hosting/lib/image_load.patlang"
+
+# ---- color ----
+#
+# tmn_colors_enabled (a global var, set once at startup by
+# console_enable_colors()'s own return value) gates every color call
+# below -- ANSI codes are only ever emitted when the console actually
+# confirmed VT-processing support; a redirected/piped run (like this
+# file's own BDD spec) just gets plain text, same as before.
+
+make a function called tmn_ansi takes code, text returns colored
+  return chr(27) + "[" + code + "m" + text + chr(27) + "[0m"
+end
+
+make a function called tmn_color takes code, text returns colored
+  if get("__vars", "tmn_colors_enabled") == true then
+    return tmn_ansi(code, text)
+  end
+  return text
+end
+
+# tmn_colorize_event(event) -> event with its "[ok]"/"[error]"/"[healed]"
+# prefix colored (green/red/yellow) when it starts with one -- console.
+# patlang's own render_human is left untouched (it's shared with
+# terminal.patlang and console_bdd_demo.patlang's own tests); this is a
+# thin, terminal_native-only wrapper applied only at print(output) time.
+make a function called tmn_colorize_event takes event returns colored
+  if str_starts_with(event, "[ok]") then
+    return tmn_color("32", event)
+  end
+  if str_starts_with(event, "[error]") then
+    return tmn_color("31", event)
+  end
+  if str_starts_with(event, "[healed]") then
+    return tmn_color("33", event)
+  end
+  return event
+end
+
+# tmn_prompt() -> "<cwd-basename>> ", the cwd hint colored cyan when
+# color is available. Just the LAST path component (not the full cwd)
+# -- enough of a hint to notice you've changed directory without making
+# every prompt line long; `pwd` (a real command, shelled out) or the
+# window's own title bar shows the full path if genuinely needed. No
+# "friendly_cli" label here -- the startup banner already says what
+# this is once; repeating it on every single prompt line was just
+# noise, found worth dropping directly from a live user report.
+make a function called tmn_prompt returns text
+  let hint = path_basename(cwd())
+  return tmn_color("36", hint) + "> "
+end
+
+make a function called tmn_help returns ok
+  print("friendly_cli (native, Tab completion) -- a terminal you can also embed.")
+  print("Built-in commands: help, status, history, heal-config, cd, img [--truecolor] <path>, exit, quit.")
+  print("Anything else is tried as a real command, gated by command_safety.patlang's classification.")
+  return true
+end
+
+make a function called tmn_status returns ok
+  print("self-healing hand-off: not configured (see 'heal-config')")
+  let hist = get("__vars", "terminal_history")
+  print("" + hist.length + " command(s) run this session")
+  return true
+end
+
+make a function called tmn_history returns ok
+  let hist = get("__vars", "terminal_history")
+  let i = 0
+  while i < hist.length do
+    print("" + (i + 1) + ": " + hist[i])
+    let i = i + 1
+  end
+  return true
+end
+
+make a function called tmn_heal_config returns ok
+  print("Self-healing hand-off is pluggable (self_hosting/lib/console.patlang, console_with_heal_fn).")
+  print("Not configured in this session -- see terminal.patlang's own header comment for why.")
+  return true
+end
+
+# tmn_joined_path_arg(args) -> a single path argument, joining every
+# token back together with spaces (console_tokenize has no quote-
+# awareness at all, so an unquoted multi-word path already arrived as
+# several separate tokens) and stripping one matched pair of
+# surrounding double quotes, if present -- for any built-in that takes
+# exactly one path argument that may contain spaces (`cd "some path"`,
+# `img "some path.bmp"`). Found needed for `img` specifically from a
+# live user report: a quoted Windows path with spaces (a real
+# Screenshot filename) was being truncated at the first space, leaving
+# the leading `"` and everything after the space silently dropped --
+# `cd` already had this fix; `img` was just added later and missed it.
+make a function called tmn_joined_path_arg takes args returns path
+  let joined = ""
+  let i = 0
+  while i < args.length do
+    if i > 0 then
+      let joined = joined + " "
+    end
+    let joined = joined + args[i]
+    let i = i + 1
+  end
+  if (joined.length >= 2) and (substr(joined, 0, 1) == "\"") and (substr(joined, joined.length - 1, 1) == "\"") then
+    return substr(joined, 1, joined.length - 2)
+  end
+  return joined
+end
+
+# tmn_cd -- a REAL built-in, not routed through shell_ops_run at all.
+# `cd` can never work via `cmd.exe /c cd ...` (this terminal's own
+# fallback for any unrecognized command): a subprocess's own working-
+# directory change is local to that subprocess and vanishes the instant
+# it exits, never reaching the parent (this terminal's own process) --
+# confirmed directly from a live user report (`cd` always reporting
+# success, `pwd` never actually changing). set_cwd (self_hosting/lib/
+# x64_runtime.patlang) calls SetCurrentDirectoryA in-process instead.
+make a function called tmn_cd returns ok
+  let args = get("__vars", "console_args")
+  let path = tmn_joined_path_arg(args)
+  if path == "" then
+    print(cwd())
+    return true
+  end
+  if set_cwd(path) then
+    return true
+  end
+  set_var("console_last_proc_result", ["1", "", "", "PathResolutionError", "'" + path + "' could not be resolved as a directory -- check that it exists and is spelled correctly."])
+  set_var("console_last_proc_result_set", true)
+  return false
+end
+
+# tmn_img -- renders an image file (Sixel, so needs a real Sixel-
+# capable terminal -- verified live in this one, see image.patlang's
+# own header) straight in the terminal. Format support grows as
+# image_load.patlang's own decoder dispatch grows (BMP/PNG so far; JPEG/
+# SVG are the same "img" command once their decoders land, no
+# terminal-side change needed).
+#
+# `--truecolor` (must come first): renders with img_show_truecolor
+# instead of the default quantized img_show -- every pixel's own exact
+# color, no palette/register cap, at the cost of larger/slower output
+# on genuinely high-entropy images (see image.patlang's own header on
+# img_to_sixel_truecolor for the real tradeoff). Added directly from a
+# live user question ("is there a way of giving it true colour?") --
+# the default stays the bounded-cost quantized path since that's the
+# right default for arbitrary files, this is the explicit opt-in for
+# exactness.
+make a function called tmn_img returns ok
+  let args = get("__vars", "console_args")
+  if args.length == 0 then
+    set_var("console_last_proc_result", ["1", "", "", "UsageError", "usage: img [--truecolor] <path>"])
+    set_var("console_last_proc_result_set", true)
+    return false
+  end
+  let truecolor = false
+  let path_args = args
+  if args[0] == "--truecolor" then
+    let truecolor = true
+    let path_args = console_tail(args)
+  end
+  if path_args.length == 0 then
+    set_var("console_last_proc_result", ["1", "", "", "UsageError", "usage: img [--truecolor] <path>"])
+    set_var("console_last_proc_result_set", true)
+    return false
+  end
+  let path = tmn_joined_path_arg(path_args)
+  let image = img_load_file(path)
+  if image.length == 0 then
+    set_var("console_last_proc_result", ["1", "", "", "ImageLoadError", "'" + path + "' could not be read/decoded -- check the path, and that it's a supported format (currently: BMP, PNG)."])
+    set_var("console_last_proc_result_set", true)
+    return false
+  end
+  if truecolor then
+    if img_show_truecolor(image, 640, 400) == false then
+      set_var("console_last_proc_result", ["1", "", "", "ImageTooComplexError", "'" + path + "' has too many distinct colors for --truecolor (no palette cap, so cost scales with actual color count -- this image needs it) -- try plain 'img' (quantized, bounded cost) instead."])
+      set_var("console_last_proc_result_set", true)
+      return false
+    end
+  else
+    img_show(image, 640, 400)
+  end
+  print("")
+  return true
+end
+
+make a function called tmn_builtin_table returns table
+  return [
+    ["help", "tmn_help"],
+    ["status", "tmn_status"],
+    ["history", "tmn_history"],
+    ["heal-config", "tmn_heal_config"],
+    ["cd", "tmn_cd"],
+    ["img", "tmn_img"]
+  ]
+end
+
+make a function called tmn_builtin_names returns names
+  return ["help", "status", "history", "heal-config", "cd", "img", "exit", "quit"]
+end
+
+make a function called tmn_dispatch_table_for takes trimmed_line returns table
+  let table = tmn_builtin_table()
+  let tokens = console_tokenize(trimmed_line)
+  if tokens.length > 0 then
+    let cmd_name = tokens[0]
+    if console_lookup_handler(table, cmd_name) == "" then
+      let table = list_push(table, [cmd_name, "shell_ops_run"])
+    end
+  end
+  return table
+end
+
+# tmn_first_word(line) -> the command-name token (before any args), or
+# "" for a blank line.
+make a function called tmn_first_word takes line returns word
+  let tokens = console_tokenize(line)
+  if tokens.length > 0 then
+    return tokens[0]
+  end
+  return ""
+end
+
+# tmn_completion_candidates() -> built-in names PLUS the command name
+# from every history entry this session, rebuilt fresh each prompt (so
+# it grows as the session goes on). Found worth adding directly from a
+# live user report ("tab does nothing"): completing against ONLY the
+# 4 built-ins meant Tab visibly did nothing for the overwhelmingly
+# common case of completing a real shell command already typed once
+# this session -- indistinguishable from a genuine bug. Matches how
+# real shells (fish, zsh) complete against history, not just built-ins.
+make a function called tmn_completion_candidates returns names
+  let names = tmn_builtin_names()
+  let hist = get("__vars", "terminal_history")
+  let i = 0
+  while i < hist.length do
+    let w = tmn_first_word(hist[i])
+    if w != "" then
+      let names = list_push(names, w)
+    end
+    let i = i + 1
+  end
+  return names
+end
+
+make a function called tmn_run returns done
+  set_var("terminal_history", [])
+  # UTF-8 code pages, set once at startup -- see console_set_utf8's own
+  # header for why (fixes real mojibake in this terminal's own output,
+  # found via a live user report of garbled captured file content).
+  console_set_utf8()
+  # Colors: attempted once at startup, result cached in a global var so
+  # every tmn_color call below is a cheap var read, not a repeated
+  # syscall. Harmless (and stays off) on a redirected/piped run -- see
+  # os_enable_ansi_colors's own header.
+  set_var("tmn_colors_enabled", console_enable_colors())
+  let state = console_new_state("interactive")
+  print("friendly_cli terminal (native). Tab completes built-in commands, command history, and filenames. Type 'help', 'exit' to quit.")
+  let running = true
+  while running do
+    let line = line_edit_read(tmn_completion_candidates(), tmn_prompt())
+    if (line == "exit") or (line == "quit") or (line == "") then
+      let running = false
+    else
+      let trimmed = str_trim(line)
+      if trimmed != "" then
+        let hist = get("__vars", "terminal_history")
+        set_var("terminal_history", list_push(hist, trimmed))
+      end
+      let table = tmn_dispatch_table_for(trimmed)
+      let result = console_step(state, line, table)
+      let state = cs_result_state(result)
+      let output = cs_result_output(result)
+      if output != "" then
+        print(tmn_colorize_event(output))
+      end
+    end
+  end
+  print("goodbye.")
+  return true
+end
+
+tmn_run()

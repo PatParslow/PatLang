@@ -2516,6 +2516,7 @@ pub fn host_tcp_close(args: &[Value]) -> Result<Value, String> {
 // all, not a bug to fix later.
 thread_local! {
     static CHILD_PROCS: RefCell<HashMap<u32, std::process::Child>> = RefCell::new(HashMap::new());
+    static NEXT_PROC_ID: RefCell<u32> = RefCell::new(1);
 }
 
 pub fn host_spawn(args: &[Value]) -> Result<Value, String> {
@@ -2540,16 +2541,32 @@ pub fn host_spawn(args: &[Value]) -> Result<Value, String> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn().map_err(|e| format!("spawn: {}: {}", path, e))?;
-    let pid = child.id();
-    CHILD_PROCS.with(|c| c.borrow_mut().insert(pid, child));
-    Ok(Value::Int(pid as i64))
+    // Keyed by a synthetic, monotonically-increasing id, NOT the real OS
+    // pid (child.id()) -- the SAME fix applied to this identical
+    // thread_local pattern in codegen.rs's embedded --patc prelude, found
+    // there first: a batch of many short-lived children (nasm.exe, one
+    // per function in x64_compile_unit.patlang's per-function ObjCache)
+    // reproducibly hit "wait: unknown or already-reaped pid" once enough
+    // ran concurrently -- Windows reusing a just-freed OS pid for a newly
+    // spawned process before this map's own earlier entry for that pid
+    // had been removed, so a later insert silently overwrote it and a
+    // still-pending wait() for the original process found nothing (or
+    // waited on the wrong child). A synthetic id can never collide within
+    // one process's lifetime. Applied here too for consistency, even
+    // though this specific crash was only reproduced via the --patc/--x64
+    // path -- it's the identical bug pattern, and this interpreter path
+    // is exactly as exposed to the same race under a large enough
+    // concurrent spawn batch.
+    let id = NEXT_PROC_ID.with(|n| { let mut b = n.borrow_mut(); let v = *b; *b += 1; v });
+    CHILD_PROCS.with(|c| c.borrow_mut().insert(id, child));
+    Ok(Value::Int(id as i64))
 }
 
 pub fn host_is_alive(args: &[Value]) -> Result<Value, String> {
-    let pid = arg_num(args, 0, "is_alive")? as u32;
+    let id = arg_num(args, 0, "is_alive")? as u32;
     let alive = CHILD_PROCS.with(|c| {
         let mut b = c.borrow_mut();
-        match b.get_mut(&pid) {
+        match b.get_mut(&id) {
             Some(child) => match child.try_wait() {
                 Ok(None) => true,
                 _ => false, // exited, or the check itself failed -- either way, not alive
@@ -2561,20 +2578,20 @@ pub fn host_is_alive(args: &[Value]) -> Result<Value, String> {
 }
 
 pub fn host_wait(args: &[Value]) -> Result<Value, String> {
-    let pid = arg_num(args, 0, "wait")? as u32;
-    let child = CHILD_PROCS.with(|c| c.borrow_mut().remove(&pid));
+    let id = arg_num(args, 0, "wait")? as u32;
+    let child = CHILD_PROCS.with(|c| c.borrow_mut().remove(&id));
     match child {
         Some(mut child) => {
-            let status = child.wait().map_err(|e| format!("wait: {}: {}", pid, e))?;
+            let status = child.wait().map_err(|e| format!("wait: {}: {}", id, e))?;
             Ok(Value::Int(status.code().unwrap_or(-1) as i64))
         }
-        None => Err(format!("wait: unknown or already-reaped pid {}", pid)),
+        None => Err(format!("wait: unknown or already-reaped pid {}", id)),
     }
 }
 
 pub fn host_kill(args: &[Value]) -> Result<Value, String> {
-    let pid = arg_num(args, 0, "kill")? as u32;
-    let child = CHILD_PROCS.with(|c| c.borrow_mut().remove(&pid));
+    let id = arg_num(args, 0, "kill")? as u32;
+    let child = CHILD_PROCS.with(|c| c.borrow_mut().remove(&id));
     match child {
         Some(mut child) => {
             let _ = child.kill(); // ignore "already exited" -- that's success too, not an error

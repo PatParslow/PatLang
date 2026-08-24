@@ -1,0 +1,406 @@
+# A real DEFLATE (RFC 1951) / zlib (RFC 1950) decompressor, needed for
+# PNG's IDAT stream (always zlib-wrapped DEFLATE, regardless of PNG
+# color type/bit depth). Native --x64 ONLY -- uses raw heap memory
+# (mem_peek_byte/mem_poke_byte) for the output buffer, and rt_list_new/
+# rt_list_set for the Huffman decode tables, same convention as
+# image.patlang's own pixel buffer.
+#
+# Ported directly from the structure of puff.c (Mark Adler's own
+# minimal reference DEFLATE decoder, the same "canonical Huffman via
+# count-per-length + first-code-per-length + symbols-sorted-by-length"
+# table construction/decode algorithm, NOT a from-scratch design) --
+# that algorithm is well-known-correct and avoids building an explicit
+# tree structure, which would need a node/pointer representation this
+# codebase has no natural equivalent for. Bit order matches DEFLATE's
+# own spec exactly (RFC 1951 section 3.1.1): bits are consumed LSB-
+# first within each byte; multi-bit VALUE fields (block header, stored-
+# block length, HLIT/HDIST/HCLEN, extra bits) are assembled with the
+# first bit read as the value's low bit; Huffman CODES are the one
+# exception -- built MSB-first as bits are read (see infl_decode).
+#
+# Scope limit, named honestly: no output-buffer growth -- the caller
+# must pre-allocate out_buf sized to the EXACT expected decompressed
+# size. This is not a shortcut: PNG's own decompressed size is fully
+# determined by IHDR (height * (1 + bytes-per-row)) before decoding
+# ever starts, so image_png.patlang always knows the exact size up
+# front and a growable buffer would be unneeded complexity for this
+# codebase's only real caller.
+
+include "includes.patlang"
+
+# ---- bit-level reader (global state -- one inflate run at a time) ----
+
+make a function called infl_reset takes bytes, start_offset returns done
+  set_var("infl_bytes", bytes)
+  set_var("infl_pos", start_offset)
+  set_var("infl_bitbuf", 0)
+  set_var("infl_bitcnt", 0)
+  return true
+end
+
+make a function called infl_getbyte returns b
+  let bytes = get("__vars", "infl_bytes")
+  let pos = get("__vars", "infl_pos")
+  if pos >= bytes.length then
+    set_var("infl_pos", pos + 1)
+    return 0
+  end
+  set_var("infl_pos", pos + 1)
+  return char_code(bytes, pos)
+end
+
+make a function called infl_getbit returns bit
+  let cnt = get("__vars", "infl_bitcnt")
+  if cnt == 0 then
+    set_var("infl_bitbuf", infl_getbyte())
+    set_var("infl_bitcnt", 8)
+  end
+  let buf = get("__vars", "infl_bitbuf")
+  let bit = buf band 1
+  set_var("infl_bitbuf", buf shr 1)
+  set_var("infl_bitcnt", get("__vars", "infl_bitcnt") - 1)
+  return bit
+end
+
+# infl_getbits(n) -> an n-bit value, LSB-first (block header fields,
+# stored-block LEN/NLEN, HLIT/HDIST/HCLEN, length/distance extra bits).
+make a function called infl_getbits takes n returns v
+  let val = 0
+  let i = 0
+  while i < n do
+    let val = val bor (infl_getbit() shl i)
+    let i = i + 1
+  end
+  return val
+end
+
+# Discards any partial byte in the bit buffer -- needed before a
+# stored (uncompressed) block, which is always byte-aligned.
+make a function called infl_align_byte returns done
+  set_var("infl_bitbuf", 0)
+  set_var("infl_bitcnt", 0)
+  return true
+end
+
+# ---- canonical Huffman: construct + decode (puff.c's algorithm) ----
+
+# infl_construct(lengths, n) -> [count, symbol]: count is a 16-entry
+# list (index 0..15, count[len] = how many of the n symbols have code
+# length `len`); symbol is an n-entry list holding the n symbol values
+# sorted first by code length then by symbol value (the canonical
+# Huffman assignment order) -- exactly what infl_decode needs to map a
+# decoded (length, offset-within-that-length) pair back to a symbol.
+make a function called infl_construct takes lengths, n returns huff
+  let count = rt_list_new(16)
+  let li = 0
+  while li < 16 do
+    rt_list_set(count, li, 0)
+    let li = li + 1
+  end
+  let si = 0
+  while si < n do
+    let len = lengths[si]
+    rt_list_set(count, len, count[len] + 1)
+    let si = si + 1
+  end
+  let offs = rt_list_new(16)
+  rt_list_set(offs, 0, 0)
+  rt_list_set(offs, 1, 0)
+  let len2 = 1
+  while len2 < 15 do
+    rt_list_set(offs, len2 + 1, offs[len2] + count[len2])
+    let len2 = len2 + 1
+  end
+  let symbol = rt_list_new(n)
+  let sj = 0
+  while sj < n do
+    rt_list_set(symbol, sj, 0)
+    let sj = sj + 1
+  end
+  let sk = 0
+  while sk < n do
+    let len3 = lengths[sk]
+    if len3 != 0 then
+      rt_list_set(symbol, offs[len3], sk)
+      rt_list_set(offs, len3, offs[len3] + 1)
+    end
+    let sk = sk + 1
+  end
+  return [count, symbol]
+end
+
+# infl_decode(huff) -> the next symbol, decoded bit-by-bit against
+# huff's [count, symbol] tables. Huffman codes are the one place
+# DEFLATE packs bits MSB-first: each new bit read becomes the new LOW
+# bit of `code` (code = (code << 1) | bit), which is the standard
+# canonical-Huffman decode loop (puff.c's own `decode()`).
+make a function called infl_decode takes huff returns symbol_val
+  let count = huff[0]
+  let symtab = huff[1]
+  let code = 0
+  let first = 0
+  let index = 0
+  let len = 1
+  while len <= 15 do
+    let code = code bor infl_getbit()
+    let cnt = count[len]
+    if (code - cnt) < first then
+      return symtab[index + (code - first)]
+    end
+    let index = index + cnt
+    let first = first + cnt
+    let first = first shl 1
+    let code = code shl 1
+    let len = len + 1
+  end
+  return 0 - 1
+end
+
+# ---- RFC 1951 fixed tables ----
+
+make a function called infl_lbase returns t
+  return [3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258]
+end
+
+make a function called infl_lext returns t
+  return [0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0]
+end
+
+make a function called infl_dbase returns t
+  return [1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577]
+end
+
+make a function called infl_dext returns t
+  return [0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13]
+end
+
+make a function called infl_clcidx returns t
+  return [16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15]
+end
+
+make a function called infl_fixed_litlen_huff returns huff
+  let lengths = rt_list_new(288)
+  let i = 0
+  while i < 144 do
+    rt_list_set(lengths, i, 8)
+    let i = i + 1
+  end
+  while i < 256 do
+    rt_list_set(lengths, i, 9)
+    let i = i + 1
+  end
+  while i < 280 do
+    rt_list_set(lengths, i, 7)
+    let i = i + 1
+  end
+  while i < 288 do
+    rt_list_set(lengths, i, 8)
+    let i = i + 1
+  end
+  return infl_construct(lengths, 288)
+end
+
+make a function called infl_fixed_dist_huff returns huff
+  let lengths = rt_list_new(30)
+  let i = 0
+  while i < 30 do
+    rt_list_set(lengths, i, 5)
+    let i = i + 1
+  end
+  return infl_construct(lengths, 30)
+end
+
+# ---- dynamic Huffman tree header (RFC 1951 section 3.2.7) ----
+
+make a function called infl_dynamic_trees returns huffs
+  let hlit = infl_getbits(5) + 257
+  let hdist = infl_getbits(5) + 1
+  let hclen = infl_getbits(4) + 4
+  let order = infl_clcidx()
+  let cl_lengths = rt_list_new(19)
+  let i = 0
+  while i < 19 do
+    rt_list_set(cl_lengths, i, 0)
+    let i = i + 1
+  end
+  let j = 0
+  while j < hclen do
+    rt_list_set(cl_lengths, order[j], infl_getbits(3))
+    let j = j + 1
+  end
+  let cl_huff = infl_construct(cl_lengths, 19)
+
+  let total = hlit + hdist
+  let lengths = rt_list_new(total)
+  let k = 0
+  while k < total do
+    rt_list_set(lengths, k, 0)
+    let k = k + 1
+  end
+  let n = 0
+  while n < total do
+    let sym = infl_decode(cl_huff)
+    if sym < 16 then
+      rt_list_set(lengths, n, sym)
+      let n = n + 1
+    elif sym == 16 then
+      let prev = lengths[n - 1]
+      let rep = infl_getbits(2) + 3
+      let r = 0
+      while r < rep do
+        rt_list_set(lengths, n, prev)
+        let n = n + 1
+        let r = r + 1
+      end
+    elif sym == 17 then
+      let rep2 = infl_getbits(3) + 3
+      let r2 = 0
+      while r2 < rep2 do
+        rt_list_set(lengths, n, 0)
+        let n = n + 1
+        let r2 = r2 + 1
+      end
+    else
+      let rep3 = infl_getbits(7) + 11
+      let r3 = 0
+      while r3 < rep3 do
+        rt_list_set(lengths, n, 0)
+        let n = n + 1
+        let r3 = r3 + 1
+      end
+    end
+  end
+
+  let litlen_lengths = rt_list_new(hlit)
+  let a = 0
+  while a < hlit do
+    rt_list_set(litlen_lengths, a, lengths[a])
+    let a = a + 1
+  end
+  let dist_lengths = rt_list_new(hdist)
+  let b = 0
+  while b < hdist do
+    rt_list_set(dist_lengths, b, lengths[hlit + b])
+    let b = b + 1
+  end
+  return [infl_construct(litlen_lengths, hlit), infl_construct(dist_lengths, hdist)]
+end
+
+# ---- literal/length/distance decode loop (one compressed block) ----
+#
+# Returns the new out_pos, or -1 on overflow (out_size exceeded) or a
+# malformed/unsupported symbol -- checked so a corrupt/truncated PNG
+# fails cleanly (image_png.patlang reports [] like every other decoder
+# here) instead of writing past out_buf's real allocation.
+make a function called infl_decode_block takes litlen_huff, dist_huff, out_buf, out_pos, out_size returns new_pos
+  let pos = out_pos
+  let lbase = infl_lbase()
+  let lext = infl_lext()
+  let dbase = infl_dbase()
+  let dext = infl_dext()
+  let running = true
+  while running do
+    let sym = infl_decode(litlen_huff)
+    if sym < 0 then
+      return 0 - 1
+    elif sym < 256 then
+      if pos >= out_size then
+        return 0 - 1
+      end
+      mem_poke_byte(out_buf, pos, sym)
+      let pos = pos + 1
+    elif sym == 256 then
+      let running = false
+    else
+      let li = sym - 257
+      if li >= 29 then
+        return 0 - 1
+      end
+      let length = lbase[li] + infl_getbits(lext[li])
+      let dsym = infl_decode(dist_huff)
+      if (dsym < 0) or (dsym >= 30) then
+        return 0 - 1
+      end
+      let distance = dbase[dsym] + infl_getbits(dext[dsym])
+      if distance > pos then
+        return 0 - 1
+      end
+      if (pos + length) > out_size then
+        return 0 - 1
+      end
+      let c = 0
+      while c < length do
+        let src_byte = mem_peek_byte(out_buf, pos - distance)
+        mem_poke_byte(out_buf, pos, src_byte)
+        let pos = pos + 1
+        let c = c + 1
+      end
+    end
+  end
+  return pos
+end
+
+make a function called infl_stored_block takes out_buf, out_pos, out_size returns new_pos
+  infl_align_byte()
+  let len_lo = infl_getbyte()
+  let len_hi = infl_getbyte()
+  let len = len_lo + (len_hi * 256)
+  infl_getbyte()
+  infl_getbyte()
+  if (out_pos + len) > out_size then
+    return 0 - 1
+  end
+  let i = 0
+  while i < len do
+    mem_poke_byte(out_buf, out_pos + i, infl_getbyte())
+    let i = i + 1
+  end
+  return out_pos + len
+end
+
+# infl_run(bytes, start_offset, out_buf, out_size) -> total bytes
+# written to out_buf, or -1 on any error. `bytes` is the RAW DEFLATE
+# stream (no zlib header/trailer -- see zlib_inflate_to_buffer for
+# that): a sequence of blocks, each starting with a 3-bit header
+# (BFINAL, BTYPE), continuing until a BFINAL=1 block is fully decoded.
+make a function called infl_run takes bytes, start_offset, out_buf, out_size returns total
+  infl_reset(bytes, start_offset)
+  let pos = 0
+  let final = false
+  while final == false do
+    let bfinal = infl_getbits(1)
+    if bfinal == 1 then
+      let final = true
+    end
+    let btype = infl_getbits(2)
+    if btype == 0 then
+      let pos = infl_stored_block(out_buf, pos, out_size)
+    elif btype == 1 then
+      let pos = infl_decode_block(infl_fixed_litlen_huff(), infl_fixed_dist_huff(), out_buf, pos, out_size)
+    elif btype == 2 then
+      let trees = infl_dynamic_trees()
+      let pos = infl_decode_block(trees[0], trees[1], out_buf, pos, out_size)
+    else
+      return 0 - 1
+    end
+    if pos < 0 then
+      return 0 - 1
+    end
+  end
+  return pos
+end
+
+# zlib_inflate_to_buffer(bytes, out_buf, out_size) -> total bytes
+# written, or -1 on error. Skips zlib's 2-byte header (CMF, FLG) and
+# ignores the trailing 4-byte Adler-32 (no checksum verification --
+# a real, named scope limit: a corrupt stream either fails cleanly
+# inside infl_run's own bounds/symbol checks or produces wrong pixels,
+# same class of risk as any other decoder here with a malformed file;
+# adding Adler-32 verification is straightforward to add later if a
+# real corrupt-but-structurally-valid file is ever actually seen).
+make a function called zlib_inflate_to_buffer takes bytes, out_buf, out_size returns total
+  if bytes.length < 6 then
+    return 0 - 1
+  end
+  return infl_run(bytes, 2, out_buf, out_size)
+end
