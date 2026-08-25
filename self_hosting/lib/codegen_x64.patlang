@@ -2488,6 +2488,131 @@ make a function called x64_lock_release_asm returns asm
   return sb_str(sb)
 end
 
+# ---- g_fiber_table lock -- a SEPARATE CRITICAL_SECTION from g_scratch's
+# own (g_fiber_table_cs, not g_scratch_cs -- unrelated contention),
+# same lazy 3-state lock-cmpxchg-race pattern as x64_lock_acquire_asm/
+# _release_asm above. Needed because g_fiber_table's own mutation is
+# NOT guaranteed single-threaded the way g_threads_table's is: a
+# fiber's own body can legally call fiber_new itself (nested fibers).
+# Exposed to PatLang as two thin 0-arg CallHost primitives
+# (os_fiber_table_lock_acquire/_release below) rather than only spliced
+# inline, since the table logic itself lives in ordinary PatLang
+# (fibers_table_add/_row/_update_row, x64_runtime.patlang), not asm. ----
+make a function called x64_fiber_lock_acquire_asm takes suffix returns asm
+  let sb = sb_new()
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "  .flock_check_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rel g_fiber_table_cs_ready]" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 2" + x64_nl_char())
+  sb_push(sb, "    je .flock_ready_" + suffix + x64_nl_char())
+  sb_push(sb, "    xor rax, rax" + x64_nl_char())
+  sb_push(sb, "    mov rcx, 1" + x64_nl_char())
+  sb_push(sb, "    lock cmpxchg [rel g_fiber_table_cs_ready], rcx" + x64_nl_char())
+  sb_push(sb, "    jne .flock_spin_" + suffix + x64_nl_char())
+  sb_push(sb, "    lea rcx, [rel g_fiber_table_cs]" + x64_nl_char())
+  sb_push(sb, "    call InitializeCriticalSection" + x64_nl_char())
+  sb_push(sb, "    mov qword [rel g_fiber_table_cs_ready], 2" + x64_nl_char())
+  sb_push(sb, "    jmp .flock_ready_" + suffix + x64_nl_char())
+  sb_push(sb, "  .flock_spin_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    pause" + x64_nl_char())
+  sb_push(sb, "    jmp .flock_check_" + suffix + x64_nl_char())
+  sb_push(sb, "  .flock_ready_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [rel g_fiber_table_cs]" + x64_nl_char())
+  sb_push(sb, "    call EnterCriticalSection" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  return sb_str(sb)
+end
+
+make a function called x64_fiber_lock_release_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [rel g_fiber_table_cs]" + x64_nl_char())
+  sb_push(sb, "    call LeaveCriticalSection" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  return sb_str(sb)
+end
+
+make a function called x64_os_fiber_table_lock_acquire_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, x64_fiber_lock_acquire_asm(suffix))
+  sb_push(sb, "    push 0" + x64_nl_char())
+  return sb_str(sb)
+end
+
+make a function called x64_os_fiber_table_lock_release_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, x64_fiber_lock_release_asm())
+  sb_push(sb, "    push 0" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# ---- fiber TLS ("which fiber's handle is running on this thread") ----
+#
+# x64_fiber_tls_ensure_asm(suffix) is SPLICED inline (same convention
+# as x64_lock_acquire_asm), self-aligning, lazily TlsAlloc()'s a real
+# Windows TLS slot on first use (3-state lock-cmpxchg-race, same shape
+# as the locks above) -- g_fiber_tls_slot then holds a real per-process
+# TLS index, valid for the rest of the program's life. The slot's own
+# PER-THREAD value is the current fiber's raw handle address (0 on any
+# thread that's never been inside a fiber, including the main thread --
+# Windows' own TlsGetValue returns NULL for a never-set slot on a given
+# thread, which is exactly the "not running inside a fiber" sentinel
+# fiber.rs's CURRENT_FIBER thread-local uses).
+make a function called x64_fiber_tls_ensure_asm takes suffix returns asm
+  let sb = sb_new()
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "  .ftls_check_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rel g_fiber_tls_ready]" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 2" + x64_nl_char())
+  sb_push(sb, "    je .ftls_ready_" + suffix + x64_nl_char())
+  sb_push(sb, "    xor rax, rax" + x64_nl_char())
+  sb_push(sb, "    mov rcx, 1" + x64_nl_char())
+  sb_push(sb, "    lock cmpxchg [rel g_fiber_tls_ready], rcx" + x64_nl_char())
+  sb_push(sb, "    jne .ftls_spin_" + suffix + x64_nl_char())
+  sb_push(sb, "    call TlsAlloc" + x64_nl_char())
+  sb_push(sb, "    mov [rel g_fiber_tls_slot], rax" + x64_nl_char())
+  sb_push(sb, "    mov qword [rel g_fiber_tls_ready], 2" + x64_nl_char())
+  sb_push(sb, "    jmp .ftls_ready_" + suffix + x64_nl_char())
+  sb_push(sb, "  .ftls_spin_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    pause" + x64_nl_char())
+  sb_push(sb, "    jmp .ftls_check_" + suffix + x64_nl_char())
+  sb_push(sb, "  .ftls_ready_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# os_fiber_current_id() -> id (0 if not running inside a fiber). Reads
+# the TLS-stored handle address, then that handle's own [+8] id field
+# -- PatLang-level code (budget_check) needs the small id, not the raw
+# handle, to look up its own fiber_table row.
+make a function called x64_os_fiber_current_id_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, x64_fiber_tls_ensure_asm(suffix))
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    mov ecx, [rel g_fiber_tls_slot]" + x64_nl_char())
+  sb_push(sb, "    call TlsGetValue" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+  sb_push(sb, "    je .fcurid_none_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rax, [rax+8]" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    jmp .fcurid_end_" + suffix + x64_nl_char())
+  sb_push(sb, "  .fcurid_none_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    push 0" + x64_nl_char())
+  sb_push(sb, "  .fcurid_end_" + suffix + ":" + x64_nl_char())
+  return sb_str(sb)
+end
+
 # ---- file I/O (self-hosting-toward-x64, step 2 of 3: growable lists
 # already done, exec_capture still ahead) ----
 #
@@ -4004,6 +4129,289 @@ make a function called x64_thread_trampoline_asm returns asm
   sb_push(sb, "    pop rbp" + x64_nl_char())
   sb_push(sb, "    xor eax, eax" + x64_nl_char())
   sb_push(sb, "    ret" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# ---- Fibers: real-OS-thread-plus-condvar cooperative coroutines ----
+#
+# Ported from rust-runtime/src/ir/fiber.rs's own design (see that
+# file's module doc comment): NOT stack-switching -- each fiber gets a
+# real OS thread; an SRWLOCK+CONDITION_VARIABLE pair ensures only one
+# side (the fiber's own thread, or whichever fiber_resume caller is
+# waiting) is ever actually running PatLang code at a time, so the
+# parked thread's own native call stack IS the saved coroutine state.
+#
+# FiberHandle context block (rt_heap_alloc'd, 72 bytes, one per fiber):
+#   [0]  code_addr          -- the target function's entry label
+#   [8]  id                 -- this fiber's own small int id
+#   [16] srwlock            -- SRWLOCK, all-zero is its valid initial
+#   [24] condvar            -- CONDITION_VARIABLE, ditto
+#   [32] to_fiber_present   -- 0/1
+#   [40] to_fiber_value     -- set by fiber_resume, read by the fiber
+#   [48] from_fiber_tag     -- 0=none 1=Yielded 2=Done
+#   [56] from_fiber_value   -- set by the fiber (yield or return), read
+#                               by fiber_resume
+#   [64] alive               -- 1 until the target function returns
+#
+# patlang_fiber_trampoline is CreateThread's own entry point (DWORD
+# WINAPI (LPVOID) -- rcx=context on entry, same "one real global label,
+# gated behind owns_globals" pattern as patlang_thread_trampoline just
+# above -- see ITS header for why this must be gated). Unlike that
+# trampoline (which calls its target ONCE and exits), this one first
+# sets TLS to its own handle address, then waits for the FIRST resume
+# exactly the same way os_fiber_yield_asm waits for a later one --
+# "parked until first resume" needs no special case, it's the identical
+# wait-for-to_fiber logic. Calls the target with that delivered value
+# as its one argument (same push-one-arg/call/add-rsp,8 shape proven in
+# x64_callvalue_asm), then on return stores Done + wakes + ExitThreads.
+#
+# The context pointer lives in a real [rbp-N] local frame slot
+# throughout (never a register) -- this file's universal rule (no
+# register survives a call to a PatLang-convention function) applies to
+# the `call r12` into the target just as much as it did to
+# patlang_thread_trampoline's own identical fix; re-deriving it fresh
+# from [rbp-8] before each use sidesteps the whole question of which
+# registers any given WinAPI call happens to clobber, too.
+make a function called x64_fiber_trampoline_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "global patlang_fiber_trampoline" + x64_nl_char())
+  sb_push(sb, "patlang_fiber_trampoline:" + x64_nl_char())
+  sb_push(sb, "    push rbp" + x64_nl_char())
+  sb_push(sb, "    mov rbp, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    mov [rbp-8], rcx" + x64_nl_char())
+  # TLS = this fiber's own handle address (ctx itself).
+  sb_push(sb, x64_fiber_tls_ensure_asm(suffix))
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rbp-8]" + x64_nl_char())
+  sb_push(sb, "    mov ecx, [rel g_fiber_tls_slot]" + x64_nl_char())
+  sb_push(sb, "    mov rdx, rax" + x64_nl_char())
+  sb_push(sb, "    call TlsSetValue" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  # Wait for the first fiber_resume (identical shape to os_fiber_yield_
+  # asm's own wait-for-to_fiber loop, just inlined here since this is
+  # the thread's very first frame, not a separate CallHost primitive).
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rbp-8]" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [rax+16]" + x64_nl_char())
+  sb_push(sb, "    call AcquireSRWLockExclusive" + x64_nl_char())
+  sb_push(sb, "  .ftramp_waitfirst_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rbp-8]" + x64_nl_char())
+  sb_push(sb, "    cmp qword [rax+32], 0" + x64_nl_char())
+  sb_push(sb, "    jne .ftramp_gotfirst_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rax, [rbp-8]" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [rax+24]" + x64_nl_char())
+  sb_push(sb, "    lea rdx, [rax+16]" + x64_nl_char())
+  sb_push(sb, "    mov r8, 4294967295" + x64_nl_char())
+  sb_push(sb, "    xor r9, r9" + x64_nl_char())
+  sb_push(sb, "    call SleepConditionVariableSRW" + x64_nl_char())
+  sb_push(sb, "    jmp .ftramp_waitfirst_" + suffix + x64_nl_char())
+  sb_push(sb, "  .ftramp_gotfirst_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rbp-8]" + x64_nl_char())
+  sb_push(sb, "    mov rdx, [rax+40]" + x64_nl_char())
+  sb_push(sb, "    mov [rbp-16], rdx" + x64_nl_char())
+  sb_push(sb, "    mov qword [rax+32], 0" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rbp-8]" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [rax+16]" + x64_nl_char())
+  sb_push(sb, "    call ReleaseSRWLockExclusive" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  # Call the target function with the delivered value as its one arg.
+  sb_push(sb, "    mov rax, [rbp-8]" + x64_nl_char())
+  sb_push(sb, "    mov r12, [rax]" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rbp-16]" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    call r12" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, "    mov [rbp-24], rax" + x64_nl_char())
+  # Store Done + wake + exit.
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rbp-8]" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [rax+16]" + x64_nl_char())
+  sb_push(sb, "    call AcquireSRWLockExclusive" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rbp-8]" + x64_nl_char())
+  sb_push(sb, "    mov qword [rax+64], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rax+48], 2" + x64_nl_char())
+  sb_push(sb, "    mov rdx, [rbp-24]" + x64_nl_char())
+  sb_push(sb, "    mov [rax+56], rdx" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rbp-8]" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [rax+24]" + x64_nl_char())
+  sb_push(sb, "    call WakeConditionVariable" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rbp-8]" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [rax+16]" + x64_nl_char())
+  sb_push(sb, "    call ReleaseSRWLockExclusive" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    mov rsp, rbp" + x64_nl_char())
+  sb_push(sb, "    pop rbp" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    xor ecx, ecx" + x64_nl_char())
+  sb_push(sb, "    call ExitThread" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# os_fiber_spawn(code_addr, id) -> raw handle address (untagged --
+# fibers_table_add, x64_runtime.patlang, wraps it alongside the small
+# id, same "never expose a bare heap address directly" convention as
+# os_thread_spawn_raw). code_addr comes from resolve_func_addr (the
+# apply-table scan, x64_runtime.patlang) -- id is allocated by the
+# CALLER (fiber_new, atomically, via rt_atomic_fetch_add) BEFORE this
+# is called, specifically so patlang_fiber_trampoline can set TLS to
+# the right handle from its very first instruction, with no race
+# against fibers_table_add happening on a different thread afterward.
+make a function called x64_os_fiber_spawn_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    pop r13" + x64_nl_char())
+  sb_push(sb, "    pop r12" + x64_nl_char())
+  sb_push(sb, "    push r12" + x64_nl_char())
+  sb_push(sb, "    push r13" + x64_nl_char())
+  sb_push(sb, "    mov rax, 72" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    call rt_heap_alloc" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, "    pop r13" + x64_nl_char())
+  sb_push(sb, "    pop r12" + x64_nl_char())
+  sb_push(sb, "    mov [rax], r12" + x64_nl_char())
+  sb_push(sb, "    mov [rax+8], r13" + x64_nl_char())
+  sb_push(sb, "    mov qword [rax+16], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rax+24], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rax+32], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rax+40], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rax+48], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rax+56], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rax+64], 1" + x64_nl_char())
+  sb_push(sb, "    mov r12, rax" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 48" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    xor rcx, rcx" + x64_nl_char())
+  sb_push(sb, "    xor rdx, rdx" + x64_nl_char())
+  sb_push(sb, "    lea r8, [rel patlang_fiber_trampoline]" + x64_nl_char())
+  sb_push(sb, "    mov r9, r12" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+32], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+40], 0" + x64_nl_char())
+  sb_push(sb, "    call CreateThread" + x64_nl_char())
+  sb_push(sb, "    mov rcx, rax" + x64_nl_char())
+  sb_push(sb, "    call CloseHandle" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    push r12" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# os_fiber_resume(handle_addr, arg) -> value. Blocks the CALLING thread
+# (which may itself be another fiber's own thread, or the main thread)
+# until the target fiber yields or returns. handle_addr/arg held in
+# r12/r13 throughout -- both are genuine WinAPI calls below (Acquire/
+# ReleaseSRWLockExclusive, Sleep/WakeConditionVariable), and r12-r15
+# (unlike r11 -- see the clipboard bug this same session found and
+# fixed) ARE preserved across a real Win64 ABI call.
+make a function called x64_os_fiber_resume_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "    pop r13" + x64_nl_char())
+  sb_push(sb, "    pop r12" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [r12+16]" + x64_nl_char())
+  sb_push(sb, "    call AcquireSRWLockExclusive" + x64_nl_char())
+  sb_push(sb, "    cmp qword [r12+64], 0" + x64_nl_char())
+  sb_push(sb, "    je .fresume_dead_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov [r12+40], r13" + x64_nl_char())
+  sb_push(sb, "    mov qword [r12+32], 1" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [r12+24]" + x64_nl_char())
+  sb_push(sb, "    call WakeConditionVariable" + x64_nl_char())
+  sb_push(sb, "  .fresume_wait_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    cmp qword [r12+48], 0" + x64_nl_char())
+  sb_push(sb, "    jne .fresume_got_" + suffix + x64_nl_char())
+  sb_push(sb, "    lea rcx, [r12+24]" + x64_nl_char())
+  sb_push(sb, "    lea rdx, [r12+16]" + x64_nl_char())
+  sb_push(sb, "    mov r8, 4294967295" + x64_nl_char())
+  sb_push(sb, "    xor r9, r9" + x64_nl_char())
+  sb_push(sb, "    call SleepConditionVariableSRW" + x64_nl_char())
+  sb_push(sb, "    jmp .fresume_wait_" + suffix + x64_nl_char())
+  sb_push(sb, "  .fresume_got_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov r14, [r12+56]" + x64_nl_char())
+  sb_push(sb, "    mov qword [r12+48], 0" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [r12+16]" + x64_nl_char())
+  sb_push(sb, "    call ReleaseSRWLockExclusive" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    push r14" + x64_nl_char())
+  sb_push(sb, "    jmp .fresume_end_" + suffix + x64_nl_char())
+  sb_push(sb, "  .fresume_dead_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [r12+16]" + x64_nl_char())
+  sb_push(sb, "    call ReleaseSRWLockExclusive" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    push 0" + x64_nl_char())
+  sb_push(sb, "  .fresume_end_" + suffix + ":" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# os_fiber_yield(value) -> value (whatever the next os_fiber_resume
+# delivers). Must be called from inside a fiber's own thread -- finds
+# its own handle via TLS (see x64_fiber_tls_ensure_asm's own header),
+# no id/handle parameter, matching fiber_yield's real signature.
+make a function called x64_os_fiber_yield_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "    pop r13" + x64_nl_char())
+  sb_push(sb, x64_fiber_tls_ensure_asm(suffix))
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    mov ecx, [rel g_fiber_tls_slot]" + x64_nl_char())
+  sb_push(sb, "    call TlsGetValue" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    mov r12, rax" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [r12+16]" + x64_nl_char())
+  sb_push(sb, "    call AcquireSRWLockExclusive" + x64_nl_char())
+  sb_push(sb, "    mov [r12+56], r13" + x64_nl_char())
+  sb_push(sb, "    mov qword [r12+48], 1" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [r12+24]" + x64_nl_char())
+  sb_push(sb, "    call WakeConditionVariable" + x64_nl_char())
+  sb_push(sb, "  .fyield_wait_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    cmp qword [r12+32], 0" + x64_nl_char())
+  sb_push(sb, "    jne .fyield_got_" + suffix + x64_nl_char())
+  sb_push(sb, "    lea rcx, [r12+24]" + x64_nl_char())
+  sb_push(sb, "    lea rdx, [r12+16]" + x64_nl_char())
+  sb_push(sb, "    mov r8, 4294967295" + x64_nl_char())
+  sb_push(sb, "    xor r9, r9" + x64_nl_char())
+  sb_push(sb, "    call SleepConditionVariableSRW" + x64_nl_char())
+  sb_push(sb, "    jmp .fyield_wait_" + suffix + x64_nl_char())
+  sb_push(sb, "  .fyield_got_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov r14, [r12+40]" + x64_nl_char())
+  sb_push(sb, "    mov qword [r12+32], 0" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [r12+16]" + x64_nl_char())
+  sb_push(sb, "    call ReleaseSRWLockExclusive" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    push r14" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# os_fiber_alive(handle_addr) -> bool.
+make a function called x64_os_fiber_alive_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    pop r12" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [r12+16]" + x64_nl_char())
+  sb_push(sb, "    call AcquireSRWLockExclusive" + x64_nl_char())
+  sb_push(sb, "    mov r14, [r12+64]" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [r12+16]" + x64_nl_char())
+  sb_push(sb, "    call ReleaseSRWLockExclusive" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    push r14" + x64_nl_char())
   return sb_str(sb)
 end
 
@@ -6456,6 +6864,36 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
     sb_push(sb, x64_win_clipboard_get_text_asm())
   elif name == "os_thread_spawn_raw" then
     sb_push(sb, x64_os_thread_spawn_raw_asm())
+  elif name == "os_fiber_spawn" then
+    sb_push(sb, x64_os_fiber_spawn_asm())
+  elif name == "os_fiber_resume" then
+    sb_push(sb, x64_os_fiber_resume_asm())
+  elif name == "os_fiber_yield" then
+    sb_push(sb, x64_os_fiber_yield_asm())
+  elif name == "os_fiber_alive" then
+    sb_push(sb, x64_os_fiber_alive_asm())
+  elif name == "os_fiber_current_id" then
+    sb_push(sb, x64_os_fiber_current_id_asm())
+  elif name == "os_fiber_table_lock_acquire" then
+    sb_push(sb, x64_os_fiber_table_lock_acquire_asm())
+  elif name == "os_fiber_table_lock_release" then
+    sb_push(sb, x64_os_fiber_table_lock_release_asm())
+  elif name == "budgeted_run" then
+    # lower.patlang's own lower_budgeted_literal emits this as a raw
+    # CallHost op UNCONDITIONALLY (see its header there) -- it never
+    # goes through the ordinary "is this name a real function?" Call
+    # path, even though budgeted_run IS one (x64_runtime.patlang), so
+    # it needs its own thin bridge here: same call/add-rsp/push-rax
+    # shape the ordinary "Call" instruction case uses (this file's own
+    # x64_emit_instr, the "ty == Call" branch), just reached via
+    # CallHost dispatch instead.
+    sb_push(sb, "    call " + x64_asm_label_for_func("budgeted_run") + x64_nl_char())
+    sb_push(sb, "    add rsp, 32" + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
+  elif name == "budget_check" then
+    # Same bridge as budgeted_run just above, 0 args (nothing to pop).
+    sb_push(sb, "    call " + x64_asm_label_for_func("budget_check") + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
   elif name == "win_canvas_resize" then
     sb_push(sb, x64_win_canvas_resize_asm())
   elif name == "win_peek_message" then
@@ -6814,6 +7252,19 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
         # exposed directly as a PatLang value risks colliding with this
         # backend's own tag-bit scheme).
         sb_push(sb, "    lea rax, [rel g_threads_table]" + x64_nl_char())
+        sb_push(sb, "    push rax" + x64_nl_char())
+      elif name == "mem_fiber_table_addr" then
+        # fibers_table_add/_row/_update_row's global [id, handle_addr,
+        # deadline_ms, last_check_ms, durations_list] table -- same
+        # shape/reason as g_threads_table just above.
+        sb_push(sb, "    lea rax, [rel g_fiber_table]" + x64_nl_char())
+        sb_push(sb, "    push rax" + x64_nl_char())
+      elif name == "mem_fiber_id_ctr_addr" then
+        # fiber_new's atomically-bumped (rt_atomic_fetch_add) id
+        # counter -- NOT set_var/get-backed, since fiber_new may
+        # legally be called from a fiber's own thread (nested fibers),
+        # unlike thread_spawn's own logic_next_thread_id.
+        sb_push(sb, "    lea rax, [rel g_fiber_id_ctr]" + x64_nl_char())
         sb_push(sb, "    push rax" + x64_nl_char())
       elif name == "mem_wsa_init_addr" then
         # Lazy WSAStartup-done flag -- same lazy-init-on-first-use
@@ -8717,6 +9168,14 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
   # "In low memory situations... raises a STATUS_NO_MEMORY exception",
   # not a return-value failure this code needs to check).
   sb_push(sb, "extern CreateThread, ExitThread, InitializeCriticalSection, EnterCriticalSection, LeaveCriticalSection" + x64_nl_char())
+  # Fibers (fiber_new/fiber_resume/fiber_yield/fiber_alive, budgeted_run/
+  # budget_check): real-OS-thread-plus-condvar cooperative coroutines,
+  # ported from rust-runtime/src/ir/fiber.rs's own design (see
+  # patlang_fiber_trampoline's own header). SRWLOCK/CONDITION_VARIABLE
+  # are both single pointer-sized fields whose all-zero state is their
+  # valid initial state (documented Windows behavior), unlike
+  # CRITICAL_SECTION -- no Initialize* call needed for either.
+  sb_push(sb, "extern TlsAlloc, TlsGetValue, TlsSetValue, AcquireSRWLockExclusive, ReleaseSRWLockExclusive, SleepConditionVariableSRW, WakeConditionVariable" + x64_nl_char())
   # (GetExitCodeProcess was already externed above, for kill()'s own
   # unrelated use elsewhere -- x64_os_exec_run_asm's new use of it,
   # right above, needed no new extern entry.)
@@ -8743,7 +9202,7 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
   sb_push(sb, x64_nl_char())
   sb_push(sb, "section .bss" + x64_nl_char())
   if owns_globals then
-    sb_push(sb, "    global g_written, g_scratch, g_scratch2, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init, g_last_recv_error, g_vfs_table, g_classes_table, g_goal_defs_table, g_finddata, g_last_exec_exit_code, g_hwnd, g_canvas_buf, g_canvas_w, g_canvas_h, g_mem_dc, g_msg_scratch, g_paintstruct_scratch, g_bmih_scratch, g_conpty_hpc, g_conpty_in_write, g_conpty_out_read, g_conpty_process, g_pta_list, g_pta_size, g_startupinfoex, g_process_info, g_scratch_cs, g_scratch_cs_ready, g_threads_table, g_resize_pending, g_resize_w, g_resize_h" + x64_nl_char())
+    sb_push(sb, "    global g_written, g_scratch, g_scratch2, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init, g_last_recv_error, g_vfs_table, g_classes_table, g_goal_defs_table, g_finddata, g_last_exec_exit_code, g_hwnd, g_canvas_buf, g_canvas_w, g_canvas_h, g_mem_dc, g_msg_scratch, g_paintstruct_scratch, g_bmih_scratch, g_conpty_hpc, g_conpty_in_write, g_conpty_out_read, g_conpty_process, g_pta_list, g_pta_size, g_startupinfoex, g_process_info, g_scratch_cs, g_scratch_cs_ready, g_threads_table, g_resize_pending, g_resize_w, g_resize_h, g_fiber_tls_slot, g_fiber_tls_ready, g_fiber_table_cs, g_fiber_table_cs_ready, g_fiber_table, g_fiber_id_ctr" + x64_nl_char())
     sb_push(sb, "    align 8" + x64_nl_char())
     sb_push(sb, "    g_written resd 1" + x64_nl_char())
     sb_push(sb, "    align 8" + x64_nl_char())
@@ -8910,8 +9369,33 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
     sb_push(sb, "    g_resize_pending resq 1" + x64_nl_char())
     sb_push(sb, "    g_resize_w resq 1" + x64_nl_char())
     sb_push(sb, "    g_resize_h resq 1" + x64_nl_char())
+    sb_push(sb, "    align 8" + x64_nl_char())
+    # Fibers. g_fiber_tls_slot/_ready: lazy one-time TlsAlloc(), same
+    # 3-state lock cmpxchg race as g_scratch_cs_ready just above -- the
+    # TLS slot holds the CURRENT fiber's own handle address (0 outside
+    # any fiber), set once by patlang_fiber_trampoline at thread start,
+    # read by os_fiber_yield/os_fiber_current_id. g_fiber_table_cs/
+    # _ready: a SEPARATE CRITICAL_SECTION from g_scratch's own (not
+    # shared -- unrelated contention) protecting g_fiber_table's list
+    # structure, needed because unlike g_threads_table (only ever
+    # mutated from the main thread by convention), a fiber's own body
+    # can legally call fiber_new itself (nested fibers), so table
+    # mutation here is NOT guaranteed single-threaded. g_fiber_table:
+    # [id, handle_addr, deadline_ms, last_check_ms, durations_list]
+    # rows (see fibers_table_add, x64_runtime.patlang). g_fiber_id_ctr:
+    # atomically bumped (rt_atomic_fetch_add) for id allocation, NOT
+    # via set_var/get (g_vars_table is unsafe for fiber_new's own
+    # possible cross-thread callers -- see fiber_table's own header).
+    sb_push(sb, "    g_fiber_tls_slot resq 1" + x64_nl_char())
+    sb_push(sb, "    g_fiber_tls_ready resq 1" + x64_nl_char())
+    sb_push(sb, "    g_fiber_table_cs_ready resq 1" + x64_nl_char())
+    sb_push(sb, "    align 8" + x64_nl_char())
+    sb_push(sb, "    g_fiber_table_cs resb 40" + x64_nl_char())
+    sb_push(sb, "    align 8" + x64_nl_char())
+    sb_push(sb, "    g_fiber_table resq 1" + x64_nl_char())
+    sb_push(sb, "    g_fiber_id_ctr resq 1" + x64_nl_char())
   else
-    sb_push(sb, "extern g_written, g_scratch, g_scratch2, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init, g_last_recv_error, g_vfs_table, g_classes_table, g_goal_defs_table, g_finddata, g_last_exec_exit_code, g_hwnd, g_canvas_buf, g_canvas_w, g_canvas_h, g_mem_dc, g_msg_scratch, g_paintstruct_scratch, g_bmih_scratch, g_conpty_hpc, g_conpty_in_write, g_conpty_out_read, g_conpty_process, g_pta_list, g_pta_size, g_startupinfoex, g_process_info, g_scratch_cs, g_scratch_cs_ready, g_threads_table, g_resize_pending, g_resize_w, g_resize_h" + x64_nl_char())
+    sb_push(sb, "extern g_written, g_scratch, g_scratch2, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init, g_last_recv_error, g_vfs_table, g_classes_table, g_goal_defs_table, g_finddata, g_last_exec_exit_code, g_hwnd, g_canvas_buf, g_canvas_w, g_canvas_h, g_mem_dc, g_msg_scratch, g_paintstruct_scratch, g_bmih_scratch, g_conpty_hpc, g_conpty_in_write, g_conpty_out_read, g_conpty_process, g_pta_list, g_pta_size, g_startupinfoex, g_process_info, g_scratch_cs, g_scratch_cs_ready, g_threads_table, g_resize_pending, g_resize_w, g_resize_h, g_fiber_tls_slot, g_fiber_tls_ready, g_fiber_table_cs, g_fiber_table_cs_ready, g_fiber_table, g_fiber_id_ctr" + x64_nl_char())
     # patlang_wndproc_trampoline AND the two fixed wide-string data
     # labels are only DEFINED by the owns_globals unit (see x64_win_
     # data_and_trampoline_asm, only emitted there) -- every other unit
@@ -8921,7 +9405,7 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
     # singleton-symbol pattern as g_hwnd etc just above. (First cut of
     # this missed g_win_class_name/g_win_title specifically -- caught
     # by a real NASM "symbol not defined" error, not by review.)
-    sb_push(sb, "extern patlang_wndproc_trampoline, g_win_class_name, g_win_title, patlang_thread_trampoline" + x64_nl_char())
+    sb_push(sb, "extern patlang_wndproc_trampoline, g_win_class_name, g_win_title, patlang_thread_trampoline, patlang_fiber_trampoline" + x64_nl_char())
   end
   sb_push(sb, x64_nl_char())
   sb_push(sb, "section .data" + x64_nl_char())
@@ -8941,6 +9425,8 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
     sb_push(sb, x64_win_data_and_trampoline_asm())
     sb_push(sb, x64_nl_char())
     sb_push(sb, x64_thread_trampoline_asm())
+    sb_push(sb, x64_nl_char())
+    sb_push(sb, x64_fiber_trampoline_asm())
     sb_push(sb, x64_nl_char())
   end
   sb_push(sb, "section .text" + x64_nl_char())

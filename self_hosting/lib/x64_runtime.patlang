@@ -4597,6 +4597,274 @@ make a function called thread_result takes id returns value
   return mem_peek_qword(ctx_addr, 24)
 end
 
+# ---- Fibers: cooperative, real-OS-thread-backed coroutines
+# (fiber_new/fiber_resume/fiber_yield/fiber_alive), plus budgeted(ms)
+# { ... } sugar (budgeted_run/budget_check, emitted by lower.patlang's
+# own lower_budgeted_literal -- see its header there for the exact
+# CallHost shape this must match). Ported from rust-runtime/src/ir/
+# fiber.rs's real-thread-plus-condvar design (see codegen_x64.patlang's
+# own "Fibers" section header for why, and the FiberHandle layout). The
+# native os_fiber_* primitives there own only the thread/lock/condvar
+# handshake itself; everything else here -- the id table, budget
+# deadline tracking, the regression predictor -- is ordinary PatLang,
+# matching this file's/apply()'s own stated "narrow native primitives,
+# runtime logic in PatLang" philosophy.
+#
+# fiber_table rows are [id, handle_addr, deadline_ms, last_check_ms,
+# durations_list]; id starts at 1 (0 is os_fiber_current_id's own
+# "not running inside a fiber" sentinel). Table mutation is protected
+# by os_fiber_table_lock_acquire/_release (a SEPARATE CRITICAL_SECTION
+# from g_scratch's own) because, unlike thread_spawn's threads_table
+# (only ever mutated from the main thread by convention), a fiber's own
+# body can legally call fiber_new itself (nested fibers) -- so table
+# writes here are NOT guaranteed single-threaded. A given row's own
+# budget fields (deadline/last_check/durations), by contrast, are only
+# ever touched either by budgeted_run between resumes (while that
+# fiber is provably parked) or by that fiber's own thread while running
+# (never both at once) -- the same non-overlapping guarantee the
+# condvar handshake already gives to_fiber/from_fiber, so no separate
+# per-row lock is needed for those fields beyond the table lock already
+# serializing the list structure itself.
+make a function called logic_fibers_list returns l
+  let addr = mem_fiber_table_addr()
+  let l = mem_peek_qword(addr, 0)
+  if l == 0 then
+    let l = rt_list_new(0)
+    mem_poke_qword(addr, 0, l)
+  end
+  return l
+end
+
+make a function called logic_fibers_list_set takes l returns done
+  mem_poke_qword(mem_fiber_table_addr(), 0, l)
+  return true
+end
+
+make a function called fibers_table_add takes id, handle_addr returns done
+  os_fiber_table_lock_acquire()
+  let fibers = logic_fibers_list()
+  let fibers = rt_list_push(fibers, [id, handle_addr, 0 - 1, 0 - 1, []])
+  logic_fibers_list_set(fibers)
+  os_fiber_table_lock_release()
+  return true
+end
+
+# fibers_table_row(id) -> the row (a 5-element list) or false if id is
+# unknown.
+make a function called fibers_table_row takes id returns row
+  os_fiber_table_lock_acquire()
+  let fibers = logic_fibers_list()
+  let n = fibers.length
+  let i = 0
+  let found = 0 - 1
+  while i < n do
+    if fibers[i][0] == id then
+      let found = i
+    end
+    let i = i + 1
+  end
+  let row = false
+  if found != (0 - 1) then
+    let row = fibers[found]
+  end
+  os_fiber_table_lock_release()
+  return row
+end
+
+# fibers_table_update_row(id, deadline_ms, last_check_ms, durations) --
+# replaces an existing row's own trailing three fields (id/handle_addr
+# never change after fibers_table_add). The lock here protects the
+# LIST structure against a concurrent, unrelated fiber_new appending at
+# the same moment -- not this row's own fields against a second writer,
+# which this section's own header explains can't happen.
+make a function called fibers_table_update_row takes id, deadline_ms, last_check_ms, durations returns done
+  os_fiber_table_lock_acquire()
+  let fibers = logic_fibers_list()
+  let n = fibers.length
+  let out = []
+  let i = 0
+  while i < n do
+    if fibers[i][0] == id then
+      let out = rt_list_push(out, [id, fibers[i][1], deadline_ms, last_check_ms, durations])
+    else
+      let out = rt_list_push(out, fibers[i])
+    end
+    let i = i + 1
+  end
+  logic_fibers_list_set(out)
+  os_fiber_table_lock_release()
+  return true
+end
+
+# fiber_new(fname) -> id, or -1 if no function named fname exists in
+# this build. The id is allocated (atomically -- rt_atomic_fetch_add,
+# not set_var/get, since this may run on a fiber's own thread) BEFORE
+# spawning, specifically so patlang_fiber_trampoline can set TLS to the
+# right handle from its very first instruction with no ordering race
+# against fibers_table_add running on a different thread afterward --
+# see os_fiber_spawn's own header in codegen_x64.patlang.
+make a function called fiber_new takes fname returns id
+  let addr = resolve_func_addr(fname)
+  if addr == (0 - 1) then
+    return 0 - 1
+  end
+  let id = rt_atomic_fetch_add(mem_fiber_id_ctr_addr(), 1) + 1
+  let handle = os_fiber_spawn(addr, id)
+  fibers_table_add(id, handle)
+  return id
+end
+
+# fiber_resume(id, arg) -> the value the fiber yielded, or its final
+# return value if this resume caused it to finish. Blocks the calling
+# thread (which may itself be another fiber, or the main thread) until
+# the target fiber yields or returns.
+make a function called fiber_resume takes id, arg returns value
+  let row = fibers_table_row(id)
+  if row == false then
+    return 0 - 1
+  end
+  return os_fiber_resume(row[1], arg)
+end
+
+# fiber_yield(value) -> whatever the next fiber_resume(id, arg) passes
+# in. Must be called from inside a fiber's own thread -- no id
+# parameter, matching the real fiber_yield signature (os_fiber_yield
+# finds its own handle via TLS).
+make a function called fiber_yield takes value returns delivered
+  return os_fiber_yield(value)
+end
+
+# fiber_alive(id) -> Bool. True until the fiber's function has returned
+# and its final Done message has been consumed by a resume.
+make a function called fiber_alive takes id returns is_alive
+  let row = fibers_table_row(id)
+  if row == false then
+    return false
+  end
+  return os_fiber_alive(row[1])
+end
+
+# budgeted_run(ms, func_name, captured, existing) -- the runtime half
+# of `budgeted(ms) { ... }` (see lower.patlang's lower_budgeted_literal
+# for the exact call shape this must match: existing is Bool(false) on
+# the very first call for a given block, per the parser's own default
+# for the omitted second arg). Direct port of fiber.rs's budgeted_run.
+make a function called budgeted_run takes ms, func_name, captured, existing returns out
+  let first_call = existing == false
+  if first_call then
+    let id = fiber_new(func_name)
+  else
+    let id = existing
+  end
+  let deadline = now_ms() + ms
+  fibers_table_update_row(id, deadline, 0 - 1, [])
+  if first_call then
+    let result = fiber_resume(id, captured)
+  else
+    let result = fiber_resume(id, 0)
+  end
+  if fiber_alive(id) then
+    return ["paused", id]
+  else
+    return ["done", result]
+  end
+end
+
+# predict_next_duration_ms(samples) -- direct port of fiber.rs's OLS-
+# regression-with-a-floor predictor: fits a line through recent
+# per-iteration durations and extrapolates one step past the last
+# sample, clamped to never predict below the most recent sample (a
+# flat or noisy-but-not-trending series still predicts its own worst
+# recent case, not an average that could understate a spike).
+make a function called predict_next_duration_ms takes samples returns predicted
+  let n = samples.length
+  if n == 0 then
+    return 0
+  end
+  if n < 2 then
+    return samples[n - 1]
+  end
+  let sum_x = 0
+  let sum_y = 0
+  let sum_xy = 0
+  let sum_xx = 0
+  let recent_max = samples[0]
+  let i = 0
+  while i < n do
+    let x = to_num(i)
+    let y = samples[i]
+    let sum_x = sum_x + x
+    let sum_y = sum_y + y
+    let sum_xy = sum_xy + (x * y)
+    let sum_xx = sum_xx + (x * x)
+    if y > recent_max then
+      let recent_max = y
+    end
+    let i = i + 1
+  end
+  let n_f = to_num(n)
+  let denom = (n_f * sum_xx) - (sum_x * sum_x)
+  if denom == 0 then
+    let slope = 0
+    let intercept = sum_y / n_f
+  else
+    let slope = ((n_f * sum_xy) - (sum_x * sum_y)) / denom
+    let intercept = (sum_y - (slope * sum_x)) / n_f
+  end
+  let estimate = (slope * n_f) + intercept
+  if estimate < 0 then
+    let estimate = 0
+  end
+  if estimate < recent_max then
+    return recent_max
+  end
+  return estimate
+end
+
+# budget_check() -- called at every while-loop back-edge lexically
+# inside a budgeted(ms) { ... } block (lower.patlang's own while-loop
+# lowering, when budgeted_depth_get() > 0). A no-op when not running
+# inside any fiber (os_fiber_current_id() returns 0), matching
+# fiber.rs's own fail-safe behavior for the same case.
+make a function called budget_check returns done
+  let id = os_fiber_current_id()
+  if id == 0 then
+    return true
+  end
+  let row = fibers_table_row(id)
+  if row == false then
+    return true
+  end
+  let deadline = row[2]
+  let last_check = row[3]
+  let durations = row[4]
+  let now = now_ms()
+  if last_check != (0 - 1) then
+    let dur = now - last_check
+    if dur < 0 then
+      let dur = 0
+    end
+    let durations = rt_list_push(durations, dur)
+    if durations.length > 16 then
+      let trimmed = []
+      let j = 1
+      while j < durations.length do
+        let trimmed = rt_list_push(trimmed, durations[j])
+        let j = j + 1
+      end
+      let durations = trimmed
+    end
+  end
+  fibers_table_update_row(id, deadline, now, durations)
+  let predicted = predict_next_duration_ms(durations)
+  if deadline != (0 - 1) then
+    if (now + predicted) >= deadline then
+      fiber_yield(0)
+    end
+  end
+  return true
+end
+
 make a function called tcp_listen takes port returns actual
   os_wsa_startup()
   let sock = os_socket_tcp()
@@ -5287,16 +5555,29 @@ end
 # matching scan lives here, in ordinary PatLang (reusing the already-
 # proven rt_str_eq), with only the table lookup and the indirect call
 # itself as native primitives.
-make a function called apply takes fname returns result
+# resolve_func_addr(fname) -- the actual name-matching scan (factored
+# out of apply() so fiber_new, below, can reuse it too: it needs the
+# raw callable address to hand to a fiber-spawn primitive instead of
+# calling it synchronously the way apply()'s own os_call_indirect
+# does). Returns -1 if no function of that name exists in this build.
+make a function called resolve_func_addr takes fname returns addr
   let count = os_apply_table_count()
   let i = 0
   while i < count do
     if rt_str_eq(fname, os_apply_table_name_at(i)) then
-      return os_call_indirect(os_apply_table_func_at(i))
+      return os_apply_table_func_at(i)
     end
     let i = i + 1
   end
-  return false
+  return 0 - 1
+end
+
+make a function called apply takes fname returns result
+  let addr = resolve_func_addr(fname)
+  if addr == (0 - 1) then
+    return false
+  end
+  return os_call_indirect(addr)
 end
 
 # fact/query/goal -- the legacy flat 2-arg fact-store trio (superseded
