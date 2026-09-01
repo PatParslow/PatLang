@@ -1,0 +1,163 @@
+# ---- Design C, multi-step: drive synthesize_from_examples's own
+# candidate-generation machinery (sbe_build_calls/sbe_index_*, the same
+# type-directed, contract-checked primitive registry) but hand the
+# resulting search graph to the GOAP planner (action_add/plan(),
+# rust-runtime/src/ir/hosts.rs) instead of our own hand-rolled bucket
+# scan, to see whether its own state-deduplicated Dijkstra search reaches
+# the same answers -- and at what cost -- on the same real cases
+# (self_hosting/examples/_tmp_goap_synth_poc.patlang and _multi.patlang
+# proved the single-primitive-call shape works first).
+#
+# Design: every candidate node, at every level, becomes a ground GOAP
+# fact/action pair:
+#   - a "slot key" is sbe_output_key(node, examples, registry) -- the
+#     SAME multi-example value-tuple identity synthesize_from_examples
+#     already uses for its own `seen` dedup, so two structurally
+#     different nodes that behave identically across every example
+#     collapse onto the same GOAP fact, exactly like today's dedup.
+#   - action_add("produce:"+key, <preconditions: the arg nodes' own
+#     keys>, [[has_value,[key,"1"]]], [], 1) makes that value reachable
+#     once its inputs are.
+#   - if a key matches every example's expected output simultaneously
+#     (goap_expected_key), a zero-cost "select:"+key action bridges it to
+#     a single ground goal fact has_value(GOAL,"1").
+# plan() then does real uniform-cost search for the cheapest (smallest)
+# reachable composition -- letting the planner choose is what actually
+# tests whether GOAP's own search adds anything over the enumerator's
+# scan, since candidate GENERATION and per-candidate EVALUATION cost are
+# otherwise identical to synthesize_from_examples (this deliberately
+# reuses sbe_build_calls/sbe_output_key rather than reinventing them).
+#
+# Known, load-bearing limitation this file does NOT attempt to fix:
+# ACTIONS (rust-runtime/src/ir/hosts.rs) has no sliding-window eviction
+# equivalent to sbe_window_size() -- every action ever registered stays
+# for the life of the process, and plan() clones the full action vec on
+# every call. This is exactly the unbounded-growth shape Design B was
+# built to fix for the enumerator's own index; unifying with GOAP for
+# real would need an equivalent bound on ACTIONS before it could safely
+# attempt the full two-list first_exceeding case (issue #73) the
+# enumerator already solved. This file is scoped to proving/measuring
+# the translation on smaller cases, per the plan's explicit caution not
+# to push through to a harder case before the smaller one "cleanly falls
+# out."
+
+include "synthesis_by_example.patlang"
+
+make a function called goap_expected_key takes examples returns key
+  let out = sb_new()
+  let i = 0
+  let n = to_num(list_len(examples))
+  while i < n do
+    let ex = examples[i]
+    sb_push(out, "1:" + ("" + ex[1]) + "|")
+    let i = i + 1
+  end
+  return sb_str(out)
+end
+
+make a function called goap_preconds_for_args takes args, examples, registry returns preconds
+  let out = []
+  let i = 0
+  let n = to_num(list_len(args))
+  while i < n do
+    let akey = sbe_output_key(args[i], examples, registry)
+    let out = list_push(out, ["has_value", [akey, "1"]])
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called goap_decode_plan takes plan_labels, slot_nodes returns node
+  let i = 0
+  let n = to_num(list_len(plan_labels))
+  while i < n do
+    let label = plan_labels[i]
+    if contains_text(label, "select:") then
+      let key = substr(label, 7, 100000)
+      return get(slot_nodes, key)
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called goap_register_node takes node, examples, registry, seen, slot_nodes, expected_key, sample_bindings, index returns is_new
+  let key = sbe_output_key(node, examples, registry)
+  if get(seen, key) then
+    return false
+  end
+  send(seen, "set", key, true)
+  send(slot_nodes, "set", key, node)
+  let tag = node[0]
+  let preconds = []
+  if tag == "Call" then
+    let preconds = goap_preconds_for_args(node[2], examples, registry)
+  end
+  action_add("produce:" + key, preconds, [["has_value", [key, "1"]]], [], 1)
+  if key == expected_key then
+    action_add("select:" + key, [["has_value", [key, "1"]]], [["has_value", ["GOAL", "1"]]], [], 0)
+  end
+  sbe_index_add(index, sbe_wrap(node, registry, sample_bindings))
+  return true
+end
+
+make a function called goap_synthesize_from_examples takes examples, input_names, extra_consts, registry, primitive_names, max_size returns result
+  let consts = sbe_list_concat(sbe_default_int_consts(), extra_consts)
+  let sample_bindings = examples[0][0]
+  let leaves = sbe_seed_leaves(input_names, consts)
+  let index = sbe_index_new()
+  let seen = new("Dict", "goap_seen_" + pr_next_id())
+  let slot_nodes = new("Dict", "goap_slots_" + pr_next_id())
+  let expected_key = goap_expected_key(examples)
+  let notes = []
+
+  let i = 0
+  let n = to_num(list_len(leaves))
+  while i < n do
+    goap_register_node(leaves[i], examples, registry, seen, slot_nodes, expected_key, sample_bindings, index)
+    let i = i + 1
+  end
+
+  let plan_labels = plan([["has_value", ["GOAL", "1"]]])
+  if to_num(list_len(plan_labels)) > 0 then
+    let winner = goap_decode_plan(plan_labels, slot_nodes)
+    if winner then
+      return ["OK", winner, notes]
+    end
+  end
+
+  let size = 2
+  while size <= max_size do
+    print("goap_synthesize_from_examples: size=" + size + " at " + now_ms())
+    let p = 0
+    let pn = to_num(list_len(primitive_names))
+    while p < pn do
+      let prim = primitive_names[p]
+      let entry = pr_lookup(registry, prim)
+      if entry then
+        let arg_types = entry[5]
+        let arg_contracts = entry[7]
+        let candidates = sbe_build_calls(prim, arg_types, arg_contracts, size, index)
+        let cn = to_num(list_len(candidates))
+        let c = 0
+        while c < cn do
+          goap_register_node(candidates[c], examples, registry, seen, slot_nodes, expected_key, sample_bindings, index)
+          let c = c + 1
+        end
+      end
+      let p = p + 1
+    end
+
+    let plan_labels = plan([["has_value", ["GOAL", "1"]]])
+    if to_num(list_len(plan_labels)) > 0 then
+      let winner = goap_decode_plan(plan_labels, slot_nodes)
+      if winner then
+        return ["OK", winner, notes]
+      end
+    end
+    let size = size + 1
+  end
+
+  let notes = list_push(notes, "reached max_size (" + max_size + ") without a GOAP-reachable match")
+  return ["ERR", "no candidate up to size " + max_size, notes]
+end
