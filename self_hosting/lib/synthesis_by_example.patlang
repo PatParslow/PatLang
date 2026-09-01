@@ -540,6 +540,124 @@ make a function called sbe_default_int_consts returns cs
   return [0, 1, 2, 3, 9, 10, 13, 32]
 end
 
+# ---- parallel candidate evaluation ----
+#
+# Each candidate's evaluation (does it match every example? what's its
+# observational-equivalence key? what type/value does it produce?) is
+# pure and independent of every other candidate's -- the confirmed real
+# bottleneck (measured directly: ~250,000 independent evaluations at one
+# level of the first_exceeding search, see the site page's worked
+# example) is exactly the shape parallel_map (rust-runtime/src/ir/
+# interpreter.rs's real-OS-thread map, not a fiber) is for. This worker
+# is a plain top-level function, not a closure, because parallel_map
+# calls it as `name(item)` on a fresh Interpreter per thread with no
+# access to synthesize_from_examples's own locals -- examples/registry/
+# sample_bindings are fetched from __vars instead, which PatLang's
+# object store already guarantees is shared across every OS thread
+# (confirmed: it's a single process-wide Mutex-protected map, not
+# per-interpreter state). The SAME worker is used for the sequential
+# fallback below max_size threshold too, so both paths share one
+# implementation and can never silently diverge in behavior.
+make a function called sbe_eval_candidate_worker takes node returns result
+  let examples = get("__vars", "sbe_par_examples")
+  let registry = get("__vars", "sbe_par_registry")
+  let sample_bindings = get("__vars", "sbe_par_sample_bindings")
+  let ok = sbe_matches_all(node, examples, registry)
+  let key = sbe_output_key(node, examples, registry)
+  let typed = sbe_wrap(node, registry, sample_bindings)
+  return [ok, key, typed[2], typed[3]]
+end
+
+# Below this many candidates, thread-spawn overhead would cost more than
+# it saves (confirmed: sizes 2-8 typically have dozens to low hundreds of
+# candidates and already finish in well under a second sequentially).
+make a function called sbe_parallel_threshold returns n
+  return 300
+end
+
+# parallel_map spawns one real OS thread PER ITEM it's given (rust-
+# runtime/src/ir/interpreter.rs:346-361's std::thread::scope loop) --
+# fine for a bounded list, but a candidate list at size 14+ can run into
+# the tens of thousands, and spawning that many threads AT ONCE causes
+# real OS-level scheduling contention (confirmed directly: the whole
+# machine, not just this process, became sluggish -- not a memory or
+# per-process CPU symptom, a thread-count one). Fixed by chunking:
+# split the candidate list into a small, FIXED number of chunks
+# (matching real core count, not the candidate count), and parallel_map
+# over the CHUNKS -- each chunk's own candidates are evaluated
+# sequentially, within that one thread, by sbe_eval_candidate_chunk_worker.
+make a function called sbe_parallel_chunk_count returns n
+  return 20
+end
+
+make a function called sbe_chunk_list takes items, num_chunks returns chunks
+  let n = to_num(list_len(items))
+  let chunks = []
+  if n == 0 then
+    return chunks
+  end
+  let chunk_size = to_num(floor((n + num_chunks - 1) / num_chunks))
+  if chunk_size < 1 then
+    let chunk_size = 1
+  end
+  let i = 0
+  while i < n do
+    let stop = i + chunk_size
+    if stop > n then
+      let stop = n
+    end
+    let chunk = []
+    let j = i
+    while j < stop do
+      let chunk = list_push(chunk, items[j])
+      let j = j + 1
+    end
+    let chunks = list_push(chunks, chunk)
+    let i = stop
+  end
+  return chunks
+end
+
+make a function called sbe_eval_candidate_chunk_worker takes chunk returns results
+  let results = []
+  let i = 0
+  let n = to_num(list_len(chunk))
+  while i < n do
+    let results = list_push(results, sbe_eval_candidate_worker(chunk[i]))
+    let i = i + 1
+  end
+  return results
+end
+
+make a function called sbe_evaluate_candidates takes candidates, examples, registry, sample_bindings returns results
+  set_var("sbe_par_examples", examples)
+  set_var("sbe_par_registry", registry)
+  set_var("sbe_par_sample_bindings", sample_bindings)
+  let cn = to_num(list_len(candidates))
+  if cn > sbe_parallel_threshold() then
+    let chunks = sbe_chunk_list(candidates, sbe_parallel_chunk_count())
+    let chunk_results = parallel_map(chunks, "sbe_eval_candidate_chunk_worker")
+    # Flatten in order -- parallel_map preserves input order, and each
+    # chunk's own results are already in-order (sequential within it),
+    # so a straight concatenation reconstructs candidates' original order.
+    let results = []
+    let k = 0
+    let kn = to_num(list_len(chunk_results))
+    while k < kn do
+      let results = sbe_list_concat(results, chunk_results[k])
+      let k = k + 1
+    end
+    return results
+  end
+  let results = []
+  let c = 0
+  while c < cn do
+    let results = list_push(results, sbe_eval_candidate_worker(candidates[c]))
+    let c = c + 1
+  end
+  return results
+end
+
 # ---- the bottom-up search ----
 #
 # Returns ["OK", ast] for the smallest AST (by node count) that reproduces
@@ -641,11 +759,23 @@ make a function called synthesize_from_examples takes examples, input_names, ext
         let arg_types = entry[5]
         let arg_contracts = entry[7]
         let candidates = sbe_build_calls(prim, arg_types, arg_contracts, size, index)
-        let c = 0
         let cn = to_num(list_len(candidates))
+        let results = sbe_evaluate_candidates(candidates, examples, registry, sample_bindings)
+        # Sequential reduce pass -- cheap bookkeeping only, since the
+        # expensive per-candidate work already happened above (in
+        # parallel, once cn is large enough). Iterated by index so the
+        # exact same logic serves both the parallel and sequential paths
+        # from sbe_evaluate_candidates, and so "first match in original
+        # order wins" stays deterministic regardless of which path ran.
+        let c = 0
         while c < cn do
           let node = candidates[c]
-          if sbe_matches_all(node, examples, registry) then
+          let r = results[c]
+          let ok = r[0]
+          let key = r[1]
+          let ty = r[2]
+          let value = r[3]
+          if ok then
             if found_match then
               let alt_count = alt_count + 1
             else
@@ -653,12 +783,10 @@ make a function called synthesize_from_examples takes examples, input_names, ext
               let winner = node
             end
           end
-          let key = sbe_output_key(node, examples, registry)
           let already = get(seen, key)
           if not already then
             send(seen, "set", key, true)
-            let typed = sbe_wrap(node, registry, sample_bindings)
-            let ty = typed[2]
+            let typed = [node, size, ty, value]
             if ty == "int" then
               let level_int = list_push(level_int, typed)
             else
