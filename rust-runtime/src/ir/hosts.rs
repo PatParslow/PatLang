@@ -1028,7 +1028,7 @@ struct GroundFact { pred: String, args: Vec<String> }
 // -- avoids float Eq/Hash entirely in the search's own dedup step, and
 // the motivating use case (a counter) never needed non-integer values;
 // a stated, explicit scope limit, not an oversight.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct NumCond { fluent: String, op: String, rhs: String } // op: < <= > >= == !=
 
 #[derive(Clone)]
@@ -1174,6 +1174,11 @@ pub fn host_action_add(args: &[Value]) -> Result<Value, String> {
 // touching plan_facts.
 pub fn host_action_clear(_args: &[Value]) -> Result<Value, String> {
     ACTIONS.with(|a| a.borrow_mut().clear());
+    // Clearing the action set invalidates plan_incremental's own cache
+    // by construction (it assumes actions only ever get added) -- this
+    // isn't a second, independent concern, just consistent behavior:
+    // whatever assumed the old action set no longer has one to assume.
+    INCR_PLAN.with(|c| *c.borrow_mut() = None);
     Ok(Value::Unit)
 }
 
@@ -1338,6 +1343,217 @@ pub fn host_plan(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 { return Err("plan: expected 1 arg (goal_facts_list)".into()); }
     let goal_facts = parse_ground_facts(&args[0]);
     Ok(Value::List(Arc::new(plan_facts(goal_facts, Vec::new()).into_iter().map(|s| Value::String(s.into())).collect())))
+}
+
+// ---- plan_incremental: additive alongside plan()/plan_facts, which are
+// completely untouched (existing callers -- the goal-oriented
+// web-service demo, PDDL numeric-fluent planning -- keep their current,
+// unchanged behavior and tie-breaking).
+//
+// Motivation (GitHub issue #71, self_hosting/lib/goap_synthesis.patlang):
+// a caller that registers actions PROGRAMMATICALLY and calls plan()
+// repeatedly against a MONOTONICALLY GROWING action set (ask "reachable
+// yet?", add more actions, ask again, ...) pays for a full from-scratch
+// Dijkstra re-solve every single call, even though almost the entire
+// search graph is identical to the previous call's. Measured directly:
+// this was roughly half of the real cost on a synthesis benchmark (the
+// other half being candidate generation/evaluation upstream, already
+// addressed separately). plan_incremental keeps the frontier's CLOSED
+// set (not the frontier itself, which is always fully drained before a
+// call returns) alive across calls in a thread-local, and on each call
+// only re-examines actions added SINCE THE LAST CALL against already-
+// visited states ("reopening") before continuing the same Dijkstra
+// expansion loop plan_facts itself uses -- so the amortized cost across
+// N calls approaches ONE full solve, not N.
+//
+// This assumes actions only ever get ADDED between calls -- true by
+// construction as long as the caller never calls action_clear() mid-
+// sequence. action_clear() explicitly resets this cache too (see its
+// own definition) precisely because clearing the action set invalidates
+// everything this cache assumes; a caller that needs periodic memory
+// bounding (goap_synthesis.patlang's own sliding window, mirroring
+// Design B) calls action_clear() at each window boundary and accepts
+// one fresh solve there in exchange for staying memory-bounded --
+// deliberately NOT full D*-Lite-style incremental replanning under
+// action removal, which would need to treat an evicted action as an
+// edge-cost change and invalidate only the specific paths that
+// depended on it. That is real additional algorithmic complexity, out
+// of scope for this change; noted as the natural next step if the
+// reset-per-window-boundary cost ever turns out to still dominate.
+//
+// Correctness is verified (rust-runtime/tests/goal_oriented_incremental.
+// rs): finds the same reachability/cost answers plan() would at each
+// point in a growing batch sequence, keeps a cheaper cached route when a
+// pricier one is added later, and action_clear() genuinely invalidates
+// it rather than serving a stale path. It is NOT, however, wired into
+// self_hosting/lib/goap_synthesis.patlang -- tried directly (not just
+// assumed), it made that specific workload WORSE, not better: the
+// "reopen" step here tries every newly-added action against every
+// already-visited state unconditionally (O(visited x new_actions)), and
+// since `visited` grows roughly in proportion to total actions
+// registered, that cost approaches a full fresh solve's own cost anyway
+// -- without Dijkstra's early-termination benefit, since every pair is
+// tried regardless of relevance. Measured directly: replacing plan()
+// with this in goap_synthesize_from_examples made sizes 8-11 (which
+// previously completed in ~1.5s combined) stall past a 300s timeout.
+// A real fix needs the reopen step indexed by fact (only test a new
+// action's specific precondition facts against states known to already
+// contain them), not the naive full cross-product above -- real,
+// separate work, not attempted here. This primitive stays available
+// and correct for a caller whose action set is small enough, or whose
+// per-level growth is modest enough, for the naive reopen to be cheap.
+struct IncrPlanState {
+    goal_facts: Vec<GroundFact>,
+    goal_numeric: Vec<(String, String, String)>,
+    known_action_count: usize,
+    // Keyed by (sorted facts, sorted fluents) -- the exact same state
+    // identity plan_facts's own `visited` set already dedups on.
+    visited: HashMap<(Vec<GroundFact>, Vec<(String, i64)>), IncrVisitedEntry>,
+}
+
+struct IncrVisitedEntry {
+    state: std::collections::HashSet<GroundFact>,
+    fluents: std::collections::BTreeMap<String, i64>,
+    path: Vec<String>,
+    cost: i64,
+}
+
+thread_local! {
+    static INCR_PLAN: RefCell<Option<IncrPlanState>> = RefCell::new(None);
+}
+
+fn state_key(state: &std::collections::HashSet<GroundFact>, fluents: &std::collections::BTreeMap<String, i64>) -> (Vec<GroundFact>, Vec<(String, i64)>) {
+    let mut fk: Vec<GroundFact> = state.iter().cloned().collect();
+    fk.sort();
+    let vk: Vec<(String, i64)> = fluents.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    (fk, vk)
+}
+
+fn goal_conds_equal(a: &[NumCond], b: &[(String, String, String)]) -> bool {
+    if a.len() != b.len() { return false; }
+    a.iter().zip(b.iter()).all(|(x, y)| x.fluent == y.0 && x.op == y.1 && x.rhs == y.2)
+}
+
+fn plan_facts_incremental(goal_facts: Vec<GroundFact>, goal_numeric: Vec<NumCond>) -> Vec<String> {
+    use std::collections::{BinaryHeap, HashSet as HSet};
+    use std::cmp::Reverse;
+
+    let goal_numeric_key: Vec<(String, String, String)> = goal_numeric.iter().map(|nc| (nc.fluent.clone(), nc.op.clone(), nc.rhs.clone())).collect();
+
+    let mut state_opt = INCR_PLAN.with(|c| c.borrow_mut().take());
+    let fresh_needed = match &state_opt {
+        None => true,
+        Some(s) => s.goal_facts != goal_facts || !goal_conds_equal(&goal_numeric, &s.goal_numeric),
+    };
+    if fresh_needed {
+        let start_state = current_ground_facts_as_state();
+        let start_fluents = current_fluents_as_state();
+        let key = state_key(&start_state, &start_fluents);
+        let mut visited = HashMap::new();
+        visited.insert(key, IncrVisitedEntry { state: start_state, fluents: start_fluents, path: Vec::new(), cost: 0 });
+        state_opt = Some(IncrPlanState { goal_facts: goal_facts.clone(), goal_numeric: goal_numeric_key.clone(), known_action_count: 0, visited });
+    }
+    let mut istate = state_opt.expect("just initialized above if it was None");
+
+    let actions: Vec<GoapAction> = ACTIONS.with(|a| a.borrow().clone());
+    let new_actions = &actions[istate.known_action_count.min(actions.len())..];
+
+    let mut frontier: BinaryHeap<Reverse<(i64, (Vec<GroundFact>, Vec<(String, i64)>))>> = BinaryHeap::new();
+    let empty_subst: Subst = Subst::new();
+
+    // Reopen: only NEW actions can possibly unlock a transition out of an
+    // already-visited state that a prior call didn't already explore --
+    // every OLD action was already tried against every state visited so
+    // far, in a prior call.
+    let existing_keys: Vec<(Vec<GroundFact>, Vec<(String, i64)>)> = istate.visited.keys().cloned().collect();
+    for key in &existing_keys {
+        let (state_c, fluents_c, cost_c) = {
+            let e = &istate.visited[key];
+            (e.state.clone(), e.fluents.clone(), e.cost)
+        };
+        for action in new_actions {
+            for subst in ground_action_instances(&action.preconds, &state_c) {
+                if !action.numeric_preconds.iter().all(|nc| eval_num_cond(nc, &fluents_c, &subst)) { continue; }
+                let mut new_state = state_c.clone();
+                for d in &action.del_effects { new_state.remove(&apply_subst_to_fact(d, &subst)); }
+                for a2 in &action.add_effects { new_state.insert(apply_subst_to_fact(a2, &subst)); }
+                let mut new_fluents = fluents_c.clone();
+                for ne in &action.numeric_effects { apply_num_effect(ne, &mut new_fluents, &subst); }
+                let new_key = state_key(&new_state, &new_fluents);
+                let new_cost = cost_c + action.cost;
+                let improves = istate.visited.get(&new_key).map_or(true, |e| new_cost < e.cost);
+                if improves {
+                    let mut new_path = istate.visited[key].path.clone();
+                    new_path.push(action_instance_label(&action.name, &action.preconds, &subst));
+                    istate.visited.insert(new_key.clone(), IncrVisitedEntry { state: new_state, fluents: new_fluents, path: new_path, cost: new_cost });
+                    frontier.push(Reverse((new_cost, new_key)));
+                }
+            }
+        }
+    }
+    // Also seed the frontier with every already-visited state at its
+    // known cost, so a state that was a dead end against OLD actions
+    // alone gets a chance to expand against the FULL current action set
+    // (a state discovered mid-reopening above already gets this for
+    // free via the main loop below, since it enters via `frontier.push`
+    // and the loop tries every action, not just the new ones).
+    for key in &existing_keys {
+        let cost = istate.visited[key].cost;
+        frontier.push(Reverse((cost, key.clone())));
+    }
+
+    const NODE_CAP: usize = 5000;
+    let mut expansions = 0usize;
+    let mut closed_this_call: HSet<(Vec<GroundFact>, Vec<(String, i64)>)> = HSet::new();
+    let mut result: Vec<String> = Vec::new();
+
+    while let Some(Reverse((cost, key))) = frontier.pop() {
+        if expansions >= NODE_CAP { break; }
+        let entry_cost = istate.visited.get(&key).map(|e| e.cost);
+        if entry_cost != Some(cost) { continue; } // stale heap entry
+        if !closed_this_call.insert(key.clone()) { continue; } // already expanded this call
+        expansions += 1;
+        let (state_c, fluents_c, path_c) = {
+            let e = &istate.visited[&key];
+            (e.state.clone(), e.fluents.clone(), e.path.clone())
+        };
+        if goal_facts.iter().all(|g| state_c.contains(g)) && goal_numeric.iter().all(|nc| eval_num_cond(nc, &fluents_c, &empty_subst)) {
+            result = path_c;
+            break;
+        }
+        for action in &actions {
+            for subst in ground_action_instances(&action.preconds, &state_c) {
+                if !action.numeric_preconds.iter().all(|nc| eval_num_cond(nc, &fluents_c, &subst)) { continue; }
+                let mut new_state = state_c.clone();
+                for d in &action.del_effects { new_state.remove(&apply_subst_to_fact(d, &subst)); }
+                for a2 in &action.add_effects { new_state.insert(apply_subst_to_fact(a2, &subst)); }
+                let mut new_fluents = fluents_c.clone();
+                for ne in &action.numeric_effects { apply_num_effect(ne, &mut new_fluents, &subst); }
+                let new_key = state_key(&new_state, &new_fluents);
+                let new_cost = cost + action.cost;
+                let improves = istate.visited.get(&new_key).map_or(true, |e| new_cost < e.cost);
+                if improves {
+                    let mut new_path = path_c.clone();
+                    new_path.push(action_instance_label(&action.name, &action.preconds, &subst));
+                    istate.visited.insert(new_key.clone(), IncrVisitedEntry { state: new_state, fluents: new_fluents, path: new_path, cost: new_cost });
+                    frontier.push(Reverse((new_cost, new_key)));
+                }
+            }
+        }
+    }
+
+    istate.known_action_count = actions.len();
+    INCR_PLAN.with(|c| *c.borrow_mut() = Some(istate));
+    result
+}
+
+pub fn host_plan_incremental(args: &[Value]) -> Result<Value, String> {
+    // plan_incremental(goal_facts_list) -> same contract as plan(), but
+    // reuses search work across repeated calls with a growing action
+    // set. See plan_facts_incremental's own comment.
+    if args.len() != 1 { return Err("plan_incremental: expected 1 arg (goal_facts_list)".into()); }
+    let goal_facts = parse_ground_facts(&args[0]);
+    Ok(Value::List(Arc::new(plan_facts_incremental(goal_facts, Vec::new()).into_iter().map(|s| Value::String(s.into())).collect())))
 }
 
 // plan_numeric(goal_facts_list, goal_numeric_conditions_list) -> List,
@@ -3012,6 +3228,7 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("action_add", host_action_add);
     interp.host.insert("action_clear", host_action_clear);
     interp.host.insert("plan", host_plan);
+    interp.host.insert("plan_incremental", host_plan_incremental);
     interp.host.insert("fluent_set", host_fluent_set);
     interp.host.insert("action_add_numeric", host_action_add_numeric);
     interp.host.insert("plan_numeric", host_plan_numeric);
