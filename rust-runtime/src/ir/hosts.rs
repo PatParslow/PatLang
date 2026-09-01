@@ -1385,30 +1385,68 @@ pub fn host_plan(args: &[Value]) -> Result<Value, String> {
 // rs): finds the same reachability/cost answers plan() would at each
 // point in a growing batch sequence, keeps a cheaper cached route when a
 // pricier one is added later, and action_clear() genuinely invalidates
-// it rather than serving a stale path. It is NOT, however, wired into
-// self_hosting/lib/goap_synthesis.patlang -- tried directly (not just
-// assumed), it made that specific workload WORSE, not better: the
-// "reopen" step here tries every newly-added action against every
-// already-visited state unconditionally (O(visited x new_actions)), and
-// since `visited` grows roughly in proportion to total actions
-// registered, that cost approaches a full fresh solve's own cost anyway
-// -- without Dijkstra's early-termination benefit, since every pair is
-// tried regardless of relevance. Measured directly: replacing plan()
-// with this in goap_synthesize_from_examples made sizes 8-11 (which
-// previously completed in ~1.5s combined) stall past a 300s timeout.
-// A real fix needs the reopen step indexed by fact (only test a new
-// action's specific precondition facts against states known to already
-// contain them), not the naive full cross-product above -- real,
-// separate work, not attempted here. This primitive stays available
-// and correct for a caller whose action set is small enough, or whose
-// per-level growth is modest enough, for the naive reopen to be cheap.
+// it rather than serving a stale path.
+//
+// A first version reopened naively -- every newly-added action tried
+// against every already-visited state unconditionally (O(visited x
+// new_actions)) -- and, tried directly against self_hosting/lib/
+// goap_synthesis.patlang, that made the workload WORSE than plain
+// plan(): visited-state count tracks total actions registered, so the
+// naive reopen cost approached a full resolve anyway, without Dijkstra's
+// early-termination benefit. Fixed by doing the one thing that was
+// actually the point of going incremental at all: index visited states
+// by the ground facts they contain (`fact_index`), so reopening a new
+// action looks up candidate states by its OWN ground precondition facts
+// -- an O(1) HashMap lookup and small-set intersection per precond,
+// touching only states that could plausibly satisfy it, rather than
+// scanning every state ever visited. An action with no ground
+// preconditions at all (fully open, matching any fact of some
+// predicate -- not a shape self_hosting/lib/goap_synthesis.patlang ever
+// produces, since every one of its actions is fully ground) still falls
+// back to the full visited set for that one action, which is the
+// correct, unavoidable cost for a genuinely unconstrained precondition,
+// not a shortcut taken here.
+//
+// This fact-indexing fix is correct and DOES eliminate the originally
+// diagnosed O(visited x new_actions) blowup -- but wiring it back into
+// goap_synthesis.patlang exposed a second, deeper problem that indexing
+// alone cannot fix: that translation's actions never have del_effects
+// (every "produce" action just adds one more fact to what's already
+// true), which makes it a monotonic reachability problem, not a real
+// STRIPS domain with meaningfully different alternative world-states.
+// Modeled as world-state search anyway, every combination of
+// independently-derivable facts becomes its own distinct graph node --
+// measured directly: 10 mutually-independent leaf facts alone produced
+// exactly 1024 (2^10) visited states on the very first call, growing to
+// 270,824 by size 6->7. Plain plan() never shows this because it starts
+// fresh from empty every single call and is bounded by NODE_CAP=5000
+// PER CALL -- all that exploratory work is thrown away before it can
+// compound. Persisting `visited` across calls (this function's entire
+// premise) is exactly the wrong thing to do for a domain shaped this
+// way: it keeps adding to a combinatorially-growing set instead of
+// discarding it every time. No amount of caching or indexing on top of
+// world-state search fixes this -- the actual fix for a monotonic
+// (no-delete) domain is a differently-shaped algorithm entirely:
+// shortest-hyperpath / weighted-Datalog reachability (facts as nodes,
+// actions as AND-join hyperedges, one relaxation pass per newly
+// derivable fact), not STRIPS world-state search at all. That is real,
+// separate algorithmic work, out of scope here. This function remains
+// correct and useful for genuine STRIPS domains where del_effects give
+// distinct world-states real meaning -- just not for self_hosting/lib/
+// goap_synthesis.patlang's specific translation, which was reverted
+// back to plain plan() (see that file's own comment).
+type StateKey = (Vec<GroundFact>, Vec<(String, i64)>);
+
 struct IncrPlanState {
     goal_facts: Vec<GroundFact>,
     goal_numeric: Vec<(String, String, String)>,
     known_action_count: usize,
     // Keyed by (sorted facts, sorted fluents) -- the exact same state
     // identity plan_facts's own `visited` set already dedups on.
-    visited: HashMap<(Vec<GroundFact>, Vec<(String, i64)>), IncrVisitedEntry>,
+    visited: HashMap<StateKey, IncrVisitedEntry>,
+    // Which visited states contain a given ground fact -- see the
+    // header comment above for why this exists.
+    fact_index: HashMap<GroundFact, std::collections::HashSet<StateKey>>,
 }
 
 struct IncrVisitedEntry {
@@ -1422,11 +1460,38 @@ thread_local! {
     static INCR_PLAN: RefCell<Option<IncrPlanState>> = RefCell::new(None);
 }
 
-fn state_key(state: &std::collections::HashSet<GroundFact>, fluents: &std::collections::BTreeMap<String, i64>) -> (Vec<GroundFact>, Vec<(String, i64)>) {
+fn state_key(state: &std::collections::HashSet<GroundFact>, fluents: &std::collections::BTreeMap<String, i64>) -> StateKey {
     let mut fk: Vec<GroundFact> = state.iter().cloned().collect();
     fk.sort();
     let vk: Vec<(String, i64)> = fluents.iter().map(|(k, v)| (k.clone(), *v)).collect();
     (fk, vk)
+}
+
+fn fact_index_insert(index: &mut HashMap<GroundFact, std::collections::HashSet<StateKey>>, state: &std::collections::HashSet<GroundFact>, key: &StateKey) {
+    for fact in state {
+        index.entry(fact.clone()).or_insert_with(std::collections::HashSet::new).insert(key.clone());
+    }
+}
+
+// Ground (variable-free) preconditions of an action can be looked up in
+// `fact_index` directly; a precondition containing a logic variable
+// can't (it doesn't name one specific fact), so those still go through
+// the ordinary unify-against-a-known-state path once candidates are
+// found. Returns None if the action has no ground preconditions at all
+// (nothing to index on -- caller falls back to the full visited set).
+fn candidate_states_for_action(action: &GoapAction, fact_index: &HashMap<GroundFact, std::collections::HashSet<StateKey>>) -> Option<std::collections::HashSet<StateKey>> {
+    let ground_preconds: Vec<&GroundFact> = action.preconds.iter().filter(|p| !p.args.iter().any(|a| is_logic_var(a))).collect();
+    if ground_preconds.is_empty() { return None; }
+    let mut candidates: Option<std::collections::HashSet<StateKey>> = None;
+    for gp in ground_preconds {
+        let matching = fact_index.get(gp).cloned().unwrap_or_default();
+        candidates = Some(match candidates {
+            None => matching,
+            Some(prev) => prev.intersection(&matching).cloned().collect(),
+        });
+        if candidates.as_ref().map_or(false, |c| c.is_empty()) { break; }
+    }
+    candidates
 }
 
 fn goal_conds_equal(a: &[NumCond], b: &[(String, String, String)]) -> bool {
@@ -1449,24 +1514,37 @@ fn plan_facts_incremental(goal_facts: Vec<GroundFact>, goal_numeric: Vec<NumCond
         let start_state = current_ground_facts_as_state();
         let start_fluents = current_fluents_as_state();
         let key = state_key(&start_state, &start_fluents);
+        let mut fact_index = HashMap::new();
+        fact_index_insert(&mut fact_index, &start_state, &key);
         let mut visited = HashMap::new();
         visited.insert(key, IncrVisitedEntry { state: start_state, fluents: start_fluents, path: Vec::new(), cost: 0 });
-        state_opt = Some(IncrPlanState { goal_facts: goal_facts.clone(), goal_numeric: goal_numeric_key.clone(), known_action_count: 0, visited });
+        state_opt = Some(IncrPlanState { goal_facts: goal_facts.clone(), goal_numeric: goal_numeric_key.clone(), known_action_count: 0, visited, fact_index });
     }
     let mut istate = state_opt.expect("just initialized above if it was None");
 
     let actions: Vec<GoapAction> = ACTIONS.with(|a| a.borrow().clone());
     let new_actions = &actions[istate.known_action_count.min(actions.len())..];
 
-    let mut frontier: BinaryHeap<Reverse<(i64, (Vec<GroundFact>, Vec<(String, i64)>))>> = BinaryHeap::new();
-    let empty_subst: Subst = Subst::new();
+    let mut frontier: BinaryHeap<Reverse<(i64, StateKey)>> = BinaryHeap::new();
 
     // Reopen: only NEW actions can possibly unlock a transition out of an
     // already-visited state that a prior call didn't already explore --
     // every OLD action was already tried against every state visited so
-    // far, in a prior call.
-    let existing_keys: Vec<(Vec<GroundFact>, Vec<(String, i64)>)> = istate.visited.keys().cloned().collect();
-    for key in &existing_keys {
+    // far, in a prior call. Which states to try each new action against
+    // comes from `fact_index` (see candidate_states_for_action's own
+    // comment) rather than the full visited set -- this is the actual
+    // fix for the O(visited x new_actions) blowup the naive version hit.
+    let touched_keys: Vec<StateKey> = {
+        let mut seen: std::collections::HashSet<StateKey> = std::collections::HashSet::new();
+        for action in new_actions {
+            match candidate_states_for_action(action, &istate.fact_index) {
+                Some(candidates) => { for k in candidates { seen.insert(k); } }
+                None => { seen.extend(istate.visited.keys().cloned()); }
+            }
+        }
+        seen.into_iter().collect()
+    };
+    for key in &touched_keys {
         let (state_c, fluents_c, cost_c) = {
             let e = &istate.visited[key];
             (e.state.clone(), e.fluents.clone(), e.cost)
@@ -1485,19 +1563,23 @@ fn plan_facts_incremental(goal_facts: Vec<GroundFact>, goal_numeric: Vec<NumCond
                 if improves {
                     let mut new_path = istate.visited[key].path.clone();
                     new_path.push(action_instance_label(&action.name, &action.preconds, &subst));
+                    fact_index_insert(&mut istate.fact_index, &new_state, &new_key);
                     istate.visited.insert(new_key.clone(), IncrVisitedEntry { state: new_state, fluents: new_fluents, path: new_path, cost: new_cost });
                     frontier.push(Reverse((new_cost, new_key)));
                 }
             }
         }
     }
-    // Also seed the frontier with every already-visited state at its
-    // known cost, so a state that was a dead end against OLD actions
-    // alone gets a chance to expand against the FULL current action set
-    // (a state discovered mid-reopening above already gets this for
-    // free via the main loop below, since it enters via `frontier.push`
-    // and the loop tries every action, not just the new ones).
-    for key in &existing_keys {
+    // Also seed the frontier with every state actually touched above (at
+    // its known cost), so a state that was a dead end against OLD
+    // actions alone gets a chance to expand against the FULL current
+    // action set once popped by the main loop below -- deliberately NOT
+    // every visited state (that would reintroduce the O(visited) scan
+    // this whole rewrite exists to avoid); a visited state NOT touched
+    // by any new action's ground preconditions has, by construction, no
+    // new outgoing edge to discover.
+    let empty_subst: Subst = Subst::new();
+    for key in &touched_keys {
         let cost = istate.visited[key].cost;
         frontier.push(Reverse((cost, key.clone())));
     }
@@ -1535,6 +1617,7 @@ fn plan_facts_incremental(goal_facts: Vec<GroundFact>, goal_numeric: Vec<NumCond
                 if improves {
                     let mut new_path = path_c.clone();
                     new_path.push(action_instance_label(&action.name, &action.preconds, &subst));
+                    fact_index_insert(&mut istate.fact_index, &new_state, &new_key);
                     istate.visited.insert(new_key.clone(), IncrVisitedEntry { state: new_state, fluents: new_fluents, path: new_path, cost: new_cost });
                     frontier.push(Reverse((new_cost, new_key)));
                 }
