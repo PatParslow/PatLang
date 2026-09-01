@@ -231,6 +231,54 @@ make a function called sbe_index_lookup takes index, size, ty returns bucket
   return bucket
 end
 
+# ---- sliding-window memory bound (Design B) ----
+#
+# The index otherwise retains every surviving candidate from every level
+# ever explored, unboundedly -- confirmed directly as the real memory
+# driver behind GitHub issue #73 (the first_exceeding two-list case
+# climbed past 20GB+ and kept growing well before finding a match).
+# Parallelizing evaluation (Design A) only ever addressed wall-clock
+# time, not this. Only the most recent `sbe_window_size()` composed
+# levels are kept; older ones are evicted by overwriting their bucket
+# with an empty list (no delete primitive needed -- sbe_index_lookup
+# already treats empty and missing the same way, and dropping the last
+# reference to the old list lets it actually be freed).
+#
+# Leaves (size 1 -- Input/Const) are NEVER evicted: they're cheap (a
+# small, fixed set per search) and are exactly what a late-level
+# candidate most often reaches back for -- confirmed directly in the
+# actual first_exceeding formula this was built to fix, which reused
+# list_get(xs, 1) (built from two size-1 leaves) deep inside a
+# size-17+ AST. Windowing sizes >= 2 only, while keeping every leaf,
+# is a real completeness/memory tradeoff, not a free lunch: a solution
+# that needs a specific size-3+ intermediate piece combined only many
+# levels later than the window allows could still be missed. State that
+# plainly wherever this is described, not just here.
+make a function called sbe_window_size returns w
+  let override = get("__vars", "sbe_window_size_override")
+  if override then
+    return to_num(override)
+  end
+  return 8
+end
+
+make a function called sbe_evict_size takes index, size returns done
+  if size < 2 then
+    return true
+  end
+  let types = sbe_concrete_types()
+  let t = 0
+  let tn = to_num(list_len(types))
+  while t < tn do
+    let by_size = get(index, types[t])
+    if by_size then
+      send(by_size, "set", "" + size, [])
+    end
+    let t = t + 1
+  end
+  return true
+end
+
 # The (size, type)-indexed bucket, ALSO filtered by a single-argument
 # contract (self_hosting/lib/primitive_registry.patlang's arg_contracts)
 # checked against each candidate's already-computed value -- so a
@@ -820,6 +868,11 @@ make a function called synthesize_from_examples takes examples, input_names, ext
     end
     if to_num(list_len(level_list)) > 0 then
       sbe_index_set_bucket(index, "list", size, level_list)
+    end
+
+    let evict_size = size - sbe_window_size()
+    if evict_size >= 2 then
+      sbe_evict_size(index, evict_size)
     end
 
     if pool_before_level > 0 then
