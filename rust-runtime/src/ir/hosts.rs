@@ -1158,6 +1158,25 @@ pub fn host_action_add(args: &[Value]) -> Result<Value, String> {
     Ok(Value::Unit)
 }
 
+// Purely additive: no existing caller ever invokes this, so ordinary
+// action_add/plan() usage (the goal-oriented web-service demo, PDDL
+// numeric-fluent planning) is completely unaffected. Exists so a caller
+// that registers actions PROGRAMMATICALLY and in large numbers (e.g.
+// self_hosting/lib/goap_synthesis.patlang's bottom-up search-graph
+// translation, GitHub issue #71) can bound its own action set the same
+// way self_hosting/lib/synthesis_by_example.patlang's sbe_evict_size
+// already bounds its own candidate index -- by clearing and
+// re-registering only a retained window, entirely from PatLang-side
+// state, rather than requiring plan_facts's core search loop to change
+// at all. plan()'s repeated full-graph Dijkstra re-solve is otherwise
+// the confirmed bottleneck for that caller (see the issue): this gives
+// it a lever to keep each solve's action count bounded without
+// touching plan_facts.
+pub fn host_action_clear(_args: &[Value]) -> Result<Value, String> {
+    ACTIONS.with(|a| a.borrow_mut().clear());
+    Ok(Value::Unit)
+}
+
 // GitHub follow-up (this session's own "PDDL 2.1-style numeric
 // fluents" design conversation): action_add_numeric(name, preconds,
 // numeric_preconds, add_effects, del_effects, numeric_effects, cost)
@@ -2991,6 +3010,7 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("rule_add", host_rule_add);
     interp.host.insert("solve", host_solve);
     interp.host.insert("action_add", host_action_add);
+    interp.host.insert("action_clear", host_action_clear);
     interp.host.insert("plan", host_plan);
     interp.host.insert("fluent_set", host_fluent_set);
     interp.host.insert("action_add_numeric", host_action_add_numeric);

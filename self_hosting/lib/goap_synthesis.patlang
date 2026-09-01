@@ -28,18 +28,58 @@
 # otherwise identical to synthesize_from_examples (this deliberately
 # reuses sbe_build_calls/sbe_output_key rather than reinventing them).
 #
-# Known, load-bearing limitation this file does NOT attempt to fix:
-# ACTIONS (rust-runtime/src/ir/hosts.rs) has no sliding-window eviction
-# equivalent to sbe_window_size() -- every action ever registered stays
-# for the life of the process, and plan() clones the full action vec on
-# every call. This is exactly the unbounded-growth shape Design B was
-# built to fix for the enumerator's own index; unifying with GOAP for
-# real would need an equivalent bound on ACTIONS before it could safely
-# attempt the full two-list first_exceeding case (issue #73) the
-# enumerator already solved. This file is scoped to proving/measuring
-# the translation on smaller cases, per the plan's explicit caution not
-# to push through to a harder case before the smaller one "cleanly falls
-# out."
+# Follow-up (measured, not assumed): a first version of this file with
+# NO eviction at all found the single-list first_exceeding case's
+# candidate index growing unbounded (same shape Design B fixed for the
+# enumerator) AND, separately, plan() re-solving the ENTIRE accumulated
+# ACTIONS vec from scratch on every level -- per-level time went
+# 2s -> 25s -> 44s -> 136s across sizes 12-17, then didn't finish size
+# 18 in 600s. rust-runtime/src/ir/hosts.rs's ACTIONS had no eviction
+# mechanism at all (ordinary action_add/plan() users -- the
+# goal-oriented web-service demo, PDDL numeric-fluent planning --
+# register a small, fixed action set once and never needed one), so a
+# purely additive `action_clear()` host fn was added specifically for
+# this caller (zero effect on any existing plan()/action_add() usage,
+# since nothing else calls it). This file now applies the SAME
+# sliding-window discipline to both structures the enumerator already
+# uses for its own index: `index` is evicted via the existing
+# sbe_evict_size(), and ACTIONS is periodically cleared and rebuilt from
+# a PatLang-side per-size action log, keeping only the current window's
+# worth (leaves/size-1 exempt, same rationale as sbe_window_size's own
+# comment -- cheap, and exactly what a late-level candidate reaches back
+# for). This carries the exact same, already-documented completeness
+# tradeoff as Design B: a solution needing a piece older than the window
+# can be missed, reported as ERR rather than a crash.
+#
+# Second follow-up (also measured): windowing alone changed per-level
+# timing NOT AT ALL -- 136s at size 16->17 both before and after. The
+# actual driver at these sizes is candidate volume itself (measured
+# directly: sbe_build_calls returns 547,575 candidates for `cond` alone
+# at size 16 on this single-list case), evaluated one at a time with no
+# parallelization -- the exact same shape Design A fixed for the
+# enumerator, simply never ported here. Porting it (goap_eval_candidate_
+# worker/goap_evaluate_candidates, reusing sbe_chunk_list/
+# sbe_parallel_threshold/sbe_parallel_chunk_count as-is) roughly halved
+# per-level time (e.g. size 16->17: 137s -> 77s) but did not change the
+# fundamental picture: candidate volume keeps growing combinatorially
+# regardless of search engine, and this single-list case's true minimal
+# composition needs size 18+ (confirmed: size 17 completed cleanly with
+# ACTIONS/index both correctly bounded, in ~203s, and still returned
+# ERR). The two mechanics changes here (an additive `action_clear()`
+# host fn, verified against the full existing GOAP test suite --
+# goal_oriented_logic/goal_oriented_numeric/goal_pursue_activate, all
+# still pass unchanged -- plus porting Design A's own parallelization)
+# are real, measured, no-regression improvements to how GOAP handles a
+# large, dynamically-generated action set. They are not, on their own,
+# enough to make plan()-driven search competitive with the
+# purpose-built enumerator on this problem shape: the combinatorial
+# candidate explosion from "any"-typed primitives is the dominant cost
+# either way, and GOAP's per-level full-graph solve adds overhead on
+# top rather than removing any. Making this fully competitive would
+# need genuinely incremental search (extending a frontier across levels
+# instead of re-solving from scratch each time) -- a real change to
+# plan_facts itself, out of scope here. Left as the closing, evidence-
+# based finding on issue #71.
 
 include "synthesis_by_example.patlang"
 
@@ -81,7 +121,53 @@ make a function called goap_decode_plan takes plan_labels, slot_nodes returns no
   return false
 end
 
-make a function called goap_register_node takes node, examples, registry, seen, slot_nodes, expected_key, sample_bindings, index returns is_new
+make a function called goap_action_log_add takes action_log, size, rec returns done
+  let bucket_key = "" + size
+  let bucket = get(action_log, bucket_key)
+  if not bucket then
+    let bucket = []
+  end
+  let bucket = list_push(bucket, rec)
+  send(action_log, "set", bucket_key, bucket)
+  return true
+end
+
+make a function called goap_replay_records takes recs returns done
+  if not recs then
+    return true
+  end
+  let i = 0
+  let n = to_num(list_len(recs))
+  while i < n do
+    let rec = recs[i]
+    action_add(rec[0], rec[1], rec[2], [], rec[3])
+    let i = i + 1
+  end
+  return true
+end
+
+# Mirrors sbe_evict_size's own window discipline (self_hosting/lib/
+# synthesis_by_example.patlang), but for ACTIONS: rather than trying to
+# remove individual actions (no such primitive exists, or is needed --
+# see action_clear's own comment), clear the whole vec and replay only
+# size-1 (leaves, always kept) plus the sizes still inside the window.
+make a function called goap_rebuild_action_window takes action_log, current_size returns done
+  action_clear()
+  goap_replay_records(get(action_log, "1"))
+  let window = sbe_window_size()
+  let lo = current_size - window + 1
+  if lo < 2 then
+    let lo = 2
+  end
+  let s = lo
+  while s <= current_size do
+    goap_replay_records(get(action_log, "" + s))
+    let s = s + 1
+  end
+  return true
+end
+
+make a function called goap_register_node takes node, examples, registry, seen, slot_nodes, expected_key, sample_bindings, index, action_log returns is_new
   let key = sbe_output_key(node, examples, registry)
   if get(seen, key) then
     return false
@@ -93,11 +179,107 @@ make a function called goap_register_node takes node, examples, registry, seen, 
   if tag == "Call" then
     let preconds = goap_preconds_for_args(node[2], examples, registry)
   end
-  action_add("produce:" + key, preconds, [["has_value", [key, "1"]]], [], 1)
+  let size = sbe_size(node)
+  let produce_rec = ["produce:" + key, preconds, [["has_value", [key, "1"]]], 1]
+  action_add(produce_rec[0], produce_rec[1], produce_rec[2], [], produce_rec[3])
+  goap_action_log_add(action_log, size, produce_rec)
   if key == expected_key then
-    action_add("select:" + key, [["has_value", [key, "1"]]], [["has_value", ["GOAL", "1"]]], [], 0)
+    let select_rec = ["select:" + key, [["has_value", [key, "1"]]], [["has_value", ["GOAL", "1"]]], 0]
+    action_add(select_rec[0], select_rec[1], select_rec[2], [], select_rec[3])
+    goap_action_log_add(action_log, size, select_rec)
   end
   sbe_index_add(index, sbe_wrap(node, registry, sample_bindings))
+  return true
+end
+
+# The candidate counts sbe_build_calls produces at these sizes are the
+# SAME combinatorial-branching shape documented in synthesis_by_example.
+# patlang (gt/cond's "any"-typed positions, confirmed directly here too:
+# 547,575 candidates at size 16 alone on the single-list first_exceeding
+# case). A first version of this file evaluated each one sequentially --
+# proven, by measurement, to be the actual bottleneck (windowing ACTIONS
+# and `index` alike changed per-level timing not at all: 136s at size
+# 16->17 before AND after). Design A's own fix (chunked parallel_map,
+# see sbe_evaluate_candidates) already solves exactly this, and is
+# reused as-is here rather than re-implemented -- only the CHEAP,
+# necessarily-sequential bookkeeping (seen/slot_nodes/action_log/
+# action_add, all Dict/vec mutation) stays outside the parallel section.
+make a function called goap_eval_candidate_worker takes node returns result
+  let examples = get("__vars", "goap_par_examples")
+  let registry = get("__vars", "goap_par_registry")
+  let sample_bindings = get("__vars", "goap_par_sample_bindings")
+  let key = sbe_output_key(node, examples, registry)
+  let tag = node[0]
+  let arg_keys = []
+  if tag == "Call" then
+    let args = node[2]
+    let i = 0
+    let n = to_num(list_len(args))
+    while i < n do
+      let arg_keys = list_push(arg_keys, sbe_output_key(args[i], examples, registry))
+      let i = i + 1
+    end
+  end
+  let typed = sbe_wrap(node, registry, sample_bindings)
+  return [key, typed[2], typed[3], arg_keys]
+end
+
+make a function called goap_eval_candidate_chunk_worker takes chunk returns results
+  let results = []
+  let i = 0
+  let n = to_num(list_len(chunk))
+  while i < n do
+    let results = list_push(results, goap_eval_candidate_worker(chunk[i]))
+    let i = i + 1
+  end
+  return results
+end
+
+make a function called goap_evaluate_candidates takes candidates, examples, registry, sample_bindings returns results
+  set_var("goap_par_examples", examples)
+  set_var("goap_par_registry", registry)
+  set_var("goap_par_sample_bindings", sample_bindings)
+  let cn = to_num(list_len(candidates))
+  if cn > sbe_parallel_threshold() then
+    let chunks = sbe_chunk_list(candidates, sbe_parallel_chunk_count())
+    let chunk_results = parallel_map(chunks, "goap_eval_candidate_chunk_worker")
+    let results = []
+    let k = 0
+    let kn = to_num(list_len(chunk_results))
+    while k < kn do
+      let results = sbe_list_concat(results, chunk_results[k])
+      let k = k + 1
+    end
+    return results
+  end
+  return goap_eval_candidate_chunk_worker(candidates)
+end
+
+make a function called goap_register_evaluated takes node, r, seen, slot_nodes, expected_key, index, action_log returns is_new
+  let key = r[0]
+  if get(seen, key) then
+    return false
+  end
+  send(seen, "set", key, true)
+  send(slot_nodes, "set", key, node)
+  let arg_keys = r[3]
+  let preconds = []
+  let ai = 0
+  let an = to_num(list_len(arg_keys))
+  while ai < an do
+    let preconds = list_push(preconds, ["has_value", [arg_keys[ai], "1"]])
+    let ai = ai + 1
+  end
+  let size = sbe_size(node)
+  let produce_rec = ["produce:" + key, preconds, [["has_value", [key, "1"]]], 1]
+  action_add(produce_rec[0], produce_rec[1], produce_rec[2], [], produce_rec[3])
+  goap_action_log_add(action_log, size, produce_rec)
+  if key == expected_key then
+    let select_rec = ["select:" + key, [["has_value", [key, "1"]]], [["has_value", ["GOAL", "1"]]], 0]
+    action_add(select_rec[0], select_rec[1], select_rec[2], [], select_rec[3])
+    goap_action_log_add(action_log, size, select_rec)
+  end
+  sbe_index_add(index, [node, size, r[1], r[2]])
   return true
 end
 
@@ -108,13 +290,14 @@ make a function called goap_synthesize_from_examples takes examples, input_names
   let index = sbe_index_new()
   let seen = new("Dict", "goap_seen_" + pr_next_id())
   let slot_nodes = new("Dict", "goap_slots_" + pr_next_id())
+  let action_log = new("Dict", "goap_action_log_" + pr_next_id())
   let expected_key = goap_expected_key(examples)
   let notes = []
 
   let i = 0
   let n = to_num(list_len(leaves))
   while i < n do
-    goap_register_node(leaves[i], examples, registry, seen, slot_nodes, expected_key, sample_bindings, index)
+    goap_register_node(leaves[i], examples, registry, seen, slot_nodes, expected_key, sample_bindings, index, action_log)
     let i = i + 1
   end
 
@@ -139,14 +322,21 @@ make a function called goap_synthesize_from_examples takes examples, input_names
         let arg_contracts = entry[7]
         let candidates = sbe_build_calls(prim, arg_types, arg_contracts, size, index)
         let cn = to_num(list_len(candidates))
+        let results = goap_evaluate_candidates(candidates, examples, registry, sample_bindings)
         let c = 0
         while c < cn do
-          goap_register_node(candidates[c], examples, registry, seen, slot_nodes, expected_key, sample_bindings, index)
+          goap_register_evaluated(candidates[c], results[c], seen, slot_nodes, expected_key, index, action_log)
           let c = c + 1
         end
       end
       let p = p + 1
     end
+
+    let evict_size = size - sbe_window_size()
+    if evict_size >= 2 then
+      sbe_evict_size(index, evict_size)
+    end
+    goap_rebuild_action_window(action_log, size)
 
     let plan_labels = plan([["has_value", ["GOAL", "1"]]])
     if to_num(list_len(plan_labels)) > 0 then
