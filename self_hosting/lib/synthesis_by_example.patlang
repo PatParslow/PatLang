@@ -238,7 +238,35 @@ end
 # dropped before it's ever combined into a Call node, not generated then
 # rejected by full evaluation. Returns raw AST nodes (the Call node needs
 # the ast, not the bookkeeping).
+# The 4 concrete runtime types sbe_infer_type_and_value can ever produce
+# (never "any" -- that's a registry-declared wildcard, not a real
+# runtime type, see primitive_registry.patlang's own note on this).
+make a function called sbe_concrete_types returns tys
+  return ["int", "string", "bool", "list"]
+end
+
+# "any" argument position (e.g. cond's 2nd/3rd args): union every
+# concrete type's bucket at this size, contract-filtered the same way a
+# single concrete type would be -- lets a primitive genuinely accept a
+# value of whatever type, needed for real conditional SELECTION (return
+# whichever of two already-computed values a test picks) without the
+# type system rejecting it outright.
+make a function called sbe_index_lookup_filtered_any takes index, size, contract_fn returns out
+  let out = []
+  let types = sbe_concrete_types()
+  let t = 0
+  let tn = to_num(list_len(types))
+  while t < tn do
+    let out = sbe_list_concat(out, sbe_index_lookup_filtered(index, size, types[t], contract_fn))
+    let t = t + 1
+  end
+  return out
+end
+
 make a function called sbe_index_lookup_filtered takes index, size, ty, contract_fn returns out
+  if ty == "any" then
+    return sbe_index_lookup_filtered_any(index, size, contract_fn)
+  end
   let bucket = sbe_index_lookup(index, size, ty)
   if contract_fn == "" then
     let out = []
@@ -271,7 +299,57 @@ end
 # directly by (size, type) and pruned by its own arg_contract, rather
 # than scanned out of a flat pool. Only arities 1-3 are needed by the
 # registered primitive set.
+make a function called sbe_arg_types_has_any takes arg_types returns yes
+  let i = 0
+  let n = to_num(list_len(arg_types))
+  while i < n do
+    if arg_types[i] == "any" then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called sbe_resolve_any_types takes arg_types, concrete returns out
+  let out = []
+  let i = 0
+  let n = to_num(list_len(arg_types))
+  while i < n do
+    if arg_types[i] == "any" then
+      let out = list_push(out, concrete)
+    else
+      let out = list_push(out, arg_types[i])
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# A call with more than one "any" position (e.g. cond(test, a, b)'s two
+# branches) must have EVERY "any" position resolve to the SAME concrete
+# type together, not independently -- resolving them independently once
+# let a candidate's two branches be different types (say int and bool),
+# which is exactly how a single-example-derived type tag went stale on a
+# later example with a different test outcome, crashing a downstream
+# comparison with a real "type error in cmp" (confirmed directly while
+# building the first_exceeding worked example). Only "any" itself is
+# ever ambiguous this way -- every other declared type is fixed
+# regardless of value, so this loop is skipped entirely (zero behavior
+# change) for every primitive that doesn't use "any".
 make a function called sbe_build_calls takes prim, arg_types, arg_contracts, target_size, index returns out
+  if sbe_arg_types_has_any(arg_types) then
+    let out = []
+    let types = sbe_concrete_types()
+    let t = 0
+    let tn = to_num(list_len(types))
+    while t < tn do
+      let resolved = sbe_resolve_any_types(arg_types, types[t])
+      let out = sbe_list_concat(out, sbe_build_calls(prim, resolved, arg_contracts, target_size, index))
+      let t = t + 1
+    end
+    return out
+  end
   let out = []
   let rem = target_size - 1
   let arity = to_num(list_len(arg_types))
