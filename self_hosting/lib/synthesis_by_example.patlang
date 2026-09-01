@@ -1,0 +1,893 @@
+# Layer 2 of general bottom-up program synthesis for the GOAP goal solver
+# (see plan: general bottom-up program synthesis). A bottom-up ENUMERATIVE
+# synthesizer: given input/output examples, searches compositions of
+# self_hosting/lib/primitive_registry.patlang's registered primitives for
+# the smallest expression that reproduces every example exactly -- classic
+# FlashFill/Blaze-style enumerative program synthesis, deliberately a
+# different technique from self_hosting/lib/synthesis_*.patlang's
+# predicate/rule induction (LGG/anti-unification feeding rule_add/solve):
+# this searches over PRIMITIVE OPERATIONS composed into a VALUE, not over
+# predicate names composed into a rule.
+#
+# Program representation: parser.patlang's own tagged-list AST node shape
+# (["Const", v], ["Call", name, [args...]]), extended here with
+# ["Input", param_name] for a formal parameter reference and ["If", cond,
+# then, else] for the separate decision-list synthesis mode below -- so a
+# winning candidate can, in principle, be pretty-printed the same way
+# lib/parser.patlang's own ast_to_str already knows how.
+#
+# Example representation: a list of [bindings, expected_output] pairs,
+# `bindings` a Dict of param-name -> value (matches self_hosting/lib/
+# synthesis.patlang's [input, output] pair convention, just with named
+# params since these functions can take more than one argument).
+
+include "primitive_registry.patlang"
+
+# ---- evaluator ----
+#
+# Dispatches a Call node to its registry entry's real implementation --
+# either a Layer-1 try_ wrapper (kind "prim") or a previously-derived
+# composite's own stored AST (kind "composite", see register_composite
+# below), replaying that composite's parameter bindings the same way a
+# real function call would. If any sub-call comes back not-ok, the WHOLE
+# candidate is rejected for that example (returned as [false, ...]) rather
+# than aborting the search -- this is exactly why every Layer-1 wrapper is
+# non-fatal (plain `if`, never a fatal require) on its real failure path.
+
+make a function called sbe_call_prim takes try_fn, vals returns result
+  let n = to_num(list_len(vals))
+  if n == 0 then
+    return apply(try_fn)
+  end
+  if n == 1 then
+    return apply(try_fn, vals[0])
+  end
+  if n == 2 then
+    return apply(try_fn, vals[0], vals[1])
+  end
+  if n == 3 then
+    return apply(try_fn, vals[0], vals[1], vals[2])
+  end
+  if n == 4 then
+    return apply(try_fn, vals[0], vals[1], vals[2], vals[3])
+  end
+  return [false, "sbe_call_prim: unsupported arity " + n]
+end
+
+make a function called sbe_eval takes node, bindings, registry returns result
+  let tag = node[0]
+  if tag == "Const" then
+    return [true, node[1]]
+  end
+  if tag == "Input" then
+    return [true, get(bindings, node[1])]
+  end
+  if tag == "If" then
+    let cond = sbe_eval(node[1], bindings, registry)
+    if cond[0] == false then
+      return [false, ""]
+    end
+    if cond[1] then
+      return sbe_eval(node[2], bindings, registry)
+    end
+    return sbe_eval(node[3], bindings, registry)
+  end
+  if tag == "Call" then
+    let prim = node[1]
+    let arg_nodes = node[2]
+    let entry = pr_lookup(registry, prim)
+    if not entry then
+      return [false, ""]
+    end
+    let n = to_num(list_len(arg_nodes))
+    let vals = []
+    let all_ok = true
+    let i = 0
+    while i < n do
+      let sub = sbe_eval(arg_nodes[i], bindings, registry)
+      if sub[0] == false then
+        let all_ok = false
+      end
+      let vals = list_push(vals, sub[1])
+      let i = i + 1
+    end
+    if all_ok == false then
+      return [false, ""]
+    end
+    let kind = entry[0]
+    let impl = entry[1]
+    if kind == "prim" then
+      return sbe_call_prim(impl, vals)
+    end
+    # kind == "composite": impl = [inner_ast, param_names] -- replay the
+    # derived function's own body against ITS OWN parameter names, the
+    # same way any ordinary function call binds formal parameters.
+    let inner_ast = impl[0]
+    let param_names = impl[1]
+    let inner_bindings = new("Dict", "sbe_bind_" + pr_next_id())
+    let j = 0
+    while j < n do
+      send(inner_bindings, "set", param_names[j], vals[j])
+      let j = j + 1
+    end
+    return sbe_eval(inner_ast, inner_bindings, registry)
+  end
+  return [false, "sbe_eval: unknown node tag"]
+end
+
+# ---- size, filtering, candidate construction ----
+
+make a function called sbe_size takes node returns n
+  let tag = node[0]
+  if tag == "Call" then
+    let args = node[2]
+    let total = 1
+    let i = 0
+    let m = to_num(list_len(args))
+    while i < m do
+      let total = total + sbe_size(args[i])
+      let i = i + 1
+    end
+    return total
+  end
+  if tag == "If" then
+    return 1 + sbe_size(node[1]) + sbe_size(node[2]) + sbe_size(node[3])
+  end
+  return 1
+end
+
+# Every candidate AST is tracked as a TYPED node [ast, size, type, value]
+# once built -- `type` is type_of(...) of that AST's value when evaluated
+# against a representative example's bindings ("int"/"string"/"bool", or
+# "invalid" if that evaluation itself came back not-ok); `value` is that
+# same computed value, kept alongside so a primitive's arg_contracts can
+# be checked against it later without re-evaluating. This typing is
+# required, not just an optimization: PatLang raises a FATAL interpreter
+# error on a type-mismatched comparison (`code < 0` on a string aborts
+# the whole process, confirmed empirically -- there is no try/catch to
+# recover from it), so the search must know an argument's type BEFORE
+# ever constructing a call with it, never discover a mismatch by
+# attempting one.
+make a function called sbe_infer_type_and_value takes node, registry, sample_bindings returns pair
+  let r = sbe_eval(node, sample_bindings, registry)
+  if r[0] == false then
+    return ["invalid", ""]
+  end
+  return [type_of(r[1]), r[1]]
+end
+
+make a function called sbe_wrap takes node, registry, sample_bindings returns typed
+  let tv = sbe_infer_type_and_value(node, registry, sample_bindings)
+  return [node, sbe_size(node), tv[0], tv[1]]
+end
+
+# ---- the candidate pool INDEX: a real (type -> size -> bucket) tree,
+# not a flat list scanned on every lookup. sbe_build_calls used to call a
+# linear-scan filter once per (primitive, argument position, size
+# partition) -- with the pool itself growing multiplicatively every
+# level, that repeated O(pool) scan compounded the blowup on top of the
+# search space's own genuine growth (measured directly: a flat,
+# non-decomposed search on replace_in_text grew from a 12s level to a
+# 165s level across 3 levels, growing FASTER than the pool itself). This
+# index turns "every size-5 string-typed node" into a couple of Dict
+# lookups instead of a scan of everything ever built.
+
+make a function called sbe_index_new returns index
+  return new("Dict", "sbe_index_" + pr_next_id())
+end
+
+make a function called sbe_index_add takes index, typed returns done
+  let ty = typed[2]
+  let size = typed[1]
+  let by_size = get(index, ty)
+  if not by_size then
+    let by_size = new("Dict", "sbe_index_bysize_" + pr_next_id())
+    send(index, "set", ty, by_size)
+  end
+  let size_key = "" + size
+  let bucket = get(by_size, size_key)
+  if not bucket then
+    let bucket = []
+  end
+  send(by_size, "set", size_key, list_push(bucket, typed))
+  return true
+end
+
+# Stores an entire (type, size) bucket in ONE Dict write. Only ever
+# called with a size that has never been written for this type before
+# (each level only ever produces nodes of exactly the current size, and
+# sizes strictly increase), so this never has to merge with an existing
+# bucket -- the caller (synthesize_from_examples) accumulates a level's
+# new nodes in a plain LOCAL list first (cheap: a uniquely-held list, not
+# aliased into any Dict, so list_push there is a genuine in-place O(1)
+# amortized append -- see rust-runtime/src/ir/hosts.rs's own comment on
+# host_list_push's Arc::make_mut: pushing onto a list some OTHER live
+# reference still shares forces a full deep clone). Calling sbe_index_add
+# once PER CANDIDATE during a level, instead of batching like this, was
+# measured to make the search SLOWER than the original flat scan it was
+# meant to replace -- every such call re-reads the bucket already stored
+# in the Dict (aliasing its Arc), so the very next list_push onto it has
+# to deep-clone the whole bucket first, turning insertion into O(bucket
+# size) per candidate instead of O(1).
+make a function called sbe_index_set_bucket takes index, ty, size, items returns done
+  let by_size = get(index, ty)
+  if not by_size then
+    let by_size = new("Dict", "sbe_index_bysize_" + pr_next_id())
+    send(index, "set", ty, by_size)
+  end
+  send(by_size, "set", "" + size, items)
+  return true
+end
+
+make a function called sbe_index_lookup takes index, size, ty returns bucket
+  let by_size = get(index, ty)
+  if not by_size then
+    return []
+  end
+  let bucket = get(by_size, "" + size)
+  if not bucket then
+    return []
+  end
+  return bucket
+end
+
+# The (size, type)-indexed bucket, ALSO filtered by a single-argument
+# contract (self_hosting/lib/primitive_registry.patlang's arg_contracts)
+# checked against each candidate's already-computed value -- so a
+# provably-inadmissible argument (e.g. a negative substr count) is
+# dropped before it's ever combined into a Call node, not generated then
+# rejected by full evaluation. Returns raw AST nodes (the Call node needs
+# the ast, not the bookkeeping).
+make a function called sbe_index_lookup_filtered takes index, size, ty, contract_fn returns out
+  let bucket = sbe_index_lookup(index, size, ty)
+  if contract_fn == "" then
+    let out = []
+    let i = 0
+    let n = to_num(list_len(bucket))
+    while i < n do
+      let out = list_push(out, bucket[i][0])
+      let i = i + 1
+    end
+    return out
+  end
+  let out = []
+  let i = 0
+  let n = to_num(list_len(bucket))
+  while i < n do
+    let typed = bucket[i]
+    if apply(contract_fn, typed[3]) then
+      let out = list_push(out, typed[0])
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# All Call nodes of exactly target_size for a primitive with the given
+# per-position arg_types/arg_contracts, drawing arguments from the INDEX
+# (any smaller, type-tagged node already built), by partitioning
+# target_size - 1 (the budget left after paying 1 for the Call itself)
+# across the primitive's argument positions -- each position looked up
+# directly by (size, type) and pruned by its own arg_contract, rather
+# than scanned out of a flat pool. Only arities 1-3 are needed by the
+# registered primitive set.
+make a function called sbe_build_calls takes prim, arg_types, arg_contracts, target_size, index returns out
+  let out = []
+  let rem = target_size - 1
+  let arity = to_num(list_len(arg_types))
+  if arity == 1 then
+    if rem >= 1 then
+      let group = sbe_index_lookup_filtered(index, rem, arg_types[0], arg_contracts[0])
+      let i = 0
+      let n = to_num(list_len(group))
+      while i < n do
+        let out = list_push(out, ["Call", prim, [group[i]]])
+        let i = i + 1
+      end
+    end
+    return out
+  end
+  if arity == 2 then
+    let a = 1
+    while a <= rem - 1 do
+      let b = rem - a
+      let ga = sbe_index_lookup_filtered(index, a, arg_types[0], arg_contracts[0])
+      let gb = sbe_index_lookup_filtered(index, b, arg_types[1], arg_contracts[1])
+      let i = 0
+      let ni = to_num(list_len(ga))
+      while i < ni do
+        let j = 0
+        let nj = to_num(list_len(gb))
+        while j < nj do
+          let out = list_push(out, ["Call", prim, [ga[i], gb[j]]])
+          let j = j + 1
+        end
+        let i = i + 1
+      end
+      let a = a + 1
+    end
+    return out
+  end
+  if arity == 3 then
+    let a = 1
+    while a <= rem - 2 do
+      let b = 1
+      while b <= rem - a - 1 do
+        let c = rem - a - b
+        let ga = sbe_index_lookup_filtered(index, a, arg_types[0], arg_contracts[0])
+        let gb = sbe_index_lookup_filtered(index, b, arg_types[1], arg_contracts[1])
+        let gc = sbe_index_lookup_filtered(index, c, arg_types[2], arg_contracts[2])
+        let i = 0
+        let ni = to_num(list_len(ga))
+        while i < ni do
+          let j = 0
+          let nj = to_num(list_len(gb))
+          while j < nj do
+            let k = 0
+            let nk = to_num(list_len(gc))
+            while k < nk do
+              let out = list_push(out, ["Call", prim, [ga[i], gb[j], gc[k]]])
+              let k = k + 1
+            end
+            let j = j + 1
+          end
+          let i = i + 1
+        end
+        let b = b + 1
+      end
+      let a = a + 1
+    end
+    return out
+  end
+  if arity == 4 then
+    let a = 1
+    while a <= rem - 3 do
+      let b = 1
+      while b <= rem - a - 2 do
+        let c = 1
+        while c <= rem - a - b - 1 do
+          let d = rem - a - b - c
+          let ga = sbe_index_lookup_filtered(index, a, arg_types[0], arg_contracts[0])
+          let gb = sbe_index_lookup_filtered(index, b, arg_types[1], arg_contracts[1])
+          let gc = sbe_index_lookup_filtered(index, c, arg_types[2], arg_contracts[2])
+          let gd = sbe_index_lookup_filtered(index, d, arg_types[3], arg_contracts[3])
+          let i = 0
+          let ni = to_num(list_len(ga))
+          while i < ni do
+            let j = 0
+            let nj = to_num(list_len(gb))
+            while j < nj do
+              let k = 0
+              let nk = to_num(list_len(gc))
+              while k < nk do
+                let l = 0
+                let nl = to_num(list_len(gd))
+                while l < nl do
+                  let out = list_push(out, ["Call", prim, [ga[i], gb[j], gc[k], gd[l]]])
+                  let l = l + 1
+                end
+                let k = k + 1
+              end
+              let j = j + 1
+            end
+            let i = i + 1
+          end
+          let c = c + 1
+        end
+        let b = b + 1
+      end
+      let a = a + 1
+    end
+    return out
+  end
+  return out
+end
+
+make a function called sbe_matches_all takes node, examples, registry returns ok
+  let i = 0
+  let n = to_num(list_len(examples))
+  while i < n do
+    let ex = examples[i]
+    let result = sbe_eval(node, ex[0], registry)
+    if result[0] == false then
+      return false
+    end
+    if result[1] != ex[1] then
+      return false
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+# Observational-equivalence key: two candidates that produce the exact
+# same [ok, value] outcome across every example are interchangeable for
+# search purposes -- keeping only the first (smallest) one found is the
+# same pruning classic enumerative synthesis engines use to stay
+# tractable.
+make a function called sbe_output_key takes node, examples, registry returns key
+  let key = sb_new()
+  let i = 0
+  let n = to_num(list_len(examples))
+  while i < n do
+    let ex = examples[i]
+    let result = sbe_eval(node, ex[0], registry)
+    if result[0] then
+      sb_push(key, "1:" + ("" + result[1]))
+    else
+      sb_push(key, "0")
+    end
+    sb_push(key, "|")
+    let i = i + 1
+  end
+  return sb_str(key)
+end
+
+make a function called sbe_list_concat takes a, b returns out
+  let out = a
+  let i = 0
+  let n = to_num(list_len(b))
+  while i < n do
+    let out = list_push(out, b[i])
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called sbe_seed_leaves takes input_names, const_values returns out
+  let out = []
+  let i = 0
+  let n = to_num(list_len(input_names))
+  while i < n do
+    let out = list_push(out, ["Input", input_names[i]])
+    let i = i + 1
+  end
+  let i = 0
+  let n = to_num(list_len(const_values))
+  while i < n do
+    let out = list_push(out, ["Const", const_values[i]])
+    let i = i + 1
+  end
+  return out
+end
+
+# A small, DOCUMENTED curated constant pool, not the full 0-255 byte range:
+# the plan's original "0-255" idea would blow up the level-2 combinatorics
+# (every Call argument slot drawn from this pool) to hundreds of millions
+# of candidates for a 2-3 argument primitive. Covers the separators/counts
+# actually needed by ASCII text parsing (CR/LF/space/tab, and small
+# offsets like "one past a delimiter"); callers needing a different pool
+# (e.g. a specific separator string) pass it via `extra_consts`.
+make a function called sbe_default_int_consts returns cs
+  return [0, 1, 2, 3, 9, 10, 13, 32]
+end
+
+# ---- the bottom-up search ----
+#
+# Returns ["OK", ast] for the smallest AST (by node count) that reproduces
+# every example exactly, searched in strictly increasing size order so the
+# first match found IS the smallest, or ["ERR", msg] if none exists up to
+# max_size.
+# ---- diagnostics ----
+#
+# The exponential blow-up measured on a flat, non-decomposed search (see
+# the plan/session notes on replace_in_text) and the "constant trap"/
+# "algebraic coincidence" pitfalls found repeatedly across this session's
+# demos (after_space, tail_after, inner_text -- always because too few
+# examples let a smaller, wrong candidate through) are the SAME kind of
+# signal in both directions: the search itself already has the data to
+# tell a BDD author "this spec needs splitting" (sustained fast pool
+# growth) or "this spec needs another example" (more than one
+# structurally different, equally-minimal candidate satisfies it) --
+# rather than that only ever being noticed after the fact by a human
+# staring at a suspicious-looking AST. These notes are advisory only
+# (appended as a 3rd list element every existing caller already ignores,
+# since none of them look past result[0]/result[1]).
+
+make a function called sbe_growth_note takes size, ratio returns note
+  return "search pool grew " + to_fixed(ratio, 1) + "x at size " + size + " (sustained fast growth) -- if this gets slow, consider decomposing the target into smaller, independently-specified composites (see how after_space/take_before/take_after/splice were split out of replace_in_text)"
+end
+
+make a function called sbe_ambiguity_note takes alt_count, size returns note
+  return "" + alt_count + " other structurally different candidate(s) of the same minimal size (" + size + ") also satisfy every given example -- if the intended behavior is more specific than what's shown, add a disambiguating example (the same fix that ruled out after_space's substr-clamp shortcut and inner_text's reused-length shortcut)"
+end
+
+make a function called synthesize_from_examples takes examples, input_names, extra_consts, registry, primitive_names, max_size returns result
+  let consts = sbe_list_concat(sbe_default_int_consts(), extra_consts)
+  let sample_bindings = examples[0][0]
+  let leaves = sbe_seed_leaves(input_names, consts)
+  let index = sbe_index_new()
+  let seen = new("Dict", "sbe_seen_" + pr_next_id())
+  let pool_count = 0
+  let notes = []
+  let high_growth_streak = 0
+
+  let winner = ["Const", ""]
+  let found_match = false
+  let alt_count = 0
+  let i = 0
+  let n = to_num(list_len(leaves))
+  while i < n do
+    let node = leaves[i]
+    if sbe_matches_all(node, examples, registry) then
+      if found_match then
+        let alt_count = alt_count + 1
+      else
+        let found_match = true
+        let winner = node
+      end
+    end
+    let key = sbe_output_key(node, examples, registry)
+    if not get(seen, key) then
+      send(seen, "set", key, true)
+      sbe_index_add(index, sbe_wrap(node, registry, sample_bindings))
+      let pool_count = pool_count + 1
+    end
+    let i = i + 1
+  end
+  if found_match then
+    if alt_count > 0 then
+      let notes = list_push(notes, sbe_ambiguity_note(alt_count, 1))
+    end
+    return ["OK", winner, notes]
+  end
+
+  let size = 2
+  while size <= max_size do
+    print("synthesize_from_examples: size=" + size + " pool=" + pool_count + " at " + now_ms())
+    let pool_before_level = pool_count
+    # Accumulate this level's newly-accepted candidates in plain LOCAL
+    # lists, one per runtime type, grouped by hand rather than through
+    # the Dict-backed index -- every candidate this level shares the same
+    # `size`, so each of these lists becomes exactly one brand-new bucket
+    # merged into the index ONCE at the end of the level (via
+    # sbe_index_set_bucket), instead of once per candidate. A uniquely-
+    # held local list's list_push is a genuine O(1) amortized append;
+    # reading a bucket back out of the index mid-level and pushing onto
+    # THAT would alias its stored Arc and force a full deep clone on
+    # every single push (measured directly: doing it that way made this
+    # search slower than the flat scan it was meant to replace).
+    let level_int = []
+    let level_string = []
+    let level_bool = []
+    let level_list = []
+    let winner = ["Const", ""]
+    let found_match = false
+    let alt_count = 0
+    let p = 0
+    let pn = to_num(list_len(primitive_names))
+    while p < pn do
+      let prim = primitive_names[p]
+      let entry = pr_lookup(registry, prim)
+      if entry then
+        let arg_types = entry[5]
+        let arg_contracts = entry[7]
+        let candidates = sbe_build_calls(prim, arg_types, arg_contracts, size, index)
+        let c = 0
+        let cn = to_num(list_len(candidates))
+        while c < cn do
+          let node = candidates[c]
+          if sbe_matches_all(node, examples, registry) then
+            if found_match then
+              let alt_count = alt_count + 1
+            else
+              let found_match = true
+              let winner = node
+            end
+          end
+          let key = sbe_output_key(node, examples, registry)
+          let already = get(seen, key)
+          if not already then
+            send(seen, "set", key, true)
+            let typed = sbe_wrap(node, registry, sample_bindings)
+            let ty = typed[2]
+            if ty == "int" then
+              let level_int = list_push(level_int, typed)
+            else
+              if ty == "string" then
+                let level_string = list_push(level_string, typed)
+              else
+                if ty == "bool" then
+                  let level_bool = list_push(level_bool, typed)
+                else
+                  if ty == "list" then
+                    let level_list = list_push(level_list, typed)
+                  end
+                end
+              end
+            end
+            let pool_count = pool_count + 1
+          end
+          let c = c + 1
+        end
+      end
+      let p = p + 1
+    end
+    if to_num(list_len(level_int)) > 0 then
+      sbe_index_set_bucket(index, "int", size, level_int)
+    end
+    if to_num(list_len(level_string)) > 0 then
+      sbe_index_set_bucket(index, "string", size, level_string)
+    end
+    if to_num(list_len(level_bool)) > 0 then
+      sbe_index_set_bucket(index, "bool", size, level_bool)
+    end
+    if to_num(list_len(level_list)) > 0 then
+      sbe_index_set_bucket(index, "list", size, level_list)
+    end
+
+    if pool_before_level > 0 then
+      let ratio = pool_count / pool_before_level
+      if ratio > 2.5 then
+        let high_growth_streak = high_growth_streak + 1
+        if high_growth_streak >= 2 then
+          let notes = list_push(notes, sbe_growth_note(size, ratio))
+        end
+      else
+        let high_growth_streak = 0
+      end
+    end
+
+    if found_match then
+      if alt_count > 0 then
+        let notes = list_push(notes, sbe_ambiguity_note(alt_count, size))
+      end
+      return ["OK", winner, notes]
+    end
+    let size = size + 1
+  end
+
+  let notes = list_push(notes, "reached max_size (" + max_size + ") without a match -- consider decomposing the target into smaller, independently-specified composites (see how after_space/take_before/take_after/splice were split out of replace_in_text) rather than raising max_size further")
+  return ["ERR", "no candidate up to size " + max_size, notes]
+end
+
+# ---- second mode: decision-list synthesis ----
+#
+# A finite literal-input -> literal-output mapping (e.g. "/health" ->
+# "OK") isn't naturally reachable by expression composition alone -- this
+# is a deliberately different, much simpler technique (build a chain of
+# equality-guarded branches straight from the example pairs, ending in a
+# default), not a variant of the enumerator above.
+make a function called synthesize_lookup_from_examples takes input_name, examples, default_value returns ast
+  let node = ["Const", default_value]
+  let i = to_num(list_len(examples)) - 1
+  while i >= 0 do
+    let ex = examples[i]
+    let cond = ["Call", "str_eq", [["Input", input_name], ["Const", ex[0]]]]
+    let node = ["If", cond, ["Const", ex[1]], node]
+    let i = i - 1
+  end
+  return node
+end
+
+# ---- multi-language emission ----
+#
+# Walks a winning (non-decision-list) AST once, looking up each Call
+# node's primitive/composite name in the registry's per-language snippet
+# dict and substituting recursively-emitted argument code into the
+# template's {0}/{1}/... placeholders. Errors BY NAME on a primitive with
+# no snippet registered for the requested language -- matching
+# self_hosting/lib/transpile_ruby.patlang's own convention of a clear
+# ["Err", msg] over silently-broken output -- rather than guessing.
+# Deliberately does not handle "If" nodes (decision-list ASTs use their
+# own dedicated PatLang-only emitter below, since PatLang's `if` is a
+# statement, not an expression -- there is no single-expression rendering
+# to fall back to for that shape in this language).
+
+make a function called sbe_quote_string takes s returns text
+  let out = sb_new()
+  sb_push(out, "\"")
+  let i = 0
+  let n = s.length
+  while i < n do
+    let c = char_code(s, i)
+    if c == 92 then
+      sb_push(out, "\\\\")
+    else
+      if c == 34 then
+        sb_push(out, "\\\"")
+      else
+        if c == 10 then
+          sb_push(out, "\\n")
+        else
+          if c == 13 then
+            sb_push(out, "\\r")
+          else
+            sb_push(out, s[i])
+          end
+        end
+      end
+    end
+    let i = i + 1
+  end
+  sb_push(out, "\"")
+  return sb_str(out)
+end
+
+make a function called sbe_emit_const takes v returns text
+  let ty = type_of(v)
+  if ty == "string" then
+    return sbe_quote_string(v)
+  end
+  if ty == "bool" then
+    if v then
+      return "true"
+    end
+    return "false"
+  end
+  return "" + v
+end
+
+make a function called sbe_replace_all takes s, needle, replacement returns out
+  let out = sb_new()
+  let i = 0
+  let nlen = needle.length
+  let slen = s.length
+  while i < slen do
+    if (nlen > 0) and (i <= slen - nlen) and (substr(s, i, nlen) == needle) then
+      sb_push(out, replacement)
+      let i = i + nlen
+    else
+      sb_push(out, s[i])
+      let i = i + 1
+    end
+  end
+  return sb_str(out)
+end
+
+make a function called sbe_fill_template takes tmpl, arg_texts returns out
+  let out = tmpl
+  let i = 0
+  let n = to_num(list_len(arg_texts))
+  while i < n do
+    let placeholder = "{" + i + "}"
+    let out = sbe_replace_all(out, placeholder, arg_texts[i])
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called emit_ast takes node, lang, registry returns result
+  let tag = node[0]
+  if tag == "Const" then
+    return ["OK", sbe_emit_const(node[1])]
+  end
+  if tag == "Input" then
+    return ["OK", node[1]]
+  end
+  if tag == "Call" then
+    let prim = node[1]
+    let arg_nodes = node[2]
+    let tmpl = pr_snippet(registry, prim, lang)
+    if tmpl == "" then
+      return ["ERR", "no \"" + lang + "\" snippet registered for \"" + prim + "\""]
+    end
+    let arg_texts = []
+    let i = 0
+    let n = to_num(list_len(arg_nodes))
+    while i < n do
+      let sub = emit_ast(arg_nodes[i], lang, registry)
+      if sub[0] != "OK" then
+        return sub
+      end
+      let arg_texts = list_push(arg_texts, sub[1])
+      let i = i + 1
+    end
+    return ["OK", sbe_fill_template(tmpl, arg_texts)]
+  end
+  return ["ERR", "emit_ast: unsupported node tag \"" + tag + "\" for expression emission (decision-list ASTs use emit_decision_list_patlang)"]
+end
+
+# Full function-definition text for a plain expression-bodied composite
+# (crlf/first_line/es_contains-shaped -- no branching), in PatLang.
+make a function called emit_function_def_patlang takes name, param_names, node, registry returns result
+  let body = emit_ast(node, "patlang", registry)
+  if body[0] != "OK" then
+    return body
+  end
+  let params = sbe_join_comma(param_names)
+  let text = "make a function called " + name + " takes " + params + " returns result\n  let result = " + body[1] + "\n  return result\nend\n"
+  if to_num(list_len(param_names)) == 0 then
+    let text = "make a function called " + name + " returns result\n  let result = " + body[1] + "\n  return result\nend\n"
+  end
+  return ["OK", text]
+end
+
+make a function called sbe_join_comma takes items returns out
+  let out = sb_new()
+  let i = 0
+  let n = to_num(list_len(items))
+  while i < n do
+    if i > 0 then
+      sb_push(out, ", ")
+    end
+    sb_push(out, items[i])
+    let i = i + 1
+  end
+  return sb_str(out)
+end
+
+# Decision-list ASTs (synthesize_lookup_from_examples's output) are a
+# strictly right-leaning chain of ["If", cond, then, rest] nodes ending in
+# a default -- rendered directly as PatLang if/elif/.../else statements
+# (CLAUDE.md's own convention for this repo: elif, never nested else-if),
+# not through the generic expression emitter above.
+make a function called emit_decision_list_patlang takes node, registry returns text
+  let out = sb_new()
+  let cur = node
+  let first = true
+  while cur[0] == "If" do
+    let cond_r = emit_ast(cur[1], "patlang", registry)
+    let then_r = emit_ast(cur[2], "patlang", registry)
+    if first then
+      sb_push(out, "if " + cond_r[1] + " then\n")
+      let first = false
+    else
+      sb_push(out, "elif " + cond_r[1] + " then\n")
+    end
+    sb_push(out, "    return " + then_r[1] + "\n")
+    let cur = cur[3]
+  end
+  let default_r = emit_ast(cur, "patlang", registry)
+  sb_push(out, "  else\n    return " + default_r[1] + "\n  end\n")
+  return sb_str(out)
+end
+
+make a function called emit_decision_function_patlang takes name, param_name, node, registry returns text
+  return "make a function called " + name + " takes " + param_name + " returns result\n  " + emit_decision_list_patlang(node, registry) + "end\n"
+end
+
+# ---- composites become registry citizens ----
+#
+# Once synthesize_from_examples/synthesize_lookup_from_examples finds a
+# winning AST, registering it back into the SAME registry under `name`
+# means a LATER, larger search can call it as an ordinary primitive
+# (arity = param count), and its call-site rendering is available in
+# every language the registry already knows about -- call syntax
+# `name(args...)` is uniform across PatLang/Ruby/Python, so no per-
+# language body re-derivation is needed just to make the composite
+# CALLABLE; only actually emitting its own definition (emit_function_def_
+# patlang / emit_decision_function_patlang above) needs the AST itself,
+# which register_composite stores alongside the call template.
+make a function called register_composite takes registry, name, ast, param_names, arg_types, cost returns done
+  let snippets = pr_new_snippets()
+  let placeholders = []
+  let i = 0
+  let n = to_num(list_len(param_names))
+  while i < n do
+    let placeholders = list_push(placeholders, "{" + i + "}")
+    let i = i + 1
+  end
+  let call_text = name + "(" + sbe_join_comma(placeholders) + ")"
+  pr_set_snippet(snippets, "patlang", call_text)
+  pr_set_snippet(snippets, "ruby", call_text)
+  pr_set_snippet(snippets, "python", call_text)
+  # Composites are registered under ret_type "any" (rather than trying to
+  # infer a precise one here without access to the examples that proved
+  # them) and with no extra arg_contracts beyond their type tags -- this
+  # keeps register_composite's own signature unchanged for every existing
+  # caller. Being "any" only means pr_names_for_ret_type always offers a
+  # composite as a candidate for any requested type; it never causes one
+  # to be wrongly excluded, so this is a safe, low-precision default, not
+  # a correctness gap.
+  let arg_contracts = []
+  let i = 0
+  let n = to_num(list_len(arg_types))
+  while i < n do
+    let arg_contracts = list_push(arg_contracts, "")
+    let i = i + 1
+  end
+  send(registry, "set", name, ["composite", [ast, param_names], to_num(list_len(param_names)), cost, snippets, arg_types, "any", arg_contracts])
+  let idx = get(registry, "__by_ret_type__")
+  if not idx then
+    let idx = new("Dict", "pr_by_ret_type_" + pr_next_id())
+    send(registry, "set", "__by_ret_type__", idx)
+  end
+  let existing = get(idx, "any")
+  if existing then
+    send(idx, "set", "any", list_push(existing, name))
+  else
+    send(idx, "set", "any", [name])
+  end
+  return true
+end

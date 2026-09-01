@@ -1,0 +1,244 @@
+# Search-and-replace-in-file utility, specified ENTIRELY as BDD .feature
+# text below -- no hand-written replace algorithm anywhere in this file.
+# self_hosting/lib/bdd_examples.patlang turns the Given/Then scenarios
+# into (bindings, expected) examples automatically, self_hosting/lib/
+# synthesis_by_example.patlang derives the actual string-manipulation
+# logic from them, and self_hosting/lib/bdd_file_scenarios.patlang then
+# runs a SEPARATE, file-level .feature scenario end-to-end against a real
+# file on disk to prove the derived logic actually works as a program,
+# not just in isolation.
+#
+# A single flat AST for the whole transform is too large for bounded
+# enumeration to search directly (confirmed empirically: max_size ~20
+# over 5 primitives did not finish in several minutes -- see the
+# session's own benchmark of this). The problem naturally splits into a
+# SEARCH half (where does `original` occur?) and a REPLACE half (splice
+# `replacement` in at that position) -- so the decomposition here follows
+# that split directly, rather than being an arbitrary implementation
+# choice:
+#
+#   find_position(text, original) = find_substr(text, original)   -- SEARCH
+#   take_before(text, position)   = substr(text, 0, position)
+#   take_after(text, position)    = substr(text, position, str_len(text))
+#   splice(text, pos, len, repl)  = take_before + repl + take_after(pos+len)  -- REPLACE
+#   replace_in_text(text, o, r)   = splice(text, find_position(text,o), str_len(o), r)
+#
+# find_position/take_before/take_after are independently reusable
+# composites (not one-off pieces of "the replace function"), not just an
+# implementation detail -- e.g. take_before/take_after are exactly what
+# any future "insert/trim/crop at a located position" demo would want.
+#
+# splice takes 4 arguments, which pushed self_hosting/lib/synthesis_by_
+# example.patlang's sbe_build_calls/sbe_call_prim (previously arity 1-3
+# only) to gain arity-4 support -- a real, needed extension, not
+# speculative. Composing splice from take_before/take_after/add/concat
+# (rather than searching one flat 4-argument AST over raw primitives)
+# still took ~2m44s on a cold library, dominated by splice's own
+# 4-parameter search -- meaningfully more than head_before/tail_after's
+# earlier ~15s two-piece decomposition, the real cost of the extra
+# argument. The composite library (self_hosting/lib/composite_library.
+# patlang) is what makes that cost a one-time thing: this file always
+# tries the library FIRST and only re-derives what's missing.
+#
+# Bugs found and fixed while writing THESE examples (kept as comments at
+# the point they occurred): take_after's first attempt was off by one
+# (position 3 instead of 4 in the long-tail example), which made that
+# scenario unsatisfiable by ANY correct formula -- a real ERR, correctly
+# reported, not a solver bug. A separate, genuine finding from the
+# original head_before/tail_after decomposition: tail_after's first 3
+# examples all had a remaining tail under 32 characters, so a bare
+# Const(32) satisfied every one of them exactly as well as the intended
+# str_len(text)-based formula -- the same substr-clamp-shortcut pitfall
+# found in after_space (synth_demo_http_helpers.patlang) and predicted in
+# synth_demo_adversarial.patlang, confirmed a third time in a new
+# function. Fixed the only way it can be: adding a genuinely long
+# held-out example that no small fixed constant survives -- take_after
+# below inherits that same long-tail scenario for the same reason.
+#
+# The only hand-authored code in this file is the operation wrapper
+# (run_search_replace_op) that performs real file I/O -- read_file,
+# evaluate the derived AST, write_file -- never the replace logic itself.
+# This mirrors the same boundary self_hosting/examples/goap_webservice_
+# demo.patlang draws around StartServerStep's socket loop: an
+# orchestration shell around synthesized logic is accepted as out of
+# scope for example-driven derivation (there's no clean input/output
+# pair for "write bytes to disk"), the logic inside it is not.
+
+include "../lib/test.patlang"
+include "../lib/bdd_examples.patlang"
+include "../lib/bdd_file_scenarios.patlang"
+include "../lib/composite_library.patlang"
+
+t_init()
+
+# ---- SEARCH ----
+
+make a function called find_position_feature returns text
+  return "Feature: find_position -- where original first occurs in text
+
+Scenario: match at the very start
+  Given text = \"cat sat mat\"
+  Given original = \"cat\"
+  Then result = 0
+
+Scenario: match in the middle
+  Given text = \"the quick fox\"
+  Given original = \"quick\"
+  Then result = 4
+
+Scenario: match near the end
+  Given text = \"a b c d e original\"
+  Given original = \"original\"
+  Then result = 10
+"
+end
+
+# ---- REPLACE, split into two small position-based pieces ----
+
+make a function called take_before_feature returns text
+  return "Feature: take_before -- everything in text up to (not including) position
+
+Scenario: mid-string position
+  Given text = \"the quick fox\"
+  Given position = 4
+  Then result = \"the \"
+
+Scenario: position zero
+  Given text = \"cat sat mat\"
+  Given position = 0
+  Then result = \"\"
+"
+end
+
+make a function called take_after_feature returns text
+  return "Feature: take_after -- everything in text from position onward
+
+Scenario: mid-string position
+  Given text = \"the quick fox\"
+  Given position = 9
+  Then result = \" fox\"
+
+Scenario: a tail deliberately over 32 characters -- rules out a fixed-constant shortcut
+  Given text = \"a b this tail deliberately runs past thirty two characters and keeps going for a while longer still\"
+  Given position = 4
+  Then result = \"this tail deliberately runs past thirty two characters and keeps going for a while longer still\"
+"
+end
+
+make a function called splice_examples_raw returns pairs
+  let s1 = new("Dict", "sr_splice_s1")
+  send(s1, "set", "text", "the quick fox")
+  send(s1, "set", "position", 4)
+  send(s1, "set", "original_len", 5)
+  send(s1, "set", "replacement", "slow")
+  let s2 = new("Dict", "sr_splice_s2")
+  send(s2, "set", "text", "a b c")
+  send(s2, "set", "position", 2)
+  send(s2, "set", "original_len", 1)
+  send(s2, "set", "replacement", "banana")
+  return [[s1, "the slow fox"], [s2, "a banana c"]]
+end
+
+make a function called replace_examples_raw returns pairs
+  let r1 = new("Dict", "sr_replace_r1")
+  send(r1, "set", "text", "the quick fox")
+  send(r1, "set", "original", "quick")
+  send(r1, "set", "replacement", "slow")
+  let r2 = new("Dict", "sr_replace_r2")
+  send(r2, "set", "text", "cat sat mat")
+  send(r2, "set", "original", "cat")
+  send(r2, "set", "replacement", "hat")
+  return [[r1, "the slow fox"], [r2, "hat sat mat"]]
+end
+
+make a function called sr_have_all takes registry returns yes
+  return pr_lookup(registry, "find_position") and pr_lookup(registry, "take_before") and pr_lookup(registry, "take_after") and pr_lookup(registry, "splice") and pr_lookup(registry, "replace_in_text")
+end
+
+make a function called run_synth_demo_search_replace returns ok
+  let registry = pr_standard_registry()
+  cl_load_all(registry)
+
+  if sr_have_all(registry) then
+    print("search-replace: reusing find_position/take_before/take_after/splice/replace_in_text from the composite library")
+  else
+    print("search-replace: composite library incomplete -- deriving from scratch (the ~2m44s cold path) and saving")
+
+    let fp_parsed = bde_examples_from_feature(find_position_feature())
+    let fp_result = synthesize_from_examples(fp_parsed[1], fp_parsed[0], [], registry, ["find_substr"], 4)
+    check("find_position (the SEARCH half) is derived purely from its Given/Then feature text", fp_result[0], "OK")
+    register_composite(registry, "find_position", fp_result[1], fp_parsed[0], ["string", "string"], 3)
+    cl_save("text", "find_position", fp_parsed[0], ["string", "string"], 3, "expression", fp_result[1], fp_parsed[1])
+
+    let tb_parsed = bde_examples_from_feature(take_before_feature())
+    let tb_result = synthesize_from_examples(tb_parsed[1], tb_parsed[0], [], registry, ["substr"], 6)
+    check("take_before is derived purely from its Given/Then feature text", tb_result[0], "OK")
+    register_composite(registry, "take_before", tb_result[1], tb_parsed[0], ["string", "int"], 2)
+    cl_save("text", "take_before", tb_parsed[0], ["string", "int"], 2, "expression", tb_result[1], tb_parsed[1])
+
+    let ta_parsed = bde_examples_from_feature(take_after_feature())
+    let ta_result = synthesize_from_examples(ta_parsed[1], ta_parsed[0], [], registry, ["substr", "str_len"], 8)
+    check("take_after is derived purely from its Given/Then feature text (needs the long held-out example)", ta_result[0], "OK")
+    check("take_after's derived formula uses str_len, not a fixed-constant shortcut", contains_text("" + ta_result[1], "str_len"), true)
+    register_composite(registry, "take_after", ta_result[1], ta_parsed[0], ["string", "int"], 3)
+    cl_save("text", "take_after", ta_parsed[0], ["string", "int"], 3, "expression", ta_result[1], ta_parsed[1])
+
+    let splice_examples = splice_examples_raw()
+    let splice_result = synthesize_from_examples(splice_examples, ["text", "position", "original_len", "replacement"], [], registry, ["take_before", "take_after", "add", "concat"], 12)
+    check("splice (the REPLACE half) is derived by COMPOSING take_before + take_after, purely from its own examples", splice_result[0], "OK")
+    register_composite(registry, "splice", splice_result[1], ["text", "position", "original_len", "replacement"], ["string", "int", "int", "string"], 6)
+    cl_save("text", "splice", ["text", "position", "original_len", "replacement"], ["string", "int", "int", "string"], 6, "expression", splice_result[1], splice_examples)
+
+    let replace_examples = replace_examples_raw()
+    let replace_result = synthesize_from_examples(replace_examples, ["text", "original", "replacement"], [], registry, ["find_position", "splice", "str_len"], 10)
+    check("replace_in_text composes the SEARCH half (find_position) with the REPLACE half (splice)", replace_result[0], "OK")
+    register_composite(registry, "replace_in_text", replace_result[1], ["text", "original", "replacement"], ["string", "string", "string"], 8)
+    cl_save("text", "replace_in_text", ["text", "original", "replacement"], ["string", "string", "string"], 8, "expression", replace_result[1], replace_examples)
+  end
+
+  let replace_entry = pr_lookup(registry, "replace_in_text")
+  set_var("sr_replace_ast", replace_entry[1][0])
+  set_var("sr_registry", registry)
+
+  # ---- run the derived logic end-to-end against a REAL file ----
+
+  let op_registry = new("Dict", "sr_op_registry")
+  send(op_registry, "set", "search-replace", "run_search_replace_op")
+
+  let fixture_path = "self_hosting/build/synth_demo_search_replace_fixture.txt"
+  let file_feature = "Feature: search-replace on a real file
+
+Scenario: replace text in a real file
+  Given a file named \"" + fixture_path + "\" containing \"the quick fox jumps\"
+  And the original is \"quick\"
+  And the replacement is \"slow\"
+  When I run \"search-replace\" on \"" + fixture_path + "\"
+  Then the file \"" + fixture_path + "\" contains \"the slow fox jumps\"
+"
+  bfs_run_feature(file_feature, op_registry)
+
+  t_report()
+  return get("__vars", "t_fail") == 0
+end
+
+# Thin, hand-authored I/O orchestration -- read the file, evaluate the
+# SYNTHESIZED AST directly (sbe_eval, not a hand-written formula), write
+# the result back. Fetches the derived AST/registry from __vars since
+# bdd_file_scenarios.patlang's apply(op_fn, path, extra) dispatch calls
+# this by name with only (path, extra), the same convention self_hosting/
+# examples/microservices_demo.patlang-style code already uses for shared
+# state that can't be passed as a closure.
+make a function called run_search_replace_op takes path, extra returns done
+  let contents = read_file(path)
+  let bindings = new("Dict", "sr_call_bindings_" + pr_next_id())
+  send(bindings, "set", "text", contents)
+  send(bindings, "set", "original", get(extra, "original"))
+  send(bindings, "set", "replacement", get(extra, "replacement"))
+  let ast = get("__vars", "sr_replace_ast")
+  let registry = get("__vars", "sr_registry")
+  let result = sbe_eval(ast, bindings, registry)
+  write_file(path, result[1])
+  return true
+end
+
+run_synth_demo_search_replace()

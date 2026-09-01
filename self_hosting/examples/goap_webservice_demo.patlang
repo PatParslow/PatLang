@@ -1,0 +1,378 @@
+# GOAP planning WITHOUT the logic aspect: standing up a small real HTTP
+# service with several endpoints, planned and executed via the existing
+# GOAP primitives (action_add/plan, self_hosting/lib/goap_step_interfaces.
+# patlang) but authored entirely in GROUND facts -- no uppercase-first
+# logic-variable args anywhere in this file. Every other GOAP demo in this
+# repo (goap_contract_bdd_demo.patlang, goap_step_interfaces_selftest.
+# patlang) relies on the planner's unification of a logic variable (e.g.
+# "X") against bound facts; that machinery lives inside hosts.rs's
+# ground_action_instances/unify_args and can't be stripped out of the
+# planner itself, but it is simply never EXERCISED when every action's
+# preconditions/effects are already fully ground -- which is what this
+# file demonstrates, with a BDD check (st_plan_is_ground_only below) that
+# actually scans the winning plan for the absence of any "VAR=" binding
+# rather than just asserting the property in prose.
+#
+# The domain is deliberately given MORE actions than the goal strictly
+# needs, so plan() actually has to search rather than just execute a
+# single hand-fed sequence:
+#   - Two competing ways to satisfy endpoint_registered(health): a direct
+#     action (cost 5) and a two-step "load a template, then register from
+#     it" path (cost 2 + 1 = 3). hosts.rs's planner is real uniform-cost
+#     (Dijkstra) search over world-states (see the comment at
+#     rust-runtime/src/ir/hosts.rs:~1254), so the cheaper 2-step path
+#     should win -- checked below by asserting the winning plan contains
+#     register_health_via_template and NOT register_health_direct.
+#   - echo/time endpoints each have a genuine prerequisite the planner has
+#     to discover on its own (load_network_module / load_clock_module)
+#     before the corresponding registration action's precondition is
+#     satisfiable at all -- there's no way to reach the goal without
+#     finding that dependency first.
+#   - Three decoy actions (register_admin_endpoint, whose effect fact
+#     the goal never asks for; register_legacy_health_endpoint, whose
+#     effect fact name deliberately looks similar to the one needed but
+#     isn't the same predicate/arg; reset_router, wholly irrelevant) are
+#     registered alongside everything else. None of them can appear in a
+#     valid, minimal-cost plan toward server_listening -- checked below.
+#
+# As with the ground-only property, the point is proven by inspecting the
+# actual winning plan's labels, not by asserting it in a comment.
+
+include "../lib/test.patlang"
+include "../lib/goap_step_interfaces.patlang"
+include "../lib/composite_library.patlang"
+
+# ---- ground domain, deliberately over-provisioned with alternatives and
+# decoys so the planner has real choices to make ----
+
+action_add("load_template", [], [["template_loaded", []]], [], 2)
+action_add("register_health_via_template", [["template_loaded", []]], [["endpoint_registered", ["health"]]], [], 1)
+action_add("register_health_direct", [], [["endpoint_registered", ["health"]]], [], 5)
+
+action_add("load_network_module", [], [["network_module_loaded", []]], [], 2)
+action_add("register_echo_endpoint", [["network_module_loaded", []]], [["endpoint_registered", ["echo"]]], [], 1)
+
+action_add("load_clock_module", [], [["clock_module_loaded", []]], [], 2)
+action_add("register_time_endpoint", [["clock_module_loaded", []]], [["endpoint_registered", ["time"]]], [], 1)
+
+action_add("start_server", [["endpoint_registered", ["health"]], ["endpoint_registered", ["echo"]], ["endpoint_registered", ["time"]]], [["server_listening", []]], [], 1)
+
+# decoys: registered but never needed to reach server_listening
+action_add("register_admin_endpoint", [], [["endpoint_registered", ["admin"]]], [], 1)
+action_add("register_legacy_health_endpoint", [], [["endpoint_registered", ["health_legacy"]]], [], 1)
+action_add("reset_router", [], [["router_reset", []]], [], 1)
+
+# ---- BDD contract gate (pre-execution, over the plan's own labels) ----
+#
+# The variable-binding contract mechanism built for parameterized actions
+# (goap_verify_contracts, which extracts a bound value out of a plan
+# label like "scale(X=5)") has nothing to extract here, since there is no
+# logic variable anywhere in this plan -- forcing this domain's shape
+# constraints through that machinery would be using a tool for a case it
+# isn't built for. Instead, the pre-execution contract here is a direct
+# Gherkin Then-step assertion over the plan's own label list -- still a
+# real BDD-checked gate before any code is generated, just not routed
+# through the numeric-binding extractor.
+
+make a function called st_noop returns done
+  return true
+end
+
+make a function called st_plan_synthesized returns done
+  set_var("ws_plan", plan([["server_listening", []]]))
+  return true
+end
+
+make a function called ws_plan_contains takes needle returns found
+  let labels = get("__vars", "ws_plan")
+  let found = false
+  let i = 0
+  let n = to_num(list_len(labels))
+  while i < n do
+    if gc_find_substr(labels[i], needle) == 0 then
+      let found = true
+    end
+    let i = i + 1
+  end
+  return found
+end
+
+make a function called st_seven_step_plan_found returns done
+  let labels = get("__vars", "ws_plan")
+  check("the cost-optimal plan has exactly 7 steps", to_num(list_len(labels)), 7)
+  return true
+end
+
+make a function called st_chooses_cheaper_health_path returns done
+  check("the plan uses the cheaper templated health path (cost 3)", ws_plan_contains("register_health_via_template"), true)
+  check("the plan does NOT use the costlier direct health action (cost 5)", ws_plan_contains("register_health_direct"), false)
+  return true
+end
+
+make a function called st_discovers_module_prerequisites returns done
+  check("the plan discovers it must load_network_module before registering echo", ws_plan_contains("load_network_module"), true)
+  check("the plan discovers it must load_clock_module before registering time", ws_plan_contains("load_clock_module"), true)
+  return true
+end
+
+make a function called st_no_decoy_actions_used returns done
+  check("the admin-endpoint decoy is excluded from the plan", ws_plan_contains("register_admin_endpoint"), false)
+  check("the legacy-health-endpoint decoy is excluded from the plan", ws_plan_contains("register_legacy_health_endpoint"), false)
+  check("the router-reset decoy is excluded from the plan", ws_plan_contains("reset_router"), false)
+  return true
+end
+
+make a function called st_start_server_last returns done
+  let labels = get("__vars", "ws_plan")
+  let n = to_num(list_len(labels))
+  let last = labels[n - 1]
+  check("start_server is the final plan step", gc_find_substr(last, "start_server") == 0, true)
+  return true
+end
+
+make a function called st_plan_is_ground_only returns done
+  let labels = get("__vars", "ws_plan")
+  let all_ground = true
+  let i = 0
+  let n = to_num(list_len(labels))
+  while i < n do
+    if gc_find_substr(labels[i], "=") >= 0 then
+      let all_ground = false
+    end
+    let i = i + 1
+  end
+  check("no plan step label binds a logic variable (no '=' in any label)", all_ground, true)
+  return true
+end
+
+make a function called register_ws_bdd_steps returns done
+  step("a web service planning goal with alternatives and decoys", "st_noop")
+  step("the plan is synthesized", "st_plan_synthesized")
+  step("the cost-optimal 7-step plan is found", "st_seven_step_plan_found")
+  step("it chooses the cheaper health registration path", "st_chooses_cheaper_health_path")
+  step("it discovers the module-loading prerequisites on its own", "st_discovers_module_prerequisites")
+  step("no decoy action is used", "st_no_decoy_actions_used")
+  step("start_server is the final plan step", "st_start_server_last")
+  step("no plan step binds a logic variable", "st_plan_is_ground_only")
+  return true
+end
+
+make a function called ws_feature returns text
+  return "Feature: Web service GOAP planning without logic variables
+
+Scenario: cost-optimal search over a branching action space with decoys
+  Given a web service planning goal with alternatives and decoys
+  When the plan is synthesized
+  Then the cost-optimal 7-step plan is found
+  And it chooses the cheaper health registration path
+  And it discovers the module-loading prerequisites on its own
+  And no decoy action is used
+  And start_server is the final plan step
+  And no plan step binds a logic variable
+"
+end
+
+# ---- reusing (or, the first time, deriving) the pure HTTP helpers by
+# example (Layers 1+2), instead of hand-writing their bodies ----
+#
+# crlf/es_contains/first_line/path_of/body_for_path are all pure string
+# functions with clean input->output examples, so self_hosting/lib/
+# synthesis_by_example.patlang's bottom-up enumerator (expression mode)
+# and decision-list mode (for body_for_path's finite lookup) derive their
+# bodies from examples over self_hosting/lib/primitive_registry.patlang's
+# registered primitives -- see self_hosting/synthesis_by_example_
+# selftest.patlang for the same derivations proven in isolation,
+# including why a 3rd, length-varying example is needed for after_space
+# to rule out an overfit shortcut (substr's own clamp-on-overrun
+# behavior). path_of is derived by COMPOSING two smaller, independently
+# derived composites (after_space, up_to_space) rather than as one flat
+# expression -- deriving it directly would need an AST far too large for
+# bounded enumeration to search in reasonable time.
+#
+# This run FIRST tries self_hosting/lib/composite_library.patlang's
+# on-disk library (populated by self_hosting/examples/synth_demo_http_
+# helpers.patlang) -- this is the actual "a later goal-solving task
+# reuses an already-derived composite" story, not just re-deriving the
+# same thing every run. Anything the library doesn't already have is
+# derived here and saved back, so a first-ever run still works.
+#
+# StartServerStep's own orchestration (tcp_listen/accept/the request
+# loop) stays hand-authored below -- there is no clean input/output value
+# pair for "open a real socket and serve N real connections" the way
+# there is for a pure string function; see the plan's explicit scope
+# boundary on this.
+
+make a function called ws_emit_composite_def takes registry, name returns text
+  let entry = pr_lookup(registry, name)
+  let ast = entry[1][0]
+  let param_names = entry[1][1]
+  if ast[0] == "If" then
+    return emit_decision_function_patlang(name, param_names[0], ast, registry)
+  end
+  return emit_function_def_patlang(name, param_names, ast, registry)[1]
+end
+
+make a function called ws_derive_helpers_text returns text
+  let registry = pr_standard_registry()
+  cl_load_all(registry)
+
+  if pr_lookup(registry, "crlf") and pr_lookup(registry, "es_contains") and pr_lookup(registry, "first_line") and pr_lookup(registry, "after_space") and pr_lookup(registry, "up_to_space") and pr_lookup(registry, "path_of") and pr_lookup(registry, "body_for_path") then
+    print("web-service demo: reusing all 7 HTTP helpers from the composite library (no re-derivation)")
+    let t = ws_emit_composite_def(registry, "crlf")
+    let t = t + ws_emit_composite_def(registry, "es_contains")
+    let t = t + ws_emit_composite_def(registry, "first_line")
+    let t = t + ws_emit_composite_def(registry, "after_space")
+    let t = t + ws_emit_composite_def(registry, "up_to_space")
+    let t = t + ws_emit_composite_def(registry, "path_of")
+    let t = t + ws_emit_composite_def(registry, "body_for_path")
+    return t
+  end
+
+  print("web-service demo: composite library incomplete -- deriving the HTTP helpers from scratch and saving them")
+
+  let empty_bindings = new("Dict", "ws_empty_bindings")
+  let crlf_examples = [[empty_bindings, chr(13) + chr(10)]]
+  let crlf_ast = synthesize_from_examples(crlf_examples, [], [], registry, ["chr", "concat"], 6)[1]
+
+  let e1 = new("Dict", "ws_e1")
+  send(e1, "set", "hay", "hello world")
+  send(e1, "set", "needle", "world")
+  let e2 = new("Dict", "ws_e2")
+  send(e2, "set", "hay", "hello world")
+  send(e2, "set", "needle", "zzz")
+  let es_ast = synthesize_from_examples([[e1, true], [e2, false]], ["hay", "needle"], [], registry, ["index_of", "geq"], 6)[1]
+
+  let f1 = new("Dict", "ws_f1")
+  send(f1, "set", "text", "GET /health HTTP/1.1" + chr(13) + chr(10) + chr(13) + chr(10))
+  let f2 = new("Dict", "ws_f2")
+  send(f2, "set", "text", "POST /x HTTP/1.1" + chr(13) + chr(10) + chr(13) + chr(10))
+  let fl_ast = synthesize_from_examples([[f1, "GET /health HTTP/1.1"], [f2, "POST /x HTTP/1.1"]], ["text"], [chr(13) + chr(10)], registry, ["substr", "index_of"], 7)[1]
+
+  let a1 = new("Dict", "ws_a1")
+  send(a1, "set", "s", "GET /health HTTP/1.1")
+  let a2 = new("Dict", "ws_a2")
+  send(a2, "set", "s", "POST /x HTTP/1.1")
+  let a3 = new("Dict", "ws_a3")
+  send(a3, "set", "s", "GET /a/very/long/path/that/keeps/going/on/and/on/for/a/while HTTP/1.1")
+  let after_space_examples = [[a1, "/health HTTP/1.1"], [a2, "/x HTTP/1.1"], [a3, "/a/very/long/path/that/keeps/going/on/and/on/for/a/while HTTP/1.1"]]
+  let after_space_ast = synthesize_from_examples(after_space_examples, ["s"], [" "], registry, ["substr", "index_of", "add", "sub", "str_len"], 12)[1]
+  register_composite(registry, "after_space", after_space_ast, ["s"], ["string"], 4)
+
+  let u1 = new("Dict", "ws_u1")
+  send(u1, "set", "s", "/health HTTP/1.1")
+  let u2 = new("Dict", "ws_u2")
+  send(u2, "set", "s", "/x HTTP/1.1")
+  let up_to_space_ast = synthesize_from_examples([[u1, "/health"], [u2, "/x"]], ["s"], [" "], registry, ["substr", "index_of"], 8)[1]
+  register_composite(registry, "up_to_space", up_to_space_ast, ["s"], ["string"], 4)
+
+  let p1 = new("Dict", "ws_p1")
+  send(p1, "set", "reqline", "GET /health HTTP/1.1")
+  let p2 = new("Dict", "ws_p2")
+  send(p2, "set", "reqline", "POST /x HTTP/1.1")
+  let path_of_ast = synthesize_from_examples([[p1, "/health"], [p2, "/x"]], ["reqline"], [], registry, ["after_space", "up_to_space"], 6)[1]
+
+  let bfp_b1 = new("Dict", "ws_bfp1")
+  send(bfp_b1, "set", "path", "/health")
+  let bfp_b2 = new("Dict", "ws_bfp2")
+  send(bfp_b2, "set", "path", "/echo")
+  let bfp_b3 = new("Dict", "ws_bfp3")
+  send(bfp_b3, "set", "path", "/time")
+  let bfp_b4 = new("Dict", "ws_bfp4")
+  send(bfp_b4, "set", "path", "/nope")
+  let bfp_examples = [[bfp_b1, "OK"], [bfp_b2, "ECHO"], [bfp_b3, "TIME"], [bfp_b4, "NOT FOUND"]]
+  let bfp_ast = synthesize_lookup_from_examples("path", [["/health", "OK"], ["/echo", "ECHO"], ["/time", "TIME"]], "NOT FOUND")
+
+  # Save every helper back to the library so the NEXT run (or a fresh
+  # goal-solving task in a different demo) reuses it instead of
+  # re-deriving from scratch -- see self_hosting/examples/synth_demo_
+  # library_reuse.patlang for a process that does exactly that.
+  cl_save("http", "crlf", [], [], 4, "expression", crlf_ast, crlf_examples)
+  cl_save("string", "es_contains", ["hay", "needle"], ["string", "string"], 5, "expression", es_ast, [[e1, true], [e2, false]])
+  cl_save("http", "first_line", ["text"], ["string"], 6, "expression", fl_ast, [[f1, "GET /health HTTP/1.1"], [f2, "POST /x HTTP/1.1"]])
+  cl_save("http", "after_space", ["s"], ["string"], 4, "expression", after_space_ast, after_space_examples)
+  cl_save("http", "up_to_space", ["s"], ["string"], 4, "expression", up_to_space_ast, [[u1, "/health"], [u2, "/x"]])
+  cl_save("http", "path_of", ["reqline"], ["string"], 8, "expression", path_of_ast, [[p1, "/health"], [p2, "/x"]])
+  cl_save("http", "body_for_path", ["path"], ["string"], 5, "lookup", bfp_ast, bfp_examples)
+
+  let t = emit_function_def_patlang("crlf", [], crlf_ast, registry)[1]
+  let t = t + emit_function_def_patlang("es_contains", ["hay", "needle"], es_ast, registry)[1]
+  let t = t + emit_function_def_patlang("first_line", ["text"], fl_ast, registry)[1]
+  let t = t + emit_function_def_patlang("after_space", ["s"], after_space_ast, registry)[1]
+  let t = t + emit_function_def_patlang("up_to_space", ["s"], up_to_space_ast, registry)[1]
+  let t = t + emit_function_def_patlang("path_of", ["reqline"], path_of_ast, registry)[1]
+  let t = t + emit_decision_function_patlang("body_for_path", "path", bfp_ast, registry)
+  return t
+end
+
+# ---- synthesis: plan labels -> real GoapStep classes with real params ----
+#
+# The class bodies are generated as TEXT here and written to a companion
+# file under self_hosting/build/, then run in a fresh process via
+# exec_capture -- the same idiom self_hosting/goap_step_interfaces_
+# selftest.patlang already uses to prove the assembler's wiring
+# reproduces real runtime behavior, not just well-formed source text.
+# Only the 7 action kinds that can actually appear in a winning plan need
+# a class + an action_defs entry here -- the decoys and the rejected
+# direct-health action never need one, because the assembler only looks
+# one up per label actually present in the plan.
+
+make a function called ws_class_defs_text takes derived_helpers_text returns text
+  let t = "include \"../lib/goap_step_interfaces.patlang\"\n"
+  let t = t + derived_helpers_text
+  let t = t + "class LoadTemplateStep {\n  traits GoapStep\n  make a function called run takes self returns marker\n    let marker = \"template_ready\"\n    print(\"loaded endpoint template\")\n    return marker\n  end\n}\n"
+  let t = t + "class RegisterHealthViaTemplateStep {\n  traits GoapStep\n  make a function called run takes self, template_marker returns name\n    let name = \"health\"\n    print(\"registered endpoint (via template \" + template_marker + \"): \" + name)\n    return name\n  end\n}\n"
+  let t = t + "class LoadNetworkModuleStep {\n  traits GoapStep\n  make a function called run takes self returns marker\n    let marker = \"net_ready\"\n    print(\"loaded network module\")\n    return marker\n  end\n}\n"
+  let t = t + "class RegisterEchoEndpointStep {\n  traits GoapStep\n  make a function called run takes self, net_marker returns name\n    let name = \"echo\"\n    print(\"registered endpoint (via \" + net_marker + \"): \" + name)\n    return name\n  end\n}\n"
+  let t = t + "class LoadClockModuleStep {\n  traits GoapStep\n  make a function called run takes self returns marker\n    let marker = \"clock_ready\"\n    print(\"loaded clock module\")\n    return marker\n  end\n}\n"
+  let t = t + "class RegisterTimeEndpointStep {\n  traits GoapStep\n  make a function called run takes self, clock_marker returns name\n    let name = \"time\"\n    print(\"registered endpoint (via \" + clock_marker + \"): \" + name)\n    return name\n  end\n}\n"
+  let t = t + "class StartServerStep {\n  traits GoapStep\n  make a function called run takes self, r1, r2, r3 returns port\n    let routes = [r1, r2, r3]\n    require to_num(list_len(routes)) >= 3\n    let port = tcp_listen(0)\n    ensure port > 0\n    print(\"PORT: \" + port)\n    let ok_count = 0\n    let i = 0\n    while i < to_num(list_len(routes)) do\n      let path = \"/\" + routes[i]\n      let client = tcp_connect(\"127.0.0.1\", port)\n      tcp_write(client, \"GET \" + path + \" HTTP/1.1\" + crlf() + crlf())\n      let server_conn = tcp_accept(port)\n      let request = tcp_read(server_conn)\n      let reqline = first_line(request)\n      let req_path = path_of(reqline)\n      let body = body_for_path(req_path)\n      let response = \"HTTP/1.1 200 OK\" + crlf() + \"Content-Length: \" + body.length + crlf() + crlf() + body\n      tcp_write(server_conn, response)\n      tcp_close(server_conn)\n      let reply = tcp_read(client)\n      tcp_close(client)\n      if es_contains(reply, body) then\n        print(\"ENDPOINT OK: \" + path)\n        let ok_count = ok_count + 1\n      else\n        print(\"ENDPOINT FAIL: \" + path)\n      end\n      let i = i + 1\n    end\n    print(\"ENDPOINTS_OK=\" + ok_count)\n    return port\n  end\n}\n"
+  return t
+end
+
+make a function called run_goap_webservice_demo returns ok
+  t_init()
+  register_ws_bdd_steps()
+  run_feature(ws_feature())
+  t_report()
+  let bdd_ok = get("__vars", "t_fail") == 0
+
+  let plan_labels = get("__vars", "ws_plan")
+
+  let class_registry = new("Dict", "ws_step_classes")
+  send(class_registry, "set", "load_template", "LoadTemplateStep")
+  send(class_registry, "set", "register_health_via_template", "RegisterHealthViaTemplateStep")
+  send(class_registry, "set", "load_network_module", "LoadNetworkModuleStep")
+  send(class_registry, "set", "register_echo_endpoint", "RegisterEchoEndpointStep")
+  send(class_registry, "set", "load_clock_module", "LoadClockModuleStep")
+  send(class_registry, "set", "register_time_endpoint", "RegisterTimeEndpointStep")
+  send(class_registry, "set", "start_server", "StartServerStep")
+
+  let action_defs = [
+    ["load_template", [], [["template_loaded", []]]],
+    ["register_health_via_template", [["template_loaded", []]], [["endpoint_registered", ["health"]]]],
+    ["load_network_module", [], [["network_module_loaded", []]]],
+    ["register_echo_endpoint", [["network_module_loaded", []]], [["endpoint_registered", ["echo"]]]],
+    ["load_clock_module", [], [["clock_module_loaded", []]]],
+    ["register_time_endpoint", [["clock_module_loaded", []]], [["endpoint_registered", ["time"]]]],
+    ["start_server", [["endpoint_registered", ["health"]], ["endpoint_registered", ["echo"]], ["endpoint_registered", ["time"]]], [["server_listening", []]]]
+  ]
+
+  let synth = synthesize_program_structural(plan_labels, action_defs, class_registry, [])
+  print("synthesis: " + synth[0])
+  if synth[0] != "OK" then
+    print(synth[1])
+    return false
+  end
+
+  let derived_helpers_text = ws_derive_helpers_text()
+
+  let synth_path = "self_hosting/build/goap_webservice_demo_synth.patlang"
+  write_file(synth_path, ws_class_defs_text(derived_helpers_text) + synth[1])
+  let run_out = exec_capture("rust-runtime/target/release/pat.exe", "--ir-run", synth_path)
+  print(run_out)
+
+  let synth_ok = contains_text(run_out, "ENDPOINTS_OK=3")
+  return bdd_ok and (synth[0] == "OK") and synth_ok
+end
+
+run_goap_webservice_demo()

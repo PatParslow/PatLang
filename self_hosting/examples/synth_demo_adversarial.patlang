@@ -1,0 +1,106 @@
+# Deliberately hunts for bugs/pitfalls in the example-driven synthesizer
+# (self_hosting/lib/synthesis_by_example.patlang) rather than showing it
+# off at its best. Three distinct findings, none swept under the rug:
+#
+#   1. The "constant trap": too few examples lets the search return a
+#      Const that ignores its own input entirely, because nothing in a
+#      single example forces the input to matter.
+#   2. The "algebraic coincidence" trap (found for real while building
+#      synth_demo_numeric_ops.patlang, not manufactured for this file):
+#      example triples that accidentally satisfy an unintended relation
+#      (a+b==c) let a smaller, wrong formula (c+c) pass every example.
+#   3. An honest negative result: reversing a string of unbounded length
+#      needs a loop, which nothing in this bottom-up, loop-free expression
+#      search can express -- it correctly reports ["ERR", ...] rather than
+#      crashing or guessing, at a documented size bound.
+
+include "../lib/test.patlang"
+include "../lib/synthesis_by_example.patlang"
+
+t_init()
+
+# ---- 1. the constant trap ----
+
+let registry = pr_standard_registry()
+
+let c1 = new("Dict", "adv_c1")
+send(c1, "set", "path", "/health")
+let one_example = [[c1, "OK"]]
+let trap_result = synthesize_from_examples(one_example, ["path"], ["OK"], registry, ["str_eq"], 3)
+check("constant trap: a single example is satisfiable", trap_result[0], "OK")
+check("constant trap: the search returns a bare Const, ignoring `path` entirely", trap_result[1][0], "Const")
+
+let c2 = new("Dict", "adv_c2")
+send(c2, "set", "path", "/echo")
+let trap_on_second = sbe_eval(trap_result[1], c2, registry)
+check("constant trap: that Const is wrong for a second, different input (still says \"OK\" for /echo)", trap_on_second[1] == "ECHO", false)
+
+# Fixed the only way it can be: give the search a second example with a
+# genuinely DIFFERENT expected output, forcing it to actually consult
+# `path`. But note what it does NOT do: expression enumeration alone has
+# no primitive that turns "path" into "OK" vs "ECHO" other than a literal
+# equality test per branch -- exactly what decision-list mode (a
+# DIFFERENT technique, see synthesize_lookup_from_examples) is for. This
+# demo doesn't claim expression mode "solves" the two-example case; it
+# demonstrates it correctly reports no candidate exists in this primitive
+# set, rather than silently returning the same wrong constant again.
+let two_examples = [[c1, "OK"], [c2, "ECHO"]]
+let two_example_result = synthesize_from_examples(two_examples, ["path"], ["OK", "ECHO"], registry, ["str_eq"], 5)
+check("constant trap, corrected: with 2 differentiating examples and only str_eq available, expression mode correctly finds no match (this needs decision-list mode instead)", two_example_result[0], "ERR")
+
+# ---- 2. the algebraic-coincidence trap (real, not manufactured) ----
+#
+# See synth_demo_numeric_ops.patlang's own comments for the full story:
+# this reproduces the exact original (buggy) example set that shipped
+# with the first version of that file, to keep the finding itself
+# checked and reproducible rather than only described in prose.
+
+let s1 = new("Dict", "adv_s1")
+send(s1, "set", "a", 1)
+send(s1, "set", "b", 2)
+send(s1, "set", "c", 3)
+let s2 = new("Dict", "adv_s2")
+send(s2, "set", "a", 10)
+send(s2, "set", "b", 20)
+send(s2, "set", "c", 30)
+let coincidental_examples = [[s1, 6], [s2, 60]]
+let coincidental_result = synthesize_from_examples(coincidental_examples, ["a", "b", "c"], [], registry, ["add"], 6)
+check("algebraic coincidence: [1,2,3]->6 and [10,20,30]->60 are both satisfiable", coincidental_result[0], "OK")
+check("algebraic coincidence: the search returns add(c,c), not the intended a+b+c", contains_text("" + coincidental_result[1], "Input, c"), true)
+
+let s3 = new("Dict", "adv_s3")
+send(s3, "set", "a", 1)
+send(s3, "set", "b", 2)
+send(s3, "set", "c", 5)
+let wrong_on_third = sbe_eval(coincidental_result[1], s3, registry)
+let correct_on_third = 1 + 2 + 5
+check("algebraic coincidence: add(c,c) is wrong on a triple where a+b != c", wrong_on_third[1] == correct_on_third, false)
+
+# A second attempt at "fixing" this with just [s1, s3] turned out to hit
+# the EXACT SAME PITFALL AGAIN: a=1,b=2 is shared by both, so a+b (=3)
+# coincidentally equals one of the curated int consts, and add(c, 3)
+# satisfies both s1 (3+3=6) and s3 (5+3=8) just as validly as a+b+c does.
+# Two examples can never pin down a 3-argument linear function's three
+# coefficients (an under-determined system) -- genuinely needs a THIRD,
+# independently-varying triple, kept here rather than quietly using a
+# cleaner example set, since the repeated near-miss is itself the point.
+let s4 = new("Dict", "adv_s4")
+send(s4, "set", "a", 7)
+send(s4, "set", "b", 1)
+send(s4, "set", "c", 2)
+let fixed_examples = [[s1, 6], [s3, 8], [s4, 10]]
+let fixed_result = synthesize_from_examples(fixed_examples, ["a", "b", "c"], [], registry, ["add"], 6)
+check("algebraic coincidence, corrected: a THIRD, independently-varying triple finally forces the genuine a+b+c formula", contains_text("" + fixed_result[1], "Input, a"), true)
+
+# ---- 3. honest negative result: reversal needs a loop this search
+# doesn't have ----
+
+let r1 = new("Dict", "adv_r1")
+send(r1, "set", "s", "ab")
+let r2 = new("Dict", "adv_r2")
+send(r2, "set", "s", "abc")
+let reverse_examples = [[r1, "ba"], [r2, "cba"]]
+let reverse_result = synthesize_from_examples(reverse_examples, ["s"], [], registry, ["substr", "char_code", "chr", "concat", "str_len", "add", "sub"], 9)
+check("string reversal of unbounded length is correctly UNREACHABLE by bounded loop-free expression search (real ERR, not a crash or a wrong guess)", reverse_result[0], "ERR")
+
+t_report()

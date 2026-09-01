@@ -1,0 +1,411 @@
+# A persistent, on-disk library of composites derived by self_hosting/lib/
+# synthesis_by_example.patlang, organized as one JSON file per composite
+# under self_hosting/composite_library/<domain>/<name>.json (domain is a
+# caller-chosen grouping, e.g. "string"/"list"/"http" -- granular enough
+# that the library doesn't become one unmanageable file as more
+# composites accumulate, but still browsable by category rather than one
+# flat directory of hundreds of files).
+#
+# Re-verified on load, always: a composite's stored examples are replayed
+# against its stored AST every time the library is loaded (cl_load_all/
+# cl_load_one), and a composite that no longer matches its own examples
+# (a primitive_registry.patlang change, an emitter regression, a hand-
+# edited file) is reported LOUDLY and excluded, never silently trusted --
+# the whole point of storing the examples alongside the AST is to make
+# that check possible instead of just trusting a cached result forever.
+#
+# Alongside each .json file, a human-readable .feature file is generated
+# (Given/When/Then prose over the same stored examples) -- documentation
+# a person can read without decoding the AST, not itself the mechanism
+# that gates reuse (that's cl_verify_entry, which checks the same
+# examples directly and fast, the same way every other selftest in this
+# repo uses check() rather than a live Gherkin parse for its real
+# assertions).
+
+include "synthesis_by_example.patlang"
+include "json.patlang"
+
+make a function called cl_root returns path
+  return "self_hosting/composite_library"
+end
+
+make a function called cl_domain_dir takes domain returns path
+  return cl_root() + "/" + domain
+end
+
+make a function called cl_json_path takes domain, name returns path
+  return cl_domain_dir(domain) + "/" + name + ".json"
+end
+
+make a function called cl_feature_path takes domain, name returns path
+  return cl_domain_dir(domain) + "/" + name + ".feature"
+end
+
+# ---- AST <-> JSON ----
+
+make a function called cl_value_to_json takes v returns jv
+  let ty = type_of(v)
+  if ty == "string" then
+    return json_make_str(v)
+  end
+  if ty == "bool" then
+    return json_make_bool(v)
+  end
+  if ty == "list" then
+    let items = []
+    let i = 0
+    let n = to_num(list_len(v))
+    while i < n do
+      let items = list_push(items, cl_value_to_json(v[i]))
+      let i = i + 1
+    end
+    return json_make_arr(items)
+  end
+  return json_make_num(v)
+end
+
+make a function called cl_json_to_value takes jv returns v
+  let ty = jv[0]
+  if ty == "str" then
+    return json_str(jv)
+  end
+  if ty == "bool" then
+    return jv[1]
+  end
+  if ty == "arr" then
+    let items = json_arr(jv)
+    let out = []
+    let i = 0
+    let n = to_num(list_len(items))
+    while i < n do
+      let out = list_push(out, cl_json_to_value(items[i]))
+      let i = i + 1
+    end
+    return out
+  end
+  return json_num(jv)
+end
+
+make a function called cl_ast_to_json takes node returns jv
+  let tag = node[0]
+  if tag == "Const" then
+    return json_make_obj([["tag", json_make_str("Const")], ["value", cl_value_to_json(node[1])]])
+  end
+  if tag == "Input" then
+    return json_make_obj([["tag", json_make_str("Input")], ["name", json_make_str(node[1])]])
+  end
+  if tag == "Call" then
+    let arg_nodes = node[2]
+    let args_json = []
+    let i = 0
+    let n = to_num(list_len(arg_nodes))
+    while i < n do
+      let args_json = list_push(args_json, cl_ast_to_json(arg_nodes[i]))
+      let i = i + 1
+    end
+    return json_make_obj([["tag", json_make_str("Call")], ["prim", json_make_str(node[1])], ["args", json_make_arr(args_json)]])
+  end
+  # "If"
+  return json_make_obj([["tag", json_make_str("If")], ["cond", cl_ast_to_json(node[1])], ["then", cl_ast_to_json(node[2])], ["else", cl_ast_to_json(node[3])]])
+end
+
+make a function called cl_json_to_ast takes jv returns node
+  let tag = json_str(json_get(jv, "tag"))
+  if tag == "Const" then
+    return ["Const", cl_json_to_value(json_get(jv, "value"))]
+  end
+  if tag == "Input" then
+    return ["Input", json_str(json_get(jv, "name"))]
+  end
+  if tag == "Call" then
+    let args_j = json_arr(json_get(jv, "args"))
+    let args = []
+    let i = 0
+    let n = to_num(list_len(args_j))
+    while i < n do
+      let args = list_push(args, cl_json_to_ast(args_j[i]))
+      let i = i + 1
+    end
+    return ["Call", json_str(json_get(jv, "prim")), args]
+  end
+  return ["If", cl_json_to_ast(json_get(jv, "cond")), cl_json_to_ast(json_get(jv, "then")), cl_json_to_ast(json_get(jv, "else"))]
+end
+
+# ---- examples <-> JSON (bindings encoded against the composite's OWN
+# param_names, since a Dict's keys can't be enumerated generically) ----
+
+make a function called cl_examples_to_json takes param_names, examples returns jv
+  let out = []
+  let i = 0
+  let n = to_num(list_len(examples))
+  while i < n do
+    let ex = examples[i]
+    let bindings = ex[0]
+    let pairs = []
+    let j = 0
+    let pn = to_num(list_len(param_names))
+    while j < pn do
+      let pname = param_names[j]
+      let pairs = list_push(pairs, [pname, cl_value_to_json(get(bindings, pname))])
+      let j = j + 1
+    end
+    let entry = json_make_obj([["bindings", json_make_obj(pairs)], ["expected", cl_value_to_json(ex[1])]])
+    let out = list_push(out, entry)
+    let i = i + 1
+  end
+  return json_make_arr(out)
+end
+
+make a function called cl_examples_from_json takes param_names, jv returns examples
+  let items = json_arr(jv)
+  let out = []
+  let i = 0
+  let n = to_num(list_len(items))
+  while i < n do
+    let item = items[i]
+    let bindings_j = json_get(item, "bindings")
+    let bindings = new("Dict", "cl_bindings_" + pr_next_id())
+    let j = 0
+    let pn = to_num(list_len(param_names))
+    while j < pn do
+      let pname = param_names[j]
+      send(bindings, "set", pname, cl_json_to_value(json_get(bindings_j, pname)))
+      let j = j + 1
+    end
+    let expected = cl_json_to_value(json_get(item, "expected"))
+    let out = list_push(out, [bindings, expected])
+    let i = i + 1
+  end
+  return out
+end
+
+# ---- human-readable .feature documentation (not the verification gate
+# itself -- see file header) ----
+
+make a function called cl_render_value takes v returns text
+  let ty = type_of(v)
+  if ty == "string" then
+    return "\"" + v + "\""
+  end
+  return "" + v
+end
+
+make a function called cl_feature_text takes name, param_names, examples returns text
+  let out = sb_new()
+  sb_push(out, "Feature: " + name + " (derived by example, self_hosting/lib/synthesis_by_example.patlang)\n\n")
+  let i = 0
+  let n = to_num(list_len(examples))
+  while i < n do
+    let ex = examples[i]
+    let bindings = ex[0]
+    sb_push(out, "Scenario: example " + (i + 1) + "\n")
+    let j = 0
+    let pn = to_num(list_len(param_names))
+    while j < pn do
+      let pname = param_names[j]
+      sb_push(out, "  Given " + pname + " = " + cl_render_value(get(bindings, pname)) + "\n")
+      let j = j + 1
+    end
+    sb_push(out, "  Then " + name + "(...) = " + cl_render_value(ex[1]) + "\n\n")
+    let i = i + 1
+  end
+  return sb_str(out)
+end
+
+# ---- save / load / verify ----
+
+make a function called cl_save takes domain, name, param_names, arg_types, cost, kind, ast, examples returns done
+  let obj = json_make_obj([
+    ["name", json_make_str(name)],
+    ["domain", json_make_str(domain)],
+    ["param_names", json_make_arr(sbe_map_json_str(param_names))],
+    ["arg_types", json_make_arr(sbe_map_json_str(arg_types))],
+    ["cost", json_make_num(cost)],
+    ["kind", json_make_str(kind)],
+    ["ast", cl_ast_to_json(ast)],
+    ["examples", cl_examples_to_json(param_names, examples)]
+  ])
+  write_file(cl_json_path(domain, name), json_stringify_pretty(obj, 0))
+  write_file(cl_feature_path(domain, name), cl_feature_text(name, param_names, examples))
+  return true
+end
+
+make a function called sbe_map_json_str takes strs returns out
+  let out = []
+  let i = 0
+  let n = to_num(list_len(strs))
+  while i < n do
+    let out = list_push(out, json_make_str(strs[i]))
+    let i = i + 1
+  end
+  return out
+end
+
+# entry: [name, domain, param_names, arg_types, cost, kind, ast, examples]
+# or ["ERR", msg] if the file is missing/unparseable.
+make a function called cl_load_one takes domain, name returns entry
+  let path = cl_json_path(domain, name)
+  let exists = file_exists(path)
+  if exists == "0" then
+    return ["ERR", "composite library file not found: " + path]
+  end
+  let text = read_file(path)
+  let obj = json_parse(text)
+  let param_names = sbe_map_json_to_str(json_arr(json_get(obj, "param_names")))
+  let arg_types = sbe_map_json_to_str(json_arr(json_get(obj, "arg_types")))
+  let ast = cl_json_to_ast(json_get(obj, "ast"))
+  let examples = cl_examples_from_json(param_names, json_get(obj, "examples"))
+  return [json_str(json_get(obj, "name")), json_str(json_get(obj, "domain")), param_names, arg_types, json_num(json_get(obj, "cost")), json_str(json_get(obj, "kind")), ast, examples]
+end
+
+make a function called sbe_map_json_to_str takes json_items returns out
+  let out = []
+  let i = 0
+  let n = to_num(list_len(json_items))
+  while i < n do
+    let out = list_push(out, json_str(json_items[i]))
+    let i = i + 1
+  end
+  return out
+end
+
+# Re-runs the entry's own stored examples against its own stored AST --
+# the actual reuse gate. Returns [true, ""] or [false, description].
+make a function called cl_verify_entry takes entry, registry returns result
+  let ast = entry[6]
+  let examples = entry[7]
+  if sbe_matches_all(ast, examples, registry) then
+    return [true, ""]
+  end
+  return [false, "composite \"" + entry[0] + "\" (domain \"" + entry[1] + "\") no longer satisfies its own stored examples -- NOT loaded"]
+end
+
+# Loads, verifies, and registers ONE composite. Returns [ok, message] --
+# never prints itself, since a failure here might just mean "a dependency
+# hasn't loaded yet" (see cl_load_all's fixed-point retry) rather than a
+# genuine defect; the caller decides what's worth reporting once it knows
+# whether a later retry succeeded.
+make a function called cl_load_and_register takes domain, name, registry returns result
+  let entry = cl_load_one(domain, name)
+  if entry[0] == "ERR" then
+    return [false, entry[1]]
+  end
+  let v = cl_verify_entry(entry, registry)
+  if v[0] == false then
+    return [false, v[1]]
+  end
+  register_composite(registry, entry[0], entry[6], entry[2], entry[3], entry[4])
+  return [true, ""]
+end
+
+make a function called cl_list_domains returns domains
+  let root_exists = file_exists(cl_root())
+  if root_exists == "0" then
+    return []
+  end
+  let entries = list_dir(cl_root())
+  let out = []
+  let i = 0
+  let n = to_num(list_len(entries))
+  while i < n do
+    let e = entries[i]
+    if e[e.length - 1] == "/" then
+      let out = list_push(out, substr(e, 0, e.length - 1))
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called cl_list_names takes domain returns names
+  let dir = cl_domain_dir(domain)
+  let dir_exists = file_exists(dir)
+  if dir_exists == "0" then
+    return []
+  end
+  let entries = list_dir(dir)
+  let out = []
+  let i = 0
+  let n = to_num(list_len(entries))
+  while i < n do
+    let e = entries[i]
+    if gc_find_substr(e, ".json") == (e.length - 5) then
+      let out = list_push(out, substr(e, 0, e.length - 5))
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# Loads and registers EVERY composite in the library, across every domain
+# directory. A composite may itself call another composite by name (e.g.
+# "http/path_of" calls "http/after_space" and "http/up_to_space") --
+# plain alphabetical filename order can easily load a dependent before
+# its dependency (confirmed empirically: "path_of" sorts before
+# "up_to_space", so a single linear pass reports path_of as broken purely
+# from load order, not any real defect). So this repeatedly sweeps the
+# not-yet-loaded set, retrying only entries that failed, until a full
+# sweep makes no further progress -- a fixed-point pass, not a real
+# dependency graph, but sufficient since composites only ever reference
+# already-derived (hence acyclic) composites. Whatever still fails after
+# the fixed point is a genuine verification failure, not an ordering
+# artifact.
+#
+# Returns a report: list of [domain, name, ok] triples, so a caller can
+# see exactly what loaded and what was rejected, rather than just a
+# pass/fail count.
+make a function called cl_load_all takes registry returns report
+  let pending = []
+  let domains = cl_list_domains()
+  let d = 0
+  let dn = to_num(list_len(domains))
+  while d < dn do
+    let domain = domains[d]
+    let names = cl_list_names(domain)
+    let i = 0
+    let n = to_num(list_len(names))
+    while i < n do
+      let pending = list_push(pending, [domain, names[i]])
+      let i = i + 1
+    end
+    let d = d + 1
+  end
+
+  let report = []
+  let progress = true
+  while progress and (to_num(list_len(pending)) > 0) do
+    let progress = false
+    let still_pending = []
+    let i = 0
+    let n = to_num(list_len(pending))
+    while i < n do
+      let domain = pending[i][0]
+      let name = pending[i][1]
+      let r = cl_load_and_register(domain, name, registry)
+      if r[0] then
+        let report = list_push(report, [domain, name, true])
+        let progress = true
+      else
+        let still_pending = list_push(still_pending, pending[i])
+      end
+      let i = i + 1
+    end
+    let pending = still_pending
+  end
+
+  # Anything left after the fixed point genuinely failed (not just "a
+  # dependency hadn't loaded yet") -- NOW print why, once, and report it,
+  # rather than dropping it silently or spamming a warning per retry.
+  let i = 0
+  let n = to_num(list_len(pending))
+  while i < n do
+    let domain = pending[i][0]
+    let name = pending[i][1]
+    let r = cl_load_and_register(domain, name, registry)
+    print("composite_library: " + domain + "/" + name + ": " + r[1])
+    let report = list_push(report, [domain, name, false])
+    let i = i + 1
+  end
+
+  return report
+end

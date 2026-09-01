@@ -1,0 +1,206 @@
+# Generic Given/Then -> examples extraction, so a new synthesis-by-example
+# demo can be specified with ONLY .feature text -- no hand-built example
+# Dict/bindings code at all. Deliberately a constrained grammar (mirrors
+# self_hosting/lib/gherkin_contracts.patlang's own narrow require/ensure
+# clause grammar rather than a full expression parser), extended to
+# support quoted string literals with embedded spaces (needed for real
+# text values like "the quick fox"), since a bare 3-token whitespace split
+# can't represent those:
+#
+#   Scenario: <name>
+#     Given <ident> = <literal>
+#     And <ident> = <literal>
+#     ...
+#     Then result = <literal>
+#
+# <literal> is a double-quoted string (\" and \\ escapes, plus \n/\r),
+# `true`/`false`, or a bare number. One Scenario block -> one
+# [bindings, expected] example; bde_examples_from_feature returns every
+# scenario's example plus the param name order (taken from the first
+# scenario's Given/And idents, in the order they first appear).
+
+include "primitive_registry.patlang"
+
+make a function called bde_trim takes s returns out
+  let start = 0
+  while (start < s.length) and (char_code(s, start) == 32) do
+    let start = start + 1
+  end
+  let stop = s.length
+  while (stop > start) and (char_code(s, stop - 1) == 32) do
+    let stop = stop - 1
+  end
+  return substr(s, start, stop - start)
+end
+
+make a function called bde_starts_with takes s, prefix returns yes
+  if prefix.length > s.length then
+    return false
+  end
+  return substr(s, 0, prefix.length) == prefix
+end
+
+make a function called bde_split_lines takes text returns lines
+  let lines = []
+  let cur = sb_new()
+  let i = 0
+  while i < text.length do
+    let c = char_code(text, i)
+    if c == 10 then
+      let lines = list_push(lines, sb_str(cur))
+      let cur = sb_new()
+    else
+      if c != 13 then
+        sb_push(cur, text[i])
+      end
+    end
+    let i = i + 1
+  end
+  if sb_str(cur).length > 0 then
+    let lines = list_push(lines, sb_str(cur))
+  end
+  return lines
+end
+
+# Every double-quoted substring on a line, in order, with \" \\ \n \r
+# unescaped -- shared by both the value grammar below and
+# self_hosting/lib/bdd_file_scenarios.patlang's file-scenario grammar.
+make a function called bde_extract_quoted_strings takes line returns items
+  let items = []
+  let i = 0
+  let n = line.length
+  while i < n do
+    if line[i] == "\"" then
+      let j = i + 1
+      let buf = sb_new()
+      while (j < n) and (line[j] != "\"") do
+        if (line[j] == "\\") and (j + 1 < n) then
+          let nx = line[j + 1]
+          if nx == "n" then
+            sb_push(buf, chr(10))
+          else
+            if nx == "r" then
+              sb_push(buf, chr(13))
+            else
+              sb_push(buf, nx)
+            end
+          end
+          let j = j + 2
+        else
+          sb_push(buf, line[j])
+          let j = j + 1
+        end
+      end
+      let items = list_push(items, sb_str(buf))
+      let i = j + 1
+    else
+      let i = i + 1
+    end
+  end
+  return items
+end
+
+make a function called bde_find_char takes s, c returns idx
+  let i = 0
+  while i < s.length do
+    if s[i] == c then
+      return i
+    end
+    let i = i + 1
+  end
+  return -1
+end
+
+make a function called bde_parse_value takes text returns value
+  let t = bde_trim(text)
+  if t.length == 0 then
+    return ""
+  end
+  if t[0] == "\"" then
+    let quoted = bde_extract_quoted_strings(t)
+    return quoted[0]
+  end
+  if t == "true" then
+    return true
+  end
+  if t == "false" then
+    return false
+  end
+  return to_num(t)
+end
+
+# "<ident> = <literal>" or "<ident> is <literal>" -> [ident, value], or
+# ["ERR", msg] on malformed input.
+make a function called bde_parse_binding_line takes remainder returns pair
+  let eq = bde_find_char(remainder, "=")
+  if eq >= 0 then
+    let ident = bde_trim(substr(remainder, 0, eq))
+    let value_text = substr(remainder, eq + 1, remainder.length - eq - 1)
+    return [ident, bde_parse_value(value_text)]
+  end
+  let idx = gc_find_substr(remainder, " is ")
+  if idx >= 0 then
+    let ident = bde_trim(substr(remainder, 0, idx))
+    let value_text = substr(remainder, idx + 4, remainder.length - idx - 4)
+    return [ident, bde_parse_value(value_text)]
+  end
+  return ["ERR", "malformed Given/Then line (expected '<ident> = <literal>' or '<ident> is <literal>'): " + remainder]
+end
+
+make a function called bde_index_of_str takes items, needle returns idx
+  let i = 0
+  let n = to_num(list_len(items))
+  while i < n do
+    if items[i] == needle then
+      return i
+    end
+    let i = i + 1
+  end
+  return -1
+end
+
+# Returns [param_names, examples] or ["ERR", msg].
+make a function called bde_examples_from_feature takes feature_text returns result
+  let lines = bde_split_lines(feature_text)
+  let param_names = []
+  let examples = []
+  let bindings = new("Dict", "bde_bindings_" + pr_next_id())
+  let i = 0
+  let n = to_num(list_len(lines))
+  while i < n do
+    let line = bde_trim(lines[i])
+    if bde_starts_with(line, "Scenario:") then
+      let bindings = new("Dict", "bde_bindings_" + pr_next_id())
+    else
+      if bde_starts_with(line, "Given ") or bde_starts_with(line, "And ") then
+        let kw_len = 6
+        if bde_starts_with(line, "And ") then
+          let kw_len = 4
+        end
+        let remainder = bde_trim(substr(line, kw_len, line.length - kw_len))
+        let pair = bde_parse_binding_line(remainder)
+        if pair[0] == "ERR" then
+          return ["ERR", pair[1]]
+        end
+        send(bindings, "set", pair[0], pair[1])
+        if bde_index_of_str(param_names, pair[0]) < 0 then
+          let param_names = list_push(param_names, pair[0])
+        end
+      else
+        if bde_starts_with(line, "Then ") then
+          let remainder = bde_trim(substr(line, 5, line.length - 5))
+          if bde_starts_with(remainder, "the ") then
+            let remainder = bde_trim(substr(remainder, 4, remainder.length - 4))
+          end
+          let pair = bde_parse_binding_line(remainder)
+          if pair[0] == "ERR" then
+            return ["ERR", pair[1]]
+          end
+          let examples = list_push(examples, [bindings, pair[1]])
+        end
+      end
+    end
+    let i = i + 1
+  end
+  return [param_names, examples]
+end

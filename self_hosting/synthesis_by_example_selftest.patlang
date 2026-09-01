@@ -1,0 +1,155 @@
+# BDD selftest for Layers 1+2 of general bottom-up program synthesis (see
+# plan: general bottom-up program synthesis). Proves the enumerator
+# actually DERIVES several small helper functions from input/output
+# examples over self_hosting/lib/primitive_registry.patlang's registered
+# primitives -- rather than being handed their bodies -- by running the
+# emitted source through a fresh `pat.exe --ir-run`, exactly the way
+# self_hosting/goap_step_interfaces_selftest.patlang already validates
+# goap_step_interfaces.patlang's own synthesized text.
+
+include "lib/test.patlang"
+include "lib/synthesis_by_example.patlang"
+
+t_init()
+
+# ---- RED: too few examples lets the search find a correct-but-overfit
+# shortcut, not the intended general solution -- proving the tests below
+# can genuinely fail, not just always pass ----
+#
+# With only ONE example, substr's own clamp-on-overrun behavior (verified
+# in primitive_registry.patlang's try_substr contract) lets a fixed,
+# coincidentally-large constant count stand in for "the rest of the
+# string" -- the search has no reason to prefer the general str_len-based
+# formula over the smaller, examples-satisfying shortcut.
+let b1_red = new("Dict", "b1_red")
+send(b1_red, "set", "s", "GET /health HTTP/1.1")
+let one_example = [[b1_red, "/health HTTP/1.1"]]
+let shortcut_result = synthesize_from_examples(one_example, ["s"], [" "], pr_standard_registry(), ["substr", "index_of", "add", "sub", "str_len"], 8)
+check("RED: a single example is satisfiable at all", shortcut_result[0], "OK")
+
+let b_longer_red = new("Dict", "b_longer_red")
+send(b_longer_red, "set", "s", "GET /a/very/long/path/that/keeps/going/on/and/on/for/a/while HTTP/1.1")
+let shortcut_on_longer = sbe_eval(shortcut_result[1], b_longer_red, pr_standard_registry())
+let shortcut_generalizes = shortcut_on_longer[1] == "/a/very/long/path/that/keeps/going/on/and/on/for/a/while HTTP/1.1"
+check("RED: the single-example shortcut does NOT generalize to a longer held-out input", shortcut_generalizes, false)
+
+# ---- GREEN: a third, deliberately length-varying example rules the
+# shortcut out, forcing the genuine general formula ----
+
+let registry = pr_standard_registry()
+
+let a1 = new("Dict", "a1")
+send(a1, "set", "s", "GET /health HTTP/1.1")
+let a2 = new("Dict", "a2")
+send(a2, "set", "s", "POST /x HTTP/1.1")
+let a3 = new("Dict", "a3")
+send(a3, "set", "s", "GET /a/very/long/path/that/keeps/going/on/and/on/for/a/while HTTP/1.1")
+let after_space_examples = [[a1, "/health HTTP/1.1"], [a2, "/x HTTP/1.1"], [a3, "/a/very/long/path/that/keeps/going/on/and/on/for/a/while HTTP/1.1"]]
+let after_space_result = synthesize_from_examples(after_space_examples, ["s"], [" "], registry, ["substr", "index_of", "add", "sub", "str_len"], 12)
+check("after_space is derived from 3 examples (rules out the overfit shortcut)", after_space_result[0], "OK")
+register_composite(registry, "after_space", after_space_result[1], ["s"], ["string"], 4)
+
+let u1 = new("Dict", "u1")
+send(u1, "set", "s", "/health HTTP/1.1")
+let u2 = new("Dict", "u2")
+send(u2, "set", "s", "/x HTTP/1.1")
+let up_to_space_examples = [[u1, "/health"], [u2, "/x"]]
+let up_to_space_result = synthesize_from_examples(up_to_space_examples, ["s"], [" "], registry, ["substr", "index_of"], 8)
+check("up_to_space is derived from examples", up_to_space_result[0], "OK")
+register_composite(registry, "up_to_space", up_to_space_result[1], ["s"], ["string"], 4)
+
+# path_of composes the two ALREADY-DERIVED composites -- proving
+# composites really do become ordinary, cheaply-reusable registry
+# citizens rather than one-off outputs.
+let p1 = new("Dict", "p1")
+send(p1, "set", "reqline", "GET /health HTTP/1.1")
+let p2 = new("Dict", "p2")
+send(p2, "set", "reqline", "POST /x HTTP/1.1")
+let path_of_examples = [[p1, "/health"], [p2, "/x"]]
+let path_of_result = synthesize_from_examples(path_of_examples, ["reqline"], [], registry, ["after_space", "up_to_space"], 6)
+check("path_of is derived by COMPOSING two already-derived composites", path_of_result[0], "OK")
+check("path_of's derived AST really does call the two composites (not a from-scratch re-derivation)", contains_text("" + path_of_result[1], "up_to_space"), true)
+
+# ---- crlf: 0-argument constant, derived from chr + concat ----
+
+let empty_bindings = new("Dict", "empty_bindings")
+let crlf_examples = [[empty_bindings, chr(13) + chr(10)]]
+let crlf_result = synthesize_from_examples(crlf_examples, [], [], registry, ["chr", "concat"], 6)
+check("crlf is derived from a single 0-arg example", crlf_result[0], "OK")
+
+# ---- es_contains: a presence test via index_of + geq ----
+
+let e1 = new("Dict", "e1")
+send(e1, "set", "hay", "hello world")
+send(e1, "set", "needle", "world")
+let e2 = new("Dict", "e2")
+send(e2, "set", "hay", "hello world")
+send(e2, "set", "needle", "zzz")
+let es_examples = [[e1, true], [e2, false]]
+let es_result = synthesize_from_examples(es_examples, ["hay", "needle"], [], registry, ["index_of", "geq"], 6)
+check("es_contains is derived from a present/absent example pair", es_result[0], "OK")
+
+# ---- first_line: substr up to a curated separator constant ----
+
+let f1 = new("Dict", "f1")
+send(f1, "set", "text", "GET /health HTTP/1.1" + chr(13) + chr(10) + chr(13) + chr(10))
+let f2 = new("Dict", "f2")
+send(f2, "set", "text", "POST /x HTTP/1.1" + chr(13) + chr(10) + chr(13) + chr(10))
+let fl_examples = [[f1, "GET /health HTTP/1.1"], [f2, "POST /x HTTP/1.1"]]
+let fl_result = synthesize_from_examples(fl_examples, ["text"], [chr(13) + chr(10)], registry, ["substr", "index_of"], 7)
+check("first_line is derived from examples", fl_result[0], "OK")
+
+# ---- body_for_path: decision-list mode, not expression enumeration ----
+
+let bfp_examples = [["/health", "OK"], ["/echo", "ECHO"], ["/time", "TIME"]]
+let bfp_ast = synthesize_lookup_from_examples("path", bfp_examples, "NOT FOUND")
+
+# ---- emit every derived function as real PatLang source, run it in a
+# fresh process, and confirm the emitted source actually reproduces the
+# behavior the examples specified -- not just that emission succeeded ----
+
+let src = sb_new()
+sb_push(src, "include \"../lib/gherkin_contracts.patlang\"\n")
+sb_push(src, emit_function_def_patlang("crlf", [], crlf_result[1], registry)[1])
+sb_push(src, emit_function_def_patlang("es_contains", ["hay", "needle"], es_result[1], registry)[1])
+sb_push(src, emit_function_def_patlang("first_line", ["text"], fl_result[1], registry)[1])
+sb_push(src, emit_function_def_patlang("after_space", ["s"], after_space_result[1], registry)[1])
+sb_push(src, emit_function_def_patlang("up_to_space", ["s"], up_to_space_result[1], registry)[1])
+sb_push(src, emit_function_def_patlang("path_of", ["reqline"], path_of_result[1], registry)[1])
+sb_push(src, emit_decision_function_patlang("body_for_path", "path", bfp_ast, registry))
+sb_push(src, "print(crlf() == (chr(13) + chr(10)))\n")
+sb_push(src, "print(es_contains(\"hello world\", \"world\"))\n")
+sb_push(src, "print(es_contains(\"hello world\", \"zzz\"))\n")
+sb_push(src, "print(first_line(\"GET /health HTTP/1.1\" + chr(13) + chr(10) + chr(13) + chr(10)))\n")
+sb_push(src, "print(path_of(\"GET /health HTTP/1.1\"))\n")
+sb_push(src, "print(path_of(\"POST /echo HTTP/1.1\"))\n")
+sb_push(src, "print(body_for_path(\"/health\"))\n")
+sb_push(src, "print(body_for_path(\"/echo\"))\n")
+sb_push(src, "print(body_for_path(\"/time\"))\n")
+sb_push(src, "print(body_for_path(\"/nope\"))\n")
+
+let synth_path = "self_hosting/build/synthesis_by_example_selftest_generated.patlang"
+write_file(synth_path, sb_str(src))
+let run_out = exec_capture("rust-runtime/target/release/pat.exe", "--ir-run", synth_path)
+print(run_out)
+
+check("emitted crlf() matches its example", contains_text(run_out, "true"), true)
+check("emitted es_contains reports presence", contains_text(run_out, "true\ntrue\nfalse"), true)
+check("emitted first_line extracts the request line", contains_text(run_out, "GET /health HTTP/1.1"), true)
+check("emitted path_of resolves both routes", contains_text(run_out, "/health\n/echo"), true)
+check("emitted body_for_path resolves all 3 endpoints plus the default", contains_text(run_out, "OK\nECHO\nTIME\nNOT FOUND"), true)
+
+# ---- multi-language emission: the same derived AST, emitted in Ruby, and
+# actually run through a real local Ruby interpreter (not just checked
+# for well-formed-looking text) ----
+
+let ruby_expr = emit_ast(crlf_result[1], "ruby", registry)
+check("crlf's derived AST emits a Ruby expression", ruby_expr[0], "OK")
+
+let ruby_src = "puts((" + ruby_expr[1] + ") == \"\\r\\n\")\n"
+let ruby_path = "self_hosting/build/synthesis_by_example_selftest_generated.rb"
+write_file(ruby_path, ruby_src)
+let ruby_out = exec_capture("ruby", ruby_path)
+check("the Ruby-emitted crlf expression runs under a real Ruby interpreter and matches", contains_text(ruby_out, "true"), true)
+
+t_report()

@@ -1,0 +1,509 @@
+# Layer 1 of general bottom-up program synthesis for the GOAP goal solver
+# (see plan: general bottom-up program synthesis). A registry of PRIMITIVE
+# operations, each wrapped to a uniform try_<name>(args...) -> [ok, value]
+# calling convention, with a per-primitive contract and a per-language code
+# snippet dictionary -- so a later enumerative synthesizer (self_hosting/
+# lib/synthesis_by_example.patlang) can search over primitives it never
+# has to special-case as "pure" vs "effectful", and so a winning candidate
+# can be emitted as source in more than just PatLang.
+#
+# Why every wrapper is hand-written rather than derived automatically: the
+# real primitive surface (rust-runtime/src/ir/hosts.rs) is inconsistent --
+# read-accessors (substr, char_code) silently clamp/sentinel on bad input
+# and never fail; mutating ops (list_set) and file I/O raise a hard Err;
+# only the tcp_* family has a genuine host-level try_ pairing already
+# (tcp_connect/tcp_try_connect, see self_hosting/lib/signals.patlang's own
+# header on why). PatLang has no try/catch, so a raised host Err can't be
+# caught from inside PatLang code -- exactly why tcp_try_* exist as
+# separate host entry points instead of a catchable wrapper, and exactly
+# why each wrapper below checks its own precondition with a plain `if`
+# BEFORE calling the real primitive, rather than trying to catch a failure
+# after the fact.
+#
+# Contracts, correctly: require/ensure (-> contract_check, rust-runtime/
+# src/ir/lowering.rs:365-374) are FATAL on violation -- confirmed via
+# self_hosting/examples/contracts_demo.patlang. A synthesizer that tries
+# many candidate calls, many of them intentionally invalid, cannot use
+# require for the real failure path (that would abort the whole search on
+# the first bad candidate). So every wrapper's real failure path is a
+# plain `if`/early-return; require/ensure are used only to defend an
+# invariant that should NEVER actually fire once the manual guard has
+# already passed -- e.g. "the result this wrapper returns is always a
+# 2-element [ok, value] list" -- giving every wrapper a real, checked
+# contract without making the search fatal on an expected miss.
+
+include "gherkin_contracts.patlang"
+
+# new("Dict", name) is a GLOBAL object keyed by that literal name string
+# (rust-runtime/src/ir/hosts.rs's OBJECTS map) -- two calls with the same
+# name alias the SAME object rather than creating independent ones. Every
+# Dict this file creates therefore gets a fresh, process-unique name via
+# this counter, never a fixed literal.
+make a function called pr_next_id returns id
+  let cur = get("__vars", "pr_id_counter")
+  let n = 0
+  if cur then
+    let n = to_num(cur)
+  end
+  set_var("pr_id_counter", n + 1)
+  return n
+end
+
+make a function called pr_new_registry returns registry
+  return new("Dict", "primitive_registry_" + pr_next_id())
+end
+
+# entry: ["prim", try_fn_name, arity, cost, snippets, arg_types, ret_type,
+# arg_contracts] for a hand-written primitive wrapper, or ["composite",
+# [ast, param_names], arity, cost, snippets, arg_types, ret_type,
+# arg_contracts] for a function synthesis_by_example.patlang derived from
+# examples and registered back in (see register_composite there) -- the
+# "kind" tag at index 0 is what lets both live in the same registry and
+# be dispatched uniformly by the enumerator's evaluator. snippets is a
+# Dict from language name -> template string with positional {0}/{1}/...
+# placeholders.
+#
+# arg_types is a list of "int"/"string"/"bool"/"list" tags, one per
+# argument position -- comparisons on mismatched types are a FATAL
+# interpreter error in PatLang (confirmed empirically: `code < 0` on a
+# string argument aborts the whole process, not just that call), so the
+# enumerator MUST filter candidate arguments by inferred type before ever
+# constructing a call, never discover a type mismatch by trying it and
+# catching a failure.
+#
+# ret_type is the type this primitive PRODUCES (declared, not inferred --
+# a composite's actual output type still comes from evaluating it, but a
+# raw primitive's doesn't change per call the way a composite's might
+# depend on its own internals, so it's simplest to just state it).
+# "any" is reserved for a genuinely polymorphic primitive (list_get's
+# return type is whatever the list holds) -- pr_names_for_ret_type treats
+# "any"-tagged primitives as a candidate for every requested type.
+#
+# arg_contracts is a list, one per argument position, of either "" (no
+# extra contract beyond the type tag) or a predicate FUNCTION NAME that
+# takes the argument's actual value (on the sample binding) and returns a
+# bool -- checked BEFORE a candidate is even constructed, not after,
+# pruning combinations that are provably inadmissible (e.g. a negative
+# substr count) rather than building-then-rejecting them via full
+# evaluation. This is deliberately unary/per-position only -- a RELATIONAL
+# contract across two argument positions (e.g. "start <= text.length") is
+# still enforced the way it always was, inside the try_ wrapper itself at
+# evaluation time, not pruned at construction time; expressing that
+# relationally at construction time is a real further improvement, not
+# attempted here (see the plan's explicit non-goal on unifying this with
+# the GOAP planner's own effect/precondition language).
+make a function called pr_register takes registry, name, try_fn_name, arity, cost, snippets, arg_types, ret_type, arg_contracts returns done
+  send(registry, "set", name, ["prim", try_fn_name, arity, cost, snippets, arg_types, ret_type, arg_contracts])
+  let idx = get(registry, "__by_ret_type__")
+  if not idx then
+    let idx = new("Dict", "pr_by_ret_type_" + pr_next_id())
+    send(registry, "set", "__by_ret_type__", idx)
+  end
+  let existing = get(idx, ret_type)
+  if existing then
+    send(idx, "set", ret_type, list_push(existing, name))
+  else
+    send(idx, "set", ret_type, [name])
+  end
+  return true
+end
+
+make a function called pr_lookup takes registry, name returns entry
+  return get(registry, name)
+end
+
+# Every primitive/composite registered with the given ret_type, PLUS
+# every one registered as "any" (a genuinely polymorphic producer) --
+# lets a caller ask "what can produce a string?" instead of hand-curating
+# a primitive_names list per demo, the "more realistic action set" this
+# was built for.
+make a function called pr_names_for_ret_type takes registry, ret_type returns names
+  let idx = get(registry, "__by_ret_type__")
+  if not idx then
+    return []
+  end
+  let exact = get(idx, ret_type)
+  if not exact then
+    let exact = []
+  end
+  if ret_type == "any" then
+    return exact
+  end
+  let poly = get(idx, "any")
+  if not poly then
+    return exact
+  end
+  return sbe_map_json_str_free(exact, poly)
+end
+
+# Plain list concatenation, named locally so this file doesn't need to
+# include synthesis_by_example.patlang (which includes THIS file) just
+# for sbe_list_concat.
+make a function called sbe_map_json_str_free takes a, b returns out
+  let out = a
+  let i = 0
+  let n = to_num(list_len(b))
+  while i < n do
+    let out = list_push(out, b[i])
+    let i = i + 1
+  end
+  return out
+end
+
+# Checks arg_contracts (if any) for the given primitive against the
+# ACTUAL VALUES a candidate call's arguments would take on the sample
+# binding -- true if every declared per-position contract passes (or has
+# none declared).
+make a function called pr_args_satisfy_contracts takes entry, arg_values returns ok
+  let arg_contracts = entry[7]
+  let i = 0
+  let n = to_num(list_len(arg_contracts))
+  while i < n do
+    let contract_fn = arg_contracts[i]
+    if contract_fn != "" then
+      if not apply(contract_fn, arg_values[i]) then
+        return false
+      end
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+# ---- reusable arg-contract predicates ----
+
+make a function called pr_contract_nonneg takes v returns ok
+  return v >= 0
+end
+
+make a function called pr_snippet takes registry, name, lang returns tmpl
+  let entry = pr_lookup(registry, name)
+  if entry then
+    let snippets = entry[4]
+    let t = get(snippets, lang)
+    if t then
+      return t
+    end
+  end
+  return ""
+end
+
+make a function called pr_new_snippets returns d
+  return new("Dict", "primitive_snippets_" + pr_next_id())
+end
+
+make a function called pr_set_snippet takes snippets, lang, tmpl returns done
+  send(snippets, "set", lang, tmpl)
+  return true
+end
+
+# ---- try_ wrappers: the uniform [ok, value] calling convention ----
+
+make a function called try_chr takes code returns result
+  if (code < 0) or (code > 1114111) then
+    let result = [false, ""]
+    ensure to_num(list_len(result)) == 2
+    return result
+  end
+  let result = [true, chr(code)]
+  ensure to_num(list_len(result)) == 2
+  return result
+end
+
+# char_code(s, idx) sentinel-returns -1 on an out-of-range index (verified
+# in rust-runtime/src/ir/hosts.rs) rather than raising -- treated here as
+# the wrapper's real, meaningful failure signal.
+make a function called try_char_code takes s, idx returns result
+  let c = char_code(s, idx)
+  if c < 0 then
+    let result = [false, -1]
+    ensure to_num(list_len(result)) == 2
+    return result
+  end
+  let result = [true, c]
+  ensure to_num(list_len(result)) == 2
+  return result
+end
+
+# substr(s, start, count) clamps/saturates rather than raising (verified
+# in hosts.rs) -- the manual guard below is what makes an out-of-range
+# start a real, observable failure instead of a silently truncated result.
+make a function called try_substr takes s, start, count returns result
+  if (start < 0) or (start > s.length) or (count < 0) then
+    let result = [false, ""]
+    ensure to_num(list_len(result)) == 2
+    return result
+  end
+  require (start >= 0) and (start <= s.length)
+  let result = [true, substr(s, start, count)]
+  ensure to_num(list_len(result)) == 2
+  return result
+end
+
+# String concatenation, equality, and length never fail -- always ok, kept
+# in the uniform [ok, value] shape purely for the enumerator's calling
+# convention.
+make a function called try_concat takes a, b returns result
+  let result = [true, a + b]
+  ensure to_num(list_len(result)) == 2
+  return result
+end
+
+make a function called try_str_eq takes a, b returns result
+  let result = [true, a == b]
+  ensure to_num(list_len(result)) == 2
+  return result
+end
+
+make a function called try_str_len takes s returns result
+  let result = [true, s.length]
+  ensure to_num(list_len(result)) == 2
+  return result
+end
+
+# Wraps the existing library scan (self_hosting/lib/gherkin_contracts.
+# patlang's gc_find_substr) rather than reimplementing it -- the registry
+# doesn't care whether a primitive is host- or library-implemented, only
+# that it has a wrapper of the uniform shape.
+#
+# Two variants, deliberately: try_find_substr treats "not found" as a real
+# FAILURE (ok=false) -- useful when a composition should be rejected
+# outright if the needle is absent. try_index_of treats "not found" as a
+# perfectly valid VALUE (-1) that a later comparison can act on (e.g.
+# `index_of(...) >= 0` as a presence test) -- needed because sbe_eval
+# short-circuits a whole candidate to non-matching the moment any sub-call
+# comes back not-ok, which would make a presence test like es_contains
+# unreachable if find_substr's fail-on-absence were the only option.
+make a function called try_find_substr takes hay, needle returns result
+  let idx = gc_find_substr(hay, needle)
+  if idx < 0 then
+    let result = [false, -1]
+    ensure to_num(list_len(result)) == 2
+    return result
+  end
+  let result = [true, idx]
+  ensure to_num(list_len(result)) == 2
+  return result
+end
+
+make a function called try_index_of takes hay, needle returns result
+  let result = [true, gc_find_substr(hay, needle)]
+  ensure to_num(list_len(result)) == 2
+  return result
+end
+
+# Search starting from a given offset (needed to find a SECOND
+# occurrence of a delimiter, e.g. Markdown's closing "**" -- ordinary
+# find_substr/index_of always find the FIRST occurrence from the start).
+make a function called try_index_of_from takes hay, needle, start returns result
+  if (start < 0) or (start > hay.length) then
+    let result = [false, -1]
+    ensure to_num(list_len(result)) == 2
+    return result
+  end
+  let rest = substr(hay, start, hay.length - start)
+  let found = gc_find_substr(rest, needle)
+  if found < 0 then
+    let result = [true, -1]
+    ensure to_num(list_len(result)) == 2
+    return result
+  end
+  let result = [true, found + start]
+  ensure to_num(list_len(result)) == 2
+  return result
+end
+
+# Small arithmetic/comparison primitives -- never fail, needed so the
+# enumerator can compose index arithmetic (e.g. "one past the delimiter")
+# the same way it composes string operations.
+make a function called try_add takes a, b returns result
+  let result = [true, a + b]
+  ensure to_num(list_len(result)) == 2
+  return result
+end
+
+make a function called try_sub takes a, b returns result
+  let result = [true, a - b]
+  ensure to_num(list_len(result)) == 2
+  return result
+end
+
+make a function called try_geq takes a, b returns result
+  let result = [true, a >= b]
+  ensure to_num(list_len(result)) == 2
+  return result
+end
+
+make a function called try_eq_int takes a, b returns result
+  let result = [true, a == b]
+  ensure to_num(list_len(result)) == 2
+  return result
+end
+
+# list_get(xs, idx) returns Unit/empty on an out-of-range index rather
+# than raising (verified in rust-runtime/src/ir/hosts.rs) -- the manual
+# guard below is what makes an out-of-range index a real, observable
+# failure instead of an ambiguous "empty" result.
+make a function called try_list_get takes xs, idx returns result
+  if (idx < 0) or (idx >= to_num(list_len(xs))) then
+    let result = [false, ""]
+    ensure to_num(list_len(result)) == 2
+    return result
+  end
+  let result = [true, list_get(xs, idx)]
+  ensure to_num(list_len(result)) == 2
+  return result
+end
+
+make a function called try_list_len takes xs returns result
+  let result = [true, to_num(list_len(xs))]
+  ensure to_num(list_len(result)) == 2
+  return result
+end
+
+# ---- effectful primitives: same uniform shape, same contract discipline.
+# tcp_try_connect/tcp_try_listen already exist at the host level (the
+# "real try_ pairing" case) -- these wrappers just normalize their
+# -1-on-failure sentinel into the same [ok, value] convention every other
+# registrant uses, so the enumerator never has to special-case them.
+
+make a function called try_tcp_connect takes host, port returns result
+  let id = tcp_try_connect(host, port)
+  if id < 0 then
+    let result = [false, -1]
+    ensure to_num(list_len(result)) == 2
+    return result
+  end
+  let result = [true, id]
+  ensure to_num(list_len(result)) == 2
+  return result
+end
+
+make a function called try_tcp_listen takes port returns result
+  let id = tcp_try_listen(port)
+  if id < 0 then
+    let result = [false, -1]
+    ensure to_num(list_len(result)) == 2
+    return result
+  end
+  let result = [true, id]
+  ensure to_num(list_len(result)) == 2
+  return result
+end
+
+# ---- the standard registry: every primitive above, registered with its
+# arity, a search cost, and a per-language snippet dictionary. "patlang"
+# is always present (its template is just the real primitive call text);
+# other languages are added incrementally, one snippet at a time, per
+# primitive -- adding a new target language never requires a new
+# per-node-kind transpiler (contrast self_hosting/lib/transpile_ruby.
+# patlang's whole-AST walker), just one template per primitive you want
+# callable from it.
+
+make a function called pr_standard_registry returns registry
+  let registry = pr_new_registry()
+
+  let s_chr = pr_new_snippets()
+  pr_set_snippet(s_chr, "patlang", "chr({0})")
+  pr_set_snippet(s_chr, "ruby", "({0}).chr")
+  pr_set_snippet(s_chr, "python", "chr({0})")
+  pr_register(registry, "chr", "try_chr", 1, 1, s_chr, ["int"], "string", [""])
+
+  let s_char_code = pr_new_snippets()
+  pr_set_snippet(s_char_code, "patlang", "char_code({0}, {1})")
+  pr_set_snippet(s_char_code, "ruby", "({0}).getbyte({1})")
+  pr_set_snippet(s_char_code, "python", "ord({0}[{1}])")
+  pr_register(registry, "char_code", "try_char_code", 2, 1, s_char_code, ["string", "int"], "int", ["", "pr_contract_nonneg"])
+
+  let s_substr = pr_new_snippets()
+  pr_set_snippet(s_substr, "patlang", "substr({0}, {1}, {2})")
+  pr_set_snippet(s_substr, "ruby", "({0})[{1}, {2}]")
+  pr_set_snippet(s_substr, "python", "({0})[{1}:{1}+{2}]")
+  pr_register(registry, "substr", "try_substr", 3, 1, s_substr, ["string", "int", "int"], "string", ["", "pr_contract_nonneg", "pr_contract_nonneg"])
+
+  let s_concat = pr_new_snippets()
+  pr_set_snippet(s_concat, "patlang", "({0} + {1})")
+  pr_set_snippet(s_concat, "ruby", "({0} + {1})")
+  pr_set_snippet(s_concat, "python", "({0} + {1})")
+  pr_register(registry, "concat", "try_concat", 2, 1, s_concat, ["string", "string"], "string", ["", ""])
+
+  let s_str_eq = pr_new_snippets()
+  pr_set_snippet(s_str_eq, "patlang", "({0} == {1})")
+  pr_set_snippet(s_str_eq, "ruby", "({0} == {1})")
+  pr_set_snippet(s_str_eq, "python", "({0} == {1})")
+  pr_register(registry, "str_eq", "try_str_eq", 2, 1, s_str_eq, ["string", "string"], "bool", ["", ""])
+
+  let s_str_len = pr_new_snippets()
+  pr_set_snippet(s_str_len, "patlang", "({0}).length")
+  pr_set_snippet(s_str_len, "ruby", "({0}).length")
+  pr_set_snippet(s_str_len, "python", "len({0})")
+  pr_register(registry, "str_len", "try_str_len", 1, 1, s_str_len, ["string"], "int", [""])
+
+  let s_find_substr = pr_new_snippets()
+  pr_set_snippet(s_find_substr, "patlang", "gc_find_substr({0}, {1})")
+  pr_set_snippet(s_find_substr, "ruby", "(({0}).index({1}) or -1)")
+  pr_set_snippet(s_find_substr, "python", "({0}).find({1})")
+  pr_register(registry, "find_substr", "try_find_substr", 2, 1, s_find_substr, ["string", "string"], "int", ["", ""])
+
+  let s_index_of = pr_new_snippets()
+  pr_set_snippet(s_index_of, "patlang", "gc_find_substr({0}, {1})")
+  pr_set_snippet(s_index_of, "ruby", "(({0}).index({1}) or -1)")
+  pr_set_snippet(s_index_of, "python", "({0}).find({1})")
+  pr_register(registry, "index_of", "try_index_of", 2, 1, s_index_of, ["string", "string"], "int", ["", ""])
+
+  # NOTE: this call-site template is only correct when the needle IS
+  # found (it doesn't special-case gc_find_substr's -1-not-found sentinel
+  # the way try_index_of_from itself does) -- fine for emitting source
+  # that's only ever run on inputs already known (via the examples that
+  # proved it) to contain a match; not used by sbe_eval's own direct
+  # evaluation path, which always calls the real try_ function.
+  let s_index_of_from = pr_new_snippets()
+  pr_set_snippet(s_index_of_from, "patlang", "(gc_find_substr(substr({0}, {2}, ({0}).length - {2}), {1}) + {2})")
+  pr_register(registry, "index_of_from", "try_index_of_from", 3, 2, s_index_of_from, ["string", "string", "int"], "int", ["", "", "pr_contract_nonneg"])
+
+  let s_add = pr_new_snippets()
+  pr_set_snippet(s_add, "patlang", "({0} + {1})")
+  pr_set_snippet(s_add, "ruby", "({0} + {1})")
+  pr_set_snippet(s_add, "python", "({0} + {1})")
+  pr_register(registry, "add", "try_add", 2, 1, s_add, ["int", "int"], "int", ["", ""])
+
+  let s_sub = pr_new_snippets()
+  pr_set_snippet(s_sub, "patlang", "({0} - {1})")
+  pr_set_snippet(s_sub, "ruby", "({0} - {1})")
+  pr_set_snippet(s_sub, "python", "({0} - {1})")
+  pr_register(registry, "sub", "try_sub", 2, 1, s_sub, ["int", "int"], "int", ["", ""])
+
+  let s_geq = pr_new_snippets()
+  pr_set_snippet(s_geq, "patlang", "({0} >= {1})")
+  pr_set_snippet(s_geq, "ruby", "({0} >= {1})")
+  pr_set_snippet(s_geq, "python", "({0} >= {1})")
+  pr_register(registry, "geq", "try_geq", 2, 1, s_geq, ["int", "int"], "bool", ["", ""])
+
+  let s_eq_int = pr_new_snippets()
+  pr_set_snippet(s_eq_int, "patlang", "({0} == {1})")
+  pr_set_snippet(s_eq_int, "ruby", "({0} == {1})")
+  pr_set_snippet(s_eq_int, "python", "({0} == {1})")
+  pr_register(registry, "eq_int", "try_eq_int", 2, 1, s_eq_int, ["int", "int"], "bool", ["", ""])
+
+  let s_list_get = pr_new_snippets()
+  pr_set_snippet(s_list_get, "patlang", "list_get({0}, {1})")
+  pr_set_snippet(s_list_get, "ruby", "({0})[{1}]")
+  pr_set_snippet(s_list_get, "python", "({0})[{1}]")
+  pr_register(registry, "list_get", "try_list_get", 2, 1, s_list_get, ["list", "int"], "any", ["", "pr_contract_nonneg"])
+
+  let s_list_len = pr_new_snippets()
+  pr_set_snippet(s_list_len, "patlang", "to_num(list_len({0}))")
+  pr_set_snippet(s_list_len, "ruby", "({0}).length")
+  pr_set_snippet(s_list_len, "python", "len({0})")
+  pr_register(registry, "list_len", "try_list_len", 1, 1, s_list_len, ["list"], "int", [""])
+
+  let s_tcp_connect = pr_new_snippets()
+  pr_set_snippet(s_tcp_connect, "patlang", "tcp_try_connect({0}, {1})")
+  pr_register(registry, "tcp_connect", "try_tcp_connect", 2, 5, s_tcp_connect, ["string", "int"], "int", ["", "pr_contract_nonneg"])
+
+  let s_tcp_listen = pr_new_snippets()
+  pr_set_snippet(s_tcp_listen, "patlang", "tcp_try_listen({0})")
+  pr_register(registry, "tcp_listen", "try_tcp_listen", 1, 5, s_tcp_listen, ["int"], "int", ["pr_contract_nonneg"])
+
+  return registry
+end

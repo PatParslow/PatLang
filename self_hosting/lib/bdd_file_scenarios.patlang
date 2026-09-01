@@ -1,0 +1,98 @@
+# Generic END-TO-END file-scenario runner: a .feature scenario describes
+# real file state before and after, and this actually performs the real
+# file I/O (creating the fixture file, invoking a registered operation,
+# re-reading the result) -- proving a synthesized pure transform correctly
+# drives a real program on a real file, not just that the isolated
+# function matches its own examples.
+#
+# Grammar (deliberately narrow, matching self_hosting/lib/bdd_examples.
+# patlang's own style):
+#
+#   Scenario: <name>
+#     Given a file named "<path>" containing "<content>"
+#     And the <label> is "<value>"     (op-specific extra bindings -- the
+#                                        text between "the" and "is" IS the
+#                                        binding's key, verbatim, so use a
+#                                        single word here that matches
+#                                        whatever key the op wrapper reads
+#                                        via get(extra, "<label>"); add as
+#                                        many "And the X is Y" lines as the
+#                                        op needs)
+#     When I run "<op-name>" on "<path>"
+#     Then the file "<path>" contains "<content>"
+#
+# The operation named in `When I run "<op-name>"` is looked up in an
+# op_registry (name -> function-name string) the caller supplies. That
+# function is ALWAYS thin, hand-authored I/O orchestration (read_file,
+# evaluate a synthesized AST, write_file) -- never the actual
+# algorithm/business logic, which must come from self_hosting/lib/
+# synthesis_by_example.patlang. See self_hosting/examples/synth_demo_
+# search_replace.patlang for the concrete case this exists for.
+
+include "bdd_examples.patlang"
+
+# "And the <label> is "<value>"" -> [label, value], or ["ERR", msg].
+make a function called bfs_parse_and_is_line takes remainder returns pair
+  let idx = gc_find_substr(remainder, " is ")
+  if idx < 0 then
+    return ["ERR", "malformed 'And the X is \"...\"' line: " + remainder]
+  end
+  let label_part = bde_trim(substr(remainder, 0, idx))
+  if bde_starts_with(label_part, "the ") then
+    let label_part = bde_trim(substr(label_part, 4, label_part.length - 4))
+  end
+  let value_text = substr(remainder, idx + 4, remainder.length - idx - 4)
+  let quoted = bde_extract_quoted_strings(value_text)
+  return [label_part, quoted[0]]
+end
+
+make a function called bfs_run_feature takes feature_text, op_registry returns done
+  let lines = bde_split_lines(feature_text)
+  let extra = new("Dict", "bfs_extra_" + pr_next_id())
+  let i = 0
+  let n = to_num(list_len(lines))
+  while i < n do
+    let line = bde_trim(lines[i])
+    if bde_starts_with(line, "Scenario:") then
+      let extra = new("Dict", "bfs_extra_" + pr_next_id())
+    else
+      if bde_starts_with(line, "Given a file named ") or bde_starts_with(line, "And a file named ") then
+        let parts = bde_extract_quoted_strings(line)
+        write_file(parts[0], parts[1])
+        print("  [fixture] wrote " + parts[0] + " = \"" + parts[1] + "\"")
+      else
+        if bde_starts_with(line, "And the ") then
+          let remainder = bde_trim(substr(line, 4, line.length - 4))
+          let pair = bfs_parse_and_is_line(remainder)
+          if pair[0] == "ERR" then
+            print("  " + pair[1])
+          else
+            send(extra, "set", pair[0], pair[1])
+          end
+        else
+          if bde_starts_with(line, "When I run ") then
+            let quoted = bde_extract_quoted_strings(line)
+            let op_name = quoted[0]
+            let path = quoted[1]
+            let op_fn = get(op_registry, op_name)
+            if op_fn then
+              apply(op_fn, path, extra)
+            else
+              print("  no operation registered for \"" + op_name + "\"")
+            end
+          else
+            if bde_starts_with(line, "Then the file ") then
+              let parts = bde_extract_quoted_strings(line)
+              let path = parts[0]
+              let expected = parts[1]
+              let actual = read_file(path)
+              check("file " + path + " has the expected contents", actual, expected)
+            end
+          end
+        end
+      end
+    end
+    let i = i + 1
+  end
+  return true
+end
