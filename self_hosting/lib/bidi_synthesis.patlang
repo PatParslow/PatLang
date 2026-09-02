@@ -215,11 +215,397 @@ make a function called bidi_witness_pass takes examples, index, registry, max_si
   return ["ERR"]
 end
 
+# ---- Phase 2: cond's disjunctive witness ----
+#
+# cond(test, a, b) = target doesn't have ONE inverse the way concat/add
+# do -- it has two, and they don't compose the same way (a split always
+# names exactly one pair of sub-goals; a branch could be either of two
+# DIFFERENT sub-expressions, and which examples belong to which branch
+# isn't known in advance). The witness here: try every way of
+# partitioning the examples into two non-empty groups, and for each
+# partition, search independently for (a) an expression correct on the
+# "true" group, (b) an expression correct on the "false" group, and
+# (c) a boolean expression that is true on the "true" group and false
+# on the "false" group -- reusing the SAME recursive search (forward +
+# Phase 1 witnesses) for all three, not a separate mechanism. Only
+# succeeds if all three sub-searches succeed AND the assembled
+# cond(test,a,b) verifies against every original example (a partition
+# guess can be internally consistent per-branch yet still wrong overall
+# if the "test" that separates them doesn't generalize the same way the
+# real domain does -- sbe_matches_all is the final, unconditional
+# check, same as everywhere else in this codebase).
+#
+# Bounded by 2^n - 2 partitions for n examples (every non-empty,
+# non-full split; no attempt to dedupe a partition against its A/B-
+# swapped mirror, which just tries the same work twice, not more of it)
+# -- fine for the single-digit example counts this codebase's own
+# demos use, not attempted for large n. depth caps recursion (each
+# sub-search can itself try to build a cond via its own boolean-test
+# search), since a boolean sub-search could otherwise try to explain
+# itself with another cond, recursively, without limit.
+make a function called bidi_all_partitions takes n returns partitions
+  let out = [[]]
+  let i = 0
+  while i < n do
+    let next = []
+    let j = 0
+    let jn = to_num(list_len(out))
+    while j < jn do
+      let p = out[j]
+      let next = list_push(next, list_push(p, true))
+      let next = list_push(next, list_push(p, false))
+      let j = j + 1
+    end
+    let out = next
+    let i = i + 1
+  end
+  let filtered = []
+  let k = 0
+  let kn = to_num(list_len(out))
+  while k < kn do
+    let p = out[k]
+    let all_true = true
+    let all_false = true
+    let m = 0
+    let mn = to_num(list_len(p))
+    while m < mn do
+      if p[m] then
+        let all_false = false
+      else
+        let all_true = false
+      end
+      let m = m + 1
+    end
+    if (not all_true) and (not all_false) then
+      let filtered = list_push(filtered, p)
+    end
+    let k = k + 1
+  end
+  return filtered
+end
+
+make a function called bidi_subset_examples takes examples, partition, want returns subset
+  let out = []
+  let i = 0
+  let n = to_num(list_len(examples))
+  while i < n do
+    if partition[i] == want then
+      let out = list_push(out, examples[i])
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called bidi_bool_examples takes examples, partition returns bool_examples
+  let out = []
+  let i = 0
+  let n = to_num(list_len(examples))
+  while i < n do
+    let out = list_push(out, [examples[i][0], partition[i]])
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called bidi_list_contains takes items, value returns yes
+  let i = 0
+  let n = to_num(list_len(items))
+  while i < n do
+    if items[i] == value then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# Every concrete type reachable from `available_types` within `cap`
+# primitive calls, ignoring whether a primitive's OTHER argument
+# positions are actually cheap to fill (the standard "delete-relaxation"
+# move: relaxing a constraint can only ever make the true cost look
+# smaller than it really is, never larger, which is exactly what
+# admissibility needs -- see plan-file note on this technique). One
+# registered primitive with ANY argument position matching an already-
+# reachable type makes its OWN return type reachable one hop further
+# out; "any"-typed argument positions are trivially satisfiable by
+# construction. Returns a Dict from type name -> hop count (0 for
+# types already in `available_types`).
+make a function called bidi_type_reachability takes available_types, registry, primitive_names, cap returns reach
+  let reach = new("Dict", "bidi_reach_" + pr_next_id())
+  let ai = 0
+  let an = to_num(list_len(available_types))
+  while ai < an do
+    send(reach, "set", available_types[ai], 0)
+    let ai = ai + 1
+  end
+  let dist = 0
+  while dist < cap do
+    let dist = dist + 1
+    let added_any = false
+    let p = 0
+    let pn = to_num(list_len(primitive_names))
+    while p < pn do
+      let entry = pr_lookup(registry, primitive_names[p])
+      if entry then
+        let ret_type = entry[6]
+        if not get(reach, ret_type) then
+          let arg_types = entry[5]
+          let reachable_arg = false
+          let a = 0
+          let an2 = to_num(list_len(arg_types))
+          while a < an2 do
+            let at = arg_types[a]
+            if (at == "any") or get(reach, at) then
+              let reachable_arg = true
+            end
+            let a = a + 1
+          end
+          if reachable_arg then
+            send(reach, "set", ret_type, dist)
+            let added_any = true
+          end
+        end
+      end
+      let p = p + 1
+    end
+    if not added_any then
+      let dist = cap
+    end
+  end
+  return reach
+end
+
+make a function called bidi_available_types takes examples, input_names, extra_consts returns types
+  let out = ["int"]
+  let bindings = examples[0][0]
+  let i = 0
+  let n = to_num(list_len(input_names))
+  while i < n do
+    let ty = type_of(get(bindings, input_names[i]))
+    if not bidi_list_contains(out, ty) then
+      let out = list_push(out, ty)
+    end
+    let i = i + 1
+  end
+  let j = 0
+  let jn = to_num(list_len(extra_consts))
+  while j < jn do
+    let ty = type_of(extra_consts[j])
+    if not bidi_list_contains(out, ty) then
+      let out = list_push(out, ty)
+    end
+    let j = j + 1
+  end
+  return out
+end
+
+# Admissible lower bound on the size of ANY expression matching every
+# example in this branch, computable WITHOUT running the real search:
+# if a single input (or a single literal constant) already equals the
+# target for every example in the branch, 1 is not just a bound, it's
+# the exact achievable minimum (a bare leaf). Otherwise, use the type-
+# reachability graph: if the target's own type is already available
+# (just not at the right VALUE), one "maintaining" primitive call
+# suffices at minimum -- cost 2 (a Call plus at least one leaf arg). If
+# the target's type needs `h` primitive hops to reach from the
+# available types, a chain of `h` necessarily-required Call nodes has
+# size at least `h` (each contributes >= 1) plus at least one more leaf
+# somewhere -- `h + 1`, a safe (if loose) floor, never overestimating
+# since it's derived from an already-relaxed (optimistic) reachability
+# search. Falls back to the OLD flat floor of 2 only if reachability
+# search doesn't find the type within `cap` hops (a real "no idea, but
+# it's definitely more than a leaf" case, not a silent wrong answer --
+# admissible either way, just less informative).
+make a function called bidi_branch_lower_bound takes examples, input_names, extra_consts, registry, primitive_names returns bound
+  let n = to_num(list_len(examples))
+  let ii = 0
+  let in_n = to_num(list_len(input_names))
+  while ii < in_n do
+    let name = input_names[ii]
+    let matches = true
+    let i = 0
+    while i < n do
+      let ex = examples[i]
+      if get(ex[0], name) != ex[1] then
+        let matches = false
+      end
+      let i = i + 1
+    end
+    if matches then
+      return 1
+    end
+    let ii = ii + 1
+  end
+  let const_matches = true
+  let j = 0
+  while j < n do
+    if examples[j][1] != examples[0][1] then
+      let const_matches = false
+    end
+    let j = j + 1
+  end
+  if const_matches then
+    return 1
+  end
+
+  let target_type = type_of(examples[0][1])
+  let available_types = bidi_available_types(examples, input_names, extra_consts)
+  if bidi_list_contains(available_types, target_type) then
+    return 2
+  end
+  let cap = 4
+  let reach = bidi_type_reachability(available_types, registry, primitive_names, cap)
+  let hops = get(reach, target_type)
+  if hops then
+    return hops + 1
+  end
+  return 2
+end
+
+# A*-style: rank every candidate partition by an admissible lower bound
+# on the total cost cond(test,a,b) could possibly achieve (h(test)=3,
+# the cheapest a real non-degenerate comparison could ever be, plus
+# each branch's own bidi_branch_lower_bound, plus 1 for the cond call
+# itself), explore in ascending order, and stop the instant the best
+# VERIFIED result found so far is already <= the next unexplored
+# partition's lower bound -- nothing left could possibly beat it. This
+# is what actually fixes a real, observed bug, not just a speed
+# optimization: naive first-found-wins order let an arbitrarily large,
+# numerically-coincidental cond tree get accepted before a genuinely
+# smaller (and so more likely to actually generalize, same reasoning
+# the plain forward enumerator's own smallest-first order relies on)
+# one was ever considered -- confirmed directly: a first version
+# returned a 4-deep nested cond/add tree that verified against all 5
+# training examples but failed BOTH of two held-out checks. Ordering by
+# a real lower bound and keeping only the smallest verified result
+# restores the same "prefer minimal, more general solutions" property
+# the rest of this codebase already depends on -- it does not, and
+# cannot, eliminate overfitting in principle (a genuinely small AST can
+# still fail to generalize; the existing "add a disambiguating example"
+# remedy applies here exactly as it does everywhere else in this file).
+make a function called bidi_try_cond takes examples, input_names, extra_consts, registry, primitive_names, max_size, depth returns result
+  let n = to_num(list_len(examples))
+  if (n < 2) or (depth > 2) then
+    return ["ERR"]
+  end
+  let partitions = bidi_all_partitions(n)
+  let scored = []
+  let pi = 0
+  let pn = to_num(list_len(partitions))
+  while pi < pn do
+    let partition = partitions[pi]
+    let sub_true = bidi_subset_examples(examples, partition, true)
+    let sub_false = bidi_subset_examples(examples, partition, false)
+    let h = 1 + 3 + bidi_branch_lower_bound(sub_true, input_names, extra_consts, registry, primitive_names) + bidi_branch_lower_bound(sub_false, input_names, extra_consts, registry, primitive_names)
+    let scored = list_push(scored, [h, partition, sub_true, sub_false])
+    let pi = pi + 1
+  end
+  let scored = bidi_sort_by_heuristic(scored)
+
+  # Stops on strictly-worse lower bound only (h > best_size), NOT on
+  # h == best_size -- a tying heuristic can still produce a candidate
+  # that TIES on actual size, and those ties are exactly the signal
+  # worth keeping: multiple structurally different partitions verifying
+  # at the same minimal size is the same "the examples under-specify
+  # this" ambiguity sbe_ambiguity_note already surfaces for the plain
+  # enumerator (self_hosting/lib/synthesis_by_example.patlang). A first
+  # version of this search stopped at the very first verified candidate
+  # regardless of size and returned a confidently WRONG, deeply nested
+  # answer on a known-under-specified 5-example case -- it never even
+  # LOOKED for a second explanation, so there was no chance to notice
+  # the ambiguity that was actually there. Tracking alt_count here is
+  # the fix for that blind spot, not just a nicety.
+  let best_size = -1
+  let best_candidate = false
+  let alt_count = 0
+  let si = 0
+  let sn = to_num(list_len(scored))
+  while si < sn do
+    let entry = scored[si]
+    let h = entry[0]
+    if (best_size >= 0) and (h > best_size) then
+      let si = sn
+    else
+      let partition = entry[1]
+      let sub_true = entry[2]
+      let sub_false = entry[3]
+      let a_result = bidi_synthesize_from_examples_d(sub_true, input_names, extra_consts, registry, primitive_names, max_size, depth)
+      if a_result[0] == "OK" then
+        let b_result = bidi_synthesize_from_examples_d(sub_false, input_names, extra_consts, registry, primitive_names, max_size, depth)
+        if b_result[0] == "OK" then
+          let bool_examples = bidi_bool_examples(examples, partition)
+          let t_result = bidi_synthesize_from_examples_d(bool_examples, input_names, extra_consts, registry, primitive_names, max_size, depth)
+          if t_result[0] == "OK" then
+            let candidate = ["Call", "cond", [t_result[1], a_result[1], b_result[1]]]
+            if sbe_matches_all(candidate, examples, registry) then
+              let actual_size = sbe_size(candidate)
+              if (best_size < 0) or (actual_size < best_size) then
+                let best_size = actual_size
+                let best_candidate = candidate
+                let alt_count = 0
+              else
+                if actual_size == best_size then
+                  let alt_count = alt_count + 1
+                end
+              end
+            end
+          end
+        end
+      end
+      let si = si + 1
+    end
+  end
+  if best_candidate then
+    return ["OK", best_candidate, alt_count, best_size]
+  end
+  return ["ERR"]
+end
+
+# Plain insertion sort by entry[0] (the heuristic) -- partition counts
+# here are small (2^n - 2 for this codebase's own single-digit example
+# counts), so O(n^2) is the right tradeoff against writing/maintaining
+# a real sort for a list this size.
+make a function called bidi_sort_by_heuristic takes scored returns sorted
+  let out = []
+  let i = 0
+  let n = to_num(list_len(scored))
+  while i < n do
+    let item = scored[i]
+    let inserted = false
+    let j = 0
+    let out2 = []
+    let jn = to_num(list_len(out))
+    while j < jn do
+      if (not inserted) and (item[0] < out[j][0]) then
+        let out2 = list_push(out2, item)
+        let inserted = true
+      end
+      let out2 = list_push(out2, out[j])
+      let j = j + 1
+    end
+    if not inserted then
+      let out2 = list_push(out2, item)
+    end
+    let out = out2
+    let i = i + 1
+  end
+  return out
+end
+
+# Public entry point -- unchanged signature, depth always starts at 0.
+make a function called bidi_synthesize_from_examples takes examples, input_names, extra_consts, registry, primitive_names, max_size returns result
+  return bidi_synthesize_from_examples_d(examples, input_names, extra_consts, registry, primitive_names, max_size, 0)
+end
+
 # Same overall shape as synthesize_from_examples (same leaf-seeding,
 # same forward per-level growth via sbe_build_calls/sbe_evaluate_
-# candidates, same windowing) -- the only addition is bidi_witness_pass,
-# tried once per level, before growing the forward pool further.
-make a function called bidi_synthesize_from_examples takes examples, input_names, extra_consts, registry, primitive_names, max_size returns result
+# candidates, same windowing) -- the additions are bidi_witness_pass
+# (concat/add/sub, Phase 1), tried once per level, and bidi_try_cond
+# (Phase 2), tried once up front (it doesn't depend on the forward
+# index at all, unlike Phase 1's witnesses, so there's nothing to gain
+# from retrying it as the index grows).
+make a function called bidi_synthesize_from_examples_d takes examples, input_names, extra_consts, registry, primitive_names, max_size, depth returns result
   let consts = sbe_list_concat(sbe_default_int_consts(), extra_consts)
   let sample_bindings = examples[0][0]
   let leaves = sbe_seed_leaves(input_names, consts)
@@ -254,6 +640,15 @@ make a function called bidi_synthesize_from_examples takes examples, input_names
   if wr[0] == "OK" then
     if sbe_matches_all(wr[1], examples, registry) then
       return ["OK", wr[1], notes]
+    end
+  end
+  if bidi_list_contains(primitive_names, "cond") then
+    let cr = bidi_try_cond(examples, input_names, extra_consts, registry, primitive_names, max_size, depth + 1)
+    if cr[0] == "OK" then
+      if cr[2] > 0 then
+        let notes = list_push(notes, sbe_ambiguity_note(cr[2], cr[3]))
+      end
+      return ["OK", cr[1], notes]
     end
   end
 
