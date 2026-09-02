@@ -1,0 +1,108 @@
+# Event-based domain, same boundary discipline as synth_demo_account_
+# object.patlang (and every other demo in this suite): the PURE logic
+# is derived from Given/Then examples, and the only hand-authored code
+# is the thin event wiring itself (real PatLang when/emit, not a
+# bespoke dispatch table) -- mirroring event_loop_server.patlang's own
+# when/emit convention.
+#
+#   apply_restock(stock, qty) = stock + qty                    -- add witness
+#   apply_order(stock, qty) = qty > stock
+#                              ? stock                          -- can't fulfil: unchanged
+#                              : stock - qty                    -- otherwise: fulfil
+#
+# apply_order is structurally the same shape as synth_demo_account_
+# object.patlang's withdraw (a genuine clamp-on-insufficient
+# conditional) -- deliberately reused shape, different domain, to prove
+# the cond witness generalizes across unrelated problems rather than
+# happening to fit one specific case. "stock" plays the same role
+# "balance" did there.
+
+include "../lib/bidi_synthesis.patlang"
+include "../lib/test.patlang"
+
+t_init()
+
+make a function called inventory_examples takes triples returns examples
+  let out = []
+  let i = 0
+  let n = to_num(list_len(triples))
+  while i < n do
+    let t = triples[i]
+    let b = new("Dict", "inv_ex_" + pr_next_id())
+    send(b, "set", "stock", t[0])
+    send(b, "set", "qty", t[1])
+    let out = list_push(out, [b, t[2]])
+    let i = i + 1
+  end
+  return out
+end
+
+when restocked do
+  let ast = get("__vars", "inventory_restock_ast")
+  let registry = get("__vars", "inventory_registry")
+  let b = new("Dict", "inv_call_" + pr_next_id())
+  send(b, "set", "stock", get("__vars", "stock"))
+  send(b, "set", "qty", event_data)
+  let result = sbe_eval(ast, b, registry)
+  set_var("stock", result[1])
+  let log = get("__vars", "event_log")
+  set_var("event_log", list_push(log, "restocked(" + event_data + ") -> stock=" + result[1]))
+end
+
+when order_placed do
+  let ast = get("__vars", "inventory_order_ast")
+  let registry = get("__vars", "inventory_registry")
+  let b = new("Dict", "inv_call_" + pr_next_id())
+  send(b, "set", "stock", get("__vars", "stock"))
+  send(b, "set", "qty", event_data)
+  let result = sbe_eval(ast, b, registry)
+  set_var("stock", result[1])
+  let log = get("__vars", "event_log")
+  set_var("event_log", list_push(log, "order_placed(" + event_data + ") -> stock=" + result[1]))
+end
+
+make a function called run_synth_demo_inventory_events returns ok
+  let registry = pr_standard_registry()
+
+  let restock_examples = inventory_examples([[10, 5, 15], [0, 20, 20], [100, 1, 101]])
+  let restock_result = bidi_synthesize_from_examples(restock_examples, ["stock", "qty"], [], registry, ["add"], 6)
+  check("restock logic derives (add witness)", restock_result[0], "OK")
+  set_var("inventory_restock_ast", restock_result[1])
+
+  let order_examples = inventory_examples([
+    [20, 5, 15],
+    [20, 20, 0],
+    [20, 25, 20],
+    [7, 2, 5],
+    [7, 9, 7]
+  ])
+  let order_result = bidi_synthesize_from_examples(order_examples, ["stock", "qty"], [], registry, ["cond", "gt", "sub"], 12)
+  check("order logic derives (cond witness -- clamp when stock insufficient)", order_result[0], "OK")
+  set_var("inventory_order_ast", order_result[1])
+  set_var("inventory_registry", registry)
+
+  print("derived order AST: " + order_result[1])
+
+  # ---- real end-to-end event-driven behaviour, via the derived logic alone ----
+  set_var("stock", 20)
+  set_var("event_log", [])
+
+  emit("restocked", 10)
+  check("restocked(10) on stock 20 -> 30", get("__vars", "stock"), 30)
+
+  emit("order_placed", 12)
+  check("order_placed(12) on stock 30 -> 18", get("__vars", "stock"), 18)
+
+  emit("order_placed", 100)
+  check("order_placed(100) on stock 18, insufficient -> unchanged (18)", get("__vars", "stock"), 18)
+
+  emit("restocked", 2)
+  check("restocked(2) on stock 18 -> 20", get("__vars", "stock"), 20)
+
+  check("event_log recorded all 4 handled events in order", to_num(list_len(get("__vars", "event_log"))), 4)
+
+  t_report()
+  return get("__vars", "t_fail") == 0
+end
+
+run_synth_demo_inventory_events()
