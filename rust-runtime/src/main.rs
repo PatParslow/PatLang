@@ -41,7 +41,49 @@ fn suggest_runtime_fix(message: &str) -> String {
     "No specific suggestion for this message -- check the text above for the operation and value involved, and look for the corresponding host function or language construct in the docs.".into()
 }
 
+// Background safety valve, not a performance feature: PatLang's own
+// bottom-up synthesis/GOAP search engines (self_hosting/lib/synthesis_
+// by_example.patlang, goap_synthesis.patlang) have a real, repeated
+// history of runaway memory growth when a search is under-constrained
+// (GitHub issue #73; the markdown-domain scaling-wall crashes,
+// self_hosting/examples/synth_demo_markdown.patlang, ~918k-1.9M
+// candidates before a genuine OOM). Those are real engine limitations,
+// already documented -- this doesn't fix them, it makes exceeding them
+// FAIL SAFE (a clean, immediate exit with a clear message) instead of
+// exhausting all system memory and taking down unrelated processes,
+// which is what actually happened once: a benchmark process alone hit
+// 47GB resident and the whole machine needed a reboot. Checked against
+// this process's own memory only (sysinfo), every 2s -- cheap, and
+// independent of anything the interpreted PatLang program does or
+// could disable. PATLANG_MAX_MEM_MB overrides the default for a run
+// that genuinely needs more.
+fn spawn_memory_watchdog() {
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+    let max_mb: u64 = env::var("PATLANG_MAX_MEM_MB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8192);
+    std::thread::spawn(move || {
+        let pid = Pid::from_u32(process::id());
+        let mut sys = System::new();
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            sys.refresh_processes(ProcessesToUpdate::Some(&[pid]));
+            if let Some(proc) = sys.process(pid) {
+                let mem_mb = proc.memory() / (1024 * 1024);
+                if mem_mb > max_mb {
+                    eprintln!(
+                        "IR runtime error: process memory usage ({mem_mb} MB) exceeded the safety cap ({max_mb} MB) -- aborting to avoid exhausting system memory.\n  Suggestion: this usually means an unbounded search (synthesize_from_examples/goap_synthesize_from_examples without a small enough max_size, or too wide a sliding window) is still growing its candidate pool. If this run genuinely needs more memory, set PATLANG_MAX_MEM_MB to a higher value explicitly."
+                    );
+                    process::exit(137); // conventional OOM-kill exit code
+                }
+            }
+        }
+    });
+}
+
 fn main() {
+    spawn_memory_watchdog();
     // Run on a spawned thread with a much larger stack than the OS-default
     // main thread stack: deeply recursive-descent PatLang programs
     // interpreted via `--ir-run` (notably the self-hosted compiler's own
