@@ -1,0 +1,129 @@
+# Object + event combination -- the next complexity tier above synth_
+# demo_account_object.patlang and synth_demo_inventory_events.patlang
+# separately: an Account object's own withdraw method now composes TWO
+# independently-derived pieces (not one), and uses the second one's
+# result to decide whether to emit an event at all -- the DECISION of
+# "should this fire" is itself synthesized, not hand-written.
+#
+#   apply_withdraw(balance, amount) = amount > balance
+#                                      ? balance                 -- clamp, same as before
+#                                      : balance - amount
+#   is_insufficient(balance, amount) = amount > balance          -- gt witness, trivial
+#
+# withdraw() (hand-authored wiring, the only hand-written code here)
+# evaluates BOTH derived ASTs against the same call, updates balance
+# from the first, and emits "insufficient_funds" only when the SECOND
+# one says so -- a real composition of two synthesized pieces inside
+# one stateful method, plus real event delivery out of it, mirroring
+# exactly how synth_demo_search_replace.patlang composed find_position
+# + splice into replace_in_text, just across the object/event boundary
+# instead of within one pure expression.
+
+include "../lib/bidi_synthesis.patlang"
+include "../lib/test.patlang"
+
+t_init()
+
+make a function called account_examples takes pairs returns examples
+  let out = []
+  let i = 0
+  let n = to_num(list_len(pairs))
+  while i < n do
+    let p = pairs[i]
+    let b = new("Dict", "ae_ex_" + pr_next_id())
+    send(b, "set", "balance", p[0])
+    send(b, "set", "amount", p[1])
+    let out = list_push(out, [b, p[2]])
+    let i = i + 1
+  end
+  return out
+end
+
+when insufficient_funds do
+  let log = get("__vars", "event_log")
+  set_var("event_log", list_push(log, "insufficient_funds: attempted " + event_data))
+end
+
+class Account {
+  field balance = 0
+  field id = "acct"
+
+  make a function called withdraw takes self, amount returns done
+    let b = new("Dict", "ae_call_" + pr_next_id())
+    send(b, "set", "balance", get(self, "balance"))
+    send(b, "set", "amount", amount)
+    let registry = get("__vars", "account_registry")
+
+    let withdraw_ast = get("__vars", "account_withdraw_ast")
+    let new_balance = sbe_eval(withdraw_ast, b, registry)
+    send(self, "set", "balance", new_balance[1])
+
+    let insufficient_ast = get("__vars", "account_insufficient_ast")
+    let insufficient = sbe_eval(insufficient_ast, b, registry)
+    if insufficient[1] then
+      emit("insufficient_funds", amount)
+    end
+    return true
+  end
+}
+
+make a function called run_synth_demo_account_events returns ok
+  let registry = pr_standard_registry()
+
+  let withdraw_examples = account_examples([
+    [100, 30, 70],
+    [100, 100, 0],
+    [100, 150, 100],
+    [50, 20, 30],
+    [50, 60, 50]
+  ])
+  let withdraw_result = bidi_synthesize_from_examples(withdraw_examples, ["balance", "amount"], [], registry, ["cond", "gt", "sub"], 12)
+  check("withdraw logic derives (cond witness)", withdraw_result[0], "OK")
+  set_var("account_withdraw_ast", withdraw_result[1])
+
+  let b1 = new("Dict", "ae_i1")
+  send(b1, "set", "balance", 100)
+  send(b1, "set", "amount", 150)
+  let b2 = new("Dict", "ae_i2")
+  send(b2, "set", "balance", 100)
+  send(b2, "set", "amount", 70)
+  let b3 = new("Dict", "ae_i3")
+  send(b3, "set", "balance", 50)
+  send(b3, "set", "amount", 50)
+  let b4 = new("Dict", "ae_i4")
+  send(b4, "set", "balance", 50)
+  send(b4, "set", "amount", 51)
+  let b5 = new("Dict", "ae_i5")
+  send(b5, "set", "balance", 30)
+  send(b5, "set", "amount", 10)
+  let insufficient_examples = [[b1, true], [b2, false], [b3, false], [b4, true], [b5, false]]
+  let insufficient_result = bidi_synthesize_from_examples(insufficient_examples, ["balance", "amount"], [], registry, ["gt"], 6)
+  check("is_insufficient predicate derives (gt witness)", insufficient_result[0], "OK")
+  set_var("account_insufficient_ast", insufficient_result[1])
+  set_var("account_registry", registry)
+
+  print("derived withdraw AST: " + withdraw_result[1])
+  print("derived is_insufficient AST: " + insufficient_result[1])
+
+  # ---- real end-to-end object + event behaviour, via BOTH derived pieces ----
+  set_var("event_log", [])
+  let acc = new("Account", "acc1")
+  send(acc, "set", "balance", 100)
+
+  send(acc, "withdraw", 30)
+  check("withdraw(30) on balance 100 -> 70, no event", get(acc, "balance"), 70)
+  check("no insufficient_funds event fired for a fulfillable withdrawal", to_num(list_len(get("__vars", "event_log"))), 0)
+
+  send(acc, "withdraw", 500)
+  check("withdraw(500) on balance 70, insufficient -> unchanged (70)", get(acc, "balance"), 70)
+  check("insufficient_funds event DID fire, driven by the derived predicate", to_num(list_len(get("__vars", "event_log"))), 1)
+
+  send(acc, "withdraw", 70)
+  check("withdraw(70) on balance 70, exact boundary -> 0, no event (not insufficient)", get(acc, "balance"), 0)
+  check("event log still has exactly 1 entry after an exact-boundary (non-insufficient) withdrawal", to_num(list_len(get("__vars", "event_log"))), 1)
+
+  t_report()
+  return get("__vars", "t_fail") == 0
+end
+
+run_synth_demo_account_events()
