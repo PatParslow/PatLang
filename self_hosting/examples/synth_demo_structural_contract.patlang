@@ -1,0 +1,149 @@
+# Structural contracts on derived functions -- a generalization of
+# primitive_registry.patlang's existing per-argument arg_contracts to
+# a whole-function output constraint, checked on the ASSEMBLED
+# candidate rather than on one argument in isolation.
+#
+# Motivation: synth_demo_ticket_state_machine.patlang's own exhaustive
+# 3x2 transition table derives cond(eq_int(state,action), cond(eq_int(
+# state,0),1,2), state) -- fully correct (the domain is exhaustively
+# specified, so no held-out case can distinguish it from any other
+# correct formula) but semantically odd: it compares state directly to
+# action, which happens to work only because the numbers line up, not
+# because that's what the transition logic actually means. Several
+# earlier attempts to force a more human-intuitive result by varying
+# the examples (more inputs, disjoint integer ranges, string-typed
+# actions) all failed to change this -- either the search still found
+# a different coincidental shortcut, or it ran out of memory looking
+# for one. This demo tests the next lever instead: don't hope a
+# different formula shows up, RULE OUT the specific shortcut directly.
+#
+# bidi_contract_ok(node) (self_hosting/lib/bidi_synthesis.patlang) is
+# an optional check applied to bidi_try_cond_combined's ASSEMBLED
+# cond(test, a, b) candidates: if set_var("bidi_contract_fn", name) has
+# been called, a candidate is only accepted when apply(name, candidate)
+# is true, and rejected candidates simply lose the partition -- the
+# search moves on and tries other partitions/branch pairs, it doesn't
+# stop. This mirrors arg_contracts' own accept-or-skip discipline
+# (primitive_registry.patlang), just applied to the whole node instead
+# of one argument. Purely additive: unset (the default), every existing
+# caller behaves exactly as before -- this file is the only caller that
+# sets it.
+#
+# The contract used here bans a Call node whose two DIRECT arguments
+# are exactly Input(state) and Input(action) compared to each other,
+# anywhere in the tree -- narrow enough that a correct formula (which
+# legitimately needs to reference both state and action, just never
+# directly against each other) is not ruled out entirely, only the
+# specific coincidental shortcut is.
+
+include "../lib/bidi_synthesis.patlang"
+include "../lib/test.patlang"
+
+t_init()
+
+make a function called ast_contains_pair takes node, a, b returns yes
+  let tag = node[0]
+  if tag == "Call" then
+    let args = node[2]
+    if to_num(list_len(args)) == 2 then
+      let x = args[0]
+      let y = args[1]
+      let is_ab = (x[0] == "Input") and (x[1] == a) and (y[0] == "Input") and (y[1] == b)
+      let is_ba = (x[0] == "Input") and (x[1] == b) and (y[0] == "Input") and (y[1] == a)
+      if is_ab or is_ba then
+        return true
+      end
+    end
+    let i = 0
+    let n = to_num(list_len(args))
+    while i < n do
+      if ast_contains_pair(args[i], a, b) then
+        return true
+      end
+      let i = i + 1
+    end
+    return false
+  end
+  return false
+end
+
+make a function called contract_no_direct_state_action_compare takes node returns ok
+  return not ast_contains_pair(node, "state", "action")
+end
+
+make a function called transition_examples takes triples returns examples
+  let out = []
+  let i = 0
+  let n = to_num(list_len(triples))
+  while i < n do
+    let t = triples[i]
+    let b = new("Dict", "sc_ex_" + pr_next_id())
+    send(b, "set", "state", t[0])
+    send(b, "set", "action", t[1])
+    let out = list_push(out, [b, t[2]])
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called run_synth_demo_structural_contract returns ok
+  let registry = pr_standard_registry()
+
+  # exhaustive 3x3 transition table -- same shape as synth_demo_ticket_
+  # state_machine.patlang's own 3x2 table, extended to a 3rd action so
+  # the coincidental eq_int(state,action) shortcut (which needed states
+  # and actions to line up 1:1) is available to find again here, giving
+  # the contract something real to rule out.
+  let examples = transition_examples([
+    [0, 0, 1], [0, 1, 0], [0, 2, 0],
+    [1, 0, 1], [1, 1, 2], [1, 2, 0],
+    [2, 0, 2], [2, 1, 2], [2, 2, 2]
+  ])
+
+  set_var("bidi_contract_fn", false)
+  let baseline = bidi_synthesize_from_examples(examples, ["state", "action"], [], registry, ["cond", "eq_int"], 24)
+  check("baseline (no contract) derives", baseline[0], "OK")
+  check("baseline coincidentally compares state directly to action", ast_contains_pair(baseline[1], "state", "action"), true)
+
+  set_var("bidi_contract_fn", "contract_no_direct_state_action_compare")
+  let contracted = bidi_synthesize_from_examples(examples, ["state", "action"], [], registry, ["cond", "eq_int"], 24)
+  set_var("bidi_contract_fn", false)
+  check("contracted derivation still succeeds", contracted[0], "OK")
+  check("contracted result never directly compares state to action", ast_contains_pair(contracted[1], "state", "action"), false)
+
+  print("baseline AST:   " + baseline[1])
+  print("contracted AST: " + contracted[1])
+
+  # Verify the contracted formula against the FULL transition table
+  # directly (not just the training examples it was derived from --
+  # here they're the same 9 cases, since the domain is exhaustively
+  # specified, but re-checking independently of sbe_matches_all's own
+  # internal bookkeeping is the real test of correctness).
+  let i = 0
+  let n = to_num(list_len(examples))
+  let all_correct = true
+  while i < n do
+    let ex = examples[i]
+    let result = sbe_eval(contracted[1], ex[0], registry)
+    if result[1] != ex[1] then
+      let all_correct = false
+    end
+    let i = i + 1
+  end
+  check("contracted formula matches every one of the 9 transition-table entries", all_correct, true)
+
+  # Honest finding, not a hidden caveat: the contract achieves exactly
+  # what it was asked to (rule out the ONE named pattern) but does not
+  # make the result more human-intuitive in general -- it can just as
+  # easily trade one coincidence for a more convoluted one, since
+  # nothing about "smallest AST that satisfies the contract" implies
+  # "the AST a person would have written." Ruling out a specific known
+  # bad pattern is a real, useful capability; it is not a general fix
+  # for search landing on non-intuitive-but-correct formulas.
+  print("size: baseline=" + sbe_size(baseline[1]) + " contracted=" + sbe_size(contracted[1]))
+
+  t_report()
+  return get("__vars", "t_fail") == 0
+end
+
+run_synth_demo_structural_contract()
