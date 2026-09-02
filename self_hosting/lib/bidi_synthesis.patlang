@@ -205,12 +205,110 @@ make a function called bidi_try_arith takes examples, index, registry, max_size_
   return ["ERR"]
 end
 
-make a function called bidi_witness_pass takes examples, index, registry, max_size_so_far, target_type returns result
+# ---- Phase 3: range witnesses for gt/geq/eq_int ----
+#
+# A boolean target from a comparison doesn't pin its two arguments to
+# single values the way concat's split or add/sub's two-sum inversion
+# do -- gt(a,b)=true only pins the RELATION between a and b, and the
+# set of (a,b) pairs satisfying a relation is unbounded in general (any
+# a>b at all). The useful, bounded move: scan pairs of ALREADY forward-
+# built int candidates directly (not inventing new ones) and check
+# whether the relation already holds across every example -- a
+# filtering pass over existing work, exactly like concat/arith's
+# witnesses, just checking a relation instead of deriving one exact
+# target value per side. Smallest-total-size-first (outer loop by size)
+# so a match here is never larger than one plain forward search over
+# gt/geq/eq_int at the same level would eventually find -- this witness
+# doesn't skip ahead of when the forward loop would naturally construct
+# the same expression (their combined size is fixed either way), it
+# just reaches it via a cheaper existing-pool scan instead of sbe_
+# build_calls's own combinatorial arg-type-and-contract generation.
+make a function called bidi_relation_holds takes rel, av, bv returns yes
+  if rel == "gt" then
+    return av > bv
+  end
+  if rel == "geq" then
+    return av >= bv
+  end
+  if rel == "eq_int" then
+    return av == bv
+  end
+  return false
+end
+
+make a function called bidi_try_range takes examples, index, registry, max_size_so_far, primitive_names returns result
+  let rels = []
+  if bidi_list_contains(primitive_names, "gt") then
+    let rels = list_push(rels, "gt")
+  end
+  if bidi_list_contains(primitive_names, "geq") then
+    let rels = list_push(rels, "geq")
+  end
+  if bidi_list_contains(primitive_names, "eq_int") then
+    let rels = list_push(rels, "eq_int")
+  end
+  if to_num(list_len(rels)) == 0 then
+    return ["ERR"]
+  end
+  let sa = 1
+  while sa <= max_size_so_far do
+    let bucket_a = sbe_index_lookup(index, sa, "int")
+    let ai = 0
+    let an = to_num(list_len(bucket_a))
+    while ai < an do
+      let node_a = bucket_a[ai][0]
+      let sb = 1
+      while sb <= max_size_so_far do
+        let bucket_b = sbe_index_lookup(index, sb, "int")
+        let bi = 0
+        let bn = to_num(list_len(bucket_b))
+        while bi < bn do
+          let node_b = bucket_b[bi][0]
+          let ri = 0
+          let rn = to_num(list_len(rels))
+          while ri < rn do
+            let rel = rels[ri]
+            let ok = true
+            let i = 0
+            let n = to_num(list_len(examples))
+            while i < n do
+              let ex = examples[i]
+              let av = sbe_eval(node_a, ex[0], registry)
+              let bv = sbe_eval(node_b, ex[0], registry)
+              if (av[0] == false) or (bv[0] == false) then
+                let ok = false
+              else
+                if bidi_relation_holds(rel, av[1], bv[1]) != ex[1] then
+                  let ok = false
+                end
+              end
+              let i = i + 1
+            end
+            if ok then
+              return ["OK", ["Call", rel, [node_a, node_b]]]
+            end
+            let ri = ri + 1
+          end
+          let bi = bi + 1
+        end
+        let sb = sb + 1
+      end
+      let ai = ai + 1
+    end
+    let sa = sa + 1
+  end
+  return ["ERR"]
+end
+
+make a function called bidi_witness_pass takes examples, index, registry, max_size_so_far, target_type, primitive_names returns result
   if target_type == "string" then
     return bidi_try_concat(examples, index, registry, max_size_so_far)
   end
   if target_type == "int" then
     return bidi_try_arith(examples, index, registry, max_size_so_far)
+  end
+  if target_type == "bool" then
+    return bidi_try_range(examples, index, registry, max_size_so_far, primitive_names)
   end
   return ["ERR"]
 end
@@ -303,6 +401,33 @@ make a function called bidi_bool_examples takes examples, partition returns bool
   let n = to_num(list_len(examples))
   while i < n do
     let out = list_push(out, [examples[i][0], partition[i]])
+    let i = i + 1
+  end
+  return out
+end
+
+# The boolean TEST search is over the FULL original example count
+# (bidi_bool_examples relabels every example, it never subsets), so
+# leaving "cond" available to it means a genuinely redundant recursion:
+# searching for a predicate by trying to build ANOTHER disjunctive cond
+# (itself needing its own predicate search, its own two branches...)
+# at full "any"-type combinatorial cost, when what's actually needed is
+# just a plain comparison. Confirmed directly to be the dominant cost,
+# not a memory-hygiene issue: 574 candidates for a single nested `cond`
+# attempt at size 6 alone, at the FULL 5-example count, one of 92
+# equally-expensive recursive calls that together exhausted the
+# interpreter's memory cap. Excluding "cond" from the test search's own
+# primitive list removes this specific redundant recursion outright --
+# a nested-cond-as-test is a real, rarer capability this doesn't
+# attempt to preserve, not assumed harmless to drop.
+make a function called bidi_strip_cond takes primitive_names returns filtered
+  let out = []
+  let i = 0
+  let n = to_num(list_len(primitive_names))
+  while i < n do
+    if primitive_names[i] != "cond" then
+      let out = list_push(out, primitive_names[i])
+    end
     let i = i + 1
   end
   return out
@@ -535,7 +660,7 @@ make a function called bidi_try_cond takes examples, input_names, extra_consts, 
         let b_result = bidi_synthesize_from_examples_d(sub_false, input_names, extra_consts, registry, primitive_names, max_size, depth)
         if b_result[0] == "OK" then
           let bool_examples = bidi_bool_examples(examples, partition)
-          let t_result = bidi_synthesize_from_examples_d(bool_examples, input_names, extra_consts, registry, primitive_names, max_size, depth)
+          let t_result = bidi_synthesize_from_examples_d(bool_examples, input_names, extra_consts, registry, bidi_strip_cond(primitive_names), max_size, depth)
           if t_result[0] == "OK" then
             let candidate = ["Call", "cond", [t_result[1], a_result[1], b_result[1]]]
             if sbe_matches_all(candidate, examples, registry) then
@@ -598,6 +723,27 @@ make a function called bidi_synthesize_from_examples takes examples, input_names
   return bidi_synthesize_from_examples_d(examples, input_names, extra_consts, registry, primitive_names, max_size, 0)
 end
 
+# Frees its own scratch Dicts (`index`/`seen`) on every exit path,
+# regardless of which return in the impl function below actually fired
+# -- PatLang's object store (OBJECTS, rust-runtime/src/ir/hosts.rs)
+# never frees an entry on its own, and this function is called
+# recursively, often many times over, by bidi_try_cond's partition
+# search (confirmed directly: 92 recursive sub-searches on a real case,
+# none individually large, exhausted the interpreter's own memory cap
+# purely from the accumulated, never-freed count). Delegating the real
+# work to `_impl` (which takes index/seen as plain parameters instead
+# of creating them itself) is what makes a single cleanup point here
+# possible without duplicating it across every one of `_impl`'s own
+# early returns.
+make a function called bidi_synthesize_from_examples_d takes examples, input_names, extra_consts, registry, primitive_names, max_size, depth returns result
+  let index = sbe_index_new()
+  let seen = new("Dict", "bidi_seen_" + pr_next_id())
+  let result = bidi_synthesize_from_examples_impl(examples, input_names, extra_consts, registry, primitive_names, max_size, depth, index, seen)
+  object_delete(index)
+  object_delete(seen)
+  return result
+end
+
 # Same overall shape as synthesize_from_examples (same leaf-seeding,
 # same forward per-level growth via sbe_build_calls/sbe_evaluate_
 # candidates, same windowing) -- the additions are bidi_witness_pass
@@ -605,12 +751,10 @@ end
 # (Phase 2), tried once up front (it doesn't depend on the forward
 # index at all, unlike Phase 1's witnesses, so there's nothing to gain
 # from retrying it as the index grows).
-make a function called bidi_synthesize_from_examples_d takes examples, input_names, extra_consts, registry, primitive_names, max_size, depth returns result
+make a function called bidi_synthesize_from_examples_impl takes examples, input_names, extra_consts, registry, primitive_names, max_size, depth, index, seen returns result
   let consts = sbe_list_concat(sbe_default_int_consts(), extra_consts)
   let sample_bindings = examples[0][0]
   let leaves = sbe_seed_leaves(input_names, consts)
-  let index = sbe_index_new()
-  let seen = new("Dict", "bidi_seen_" + pr_next_id())
   let notes = []
   let target_type = type_of(examples[0][1])
 
@@ -636,7 +780,7 @@ make a function called bidi_synthesize_from_examples_d takes examples, input_nam
   if found_match then
     return ["OK", winner, notes]
   end
-  let wr = bidi_witness_pass(examples, index, registry, 1, target_type)
+  let wr = bidi_witness_pass(examples, index, registry, 1, target_type, primitive_names)
   if wr[0] == "OK" then
     if sbe_matches_all(wr[1], examples, registry) then
       return ["OK", wr[1], notes]
@@ -733,7 +877,7 @@ make a function called bidi_synthesize_from_examples_d takes examples, input_nam
       return ["OK", winner, notes]
     end
 
-    let wr2 = bidi_witness_pass(examples, index, registry, size, target_type)
+    let wr2 = bidi_witness_pass(examples, index, registry, size, target_type, primitive_names)
     if wr2[0] == "OK" then
       if sbe_matches_all(wr2[1], examples, registry) then
         return ["OK", wr2[1], notes]

@@ -648,6 +648,28 @@ fn ensure_obj(name: &str, class: &str) {
     obj_set(name, "name", Value::String((name.to_string()).into()));
 }
 
+// Purely additive: no existing caller needs this (every prior `new(...)`
+// object was either long-lived by design or cheap/few in number), so
+// nothing already written is affected by it existing. Added for a real,
+// measured leak: OBJECTS is a single process-wide map that nothing else
+// ever frees an entry from -- a recursive search that creates its own
+// scratch Dict per call (self_hosting/lib/bidi_synthesis.patlang's
+// bidi_synthesize_from_examples_d, one `index`/`seen` pair per
+// invocation) accumulates every one of them for the life of the
+// process, even after the call that created them has returned and the
+// data is provably never needed again. Confirmed directly: cond's
+// partition search (self_hosting/lib/bidi_synthesis.patlang's
+// bidi_try_cond) fired 92 recursive sub-searches on a real case, none
+// individually large, and exhausted the interpreter's own memory
+// safety cap (rust-runtime/src/main.rs) purely from the accumulated,
+// never-freed count -- not from any single search's candidate pool.
+pub fn host_object_delete(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 { return Err("object_delete: expected 1 arg (name)".into()); }
+    let name = to_s(&args[0]);
+    OBJECTS.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap().remove(&name);
+    Ok(Value::Unit)
+}
+
 // Slice 1 of the classes/traits/inheritance feature (see the
 // "synchronous-questing-metcalfe" plan): a class is just a name, an
 // optional single parent, and a set of field defaults (already-evaluated
@@ -3310,6 +3332,7 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("solve", host_solve);
     interp.host.insert("action_add", host_action_add);
     interp.host.insert("action_clear", host_action_clear);
+    interp.host.insert("object_delete", host_object_delete);
     interp.host.insert("plan", host_plan);
     interp.host.insert("plan_incremental", host_plan_incremental);
     interp.host.insert("fluent_set", host_fluent_set);
