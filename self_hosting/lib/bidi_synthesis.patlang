@@ -1,0 +1,353 @@
+# ---- Bidirectional (meet-in-the-middle) synthesis via witness
+# functions -- Phase 1 of the design at
+# C:\Users\p\.claude\plans\yes-design-it-bidirectional-witness.md
+# (issue #69's markdown scaling wall).
+#
+# Every fix tried on #69 so far (windowing, chunked parallelization,
+# GOAP translation, fact-cost relaxation) kept the same shape: generate
+# every forward combination, THEN check it against the goal. This file
+# adds a second, backward direction: at each level, before growing the
+# forward pool further, ask "does the GOAL decompose, via some
+# invertible primitive, into pieces that already exist in the forward
+# index?" -- turning "search until you stumble on the goal" into
+# "actively look for a route to it." The meet-in-the-middle check
+# itself is just an exact-value scan over the SAME (type,size)-bucketed
+# index synthesize_from_examples already builds (sbe_index_lookup) --
+# no new index structure, no change to the forward loop it's borrowed
+# from.
+#
+# Phase 1 covers the cleanly-invertible primitives only: concat (split
+# the target string at every possible point) and add/sub (classic
+# two-sum-style arithmetic inversion, checking only against ALREADY
+# forward-built values, never inventing new ones speculatively). cond's
+# disjunctive witness (Phase 2: partition examples by which branch must
+# have fired, search each branch independently, then search for the
+# separating predicate) and range witnesses for gt/geq/eq_int
+# (Phase 3) are NOT implemented here. substr/find_substr are
+# deliberately given no witness at all -- their backward image is
+# unconstrained (an arbitrary string/position doesn't decompose into a
+# small candidate set) -- see the design doc for why that's a real
+# architectural limit, not an oversight, and why it still doesn't make
+# this pointless (arithmetic wrapping their results still narrows
+# targets even though they can't be stepped through directly).
+
+include "synthesis_by_example.patlang"
+
+# Scans the index for a node whose value (under sample_bindings/
+# example 0, the same value sbe_index_add already stored) exactly
+# equals target_value, smallest size first -- so a witness-found match
+# is never larger than one already sitting in the forward pool.
+make a function called bidi_index_scan_by_value takes index, ty, target_value, max_size_so_far returns node
+  let s = 1
+  while s <= max_size_so_far do
+    let bucket = sbe_index_lookup(index, s, ty)
+    let i = 0
+    let n = to_num(list_len(bucket))
+    while i < n do
+      if bucket[i][3] == target_value then
+        return bucket[i][0]
+      end
+      let i = i + 1
+    end
+    let s = s + 1
+  end
+  return false
+end
+
+# concat(a, b) = target, split at position k: a = target[0:k], b =
+# target[k:]. Looks up `a` FIRST (by its example-0 value), then -- only
+# if found -- derives what `b` must be for EVERY example from that
+# specific node's own per-example values (never assuming example 0's
+# split point transfers literally to other examples, since target
+# strings vary in length across examples), and looks up `b` the same
+# way. Both sides must already exist in the forward index for this to
+# fire -- Phase 1 doesn't hand back an open sub-goal for further
+# recursive decomposition, it only reports an immediate meet.
+make a function called bidi_try_concat_split takes examples, index, registry, max_size_so_far, k returns result
+  let t0 = examples[0][1]
+  let a0 = substr(t0, 0, k)
+  let node_a = bidi_index_scan_by_value(index, "string", a0, max_size_so_far)
+  if node_a then
+    let ok = true
+    let b_values = []
+    let i = 0
+    let n = to_num(list_len(examples))
+    while i < n do
+      let ex = examples[i]
+      let av = sbe_eval(node_a, ex[0], registry)
+      let ti = ex[1]
+      if av[0] == false then
+        let ok = false
+      else
+        let al = av[1].length
+        if (al > ti.length) or (substr(ti, 0, al) != av[1]) then
+          let ok = false
+        else
+          let b_values = list_push(b_values, substr(ti, al, ti.length - al))
+        end
+      end
+      let i = i + 1
+    end
+    if ok then
+      let node_b = bidi_index_scan_by_value(index, "string", b_values[0], max_size_so_far)
+      if node_b then
+        let bok = true
+        let j = 0
+        let jn = to_num(list_len(examples))
+        while j < jn do
+          let bv = sbe_eval(node_b, examples[j][0], registry)
+          if (bv[0] == false) or (bv[1] != b_values[j]) then
+            let bok = false
+          end
+          let j = j + 1
+        end
+        if bok then
+          return ["OK", ["Call", "concat", [node_a, node_b]]]
+        end
+      end
+    end
+  end
+  return ["ERR"]
+end
+
+make a function called bidi_try_concat takes examples, index, registry, max_size_so_far returns result
+  let kn = examples[0][1].length
+  let k = 0
+  while k <= kn do
+    let r = bidi_try_concat_split(examples, index, registry, max_size_so_far, k)
+    if r[0] == "OK" then
+      return r
+    end
+    let k = k + 1
+  end
+  return ["ERR"]
+end
+
+# add(v, other) = target => other = target - v, and sub(v, other) =
+# target => other = v - target -- both checked against the SAME scan
+# over already-indexed int candidates for `v`, since both directions
+# are worth trying per candidate at negligible extra cost.
+make a function called bidi_try_arith takes examples, index, registry, max_size_so_far returns result
+  let s = 1
+  while s <= max_size_so_far do
+    let bucket = sbe_index_lookup(index, s, "int")
+    let bi = 0
+    let bn = to_num(list_len(bucket))
+    while bi < bn do
+      let node_v = bucket[bi][0]
+      let n = to_num(list_len(examples))
+
+      let ok_add = true
+      let other_add = []
+      let i = 0
+      while i < n do
+        let ex = examples[i]
+        let vv = sbe_eval(node_v, ex[0], registry)
+        if vv[0] == false then
+          let ok_add = false
+        else
+          let other_add = list_push(other_add, ex[1] - vv[1])
+        end
+        let i = i + 1
+      end
+      if ok_add then
+        let node_other = bidi_index_scan_by_value(index, "int", other_add[0], max_size_so_far)
+        if node_other then
+          let verify_ok = true
+          let j = 0
+          while j < n do
+            let ov = sbe_eval(node_other, examples[j][0], registry)
+            if (ov[0] == false) or (ov[1] != other_add[j]) then
+              let verify_ok = false
+            end
+            let j = j + 1
+          end
+          if verify_ok then
+            return ["OK", ["Call", "add", [node_v, node_other]]]
+          end
+        end
+      end
+
+      let ok_sub = true
+      let other_sub = []
+      let i2 = 0
+      while i2 < n do
+        let ex = examples[i2]
+        let vv = sbe_eval(node_v, ex[0], registry)
+        if vv[0] == false then
+          let ok_sub = false
+        else
+          let other_sub = list_push(other_sub, vv[1] - ex[1])
+        end
+        let i2 = i2 + 1
+      end
+      if ok_sub then
+        let node_other2 = bidi_index_scan_by_value(index, "int", other_sub[0], max_size_so_far)
+        if node_other2 then
+          let verify_ok2 = true
+          let j2 = 0
+          while j2 < n do
+            let ov2 = sbe_eval(node_other2, examples[j2][0], registry)
+            if (ov2[0] == false) or (ov2[1] != other_sub[j2]) then
+              let verify_ok2 = false
+            end
+            let j2 = j2 + 1
+          end
+          if verify_ok2 then
+            return ["OK", ["Call", "sub", [node_v, node_other2]]]
+          end
+        end
+      end
+      let bi = bi + 1
+    end
+    let s = s + 1
+  end
+  return ["ERR"]
+end
+
+make a function called bidi_witness_pass takes examples, index, registry, max_size_so_far, target_type returns result
+  if target_type == "string" then
+    return bidi_try_concat(examples, index, registry, max_size_so_far)
+  end
+  if target_type == "int" then
+    return bidi_try_arith(examples, index, registry, max_size_so_far)
+  end
+  return ["ERR"]
+end
+
+# Same overall shape as synthesize_from_examples (same leaf-seeding,
+# same forward per-level growth via sbe_build_calls/sbe_evaluate_
+# candidates, same windowing) -- the only addition is bidi_witness_pass,
+# tried once per level, before growing the forward pool further.
+make a function called bidi_synthesize_from_examples takes examples, input_names, extra_consts, registry, primitive_names, max_size returns result
+  let consts = sbe_list_concat(sbe_default_int_consts(), extra_consts)
+  let sample_bindings = examples[0][0]
+  let leaves = sbe_seed_leaves(input_names, consts)
+  let index = sbe_index_new()
+  let seen = new("Dict", "bidi_seen_" + pr_next_id())
+  let notes = []
+  let target_type = type_of(examples[0][1])
+
+  let winner = ["Const", ""]
+  let found_match = false
+  let i = 0
+  let n = to_num(list_len(leaves))
+  while i < n do
+    let node = leaves[i]
+    if sbe_matches_all(node, examples, registry) then
+      if not found_match then
+        let found_match = true
+        let winner = node
+      end
+    end
+    let key = sbe_output_key(node, examples, registry)
+    if not get(seen, key) then
+      send(seen, "set", key, true)
+      sbe_index_add(index, sbe_wrap(node, registry, sample_bindings))
+    end
+    let i = i + 1
+  end
+  if found_match then
+    return ["OK", winner, notes]
+  end
+  let wr = bidi_witness_pass(examples, index, registry, 1, target_type)
+  if wr[0] == "OK" then
+    if sbe_matches_all(wr[1], examples, registry) then
+      return ["OK", wr[1], notes]
+    end
+  end
+
+  let size = 2
+  while size <= max_size do
+    print("bidi_synthesize_from_examples: size=" + size + " at " + now_ms())
+    let level_int = []
+    let level_string = []
+    let level_bool = []
+    let level_list = []
+    let winner = ["Const", ""]
+    let found_match = false
+    let p = 0
+    let pn = to_num(list_len(primitive_names))
+    while p < pn do
+      let prim = primitive_names[p]
+      let entry = pr_lookup(registry, prim)
+      if entry then
+        let arg_types = entry[5]
+        let arg_contracts = entry[7]
+        let prim_cost = to_num(entry[3])
+        let candidates = sbe_build_calls(prim, arg_types, arg_contracts, size, index, prim_cost)
+        let cn = to_num(list_len(candidates))
+        let results = sbe_evaluate_candidates(candidates, examples, registry, sample_bindings)
+        let c = 0
+        while c < cn do
+          let node = candidates[c]
+          let r = results[c]
+          let ok = r[0]
+          let key = r[1]
+          let ty = r[2]
+          let value = r[3]
+          if ok then
+            if not found_match then
+              let found_match = true
+              let winner = node
+            end
+          end
+          if not get(seen, key) then
+            send(seen, "set", key, true)
+            let typed = [node, size, ty, value]
+            if ty == "int" then
+              let level_int = list_push(level_int, typed)
+            else
+              if ty == "string" then
+                let level_string = list_push(level_string, typed)
+              else
+                if ty == "bool" then
+                  let level_bool = list_push(level_bool, typed)
+                else
+                  if ty == "list" then
+                    let level_list = list_push(level_list, typed)
+                  end
+                end
+              end
+            end
+          end
+          let c = c + 1
+        end
+      end
+      let p = p + 1
+    end
+    if to_num(list_len(level_int)) > 0 then
+      sbe_index_set_bucket(index, "int", size, level_int)
+    end
+    if to_num(list_len(level_string)) > 0 then
+      sbe_index_set_bucket(index, "string", size, level_string)
+    end
+    if to_num(list_len(level_bool)) > 0 then
+      sbe_index_set_bucket(index, "bool", size, level_bool)
+    end
+    if to_num(list_len(level_list)) > 0 then
+      sbe_index_set_bucket(index, "list", size, level_list)
+    end
+
+    let evict_size = size - sbe_window_size()
+    if evict_size >= 2 then
+      sbe_evict_size(index, evict_size)
+    end
+
+    if found_match then
+      return ["OK", winner, notes]
+    end
+
+    let wr2 = bidi_witness_pass(examples, index, registry, size, target_type)
+    if wr2[0] == "OK" then
+      if sbe_matches_all(wr2[1], examples, registry) then
+        return ["OK", wr2[1], notes]
+      end
+    end
+
+    let size = size + 1
+  end
+
+  let notes = list_push(notes, "reached max_size (" + max_size + ") without a match")
+  return ["ERR", "no candidate up to size " + max_size, notes]
+end
