@@ -348,6 +348,38 @@ pub fn host_write_file(args: &[Value]) -> Result<Value, String> {
     std::fs::write(&p, contents).map(|_| Value::Bool(true)).map_err(|e| format!("write_file: {}: {}", p, e))
 }
 
+pub fn host_write_file_bytes(args: &[Value]) -> Result<Value, String> {
+    // write_file_bytes(path, byte_list) -> Bool
+    //
+    // write_file's own `contents` is a PatLang String, which is UTF-8 --
+    // there is no way to represent arbitrary binary content (a PE image,
+    // raw machine code, anything containing an invalid-UTF-8 byte
+    // sequence) as a PatLang string value at all. This is the one
+    // unavoidable exception to "runtime logic belongs in PatLang, not a
+    // native primitive" (see self_hosting/lib/x64_build.patlang's own
+    // header comment) needed for the self-hosted x64 assembler/linker
+    // (self_hosting/lib/x64_pe_link.patlang) to write a real .exe file.
+    let p = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => display_value(v).into(), None => String::new().into() };
+    let items: &[Value] = match args.get(1) {
+        Some(Value::List(xs)) => xs.as_ref(),
+        _ => return Err("write_file_bytes: expected a list of byte values (0-255) as the second arg".into()),
+    };
+    let mut bytes = Vec::with_capacity(items.len());
+    for (i, v) in items.iter().enumerate() {
+        let n = match v {
+            Value::Int(n) => *n,
+            Value::Float(n) => *n as i64,
+            _ => return Err(format!("write_file_bytes: byte at index {} is not a number", i)),
+        };
+        if !(0..=255).contains(&n) {
+            return Err(format!("write_file_bytes: byte at index {} ({}) is out of range 0-255", i, n));
+        }
+        bytes.push(n as u8);
+    }
+    if let Some(parent) = std::path::Path::new(&p).parent() { let _ = std::fs::create_dir_all(parent); }
+    std::fs::write(&p, bytes).map(|_| Value::Bool(true)).map_err(|e| format!("write_file_bytes: {}: {}", p, e))
+}
+
 pub fn host_list_dir(args: &[Value]) -> Result<Value, String> {
     // list_dir(path) -> List of entry names; directories are suffixed with
     // "/" so callers can tell them apart from files without a second host
@@ -3326,6 +3358,7 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("to_num", host_to_num);
     interp.host.insert("read_file", host_read_file);
     interp.host.insert("write_file", host_write_file);
+    interp.host.insert("write_file_bytes", host_write_file_bytes);
     interp.host.insert("file_exists", host_file_exists);
     interp.host.insert("list_dir", host_list_dir);
     interp.host.insert("rename_file", host_rename_file);

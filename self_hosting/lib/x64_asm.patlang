@@ -1,0 +1,1034 @@
+include "includes.patlang"
+
+# ---- Self-hosted x86-64 assembler --------------------------------------
+#
+# Replaces nasm.exe for exactly the NASM-subset text
+# self_hosting/lib/codegen_x64.patlang ever emits (see the design plan
+# for the full inventory this was scoped against). Deliberately NOT a
+# general x86-64 assembler: codegen_x64.patlang's own output interface
+# (NASM-syntax text) is kept completely unchanged and untouched -- this
+# file parses that same text rather than requiring codegen_x64.patlang
+# to emit anything new, so none of its 9,000+ lines of proven,
+# heavily-tested instruction-selection logic are put at risk.
+#
+# Public entry point: x64_assemble_chunk(asm_text) -> ChunkImage, a
+# plain tagged list (matching this codebase's own convention elsewhere,
+# e.g. AST nodes like ["Call", name, args]):
+#
+#   ["ChunkImage", text_bytes, data_bytes, bss_size, symbols, relocs, externs]
+#
+#   text_bytes:  list of int (0-255), the encoded .text section
+#   data_bytes:  list of int (0-255), the encoded .data section
+#   bss_size:    int, total .bss reservation (alignment-padded)
+#   symbols:     list of [name, section, offset, is_global]
+#                section in "text"|"data"|"bss"
+#   relocs:      list of [section, offset, target_symbol, kind, addend]
+#                kind in "REL32" | "RIP32" | "ABS64"
+#   externs:     list of name (strings)
+#
+# Only three relocation kinds exist because codegen_x64.patlang never
+# emits SIB/scaled-index addressing (confirmed by direct inspection --
+# a code comment there explicitly considered and rejected it): REL32
+# (call/jmp/jcc rel32, resolved as target_rva - (reloc_rva + 4)),
+# RIP32 ([rel label(+disp)], same formula), ABS64 (dq label -- an
+# absolute 8-byte pointer stored in .data).
+#
+# One real exception to "no SIB needed": x86-64 mandates a SIB byte for
+# ANY memory operand whose base register is rsp or r12, even with no
+# actual scaled index (rm=100 is the SIB-escape encoding, not just a
+# register number) -- codegen_x64.patlang does address off rsp (e.g.
+# "word [rsp+34]"), so this one mandatory-but-trivial SIB case (index
+# field = 100 meaning "none", scale doesn't matter) IS handled below.
+# This is not general SIB support; it's the one case x86-64 itself
+# forces regardless of what the assembler wants to support.
+
+# ---- byte-list emission helpers ----
+
+make a function called xa_emit_u8 takes lst, v returns out
+  return list_push(lst, v band 255)
+end
+
+# Encodes v as `n` little-endian bytes, two's-complement for negatives.
+# Safe for n<=4 (fits well within PatLang's native int range even after
+# the 2^(8n) bias below); n=8 (imm64) is only ever used in this codebase
+# for positive tagged-pointer style constants, so no 2^64 bias is
+# attempted -- a genuinely negative 64-bit immediate is out of scope.
+make a function called xa_int_to_bytes_le takes v, n returns bytes
+  let uv = v
+  if uv < 0 then
+    let bits = n * 8
+    if bits < 64 then
+      let uv = v + (1 shl bits)
+    end
+  end
+  let out = []
+  let i = 0
+  while i < n do
+    let out = list_push(out, uv band 255)
+    let uv = uv shr 8
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called xa_emit_bytes takes lst, bytes returns out
+  let out = lst
+  let i = 0
+  let n = to_num(list_len(bytes))
+  while i < n do
+    let out = list_push(out, bytes[i])
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called xa_emit_i32 takes lst, v returns out
+  return xa_emit_bytes(lst, xa_int_to_bytes_le(v, 4))
+end
+
+make a function called xa_emit_i64 takes lst, v returns out
+  return xa_emit_bytes(lst, xa_int_to_bytes_le(v, 8))
+end
+
+# ---- register tables ----
+#
+# One flat table: [name, num, size, is_xmm]. size in 8/16/32/64.
+# Built once as a literal rather than a big if/elif chain, then
+# scanned -- table lookups over ~70 short-lived entries are not
+# remotely a hot path (each program is assembled once).
+
+make a function called xa_reg_table returns table
+  return [
+    ["al",0,8,false],["cl",1,8,false],["dl",2,8,false],["bl",3,8,false],
+    ["spl",4,8,false],["bpl",5,8,false],["sil",6,8,false],["dil",7,8,false],
+    ["r8b",8,8,false],["r9b",9,8,false],["r10b",10,8,false],["r11b",11,8,false],
+    ["r12b",12,8,false],["r13b",13,8,false],["r14b",14,8,false],["r15b",15,8,false],
+    ["ax",0,16,false],["cx",1,16,false],["dx",2,16,false],["bx",3,16,false],
+    ["sp",4,16,false],["bp",5,16,false],["si",6,16,false],["di",7,16,false],
+    ["r8w",8,16,false],["r9w",9,16,false],["r10w",10,16,false],["r11w",11,16,false],
+    ["r12w",12,16,false],["r13w",13,16,false],["r14w",14,16,false],["r15w",15,16,false],
+    ["eax",0,32,false],["ecx",1,32,false],["edx",2,32,false],["ebx",3,32,false],
+    ["esp",4,32,false],["ebp",5,32,false],["esi",6,32,false],["edi",7,32,false],
+    ["r8d",8,32,false],["r9d",9,32,false],["r10d",10,32,false],["r11d",11,32,false],
+    ["r12d",12,32,false],["r13d",13,32,false],["r14d",14,32,false],["r15d",15,32,false],
+    ["rax",0,64,false],["rcx",1,64,false],["rdx",2,64,false],["rbx",3,64,false],
+    ["rsp",4,64,false],["rbp",5,64,false],["rsi",6,64,false],["rdi",7,64,false],
+    ["r8",8,64,false],["r9",9,64,false],["r10",10,64,false],["r11",11,64,false],
+    ["r12",12,64,false],["r13",13,64,false],["r14",14,64,false],["r15",15,64,false],
+    ["xmm0",0,128,true],["xmm1",1,128,true],["xmm2",2,128,true],["xmm3",3,128,true],
+    ["xmm4",4,128,true],["xmm5",5,128,true],["xmm6",6,128,true],["xmm7",7,128,true],
+    ["xmm8",8,128,true],["xmm9",9,128,true],["xmm10",10,128,true],["xmm11",11,128,true],
+    ["xmm12",12,128,true],["xmm13",13,128,true],["xmm14",14,128,true],["xmm15",15,128,true]
+  ]
+end
+
+# Returns [num, size, is_xmm] or false if `name` is not a register.
+make a function called xa_lookup_reg takes name returns info
+  let table = xa_reg_table()
+  let i = 0
+  let n = to_num(list_len(table))
+  while i < n do
+    let row = table[i]
+    if row[0] == name then
+      return [row[1], row[2], row[3]]
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# ---- tiny string helpers specific to this assembler ----
+
+make a function called xa_is_digit_char takes code returns yes
+  return (code >= 48) and (code <= 57)
+end
+
+# Parses a decimal integer, optionally signed with a leading '-'.
+# Bare wrapper over to_num for readability at call sites.
+make a function called xa_parse_int takes s returns v
+  return to_num(s)
+end
+
+make a function called xa_looks_like_int takes s returns yes
+  if s.length == 0 then
+    return false
+  end
+  let i = 0
+  if char_code(s, 0) == 45 then
+    let i = 1
+  end
+  if i >= s.length then
+    return false
+  end
+  while i < s.length do
+    if not xa_is_digit_char(char_code(s, i)) then
+      return false
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+# Splits `s` on every top-level occurrence of single-char `sep`.
+# Safe for this assembler's comma-separated operand/directive lists
+# because codegen_x64.patlang never emits a comma inside `[...]`
+# (confirmed: no SIB/scaled-index addressing is ever generated, which
+# is the only shape that would need one).
+make a function called xa_split_char takes s, sep returns parts
+  let out = []
+  let start = 0
+  let i = 0
+  let n = s.length
+  while i < n do
+    if char_code(s, i) == sep then
+      let out = list_push(out, substr(s, start, i - start))
+      let start = i + 1
+    end
+    let i = i + 1
+  end
+  let out = list_push(out, substr(s, start, n - start))
+  return out
+end
+
+make a function called xa_strip_comment takes line returns stripped
+  let i = 0
+  let n = line.length
+  while i < n do
+    if char_code(line, i) == 59 then
+      return substr(line, 0, i)
+    end
+    let i = i + 1
+  end
+  return line
+end
+
+# ---- operand parsing ----
+#
+# Returns a tagged operand:
+#   ["reg", num, size, is_xmm]
+#   ["imm", value]
+#   ["mem", base_num, disp, size_hint]        -- size_hint 0 if none given
+#   ["relmem", label, disp, size_hint]        -- [rel label(+/-N)]
+#   ["label", name]                            -- bare identifier (call/jmp
+#                                                  target, or a dq/db value)
+
+make a function called xa_parse_mem_inner takes inner returns operand
+  # inner is whatever was between [ and ], already trimmed, with any
+  # leading "rel " already stripped by the caller when present.
+  # Forms seen: "reg", "reg+N", "reg-N".
+  let plus_idx = -1
+  let i = 0
+  while i < inner.length do
+    let c = char_code(inner, i)
+    if (c == 43) or ((c == 45) and (i > 0)) then
+      let plus_idx = i
+      let i = inner.length
+    end
+    let i = i + 1
+  end
+  if plus_idx < 0 then
+    return [inner, 0]
+  end
+  let base = substr(inner, 0, plus_idx)
+  let disp_text = substr(inner, plus_idx, inner.length - plus_idx)
+  if char_code(disp_text, 0) == 43 then
+    let disp_text = substr(disp_text, 1, disp_text.length - 1)
+  end
+  return [base, xa_parse_int(disp_text)]
+end
+
+make a function called xa_parse_operand takes raw returns operand
+  let s = str_trim(raw)
+  let size_hint = 0
+  if str_starts_with(s, "byte ") then
+    let size_hint = 8
+    let s = str_trim(substr(s, 5, s.length - 5))
+  else
+    if str_starts_with(s, "word ") then
+      let size_hint = 16
+      let s = str_trim(substr(s, 5, s.length - 5))
+    else
+      if str_starts_with(s, "dword ") then
+        let size_hint = 32
+        let s = str_trim(substr(s, 6, s.length - 6))
+      else
+        if str_starts_with(s, "qword ") then
+          let size_hint = 64
+          let s = str_trim(substr(s, 6, s.length - 6))
+        end
+      end
+    end
+  end
+
+  if str_starts_with(s, "[") then
+    let inner = str_trim(substr(s, 1, s.length - 2))
+    if str_starts_with(inner, "rel ") then
+      let rest = str_trim(substr(inner, 4, inner.length - 4))
+      let parsed = xa_parse_mem_inner(rest)
+      return ["relmem", parsed[0], parsed[1], size_hint]
+    end
+    let parsed = xa_parse_mem_inner(inner)
+    let reg = xa_lookup_reg(parsed[0])
+    return ["mem", reg[0], parsed[1], size_hint]
+  end
+
+  if xa_looks_like_int(s) then
+    return ["imm", xa_parse_int(s)]
+  end
+
+  let reg = xa_lookup_reg(s)
+  if reg then
+    return ["reg", reg[0], reg[1], reg[2]]
+  end
+
+  return ["label", s]
+end
+
+# ---- REX / ModRM / SIB encoding ----
+#
+# rex(w, r, x, b) -- the four REX fields as described in the Intel SDM:
+# W=64-bit operand size, R=extension of ModRM.reg, X=extension of
+# SIB.index (always 0 here, no SIB index is ever used), B=extension of
+# ModRM.rm (or of an opcode+reg encoding, e.g. push/pop).
+make a function called xa_rex takes w, r, x, b returns byte
+  let v = 64
+  if w then
+    let v = v + 8
+  end
+  if r then
+    let v = v + 4
+  end
+  if x then
+    let v = v + 2
+  end
+  if b then
+    let v = v + 1
+  end
+  return v
+end
+
+make a function called xa_needs_rex_b takes regnum returns yes
+  return regnum >= 8
+end
+
+# Encodes a ModRM(+SIB)(+disp) byte sequence for `rm_operand` (a "reg",
+# "mem", or "relmem" tagged operand) paired with a `reg_field` register
+# number (the instruction's other operand, or a fixed /digit extension
+# for single-operand opcodes like `neg`/`inc`). Returns
+# [bytes, reloc_or_false] where reloc, if present, is
+# [offset_within_bytes, kind, label, addend] -- offset_within_bytes
+# locates where the 4-byte disp32/RIP32 placeholder starts, for the
+# caller to translate into an absolute reloc once it knows this
+# instruction's final position in the chunk.
+make a function called xa_encode_modrm takes rm_operand, reg_field returns result
+  let tag = rm_operand[0]
+  if tag == "reg" then
+    let rm_num = rm_operand[1]
+    let modrm = 192 + ((reg_field band 7) * 8) + (rm_num band 7)
+    return [[modrm], false]
+  end
+  if tag == "relmem" then
+    let label = rm_operand[1]
+    let addend = rm_operand[2]
+    let modrm = 0 + ((reg_field band 7) * 8) + 5
+    let bytes = [modrm, 0, 0, 0, 0]
+    return [bytes, [1, "RIP32", label, addend]]
+  end
+  # tag == "mem": [base_reg (+disp)]
+  let base_num = rm_operand[1]
+  let disp = rm_operand[2]
+  let base_low = base_num band 7
+  let needs_sib = base_low == 4
+  if disp == 0 then
+    if base_low == 5 then
+      # [rbp]/[r13] with no displacement is not encodable via mod=00
+      # (that encoding means RIP-relative instead) -- codegen_x64.patlang
+      # never emits a bare "[rbp]"/"[r13]" (always +disp), so this path
+      # is intentionally left unsupported rather than silently wrong.
+      print("x64_asm: unsupported bare [rbp]/[r13] with no displacement")
+    end
+    let modrm = 0 + ((reg_field band 7) * 8) + base_low
+    if needs_sib then
+      return [[modrm, 36], false]
+    end
+    return [[modrm], false]
+  end
+  let modrm = 128 + ((reg_field band 7) * 8) + base_low
+  let disp_bytes = xa_int_to_bytes_le(disp, 4)
+  if needs_sib then
+    return [xa_emit_bytes([modrm, 36], disp_bytes), false]
+  end
+  return [xa_emit_bytes([modrm], disp_bytes), false]
+end
+
+# ---- instruction encoders ----
+#
+# Every encoder returns [bytes, reloc_or_false] with the same reloc
+# shape as xa_encode_modrm (an offset local to `bytes`, resolved to an
+# absolute chunk offset by the caller). Two-operand forms follow this
+# codebase's own NASM-text convention throughout: `op dst, src`.
+
+make a function called xa_enc_push_pop takes op, reg returns result
+  let base = 80
+  if op == "pop" then
+    let base = 88
+  end
+  let opcode = base + (reg[1] band 7)
+  if xa_needs_rex_b(reg[1]) then
+    return [[xa_rex(false, false, false, true), opcode], false]
+  end
+  return [[opcode], false]
+end
+
+make a function called xa_enc_mov takes dst, src returns result
+  if (dst[0] == "reg") and (src[0] == "imm") then
+    let opcode = 184 + (dst[1] band 7)
+    let rex = xa_rex(true, false, false, xa_needs_rex_b(dst[1]))
+    return [xa_emit_bytes([rex, opcode], xa_int_to_bytes_le(src[1], 8)), false]
+  end
+  if dst[0] == "reg" then
+    # mov reg, r/m  (8B /r)
+    let rex = xa_rex(true, xa_needs_rex_b(dst[1]), false, xa_needs_rex_b_for_rm(src))
+    let mm = xa_encode_modrm(src, dst[1])
+    return [xa_emit_bytes([rex, 139], mm[0]), xa_shift_reloc(mm[1], 2)]
+  end
+  # mov r/m, reg  (89 /r) -- dst is "mem"/"relmem"
+  let rex = xa_rex(true, xa_needs_rex_b(src[1]), false, xa_needs_rex_b_for_rm(dst))
+  let mm = xa_encode_modrm(dst, src[1])
+  return [xa_emit_bytes([rex, 137], mm[0]), xa_shift_reloc(mm[1], 2)]
+end
+
+# xa_encode_modrm's reloc offset is relative to the START of mm[0] (the
+# modrm+disp bytes alone) -- every caller that prepends prefix bytes
+# (REX, opcode, 0F, mandatory SSE prefixes, ...) before mm[0] must shift
+# the reloc's recorded offset by however many prefix bytes it added, or
+# the linker patches the wrong bytes later.
+make a function called xa_shift_reloc takes reloc, extra returns out
+  if reloc == false then
+    return false
+  end
+  return [reloc[0] + extra, reloc[1], reloc[2], reloc[3]]
+end
+
+make a function called xa_needs_rex_b_for_rm takes operand returns yes
+  if operand[0] == "reg" then
+    return xa_needs_rex_b(operand[1])
+  end
+  if operand[0] == "mem" then
+    return xa_needs_rex_b(operand[1])
+  end
+  return false
+end
+
+make a function called xa_enc_lea takes dst, src returns result
+  let rex = xa_rex(true, xa_needs_rex_b(dst[1]), false, xa_needs_rex_b_for_rm(src))
+  let mm = xa_encode_modrm(src, dst[1])
+  return [xa_emit_bytes([rex, 141], mm[0]), xa_shift_reloc(mm[1], 2)]
+end
+
+# add/sub/and/or/xor/cmp, all `op dst, src` where dst is reg or mem.
+make a function called xa_alu_opcodes takes name returns pair
+  # [reg_form_opcode, imm_extension]
+  if name == "add" then
+    return [1, 0]
+  end
+  if name == "or" then
+    return [9, 1]
+  end
+  if name == "and" then
+    return [33, 4]
+  end
+  if name == "sub" then
+    return [41, 5]
+  end
+  if name == "xor" then
+    return [49, 6]
+  end
+  if name == "cmp" then
+    return [57, 7]
+  end
+  return [1, 0]
+end
+
+make a function called xa_enc_alu takes name, dst, src returns result
+  let ops = xa_alu_opcodes(name)
+  if src[0] == "imm" then
+    let ext = ops[1]
+    let v = src[1]
+    let rex = xa_rex(true, false, false, xa_needs_rex_b_for_rm(dst))
+    if (v >= -128) and (v <= 127) then
+      let mm = xa_encode_modrm(dst, ext)
+      return [xa_emit_bytes(xa_emit_bytes([rex, 131], mm[0]), xa_int_to_bytes_le(v, 1)), xa_shift_reloc(mm[1], 2)]
+    end
+    let mm = xa_encode_modrm(dst, ext)
+    return [xa_emit_bytes(xa_emit_bytes([rex, 129], mm[0]), xa_int_to_bytes_le(v, 4)), xa_shift_reloc(mm[1], 2)]
+  end
+  # reg/reg or reg/mem: `op dst, src` -> encode as opcode /r with
+  # dst as the r/m operand and src's register number as the reg field
+  # (opcode+1 selects the "r/m, reg" -> actually reversed; see note).
+  # ops[0] here is the "Eb/Ev, Gb/Gv" (dst=r/m, src=reg) form's opcode,
+  # which is what every alu reg,reg / mem,reg case in this codebase's
+  # emitted text needs (dst is never a bare label/imm-only target).
+  let rex = xa_rex(true, xa_needs_rex_b_for_rm(src), false, xa_needs_rex_b_for_rm(dst))
+  let mm = xa_encode_modrm(dst, src[1])
+  return [xa_emit_bytes([rex, ops[0]], mm[0]), xa_shift_reloc(mm[1], 2)]
+end
+
+make a function called xa_enc_imul takes dst, src returns result
+  let rex = xa_rex(true, xa_needs_rex_b(dst[1]), false, xa_needs_rex_b_for_rm(src))
+  let mm = xa_encode_modrm(src, dst[1])
+  return [xa_emit_bytes([rex, 15, 175], mm[0]), xa_shift_reloc(mm[1], 3)]
+end
+
+make a function called xa_enc_test takes a, b returns result
+  let rex = xa_rex(true, xa_needs_rex_b_for_rm(b), false, xa_needs_rex_b_for_rm(a))
+  let mm = xa_encode_modrm(a, b[1])
+  return [xa_emit_bytes([rex, 133], mm[0]), xa_shift_reloc(mm[1], 2)]
+end
+
+make a function called xa_enc_unary takes ext, operand returns result
+  # inc/dec/neg/not, all FF/F7 /ext r/m64
+  let opcode = 255
+  if (ext == 3) or (ext == 2) then
+    let opcode = 247
+  end
+  let rex = xa_rex(true, false, false, xa_needs_rex_b_for_rm(operand))
+  let mm = xa_encode_modrm(operand, ext)
+  return [xa_emit_bytes([rex, opcode], mm[0]), xa_shift_reloc(mm[1], 2)]
+end
+
+make a function called xa_enc_shift_imm takes ext, dst, amount returns result
+  let rex = xa_rex(true, false, false, xa_needs_rex_b_for_rm(dst))
+  let mm = xa_encode_modrm(dst, ext)
+  return [xa_emit_bytes(xa_emit_bytes([rex, 193], mm[0]), [amount band 255]), xa_shift_reloc(mm[1], 2)]
+end
+
+make a function called xa_shift_ext takes name returns ext
+  if name == "shl" then
+    return 4
+  end
+  if name == "shr" then
+    return 5
+  end
+  return 7
+end
+
+make a function called xa_enc_setcc takes name returns result
+  # Always `setcc al` in this codebase's emitted text -- no REX needed
+  # (al is register 0, no extension, and al never collides with the
+  # spl/bpl/sil/dil low-byte-needs-REX ambiguity since those are never
+  # the target here).
+  let op = 148
+  if name == "setne" then
+    let op = 149
+  else
+    if name == "setl" then
+      let op = 156
+    else
+      if name == "setg" then
+        let op = 159
+      else
+        if name == "setle" then
+          let op = 158
+        else
+          if name == "setge" then
+            let op = 157
+          else
+            if name == "seta" then
+              let op = 151
+            else
+              if name == "setae" then
+                let op = 147
+              else
+                if name == "setb" then
+                  let op = 146
+                else
+                  if name == "setbe" then
+                    let op = 150
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  return [[15, op, 192], false]
+end
+
+make a function called xa_enc_movzx takes dst, src returns result
+  let opcode = 182
+  if src[2] == 16 then
+    let opcode = 183
+  end
+  let rex = xa_rex(dst[2] == 64, xa_needs_rex_b(dst[1]), false, xa_needs_rex_b_for_rm(src))
+  let mm = xa_encode_modrm(src, dst[1])
+  return [xa_emit_bytes([rex, 15, opcode], mm[0]), xa_shift_reloc(mm[1], 3)]
+end
+
+# call/jmp/jcc: all `op label`, always encoded as the near rel32 form
+# (uniform, no short-jump optimization) -- correctness over code size.
+make a function called xa_enc_call takes label returns result
+  return [[232, 0, 0, 0, 0], [1, "REL32", label, 0]]
+end
+
+make a function called xa_enc_jmp takes label returns result
+  return [[233, 0, 0, 0, 0], [1, "REL32", label, 0]]
+end
+
+make a function called xa_jcc_opcode takes name returns op
+  if (name == "je") or (name == "jz") then
+    return 132
+  end
+  if name == "jne" then
+    return 133
+  end
+  if name == "jg" then
+    return 143
+  end
+  if name == "jl" then
+    return 140
+  end
+  if name == "jge" then
+    return 141
+  end
+  if name == "jle" then
+    return 142
+  end
+  if name == "jo" then
+    return 128
+  end
+  return 132
+end
+
+make a function called xa_enc_jcc takes name, label returns result
+  let op = xa_jcc_opcode(name)
+  return [[15, op, 0, 0, 0, 0], [2, "REL32", label, 0]]
+end
+
+# SSE: F2/F3/66-prefixed scalar-double ops, all `op dst_xmm, src`.
+make a function called xa_enc_sse_rr takes prefix, opcode, dst, src returns result
+  let mm = xa_encode_modrm(src, dst[1])
+  return [xa_emit_bytes(xa_emit_bytes(prefix, [15, opcode]), mm[0]), xa_shift_reloc(mm[1], to_num(list_len(prefix)) + 2)]
+end
+
+make a function called xa_enc_movq_sse takes dst, src returns result
+  if (dst[3] == true) and (src[3] == true) then
+    let mm = xa_encode_modrm(src, dst[1])
+    return [xa_emit_bytes([243, 15, 126], mm[0]), xa_shift_reloc(mm[1], 3)]
+  end
+  if dst[3] == true then
+    # movq xmm, r64 -- 66 REX.W 0F 6E /r
+    let rex = xa_rex(true, xa_needs_rex_b(dst[1]), false, xa_needs_rex_b_for_rm(src))
+    let mm = xa_encode_modrm(src, dst[1])
+    return [xa_emit_bytes([102, rex, 15, 110], mm[0]), xa_shift_reloc(mm[1], 4)]
+  end
+  # movq r64, xmm -- 66 REX.W 0F 7E /r
+  let rex = xa_rex(true, xa_needs_rex_b(src[1]), false, xa_needs_rex_b_for_rm(dst))
+  let mm = xa_encode_modrm(dst, src[1])
+  return [xa_emit_bytes([102, rex, 15, 126], mm[0]), xa_shift_reloc(mm[1], 4)]
+end
+
+make a function called xa_enc_cvtsi2sd takes dst, src returns result
+  let rex = xa_rex(true, xa_needs_rex_b(dst[1]), false, xa_needs_rex_b_for_rm(src))
+  let mm = xa_encode_modrm(src, dst[1])
+  return [xa_emit_bytes([242, rex, 15, 42], mm[0]), xa_shift_reloc(mm[1], 4)]
+end
+
+make a function called xa_enc_cvttsd2si takes dst, src returns result
+  let rex = xa_rex(true, xa_needs_rex_b(dst[1]), false, xa_needs_rex_b_for_rm(src))
+  let mm = xa_encode_modrm(src, dst[1])
+  return [xa_emit_bytes([242, rex, 15, 44], mm[0]), xa_shift_reloc(mm[1], 4)]
+end
+
+# ---- top-level instruction dispatch ----
+#
+# Returns [bytes, reloc_or_false] like every xa_enc_* helper.
+make a function called xa_encode_instr takes mnemonic, ops returns result
+  if mnemonic == "push" then
+    return xa_enc_push_pop("push", ops[0])
+  end
+  if mnemonic == "pop" then
+    return xa_enc_push_pop("pop", ops[0])
+  end
+  if mnemonic == "mov" then
+    return xa_enc_mov(ops[0], ops[1])
+  end
+  if mnemonic == "lea" then
+    return xa_enc_lea(ops[0], ops[1])
+  end
+  if (mnemonic == "add") or (mnemonic == "sub") or (mnemonic == "and") or (mnemonic == "or") or (mnemonic == "xor") or (mnemonic == "cmp") then
+    return xa_enc_alu(mnemonic, ops[0], ops[1])
+  end
+  if mnemonic == "imul" then
+    return xa_enc_imul(ops[0], ops[1])
+  end
+  if mnemonic == "test" then
+    return xa_enc_test(ops[0], ops[1])
+  end
+  if mnemonic == "inc" then
+    return xa_enc_unary(0, ops[0])
+  end
+  if mnemonic == "dec" then
+    return xa_enc_unary(1, ops[0])
+  end
+  if mnemonic == "neg" then
+    return xa_enc_unary(3, ops[0])
+  end
+  if mnemonic == "not" then
+    return xa_enc_unary(2, ops[0])
+  end
+  if (mnemonic == "shl") or (mnemonic == "shr") or (mnemonic == "sar") then
+    return xa_enc_shift_imm(xa_shift_ext(mnemonic), ops[0], ops[1][1])
+  end
+  if str_starts_with(mnemonic, "set") then
+    return xa_enc_setcc(mnemonic)
+  end
+  if mnemonic == "movzx" then
+    return xa_enc_movzx(ops[0], ops[1])
+  end
+  if mnemonic == "call" then
+    return xa_enc_call(ops[0][1])
+  end
+  if mnemonic == "jmp" then
+    return xa_enc_jmp(ops[0][1])
+  end
+  if str_starts_with(mnemonic, "j") then
+    return xa_enc_jcc(mnemonic, ops[0][1])
+  end
+  if mnemonic == "ret" then
+    return [[195], false]
+  end
+  if mnemonic == "leave" then
+    return [[201], false]
+  end
+  if mnemonic == "cqo" then
+    return [[72, 153], false]
+  end
+  if mnemonic == "cdq" then
+    return [[153], false]
+  end
+  if mnemonic == "pause" then
+    return [[243, 144], false]
+  end
+  if mnemonic == "idiv" then
+    let rex = xa_rex(true, false, false, xa_needs_rex_b_for_rm(ops[0]))
+    let mm = xa_encode_modrm(ops[0], 7)
+    return [xa_emit_bytes([rex, 247], mm[0]), xa_shift_reloc(mm[1], 2)]
+  end
+  if mnemonic == "lock" then
+    # "lock cmpxchg [mem], reg" is emitted as one logical line
+    # ("lock cmpxchg ...") by codegen_x64.patlang -- the caller passes
+    # the remainder through with mnemonic already reduced to
+    # "cmpxchg" and this arm is unreachable in practice, kept only so
+    # a bare "lock" prefix token is never silently swallowed if seen.
+    return [[240], false]
+  end
+  if mnemonic == "cmpxchg" then
+    let rex = xa_rex(true, xa_needs_rex_b(ops[1][1]), false, xa_needs_rex_b_for_rm(ops[0]))
+    let mm = xa_encode_modrm(ops[0], ops[1][1])
+    return [xa_emit_bytes([240, rex, 15, 177], mm[0]), xa_shift_reloc(mm[1], 4)]
+  end
+  if mnemonic == "movq" then
+    return xa_enc_movq_sse(ops[0], ops[1])
+  end
+  if mnemonic == "addsd" then
+    return xa_enc_sse_rr([242], 88, ops[0], ops[1])
+  end
+  if mnemonic == "subsd" then
+    return xa_enc_sse_rr([242], 92, ops[0], ops[1])
+  end
+  if mnemonic == "mulsd" then
+    return xa_enc_sse_rr([242], 89, ops[0], ops[1])
+  end
+  if mnemonic == "divsd" then
+    return xa_enc_sse_rr([242], 94, ops[0], ops[1])
+  end
+  if mnemonic == "ucomisd" then
+    return xa_enc_sse_rr([102], 46, ops[0], ops[1])
+  end
+  if mnemonic == "cvtsi2sd" then
+    return xa_enc_cvtsi2sd(ops[0], ops[1])
+  end
+  if mnemonic == "cvttsd2si" then
+    return xa_enc_cvttsd2si(ops[0], ops[1])
+  end
+  print("x64_asm: unknown mnemonic '" + mnemonic + "'")
+  return [[], false]
+end
+
+# ---- line-oriented parser + chunk assembler ----
+
+make a function called xa_next_id returns id
+  let n = get("__vars", "xa_id_counter")
+  if not n then
+    let n = 0
+  end
+  set_var("xa_id_counter", n + 1)
+  return n
+end
+
+make a function called xa_new_state returns state
+  let d = new("Dict", "xa_state_" + xa_next_id())
+  send(d, "set", "section", "text")
+  send(d, "set", "text_bytes", [])
+  send(d, "set", "data_bytes", [])
+  send(d, "set", "bss_size", 0)
+  send(d, "set", "symbols", [])
+  send(d, "set", "relocs", [])
+  send(d, "set", "externs", [])
+  send(d, "set", "globals", [])
+  send(d, "set", "current_global", "")
+  return d
+end
+
+make a function called xa_state_offset takes state, section returns off
+  if section == "text" then
+    return to_num(list_len(get(state, "text_bytes")))
+  end
+  if section == "data" then
+    return to_num(list_len(get(state, "data_bytes")))
+  end
+  return get(state, "bss_size")
+end
+
+make a function called xa_declare_symbol takes state, name, section returns done
+  let globals = get(state, "globals")
+  let is_global = list_contains_str(globals, name)
+  let off = xa_state_offset(state, section)
+  let syms = get(state, "symbols")
+  send(state, "set", "symbols", list_push(syms, [name, section, off, is_global]))
+  return true
+end
+
+make a function called list_contains_str takes lst, v returns yes
+  let i = 0
+  let n = to_num(list_len(lst))
+  while i < n do
+    if lst[i] == v then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called xa_add_names takes state, key, names_csv returns done
+  let parts = xa_split_char(names_csv, 44)
+  let cur = get(state, key)
+  let i = 0
+  let n = to_num(list_len(parts))
+  while i < n do
+    let name = str_trim(parts[i])
+    if name.length > 0 then
+      let cur = list_push(cur, name)
+    end
+    let i = i + 1
+  end
+  send(state, "set", key, cur)
+  return true
+end
+
+# Records a REL32/RIP32 reloc found at `local_offset` inside `bytes`
+# (as returned by an xa_enc_* helper) at its real position once
+# `bytes` is appended to the chunk at `base_offset`.
+make a function called xa_record_reloc takes state, section, base_offset, reloc returns done
+  if reloc == false then
+    return true
+  end
+  let local_offset = reloc[0]
+  let kind = reloc[1]
+  let label = reloc[2]
+  let addend = reloc[3]
+  let relocs = get(state, "relocs")
+  let entry = [section, base_offset + local_offset, label, kind, addend]
+  send(state, "set", "relocs", list_push(relocs, entry))
+  return true
+end
+
+make a function called xa_process_instr_line takes state, line returns done
+  let sp = -1
+  let i = 0
+  while i < line.length do
+    if char_code(line, i) == 32 then
+      let sp = i
+      let i = line.length
+    end
+    let i = i + 1
+  end
+  let mnemonic = line
+  let rest = ""
+  if sp >= 0 then
+    let mnemonic = substr(line, 0, sp)
+    let rest = str_trim(substr(line, sp + 1, line.length - sp - 1))
+  end
+
+  if mnemonic == "lock" then
+    let sp2 = -1
+    let i = 0
+    while i < rest.length do
+      if char_code(rest, i) == 32 then
+        let sp2 = i
+        let i = rest.length
+      end
+      let i = i + 1
+    end
+    let mnemonic = substr(rest, 0, sp2)
+    let rest = str_trim(substr(rest, sp2 + 1, rest.length - sp2 - 1))
+  end
+
+  let ops = []
+  if rest.length > 0 then
+    let raw_parts = xa_split_char(rest, 44)
+    let i = 0
+    let n = to_num(list_len(raw_parts))
+    while i < n do
+      let ops = list_push(ops, xa_parse_operand(raw_parts[i]))
+      let i = i + 1
+    end
+  end
+
+  let result = xa_encode_instr(mnemonic, ops)
+  let base_offset = xa_state_offset(state, "text")
+  send(state, "set", "text_bytes", xa_emit_bytes(get(state, "text_bytes"), result[0]))
+  xa_record_reloc(state, "text", base_offset, result[1])
+  return true
+end
+
+make a function called xa_process_line takes state, raw_line returns done
+  let line = str_trim(xa_strip_comment(raw_line))
+  if line.length == 0 then
+    return true
+  end
+  if str_starts_with(line, "default ") then
+    return true
+  end
+  if str_starts_with(line, "section ") then
+    let name = str_trim(substr(line, 8, line.length - 8))
+    if name == ".text" then
+      send(state, "set", "section", "text")
+    else
+      if name == ".data" then
+        send(state, "set", "section", "data")
+      else
+        send(state, "set", "section", "bss")
+      end
+    end
+    return true
+  end
+  if str_starts_with(line, "global ") then
+    xa_add_names(state, "globals", substr(line, 7, line.length - 7))
+    return true
+  end
+  if str_starts_with(line, "extern ") then
+    xa_add_names(state, "externs", substr(line, 7, line.length - 7))
+    return true
+  end
+  if str_starts_with(line, "align ") then
+    let n = xa_parse_int(str_trim(substr(line, 6, line.length - 6)))
+    let sec = get(state, "section")
+    if sec == "text" then
+      let bytes = get(state, "text_bytes")
+      while (to_num(list_len(bytes)) % n) != 0 do
+        let bytes = list_push(bytes, 144)
+      end
+      send(state, "set", "text_bytes", bytes)
+    else
+      if sec == "data" then
+        let bytes = get(state, "data_bytes")
+        while (to_num(list_len(bytes)) % n) != 0 do
+          let bytes = list_push(bytes, 0)
+        end
+        send(state, "set", "data_bytes", bytes)
+      else
+        let bss = get(state, "bss_size")
+        while (bss % n) != 0 do
+          let bss = bss + 1
+        end
+        send(state, "set", "bss_size", bss)
+      end
+    end
+    return true
+  end
+  if str_starts_with(line, "db ") then
+    let parts = xa_split_char(str_trim(substr(line, 3, line.length - 3)), 44)
+    let bytes = get(state, "data_bytes")
+    let i = 0
+    let n = to_num(list_len(parts))
+    while i < n do
+      let bytes = list_push(bytes, xa_parse_int(str_trim(parts[i])) band 255)
+      let i = i + 1
+    end
+    send(state, "set", "data_bytes", bytes)
+    return true
+  end
+  if str_starts_with(line, "dq ") then
+    let parts = xa_split_char(str_trim(substr(line, 3, line.length - 3)), 44)
+    let i = 0
+    let n = to_num(list_len(parts))
+    while i < n do
+      let v = str_trim(parts[i])
+      if xa_looks_like_int(v) then
+        send(state, "set", "data_bytes", xa_emit_i64(get(state, "data_bytes"), xa_parse_int(v)))
+      else
+        let off = xa_state_offset(state, "data")
+        send(state, "set", "data_bytes", xa_emit_i64(get(state, "data_bytes"), 0))
+        let relocs = get(state, "relocs")
+        send(state, "set", "relocs", list_push(relocs, ["data", off, v, "ABS64", 0]))
+      end
+      let i = i + 1
+    end
+    return true
+  end
+  if char_code(line, line.length - 1) == 58 then
+    let name = substr(line, 0, line.length - 1)
+    if str_starts_with(name, ".") then
+      let full = get(state, "current_global") + name
+      xa_declare_symbol(state, full, get(state, "section"))
+    else
+      xa_declare_symbol(state, name, get(state, "section"))
+      send(state, "set", "current_global", name)
+    end
+    return true
+  end
+  let parts = xa_split_char(line, 32)
+  if to_num(list_len(parts)) >= 3 then
+    let kind = parts[1]
+    if (kind == "resb") or (kind == "resq") or (kind == "resd") then
+      let name = parts[0]
+      xa_declare_symbol(state, name, "bss")
+      let count = xa_parse_int(parts[2])
+      let sz_unit = 1
+      if kind == "resq" then
+        let sz_unit = 8
+      end
+      if kind == "resd" then
+        let sz_unit = 4
+      end
+      send(state, "set", "bss_size", get(state, "bss_size") + (count * sz_unit))
+      return true
+    end
+  end
+  xa_process_instr_line(state, line)
+  return true
+end
+
+# Assembles one chunk of NASM-subset text into a ChunkImage.
+make a function called x64_assemble_chunk takes asm_text returns chunk
+  let state = xa_new_state()
+  let lines = split_lines(asm_text)
+  let i = 0
+  let n = to_num(list_len(lines))
+  while i < n do
+    xa_process_line(state, lines[i])
+    let i = i + 1
+  end
+  return ["ChunkImage",
+    get(state, "text_bytes"),
+    get(state, "data_bytes"),
+    get(state, "bss_size"),
+    get(state, "symbols"),
+    get(state, "relocs"),
+    get(state, "externs")]
+end

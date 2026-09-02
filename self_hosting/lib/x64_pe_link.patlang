@@ -1,0 +1,527 @@
+include "x64_asm.patlang"
+
+# ---- Minimal PE32+ linker for PatLang-assembled x64 chunks ---------------
+#
+# Replaces gcc-as-linker for exactly the shape x64_build.patlang needs: one
+# or more ChunkImage records (see x64_asm.patlang) produced by
+# x64_assemble_chunk, plus a fixed list of DLL imports, merged into a
+# single working PE32+ .exe. Not a general linker -- no arbitrary object
+# file formats, no static libraries, no ordinal imports, always
+# import-by-name, no base relocation table (ASLR off, fixed ImageBase),
+# matching what the design plan scoped for Phase 1.
+#
+# Entry point is set directly to the "main" symbol (the program is
+# CRT-less and calls ExitProcess itself -- confirmed safe by inspecting
+# bootstrap/hello_bootstrap.asm, which ends every path via `call
+# ExitProcess`, never `ret`).
+
+make a function called xpl_round_up takes v, boundary returns r
+  let rem = v % boundary
+  if rem == 0 then
+    return v
+  end
+  return v + (boundary - rem)
+end
+
+make a function called xpl_emit_u16 takes lst, v returns out
+  return xa_emit_bytes(lst, xa_int_to_bytes_le(v, 2))
+end
+
+make a function called xpl_emit_u32 takes lst, v returns out
+  return xa_emit_bytes(lst, xa_int_to_bytes_le(v, 4))
+end
+
+make a function called xpl_emit_u64 takes lst, v returns out
+  return xa_emit_bytes(lst, xa_int_to_bytes_le(v, 8))
+end
+
+make a function called xpl_ascii_bytes takes s returns bytes
+  let out = []
+  let i = 0
+  while i < s.length do
+    let out = list_push(out, char_code(s, i))
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called xpl_pad_to takes lst, n returns out
+  let out = lst
+  while to_num(list_len(out)) < n do
+    let out = list_push(out, 0)
+  end
+  return out
+end
+
+# ---- symbol table ----
+
+make a function called xpl_symtab_new returns t
+  return new("Dict", "xpl_symtab_" + xa_next_id())
+end
+
+make a function called xpl_symtab_set takes t, name, rva returns done
+  send(t, "set", name, rva)
+  return true
+end
+
+make a function called xpl_symtab_get takes t, name returns rva_or_false
+  return get(t, name)
+end
+
+# ---- layout + link ----
+#
+# chunks: list of ChunkImage (see x64_asm.patlang header comment)
+# import_spec: [ [dll_name, [func_name, ...]], ... ]
+# entry_symbol: name of the label to use as the PE entry point (usually "main")
+# out_path: where to write the final .exe
+#
+# Returns out_path on success, or a string starting with "LINK ERROR:"
+# on failure.
+make a function called x64_link takes chunks, import_spec, entry_symbol, out_path returns result
+  let image_base = 5368709120
+  let section_align = 4096
+  let file_align = 512
+
+  # ---- Pass 1: concatenate chunk sections, recording each chunk's base
+  # offset within the merged text/data/bss regions and every symbol's
+  # ABSOLUTE offset within its section (not yet an RVA -- the section's
+  # own RVA is only known after import-table size is decided below).
+  let merged_text = []
+  let merged_data = []
+  let merged_bss = 0
+  let all_symbols = []
+  let all_relocs = []
+  let ci = 0
+  let cn = to_num(list_len(chunks))
+  while ci < cn do
+    let chunk = chunks[ci]
+    let text_base = to_num(list_len(merged_text))
+    let data_base = to_num(list_len(merged_data))
+    let bss_base = merged_bss
+    let merged_text = xa_emit_bytes(merged_text, chunk[1])
+    let merged_data = xa_emit_bytes(merged_data, chunk[2])
+    let merged_bss = merged_bss + chunk[3]
+
+    let syms = chunk[4]
+    let si = 0
+    let sn = to_num(list_len(syms))
+    while si < sn do
+      let sym = syms[si]
+      let name = sym[0]
+      let section = sym[1]
+      let offset = sym[2]
+      let base = text_base
+      if section == "data" then
+        let base = data_base
+      else
+        if section == "bss" then
+          let base = bss_base
+        end
+      end
+      let all_symbols = list_push(all_symbols, [name, section, base + offset])
+      let si = si + 1
+    end
+
+    let relocs = chunk[5]
+    let ri = 0
+    let rn = to_num(list_len(relocs))
+    while ri < rn do
+      let reloc = relocs[ri]
+      let section = reloc[0]
+      let offset = reloc[1]
+      let target = reloc[2]
+      let kind = reloc[3]
+      let addend = reloc[4]
+      let base = text_base
+      if section == "data" then
+        let base = data_base
+      end
+      let all_relocs = list_push(all_relocs, [section, base + offset, target, kind, addend])
+      let ri = ri + 1
+    end
+    let ci = ci + 1
+  end
+
+  # ---- Import-thunk generation: one 6-byte `jmp [rel iat_slot]`
+  # (FF 25 disp32) per imported function, placed at the START of .text
+  # so their RVAs are known before user code offsets are rebased.
+  let thunk_names = []
+  let di = 0
+  let dn = to_num(list_len(import_spec))
+  while di < dn do
+    let dll_entry = import_spec[di]
+    let funcs = dll_entry[1]
+    let fi = 0
+    let fcount = to_num(list_len(funcs))
+    while fi < fcount do
+      let thunk_names = list_push(thunk_names, funcs[fi])
+      let fi = fi + 1
+    end
+    let di = di + 1
+  end
+  let thunk_area_size = to_num(list_len(thunk_names)) * 6
+
+  # ---- Section RVA layout ----
+  let headers_size = xpl_round_up(1024, file_align)
+  let text_rva = section_align
+  let text_size_raw = thunk_area_size + to_num(list_len(merged_text))
+  let text_size = xpl_round_up(text_size_raw, file_align)
+  let data_rva = xpl_round_up(text_rva + text_size_raw, section_align)
+  let data_size_raw = to_num(list_len(merged_data))
+  let data_size = xpl_round_up(data_size_raw, file_align)
+  let bss_rva = xpl_round_up(data_rva + data_size_raw, section_align)
+  let bss_size_raw = merged_bss
+  let idata_rva = xpl_round_up(bss_rva + bss_size_raw, section_align)
+
+  # ---- Build .idata content: Import Directory Table, then per-DLL
+  # ILT, IAT, Hint/Name entries, then DLL name strings -- offsets
+  # within .idata are computed in a fixed, pre-planned order so every
+  # cross-reference (descriptor -> ILT/IAT/name) can be resolved before
+  # any bytes are emitted.
+  let num_dlls = to_num(list_len(import_spec))
+  let descriptors_size = (num_dlls + 1) * 20
+  let dll_thunk_offsets = []
+  let running = descriptors_size
+  let di = 0
+  while di < num_dlls do
+    let funcs = import_spec[di][1]
+    let count = to_num(list_len(funcs)) + 1
+    let dll_thunk_offsets = list_push(dll_thunk_offsets, running)
+    let running = running + (count * 8)
+    let di = di + 1
+  end
+  let ilt_offsets = dll_thunk_offsets
+  let iat_offsets = []
+  let iat_region_start = running
+  let di = 0
+  while di < num_dlls do
+    let funcs = import_spec[di][1]
+    let count = to_num(list_len(funcs)) + 1
+    let iat_offsets = list_push(iat_offsets, running)
+    let running = running + (count * 8)
+    let di = di + 1
+  end
+  let iat_region_size = running - iat_region_start
+  let hintname_offsets = []
+  let di = 0
+  while di < num_dlls do
+    let funcs = import_spec[di][1]
+    let per_dll = []
+    let fi = 0
+    let fcount = to_num(list_len(funcs))
+    while fi < fcount do
+      let per_dll = list_push(per_dll, running)
+      let entry_len = 2 + funcs[fi].length + 1
+      let running = running + xpl_round_up(entry_len, 2)
+      let fi = fi + 1
+    end
+    let hintname_offsets = list_push(hintname_offsets, per_dll)
+    let di = di + 1
+  end
+  let dllname_offsets = []
+  let di = 0
+  while di < num_dlls do
+    let dllname_offsets = list_push(dllname_offsets, running)
+    let running = running + import_spec[di][0].length + 1
+    let di = di + 1
+  end
+  let idata_size_raw = running
+
+  # ---- Emit .idata bytes ----
+  let idata = []
+  let di = 0
+  while di < num_dlls do
+    let idata = xpl_emit_u32(idata, idata_rva + ilt_offsets[di])
+    let idata = xpl_emit_u32(idata, 0)
+    let idata = xpl_emit_u32(idata, 0)
+    let idata = xpl_emit_u32(idata, idata_rva + dllname_offsets[di])
+    let idata = xpl_emit_u32(idata, idata_rva + iat_offsets[di])
+    let di = di + 1
+  end
+  let idata = xpl_pad_to(idata, descriptors_size)
+
+  let di = 0
+  while di < num_dlls do
+    let funcs = import_spec[di][1]
+    let hn = hintname_offsets[di]
+    let fi = 0
+    let fnn = to_num(list_len(funcs))
+    while fi < fnn do
+      let idata = xpl_emit_u64(idata, idata_rva + hn[fi])
+      let fi = fi + 1
+    end
+    let idata = xpl_emit_u64(idata, 0)
+    let di = di + 1
+  end
+
+  let iat_rva_of = xpl_symtab_new()
+  let di = 0
+  while di < num_dlls do
+    let funcs = import_spec[di][1]
+    let base_off = iat_offsets[di]
+    let fi = 0
+    let fnn = to_num(list_len(funcs))
+    while fi < fnn do
+      xpl_symtab_set(iat_rva_of, funcs[fi], idata_rva + base_off + (fi * 8))
+      let fi = fi + 1
+    end
+    let di = di + 1
+  end
+  let di = 0
+  while di < num_dlls do
+    let funcs = import_spec[di][1]
+    let hn = hintname_offsets[di]
+    let fi = 0
+    let fnn = to_num(list_len(funcs))
+    while fi < fnn do
+      let idata = xpl_emit_u64(idata, idata_rva + hn[fi])
+      let fi = fi + 1
+    end
+    let idata = xpl_emit_u64(idata, 0)
+    let di = di + 1
+  end
+
+  let di = 0
+  while di < num_dlls do
+    let funcs = import_spec[di][1]
+    let fi = 0
+    let fnn = to_num(list_len(funcs))
+    while fi < fnn do
+      let idata = xpl_emit_u16(idata, 0)
+      let idata = xa_emit_bytes(idata, xpl_ascii_bytes(funcs[fi]))
+      let idata = list_push(idata, 0)
+      if (to_num(list_len(idata)) % 2) != 0 then
+        let idata = list_push(idata, 0)
+      end
+      let fi = fi + 1
+    end
+    let di = di + 1
+  end
+
+  let di = 0
+  while di < num_dlls do
+    let idata = xa_emit_bytes(idata, xpl_ascii_bytes(import_spec[di][0]))
+    let idata = list_push(idata, 0)
+    let di = di + 1
+  end
+  let idata = xpl_pad_to(idata, idata_size_raw)
+  let idata_size = xpl_round_up(idata_size_raw, file_align)
+
+  # ---- Import thunks (start of .text) ----
+  let thunks = []
+  let ti = 0
+  let tn = to_num(list_len(thunk_names))
+  while ti < tn do
+    let thunk_rva = text_rva + (ti * 6)
+    let iat_slot_rva = xpl_symtab_get(iat_rva_of, thunk_names[ti])
+    let disp = iat_slot_rva - (thunk_rva + 6)
+    let thunks = xpl_emit_u16(thunks, 9727)
+    let thunks = xpl_emit_u32(thunks, disp)
+    xpl_symtab_set(iat_rva_of, "$thunk$" + thunk_names[ti], thunk_rva)
+    let ti = ti + 1
+  end
+
+  # ---- Flat symbol table: user symbols (rebased to final RVAs) plus
+  # one thunk-symbol per import (so a `call SomeImport` reloc resolves
+  # exactly like a `call SomeLocalFunction` reloc -- no special-casing
+  # needed at the point a relocation is patched, only here at table-
+  # build time).
+  let symtab = xpl_symtab_new()
+  let si = 0
+  let sn = to_num(list_len(all_symbols))
+  while si < sn do
+    let sym = all_symbols[si]
+    let name = sym[0]
+    let section = sym[1]
+    let offset = sym[2]
+    let base_rva = text_rva + thunk_area_size
+    if section == "data" then
+      let base_rva = data_rva
+    else
+      if section == "bss" then
+        let base_rva = bss_rva
+      end
+    end
+    xpl_symtab_set(symtab, name, base_rva + offset)
+    let si = si + 1
+  end
+  let ti = 0
+  while ti < tn do
+    xpl_symtab_set(symtab, thunk_names[ti], xpl_symtab_get(iat_rva_of, "$thunk$" + thunk_names[ti]))
+    let ti = ti + 1
+  end
+
+  # ---- Patch relocations directly into merged_text / merged_data ----
+  let ri = 0
+  let rn = to_num(list_len(all_relocs))
+  while ri < rn do
+    let reloc = all_relocs[ri]
+    let section = reloc[0]
+    let offset = reloc[1]
+    let target = reloc[2]
+    let kind = reloc[3]
+    let addend = reloc[4]
+    let target_rva = xpl_symtab_get(symtab, target)
+    if not target_rva then
+      return "LINK ERROR: undefined symbol '" + target + "'"
+    end
+    if kind == "ABS64" then
+      let value_bytes = xa_int_to_bytes_le(image_base + target_rva + addend, 8)
+      let merged_data = xpl_patch_bytes(merged_data, offset, value_bytes)
+    else
+      let reloc_rva = text_rva + thunk_area_size + offset
+      let value = (target_rva + addend) - (reloc_rva + 4)
+      let value_bytes = xa_int_to_bytes_le(value, 4)
+      let merged_text = xpl_patch_bytes(merged_text, offset, value_bytes)
+    end
+    let ri = ri + 1
+  end
+
+  let entry_rva = xpl_symtab_get(symtab, entry_symbol)
+  if not entry_rva then
+    return "LINK ERROR: entry symbol '" + entry_symbol + "' not defined"
+  end
+
+  # ---- Assemble final image ----
+  let idata_datadir_size = descriptors_size
+  let sizeof_image = xpl_round_up(idata_rva + idata_size_raw, section_align)
+
+  let text_file_offset = headers_size
+  let data_file_offset = headers_size + text_size
+  let idata_file_offset = headers_size + text_size + data_size
+
+  let hdr = xpl_build_headers(headers_size, image_base, section_align, file_align,
+    entry_rva, sizeof_image,
+    text_rva, text_size, thunk_area_size + to_num(list_len(merged_text)), text_file_offset,
+    data_rva, data_size, data_size_raw, data_file_offset,
+    bss_rva, xpl_round_up(bss_size_raw, section_align),
+    idata_rva, idata_size, idata_size_raw, idata_datadir_size, idata_file_offset,
+    iat_region_start, iat_region_size)
+
+  let out = xpl_pad_to(hdr, headers_size)
+  let out = xa_emit_bytes(out, thunks)
+  let out = xa_emit_bytes(out, merged_text)
+  let out = xpl_pad_to(out, headers_size + text_size)
+  let out = xa_emit_bytes(out, merged_data)
+  let out = xpl_pad_to(out, headers_size + text_size + data_size)
+  let out = xa_emit_bytes(out, idata)
+  let out = xpl_pad_to(out, headers_size + text_size + data_size + idata_size)
+
+  let ok = write_file_bytes(out_path, out)
+  if not ok then
+    return "LINK ERROR: write_file_bytes failed for " + out_path
+  end
+  return out_path
+end
+
+make a function called xpl_patch_bytes takes lst, offset, value_bytes returns out
+  let out = lst
+  let i = 0
+  let n = to_num(list_len(value_bytes))
+  while i < n do
+    let out = list_set(out, offset + i, value_bytes[i])
+    let i = i + 1
+  end
+  return out
+end
+
+# ---- PE header construction ----
+#
+# text_raw/data_raw/idata_raw are the ACTUAL content sizes (before
+# file-alignment padding) -- PE's SizeOfRawData per section is the
+# padded size, but VirtualSize is the real, unpadded size.
+make a function called xpl_build_headers takes headers_size, image_base, section_align, file_align, entry_rva, sizeof_image, text_rva, text_size, text_raw, text_file_offset, data_rva, data_size, data_raw, data_file_offset, bss_rva, bss_virtual_size, idata_rva, idata_size, idata_raw, idata_datadir_size, idata_file_offset, iat_region_start, iat_region_size returns bytes
+  let b = []
+  # DOS header: MZ + e_lfanew at offset 0x3C pointing past a 64-byte stub.
+  let b = xa_emit_bytes(b, [77, 90])
+  let b = xpl_pad_to(b, 60)
+  let b = xpl_emit_u32(b, 64)
+
+  # PE signature
+  let b = xa_emit_bytes(b, [80, 69, 0, 0])
+
+  # COFF File Header
+  let b = xpl_emit_u16(b, 34404)
+  let b = xpl_emit_u16(b, 4)
+  let b = xpl_emit_u32(b, 0)
+  let b = xpl_emit_u32(b, 0)
+  let b = xpl_emit_u32(b, 0)
+  let b = xpl_emit_u16(b, 240)
+  let b = xpl_emit_u16(b, 34)
+
+  # Optional Header (PE32+)
+  let b = xpl_emit_u16(b, 523)
+  let b = xa_emit_bytes(b, [0, 0])
+  let b = xpl_emit_u32(b, text_size)
+  let b = xpl_emit_u32(b, data_size + idata_size)
+  let b = xpl_emit_u32(b, bss_virtual_size)
+  let b = xpl_emit_u32(b, entry_rva)
+  let b = xpl_emit_u32(b, text_rva)
+  let b = xpl_emit_u64(b, image_base)
+  let b = xpl_emit_u32(b, section_align)
+  let b = xpl_emit_u32(b, file_align)
+  let b = xpl_emit_u16(b, 6)
+  let b = xpl_emit_u16(b, 0)
+  let b = xpl_emit_u16(b, 0)
+  let b = xpl_emit_u16(b, 0)
+  let b = xpl_emit_u16(b, 6)
+  let b = xpl_emit_u16(b, 0)
+  let b = xpl_emit_u32(b, 0)
+  let b = xpl_emit_u32(b, sizeof_image)
+  let b = xpl_emit_u32(b, headers_size)
+  let b = xpl_emit_u32(b, 0)
+  let b = xpl_emit_u16(b, 3)
+  let b = xpl_emit_u16(b, 256)
+  let b = xpl_emit_u64(b, 1048576)
+  let b = xpl_emit_u64(b, 4096)
+  let b = xpl_emit_u64(b, 1048576)
+  let b = xpl_emit_u64(b, 4096)
+  let b = xpl_emit_u32(b, 0)
+  let b = xpl_emit_u32(b, 16)
+
+  let dd = 0
+  while dd < 16 do
+    if dd == 1 then
+      let b = xpl_emit_u32(b, idata_rva)
+      let b = xpl_emit_u32(b, idata_datadir_size)
+    else
+      if dd == 12 then
+        let b = xpl_emit_u32(b, idata_rva + iat_region_start)
+        let b = xpl_emit_u32(b, iat_region_size)
+      else
+        let b = xpl_emit_u32(b, 0)
+        let b = xpl_emit_u32(b, 0)
+      end
+    end
+    let dd = dd + 1
+  end
+
+  let b = xpl_emit_section_header(b, ".text", text_raw, text_rva, text_size, text_file_offset, 1610612768)
+  let b = xpl_emit_section_header(b, ".data", data_raw, data_rva, data_size, data_file_offset, 3221225536)
+  let b = xpl_emit_section_header(b, ".bss", bss_virtual_size, bss_rva, 0, 0, 3221225600)
+  let b = xpl_emit_section_header(b, ".idata", idata_raw, idata_rva, idata_size, idata_file_offset, 3221225536)
+
+  return b
+end
+
+# One 40-byte IMAGE_SECTION_HEADER: an 8-byte name (NUL-padded, not
+# NUL-terminated if exactly 8 chars -- ".idata" fits with room to
+# spare so this is never actually exercised at the boundary here),
+# VirtualSize, VirtualAddress, SizeOfRawData, PointerToRawData, then
+# four zeroed fields (relocations/linenumbers, unused for an EXE),
+# and Characteristics.
+make a function called xpl_emit_section_header takes b, name, virtual_size, rva, raw_size, raw_ptr, characteristics returns out
+  let start = to_num(list_len(b))
+  let out = xa_emit_bytes(b, xpl_ascii_bytes(name))
+  let out = xpl_pad_to(out, start + 8)
+  let out = xpl_emit_u32(out, virtual_size)
+  let out = xpl_emit_u32(out, rva)
+  let out = xpl_emit_u32(out, raw_size)
+  let out = xpl_emit_u32(out, raw_ptr)
+  let out = xpl_emit_u32(out, 0)
+  let out = xpl_emit_u32(out, 0)
+  let out = xpl_emit_u16(out, 0)
+  let out = xpl_emit_u16(out, 0)
+  let out = xpl_emit_u32(out, characteristics)
+  return out
+end
