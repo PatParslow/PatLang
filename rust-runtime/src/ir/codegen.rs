@@ -616,6 +616,16 @@ impl Host {
         // "int" -- checked before the generic coercion, matching how the
         // interpreter's own host_type_of (ir/hosts.rs) never coerces at all).
         if name == "type_of" { return Ok(type_of_impl(args)); }
+        // "send" is exempted the same way: its "set" sub-case (host_call_oo
+        // via dispatch_fallback below) stores its value argument VERBATIM as
+        // an object/Dict field, read back later -- none of send's own argument
+        // positions (receiver id, method name, property name) are ever
+        // pattern-matched as a plain Value::Number the way list indices/counts
+        // are, so there is no index-coercion need to preserve here, only a
+        // storage-fidelity bug to avoid. Confirmed via direct repro: type_of(
+        // get(dict, key)) after send(dict,"set",key,5) returned "float"
+        // before this exemption, "int" after.
+        if name == "send" { return dispatch_fallback(name, args); }
         // Coerce into a small STACK-allocated buffer for the common case
         // (the overwhelming majority of host calls pass a handful of
         // args), avoiding a heap Vec allocation on every single host call
@@ -1390,13 +1400,21 @@ fn run_function<'p>(program: &'p Program, func: &'p Function, args: &[Value], ca
                     // above (FnPrecomputed::move_ok), a `let x = list_push(x,
                     // v)` reassignment loop now has a real, verified path to
                     // amortized-O(1) push instead of measured O(n^2) (8192
-                    // elems ~521ms, 32768 ~17.4s before this fix). Coerces
-                    // the pushed item the same way Host::call's shared
-                    // coercion step would, so list contents stay identical
-                    // to before this special-case existed.
+                    // elems ~521ms, 32768 ~17.4s before this fix). Does NOT
+                    // coerce the pushed item (fixed -- see host_coerce_arg's
+                    // own doc comment): host_coerce_arg exists so index/count-
+                    // style arguments a host chunk pattern-matches as plain
+                    // Value::Number still work, but the pushed ITEM is stored
+                    // verbatim and read back later -- coercing it here silently
+                    // downgraded a stored Int to a generic Number, which type_of
+                    // then reported as "float". Confirmed via a direct repro:
+                    // type_of(list_get(list_push([], 5), 0)) returned "float"
+                    // before this fix (both natively compiled and under wasm --
+                    // this whole file is shared runtime for both targets), "int"
+                    // after.
                     let mut it = args.into_iter();
                     let first = it.next().unwrap();
-                    let item = host_coerce_arg(&it.next().unwrap());
+                    let item = it.next().unwrap();
                     let result = match first {
                         Value::List(mut xs) => { Arc::make_mut(&mut xs).push(item); Value::List(xs) }
                         Value::Unit => Value::List(Arc::new(vec![item])),
@@ -1404,11 +1422,13 @@ fn run_function<'p>(program: &'p Program, func: &'p Function, args: &[Value], ca
                     };
                     stack.push(result);
                 } else if n == "list_set" && args.len() == 3 {
-                    // Same reasoning as list_push above.
+                    // Same reasoning as list_push above -- the INDEX genuinely
+                    // needs coercing (this chunk pattern-matches Value::Number
+                    // for it), the stored VALUE does not.
                     let mut it = args.into_iter();
                     let first = it.next().unwrap();
                     let idxv = host_coerce_arg(&it.next().unwrap());
-                    let value = host_coerce_arg(&it.next().unwrap());
+                    let value = it.next().unwrap();
                     let idx = match &idxv { Value::Number(v) => *v as usize, Value::String(s) => s.parse::<usize>().unwrap_or(usize::MAX), _ => usize::MAX };
                     let mut xs = match first { Value::List(xs) => xs, _ => return Err("list_set: expected list".into()) };
                     if idx >= xs.len() { return Err(format!("list_set: index {} out of range (len {})", idx, xs.len())); }
