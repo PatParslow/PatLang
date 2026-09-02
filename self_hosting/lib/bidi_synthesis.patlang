@@ -300,7 +300,118 @@ make a function called bidi_try_range takes examples, index, registry, max_size_
   return ["ERR"]
 end
 
+# ---- cond as a direct scan witness, not partition-and-recurse ----
+#
+# The original bidi_try_cond commits to a COMPLETE partition of the
+# examples upfront, then runs THREE full recursive syntheses (a, b,
+# test) before ever checking whether the combination holds together --
+# most of the 2^n-2 candidate partitions are wrong, but they don't fail
+# fast: they succeed locally on their own subset and waste a full
+# expensive sub-search before the outer verification catches it.
+# Measured directly on the real 8-example case: 55s average per
+# recursive sub-search, with no fast-fail path for a bad guess.
+#
+# This is the constraint-propagation alternative: `test`/`a`/`b` are
+# never separately synthesized at all -- they're read directly off the
+# SAME shared, already-being-built forward index every OTHER witness in
+# this file already scans (bidi_try_concat/arith/range), and checked
+# for per-example consistency using their ALREADY-CACHED behavior
+# (sbe_eval against each example's own bindings -- a plain value
+# lookup, not a new synthesis). A bad (test,a,b) triple is rejected in
+# O(examples) cheap comparisons, not after a full recursive solve. The
+# "local world state" is exactly this: per-example, what value has this
+# specific candidate ALREADY produced -- never a combinatorial subset
+# of facts (that's the STRIPS/GOAP shape issue #71 already ruled out
+# for this problem), just one cached value per example per candidate.
+#
+# Tried directly, not just reasoned about: the constraint-propagation
+# fix is real (validated on a small ambiguous case -- correct minimal
+# answer, ~700ms, matching Phase 3's own result). But wiring it into
+# bidi_witness_pass (tried every level, like concat/arith/range) made
+# the real first_exceeding case WORSE than the partition-based
+# bidi_try_cond, not better: this scan is a TRIPLE-nested loop over
+# (a,b,test) candidate pools -- cubic in pool size -- and this domain's
+# `any`-typed pools are already large (the same combinatorial driver
+# behind issue #73/#69). It genuinely exhausted the interpreter's 8GB
+# memory cap at size 8 alone on the 5-example case, where partition-
+# based cond finds the answer in ~29s total. Kept here as a documented,
+# available alternative (NOT wired into bidi_witness_pass's default
+# flow) -- a real, different tool for a domain with small-to-modest
+# per-level pools, not a strict improvement for one with large ones. A
+# genuinely better version would need value-INDEXED lookups for the
+# third argument (given test+a, look up the exact node matching the
+# remaining examples' required values directly, the same trick concat/
+# arith's witnesses already use) instead of a brute nested scan over
+# every candidate -- real further engineering, not attempted here.
+make a function called bidi_try_cond_scan takes examples, index, registry, max_size_so_far, target_type returns result
+  let sa = 1
+  while sa <= max_size_so_far do
+    let bucket_a = sbe_index_lookup(index, sa, target_type)
+    let ai = 0
+    let an = to_num(list_len(bucket_a))
+    while ai < an do
+      let node_a = bucket_a[ai][0]
+      let sb = 1
+      while sb <= max_size_so_far do
+        let bucket_b = sbe_index_lookup(index, sb, target_type)
+        let bi = 0
+        let bn = to_num(list_len(bucket_b))
+        while bi < bn do
+          let node_b = bucket_b[bi][0]
+          if node_a != node_b then
+            let st = 1
+            while st <= max_size_so_far do
+              let bucket_t = sbe_index_lookup(index, st, "bool")
+              let ti = 0
+              let tn = to_num(list_len(bucket_t))
+              while ti < tn do
+                let node_t = bucket_t[ti][0]
+                let ok = true
+                let i = 0
+                let n = to_num(list_len(examples))
+                while i < n do
+                  let ex = examples[i]
+                  let tv = sbe_eval(node_t, ex[0], registry)
+                  if tv[0] == false then
+                    let ok = false
+                  else
+                    let chosen = node_a
+                    if tv[1] == false then
+                      let chosen = node_b
+                    end
+                    let cv = sbe_eval(chosen, ex[0], registry)
+                    if (cv[0] == false) or (cv[1] != ex[1]) then
+                      let ok = false
+                    end
+                  end
+                  let i = i + 1
+                end
+                if ok then
+                  return ["OK", ["Call", "cond", [node_t, node_a, node_b]]]
+                end
+                let ti = ti + 1
+              end
+              let st = st + 1
+            end
+          end
+          let bi = bi + 1
+        end
+        let sb = sb + 1
+      end
+      let ai = ai + 1
+    end
+    let sa = sa + 1
+  end
+  return ["ERR"]
+end
+
 make a function called bidi_witness_pass takes examples, index, registry, max_size_so_far, target_type, primitive_names returns result
+  if bidi_list_contains(primitive_names, "cond") then
+    let cr = bidi_try_cond_combined(examples, index, registry, max_size_so_far, target_type)
+    if cr[0] == "OK" then
+      return cr
+    end
+  end
   if target_type == "string" then
     return bidi_try_concat(examples, index, registry, max_size_so_far)
   end
@@ -609,6 +720,95 @@ end
 # cannot, eliminate overfitting in principle (a genuinely small AST can
 # still fail to generalize; the existing "add a disambiguating example"
 # remedy applies here exactly as it does everywhere else in this file).
+# ---- cond: partition enumeration + shared-index scan, combined ----
+#
+# Keeps the partition-based approach's cheap structure (enumerate
+# candidate splits, bound to 2^n-2 rather than a full cross product) but
+# replaces its costliest step -- a full RECURSIVE re-synthesis of a, b,
+# and test from scratch per partition -- with a single-pass scan of the
+# SAME shared, already-growing forward index every other witness in
+# this file reads from, checking per-example consistency against
+# already-cached candidate values (the scan-based witness's real
+# insight) instead of spawning new searches. Per partition this is
+# O(pool size) for each of a/b/test, not the O(pool size^3) triple-
+# nested cross product a bare scan needs when it isn't first narrowed
+# by a partition -- the combination is what makes both halves cheap
+# where each was expensive alone.
+make a function called bidi_scan_for_subset_match takes index, ty, sub_examples, max_size_so_far, registry returns node
+  let s = 1
+  while s <= max_size_so_far do
+    let bucket = sbe_index_lookup(index, s, ty)
+    let i = 0
+    let n = to_num(list_len(bucket))
+    while i < n do
+      let candidate = bucket[i][0]
+      let ok = true
+      let j = 0
+      let jn = to_num(list_len(sub_examples))
+      while j < jn do
+        let ex = sub_examples[j]
+        let v = sbe_eval(candidate, ex[0], registry)
+        if (v[0] == false) or (v[1] != ex[1]) then
+          let ok = false
+        end
+        let j = j + 1
+      end
+      if ok then
+        return candidate
+      end
+      let i = i + 1
+    end
+    let s = s + 1
+  end
+  return false
+end
+
+make a function called bidi_try_cond_combined takes examples, index, registry, max_size_so_far, target_type returns result
+  let n = to_num(list_len(examples))
+  if n < 2 then
+    return ["ERR"]
+  end
+  let partitions = bidi_all_partitions(n)
+  let best_size = -1
+  let best_candidate = false
+  let alt_count = 0
+  let pi = 0
+  let pn = to_num(list_len(partitions))
+  while pi < pn do
+    let partition = partitions[pi]
+    let sub_true = bidi_subset_examples(examples, partition, true)
+    let sub_false = bidi_subset_examples(examples, partition, false)
+    let node_a = bidi_scan_for_subset_match(index, target_type, sub_true, max_size_so_far, registry)
+    if node_a then
+      let node_b = bidi_scan_for_subset_match(index, target_type, sub_false, max_size_so_far, registry)
+      if node_b then
+        let bool_examples = bidi_bool_examples(examples, partition)
+        let node_t = bidi_scan_for_subset_match(index, "bool", bool_examples, max_size_so_far, registry)
+        if node_t then
+          let candidate = ["Call", "cond", [node_t, node_a, node_b]]
+          if sbe_matches_all(candidate, examples, registry) then
+            let actual_size = sbe_size(candidate)
+            if (best_size < 0) or (actual_size < best_size) then
+              let best_size = actual_size
+              let best_candidate = candidate
+              let alt_count = 0
+            else
+              if actual_size == best_size then
+                let alt_count = alt_count + 1
+              end
+            end
+          end
+        end
+      end
+    end
+    let pi = pi + 1
+  end
+  if best_candidate then
+    return ["OK", best_candidate, alt_count, best_size]
+  end
+  return ["ERR"]
+end
+
 make a function called bidi_try_cond takes examples, input_names, extra_consts, registry, primitive_names, max_size, depth returns result
   let n = to_num(list_len(examples))
   if (n < 2) or (depth > 2) then
@@ -784,16 +984,10 @@ make a function called bidi_synthesize_from_examples_impl takes examples, input_
   let wr = bidi_witness_pass(examples, index, registry, 1, target_type, primitive_names)
   if wr[0] == "OK" then
     if sbe_matches_all(wr[1], examples, registry) then
-      return ["OK", wr[1], notes]
-    end
-  end
-  if bidi_list_contains(primitive_names, "cond") then
-    let cr = bidi_try_cond(examples, input_names, extra_consts, registry, primitive_names, max_size, depth + 1)
-    if cr[0] == "OK" then
-      if cr[2] > 0 then
-        let notes = list_push(notes, sbe_ambiguity_note(cr[2], cr[3]))
+      if (to_num(list_len(wr)) > 2) and (wr[2] > 0) then
+        let notes = list_push(notes, sbe_ambiguity_note(wr[2], wr[3]))
       end
-      return ["OK", cr[1], notes]
+      return ["OK", wr[1], notes]
     end
   end
 
@@ -881,6 +1075,9 @@ make a function called bidi_synthesize_from_examples_impl takes examples, input_
     let wr2 = bidi_witness_pass(examples, index, registry, size, target_type, primitive_names)
     if wr2[0] == "OK" then
       if sbe_matches_all(wr2[1], examples, registry) then
+        if (to_num(list_len(wr2)) > 2) and (wr2[2] > 0) then
+          let notes = list_push(notes, sbe_ambiguity_note(wr2[2], wr2[3]))
+        end
         return ["OK", wr2[1], notes]
       end
     end
