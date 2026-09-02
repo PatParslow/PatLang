@@ -1305,8 +1305,25 @@ fn run_function<'p>(program: &'p Program, func: &'p Function, args: &[Value], ca
                     if !program.functions.contains_key(&fname) {
                         return Err(format!("parallel_map: function '{}' not found", fname));
                     }
+                    // An ordinary (non-atomics) wasm32 target has no real
+                    // OS threads to spawn -- fall back to running each item
+                    // sequentially rather than erroring outright. Same
+                    // results, same order, just no parallelism; callers
+                    // (e.g. self_hosting/lib/synthesis_by_example.patlang's
+                    // sbe_evaluate_candidates) already have their own
+                    // sequential path for small inputs, but route through
+                    // parallel_map unconditionally once candidate counts
+                    // cross a threshold, which used to hard-fail every such
+                    // search under this target.
                     #[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
-                    { return Err("parallel_map is not supported when compiled to an ordinary (non-threaded) wasm32 target".into()); }
+                    {
+                        let cache = PrecomputeCache::default();
+                        let results: Result<Vec<Value>, String> = items.iter().map(|item| {
+                            let callee = program.functions.get(&fname).unwrap();
+                            run_function(program, callee, std::slice::from_ref(item), &cache)
+                        }).collect();
+                        stack.push(Value::List(Arc::new(results?)));
+                    }
                     #[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
                     {
                         let results: Result<Vec<Value>, String> = std::thread::scope(|scope| {
