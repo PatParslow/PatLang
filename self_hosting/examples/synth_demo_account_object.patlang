@@ -1,0 +1,114 @@
+# Object-based domain, following the same boundary every demo in this
+# suite already draws: the PURE logic is derived from Given/Then
+# examples (never hand-written), and the STATEFUL object wrapper around
+# it (real PatLang class/new/send, not a bespoke Dict) is the only
+# hand-authored code -- exactly the same shape as synth_demo_search_
+# replace.patlang's file-I/O wrapper around its own derived AST.
+#
+#   apply_deposit(balance, amount) = balance + amount            -- add witness, trivial
+#   apply_withdraw(balance, amount) = amount > balance
+#                                      ? balance                  -- insufficient funds: unchanged
+#                                      : balance - amount         -- otherwise: subtract
+#
+# withdraw is the actual point of this demo: it needs a genuine
+# conditional (clamp-if-insufficient vs subtract), the first test of
+# the combined partition+scan cond witness (self_hosting/lib/bidi_
+# synthesis.patlang) on a domain that has nothing to do with
+# first_exceeding. Two account balances are used (100 and 50) for the
+# same reason every other conditional demo in this codebase uses more
+# than one input scenario: a single balance lets `cond`'s branches
+# collapse onto coincidental constants instead of the real relation.
+
+include "../lib/bidi_synthesis.patlang"
+include "../lib/test.patlang"
+
+t_init()
+
+make a function called account_examples takes pairs returns examples
+  let out = []
+  let i = 0
+  let n = to_num(list_len(pairs))
+  while i < n do
+    let p = pairs[i]
+    let b = new("Dict", "acct_ex_" + pr_next_id())
+    send(b, "set", "balance", p[0])
+    send(b, "set", "amount", p[1])
+    let out = list_push(out, [b, p[2]])
+    let i = i + 1
+  end
+  return out
+end
+
+class Account {
+  field balance = 0
+
+  make a function called deposit takes self, amount returns done
+    let b = new("Dict", "acct_call_" + pr_next_id())
+    send(b, "set", "balance", get(self, "balance"))
+    send(b, "set", "amount", amount)
+    let ast = get("__vars", "account_deposit_ast")
+    let registry = get("__vars", "account_registry")
+    let result = sbe_eval(ast, b, registry)
+    send(self, "set", "balance", result[1])
+    return true
+  end
+
+  make a function called withdraw takes self, amount returns done
+    let b = new("Dict", "acct_call_" + pr_next_id())
+    send(b, "set", "balance", get(self, "balance"))
+    send(b, "set", "amount", amount)
+    let ast = get("__vars", "account_withdraw_ast")
+    let registry = get("__vars", "account_registry")
+    let result = sbe_eval(ast, b, registry)
+    send(self, "set", "balance", result[1])
+    return true
+  end
+}
+
+make a function called run_synth_demo_account_object returns ok
+  let registry = pr_standard_registry()
+
+  let deposit_examples = account_examples([[100, 50, 150], [0, 20, 20], [30, 30, 60]])
+  let deposit_result = bidi_synthesize_from_examples(deposit_examples, ["balance", "amount"], [], registry, ["add"], 6)
+  check("deposit logic derives (add witness)", deposit_result[0], "OK")
+  set_var("account_deposit_ast", deposit_result[1])
+
+  let withdraw_examples = account_examples([
+    [100, 30, 70],
+    [100, 100, 0],
+    [100, 150, 100],
+    [50, 20, 30],
+    [50, 60, 50]
+  ])
+  let withdraw_result = bidi_synthesize_from_examples(withdraw_examples, ["balance", "amount"], [], registry, ["cond", "gt", "sub"], 12)
+  check("withdraw logic derives (cond witness -- clamp on insufficient funds)", withdraw_result[0], "OK")
+  set_var("account_withdraw_ast", withdraw_result[1])
+  set_var("account_registry", registry)
+
+  print("derived withdraw AST: " + withdraw_result[1])
+
+  # ---- real end-to-end object behaviour, via the derived logic alone ----
+  let acc = new("Account", "acc1")
+  send(acc, "set", "balance", 100)
+  send(acc, "deposit", 50)
+  check("deposit(50) on balance 100 -> 150", get(acc, "balance"), 150)
+
+  send(acc, "withdraw", 70)
+  check("withdraw(70) on balance 150 -> 80", get(acc, "balance"), 80)
+
+  send(acc, "withdraw", 500)
+  check("withdraw(500) on balance 80, insufficient funds -> unchanged (80)", get(acc, "balance"), 80)
+
+  # A second, independent account proves the logic is genuinely reused
+  # per-instance, not accidentally shared/global state.
+  let acc2 = new("Account", "acc2")
+  send(acc2, "set", "balance", 10)
+  send(acc2, "withdraw", 5)
+  check("a second, independent Account instance: withdraw(5) on balance 10 -> 5", get(acc2, "balance"), 5)
+  check("first account's own balance is untouched by the second instance's call", get(acc, "balance"), 80)
+
+  t_report()
+  return get("__vars", "t_fail") == 0
+end
+
+run_synth_demo_account_object()
