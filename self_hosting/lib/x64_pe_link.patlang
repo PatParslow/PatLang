@@ -15,6 +15,14 @@ include "x64_asm.patlang"
 # bootstrap/hello_bootstrap.asm, which ends every path via `call
 # ExitProcess`, never `ret`).
 
+make a function called xpl_section_span takes raw_size, section_align returns span
+  let floored = raw_size
+  if floored < 1 then
+    let floored = 1
+  end
+  return xpl_round_up(floored, section_align)
+end
+
 make a function called xpl_round_up takes v, boundary returns r
   let rem = v % boundary
   if rem == 0 then
@@ -162,16 +170,26 @@ make a function called x64_link takes chunks, import_spec, entry_symbol, out_pat
   let thunk_area_size = to_num(list_len(thunk_names)) * 6
 
   # ---- Section RVA layout ----
+  #
+  # Every section this linker declares is unconditional (always exactly
+  # 4: .text/.data/.bss/.idata), so each one must reserve at least one
+  # full page of RVA space even when its real content is empty (e.g. a
+  # pure-arithmetic test program with no globals at all has zero .data
+  # and zero .bss) -- xpl_round_up(0, section_align) is 0, which would
+  # make the NEXT section start at the exact same RVA as this one,
+  # producing overlapping sections. objdump tolerates reading a file
+  # like that; the real Windows loader does not ("Exec format error"),
+  # confirmed directly. xpl_section_span floors at one page.
   let headers_size = xpl_round_up(1024, file_align)
   let text_rva = section_align
   let text_size_raw = thunk_area_size + to_num(list_len(merged_text))
   let text_size = xpl_round_up(text_size_raw, file_align)
-  let data_rva = xpl_round_up(text_rva + text_size_raw, section_align)
+  let data_rva = text_rva + xpl_section_span(text_size_raw, section_align)
   let data_size_raw = to_num(list_len(merged_data))
   let data_size = xpl_round_up(data_size_raw, file_align)
-  let bss_rva = xpl_round_up(data_rva + data_size_raw, section_align)
+  let bss_rva = data_rva + xpl_section_span(data_size_raw, section_align)
   let bss_size_raw = merged_bss
-  let idata_rva = xpl_round_up(bss_rva + bss_size_raw, section_align)
+  let idata_rva = bss_rva + xpl_section_span(bss_size_raw, section_align)
 
   # ---- Build .idata content: Import Directory Table, then per-DLL
   # ILT, IAT, Hint/Name entries, then DLL name strings -- offsets
@@ -496,10 +514,36 @@ make a function called xpl_build_headers takes headers_size, image_base, section
     let dd = dd + 1
   end
 
-  let b = xpl_emit_section_header(b, ".text", text_raw, text_rva, text_size, text_file_offset, 1610612768)
-  let b = xpl_emit_section_header(b, ".data", data_raw, data_rva, data_size, data_file_offset, 3221225536)
-  let b = xpl_emit_section_header(b, ".bss", bss_virtual_size, bss_rva, 0, 0, 3221225600)
-  let b = xpl_emit_section_header(b, ".idata", idata_raw, idata_rva, idata_size, idata_file_offset, 3221225536)
+  let text_virtual_size = text_raw
+  if text_virtual_size < section_align then
+    let text_virtual_size = section_align
+  end
+  let b = xpl_emit_section_header(b, ".text", text_virtual_size, text_rva, text_size, text_file_offset, 1610612768)
+  # A section header's VirtualSize of exactly 0 is rejected by the real
+  # Windows loader even though objdump tolerates it when just reading
+  # the file -- confirmed directly: a program with no .data/.bss
+  # content (e.g. a pure-arithmetic test with no globals) produced a
+  # file objdump parsed fine but Windows refused to run ("Exec format
+  # error"). Every section this linker ever declares is unconditional
+  # (always exactly 4), so floor VirtualSize at one page whenever the
+  # real content is smaller than that, rather than only emitting a
+  # section header when there's real content -- simpler than making
+  # NumberOfSections and the RVA layout conditional.
+  let data_virtual_size = data_raw
+  if data_virtual_size < section_align then
+    let data_virtual_size = section_align
+  end
+  let bss_virtual_size_hdr = bss_virtual_size
+  if bss_virtual_size_hdr < section_align then
+    let bss_virtual_size_hdr = section_align
+  end
+  let b = xpl_emit_section_header(b, ".data", data_virtual_size, data_rva, data_size, data_file_offset, 3221225536)
+  let b = xpl_emit_section_header(b, ".bss", bss_virtual_size_hdr, bss_rva, 0, 0, 3221225600)
+  let idata_virtual_size = idata_raw
+  if idata_virtual_size < section_align then
+    let idata_virtual_size = section_align
+  end
+  let b = xpl_emit_section_header(b, ".idata", idata_virtual_size, idata_rva, idata_size, idata_file_offset, 3221225536)
 
   return b
 end

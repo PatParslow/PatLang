@@ -229,10 +229,10 @@ make a function called xa_parse_mem_inner takes inner returns operand
   if plus_idx < 0 then
     return [inner, 0]
   end
-  let base = substr(inner, 0, plus_idx)
-  let disp_text = substr(inner, plus_idx, inner.length - plus_idx)
+  let base = str_trim(substr(inner, 0, plus_idx))
+  let disp_text = str_trim(substr(inner, plus_idx, inner.length - plus_idx))
   if char_code(disp_text, 0) == 43 then
-    let disp_text = substr(disp_text, 1, disp_text.length - 1)
+    let disp_text = str_trim(substr(disp_text, 1, disp_text.length - 1))
   end
   return [base, xa_parse_int(disp_text)]
 end
@@ -392,6 +392,19 @@ make a function called xa_enc_mov takes dst, src returns result
     let mm = xa_encode_modrm(src, dst[1])
     return [xa_emit_bytes([rex, 139], mm[0]), xa_shift_reloc(mm[1], 2)]
   end
+  if src[0] == "imm" then
+    # mov r/m64, imm32 (sign-extended)  (C7 /0 id) -- dst is "mem"/"relmem".
+    # A RIP-relative disp32 here is followed by a 4-byte immediate --
+    # RIP-relative addressing always means "relative to the address of
+    # the NEXT instruction", which is 4 bytes further away than usual
+    # once a trailing immediate is present. xa_reloc_rip_trail folds
+    # that adjustment into the reloc's own addend rather than teaching
+    # the generic RIP32 patch formula (x64_pe_link.patlang) about
+    # per-instruction trailing-byte counts.
+    let rex = xa_rex(true, false, false, xa_needs_rex_b_for_rm(dst))
+    let mm = xa_encode_modrm(dst, 0)
+    return [xa_emit_bytes(xa_emit_bytes([rex, 199], mm[0]), xa_int_to_bytes_le(src[1], 4)), xa_reloc_rip_trail(xa_shift_reloc(mm[1], 2), 4)]
+  end
   # mov r/m, reg  (89 /r) -- dst is "mem"/"relmem"
   let rex = xa_rex(true, xa_needs_rex_b(src[1]), false, xa_needs_rex_b_for_rm(dst))
   let mm = xa_encode_modrm(dst, src[1])
@@ -408,6 +421,23 @@ make a function called xa_shift_reloc takes reloc, extra returns out
     return false
   end
   return [reloc[0] + extra, reloc[1], reloc[2], reloc[3]]
+end
+
+# See the comment at xa_enc_mov's "mov [mem], imm" case: a RIP32 reloc
+# followed by a trailing immediate needs its addend reduced by however
+# many bytes of immediate follow the disp32, since "relative to the
+# next instruction" moves further away once there's more instruction
+# left after the displacement field. A no-op for anything else
+# (REL32 call/jmp targets in this codebase are never followed by a
+# trailing immediate).
+make a function called xa_reloc_rip_trail takes reloc, trailing_bytes returns out
+  if reloc == false then
+    return false
+  end
+  if reloc[1] != "RIP32" then
+    return reloc
+  end
+  return [reloc[0], reloc[1], reloc[2], reloc[3] - trailing_bytes]
 end
 
 make a function called xa_needs_rex_b_for_rm takes operand returns yes
@@ -458,10 +488,10 @@ make a function called xa_enc_alu takes name, dst, src returns result
     let rex = xa_rex(true, false, false, xa_needs_rex_b_for_rm(dst))
     if (v >= -128) and (v <= 127) then
       let mm = xa_encode_modrm(dst, ext)
-      return [xa_emit_bytes(xa_emit_bytes([rex, 131], mm[0]), xa_int_to_bytes_le(v, 1)), xa_shift_reloc(mm[1], 2)]
+      return [xa_emit_bytes(xa_emit_bytes([rex, 131], mm[0]), xa_int_to_bytes_le(v, 1)), xa_reloc_rip_trail(xa_shift_reloc(mm[1], 2), 1)]
     end
     let mm = xa_encode_modrm(dst, ext)
-    return [xa_emit_bytes(xa_emit_bytes([rex, 129], mm[0]), xa_int_to_bytes_le(v, 4)), xa_shift_reloc(mm[1], 2)]
+    return [xa_emit_bytes(xa_emit_bytes([rex, 129], mm[0]), xa_int_to_bytes_le(v, 4)), xa_reloc_rip_trail(xa_shift_reloc(mm[1], 2), 4)]
   end
   # reg/reg or reg/mem: `op dst, src` -> encode as opcode /r with
   # dst as the r/m operand and src's register number as the reg field
@@ -500,7 +530,7 @@ end
 make a function called xa_enc_shift_imm takes ext, dst, amount returns result
   let rex = xa_rex(true, false, false, xa_needs_rex_b_for_rm(dst))
   let mm = xa_encode_modrm(dst, ext)
-  return [xa_emit_bytes(xa_emit_bytes([rex, 193], mm[0]), [amount band 255]), xa_shift_reloc(mm[1], 2)]
+  return [xa_emit_bytes(xa_emit_bytes([rex, 193], mm[0]), [amount band 255]), xa_reloc_rip_trail(xa_shift_reloc(mm[1], 2), 1)]
 end
 
 make a function called xa_shift_ext takes name returns ext
@@ -557,9 +587,20 @@ make a function called xa_enc_setcc takes name returns result
   return [[15, op, 192], false]
 end
 
+# Source-operand size for movzx: a "reg" operand carries its size at
+# index 2 (["reg", num, size, is_xmm]); a "mem"/"relmem" operand's
+# index 2 is its displacement, NOT a size -- the explicit byte/word
+# size prefix is carried separately, at index 3.
+make a function called xa_operand_size takes op returns size
+  if op[0] == "reg" then
+    return op[2]
+  end
+  return op[3]
+end
+
 make a function called xa_enc_movzx takes dst, src returns result
   let opcode = 182
-  if src[2] == 16 then
+  if xa_operand_size(src) == 16 then
     let opcode = 183
   end
   let rex = xa_rex(dst[2] == 64, xa_needs_rex_b(dst[1]), false, xa_needs_rex_b_for_rm(src))
