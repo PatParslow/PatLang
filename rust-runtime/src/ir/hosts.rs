@@ -648,6 +648,32 @@ fn ensure_obj(name: &str, class: &str) {
     obj_set(name, "name", Value::String((name.to_string()).into()));
 }
 
+// Raised directly by watching an 80+ minute self_hosting/lib/bidi_
+// synthesis.patlang run with nothing to go on but raw process memory
+// and a `size=N` print that resets every recursive sub-search --
+// there was no way to ask "how far through the real unit of work
+// (partitions attempted, current best size) are you?" without
+// disturbing the running process. A real cross-platform OS signal is
+// more fragile than it sounds here (Windows console-control events are
+// notoriously unreliable to deliver cross-process, and need matching
+// process-group flags at spawn time); a local-only TCP status port
+// (see PROGRESS_STATUS/spawn_progress_server in main.rs) gives the
+// same on-demand, push-free query without that fragility or any file
+// I/O overhead on the hot path. `progress_report(text)` is the
+// PatLang-side half: a search reports whatever free-form status text
+// it wants (partitions done/total, current best size, current level),
+// and a query against the status port always returns the LATEST call,
+// with no history retained -- deliberately minimal, additive, and
+// zero-cost for any program that never calls it.
+pub static PROGRESS_STATUS: std::sync::OnceLock<std::sync::Mutex<String>> = std::sync::OnceLock::new();
+
+pub fn host_progress_report(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 { return Err("progress_report: expected 1 arg (status text)".into()); }
+    let text = to_s(&args[0]);
+    *PROGRESS_STATUS.get_or_init(|| std::sync::Mutex::new(String::new())).lock().unwrap() = text;
+    Ok(Value::Unit)
+}
+
 // Purely additive: no existing caller needs this (every prior `new(...)`
 // object was either long-lived by design or cheap/few in number), so
 // nothing already written is affected by it existing. Added for a real,
@@ -3333,6 +3359,7 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("action_add", host_action_add);
     interp.host.insert("action_clear", host_action_clear);
     interp.host.insert("object_delete", host_object_delete);
+    interp.host.insert("progress_report", host_progress_report);
     interp.host.insert("plan", host_plan);
     interp.host.insert("plan_incremental", host_plan_incremental);
     interp.host.insert("fluent_set", host_fluent_set);

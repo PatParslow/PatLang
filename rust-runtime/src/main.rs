@@ -82,8 +82,41 @@ fn spawn_memory_watchdog() {
     });
 }
 
+// Local-only, on-demand progress query: a PatLang program calls
+// progress_report(text) (self_hosting/lib/hosts.rs's own comment has
+// the full motivation) to set the LATEST status string; connecting to
+// this port and reading one line returns it, with no history kept.
+// 127.0.0.1 only -- never exposed beyond the local machine. Silently
+// does nothing (no progress query available, not a crash) if the port
+// is already taken, e.g. by another concurrently-running instance;
+// PATLANG_PROGRESS_PORT overrides the default for exactly that case.
+fn spawn_progress_server() {
+    use std::io::Write;
+    let port: u16 = env::var("PATLANG_PROGRESS_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(47701);
+    let listener = match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(l) => l,
+        Err(_) => return,
+    };
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            if let Ok(mut s) = stream {
+                let text = patlang_runtime::ir::hosts::PROGRESS_STATUS
+                    .get_or_init(|| std::sync::Mutex::new(String::new()))
+                    .lock()
+                    .unwrap()
+                    .clone();
+                let _ = s.write_all(format!("{text}\n").as_bytes());
+            }
+        }
+    });
+}
+
 fn main() {
     spawn_memory_watchdog();
+    spawn_progress_server();
     // Run on a spawned thread with a much larger stack than the OS-default
     // main thread stack: deeply recursive-descent PatLang programs
     // interpreted via `--ir-run` (notably the self-hosted compiler's own
