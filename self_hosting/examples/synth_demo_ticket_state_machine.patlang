@@ -1,0 +1,165 @@
+# State machine domain -- the next complexity tier above synth_demo_
+# account_events.patlang: rather than one conditional guarding a single
+# decision, the transition function needs NESTED conditionals (guard on
+# current state, then guard on action WITHIN that state), and the
+# object wraps a genuinely small state machine (3 states, 2 actions)
+# instead of a single numeric field.
+#
+# States are small integers (0=pending, 1=active, 2=done) rather than
+# strings deliberately -- the interesting part of this demo is the
+# NESTED-conditional transition logic itself (a real test of the
+# combined partition+scan cond witness at 2 levels of nesting, not
+# attempted in any earlier demo in this suite), not string-keyed
+# decision tables (self_hosting/lib/synthesis_by_example.patlang's
+# synthesize_lookup_from_examples already covers that shape). Actions:
+# 0=start, 1=finish.
+#
+#   next_state(state, action) =
+#     state == 2 ? 2                                -- done is terminal
+#     : state == 0 ? (action == 0 ? 1 : 0)           -- pending: start->active, else stays
+#     : (action == 1 ? 2 : 1)                        -- active: finish->done, else stays
+#
+# The 3x2 transition table is given EXHAUSTIVELY (6 examples covering
+# every (state,action) pair) rather than leaving gaps to force
+# generalization -- deliberately different from first_exceeding's own
+# examples, and the more common real shape for a genuinely small,
+# finite state machine's own spec: enumerate the whole table, don't
+# leave corners undefined.
+
+include "../lib/bidi_synthesis.patlang"
+include "../lib/test.patlang"
+
+t_init()
+
+make a function called ticket_state_name takes n returns name
+  if n == 0 then
+    return "pending"
+  end
+  if n == 1 then
+    return "active"
+  end
+  return "done"
+end
+
+make a function called ticket_examples takes triples returns examples
+  let out = []
+  let i = 0
+  let n = to_num(list_len(triples))
+  while i < n do
+    let t = triples[i]
+    let b = new("Dict", "tsm_ex_" + pr_next_id())
+    send(b, "set", "state", t[0])
+    send(b, "set", "action", t[1])
+    let out = list_push(out, [b, t[2]])
+    let i = i + 1
+  end
+  return out
+end
+
+class Ticket {
+  field state = 0
+
+  make a function called apply takes self, action returns done
+    let b = new("Dict", "tsm_call_" + pr_next_id())
+    send(b, "set", "state", get(self, "state"))
+    send(b, "set", "action", action)
+    let ast = get("__vars", "ticket_transition_ast")
+    let registry = get("__vars", "ticket_registry")
+    let result = sbe_eval(ast, b, registry)
+    send(self, "set", "state", result[1])
+    return true
+  end
+}
+
+make a function called run_synth_demo_ticket_state_machine returns ok
+  let registry = pr_standard_registry()
+
+  # exhaustive 3x2 transition table: (state, action) -> next_state
+  let transition_examples = ticket_examples([
+    [0, 0, 1],
+    [0, 1, 0],
+    [1, 0, 1],
+    [1, 1, 2],
+    [2, 0, 2],
+    [2, 1, 2]
+  ])
+  let transition_result = bidi_synthesize_from_examples(transition_examples, ["state", "action"], [], registry, ["cond", "eq_int"], 16)
+  check("transition logic derives (nested cond witness, 2 levels)", transition_result[0], "OK")
+  set_var("ticket_transition_ast", transition_result[1])
+  set_var("ticket_registry", registry)
+
+  print("derived transition AST: " + transition_result[1])
+  # Genuinely found, not hand-picked: cond(eq_int(state,action),
+  # cond(eq_int(state,0),1,2), state) -- comparing state==action looks
+  # semantically bizarre next to the intended "state==2 is terminal"
+  # reading, but it's still completely correct: with only 3 states x 2
+  # actions = 6 possible inputs, ALL given as training examples, there
+  # is no held-out input left to distinguish a "coincidental" formula
+  # from "the" formula -- any expression matching all 6 given pairs IS
+  # the complete, correct specification for every input this system
+  # could ever see. A genuinely different lesson from first_exceeding's
+  # own overfitting story: overfitting isn't a coherent risk once a
+  # domain is this small and exhaustively enumerated, it just means the
+  # search is free to land on whichever correct closed form it finds
+  # first, not necessarily the human-intuitive one.
+
+  # ---- real end-to-end state machine behaviour, via the derived logic alone ----
+  let t = new("Ticket", "t1")
+  check("starts pending", ticket_state_name(get(t, "state")), "pending")
+
+  send(t, "apply", 1)
+  check("pending + finish (invalid action) -> still pending", ticket_state_name(get(t, "state")), "pending")
+
+  send(t, "apply", 0)
+  check("pending + start -> active", ticket_state_name(get(t, "state")), "active")
+
+  send(t, "apply", 0)
+  check("active + start (invalid action) -> still active", ticket_state_name(get(t, "state")), "active")
+
+  send(t, "apply", 1)
+  check("active + finish -> done", ticket_state_name(get(t, "state")), "done")
+
+  send(t, "apply", 0)
+  check("done is terminal: + start -> still done", ticket_state_name(get(t, "state")), "done")
+  send(t, "apply", 1)
+  check("done is terminal: + finish -> still done", ticket_state_name(get(t, "state")), "done")
+
+  # A second, independent Ticket proves the transition logic is
+  # correctly reused per-instance, same discipline as the earlier
+  # object demo's second-account check.
+  let t2 = new("Ticket", "t2")
+  send(t2, "apply", 0)
+  check("a second, independent Ticket: pending + start -> active", ticket_state_name(get(t2, "state")), "active")
+  check("first ticket's own state is untouched by the second instance", ticket_state_name(get(t, "state")), "done")
+
+  t_report()
+  return get("__vars", "t_fail") == 0
+end
+
+run_synth_demo_ticket_state_machine()
+
+# ---- PLANNED, not built: multi-hop event cascades ----
+#
+# Next tier after this one: a chain where one handler's OWN emitted
+# event triggers a second, independent handler, which in turn emits a
+# third event -- testing whether synthesized decisions compose across
+# multiple hops, not just within one method (synth_demo_account_events.
+# patlang's own composition was two derived pieces inside ONE handler;
+# this would be the derived pieces spanning SEPARATE handlers instead).
+#
+# Concrete shape planned: extend the Ticket state machine above so that
+# reaching "done" (a state the transition function ALREADY derives)
+# emits "ticket_completed"; a separate, independent handler listens for
+# that and decides (via its OWN small derived predicate, e.g. "was this
+# ticket high-priority") whether to emit a further "notify_customer"
+# event; a third, terminal handler just logs it. Real things to verify
+# that a single-hop demo can't: (1) the cascade actually reaches the
+# terminal handler (not just the first hop), (2) it does NOT fire
+# further hops when an earlier decision says no (e.g. a non-priority
+# ticket's completion should stop at hop one), (3) no infinite loop
+# forms if a later handler's own logic could, even accidentally, re-
+# trigger an earlier event in the chain -- worth a deliberate check,
+# not just an assumption, given `when`/`emit` here has no built-in
+# cycle guard. Would reuse this file's own Ticket/transition AST
+# rather than a fresh domain, since the state-reaches-"done" trigger is
+# already naturally in place.
