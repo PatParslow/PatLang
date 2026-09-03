@@ -51,9 +51,36 @@ end
 # Encodes v as `n` little-endian bytes, two's-complement for negatives.
 # Safe for n<=4 (fits well within PatLang's native int range even after
 # the 2^(8n) bias below); n=8 (imm64) is only ever used in this codebase
-# for positive tagged-pointer style constants, so no 2^64 bias is
-# attempted -- a genuinely negative 64-bit immediate is out of scope.
+# for positive tagged-pointer style constants OR small negative tagged
+# constants that fit a plain machine Int -- a genuinely negative 64-bit
+# BigInt immediate is out of scope, matching the assumption below.
+#
+# BigInt branch: a real 64-bit immediate with the top bit set (e.g. a
+# pointer-tag mask like 0xF000000000000000 = 17293822569102704640,
+# found in x64_runtime.patlang's own rt_int_to_string) exceeds i64::MAX
+# and gets auto-promoted to BigInt by `to_num` -- the numeric tower's
+# bitwise ops (band/bor/bxor/shl/shr) only accept a plain machine Int
+# (rust-runtime/src/ir/ops.rs's `as_int`), so `uv band 255` on a BigInt
+# fails outright ("band: expected an integer"), confirmed directly.
+# `%`/`/` both work uniformly across Int and BigInt, so this branch
+# uses those instead -- but ONLY for BigInt, not unconditionally: `%`/
+# `/` are not guaranteed to match `band`/`shr`'s two's-complement
+# result for a NEGATIVE machine Int (band(-1,255)==255 via native
+# bitwise semantics; -1 % 256 is not guaranteed to also be 255), so the
+# plain-Int path below is left exactly as it was to avoid silently
+# breaking the negative-immediate case that already worked correctly.
 make a function called xa_int_to_bytes_le takes v, n returns bytes
+  if type_of(v) == "bigint" then
+    let uv = v
+    let out = []
+    let i = 0
+    while i < n do
+      let out = list_push(out, to_num(uv % 256))
+      let uv = to_num(uv / 256)
+      let i = i + 1
+    end
+    return out
+  end
   let uv = v
   if uv < 0 then
     let bits = n * 8
@@ -88,6 +115,25 @@ end
 
 make a function called xa_emit_i64 takes lst, v returns out
   return xa_emit_bytes(lst, xa_int_to_bytes_le(v, 8))
+end
+
+make a function called xa_emit_i16 takes lst, v returns out
+  return xa_emit_bytes(lst, xa_int_to_bytes_le(v, 2))
+end
+
+# One comma-separated item from a `db`/`dw` data directive: either a
+# plain integer literal ("104") or a single-character NASM literal
+# ('P') -- codegen_x64.patlang's `dw` UTF-16-ish string literals
+# (g_win_class_name/g_win_title, x64_win32_window.patlang's own window-
+# title data) are the only real user of the quoted-char form; db never
+# emits it (always pre-converted to numeric byte codes), but this
+# helper is used by both so a future db-with-char-literals emission
+# doesn't need its own copy of this parsing.
+make a function called xa_parse_data_item takes item returns v
+  if (item.length == 3) and (char_code(item, 0) == 39) and (char_code(item, 2) == 39) then
+    return char_code(item, 1)
+  end
+  return xa_parse_int(item)
 end
 
 # ---- register tables ----
@@ -212,29 +258,72 @@ end
 #   ["label", name]                            -- bare identifier (call/jmp
 #                                                  target, or a dq/db value)
 
-make a function called xa_parse_mem_inner takes inner returns operand
-  # inner is whatever was between [ and ], already trimmed, with any
-  # leading "rel " already stripped by the caller when present.
-  # Forms seen: "reg", "reg+N", "reg-N".
-  let plus_idx = -1
-  let i = 0
-  while i < inner.length do
-    let c = char_code(inner, i)
-    if (c == 43) or ((c == 45) and (i > 0)) then
-      let plus_idx = i
-      let i = inner.length
+# Splits `inner` on every top-level '+' (or '-' not at position 0,
+# which starts a negative term) into terms, keeping each term's own
+# leading sign character (default '+' for the first term and any term
+# whose split point was itself a '+'). E.g. "r12+8+rax" ->
+# ["+r12", "+8", "+rax"]; "rbp-16" -> ["+rbp", "-16"].
+make a function called xa_split_mem_terms takes inner returns terms
+  let terms = []
+  let start = 0
+  let sign = "+"
+  let i = 1
+  while i <= inner.length do
+    let at_end = i == inner.length
+    let c = 0
+    if not at_end then
+      let c = char_code(inner, i)
+    end
+    if at_end or (c == 43) or (c == 45) then
+      let terms = list_push(terms, sign + str_trim(substr(inner, start, i - start)))
+      if not at_end then
+        if c == 43 then
+          let sign = "+"
+        else
+          let sign = "-"
+        end
+        let start = i + 1
+      end
     end
     let i = i + 1
   end
-  if plus_idx < 0 then
-    return [inner, 0]
+  return terms
+end
+
+make a function called xa_parse_mem_inner takes inner returns operand
+  # inner is whatever was between [ and ], already trimmed, with any
+  # leading "rel " already stripped by the caller when present. Forms
+  # seen: "reg", "reg+N", "reg-N", "reg+reg" (base+index, no scale --
+  # e.g. x64_runtime.patlang's own byte-scan loops' "[r13+r14]"), and
+  # "reg+N+reg"/"reg+reg+N" (base+disp+index, e.g. "[r12+8+rax]") --
+  # the last two found only at real (x64_runtime.patlang) scale, not
+  # anticipated by this plan's original addressing-mode inventory.
+  # Returns [base_name, index_name_or_false, disp].
+  let terms = xa_split_mem_terms(inner)
+  let base = substr(terms[0], 1, terms[0].length - 1)
+  let index_name = false
+  let disp = 0
+  let ti = 1
+  let tn = to_num(list_len(terms))
+  while ti < tn do
+    let term = terms[ti]
+    let term_sign = substr(term, 0, 1)
+    let term_body = substr(term, 1, term.length - 1)
+    if xa_looks_like_int(term_body) then
+      let v = xa_parse_int(term_body)
+      if term_sign == "-" then
+        let v = 0 - v
+      end
+      let disp = disp + v
+    else
+      # A register term -- x86-64 addressing has no negative index, so
+      # a leading '-' here would be meaningless; never emitted in
+      # practice (codegen_x64.patlang only ever adds an index).
+      let index_name = term_body
+    end
+    let ti = ti + 1
   end
-  let base = str_trim(substr(inner, 0, plus_idx))
-  let disp_text = str_trim(substr(inner, plus_idx, inner.length - plus_idx))
-  if char_code(disp_text, 0) == 43 then
-    let disp_text = str_trim(substr(disp_text, 1, disp_text.length - 1))
-  end
-  return [base, xa_parse_int(disp_text)]
+  return [base, index_name, disp]
 end
 
 make a function called xa_parse_operand takes raw returns operand
@@ -265,15 +354,35 @@ make a function called xa_parse_operand takes raw returns operand
     if str_starts_with(inner, "rel ") then
       let rest = str_trim(substr(inner, 4, inner.length - 4))
       let parsed = xa_parse_mem_inner(rest)
-      return ["relmem", parsed[0], parsed[1], size_hint]
+      # `[rel label]` is always RIP-relative to a single symbol -- never
+      # base+index -- so parsed[1] (the index name, if any) is ignored.
+      return ["relmem", parsed[0], parsed[2], size_hint]
     end
     let parsed = xa_parse_mem_inner(inner)
     let reg = xa_lookup_reg(parsed[0])
-    return ["mem", reg[0], parsed[1], size_hint]
+    if parsed[1] then
+      let idx_reg = xa_lookup_reg(parsed[1])
+      return ["mem", reg[0], parsed[2], size_hint, idx_reg[0]]
+    end
+    return ["mem", reg[0], parsed[2], size_hint]
   end
 
   if xa_looks_like_int(s) then
     return ["imm", xa_parse_int(s)]
+  end
+
+  # NASM's `__float64__(literal)` pseudo-immediate: codegen_x64.patlang
+  # emits `mov reg, __float64__(x)` to load an arbitrary float
+  # constant's raw IEEE-754 bit pattern into a general register (see
+  # x64_runtime.patlang's own float-decompose/float-classify code) --
+  # found missing here only at real-scale (x64_runtime.patlang)
+  # verification, none of Phase 2's hand-written fixtures used it.
+  # float_to_bits is a new, narrow host primitive (same "one
+  # unavoidable exception" reasoning as write_file_bytes) since no
+  # ordinary PatLang arithmetic can compute an IEEE-754 bit pattern.
+  if str_starts_with(s, "__float64__(") then
+    let inner = substr(s, 12, s.length - 13)
+    return ["imm", float_to_bits(to_num(inner))]
   end
 
   let reg = xa_lookup_reg(s)
@@ -334,19 +443,45 @@ make a function called xa_encode_modrm takes rm_operand, reg_field returns resul
     let bytes = [modrm, 0, 0, 0, 0]
     return [bytes, [1, "RIP32", label, addend]]
   end
-  # tag == "mem": [base_reg (+disp)]
+  # tag == "mem": [base_reg (+disp)], or [base_reg+index_reg] when a
+  # 5th element is present -- a real SIB base+index addressing mode
+  # (scale always 1, no displacement in this codebase's actual usage:
+  # e.g. x64_runtime.patlang's own byte-scan loops use `[r13+r14]`),
+  # found missing entirely (the index register name was silently
+  # misparsed as a garbage displacement, defaulting to 0) only at
+  # real-scale verification -- none of Phase 1-4's addressing-mode
+  # coverage anticipated it (the plan's own scope notes explicitly, and
+  # wrongly, assumed no SIB/scaled-index addressing was ever emitted).
+  if to_num(list_len(rm_operand)) >= 5 then
+    let base_num = rm_operand[1]
+    let disp = rm_operand[2]
+    let index_num = rm_operand[4]
+    let base_low = base_num band 7
+    let index_low = index_num band 7
+    let sib = (index_low * 8) + base_low
+    if (disp == 0) and (base_low != 5) then
+      let modrm = 0 + ((reg_field band 7) * 8) + 4
+      return [[modrm, sib], false]
+    end
+    let modrm = 128 + ((reg_field band 7) * 8) + 4
+    let disp_bytes = xa_int_to_bytes_le(disp, 4)
+    return [xa_emit_bytes([modrm, sib], disp_bytes), false]
+  end
   let base_num = rm_operand[1]
   let disp = rm_operand[2]
   let base_low = base_num band 7
   let needs_sib = base_low == 4
-  if disp == 0 then
-    if base_low == 5 then
-      # [rbp]/[r13] with no displacement is not encodable via mod=00
-      # (that encoding means RIP-relative instead) -- codegen_x64.patlang
-      # never emits a bare "[rbp]"/"[r13]" (always +disp), so this path
-      # is intentionally left unsupported rather than silently wrong.
-      print("x64_asm: unsupported bare [rbp]/[r13] with no displacement")
-    end
+  # [rbp]/[r13] with a ZERO displacement can't use mod=00 (that
+  # encoding is reserved for RIP-relative addressing when rm=101) --
+  # forcing it through the mod=10/disp32 path below (same as any other
+  # non-zero displacement, just with disp32=0) is correct and simplest,
+  # matching that path's own existing "always disp32, never disp8"
+  # simplification. Found missing (previously printed-and-silently-
+  # produced-a-wrong-RIP-relative-encoding) only at real-scale
+  # (x64_runtime.patlang) verification -- none of Phase 1-4's fixtures
+  # happened to spill a local into the very first stack slot below rbp
+  # with zero offset.
+  if (disp == 0) and (base_low != 5) then
     let modrm = 0 + ((reg_field band 7) * 8) + base_low
     if needs_sib then
       return [[modrm, 36], false]
@@ -380,35 +515,102 @@ make a function called xa_enc_push_pop takes op, reg returns result
   return [[opcode], false]
 end
 
+# The effective operand size (8/16/32/64) for a mov -- taken from
+# whichever operand is a real register (its own size field is
+# authoritative), or from the memory operand's own size_hint ("byte "/
+# "word "/"dword "/"qword " prefix) when the other side is an
+# immediate and there's no register to ask. Defaults to 64 (this
+# codebase's overwhelming common case) when neither is available.
+# Needed because xa_enc_mov used to hardcode REX.W=true and the 32/64-
+# bit opcode forms unconditionally, silently emitting a 64-bit mov's
+# machine code for an 8-bit ("mov cl, [mem]", 45 uses) or 32-bit
+# ("mov eax, ecx", "mov ecx, 2", 74 uses combined) mov in
+# x64_runtime.patlang -- found only at real-scale verification, since
+# none of Phase 1-4's fixtures exercised anything but 64-bit registers.
+make a function called xa_mov_size takes dst, src returns sz
+  if dst[0] == "reg" then
+    return dst[2]
+  end
+  if src[0] == "reg" then
+    return src[2]
+  end
+  if to_num(list_len(dst)) >= 4 then
+    if dst[3] != 0 then
+      return dst[3]
+    end
+  end
+  return 64
+end
+
 make a function called xa_enc_mov takes dst, src returns result
+  let sz = xa_mov_size(dst, src)
   if (dst[0] == "reg") and (src[0] == "imm") then
+    if sz == 64 then
+      let opcode = 184 + (dst[1] band 7)
+      let rex = xa_rex(true, false, false, xa_needs_rex_b(dst[1]))
+      return [xa_emit_bytes([rex, opcode], xa_int_to_bytes_le(src[1], 8)), false]
+    end
+    # 8/16/32-bit reg<-imm (B8+r id, imm32 zero-extended to 64 for
+    # 32-bit; 16-bit needs a 0x66 operand-size prefix; 8-bit uses B0+r
+    # ib instead) -- REX.W always false here (imm64 is the ONLY form
+    # that needs it, handled above).
+    if sz == 8 then
+      let opcode = 176 + (dst[1] band 7)
+      let rex = xa_rex(false, false, false, xa_needs_rex_b(dst[1]))
+      return [xa_emit_bytes([rex, opcode], xa_int_to_bytes_le(src[1], 1)), false]
+    end
     let opcode = 184 + (dst[1] band 7)
-    let rex = xa_rex(true, false, false, xa_needs_rex_b(dst[1]))
-    return [xa_emit_bytes([rex, opcode], xa_int_to_bytes_le(src[1], 8)), false]
+    let rex = xa_rex(false, false, false, xa_needs_rex_b(dst[1]))
+    if sz == 16 then
+      return [xa_emit_bytes([102, rex, opcode], xa_int_to_bytes_le(src[1], 2)), false]
+    end
+    return [xa_emit_bytes([rex, opcode], xa_int_to_bytes_le(src[1], 4)), false]
   end
   if dst[0] == "reg" then
-    # mov reg, r/m  (8B /r)
-    let rex = xa_rex(true, xa_needs_rex_b(dst[1]), false, xa_needs_rex_b_for_rm(src))
+    # mov reg, r/m  (8B /r, or 8A /r for 8-bit) -- REX.W only for 64-bit;
+    # 16-bit needs a leading 0x66 operand-size prefix.
+    let opcode = 139
+    if sz == 8 then
+      let opcode = 138
+    end
+    let rex = xa_rex(sz == 64, xa_needs_rex_b(dst[1]), xa_needs_rex_x_for_rm(src), xa_needs_rex_b_for_rm(src))
     let mm = xa_encode_modrm(src, dst[1])
-    return [xa_emit_bytes([rex, 139], mm[0]), xa_shift_reloc(mm[1], 2)]
+    if sz == 16 then
+      return [xa_emit_bytes([102, rex, opcode], mm[0]), xa_shift_reloc(mm[1], 3)]
+    end
+    return [xa_emit_bytes([rex, opcode], mm[0]), xa_shift_reloc(mm[1], 2)]
   end
   if src[0] == "imm" then
-    # mov r/m64, imm32 (sign-extended)  (C7 /0 id) -- dst is "mem"/"relmem".
-    # A RIP-relative disp32 here is followed by a 4-byte immediate --
+    # mov r/m, imm  (C7 /0 for 16/32/64-bit id/iw, sign/zero-extended
+    # as appropriate; C6 /0 ib for 8-bit) -- dst is "mem"/"relmem". A
+    # RIP-relative disp32 here is followed by a trailing immediate --
     # RIP-relative addressing always means "relative to the address of
-    # the NEXT instruction", which is 4 bytes further away than usual
-    # once a trailing immediate is present. xa_reloc_rip_trail folds
-    # that adjustment into the reloc's own addend rather than teaching
-    # the generic RIP32 patch formula (x64_pe_link.patlang) about
-    # per-instruction trailing-byte counts.
-    let rex = xa_rex(true, false, false, xa_needs_rex_b_for_rm(dst))
+    # the NEXT instruction", which is further away once a trailing
+    # immediate is present. xa_reloc_rip_trail folds that adjustment
+    # into the reloc's own addend rather than teaching the generic
+    # RIP32 patch formula (x64_pe_link.patlang) about per-instruction
+    # trailing-byte counts.
+    let rex = xa_rex(sz == 64, false, xa_needs_rex_x_for_rm(dst), xa_needs_rex_b_for_rm(dst))
     let mm = xa_encode_modrm(dst, 0)
+    if sz == 8 then
+      return [xa_emit_bytes(xa_emit_bytes([rex, 198], mm[0]), xa_int_to_bytes_le(src[1], 1)), xa_reloc_rip_trail(xa_shift_reloc(mm[1], 2), 1)]
+    end
+    if sz == 16 then
+      return [xa_emit_bytes(xa_emit_bytes([102, rex, 199], mm[0]), xa_int_to_bytes_le(src[1], 2)), xa_reloc_rip_trail(xa_shift_reloc(mm[1], 3), 2)]
+    end
     return [xa_emit_bytes(xa_emit_bytes([rex, 199], mm[0]), xa_int_to_bytes_le(src[1], 4)), xa_reloc_rip_trail(xa_shift_reloc(mm[1], 2), 4)]
   end
-  # mov r/m, reg  (89 /r) -- dst is "mem"/"relmem"
-  let rex = xa_rex(true, xa_needs_rex_b(src[1]), false, xa_needs_rex_b_for_rm(dst))
+  # mov r/m, reg  (89 /r, or 88 /r for 8-bit) -- dst is "mem"/"relmem".
+  let opcode = 137
+  if sz == 8 then
+    let opcode = 136
+  end
+  let rex = xa_rex(sz == 64, xa_needs_rex_b(src[1]), xa_needs_rex_x_for_rm(dst), xa_needs_rex_b_for_rm(dst))
   let mm = xa_encode_modrm(dst, src[1])
-  return [xa_emit_bytes([rex, 137], mm[0]), xa_shift_reloc(mm[1], 2)]
+  if sz == 16 then
+    return [xa_emit_bytes([102, rex, opcode], mm[0]), xa_shift_reloc(mm[1], 3)]
+  end
+  return [xa_emit_bytes([rex, opcode], mm[0]), xa_shift_reloc(mm[1], 2)]
 end
 
 # xa_encode_modrm's reloc offset is relative to the START of mm[0] (the
@@ -450,6 +652,23 @@ make a function called xa_needs_rex_b_for_rm takes operand returns yes
   return false
 end
 
+# REX.X extends the SIB index field to select r8-r15 -- only relevant
+# for a "mem" operand carrying a real index register (the 5th element,
+# see xa_parse_operand's own base+index comment). Needed alongside
+# xa_needs_rex_b_for_rm (which only ever covers the BASE register)
+# wherever a base+index memory operand can appear, or the SIB index
+# field silently picks the wrong register (e.g. r14 without REX.X
+# reads as rsi) -- a real, previously-nonexistent case now that
+# base+index addressing itself exists.
+make a function called xa_needs_rex_x_for_rm takes operand returns yes
+  if operand[0] == "mem" then
+    if to_num(list_len(operand)) >= 5 then
+      return xa_needs_rex_b(operand[4])
+    end
+  end
+  return false
+end
+
 make a function called xa_enc_lea takes dst, src returns result
   let rex = xa_rex(true, xa_needs_rex_b(dst[1]), false, xa_needs_rex_b_for_rm(src))
   let mm = xa_encode_modrm(src, dst[1])
@@ -485,7 +704,7 @@ make a function called xa_enc_alu takes name, dst, src returns result
   if src[0] == "imm" then
     let ext = ops[1]
     let v = src[1]
-    let rex = xa_rex(true, false, false, xa_needs_rex_b_for_rm(dst))
+    let rex = xa_rex(true, false, xa_needs_rex_x_for_rm(dst), xa_needs_rex_b_for_rm(dst))
     if (v >= -128) and (v <= 127) then
       let mm = xa_encode_modrm(dst, ext)
       return [xa_emit_bytes(xa_emit_bytes([rex, 131], mm[0]), xa_int_to_bytes_le(v, 1)), xa_reloc_rip_trail(xa_shift_reloc(mm[1], 2), 1)]
@@ -499,7 +718,7 @@ make a function called xa_enc_alu takes name, dst, src returns result
   # ops[0] here is the "Eb/Ev, Gb/Gv" (dst=r/m, src=reg) form's opcode,
   # which is what every alu reg,reg / mem,reg case in this codebase's
   # emitted text needs (dst is never a bare label/imm-only target).
-  let rex = xa_rex(true, xa_needs_rex_b_for_rm(src), false, xa_needs_rex_b_for_rm(dst))
+  let rex = xa_rex(true, xa_needs_rex_b_for_rm(src), xa_needs_rex_x_for_rm(dst), xa_needs_rex_b_for_rm(dst))
   let mm = xa_encode_modrm(dst, src[1])
   return [xa_emit_bytes([rex, ops[0]], mm[0]), xa_shift_reloc(mm[1], 2)]
 end
@@ -517,9 +736,12 @@ make a function called xa_enc_test takes a, b returns result
 end
 
 make a function called xa_enc_unary takes ext, operand returns result
-  # inc/dec/neg/not, all FF/F7 /ext r/m64
+  # inc/dec (FF /0, /1), neg/not (F7 /3, /2), single-operand imul
+  # (F7 /5: RDX:RAX := RAX * r/m64) -- all r/m64, group-5-or-group-3
+  # opcode extensions distinguished only by which FF/F7 opcode byte
+  # each ext value needs.
   let opcode = 255
-  if (ext == 3) or (ext == 2) then
+  if (ext == 3) or (ext == 2) or (ext == 5) then
     let opcode = 247
   end
   let rex = xa_rex(true, false, false, xa_needs_rex_b_for_rm(operand))
@@ -703,6 +925,17 @@ make a function called xa_encode_instr takes mnemonic, ops returns result
     return xa_enc_alu(mnemonic, ops[0], ops[1])
   end
   if mnemonic == "imul" then
+    # Two forms: "imul reg, r/m" (0F AF /r, xa_enc_imul below) and the
+    # single-operand "imul r/m" (F7 /5: RDX:RAX := RAX * r/m64, sets
+    # OF/CF for the overflow-checked-arithmetic idiom this codebase
+    # uses -- `imul r10` immediately followed by `jo .OVERFLOW_n` in
+    # x64_runtime.patlang's own dynamic-mode integer multiply). Found
+    # missing (single-operand form entirely unhandled -- xa_enc_imul
+    # unconditionally read a nonexistent ops[1]) only at real-scale
+    # verification; none of Phase 2's fixtures exercised it.
+    if to_num(list_len(ops)) == 1 then
+      return xa_enc_unary(5, ops[0])
+    end
     return xa_enc_imul(ops[0], ops[1])
   end
   if mnemonic == "test" then
@@ -770,6 +1003,18 @@ make a function called xa_encode_instr takes mnemonic, ops returns result
     let rex = xa_rex(true, xa_needs_rex_b(ops[1][1]), false, xa_needs_rex_b_for_rm(ops[0]))
     let mm = xa_encode_modrm(ops[0], ops[1][1])
     return [xa_emit_bytes([240, rex, 15, 177], mm[0]), xa_shift_reloc(mm[1], 4)]
+  end
+  if mnemonic == "xadd" then
+    # "lock xadd [mem], reg" -- 0F C1 /r (XADD r/m64, r64), same
+    # operand-order/lock-prefix shape as cmpxchg just above (r/m is
+    # the destination, reg is the other operand); codegen_x64.patlang's
+    # only real use is a genuine hardware atomic fetch-and-add
+    # (`lock xadd [rcx], rax`), found missing here at real-scale
+    # (x64_runtime.patlang) verification -- none of Phase 2's 6 hand-
+    # written fixtures happened to exercise it.
+    let rex = xa_rex(true, xa_needs_rex_b(ops[1][1]), false, xa_needs_rex_b_for_rm(ops[0]))
+    let mm = xa_encode_modrm(ops[0], ops[1][1])
+    return [xa_emit_bytes([240, rex, 15, 193], mm[0]), xa_shift_reloc(mm[1], 4)]
   end
   if mnemonic == "movq" then
     return xa_enc_movq_sse(ops[0], ops[1])
@@ -942,6 +1187,42 @@ make a function called xa_process_line takes state, raw_line returns done
   if line.length == 0 then
     return true
   end
+  # `label: rest-of-line` (label and a directive on ONE line) -- only
+  # emitted by codegen_x64.patlang for its two win32-window UTF-16-ish
+  # string literals (g_win_class_name/g_win_title: dw ...), but handled
+  # generically here rather than special-cased to that one directive.
+  # A PURE label line (nothing after the colon) still falls through
+  # unchanged to the dedicated check further below -- this only fires
+  # when there's real content after the colon to re-dispatch.
+  let colon_idx = -1
+  let ci = 0
+  while ci < line.length do
+    let c = char_code(line, ci)
+    if c == 58 then
+      let colon_idx = ci
+      let ci = line.length
+    else
+      if (c == 32) or (c == 9) then
+        let ci = line.length
+      else
+        let ci = ci + 1
+      end
+    end
+  end
+  if colon_idx >= 0 then
+    let after = str_trim(substr(line, colon_idx + 1, line.length - colon_idx - 1))
+    if after.length > 0 then
+      let name = substr(line, 0, colon_idx)
+      if str_starts_with(name, ".") then
+        let full = get(state, "current_global") + name
+        xa_declare_symbol(state, full, get(state, "section"))
+      else
+        xa_declare_symbol(state, name, get(state, "section"))
+        send(state, "set", "current_global", name)
+      end
+      return xa_process_line(state, after)
+    end
+  end
   if str_starts_with(line, "default ") then
     return true
   end
@@ -998,10 +1279,27 @@ make a function called xa_process_line takes state, raw_line returns done
     let i = 0
     let n = to_num(list_len(parts))
     while i < n do
-      let bytes = list_push(bytes, xa_parse_int(str_trim(parts[i])) band 255)
+      let bytes = list_push(bytes, xa_parse_data_item(str_trim(parts[i])) band 255)
       let i = i + 1
     end
     send(state, "set", "data_bytes", bytes)
+    return true
+  end
+  # `dw` -- only used for two UTF-16-ish window-title string literals
+  # (g_win_class_name/g_win_title in x64_runtime.patlang, generated by
+  # codegen_x64.patlang's own win32-window support), always numeric or
+  # single-char-literal items, never a label reference -- so no reloc
+  # handling is needed here, unlike dq.
+  if str_starts_with(line, "dw ") then
+    let parts = xa_split_char(str_trim(substr(line, 3, line.length - 3)), 44)
+    let data_bytes = get(state, "data_bytes")
+    let i = 0
+    let n = to_num(list_len(parts))
+    while i < n do
+      let data_bytes = xa_emit_i16(data_bytes, xa_parse_data_item(str_trim(parts[i])))
+      let i = i + 1
+    end
+    send(state, "set", "data_bytes", data_bytes)
     return true
   end
   if str_starts_with(line, "dq ") then

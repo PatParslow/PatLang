@@ -306,7 +306,36 @@ pub fn host_to_num(args: &[Value]) -> Result<Value, String> {
         Value::Int(_) | Value::Float(_) | Value::BigInt(_) | Value::Rational(_, _) => Ok(v),
         Value::String(s) => {
             let t = s.trim();
-            if let Ok(i) = t.parse::<i64>() { Ok(Value::Int(i)) } else { Ok(Value::Float(t.parse::<f64>().unwrap_or(0.0))) }
+            // A digit string too large for i64 (e.g. a full 64-bit
+            // pointer-tag mask literal like "17293822569102704640",
+            // 0xF000000000000000) used to silently fall through to the
+            // f64 parse below, losing precision to a nearby-but-wrong
+            // value (f64 can't exactly represent most 19-digit
+            // integers) instead of promoting to BigInt the way an
+            // ordinary numeric LITERAL in source already does at parse
+            // time -- confirmed directly: to_num("17293822569102704640")
+            // returned 9223372036854775807 (i64::MAX) as a Float, not
+            // the real value, as a BigInt. Try BigInt before falling
+            // back to float, but only for a string that's actually all
+            // digits (an optional leading sign): running BigInt's
+            // FromStr on data with an exponent/decimal point ("1e10",
+            // "3.5") would just fail and fall through anyway, but
+            // there's no reason to spend the attempt on inputs that are
+            // never going to be a big *integer* in the first place.
+            if let Ok(i) = t.parse::<i64>() {
+                Ok(Value::Int(i))
+            } else {
+                let looks_like_int = {
+                    let digits = t.strip_prefix(['+', '-']).unwrap_or(t);
+                    !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+                };
+                if looks_like_int {
+                    if let Ok(b) = t.parse::<BigInt>() {
+                        return Ok(normalize(Value::BigInt(b)));
+                    }
+                }
+                Ok(Value::Float(t.parse::<f64>().unwrap_or(0.0)))
+            }
         }
         Value::Bool(b) => Ok(Value::Int(if b { 1 } else { 0 })),
         _ => Ok(Value::Int(0)),
@@ -378,6 +407,35 @@ pub fn host_write_file_bytes(args: &[Value]) -> Result<Value, String> {
     }
     if let Some(parent) = std::path::Path::new(&p).parent() { let _ = std::fs::create_dir_all(parent); }
     std::fs::write(&p, bytes).map(|_| Value::Bool(true)).map_err(|e| format!("write_file_bytes: {}: {}", p, e))
+}
+
+pub fn host_float_to_bits(args: &[Value]) -> Result<Value, String> {
+    // float_to_bits(f) -> the IEEE-754 64-bit bit pattern of f, as an
+    // integer (BigInt when the top bit is set, since that exceeds
+    // i64::MAX -- exactly the same "large unsigned 64-bit value" case
+    // to_num's own BigInt-promotion fix handles for decimal literals).
+    //
+    // Added for the self-hosted x64 assembler (x64_asm.patlang) to
+    // support NASM's `__float64__(literal)` pseudo-immediate --
+    // codegen_x64.patlang emits `mov reg, __float64__(x)` to load an
+    // arbitrary float constant's raw bits into a general register (see
+    // x64_runtime.patlang's own float-decompose/float-classify code),
+    // and there is no way to compute an IEEE-754 bit pattern from
+    // ordinary PatLang arithmetic -- the same "one unavoidable
+    // exception to 'runtime logic belongs in PatLang'" reasoning
+    // write_file_bytes's own header comment already documents.
+    let f = match args.get(0) {
+        Some(Value::Float(n)) => *n,
+        Some(Value::Int(n)) => *n as f64,
+        Some(v) => v.as_number().unwrap_or(0.0),
+        None => return Err("float_to_bits: expected 1 arg".into()),
+    };
+    let bits = f.to_bits();
+    if bits <= i64::MAX as u64 {
+        Ok(Value::Int(bits as i64))
+    } else {
+        Ok(Value::BigInt(BigInt::from(bits)))
+    }
 }
 
 pub fn host_list_dir(args: &[Value]) -> Result<Value, String> {
@@ -3359,6 +3417,7 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("read_file", host_read_file);
     interp.host.insert("write_file", host_write_file);
     interp.host.insert("write_file_bytes", host_write_file_bytes);
+    interp.host.insert("float_to_bits", host_float_to_bits);
     interp.host.insert("file_exists", host_file_exists);
     interp.host.insert("list_dir", host_list_dir);
     interp.host.insert("rename_file", host_rename_file);

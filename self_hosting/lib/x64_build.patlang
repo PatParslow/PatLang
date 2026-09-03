@@ -6,6 +6,8 @@
 # the exact nasm/gcc toolchain invocation already proven across every
 # earlier slice's own driver script.
 
+include "x64_pe_link.patlang"
+
 make a function called x64_nasm_exe returns path
   return "C:/Program Files/NASM/nasm.exe"
 end
@@ -175,4 +177,78 @@ make a function called x64_build_linked_multi takes program_asm_chunks, runtime_
     let i = i + 1
   end
   return x64_link_objs(objs, runtime_obj_path, out_path)
+end
+
+# ==========================================================================
+# Phase 5 -- self-hosted toolchain (x64_asm.patlang + x64_pe_link.patlang)
+# as an explicit ALTERNATIVE to the nasm/gcc functions above, not a
+# replacement. Per the plan's own verification discipline (this project
+# keeps --ir-run/--patc/wasm as permanent cross-checking oracles rather
+# than deleting superseded paths): nasm/gcc stay the DEFAULT, real build
+# path indefinitely. x64_build_use_native_toolchain() below is the single
+# switch a caller flips to opt into the new toolchain -- deliberately NOT
+# wired into patc1_main.patlang's own real build path yet. Flipping that
+# default is a separate, deliberate decision for once the new toolchain
+# has been run against the full self-hosted-compiler-bundle scale that
+# originally motivated chunking (288,700 labels) -- Phase 4 only proved
+# import-table correctness at real DLL-surface scale, not full-bundle
+# function-count/chunk-count scale.
+# ==========================================================================
+
+make a function called x64_build_use_native_toolchain returns enabled
+  return false
+end
+
+# The exact real import surface codegen_x64.patlang's own emit_program_x64
+# declares (see its own "extern ..." sb_push lines) -- kept as one
+# explicit, verified-against-the-real-DLLs list here rather than derived
+# from a ChunkImage's own `externs` (which would also have to include
+# round/trunc: codegen_x64.patlang declares them as a vestigial `extern`
+# but never actually CALLs them -- x64_roundlike_asm implements round/
+# trunc/ceil natively via SSE roundsd instead -- so including them here
+# would try to import two symbols that genuinely don't exist in
+# msvcrt.dll, exactly the Phase 4 bug already found and fixed once).
+make a function called x64_default_import_spec returns spec
+  return [
+    ["KERNEL32.DLL", ["GetStdHandle", "WriteFile", "ExitProcess", "CreateFileA", "GetFileSize", "CloseHandle", "ReadFile", "CreateProcessA", "CreatePipe", "SetHandleInformation", "WaitForSingleObject", "GetCommandLineA", "GetExitCodeProcess", "TerminateProcess", "Sleep", "GetTickCount64", "CopyFileA", "MoveFileExA", "FindFirstFileA", "FindNextFileA", "FindClose", "GetConsoleMode", "SetConsoleMode", "SetConsoleOutputCP", "SetConsoleCP", "GetCurrentDirectoryA", "SetCurrentDirectoryA", "CreatePseudoConsole", "ResizePseudoConsole", "ClosePseudoConsole", "InitializeProcThreadAttributeList", "UpdateProcThreadAttribute", "CreateProcessW", "PeekNamedPipe", "GetLastError", "CreateThread", "ExitThread", "InitializeCriticalSection", "EnterCriticalSection", "LeaveCriticalSection", "TlsAlloc", "TlsGetValue", "TlsSetValue", "AcquireSRWLockExclusive", "ReleaseSRWLockExclusive", "SleepConditionVariableSRW", "WakeConditionVariable", "GetModuleHandleW", "GlobalAlloc", "GlobalLock", "GlobalUnlock", "GlobalSize"]],
+    ["WS2_32.DLL", ["WSAStartup", "WSAGetLastError", "socket", "bind", "listen", "accept", "connect", "send", "recv", "closesocket", "shutdown", "getaddrinfo", "freeaddrinfo", "getsockname", "ioctlsocket", "htons", "ntohs"]],
+    ["USER32.DLL", ["RegisterClassExW", "CreateWindowExW", "ShowWindow", "UpdateWindow", "DefWindowProcW", "PeekMessageW", "TranslateMessage", "DispatchMessageW", "BeginPaint", "EndPaint", "InvalidateRect", "GetClientRect", "DestroyWindow", "GetKeyState", "OpenClipboard", "CloseClipboard", "EmptyClipboard", "SetClipboardData", "GetClipboardData", "SetWindowTextA", "GetDC", "ReleaseDC"]],
+    ["GDI32.DLL", ["CreateCompatibleDC", "CreateDIBSection", "SelectObject", "BitBlt", "TextOutA", "SetTextColor", "SetBkMode", "DeleteObject", "StretchDIBits"]],
+    ["MSVCRT.DLL", ["sqrt", "pow", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "log", "exp", "ceil", "floor", "fabs"]]
+  ]
+end
+
+# x64_assemble_native(asm_source, asm_path) -> ChunkImage, or an error
+# string starting with "ASM ERROR:" -- the native-toolchain analogue of
+# x64_assemble. Still writes asm_path to disk (even though nothing reads
+# it back) purely so this stays a drop-in swap for any caller/diagnostic
+# workflow that expects the .asm text to land on disk at that path, same
+# as every nasm-based caller already relies on.
+make a function called x64_assemble_native takes asm_source, asm_path returns result
+  write_file(asm_path, asm_source)
+  let chunk = x64_assemble_chunk(asm_source)
+  if not chunk then
+    return "ASM ERROR: x64_assemble_chunk failed for " + asm_path
+  end
+  return chunk
+end
+
+# x64_link_native_chunks(chunks, out_path) -> out_path, or an error string
+# starting with "LINK ERROR:" -- the native-toolchain analogue of
+# x64_link_objs. `chunks` is a plain list of ChunkImages (the runtime
+# chunk plus every program chunk), already merged the same way x64_link
+# has supported since Phase 1 -- no separate "link objs against a
+# pre-built runtime .obj" step is meaningful here, since this linker has
+# no COFF reader (Phase 3's own explicitly-deferred note) and therefore
+# cannot consume a nasm-built runtime.obj at all: the runtime's OWN asm
+# source (self_hosting/build/x64_runtime.asm, written by
+# build_x64_runtime.patlang regardless of which toolchain built its
+# cached .obj) must be assembled into a ChunkImage via x64_assemble_native
+# too and included in `chunks`, same as any other chunk.
+make a function called x64_link_native_chunks takes chunks, out_path returns result
+  let result = x64_link(chunks, x64_default_import_spec(), "main", out_path)
+  if x64_build_contains(result, "LINK ERROR:") then
+    return result
+  end
+  return result
 end
