@@ -71,12 +71,28 @@ end
 # breaking the negative-immediate case that already worked correctly.
 make a function called xa_int_to_bytes_le takes v, n returns bytes
   if type_of(v) == "bigint" then
+    # `/` is exact (non-truncating) division in this numeric tower --
+    # it promotes to Rational whenever the dividend isn't a clean
+    # multiple of 256 (confirmed directly: (uv % 256) stays a proper
+    # Int, but plain `uv / 256` on an odd BigInt returns e.g.
+    # "17293822569102704641/256", a Rational, not a truncated
+    # integer). Only the FIRST BigInt immediate this codebase actually
+    # used (0xF000000000000000, a clean multiple of every power of
+    # 256) happened to hide this: `%` was 0, so `uv/256` was ALSO
+    # exact by construction and no Rational ever appeared -- a second,
+    # non-multiple-of-256 BigInt immediate (found only via a raw
+    # non-integer byte value reaching write_file_bytes, deep in the
+    # linker, far downstream of where it was actually produced) exposed
+    # it. Fixed by computing the quotient via subtraction
+    # (`(uv - rem) / 256`, which IS exact by construction) instead of
+    # dividing the original value directly.
     let uv = v
     let out = []
     let i = 0
     while i < n do
-      let out = list_push(out, to_num(uv % 256))
-      let uv = to_num(uv / 256)
+      let rem = to_num(uv % 256)
+      let out = list_push(out, rem)
+      let uv = to_num((uv - rem) / 256)
       let i = i + 1
     end
     return out
@@ -294,15 +310,19 @@ make a function called xa_parse_mem_inner takes inner returns operand
   # inner is whatever was between [ and ], already trimmed, with any
   # leading "rel " already stripped by the caller when present. Forms
   # seen: "reg", "reg+N", "reg-N", "reg+reg" (base+index, no scale --
-  # e.g. x64_runtime.patlang's own byte-scan loops' "[r13+r14]"), and
-  # "reg+N+reg"/"reg+reg+N" (base+disp+index, e.g. "[r12+8+rax]") --
-  # the last two found only at real (x64_runtime.patlang) scale, not
-  # anticipated by this plan's original addressing-mode inventory.
-  # Returns [base_name, index_name_or_false, disp].
+  # e.g. x64_runtime.patlang's own byte-scan loops' "[r13+r14]"),
+  # "reg+N+reg"/"reg+reg+N" (base+disp+index, e.g. "[r12+8+rax]"), and
+  # "reg+N+reg*N" (base+disp+scaled-index, e.g. "[rcx+32+r10*8]",
+  # array/list-element addressing) -- all found only at real
+  # (x64_runtime.patlang) scale, not anticipated by this plan's
+  # original addressing-mode inventory. Returns
+  # [base_name, index_name_or_false, disp, scale] (scale is 1 when no
+  # index, or when an index has no explicit "*N").
   let terms = xa_split_mem_terms(inner)
   let base = substr(terms[0], 1, terms[0].length - 1)
   let index_name = false
   let disp = 0
+  let scale = 1
   let ti = 1
   let tn = to_num(list_len(terms))
   while ti < tn do
@@ -316,14 +336,29 @@ make a function called xa_parse_mem_inner takes inner returns operand
       end
       let disp = disp + v
     else
-      # A register term -- x86-64 addressing has no negative index, so
-      # a leading '-' here would be meaningless; never emitted in
-      # practice (codegen_x64.patlang only ever adds an index).
-      let index_name = term_body
+      # A register term, optionally scaled ("reg*N") -- x86-64
+      # addressing has no negative index, so a leading '-' here would
+      # be meaningless; never emitted in practice (codegen_x64.patlang
+      # only ever adds an index).
+      let star_idx = -1
+      let si = 0
+      while si < term_body.length do
+        if char_code(term_body, si) == 42 then
+          let star_idx = si
+          let si = term_body.length
+        end
+        let si = si + 1
+      end
+      if star_idx >= 0 then
+        let index_name = substr(term_body, 0, star_idx)
+        let scale = xa_parse_int(str_trim(substr(term_body, star_idx + 1, term_body.length - star_idx - 1)))
+      else
+        let index_name = term_body
+      end
     end
     let ti = ti + 1
   end
-  return [base, index_name, disp]
+  return [base, index_name, disp, scale]
 end
 
 make a function called xa_parse_operand takes raw returns operand
@@ -362,13 +397,38 @@ make a function called xa_parse_operand takes raw returns operand
     let reg = xa_lookup_reg(parsed[0])
     if parsed[1] then
       let idx_reg = xa_lookup_reg(parsed[1])
-      return ["mem", reg[0], parsed[2], size_hint, idx_reg[0]]
+      return ["mem", reg[0], parsed[2], size_hint, idx_reg[0], parsed[3]]
     end
     return ["mem", reg[0], parsed[2], size_hint]
   end
 
   if xa_looks_like_int(s) then
     return ["imm", xa_parse_int(s)]
+  end
+
+  # A simple unevaluated arithmetic immediate ("0 - 2", "0 - 2147195266")
+  # -- NASM evaluates constant expressions itself at assemble time;
+  # codegen_x64.patlang relies on that for negation (`0 - N` instead of
+  # a literal `-N`) rather than pre-computing it, found only at real
+  # scale (x64_runtime.patlang's own tcp_listen error-code handling).
+  # Only "A - B" (space-separated, both sides plain digit strings) is
+  # needed -- confirmed by grepping the real file for every occurrence
+  # of this shape before adding support, not guessed.
+  let minus_idx = -1
+  let mi = 0
+  while mi < s.length do
+    if (char_code(s, mi) == 45) and (mi > 0) and (char_code(s, mi - 1) == 32) then
+      let minus_idx = mi
+      let mi = s.length
+    end
+    let mi = mi + 1
+  end
+  if minus_idx >= 0 then
+    let lhs = str_trim(substr(s, 0, minus_idx))
+    let rhs = str_trim(substr(s, minus_idx + 1, s.length - minus_idx - 1))
+    if xa_looks_like_int(lhs) and xa_looks_like_int(rhs) then
+      return ["imm", xa_parse_int(lhs) - xa_parse_int(rhs)]
+    end
   end
 
   # NASM's `__float64__(literal)` pseudo-immediate: codegen_x64.patlang
@@ -443,22 +503,37 @@ make a function called xa_encode_modrm takes rm_operand, reg_field returns resul
     let bytes = [modrm, 0, 0, 0, 0]
     return [bytes, [1, "RIP32", label, addend]]
   end
-  # tag == "mem": [base_reg (+disp)], or [base_reg+index_reg] when a
-  # 5th element is present -- a real SIB base+index addressing mode
-  # (scale always 1, no displacement in this codebase's actual usage:
-  # e.g. x64_runtime.patlang's own byte-scan loops use `[r13+r14]`),
-  # found missing entirely (the index register name was silently
-  # misparsed as a garbage displacement, defaulting to 0) only at
-  # real-scale verification -- none of Phase 1-4's addressing-mode
-  # coverage anticipated it (the plan's own scope notes explicitly, and
+  # tag == "mem": [base_reg (+disp)], or [base_reg+index_reg(*scale)]
+  # when a 5th element is present -- a real SIB base+index addressing
+  # mode (e.g. x64_runtime.patlang's own byte-scan loops' `[r13+r14]`,
+  # or scaled array/list-element addressing like `[rcx+32+r10*8]`,
+  # 6th element = scale, defaulting to 1 when absent), found missing
+  # entirely (the index register name was silently misparsed as a
+  # garbage displacement, defaulting to 0) only at real-scale
+  # verification -- none of Phase 1-4's addressing-mode coverage
+  # anticipated it (the plan's own scope notes explicitly, and
   # wrongly, assumed no SIB/scaled-index addressing was ever emitted).
   if to_num(list_len(rm_operand)) >= 5 then
     let base_num = rm_operand[1]
     let disp = rm_operand[2]
     let index_num = rm_operand[4]
+    let scale = 1
+    if to_num(list_len(rm_operand)) >= 6 then
+      let scale = rm_operand[5]
+    end
+    let scale_bits = 0
+    if scale == 2 then
+      let scale_bits = 1
+    end
+    if scale == 4 then
+      let scale_bits = 2
+    end
+    if scale == 8 then
+      let scale_bits = 3
+    end
     let base_low = base_num band 7
     let index_low = index_num band 7
-    let sib = (index_low * 8) + base_low
+    let sib = (scale_bits * 64) + (index_low * 8) + base_low
     if (disp == 0) and (base_low != 5) then
       let modrm = 0 + ((reg_field band 7) * 8) + 4
       return [[modrm, sib], false]
@@ -504,6 +579,39 @@ end
 # codebase's own NASM-text convention throughout: `op dst, src`.
 
 make a function called xa_enc_push_pop takes op, reg returns result
+  if reg[0] == "imm" then
+    # `push 0` (an extra literal argument pushed onto the evaluation
+    # stack before a host call, e.g. rt_dynamic_binop's operator-code
+    # arg) -- PUSH imm32 (0x68 id, sign-extended to 64-bit), always the
+    # 4-byte form for simplicity (matching this codebase's own
+    # established "always the wider immediate/displacement form, never
+    # the short one" pattern elsewhere). pop never takes an immediate.
+    return [xa_emit_bytes([104], xa_int_to_bytes_le(reg[1], 4)), false]
+  end
+  if reg[0] != "reg" then
+    # push/pop r/m64 -- a genuine, real gap: `pop qword [rbp-24]`/
+    # `push qword [rbp-16]` (spilling an evaluation-stack value
+    # straight to a stack local, x64_runtime.patlang's own overflow-
+    # checked "DYN" fast-path arithmetic) were previously silently
+    # mis-encoded as a REGISTER push/pop (reg[1] read as a register
+    # number when `reg` was actually a "mem" operand whose index-1
+    # element is the BASE register number, not itself a valid
+    # register to push/pop) -- found only by tracing a real segfault
+    # back to this exact miscompilation, not caught by any Phase 1-4
+    # fixture (none used a mem-operand push/pop). `push r/m64` is
+    # FF /6; `pop r/m64` is 8F /0.
+    let ext = 6
+    if op == "pop" then
+      let ext = 0
+    end
+    let rex = xa_rex(false, false, xa_needs_rex_x_for_rm(reg), xa_needs_rex_b_for_rm(reg))
+    let mm = xa_encode_modrm(reg, ext)
+    let opcode = 255
+    if op == "pop" then
+      let opcode = 143
+    end
+    return [xa_emit_bytes([rex, opcode], mm[0]), xa_shift_reloc(mm[1], 2)]
+  end
   let base = 80
   if op == "pop" then
     let base = 88
@@ -836,6 +944,21 @@ make a function called xa_enc_call takes label returns result
   return [[232, 0, 0, 0, 0], [1, "REL32", label, 0]]
 end
 
+# Register-indirect call (`call r12`, FF /2 -- calls through a runtime
+# function-pointer value, e.g. the apply()-by-name dispatch table) --
+# explicitly deferred as unimplemented back in Phase 3 (only a
+# function-POINTER-VALUE relocation, `dq label`, was tested then, never
+# an actual indirect call through one) and found genuinely load-bearing
+# at real (x64_runtime.patlang) scale: 5 real `call r12` sites.
+make a function called xa_enc_call_indirect takes reg_operand returns result
+  let reg_num = reg_operand[1]
+  let modrm = 192 + (2 * 8) + (reg_num band 7)
+  if xa_needs_rex_b(reg_num) then
+    return [[xa_rex(false, false, false, true), 255, modrm], false]
+  end
+  return [[255, modrm], false]
+end
+
 make a function called xa_enc_jmp takes label returns result
   return [[233, 0, 0, 0, 0], [1, "REL32", label, 0]]
 end
@@ -963,6 +1086,9 @@ make a function called xa_encode_instr takes mnemonic, ops returns result
     return xa_enc_movzx(ops[0], ops[1])
   end
   if mnemonic == "call" then
+    if ops[0][0] == "reg" then
+      return xa_enc_call_indirect(ops[0])
+    end
     return xa_enc_call(ops[0][1])
   end
   if mnemonic == "jmp" then
@@ -1170,7 +1296,22 @@ make a function called xa_process_instr_line takes state, line returns done
     let i = 0
     let n = to_num(list_len(raw_parts))
     while i < n do
-      let ops = list_push(ops, xa_parse_operand(raw_parts[i]))
+      let op = xa_parse_operand(raw_parts[i])
+      # A dot-scoped local label used as a jump/call TARGET (e.g. "jne
+      # .DYN_FASTOK1_0") must be prefixed with the enclosing global
+      # label's name, exactly matching how xa_declare_symbol already
+      # prefixes the DECLARATION of that same label -- xa_parse_operand
+      # has no access to `state`/current_global, so this can't happen
+      # inside it; done here instead, right where both the operand and
+      # `state` are in scope. Found missing (the reloc target name
+      # never matched the declared symbol name at all, always failing
+      # as "undefined symbol") only at real-scale verification -- none
+      # of Phase 1-4's fixtures happened to reference a dot-label from
+      # inside a JUMP rather than only declaring/falling into one.
+      if (op[0] == "label") and str_starts_with(op[1], ".") then
+        let op = ["label", get(state, "current_global") + op[1]]
+      end
+      let ops = list_push(ops, op)
       let i = i + 1
     end
   end
@@ -1279,7 +1420,24 @@ make a function called xa_process_line takes state, raw_line returns done
     let i = 0
     let n = to_num(list_len(parts))
     while i < n do
-      let bytes = list_push(bytes, xa_parse_data_item(str_trim(parts[i])) band 255)
+      let item = str_trim(parts[i])
+      # A whole quoted STRING literal (`db 'bench_fib'`, x64_emit_
+      # apply_table_asm's own function-name-string data) -- distinct
+      # from the single-quoted-CHAR literal xa_parse_data_item already
+      # handles (`db 'P'` from the dw-adjacent case, length 3) -- any
+      # longer single-quoted item expands to one byte per character.
+      # Found missing only at real-scale verification (the apply-table
+      # object x64_compile_unit.patlang's own real build always links
+      # in, never exercised by any Phase 1-4 fixture).
+      if (item.length > 3) and (char_code(item, 0) == 39) and (char_code(item, item.length - 1) == 39) then
+        let ci = 1
+        while ci < item.length - 1 do
+          let bytes = list_push(bytes, char_code(item, ci))
+          let ci = ci + 1
+        end
+      else
+        let bytes = list_push(bytes, xa_parse_data_item(item) band 255)
+      end
       let i = i + 1
     end
     send(state, "set", "data_bytes", bytes)
