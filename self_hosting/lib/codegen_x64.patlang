@@ -568,6 +568,35 @@ make a function called x64_taint_one_pass takes instrs, locals_taint returns res
     let ty = instr[0]
     if ty == "Const" then
       let tainted = instr[1] == "str"
+      # A numeric literal whose magnitude exceeds the 48-bit fixnum
+      # range gets promoted to a genuine, properly-tagged BigInt at
+      # the SOURCE (x64_num_const_needs_bigint_promotion, GitHub #38) --
+      # but this taint analysis, which decides whether a Bin op needs
+      # the dynamic (BigInt-aware) dispatch path at all, never knew
+      # that: only a STRING Const was ever marked tainted here, so
+      # `bigLiteralA >= bigLiteralB` (both operands already boxed
+      # BigInt) fell through to the STATIC comparison path
+      # (x64_binop_asm, not x64_binop_asm_dynamic), which emits a raw
+      # `cmp`/`setge` on the two TAGGED POINTER VALUES directly --
+      # comparing heap addresses and tag bits, not the actual BigInt
+      # magnitudes they represent. Confirmed exactly: `rt_bigint_cmp`
+      # and `rt_dynamic_binop` both give the mathematically correct
+      # answer when called directly on the same two literals, but the
+      # bare `>=` operator syntax on them did not. Fixed by tainting
+      # (forcing dynamic dispatch for) any numeric Const that needed
+      # this promotion -- the tower-ctor-arg exemption
+      # x64_emit_instr's own Const branch applies before actually
+      # promoting a literal is deliberately NOT re-checked here: over-
+      # tainting a tower-ctor argument only costs a redundant dynamic-
+      # dispatch check, never a correctness issue, matching this
+      # analysis's own established "taint only grows, safe over-
+      # approximation" philosophy stated above for the op_can_overflow
+      # case.
+      if instr[1] == "num" then
+        if x64_num_const_needs_bigint_promotion(instr[2]) then
+          let tainted = true
+        end
+      end
       let pr = x64_vstack_push(stack, sp, tainted)
       let stack = pr[0]
       let sp = pr[1]
@@ -8988,6 +9017,31 @@ make a function called x64_func_is_dynamic takes func returns yes
     if instr[0] == "Const" then
       if instr[1] == "str" then
         return true
+      end
+      # Same reasoning as the string-literal check just above, for a
+      # numeric literal instead: a Const "num" whose magnitude exceeds
+      # the 48-bit fixnum range gets promoted to a genuine, properly-
+      # tagged BigInt at the source
+      # (x64_num_const_needs_bigint_promotion, GitHub #38) -- but this
+      # whole-function classifier never knew that, so a function whose
+      # ONLY dynamic-looking content is such a literal (no string, no
+      # tower-ctor call, and a COMPARISON rather than +/-/* so the
+      # overflow-forced-dynamic check just below doesn't fire either)
+      # stayed classified as non-dynamic entirely, meaning
+      # x64_analyze_dynamic_bins never even RAN for it and every Bin op
+      # (including a comparison between two such literals) used the
+      # plain static path -- a raw `cmp`/`setge` directly on the two
+      # TAGGED POINTER VALUES, comparing heap addresses and tag bits,
+      # not the actual BigInt magnitudes they represent. Confirmed
+      # exactly: `bigLiteralA >= bigLiteralB` (both individually
+      # correct per `rt_bigint_to_string`, and `rt_bigint_cmp`/
+      # `rt_dynamic_binop` both give the right answer when called
+      # directly) gave a flatly wrong boolean via the bare `>=` operator
+      # until this was added.
+      if instr[1] == "num" then
+        if x64_num_const_needs_bigint_promotion(instr[2]) then
+          return true
+        end
       end
     end
     # Integer-overflow-to-BigInt fix, mirroring pat --ir-run's own
