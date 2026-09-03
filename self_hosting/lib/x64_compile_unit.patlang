@@ -140,6 +140,38 @@ class CompileUnit {
     send(cache, "store", h, obj_path)
     return send(cache, "path_for", h)
   end
+
+  # ensure_chunk_native(self, cache_dir, extern_names) -> ChunkImage, or
+  # an error string starting with "ASM ERROR:". The native-toolchain
+  # (self-hosted assembler, x64_asm.patlang/x64_pe_link.patlang)
+  # analogue of ensure_obj above: same cache-hit-or-fresh-assemble shape
+  # and same content_hash (already folds in x64_compiler_fingerprint(),
+  # see x64_make_compile_unit), but produces an in-memory ChunkImage
+  # instead of an on-disk .obj, since this linker has no COFF reader
+  # (x64_link_native_chunks's own header) and never needs one -- no
+  # nasm/gcc subprocess involved at all. Cached as JSON on disk (a
+  # ChunkImage is a plain tagged list of ints/strings, see
+  # x64_assemble_chunk's own return shape -- round-trips exactly through
+  # to_json_value/json_stringify/json_parse/from_json_value the same way
+  # x64_content_hash already serializes a func_ir) so a cache hit skips
+  # re-assembling entirely, preserving the whole point of this per-
+  # function architecture (an unchanged function costs nothing on a
+  # rebuild) for the native path too, not just the nasm path.
+  make a function called ensure_chunk_native takes self, cache_dir, extern_names returns chunk_or_err
+    let h = get(self, "content_hash")
+    let cache_path = cache_dir + "/" + h + ".chunk.json"
+    if file_exists(cache_path) == "1" then
+      return from_json_value(json_parse(read_file(cache_path)))
+    end
+    let func_ir = get(self, "func_ir")
+    let asm = emit_program_x64(["ProgramIR", "main", [func_ir], []], false, extern_names)
+    let chunk = x64_assemble_chunk(asm)
+    if not chunk then
+      return "ASM ERROR: x64_assemble_chunk failed for unit " + get(self, "name")
+    end
+    write_file(cache_path, json_stringify(to_json_value(chunk)))
+    return chunk
+  end
 }
 
 # Builds a CompileUnit for one function's IR -- the "constructor" step
@@ -242,5 +274,56 @@ class X64UnitLinker {
     end
     let objs = list_push(objs, apply_table_obj_path)
     return x64_link_objs(objs, runtime_obj_path, out_path)
+  end
+
+  # build_native(self, funcs, rt_names, runtime_asm_path, out_path) --
+  # the self-hosted-toolchain (x64_asm.patlang/x64_pe_link.patlang)
+  # analogue of build() above: same per-function cache-hit-or-fresh-
+  # assemble shape (ensure_chunk_native instead of ensure_obj), same
+  # apply-table generation, but produces in-memory ChunkImages and links
+  # them via x64_link_native_chunks -- no nasm/gcc subprocess anywhere
+  # in this path. Takes the RUNTIME'S OWN ASM SOURCE PATH (not a
+  # pre-built .obj -- this linker has no COFF reader, so
+  # self_hosting/build/x64_runtime.asm, written by build_x64_runtime.
+  # patlang regardless of which toolchain built its cached .obj, is
+  # assembled into a ChunkImage here directly), matching
+  # x64_link_native_chunks's own documented requirement.
+  #
+  # No non-blocking spawn()/parallelism here (unlike build() above) --
+  # x64_assemble_chunk runs synchronously, in-process, with no
+  # subprocess to overlap; ensure_chunk_native's own on-disk JSON cache
+  # is what keeps a rebuild of an otherwise-unchanged function cheap.
+  make a function called build_native takes self, funcs, rt_names, runtime_asm_path, out_path returns result
+    let cache = get(self, "cache")
+    let cache_dir = get(cache, "cache_dir")
+    let runtime_asm = read_file(runtime_asm_path)
+    let runtime_chunk = x64_assemble_chunk(runtime_asm)
+    if not runtime_chunk then
+      return "ASM ERROR: x64_assemble_chunk failed for runtime asm " + runtime_asm_path
+    end
+    let chunks = [runtime_chunk]
+    let n = funcs.length
+    let i = 0
+    while i < n do
+      let unit = x64_make_compile_unit(funcs[i])
+      let extern_names = x64_extern_names_for(funcs, i, rt_names)
+      let chunk_or_err = send(unit, "ensure_chunk_native", cache_dir, extern_names)
+      # chunk_or_err is either a ChunkImage (a list) or an "ASM ERROR:"-
+      # prefixed string -- check via type_of() rather than
+      # x64_build_contains, which assumes a plain string and would fail
+      # calling substr() on a list.
+      if type_of(chunk_or_err) == "string" then
+        return chunk_or_err
+      end
+      let chunks = list_push(chunks, chunk_or_err)
+      let i = i + 1
+    end
+    let apply_table_asm = x64_emit_apply_table_asm(funcs)
+    let apply_table_chunk = x64_assemble_chunk(apply_table_asm)
+    if not apply_table_chunk then
+      return "ASM ERROR: x64_assemble_chunk failed for the apply table"
+    end
+    let chunks = list_push(chunks, apply_table_chunk)
+    return x64_link_native_chunks(chunks, out_path)
   end
 }
