@@ -1167,6 +1167,25 @@ make a function called x64_instr_is_call_boundary takes instr, idx, dyn_bin_indi
   if ty == "MakeClosure" then
     return true
   end
+  if ty == "Const" then
+    # Same class of bug as the "+"/"=="/"!=" string carve-out below:
+    # an oversized numeric literal's Const emission embeds a REAL
+    # `call rt_bigint_from_decimal_str` (see
+    # x64_num_const_needs_bigint_promotion), invisible at this IR level
+    # since it's still just a "Const" node here -- but a local kept
+    # live in a pool register (rbx/r13/r14) across one of these Consts
+    # gets silently clobbered by that hidden call, exactly like the
+    # comparison bug this was found chasing (patlang-x64-int-48bit-
+    # grayzone-gap memory). Confirmed: `let a = <huge>; let b = <huge2>;
+    # print(a >= b)` wrongly registered `a` across `b`'s Const, giving a
+    # wrong comparison, while any extra statement in between happened
+    # to force both to spill and mask it.
+    if instr[1] == "num" then
+      if x64_num_const_needs_bigint_promotion(instr[2]) then
+        return true
+      end
+    end
+  end
   if ty == "Bin" then
     if x64_is_jump_target(dyn_bin_indices, idx) then
       return true
@@ -8084,6 +8103,18 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
                       sb_push(sb, "    call ExitProcess" + x64_nl_char())
                     else
                       sb_push(sb, "    pop rax" + x64_nl_char())
+                      # Restore via fixed [rbp-N] offsets (where the
+                      # prologue's own pushes landed, immediately below
+                      # rbp, before `sub rsp,frame_size` carved out the
+                      # rest of the frame) -- NOT via `pop`, since rsp at
+                      # this point reflects the function body's own
+                      # (balanced) stack traffic, not the state right
+                      # after the prologue's pushes.
+                      let pei = 0
+                      while pei < pool_used_n do
+                        sb_push(sb, "    mov " + pool_used[pei] + ", [rbp-" + (8 * (save_base + pei + 1)) + "]" + x64_nl_char())
+                        let pei = pei + 1
+                      end
                       sb_push(sb, "    leave" + x64_nl_char())
                       sb_push(sb, "    ret" + x64_nl_char())
                     end
@@ -8360,7 +8391,21 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
   # operand pair, freeing r13/r14 for the locals register allocator
   # (patlang-x64-register-allocator-slice8). ALWAYS reserved, same
   # unconditional-reservation reasoning as the CallValue slot above.
-  let frame_size = 8 * (to_num(list_len(spilled)) + 3)
+  # A function whose regmap claims rbx/r13/r14 for its own locals (see
+  # x64_build_regmap/x64_reg_pool) must save/restore whichever of those
+  # it actually uses, or any CALLER that also keeps a value live in the
+  # same register across the call to THIS function gets it silently
+  # clobbered -- confirmed as a real bug (rt_bigint_from_decimal_str's
+  # own use of rbx via rt_heap_alloc corrupting a caller-held BigInt
+  # comparison operand). Reserve dedicated frame slots for this (own
+  # `mov [rbp-N], reg` writes, not `push`/`pop` -- those slots must sit
+  # at fixed offsets alongside the other always-reserved slots below,
+  # not wherever rsp happens to be at prologue/epilogue time, since the
+  # function body's own call/spill traffic moves rsp around in between).
+  let pool_used = x64_reg_pool()
+  let pool_used_n = to_num(list_len(regmap))
+  let save_base = to_num(list_len(spilled)) + 3
+  let frame_size = 8 * (save_base + pool_used_n)
   if frame_size < 16 then
     let frame_size = 16
   end
@@ -8369,6 +8414,11 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
   sb_push(sb, "    push rbp" + x64_nl_char())
   sb_push(sb, "    mov rbp, rsp" + x64_nl_char())
   sb_push(sb, "    sub rsp, " + frame_size + x64_nl_char())
+  let pri = 0
+  while pri < pool_used_n do
+    sb_push(sb, "    mov [rbp-" + (8 * (save_base + pri + 1)) + "], " + pool_used[pri] + x64_nl_char())
+    let pri = pri + 1
+  end
   let argc = to_num(list_len(params))
   let p = 0
   while p < argc do
