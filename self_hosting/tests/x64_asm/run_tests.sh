@@ -13,6 +13,11 @@ FAIL=0
 PASS=0
 
 for asm in *.asm; do
+  # test_multidll_libm.asm needs a non-default (msvcrt.dll) import and
+  # has its own dedicated runner (run_multidll_test.sh) -- skip it here.
+  if [ "$asm" == "test_multidll_libm.asm" ]; then
+    continue
+  fi
   name="${asm%.asm}"
   ref_exe="F:/PatLang/self_hosting/tests/x64_asm/tmp_x64test_${name}_ref.exe"
   new_exe="F:/PatLang/self_hosting/tests/x64_asm/tmp_x64test_${name}_new.exe"
