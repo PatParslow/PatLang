@@ -49,67 +49,80 @@ make a function called xa_emit_u8 takes lst, v returns out
 end
 
 # Encodes v as `n` little-endian bytes, two's-complement for negatives.
-# Safe for n<=4 (fits well within PatLang's native int range even after
-# the 2^(8n) bias below); n=8 (imm64) is only ever used in this codebase
-# for positive tagged-pointer style constants OR small negative tagged
-# constants that fit a plain machine Int -- a genuinely negative 64-bit
-# BigInt immediate is out of scope, matching the assumption below.
+# n<=8 (imm64 is the largest form used anywhere in this codebase).
 #
-# BigInt branch: a real 64-bit immediate with the top bit set (e.g. a
-# pointer-tag mask like 0xF000000000000000 = 17293822569102704640,
-# found in x64_runtime.patlang's own rt_int_to_string) exceeds i64::MAX
-# and gets auto-promoted to BigInt by `to_num` -- the numeric tower's
-# bitwise ops (band/bor/bxor/shl/shr) only accept a plain machine Int
-# (rust-runtime/src/ir/ops.rs's `as_int`), so `uv band 255` on a BigInt
-# fails outright ("band: expected an integer"), confirmed directly.
-# `%`/`/` both work uniformly across Int and BigInt, so this branch
-# uses those instead -- but ONLY for BigInt, not unconditionally: `%`/
-# `/` are not guaranteed to match `band`/`shr`'s two's-complement
-# result for a NEGATIVE machine Int (band(-1,255)==255 via native
-# bitwise semantics; -1 % 256 is not guaranteed to also be 255), so the
-# plain-Int path below is left exactly as it was to avoid silently
-# breaking the negative-immediate case that already worked correctly.
+# Deliberately uses ONLY `+`/`-`/`*`/`>=`/`<` -- never `band`/`shr`/`/`/
+# `%` -- on `v` itself. This isn't just a BigInt accommodation (an
+# earlier version of this function branched on `type_of(v)`, using
+# `band`/`shr` for a "plain Int" and a separate safe path only for a
+# genuine BigInt): `band`/`shr`, when x64_asm.patlang itself is
+# COMPILED (not interpreted), silently misbehave for ANY value outside
+# this backend's own internal 48-bit "fast" tagged-int range -- found
+# directly via a value as unremarkable as 2^47 (well within i64,
+# `type_of` reports plain "int" both interpreted and compiled)
+# returning a WRONG `band 255` result (16 instead of the correct 0)
+# once compiled, and a considerably larger value (a real float64 bit
+# pattern, ~4.6e18) segfaulting outright. `/`/`%` have their own
+# separate, already-documented compiled-mode gap for genuine BigInt
+# (`os_exit(97)`) plus the Rational-promotion trap below. `+`/`-`/`*`/
+# comparisons are the only operators confirmed to behave correctly
+# across the FULL range (ordinary Int, an Int outside the 48-bit fast
+# range, and genuine BigInt) in both interpreted and compiled code, so
+# this function stays entirely within that safe set unconditionally,
+# rather than trying to track which specific range each operator does
+# or doesn't handle correctly.
+#
+# Algorithm: bias a negative value into the equivalent non-negative
+# two's-complement bit pattern first (via `+`, never `shl`, since `1
+# shl 64` is itself out of range for n=8), then peel off each of the
+# resulting value's bits from the TOP (bit 63) down via comparison and
+# subtraction against a shrinking power of two, placing each set bit
+# into the correct output byte. Must go top-down, not byte-by-byte from
+# the bottom up: testing a low bit against the ORIGINAL, still-large
+# remaining value before any higher bit has been subtracted out is
+# meaningless (it compares the whole value against a tiny power of
+# two, which is trivially true and proves nothing about that specific
+# bit) -- confirmed as a real bug this way, on a value as simple as
+# exactly 2^63, which came back as 2^63-1 (every low bit falsely "set")
+# before this was restructured as a single top-down pass.
 make a function called xa_int_to_bytes_le takes v, n returns bytes
-  if type_of(v) == "bigint" then
-    # `/` is exact (non-truncating) division in this numeric tower --
-    # it promotes to Rational whenever the dividend isn't a clean
-    # multiple of 256 (confirmed directly: (uv % 256) stays a proper
-    # Int, but plain `uv / 256` on an odd BigInt returns e.g.
-    # "17293822569102704641/256", a Rational, not a truncated
-    # integer). Only the FIRST BigInt immediate this codebase actually
-    # used (0xF000000000000000, a clean multiple of every power of
-    # 256) happened to hide this: `%` was 0, so `uv/256` was ALSO
-    # exact by construction and no Rational ever appeared -- a second,
-    # non-multiple-of-256 BigInt immediate (found only via a raw
-    # non-integer byte value reaching write_file_bytes, deep in the
-    # linker, far downstream of where it was actually produced) exposed
-    # it. Fixed by computing the quotient via subtraction
-    # (`(uv - rem) / 256`, which IS exact by construction) instead of
-    # dividing the original value directly.
-    let uv = v
-    let out = []
-    let i = 0
-    while i < n do
-      let rem = to_num(uv % 256)
-      let out = list_push(out, rem)
-      let uv = to_num((uv - rem) / 256)
-      let i = i + 1
-    end
-    return out
+  let powers = [1]
+  let k = 0
+  while k < 63 do
+    let powers = list_push(powers, powers[k] * 2)
+    let k = k + 1
   end
   let uv = v
   if uv < 0 then
     let bits = n * 8
     if bits < 64 then
-      let uv = v + (1 shl bits)
+      let uv = v + powers[bits]
+    else
+      let uv = v + (powers[63] * 2)
     end
   end
   let out = []
-  let i = 0
-  while i < n do
-    let out = list_push(out, uv band 255)
-    let uv = uv shr 8
-    let i = i + 1
+  let bi = 0
+  while bi < n do
+    let out = list_push(out, 0)
+    let bi = bi + 1
+  end
+  # `bit_pos`/`byte_idx`/`bit_in_byte` below are always plain machine
+  # ints (0-63/0-7), never BigInt, so ordinary `/`/`%` on THEM (never
+  # on `uv`/`remaining` themselves) is safe.
+  let remaining = uv
+  let bit_pos = 63
+  while bit_pos >= 0 do
+    let p = powers[bit_pos]
+    if remaining >= p then
+      let remaining = remaining - p
+      let byte_idx = bit_pos / 8
+      if byte_idx < n then
+        let bit_in_byte = bit_pos % 8
+        let out = list_set(out, byte_idx, out[byte_idx] + powers[bit_in_byte])
+      end
+    end
+    let bit_pos = bit_pos - 1
   end
   return out
 end
@@ -209,6 +222,131 @@ end
 # Bare wrapper over to_num for readability at call sites.
 make a function called xa_parse_int takes s returns v
   return to_num(s)
+end
+
+make a function called xa_pow10 takes n returns v
+  let v = 1
+  let i = 0
+  while i < n do
+    let v = v * 10
+    let i = i + 1
+  end
+  return v
+end
+
+# Parses a decimal string of the form "[-]digits.digits" (always
+# containing exactly one '.', per x64_float_literal_text's own
+# guarantee -- callers never need to handle a dotless or exponent-
+# notation form) into its exact IEEE-754 double bit pattern, entirely
+# via integer/BigInt arithmetic -- never materializes an actual
+# "Float" value at any point. That's deliberate, not just a style
+# choice: this backend's own float_mode is a per-FUNCTION (not
+# per-value) static classification, and `to_num` compiled natively
+# only accumulates decimal digits (silently ignoring "."), so neither
+# "make this function float_mode" nor "call to_num" reliably produces
+# a correct float value here at all, let alone its exact bits.
+# Staying entirely in Int/BigInt arithmetic sidesteps both problems.
+#
+# Algorithm: represent the value exactly as numerator/denominator
+# (both arbitrary-precision integers, e.g. "3.14" -> 314/100),
+# normalize into the form (num/den)*2^e with num/den in [1,2) by
+# repeated doubling of whichever side is smaller (never fractional,
+# so plain BigInt multiplication suffices), then extract the 52
+# fraction bits one at a time via ordinary restoring binary long
+# division (double num, compare to den, subtract-and-set-bit or not) --
+# deliberately NEVER using `/` or `%` on a BigInt-sized value: this
+# backend's own compiled dynamic-dispatch codegen for those two
+# operators only handles genuine fixnum operands and hard-exits
+# (`os_exit(97)`, the ".MOD_UNSUPPORTED_"/equivalent DIV trap) on a
+# real BigInt one, confirmed directly (this function's own scaled
+# numerator routinely exceeds 48 bits) -- `*`, `-`, `>=`/`<`, and `+`
+# all verified working correctly on BigInt operands when compiled,
+# unlike `/`/`%`. Rounds half-UP, not the IEEE-correct half-to-EVEN --
+# a deliberate, real simplification: an exact tie at the 53rd bit
+# would require the fractional part to be EXACTLY representable in
+# exactly 53 bits of binary precision, which essentially never happens
+# for a literal a real program would actually write, so this is
+# correct for every realistic input without the extra complexity of
+# tie-breaking-to-even.
+make a function called xa_float_bits_of_string takes s returns bits
+  let neg = false
+  let i = 0
+  if char_code(s, 0) == 45 then
+    let neg = true
+    let i = 1
+  end
+  let dot = i
+  while char_code(s, dot) != 46 do
+    let dot = dot + 1
+  end
+  let int_part = substr(s, i, dot - i)
+  let frac_part = substr(s, dot + 1, s.length - dot - 1)
+  let frac_len = frac_part.length
+  let num = xa_parse_int(int_part + frac_part)
+  let den = xa_pow10(frac_len)
+
+  if num == 0 then
+    if neg then
+      return 9223372036854775808
+    end
+    return 0
+  end
+
+  let e = 0
+  if num >= den then
+    while num >= (den * 2) do
+      let den = den * 2
+      let e = e + 1
+    end
+  else
+    while num < den do
+      let num = num * 2
+      let e = e - 1
+    end
+  end
+
+  # num/den is now in [1,2) -- the leading "1" is the implicit bit
+  # every normal double's significand already has, so subtract it off
+  # once before extracting fraction bits: only the ".something" part
+  # (now num/den in [0,1)) is real mantissa content.
+  let num = num - den
+
+  # Extract the 52 fraction bits one at a time via restoring binary
+  # long division (double num, compare to den: if it fits, that bit
+  # is 1 and we subtract; otherwise 0).
+  let frac_bits = 0
+  let bit_i = 0
+  while bit_i < 52 do
+    let num = num * 2
+    let frac_bits = frac_bits * 2
+    if num >= den then
+      let num = num - den
+      let frac_bits = frac_bits + 1
+    end
+    let bit_i = bit_i + 1
+  end
+  # Round half-up using one more bit: double the leftover remainder
+  # and compare to den again (equivalent to asking whether the 53rd
+  # bit would be >= 1, i.e. the true fraction is at or past halfway
+  # between this value and the next representable one).
+  let num = num * 2
+  if num >= den then
+    let frac_bits = frac_bits + 1
+  end
+  # A round-up carry can push the fraction to exactly 2^52 (e.g.
+  # 0.99999...-style rounding) -- renormalize by bumping the exponent.
+  if frac_bits >= 4503599627370496 then
+    let frac_bits = 0
+    let e = e + 1
+  end
+
+  let exponent_biased = e + 1023
+  let mantissa_bits = frac_bits
+  let result = mantissa_bits + (exponent_biased * 4503599627370496)
+  if neg then
+    let result = result + 9223372036854775808
+  end
+  return result
 end
 
 make a function called xa_looks_like_int takes s returns yes
@@ -432,17 +570,22 @@ make a function called xa_parse_operand takes raw returns operand
   end
 
   # NASM's `__float64__(literal)` pseudo-immediate: codegen_x64.patlang
-  # emits `mov reg, __float64__(x)` to load an arbitrary float
-  # constant's raw IEEE-754 bit pattern into a general register (see
-  # x64_runtime.patlang's own float-decompose/float-classify code) --
-  # found missing here only at real-scale (x64_runtime.patlang)
-  # verification, none of Phase 2's hand-written fixtures used it.
-  # float_to_bits is a new, narrow host primitive (same "one
-  # unavoidable exception" reasoning as write_file_bytes) since no
-  # ordinary PatLang arithmetic can compute an IEEE-754 bit pattern.
+  # emits `mov reg, __float64__(x)` for EVERY float literal Const in
+  # ANY compiled program (not just x64_runtime.patlang's own window-
+  # title strings -- confirmed by reading the real emission site,
+  # x64_emit_func's "is_float_const or contains '.'" branch), to load
+  # its raw IEEE-754 bit pattern into a general register. Parsed here
+  # via xa_float_bits_of_string, NOT `to_num` + a host `float_to_bits`
+  # primitive: this needs to work when x64_asm.patlang ITSELF is
+  # compiled (to run inside patc1.exe natively, not just interpreted),
+  # and a compiled program has no interpreter to call a host-only
+  # primitive back into. `to_num` compiled natively is also, separately,
+  # too narrow for this -- confirmed directly: x64_runtime.patlang's
+  # own to_num implementation only accumulates decimal DIGITS, silently
+  # ignoring the "." entirely (to_num("3.14") compiled == 3, not 3.14).
   if str_starts_with(s, "__float64__(") then
     let inner = substr(s, 12, s.length - 13)
-    return ["imm", float_to_bits(to_num(inner))]
+    return ["imm", xa_float_bits_of_string(inner)]
   end
 
   let reg = xa_lookup_reg(s)

@@ -2,6 +2,7 @@ use crate::ast::{Expr, Stmt, BinaryOperator};
 use crate::parser::is_side_effect_free_expr;
 use std::collections::HashSet;
 use super::types::*;
+use super::numeric::normalize;
 
 #[derive(Default)]
 pub struct Lowerer {
@@ -615,8 +616,16 @@ impl Lowerer {
             // exactly: `print(17293822569102704640)` gave
             // `9223372036854775807` before this fix).
             Expr::BigNumber(s) => {
+                // Normalize back down to a plain Int when it fits --
+                // needed now that the lexer also routes exact-i64-but-
+                // beyond-f64-precision literals (e.g. a real ~4.6e18
+                // IEEE-754 bit-pattern constant) through this same
+                // token/Expr, not just genuinely-exceeds-i64::MAX ones;
+                // without this they'd be tagged as BigInt even though
+                // they fit i64 exactly, a real (if less severe than the
+                // original GitHub #39 bug) representation inconsistency.
                 let b: num_bigint::BigInt = s.parse().unwrap_or_else(|_| num_bigint::BigInt::from(0));
-                f.body.push(Instr::Const(Value::BigInt(b)));
+                f.body.push(Instr::Const(normalize(Value::BigInt(b))));
             }
             Expr::Float(n) => f.body.push(Instr::Const(Value::Float(*n))),
             Expr::String(s) => f.body.push(Instr::Const(Value::String((s.clone()).into()))),

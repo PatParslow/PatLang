@@ -319,15 +319,32 @@ impl<'a> Lexer<'a> {
                     lex_debug!("[DEBUG][lexer] Returning Token::Float({})", num);
                     return Ok(Token::Float(num));
                 }
-                // GitHub #39: try the exact i64 parse first -- if the
-                // literal's decimal text doesn't fit i64, emit BigNumber
-                // (preserving the exact text) instead of silently losing
-                // precision through an f64 round-trip. Only integer
-                // literals reach this branch (is_float is false here).
-                if let Ok(_) = num_str.parse::<i64>() {
-                    let num = num_str.parse::<f64>().unwrap_or(0.0);
-                    lex_debug!("[DEBUG][lexer] Returning Token::Number({})", num);
-                    return Ok(Token::Number(num));
+                // GitHub #39 fixed the case where the literal's decimal
+                // text doesn't fit i64 at all (BigNumber preserves the
+                // exact text instead of silently losing precision through
+                // an f64 round-trip). It missed a second, narrower case:
+                // f64 can only represent INTEGERS exactly up to 2^53 --
+                // a literal that fits i64 but exceeds that (e.g. a real
+                // ~4.6e18 IEEE-754 bit-pattern constant) still went
+                // through the same lossy f64 round-trip as any ordinary
+                // small number, and came back silently rounded to the
+                // nearest representable f64 (confirmed directly:
+                // `print(4614253070214989087)` returned
+                // `4614253070214988800`, off by 287, corrupted at parse
+                // time, before any arithmetic ever touched it). Only
+                // integer literals reach this branch (is_float is false
+                // here); route anything past the exact-f64-integer range
+                // through the same BigNumber(String) path GitHub #39
+                // already built -- downstream lowering parses that text
+                // exactly via BigInt and normalizes back to a plain Int
+                // when it fits (see Expr::BigNumber's own lowering), so
+                // this value round-trips exactly either way.
+                if let Ok(iv) = num_str.parse::<i64>() {
+                    if iv.unsigned_abs() <= (1u64 << 53) {
+                        let num = num_str.parse::<f64>().unwrap_or(0.0);
+                        lex_debug!("[DEBUG][lexer] Returning Token::Number({})", num);
+                        return Ok(Token::Number(num));
+                    }
                 }
                 lex_debug!("[DEBUG][lexer] Returning Token::BigNumber({})", num_str);
                 return Ok(Token::BigNumber(num_str.to_string()));
