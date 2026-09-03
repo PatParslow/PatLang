@@ -110,6 +110,7 @@ const HOST_CHUNK_TABLE: &[(&str, ChunkId)] = &[
     ("sb_str", ChunkId::CollectionsHandles),
     ("read_file", ChunkId::Files),
     ("write_file", ChunkId::Files),
+    ("write_file_bytes", ChunkId::Files),
     ("touch_file", ChunkId::Files),
     ("file_exists", ChunkId::Files),
     ("list_dir", ChunkId::Files),
@@ -2889,6 +2890,41 @@ fn host_call_collections_handles(name: &str, args: &[Value]) -> Option<Result<Va
                 if let Some(parent) = std::path::Path::new(&p).parent() { let _ = std::fs::create_dir_all(parent); }
                 std::fs::write(&p, contents).map(|_| Value::Bool(true)).map_err(|e| format!("write_file: {}: {}", p, e))
             }
+            "write_file_bytes" => {
+                // write_file_bytes(path, byte_list) -> Bool -- the one
+                // unavoidable exception to "runtime logic belongs in
+                // PatLang, not a native primitive" (see hosts.rs's own
+                // host_write_file_bytes, which this mirrors): a PatLang
+                // String is UTF-8-only, so raw binary content (a PE
+                // image, self_hosting/lib/x64_pe_link.patlang's own real
+                // use) can't round-trip through write_file's own
+                // String-typed `contents`. Needed here too now that
+                // x64_pe_link.patlang is itself part of patc1.exe's own
+                // compiled body (Phase 5 native-toolchain wiring) --
+                // previously this codegen backend never compiled any
+                // caller of write_file_bytes, so its absence here went
+                // unnoticed.
+                let p = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => to_s(v), None => String::new() };
+                let items: &[Value] = match args.get(1) {
+                    Some(Value::List(xs)) => xs.as_ref(),
+                    _ => return Err("write_file_bytes: expected a list of byte values (0-255) as the second arg".into()),
+                };
+                let mut bytes = Vec::with_capacity(items.len());
+                for (i, v) in items.iter().enumerate() {
+                    let n = match v {
+                        Value::Int(n) => *n,
+                        Value::Number(n) => *n as i64,
+                        Value::Float(n) => *n as i64,
+                        _ => return Err(format!("write_file_bytes: byte at index {} is not a number", i)),
+                    };
+                    if !(0..=255).contains(&n) {
+                        return Err(format!("write_file_bytes: byte at index {} ({}) is out of range 0-255", i, n));
+                    }
+                    bytes.push(n as u8);
+                }
+                if let Some(parent) = std::path::Path::new(&p).parent() { let _ = std::fs::create_dir_all(parent); }
+                std::fs::write(&p, bytes).map(|_| Value::Bool(true)).map_err(|e| format!("write_file_bytes: {}: {}", p, e))
+            }
             "touch_file" => {
                 // touch_file(path) -> String message (OK <abs> or ERR: <msg>)
                 let p = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => display_value(v), None => String::new() };
@@ -2981,7 +3017,7 @@ fn host_call_collections_handles(name: &str, args: &[Value]) -> Option<Result<Va
 
 fn host_call_files(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match name {
-        "read_file" | "write_file" | "touch_file" | "file_exists" | "list_dir" | "rename_file" | "exec_capture" | "exec_capture_io" => Some(host_call_files_inner(name, args)),
+        "read_file" | "write_file" | "write_file_bytes" | "touch_file" | "file_exists" | "list_dir" | "rename_file" | "exec_capture" | "exec_capture_io" => Some(host_call_files_inner(name, args)),
         _ => None,
     }
 }
