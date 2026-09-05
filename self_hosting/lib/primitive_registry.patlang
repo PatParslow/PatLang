@@ -93,7 +93,25 @@ end
 # attempted here (see the plan's explicit non-goal on unifying this with
 # the GOAP planner's own effect/precondition language).
 make a function called pr_register takes registry, name, try_fn_name, arity, cost, snippets, arg_types, ret_type, arg_contracts returns done
-  send(registry, "set", name, ["prim", try_fn_name, arity, cost, snippets, arg_types, ret_type, arg_contracts])
+  return pr_register_tagged(registry, name, try_fn_name, arity, cost, snippets, arg_types, ret_type, arg_contracts, [])
+end
+
+# Every field pr_register has, plus a `tags` list (associative, human- and
+# machine-legible pre-filter labels -- see plan: descriptive tagging for
+# the synthesis-engine registry). pr_register delegates here with tags=[]
+# so there is exactly one code path; existing 9-arg call sites never need
+# to change. Tags are additive metadata only -- they never gate pr_lookup
+# or pr_names_for_ret_type, only narrow a caller's OWN candidate list via
+# pr_lookup_by_tags/pr_narrow_by_tags before the real contract/type check
+# still runs unchanged.
+make a function called pr_register_tagged takes registry, name, try_fn_name, arity, cost, snippets, arg_types, ret_type, arg_contracts, tags returns done
+  let i = 0
+  let n = to_num(list_len(tags))
+  while i < n do
+    require pr_tag_valid(tags[i])
+    let i = i + 1
+  end
+  send(registry, "set", name, ["prim", try_fn_name, arity, cost, snippets, arg_types, ret_type, arg_contracts, tags])
   let idx = get(registry, "__by_ret_type__")
   if not idx then
     let idx = new("Dict", "pr_by_ret_type_" + pr_next_id())
@@ -105,7 +123,87 @@ make a function called pr_register takes registry, name, try_fn_name, arity, cos
   else
     send(idx, "set", ret_type, [name])
   end
+  pr_index_tags(registry, name, tags)
   return true
+end
+
+# Adds `name` to the __by_tag__ inverted index under each of `tags` --
+# split out of pr_register_tagged so register_composite (synthesis_by_
+# example.patlang) can also index a composite's auto-derived tags without
+# re-registering the whole entry.
+make a function called pr_index_tags takes registry, name, tags returns done
+  if to_num(list_len(tags)) == 0 then
+    return true
+  end
+  let idx = get(registry, "__by_tag__")
+  if not idx then
+    let idx = new("Dict", "pr_by_tag_" + pr_next_id())
+    send(registry, "set", "__by_tag__", idx)
+  end
+  let i = 0
+  let n = to_num(list_len(tags))
+  while i < n do
+    let tag = tags[i]
+    let existing = get(idx, tag)
+    if existing then
+      send(idx, "set", tag, list_push(existing, name))
+    else
+      send(idx, "set", tag, [name])
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+# Stored tag format: lowercase, at most one "facet:value" colon, no spaces
+# (use "-") -- see plan §2. Called at registration time so a malformed tag
+# is a loud, immediate failure rather than a silent no-match later. No
+# lowercase()/contains_text() host primitive exists (checked hosts.rs and
+# the lib tree) -- checked directly via char_code, the same primitive
+# try_char_code above already wraps.
+make a function called pr_tag_valid takes tag returns ok
+  if gc_find_substr(tag, " ") >= 0 then
+    return false
+  end
+  let i = 0
+  let n = to_num(tag.length)
+  while i < n do
+    let c = char_code(tag, i)
+    if (c >= 65) and (c <= 90) then
+      return false
+    end
+    let i = i + 1
+  end
+  let first_colon = gc_find_substr(tag, ":")
+  if first_colon < 0 then
+    return true
+  end
+  let rest = substr(tag, first_colon + 1, tag.length - (first_colon + 1))
+  return gc_find_substr(rest, ":") < 0
+end
+
+# entry[8] (tags) is absent on any entry created before this change (or
+# via the plain 9-arg pr_register path, which now always supplies [] --
+# but a caller could still hold an old, shorter-shaped entry from before
+# this file existed) -- always go through this accessor rather than
+# positional indexing so those entries don't need to be rewritten.
+make a function called pr_tags takes entry returns tags
+  if to_num(list_len(entry)) < 9 then
+    return []
+  end
+  return entry[8]
+end
+
+# true only for a composite whose tags[] were auto-derived by
+# register_composite's provisional inheritance rule (plan §4.3) --
+# entries[9] is absent on every manually-authored primitive entry, which
+# is exactly the "manually authored, no ancestor to infer from" case §4
+# says should never be marked suggested.
+make a function called pr_tags_suggested takes entry returns suggested
+  if to_num(list_len(entry)) < 10 then
+    return false
+  end
+  return entry[9]
 end
 
 make a function called pr_lookup takes registry, name returns entry
@@ -134,6 +232,103 @@ make a function called pr_names_for_ret_type takes registry, ret_type returns na
     return exact
   end
   return sbe_map_json_str_free(exact, poly)
+end
+
+make a function called pr_list_contains takes list, val returns ok
+  let i = 0
+  let n = to_num(list_len(list))
+  while i < n do
+    if list[i] == val then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# Names registered under ANY of `tags` (mode "any", union) or under EVERY
+# one of `tags` (mode "all", intersection) via the __by_tag__ inverted
+# index pr_register_tagged/pr_index_tags maintain -- the O(1)-per-tag
+# pre-filter the whole design exists for, as opposed to a full registry
+# scan. Returns [] (not an error) for an unknown tag or an empty registry
+# -- an empty result is a legitimate "nothing tagged that way yet", not a
+# failure, since tags are optional metadata a caller can always fall back
+# from.
+make a function called pr_lookup_by_tags takes registry, tags, mode returns names
+  let idx = get(registry, "__by_tag__")
+  if not idx then
+    return []
+  end
+  let n = to_num(list_len(tags))
+  if n == 0 then
+    return []
+  end
+  if mode == "all" then
+    let result = get(idx, tags[0])
+    if not result then
+      let result = []
+    end
+    let i = 1
+    while i < n do
+      let bucket = get(idx, tags[i])
+      if not bucket then
+        let bucket = []
+      end
+      let filtered = []
+      let j = 0
+      let jn = to_num(list_len(result))
+      while j < jn do
+        if pr_list_contains(bucket, result[j]) then
+          let filtered = list_push(filtered, result[j])
+        end
+        let j = j + 1
+      end
+      let result = filtered
+      let i = i + 1
+    end
+    return result
+  end
+  let out = []
+  let i = 0
+  while i < n do
+    let bucket = get(idx, tags[i])
+    if bucket then
+      let j = 0
+      let bn = to_num(list_len(bucket))
+      while j < bn do
+        if not pr_list_contains(out, bucket[j]) then
+          let out = list_push(out, bucket[j])
+        end
+        let j = j + 1
+      end
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# The actual insertion point into the synthesis search (plan §5):
+# narrows a caller's OWN `primitive_names` candidate list down to the
+# subset that also matches `intent_tags`, preserving primitive_names'
+# order (so synthesize_from_examples' "first match in original order
+# wins" determinism is untouched). Passing intent_tags=[] is a no-op --
+# returns primitive_names unchanged -- so an existing caller that doesn't
+# care about tags is never forced to adopt them.
+make a function called pr_narrow_by_tags takes registry, primitive_names, intent_tags, mode returns names
+  if to_num(list_len(intent_tags)) == 0 then
+    return primitive_names
+  end
+  let tagged = pr_lookup_by_tags(registry, intent_tags, mode)
+  let out = []
+  let i = 0
+  let n = to_num(list_len(primitive_names))
+  while i < n do
+    if pr_list_contains(tagged, primitive_names[i]) then
+      let out = list_push(out, primitive_names[i])
+    end
+    let i = i + 1
+  end
+  return out
 end
 
 # Plain list concatenation, named locally so this file doesn't need to
@@ -442,49 +637,49 @@ make a function called pr_standard_registry returns registry
   pr_set_snippet(s_chr, "patlang", "chr({0})")
   pr_set_snippet(s_chr, "ruby", "({0}).chr")
   pr_set_snippet(s_chr, "python", "chr({0})")
-  pr_register(registry, "chr", "try_chr", 1, 1, s_chr, ["int"], "string", [""])
+  pr_register_tagged(registry, "chr", "try_chr", 1, 1, s_chr, ["int"], "string", [""], ["string:encoding"])
 
   let s_char_code = pr_new_snippets()
   pr_set_snippet(s_char_code, "patlang", "char_code({0}, {1})")
   pr_set_snippet(s_char_code, "ruby", "({0}).getbyte({1})")
   pr_set_snippet(s_char_code, "python", "ord({0}[{1}])")
-  pr_register(registry, "char_code", "try_char_code", 2, 1, s_char_code, ["string", "int"], "int", ["", "pr_contract_nonneg"])
+  pr_register_tagged(registry, "char_code", "try_char_code", 2, 1, s_char_code, ["string", "int"], "int", ["", "pr_contract_nonneg"], ["string:encoding"])
 
   let s_substr = pr_new_snippets()
   pr_set_snippet(s_substr, "patlang", "substr({0}, {1}, {2})")
   pr_set_snippet(s_substr, "ruby", "({0})[{1}, {2}]")
   pr_set_snippet(s_substr, "python", "({0})[{1}:{1}+{2}]")
-  pr_register(registry, "substr", "try_substr", 3, 1, s_substr, ["string", "int", "int"], "string", ["", "pr_contract_nonneg", "pr_contract_nonneg"])
+  pr_register_tagged(registry, "substr", "try_substr", 3, 1, s_substr, ["string", "int", "int"], "string", ["", "pr_contract_nonneg", "pr_contract_nonneg"], ["string:manipulation"])
 
   let s_concat = pr_new_snippets()
   pr_set_snippet(s_concat, "patlang", "({0} + {1})")
   pr_set_snippet(s_concat, "ruby", "({0} + {1})")
   pr_set_snippet(s_concat, "python", "({0} + {1})")
-  pr_register(registry, "concat", "try_concat", 2, 1, s_concat, ["string", "string"], "string", ["", ""])
+  pr_register_tagged(registry, "concat", "try_concat", 2, 1, s_concat, ["string", "string"], "string", ["", ""], ["string:manipulation"])
 
   let s_str_eq = pr_new_snippets()
   pr_set_snippet(s_str_eq, "patlang", "({0} == {1})")
   pr_set_snippet(s_str_eq, "ruby", "({0} == {1})")
   pr_set_snippet(s_str_eq, "python", "({0} == {1})")
-  pr_register(registry, "str_eq", "try_str_eq", 2, 1, s_str_eq, ["string", "string"], "bool", ["", ""])
+  pr_register_tagged(registry, "str_eq", "try_str_eq", 2, 1, s_str_eq, ["string", "string"], "bool", ["", ""], ["string:compare"])
 
   let s_str_len = pr_new_snippets()
   pr_set_snippet(s_str_len, "patlang", "({0}).length")
   pr_set_snippet(s_str_len, "ruby", "({0}).length")
   pr_set_snippet(s_str_len, "python", "len({0})")
-  pr_register(registry, "str_len", "try_str_len", 1, 1, s_str_len, ["string"], "int", [""])
+  pr_register_tagged(registry, "str_len", "try_str_len", 1, 1, s_str_len, ["string"], "int", [""], ["string:manipulation"])
 
   let s_find_substr = pr_new_snippets()
   pr_set_snippet(s_find_substr, "patlang", "gc_find_substr({0}, {1})")
   pr_set_snippet(s_find_substr, "ruby", "(({0}).index({1}) or -1)")
   pr_set_snippet(s_find_substr, "python", "({0}).find({1})")
-  pr_register(registry, "find_substr", "try_find_substr", 2, 1, s_find_substr, ["string", "string"], "int", ["", ""])
+  pr_register_tagged(registry, "find_substr", "try_find_substr", 2, 1, s_find_substr, ["string", "string"], "int", ["", ""], ["string:search"])
 
   let s_index_of = pr_new_snippets()
   pr_set_snippet(s_index_of, "patlang", "gc_find_substr({0}, {1})")
   pr_set_snippet(s_index_of, "ruby", "(({0}).index({1}) or -1)")
   pr_set_snippet(s_index_of, "python", "({0}).find({1})")
-  pr_register(registry, "index_of", "try_index_of", 2, 1, s_index_of, ["string", "string"], "int", ["", ""])
+  pr_register_tagged(registry, "index_of", "try_index_of", 2, 1, s_index_of, ["string", "string"], "int", ["", ""], ["string:search"])
 
   # NOTE: this call-site template is only correct when the needle IS
   # found (it doesn't special-case gc_find_substr's -1-not-found sentinel
@@ -494,61 +689,61 @@ make a function called pr_standard_registry returns registry
   # evaluation path, which always calls the real try_ function.
   let s_index_of_from = pr_new_snippets()
   pr_set_snippet(s_index_of_from, "patlang", "(gc_find_substr(substr({0}, {2}, ({0}).length - {2}), {1}) + {2})")
-  pr_register(registry, "index_of_from", "try_index_of_from", 3, 2, s_index_of_from, ["string", "string", "int"], "int", ["", "", "pr_contract_nonneg"])
+  pr_register_tagged(registry, "index_of_from", "try_index_of_from", 3, 2, s_index_of_from, ["string", "string", "int"], "int", ["", "", "pr_contract_nonneg"], ["string:search"])
 
   let s_add = pr_new_snippets()
   pr_set_snippet(s_add, "patlang", "({0} + {1})")
   pr_set_snippet(s_add, "ruby", "({0} + {1})")
   pr_set_snippet(s_add, "python", "({0} + {1})")
-  pr_register(registry, "add", "try_add", 2, 1, s_add, ["int", "int"], "int", ["", ""])
+  pr_register_tagged(registry, "add", "try_add", 2, 1, s_add, ["int", "int"], "int", ["", ""], ["math:arithmetic"])
 
   let s_sub = pr_new_snippets()
   pr_set_snippet(s_sub, "patlang", "({0} - {1})")
   pr_set_snippet(s_sub, "ruby", "({0} - {1})")
   pr_set_snippet(s_sub, "python", "({0} - {1})")
-  pr_register(registry, "sub", "try_sub", 2, 1, s_sub, ["int", "int"], "int", ["", ""])
+  pr_register_tagged(registry, "sub", "try_sub", 2, 1, s_sub, ["int", "int"], "int", ["", ""], ["math:arithmetic"])
 
   let s_geq = pr_new_snippets()
   pr_set_snippet(s_geq, "patlang", "({0} >= {1})")
   pr_set_snippet(s_geq, "ruby", "({0} >= {1})")
   pr_set_snippet(s_geq, "python", "({0} >= {1})")
-  pr_register(registry, "geq", "try_geq", 2, 1, s_geq, ["int", "int"], "bool", ["", ""])
+  pr_register_tagged(registry, "geq", "try_geq", 2, 1, s_geq, ["int", "int"], "bool", ["", ""], ["math:compare"])
 
   let s_gt = pr_new_snippets()
   pr_set_snippet(s_gt, "patlang", "({0} > {1})")
   pr_set_snippet(s_gt, "ruby", "({0} > {1})")
   pr_set_snippet(s_gt, "python", "({0} > {1})")
-  pr_register(registry, "gt", "try_gt", 2, 1, s_gt, ["int", "int"], "bool", ["", ""])
+  pr_register_tagged(registry, "gt", "try_gt", 2, 1, s_gt, ["int", "int"], "bool", ["", ""], ["math:compare"])
 
   let s_cond = pr_new_snippets()
   pr_set_snippet(s_cond, "patlang", "sbe_pat_cond({0}, {1}, {2})")
-  pr_register(registry, "cond", "try_cond", 3, 1, s_cond, ["bool", "any", "any"], "any", ["", "", ""])
+  pr_register_tagged(registry, "cond", "try_cond", 3, 1, s_cond, ["bool", "any", "any"], "any", ["", "", ""], ["paradigm:functional"])
 
   let s_eq_int = pr_new_snippets()
   pr_set_snippet(s_eq_int, "patlang", "({0} == {1})")
   pr_set_snippet(s_eq_int, "ruby", "({0} == {1})")
   pr_set_snippet(s_eq_int, "python", "({0} == {1})")
-  pr_register(registry, "eq_int", "try_eq_int", 2, 1, s_eq_int, ["int", "int"], "bool", ["", ""])
+  pr_register_tagged(registry, "eq_int", "try_eq_int", 2, 1, s_eq_int, ["int", "int"], "bool", ["", ""], ["math:compare"])
 
   let s_list_get = pr_new_snippets()
   pr_set_snippet(s_list_get, "patlang", "list_get({0}, {1})")
   pr_set_snippet(s_list_get, "ruby", "({0})[{1}]")
   pr_set_snippet(s_list_get, "python", "({0})[{1}]")
-  pr_register(registry, "list_get", "try_list_get", 2, 1, s_list_get, ["list", "int"], "any", ["", "pr_contract_nonneg"])
+  pr_register_tagged(registry, "list_get", "try_list_get", 2, 1, s_list_get, ["list", "int"], "any", ["", "pr_contract_nonneg"], ["collection:access"])
 
   let s_list_len = pr_new_snippets()
   pr_set_snippet(s_list_len, "patlang", "to_num(list_len({0}))")
   pr_set_snippet(s_list_len, "ruby", "({0}).length")
   pr_set_snippet(s_list_len, "python", "len({0})")
-  pr_register(registry, "list_len", "try_list_len", 1, 1, s_list_len, ["list"], "int", [""])
+  pr_register_tagged(registry, "list_len", "try_list_len", 1, 1, s_list_len, ["list"], "int", [""], ["collection:access"])
 
   let s_tcp_connect = pr_new_snippets()
   pr_set_snippet(s_tcp_connect, "patlang", "tcp_try_connect({0}, {1})")
-  pr_register(registry, "tcp_connect", "try_tcp_connect", 2, 5, s_tcp_connect, ["string", "int"], "int", ["", "pr_contract_nonneg"])
+  pr_register_tagged(registry, "tcp_connect", "try_tcp_connect", 2, 5, s_tcp_connect, ["string", "int"], "int", ["", "pr_contract_nonneg"], ["io:network", "effectful"])
 
   let s_tcp_listen = pr_new_snippets()
   pr_set_snippet(s_tcp_listen, "patlang", "tcp_try_listen({0})")
-  pr_register(registry, "tcp_listen", "try_tcp_listen", 1, 5, s_tcp_listen, ["int"], "int", ["pr_contract_nonneg"])
+  pr_register_tagged(registry, "tcp_listen", "try_tcp_listen", 1, 5, s_tcp_listen, ["int"], "int", ["pr_contract_nonneg"], ["io:network", "effectful"])
 
   return registry
 end

@@ -1,0 +1,96 @@
+# BDD-style selftest for descriptive tagging on the synthesis-engine
+# primitive/composite registry (see plan: docs/plans/synthesis_tagging_
+# design.md). Proves: manual tags on primitives are queryable via the
+# __by_tag__ inverted index (pr_lookup_by_tags), a tag-based pre-filter
+# narrows a caller's own primitive_names list (pr_narrow_by_tags) without
+# touching the existing contract/type check, untagged legacy-shaped
+# entries stay backward compatible, and composites synthesized from
+# tagged primitives auto-inherit a provisional tag set (register_composite
+# via sbe_derive_composite_tags) rather than starting untagged.
+
+include "lib/test.patlang"
+include "lib/synthesis_by_example.patlang"
+
+t_init()
+
+let registry = pr_standard_registry()
+
+# ---- forward field + inverse index ----
+
+let add_entry = pr_lookup(registry, "add")
+check("add's manually-authored tags are readable via pr_tags", pr_tags(add_entry), ["math:arithmetic"])
+check("add is NOT marked as a suggested/provisional tag set (manually authored)", pr_tags_suggested(add_entry), false)
+
+let by_arith = pr_lookup_by_tags(registry, ["math:arithmetic"], "any")
+check("__by_tag__ finds add under math:arithmetic", pr_list_contains(by_arith, "add"), true)
+check("__by_tag__ finds sub under math:arithmetic", pr_list_contains(by_arith, "sub"), true)
+check("__by_tag__ does NOT put concat under math:arithmetic", pr_list_contains(by_arith, "concat"), false)
+
+# ---- backward compatibility: an untagged registration ----
+
+let s_untagged = pr_new_snippets()
+pr_set_snippet(s_untagged, "patlang", "untagged_thing({0})")
+pr_register(registry, "untagged_thing", "try_add", 1, 1, s_untagged, ["int"], "int", [""])
+let untagged_entry = pr_lookup(registry, "untagged_thing")
+check("plain pr_register still yields [] from pr_tags (backward compatible)", pr_tags(untagged_entry), [])
+let by_arith_after = pr_lookup_by_tags(registry, ["math:arithmetic"], "any")
+check("an untagged entry never leaks into an unrelated __by_tag__ bucket", pr_list_contains(by_arith_after, "untagged_thing"), false)
+
+# ---- pr_lookup_by_tags: any vs. all ----
+
+let by_compare_any = pr_lookup_by_tags(registry, ["math:compare", "string:compare"], "any")
+check("mode=any unions across tags: math:compare member present", pr_list_contains(by_compare_any, "geq"), true)
+check("mode=any unions across tags: string:compare member present", pr_list_contains(by_compare_any, "str_eq"), true)
+
+let by_network_effectful_all = pr_lookup_by_tags(registry, ["io:network", "effectful"], "all")
+check("mode=all intersects: tcp_connect carries BOTH io:network and effectful", pr_list_contains(by_network_effectful_all, "tcp_connect"), true)
+check("mode=all intersects: add carries effectful but not io:network, so it's excluded", pr_list_contains(by_network_effectful_all, "add"), false)
+
+# ---- pr_narrow_by_tags: the actual synthesize_from_examples insertion point ----
+
+let candidate_pool = ["add", "sub", "concat", "substr", "geq"]
+let narrowed = pr_narrow_by_tags(registry, candidate_pool, ["math:arithmetic"], "any")
+check("pr_narrow_by_tags keeps only tagged members of the caller's own list", narrowed, ["add", "sub"])
+
+let narrowed_noop = pr_narrow_by_tags(registry, candidate_pool, [], "any")
+check("pr_narrow_by_tags is a no-op when intent_tags is empty", narrowed_noop, candidate_pool)
+
+# ---- composite auto-tag inheritance (register_composite) ----
+
+let sum3_examples_a = new("Dict", "sum3_a")
+send(sum3_examples_a, "set", "a", 1)
+send(sum3_examples_a, "set", "b", 2)
+send(sum3_examples_a, "set", "c", 3)
+let sum3_examples_b = new("Dict", "sum3_b")
+send(sum3_examples_b, "set", "a", 10)
+send(sum3_examples_b, "set", "b", 20)
+send(sum3_examples_b, "set", "c", 30)
+let sum3_examples = [[sum3_examples_a, 6], [sum3_examples_b, 60]]
+let sum3_result = synthesize_from_examples(sum3_examples, ["a", "b", "c"], [], registry, ["add"], 6)
+check("sum3 (add+add, both math:arithmetic) is derivable", sum3_result[0], "OK")
+register_composite(registry, "sum3", sum3_result[1], ["a", "b", "c"], ["int"], 2)
+let sum3_entry = pr_lookup(registry, "sum3")
+check("sum3 inherits the shared math:arithmetic facet tag from its ONLY constituent (add)", pr_list_contains(pr_tags(sum3_entry), "math:arithmetic"), true)
+check("sum3 is derived to be pure (add has no effectful tag)", pr_list_contains(pr_tags(sum3_entry), "purity:pure"), true)
+check("sum3's auto-derived tags are marked provisional/suggested", pr_tags_suggested(sum3_entry), true)
+check("sum3 is now itself findable via the tag it inherited", pr_list_contains(pr_lookup_by_tags(registry, ["math:arithmetic"], "any"), "sum3"), true)
+
+# ---- composite with NO shared facet across constituents: intersection is
+# empty. chr(add(a, b)) genuinely needs both examples (a fixed chr(const)
+# leaf can satisfy the FIRST example alone but not the second) so this
+# also proves the search doesn't overfit before crossing domains.
+
+let mix_a = new("Dict", "mix_a")
+send(mix_a, "set", "a", 70)
+send(mix_a, "set", "b", 1)
+let mix_b = new("Dict", "mix_b")
+send(mix_b, "set", "a", 72)
+send(mix_b, "set", "b", 1)
+let mix_examples = [[mix_a, "G"], [mix_b, "I"]]
+let mix_result = synthesize_from_examples(mix_examples, ["a", "b"], [], registry, ["chr", "add"], 4)
+check("chr(add(a, b)) crossing string:encoding + math:arithmetic is derivable", mix_result[0], "OK")
+register_composite(registry, "letter_at", mix_result[1], ["a", "b"], ["int", "int"], 2)
+let mix_entry = pr_lookup(registry, "letter_at")
+check("crossing chr (string:encoding) + add (math:arithmetic) shares NEITHER facet", pr_tags(mix_entry), ["purity:pure"])
+
+t_report()

@@ -1163,7 +1163,8 @@ make a function called register_composite takes registry, name, ast, param_names
     let arg_contracts = list_push(arg_contracts, "")
     let i = i + 1
   end
-  send(registry, "set", name, ["composite", [ast, param_names], to_num(list_len(param_names)), cost, snippets, arg_types, "any", arg_contracts])
+  let tags = sbe_derive_composite_tags(registry, sbe_dedup_names(sbe_collect_call_names(ast)), cost)
+  send(registry, "set", name, ["composite", [ast, param_names], to_num(list_len(param_names)), cost, snippets, arg_types, "any", arg_contracts, tags, true])
   let idx = get(registry, "__by_ret_type__")
   if not idx then
     let idx = new("Dict", "pr_by_ret_type_" + pr_next_id())
@@ -1175,5 +1176,162 @@ make a function called register_composite takes registry, name, ast, param_names
   else
     send(idx, "set", "any", [name])
   end
+  pr_index_tags(registry, name, tags)
   return true
+end
+
+# ---- composite auto-tagging (plan: descriptive tagging for the
+# synthesis-engine registry, §4) -- provisional tags derived from
+# PROVENANCE, not invented from scratch: a facet:value tag survives only
+# if every constituent primitive/composite the winning AST actually calls
+# shares it (real agreement, not a guess); free tags are the union (safe
+# to over-include, since tags only ever narrow a caller's OWN candidate
+# list -- pr_narrow_by_tags -- while the existing contract/type check
+# still gates correctness regardless of what a tag claims). Marked
+# provisional via the trailing `true` (pr_tags_suggested) in
+# register_composite above, for later human review or promotion.
+
+# Every distinct primitive/composite name a winning AST actually calls,
+# walked (not folded) because PatLang lists are values, not references --
+# each recursive call returns its OWN name list rather than mutating a
+# shared accumulator, then sbe_dedup_names collapses the whole tree's
+# names once at the top.
+make a function called sbe_collect_call_names takes node returns names
+  let tag = node[0]
+  if tag == "Call" then
+    let names = [node[1]]
+    let arg_nodes = node[2]
+    let i = 0
+    let n = to_num(list_len(arg_nodes))
+    while i < n do
+      let sub = sbe_collect_call_names(arg_nodes[i])
+      let j = 0
+      let jn = to_num(list_len(sub))
+      while j < jn do
+        let names = list_push(names, sub[j])
+        let j = j + 1
+      end
+      let i = i + 1
+    end
+    return names
+  end
+  if tag == "If" then
+    let names = sbe_collect_call_names(node[1])
+    let then_names = sbe_collect_call_names(node[2])
+    let k = 0
+    let kn = to_num(list_len(then_names))
+    while k < kn do
+      let names = list_push(names, then_names[k])
+      let k = k + 1
+    end
+    let else_names = sbe_collect_call_names(node[3])
+    let m = 0
+    let mn = to_num(list_len(else_names))
+    while m < mn do
+      let names = list_push(names, else_names[m])
+      let m = m + 1
+    end
+    return names
+  end
+  return []
+end
+
+make a function called sbe_dedup_names takes names returns out
+  let out = []
+  let i = 0
+  let n = to_num(list_len(names))
+  while i < n do
+    if not pr_list_contains(out, names[i]) then
+      let out = list_push(out, names[i])
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called sbe_is_facet_tag takes tag returns ok
+  return gc_find_substr(tag, ":") >= 0
+end
+
+# facet:value tags: kept only if EVERY constituent's own tag set contains
+# that exact string (real intersection, computed incrementally by
+# filtering the running `facet_common` list down as each constituent is
+# visited). Free tags: union, deduplicated. Structural additions on top,
+# from data this function already has in hand -- no fabricated facet
+# (e.g. an allocation facet) is added without a real signal to derive it
+# from; only complexity:o-1 (from the composite's own registered cost)
+# and purity (from whether any constituent already declares itself
+# "effectful") are computed here, per the plan's own scope.
+make a function called sbe_derive_composite_tags takes registry, constituent_names, cost returns tags
+  let cn = to_num(list_len(constituent_names))
+  let facet_common = []
+  let free_union = []
+  let any_effectful = false
+  let first = true
+  let i = 0
+  while i < cn do
+    let entry = pr_lookup(registry, constituent_names[i])
+    let ctags = []
+    if entry then
+      let ctags = pr_tags(entry)
+    end
+    if pr_list_contains(ctags, "effectful") then
+      let any_effectful = true
+    end
+    let facets_here = []
+    let j = 0
+    let jn = to_num(list_len(ctags))
+    while j < jn do
+      let t = ctags[j]
+      if sbe_is_facet_tag(t) then
+        let facets_here = list_push(facets_here, t)
+      else
+        if not pr_list_contains(free_union, t) then
+          let free_union = list_push(free_union, t)
+        end
+      end
+      let j = j + 1
+    end
+    if first then
+      let facet_common = facets_here
+      let first = false
+    else
+      let kept = []
+      let k = 0
+      let kn = to_num(list_len(facet_common))
+      while k < kn do
+        if pr_list_contains(facets_here, facet_common[k]) then
+          let kept = list_push(kept, facet_common[k])
+        end
+        let k = k + 1
+      end
+      let facet_common = kept
+    end
+    let i = i + 1
+  end
+  if cn == 0 then
+    let facet_common = []
+  end
+  let tags = facet_common
+  let f = 0
+  let free_n = to_num(list_len(free_union))
+  while f < free_n do
+    let tags = list_push(tags, free_union[f])
+    let f = f + 1
+  end
+  if cost <= 1 then
+    if not pr_list_contains(tags, "complexity:o-1") then
+      let tags = list_push(tags, "complexity:o-1")
+    end
+  end
+  if any_effectful then
+    if not pr_list_contains(tags, "purity:effectful") then
+      let tags = list_push(tags, "purity:effectful")
+    end
+  else
+    if not pr_list_contains(tags, "purity:pure") then
+      let tags = list_push(tags, "purity:pure")
+    end
+  end
+  return tags
 end
