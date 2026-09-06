@@ -1,0 +1,101 @@
+# Follow-up to x64_asm_scaling_probe.patlang, and to issue #89's still-
+# open "raising patc2.exe's heap size makes requested grow WAY faster
+# than heap size" mystery. That probe's synthetic text (repeated "mov
+# rax, 1", then a labels+calls variant) confirmed the Dict-aliasing bug
+# (now fixed) was interpreter-only and never reached patc2.exe's own
+# x64-compiled self-assembly. This probe goes one step further: it
+# assembles the REAL 94k-line runtime asm text itself (self_hosting/
+# build/x64_runtime.asm, the exact input the original mystery was
+# about), sliced at 5 sizes, to check for any scaling behavior real
+# generated code shows that a synthetic stand-in might miss.
+#
+# REQUIRES self_hosting/build/x64_runtime.asm to already exist --
+# a build artifact (gitignored), not checked in. Produce it first via
+# self_hosting/tests/x64_asm/run_full_runtime_test.sh (which builds it
+# as a side effect) or self_hosting/build_x64_runtime.patlang.
+#
+# RESULT (2026-09-06), run BOTH interpreted and compiled to --x64:
+#
+#   Interpreted (pat --ir-run): mildly superlinear, NOT the original
+#   bug's O(n^2) but not clean O(n) either -- time/line kept increasing
+#   as the prefix grew (0.167 -> 0.272 -> 0.407 -> 0.732 -> 0.827 ms per
+#   line across the 5 sizes below). Ruled out xa_declare_symbol's
+#   list_contains_str(globals, name) scan as the cause: all 5 `global`
+#   directives in the real runtime appear in the first 886 lines, so
+#   `globals` is already fully populated (~330 names) for every prefix
+#   tested here -- a FIXED per-label cost, not a growing one, so it
+#   cannot explain a changing growth rate. Left unresolved -- plausibly
+#   ordinary interpreter/allocator overhead at larger absolute list/heap
+#   sizes, unrelated to x64_asm.patlang's own algorithm.
+#
+#   Compiled via --x64 (the ACTUAL patc2.exe-relevant path): clean
+#   LINEAR, at REAL scale, not just the earlier synthetic tests --
+#     9997 lines:  468ms
+#    19999 lines:  969ms  (ratio 2.07 for 2.00x lines)
+#    39984 lines: 2000ms  (ratio 2.06 for 2.00x lines)
+#    79948 lines: 4546ms  (ratio 2.27 for 2.00x lines)
+#    98084 lines: 5688ms  (ratio 1.25 for 1.23x lines)
+#   Every ratio tracks the line-count ratio closely. CONCLUSION: the
+#   self-hosted x64 assembler, run the way patc2.exe actually runs it,
+#   is NOT the source of the original heap-scaling mystery -- confirmed
+#   now against the real 94k-line text, not a synthetic stand-in. The
+#   mystery must live elsewhere: most likely the LINKING phase
+#   (x64_pe_link.patlang -- see its own header on an already-fixed,
+#   different O(n^2) symbol-lookup bug at ~330-function-compiler scale,
+#   which this probe never exercises since it only assembles, never
+#   links) or was an artifact of comparing three separately-rebuilt
+#   binaries at different heap sizes in the original investigation
+#   (each requiring a ~10min rebuild, nothing else controlled for).
+#   Next step for whoever picks this up: an equivalent probe through
+#   x64_pe_link.patlang's own linking path at multi-chunk (~330-function)
+#   scale, or simply re-running patc2.exe's actual self-assembly at a
+#   couple of heap sizes now that this confirmed-but-unrelated bug is
+#   fixed, to see if the original symptom persists at all.
+
+include "../lib/x64_asm.patlang"
+
+make a function called join_lines takes lines, upto returns text
+  let sb = sb_new()
+  let i = 0
+  while i < upto do
+    sb_push(sb, lines[i])
+    sb_push(sb, chr(10))
+    let i = i + 1
+  end
+  return sb_str(sb)
+end
+
+let full_text = read_file("self_hosting/build/x64_runtime.asm")
+let all_lines = split_lines(full_text)
+let total = to_num(list_len(all_lines))
+print("real runtime asm: " + total + " lines")
+
+# Cut points verified (2026-09-06) to land exactly on a label line
+# (`name:` at column 0) in the CURRENT x64_runtime.asm -- if this file
+# has changed enough to shift these, a cut landing mid-instruction will
+# just fail assembly loudly (not silently misassemble), safe to re-pick
+# by hand (`grep -n "^[a-zA-Z_][a-zA-Z0-9_]*:$" ... | awk ...`, see this
+# probe's own investigation notes above).
+let sizes = [9997, 19999, 39984, 79948, total]
+let i = 0
+let n = to_num(list_len(sizes))
+let prev_ms = 0
+let prev_lines = 0
+while i < n do
+  let upto = sizes[i]
+  let text = join_lines(all_lines, upto)
+  let t0 = now_ms()
+  let chunk = x64_assemble_chunk(text)
+  let t1 = now_ms()
+  let elapsed = t1 - t0
+  let ratio = "n/a"
+  let line_ratio = "n/a"
+  if prev_ms > 0 then
+    let ratio = "" + (elapsed / prev_ms)
+    let line_ratio = "" + (upto / prev_lines)
+  end
+  print("lines=" + upto + " text_bytes=" + list_len(chunk[1]) + " symbols=" + list_len(chunk[4]) + " relocs=" + list_len(chunk[5]) + " " + elapsed + "ms (time_ratio=" + ratio + " line_ratio=" + line_ratio + ")")
+  let prev_ms = elapsed
+  let prev_lines = upto
+  let i = i + 1
+end
