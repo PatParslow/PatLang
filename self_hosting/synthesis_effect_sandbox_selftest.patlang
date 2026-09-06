@@ -1,0 +1,56 @@
+# BDD-style selftest for the synthesis-search effect sandbox (see plan:
+# docs/plans/synthesis_effect_sandboxing.md). Proves the gate added to
+# sbe_eval's "Call" dispatch (self_hosting/lib/synthesis_by_example.
+# patlang) is a real, structural block -- not advisory metadata a caller
+# has to remember to respect -- and that it's a genuine allow/deny switch,
+# not a permanent one: tcp_listen(0) (a local, OS-assigned-port bind, no
+# external network dependency, safe to run anywhere) is denied by default
+# and only actually invoked once a registry explicitly opts it in via
+# pr_set_effects_allowed.
+
+include "lib/test.patlang"
+include "lib/synthesis_by_example.patlang"
+
+t_init()
+
+let registry = pr_standard_registry()
+
+# ---- deny by default ----
+
+check("a fresh registry starts with no effects allowed", pr_effects_allowed(registry), [])
+
+let empty_bindings = new("Dict", "eb1")
+let listen_node = ["Call", "tcp_listen", [["Const", 0]]]
+let denied = sbe_eval(listen_node, empty_bindings, registry)
+check("tcp_listen(0) is denied by default -- the real bind NEVER runs", denied, [false, ""])
+
+let connect_node = ["Call", "tcp_connect", [["Const", "127.0.0.1"], ["Const", 1]]]
+let denied_connect = sbe_eval(connect_node, empty_bindings, registry)
+check("tcp_connect is denied by default too (a bad port here would otherwise raise a FATAL error -- the gate prevents even attempting it)", denied_connect, [false, ""])
+
+# A denied Call composes safely inside a larger expression -- it's an
+# ordinary [false, ...] non-match to whatever wraps it, not a special
+# error path a caller has to know to handle.
+let wrapped_node = ["If", ["Call", "tcp_listen", [["Const", 0]]], ["Const", "yes"], ["Const", "no"]]
+let wrapped = sbe_eval(wrapped_node, empty_bindings, registry)
+check("a denied effect inside an If's condition just evaluates to a normal non-match", wrapped, [false, ""])
+
+# ---- non-effectful primitives are completely unaffected ----
+
+let add_node = ["Call", "add", [["Const", 2], ["Const", 3]]]
+check("a pure primitive is never touched by the effect gate", sbe_eval(add_node, empty_bindings, registry), [true, 5])
+
+# ---- explicit opt-in actually flips it ----
+
+pr_set_effects_allowed(registry, ["tcp_listen"])
+check("pr_effects_allowed reflects the explicit opt-in", pr_effects_allowed(registry), ["tcp_listen"])
+let allowed = sbe_eval(listen_node, empty_bindings, registry)
+check("tcp_listen(0) genuinely runs once explicitly allowed", allowed[0], true)
+check("the real OS-assigned port comes back once allowed (not a sentinel)", allowed[1] > 0, true)
+
+# tcp_connect was NEVER added to the allowlist above -- proves the
+# allowlist is per-NAME, not "any effect is now fine because one was
+# allowed".
+check("tcp_connect stays denied -- allowing tcp_listen did not blanket-allow every effect", sbe_eval(connect_node, empty_bindings, registry), [false, ""])
+
+t_report()

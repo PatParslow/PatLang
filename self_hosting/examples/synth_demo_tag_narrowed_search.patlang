@@ -17,26 +17,35 @@
 # Three configurations, same goal, same registry:
 #   A. Hand-curated (today's only real option): the developer already knows
 #      to pass exactly ["substr", "index_of"].
-#   B. Broad, unfiltered: every non-effectful name in the registry (18,
-#      including a compound and several primitives from unrelated domains
-#      -- encoding, list access, bool comparison, functional selection),
-#      passed straight through with no narrowing at all. Still finds the
-#      correct answer (arg-type/contract checking already prevents an
-#      ill-typed candidate from ever being constructed -- see
-#      primitive_registry.patlang's own header) but the per-level pool
-#      counts printed by synthesize_from_examples grow considerably larger,
-#      because every irrelevant primitive still contributes leaves/branches
-#      to the index at every size level even though none of them end up in
-#      the winning AST.
-#   C. Broad pool + tag narrowing: pool_all (20 names, INCLUDING the two
-#      effectful network primitives this time), narrowed via
+#   B. Broad, unfiltered: EVERY name in the registry (20 -- a compound,
+#      several primitives from unrelated domains -- encoding, list access,
+#      bool comparison, functional selection -- and, deliberately, the two
+#      EFFECTFUL network primitives, tcp_connect/tcp_listen), passed
+#      straight through with no narrowing at all. This is safe to do at
+#      all only because of the effect sandbox (plan: docs/plans/
+#      synthesis_effect_sandboxing.md, sbe_eval's gate in synthesis_by_
+#      example.patlang): a fresh registry starts with pr_effects_allowed
+#      == [], so any candidate that would have called tcp_connect/
+#      tcp_listen is refused before its real args are even built, never
+#      mind actually invoked -- confirmed below by construction, not just
+#      argued (see the effect-sandbox check). Still finds the correct
+#      answer (arg-type/contract checking already prevents an ill-typed
+#      candidate from ever being constructed -- see primitive_registry.
+#      patlang's own header) but the per-level pool counts printed by
+#      synthesize_from_examples grow considerably larger, because every
+#      irrelevant primitive still contributes leaves/branches to the index
+#      at every size level even though none of them end up in the winning
+#      AST.
+#   C. Broad pool + tag narrowing: the SAME 20-name pool, narrowed via
 #      pr_narrow_by_tags down to whatever matches a caller's own DECLARED
 #      intent tags -- no per-goal name memorization required, just "this is
 #      roughly a string-manipulation/search problem". Pool sizes fall back
 #      close to config A's, and the winning AST is checked to be
 #      functionally IDENTICAL to config A's -- broadening the raw pool
-#      never degrades the output, tags just make searching a big pool
-#      cheap (and, for effectful primitives, SAFE) again.
+#      never degrades the output. Tags and the effect sandbox are
+#      deliberately two separate, overlapping layers here: tags make
+#      searching a big pool cheap again; the sandbox is what makes it safe
+#      regardless of whether a caller's tags happen to exclude an effect.
 
 include "../lib/synthesis_by_example.patlang"
 include "../lib/test.patlang"
@@ -64,20 +73,11 @@ print("compound 'double' auto-tagged: " + pr_tags(double_entry) + " (suggested="
 
 # Every name pr_standard_registry() currently registers, plus the compound
 # just added -- exactly what a caller who refuses to hand-curate per goal
-# would pass: "here is the whole library, go find it." pool_all keeps
-# tcp_connect/tcp_listen for the TAG-NARROWING demonstration below (they
-# get correctly excluded by name-matching alone, never evaluated); broad_pool
-# drops them for the UNFILTERED config B run, because a blind broad-pool
-# search will happily construct tcp_connect(<string leaf>, <int leaf>) as a
-# type-correct candidate and then genuinely CALL it during evaluation --
-# confirmed empirically while building this demo (a real live
-# "No such host is known" OS error, mid-search). PatLang has no try/catch
-# to recover from that: tag-based filtering is a SAFETY property here, not
-# just a performance one, since pr_narrow_by_tags would exclude both
-# (neither has a "string:..."/"math:..." facet) the same way it excludes
-# any other effect a caller didn't ask for.
+# would pass: "here is the whole library, go find it." Includes
+# tcp_connect/tcp_listen ON PURPOSE, in every config below -- proving the
+# effect sandbox, not a hand-trimmed pool, is what keeps this safe.
+check("this registry starts with no effects allowed (the safe default)", pr_effects_allowed(registry), [])
 let pool_all = ["chr", "char_code", "substr", "concat", "str_eq", "str_len", "find_substr", "index_of", "index_of_from", "add", "sub", "geq", "gt", "cond", "eq_int", "list_get", "list_len", "tcp_connect", "tcp_listen", "double"]
-let broad_pool = ["chr", "char_code", "substr", "concat", "str_eq", "str_len", "find_substr", "index_of", "index_of_from", "add", "sub", "geq", "gt", "cond", "eq_int", "list_get", "list_len", "double"]
 
 let u1 = new("Dict", "u1")
 send(u1, "set", "s", "/health HTTP/1.1")
@@ -93,12 +93,12 @@ let result_a = synthesize_from_examples(up_to_space_examples, ["s"], [" "], regi
 check("config A derives up_to_space", result_a[0], "OK")
 
 print("")
-print("=== Config B: broad pool (" + list_len(broad_pool) + " names), NO tag narrowing ===")
-let result_b = synthesize_from_examples(up_to_space_examples, ["s"], [" "], registry, broad_pool, 8)
-check("config B (unfiltered broad pool) still derives up_to_space", result_b[0], "OK")
+print("=== Config B: broad pool (" + list_len(pool_all) + " names, INCLUDING tcp_connect/tcp_listen), NO tag narrowing ===")
+let result_b = synthesize_from_examples(up_to_space_examples, ["s"], [" "], registry, pool_all, 8)
+check("config B (unfiltered broad pool, network primitives included) still derives up_to_space -- the sandbox made this safe to even attempt", result_b[0], "OK")
 
 print("")
-print("=== Config C: broad pool (incl. the network primitives), narrowed by declared intent tags ===")
+print("=== Config C: same broad pool (incl. the network primitives), narrowed by declared intent tags ===")
 let intent_tags = ["string:manipulation", "string:search"]
 let narrowed_pool = pr_narrow_by_tags(registry, pool_all, intent_tags, "any")
 print("intent tags: " + intent_tags)
@@ -141,16 +141,20 @@ print(emitted[1])
 # The genuinely harder sibling example, after_space(s) = substr(s,
 # add(index_of(s," "),1), sub(str_len(s), add(index_of(s," "),1))), needs
 # max_size=12 even with the exact 4 curated primitives (7990-candidate
-# pool by the final level). Widening that SAME search to the 18-name
-# broad_pool above, unfiltered, does not just get slower: by size=9 the
-# pool had already reached 103037 candidates and the process was killed by
-# the interpreter's own memory safety cap shortly after (a real, reproduced
+# pool by the final level). Widening that SAME search to an 18-name
+# unfiltered pool does not just get slower: by size=9 the pool had already
+# reached 103037 candidates and the process was killed by the
+# interpreter's own memory safety cap shortly after (a real, reproduced
 # result, not a hypothetical) -- confirmed while building this file, not
-# re-run here on purpose. Narrowing that SAME 18-name pool down to
-# ["string:manipulation", "string:search", "math:arithmetic"] before the
-# search starts is precisely what keeps a goal like that tractable at all
-# once the registry has grown past a small hand-curated handful -- the
+# re-run here on purpose. The effect sandbox above closes the SAFETY gap
+# (an effectful primitive left in a broad pool is never actually invoked),
+# but it does nothing for THIS cost problem -- a denied candidate is still
+# a candidate the search had to construct and reject. Narrowing the pool
+# down to ["string:manipulation", "string:search", "math:arithmetic"]
+# before the search starts is what keeps a goal like that tractable at
+# all once the registry has grown past a small hand-curated handful -- the
 # actual motivating case for pr_narrow_by_tags, not just this file's
-# cheaper up_to_space illustration.
+# cheaper up_to_space illustration. Tags and the sandbox are complementary,
+# not substitutes: tags keep it cheap, the sandbox keeps it safe.
 
 t_report()
