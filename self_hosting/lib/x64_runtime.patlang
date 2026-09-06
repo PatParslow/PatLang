@@ -1701,35 +1701,42 @@ make a function called rt_list_push takes l, v returns tagged
   return new_addr bor rt_list_tag()
 end
 
-# GitHub #29: the plain `list_set` host function (rust-runtime/src/ir/
-# hosts.rs's host_list_set) is COPY-ON-WRITE/functional -- returns a NEW
-# list with one element replaced, leaves the original untouched -- unlike
-# this file's own `rt_list_set` just above (in-place mutation, used
-# throughout this file's own internal tables like g_rules_table). Needed
-# for real the first time by codegen_x64.patlang's own x64_analyze_
-# dynamic_bins (a per-instruction dynamic-mode classification pass,
-# GitHub #29): its virtual-stack simulation needs a real functional
-# list_set to reuse storage across push/pop cycles at the same stack
-# depth. Before this, plain `list_set` had NO native x64 support at
-# all (deliberately, see x64_callhost_asm's own big comment on why
-# list_set/list_push were never aliased to the MUTATING rt_list_set) --
-# compiling ANY function that called plain list_set via --x64 failed
-# with "unsupported primitive," discovered attempting to self-compile
-# the bundle containing codegen_x64.patlang's own new analysis code.
+# GitHub #29 (original design, see codegen_x64.patlang's x64_callhost_
+# asm comment on `list_set` for the full history): plain `list_set` was
+# deliberately aliased to a SEPARATE function from the mutating
+# `rt_list_set` above, to keep PatLang's own observable list_set
+# semantics (copy-on-write, matching the interpreter's host_list_set)
+# intact -- reallocating and copying every element on every call.
+#
+# REVERSED (issue #89's linker-scaling follow-up, 2026-09-06): that
+# unconditional O(n)-per-call copy, with NO in-place fast path at all,
+# made x64_pe_link.patlang's relocation-patching loop (list_set called
+# once per patched byte against `merged_text`/`merged_data`, potentially
+# megabytes) cost O(relocations * image_size) -- confirmed directly via
+# self_hosting/examples/x64_linker_scaling_probe.exe: fine up to 1500
+# synthetic one-function chunks, exhausts a 1.9GB heap by 1800. This
+# backend has no reference counting at all (same fact rt_list_push's own
+# header already leans on), so there was never a way to detect "is this
+# safe to mutate in place" here -- rt_list_push already accepts that and
+# mutates in place unconditionally when capacity allows ("only PROBABLY
+# safe, not PROVABLY safe... deliberate tradeoff", its own words). This
+# now makes the SAME tradeoff for list_set: mutate in place and return
+# the SAME tagged pointer (the address never changes -- no growth is
+# possible here, `i` is always < the existing length). Checked both real
+# callers of plain list_set before making this change (x64_pe_link.
+# patlang's own relocation patching and index building;
+# codegen_x64.patlang's x64_vstack_push/x64_analyze_dynamic_bins) --
+# all follow the same `let x = list_set(x, ...)` reassign-and-never-
+# reread-the-old-binding shape that already makes rt_list_push's
+# identical tradeoff safe. The risk this reintroduces, stated the same
+# way rt_list_push's header states its own: a program that keeps an
+# OLDER list value alive while ALSO list_set-ing a descendant of it
+# would observe the older value change underneath it. Not exercised by
+# any current caller; worth remembering if a future one appears.
 make a function called rt_list_set_functional takes l, i, v returns tagged
   let addr = l band rt_payload_mask()
-  let n = mem_peek_qword(addr, 0)
-  let cap = mem_peek_qword(addr, 8)
-  let new_addr = rt_heap_alloc(16 + cap * 8)
-  mem_poke_qword(new_addr, 0, n)
-  mem_poke_qword(new_addr, 8, cap)
-  let k = 0
-  while k < n do
-    mem_poke_qword(new_addr, 16 + k * 8, mem_peek_qword(addr, 16 + k * 8))
-    let k = k + 1
-  end
-  mem_poke_qword(new_addr, 16 + i * 8, v)
-  return new_addr bor rt_list_tag()
+  mem_poke_qword(addr, 16 + i * 8, v)
+  return l
 end
 
 # ---- bool_array (Slice 1, GitHub #45) ----

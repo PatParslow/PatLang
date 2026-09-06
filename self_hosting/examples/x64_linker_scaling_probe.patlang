@@ -1,0 +1,125 @@
+# Scaling probe for x64_pe_link.patlang's own linking phase -- the other
+# candidate location for issue #89's still-open "raising patc2.exe's
+# heap size makes requested grow way faster than heap size" mystery,
+# now that x64_asm_real_runtime_scaling_probe.patlang has confirmed the
+# ASSEMBLER is clean at real 94k-line scale.
+#
+# Builds N one-function-per-chunk ChunkImages (matching x64_compile_
+# unit.patlang's real convention: "each function is its own tiny
+# program"), each calling the previous one by name (a real cross-chunk
+# relocation + symbol resolution, not just concatenation), plus a real
+# "main" chunk calling the last one -- then times a SINGLE
+# x64_link_native_chunks call.
+#
+# N comes from argv() (`x64_linker_scaling_probe.exe <N>`), ONE link per
+# PROCESS -- deliberately NOT a loop over several sizes in one process.
+# An earlier version of this probe looped multiple sizes in one process
+# and hit a silent crash (exit 127, no message) on the SECOND call
+# regardless of size, while a single isolated call at the same size
+# succeeded -- meaning that failure mode was an artifact of calling
+# x64_link_native_chunks more than once per process (something no real
+# caller ever does; patc1_main.patlang calls it exactly once, in a fresh
+# process, per build), not a real scaling bug. This version compiles
+# ONCE and gets run multiple times with different N instead, matching
+# how the function is actually used.
+#
+# x64_pe_link.patlang's own header already documents TWO previously-
+# found-and-fixed quadratic hazards at this same kind of scale: GitHub
+# #75 (an accumulating merged-image list copied on every function-call
+# boundary -- fixed by inlining the merge loops directly in x64_link's
+# body) and an unbucketed per-relocation linear scan of the whole symbol
+# table (fixed via xpl_build_index/xpl_index_lookup -- measured at 1h45m
+# for the real ~330-function compiler bundle before the fix). Both fixes
+# are confirmed present by reading the code, and BOTH check out empty-
+# handed -- this is a THIRD, still-unlocated hazard.
+#
+# RESULT (2026-09-06), one link per process, `x64_linker_scaling_probe.exe <N>`:
+#   400/800/1000/1200/1500 chunks: all succeed, 172ms/406ms/578ms/3422ms/
+#   1312ms (non-monotonic -- 1200 slower than 1500 -- a real signal, not
+#   noise: see below).
+#   1800/2000/3000/4000/5000/12800 chunks: ALL exhaust the heap, at
+#   requested totals clustering tightly around ~1.900-1.902 BILLION bytes
+#   regardless of N (1800: 1,900,028,888 ... 12800: 1,901,716,984) --
+#   i.e. once N crosses the threshold, the process doesn't need
+#   proportionally more memory for a bigger N, it needs roughly the SAME
+#   enormous amount every time. That, plus the non-monotonic timing among
+#   the succeeding sizes, is the signature of something EXPONENTIAL (or a
+#   near-infinite loop bounded only by the heap ceiling), not merely
+#   quadratic -- and it fully explains the ORIGINAL #89 symptom (a small
+#   heap-size increase produces a wildly disproportionate "requested"
+#   jump): an exponential process saturates whatever heap is available
+#   almost immediately past its own threshold.
+#
+# RULED OUT, all checked directly rather than assumed:
+#   - xpl_build_index/xpl_hash_bucket collision clustering: checked bucket
+#     occupancy directly for N=1000/1200/1500/1800/5000 against this
+#     probe's own "funcN" naming scheme -- healthy throughout (max bucket
+#     size 2-6 out of 4096 buckets even at N=5000). Not it.
+#   - The Dict-get/list_push/set-back aliasing bug (issue #89, fixed in
+#     x64_asm.patlang): x64_pe_link.patlang deliberately never uses Dict
+#     at all (see xpl_list_lookup's own header on why) -- structurally
+#     can't be this.
+#   - xpl_round_up: plain division-based arithmetic, O(1), no loop.
+#   - text_size_raw / thunk_area_size ordering (line ~306/321 of
+#     x64_pe_link.patlang): read through it, consistent -- not an
+#     obvious stale-value mismatch.
+#
+# STILL UNLOCATED as of this writing. Best remaining lead, not yet
+# checked: xpl_pad_to (a `while list_len(out) < n do list_push(out, 0)`
+# loop) is called several times inside x64_link with `n` built from
+# `headers_size + text_size + data_size + idata_size`-style running
+# sums (lines ~629-636) -- if any ONE of those size components were ever
+# wrong (a stale/mismatched value, an off-by-something), the gap
+# `xpl_pad_to` has to fill could be enormous instead of the small
+# alignment remainder it's supposed to be, and it fills that gap ONE
+# ELEMENT AT A TIME. Not yet proven -- the next concrete step is either
+# bisecting with print-based heap-usage checkpoints between x64_link's
+# own major phases (merge / symbol-index / relocation-patch / header-
+# build / final pad-and-assemble), or a live trace with the write-
+# watchpoint debugger (self_hosting/tools/debug/win_write_watchpoint.py,
+# already built and used successfully earlier in this exact investigation
+# chain) on a small-but-failing N like 1800.
+
+include "../lib/x64_build.patlang"
+
+make a function called make_func_chunk takes idx returns chunk
+  let sb = sb_new()
+  sb_push(sb, "global func" + idx + chr(10))
+  sb_push(sb, "func" + idx + ":" + chr(10))
+  sb_push(sb, "mov rax, 1" + chr(10))
+  if idx > 0 then
+    sb_push(sb, "call func" + (idx - 1) + chr(10))
+  end
+  sb_push(sb, "ret" + chr(10))
+  return x64_assemble_chunk(sb_str(sb))
+end
+
+make a function called make_main_chunk takes last_idx returns chunk
+  let sb = sb_new()
+  sb_push(sb, "global main" + chr(10))
+  sb_push(sb, "main:" + chr(10))
+  sb_push(sb, "call func" + last_idx + chr(10))
+  sb_push(sb, "mov rax, 42" + chr(10))
+  sb_push(sb, "ret" + chr(10))
+  return x64_assemble_chunk(sb_str(sb))
+end
+
+make a function called build_chunks takes count returns chunks
+  let chunks = []
+  let i = 0
+  while i < count do
+    let chunks = list_push(chunks, make_func_chunk(i))
+    let i = i + 1
+  end
+  let chunks = list_push(chunks, make_main_chunk(count - 1))
+  return chunks
+end
+
+let args = argv()
+let count = xa_parse_int(args[0])
+let chunks = build_chunks(count)
+let out_path = "self_hosting/examples/_tmp_linker_probe_" + count + ".exe"
+let t0 = now_ms()
+let result = x64_link_native_chunks(chunks, out_path)
+let t1 = now_ms()
+print(count + " chunks: " + (t1 - t0) + "ms link_result=" + result)
