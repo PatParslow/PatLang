@@ -1,3 +1,4 @@
+include "build_progress.patlang"
 include "includes.patlang"
 
 # ---- Self-hosted x86-64 assembler --------------------------------------
@@ -86,6 +87,44 @@ end
 # exactly 2^63, which came back as 2^63-1 (every low bit falsely "set")
 # before this was restructured as a single top-down pass.
 make a function called xa_int_to_bytes_le takes v, n returns bytes
+  # Real bug found (session 8, native-toolchain cutover): the old
+  # negative-value handling below computed `uv = v + 2^bits` directly,
+  # which for the n=8 (64-bit) case needed `powers[63] * 2` == 2^64 as
+  # an actual intermediate VALUE -- one bit past what a signed 64-bit
+  # integer can hold. The INTERPRETER promotes this transparently to a
+  # genuine BigInt (confirmed: xa_int_to_bytes_le(-11, 8) returns the
+  # correct two's-complement bytes under `pat --ir-run`), but
+  # the current bootstrap compiler (the one that compiles patc1.exe
+  # itself, separate from codegen_x64.patlang) does NOT reliably auto-
+  # promote a runtime multiplication's overflow to BigInt
+  # the same way -- confirmed via cdb: `mov rcx, -11` (GetStdHandle's
+  # own STD_OUTPUT_HANDLE argument, self_hosting/lib/x64_runtime.patlang)
+  # compiled through patc1.exe emitted the bytes for -1
+  # (0xFFFFFFFFFFFFFFFF) instead of -11 (0xFFFFFFFFFFFFFFF5), silently
+  # corrupting the handle argument -- GetStdHandle(-1) returns
+  # INVALID_HANDLE_VALUE, so every WriteFile call after it silently no-
+  # ops, matching the observed symptom exactly (clean exit, zero
+  # console output). Fixed by computing two's complement via the
+  # standard "invert(|v|-1)" identity instead: `magnitude = (0-v)-1` is
+  # always a SMALL, safely-representable non-negative value (10 for
+  # v=-11), gets its own bytes via the SAME extraction loop already
+  # used for non-negative inputs (recursing once, never needing
+  # anything near 2^63 as an actual value), then each byte is bitwise-
+  # inverted (255-byte) to recover the true two's-complement
+  # representation -- entirely via `+`/`-`/comparisons, matching this
+  # function's own established safe-operator set, and never
+  # materializing 2^64 (or even 2^63) as a real intermediate value.
+  if v < 0 then
+    let magnitude = (0 - v) - 1
+    let mag_bytes = xa_int_to_bytes_le(magnitude, n)
+    let out = []
+    let bi = 0
+    while bi < n do
+      let out = list_push(out, 255 - mag_bytes[bi])
+      let bi = bi + 1
+    end
+    return out
+  end
   let powers = [1]
   let k = 0
   while k < 63 do
@@ -93,14 +132,6 @@ make a function called xa_int_to_bytes_le takes v, n returns bytes
     let k = k + 1
   end
   let uv = v
-  if uv < 0 then
-    let bits = n * 8
-    if bits < 64 then
-      let uv = v + powers[bits]
-    else
-      let uv = v + (powers[63] * 2)
-    end
-  end
   let out = []
   let bi = 0
   while bi < n do
@@ -123,9 +154,9 @@ make a function called xa_int_to_bytes_le takes v, n returns bytes
       # moment the division isn't even (e.g. `4 / 8` is the rational
       # `1/2`, not truncating int division) -- confirmed harmless under
       # the INTERPRETER (which apparently truncates `/` for two plain
-      # ints) but NOT under the ordinary Rust-codegen backend
-      # (codegen.patlang/codegen.rs, used to compile patc1.exe itself,
-      # separate from codegen_x64.patlang): there, `list_set`'s index
+      # ints) but NOT under the current bootstrap compiler (codegen.
+      # patlang, used to compile patc1.exe itself, separate from
+      # codegen_x64.patlang): there, `list_set`'s index
       # argument silently falls through its Value::Rational-unhandled
       # case to `usize::MAX`, corrupting every non-multiple-of-8 bit
       # position -- found via `patc1.exe`'s own crash compiling this
@@ -157,6 +188,26 @@ make a function called xa_emit_bytes takes lst, bytes returns out
     let i = i + 1
   end
   return out
+end
+
+# Appends each of `bytes` to `state`'s `key` field ONE AT A TIME via
+# send(..., "push", ...) -- in-place (rust-runtime/src/ir/hosts.rs's
+# obj_push), never through a get()-alias-list_push()-set()-back round
+# trip. Deliberately separate from xa_emit_bytes above: THAT function
+# combines two plain, never-Dict-aliased LOCAL lists (used throughout
+# xa_encode_instr's own byte-building, correct and unaffected by any
+# of this), while every call site below builds up a field that lives
+# ON `state` across the whole assembly run and must never be read back
+# out with `get` mid-accumulation (see xa_declare_symbol's header on
+# why -- issue #89).
+make a function called xa_push_bytes takes state, key, bytes returns done
+  let i = 0
+  let n = to_num(list_len(bytes))
+  while i < n do
+    send(state, "push", key, bytes[i])
+    let i = i + 1
+  end
+  return true
 end
 
 make a function called xa_emit_i32 takes lst, v returns out
@@ -240,9 +291,55 @@ make a function called xa_is_digit_char takes code returns yes
 end
 
 # Parses a decimal integer, optionally signed with a leading '-'.
-# Bare wrapper over to_num for readability at call sites.
+# Exact decimal-string -> integer parse using only integer +/* (no
+# float64 round-trip). to_num() was found to silently lose precision
+# for large magnitudes (e.g. "6917529027641081857" -> 6917529027641081856,
+# rounded to the nearest representable f64 at that magnitude) when this
+# assembler runs compiled inside patc1.exe -- that single off-by-one bit
+# corrupted the runtime's Bool-TRUE tagged constant (0x6000...0001) into
+# Bool-FALSE (0x6000...0000) everywhere it was assembled, which is why
+# every string-equality comparison silently returned false. Digit
+# extraction uses substr(s,i,1) + a plain string-compare lookup table,
+# NOT char_code(s,i): char_code is defined in x64_runtime.patlang for
+# the TARGET program's own tagged-pointer memory model (mem_peek_qword/
+# mem_peek_byte over a family-tagged address) -- calling it here, where
+# this assembler runs as part of patc1.exe's OWN compiled body -- the
+# current bootstrap compiler represents strings differently there, not
+# via the tagged scheme -- corrupted memory and crashed with "IR
+# runtime error: expected an integer" on every --x64 compile, even
+# trivial ones.
+make a function called xa_digit_value takes c returns d
+  if c == "0" then return 0 end
+  if c == "1" then return 1 end
+  if c == "2" then return 2 end
+  if c == "3" then return 3 end
+  if c == "4" then return 4 end
+  if c == "5" then return 5 end
+  if c == "6" then return 6 end
+  if c == "7" then return 7 end
+  if c == "8" then return 8 end
+  if c == "9" then return 9 end
+  return 0 - 1
+end
+
 make a function called xa_parse_int takes s returns v
-  return to_num(s)
+  let neg = false
+  let start = 0
+  if s.length > 0 and substr(s, 0, 1) == "-" then
+    let neg = true
+    let start = 1
+  end
+  let v = 0
+  let i = start
+  while i < s.length do
+    let d = xa_digit_value(substr(s, i, 1))
+    let v = v * 10 + d
+    let i = i + 1
+  end
+  if neg then
+    return 0 - v
+  end
+  return v
 end
 
 make a function called xa_pow10 takes n returns v
@@ -989,6 +1086,34 @@ make a function called xa_enc_alu takes name, dst, src returns result
   if src[0] == "imm" then
     let ext = ops[1]
     let v = src[1]
+    # GitHub #89: a BYTE-sized memory destination (`cmp byte [...], N`
+    # etc) was always falling through to the 16/32/64-bit immediate-
+    # group encoding below (REX.W always set, opcode 0x83/0x81) --
+    # `dst`'s own size_hint (xa_parse_operand's "byte "/"word "/"dword "
+    # prefix) was parsed but never consulted here. Confirmed the exact
+    # consequence via a from-scratch Win32-Debug-API write-watchpoint
+    # (no cdb/gdb in this environment): os_get_command_line_asm's own
+    # NUL-terminator scan, `cmp byte [r13+r14], 0`, got compiled as a
+    # 64-bit compare -- checking 8 bytes at once for all-zero instead of
+    # 1 byte for zero -- so the scan ran PAST the real end of the
+    # command line looking for 8 consecutive zero bytes, silently
+    # measuring the wrong length and corrupting argv()'s own last
+    # extracted argument. A byte destination must always use the 8-bit
+    # immediate-group opcode (0x80) with REX.W clear and a 1-byte
+    # immediate, never the sign-extended-imm8/imm32 forms below (those
+    # exist only to pick the SHORTEST encoding for a 16/32/64-bit
+    # destination, not to determine operand width).
+    let is_byte_mem = false
+    if dst[0] == "mem" then
+      if dst[3] == 8 then
+        let is_byte_mem = true
+      end
+    end
+    if is_byte_mem then
+      let rex = xa_rex(false, false, xa_needs_rex_x_for_rm(dst), xa_needs_rex_b_for_rm(dst))
+      let mm = xa_encode_modrm(dst, ext)
+      return [xa_emit_bytes(xa_emit_bytes([rex, 128], mm[0]), xa_int_to_bytes_le(v, 1)), xa_reloc_rip_trail(xa_shift_reloc(mm[1], 2), 1)]
+    end
     let rex = xa_rex(true, false, xa_needs_rex_x_for_rm(dst), xa_needs_rex_b_for_rm(dst))
     if (v >= -128) and (v <= 127) then
       let mm = xa_encode_modrm(dst, ext)
@@ -1012,6 +1137,31 @@ make a function called xa_enc_imul takes dst, src returns result
   let rex = xa_rex(true, xa_needs_rex_b(dst[1]), false, xa_needs_rex_b_for_rm(src))
   let mm = xa_encode_modrm(src, dst[1])
   return [xa_emit_bytes([rex, 15, 175], mm[0]), xa_shift_reloc(mm[1], 3)]
+end
+
+# `imul reg, r/m, imm` -- the THREE-operand form (REX.W + 69 /r id:
+# dst := src * imm32). Real bug found and fixed here: xa_dispatch_instr's
+# own imul case handled only the ONE-operand (F7 /5) and TWO-operand
+# (0F AF /r) forms, so a three-operand `imul rax, rax, 8` fell straight
+# through to the two-operand encoder, which silently DROPPED the
+# immediate entirely and emitted `imul rax, rax` -- computing rax*rax
+# instead of rax*8. That turned every `i * 8` element-stride
+# computation into `i * i`. rt_bigint_from_i64 shows both halves of the
+# damage: its `mem_poke_qword(addr, 16 + i * 8, ...)` wrote limb 1 at
+# offset 17 rather than 24 (1*1 vs 1*8), overlapping limb 0 and
+# corrupting it (0x2F075F79 -> 0x01E24079, i.e. 789012345 read back as
+# 31604857), while its `rt_heap_alloc(16 + n_limbs * 8)` under-
+# allocated the block in the first place (16 + n*n, not 16 + n*8). So
+# every BigInt value built through it came out silently wrong under the
+# native toolchain while staying correct through nasm, which assembles
+# the three-operand form properly. Caught by diffing the two
+# assemblers' instruction streams for the same .asm text, not by
+# reading either one's source.
+make a function called xa_enc_imul_imm takes dst, src, imm returns result
+  let rex = xa_rex(true, xa_needs_rex_b(dst[1]), false, xa_needs_rex_b_for_rm(src))
+  let mm = xa_encode_modrm(src, dst[1])
+  let bytes = xa_emit_i32(xa_emit_bytes([rex, 105], mm[0]), imm)
+  return [bytes, xa_reloc_rip_trail(xa_shift_reloc(mm[1], 2), 4)]
 end
 
 make a function called xa_enc_test takes a, b returns result
@@ -1038,6 +1188,42 @@ make a function called xa_enc_shift_imm takes ext, dst, amount returns result
   let rex = xa_rex(true, false, false, xa_needs_rex_b_for_rm(dst))
   let mm = xa_encode_modrm(dst, ext)
   return [xa_emit_bytes(xa_emit_bytes([rex, 193], mm[0]), [amount band 255]), xa_reloc_rip_trail(xa_shift_reloc(mm[1], 2), 1)]
+end
+
+# `shl/shr/sar reg, cl` -- the VARIABLE-count form (D3 /ext), needed
+# whenever the shift amount is the CL register itself rather than a
+# fixed literal. Real bug found and fixed here: xa_dispatch_instr's own
+# shl/shr/sar case ALWAYS routed to xa_enc_shift_imm regardless of
+# whether the second operand was a genuine immediate or the literal
+# text "cl" -- for the latter, `ops[1]` parses as a "reg" operand
+# (["reg", 1, 1, false], register number 1 being CL's own encoding),
+# and xa_enc_shift_imm blindly used THAT REGISTER NUMBER (1) as if it
+# were the immediate shift count, silently emitting `shl reg, 1`
+# instead of the intended `shl reg, cl`. Confirmed via cdb: this made
+# rt_payload_mask() (`1 shl 48 - 1`) compute `1 shl 1 - 1 = 1` instead
+# of the real 48-bit mask, corrupting every payload-address computation
+# throughout the whole runtime -- silent, catastrophic, and never
+# caught by the fixture suite because test_shifts.asm only exercised
+# the immediate-count form, never `shl reg, cl`. Same D3/ext opcode as
+# the immediate form's C1/ext, just no trailing immediate byte and no
+# ModRM `reg`-field ambiguity with a real register operand.
+make a function called xa_enc_shift_cl takes ext, dst returns result
+  let rex = xa_rex(true, false, false, xa_needs_rex_b_for_rm(dst))
+  let mm = xa_encode_modrm(dst, ext)
+  return [xa_emit_bytes([rex, 211], mm[0]), xa_shift_reloc(mm[1], 2)]
+end
+
+make a function called xa_operand_is_cl takes op returns yes
+  if op[0] != "reg" then
+    return false
+  end
+  if op[1] != 1 then
+    return false
+  end
+  if op[2] != 8 then
+    return false
+  end
+  return true
 end
 
 make a function called xa_shift_ext takes name returns ext
@@ -1162,7 +1348,16 @@ make a function called xa_jcc_opcode takes name returns op
   if name == "jo" then
     return 128
   end
-  return 132
+  # No silent default. This used to `return 132` -- je's opcode -- for
+  # ANY condition it did not recognise, so an unsupported branch was
+  # assembled as "jump if equal" and the program simply took the wrong
+  # branch at runtime. Found the hard way: a `jb` emitted by
+  # x64_roundlike_asm became `je`, and the resulting binary segfaulted
+  # with nothing anywhere reporting an unknown mnemonic. Same shape as
+  # the 3-operand `imul` bug (an unhandled operand form silently
+  # encoded as a different instruction), so it fails loudly now.
+  print("x64_asm: unsupported condition code '" + name + "' -- no encoding, refusing to guess")
+  return 0 - 1
 end
 
 make a function called xa_enc_jcc takes name, label returns result
@@ -1236,6 +1431,9 @@ make a function called xa_encode_instr takes mnemonic, ops returns result
     if to_num(list_len(ops)) == 1 then
       return xa_enc_unary(5, ops[0])
     end
+    if to_num(list_len(ops)) == 3 then
+      return xa_enc_imul_imm(ops[0], ops[1], ops[2][1])
+    end
     return xa_enc_imul(ops[0], ops[1])
   end
   if mnemonic == "test" then
@@ -1254,6 +1452,9 @@ make a function called xa_encode_instr takes mnemonic, ops returns result
     return xa_enc_unary(2, ops[0])
   end
   if (mnemonic == "shl") or (mnemonic == "shr") or (mnemonic == "sar") then
+    if xa_operand_is_cl(ops[1]) then
+      return xa_enc_shift_cl(xa_shift_ext(mnemonic), ops[0])
+    end
     return xa_enc_shift_imm(xa_shift_ext(mnemonic), ops[0], ops[1][1])
   end
   if str_starts_with(mnemonic, "set") then
@@ -1386,8 +1587,18 @@ make a function called xa_declare_symbol takes state, name, section returns done
   let globals = get(state, "globals")
   let is_global = list_contains_str(globals, name)
   let off = xa_state_offset(state, section)
-  let syms = get(state, "symbols")
-  send(state, "set", "symbols", list_push(syms, [name, section, off, is_global]))
+  # send(state, "push", ...) appends to `state`'s "symbols" field IN
+  # PLACE (rust-runtime/src/ir/hosts.rs's obj_push), instead of get()-ing
+  # the current list out (aliasing it -- state's own Dict entry still
+  # holds a live reference), list_push()-ing onto that alias, then
+  # set()-ing the result back. That old get/push/set-back idiom made
+  # EVERY push pay a full clone of everything accumulated so far
+  # (Arc::make_mut sees refcount>1 the moment anything else still
+  # references the list), turning n calls into O(n^2) -- confirmed
+  # directly: 60000 such pushes took 63768ms, the same 60000 through a
+  # never-aliased local variable took 15ms. See issue #89 and
+  # self_hosting/examples/x64_asm_scaling_probe.patlang.
+  send(state, "push", "symbols", [name, section, off, is_global])
   return true
 end
 
@@ -1405,17 +1616,17 @@ end
 
 make a function called xa_add_names takes state, key, names_csv returns done
   let parts = xa_split_char(names_csv, 44)
-  let cur = get(state, key)
   let i = 0
   let n = to_num(list_len(parts))
   while i < n do
     let name = str_trim(parts[i])
     if name.length > 0 then
-      let cur = list_push(cur, name)
+      # See xa_declare_symbol's header on why "push" (in-place), not
+      # get()/list_push()/"set" (aliased, O(n^2) -- issue #89).
+      send(state, "push", key, name)
     end
     let i = i + 1
   end
-  send(state, "set", key, cur)
   return true
 end
 
@@ -1430,9 +1641,10 @@ make a function called xa_record_reloc takes state, section, base_offset, reloc 
   let kind = reloc[1]
   let label = reloc[2]
   let addend = reloc[3]
-  let relocs = get(state, "relocs")
   let entry = [section, base_offset + local_offset, label, kind, addend]
-  send(state, "set", "relocs", list_push(relocs, entry))
+  # See xa_declare_symbol's header on why "push" (in-place), not
+  # get()/list_push()/"set" (aliased, O(n^2) -- issue #89).
+  send(state, "push", "relocs", entry)
   return true
 end
 
@@ -1495,7 +1707,7 @@ make a function called xa_process_instr_line takes state, line returns done
 
   let result = xa_encode_instr(mnemonic, ops)
   let base_offset = xa_state_offset(state, "text")
-  send(state, "set", "text_bytes", xa_emit_bytes(get(state, "text_bytes"), result[0]))
+  xa_push_bytes(state, "text_bytes", result[0])
   xa_record_reloc(state, "text", base_offset, result[1])
   return true
 end
@@ -1565,22 +1777,22 @@ make a function called xa_process_line takes state, raw_line returns done
     xa_add_names(state, "externs", substr(line, 7, line.length - 7))
     return true
   end
+  # Every accumulator push below goes through send(state, "push", ...)
+  # -- in place, never get()/list_push()/"set"-back -- see
+  # xa_declare_symbol's header (issue #89) on why the old idiom made
+  # every push pay a full clone of everything accumulated so far.
   if str_starts_with(line, "align ") then
     let n = xa_parse_int(str_trim(substr(line, 6, line.length - 6)))
     let sec = get(state, "section")
     if sec == "text" then
-      let bytes = get(state, "text_bytes")
-      while (to_num(list_len(bytes)) % n) != 0 do
-        let bytes = list_push(bytes, 144)
+      while (xa_state_offset(state, "text") % n) != 0 do
+        send(state, "push", "text_bytes", 144)
       end
-      send(state, "set", "text_bytes", bytes)
     else
       if sec == "data" then
-        let bytes = get(state, "data_bytes")
-        while (to_num(list_len(bytes)) % n) != 0 do
-          let bytes = list_push(bytes, 0)
+        while (xa_state_offset(state, "data") % n) != 0 do
+          send(state, "push", "data_bytes", 0)
         end
-        send(state, "set", "data_bytes", bytes)
       else
         let bss = get(state, "bss_size")
         while (bss % n) != 0 do
@@ -1593,7 +1805,6 @@ make a function called xa_process_line takes state, raw_line returns done
   end
   if str_starts_with(line, "db ") then
     let parts = xa_split_char(str_trim(substr(line, 3, line.length - 3)), 44)
-    let bytes = get(state, "data_bytes")
     let i = 0
     let n = to_num(list_len(parts))
     while i < n do
@@ -1609,15 +1820,14 @@ make a function called xa_process_line takes state, raw_line returns done
       if (item.length > 3) and (char_code(item, 0) == 39) and (char_code(item, item.length - 1) == 39) then
         let ci = 1
         while ci < item.length - 1 do
-          let bytes = list_push(bytes, char_code(item, ci))
+          send(state, "push", "data_bytes", char_code(item, ci))
           let ci = ci + 1
         end
       else
-        let bytes = list_push(bytes, xa_parse_data_item(item) band 255)
+        send(state, "push", "data_bytes", xa_parse_data_item(item) band 255)
       end
       let i = i + 1
     end
-    send(state, "set", "data_bytes", bytes)
     return true
   end
   # `dw` -- only used for two UTF-16-ish window-title string literals
@@ -1627,14 +1837,12 @@ make a function called xa_process_line takes state, raw_line returns done
   # handling is needed here, unlike dq.
   if str_starts_with(line, "dw ") then
     let parts = xa_split_char(str_trim(substr(line, 3, line.length - 3)), 44)
-    let data_bytes = get(state, "data_bytes")
     let i = 0
     let n = to_num(list_len(parts))
     while i < n do
-      let data_bytes = xa_emit_i16(data_bytes, xa_parse_data_item(str_trim(parts[i])))
+      xa_push_bytes(state, "data_bytes", xa_int_to_bytes_le(xa_parse_data_item(str_trim(parts[i])), 2))
       let i = i + 1
     end
-    send(state, "set", "data_bytes", data_bytes)
     return true
   end
   if str_starts_with(line, "dq ") then
@@ -1644,12 +1852,11 @@ make a function called xa_process_line takes state, raw_line returns done
     while i < n do
       let v = str_trim(parts[i])
       if xa_looks_like_int(v) then
-        send(state, "set", "data_bytes", xa_emit_i64(get(state, "data_bytes"), xa_parse_int(v)))
+        xa_push_bytes(state, "data_bytes", xa_int_to_bytes_le(xa_parse_int(v), 8))
       else
         let off = xa_state_offset(state, "data")
-        send(state, "set", "data_bytes", xa_emit_i64(get(state, "data_bytes"), 0))
-        let relocs = get(state, "relocs")
-        send(state, "set", "relocs", list_push(relocs, ["data", off, v, "ABS64", 0]))
+        xa_push_bytes(state, "data_bytes", xa_int_to_bytes_le(0, 8))
+        send(state, "push", "relocs", ["data", off, v, "ABS64", 0])
       end
       let i = i + 1
     end
@@ -1695,6 +1902,13 @@ make a function called x64_assemble_chunk takes asm_text returns chunk
   let i = 0
   let n = to_num(list_len(lines))
   while i < n do
+    # Assembling the runtime is a single ~88k-line uninterrupted loop --
+    # by far the longest stretch in which nothing else gets a look in.
+    # Yielding every 2000 lines keeps a live progress query answerable
+    # mid-phase at negligible cost (see x64_build_tick's own header).
+    if (i % 2000) == 0 then
+      x64_build_tick()
+    end
     xa_process_line(state, lines[i])
     let i = i + 1
   end

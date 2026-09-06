@@ -733,6 +733,28 @@ fn obj_set(name: &str, prop: &str, val: Value) {
     b.entry(name.to_string()).or_insert_with(HashMap::new).insert(prop.to_string(), val);
 }
 
+// send(obj, "push", field, val): appends to a List field IN PLACE, never
+// going through obj_get first -- the whole point. `send(d, "set", k,
+// list_push(get(d, k), v))` (the only way to grow a Dict-held list
+// before this existed) clones the Arc out via obj_get, leaving the
+// OBJECTS map's own copy and the caller's copy both alive, so
+// Arc::make_mut inside list_push always sees a shared (refcount>1)
+// Vec and pays a full O(n) deep clone on every single push -- O(n^2)
+// over n pushes. Confirmed directly: 60000 pushes via that pattern took
+// 63768ms; through a plain (never-aliased) local variable, 15ms.
+// Mutating the map's own stored Arc directly (get_mut, never cloned
+// out) keeps its refcount at 1 in the common case, so Arc::make_mut
+// grows in place -- genuine O(1) amortized, matching a plain variable.
+// See docs/plans/x64_asm_dict_aliasing_fix.md and issue #89.
+fn obj_push(name: &str, prop: &str, val: Value) {
+    let mut b = OBJECTS.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap();
+    let m = b.entry(name.to_string()).or_insert_with(HashMap::new);
+    match m.get_mut(prop) {
+        Some(Value::List(list)) => { Arc::make_mut(list).push(val); }
+        _ => { m.insert(prop.to_string(), Value::List(Arc::new(vec![val]))); }
+    }
+}
+
 fn ensure_obj(name: &str, class: &str) {
     obj_set(name, "type", Value::String((class.to_string()).into()));
     obj_set(name, "name", Value::String((name.to_string()).into()));
@@ -2161,6 +2183,19 @@ pub fn host_send(args: &[Value]) -> Result<Value, String> {
             if rest.len() != 2 { return Ok(Value::Unit); }
             let prop = match &rest[0] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
             if !recv_name.is_empty() && !prop.is_empty() { obj_set(&recv_name, &prop, rest[1].clone()); }
+            Ok(Value::Unit)
+        }
+        // send(recv, "push", field, val): appends to a List field WITHOUT
+        // the get-then-set round trip that aliases the list and defeats
+        // list_push's own O(1)-amortized design (see obj_push's header,
+        // issue #89) -- e.g. `send(state, "push", "text_bytes", byte)`
+        // instead of `send(state, "set", "text_bytes", list_push(get(state,
+        // "text_bytes"), byte))`.
+        "push" => {
+            let recv_name = match recv { Value::String(s) => s.as_ref().clone(), _ => String::new() };
+            if rest.len() != 2 { return Ok(Value::Unit); }
+            let prop = match &rest[0] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
+            if !recv_name.is_empty() && !prop.is_empty() { obj_push(&recv_name, &prop, rest[1].clone()); }
             Ok(Value::Unit)
         }
         // Ruby-style built-in methods callable with parens (e.g. `2.34.to_s()`),

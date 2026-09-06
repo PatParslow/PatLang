@@ -142,7 +142,26 @@ make a function called rt_heap_alloc takes size returns addr
   end
   let used = rt_atomic_fetch_add(mem_heap_state_addr(), aligned_size)
   if used + aligned_size > mem_heap_size() then
-    print("rt_heap_alloc: heap exhausted (" + (used + aligned_size) + " bytes requested, " + mem_heap_size() + " reserved) -- see rt_heap_alloc's own header in x64_runtime.patlang")
+    # GitHub #89 follow-up: this used to build ONE concatenated string
+    # via `+` ("...(" + number + "..." + number + "...") -- correct now
+    # that `+` properly stringifies a number against a string (the
+    # x64_str_aware_plus_asm fix), but NOT SAFE here specifically:
+    # stringifying a number allocates a fresh heap string (rt_int_to_str
+    # calls rt_heap_alloc), and this function runs BECAUSE the heap is
+    # already exhausted -- so building the error message tried to
+    # allocate again, failed the same check again, tried to print the
+    # same message again, ad infinitum (a real, reproduced stack
+    # overflow, found via a from-scratch Win32-Debug-API watchpoint
+    # debugger, self_hosting/tools/debug/win_write_watchpoint.py).
+    # Fixed by never allocating here: print the numbers via
+    # rt_print_i64 (writes to the static scratch buffer, no heap touch)
+    # interleaved with plain string-literal prints instead of one `+`
+    # chain.
+    print("rt_heap_alloc: heap exhausted (")
+    rt_print_i64(used + aligned_size)
+    print(" bytes requested, ")
+    rt_print_i64(mem_heap_size())
+    print(" reserved) -- see rt_heap_alloc's own header in x64_runtime.patlang")
     os_exit(97)
   end
   let addr = mem_heap_base() + used
@@ -1155,6 +1174,53 @@ make a function called rt_ns_set takes store, key, value returns done
   return true
 end
 
+# Appends `value` to the LIST currently stored at `store`/`key`, mirroring
+# rt_ns_set's own table/namespace lookup exactly, but ending in an append
+# (rt_list_push onto the existing value) rather than a plain overwrite.
+# Every real caller (x64_asm.patlang's xa_declare_symbol/xa_record_reloc/
+# xa_add_names/xa_push_bytes) always pushes onto a field xa_new_state
+# already initialized to `[]` via rt_ns_set, so the "key exists" branch
+# is the only one exercised in practice; the "brand new key" tail below
+# exists for API completeness with rt_ns_set, not because anything here
+# currently depends on it.
+make a function called rt_ns_push takes store, key, value returns done
+  let table_addr = mem_vars_table_addr()
+  let table = mem_peek_qword(table_addr, 0)
+  if table == 0 then
+    let table = rt_list_new(0)
+    mem_poke_qword(table_addr, 0, table)
+  end
+  let ns_idx = rt_ns_find(table, store)
+  if ns_idx < 0 then
+    let keys = rt_list_new(0)
+    let vals = rt_list_new(0)
+    let ns = rt_list_new(3)
+    rt_list_set(ns, 0, store)
+    rt_list_set(ns, 1, keys)
+    rt_list_set(ns, 2, vals)
+    let table = rt_list_push(table, ns)
+    mem_poke_qword(table_addr, 0, table)
+    let ns_idx = rt_list_len(table) - 1
+  end
+  let ns = rt_list_get(table, ns_idx)
+  let keys = rt_list_get(ns, 1)
+  let vals = rt_list_get(ns, 2)
+  let n = rt_list_len(keys)
+  let i = 0
+  while i < n do
+    if rt_str_eq(rt_list_get(keys, i), key) then
+      rt_list_set(vals, i, rt_list_push(rt_list_get(vals, i), value))
+      return true
+    end
+    let i = i + 1
+  end
+  let new_keys = rt_list_push(keys, key)
+  let new_vals = rt_list_push(vals, rt_list_push(rt_list_new(0), value))
+  rt_list_set(ns, 1, new_keys)
+  rt_list_set(ns, 2, new_vals)
+  return true
+end
+
 # Returns 0 on an unset key -- matches this function's own pre-existing
 # convention (documented below on `get`), not Rust's Unit/nil.
 make a function called rt_ns_get takes store, key returns value
@@ -1326,6 +1392,20 @@ end
 make a function called rt_send_prepare takes recv, method, rest_args returns closure_or_zero
   if rt_str_eq(method, "set") then
     rt_ns_set(recv, rt_list_get(rest_args, 0), rt_list_get(rest_args, 1))
+    return 0
+  end
+  # Mirrors rust-runtime/src/ir/hosts.rs's own "push" case (issue #89's
+  # fix) -- send(recv, "push", field, val) appends to a List field
+  # in-place, without a get-then-set round trip. Unlike the interpreter,
+  # this backend has NO reference counting to be defeated by that round
+  # trip anyway (rt_list_push's own header explains why), so this exists
+  # for API PARITY with x64_asm.patlang's call sites, not because this
+  # backend was independently measured to be quadratic there -- without
+  # it, send(recv, "push", ...) would silently fall through to the
+  # class-method lookup below and do nothing, since no class registers a
+  # "push" method.
+  if rt_str_eq(method, "push") then
+    rt_ns_push(recv, rt_list_get(rest_args, 0), rt_list_get(rest_args, 1))
     return 0
   end
   let class = rt_ns_get(recv, "type")
@@ -3203,6 +3283,66 @@ make a function called write_file_bytes takes path, byte_list returns ok
   return os_write_file(path_bytes, path_len, buf, n)
 end
 
+# read_file_bytes(path, offset, length) -- the compiled-code counterpart
+# of the interpreter's own host primitive of the same name
+# (rust-runtime/src/ir/hosts.rs::host_read_file_bytes): reads raw bytes
+# at [offset, offset+length) as a List of Int (0-255). Matches its exact
+# fail-soft contract: any open/offset/length problem returns an empty
+# list rather than erroring (this language has no try/catch, so an
+# error here would be fatal to the whole program -- see hosts.rs's own
+# header on this primitive for why that's deliberate), and a request
+# that runs past EOF is silently clamped to what's actually available.
+#
+# There is no native file-seek primitive in this backend, so unlike the
+# interpreter's Seek-based implementation, this always reads the WHOLE
+# file into a scratch buffer first and slices out [offset,offset+want)
+# from that -- wasteful for a small slice out of a huge file, cheap for
+# the actual call shape every caller in this codebase uses
+# (offset always 0, length a large cap meaning "the whole file").
+#
+# The result list is built via rt_list_new(want) + rt_list_set in a
+# single inline loop, deliberately NOT rt_list_push in a loop and
+# deliberately NOT through any helper function that takes the
+# growing/whole buffer as a parameter -- see GitHub #75 (list
+# accumulation across a function-call boundary measured at 2700x
+# slower than doing the same work inline). rt_list_new(want) allocates
+# the EXACT final size up front (no growth at all), and rt_list_set is
+# an unconditional in-place qword write with no allocation, so this is
+# genuinely O(n) total with no call-boundary exposure for the
+# accumulator at any point. (rt_list_set mutates its target IN PLACE
+# and returns a throwaway `true`, not the list -- called as a bare
+# statement here, matching every other rt_list_set call site in this
+# file; `out` itself never needs reassigning.)
+make a function called read_file_bytes takes path, offset, length returns bytes
+  let addr = path band rt_payload_mask()
+  let path_len = mem_peek_qword(addr, 0)
+  let path_bytes = addr + 8
+  let size = os_file_size(path_bytes, path_len)
+  if size < 0 then
+    return rt_list_new(0)
+  end
+  if offset >= size then
+    return rt_list_new(0)
+  end
+  let avail = size - offset
+  let want = length
+  if want > avail then
+    let want = avail
+  end
+  if want <= 0 then
+    return rt_list_new(0)
+  end
+  let buf = rt_heap_alloc(size)
+  let unused = os_read_file_into(path_bytes, path_len, buf, size)
+  let out = rt_list_new(want)
+  let i = 0
+  while i < want do
+    rt_list_set(out, i, mem_peek_byte(buf, offset + i))
+    let i = i + 1
+  end
+  return out
+end
+
 make a function called rt_file_exists takes path returns s
   let addr = path band rt_payload_mask()
   let path_len = mem_peek_qword(addr, 0)
@@ -3383,6 +3523,224 @@ make a function called exec_capture_io takes program, args, stdin_text returns r
   let exit_code = os_last_exec_exit_code()
   let success = exit_code == 0
   return [combined, combined, success]
+end
+
+# ---- rustc_build / rustc_build_chunked_texts (compiled-code
+# counterparts of rust-runtime/src/ir/hosts.rs's host_rustc_build /
+# host_rustc_build_chunked_texts) ----
+#
+# The interpreter-side "chunked" variant exists purely as a BUILD-TIME
+# PERFORMANCE optimization: it precompiles each Rust chunk into its own
+# cached .rlib and links the small per-program glue against those,
+# rather than recompiling everything from source every time. That
+# machinery (rustc-runtime/src/ir/codegen.rs's build_chunked_native_
+# from_texts, a multi-file Cargo-shaped pipeline with its own rlib
+# cache) is NOT reproduced here -- it is disproportionate effort for a
+# primitive whose only real caller is the compiler's OWN alternate,
+# rustc-mediated build path, which a native x64 compiler has no
+# functional need to invoke at all. What IS reproduced is the
+# OBSERVABLE CONTRACT: given the same Rust source (chunk texts
+# concatenated, in this simpler version, rather than precompiled and
+# linked), produce the same working binary at the same path. Slower
+# (no caching, one big rustc invocation), not less correct.
+#
+# rt_rustc_flags(target, opt_level) -> the six-or-eight-argument tail
+# every invocation below shares (-C opt-level=N, -C strip=symbols,
+# optionally --target T), built as ordinary PatLang so both entry
+# points stay in sync rather than hand-duplicating this logic twice.
+# opt_level="" matches compile_source_to_exe's own None-branch exactly
+# (rust-runtime/src/ir/hosts.rs): full "-O" for a native target, "-C
+# opt-level=z" for a wasm target -- NOT silently downgraded to a safer
+# default, since "parity with the interpreter" means matching its
+# actual default, not second-guessing it. (patc1_main.patlang's own
+# caller already passes "0" explicitly for exactly the reason the
+# comment there gives -- rustc's optimizer can blow up to 30GB+ RAM or
+# hang outright on this compiler's own multi-megabyte generated
+# source at opt-level 1+ -- so real self-hosting usage never actually
+# exercises the risky bare-"-O" default in practice.)
+# This file is compiled entirely standalone (no `include`s at all, per
+# its own top of file) -- str_contains/str_starts_with live in OTHER
+# files' own dependency graphs, not here, so this checks the prefix
+# directly via substr rather than assuming either is available. Real
+# wasm target triples always begin with "wasm" (e.g.
+# "wasm32-unknown-unknown"), so a prefix check is exact for this case,
+# not an approximation.
+make a function called rt_rustc_is_wasm_target takes target returns yes
+  if target == "" then
+    return false
+  end
+  if rt_str_len(target) < 4 then
+    return false
+  end
+  return substr(target, 0, 4) == "wasm"
+end
+
+# rt_rustc_run(src_path, out_path, target, opt_level) -> exit code.
+#
+# TWO real bugs found here in succession, both via direct `rustc`
+# repros on the exact file/argv actually produced, not by re-reading
+# code -- worth restating so the pattern isn't repeated a third time:
+# a real subprocess's OWN error message is ground truth, and this
+# backend's async-string-building style makes it very easy to end up
+# with a command line that LOOKS right as one concatenated string but
+# is wrong once split into real argv entries.
+#
+# Bug 1: rustc derives its crate name from the source file's OWN
+# filename by default, and src_path is built from out_path (rustc_build,
+# below), which already ends in ".exe" -- so the derived crate name
+# (e.g. "tmp_foo.exe.rustc_build") contains a "." and rustc refuses it
+# outright ("invalid character '.' in crate name"), regardless of
+# whether the file's CONTENT is valid Rust at all. Fixed with an
+# explicit `--crate-name`, sidestepping filename shape entirely.
+#
+# Bug 2: every multi-word flag here (`--crate-name NAME`, `-C KEY=VAL`,
+# `--target T`) was originally passed to spawn as ONE PatLang string
+# with an embedded space (e.g. "-C opt-level=0"), on the assumption
+# that joining now vs. joining later in rt_exec_join_args comes out the
+# same either way. It does NOT: rt_exec_arg_needs_quoting quotes any
+# argument containing a space (needed so a path with a space in it
+# survives as ONE argv entry on the far side) -- so "-C opt-level=0"
+# arrived at rustc as the single quoted token "-C opt-level=0", not as
+# the two separate arguments "-C" and "opt-level=0" it actually needs.
+# rustc's own real exit code (1, a genuine compile-invocation failure)
+# gave no hint of this; only re-running the EXACT argv by hand
+# (rustc <file> "-C opt-level=0" ... ) surfaced it, confirmed by then
+# running the CORRECTLY-split version and having it work. Fixed by
+# passing every flag and its value as fully separate spawn arguments,
+# matching four possible arg counts (target present/absent x bare "-O"
+# vs "-C opt-level=N") as four distinct call sites, since spawn's argc
+# is fixed per call site.
+make a function called rt_rustc_run takes src_path, out_path, target, opt_level returns code
+  let use_c_opt = opt_level != ""
+  let opt_value = opt_level
+  if not use_c_opt then
+    if rt_rustc_is_wasm_target(target) then
+      let use_c_opt = true
+      let opt_value = "z"
+    end
+  end
+  let pid = 0
+  if target == "" then
+    if use_c_opt then
+      let pid = spawn("rustc", src_path, "--crate-name", "rustc_build_temp", "-C", "opt-level=" + opt_value, "-C", "strip=symbols", "-o", out_path)
+    else
+      let pid = spawn("rustc", src_path, "--crate-name", "rustc_build_temp", "-O", "-C", "strip=symbols", "-o", out_path)
+    end
+  else
+    if use_c_opt then
+      let pid = spawn("rustc", src_path, "--crate-name", "rustc_build_temp", "-C", "opt-level=" + opt_value, "-C", "strip=symbols", "-o", out_path, "--target", target)
+    else
+      let pid = spawn("rustc", src_path, "--crate-name", "rustc_build_temp", "-O", "-C", "strip=symbols", "-o", out_path, "--target", target)
+    end
+  end
+  return wait(pid)
+end
+
+make a function called rustc_build takes rust_src, out_path, target, opt_level returns result
+  let src_path = out_path + ".rustc_build.rs"
+  write_file(src_path, rust_src)
+  let code = rt_rustc_run(src_path, out_path, target, opt_level)
+  if code != 0 then
+    return "RUSTC ERROR: rustc_build: rustc exited with status " + code
+  end
+  if file_exists(out_path) != "1" then
+    return "RUSTC ERROR: rustc_build: rustc reported success but " + out_path + " does not exist"
+  end
+  return out_path
+end
+
+# chunk_texts: a list of [name, text] pairs (base_name is not treated
+# specially here -- see this section's own header for why the
+# per-chunk distinction that name exists for under the interpreter's
+# rlib-caching path doesn't apply to this simpler, single-file
+# implementation). Concatenated in the order given, plus rust_src
+# (the program's own small glue code) last, into ONE source file --
+# via sb_new/sb_push, NOT repeated string "+" in a loop: plain "+"
+# reallocates and copies its full result on every use (why this file
+# reaches for a string builder everywhere else it accumulates text),
+# and chunk texts here can individually run to megabytes.
+make a function called rustc_build_chunked_texts takes rust_src, base_name, chunk_texts, out_path, opt_level returns result
+  let n = rt_list_len(chunk_texts)
+  let sb = sb_new()
+  let i = 0
+  while i < n do
+    let pair = chunk_texts[i]
+    sb_push(sb, pair[1])
+    let i = i + 1
+  end
+  sb_push(sb, rust_src)
+  return rustc_build(sb_str(sb), out_path, "", opt_level)
+end
+
+# ---- register_event_handler / emit (compiled-code counterparts of
+# rust-runtime/src/ir/codegen.rs's own CallHost "register_event_handler"
+# /"emit" handling) ----
+#
+# codegen.rs keeps TWO separate handler registries -- a legacy bare-
+# function-name one (compile-time IR "When" shapes) and a "real" one of
+# genuine CLOSURE values (registered at RUNTIME by a lowered source-level
+# `when EVENT { ... }` block, so a handler can see an enclosing `let`).
+# This backend only ever compiles source-level `when` blocks, never the
+# legacy IR shape, so only the closure-based registry is implemented --
+# the legacy path is simply never reachable from any --x64-compiled
+# program's own source, matching what the language surface actually
+# exposes to it.
+#
+# The table itself is a plain PatLang list of [event_name, closure]
+# pairs, held in the __vars global store (set_var/get) rather than a new
+# dedicated .bss global -- adding one of those means correctly touching
+# THREE separate hand-maintained name lists elsewhere in this file
+# (owns_globals's own .bss declaration, the `global` list, the `extern`
+# list), a real, easy-to-get-wrong cost for a table this simple. Guarded
+# with type_of(...) != "list" rather than an equality check against
+# some assumed "unset" sentinel, since get()'s exact return value for a
+# never-set key is its own separate gotcha this deliberately sidesteps:
+# whatever comes back before the first ever register_event_handler call,
+# it will not be a list.
+make a function called rt_event_handlers_list returns l
+  let l = get("__vars", "__event_handlers")
+  if type_of(l) != "list" then
+    return rt_list_new(0)
+  end
+  return l
+end
+
+make a function called register_event_handler takes event, handler returns done
+  let handlers = rt_event_handlers_list()
+  let entry = rt_list_new(2)
+  rt_list_set(entry, 0, event)
+  rt_list_set(entry, 1, handler)
+  let handlers = rt_list_push(handlers, entry)
+  set_var("__event_handlers", handlers)
+  return true
+end
+
+# emit(event, payload) -> the last handler's own return value (Unit if
+# no handler matched -- 9223372036854775808 is this backend's Unit tag,
+# same constant x64_emit_instr's own Const("unit",...) case already
+# uses elsewhere in codegen_x64.patlang). Sets event_name/event_data in
+# the SAME __vars store just before each call, matching codegen.rs's
+# own obj_set("__vars", "event_name"/"event_data", ...) exactly, so a
+# handler that reads them via source-level `event_name`/`event_data`
+# sees the same values under --x64 as under the interpreter.
+make a function called emit takes event, payload returns last
+  let handlers = rt_event_handlers_list()
+  let n = rt_list_len(handlers)
+  let last = 9223372036854775808
+  let i = 0
+  while i < n do
+    let entry = handlers[i]
+    if entry[0] == event then
+      set_var("event_name", event)
+      set_var("event_data", payload)
+      # closure FIRST, matching rt_invoke_closure2's own (closure, a,
+      # b) parameter order -- see its CallHost case in codegen_x64.patlang
+      # for exactly why that order (not (a,b,closure)) is required.
+      let last = rt_invoke_closure2(entry[1], event, payload)
+    end
+    let i = i + 1
+  end
+  return last
 end
 
 # =============================================================================
@@ -4624,6 +4982,56 @@ make a function called thread_result takes id returns value
   return mem_peek_qword(ctx_addr, 24)
 end
 
+# parallel_map(items, fname) -> results. Compiled-code counterpart of
+# rust-runtime/src/ir/codegen.rs's own special-cased "parallel_map"
+# CallHost handling (real OS threads via std::thread::scope there;
+# genuinely concurrent OS threads here too, via
+# os_thread_spawn_by_addr -- see that primitive's own header for why
+# fiber machinery, despite looking similar, would be the wrong
+# building block).
+#
+# resolve_func_addr is the SAME name-to-address lookup fiber_new
+# already uses; "function not found" is fatal here for the same reason
+# tcp_connect/tcp_accept already treat their own unrecoverable
+# conditions as fatal (print + os_exit(96)) rather than returning a
+# sentinel this language has no exception mechanism to signal through.
+#
+# Both the context-address list and the result list are built via
+# rt_list_new(n) + rt_list_set in place, NOT rt_list_push in a loop --
+# same #75 avoidance as read_file_bytes above, and doubly relevant
+# here since n (the item count) is known exactly up front either way.
+#
+# PARITY NOTE, not a NEW x64-specific hazard: if `fname`'s own body
+# touches shared global state (set_var/get), concurrent workers race on
+# it exactly as they would under the interpreter's own real-OS-thread
+# parallel_map -- this backend does not make parallel_map safer than
+# the interpreter, only equally (un)safe, which is what parity means.
+make a function called parallel_map takes items, fname returns results
+  let addr = resolve_func_addr(fname)
+  if addr == 0 - 1 then
+    print("parallel_map: function '" + fname + "' not found")
+    os_exit(96)
+  end
+  let n = rt_list_len(items)
+  let ctxs = rt_list_new(n)
+  let i = 0
+  while i < n do
+    rt_list_set(ctxs, i, os_thread_spawn_by_addr(addr, items[i]))
+    let i = i + 1
+  end
+  let out = rt_list_new(n)
+  let j = 0
+  while j < n do
+    let cj = ctxs[j]
+    while mem_peek_qword(cj, 16) != 1 do
+      os_sleep_ms(0)
+    end
+    rt_list_set(out, j, mem_peek_qword(cj, 24))
+    let j = j + 1
+  end
+  return out
+end
+
 # ---- Fibers: cooperative, real-OS-thread-backed coroutines
 # (fiber_new/fiber_resume/fiber_yield/fiber_alive), plus budgeted(ms)
 # { ... } sugar (budgeted_run/budget_check, emitted by lower.patlang's
@@ -4929,6 +5337,28 @@ make a function called tcp_connect takes host, port returns id
   let sock = os_connect(host, port)
   if sock == 0 - 1 then
     print("tcp_connect: " + host + ":" + port + ": failed")
+    os_exit(96)
+  end
+  let id = conns_table_add(sock)
+  return id
+end
+
+# tcp_try_connect(host, port) -> connection id, or -1 specifically if
+# nothing is listening yet. Compiled-code counterpart of the
+# interpreter's own host primitive of the same name
+# (rust-runtime/src/ir/hosts.rs::host_tcp_try_connect) -- exact same
+# rationale as tcp_try_listen's own -1/fatal split just above, for the
+# other side of the same "poll until a spawned worker is listening"
+# problem (GitHub #62). Any OTHER connect failure (bad host, network
+# unreachable, ...) is still fatal, matching tcp_connect.
+make a function called tcp_try_connect takes host, port returns id
+  os_wsa_startup()
+  let sock = os_connect_try(host, port)
+  if sock == 0 - 1 then
+    return 0 - 1
+  end
+  if sock == 0 - 2 then
+    print("tcp_try_connect: " + host + ":" + port + ": failed")
     os_exit(96)
   end
   let id = conns_table_add(sock)

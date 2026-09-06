@@ -1,0 +1,106 @@
+# Scaling probe for issue #89's still-open mystery: raising patc2.exe's
+# heap size (Y) made the reported "requested" total grow WAY faster than
+# Y itself (784 -> 14,352 -> ~1.9 million bytes for only ~5-12% steps in
+# Y) while self-assembling the runtime's own ~94k-line asm text. That
+# investigation was never able to tell whether this is a genuine
+# algorithmic blowup or an artifact of comparing three separately
+# rebuilt x64 binaries (rebuilding costs ~10min/cycle, per
+# [[patlang-x64-argv-frame-size-corruption-issue89]]).
+#
+# This tests the SAME code path (x64_assemble_chunk, the self-hosted
+# assembler) at a much smaller, controllable scale, and WITHOUT
+# compiling anything to x64 at all -- run directly in the interpreter
+# (pat.exe --ir-run) over synthetic, guaranteed-valid input of
+# increasing size.
+#
+# CONFIRMED, then FIXED (2026-09-06). Original (broken) timing per
+# doubling of N: 233ms -> 818ms -> 3485ms -> 14464ms -> 59520ms ->
+# 239191ms -- ratios converging on ~4.0x (the textbook O(n^2) signature:
+# doubling N should exactly quadruple time for pure quadratic cost).
+# Root cause: aliasing, not list_push itself. `send(d, "set", k,
+# list_push(get(d, k), v))` -- xa_emit_bytes's own pattern for state's
+# text_bytes field -- took 63768ms for 60000 pushes; the identical
+# 60000 pushes through a plain local variable (no Dict round-trip) took
+# 15ms. Because `state`'s Dict field still holds its own Arc reference
+# to the list at the moment `get` hands a copy to `list_push`, every
+# push sees a shared (refcount>1) list and pays a full clone of
+# everything accumulated so far. Every one of xa_new_state's accumulator
+# fields (text_bytes, data_bytes, symbols, relocs, externs, globals)
+# used this same get/push/send-set idiom -- systemic to x64_asm.
+# patlang's state design, not one bad call site.
+#
+# FIX: added a native send(recv, "push", field, val) op that appends
+# in place (rust-runtime/src/ir/hosts.rs's obj_push), and converted all
+# 6 accumulator call sites to use it. Fixed timing, same N range: 137ms
+# -> 257ms -> 529ms -> 1130ms -> 2890ms -> 7414ms -- ~2x per doubling,
+# linear. Verified against the REAL, full 88k-line runtime via
+# self_hosting/tests/x64_asm/run_full_runtime_test.sh: matches nasm+gcc
+# exactly, 2m34s total (was ~5-7min for the self-hosted phase alone).
+#
+# IMPORTANT, found empirically, not assumed: this bug is INTERPRETER-
+# ONLY. Compiling this SAME file via --x64 and running the resulting
+# .exe was LINEAR both before and after the fix (31ms->1406ms pre-fix,
+# 47ms->1641ms post-fix) -- x64_runtime.patlang's own rt_list_push has
+# no reference counting at all (see its own header) and grows lists in
+# place unconditionally, so it was never exposed to this aliasing
+# mechanism. This means the ORIGINAL #89 mystery this probe was built to
+# chase ("raising patc2.exe's heap size makes requested grow WAY faster
+# than heap size") is NOT explained by this bug -- patc2.exe's own
+# self-assembly runs x64-compiled, not interpreted. See
+# [[patlang-x64-argv-frame-size-corruption-issue89]] for the still-open
+# question and what would need checking next (a labels+relocs-heavy
+# input compiled to --x64, or just re-testing patc2's real heap-scaling
+# behavior now that this confirmed-but-unrelated bug is out of the way).
+#
+# send(recv, "push", ...) also needed adding to x64_runtime.patlang's
+# own rt_send_prepare (a new rt_ns_push) purely so this file still
+# compiles/runs correctly via --x64 -- not for a performance reason on
+# that path. Deliberately NOT mirrored into native codegen's own
+# embedded Rust runtime template (rust-runtime/src/ir/codegen.rs) or its
+# self_hosting/lib/runtime_rs.patlang copy -- a documented gap, not
+# silently hidden, per [[feedback-patlang-native-canonical-not-rust]].
+
+include "../lib/x64_asm.patlang"
+
+make a function called build_asm_text takes n returns text
+  let sb = sb_new()
+  let i = 0
+  while i < n do
+    sb_push(sb, "mov rax, 1\n")
+    let i = i + 1
+  end
+  return sb_str(sb)
+end
+
+make a function called prev_n_ratio_str takes sz, prev_n returns s
+  if prev_n == 0 then
+    return "n/a"
+  end
+  return "" + (sz / prev_n)
+end
+
+let sizes = [1000, 2000, 4000, 8000, 16000, 32000]
+let i = 0
+let n = to_num(list_len(sizes))
+let prev_ms = 0
+let prev_n = 0
+while i < n do
+  let sz = sizes[i]
+  let text = build_asm_text(sz)
+  let t0 = now_ms()
+  let chunk = x64_assemble_chunk(text)
+  let t1 = now_ms()
+  let elapsed = t1 - t0
+  let bytes_out = to_num(list_len(chunk[1]))
+  let ratio = "n/a"
+  if prev_ms > 0 then
+    # doubling N: ratio ~2 means linear, ~4 means quadratic, in between
+    # is the honest, unrounded signal -- not asserted against a fixed
+    # threshold, since interpreter timing noise at small N is real.
+    let ratio = "" + (elapsed / prev_ms)
+  end
+  print("N=" + sz + " instructions -> " + bytes_out + " bytes, " + elapsed + "ms (elapsed/prev=" + ratio + ", N/prev_N=" + (prev_n_ratio_str(sz, prev_n)) + ")")
+  let prev_ms = elapsed
+  let prev_n = sz
+  let i = i + 1
+end
