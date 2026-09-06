@@ -1,0 +1,156 @@
+# Demo: descriptive tagging (docs/plans/synthesis_tagging_design.md) lets a
+# caller hand the enumerative synthesizer a MUCH broader candidate pool --
+# the whole registry, primitives AND already-derived compounds, instead of
+# hand-picking exact names per goal -- while still deriving the SAME small,
+# sensible composite as output, at close to hand-curated search cost.
+#
+# The goal is `up_to_space(s)` (the request-line-parsing example from
+# synthesis_by_example_selftest.patlang: substr(s, 0, index_of(s, " "))),
+# picked specifically because it's cheap enough (needs only max_size=8) to
+# broaden the pool safely -- an earlier draft of this demo used the
+# selftest's OTHER example, after_space, whose own genuine cost (needs
+# max_size=12 even hand-curated) made an 18-name unfiltered pool balloon
+# past the interpreter's memory safety cap before finishing; that's a real
+# finding in its own right (documented at the bottom), just not a safe one
+# to run unconditionally in a demo everyone re-runs.
+#
+# Three configurations, same goal, same registry:
+#   A. Hand-curated (today's only real option): the developer already knows
+#      to pass exactly ["substr", "index_of"].
+#   B. Broad, unfiltered: every non-effectful name in the registry (18,
+#      including a compound and several primitives from unrelated domains
+#      -- encoding, list access, bool comparison, functional selection),
+#      passed straight through with no narrowing at all. Still finds the
+#      correct answer (arg-type/contract checking already prevents an
+#      ill-typed candidate from ever being constructed -- see
+#      primitive_registry.patlang's own header) but the per-level pool
+#      counts printed by synthesize_from_examples grow considerably larger,
+#      because every irrelevant primitive still contributes leaves/branches
+#      to the index at every size level even though none of them end up in
+#      the winning AST.
+#   C. Broad pool + tag narrowing: pool_all (20 names, INCLUDING the two
+#      effectful network primitives this time), narrowed via
+#      pr_narrow_by_tags down to whatever matches a caller's own DECLARED
+#      intent tags -- no per-goal name memorization required, just "this is
+#      roughly a string-manipulation/search problem". Pool sizes fall back
+#      close to config A's, and the winning AST is checked to be
+#      functionally IDENTICAL to config A's -- broadening the raw pool
+#      never degrades the output, tags just make searching a big pool
+#      cheap (and, for effectful primitives, SAFE) again.
+
+include "../lib/synthesis_by_example.patlang"
+include "../lib/test.patlang"
+
+t_init()
+
+let registry = pr_standard_registry()
+
+# ---- a compound joins the pool, the same way primitives do ----
+#
+# double(n) = add(n, n): a trivial composite, registered here purely so the
+# "broad pool" below genuinely contains a COMPOUND alongside primitives,
+# not just more primitives. register_composite auto-derives its tags from
+# its one constituent (add) -- no manual tagging step needed for compounds.
+let dbl_a = new("Dict", "dbl_a")
+send(dbl_a, "set", "n", 3)
+let dbl_b = new("Dict", "dbl_b")
+send(dbl_b, "set", "n", 10)
+let double_examples = [[dbl_a, 6], [dbl_b, 20]]
+let double_result = synthesize_from_examples(double_examples, ["n"], [], registry, ["add"], 4)
+check("double(n) = add(n, n) derives cleanly", double_result[0], "OK")
+register_composite(registry, "double", double_result[1], ["n"], ["int"], 1)
+let double_entry = pr_lookup(registry, "double")
+print("compound 'double' auto-tagged: " + pr_tags(double_entry) + " (suggested=" + pr_tags_suggested(double_entry) + ")")
+
+# Every name pr_standard_registry() currently registers, plus the compound
+# just added -- exactly what a caller who refuses to hand-curate per goal
+# would pass: "here is the whole library, go find it." pool_all keeps
+# tcp_connect/tcp_listen for the TAG-NARROWING demonstration below (they
+# get correctly excluded by name-matching alone, never evaluated); broad_pool
+# drops them for the UNFILTERED config B run, because a blind broad-pool
+# search will happily construct tcp_connect(<string leaf>, <int leaf>) as a
+# type-correct candidate and then genuinely CALL it during evaluation --
+# confirmed empirically while building this demo (a real live
+# "No such host is known" OS error, mid-search). PatLang has no try/catch
+# to recover from that: tag-based filtering is a SAFETY property here, not
+# just a performance one, since pr_narrow_by_tags would exclude both
+# (neither has a "string:..."/"math:..." facet) the same way it excludes
+# any other effect a caller didn't ask for.
+let pool_all = ["chr", "char_code", "substr", "concat", "str_eq", "str_len", "find_substr", "index_of", "index_of_from", "add", "sub", "geq", "gt", "cond", "eq_int", "list_get", "list_len", "tcp_connect", "tcp_listen", "double"]
+let broad_pool = ["chr", "char_code", "substr", "concat", "str_eq", "str_len", "find_substr", "index_of", "index_of_from", "add", "sub", "geq", "gt", "cond", "eq_int", "list_get", "list_len", "double"]
+
+let u1 = new("Dict", "u1")
+send(u1, "set", "s", "/health HTTP/1.1")
+let u2 = new("Dict", "u2")
+send(u2, "set", "s", "/x HTTP/1.1")
+let up_to_space_examples = [[u1, "/health"], [u2, "/x"]]
+
+# " " is the delimiter these examples split on -- seeding it as an extra
+# constant is what makes index_of(s, " ") constructible at all.
+print("")
+print("=== Config A: hand-curated pool (2 names the developer already knows to pick) ===")
+let result_a = synthesize_from_examples(up_to_space_examples, ["s"], [" "], registry, ["substr", "index_of"], 8)
+check("config A derives up_to_space", result_a[0], "OK")
+
+print("")
+print("=== Config B: broad pool (" + list_len(broad_pool) + " names), NO tag narrowing ===")
+let result_b = synthesize_from_examples(up_to_space_examples, ["s"], [" "], registry, broad_pool, 8)
+check("config B (unfiltered broad pool) still derives up_to_space", result_b[0], "OK")
+
+print("")
+print("=== Config C: broad pool (incl. the network primitives), narrowed by declared intent tags ===")
+let intent_tags = ["string:manipulation", "string:search"]
+let narrowed_pool = pr_narrow_by_tags(registry, pool_all, intent_tags, "any")
+print("intent tags: " + intent_tags)
+print("narrowed pool (" + list_len(narrowed_pool) + " of " + list_len(pool_all) + " names): " + narrowed_pool)
+check("tag narrowing drops the compound 'double' (math:arithmetic, not string:*)", pr_list_contains(narrowed_pool, "double"), false)
+check("tag narrowing drops tcp_connect (no string facet -- and never gets evaluated)", pr_list_contains(narrowed_pool, "tcp_connect"), false)
+check("tag narrowing drops tcp_listen (no string facet -- and never gets evaluated)", pr_list_contains(narrowed_pool, "tcp_listen"), false)
+check("tag narrowing drops list_get (no string facet)", pr_list_contains(narrowed_pool, "list_get"), false)
+check("tag narrowing drops chr (string:encoding, not manipulation/search)", pr_list_contains(narrowed_pool, "chr"), false)
+check("tag narrowing keeps substr (string:manipulation)", pr_list_contains(narrowed_pool, "substr"), true)
+check("tag narrowing keeps index_of (string:search)", pr_list_contains(narrowed_pool, "index_of"), true)
+let result_c = synthesize_from_examples(up_to_space_examples, ["s"], [" "], registry, narrowed_pool, 8)
+check("config C (tag-narrowed broad pool) derives up_to_space", result_c[0], "OK")
+
+# ---- broadening the pool never degrades the output ----
+
+print("")
+print("=== Correctness: all three configs must agree on the SAME function ===")
+let held_out = new("Dict", "held_out")
+send(held_out, "set", "s", "PUT /orders/42 HTTP/2")
+let via_a = sbe_eval(result_a[1], held_out, registry)
+let via_b = sbe_eval(result_b[1], held_out, registry)
+let via_c = sbe_eval(result_c[1], held_out, registry)
+check("config A on a held-out input", via_a[1], "PUT")
+check("config B (unfiltered broad pool) agrees with config A on the held-out input", via_b[1], via_a[1])
+check("config C (tag-narrowed broad pool) agrees with config A on the held-out input", via_c[1], via_a[1])
+
+let calls_c = sbe_dedup_names(sbe_collect_call_names(result_c[1]))
+print("config C's winning AST actually calls: " + calls_c)
+check("config C's output never reaches for the compound (irrelevant here, but WAS pool-eligible)", pr_list_contains(calls_c, "double"), false)
+check("config C's output never reaches for an unrelated-domain primitive that was ALSO in the pool", pr_list_contains(calls_c, "list_get"), false)
+
+print("")
+print("=== Emitted PatLang source for config C's derived function ===")
+let emitted = emit_function_def_patlang("up_to_space", ["s"], result_c[1], registry)
+print(emitted[1])
+
+# ---- addendum: why after_space (not this file's goal) needs real care ----
+#
+# The genuinely harder sibling example, after_space(s) = substr(s,
+# add(index_of(s," "),1), sub(str_len(s), add(index_of(s," "),1))), needs
+# max_size=12 even with the exact 4 curated primitives (7990-candidate
+# pool by the final level). Widening that SAME search to the 18-name
+# broad_pool above, unfiltered, does not just get slower: by size=9 the
+# pool had already reached 103037 candidates and the process was killed by
+# the interpreter's own memory safety cap shortly after (a real, reproduced
+# result, not a hypothetical) -- confirmed while building this file, not
+# re-run here on purpose. Narrowing that SAME 18-name pool down to
+# ["string:manipulation", "string:search", "math:arithmetic"] before the
+# search starts is precisely what keeps a goal like that tractable at all
+# once the registry has grown past a small hand-curated handful -- the
+# actual motivating case for pr_narrow_by_tags, not just this file's
+# cheaper up_to_space illustration.
+
+t_report()
