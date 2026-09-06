@@ -1,0 +1,106 @@
+include "signals.patlang"
+
+# ---- live build progress / health, over the signals IPC port ----
+#
+# A native build is a genuinely long-running job (the self-hosted
+# compiler's own ~330-function bundle takes minutes) and it used to run
+# completely silently -- no way to tell "assembling unit 200 of 511"
+# from "wedged". That opacity has a real, measured cost: one two-hour
+# run's phase boundary (assembly finished, linking began) could only be
+# recovered AFTER the fact, by noticing the newest per-unit cache file
+# had stopped advancing.
+#
+# Exposed the way this codebase already exposes live process state --
+# signals.patlang's claim/poll/reply, the same request/response shape
+# signals_demo.patlang's own "status" signal uses. A build holds the
+# port and services queries as it works; anything else can ask it, from
+# any process, WHILE it runs:
+#   let reply = signal_query(x64_build_signal_port(), "x64_status", "")
+#
+# Lives in its own leaf module, included by BOTH the assembler
+# (x64_asm.patlang) and the build orchestrator (x64_compile_unit.
+# patlang), because both need to report. It was originally defined
+# alongside the orchestrator, which quietly inverted the dependency --
+# the assembler is the lower-level module, and calling upward into the
+# orchestrator worked only by accident of build_patc1.patlang's
+# concatenation order. Anything that included x64_asm.patlang on its own
+# died with "host fn 'x64_build_tick' not found". Only signals.patlang
+# is depended on here, and that file includes nothing itself, so this
+# stays safe to include from anywhere.
+make a function called x64_build_signal_port takes none returns port
+  return 9410
+end
+
+# Concurrent builds are normal here, so a single fixed port is not
+# enough: whichever build starts second gets -1 from signal_claim and
+# goes silent for its whole run -- and two builds racing is exactly when
+# you most want to see what each is doing. Claiming across a small range
+# lets several publish at once. Kept deliberately small; a build that
+# cannot find a free port in eleven tries simply does not serve, which
+# is still never fatal.
+make a function called x64_build_signal_port_last takes none returns port
+  return 9420
+end
+
+make a function called x64_build_status_text takes none returns status
+  return "" + get("__vars", "__x64_build_status")
+end
+
+# Claimed once per build, walking the port range until one is free.
+# Returns the claimed port_id, or -1 if every port in the range is taken
+# -- which is a normal, fine outcome: this build then simply never
+# serves. Reporting must never block, delay, or fail the actual work.
+make a function called x64_build_signal_claim takes none returns port_id
+  let port = x64_build_signal_port()
+  let last = x64_build_signal_port_last()
+  let claimed = 0 - 1
+  while (port <= last) and (claimed < 0) do
+    let claimed = signal_claim(port)
+    let port = port + 1
+  end
+  set_var("__x64_build_port", "" + claimed)
+  return claimed
+end
+
+# Records a new phase/position AND services one pending query.
+make a function called x64_build_progress takes phase, done, total returns ok
+  set_var("__x64_build_status", phase + " " + done + "/" + total + " t_ms=" + now_ms())
+  return x64_build_tick()
+end
+
+# A bare yield: services one pending query, if any, WITHOUT updating the
+# status line. Long-running components call this on a routine basis from
+# inside their own loops, so a query gets answered in reasonable time
+# even mid-phase rather than only at the phase boundaries where
+# x64_build_progress happens to be called -- exactly the gap that left a
+# status probe hanging for minutes while the linker ground through one
+# uninterrupted loop.
+#
+# Costs a single non-blocking accept (signal_poll with a 0 timeout
+# returns immediately when nobody is asking), so it is cheap enough for
+# every few hundred iterations of a hot loop, and free when no port was
+# ever claimed.
+#
+# The guard is `> 0`, deliberately, not `>= 0`: when no build has
+# claimed a port the var is unset, and an unset var coerces to 0, which
+# `>= 0` happily accepts -- sending signal_poll at port 0 and taking
+# down any program that merely INCLUDED this file without running a
+# build ("tcp_accept_timeout: no listener on port 0"). A real claimed
+# port is always > 0, and signal_claim's own already-held answer is -1,
+# so both non-serving cases fall out here.
+make a function called x64_build_tick takes none returns ok
+  let pid = to_num("" + get("__vars", "__x64_build_port"))
+  if pid > 0 then
+    let unused = signal_poll(pid, 0)
+  end
+  return true
+end
+
+# Answers a live `signal_query(x64_build_signal_port(), "x64_status", "")`
+# from any other process with the current phase/progress line. Top level
+# by necessity, not style: a `when` handler registered inside a function
+# or method body does not fire -- it has to be declared at file scope to
+# be reachable when signal_poll dispatches.
+when x64_status do
+  signal_reply(x64_build_status_text())
+end

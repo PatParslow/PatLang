@@ -180,58 +180,62 @@ make a function called x64_build_linked_multi takes program_asm_chunks, runtime_
 end
 
 # ==========================================================================
-# Phase 5 -- self-hosted toolchain (x64_asm.patlang + x64_pe_link.patlang)
-# as an explicit ALTERNATIVE to the nasm/gcc functions above, not a
-# replacement. Per the plan's own verification discipline (this project
-# keeps --ir-run/--patc/wasm as permanent cross-checking oracles rather
-# than deleting superseded paths): nasm/gcc stay the DEFAULT, real build
-# path indefinitely. x64_build_use_native_toolchain() below is the single
-# switch a caller flips to opt into the new toolchain -- deliberately NOT
-# wired into patc1_main.patlang's own real build path yet. Flipping that
-# default is a separate, deliberate decision for once the new toolchain
-# has been run against the full self-hosted-compiler-bundle scale that
-# originally motivated chunking (288,700 labels) -- Phase 4 only proved
-# import-table correctness at real DLL-surface scale, not full-bundle
-# function-count/chunk-count scale.
+# Phase 5 -- the self-hosted toolchain (x64_asm.patlang +
+# x64_pe_link.patlang) is now the DEFAULT real build path for --x64:
+# x64_build_use_native_toolchain() below returns true, and
+# patc1_main.patlang genuinely consults it (send(linker, "build_native",
+# ...) vs send(linker, "build", ...)). The nasm/gcc functions above are
+# NOT deleted and remain fully reachable by flipping that one return
+# value to false -- per this project's own verification discipline of
+# keeping superseded paths as permanent cross-checking oracles rather
+# than removing them, the same reason --ir-run/--patc/wasm are all still
+# around. That fallback has already earned its keep: differential-testing
+# the two assemblers against each other on identical .asm input is what
+# found the three-operand `imul` encoding bug.
 # ==========================================================================
 
 # Real production wiring now exists (X64UnitLinker.build_native /
 # CompileUnit.ensure_chunk_native, self_hosting/lib/x64_compile_unit.
-# patlang) and patc1_main.patlang's --x64 path DOES consult this flag
-# now -- but flipped back to FALSE (nasm/gcc stays the real default)
-# after wiring it in found a genuine, separate, previously-unexercised
-# bug: x64_asm.patlang/x64_pe_link.patlang were never themselves part
-# of patc1.exe's OWN compiled body until this session (build_patc1.
-# patlang's own source-concatenation list omitted them), so running
-# the wired build_native path through the REAL patc1.exe crashes
-# ("list_set: index 18446744073709551615 out of range (len 8)",
-# apparently inside x64_asm.patlang's own huge-integer handling)
-# somewhere the interpreter-driven self_hosting/tests/x64_asm/
-# run_full_runtime_test.sh never exercised -- that test drives
-# x64_assemble_chunk via `pat --ir-run` (the Rust interpreter
-# directly), never via a *compiled* patc1.exe executing its own
-# Rust-codegen'd (codegen.patlang, NOT codegen_x64.patlang) copy of
-# that same code, which is a third, separate numeric-tower
-# implementation from the one this session's earlier BigInt-comparison
-# fixes touched. NOT yet root-caused -- do not flip this back to true
-# until it is; see patlang-x64-selfhosted-assembler-phase1 memory for
-# the full trail.
+# patlang) and patc1_main.patlang's --x64 path DOES consult this flag.
+# RESOLVED (session 8): the root cause of the earlier string-equality-
+# vs-literal corruption (every rt_str_eq comparison returning false
+# once compiled through the native toolchain) was xa_parse_int's use
+# of to_num(), which silently loses precision via a float64 round-trip
+# for large decimal literals -- corrupting the Bool-TRUE tagged
+# constant (0x6000000000000001 -> 0x6000000000000000, i.e. Bool-FALSE)
+# every time it was assembled. Fixed by parsing decimal strings with
+# exact integer arithmetic (substr + a digit lookup table), with no
+# to_num()/char_code() dependency (char_code assumes the TARGET
+# program's tagged-pointer memory model, which does not hold for code
+# running inside the current bootstrap compiler's own compiled body).
+# Verified: a trivial --x64 program, the rt_str_eq("abc","abc") direct-
+# call repro (now correctly exits 1), the full self_hosting/tests/
+# x64_asm/run_tests.sh suite (9/9), and a real recursive benchmark
+# (fib(32) = 2178309) all pass through the native toolchain. See
+# patlang-x64-selfhosted-assembler-phase1 memory for the full
+# investigation trail.
 make a function called x64_build_use_native_toolchain returns enabled
-  return false
+  return true
 end
 
 # The exact real import surface codegen_x64.patlang's own emit_program_x64
 # declares (see its own "extern ..." sb_push lines) -- kept as one
 # explicit, verified-against-the-real-DLLs list here rather than derived
-# from a ChunkImage's own `externs` (which would also have to include
-# round/trunc: codegen_x64.patlang declares them as a vestigial `extern`
-# but never actually CALLs them -- x64_roundlike_asm implements round/
-# trunc/ceil natively via SSE roundsd instead -- so including them here
-# would try to import two symbols that genuinely don't exist in
-# msvcrt.dll, exactly the Phase 4 bug already found and fixed once).
+# from a ChunkImage's own `externs`.
+#
+# round/trunc are deliberately ABSENT and must stay absent: msvcrt.dll
+# exports ceil, floor and fabs but neither round nor trunc (checked
+# against the real DLL's export table). Importing them would name two
+# symbols that do not exist -- exactly the Phase 4 bug already found and
+# fixed once. x64_roundlike_asm therefore synthesises both from
+# floor/ceil; see its own header. (An earlier version of this comment
+# claimed roundlike used SSE roundsd and never called out at all; that
+# had stopped being true, and the stale claim hid a real bug -- codegen
+# was emitting `call round` against an import list that rightly did not
+# declare it, so any program rounding a float failed to link natively.)
 make a function called x64_default_import_spec returns spec
   return [
-    ["KERNEL32.DLL", ["GetStdHandle", "WriteFile", "ExitProcess", "CreateFileA", "GetFileSize", "CloseHandle", "ReadFile", "CreateProcessA", "CreatePipe", "SetHandleInformation", "WaitForSingleObject", "GetCommandLineA", "GetExitCodeProcess", "TerminateProcess", "Sleep", "GetTickCount64", "CopyFileA", "MoveFileExA", "FindFirstFileA", "FindNextFileA", "FindClose", "GetConsoleMode", "SetConsoleMode", "SetConsoleOutputCP", "SetConsoleCP", "GetCurrentDirectoryA", "SetCurrentDirectoryA", "CreatePseudoConsole", "ResizePseudoConsole", "ClosePseudoConsole", "InitializeProcThreadAttributeList", "UpdateProcThreadAttribute", "CreateProcessW", "PeekNamedPipe", "GetLastError", "CreateThread", "ExitThread", "InitializeCriticalSection", "EnterCriticalSection", "LeaveCriticalSection", "TlsAlloc", "TlsGetValue", "TlsSetValue", "AcquireSRWLockExclusive", "ReleaseSRWLockExclusive", "SleepConditionVariableSRW", "WakeConditionVariable", "GetModuleHandleW", "GlobalAlloc", "GlobalLock", "GlobalUnlock", "GlobalSize"]],
+    ["KERNEL32.DLL", ["GetStdHandle", "WriteFile", "ExitProcess", "CreateFileA", "GetFileSize", "CloseHandle", "ReadFile", "CreateProcessA", "CreatePipe", "SetHandleInformation", "WaitForSingleObject", "GetCommandLineA", "GetEnvironmentVariableA", "GetExitCodeProcess", "TerminateProcess", "Sleep", "GetTickCount64", "CopyFileA", "MoveFileExA", "FindFirstFileA", "FindNextFileA", "FindClose", "GetConsoleMode", "SetConsoleMode", "SetConsoleOutputCP", "SetConsoleCP", "GetCurrentDirectoryA", "SetCurrentDirectoryA", "CreatePseudoConsole", "ResizePseudoConsole", "ClosePseudoConsole", "InitializeProcThreadAttributeList", "UpdateProcThreadAttribute", "CreateProcessW", "PeekNamedPipe", "GetLastError", "CreateThread", "ExitThread", "InitializeCriticalSection", "EnterCriticalSection", "LeaveCriticalSection", "TlsAlloc", "TlsGetValue", "TlsSetValue", "AcquireSRWLockExclusive", "ReleaseSRWLockExclusive", "SleepConditionVariableSRW", "WakeConditionVariable", "GetModuleHandleW", "GlobalAlloc", "GlobalLock", "GlobalUnlock", "GlobalSize"]],
     ["WS2_32.DLL", ["WSAStartup", "WSAGetLastError", "socket", "bind", "listen", "accept", "connect", "send", "recv", "closesocket", "shutdown", "getaddrinfo", "freeaddrinfo", "getsockname", "ioctlsocket", "htons", "ntohs"]],
     ["USER32.DLL", ["RegisterClassExW", "CreateWindowExW", "ShowWindow", "UpdateWindow", "DefWindowProcW", "PeekMessageW", "TranslateMessage", "DispatchMessageW", "BeginPaint", "EndPaint", "InvalidateRect", "GetClientRect", "DestroyWindow", "GetKeyState", "OpenClipboard", "CloseClipboard", "EmptyClipboard", "SetClipboardData", "GetClipboardData", "SetWindowTextA", "GetDC", "ReleaseDC"]],
     ["GDI32.DLL", ["CreateCompatibleDC", "CreateDIBSection", "SelectObject", "BitBlt", "TextOutA", "SetTextColor", "SetBkMode", "DeleteObject", "StretchDIBits"]],

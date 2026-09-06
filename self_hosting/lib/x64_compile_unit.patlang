@@ -1,3 +1,5 @@
+include "build_progress.patlang"
+
 # CompileUnit -- one function's own compilation unit: its IR, a stable
 # content hash (the ObjCache lookup key), and the logic to produce its
 # own .obj, either from cache or by running the exact same codegen/
@@ -43,6 +45,346 @@ end
 # automatically invalidates every cached object -- no manual cache-clearing
 # required. Memoized in a global var since it's the same value for every
 # unit within one compiler run and reading+hashing the file is not free.
+# ---- binary ChunkImage cache format ----
+#
+# The chunk cache was originally JSON (json_stringify/to_json_value on
+# the way out, json_parse/from_json_value on the way back). That turned
+# out to cost as much as it saved: a ChunkImage is dominated by two flat
+# byte lists, and JSON renders each byte as up to four characters of
+# text that then have to be re-tokenised and re-boxed on load, so the
+# runtime chunk's cache file was 2.3MB of text whose parse time simply
+# replaced the assembly time the cache existed to avoid. Measured, not
+# assumed -- a cache-populating build and a confirmed cache-HIT build
+# came in at the same ~9 minutes.
+#
+# This encodes the same structure as raw bytes instead: one byte per
+# byte, lengths as fixed 4-byte little-endian, strings as length+bytes.
+# Same information, roughly a seventh the size, and no tokeniser on the
+# read path.
+#
+# Integers are encoded unsigned except where a field is genuinely
+# signed (a reloc addend), which gets an explicit sign byte rather than
+# a two's-complement encoding -- this file only ever needs to survive
+# its own round trip, and an explicit sign is far harder to get subtly
+# wrong than sign-extension across a hand-rolled decoder.
+# Shifts, not `/`: PatLang's `/` is EXACT division and promotes to a
+# Rational the moment it isn't even (4/8 is the rational 1/2, not 0),
+# so the obvious `(v / 256) % 256` would hand a Rational to a byte
+# list. `shr`/`band` stay in integer space throughout.
+#
+# NOTE ON SHAPE (GitHub #75): these helpers RETURN a small fixed-size
+# byte list and never take the accumulator as a parameter. The natural
+# design -- `put_u32(out, v)` taking the growing output list and
+# returning it -- is quadratic here: passing an accumulating list across
+# a call boundary copies it every time (measured: 40,000 appends cost
+# 9ms inline versus 24,125ms through a one-line helper, ~2700x). The
+# encoder below therefore does every `list_push` onto `out` INLINE, and
+# uses these only to compute the handful of bytes to append. Small
+# returned lists are cheap; it is specifically the big accumulator
+# crossing the boundary that is not.
+make a function called x64_bin_u32_bytes takes v returns b
+  return [v band 255, (v shr 8) band 255, (v shr 16) band 255, (v shr 24) band 255]
+end
+
+make a function called x64_bin_int_bytes takes v returns b
+  if v < 0 then
+    let m = 0 - v
+    return [1, m band 255, (m shr 8) band 255, (m shr 16) band 255, (m shr 24) band 255]
+  end
+  return [0, v band 255, (v shr 8) band 255, (v shr 16) band 255, (v shr 24) band 255]
+end
+
+make a function called x64_bin_get_u32 takes bytes, i returns v
+  return bytes[i] + (bytes[i + 1] * 256) + (bytes[i + 2] * 65536) + (bytes[i + 3] * 16777216)
+end
+
+make a function called x64_bin_get_int takes bytes, i returns v
+  let mag = x64_bin_get_u32(bytes, i + 1)
+  if bytes[i] == 1 then
+    return 0 - mag
+  end
+  return mag
+end
+
+make a function called x64_bin_get_str takes bytes, i, n returns s
+  let sb = sb_new()
+  let k = 0
+  while k < n do
+    sb_push(sb, chr(bytes[i + k]))
+    let k = k + 1
+  end
+  return sb_str(sb)
+end
+
+# ChunkImage: ["ChunkImage", text_bytes, data_bytes, bss_size, symbols,
+# relocs, externs] -- symbols are [name, section, offset, is_global],
+# relocs are [section, offset, target, kind, addend].
+#
+# Written as one long function on purpose. Every append to `out` is an
+# inline list_push; nothing hands the growing accumulator to a helper,
+# because doing so copies it on each call (GitHub #75) and turned this
+# encoder from seconds into "did not finish in 38 minutes". The small
+# x64_bin_*_bytes helpers above are still used -- they only ever compute
+# and return a handful of bytes, which is cheap.
+make a function called x64_chunk_to_bin takes chunk returns bytes
+  let out = []
+
+  let text = chunk[1]
+  let tn = to_num(list_len(text))
+  let hdr = x64_bin_u32_bytes(tn)
+  let out = list_push(out, hdr[0])
+  let out = list_push(out, hdr[1])
+  let out = list_push(out, hdr[2])
+  let out = list_push(out, hdr[3])
+  let i = 0
+  while i < tn do
+    if (i % 20000) == 0 then
+      x64_build_tick()
+    end
+    let out = list_push(out, text[i] band 255)
+    let i = i + 1
+  end
+
+  let data = chunk[2]
+  let dn = to_num(list_len(data))
+  let hdr = x64_bin_u32_bytes(dn)
+  let out = list_push(out, hdr[0])
+  let out = list_push(out, hdr[1])
+  let out = list_push(out, hdr[2])
+  let out = list_push(out, hdr[3])
+  let i = 0
+  while i < dn do
+    let out = list_push(out, data[i] band 255)
+    let i = i + 1
+  end
+
+  let bb = x64_bin_int_bytes(chunk[3])
+  let out = list_push(out, bb[0])
+  let out = list_push(out, bb[1])
+  let out = list_push(out, bb[2])
+  let out = list_push(out, bb[3])
+  let out = list_push(out, bb[4])
+
+  let syms = chunk[4]
+  let sn = to_num(list_len(syms))
+  let hdr = x64_bin_u32_bytes(sn)
+  let out = list_push(out, hdr[0])
+  let out = list_push(out, hdr[1])
+  let out = list_push(out, hdr[2])
+  let out = list_push(out, hdr[3])
+  let i = 0
+  while i < sn do
+    if (i % 2000) == 0 then
+      x64_build_tick()
+    end
+    let s = syms[i]
+    let name = s[0]
+    let nn = name.length
+    let hdr = x64_bin_u32_bytes(nn)
+    let out = list_push(out, hdr[0])
+    let out = list_push(out, hdr[1])
+    let out = list_push(out, hdr[2])
+    let out = list_push(out, hdr[3])
+    let c = 0
+    while c < nn do
+      let out = list_push(out, char_code(name, c))
+      let c = c + 1
+    end
+    let sec = "" + s[1]
+    let sl = sec.length
+    let hdr = x64_bin_u32_bytes(sl)
+    let out = list_push(out, hdr[0])
+    let out = list_push(out, hdr[1])
+    let out = list_push(out, hdr[2])
+    let out = list_push(out, hdr[3])
+    let c = 0
+    while c < sl do
+      let out = list_push(out, char_code(sec, c))
+      let c = c + 1
+    end
+    let ob = x64_bin_int_bytes(s[2])
+    let out = list_push(out, ob[0])
+    let out = list_push(out, ob[1])
+    let out = list_push(out, ob[2])
+    let out = list_push(out, ob[3])
+    let out = list_push(out, ob[4])
+    if s[3] then
+      let out = list_push(out, 1)
+    else
+      let out = list_push(out, 0)
+    end
+    let i = i + 1
+  end
+
+  let rels = chunk[5]
+  let rn = to_num(list_len(rels))
+  let hdr = x64_bin_u32_bytes(rn)
+  let out = list_push(out, hdr[0])
+  let out = list_push(out, hdr[1])
+  let out = list_push(out, hdr[2])
+  let out = list_push(out, hdr[3])
+  let j = 0
+  while j < rn do
+    if (j % 2000) == 0 then
+      x64_build_tick()
+    end
+    let r = rels[j]
+    let sec = "" + r[0]
+    let sl = sec.length
+    let hdr = x64_bin_u32_bytes(sl)
+    let out = list_push(out, hdr[0])
+    let out = list_push(out, hdr[1])
+    let out = list_push(out, hdr[2])
+    let out = list_push(out, hdr[3])
+    let c = 0
+    while c < sl do
+      let out = list_push(out, char_code(sec, c))
+      let c = c + 1
+    end
+    let ob = x64_bin_int_bytes(r[1])
+    let out = list_push(out, ob[0])
+    let out = list_push(out, ob[1])
+    let out = list_push(out, ob[2])
+    let out = list_push(out, ob[3])
+    let out = list_push(out, ob[4])
+    let tgt = "" + r[2]
+    let tl = tgt.length
+    let hdr = x64_bin_u32_bytes(tl)
+    let out = list_push(out, hdr[0])
+    let out = list_push(out, hdr[1])
+    let out = list_push(out, hdr[2])
+    let out = list_push(out, hdr[3])
+    let c = 0
+    while c < tl do
+      let out = list_push(out, char_code(tgt, c))
+      let c = c + 1
+    end
+    let knd = "" + r[3]
+    let kl = knd.length
+    let hdr = x64_bin_u32_bytes(kl)
+    let out = list_push(out, hdr[0])
+    let out = list_push(out, hdr[1])
+    let out = list_push(out, hdr[2])
+    let out = list_push(out, hdr[3])
+    let c = 0
+    while c < kl do
+      let out = list_push(out, char_code(knd, c))
+      let c = c + 1
+    end
+    let ab = x64_bin_int_bytes(r[4])
+    let out = list_push(out, ab[0])
+    let out = list_push(out, ab[1])
+    let out = list_push(out, ab[2])
+    let out = list_push(out, ab[3])
+    let out = list_push(out, ab[4])
+    let j = j + 1
+  end
+
+  let exts = chunk[6]
+  let en = to_num(list_len(exts))
+  let hdr = x64_bin_u32_bytes(en)
+  let out = list_push(out, hdr[0])
+  let out = list_push(out, hdr[1])
+  let out = list_push(out, hdr[2])
+  let out = list_push(out, hdr[3])
+  let k = 0
+  while k < en do
+    let e = "" + exts[k]
+    let el = e.length
+    let hdr = x64_bin_u32_bytes(el)
+    let out = list_push(out, hdr[0])
+    let out = list_push(out, hdr[1])
+    let out = list_push(out, hdr[2])
+    let out = list_push(out, hdr[3])
+    let c = 0
+    while c < el do
+      let out = list_push(out, char_code(e, c))
+      let c = c + 1
+    end
+    let k = k + 1
+  end
+
+  return out
+end
+
+make a function called x64_bin_slice_bytes takes bytes, i, n returns bl
+  let out = []
+  let k = 0
+  while k < n do
+    if (k % 20000) == 0 then
+      x64_build_tick()
+    end
+    let out = list_push(out, bytes[i + k])
+    let k = k + 1
+  end
+  return out
+end
+
+make a function called x64_chunk_from_bin takes bytes returns chunk
+  let tn = x64_bin_get_u32(bytes, 0)
+  let text_bytes = x64_bin_slice_bytes(bytes, 4, tn)
+  let p = 4 + tn
+  let dn = x64_bin_get_u32(bytes, p)
+  let data_bytes = x64_bin_slice_bytes(bytes, p + 4, dn)
+  let p = p + 4 + dn
+  let bss_size = x64_bin_get_int(bytes, p)
+  let p = p + 5
+  let sn = x64_bin_get_u32(bytes, p)
+  let p = p + 4
+  let syms = []
+  let i = 0
+  while i < sn do
+    let nl = x64_bin_get_u32(bytes, p)
+    let name = x64_bin_get_str(bytes, p + 4, nl)
+    let p = p + 4 + nl
+    let sl = x64_bin_get_u32(bytes, p)
+    let section = x64_bin_get_str(bytes, p + 4, sl)
+    let p = p + 4 + sl
+    let offset = x64_bin_get_int(bytes, p)
+    let p = p + 5
+    let is_global = false
+    if bytes[p] == 1 then
+      let is_global = true
+    end
+    let p = p + 1
+    let syms = list_push(syms, [name, section, offset, is_global])
+    let i = i + 1
+  end
+  let rn = x64_bin_get_u32(bytes, p)
+  let p = p + 4
+  let rels = []
+  let j = 0
+  while j < rn do
+    let sl = x64_bin_get_u32(bytes, p)
+    let section = x64_bin_get_str(bytes, p + 4, sl)
+    let p = p + 4 + sl
+    let offset = x64_bin_get_int(bytes, p)
+    let p = p + 5
+    let tl = x64_bin_get_u32(bytes, p)
+    let target = x64_bin_get_str(bytes, p + 4, tl)
+    let p = p + 4 + tl
+    let kl = x64_bin_get_u32(bytes, p)
+    let kind = x64_bin_get_str(bytes, p + 4, kl)
+    let p = p + 4 + kl
+    let addend = x64_bin_get_int(bytes, p)
+    let p = p + 5
+    let rels = list_push(rels, [section, offset, target, kind, addend])
+    let j = j + 1
+  end
+  let en = x64_bin_get_u32(bytes, p)
+  let p = p + 4
+  let exts = []
+  let k = 0
+  while k < en do
+    let el = x64_bin_get_u32(bytes, p)
+    let ename = x64_bin_get_str(bytes, p + 4, el)
+    let p = p + 4 + el
+    let exts = list_push(exts, ename)
+    let k = k + 1
+  end
+  return ["ChunkImage", text_bytes, data_bytes, bss_size, syms, rels, exts]
+end
+
 make a function called x64_compiler_fingerprint takes none returns fp
   # NOTE: get() on a never-set key concatenates as "" but is NOT == ""
   # (patlang-get-unset-key-not-equal-empty-string) -- coerce first.
@@ -149,19 +491,26 @@ class CompileUnit {
   # see x64_make_compile_unit), but produces an in-memory ChunkImage
   # instead of an on-disk .obj, since this linker has no COFF reader
   # (x64_link_native_chunks's own header) and never needs one -- no
-  # nasm/gcc subprocess involved at all. Cached as JSON on disk (a
-  # ChunkImage is a plain tagged list of ints/strings, see
-  # x64_assemble_chunk's own return shape -- round-trips exactly through
-  # to_json_value/json_stringify/json_parse/from_json_value the same way
-  # x64_content_hash already serializes a func_ir) so a cache hit skips
-  # re-assembling entirely, preserving the whole point of this per-
-  # function architecture (an unchanged function costs nothing on a
-  # rebuild) for the native path too, not just the nasm path.
+  # nasm/gcc subprocess involved at all. Cached on disk as a compact
+  # binary `.chunkbin` (x64_chunk_to_bin/x64_chunk_from_bin above) so a
+  # cache hit skips re-assembling entirely, preserving the whole point
+  # of this per-function architecture (an unchanged function costs
+  # nothing on a rebuild) for the native path too, not just the nasm
+  # path. NOT JSON, deliberately: a ChunkImage is dominated by flat byte
+  # lists, and json_parse is quadratic (GitHub #74 -- 9m19s to parse the
+  # 2.3MB runtime chunk, against 1ms to read the same file off disk), so
+  # the JSON cache this replaced cost MORE on a hit than re-assembling
+  # from scratch did.
+  #
+  # Note this does NOT go through ObjCache: that class's own path_for
+  # hard-codes `.obj` and belongs to the nasm path. This borrows only
+  # its cache_dir and does its own file_exists/read_file_bytes/
+  # write_file_bytes.
   make a function called ensure_chunk_native takes self, cache_dir, extern_names returns chunk_or_err
     let h = get(self, "content_hash")
-    let cache_path = cache_dir + "/" + h + ".chunk.json"
+    let cache_path = cache_dir + "/" + h + ".chunkbin"
     if file_exists(cache_path) == "1" then
-      return from_json_value(json_parse(read_file(cache_path)))
+      return x64_chunk_from_bin(read_file_bytes(cache_path, 0, 2000000000))
     end
     let func_ir = get(self, "func_ir")
     let asm = emit_program_x64(["ProgramIR", "main", [func_ir], []], false, extern_names)
@@ -169,8 +518,30 @@ class CompileUnit {
     if not chunk then
       return "ASM ERROR: x64_assemble_chunk failed for unit " + get(self, "name")
     end
-    write_file(cache_path, json_stringify(to_json_value(chunk)))
+    write_file_bytes(cache_path, x64_chunk_to_bin(chunk))
     return chunk
+  end
+
+  # The emit half of ensure_chunk_native, on its own, so the assemble
+  # half can be handed to a separate process. Returns the .asm path
+  # written, or "" if this unit's chunk is already cached.
+  #
+  # Emission stays in the PARENT and stays sequential on purpose: the
+  # string-literal and captured-value label counters live in the global
+  # variable store, and two units emitting at once interleave their two
+  # label passes and miscompile (#80). Assembling is what gets
+  # distributed, and only to processes, which do not share that store.
+  make a function called emit_asm_native takes self, cache_dir, extern_names returns asm_path
+    let h = get(self, "content_hash")
+    let cache_path = cache_dir + "/" + h + ".chunkbin"
+    if file_exists(cache_path) == "1" then
+      return ""
+    end
+    let func_ir = get(self, "func_ir")
+    let asm = emit_program_x64(["ProgramIR", "main", [func_ir], []], false, extern_names)
+    let asm_path = cache_dir + "/" + h + ".asm"
+    write_file(asm_path, asm)
+    return asm_path
   end
 }
 
@@ -193,6 +564,118 @@ end
 # against everything else, same computation patc1_main.patlang's own
 # per-chunk path already did (just per-function now instead of per
 # size-bucketed chunk).
+# ---- parallel unit assembly ----
+#
+# One batch of compile units, assembled on its own OS thread. Called via
+# parallel_map (genuine std::thread parallelism, one thread per item,
+# fork-join) from build_native's first pass. Measured on this machine
+# (20 cores): 14 items of equal work took 723ms in parallel against
+# 7,876ms sequentially -- a 10.9x speedup, and that was with an
+# unrelated build already competing for CPU.
+#
+# Everything the batch needs arrives in `item`, deliberately. A
+# parallel_map worker runs with FRESH interpreter state that jumps
+# straight into this function and never executes the program's
+# top-level `let` statements, so a top-level binding referenced from
+# here would silently fail to resolve.
+#
+# The result is discarded: each unit's real output is its own
+# .chunkbin cache file, written under a content-hash name, so the
+# parent's second pass simply reads them back in order as cache hits.
+# That handoff-through-the-cache is the same shape the nasm path
+# already uses for its parallel `spawn`, and it is what keeps the
+# unique-filename property that makes concurrent writes safe.
+#
+# Note this deliberately does NOT accumulate anything across a call
+# boundary (GitHub #75) -- it pushes to no shared list at all.
+# OFF, and it must stay off until code generation is thread-safe.
+#
+# Assembling units in a parallel_map pool is not merely unproven here --
+# it is actively WRONG, and it corrupts the binaries it produces.
+# parallel_map workers get fresh interpreter state but SHARE the global
+# variable table, and code generation keeps three counters in exactly
+# that table:
+#
+#   __x64_str_counter  (codegen_x64: string-literal labels S0, S1, ...)
+#   __x64_cv_counter   (codegen_x64: captured-value labels)
+#   xa_id_counter      (x64_asm: the assembler's own id counter)
+#
+# The string-label counter is the one that bites. Each unit emits its
+# .data labels and its code references in two passes that both restart
+# that counter and must agree; with several units emitting at once the
+# passes interleave, and a chunk ends up DEFINING S0 while REFERENCING
+# some other unit's number. That is a silent miscompile which only
+# becomes visible at link time, as "undefined symbol 'S<n>'".
+#
+# Demonstrated, not inferred: a three-function program compiled three
+# times in a row failed with undefined symbol 'S2', then 'S3', then
+# 'S0'. Different answer each run from identical input is a data race,
+# and it means a build that happens to link cannot be trusted either --
+# the same race can leave a chunk pointing at a WRONG but existing
+# label, which links cleanly and misbehaves at runtime.
+#
+# Parallelising only the assembler would not help: xa_id_counter is
+# shared too. The fix is per-emission (or per-thread) counter state
+# rather than process-global counters; until then this stays false.
+# Kept rather than deleted so the work is picked up, not rediscovered.
+make a function called x64_build_use_parallel_units returns enabled
+  return false
+end
+
+make a function called x64_assemble_unit_batch takes item returns done
+  # Silence progress ticking for the duration of the parallel phase.
+  #
+  # The listener socket that x64_build_tick polls is THREAD-LOCAL, but
+  # the variable store holding its port number is SHARED across threads.
+  # So a worker inherits the port NUMBER, calls signal_poll on it, and
+  # dies with "tcp_accept_timeout: no listener on port 9410" -- the
+  # listener exists only on the parent thread. Since the assembler and
+  # the binary encoder both tick from inside their own loops, and
+  # workers run exactly that code, every worker hit this.
+  #
+  # Setting the port to -1 disables ticking everywhere while the pool
+  # runs, which costs nothing: the parent is blocked inside parallel_map
+  # for the whole phase and so cannot service queries anyway. build_native
+  # restores the real port immediately afterwards.
+  set_var("__x64_build_port", "-1")
+  let funcs = item[0]
+  let start = item[1]
+  let count = item[2]
+  let rt_names = item[3]
+  let cache_dir = item[4]
+  let i = 0
+  while i < count do
+    let idx = start + i
+    let unit = x64_make_compile_unit(funcs[idx])
+    let extern_names = x64_extern_names_for(funcs, idx, rt_names)
+    let unused = send(unit, "ensure_chunk_native", cache_dir, extern_names)
+    let i = i + 1
+  end
+  return "ok"
+end
+
+# Splits [0, n) into at most `nb` contiguous batches, as descriptors
+# ready for parallel_map. Batch size is computed by incrementing rather
+# than dividing: PatLang's `/` is exact division and would yield a
+# Rational for anything that does not divide evenly.
+make a function called x64_build_unit_batches takes funcs, n, nb, rt_names, cache_dir returns batches
+  let bs = 1
+  while (bs * nb) < n do
+    let bs = bs + 1
+  end
+  let batches = []
+  let start = 0
+  while start < n do
+    let count = bs
+    if (start + count) > n then
+      let count = n - start
+    end
+    let batches = list_push(batches, [funcs, start, count, rt_names, cache_dir])
+    let start = start + bs
+  end
+  return batches
+end
+
 make a function called x64_extern_names_for takes funcs, self_idx, rt_names returns names
   # g_apply_table/g_apply_table_count are DATA symbols defined in the
   # separately-generated, separately-linked apply-table unit (see
@@ -296,15 +779,119 @@ class X64UnitLinker {
   make a function called build_native takes self, funcs, rt_names, runtime_asm_path, out_path returns result
     let cache = get(self, "cache")
     let cache_dir = get(cache, "cache_dir")
+    # The runtime chunk is cached on disk exactly like every per-function
+    # unit below. Without this, build_native re-assembled the whole
+    # ~88k-line x64_runtime.asm from scratch on EVERY build, including a
+    # one-line `print("hello")` -- a fixed, unavoidable multi-minute tax
+    # that dominated the measured native-vs-nasm gap for small programs.
+    # It was never a fair comparison: the nasm path has ALWAYS used a
+    # separately pre-built, cached x64_runtime.obj (see patc1_main.
+    # patlang's own runtime_obj check, and its comment noting "the
+    # runtime's own .obj is separately cached") and never re-assembles
+    # it either. This just brings the native path to the same footing.
+    # Keyed on the asm text itself plus the compiler fingerprint, so any
+    # runtime or codegen change invalidates it automatically.
+    let unused_claim = x64_build_signal_claim()
+    let unused_p0 = x64_build_progress("runtime-assemble", 0, 1)
     let runtime_asm = read_file(runtime_asm_path)
-    let runtime_chunk = x64_assemble_chunk(runtime_asm)
+    let rt_key = "x64runtime_" + x64_content_hash(runtime_asm) + "_" + x64_compiler_fingerprint()
+    let rt_cache_path = cache_dir + "/" + rt_key + ".chunkbin"
+    if file_exists(rt_cache_path) == "1" then
+      let runtime_chunk = x64_chunk_from_bin(read_file_bytes(rt_cache_path, 0, 2000000000))
+    else
+      let runtime_chunk = x64_assemble_chunk(runtime_asm)
+      if not runtime_chunk then
+        return "ASM ERROR: x64_assemble_chunk failed for runtime asm " + runtime_asm_path
+      end
+      write_file_bytes(rt_cache_path, x64_chunk_to_bin(runtime_chunk))
+    end
     if not runtime_chunk then
       return "ASM ERROR: x64_assemble_chunk failed for runtime asm " + runtime_asm_path
     end
     let chunks = [runtime_chunk]
     let n = funcs.length
+
+    # PASS 1 -- assemble every cache-missing unit, in parallel.
+    #
+    # This is the phase that dominates a cold build: measured at ~1.5s
+    # per unit against 534 units for the self-hosted compiler's own
+    # bundle, i.e. over an hour single-threaded, while every other phase
+    # is minutes at most. It parallelises cleanly because units are
+    # genuinely independent -- each is emitted from its own function's
+    # IR plus a list of extern NAMES, never from another unit's body --
+    # and because each writes a content-hash-named .chunkbin, so
+    # concurrent writers can never collide on a filename.
+    #
+    # Batched rather than one-thread-per-unit: parallel_map spawns a
+    # real OS thread per ITEM, so handing it 534 items would mean 534
+    # threads. Splitting into a small number of contiguous batches keeps
+    # the thread count near the core count while still saturating it.
+    #
+    # Results are ignored here on purpose. Pass 2 below re-reads every
+    # unit through the ordinary ensure_chunk_native path, which now hits
+    # the cache each time -- so ORDER and ERROR HANDLING stay exactly as
+    # they were sequentially, and an assembly failure still surfaces as
+    # the same "ASM ERROR:" string from the same place. Parallelism
+    # therefore changes only how fast the cache gets filled, never what
+    # the build concludes from it.
+    # PASS 1 -- fill the chunk cache, in parallel when a worker command
+    # is configured.
+    #
+    # Set PATC1_EXE to this compiler's own path to enable it. It is not
+    # inferred: argv() omits the program name and the runtime exposes no
+    # executable-path primitive, and guessing "./patc1.exe" would be
+    # exactly the kind of relative-path assumption that breaks. Unset
+    # means sequential, which is always correct.
+    let worker_exe = getenv("PATC1_EXE")
+    if (worker_exe != "") and (n > 1) then
+      # 1a: emit every missing unit's asm, SEQUENTIALLY. See
+      # emit_asm_native's header for why this half must not be shared out.
+      let unused_pe = x64_build_progress("emit-unit-asm", 0, n)
+      let asm_paths = []
+      let out_paths = []
+      let ei = 0
+      while ei < n do
+        if (ei % 25) == 0 then
+          let unused_pei = x64_build_progress("emit-unit-asm", ei, n)
+        end
+        let unit = x64_make_compile_unit(funcs[ei])
+        let extern_names = x64_extern_names_for(funcs, ei, rt_names)
+        let ap = send(unit, "emit_asm_native", cache_dir, extern_names)
+        if ap != "" then
+          let asm_paths = list_push(asm_paths, ap)
+          let out_paths = list_push(out_paths, cache_dir + "/" + get(unit, "content_hash") + ".chunkbin")
+        end
+        let ei = ei + 1
+      end
+
+      # 1b: assemble them in child processes, a wave at a time. Each
+      # child writes its own content-hash-named .chunkbin, so concurrent
+      # writers can never collide on a filename.
+      let m = to_num(list_len(asm_paths))
+      let unused_pa = x64_build_progress("assemble-units-parallel", 0, m)
+      let k = 0
+      while k < m do
+        let pids = []
+        let c = 0
+        while (c < 14) and ((k + c) < m) do
+          let pid = spawn(worker_exe, "assemble_asm", asm_paths[k + c], out_paths[k + c])
+          let pids = list_push(pids, pid)
+          let c = c + 1
+        end
+        let w = 0
+        while w < c do
+          let unused_rc = wait(pids[w])
+          let w = w + 1
+        end
+        let k = k + c
+        let unused_pk = x64_build_progress("assemble-units-parallel", k, m)
+      end
+    end
+
+    # PASS 2 -- collect in order (cache hits after pass 1).
     let i = 0
     while i < n do
+      let unused_pi = x64_build_progress("assemble-units", i, n)
       let unit = x64_make_compile_unit(funcs[i])
       let extern_names = x64_extern_names_for(funcs, i, rt_names)
       let chunk_or_err = send(unit, "ensure_chunk_native", cache_dir, extern_names)
@@ -318,12 +905,20 @@ class X64UnitLinker {
       let chunks = list_push(chunks, chunk_or_err)
       let i = i + 1
     end
+    let unused_pa = x64_build_progress("apply-table", 0, 1)
     let apply_table_asm = x64_emit_apply_table_asm(funcs)
     let apply_table_chunk = x64_assemble_chunk(apply_table_asm)
     if not apply_table_chunk then
       return "ASM ERROR: x64_assemble_chunk failed for the apply table"
     end
     let chunks = list_push(chunks, apply_table_chunk)
-    return x64_link_native_chunks(chunks, out_path)
+    # Linking is a single opaque step from the outside but was, before
+    # the symbol-index fix, by far the longest phase of a large build --
+    # worth naming explicitly so a slow build is attributable rather
+    # than mysterious.
+    let unused_pl = x64_build_progress("link", 0, to_num(list_len(chunks)))
+    let linked = x64_link_native_chunks(chunks, out_path)
+    let unused_pd = x64_build_progress("done", 1, 1)
+    return linked
   end
 }

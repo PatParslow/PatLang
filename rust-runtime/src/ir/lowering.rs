@@ -639,11 +639,25 @@ impl Lowerer {
                 // became a real, concrete gap once a runtime function
                 // (x64_runtime.patlang's rt_print_str) needed to explicitly
                 // return one instead of a stand-in `true`.
-                if name == "true" {
+                // A BOUND name always wins over the literal. `unit` is a
+                // perfectly legal ordinary variable name, and this very
+                // codebase uses it as one: self_hosting/lib/x64_compile_
+                // unit.patlang's x64_make_compile_unit declares `returns
+                // unit`, does `let unit = new("CompileUnit", ...)`, and
+                // ends `return unit`. Without the known_locals guard,
+                // that final read lowered to a Unit constant, so the
+                // function silently returned void instead of the object
+                // it had just built -- every per-function compile unit
+                // came back empty, and the failure only showed up much
+                // further downstream as a baffling "LINK ERROR:
+                // undefined symbol '<first function>'". Found during the
+                // all-self-hosted fixpoint self-compile; the self-hosted
+                // mirror (lower.patlang) carries the same guard.
+                if name == "true" && !self.known_locals.contains_key(name) {
                     f.body.push(Instr::Const(Value::Bool(true)));
-                } else if name == "false" {
+                } else if name == "false" && !self.known_locals.contains_key(name) {
                     f.body.push(Instr::Const(Value::Bool(false)));
-                } else if name == "unit" {
+                } else if name == "unit" && !self.known_locals.contains_key(name) {
                     f.body.push(Instr::Const(Value::Unit));
                 } else {
                     f.body.push(Instr::LoadLocal(name.clone()));

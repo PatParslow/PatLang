@@ -27,11 +27,16 @@
 # source); the only external tool is rustc.
 #
 # ALTERNATE BACKEND: `patc1 <input.patlang> <output-exe> --x64` routes
-# through lib/codegen_x64.patlang instead -- real x64 NASM, assembled
-# and linked via nasm+gcc (lib/x64_build.patlang), NO rustc anywhere in
-# that path. Only the Slice 1-6 subset (plain ints/strings/lists/
-# closures, no numeric tower/BigInt/Rational/Object/facts-and-rules) is
-# supported -- anything outside that subset is a clear compile-time
+# through lib/codegen_x64.patlang instead -- real x64 machine code, with
+# NO rustc anywhere in that path. Assembly and linking now go through
+# the self-hosted assembler and PE linker (lib/x64_asm.patlang +
+# lib/x64_pe_link.patlang) by default, so nasm and gcc are not involved
+# either; lib/x64_build.patlang's x64_build_use_native_toolchain() is
+# the single switch, and setting it false restores the original
+# nasm+gcc path, which is kept deliberately as a differential-testing
+# oracle. The numeric tower (BigInt/Rational/Object/facts-and-rules) is
+# supported well beyond the original Slice 1-6 subset, though not
+# exhaustively -- anything genuinely unsupported is a clear compile-time
 # error from codegen_x64.patlang itself, not silently wrong output.
 #
 # SEPARATE COMPILATION (chunk link, not textual concatenation): the
@@ -108,6 +113,29 @@ end
 
 let args = argv()
 if args.length >= 1 then
+  # Child mode for the process-based assembly pool (see
+  # x64_compile_unit.patlang's build_native). Reads one unit's already-
+  # emitted .asm and writes its .chunkbin -- no IR, no lowering, no
+  # front-end, so a child starts cheaply.
+  #
+  # This runs in its own PROCESS deliberately, not a thread: code
+  # generation and the assembler both keep counters in the global
+  # variable store, which threads share, and concurrent access to them
+  # silently miscompiles (#80). Separate processes have separate stores,
+  # so the race cannot occur at all.
+  #
+  # No exit code is set on failure because the runtime has no
+  # process-exit primitive (#81); the parent checks for the output file
+  # instead, which it has to do anyway.
+  if args[0] == "assemble_asm" then
+    let child_asm = read_file(args[1])
+    let child_chunk = x64_assemble_chunk(child_asm)
+    if not child_chunk then
+      print("ASM ERROR: assemble_asm failed for " + args[1])
+    else
+      write_file_bytes(args[2], x64_chunk_to_bin(child_chunk))
+    end
+  end
   if args[0] == "lower" then
     let raw_source = read_file(args[1])
     let source = expand_includes(raw_source, path_dirname(args[1]))
@@ -173,7 +201,7 @@ if args.length < 2 then
     print("       patc1 lower|emit_rust|emit_x64|emit_wasm|interpret ...")
   end
 else
-  if (args[0] == "lower") or (args[0] == "emit_rust") or (args[0] == "emit_x64") or (args[0] == "emit_wasm") or (args[0] == "interpret") then
+  if (args[0] == "lower") or (args[0] == "emit_rust") or (args[0] == "emit_x64") or (args[0] == "emit_wasm") or (args[0] == "interpret") or (args[0] == "assemble_asm") then
     # already handled above
     let dummy = 0
   else
@@ -363,6 +391,22 @@ else
             let exe = send(linker, "build", program_funcs, rt_names, runtime_obj, output)
           end
           print("patc1: " + exe)
+          # NOTE: a failed build still exits 0 here, and that is a real
+          # problem -- `build`/`build_native` report failure by RETURNING
+          # a "NASM ERROR:"/"LINK ERROR:"-prefixed string rather than
+          # halting, so a run that produced no .exe at all looks like
+          # success to any script reading $?. Found when a self-compile
+          # fixpoint reported rc=0 having emitted no binary.
+          #
+          # It is NOT fixed here because there is currently no way to do
+          # so: the runtime exposes no process-exit primitive at all
+          # (`os_exit` is defined only inside x64_runtime.patlang, for
+          # the TARGET programs this compiler emits -- it is not a host
+          # function, so patc1's own compiled body cannot call it).
+          # Calling it here did produce a non-zero status, but only by
+          # raising "host fn 'os_exit' not found", i.e. by showing the
+          # user an internal error instead of a compiler diagnostic.
+          # Needs a real exit-code primitive first; filed separately.
         end
       else
         print("patc1: --x64 needs self_hosting/build/x64_runtime.obj -- run:")

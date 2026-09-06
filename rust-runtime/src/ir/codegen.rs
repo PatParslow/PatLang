@@ -111,11 +111,13 @@ const HOST_CHUNK_TABLE: &[(&str, ChunkId)] = &[
     ("read_file", ChunkId::Files),
     ("write_file", ChunkId::Files),
     ("write_file_bytes", ChunkId::Files),
+    ("read_file_bytes", ChunkId::Files),
     ("touch_file", ChunkId::Files),
     ("file_exists", ChunkId::Files),
     ("list_dir", ChunkId::Files),
     ("rename_file", ChunkId::Files),
     ("exec_capture", ChunkId::Files),
+    ("getenv", ChunkId::Files),
     ("exec_capture_io", ChunkId::Files),
     ("now_ms", ChunkId::IoMisc),
     ("byte_length", ChunkId::IoMisc),
@@ -1327,10 +1329,29 @@ fn run_function<'p>(program: &'p Program, func: &'p Function, args: &[Value], ca
                     }
                     #[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
                     {
+                        // DISPATCH_FALLBACK is a thread_local, so a freshly
+                        // spawned worker starts with none -- and every host
+                        // call that isn't handled by a linked-in chunk goes
+                        // through it, `new`/`send` (the whole object system)
+                        // included. Without forwarding, any worker touching
+                        // an object died with "host fn 'new' not found
+                        // (dispatch fallback not set -- did main() call
+                        // set_dispatch_fallback?)", which made parallel_map
+                        // unusable for most real work: the x64 assembler
+                        // itself builds its state via new/send, so an
+                        // attempt to assemble compile units in parallel
+                        // failed immediately. fiber_new already forwards the
+                        // parent's fallback for exactly this reason (see
+                        // get_dispatch_fallback's own comment); this does
+                        // the same for worker threads.
+                        let parent_fallback = get_dispatch_fallback();
                         let results: Result<Vec<Value>, String> = std::thread::scope(|scope| {
                             let handles: Vec<_> = items.iter().map(|item| {
                                 let fname = &fname;
                                 scope.spawn(move || {
+                                    if let Some(f) = parent_fallback {
+                                        set_dispatch_fallback(f);
+                                    }
                                     let callee = program.functions.get(fname).unwrap();
                                     // Fresh cache per worker thread -- these
                                     // threads share the SAME Program
@@ -2706,15 +2727,31 @@ fn host_call_math(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
                 Ok(Value::String(char::from_u32(n as u32).map(|c| c.to_string()).unwrap_or_default().into()))
             }
             "to_num" => {
-                // to_num(value) -> Number (parse string, else 0)
+                // to_num(value) -> a number, PRESERVING integer-ness.
+                // Mirrors hosts.rs's host_to_num, which deliberately keeps
+                // the value's numeric kind. This used to return f64
+                // unconditionally, so type_of(to_num("5")) was "int"
+                // interpreted but "float" compiled -- invisible until such a
+                // value reached band/shr, which take only Value::Int. It bit
+                // widely because list_len() returns a STRING, making
+                // to_num(list_len(xs)) the ordinary way to get a count.
+                // No BigInt promotion here: that variant exists only in the
+                // numeric-tower prelude, and this text is shared with the
+                // fast-value prelude that lacks it.
                 let v = args.get(0).cloned().unwrap_or(Value::Unit);
-                let n = match v {
-                    Value::Number(n) => n,
-                    Value::String(s) => s.trim().parse::<f64>().unwrap_or(0.0),
-                    Value::Bool(b) => if b { 1.0 } else { 0.0 },
-                    _ => 0.0,
-                };
-                Ok(Value::Number(n))
+                Ok(match v {
+                    Value::Int(_) => v,
+                    Value::String(s) => {
+                        let t = s.trim();
+                        match t.parse::<i64>() {
+                            Ok(i) => Value::Int(i),
+                            Err(_) => Value::Number(t.parse::<f64>().unwrap_or(0.0)),
+                        }
+                    }
+                    Value::Bool(b) => Value::Int(if b { 1 } else { 0 }),
+                    Value::Number(n) => Value::Number(n),
+                    other => Value::Number(other.as_number().unwrap_or(0.0)),
+                })
             }
             "hash_string" => {
                 // hash_string(s) -> lowercase hex FNV-1a 64-bit digest
@@ -2925,6 +2962,41 @@ fn host_call_collections_handles(name: &str, args: &[Value]) -> Option<Result<Va
                 if let Some(parent) = std::path::Path::new(&p).parent() { let _ = std::fs::create_dir_all(parent); }
                 std::fs::write(&p, bytes).map(|_| Value::Bool(true)).map_err(|e| format!("write_file_bytes: {}: {}", p, e))
             }
+            "read_file_bytes" => {
+                // read_file_bytes(path, offset, length) -> List of Int
+                // (0-255). The read counterpart of write_file_bytes above,
+                // and needed here for the same reason: a PatLang String is
+                // UTF-8-only, so raw binary content cannot round-trip
+                // through read_file. write_file_bytes was added to this
+                // backend earlier but its counterpart was not, so a
+                // compiled program could WRITE a binary file and then fail
+                // with "host fn 'read_file_bytes' not found" trying to read
+                // it back -- which is exactly what happened to the x64
+                // toolchain's own binary chunk cache: the populating build
+                // succeeded and the very next build died on the cache hit.
+                // Mirrors hosts.rs's host_read_file_bytes, including its
+                // fail-soft behaviour: clamps to what is actually there
+                // rather than erroring, and returns an empty list for a
+                // file that cannot be opened at all (this language has no
+                // try/catch, so an Err here would be fatal to the whole
+                // program rather than to this one call).
+                use std::io::{Read, Seek, SeekFrom};
+                let p = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => to_s(v), None => String::new() };
+                let off = match args.get(1) { Some(v) => v.as_number().unwrap_or(0.0) as u64, None => 0 };
+                let len = match args.get(2) { Some(v) => v.as_number().unwrap_or(0.0) as usize, None => 0 };
+                let mut f = match std::fs::File::open(&p) {
+                    Ok(f) => f,
+                    Err(_) => return Ok(Value::List(std::sync::Arc::new(Vec::new()))),
+                };
+                if f.seek(SeekFrom::Start(off)).is_err() {
+                    return Ok(Value::List(std::sync::Arc::new(Vec::new())));
+                }
+                let mut buf = vec![0u8; len];
+                let n = f.read(&mut buf).unwrap_or(0);
+                buf.truncate(n);
+                let out: Vec<Value> = buf.into_iter().map(|b| Value::Int(b as i64)).collect();
+                Ok(Value::List(std::sync::Arc::new(out)))
+            }
             "touch_file" => {
                 // touch_file(path) -> String message (OK <abs> or ERR: <msg>)
                 let p = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => display_value(v), None => String::new() };
@@ -2967,6 +3039,14 @@ fn host_call_collections_handles(name: &str, args: &[Value]) -> Option<Result<Va
                 let to = match args.get(1) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => display_value(v), None => String::new() };
                 if let Some(parent) = std::path::Path::new(&to).parent() { let _ = std::fs::create_dir_all(parent); }
                 std::fs::rename(&from, &to).map(|_| Value::Bool(true)).map_err(|e| format!("rename_file: {} -> {}: {}", from, to, e))
+            }
+            "getenv" => {
+                // getenv(name) -> the real OS environment variable's value, or
+                // "" if unset -- distinct from set_var/get's own __vars object
+                // store, which is an internal PatLang convention with no
+                // connection to actual process environment variables.
+                let name = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => display_value(v), None => String::new() };
+                Ok(Value::String((std::env::var(&name).unwrap_or_default()).into()))
             }
             "exec_capture" => {
                 // exec_capture(path, [arg1, arg2, ...]) -> stdout of running the
@@ -3017,7 +3097,7 @@ fn host_call_collections_handles(name: &str, args: &[Value]) -> Option<Result<Va
 
 fn host_call_files(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match name {
-        "read_file" | "write_file" | "write_file_bytes" | "touch_file" | "file_exists" | "list_dir" | "rename_file" | "exec_capture" | "exec_capture_io" => Some(host_call_files_inner(name, args)),
+        "read_file" | "write_file" | "write_file_bytes" | "read_file_bytes" | "touch_file" | "file_exists" | "list_dir" | "rename_file" | "exec_capture" | "exec_capture_io" | "getenv" => Some(host_call_files_inner(name, args)),
         _ => None,
     }
 }

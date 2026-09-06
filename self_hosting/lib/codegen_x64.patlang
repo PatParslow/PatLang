@@ -913,15 +913,12 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
       # Real bug found testing this fix: hardcoding these as
       # "always float" broke x64_math_abs_int_selftest's whole point
       # (abs of a plain int argument, which must stay plain int).
+      # (floor joined this list once it was actually implemented -- it is
+      # adaptive in exactly the same way, and was previously missing a
+      # codegen case altogether.)
       let is_float_result = last_arg_taint
-      if instr[1] != "abs" then
-        if instr[1] != "ceil" then
-          if instr[1] != "round" then
-            if instr[1] != "trunc" then
-              let is_float_result = x64_str_in_list(x64_float_producing_host_names(), instr[1])
-            end
-          end
-        end
+      if not x64_str_in_list(["abs", "ceil", "floor", "round", "trunc"], instr[1]) then
+        let is_float_result = x64_str_in_list(x64_float_producing_host_names(), instr[1])
       end
       let produces_float = list_set(produces_float, i, is_float_result)
       let pr2 = x64_vstack_push(stack, sp, is_float_result)
@@ -2270,6 +2267,61 @@ make a function called x64_str_aware_plus_asm returns asm
   sb_push(sb, "    mov r10, rax" + x64_nl_char())
   sb_push(sb, "    pop rax" + x64_nl_char())
   sb_push(sb, ".PLUSNOTLIST2_" + suffix + ":" + x64_nl_char())
+  # Number-to-string coercion (GitHub #89 follow-up) -- mirrors the List
+  # conversion above exactly, for the equally common "number + string"/
+  # "string + number" idiom (e.g. rt_heap_alloc's own "heap exhausted ("
+  # + n + ") bytes..." error message) that this function silently
+  # corrupted via a raw, meaningless pointer/int `add` whenever a plain
+  # fixnum was combined with a real string -- confirmed via a from-
+  # scratch Win32-Debug-API watchpoint (self_hosting/tools/debug/
+  # win_write_watchpoint.py): the raw add's result bits occasionally
+  # collided with a real family tag, so a LATER, unrelated string
+  # operation misread the garbage as a valid tagged value and crashed
+  # far away from the actual bug. A fixnum carries NO tag at all in
+  # this scheme (family reads as 0), so: if rax is a fixnum and r10 is
+  # genuinely String-tagged with a nonzero payload, stringify rax via
+  # rt_int_to_str; the check is mirrored for r10 being the fixnum and
+  # rax the string.
+  sb_push(sb, "    mov r15, 17293822569102704640" + x64_nl_char())
+  sb_push(sb, "    mov r9, 281474976710655" + x64_nl_char())
+  sb_push(sb, "    mov r8, 2305843009213693952" + x64_nl_char())
+  sb_push(sb, "    mov rcx, rax" + x64_nl_char())
+  sb_push(sb, "    and rcx, r15" + x64_nl_char())
+  sb_push(sb, "    cmp rcx, 0" + x64_nl_char())
+  sb_push(sb, "    jne .PLUSNOTNUM1_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rcx, r10" + x64_nl_char())
+  sb_push(sb, "    and rcx, r15" + x64_nl_char())
+  sb_push(sb, "    cmp rcx, r8" + x64_nl_char())
+  sb_push(sb, "    jne .PLUSNOTNUM1_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rcx, r10" + x64_nl_char())
+  sb_push(sb, "    and rcx, r9" + x64_nl_char())
+  sb_push(sb, "    cmp rcx, 0" + x64_nl_char())
+  sb_push(sb, "    je .PLUSNOTNUM1_" + suffix + x64_nl_char())
+  sb_push(sb, "    push r10" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    call rt_int_to_str" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, "    pop r10" + x64_nl_char())
+  sb_push(sb, ".PLUSNOTNUM1_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rcx, r10" + x64_nl_char())
+  sb_push(sb, "    and rcx, r15" + x64_nl_char())
+  sb_push(sb, "    cmp rcx, 0" + x64_nl_char())
+  sb_push(sb, "    jne .PLUSNOTNUM2_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rcx, rax" + x64_nl_char())
+  sb_push(sb, "    and rcx, r15" + x64_nl_char())
+  sb_push(sb, "    cmp rcx, r8" + x64_nl_char())
+  sb_push(sb, "    jne .PLUSNOTNUM2_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rcx, rax" + x64_nl_char())
+  sb_push(sb, "    and rcx, r9" + x64_nl_char())
+  sb_push(sb, "    cmp rcx, 0" + x64_nl_char())
+  sb_push(sb, "    je .PLUSNOTNUM2_" + suffix + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    push r10" + x64_nl_char())
+  sb_push(sb, "    call rt_int_to_str" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, "    mov r10, rax" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, ".PLUSNOTNUM2_" + suffix + ":" + x64_nl_char())
   # Same bug class as x64_str_aware_eq_asm just above, same fix: only
   # concatenate once BOTH operands independently pass the string-
   # family-and-nonzero-payload check (a straight-line AND chain), not
@@ -3604,6 +3656,73 @@ make a function called x64_os_read_file_into_asm returns asm
   return sb_str(sb)
 end
 
+# os_getenv(name_addr, name_len) -> tagged string: the real OS
+# environment variable's value, or "" if unset (matching getenv's own
+# interpreter-side contract, host_getenv in hosts.rs: distinct from
+# set_var/get's own __vars object store, which is an internal PatLang
+# convention with no connection to actual process environment
+# variables). 32KB output buffer -- far beyond any realistic
+# environment variable (this exists to check PATC1_EXE, a file path),
+# not sized for arbitrary content; a value that needed more would
+# silently read as garbage-length/empty, the same accepted-and-
+# documented style of size cap os_exec_run's own 64KB output limit
+# already uses elsewhere in this file.
+#
+# BLOCKING BUG this closes: this primitive was ENTIRELY MISSING until
+# now -- getenv had a compiled-backend (codegen.rs, native Rust) fix
+# earlier this session, but never a codegen_x64 CallHost case, so any
+# --x64-compiled program calling it (here: x64_compile_unit.patlang's
+# own build_native, checking PATC1_EXE to enable the process-based
+# parallel pool) got the usual silent "unsupported primitive" push-0
+# placeholder. Confirmed by direct repro: a self-hosted fixpoint build
+# LINKED cleanly with this as its only remaining placeholder, and the
+# resulting patc2.exe SEGFAULTED on every attempt to compile anything
+# at all (comparing the placeholder's raw 0 against a string, most
+# likely) -- a genuinely different failure mode from every other gap
+# tonight, since a placeholder to an OPTIONAL, off-by-default feature
+# still crashed the WHOLE COMPILER rather than just being unreachable.
+make a function called x64_os_getenv_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, x64_lock_acquire_asm(suffix))
+  # Called directly as getenv(name) with a single TAGGED STRING
+  # argument -- matching the interpreter's own single-arg signature --
+  # not a pre-split (addr,len) pair the way the os_* internal helpers
+  # above take theirs. Unmask it the same way os_connect_asm/
+  # os_file_size_asm do.
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    mov r11, 281474976710655" + x64_nl_char())
+  sb_push(sb, "    and rax, r11" + x64_nl_char())
+  sb_push(sb, "    mov r10, [rax]" + x64_nl_char())
+  sb_push(sb, "    add rax, 8" + x64_nl_char())
+  sb_push(sb, x64_os_null_terminate_path_asm(suffix))
+  # Heap-allocate the result buffer BEFORE the win64-alignment window
+  # below -- rt_heap_alloc is an ordinary PatLang-convention call, not
+  # a raw WinAPI one, matching x64_os_read_file_into_asm's own
+  # established reasoning for its buffer allocation.
+  sb_push(sb, "    mov rax, 32768" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    call rt_heap_alloc" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, "    mov r14, rax" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [rel g_scratch]" + x64_nl_char())
+  sb_push(sb, "    lea rdx, [r14+8]" + x64_nl_char())
+  sb_push(sb, "    mov r8, 32760" + x64_nl_char())
+  sb_push(sb, "    call GetEnvironmentVariableA" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    mov [r14], rax" + x64_nl_char())
+  sb_push(sb, "    mov r13, r14" + x64_nl_char())
+  sb_push(sb, "    mov rcx, 2305843009213693952" + x64_nl_char())
+  sb_push(sb, "    or r13, rcx" + x64_nl_char())
+  sb_push(sb, x64_lock_release_asm())
+  sb_push(sb, "    mov rax, r13" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
 # os_write_file(path_addr, path_len, data_addr, data_len) -> 1 on
 # success, 0 on failure. Creates/overwrites (CREATE_ALWAYS) -- unlike
 # the interpreter's own write_file, does NOT create parent
@@ -4342,6 +4461,61 @@ make a function called x64_os_fiber_spawn_asm returns asm
   sb_push(sb, "    xor rcx, rcx" + x64_nl_char())
   sb_push(sb, "    xor rdx, rdx" + x64_nl_char())
   sb_push(sb, "    lea r8, [rel patlang_fiber_trampoline]" + x64_nl_char())
+  sb_push(sb, "    mov r9, r12" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+32], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+40], 0" + x64_nl_char())
+  sb_push(sb, "    call CreateThread" + x64_nl_char())
+  sb_push(sb, "    mov rcx, rax" + x64_nl_char())
+  sb_push(sb, "    call CloseHandle" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    push r12" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# os_thread_spawn_by_addr(addr, arg) -> raw context-block address
+# (untagged, same convention as os_thread_spawn_raw/os_fiber_spawn) --
+# spawns a REAL, genuinely concurrent OS thread that calls the function
+# AT addr with arg as its one argument, via patlang_thread_trampoline.
+#
+# Deliberately built on patlang_thread_trampoline, NOT reusing
+# os_fiber_spawn/patlang_fiber_trampoline even though their shapes look
+# almost identical: fibers are COOPERATIVE by design (see this file's
+# own Fibers section header -- "only one fiber's thread is ever
+# unparked at a time... deliberately not concurrent"). Using fiber
+# machinery here would silently turn parallel_map into something that
+# LOOKS parallel but runs every item sequentially, defeating the one
+# thing it exists for. patlang_thread_trampoline's own context layout
+# ([func_addr@0, argc@8, done@16, result@24, args[0..]@32], set once by
+# thread_spawn/os_thread_spawn_raw and already read by thread_poll/
+# thread_result) is reused here with argc hardcoded to 1 -- this is a
+# near-verbatim copy of x64_os_fiber_spawn_asm's own structure (alloc,
+# fill fields, CreateThread, CloseHandle, return the raw ctx address),
+# just targeting the true-concurrent trampoline and this context shape
+# instead of the fiber one.
+make a function called x64_os_thread_spawn_by_addr_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    pop r13" + x64_nl_char())
+  sb_push(sb, "    pop r12" + x64_nl_char())
+  sb_push(sb, "    push r12" + x64_nl_char())
+  sb_push(sb, "    push r13" + x64_nl_char())
+  sb_push(sb, "    mov rax, 72" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    call rt_heap_alloc" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, "    pop r13" + x64_nl_char())
+  sb_push(sb, "    pop r12" + x64_nl_char())
+  sb_push(sb, "    mov [rax], r12" + x64_nl_char())
+  sb_push(sb, "    mov qword [rax+8], 1" + x64_nl_char())
+  sb_push(sb, "    mov qword [rax+16], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rax+24], 0" + x64_nl_char())
+  sb_push(sb, "    mov [rax+32], r13" + x64_nl_char())
+  sb_push(sb, "    mov r12, rax" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 48" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    xor rcx, rcx" + x64_nl_char())
+  sb_push(sb, "    xor rdx, rdx" + x64_nl_char())
+  sb_push(sb, "    lea r8, [rel patlang_thread_trampoline]" + x64_nl_char())
   sb_push(sb, "    mov r9, r12" + x64_nl_char())
   sb_push(sb, "    mov qword [rsp+32], 0" + x64_nl_char())
   sb_push(sb, "    mov qword [rsp+40], 0" + x64_nl_char())
@@ -6005,6 +6179,107 @@ make a function called x64_os_connect_asm returns asm
   return sb_str(sb)
 end
 
+# os_connect_try(host, port) -> socket, or -1 SPECIFICALLY for
+# WSAECONNREFUSED (10061, "nobody's listening on that port yet"), or -2
+# for any other connect failure -- the raw-primitive half of
+# tcp_try_connect (rust-runtime/src/ir/hosts.rs::host_tcp_try_connect's
+# own header explains the "poll for a not-yet-ready listener" use case
+# this exists for). A near-verbatim copy of x64_os_connect_asm, not a
+# refactor of it into a shared helper: this file's own established
+# convention for the sibling case (x64_os_bind_listen_asm's -1=address-
+# in-use / -2=other-failure split for tcp_try_listen) already keeps the
+# plain and "try" variants as separate, independently-readable
+# functions rather than parameterizing one -- followed here for the
+# same reason and to avoid any risk to the already-working, proven
+# os_connect_asm by threading a new conditional through it. Only the
+# `call connect` failure branch differs (checks WSAGetLastError before
+# deciding -1 vs -2); getaddrinfo/socket() failures are always -2, same
+# as plain os_connect's blanket -1, since only the CONNECT attempt
+# itself refusing is the graceful, expected-while-polling case.
+make a function called x64_os_connect_try_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, x64_lock_acquire_asm(suffix))
+  sb_push(sb, "    pop rdx" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    mov r12, rdx" + x64_nl_char())
+  sb_push(sb, "    mov r15, 281474976710655" + x64_nl_char())
+  sb_push(sb, "    and rax, r15" + x64_nl_char())
+  sb_push(sb, "    mov r10, [rax]" + x64_nl_char())
+  sb_push(sb, "    add rax, 8" + x64_nl_char())
+  sb_push(sb, x64_os_null_terminate_path_asm(suffix))
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 128" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+32], 0" + x64_nl_char())
+  sb_push(sb, "    mov dword [rsp+40], 1" + x64_nl_char())
+  sb_push(sb, "    mov dword [rsp+44], 6" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+48], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+56], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+64], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+72], 0" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [rel g_scratch]" + x64_nl_char())
+  sb_push(sb, "    xor rdx, rdx" + x64_nl_char())
+  sb_push(sb, "    lea r8, [rsp+32]" + x64_nl_char())
+  sb_push(sb, "    lea r9, [rsp+88]" + x64_nl_char())
+  sb_push(sb, "    call getaddrinfo" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+  sb_push(sb, "    jne .conntry_fail_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov r13, [rsp+88]" + x64_nl_char())
+  sb_push(sb, "    mov cx, r12w" + x64_nl_char())
+  sb_push(sb, "    call htons" + x64_nl_char())
+  sb_push(sb, "    mov r14, [r13+32]" + x64_nl_char())
+  sb_push(sb, "    mov [r14+2], ax" + x64_nl_char())
+  sb_push(sb, "    mov ecx, [r13+4]" + x64_nl_char())
+  sb_push(sb, "    mov edx, [r13+8]" + x64_nl_char())
+  sb_push(sb, "    mov r8d, [r13+12]" + x64_nl_char())
+  sb_push(sb, "    call socket" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 0 - 1" + x64_nl_char())
+  sb_push(sb, "    je .conntry_fail_freeaddr_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rbx, rax" + x64_nl_char())
+  sb_push(sb, "    mov rcx, rbx" + x64_nl_char())
+  sb_push(sb, "    mov rdx, r14" + x64_nl_char())
+  sb_push(sb, "    mov r8d, dword [r13+16]" + x64_nl_char())
+  sb_push(sb, "    call connect" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+  sb_push(sb, "    jne .conntry_fail_closesock_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rcx, r13" + x64_nl_char())
+  sb_push(sb, "    call freeaddrinfo" + x64_nl_char())
+  sb_push(sb, "    mov rax, rbx" + x64_nl_char())
+  sb_push(sb, "    jmp .conntry_done_" + suffix + x64_nl_char())
+  sb_push(sb, ".conntry_fail_closesock_" + suffix + ":" + x64_nl_char())
+  # WSAGetLastError() must be read BEFORE closesocket/freeaddrinfo --
+  # either call is free to reset the thread's own last-error value,
+  # same reasoning x64_os_bind_listen_asm's own check already relies on.
+  sb_push(sb, "    call WSAGetLastError" + x64_nl_char())
+  sb_push(sb, "    mov r14, rax" + x64_nl_char())
+  sb_push(sb, "    mov rcx, rbx" + x64_nl_char())
+  sb_push(sb, "    call closesocket" + x64_nl_char())
+  sb_push(sb, "    mov rcx, r13" + x64_nl_char())
+  sb_push(sb, "    call freeaddrinfo" + x64_nl_char())
+  sb_push(sb, "    cmp r14, 10061" + x64_nl_char())
+  sb_push(sb, "    je .conntry_refused_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rax, 0 - 2" + x64_nl_char())
+  sb_push(sb, "    jmp .conntry_done_" + suffix + x64_nl_char())
+  sb_push(sb, ".conntry_refused_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rax, 0 - 1" + x64_nl_char())
+  sb_push(sb, "    jmp .conntry_done_" + suffix + x64_nl_char())
+  sb_push(sb, ".conntry_fail_freeaddr_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rcx, r13" + x64_nl_char())
+  sb_push(sb, "    call freeaddrinfo" + x64_nl_char())
+  sb_push(sb, "    mov rax, 0 - 2" + x64_nl_char())
+  sb_push(sb, "    jmp .conntry_done_" + suffix + x64_nl_char())
+  sb_push(sb, ".conntry_fail_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rax, 0 - 2" + x64_nl_char())
+  sb_push(sb, ".conntry_done_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    mov r14, rax" + x64_nl_char())
+  sb_push(sb, x64_lock_release_asm())
+  sb_push(sb, "    mov rax, r14" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
 # os_recv(sock) -> tagged string (0..65536 bytes read). Also records
 # whether the recv itself failed into g_last_recv_error (read
 # separately by os_recv_had_error) -- tcp_read (fatal on a genuine
@@ -6177,21 +6452,107 @@ make a function called x64_abs_asm returns asm
   return sb_str(sb)
 end
 
+# ceil/round/trunc, for a value that may be a plain int or a real float.
+#
+# Only `ceil` is a direct C call. `round` and `trunc` are SYNTHESISED
+# from floor/ceil rather than called, because msvcrt.dll does not export
+# them: it exports ceil, floor and fabs but neither round nor trunc
+# (verified against the real DLL's export table, not assumed). Emitting
+# `call round` therefore produced a binary the self-hosted PE linker
+# could not link at all -- "undefined symbol 'round'" -- for any program
+# that rounded a float. The nasm/gcc path never showed this because gcc
+# links a fuller libm that does provide them, so this was a genuine
+# native-vs-nasm divergence rather than a missing import.
+#
+# The identities used give C's round-half-AWAY-from-zero semantics,
+# which SSE's roundsd (round-half-to-even) would NOT match:
+#   trunc(x) = x >= 0 ? floor(x) : ceil(x)
+#   round(x) = x >= 0 ? floor(x + 0.5) : ceil(x - 0.5)
+make a function called x64_roundlike_call_asm takes cfunc returns asm
+  let sb = sb_new()
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    call " + cfunc + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# Flip a float's sign by XORing bit 63, the same GPR trick used for
+# float negation elsewhere in this backend. r10 is volatile under the
+# Win64 ABI, so the constant is reloaded rather than kept across a call.
+make a function called x64_float_negate_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    movq rax, xmm0" + x64_nl_char())
+  sb_push(sb, "    mov r10, 9223372036854775808" + x64_nl_char())
+  sb_push(sb, "    xor rax, r10" + x64_nl_char())
+  sb_push(sb, "    movq xmm0, rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# floor(x), computed as -ceil(-x), deliberately WITHOUT calling `floor`.
+#
+# `floor` cannot be called from generated code at all: x64_runtime.patlang
+# defines a PatLang function of that name, so the flat symbol table
+# resolves `call floor` to THAT function -- a stack-convention PatLang
+# routine -- instead of the C import. Calling it with a float in xmm0
+# crashed. (Only the positive cases crashed, which is what pinned it
+# down: negatives went to ceil, which has no such name collision.)
+# The identity avoids the name entirely. See issue #83.
+make a function called x64_floor_via_ceil_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, x64_float_negate_asm())
+  sb_push(sb, x64_roundlike_call_asm("ceil"))
+  sb_push(sb, x64_float_negate_asm())
+  return sb_str(sb)
+end
+
 make a function called x64_roundlike_asm takes cfunc returns asm
   let suffix = label_asm_safe(0)
   let sb = sb_new()
   sb_push(sb, "    pop rax" + x64_nl_char())
+  # Already a plain 48-bit fixnum? Then it is an integer and every one
+  # of these operations is the identity -- leave it exactly as it is,
+  # int-typed, rather than round-tripping it through a float.
   sb_push(sb, "    mov rcx, rax" + x64_nl_char())
   sb_push(sb, "    shl rcx, 16" + x64_nl_char())
   sb_push(sb, "    sar rcx, 16" + x64_nl_char())
   sb_push(sb, "    cmp rcx, rax" + x64_nl_char())
   sb_push(sb, "    je .rl_done_" + suffix + x64_nl_char())
   sb_push(sb, "    movq xmm0, rax" + x64_nl_char())
-  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
-  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
-  sb_push(sb, "    and rsp, -16" + x64_nl_char())
-  sb_push(sb, "    call " + cfunc + x64_nl_char())
-  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  if cfunc == "ceil" then
+    sb_push(sb, x64_roundlike_call_asm("ceil"))
+  elif cfunc == "floor" then
+    sb_push(sb, x64_floor_via_ceil_asm())
+  else
+    # Sign test on the RAW float bits (bit 63), not an SSE compare. A
+    # `ucomisd` against 0.0 would need jb/ja, and this assembler has no
+    # encoding for those -- worse, xa_jcc_opcode used to answer any
+    # unknown condition with je's opcode, so `jb` assembled as `je` and
+    # the branch silently went the wrong way. An integer sign test needs
+    # only shr/cmp/jne, all of which are genuinely supported.
+    # -0.0 has the sign bit set and so takes the negative branch, where
+    # ceil(-0.0) is -0.0 -- correct.
+    sb_push(sb, "    mov rcx, rax" + x64_nl_char())
+    sb_push(sb, "    shr rcx, 63" + x64_nl_char())
+    sb_push(sb, "    cmp rcx, 0" + x64_nl_char())
+    sb_push(sb, "    jne .rl_neg_" + suffix + x64_nl_char())
+    if cfunc == "round" then
+      sb_push(sb, "    mov rcx, __float64__(0.5)" + x64_nl_char())
+      sb_push(sb, "    movq xmm1, rcx" + x64_nl_char())
+      sb_push(sb, "    addsd xmm0, xmm1" + x64_nl_char())
+    end
+    sb_push(sb, x64_floor_via_ceil_asm())
+    sb_push(sb, "    jmp .rl_joined_" + suffix + x64_nl_char())
+    sb_push(sb, ".rl_neg_" + suffix + ":" + x64_nl_char())
+    if cfunc == "round" then
+      sb_push(sb, "    mov rcx, __float64__(0.5)" + x64_nl_char())
+      sb_push(sb, "    movq xmm1, rcx" + x64_nl_char())
+      sb_push(sb, "    subsd xmm0, xmm1" + x64_nl_char())
+    end
+    sb_push(sb, x64_roundlike_call_asm("ceil"))
+    sb_push(sb, ".rl_joined_" + suffix + ":" + x64_nl_char())
+  end
   sb_push(sb, "    movq rax, xmm0" + x64_nl_char())
   sb_push(sb, ".rl_done_" + suffix + ":" + x64_nl_char())
   sb_push(sb, "    push rax" + x64_nl_char())
@@ -6914,6 +7275,8 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
     sb_push(sb, x64_os_thread_spawn_raw_asm())
   elif name == "os_fiber_spawn" then
     sb_push(sb, x64_os_fiber_spawn_asm())
+  elif name == "os_thread_spawn_by_addr" then
+    sb_push(sb, x64_os_thread_spawn_by_addr_asm())
   elif name == "os_fiber_resume" then
     sb_push(sb, x64_os_fiber_resume_asm())
   elif name == "os_fiber_yield" then
@@ -6926,6 +7289,56 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
     sb_push(sb, x64_os_fiber_table_lock_acquire_asm())
   elif name == "os_fiber_table_lock_release" then
     sb_push(sb, x64_os_fiber_table_lock_release_asm())
+  elif name == "rt_invoke_closure2" then
+    # rt_invoke_closure2(closure, a, b) -> result -- calls `closure` as
+    # if the source had written `closure(a, b)` directly. Exists so
+    # `emit`/`register_event_handler` (x64_runtime.patlang, ordinary
+    # PatLang built on this ONE new raw primitive) can invoke an
+    # arbitrary event-handler closure without needing their own new
+    # asm: x64_callvalue_asm already does exactly this, it just needs
+    # `spilled` (a codegen-TIME concept -- the enclosing function's own
+    # spilled-locals list, used to compute a private scratch-slot
+    # offset) which only a CallHost case compiled inline like this one
+    # has access to; an ordinary PatLang function never could.
+    #
+    # REAL BUG found and fixed here via cdb, not by re-reading code a
+    # second time (which found nothing): the FIRST version of this
+    # primitive declared `(a, b, closure)`, closure LAST, on the
+    # assumption that x64_callvalue_asm pops the closure value FIRST
+    # (so it should be pushed last/on top). That assumption was
+    # backwards. x64_callvalue_asm's own step 1 pops its N own-args
+    # OFF THE TOP first (assuming THEY are topmost) and only THEN pops
+    # the closure -- so the closure must be the DEEPEST of the three,
+    # i.e. pushed FIRST, matching how a genuine source-level
+    # `myclosure(x0, x1)` CallValue site naturally pushes its callee
+    # expression before its arguments. With the old `(a, b, closure)`
+    # order, a call site's normal left-to-right push left the CLOSURE
+    # on top and the FIRST ARGUMENT deepest -- so x64_callvalue_asm's
+    # `pop r14` grabbed the first argument instead of the closure.
+    # Confirmed via cdb on the actual crash: r13 (meant to be the
+    # closure's captured_count) held 0x00000f5445455247 -- the raw
+    # bytes of the string "GREET", the event name that was `emit`'s
+    # OWN first argument -- read as a captured-value loop bound, this
+    # pushed captured "values" until the stack was exhausted
+    # (STATUS_STACK_OVERFLOW, zero program output since the crash
+    # happened before the handler, or even `emit`, ever returned).
+    sb_push(sb, x64_callvalue_asm(2, spilled))
+  elif name == "register_event_handler" then
+    # lower.patlang's own "When" case (a source-level `when EVENT { ...
+    # }` block) ALWAYS emits `CallHost("register_event_handler", 2)`
+    # unconditionally -- unlike an ordinary call to a plain name, this
+    # is never routed through the normal "is this name a known
+    # function?" Call-vs-CallHost classification at all, so defining
+    # register_event_handler as a real function in x64_runtime.patlang
+    # (which it also is, for the case of a program calling it directly
+    # as ordinary source syntax) is not sufficient on its own -- this
+    # CallHost case is what the `when`-generated instruction actually
+    # reaches. Simply calls that same real function and reclaims its 2
+    # args, exactly the "call a real function, argc*8 caller-cleans"
+    # shape the "list_push" case above already establishes.
+    sb_push(sb, "    call register_event_handler" + x64_nl_char())
+    sb_push(sb, "    add rsp, 16" + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
   elif name == "budgeted_run" then
     # lower.patlang's own lower_budgeted_literal emits this as a raw
     # CallHost op UNCONDITIONALLY (see its header there) -- it never
@@ -7079,6 +7492,10 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
     sb_push(sb, x64_os_accept_asm())
   elif name == "os_connect" then
     sb_push(sb, x64_os_connect_asm())
+  elif name == "os_connect_try" then
+    sb_push(sb, x64_os_connect_try_asm())
+  elif name == "getenv" then
+    sb_push(sb, x64_os_getenv_asm())
   elif name == "os_recv" then
     sb_push(sb, x64_os_recv_asm())
   elif name == "os_recv_had_error" then
@@ -7152,6 +7569,13 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
     sb_push(sb, x64_abs_asm())
   elif name == "ceil" then
     sb_push(sb, x64_roundlike_asm("ceil"))
+  elif name == "floor" then
+    # There was no `floor` case here at all, so it fell through to the
+    # generic path and came back as the argument's raw float64 BITS
+    # printed as an integer: floor(2.4) gave 4612586738352862003, which
+    # is exactly 2.4's bit pattern. It is a direct C call like ceil --
+    # msvcrt does export floor.
+    sb_push(sb, x64_roundlike_asm("floor"))
   elif name == "round" then
     sb_push(sb, x64_roundlike_asm("round"))
   elif name == "trunc" then
@@ -7212,7 +7636,19 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
         # rt_heap_alloc's own bounds check (x64_runtime.patlang) relies
         # on this to detect exhaustion instead of silently overflowing
         # into unmapped memory (GitHub #31 follow-up, patc2->patc3 crash).
-        sb_push(sb, "    mov rax, 536870912" + x64_nl_char())
+        # Bumped 512MB -> 2GB (GitHub #89 follow-up): self-assembling the
+        # compiler's own ~94k-line x64_runtime.asm via x64_assemble_chunk
+        # (patc2.exe compiling itself) genuinely exhausted the 512MB
+        # heap -- confirmed by finding the crash was actually inside
+        # rt_heap_alloc's own "heap exhausted" error-reporting path
+        # (which has a real, separate bug of its own: `(used+size) +
+        # " bytes requested, "` silently does a raw pointer add instead
+        # of stringifying the number, since the non-dynamic `+` codegen
+        # path has no int-to-string case -- not fixed here, out of
+        # scope for this specific bump, but is why exhaustion crashed
+        # instead of printing a clean message). Costs nothing at rest:
+        # .bss pages are zero-fill-on-demand on 64-bit Windows.
+        sb_push(sb, "    mov rax, 1900000000" + x64_nl_char())
         sb_push(sb, "    push rax" + x64_nl_char())
       else
       if name == "mem_heap_state_addr" then
@@ -7461,6 +7897,31 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
             sb_push(sb, "    mov r15, rsp" + x64_nl_char())
             sb_push(sb, "    sub rsp, 32" + x64_nl_char())
             sb_push(sb, "    and rsp, -16" + x64_nl_char())
+            sb_push(sb, "    call ExitProcess" + x64_nl_char())
+          elif name == "x64_fatal_compile_error_halt" then
+            # x64_fatal_compile_error_halt(text) is codegen_x64.patlang's
+            # OWN internal "this should never happen" panic -- called
+            # from ITS OWN body (see its one call site) to stop a
+            # confidently-wrong compile from proceeding. It used to be a
+            # deliberately UNDEFINED name: calling it made the
+            # INTERPRETER raise "host fn not found" as a crude but real
+            # halt, since no genuine process-halt primitive existed. That
+            # trick only works under the interpreter -- under --x64 an
+            # unresolved name is just another "unsupported primitive"
+            # placeholder (prints a comment, pushes 0, keeps going), so
+            # compiling codegen_x64.patlang's OWN source into a self-
+            # hosted patc2 silently defeated the one safety net this
+            # panic path exists for. Real halt now: print the message,
+            # then ExitProcess with a distinct code (3) so a genuine
+            # internal-compiler panic is distinguishable from an ordinary
+            # exit(0)/exit(1). Caller reclaims nothing after this (same
+            # as os_exit just above) since ExitProcess never returns.
+            sb_push(sb, "    call rt_print_str" + x64_nl_char())
+            sb_push(sb, "    add rsp, 8" + x64_nl_char())
+            sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+            sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+            sb_push(sb, "    and rsp, -16" + x64_nl_char())
+            sb_push(sb, "    mov rcx, 3" + x64_nl_char())
             sb_push(sb, "    call ExitProcess" + x64_nl_char())
           else
             print("codegen_x64: unsupported primitive (not a real function and not in the OS-boundary allowlist): " + name)
@@ -8110,6 +8571,23 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
                       # this point reflects the function body's own
                       # (balanced) stack traffic, not the state right
                       # after the prologue's pushes.
+                      # Real bug found here during the (all-self-hosted,
+                      # no rustc/nasm/gcc) fixpoint self-compile: `pool_
+                      # used`/`pool_used_n`/`save_base` are locals of the
+                      # CALLER (x64_emit_func), not of this function --
+                      # this branch happened to be one this codebase's
+                      # own interpreter-driven and rustc-backed self-
+                      # compiles never actually reached, so the missing-
+                      # scope reference stayed latent until the fully
+                      # self-hosted --x64 toolchain tried to compile
+                      # codegen_x64.patlang's own source and hit it for
+                      # real. Fixed by recomputing all three locally from
+                      # this function's own real parameters (`regmap`,
+                      # `spilled`), matching exactly how x64_emit_func's
+                      # own prologue derives them.
+                      let pool_used = x64_reg_pool()
+                      let pool_used_n = to_num(list_len(regmap))
+                      let save_base = to_num(list_len(spilled)) + 3
                       let pei = 0
                       while pei < pool_used_n do
                         sb_push(sb, "    mov " + pool_used[pei] + ", [rbp-" + (8 * (save_base + pei + 1)) + "]" + x64_nl_char())
@@ -9251,7 +9729,7 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
     end
     sb_push(sb, sb_str(gl_line) + x64_nl_char())
   end
-  sb_push(sb, "extern GetStdHandle, WriteFile, ExitProcess, CreateFileA, GetFileSize, CloseHandle, ReadFile, CreateProcessA, CreatePipe, SetHandleInformation, WaitForSingleObject, GetCommandLineA, GetExitCodeProcess, TerminateProcess, WSAStartup, WSAGetLastError, socket, bind, listen, accept, connect, send, recv, closesocket, shutdown, getaddrinfo, freeaddrinfo, getsockname, ioctlsocket, htons, ntohs, Sleep, GetTickCount64, CopyFileA, MoveFileExA, FindFirstFileA, FindNextFileA, FindClose, GetConsoleMode, SetConsoleMode, SetConsoleOutputCP, SetConsoleCP, GetCurrentDirectoryA, SetCurrentDirectoryA" + x64_nl_char())
+  sb_push(sb, "extern GetStdHandle, WriteFile, ExitProcess, CreateFileA, GetFileSize, CloseHandle, ReadFile, CreateProcessA, CreatePipe, SetHandleInformation, WaitForSingleObject, GetCommandLineA, GetEnvironmentVariableA, GetExitCodeProcess, TerminateProcess, WSAStartup, WSAGetLastError, socket, bind, listen, accept, connect, send, recv, closesocket, shutdown, getaddrinfo, freeaddrinfo, getsockname, ioctlsocket, htons, ntohs, Sleep, GetTickCount64, CopyFileA, MoveFileExA, FindFirstFileA, FindNextFileA, FindClose, GetConsoleMode, SetConsoleMode, SetConsoleOutputCP, SetConsoleCP, GetCurrentDirectoryA, SetCurrentDirectoryA" + x64_nl_char())
   # Canvas host, Phase 1 (win32_window.patlang's own backing
   # primitives): window creation, message pump, GDI pixel blit.
   # user32.dll/gdi32.dll are already linked (x64_build.patlang) but
@@ -9369,7 +9847,9 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
     # until touched), not a claim this is unbounded -- see
     # rt_heap_alloc's own header in x64_runtime.patlang for the real
     # fix still outstanding (genuine dynamic growth/free-list).
-    sb_push(sb, "    g_heap resb 536870912" + x64_nl_char())
+    # Bumped again 512MB -> 2GB (GitHub #89 follow-up) -- see
+    # mem_heap_size()'s own comment above for why.
+    sb_push(sb, "    g_heap resb 1900000000" + x64_nl_char())
     sb_push(sb, "    align 8" + x64_nl_char())
     # x64_os_exec_run_asm's real GetExitCodeProcess result, replacing
     # the earlier "non-empty output = success" heuristic -- see that

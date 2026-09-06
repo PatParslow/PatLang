@@ -62,18 +62,100 @@ make a function called xpl_pad_to takes lst, n returns out
 end
 
 # ---- symbol table ----
-
-make a function called xpl_symtab_new returns t
-  return new("Dict", "xpl_symtab_" + xa_next_id())
+#
+# Real bug found (session 8, native-toolchain cutover): the built-in
+# "Dict" class (a host-level/Rust construct, no PatLang source of its
+# own to inspect) silently returned a WRONG value for a genuinely-set
+# key once this symbol table grew to real-program scale (hundreds of
+# entries across multiple chunks) -- confirmed directly: a chunk-local
+# symbol's own correctly-registered offset did not come back out of a
+# later `get` for the exact same key. A follow-up hand-rolled CLASS
+# (mutating `self.field` inside a method) ALSO failed once compiled,
+# despite round-tripping correctly under the trusted INTERPRETER --
+# never actually proven correct through patc1.exe's own compiled body,
+# only through `pat --ir-run`, the same class of gap this session's
+# other two bugs (shl/shr/sar-by-cl; the negative-imm64 2^64 overflow)
+# already showed can hide a compiled-only defect. The fix that actually
+# held: avoid BOTH Dict and any new class/`send`-based abstraction, and
+# use the exact same plain-parallel-lists-plus-linear-scan shape
+# already proven correct, compiled, in x64_link's own body for
+# `all_symbols`/`all_relocs`/`local_names` -- two parallel lists (names,
+# values) threaded through as ordinary function-local variables via
+# `let x = list_push(x, ...)`, looked up with this one helper. A linear
+# scan isn't the fastest structure for a few hundred entries, but this
+# runs once per build, not once per program execution -- correctness
+# matters far more than micro-optimizing a compile-time lookup here.
+make a function called xpl_list_lookup takes names, values, target returns v_or_false
+  let i = 0
+  let n = to_num(list_len(names))
+  while i < n do
+    if names[i] == target then
+      return values[i]
+    end
+    let i = i + 1
+  end
+  return false
 end
 
-make a function called xpl_symtab_set takes t, name, rva returns done
-  send(t, "set", name, rva)
-  return true
+# ---- bucketed symbol index ----
+#
+# xpl_list_lookup above is a LINEAR scan, and the relocation loop calls
+# it once per relocation against the WHOLE merged symbol table. That is
+# quadratic in program size, and at real self-hosted-compiler-bundle
+# scale it stops being a footnote and becomes the entire build: linking
+# the ~330-function compiler (513 chunks, tens of thousands of symbols
+# and relocations) sat in that one loop for over an hour and 45 minutes,
+# single-threaded, while the per-function ASSEMBLY phase that precedes
+# it had finished in about 24 minutes. Measured, not assumed -- the
+# per-unit .chunk.json cache files stop being written the moment
+# assembly ends, so their newest timestamp dates the phase boundary
+# exactly.
+#
+# Fixed by bucketing the symbol table once up front and scanning only
+# the matching bucket. Deliberately hand-rolled over plain lists rather
+# than reaching for the Dict host type: Dict was found to silently lose
+# or misresolve entries when compiled at scale in this codebase (see
+# patlang-x64-selfhosted-assembler-phase1 memory), which is exactly why
+# the symbol table is a pair of parallel lists in the first place.
+make a function called xpl_hash_bucket takes s, nbuckets returns idx
+  let h = 5381
+  let n = s.length
+  let i = 0
+  while i < n do
+    let h = (h * 33 + char_code(s, i)) % 999999937
+    let i = i + 1
+  end
+  return h % nbuckets
 end
 
-make a function called xpl_symtab_get takes t, name returns rva_or_false
-  return get(t, name)
+make a function called xpl_build_index takes names, values returns index
+  # ~8 names per bucket at the compiler bundle's own symbol count; the
+  # bucket lists stay short enough that the residual per-bucket linear
+  # scan is genuinely cheap, without allocating an absurd number of
+  # empty lists for a small program.
+  let nbuckets = 4096
+  let bn = []
+  let bv = []
+  let b = 0
+  while b < nbuckets do
+    let bn = list_push(bn, [])
+    let bv = list_push(bv, [])
+    let b = b + 1
+  end
+  let n = to_num(list_len(names))
+  let j = 0
+  while j < n do
+    let k = xpl_hash_bucket(names[j], nbuckets)
+    let bn = list_set(bn, k, list_push(bn[k], names[j]))
+    let bv = list_set(bv, k, list_push(bv[k], values[j]))
+    let j = j + 1
+  end
+  return [bn, bv, nbuckets]
+end
+
+make a function called xpl_index_lookup takes index, target returns v_or_false
+  let k = xpl_hash_bucket(target, index[2])
+  return xpl_list_lookup(index[0][k], index[1][k], target)
 end
 
 # ---- layout + link ----
@@ -106,11 +188,55 @@ make a function called x64_link takes chunks, import_spec, entry_symbol, out_pat
     let text_base = to_num(list_len(merged_text))
     let data_base = to_num(list_len(merged_data))
     let bss_base = merged_bss
-    let merged_text = xa_emit_bytes(merged_text, chunk[1])
-    let merged_data = xa_emit_bytes(merged_data, chunk[2])
+    # Appended INLINE rather than via xa_emit_bytes, for the same reason
+    # the relocation patching below is inline: handing the ACCUMULATING
+    # merged image to a function that appends and returns it copies the
+    # whole thing per call (GitHub #75). Here that is once per chunk
+    # against a list growing into the megabytes -- 535 chunks for the
+    # self-hosted compiler's own bundle. xa_emit_bytes itself is fine and
+    # stays in use elsewhere; it is passing a large accumulator across
+    # the boundary that is not.
+    let ct = chunk[1]
+    let ctn = to_num(list_len(ct))
+    let bi = 0
+    while bi < ctn do
+      let merged_text = list_push(merged_text, ct[bi])
+      let bi = bi + 1
+    end
+    let cd = chunk[2]
+    let cdn = to_num(list_len(cd))
+    let bi = 0
+    while bi < cdn do
+      let merged_data = list_push(merged_data, cd[bi])
+      let bi = bi + 1
+    end
     let merged_bss = merged_bss + chunk[3]
 
+    # Real bug found (session 8, native-toolchain cutover): every chunk
+    # is assembled independently, and x64_string_label_next() (codegen_
+    # x64.patlang) resets its own counter to S0 at the start of EVERY
+    # emit_program_x64() call -- meaning the runtime chunk's own string
+    # labels ("S0", "S1", ...) and the SEPARATE per-function program
+    # chunks' own string labels (each function is its own tiny "program"
+    # per x64_compile_unit.patlang's ensure_chunk_native, so EACH ALSO
+    # restarts at S0) all reuse the exact same bare names. None of these
+    # are ever declared `global` (only real cross-chunk references like
+    # function names are), so `is_global` (sym[3]) is false for all of
+    # them -- but this flat symbol table used to key EVERY symbol by its
+    # bare name regardless, so chunk B's own "S0" would silently
+    # OVERWRITE chunk A's "S0" in the shared Dict the moment both
+    # chunks' symbols were collected, corrupting any relocation in chunk
+    # A that referenced its own "S0" to point at chunk B's data instead.
+    # NASM never hits this because a real .obj file gives every non-
+    # `global` label real LOCAL (file-scoped) symbol visibility -- this
+    # simple linker's one flat table had no equivalent scoping. Fixed by
+    # giving every NON-global symbol (and every reloc target that
+    # resolves to one) a chunk-unique prefix, so same-named locals from
+    # different chunks never collide; only genuinely `global` names
+    # (still bare) are visible across chunk boundaries, matching real
+    # symbol-visibility semantics.
     let syms = chunk[4]
+    let local_names = []
     let si = 0
     let sn = to_num(list_len(syms))
     while si < sn do
@@ -118,6 +244,7 @@ make a function called x64_link takes chunks, import_spec, entry_symbol, out_pat
       let name = sym[0]
       let section = sym[1]
       let offset = sym[2]
+      let is_global = sym[3]
       let base = text_base
       if section == "data" then
         let base = data_base
@@ -126,7 +253,12 @@ make a function called x64_link takes chunks, import_spec, entry_symbol, out_pat
           let base = bss_base
         end
       end
-      let all_symbols = list_push(all_symbols, [name, section, base + offset])
+      let key = name
+      if not is_global then
+        let key = "$L" + ci + "$" + name
+        let local_names = list_push(local_names, name)
+      end
+      let all_symbols = list_push(all_symbols, [key, section, base + offset])
       let si = si + 1
     end
 
@@ -144,7 +276,11 @@ make a function called x64_link takes chunks, import_spec, entry_symbol, out_pat
       if section == "data" then
         let base = data_base
       end
-      let all_relocs = list_push(all_relocs, [section, base + offset, target, kind, addend])
+      let target_key = target
+      if list_contains_str(local_names, target) then
+        let target_key = "$L" + ci + "$" + target
+      end
+      let all_relocs = list_push(all_relocs, [section, base + offset, target_key, kind, addend])
       let ri = ri + 1
     end
     let ci = ci + 1
@@ -272,7 +408,26 @@ make a function called x64_link takes chunks, import_spec, entry_symbol, out_pat
     let di = di + 1
   end
 
-  let iat_rva_of = xpl_symtab_new()
+  # Real bug found (session 8, native-toolchain cutover): the built-in
+  # "Dict" class (a host-level/Rust construct with no PatLang source of
+  # its own) silently lost or misresolved entries once COMPILED into
+  # patc1.exe at real-program scale (confirmed: a basic get/set round-
+  # trip that worked perfectly under the trusted interpreter came back
+  # `false` for everything once compiled). A hand-rolled class-based
+  # replacement (mutating `self.field` inside a method) ALSO failed
+  # once compiled, even though it round-tripped correctly under the
+  # interpreter -- never actually proven correct THROUGH patc1.exe
+  # itself, only through `pat --ir-run`, which is exactly the kind of
+  # gap this session's other two bugs (shl/shr/sar-by-cl; the negative-
+  # imm64 2^64 overflow) already showed can hide a compiled-only
+  # defect. Rather than trust ANY new abstraction without a compiled
+  # proof, this now uses the exact same plain-parallel-lists-plus-
+  # linear-scan shape ALREADY PROVEN correct, compiled, in THIS SAME
+  # FUNCTION for `all_symbols`/`all_relocs`/`local_names` above -- no
+  # class, no `send`, no Dict, just `let x = list_push(x, ...)` at this
+  # function's own top level.
+  let iat_names = []
+  let iat_values = []
   let di = 0
   while di < num_dlls do
     let funcs = import_spec[di][1]
@@ -280,7 +435,8 @@ make a function called x64_link takes chunks, import_spec, entry_symbol, out_pat
     let fi = 0
     let fnn = to_num(list_len(funcs))
     while fi < fnn do
-      xpl_symtab_set(iat_rva_of, funcs[fi], idata_rva + base_off + (fi * 8))
+      let iat_names = list_push(iat_names, funcs[fi])
+      let iat_values = list_push(iat_values, idata_rva + base_off + (fi * 8))
       let fi = fi + 1
     end
     let di = di + 1
@@ -331,11 +487,12 @@ make a function called x64_link takes chunks, import_spec, entry_symbol, out_pat
   let tn = to_num(list_len(thunk_names))
   while ti < tn do
     let thunk_rva = text_rva + (ti * 6)
-    let iat_slot_rva = xpl_symtab_get(iat_rva_of, thunk_names[ti])
+    let iat_slot_rva = xpl_list_lookup(iat_names, iat_values, thunk_names[ti])
     let disp = iat_slot_rva - (thunk_rva + 6)
     let thunks = xpl_emit_u16(thunks, 9727)
     let thunks = xpl_emit_u32(thunks, disp)
-    xpl_symtab_set(iat_rva_of, "$thunk$" + thunk_names[ti], thunk_rva)
+    let iat_names = list_push(iat_names, "$thunk$" + thunk_names[ti])
+    let iat_values = list_push(iat_values, thunk_rva)
     let ti = ti + 1
   end
 
@@ -344,7 +501,8 @@ make a function called x64_link takes chunks, import_spec, entry_symbol, out_pat
   # exactly like a `call SomeLocalFunction` reloc -- no special-casing
   # needed at the point a relocation is patched, only here at table-
   # build time).
-  let symtab = xpl_symtab_new()
+  let symtab_names = []
+  let symtab_values = []
   let si = 0
   let sn = to_num(list_len(all_symbols))
   while si < sn do
@@ -360,42 +518,101 @@ make a function called x64_link takes chunks, import_spec, entry_symbol, out_pat
         let base_rva = bss_rva
       end
     end
-    xpl_symtab_set(symtab, name, base_rva + offset)
+    let symtab_names = list_push(symtab_names, name)
+    let symtab_values = list_push(symtab_values, base_rva + offset)
     let si = si + 1
   end
   let ti = 0
   while ti < tn do
-    xpl_symtab_set(symtab, thunk_names[ti], xpl_symtab_get(iat_rva_of, "$thunk$" + thunk_names[ti]))
+    let symtab_names = list_push(symtab_names, thunk_names[ti])
+    let symtab_values = list_push(symtab_values, xpl_list_lookup(iat_names, iat_values, "$thunk$" + thunk_names[ti]))
     let ti = ti + 1
   end
 
   # ---- Patch relocations directly into merged_text / merged_data ----
+  # Index the finished symbol table ONCE here, rather than linear-scanning
+  # it per relocation inside the loop below (see xpl_build_index's own
+  # header for the measured cost of not doing this).
+  let unused_pidx = x64_build_progress("link-index-symbols", 0, to_num(list_len(symtab_names)))
+  let symtab_index = xpl_build_index(symtab_names, symtab_values)
   let ri = 0
   let rn = to_num(list_len(all_relocs))
+  # Reported every 500 relocations rather than every one: enough
+  # resolution to see the loop advancing (or not) on a build that takes
+  # minutes, without paying a status update per iteration on the
+  # hottest loop in the linker.
+  let unused_prel = x64_build_progress("link-relocations", 0, rn)
   while ri < rn do
+    if (ri % 500) == 0 then
+      let unused_pr = x64_build_progress("link-relocations", ri, rn)
+    else
+      if (ri % 50) == 0 then
+        x64_build_tick()
+      end
+    end
     let reloc = all_relocs[ri]
     let section = reloc[0]
     let offset = reloc[1]
     let target = reloc[2]
     let kind = reloc[3]
     let addend = reloc[4]
-    let target_rva = xpl_symtab_get(symtab, target)
+    let target_rva = xpl_index_lookup(symtab_index, target)
     if not target_rva then
-      return "LINK ERROR: undefined symbol '" + target + "'"
+      # Distinguish the two very different reasons a lookup can miss,
+      # rather than reporting both as "undefined symbol". A bare linear
+      # scan of the same table answers it definitively: if the name IS
+      # there, the bucket index disagreed between build and lookup (a
+      # real defect in the indexing, and the error should say so
+      # instead of blaming the symbol); if it genuinely is not there,
+      # the reference really is dangling. This costs one linear scan on
+      # a path that is about to abort anyway.
+      let linear_rva = xpl_list_lookup(symtab_names, symtab_values, target)
+      if not linear_rva then
+        return "LINK ERROR: undefined symbol '" + target + "' (not present in the symbol table at all; reloc " + ri + " of " + rn + ", section " + section + ", kind " + kind + ")"
+      end
+      return "LINK ERROR: symbol index inconsistency for '" + target + "' -- present in the symbol table (rva " + linear_rva + ") but the hash index did not find it; build bucket and lookup bucket disagree (reloc " + ri + " of " + rn + ")"
     end
+    # Patched INLINE, deliberately, rather than through xpl_patch_bytes
+    # (see GitHub #75 -- unchanged reasoning, still correct: handing an
+    # accumulator through a function call that returns it copies it in
+    # full on every call). A SEPARATE, deeper bug in the same spot was
+    # found and fixed one level down instead of here (issue #89's
+    # linker-scaling follow-up, 2026-09-06): plain `list_set`, when
+    # compiled via --x64, routed to x64_runtime.patlang's own
+    # rt_list_set_functional, which UNCONDITIONALLY reallocated and
+    # copied every element of the WHOLE list on every single call, with
+    # no in-place fast path at all (unlike rt_list_push, which mutates
+    # in place whenever capacity allows). Calling it once per patched
+    # byte (4-8 times per relocation) against `merged_text`/`merged_data`
+    # -- potentially megabytes -- made this loop O(relocations *
+    # image_size), not O(relocations): confirmed directly via
+    # self_hosting/examples/x64_linker_scaling_probe.exe (1500 synthetic
+    # one-function chunks fine, 1800 exhausts a 1.9GB heap). Fixed at the
+    # actual source, rt_list_set_functional's own body in x64_runtime.
+    # patlang, so every caller of plain `list_set` -- this loop, and
+    # codegen_x64.patlang's x64_vstack_push/x64_analyze_dynamic_bins --
+    # benefits without needing to change anything here.
     if kind == "ABS64" then
       let value_bytes = xa_int_to_bytes_le(image_base + target_rva + addend, 8)
-      let merged_data = xpl_patch_bytes(merged_data, offset, value_bytes)
+      let bi = 0
+      while bi < 8 do
+        let merged_data = list_set(merged_data, offset + bi, value_bytes[bi])
+        let bi = bi + 1
+      end
     else
       let reloc_rva = text_rva + thunk_area_size + offset
       let value = (target_rva + addend) - (reloc_rva + 4)
       let value_bytes = xa_int_to_bytes_le(value, 4)
-      let merged_text = xpl_patch_bytes(merged_text, offset, value_bytes)
+      let bi = 0
+      while bi < 4 do
+        let merged_text = list_set(merged_text, offset + bi, value_bytes[bi])
+        let bi = bi + 1
+      end
     end
     let ri = ri + 1
   end
 
-  let entry_rva = xpl_symtab_get(symtab, entry_symbol)
+  let entry_rva = xpl_index_lookup(symtab_index, entry_symbol)
   if not entry_rva then
     return "LINK ERROR: entry symbol '" + entry_symbol + "' not defined"
   end
