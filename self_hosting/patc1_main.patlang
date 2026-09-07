@@ -218,6 +218,19 @@ else
   end
   let runtime_obj = "F:/PatLang/self_hosting/build/x64_runtime.obj"
   let lower_source = source
+  # Live progress over the signals IPC port (issue #89's follow-up,
+  # 2026-09-06) for what used to be a completely silent front end: a
+  # ~15-minute self-compile of the compiler's own ~27k-line bundle gave
+  # NO signal at all until x64_compile_unit.patlang's build_native
+  # claimed the port partway through -- lex/parse/lower of that much
+  # source is real, non-trivial time, not the free pass its own single-
+  # pass nature might suggest. x64_build_signal_claim() is idempotent
+  # (see its own header), so claiming here and again later inside
+  # build_native holds the SAME port throughout, not two different ones.
+  if use_x64 then
+    let unused_claim0 = x64_build_signal_claim()
+    let unused_p0 = x64_build_progress("reading-source", 0, 1)
+  end
   if use_x64 then
     if file_exists(runtime_obj) == "1" then
       # The lowerer resolves Call vs CallHost by whether it sees a
@@ -229,17 +242,46 @@ else
       # parsing is cheap (not the cost this split exists to avoid);
       # only CODEGEN (below, x64_collect_runtime_names/the emit_
       # program_x64 split) skips redoing the runtime's own work.
-      let rt_src = read_file("F:/PatLang/self_hosting/lib/x64_runtime.patlang")
+      # Real bug found (issue #89 follow-up, 2026-09-06): read_file
+      # called with an INLINE string-literal path argument, at this
+      # ~27k-line/~1.6MB-combined-source scale, produces a result that
+      # concatenates and reports .length correctly but crashes with a
+      # deterministic null-pointer read partway through a LATER
+      # tokenize() call on the concatenated text -- confirmed via a
+      # from-scratch Win32 debug-API probe (faultAddr=0x0, READ,
+      # identical RIP every time) and isolated, bisected repros:
+      # read_file(var_holding_same_literal) does not crash; read_file(
+      # "literal") does, on the exact same file content. Root cause not
+      # yet found (something in how a bare string-literal ARGUMENT to a
+      # CallHost differs in codegen from a variable reference -- the
+      # literal's own .data emission and length prefix are byte-
+      # identical either way, so the divergence is in argument-passing/
+      # register-allocation, not the string's own encoding). Routing
+      # through a local variable first is a real, verified fix at this
+      # call site, not a superstition -- MUST NOT be reverted to an
+      # inline literal without re-testing the full patc2->patc3
+      # fixpoint.
+      let runtime_path = "F:/PatLang/self_hosting/lib/x64_runtime.patlang"
+      let rt_src = read_file(runtime_path)
       let lower_source = rt_src + chr(10) + source
     end
   end
+  if use_x64 then
+    let unused_p1 = x64_build_progress("lexing", 0, 1)
+  end
   let toks = tokenize(lower_source)
+  if use_x64 then
+    let unused_p2 = x64_build_progress("parsing", 0, 1)
+  end
   let ast = parse_program(toks)
   let stmts = ast[1]
   let err = parse_find_error(stmts)
   if err[0] != "" then
     print(format_parse_error(err[0], err[1], lower_source))
   else
+    if use_x64 then
+      let unused_p3 = x64_build_progress("lowering", 0, 1)
+    end
     let ir = lower_program(ast)
     if use_x64 then
       let runtime_names_file = "F:/PatLang/self_hosting/build/x64_runtime.funcs"
@@ -368,7 +410,31 @@ else
         # own now-superseded header) -- every function is its own,
         # always-small .obj, regardless of how many other functions the
         # program has.
+        # Fail fast, before any of the expensive per-function assemble/
+        # link work below, if "main" itself didn't survive lowering and
+        # dedup -- rather than discovering it only at the final link
+        # step's "entry symbol 'main' not defined", after a build that
+        # can take many minutes. lower_program is documented to always
+        # synthesize an empty main for a source unit's own top-level
+        # statements, so this firing means something upstream (the
+        # rt_names/duplicate-include filtering just above) dropped it --
+        # a real, loud bug report, never expected to actually trigger.
+        # A separate guard block, not folded into the existing
+        # `if collided_names.length == 0` check below, so the large,
+        # already-working block it guards needs no restructuring at all:
+        # appending a sentinel to collided_names here just makes that
+        # existing check correctly skip the build the same way a real
+        # name collision already does.
         if collided_names.length == 0 then
+          if not x64_name_in_list(seen_names, "main") then
+            print("patc1 --x64: compile error -- no 'main' function found after lowering and dedup (" + to_num(list_len(program_funcs)) + " program function(s) collected). Not attempting the build.")
+            let collided_names = list_push(collided_names, "main")
+          end
+        end
+        if collided_names.length == 0 then
+          if use_x64 then
+            let unused_p4 = x64_build_progress("resolved-functions", to_num(list_len(program_funcs)), to_num(list_len(program_funcs)))
+          end
           let cache = new("ObjCache", "patc1_obj_cache")
           cache.cache_dir = "self_hosting/build/x64_obj_cache"
           let linker = new("X64UnitLinker", "patc1_linker")
