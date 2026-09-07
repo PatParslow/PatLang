@@ -14,10 +14,22 @@
 #                                       .bss scratch buffer
 #   mem_poke_byte(addr, offset, v)  -> write one byte
 #   mem_peek_byte(addr, offset)     -> read one byte
-#   mem_heap_base()                 -> address of a fixed 16MB .bss
-#                                       heap region -- one single OS-
-#                                       free static reservation, NOT a
-#                                       per-allocation OS call
+#   mem_heap_base()                 -> the heap's reserved base address.
+#                                       Reserves 64GB of address space
+#                                       via VirtualAlloc on first call
+#                                       (MEM_RESERVE, no physical/page-
+#                                       file cost until committed), then
+#                                       just returns the cached base on
+#                                       every later call -- see its own
+#                                       header in codegen_x64.patlang.
+#   mem_heap_ensure_committed(used) -> ensures the heap is COMMITTED
+#                                       (physically backed) at least up
+#                                       to `used` bytes past the base,
+#                                       calling VirtualAlloc(MEM_COMMIT)
+#                                       as needed; returns 1 on success,
+#                                       0 if that commit call itself
+#                                       fails (genuinely out of address
+#                                       space/page file).
 #   mem_heap_state_addr()           -> address of a persistent 8-byte
 #                                       "bytes used so far" counter
 #   mem_poke_qword(addr, offset, v) -> write eight bytes
@@ -98,29 +110,18 @@ end
 
 # Real bug found (GitHub #31 follow-up) via WinDbg on the patc2.exe ->
 # patc3.exe self-hosting fixpoint: rt_heap_alloc never checked `used`
-# against g_heap's actual reserved size (codegen_x64.patlang's
-# `g_heap resb <N>` -- see mem_heap_size() below, which MUST be kept
-# in sync with that literal by hand, no shared constant exists between
-# the two files). Once a compile touched enough heap to run past the
-# end of g_heap -- g_heap is declared LAST in the .bss section, so
-# there's nothing but unmapped memory beyond it -- every subsequent
-# "allocation" kept silently handing out addresses past the reserved
-# region, and the first write through one of them (inside rt_list_get's
-# string branch, in this case) hit an unmapped page and crashed with a
-# generic access violation, giving zero indication the real cause was
-# heap exhaustion. User's explicit correction after this was found:
-# "the heap alloc should grow our heap, and we should definitely not
-# fail silently AND we might want to consider the size first" -- so
-# this now (1) fails LOUDLY via a diagnostic print + os_exit rather
-# than silently corrupting memory, and (2) the reservation itself
-# (mem_heap_size()) was sized generously rather than left at the
-# original 16MB. Real dynamic growth (a second VirtualAlloc'd region
-# once this one fills, or a proper segmented heap) is a bigger, still-
-# undone follow-up -- deliberately NOT attempted here; a large-but-
-# still-fixed reservation is a legitimate, cheap mitigation on 64-bit
-# Windows specifically because `.bss` pages are zero-fill-on-demand
-# (reserving 512MB costs nothing in actual RAM until touched), not a
-# claim that this is unbounded.
+# against the heap's actual backing, so every "allocation" past the end
+# of whatever was actually reserved/committed kept silently handing out
+# addresses into unmapped memory, and the first write through one of
+# them (inside rt_list_get's string branch, in this case) hit an
+# unmapped page and crashed with a generic access violation, giving
+# zero indication the real cause was heap exhaustion. User's explicit
+# correction after this was found: "the heap alloc should grow our
+# heap, and we should definitely not fail silently AND we might want to
+# consider the size first" -- so this fails LOUDLY via a diagnostic
+# print + os_exit rather than silently corrupting memory, on the rare
+# path where that's still possible at all.
+#
 # REAL BUG FOUND (not yet triggered by any pre-existing single-
 # threaded caller, but a genuine one once thread_spawn/real OS threads
 # exist -- see rt_atomic_fetch_add's own header in codegen_x64.patlang):
@@ -134,14 +135,37 @@ end
 # operation anywhere goes through this. Fixed with a single atomic
 # fetch-and-add (`lock xadd`) claiming the range, rather than a
 # separate read+write.
+#
+# DYNAMIC GROWTH (GitHub #89 follow-up, 2026-09-06 -- docs/plans/
+# x64_dynamic_heap_growth.md): this used to check `used + aligned_size`
+# against a compile-time-constant ceiling (`mem_heap_size()`, a literal
+# that needed hand-bumping and manual byte-for-byte sync with a
+# `g_heap resb <N>` .bss reservation in codegen_x64.patlang every time
+# a bigger compile needed more room) -- replaced after THREE bumps in
+# one session (512MB/1.9GB/2.1GB/1.98GB) each turned out to be a
+# stopgap, the last two spent chasing an empirically-found hard Windows
+# loader ceiling on PE SizeOfImage that no static `.bss` reservation
+# can safely approach, let alone cross. mem_heap_base() now reserves
+# 64GB of address space via VirtualAlloc (lazily, once, no physical
+# cost until committed) instead of returning a fixed link-time label
+# address, and mem_heap_ensure_committed(new_used) commits real pages
+# on demand as the bump pointer advances past what's already backed --
+# see both functions' own headers in codegen_x64.patlang. Exhaustion
+# now means "a VirtualAlloc commit call itself failed" (genuinely out
+# of address space or page file at 64GB reserved), not "hit an
+# arbitrary constant" -- essentially unreachable in practice, kept as
+# the fallback path rather than removed.
 make a function called rt_heap_alloc takes size returns addr
   let aligned_size = size
   let rem = aligned_size % 8
   if rem != 0 then
     let aligned_size = aligned_size + (8 - rem)
   end
+  let base = mem_heap_base()
   let used = rt_atomic_fetch_add(mem_heap_state_addr(), aligned_size)
-  if used + aligned_size > mem_heap_size() then
+  let new_used = used + aligned_size
+  let committed = mem_heap_ensure_committed(new_used)
+  if committed == 0 then
     # GitHub #89 follow-up: this used to build ONE concatenated string
     # via `+` ("...(" + number + "..." + number + "...") -- correct now
     # that `+` properly stringifies a number against a string (the
@@ -157,14 +181,12 @@ make a function called rt_heap_alloc takes size returns addr
     # rt_print_i64 (writes to the static scratch buffer, no heap touch)
     # interleaved with plain string-literal prints instead of one `+`
     # chain.
-    print("rt_heap_alloc: heap exhausted (")
-    rt_print_i64(used + aligned_size)
-    print(" bytes requested, ")
-    rt_print_i64(mem_heap_size())
-    print(" reserved) -- see rt_heap_alloc's own header in x64_runtime.patlang")
+    print("rt_heap_alloc: VirtualAlloc commit failed (")
+    rt_print_i64(new_used)
+    print(" bytes requested) -- see rt_heap_alloc's own header in x64_runtime.patlang")
     os_exit(97)
   end
-  let addr = mem_heap_base() + used
+  let addr = base + used
   return addr
 end
 
