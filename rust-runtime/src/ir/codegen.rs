@@ -423,6 +423,17 @@ fn obj_set(name: &str, prop: &str, val: Value) {
         m.insert(prop.to_string(), val);
     });
 }
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+fn obj_push(name: &str, prop: &str, val: Value) {
+    OBJECTS.with(|o| {
+        let mut b = o.borrow_mut();
+        let m = b.entry(name.to_string()).or_insert_with(HashMap::new);
+        match m.get_mut(prop) {
+            Some(Value::List(list)) => { Arc::make_mut(list).push(val); }
+            _ => { m.insert(prop.to_string(), Value::List(Arc::new(vec![val]))); }
+        }
+    });
+}
 
 #[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
 fn obj_get(name: &str, prop: &str) -> Option<Value> {
@@ -432,6 +443,15 @@ fn obj_get(name: &str, prop: &str) -> Option<Value> {
 fn obj_set(name: &str, prop: &str, val: Value) {
     let mut b = OBJECTS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
     b.entry(name.to_string()).or_insert_with(HashMap::new).insert(prop.to_string(), val);
+}
+#[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+fn obj_push(name: &str, prop: &str, val: Value) {
+    let mut b = OBJECTS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    let m = b.entry(name.to_string()).or_insert_with(HashMap::new);
+    match m.get_mut(prop) {
+        Some(Value::List(list)) => { Arc::make_mut(list).push(val); }
+        _ => { m.insert(prop.to_string(), Value::List(Arc::new(vec![val]))); }
+    }
 }
 
 fn ensure_obj(name: &str, class: &str) {
@@ -3419,6 +3439,13 @@ fn host_call_io_misc(name: &str, args: &[Value]) -> Option<Result<Value, String>
                         let prop = match &rest[0] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
                         let val = rest[1].clone();
                         if !recv.is_empty() && !prop.is_empty() { obj_set(&recv, &prop, val); }
+                        Ok(Value::Unit)
+                    }
+                    "push" => {
+                        if rest.len() != 2 { return Ok(Value::Unit); }
+                        let prop = match &rest[0] { Value::String(s) => s.as_ref().clone(), _ => String::new() };
+                        let val = rest[1].clone();
+                        if !recv.is_empty() && !prop.is_empty() { obj_push(&recv, &prop, val); }
                         Ok(Value::Unit)
                     }
                     "infer_is_adult" => {
