@@ -102,3 +102,55 @@ end
 * Save detailed write-ups for major milestones.
 
 * **Avoid `| head -N` / `| tail -N`**: they queue output up instead of letting it stream, truncate before you've actually seen what matters, and aren't usually needed. Prefer `wc -l`, `grep -c`, or targeted `grep` for counts/verification; only cap output when a command is genuinely unbounded (e.g. a live log tail) and even then prefer a real filter over a blind line count. A prior session miscounted a directory's file total this way — trust an explicit count command (`ls ... | wc -l`) over a truncated listing.
+
+## 6. Long-Running Programs: Signals, Queue, and Budgeted Yields
+
+Any program intended to run for more than a few seconds, or as a background
+process, must be built with health/progress monitoring and resumability
+from the start — not added afterward, and not left out because the request
+that prompted the program didn't mention it explicitly.
+
+- **Rule**: If a program's main work will take more than a few seconds, or
+  runs as a daemon, it must include `status` and `quit` signal handlers at
+  minimum, declared at the top level per `patlang-program-conventions`.
+  Do not wait to be asked for this separately — treat it as an implicit
+  requirement of "long-running," the same way error handling is an implicit
+  requirement of "reads a file."
+
+- **Rule**: A `status` handler that cannot actually respond promptly while
+  the real workload is running is not compliant, even if it is present and
+  correctly written. Any main work loop of meaningful size or duration must
+  be wrapped in `budgeted(ms) { ... }` (or otherwise yield on a comparable
+  schedule) specifically so the signal-polling loop gets a genuine, regular
+  turn. An unyielding tight loop with a technically-correct `status` handler
+  behind it is a known, previously-repeated failure mode — the API exists
+  and does not deliver on its own claim.
+
+  **Do not assume this is done. Verify it**: after writing the program, run
+  it against a realistically-sized workload (not a toy case) and issue a
+  real `signal_query(..., "status", "")` while it is genuinely still busy.
+  If the reply is slow, or only arrives once the work has already finished,
+  the yield is missing or too coarse — go back and add/shorten it. A short
+  demo-sized run is not sufficient evidence that this works.
+
+- **Rule**: For any unit of work whose loss would matter if the process
+  crashed mid-task, use the message queue (`queue_publish`/`queue_consume`/
+  `queue_ack`) for durable checkpointing, not signals — signals are live,
+  in-memory, and gone the instant either side stops running. Only call
+  `queue_ack` once the corresponding work is genuinely, verifiably complete;
+  acking early defeats the entire mechanism.
+
+- **Rule**: If another PatLang program might reasonably need to find this
+  one without being told a port number in advance, call `signal_announce`
+  right after claiming the port, with an action list that accurately
+  reflects the `when` handlers actually implemented — an announced
+  capability the program doesn't really have is worse than no announcement.
+
+- **Report explicitly, either way**: when a long-running program is
+  delivered, state plainly whether status/progress reporting and
+  crash-safe resumability were included, and if either was scoped out,
+  say so — the same standard applied elsewhere in this file to deferred
+  mirror-sync work and known-gap test coverage. "It runs and produces the
+  right output eventually" is not the same claim as "it can be checked on
+  and safely interrupted," and the two should never be conflated in a
+  summary.
