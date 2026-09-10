@@ -64,14 +64,30 @@ make a function called http_body takes raw returns body
   return payload
 end
 
+# tcp_try_connect/tcp_read_or_empty, not tcp_connect/tcp_read -- Ollama
+# is a single shared local server every caller of this file hits, and
+# under real concurrent load (multiple processes, each making several
+# chat calls per turn for tool-selection/generation/follow-up) it can
+# reset a connection mid-response rather than complete it. Confirmed
+# directly, live: "tcp_read: An existing connection was forcibly closed
+# by the remote host (os error 10054)" -- a genuine OS-level TCP reset,
+# not a bug in the request itself -- crashed the ENTIRE calling process
+# outright (PatLang has no try/catch), taking down a whole component
+# over a transient network hiccup that a simple retry-or-report would
+# have survived. Returns "" on ANY failure (connect refused, or a reset
+# mid-read) -- ollama_chat_once below checks for that before ever
+# calling json_parse on it, rather than assuming a non-empty body.
 make a function called http_roundtrip takes request returns body
-  let conn = tcp_connect(get("__vars", "ollama_host"), get("__vars", "ollama_port"))
+  let conn = tcp_try_connect(get("__vars", "ollama_host"), get("__vars", "ollama_port"))
+  if conn < 0 then
+    return ""
+  end
   tcp_write(conn, request)
   let raw = ""
-  let chunk = tcp_read(conn)
+  let chunk = tcp_read_or_empty(conn)
   while chunk != "" do
     let raw = raw + chunk
-    let chunk = tcp_read(conn)
+    let chunk = tcp_read_or_empty(conn)
   end
   tcp_close(conn)
   return http_body(raw)
@@ -88,7 +104,13 @@ make a function called http_post takes path, body returns resp
 end
 
 make a function called list_models returns names
-  let v = json_parse(http_get("/api/tags"))
+  let raw_response = http_get("/api/tags")
+  # Same guard as ollama_chat_once above, same reason: json_parse hangs
+  # (does not error, does not crash) on a truncated/incomplete body.
+  if (raw_response == "") or (substr(raw_response, raw_response.length - 1, 1) != "}") then
+    return []
+  end
+  let v = json_parse(raw_response)
   let models = json_arr(json_get(v, "models"))
   let names = []
   let i = 0
@@ -111,7 +133,25 @@ make a function called ollama_chat_once takes model, system_prompt, user_content
   # gives fast, reliable replies; it's a harmless no-op for models without
   # "thinking" capability.
   let body = "{\"model\":" + json_quote(model) + ",\"think\":false,\"messages\":" + messages + ",\"stream\":false}"
-  let v = json_parse(http_post("/api/chat", body))
+  let raw_response = http_post("/api/chat", body)
+  # Checked BEFORE json_parse ever sees this, not after -- confirmed
+  # directly, separately from the tcp_read crash above: json_parse
+  # HANGS (not crashes, not a clean parse failure) on truncated JSON
+  # like an object with an unterminated string, e.g. '{"incomplete' --
+  # exactly the shape a connection reset mid-response can leave behind
+  # even with tcp_read_or_empty's own graceful (never-fatal) read, since
+  # "the read returned empty" is indistinguishable from "the connection
+  # closed cleanly" once some real bytes already arrived. A crash at
+  # least fails loud and fast; this would have hung the whole component
+  # forever, invisible to any status/liveness check that only asks "is
+  # the process still there" -- worse than the crash it would have
+  # replaced. A well-formed, complete Ollama response always ends in
+  # "}"; anything else is treated as incomplete without ever handing it
+  # to json_parse.
+  if (raw_response == "") or (substr(raw_response, raw_response.length - 1, 1) != "}") then
+    return "ERROR: Ollama response was empty or incomplete (connection failed or was reset mid-response)"
+  end
+  let v = json_parse(raw_response)
   let err = json_get(v, "error")
   if err[0] == "str" then
     return "ERROR: " + json_str(err)
