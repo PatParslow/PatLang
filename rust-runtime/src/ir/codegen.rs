@@ -109,6 +109,7 @@ const HOST_CHUNK_TABLE: &[(&str, ChunkId)] = &[
     ("sb_push", ChunkId::CollectionsHandles),
     ("sb_str", ChunkId::CollectionsHandles),
     ("read_file", ChunkId::Files),
+    ("try_read_file", ChunkId::Files),
     ("write_file", ChunkId::Files),
     ("write_file_bytes", ChunkId::Files),
     ("read_file_bytes", ChunkId::Files),
@@ -2940,6 +2941,13 @@ fn host_call_collections_handles(name: &str, args: &[Value]) -> Option<Result<Va
                 let p = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => to_s(v), None => String::new() };
                 std::fs::read_to_string(&p).map(|s| Value::String(s.into())).map_err(|e| format!("read_file: {}: {}", p, e))
             }
+            "try_read_file" => {
+                // try_read_file(path) -> contents, or "" if the read failed
+                // for any reason (see #93) -- same shape as read_file above
+                // but never aborts.
+                let p = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => to_s(v), None => String::new() };
+                Ok(Value::String(std::fs::read_to_string(&p).unwrap_or_default().into()))
+            }
             "write_file" => {
                 // write_file(path, contents) -> Bool
                 let p = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => to_s(v), None => String::new() };
@@ -3033,10 +3041,10 @@ fn host_call_collections_handles(name: &str, args: &[Value]) -> Option<Result<Va
                 }
             }
             "file_exists" => {
-                // file_exists(path) -> "1" or "0"
+                // file_exists(path) -> a real Bool (was "1"/"0" -- see #92)
                 let p = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => display_value(v), None => String::new() };
                 let exists = std::path::Path::new(&p).exists();
-                Ok(Value::String(if exists { "1".to_string().into() } else { "0".to_string().into() }))
+                Ok(Value::Bool(exists))
             }
             "list_dir" => {
                 // list_dir(path) -> List of entry names, directories suffixed "/"
@@ -3117,7 +3125,7 @@ fn host_call_collections_handles(name: &str, args: &[Value]) -> Option<Result<Va
 
 fn host_call_files(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match name {
-        "read_file" | "write_file" | "write_file_bytes" | "read_file_bytes" | "touch_file" | "file_exists" | "list_dir" | "rename_file" | "exec_capture" | "exec_capture_io" | "getenv" => Some(host_call_files_inner(name, args)),
+        "read_file" | "try_read_file" | "write_file" | "write_file_bytes" | "read_file_bytes" | "touch_file" | "file_exists" | "list_dir" | "rename_file" | "exec_capture" | "exec_capture_io" | "getenv" => Some(host_call_files_inner(name, args)),
         _ => None,
     }
 }

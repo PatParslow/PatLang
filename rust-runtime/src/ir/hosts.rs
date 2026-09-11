@@ -347,12 +347,29 @@ pub fn host_read_file(args: &[Value]) -> Result<Value, String> {
     std::fs::read_to_string(&p).map(|s| Value::String(s.into())).map_err(|e| format!("read_file: {}: {}", p, e))
 }
 
+pub fn host_try_read_file(args: &[Value]) -> Result<Value, String> {
+    // try_read_file(path) -> the file's contents, or "" if the read
+    // failed for any reason (missing file, permissions, etc.) -- the
+    // same "catch the expected failure, return a sentinel" shape as
+    // tcp_try_connect/tcp_read_or_empty (see #93), for call sites that
+    // need "the file might not be there" to be an expected, recoverable
+    // outcome rather than a hard abort. read_file itself is left exactly
+    // as it was: a missing file is still a loud, immediate error there,
+    // which is the right default when it signals an actual bug.
+    let p = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => display_value(v).into(), None => String::new().into() };
+    Ok(Value::String(std::fs::read_to_string(&p).unwrap_or_default().into()))
+}
+
 pub fn host_file_exists(args: &[Value]) -> Result<Value, String> {
-    // file_exists(path) -> "1" or "0" (legacy string-bool convention, kept
-    // consistent with the codegen template's arm of the same name)
+    // file_exists(path) -> a real Bool (was a "1"/"0" string -- see #92: a
+    // non-empty string is always truthy, which made a bare `if
+    // file_exists(...)` always take the true branch regardless of the
+    // real answer, and had already produced a live bug in
+    // lean_run.patlang). Kept consistent with the codegen template's arm
+    // of the same name, same as before.
     let p = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => display_value(v).into(), None => String::new().into() };
     let exists = std::path::Path::new(&p).exists();
-    Ok(Value::String(if exists { "1".to_string().into() } else { "0".to_string().into() }))
+    Ok(Value::Bool(exists))
 }
 
 pub fn host_hash_string(args: &[Value]) -> Result<Value, String> {
@@ -3450,6 +3467,7 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("chr", host_chr);
     interp.host.insert("to_num", host_to_num);
     interp.host.insert("read_file", host_read_file);
+    interp.host.insert("try_read_file", host_try_read_file);
     interp.host.insert("write_file", host_write_file);
     interp.host.insert("write_file_bytes", host_write_file_bytes);
     interp.host.insert("float_to_bits", host_float_to_bits);
