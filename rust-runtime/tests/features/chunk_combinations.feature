@@ -32,6 +32,7 @@ Feature: Compiled-chunk combinations
     Examples:
       | expr                                                | expected |
       | list_len(list_push(list_push([], 1), 2))            | 2        |
+      | list_len(list_push(list_push([], 1), 2)) + 1         | 3        |
       | substr("hello world", 6, 5)                          | world    |
       | max(3, 7)                                             | 7        |
       | file_exists("this_file_should_not_exist_12345.tmp")   | false    |

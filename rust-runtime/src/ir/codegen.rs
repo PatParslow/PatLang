@@ -687,14 +687,16 @@ impl Host {
                 }
             }
             "list_len" => {
-                // list_len(listOrString) -> String count (to match Stage 0 builtins)
+                // list_len(listOrString) -> a real Int (was a String -- see
+                // #94: ir/hosts.rs's copy of this same bug was fixed in #91,
+                // but this separate, compiled-output copy was missed)
                 if args.len() != 1 { return Err("expected 1 arg".into()); }
                 let n = match &args[0] {
                     Value::List(xs) => xs.len(),
                     Value::String(s) => s.chars().count(),
                     _ => 0,
                 };
-                Ok(Value::String(n.to_string().into()))
+                Ok(Value::Int(n as i64))
             }
             "list_push" => {
                 // list_push(list, item) -> new list with item appended
