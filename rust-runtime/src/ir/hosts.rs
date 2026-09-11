@@ -63,7 +63,7 @@ pub fn host_list_len(args: &[Value]) -> Result<Value, String> {
         Value::String(s) => s.chars().count(),
         _ => 0,
     };
-    Ok(Value::String((n.to_string()).into()))
+    Ok(Value::Int(n as i64))
 }
 
 pub fn host_list_push(args: &[Value]) -> Result<Value, String> {
