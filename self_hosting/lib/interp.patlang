@@ -367,6 +367,87 @@ make a function called interp_call_host takes name, args returns result
   return ["Err", "host function '" + name + "' not supported by interpret_ir (codegen_bootstrap's legacy compiler-meta tools -- parse_tiny_source/lower_and_compile/emit_rust_for/copy_file/remove_file/patc_compile_from_argv/get_argv -- are deliberately out of scope: half debug-scaffolding, superseded here by the cleaner compile_patlang/interpret_patlang pair above; bare rustc_build/rustc_build_chunked*/run_ir are likewise out of scope, since compile_patlang/interpret_patlang already cover the same need in one call)"]
 end
 
+# ---- when/emit event handlers ----
+#
+# Bringing this interpreter back in line with the compiled path (ir/
+# interpreter.rs's own Instr::CallHost "emit" arm): a `when EVENT do
+# ... end` block lowers to a real closure, registered at RUNTIME via
+# register_event_handler (called from wherever the `when` statement
+# itself executes, so it can see an enclosing `let` -- see lower.patlang).
+# Closures here are plain ["__closure__", func_name, captured_values]
+# lists, not something a host function could invoke -- so, exactly like
+# the native side, this has to live in the interpreter itself (see
+# run()'s CallHost dispatch), not in interp_call_host's plain host-fn
+# table. The registry is a global (__vars), not per-Interpreter-instance
+# state, since a `when` block registered inside one call frame must stay
+# registered for `emit` calls from anywhere else in the same run.
+
+make a function called interp_event_handlers_get takes name returns handlers
+  let all = get("__vars", "__interp_event_handlers")
+  if not all then
+    return []
+  end
+  let i = 0
+  while i < all.length do
+    if all[i][0] == name then
+      return all[i][1]
+    end
+    let i = i + 1
+  end
+  return []
+end
+
+make a function called interp_event_handler_add takes name, closure returns done
+  let all = get("__vars", "__interp_event_handlers")
+  if not all then
+    let all = []
+  end
+  let i = 0
+  let found = false
+  while i < all.length do
+    if all[i][0] == name then
+      let all = list_set(all, i, [name, list_push(all[i][1], closure)])
+      let found = true
+    end
+    let i = i + 1
+  end
+  if not found then
+    let all = list_push(all, [name, [closure]])
+  end
+  set_var("__interp_event_handlers", all)
+  return true
+end
+
+# emit(funcs, name, payload) -> ["Ok", last_handler_result] | ["Err", msg].
+# Calls each handler registered for `name`, in registration order, with
+# args = captured_values ++ [name, payload] -- matching lower_when's
+# auto-bound ["event_name", "event_data"] closure params exactly, same
+# as the native side's full_args construction.
+make a function called interp_emit takes funcs, name, payload returns result
+  let handlers = interp_event_handlers_get(name)
+  let last = 0
+  let i = 0
+  while i < handlers.length do
+    let closure = handlers[i]
+    let func_name = closure[1]
+    let captured_values = closure[2]
+    let all_args = captured_values
+    let all_args = list_push(all_args, name)
+    let all_args = list_push(all_args, payload)
+    let callee = find_func(funcs, func_name)
+    if callee == 0 then
+      return ["Err", "emit: handler function '" + func_name + "' not found"]
+    end
+    let call_result = interp_run_function(funcs, callee, all_args)
+    if call_result[0] == "Err" then
+      return call_result
+    end
+    let last = call_result[1]
+    let i = i + 1
+  end
+  return ["Ok", last]
+end
+
 make a function called interp_bin takes op, a, b returns v
   if op == "+" then return ["Ok", a + b] end
   if op == "-" then return ["Ok", a - b] end
@@ -515,14 +596,37 @@ class Interpreter {
           self.running = false
         elif op == "CallHost" then
           let popped = stack_pop_n(get(self, "stack"), instr[2])
-          let call_result = interp_call_host(instr[1], popped[0])
-          if call_result[0] == "Err" then
-            self.error_msg = call_result[1]
-            self.has_error = true
-            self.running = false
-          else
-            self.stack = list_push(popped[1], call_result[1])
+          # register_event_handler/emit need to invoke a CLOSURE (a `when`
+          # block's synthesized handler) -- an ordinary host fn can't do
+          # that (interp_call_host has no access to `funcs`, and closures
+          # here are plain PatLang lists, not something a host fn could
+          # call back into anyway). Mirrors ir/interpreter.rs's own
+          # Instr::CallHost dispatch exactly: these two names are special-
+          # cased in the INTERPRETER itself, not the plain host-fn table.
+          if instr[1] == "register_event_handler" then
+            interp_event_handler_add(popped[0][0], popped[0][1])
+            self.stack = list_push(popped[1], 0)
             self.pc = pc + 1
+          elif instr[1] == "emit" then
+            let emit_result = interp_emit(get(self, "funcs"), popped[0][0], popped[0][1])
+            if emit_result[0] == "Err" then
+              self.error_msg = emit_result[1]
+              self.has_error = true
+              self.running = false
+            else
+              self.stack = list_push(popped[1], emit_result[1])
+              self.pc = pc + 1
+            end
+          else
+            let call_result = interp_call_host(instr[1], popped[0])
+            if call_result[0] == "Err" then
+              self.error_msg = call_result[1]
+              self.has_error = true
+              self.running = false
+            else
+              self.stack = list_push(popped[1], call_result[1])
+              self.pc = pc + 1
+            end
           end
         elif op == "BuildList" then
           let popped = stack_pop_n(get(self, "stack"), instr[1])
@@ -808,6 +912,7 @@ make a function called dbg_fiber_entry takes bundle returns result
   set_var("__dbg_target_depth", 0)
   set_var("__dbg_call_stack", [])
   set_var("__dbg_stop_requested", false)
+  set_var("__interp_event_handlers", [])
   let main_func = find_func(funcs, entry)
   if main_func == 0 then
     return ["Err", "entry function '" + entry + "' not found"]
@@ -897,6 +1002,7 @@ end
 make a function called interpret_ir takes ir returns result
   let entry = ir[1]
   let funcs = ir[2]
+  set_var("__interp_event_handlers", [])
   let main_func = find_func(funcs, entry)
   if main_func == 0 then
     return ["Err", "entry function '" + entry + "' not found"]
