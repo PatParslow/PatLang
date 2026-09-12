@@ -1,0 +1,241 @@
+include "../lib/signal_discovery.patlang"
+include "../lib/queue.patlang"
+
+let args = argv()
+
+# ===================================================================
+# TOP-LEVEL SIGNAL HANDLERS & HELPER FUNCTIONS
+# ===================================================================
+when quit do
+  set_var("should_stop", "1")
+  signal_reply("bye")
+end
+
+# Simple HTML strip heuristic: removes script/style blocks & HTML tags
+make a function called strip_html takes html returns clean_text
+  let s = html
+  # Strip common script and style blocks
+  let s = regex_replace(s, "<script[\\s\\S]*?</script>", " ")
+  let s = regex_replace(s, "<style[\\s\\S]*?</style>", " ")
+  # Strip all remaining tags
+  let s = regex_replace(s, "<[^>]+>", " ")
+  # Normalize whitespace
+  let s = regex_replace(s, "\\s+", " ")
+  return str_trim(s)
+end
+
+# Extract domain or title for basic file naming
+make a function called sanitize_filename takes url returns filename
+  let clean = regex_replace(url, "https?://", "")
+  let clean = regex_replace(clean, "[^a-zA-Z0-9_]", "_")
+  return clean + ".html"
+end
+
+# ===================================================================
+# WORKER LOOPS (Driven by Queue Consumption)
+# ===================================================================
+make a function called run_crawler_loop takes port_id returns void
+  while get("__vars", "should_stop") == "0" do
+    let msg = queue_pop("urls_to_crawl")
+    if msg != "" then
+      log_line("[Crawler] Popped URL: " + msg)
+      
+      # Polite backoff between requests
+      sleep_ms(2000)
+      
+      let html = http_get(msg)
+      if html != "" then
+        # Package payload with metadata: "url|||html"
+        queue_push("raw_html", msg + "|||" + html)
+        log_line("[Crawler] Enqueued HTML for: " + msg)
+      else
+        log_line("[Crawler] Failed to fetch: " + msg)
+      end
+    else
+      signal_poll(port_id, 200)
+    end
+  end
+end
+
+make a function called run_parser_loop takes port_id returns void
+  while get("__vars", "should_stop") == "0" do
+    let msg = queue_pop("raw_html")
+    if msg != "" then
+      let parts = sd_split(msg, "|||")
+      let url = parts[0]
+      let raw_html = parts[1]
+      
+      log_line("[Parser] Cleaning HTML for: " + url)
+      let text = strip_html(raw_html)
+      
+      queue_push("clean_text", url + "|||" + text)
+      log_line("[Parser] Enqueued clean text for: " + url)
+    else
+      signal_poll(port_id, 200)
+    end
+  end
+end
+
+make a function called run_summariser_loop takes port_id returns void
+  while get("__vars", "should_stop") == "0" do
+    let msg = queue_pop("clean_text")
+    if msg != "" then
+      let parts = sd_split(msg, "|||")
+      let url = parts[0]
+      let body_text = parts[1]
+      
+      log_line("[Summariser] Sending text to Ollama for: " + url)
+      
+      # Truncate text if needed to avoid context limit issues
+      let snippet = str_substr(body_text, 0, 3000)
+      
+      let prompt_payload = json_encode([
+        ["model", "llama3"],
+        ["prompt", "Summarize the key points of this webpage content cleanly:\\n\\n" + snippet],
+        ["stream", false]
+      ])
+      
+      let response = http_post("http://localhost:11434/api/generate", prompt_payload)
+      let summary = json_get(response, "response")
+      
+      if summary != "" then
+        queue_push("summaries", url + "|||" + summary)
+        log_line("[Summariser] Enqueued summary for: " + url)
+      else
+        log_line("[Summariser] Ollama returned empty response. Re-queueing...")
+        queue_push("clean_text", msg) # Re-queue for crash/failure recovery
+      end
+    else
+      signal_poll(port_id, 200)
+    end
+  end
+end
+
+make a function called run_publisher_loop takes port_id returns void
+  while get("__vars", "should_stop") == "0" do
+    let msg = queue_pop("summaries")
+    if msg != "" then
+      let parts = sd_split(msg, "|||")
+      let url = parts[0]
+      let summary = parts[1]
+      
+      log_line("[Publisher] Generating output HTML for: " + url)
+      
+      let html_doc = "<html><head><title>Summary: " + url + "</title></head><body>"
+      let html_doc = html_doc + "<h1>Summary for " + url + "</h1>"
+      let html_doc = html_doc + "<p><em>Generated via PatLang Pipeline & Ollama</em></p><hr>"
+      let html_doc = html_doc + "<div>" + summary + "</div>"
+      let html_doc = html_doc + "</body></html>"
+      
+      let outfile = sanitize_filename(url)
+      file_write(outfile, html_doc)
+      log_line("[Publisher] Saved report to: " + outfile)
+    else
+      signal_poll(port_id, 200)
+    end
+  end
+end
+
+# Helper to check string inequality safely in PatLang
+make a function called is_not_equal takes a, b returns res
+  return not (a == b)
+end
+
+# Check if we were launched as a specific worker role
+let is_worker = false
+let role = ""
+
+if list_len(args) > 0 then
+  let arg0 = args[0]
+  if arg0 == "crawler" then
+    let is_worker = true
+    let role = "crawler"
+  else if arg0 == "parser" then
+    let is_worker = true
+    let role = "parser"
+  else if arg0 == "summariser" then
+    let is_worker = true
+    let role = "summariser"
+  else if arg0 == "publisher" then
+    let is_worker = true
+    let role = "publisher"
+  end
+end
+
+print("Well, I am here")
+# ===================================================================
+# ROLE DISPATCHER VS ORCHESTRATOR
+# ===================================================================
+if is_worker then
+  # -----------------------------------------------------------------
+  # WORKER BRANCH (Spawned instance)
+  # -----------------------------------------------------------------
+  let port_id = signal_claim(0)
+  set_var("should_stop", "0")
+
+  if port_id >= 0 then
+    if role == "crawler" then
+      run_crawler_loop(port_id)
+    else if role == "parser" then
+      run_parser_loop(port_id)
+    else if role == "summariser" then
+      run_summariser_loop(port_id)
+    else if role == "publisher" then
+      run_publisher_loop(port_id)
+    end
+  end
+
+else
+  # -----------------------------------------------------------------
+  # ORCHESTRATOR BRANCH (Primary execution)
+  # -----------------------------------------------------------------
+  log_line("=====================================================")
+  log_line(" PatLang Queue-Driven Web Summariser Pipeline")
+  log_line("=====================================================")
+
+  # Extract seed URL from CLI (default to example.org if none given)
+  let seed_url = "https://example.org"
+  if list_len(args) > 0 then
+    let seed_url = args[0]
+  end
+
+  log_line("Seed URL specified: " + seed_url)
+
+  # Push seed URL to durable queue
+  queue_push("urls_to_crawl", seed_url)
+  log_line("Pushed seed URL into durable queue 'urls_to_crawl'.")
+
+  # Spawn worker instances of self with explicit role arguments
+  make a function called spawn_role takes role_name returns pid
+    let p = spawn(pat_path(), "--ir-run", self_path(), role_name)
+    log_line("Spawned worker role '" + role_name + "' (PID " + p + ")")
+    return p
+  end
+
+  let p_crawler    = spawn_role("crawler")
+  let p_parser     = spawn_role("parser")
+  let p_summariser = spawn_role("summariser")
+  let p_publisher  = spawn_role("publisher")
+
+  log_line("Pipeline active. Waiting for completion...")
+
+  # Monitor loop
+  let check_count = 0
+  while check_count < 30 do
+    sleep_ms(1000)
+    let check_count = check_count + 1
+  end
+
+  log_line("Shutting down pipeline processes...")
+  signal_send_pid(p_crawler, "quit", "")
+  signal_send_pid(p_parser, "quit", "")
+  signal_send_pid(p_summariser, "quit", "")
+  signal_send_pid(p_publisher, "quit", "")
+
+  wait(p_crawler)
+  wait(p_parser)
+  wait(p_summariser)
+  wait(p_publisher)
+
+  log_line("Pipeline run complete.")
+end

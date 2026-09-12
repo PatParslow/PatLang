@@ -1,0 +1,108 @@
+# Rounding operations under the native x64 toolchain: ceil, round, trunc
+# and floor, across both signs and both int and float inputs.
+#
+# This exists because all three of the bugs below were SILENT -- wrong
+# answers or crashes with nothing reporting a problem anywhere:
+#
+#   * round/trunc were emitted as `call round` / `call trunc`, but
+#     msvcrt.dll exports ceil, floor and fabs and NEITHER round NOR
+#     trunc. Any program rounding a float failed to link under --x64.
+#     They are now synthesised (see x64_roundlike_asm):
+#       trunc(x) = x >= 0 ? floor(x) : ceil(x)
+#       round(x) = x >= 0 ? floor(x + 0.5) : ceil(x - 0.5)
+#     which give C's round-half-AWAY-from-zero. SSE roundsd would be the
+#     obvious instruction but rounds half-to-EVEN, and would disagree on
+#     exactly the round(-2.5) case below -- hence testing both signs of
+#     a .5 value specifically, not just one.
+#   * `floor` had no codegen case at all and returned its argument's raw
+#     float64 BITS (floor(2.4) gave 4612586738352862003).
+#   * an unsupported condition code assembled as `je` rather than being
+#     rejected, so a wrong branch was taken and the binary segfaulted.
+#
+# All cases (including floor(), formerly a known gap under GitHub #83 --
+# see below) are now in the single "core" bucket: every one must pass,
+# a regression here is a real failure.
+let ok_core = true
+
+# ---- ceil ----
+if ceil(2.4) != 3 then
+  print("FAIL (core): ceil(2.4)")
+  let ok_core = false
+end
+if ceil(0 - 2.4) != -2 then
+  print("FAIL (core): ceil(-2.4)")
+  let ok_core = false
+end
+
+# ---- trunc: toward zero, so the two signs go opposite ways ----
+if trunc(2.7) != 2 then
+  print("FAIL (core): trunc(2.7)")
+  let ok_core = false
+end
+if trunc(0 - 2.7) != -2 then
+  print("FAIL (core): trunc(-2.7)")
+  let ok_core = false
+end
+if trunc(0 - 0.5) != 0 then
+  print("FAIL (core): trunc(-0.5)")
+  let ok_core = false
+end
+
+# ---- round: half AWAY from zero, the case SSE roundsd would get wrong ----
+if round(2.5) != 3 then
+  print("FAIL (core): round(2.5)")
+  let ok_core = false
+end
+if round(0 - 2.5) != -3 then
+  print("FAIL (core): round(-2.5) -- half-to-even would give -2 here")
+  let ok_core = false
+end
+if round(2.4) != 2 then
+  print("FAIL (core): round(2.4)")
+  let ok_core = false
+end
+
+# ---- integer inputs stay integers ----
+# Each of these is the identity on an int, and must come back int-typed
+# rather than being round-tripped through a float.
+if round(7) != 7 then
+  print("FAIL (core): round(7)")
+  let ok_core = false
+end
+if trunc(7) != 7 then
+  print("FAIL (core): trunc(7)")
+  let ok_core = false
+end
+if ceil(7) != 7 then
+  print("FAIL (core): ceil(7)")
+  let ok_core = false
+end
+if floor(7) != 7 then
+  print("FAIL (core): floor(7)")
+  let ok_core = false
+end
+
+# ---- floor() on a FLOAT (GitHub #83, fixed) ----
+# x64_runtime.patlang defined a PatLang function named `floor` which
+# handled Rational and returned everything else UNCHANGED. patc1 prepends
+# the runtime's source before lowering on the --x64 path, so floor()
+# resolved to that function and never reached codegen's dispatch --
+# floor(2.4) came back as 2.4's raw float64 bits. Fixed via
+# x64_floor_via_ceil_asm (floor(x) = -ceil(-x), sidestepping the
+# floor/ceil symbol-shadowing collision entirely) -- moved from the
+# known-gap bucket into core now that it's confirmed fixed and verified.
+if floor(2.4) != 2 then
+  print("FAIL (core): floor(2.4)")
+  let ok_core = false
+end
+if floor(0 - 2.4) != -3 then
+  print("FAIL (core): floor(-2.4)")
+  let ok_core = false
+end
+
+if ok_core then
+  print("ALL CORE PASS")
+  os_exit(0)
+else
+  os_exit(1)
+end

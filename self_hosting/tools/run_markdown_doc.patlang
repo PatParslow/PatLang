@@ -1,0 +1,218 @@
+# Executable-markdown doc runner.
+#
+# Scans a .md file for fenced ```patlang code blocks, runs each one against
+# the self-hosted compiler pipeline while carrying state across blocks
+# (same "replay the whole accumulated session buffer" model as
+# self_hosting/lib/repl_core.patlang -- see that file's header for why
+# there's no persistent-interpreter-process option), and injects the
+# result back into the document as ```stdout / ```stderr blocks placed
+# immediately after each ```patlang block. A ```stdin block, if present
+# immediately after the ```patlang block (before any stdout/stderr), is
+# fed to that block's stdin. Re-running an already-executed doc overwrites
+# its stale stdout/stderr blocks in place rather than duplicating them, so
+# the doc is idempotent to re-run -- like a notebook, not an append log.
+#
+# Each block runs in a fresh child process (`pat.exe --ir-run <tmpfile>`,
+# via the exec_capture_io host fn) rather than in-process: run_ir() prints
+# straight to this process's own real stdout, with no in-process capture
+# primitive, so a subprocess per block is the only way to grab a block's
+# stdout/stderr separately. The state-carrying session buffer is spliced
+# into every child's source, so state persists even though the process
+# doesn't.
+#
+# Run:
+#   rust-runtime/target/release/pat.exe --ir-run self_hosting/tools/run_markdown_doc.patlang <doc.md>
+
+include "../lib/includes.patlang"
+
+# NOTE: deliberately not a top-level `let` -- a module-level `let` above the
+# function definitions is not visible inside them (confirmed directly: a
+# function body referencing such a global fails SILENTLY, no error, no
+# output, script just stops -- the same class of gotcha CLAUDE.md's control-
+# flow section warns about for nested else-if). Each function that needs the
+# compiler path re-declares it locally instead.
+make a function called mdrun_pat_exe returns path
+  return "rust-runtime/target/release/pat.exe"
+end
+
+# ---- fence scanning: doc -> ordered list of blocks -------------------------
+# Each block is ["text", raw_lines_joined] or ["fence", lang, content_lines_joined].
+
+make a function called md_scan_blocks takes text returns blocks
+  let lines = split_lines(text)
+  let blocks = []
+  let n = lines.length
+  let i = 0
+  let text_buf = ""
+  while i < n do
+    let line = lines[i]
+    if str_starts_with(str_trim(line), "```") then
+      if text_buf != "" then
+        let blocks = list_push(blocks, ["text", text_buf])
+        let text_buf = ""
+      end
+      let lang = str_trim(substr(str_trim(line), 3, str_trim(line).length - 3))
+      let fence_buf = ""
+      let i = i + 1
+      let closed = false
+      while (i < n) and (closed == false) do
+        let fl = lines[i]
+        if str_starts_with(str_trim(fl), "```") then
+          let closed = true
+        else
+          let fence_buf = fence_buf + fl + chr(10)
+          let i = i + 1
+        end
+      end
+      let blocks = list_push(blocks, ["fence", lang, fence_buf])
+      let i = i + 1
+    else
+      let text_buf = text_buf + line + chr(10)
+      let i = i + 1
+    end
+  end
+  if text_buf != "" then
+    let blocks = list_push(blocks, ["text", text_buf])
+  end
+  return blocks
+end
+
+# ---- execution: run one candidate program, capturing stdout/stderr --------
+
+make a function called mdrun_exec takes source, stdin_text returns result
+  let tmp_path = "temp/mdrun_block.patlang"
+  write_file(tmp_path, source)
+  let out = exec_capture_io(mdrun_pat_exe(), ["--ir-run", tmp_path], stdin_text)
+  let stdout_raw = out[0]
+  let stderr_raw = out[1]
+  let succeeded = out[2]
+  # `--ir-run` unconditionally auto-prints the program's own final value,
+  # but ONLY on a successful run (main.rs: `Ok(v) => println!("{}",
+  # display_value(&v))`; the Err branch exits before ever reaching that
+  # println) -- for a candidate whose last statement is a print(...)/
+  # statement expression, that value is Unit, which displays as "", so a
+  # successful run has exactly one guaranteed trailing blank line that
+  # has nothing to do with the block's own output. Strip it here, once,
+  # but ONLY when the run actually succeeded -- confirmed directly that
+  # stripping unconditionally eats a real trailing newline from a block
+  # that crashed mid-way (no baseline blank line was ever added there).
+  if succeeded then
+    if str_ends_with(stdout_raw, chr(10)) then
+      let stdout_raw = substr(stdout_raw, 0, stdout_raw.length - 1)
+    end
+  end
+  return [stdout_raw, stderr_raw]
+end
+
+# ---- the rewrite pass -------------------------------------------------------
+# blocks: output of md_scan_blocks. Returns the rewritten document text.
+
+make a function called mdrun_process takes blocks returns out_text
+  let n = blocks.length
+  let session_buffer_sb = sb_new()
+  let session_stdin_sb = sb_new()
+  # prev_stdout/prev_stderr: each block's replayed candidate re-executes
+  # every earlier block's statements too (no persistent interpreter
+  # process -- see the file header). That means any earlier read_line()
+  # call replays and needs its original stdin fed again (hence
+  # session_stdin_sb, accumulated the same way as session_buffer_sb), and
+  # earlier print() calls replay and need stripping back out of this
+  # block's captured output so the injected ```stdout/```stderr show only
+  # what's NEW from this block, not the whole session's history.
+  let prev_stdout = ""
+  let prev_stderr = ""
+  let out = sb_new()
+  let i = 0
+  while i < n do
+    let block = blocks[i]
+    if block[0] == "text" then
+      sb_push(out, block[1])
+      let i = i + 1
+    elif block[1] == "patlang" then
+      let code = block[2]
+      # re-emit the patlang block unchanged
+      sb_push(out, "```patlang" + chr(10))
+      sb_push(out, code)
+      sb_push(out, "```" + chr(10))
+      let i = i + 1
+      # look ahead: an optional ```stdin block, then skip any stale
+      # ```stdout / ```stderr blocks from a previous run of this doc.
+      let stdin_text = ""
+      if (i < n) and (blocks[i][0] == "fence") and (blocks[i][1] == "stdin") then
+        let stdin_text = blocks[i][2]
+        sb_push(out, "```stdin" + chr(10))
+        sb_push(out, stdin_text)
+        sb_push(out, "```" + chr(10))
+        let i = i + 1
+      end
+      while (i < n) and (blocks[i][0] == "fence") and ((blocks[i][1] == "stdout") or (blocks[i][1] == "stderr")) do
+        let i = i + 1
+      end
+      let candidate = sb_str(session_buffer_sb) + code
+      let candidate_stdin = sb_str(session_stdin_sb) + stdin_text
+      let captured = mdrun_exec(candidate, candidate_stdin)
+      let full_stdout = captured[0]
+      let full_stderr = captured[1]
+      sb_push(session_buffer_sb, code)
+      sb_push(session_stdin_sb, stdin_text)
+      let stdout_text = full_stdout
+      if str_starts_with(full_stdout, prev_stdout) then
+        let stdout_text = substr(full_stdout, prev_stdout.length, full_stdout.length - prev_stdout.length)
+      end
+      let stderr_text = full_stderr
+      if str_starts_with(full_stderr, prev_stderr) then
+        let stderr_text = substr(full_stderr, prev_stderr.length, full_stderr.length - prev_stderr.length)
+      end
+      let prev_stdout = full_stdout
+      let prev_stderr = full_stderr
+      if stdout_text != "" then
+        sb_push(out, "```stdout" + chr(10))
+        sb_push(out, stdout_text)
+        if str_ends_with(stdout_text, chr(10)) == false then
+          sb_push(out, chr(10))
+        end
+        sb_push(out, "```" + chr(10))
+      end
+      if stderr_text != "" then
+        sb_push(out, "```stderr" + chr(10))
+        sb_push(out, stderr_text)
+        if str_ends_with(stderr_text, chr(10)) == false then
+          sb_push(out, chr(10))
+        end
+        sb_push(out, "```" + chr(10))
+      end
+    else
+      # a stray stdin/stdout/stderr block with no preceding patlang block
+      # (or any other fenced language) -- pass through unchanged.
+      sb_push(out, "```" + block[1] + chr(10))
+      sb_push(out, block[2])
+      sb_push(out, "```" + chr(10))
+      let i = i + 1
+    end
+  end
+  return sb_str(out)
+end
+
+make a function called str_ends_with takes s, suffix returns matches
+  if suffix.length > s.length then
+    return false
+  end
+  return substr(s, s.length - suffix.length, suffix.length) == suffix
+end
+
+make a function called mdrun_main returns done
+  let args = argv()
+  if args.length < 1 then
+    print("usage: pat --ir-run self_hosting/tools/run_markdown_doc.patlang <doc.md>")
+    return false
+  end
+  let path = args[0]
+  let text = read_file(path)
+  let blocks = md_scan_blocks(text)
+  let rewritten = mdrun_process(blocks)
+  write_file(path, rewritten)
+  print("executed " + path)
+  return true
+end
+
+mdrun_main()
