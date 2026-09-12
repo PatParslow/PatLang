@@ -341,6 +341,7 @@ pub fn as_index(v: &Value) -> Result<usize, String> {
 fn as_int(v: &Value, ctx: &str) -> Result<i64, String> {
     match v {
         Value::Int(n) => Ok(*n),
+        Value::Float(n) => Ok(*n as i64),
         Value::BigInt(b) => {
             let bytes = b.to_signed_bytes_le();
             let mut buf = [0u8; 8];

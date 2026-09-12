@@ -1720,7 +1720,7 @@ fn div(a:&Value,b:&Value)->Result<Value,String>{ Ok(Value::Number(a.as_number()?
 fn modu(a:&Value,b:&Value)->Result<Value,String>{ Ok(Value::Number(a.as_number()? % b.as_number()?)) }
 fn neg(a:&Value)->Result<Value,String>{ Ok(Value::Number(-a.as_number()?)) }
 fn as_bits(v:&Value)->Result<i64,String>{
-    match v { Value::Int(n) => Ok(*n), Value::Number(n) => Ok(*n as i64), _ => Err("expected an integer".into()) }
+    match v { Value::Int(n) => Ok(*n), Value::Number(n) => Ok(*n as i64), Value::Float(n) => Ok(*n as i64), _ => Err("expected an integer".into()) }
 }
 fn bitand(a:&Value,b:&Value)->Result<Value,String>{ Ok(Value::Int(as_bits(a)? & as_bits(b)?)) }
 fn bitor(a:&Value,b:&Value)->Result<Value,String>{ Ok(Value::Int(as_bits(a)? | as_bits(b)?)) }
@@ -2395,6 +2395,7 @@ fn as_bits(v:&Value)->Result<i64,String>{
     match v {
         Value::Int(n) => Ok(*n),
         Value::Number(n) => Ok(*n as i64),
+        Value::Float(n) => Ok(*n as i64),
         Value::BigInt(b) => {
             let s = b.to_string();
             let (neg, digits) = match s.strip_prefix('-') { Some(rest) => (true, rest), None => (false, s.as_str()) };
