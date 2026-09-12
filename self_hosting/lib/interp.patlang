@@ -443,6 +443,8 @@ class Interpreter {
   field error_msg = ""
   field has_error = false
   field running = true
+  field fname = "main"
+  field lines = []
 
   make a function called run takes self returns result
     while get(self, "running") do
@@ -451,6 +453,12 @@ class Interpreter {
       if pc >= instrs.length then
         self.running = false
       else
+        # Debugger hook: a no-op (a single lookup that finds nothing) unless
+        # dbg_start has actually put breakpoints/step-mode into the global
+        # debug state, so ordinary (non-debug) interpretation pays only that
+        # one cheap lookup per instruction. See dbg_check_pause's own
+        # comment for the full pause/resume story via fiber_yield.
+        dbg_check_pause(self, get(self, "fname"), get(self, "lines"), pc)
         let instr = instrs[pc]
         let op = instr[0]
         if op == "Const" then
@@ -528,7 +536,9 @@ class Interpreter {
             self.has_error = true
             self.running = false
           else
+            dbg_call_stack_push(instr[1])
             let call_result = interp_run_function(get(self, "funcs"), callee, popped[0])
+            dbg_call_stack_pop()
             if call_result[0] == "Err" then
               self.error_msg = call_result[1]
               self.has_error = true
@@ -561,7 +571,9 @@ class Interpreter {
             self.has_error = true
             self.running = false
           else
+            dbg_call_stack_push(func_name)
             let call_result = interp_run_function(get(self, "funcs"), callee, all_args)
+            dbg_call_stack_pop()
             if call_result[0] == "Err" then
               self.error_msg = call_result[1]
               self.has_error = true
@@ -614,7 +626,266 @@ make a function called interp_run_function takes funcs, func, arg_values returns
   interp.funcs = funcs
   interp.instrs = instrs
   interp.locals = locals
+  interp.fname = func[1]
+  # func[4] (the debug line table) is absent on IR loaded from a .ir file
+  # saved before this field existed -- fall back to an empty table rather
+  # than an out-of-bounds index, so old .ir files still interpret fine
+  # (just without breakpoint/step support on those specific functions).
+  if func.length > 4 then
+    interp.lines = func[4]
+  end
   return send(interp, "run")
+end
+
+# ---- Debugger: breakpoints, stepping, call-stack, via fiber pause/resume ----
+#
+# A whole debugged run is ONE fiber (dbg_start below), resumed repeatedly
+# with a debug command. Each resume returns either a ["Paused", fname,
+# line, locals, call_stack] snapshot (dbg_check_pause below yielded one
+# instruction before it would have run) or the interpreter's own natural
+# ["Ok", value] / ["Err", message] once the program actually finishes --
+# no separate "Done" wrapper needed, since fiber_resume's final return is
+# exactly the fiber body's own return value, and only a pause is ever
+# tagged "Paused".
+#
+# All debug state (mode, breakpoints, the shadow call stack) lives in the
+# __vars global table, NOT on any one Interpreter instance -- a paused
+# program is typically many nested Interpreter objects deep (one per live
+# PatLang call frame, since Call/CallValue recurse via ordinary PatLang
+# calls, not an explicit frame stack), and the debugger needs to see
+# across all of them at once from a single place.
+#
+# Modes: "run" (stop only at a breakpoint), "into" (stop at the very next
+# line-tagged pc, any call depth), "over"/"out" (stop once the call-stack
+# depth drops to/below a target depth recorded when the step command was
+# issued).
+
+make a function called dbg_lines_lookup takes lines, pc returns line
+  let i = 0
+  while i < lines.length do
+    if lines[i][0] == pc then
+      return lines[i][1]
+    end
+    let i = i + 1
+  end
+  return 0
+end
+
+make a function called dbg_breakpoint_hit takes fname, line returns hit
+  let bps = get("__vars", "__dbg_breakpoints")
+  if not bps then
+    return false
+  end
+  let i = 0
+  while i < bps.length do
+    if (bps[i][0] == fname) and (bps[i][1] == line) then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called dbg_call_stack_snapshot returns cs
+  let cs = get("__vars", "__dbg_call_stack")
+  if not cs then
+    return []
+  end
+  return cs
+end
+
+make a function called dbg_call_stack_depth returns n
+  return dbg_call_stack_snapshot().length
+end
+
+# No list_slice/pop-last host builtin exists -- rebuild everything but the
+# last element instead.
+make a function called dbg_list_drop_last takes lst returns out
+  let out = []
+  let i = 0
+  while i < (lst.length - 1) do
+    let out = list_push(out, lst[i])
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called dbg_call_stack_push takes fname returns done
+  set_var("__dbg_call_stack", list_push(dbg_call_stack_snapshot(), fname))
+  return true
+end
+
+make a function called dbg_call_stack_pop returns done
+  let cs = dbg_call_stack_snapshot()
+  if cs.length > 0 then
+    set_var("__dbg_call_stack", dbg_list_drop_last(cs))
+  end
+  return true
+end
+
+# cmd is [kind, breakpoints_or_false]: kind is one of "continue"/
+# "step_into"/"step_over"/"step_out"/"stop"; breakpoints, when not false,
+# REPLACES the current breakpoint set (a real IDE debugger conveniently
+# just re-sends its whole current breakpoint list on every resume, rather
+# than needing a separate "just update breakpoints, don't resume" command
+# that this fiber-parked design has no clean way to express anyway).
+make a function called dbg_apply_command takes cmd returns done
+  let kind = cmd[0]
+  let bps = cmd[1]
+  if bps then
+    set_var("__dbg_breakpoints", bps)
+  end
+  if kind == "continue" then
+    set_var("__dbg_mode", "run")
+  elif kind == "step_into" then
+    set_var("__dbg_mode", "into")
+  elif kind == "step_over" then
+    set_var("__dbg_mode", "over")
+    set_var("__dbg_target_depth", dbg_call_stack_depth())
+  elif kind == "step_out" then
+    set_var("__dbg_mode", "out")
+    set_var("__dbg_target_depth", dbg_call_stack_depth() - 1)
+  elif kind == "stop" then
+    set_var("__dbg_stop_requested", true)
+  end
+  return true
+end
+
+# Called once per instruction from Interpreter.run(), BEFORE the
+# instruction at pc executes -- a single lookup that finds nothing for
+# most pcs (this table is sparse, one entry per statement), so ordinary
+# non-debug interpretation pays almost nothing extra. Only pauses (via
+# fiber_yield) at a statement boundary that's a breakpoint or satisfies
+# the current step mode.
+make a function called dbg_check_pause takes self, fname, lines, pc returns done
+  if get("__vars", "__dbg_stop_requested") then
+    self.error_msg = "stopped by debugger"
+    self.has_error = true
+    self.running = false
+    return true
+  end
+  let line = dbg_lines_lookup(lines, pc)
+  if line == 0 then
+    return true
+  end
+  let mode = get("__vars", "__dbg_mode")
+  if not mode then
+    let mode = "run"
+  end
+  let should_pause = dbg_breakpoint_hit(fname, line)
+  if mode == "into" then
+    let should_pause = true
+  end
+  if (mode == "over") or (mode == "out") then
+    if dbg_call_stack_depth() <= get("__vars", "__dbg_target_depth") then
+      let should_pause = true
+    end
+  end
+  if should_pause then
+    let cmd = fiber_yield(["Paused", fname, line, get(self, "locals"), dbg_call_stack_snapshot()])
+    dbg_apply_command(cmd)
+    if get("__vars", "__dbg_stop_requested") then
+      self.error_msg = "stopped by debugger"
+      self.has_error = true
+      self.running = false
+    end
+  end
+  return true
+end
+
+# The one fiber-body function: fiber_new calls whatever named function
+# with exactly the first fiber_resume's argument, so `bundle` is
+# [entry_name, funcs] (lower_program's ProgramIR, indices 1 and 2) --
+# dbg_start below sends that as its very first resume. Resets the debug
+# globals fresh here (rather than trusting leftover state from an earlier
+# session) and starts in "into" mode so the very first statement already
+# pauses, matching what a debugger's initial "run to first line" normally
+# does.
+make a function called dbg_fiber_entry takes bundle returns result
+  let entry = bundle[0]
+  let funcs = bundle[1]
+  set_var("__dbg_mode", "into")
+  set_var("__dbg_target_depth", 0)
+  set_var("__dbg_call_stack", [])
+  set_var("__dbg_stop_requested", false)
+  let main_func = find_func(funcs, entry)
+  if main_func == 0 then
+    return ["Err", "entry function '" + entry + "' not found"]
+  end
+  return interp_run_function(funcs, main_func, [])
+end
+
+# dbg_start(source) -> ["Ok", fiber_id, first_state]. Compiles `source`
+# through the ordinary tokenize/parse_program/lower_program pipeline,
+# spawns it as a fiber running dbg_fiber_entry, and performs the FIRST
+# fiber_resume (delivering [entry, funcs] as that function's one
+# argument) -- since dbg_fiber_entry starts in "into" mode, this first
+# resume already returns the initial ["Paused", ...] snapshot at the
+# program's first statement (or an immediate ["Ok"/"Err", ...] for a
+# program with no debuggable top-level statement at all, e.g. an empty
+# source file).
+make a function called dbg_start takes source returns result
+  let toks = tokenize(source)
+  let ast = parse_program(toks)
+  let ir = lower_program(ast)
+  let fid = fiber_new("dbg_fiber_entry")
+  let first = fiber_resume(fid, [ir[1], ir[2]])
+  return ["Ok", fid, first]
+end
+
+# dbg_step(fiber_id, cmd) -> the next ["Paused", ...] or ["Ok"/"Err", ...]
+# state. See dbg_apply_command for cmd's shape.
+make a function called dbg_step takes fiber_id, cmd returns result
+  return fiber_resume(fiber_id, cmd)
+end
+
+# dbg_trace(source, breakpoints, max_steps) -> ["Ok"/"Err", trace, final].
+# A REPLAY debugger's capture pass: runs the whole program to completion in
+# ONE call, single-stepping "into" every statement so `trace` captures the
+# COMPLETE ["Paused", fname, line, locals, call_stack] sequence, not just
+# breakpoint stops -- the browser UI needs the full sequence to scrub
+# forward/back through afterwards. `breakpoints` is still threaded through
+# to dbg_step/dbg_apply_command so it lands in the debug state (available
+# to a caller that wants dbg_breakpoint_hit-style marking of which trace
+# entries are breakpoints, e.g. to highlight them in the scrub UI) -- it
+# does not change what gets captured here.
+#
+# Exists because the browser IDE calls into a WASM module through a
+# stateless, one-shot convention (this site's runWasm/runWasmThreaded: one
+# call, one _start(), the instance is then discarded) -- there is no
+# persistent-instance calling convention here, and no blocking-stdin
+# bridge either, so a genuinely interactive "click Step, resume the SAME
+# paused fiber" design has no supported browser transport on this site.
+# Capturing one real, complete execution trace and letting the UI scrub
+# forward/back through it client-side (already-captured, real data, not
+# synthesized) is the design that actually fits: the exact same shape
+# patlang-robots.html's "replays the exact step-by-step transcript from a
+# genuine run" already uses and documents to users.
+#
+# max_steps is a hard safety cap (an infinite/runaway loop in the user's
+# own program must not hang the capture pass forever); hitting it ends the
+# trace early with an ["Err", "..."] final rather than never returning.
+make a function called dbg_trace takes source, breakpoints, max_steps returns result
+  let started = dbg_start(source)
+  let fid = started[1]
+  let state = started[2]
+  let trace = []
+  let n = 0
+  let looping = true
+  while looping do
+    if state[0] != "Paused" then
+      let looping = false
+    else
+      let trace = list_push(trace, state)
+      let n = n + 1
+      if n >= max_steps then
+        let looping = false
+        return ["Err", trace, ["Err", "dbg_trace: stopped after " + max_steps + " steps (possible infinite loop)"]]
+      end
+      let state = dbg_step(fid, ["step_into", breakpoints])
+    end
+  end
+  return ["Ok", trace, state]
 end
 
 # interpret_ir(ir) -> ["Ok", value] | ["Err", message]. Runs `ir`'s "main"
@@ -631,4 +902,86 @@ make a function called interpret_ir takes ir returns result
     return ["Err", "entry function '" + entry + "' not found"]
   end
   return interp_run_function(funcs, main_func, [])
+end
+
+# ---- Debug trace JSON serialization (for the browser IDE) ----
+#
+# Needs json_quote/json_escape from lib/json.patlang -- any bundle that
+# includes this section must also include lib/json.patlang (build_patc1's
+# own bundle already does, for its own unrelated reasons; a standalone
+# IDE-debug WASM bundle needs to add it explicitly).
+
+make a function called dbg_value_to_json takes v returns json
+  let ty = type_of(v)
+  if ty == "string" then
+    return json_quote(v)
+  end
+  if ty == "list" then
+    let out = "["
+    let i = 0
+    while i < v.length do
+      if i > 0 then
+        let out = out + ","
+      end
+      let out = out + dbg_value_to_json(v[i])
+      let i = i + 1
+    end
+    return out + "]"
+  end
+  if (ty == "int") or (ty == "float") or (ty == "bigint") or (ty == "bool") then
+    return "" + v
+  end
+  # rational/complex/closure/object/unit: no direct JSON representation --
+  # fall back to the same display string print(v) would show, as a JSON
+  # string rather than a bare (possibly non-JSON) token.
+  return json_quote("" + v)
+end
+
+# One ["Paused", fname, line, locals, call_stack] entry -> a JSON object
+# string. locals is encoded as a JSON object (name -> value), not an
+# array of pairs, so the IDE's variables panel can index straight by name.
+make a function called dbg_paused_to_json takes ev returns json
+  let fname = ev[1]
+  let line = ev[2]
+  let locals = ev[3]
+  let call_stack = ev[4]
+  let locals_json = "{"
+  let i = 0
+  while i < locals.length do
+    if i > 0 then
+      let locals_json = locals_json + ","
+    end
+    let locals_json = locals_json + json_quote(locals[i][0]) + ":" + dbg_value_to_json(locals[i][1])
+    let i = i + 1
+  end
+  let locals_json = locals_json + "}"
+  return "{\"fname\":" + json_quote(fname) + ",\"line\":" + line + ",\"locals\":" + locals_json + ",\"call_stack\":" + dbg_value_to_json(call_stack) + "}"
+end
+
+# dbg_trace_json(source, max_steps) -> a JSON string:
+# {"ok":true,"trace":[...],"final_ok":true,"final_value":<json>} or
+# {"ok":false,"trace":[...],"error":"..."} -- the browser IDE's actual
+# entry point (see dbg_trace's own comment for why this is a captured
+# replay, not a live click-driven session). Breakpoints are always empty
+# here: this bundle always captures the FULL trace regardless, and lets
+# the page-side UI decide which captured steps to treat as "breakpoint
+# stops" when scrubbing through it.
+make a function called dbg_trace_json takes source, max_steps returns json
+  let r = dbg_trace(source, false, max_steps)
+  let trace = r[1]
+  let final = r[2]
+  let trace_json = "["
+  let i = 0
+  while i < trace.length do
+    if i > 0 then
+      let trace_json = trace_json + ","
+    end
+    let trace_json = trace_json + dbg_paused_to_json(trace[i])
+    let i = i + 1
+  end
+  let trace_json = trace_json + "]"
+  if r[0] == "Ok" then
+    return "{\"ok\":true,\"trace\":" + trace_json + ",\"final_ok\":" + (final[0] == "Ok") + ",\"final_value\":" + dbg_value_to_json(final[1]) + "}"
+  end
+  return "{\"ok\":false,\"trace\":" + trace_json + ",\"error\":" + json_quote(final[1]) + "}"
 end

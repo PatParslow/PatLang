@@ -560,138 +560,128 @@ make a function called parse_unary takes toks, pos returns r
   end
 end
 
-make a function called parse_mul takes toks, pos returns r
+# GitHub #28: the binary-operator precedence chain used to be seven
+# hand-cascaded functions (parse_mul -&gt; parse_shift -&gt; parse_add -&gt;
+# parse_bitwise -&gt; parse_cmp -&gt; parse_and -&gt; parse_expr's own `or`
+# tier), each re-implementing its OWN copy of &quot;peek for a continuation
+# operator, optionally past a newline, recurse.&quot; Every one of those
+# seven copies was a separate place to forget the fix, which is
+# exactly what happened (`let x =\n &quot;a&quot;` and several tiers were still
+# missing it even after `+`/`-`/`*`/`/`/`%` had already been patched).
+# Replaced with ONE table-driven precedence-climbing (Pratt) loop,
+# `parse_binary`, so there is only one place left where &quot;does this
+# expression continue&quot; is decided at all -- matching the native Rust
+# frontend's own architecture (a single unified `parse_expression`,
+# not a cascade), not just its behavior.
+#
+# binop_info(t) -&gt; [&quot;&quot;, 0, false] if t isn't a binary operator at all,
+# else [canonical_op_name, precedence (1=loosest .. 7=tightest),
+# continues_across_a_newline]. Precedence numbers match the OLD
+# cascade's own nesting exactly (parse_expr=or=1 was outermost/
+# loosest, parse_mul=7 was innermost/tightest) so existing precedence
+# stays identical; only the MECHANISM collapsed to one function.
+# `continues_across_a_newline` mirrors the native frontend's own
+# whitelist (parser.rs's parse_expression) exactly: every arithmetic/
+# comparison/bitwise/shift operator continues across a newline: `and`/
+# `or` deliberately do NOT (matching that this is a real, general
+# design DECISION already made by the reference implementation, not
+# an oversight to &quot;complete&quot; -- `let ok = a\nand b` stays two separate
+# things, same as it always has been in both frontends).
+make a function called binop_info takes t returns info
+  if t[0] == &quot;OP&quot; then
+    if t[1] == &quot;*&quot; then
+      return [&quot;*&quot;, 7, true]
+    end
+    if t[1] == &quot;/&quot; then
+      return [&quot;/&quot;, 7, true]
+    end
+    if t[1] == &quot;%&quot; then
+      return [&quot;%&quot;, 7, true]
+    end
+    if t[1] == &quot;+&quot; then
+      return [&quot;+&quot;, 5, true]
+    end
+    if t[1] == &quot;-&quot; then
+      return [&quot;-&quot;, 5, true]
+    end
+    if t[1] == &quot;==&quot; then
+      return [&quot;==&quot;, 3, true]
+    end
+    if t[1] == &quot;!=&quot; then
+      return [&quot;!=&quot;, 3, true]
+    end
+    if t[1] == &quot;&lt;&quot; then
+      return [&quot;&lt;&quot;, 3, true]
+    end
+    if t[1] == &quot;&lt;=&quot; then
+      return [&quot;&lt;=&quot;, 3, true]
+    end
+    if t[1] == &quot;&gt;&quot; then
+      return [&quot;&gt;&quot;, 3, true]
+    end
+    if t[1] == &quot;&gt;=&quot; then
+      return [&quot;&gt;=&quot;, 3, true]
+    end
+    return [&quot;&quot;, 0, false]
+  else
+    if t[0] == &quot;IDENT&quot; then
+      if t[1] == &quot;shl&quot; then
+        return [&quot;shl&quot;, 6, true]
+      end
+      if t[1] == &quot;shr&quot; then
+        return [&quot;shr&quot;, 6, true]
+      end
+      if t[1] == &quot;band&quot; then
+        return [&quot;band&quot;, 4, true]
+      end
+      if t[1] == &quot;bxor&quot; then
+        return [&quot;bxor&quot;, 4, true]
+      end
+      if t[1] == &quot;bor&quot; then
+        return [&quot;bor&quot;, 4, true]
+      end
+      if t[1] == &quot;and&quot; then
+        return [&quot;and&quot;, 2, false]
+      end
+      if t[1] == &quot;or&quot; then
+        return [&quot;or&quot;, 1, false]
+      end
+      return [&quot;&quot;, 0, false]
+    else
+      return [&quot;&quot;, 0, false]
+    end
+  end
+end
+
+make a function called parse_binary takes toks, pos, min_prec returns r
   let r1 = parse_unary(toks, pos)
   let node = r1[0]
   let p = r1[1]
   let looping = true
   while looping do
-    # Peek past any newlines for a continuation operator (mirrors the
-    # native Rust frontend, and parse_args's own newline tolerance below)
-    # -- without this, a leading `*`/`/`/`%` on the next line is invisible
-    # here because the token right after `p` is an NL, not an OP, and the
-    # expression silently truncates instead of continuing.
-    let p2 = skip_nl(toks, p)
-    let t = vec_get(toks, p2)
-    if (t[0] == &quot;OP&quot;) and ((t[1] == &quot;*&quot;) or (t[1] == &quot;/&quot;) or (t[1] == &quot;%&quot;)) then
-      let r2 = parse_unary(toks, p2 + 1)
-      let node = [&quot;Bin&quot;, t[1], node, r2[0]]
-      let p = r2[1]
-    else
-      let looping = false
-    end
-  end
-  return [node, p]
-end
-
-make a function called parse_shift takes toks, pos returns r
-  # shl/shr: bind tighter than +/- but looser than */%,  matching the
-  # native Rust frontend's precedence table (parser.rs).
-  let r1 = parse_mul(toks, pos)
-  let node = r1[0]
-  let p = r1[1]
-  let looping = true
-  while looping do
-    let t = vec_get(toks, p)
-    if tok_is(t, &quot;IDENT&quot;, &quot;shl&quot;) then
-      let r2 = parse_mul(toks, p + 1)
-      let node = [&quot;Bin&quot;, &quot;shl&quot;, node, r2[0]]
-      let p = r2[1]
-    else
-      if tok_is(t, &quot;IDENT&quot;, &quot;shr&quot;) then
-        let r2 = parse_mul(toks, p + 1)
-        let node = [&quot;Bin&quot;, &quot;shr&quot;, node, r2[0]]
-        let p = r2[1]
-      else
-        let looping = false
+    # Same-line operator first (the common case, no newline involved
+    # at all); only if that's absent do we look PAST any newlines to
+    # see whether a continuation-eligible operator starts the next
+    # line -- this order is what keeps `let x = 5\n-3` two separate
+    # things: a leading `-` past a newline IS eligible in principle,
+    # but only actually taken if `binop_info`'s continues flag says so
+    # (true for `-`, matching the native frontend's own choice; this
+    # is an intentional, documented tradeoff shared with every C-like
+    # language that allows optional statement separators, not a bug).
+    let info = binop_info(vec_get(toks, p))
+    let oppos = p
+    if info[0] == &quot;&quot; then
+      let p2 = skip_nl(toks, p)
+      let info2 = binop_info(vec_get(toks, p2))
+      if info2[2] then
+        let info = info2
+        let oppos = p2
       end
     end
-  end
-  return [node, p]
-end
-
-make a function called parse_add takes toks, pos returns r
-  let r1 = parse_shift(toks, pos)
-  let node = r1[0]
-  let p = r1[1]
-  let looping = true
-  while looping do
-    # See parse_mul's comment: peek past newlines for a continuation `+`/`-`.
-    let p2 = skip_nl(toks, p)
-    let t = vec_get(toks, p2)
-    if (t[0] == &quot;OP&quot;) and ((t[1] == &quot;+&quot;) or (t[1] == &quot;-&quot;)) then
-      let r2 = parse_shift(toks, p2 + 1)
-      let node = [&quot;Bin&quot;, t[1], node, r2[0]]
-      let p = r2[1]
-    else
-      let looping = false
-    end
-  end
-  return [node, p]
-end
-
-make a function called parse_bitwise takes toks, pos returns r
-  # band/bxor/bor: a single combined tier (looser than +/-, tighter than
-  # comparisons), matching the native Rust frontend -- mixed band/bxor/bor
-  # expressions evaluate left-to-right; parenthesize if a specific grouping
-  # matters, same advice as mixing and/or.
-  let r1 = parse_add(toks, pos)
-  let node = r1[0]
-  let p = r1[1]
-  let looping = true
-  while looping do
-    let t = vec_get(toks, p)
-    if tok_is(t, &quot;IDENT&quot;, &quot;band&quot;) then
-      let r2 = parse_add(toks, p + 1)
-      let node = [&quot;Bin&quot;, &quot;band&quot;, node, r2[0]]
-      let p = r2[1]
-    else
-      if tok_is(t, &quot;IDENT&quot;, &quot;bxor&quot;) then
-        let r2 = parse_add(toks, p + 1)
-        let node = [&quot;Bin&quot;, &quot;bxor&quot;, node, r2[0]]
-        let p = r2[1]
-      else
-        if tok_is(t, &quot;IDENT&quot;, &quot;bor&quot;) then
-          let r2 = parse_add(toks, p + 1)
-          let node = [&quot;Bin&quot;, &quot;bor&quot;, node, r2[0]]
-          let p = r2[1]
-        else
-          let looping = false
-        end
-      end
-    end
-  end
-  return [node, p]
-end
-
-make a function called parse_cmp takes toks, pos returns r
-  let r1 = parse_bitwise(toks, pos)
-  let node = r1[0]
-  let p = r1[1]
-  let looping = true
-  while looping do
-    let t = vec_get(toks, p)
-    if (t[0] == &quot;OP&quot;) and ((t[1] == &quot;==&quot;) or (t[1] == &quot;!=&quot;) or (t[1] == &quot;&lt;&quot;) or (t[1] == &quot;&lt;=&quot;) or (t[1] == &quot;&gt;&quot;) or (t[1] == &quot;&gt;=&quot;)) then
-      let r2 = parse_bitwise(toks, p + 1)
-      let node = [&quot;Bin&quot;, t[1], node, r2[0]]
-      let p = r2[1]
-    else
-      let looping = false
-    end
-  end
-  return [node, p]
-end
-
-make a function called parse_and takes toks, pos returns r
-  let r1 = parse_cmp(toks, pos)
-  let node = r1[0]
-  let p = r1[1]
-  let looping = true
-  while looping do
-    let t = vec_get(toks, p)
-    if tok_is(t, &quot;IDENT&quot;, &quot;and&quot;) then
-      let r2 = parse_cmp(toks, p + 1)
-      let node = [&quot;Bin&quot;, &quot;and&quot;, node, r2[0]]
+    if (info[0] != &quot;&quot;) and (info[1] &gt;= min_prec) then
+      let rhs_start = skip_nl(toks, oppos + 1)
+      let r2 = parse_binary(toks, rhs_start, info[1] + 1)
+      let node = [&quot;Bin&quot;, info[0], node, r2[0]]
       let p = r2[1]
     else
       let looping = false
@@ -701,21 +691,15 @@ make a function called parse_and takes toks, pos returns r
 end
 
 make a function called parse_expr takes toks, pos returns r
-  let r1 = parse_and(toks, pos)
-  let node = r1[0]
-  let p = r1[1]
-  let looping = true
-  while looping do
-    let t = vec_get(toks, p)
-    if tok_is(t, &quot;IDENT&quot;, &quot;or&quot;) then
-      let r2 = parse_and(toks, p + 1)
-      let node = [&quot;Bin&quot;, &quot;or&quot;, node, r2[0]]
-      let p = r2[1]
-    else
-      let looping = false
-    end
-  end
-  return [node, p]
+  # GitHub #28: an expression may legitimately START on the line AFTER
+  # whatever introduces it (`let x =\n  &quot;...&quot;`, `return\n  expr`, an
+  # `if`/`while` condition on its own line, etc.) -- skip any leading
+  # newlines here ONCE, at parse_expr's own single entry point, so
+  # every one of its call sites gets this for free, matching the
+  # native Rust frontend's own parse_expression (skips newlines before
+  # parsing its first primary, unconditionally, before the Pratt loop
+  # even starts).
+  return parse_binary(toks, skip_nl(toks, pos), 1)
 end
 
 # ---- statements ----
@@ -976,8 +960,18 @@ make a function called parse_function_def takes toks, pos returns r
         end
       end
     end
+    # Named-return hint (GitHub issue #5): `returns r` gives r real
+    # fall-through semantics via lower.patlang's Func-lowering, matching
+    # Stage 0's rust-runtime/src/parser.rs:781-797 -- previously parsed
+    # and unconditionally discarded here (Stage 1 always required an
+    # explicit return). &quot;&quot; means no hint, matching the convention no
+    # other Func-node consumer treats an empty string specially.
+    let return_hint = &quot;&quot;
     if tok_is(vec_get(toks, p), &quot;IDENT&quot;, &quot;returns&quot;) then
-      # return-var hint: parsed and ignored (Stage 1 requires explicit return)
+      let hintTok = vec_get(toks, p + 1)
+      if hintTok[0] == &quot;IDENT&quot; then
+        let return_hint = hintTok[1]
+      end
       let p = p + 2
     end
     # Body may be `... end` (word form) or `{ ... }` (brace form).
@@ -985,7 +979,7 @@ make a function called parse_function_def takes toks, pos returns r
       let body = parse_stmts_until(toks, p + 1)
       let p2 = body[1]
       if tok_is(vec_get(toks, p2), &quot;OP&quot;, &quot;}&quot;) then
-        return [[&quot;Func&quot;, name, params, body[0]], p2 + 1]
+        return [[&quot;Func&quot;, name, params, body[0], return_hint], p2 + 1]
       else
         return [[&quot;Err&quot;, &quot;expected } after function body&quot;, vec_get(toks, p2)[2]], p2]
       end
@@ -993,7 +987,7 @@ make a function called parse_function_def takes toks, pos returns r
       let body = parse_stmts_until(toks, p)
       let p2 = body[1]
       if tok_is(vec_get(toks, p2), &quot;IDENT&quot;, &quot;end&quot;) then
-        return [[&quot;Func&quot;, name, params, body[0]], p2 + 1]
+        return [[&quot;Func&quot;, name, params, body[0], return_hint], p2 + 1]
       else
         return [[&quot;Err&quot;, &quot;expected end after function body&quot;, vec_get(toks, p2)[2]], p2]
       end
@@ -1309,7 +1303,7 @@ make a function called parse_class_decl takes toks, pos returns r
   end
 end
 
-make a function called parse_stmt takes toks, pos returns r
+make a function called parse_stmt_inner takes toks, pos returns r
   let t = vec_get(toks, pos)
   let ty = t[0]
   let tx = t[1]
@@ -1458,6 +1452,30 @@ make a function called parse_stmt takes toks, pos returns r
   else
     return [[&quot;Err&quot;, &quot;unexpected &quot; + ty + &quot; '&quot; + tx + &quot;'&quot;, vec_get(toks, pos)[2]], pos + 1]
   end
+  end
+end
+
+# Thin line-tagging wrapper around parse_stmt_inner: the debugger's
+# breakpoint/step machinery (self_hosting/lib/interp.patlang) needs a
+# source line on Let/Expr/Return/Assert/MemberAssign nodes, which were
+# never given one (If/While/When/Err already carry their own trailing
+# line field). Deliberately an INCLUSION list, not &quot;append to everything
+# except the types that already have a line&quot;: Func nodes use
+# `s.length &gt; 4` in lower_program to detect an optional trailing
+# return-hint element, so unconditionally appending a line there would
+# silently corrupt that check on every ordinary function (s[4] would
+# sometimes be the return hint, sometimes a line number). Any other node
+# shape gains a shape-dependent meaning for a new trailing slot exactly
+# the same way, so only touch the shapes actually needed here.
+make a function called parse_stmt takes toks, pos returns r
+  let line = vec_get(toks, pos)[2]
+  let inner = parse_stmt_inner(toks, pos)
+  let node = inner[0]
+  let ty = node[0]
+  if (ty == &quot;Let&quot;) or (ty == &quot;Expr&quot;) or (ty == &quot;Return&quot;) or (ty == &quot;Assert&quot;) or (ty == &quot;MemberAssign&quot;) then
+    return [list_push(node, line), inner[1]]
+  else
+    return inner
   end
 end
 
@@ -1997,8 +2015,16 @@ end
 #
 # IR shape:
 #   [&quot;ProgramIR&quot;, entry, [functions], [events]]
-#   [&quot;FuncIR&quot;, name, [params], [instrs]]
+#   [&quot;FuncIR&quot;, name, [params], [instrs], [lines]]
 #   [&quot;EventIR&quot;, event, handler_name]
+#
+# lines: a SPARSE, statement-granularity debug table, one [pc, source_line]
+# pair per Let/Expr/Return/Assert/MemberAssign statement lowered into this
+# function's own instrs (not every instruction -- see parser.patlang's
+# parse_stmt wrapper for which node shapes carry a line at all, and why
+# Func/If/While/When/Err were deliberately left out of that set). Built for
+# self_hosting/lib/interp.patlang's debugger: enough to map a paused pc back
+# to &quot;which statement&quot;, not full per-instruction provenance.
 # Instructions:
 #   [&quot;Const&quot;, &quot;num&quot;|&quot;str&quot;|&quot;bool&quot;, text]   [&quot;Load&quot;, name]   [&quot;Store&quot;, name]
 #   [&quot;Bin&quot;, op]   [&quot;Un&quot;, op]   [&quot;Jump&quot;, n]   [&quot;JumpIfFalse&quot;, n]
@@ -2109,14 +2135,14 @@ make a function called budgeted_depth_dec returns done
   return true
 end
 
-# lower_expr(node, code, fns, locals, pending) -&gt; code
+# lower_expr(node, code, fns, locals, pending, lines) -&gt; code
 #   fns:     list of top-level function names (static call vs host call)
 #   locals:  vec of names currently bound in the enclosing scope (for
 #            disambiguating a call through a closure-valued variable, and
 #            for over-capturing into new closures)
 #   pending: vec of synthesized [&quot;FuncIR&quot;, ...] nodes from closure literals,
 #            merged into the program's function list once lowering finishes
-make a function called lower_expr takes node, code, fns, locals, pending returns out
+make a function called lower_expr takes node, code, fns, locals, pending, lines returns out
   let ty = node[0]
   if ty == &quot;Num&quot; then
     vec_push(code, [&quot;Const&quot;, &quot;num&quot;, node[1]])
@@ -2131,13 +2157,41 @@ make a function called lower_expr takes node, code, fns, locals, pending returns
         return code
       else
         if ty == &quot;Var&quot; then
+          # `unit` is the language's own literal for the Unit/void value
+          # (a program can write it directly as an expression, e.g.
+          # `return unit` -- see self_hosting/lib/interp.patlang's
+          # interp_const), so a bare `unit` that ISN'T a bound variable
+          # lowers to a Unit constant rather than a variable load. Found
+          # during the all-self-hosted fixpoint self-compile: without
+          # this, codegen_x64.patlang's own undefined-variable check
+          # correctly rejected the resulting unresolved `Load &quot;unit&quot;`.
+          #
+          # The `vec_contains(locals, ...)` guard is load-bearing, and
+          # NOT what rust-runtime/src/ir/lowering.rs's own Expr::
+          # Identifier arm does -- it special-cases the name
+          # unconditionally. Matching that unconditionally here is a
+          # real regression, because `unit` is also just an ordinary,
+          # legal variable name that this very codebase uses: x64_
+          # compile_unit.patlang's own x64_make_compile_unit declares
+          # `returns unit`, does `let unit = new(&quot;CompileUnit&quot;, ...)`,
+          # and ends `return unit`. Lowering that final read as a Unit
+          # constant makes the function silently return void instead of
+          # the object it just built -- every per-function compile unit
+          # then came back empty, and every --x64 build died with a
+          # confusing &quot;LINK ERROR: undefined symbol '&lt;first function&gt;'&quot;
+          # far downstream of the actual cause. A bound name always wins
+          # over the literal.
+          if (node[1] == &quot;unit&quot;) and (not vec_contains(locals, &quot;unit&quot;)) then
+            vec_push(code, [&quot;Const&quot;, &quot;unit&quot;, &quot;&quot;])
+            return code
+          end
           vec_push(code, [&quot;Load&quot;, node[1]])
           return code
         else
           if ty == &quot;Bin&quot; then
             if node[1] == &quot;and&quot; then
               # short-circuit: false when lhs falsey, else truthiness of rhs
-              let code = lower_expr(node[2], code, fns, locals, pending)
+              let code = lower_expr(node[2], code, fns, locals, pending, lines)
               vec_push(code, [&quot;Un&quot;, &quot;not&quot;])
               let jif = vec_len(code)
               vec_push(code, [&quot;JumpIfFalse&quot;, 0])
@@ -2145,7 +2199,7 @@ make a function called lower_expr takes node, code, fns, locals, pending returns
               let jmp = vec_len(code)
               vec_push(code, [&quot;Jump&quot;, 0])
               vec_set(code, jif, [&quot;JumpIfFalse&quot;, vec_len(code)])
-              let code = lower_expr(node[3], code, fns, locals, pending)
+              let code = lower_expr(node[3], code, fns, locals, pending, lines)
               vec_push(code, [&quot;Un&quot;, &quot;not&quot;])
               vec_push(code, [&quot;Un&quot;, &quot;not&quot;])
               vec_set(code, jmp, [&quot;Jump&quot;, vec_len(code)])
@@ -2153,11 +2207,11 @@ make a function called lower_expr takes node, code, fns, locals, pending returns
             else
               if node[1] == &quot;or&quot; then
                 # short-circuit: true when lhs truthy, else truthiness of rhs
-                let code = lower_expr(node[2], code, fns, locals, pending)
+                let code = lower_expr(node[2], code, fns, locals, pending, lines)
                 vec_push(code, [&quot;Un&quot;, &quot;not&quot;])
                 let jif = vec_len(code)
                 vec_push(code, [&quot;JumpIfFalse&quot;, 0])
-                let code = lower_expr(node[3], code, fns, locals, pending)
+                let code = lower_expr(node[3], code, fns, locals, pending, lines)
                 vec_push(code, [&quot;Un&quot;, &quot;not&quot;])
                 vec_push(code, [&quot;Un&quot;, &quot;not&quot;])
                 let jmp = vec_len(code)
@@ -2167,15 +2221,15 @@ make a function called lower_expr takes node, code, fns, locals, pending returns
                 vec_set(code, jmp, [&quot;Jump&quot;, vec_len(code)])
                 return code
               else
-                let code = lower_expr(node[2], code, fns, locals, pending)
-                let code = lower_expr(node[3], code, fns, locals, pending)
+                let code = lower_expr(node[2], code, fns, locals, pending, lines)
+                let code = lower_expr(node[3], code, fns, locals, pending, lines)
                 vec_push(code, [&quot;Bin&quot;, node[1]])
                 return code
               end
             end
           else
             if ty == &quot;Un&quot; then
-              let code = lower_expr(node[2], code, fns, locals, pending)
+              let code = lower_expr(node[2], code, fns, locals, pending, lines)
               vec_push(code, [&quot;Un&quot;, node[1]])
               return code
             else
@@ -2185,7 +2239,7 @@ make a function called lower_expr takes node, code, fns, locals, pending returns
                 if contains_str(fns, callee) then
                   let i = 0
                   while i &lt; args.length do
-                    let code = lower_expr(args[i], code, fns, locals, pending)
+                    let code = lower_expr(args[i], code, fns, locals, pending, lines)
                     let i = i + 1
                   end
                   vec_push(code, [&quot;Call&quot;, callee, args.length])
@@ -2196,7 +2250,7 @@ make a function called lower_expr takes node, code, fns, locals, pending returns
                     vec_push(code, [&quot;Load&quot;, callee])
                     let i = 0
                     while i &lt; args.length do
-                      let code = lower_expr(args[i], code, fns, locals, pending)
+                      let code = lower_expr(args[i], code, fns, locals, pending, lines)
                       let i = i + 1
                     end
                     vec_push(code, [&quot;CallValue&quot;, args.length])
@@ -2204,7 +2258,7 @@ make a function called lower_expr takes node, code, fns, locals, pending returns
                   else
                     let i = 0
                     while i &lt; args.length do
-                      let code = lower_expr(args[i], code, fns, locals, pending)
+                      let code = lower_expr(args[i], code, fns, locals, pending, lines)
                       let i = i + 1
                     end
                     vec_push(code, [&quot;CallHost&quot;, callee, args.length])
@@ -2216,20 +2270,20 @@ make a function called lower_expr takes node, code, fns, locals, pending returns
                   let items = node[1]
                   let i = 0
                   while i &lt; items.length do
-                    let code = lower_expr(items[i], code, fns, locals, pending)
+                    let code = lower_expr(items[i], code, fns, locals, pending, lines)
                     let i = i + 1
                   end
                   vec_push(code, [&quot;BuildList&quot;, items.length])
                   return code
                 else
                   if ty == &quot;Index&quot; then
-                    let code = lower_expr(node[1], code, fns, locals, pending)
-                    let code = lower_expr(node[2], code, fns, locals, pending)
+                    let code = lower_expr(node[1], code, fns, locals, pending, lines)
+                    let code = lower_expr(node[2], code, fns, locals, pending, lines)
                     vec_push(code, [&quot;CallHost&quot;, &quot;list_get&quot;, 2])
                     return code
                   else
                     if ty == &quot;Member&quot; then
-                      let code = lower_expr(node[1], code, fns, locals, pending)
+                      let code = lower_expr(node[1], code, fns, locals, pending, lines)
                       if (node[2] == &quot;length&quot;) or (node[2] == &quot;len&quot;) then
                         vec_push(code, [&quot;CallHost&quot;, &quot;len&quot;, 1])
                         return code
@@ -2246,21 +2300,21 @@ make a function called lower_expr takes node, code, fns, locals, pending returns
                         let object = node[1]
                         let method = node[2]
                         let args = node[3]
-                        let code = lower_expr(object, code, fns, locals, pending)
+                        let code = lower_expr(object, code, fns, locals, pending, lines)
                         vec_push(code, [&quot;Const&quot;, &quot;str&quot;, method])
                         let i = 0
                         while i &lt; args.length do
-                          let code = lower_expr(args[i], code, fns, locals, pending)
+                          let code = lower_expr(args[i], code, fns, locals, pending, lines)
                           let i = i + 1
                         end
                         vec_push(code, [&quot;CallHost&quot;, &quot;send&quot;, 2 + args.length])
                         return code
                       else
                       if ty == &quot;Closure&quot; then
-                        return lower_closure_literal(node[1], node[2], code, fns, locals, pending)
+                        return lower_closure_literal(node[1], node[2], code, fns, locals, pending, lines)
                       else
                         if ty == &quot;Budgeted&quot; then
-                          return lower_budgeted_literal(node[1], node[2], node[3], code, fns, locals, pending)
+                          return lower_budgeted_literal(node[1], node[2], node[3], code, fns, locals, pending, lines)
                         else
                           # unknown expression: lower as unit-ish empty string
                           vec_push(code, [&quot;Const&quot;, &quot;str&quot;, &quot;&quot;])
@@ -2283,7 +2337,7 @@ end
 # Lowers a closure literal: synthesizes a Function (params = the enclosing
 # scope's current locals ++ the closure's own params) queued in `pending`,
 # and emits the Load.../MakeClosure sequence at the creation site into `code`.
-make a function called lower_closure_literal takes params, body, code, fns, locals, pending returns out
+make a function called lower_closure_literal takes params, body, code, fns, locals, pending, lines returns out
   let captured = vec_to_list(locals)
   let func_name = next_closure_name()
   let all_params = []
@@ -2306,9 +2360,15 @@ make a function called lower_closure_literal takes params, body, code, fns, loca
     vec_push(inner_mutables, true)
     let i = i + 1
   end
-  let inner_code = lower_block(body, vec_new(), fns, func_name, inner_locals, inner_mutables, pending)
+  # A closure's body is its own function with its own pc-space, so it gets
+  # its own fresh lines table -- the threaded-in `lines` param belongs to
+  # the OUTER code this closure literal is embedded in, and recording the
+  # inner body's statements into it would attach the wrong function's pcs
+  # to those source lines.
+  let inner_lines = vec_new()
+  let inner_code = lower_block(body, vec_new(), fns, func_name, inner_locals, inner_mutables, pending, inner_lines, true)
   vec_push(inner_code, [&quot;Return&quot;])
-  vec_push(pending, [&quot;FuncIR&quot;, func_name, all_params, vec_to_list(inner_code)])
+  vec_push(pending, [&quot;FuncIR&quot;, func_name, all_params, vec_to_list(inner_code), vec_to_list(inner_lines)])
 
   # At the creation site: push captured values in the SAME order used for
   # all_params's leading section, then bundle them.
@@ -2329,7 +2389,7 @@ end
 # list_get/Store. `existing` defaults to Bool(false) at parse time when
 # omitted from source (see parser.patlang), which budgeted_run treats the
 # same as Unit: &quot;no handle yet, start a new fiber&quot;.
-make a function called lower_budgeted_literal takes msNode, existingNode, body, code, fns, locals, pending returns out
+make a function called lower_budgeted_literal takes msNode, existingNode, body, code, fns, locals, pending, lines returns out
   let captured = vec_to_list(locals)
   let func_name = next_budgeted_name()
 
@@ -2352,14 +2412,18 @@ make a function called lower_budgeted_literal takes msNode, existingNode, body, 
     vec_push(inner_code, [&quot;Store&quot;, captured[i]])
     let i = i + 1
   end
+  # Same reasoning as lower_closure_literal: this is a separate function
+  # with its own pc-space, so it needs its own fresh lines table rather
+  # than the caller's.
+  let inner_lines = vec_new()
   budgeted_depth_inc()
-  let inner_code = lower_block(body, inner_code, fns, func_name, inner_locals, inner_mutables, pending)
+  let inner_code = lower_block(body, inner_code, fns, func_name, inner_locals, inner_mutables, pending, inner_lines, true)
   budgeted_depth_dec()
   vec_push(inner_code, [&quot;Return&quot;])
-  vec_push(pending, [&quot;FuncIR&quot;, func_name, [&quot;__captured&quot;], vec_to_list(inner_code)])
+  vec_push(pending, [&quot;FuncIR&quot;, func_name, [&quot;__captured&quot;], vec_to_list(inner_code), vec_to_list(inner_lines)])
 
   # budgeted_run(ms, func_name, captured_list, existing)
-  let code = lower_expr(msNode, code, fns, locals, pending)
+  let code = lower_expr(msNode, code, fns, locals, pending, lines)
   vec_push(code, [&quot;Const&quot;, &quot;str&quot;, func_name])
   let i = 0
   while i &lt; captured.length do
@@ -2367,7 +2431,7 @@ make a function called lower_budgeted_literal takes msNode, existingNode, body, 
     let i = i + 1
   end
   vec_push(code, [&quot;BuildList&quot;, captured.length])
-  let code = lower_expr(existingNode, code, fns, locals, pending)
+  let code = lower_expr(existingNode, code, fns, locals, pending, lines)
   vec_push(code, [&quot;CallHost&quot;, &quot;budgeted_run&quot;, 4])
   return code
 end
@@ -2382,7 +2446,7 @@ end
 # single List (not positionally splatted -- a plan step's real arity is
 # only known once the planner has run), and the loop stops immediately,
 # reporting failure, the moment one returns false.
-make a function called lower_activate_stmt takes plan_node, code, fns, fname, locals, mutables, pending returns out
+make a function called lower_activate_stmt takes plan_node, code, fns, fname, locals, mutables, pending, lines returns out
   let n = next_activate_name()
   let plan_var = &quot;__act_plan_&quot; + n
   let i_var = &quot;__act_i_&quot; + n
@@ -2415,8 +2479,8 @@ make a function called lower_activate_stmt takes plan_node, code, fns, fname, lo
     ]
   ]
 
-  let code = lower_block(synth, code, fns, fname, locals, mutables, pending)
-  return lower_expr([&quot;Var&quot;, ok_var], code, fns, locals, pending)
+  let code = lower_block(synth, code, fns, fname, locals, mutables, pending, lines, false)
+  return lower_expr([&quot;Var&quot;, ok_var], code, fns, locals, pending, lines)
 end
 
 # Render a rule head/body arg as the compile-time string token rule_add
@@ -2427,14 +2491,65 @@ make a function called rule_arg_str takes node returns s
   return node[1]
 end
 
-make a function called lower_stmt takes node, code, fns, fname, locals, mutables, pending returns out
+# is_side_effect_free_node(node) -&gt; mirrors ir/lowering.rs's own
+# is_side_effect_free_expr exactly, on this file's list-shaped AST instead
+# of the native Expr enum: true for a shape that structurally CANNOT have a
+# side effect of its own (a literal, arithmetic/comparison over such, a
+# bare variable read, a list literal of such) -- everything that dispatches
+# through a host/function call, a message send, or a closure creation is
+# false, since those already speak for themselves via whatever they do; see
+# lower_stmt's &quot;Expr&quot; arm below for why this distinction matters (auto-
+# printing a Call's own incidental return value, e.g. print(x)'s Unit,
+# would be noise, not the intended feature).
+make a function called is_side_effect_free_node takes node returns r
   let ty = node[0]
+  if (ty == &quot;Num&quot;) or (ty == &quot;Str&quot;) or (ty == &quot;Bool&quot;) or (ty == &quot;Var&quot;) then
+    return true
+  end
+  if ty == &quot;Un&quot; then
+    return is_side_effect_free_node(node[2])
+  end
+  if ty == &quot;Bin&quot; then
+    return is_side_effect_free_node(node[2]) and is_side_effect_free_node(node[3])
+  end
+  if ty == &quot;List&quot; then
+    let items = node[1]
+    let i = 0
+    let all_free = true
+    while i &lt; items.length do
+      if is_side_effect_free_node(items[i]) == false then
+        let all_free = false
+      end
+      let i = i + 1
+    end
+    return all_free
+  end
+  return false
+end
+
+# wants_value: mirrors ir/lowering.rs's own `wants_value` thread exactly --
+# true when this statement is in TAIL POSITION of a block/function that
+# itself wants a value (the &quot;blocks and functions return their last value&quot;
+# feature), meaning its own computed value should be left on the stack for
+# the caller instead of discarded/auto-printed. See lower_block below for
+# how a statement LIST decides which single statement (if any) gets
+# wants_value=true.
+make a function called lower_stmt takes node, code, fns, fname, locals, mutables, pending, lines, wants_value returns out
+  let ty = node[0]
+  # Record this statement's source line BEFORE lowering it, at the pc it's
+  # about to start emitting at -- only Let/Expr/Return/Assert/MemberAssign
+  # carry one (see parser.patlang's parse_stmt wrapper); node[node.length-1]
+  # is that line regardless of the node's own arity, since it was always
+  # appended as the trailing element there.
+  if (ty == &quot;Let&quot;) or (ty == &quot;Expr&quot;) or (ty == &quot;Return&quot;) or (ty == &quot;Assert&quot;) or (ty == &quot;MemberAssign&quot;) then
+    vec_push(lines, [vec_len(code), node[node.length - 1]])
+  end
   if ty == &quot;Let&quot; then
     let valNode = node[2]
     if (valNode[0] == &quot;Call&quot;) and (valNode[1] == &quot;activate&quot;) and (to_num(valNode[2].length) == 1) then
-      let code = lower_activate_stmt(valNode[2][0], code, fns, fname, locals, mutables, pending)
+      let code = lower_activate_stmt(valNode[2][0], code, fns, fname, locals, mutables, pending, lines)
     else
-      let code = lower_expr(node[2], code, fns, locals, pending)
+      let code = lower_expr(node[2], code, fns, locals, pending, lines)
     end
     let isReassign = node[3]
     let isMut = node[4]
@@ -2467,6 +2582,13 @@ make a function called lower_stmt takes node, code, fns, fname, locals, mutables
       vec_push(locals, node[1])
       vec_push(mutables, isMut)
     end
+    # Ruby-style assignment-as-expression (mirrors ir/lowering.rs's own
+    # Stmt::Let arm): Store already consumed the value off the stack, so
+    # when this `let` is in tail position of a block that wants a value,
+    # reload it -- the assigned value IS the block's value.
+    if wants_value then
+      vec_push(code, [&quot;Load&quot;, node[1]])
+    end
     return code
   else
     if ty == &quot;MemberAssign&quot; then
@@ -2479,58 +2601,132 @@ make a function called lower_stmt takes node, code, fns, fname, locals, mutables
       # a real parser bug (bare '=' always consumed as equality before
       # this ever got a chance) was fixed; nothing had ever exercised
       # this lowering path before.
-      let code = lower_expr(node[1], code, fns, locals, pending)
+      let code = lower_expr(node[1], code, fns, locals, pending, lines)
       vec_push(code, [&quot;Const&quot;, &quot;str&quot;, &quot;set&quot;])
       vec_push(code, [&quot;Const&quot;, &quot;str&quot;, node[2]])
-      let code = lower_expr(node[3], code, fns, locals, pending)
+      let code = lower_expr(node[3], code, fns, locals, pending, lines)
       vec_push(code, [&quot;CallHost&quot;, &quot;send&quot;, 4])
+      if wants_value == false then
+        vec_push(code, [&quot;Store&quot;, &quot;__discard&quot;])
+      end
       return code
     else
     if ty == &quot;Expr&quot; then
       let exprNode = node[1]
       if (exprNode[0] == &quot;Call&quot;) and (exprNode[1] == &quot;activate&quot;) and (to_num(exprNode[2].length) == 1) then
-        return lower_activate_stmt(exprNode[2][0], code, fns, fname, locals, mutables, pending)
+        let code = lower_activate_stmt(exprNode[2][0], code, fns, fname, locals, mutables, pending, lines)
       else
-        return lower_expr(node[1], code, fns, locals, pending)
+        let code = lower_expr(node[1], code, fns, locals, pending, lines)
       end
+      # GitHub #31 fix (mirrors ir/lowering.rs's Stmt::ExprStmt): every
+      # function body ends with an explicit Return, so a bare expression
+      # statement's pushed value is never actually consumed UNLESS this
+      # statement is in tail position of a block/function that wants it
+      # (wants_value) -- the interpreter's heap Vec-based operand stack
+      # tolerates leaving it regardless, but the x64 backend's real
+      # rsp-based stack overflows once a large loop repeats an unassigned
+      # call statement enough times (traced via WinDbg to
+      # expand_includes_at_depth's ~30,000-line loop). When unconsumed:
+      # auto-print (the &quot;echoed only if not consumed&quot; feature) ONLY for a
+      # structurally side-effect-free shape -- a Call (e.g. `activate PLAN`
+      # itself, or an ordinary print(x)) already speaks for itself via its
+      # own side effect, so it's silently discarded instead, exactly as
+      # before this feature existed (mirrors ir/lowering.rs's own
+      # discard_or_use / is_side_effect_free_expr split).
+      if wants_value then
+        return code
+      end
+      if is_side_effect_free_node(exprNode) then
+        vec_push(code, [&quot;CallHost&quot;, &quot;print&quot;, 1])
+        return code
+      end
+      vec_push(code, [&quot;Store&quot;, &quot;__discard&quot;])
+      return code
     else
       if ty == &quot;Print&quot; then
-        let code = lower_expr(node[1], code, fns, locals, pending)
+        let code = lower_expr(node[1], code, fns, locals, pending, lines)
         vec_push(code, [&quot;CallHost&quot;, &quot;print&quot;, 1])
+        if wants_value == false then
+          vec_push(code, [&quot;Store&quot;, &quot;__discard&quot;])
+        end
         return code
       else
         if ty == &quot;Return&quot; then
-          let code = lower_expr(node[1], code, fns, locals, pending)
+          let code = lower_expr(node[1], code, fns, locals, pending, lines)
           vec_push(code, [&quot;Return&quot;])
           return code
         else
           if ty == &quot;If&quot; then
-            let code = lower_expr(node[1], code, fns, locals, pending)
+            let code = lower_expr(node[1], code, fns, locals, pending, lines)
             let jif = vec_len(code)
             vec_push(code, [&quot;JumpIfFalse&quot;, 0])
-            let code = lower_block(node[2], code, fns, fname, locals, mutables, pending)
+            let code = lower_block(node[2], code, fns, fname, locals, mutables, pending, lines, wants_value)
             let jmp = vec_len(code)
             vec_push(code, [&quot;Jump&quot;, 0])
             vec_set(code, jif, [&quot;JumpIfFalse&quot;, vec_len(code)])
-            let code = lower_block(node[3], code, fns, fname, locals, mutables, pending)
+            # node[3] (the else branch) is always a list, `[]` when the
+            # source had no `else` -- lower_block's own empty-list handling
+            # already pushes Unit when wants_value, so the &quot;no else but the
+            # false path needs a value too&quot; case falls out for free.
+            let code = lower_block(node[3], code, fns, fname, locals, mutables, pending, lines, wants_value)
             vec_set(code, jmp, [&quot;Jump&quot;, vec_len(code)])
             return code
           else
             if ty == &quot;While&quot; then
-              let start = vec_len(code)
-              let code = lower_expr(node[1], code, fns, locals, pending)
-              let jif = vec_len(code)
-              vec_push(code, [&quot;JumpIfFalse&quot;, 0])
-              let code = lower_block(node[2], code, fns, fname, locals, mutables, pending)
-              # Lexically inside a budgeted(ms) { ... } block: check the time
-              # budget just before looping back (mirrors lowering.rs's
-              # equivalent Stage 0 instrumentation).
-              if budgeted_depth_get() &gt; 0 then
-                vec_push(code, [&quot;CallHost&quot;, &quot;budget_check&quot;, 0])
+              if wants_value then
+                # A while loop's value is Unit on zero iterations, otherwise
+                # its last-run iteration's tail value -- mirrors
+                # ir/lowering.rs's While arm exactly: push the zero-
+                # iteration default up front, then each iteration that
+                # actually runs pops the previous placeholder/prior value
+                # before pushing its own, so exactly one &quot;current result&quot;
+                # slot exists on the stack the whole time.
+                vec_push(code, [&quot;Const&quot;, &quot;unit&quot;, &quot;&quot;])
+                let start = vec_len(code)
+                let code = lower_expr(node[1], code, fns, locals, pending, lines)
+                let jif = vec_len(code)
+                vec_push(code, [&quot;JumpIfFalse&quot;, 0])
+                vec_push(code, [&quot;Store&quot;, &quot;__discard&quot;])
+                let code = lower_block(node[2], code, fns, fname, locals, mutables, pending, lines, true)
+                if budgeted_depth_get() &gt; 0 then
+                  # REAL BUG FOUND AND FIXED (caught by a real stack
+                  # overflow, not review -- see budgeted_run's own
+                  # x64 verification notes): CallHost always pushes
+                  # exactly one result, but budget_check's own return
+                  # value is never used here, and nothing was popping
+                  # it -- on this wants_value=true path specifically it
+                  # also broke the &quot;exactly one current-result slot&quot;
+                  # invariant this loop's own header comment describes,
+                  # stacking a second, permanent value on top of it
+                  # every single iteration. A tight loop with thousands
+                  # of iterations per budgeted() timeslice turns that
+                  # into megabytes of unreclaimed stack in minutes.
+                  vec_push(code, [&quot;CallHost&quot;, &quot;budget_check&quot;, 0])
+                  vec_push(code, [&quot;Store&quot;, &quot;__discard&quot;])
+                end
+                vec_push(code, [&quot;Jump&quot;, start])
+                vec_set(code, jif, [&quot;JumpIfFalse&quot;, vec_len(code)])
+                return code
+              else
+                let start = vec_len(code)
+                let code = lower_expr(node[1], code, fns, locals, pending, lines)
+                let jif = vec_len(code)
+                vec_push(code, [&quot;JumpIfFalse&quot;, 0])
+                let code = lower_block(node[2], code, fns, fname, locals, mutables, pending, lines, false)
+                # Lexically inside a budgeted(ms) { ... } block: check the time
+                # budget just before looping back (mirrors lowering.rs's
+                # equivalent Stage 0 instrumentation). Store &quot;__discard&quot;
+                # pops budget_check's own unused return value -- see the
+                # wants_value=true branch just above for the real bug
+                # this fixes (a real stack overflow, not a review catch).
+                if budgeted_depth_get() &gt; 0 then
+                  vec_push(code, [&quot;CallHost&quot;, &quot;budget_check&quot;, 0])
+                  vec_push(code, [&quot;Store&quot;, &quot;__discard&quot;])
+                end
+                vec_push(code, [&quot;Jump&quot;, start])
+                vec_set(code, jif, [&quot;JumpIfFalse&quot;, vec_len(code)])
+                return code
               end
-              vec_push(code, [&quot;Jump&quot;, start])
-              vec_set(code, jif, [&quot;JumpIfFalse&quot;, vec_len(code)])
-              return code
             else
               if ty == &quot;Assert&quot; then
                 # contract_check(func_name, kind, text, ok) — args pushed in
@@ -2538,8 +2734,11 @@ make a function called lower_stmt takes node, code, fns, fname, locals, mutables
                 vec_push(code, [&quot;Const&quot;, &quot;str&quot;, fname])
                 vec_push(code, [&quot;Const&quot;, &quot;str&quot;, node[1]])
                 vec_push(code, [&quot;Const&quot;, &quot;str&quot;, ast_to_str(node[2])])
-                let code = lower_expr(node[2], code, fns, locals, pending)
+                let code = lower_expr(node[2], code, fns, locals, pending, lines)
                 vec_push(code, [&quot;CallHost&quot;, &quot;contract_check&quot;, 4])
+                if wants_value == false then
+                  vec_push(code, [&quot;Store&quot;, &quot;__discard&quot;])
+                end
                 return code
               else
                 if ty == &quot;RuleDecl&quot; then
@@ -2576,6 +2775,9 @@ make a function called lower_stmt takes node, code, fns, fname, locals, mutables
                   end
                   vec_push(code, [&quot;BuildList&quot;, body.length])
                   vec_push(code, [&quot;CallHost&quot;, &quot;rule_add&quot;, 3])
+                  if wants_value == false then
+                    vec_push(code, [&quot;Store&quot;, &quot;__discard&quot;])
+                  end
                   return code
                 else
                   if ty == &quot;GoalDecl&quot; then
@@ -2605,6 +2807,9 @@ make a function called lower_stmt takes node, code, fns, fname, locals, mutables
                     end
                     vec_push(code, [&quot;BuildList&quot;, deps.length])
                     vec_push(code, [&quot;CallHost&quot;, &quot;goal_def&quot;, 2])
+                    if wants_value == false then
+                      vec_push(code, [&quot;Store&quot;, &quot;__discard&quot;])
+                    end
                     return code
                   else
                     if ty == &quot;ClassDecl&quot; then
@@ -2631,7 +2836,7 @@ make a function called lower_stmt takes node, code, fns, fname, locals, mutables
                       while j &lt; cfields.length do
                         let fld = cfields[j]
                         vec_push(code, [&quot;Const&quot;, &quot;str&quot;, fld[0]])
-                        let code = lower_expr(fld[1], code, fns, locals, pending)
+                        let code = lower_expr(fld[1], code, fns, locals, pending, lines)
                         vec_push(code, [&quot;BuildList&quot;, 2])
                         let j = j + 1
                       end
@@ -2649,7 +2854,7 @@ make a function called lower_stmt takes node, code, fns, fname, locals, mutables
                           let full_params = list_push(full_params, mparams[k])
                           let k = k + 1
                         end
-                        let code = lower_closure_literal(full_params, mbody, code, fns, locals, pending)
+                        let code = lower_closure_literal(full_params, mbody, code, fns, locals, pending, lines)
                         vec_push(code, [&quot;BuildList&quot;, 2])
                         let j = j + 1
                       end
@@ -2661,9 +2866,17 @@ make a function called lower_stmt takes node, code, fns, fname, locals, mutables
                       end
                       vec_push(code, [&quot;BuildList&quot;, ctraits.length])
                       vec_push(code, [&quot;CallHost&quot;, &quot;class_def&quot;, 5])
+                      if wants_value == false then
+                        vec_push(code, [&quot;Store&quot;, &quot;__discard&quot;])
+                      end
                       return code
                     else
-                      # unknown statement: no code
+                      # unknown statement: no code -- but a tail position
+                      # that wants a value still needs something on the
+                      # stack (mirrors ir/lowering.rs's own catch-all arm).
+                      if wants_value then
+                        vec_push(code, [&quot;Const&quot;, &quot;unit&quot;, &quot;&quot;])
+                      end
                       return code
                     end
                   end
@@ -2678,10 +2891,23 @@ make a function called lower_stmt takes node, code, fns, fname, locals, mutables
   end
 end
 
-make a function called lower_block takes stmts, code, fns, fname, locals, mutables, pending returns out
+# Mirrors ir/lowering.rs's own lower_stmt_list exactly: lowers a statement
+# LIST as a unit. Every statement but the last gets wants_value=false; the
+# last inherits the list's own wants_value, so a value genuinely flows out
+# of the block only from its tail position. An empty list that wants a
+# value produces Unit (the block's value when it has no statements at all).
+make a function called lower_block takes stmts, code, fns, fname, locals, mutables, pending, lines, wants_value returns out
+  if stmts.length == 0 then
+    if wants_value then
+      vec_push(code, [&quot;Const&quot;, &quot;unit&quot;, &quot;&quot;])
+    end
+    return code
+  end
+  let last = stmts.length - 1
   let i = 0
   while i &lt; stmts.length do
-    let code = lower_stmt(stmts[i], code, fns, fname, locals, mutables, pending)
+    let stmt_wants_value = (i == last) and wants_value
+    let code = lower_stmt(stmts[i], code, fns, fname, locals, mutables, pending, lines, stmt_wants_value)
     let i = i + 1
   end
   return code
@@ -2700,6 +2926,59 @@ make a function called collect_fns takes stmts returns fns
   return fns
 end
 
+# body_assigns_name(stmts, name) -&gt; mirrors rust-runtime/src/parser.rs's
+# own body_assigns_name exactly, on this file's list-shaped statement AST:
+# true if `name` is `let`-assigned anywhere in `stmts`, at any nesting
+# depth inside if/while branches (a shallow top-level-only scan would miss
+# the common `if cond then let r = X else let r = Y end` shape). Used below
+# to decide whether the `returns NAME` hint's synthesized trailing return
+# should fire -- see that call site's own comment for why unconditionally
+# synthesizing it would silently defeat implicit-last-value-return for any
+# function that never touches NAME at all.
+make a function called body_assigns_name takes stmts, name returns r
+  let i = 0
+  while i &lt; stmts.length do
+    let s = stmts[i]
+    if (s[0] == &quot;Let&quot;) and (s[1] == name) then
+      return true
+    end
+    if s[0] == &quot;If&quot; then
+      if body_assigns_name(s[2], name) then
+        return true
+      end
+      if body_assigns_name(s[3], name) then
+        return true
+      end
+    end
+    if s[0] == &quot;While&quot; then
+      if body_assigns_name(s[2], name) then
+        return true
+      end
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# Index of the LAST non-&quot;Func&quot; top-level statement, or -1 if there are
+# none -- mirrors ir/lowering.rs's own `top_level`/`last_idx` computation
+# in lower_program_basic: main's own tail statement wants a value too (the
+# whole program's own implicit last-value return, restoring the pre-
+# 86e4fef patc1_main echo behaviour as a consequence of this design rather
+# than a separate code path), so its position needs to be known before the
+# main loop below decides each statement's own wants_value.
+make a function called last_nonfunc_index takes stmts returns idx
+  let last = -1
+  let i = 0
+  while i &lt; stmts.length do
+    if stmts[i][0] != &quot;Func&quot; then
+      let last = i
+    end
+    let i = i + 1
+  end
+  return last
+end
+
 make a function called lower_program takes ast returns ir
   set_var(&quot;__closure_seq&quot;, 0)
   let stmts = ast[1]
@@ -2709,8 +2988,10 @@ make a function called lower_program takes ast returns ir
   let mainCode = vec_new()
   let mainLocals = vec_new()
   let mainMutables = vec_new()
+  let mainLines = vec_new()
   let pending = vec_new()
   let handlerCount = 0
+  let last_top_level = last_nonfunc_index(stmts)
   let i = 0
   while i &lt; stmts.length do
     let s = stmts[i]
@@ -2723,9 +3004,31 @@ make a function called lower_program takes ast returns ir
         vec_push(fmutables, true)
         let k = k + 1
       end
-      let code = lower_block(s[3], vec_new(), fns, s[1], flocals, fmutables, pending)
+      # Named-return hint (GitHub issue #5): if this Func node carries a
+      # 5th element (the `returns NAME` hint, non-empty), append a
+      # synthesized `[&quot;Return&quot;, [&quot;Var&quot;, NAME]]` to the AST-level body
+      # BEFORE lowering -- matching Stage 0's rust-runtime/src/parser.rs
+      # (which appends the same synthesized return at parse time, not
+      # lowering time), so both backends' synthesis point stays
+      # structurally analogous. Reached only via genuine fall-through:
+      # any earlier explicit `return` already exits before this point.
+      # Only synthesized when the body actually assigns the hint name
+      # somewhere (see body_assigns_name above) -- unconditionally
+      # appending this for EVERY `returns NAME` declaration would
+      # silently steal the tail position from a function relying on
+      # implicit-last-value-return instead, returning an unassigned NAME.
+      let fbody = s[3]
+      if s.length &gt; 4 then
+        if s[4] != &quot;&quot; then
+          if body_assigns_name(s[3], s[4]) then
+            let fbody = list_push(s[3], [&quot;Return&quot;, [&quot;Var&quot;, s[4]]])
+          end
+        end
+      end
+      let flines = vec_new()
+      let code = lower_block(fbody, vec_new(), fns, s[1], flocals, fmutables, pending, flines, true)
       vec_push(code, [&quot;Return&quot;])
-      let funcs = list_push(funcs, [&quot;FuncIR&quot;, s[1], s[2], vec_to_list(code)])
+      let funcs = list_push(funcs, [&quot;FuncIR&quot;, s[1], s[2], vec_to_list(code), vec_to_list(flines)])
     else
       if s[0] == &quot;When&quot; then
         # `when EVENT { ... }` now lowers to a genuine closure (reusing
@@ -2744,16 +3047,22 @@ make a function called lower_program takes ast returns ir
         # separate pre-pass) is what lower_closure_literal captures --
         # so this genuinely sees whatever's been declared before it.
         vec_push(mainCode, [&quot;Const&quot;, &quot;str&quot;, s[1]])
-        let mainCode = lower_closure_literal([&quot;event_name&quot;, &quot;event_data&quot;], s[2], mainCode, fns, mainLocals, pending)
+        let mainCode = lower_closure_literal([&quot;event_name&quot;, &quot;event_data&quot;], s[2], mainCode, fns, mainLocals, pending, mainLines)
         vec_push(mainCode, [&quot;CallHost&quot;, &quot;register_event_handler&quot;, 2])
+        if i != last_top_level then
+          vec_push(mainCode, [&quot;Store&quot;, &quot;__discard&quot;])
+        end
       else
-        let mainCode = lower_stmt(s, mainCode, fns, &quot;main&quot;, mainLocals, mainMutables, pending)
+        let mainCode = lower_stmt(s, mainCode, fns, &quot;main&quot;, mainLocals, mainMutables, pending, mainLines, i == last_top_level)
       end
     end
     let i = i + 1
   end
+  if last_top_level == -1 then
+    vec_push(mainCode, [&quot;Const&quot;, &quot;unit&quot;, &quot;&quot;])
+  end
   vec_push(mainCode, [&quot;Return&quot;])
-  let funcs = list_push(funcs, [&quot;FuncIR&quot;, &quot;main&quot;, [], vec_to_list(mainCode)])
+  let funcs = list_push(funcs, [&quot;FuncIR&quot;, &quot;main&quot;, [], vec_to_list(mainCode), vec_to_list(mainLines)])
 
   let pendingList = vec_to_list(pending)
   let i = 0
