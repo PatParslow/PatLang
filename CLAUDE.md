@@ -91,6 +91,49 @@ end
 
 ---
 
+## 4.5 String Building: never `s = s + ...` in a loop — check BEFORE running, not after
+
+PatLang strings are immutable, so `out = out + x` inside a `while`/`for`-style
+loop copies the *entire accumulated string* on every single iteration,
+turning an O(n) scan into O(n²). This is a real, previously-hit perf bug
+(self_hosting/lib/syntax_dsl.patlang cost 30+ minutes on a ~700K-char file
+before being fixed this way), not a theoretical one. Despite an earlier
+version of this exact rule already being in this file, it has now been
+reintroduced and caught, one file at a time, across MULTIPLE separate
+sessions/edits: `glob_to_regex` and `parse_glob_pattern`
+(self_hosting/lib/{regex,parser}.patlang, issue #44 match/case work), then
+`dbg_value_to_json`/`dbg_paused_to_json`/`dbg_trace_json`
+(self_hosting/lib/interp.patlang, issue #96 BigInt-literal work) — three
+separate JSON-building loops in ONE file, found only because the user
+had to point out the warning a second time. Relying on "the compiler will
+warn me" as the actual enforcement mechanism has already failed
+repeatedly; the warning is a safety net for what slips through, not the
+primary control.
+
+* **Rule**: Any code written or edited — in PatLang, self-hosted or
+  otherwise — that accumulates a string across loop iterations MUST use
+  `sb_new()`/`sb_push(b, ...)`/`sb_str(b)` instead of `out = out + ...`,
+  decided at the moment the loop is WRITTEN, not caught afterward by
+  build output. This applies even to loops that look short/bounded — the
+  anti-pattern is invisible until the *input* happens to be large, often
+  buried deep in the call graph by then.
+* **Mandatory self-check**: before considering any edit to a `.patlang`
+  file done, re-read every `while`/loop you touched or added and ask
+  "does this reassign the same string variable to itself plus something,
+  every iteration?" If yes, it's this bug — fix it before moving on, not
+  after a build warns about it.
+* **Opportunistic cleanup**: if you're already editing a file for an
+  unrelated reason and notice this pattern elsewhere in the SAME file
+  (as happened with interp.patlang's three separate JSON builders), fix
+  those too in the same pass rather than leaving known-bad neighbors — a
+  file already open for editing is the cheapest possible time to do this.
+* If the runtime emits this warning during a build anyway, that means the
+  self-check above was skipped — fix it immediately, and treat its
+  recurrence as a signal to slow down on the next `.patlang` edit, not as
+  routine background noise.
+
+---
+
 ## 5. Output Rules
 
 * Keep turn narration to lean, concise text.

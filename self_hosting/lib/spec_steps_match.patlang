@@ -1,0 +1,193 @@
+# Issue #44: match/case step registrations for spec_library/language/
+# match_pattern.feature.
+#
+# `match` is now implemented in BOTH the self-hosted toolchain
+# (self_hosting/lib/{lexer,parser,lower}.patlang) and the native Rust
+# frontend (rust-runtime/src/{ast,parser}.rs + ir/lowering.rs), as pure
+# lowering-only sugar in each -- so this file runs fine either through
+# patc1.exe (lower+interpret, or a real compiled binary) or through native
+# `rust-runtime/target/release/pat.exe --ir-run`/`--build-run`. It's kept
+# as its own suite (self_hosting/tools/run_match_spec_suite.patlang), separate
+# from run_language_spec_suite.patlang, only because it predates the native
+# port and there was no reason to churn a working, already-wired file --
+# feel free to fold it into run_language_spec_suite.patlang's own list
+# instead if that consolidation is ever worth doing.
+
+include "regex.patlang"
+
+make a function called st_noop returns done
+  return true
+end
+
+fn classify_demo(x) {
+    match x do
+      case 0 then
+        return "lit0"
+      case "hi" then
+        return "greeting"
+      case > 10 then
+        return "big"
+      case n then
+        return "bound:" + n
+    end
+}
+
+fn describe_demo(pair) {
+    match pair do
+      case ["Ok", v] then
+        return "ok:" + v
+      case ["Err", ["Nested", m]] then
+        return "nested-err:" + m
+      case _ then
+        return "unknown"
+    end
+}
+
+fn guarded_demo(x) {
+    match x do
+      case n when n > 100 then
+        return "big-bound:" + n
+      case n then
+        return "small-bound:" + n
+    end
+}
+
+fn glob_demo(s) {
+    match s do
+      case *fred* then
+        return "glob-hit"
+      case _ then
+        return "glob-miss"
+    end
+}
+
+fn nomatch_demo(x) {
+    match x do
+      case 1 then
+        return "one"
+      case 2 then
+        return "two"
+    end
+}
+
+# Real bug found via a user report of the browser IDE hanging (not by
+# review): a matched arm whose body does NOT end in `return` (a plain
+# side-effecting statement, e.g. `print(...)`) needs lower_match to jump
+# PAST the remaining arms and the fatal no-match block to reach whatever
+# comes after the whole match statement. That jump target was computed
+# correctly, but the `Jump 0` placeholder it should have overwritten was
+# never actually patched: lower_match collected each arm's placeholder pc
+# into `endJumps` via the Vec API (vec_new/vec_push) but then read it back
+# with list-style `.length`/`endJumps[i]` instead of `vec_len`/`vec_get` --
+# a silent type mismatch (no error, just a wrong/falsy read) that made the
+# patch-back loop iterate zero times. Every existing match scenario's
+# matching arm ended in `return`, which exits via a `Return` instruction
+# BEFORE ever reaching that arm's own unpatched `Jump 0` -- so nothing
+# until this exact shape (a matched, non-returning arm with more arms
+# after it) ever actually executed the broken jump. It jumped back to
+# instruction 0 (function entry) instead of past the match, silently
+# looping forever with the scrutinee unchanged -- reproduced directly via
+# patc1.exe (self-hosted lower.patlang); native rust-runtime/src/ir/
+# lowering.rs's own typed `Vec<usize>` has no equivalent confusion and was
+# never affected.
+fn nonreturn_arm_demo(x) {
+    match x do
+      case 1 then
+        return "one"
+      case > 2 then
+        print("two-plus-side-effect")
+      case > 10 then
+        return "lots"
+    end
+    return "fell-through"
+}
+
+make a function called st_match_literal returns ok
+  return check("the literal-0 arm's body runs", classify_demo(0), "lit0")
+end
+
+make a function called st_match_binding returns ok
+  return check("the bare-identifier arm runs with the identifier bound to 3", classify_demo(3), "bound:3")
+end
+
+make a function called st_match_comparison returns ok
+  return check("the `> 10` arm's body runs", classify_demo(20), "big")
+end
+
+make a function called st_match_tagged_list returns ok
+  return check("the [\"Ok\", v] arm runs with v bound to 5", describe_demo(["Ok", 5]), "ok:5")
+end
+
+make a function called st_match_nested_list returns ok
+  return check("the [\"Err\", [\"Nested\", m]] arm runs with m bound to \"boom\"", describe_demo(["Err", ["Nested", "boom"]]), "nested-err:boom")
+end
+
+make a function called st_match_wildcard_fallthrough returns ok
+  return check("the wildcard arm runs, not the nested-list arm", describe_demo(["Err", "flat"]), "unknown")
+end
+
+make a function called st_match_when_guard returns ok
+  return check("the guarded arm's test fails and a later arm runs instead", guarded_demo(12), "small-bound:12")
+end
+
+make a function called st_match_nonreturn_arm returns ok
+  return check("a matched arm with no `return` correctly jumps past the remaining arms, not back into the match", nonreturn_arm_demo(99), "fell-through")
+end
+
+# Real bug found via a failing run (not review): the guard used to be
+# ANDed into the pattern's own test as ONE expression, evaluated before the
+# pattern's bindings were ever Store'd -- so `n` in `when n > 100` read as
+# unbound/Unit no matter what the real scrutinee was, and every guard
+# silently evaluated false, always falling through to the next arm. This
+# scenario is the one the bug above passed anyway (guard genuinely SHOULD
+# fail for 12) -- this one instead requires the guard to actually SUCCEED
+# with its own pattern's binding in scope, which is what caught it.
+make a function called st_match_when_guard_succeeds returns ok
+  return check("the guarded arm's test succeeds, using its own pattern's binding", guarded_demo(200), "big-bound:200")
+end
+
+make a function called st_match_glob returns ok
+  return check("the glob arm's body runs", glob_demo("alfred smith"), "glob-hit")
+end
+
+make a function called st_match_nomatch_fatal returns ok
+  # nomatch_demo(99) is expected to HALT the interpreter/program via
+  # contract_check's fatal-error path (see lower.patlang's lower_match) --
+  # there is no try/catch in PatLang to observe this from inside the
+  # program (deliberately, per the language's existing "host errors are
+  # fatal" philosophy), so this step's own pass/fail is verified externally
+  # by self_hosting/tools/run_match_spec_suite.patlang's own shell-level
+  # check (a second process invocation whose exit is expected to be an
+  # error), not by this function returning normally. This step function
+  # exists only so the scenario has a named step to register; it always
+  # reports true here, and the REAL assertion is the external process check.
+  return check("the program halts with a fatal \"no case matched\" error, not a silent no-op", true, true)
+end
+
+make a function called register_language_match_steps returns done
+  step("a match over the number 0 with cases for 0, \"hi\", a comparison, and a binding", "st_noop")
+  step("the match is evaluated", "st_noop")
+  step("the literal-0 arm's body runs", "st_match_literal")
+  step("a match over the number 3 against the same case list", "st_noop")
+  step("the bare-identifier arm runs with the identifier bound to 3", "st_match_binding")
+  step("a match over the number 20 against the same case list", "st_noop")
+  step("the `> 10` arm's body runs", "st_match_comparison")
+  step("a match over [\"Ok\", 5] with cases [\"Ok\", v], [\"Err\", [\"Nested\", m]], and _", "st_noop")
+  step("the [\"Ok\", v] arm runs with v bound to 5", "st_match_tagged_list")
+  step("a match over [\"Err\", [\"Nested\", \"boom\"]] against the same case list", "st_noop")
+  step("the [\"Err\", [\"Nested\", m]] arm runs with m bound to \"boom\"", "st_match_nested_list")
+  step("a match over [\"Err\", \"flat\"] against the same case list", "st_noop")
+  step("the wildcard arm runs, not the nested-list arm", "st_match_wildcard_fallthrough")
+  step("a match over the number 12 with a binding pattern guarded by `when n > 100`", "st_noop")
+  step("the guarded arm's test fails and a later arm runs instead", "st_match_when_guard")
+  step("a match over the number 200 against the same guarded case list", "st_noop")
+  step("the guarded arm's test succeeds, using its own pattern's binding", "st_match_when_guard_succeeds")
+  step("a match over \"alfred smith\" with a `*fred*` case", "st_noop")
+  step("the glob arm's body runs", "st_match_glob")
+  step("a match with only literal cases for 1 and 2, no wildcard", "st_noop")
+  step("the match is evaluated against 99", "st_noop")
+  step("the program halts with a fatal \"no case matched\" error, not a silent no-op", "st_match_nomatch_fatal")
+  step("a match where the matching arm has no `return`, with more arms and code after it", "st_noop")
+  step("a matched arm with no `return` correctly jumps past the remaining arms, not back into the match", "st_match_nonreturn_arm")
+  return true
+end

@@ -312,11 +312,51 @@ pub fn as_index(v: &Value) -> Result<usize, String> {
     }
 }
 
-// Bitwise ops operate on Value::Int only -- unlike arithmetic, they don't
-// participate in the numeric-tower promotion rules (no BigInt/Rational/
-// Complex bitwise semantics defined), so no promote_pair here.
+// Bitwise ops operate on Value::Int (or a BigInt truncated to 64 bits, see
+// below) -- unlike arithmetic, they don't participate in the numeric-tower
+// PROMOTION rules (no BigInt/Rational/Complex bitwise RESULT type), so no
+// promote_pair here.
+//
+// A BigInt operand is accepted, truncated to its low 64 bits (two's
+// complement), rather than rejected outright: bitwise ops are defined on a
+// fixed-width bit pattern, and a literal like `17293822569102704640` --
+// used throughout self_hosting/lib/codegen_x64.patlang and x64_runtime.
+// patlang as a 64-bit tag mask -- exceeds i64::MAX and is CORRECTLY
+// promoted to BigInt by the numeric tower's own literal-decoding rules
+// (see GitHub #96), yet is still exactly representable in 64 bits and is
+// semantically meant as a raw bit pattern, not an arbitrary-precision
+// number. Rejecting it here made every such mask literal unusable in
+// `band`/`bor`/etc, which in turn made compiling codegen_x64.patlang
+// itself (via the self-hosted chunked-bootstrap build, where these
+// literals are runtime Values rather than compile-time Rust constants)
+// fail with a bare "expected an integer" the moment x64 codegen actually
+// ran -- found while chasing GitHub #85 (`--x64` string+Unit concat) via
+// a from-scratch, real invocation of `patc1 <in> <out> --x64`, not by
+// review. Truncation (not an error) is correct here specifically because
+// this codebase's own BigInt-range literals are always meant as bit
+// patterns in this position; a value that's `BigInt` for a genuinely
+// arbitrary-precision-arithmetic reason has no defined bitwise meaning
+// either way, and truncating its low 64 bits is the same thing a real CPU
+// would do reinterpreting any wider integer as a 64-bit word.
 fn as_int(v: &Value, ctx: &str) -> Result<i64, String> {
-    match v { Value::Int(n) => Ok(*n), _ => Err(format!("{}: expected an integer", ctx)) }
+    match v {
+        Value::Int(n) => Ok(*n),
+        Value::BigInt(b) => {
+            let bytes = b.to_signed_bytes_le();
+            let mut buf = [0u8; 8];
+            let take = bytes.len().min(8);
+            buf[..take].copy_from_slice(&bytes[..take]);
+            if bytes.len() < 8 {
+                if let Some(&last) = bytes.last() {
+                    if last & 0x80 != 0 {
+                        for b in buf.iter_mut().skip(bytes.len()) { *b = 0xFF; }
+                    }
+                }
+            }
+            Ok(i64::from_le_bytes(buf))
+        }
+        _ => Err(format!("{}: expected an integer", ctx)),
+    }
 }
 
 pub fn bitand(a: &Value, b: &Value) -> Result<Value, String> {

@@ -1,6 +1,6 @@
 //! Minimal Patlang parser (Rust)
 
-use crate::ast::{BinaryOperator, Expr, Stmt};
+use crate::ast::{BinaryOperator, Expr, Pattern, Stmt};
 use crate::lexer::{Lexer, LexerError, Token, TokenExpectation};
 
 #[derive(Debug)]
@@ -64,6 +64,11 @@ fn check_when_placement(stmts: &[Stmt], depth: usize) -> Result<(), ParserError>
             }
             Stmt::While { body, .. } => check_when_placement(body, depth + 1)?,
             Stmt::Function { body, .. } => check_when_placement(body, depth + 1)?,
+            Stmt::Match { arms, .. } => {
+                for (_, _, body) in arms {
+                    check_when_placement(body, depth + 1)?;
+                }
+            }
             _ => {}
         }
     }
@@ -629,6 +634,14 @@ impl<'a> Parser<'a> {
                     // "budgeted") -- at the statement level it just falls
                     // through to ordinary expression-statement parsing
                     // below, no special case needed here.
+                    // Issue #44: match EXPR do case PATTERN [when GUARD] then
+                    // ... end. Dispatched here (before the legacy bare
+                    // "case ... end" skip-arm just below) so match's own
+                    // case-arm parsing consumes its "case" tokens directly,
+                    // never falling into that unrelated fallback.
+                    if curr_lc == "match" {
+                        return self.parse_match();
+                    }
                     // Skip 'case ... end' constructs (Ruby-like)
                     if curr_lc == "case" {
                         self.skip_until_ident("end")?;
@@ -1184,6 +1197,166 @@ impl<'a> Parser<'a> {
         Ok(Stmt::While { cond, body })
     }
 
+    // ---- match/case pattern matching (issue #44) ----
+    //
+    // Grammar (word-block only, matching self_hosting/lib/parser.patlang's
+    // own v1 grammar exactly -- no brace form):
+    //   match EXPR do
+    //     case PATTERN [when GUARD] then STMTS
+    //     ...
+    //     case _ then STMTS
+    //   end
+    //
+    // Neither "match" nor "case" is a dedicated Token variant (same
+    // approach as "when"/"do"/"then"/"begin" elsewhere in this parser --
+    // they lex as plain Token::Identifier and are recognized by text at
+    // the statement level), so no lexer.rs changes are needed at all.
+
+    fn parse_match(&mut self) -> Result<Stmt, ParserError> {
+        let match_line = self.line_no;
+        self.advance()?; // consume 'match'
+        let prev_flag = self.stop_trailing_block_for_condition;
+        self.stop_trailing_block_for_condition = true;
+        let scrutinee = self.parse_expression(0)?;
+        self.stop_trailing_block_for_condition = prev_flag;
+        self.consume_newlines()?;
+        match &self.curr {
+            Token::Identifier(s) if s == "do" => { self.advance()?; }
+            _ => return Err(ParserError::ExpectedToken { expected: "'do' after match expression", line: self.line_no, hint: "Use `match EXPR do case PATTERN then ... end`" }),
+        }
+        self.consume_newlines()?;
+        let mut arms: Vec<(Pattern, Option<Expr>, Vec<Stmt>)> = Vec::new();
+        match &self.curr {
+            Token::Identifier(s) if s == "case" => { self.advance()?; }
+            Token::Identifier(s) if s == "end" => {
+                self.advance()?;
+                return Ok(Stmt::Match { scrutinee, arms, line: match_line });
+            }
+            _ => return Err(ParserError::UnexpectedToken { token: self.curr.clone(), line: self.line_no, hint: "Expected 'case' or 'end' inside a match block" }),
+        }
+        // parse_word_block's stop-word handling (shared with if/while)
+        // already CONSUMES the stop word it finds -- so each iteration
+        // here starts right past a 'case'/'end' that's already been eaten
+        // by the PREVIOUS arm's own parse_word_block call (or, for the
+        // very first arm, by the check just above). Re-checking self.curr
+        // for a literal "case" token here would be checking the pattern
+        // that follows it instead, one token too late.
+        loop {
+            let (pattern, guard, body, stopper) = self.parse_case_arm_body()?;
+            arms.push((pattern, guard, body));
+            if stopper == "end" { break; }
+        }
+        Ok(Stmt::Match { scrutinee, arms, line: match_line })
+    }
+
+    // Called with self.curr already AT the pattern (the 'case' keyword
+    // itself was consumed by the caller -- see parse_match's own comment).
+    // Returns (pattern, guard, body, stopper) where stopper is "case"
+    // (another arm follows, its own 'case' keyword already consumed) or
+    // "end" (match block closes, already consumed) -- mirrors
+    // parse_if_then_tail's own stopper-threading convention.
+    fn parse_case_arm_body(&mut self) -> Result<(Pattern, Option<Expr>, Vec<Stmt>, String), ParserError> {
+        let pattern = self.parse_pattern()?;
+        let guard = if matches!(&self.curr, Token::Identifier(s) if s == "when") {
+            self.advance()?;
+            Some(self.parse_expression(0)?)
+        } else {
+            None
+        };
+        self.consume_newlines()?;
+        match &self.curr {
+            Token::Identifier(s) if s == "then" => { self.advance()?; }
+            _ => return Err(ParserError::ExpectedToken { expected: "'then' (or 'when GUARD then') after case pattern", line: self.line_no, hint: "Use `case PATTERN [when GUARD] then ...`" }),
+        }
+        let (body, stopper) = self.parse_word_block(&["end", "case"], false)?;
+        Ok((pattern, guard, body, stopper))
+    }
+
+    fn parse_pattern(&mut self) -> Result<Pattern, ParserError> {
+        match &self.curr {
+            Token::Identifier(s) if s == "_" => { self.advance()?; Ok(Pattern::Wildcard) }
+            Token::LBracket => {
+                self.advance()?;
+                self.consume_newlines()?;
+                let mut elems: Vec<Pattern> = Vec::new();
+                if matches!(self.curr, Token::RBracket) {
+                    self.advance()?;
+                    return Ok(Pattern::List(elems));
+                }
+                loop {
+                    elems.push(self.parse_pattern()?);
+                    self.consume_newlines()?;
+                    match self.curr {
+                        Token::Comma => { self.advance()?; self.consume_newlines()?; }
+                        Token::RBracket => { self.advance()?; break; }
+                        _ => return Err(ParserError::ExpectedToken { expected: "',' or ']' in list pattern", line: self.line_no, hint: "Close the list pattern with ']'" }),
+                    }
+                }
+                Ok(Pattern::List(elems))
+            }
+            Token::Greater | Token::GreaterEqual | Token::Less | Token::LessEqual | Token::EqualEqual | Token::NotEqual => {
+                let op = match self.curr {
+                    Token::Greater => BinaryOperator::Greater,
+                    Token::GreaterEqual => BinaryOperator::GreaterEqual,
+                    Token::Less => BinaryOperator::Less,
+                    Token::LessEqual => BinaryOperator::LessEqual,
+                    Token::EqualEqual => BinaryOperator::Equal,
+                    Token::NotEqual => BinaryOperator::NotEqual,
+                    _ => unreachable!(),
+                };
+                self.advance()?;
+                let e = self.parse_expression(0)?;
+                Ok(Pattern::Cmp(op, e))
+            }
+            Token::Star => self.parse_glob_pattern(String::new()),
+            Token::Number(n) => { let v = *n; self.advance()?; Ok(Pattern::Lit(Expr::Number(v))) }
+            Token::BigNumber(s) => { let v = s.clone(); self.advance()?; Ok(Pattern::Lit(Expr::BigNumber(v))) }
+            Token::Float(n) => { let v = *n; self.advance()?; Ok(Pattern::Lit(Expr::Float(v))) }
+            Token::String(s) => { let v = s.clone(); self.advance()?; Ok(Pattern::Lit(Expr::String(v))) }
+            Token::Identifier(s) if s == "true" || s == "false" => {
+                let v = s.clone();
+                self.advance()?;
+                Ok(Pattern::Lit(Expr::Identifier(v)))
+            }
+            Token::Identifier(s) => {
+                let name = s.clone();
+                // Trailing-wildcard glob (`fred*`): the identifier is
+                // immediately followed by '*' with no gap. A leading-
+                // wildcard glob (`*fred*`) is handled by the Token::Star
+                // arm above instead.
+                if matches!(self.peek, Token::Star) {
+                    self.advance()?; // consume the identifier segment
+                    return self.parse_glob_pattern(name);
+                }
+                self.advance()?;
+                Ok(Pattern::Bind(name))
+            }
+            _ => Err(ParserError::UnexpectedToken { token: self.curr.clone(), line: self.line_no, hint: "Invalid pattern in match/case" }),
+        }
+    }
+
+    // Collects a run of Identifier/Star tokens (with no gap expected
+    // between them, `*`/identifier-text concatenated verbatim) into a
+    // single glob string, stopping before 'then'/'when'. `prefix` seeds
+    // the accumulator with an identifier segment already consumed by the
+    // caller (trailing-wildcard form); starts empty for the leading-
+    // wildcard form.
+    fn parse_glob_pattern(&mut self, prefix: String) -> Result<Pattern, ParserError> {
+        let mut glob_str = prefix;
+        loop {
+            match &self.curr {
+                Token::Star => { glob_str.push('*'); self.advance()?; }
+                Token::Dot => { glob_str.push('.'); self.advance()?; }
+                Token::Identifier(s) if s != "then" && s != "when" => {
+                    glob_str.push_str(s);
+                    self.advance()?;
+                }
+                _ => break,
+            }
+        }
+        Ok(Pattern::Glob(glob_str))
+    }
+
     // Pratt parser
     fn parse_expression(&mut self, min_bp: u8) -> Result<Expr, ParserError> {
         // skip newlines before a primary (continuation lines)
@@ -1517,6 +1690,7 @@ fn body_assigns_name(stmts: &[Stmt], name: &str) -> bool {
                 || else_branch.as_ref().is_some_and(|eb| body_assigns_name(eb, name))
         }
         Stmt::While { body, .. } => body_assigns_name(body, name),
+        Stmt::Match { arms, .. } => arms.iter().any(|(_, _, body)| body_assigns_name(body, name)),
         _ => false,
     })
 }

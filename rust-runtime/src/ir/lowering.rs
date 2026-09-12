@@ -1,4 +1,4 @@
-use crate::ast::{Expr, Stmt, BinaryOperator};
+use crate::ast::{Expr, Stmt, BinaryOperator, Pattern};
 use crate::parser::is_side_effect_free_expr;
 use std::collections::HashSet;
 use super::types::*;
@@ -44,6 +44,9 @@ pub struct Lowerer {
     // interesting fact is WHICH VARIABLE, not how many times the loop
     // executed it.
     warned_string_concat: HashSet<String>,
+    // Issue #44: unique naming for synthesized match-scrutinee temporaries
+    // (lower_match's own "store once" local -- see next_match_name).
+    match_counter: usize,
 }
 
 impl Lowerer {
@@ -288,6 +291,9 @@ impl Lowerer {
             Stmt::Return(opt) => {
                 if let Some(e) = opt { self.lower_expr(e, f); } else { f.body.push(Instr::Const(Value::Unit)); }
                 f.body.push(Instr::Return);
+            }
+            Stmt::Match { scrutinee, arms, .. } => {
+                self.lower_match(scrutinee, arms, wants_value, f);
             }
             Stmt::If { cond, then_branch, else_branch } => {
                 self.lower_expr(cond, f);
@@ -915,6 +921,152 @@ impl Lowerer {
         f.body.push(Instr::MakeClosure(func_name, captured_names));
     }
 
+    fn next_match_name(&mut self) -> String {
+        self.match_counter += 1;
+        format!("__match_{}", self.match_counter)
+    }
+
+    // =========================================================================
+    // match/case (issue #44). Load-bearing design decision, mirrored exactly
+    // from self_hosting/lib/lower.patlang's own lower_match: `match` is PURE
+    // SYNTACTIC SUGAR -- compile_pattern only ever produces ordinary Expr/Stmt
+    // shapes (BinaryOp/Call/Index/Member/Let) that lower_expr/lower_stmt
+    // already know how to lower, and lower_match itself only ever emits the
+    // same Const/StoreLocal/LoadLocal/Jump/JumpIfFalse instructions an if/elif
+    // chain already uses. No new Instr variant -- every existing execution
+    // path (tree-walking interpreter, x64/Rust codegen) gets `match` for free
+    // since none of them ever see anything but instructions they already
+    // handle.
+    // =========================================================================
+
+    fn compile_pattern(pattern: &Pattern, scrutinee: &Expr) -> (Expr, Vec<Stmt>) {
+        match pattern {
+            Pattern::Wildcard => (Expr::Identifier("true".to_string()), vec![]),
+            Pattern::Bind(name) => (
+                Expr::Identifier("true".to_string()),
+                vec![Stmt::Let { name: name.clone(), value: scrutinee.clone(), is_reassignment: false, mutable: false }],
+            ),
+            Pattern::Lit(lit) => (
+                Expr::BinaryOp { left: Box::new(scrutinee.clone()), op: BinaryOperator::Equal, right: Box::new(lit.clone()) },
+                vec![],
+            ),
+            Pattern::Cmp(op, rhs) => (
+                Expr::BinaryOp { left: Box::new(scrutinee.clone()), op: op.clone(), right: Box::new(rhs.clone()) },
+                vec![],
+            ),
+            Pattern::Glob(s) => (
+                Expr::Call {
+                    function: Box::new(Expr::Identifier("glob_match".to_string())),
+                    args: vec![scrutinee.clone(), Expr::String(s.clone())],
+                },
+                vec![],
+            ),
+            Pattern::List(subs) => Self::compile_list_pattern(subs, scrutinee),
+        }
+    }
+
+    fn compile_list_pattern(subs: &[Pattern], scrutinee: &Expr) -> (Expr, Vec<Stmt>) {
+        let type_check = Expr::BinaryOp {
+            left: Box::new(Expr::Call { function: Box::new(Expr::Identifier("type_of".to_string())), args: vec![scrutinee.clone()] }),
+            op: BinaryOperator::Equal,
+            right: Box::new(Expr::String("list".to_string())),
+        };
+        let len_check = Expr::BinaryOp {
+            left: Box::new(Expr::Member { object: Box::new(scrutinee.clone()), property: "length".to_string() }),
+            op: BinaryOperator::Equal,
+            right: Box::new(Expr::Number(subs.len() as f64)),
+        };
+        let mut test = Expr::BinaryOp { left: Box::new(type_check), op: BinaryOperator::And, right: Box::new(len_check) };
+        let mut lets = Vec::new();
+        for (i, sub) in subs.iter().enumerate() {
+            let elem = Expr::Index { object: Box::new(scrutinee.clone()), index: Box::new(Expr::Number(i as f64)) };
+            let (sub_test, sub_lets) = Self::compile_pattern(sub, &elem);
+            test = Expr::BinaryOp { left: Box::new(test), op: BinaryOperator::And, right: Box::new(sub_test) };
+            lets.extend(sub_lets);
+        }
+        (test, lets)
+    }
+
+    // Mirrors lower_stmt's own "If" arm, generalized to N arms with a
+    // guaranteed-fail tail when no arm's pattern (+ optional guard) matches
+    // -- a runtime error naming the failure (via contract_check, the exact
+    // same design-by-contract host primitive this file already uses for
+    // other "this should be unreachable" cases, e.g. immutable reassignment
+    // above), NOT a silent no-op: PatLang has no static type system to check
+    // exhaustiveness against, so an unmatched scrutinee with no `_` arm is a
+    // genuine bug at runtime (decided explicitly in the issue #44 follow-up
+    // plan, not left implicit).
+    fn lower_match(&mut self, scrutinee: &Expr, arms: &[(Pattern, Option<Expr>, Vec<Stmt>)], wants_value: bool, f: &mut Function) {
+        // Store the scrutinee ONCE into a fresh synthesized local --
+        // re-evaluating an expression with side effects once per arm (e.g.
+        // `match next_event() do ...`) would be a real correctness bug, not
+        // just wasted work.
+        let tmp = self.next_match_name();
+        self.lower_expr(scrutinee, f);
+        f.body.push(Instr::StoreLocal(tmp.clone()));
+        self.known_locals.insert(tmp.clone(), false);
+        let scrutinee_var = Expr::Identifier(tmp);
+
+        let mut end_jumps: Vec<usize> = Vec::new();
+        for (pattern, guard, body) in arms {
+            let (test, lets) = Self::compile_pattern(pattern, &scrutinee_var);
+            self.lower_expr(&test, f);
+            let jif_pattern_idx = f.body.len();
+            f.body.push(Instr::JumpIfFalse(usize::MAX));
+            // Bindings the pattern introduced (e.g. Pattern::Bind's `let v =
+            // scrutinee`) must be emitted BEFORE the guard is evaluated, not
+            // folded into one `pattern_test && guard` expression -- a `when`
+            // guard is documented to reference bindings its own pattern just
+            // introduced (`case n when n > 100`), and `n` isn't a real local
+            // until this StoreLocal actually runs. Evaluating the `&&` as a
+            // single expression would read an unbound `n` while still
+            // building the left side's truth value. Found via a real failing
+            // run (`guarded(200)` returning "small:200" instead of
+            // "big:200"), not by inspection -- see self_hosting/lib/
+            // lower.patlang's lower_match for the identical fix there.
+            for let_stmt in &lets {
+                self.lower_stmt(let_stmt, false, f);
+            }
+            let jif_guard_idx = if let Some(g) = guard {
+                self.lower_expr(g, f);
+                let idx = f.body.len();
+                f.body.push(Instr::JumpIfFalse(usize::MAX));
+                Some(idx)
+            } else {
+                None
+            };
+            self.lower_stmt_list(body, wants_value, f);
+            let jmp_idx = f.body.len();
+            f.body.push(Instr::Jump(usize::MAX));
+            end_jumps.push(jmp_idx);
+            let next_arm_pc = f.body.len();
+            if let Instr::JumpIfFalse(ref mut tgt) = f.body[jif_pattern_idx] { *tgt = next_arm_pc; }
+            if let Some(idx) = jif_guard_idx {
+                if let Instr::JumpIfFalse(ref mut tgt) = f.body[idx] { *tgt = next_arm_pc; }
+            }
+        }
+
+        // No arm matched: fatal (contract_check's ok=false always errors --
+        // see the immutable-reassignment Stmt::Let arm above for the exact
+        // same pattern -- so nothing after this point ever actually runs;
+        // the StoreLocal/Const that follow exist only to keep the
+        // instruction stream's stack shape consistent with the matched-arm
+        // paths).
+        f.body.push(Instr::Const(Value::String((self.current_function.clone()).into())));
+        f.body.push(Instr::Const(Value::String("assert".to_string().into())));
+        f.body.push(Instr::Const(Value::String("match: no case matched the scrutinee value".to_string().into())));
+        f.body.push(Instr::Const(Value::Bool(false)));
+        f.body.push(Instr::CallHost("contract_check".into(), 4));
+        f.body.push(Instr::StoreLocal("__discard".to_string()));
+        if wants_value {
+            f.body.push(Instr::Const(Value::Unit));
+        }
+        let end_pc = f.body.len();
+        for idx in end_jumps {
+            if let Instr::Jump(ref mut tgt) = f.body[idx] { *tgt = end_pc; }
+        }
+    }
+
     // Warns (to stderr, non-fatal) on `let x = x + <expr>` reassignments
     // found anywhere inside a while-loop's body (recursing into nested
     // if/while blocks, since the append is often guarded by a condition)
@@ -962,6 +1114,11 @@ impl Lowerer {
                     }
                 }
                 Stmt::While { body, .. } => self.warn_string_concat_in_loop(body),
+                Stmt::Match { arms, .. } => {
+                    for (_, _, body) in arms {
+                        self.warn_string_concat_in_loop(body);
+                    }
+                }
                 _ => {}
             }
         }
@@ -978,8 +1135,40 @@ fn collect_let_bound_names(stmts: &[Stmt], out: &mut HashSet<String>) {
             }
             Stmt::While { body, .. } => collect_let_bound_names(body, out),
             Stmt::When { body, .. } => collect_let_bound_names(body, out),
+            Stmt::Match { arms, .. } => {
+                for (pattern, _, body) in arms {
+                    // A pattern's Bind names become genuine `Let`s at
+                    // lowering time (see lower_match) -- own for capture
+                    // purposes exactly like an ordinary `let`.
+                    collect_pattern_bind_names(pattern, out);
+                    collect_let_bound_names(body, out);
+                }
+            }
             _ => {}
         }
+    }
+}
+
+// Pattern::Bind names a match lowers to a real `Let` (see lower_match) --
+// collected here so collect_let_bound_names/lower_closure_literal's "own"
+// set treats them exactly like an ordinary let-bound local.
+fn collect_pattern_bind_names(p: &Pattern, out: &mut HashSet<String>) {
+    match p {
+        Pattern::Bind(name) => { out.insert(name.clone()); }
+        Pattern::List(subs) => { for s in subs { collect_pattern_bind_names(s, out); } }
+        Pattern::Wildcard | Pattern::Lit(_) | Pattern::Cmp(_, _) | Pattern::Glob(_) => {}
+    }
+}
+
+// A pattern's own embedded expressions that could reference an outer
+// variable -- a comparison guard's RHS (`case > x then`), or (harmlessly)
+// a literal's own Expr. Bind/Wildcard/Glob introduce no expression to walk.
+fn collect_pattern_idents(p: &Pattern, out: &mut Vec<String>, seen: &mut HashSet<String>) {
+    match p {
+        Pattern::Lit(e) => collect_ident_expr(e, out, seen),
+        Pattern::Cmp(_, e) => collect_ident_expr(e, out, seen),
+        Pattern::List(subs) => { for s in subs { collect_pattern_idents(s, out, seen); } }
+        Pattern::Wildcard | Pattern::Bind(_) | Pattern::Glob(_) => {}
     }
 }
 
@@ -1024,6 +1213,11 @@ fn collect_self_referential_let_names(stmts: &[Stmt], out: &mut HashSet<String>)
             }
             Stmt::While { body, .. } => collect_self_referential_let_names(body, out),
             Stmt::When { body, .. } => collect_self_referential_let_names(body, out),
+            Stmt::Match { arms, .. } => {
+                for (_, _, body) in arms {
+                    collect_self_referential_let_names(body, out);
+                }
+            }
             _ => {}
         }
     }
@@ -1055,6 +1249,14 @@ fn collect_referenced_idents(stmts: &[Stmt], out: &mut Vec<String>, seen: &mut H
             }
             Stmt::ClassDecl { fields, .. } => {
                 for (_, default_expr) in fields { collect_ident_expr(default_expr, out, seen); }
+            }
+            Stmt::Match { scrutinee, arms, .. } => {
+                collect_ident_expr(scrutinee, out, seen);
+                for (pattern, guard, body) in arms {
+                    collect_pattern_idents(pattern, out, seen);
+                    if let Some(g) = guard { collect_ident_expr(g, out, seen); }
+                    collect_referenced_idents(body, out, seen);
+                }
             }
         }
     }

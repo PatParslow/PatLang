@@ -1056,6 +1056,224 @@ make a function called parse_fn_def takes toks, pos returns r
   end
 end
 
+# ---- match/case pattern matching (issue #44) ----
+#
+# Grammar:
+#   match EXPR do
+#     case PATTERN [when GUARD] then STMTS
+#     ...
+#     case _ then STMTS
+#   end
+#
+# Pattern AST shapes (never seen outside the parser/lowerer -- lower.patlang's
+# compile_pattern is the only consumer):
+#   [&quot;PWild&quot;]                 _
+#   [&quot;PBind&quot;, name]           bare lowercase identifier
+#   [&quot;PLit&quot;, litNode]         Num/Str/Bool literal
+#   [&quot;PCmp&quot;, op, exprNode]    &gt; &lt; &gt;= &lt;= == != EXPR   (a guard wearing pattern
+#                             clothing -- see lower.patlang's compile_pattern)
+#   [&quot;PGlob&quot;, globStr]        *fred*, fred*, etc (unquoted, translated to a
+#                             regex and matched via regex.patlang's glob_match)
+#   [&quot;PList&quot;, [subpatterns]]  [p1, p2, ...] -- recursive tagged-list pattern
+#
+# `match` is pure syntactic sugar (see lower.patlang's lower_match): the
+# [&quot;Match&quot;, scrutinee, arms, line] AST node it produces here carries its own
+# line as the last element, same append-only convention as If/While/When.
+
+make a function called at_case_stop takes toks, pos returns r
+  # Case-arm bodies stop at the next 'case', 'end', or EOF (never 'else'/
+  # 'elif' -- those belong to a nested if/while inside the arm body, not to
+  # match's own grammar, so at_block_stop's stop-set doesn't apply here).
+  let t = vec_get(toks, pos)
+  if t[0] == &quot;EOF&quot; then
+    return true
+  else
+    if (t[0] == &quot;IDENT&quot;) and ((t[1] == &quot;end&quot;) or (t[1] == &quot;case&quot;)) then
+      return true
+    else
+      return false
+    end
+  end
+end
+
+make a function called parse_case_stmts_until takes toks, pos returns r
+  let stmts = []
+  let p = skip_nl(toks, pos)
+  let looping = true
+  while looping do
+    if at_case_stop(toks, p) then
+      let looping = false
+    else
+      let s = parse_stmt(toks, p)
+      let stmts = list_push(stmts, s[0])
+      let p = skip_nl(toks, s[1])
+    end
+  end
+  return [stmts, p]
+end
+
+# Collects a run of IDENT/NUM/OP(&quot;*&quot;)/OP(&quot;?&quot;) token text into a single glob
+# string, stopping before 'then'/'when' (or NL/EOF). Handles both leading-
+# wildcard globs (`*fred*`, pos already at the leading '*') and trailing-
+# wildcard globs (`fred*`, pos at the leading identifier).
+make a function called parse_glob_pattern takes toks, pos returns r
+  let glob_b = sb_new()
+  let p = pos
+  let looping = true
+  while looping do
+    let t = vec_get(toks, p)
+    if (t[0] == &quot;IDENT&quot;) and ((t[1] == &quot;then&quot;) or (t[1] == &quot;when&quot;)) then
+      let looping = false
+    else
+      if (t[0] == &quot;NL&quot;) or (t[0] == &quot;EOF&quot;) then
+        let looping = false
+      else
+        if (t[0] == &quot;OP&quot;) and ((t[1] == &quot;*&quot;) or (t[1] == &quot;?&quot;) or (t[1] == &quot;.&quot;)) then
+          sb_push(glob_b, t[1])
+          let p = p + 1
+        else
+          if (t[0] == &quot;IDENT&quot;) or (t[0] == &quot;NUM&quot;) then
+            sb_push(glob_b, t[1])
+            let p = p + 1
+          else
+            let looping = false
+          end
+        end
+      end
+    end
+  end
+  return [[&quot;PGlob&quot;, sb_str(glob_b)], p]
+end
+
+make a function called parse_pattern takes toks, pos returns r
+  let t = vec_get(toks, pos)
+  if tok_is(t, &quot;IDENT&quot;, &quot;_&quot;) then
+    return [[&quot;PWild&quot;], pos + 1]
+  else
+    if tok_is(t, &quot;OP&quot;, &quot;[&quot;) then
+      let p = skip_nl(toks, pos + 1)
+      if tok_is(vec_get(toks, p), &quot;OP&quot;, &quot;]&quot;) then
+        return [[&quot;PList&quot;, []], p + 1]
+      else
+        return parse_pattern_list_tail(toks, p, [])
+      end
+    else
+      if (t[0] == &quot;OP&quot;) and ((t[1] == &quot;&gt;&quot;) or (t[1] == &quot;&lt;&quot;) or (t[1] == &quot;&gt;=&quot;) or (t[1] == &quot;&lt;=&quot;) or (t[1] == &quot;==&quot;) or (t[1] == &quot;!=&quot;)) then
+        let e = parse_expr(toks, pos + 1)
+        return [[&quot;PCmp&quot;, t[1], e[0]], e[1]]
+      else
+        if tok_is(t, &quot;OP&quot;, &quot;*&quot;) then
+          return parse_glob_pattern(toks, pos)
+        else
+          if t[0] == &quot;NUM&quot; then
+            return [[&quot;PLit&quot;, [&quot;Num&quot;, t[1]]], pos + 1]
+          else
+            if t[0] == &quot;STR&quot; then
+              return [[&quot;PLit&quot;, [&quot;Str&quot;, t[1]]], pos + 1]
+            else
+              if tok_is(t, &quot;IDENT&quot;, &quot;true&quot;) or tok_is(t, &quot;IDENT&quot;, &quot;false&quot;) then
+                return [[&quot;PLit&quot;, [&quot;Bool&quot;, t[1]]], pos + 1]
+              else
+                if t[0] == &quot;IDENT&quot; then
+                  let nxt = vec_get(toks, pos + 1)
+                  if (nxt[0] == &quot;OP&quot;) and ((nxt[1] == &quot;*&quot;) or (nxt[1] == &quot;?&quot;)) then
+                    return parse_glob_pattern(toks, pos)
+                  else
+                    return [[&quot;PBind&quot;, t[1]], pos + 1]
+                  end
+                else
+                  return [[&quot;Err&quot;, &quot;invalid pattern&quot;, t[2]], pos + 1]
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+make a function called parse_pattern_list_tail takes toks, pos, acc returns r
+  let pr = parse_pattern(toks, pos)
+  let acc2 = list_push(acc, pr[0])
+  let p = skip_nl(toks, pr[1])
+  let t = vec_get(toks, p)
+  if tok_is(t, &quot;OP&quot;, &quot;,&quot;) then
+    return parse_pattern_list_tail(toks, skip_nl(toks, p + 1), acc2)
+  else
+    if tok_is(t, &quot;OP&quot;, &quot;]&quot;) then
+      return [[&quot;PList&quot;, acc2], p + 1]
+    else
+      return [[&quot;Err&quot;, &quot;expected ',' or ']' in list pattern&quot;, t[2]], p]
+    end
+  end
+end
+
+make a function called parse_case_arm takes toks, pos returns r
+  # pos points at 'case'. Returns [[pattern, guard_or_false, body], next_pos].
+  let pr = parse_pattern(toks, pos + 1)
+  let pattern = pr[0]
+  let p = skip_nl(toks, pr[1])
+  let t = vec_get(toks, p)
+  if tok_is(t, &quot;IDENT&quot;, &quot;when&quot;) then
+    let g = parse_expr(toks, p + 1)
+    let guard = g[0]
+    let p2 = skip_nl(toks, g[1])
+    let t2 = vec_get(toks, p2)
+    if tok_is(t2, &quot;IDENT&quot;, &quot;then&quot;) then
+      let body = parse_case_stmts_until(toks, p2 + 1)
+      return [[pattern, guard, body[0]], body[1]]
+    else
+      return [[&quot;Err&quot;, &quot;expected then after when guard&quot;, t2[2]], p2]
+    end
+  else
+    if tok_is(t, &quot;IDENT&quot;, &quot;then&quot;) then
+      let body = parse_case_stmts_until(toks, p + 1)
+      return [[pattern, false, body[0]], body[1]]
+    else
+      return [[&quot;Err&quot;, &quot;expected then (or when GUARD then) after case pattern&quot;, t[2]], p]
+    end
+  end
+end
+
+make a function called parse_match_arms takes toks, pos, acc returns r
+  let p = skip_nl(toks, pos)
+  let t = vec_get(toks, p)
+  if tok_is(t, &quot;IDENT&quot;, &quot;end&quot;) then
+    return [acc, p + 1]
+  else
+    if tok_is(t, &quot;IDENT&quot;, &quot;case&quot;) then
+      let arm = parse_case_arm(toks, p)
+      if arm[0][0] == &quot;Err&quot; then
+        return [arm[0], arm[1]]
+      else
+        return parse_match_arms(toks, skip_nl(toks, arm[1]), list_push(acc, arm[0]))
+      end
+    else
+      return [[&quot;Err&quot;, &quot;expected case or end in match block&quot;, t[2]], p]
+    end
+  end
+end
+
+make a function called parse_match takes toks, pos returns r
+  # pos points at 'match'.
+  let match_line = vec_get(toks, pos)[2]
+  let se = parse_expr(toks, pos + 1)
+  let scrutinee = se[0]
+  let p = se[1]
+  let t = vec_get(toks, p)
+  if tok_is(t, &quot;IDENT&quot;, &quot;do&quot;) then
+    let arms = parse_match_arms(toks, p + 1, [])
+    if arms[0][0] == &quot;Err&quot; then
+      return [arms[0], arms[1]]
+    else
+      return [[&quot;Match&quot;, scrutinee, arms[0], match_line], arms[1]]
+    end
+  else
+    return [[&quot;Err&quot;, &quot;expected do after match expression&quot;, t[2]], p]
+  end
+end
+
 make a function called parse_when takes toks, pos returns r
   # pos points at 'when'; expect: when EVENT do body end, or when EVENT { body }
   # `when_line` is appended as the node's LAST element (same append-only
@@ -1343,6 +1561,9 @@ make a function called parse_stmt_inner takes toks, pos returns r
         if tx == &quot;while&quot; then
           return parse_while(toks, pos)
         else
+          if tx == &quot;match&quot; then
+            return parse_match(toks, pos)
+          else
           if (tx == &quot;require&quot;) or (tx == &quot;ensure&quot;) or (tx == &quot;assert&quot;) then
             let e = parse_expr(toks, pos + 1)
             return [[&quot;Assert&quot;, tx, e[0]], e[1]]
@@ -1444,6 +1665,7 @@ make a function called parse_stmt_inner takes toks, pos returns r
               end
             end
             end
+          end
           end
           end
         end
@@ -1743,6 +1965,29 @@ make a function called pf_walk_list takes nodes returns err
   return [&quot;&quot;, -1]
 end
 
+make a function called pf_walk_pattern takes pattern returns err
+  let tag = pattern[0]
+  if tag == &quot;Err&quot; then
+    return [pattern[1], pattern[2]]
+  end
+  if tag == &quot;PCmp&quot; then
+    return pf_walk_node(pattern[2])
+  end
+  if tag == &quot;PList&quot; then
+    let subs = pattern[1]
+    let i = 0
+    let n = to_num(list_len(subs))
+    while i &lt; n do
+      let r = pf_walk_pattern(subs[i])
+      if r[0] != &quot;&quot; then return r end
+      let i = i + 1
+    end
+    return [&quot;&quot;, -1]
+  end
+  # PWild/PBind/PLit/PGlob carry no sub-expressions that could hold an Err.
+  return [&quot;&quot;, -1]
+end
+
 make a function called pf_walk_node takes node returns err
   let ty = node[0]
   if ty == &quot;Err&quot; then
@@ -1795,6 +2040,26 @@ make a function called pf_walk_node takes node returns err
     let r = pf_walk_node(node[1])
     if r[0] != &quot;&quot; then return r end
     return pf_walk_list(node[2])
+  end
+  if ty == &quot;Match&quot; then
+    let r = pf_walk_node(node[1])
+    if r[0] != &quot;&quot; then return r end
+    let arms = node[2]
+    let i = 0
+    let n = to_num(list_len(arms))
+    while i &lt; n do
+      let arm = arms[i]
+      let pr = pf_walk_pattern(arm[0])
+      if pr[0] != &quot;&quot; then return pr end
+      if arm[1] != false then
+        let gr = pf_walk_node(arm[1])
+        if gr[0] != &quot;&quot; then return gr end
+      end
+      let br = pf_walk_list(arm[2])
+      if br[0] != &quot;&quot; then return br end
+      let i = i + 1
+    end
+    return [&quot;&quot;, -1]
   end
   if (ty == &quot;Func&quot;) or (ty == &quot;When&quot;) then
     return pf_walk_list(node[2])
@@ -1891,6 +2156,18 @@ make a function called parse_check_when_placement takes stmts, depth returns err
       let r = parse_check_when_placement(stmt[2], depth + 1)
       if r[0] != &quot;&quot; then
         return r
+      end
+    end
+    if tag == &quot;Match&quot; then
+      let arms = stmt[2]
+      let ai = 0
+      let an = to_num(list_len(arms))
+      while ai &lt; an do
+        let r = parse_check_when_placement(arms[ai][2], depth + 1)
+        if r[0] != &quot;&quot; then
+          return r
+        end
+        let ai = ai + 1
       end
     end
     if tag == &quot;Func&quot; then
@@ -2099,6 +2376,15 @@ make a function called next_budgeted_name returns name
   end
   set_var(&quot;__budgeted_seq&quot;, n + 1)
   return &quot;__budgeted_&quot; + n
+end
+
+make a function called next_match_name returns name
+  let n = get(&quot;__vars&quot;, &quot;__match_seq&quot;)
+  if not n then
+    let n = 0
+  end
+  set_var(&quot;__match_seq&quot;, n + 1)
+  return &quot;__match_&quot; + n
 end
 
 make a function called next_activate_name returns name
@@ -2534,6 +2820,174 @@ end
 # the caller instead of discarded/auto-printed. See lower_block below for
 # how a statement LIST decides which single statement (if any) gets
 # wants_value=true.
+# =============================================================================
+# match/case (issue #44). Load-bearing design decision: `match` is PURE
+# SYNTACTIC SUGAR -- compile_pattern below only ever produces ordinary AST
+# nodes (Bin/Call/Index/Member/Var/Str/Num) that lower_expr/lower_stmt
+# already know how to lower, and lower_match itself only ever emits the
+# same Const/Load/Store/Jump/JumpIfFalse instructions an if/elif chain
+# already uses (see lower_stmt's existing &quot;If&quot; arm just below, which this
+# mirrors exactly). No new Instr variant -- see the plan's own design
+# rationale (issue #44 follow-up) for why: every execution path
+# (interp.patlang, codegen.patlang/codegen_x64.patlang) gets `match` for
+# free since they never see anything but instructions they already handle.
+#
+# compile_pattern(pattern, scrutineeNode) -&gt; [testExprNode, [letStmtNodes]]
+#   testExprNode: an ordinary boolean-valued AST expr node.
+#   letStmtNodes: [&quot;Let&quot;, name, valueNode, false, false] nodes to run BEFORE
+#                 the arm body, once the test has passed (a PBind's binding,
+#                 or nested bindings from a PList's sub-patterns).
+# =============================================================================
+
+make a function called compile_pattern takes pattern, scrutineeNode returns r
+  let tag = pattern[0]
+  if tag == &quot;PWild&quot; then
+    return [[&quot;Bool&quot;, &quot;true&quot;], []]
+  else
+    if tag == &quot;PBind&quot; then
+      return [[&quot;Bool&quot;, &quot;true&quot;], [[&quot;Let&quot;, pattern[1], scrutineeNode, false, false]]]
+    else
+      if tag == &quot;PLit&quot; then
+        return [[&quot;Bin&quot;, &quot;==&quot;, scrutineeNode, pattern[1]], []]
+      else
+        if tag == &quot;PCmp&quot; then
+          return [[&quot;Bin&quot;, pattern[1], scrutineeNode, pattern[2]], []]
+        else
+          if tag == &quot;PGlob&quot; then
+            return [[&quot;Call&quot;, &quot;glob_match&quot;, [scrutineeNode, [&quot;Str&quot;, pattern[1]]]], []]
+          else
+            if tag == &quot;PList&quot; then
+              return compile_list_pattern(pattern[1], scrutineeNode)
+            else
+              # Unreachable for a successfully-parsed pattern; a stray
+              # [&quot;Err&quot;, ...] pattern (already surfaced separately by
+              # parser.patlang's pf_walk_pattern) falls back to an
+              # always-false test rather than crashing the lowerer.
+              return [[&quot;Bool&quot;, &quot;false&quot;], []]
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+make a function called compile_list_pattern takes subs, scrutineeNode returns r
+  let n = to_num(list_len(subs))
+  let test = [&quot;Bin&quot;, &quot;and&quot;,
+    [&quot;Bin&quot;, &quot;==&quot;, [&quot;Call&quot;, &quot;type_of&quot;, [scrutineeNode]], [&quot;Str&quot;, &quot;list&quot;]],
+    [&quot;Bin&quot;, &quot;==&quot;, [&quot;Member&quot;, scrutineeNode, &quot;length&quot;], [&quot;Num&quot;, &quot;&quot; + n]]]
+  let lets = []
+  let i = 0
+  while i &lt; n do
+    let elemNode = [&quot;Index&quot;, scrutineeNode, [&quot;Num&quot;, &quot;&quot; + i]]
+    let sub = compile_pattern(subs[i], elemNode)
+    let test = [&quot;Bin&quot;, &quot;and&quot;, test, sub[0]]
+    let j = 0
+    while j &lt; sub[1].length do
+      let lets = list_push(lets, sub[1][j])
+      let j = j + 1
+    end
+    let i = i + 1
+  end
+  return [test, lets]
+end
+
+# Mirrors lower_stmt's &quot;If&quot; arm exactly, generalized to N arms with a
+# guaranteed-fail tail when no arm's pattern (+ optional guard) matches --
+# a runtime error naming the failure (via contract_check, the same
+# design-by-contract host primitive already used for other &quot;this should be
+# unreachable&quot; cases in this file, e.g. immutable-reassignment above), NOT
+# a silent no-op: PatLang has no static type system to check exhaustiveness
+# against, so an unmatched scrutinee with no `_` arm is a genuine bug at
+# runtime, not a case to swallow quietly (decided explicitly in the issue
+# #44 follow-up plan, not left implicit).
+make a function called lower_match takes node, code, fns, fname, locals, mutables, pending, lines, wants_value returns out
+  let scrutineeExpr = node[1]
+  let arms = node[2]
+  # Store the scrutinee ONCE into a fresh synthesized local -- same
+  # reasoning as this file's other __closure_N/__budgeted_N synthesized
+  # names: re-evaluating an expression with side effects once per arm
+  # (e.g. `match next_event() do ...`) would be a real correctness bug,
+  # not just wasted work.
+  let tmp = next_match_name()
+  let code = lower_expr(scrutineeExpr, code, fns, locals, pending, lines)
+  vec_push(code, [&quot;Store&quot;, tmp])
+  vec_push(locals, tmp)
+  vec_push(mutables, false)
+  let scrutineeVar = [&quot;Var&quot;, tmp]
+  let endJumps = vec_new()
+  let i = 0
+  let n = to_num(list_len(arms))
+  while i &lt; n do
+    let arm = arms[i]
+    let pattern = arm[0]
+    let guard = arm[1]
+    let body = arm[2]
+    let comp = compile_pattern(pattern, scrutineeVar)
+    let testNode = comp[0]
+    let letStmts = comp[1]
+    let code = lower_expr(testNode, code, fns, locals, pending, lines)
+    let jifPattern = vec_len(code)
+    vec_push(code, [&quot;JumpIfFalse&quot;, 0])
+    # Bindings the pattern introduced (e.g. PBind's `let v = scrutinee`)
+    # must be emitted BEFORE the guard is evaluated, not folded into one
+    # `pattern_test and guard` expression -- a `when` guard is documented
+    # to reference bindings its own pattern just introduced (e.g. `case n
+    # when n &gt; 100`), and `n` doesn't exist as a real local until this
+    # Store actually runs. Evaluating the AND as a single expression would
+    # load an unbound `n` while still building the LEFT side's truth value,
+    # silently reading Unit/stale-load instead of the real scrutinee no
+    # matter what the guard says. Found via a real failing run (guarded(200)
+    # returning &quot;small:200&quot; instead of &quot;big:200&quot;), not by inspection.
+    let j = 0
+    while j &lt; letStmts.length do
+      let code = lower_stmt(letStmts[j], code, fns, fname, locals, mutables, pending, lines, false)
+      let j = j + 1
+    end
+    let jifGuard = -1
+    if guard != false then
+      let code = lower_expr(guard, code, fns, locals, pending, lines)
+      let jifGuard = vec_len(code)
+      vec_push(code, [&quot;JumpIfFalse&quot;, 0])
+    end
+    let code = lower_block(body, code, fns, fname, locals, mutables, pending, lines, wants_value)
+    let jmp = vec_len(code)
+    vec_push(code, [&quot;Jump&quot;, 0])
+    vec_push(endJumps, jmp)
+    let next_arm_pc = vec_len(code)
+    vec_set(code, jifPattern, [&quot;JumpIfFalse&quot;, next_arm_pc])
+    if jifGuard &gt;= 0 then
+      vec_set(code, jifGuard, [&quot;JumpIfFalse&quot;, next_arm_pc])
+    end
+    let i = i + 1
+  end
+  # No arm matched: fatal, mirrors PatLang's existing &quot;no try/catch, host
+  # errors are fatal&quot; philosophy (contract_check's ok=false arg always
+  # errors -- see its use for immutable reassignment above -- so nothing
+  # after this point ever actually runs; the Store/Const that follow it
+  # exist only to keep the instruction stream's stack shape consistent
+  # with the matched-arm paths for any backend that reasons about it
+  # statically, matching the same dead-but-shape-correct pattern the
+  # immutable-reassignment path above already relies on).
+  vec_push(code, [&quot;Const&quot;, &quot;str&quot;, fname])
+  vec_push(code, [&quot;Const&quot;, &quot;str&quot;, &quot;assert&quot;])
+  vec_push(code, [&quot;Const&quot;, &quot;str&quot;, &quot;match: no case matched the scrutinee value&quot;])
+  vec_push(code, [&quot;Const&quot;, &quot;bool&quot;, &quot;false&quot;])
+  vec_push(code, [&quot;CallHost&quot;, &quot;contract_check&quot;, 4])
+  vec_push(code, [&quot;Store&quot;, &quot;__discard&quot;])
+  if wants_value then
+    vec_push(code, [&quot;Const&quot;, &quot;unit&quot;, &quot;&quot;])
+  end
+  let end_pc = vec_len(code)
+  let i = 0
+  while i &lt; vec_len(endJumps) do
+    vec_set(code, vec_get(endJumps, i), [&quot;Jump&quot;, end_pc])
+    let i = i + 1
+  end
+  return code
+end
+
 make a function called lower_stmt takes node, code, fns, fname, locals, mutables, pending, lines, wants_value returns out
   let ty = node[0]
   # Record this statement's source line BEFORE lowering it, at the pc it's
@@ -2656,6 +3110,9 @@ make a function called lower_stmt takes node, code, fns, fname, locals, mutables
           vec_push(code, [&quot;Return&quot;])
           return code
         else
+          if ty == &quot;Match&quot; then
+            return lower_match(node, code, fns, fname, locals, mutables, pending, lines, wants_value)
+          else
           if ty == &quot;If&quot; then
             let code = lower_expr(node[1], code, fns, locals, pending, lines)
             let jif = vec_len(code)
@@ -2889,6 +3346,7 @@ make a function called lower_stmt takes node, code, fns, fname, locals, mutables
     end
     end
   end
+  end
 end
 
 # Mirrors ir/lowering.rs's own lower_stmt_list exactly: lowers a statement
@@ -2953,6 +3411,16 @@ make a function called body_assigns_name takes stmts, name returns r
     if s[0] == &quot;While&quot; then
       if body_assigns_name(s[2], name) then
         return true
+      end
+    end
+    if s[0] == &quot;Match&quot; then
+      let arms = s[2]
+      let ai = 0
+      while ai &lt; arms.length do
+        if body_assigns_name(arms[ai][2], name) then
+          return true
+        end
+        let ai = ai + 1
       end
     end
     let i = i + 1

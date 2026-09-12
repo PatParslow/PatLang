@@ -93,6 +93,15 @@ make a function called next_budgeted_name returns name
   return "__budgeted_" + n
 end
 
+make a function called next_match_name returns name
+  let n = get("__vars", "__match_seq")
+  if not n then
+    let n = 0
+  end
+  set_var("__match_seq", n + 1)
+  return "__match_" + n
+end
+
 make a function called next_activate_name returns name
   let n = get("__vars", "__activate_seq")
   if not n then
@@ -526,6 +535,174 @@ end
 # the caller instead of discarded/auto-printed. See lower_block below for
 # how a statement LIST decides which single statement (if any) gets
 # wants_value=true.
+# =============================================================================
+# match/case (issue #44). Load-bearing design decision: `match` is PURE
+# SYNTACTIC SUGAR -- compile_pattern below only ever produces ordinary AST
+# nodes (Bin/Call/Index/Member/Var/Str/Num) that lower_expr/lower_stmt
+# already know how to lower, and lower_match itself only ever emits the
+# same Const/Load/Store/Jump/JumpIfFalse instructions an if/elif chain
+# already uses (see lower_stmt's existing "If" arm just below, which this
+# mirrors exactly). No new Instr variant -- see the plan's own design
+# rationale (issue #44 follow-up) for why: every execution path
+# (interp.patlang, codegen.patlang/codegen_x64.patlang) gets `match` for
+# free since they never see anything but instructions they already handle.
+#
+# compile_pattern(pattern, scrutineeNode) -> [testExprNode, [letStmtNodes]]
+#   testExprNode: an ordinary boolean-valued AST expr node.
+#   letStmtNodes: ["Let", name, valueNode, false, false] nodes to run BEFORE
+#                 the arm body, once the test has passed (a PBind's binding,
+#                 or nested bindings from a PList's sub-patterns).
+# =============================================================================
+
+make a function called compile_pattern takes pattern, scrutineeNode returns r
+  let tag = pattern[0]
+  if tag == "PWild" then
+    return [["Bool", "true"], []]
+  else
+    if tag == "PBind" then
+      return [["Bool", "true"], [["Let", pattern[1], scrutineeNode, false, false]]]
+    else
+      if tag == "PLit" then
+        return [["Bin", "==", scrutineeNode, pattern[1]], []]
+      else
+        if tag == "PCmp" then
+          return [["Bin", pattern[1], scrutineeNode, pattern[2]], []]
+        else
+          if tag == "PGlob" then
+            return [["Call", "glob_match", [scrutineeNode, ["Str", pattern[1]]]], []]
+          else
+            if tag == "PList" then
+              return compile_list_pattern(pattern[1], scrutineeNode)
+            else
+              # Unreachable for a successfully-parsed pattern; a stray
+              # ["Err", ...] pattern (already surfaced separately by
+              # parser.patlang's pf_walk_pattern) falls back to an
+              # always-false test rather than crashing the lowerer.
+              return [["Bool", "false"], []]
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
+make a function called compile_list_pattern takes subs, scrutineeNode returns r
+  let n = to_num(list_len(subs))
+  let test = ["Bin", "and",
+    ["Bin", "==", ["Call", "type_of", [scrutineeNode]], ["Str", "list"]],
+    ["Bin", "==", ["Member", scrutineeNode, "length"], ["Num", "" + n]]]
+  let lets = []
+  let i = 0
+  while i < n do
+    let elemNode = ["Index", scrutineeNode, ["Num", "" + i]]
+    let sub = compile_pattern(subs[i], elemNode)
+    let test = ["Bin", "and", test, sub[0]]
+    let j = 0
+    while j < sub[1].length do
+      let lets = list_push(lets, sub[1][j])
+      let j = j + 1
+    end
+    let i = i + 1
+  end
+  return [test, lets]
+end
+
+# Mirrors lower_stmt's "If" arm exactly, generalized to N arms with a
+# guaranteed-fail tail when no arm's pattern (+ optional guard) matches --
+# a runtime error naming the failure (via contract_check, the same
+# design-by-contract host primitive already used for other "this should be
+# unreachable" cases in this file, e.g. immutable-reassignment above), NOT
+# a silent no-op: PatLang has no static type system to check exhaustiveness
+# against, so an unmatched scrutinee with no `_` arm is a genuine bug at
+# runtime, not a case to swallow quietly (decided explicitly in the issue
+# #44 follow-up plan, not left implicit).
+make a function called lower_match takes node, code, fns, fname, locals, mutables, pending, lines, wants_value returns out
+  let scrutineeExpr = node[1]
+  let arms = node[2]
+  # Store the scrutinee ONCE into a fresh synthesized local -- same
+  # reasoning as this file's other __closure_N/__budgeted_N synthesized
+  # names: re-evaluating an expression with side effects once per arm
+  # (e.g. `match next_event() do ...`) would be a real correctness bug,
+  # not just wasted work.
+  let tmp = next_match_name()
+  let code = lower_expr(scrutineeExpr, code, fns, locals, pending, lines)
+  vec_push(code, ["Store", tmp])
+  vec_push(locals, tmp)
+  vec_push(mutables, false)
+  let scrutineeVar = ["Var", tmp]
+  let endJumps = vec_new()
+  let i = 0
+  let n = to_num(list_len(arms))
+  while i < n do
+    let arm = arms[i]
+    let pattern = arm[0]
+    let guard = arm[1]
+    let body = arm[2]
+    let comp = compile_pattern(pattern, scrutineeVar)
+    let testNode = comp[0]
+    let letStmts = comp[1]
+    let code = lower_expr(testNode, code, fns, locals, pending, lines)
+    let jifPattern = vec_len(code)
+    vec_push(code, ["JumpIfFalse", 0])
+    # Bindings the pattern introduced (e.g. PBind's `let v = scrutinee`)
+    # must be emitted BEFORE the guard is evaluated, not folded into one
+    # `pattern_test and guard` expression -- a `when` guard is documented
+    # to reference bindings its own pattern just introduced (e.g. `case n
+    # when n > 100`), and `n` doesn't exist as a real local until this
+    # Store actually runs. Evaluating the AND as a single expression would
+    # load an unbound `n` while still building the LEFT side's truth value,
+    # silently reading Unit/stale-load instead of the real scrutinee no
+    # matter what the guard says. Found via a real failing run (guarded(200)
+    # returning "small:200" instead of "big:200"), not by inspection.
+    let j = 0
+    while j < letStmts.length do
+      let code = lower_stmt(letStmts[j], code, fns, fname, locals, mutables, pending, lines, false)
+      let j = j + 1
+    end
+    let jifGuard = -1
+    if guard != false then
+      let code = lower_expr(guard, code, fns, locals, pending, lines)
+      let jifGuard = vec_len(code)
+      vec_push(code, ["JumpIfFalse", 0])
+    end
+    let code = lower_block(body, code, fns, fname, locals, mutables, pending, lines, wants_value)
+    let jmp = vec_len(code)
+    vec_push(code, ["Jump", 0])
+    vec_push(endJumps, jmp)
+    let next_arm_pc = vec_len(code)
+    vec_set(code, jifPattern, ["JumpIfFalse", next_arm_pc])
+    if jifGuard >= 0 then
+      vec_set(code, jifGuard, ["JumpIfFalse", next_arm_pc])
+    end
+    let i = i + 1
+  end
+  # No arm matched: fatal, mirrors PatLang's existing "no try/catch, host
+  # errors are fatal" philosophy (contract_check's ok=false arg always
+  # errors -- see its use for immutable reassignment above -- so nothing
+  # after this point ever actually runs; the Store/Const that follow it
+  # exist only to keep the instruction stream's stack shape consistent
+  # with the matched-arm paths for any backend that reasons about it
+  # statically, matching the same dead-but-shape-correct pattern the
+  # immutable-reassignment path above already relies on).
+  vec_push(code, ["Const", "str", fname])
+  vec_push(code, ["Const", "str", "assert"])
+  vec_push(code, ["Const", "str", "match: no case matched the scrutinee value"])
+  vec_push(code, ["Const", "bool", "false"])
+  vec_push(code, ["CallHost", "contract_check", 4])
+  vec_push(code, ["Store", "__discard"])
+  if wants_value then
+    vec_push(code, ["Const", "unit", ""])
+  end
+  let end_pc = vec_len(code)
+  let i = 0
+  while i < vec_len(endJumps) do
+    vec_set(code, vec_get(endJumps, i), ["Jump", end_pc])
+    let i = i + 1
+  end
+  return code
+end
+
 make a function called lower_stmt takes node, code, fns, fname, locals, mutables, pending, lines, wants_value returns out
   let ty = node[0]
   # Record this statement's source line BEFORE lowering it, at the pc it's
@@ -648,6 +825,9 @@ make a function called lower_stmt takes node, code, fns, fname, locals, mutables
           vec_push(code, ["Return"])
           return code
         else
+          if ty == "Match" then
+            return lower_match(node, code, fns, fname, locals, mutables, pending, lines, wants_value)
+          else
           if ty == "If" then
             let code = lower_expr(node[1], code, fns, locals, pending, lines)
             let jif = vec_len(code)
@@ -881,6 +1061,7 @@ make a function called lower_stmt takes node, code, fns, fname, locals, mutables
     end
     end
   end
+  end
 end
 
 # Mirrors ir/lowering.rs's own lower_stmt_list exactly: lowers a statement
@@ -945,6 +1126,16 @@ make a function called body_assigns_name takes stmts, name returns r
     if s[0] == "While" then
       if body_assigns_name(s[2], name) then
         return true
+      end
+    end
+    if s[0] == "Match" then
+      let arms = s[2]
+      let ai = 0
+      while ai < arms.length do
+        if body_assigns_name(arms[ai][2], name) then
+          return true
+        end
+        let ai = ai + 1
       end
     end
     let i = i + 1

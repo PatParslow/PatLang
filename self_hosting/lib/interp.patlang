@@ -61,9 +61,70 @@
 # SLICE 4: MakeClosure/CallValue (closures).
 # =============================================================================
 
+# GitHub #96: an integer literal whose exact decimal text doesn't fit an
+# i64 (e.g. `100000000000000000000`) used to silently saturate to
+# i64::MAX when a program ran through this interpreter -- `interp_const`
+# delegated to the general `to_num()` host function, but `to_num` is
+# permanently bound to the "fast value" prelude chunk in any natively-
+# compiled PatLang program (ir/codegen.rs's CHUNK_MAP pins it to
+# ChunkId::StringsExt unconditionally), which has NO BigInt awareness by
+# design -- it falls back to a lossy f64 parse for anything past i64
+# range. That's a real, separate, already-documented limitation of
+# `to_num` as a general string-to-number coercion (see hosts.rs's
+# host_to_num for the equivalent fix already made THERE, in the
+# interpreter-native path) -- not something to change here, since to_num
+# is a hot, pervasively-used utility and changing its chunk binding risks
+# bloating every simple compiled program that currently links cheaply.
+#
+# The actual fix: a LITERAL never needs `to_num`'s general string
+# coercion at all -- it's parsed once, here, from lexer-preserved exact
+# decimal text (self_hosting/lib/lexer.patlang never rounds through f64
+# itself). Building the integer digit-by-digit with ordinary `*`/`+`
+# instead reuses this same interpreter's OWN already-correct numeric-
+# tower arithmetic (proved working: `factorial(25)` already promotes to
+# an exact BigInt through ordinary `*` overflow, since arithmetic
+# operators -- unlike to_num -- ARE numeric-tower-aware in every backend
+# that links this chunk) rather than a second, separately-scoped
+# conversion utility.
+make a function called text_has_dot takes text returns r
+  let n = text.length
+  let i = 0
+  while i < n do
+    if char_code(text, i) == 46 then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called parse_int_literal_exact takes text returns v
+  let neg = false
+  let start = 0
+  if (text.length > 0) and (substr(text, 0, 1) == "-") then
+    let neg = true
+    let start = 1
+  end
+  let n = text.length
+  let i = start
+  let acc = 0
+  while i < n do
+    let d = char_code(text, i) - 48
+    let acc = (acc * 10) + d
+    let i = i + 1
+  end
+  if neg then
+    return 0 - acc
+  end
+  return acc
+end
+
 make a function called interp_const takes kind, text returns v
   if kind == "num" then
-    return to_num(text)
+    if text_has_dot(text) then
+      return to_num(text)
+    end
+    return parse_int_literal_exact(text)
   end
   if kind == "bool" then
     if text == "true" then
@@ -1056,16 +1117,18 @@ make a function called dbg_value_to_json takes v returns json
     return json_quote(v)
   end
   if ty == "list" then
-    let out = "["
+    let out = sb_new()
+    sb_push(out, "[")
     let i = 0
     while i < v.length do
       if i > 0 then
-        let out = out + ","
+        sb_push(out, ",")
       end
-      let out = out + dbg_value_to_json(v[i])
+      sb_push(out, dbg_value_to_json(v[i]))
       let i = i + 1
     end
-    return out + "]"
+    sb_push(out, "]")
+    return sb_str(out)
   end
   if (ty == "int") or (ty == "float") or (ty == "bigint") or (ty == "bool") then
     return "" + v
@@ -1084,16 +1147,18 @@ make a function called dbg_paused_to_json takes ev returns json
   let line = ev[2]
   let locals = ev[3]
   let call_stack = ev[4]
-  let locals_json = "{"
+  let locals_b = sb_new()
+  sb_push(locals_b, "{")
   let i = 0
   while i < locals.length do
     if i > 0 then
-      let locals_json = locals_json + ","
+      sb_push(locals_b, ",")
     end
-    let locals_json = locals_json + json_quote(locals[i][0]) + ":" + dbg_value_to_json(locals[i][1])
+    sb_push(locals_b, json_quote(locals[i][0]) + ":" + dbg_value_to_json(locals[i][1]))
     let i = i + 1
   end
-  let locals_json = locals_json + "}"
+  sb_push(locals_b, "}")
+  let locals_json = sb_str(locals_b)
   return "{\"fname\":" + json_quote(fname) + ",\"line\":" + line + ",\"locals\":" + locals_json + ",\"call_stack\":" + dbg_value_to_json(call_stack) + "}"
 end
 
@@ -1109,16 +1174,18 @@ make a function called dbg_trace_json takes source, max_steps returns json
   let r = dbg_trace(source, false, max_steps)
   let trace = r[1]
   let final = r[2]
-  let trace_json = "["
+  let trace_b = sb_new()
+  sb_push(trace_b, "[")
   let i = 0
   while i < trace.length do
     if i > 0 then
-      let trace_json = trace_json + ","
+      sb_push(trace_b, ",")
     end
-    let trace_json = trace_json + dbg_paused_to_json(trace[i])
+    sb_push(trace_b, dbg_paused_to_json(trace[i]))
     let i = i + 1
   end
-  let trace_json = trace_json + "]"
+  sb_push(trace_b, "]")
+  let trace_json = sb_str(trace_b)
   if r[0] == "Ok" then
     return "{\"ok\":true,\"trace\":" + trace_json + ",\"final_ok\":" + (final[0] == "Ok") + ",\"final_value\":" + dbg_value_to_json(final[1]) + "}"
   end

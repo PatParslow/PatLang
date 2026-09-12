@@ -836,8 +836,28 @@ impl Host {
 // need an integer extractor that works regardless of which Value-shape
 // chunk is paired alongside PRELUDE_CORE -- Value::Int exists in both, but
 // arithmetic results in the "fast" shape can come back as Value::Number.
+// This text is genuinely SHARED (one copy, unlike as_bits above, which is
+// duplicated once per Value-shape) so it cannot name Value::BigInt
+// directly -- that variant doesn't exist in the "fast" enum at all, and
+// would be a hard compile error there. Falls back to the already-generic
+// `as_number()` method (defined identically in both preludes) instead,
+// mirroring rust-runtime/src/ir/hosts.rs's own bits_arg (used by these
+// same host functions under the tree-walking interpreter) exactly --
+// same accepted trade-off: lossy for a BigInt-range value (through an f64
+// round-trip) rather than an outright error, consistent with what
+// `--ir-run` already does for this exact call today, not a NEW precision
+// loss introduced here. GitHub #85 investigation: with no BigInt handling
+// at all, `bit_get`/`bit_set`/`bit_slice`/`bit_set_slice` on a 64-bit tag-
+// mask-shaped literal (which the numeric tower correctly promotes past
+// i64::MAX) failed outright with a bare "expected an integer", not just
+// imprecisely -- self_hosting/lib/codegen_x64.patlang and x64_runtime.
+// patlang both call these with exactly such literals.
 fn bits_of(v: &Value) -> Result<i64, String> {
-    match v { Value::Int(n) => Ok(*n), Value::Number(n) => Ok(*n as i64), _ => Err("expected an integer".into()) }
+    match v {
+        Value::Int(n) => Ok(*n),
+        Value::Number(n) => Ok(*n as i64),
+        other => other.as_number().map(|n| n as i64).map_err(|_| "expected an integer".to_string()),
+    }
 }
 
 #[derive(Clone)]
@@ -2372,7 +2392,21 @@ fn neg(a:&Value)->Result<Value,String>{
     }
 }
 fn as_bits(v:&Value)->Result<i64,String>{
-    match v { Value::Int(n) => Ok(*n), Value::Number(n) => Ok(*n as i64), _ => Err("expected an integer".into()) }
+    match v {
+        Value::Int(n) => Ok(*n),
+        Value::Number(n) => Ok(*n as i64),
+        Value::BigInt(b) => {
+            let s = b.to_string();
+            let (neg, digits) = match s.strip_prefix('-') { Some(rest) => (true, rest), None => (false, s.as_str()) };
+            let mut acc: u64 = 0;
+            for ch in digits.chars() {
+                if let Some(d) = ch.to_digit(10) { acc = acc.wrapping_mul(10).wrapping_add(d as u64); }
+            }
+            let bits = if neg { acc.wrapping_neg() } else { acc };
+            Ok(bits as i64)
+        }
+        _ => Err("expected an integer".into()),
+    }
 }
 fn bitand(a:&Value,b:&Value)->Result<Value,String>{ Ok(Value::Int(as_bits(a)? & as_bits(b)?)) }
 fn bitor(a:&Value,b:&Value)->Result<Value,String>{ Ok(Value::Int(as_bits(a)? | as_bits(b)?)) }
@@ -2710,7 +2744,21 @@ fn host_call_math(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     const PRELUDE_STRINGS_EXT: &'static str = r##"fn host_call_strings_ext_inner(name: &str, args: &[Value]) -> Result<Value, String> {
     match name {
 "char_code" => {
-                // char_code(string, index) -> Number code point, or -1 if out of range
+                // char_code(string, index) -> Int code point, or -1 if out of range.
+                // GitHub #96 (follow-up): a character code is ALWAYS an integer,
+                // never fractional -- returning Value::Number(f64) here (the
+                // untyped "fast value" fallback shape) instead of Value::Int
+                // silently poisons any numeric-tower-aware arithmetic built on
+                // it into float-space (the tower's own add/mul only fast-path
+                // Int/Int and Float/Float; anything else, including Number,
+                // falls through to a generic float-losing conversion), which
+                // defeats BigInt overflow-promotion. Confirmed directly: a
+                // self-hosted digit-accumulation loop (`acc = acc*10 + (char_
+                // code(text,i) - 48)`) silently saturated to i64::MAX on a
+                // 21-digit literal instead of promoting to BigInt, while the
+                // IDENTICAL loop over a plain list of int digits (bypassing
+                // char_code) worked correctly -- isolating the return type,
+                // not the loop logic, as the actual defect.
                 // NOTE: must not clone the whole string here (`s.as_ref().clone()`
                 // would deep-copy the entire backing String on every call --
                 // exactly the O(n^2) LoadLocal-clone bug the Arc<String>
@@ -2718,13 +2766,13 @@ fn host_call_math(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
                 if args.len() != 2 { return Err("char_code: expected 2 args".into()); }
                 let owned0;
                 let s: &str = match &args[0] { Value::String(s) => s.as_str(), v => { owned0 = to_s(v); owned0.as_str() } };
-                let idx = match &args[1] { Value::Number(n) => *n as usize, Value::String(t) => t.parse::<usize>().unwrap_or(usize::MAX), _ => usize::MAX };
+                let idx = match &args[1] { Value::Number(n) => *n as usize, Value::Int(n) => *n as usize, Value::String(t) => t.parse::<usize>().unwrap_or(usize::MAX), _ => usize::MAX };
                 if s.is_ascii() {
-                    return Ok(Value::Number(match s.as_bytes().get(idx) { Some(b) => *b as f64, None => -1.0 }));
+                    return Ok(Value::Int(match s.as_bytes().get(idx) { Some(b) => *b as i64, None => -1 }));
                 }
                 match s.chars().nth(idx) {
-                    Some(c) => Ok(Value::Number(c as u32 as f64)),
-                    None => Ok(Value::Number(-1.0)),
+                    Some(c) => Ok(Value::Int(c as u32 as i64)),
+                    None => Ok(Value::Int(-1)),
                 }
             }
             "substr" => {
@@ -2872,23 +2920,32 @@ fn host_call_collections_handles_inner(name: &str, args: &[Value]) -> Result<Val
                 Ok(Value::Number(id as f64))
             }
             "sc_len" => {
+                // GitHub #96 (follow-up): a string LENGTH is always an
+                // integer -- Value::Number(f64) here poisons any numeric-
+                // tower-aware arithmetic built on it (e.g. `i < sc_len(h)`
+                // loop bounds, or accumulation) into float-space, same bug
+                // class as char_code below. sc_len is used in essentially
+                // every self-hosted lexer loop (self_hosting/lib/lexer.
+                // patlang's tokenize), so this has broad reach.
                 let id = arg_usize(&args, 0, "sc_len")?;
                 ISTRINGS.with(|v| {
                     let b = v.borrow();
                     b.get(id).ok_or_else(|| format!("sc_len: unknown string {}", id))
-                        .map(|(s, is_ascii)| Value::Number(if *is_ascii { s.len() as f64 } else { s.chars().count() as f64 }))
+                        .map(|(s, is_ascii)| Value::Int(if *is_ascii { s.len() as i64 } else { s.chars().count() as i64 }))
                 })
             }
             "sc_code" => {
+                // GitHub #96 (follow-up): same fix as char_code above -- a
+                // character code is always an integer.
                 let id = arg_usize(&args, 0, "sc_code")?;
                 let idx = arg_usize(&args, 1, "sc_code")?;
                 ISTRINGS.with(|v| {
                     let b = v.borrow();
                     let (s, is_ascii) = b.get(id).ok_or_else(|| format!("sc_code: unknown string {}", id))?;
                     if *is_ascii {
-                        return Ok(Value::Number(match s.as_bytes().get(idx) { Some(c) => *c as f64, None => -1.0 }));
+                        return Ok(Value::Int(match s.as_bytes().get(idx) { Some(c) => *c as i64, None => -1 }));
                     }
-                    Ok(Value::Number(match s.chars().nth(idx) { Some(c) => c as u32 as f64, None => -1.0 }))
+                    Ok(Value::Int(match s.chars().nth(idx) { Some(c) => c as u32 as i64, None => -1 }))
                 })
             }
             "sc_char" => {
@@ -4385,7 +4442,7 @@ struct EmbeddedRlibBuild {
     child: Option<std::process::Child>,
 }
 
-fn embedded_spawn_rlib_build(crate_name: &str, text: &str, deps: &[(String, std::path::PathBuf)]) -> Result<EmbeddedRlibBuild, String> {
+fn embedded_spawn_rlib_build(crate_name: &str, text: &str, deps: &[(String, std::path::PathBuf, String)]) -> Result<EmbeddedRlibBuild, String> {
     let dir = embedded_chunk_cache_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("chunk cache dir: {}", e))?;
     let rlib_path = dir.join(format!("lib{}.rlib", crate_name));
@@ -4417,10 +4474,18 @@ fn embedded_spawn_rlib_build(crate_name: &str, text: &str, deps: &[(String, std:
             full_text.push('\n');
         }
     }
-    for (dep_name, _) in deps {
+    for (dep_name, _, _) in deps {
         full_text.push_str(&format!("use {}::*;\n", dep_name));
     }
     full_text.push_str(text);
+    // GitHub #78: same fix as the non-embedded spawn_rlib_build above --
+    // fold each dependency's own resolved content hash into this chunk's
+    // cache key, so a base chunk's edit transitively invalidates every
+    // dependent instead of leaving their stale rlibs cached (surfacing
+    // later as `error[E0463]: can't find crate`, far from the real cause).
+    for (dep_name, _, dep_hash) in deps {
+        full_text.push_str(&format!("// dep-hash:{}={}\n", dep_name, dep_hash));
+    }
     let hash = embedded_fnv1a_hex(&full_text);
     let cached_hash = std::fs::read_to_string(&fingerprint_path).ok();
     if cached_hash.as_deref() == Some(hash.as_str()) && rlib_path.exists() {
@@ -4430,7 +4495,7 @@ fn embedded_spawn_rlib_build(crate_name: &str, text: &str, deps: &[(String, std:
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
     let mut cmd = std::process::Command::new(&rustc);
     cmd.arg("--edition=2021").arg("--crate-type=rlib").arg("--crate-name").arg(crate_name).arg("-O");
-    for (dep_name, dep_path) in deps {
+    for (dep_name, dep_path, _) in deps {
         cmd.arg("--extern").arg(format!("{}={}", dep_name, dep_path.display()));
     }
     cmd.arg(&src_path).arg("-o").arg(&rlib_path);
@@ -4438,7 +4503,7 @@ fn embedded_spawn_rlib_build(crate_name: &str, text: &str, deps: &[(String, std:
     Ok(EmbeddedRlibBuild { crate_name: crate_name.to_string(), rlib_path, fingerprint_path, hash, child: Some(child) })
 }
 
-fn embedded_wait_rlib_build(mut build: EmbeddedRlibBuild) -> Result<std::path::PathBuf, String> {
+fn embedded_wait_rlib_build(mut build: EmbeddedRlibBuild) -> Result<(std::path::PathBuf, String), String> {
     if let Some(mut child) = build.child.take() {
         let status = child.wait().map_err(|e| format!("wait rustc for chunk '{}': {}", build.crate_name, e))?;
         if !status.success() {
@@ -4446,7 +4511,7 @@ fn embedded_wait_rlib_build(mut build: EmbeddedRlibBuild) -> Result<std::path::P
         }
         std::fs::write(&build.fingerprint_path, &build.hash).map_err(|e| format!("write fingerprint for '{}': {}", build.crate_name, e))?;
     }
-    Ok(build.rlib_path)
+    Ok((build.rlib_path, build.hash))
 }
 
 fn embedded_build_chunked(program_src: &str, base_name: &str, chunk_texts: &[(String, String)], out: &str, opt_level: Option<&str>) -> Result<String, String> {
@@ -4456,8 +4521,8 @@ fn embedded_build_chunked(program_src: &str, base_name: &str, chunk_texts: &[(St
     };
     let base_text = embedded_pubify_chunk_text(text_of(base_name)?);
     let base_rlib_build = embedded_spawn_rlib_build(base_name, &base_text, &[])?;
-    let base_rlib = embedded_wait_rlib_build(base_rlib_build)?;
-    let base_dep = (base_name.to_string(), base_rlib);
+    let (base_rlib, base_hash) = embedded_wait_rlib_build(base_rlib_build)?;
+    let base_dep = (base_name.to_string(), base_rlib, base_hash);
 
     let other_names: Vec<&str> = chunk_texts.iter()
         .map(|(n, _)| n.as_str())
@@ -4468,13 +4533,13 @@ fn embedded_build_chunked(program_src: &str, base_name: &str, chunk_texts: &[(St
         let text = embedded_pubify_chunk_text(text_of(name)?);
         tier1_builds.push(embedded_spawn_rlib_build(name, &text, std::slice::from_ref(&base_dep))?);
     }
-    let mut chunk_rlibs: Vec<(String, std::path::PathBuf)> = vec![base_dep.clone()];
+    let mut chunk_rlibs: Vec<(String, std::path::PathBuf, String)> = vec![base_dep.clone()];
     for build in tier1_builds {
         let name = build.crate_name.clone();
-        let path = embedded_wait_rlib_build(build)?;
-        chunk_rlibs.push((name, path));
+        let (path, hash) = embedded_wait_rlib_build(build)?;
+        chunk_rlibs.push((name, path, hash));
     }
-    let logic_dep = chunk_rlibs.iter().find(|(n, _)| n == "logic").cloned();
+    let logic_dep = chunk_rlibs.iter().find(|(n, _, _)| n == "logic").cloned();
 
     let mut tier2_builds = Vec::new();
     for name in ["oo", "contracts"] {
@@ -4486,13 +4551,13 @@ fn embedded_build_chunked(program_src: &str, base_name: &str, chunk_texts: &[(St
     }
     for build in tier2_builds {
         let name = build.crate_name.clone();
-        let path = embedded_wait_rlib_build(build)?;
-        chunk_rlibs.push((name, path));
+        let (path, hash) = embedded_wait_rlib_build(build)?;
+        chunk_rlibs.push((name, path, hash));
     }
 
     let mut full_src = String::new();
     full_src.push_str(&embedded_common_use_header());
-    for (name, _) in &chunk_rlibs {
+    for (name, _, _) in &chunk_rlibs {
         full_src.push_str(&format!("use {}::*;\n", name));
     }
     full_src.push_str(program_src);
@@ -4510,7 +4575,7 @@ fn embedded_build_chunked(program_src: &str, base_name: &str, chunk_texts: &[(St
         Some(level) => { cmd.arg("-C").arg(format!("opt-level={}", level)); }
         None => { cmd.arg("-O"); }
     }
-    for (name, path) in &chunk_rlibs {
+    for (name, path, _) in &chunk_rlibs {
         cmd.arg("--extern").arg(format!("{}={}", name, path.display()));
     }
     cmd.arg(&src_path).arg("-o").arg(out);
@@ -5785,12 +5850,20 @@ fn chunk_cache_dir() -> std::path::PathBuf {
 }
 
 /// Ensures a `.rlib` exists for the given crate name + source text +
-/// list of already-built dependency rlibs (as `(crate_name, rlib_path)`
-/// pairs to pass via `--extern`), building it if the cached copy is
-/// missing or the text's hash has changed. Returns the rlib's path.
-/// Synchronous/blocking -- callers wanting parallelism spawn several of
-/// these concurrently via `spawn_rlib_build` instead.
-fn ensure_chunk_rlib(crate_name: &str, text: &str, deps: &[(String, std::path::PathBuf)]) -> Result<std::path::PathBuf, String> {
+/// list of already-built dependency rlibs (as `(crate_name, rlib_path,
+/// content_hash)` triples to pass via `--extern`; `content_hash` is each
+/// dependency's OWN resolved hash from `RlibBuild`/`ensure_chunk_rlib`,
+/// folded into THIS chunk's cache key -- see `spawn_rlib_build`'s own
+/// comment for why: a chunk's cache key must depend on its dependencies'
+/// CONTENT, not just their names, or a base chunk's edit leaves every
+/// dependent's stale rlib cached and reused, breaking with `error[E0463]:
+/// can't find crate` far from the actual cause), building it if the
+/// cached copy is missing or the (content-plus-deps) hash has changed.
+/// Returns the rlib's path and its own resolved hash (so a CALLER of
+/// this chunk can, in turn, fold it into their own key). Synchronous/
+/// blocking -- callers wanting parallelism spawn several of these
+/// concurrently via `spawn_rlib_build` instead.
+fn ensure_chunk_rlib(crate_name: &str, text: &str, deps: &[(String, std::path::PathBuf, String)]) -> Result<(std::path::PathBuf, String), String> {
     let child = spawn_rlib_build(crate_name, text, deps)?;
     wait_rlib_build(child)
 }
@@ -5811,7 +5884,7 @@ struct RlibBuild {
 /// everything except the base, which everything else needs first)
 /// compile on separate cores simultaneously, per the user's explicit
 /// ask ("there are 20 cores on this machine, after all").
-fn spawn_rlib_build(crate_name: &str, text: &str, deps: &[(String, std::path::PathBuf)]) -> Result<RlibBuild, String> {
+fn spawn_rlib_build(crate_name: &str, text: &str, deps: &[(String, std::path::PathBuf, String)]) -> Result<RlibBuild, String> {
     let dir = chunk_cache_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("chunk cache dir: {}", e))?;
     let rlib_path = dir.join(format!("lib{}.rlib", crate_name));
@@ -5864,21 +5937,40 @@ fn spawn_rlib_build(crate_name: &str, text: &str, deps: &[(String, std::path::Pa
             full_text.push('\n');
         }
     }
-    for (dep_name, _) in deps {
+    for (dep_name, _, _) in deps {
         full_text.push_str(&format!("use {}::*;\n", dep_name));
     }
     full_text.push_str(text);
+    // GitHub #78: a chunk's cache key must depend on its dependencies'
+    // CONTENT, not just their names -- otherwise, when a base chunk is
+    // rebuilt with genuinely different text, every chunk that depends on
+    // it keeps its OLD cached rlib (this chunk's own `full_text`, and
+    // thus its hash, is unchanged: only the literal string "use
+    // <dep>::*;" was ever part of it, never the dependency's actual
+    // content), which now references stale crate metadata. The build
+    // then fails at the FINAL link step with `error[E0463]: can't find
+    // crate`, far from -- and looking nothing like -- the actual cause
+    // (the base chunk's edit). Folding each dependency's own resolved
+    // hash in as trailing comment lines (valid, inert Rust, harmless if
+    // written to the .rs file) makes this chunk's key transitively
+    // depend on everything it links against, not just its own text.
+    for (dep_name, _, dep_hash) in deps {
+        full_text.push_str(&format!("// dep-hash:{}={}\n", dep_name, dep_hash));
+    }
     // Hash the FULLY ASSEMBLED text (including the `use <dep>::*;` lines
-    // above), not just the chunk's own static body -- a chunk like
-    // `io_misc` has byte-identical own-text whether it's linked against
-    // `patlang_base_fast` or `patlang_base_tower`, but the compiled rlib
-    // is NOT interchangeable between them (different `Value` layout/
-    // metadata hash). Hashing only the static text let a stale
-    // fast-linked (or tower-linked) rlib get silently reused for the
-    // other base variant, surfacing later as a baffling `error[E0463]:
-    // can't find crate for 'io_misc'` at the FINAL link step -- looked
-    // exactly like a cache race at first, but reproduced deterministically
-    // even single-threaded once the two base variants alternated.
+    // and `dep-hash` comments above), not just the chunk's own static
+    // body -- a chunk like `io_misc` has byte-identical own-text whether
+    // it's linked against `patlang_base_fast` or `patlang_base_tower`,
+    // but the compiled rlib is NOT interchangeable between them
+    // (different `Value` layout/metadata hash). Hashing only the static
+    // text let a stale fast-linked (or tower-linked) rlib get silently
+    // reused for the other base variant, surfacing later as a baffling
+    // `error[E0463]: can't find crate for 'io_misc'` at the FINAL link
+    // step -- looked exactly like a cache race at first, but reproduced
+    // deterministically even single-threaded once the two base variants
+    // alternated. The `dep-hash` comments above close the SAME class of
+    // gap one level further: base-variant identity AND base-variant
+    // CONTENT both now participate in every dependent's cache key.
     let hash = fnv1a_hex(&full_text);
     let cached_hash = std::fs::read_to_string(&fingerprint_path).ok();
     if cached_hash.as_deref() == Some(hash.as_str()) && rlib_path.exists() {
@@ -5888,7 +5980,7 @@ fn spawn_rlib_build(crate_name: &str, text: &str, deps: &[(String, std::path::Pa
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
     let mut cmd = std::process::Command::new(&rustc);
     cmd.arg("--edition=2021").arg("--crate-type=rlib").arg("--crate-name").arg(crate_name).arg("-O");
-    for (dep_name, dep_path) in deps {
+    for (dep_name, dep_path, _) in deps {
         cmd.arg("--extern").arg(format!("{}={}", dep_name, dep_path.display()));
     }
     cmd.arg(&src_path).arg("-o").arg(&rlib_path);
@@ -5896,7 +5988,7 @@ fn spawn_rlib_build(crate_name: &str, text: &str, deps: &[(String, std::path::Pa
     Ok(RlibBuild { crate_name: crate_name.to_string(), rlib_path, fingerprint_path, hash, child: Some(child) })
 }
 
-fn wait_rlib_build(mut build: RlibBuild) -> Result<std::path::PathBuf, String> {
+fn wait_rlib_build(mut build: RlibBuild) -> Result<(std::path::PathBuf, String), String> {
     if let Some(mut child) = build.child.take() {
         let status = child.wait().map_err(|e| format!("wait rustc for chunk '{}': {}", build.crate_name, e))?;
         if !status.success() {
@@ -5904,7 +5996,7 @@ fn wait_rlib_build(mut build: RlibBuild) -> Result<std::path::PathBuf, String> {
         }
         std::fs::write(&build.fingerprint_path, &build.hash).map_err(|e| format!("write fingerprint for '{}': {}", build.crate_name, e))?;
     }
-    Ok(build.rlib_path)
+    Ok((build.rlib_path, build.hash))
 }
 
 /// The main entry point: given the caller's per-program Rust text (NOT
@@ -5968,8 +6060,8 @@ pub fn build_chunked_native_from_texts(program_src: &str, base_name: &str, chunk
     let base_text = pubify_chunk_text(text_of(base_name)?);
 
     // Tier 0: base (everything else depends on it).
-    let base_rlib = ensure_chunk_rlib(base_name, &base_text, &[])?;
-    let base_dep = (base_name.to_string(), base_rlib.clone());
+    let (base_rlib, base_hash) = ensure_chunk_rlib(base_name, &base_text, &[])?;
+    let base_dep = (base_name.to_string(), base_rlib.clone(), base_hash);
 
     // Tier 1: every other required chunk except `oo`/`contracts` (which
     // additionally need `logic`), started concurrently.
@@ -5982,13 +6074,13 @@ pub fn build_chunked_native_from_texts(program_src: &str, base_name: &str, chunk
         let text = pubify_chunk_text(text_of(name)?);
         tier1_builds.push(spawn_rlib_build(name, &text, std::slice::from_ref(&base_dep))?);
     }
-    let mut chunk_rlibs: Vec<(String, std::path::PathBuf)> = vec![base_dep.clone()];
+    let mut chunk_rlibs: Vec<(String, std::path::PathBuf, String)> = vec![base_dep.clone()];
     for build in tier1_builds {
         let name = build.crate_name.clone();
-        let path = wait_rlib_build(build)?;
-        chunk_rlibs.push((name, path));
+        let (path, hash) = wait_rlib_build(build)?;
+        chunk_rlibs.push((name, path, hash));
     }
-    let logic_dep = chunk_rlibs.iter().find(|(n, _)| n == "logic").cloned();
+    let logic_dep = chunk_rlibs.iter().find(|(n, _, _)| n == "logic").cloned();
 
     // Tier 2: `oo`/`contracts`, each needing base + logic (per
     // CROSS_CHUNK_EDGES), also started concurrently with each other.
@@ -6002,8 +6094,8 @@ pub fn build_chunked_native_from_texts(program_src: &str, base_name: &str, chunk
     }
     for build in tier2_builds {
         let name = build.crate_name.clone();
-        let path = wait_rlib_build(build)?;
-        chunk_rlibs.push((name, path));
+        let (path, hash) = wait_rlib_build(build)?;
+        chunk_rlibs.push((name, path, hash));
     }
 
     // Final link: the per-program text against every chunk rlib. A
@@ -6012,7 +6104,7 @@ pub fn build_chunked_native_from_texts(program_src: &str, base_name: &str, chunk
     // bare, unqualified references to `Value`/host functions/etc.
     let mut full_src = String::new();
     full_src.push_str(COMMON_USE_HEADER);
-    for (name, _) in &chunk_rlibs {
+    for (name, _, _) in &chunk_rlibs {
         full_src.push_str(&format!("use {}::*;\n", name));
     }
     full_src.push_str(program_src);
@@ -6030,7 +6122,7 @@ pub fn build_chunked_native_from_texts(program_src: &str, base_name: &str, chunk
         Some(level) => { cmd.arg(format!("-C")).arg(format!("opt-level={}", level)); }
         None => { cmd.arg("-O"); }
     }
-    for (name, path) in &chunk_rlibs {
+    for (name, path, _) in &chunk_rlibs {
         cmd.arg("--extern").arg(format!("{}={}", name, path.display()));
     }
     cmd.arg(&src_path).arg("-o").arg(out);

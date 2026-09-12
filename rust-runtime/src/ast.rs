@@ -65,6 +65,30 @@ pub enum Expr {
     // Extend with more expression types as needed
 }
 
+// Issue #44: `match`/`case` pattern shapes. Mirrors self_hosting/lib/
+// parser.patlang's own Pattern AST exactly (PWild/PBind/PLit/PCmp/PGlob/
+// PList there) -- same grammar, same v1 scope, kept in sync by hand (see
+// the mirror-check skill's "grammar parity" distinction). `Lit` reuses
+// Expr rather than a bespoke literal type since Expr::Number/BigNumber/
+// Float/String/Identifier("true"/"false") already cover every literal
+// shape a pattern needs, with no new representation to keep in sync.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Pattern {
+    Wildcard,
+    Bind(String),
+    Lit(Expr),
+    // A comparison guard wearing pattern clothing (`case > 10 then`) --
+    // deliberately not a distinct "range pattern" concept, see the issue
+    // #44 follow-up plan's own rationale for keeping the grammar small.
+    Cmp(BinaryOperator, Expr),
+    // Unquoted glob syntax (`*fred*`, `fred*`) -- translated to a regex
+    // and matched via glob_match (ir/hosts.rs), reusing the existing
+    // regex engine rather than a bespoke matcher.
+    Glob(String),
+    // Recursive tagged-list pattern: `["Ok", v]`, `["Err", ["Nested", m]]`.
+    List(Vec<Pattern>),
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Stmt {
     ExprStmt(Expr),
@@ -174,6 +198,18 @@ pub enum Stmt {
         fields: Vec<(String, Expr)>,
         methods: Vec<(String, Vec<String>, Vec<Stmt>)>,
         traits: Vec<String>,
+    },
+    // Issue #44: `match EXPR do case PATTERN [when GUARD] then STMTS ...
+    // end`. Pure syntactic sugar -- see ir/lowering.rs's lower_match, which
+    // desugars every arm to ordinary Expr/Instr this backend already knows
+    // how to lower (no new Instr variant), mirroring self_hosting/lib/
+    // lower.patlang's own lower_match exactly. `line` is the `match`
+    // keyword's own line, same append-only convention If/While/When
+    // already carry it for.
+    Match {
+        scrutinee: Expr,
+        arms: Vec<(Pattern, Option<Expr>, Vec<Stmt>)>,
+        line: usize,
     },
     // Extend with more statement types as needed
 }
