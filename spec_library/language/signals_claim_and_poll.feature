@@ -15,6 +15,11 @@ Feature: signals (signal_claim/signal_poll -- port ownership + idle polling)
     When signal_poll(port_id, 20) is called
     Then it returns "" within the timeout, not an error or a hang
 
+  Scenario: Polling an inherited port_id from a DIFFERENT thread is a no-op, not a crash (GitHub #79)
+    Given a port claimed on the main thread, then its port_id handed to parallel_map workers running on their own OS threads
+    When each worker calls signal_poll(port_id, 50)
+    Then every worker returns "" -- the listener genuinely lives only on the claiming thread, but a poll from elsewhere reports "nothing here" instead of the old fatal "no listener on port N" error
+
   IMPORTANT SCOPE NOTE: the full signal_send/signal_query/signal_reply
   round trip needs TWO genuinely concurrent processes (a primary polling
   in a loop while a secondary connects and queries it) -- PatLang has no

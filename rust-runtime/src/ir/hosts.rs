@@ -2899,9 +2899,23 @@ pub fn host_tcp_accept_timeout(args: &[Value]) -> Result<Value, String> {
     // time. The non-blocking primitive under PatLang event loops.
     let port = arg_num(args, 0, "tcp_accept_timeout")? as u16;
     let ms = arg_num(args, 1, "tcp_accept_timeout")?.max(0.0) as u64;
-    let listener = LISTENERS.with(|l| l.borrow().get(&port).map(|x| x.try_clone()))
-        .ok_or_else(|| format!("tcp_accept_timeout: no listener on port {}", port))?
-        .map_err(|e| format!("tcp_accept_timeout: {}", e))?;
+    // GitHub #79: LISTENERS is thread-local, but the port number a
+    // caller holds is an ordinary Value that's visible (via set_var/
+    // get, or a closure) to every thread -- parallel_map's workers each
+    // run in their own freshly-spawned OS thread (see interpreter.rs),
+    // so a worker that inherits a port number claimed on a DIFFERENT
+    // thread finds nothing in its own thread's LISTENERS map. That used
+    // to be a hard error here, indistinguishable from "you never
+    // claimed this port anywhere" -- but from a POLLER's perspective
+    // (this function backs signal_poll, whose whole contract is "return
+    // '' if nothing is here yet, never crash") a listener that exists
+    // only on some other thread is just as unreachable as no listener
+    // at all, so it is treated the same as an ordinary timeout rather
+    // than a fatal error.
+    let listener = match LISTENERS.with(|l| l.borrow().get(&port).map(|x| x.try_clone())) {
+        Some(l) => l.map_err(|e| format!("tcp_accept_timeout: {}", e))?,
+        None => return Ok(Value::Int(-1)),
+    };
     listener.set_nonblocking(true).map_err(|e| format!("tcp_accept_timeout: {}", e))?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
     loop {
