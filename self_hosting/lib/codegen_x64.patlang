@@ -926,13 +926,34 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
       let sp = pr2[1]
     elif ty == "Call" then
       let argc = to_num(instr[2])
+      let last_arg_taint = false
       let k = 0
       while k < argc do
         let pr = x64_vstack_pop(stack, sp)
         let sp = pr[1]
+        let last_arg_taint = pr[0]
         let k = k + 1
       end
+      # GitHub #99: `floor` is an ordinary Call (not CallHost), because
+      # x64_runtime.patlang defines a genuine PatLang-level function of
+      # that name (its own Rational case) -- x64_func_is_float/
+      # float_func_names classify a Call's result by whether the
+      # CALLEE'S OWN BODY contains float evidence, which floor's body
+      # (bit-masking plus a CallHost to rt_floor_via_ceil) never does,
+      # so its result was always classified plain-int here regardless of
+      # this fix's own runtime correctness -- confirmed directly:
+      # floor(2.4) computed the right float bits but printed via the
+      # generic (non-float) path, whose family-code classifier happened
+      # to misread 2.0's raw bits as the Closure family tag. floor is
+      # adaptive in exactly the same sense abs/ceil/round/trunc already
+      # are (the CallHost branch just above): its result is float
+      # exactly when its argument was, so it needs the same
+      # argument-taint-following treatment as those, not the fixed
+      # per-callee-body classification every OTHER ordinary Call gets.
       let is_float_result = x64_str_in_list(float_func_names, instr[1])
+      if instr[1] == "floor" then
+        let is_float_result = last_arg_taint
+      end
       let produces_float = list_set(produces_float, i, is_float_result)
       let pr2 = x64_vstack_push(stack, sp, is_float_result)
       let stack = pr2[0]
@@ -7215,6 +7236,22 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
     sb_push(gd_sb, "    add rsp, 16" + x64_nl_char())
     sb_push(gd_sb, "    push rax" + x64_nl_char())
     return sb_str(gd_sb)
+  end
+  # GitHub #99: `floor` genuinely never reaches x64_roundlike_asm("floor")
+  # for ordinary user code, despite that being fully correct (the
+  # floor(x) = -ceil(-x) identity, #83) -- x64_runtime.patlang ALSO
+  # defines a PatLang-level function literally named "floor" (needed for
+  # its own Rational-simplification case), so the lowerer's ordinary
+  # Call-resolution ALWAYS finds that definition first and never emits a
+  # CallHost for "floor" at all. That PatLang function's own non-
+  # Rational fallback was `return v` (the value unchanged) -- exactly
+  # #83's original bug, just moved one level up and never actually
+  # fixed for the case a real program hits. Wired here as a
+  # differently-named CallHost (rt_floor_via_ceil) x64_runtime.patlang's
+  # own floor() now calls for its fallback, so the already-correct,
+  # already-tested asm gets used instead of "unchanged".
+  if name == "rt_floor_via_ceil" then
+    return x64_roundlike_asm("floor")
   end
   if name == "rt_raw_word_eq" then
     let rweq_sb = sb_new()

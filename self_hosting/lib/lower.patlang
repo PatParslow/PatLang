@@ -1258,7 +1258,23 @@ end
 # threaded naturally through recursion (lower_expr itself has no
 # "which function/scope am I in" parameter to hang this off of).
 
-make a function called x64_rewrite_expr_boxing takes expr, ambiguous, tainted returns expr2
+# GitHub #99 regression found and fixed while completing #25 Piece 1:
+# the box-on-crossing rewrite must ONLY ever apply to an ordinary Call
+# to a ordinary user-visible PatLang FUNCTION (fns membership -- same
+# gate lower_expr's own Call-lowering already uses to decide Call vs
+# CallHost) -- NOT to a bare CallHost-dispatched primitive name like
+# ceil/round/trunc, which take a raw float and would silently receive a
+# boxed pointer instead if wrapped. `floor` is exactly this trap: it IS
+# in `fns` (x64_runtime.patlang defines a real PatLang function with
+# that name, for its own Rational case), so ceil(2.4)/round(2.4)/etc
+# calls elsewhere in the SAME file, none of which are in `fns`, were
+# never meant to be touched -- but the first version of this pass
+# didn't check `fns` membership at all before deciding "ambiguous", so
+# EVERY rounding-function call in a file mixing int/float rounding
+# calls got its argument wrongly boxed. Found immediately re-testing
+# self_hosting/examples/x64_rounding_ops.patlang (every single check
+# failed, not just floor's) while verifying #99's real fix.
+make a function called x64_rewrite_expr_boxing takes expr, ambiguous, tainted, fns returns expr2
   let ty = expr[0]
   if ty == "Call" then
     let callee = expr[1]
@@ -1266,10 +1282,14 @@ make a function called x64_rewrite_expr_boxing takes expr, ambiguous, tainted re
     let new_args = []
     let i = 0
     while i < args.length do
-      let rewritten = x64_rewrite_expr_boxing(args[i], ambiguous, tainted)
-      if x64_list_contains_str(ambiguous, callee + "#" + i) then
-        if ast_expr_looks_float_ctx(args[i], tainted) then
-          let rewritten = ["Call", "rt_box_float", [rewritten]]
+      let rewritten = x64_rewrite_expr_boxing(args[i], ambiguous, tainted, fns)
+      if contains_str(fns, callee) then
+        if not x64_list_contains_str(x64_box_crossing_excluded_names(), callee) then
+          if x64_list_contains_str(ambiguous, callee + "#" + i) then
+            if ast_expr_looks_float_ctx(args[i], tainted) then
+              let rewritten = ["Call", "rt_box_float", [rewritten]]
+            end
+          end
         end
       end
       let new_args = list_push(new_args, rewritten)
@@ -1277,16 +1297,16 @@ make a function called x64_rewrite_expr_boxing takes expr, ambiguous, tainted re
     end
     return ast_list_replace_at(expr, 2, new_args)
   elif ty == "Bin" then
-    let e2 = ast_list_replace_at(expr, 2, x64_rewrite_expr_boxing(expr[2], ambiguous, tainted))
-    return ast_list_replace_at(e2, 3, x64_rewrite_expr_boxing(expr[3], ambiguous, tainted))
+    let e2 = ast_list_replace_at(expr, 2, x64_rewrite_expr_boxing(expr[2], ambiguous, tainted, fns))
+    return ast_list_replace_at(e2, 3, x64_rewrite_expr_boxing(expr[3], ambiguous, tainted, fns))
   elif ty == "Un" then
-    return ast_list_replace_at(expr, 2, x64_rewrite_expr_boxing(expr[2], ambiguous, tainted))
+    return ast_list_replace_at(expr, 2, x64_rewrite_expr_boxing(expr[2], ambiguous, tainted, fns))
   else
     return expr
   end
 end
 
-make a function called x64_rewrite_stmts_boxing takes stmts, ambiguous, tainted returns stmts2
+make a function called x64_rewrite_stmts_boxing takes stmts, ambiguous, tainted, fns returns stmts2
   let out = []
   let cur_tainted = tainted
   let i = 0
@@ -1299,30 +1319,30 @@ make a function called x64_rewrite_stmts_boxing takes stmts, ambiguous, tainted 
           let cur_tainted = list_push(cur_tainted, s[1])
         end
       end
-      let new_s = ast_list_replace_at(s, 2, x64_rewrite_expr_boxing(s[2], ambiguous, cur_tainted))
+      let new_s = ast_list_replace_at(s, 2, x64_rewrite_expr_boxing(s[2], ambiguous, cur_tainted, fns))
       let out = list_push(out, new_s)
     elif ty == "Return" then
       if s.length > 1 then
-        let out = list_push(out, ast_list_replace_at(s, 1, x64_rewrite_expr_boxing(s[1], ambiguous, cur_tainted)))
+        let out = list_push(out, ast_list_replace_at(s, 1, x64_rewrite_expr_boxing(s[1], ambiguous, cur_tainted, fns)))
       else
         let out = list_push(out, s)
       end
     elif ty == "If" then
-      let s2 = ast_list_replace_at(s, 1, x64_rewrite_expr_boxing(s[1], ambiguous, cur_tainted))
-      let s3 = ast_list_replace_at(s2, 2, x64_rewrite_stmts_boxing(s[2], ambiguous, cur_tainted))
-      let s4 = ast_list_replace_at(s3, 3, x64_rewrite_stmts_boxing(s[3], ambiguous, cur_tainted))
+      let s2 = ast_list_replace_at(s, 1, x64_rewrite_expr_boxing(s[1], ambiguous, cur_tainted, fns))
+      let s3 = ast_list_replace_at(s2, 2, x64_rewrite_stmts_boxing(s[2], ambiguous, cur_tainted, fns))
+      let s4 = ast_list_replace_at(s3, 3, x64_rewrite_stmts_boxing(s[3], ambiguous, cur_tainted, fns))
       let out = list_push(out, s4)
     elif ty == "While" then
-      let s2 = ast_list_replace_at(s, 1, x64_rewrite_expr_boxing(s[1], ambiguous, cur_tainted))
-      let s3 = ast_list_replace_at(s2, 2, x64_rewrite_stmts_boxing(s[2], ambiguous, cur_tainted))
+      let s2 = ast_list_replace_at(s, 1, x64_rewrite_expr_boxing(s[1], ambiguous, cur_tainted, fns))
+      let s3 = ast_list_replace_at(s2, 2, x64_rewrite_stmts_boxing(s[2], ambiguous, cur_tainted, fns))
       let out = list_push(out, s3)
     elif ty == "MemberAssign" then
-      let out = list_push(out, ast_list_replace_at(s, 3, x64_rewrite_expr_boxing(s[3], ambiguous, cur_tainted)))
+      let out = list_push(out, ast_list_replace_at(s, 3, x64_rewrite_expr_boxing(s[3], ambiguous, cur_tainted, fns)))
     elif ty == "Expr" then
-      let out = list_push(out, ast_list_replace_at(s, 1, x64_rewrite_expr_boxing(s[1], ambiguous, cur_tainted)))
+      let out = list_push(out, ast_list_replace_at(s, 1, x64_rewrite_expr_boxing(s[1], ambiguous, cur_tainted, fns)))
     elif ty == "Func" then
       let fn_tainted = ast_collect_float_tainted_vars_in_stmts(s[3], [])
-      let new_body = x64_rewrite_stmts_boxing(s[3], ambiguous, fn_tainted)
+      let new_body = x64_rewrite_stmts_boxing(s[3], ambiguous, fn_tainted, fns)
       let out = list_push(out, ast_list_replace_at(s, 3, new_body))
     else
       let out = list_push(out, s)
@@ -1346,34 +1366,42 @@ end
 # ever assigned a float-looking value earlier in the SAME function --
 # not just x's own (context-free) syntax, which is never float for a
 # bare Var node.
-make a function called x64_collect_call_arg_floatness_in_expr takes expr, out, tainted returns done
+make a function called x64_collect_call_arg_floatness_in_expr takes expr, out, tainted, fns returns done
   let ty = expr[0]
   if ty == "Call" then
     let callee = expr[1]
     let args = expr[2]
+    if contains_str(fns, callee) then
+      if not x64_list_contains_str(x64_box_crossing_excluded_names(), callee) then
+        let i = 0
+        while i < args.length do
+          let is_f = ast_expr_looks_float_ctx(args[i], tainted)
+          vec_push(out, [callee, i, is_f])
+          let i = i + 1
+        end
+      end
+    end
     let i = 0
     while i < args.length do
-      let is_f = ast_expr_looks_float_ctx(args[i], tainted)
-      vec_push(out, [callee, i, is_f])
-      x64_collect_call_arg_floatness_in_expr(args[i], out, tainted)
+      x64_collect_call_arg_floatness_in_expr(args[i], out, tainted, fns)
       let i = i + 1
     end
   elif ty == "Bin" then
-    x64_collect_call_arg_floatness_in_expr(expr[2], out, tainted)
-    x64_collect_call_arg_floatness_in_expr(expr[3], out, tainted)
+    x64_collect_call_arg_floatness_in_expr(expr[2], out, tainted, fns)
+    x64_collect_call_arg_floatness_in_expr(expr[3], out, tainted, fns)
   elif ty == "Un" then
-    x64_collect_call_arg_floatness_in_expr(expr[2], out, tainted)
+    x64_collect_call_arg_floatness_in_expr(expr[2], out, tainted, fns)
   end
 end
 
-make a function called x64_collect_call_arg_floatness_in_stmts takes stmts, out, tainted returns done
+make a function called x64_collect_call_arg_floatness_in_stmts takes stmts, out, tainted, fns returns done
   let cur_tainted = tainted
   let i = 0
   while i < stmts.length do
     let s = stmts[i]
     let ty = s[0]
     if ty == "Let" then
-      x64_collect_call_arg_floatness_in_expr(s[2], out, cur_tainted)
+      x64_collect_call_arg_floatness_in_expr(s[2], out, cur_tainted, fns)
       if ast_expr_looks_float_ctx(s[2], cur_tainted) then
         if not x64_list_contains_str(cur_tainted, s[1]) then
           let cur_tainted = list_push(cur_tainted, s[1])
@@ -1381,31 +1409,50 @@ make a function called x64_collect_call_arg_floatness_in_stmts takes stmts, out,
       end
     elif ty == "Return" then
       if s.length > 1 then
-        x64_collect_call_arg_floatness_in_expr(s[1], out, cur_tainted)
+        x64_collect_call_arg_floatness_in_expr(s[1], out, cur_tainted, fns)
       end
     elif ty == "If" then
-      x64_collect_call_arg_floatness_in_expr(s[1], out, cur_tainted)
-      x64_collect_call_arg_floatness_in_stmts(s[2], out, cur_tainted)
-      x64_collect_call_arg_floatness_in_stmts(s[3], out, cur_tainted)
+      x64_collect_call_arg_floatness_in_expr(s[1], out, cur_tainted, fns)
+      x64_collect_call_arg_floatness_in_stmts(s[2], out, cur_tainted, fns)
+      x64_collect_call_arg_floatness_in_stmts(s[3], out, cur_tainted, fns)
     elif ty == "While" then
-      x64_collect_call_arg_floatness_in_expr(s[1], out, cur_tainted)
-      x64_collect_call_arg_floatness_in_stmts(s[2], out, cur_tainted)
+      x64_collect_call_arg_floatness_in_expr(s[1], out, cur_tainted, fns)
+      x64_collect_call_arg_floatness_in_stmts(s[2], out, cur_tainted, fns)
     elif ty == "MemberAssign" then
-      x64_collect_call_arg_floatness_in_expr(s[1], out, cur_tainted)
-      x64_collect_call_arg_floatness_in_expr(s[3], out, cur_tainted)
+      x64_collect_call_arg_floatness_in_expr(s[1], out, cur_tainted, fns)
+      x64_collect_call_arg_floatness_in_expr(s[3], out, cur_tainted, fns)
     elif ty == "Func" then
-      x64_collect_call_arg_floatness_in_stmts(s[3], out, [])
+      x64_collect_call_arg_floatness_in_stmts(s[3], out, [], fns)
     elif ty == "Expr" then
       # A bare expression used as a statement (e.g. `bandtest(1)` on its
       # own line) parses as ["Expr", <the real expression>, <line>], not
       # the bare expression node directly -- found via a real repro that
       # produced zero observations until this was dumped and inspected.
-      x64_collect_call_arg_floatness_in_expr(s[1], out, cur_tainted)
+      x64_collect_call_arg_floatness_in_expr(s[1], out, cur_tainted, fns)
     else
-      x64_collect_call_arg_floatness_in_expr(s, out, cur_tainted)
+      x64_collect_call_arg_floatness_in_expr(s, out, cur_tainted, fns)
     end
     let i = i + 1
   end
+end
+
+# GitHub #99 (found completing #25 Piece 1): a function that is ALREADY
+# internally adaptive over int/float via the same runtime round-trip
+# fixnum test x64_roundlike_asm/x64_abs_asm use (an int argument passes
+# through unchanged, only a genuine float takes the real float path)
+# must never be box-on-crossing eligible: boxing wraps its argument in
+# a heap pointer, which that round-trip test cannot distinguish from
+# "a very large but genuine int" -- it takes the float path on the
+# pointer's own bits, computing garbage. `floor` is the concrete case:
+# it's an ordinary PatLang-level Call (x64_runtime.patlang's own
+# Rational-handling wrapper, colliding with the C import name), called
+# with both float and plain-int arguments across a real program is
+# exactly the ambiguity pattern this pass looks for, and it was WRONGLY
+# getting boxed before this exclusion -- confirmed directly: floor(2.4)
+# alone (no int call site anywhere else) computed correctly, but adding
+# a single floor(7) call elsewhere in the same file broke it.
+make a function called x64_box_crossing_excluded_names returns names
+  return ["floor"]
 end
 
 make a function called x64_list_contains_str takes xs, target returns found
@@ -1422,9 +1469,9 @@ end
 # Returns a list of "funcname#argindex" string keys for every (function,
 # argument position) pair observed with BOTH a float-looking AND a
 # not-float-looking argument across all its call sites in this program.
-make a function called x64_compute_ambiguous_call_params takes stmts returns keys
+make a function called x64_compute_ambiguous_call_params takes stmts, fns returns keys
   let observations = vec_new()
-  x64_collect_call_arg_floatness_in_stmts(stmts, observations, [])
+  x64_collect_call_arg_floatness_in_stmts(stmts, observations, [], fns)
   let n = vec_len(observations)
   let saw_float = []
   let saw_nonfloat = []
@@ -1535,8 +1582,8 @@ make a function called lower_program takes ast returns ir
   let stmts = ast[1]
   let fns = collect_fns(stmts)
   if x64_lower_target_is_x64() then
-    let ambiguous = x64_compute_ambiguous_call_params(stmts)
-    let stmts = x64_rewrite_stmts_boxing(stmts, ambiguous, [])
+    let ambiguous = x64_compute_ambiguous_call_params(stmts, fns)
+    let stmts = x64_rewrite_stmts_boxing(stmts, ambiguous, [], fns)
     set_var("x64_ambiguous_call_params", ambiguous)
   else
     set_var("x64_ambiguous_call_params", [])
