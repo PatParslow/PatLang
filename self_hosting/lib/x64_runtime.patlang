@@ -2767,6 +2767,66 @@ make a function called rt_interval_tag returns tag
   return (1 shl 60) bor (1 shl 52)
 end
 
+# ---- boxed Float (GitHub #102/#50 prototype: "typed homes + box-on-
+# crossing") ----
+#
+# This backend represents an ORDINARY (unboxed) float as a raw IEEE-754
+# bit pattern with NO tag at all (see codegen_x64.patlang's own header
+# on x64_math1_asm for why -- floats sit natively in xmm registers at
+# full hardware speed whenever a function's per-instruction analysis
+# (#29/#37) can prove a value is float everywhere it's used). That
+# analysis is intraprocedural only: it cannot see across a call
+# boundary, so a float value passed into a function whose OWN body
+# gives no local evidence it might be one gets silently treated as a
+# plain int wherever that function does int-only things with it (e.g.
+# a bitwise op) -- confirmed as GitHub #102 (`band` on such a value
+# reads its raw float bits as if they were an integer).
+#
+# This is the OCaml/JVM-JIT-style fix: keep the untagged fast path for
+# the common (provably-monomorphic) case entirely unchanged, and add a
+# genuine BOXED float representation -- a heap-allocated qword holding
+# the float's raw bits, tagged like Rational/Complex/Interval already
+# are -- used ONLY at points where a value's type can't be proven to
+# cross a boundary safely. Gets its own dedicated local bit (bit5, i.e.
+# local bits 0b100000) rather than extending the BigInt/Rational/
+# Complex thermometer, same reasoning as Interval's own bit4: being a
+# float says nothing about exactness-tower level, it's an orthogonal
+# axis.
+#
+# SCOPE OF THIS PROTOTYPE, named honestly: this adds the REPRESENTATION
+# (tag, box, unbox) and makes the bitwise ops (band/bor/bxor/shl/shr)
+# correctly unbox-and-truncate a boxed float before operating, matching
+# what they already do for a genuine unboxed fixnum. It does NOT yet
+# include the compiler-side analysis that would automatically decide
+# WHERE to box a float value before passing it across an unprovable
+# call boundary (interprocedural taint propagation, or per-call-site
+# monomorphization) -- that's real, separate, larger follow-up work.
+# Today, boxing only happens where a caller explicitly calls
+# rt_box_float itself.
+make a function called rt_float_tag returns tag
+  return (1 shl 60) bor (1 shl 53)
+end
+
+# rt_box_float(bits) -> a tagged heap value wrapping bits UNINTERPRETED
+# -- the caller is responsible for having a genuine float64 bit pattern
+# in hand already (e.g. the direct result of a float expression); this
+# function never inspects or converts it, only stores and tags it.
+make a function called rt_box_float takes bits returns tagged
+  let addr = rt_heap_alloc(8)
+  mem_poke_qword(addr, 0, bits)
+  return addr bor rt_float_tag()
+end
+
+# rt_unbox_float_bits(v) -> the raw float64 bit pattern stored in a
+# boxed float v, UNCONVERTED (still needs movq-into-xmm to use as a
+# float, or a truncating conversion to use as an int -- see
+# x64_maybe_coerce_boxed_float_asm in codegen_x64.patlang for the
+# int-truncating case the bitwise ops use).
+make a function called rt_unbox_float_bits takes v returns bits
+  let addr = v band rt_payload_mask()
+  return mem_peek_qword(addr, 0)
+end
+
 make a function called rt_interval_new takes lo, hi returns tagged
   let addr = rt_heap_alloc(16)
   mem_poke_qword(addr, 0, lo)
@@ -5749,6 +5809,9 @@ make a function called type_of takes v returns result
   if code == 13 then
     return "unit"
   end
+  if code == 14 then
+    return "float"
+  end
   if code == 0 then
     return "int"
   end
@@ -5771,6 +5834,9 @@ make a function called numeric_kind takes v returns result
   end
   if code == 9 then
     return "interval"
+  end
+  if code == 14 then
+    return "float"
   end
   return "other"
 end

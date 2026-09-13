@@ -2451,6 +2451,59 @@ make a function called x64_str_aware_ord_asm takes setcc returns asm
   return sb_str(sb)
 end
 
+# GitHub #102/#50 prototype: if reg holds a boxed-float value (see
+# x64_runtime.patlang's rt_float_tag/rt_box_float), unbox it and
+# truncate to an int in place -- otherwise leave reg untouched. Used by
+# x64_binop_asm's bitwise cases (band/bor/bxor/shl/shr) so a boxed float
+# reaching one behaves like the interpreter's own as_bits/as_int
+# (truncating conversion) instead of having its raw bits misread as an
+# integer, matching the fix already made at the runtime-helper level
+# for the interpreter/native backends (#98) but for THIS backend's own
+# generated code.
+#
+# KNOWN COST, named honestly: this check runs on every band/bor/bxor/
+# shl/shr this function emits, including x64_runtime.patlang's own
+# extremely hot internal tag-packing arithmetic (rt_bigint_from_i64
+# etc), which never receives a boxed float in practice. The real fix is
+# making this conditional on whether static analysis can rule out a
+# boxed float at this specific call site at all (skipping the check
+# entirely for providably-safe sites) -- exactly the interprocedural
+# taint-propagation follow-up work named in #102/#50, not attempted in
+# this prototype. Accepted here as a real, measured trade-off for a
+# first working cut, not an oversight.
+make a function called x64_maybe_coerce_boxed_float_asm takes reg returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "    mov r9, " + reg + x64_nl_char())
+  sb_push(sb, "    mov r15, 18446462598732840960" + x64_nl_char())
+  sb_push(sb, "    and r9, r15" + x64_nl_char())
+  sb_push(sb, "    mov r8, 1161928703861587968" + x64_nl_char())
+  sb_push(sb, "    cmp r9, r8" + x64_nl_char())
+  sb_push(sb, "    jne .mcbf_skip_" + suffix + x64_nl_char())
+  # Real bug found prototyping this (#102/#50): the tag bits alone are
+  # not enough -- x64_runtime.patlang's OWN tag-construction code
+  # (rt_box_float itself, and any other `addr bor <tag>`-shaped
+  # expression) passes the BARE TAG CONSTANT as one of band/bor's raw
+  # operands, and a bare tag constant has payload 0. Checking only the
+  # top 16 bits made a bare float_tag literal (payload 0) indistinguishable
+  # from "a boxed float pointing at heap address 0" -- unboxing then
+  # dereferenced a null pointer and segfaulted. Same zero-payload
+  # ambiguity class this scheme already solves for Bool/Unit; fixed the
+  # same way -- require a genuinely NONZERO payload before treating
+  # something as a real boxed value, since rt_heap_alloc never returns
+  # address 0.
+  sb_push(sb, "    mov r9, " + reg + x64_nl_char())
+  sb_push(sb, "    mov r15, 281474976710655" + x64_nl_char())
+  sb_push(sb, "    and r9, r15" + x64_nl_char())
+  sb_push(sb, "    cmp r9, 0" + x64_nl_char())
+  sb_push(sb, "    je .mcbf_skip_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov r9, [r9]" + x64_nl_char())
+  sb_push(sb, "    movq xmm0, r9" + x64_nl_char())
+  sb_push(sb, "    cvttsd2si " + reg + ", xmm0" + x64_nl_char())
+  sb_push(sb, ".mcbf_skip_" + suffix + ":" + x64_nl_char())
+  return sb_str(sb)
+end
+
 make a function called x64_binop_asm takes op returns asm
   let sb = sb_new()
   sb_push(sb, "    pop r10" + x64_nl_char())
@@ -2496,19 +2549,29 @@ make a function called x64_binop_asm takes op returns asm
             # too, these ops need real codegen here, not just in the
             # rustc-text backend).
             if op == "band" then
+              sb_push(sb, x64_maybe_coerce_boxed_float_asm("rax"))
+              sb_push(sb, x64_maybe_coerce_boxed_float_asm("r10"))
               sb_push(sb, "    and rax, r10" + x64_nl_char())
             else
               if op == "bor" then
+                sb_push(sb, x64_maybe_coerce_boxed_float_asm("rax"))
+                sb_push(sb, x64_maybe_coerce_boxed_float_asm("r10"))
                 sb_push(sb, "    or rax, r10" + x64_nl_char())
               else
                 if op == "bxor" then
+                  sb_push(sb, x64_maybe_coerce_boxed_float_asm("rax"))
+                  sb_push(sb, x64_maybe_coerce_boxed_float_asm("r10"))
                   sb_push(sb, "    xor rax, r10" + x64_nl_char())
                 else
                   if op == "shl" then
+                    sb_push(sb, x64_maybe_coerce_boxed_float_asm("rax"))
+                    sb_push(sb, x64_maybe_coerce_boxed_float_asm("r10"))
                     sb_push(sb, "    mov rcx, r10" + x64_nl_char())
                     sb_push(sb, "    shl rax, cl" + x64_nl_char())
                   else
                     if op == "shr" then
+                      sb_push(sb, x64_maybe_coerce_boxed_float_asm("rax"))
+                      sb_push(sb, x64_maybe_coerce_boxed_float_asm("r10"))
                       sb_push(sb, "    mov rcx, r10" + x64_nl_char())
                       sb_push(sb, "    sar rax, cl" + x64_nl_char())
                     else
@@ -6705,6 +6768,7 @@ make a function called x64_family_code_asm returns asm
   let rational_tag = (1 shl 60) bor (1 shl 48) bor (1 shl 49)
   let complex_tag = (1 shl 60) bor (1 shl 48) bor (1 shl 49) bor (1 shl 50)
   let interval_tag = (1 shl 60) bor (1 shl 52)
+  let float_tag = (1 shl 60) bor (1 shl 53)
   sb_push(sb, "    pop rax" + x64_nl_char())
   sb_push(sb, "    mov rcx, rax" + x64_nl_char())
   sb_push(sb, "    shl rcx, 16" + x64_nl_char())
@@ -6895,6 +6959,14 @@ make a function called x64_family_code_asm returns asm
   sb_push(sb, "    mov rax, 9" + x64_nl_char())
   sb_push(sb, "    jmp .fc_done_" + suffix + x64_nl_char())
   sb_push(sb, ".fc_notinterval_" + suffix + ":" + x64_nl_char())
+  # GitHub #102/#50 prototype: boxed Float (14) -- see x64_runtime.
+  # patlang's rt_float_tag/rt_box_float header for the full design.
+  sb_push(sb, "    mov rcx, " + float_tag + x64_nl_char())
+  sb_push(sb, "    cmp rax, rcx" + x64_nl_char())
+  sb_push(sb, "    jne .fc_notboxedfloat_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rax, 14" + x64_nl_char())
+  sb_push(sb, "    jmp .fc_done_" + suffix + x64_nl_char())
+  sb_push(sb, ".fc_notboxedfloat_" + suffix + ":" + x64_nl_char())
   # GitHub #24: dedicated Bool family tag (6 shl 60 = 6917529027641081856),
   # the first genuinely new family added since this scheme's original six
   # (fixnum/Numeric/String/List/Closure/Object) -- confirmed unused via a
