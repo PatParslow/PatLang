@@ -2495,6 +2495,30 @@ end
 make a function called x64_maybe_coerce_boxed_float_asm takes reg returns asm
   let suffix = label_asm_safe(0)
   let sb = sb_new()
+  # GitHub #99/#25 Piece 1 fixpoint investigation: a REAL, serious bug
+  # found here -- the original version of this function used r8/r9/r15/
+  # xmm0 as scratch UNCONDITIONALLY, even on the (overwhelmingly common)
+  # fast path where reg turns out not to be a boxed float at all. The
+  # plain `and rax, r10`/`or rax, r10` this replaces used NO scratch
+  # registers at all, so this silently clobbered whatever the
+  # surrounding code had live in any of those four -- invisible in any
+  # small test program, but catastrophic compiling x64_runtime.patlang's
+  # own ~1.5MB self-hosted-compiler bundle through itself (Gen B of the
+  # patc1->patc2->patc3 fixpoint): patc2.exe segfaulted on the most
+  # trivial possible program. Found by bisecting away the #102 rewrite
+  # pass first (ruled out, Gen B still segfaulted), then reasoning about
+  # what ELSE touches band/bor/bxor/shl/shr unconditionally -- this
+  # function, added in the same session, was the only other candidate
+  # touching an operation used THIS pervasively throughout the runtime's
+  # own tag-packing arithmetic. Fixed by saving/restoring every register
+  # this function touches beyond `reg` itself, so its only observable
+  # effect on the surrounding code is reg's own updated value (and
+  # flags) -- exactly matching what the replaced single instruction did.
+  sb_push(sb, "    push r8" + x64_nl_char())
+  sb_push(sb, "    push r9" + x64_nl_char())
+  sb_push(sb, "    push r15" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 8" + x64_nl_char())
+  sb_push(sb, "    movq [rsp], xmm0" + x64_nl_char())
   sb_push(sb, "    mov r9, " + reg + x64_nl_char())
   sb_push(sb, "    mov r15, 18446462598732840960" + x64_nl_char())
   sb_push(sb, "    and r9, r15" + x64_nl_char())
@@ -2522,6 +2546,11 @@ make a function called x64_maybe_coerce_boxed_float_asm takes reg returns asm
   sb_push(sb, "    movq xmm0, r9" + x64_nl_char())
   sb_push(sb, "    cvttsd2si " + reg + ", xmm0" + x64_nl_char())
   sb_push(sb, ".mcbf_skip_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    movq xmm0, [rsp]" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, "    pop r15" + x64_nl_char())
+  sb_push(sb, "    pop r9" + x64_nl_char())
+  sb_push(sb, "    pop r8" + x64_nl_char())
   return sb_str(sb)
 end
 
