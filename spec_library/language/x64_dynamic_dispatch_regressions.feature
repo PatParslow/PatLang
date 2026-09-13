@@ -17,7 +17,12 @@ Feature: x64 dynamic-dispatch regressions (#98/#100/#85) -- a real interp-vs-x64
     Then both show: bool concat: true, false tail, noop, unit, prefix:
     And the two outputs match exactly
 
-  Note: none of these three were catchable by the Rust cargo test suite
+  Scenario: sqrt/sin/cos/pow print their real numeric result under --x64, not a garbage int (#109)
+    Given self_hosting/examples/x64_math1_float_print_native.patlang calls sqrt/sin/cos/pow
+    When the file is run under `pat --ir-run` and compiled+run via patc1's `--x64`
+    Then both show the same real numeric results, not garbage ints (GitHub #109)
+
+  Note: none of these four were catchable by the Rust cargo test suite
   (it has zero tests that invoke --x64 at all) or, for #85 and the
   related #83/#99 floor() regression, by `--ir-run`-only verification --
   both were previously "confirmed fixed" using only the interpreter,

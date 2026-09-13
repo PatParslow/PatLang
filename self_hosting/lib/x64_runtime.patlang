@@ -946,6 +946,24 @@ make a function called print takes v returns done
   let kind = type_of(v)
   if kind == "int" then
     rt_print_str(rt_int_to_str(v))
+  elif kind == "float" then
+    # GitHub #109: a genuine boxed float (rt_box_float -- e.g. sqrt()'s
+    # result, coerced into dynamic/tagged form before reaching this
+    # dynamic dispatch) had NO case here at all, so it fell all the way
+    # through to the `else` raw-signed-int default below, printing the
+    # box's raw HEAP-POINTER bits as if they were the number itself
+    # (sqrt(9.0) printed as e.g. 1161928709230755840, not 3). Unboxing
+    # gets back the original float64 bit pattern UNCONVERTED (an int-
+    # classified value at THIS call site, which does not matter: every
+    # function call in this backend passes its full 64-bit argument
+    # value through the stack unchanged, and it is the CALLEE's own
+    # float_mode classification -- not the caller's -- that decides
+    # whether those bits get reinterpreted via movq into an xmm
+    # register. rt_print_float's own rt_float_decompose is unconditionally
+    # float_mode (it contains a literal "0.0"), so it correctly
+    # reinterprets whatever raw bits arrive here as an IEEE754 double,
+    # not as an int->float VALUE conversion).
+    rt_print_float(rt_unbox_float_bits(v))
   elif kind == "string" then
     rt_print_str(v)
   elif kind == "bigint" then
@@ -2831,9 +2849,21 @@ end
 # float, or a truncating conversion to use as an int -- see
 # x64_maybe_coerce_boxed_float_asm in codegen_x64.patlang for the
 # int-truncating case the bitwise ops use).
+#
+# GitHub #109: the obvious `v band rt_payload_mask()` never actually
+# worked -- `band` on a value the numeric tower genuinely classifies as
+# "float" (which a boxed float, by construction, IS) goes through the
+# dynamic bitwise-op path, and x64_maybe_coerce_boxed_float_asm's whole
+# point (#102) is to convert that float to a truncated INT value before
+# ANDing -- exactly wrong for a function whose entire job is extracting
+# the raw bits UNCONVERTED. Confirmed directly: it segfaulted (a masked
+# address of 0, i.e. a null heap read) rather than returning the
+# original pattern. rt_unbox_float_bits_raw is a self-contained
+# CallHost primitive (same "no dynamic dispatch" treatment as
+# rt_raw_word_eq) that does the plain AND-then-dereference this always
+# needed, with no numeric-tower coercion in the way.
 make a function called rt_unbox_float_bits takes v returns bits
-  let addr = v band rt_payload_mask()
-  return mem_peek_qword(addr, 0)
+  return rt_unbox_float_bits_raw(v)
 end
 
 make a function called rt_interval_new takes lo, hi returns tagged
