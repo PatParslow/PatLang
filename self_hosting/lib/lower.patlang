@@ -238,9 +238,24 @@ make a function called lower_expr takes node, code, fns, locals, pending, lines 
                 let callee = node[1]
                 let args = node[2]
                 if contains_str(fns, callee) then
+                  # GitHub #102/#50: box a float-looking argument at a
+                  # call site where this (callee, position) pair is
+                  # genuinely ambiguous (called with both a float and a
+                  # non-float elsewhere in the program) -- see this
+                  # file's own header comment on x64_compute_ambiguous_
+                  # call_params for the full design and its named scope
+                  # limits. A no-op list (x64_ambiguous_call_params ==
+                  # []) for every non-x64 target, so this changes
+                  # nothing there.
+                  let ambiguous = get("__vars", "x64_ambiguous_call_params")
                   let i = 0
                   while i < args.length do
                     let code = lower_expr(args[i], code, fns, locals, pending, lines)
+                    if x64_list_contains_str(ambiguous, callee + "#" + i) then
+                      if ast_expr_looks_float(args[i]) then
+                        vec_push(code, ["Call", "rt_box_float", 1])
+                      end
+                    end
                     let i = i + 1
                   end
                   vec_push(code, ["Call", callee, args.length])
@@ -1086,6 +1101,196 @@ make a function called lower_block takes stmts, code, fns, fname, locals, mutabl
   return code
 end
 
+# ---- GitHub #102/#50: automatic box-on-crossing for ambiguous call
+# arguments, --x64 only ----
+#
+# The boxed-Float REPRESENTATION (rt_float_tag/rt_box_float/rt_unbox_
+# float_bits, x64_runtime.patlang; classification + bitwise-op unboxing,
+# codegen_x64.patlang) already exists and is verified correct -- what
+# was still missing is deciding WHERE to box automatically, so #102's
+# actual repro (a function called with a float argument at one call
+# site and a plain int at another) fixes itself without a caller having
+# to call rt_box_float by hand.
+#
+# APPROACH (syntactic, not full dataflow -- named honestly, see below):
+# a whole-program pre-scan, run once before lowering, finds every
+# (function name, argument position) pair that is called with a
+# SYNTACTICALLY float-looking argument expression at at least one call
+# site and a NOT-float-looking one at another -- i.e. genuinely
+# ambiguous across call sites, exactly #102's shape. Lowering a Call's
+# argument for such a pair, when THIS specific argument expression also
+# looks float, wraps it in a `rt_box_float` call; every other argument
+# (including every argument of every non-ambiguous function) lowers
+# completely unchanged, so a function that's consistently called with
+# one type pays nothing extra -- the whole point of the "typed homes,
+# box only at genuinely ambiguous crossings" design from #50.
+#
+# NAMED LIMITATION: "looks float" is judged SYNTACTICALLY on the
+# argument expression itself (a dotted literal, arithmetic combining
+# one, or a call to a known float-returning builtin) -- it does NOT
+# trace data flow through a variable. `f(1.0 + 61.0)` is caught;
+# `let x = 1.0 + 61.0; f(x)` is NOT (x's own taint isn't traced back to
+# this call site). Closing that gap needs the real interprocedural
+# taint-propagation extension discussed on #50/#102 -- genuinely
+# separate, larger follow-up work, not attempted here. This pass also
+# only looks at DIRECT `Call` argument expressions inside Let/Return/If/
+# While conditions and bodies/MemberAssign/bare-expression statements --
+# it does not descend into closures or List/BuildList/Index/Member
+# sub-expressions beyond one hop, another named, deliberate scope cut
+# for a first working version.
+#
+# Gated entirely on x64_lower_target_is_x64() (set by patc1_main.patlang
+# only when --x64 is the active target) -- lower_program's output for
+# every OTHER backend is completely unchanged; this whole mechanism is
+# a no-op there.
+
+make a function called x64_lower_target_is_x64 returns is_x64
+  let v = get("__vars", "x64_lower_target_is_x64")
+  return v == true
+end
+
+make a function called x64_lower_set_target_is_x64 takes flag returns done
+  set_var("x64_lower_target_is_x64", flag)
+  return true
+end
+
+# Syntactic float classifier -- see this section's own header for scope.
+make a function called ast_expr_looks_float takes expr returns is_float
+  let ty = expr[0]
+  if ty == "Num" then
+    return contains_str(expr[1], ".")
+  elif ty == "Bin" then
+    let op = expr[1]
+    if (op == "+") or (op == "-") or (op == "*") or (op == "/") or (op == "%") then
+      return ast_expr_looks_float(expr[2]) or ast_expr_looks_float(expr[3])
+    end
+    return false
+  elif ty == "Un" then
+    if expr[1] == "-" then
+      return ast_expr_looks_float(expr[2])
+    end
+    return false
+  elif ty == "Call" then
+    let fname = expr[1]
+    if (fname == "sqrt") or (fname == "sin") or (fname == "cos") or (fname == "tan") or (fname == "asin") or (fname == "acos") or (fname == "atan") or (fname == "atan2") or (fname == "log") or (fname == "exp") or (fname == "pow") then
+      return true
+    end
+    return false
+  else
+    return false
+  end
+end
+
+# Walks expr (and, one hop deep, its own Call-argument/Bin/Un operand
+# sub-expressions) pushing [callee, arg_index, is_float] into the
+# mutable Vec `out` for every direct Call it finds. `out` MUST be a Vec
+# (vec_new()), not an ordinary list -- list_push is functional
+# (returns a new list, leaves the caller's variable unchanged), which
+# cannot accumulate across these recursive calls; vec_push mutates the
+# handle in place, exactly what a shared accumulator threaded through
+# recursion needs.
+make a function called x64_collect_call_arg_floatness_in_expr takes expr, out returns done
+  let ty = expr[0]
+  if ty == "Call" then
+    let callee = expr[1]
+    let args = expr[2]
+    let i = 0
+    while i < args.length do
+      let is_f = ast_expr_looks_float(args[i])
+      vec_push(out, [callee, i, is_f])
+      x64_collect_call_arg_floatness_in_expr(args[i], out)
+      let i = i + 1
+    end
+  elif ty == "Bin" then
+    x64_collect_call_arg_floatness_in_expr(expr[2], out)
+    x64_collect_call_arg_floatness_in_expr(expr[3], out)
+  elif ty == "Un" then
+    x64_collect_call_arg_floatness_in_expr(expr[2], out)
+  end
+end
+
+make a function called x64_collect_call_arg_floatness_in_stmts takes stmts, out returns done
+  let i = 0
+  while i < stmts.length do
+    let s = stmts[i]
+    let ty = s[0]
+    if ty == "Let" then
+      x64_collect_call_arg_floatness_in_expr(s[2], out)
+    elif ty == "Return" then
+      if s.length > 1 then
+        x64_collect_call_arg_floatness_in_expr(s[1], out)
+      end
+    elif ty == "If" then
+      x64_collect_call_arg_floatness_in_expr(s[1], out)
+      x64_collect_call_arg_floatness_in_stmts(s[2], out)
+      x64_collect_call_arg_floatness_in_stmts(s[3], out)
+    elif ty == "While" then
+      x64_collect_call_arg_floatness_in_expr(s[1], out)
+      x64_collect_call_arg_floatness_in_stmts(s[2], out)
+    elif ty == "MemberAssign" then
+      x64_collect_call_arg_floatness_in_expr(s[1], out)
+      x64_collect_call_arg_floatness_in_expr(s[3], out)
+    elif ty == "Func" then
+      x64_collect_call_arg_floatness_in_stmts(s[3], out)
+    elif ty == "Expr" then
+      # A bare expression used as a statement (e.g. `bandtest(1)` on its
+      # own line) parses as ["Expr", <the real expression>, <line>], not
+      # the bare expression node directly -- found via a real repro that
+      # produced zero observations until this was dumped and inspected.
+      x64_collect_call_arg_floatness_in_expr(s[1], out)
+    else
+      x64_collect_call_arg_floatness_in_expr(s, out)
+    end
+    let i = i + 1
+  end
+end
+
+make a function called x64_list_contains_str takes xs, target returns found
+  let i = 0
+  while i < xs.length do
+    if xs[i] == target then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# Returns a list of "funcname#argindex" string keys for every (function,
+# argument position) pair observed with BOTH a float-looking AND a
+# not-float-looking argument across all its call sites in this program.
+make a function called x64_compute_ambiguous_call_params takes stmts returns keys
+  let observations = vec_new()
+  x64_collect_call_arg_floatness_in_stmts(stmts, observations)
+  let n = vec_len(observations)
+  let saw_float = []
+  let saw_nonfloat = []
+  let i = 0
+  while i < n do
+    let obs = vec_get(observations, i)
+    let key = obs[0] + "#" + obs[1]
+    if obs[2] then
+      if not x64_list_contains_str(saw_float, key) then
+        let saw_float = list_push(saw_float, key)
+      end
+    else
+      if not x64_list_contains_str(saw_nonfloat, key) then
+        let saw_nonfloat = list_push(saw_nonfloat, key)
+      end
+    end
+    let i = i + 1
+  end
+  let keys = []
+  let j = 0
+  while j < saw_float.length do
+    if x64_list_contains_str(saw_nonfloat, saw_float[j]) then
+      let keys = list_push(keys, saw_float[j])
+    end
+    let j = j + 1
+  end
+  return keys
+end
+
 make a function called collect_fns takes stmts returns fns
   let fns = []
   let i = 0
@@ -1166,6 +1371,11 @@ make a function called lower_program takes ast returns ir
   set_var("__closure_seq", 0)
   let stmts = ast[1]
   let fns = collect_fns(stmts)
+  if x64_lower_target_is_x64() then
+    set_var("x64_ambiguous_call_params", x64_compute_ambiguous_call_params(stmts))
+  else
+    set_var("x64_ambiguous_call_params", [])
+  end
   let funcs = []
   let events = []
   let mainCode = vec_new()
