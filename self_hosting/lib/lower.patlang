@@ -238,24 +238,21 @@ make a function called lower_expr takes node, code, fns, locals, pending, lines 
                 let callee = node[1]
                 let args = node[2]
                 if contains_str(fns, callee) then
-                  # GitHub #102/#50: box a float-looking argument at a
-                  # call site where this (callee, position) pair is
-                  # genuinely ambiguous (called with both a float and a
-                  # non-float elsewhere in the program) -- see this
-                  # file's own header comment on x64_compute_ambiguous_
-                  # call_params for the full design and its named scope
-                  # limits. A no-op list (x64_ambiguous_call_params ==
-                  # []) for every non-x64 target, so this changes
-                  # nothing there.
-                  let ambiguous = get("__vars", "x64_ambiguous_call_params")
+                  # GitHub #102/#50: automatic box-on-crossing for a
+                  # genuinely ambiguous call argument is now done as an
+                  # AST REWRITE PASS (x64_rewrite_stmts_boxing, run once
+                  # by lower_program before this function ever sees
+                  # stmts) rather than here -- that pass can compute
+                  # each function's own float-tainted-variable context
+                  # once and thread it through naturally, which this
+                  # per-Call codegen site has no way to do (lower_expr
+                  # carries no "which function/scope am I in" parameter).
+                  # By the time control reaches here, any needed
+                  # rt_box_float wrapping is already a literal Call node
+                  # in `args[i]` -- nothing extra to do.
                   let i = 0
                   while i < args.length do
                     let code = lower_expr(args[i], code, fns, locals, pending, lines)
-                    if x64_list_contains_str(ambiguous, callee + "#" + i) then
-                      if ast_expr_looks_float(args[i]) then
-                        vec_push(code, ["Call", "rt_box_float", 1])
-                      end
-                    end
                     let i = i + 1
                   end
                   vec_push(code, ["Call", callee, args.length])
@@ -1155,19 +1152,28 @@ make a function called x64_lower_set_target_is_x64 takes flag returns done
 end
 
 # Syntactic float classifier -- see this section's own header for scope.
-make a function called ast_expr_looks_float takes expr returns is_float
+# `tainted` is a list of local variable names PROVEN float-looking
+# somewhere earlier in the SAME function's own statement order (see
+# ast_collect_float_tainted_vars_in_stmts) -- this is real, if simple,
+# single-forward-pass dataflow (not just per-expression syntax): closes
+# the `let x = 1.0 + 61.0; f(x)` case the original syntax-only version
+# missed, since x's own taint is now looked up via the Var case below
+# instead of unconditionally returning false for any Var.
+make a function called ast_expr_looks_float_ctx takes expr, tainted returns is_float
   let ty = expr[0]
   if ty == "Num" then
     return contains_str(expr[1], ".")
+  elif ty == "Var" then
+    return x64_list_contains_str(tainted, expr[1])
   elif ty == "Bin" then
     let op = expr[1]
     if (op == "+") or (op == "-") or (op == "*") or (op == "/") or (op == "%") then
-      return ast_expr_looks_float(expr[2]) or ast_expr_looks_float(expr[3])
+      return ast_expr_looks_float_ctx(expr[2], tainted) or ast_expr_looks_float_ctx(expr[3], tainted)
     end
     return false
   elif ty == "Un" then
     if expr[1] == "-" then
-      return ast_expr_looks_float(expr[2])
+      return ast_expr_looks_float_ctx(expr[2], tainted)
     end
     return false
   elif ty == "Call" then
@@ -1181,6 +1187,151 @@ make a function called ast_expr_looks_float takes expr returns is_float
   end
 end
 
+# No-context convenience wrapper (equivalent to ast_expr_looks_float_ctx
+# with an empty tainted-variable set) -- kept for any caller that
+# genuinely has no local-scope context to offer (there are none left in
+# this file after wiring the rewrite pass below, but keeping the name
+# stable avoids an unnecessary rename of a small utility).
+make a function called ast_expr_looks_float takes expr returns is_float
+  return ast_expr_looks_float_ctx(expr, [])
+end
+
+# ast_list_replace_at(lst, idx, newval) -> a NEW list, identical to lst
+# except index idx is replaced with newval. Used by the AST rewrite pass
+# below to change exactly one field of a statement/expression node
+# (e.g. a Let's value expression) without having to know or reconstruct
+# that node's full arity -- several of these AST node shapes carry
+# extra trailing fields (Let's mutability flag, Func's optional named-
+# return hint) that would be silently dropped by rebuilding the node
+# from a fixed guessed field list instead.
+make a function called ast_list_replace_at takes lst, idx, newval returns lst2
+  let out = []
+  let i = 0
+  while i < lst.length do
+    if i == idx then
+      let out = list_push(out, newval)
+    else
+      let out = list_push(out, lst[i])
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# Single forward pass over stmts: a `let x = <expr>` whose expr looks
+# float (judged against the tainted set as grown so far, so `let y = x`
+# after `let x = 1.0` also propagates) adds x to the returned set.
+# Recurses into If/While bodies in the SAME scope (an assignment inside
+# a branch still taints the name for code after the branch, matching
+# this being a real, if conservative, over-approximation -- consistent
+# with this whole pass's "syntactic, single forward pass, not a fixed-
+# point dataflow solver" scope, named in this section's own header).
+make a function called ast_collect_float_tainted_vars_in_stmts takes stmts, tainted returns tainted2
+  let result = tainted
+  let i = 0
+  while i < stmts.length do
+    let s = stmts[i]
+    let ty = s[0]
+    if ty == "Let" then
+      if ast_expr_looks_float_ctx(s[2], result) then
+        if not x64_list_contains_str(result, s[1]) then
+          let result = list_push(result, s[1])
+        end
+      end
+    elif ty == "If" then
+      let result = ast_collect_float_tainted_vars_in_stmts(s[2], result)
+      let result = ast_collect_float_tainted_vars_in_stmts(s[3], result)
+    elif ty == "While" then
+      let result = ast_collect_float_tainted_vars_in_stmts(s[2], result)
+    end
+    let i = i + 1
+  end
+  return result
+end
+
+# ---- AST rewrite pass: actually inserts the rt_box_float wrapper ----
+#
+# Runs AFTER x64_compute_ambiguous_call_params (needs its result) and
+# BEFORE the real lower_program body processes stmts -- a genuine
+# AST-to-AST transformation, not a codegen-time decision, precisely so
+# each function's own tainted-variable context can be computed once and
+# threaded naturally through recursion (lower_expr itself has no
+# "which function/scope am I in" parameter to hang this off of).
+
+make a function called x64_rewrite_expr_boxing takes expr, ambiguous, tainted returns expr2
+  let ty = expr[0]
+  if ty == "Call" then
+    let callee = expr[1]
+    let args = expr[2]
+    let new_args = []
+    let i = 0
+    while i < args.length do
+      let rewritten = x64_rewrite_expr_boxing(args[i], ambiguous, tainted)
+      if x64_list_contains_str(ambiguous, callee + "#" + i) then
+        if ast_expr_looks_float_ctx(args[i], tainted) then
+          let rewritten = ["Call", "rt_box_float", [rewritten]]
+        end
+      end
+      let new_args = list_push(new_args, rewritten)
+      let i = i + 1
+    end
+    return ast_list_replace_at(expr, 2, new_args)
+  elif ty == "Bin" then
+    let e2 = ast_list_replace_at(expr, 2, x64_rewrite_expr_boxing(expr[2], ambiguous, tainted))
+    return ast_list_replace_at(e2, 3, x64_rewrite_expr_boxing(expr[3], ambiguous, tainted))
+  elif ty == "Un" then
+    return ast_list_replace_at(expr, 2, x64_rewrite_expr_boxing(expr[2], ambiguous, tainted))
+  else
+    return expr
+  end
+end
+
+make a function called x64_rewrite_stmts_boxing takes stmts, ambiguous, tainted returns stmts2
+  let out = []
+  let cur_tainted = tainted
+  let i = 0
+  while i < stmts.length do
+    let s = stmts[i]
+    let ty = s[0]
+    if ty == "Let" then
+      if ast_expr_looks_float_ctx(s[2], cur_tainted) then
+        if not x64_list_contains_str(cur_tainted, s[1]) then
+          let cur_tainted = list_push(cur_tainted, s[1])
+        end
+      end
+      let new_s = ast_list_replace_at(s, 2, x64_rewrite_expr_boxing(s[2], ambiguous, cur_tainted))
+      let out = list_push(out, new_s)
+    elif ty == "Return" then
+      if s.length > 1 then
+        let out = list_push(out, ast_list_replace_at(s, 1, x64_rewrite_expr_boxing(s[1], ambiguous, cur_tainted)))
+      else
+        let out = list_push(out, s)
+      end
+    elif ty == "If" then
+      let s2 = ast_list_replace_at(s, 1, x64_rewrite_expr_boxing(s[1], ambiguous, cur_tainted))
+      let s3 = ast_list_replace_at(s2, 2, x64_rewrite_stmts_boxing(s[2], ambiguous, cur_tainted))
+      let s4 = ast_list_replace_at(s3, 3, x64_rewrite_stmts_boxing(s[3], ambiguous, cur_tainted))
+      let out = list_push(out, s4)
+    elif ty == "While" then
+      let s2 = ast_list_replace_at(s, 1, x64_rewrite_expr_boxing(s[1], ambiguous, cur_tainted))
+      let s3 = ast_list_replace_at(s2, 2, x64_rewrite_stmts_boxing(s[2], ambiguous, cur_tainted))
+      let out = list_push(out, s3)
+    elif ty == "MemberAssign" then
+      let out = list_push(out, ast_list_replace_at(s, 3, x64_rewrite_expr_boxing(s[3], ambiguous, cur_tainted)))
+    elif ty == "Expr" then
+      let out = list_push(out, ast_list_replace_at(s, 1, x64_rewrite_expr_boxing(s[1], ambiguous, cur_tainted)))
+    elif ty == "Func" then
+      let fn_tainted = ast_collect_float_tainted_vars_in_stmts(s[3], [])
+      let new_body = x64_rewrite_stmts_boxing(s[3], ambiguous, fn_tainted)
+      let out = list_push(out, ast_list_replace_at(s, 3, new_body))
+    else
+      let out = list_push(out, s)
+    end
+    let i = i + 1
+  end
+  return out
+end
+
 # Walks expr (and, one hop deep, its own Call-argument/Bin/Un operand
 # sub-expressions) pushing [callee, arg_index, is_float] into the
 # mutable Vec `out` for every direct Call it finds. `out` MUST be a Vec
@@ -1189,57 +1340,69 @@ end
 # cannot accumulate across these recursive calls; vec_push mutates the
 # handle in place, exactly what a shared accumulator threaded through
 # recursion needs.
-make a function called x64_collect_call_arg_floatness_in_expr takes expr, out returns done
+# `tainted` threads the enclosing function's own float-tainted local
+# variables (see ast_collect_float_tainted_vars_in_stmts) through this
+# walk, so an observation for `f(x)` correctly reflects whether x was
+# ever assigned a float-looking value earlier in the SAME function --
+# not just x's own (context-free) syntax, which is never float for a
+# bare Var node.
+make a function called x64_collect_call_arg_floatness_in_expr takes expr, out, tainted returns done
   let ty = expr[0]
   if ty == "Call" then
     let callee = expr[1]
     let args = expr[2]
     let i = 0
     while i < args.length do
-      let is_f = ast_expr_looks_float(args[i])
+      let is_f = ast_expr_looks_float_ctx(args[i], tainted)
       vec_push(out, [callee, i, is_f])
-      x64_collect_call_arg_floatness_in_expr(args[i], out)
+      x64_collect_call_arg_floatness_in_expr(args[i], out, tainted)
       let i = i + 1
     end
   elif ty == "Bin" then
-    x64_collect_call_arg_floatness_in_expr(expr[2], out)
-    x64_collect_call_arg_floatness_in_expr(expr[3], out)
+    x64_collect_call_arg_floatness_in_expr(expr[2], out, tainted)
+    x64_collect_call_arg_floatness_in_expr(expr[3], out, tainted)
   elif ty == "Un" then
-    x64_collect_call_arg_floatness_in_expr(expr[2], out)
+    x64_collect_call_arg_floatness_in_expr(expr[2], out, tainted)
   end
 end
 
-make a function called x64_collect_call_arg_floatness_in_stmts takes stmts, out returns done
+make a function called x64_collect_call_arg_floatness_in_stmts takes stmts, out, tainted returns done
+  let cur_tainted = tainted
   let i = 0
   while i < stmts.length do
     let s = stmts[i]
     let ty = s[0]
     if ty == "Let" then
-      x64_collect_call_arg_floatness_in_expr(s[2], out)
+      x64_collect_call_arg_floatness_in_expr(s[2], out, cur_tainted)
+      if ast_expr_looks_float_ctx(s[2], cur_tainted) then
+        if not x64_list_contains_str(cur_tainted, s[1]) then
+          let cur_tainted = list_push(cur_tainted, s[1])
+        end
+      end
     elif ty == "Return" then
       if s.length > 1 then
-        x64_collect_call_arg_floatness_in_expr(s[1], out)
+        x64_collect_call_arg_floatness_in_expr(s[1], out, cur_tainted)
       end
     elif ty == "If" then
-      x64_collect_call_arg_floatness_in_expr(s[1], out)
-      x64_collect_call_arg_floatness_in_stmts(s[2], out)
-      x64_collect_call_arg_floatness_in_stmts(s[3], out)
+      x64_collect_call_arg_floatness_in_expr(s[1], out, cur_tainted)
+      x64_collect_call_arg_floatness_in_stmts(s[2], out, cur_tainted)
+      x64_collect_call_arg_floatness_in_stmts(s[3], out, cur_tainted)
     elif ty == "While" then
-      x64_collect_call_arg_floatness_in_expr(s[1], out)
-      x64_collect_call_arg_floatness_in_stmts(s[2], out)
+      x64_collect_call_arg_floatness_in_expr(s[1], out, cur_tainted)
+      x64_collect_call_arg_floatness_in_stmts(s[2], out, cur_tainted)
     elif ty == "MemberAssign" then
-      x64_collect_call_arg_floatness_in_expr(s[1], out)
-      x64_collect_call_arg_floatness_in_expr(s[3], out)
+      x64_collect_call_arg_floatness_in_expr(s[1], out, cur_tainted)
+      x64_collect_call_arg_floatness_in_expr(s[3], out, cur_tainted)
     elif ty == "Func" then
-      x64_collect_call_arg_floatness_in_stmts(s[3], out)
+      x64_collect_call_arg_floatness_in_stmts(s[3], out, [])
     elif ty == "Expr" then
       # A bare expression used as a statement (e.g. `bandtest(1)` on its
       # own line) parses as ["Expr", <the real expression>, <line>], not
       # the bare expression node directly -- found via a real repro that
       # produced zero observations until this was dumped and inspected.
-      x64_collect_call_arg_floatness_in_expr(s[1], out)
+      x64_collect_call_arg_floatness_in_expr(s[1], out, cur_tainted)
     else
-      x64_collect_call_arg_floatness_in_expr(s, out)
+      x64_collect_call_arg_floatness_in_expr(s, out, cur_tainted)
     end
     let i = i + 1
   end
@@ -1261,7 +1424,7 @@ end
 # not-float-looking argument across all its call sites in this program.
 make a function called x64_compute_ambiguous_call_params takes stmts returns keys
   let observations = vec_new()
-  x64_collect_call_arg_floatness_in_stmts(stmts, observations)
+  x64_collect_call_arg_floatness_in_stmts(stmts, observations, [])
   let n = vec_len(observations)
   let saw_float = []
   let saw_nonfloat = []
@@ -1372,7 +1535,9 @@ make a function called lower_program takes ast returns ir
   let stmts = ast[1]
   let fns = collect_fns(stmts)
   if x64_lower_target_is_x64() then
-    set_var("x64_ambiguous_call_params", x64_compute_ambiguous_call_params(stmts))
+    let ambiguous = x64_compute_ambiguous_call_params(stmts)
+    let stmts = x64_rewrite_stmts_boxing(stmts, ambiguous, [])
+    set_var("x64_ambiguous_call_params", ambiguous)
   else
     set_var("x64_ambiguous_call_params", [])
   end
