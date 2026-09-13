@@ -1,7 +1,9 @@
 import re, sys, io
 
-CODEGEN = r"F:\PatLang\rust-runtime\src\ir\codegen.rs"
-RUNTIME_RS = r"F:\PatLang\self_hosting\lib\runtime_rs.patlang"
+import os
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CODEGEN = os.path.join(_REPO_ROOT, "rust-runtime", "src", "ir", "codegen.rs")
+RUNTIME_RS = os.path.join(_REPO_ROOT, "self_hosting", "lib", "runtime_rs.patlang")
 
 # chunk_name (as used in PARITY-* / codegen_prelude_chunk) -> PRELUDE_<X> const name
 CHUNKS = {
