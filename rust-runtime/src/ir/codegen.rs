@@ -105,6 +105,7 @@ const HOST_CHUNK_TABLE: &[(&str, ChunkId)] = &[
     ("sc_len", ChunkId::CollectionsHandles),
     ("sc_code", ChunkId::CollectionsHandles),
     ("sc_char", ChunkId::CollectionsHandles),
+    ("sc_substr", ChunkId::CollectionsHandles),
     ("sb_new", ChunkId::CollectionsHandles),
     ("sb_push", ChunkId::CollectionsHandles),
     ("sb_str", ChunkId::CollectionsHandles),
@@ -2995,6 +2996,30 @@ fn host_call_collections_handles_inner(name: &str, args: &[Value]) -> Result<Val
                     Ok(match s.chars().nth(idx) { Some(c) => Value::String(c.to_string().into()), None => Value::String(String::new().into()) })
                 })
             }
+            "sc_substr" => {
+                // GitHub #74: same fix as sc_char/sc_code above, applied to
+                // substr()'s own untouched is_ascii() cost -- a parser
+                // calling substr() once per token (e.g. a numeric literal or
+                // a \u escape) on a multi-megabyte document pays the full
+                // is_ascii() scan on every token, itself O(n) calls for a
+                // document made of many small tokens -- the second O(n^2)
+                // contributor json_parse's quadratic blowup came from,
+                // alongside sc_char replacing raw s[p].
+                let id = arg_usize(&args, 0, "sc_substr")?;
+                let start = arg_usize(&args, 1, "sc_substr")?;
+                let count = arg_usize(&args, 2, "sc_substr")?;
+                ISTRINGS.with(|v| {
+                    let b = v.borrow();
+                    let (s, is_ascii) = b.get(id).ok_or_else(|| format!("sc_substr: unknown string {}", id))?;
+                    if *is_ascii {
+                        let bytes = s.as_bytes();
+                        let st = start.min(bytes.len());
+                        let en = st.saturating_add(count).min(bytes.len());
+                        return Ok(Value::String(String::from_utf8_lossy(&bytes[st..en]).to_string().into()));
+                    }
+                    Ok(Value::String(s.chars().skip(start).take(count).collect::<String>().into()))
+                })
+            }
             "sb_new" => {
                 let id = SBUFS.with(|v| { let mut b = v.borrow_mut(); b.push(String::new()); b.len() - 1 });
                 Ok(Value::Number(id as f64))
@@ -3021,7 +3046,7 @@ fn host_call_collections_handles_inner(name: &str, args: &[Value]) -> Result<Val
 
 fn host_call_collections_handles(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match name {
-        "vec_new" | "vec_push" | "vec_set" | "vec_get" | "vec_len" | "vec_to_list" | "str_intern" | "sc_len" | "sc_code" | "sc_char" | "sb_new" | "sb_push" | "sb_str" => Some(host_call_collections_handles_inner(name, args)),
+        "vec_new" | "vec_push" | "vec_set" | "vec_get" | "vec_len" | "vec_to_list" | "str_intern" | "sc_len" | "sc_code" | "sc_char" | "sc_substr" | "sb_new" | "sb_push" | "sb_str" => Some(host_call_collections_handles_inner(name, args)),
         _ => None,
     }
 }

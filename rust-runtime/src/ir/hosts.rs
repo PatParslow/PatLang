@@ -268,6 +268,33 @@ pub fn host_sc_char(args: &[Value]) -> Result<Value, String> {
     })
 }
 
+// GitHub #74: substr()'s own is_ascii() check is exactly the same O(n)-
+// per-call cost sc_char/sc_code exist to avoid -- a parser calling
+// substr() once per token (e.g. json_parse_number's numeric literal,
+// json_parse_string's \u escape) on a multi-megabyte document pays that
+// full-document is_ascii() scan on every single token, which is itself
+// O(document length) calls for a document made of many small tokens
+// (e.g. a large flat array of numbers) -- O(n) work per call times O(n)
+// calls is the second O(n^2) contributor this issue's own repro hit,
+// alongside sc_char's untouched raw substr()/s[p] equivalents. Reuses
+// the same cached is_ascii flag an interned handle already carries.
+pub fn host_sc_substr(args: &[Value]) -> Result<Value, String> {
+    let id = arg_usize(args, 0, "sc_substr")?;
+    let start = arg_usize(args, 1, "sc_substr")?;
+    let count = arg_usize(args, 2, "sc_substr")?;
+    ISTRINGS.with(|v| {
+        let b = v.borrow();
+        let (s, is_ascii) = b.get(id).ok_or_else(|| format!("sc_substr: unknown string {}", id))?;
+        if *is_ascii {
+            let bytes = s.as_bytes();
+            let st = start.min(bytes.len());
+            let en = st.saturating_add(count).min(bytes.len());
+            return Ok(Value::String(String::from_utf8_lossy(&bytes[st..en]).to_string().into()));
+        }
+        Ok(Value::String(s.chars().skip(start).take(count).collect::<String>().into()))
+    })
+}
+
 pub fn host_sb_new(_args: &[Value]) -> Result<Value, String> {
     let id = SBUFS.with(|v| { let mut b = v.borrow_mut(); b.push(String::new()); b.len() - 1 });
     Ok(Value::Int(id as i64))
@@ -3492,6 +3519,7 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("sc_len", host_sc_len);
     interp.host.insert("sc_code", host_sc_code);
     interp.host.insert("sc_char", host_sc_char);
+    interp.host.insert("sc_substr", host_sc_substr);
     interp.host.insert("char_code", host_char_code);
     interp.host.insert("substr", host_substr);
     interp.host.insert("chr", host_chr);

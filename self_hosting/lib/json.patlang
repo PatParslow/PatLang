@@ -33,11 +33,35 @@ make a function called json_hex_to_num takes hex returns n
   return n
 end
 
-make a function called json_skip_ws takes s, pos returns p
+# GitHub #74: json_parse used to index the raw input string directly
+# (`s[p]`, `char_code(s, p)`, `s.length`, `substr(s, start, len)`) --
+# every one of those host functions computes `s.is_ascii()` FRESH on
+# every single call (an O(document length) full-string scan, not O(1)),
+# so a single left-to-right scan over an n-character document paid O(n)
+# work per character/token, i.e. O(n^2) overall. Measured: 9m19s to
+# parse a real 2.3MB document, ~4KB/sec. This is the exact same bug
+# class already found and fixed once for the tokenizer (see hosts.rs's
+# ISTRINGS comment: html_tokenize on a 1.2MB article cost 62.6s from
+# this alone) via `str_intern`/`sc_len`/`sc_code`/`sc_char` -- an
+# intern step that computes is_ascii() ONCE and caches it against a
+# handle, so every subsequent sc_* call on that handle is genuinely
+# O(1) (for the ASCII case, which covers ordinary JSON's structural
+# characters and any ASCII-only payload). This file now uses that same
+# mechanism: json_parse interns its input once into a handle `h`, and
+# every parse_* helper below takes and threads that handle instead of
+# the raw string. `sc_substr` (added alongside this fix) closes the
+# same gap for the two remaining `substr(s, ...)` call sites below
+# (json_parse_number's numeric literal, json_parse_string's \u escape),
+# which were the SECOND O(n^2) contributor: one substr() call per
+# token, each paying that same full-document is_ascii() scan, is O(n)
+# calls x O(n) work for a document made of many small tokens (a large
+# flat array of numbers -- exactly this issue's own repro shape).
+
+make a function called json_skip_ws takes h, pos returns p
   let p = pos
   let scanning = true
-  while scanning and (p < s.length) do
-    let c = char_code(s, p)
+  while scanning and (p < sc_len(h)) do
+    let c = sc_code(h, p)
     if (c == 32) or (c == 9) or (c == 10) or (c == 13) then
       let p = p + 1
     else
@@ -47,13 +71,13 @@ make a function called json_skip_ws takes s, pos returns p
   return p
 end
 
-make a function called json_parse_string takes s, pos returns pair
+make a function called json_parse_string takes h, pos returns pair
   let b = sb_new()
   let p = pos + 1
-  while s[p] != "\"" do
-    let c = s[p]
+  while sc_char(h, p) != "\"" do
+    let c = sc_char(h, p)
     if c == "\\" then
-      let e = s[p + 1]
+      let e = sc_char(h, p + 1)
       if e == "n" then
         sb_push(b, chr(10))
       end
@@ -73,7 +97,7 @@ make a function called json_parse_string takes s, pos returns pair
         sb_push(b, "/")
       end
       if e == "u" then
-        sb_push(b, chr(json_hex_to_num(substr(s, p + 2, 4))))
+        sb_push(b, chr(json_hex_to_num(sc_substr(h, p + 2, 4))))
         let p = p + 4
       end
       let p = p + 2
@@ -85,46 +109,46 @@ make a function called json_parse_string takes s, pos returns pair
   return [["str", sb_str(b)], p + 1]
 end
 
-make a function called json_parse_number takes s, pos returns pair
+make a function called json_parse_number takes h, pos returns pair
   let p = pos
   let start = pos
-  if s[p] == "-" then
+  if sc_char(h, p) == "-" then
     let p = p + 1
   end
-  while (p < s.length) and json_is_digit(s[p]) do
+  while (p < sc_len(h)) and json_is_digit(sc_char(h, p)) do
     let p = p + 1
   end
-  if (p < s.length) and (s[p] == ".") then
+  if (p < sc_len(h)) and (sc_char(h, p) == ".") then
     let p = p + 1
-    while (p < s.length) and json_is_digit(s[p]) do
+    while (p < sc_len(h)) and json_is_digit(sc_char(h, p)) do
       let p = p + 1
     end
   end
-  if (p < s.length) and ((s[p] == "e") or (s[p] == "E")) then
+  if (p < sc_len(h)) and ((sc_char(h, p) == "e") or (sc_char(h, p) == "E")) then
     let p = p + 1
-    if (p < s.length) and ((s[p] == "+") or (s[p] == "-")) then
+    if (p < sc_len(h)) and ((sc_char(h, p) == "+") or (sc_char(h, p) == "-")) then
       let p = p + 1
     end
-    while (p < s.length) and json_is_digit(s[p]) do
+    while (p < sc_len(h)) and json_is_digit(sc_char(h, p)) do
       let p = p + 1
     end
   end
-  return [["num", to_num(substr(s, start, p - start))], p]
+  return [["num", to_num(sc_substr(h, start, p - start))], p]
 end
 
-make a function called json_parse_array takes s, pos returns pair
-  let p = json_skip_ws(s, pos + 1)
+make a function called json_parse_array takes h, pos returns pair
+  let p = json_skip_ws(h, pos + 1)
   let items = []
-  if s[p] == "]" then
+  if sc_char(h, p) == "]" then
     return [["arr", items], p + 1]
   end
   let done = false
   while not done do
-    let r = json_parse_value(s, p)
+    let r = json_parse_value(h, p)
     let items = list_push(items, r[0])
-    let p = json_skip_ws(s, r[1])
-    if s[p] == "," then
-      let p = json_skip_ws(s, p + 1)
+    let p = json_skip_ws(h, r[1])
+    if sc_char(h, p) == "," then
+      let p = json_skip_ws(h, p + 1)
     else
       let done = true
     end
@@ -132,24 +156,24 @@ make a function called json_parse_array takes s, pos returns pair
   return [["arr", items], p + 1]
 end
 
-make a function called json_parse_object takes s, pos returns pair
-  let p = json_skip_ws(s, pos + 1)
+make a function called json_parse_object takes h, pos returns pair
+  let p = json_skip_ws(h, pos + 1)
   let pairs = []
-  if s[p] == "}" then
+  if sc_char(h, p) == "}" then
     return [["obj", pairs], p + 1]
   end
   let done = false
   while not done do
-    let p = json_skip_ws(s, p)
-    let kr = json_parse_string(s, p)
+    let p = json_skip_ws(h, p)
+    let kr = json_parse_string(h, p)
     let key = kr[0][1]
-    let p = json_skip_ws(s, kr[1])
-    let p = json_skip_ws(s, p + 1)
-    let vr = json_parse_value(s, p)
+    let p = json_skip_ws(h, kr[1])
+    let p = json_skip_ws(h, p + 1)
+    let vr = json_parse_value(h, p)
     let pairs = list_push(pairs, [key, vr[0]])
-    let p = json_skip_ws(s, vr[1])
-    if s[p] == "," then
-      let p = json_skip_ws(s, p + 1)
+    let p = json_skip_ws(h, vr[1])
+    if sc_char(h, p) == "," then
+      let p = json_skip_ws(h, p + 1)
     else
       let done = true
     end
@@ -157,17 +181,17 @@ make a function called json_parse_object takes s, pos returns pair
   return [["obj", pairs], p + 1]
 end
 
-make a function called json_parse_value takes s, pos returns pair
-  let p = json_skip_ws(s, pos)
-  let c = s[p]
+make a function called json_parse_value takes h, pos returns pair
+  let p = json_skip_ws(h, pos)
+  let c = sc_char(h, p)
   if c == "{" then
-    return json_parse_object(s, p)
+    return json_parse_object(h, p)
   end
   if c == "[" then
-    return json_parse_array(s, p)
+    return json_parse_array(h, p)
   end
   if c == "\"" then
-    return json_parse_string(s, p)
+    return json_parse_string(h, p)
   end
   if c == "t" then
     return [["bool", true], p + 4]
@@ -178,11 +202,12 @@ make a function called json_parse_value takes s, pos returns pair
   if c == "n" then
     return [["null"], p + 4]
   end
-  return json_parse_number(s, p)
+  return json_parse_number(h, p)
 end
 
 make a function called json_parse takes s returns value
-  let r = json_parse_value(s, 0)
+  let h = str_intern(s)
+  let r = json_parse_value(h, 0)
   return r[0]
 end
 
