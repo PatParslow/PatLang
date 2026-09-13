@@ -98,10 +98,7 @@ impl Interpreter {
         self.run_function(program, func, args, &cache)
     }
 
-    fn run_function<'p>(&self, program: &'p Program, func: &'p Function, args: &[Value], cache: &PrecomputeCache<'p>) -> Result<Value, String> {
-        let mut pc: usize = 0;
-        let mut stack: Vec<Value> = Vec::new();
-
+    fn get_precomp<'p>(&self, program: &'p Program, func: &'p Function, cache: &PrecomputeCache<'p>) -> Rc<FnPrecomputed<'p>> {
         // Precomputed dispatch table, cached ONCE PER FUNCTION (keyed by this
         // function's own address) rather than rebuilt on every call -- see
         // FnPrecomputed's doc comment above for the full story, including why
@@ -116,7 +113,7 @@ impl Interpreter {
         // stale mid-run.
         let key = func as *const Function as usize;
         let existing = cache.borrow().get(&key).cloned();
-        let precomp = match existing {
+        match existing {
             Some(p) => p,
             None => {
                 let mut slot_of: HashMap<&str, usize> = HashMap::new();
@@ -171,14 +168,59 @@ impl Interpreter {
                 cache.borrow_mut().insert(key, Rc::clone(&p));
                 p
             }
-        };
+        }
+    }
+
+    fn run_function<'p>(&self, program: &'p Program, func: &'p Function, args: &[Value], cache: &PrecomputeCache<'p>) -> Result<Value, String> {
+        let precomp = self.get_precomp(program, func, cache);
         // Parameter i always occupies slot i, guaranteed by the slot-
         // assignment order above (params inserted first, in order) --
-        // no separate name->slot lookup needed to bind args.
+        // no separate name->slot lookup needed to bind args. Cloned here
+        // because `args` is only borrowed -- callers that already OWN a
+        // freshly-built, single-use Vec<Value> (the common Instr::Call
+        // path) should use run_function_owned instead, which moves
+        // instead: see that function's own doc comment for why the clone
+        // here matters (GitHub #75).
         let mut locals: Vec<Value> = vec![Value::Unit; precomp.slot_count];
         for (i, v) in args.iter().enumerate().take(func.params.len()) {
             locals[i] = v.clone();
         }
+        self.run_function_locals(program, func, precomp, locals, cache)
+    }
+
+    // Identical to run_function except it takes ownership of `args` and
+    // MOVES each element into its local slot instead of cloning.
+    //
+    // GitHub #75: `let out = push_via_fn(out, v)` (accumulating a list
+    // through a helper function call) was O(n) PER CALL -- O(n^2)
+    // overall -- 2700x slower than the equivalent inline `list_push` at
+    // n=40,000. Root cause: Instr::Call already drains the stack into a
+    // freshly-owned `argsv: Vec<Value>` (so the CALLER's own alias is
+    // already gone, via LoadLocal's existing move_ok optimization), but
+    // the callee's own parameter binding then did `locals[i] =
+    // v.clone()` against that Vec -- creating a SECOND live Arc
+    // reference (argsv's own element, plus the fresh clone in `locals`)
+    // for the callee's *entire* execution. `list_push` inside the callee
+    // therefore always saw Arc::strong_count() > 1 and paid a full O(n)
+    // deep-clone on every single call, regardless of how many other
+    // aliases existed anywhere else. Moving here instead means `argsv`
+    // is left holding only `Value::Unit` placeholders once bound, so the
+    // callee's `locals[i]` is the ONLY live owner and Arc::make_mut can
+    // mutate in place -- collapsing this back to the already-correct
+    // O(1)-amortized inline case.
+    fn run_function_owned<'p>(&self, program: &'p Program, func: &'p Function, args: Vec<Value>, cache: &PrecomputeCache<'p>) -> Result<Value, String> {
+        let precomp = self.get_precomp(program, func, cache);
+        let mut locals: Vec<Value> = vec![Value::Unit; precomp.slot_count];
+        let n = func.params.len();
+        for (i, v) in args.into_iter().enumerate().take(n) {
+            locals[i] = v;
+        }
+        self.run_function_locals(program, func, precomp, locals, cache)
+    }
+
+    fn run_function_locals<'p>(&self, program: &'p Program, func: &'p Function, precomp: Rc<FnPrecomputed<'p>>, mut locals: Vec<Value>, cache: &PrecomputeCache<'p>) -> Result<Value, String> {
+        let mut pc: usize = 0;
+        let mut stack: Vec<Value> = Vec::new();
 
         while pc < func.body.len() {
             match &func.body[pc] {
@@ -433,7 +475,10 @@ impl Interpreter {
                     let args_index = stack.len() - argc;
                     let argsv: Vec<Value> = stack.drain(args_index..).collect();
                     let callee = precomp.resolved_call[pc].ok_or_else(|| format!("function '{}' not found", fname))?;
-                    let ret = self.run_function(program, callee, &argsv, cache)?;
+                    // run_function_owned, not run_function: argsv is a
+                    // freshly-drained, single-use Vec -- moving instead of
+                    // cloning into the callee's locals is what fixes #75.
+                    let ret = self.run_function_owned(program, callee, argsv, cache)?;
                     stack.push(ret);
                 }
                 Instr::MakeClosure(func_name, captured_names) => {

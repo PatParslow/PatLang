@@ -131,6 +131,53 @@ fn hot_loop_calling_several_named_functions_repeatedly() {
 }
 
 #[test]
+fn list_accumulated_through_a_helper_function_stays_correct() {
+    // GitHub #75: correctness companion to the timing guard below.
+    // list_push must still append in order (not lose/duplicate/reorder
+    // elements) once the move-instead-of-clone argument-binding fix
+    // (run_function_owned) is in place.
+    let out = run_capture(
+        "make a function called push_via_fn takes out, v returns lst\n  let out = list_push(out, v)\n  return out\nend\nlet acc = []\nlet i = 0\nwhile i < 20 do\n  let acc = push_via_fn(acc, i)\n  let i = i + 1\nend\nprint(list_len(acc))\nlet j = 0\nwhile j < 20 do\n  print(acc[j])\n  let j = j + 1\nend\n"
+    );
+    let mut expected = vec!["20".to_string()];
+    expected.extend((0..20i64).map(|i| i.to_string()));
+    assert_eq!(out, expected);
+}
+
+#[test]
+fn list_accumulated_through_a_helper_function_is_not_quadratic() {
+    // GitHub #75: `let out = push_via_fn(out, v)` (accumulating a list by
+    // passing it through an ordinary function call, then reassigning the
+    // caller's own variable to the result) measured 2700x slower than
+    // the equivalent inline `list_push` at n=40,000 -- ~24.1s instead of
+    // ~9ms -- because Instr::Call bound the callee's parameter via
+    // `locals[i] = v.clone()` against a Vec the caller's own argsv was
+    // still alive to alias, so Arc::make_mut inside list_push always saw
+    // strong_count() > 1 and paid a full O(n) deep-clone on every single
+    // call (O(n^2) overall). Fixed by binding call arguments via move
+    // (run_function_owned) instead of clone, since Instr::Call's argsv is
+    // always a freshly-drained, single-use Vec with nothing else to alias
+    // it. This is a genuine wall-clock guard, not a unit-count one -- the
+    // quadratic behavior would still pass a "does it terminate" test if
+    // this timeout were removed, at 4x the wall time per doubling.
+    // n=20,000 was ~4.9s quadratic (see the issue's own measurements) and
+    // is a few ms fixed; 5s of slack covers slow/loaded CI machines by a
+    // wide margin while still catching a regression back to quadratic.
+    let src = "make a function called push_via_fn takes out, v returns lst\n  let out = list_push(out, v)\n  return out\nend\nlet out = []\nlet i = 0\nwhile i < 20000 do\n  let out = push_via_fn(out, i % 256)\n  let i = i + 1\nend\nprint(list_len(out))\n";
+    let start = std::time::Instant::now();
+    let out = run_capture(src);
+    let elapsed = start.elapsed();
+    assert_eq!(out, vec!["20000"]);
+    assert!(
+        elapsed.as_secs_f64() < 5.0,
+        "list accumulation through a function call took {:?} for n=20000 -- expected well under 5s; \
+         this shape was ~4.9s BEFORE #75's fix and should now be single-digit milliseconds, \
+         so a slow result here means the quadratic behavior has come back",
+        elapsed
+    );
+}
+
+#[test]
 fn nested_closures_three_levels_independent_state() {
     let out = run_capture(
         "let make_adder3 = |a| do\n  let level2 = |b| do\n    let level3 = |c| do\n      return a + b + c\n    end\n    return level3\n  end\n  return level2\nend\nlet add10_20 = make_adder3(10)(20)\nprint(add10_20(1))\nprint(make_adder3(100)(20)(1))\nprint(add10_20(2))\n"

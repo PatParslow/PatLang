@@ -92,6 +92,7 @@ struct PatWorld {
     compile_stderr: String,
     compiled: Option<RunResult>,
     selfhost_interp: Option<RunResult>,
+    compiled_run_elapsed: Option<std::time::Duration>,
 }
 
 impl PatWorld {
@@ -107,6 +108,7 @@ impl PatWorld {
             compile_stderr: String::new(),
             compiled: None,
             selfhost_interp: None,
+            compiled_run_elapsed: None,
         }
     }
 
@@ -238,7 +240,9 @@ fn when_compile_and_run(world: &mut PatWorld) {
     world.compile_ok = Some(build.success);
     world.compile_stderr = build.stderr;
     if build.success {
+        let t0 = std::time::Instant::now();
         world.compiled = Some(run(&exe, &[], &root));
+        world.compiled_run_elapsed = Some(t0.elapsed());
     }
 }
 
@@ -408,6 +412,18 @@ fn then_size_at_most(world: &mut PatWorld, max_bytes: usize) {
     assert!(
         n <= max_bytes,
         "Value size regressed: reported {n} bytes, expected at most {max_bytes}"
+    );
+}
+
+#[then(regex = r"^the compiled run completes within (\d+) seconds$")]
+fn then_compiled_run_within_seconds(world: &mut PatWorld, max_secs: u64) {
+    let elapsed = world
+        .compiled_run_elapsed
+        .expect("no compiled run was performed before this assertion");
+    assert!(
+        elapsed.as_secs_f64() < max_secs as f64,
+        "compiled run took {:?}, expected under {max_secs}s -- a wall-clock regression like this is exactly how GitHub #75 (list accumulation through a function call, O(n^2)) first showed up in the native/--patc path",
+        elapsed
     );
 }
 

@@ -1166,12 +1166,10 @@ pub struct FnPrecomputed<'p> {
 }
 pub type PrecomputeCache<'p> = RefCell<HashMap<usize, Rc<FnPrecomputed<'p>>>>;
 
-fn run_function<'p>(program: &'p Program, func: &'p Function, args: &[Value], cache: &PrecomputeCache<'p>) -> Result<Value,String> {
-    let mut pc: usize = 0;
-    let mut stack: Vec<Value> = Vec::new();
+fn get_precomp<'p>(program: &'p Program, func: &'p Function, cache: &PrecomputeCache<'p>) -> Rc<FnPrecomputed<'p>> {
     let key = func as *const Function as usize;
     let existing = cache.borrow().get(&key).cloned();
-    let precomp = match existing {
+    match existing {
         Some(p) => p,
         None => {
             let mut slot_of: HashMap<&str, usize> = HashMap::new();
@@ -1216,9 +1214,36 @@ fn run_function<'p>(program: &'p Program, func: &'p Function, args: &[Value], ca
             cache.borrow_mut().insert(key, Rc::clone(&p));
             p
         }
-    };
+    }
+}
+
+fn run_function<'p>(program: &'p Program, func: &'p Function, args: &[Value], cache: &PrecomputeCache<'p>) -> Result<Value,String> {
+    let precomp = get_precomp(program, func, cache);
     let mut locals: Vec<Value> = vec![Value::Unit; precomp.slot_count];
     for (i, v) in args.iter().enumerate().take(func.params.len()) { locals[i] = v.clone(); }
+    run_function_locals(program, func, precomp, locals, cache)
+}
+
+// GitHub #75: identical fix to interpreter.rs's own run_function_owned --
+// see that copy's doc comment for the full root-cause explanation. This
+// codegen.rs copy is the one actually exercised by `pat --patc`-compiled
+// binaries (their generated program.rs links against this exact function,
+// running the baked-in IR through it rather than emitting genuine
+// per-function native Rust calls), so it shares the identical O(n^2)
+// list-accumulation-through-a-function-call bug and needs the identical
+// fix: move owned, single-use call arguments into the callee's locals
+// instead of cloning them, so Arc::make_mut sees a uniquely-held Arc
+// inside the callee's own list_push/list_set calls.
+fn run_function_owned<'p>(program: &'p Program, func: &'p Function, args: Vec<Value>, cache: &PrecomputeCache<'p>) -> Result<Value,String> {
+    let precomp = get_precomp(program, func, cache);
+    let mut locals: Vec<Value> = vec![Value::Unit; precomp.slot_count];
+    for (i, v) in args.into_iter().enumerate().take(func.params.len()) { locals[i] = v; }
+    run_function_locals(program, func, precomp, locals, cache)
+}
+
+fn run_function_locals<'p>(program: &'p Program, func: &'p Function, precomp: Rc<FnPrecomputed<'p>>, mut locals: Vec<Value>, cache: &PrecomputeCache<'p>) -> Result<Value,String> {
+    let mut pc: usize = 0;
+    let mut stack: Vec<Value> = Vec::new();
     while pc < func.body.len() {
         match &func.body[pc] {
             Instr::Const(v) => stack.push(v.clone()),
@@ -1533,7 +1558,7 @@ fn run_function<'p>(program: &'p Program, func: &'p Function, args: &[Value], ca
                 let argc = *argc; if stack.len() < argc { return Err("stack underflow".into()); }
                 let args_index = stack.len() - argc; let args: Vec<Value> = stack.drain(args_index..).collect();
                 let callee = precomp.resolved_call[pc].ok_or_else(|| format!("function '{}' not found", n))?;
-                let r = run_function(program, callee, &args, cache)?; stack.push(r);
+                let r = run_function_owned(program, callee, args, cache)?; stack.push(r);
             }
             Instr::MakeClosure(func_name, captured_names) => {
                 let n = captured_names.len();
