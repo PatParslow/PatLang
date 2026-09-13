@@ -3342,6 +3342,22 @@ pub fn host_ceil(args: &[Value]) -> Result<Value, String> { round_like(args, "ce
 pub fn host_round(args: &[Value]) -> Result<Value, String> { round_like(args, "round") }
 pub fn host_trunc(args: &[Value]) -> Result<Value, String> { round_like(args, "trunc") }
 
+/// exit_with(code) -> never returns; terminates the process with the given
+/// exit code. GitHub #81: patc1_main's own compiled body (a codegen.rs-
+/// compiled native program, not an x64-target one) had no way to set a
+/// non-zero exit code on a failed build -- os_exit exists only inside
+/// x64_runtime.patlang, emitted for the TARGET programs patc1 compiles,
+/// unreachable from patc1's own body. This is the genuine host-level
+/// primitive that was missing, mirrored into codegen.rs's compiled-program
+/// text so patc1.exe (itself compiled via that path) can call it.
+pub fn host_exit_with(args: &[Value]) -> Result<Value, String> {
+    let code = match args.get(0) {
+        Some(v) => v.as_number().unwrap_or(0.0) as i32,
+        None => 0,
+    };
+    std::process::exit(code);
+}
+
 /// to_fixed(x, places) -> String, exactly `places` decimal digits, always.
 /// Not the same problem `round` solves: `round`/floor/ceil/trunc return a
 /// NUMBER, so a Float result is still subject to `v_to_string`'s ordinary
@@ -3564,6 +3580,7 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("ceil", host_ceil);
     interp.host.insert("round", host_round);
     interp.host.insert("trunc", host_trunc);
+    interp.host.insert("exit_with", host_exit_with);
     interp.host.insert("to_fixed", host_to_fixed);
     interp.host.insert("abs", host_abs);
     interp.host.insert("numeric_kind", host_numeric_kind);

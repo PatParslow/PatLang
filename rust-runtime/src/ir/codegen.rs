@@ -670,7 +670,16 @@ impl Host {
             &heap_buf
         };
         match name {
-"list_get" => {
+"exit_with" => {
+                // exit_with(code) -> never returns. GitHub #81: patc1_main's
+                // own compiled body had no way to set a non-zero exit code on
+                // a failed build -- os_exit exists only inside x64_runtime.
+                // patlang, emitted for the TARGET programs patc1 compiles,
+                // unreachable from patc1's own body compiled via THIS path.
+                let code = match args.get(0) { Some(v) => v.as_number().unwrap_or(0.0) as i32, None => 0 };
+                std::process::exit(code);
+            }
+            "list_get" => {
                 // list_get(list, index)
                 if args.len() != 2 { return Err("expected 2 args".into()); }
                 let idx = match &args[1] { Value::Number(n) => *n as usize, Value::String(s) => s.parse::<usize>().unwrap_or(0), _ => 0 };
