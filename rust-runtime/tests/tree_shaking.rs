@@ -43,12 +43,22 @@ fn networking_chunk_excluded_unless_used() {
 
 #[test]
 fn oo_chunk_excluded_unless_used() {
+    // GitHub #111: the original `!bare_src.contains("host_call_oo")`
+    // check was a false positive, not a real tree-shaking bug --
+    // PRELUDE_CORE's own text mentions the string "host_call_oo" in an
+    // explanatory COMMENT (about `send`'s "set" sub-case), which a bare
+    // substring search can't tell apart from a genuine call to or
+    // definition of that function. Checking for `fn host_call_oo`
+    // specifically (the real function definition, only ever emitted
+    // when the oo chunk's own PRELUDE_OO text is included) is what the
+    // networking test just above already does for exactly this reason
+    // (checks `fn tcp_listen` as well as the bare name).
     let cg = RustCodegen::new();
     let bare_src = cg.emit_rust(&bare_program());
-    assert!(!bare_src.contains("host_call_oo"), "bare program should not pull in the oo chunk");
+    assert!(!bare_src.contains("fn host_call_oo"), "bare program should not pull in the oo chunk: {}", bare_src);
 
     let oo_src = cg.emit_rust(&program_calling("new", 2));
-    assert!(oo_src.contains("host_call_oo"), "new()-using program should include the oo chunk");
+    assert!(oo_src.contains("fn host_call_oo"), "new()-using program should include the oo chunk");
 }
 
 #[test]
