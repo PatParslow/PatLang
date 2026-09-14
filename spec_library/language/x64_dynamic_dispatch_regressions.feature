@@ -17,6 +17,15 @@ Feature: x64 dynamic-dispatch regressions (#98/#100/#85) -- a real interp-vs-x64
     Then both show: bool concat: true, false tail, noop, unit, prefix:
     And the two outputs match exactly
 
+  Scenario: rt_print_str itself returns genuine Unit, not the old truthy-Bool placeholder (#63 item 2)
+    Given self_hosting/examples/x64_rt_print_str_unit_native.patlang calls
+      rt_print_str/rt_print_bool/rt_print_float directly (not through
+      print()'s own separate Unit workaround, and not available under
+      `pat --ir-run` at all -- these are x64-runtime-only primitives)
+      and reports type_of() on each return value
+    When the file is compiled+run via patc1's `--x64`
+    Then it shows: unit, unit, unit
+
   Scenario: sqrt/sin/cos/pow print their real numeric result under --x64, not a garbage int (#109)
     Given self_hosting/examples/x64_math1_float_print_native.patlang calls sqrt/sin/cos/pow
     When the file is run under `pat --ir-run` and compiled+run via patc1's `--x64`
