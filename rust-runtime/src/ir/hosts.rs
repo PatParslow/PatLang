@@ -1549,6 +1549,114 @@ pub fn host_plan(args: &[Value]) -> Result<Value, String> {
     Ok(Value::List(Arc::new(plan_facts(goal_facts, Vec::new()).into_iter().map(|s| Value::String(s.into())).collect())))
 }
 
+// ---- plan_with_state: additive alongside plan()/plan_facts, which remain
+// completely untouched by this (same "additive sibling, zero risk to
+// existing callers" shape as plan_incremental just below). Motivation:
+// plan_facts's own uniform-cost search already computes the exact
+// resulting world-state and fluents at the node where a goal is reached
+// -- `new_state`/`new_fluents` in the loop below -- but only ever returns
+// `path`, discarding them once found. goap_verify_contracts and the
+// narrow Gherkin contract-clause system (self_hosting/lib/
+// gherkin_contracts.patlang) can currently only check a contract against
+// STRING-PARSED action-label bindings ("scale(X=5)"-style), never the
+// real resulting state a schema's invariant would need to check against
+// directly (implementation plan Phase 3, item 3). This is a literal,
+// separate copy of plan_facts's search loop rather than a refactor of it
+// into a shared core, specifically so plan_facts itself needs no change
+// of any kind -- verified byte-for-byte behavior-preserving is a much
+// higher bar to fail than "produces the same output on the cases I
+// thought to test," and every existing caller of plan()/plan_facts
+// depends on this binary being exactly what it already is today.
+fn plan_facts_with_state(goal_facts: Vec<GroundFact>, goal_numeric: Vec<NumCond>) -> Option<(Vec<String>, std::collections::HashSet<GroundFact>, std::collections::BTreeMap<String, i64>)> {
+    let actions: Vec<GoapAction> = ACTIONS.with(|a| a.borrow().clone());
+
+    use std::collections::{BTreeMap, BinaryHeap, HashSet};
+    use std::cmp::Reverse;
+
+    let start_state: HashSet<GroundFact> = current_ground_facts_as_state();
+    let start_fluents: BTreeMap<String, i64> = current_fluents_as_state();
+    let mut nodes: Vec<(HashSet<GroundFact>, BTreeMap<String, i64>, Vec<String>, i64)> = vec![(start_state, start_fluents, Vec::new(), 0)];
+    let mut frontier: BinaryHeap<Reverse<(i64, usize)>> = BinaryHeap::new();
+    frontier.push(Reverse((0, 0)));
+
+    let mut visited: HashSet<(Vec<GroundFact>, Vec<(String, i64)>)> = HashSet::new();
+    const NODE_CAP: usize = 5000;
+    let mut expansions = 0usize;
+    let empty_subst: Subst = Subst::new();
+
+    while let Some(Reverse((cost, idx))) = frontier.pop() {
+        if expansions >= NODE_CAP { break; }
+        let (state, fluents, path, node_cost) = nodes[idx].clone();
+        if node_cost != cost { continue; }
+        expansions += 1;
+        if goal_facts.iter().all(|g| state.contains(g))
+            && goal_numeric.iter().all(|nc| eval_num_cond(nc, &fluents, &empty_subst))
+        {
+            return Some((path, state, fluents));
+        }
+        let mut state_key: Vec<GroundFact> = state.iter().cloned().collect();
+        state_key.sort();
+        let fluent_key: Vec<(String, i64)> = fluents.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        if !visited.insert((state_key, fluent_key)) { continue; }
+
+        for action in &actions {
+            for subst in ground_action_instances(&action.preconds, &state) {
+                if !action.numeric_preconds.iter().all(|nc| eval_num_cond(nc, &fluents, &subst)) { continue; }
+                let mut new_state = state.clone();
+                for d in &action.del_effects { new_state.remove(&apply_subst_to_fact(d, &subst)); }
+                for a2 in &action.add_effects { new_state.insert(apply_subst_to_fact(a2, &subst)); }
+                let mut new_fluents = fluents.clone();
+                for ne in &action.numeric_effects { apply_num_effect(ne, &mut new_fluents, &subst); }
+                let mut new_path = path.clone();
+                new_path.push(action_instance_label(&action.name, &action.preconds, &subst));
+                let new_cost = node_cost + action.cost;
+                nodes.push((new_state, new_fluents, new_path, new_cost));
+                frontier.push(Reverse((new_cost, nodes.len() - 1)));
+            }
+        }
+    }
+    None
+}
+
+fn ground_fact_to_value(f: &GroundFact) -> Value {
+    Value::List(Arc::new(vec![
+        Value::String(f.pred.clone().into()),
+        Value::List(Arc::new(f.args.iter().map(|a| Value::String(a.clone().into())).collect())),
+    ]))
+}
+
+pub fn host_plan_with_state(args: &[Value]) -> Result<Value, String> {
+    // plan_with_state(goal_facts_list) -> [path_list, resulting_facts_list,
+    // resulting_fluents_list]. resulting_facts_list is a list of [pred,
+    // args_list] pairs -- the SAME shape rule_add's own args and a goal
+    // facts list already use, so a caller can feed it straight back into
+    // rule_add or a schema's state-mapping function without a separate
+    // conversion step. resulting_fluents_list is a list of [name, value]
+    // pairs (PatLang has no native map -- see self_hosting/lib/pmap.
+    // patlang's own association-list convention, mirrored here). All
+    // three lists come back empty if no plan is found within the search
+    // cap, mirroring plan()'s own "empty List means no plan" convention.
+    if args.len() != 1 { return Err("plan_with_state: expected 1 arg (goal_facts_list)".into()); }
+    let goal_facts = parse_ground_facts(&args[0]);
+    match plan_facts_with_state(goal_facts, Vec::new()) {
+        Some((path, state, fluents)) => {
+            let path_v = Value::List(Arc::new(path.into_iter().map(|s| Value::String(s.into())).collect()));
+            let mut facts_sorted: Vec<GroundFact> = state.into_iter().collect();
+            facts_sorted.sort();
+            let facts_v = Value::List(Arc::new(facts_sorted.iter().map(ground_fact_to_value).collect()));
+            let fluents_v = Value::List(Arc::new(fluents.into_iter().map(|(k, v)| {
+                Value::List(Arc::new(vec![Value::String(k.into()), Value::Int(v)]))
+            }).collect()));
+            Ok(Value::List(Arc::new(vec![path_v, facts_v, fluents_v])))
+        }
+        None => Ok(Value::List(Arc::new(vec![
+            Value::List(Arc::new(Vec::new())),
+            Value::List(Arc::new(Vec::new())),
+            Value::List(Arc::new(Vec::new())),
+        ]))),
+    }
+}
+
 // ---- plan_incremental: additive alongside plan()/plan_facts, which are
 // completely untouched (existing callers -- the goal-oriented
 // web-service demo, PDDL numeric-fluent planning -- keep their current,
@@ -3564,6 +3672,7 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("object_delete", host_object_delete);
     interp.host.insert("progress_report", host_progress_report);
     interp.host.insert("plan", host_plan);
+    interp.host.insert("plan_with_state", host_plan_with_state);
     interp.host.insert("plan_incremental", host_plan_incremental);
     interp.host.insert("fluent_set", host_fluent_set);
     interp.host.insert("action_add_numeric", host_action_add_numeric);

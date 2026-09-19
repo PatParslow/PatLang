@@ -1,0 +1,372 @@
+# =============================================================================
+# LibraryLoans, fully worked: a richer Z/BDD hybrid schema than the plan's
+# own minimal selftest (self_hosting/schema_bdd_selftest.patlang) --
+# three pieces of interacting state, a multi-clause precondition, a
+# cross-cutting invariant (no member may exceed three simultaneous
+# loans), and enough scenarios to exercise every diagnosis tag
+# schema_check can produce: invariant_violated_before, precondition_
+# violated, postcondition_violated, and ok. Companion to the parslow.net
+# "Schemas and Scenarios" page.
+#
+# State: books (Set<Title>), borrowedBy (Map<Title,Member>), loanCount
+# (Map<Member,Int>) -- loanCount is tracked SEPARATELY from borrowedBy
+# rather than recomputed from it on every check, the same design choice
+# a real system would make (a denormalised, maintained count rather than
+# a full table scan every time), which is exactly why BorrowBook/
+# ReturnBook's own postconditions -- not just the invariant -- have real
+# work to do keeping the two consistent with each other.
+#
+# Run from the repo root:
+#   rust-runtime/target/release/pat --ir-run self_hosting/examples/library_loans_schema_demo.patlang
+
+include "../lib/test.patlang"
+include "../lib/pset.patlang"
+include "../lib/pmap.patlang"
+include "../lib/schema_bdd.patlang"
+
+# ---- LibraryLoans: invariant + BorrowBook/ReturnBook contracts ----
+
+make a function called ll_loan_count_of takes loan_count, member returns n
+  if pmap_has(loan_count, member) then
+    return pmap_get(loan_count, member)
+  end
+  return 0
+end
+
+# Invariant: every title on loan is one the library actually holds, and
+# no member exceeds three simultaneous loans -- the second half is a
+# genuine cross-cutting business rule, not derivable from the first.
+make a function called ll_invariant takes state returns ok
+  let books = state[0]
+  let borrowed_by = state[1]
+  let loan_count = state[2]
+  let keys = pmap_keys(borrowed_by)
+  let i = 0
+  let n = to_num(list_len(keys))
+  while i < n do
+    if pset_contains(books, keys[i]) == false then
+      return false
+    end
+    let i = i + 1
+  end
+  let members = pmap_keys(loan_count)
+  let j = 0
+  let mn = to_num(list_len(members))
+  while j < mn do
+    let count = pmap_get(loan_count, members[j])
+    if (count < 0) or (count > 3) then
+      return false
+    end
+    let j = j + 1
+  end
+  return true
+end
+
+# BorrowBook's precondition is three independent clauses, checked
+# together -- exactly the shape a hand-written scenario can violate in
+# three genuinely different ways, each needing its own scenario to
+# demonstrate (see the feature text below).
+make a function called ll_require_borrow takes state, inputs returns ok
+  let books = state[0]
+  let borrowed_by = state[1]
+  let loan_count = state[2]
+  let title = inputs[0]
+  let member = inputs[1]
+  if pset_contains(books, title) == false then
+    return false
+  end
+  if pmap_has(borrowed_by, title) then
+    return false
+  end
+  return ll_loan_count_of(loan_count, member) < 3
+end
+
+make a function called ll_ensure_borrow takes before, after, inputs returns ok
+  let books_before = before[0]
+  let borrowed_by_before = before[1]
+  let loan_count_before = before[2]
+  let books_after = after[0]
+  let borrowed_by_after = after[1]
+  let loan_count_after = after[2]
+  let title = inputs[0]
+  let member = inputs[1]
+  if pset_equal(books_before, books_after) == false then
+    return false
+  end
+  let expected_borrowed_by = pmap_put(borrowed_by_before, title, member)
+  if schema_pmap_equal(expected_borrowed_by, borrowed_by_after) == false then
+    return false
+  end
+  let expected_count = ll_loan_count_of(loan_count_before, member) + 1
+  let expected_loan_count = pmap_put(loan_count_before, member, expected_count)
+  return schema_pmap_equal(expected_loan_count, loan_count_after)
+end
+
+# ReturnBook takes only the title -- the member is recovered from
+# borrowedBy, exactly the way a real return desk works (you hand back
+# the book, not a signed claim of who you are).
+make a function called ll_require_return takes state, inputs returns ok
+  let borrowed_by = state[1]
+  let title = inputs[0]
+  return pmap_has(borrowed_by, title)
+end
+
+make a function called ll_ensure_return takes before, after, inputs returns ok
+  let books_before = before[0]
+  let borrowed_by_before = before[1]
+  let loan_count_before = before[2]
+  let books_after = after[0]
+  let borrowed_by_after = after[1]
+  let loan_count_after = after[2]
+  let title = inputs[0]
+  let member = pmap_get(borrowed_by_before, title)
+  if pset_equal(books_before, books_after) == false then
+    return false
+  end
+  let expected_borrowed_by = pmap_remove(borrowed_by_before, title)
+  if schema_pmap_equal(expected_borrowed_by, borrowed_by_after) == false then
+    return false
+  end
+  let expected_count = ll_loan_count_of(loan_count_before, member) - 1
+  let expected_loan_count = pmap_put(loan_count_before, member, expected_count)
+  return schema_pmap_equal(expected_loan_count, loan_count_after)
+end
+
+# pmap.patlang has no pmap_equal (see schema_bdd_selftest.patlang's own
+# note on this); defined once here, shared by both ensure functions.
+make a function called schema_pmap_equal takes a, b returns eq
+  if pmap_size(a) != pmap_size(b) then
+    return false
+  end
+  let keys = pmap_keys(a)
+  let i = 0
+  let n = to_num(list_len(keys))
+  while i < n do
+    let k = keys[i]
+    if pmap_has(b, k) == false then
+      return false
+    end
+    if pmap_get(a, k) != pmap_get(b, k) then
+      return false
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+make a function called register_library_loans_schema returns done
+  schema_define("LibraryLoans", ["books", "borrowedBy", "loanCount"], "ll_invariant")
+  schema_operation("LibraryLoans", "BorrowBook", ["title", "member"], "ll_require_borrow", "ll_ensure_borrow")
+  schema_operation("LibraryLoans", "ReturnBook", ["title"], "ll_require_return", "ll_ensure_return")
+  return true
+end
+
+# ---- step definitions ----
+
+make a function called ll_standard_catalogue returns s
+  let s = pset_add(pset_new(), "Dune")
+  let s = pset_add(s, "Neuromancer")
+  let s = pset_add(s, "Foundation")
+  return s
+end
+
+make a function called st_given_standard_catalogue returns done
+  schema_bind_state("LibraryLoans", "books", "before", ll_standard_catalogue())
+  return true
+end
+
+make a function called st_given_no_loans_out returns done
+  schema_bind_state("LibraryLoans", "borrowedBy", "before", pmap_new())
+  schema_bind_state("LibraryLoans", "loanCount", "before", pmap_new())
+  return true
+end
+
+make a function called st_given_dune_borrowed_by_okonkwo returns done
+  schema_bind_state("LibraryLoans", "borrowedBy", "before", pmap_put(pmap_new(), "Dune", "S. Okonkwo"))
+  schema_bind_state("LibraryLoans", "loanCount", "before", pmap_put(pmap_new(), "S. Okonkwo", 1))
+  return true
+end
+
+# Deliberately consistent, valid "already at the limit" state -- three
+# real titles, all correctly attributed to the same member, matching
+# what the invariant actually checks (the count, not the specific books).
+make a function called st_given_diallo_at_loan_limit returns done
+  let borrowed_by = pmap_put(pmap_new(), "Dune", "A. Diallo")
+  let borrowed_by = pmap_put(borrowed_by, "Neuromancer", "A. Diallo")
+  let borrowed_by = pmap_put(borrowed_by, "Foundation", "A. Diallo")
+  schema_bind_state("LibraryLoans", "borrowedBy", "before", borrowed_by)
+  schema_bind_state("LibraryLoans", "loanCount", "before", pmap_put(pmap_new(), "A. Diallo", 3))
+  return true
+end
+
+# Deliberately INVALID state: the record already claims four loans,
+# violating the invariant before any operation is even attempted.
+make a function called st_given_corrupted_loan_record returns done
+  schema_bind_state("LibraryLoans", "borrowedBy", "before", pmap_new())
+  schema_bind_state("LibraryLoans", "loanCount", "before", pmap_put(pmap_new(), "A. Diallo", 4))
+  return true
+end
+
+make a function called st_when_diallo_borrows_foundation returns done
+  schema_bind_input("LibraryLoans", "BorrowBook", "title", "Foundation")
+  schema_bind_input("LibraryLoans", "BorrowBook", "member", "A. Diallo")
+  return true
+end
+
+make a function called st_when_diallo_borrows_dune returns done
+  schema_bind_input("LibraryLoans", "BorrowBook", "title", "Dune")
+  schema_bind_input("LibraryLoans", "BorrowBook", "member", "A. Diallo")
+  return true
+end
+
+make a function called st_when_okonkwo_returns_dune returns done
+  schema_bind_input("LibraryLoans", "ReturnBook", "title", "Dune")
+  return true
+end
+
+make a function called st_when_someone_returns_foundation returns done
+  schema_bind_input("LibraryLoans", "ReturnBook", "title", "Foundation")
+  return true
+end
+
+# ---- Then steps: state the scenario's own claim, then check it ----
+
+make a function called ll_check takes op, expected_tag, label returns done
+  let diagnosis = schema_check("LibraryLoans", op)
+  check(label, diagnosis[0], expected_tag)
+  return true
+end
+
+make a function called st_then_foundation_correctly_recorded returns done
+  let before_books = get("__vars", "LibraryLoans__books__before")
+  schema_bind_state("LibraryLoans", "books", "after", before_books)
+  let before_borrowed_by = get("__vars", "LibraryLoans__borrowedBy__before")
+  schema_bind_state("LibraryLoans", "borrowedBy", "after", pmap_put(before_borrowed_by, "Foundation", "A. Diallo"))
+  let before_loan_count = get("__vars", "LibraryLoans__loanCount__before")
+  schema_bind_state("LibraryLoans", "loanCount", "after", pmap_put(before_loan_count, "A. Diallo", ll_loan_count_of(before_loan_count, "A. Diallo") + 1))
+  ll_check("BorrowBook", "ok", "borrowing an available title, under the loan limit, is accepted")
+  return true
+end
+
+make a function called st_then_borrow_rejected_already_out returns done
+  ll_check("BorrowBook", "precondition_violated", "borrowing a title someone else already has out is rejected")
+  return true
+end
+
+make a function called st_then_borrow_rejected_at_limit returns done
+  ll_check("BorrowBook", "precondition_violated", "borrowing while already at the three-loan limit is rejected")
+  return true
+end
+
+make a function called st_then_invariant_flagged_first returns done
+  ll_check("BorrowBook", "invariant_violated_before", "a corrupted loan record is flagged before the operation is even considered")
+  return true
+end
+
+# Deliberately WRONG claimed outcome: the loan count is claimed to stay
+# the same after a successful borrow, which violates BorrowBook's own
+# postcondition even though the precondition and invariant are both fine.
+make a function called st_then_wrongly_claims_count_unchanged returns done
+  let before_books = get("__vars", "LibraryLoans__books__before")
+  schema_bind_state("LibraryLoans", "books", "after", before_books)
+  let before_borrowed_by = get("__vars", "LibraryLoans__borrowedBy__before")
+  schema_bind_state("LibraryLoans", "borrowedBy", "after", pmap_put(before_borrowed_by, "Dune", "A. Diallo"))
+  let before_loan_count = get("__vars", "LibraryLoans__loanCount__before")
+  schema_bind_state("LibraryLoans", "loanCount", "after", before_loan_count)
+  ll_check("BorrowBook", "postcondition_violated", "a claimed loan count that doesn't actually increment is rejected")
+  return true
+end
+
+make a function called st_then_return_accepted returns done
+  let before_books = get("__vars", "LibraryLoans__books__before")
+  schema_bind_state("LibraryLoans", "books", "after", before_books)
+  let before_borrowed_by = get("__vars", "LibraryLoans__borrowedBy__before")
+  schema_bind_state("LibraryLoans", "borrowedBy", "after", pmap_remove(before_borrowed_by, "Dune"))
+  let before_loan_count = get("__vars", "LibraryLoans__loanCount__before")
+  schema_bind_state("LibraryLoans", "loanCount", "after", pmap_put(before_loan_count, "S. Okonkwo", ll_loan_count_of(before_loan_count, "S. Okonkwo") - 1))
+  ll_check("ReturnBook", "ok", "returning a borrowed title is accepted")
+  return true
+end
+
+make a function called st_then_return_rejected_never_out returns done
+  ll_check("ReturnBook", "precondition_violated", "returning a title nobody borrowed is rejected")
+  return true
+end
+
+make a function called register_library_loans_steps returns done
+  step("the library holds its standard catalogue", "st_given_standard_catalogue")
+  step("no member has any books out", "st_given_no_loans_out")
+  step("\"Dune\" is currently borrowed by \"S. Okonkwo\"", "st_given_dune_borrowed_by_okonkwo")
+  step("\"A. Diallo\" already has three books out, at the loan limit", "st_given_diallo_at_loan_limit")
+  step("the loan record incorrectly already shows \"A. Diallo\" with four loans", "st_given_corrupted_loan_record")
+  step("\"A. Diallo\" borrows \"Foundation\"", "st_when_diallo_borrows_foundation")
+  step("\"A. Diallo\" borrows \"Dune\"", "st_when_diallo_borrows_dune")
+  step("\"S. Okonkwo\" returns \"Dune\"", "st_when_okonkwo_returns_dune")
+  step("someone returns \"Foundation\"", "st_when_someone_returns_foundation")
+  step("the loan is correctly recorded", "st_then_foundation_correctly_recorded")
+  step("the borrow is rejected", "st_then_borrow_rejected_already_out")
+  step("the borrow is rejected for being at the limit", "st_then_borrow_rejected_at_limit")
+  step("the schema flags the corrupted record, not the borrow attempt", "st_then_invariant_flagged_first")
+  step("the incorrect record is rejected", "st_then_wrongly_claims_count_unchanged")
+  step("the return is accepted", "st_then_return_accepted")
+  step("the return is rejected", "st_then_return_rejected_never_out")
+  return true
+end
+
+make a function called library_loans_feature returns text
+  return "Feature: Library loans, fully worked
+
+Scenario: Borrowing an available title under the loan limit
+  Given the library holds its standard catalogue
+  And no member has any books out
+  When \"A. Diallo\" borrows \"Foundation\"
+  Then the loan is correctly recorded
+
+Scenario: Borrowing a title someone else already has out
+  Given the library holds its standard catalogue
+  And \"Dune\" is currently borrowed by \"S. Okonkwo\"
+  When \"A. Diallo\" borrows \"Dune\"
+  Then the borrow is rejected
+
+Scenario: Borrowing while already at the three-loan limit
+  Given the library holds its standard catalogue
+  And \"A. Diallo\" already has three books out, at the loan limit
+  When \"A. Diallo\" borrows \"Dune\"
+  Then the borrow is rejected for being at the limit
+
+Scenario: A corrupted loan record is caught before the operation runs
+  Given the library holds its standard catalogue
+  And the loan record incorrectly already shows \"A. Diallo\" with four loans
+  When \"A. Diallo\" borrows \"Foundation\"
+  Then the schema flags the corrupted record, not the borrow attempt
+
+Scenario: A scenario that under-reports its own effect is caught too
+  Given the library holds its standard catalogue
+  And no member has any books out
+  When \"A. Diallo\" borrows \"Dune\"
+  Then the incorrect record is rejected
+
+Scenario: Returning a borrowed title
+  Given the library holds its standard catalogue
+  And \"Dune\" is currently borrowed by \"S. Okonkwo\"
+  When \"S. Okonkwo\" returns \"Dune\"
+  Then the return is accepted
+
+Scenario: Returning a title nobody borrowed
+  Given the library holds its standard catalogue
+  And no member has any books out
+  When someone returns \"Foundation\"
+  Then the return is rejected
+"
+end
+
+make a function called run_library_loans_schema_demo returns ok
+  t_init()
+  register_library_loans_schema()
+  register_library_loans_steps()
+  run_feature(library_loans_feature())
+  t_report()
+  return get("__vars", "t_fail") == 0
+end
+
+run_library_loans_schema_demo()

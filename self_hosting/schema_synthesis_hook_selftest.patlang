@@ -1,0 +1,77 @@
+# Selftest for schema_bdd.patlang's synthesis-integration hook
+# (schema_register_synthesis_check / schema_run_synthesis_check --
+# implementation plan Phase 3, item 1: friendly_cli/lib/self_healing_
+# engine.patlang's green_phase).
+#
+# Deliberately does NOT drive a real self-healing cycle (no LLM call, no
+# patc1.exe compile, no touching friendly_cli/lib/synthesized_tools.
+# patlang's live index) -- that's real file I/O against a shared project
+# index, out of scope for a safe, repeatable selftest. Instead this proves
+# the underlying mechanism green_phase's hook calls into: a harness
+# function that calls a "synthesized" candidate directly via apply() and
+# hands its behaviour to schema_check_values, exactly the shape
+# green_phase's own hook uses.
+#
+# Run from the repo root:
+#   rust-runtime/target/release/pat --ir-run self_hosting/schema_synthesis_hook_selftest.patlang
+
+include "lib/test.patlang"
+include "lib/schema_bdd.patlang"
+
+# ---- Counter schema: state = [count], invariant count >= 0.
+# Increment: require true (always allowed), ensure after == before + 1.
+make a function called sh_inv_counter takes state returns ok
+  let count = state[0]
+  return count >= 0
+end
+
+make a function called sh_require_increment takes state, inputs returns ok
+  return true
+end
+
+make a function called sh_ensure_increment takes before, after, inputs returns ok
+  let before_count = before[0]
+  let after_count = after[0]
+  return after_count == before_count + 1
+end
+
+# Two candidate "synthesized" functions -- plain functions standing in for
+# what an LLM or GOAP synthesis path would actually produce and hand to
+# green_phase as impl_code, compiled and callable by name.
+make a function called sh_good_increment takes x returns r
+  return x + 1
+end
+
+make a function called sh_bad_increment takes x returns r
+  return x + 2
+end
+
+# The harness registered against each candidate: calls the named candidate
+# directly on a fixed test input (5) and reports [state_before, inputs,
+# state_after] -- the same shape green_phase's real hook would build from
+# actually running a compiled, synthesized function and observing its
+# output, just without the compile/subprocess machinery here.
+make a function called sh_harness takes func_name returns triple
+  let input_val = 5
+  let result = apply(func_name, input_val)
+  return [[input_val], [input_val], [result]]
+end
+
+t_init()
+
+schema_define("Counter", ["count"], "sh_inv_counter")
+schema_operation("Counter", "Increment", ["x"], "sh_require_increment", "sh_ensure_increment")
+
+schema_register_synthesis_check("sh_good_increment", "Counter", "Increment", "sh_harness")
+schema_register_synthesis_check("sh_bad_increment", "Counter", "Increment", "sh_harness")
+
+let good_diagnosis = schema_run_synthesis_check("sh_good_increment")
+check("a correct synthesized candidate is accepted by its schema", good_diagnosis[0], "ok")
+
+let bad_diagnosis = schema_run_synthesis_check("sh_bad_increment")
+check("an incorrect synthesized candidate is rejected by its schema", bad_diagnosis[0], "postcondition_violated")
+
+let no_hook = schema_lookup_synthesis_check("sh_never_registered")
+check("a function with no registered hook has no lookup entry", not no_hook, true)
+
+t_report()

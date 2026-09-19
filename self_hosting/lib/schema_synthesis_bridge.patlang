@@ -1,0 +1,86 @@
+# =============================================================================
+# schema_synthesis_bridge: connects schema_bdd.patlang to the inductive-
+# logic-programming engine (synthesis_lgg.patlang) -- implementation plan
+# Phase 3, item 2.
+#
+# synth5_induce derives a rule that's correct with respect to its own
+# training examples; it has no way to know about an independent
+# constraint a schema states (a business rule, a policy, an invariant
+# from a completely different part of the system). This bridge asserts an
+# already-induced rule into the real logic engine, enumerates every value
+# it proves true via solve(), and checks each one against a schema
+# operation -- catching a rule that's logically correct on its training
+# data but still produces a value the schema forbids.
+#
+# rule_add/solve (rust-runtime/src/ir/hosts.rs) are the real backward-
+# chaining logic engine already used by synth5_induce's own domain
+# (parent/grandparent-style facts); synth5_induce's own `facts` parameter
+# is plain data for ITS internal graph search, not automatically visible
+# to solve() -- background facts and the induced rule must be separately
+# asserted here before solve() can see them at all.
+# =============================================================================
+
+include "schema_bdd.patlang"
+
+# facts: list of [pred, arg1] or [pred, arg1, arg2] tuples -- the same
+# shape synth5_facts_to_src (synthesis_lgg.patlang) already renders as
+# source text; asserted here directly via rule_add instead.
+make a function called schema_assert_facts takes facts returns done
+  let i = 0
+  let n = to_num(list_len(facts))
+  while i < n do
+    let f = facts[i]
+    if to_num(list_len(f)) == 2 then
+      rule_add(f[0], [f[1]], [])
+    else
+      rule_add(f[0], [f[1], f[2]], [])
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+# Mirrors synth4_chain_clause's own "rule target(X) :- R1(X,Y1),
+# R2(Y1,Y2), ..." shape (synthesis_chain.patlang:52), asserted directly
+# via rule_add instead of compiled from generated source text -- valid
+# in-process for checking one already-chosen rule (no isolation concern,
+# unlike synth2_test_hypothesis's fresh-subprocess-per-candidate search).
+make a function called schema_assert_chain_rule takes target_pred, pred_seq returns done
+  let body = []
+  let i = 0
+  let n = to_num(list_len(pred_seq))
+  let prev_var = "X"
+  while i < n do
+    let next_var = "Y" + (i + 1)
+    let body = list_push(body, [pred_seq[i], [prev_var, next_var]])
+    let prev_var = next_var
+    let i = i + 1
+  end
+  rule_add(target_pred, ["X"], body)
+  return true
+end
+
+# Enumerates every value the already-asserted rule proves true for
+# target_pred (via solve), maps each through mapper_fn -- a caller-
+# supplied function taking one candidate value and returning
+# [state_before, inputs, state_after], the same triple shape a synthesis
+# harness returns in schema_bdd.patlang's schema_run_synthesis_check --
+# and checks it against schema_name/op_name. Returns the FIRST non-"ok"
+# diagnosis found, as [tag, [candidate_value, original_payload]], or
+# ["ok", []] if every candidate the rule proves true also satisfies the
+# schema.
+make a function called schema_check_induced_rule takes schema_name, op_name, target_pred, mapper_fn returns diagnosis
+  let solutions = solve(target_pred, ["X"])
+  let i = 0
+  let n = to_num(list_len(solutions))
+  while i < n do
+    let candidate = solutions[i][0]
+    let triple = apply(mapper_fn, candidate)
+    let d = schema_check_values(schema_name, op_name, triple[0], triple[1], triple[2])
+    if d[0] != "ok" then
+      return [d[0], [candidate, d[1]]]
+    end
+    let i = i + 1
+  end
+  return ["ok", []]
+end

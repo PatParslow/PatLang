@@ -1,0 +1,179 @@
+# Selftest for self_hosting/lib/schema_bdd.patlang: the LibraryLoans/
+# BorrowBook worked example from the teaching site's "Schemas and
+# Scenarios" page and the implementation plan built from it. Proven through
+# the real Gherkin runner (run_feature), not by calling schema_check
+# directly -- the point is proving the BDD-integration path works, not
+# just the underlying function.
+#
+# Run from the repo root:
+#   rust-runtime/target/release/pat --ir-run self_hosting/schema_bdd_selftest.patlang
+
+include "lib/test.patlang"
+include "lib/pset.patlang"
+include "lib/pmap.patlang"
+include "lib/schema_bdd.patlang"
+
+# ---- LibraryLoans schema: invariant + BorrowBook's precondition/postcondition ----
+#
+# state = [books, borrowedBy]. Invariant: every title on loan is a title
+# the library actually holds -- dom borrowedBy subset_of books, in the
+# teaching page's own Z notation.
+make a function called schema_inv_library_loans takes state returns ok
+  let books = state[0]
+  let borrowedBy = state[1]
+  let keys = pmap_keys(borrowedBy)
+  let i = 0
+  let n = to_num(list_len(keys))
+  while i < n do
+    if pset_contains(books, keys[i]) == false then
+      return false
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+# BorrowBook's precondition: the title exists and isn't already on loan.
+make a function called schema_require_borrow_book takes state, inputs returns ok
+  let books = state[0]
+  let borrowedBy = state[1]
+  let title = inputs[0]
+  if pset_contains(books, title) == false then
+    return false
+  end
+  return pmap_has(borrowedBy, title) == false
+end
+
+# BorrowBook's postcondition: the set of titles is unchanged (borrowing
+# doesn't add or remove books), and borrowedBy after equals borrowedBy
+# before with exactly [title -> member] added.
+make a function called schema_ensure_borrow_book takes before, after, inputs returns ok
+  let books_before = before[0]
+  let borrowedBy_before = before[1]
+  let books_after = after[0]
+  let borrowedBy_after = after[1]
+  let title = inputs[0]
+  let member = inputs[1]
+  if pset_equal(books_before, books_after) == false then
+    return false
+  end
+  let expected_after = pmap_put(borrowedBy_before, title, member)
+  return schema_pmap_equal(expected_after, borrowedBy_after)
+end
+
+# pmap.patlang has no pmap_equal (not needed by pset/pmap's own selftests);
+# small enough to define locally here rather than grow pmap.patlang's
+# surface for a single caller.
+make a function called schema_pmap_equal takes a, b returns eq
+  if pmap_size(a) != pmap_size(b) then
+    return false
+  end
+  let keys = pmap_keys(a)
+  let i = 0
+  let n = to_num(list_len(keys))
+  while i < n do
+    let k = keys[i]
+    if pmap_has(b, k) == false then
+      return false
+    end
+    if pmap_get(a, k) != pmap_get(b, k) then
+      return false
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+make a function called register_library_loans_schema returns done
+  schema_define("LibraryLoans", ["books", "borrowedBy"], "schema_inv_library_loans")
+  schema_operation("LibraryLoans", "BorrowBook", ["title", "member"], "schema_require_borrow_book", "schema_ensure_borrow_book")
+  return true
+end
+
+# ---- step definitions ----
+
+make a function called st_given_library_holds_dune returns done
+  schema_bind_state("LibraryLoans", "books", "before", pset_add(pset_new(), "Dune"))
+  return true
+end
+
+make a function called st_given_dune_not_borrowed returns done
+  schema_bind_state("LibraryLoans", "borrowedBy", "before", pmap_new())
+  return true
+end
+
+make a function called st_given_dune_borrowed_by_okonkwo returns done
+  schema_bind_state("LibraryLoans", "borrowedBy", "before", pmap_put(pmap_new(), "Dune", "S. Okonkwo"))
+  return true
+end
+
+make a function called st_when_diallo_borrows_dune returns done
+  schema_bind_input("LibraryLoans", "BorrowBook", "title", "Dune")
+  schema_bind_input("LibraryLoans", "BorrowBook", "member", "A. Diallo")
+  return true
+end
+
+# The scenario's own claimed outcome: books unchanged, Dune now on loan to
+# Diallo. Restates books explicitly per schema_bdd.patlang's hard rule
+# (every scenario must rebind every declared state var in Then, never rely
+# on a default).
+make a function called st_then_dune_borrowed_by_diallo returns done
+  let before_books = get("__vars", "LibraryLoans__books__before")
+  schema_bind_state("LibraryLoans", "books", "after", before_books)
+  let before_borrowedBy = get("__vars", "LibraryLoans__borrowedBy__before")
+  schema_bind_state("LibraryLoans", "borrowedBy", "after", pmap_put(before_borrowedBy, "Dune", "A. Diallo"))
+  let diagnosis = schema_check("LibraryLoans", "BorrowBook")
+  check("borrowing an available title is accepted by the schema", diagnosis[0], "ok")
+  return true
+end
+
+# Deliberately does NOT bind an "after" state -- schema_check's own
+# ordering (invariant -> precondition -> invariant-after -> postcondition)
+# means a precondition failure is reported before "after" is ever read, so
+# there is nothing to claim here: the request never gets that far.
+make a function called st_then_system_rejects_request returns done
+  let diagnosis = schema_check("LibraryLoans", "BorrowBook")
+  check("borrowing an already-borrowed title is rejected by the schema", diagnosis[0], "precondition_violated")
+  let questions = schema_format_diagnosis("LibraryLoans", "BorrowBook", diagnosis)
+  check("a rejected scenario gets exactly one diagnostic question", to_num(list_len(questions)), 1)
+  check("the diagnostic question is non-empty", questions[0].length > 0, true)
+  return true
+end
+
+make a function called register_library_loans_steps returns done
+  step("the library holds \"Dune\"", "st_given_library_holds_dune")
+  step("\"Dune\" is not currently borrowed", "st_given_dune_not_borrowed")
+  step("\"Dune\" is currently borrowed by \"S. Okonkwo\"", "st_given_dune_borrowed_by_okonkwo")
+  step("\"A. Diallo\" borrows \"Dune\"", "st_when_diallo_borrows_dune")
+  step("\"Dune\" is borrowed by \"A. Diallo\"", "st_then_dune_borrowed_by_diallo")
+  step("the system rejects the request", "st_then_system_rejects_request")
+  return true
+end
+
+make a function called library_loans_feature returns text
+  return "Feature: Library loans
+
+Scenario: Borrowing an available book
+  Given the library holds \"Dune\"
+  And \"Dune\" is not currently borrowed
+  When \"A. Diallo\" borrows \"Dune\"
+  Then \"Dune\" is borrowed by \"A. Diallo\"
+
+Scenario: Borrowing an already-borrowed book
+  Given the library holds \"Dune\"
+  And \"Dune\" is currently borrowed by \"S. Okonkwo\"
+  When \"A. Diallo\" borrows \"Dune\"
+  Then the system rejects the request
+"
+end
+
+make a function called run_schema_bdd_selftest returns ok
+  t_init()
+  register_library_loans_schema()
+  register_library_loans_steps()
+  run_feature(library_loans_feature())
+  t_report()
+  return get("__vars", "t_fail") == 0
+end
+
+run_schema_bdd_selftest()

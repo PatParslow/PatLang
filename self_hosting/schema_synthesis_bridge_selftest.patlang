@@ -1,0 +1,78 @@
+# Selftest for self_hosting/lib/schema_synthesis_bridge.patlang
+# (implementation plan Phase 3, item 2): a REAL synth5_induce call derives
+# grandparent(X) :- parent(X,Y), parent(Y,Z) from training facts and
+# examples, exactly as in synthesis_lgg_selftest.patlang's own scenario A
+# -- then the induced rule is checked against a GrandparentPolicy schema
+# stating an independent constraint (a restricted-names list) the
+# induction engine had no way to know about, since it only ever reasoned
+# over parent/grandparent facts. One of the two candidates the induced
+# rule proves true ("dave") is on the restricted list; the other
+# ("alice") isn't -- proving the bridge catches a logically-correct
+# induced rule producing a value an unrelated schema still forbids.
+#
+# Run from the repo root:
+#   rust-runtime/target/release/pat --ir-run self_hosting/schema_synthesis_bridge_selftest.patlang
+
+include "lib/test.patlang"
+include "lib/pset.patlang"
+include "lib/synthesis.patlang"
+include "lib/synthesis_lgg.patlang"
+include "lib/schema_synthesis_bridge.patlang"
+
+# ---- GrandparentPolicy schema: state = [restricted], a pset of names
+# certification is never allowed to name. No general invariant beyond
+# "the state exists" -- the real constraint is entirely in Certify's own
+# postcondition, deliberately independent of how a candidate was derived.
+make a function called gp_inv_trivial takes state returns ok
+  return true
+end
+
+make a function called gp_require_true takes state, inputs returns ok
+  return true
+end
+
+make a function called gp_ensure_not_restricted takes before, after, inputs returns ok
+  let restricted = before[0]
+  return pset_contains(restricted, inputs[0]) == false
+end
+
+# mapper_fn for schema_check_induced_rule: state before/after both name
+# "dave" as the one restricted name (the point is the policy, which never
+# changes across the check, not any real state transition).
+make a function called gp_mapper takes candidate returns triple
+  let restricted = pset_add(pset_new(), "dave")
+  return [[restricted], [candidate], [restricted]]
+end
+
+t_init()
+
+schema_define("GrandparentPolicy", ["restricted"], "gp_inv_trivial")
+schema_operation("GrandparentPolicy", "Certify", ["who"], "gp_require_true", "gp_ensure_not_restricted")
+
+# ---- real induction, same domain/shape as synthesis_lgg_selftest.patlang's
+# scenario A, with dave's line ending in "eve" instead of "frank" so both
+# candidates are otherwise unremarkable to the induction engine itself.
+let facts = [
+  synth5_fact_binary("parent", "alice", "bob"),
+  synth5_fact_binary("parent", "bob", "carol"),
+  synth5_fact_binary("parent", "dave", "erin"),
+  synth5_fact_binary("parent", "erin", "eve")
+]
+let queries = [
+  synth2_query("grandparent", "alice", true),
+  synth2_query("grandparent", "dave", true)
+]
+let induced = synth5_induce("grandparent", ["alice", "dave"], queries, facts, 2)
+check("induction succeeds on the training examples", induced[0], "ok")
+check("induced rule is the expected 2-hop parent/parent chain", induced[1], ["parent", "parent"])
+
+# ---- bridge: assert the same facts + induced rule into the real logic
+# engine, then check every value the rule proves true against the policy.
+schema_assert_facts(facts)
+schema_assert_chain_rule("grandparent", induced[1])
+
+let bridge_diagnosis = schema_check_induced_rule("GrandparentPolicy", "Certify", "grandparent", "gp_mapper")
+check("the induced rule is caught violating an unrelated schema policy", bridge_diagnosis[0], "postcondition_violated")
+check("the flagged candidate is the restricted name, not the other one", bridge_diagnosis[1][0], "dave")
+
+t_report()

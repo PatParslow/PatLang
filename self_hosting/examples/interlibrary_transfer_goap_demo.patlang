@@ -1,0 +1,80 @@
+# =============================================================================
+# Inter-library transfer via GOAP, checked against real resulting state --
+# the payoff plan_with_state exists for. The pre-existing gherkin_
+# contracts.patlang / goap_verify_contracts system can only check a
+# contract against a STRING-PARSED action-label binding, e.g.
+# "ship_to_branch(Book=rare_atlas)" -- it has no way to express "and the
+# book must not ALSO still be shelved at the origin branch," because that
+# needs the plan's full resulting fact set, not one action's own
+# parameter. plan_with_state exposes exactly that.
+#
+# Domain: a rare book moves branch_a -> depot -> branch_b through three
+# GOAP actions; a TransferPolicy schema checks the actual resulting
+# state, not the plan's own step labels.
+#
+# Run from the repo root:
+#   rust-runtime/target/release/pat --ir-run self_hosting/examples/interlibrary_transfer_goap_demo.patlang
+
+include "../lib/test.patlang"
+include "../lib/schema_goap_bridge.patlang"
+
+# ---- TransferPolicy schema: no general invariant (state = []); the real
+# check is entirely in TransferBook's own postcondition, which reads the
+# plan's ACTUAL resulting facts.
+make a function called tp_inv_trivial takes state returns ok
+  return true
+end
+
+make a function called tp_require_true takes state, inputs returns ok
+  return true
+end
+
+# The real check: the book must end up at the destination branch, AND
+# must not simultaneously still be recorded at the origin branch --
+# a two-clause property no single action label could express on its own.
+make a function called tp_ensure_arrived_and_gone takes before, after, inputs returns ok
+  let resulting_facts = after[0]
+  let book = inputs[0]
+  let origin = inputs[1]
+  let destination = inputs[2]
+  let arrived = schema_facts_contains(resulting_facts, "at", [book, destination])
+  let still_at_origin = schema_facts_contains(resulting_facts, "at", [book, origin])
+  return arrived and (still_at_origin == false)
+end
+
+make a function called tp_mapper takes path, resulting_facts returns triple
+  return [[resulting_facts], ["rare_atlas", "branch_a", "branch_b"], [resulting_facts]]
+end
+
+t_init()
+
+schema_define("TransferPolicy", [], "tp_inv_trivial")
+schema_operation("TransferPolicy", "TransferBook", ["book", "origin", "destination"], "tp_require_true", "tp_ensure_arrived_and_gone")
+
+# ---- real GOAP domain: three actions moving a book through a depot.
+action_add("pack_for_transit", [["at", ["Book", "branch_a"]]], [["in_transit", ["Book"]]], [["at", ["Book", "branch_a"]]], 1)
+action_add("ship_to_depot", [["in_transit", ["Book"]]], [["at", ["Book", "depot"]]], [["in_transit", ["Book"]]], 2)
+action_add("ship_to_branch", [["at", ["Book", "depot"]]], [["at", ["Book", "branch_b"]]], [["at", ["Book", "depot"]]], 2)
+
+rule_add("at", ["rare_atlas", "branch_a"], [])
+
+let transfer_goal = [["at", ["rare_atlas", "branch_b"]]]
+
+let raw_result = plan_with_state(transfer_goal)
+check("the planner finds the full three-hop route", to_num(list_len(raw_result[0])), 3)
+check("step 1 packs the book for transit", raw_result[0][0], "pack_for_transit(Book=rare_atlas)")
+check("step 2 ships it to the depot", raw_result[0][1], "ship_to_depot(Book=rare_atlas)")
+check("step 3 ships it on to the destination branch", raw_result[0][2], "ship_to_branch(Book=rare_atlas)")
+check("the real resulting state has the book at branch_b", schema_facts_contains(raw_result[1], "at", ["rare_atlas", "branch_b"]), true)
+check("the real resulting state no longer has it at branch_a", schema_facts_contains(raw_result[1], "at", ["rare_atlas", "branch_a"]), false)
+check("the real resulting state has no dangling in-transit record", schema_facts_contains(raw_result[1], "in_transit", ["rare_atlas"]), false)
+
+let diagnosis = schema_check_goap_plan("TransferPolicy", "TransferBook", transfer_goal, "tp_mapper")
+check("the full transfer plan satisfies the transfer policy", diagnosis[0], "ok")
+
+# ---- an unreachable transfer: no route exists to a branch nothing ships to.
+let impossible_goal = [["at", ["rare_atlas", "branch_c"]]]
+let no_route_diagnosis = schema_check_goap_plan("TransferPolicy", "TransferBook", impossible_goal, "tp_mapper")
+check("a destination with no shipping route is reported as no_plan_found", no_route_diagnosis[0], "no_plan_found")
+
+t_report()

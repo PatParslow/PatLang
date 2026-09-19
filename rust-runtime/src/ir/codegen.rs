@@ -151,6 +151,7 @@ const HOST_CHUNK_TABLE: &[(&str, ChunkId)] = &[
     ("solve", ChunkId::Logic),
     ("action_add", ChunkId::Logic),
     ("plan", ChunkId::Logic),
+    ("plan_with_state", ChunkId::Logic),
     ("goal_def", ChunkId::Logic),
     ("pursue", ChunkId::Logic),
     ("action_bind", ChunkId::Logic),
@@ -202,6 +203,7 @@ const HOST_CHUNK_TABLE: &[(&str, ChunkId)] = &[
     ("abs", ChunkId::Math),
     ("to_fixed", ChunkId::Math),
     ("numeric_kind", ChunkId::Math),
+    ("float_to_bits", ChunkId::Math),
 ];
 
 /// Cross-chunk dependency edges between non-`core` chunks, for
@@ -2763,6 +2765,22 @@ fn host_call_math_inner(name: &str, args: &[Value]) -> Result<Value, String> {
             Ok(Value::String(format!("{:.*}", places, x).into()))
         }
         "numeric_kind" => math_numeric_kind(args),
+        // i64-only, unlike rust-runtime/src/ir/hosts.rs's own host_float_to_bits:
+        // f.to_bits() only needs the BigInt branch when the sign bit is set (a
+        // negative float), which is >= 2^63 and would need this chunk's own
+        // hand-rolled BigIntT rather than i64::try_from -- every caller in
+        // self_hosting/lib/symbolic.patlang only ever calls this on a positive
+        // finite double (bits < 2^63), so that branch is left unimplemented
+        // rather than built and untested.
+        //
+        // as_number(), not arg_num: real bug found via testing -- arg_num only
+        // matches Value::Number/Value::String, but acos/asin/sin/cos all return
+        // Value::Float, which arg_num rejects with "expected number" (the same
+        // trap to_fixed's own comment above already documents working around).
+        "float_to_bits" => {
+            let f = args.get(0).ok_or("float_to_bits: expected 1 arg")?.as_number().map_err(|_| "float_to_bits: expected number".to_string())?;
+            Ok(Value::Int(f.to_bits() as i64))
+        }
         _ => Err(format!("host fn '{}' not found", name)),
     }
 }
@@ -2770,7 +2788,7 @@ fn host_call_math_inner(name: &str, args: &[Value]) -> Result<Value, String> {
 fn host_call_math(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match name {
         "sqrt" | "pow" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2" | "log" | "exp"
-        | "floor" | "ceil" | "round" | "trunc" | "abs" | "to_fixed" | "numeric_kind" => Some(host_call_math_inner(name, args)),
+        | "floor" | "ceil" | "round" | "trunc" | "abs" | "to_fixed" | "numeric_kind" | "float_to_bits" => Some(host_call_math_inner(name, args)),
         _ => None,
     }
 }
@@ -3911,6 +3929,74 @@ fn host_call_logic_inner(name: &str, args: &[Value]) -> Result<Value, String> {
                 }
                 Ok(Value::List(Arc::new(found.unwrap_or_default().into_iter().map(|s| Value::String(s.into())).collect())))
             }
+            "plan_with_state" => {
+                // Additive alongside "plan" above, which stays completely
+                // untouched -- see the interpreter's own plan_with_state
+                // (rust-runtime/src/ir/hosts.rs) for why this is a literal
+                // second copy of the search rather than a refactor: this
+                // compiled-codegen path's own GoapAction has no numeric-
+                // fluent fields at all (a pre-existing divergence from the
+                // interpreter path's GoapAction, found while adding this,
+                // not introduced by it), so resulting_fluents_list is
+                // always empty here -- kept as a third list anyway so a
+                // caller checking [path, facts, fluents] behaves the same
+                // shape regardless of which of the two execution paths
+                // (--ir-run vs. compiled with patc1.exe) actually ran it.
+                if args.len() != 1 { return Err("plan_with_state: expected 1 arg (goal_facts_list)".into()); }
+                let goal_facts = parse_ground_facts(&args[0]);
+                let actions: Vec<GoapAction> = ACTIONS.with(|a| a.borrow().clone());
+                use std::collections::BinaryHeap;
+                use std::cmp::Reverse;
+                let start_state: HashSet<GroundFact> = current_ground_facts_as_state();
+                let mut nodes: Vec<(HashSet<GroundFact>, Vec<String>, i64)> = vec![(start_state, Vec::new(), 0)];
+                let mut frontier: BinaryHeap<Reverse<(i64, usize)>> = BinaryHeap::new();
+                frontier.push(Reverse((0, 0)));
+                let mut visited: HashSet<Vec<GroundFact>> = HashSet::new();
+                const NODE_CAP: usize = 5000;
+                let mut expansions = 0usize;
+                let mut found: Option<(Vec<String>, HashSet<GroundFact>)> = None;
+                while let Some(Reverse((cost, idx))) = frontier.pop() {
+                    if expansions >= NODE_CAP { break; }
+                    let (state, path, node_cost) = nodes[idx].clone();
+                    if node_cost != cost { continue; }
+                    expansions += 1;
+                    if goal_facts.iter().all(|g| state.contains(g)) { found = Some((path, state)); break; }
+                    let mut state_key: Vec<GroundFact> = state.iter().cloned().collect();
+                    state_key.sort();
+                    if !visited.insert(state_key) { continue; }
+                    for action in &actions {
+                        for subst in ground_action_instances(&action.preconds, &state) {
+                            let mut new_state = state.clone();
+                            for d in &action.del_effects { new_state.remove(&apply_subst_to_fact(d, &subst)); }
+                            for a2 in &action.add_effects { new_state.insert(apply_subst_to_fact(a2, &subst)); }
+                            let mut new_path = path.clone();
+                            new_path.push(action_instance_label(&action.name, &action.preconds, &subst));
+                            let new_cost = node_cost + action.cost;
+                            nodes.push((new_state, new_path, new_cost));
+                            frontier.push(Reverse((new_cost, nodes.len() - 1)));
+                        }
+                    }
+                }
+                match found {
+                    Some((path, state)) => {
+                        let path_v = Value::List(Arc::new(path.into_iter().map(|s| Value::String(s.into())).collect()));
+                        let mut facts_sorted: Vec<GroundFact> = state.into_iter().collect();
+                        facts_sorted.sort();
+                        let facts_v = Value::List(Arc::new(facts_sorted.iter().map(|f| {
+                            Value::List(Arc::new(vec![
+                                Value::String(f.pred.clone().into()),
+                                Value::List(Arc::new(f.args.iter().map(|a| Value::String(a.clone().into())).collect())),
+                            ]))
+                        }).collect()));
+                        Ok(Value::List(Arc::new(vec![path_v, facts_v, Value::List(Arc::new(Vec::new()))])))
+                    }
+                    None => Ok(Value::List(Arc::new(vec![
+                        Value::List(Arc::new(Vec::new())),
+                        Value::List(Arc::new(Vec::new())),
+                        Value::List(Arc::new(Vec::new())),
+                    ]))),
+                }
+            }
 "goal_def" => {
                 if args.len() != 2 { return Err("goal_def: expected 2 args (name, deps_list)".into()); }
                 let goal_name = match &args[0] { Value::String(s) => s.as_ref().clone(), v => to_s(v) };
@@ -4005,7 +4091,7 @@ fn split_action_label(label: &str) -> (String, Vec<String>) {
 
 fn host_call_logic(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match name {
-        "infer_type_for" | "fact" | "goal" | "query" | "rule_add" | "solve" | "action_add" | "plan"
+        "infer_type_for" | "fact" | "goal" | "query" | "rule_add" | "solve" | "action_add" | "plan" | "plan_with_state"
         | "goal_def" | "pursue" | "action_bind" | "action_lookup" | "action_base_name" | "action_label_args" => Some(host_call_logic_inner(name, args)),
         _ => None,
     }

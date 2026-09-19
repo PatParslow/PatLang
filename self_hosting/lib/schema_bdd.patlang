@@ -1,0 +1,265 @@
+# =============================================================================
+# schema_bdd: attach a Z-notation-style schema (declared state + a general
+# invariant, plus named operations each with a require/ensure precondition/
+# postcondition) to a BDD feature, and check a concrete Given/When/Then
+# scenario as a WITNESS of that schema -- catching a scenario whose own
+# Given already violates an operation's precondition, before any of the
+# scenario's own Then assertions even run.
+#
+# Design decisions, and why (see the implementation plan this file was
+# built from for the full investigation):
+#
+# - A schema's invariant/require/ensure are ORDINARY, separately-compiled
+#   PatLang functions returning bool, referenced by name string and called
+#   via apply() -- never the literal `require`/`ensure` keywords. Those
+#   keywords lower to contract_check (rust-runtime/src/ir/hosts.rs), which
+#   is FATAL on violation (confirmed directly, and independently documented
+#   in self_hosting/lib/primitive_registry.patlang's own header) -- unusable
+#   for a check that must report a diagnosis and keep running, the same
+#   reason primitive_registry.patlang's own try_ wrappers never use
+#   require/ensure for their real failure path either.
+#
+# - apply() has no argument-spread form (confirmed in
+#   rust-runtime/src/ir/interpreter.rs): a function written once, generic
+#   over any schema's own number of state variables, cannot pass one
+#   positional argument per variable. State and inputs are therefore always
+#   bundled as a single list argument: invariant_fn(state_list),
+#   require_fn(state_list, input_list), ensure_fn(before_list, after_list,
+#   input_list).
+#
+# - Binding extends the existing set_var/get("__vars", ...) convention
+#   every Gherkin step in this codebase already uses (there is no
+#   parametrized step-matching mechanism anywhere to extend instead --
+#   step() dispatch is exact-literal-text, zero-argument, confirmed across
+#   every existing _bdd_demo.patlang file). A scenario's own Given/Then step
+#   functions call schema_bind_state/schema_bind_input directly.
+#
+# HARD RULE: self_hosting/lib/test.patlang's run_feature never resets bound
+# vars between scenarios (only t_skipping/t_pending_tags are per-scenario).
+# Every scenario's Given/Then must explicitly rebind every declared state
+# variable and input itself, every time -- including restating an unchanged
+# variable in Then. Do not rely on a value surviving from a previous
+# scenario, and do not assume an unmentioned variable defaults to its
+# "before" value in Then -- an omitted rebind reads back as the not-yet-
+# bound sentinel (see schema_state_values below), which will correctly
+# fail the check rather than silently pass, but the failure will look like
+# a real violation unless this rule is followed.
+# =============================================================================
+
+include "pmap.patlang"
+
+# Single, process-wide registry (like Step's own new("Step", text)
+# convention -- schemas and operations are inherently global, not
+# per-instance, so one lazily-created Dict is simpler than
+# primitive_registry.patlang's counter-named multi-registry support, which
+# this doesn't need).
+make a function called schema_registry returns registry
+  let existing = get("__vars", "schema_bdd_registry_obj")
+  if existing then
+    return existing
+  end
+  let registry = new("Dict", "schema_bdd_registry")
+  set_var("schema_bdd_registry_obj", registry)
+  return registry
+end
+
+# state_var_names: list of strings naming the schema's declared state.
+# invariant_fn: name of a function taking ONE argument (the state values,
+# in the same order as state_var_names) and returning bool.
+make a function called schema_define takes name, state_var_names, invariant_fn returns done
+  send(schema_registry(), "set", name + "__schema", [state_var_names, invariant_fn])
+  return true
+end
+
+make a function called schema_lookup takes name returns entry
+  return get(schema_registry(), name + "__schema")
+end
+
+# input_names: list of strings naming the operation's declared inputs.
+# require_fn: name of a function taking (state_values, input_values),
+# returning bool -- the operation's precondition.
+# ensure_fn: name of a function taking (before_values, after_values,
+# input_values), returning bool -- the operation's postcondition.
+make a function called schema_operation takes schema_name, op_name, input_names, require_fn, ensure_fn returns done
+  send(schema_registry(), "set", schema_name + "::" + op_name + "__op", [schema_name, input_names, require_fn, ensure_fn])
+  return true
+end
+
+make a function called schema_lookup_operation takes schema_name, op_name returns entry
+  return get(schema_registry(), schema_name + "::" + op_name + "__op")
+end
+
+# ---- binding: a scenario's own step functions call these ----
+
+make a function called schema_bind_state takes schema, var_name, phase, value returns done
+  set_var(schema + "__" + var_name + "__" + phase, value)
+  return true
+end
+
+make a function called schema_bind_input takes schema, op, param_name, value returns done
+  set_var(schema + "__" + op + "__in__" + param_name, value)
+  return true
+end
+
+# Not-yet-bound sentinel: get("__vars", ...) on an unset key -- same
+# absence convention already relied on throughout this codebase (e.g.
+# gherkin_contracts.patlang's `already_bound` check). Never distinguishes
+# "never bound" from "bound to this same falsy value"; low risk for the
+# LibraryLoans-shaped schemas this was designed against (string/list-typed
+# state), a documented hard limit for anything boolean- or zero-valued.
+make a function called schema_state_values takes schema, state_var_names returns values
+  let out = []
+  let i = 0
+  let n = to_num(list_len(state_var_names))
+  while i < n do
+    let out = list_push(out, get("__vars", schema + "__" + state_var_names[i] + "__before"))
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called schema_state_values_after takes schema, state_var_names returns values
+  let out = []
+  let i = 0
+  let n = to_num(list_len(state_var_names))
+  while i < n do
+    let out = list_push(out, get("__vars", schema + "__" + state_var_names[i] + "__after"))
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called schema_input_values takes schema, op, input_names returns values
+  let out = []
+  let i = 0
+  let n = to_num(list_len(input_names))
+  while i < n do
+    let out = list_push(out, get("__vars", schema + "__" + op + "__in__" + input_names[i]))
+    let i = i + 1
+  end
+  return out
+end
+
+# ---- the witness check ----
+#
+# Four-stage check, each stage its own diagnosis tag, checked in the order
+# a Z schema's own reasoning goes: is the state even valid to start from,
+# does this operation's precondition actually hold for it, does the
+# claimed resulting state stay valid, and does the operation's own
+# postcondition connect before to after correctly. Returns [tag, payload],
+# the same 2-element diagnosis shape as synth5_induce
+# (self_hosting/lib/synthesis_lgg.patlang) -- deliberately, so
+# schema_format_diagnosis below can mirror synth5_format_diagnosis's own
+# real structure rather than inventing a new diagnosis style.
+# The value-based core: takes state_before/inputs/state_after directly
+# rather than reading them out of the __vars binding store. schema_check
+# below is the BDD-scenario-shaped wrapper around this; this function is
+# what any OTHER caller (a synthesis harness, a future GOAP or ILP hook --
+# see the implementation plan's Phase 3) should call directly instead of
+# faking a scenario's Given/When/Then bindings just to reach schema_check.
+make a function called schema_check_values takes schema_name, op_name, state_before, inputs, state_after returns diagnosis
+  let schema_entry = schema_lookup(schema_name)
+  let invariant_fn = schema_entry[1]
+
+  let op_entry = schema_lookup_operation(schema_name, op_name)
+  let require_fn = op_entry[2]
+  let ensure_fn = op_entry[3]
+
+  if apply(invariant_fn, state_before) == false then
+    return ["invariant_violated_before", [schema_name, state_before]]
+  end
+
+  if apply(require_fn, state_before, inputs) == false then
+    return ["precondition_violated", [op_name, state_before, inputs]]
+  end
+
+  if apply(invariant_fn, state_after) == false then
+    return ["invariant_violated_after", [schema_name, state_after]]
+  end
+
+  if apply(ensure_fn, state_before, state_after, inputs) == false then
+    return ["postcondition_violated", [op_name, state_before, state_after, inputs]]
+  end
+
+  return ["ok", [op_name, state_before, state_after, inputs]]
+end
+
+make a function called schema_check takes schema_name, op_name returns diagnosis
+  let schema_entry = schema_lookup(schema_name)
+  let state_var_names = schema_entry[0]
+
+  let op_entry = schema_lookup_operation(schema_name, op_name)
+  let input_names = op_entry[1]
+
+  let state_before = schema_state_values(schema_name, state_var_names)
+  let inputs = schema_input_values(schema_name, op_name, input_names)
+  let state_after = schema_state_values_after(schema_name, state_var_names)
+  return schema_check_values(schema_name, op_name, state_before, inputs, state_after)
+end
+
+# Mirrors synth5_format_diagnosis's real structure (synthesis_lgg.patlang):
+# switch on diagnosis[0], build a human-readable question per case. Returns
+# a plain list of question strings (empty for "ok"), same shape as
+# synth5_induce_and_ask's own return convention.
+make a function called schema_format_diagnosis takes schema_name, op_name, diagnosis returns questions
+  let tag = diagnosis[0]
+  let payload = diagnosis[1]
+
+  if tag == "invariant_violated_before" then
+    return ["This scenario's Given already leaves " + schema_name + " in a state that violates its own invariant, before " + op_name + " is even checked. Is the Given wrong, or is the invariant too strict?"]
+  end
+
+  if tag == "precondition_violated" then
+    return ["Scenario claims " + op_name + " can run from this Given, but " + op_name + "'s own precondition returned false for these inputs. Is the Given wrong, or is " + op_name + "'s precondition too strict -- or is this scenario meant to test a rejection path, which needs its own operation schema rather than " + op_name + "'s?"]
+  end
+
+  if tag == "invariant_violated_after" then
+    return ["Applying " + op_name + " produces a state that violates " + schema_name + "'s invariant. Is the Then clause's claimed resulting state wrong, or does " + op_name + " need a stronger precondition to rule this case out?"]
+  end
+
+  if tag == "postcondition_violated" then
+    return ["The before/after state this scenario claims for " + op_name + " does not satisfy its own postcondition. Is the Then clause's claimed resulting state wrong, or is " + op_name + "'s postcondition wrong?"]
+  end
+
+  return []
+end
+
+# ---- synthesis integration (implementation plan Phase 3) ----
+#
+# Opt-in registration linking a SYNTHESIZED function's name to a schema
+# operation it's meant to satisfy, plus a "harness" function name that
+# knows how to actually exercise it: harness_fn takes (func_name) and
+# returns [state_before, inputs, state_after] by calling the synthesized
+# function itself (via apply) on some concrete test input and observing
+# what it does. This is necessarily domain-specific -- there is no way to
+# derive it generically -- so it must be supplied by whoever registers the
+# hook, not synthesized here.
+#
+# Deliberately separate from schema_operation itself: a schema operation
+# describes the CONTRACT; a synthesis hook additionally says "and here's
+# how to actually run a candidate implementation against it," which only
+# matters once there's a synthesized candidate to check, not for the
+# scenario-witnessing use in schema_check above.
+make a function called schema_register_synthesis_check takes func_name, schema_name, op_name, harness_fn returns done
+  send(schema_registry(), "set", func_name + "__synthesis_check", [schema_name, op_name, harness_fn])
+  return true
+end
+
+make a function called schema_lookup_synthesis_check takes func_name returns entry
+  return get(schema_registry(), func_name + "__synthesis_check")
+end
+
+# Runs a registered synthesis hook for func_name and returns its
+# schema_check_values diagnosis directly. Callers with no hook registered
+# for func_name should skip calling this entirely (schema_lookup_
+# synthesis_check(func_name) is falsy) rather than call it and inspect the
+# result -- there is no "no hook registered" diagnosis tag, since this
+# function assumes a hook exists.
+make a function called schema_run_synthesis_check takes func_name returns diagnosis
+  let hook = schema_lookup_synthesis_check(func_name)
+  let schema_name = hook[0]
+  let op_name = hook[1]
+  let harness_fn = hook[2]
+  let triple = apply(harness_fn, func_name)
+  return schema_check_values(schema_name, op_name, triple[0], triple[1], triple[2])
+end

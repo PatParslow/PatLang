@@ -1,0 +1,65 @@
+# Selftest for self_hosting/lib/schema_goap_bridge.patlang (implementation
+# plan Phase 3, item 3): a real GOAP action moves a box from the
+# warehouse onto a truck; plan_with_state's real resulting facts (not a
+# string-parsed action label) are checked against a WarehousePolicy
+# schema's postcondition -- proving the bridge sees genuine planner state,
+# not a re-parsed label.
+#
+# Run from the repo root:
+#   rust-runtime/target/release/pat --ir-run self_hosting/schema_goap_bridge_selftest.patlang
+
+include "lib/test.patlang"
+include "lib/schema_goap_bridge.patlang"
+
+# ---- WarehousePolicy schema: state = [], no general invariant beyond
+# "the state exists" -- LoadTruck's own postcondition is the real check.
+make a function called wp_inv_trivial takes state returns ok
+  return true
+end
+
+make a function called wp_require_true takes state, inputs returns ok
+  return true
+end
+
+# Checks the GOAP plan's REAL resulting facts (not a parsed label) for
+# the item actually ending up "at" the truck.
+make a function called wp_ensure_item_on_truck takes before, after, inputs returns ok
+  let resulting_facts = after[0]
+  let item = inputs[0]
+  return schema_facts_contains(resulting_facts, "at", [item, "truck"])
+end
+
+# mapper_fn for schema_check_goap_plan: state_before/after both just wrap
+# the resulting_facts list (the postcondition checks the plan's actual
+# effect, not a state transition of its own).
+make a function called wp_mapper takes path, resulting_facts returns triple
+  return [[resulting_facts], ["box"], [resulting_facts]]
+end
+
+t_init()
+
+schema_define("WarehousePolicy", [], "wp_inv_trivial")
+schema_operation("WarehousePolicy", "LoadTruck", ["item"], "wp_require_true", "wp_ensure_item_on_truck")
+
+# ---- real GOAP setup: one parameterized action, one initial fact.
+action_add("load_truck", [["at", ["Item", "warehouse"]]], [["at", ["Item", "truck"]]], [["at", ["Item", "warehouse"]]], 1)
+rule_add("at", ["box", "warehouse"], [])
+
+let goal_facts_val = [["at", ["box", "truck"]]]
+
+# ---- prove plan_with_state itself first, before going through the schema.
+let raw_result = plan_with_state(goal_facts_val)
+check("plan_with_state finds a one-step plan", to_num(list_len(raw_result[0])), 1)
+check("plan_with_state's resulting facts include the box now at the truck", schema_facts_contains(raw_result[1], "at", ["box", "truck"]), true)
+check("plan_with_state's resulting facts no longer place the box at the warehouse", schema_facts_contains(raw_result[1], "at", ["box", "warehouse"]), false)
+
+# ---- now through the schema bridge.
+let diagnosis = schema_check_goap_plan("WarehousePolicy", "LoadTruck", goal_facts_val, "wp_mapper")
+check("the real GOAP plan satisfies the warehouse policy schema", diagnosis[0], "ok")
+
+# ---- an unreachable goal: no plan exists at all.
+let impossible_goal = [["at", ["box", "orbit"]]]
+let no_plan_diagnosis = schema_check_goap_plan("WarehousePolicy", "LoadTruck", impossible_goal, "wp_mapper")
+check("an unreachable goal is reported as no_plan_found, not a schema violation", no_plan_diagnosis[0], "no_plan_found")
+
+t_report()
