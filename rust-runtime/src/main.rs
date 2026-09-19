@@ -181,9 +181,13 @@ fn real_main() {
     let mut mode = "eval".to_string();
     let mut filename: Option<&str> = None;
     let mut out_file: Option<&str> = None;
+    // `--quiet` (must come before the mode flag so argv() can strip it) drops
+    // --ir-run's echo of the program's final value, leaving only its prints.
+    let mut quiet = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--quiet" => { quiet = true; }
             "--ir-run" => { mode = "ir-run".into(); if i+1 < args.len() { filename = Some(&args[i+1]); i+=1; } }
             "--emit-rust" => { mode = "emit-rust".into(); if i+1 < args.len() { filename = Some(&args[i+1]); i+=1; } }
             "--build-run" => { mode = "build-run".into(); if i+1 < args.len() { filename = Some(&args[i+1]); i+=1; } }
@@ -478,7 +482,7 @@ fn real_main() {
     register_stage0_shims(&mut interp);
     match interp.run(&program) {
             Ok(v) => {
-                println!("{}", display_value(&v));
+                if !quiet { println!("{}", display_value(&v)); }
             }
             Err(e) => {
                 eprintln!("IR runtime error: {}", e);
@@ -516,9 +520,9 @@ fn display_value(v: &Value) -> String {
 
 fn ir_host_print(args: &[Value]) -> Result<Value, String> {
     if let Some(arg0) = args.get(0) {
-        println!("{}", display_value(arg0));
+        patlang_runtime::ir::hosts::emit_out(&display_value(arg0));
     } else {
-        println!("");
+        patlang_runtime::ir::hosts::emit_out("");
     }
     Ok(Value::Unit)
 }

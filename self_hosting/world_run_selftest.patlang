@@ -1,0 +1,124 @@
+# Selftest for the world_run / host_caps host primitives (clean in-process
+# interpreter run).
+#
+# Run from the repo root:
+#   rust-runtime/target/release/pat.exe --ir-run self_hosting/world_run_selftest.patlang
+
+include "lib/test.patlang"
+include "lib/includes.patlang"
+include "lib/lexer.patlang"
+include "lib/parser.patlang"
+include "lib/lower.patlang"
+
+make a function called wrt_ir takes src returns ir
+  return lower_program(parse_program(tokenize(src)))
+end
+
+# lines of source joined with newlines
+make a function called wrt_src takes lines returns text
+  let out = ""
+  let i = 0
+  while i < list_len(lines) do
+    let out = out + lines[i] + chr(10)
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called wrt_vfs_lookup takes vfs_out, path returns text
+  let i = 0
+  while i < list_len(vfs_out) do
+    if vfs_out[i][0] == path then return vfs_out[i][1] end
+    let i = i + 1
+  end
+  return "<absent>"
+end
+
+t_init()
+
+# --- capability probe ---
+let caps = host_caps()
+let has_ws = false
+let ci = 0
+while ci < list_len(caps) do
+  if caps[ci] == "world_swap" then let has_ws = true end
+  let ci = ci + 1
+end
+check("host_caps reports world_swap", has_ws, true)
+
+# --- output capture ---
+let r = world_run(wrt_ir(wrt_src(["print(\"hello\")", "print(1 + 2)"])), [])
+check("stdout is exactly the print stream", r[0], "hello" + chr(10) + "3" + chr(10))
+check("a clean run has empty stderr", r[1], "")
+check("a clean run is ok", r[2], true)
+
+# --- store isolation: objects/vars, vecs, facts, vfs ---
+set_var("wr_k", "parent")
+let h = vec_new()
+vec_push(h, 41)
+fact("wr_p", "a", "b")
+vfs_write("/wr/parent", "P")
+
+let child = wrt_src([
+  "print(\"var=[\" + get(\"__vars\", \"wr_k\") + \"]\")",
+  "print(\"facts=\" + query(\"wr_p\", \"a\", \"_\"))",
+  "print(\"vfs=\" + vfs_exists(\"/wr/parent\"))",
+  "let c = vec_new()",
+  "vec_push(c, 1)",
+  "print(\"vec_len=\" + vec_len(c))",
+  "set_var(\"wr_child_only\", \"x\")",
+  "vfs_write(\"/wr/child\", \"C\")",
+  "fact(\"wr_q\", \"c\", \"d\")"
+])
+let r2 = world_run(wrt_ir(child), [])
+check("child run ok", r2[2], true)
+check("child does not see the parent's vars", contains_text(r2[0], "var=[]"), true)
+check("child does not see the parent's facts", contains_text(r2[0], "facts=0"), true)
+check("child does not see the parent's vfs", contains_text(r2[0], "vfs=0"), true)
+check("child's first vec handle is fresh (len 1, not parent's)", contains_text(r2[0], "vec_len=1"), true)
+check("parent var restored", get("__vars", "wr_k"), "parent")
+check("parent vec restored", vec_len(h), 1)
+check("parent fact restored", query("wr_p", "a", "_"), 1)
+check("parent vfs restored", vfs_read("/wr/parent"), "P")
+check("child var did not leak", "" + get("__vars", "wr_child_only"), "")
+check("child vfs write did not leak", "" + vfs_exists("/wr/child"), "0")
+check("child fact did not leak", query("wr_q", "c", "_"), 0)
+
+# --- vfs_in / vfs_out ---
+let io_src = wrt_src([
+  "let t = vfs_read(\"/in/a\")",
+  "vfs_write(\"/out/b\", t + \"!\")",
+  "vfs_write(\"/scratch\", \"s\")"
+])
+let r3 = world_run(wrt_ir(io_src), [["vfs_in", [["/in/a", "hi"]]], ["vfs_out_prefix", "/out/"]])
+check("vfs_in is visible to the child and vfs_out returns its write", wrt_vfs_lookup(r3[3], "/out/b"), "hi!")
+check("vfs_out_prefix filters other paths", wrt_vfs_lookup(r3[3], "/scratch"), "<absent>")
+check("vfs_out does not echo the input outside the prefix", wrt_vfs_lookup(r3[3], "/in/a"), "<absent>")
+check("vfs_out did not reach the parent", "" + vfs_exists("/out/b"), "0")
+
+# --- crash: restore on Err, partial stdout kept, ok=false ---
+set_var("wr_k2", "still-here")
+let r4 = world_run(wrt_ir(wrt_src(["print(\"before\")", "set_var(\"wr_crash\", \"y\")", "let x = wr_no_such_function(1)"])), [])
+check("a crashing child is ok=false", r4[2], false)
+check("a crashing child keeps its partial stdout", r4[0], "before" + chr(10))
+check("a crashing child reports an IR runtime error", starts_with(r4[1], "IR runtime error"), true)
+check("parent world is restored after a crash", get("__vars", "wr_k2"), "still-here")
+check("crashed child writes did not leak", "" + get("__vars", "wr_crash"), "")
+
+# --- step budget ---
+let r5 = world_run(wrt_ir(wrt_src(["while true do", "end"])), [["max_steps", 1000]])
+check("an infinite loop is stopped by max_steps", r5[2], false)
+check("the budget error is reported", contains_text(r5[1], "step budget exhausted"), true)
+let r6 = world_run(wrt_ir(wrt_src(["print(\"after\")"])), [])
+check("a later run has no budget carried over", r6[2], true)
+
+# --- two runs in sequence share nothing ---
+let ra = world_run(wrt_ir(wrt_src(["set_var(\"wr_seq\", \"1\")", "fact(\"wr_s\", \"x\", \"y\")"])), [])
+let rb = world_run(wrt_ir(wrt_src(["print(\"[\" + get(\"__vars\", \"wr_seq\") + \"]\" + query(\"wr_s\", \"x\", \"_\"))"])), [])
+check("second run does not inherit the first run's world", rb[0], "[]0" + chr(10))
+
+# --- malformed IR is ok=false, not a fatal error ---
+let r7 = world_run(["not", "an", "ir"], [])
+check("undecodable IR is reported as ok=false", r7[2], false)
+
+t_report()

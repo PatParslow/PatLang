@@ -32,11 +32,26 @@ fn number_or_max(v: &Value) -> Option<usize> { as_index(v).ok() }
 // shims-only interpreter gets it too.
 pub fn host_print(args: &[Value]) -> Result<Value, String> {
     if let Some(arg0) = args.get(0) {
-        println!("{}", display_value(arg0));
+        emit_out(&display_value(arg0));
     } else {
-        println!();
+        emit_out("");
     }
     Ok(Value::Unit)
+}
+
+// Output sink for `print`. Normally stdout; while host_world_run is active on
+// this thread it collects into CAPTURE instead, so a nested clean run's output
+// can be returned as a value.
+thread_local! {
+    static CAPTURE: RefCell<Option<String>> = RefCell::new(None);
+}
+
+pub fn emit_out(s: &str) {
+    let captured = CAPTURE.with(|c| match c.borrow_mut().as_mut() {
+        Some(buf) => { buf.push_str(s); buf.push('\n'); true }
+        None => false,
+    });
+    if !captured { println!("{}", s); }
 }
 
 pub fn host_list_get(args: &[Value]) -> Result<Value, String> {
@@ -689,6 +704,31 @@ pub fn host_exec_capture_io(args: &[Value]) -> Result<Value, String> {
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(stdin_text.as_bytes());
     }
+    // Optional 4th arg: wall-clock timeout in ms. On expiry the child is killed
+    // and the result is [stdout so far, stderr + "timeout after N ms", false].
+    let timeout_ms: u64 = match args.get(3) { Some(Value::Int(n)) if *n > 0 => *n as u64, _ => 0 };
+    if timeout_ms > 0 {
+        use std::io::Read;
+        let mut so = child.stdout.take().ok_or("exec_capture_io: no stdout pipe")?;
+        let mut se = child.stderr.take().ok_or("exec_capture_io: no stderr pipe")?;
+        let t_out = std::thread::spawn(move || { let mut b = Vec::new(); let _ = so.read_to_end(&mut b); b });
+        let t_err = std::thread::spawn(move || { let mut b = Vec::new(); let _ = se.read_to_end(&mut b); b });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        let (success, timed_out) = loop {
+            match child.try_wait().map_err(|e| format!("exec_capture_io: {}: {}", p, e))? {
+                Some(st) => break (st.success(), false),
+                None if std::time::Instant::now() >= deadline => { let _ = child.kill(); let _ = child.wait(); break (false, true); }
+                None => std::thread::sleep(std::time::Duration::from_millis(2)),
+            }
+        };
+        let stdout_text = String::from_utf8_lossy(&t_out.join().unwrap_or_default()).to_string();
+        let mut stderr_text = String::from_utf8_lossy(&t_err.join().unwrap_or_default()).to_string();
+        if timed_out {
+            if !stderr_text.is_empty() && !stderr_text.ends_with('\n') { stderr_text.push('\n'); }
+            stderr_text.push_str(&format!("timeout after {} ms", timeout_ms));
+        }
+        return Ok(Value::List(Arc::new(vec![Value::String(stdout_text.into()), Value::String(stderr_text.into()), Value::Bool(success)])));
+    }
     let out = child.wait_with_output().map_err(|e| format!("exec_capture_io: {}: {}", p, e))?;
     let stdout_text = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr_text = String::from_utf8_lossy(&out.stderr).to_string();
@@ -703,6 +743,7 @@ pub fn host_argv(args: &[Value]) -> Result<Value, String> {
     let _ = args;
     let mut rest: Vec<String> = std::env::args().collect();
     if !rest.is_empty() { rest.remove(0); } // drop runner exe
+    if rest.first().map(|s| s.as_str()) == Some("--quiet") { rest.remove(0); }
     // drop a leading mode flag and the script path when running under pat
     if matches!(rest.first().map(|s| s.as_str()), Some("--ir-run") | Some("--build-run") | Some("--patc") | Some("--emit-rust") | Some("--compare")) {
         rest.remove(0);
@@ -3294,7 +3335,7 @@ pub fn host_contract_check(args: &[Value]) -> Result<Value, String> {
 
 fn playground_print(args: &[Value]) -> Result<Value, String> {
     if let Some(v) = args.get(0) {
-        println!("{}", display_value(v));
+        emit_out(&display_value(v));
         use std::io::Write;
         let _ = std::io::stdout().flush();
     }
@@ -3310,6 +3351,170 @@ pub fn host_run_ir(args: &[Value]) -> Result<Value, String> {
     interp.host.insert("print", playground_print);
     register_stage0_shims(&mut interp);
     interp.run(&program).map(|_| Value::Unit).map_err(|e| format!("run_ir: {}", e))
+}
+
+// ---- world_run: run a lowered program in a clean interpreter, in-process ----
+//
+// Every process- or thread-global store a program can touch is swapped for an
+// empty one on entry and put back on exit (Ok, Err or panic), so the caller's
+// world is untouched. `world_enter` below is the single list of those stores;
+// tests/world_registry.rs fails if a store is declared in this file without
+// being named there.
+//
+// Deliberately NOT swapped: fiber REGISTRY/CURRENT_FIBER (world_run refuses to
+// run while a fiber is alive instead), RULE_RENAME_COUNTER and the temp-name
+// SEQ counter (monotonic uniqueness counters, no observable state).
+
+static WORLD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+thread_local! {
+    static WORLD_DEPTH: std::cell::Cell<usize> = std::cell::Cell::new(0);
+}
+
+macro_rules! swap_local {
+    ($restores:expr, $store:ident, $fresh:expr) => {{
+        let old = $store.with(|c| std::mem::replace(&mut *c.borrow_mut(), $fresh));
+        $restores.push(Box::new(move || { $store.with(|c| { *c.borrow_mut() = old; }); }) as Box<dyn FnOnce()>);
+    }};
+}
+
+macro_rules! swap_global {
+    ($restores:expr, $store:ident, $ty:ty) => {{
+        let old = std::mem::take(&mut *$store.get_or_init(|| std::sync::Mutex::new(<$ty>::default())).lock().unwrap_or_else(|e| e.into_inner()));
+        $restores.push(Box::new(move || {
+            *$store.get_or_init(|| std::sync::Mutex::new(<$ty>::default())).lock().unwrap_or_else(|e| e.into_inner()) = old;
+        }) as Box<dyn FnOnce()>);
+    }};
+}
+
+struct WorldGuard {
+    restores: Vec<Box<dyn FnOnce()>>,
+    prev_capture: Option<String>,
+    prev_budget: i64,
+    _lock: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+impl WorldGuard {
+    fn captured(&self) -> String { CAPTURE.with(|c| c.borrow().clone().unwrap_or_default()) }
+}
+
+impl Drop for WorldGuard {
+    fn drop(&mut self) {
+        // Reap processes the child started before its handles are dropped.
+        CHILD_PROCS.with(|c| { for (_, ch) in c.borrow_mut().iter_mut() { let _ = ch.kill(); let _ = ch.wait(); } });
+        for r in self.restores.drain(..).rev() { r(); }
+        CAPTURE.with(|c| { *c.borrow_mut() = self.prev_capture.take(); });
+        super::interpreter::step_budget_set(self.prev_budget);
+        WORLD_DEPTH.with(|d| d.set(d.get() - 1));
+    }
+}
+
+fn world_enter(max_steps: i64) -> WorldGuard {
+    let depth = WORLD_DEPTH.with(|d| { let n = d.get(); d.set(n + 1); n });
+    let lock = if depth == 0 { Some(WORLD_LOCK.lock().unwrap_or_else(|e| e.into_inner())) } else { None };
+    let mut r: Vec<Box<dyn FnOnce()>> = Vec::new();
+    swap_local!(r, VECS, Vec::new());
+    swap_local!(r, SBUFS, Vec::new());
+    swap_local!(r, ISTRINGS, Vec::new());
+    swap_local!(r, FACTS, HashMap::new());
+    swap_local!(r, GOALS, Vec::new());
+    swap_local!(r, RULES, Vec::new());
+    swap_local!(r, ACTIONS, Vec::new());
+    swap_local!(r, FLUENTS, HashMap::new());
+    swap_local!(r, INCR_PLAN, None);
+    swap_local!(r, GOAL_DEFS, HashMap::new());
+    swap_local!(r, ACTION_BODIES, HashMap::new());
+    swap_local!(r, RUNTIME_EVENT_HANDLERS, HashMap::new());
+    swap_local!(r, LISTENERS, HashMap::new());
+    swap_local!(r, CONNS, HashMap::new());
+    swap_local!(r, NEXT_CONN, 1);
+    swap_local!(r, CHILD_PROCS, HashMap::new());
+    swap_local!(r, NEXT_PROC_ID, 1);
+    swap_global!(r, OBJECTS, HashMap<String, HashMap<String, Value>>);
+    swap_global!(r, CLASSES, HashMap<String, ClassDef>);
+    swap_global!(r, VFS, HashMap<String, String>);
+    swap_global!(r, PROGRESS_STATUS, String);
+    let prev_capture = CAPTURE.with(|c| c.borrow_mut().replace(String::new()));
+    let prev_budget = super::interpreter::step_budget_set(max_steps);
+    WorldGuard { restores: r, prev_capture, prev_budget, _lock: lock }
+}
+
+fn opt_get(opts: &Value, key: &str) -> Option<Value> {
+    match opts {
+        Value::Object(m) => m.get(key).cloned(),
+        Value::List(xs) => xs.iter().find_map(|p| match p {
+            Value::List(kv) if kv.len() == 2 && matches!(&kv[0], Value::String(k) if k.as_str() == key) => Some(kv[1].clone()),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn world_result(out: String, err: String, ok: bool, vfs_out: Vec<Value>) -> Value {
+    Value::List(Arc::new(vec![
+        Value::String(out.into()),
+        Value::String(err.into()),
+        Value::Bool(ok),
+        Value::List(Arc::new(vfs_out)),
+    ]))
+}
+
+/// world_run(ir_shape, opts) -> [stdout, stderr, ok, vfs_out]
+/// opts (Object or list of [key, value] pairs), all optional:
+///   vfs_in         list of [path, content] preloaded into the child's VFS
+///   vfs_out_prefix only VFS paths with this prefix are returned (default "")
+///   max_steps      loop/call budget; exhausted => ok=false
+/// A crashing child yields ok=false and stderr "IR runtime error: ...".
+pub fn host_world_run(args: &[Value]) -> Result<Value, String> {
+    let shape = args.get(0).ok_or("world_run: expected IR shape")?;
+    let opts = args.get(1).cloned().unwrap_or(Value::Unit);
+    let program = match ir_shape_to_program(shape) {
+        Ok(p) => p,
+        Err(e) => return Ok(world_result(String::new(), format!("IR decode error: {}", e), false, Vec::new())),
+    };
+    if let Some(Value::String(s)) = opt_get(&opts, "stdin") {
+        if !s.is_empty() { return Err("world_run: unsupported: stdin".into()); }
+    }
+    if super::fiber::fibers_active() { return Err("world_run: unsupported while a fiber is alive".into()); }
+    let max_steps = match opt_get(&opts, "max_steps") { Some(Value::Int(n)) if n > 0 => n, _ => i64::MAX };
+    let prefix = match opt_get(&opts, "vfs_out_prefix") { Some(Value::String(s)) => s.as_ref().clone(), _ => String::new() };
+    let vfs_in: Vec<(String, String)> = match opt_get(&opts, "vfs_in") {
+        Some(Value::List(xs)) => xs.iter().filter_map(|p| match p {
+            Value::List(kv) if kv.len() == 2 => match (&kv[0], &kv[1]) {
+                (Value::String(k), Value::String(v)) => Some((k.as_ref().clone(), v.as_ref().clone())),
+                _ => None,
+            },
+            _ => None,
+        }).collect(),
+        _ => Vec::new(),
+    };
+
+    let guard = world_enter(max_steps);
+    for (k, v) in vfs_in { vfs_set(k, v); }
+    let mut interp = Interpreter::new();
+    interp.host.insert("print", playground_print);
+    register_stage0_shims(&mut interp);
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| interp.run(&program)));
+    let mut keys: Vec<String> = vfs_keys().into_iter().filter(|k| k.starts_with(&prefix)).collect();
+    keys.sort();
+    let vfs_out: Vec<Value> = keys.into_iter().filter_map(|k| {
+        vfs_get(&k).map(|v| Value::List(Arc::new(vec![Value::String(k.into()), Value::String(v.into())])))
+    }).collect();
+    let out = guard.captured();
+    drop(guard);
+    Ok(match ran {
+        Ok(Ok(_)) => world_result(out, String::new(), true, vfs_out),
+        Ok(Err(e)) => world_result(out, format!("IR runtime error: {}", e), false, vfs_out),
+        Err(p) => {
+            let msg = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_else(|| "panic".into());
+            world_result(out, format!("IR runtime error: panic: {}", msg), false, vfs_out)
+        }
+    })
+}
+
+/// host_caps() -> capability names this runtime supports.
+pub fn host_host_caps(_args: &[Value]) -> Result<Value, String> {
+    let caps = ["world_swap", "subprocess", "tcp", "threads", "fs"];
+    Ok(Value::List(Arc::new(caps.iter().map(|c| Value::String((*c).to_string().into())).collect())))
 }
 
 // --- Stage 39 — Math library primitives ---
@@ -3655,6 +3860,8 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("compile_shape", host_compile_shape);
     interp.host.insert("compile_ir", host_compile_ir);
     interp.host.insert("run_ir", host_run_ir);
+    interp.host.insert("world_run", host_world_run);
+    interp.host.insert("host_caps", host_host_caps);
     interp.host.insert("contract_check", host_contract_check);
     interp.host.insert("codegen_prelude", host_codegen_prelude);
     interp.host.insert("codegen_prelude_chunk", host_codegen_prelude_chunk);

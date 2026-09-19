@@ -185,6 +185,8 @@ const HOST_CHUNK_TABLE: &[(&str, ChunkId)] = &[
     ("rustc_build_chunked", ChunkId::CodegenBootstrap),
     ("rustc_build_chunked_texts", ChunkId::CodegenBootstrap),
     ("run_ir", ChunkId::CodegenBootstrap),
+    ("world_run", ChunkId::CodegenBootstrap),
+    ("host_caps", ChunkId::CodegenBootstrap),
     ("sqrt", ChunkId::Math),
     ("pow", ChunkId::Math),
     ("sin", ChunkId::Math),
@@ -236,6 +238,11 @@ const CROSS_CHUNK_EDGES: &[(ChunkId, ChunkId)] = &[
     // contract_check (via require/ensure/assert) needs Logic's declarations
     // to compile, same rationale as the Oo -> Logic edge above.
     (ChunkId::Contracts, ChunkId::Logic),
+    // `world_run` (codegen_bootstrap chunk) swaps every store a program can
+    // touch, so its text names the stores declared by these chunks.
+    (ChunkId::CodegenBootstrap, ChunkId::CollectionsHandles),
+    (ChunkId::CodegenBootstrap, ChunkId::Logic),
+    (ChunkId::CodegenBootstrap, ChunkId::Networking),
 ];
 
 pub struct RustCodegen;
@@ -278,6 +285,36 @@ use std::sync::Arc;
 use std::sync::{Condvar, Mutex, OnceLock};
 #[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
 use std::sync::atomic::{AtomicU64, Ordering};
+
+// Output sink for `print`: stdout normally, or CAPTURE while `world_run` (the
+// clean nested interpreter, see the codegen_bootstrap chunk) is active on this
+// thread. Mirrors ir/hosts.rs's CAPTURE/emit_out.
+thread_local! {
+    static CAPTURE: RefCell<Option<String>> = RefCell::new(None);
+}
+fn emit_out(s: &str) {
+    let captured = CAPTURE.with(|c| match c.borrow_mut().as_mut() {
+        Some(buf) => { buf.push_str(s); buf.push('\n'); true }
+        None => false,
+    });
+    if !captured { println!("{}", s); }
+}
+
+// Step budget for `world_run`: ticked on function entry and backward jumps
+// only, so the unlimited default (i64::MAX) is one compare on those paths.
+thread_local! {
+    static STEP_BUDGET: std::cell::Cell<i64> = std::cell::Cell::new(i64::MAX);
+}
+fn step_budget_set(n: i64) -> i64 { STEP_BUDGET.with(|b| b.replace(n)) }
+#[inline]
+fn step_tick() -> Result<(), String> {
+    STEP_BUDGET.with(|b| {
+        let v = b.get();
+        if v == i64::MAX { Ok(()) }
+        else if v <= 0 { Err("step budget exhausted".into()) }
+        else { b.set(v - 1); Ok(()) }
+    })
+}
 
 // OBJECTS (new/send/get's backing store) is shared across OS threads
 // (fiber threads, parallel_map workers, WASI-threads Workers) rather than
@@ -930,6 +967,12 @@ mod fibers {
         NEXT.fetch_add(1, Ordering::Relaxed)
     }
 
+    // True while any fiber's thread is alive; `world_run` refuses to swap the
+    // process-global stores under one.
+    pub fn active() -> bool {
+        registry().lock().unwrap().values().any(|h| h.state.lock().map(|s| s.alive).unwrap_or(true))
+    }
+
     thread_local! {
         static CURRENT_FIBER: std::cell::Cell<Option<u64>> = std::cell::Cell::new(None);
     }
@@ -1247,6 +1290,7 @@ fn run_function_owned<'p>(program: &'p Program, func: &'p Function, args: Vec<Va
 fn run_function_locals<'p>(program: &'p Program, func: &'p Function, precomp: Rc<FnPrecomputed<'p>>, mut locals: Vec<Value>, cache: &PrecomputeCache<'p>) -> Result<Value,String> {
     let mut pc: usize = 0;
     let mut stack: Vec<Value> = Vec::new();
+    step_tick()?;
     while pc < func.body.len() {
         match &func.body[pc] {
             Instr::Const(v) => stack.push(v.clone()),
@@ -1278,7 +1322,7 @@ fn run_function_locals<'p>(program: &'p Program, func: &'p Function, precomp: Rc
                 };
                 stack.push(r);
             }
-            Instr::Jump(t) => { pc = *t; continue; }
+            Instr::Jump(t) => { if *t <= pc { step_tick()?; } pc = *t; continue; }
             Instr::JumpIfFalse(t) => { let c = stack.pop().ok_or("stack underflow")?; if !c.as_bool()? { pc = *t; continue; } }
             Instr::CallHost(n, argc) => {
                 let argc = *argc; if stack.len() < argc { return Err("stack underflow".into()); }
@@ -3251,6 +3295,31 @@ fn host_call_collections_handles(name: &str, args: &[Value]) -> Option<Result<Va
                 if let Some(mut stdin) = child.stdin.take() {
                     let _ = stdin.write_all(stdin_text.as_bytes());
                 }
+                // Optional 4th arg: wall-clock timeout in ms. On expiry the child is killed
+                // and the result is [stdout so far, stderr + "timeout after N ms", false].
+                let timeout_ms: u64 = match args.get(3) { Some(Value::Int(n)) if *n > 0 => *n as u64, _ => 0 };
+                if timeout_ms > 0 {
+                    use std::io::Read;
+                    let mut so = child.stdout.take().ok_or("exec_capture_io: no stdout pipe")?;
+                    let mut se = child.stderr.take().ok_or("exec_capture_io: no stderr pipe")?;
+                    let t_out = std::thread::spawn(move || { let mut b = Vec::new(); let _ = so.read_to_end(&mut b); b });
+                    let t_err = std::thread::spawn(move || { let mut b = Vec::new(); let _ = se.read_to_end(&mut b); b });
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+                    let (success, timed_out) = loop {
+                        match child.try_wait().map_err(|e| format!("exec_capture_io: {}: {}", p, e))? {
+                            Some(st) => break (st.success(), false),
+                            None if std::time::Instant::now() >= deadline => { let _ = child.kill(); let _ = child.wait(); break (false, true); }
+                            None => std::thread::sleep(std::time::Duration::from_millis(2)),
+                        }
+                    };
+                    let stdout_text = String::from_utf8_lossy(&t_out.join().unwrap_or_default()).to_string();
+                    let mut stderr_text = String::from_utf8_lossy(&t_err.join().unwrap_or_default()).to_string();
+                    if timed_out {
+                        if !stderr_text.is_empty() && !stderr_text.ends_with('\n') { stderr_text.push('\n'); }
+                        stderr_text.push_str(&format!("timeout after {} ms", timeout_ms));
+                    }
+                    return Ok(Value::List(Arc::new(vec![Value::String(stdout_text.into()), Value::String(stderr_text.into()), Value::Bool(success)])));
+                }
                 let out = child.wait_with_output().map_err(|e| format!("exec_capture_io: {}: {}", p, e))?;
                 let stdout_text = String::from_utf8_lossy(&out.stdout).to_string();
                 let stderr_text = String::from_utf8_lossy(&out.stderr).to_string();
@@ -3418,7 +3487,7 @@ fn host_call_io_misc_inner(name: &str, args: &[Value]) -> Result<Value, String> 
                     // Support simple string interpolation for IR runtime: "#{var}"
                     let s = display_value(x);
                     let out = interpolate(&s);
-                    println!("{}", out);
+                    emit_out(&out);
                     // Flush so piped consumers (tests, process supervisors) see
                     // output promptly -- stdout is block-buffered when not a tty
                     use std::io::Write;
@@ -4504,6 +4573,7 @@ fn embedded_pubify_chunk_text(text: &str) -> String {
             || rest.starts_with("struct ")
             || rest.starts_with("const ")
             || rest.starts_with("static ")
+            || rest.starts_with("mod ")
         );
         let is_field_line = !needs_pub
             && !already_pub
@@ -4670,9 +4740,16 @@ fn embedded_build_chunked(program_src: &str, base_name: &str, chunk_texts: &[(St
     let (base_rlib, base_hash) = embedded_wait_rlib_build(base_rlib_build)?;
     let base_dep = (base_name.to_string(), base_rlib, base_hash);
 
+    let extra_deps = |name: &str| -> &'static [&'static str] {
+        match name {
+            "oo" | "contracts" => &["logic"],
+            "codegen_bootstrap" => &["logic", "collections_handles", "networking"],
+            _ => &[],
+        }
+    };
     let other_names: Vec<&str> = chunk_texts.iter()
         .map(|(n, _)| n.as_str())
-        .filter(|n| *n != base_name && *n != "oo" && *n != "contracts")
+        .filter(|n| *n != base_name && extra_deps(n).is_empty())
         .collect();
     let mut tier1_builds = Vec::new();
     for name in &other_names {
@@ -4685,14 +4762,18 @@ fn embedded_build_chunked(program_src: &str, base_name: &str, chunk_texts: &[(St
         let (path, hash) = embedded_wait_rlib_build(build)?;
         chunk_rlibs.push((name, path, hash));
     }
-    let logic_dep = chunk_rlibs.iter().find(|(n, _, _)| n == "logic").cloned();
 
     let mut tier2_builds = Vec::new();
-    for name in ["oo", "contracts"] {
+    for name in ["oo", "contracts", "codegen_bootstrap"] {
         if chunk_texts.iter().any(|(n, _)| n == name) {
             let text = embedded_pubify_chunk_text(text_of(name)?);
-            let logic_dep = logic_dep.clone().ok_or_else(|| format!("embedded_build_chunked: chunk '{}' needs 'logic' but it wasn't supplied", name))?;
-            tier2_builds.push(embedded_spawn_rlib_build(name, &text, &[base_dep.clone(), logic_dep])?);
+            let mut deps = vec![base_dep.clone()];
+            for dep_name in extra_deps(name) {
+                let dep = chunk_rlibs.iter().find(|(n, _, _)| n == dep_name).cloned()
+                    .ok_or_else(|| format!("embedded_build_chunked: chunk '{}' needs '{}' but it wasn't supplied", name, dep_name))?;
+                deps.push(dep);
+            }
+            tier2_builds.push(embedded_spawn_rlib_build(name, &text, &deps)?);
         }
     }
     for build in tier2_builds {
@@ -5375,7 +5456,7 @@ fn host_call_codegen_bootstrap_inner(name: &str, args: &[Value]) -> Result<Value
                 let abs = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
                 Ok(Value::String(abs.display().to_string().into()))
             }
-            "run_ir" => {
+            "run_ir" | "world_run" => {
                 // run_ir(ir_shape): decode a freshly lowered IR shape and run
                 // it on this runtime's VM (the browser-playground back end)
                 fn sl(v: &Value) -> Result<&Vec<Value>, String> {
@@ -5457,37 +5538,180 @@ fn host_call_codegen_bootstrap_inner(name: &str, args: &[Value]) -> Result<Value
                         _ => Instr::Return,
                     })
                 }
-                let shape = args.get(0).ok_or("run_ir: expected IR shape")?;
-                let xs = sl(shape)?;
-                if st(xs, 0)? != "ProgramIR" { return Err("run_ir: root must be ProgramIR".into()); }
-                let entry = st(xs, 1)?;
-                let mut program = Program { functions: HashMap::new(), entry: entry.clone() };
-                for fv in sl(xs.get(2).ok_or("run_ir: missing functions")?)? {
-                    let fx = sl(fv)?;
-                    let name = st(fx, 1)?;
-                    let params: Vec<String> = sl(fx.get(2).ok_or("run_ir: missing params")?)?
-                        .iter().map(|p| match p { Value::String(s) => Ok(s.as_ref().clone()), _ => Err("run_ir: bad param".to_string()) })
-                        .collect::<Result<_, _>>()?;
-                    let mut body = Vec::new();
-                    for iv in sl(fx.get(3).ok_or("run_ir: missing body")?)? { body.push(dinstr(iv)?); }
-                    program.functions.insert(name.clone(), Function { name, params, body });
-                }
-                for ev in sl(xs.get(3).ok_or("run_ir: missing events")?)? {
-                    let ex = sl(ev)?;
-                    let event = st(ex, 1)?; let handler = st(ex, 2)?;
-                    event_handlers_register(event, handler);
-                }
+                let decoded = (|| -> Result<(Program, Vec<(String, String)>), String> {
+                    let shape = args.get(0).ok_or("run_ir: expected IR shape")?;
+                    let xs = sl(shape)?;
+                    if st(xs, 0)? != "ProgramIR" { return Err("run_ir: root must be ProgramIR".into()); }
+                    let entry = st(xs, 1)?;
+                    let mut program = Program { functions: HashMap::new(), entry: entry.clone() };
+                    for fv in sl(xs.get(2).ok_or("run_ir: missing functions")?)? {
+                        let fx = sl(fv)?;
+                        let name = st(fx, 1)?;
+                        let params: Vec<String> = sl(fx.get(2).ok_or("run_ir: missing params")?)?
+                            .iter().map(|p| match p { Value::String(s) => Ok(s.as_ref().clone()), _ => Err("run_ir: bad param".to_string()) })
+                            .collect::<Result<_, _>>()?;
+                        let mut body = Vec::new();
+                        for iv in sl(fx.get(3).ok_or("run_ir: missing body")?)? { body.push(dinstr(iv)?); }
+                        program.functions.insert(name.clone(), Function { name, params, body });
+                    }
+                    let mut events: Vec<(String, String)> = Vec::new();
+                    for ev in sl(xs.get(3).ok_or("run_ir: missing events")?)? {
+                        let ex = sl(ev)?;
+                        events.push((st(ex, 1)?, st(ex, 2)?));
+                    }
+                    Ok((program, events))
+                })();
+                let (program, events) = match decoded {
+                    Ok(d) => d,
+                    Err(e) if name == "world_run" => return Ok(rt_world_result(String::new(), format!("IR decode error: {}", e), false, Vec::new())),
+                    Err(e) => return Err(e),
+                };
+                if name == "world_run" { return rt_world_run(&program, events, args.get(1)); }
+                for (event, handler) in events { event_handlers_register(event, handler); }
                 let f = program.functions.get(&program.entry).ok_or("run_ir: entry not found")?;
                 let cache = PrecomputeCache::default();
                 run_function(&program, f, &[], &cache)
+            }
+            "host_caps" => {
+                let mut caps: Vec<&str> = vec!["world_swap"];
+                if !cfg!(target_arch = "wasm32") { caps.extend(["subprocess", "tcp", "fs"]); }
+                if cfg!(any(not(target_arch = "wasm32"), target_feature = "atomics")) { caps.push("threads"); }
+                Ok(Value::List(Arc::new(caps.into_iter().map(|c| Value::String(c.to_string().into())).collect())))
             }
                     _ => Err(format!("host fn '{}' not found", name)),
     }
 }
 
+fn rt_world_result(out: String, err: String, ok: bool, vfs_out: Vec<Value>) -> Value {
+    Value::List(Arc::new(vec![
+        Value::String(out.into()),
+        Value::String(err.into()),
+        Value::Bool(ok),
+        Value::List(Arc::new(vfs_out)),
+    ]))
+}
+
+fn rt_opt_get(opts: Option<&Value>, key: &str) -> Option<Value> {
+    match opts {
+        Some(Value::Object(m)) => m.get(key).cloned(),
+        Some(Value::List(xs)) => xs.iter().find_map(|p| match p {
+            Value::List(kv) if kv.len() == 2 && matches!(&kv[0], Value::String(k) if k.as_str() == key) => Some(kv[1].clone()),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+// world_run's store swap. Same store list as ir/hosts.rs's world_enter (that is
+// the reference; this mirrors it for the compiled/WASM runtime). Shared stores
+// are thread_local on plain wasm32 and Mutex/OnceLock elsewhere, exactly as
+// declared in the core chunk.
+macro_rules! rt_swap_local {
+    ($r:expr, $s:ident, $fresh:expr) => {{
+        let old = $s.with(|c| std::mem::replace(&mut *c.borrow_mut(), $fresh));
+        $r.push(Box::new(move || { $s.with(|c| { *c.borrow_mut() = old; }); }) as Box<dyn FnOnce()>);
+    }};
+}
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+macro_rules! rt_swap_shared {
+    ($r:expr, $s:ident) => { rt_swap_local!($r, $s, Default::default()) };
+}
+#[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+macro_rules! rt_swap_shared {
+    ($r:expr, $s:ident) => {{
+        let old = std::mem::take(&mut *$s.get_or_init(|| Mutex::new(Default::default())).lock().unwrap_or_else(|e| e.into_inner()));
+        $r.push(Box::new(move || {
+            *$s.get_or_init(|| Mutex::new(Default::default())).lock().unwrap_or_else(|e| e.into_inner()) = old;
+        }) as Box<dyn FnOnce()>);
+    }};
+}
+
+#[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+static WORLD_LOCK: Mutex<()> = Mutex::new(());
+thread_local! {
+    static WORLD_DEPTH: std::cell::Cell<usize> = std::cell::Cell::new(0);
+}
+
+fn rt_world_run(program: &Program, events: Vec<(String, String)>, opts: Option<&Value>) -> Result<Value, String> {
+    if let Some(Value::String(s)) = rt_opt_get(opts, "stdin") {
+        if !s.is_empty() { return Err("world_run: unsupported: stdin".into()); }
+    }
+    #[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+    { if fibers::active() { return Err("world_run: unsupported while a fiber is alive".into()); } }
+    let max_steps = match rt_opt_get(opts, "max_steps") { Some(Value::Int(n)) if n > 0 => n, _ => i64::MAX };
+    let prefix = match rt_opt_get(opts, "vfs_out_prefix") { Some(Value::String(s)) => s.as_ref().clone(), _ => String::new() };
+    let vfs_in: Vec<(String, String)> = match rt_opt_get(opts, "vfs_in") {
+        Some(Value::List(xs)) => xs.iter().filter_map(|p| match p {
+            Value::List(kv) if kv.len() == 2 => match (&kv[0], &kv[1]) {
+                (Value::String(k), Value::String(v)) => Some((k.as_ref().clone(), v.as_ref().clone())),
+                _ => None,
+            },
+            _ => None,
+        }).collect(),
+        _ => Vec::new(),
+    };
+
+    let depth = WORLD_DEPTH.with(|d| { let n = d.get(); d.set(n + 1); n });
+    #[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+    let _lock = if depth == 0 { Some(WORLD_LOCK.lock().unwrap_or_else(|e| e.into_inner())) } else { None };
+    #[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+    let _ = depth;
+    let mut r: Vec<Box<dyn FnOnce()>> = Vec::new();
+    rt_swap_local!(r, VECS, Vec::new());
+    rt_swap_local!(r, SBUFS, Vec::new());
+    rt_swap_local!(r, ISTRINGS, Vec::new());
+    rt_swap_local!(r, FACTS, HashMap::new());
+    rt_swap_local!(r, GOALS, Vec::new());
+    rt_swap_local!(r, TYPE_RULES, HashMap::new());
+    rt_swap_local!(r, RULES, Vec::new());
+    rt_swap_local!(r, ACTIONS, Vec::new());
+    rt_swap_local!(r, GOAL_DEFS, HashMap::new());
+    rt_swap_local!(r, ACTION_BODIES, HashMap::new());
+    rt_swap_local!(r, LISTENERS, HashMap::new());
+    rt_swap_local!(r, CONNS, HashMap::new());
+    rt_swap_local!(r, NEXT_CONN, 1);
+    rt_swap_local!(r, CHILD_PROCS, HashMap::new());
+    rt_swap_local!(r, NEXT_PROC_ID, 1);
+    rt_swap_shared!(r, OBJECTS);
+    rt_swap_shared!(r, EVENT_HANDLERS);
+    rt_swap_shared!(r, RUNTIME_EVENT_HANDLERS);
+    rt_swap_shared!(r, VFS);
+    rt_swap_shared!(r, CLASSES);
+    let prev_capture = CAPTURE.with(|c| c.borrow_mut().replace(String::new()));
+    let prev_budget = step_budget_set(max_steps);
+
+    for (k, v) in vfs_in { vfs_set(k, v); }
+    for (event, handler) in events { event_handlers_register(event, handler); }
+    let ran = match program.functions.get(&program.entry) {
+        None => Err("entry not found".to_string()),
+        Some(f) => {
+            let cache = PrecomputeCache::default();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_function(program, f, &[], &cache)))
+                .unwrap_or_else(|p| Err(format!("panic: {}", p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_else(|| "panic".into()))))
+        }
+    };
+    let mut keys: Vec<String> = vfs_keys().into_iter().filter(|k| k.starts_with(&prefix)).collect();
+    keys.sort();
+    let vfs_out: Vec<Value> = keys.into_iter().filter_map(|k| {
+        vfs_get(&k).map(|v| Value::List(Arc::new(vec![Value::String(k.into()), Value::String(v.into())])))
+    }).collect();
+    let out = CAPTURE.with(|c| c.borrow().clone().unwrap_or_default());
+
+    CHILD_PROCS.with(|c| { for (_, ch) in c.borrow_mut().iter_mut() { let _ = ch.kill(); let _ = ch.wait(); } });
+    for restore in r.drain(..).rev() { restore(); }
+    CAPTURE.with(|c| { *c.borrow_mut() = prev_capture; });
+    step_budget_set(prev_budget);
+    WORLD_DEPTH.with(|d| d.set(d.get() - 1));
+
+    Ok(match ran {
+        Ok(_) => rt_world_result(out, String::new(), true, vfs_out),
+        Err(e) => rt_world_result(out, format!("IR runtime error: {}", e), false, vfs_out),
+    })
+}
+
 fn host_call_codegen_bootstrap(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match name {
-        "parse_tiny_source" | "lower_and_compile" | "emit_rust_for" | "copy_file" | "remove_file" | "patc_compile_from_argv" | "get_argv" | "rustc_build" | "rustc_build_chunked" | "rustc_build_chunked_texts" | "run_ir" => Some(host_call_codegen_bootstrap_inner(name, args)),
+        "parse_tiny_source" | "lower_and_compile" | "emit_rust_for" | "copy_file" | "remove_file" | "patc_compile_from_argv" | "get_argv" | "rustc_build" | "rustc_build_chunked" | "rustc_build_chunked_texts" | "run_ir" | "world_run" | "host_caps" => Some(host_call_codegen_bootstrap_inner(name, args)),
         _ => None,
     }
 }
@@ -5523,7 +5747,7 @@ fn host_call_codegen_bootstrap(name: &str, args: &[Value]) -> Option<Result<Valu
                     // primitives unconditionally whenever `run_ir` appears
                     // anywhere, regardless of what this program's own static
                     // CallHost/BinOp scan would otherwise conclude.
-                    if name.as_str() == "run_ir" {
+                    if name.as_str() == "run_ir" || name.as_str() == "world_run" {
                         // A live playground must support arbitrary PatLang --
                         // not just numeric/math -- so force-include every
                         // optional chunk (oo/logic/contracts/networking/etc
@@ -5922,6 +6146,7 @@ fn pubify_chunk_text(text: &str) -> String {
             || rest.starts_with("struct ")
             || rest.starts_with("const ")
             || rest.starts_with("static ")
+            || rest.starts_with("mod ")
             // `thread_local!` is a MACRO -- `pub thread_local! { ... }` is
             // invalid syntax; the `static` declarations INSIDE the block
             // already get `pub` from the `static ` rule above (each such
@@ -6209,11 +6434,22 @@ pub fn build_chunked_native_from_texts(program_src: &str, base_name: &str, chunk
     let (base_rlib, base_hash) = ensure_chunk_rlib(base_name, &base_text, &[])?;
     let base_dep = (base_name.to_string(), base_rlib.clone(), base_hash);
 
-    // Tier 1: every other required chunk except `oo`/`contracts` (which
-    // additionally need `logic`), started concurrently.
+    // Chunks that need other non-base chunks' items (mirrors
+    // CROSS_CHUNK_EDGES, minus the base-only edges): built after their
+    // dependencies, in a second tier.
+    let extra_deps = |name: &str| -> &'static [&'static str] {
+        match name {
+            "oo" | "contracts" => &["logic"],
+            "codegen_bootstrap" => &["logic", "collections_handles", "networking"],
+            _ => &[],
+        }
+    };
+
+    // Tier 1: every other required chunk without extra dependencies,
+    // started concurrently.
     let other_names: Vec<&str> = chunk_texts.iter()
         .map(|(n, _)| n.as_str())
-        .filter(|n| *n != base_name && *n != "oo" && *n != "contracts")
+        .filter(|n| *n != base_name && extra_deps(n).is_empty())
         .collect();
     let mut tier1_builds = Vec::new();
     for name in &other_names {
@@ -6226,16 +6462,21 @@ pub fn build_chunked_native_from_texts(program_src: &str, base_name: &str, chunk
         let (path, hash) = wait_rlib_build(build)?;
         chunk_rlibs.push((name, path, hash));
     }
-    let logic_dep = chunk_rlibs.iter().find(|(n, _, _)| n == "logic").cloned();
 
-    // Tier 2: `oo`/`contracts`, each needing base + logic (per
-    // CROSS_CHUNK_EDGES), also started concurrently with each other.
+    // Tier 2: chunks with extra dependencies (`oo`/`contracts` need logic,
+    // `codegen_bootstrap` needs logic + collections_handles + networking),
+    // each built against base plus its dependencies, started concurrently.
     let mut tier2_builds = Vec::new();
-    for name in ["oo", "contracts"] {
+    for name in ["oo", "contracts", "codegen_bootstrap"] {
         if chunk_texts.iter().any(|(n, _)| n == name) {
             let text = pubify_chunk_text(text_of(name)?);
-            let logic_dep = logic_dep.clone().ok_or_else(|| format!("build_chunked_native_from_texts: chunk '{}' needs 'logic' but it wasn't supplied", name))?;
-            tier2_builds.push(spawn_rlib_build(name, &text, &[base_dep.clone(), logic_dep])?);
+            let mut deps = vec![base_dep.clone()];
+            for dep_name in extra_deps(name) {
+                let dep = chunk_rlibs.iter().find(|(n, _, _)| n == dep_name).cloned()
+                    .ok_or_else(|| format!("build_chunked_native_from_texts: chunk '{}' needs '{}' but it wasn't supplied", name, dep_name))?;
+                deps.push(dep);
+            }
+            tier2_builds.push(spawn_rlib_build(name, &text, &deps)?);
         }
     }
     for build in tier2_builds {

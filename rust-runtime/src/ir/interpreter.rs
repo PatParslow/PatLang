@@ -6,6 +6,23 @@ use std::rc::Rc;
 use super::types::*;
 use super::ops;
 
+// Step budget for hosts::host_world_run: counted only on function entry and
+// backward jumps (loops/recursion), so the unlimited default is one compare
+// on those paths and straight-line code pays nothing.
+thread_local! {
+    static STEP_BUDGET: std::cell::Cell<i64> = std::cell::Cell::new(i64::MAX);
+}
+pub fn step_budget_set(n: i64) -> i64 { STEP_BUDGET.with(|b| b.replace(n)) }
+#[inline]
+pub fn step_tick() -> Result<(), String> {
+    STEP_BUDGET.with(|b| {
+        let v = b.get();
+        if v == i64::MAX { Ok(()) }
+        else if v <= 0 { Err("step budget exhausted".into()) }
+        else { b.set(v - 1); Ok(()) }
+    })
+}
+
 // Per-function precomputed dispatch info, cached ONCE PER FUNCTION (keyed by
 // the function's own stable address) rather than once per CALL -- see
 // run_function's own doc comment for the full story of why a per-CALL
@@ -221,6 +238,7 @@ impl Interpreter {
     fn run_function_locals<'p>(&self, program: &'p Program, func: &'p Function, precomp: Rc<FnPrecomputed<'p>>, mut locals: Vec<Value>, cache: &PrecomputeCache<'p>) -> Result<Value, String> {
         let mut pc: usize = 0;
         let mut stack: Vec<Value> = Vec::new();
+        step_tick()?;
 
         while pc < func.body.len() {
             match &func.body[pc] {
@@ -267,7 +285,7 @@ impl Interpreter {
                     };
                     stack.push(res);
                 }
-                Instr::Jump(target) => { pc = *target; continue; }
+                Instr::Jump(target) => { if *target <= pc { step_tick()?; } pc = *target; continue; }
                 Instr::JumpIfFalse(target) => {
                     let cond = stack.pop().ok_or("stack underflow")?;
                     if !cond.as_bool()? { pc = *target; continue; }

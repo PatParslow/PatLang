@@ -375,3 +375,11 @@ mod tests {
         assert!(predicted >= 8, "predicted {} should be at least the recent max (8) for noisy-but-flat data", predicted);
     }
 }
+
+/// True while any fiber's OS thread is still alive. `world_run` refuses to
+/// swap the process-global stores under a live fiber, since that fiber would
+/// see (and write into) the child's world.
+pub fn fibers_active() -> bool {
+    let reg = registry().lock().unwrap();
+    reg.values().any(|h| h.state.lock().map(|st| st.alive).unwrap_or(true))
+}
