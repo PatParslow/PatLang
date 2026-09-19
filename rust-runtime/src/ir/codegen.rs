@@ -2948,7 +2948,7 @@ fn host_call_strings_ext(name: &str, args: &[Value]) -> Option<Result<Value, Str
     const PRELUDE_COLLECTIONS_HANDLES: &'static str = r##"thread_local! {
     static VECS: RefCell<Vec<Vec<Value>>> = RefCell::new(Vec::new());
     static SBUFS: RefCell<Vec<String>> = RefCell::new(Vec::new());
-    static ISTRINGS: RefCell<Vec<(String, bool)>> = RefCell::new(Vec::new());
+    static ISTRINGS: RefCell<Vec<(String, bool, Vec<char>)>> = RefCell::new(Vec::new());
 }
 
 fn host_call_collections_handles_inner(name: &str, args: &[Value]) -> Result<Value, String> {
@@ -3014,7 +3014,8 @@ fn host_call_collections_handles_inner(name: &str, args: &[Value]) -> Result<Val
             "str_intern" => {
                 let s = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => to_s(v), None => String::new() };
                 let is_ascii = s.is_ascii();
-                let id = ISTRINGS.with(|v| { let mut b = v.borrow_mut(); b.push((s, is_ascii)); b.len() - 1 });
+                let chars: Vec<char> = if is_ascii { Vec::new() } else { s.chars().collect() };
+                let id = ISTRINGS.with(|v| { let mut b = v.borrow_mut(); b.push((s, is_ascii, chars)); b.len() - 1 });
                 Ok(Value::Number(id as f64))
             }
             "sc_len" => {
@@ -3029,7 +3030,7 @@ fn host_call_collections_handles_inner(name: &str, args: &[Value]) -> Result<Val
                 ISTRINGS.with(|v| {
                     let b = v.borrow();
                     b.get(id).ok_or_else(|| format!("sc_len: unknown string {}", id))
-                        .map(|(s, is_ascii)| Value::Int(if *is_ascii { s.len() as i64 } else { s.chars().count() as i64 }))
+                        .map(|(s, is_ascii, chars)| Value::Int(if *is_ascii { s.len() as i64 } else { chars.len() as i64 }))
                 })
             }
             "sc_code" => {
@@ -3039,11 +3040,11 @@ fn host_call_collections_handles_inner(name: &str, args: &[Value]) -> Result<Val
                 let idx = arg_usize(&args, 1, "sc_code")?;
                 ISTRINGS.with(|v| {
                     let b = v.borrow();
-                    let (s, is_ascii) = b.get(id).ok_or_else(|| format!("sc_code: unknown string {}", id))?;
+                    let (s, is_ascii, chars) = b.get(id).ok_or_else(|| format!("sc_code: unknown string {}", id))?;
                     if *is_ascii {
                         return Ok(Value::Int(match s.as_bytes().get(idx) { Some(c) => *c as i64, None => -1 }));
                     }
-                    Ok(Value::Int(match s.chars().nth(idx) { Some(c) => c as u32 as i64, None => -1 }))
+                    Ok(Value::Int(match chars.get(idx) { Some(c) => *c as u32 as i64, None => -1 }))
                 })
             }
             "sc_char" => {
@@ -3051,11 +3052,11 @@ fn host_call_collections_handles_inner(name: &str, args: &[Value]) -> Result<Val
                 let idx = arg_usize(&args, 1, "sc_char")?;
                 ISTRINGS.with(|v| {
                     let b = v.borrow();
-                    let (s, is_ascii) = b.get(id).ok_or_else(|| format!("sc_char: unknown string {}", id))?;
+                    let (s, is_ascii, chars) = b.get(id).ok_or_else(|| format!("sc_char: unknown string {}", id))?;
                     if *is_ascii {
                         return Ok(match s.as_bytes().get(idx) { Some(c) => Value::String((*c as char).to_string().into()), None => Value::String(String::new().into()) });
                     }
-                    Ok(match s.chars().nth(idx) { Some(c) => Value::String(c.to_string().into()), None => Value::String(String::new().into()) })
+                    Ok(match chars.get(idx) { Some(c) => Value::String(c.to_string().into()), None => Value::String(String::new().into()) })
                 })
             }
             "sc_substr" => {
@@ -3072,14 +3073,14 @@ fn host_call_collections_handles_inner(name: &str, args: &[Value]) -> Result<Val
                 let count = arg_usize(&args, 2, "sc_substr")?;
                 ISTRINGS.with(|v| {
                     let b = v.borrow();
-                    let (s, is_ascii) = b.get(id).ok_or_else(|| format!("sc_substr: unknown string {}", id))?;
+                    let (s, is_ascii, chars) = b.get(id).ok_or_else(|| format!("sc_substr: unknown string {}", id))?;
                     if *is_ascii {
                         let bytes = s.as_bytes();
                         let st = start.min(bytes.len());
                         let en = st.saturating_add(count).min(bytes.len());
                         return Ok(Value::String(String::from_utf8_lossy(&bytes[st..en]).to_string().into()));
                     }
-                    Ok(Value::String(s.chars().skip(start).take(count).collect::<String>().into()))
+                    Ok(Value::String(chars.iter().skip(start).take(count).collect::<String>().into()))
                 })
             }
             "sb_new" => {

@@ -238,13 +238,16 @@ pub fn host_vec_to_list(args: &[Value]) -> Result<Value, String> {
 // patlang-perf-ladder-findings / patlang-ascii-fastpath-cache-fix memory:
 // html_tokenize on a real 1.2MB article took 62.6s from this alone.
 thread_local! {
-    static ISTRINGS: RefCell<Vec<(String, bool)>> = RefCell::new(Vec::new());
+    static ISTRINGS: RefCell<Vec<(String, bool, Vec<char>)>> = RefCell::new(Vec::new());
 }
 
 pub fn host_str_intern(args: &[Value]) -> Result<Value, String> {
     let s: String = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => display_value(v).into(), None => String::new() };
     let is_ascii = s.is_ascii();
-    let id = ISTRINGS.with(|v| { let mut b = v.borrow_mut(); b.push((s, is_ascii)); b.len() - 1 });
+    // Non-ASCII strings get a char index once, here, so sc_code/sc_char/sc_len/
+    // sc_substr stay O(1) instead of walking chars() from the start on every call.
+    let chars: Vec<char> = if is_ascii { Vec::new() } else { s.chars().collect() };
+    let id = ISTRINGS.with(|v| { let mut b = v.borrow_mut(); b.push((s, is_ascii, chars)); b.len() - 1 });
     Ok(Value::Int(id as i64))
 }
 
@@ -253,7 +256,7 @@ pub fn host_sc_len(args: &[Value]) -> Result<Value, String> {
     ISTRINGS.with(|v| {
         let b = v.borrow();
         b.get(id).ok_or_else(|| format!("sc_len: unknown string {}", id))
-            .map(|(s, is_ascii)| Value::Int(if *is_ascii { s.len() as i64 } else { s.chars().count() as i64 }))
+            .map(|(s, is_ascii, chars)| Value::Int(if *is_ascii { s.len() as i64 } else { chars.len() as i64 }))
     })
 }
 
@@ -262,11 +265,11 @@ pub fn host_sc_code(args: &[Value]) -> Result<Value, String> {
     let idx = arg_usize(args, 1, "sc_code")?;
     ISTRINGS.with(|v| {
         let b = v.borrow();
-        let (s, is_ascii) = b.get(id).ok_or_else(|| format!("sc_code: unknown string {}", id))?;
+        let (s, is_ascii, chars) = b.get(id).ok_or_else(|| format!("sc_code: unknown string {}", id))?;
         if *is_ascii {
             return Ok(Value::Int(match s.as_bytes().get(idx) { Some(c) => *c as i64, None => -1 }));
         }
-        Ok(Value::Int(match s.chars().nth(idx) { Some(c) => c as u32 as i64, None => -1 }))
+        Ok(Value::Int(match chars.get(idx) { Some(c) => *c as u32 as i64, None => -1 }))
     })
 }
 
@@ -275,11 +278,11 @@ pub fn host_sc_char(args: &[Value]) -> Result<Value, String> {
     let idx = arg_usize(args, 1, "sc_char")?;
     ISTRINGS.with(|v| {
         let b = v.borrow();
-        let (s, is_ascii) = b.get(id).ok_or_else(|| format!("sc_char: unknown string {}", id))?;
+        let (s, is_ascii, chars) = b.get(id).ok_or_else(|| format!("sc_char: unknown string {}", id))?;
         if *is_ascii {
             return Ok(match s.as_bytes().get(idx) { Some(c) => Value::String(((*c as char).to_string()).into()), None => Value::String((String::new()).into()) });
         }
-        Ok(match s.chars().nth(idx) { Some(c) => Value::String((c.to_string()).into()), None => Value::String((String::new()).into()) })
+        Ok(match chars.get(idx) { Some(c) => Value::String((c.to_string()).into()), None => Value::String((String::new()).into()) })
     })
 }
 
@@ -299,14 +302,14 @@ pub fn host_sc_substr(args: &[Value]) -> Result<Value, String> {
     let count = arg_usize(args, 2, "sc_substr")?;
     ISTRINGS.with(|v| {
         let b = v.borrow();
-        let (s, is_ascii) = b.get(id).ok_or_else(|| format!("sc_substr: unknown string {}", id))?;
+        let (s, is_ascii, chars) = b.get(id).ok_or_else(|| format!("sc_substr: unknown string {}", id))?;
         if *is_ascii {
             let bytes = s.as_bytes();
             let st = start.min(bytes.len());
             let en = st.saturating_add(count).min(bytes.len());
             return Ok(Value::String(String::from_utf8_lossy(&bytes[st..en]).to_string().into()));
         }
-        Ok(Value::String(s.chars().skip(start).take(count).collect::<String>().into()))
+        Ok(Value::String(chars.iter().skip(start).take(count).collect::<String>().into()))
     })
 }
 
