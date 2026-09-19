@@ -1,0 +1,130 @@
+# Weighted-particle-ensemble uncertainty propagation, built on the same
+# stepper as self_hosting/lib/symbolic_ode.patlang (lv_step_rk4) rather
+# than the interval type in symbolic.patlang. Concatenate after
+# symbolic_ode.patlang when compiling.
+#
+# Deliberately a SEPARATE mechanism from the Interval type, not an
+# extension of it: an Interval's whole identity is a PROVEN bound (every
+# sqrt/pi/trig enclosure in symbolic.patlang exists to make that claim
+# honestly). A particle ensemble makes a genuinely weaker claim -- "here
+# is the likely spread, sampled at K points" -- which is why it lives in
+# its own file rather than blurring into the Interval abstraction.
+#
+# The idea this ports from D:\multiverse_VM (its "K weighted hypotheses,
+# combined and pruned by weight" P-Register mechanism), NOT its bit-vector
+# encoding, GPU kernels, or program inversion -- none of that is relevant
+# here. What transfers is the core shape: represent uncertainty as a
+# bounded SET of weighted candidates rather than either one point value or
+# one worst-case bracket, and propagate each candidate through the real
+# dynamics rather than through a conservative outer approximation of them.
+#
+# Motivation: self_hosting/examples/predator_prey_demo.patlang's own
+# interval-Euler uncertainty band explodes into physically meaningless
+# negative population by t=1.8, precisely BECAUSE naive interval
+# arithmetic has no way to represent "most of the probability mass is
+# still concentrated near the center" even as the bracket balloons (the
+# wrapping effect, already documented on that page). A particle ensemble's
+# spread reflects the true nonlinear propagation of a real starting
+# uncertainty instead of a Cartesian-product worst case, so it should stay
+# informative for far longer than one twentieth of one oscillation period
+# -- this file exists to check that claim against real numbers, not just
+# assert it.
+#
+# Real, stated limitation, not glossed over: an ensemble is a SAMPLING
+# approximation (K candidates out of infinitely many), not a proof. Too
+# small a K, or a badly-specified initial spread, can miss a real tail
+# scenario in a way the Interval type's actual containment guarantee
+# cannot, by construction. This file makes no rigor claim the Interval
+# type makes.
+
+# Each particle is [r, f, weight]. An ensemble is a list of particles
+# whose weights sum to 1.
+
+make a function called ens_init_grid takes r_lo, r_hi, f_lo, f_hi, n_per_axis returns ens
+  let particles = []
+  let w = 1.0 / (n_per_axis * n_per_axis)
+  let i = 0
+  while i < n_per_axis do
+    let r = r_lo + ((r_hi - r_lo) * ((i + 0.5) / n_per_axis))
+    let j = 0
+    while j < n_per_axis do
+      let f = f_lo + ((f_hi - f_lo) * ((j + 0.5) / n_per_axis))
+      let particles = list_push(particles, [r, f, w])
+      let j = j + 1
+    end
+    let i = i + 1
+  end
+  return particles
+end
+
+# Propagates every particle one step through the SAME lv_step_rk4 used for
+# the point trajectory -- no new stepper, no approximation beyond RK4's
+# own ordinary numerical error, and no reweighting (pure forward
+# uncertainty propagation, not a Bayesian update against new evidence).
+make a function called ens_step takes ens, a, b, c, d, h returns ens2
+  let out = []
+  let i = 0
+  while i < ens.length do
+    let p = ens[i]
+    let step = lv_step_rk4(p[0], p[1], a, b, c, d, h)
+    let out = list_push(out, [step[0], step[1], p[2]])
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called ens_mean takes ens returns pair
+  let rsum = 0.0
+  let fsum = 0.0
+  let i = 0
+  while i < ens.length do
+    let p = ens[i]
+    let rsum = rsum + (p[0] * p[2])
+    let fsum = fsum + (p[1] * p[2])
+    let i = i + 1
+  end
+  return [rsum, fsum]
+end
+
+# Sample extremes, not a proven bound -- reported alongside the weighted
+# std below specifically so a reader isn't tempted to read this the same
+# way as an Interval's lo/hi (see module header).
+make a function called ens_bounds takes ens returns bounds
+  let rlo = ens[0][0]
+  let rhi = ens[0][0]
+  let flo = ens[0][1]
+  let fhi = ens[0][1]
+  let i = 1
+  while i < ens.length do
+    let p = ens[i]
+    if p[0] < rlo then
+      let rlo = p[0]
+    end
+    if p[0] > rhi then
+      let rhi = p[0]
+    end
+    if p[1] < flo then
+      let flo = p[1]
+    end
+    if p[1] > fhi then
+      let fhi = p[1]
+    end
+    let i = i + 1
+  end
+  return [rlo, rhi, flo, fhi]
+end
+
+make a function called ens_weighted_std takes ens, mean_r, mean_f returns pair
+  let vr = 0.0
+  let vf = 0.0
+  let i = 0
+  while i < ens.length do
+    let p = ens[i]
+    let dr = p[0] - mean_r
+    let df = p[1] - mean_f
+    let vr = vr + (p[2] * dr * dr)
+    let vf = vf + (p[2] * df * df)
+    let i = i + 1
+  end
+  return [sqrt(vr), sqrt(vf)]
+end

@@ -1,0 +1,325 @@
+# LaTeX math-notation parser -> self_hosting/lib/symbolic.patlang expression
+# trees. Targets the subset MathJax actually renders for ordinary algebra:
+# numbers, a single-letter variable, + - * / ^, implicit juxtaposition
+# multiplication (2x, x(x+1)), \sqrt{}, \frac{}{}, \sin/\cos/\tan (bare,
+# paren, or brace argument), \pi, \left/\right (transparent), parens/braces
+# for grouping, and a top-level '=' turning an equation into "LHS - RHS"
+# (already zeroed, ready to hand straight to sym_solve_for/
+# sym_solve_closed_form). Concatenate after symbolic.patlang when compiling
+# -- matches this project's own "concatenate after lib/X" convention.
+#
+# Deliberately NOT a general LaTeX engine: multi-letter identifiers are read
+# as adjacent single-letter variables (implicit multiplication), matching
+# how typeset math actually reads; \sin^2, subscripts, matrices, and other
+# LaTeX well outside ordinary single-variable algebra are out of scope.
+
+make a function called lx_is_digit takes c returns yes
+  let cc = char_code(c, 0)
+  return (cc >= 48) and (cc <= 57)
+end
+
+make a function called lx_is_alpha takes c returns yes
+  let cc = char_code(c, 0)
+  return ((cc >= 65) and (cc <= 90)) or ((cc >= 97) and (cc <= 122))
+end
+
+# =============================================================================
+# Tokenizer. \left / \right are transparent (skipped, no token emitted) --
+# the delimiter that follows is tokenized normally as LP/RP.
+# =============================================================================
+
+make a function called lx_tokenize takes s returns toks
+  let toks = []
+  let i = 0
+  let n = s.length
+  while i < n do
+    let c = s[i]
+    let cc = char_code(s, i)
+    if cc == 32 then
+      let i = i + 1
+    else
+      if c == "\\" then
+        let j = i + 1
+        while (j < n) and (lx_is_alpha(s[j])) do
+          let j = j + 1
+        end
+        let name = substr(s, i + 1, j - (i + 1))
+        if (name == "left") or (name == "right") then
+          let i = j
+        else
+          let toks = list_push(toks, ["CMD", name])
+          let i = j
+        end
+      else
+        if lx_is_digit(c) then
+          let j = i
+          let seen_dot = false
+          while (j < n) and (lx_is_digit(s[j]) or ((s[j] == ".") and (seen_dot == false))) do
+            if s[j] == "." then
+              let seen_dot = true
+            end
+            let j = j + 1
+          end
+          let numtext = substr(s, i, j - i)
+          let toks = list_push(toks, ["NUM", to_num(numtext)])
+          let i = j
+        else
+          if lx_is_alpha(c) then
+            let toks = list_push(toks, ["ID", c])
+            let i = i + 1
+          else
+            if c == "(" then
+              let toks = list_push(toks, ["LP"])
+              let i = i + 1
+            else
+              if c == ")" then
+                let toks = list_push(toks, ["RP"])
+                let i = i + 1
+              else
+                if c == "{" then
+                  let toks = list_push(toks, ["LB"])
+                  let i = i + 1
+                else
+                  if c == "}" then
+                    let toks = list_push(toks, ["RB"])
+                    let i = i + 1
+                  else
+                    if c == "=" then
+                      let toks = list_push(toks, ["EQ"])
+                      let i = i + 1
+                    else
+                      if (c == "+") or (c == "-") or (c == "*") or (c == "/") or (c == "^") then
+                        let toks = list_push(toks, ["OP", c])
+                        let i = i + 1
+                      else
+                        let i = i + 1
+                      end
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  return toks
+end
+
+make a function called lx_peek takes toks, pos returns tok
+  if pos < toks.length then
+    return toks[pos]
+  end
+  return ["EOF"]
+end
+
+make a function called lx_can_start_factor takes tok returns yes
+  if tok[0] == "NUM" then
+    return true
+  end
+  if tok[0] == "ID" then
+    return true
+  end
+  if tok[0] == "LP" then
+    return true
+  end
+  if tok[0] == "LB" then
+    return true
+  end
+  if tok[0] == "CMD" then
+    return true
+  end
+  return false
+end
+
+# =============================================================================
+# Recursive-descent parser. Each lx_parse_* returns [expr, next_pos] --
+# position threaded through return values rather than mutated in place.
+# Precedence, loosest to tightest: expr (+ -) > term (* / implicit-adjacency)
+# > power (^, right-binding to a single exponent atom) > unary (leading -)
+# > atom (literals, groups, commands).
+# =============================================================================
+
+make a function called lx_parse_group takes toks, pos returns pair
+  let rp = lx_parse_expr(toks, pos + 1)
+  return [rp[0], rp[1] + 1]
+end
+
+make a function called lx_expr_to_int takes expr returns n
+  let iv = sym_eval_interval(expr, [])
+  return sym_ival_lo(iv)
+end
+
+make a function called lx_parse_fn_arg takes toks, pos returns pair
+  let t = lx_peek(toks, pos)
+  if t[0] == "LB" then
+    return lx_parse_group(toks, pos)
+  end
+  if t[0] == "LP" then
+    let rp = lx_parse_expr(toks, pos + 1)
+    return [rp[0], rp[1] + 1]
+  end
+  return lx_parse_unary(toks, pos)
+end
+
+make a function called lx_parse_atom takes toks, pos returns pair
+  let t = lx_peek(toks, pos)
+  if t[0] == "NUM" then
+    return [sym_const(t[1]), pos + 1]
+  end
+  if t[0] == "ID" then
+    return [sym_var(t[1]), pos + 1]
+  end
+  if t[0] == "LP" then
+    let rp = lx_parse_expr(toks, pos + 1)
+    return [rp[0], rp[1] + 1]
+  end
+  if t[0] == "LB" then
+    let rp = lx_parse_expr(toks, pos + 1)
+    return [rp[0], rp[1] + 1]
+  end
+  if t[0] == "CMD" then
+    let name = t[1]
+    let p2 = pos + 1
+    if name == "pi" then
+      return [sym_pi(), p2]
+    end
+    if name == "sqrt" then
+      let gp = lx_parse_group(toks, p2)
+      return [sym_sqrt(gp[0]), gp[1]]
+    end
+    if name == "frac" then
+      let np = lx_parse_group(toks, p2)
+      let dp = lx_parse_group(toks, np[1])
+      return [sym_div(np[0], dp[0]), dp[1]]
+    end
+    if name == "sin" then
+      let ap = lx_parse_fn_arg(toks, p2)
+      return [sym_sin(ap[0]), ap[1]]
+    end
+    if name == "cos" then
+      let ap = lx_parse_fn_arg(toks, p2)
+      return [sym_cos(ap[0]), ap[1]]
+    end
+    if name == "tan" then
+      let ap = lx_parse_fn_arg(toks, p2)
+      return [sym_tan(ap[0]), ap[1]]
+    end
+    if (name == "cdot") or (name == "times") then
+      # stray binary-operator command reached as an atom (shouldn't
+      # normally happen -- handled in lx_parse_term) -- skip it and parse
+      # what follows as the real atom, rather than erroring on well-formed
+      # input the term-level loop just didn't consume first.
+      return lx_parse_atom(toks, p2)
+    end
+    print("lx_parse_atom: unknown command \\" + name)
+    return [sym_const(0), p2]
+  end
+  print("lx_parse_atom: unexpected token " + t[0])
+  return [sym_const(0), pos + 1]
+end
+
+make a function called lx_parse_unary takes toks, pos returns pair
+  let t = lx_peek(toks, pos)
+  if (t[0] == "OP") and (t[1] == "-") then
+    let rp = lx_parse_unary(toks, pos + 1)
+    return [sym_neg(rp[0]), rp[1]]
+  end
+  return lx_parse_atom(toks, pos)
+end
+
+make a function called lx_parse_exponent_atom takes toks, pos returns pair
+  let t = lx_peek(toks, pos)
+  if t[0] == "LB" then
+    return lx_parse_group(toks, pos)
+  end
+  return lx_parse_unary(toks, pos)
+end
+
+make a function called lx_parse_power takes toks, pos returns pair
+  let lp = lx_parse_unary(toks, pos)
+  let node = lp[0]
+  let pos = lp[1]
+  let t = lx_peek(toks, pos)
+  if (t[0] == "OP") and (t[1] == "^") then
+    let ep = lx_parse_exponent_atom(toks, pos + 1)
+    let n = lx_expr_to_int(ep[0])
+    return [sym_pow(node, n), ep[1]]
+  end
+  return [node, pos]
+end
+
+make a function called lx_parse_term takes toks, pos returns pair
+  let lp = lx_parse_power(toks, pos)
+  let node = lp[0]
+  let pos = lp[1]
+  let going = true
+  while going do
+    let t = lx_peek(toks, pos)
+    if (t[0] == "OP") and (t[1] == "*") then
+      let rp = lx_parse_power(toks, pos + 1)
+      let node = sym_mul(node, rp[0])
+      let pos = rp[1]
+    else
+      if (t[0] == "OP") and (t[1] == "/") then
+        let rp = lx_parse_power(toks, pos + 1)
+        let node = sym_div(node, rp[0])
+        let pos = rp[1]
+      else
+        if (t[0] == "CMD") and ((t[1] == "cdot") or (t[1] == "times")) then
+          let rp = lx_parse_power(toks, pos + 1)
+          let node = sym_mul(node, rp[0])
+          let pos = rp[1]
+        else
+          if lx_can_start_factor(t) then
+            let rp = lx_parse_power(toks, pos)
+            let node = sym_mul(node, rp[0])
+            let pos = rp[1]
+          else
+            let going = false
+          end
+        end
+      end
+    end
+  end
+  return [node, pos]
+end
+
+make a function called lx_parse_expr takes toks, pos returns pair
+  let lp = lx_parse_term(toks, pos)
+  let node = lp[0]
+  let pos = lp[1]
+  let going = true
+  while going do
+    let t = lx_peek(toks, pos)
+    if (t[0] == "OP") and (t[1] == "+") then
+      let rp = lx_parse_term(toks, pos + 1)
+      let node = sym_add(node, rp[0])
+      let pos = rp[1]
+    else
+      if (t[0] == "OP") and (t[1] == "-") then
+        let rp = lx_parse_term(toks, pos + 1)
+        let node = sym_sub(node, rp[0])
+        let pos = rp[1]
+      else
+        let going = false
+      end
+    end
+  end
+  return [node, pos]
+end
+
+# Public entry point. An equation ("2x+4=0", "x^2 = 2") returns LHS - RHS,
+# already zeroed and ready for sym_solve_for/sym_solve_closed_form; a bare
+# expression ("\sqrt{2}") returns itself, ready for sym_eval_interval.
+make a function called sym_parse_latex takes s returns expr
+  let toks = lx_tokenize(s)
+  let rp = lx_parse_expr(toks, 0)
+  let t = lx_peek(toks, rp[1])
+  if t[0] == "EQ" then
+    let rp2 = lx_parse_expr(toks, rp[1] + 1)
+    return sym_sub(rp[0], rp2[0])
+  end
+  return rp[0]
+end

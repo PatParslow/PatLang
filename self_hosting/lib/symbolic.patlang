@@ -1,0 +1,980 @@
+# Symbolic expression + interval arithmetic library.
+#
+# Implements the design specified (pre-implementation) in:
+#   spec_library/language/symbolic_expr_and_interval.feature
+#   spec_library/language/symbolic_derivative_and_monotonicity.feature
+#   spec_library/language/symbolic_closed_form_solve.feature
+#   spec_library/language/symbolic_periodic_solve.feature
+#   spec_library/language/symbolic_materialize_bounded_range.feature
+#
+# Expression nodes are tagged lists, the same idiom the compiler's own
+# AST/IR uses throughout (["Add", a, b], dispatched via tag[0] checks) --
+# no new language feature needed. Interval endpoints are Numeric Tower
+# values and stay exact (Int/Rational) through every purely algebraic
+# operation (+, -, *, /, integer Pow); only a transcendental node (Sqrt of
+# a non-perfect-square, Sin, Cos, Tan) needs a genuinely-enclosing bound
+# built from a host float call.
+#
+# Built entirely on existing Host:: primitives (sqrt/pow/floor/ceil/abs/
+# numeric_kind/sin/cos/tan/asin/acos/atan/float_to_bits) -- no new host
+# functions, per this project's "build in PatLang, not Rust" convention.
+
+# =============================================================================
+# Section A -- exact bit-level float enclosure (next representable double up
+# / down, reconstructed as an exact Numeric Tower Rational rather than a raw
+# float, via IEEE-754 bit decomposition). Precondition on every function in
+# this section: input is a finite, POSITIVE, NORMAL double -- true for every
+# value this module ever feeds through it (sqrt results, pi, nonzero trig
+# outputs). Zero, subnormals, infinities are out of scope and never reach
+# these functions (guarded at the call sites in Section C, not here).
+# =============================================================================
+
+make a function called sym_bits_to_exact takes bits returns v
+  let two52 = pow(2, 52)
+  let mantissa = bits band (two52 - 1)
+  let exp_field = (bits shr 52) band 2047
+  let significand = 1 + (mantissa / two52)
+  let e = exp_field - 1023
+  if e >= 0 then
+    return significand * pow(2, e)
+  end
+  return significand / pow(2, 0 - e)
+end
+
+make a function called sym_next_up takes x returns v
+  return sym_bits_to_exact(float_to_bits(x) + 1)
+end
+
+make a function called sym_next_down takes x returns v
+  return sym_bits_to_exact(float_to_bits(x) - 1)
+end
+
+# A generous (not formally proven the way sqrt's squaring-comparison check
+# is) safety bracket for a libm transcendental result: unlike sqrt, IEEE-754
+# does not mandate correctly-rounded sin/cos/tan/acos, so 2 ULPs each side
+# is engineering margin against typical libm error, not a certified bound.
+make a function called sym_enclose_approx takes approx returns iv
+  if approx == 0 then
+    return sym_interval(0 - (1 / pow(10, 12)), 1 / pow(10, 12))
+  end
+  # Section A's next_up/next_down assume a positive double -- bracket the
+  # magnitude and negate, rather than letting the bit trick silently drop
+  # the sign (real bug found via testing: sin family gen(-1) came back +pi
+  # instead of -pi before this guard existed).
+  if approx < 0 then
+    let pos = sym_enclose_approx(0 - approx)
+    return sym_interval_neg(pos)
+  end
+  let d1 = sym_next_down(approx)
+  let d2 = sym_next_down(d1)
+  let u1 = sym_next_up(approx)
+  let u2 = sym_next_up(u1)
+  return sym_interval(d2, u2)
+end
+
+# =============================================================================
+# Section B -- interval core. An interval is ["Interval", lo, hi]; endpoints
+# are Numeric Tower values (kept exact Int/Rational whenever the value came
+# from purely algebraic operations -- see the module header).
+# =============================================================================
+
+make a function called sym_interval takes lo, hi returns iv
+  return ["Interval", lo, hi]
+end
+
+make a function called sym_ival_lo takes iv returns v
+  return iv[1]
+end
+
+make a function called sym_ival_hi takes iv returns v
+  return iv[2]
+end
+
+make a function called sym_min2 takes a, b returns m
+  if a < b then
+    return a
+  end
+  return b
+end
+
+make a function called sym_max2 takes a, b returns m
+  if a > b then
+    return a
+  end
+  return b
+end
+
+make a function called sym_interval_add takes a, b returns iv
+  return sym_interval(sym_ival_lo(a) + sym_ival_lo(b), sym_ival_hi(a) + sym_ival_hi(b))
+end
+
+make a function called sym_interval_sub takes a, b returns iv
+  return sym_interval(sym_ival_lo(a) - sym_ival_hi(b), sym_ival_hi(a) - sym_ival_lo(b))
+end
+
+make a function called sym_interval_neg takes a returns iv
+  return sym_interval(0 - sym_ival_hi(a), 0 - sym_ival_lo(a))
+end
+
+# All four cross-products checked (not just same-position endpoints) --
+# interval-arithmetic.html's own worked example of why this matters:
+# a sign flip inside either operand can put the true min/max at any pairing.
+make a function called sym_interval_mul takes a, b returns iv
+  let al = sym_ival_lo(a)
+  let ah = sym_ival_hi(a)
+  let bl = sym_ival_lo(b)
+  let bh = sym_ival_hi(b)
+  let p1 = al * bl
+  let p2 = al * bh
+  let p3 = ah * bl
+  let p4 = ah * bh
+  let lo = sym_min2(sym_min2(p1, p2), sym_min2(p3, p4))
+  let hi = sym_max2(sym_max2(p1, p2), sym_max2(p3, p4))
+  return sym_interval(lo, hi)
+end
+
+# Precondition: b does not straddle zero (b.lo > 0 or b.hi < 0) -- every
+# caller in this module constructs such a b (e.g. 2a in the quadratic
+# formula, b*b denominators), so this is not validated defensively.
+make a function called sym_interval_div takes a, b returns iv
+  let recip = sym_interval(1 / sym_ival_hi(b), 1 / sym_ival_lo(b))
+  return sym_interval_mul(a, recip)
+end
+
+# Non-negative integer exponent only (every caller passes a small Const
+# exponent -- Pow(x, 2) for a quadratic term -- so this is not generalised
+# to negative/fractional exponents, which Div already covers where needed).
+make a function called sym_interval_pow takes a, n returns iv
+  if n == 0 then
+    return sym_interval(1, 1)
+  end
+  let result = a
+  let i = 1
+  while i < n do
+    let result = sym_interval_mul(result, a)
+    let i = i + 1
+  end
+  return result
+end
+
+# =============================================================================
+# Section C -- expression construction and interval evaluation. Nodes are
+# tagged lists: ["Const", v], ["Var", name], ["Add", a, b], ["Sub", a, b],
+# ["Mul", a, b], ["Div", a, b], ["Neg", a], ["Pow", a, ["Const", n]],
+# ["Sqrt", a], ["Sin", a], ["Cos", a], ["Tan", a], ["Pi"].
+# =============================================================================
+
+make a function called sym_const takes v returns e
+  return ["Const", v]
+end
+
+make a function called sym_var takes name returns e
+  return ["Var", name]
+end
+
+make a function called sym_add takes a, b returns e
+  return ["Add", a, b]
+end
+
+make a function called sym_sub takes a, b returns e
+  return ["Sub", a, b]
+end
+
+make a function called sym_neg takes a returns e
+  return ["Neg", a]
+end
+
+make a function called sym_mul takes a, b returns e
+  return ["Mul", a, b]
+end
+
+make a function called sym_div takes a, b returns e
+  return ["Div", a, b]
+end
+
+make a function called sym_pow takes a, n returns e
+  return ["Pow", a, ["Const", n]]
+end
+
+make a function called sym_sqrt takes a returns e
+  return ["Sqrt", a]
+end
+
+make a function called sym_sin takes a returns e
+  return ["Sin", a]
+end
+
+make a function called sym_cos takes a returns e
+  return ["Cos", a]
+end
+
+make a function called sym_tan takes a returns e
+  return ["Tan", a]
+end
+
+make a function called sym_pi takes returns e
+  return ["Pi"]
+end
+
+make a function called sym_lookup takes bindings, name returns iv
+  let i = 0
+  while i < bindings.length do
+    if bindings[i][0] == name then
+      return bindings[i][1]
+    end
+    let i = i + 1
+  end
+  print("sym_lookup: unbound variable " + name)
+  return sym_interval(0, 0)
+end
+
+# Exact sqrt of a single point c (c >= 0). Zero is handled without the bit
+# trick (0's IEEE-754 pattern is not a positive-normal double, outside
+# Section A's precondition). Non-perfect-square c gets a bracket whose
+# direction is PROVEN, not assumed: r*r compared back against the exact c
+# tells us which side of r the true root falls on (this is the check
+# verified by hand against Python's exact-Fraction arithmetic for sqrt(2)).
+make a function called sym_sqrt_point takes c returns iv
+  if c == 0 then
+    return sym_interval(0, 0)
+  end
+  let r = sqrt(c)
+  let r2 = r * r
+  if r2 == c then
+    return sym_interval(r, r)
+  end
+  if r2 > c then
+    return sym_interval(sym_next_down(r), r)
+  end
+  return sym_interval(r, sym_next_up(r))
+end
+
+make a function called sym_eval_sqrt takes iv returns result
+  let lo_b = sym_sqrt_point(sym_ival_lo(iv))
+  let hi_b = sym_sqrt_point(sym_ival_hi(iv))
+  return sym_interval(sym_ival_lo(lo_b), sym_ival_hi(hi_b))
+end
+
+# pi bracketed both directions (2 ULPs total): acos(-1) is not certified
+# correctly-rounded, so unlike sqrt there is no cheap proof of which side of
+# the approximation the true value falls -- bracket both ways instead of
+# guessing.
+make a function called sym_pi_interval takes returns iv
+  let approx = acos(0 - 1)
+  return sym_interval(sym_next_down(approx), sym_next_up(approx))
+end
+
+make a function called sym_trig_point takes kind, x returns iv
+  if x == 0 then
+    if kind == "sin" then
+      return sym_interval(0, 0)
+    end
+    if kind == "cos" then
+      return sym_interval(1, 1)
+    end
+    return sym_interval(0, 0)
+  end
+  let approx = 0
+  if kind == "sin" then
+    let approx = sin(x)
+  else
+    if kind == "cos" then
+      let approx = cos(x)
+    else
+      let approx = tan(x)
+    end
+  end
+  return sym_enclose_approx(approx)
+end
+
+# Does an integer k exist with lo <= base + period*k <= hi? Existence is
+# checked with a small outward safety margin on plain floats: an occasional
+# false positive only widens the returned interval (still safe); a false
+# negative would silently break the containment guarantee, which the margin
+# guards against.
+make a function called sym_critical_in_range takes base, period, lo, hi returns yes
+  let eps = 1 / pow(10, 7)
+  let k_lo = (lo - eps - base) / period
+  let k_hi = (hi + eps - base) / period
+  let k = ceil(k_lo)
+  if k <= k_hi then
+    return true
+  end
+  return false
+end
+
+make a function called sym_eval_trig takes kind, iv returns result
+  let lo = sym_ival_lo(iv)
+  let hi = sym_ival_hi(iv)
+  if lo == hi then
+    return sym_trig_point(kind, lo)
+  end
+  let a = sym_trig_point(kind, lo)
+  let b = sym_trig_point(kind, hi)
+  let cur_lo = sym_min2(sym_ival_lo(a), sym_ival_lo(b))
+  let cur_hi = sym_max2(sym_ival_hi(a), sym_ival_hi(b))
+  let pi_iv = sym_pi_interval()
+  let pi_approx = (sym_ival_lo(pi_iv) + sym_ival_hi(pi_iv)) / 2
+  if kind == "sin" then
+    if sym_critical_in_range(pi_approx / 2, 2 * pi_approx, lo, hi) then
+      let cur_hi = 1
+    end
+    if sym_critical_in_range(0 - (pi_approx / 2), 2 * pi_approx, lo, hi) then
+      let cur_lo = 0 - 1
+    end
+  end
+  if kind == "cos" then
+    if sym_critical_in_range(0, 2 * pi_approx, lo, hi) then
+      let cur_hi = 1
+    end
+    if sym_critical_in_range(pi_approx, 2 * pi_approx, lo, hi) then
+      let cur_lo = 0 - 1
+    end
+  end
+  return sym_interval(cur_lo, cur_hi)
+end
+
+make a function called sym_eval_interval takes expr, bindings returns iv
+  let tag = expr[0]
+  if tag == "Const" then
+    return sym_interval(expr[1], expr[1])
+  end
+  if tag == "Var" then
+    return sym_lookup(bindings, expr[1])
+  end
+  if tag == "Add" then
+    return sym_interval_add(sym_eval_interval(expr[1], bindings), sym_eval_interval(expr[2], bindings))
+  end
+  if tag == "Sub" then
+    return sym_interval_sub(sym_eval_interval(expr[1], bindings), sym_eval_interval(expr[2], bindings))
+  end
+  if tag == "Neg" then
+    return sym_interval_neg(sym_eval_interval(expr[1], bindings))
+  end
+  if tag == "Mul" then
+    return sym_interval_mul(sym_eval_interval(expr[1], bindings), sym_eval_interval(expr[2], bindings))
+  end
+  if tag == "Div" then
+    return sym_interval_div(sym_eval_interval(expr[1], bindings), sym_eval_interval(expr[2], bindings))
+  end
+  if tag == "Pow" then
+    return sym_interval_pow(sym_eval_interval(expr[1], bindings), expr[2][1])
+  end
+  if tag == "Sqrt" then
+    return sym_eval_sqrt(sym_eval_interval(expr[1], bindings))
+  end
+  if tag == "Sin" then
+    return sym_eval_trig("sin", sym_eval_interval(expr[1], bindings))
+  end
+  if tag == "Cos" then
+    return sym_eval_trig("cos", sym_eval_interval(expr[1], bindings))
+  end
+  if tag == "Tan" then
+    return sym_eval_trig("tan", sym_eval_interval(expr[1], bindings))
+  end
+  if tag == "Pi" then
+    return sym_pi_interval()
+  end
+  print("sym_eval_interval: unknown tag " + tag)
+  return sym_interval(0, 0)
+end
+
+# =============================================================================
+# Section D -- structural symbolic differentiation. Produces an expression
+# tree (not simplified -- callers that need to recognise a derivative as a
+# constant do so via sym_try_const in Section F, rather than this function
+# doing algebraic simplification itself).
+# =============================================================================
+
+make a function called sym_derivative takes expr, var returns d
+  let tag = expr[0]
+  if tag == "Const" then
+    return sym_const(0)
+  end
+  if tag == "Var" then
+    if expr[1] == var then
+      return sym_const(1)
+    end
+    return sym_const(0)
+  end
+  if tag == "Add" then
+    return sym_add(sym_derivative(expr[1], var), sym_derivative(expr[2], var))
+  end
+  if tag == "Sub" then
+    return sym_sub(sym_derivative(expr[1], var), sym_derivative(expr[2], var))
+  end
+  if tag == "Neg" then
+    return sym_neg(sym_derivative(expr[1], var))
+  end
+  if tag == "Mul" then
+    let a = expr[1]
+    let b = expr[2]
+    return sym_add(sym_mul(sym_derivative(a, var), b), sym_mul(a, sym_derivative(b, var)))
+  end
+  if tag == "Div" then
+    let a = expr[1]
+    let b = expr[2]
+    let num = sym_sub(sym_mul(sym_derivative(a, var), b), sym_mul(a, sym_derivative(b, var)))
+    return sym_div(num, sym_mul(b, b))
+  end
+  if tag == "Pow" then
+    let a = expr[1]
+    let n = expr[2][1]
+    let coeff = sym_mul(sym_const(n), ["Pow", a, sym_const(n - 1)])
+    return sym_mul(coeff, sym_derivative(a, var))
+  end
+  if tag == "Sqrt" then
+    return sym_div(sym_derivative(expr[1], var), sym_mul(sym_const(2), expr))
+  end
+  if tag == "Sin" then
+    return sym_mul(sym_cos(expr[1]), sym_derivative(expr[1], var))
+  end
+  if tag == "Cos" then
+    return sym_mul(sym_neg(sym_sin(expr[1])), sym_derivative(expr[1], var))
+  end
+  if tag == "Tan" then
+    let sec2 = sym_div(sym_const(1), sym_mul(sym_cos(expr[1]), sym_cos(expr[1])))
+    return sym_mul(sec2, sym_derivative(expr[1], var))
+  end
+  if tag == "Pi" then
+    return sym_const(0)
+  end
+  print("sym_derivative: unknown tag " + tag)
+  return sym_const(0)
+end
+
+# =============================================================================
+# Section E -- monotonicity via the derivative's own interval sign.
+# Deliberately SUFFICIENT, not necessary: false negatives (reporting "not
+# proven monotonic" for a function that genuinely is) are safe and expected
+# for a coarse interval; a false positive must never happen.
+# =============================================================================
+
+make a function called sym_is_monotonic takes expr, var, iv returns yes
+  let d = sym_derivative(expr, var)
+  let di = sym_eval_interval(d, [[var, iv]])
+  if sym_ival_lo(di) > 0 then
+    return true
+  end
+  if sym_ival_hi(di) < 0 then
+    return true
+  end
+  return false
+end
+
+# =============================================================================
+# Section F -- closed-form solving for recognized polynomial forms. Degree is
+# recognized by re-differentiating (reusing sym_derivative rather than a
+# separate syntactic pattern matcher), so a form that only SIMPLIFIES to a
+# quadratic (e.g. 3*(x-1)^2 - 3*x^2 + 2*x) is still recognized correctly.
+# =============================================================================
+
+make a function called sym_substitute takes expr, var, value_expr returns out
+  let tag = expr[0]
+  if tag == "Const" then
+    return expr
+  end
+  if tag == "Pi" then
+    return expr
+  end
+  if tag == "Var" then
+    if expr[1] == var then
+      return value_expr
+    end
+    return expr
+  end
+  if tag == "Pow" then
+    return ["Pow", sym_substitute(expr[1], var, value_expr), expr[2]]
+  end
+  if tag == "Neg" then
+    return ["Neg", sym_substitute(expr[1], var, value_expr)]
+  end
+  if tag == "Sqrt" then
+    return ["Sqrt", sym_substitute(expr[1], var, value_expr)]
+  end
+  if tag == "Sin" then
+    return ["Sin", sym_substitute(expr[1], var, value_expr)]
+  end
+  if tag == "Cos" then
+    return ["Cos", sym_substitute(expr[1], var, value_expr)]
+  end
+  if tag == "Tan" then
+    return ["Tan", sym_substitute(expr[1], var, value_expr)]
+  end
+  return [tag, sym_substitute(expr[1], var, value_expr), sym_substitute(expr[2], var, value_expr)]
+end
+
+# ["Some", v] if expr evaluates to the SAME zero-width value at three
+# different bindings of var (0, 1, -1) -- ["None"] otherwise. Sampling
+# rather than a structural "does var appear at all" check deliberately,
+# because a structural check is fooled by a term like 0*x: the Var(x) node
+# is still there in the tree even though the term is algebraically zero,
+# and interval multiplication already resolves "0 times anything is
+# exactly 0" as a numeric fact without needing tree simplification first.
+# Three real samples is pragmatic, not a formal proof of constancy for an
+# arbitrary expression -- sound for the polynomial/trig forms this module
+# actually builds and differentiates, not claimed beyond that.
+make a function called sym_try_const takes expr, var returns opt
+  let v0 = sym_eval_interval(expr, [[var, sym_interval(0, 0)]])
+  let v1 = sym_eval_interval(expr, [[var, sym_interval(1, 1)]])
+  let v2 = sym_eval_interval(expr, [[var, sym_interval(0 - 1, 0 - 1)]])
+  if sym_ival_lo(v0) != sym_ival_hi(v0) then
+    return ["None"]
+  end
+  if sym_ival_lo(v1) != sym_ival_hi(v1) then
+    return ["None"]
+  end
+  if sym_ival_lo(v2) != sym_ival_hi(v2) then
+    return ["None"]
+  end
+  if sym_ival_lo(v0) != sym_ival_lo(v1) then
+    return ["None"]
+  end
+  if sym_ival_lo(v0) != sym_ival_lo(v2) then
+    return ["None"]
+  end
+  return ["Some", sym_ival_lo(v0)]
+end
+
+# ["Degree1", b, c] for b*x+c, ["Degree2", a, b, c] for a*x^2+b*x+c,
+# ["Unknown"] otherwise.
+make a function called sym_degree_and_coeffs takes expr, var returns dc
+  let d1 = sym_derivative(expr, var)
+  let c1 = sym_try_const(d1, var)
+  if c1[0] == "Some" then
+    let b = c1[1]
+    let c0 = sym_substitute(expr, var, sym_const(0))
+    let cc = sym_try_const(c0, var)
+    return ["Degree1", b, cc[1]]
+  end
+  let d2 = sym_derivative(d1, var)
+  let c2 = sym_try_const(d2, var)
+  if c2[0] == "Some" then
+    let a = c2[1] / 2
+    let d1_at_0 = sym_substitute(d1, var, sym_const(0))
+    let bres = sym_try_const(d1_at_0, var)
+    let c0 = sym_substitute(expr, var, sym_const(0))
+    let cres = sym_try_const(c0, var)
+    return ["Degree2", a, bres[1], cres[1]]
+  end
+  return ["Unknown"]
+end
+
+make a function called sym_solve_linear takes b, c returns sol
+  let root = (0 - c) / b
+  return ["Solutions", [["Const", root]]]
+end
+
+make a function called sym_solve_quadratic takes a, b, c returns sol
+  let disc = (b * b) - (4 * a * c)
+  if disc == 0 then
+    let root = (0 - b) / (2 * a)
+    return ["Solutions", [["Const", root]]]
+  end
+  if disc > 0 then
+    let r1 = sym_div(sym_add(sym_neg(sym_const(b)), sym_sqrt(sym_const(disc))), sym_mul(sym_const(2), sym_const(a)))
+    let r2 = sym_div(sym_sub(sym_neg(sym_const(b)), sym_sqrt(sym_const(disc))), sym_mul(sym_const(2), sym_const(a)))
+    return ["Solutions", [r1, r2]]
+  end
+  # Complex division is not implemented at this stage of the Tower (see
+  # rust-runtime/src/ir/ops.rs div()) -- multiply by the real reciprocal of
+  # 2a instead, which complex_mul does support for any real/complex mix.
+  let sq = sqrt(disc)
+  let recip = 1 / (2 * a)
+  let r1 = (0 - b + sq) * recip
+  let r2 = (0 - b - sq) * recip
+  return ["Solutions", [r1, r2]]
+end
+
+make a function called sym_solve_closed_form takes expr, var returns sol
+  let dc = sym_degree_and_coeffs(expr, var)
+  if dc[0] == "Degree1" then
+    return sym_solve_linear(dc[1], dc[2])
+  end
+  if dc[0] == "Degree2" then
+    return sym_solve_quadratic(dc[1], dc[2], dc[3])
+  end
+  return ["None"]
+end
+
+# =============================================================================
+# Section G -- closed-form solving for periodic (trig) equations. Returns a
+# Family: ["Family", ["TrigFamily", kind, p1, k, m], "n", ["Integers"]] --
+# a SET-PRODUCTION rule (evaluate at any integer n), not an enumerated list,
+# because these equations genuinely have infinitely many solutions with no
+# finite list able to represent them all.
+#
+# sin(m*x+k) = c always collapses to the single combined-branch form
+# x = ((-1)^n * asin(c) + n*pi - k) / m, valid for every c, so it is always
+# recognized. cos(m*x+k) = c is genuinely two branches (x = (2*pi*n +- acos(c)
+# - k)/m) in general; this data model holds one generator per Family, so
+# only the degenerate c = +-1 case (where acos(c) is 0 or pi and the two
+# branches coincide into one) is recognized -- the general two-branch case
+# returns ["None"], a real, documented scope limit, not a silent wrong
+# answer. tan(m*x+k) = c is always a single branch (period pi) and is always
+# recognized.
+# =============================================================================
+
+make a function called sym_solve_trig_closed_form takes expr, var returns sol
+  let tag = expr[0]
+  let c = 0
+  let inner = expr
+  if tag == "Sub" then
+    let cres = sym_try_const(expr[2], var)
+    if cres[0] == "Some" then
+      let c = cres[1]
+      let inner = expr[1]
+    else
+      return ["None"]
+    end
+  end
+  let inner_tag = inner[0]
+  if (inner_tag != "Sin") and (inner_tag != "Cos") and (inner_tag != "Tan") then
+    return ["None"]
+  end
+  let mk = sym_degree_and_coeffs(inner[1], var)
+  if mk[0] != "Degree1" then
+    return ["None"]
+  end
+  let m = mk[1]
+  let k = mk[2]
+  if inner_tag == "Sin" then
+    return ["Family", ["TrigFamily", "sin", c, k, m], "n", ["Integers"]]
+  end
+  if inner_tag == "Tan" then
+    return ["Family", ["TrigFamily", "tan", c, k, m], "n", ["Integers"]]
+  end
+  let a_angle = acos(c)
+  let pi_val = acos(0 - 1)
+  if (a_angle == 0) or (a_angle == pi_val) then
+    return ["Family", ["TrigFamily", "cos", a_angle, k, m], "n", ["Integers"]]
+  end
+  return ["None"]
+end
+
+make a function called sym_eval_family_at takes family, n returns iv
+  let spec = family[1]
+  let pi_val = acos(0 - 1)
+  let kind = spec[1]
+  let p1 = spec[2]
+  let k = spec[3]
+  let m = spec[4]
+  if kind == "sin" then
+    let par = (abs(n)) % 2
+    let sign = 1
+    if par == 1 then
+      let sign = 0 - 1
+    end
+    let theta = (sign * asin(p1)) + (n * pi_val)
+    return sym_enclose_approx((theta - k) / m)
+  end
+  if kind == "tan" then
+    let theta = atan(p1) + (n * pi_val)
+    return sym_enclose_approx((theta - k) / m)
+  end
+  # cos: p1 already holds the collapsed angle A (0 or pi), period 2*pi
+  let theta = p1 + (n * (pi_val * 2))
+  return sym_enclose_approx((theta - k) / m)
+end
+
+# =============================================================================
+# Section H -- numeric fallback for equations with no recognized closed
+# form: split the search range wherever monotonicity can't be proven, bisect
+# each surviving sign-changing monotonic piece to a one-ULP bracket (the
+# same algorithm hand-verified for sqrt(2) on interval-arithmetic.html,
+# generalized from a fixed f(x)=x^2-2 to an arbitrary expression).
+#
+# sym_eval_float is a plain-float structural evaluator, deliberately
+# separate from the exact/enclosing sym_eval_interval -- bisection's inner
+# loop only ever needs an ordinary float sign check at a point, the same
+# role f(x) played in the original hand-verified Python script.
+# =============================================================================
+
+make a function called sym_eval_float takes expr, var, x returns v
+  let tag = expr[0]
+  if tag == "Const" then
+    return expr[1]
+  end
+  if tag == "Var" then
+    return x
+  end
+  if tag == "Add" then
+    return sym_eval_float(expr[1], var, x) + sym_eval_float(expr[2], var, x)
+  end
+  if tag == "Sub" then
+    return sym_eval_float(expr[1], var, x) - sym_eval_float(expr[2], var, x)
+  end
+  if tag == "Neg" then
+    return 0 - sym_eval_float(expr[1], var, x)
+  end
+  if tag == "Mul" then
+    return sym_eval_float(expr[1], var, x) * sym_eval_float(expr[2], var, x)
+  end
+  if tag == "Div" then
+    return sym_eval_float(expr[1], var, x) / sym_eval_float(expr[2], var, x)
+  end
+  if tag == "Pow" then
+    return pow(sym_eval_float(expr[1], var, x), expr[2][1])
+  end
+  if tag == "Sqrt" then
+    return sqrt(sym_eval_float(expr[1], var, x))
+  end
+  if tag == "Sin" then
+    return sin(sym_eval_float(expr[1], var, x))
+  end
+  if tag == "Cos" then
+    return cos(sym_eval_float(expr[1], var, x))
+  end
+  if tag == "Tan" then
+    return tan(sym_eval_float(expr[1], var, x))
+  end
+  if tag == "Pi" then
+    return acos(0 - 1)
+  end
+  print("sym_eval_float: unknown tag " + tag)
+  return 0
+end
+
+# Precondition: sign(f(lo)) != sign(f(hi)), both nonzero -- callers only
+# invoke this once a sign change has been confirmed. Same halving-until-the-
+# midpoint-collapses-onto-an-endpoint termination rule verified by hand for
+# sqrt(2) (interval_bisect_sqrt2.py), generalized to any expression.
+make a function called sym_bisect_root takes expr, var, lo, hi returns iv
+  let a = lo
+  let b = hi
+  let flo = sym_eval_float(expr, var, a)
+  let going = true
+  while going do
+    let mid = (a + b) / 2
+    if (mid == a) or (mid == b) then
+      let going = false
+    else
+      let fm = sym_eval_float(expr, var, mid)
+      if fm == 0 then
+        let a = mid
+        let b = mid
+        let going = false
+      else
+        if (fm < 0) == (flo < 0) then
+          let a = mid
+        else
+          let b = mid
+        end
+      end
+    end
+  end
+  return sym_interval(a, b)
+end
+
+# Splits [lo,hi] at its midpoint wherever a sign change is present but
+# sym_is_monotonic cannot prove the piece has at most one root, bisecting
+# each piece it CAN either prove monotonic or has been forced to accept at
+# the depth cap (40 halvings -- a safety bound that stops the recursion,
+# not a claim about how many splits are actually needed; the required test
+# case resolves in a handful). A known, documented scope limit: a piece
+# with matching-sign endpoints is treated as rootless even when it is not
+# monotonic (an even number of roots could hide inside without a sign
+# change at the ends) -- not exercised by any current scenario.
+make a function called sym_find_roots_in_range takes expr, var, lo, hi, depth, acc returns acc2
+  let flo = sym_eval_float(expr, var, lo)
+  let fhi = sym_eval_float(expr, var, hi)
+  if (flo < 0) != (fhi < 0) then
+    if sym_is_monotonic(expr, var, sym_interval(lo, hi)) then
+      return list_push(acc, sym_bisect_root(expr, var, lo, hi))
+    end
+    if depth >= 40 then
+      return list_push(acc, sym_bisect_root(expr, var, lo, hi))
+    end
+    let mid = (lo + hi) / 2
+    let acc = sym_find_roots_in_range(expr, var, lo, mid, depth + 1, acc)
+    let acc = sym_find_roots_in_range(expr, var, mid, hi, depth + 1, acc)
+    return acc
+  end
+  return acc
+end
+
+make a function called sym_solve_numeric_bounded takes expr, var, range returns sol
+  # Force Float, not exact Int/Rational: a caller passing sym_interval(-10,
+  # 10) hands over exact Ints, and exact-Rational division has unlimited
+  # precision -- (a+b)/2 would keep halving forever rather than collapsing
+  # onto adjacent representable doubles the way the verified sqrt(2)
+  # bisection does. Real bug found via testing: without this coercion the
+  # loop ran to a denominator near 2^1074 instead of stopping after ~52-60
+  # steps.
+  let lo = sym_ival_lo(range) * 1.0
+  let hi = sym_ival_hi(range) * 1.0
+  let roots = sym_find_roots_in_range(expr, var, lo, hi, 0, [])
+  return ["Solutions", roots]
+end
+
+# =============================================================================
+# Section I -- the public sym_solve_for entry point (closed form first,
+# trig family second, numeric fallback last -- and only the fallback ever
+# requires a range), and sym_materialize for reading concrete values out of
+# either a finite Solutions set or an unbounded Family within a range.
+# =============================================================================
+
+make a function called sym_no_range takes returns r
+  return ["NoRange"]
+end
+
+make a function called sym_solve_for takes expr, var, range returns sol
+  let poly = sym_solve_closed_form(expr, var)
+  if poly[0] == "Solutions" then
+    return poly
+  end
+  let trig = sym_solve_trig_closed_form(expr, var)
+  if trig[0] == "Family" then
+    return trig
+  end
+  if range[0] == "NoRange" then
+    return ["Error", "no closed form recognized and no bounded range supplied"]
+  end
+  return sym_solve_numeric_bounded(expr, var, range)
+end
+
+make a function called sym_materialize_solutions takes items, range returns out
+  let out = []
+  let i = 0
+  while i < items.length do
+    let elem = items[i]
+    if numeric_kind(elem) == "complex" then
+      let i = i + 1
+    else
+      let iv = elem
+      if elem[0] != "Interval" then
+        let iv = sym_eval_interval(elem, [])
+      end
+      if (sym_ival_lo(iv) >= sym_ival_lo(range)) and (sym_ival_hi(iv) <= sym_ival_hi(range)) then
+        let out = list_push(out, iv)
+      end
+      let i = i + 1
+    end
+  end
+  return out
+end
+
+# Walks n outward from 0 in both directions, relying on the combined-form
+# generators (Section G) being monotonic in n when stepped sequentially --
+# true for all three supported kinds -- to know when a direction has left
+# the range and can stop, rather than attempting to enumerate all of Z.
+make a function called sym_materialize_family takes family, range returns out
+  let lo = sym_ival_lo(range)
+  let hi = sym_ival_hi(range)
+  let out = []
+  let n = 0
+  let going = true
+  let safety = 0
+  while going do
+    let v = sym_eval_family_at(family, n)
+    if sym_ival_lo(v) > hi then
+      let going = false
+    else
+      if (sym_ival_lo(v) >= lo) and (sym_ival_hi(v) <= hi) then
+        let out = list_push(out, v)
+      end
+      let n = n + 1
+    end
+    let safety = safety + 1
+    if safety > 100000 then
+      let going = false
+    end
+  end
+  let n = 0 - 1
+  let going = true
+  let safety = 0
+  while going do
+    let v = sym_eval_family_at(family, n)
+    if sym_ival_hi(v) < lo then
+      let going = false
+    else
+      if (sym_ival_lo(v) >= lo) and (sym_ival_hi(v) <= hi) then
+        let out = list_push(out, v)
+      end
+      let n = n - 1
+    end
+    let safety = safety + 1
+    if safety > 100000 then
+      let going = false
+    end
+  end
+  return out
+end
+
+# Minimal infix pretty-printer -- always fully parenthesizes binary ops
+# rather than tracking precedence, so it's always unambiguous even though
+# not minimally-parenthesized. Presentation only, not parsed back.
+make a function called sym_to_string takes expr returns s
+  let tag = expr[0]
+  if tag == "Const" then
+    return "" + expr[1]
+  end
+  if tag == "Var" then
+    return expr[1]
+  end
+  if tag == "Pi" then
+    return "pi"
+  end
+  if tag == "Neg" then
+    return "(-" + sym_to_string(expr[1]) + ")"
+  end
+  if tag == "Add" then
+    return "(" + sym_to_string(expr[1]) + " + " + sym_to_string(expr[2]) + ")"
+  end
+  if tag == "Sub" then
+    return "(" + sym_to_string(expr[1]) + " - " + sym_to_string(expr[2]) + ")"
+  end
+  if tag == "Mul" then
+    return "(" + sym_to_string(expr[1]) + " * " + sym_to_string(expr[2]) + ")"
+  end
+  if tag == "Div" then
+    return "(" + sym_to_string(expr[1]) + " / " + sym_to_string(expr[2]) + ")"
+  end
+  if tag == "Pow" then
+    return sym_to_string(expr[1]) + "^" + expr[2][1]
+  end
+  if tag == "Sqrt" then
+    return "sqrt(" + sym_to_string(expr[1]) + ")"
+  end
+  if tag == "Sin" then
+    return "sin(" + sym_to_string(expr[1]) + ")"
+  end
+  if tag == "Cos" then
+    return "cos(" + sym_to_string(expr[1]) + ")"
+  end
+  if tag == "Tan" then
+    return "tan(" + sym_to_string(expr[1]) + ")"
+  end
+  return "?"
+end
+
+# Formats one Solutions-list element regardless of which of the three
+# shapes it is: an exact ["Const", v], a numeric ["Interval", lo, hi]
+# bracket (from the bisection fallback or a materialized Family member), a
+# raw Complex Tower value (numeric_kind "complex"), or a general expression
+# tree still needing evaluation (a quadratic's Div/Sqrt root formula).
+make a function called sym_format_item takes item returns s
+  if numeric_kind(item) == "complex" then
+    return "x = " + item
+  end
+  if item[0] == "Const" then
+    return "x = " + item[1]
+  end
+  if item[0] == "Interval" then
+    return "x approx " + sym_ival_lo(item) + " .. " + sym_ival_hi(item)
+  end
+  let iv = sym_eval_interval(item, [])
+  return "x approx " + sym_ival_lo(iv) + " .. " + sym_ival_hi(iv)
+end
+
+make a function called sym_materialize takes solset, range returns out
+  let tag = solset[0]
+  if tag == "Solutions" then
+    return sym_materialize_solutions(solset[1], range)
+  end
+  if tag == "Family" then
+    return sym_materialize_family(solset, range)
+  end
+  print("sym_materialize: unknown solution-set tag " + tag)
+  return []
+end
