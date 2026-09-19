@@ -1329,7 +1329,11 @@ fn ground_action_instances(preconds: &[GroundFact], state: &std::collections::Ha
         if remaining.is_empty() { out.push(subst); return; }
         let (first, rest) = (&remaining[0], &remaining[1..]);
         let applied = apply_subst(&first.args, &subst);
-        for fact in state.iter().filter(|f| f.pred == first.pred) {
+        // HashSet iteration order is randomised per process; sort so that
+        // equal-cost plan steps come out in the same order on every run.
+        let mut matching: Vec<&GroundFact> = state.iter().filter(|f| f.pred == first.pred).collect();
+        matching.sort();
+        for fact in matching {
             if let Some(s2) = unify_args(&applied, &fact.args, &subst) {
                 go(rest, state, s2, out);
             }
@@ -2476,6 +2480,11 @@ fn lower_shape_expr(v: &Value, f: &mut Function, ctx: &ShapeCtx) -> Result<(), S
                 // both operands are evaluated, then combined by truthiness.
                 "and" => BinOpKind::And,
                 "or" => BinOpKind::Or,
+                "band" => BinOpKind::BitAnd,
+                "bor" => BinOpKind::BitOr,
+                "bxor" => BinOpKind::BitXor,
+                "shl" => BinOpKind::Shl,
+                "shr" => BinOpKind::Shr,
                 other => return Err(format!("compile_shape: unknown operator '{}'", other)),
             };
             f.body.push(Instr::BinOp(kind));
@@ -2487,6 +2496,7 @@ fn lower_shape_expr(v: &Value, f: &mut Function, ctx: &ShapeCtx) -> Result<(), S
             match op.as_str() {
                 "-" => f.body.push(Instr::UnOp(UnOpKind::Neg)),
                 "not" => f.body.push(Instr::UnOp(UnOpKind::Not)),
+                "bnot" => f.body.push(Instr::UnOp(UnOpKind::BitNot)),
                 other => return Err(format!("compile_shape: unknown unary operator '{}'", other)),
             }
         }
@@ -2877,6 +2887,8 @@ fn decode_ir_instr(v: &Value) -> Result<Instr, String> {
                 "<" => BinOpKind::Lt, "<=" => BinOpKind::Le,
                 ">" => BinOpKind::Gt, ">=" => BinOpKind::Ge,
                 "and" => BinOpKind::And, "or" => BinOpKind::Or,
+                "band" => BinOpKind::BitAnd, "bor" => BinOpKind::BitOr, "bxor" => BinOpKind::BitXor,
+                "shl" => BinOpKind::Shl, "shr" => BinOpKind::Shr,
                 other => return Err(format!("compile_ir: unknown bin op '{}'", other)),
             };
             Instr::BinOp(kind)
@@ -2886,6 +2898,7 @@ fn decode_ir_instr(v: &Value) -> Result<Instr, String> {
             match op.as_str() {
                 "-" => Instr::UnOp(UnOpKind::Neg),
                 "not" => Instr::UnOp(UnOpKind::Not),
+                "bnot" => Instr::UnOp(UnOpKind::BitNot),
                 other => return Err(format!("compile_ir: unknown unary op '{}'", other)),
             }
         }

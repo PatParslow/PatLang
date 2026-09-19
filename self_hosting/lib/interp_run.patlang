@@ -1,0 +1,200 @@
+# interp_run.patlang -- run PatLang source in a clean interpreter and get its
+# output back as a value: [stdout, stderr, ok].
+#
+# Two backends behind one API:
+#   "world"   in-process: compile with lexer/parser/lower, then the world_run
+#             host (every global store swapped for an empty one, print
+#             captured, caller's world restored afterwards). Works wherever
+#             host_caps() lists "world_swap" -- native pat.exe, the compiled
+#             runtime and the browser playground -- and needs no subprocess.
+#   "process" a fresh pat.exe --quiet --ir-run child via exec_capture_io.
+#             Needs "subprocess" in host_caps() and a pat.exe; honours a
+#             wall-clock timeout_ms and stdin.
+#
+# Options are a list of [key, value] pairs (all optional):
+#   backend      "auto" (default) | "world" | "process"
+#   max_steps    world only: loop-iteration/call budget; exhausted => ok=false
+#   timeout_ms   process only: wall-clock limit; expiry => ok=false
+#   stdin        process only: text fed to the child's stdin
+#   base_dir     resolve `include` lines in the source relative to this
+#                directory before running (both backends; without it an
+#                include line is left for the child to fail on)
+#   pat_path     path to pat.exe (else $PATLANG_PAT, else
+#                rust-runtime/target/release/pat.exe)
+#   vfs_in       world only: [[path, content], ...] preloaded into the child
+#   vfs_out_prefix  world only: only VFS paths under this prefix come back
+#
+# "auto" picks the world backend when it exists (a spawn costs orders of
+# magnitude more than a swap), and the process backend when the caller asks
+# for something only it can do (timeout_ms, stdin) or the world backend is
+# missing (a native x64 program).
+#
+# Not supported by the world backend: `syntax { ... }` DSL blocks (expand
+# them first), reading stdin.
+
+include "includes.patlang"
+include "lexer.patlang"
+include "parser.patlang"
+include "lower.patlang"
+
+make a function called iri_opt takes opts, key, fallback returns value
+  let i = 0
+  let n = list_len(opts)
+  while i < n do
+    let kv = opts[i]
+    if kv[0] == key then return kv[1] end
+    let i = i + 1
+  end
+  return fallback
+end
+
+make a function called iri_has_cap takes name returns found
+  let caps = host_caps()
+  let i = 0
+  while i < list_len(caps) do
+    if caps[i] == name then return true end
+    let i = i + 1
+  end
+  return false
+end
+
+# Source -> ["ok", ir] or ["err", message].
+make a function called interp_compile takes src returns result
+  let ast = parse_program(tokenize(src))
+  let e = parse_find_error(ast[1])
+  if e[0] != "" then
+    return ["err", "parse error (line " + e[1] + "): " + e[0]]
+  end
+  return ["ok", lower_program(ast)]
+end
+
+make a function called interp_pat_path takes opts returns path
+  let p = iri_opt(opts, "pat_path", "")
+  if p != "" then return p end
+  let e = "" + getenv("PATLANG_PAT")
+  if e != "" then return e end
+  return "rust-runtime/target/release/pat.exe"
+end
+
+# "world" or "process" for these options on this runtime, "" if neither can run.
+make a function called interp_backend takes opts returns name
+  let want = iri_opt(opts, "backend", "auto")
+  let has_world = iri_has_cap("world_swap")
+  let has_proc = iri_has_cap("subprocess") and file_exists(interp_pat_path(opts))
+  if want == "world" then
+    if has_world then return "world" end
+    return ""
+  end
+  if want == "process" then
+    if has_proc then return "process" end
+    return ""
+  end
+  let needs_proc = iri_opt(opts, "timeout_ms", 0) > 0 or iri_opt(opts, "stdin", "") != ""
+  if needs_proc and has_proc then return "process" end
+  if has_world then return "world" end
+  if has_proc then return "process" end
+  return ""
+end
+
+make a function called iri_failed takes message returns result
+  return ["", message, false, []]
+end
+
+# Does this pat.exe understand --quiet (drops the echo of the final value)?
+# Probed once per pat_path and cached in a var.
+make a function called iri_quiet_supported takes pat returns yes
+  let key = "__interp_run_quiet_" + pat
+  let cached = "" + get("__vars", key)
+  if cached != "" then return cached == "1" end
+  let probe = "self_hosting/build/_interp_run_probe.patlang"
+  write_file(probe, "print(\"q\")" + chr(10))
+  let r = exec_capture_io(pat, ["--quiet", "--ir-run", probe], "")
+  remove_file(probe)
+  let quiet = r[0] == "q" + chr(10)
+  if quiet then set_var(key, "1") else set_var(key, "0") end
+  return quiet
+end
+
+make a function called iri_tmp_path takes opts returns path
+  let n = to_num("0" + get("__vars", "__interp_run_seq")) + 1
+  set_var("__interp_run_seq", "" + n)
+  let dir = iri_opt(opts, "tmp_dir", "self_hosting/build")
+  return dir + "/_interp_run_" + now_ms() + "_" + n + ".patlang"
+end
+
+make a function called iri_run_process takes src, opts returns result
+  let pat = interp_pat_path(opts)
+  let tmp = iri_tmp_path(opts)
+  write_file(tmp, src)
+  let quiet = iri_quiet_supported(pat)
+  let args = ["--ir-run", tmp]
+  if quiet then let args = ["--quiet", "--ir-run", tmp] end
+  let timeout = iri_opt(opts, "timeout_ms", 0)
+  let r = exec_capture_io(pat, args, iri_opt(opts, "stdin", ""), timeout)
+  remove_file(tmp)
+  let out = r[0]
+  if quiet == false and r[2] then
+    # An unpatched pat.exe echoes the program's final value (Unit -> an empty
+    # line) after its own output.
+    if out.length > 0 then let out = substr(out, 0, out.length - 1) end
+  end
+  return [out, r[1], r[2], []]
+end
+
+# interp_run_full(src, opts) -> [stdout, stderr, ok, vfs_out]
+make a function called interp_run_full takes src, opts returns result
+  let backend = interp_backend(opts)
+  if backend == "" then
+    return iri_failed("interp_run: no backend available for these options (host_caps: " + list_len(host_caps()) + " entries)")
+  end
+  let base_dir = iri_opt(opts, "base_dir", "")
+  if base_dir != "" then let src = expand_includes(src, base_dir) end
+  if backend == "process" then
+    return iri_run_process(src, opts)
+  end
+  if iri_opt(opts, "stdin", "") != "" then
+    return iri_failed("interp_run: stdin needs the process backend")
+  end
+  let c = interp_compile(src)
+  if c[0] == "err" then return iri_failed(c[1]) end
+  return interp_run_ir(c[1], opts)
+end
+
+# interp_run(src, opts) -> [stdout, stderr, ok]
+make a function called interp_run takes src, opts returns result
+  let r = interp_run_full(src, opts)
+  return [r[0], r[1], r[2]]
+end
+
+# World backend on an already-lowered IR shape (skips compile: run the same
+# program many times, or build IR directly).
+make a function called interp_run_ir takes ir, opts returns result
+  if iri_has_cap("world_swap") == false then
+    return iri_failed("interp_run_ir: this runtime has no world_swap")
+  end
+  return world_run(ir, opts)
+end
+
+# Runs src on both backends and compares stdout, ok and the first line of
+# stderr. Returns [same, detail]; only meaningful for programs that terminate.
+make a function called interp_run_check takes src, opts returns result
+  let a = interp_run_full(src, list_push(opts, ["backend", "world"]))
+  let b = interp_run_full(src, list_push(opts, ["backend", "process"]))
+  if a[0] != b[0] then return [false, "stdout differs: world=[" + a[0] + "] process=[" + b[0] + "]"] end
+  if a[2] != b[2] then return [false, "ok differs: world=" + a[2] + " process=" + b[2]] end
+  let ea = iri_first_line(a[1])
+  let eb = iri_first_line(b[1])
+  if ea != eb then return [false, "stderr differs: world=[" + ea + "] process=[" + eb + "]"] end
+  return [true, ""]
+end
+
+make a function called iri_first_line takes s returns line
+  let h = str_intern(s)
+  let n = sc_len(h)
+  let i = 0
+  while i < n do
+    if sc_code(h, i) == 10 then return substr(s, 0, i) end
+    let i = i + 1
+  end
+  return s
+end

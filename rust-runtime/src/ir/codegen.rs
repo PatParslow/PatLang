@@ -3843,7 +3843,11 @@ fn ground_action_instances(preconds: &[GroundFact], state: &HashSet<GroundFact>)
         if remaining.is_empty() { out.push(subst); return; }
         let (first, rest) = (&remaining[0], &remaining[1..]);
         let applied = logic_apply_subst(&first.args, &subst);
-        for fact in state.iter().filter(|f| f.pred == first.pred) {
+        // HashSet iteration order is randomised per process; sort so that
+        // equal-cost plan steps come out in the same order on every run.
+        let mut matching: Vec<&GroundFact> = state.iter().filter(|f| f.pred == first.pred).collect();
+        matching.sort();
+        for fact in matching {
             if let Some(s2) = unify_args(&applied, &fact.args, &subst) {
                 go(rest, state, s2, out);
             }

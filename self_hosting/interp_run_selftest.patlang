@@ -1,0 +1,145 @@
+# Selftest for self_hosting/lib/interp_run.patlang.
+#
+# Run from the repo root:
+#   rust-runtime/target/release/pat.exe --ir-run self_hosting/interp_run_selftest.patlang
+
+include "lib/test.patlang"
+include "lib/interp_run.patlang"
+
+make a function called irt_src takes lines returns text
+  let out = ""
+  let i = 0
+  while i < list_len(lines) do
+    let out = out + lines[i] + chr(10)
+    let i = i + 1
+  end
+  return out
+end
+
+let nl = chr(10)
+
+t_init()
+
+# --- backend selection ---
+check("auto picks the in-process world backend when it exists", interp_backend([]), "world")
+check("backend:process is honoured", interp_backend([["backend", "process"]]), "process")
+check("a wall-clock timeout needs the process backend", interp_backend([["timeout_ms", 1000]]), "process")
+check("stdin needs the process backend", interp_backend([["stdin", "x"]]), "process")
+
+# --- the same answer from both backends ---
+let hello = irt_src(["print(\"hello\")", "print(2 * 21)"])
+let w = interp_run(hello, [["backend", "world"]])
+let p = interp_run(hello, [["backend", "process"]])
+check("world: stdout is exactly the prints", w[0], "hello" + nl + "42" + nl)
+check("process: stdout is exactly the prints", p[0], "hello" + nl + "42" + nl)
+check("world: ok", w[2], true)
+check("process: ok", p[2], true)
+check("world: empty stderr", w[1], "")
+check("process: empty stderr", p[1], "")
+
+let prog = irt_src([
+  "make a function called fib takes n returns r",
+  "  if n < 2 then return n end",
+  "  return fib(n - 1) + fib(n - 2)",
+  "end",
+  "let xs = []",
+  "let i = 0",
+  "while i < 10 do",
+  "  let xs = list_push(xs, fib(i))",
+  "  let i = i + 1",
+  "end",
+  "print(xs)",
+  "print(\"done\" + \" \" + 1.5)"
+])
+let chk = interp_run_check(prog, [])
+check("both backends agree on a function/list/loop program", chk[0], true)
+check("interp_run_check reports no difference", chk[1], "")
+
+# --- runtime errors: partial stdout kept, ok=false, same first stderr line ---
+let crash = irt_src(["print(\"before\")", "let x = no_such_function(1)"])
+let cw = interp_run(crash, [["backend", "world"]])
+let cp = interp_run(crash, [["backend", "process"]])
+check("world crash: ok=false", cw[2], false)
+check("process crash: ok=false", cp[2], false)
+check("world crash keeps partial stdout", cw[0], "before" + nl)
+check("process crash keeps partial stdout", cp[0], "before" + nl)
+check("world crash reports an IR runtime error", starts_with(cw[1], "IR runtime error"), true)
+let cc = interp_run_check(crash, [])
+check("both backends agree on a crash", cc[0], true)
+
+# --- bitwise operators decode on both backends (world_run's IR decoder once lacked them) ---
+let bits = irt_src(["print(12 band 10)", "print(12 bor 3)", "print(12 bxor 5)", "print(1 shl 4)", "print(256 shr 2)", "print(bnot 0)"])
+let bw = interp_run(bits, [["backend", "world"]])
+check("world: bitwise operators run", bw[0], "8" + nl + "15" + nl + "9" + nl + "16" + nl + "64" + nl + "-1" + nl)
+let bc = interp_run_check(bits, [])
+check("both backends agree on bitwise operators", bc[0], true)
+
+# --- parse errors (world backend compiles in PatLang) ---
+let bad = interp_run("print(1", [["backend", "world"]])
+check("a parse error is ok=false", bad[2], false)
+check("a parse error is named as one", starts_with(bad[1], "parse error"), true)
+check("a parse error runs nothing", bad[0], "")
+
+# --- limits ---
+let spin = irt_src(["while true do", "end"])
+let sw = interp_run(spin, [["backend", "world"], ["max_steps", 5000]])
+check("world: max_steps stops an infinite loop", sw[2], false)
+check("world: the budget error says so", contains_text(sw[1], "step budget exhausted"), true)
+let sp = interp_run(spin, [["backend", "process"], ["timeout_ms", 400]])
+check("process: timeout_ms stops an infinite loop", sp[2], false)
+check("process: the timeout is reported", contains_text(sp[1], "timeout after 400 ms"), true)
+
+# --- stdin (process only) ---
+let echo = irt_src(["let a = read_line()", "let b = read_line()", "print(b + a)"])
+let ei = interp_run(echo, [["stdin", "one" + nl + "two" + nl]])
+check("stdin reaches the child", ei[0], "twoone" + nl)
+let ew = interp_run(echo, [["backend", "world"], ["stdin", "x"]])
+check("world backend refuses stdin rather than hanging", ew[2], false)
+
+# --- includes resolved before running, on both backends ---
+let inc = irt_src(["include \"lib/pset.patlang\"", "let s = pset_add(pset_new(), \"a\")", "print(pset_size(s))"])
+let iw = interp_run(inc, [["backend", "world"], ["base_dir", "self_hosting"]])
+let ip = interp_run(inc, [["backend", "process"], ["base_dir", "self_hosting"]])
+check("world: include resolved via base_dir", iw[0], "1" + nl)
+check("process: include resolved via base_dir", ip[0], "1" + nl)
+
+# --- world-only: VFS in/out ---
+let vsrc = irt_src(["vfs_write(\"/out/r\", vfs_read(\"/in/x\") + \"!\")"])
+let vr = interp_run_full(vsrc, [["backend", "world"], ["vfs_in", [["/in/x", "hey"]]], ["vfs_out_prefix", "/out/"]])
+check("vfs_out carries the child's write", vr[3][0][1], "hey!")
+
+# --- the caller's world is untouched ---
+set_var("irt_k", "mine")
+fact("irt_p", "a", "b")
+let iso = irt_src(["print(get(\"__vars\", \"irt_k\"))", "set_var(\"irt_k\", \"theirs\")", "fact(\"irt_p\", \"c\", \"d\")"])
+let ir1 = interp_run(iso, [["backend", "world"]])
+check("child does not see the caller's var", ir1[0], nl)
+check("caller var unchanged after the run", get("__vars", "irt_k"), "mine")
+check("caller facts unchanged after the run", query("irt_p", "c", "_"), 0)
+
+# --- many runs in a row ---
+let n = 0
+let last = ""
+while n < 200 do
+  let r = interp_run(irt_src(["let v = 1 + 1", "print(v)"]), [["backend", "world"]])
+  let last = r[0]
+  let n = n + 1
+end
+check("200 sequential world runs all work", last, "2" + nl)
+
+# --- planner output is deterministic (HashSet iteration order used to leak into plan order) ---
+let goap_src = read_file("self_hosting/examples/goap_parameterized_demo.patlang")
+let goap_first = interp_run(goap_src, [["backend", "world"]])[0]
+let goap_diffs = 0
+let gi = 0
+while gi < 15 do
+  if interp_run(goap_src, [["backend", "world"]])[0] != goap_first then let goap_diffs = goap_diffs + 1 end
+  let gi = gi + 1
+end
+check("a parameterized GOAP plan is identical across 15 runs", goap_diffs, 0)
+
+# --- no backend at all is reported, not fatal ---
+let none = interp_run("print(1)", [["backend", "process"], ["pat_path", "does/not/exist.exe"]])
+check("a missing pat.exe is ok=false, not a crash", none[2], false)
+
+t_report()
