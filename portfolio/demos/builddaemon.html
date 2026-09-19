@@ -48,6 +48,8 @@
 # need one before ever binding beyond 127.0.0.1; out of scope here, same as
 # this feature's own backlog note said from the start.
 
+include &quot;mailbox.patlang&quot;
+
 # signal_claim(port) -&gt; port_id (&gt;= 0) if this process is now the primary
 # holder of `port` for signal delivery, or -1 if another process already
 # holds it (the caller should treat that as &quot;an instance is already
@@ -59,6 +61,7 @@
 # bind failure (invalid port, permission denied) still aborts, same as
 # plain tcp_listen would.
 make a function called signal_claim takes port returns port_id
+  if signal_driver() == &quot;vfs&quot; then return sigv_claim(port) end
   return tcp_try_listen(port)
 end
 
@@ -78,6 +81,7 @@ end
 # signal_reply, so an empty string is written back and the sender (using
 # plain signal_send, which never reads a reply) never notices either way.
 make a function called signal_poll takes port_id, timeout_ms returns name
+  if signal_driver() == &quot;vfs&quot; then return sigv_poll(port_id) end
   let conn = tcp_accept_timeout(port_id, timeout_ms)
   if conn &lt; 0 then
     return &quot;&quot;
@@ -134,6 +138,10 @@ end
 # aborts, which is an honest failure mode for a fire-and-forget CLI
 # signal, not a silent no-op.
 make a function called signal_send takes port, name, payload returns delivered
+  if signal_driver() == &quot;vfs&quot; then
+    sigv_send(port, name, payload)
+    return true
+  end
   signal_query(port, name, payload)
   return true
 end
@@ -144,10 +152,92 @@ end
 # &quot;status&quot;). Same fatal-on-nothing-listening caveat as signal_send (no
 # try/catch to catch tcp_connect's error gracefully).
 make a function called signal_query takes port, name, payload returns reply
+  if signal_driver() == &quot;vfs&quot; then return sigv_query(port, name, payload) end
   let conn = tcp_connect(&quot;127.0.0.1&quot;, port)
   tcp_write(conn, name + chr(10) + payload)
   let reply = tcp_read(conn)
   tcp_close(conn)
+  return reply
+end
+
+# ---- vfs driver -----------------------------------------------------------
+#
+# Where the runtime has no tcp (the browser), or after signal_use_driver(&quot;vfs&quot;),
+# signals travel as mailbox messages instead: box &quot;sig/&lt;port&gt;&quot; holds what has
+# been sent, &quot;/sig/&lt;port&gt;/claim&quot; marks the port as taken, and a reply is left at
+# &quot;/sig/&lt;port&gt;/reply/&lt;message id&gt;&quot;. There are no other processes to reach, so
+# &quot;primary&quot; and &quot;sender&quot; are two parts of one program, or two isolates whose
+# namespaces the parent addresses with the mbox_*_ns calls (see isolate.patlang):
+# the parent drops a message in the isolate's &quot;sig/&lt;port&gt;&quot; box, the isolate calls
+# signal_poll during its turn, and the parent reads the reply file afterwards.
+# signal_query on this driver polls at once, so it answers only if the handler is
+# registered in the same world.
+
+make a function called signal_driver returns name
+  let forced = &quot;&quot; + get(&quot;__vars&quot;, &quot;__signal_driver&quot;)
+  if forced != &quot;&quot; then return forced end
+  let caps = host_caps()
+  let i = 0
+  while i &lt; list_len(caps) do
+    if caps[i] == &quot;tcp&quot; then return &quot;tcp&quot; end
+    let i = i + 1
+  end
+  return &quot;vfs&quot;
+end
+
+make a function called signal_use_driver takes name returns done
+  set_var(&quot;__signal_driver&quot;, name)
+  return true
+end
+
+make a function called sigv_box takes port returns box
+  return &quot;sig/&quot; + port
+end
+
+make a function called sigv_claim takes port returns port_id
+  let key = &quot;/sig/&quot; + port + &quot;/claim&quot;
+  if vfs_exists(key) == &quot;1&quot; then
+    return -1
+  end
+  vfs_write(key, &quot;1&quot;)
+  return port
+end
+
+# Queues a signal and returns its message id.
+make a function called sigv_send takes port, name, payload returns id
+  return mbox_put(sigv_box(port), &quot;sender&quot;, name + chr(10) + payload)
+end
+
+# Handles at most one queued signal: emits it, stores whatever signal_reply set
+# under the message id, returns the signal name (&quot;&quot; if none was waiting).
+make a function called sigv_poll takes port returns name
+  let m = mbox_take(sigv_box(port))
+  if list_len(m) == 0 then
+    return &quot;&quot;
+  end
+  let msg = m[1]
+  let nl = find_substr_signals(msg, chr(10))
+  let sig_name = msg
+  let payload = &quot;&quot;
+  if nl &gt;= 0 then
+    let sig_name = substr(msg, 0, nl)
+    let payload = substr(msg, nl + 1, msg.length - nl - 1)
+  end
+  set_var(&quot;__signal_reply&quot;, &quot;&quot;)
+  emit(sig_name, payload)
+  vfs_write(&quot;/sig/&quot; + port + &quot;/reply/&quot; + m[0], get(&quot;__vars&quot;, &quot;__signal_reply&quot;))
+  return sig_name
+end
+
+make a function called sigv_query takes port, name, payload returns reply
+  let id = sigv_send(port, name, payload)
+  sigv_poll(port)
+  let key = &quot;/sig/&quot; + port + &quot;/reply/&quot; + id
+  if vfs_exists(key) != &quot;1&quot; then
+    return &quot;&quot;
+  end
+  let reply = vfs_read(key)
+  vfs_delete(key)
   return reply
 end
 
@@ -838,9 +928,9 @@ PRIMARY: holding port 9411, running initial build cycle
 PRIMARY: [1/6] parse: building (est. 180ms)
 PRIMARY: [1/6] parse: done (180ms actual)
 PRIMARY: [2/6] docs: building (est. 150ms)
-PRIMARY: [2/6] docs: done (150ms actual)
+PRIMARY: [2/6] docs: done (151ms actual)
 PRIMARY: [3/6] typecheck: building (est. 260ms)
-PRIMARY: [3/6] typecheck: done (261ms actual)
+PRIMARY: [3/6] typecheck: done (260ms actual)
 PRIMARY: [4/6] compile_stdlib: building (est. 300ms)
 PRIMARY: [4/6] compile_stdlib: done (300ms actual)
 PRIMARY: [5/6] compile_core: building (est. 340ms)
@@ -858,9 +948,9 @@ PRIMARY: [2/6] docs: building (est. 150ms)
 SECONDARY: querying status again
 PRIMARY: [2/6] docs: done (150ms actual)
 PRIMARY: [3/6] typecheck: building (est. 260ms)
-PRIMARY: [3/6] typecheck: done (261ms actual)
+PRIMARY: [3/6] typecheck: done (260ms actual)
 PRIMARY: [4/6] compile_stdlib: building (est. 300ms)
-PRIMARY: [4/6] compile_stdlib: done (301ms actual)
+PRIMARY: [4/6] compile_stdlib: done (300ms actual)
 PRIMARY: [5/6] compile_core: building (est. 340ms)
 PRIMARY: [5/6] compile_core: done (340ms actual)
 PRIMARY: [6/6] link: building (est. 420ms)
