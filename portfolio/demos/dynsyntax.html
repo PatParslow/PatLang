@@ -1771,6 +1771,64 @@ make a function called rule_body_to_str takes body returns s
   return sb_str(sb)
 end
 
+# GitHub #25 (Piece 1 investigation, contract_check under --x64):
+# ast_to_str is a DEBUG/AST-inspector dump (its own &quot;Var(b)&quot;/&quot;Num(0)&quot;
+# wrapper format is deliberate there -- playground_main.patlang uses it
+# to show node TYPES explicitly). lower.patlang's require/ensure/assert
+# lowering used it too, for the condition TEXT baked into a contract
+# violation message (&quot;contract violation: precondition failed in
+# safe_divide(): ...&quot;) -- but that text is supposed to read like the
+# original source (`b != 0`), matching rust-runtime/src/ir/lowering.rs's
+# own expr_to_text exactly (the native --ir-run/--patc backends' own
+# condition-stringifier), not an AST debug dump. This divergence was
+# real and invisible for a long time: it only showed up once a real
+# --x64 compile+run of a failing contract could happen at all (#98
+# blocked that entirely before). A separate function, not a change to
+# ast_to_str itself, so the debug-dump behavior elsewhere is unaffected.
+make a function called ast_list_to_source_text takes nodes returns s
+  let b = sb_new()
+  let i = 0
+  while i &lt; nodes.length do
+    if i &gt; 0 then
+      sb_push(b, &quot;, &quot;)
+    end
+    sb_push(b, ast_to_source_text(nodes[i]))
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+make a function called ast_to_source_text takes node returns s
+  let ty = node[0]
+  if ty == &quot;Num&quot; then
+    return node[1]
+  elif ty == &quot;Str&quot; then
+    return &quot;\&quot;&quot; + node[1] + &quot;\&quot;&quot;
+  elif ty == &quot;Bool&quot; then
+    return node[1]
+  elif ty == &quot;Var&quot; then
+    return node[1]
+  elif ty == &quot;Bin&quot; then
+    return ast_to_source_text(node[2]) + &quot; &quot; + node[1] + &quot; &quot; + ast_to_source_text(node[3])
+  elif ty == &quot;Un&quot; then
+    return node[1] + ast_to_source_text(node[2])
+  elif ty == &quot;Call&quot; then
+    return node[1] + &quot;(&quot; + ast_list_to_source_text(node[2]) + &quot;)&quot;
+  elif ty == &quot;List&quot; then
+    return &quot;[&quot; + ast_list_to_source_text(node[1]) + &quot;]&quot;
+  elif ty == &quot;Index&quot; then
+    return ast_to_source_text(node[1]) + &quot;[&quot; + ast_to_source_text(node[2]) + &quot;]&quot;
+  elif ty == &quot;Member&quot; then
+    return ast_to_source_text(node[1]) + &quot;.&quot; + node[2]
+  else
+    # Anything not covered above (Closure, MemberAssign, control-flow
+    # nodes -- not realistic inside a require/ensure/assert condition)
+    # falls back to the debug dump rather than crashing on an
+    # unrecognized shape.
+    return ast_to_str(node)
+  end
+end
+
 make a function called ast_to_str takes node returns s
   let ty = node[0]
   if ty == &quot;Num&quot; then
@@ -2523,6 +2581,18 @@ make a function called lower_expr takes node, code, fns, locals, pending, lines 
                 let callee = node[1]
                 let args = node[2]
                 if contains_str(fns, callee) then
+                  # GitHub #102/#50: automatic box-on-crossing for a
+                  # genuinely ambiguous call argument is now done as an
+                  # AST REWRITE PASS (x64_rewrite_stmts_boxing, run once
+                  # by lower_program before this function ever sees
+                  # stmts) rather than here -- that pass can compute
+                  # each function's own float-tainted-variable context
+                  # once and thread it through naturally, which this
+                  # per-Call codegen site has no way to do (lower_expr
+                  # carries no &quot;which function/scope am I in&quot; parameter).
+                  # By the time control reaches here, any needed
+                  # rt_box_float wrapping is already a literal Call node
+                  # in `args[i]` -- nothing extra to do.
                   let i = 0
                   while i &lt; args.length do
                     let code = lower_expr(args[i], code, fns, locals, pending, lines)
@@ -3190,7 +3260,7 @@ make a function called lower_stmt takes node, code, fns, fname, locals, mutables
                 # order, ok (the evaluated condition) last
                 vec_push(code, [&quot;Const&quot;, &quot;str&quot;, fname])
                 vec_push(code, [&quot;Const&quot;, &quot;str&quot;, node[1]])
-                vec_push(code, [&quot;Const&quot;, &quot;str&quot;, ast_to_str(node[2])])
+                vec_push(code, [&quot;Const&quot;, &quot;str&quot;, ast_to_source_text(node[2])])
                 let code = lower_expr(node[2], code, fns, locals, pending, lines)
                 vec_push(code, [&quot;CallHost&quot;, &quot;contract_check&quot;, 4])
                 if wants_value == false then
@@ -3371,6 +3441,409 @@ make a function called lower_block takes stmts, code, fns, fname, locals, mutabl
   return code
 end
 
+# ---- GitHub #102/#50: automatic box-on-crossing for ambiguous call
+# arguments, --x64 only ----
+#
+# The boxed-Float REPRESENTATION (rt_float_tag/rt_box_float/rt_unbox_
+# float_bits, x64_runtime.patlang; classification + bitwise-op unboxing,
+# codegen_x64.patlang) already exists and is verified correct -- what
+# was still missing is deciding WHERE to box automatically, so #102's
+# actual repro (a function called with a float argument at one call
+# site and a plain int at another) fixes itself without a caller having
+# to call rt_box_float by hand.
+#
+# APPROACH (syntactic, not full dataflow -- named honestly, see below):
+# a whole-program pre-scan, run once before lowering, finds every
+# (function name, argument position) pair that is called with a
+# SYNTACTICALLY float-looking argument expression at at least one call
+# site and a NOT-float-looking one at another -- i.e. genuinely
+# ambiguous across call sites, exactly #102's shape. Lowering a Call's
+# argument for such a pair, when THIS specific argument expression also
+# looks float, wraps it in a `rt_box_float` call; every other argument
+# (including every argument of every non-ambiguous function) lowers
+# completely unchanged, so a function that's consistently called with
+# one type pays nothing extra -- the whole point of the &quot;typed homes,
+# box only at genuinely ambiguous crossings&quot; design from #50.
+#
+# NAMED LIMITATION: &quot;looks float&quot; is judged SYNTACTICALLY on the
+# argument expression itself (a dotted literal, arithmetic combining
+# one, or a call to a known float-returning builtin) -- it does NOT
+# trace data flow through a variable. `f(1.0 + 61.0)` is caught;
+# `let x = 1.0 + 61.0; f(x)` is NOT (x's own taint isn't traced back to
+# this call site). Closing that gap needs the real interprocedural
+# taint-propagation extension discussed on #50/#102 -- genuinely
+# separate, larger follow-up work, not attempted here. This pass also
+# only looks at DIRECT `Call` argument expressions inside Let/Return/If/
+# While conditions and bodies/MemberAssign/bare-expression statements --
+# it does not descend into closures or List/BuildList/Index/Member
+# sub-expressions beyond one hop, another named, deliberate scope cut
+# for a first working version.
+#
+# Gated entirely on x64_lower_target_is_x64() (set by patc1_main.patlang
+# only when --x64 is the active target) -- lower_program's output for
+# every OTHER backend is completely unchanged; this whole mechanism is
+# a no-op there.
+
+make a function called x64_lower_target_is_x64 returns is_x64
+  let v = get(&quot;__vars&quot;, &quot;x64_lower_target_is_x64&quot;)
+  return v == true
+end
+
+make a function called x64_lower_set_target_is_x64 takes flag returns done
+  set_var(&quot;x64_lower_target_is_x64&quot;, flag)
+  return true
+end
+
+# Syntactic float classifier -- see this section's own header for scope.
+# `tainted` is a list of local variable names PROVEN float-looking
+# somewhere earlier in the SAME function's own statement order (see
+# ast_collect_float_tainted_vars_in_stmts) -- this is real, if simple,
+# single-forward-pass dataflow (not just per-expression syntax): closes
+# the `let x = 1.0 + 61.0; f(x)` case the original syntax-only version
+# missed, since x's own taint is now looked up via the Var case below
+# instead of unconditionally returning false for any Var.
+make a function called ast_expr_looks_float_ctx takes expr, tainted returns is_float
+  let ty = expr[0]
+  if ty == &quot;Num&quot; then
+    return contains_str(expr[1], &quot;.&quot;)
+  elif ty == &quot;Var&quot; then
+    return x64_list_contains_str(tainted, expr[1])
+  elif ty == &quot;Bin&quot; then
+    let op = expr[1]
+    if (op == &quot;+&quot;) or (op == &quot;-&quot;) or (op == &quot;*&quot;) or (op == &quot;/&quot;) or (op == &quot;%&quot;) then
+      return ast_expr_looks_float_ctx(expr[2], tainted) or ast_expr_looks_float_ctx(expr[3], tainted)
+    end
+    return false
+  elif ty == &quot;Un&quot; then
+    if expr[1] == &quot;-&quot; then
+      return ast_expr_looks_float_ctx(expr[2], tainted)
+    end
+    return false
+  elif ty == &quot;Call&quot; then
+    let fname = expr[1]
+    if (fname == &quot;sqrt&quot;) or (fname == &quot;sin&quot;) or (fname == &quot;cos&quot;) or (fname == &quot;tan&quot;) or (fname == &quot;asin&quot;) or (fname == &quot;acos&quot;) or (fname == &quot;atan&quot;) or (fname == &quot;atan2&quot;) or (fname == &quot;log&quot;) or (fname == &quot;exp&quot;) or (fname == &quot;pow&quot;) then
+      return true
+    end
+    return false
+  else
+    return false
+  end
+end
+
+# No-context convenience wrapper (equivalent to ast_expr_looks_float_ctx
+# with an empty tainted-variable set) -- kept for any caller that
+# genuinely has no local-scope context to offer (there are none left in
+# this file after wiring the rewrite pass below, but keeping the name
+# stable avoids an unnecessary rename of a small utility).
+make a function called ast_expr_looks_float takes expr returns is_float
+  return ast_expr_looks_float_ctx(expr, [])
+end
+
+# ast_list_replace_at(lst, idx, newval) -&gt; a NEW list, identical to lst
+# except index idx is replaced with newval. Used by the AST rewrite pass
+# below to change exactly one field of a statement/expression node
+# (e.g. a Let's value expression) without having to know or reconstruct
+# that node's full arity -- several of these AST node shapes carry
+# extra trailing fields (Let's mutability flag, Func's optional named-
+# return hint) that would be silently dropped by rebuilding the node
+# from a fixed guessed field list instead.
+make a function called ast_list_replace_at takes lst, idx, newval returns lst2
+  let out = []
+  let i = 0
+  while i &lt; lst.length do
+    if i == idx then
+      let out = list_push(out, newval)
+    else
+      let out = list_push(out, lst[i])
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# Single forward pass over stmts: a `let x = &lt;expr&gt;` whose expr looks
+# float (judged against the tainted set as grown so far, so `let y = x`
+# after `let x = 1.0` also propagates) adds x to the returned set.
+# Recurses into If/While bodies in the SAME scope (an assignment inside
+# a branch still taints the name for code after the branch, matching
+# this being a real, if conservative, over-approximation -- consistent
+# with this whole pass's &quot;syntactic, single forward pass, not a fixed-
+# point dataflow solver&quot; scope, named in this section's own header).
+make a function called ast_collect_float_tainted_vars_in_stmts takes stmts, tainted returns tainted2
+  let result = tainted
+  let i = 0
+  while i &lt; stmts.length do
+    let s = stmts[i]
+    let ty = s[0]
+    if ty == &quot;Let&quot; then
+      if ast_expr_looks_float_ctx(s[2], result) then
+        if not x64_list_contains_str(result, s[1]) then
+          let result = list_push(result, s[1])
+        end
+      end
+    elif ty == &quot;If&quot; then
+      let result = ast_collect_float_tainted_vars_in_stmts(s[2], result)
+      let result = ast_collect_float_tainted_vars_in_stmts(s[3], result)
+    elif ty == &quot;While&quot; then
+      let result = ast_collect_float_tainted_vars_in_stmts(s[2], result)
+    end
+    let i = i + 1
+  end
+  return result
+end
+
+# ---- AST rewrite pass: actually inserts the rt_box_float wrapper ----
+#
+# Runs AFTER x64_compute_ambiguous_call_params (needs its result) and
+# BEFORE the real lower_program body processes stmts -- a genuine
+# AST-to-AST transformation, not a codegen-time decision, precisely so
+# each function's own tainted-variable context can be computed once and
+# threaded naturally through recursion (lower_expr itself has no
+# &quot;which function/scope am I in&quot; parameter to hang this off of).
+
+# GitHub #99 regression found and fixed while completing #25 Piece 1:
+# the box-on-crossing rewrite must ONLY ever apply to an ordinary Call
+# to a ordinary user-visible PatLang FUNCTION (fns membership -- same
+# gate lower_expr's own Call-lowering already uses to decide Call vs
+# CallHost) -- NOT to a bare CallHost-dispatched primitive name like
+# ceil/round/trunc, which take a raw float and would silently receive a
+# boxed pointer instead if wrapped. `floor` is exactly this trap: it IS
+# in `fns` (x64_runtime.patlang defines a real PatLang function with
+# that name, for its own Rational case), so ceil(2.4)/round(2.4)/etc
+# calls elsewhere in the SAME file, none of which are in `fns`, were
+# never meant to be touched -- but the first version of this pass
+# didn't check `fns` membership at all before deciding &quot;ambiguous&quot;, so
+# EVERY rounding-function call in a file mixing int/float rounding
+# calls got its argument wrongly boxed. Found immediately re-testing
+# self_hosting/examples/x64_rounding_ops.patlang (every single check
+# failed, not just floor's) while verifying #99's real fix.
+make a function called x64_rewrite_expr_boxing takes expr, ambiguous, tainted, fns returns expr2
+  let ty = expr[0]
+  if ty == &quot;Call&quot; then
+    let callee = expr[1]
+    let args = expr[2]
+    let new_args = []
+    let i = 0
+    while i &lt; args.length do
+      let rewritten = x64_rewrite_expr_boxing(args[i], ambiguous, tainted, fns)
+      if contains_str(fns, callee) then
+        if not x64_list_contains_str(x64_box_crossing_excluded_names(), callee) then
+          if x64_list_contains_str(ambiguous, callee + &quot;#&quot; + i) then
+            if ast_expr_looks_float_ctx(args[i], tainted) then
+              let rewritten = [&quot;Call&quot;, &quot;rt_box_float&quot;, [rewritten]]
+            end
+          end
+        end
+      end
+      let new_args = list_push(new_args, rewritten)
+      let i = i + 1
+    end
+    return ast_list_replace_at(expr, 2, new_args)
+  elif ty == &quot;Bin&quot; then
+    let e2 = ast_list_replace_at(expr, 2, x64_rewrite_expr_boxing(expr[2], ambiguous, tainted, fns))
+    return ast_list_replace_at(e2, 3, x64_rewrite_expr_boxing(expr[3], ambiguous, tainted, fns))
+  elif ty == &quot;Un&quot; then
+    return ast_list_replace_at(expr, 2, x64_rewrite_expr_boxing(expr[2], ambiguous, tainted, fns))
+  else
+    return expr
+  end
+end
+
+make a function called x64_rewrite_stmts_boxing takes stmts, ambiguous, tainted, fns returns stmts2
+  let out = []
+  let cur_tainted = tainted
+  let i = 0
+  while i &lt; stmts.length do
+    let s = stmts[i]
+    let ty = s[0]
+    if ty == &quot;Let&quot; then
+      if ast_expr_looks_float_ctx(s[2], cur_tainted) then
+        if not x64_list_contains_str(cur_tainted, s[1]) then
+          let cur_tainted = list_push(cur_tainted, s[1])
+        end
+      end
+      let new_s = ast_list_replace_at(s, 2, x64_rewrite_expr_boxing(s[2], ambiguous, cur_tainted, fns))
+      let out = list_push(out, new_s)
+    elif ty == &quot;Return&quot; then
+      if s.length &gt; 1 then
+        let out = list_push(out, ast_list_replace_at(s, 1, x64_rewrite_expr_boxing(s[1], ambiguous, cur_tainted, fns)))
+      else
+        let out = list_push(out, s)
+      end
+    elif ty == &quot;If&quot; then
+      let s2 = ast_list_replace_at(s, 1, x64_rewrite_expr_boxing(s[1], ambiguous, cur_tainted, fns))
+      let s3 = ast_list_replace_at(s2, 2, x64_rewrite_stmts_boxing(s[2], ambiguous, cur_tainted, fns))
+      let s4 = ast_list_replace_at(s3, 3, x64_rewrite_stmts_boxing(s[3], ambiguous, cur_tainted, fns))
+      let out = list_push(out, s4)
+    elif ty == &quot;While&quot; then
+      let s2 = ast_list_replace_at(s, 1, x64_rewrite_expr_boxing(s[1], ambiguous, cur_tainted, fns))
+      let s3 = ast_list_replace_at(s2, 2, x64_rewrite_stmts_boxing(s[2], ambiguous, cur_tainted, fns))
+      let out = list_push(out, s3)
+    elif ty == &quot;MemberAssign&quot; then
+      let out = list_push(out, ast_list_replace_at(s, 3, x64_rewrite_expr_boxing(s[3], ambiguous, cur_tainted, fns)))
+    elif ty == &quot;Expr&quot; then
+      let out = list_push(out, ast_list_replace_at(s, 1, x64_rewrite_expr_boxing(s[1], ambiguous, cur_tainted, fns)))
+    elif ty == &quot;Func&quot; then
+      let fn_tainted = ast_collect_float_tainted_vars_in_stmts(s[3], [])
+      let new_body = x64_rewrite_stmts_boxing(s[3], ambiguous, fn_tainted, fns)
+      let out = list_push(out, ast_list_replace_at(s, 3, new_body))
+    else
+      let out = list_push(out, s)
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# Walks expr (and, one hop deep, its own Call-argument/Bin/Un operand
+# sub-expressions) pushing [callee, arg_index, is_float] into the
+# mutable Vec `out` for every direct Call it finds. `out` MUST be a Vec
+# (vec_new()), not an ordinary list -- list_push is functional
+# (returns a new list, leaves the caller's variable unchanged), which
+# cannot accumulate across these recursive calls; vec_push mutates the
+# handle in place, exactly what a shared accumulator threaded through
+# recursion needs.
+# `tainted` threads the enclosing function's own float-tainted local
+# variables (see ast_collect_float_tainted_vars_in_stmts) through this
+# walk, so an observation for `f(x)` correctly reflects whether x was
+# ever assigned a float-looking value earlier in the SAME function --
+# not just x's own (context-free) syntax, which is never float for a
+# bare Var node.
+make a function called x64_collect_call_arg_floatness_in_expr takes expr, out, tainted, fns returns done
+  let ty = expr[0]
+  if ty == &quot;Call&quot; then
+    let callee = expr[1]
+    let args = expr[2]
+    if contains_str(fns, callee) then
+      if not x64_list_contains_str(x64_box_crossing_excluded_names(), callee) then
+        let i = 0
+        while i &lt; args.length do
+          let is_f = ast_expr_looks_float_ctx(args[i], tainted)
+          vec_push(out, [callee, i, is_f])
+          let i = i + 1
+        end
+      end
+    end
+    let i = 0
+    while i &lt; args.length do
+      x64_collect_call_arg_floatness_in_expr(args[i], out, tainted, fns)
+      let i = i + 1
+    end
+  elif ty == &quot;Bin&quot; then
+    x64_collect_call_arg_floatness_in_expr(expr[2], out, tainted, fns)
+    x64_collect_call_arg_floatness_in_expr(expr[3], out, tainted, fns)
+  elif ty == &quot;Un&quot; then
+    x64_collect_call_arg_floatness_in_expr(expr[2], out, tainted, fns)
+  end
+end
+
+make a function called x64_collect_call_arg_floatness_in_stmts takes stmts, out, tainted, fns returns done
+  let cur_tainted = tainted
+  let i = 0
+  while i &lt; stmts.length do
+    let s = stmts[i]
+    let ty = s[0]
+    if ty == &quot;Let&quot; then
+      x64_collect_call_arg_floatness_in_expr(s[2], out, cur_tainted, fns)
+      if ast_expr_looks_float_ctx(s[2], cur_tainted) then
+        if not x64_list_contains_str(cur_tainted, s[1]) then
+          let cur_tainted = list_push(cur_tainted, s[1])
+        end
+      end
+    elif ty == &quot;Return&quot; then
+      if s.length &gt; 1 then
+        x64_collect_call_arg_floatness_in_expr(s[1], out, cur_tainted, fns)
+      end
+    elif ty == &quot;If&quot; then
+      x64_collect_call_arg_floatness_in_expr(s[1], out, cur_tainted, fns)
+      x64_collect_call_arg_floatness_in_stmts(s[2], out, cur_tainted, fns)
+      x64_collect_call_arg_floatness_in_stmts(s[3], out, cur_tainted, fns)
+    elif ty == &quot;While&quot; then
+      x64_collect_call_arg_floatness_in_expr(s[1], out, cur_tainted, fns)
+      x64_collect_call_arg_floatness_in_stmts(s[2], out, cur_tainted, fns)
+    elif ty == &quot;MemberAssign&quot; then
+      x64_collect_call_arg_floatness_in_expr(s[1], out, cur_tainted, fns)
+      x64_collect_call_arg_floatness_in_expr(s[3], out, cur_tainted, fns)
+    elif ty == &quot;Func&quot; then
+      x64_collect_call_arg_floatness_in_stmts(s[3], out, [], fns)
+    elif ty == &quot;Expr&quot; then
+      # A bare expression used as a statement (e.g. `bandtest(1)` on its
+      # own line) parses as [&quot;Expr&quot;, &lt;the real expression&gt;, &lt;line&gt;], not
+      # the bare expression node directly -- found via a real repro that
+      # produced zero observations until this was dumped and inspected.
+      x64_collect_call_arg_floatness_in_expr(s[1], out, cur_tainted, fns)
+    else
+      x64_collect_call_arg_floatness_in_expr(s, out, cur_tainted, fns)
+    end
+    let i = i + 1
+  end
+end
+
+# GitHub #99 (found completing #25 Piece 1): a function that is ALREADY
+# internally adaptive over int/float via the same runtime round-trip
+# fixnum test x64_roundlike_asm/x64_abs_asm use (an int argument passes
+# through unchanged, only a genuine float takes the real float path)
+# must never be box-on-crossing eligible: boxing wraps its argument in
+# a heap pointer, which that round-trip test cannot distinguish from
+# &quot;a very large but genuine int&quot; -- it takes the float path on the
+# pointer's own bits, computing garbage. `floor` is the concrete case:
+# it's an ordinary PatLang-level Call (x64_runtime.patlang's own
+# Rational-handling wrapper, colliding with the C import name), called
+# with both float and plain-int arguments across a real program is
+# exactly the ambiguity pattern this pass looks for, and it was WRONGLY
+# getting boxed before this exclusion -- confirmed directly: floor(2.4)
+# alone (no int call site anywhere else) computed correctly, but adding
+# a single floor(7) call elsewhere in the same file broke it.
+make a function called x64_box_crossing_excluded_names returns names
+  return [&quot;floor&quot;]
+end
+
+make a function called x64_list_contains_str takes xs, target returns found
+  let i = 0
+  while i &lt; xs.length do
+    if xs[i] == target then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# Returns a list of &quot;funcname#argindex&quot; string keys for every (function,
+# argument position) pair observed with BOTH a float-looking AND a
+# not-float-looking argument across all its call sites in this program.
+make a function called x64_compute_ambiguous_call_params takes stmts, fns returns keys
+  let observations = vec_new()
+  x64_collect_call_arg_floatness_in_stmts(stmts, observations, [], fns)
+  let n = vec_len(observations)
+  let saw_float = []
+  let saw_nonfloat = []
+  let i = 0
+  while i &lt; n do
+    let obs = vec_get(observations, i)
+    let key = obs[0] + &quot;#&quot; + obs[1]
+    if obs[2] then
+      if not x64_list_contains_str(saw_float, key) then
+        let saw_float = list_push(saw_float, key)
+      end
+    else
+      if not x64_list_contains_str(saw_nonfloat, key) then
+        let saw_nonfloat = list_push(saw_nonfloat, key)
+      end
+    end
+    let i = i + 1
+  end
+  let keys = []
+  let j = 0
+  while j &lt; saw_float.length do
+    if x64_list_contains_str(saw_nonfloat, saw_float[j]) then
+      let keys = list_push(keys, saw_float[j])
+    end
+    let j = j + 1
+  end
+  return keys
+end
+
 make a function called collect_fns takes stmts returns fns
   let fns = []
   let i = 0
@@ -3451,6 +3924,13 @@ make a function called lower_program takes ast returns ir
   set_var(&quot;__closure_seq&quot;, 0)
   let stmts = ast[1]
   let fns = collect_fns(stmts)
+  if x64_lower_target_is_x64() then
+    let ambiguous = x64_compute_ambiguous_call_params(stmts, fns)
+    let stmts = x64_rewrite_stmts_boxing(stmts, ambiguous, [], fns)
+    set_var(&quot;x64_ambiguous_call_params&quot;, ambiguous)
+  else
+    set_var(&quot;x64_ambiguous_call_params&quot;, [])
+  end
   let funcs = []
   let events = []
   let mainCode = vec_new()
@@ -4069,9 +4549,41 @@ end
 #   }
 #
 # The `syntax { ... }` block itself is stripped. Every `routes { ... }` block
-# is expanded line-by-line into plain PatLang statements built from the
-# rule's `return` template, with `expect`-bound captures substituted in as
-# string literals -- before the normal lexer/parser ever sees the file.
+# is expanded into plain PatLang statements built from each matching rule's
+# `return` template, with `expect`-bound captures substituted in -- before
+# the normal lexer/parser ever sees the file. Two more `expect` forms exist
+# beyond a plain line-level token sequence, for grammars that need a nested
+# body or a repeated clause list (loops, if/else, switch/case, etc.):
+#
+#   expect Block          -- matches a `{ ... }` at the current position
+#                             (may span multiple lines), captures its
+#                             *already re-expanded* interior (re-run through
+#                             this SAME syntax def's full rule set,
+#                             recursively), and binds that expanded PatLang
+#                             code to the capture name.
+#   expect Many(RuleName)  -- repeatedly matches another rule of the SAME
+#                             syntax def by name, zero or more times, at the
+#                             current position; each iteration's own
+#                             substituted template output is joined with &quot;\n&quot;
+#                             and bound to the capture name.
+#
+# A capture used in a `return` template as `${name}` splices its bound value
+# in RAW, as already-valid PatLang code with no quoting -- this is how a
+# Block/Many capture (which IS PatLang code, not a data string) gets spliced
+# back in. A bare `name` (no `${...}`) keeps the original behavior: the
+# captured text is inserted as a quoted PatLang string literal (for plain
+# data captures like a route's HTTP verb or URL path).
+#
+# Example (a `for`-with-body form, illustrating Block + `${...}`):
+#
+#   rule ForLoop {
+#       expect ForKw;
+#       expect Symbol(&quot;(&quot;);
+#       let cond = expect CondExpr;
+#       expect Symbol(&quot;)&quot;);
+#       let body = expect Block;
+#       return &quot;while ${cond} do\n${body}\nend&quot;;
+#   }
 #
 # Per-token `regex(...)` matching is done by the general-purpose regex engine
 # at lib/regex_dsl.patlang -- this file assumes regex_match_string_at (and
@@ -4086,10 +4598,18 @@ end
 #
 # Data shapes (plain tagged lists -- there is no map/struct in this dialect):
 #   TokenDef  = [&quot;token&quot;, name, kind, pattern]      kind: &quot;regex&quot; | &quot;literal&quot;
-#   RuleStep  = [&quot;step&quot;, kind, value, bind]         kind: &quot;named&quot; | &quot;identifier&quot; | &quot;symbol&quot;
-#   RuleDef   = [&quot;rule&quot;, steps_list, return_template]
+#   RuleStep  = [&quot;step&quot;, kind, value, bind]         kind: &quot;named&quot; | &quot;identifier&quot; | &quot;symbol&quot; | &quot;block&quot; | &quot;many&quot;
+#                                                    (&quot;many&quot;'s `value` is the target rule's name)
+#   RuleDef   = [&quot;rule&quot;, name, steps_list, return_template]
 #   SyntaxDef = [&quot;syntax&quot;, trigger_keyword, tokens_list, rules_list]
-#   MatchResult = [&quot;ok&quot;, bindings_list] | [&quot;fail&quot;]  bindings_list: [[name, text], ...]
+#   MatchResult = [&quot;ok&quot;, bindings_list, new_pos] | [&quot;fail&quot;]  bindings_list: [[name, text], ...]
+#
+# NOTE on scope of &quot;PatLang is canon&quot; for this feature: this file is the
+# self-hosted implementation and is the canonical/primary implementation of
+# the syntax DSL feature. rust-runtime/src/syntax_dsl.rs (the Rust-native
+# twin used only by `pat --patc`) does NOT currently implement Block/Many/
+# `${...}` -- it still only supports the original flat, single-line rule
+# matching. Do not assume parity between the two for these primitives.
 # =============================================================================
 
 make a function called sdsl_is_ws takes ch returns r
@@ -4492,7 +5012,7 @@ make a function called sdsl_parse_token_defs takes tbody returns r
   return out
 end
 
-make a function called sdsl_parse_rule_def takes rbody returns r
+make a function called sdsl_parse_rule_def takes rule_name, rbody returns r
   let stmts = sdsl_split_top_level_statements(rbody)
   let steps = []
   let return_template = &quot;&quot;
@@ -4525,14 +5045,27 @@ make a function called sdsl_parse_rule_def takes rbody returns r
           if expect_part == &quot;Identifier&quot; then
             let steps = list_push(steps, [&quot;step&quot;, &quot;identifier&quot;, &quot;&quot;, bind])
           else
-            let steps = list_push(steps, [&quot;step&quot;, &quot;named&quot;, expect_part, bind])
+            if expect_part == &quot;Block&quot; then
+              let steps = list_push(steps, [&quot;step&quot;, &quot;block&quot;, &quot;&quot;, bind])
+            else
+              if sdsl_starts_with(expect_part, &quot;Many&quot;) then
+                let inner = sdsl_trim(substr(expect_part, 4, sdsl_len(expect_part) - 4))
+                let ilen = sdsl_len(inner)
+                if (ilen &gt;= 2) and (substr(inner, 0, 1) == &quot;(&quot;) and (substr(inner, ilen - 1, 1) == &quot;)&quot;) then
+                  let inner = sdsl_trim(substr(inner, 1, ilen - 2))
+                end
+                let steps = list_push(steps, [&quot;step&quot;, &quot;many&quot;, inner, bind])
+              else
+                let steps = list_push(steps, [&quot;step&quot;, &quot;named&quot;, expect_part, bind])
+              end
+            end
           end
         end
       end
     end
     let i = i + 1
   end
-  return [&quot;rule&quot;, steps, return_template]
+  return [&quot;rule&quot;, rule_name, steps, return_template]
 end
 
 make a function called sdsl_parse_syntax_def takes body returns r
@@ -4564,7 +5097,7 @@ make a function called sdsl_parse_syntax_def takes body returns r
           let nameinfo = sdsl_take_identifier(h, j)
           let j = sdsl_skip_ws(h, nameinfo[1])
           let br = sdsl_take_balanced_block(h, j)
-          let rules = list_push(rules, sdsl_parse_rule_def(br[0]))
+          let rules = list_push(rules, sdsl_parse_rule_def(nameinfo[0], br[0]))
           let i = br[1]
         else
           let i = i + 1
@@ -4720,6 +5253,26 @@ make a function called sdsl_find_token_def takes tokens, name returns r
   return found
 end
 
+# Finds `name` inside a RuleDef list (by the rule's own declared name, e.g.
+# for `expect Many(RuleName)`); returns the RuleDef, or a sentinel with empty
+# steps if absent (sdsl_match_many_step treats a zero-step match as
+# zero-width and stops the repetition rather than looping forever).
+make a function called sdsl_find_rule_by_name takes rules, name returns r
+  let n = rules.length
+  let i = 0
+  let found = [&quot;rule&quot;, &quot;&quot;, [], &quot;&quot;]
+  let scanning = true
+  while (i &lt; n) and scanning do
+    let rl = rules[i]
+    if rl[1] == name then
+      let found = rl
+      let scanning = false
+    end
+    let i = i + 1
+  end
+  return found
+end
+
 # Finds `value` inside a [[name, value], ...] bindings list; returns &quot;&quot; if absent.
 make a function called sdsl_bindings_lookup takes bindings, name returns r
   let n = bindings.length
@@ -4737,128 +5290,257 @@ make a function called sdsl_bindings_lookup takes bindings, name returns r
   return found
 end
 
-# Attempts to match every step of `rule` against `line` in order. Returns
-# [&quot;ok&quot;, bindings] on full success, [&quot;fail&quot;] if any step fails to match.
-make a function called sdsl_try_match_rule takes def, the_rule, line returns r
-  # NOTE: param renamed from `rule` -- a bare reserved keyword used as a
-  # plain parameter name silently truncates the params list instead of
-  # erroring (the parser's &quot;takes NAME, NAME, ...&quot; list expects
-  # Token::Identifier, but `rule` lexes as its own dedicated Token::Rule) --
-  # found via a genuinely confusing silent crash: this function ended up
-  # with params=[&quot;def&quot;] only and a corrupted 2-instruction body, which the
-  # interpreter then panicked on internally, and that panic was silently
-  # swallowed by main()'s `.join().unwrap_or(())` thread-join wrapper,
-  # producing a totally silent &quot;successful&quot; exit with zero output and no
-  # error message at all. Same class of bug as the earlier `fn`-as-a-
-  # param-name collision found in the paradigm gallery work.
-  let steps = the_rule[1]
-  let line_h = str_intern(line)
-  let pos = 0
-  let bindings = []
+# Matches `expect Block` at absolute body position `cur`: skips whitespace
+# (allowed to cross newlines -- a `{` may follow its header on the same
+# line or a later one), requires a `{`, captures the balanced body (which
+# may itself span many lines) via the existing sdsl_take_balanced_block, and
+# recursively re-expands that captured body against `def`'s own full rule
+# set (sdsl_expand_body) -- this is the &quot;recurse the whole syntax def&quot;
+# behavior a Block capture uses. Returns [true, expanded_code, new_pos], or
+# [false, &quot;&quot;, cur] (position unchanged) if no `{` is found there.
+make a function called sdsl_match_block_step takes def, h, cur returns r
+  let p = sdsl_skip_ws(h, cur)
+  if (p &gt;= sc_len(h)) or (sc_char(h, p) != &quot;{&quot;) then
+    return [false, &quot;&quot;, cur]
+  else
+    let br = sdsl_take_balanced_block(h, p)
+    let expanded = sdsl_expand_body(def, br[0])
+    return [true, expanded, br[1]]
+  end
+end
+
+# Matches `expect Many(RuleName)` at absolute body position `cur`: repeats
+# matching the NAMED rule (looked up by name in def's own rule list) zero or
+# more times; each iteration produces its own fully-substituted template
+# output, and all iterations are joined with &quot;\n&quot;. Always succeeds (a
+# zero-or-more repetition matching nothing is legitimate, e.g. an empty
+# switch). An iteration that matches without consuming any characters stops
+# the repetition immediately, both to guarantee termination in general and
+# to protect against an unrecognized RuleName (whose sentinel has zero
+# steps and would otherwise match trivially forever).
+make a function called sdsl_match_many_step takes def, rule_name, h, cur returns r
+  let target = sdsl_find_rule_by_name(def[3], rule_name)
+  let out = sb_new()
+  let n = sc_len(h)
+  let p = sdsl_skip_ws(h, cur)
+  let scanning = true
+  while scanning and (p &lt; n) do
+    let m = sdsl_try_match_rule_at(def, target, h, p)
+    if m[0] == &quot;ok&quot; then
+      if m[2] &lt;= p then
+        let scanning = false
+      else
+        sb_push(out, sdsl_substitute_template(target[3], m[1]))
+        sb_push(out, chr(10))
+        let p = sdsl_skip_ws(h, m[2])
+      end
+    else
+      let scanning = false
+    end
+  end
+  return [true, sb_str(out), p]
+end
+
+# Cursor-based rule matcher: attempts to match every step of `the_rule`
+# starting at absolute body position `start_pos` within the shared body
+# handle `h`. Ordinary (identifier/symbol/named-token) steps are confined to
+# the rest of the CURRENT line only, exactly like the original line-only
+# matcher this replaces; `block`/`many` steps are the only ones allowed to
+# consume across newlines. Returns [&quot;ok&quot;, bindings, new_pos] on full
+# success, [&quot;fail&quot;] if any step fails to match.
+make a function called sdsl_try_match_rule_at takes def, the_rule, h, start_pos returns r
+  # NOTE: param named `the_rule`, not `rule` -- see the historical note this
+  # replaced: a bare reserved keyword used as a plain parameter name
+  # silently truncates the params list instead of erroring.
+  let steps = the_rule[2]
   let n = steps.length
+  let cur = start_pos
+  let bindings = []
   let i = 0
   let ok = true
   while (i &lt; n) and ok do
-    let pos = sdsl_skip_ws(line_h, pos)
     let step = steps[i]
     let kind = step[1]
-    let matched = -1
-    if kind == &quot;identifier&quot; then
-      let matched = sdsl_match_identifier(line, pos)
-    else
-      if kind == &quot;symbol&quot; then
-        let matched = sdsl_match_literal(line, pos, step[2])
+    if kind == &quot;block&quot; then
+      let bm = sdsl_match_block_step(def, h, cur)
+      if bm[0] then
+        let bind = step[3]
+        if sdsl_len(bind) &gt; 0 then
+          let bindings = list_push(bindings, [bind, bm[1]])
+        end
+        let cur = bm[2]
       else
-        let tdef = sdsl_find_token_def(def[2], step[2])
-        if tdef[2] == &quot;literal&quot; then
-          let matched = sdsl_match_literal(line, pos, tdef[3])
+        let ok = false
+      end
+    else
+      if kind == &quot;many&quot; then
+        let mm = sdsl_match_many_step(def, step[2], h, cur)
+        let bind = step[3]
+        if sdsl_len(bind) &gt; 0 then
+          let bindings = list_push(bindings, [bind, mm[1]])
+        end
+        let cur = mm[2]
+      else
+        let hlen = sc_len(h)
+        let nl = sdsl_find_char(h, cur, &quot;\n&quot;)
+        let line_end = nl
+        if nl &lt; 0 then
+          let line_end = hlen
+        end
+        let line = sdsl_sc_substr(h, cur, line_end - cur)
+        let line_h = str_intern(line)
+        let lpos = sdsl_skip_ws(line_h, 0)
+        let matched = -1
+        if kind == &quot;identifier&quot; then
+          let matched = sdsl_match_identifier(line, lpos)
         else
-          if tdef[2] == &quot;regex&quot; then
-            let text = substr(line, pos, sdsl_len(line) - pos)
-            let end_off = regex_match_string_at(tdef[3], text, 0)
-            if end_off &gt; 0 then
-              let matched = pos + end_off
+          if kind == &quot;symbol&quot; then
+            let matched = sdsl_match_literal(line, lpos, step[2])
+          else
+            let tdef = sdsl_find_token_def(def[2], step[2])
+            if tdef[2] == &quot;literal&quot; then
+              let matched = sdsl_match_literal(line, lpos, tdef[3])
+            else
+              if tdef[2] == &quot;regex&quot; then
+                let text = substr(line, lpos, sdsl_len(line) - lpos)
+                let end_off = regex_match_string_at(tdef[3], text, 0)
+                if end_off &gt; 0 then
+                  let matched = lpos + end_off
+                end
+              end
             end
           end
         end
+        if matched &lt; 0 then
+          let ok = false
+        else
+          let bind = step[3]
+          if sdsl_len(bind) &gt; 0 then
+            let bindings = list_push(bindings, [bind, substr(line, lpos, matched - lpos)])
+          end
+          let cur = cur + matched
+        end
       end
-    end
-    if matched &lt; 0 then
-      let ok = false
-    else
-      let bind = step[3]
-      if sdsl_len(bind) &gt; 0 then
-        let bindings = list_push(bindings, [bind, substr(line, pos, matched - pos)])
-      end
-      let pos = matched
     end
     let i = i + 1
   end
   if ok then
-    return [&quot;ok&quot;, bindings]
+    return [&quot;ok&quot;, bindings, cur]
   else
     return [&quot;fail&quot;]
   end
 end
 
-# Replaces every whole-word occurrence of a bound capture name in `template`
-# with its matched text as a PatLang string literal.
-make a function called sdsl_substitute_template takes template, bindings returns r
-  let n = sdsl_len(template)
-  let out = sb_new()
-  let i = 0
-  while i &lt; n do
-    let c = substr(template, i, 1)
-    if sdsl_is_ident_start(c) then
-      let j = i + 1
-      let scanning = true
-      while (j &lt; n) and scanning do
-        if sdsl_is_ident_char(substr(template, j, 1)) then
-          let j = j + 1
-        else
-          let scanning = false
-        end
-      end
-      let word = substr(template, i, j - i)
-      let val = sdsl_bindings_lookup(bindings, word)
-      if sdsl_len(val) &gt; 0 then
-        sb_push(out, &quot;\&quot;&quot; + val + &quot;\&quot;&quot;)
-      else
-        sb_push(out, word)
-      end
-      let i = j
-    else
-      sb_push(out, c)
-      let i = i + 1
-    end
-  end
-  return sb_str(out)
-end
-
-# Runs each of the DSL's rules (in declaration order) against `line`,
-# returning the first one whose full `expect` sequence matches, with its
-# return template's captures substituted in as PatLang string literals.
-make a function called sdsl_expand_rule_line takes def, line returns r
+# Tries every rule of `def` (in declaration order) at absolute body position
+# `pos`. Returns [&quot;ok&quot;, substituted_text, new_pos] for the first rule whose
+# full `expect` sequence matches, or [&quot;fail&quot;] if none do.
+make a function called sdsl_try_rules_at takes def, h, pos returns r
   let rules = def[3]
   let n = rules.length
   let i = 0
-  let result = &quot;&quot;
+  let result = [&quot;fail&quot;]
   let found = false
   while (i &lt; n) and (not found) do
-    let m = sdsl_try_match_rule(def, rules[i], line)
+    let m = sdsl_try_match_rule_at(def, rules[i], h, pos)
     if m[0] == &quot;ok&quot; then
-      # No trailing &quot;;&quot; -- PatLang has no statement-terminating semicolon
-      # anywhere in its grammar. A stray &quot;;&quot; tokenizes as its own UNK token
-      # and becomes a parse error; that error was invisible when this output
-      # only ever went through compile_native (lower_program silently drops
-      # unparseable Err statements), but is fatal for the playground/IDE
-      # path, which aborts entirely if any parse error is present.
-      let result = sdsl_substitute_template(rules[i][2], m[1])
+      let text = sdsl_substitute_template(rules[i][3], m[1])
+      let result = [&quot;ok&quot;, text, m[2]]
       let found = true
     end
     let i = i + 1
   end
   return result
+end
+
+# Replaces captures in `template`: `${name}` splices the bound value RAW, no
+# quoting or escaping -- used for Block/Many captures, which are already
+# valid, already-expanded PatLang code, not data. A bare whole-word `name`
+# keeps the original behavior: the bound value is inserted as a quoted
+# PatLang string literal (for plain data captures, e.g. a route's HTTP verb).
+make a function called sdsl_substitute_template takes template, bindings returns r
+  let th = str_intern(template)
+  let n = sc_len(th)
+  let out = sb_new()
+  let i = 0
+  while i &lt; n do
+    let c = sc_char(th, i)
+    if (c == &quot;$&quot;) and ((i + 1) &lt; n) and (sc_char(th, i + 1) == &quot;{&quot;) then
+      let close = sdsl_find_char(th, i + 2, &quot;}&quot;)
+      if close &lt; 0 then
+        sb_push(out, c)
+        let i = i + 1
+      else
+        let word = sdsl_trim(sdsl_sc_substr(th, i + 2, close - (i + 2)))
+        let val = sdsl_bindings_lookup(bindings, word)
+        sb_push(out, val)
+        let i = close + 1
+      end
+    else
+      if sdsl_is_ident_start(c) then
+        let j = i + 1
+        let scanning = true
+        while (j &lt; n) and scanning do
+          if sdsl_is_ident_char(sc_char(th, j)) then
+            let j = j + 1
+          else
+            let scanning = false
+          end
+        end
+        let word = sdsl_sc_substr(th, i, j - i)
+        let val = sdsl_bindings_lookup(bindings, word)
+        if sdsl_len(val) &gt; 0 then
+          sb_push(out, &quot;\&quot;&quot; + val + &quot;\&quot;&quot;)
+        else
+          sb_push(out, word)
+        end
+        let i = j
+      else
+        sb_push(out, c)
+        let i = i + 1
+      end
+    end
+  end
+  return sb_str(out)
+end
+
+# Expands `body` (a triggered block's interior, OR -- recursively -- a
+# Block-step's captured interior) against `def`'s full rule set: tries every
+# rule at the current position, appends its substituted output, and
+# advances past whatever it consumed (which may cross many lines for a rule
+# using a Block/Many step). A position where no rule matches is surfaced via
+# `print` and the offending line is passed through unchanged, rather than
+# silently dropped (the previous line-only implementation silently vanished
+# any line that didn't match any rule -- a real latent gap, fixed here as
+# opportunistic cleanup directly adjacent to this rework).
+make a function called sdsl_expand_body takes def, body returns r
+  let h = str_intern(body)
+  let n = sc_len(h)
+  let out = sb_new()
+  let pos = sdsl_skip_ws(h, 0)
+  while pos &lt; n do
+    let m = sdsl_try_rules_at(def, h, pos)
+    if m[0] == &quot;ok&quot; then
+      sb_push(out, m[1])
+      sb_push(out, chr(10))
+      let pos = sdsl_skip_ws(h, m[2])
+    else
+      let nl = sdsl_find_char(h, pos, &quot;\n&quot;)
+      let line_end = nl
+      if nl &lt; 0 then
+        let line_end = n
+      end
+      let raw = sdsl_sc_substr(h, pos, line_end - pos)
+      print(&quot;syntax_dsl: no rule for trigger '&quot; + def[1] + &quot;' matched: &quot; + raw)
+      sb_push(out, raw)
+      sb_push(out, chr(10))
+      if nl &lt; 0 then
+        let pos = n
+      else
+        let pos = sdsl_skip_ws(h, nl + 1)
+      end
+    end
+  end
+  return sb_str(out)
 end
 
 make a function called sdsl_expand_trigger_blocks takes src, defs returns r
@@ -4899,26 +5581,7 @@ make a function called sdsl_expand_trigger_blocks takes src, defs returns r
       let j = sdsl_skip_ws(h, i + sdsl_len(def[1]))
       if (j &lt; n) and (sc_char(h, j) == &quot;{&quot;) then
         let br = sdsl_take_balanced_block(h, j)
-        let body = br[0]
-        let bh = str_intern(body)
-        let blen = sc_len(bh)
-        let start = 0
-        while start &lt;= blen do
-          let nl = sdsl_find_char(bh, start, &quot;\n&quot;)
-          let line_end = nl
-          if nl &lt; 0 then
-            let line_end = blen
-          end
-          let line = sdsl_trim(sdsl_sc_substr(bh, start, line_end - start))
-          if sdsl_len(line) &gt; 0 then
-            sb_push(out, sdsl_expand_rule_line(def, line) + &quot;\n&quot;)
-          end
-          if nl &lt; 0 then
-            let start = blen + 1
-          else
-            let start = nl + 1
-          end
-        end
+        sb_push(out, sdsl_expand_body(def, br[0]))
         let i = br[1]
       else
         sb_push(out, sc_char(h, i))

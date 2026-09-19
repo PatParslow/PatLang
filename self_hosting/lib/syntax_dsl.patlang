@@ -33,9 +33,41 @@
 #   }
 #
 # The `syntax { ... }` block itself is stripped. Every `routes { ... }` block
-# is expanded line-by-line into plain PatLang statements built from the
-# rule's `return` template, with `expect`-bound captures substituted in as
-# string literals -- before the normal lexer/parser ever sees the file.
+# is expanded into plain PatLang statements built from each matching rule's
+# `return` template, with `expect`-bound captures substituted in -- before
+# the normal lexer/parser ever sees the file. Two more `expect` forms exist
+# beyond a plain line-level token sequence, for grammars that need a nested
+# body or a repeated clause list (loops, if/else, switch/case, etc.):
+#
+#   expect Block          -- matches a `{ ... }` at the current position
+#                             (may span multiple lines), captures its
+#                             *already re-expanded* interior (re-run through
+#                             this SAME syntax def's full rule set,
+#                             recursively), and binds that expanded PatLang
+#                             code to the capture name.
+#   expect Many(RuleName)  -- repeatedly matches another rule of the SAME
+#                             syntax def by name, zero or more times, at the
+#                             current position; each iteration's own
+#                             substituted template output is joined with "\n"
+#                             and bound to the capture name.
+#
+# A capture used in a `return` template as `${name}` splices its bound value
+# in RAW, as already-valid PatLang code with no quoting -- this is how a
+# Block/Many capture (which IS PatLang code, not a data string) gets spliced
+# back in. A bare `name` (no `${...}`) keeps the original behavior: the
+# captured text is inserted as a quoted PatLang string literal (for plain
+# data captures like a route's HTTP verb or URL path).
+#
+# Example (a `for`-with-body form, illustrating Block + `${...}`):
+#
+#   rule ForLoop {
+#       expect ForKw;
+#       expect Symbol("(");
+#       let cond = expect CondExpr;
+#       expect Symbol(")");
+#       let body = expect Block;
+#       return "while ${cond} do\n${body}\nend";
+#   }
 #
 # Per-token `regex(...)` matching is done by the general-purpose regex engine
 # at lib/regex_dsl.patlang -- this file assumes regex_match_string_at (and
@@ -50,10 +82,18 @@
 #
 # Data shapes (plain tagged lists -- there is no map/struct in this dialect):
 #   TokenDef  = ["token", name, kind, pattern]      kind: "regex" | "literal"
-#   RuleStep  = ["step", kind, value, bind]         kind: "named" | "identifier" | "symbol"
-#   RuleDef   = ["rule", steps_list, return_template]
+#   RuleStep  = ["step", kind, value, bind]         kind: "named" | "identifier" | "symbol" | "block" | "many"
+#                                                    ("many"'s `value` is the target rule's name)
+#   RuleDef   = ["rule", name, steps_list, return_template]
 #   SyntaxDef = ["syntax", trigger_keyword, tokens_list, rules_list]
-#   MatchResult = ["ok", bindings_list] | ["fail"]  bindings_list: [[name, text], ...]
+#   MatchResult = ["ok", bindings_list, new_pos] | ["fail"]  bindings_list: [[name, text], ...]
+#
+# NOTE on scope of "PatLang is canon" for this feature: this file is the
+# self-hosted implementation and is the canonical/primary implementation of
+# the syntax DSL feature. rust-runtime/src/syntax_dsl.rs (the Rust-native
+# twin used only by `pat --patc`) does NOT currently implement Block/Many/
+# `${...}` -- it still only supports the original flat, single-line rule
+# matching. Do not assume parity between the two for these primitives.
 # =============================================================================
 
 make a function called sdsl_is_ws takes ch returns r
@@ -456,7 +496,7 @@ make a function called sdsl_parse_token_defs takes tbody returns r
   return out
 end
 
-make a function called sdsl_parse_rule_def takes rbody returns r
+make a function called sdsl_parse_rule_def takes rule_name, rbody returns r
   let stmts = sdsl_split_top_level_statements(rbody)
   let steps = []
   let return_template = ""
@@ -489,14 +529,27 @@ make a function called sdsl_parse_rule_def takes rbody returns r
           if expect_part == "Identifier" then
             let steps = list_push(steps, ["step", "identifier", "", bind])
           else
-            let steps = list_push(steps, ["step", "named", expect_part, bind])
+            if expect_part == "Block" then
+              let steps = list_push(steps, ["step", "block", "", bind])
+            else
+              if sdsl_starts_with(expect_part, "Many") then
+                let inner = sdsl_trim(substr(expect_part, 4, sdsl_len(expect_part) - 4))
+                let ilen = sdsl_len(inner)
+                if (ilen >= 2) and (substr(inner, 0, 1) == "(") and (substr(inner, ilen - 1, 1) == ")") then
+                  let inner = sdsl_trim(substr(inner, 1, ilen - 2))
+                end
+                let steps = list_push(steps, ["step", "many", inner, bind])
+              else
+                let steps = list_push(steps, ["step", "named", expect_part, bind])
+              end
+            end
           end
         end
       end
     end
     let i = i + 1
   end
-  return ["rule", steps, return_template]
+  return ["rule", rule_name, steps, return_template]
 end
 
 make a function called sdsl_parse_syntax_def takes body returns r
@@ -528,7 +581,7 @@ make a function called sdsl_parse_syntax_def takes body returns r
           let nameinfo = sdsl_take_identifier(h, j)
           let j = sdsl_skip_ws(h, nameinfo[1])
           let br = sdsl_take_balanced_block(h, j)
-          let rules = list_push(rules, sdsl_parse_rule_def(br[0]))
+          let rules = list_push(rules, sdsl_parse_rule_def(nameinfo[0], br[0]))
           let i = br[1]
         else
           let i = i + 1
@@ -684,6 +737,26 @@ make a function called sdsl_find_token_def takes tokens, name returns r
   return found
 end
 
+# Finds `name` inside a RuleDef list (by the rule's own declared name, e.g.
+# for `expect Many(RuleName)`); returns the RuleDef, or a sentinel with empty
+# steps if absent (sdsl_match_many_step treats a zero-step match as
+# zero-width and stops the repetition rather than looping forever).
+make a function called sdsl_find_rule_by_name takes rules, name returns r
+  let n = rules.length
+  let i = 0
+  let found = ["rule", "", [], ""]
+  let scanning = true
+  while (i < n) and scanning do
+    let rl = rules[i]
+    if rl[1] == name then
+      let found = rl
+      let scanning = false
+    end
+    let i = i + 1
+  end
+  return found
+end
+
 # Finds `value` inside a [[name, value], ...] bindings list; returns "" if absent.
 make a function called sdsl_bindings_lookup takes bindings, name returns r
   let n = bindings.length
@@ -701,128 +774,257 @@ make a function called sdsl_bindings_lookup takes bindings, name returns r
   return found
 end
 
-# Attempts to match every step of `rule` against `line` in order. Returns
-# ["ok", bindings] on full success, ["fail"] if any step fails to match.
-make a function called sdsl_try_match_rule takes def, the_rule, line returns r
-  # NOTE: param renamed from `rule` -- a bare reserved keyword used as a
-  # plain parameter name silently truncates the params list instead of
-  # erroring (the parser's "takes NAME, NAME, ..." list expects
-  # Token::Identifier, but `rule` lexes as its own dedicated Token::Rule) --
-  # found via a genuinely confusing silent crash: this function ended up
-  # with params=["def"] only and a corrupted 2-instruction body, which the
-  # interpreter then panicked on internally, and that panic was silently
-  # swallowed by main()'s `.join().unwrap_or(())` thread-join wrapper,
-  # producing a totally silent "successful" exit with zero output and no
-  # error message at all. Same class of bug as the earlier `fn`-as-a-
-  # param-name collision found in the paradigm gallery work.
-  let steps = the_rule[1]
-  let line_h = str_intern(line)
-  let pos = 0
-  let bindings = []
+# Matches `expect Block` at absolute body position `cur`: skips whitespace
+# (allowed to cross newlines -- a `{` may follow its header on the same
+# line or a later one), requires a `{`, captures the balanced body (which
+# may itself span many lines) via the existing sdsl_take_balanced_block, and
+# recursively re-expands that captured body against `def`'s own full rule
+# set (sdsl_expand_body) -- this is the "recurse the whole syntax def"
+# behavior a Block capture uses. Returns [true, expanded_code, new_pos], or
+# [false, "", cur] (position unchanged) if no `{` is found there.
+make a function called sdsl_match_block_step takes def, h, cur returns r
+  let p = sdsl_skip_ws(h, cur)
+  if (p >= sc_len(h)) or (sc_char(h, p) != "{") then
+    return [false, "", cur]
+  else
+    let br = sdsl_take_balanced_block(h, p)
+    let expanded = sdsl_expand_body(def, br[0])
+    return [true, expanded, br[1]]
+  end
+end
+
+# Matches `expect Many(RuleName)` at absolute body position `cur`: repeats
+# matching the NAMED rule (looked up by name in def's own rule list) zero or
+# more times; each iteration produces its own fully-substituted template
+# output, and all iterations are joined with "\n". Always succeeds (a
+# zero-or-more repetition matching nothing is legitimate, e.g. an empty
+# switch). An iteration that matches without consuming any characters stops
+# the repetition immediately, both to guarantee termination in general and
+# to protect against an unrecognized RuleName (whose sentinel has zero
+# steps and would otherwise match trivially forever).
+make a function called sdsl_match_many_step takes def, rule_name, h, cur returns r
+  let target = sdsl_find_rule_by_name(def[3], rule_name)
+  let out = sb_new()
+  let n = sc_len(h)
+  let p = sdsl_skip_ws(h, cur)
+  let scanning = true
+  while scanning and (p < n) do
+    let m = sdsl_try_match_rule_at(def, target, h, p)
+    if m[0] == "ok" then
+      if m[2] <= p then
+        let scanning = false
+      else
+        sb_push(out, sdsl_substitute_template(target[3], m[1]))
+        sb_push(out, chr(10))
+        let p = sdsl_skip_ws(h, m[2])
+      end
+    else
+      let scanning = false
+    end
+  end
+  return [true, sb_str(out), p]
+end
+
+# Cursor-based rule matcher: attempts to match every step of `the_rule`
+# starting at absolute body position `start_pos` within the shared body
+# handle `h`. Ordinary (identifier/symbol/named-token) steps are confined to
+# the rest of the CURRENT line only, exactly like the original line-only
+# matcher this replaces; `block`/`many` steps are the only ones allowed to
+# consume across newlines. Returns ["ok", bindings, new_pos] on full
+# success, ["fail"] if any step fails to match.
+make a function called sdsl_try_match_rule_at takes def, the_rule, h, start_pos returns r
+  # NOTE: param named `the_rule`, not `rule` -- see the historical note this
+  # replaced: a bare reserved keyword used as a plain parameter name
+  # silently truncates the params list instead of erroring.
+  let steps = the_rule[2]
   let n = steps.length
+  let cur = start_pos
+  let bindings = []
   let i = 0
   let ok = true
   while (i < n) and ok do
-    let pos = sdsl_skip_ws(line_h, pos)
     let step = steps[i]
     let kind = step[1]
-    let matched = -1
-    if kind == "identifier" then
-      let matched = sdsl_match_identifier(line, pos)
-    else
-      if kind == "symbol" then
-        let matched = sdsl_match_literal(line, pos, step[2])
+    if kind == "block" then
+      let bm = sdsl_match_block_step(def, h, cur)
+      if bm[0] then
+        let bind = step[3]
+        if sdsl_len(bind) > 0 then
+          let bindings = list_push(bindings, [bind, bm[1]])
+        end
+        let cur = bm[2]
       else
-        let tdef = sdsl_find_token_def(def[2], step[2])
-        if tdef[2] == "literal" then
-          let matched = sdsl_match_literal(line, pos, tdef[3])
+        let ok = false
+      end
+    else
+      if kind == "many" then
+        let mm = sdsl_match_many_step(def, step[2], h, cur)
+        let bind = step[3]
+        if sdsl_len(bind) > 0 then
+          let bindings = list_push(bindings, [bind, mm[1]])
+        end
+        let cur = mm[2]
+      else
+        let hlen = sc_len(h)
+        let nl = sdsl_find_char(h, cur, "\n")
+        let line_end = nl
+        if nl < 0 then
+          let line_end = hlen
+        end
+        let line = sdsl_sc_substr(h, cur, line_end - cur)
+        let line_h = str_intern(line)
+        let lpos = sdsl_skip_ws(line_h, 0)
+        let matched = -1
+        if kind == "identifier" then
+          let matched = sdsl_match_identifier(line, lpos)
         else
-          if tdef[2] == "regex" then
-            let text = substr(line, pos, sdsl_len(line) - pos)
-            let end_off = regex_match_string_at(tdef[3], text, 0)
-            if end_off > 0 then
-              let matched = pos + end_off
+          if kind == "symbol" then
+            let matched = sdsl_match_literal(line, lpos, step[2])
+          else
+            let tdef = sdsl_find_token_def(def[2], step[2])
+            if tdef[2] == "literal" then
+              let matched = sdsl_match_literal(line, lpos, tdef[3])
+            else
+              if tdef[2] == "regex" then
+                let text = substr(line, lpos, sdsl_len(line) - lpos)
+                let end_off = regex_match_string_at(tdef[3], text, 0)
+                if end_off > 0 then
+                  let matched = lpos + end_off
+                end
+              end
             end
           end
         end
+        if matched < 0 then
+          let ok = false
+        else
+          let bind = step[3]
+          if sdsl_len(bind) > 0 then
+            let bindings = list_push(bindings, [bind, substr(line, lpos, matched - lpos)])
+          end
+          let cur = cur + matched
+        end
       end
-    end
-    if matched < 0 then
-      let ok = false
-    else
-      let bind = step[3]
-      if sdsl_len(bind) > 0 then
-        let bindings = list_push(bindings, [bind, substr(line, pos, matched - pos)])
-      end
-      let pos = matched
     end
     let i = i + 1
   end
   if ok then
-    return ["ok", bindings]
+    return ["ok", bindings, cur]
   else
     return ["fail"]
   end
 end
 
-# Replaces every whole-word occurrence of a bound capture name in `template`
-# with its matched text as a PatLang string literal.
-make a function called sdsl_substitute_template takes template, bindings returns r
-  let n = sdsl_len(template)
-  let out = sb_new()
-  let i = 0
-  while i < n do
-    let c = substr(template, i, 1)
-    if sdsl_is_ident_start(c) then
-      let j = i + 1
-      let scanning = true
-      while (j < n) and scanning do
-        if sdsl_is_ident_char(substr(template, j, 1)) then
-          let j = j + 1
-        else
-          let scanning = false
-        end
-      end
-      let word = substr(template, i, j - i)
-      let val = sdsl_bindings_lookup(bindings, word)
-      if sdsl_len(val) > 0 then
-        sb_push(out, "\"" + val + "\"")
-      else
-        sb_push(out, word)
-      end
-      let i = j
-    else
-      sb_push(out, c)
-      let i = i + 1
-    end
-  end
-  return sb_str(out)
-end
-
-# Runs each of the DSL's rules (in declaration order) against `line`,
-# returning the first one whose full `expect` sequence matches, with its
-# return template's captures substituted in as PatLang string literals.
-make a function called sdsl_expand_rule_line takes def, line returns r
+# Tries every rule of `def` (in declaration order) at absolute body position
+# `pos`. Returns ["ok", substituted_text, new_pos] for the first rule whose
+# full `expect` sequence matches, or ["fail"] if none do.
+make a function called sdsl_try_rules_at takes def, h, pos returns r
   let rules = def[3]
   let n = rules.length
   let i = 0
-  let result = ""
+  let result = ["fail"]
   let found = false
   while (i < n) and (not found) do
-    let m = sdsl_try_match_rule(def, rules[i], line)
+    let m = sdsl_try_match_rule_at(def, rules[i], h, pos)
     if m[0] == "ok" then
-      # No trailing ";" -- PatLang has no statement-terminating semicolon
-      # anywhere in its grammar. A stray ";" tokenizes as its own UNK token
-      # and becomes a parse error; that error was invisible when this output
-      # only ever went through compile_native (lower_program silently drops
-      # unparseable Err statements), but is fatal for the playground/IDE
-      # path, which aborts entirely if any parse error is present.
-      let result = sdsl_substitute_template(rules[i][2], m[1])
+      let text = sdsl_substitute_template(rules[i][3], m[1])
+      let result = ["ok", text, m[2]]
       let found = true
     end
     let i = i + 1
   end
   return result
+end
+
+# Replaces captures in `template`: `${name}` splices the bound value RAW, no
+# quoting or escaping -- used for Block/Many captures, which are already
+# valid, already-expanded PatLang code, not data. A bare whole-word `name`
+# keeps the original behavior: the bound value is inserted as a quoted
+# PatLang string literal (for plain data captures, e.g. a route's HTTP verb).
+make a function called sdsl_substitute_template takes template, bindings returns r
+  let th = str_intern(template)
+  let n = sc_len(th)
+  let out = sb_new()
+  let i = 0
+  while i < n do
+    let c = sc_char(th, i)
+    if (c == "$") and ((i + 1) < n) and (sc_char(th, i + 1) == "{") then
+      let close = sdsl_find_char(th, i + 2, "}")
+      if close < 0 then
+        sb_push(out, c)
+        let i = i + 1
+      else
+        let word = sdsl_trim(sdsl_sc_substr(th, i + 2, close - (i + 2)))
+        let val = sdsl_bindings_lookup(bindings, word)
+        sb_push(out, val)
+        let i = close + 1
+      end
+    else
+      if sdsl_is_ident_start(c) then
+        let j = i + 1
+        let scanning = true
+        while (j < n) and scanning do
+          if sdsl_is_ident_char(sc_char(th, j)) then
+            let j = j + 1
+          else
+            let scanning = false
+          end
+        end
+        let word = sdsl_sc_substr(th, i, j - i)
+        let val = sdsl_bindings_lookup(bindings, word)
+        if sdsl_len(val) > 0 then
+          sb_push(out, "\"" + val + "\"")
+        else
+          sb_push(out, word)
+        end
+        let i = j
+      else
+        sb_push(out, c)
+        let i = i + 1
+      end
+    end
+  end
+  return sb_str(out)
+end
+
+# Expands `body` (a triggered block's interior, OR -- recursively -- a
+# Block-step's captured interior) against `def`'s full rule set: tries every
+# rule at the current position, appends its substituted output, and
+# advances past whatever it consumed (which may cross many lines for a rule
+# using a Block/Many step). A position where no rule matches is surfaced via
+# `print` and the offending line is passed through unchanged, rather than
+# silently dropped (the previous line-only implementation silently vanished
+# any line that didn't match any rule -- a real latent gap, fixed here as
+# opportunistic cleanup directly adjacent to this rework).
+make a function called sdsl_expand_body takes def, body returns r
+  let h = str_intern(body)
+  let n = sc_len(h)
+  let out = sb_new()
+  let pos = sdsl_skip_ws(h, 0)
+  while pos < n do
+    let m = sdsl_try_rules_at(def, h, pos)
+    if m[0] == "ok" then
+      sb_push(out, m[1])
+      sb_push(out, chr(10))
+      let pos = sdsl_skip_ws(h, m[2])
+    else
+      let nl = sdsl_find_char(h, pos, "\n")
+      let line_end = nl
+      if nl < 0 then
+        let line_end = n
+      end
+      let raw = sdsl_sc_substr(h, pos, line_end - pos)
+      print("syntax_dsl: no rule for trigger '" + def[1] + "' matched: " + raw)
+      sb_push(out, raw)
+      sb_push(out, chr(10))
+      if nl < 0 then
+        let pos = n
+      else
+        let pos = sdsl_skip_ws(h, nl + 1)
+      end
+    end
+  end
+  return sb_str(out)
 end
 
 make a function called sdsl_expand_trigger_blocks takes src, defs returns r
@@ -863,26 +1065,7 @@ make a function called sdsl_expand_trigger_blocks takes src, defs returns r
       let j = sdsl_skip_ws(h, i + sdsl_len(def[1]))
       if (j < n) and (sc_char(h, j) == "{") then
         let br = sdsl_take_balanced_block(h, j)
-        let body = br[0]
-        let bh = str_intern(body)
-        let blen = sc_len(bh)
-        let start = 0
-        while start <= blen do
-          let nl = sdsl_find_char(bh, start, "\n")
-          let line_end = nl
-          if nl < 0 then
-            let line_end = blen
-          end
-          let line = sdsl_trim(sdsl_sc_substr(bh, start, line_end - start))
-          if sdsl_len(line) > 0 then
-            sb_push(out, sdsl_expand_rule_line(def, line) + "\n")
-          end
-          if nl < 0 then
-            let start = blen + 1
-          else
-            let start = nl + 1
-          end
-        end
+        sb_push(out, sdsl_expand_body(def, br[0]))
         let i = br[1]
       else
         sb_push(out, sc_char(h, i))
