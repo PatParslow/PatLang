@@ -1,0 +1,173 @@
+# isolate.patlang -- isolated PatLang programs that share nothing but messages.
+#
+# An isolate is a compiled program plus a private VFS namespace. Execution is
+# in run-to-completion TURNS: isolate_step runs the program once, from the top,
+# in a clean interpreter (world_run); when it ends, its VFS is merged back and
+# the world is discarded. Everything else -- variables, facts, handles -- resets
+# every turn, so anything an isolate needs later goes in its VFS. This is the
+# one model that behaves identically native and in the browser, where there are
+# no threads or processes to run an isolate concurrently.
+#
+# Inside the child the namespace is its whole VFS:
+#   /state/...        durable state it reads and writes with vfs_read/vfs_write
+#   /mbox/in/...      messages sent to it       (read with mbox_take("in"))
+#   /mbox/out/...     messages it sends back    (mbox_put("out", "me", text))
+#   /__iso__/self     its own id
+#   /__iso__/turn     how many turns have completed before this one
+# The child source includes mailbox.patlang for the mbox_* calls.
+#
+# In the parent the same tree lives under /iso/<id>/, addressable with the
+# mbox_*_ns calls, and isolate_send/isolate_recv wrap those.
+#
+# A turn is transactional: if the program crashes or exhausts its step budget,
+# nothing it wrote is kept and its inbox is untouched, so the messages are seen
+# again on the next turn (at-least-once).
+#
+# Needs a runtime with "world_swap" (see host_caps); isolate_caps() says.
+
+include "interp_run.patlang"
+include "mailbox.patlang"
+
+make a function called isolate_caps returns caps
+  if iri_has_cap("world_swap") then
+    return ["turns"]
+  end
+  return []
+end
+
+make a function called iso_ns takes id returns ns
+  return "/iso/" + id
+end
+
+make a function called iso_next_id returns id
+  let n = to_num("0" + get("__vars", "__iso_seq")) + 1
+  set_var("__iso_seq", "" + n)
+  return "iso" + n
+end
+
+# isolate_start(source, opts) -> handle [id, ir] , or ["", message] if the
+# source does not compile or this runtime cannot run isolates. opts:
+# max_steps (per turn).
+make a function called isolate_start takes source, opts returns handle
+  if iri_has_cap("world_swap") == false then
+    return ["", "isolate_start: this runtime has no world_swap"]
+  end
+  let c = interp_compile(source)
+  if c[0] == "err" then
+    return ["", c[1]]
+  end
+  let id = iso_next_id()
+  vfs_write(iso_ns(id) + "/__iso__/self", id)
+  vfs_write(iso_ns(id) + "/__iso__/turn", "0")
+  return [id, c[1], opts]
+end
+
+make a function called isolate_ok takes handle returns ok
+  return handle[0] != ""
+end
+
+# The isolate's VFS as [[path, content], ...] with the namespace stripped.
+make a function called iso_snapshot takes id returns entries
+  let ns = iso_ns(id)
+  let keys = vfs_list(ns + "/")
+  let out = []
+  let i = 0
+  while i < list_len(keys) do
+    let path = substr(keys[i], ns.length, keys[i].length - ns.length)
+    let out = list_push(out, [path, vfs_read(keys[i])])
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called iso_has_path takes entries, path returns found
+  let i = 0
+  while i < list_len(entries) do
+    if entries[i][0] == path then return true end
+    let i = i + 1
+  end
+  return false
+end
+
+# Replace the isolate's namespace with the child's final VFS.
+make a function called iso_commit takes id, entries returns done
+  let ns = iso_ns(id)
+  let keys = vfs_list(ns + "/")
+  let i = 0
+  while i < list_len(keys) do
+    let path = substr(keys[i], ns.length, keys[i].length - ns.length)
+    if iso_has_path(entries, path) == false then
+      vfs_delete(keys[i])
+    end
+    let i = i + 1
+  end
+  let j = 0
+  while j < list_len(entries) do
+    vfs_write(ns + entries[j][0], entries[j][1])
+    let j = j + 1
+  end
+  return true
+end
+
+# isolate_step(handle) -> [ok, stdout, stderr]. Runs one turn.
+make a function called isolate_step takes handle returns result
+  if isolate_ok(handle) == false then
+    return [false, "", handle[1]]
+  end
+  let id = handle[0]
+  let turn_key = iso_ns(id) + "/__iso__/turn"
+  let wopts = [["vfs_in", iso_snapshot(id)], ["vfs_out_prefix", "/"]]
+  let max_steps = iri_opt(handle[2], "max_steps", 0)
+  if max_steps > 0 then
+    let wopts = list_push(wopts, ["max_steps", max_steps])
+  end
+  let r = interp_run_ir(handle[1], wopts)
+  if r[2] == false then
+    return [false, r[0], r[1]]
+  end
+  iso_commit(id, r[3])
+  vfs_write(turn_key, "" + (to_num(vfs_read(turn_key)) + 1))
+  return [true, r[0], ""]
+end
+
+# isolate_send(handle, from, payload) -> message id.
+make a function called isolate_send takes handle, from, payload returns id
+  return mbox_put_ns(iso_ns(handle[0]), "in", from, payload)
+end
+
+# isolate_recv(handle) -> [[id, payload], ...] everything the isolate has put
+# in its outbox since the last recv (each is removed).
+make a function called isolate_recv takes handle returns messages
+  return mbox_drain_ns(iso_ns(handle[0]), "out")
+end
+
+make a function called isolate_pending takes handle returns n
+  return mbox_count_ns(iso_ns(handle[0]), "in")
+end
+
+make a function called isolate_turns takes handle returns n
+  return to_num(vfs_read(iso_ns(handle[0]) + "/__iso__/turn"))
+end
+
+# Steps until the inbox is empty or `max_turns` turns have run. Returns
+# [turns_run, ok]; ok is false if a turn failed (the inbox is left as it was).
+make a function called isolate_run_until_idle takes handle, max_turns returns result
+  let turns = 0
+  while isolate_pending(handle) > 0 and turns < max_turns do
+    let r = isolate_step(handle)
+    let turns = turns + 1
+    if r[0] == false then
+      return [turns, false]
+    end
+  end
+  return [turns, true]
+end
+
+# Everything of the isolate's state under /state/, read from the parent.
+make a function called isolate_state takes handle, name returns value
+  let key = iso_ns(handle[0]) + "/state/" + name
+  if vfs_exists(key) == "1" then
+    return vfs_read(key)
+  end
+  return ""
+end

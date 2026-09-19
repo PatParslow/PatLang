@@ -1,0 +1,133 @@
+# Selftest for self_hosting/lib/mailbox.patlang and lib/isolate.patlang.
+#
+# Run from the repo root:
+#   rust-runtime/target/release/pat.exe --ir-run self_hosting/isolate_selftest.patlang
+
+include "lib/test.patlang"
+include "lib/isolate.patlang"
+
+let nl = chr(10)
+
+make a function called ist_src takes lines returns text
+  let out = ""
+  let i = 0
+  while i < list_len(lines) do
+    let out = out + lines[i] + chr(10)
+    let i = i + 1
+  end
+  return out
+end
+
+t_init()
+
+# --- mailbox: ordering, ack, at-least-once ---
+let a = mbox_put("box", "alice", "first")
+let b = mbox_put("box", "bob", "second")
+let c = mbox_put("box", "alice", "third")
+check("ids are unique", a != b and b != c, true)
+check("count reports pending messages", mbox_count("box"), 3)
+check("ids list oldest first", mbox_ids("box")[0], a)
+let p = mbox_peek("box")
+check("peek returns the oldest payload", p[1], "first")
+check("peek does not remove", mbox_count("box"), 3)
+mbox_ack("box", p[0])
+check("ack removes exactly that message", mbox_count("box"), 2)
+let t = mbox_take("box")
+check("take returns the next oldest", t[1], "second")
+let d = mbox_drain("box")
+check("drain returns what is left in order", d[0][1], "third")
+check("drain empties the box", mbox_count("box"), 0)
+check("peek on an empty box is empty", list_len(mbox_peek("box")), 0)
+let e = mbox_put("box", "alice", "later")
+check("ids are never reused after a box empties", e != a and e != b and e != c, true)
+check("boxes are independent", mbox_count("other"), 0)
+
+# --- isolate: a stateful ping-pong across turns ---
+let worker = ist_src([
+  "include \"lib/mailbox.patlang\"",
+  "let n = 0",
+  "if vfs_exists(\"/state/n\") == \"1\" then",
+  "  let n = to_num(vfs_read(\"/state/n\"))",
+  "end",
+  "let msgs = mbox_drain(\"in\")",
+  "let i = 0",
+  "while i < list_len(msgs) do",
+  "  let n = n + 1",
+  "  mbox_put(\"out\", vfs_read(\"/__iso__/self\"), \"pong:\" + msgs[i][1] + \"#\" + n)",
+  "  let i = i + 1",
+  "end",
+  "vfs_write(\"/state/n\", \"\" + n)"
+])
+let expanded = expand_includes(worker, "self_hosting")
+let h = isolate_start(expanded, [])
+check("the worker compiles", isolate_ok(h), true)
+let h2 = isolate_start(expanded, [])
+check("each isolate gets its own id", h[0] != h2[0], true)
+
+isolate_send(h, "main", "a")
+isolate_send(h, "main", "b")
+check("messages wait in the inbox until a turn runs", isolate_pending(h), 2)
+let r1 = isolate_step(h)
+check("the first turn succeeds", r1[0], true)
+check("the turn consumed the inbox", isolate_pending(h), 0)
+let out1 = isolate_recv(h)
+check("both replies came back", list_len(out1), 2)
+check("replies keep order", out1[0][1], "pong:a#1")
+check("second reply carries updated state", out1[1][1], "pong:b#2")
+check("the child knew its own id", starts_with(out1[0][0], "0000000001~iso"), true)
+check("recv empties the outbox", list_len(isolate_recv(h)), 0)
+
+isolate_send(h, "main", "c")
+let r2 = isolate_step(h)
+let out2 = isolate_recv(h)
+check("state persisted across turns", out2[0][1], "pong:c#3")
+check("the parent can read the isolate's state", isolate_state(h, "n"), "3")
+check("turns are counted", isolate_turns(h), 2)
+
+# --- isolation ---
+check("the other isolate's state is untouched", isolate_state(h2, "n"), "")
+check("the parent's own vfs has no leaked /state", vfs_exists("/state/n") == "1", false)
+set_var("ist_k", "parent")
+let leak = ist_src(["set_var(\"ist_k\", \"child\")", "fact(\"ist_f\", \"a\", \"b\")"])
+let hl = isolate_start(leak, [])
+isolate_step(hl)
+check("a child's variables do not reach the parent", get("__vars", "ist_k"), "parent")
+check("a child's facts do not reach the parent", query("ist_f", "a", "_"), 0)
+
+# --- a failed turn commits nothing and keeps the message ---
+let crashy = ist_src([
+  "include \"lib/mailbox.patlang\"",
+  "vfs_write(\"/state/touched\", \"yes\")",
+  "let m = mbox_take(\"in\")",
+  "let x = no_such_function(1)"
+])
+let hc = isolate_start(expand_includes(crashy, "self_hosting"), [])
+isolate_send(hc, "main", "keep me")
+let rc = isolate_step(hc)
+check("a crashing turn reports failure", rc[0], false)
+check("its writes were rolled back", isolate_state(hc, "touched"), "")
+check("its inbox message is still there", isolate_pending(hc), 1)
+check("a failed turn is not counted", isolate_turns(hc), 0)
+
+# --- step budget per isolate ---
+let spin = isolate_start(ist_src(["while true do", "end"]), [["max_steps", 3000]])
+let rs = isolate_step(spin)
+check("an isolate that never returns is stopped by its budget", rs[0], false)
+check("the budget error is reported", contains_text(rs[2], "step budget exhausted"), true)
+
+# --- run_until_idle ---
+let hi = isolate_start(expanded, [])
+isolate_send(hi, "main", "x")
+isolate_send(hi, "main", "y")
+let idle = isolate_run_until_idle(hi, 5)
+check("run_until_idle stops when the inbox is empty", idle[1], true)
+check("one turn was enough to drain both", idle[0], 1)
+
+# --- a bad program is reported, not fatal ---
+let bad = isolate_start("print(1", [])
+check("a source that does not compile gives no isolate", isolate_ok(bad), false)
+check("the compile error is reported", starts_with(bad[1], "parse error"), true)
+
+check("isolate_caps lists turn-based isolates", isolate_caps()[0], "turns")
+
+t_report()

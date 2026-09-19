@@ -1,0 +1,137 @@
+# mailbox.patlang -- named mailboxes on the in-memory VFS (vfs_write/vfs_read/
+# vfs_list/vfs_delete), so they work on every target including the browser.
+#
+# One VFS key per message:  <ns>/mbox/<box>/<seq><writer>   where <seq> is a
+# zero-padded counter and <writer> is "~name". A put only creates a new key
+# (plus bumps the box's counter); nothing is read back and rewritten, so
+# messages from different writers never overwrite one another, and vfs_list's
+# sorted order is delivery order.
+#
+# A message stays in the box until it is acked (deleted): mbox_peek + mbox_ack
+# is at-least-once (a consumer that dies between them leaves the message for
+# the next turn); mbox_take is peek + ack in one call.
+#
+# `ns` is a path prefix for the whole mailbox tree ("" for the caller's own
+# VFS, "/iso/<id>" for the VFS namespace isolate.patlang gives an isolate),
+# so a parent can address a child's mailboxes without a second API. The plain
+# mbox_* functions use ns "".
+#
+# Ids are the key suffix ("0000000003~alice"); they are unique per box for the
+# life of the counter, so acking an id never removes a different message.
+
+make a function called mbox_prefix takes ns, box returns prefix
+  return ns + "/mbox/" + box + "/"
+end
+
+make a function called mbox_pad takes n returns text
+  let s = "" + n
+  while s.length < 10 do
+    let s = "0" + s
+  end
+  return s
+end
+
+make a function called mbox_counter_key takes ns, box returns key
+  return mbox_prefix(ns, box) + ".seq"
+end
+
+# The pending ids of a box, oldest first.
+make a function called mbox_ids_ns takes ns, box returns ids
+  let prefix = mbox_prefix(ns, box)
+  let keys = vfs_list(prefix)
+  let ids = []
+  let i = 0
+  while i < list_len(keys) do
+    let id = substr(keys[i], prefix.length, keys[i].length - prefix.length)
+    if id != ".seq" then
+      let ids = list_push(ids, id)
+    end
+    let i = i + 1
+  end
+  return ids
+end
+
+# Adds a message; returns its id.
+make a function called mbox_put_ns takes ns, box, writer, payload returns id
+  let ckey = mbox_counter_key(ns, box)
+  let last = 0
+  if vfs_exists(ckey) == "1" then
+    let last = to_num(vfs_read(ckey))
+  end
+  let seq = last + 1
+  vfs_write(ckey, "" + seq)
+  let id = mbox_pad(seq) + "~" + writer
+  vfs_write(mbox_prefix(ns, box) + id, payload)
+  return id
+end
+
+# [id, payload] of the oldest pending message, or [] if the box is empty.
+make a function called mbox_peek_ns takes ns, box returns message
+  let ids = mbox_ids_ns(ns, box)
+  if list_len(ids) == 0 then
+    return []
+  end
+  return [ids[0], vfs_read(mbox_prefix(ns, box) + ids[0])]
+end
+
+make a function called mbox_ack_ns takes ns, box, id returns removed
+  return vfs_delete(mbox_prefix(ns, box) + id)
+end
+
+# peek + ack: [id, payload], or [] if the box is empty.
+make a function called mbox_take_ns takes ns, box returns message
+  let m = mbox_peek_ns(ns, box)
+  if list_len(m) == 0 then
+    return []
+  end
+  mbox_ack_ns(ns, box, m[0])
+  return m
+end
+
+# Every pending message, oldest first, each acked: [[id, payload], ...].
+make a function called mbox_drain_ns takes ns, box returns messages
+  let out = []
+  let ids = mbox_ids_ns(ns, box)
+  let i = 0
+  while i < list_len(ids) do
+    let key = mbox_prefix(ns, box) + ids[i]
+    let out = list_push(out, [ids[i], vfs_read(key)])
+    vfs_delete(key)
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called mbox_count_ns takes ns, box returns n
+  return list_len(mbox_ids_ns(ns, box))
+end
+
+# ---- the caller's own VFS (ns "") ----
+
+make a function called mbox_put takes box, writer, payload returns id
+  return mbox_put_ns("", box, writer, payload)
+end
+
+make a function called mbox_ids takes box returns ids
+  return mbox_ids_ns("", box)
+end
+
+make a function called mbox_peek takes box returns message
+  return mbox_peek_ns("", box)
+end
+
+make a function called mbox_ack takes box, id returns removed
+  return mbox_ack_ns("", box, id)
+end
+
+make a function called mbox_take takes box returns message
+  return mbox_take_ns("", box)
+end
+
+make a function called mbox_drain takes box returns messages
+  return mbox_drain_ns("", box)
+end
+
+make a function called mbox_count takes box returns n
+  return mbox_count_ns("", box)
+end

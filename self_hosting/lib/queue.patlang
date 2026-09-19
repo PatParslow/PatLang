@@ -22,6 +22,12 @@
 # left "pending" on disk for a later run (or a dedicated recovery pass) to
 # find via queue_pending and decide whether to retry or compensate.
 #
+# Storage driver: the log lives in real files ("fs", durable across
+# processes) wherever host_caps() lists "fs", and in the in-memory VFS
+# ("vfs", every target including the browser, gone when the world ends)
+# where it does not. queue_use_driver("vfs") or queue_use_driver("fs")
+# forces one; every queue_* call behaves the same on either.
+#
 # NOTE on style: q_dir() is a function, not a top-level `let`, for the same
 # reason build_daemon.patlang's "constants" all are -- see that file's own
 # header comment and [[patlang-backlog]] item 10.
@@ -34,6 +40,29 @@ end
 
 make a function called q_file takes topic returns path
   return q_dir() + "/" + topic + ".log"
+end
+
+make a function called q_key takes topic returns key
+  return "/queue/" + topic + ".log"
+end
+
+# "fs" or "vfs": the forced driver if queue_use_driver was called, else "fs"
+# when this runtime has files and "vfs" when it does not.
+make a function called queue_driver returns name
+  let forced = "" + get("__vars", "__queue_driver")
+  if forced != "" then return forced end
+  let caps = host_caps()
+  let i = 0
+  while i < list_len(caps) do
+    if caps[i] == "fs" then return "fs" end
+    let i = i + 1
+  end
+  return "vfs"
+end
+
+make a function called queue_use_driver takes name returns done
+  set_var("__queue_driver", name)
+  return true
 end
 
 make a function called q_tab returns t
@@ -79,11 +108,19 @@ end
 # Read a topic's log into a list of [id, status, payload] triples.
 # Returns [] if the topic has no log file yet.
 make a function called q_read takes topic returns rows
-  let path = q_file(topic)
-  if file_exists(path) != true then
-    return []
+  let raw = ""
+  if queue_driver() == "vfs" then
+    if vfs_exists(q_key(topic)) != "1" then
+      return []
+    end
+    let raw = vfs_read(q_key(topic))
+  else
+    let path = q_file(topic)
+    if file_exists(path) != true then
+      return []
+    end
+    let raw = read_file(path)
   end
-  let raw = read_file(path)
   let lines = split_lines(raw)
   let out = []
   let i = 0
@@ -108,7 +145,11 @@ make a function called q_write takes topic, rows returns done
     sb_push(b, row[0] + t + row[1] + t + row[2] + chr(10))
     let i = i + 1
   end
-  write_file(q_file(topic), sb_str(b))
+  if queue_driver() == "vfs" then
+    vfs_write(q_key(topic), sb_str(b))
+  else
+    write_file(q_file(topic), sb_str(b))
+  end
   return true
 end
 

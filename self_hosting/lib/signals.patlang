@@ -46,6 +46,8 @@
 # need one before ever binding beyond 127.0.0.1; out of scope here, same as
 # this feature's own backlog note said from the start.
 
+include "mailbox.patlang"
+
 # signal_claim(port) -> port_id (>= 0) if this process is now the primary
 # holder of `port` for signal delivery, or -1 if another process already
 # holds it (the caller should treat that as "an instance is already
@@ -57,6 +59,7 @@
 # bind failure (invalid port, permission denied) still aborts, same as
 # plain tcp_listen would.
 make a function called signal_claim takes port returns port_id
+  if signal_driver() == "vfs" then return sigv_claim(port) end
   return tcp_try_listen(port)
 end
 
@@ -76,6 +79,7 @@ end
 # signal_reply, so an empty string is written back and the sender (using
 # plain signal_send, which never reads a reply) never notices either way.
 make a function called signal_poll takes port_id, timeout_ms returns name
+  if signal_driver() == "vfs" then return sigv_poll(port_id) end
   let conn = tcp_accept_timeout(port_id, timeout_ms)
   if conn < 0 then
     return ""
@@ -132,6 +136,10 @@ end
 # aborts, which is an honest failure mode for a fire-and-forget CLI
 # signal, not a silent no-op.
 make a function called signal_send takes port, name, payload returns delivered
+  if signal_driver() == "vfs" then
+    sigv_send(port, name, payload)
+    return true
+  end
   signal_query(port, name, payload)
   return true
 end
@@ -142,10 +150,92 @@ end
 # "status"). Same fatal-on-nothing-listening caveat as signal_send (no
 # try/catch to catch tcp_connect's error gracefully).
 make a function called signal_query takes port, name, payload returns reply
+  if signal_driver() == "vfs" then return sigv_query(port, name, payload) end
   let conn = tcp_connect("127.0.0.1", port)
   tcp_write(conn, name + chr(10) + payload)
   let reply = tcp_read(conn)
   tcp_close(conn)
+  return reply
+end
+
+# ---- vfs driver -----------------------------------------------------------
+#
+# Where the runtime has no tcp (the browser), or after signal_use_driver("vfs"),
+# signals travel as mailbox messages instead: box "sig/<port>" holds what has
+# been sent, "/sig/<port>/claim" marks the port as taken, and a reply is left at
+# "/sig/<port>/reply/<message id>". There are no other processes to reach, so
+# "primary" and "sender" are two parts of one program, or two isolates whose
+# namespaces the parent addresses with the mbox_*_ns calls (see isolate.patlang):
+# the parent drops a message in the isolate's "sig/<port>" box, the isolate calls
+# signal_poll during its turn, and the parent reads the reply file afterwards.
+# signal_query on this driver polls at once, so it answers only if the handler is
+# registered in the same world.
+
+make a function called signal_driver returns name
+  let forced = "" + get("__vars", "__signal_driver")
+  if forced != "" then return forced end
+  let caps = host_caps()
+  let i = 0
+  while i < list_len(caps) do
+    if caps[i] == "tcp" then return "tcp" end
+    let i = i + 1
+  end
+  return "vfs"
+end
+
+make a function called signal_use_driver takes name returns done
+  set_var("__signal_driver", name)
+  return true
+end
+
+make a function called sigv_box takes port returns box
+  return "sig/" + port
+end
+
+make a function called sigv_claim takes port returns port_id
+  let key = "/sig/" + port + "/claim"
+  if vfs_exists(key) == "1" then
+    return -1
+  end
+  vfs_write(key, "1")
+  return port
+end
+
+# Queues a signal and returns its message id.
+make a function called sigv_send takes port, name, payload returns id
+  return mbox_put(sigv_box(port), "sender", name + chr(10) + payload)
+end
+
+# Handles at most one queued signal: emits it, stores whatever signal_reply set
+# under the message id, returns the signal name ("" if none was waiting).
+make a function called sigv_poll takes port returns name
+  let m = mbox_take(sigv_box(port))
+  if list_len(m) == 0 then
+    return ""
+  end
+  let msg = m[1]
+  let nl = find_substr_signals(msg, chr(10))
+  let sig_name = msg
+  let payload = ""
+  if nl >= 0 then
+    let sig_name = substr(msg, 0, nl)
+    let payload = substr(msg, nl + 1, msg.length - nl - 1)
+  end
+  set_var("__signal_reply", "")
+  emit(sig_name, payload)
+  vfs_write("/sig/" + port + "/reply/" + m[0], get("__vars", "__signal_reply"))
+  return sig_name
+end
+
+make a function called sigv_query takes port, name, payload returns reply
+  let id = sigv_send(port, name, payload)
+  sigv_poll(port)
+  let key = "/sig/" + port + "/reply/" + id
+  if vfs_exists(key) != "1" then
+    return ""
+  end
+  let reply = vfs_read(key)
+  vfs_delete(key)
   return reply
 end
 
