@@ -7296,7 +7296,59 @@ make a function called x64_os_get_command_line_asm returns asm
   return sb_str(sb)
 end
 
+# The hosts x64_runtime.patlang implements as rt_host_<name> rather than under
+# their own names (see the comment there). Returns the runtime function to call,
+# or "" for any other name. Only reached for a CallHost, i.e. when the program
+# did not define the name itself.
+make a function called x64_host_alias_target takes name returns target
+  let names = ["add", "multiply", "subtract", "max", "min", "calculate", "calculate_result", "get_value", "process", "validate", "run_ir", "rustc_build_chunked", "float_to_bits", "codegen_prelude", "codegen_prelude_chunk", "compile_ir", "compile_shape", "fluent_set", "action_add_numeric", "plan_numeric"]
+  let i = 0
+  while i < list_len(names) do
+    if names[i] == name then
+      return "rt_host_" + name
+    end
+    let i = i + 1
+  end
+  return ""
+end
+
+# Prints `msg` and exits with code 98 when executed; falls through to nothing
+# (the exit never returns). The text goes in .data, laid out as a length-prefixed
+# string like every string literal, and the code switches back to .text.
+make a function called x64_fatal_message_asm takes msg returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, "section .data" + x64_nl_char())
+  sb_push(sb, "FMSG_TEXT_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    dq " + to_num(sc_len(str_intern(msg))) + x64_nl_char())
+  sb_push(sb, "    db " + x64_bytes_of(msg) + x64_nl_char())
+  sb_push(sb, "section .text" + x64_nl_char())
+  sb_push(sb, "    lea rax, [rel FMSG_TEXT_" + suffix + "]" + x64_nl_char())
+  sb_push(sb, "    mov rcx, 2305843009213693952" + x64_nl_char())
+  sb_push(sb, "    or rax, rcx" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    call rt_print_str" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    mov rcx, 98" + x64_nl_char())
+  sb_push(sb, "    call ExitProcess" + x64_nl_char())
+  return sb_str(sb)
+end
+
 make a function called x64_callhost_asm takes name, argc, spilled returns asm
+  # A host implemented as an rt_host_<name> runtime function: an ordinary call.
+  let alias_target = x64_host_alias_target(name)
+  if alias_target != "" then
+    let ab = sb_new()
+    sb_push(ab, "    call " + x64_asm_label_for_func(alias_target) + x64_nl_char())
+    if argc > 0 then
+      sb_push(ab, "    add rsp, " + (argc * 8) + x64_nl_char())
+    end
+    sb_push(ab, "    push rax" + x64_nl_char())
+    return sb_str(ab)
+  end
   # GitHub #52: a fixed-size, ALWAYS-inline raw machine-word equality
   # primitive, deliberately NOT going through x64_binop_asm_dynamic's
   # own "==" dispatch -- rt_dynamic_cmp_obj (x64_runtime.patlang) needs
@@ -8416,13 +8468,12 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
             # every other primitive already follows -- still silently
             # WRONG (an unsupported primitive's real behavior is still
             # not implemented), but no longer stack-corrupting.
+            # Reached at run time only if this call executes, like the
+            # interpreter's own "host fn 'X' not found": stop with that message
+            # instead of carrying on with a placeholder 0 (GitHub #114).
             let asm = sb_new()
             sb_push(asm, "    ; UNSUPPORTED_PRIMITIVE_ERROR" + x64_nl_char())
-            if argc > 0 then
-              sb_push(asm, "    add rsp, " + (argc * 8) + x64_nl_char())
-            end
-            sb_push(asm, "    mov rax, 0" + x64_nl_char())
-            sb_push(asm, "    push rax" + x64_nl_char())
+            sb_push(asm, x64_fatal_message_asm("host fn '" + name + "' not found"))
             return sb_str(asm)
           end
         end

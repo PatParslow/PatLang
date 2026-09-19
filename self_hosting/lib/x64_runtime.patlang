@@ -1577,6 +1577,337 @@ make a function called try_read_file takes path returns s
   return rt_read_file(path)
 end
 
+# ---- interpreter hosts x64 did not have (GitHub #114) ----
+#
+# sc_substr(handle, start, count): the characters substr would return, read
+# from a str_intern handle (x64 strings are byte-indexed, like its sc_code).
+make a function called sc_substr takes handle, start, count returns s
+  return substr(handle bor rt_string_tag(), start, count)
+end
+
+# sed(cmd, input): main.rs's ir_host_sed -- a LITERAL (not regex) substitution,
+# "s/pat/repl/" with optional flags g (all matches) and i (ASCII
+# case-insensitive). Anything that is not a well-formed s command returns the
+# input unchanged, like the interpreter.
+make a function called rt_sed_find_code takes h, n, code, from returns idx
+  let i = from
+  while i < n do
+    if sc_code(h, i) == code then
+      return i
+    end
+    let i = i + 1
+  end
+  return -1
+end
+
+make a function called rt_sed_lower takes c returns lc
+  if c >= 65 then
+    if c <= 90 then
+      return c + 32
+    end
+  end
+  return c
+end
+
+make a function called rt_sed_match_at takes hh, at, ph, pn, ci returns yes
+  let k = 0
+  while k < pn do
+    let a = sc_code(hh, at + k)
+    let b = sc_code(ph, k)
+    if ci then
+      let a = rt_sed_lower(a)
+      let b = rt_sed_lower(b)
+    end
+    if a != b then
+      return false
+    end
+    let k = k + 1
+  end
+  return true
+end
+
+make a function called sed takes cmd, input returns out
+  let ch = str_intern(cmd)
+  let cn = sc_len(ch)
+  if cn == 0 then
+    return input
+  end
+  if sc_code(ch, 0) != 115 then
+    return input
+  end
+  let i0 = rt_sed_find_code(ch, cn, 47, 0)
+  if i0 < 0 then
+    return input
+  end
+  let i1 = rt_sed_find_code(ch, cn, 47, i0 + 1)
+  if i1 < 0 then
+    return input
+  end
+  let i2 = rt_sed_find_code(ch, cn, 47, i1 + 1)
+  let pat = sc_substr(ch, i0 + 1, i1 - i0 - 1)
+  let rep_end = cn
+  if i2 >= 0 then
+    let rep_end = i2
+  end
+  let rep = sc_substr(ch, i1 + 1, rep_end - i1 - 1)
+  let global = false
+  let ci = false
+  if i2 >= 0 then
+    let k = i2 + 1
+    while k < cn do
+      let c = sc_code(ch, k)
+      if c == 103 then
+        let global = true
+      end
+      if c == 105 then
+        let ci = true
+      end
+      let k = k + 1
+    end
+  end
+  let hh = str_intern(input)
+  let hn = sc_len(hh)
+  let ph = str_intern(pat)
+  let pn = sc_len(ph)
+  if pn == 0 then
+    return input
+  end
+  let sb = sb_new()
+  let i = 0
+  let copied = 0
+  while (i + pn) <= hn do
+    if rt_sed_match_at(hh, i, ph, pn, ci) then
+      sb_push(sb, sc_substr(hh, copied, i - copied))
+      sb_push(sb, rep)
+      let i = i + pn
+      let copied = i
+      if global == false then
+        let i = hn + 1
+      end
+    else
+      let i = i + 1
+    end
+  end
+  sb_push(sb, sc_substr(hh, copied, hn - copied))
+  return sb_str(sb)
+end
+
+# The stage-0 shim hosts (add, multiply, subtract, max, min, calculate,
+# calculate_result, get_value, process, validate). Their names are common
+# words a program may define itself, and x64 rejects a program that defines a
+# name x64_runtime.patlang also defines, so they live under an rt_host_ prefix
+# and codegen_x64.patlang routes a call to one only when the program did not
+# define the name (see x64_host_alias_target).
+make a function called rt_host_add takes a, b returns r
+  return a + b
+end
+
+make a function called rt_host_multiply takes a, b returns r
+  return a * b
+end
+
+make a function called rt_host_subtract takes a, b returns r
+  return a - b
+end
+
+make a function called rt_host_max takes a, b returns r
+  if a >= b then
+    return a
+  end
+  return b
+end
+
+make a function called rt_host_min takes a, b returns r
+  if a <= b then
+    return a
+  end
+  return b
+end
+
+make a function called rt_host_calculate takes x returns r
+  return 0
+end
+
+make a function called rt_host_calculate_result takes x returns r
+  return 0
+end
+
+make a function called rt_host_get_value takes x returns r
+  return 0
+end
+
+make a function called rt_host_process takes x returns r
+  return true
+end
+
+make a function called rt_host_validate takes x returns r
+  return true
+end
+
+# ---- the rest of the interpreter's hosts x64 lacked (GitHub #114) ----
+
+# exit_with(code): end the process with `code`.
+make a function called exit_with takes code returns done
+  os_exit(code)
+  return unit
+end
+
+# progress_report(text): the interpreter keeps the latest status text for a
+# status query; here it is stored under a var so nothing is lost.
+make a function called progress_report takes text returns done
+  set_var("__progress_status", text)
+  return unit
+end
+
+# object_delete(name): drop an object's namespace from the shared table.
+make a function called object_delete takes name returns done
+  let table_addr = mem_vars_table_addr()
+  let table = mem_peek_qword(table_addr, 0)
+  if table == 0 then
+    return unit
+  end
+  let idx = rt_ns_find(table, name)
+  if idx < 0 then
+    return unit
+  end
+  let n = rt_list_len(table)
+  let out = rt_list_new(n - 1)
+  let i = 0
+  let j = 0
+  while i < n do
+    if i != idx then
+      rt_list_set(out, j, rt_list_get(table, i))
+      let j = j + 1
+    end
+    let i = i + 1
+  end
+  mem_poke_qword(table_addr, 0, out)
+  return unit
+end
+
+# action_clear(): forget every registered action.
+make a function called action_clear returns done
+  logic_actions_list_set(rt_list_new(0))
+  return unit
+end
+
+# plan_incremental(goal): the interpreter's version reuses search work across
+# calls with a growing action set and returns the same plan `plan` would; this
+# backend has no cache, so it is `plan`.
+make a function called plan_incremental takes goal_facts returns path
+  return plan(goal_facts)
+end
+
+# read_file_b64(path): base64 of the file's raw bytes ("" for an unreadable
+# file, like read_file on this backend).
+make a function called read_file_b64 takes path returns text
+  let addr = path band rt_payload_mask()
+  let size = os_file_size(addr + 8, mem_peek_qword(addr, 0))
+  if size < 0 then
+    return ""
+  end
+  let bytes = read_file_bytes(path, 0, size)
+  let tbl = str_intern("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+  let sb = sb_new()
+  let i = 0
+  while i < size do
+    let b0 = bytes[i]
+    let b1 = 0
+    if (i + 1) < size then
+      let b1 = bytes[i + 1]
+    end
+    let b2 = 0
+    if (i + 2) < size then
+      let b2 = bytes[i + 2]
+    end
+    let v = (b0 shl 16) bor (b1 shl 8) bor b2
+    sb_push(sb, sc_char(tbl, (v shr 18) band 63))
+    sb_push(sb, sc_char(tbl, (v shr 12) band 63))
+    if (i + 1) < size then
+      sb_push(sb, sc_char(tbl, (v shr 6) band 63))
+    else
+      sb_push(sb, "=")
+    end
+    if (i + 2) < size then
+      sb_push(sb, sc_char(tbl, v band 63))
+    else
+      sb_push(sb, "=")
+    end
+    let i = i + 3
+  end
+  return sb_str(sb)
+end
+
+# Toolchain and GOAP-fluent hosts with no native implementation: they stop with
+# a message when reached (see rt_host_run_ir).
+make a function called rt_host_codegen_prelude returns r
+  print("host fn 'codegen_prelude' is not supported by the native x64 backend")
+  os_exit(98)
+  return 0
+end
+
+make a function called rt_host_codegen_prelude_chunk returns r
+  print("host fn 'codegen_prelude_chunk' is not supported by the native x64 backend")
+  os_exit(98)
+  return 0
+end
+
+make a function called rt_host_compile_ir returns r
+  print("host fn 'compile_ir' is not supported by the native x64 backend")
+  os_exit(98)
+  return 0
+end
+
+make a function called rt_host_compile_shape returns r
+  print("host fn 'compile_shape' is not supported by the native x64 backend")
+  os_exit(98)
+  return 0
+end
+
+make a function called rt_host_fluent_set returns r
+  print("host fn 'fluent_set' is not implemented on the native x64 backend (numeric-fluent GOAP, GitHub #121)")
+  os_exit(98)
+  return 0
+end
+
+make a function called rt_host_action_add_numeric returns r
+  print("host fn 'action_add_numeric' is not implemented on the native x64 backend (numeric-fluent GOAP, GitHub #121)")
+  os_exit(98)
+  return 0
+end
+
+make a function called rt_host_plan_numeric returns r
+  print("host fn 'plan_numeric' is not implemented on the native x64 backend (numeric-fluent GOAP, GitHub #121)")
+  os_exit(98)
+  return 0
+end
+
+# Hosts that need the Rust toolchain or an embedded interpreter, which a native
+# x64 program does not have. They stop with a clear message when reached,
+# where the interpreter would have run them.
+make a function called rt_host_run_ir takes ir returns r
+  print("host fn 'run_ir' is not supported by the native x64 backend")
+  os_exit(98)
+  return 0
+end
+
+# float_to_bits needs to know that its argument is a float, and a value's type
+# is not recorded at run time on x64: a float that crosses a function call is
+# indistinguishable from an integer word (`plus(1.5, 2)` gives 0 there). It
+# stops with a message rather than return bits computed from the wrong thing.
+make a function called rt_host_float_to_bits takes v returns r
+  print("host fn 'float_to_bits' is not supported by the native x64 backend (floats carry no run-time type there, GitHub #50)")
+  os_exit(98)
+  return 0
+end
+
+make a function called rt_host_rustc_build_chunked takes a, b, c returns r
+  print("host fn 'rustc_build_chunked' is not supported by the native x64 backend")
+  os_exit(98)
+  return 0
+end
+
+
 # floor(v): fixnum/BigInt pass through unchanged (already integers,
 # matching Rust's own `Value::Int(_) | Value::BigInt(_) => v.clone()`);
 # Rational computes real floor division on [numerator][denominator]
