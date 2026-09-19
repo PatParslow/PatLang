@@ -181,7 +181,7 @@ fn given_value_module(world: &mut PatWorld, which: String) {
     world.source = prelude + probe_main;
 }
 
-#[given(regex = r#"^the self-hosted test suite "([a-z_]+)"$"#)]
+#[given(regex = r#"^the self-hosted test suite "([a-z_0-9]+)"$"#)]
 fn given_selftest_suite(world: &mut PatWorld, name: String) {
     let root = world.repo_root.clone();
     let read = |rel: &str| -> String {
@@ -193,9 +193,12 @@ fn given_selftest_suite(world: &mut PatWorld, name: String) {
         // concatenation order: lib/test.patlang (the assertion/Gherkin-style
         // feature-runner framework) + lib/pos.patlang (the library under
         // test) + examples/pos_tests.patlang (the suite itself).
+        // test.patlang `include`s gherkin_contracts.patlang, so it cannot be
+        // spliced in as text (an include inside spliced text resolves against
+        // this file's directory, not lib/). The scenario source is written
+        // beside lib/, so give it real include lines instead.
         "pos" => {
-            read("self_hosting/lib/test.patlang")
-                + &read("self_hosting/lib/pos.patlang")
+            "include \"lib/test.patlang\"\ninclude \"lib/pos.patlang\"\n".to_string()
                 + &read("self_hosting/examples/pos_tests.patlang")
         }
         // regex_dsl_selftest.patlang and syntax_dsl_selftest.patlang are
