@@ -565,6 +565,9 @@ impl<'a> Parser<'a> {
                                 Token::Identifier(s) => { let n = s.clone(); self.advance()?; n }
                                 _ => unreachable!(),
                             };
+                            if fname == "main" {
+                                return Err(ParserError::ReservedName { name: fname, line: self.line_no, hint: "'main' collides with the native-compiled backend's own program entry point -- rename this function" });
+                            }
                             let mut params: Vec<String> = Vec::new();
                             if matches!(self.curr, Token::LParen) {
                                 self.advance()?;
@@ -768,9 +771,11 @@ impl<'a> Parser<'a> {
             return Err(ParserError::ReservedName { name, line: self.line_no, hint: "'main' collides with the native-compiled backend's own program entry point -- rename this function" });
         }
         self.advance()?;
-        // Two forms supported:
-        // 1) Curly form: { ... returns: { ... } }
-        // 2) Inline form: takes x, y returns <expr> end
+        // Forms supported:
+        // 1) Brace body straight after the name: { statements } (the original
+        //    prose-style { ... returns: { ... } } is still recognised)
+        // 2) Header form: takes x, y returns <name>, then a body delimited by
+        //    either { ... } or ... end
         if matches!(self.curr, Token::BlockStart) {
             if kind_is_function {
                 let body = self.parse_make_function_block()?;
@@ -826,8 +831,14 @@ impl<'a> Parser<'a> {
                     self.advance()?;
                 }
             }
-            // Parse statements until we encounter Identifier("end")
-            let (mut body, _) = self.parse_word_block(&["end"], false)?;
+            // The body is brace-delimited or runs to Identifier("end"), matching
+            // the self-hosted parser's parse_function_def.
+            let mut body = if matches!(self.curr, Token::BlockStart) {
+                self.advance()?; // '{'
+                self.parse_block()?
+            } else {
+                self.parse_word_block(&["end"], false)?.0
+            };
             // If a return hint was provided, unconditionally append a
             // trailing `return NAME` -- reached only via genuine fall-
             // through (any earlier explicit `return`, including one
@@ -907,12 +918,20 @@ impl<'a> Parser<'a> {
     }
 
     // Parse a function block introduced by `make a function called Name { ... }`
-    // We scan until we find `returns: { ... }` and parse that inner block with normal rules.
+    // A brace body that opens with `returns` is the original prose-style layout: we
+    // scan until we find `returns: { ... }` and parse that inner block with normal rules.
     fn parse_make_function_block(&mut self) -> Result<Vec<Stmt>, ParserError> {
         // current must be '{'
         if !matches!(self.curr, Token::BlockStart) { return Ok(vec![]); }
         // consume '{'
         self.advance()?;
+        self.consume_newlines()?;
+        // Anything but the original `returns: { ... }` layout is a plain
+        // statement body; previously its statements were skipped silently, so
+        // the function did nothing (the self-hosted parser ran them).
+        if !matches!(&self.curr, Token::Identifier(s) if s == "returns") {
+            return self.parse_block();
+        }
         let mut body: Option<Vec<Stmt>> = None;
         let mut depth: usize = 1;
         while depth > 0 {
