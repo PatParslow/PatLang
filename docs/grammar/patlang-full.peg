@@ -1,7 +1,10 @@
 Program    <- Stmt*
 
-Stmt       <- Let / Contract / When / RuleDecl / GoalDecl / FuncDef / If / While
-              / MemberAssign / Assign / Return / PrintStmt / ExprStmt
+# A ";" after a statement is an optional separator, alongside the newline
+# the grammar never requires.
+Stmt       <- StmtCore ";"?
+StmtCore   <- Let / Contract / When / RuleDecl / GoalDecl / ClassDecl / FuncDef / If / While
+              / MatchStmt / MemberAssign / Assign / Return / PrintStmt / ExprStmt
 
 Let        <- "let" "mut"? Identifier "=" Expr
 MemberAssign <- Identifier ("." Identifier)+ "=" Expr
@@ -10,10 +13,18 @@ Contract   <- ("require" / "ensure" / "assert") Expr
 When       <- "when" Identifier Block
 Return     <- "return" Expr?
 PrintStmt  <- "print" Expr
-ExprStmt   <- Expr
+# A statement that starts with "match", or with "class" not followed by
+# "(", is never an ordinary expression: both real parsers commit to the
+# declaration there and report its own error rather than reading the
+# words as a call. Without this guard a malformed class or match block
+# would fall through to ExprStmt and be accepted as calls with trailing
+# blocks.
+ExprStmt   <- !("match" / ("class" !"(")) Expr
 
 RuleDecl   <- "rule" Identifier "(" ArgList ")" (":-" RuleBody)? "."
-ArgList    <- (Identifier ("," Identifier)*)?
+# Rule and goal arguments are ordinary expressions: identifiers and
+# variables, but also numbers, strings and lists (rule dob(alice, 1996).).
+ArgList    <- (Expr ("," Expr)*)?
 RuleBody   <- RuleCall ("," RuleCall)*
 RuleCall   <- Identifier "(" ArgList ")"
 
@@ -23,6 +34,36 @@ RuleCall   <- Identifier "(" ArgList ")"
 # like "rule": ordered choice tries this production first and falls
 # through to ExprStmt (an ordinary call) on failure, e.g. goal(x).
 GoalDecl   <- "goal" Identifier "{" (RuleCall ("," RuleCall)*)? "}"
+
+# class NAME [inherits PARENT] { members } -- or do ... end / begin ... end.
+# A member is a traits line, a field with a default, or a method written
+# as an ordinary "make a function called" definition. "class" stays
+# non-reserved in call position, like "rule" and "goal": class(x) falls
+# through to an ordinary call.
+ClassDecl   <- "class" Identifier ("inherits" Identifier)? (ClassBrace / ClassWord)
+ClassBrace  <- "{" ClassMember* "}"
+ClassWord   <- ("do" / "begin") ClassMember* "end"
+ClassMember <- TraitsLine / FieldDecl / MakeForm
+TraitsLine  <- "traits" Identifier ("," Identifier)*
+FieldDecl   <- "field" Identifier "=" Expr
+
+# match EXPR do case PATTERN [when GUARD] then STMTS ... end
+# An arm's statements run up to the next "case" or the closing "end";
+# "end" is a reserved word so Stmt already stops there, and "case" is an
+# ordinary identifier, hence the explicit lookahead in CaseBody.
+MatchStmt   <- "match" Expr "do" CaseArm* "end"
+CaseArm     <- "case" Pattern ("when" Expr)? "then" CaseBody
+CaseBody    <- (!"case" Stmt)*
+
+# Pattern kinds, in the order the parsers try them: list, comparison,
+# glob (a leading "*", or an identifier directly followed by "*" or "?"),
+# then literal or binding. "_" and true/false are plain identifiers here;
+# a glob is a run of identifier, number, "*", "?" and "." tokens.
+Pattern     <- ListPattern / CmpPattern / GlobPattern / Number / String / Identifier
+ListPattern <- "[" (Pattern ("," Pattern)*)? "]"
+CmpPattern  <- ("<=" / ">=" / "==" / "!=" / "<" / ">") Expr
+GlobPattern <- "*" GlobPiece* / Identifier ("*" / "?") GlobPiece*
+GlobPiece   <- "*" / "?" / "." / Identifier / Number
 
 FuncDef    <- MakeForm / FnForm / FunctionForm
 FnForm     <- "fn" Identifier "(" ParamList ")" BraceBlock
