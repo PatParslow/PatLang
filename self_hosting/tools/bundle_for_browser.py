@@ -29,7 +29,10 @@ ORDER = [
     "zs_expr.patlang",
     "zs_schema.patlang",
     "zs_explore.patlang",
+    "zs_run.patlang",
     "zs_feature.patlang",
+    "zs_refine.patlang",
+    "zs_generate.patlang",
     "zs_demo.patlang",
 ]
 
