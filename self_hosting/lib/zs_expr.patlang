@@ -1,0 +1,1173 @@
+# =============================================================================
+# zs_expr: the small expression language schema clauses are written in.
+#
+# A clause is one line of text, parsed once into a tree (a nested list) and
+# evaluated against an environment of [name, value] pairs. The notation is
+# Z-flavoured but ASCII: sets and maps as values, quantifiers, and a trailing
+# apostrophe for the after-state of a variable (books' is books after the
+# operation).
+#
+#   literals      5   "Dune"   true   false
+#   arithmetic    + - * %  and unary -
+#   comparison    == != < <= > >=   and   x in S
+#   connectives   not  and  or  implies      (implies is right-associative)
+#   quantifiers   forall v in S : P     exists v in S : P
+#                 (the body runs to the end of the clause; parenthesise
+#                 a quantifier that sits inside a longer expression)
+#   calls         name(arg, ...) over the builtins below, or a function
+#                 registered with ze_register_fn
+#
+# Values. A set is a list of distinct atoms; a map is a list of [key, value]
+# pairs. Both come from pset.patlang / pmap.patlang, so schemas written with
+# those libraries compare correctly against schemas written here. == on two
+# lists compares them as collections, ignoring order: two sets are equal when
+# they hold the same members, two maps when they hold the same pairs. Inside a
+# collection a two-element list whose first element is an atom is read as an
+# ordered pair, and any other list as a nested set. Sequences and tuples are
+# not modelled.
+#
+# Backends. Everything here treats a list as a value: extending a set, a map,
+# an environment or a state must leave the original untouched, because they are
+# extended from shared originals. The interpreter's list_push and list_set
+# guarantee that. The native x64 backend's do not: its list_push grows a list
+# in place when the block has spare capacity (a deliberate, documented choice;
+# see rt_list_push in x64_runtime.patlang), and a list_set on a list that
+# something else still holds changed that list in place too. So code here
+# extends a shared list with list_appended (list_copy.patlang), replaces map
+# entries by building a new list, and calls list_push only on a list it has
+# just created. Native builds of the expression, schema, explorer and feature
+# selftests agree with the interpreter on everything except tick functions
+# (zs_explore.patlang), whose native behaviour is unverified: the explorer
+# selftest stops with a segmentation fault at its first tick check there.
+#
+# Errors. A tokenising or parsing problem is returned by ze_parse as
+# ["error", message]. A problem during evaluation (an unbound name, map_get on
+# a missing key) is recorded in the runtime error slot (ze_rt_error) and the
+# evaluator returns false, so a caller checks that slot after evaluating
+# rather than trusting a silent false.
+# =============================================================================
+
+include "pset.patlang"
+include "pmap.patlang"
+
+# ---- error slots (process-wide, like the rest of the __vars conventions) ----
+
+make a function called ze_rt_error returns msg
+  let v = get("__vars", "ze_rt_error")
+  if type_of(v) != "string" then
+    return ""
+  end
+  return v
+end
+
+make a function called ze_rt_clear returns done
+  set_var("ze_rt_error", "")
+  return true
+end
+
+make a function called ze_rt_fail takes msg returns done
+  if ze_rt_error() == "" then
+    set_var("ze_rt_error", msg)
+  end
+  return true
+end
+
+make a function called ze_parse_error returns msg
+  let v = get("__vars", "ze_error")
+  if type_of(v) != "string" then
+    return ""
+  end
+  return v
+end
+
+make a function called ze_parse_fail takes msg returns done
+  if ze_parse_error() == "" then
+    set_var("ze_error", msg)
+  end
+  return true
+end
+
+# ---- tokenizer ----
+# A token is [kind, text]; kind is one of num, str, id, kw, op.
+
+make a function called ze_is_alpha takes c returns r
+  return ((c >= 65) and (c <= 90)) or ((c >= 97) and (c <= 122)) or (c == 95)
+end
+
+make a function called ze_is_digit takes c returns r
+  return (c >= 48) and (c <= 57)
+end
+
+make a function called ze_is_keyword takes w returns r
+  if w == "and" then
+    return true
+  end
+  if w == "or" then
+    return true
+  end
+  if w == "not" then
+    return true
+  end
+  if w == "implies" then
+    return true
+  end
+  if w == "in" then
+    return true
+  end
+  if w == "forall" then
+    return true
+  end
+  if w == "exists" then
+    return true
+  end
+  if w == "true" then
+    return true
+  end
+  if w == "false" then
+    return true
+  end
+  return false
+end
+
+make a function called ze_tokenize takes text returns toks
+  let h = str_intern(text)
+  let n = sc_len(h)
+  let toks = []
+  let i = 0
+  while i < n do
+    let c = sc_code(h, i)
+    if (c == 32) or (c == 9) or (c == 13) or (c == 10) then
+      let i = i + 1
+    elif ze_is_digit(c) then
+      let b = sb_new()
+      let j = i
+      while (j < n) and ze_is_digit(sc_code(h, j)) do
+        sb_push(b, sc_char(h, j))
+        let j = j + 1
+      end
+      let toks = list_push(toks, ["num", sb_str(b)])
+      let i = j
+    elif ze_is_alpha(c) then
+      let b = sb_new()
+      let j = i
+      while (j < n) and (ze_is_alpha(sc_code(h, j)) or ze_is_digit(sc_code(h, j))) do
+        sb_push(b, sc_char(h, j))
+        let j = j + 1
+      end
+      if (j < n) and (sc_code(h, j) == 39) then
+        sb_push(b, "'")
+        let j = j + 1
+      end
+      let word = sb_str(b)
+      if ze_is_keyword(word) then
+        let toks = list_push(toks, ["kw", word])
+      else
+        let toks = list_push(toks, ["id", word])
+      end
+      let i = j
+    elif c == 34 then
+      let b = sb_new()
+      let j = i + 1
+      while (j < n) and (sc_code(h, j) != 34) do
+        sb_push(b, sc_char(h, j))
+        let j = j + 1
+      end
+      if j >= n then
+        ze_parse_fail("unterminated string")
+      end
+      let toks = list_push(toks, ["str", sb_str(b)])
+      let i = j + 1
+    else
+      let nx = -1
+      if i + 1 < n then
+        let nx = sc_code(h, i + 1)
+      end
+      if (c == 61) and (nx == 61) then
+        let toks = list_push(toks, ["op", "=="])
+        let i = i + 2
+      elif (c == 33) and (nx == 61) then
+        let toks = list_push(toks, ["op", "!="])
+        let i = i + 2
+      elif (c == 60) and (nx == 61) then
+        let toks = list_push(toks, ["op", "<="])
+        let i = i + 2
+      elif (c == 62) and (nx == 61) then
+        let toks = list_push(toks, ["op", ">="])
+        let i = i + 2
+      elif (c == 60) or (c == 62) or (c == 40) or (c == 41) or (c == 44) or (c == 58) or (c == 43) or (c == 45) or (c == 42) or (c == 37) then
+        let toks = list_push(toks, ["op", sc_char(h, i)])
+        let i = i + 1
+      else
+        ze_parse_fail("unexpected character " + sc_char(h, i))
+        let i = i + 1
+      end
+    end
+  end
+  return toks
+end
+
+# ---- parser: recursive descent, each function returns [node, next_position] ----
+
+make a function called ze_tok_is takes toks, pos, kind, text returns r
+  if pos >= to_num(list_len(toks)) then
+    return false
+  end
+  let t = toks[pos]
+  if t[0] != kind then
+    return false
+  end
+  return t[1] == text
+end
+
+make a function called ze_parse_implies takes toks, pos returns r
+  let a = ze_parse_or(toks, pos)
+  let p = a[1]
+  if ze_tok_is(toks, p, "kw", "implies") then
+    let b = ze_parse_implies(toks, p + 1)
+    return [["bin", "implies", a[0], b[0]], b[1]]
+  end
+  return a
+end
+
+make a function called ze_parse_or takes toks, pos returns r
+  let a = ze_parse_and(toks, pos)
+  let node = a[0]
+  let p = a[1]
+  while ze_tok_is(toks, p, "kw", "or") do
+    let b = ze_parse_and(toks, p + 1)
+    let node = ["bin", "or", node, b[0]]
+    let p = b[1]
+  end
+  return [node, p]
+end
+
+make a function called ze_parse_and takes toks, pos returns r
+  let a = ze_parse_not(toks, pos)
+  let node = a[0]
+  let p = a[1]
+  while ze_tok_is(toks, p, "kw", "and") do
+    let b = ze_parse_not(toks, p + 1)
+    let node = ["bin", "and", node, b[0]]
+    let p = b[1]
+  end
+  return [node, p]
+end
+
+make a function called ze_parse_not takes toks, pos returns r
+  if ze_tok_is(toks, pos, "kw", "not") then
+    let a = ze_parse_not(toks, pos + 1)
+    return [["not", a[0]], a[1]]
+  end
+  return ze_parse_cmp(toks, pos)
+end
+
+make a function called ze_cmp_op takes toks, pos returns op
+  if pos >= to_num(list_len(toks)) then
+    return ""
+  end
+  let t = toks[pos]
+  if t[0] == "op" then
+    if (t[1] == "==") or (t[1] == "!=") or (t[1] == "<") or (t[1] == "<=") or (t[1] == ">") or (t[1] == ">=") then
+      return t[1]
+    end
+  end
+  if (t[0] == "kw") and (t[1] == "in") then
+    return "in"
+  end
+  return ""
+end
+
+make a function called ze_parse_cmp takes toks, pos returns r
+  let a = ze_parse_add(toks, pos)
+  let op = ze_cmp_op(toks, a[1])
+  if op != "" then
+    let b = ze_parse_add(toks, a[1] + 1)
+    return [["bin", op, a[0], b[0]], b[1]]
+  end
+  return a
+end
+
+make a function called ze_parse_add takes toks, pos returns r
+  let a = ze_parse_mul(toks, pos)
+  let node = a[0]
+  let p = a[1]
+  let going = true
+  while going do
+    if ze_tok_is(toks, p, "op", "+") then
+      let b = ze_parse_mul(toks, p + 1)
+      let node = ["bin", "+", node, b[0]]
+      let p = b[1]
+    elif ze_tok_is(toks, p, "op", "-") then
+      let b = ze_parse_mul(toks, p + 1)
+      let node = ["bin", "-", node, b[0]]
+      let p = b[1]
+    else
+      let going = false
+    end
+  end
+  return [node, p]
+end
+
+make a function called ze_parse_mul takes toks, pos returns r
+  let a = ze_parse_unary(toks, pos)
+  let node = a[0]
+  let p = a[1]
+  let going = true
+  while going do
+    if ze_tok_is(toks, p, "op", "*") then
+      let b = ze_parse_unary(toks, p + 1)
+      let node = ["bin", "*", node, b[0]]
+      let p = b[1]
+    elif ze_tok_is(toks, p, "op", "%") then
+      let b = ze_parse_unary(toks, p + 1)
+      let node = ["bin", "%", node, b[0]]
+      let p = b[1]
+    else
+      let going = false
+    end
+  end
+  return [node, p]
+end
+
+make a function called ze_parse_unary takes toks, pos returns r
+  if ze_tok_is(toks, pos, "op", "-") then
+    let a = ze_parse_unary(toks, pos + 1)
+    return [["neg", a[0]], a[1]]
+  end
+  return ze_parse_atom(toks, pos)
+end
+
+make a function called ze_parse_atom takes toks, pos returns r
+  let n = to_num(list_len(toks))
+  if pos >= n then
+    ze_parse_fail("unexpected end of clause")
+    return [["num", 0], pos]
+  end
+  let t = toks[pos]
+  let kind = t[0]
+  let text = t[1]
+  if kind == "num" then
+    return [["num", to_num(text)], pos + 1]
+  end
+  if kind == "str" then
+    return [["str", text], pos + 1]
+  end
+  if kind == "kw" then
+    if text == "true" then
+      return [["bool", true], pos + 1]
+    end
+    if text == "false" then
+      return [["bool", false], pos + 1]
+    end
+    if (text == "forall") or (text == "exists") then
+      if (pos + 1 >= n) or (toks[pos + 1][0] != "id") then
+        ze_parse_fail(text + " needs a variable name")
+        return [["num", 0], pos + 1]
+      end
+      let v = toks[pos + 1][1]
+      if ze_tok_is(toks, pos + 2, "kw", "in") == false then
+        ze_parse_fail(text + " " + v + " needs 'in'")
+        return [["num", 0], pos + 2]
+      end
+      let dom = ze_parse_add(toks, pos + 3)
+      if ze_tok_is(toks, dom[1], "op", ":") == false then
+        ze_parse_fail(text + " " + v + " needs ':' before its body")
+        return [["num", 0], dom[1]]
+      end
+      let body = ze_parse_implies(toks, dom[1] + 1)
+      return [[text, v, dom[0], body[0]], body[1]]
+    end
+    ze_parse_fail("unexpected keyword " + text)
+    return [["num", 0], pos + 1]
+  end
+  if kind == "id" then
+    if ze_tok_is(toks, pos + 1, "op", "(") then
+      let args = []
+      let p = pos + 2
+      if ze_tok_is(toks, p, "op", ")") then
+        return [["call", text, args], p + 1]
+      end
+      let going = true
+      while going do
+        let a = ze_parse_implies(toks, p)
+        let args = list_push(args, a[0])
+        let p = a[1]
+        if ze_tok_is(toks, p, "op", ",") then
+          let p = p + 1
+        else
+          let going = false
+        end
+      end
+      if ze_tok_is(toks, p, "op", ")") == false then
+        ze_parse_fail("unclosed call to " + text)
+        return [["call", text, args], p]
+      end
+      return [["call", text, args], p + 1]
+    end
+    return [["var", text], pos + 1]
+  end
+  if (kind == "op") and (text == "(") then
+    let a = ze_parse_implies(toks, pos + 1)
+    if ze_tok_is(toks, a[1], "op", ")") == false then
+      ze_parse_fail("missing )")
+      return a
+    end
+    return [a[0], a[1] + 1]
+  end
+  ze_parse_fail("unexpected " + text)
+  return [["num", 0], pos + 1]
+end
+
+# Parses one clause: ["ok", tree] or ["error", message].
+make a function called ze_parse takes text returns result
+  set_var("ze_error", "")
+  let toks = ze_tokenize(text)
+  if ze_parse_error() != "" then
+    return ["error", ze_parse_error()]
+  end
+  if to_num(list_len(toks)) == 0 then
+    return ["error", "empty clause"]
+  end
+  let r = ze_parse_implies(toks, 0)
+  if ze_parse_error() != "" then
+    return ["error", ze_parse_error()]
+  end
+  if r[1] < to_num(list_len(toks)) then
+    return ["error", "unexpected " + toks[r[1]][1] + " after the end of the clause"]
+  end
+  return ["ok", r[0]]
+end
+
+# ---- free variables ----
+
+make a function called ze_names_has takes names, name returns found
+  let i = 0
+  let n = to_num(list_len(names))
+  while i < n do
+    if names[i] == name then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called ze_fv takes ast, bound, acc returns out
+  let k = ast[0]
+  if k == "var" then
+    if ze_names_has(bound, ast[1]) == false then
+      if ze_names_has(acc, ast[1]) == false then
+        return list_push(acc, ast[1])
+      end
+    end
+    return acc
+  end
+  if (k == "not") or (k == "neg") then
+    return ze_fv(ast[1], bound, acc)
+  end
+  if k == "bin" then
+    let acc = ze_fv(ast[2], bound, acc)
+    return ze_fv(ast[3], bound, acc)
+  end
+  if k == "call" then
+    let args = ast[2]
+    let i = 0
+    let n = to_num(list_len(args))
+    while i < n do
+      let acc = ze_fv(args[i], bound, acc)
+      let i = i + 1
+    end
+    return acc
+  end
+  if (k == "forall") or (k == "exists") then
+    let acc = ze_fv(ast[2], bound, acc)
+    return ze_fv(ast[3], list_appended(bound, ast[1]), acc)
+  end
+  return acc
+end
+
+# Names a clause reads, in order of first use, excluding quantifier variables.
+make a function called ze_free_vars takes ast returns names
+  return ze_fv(ast, [], [])
+end
+
+# ---- values: equality and canonical form ----
+
+# An atom is anything that is not a list.
+make a function called ze_is_atom takes v returns r
+  return type_of(v) != "list"
+end
+
+# An ordered pair inside a collection: two elements, the first an atom.
+make a function called ze_is_pair takes e returns r
+  if type_of(e) != "list" then
+    return false
+  end
+  if to_num(list_len(e)) != 2 then
+    return false
+  end
+  return type_of(e[0]) != "list"
+end
+
+# Equality of two values. Atoms must have the same type and value; lists are
+# collections and compare without regard to order.
+make a function called ze_val_eq takes a, b returns r
+  let ta = type_of(a)
+  let tb = type_of(b)
+  if ta != tb then
+    return false
+  end
+  if ta != "list" then
+    return a == b
+  end
+  let n = to_num(list_len(a))
+  if n != to_num(list_len(b)) then
+    return false
+  end
+  let i = 0
+  while i < n do
+    if ze_elem_in(a[i], b) == false then
+      return false
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+# True when some element of collection c is equal to e, under the pair rule.
+make a function called ze_elem_in takes e, c returns found
+  let n = to_num(list_len(c))
+  let j = 0
+  while j < n do
+    if ze_elem_eq(e, c[j]) then
+      return true
+    end
+    let j = j + 1
+  end
+  return false
+end
+
+make a function called ze_elem_eq takes x, y returns r
+  if ze_is_pair(x) and ze_is_pair(y) then
+    return ze_val_eq(x[0], y[0]) and ze_val_eq(x[1], y[1])
+  end
+  return ze_val_eq(x, y)
+end
+
+make a function called ze_key_of takes item, ki returns k
+  if ki < 0 then
+    return item
+  end
+  return item[ki]
+end
+
+# Merge sort of a list of strings (ki = -1) or of lists keyed at position ki.
+make a function called ze_msort takes items, ki returns out
+  let n = to_num(list_len(items))
+  if n <= 1 then
+    return items
+  end
+  let mid = (n - (n % 2)) / 2
+  let left = []
+  let right = []
+  let i = 0
+  while i < n do
+    if i < mid then
+      let left = list_push(left, items[i])
+    else
+      let right = list_push(right, items[i])
+    end
+    let i = i + 1
+  end
+  let ls = ze_msort(left, ki)
+  let rs = ze_msort(right, ki)
+  let ln = to_num(list_len(ls))
+  let rn = to_num(list_len(rs))
+  let out = []
+  let a = 0
+  let b = 0
+  while (a < ln) and (b < rn) do
+    if ze_key_of(rs[b], ki) < ze_key_of(ls[a], ki) then
+      let out = list_push(out, rs[b])
+      let b = b + 1
+    else
+      let out = list_push(out, ls[a])
+      let a = a + 1
+    end
+  end
+  while a < ln do
+    let out = list_push(out, ls[a])
+    let a = a + 1
+  end
+  while b < rn do
+    let out = list_push(out, rs[b])
+    let b = b + 1
+  end
+  return out
+end
+
+make a function called ze_atom_canon takes v returns s
+  let t = type_of(v)
+  if t == "int" then
+    return "i" + v
+  end
+  if t == "string" then
+    return "s" + v.length + ":" + v
+  end
+  if t == "bool" then
+    if v then
+      return "b1"
+    end
+    return "b0"
+  end
+  return "?" + t + ":" + v
+end
+
+# A canonical string for a value: equal under ze_val_eq exactly when the
+# strings are equal, so it serves as the key for "have I seen this state".
+make a function called ze_canon takes v returns s
+  if type_of(v) != "list" then
+    return ze_atom_canon(v)
+  end
+  let n = to_num(list_len(v))
+  let parts = []
+  let i = 0
+  while i < n do
+    let e = v[i]
+    if ze_is_pair(e) then
+      let parts = list_push(parts, "(" + ze_canon(e[0]) + "," + ze_canon(e[1]) + ")")
+    else
+      let parts = list_push(parts, ze_canon(e))
+    end
+    let i = i + 1
+  end
+  let sorted = ze_msort(parts, -1)
+  let b = sb_new()
+  sb_push(b, "{")
+  let k = 0
+  while k < n do
+    if k > 0 then
+      sb_push(b, ",")
+    end
+    sb_push(b, sorted[k])
+    let k = k + 1
+  end
+  sb_push(b, "}")
+  return sb_str(b)
+end
+
+# A value as a person would write it: "text" in quotes, numbers as digits, a
+# set as {a, b}, a map as {k -> v, ...}.
+make a function called ze_show takes v returns s
+  let t = type_of(v)
+  if t == "string" then
+    return "\"" + v + "\""
+  end
+  if t == "bool" then
+    if v then
+      return "true"
+    end
+    return "false"
+  end
+  if t != "list" then
+    return "" + v
+  end
+  let b = sb_new()
+  sb_push(b, "{")
+  let n = to_num(list_len(v))
+  let i = 0
+  while i < n do
+    if i > 0 then
+      sb_push(b, ", ")
+    end
+    if ze_is_pair(v[i]) then
+      sb_push(b, ze_show(v[i][0]))
+      sb_push(b, " -> ")
+      sb_push(b, ze_show(v[i][1]))
+    else
+      sb_push(b, ze_show(v[i]))
+    end
+    let i = i + 1
+  end
+  sb_push(b, "}")
+  return sb_str(b)
+end
+
+# ---- builtin functions ----
+
+make a function called ze_set_of takes items returns s
+  let out = pset_new()
+  let i = 0
+  let n = to_num(list_len(items))
+  while i < n do
+    let out = pset_add(out, items[i])
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called ze_set_union takes a, b returns s
+  let out = a
+  let i = 0
+  let n = to_num(list_len(b))
+  while i < n do
+    let out = pset_add(out, b[i])
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called ze_set_diff takes a, b returns s
+  let out = pset_new()
+  let i = 0
+  let n = to_num(list_len(a))
+  while i < n do
+    if pset_contains(b, a[i]) == false then
+      let out = pset_add(out, a[i])
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called ze_set_inter takes a, b returns s
+  let out = pset_new()
+  let i = 0
+  let n = to_num(list_len(a))
+  while i < n do
+    if pset_contains(b, a[i]) then
+      let out = pset_add(out, a[i])
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called ze_subset takes a, b returns r
+  let i = 0
+  let n = to_num(list_len(a))
+  while i < n do
+    if pset_contains(b, a[i]) == false then
+      return false
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+# How many keys of a map hold the value v (the size of v's preimage).
+make a function called ze_map_count_val takes m, v returns n
+  let count = 0
+  let i = 0
+  let len = to_num(list_len(m))
+  while i < len do
+    if ze_val_eq(m[i][1], v) then
+      let count = count + 1
+    end
+    let i = i + 1
+  end
+  return count
+end
+
+make a function called ze_map_of takes items returns m
+  let out = pmap_new()
+  let i = 0
+  let n = to_num(list_len(items))
+  while i + 1 < n do
+    let out = pmap_put(out, items[i], items[i + 1])
+    let i = i + 2
+  end
+  return out
+end
+
+# ---- user-registered functions ----
+
+make a function called ze_register_fn takes name, fname returns done
+  let fns = get("__vars", "ze_user_fns")
+  if type_of(fns) != "list" then
+    let fns = []
+  end
+  set_var("ze_user_fns", list_appended(fns, [name, fname]))
+  return true
+end
+
+make a function called ze_user_fn takes name returns fname
+  let fns = get("__vars", "ze_user_fns")
+  if type_of(fns) != "list" then
+    return ""
+  end
+  let i = to_num(list_len(fns)) - 1
+  while i >= 0 do
+    if fns[i][0] == name then
+      return fns[i][1]
+    end
+    let i = i - 1
+  end
+  return ""
+end
+
+make a function called ze_call_user takes fname, args returns v
+  let n = to_num(list_len(args))
+  if n == 0 then
+    return apply(fname)
+  end
+  if n == 1 then
+    return apply(fname, args[0])
+  end
+  if n == 2 then
+    return apply(fname, args[0], args[1])
+  end
+  if n == 3 then
+    return apply(fname, args[0], args[1], args[2])
+  end
+  if n == 4 then
+    return apply(fname, args[0], args[1], args[2], args[3])
+  end
+  ze_rt_fail("a registered function takes at most 4 arguments: " + fname)
+  return false
+end
+
+make a function called ze_arity takes name, args, want returns ok
+  if to_num(list_len(args)) != want then
+    ze_rt_fail(name + " takes " + want + " argument(s), got " + to_num(list_len(args)))
+    return false
+  end
+  return true
+end
+
+# How many leading arguments of a builtin must be collections. The
+# interpreter's own list primitives abort on a non-list, so the evaluator
+# checks first and records a runtime error instead.
+make a function called ze_lead_lists takes name returns n
+  if (name == "set_union") or (name == "set_diff") or (name == "set_inter") or (name == "subset") then
+    return 2
+  end
+  if (name == "size") or (name == "map_size") or (name == "set_add") or (name == "set_remove") or (name == "map_has") or (name == "map_get") or (name == "map_get_or") or (name == "map_put") or (name == "map_remove") or (name == "dom") or (name == "map_count_val") then
+    return 1
+  end
+  return 0
+end
+
+make a function called ze_lists_ok takes name, args returns ok
+  let lead = ze_lead_lists(name)
+  if lead == 0 then
+    return true
+  end
+  if to_num(list_len(args)) < lead then
+    ze_rt_fail(name + " is missing arguments")
+    return false
+  end
+  let i = 0
+  while i < lead do
+    if type_of(args[i]) != "list" then
+      ze_rt_fail(name + " needs a set or map as argument " + (i + 1) + ", got a " + type_of(args[i]))
+      return false
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+make a function called ze_call takes name, args returns v
+  if ze_lists_ok(name, args) == false then
+    return false
+  end
+  if name == "set_of" then
+    return ze_set_of(args)
+  end
+  if name == "map_of" then
+    return ze_map_of(args)
+  end
+  if name == "empty_set" then
+    return pset_new()
+  end
+  if name == "empty_map" then
+    return pmap_new()
+  end
+  if name == "size" then
+    if ze_arity(name, args, 1) == false then
+      return false
+    end
+    return to_num(list_len(args[0]))
+  end
+  if name == "map_size" then
+    if ze_arity(name, args, 1) == false then
+      return false
+    end
+    return to_num(list_len(args[0]))
+  end
+  if name == "set_add" then
+    if ze_arity(name, args, 2) == false then
+      return false
+    end
+    return pset_add(args[0], args[1])
+  end
+  if name == "set_remove" then
+    if ze_arity(name, args, 2) == false then
+      return false
+    end
+    return pset_remove(args[0], args[1])
+  end
+  if name == "set_union" then
+    if ze_arity(name, args, 2) == false then
+      return false
+    end
+    return ze_set_union(args[0], args[1])
+  end
+  if name == "set_diff" then
+    if ze_arity(name, args, 2) == false then
+      return false
+    end
+    return ze_set_diff(args[0], args[1])
+  end
+  if name == "set_inter" then
+    if ze_arity(name, args, 2) == false then
+      return false
+    end
+    return ze_set_inter(args[0], args[1])
+  end
+  if name == "subset" then
+    if ze_arity(name, args, 2) == false then
+      return false
+    end
+    return ze_subset(args[0], args[1])
+  end
+  if name == "map_has" then
+    if ze_arity(name, args, 2) == false then
+      return false
+    end
+    return pmap_has(args[0], args[1])
+  end
+  if name == "map_get" then
+    if ze_arity(name, args, 2) == false then
+      return false
+    end
+    if pmap_has(args[0], args[1]) == false then
+      ze_rt_fail("map_get: key " + args[1] + " is not in the map")
+      return false
+    end
+    return pmap_get(args[0], args[1])
+  end
+  if name == "map_get_or" then
+    if ze_arity(name, args, 3) == false then
+      return false
+    end
+    if pmap_has(args[0], args[1]) then
+      return pmap_get(args[0], args[1])
+    end
+    return args[2]
+  end
+  if name == "map_put" then
+    if ze_arity(name, args, 3) == false then
+      return false
+    end
+    return pmap_put(args[0], args[1], args[2])
+  end
+  if name == "map_remove" then
+    if ze_arity(name, args, 2) == false then
+      return false
+    end
+    return pmap_remove(args[0], args[1])
+  end
+  if name == "map_count_val" then
+    if ze_arity(name, args, 2) == false then
+      return false
+    end
+    return ze_map_count_val(args[0], args[1])
+  end
+  if name == "dom" then
+    if ze_arity(name, args, 1) == false then
+      return false
+    end
+    return pmap_keys(args[0])
+  end
+  if name == "min" then
+    if ze_arity(name, args, 2) == false then
+      return false
+    end
+    if args[1] < args[0] then
+      return args[1]
+    end
+    return args[0]
+  end
+  if name == "max" then
+    if ze_arity(name, args, 2) == false then
+      return false
+    end
+    if args[1] > args[0] then
+      return args[1]
+    end
+    return args[0]
+  end
+  if name == "abs" then
+    if ze_arity(name, args, 1) == false then
+      return false
+    end
+    if args[0] < 0 then
+      return 0 - args[0]
+    end
+    return args[0]
+  end
+  let uf = ze_user_fn(name)
+  if uf != "" then
+    return ze_call_user(uf, args)
+  end
+  ze_rt_fail("unknown function " + name)
+  return false
+end
+
+# ---- evaluator ----
+
+make a function called ze_lookup takes env, name returns v
+  let i = to_num(list_len(env)) - 1
+  while i >= 0 do
+    if env[i][0] == name then
+      return env[i][1]
+    end
+    let i = i - 1
+  end
+  ze_rt_fail("unbound name " + name)
+  return false
+end
+
+# Ordering and arithmetic need two atoms of the same type; anything else is
+# recorded as a runtime error instead of reaching the interpreter's own
+# (fatal) type error.
+make a function called ze_operands_ok takes op, a, b returns ok
+  let ta = type_of(a)
+  let tb = type_of(b)
+  if (ta == "list") or (tb == "list") or (ta == "bool") or (tb == "bool") then
+    ze_rt_fail("operator " + op + " needs numbers or strings, got " + ta + " and " + tb)
+    return false
+  end
+  if ta != tb then
+    ze_rt_fail("operator " + op + " needs operands of one type, got " + ta + " and " + tb)
+    return false
+  end
+  if (ta == "string") and ((op == "-") or (op == "*") or (op == "%")) then
+    ze_rt_fail("operator " + op + " is not defined on strings")
+    return false
+  end
+  return true
+end
+
+make a function called ze_eval takes ast, env returns v
+  let k = ast[0]
+  if k == "num" then
+    return ast[1]
+  end
+  if k == "str" then
+    return ast[1]
+  end
+  if k == "bool" then
+    return ast[1]
+  end
+  if k == "var" then
+    return ze_lookup(env, ast[1])
+  end
+  if k == "not" then
+    return ze_eval(ast[1], env) == false
+  end
+  if k == "neg" then
+    let v = ze_eval(ast[1], env)
+    if ze_operands_ok("-", 0, v) == false then
+      return false
+    end
+    return 0 - v
+  end
+  if k == "call" then
+    let args = []
+    let i = 0
+    let n = to_num(list_len(ast[2]))
+    while i < n do
+      let args = list_push(args, ze_eval(ast[2][i], env))
+      let i = i + 1
+    end
+    return ze_call(ast[1], args)
+  end
+  if (k == "forall") or (k == "exists") then
+    let dom = ze_eval(ast[2], env)
+    if type_of(dom) != "list" then
+      ze_rt_fail(k + " ranges over a set or a map's domain, got a " + type_of(dom))
+      return false
+    end
+    let i = 0
+    let n = to_num(list_len(dom))
+    while i < n do
+      let held = ze_eval(ast[3], list_appended(env, [ast[1], dom[i]]))
+      if (k == "forall") and (held == false) then
+        return false
+      end
+      if (k == "exists") and (held == true) then
+        return true
+      end
+      let i = i + 1
+    end
+    return k == "forall"
+  end
+  if k == "bin" then
+    let op = ast[1]
+    if op == "and" then
+      if ze_eval(ast[2], env) == false then
+        return false
+      end
+      return ze_eval(ast[3], env)
+    end
+    if op == "or" then
+      if ze_eval(ast[2], env) == true then
+        return true
+      end
+      return ze_eval(ast[3], env)
+    end
+    if op == "implies" then
+      if ze_eval(ast[2], env) == false then
+        return true
+      end
+      return ze_eval(ast[3], env)
+    end
+    let a = ze_eval(ast[2], env)
+    let b = ze_eval(ast[3], env)
+    if op == "==" then
+      return ze_val_eq(a, b)
+    end
+    if op == "!=" then
+      return ze_val_eq(a, b) == false
+    end
+    if op == "in" then
+      if type_of(b) != "list" then
+        ze_rt_fail("in needs a set on the right, got a " + type_of(b))
+        return false
+      end
+      return ze_elem_in(a, b)
+    end
+    if ze_operands_ok(op, a, b) == false then
+      return false
+    end
+    if op == "<" then
+      return a < b
+    end
+    if op == "<=" then
+      return a <= b
+    end
+    if op == ">" then
+      return a > b
+    end
+    if op == ">=" then
+      return a >= b
+    end
+    if op == "+" then
+      return a + b
+    end
+    if op == "-" then
+      return a - b
+    end
+    if op == "*" then
+      return a * b
+    end
+    if op == "%" then
+      return a % b
+    end
+  end
+  ze_rt_fail("cannot evaluate " + k)
+  return false
+end

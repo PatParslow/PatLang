@@ -1,0 +1,205 @@
+# Selftest for self_hosting/lib/zs_explore.patlang: breadth-first exploration
+# of every state a declared schema can reach, checking the invariants and
+# postconditions at each step.
+#
+# The scenario check (zs_check) sees only the states a scenario supplies, so a
+# defect surfaces only if someone writes the scenario that reaches it. The
+# three seeded defects below each need operations chained from the initial
+# state; the explorer must find each unprompted, with the shortest sequence
+# that triggers it.
+#
+# Run from the repo root:
+#   rust-runtime/target/release/pat.exe --ir-run self_hosting/zs_explore_selftest.patlang
+
+include "lib/test.patlang"
+include "lib/zs_explore.patlang"
+
+# LibraryLoans with a consistency invariant that ties loanCount to borrowedBy,
+# a finite catalogue and finite domains. `bug` selects one seeded defect.
+make a function called ll_text takes bug, titles returns text
+  let books = "set_of(\"Dune\", \"Neuromancer\", \"Foundation\")"
+  if titles == 4 then
+    let books = "set_of(\"Dune\", \"Neuromancer\", \"Foundation\", \"Hobbit\")"
+  end
+  let borrow_requires = "  require title in books
+  require not map_has(borrowedBy, title)
+  require map_get_or(loanCount, member, 0) < 3
+"
+  if bug == "double_borrow" then
+    let borrow_requires = "  require title in books
+  require map_get_or(loanCount, member, 0) < 3
+"
+  end
+  if bug == "no_limit" then
+    let borrow_requires = "  require title in books
+  require not map_has(borrowedBy, title)
+"
+  end
+  let return_count = "  ensure loanCount' == map_put(loanCount, map_get(borrowedBy, title), map_get(loanCount, map_get(borrowedBy, title)) - 1)
+"
+  if bug == "return_keeps_count" then
+    let return_count = "  ensure loanCount' == loanCount
+"
+  end
+  return "schema LibraryLoans
+state books, borrowedBy, loanCount
+init books = " + books + "
+init borrowedBy = empty_map()
+init loanCount = empty_map()
+domain title = " + books + "
+domain member = set_of(\"A. Diallo\", \"S. Okonkwo\")
+invariant subset(dom(borrowedBy), books)
+invariant forall m in dom(loanCount) : map_get(loanCount, m) >= 0 and map_get(loanCount, m) <= 3
+invariant forall m in dom(loanCount) : map_get(loanCount, m) == map_count_val(borrowedBy, m)
+
+operation BorrowBook(title, member)
+" + borrow_requires + "  ensure borrowedBy' == map_put(borrowedBy, title, member)
+  ensure loanCount' == map_put(loanCount, member, map_get_or(loanCount, member, 0) + 1)
+end
+
+operation ReturnBook(title)
+  require map_has(borrowedBy, title)
+  ensure borrowedBy' == map_remove(borrowedBy, title)
+" + return_count + "end
+"
+end
+
+make a function called load_ll takes bug, titles returns tag
+  let r = zs_load(ll_text(bug, titles))
+  return r[0]
+end
+
+# Names of the operations along a trace, joined with spaces.
+make a function called trace_ops takes trace returns s
+  let out = sb_new()
+  let i = 0
+  let n = to_num(list_len(trace))
+  while i < n do
+    if i > 0 then
+      sb_push(out, " ")
+    end
+    sb_push(out, trace[i][0])
+    let i = i + 1
+  end
+  return sb_str(out)
+end
+
+t_init()
+
+# ---- the correct schema: every reachable state, checked ----
+check("the correct schema loads", load_ll("none", 3), "ok")
+let good = zs_explore("LibraryLoans", 100000)
+check("the correct schema explores clean", good[0], "ok")
+# Counted by hand, independently of the explorer. Each title is on the shelf or
+# out with one of 2 members (3^3 = 27 assignments), and loanCount keeps a
+# zero-valued key for a member who has borrowed and returned everything, so
+# each assignment carries 2^(2 - members holding titles) states:
+#   no titles out            1 assignment  x 4 = 4
+#   one title out            6             x 2 = 12
+#   two titles out           12 assignments: 6 with one member (x2), 6 with two (x1) = 18
+#   three titles out         8 assignments: 2 with one member (x2), 6 with two (x1) = 10
+# 44 states. Transitions: a title on the shelf can be borrowed by either member
+# (2 each), and a title that is out can be returned (1 each):
+#   4 x 6 + 12 x 5 + 18 x 4 + 10 x 3 = 186.
+check("all 44 reachable states are found", good[1][0], 44)
+check("all 186 enabled transitions are found", good[1][1], 186)
+check("the search was exhaustive", good[1][2], true)
+
+# ---- seeded defect 1: a second borrower takes a title that is already out ----
+check("double-borrow schema loads", load_ll("double_borrow", 3), "ok")
+let r1 = zs_explore("LibraryLoans", 100000)
+check("the missing 'not already borrowed' precondition is found", r1[0], "invariant_violated_after")
+check("the shortest triggering sequence is two borrows", trace_ops(r1[1][3]), "BorrowBook BorrowBook")
+check("the violation names the consistency invariant", contains_text(r1[1][1], "map_count_val"), true)
+
+# ---- seeded defect 2: a return that forgets to lower the count ----
+check("return-keeps-count schema loads", load_ll("return_keeps_count", 3), "ok")
+let r2 = zs_explore("LibraryLoans", 100000)
+check("the forgotten decrement is found", r2[0], "invariant_violated_after")
+check("the shortest triggering sequence is a borrow then a return", trace_ops(r2[1][3]), "BorrowBook ReturnBook")
+
+# ---- seeded defect 3: no loan limit; needs four titles to exceed three loans ----
+check("no-limit schema loads", load_ll("no_limit", 4), "ok")
+let r3 = zs_explore("LibraryLoans", 100000)
+check("the missing loan limit is found", r3[0], "invariant_violated_after")
+check("the shortest triggering sequence is four borrows", trace_ops(r3[1][3]), "BorrowBook BorrowBook BorrowBook BorrowBook")
+check("the trace ends in the violating step's own operation", r3[1][0], "BorrowBook")
+
+# ---- what a single-step check sees of the double-borrow defect ----
+# Handed the exact scenario (Okonkwo borrows the title Diallo has out), the
+# single-step check does flag it. A scenario that starts from an empty library,
+# the natural first one to write, sees nothing wrong; the explorer needs no
+# scenario at all.
+check("double-borrow schema reloads", load_ll("double_borrow", 3), "ok")
+let books = pset_add(pset_new(), "Dune")
+let before = [books, pmap_put(pmap_new(), "Dune", "A. Diallo"), pmap_put(pmap_new(), "A. Diallo", 1)]
+let after = [books, pmap_put(pmap_new(), "Dune", "S. Okonkwo"), pmap_put(pmap_put(pmap_new(), "A. Diallo", 1), "S. Okonkwo", 1)]
+let single = zs_check_values("LibraryLoans", "BorrowBook", before, ["Dune", "S. Okonkwo"], after)
+check("the single-step check reports the double borrow as invariant_violated_after", single[0], "invariant_violated_after")
+let before_ok = [books, pmap_new(), pmap_new()]
+let after_ok = [books, pmap_put(pmap_new(), "Dune", "A. Diallo"), pmap_put(pmap_new(), "A. Diallo", 1)]
+let single_ok = zs_check_values("LibraryLoans", "BorrowBook", before_ok, ["Dune", "A. Diallo"], after_ok)
+check("a scenario that starts from an empty library sees nothing wrong", single_ok[0], "ok")
+
+# ---- a bound is reported as a bound ----
+check("correct schema reloads", load_ll("none", 3), "ok")
+let cut = zs_explore("LibraryLoans", 10)
+check("a search stopped at its bound says so", cut[0], "ok_bounded")
+check("a bounded search reports it was not exhaustive", cut[1][2], false)
+
+# ---- declarations the explorer cannot run are refused, not guessed at ----
+let no_init = zs_load("schema NoInit\nstate n\ninvariant n >= 0\noperation Inc()\n  ensure n' == n + 1\nend\n")
+check("a schema with no init loads", no_init[0], "ok")
+check("exploring a schema with no init is refused", zs_explore("NoInit", 100)[0], "missing_init")
+
+let no_dom = zs_load("schema NoDom\nstate n\ninit n = 0\ninvariant n >= 0\noperation Add(k)\n  ensure n' == n + k\nend\n")
+check("a schema whose input has no domain loads", no_dom[0], "ok")
+check("exploring it is refused, naming the input", zs_explore("NoDom", 100)[1][1], "k")
+
+let relational = zs_load("schema Rel\nstate n\ninit n = 0\ninvariant n >= 0\noperation Grow()\n  ensure n' > n\nend\n")
+check("a relational-only postcondition loads", relational[0], "ok")
+check("but it cannot be explored, because no after-state is defined", zs_explore("Rel", 100)[0], "not_explorable")
+
+# ---- an infinite schema is cut by the bound rather than run forever ----
+let counter = zs_load("schema Counter\nstate n\ninit n = 0\ninvariant n >= 0\noperation Inc()\n  ensure n' == n + 1\nend\n")
+check("an unbounded counter loads", counter[0], "ok")
+let cr = zs_explore("Counter", 50)
+check("an unbounded counter stops at the bound", cr[0], "ok_bounded")
+check("and explored exactly the bound", cr[1][0], 50)
+
+# ---- an init that already breaks an invariant ----
+let bad_init = zs_load("schema BadInit\nstate n\ninit n = -1\ninvariant n >= 0\n")
+check("a schema with a bad init loads", bad_init[0], "ok")
+check("the explorer reports the initial state", zs_explore("BadInit", 100)[0], "invariant_violated_init")
+
+# ---- a long search can be watched and stopped from outside ----
+# The tick function is called on a time schedule while the search runs (here
+# forced to every check by a 0 ms interval) with the states processed, the
+# states discovered and the transitions taken so far; returning false stops it.
+make a function called tick_count_only takes processed, discovered, transitions returns go
+  set_var("test_ticks", get("__vars", "test_ticks") + 1)
+  set_var("test_last_transitions", transitions)
+  return true
+end
+
+make a function called tick_stop_at_two takes processed, discovered, transitions returns go
+  set_var("test_stop_ticks", get("__vars", "test_stop_ticks") + 1)
+  return get("__vars", "test_stop_ticks") < 2
+end
+
+check("the correct schema reloads for tick tests", load_ll("none", 3), "ok")
+zs_set_tick_ms(0)
+set_var("test_ticks", 0)
+let watched = zs_explore_ticked("LibraryLoans", 100000, "tick_count_only")
+check("a watched search gives the same answer as an unwatched one", watched[0], "ok")
+check("a watched search sees the same state count", watched[1][0], 44)
+check("the tick function was called while the search ran", get("__vars", "test_ticks") >= 4, true)
+check("the tick saw transitions accumulate", get("__vars", "test_last_transitions") > 100, true)
+set_var("test_stop_ticks", 0)
+let stopped = zs_explore_ticked("LibraryLoans", 100000, "tick_stop_at_two")
+check("a tick returning false aborts the search", stopped[0], "aborted")
+check("an aborted search reports it was not exhaustive", stopped[1][2], false)
+check("an aborted search stopped before finishing", stopped[1][1] < 186, true)
+zs_set_tick_ms(50)
+
+t_report()

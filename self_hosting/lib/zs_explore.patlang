@@ -1,0 +1,495 @@
+# =============================================================================
+# zs_explore: breadth-first exploration of every state a declared schema can
+# reach (zs_schema.patlang), checking each invariant and postcondition along
+# the way.
+#
+# A scenario check sees only the states a scenario supplies. This walks the
+# schema's own state space instead: start at the init state, apply every
+# operation whose preconditions hold for every combination of input values
+# in its declared domains, compute the after-state, check it, and continue
+# from each state not seen before. A violation comes back with the shortest
+# sequence of operations that reaches it, because the search is breadth-first.
+#
+# What it can and cannot claim:
+#   - Exhaustive means every state reachable through the declared domains, and
+#     no more. A value outside a domain is never tried, so the domains are
+#     part of the claim. The result says whether the search finished or hit
+#     the max_states bound ("ok" vs "ok_bounded").
+#   - It needs an after-state to walk to. An ensure clause of the form
+#     a' == expr defines a; a variable with no such clause is taken as
+#     unchanged; an ensure clause that constrains a' without defining it
+#     (n' > n) leaves the after-state open, and the schema is refused
+#     ("not_explorable") rather than explored on a guess.
+#   - One init state, not a set of them.
+#
+# Results are [tag, payload]:
+#   ["ok", [states, transitions, true]]        every reachable state checked
+#   ["ok_bounded", [states, transitions, false]]  stopped at max_states
+#   ["invariant_violated_init", [clause, state]]
+#   ["invariant_violated_after", [op, clause, inputs, trace]]
+#   ["postcondition_violated", [op, clause, inputs, trace]]
+#   ["missing_init", [var]]   ["missing_domain", [op, input]]
+#   ["not_explorable", [op, var]]   ["unknown_schema", [name]]
+#   ["runtime_error", [message]]    ["aborted", [states, transitions, false]]
+# where trace is the list of [op, inputs, state_after] steps from the init
+# state to the violating step, the last step being the violating one.
+#
+# A caller that needs to report progress or stop the search passes the name of
+# a tick function: it is applied as tick(processed, discovered, transitions)
+# on a time schedule (at most once per zs_tick_ms, checked every
+# zs_tick_check_every transitions, so a state with thousands of transitions
+# cannot starve it), and returning false aborts the search. A driver that
+# services signals calls signal_poll from its tick function.
+# =============================================================================
+
+include "zs_schema.patlang"
+
+# Minimum milliseconds between two calls of a tick function (50 unless set).
+make a function called zs_tick_ms returns ms
+  let v = get("__vars", "zs_tick_ms")
+  if type_of(v) == "unit" then
+    return 50
+  end
+  return v
+end
+
+make a function called zs_set_tick_ms takes ms returns done
+  set_var("zs_tick_ms", ms)
+  return true
+end
+
+# What the search is doing, for a status report: set by the explorer and the
+# feature analysis as they move between phases.
+make a function called zs_set_phase takes text returns done
+  set_var("zs_phase", text)
+  return true
+end
+
+make a function called zs_phase returns text
+  let v = get("__vars", "zs_phase")
+  if type_of(v) != "string" then
+    return ""
+  end
+  return v
+end
+
+# Called from inside a work loop, once per unit of work. Looks at the clock
+# every zs_tick_check_every calls and, when zs_tick_ms have passed, applies
+# tick_fn(a, b, c); a false answer sets the aborted flag, which every loop
+# that calls this checks. Returns false once the search has been aborted.
+make a function called zs_tick_poll takes tick_fn, a, b, c returns go
+  if tick_fn == "" then
+    return true
+  end
+  let since = get("__vars", "zs_tp_since")
+  if type_of(since) == "unit" then
+    let since = 0
+  end
+  let since = since + 1
+  if since < zs_tick_check_every() then
+    set_var("zs_tp_since", since)
+    return true
+  end
+  set_var("zs_tp_since", 0)
+  let now = now_ms()
+  let last = get("__vars", "zs_tp_last")
+  if type_of(last) == "unit" then
+    let last = 0
+  end
+  if now - last < zs_tick_ms() then
+    return true
+  end
+  set_var("zs_tp_last", now)
+  if apply(tick_fn, a, b, c) == false then
+    set_var("zs_aborted", 1)
+    return false
+  end
+  return true
+end
+
+make a function called zs_aborted returns r
+  return get("__vars", "zs_aborted") == 1
+end
+
+make a function called zs_clear_abort returns done
+  set_var("zs_aborted", 0)
+  return true
+end
+
+# Transitions between two looks at the clock.
+make a function called zs_tick_check_every returns n
+  return 32
+end
+
+make a function called zs_index_of takes names, name returns idx
+  let i = 0
+  let n = to_num(list_len(names))
+  while i < n do
+    if names[i] == name then
+      return i
+    end
+    let i = i + 1
+  end
+  return -1
+end
+
+# Every combination of one value per list: [[a1, b1], [a1, b2], ...].
+make a function called zs_product takes lists returns tuples
+  let tuples = [[]]
+  let i = 0
+  let n = to_num(list_len(lists))
+  while i < n do
+    let nxt = []
+    let t = 0
+    let tn = to_num(list_len(tuples))
+    while t < tn do
+      let v = 0
+      let vn = to_num(list_len(lists[i]))
+      while v < vn do
+        let nxt = list_push(nxt, list_appended(tuples[t], lists[i][v]))
+        let v = v + 1
+      end
+      let t = t + 1
+    end
+    let tuples = nxt
+    let i = i + 1
+  end
+  return tuples
+end
+
+# The declared domain of an input: its list of values, or "" when undeclared.
+make a function called zs_domain_of takes entry, input returns values
+  let doms = entry[5]
+  let i = 0
+  let n = to_num(list_len(doms))
+  while i < n do
+    if doms[i][0] == input then
+      return doms[i][1]
+    end
+    let i = i + 1
+  end
+  return ""
+end
+
+# Every operation, ready to run: [name, inputs, tuples, requires, checked_ensures,
+# effect_by_state_index]. An ensure clause that defines a state variable's
+# after-state is used to compute it and is not re-checked; the rest are
+# checked. Returns ["ok", ops] or [tag, payload] for a schema that cannot be
+# explored.
+make a function called zs_prepare takes entry returns result
+  let state_names = entry[1]
+  let ns = to_num(list_len(state_names))
+  let ops = entry[6]
+  let prepared = []
+  let oi = 0
+  let opcount = to_num(list_len(ops))
+  while oi < opcount do
+    let op = ops[oi]
+    let doms = []
+    let k = 0
+    let kn = to_num(list_len(op[1]))
+    while k < kn do
+      let d = zs_domain_of(entry, op[1][k])
+      if type_of(d) != "list" then
+        return ["missing_domain", [op[0], op[1][k]]]
+      end
+      let doms = list_push(doms, d)
+      let k = k + 1
+    end
+    let eff = []
+    let j = 0
+    while j < ns do
+      let eff = list_push(eff, "")
+      let j = j + 1
+    end
+    let used = []
+    let e = 0
+    let en = to_num(list_len(op[4]))
+    while e < en do
+      let idx = zs_index_of(state_names, op[4][e][0])
+      if eff[idx] == "" then
+        let eff = list_set(eff, idx, op[4][e][1])
+        let used = list_push(used, op[4][e][2])
+      end
+      let e = e + 1
+    end
+    let checked = []
+    let p = 0
+    let pn = to_num(list_len(op[3]))
+    while p < pn do
+      let is_effect = false
+      let u = 0
+      let un = to_num(list_len(used))
+      while u < un do
+        if used[u] == p then
+          let is_effect = true
+        end
+        let u = u + 1
+      end
+      if is_effect == false then
+        let fv = ze_free_vars(op[3][p][1])
+        let f = 0
+        let fcount = to_num(list_len(fv))
+        while f < fcount do
+          if zs_is_primed(fv[f]) then
+            let base = sc_substr(str_intern(fv[f]), 0, sc_len(str_intern(fv[f])) - 1)
+            let bi = zs_index_of(state_names, base)
+            if bi >= 0 then
+              if eff[bi] == "" then
+                return ["not_explorable", [op[0], base]]
+              end
+            end
+          end
+          let f = f + 1
+        end
+        let checked = list_push(checked, op[3][p])
+      end
+      let p = p + 1
+    end
+    let prepared = list_push(prepared, [op[0], op[1], zs_product(doms), op[2], checked, eff])
+    let oi = oi + 1
+  end
+  return ["ok", prepared]
+end
+
+# The after-state of one operation instance: each state variable takes the
+# value of its defining ensure clause, or keeps its before value.
+make a function called zs_apply_effects takes eff, before, env_op returns after
+  let after = []
+  let j = 0
+  let n = to_num(list_len(before))
+  while j < n do
+    if eff[j] == "" then
+      let after = list_push(after, before[j])
+    else
+      let after = list_push(after, ze_eval(eff[j], env_op))
+    end
+    let j = j + 1
+  end
+  return after
+end
+
+# A string that is equal for two states exactly when they are equal.
+make a function called zs_state_key takes state returns key
+  let b = sb_new()
+  let j = 0
+  let n = to_num(list_len(state))
+  while j < n do
+    sb_push(b, "" + j)
+    sb_push(b, ":")
+    sb_push(b, ze_canon(state[j]))
+    sb_push(b, ";")
+    let j = j + 1
+  end
+  return sb_str(b)
+end
+
+# The steps [op, inputs, state] from the init state to state number idx.
+make a function called zs_trace takes states, parents, vias, idx returns steps
+  let rev = []
+  let cur = idx
+  while cur > 0 do
+    let rev = list_push(rev, [vias[cur][0], vias[cur][1], states[cur]])
+    let cur = parents[cur]
+  end
+  let steps = []
+  let i = to_num(list_len(rev)) - 1
+  while i >= 0 do
+    let steps = list_push(steps, rev[i])
+    let i = i - 1
+  end
+  return steps
+end
+
+# Runs the search and returns [diagnosis, states, parents, vias, prepared] so
+# a caller that needs the reachable states (zs_feature.patlang) can reuse them.
+# The seen-set is a Dict object, dropped here on every path out.
+make a function called zs_bfs takes schema_name, max_states, tick_fn returns result
+  let counter = get("__vars", "zs_bfs_counter")
+  if type_of(counter) == "unit" then
+    let counter = 0
+  end
+  set_var("zs_bfs_counter", counter + 1)
+  let seen = new("Dict", "zs_seen_" + counter)
+  let result = zs_bfs_impl(schema_name, max_states, tick_fn, seen)
+  object_delete(seen)
+  return result
+end
+
+make a function called zs_bfs_impl takes schema_name, max_states, tick_fn, seen returns result
+  let entry = zs_entry(schema_name)
+  if type_of(entry) != "list" then
+    return [["unknown_schema", [schema_name]], [], [], [], []]
+  end
+  let state_names = entry[1]
+  let ns = to_num(list_len(state_names))
+  let consts = entry[2]
+  let invariants = entry[4]
+
+  let init = []
+  let j = 0
+  while j < ns do
+    let found = false
+    let value = ""
+    let k = 0
+    let kn = to_num(list_len(entry[3]))
+    while k < kn do
+      if entry[3][k][0] == state_names[j] then
+        let found = true
+        let value = entry[3][k][1]
+      end
+      let k = k + 1
+    end
+    if found == false then
+      return [["missing_init", [state_names[j]]], [], [], [], []]
+    end
+    let init = list_push(init, value)
+    let j = j + 1
+  end
+
+  let prep = zs_prepare(entry)
+  if prep[0] != "ok" then
+    return [prep, [], [], [], []]
+  end
+  let ops = prep[1]
+
+  ze_rt_clear()
+  let f0 = zs_first_failing(invariants, zs_env_add(consts, state_names, init, ""))
+  if ze_rt_error() != "" then
+    return [["runtime_error", [ze_rt_error()]], [init], [-1], [[]], ops]
+  end
+  if f0 >= 0 then
+    return [["invariant_violated_init", [invariants[f0][0], init]], [init], [-1], [[]], ops]
+  end
+
+  let states = [init]
+  let parents = [-1]
+  let vias = [[]]
+  send(seen, "set", zs_state_key(init), 1)
+  let transitions = 0
+  let exhaustive = true
+  zs_clear_abort()
+  set_var("zs_tp_since", 0)
+  set_var("zs_tp_last", now_ms())
+  zs_set_phase("exploring the state space")
+  let qi = 0
+  let nops = to_num(list_len(ops))
+  while qi < to_num(list_len(states)) do
+    let st = states[qi]
+    let env_state = zs_env_add(consts, state_names, st, "")
+    let oi = 0
+    while oi < nops do
+      let op = ops[oi]
+      let tuples = op[2]
+      let ti = 0
+      let tn = to_num(list_len(tuples))
+      while ti < tn do
+        let inputs = tuples[ti]
+        let env_op = zs_env_add(env_state, op[1], inputs, "")
+        let fr = zs_first_failing(op[3], env_op)
+        if ze_rt_error() != "" then
+          return [["runtime_error", [ze_rt_error()]], states, parents, vias, ops]
+        end
+        if zs_tick_poll(tick_fn, qi, to_num(list_len(states)), transitions) == false then
+          return [["aborted", [to_num(list_len(states)), transitions, false]], states, parents, vias, ops]
+        end
+        if fr < 0 then
+          let transitions = transitions + 1
+          let after = zs_apply_effects(op[5], st, env_op)
+          let fp = zs_first_failing(op[4], zs_env_add(env_op, state_names, after, "'"))
+          if ze_rt_error() != "" then
+            return [["runtime_error", [ze_rt_error()]], states, parents, vias, ops]
+          end
+          if fp >= 0 then
+            let trace = list_push(zs_trace(states, parents, vias, qi), [op[0], inputs, after])
+            return [["postcondition_violated", [op[0], op[4][fp][0], inputs, trace]], states, parents, vias, ops]
+          end
+          let fi = zs_first_failing(invariants, zs_env_add(consts, state_names, after, ""))
+          if ze_rt_error() != "" then
+            return [["runtime_error", [ze_rt_error()]], states, parents, vias, ops]
+          end
+          if fi >= 0 then
+            let trace = list_push(zs_trace(states, parents, vias, qi), [op[0], inputs, after])
+            return [["invariant_violated_after", [op[0], invariants[fi][0], inputs, trace]], states, parents, vias, ops]
+          end
+          let key = zs_state_key(after)
+          let known = get(seen, key)
+          if known != 1 then
+            if to_num(list_len(states)) >= max_states then
+              let exhaustive = false
+            else
+              send(seen, "set", key, 1)
+              let states = list_push(states, after)
+              let parents = list_push(parents, qi)
+              let vias = list_push(vias, [op[0], inputs])
+            end
+          end
+        end
+        let ti = ti + 1
+      end
+      let oi = oi + 1
+    end
+    let qi = qi + 1
+  end
+  let tag = "ok"
+  if exhaustive == false then
+    let tag = "ok_bounded"
+  end
+  return [[tag, [to_num(list_len(states)), transitions, exhaustive]], states, parents, vias, ops]
+end
+
+# The diagnosis alone.
+make a function called zs_explore_ticked takes schema_name, max_states, tick_fn returns diagnosis
+  return zs_bfs(schema_name, max_states, tick_fn)[0]
+end
+
+make a function called zs_explore takes schema_name, max_states returns diagnosis
+  return zs_bfs(schema_name, max_states, "")[0]
+end
+
+# A readable account of a diagnosis from zs_explore: one string per line.
+make a function called zs_format_exploration takes diagnosis returns lines
+  let tag = diagnosis[0]
+  let p = diagnosis[1]
+  if tag == "ok" then
+    return ["Explored every reachable state: " + p[0] + " states, " + p[1] + " transitions. No invariant or postcondition was violated."]
+  end
+  if tag == "ok_bounded" then
+    return ["Stopped at the bound after " + p[0] + " states (" + p[1] + " transitions) with no violation found. States beyond the bound were not checked."]
+  end
+  if tag == "invariant_violated_init" then
+    return ["The initial state already breaks an invariant: " + p[0]]
+  end
+  if (tag == "invariant_violated_after") or (tag == "postcondition_violated") then
+    let out = []
+    let what = "an invariant"
+    if tag == "postcondition_violated" then
+      let what = "a postcondition"
+    end
+    let out = list_push(out, p[0] + " reaches a state that breaks " + what + ": " + p[1])
+    let trace = p[3]
+    let i = 0
+    let n = to_num(list_len(trace))
+    while i < n do
+      let out = list_push(out, "  step " + (i + 1) + ": " + trace[i][0] + " with " + ze_show(trace[i][1]))
+      let i = i + 1
+    end
+    return out
+  end
+  if tag == "missing_init" then
+    return ["The schema has no init for " + p[0] + ", so there is no state to start from."]
+  end
+  if tag == "missing_domain" then
+    return [p[0] + " takes " + p[1] + ", which has no domain declared, so its values cannot be enumerated."]
+  end
+  if tag == "not_explorable" then
+    return [p[0] + " constrains " + p[1] + "' without defining it (no ensure clause of the form " + p[1] + "' == expr), so its after-state is not determined."]
+  end
+  if tag == "aborted" then
+    return ["The search was stopped after " + p[0] + " states."]
+  end
+  if tag == "runtime_error" then
+    return ["A clause could not be evaluated: " + p[0]]
+  end
+  return ["Unrecognised result: " + tag]
+end

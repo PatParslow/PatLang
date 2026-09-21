@@ -1,0 +1,303 @@
+# Selftest for self_hosting/lib/zs_schema.patlang: a schema declared as text
+# (state, invariants, operations with require/ensure clauses) instead of as
+# separately compiled functions. LibraryLoans is the same schema the
+# function-based demo (examples/library_loans_schema_demo.patlang) uses; the
+# scenarios below run through the real Gherkin runner with parametrised steps
+# and must draw the same diagnoses from it, plus the one outcome that demo
+# never reaches (invariant_violated_after).
+#
+# Run from the repo root:
+#   rust-runtime/target/release/pat.exe --ir-run self_hosting/zs_schema_selftest.patlang
+
+include "lib/test.patlang"
+include "lib/zs_schema.patlang"
+
+make a function called ll_schema_text returns text
+  return "# LibraryLoans as a declared schema
+schema LibraryLoans
+state books, borrowedBy, loanCount
+invariant subset(dom(borrowedBy), books)
+invariant forall m in dom(loanCount) : map_get(loanCount, m) >= 0 and map_get(loanCount, m) <= 3
+
+operation BorrowBook(title, member)
+  require title in books
+  require not map_has(borrowedBy, title)
+  require map_get_or(loanCount, member, 0) < 3
+  ensure books' == books
+  ensure borrowedBy' == map_put(borrowedBy, title, member)
+  ensure loanCount' == map_put(loanCount, member, map_get_or(loanCount, member, 0) + 1)
+end
+
+operation ReturnBook(title)
+  require map_has(borrowedBy, title)
+  ensure books' == books
+  ensure borrowedBy' == map_remove(borrowedBy, title)
+  ensure loanCount' == map_put(loanCount, map_get(borrowedBy, title), map_get(loanCount, map_get(borrowedBy, title)) - 1)
+end
+"
+end
+
+# ---- steps: bindings only; the schema decides what they mean ----
+
+make a function called st_catalogue returns done
+  schema_bind_state("LibraryLoans", "books", "before", pset_add(pset_add(pset_add(pset_new(), "Dune"), "Neuromancer"), "Foundation"))
+  return true
+end
+
+make a function called st_no_loans returns done
+  schema_bind_state("LibraryLoans", "borrowedBy", "before", pmap_new())
+  schema_bind_state("LibraryLoans", "loanCount", "before", pmap_new())
+  return true
+end
+
+make a function called st_borrowed_by returns done
+  let title = step_arg("title")
+  let member = step_arg("member")
+  schema_bind_state("LibraryLoans", "borrowedBy", "before", pmap_put(pmap_new(), title, member))
+  schema_bind_state("LibraryLoans", "loanCount", "before", pmap_put(pmap_new(), member, 1))
+  return true
+end
+
+make a function called st_at_limit returns done
+  let member = step_arg("member")
+  let by = pmap_put(pmap_put(pmap_put(pmap_new(), "Dune", member), "Neuromancer", member), "Foundation", member)
+  schema_bind_state("LibraryLoans", "borrowedBy", "before", by)
+  schema_bind_state("LibraryLoans", "loanCount", "before", pmap_put(pmap_new(), member, 3))
+  # A fourth, unborrowed title, so the loan limit is the only clause that can fail.
+  schema_bind_state("LibraryLoans", "books", "before", pset_add(get("__vars", "LibraryLoans__books__before"), "Hobbit"))
+  return true
+end
+
+make a function called st_corrupt returns done
+  schema_bind_state("LibraryLoans", "borrowedBy", "before", pmap_new())
+  schema_bind_state("LibraryLoans", "loanCount", "before", pmap_put(pmap_new(), step_arg("member"), 4))
+  return true
+end
+
+make a function called st_borrows returns done
+  schema_bind_input("LibraryLoans", "BorrowBook", "title", step_arg("title"))
+  schema_bind_input("LibraryLoans", "BorrowBook", "member", step_arg("member"))
+  return true
+end
+
+make a function called st_returns returns done
+  schema_bind_input("LibraryLoans", "ReturnBook", "title", step_arg("title"))
+  return true
+end
+
+# The claimed outcome of a borrow, built from the Given the way a person
+# writing the scenario would: the title now on loan to the member, count up by one.
+make a function called ll_claim_borrow takes title, member, count_delta, extra_title returns done
+  let b0 = get("__vars", "LibraryLoans__books__before")
+  let by0 = get("__vars", "LibraryLoans__borrowedBy__before")
+  let lc0 = get("__vars", "LibraryLoans__loanCount__before")
+  schema_bind_state("LibraryLoans", "books", "after", b0)
+  let by1 = pmap_put(by0, title, member)
+  if extra_title != "" then
+    let by1 = pmap_put(by1, extra_title, member)
+  end
+  schema_bind_state("LibraryLoans", "borrowedBy", "after", by1)
+  let n0 = 0
+  if pmap_has(lc0, member) then
+    let n0 = pmap_get(lc0, member)
+  end
+  schema_bind_state("LibraryLoans", "loanCount", "after", pmap_put(lc0, member, n0 + count_delta))
+  return true
+end
+
+make a function called st_then_recorded returns done
+  ll_claim_borrow("Foundation", "A. Diallo", 1, "")
+  let d = zs_check("LibraryLoans", "BorrowBook")
+  check("a correct borrow is accepted", d[0], "ok")
+  return true
+end
+
+make a function called st_then_borrow_rejected returns done
+  let d = zs_check("LibraryLoans", "BorrowBook")
+  check("a borrow of a title already out is rejected", d[0], "precondition_violated")
+  check("the rejection names the clause that failed", d[1][1], "not map_has(borrowedBy, title)")
+  return true
+end
+
+make a function called st_then_limit_rejected returns done
+  let d = zs_check("LibraryLoans", "BorrowBook")
+  check("a borrow at the loan limit is rejected", d[0], "precondition_violated")
+  check("the rejection names the loan-limit clause", d[1][1], "map_get_or(loanCount, member, 0) < 3")
+  return true
+end
+
+make a function called st_then_corrupt_flagged returns done
+  let d = zs_check("LibraryLoans", "BorrowBook")
+  check("a corrupted record is flagged before the operation", d[0], "invariant_violated_before")
+  check("the invariant clause that broke is named", d[1][1], "forall m in dom(loanCount) : map_get(loanCount, m) >= 0 and map_get(loanCount, m) <= 3")
+  return true
+end
+
+make a function called st_then_count_unchanged returns done
+  ll_claim_borrow("Dune", "A. Diallo", 0, "")
+  let d = zs_check("LibraryLoans", "BorrowBook")
+  check("a claimed count that does not move breaks the postcondition", d[0], "postcondition_violated")
+  return true
+end
+
+make a function called st_then_phantom_title returns done
+  ll_claim_borrow("Dune", "A. Diallo", 1, "Hobbit")
+  let d = zs_check("LibraryLoans", "BorrowBook")
+  check("a claimed outcome recording a title never held breaks the invariant after", d[0], "invariant_violated_after")
+  return true
+end
+
+make a function called st_then_return_ok returns done
+  let b0 = get("__vars", "LibraryLoans__books__before")
+  let by0 = get("__vars", "LibraryLoans__borrowedBy__before")
+  let lc0 = get("__vars", "LibraryLoans__loanCount__before")
+  schema_bind_state("LibraryLoans", "books", "after", b0)
+  schema_bind_state("LibraryLoans", "borrowedBy", "after", pmap_remove(by0, "Dune"))
+  schema_bind_state("LibraryLoans", "loanCount", "after", pmap_put(lc0, "S. Okonkwo", 0))
+  let d = zs_check("LibraryLoans", "ReturnBook")
+  check("a return of a borrowed title is accepted", d[0], "ok")
+  return true
+end
+
+make a function called st_then_return_rejected returns done
+  let d = zs_check("LibraryLoans", "ReturnBook")
+  check("a return of a title nobody borrowed is rejected", d[0], "precondition_violated")
+  return true
+end
+
+make a function called register_steps returns done
+  step("the library holds its standard catalogue", "st_catalogue")
+  step("no member has any books out", "st_no_loans")
+  step("\"{title}\" is currently borrowed by \"{member}\"", "st_borrowed_by")
+  step("\"{member}\" already has three books out", "st_at_limit")
+  step("the loan record wrongly shows \"{member}\" with four loans", "st_corrupt")
+  step("\"{member}\" borrows \"{title}\"", "st_borrows")
+  step("\"{member}\" returns \"{title}\"", "st_returns")
+  step("the loan is correctly recorded", "st_then_recorded")
+  step("the borrow is rejected", "st_then_borrow_rejected")
+  step("the borrow is rejected for being at the limit", "st_then_limit_rejected")
+  step("the schema flags the corrupted record first", "st_then_corrupt_flagged")
+  step("the incorrect record is rejected", "st_then_count_unchanged")
+  step("the record of a title the library never held is rejected", "st_then_phantom_title")
+  step("the return is accepted", "st_then_return_ok")
+  step("the return is rejected", "st_then_return_rejected")
+  return true
+end
+
+make a function called ll_feature returns text
+  return "Feature: Library loans, declared as a schema
+
+Scenario: Borrowing an available title under the loan limit
+  Given the library holds its standard catalogue
+  And no member has any books out
+  When \"A. Diallo\" borrows \"Foundation\"
+  Then the loan is correctly recorded
+
+Scenario: Borrowing a title someone else already has out
+  Given the library holds its standard catalogue
+  And \"Dune\" is currently borrowed by \"S. Okonkwo\"
+  When \"A. Diallo\" borrows \"Dune\"
+  Then the borrow is rejected
+
+Scenario: Borrowing while already at the three-loan limit
+  Given the library holds its standard catalogue
+  And \"A. Diallo\" already has three books out
+  When \"A. Diallo\" borrows \"Hobbit\"
+  Then the borrow is rejected for being at the limit
+
+Scenario: A corrupted loan record is caught before the operation runs
+  Given the library holds its standard catalogue
+  And the loan record wrongly shows \"A. Diallo\" with four loans
+  When \"A. Diallo\" borrows \"Foundation\"
+  Then the schema flags the corrupted record first
+
+Scenario: A scenario that under-reports its own effect is caught
+  Given the library holds its standard catalogue
+  And no member has any books out
+  When \"A. Diallo\" borrows \"Dune\"
+  Then the incorrect record is rejected
+
+Scenario: A scenario that claims a title the library never held is caught
+  Given the library holds its standard catalogue
+  And no member has any books out
+  When \"A. Diallo\" borrows \"Dune\"
+  Then the record of a title the library never held is rejected
+
+Scenario: Returning a borrowed title
+  Given the library holds its standard catalogue
+  And \"Dune\" is currently borrowed by \"S. Okonkwo\"
+  When \"S. Okonkwo\" returns \"Dune\"
+  Then the return is accepted
+
+Scenario: Returning a title nobody borrowed
+  Given the library holds its standard catalogue
+  And no member has any books out
+  When \"A. Diallo\" returns \"Foundation\"
+  Then the return is rejected
+"
+end
+
+# ---- load-time errors are reported with the line they came from ----
+
+make a function called load_error_line takes text returns n
+  let r = zs_load(text)
+  if r[0] != "error" then
+    return -1
+  end
+  return r[1][0]
+end
+
+make a function called load_error_msg takes text returns m
+  let r = zs_load(text)
+  if r[0] != "error" then
+    return ""
+  end
+  return r[1][1]
+end
+
+t_init()
+
+let loaded = zs_load(ll_schema_text())
+check("the schema text loads", loaded[0], "ok")
+check("the loaded schema is named", loaded[1], "LibraryLoans")
+check("the schema lists its state variables", to_num(list_len(zs_state_names("LibraryLoans"))), 3)
+check("the schema lists its operations", to_num(list_len(zs_op_names("LibraryLoans"))), 2)
+
+register_steps()
+run_feature(ll_feature())
+
+# The value-based core, called directly the way a synthesis harness would.
+let books = pset_add(pset_new(), "Dune")
+let ok_diag = zs_check_values("LibraryLoans", "BorrowBook", [books, pmap_new(), pmap_new()], ["Dune", "A. Diallo"], [books, pmap_put(pmap_new(), "Dune", "A. Diallo"), pmap_put(pmap_new(), "A. Diallo", 1)])
+check("zs_check_values accepts a correct transition", ok_diag[0], "ok")
+let bad_diag = zs_check_values("LibraryLoans", "BorrowBook", [books, pmap_new(), pmap_new()], ["Dune", "A. Diallo"], [books, pmap_put(pmap_new(), "Dune", "S. Okonkwo"), pmap_put(pmap_new(), "A. Diallo", 1)])
+check("zs_check_values rejects a wrong borrower", bad_diag[0], "postcondition_violated")
+check("the failing postcondition is named", bad_diag[1][1], "borrowedBy' == map_put(borrowedBy, title, member)")
+let unknown = zs_check_values("NoSuchSchema", "BorrowBook", [], [], [])
+check("an unknown schema is reported, not crashed on", unknown[0], "unknown_schema")
+let unknown_op = zs_check_values("LibraryLoans", "Steal", [], [], [])
+check("an unknown operation is reported", unknown_op[0], "unknown_operation")
+
+# The diagnosis question names the clause.
+let q = zs_format_diagnosis("LibraryLoans", "BorrowBook", bad_diag)
+check("a diagnosis yields exactly one question", to_num(list_len(q)), 1)
+check("the question quotes the failing clause", contains_text(q[0], "borrowedBy' == map_put(borrowedBy, title, member)"), true)
+
+# A state variable a scenario forgot to bind is reported by name.
+schema_bind_state("LibraryLoans", "books", "before", books)
+schema_bind_state("LibraryLoans", "borrowedBy", "before", "")
+let unbound = zs_check_values("LibraryLoans", "ReturnBook", [books, "", pmap_new()], ["Dune"], [])
+check("a state that is not a collection is a runtime error, not a silent pass", unbound[0], "runtime_error")
+
+# ---- what a declaration may and may not say ----
+check("an unbound name in a clause is rejected at load", contains_text(load_error_msg("schema S\nstate a\ninvariant b > 0\n"), "b"), true)
+check("the error carries the line number", load_error_line("schema S\nstate a\ninvariant b > 0\n"), 3)
+check("a clause that does not parse is rejected at load", load_error_line("schema S\nstate a\ninvariant a >\n"), 3)
+check("require outside an operation is rejected", load_error_line("schema S\nstate a\nrequire a > 0\n"), 3)
+check("an unknown keyword is rejected", load_error_line("schema S\nfrobnicate a\n"), 2)
+check("a primed name is rejected in an invariant", load_error_line("schema S\nstate a\ninvariant a' > 0\n"), 3)
+check("a primed name is rejected in a require", load_error_line("schema S\nstate a\noperation Op()\n  require a' > 0\nend\n"), 4)
+check("an operation left open is rejected", load_error_line("schema S\nstate a\noperation Op()\n  require a > 0\n"), 3)
+check("a valid minimal schema loads", zs_load("schema Tiny\nstate n\ninvariant n >= 0\noperation Inc()\n  ensure n' == n + 1\nend\n")[0], "ok")
+
+t_report()

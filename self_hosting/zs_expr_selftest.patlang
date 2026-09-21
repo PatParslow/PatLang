@@ -1,0 +1,132 @@
+# Selftest for self_hosting/lib/zs_expr.patlang: the small expression language
+# schema clauses are written in (Z-flavoured: sets, maps, quantifiers,
+# primed after-state names). Each check states what a clause must mean and
+# compares the evaluator's answer with it.
+#
+# Run from the repo root:
+#   rust-runtime/target/release/pat.exe --ir-run self_hosting/zs_expr_selftest.patlang
+
+include "lib/test.patlang"
+include "lib/zs_expr.patlang"
+
+# Environment used by most checks: a number, two strings, a set, a map.
+make a function called env_basic returns env
+  let books = pset_add(pset_add(pset_add(pset_new(), "Dune"), "Neuromancer"), "Foundation")
+  let loans = pmap_put(pmap_put(pmap_new(), "Dune", "A. Diallo"), "Foundation", "S. Okonkwo")
+  let counts = pmap_put(pmap_put(pmap_new(), "A. Diallo", 2), "S. Okonkwo", 1)
+  return [["x", 5], ["name", "Dune"], ["books", books], ["loans", loans], ["counts", counts], ["flag", true]]
+end
+
+# Evaluates clause text in env_basic; "PARSE ERROR: ..." if it does not parse.
+make a function called ev takes text returns v
+  let p = ze_parse(text)
+  if p[0] != "ok" then
+    return "PARSE ERROR: " + p[1]
+  end
+  ze_rt_clear()
+  return ze_eval(p[1], env_basic())
+end
+
+t_init()
+
+# ---- arithmetic, comparison, precedence ----
+check("addition and multiplication respect precedence", ev("1 + 2 * 3"), 7)
+check("parentheses override precedence", ev("(1 + 2) * 3"), 9)
+check("subtraction and unary minus", ev("x - 2 + -1"), 2)
+check("modulo", ev("x % 3"), 2)
+check("comparison <=", ev("x <= 5"), true)
+check("comparison >", ev("x > 5"), false)
+check("string equality", ev("name == \"Dune\""), true)
+check("inequality", ev("name != \"Dune\""), false)
+
+# ---- boolean connectives ----
+check("and", ev("x > 1 and x < 10"), true)
+check("or", ev("x > 9 or x == 5"), true)
+check("not", ev("not (x == 5)"), false)
+check("implies: false antecedent holds vacuously", ev("x > 9 implies false"), true)
+check("implies: true antecedent needs the consequent", ev("x == 5 implies x > 9"), false)
+check("implies is right-associative", ev("false implies false implies false"), true)
+check("boolean variable", ev("flag and true"), true)
+
+# ---- sets ----
+check("membership with in", ev("name in books"), true)
+check("non-membership", ev("\"Hobbit\" in books"), false)
+check("set_size", ev("size(books)"), 3)
+check("set_add grows a set", ev("size(set_add(books, \"Hobbit\"))"), 4)
+check("set_add of a member changes nothing", ev("size(set_add(books, \"Dune\"))"), 3)
+check("set_remove", ev("\"Dune\" in set_remove(books, \"Dune\")"), false)
+check("subset holds", ev("subset(set_of(\"Dune\"), books)"), true)
+check("subset fails", ev("subset(set_of(\"Dune\", \"Hobbit\"), books)"), false)
+check("set_union size", ev("size(set_union(books, set_of(\"Hobbit\", \"Dune\")))"), 4)
+check("set_diff size", ev("size(set_diff(books, set_of(\"Dune\")))"), 2)
+check("set_inter size", ev("size(set_inter(books, set_of(\"Dune\", \"Hobbit\")))"), 1)
+
+# ---- maps ----
+check("map_has present", ev("map_has(loans, \"Dune\")"), true)
+check("map_has absent", ev("map_has(loans, \"Neuromancer\")"), false)
+check("map_get", ev("map_get(loans, \"Dune\")"), "A. Diallo")
+check("map_get_or default for a missing key", ev("map_get_or(counts, \"Nobody\", 0)"), 0)
+check("map_get_or finds a stored value", ev("map_get_or(counts, \"A. Diallo\", 0)"), 2)
+check("map_put adds a key", ev("map_size(map_put(loans, \"Neuromancer\", \"X\"))"), 3)
+check("map_remove drops a key", ev("map_has(map_remove(loans, \"Dune\"), \"Dune\")"), false)
+check("map_count_val counts the keys holding a value", ev("map_count_val(loans, \"A. Diallo\")"), 1)
+check("map_count_val is zero for a value nobody holds", ev("map_count_val(loans, \"Nobody\")"), 0)
+check("dom is the key set", ev("size(dom(loans))"), 2)
+check("dom membership", ev("\"Dune\" in dom(loans)"), true)
+check("map_of builds from key/value pairs", ev("map_get(map_of(\"a\", 1, \"b\", 2), \"b\")"), 2)
+check("empty_map has size 0", ev("map_size(empty_map())"), 0)
+check("empty_set has size 0", ev("size(empty_set())"), 0)
+
+# ---- quantifiers ----
+check("forall over a set (true)", ev("forall m in dom(counts) : map_get(counts, m) <= 3"), true)
+check("forall over a set (false)", ev("forall m in dom(counts) : map_get(counts, m) <= 1"), false)
+check("forall over an empty set is true", ev("forall t in empty_set() : false"), true)
+check("exists (true)", ev("exists m in dom(counts) : map_get(counts, m) == 2"), true)
+check("exists over an empty set is false", ev("exists t in empty_set() : true"), false)
+check("subset written with a quantifier", ev("forall t in dom(loans) : t in books"), true)
+check("quantifier inside a conjunction (parenthesised)", ev("x == 5 and (forall t in dom(loans) : t in books)"), true)
+
+# ---- equality on collections ignores order ----
+check("sets with the same members are equal in any order", ev("set_of(\"a\", \"b\", \"c\") == set_of(\"c\", \"a\", \"b\")"), true)
+check("sets with different members are unequal", ev("set_of(\"a\", \"b\") == set_of(\"a\", \"c\")"), false)
+check("sets of different size are unequal", ev("set_of(\"a\") == set_of(\"a\", \"b\")"), false)
+check("maps with the same pairs are equal in any order", ev("map_of(\"a\", 1, \"b\", 2) == map_of(\"b\", 2, \"a\", 1)"), true)
+check("maps with a different value are unequal", ev("map_of(\"a\", 1) == map_of(\"a\", 2)"), false)
+check("an empty set equals an empty map", ev("empty_set() == empty_map()"), true)
+check("a number never equals a string", ev("5 == \"5\""), false)
+
+# ---- canonical form (used to recognise a state already seen) ----
+check("canonical form ignores set order", ze_canon(pset_add(pset_add(pset_new(), "a"), "b")), ze_canon(pset_add(pset_add(pset_new(), "b"), "a")))
+check("canonical form ignores map order", ze_canon(pmap_put(pmap_put(pmap_new(), "a", 1), "b", 2)), ze_canon(pmap_put(pmap_put(pmap_new(), "b", 2), "a", 1)))
+check("canonical form separates different sets", ze_canon(pset_add(pset_new(), "a")) != ze_canon(pset_add(pset_new(), "b")), true)
+check("canonical form separates 1 from \"1\"", ze_canon(1) != ze_canon("1"), true)
+check("canonical form separates a value in a map from a value as a key", ze_canon(pmap_put(pmap_new(), "a", "b")) != ze_canon(pmap_put(pmap_new(), "b", "a")), true)
+
+# ---- values as a person would write them ----
+check("a string is quoted", ze_show("Dune"), "\"Dune\"")
+check("a number is digits", ze_show(10), "10")
+check("a set is braced", ze_show(pset_add(pset_add(pset_new(), "a"), "b")), "{\"a\", \"b\"}")
+check("a map shows key arrows", ze_show(pmap_put(pmap_new(), "a", 1)), "{\"a\" -> 1}")
+check("an empty collection", ze_show([]), "{}")
+
+# ---- free variables ----
+let fv = ze_free_vars(ze_parse("x > 1 and name in books")[1])
+check("free variables are collected without duplicates", to_num(list_len(fv)), 3)
+let fv2 = ze_free_vars(ze_parse("forall m in dom(counts) : map_get(counts, m) <= x")[1])
+check("a quantifier's own variable is not free", to_num(list_len(fv2)), 2)
+let fv3 = ze_free_vars(ze_parse("books' == set_add(books, t)")[1])
+check("a primed name is a distinct free variable", to_num(list_len(fv3)), 3)
+
+# ---- errors are reported, not silently false ----
+check("a dangling operator is a parse error", ev("1 +")[0], "P")
+let bad = ze_parse("x >")
+check("parse errors carry a tag", bad[0], "error")
+let bad2 = ze_parse("x $ 3")
+check("an unknown character is a parse error", bad2[0], "error")
+let bad3 = ze_parse("foo(")
+check("an unclosed call is a parse error", bad3[0], "error")
+ze_rt_clear()
+let unbound = ze_eval(ze_parse("nosuchvar + 1")[1], env_basic())
+check("an unbound name sets the runtime error", ze_rt_error() != "", true)
+
+t_report()

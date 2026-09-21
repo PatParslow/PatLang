@@ -1,0 +1,161 @@
+# zs_check: explore a declared schema, and optionally check a Gherkin feature
+# against it (lib/zs_explore.patlang, lib/zs_feature.patlang).
+#
+#   pat.exe --ir-run self_hosting/tools/zs_check.patlang SCHEMA [FEATURE]
+#           [--max N] [--port P] [--tick MS]
+#
+#   SCHEMA   a declaration in the notation of lib/zs_schema.patlang
+#   FEATURE  optional; a .feature file. Without it the schema is explored and
+#            its invariants and postconditions are checked in every reachable
+#            state. With it, the feature is also checked against the schema.
+#   --max N  stop exploring after N states (default 1000000); the result says
+#            when a search stopped at its bound instead of finishing
+#   --port P signal port (default 9431)
+#   --tick MS  minimum milliseconds between status updates (default 50)
+#
+# Exit code: 0 consistent/clean, 1 a violation or inconsistency was found,
+# 2 the schema or feature could not be read or loaded, 3 stopped by a quit
+# signal before finishing.
+#
+# Long-running behaviour. A search over a large state space takes minutes, so
+# while it runs this program answers two signals over the port it claims
+# (lib/signals.patlang), from another process:
+#   status   replies with what it is doing now: the phase, how many states it
+#            has processed and discovered, how many transitions it has taken,
+#            and the elapsed time
+#   quit     stops the search at its next check and prints what was found so
+#            far, marked as incomplete
+#   pat.exe --ir-run self_hosting/tools/zs_status.patlang [PORT] [status|quit]
+# The search polls for signals from inside its own work loops on a clock
+# (at most every --tick ms, looked at every 32 transitions), so a reply does not
+# wait for the search to finish.
+#
+# Not included: resumability. The search state lives in memory, so a process
+# that dies or is stopped with quit is rerun from the start. A durable
+# checkpoint through the message queue was left out because a rerun is
+# deterministic and the searches this is meant for finish in minutes; a search
+# that needs hours would need it.
+
+include "../lib/zs_feature.patlang"
+include "../lib/signals.patlang"
+
+when status do
+  signal_reply(zsd_status_text())
+end
+
+when quit do
+  set_var("zsd_quit", 1)
+end
+
+make a function called zsd_status_text returns text
+  let elapsed = now_ms() - get("__vars", "zsd_started")
+  return "phase: " + zs_phase() + " | progress: " + get("__vars", "zsd_a") + " of " + get("__vars", "zsd_b") + " | step: " + get("__vars", "zsd_c") + " | elapsed_ms: " + elapsed
+end
+
+# Called by the search on a clock. Records where it is, answers any signal
+# that has arrived, and says whether to carry on.
+make a function called zsd_tick takes a, b, c returns go
+  set_var("zsd_a", a)
+  set_var("zsd_b", b)
+  set_var("zsd_c", c)
+  signal_poll(get("__vars", "zsd_port_id"), 0)
+  return get("__vars", "zsd_quit") != 1
+end
+
+make a function called zsd_arg_value takes args, flag, default returns value
+  let i = 0
+  let n = to_num(list_len(args))
+  while i + 1 < n do
+    if args[i] == flag then
+      return to_num(args[i + 1])
+    end
+    let i = i + 1
+  end
+  return default
+end
+
+make a function called zsd_print_lines takes lines returns done
+  let i = 0
+  let n = to_num(list_len(lines))
+  while i < n do
+    print(lines[i])
+    let i = i + 1
+  end
+  return true
+end
+
+make a function called zsd_main returns code
+  let args = argv()
+  let n = to_num(list_len(args))
+  if n < 1 then
+    print("usage: zs_check.patlang SCHEMA [FEATURE] [--max N] [--port P] [--tick MS]")
+    return 2
+  end
+  let schema_path = args[0]
+  let feature_path = ""
+  if (n >= 2) and (sc_code(str_intern(args[1]), 0) != 45) then
+    let feature_path = args[1]
+  end
+  let max_states = zsd_arg_value(args, "--max", 1000000)
+  let port = zsd_arg_value(args, "--port", 9431)
+  zs_set_tick_ms(zsd_arg_value(args, "--tick", 50))
+
+  if file_exists(schema_path) == false then
+    print("cannot read " + schema_path)
+    return 2
+  end
+  let loaded = zs_load(read_file(schema_path))
+  if loaded[0] != "ok" then
+    print(schema_path + " line " + loaded[1][0] + ": " + loaded[1][1])
+    return 2
+  end
+  let name = loaded[1]
+  let feature_text = ""
+  if feature_path != "" then
+    if file_exists(feature_path) == false then
+      print("cannot read " + feature_path)
+      return 2
+    end
+    let feature_text = read_file(feature_path)
+  end
+
+  set_var("zsd_started", now_ms())
+  set_var("zsd_quit", 0)
+  set_var("zsd_a", 0)
+  set_var("zsd_b", 0)
+  set_var("zsd_c", 0)
+  let port_id = signal_claim(port)
+  set_var("zsd_port_id", port_id)
+  if port_id >= 0 then
+    print("signals: listening on port " + port + " (status, quit)")
+  else
+    print("signals: port " + port + " is in use, so this run cannot be queried")
+  end
+
+  let tick = ""
+  if port_id >= 0 then
+    let tick = "zsd_tick"
+  end
+
+  let code = 0
+  if feature_text == "" then
+    let diag = zs_explore_ticked(name, max_states, tick)
+    zsd_print_lines(zs_format_exploration(diag))
+    if diag[0] == "aborted" then
+      let code = 3
+    elif (diag[0] != "ok") and (diag[0] != "ok_bounded") then
+      let code = 1
+    end
+  else
+    let result = zs_analyse_feature_ticked(name, feature_text, max_states, tick)
+    zsd_print_lines(zs_format_analysis(result))
+    if result[0] == "aborted" then
+      let code = 3
+    elif result[0] != "consistent" then
+      let code = 1
+    end
+  end
+  return code
+end
+
+exit_with(zsd_main())

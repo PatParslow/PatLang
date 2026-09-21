@@ -1,0 +1,237 @@
+# Selftest for self_hosting/lib/zs_feature.patlang: checking a Gherkin feature
+# against a declared schema, after the process in Bowen Liu's thesis
+# (Integrating Behavioural and Formal Specifications, University of Waikato,
+# 2024, chapter 3).
+#
+# The worked example is the thesis's own: a vending machine, the feature
+# "Buying a snack using money" (listing 15), the goal-related operation BuyVM,
+# and the three predicates the thesis forms for it (snack in the inventory,
+# currentMoneyValue > 0, item? in snack). Liu's process is manual; here the
+# analyst's part is the vocabulary (the fact/goal lines in the declaration,
+# which say what each Given/When phrase asserts) and the rest is computed.
+#
+# Two things go beyond the thesis and are ours: a scenario is also checked for
+# being realisable (some reachable state satisfies its Given and lets the
+# operation run), and the necessity check runs over every state the schema can
+# reach. The thesis checks the same property, "in every state, if the
+# predicates do not all hold the operation is not enabled", with the ProB model
+# checker over the Z model.
+#
+# Run from the repo root:
+#   rust-runtime/target/release/pat.exe --ir-run self_hosting/zs_feature_selftest.patlang
+
+include "lib/test.patlang"
+include "lib/zs_feature.patlang"
+
+# The vending machine as a declared schema. `bug` plants a defect:
+#   "free_ride"      BuyVM no longer requires enough money and clamps at zero
+#   "no_stock_check" BuyVM no longer requires the snack to be in stock
+make a function called vm_text takes bug returns text
+  let stock_req = "  require map_get_or(inventory, item, 0) > 0
+"
+  let money_req = "  require currentMoneyValue >= map_get(price, item)
+"
+  let money_eff = "  ensure currentMoneyValue' == currentMoneyValue - map_get(price, item)
+"
+  let stock_eff = "  ensure inventory' == map_put(inventory, item, map_get(inventory, item) - 1)
+"
+  if bug == "free_ride" then
+    let money_req = ""
+    let money_eff = "  ensure currentMoneyValue' == max(currentMoneyValue - map_get(price, item), 0)
+"
+  end
+  if bug == "no_stock_check" then
+    let stock_req = ""
+    let stock_eff = "  ensure inventory' == map_put(inventory, item, max(map_get_or(inventory, item, 0) - 1, 0))
+"
+  end
+  return "schema VendingMachine
+state inventory, currentMoneyValue
+const snacks = set_of(\"cookie\", \"chocolate\", \"chips\")
+const price = map_of(\"cookie\", 5, \"chocolate\", 7, \"chips\", 3)
+const maxMoney = 20
+init inventory = map_of(\"cookie\", 2, \"chocolate\", 1, \"chips\", 0)
+init currentMoneyValue = 0
+domain item = snacks
+domain amount = set_of(1, 5, 10)
+invariant subset(dom(inventory), snacks)
+invariant currentMoneyValue >= 0 and currentMoneyValue <= maxMoney
+
+operation InsertMoney(amount)
+  require amount > 0
+  require currentMoneyValue + amount <= maxMoney
+  ensure currentMoneyValue' == currentMoneyValue + amount
+end
+
+operation BuyVM(item)
+  require item in snacks
+" + stock_req + money_req + money_eff + stock_eff + "end
+
+fact {item} is in stock => map_get_or(inventory, item, 0) > 0
+fact Bowen inserts {amount} dollars => currentMoneyValue > 0
+fact Bowen selects {item} => item in snacks
+fact no money has been inserted => currentMoneyValue == 0
+fact the machine is empty => forall s in dom(inventory) : map_get(inventory, s) == 0
+goal buy a snack with money => BuyVM
+negative the vending machine reports {reason}
+"
+end
+
+# Listing 15 of the thesis, with its narrative.
+make a function called liu_listing_15 returns text
+  return "Feature: Buying a snack using money
+  As a user
+  Bowen wants to buy a snack with money
+  So that Bowen can get a snack to eat
+
+  Scenario: Buying a cookie using money when the cookie is in stock
+    Given cookie is in stock
+    When Bowen inserts 10 dollars
+    And Bowen selects cookie
+    Then the vending machine dispenses a cookie
+"
+end
+
+# Finds a finding by tag in a list of findings; returns its payload or "".
+make a function called finding_of takes findings, tag returns payload
+  let i = 0
+  let n = to_num(list_len(findings))
+  while i < n do
+    if findings[i][0] == tag then
+      return findings[i][1]
+    end
+    let i = i + 1
+  end
+  return ""
+end
+
+make a function called has_finding takes findings, tag returns r
+  return type_of(finding_of(findings, tag)) == "list"
+end
+
+t_init()
+
+# ---- the thesis's example against the correct schema ----
+check("the vending machine schema loads", zs_load(vm_text("none"))[0], "ok")
+let good = zs_analyse_feature("VendingMachine", liu_listing_15(), 100000)
+check("listing 15 is consistent with the correct schema", good[0], "consistent")
+let good_p = good[1]
+check("the feature's goal is read from its narrative", good_p[0], "buy a snack with money")
+check("the goal maps to the goal-related operation BuyVM", good_p[1], "BuyVM")
+check("there is one scenario", to_num(list_len(good_p[2])), 1)
+check("the scenario is positive", good_p[2][0][1], "positive")
+check("the scenario is witnessed by a reachable state", has_finding(good_p[2][0][2], "witnessed"), true)
+check("no requirement is missing from the schema", has_finding(good_p[3], "requirement_not_in_schema"), false)
+
+# The witness is a real path: money must be inserted before BuyVM can run.
+let witness = finding_of(good_p[2][0][2], "witnessed")
+check("the witness trace starts with money being inserted", witness[2][0][0], "InsertMoney")
+
+# ---- defect: buying without enough money ----
+check("free-ride schema loads", zs_load(vm_text("free_ride"))[0], "ok")
+let fr = zs_analyse_feature("VendingMachine", liu_listing_15(), 100000)
+check("a schema that sells with no money is inconsistent with the feature", fr[0], "inconsistent")
+let fr_missing = finding_of(fr[1][3], "requirement_not_in_schema")
+check("the missing requirement is reported", type_of(fr_missing), "list")
+check("it names the fact 'Bowen inserts {amount} dollars'", fr_missing[0], "Bowen inserts {amount} dollars")
+check("the counterexample is the initial state, before any money", to_num(list_len(fr_missing[2])), 0)
+
+# ---- defect: dispensing a snack that is out of stock ----
+check("no-stock-check schema loads", zs_load(vm_text("no_stock_check"))[0], "ok")
+let ns = zs_analyse_feature("VendingMachine", liu_listing_15(), 100000)
+check("a schema that sells out-of-stock snacks is inconsistent with the feature", ns[0], "inconsistent")
+let ns_missing = finding_of(ns[1][3], "requirement_not_in_schema")
+check("the missing stock requirement is reported", ns_missing[0], "{item} is in stock")
+check("the counterexample buys the snack that has none", ns_missing[3][0], "chips")
+
+# ---- the other findings ----
+check("correct schema reloads", zs_load(vm_text("none"))[0], "ok")
+
+let unmapped_feature = "Feature: Buying a snack using money
+  Bowen wants to buy a snack with money
+
+  Scenario: A Given nobody gave meaning to
+    Given the moon is full
+    When Bowen inserts 10 dollars
+    And Bowen selects cookie
+    Then the vending machine dispenses a cookie
+"
+let um = zs_analyse_feature("VendingMachine", unmapped_feature, 100000)
+check("a step with no matching fact makes the feature inconsistent", um[0], "inconsistent")
+let um_step = finding_of(um[1][2][0][2], "unmapped_step")
+check("the unmapped step is named", um_step[0], "the moon is full")
+
+let contradicts_feature = "Feature: Buying a snack using money
+  Bowen wants to buy a snack with money
+
+  Scenario: Buying with no money inserted
+    Given no money has been inserted
+    And cookie is in stock
+    When Bowen selects cookie
+    Then the vending machine dispenses a cookie
+"
+let cd = zs_analyse_feature("VendingMachine", contradicts_feature, 100000)
+check("a scenario the schema never allows is inconsistent", cd[0], "inconsistent")
+check("it is reported as contradicting the schema", has_finding(cd[1][2][0][2], "contradicts_schema"), true)
+
+let unreachable_feature = "Feature: Buying a snack using money
+  Bowen wants to buy a snack with money
+
+  Scenario: An empty machine that has a cookie
+    Given the machine is empty
+    And cookie is in stock
+    When Bowen selects cookie
+    Then the vending machine dispenses a cookie
+"
+let ur = zs_analyse_feature("VendingMachine", unreachable_feature, 100000)
+check("a Given no reachable state satisfies is inconsistent", ur[0], "inconsistent")
+check("it is reported as unreachable", has_finding(ur[1][2][0][2], "given_unreachable"), true)
+
+let negative_feature = "Feature: Buying a snack using money
+  Bowen wants to buy a snack with money
+
+  Scenario: Buying a cookie using money when the cookie is in stock
+    Given cookie is in stock
+    When Bowen inserts 10 dollars
+    And Bowen selects cookie
+    Then the vending machine dispenses a cookie
+
+  Scenario: Buying chips when there are none
+    Given chips is in stock
+    When Bowen inserts 10 dollars
+    Then the vending machine reports out of stock
+"
+let ng = zs_analyse_feature("VendingMachine", negative_feature, 100000)
+check("a feature with a negative scenario is still consistent", ng[0], "consistent")
+check("the negative scenario is marked negative", ng[1][2][1][1], "negative")
+check("the negative scenario is skipped, as in the thesis", has_finding(ng[1][2][1][2], "negative_skipped"), true)
+
+let no_goal_feature = "Feature: Something else
+  Bowen wants to juggle
+
+  Scenario: Juggling
+    Given cookie is in stock
+"
+check("a goal the schema does not know is reported", zs_analyse_feature("VendingMachine", no_goal_feature, 100000)[0], "unmapped_goal")
+check("an unknown schema is reported", zs_analyse_feature("NoSuchSchema", liu_listing_15(), 100)[0], "unknown_schema")
+
+# ---- a schema that breaks its own invariant is reported before any feature ----
+let unsound = zs_load("schema Unsound\nstate n\ninit n = 0\ninvariant n < 3\noperation Inc()\n  ensure n' == n + 1\nend\ngoal count up => Inc\nfact n is small => n < 100\n")
+check("an unsound schema loads", unsound[0], "ok")
+let us = zs_analyse_feature("Unsound", "Feature: F\n  Bowen wants to count up\n\n  Scenario: S\n    Given n is small\n", 1000)
+check("an unsound schema is reported, not analysed", us[0], "schema_unsound")
+
+# ---- the report reads as text ----
+check("correct schema reloads for the report", zs_load(vm_text("free_ride"))[0], "ok")
+let lines = zs_format_analysis(zs_analyse_feature("VendingMachine", liu_listing_15(), 100000))
+check("a report has content", to_num(list_len(lines)) > 2, true)
+let all = sb_new()
+let li = 0
+while li < to_num(list_len(lines)) do
+  sb_push(all, lines[li])
+  sb_push(all, " | ")
+  let li = li + 1
+end
+check("the report names the missing requirement", contains_text(sb_str(all), "Bowen inserts {amount} dollars"), true)
+
+t_report()

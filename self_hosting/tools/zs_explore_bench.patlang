@@ -1,0 +1,119 @@
+# Scaling benchmark for the state-space explorer (lib/zs_explore.patlang).
+#
+# Explores LibraryLoans with T titles and M members at increasing sizes and
+# prints, per size: states found, transitions taken, elapsed ms, and the cost
+# per state and per transition. If exploration is linear in the state space,
+# microseconds per transition stay roughly flat as the space grows; a cost per
+# transition that grows with the space means something in the loop scales
+# with the size of what has been seen so far.
+#
+# The counts printed here are compared against an independent reference in
+# self_hosting/tools/zs_explore_reference.py (see that file for how to run it).
+#
+# Run from the repo root:
+#   rust-runtime/target/release/pat.exe --ir-run self_hosting/tools/zs_explore_bench.patlang
+
+include "../lib/zs_explore.patlang"
+
+# A set literal naming the first n of names, built with a string builder.
+make a function called bench_set_of takes names, n returns text
+  let b = sb_new()
+  sb_push(b, "set_of(")
+  let i = 0
+  while i < n do
+    if i > 0 then
+      sb_push(b, ", ")
+    end
+    sb_push(b, "\"")
+    sb_push(b, names[i])
+    sb_push(b, "\"")
+    let i = i + 1
+  end
+  sb_push(b, ")")
+  return sb_str(b)
+end
+
+make a function called bench_titles takes t returns text
+  return bench_set_of(["Dune", "Neuromancer", "Foundation", "Hobbit", "Ubik", "Solaris", "Hyperion", "Emma", "Kim", "Ilium"], t)
+end
+
+make a function called bench_members takes m returns text
+  return bench_set_of(["A. Diallo", "S. Okonkwo", "R. Mendes", "K. Ito"], m)
+end
+
+make a function called bench_schema takes t, m returns text
+  return "schema Bench
+state books, borrowedBy, loanCount
+init books = " + bench_titles(t) + "
+init borrowedBy = empty_map()
+init loanCount = empty_map()
+domain title = " + bench_titles(t) + "
+domain member = " + bench_members(m) + "
+invariant subset(dom(borrowedBy), books)
+invariant forall m in dom(loanCount) : map_get(loanCount, m) >= 0 and map_get(loanCount, m) <= 3
+invariant forall m in dom(loanCount) : map_get(loanCount, m) == map_count_val(borrowedBy, m)
+operation BorrowBook(title, member)
+  require title in books
+  require not map_has(borrowedBy, title)
+  require map_get_or(loanCount, member, 0) < 3
+  ensure borrowedBy' == map_put(borrowedBy, title, member)
+  ensure loanCount' == map_put(loanCount, member, map_get_or(loanCount, member, 0) + 1)
+end
+operation ReturnBook(title)
+  require map_has(borrowedBy, title)
+  ensure borrowedBy' == map_remove(borrowedBy, title)
+  ensure loanCount' == map_put(loanCount, map_get(borrowedBy, title), map_get(loanCount, map_get(borrowedBy, title)) - 1)
+end
+"
+end
+
+make a function called bench_one takes t, m returns done
+  zs_load(bench_schema(t, m))
+  let t0 = now_ms()
+  let r = zs_explore("Bench", 1000000)
+  let ms = now_ms() - t0
+  let states = r[1][0]
+  let trans = r[1][1]
+  let us_per_trans = 0
+  if trans > 0 then
+    let us_per_trans = (ms * 1000) / trans
+  end
+  print("T=" + t + " M=" + m + " " + r[0] + " states=" + states + " transitions=" + trans + " ms=" + ms + " us_per_transition=" + to_fixed(us_per_trans, 1))
+  return true
+end
+
+# Control: one integer of state, so a state's size is constant while the
+# number of states doubles. Cost per transition here should stay flat; a rise
+# would mean something in the loop grows with the states already seen.
+make a function called bench_counter takes n returns done
+  zs_load("schema Counter
+state n
+init n = 0
+invariant n >= 0
+operation Inc()
+  require n < " + n + "
+  ensure n' == n + 1
+end
+")
+  let t0 = now_ms()
+  let r = zs_explore("Counter", 1000000)
+  let ms = now_ms() - t0
+  let trans = r[1][1]
+  print("counter N=" + n + " " + r[0] + " states=" + r[1][0] + " transitions=" + trans + " ms=" + ms + " us_per_transition=" + to_fixed((ms * 1000) / trans, 1))
+  return true
+end
+
+print("-- LibraryLoans, growing catalogue (state size grows with the space)")
+let sizes = [[3, 2], [4, 2], [5, 2], [6, 2], [7, 2]]
+let i = 0
+while i < 5 do
+  bench_one(sizes[i][0], sizes[i][1])
+  let i = i + 1
+end
+print("-- control: constant-size states, doubling count")
+let counts = [500, 1000, 2000, 4000, 8000]
+let k = 0
+while k < 5 do
+  bench_counter(counts[k])
+  let k = k + 1
+end

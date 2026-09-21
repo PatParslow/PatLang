@@ -1,0 +1,645 @@
+# =============================================================================
+# zs_schema: a schema declared as text, kept as data, and checked against a
+# scenario's before/after states.
+#
+# The functions in schema_bdd.patlang take an invariant, a precondition and a
+# postcondition as names of separately compiled PatLang functions. Those are
+# opaque: nothing can ask which state a clause reads, which clause failed, or
+# which states the schema allows. Here every clause is one line of text in the
+# expression language of zs_expr.patlang, parsed once and kept as a tree, so
+# the same declaration serves the scenario check below, the state-space
+# explorer (zs_explore.patlang) and the feature analysis (zs_feature.patlang).
+#
+# A declaration (one schema per text; blank lines and lines starting with #
+# are ignored, indentation is free):
+#
+#   schema Name
+#   state a, b, c                    the declared state variables
+#   const name = expr                a named value, fixed for the schema
+#   init a = expr                    the initial value of a state variable
+#   domain input = expr              the values an operation input ranges over
+#                                    when states are explored (a set)
+#   invariant expr                   must hold in every state
+#   operation Op(in1, in2)
+#     require expr                   a precondition clause
+#     ensure expr                    a postcondition clause; a' names a after
+#   end
+#   fact template => expr            a Given/When phrase and what it asserts
+#   goal text => Op                  the operation a feature's goal names
+#   negative template                a phrase that marks a scenario as one
+#                                    where the goal is not achieved
+#   action template                  a phrase that performs the goal itself
+#                                    (not a condition, so it asserts no fact)
+#
+# An ensure clause of the form  a' == expr  (expr reading only before-state
+# names and inputs) also states how the operation changes a; the explorer
+# uses it to compute the after-state, and a state variable with no such
+# clause is taken to be unchanged. That reading of "unchanged" is stronger
+# than Z's, which leaves an unmentioned variable unconstrained.
+#
+# Entry layout, as stored by zs_load:
+#   schema: [name, state_names, consts, inits, invariants, domains, ops,
+#            facts, goals, negatives, actions]
+#     consts, inits, domains: lists of [name, value]
+#     invariants: lists of [text, tree]
+#     facts: [template, expr_text, tree]     goals: [text, op_name]
+#   operation: [name, input_names, requires, ensures, effects]
+#     requires, ensures: lists of [text, tree]
+#     effects: lists of [state_name, tree, index_into_ensures]
+# =============================================================================
+
+include "schema_bdd.patlang"
+include "zs_expr.patlang"
+include "step_match.patlang"
+
+make a function called zs_registry returns registry
+  let existing = get("__vars", "zs_registry_obj")
+  if existing then
+    return existing
+  end
+  let registry = new("Dict", "zs_registry")
+  set_var("zs_registry_obj", registry)
+  return registry
+end
+
+make a function called zs_entry takes name returns entry
+  let e = get(zs_registry(), name)
+  if type_of(e) != "list" then
+    return ""
+  end
+  return e
+end
+
+make a function called zs_state_names takes name returns names
+  return zs_entry(name)[1]
+end
+
+make a function called zs_op_names takes name returns names
+  let ops = zs_entry(name)[6]
+  let out = []
+  let i = 0
+  let n = to_num(list_len(ops))
+  while i < n do
+    let out = list_push(out, ops[i][0])
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called zs_find_op takes entry, op_name returns op
+  let ops = entry[6]
+  let i = 0
+  let n = to_num(list_len(ops))
+  while i < n do
+    if ops[i][0] == op_name then
+      return ops[i]
+    end
+    let i = i + 1
+  end
+  return ""
+end
+
+# ---- text helpers (every scan goes through interned handles) ----
+
+make a function called zs_is_space takes c returns r
+  return (c == 32) or (c == 9) or (c == 13)
+end
+
+make a function called zs_trim takes s returns out
+  let h = str_intern(s)
+  let n = sc_len(h)
+  let a = 0
+  while (a < n) and zs_is_space(sc_code(h, a)) do
+    let a = a + 1
+  end
+  let b = n
+  while (b > a) and zs_is_space(sc_code(h, b - 1)) do
+    let b = b - 1
+  end
+  return sc_substr(h, a, b - a)
+end
+
+# The meaningful lines of a declaration as [line_number, keyword, rest].
+make a function called zs_lines takes text returns lines
+  let h = str_intern(text)
+  let n = sc_len(h)
+  let out = []
+  let buf = sb_new()
+  let lineno = 1
+  let i = 0
+  while i <= n do
+    let c = sc_code(h, i)
+    if (c == 10) or (c == -1) then
+      let raw = zs_trim(sb_str(buf))
+      let buf = sb_new()
+      if raw != "" then
+        let rh = str_intern(raw)
+        if sc_code(rh, 0) != 35 then
+          let rn = sc_len(rh)
+          let sp = 0
+          while (sp < rn) and (zs_is_space(sc_code(rh, sp)) == false) do
+            let sp = sp + 1
+          end
+          let kw = sc_substr(rh, 0, sp)
+          let rest = zs_trim(sc_substr(rh, sp, rn - sp))
+          let out = list_push(out, [lineno, kw, rest])
+        end
+      end
+      let lineno = lineno + 1
+    else
+      sb_push(buf, sc_char(h, i))
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# Splits text at the first occurrence of sep: [before, after], or [] when sep is absent.
+make a function called zs_split_at takes text, sep returns parts
+  let h = str_intern(text)
+  let n = sc_len(h)
+  let idx = sm_find(h, n, sep, 0)
+  if idx < 0 then
+    return []
+  end
+  let sl = sc_len(str_intern(sep))
+  return [zs_trim(sc_substr(h, 0, idx)), zs_trim(sc_substr(h, idx + sl, n - idx - sl))]
+end
+
+make a function called zs_split_commas takes s returns names
+  let h = str_intern(s)
+  let n = sc_len(h)
+  let out = []
+  let buf = sb_new()
+  let i = 0
+  while i <= n do
+    let c = sc_code(h, i)
+    if (c == 44) or (c == -1) then
+      let piece = zs_trim(sb_str(buf))
+      let buf = sb_new()
+      if piece != "" then
+        let out = list_push(out, piece)
+      end
+    else
+      sb_push(buf, sc_char(h, i))
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called zs_concat takes a, b returns out
+  let out = list_copy(a)
+  let i = 0
+  let n = to_num(list_len(b))
+  while i < n do
+    let out = list_push(out, b[i])
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called zs_pair_names takes pairs returns names
+  let out = []
+  let i = 0
+  let n = to_num(list_len(pairs))
+  while i < n do
+    let out = list_push(out, pairs[i][0])
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called zs_primed takes names returns out
+  let out = []
+  let i = 0
+  let n = to_num(list_len(names))
+  while i < n do
+    let out = list_push(out, names[i] + "'")
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called zs_is_primed takes name returns r
+  let h = str_intern(name)
+  let n = sc_len(h)
+  if n == 0 then
+    return false
+  end
+  return sc_code(h, n - 1) == 39
+end
+
+# ---- loading ----
+
+# Parses a clause and checks every name it reads is one of `allowed`.
+# Returns ["ok", tree] or ["error", message].
+make a function called zs_clause takes text, allowed returns result
+  let p = ze_parse(text)
+  if p[0] != "ok" then
+    return ["error", p[1]]
+  end
+  let names = ze_free_vars(p[1])
+  let i = 0
+  let n = to_num(list_len(names))
+  while i < n do
+    if ze_names_has(allowed, names[i]) == false then
+      if zs_is_primed(names[i]) then
+        return ["error", names[i] + " (after-state) is only meaningful in an ensure clause, or names no state variable"]
+      end
+      return ["error", "unbound name " + names[i] + " in: " + text]
+    end
+    let i = i + 1
+  end
+  return ["ok", p[1]]
+end
+
+# The state variable an ensure clause defines, or "": the clause has the form
+# a' == expr and expr reads no after-state name.
+make a function called zs_effect_var takes ast, state_names returns var
+  if ast[0] != "bin" then
+    return ""
+  end
+  if ast[1] != "==" then
+    return ""
+  end
+  if ast[2][0] != "var" then
+    return ""
+  end
+  let v = ast[2][1]
+  if zs_is_primed(v) == false then
+    return ""
+  end
+  let base = sc_substr(str_intern(v), 0, sc_len(str_intern(v)) - 1)
+  if ze_names_has(state_names, base) == false then
+    return ""
+  end
+  let fv = ze_free_vars(ast[3])
+  let i = 0
+  let n = to_num(list_len(fv))
+  while i < n do
+    if zs_is_primed(fv[i]) then
+      return ""
+    end
+    let i = i + 1
+  end
+  return base
+end
+
+make a function called zs_err takes lineno, msg returns result
+  return ["error", [lineno, msg]]
+end
+
+# Evaluates a load-time expression (const, init, domain) in the constants so far.
+make a function called zs_eval_const takes tree, consts returns value
+  ze_rt_clear()
+  return ze_eval(tree, consts)
+end
+
+make a function called zs_load takes text returns result
+  let lines = zs_lines(text)
+  let n = to_num(list_len(lines))
+  let name = ""
+  let state = []
+  let consts = []
+  let inits = []
+  let invs = []
+  let domains = []
+  let ops = []
+  let facts = []
+  let goals = []
+  let negs = []
+  let acts = []
+  let in_op = false
+  let op_name = ""
+  let op_line = 0
+  let op_inputs = []
+  let op_pre = []
+  let op_post = []
+  let op_eff = []
+  let i = 0
+  while i < n do
+    let lineno = lines[i][0]
+    let kw = lines[i][1]
+    let rest = lines[i][2]
+    if kw == "schema" then
+      if name != "" then
+        return zs_err(lineno, "only one schema per declaration")
+      end
+      if rest == "" then
+        return zs_err(lineno, "schema needs a name")
+      end
+      let name = rest
+    elif name == "" then
+      return zs_err(lineno, "a declaration starts with: schema Name")
+    elif kw == "state" then
+      let state = zs_concat(state, zs_split_commas(rest))
+    elif kw == "const" then
+      let parts = zs_split_at(rest, " = ")
+      if to_num(list_len(parts)) != 2 then
+        return zs_err(lineno, "const needs: const name = expr")
+      end
+      let c = zs_clause(parts[1], zs_pair_names(consts))
+      if c[0] != "ok" then
+        return zs_err(lineno, c[1])
+      end
+      let v = zs_eval_const(c[1], consts)
+      if ze_rt_error() != "" then
+        return zs_err(lineno, ze_rt_error())
+      end
+      let consts = list_push(consts, [parts[0], v])
+    elif kw == "init" then
+      let parts = zs_split_at(rest, " = ")
+      if to_num(list_len(parts)) != 2 then
+        return zs_err(lineno, "init needs: init state_name = expr")
+      end
+      if ze_names_has(state, parts[0]) == false then
+        return zs_err(lineno, "init names " + parts[0] + ", which is not a declared state variable")
+      end
+      let c = zs_clause(parts[1], zs_pair_names(consts))
+      if c[0] != "ok" then
+        return zs_err(lineno, c[1])
+      end
+      let v = zs_eval_const(c[1], consts)
+      if ze_rt_error() != "" then
+        return zs_err(lineno, ze_rt_error())
+      end
+      let inits = list_push(inits, [parts[0], v])
+    elif kw == "domain" then
+      let parts = zs_split_at(rest, " = ")
+      if to_num(list_len(parts)) != 2 then
+        return zs_err(lineno, "domain needs: domain input_name = expr")
+      end
+      let c = zs_clause(parts[1], zs_pair_names(consts))
+      if c[0] != "ok" then
+        return zs_err(lineno, c[1])
+      end
+      let v = zs_eval_const(c[1], consts)
+      if ze_rt_error() != "" then
+        return zs_err(lineno, ze_rt_error())
+      end
+      if type_of(v) != "list" then
+        return zs_err(lineno, "a domain must be a set of values")
+      end
+      let domains = list_push(domains, [parts[0], v])
+    elif kw == "invariant" then
+      if in_op then
+        return zs_err(lineno, "invariant belongs to the schema, not inside an operation")
+      end
+      let c = zs_clause(rest, zs_concat(state, zs_pair_names(consts)))
+      if c[0] != "ok" then
+        return zs_err(lineno, c[1])
+      end
+      let invs = list_push(invs, [rest, c[1]])
+    elif kw == "operation" then
+      if in_op then
+        return zs_err(lineno, "operation " + op_name + " is not closed with end")
+      end
+      let open_at = zs_split_at(rest, "(")
+      if to_num(list_len(open_at)) != 2 then
+        return zs_err(lineno, "operation needs: operation Name(input, ...)")
+      end
+      let close_at = zs_split_at(open_at[1], ")")
+      if to_num(list_len(close_at)) != 2 then
+        return zs_err(lineno, "operation is missing its closing )")
+      end
+      let in_op = true
+      let op_name = open_at[0]
+      let op_line = lineno
+      let op_inputs = zs_split_commas(close_at[0])
+      let op_pre = []
+      let op_post = []
+      let op_eff = []
+    elif kw == "require" then
+      if in_op == false then
+        return zs_err(lineno, "require belongs inside an operation")
+      end
+      let c = zs_clause(rest, zs_concat(zs_concat(state, op_inputs), zs_pair_names(consts)))
+      if c[0] != "ok" then
+        return zs_err(lineno, c[1])
+      end
+      let op_pre = list_push(op_pre, [rest, c[1]])
+    elif kw == "ensure" then
+      if in_op == false then
+        return zs_err(lineno, "ensure belongs inside an operation")
+      end
+      let allowed = zs_concat(zs_concat(zs_concat(state, zs_primed(state)), op_inputs), zs_pair_names(consts))
+      let c = zs_clause(rest, allowed)
+      if c[0] != "ok" then
+        return zs_err(lineno, c[1])
+      end
+      let ev = zs_effect_var(c[1], state)
+      if ev != "" then
+        let op_eff = list_push(op_eff, [ev, c[1][3], to_num(list_len(op_post))])
+      end
+      let op_post = list_push(op_post, [rest, c[1]])
+    elif kw == "end" then
+      if in_op == false then
+        return zs_err(lineno, "end without an open operation")
+      end
+      let ops = list_push(ops, [op_name, op_inputs, op_pre, op_post, op_eff])
+      let in_op = false
+    elif kw == "fact" then
+      let parts = zs_split_at(rest, " => ")
+      if to_num(list_len(parts)) != 2 then
+        return zs_err(lineno, "fact needs: fact template => expr")
+      end
+      let caps = sm_parse_template(parts[0])[1]
+      let c = zs_clause(parts[1], zs_concat(zs_concat(state, caps), zs_pair_names(consts)))
+      if c[0] != "ok" then
+        return zs_err(lineno, c[1])
+      end
+      let facts = list_push(facts, [parts[0], parts[1], c[1]])
+    elif kw == "goal" then
+      let parts = zs_split_at(rest, " => ")
+      if to_num(list_len(parts)) != 2 then
+        return zs_err(lineno, "goal needs: goal text => OperationName")
+      end
+      let goals = list_push(goals, [parts[0], parts[1]])
+    elif kw == "negative" then
+      let negs = list_push(negs, rest)
+    elif kw == "action" then
+      let acts = list_push(acts, rest)
+    else
+      return zs_err(lineno, "unknown keyword " + kw)
+    end
+    let i = i + 1
+  end
+  if name == "" then
+    return zs_err(1, "a declaration starts with: schema Name")
+  end
+  if in_op then
+    return zs_err(op_line, "operation " + op_name + " is not closed with end")
+  end
+  let g = 0
+  let gn = to_num(list_len(goals))
+  while g < gn do
+    let known = false
+    let k = 0
+    let kn = to_num(list_len(ops))
+    while k < kn do
+      if ops[k][0] == goals[g][1] then
+        let known = true
+      end
+      let k = k + 1
+    end
+    if known == false then
+      return zs_err(1, "goal '" + goals[g][0] + "' names " + goals[g][1] + ", which is not an operation of " + name)
+    end
+    let g = g + 1
+  end
+  send(zs_registry(), "set", name, [name, state, consts, inits, invs, domains, ops, facts, goals, negs, acts])
+  return ["ok", name]
+end
+
+# ---- the check ----
+
+# Adds [name + suffix, value] pairs to an environment.
+make a function called zs_env_add takes env, names, values, suffix returns out
+  let out = list_copy(env)
+  let i = 0
+  let n = to_num(list_len(names))
+  let m = to_num(list_len(values))
+  while (i < n) and (i < m) do
+    let out = list_push(out, [names[i] + suffix, values[i]])
+    let i = i + 1
+  end
+  return out
+end
+
+# Index of the first clause [text, tree] that is not true in env, or -1.
+make a function called zs_first_failing takes clauses, env returns idx
+  let i = 0
+  let n = to_num(list_len(clauses))
+  while i < n do
+    if ze_eval(clauses[i][1], env) != true then
+      return i
+    end
+    let i = i + 1
+  end
+  return -1
+end
+
+# The value-based core. Same four stages and tags as schema_check_values in
+# schema_bdd.patlang, plus the text of the clause that failed:
+#   ["invariant_violated_before", [schema, clause, before]]
+#   ["precondition_violated",     [op, clause, before, inputs]]
+#   ["invariant_violated_after",  [schema, clause, after]]
+#   ["postcondition_violated",    [op, clause, before, after, inputs]]
+#   ["ok",                        [op, before, after, inputs]]
+# and, for a declaration or evaluation problem, unknown_schema,
+# unknown_operation, after_state_missing or runtime_error.
+make a function called zs_check_values takes schema_name, op_name, before, inputs, after returns diagnosis
+  let entry = zs_entry(schema_name)
+  if type_of(entry) != "list" then
+    return ["unknown_schema", [schema_name]]
+  end
+  let op = zs_find_op(entry, op_name)
+  if type_of(op) != "list" then
+    return ["unknown_operation", [schema_name, op_name]]
+  end
+  ze_rt_clear()
+  let state_names = entry[1]
+  let env_before = zs_env_add(entry[2], state_names, before, "")
+
+  let f = zs_first_failing(entry[4], env_before)
+  if ze_rt_error() != "" then
+    return ["runtime_error", [ze_rt_error()]]
+  end
+  if f >= 0 then
+    return ["invariant_violated_before", [schema_name, entry[4][f][0], before]]
+  end
+
+  let env_op = zs_env_add(env_before, op[1], inputs, "")
+  let f = zs_first_failing(op[2], env_op)
+  if ze_rt_error() != "" then
+    return ["runtime_error", [ze_rt_error()]]
+  end
+  if f >= 0 then
+    return ["precondition_violated", [op_name, op[2][f][0], before, inputs]]
+  end
+
+  if (to_num(list_len(state_names)) > 0) and (to_num(list_len(after)) == 0) then
+    return ["after_state_missing", [op_name]]
+  end
+  let env_after = zs_env_add(entry[2], state_names, after, "")
+  let f = zs_first_failing(entry[4], env_after)
+  if ze_rt_error() != "" then
+    return ["runtime_error", [ze_rt_error()]]
+  end
+  if f >= 0 then
+    return ["invariant_violated_after", [schema_name, entry[4][f][0], after]]
+  end
+
+  let env_post = zs_env_add(env_op, state_names, after, "'")
+  let f = zs_first_failing(op[3], env_post)
+  if ze_rt_error() != "" then
+    return ["runtime_error", [ze_rt_error()]]
+  end
+  if f >= 0 then
+    return ["postcondition_violated", [op_name, op[3][f][0], before, after, inputs]]
+  end
+  return ["ok", [op_name, before, after, inputs]]
+end
+
+make a function called zs_unbound takes v returns r
+  return (type_of(v) == "string") and (v == "")
+end
+
+# The scenario-shaped wrapper: reads the before state, the inputs and the
+# after state a scenario's steps bound with schema_bind_state and
+# schema_bind_input. When no after state was bound at all (a scenario that
+# only claims rejection) the after state is empty and is never read.
+make a function called zs_check takes schema_name, op_name returns diagnosis
+  let entry = zs_entry(schema_name)
+  if type_of(entry) != "list" then
+    return ["unknown_schema", [schema_name]]
+  end
+  let op = zs_find_op(entry, op_name)
+  if type_of(op) != "list" then
+    return ["unknown_operation", [schema_name, op_name]]
+  end
+  let names = entry[1]
+  let before = schema_state_values(schema_name, names)
+  let inputs = schema_input_values(schema_name, op_name, op[1])
+  let after = schema_state_values_after(schema_name, names)
+  let unbound_after = 0
+  let i = 0
+  let n = to_num(list_len(after))
+  while i < n do
+    if zs_unbound(after[i]) then
+      let unbound_after = unbound_after + 1
+    end
+    let i = i + 1
+  end
+  if (n > 0) and (unbound_after == n) then
+    let after = []
+  end
+  return zs_check_values(schema_name, op_name, before, inputs, after)
+end
+
+# The question a diagnosis poses, naming the clause that failed. Returns a
+# list of strings, empty for "ok", like schema_format_diagnosis.
+make a function called zs_format_diagnosis takes schema_name, op_name, diagnosis returns questions
+  let tag = diagnosis[0]
+  let p = diagnosis[1]
+  if tag == "invariant_violated_before" then
+    return ["The Given leaves " + schema_name + " in a state that breaks its invariant (" + p[1] + ") before " + op_name + " is even considered. Is the Given wrong, or is that invariant too strict?"]
+  end
+  if tag == "precondition_violated" then
+    return ["The scenario has " + op_name + " run from this Given, but its precondition clause (" + p[1] + ") is false. Is the Given wrong, is that clause too strict, or is the scenario about a rejection that needs its own treatment?"]
+  end
+  if tag == "invariant_violated_after" then
+    return ["The state the scenario claims after " + op_name + " breaks the invariant of " + schema_name + " (" + p[1] + "). Is the claimed outcome wrong, or does " + op_name + " need a stronger precondition to rule this case out?"]
+  end
+  if tag == "postcondition_violated" then
+    return ["The before and after states the scenario claims for " + op_name + " do not satisfy its postcondition (" + p[1] + "). Is the claimed outcome wrong, or is the postcondition?"]
+  end
+  if tag == "after_state_missing" then
+    return [op_name + " passed its precondition, so the scenario has to state the resulting state, and it stated none."]
+  end
+  if tag == "runtime_error" then
+    return ["A clause could not be evaluated: " + p[0]]
+  end
+  return []
+end
