@@ -1,0 +1,166 @@
+# Selftest for lib/zs_infer.patlang: inferring a declared-schema skeleton from
+# an existing Gherkin feature, the reverse of zs_generate (schema -> Gherkin).
+#
+# What is inferable from Gherkin text alone, and what is not, drives the
+# whole design. A quoted span or a bare number that recurs with a different
+# value is a real, mechanical signal for a capture -- the same convention
+# every hand-written feature in this codebase already follows (Liu's own
+# "Bowen inserts 10 dollars" quotes nothing but generalises the number; this
+# project's own scenarios quote every value meant to vary). What a phrase
+# ASSERTS about the state is not inferable at all: nothing in Gherkin text
+# names a state model. So the skeleton gets real capture structure -- fact,
+# then and do templates, one operation per goal, correctly arITied inputs --
+# and vacuous `require true`/`ensure true` placeholders a person replaces
+# with real meaning. The skeleton is valid PatLang from the moment it is
+# written: it loads (zs_load) immediately, though exploring it needs the
+# domain and state lines a person must still add (flagged as TODO comments,
+# never guessed at).
+#
+# Run from the repo root:
+#   rust-runtime/target/release/pat.exe --ir-run self_hosting/zs_infer_selftest.patlang
+
+include "lib/test.patlang"
+include "lib/zs_infer.patlang"
+
+make a function called borrowing_feature returns text
+  return "Feature: Borrowing a book
+  A member wants to borrow a book
+
+  Scenario: An available title
+    Given \"Dune\" is in the catalogue
+    When \"A. Diallo\" borrows \"Dune\"
+    Then \"Dune\" is borrowed by \"A. Diallo\"
+
+  Scenario: A different title and member
+    Given \"Neuromancer\" is in the catalogue
+    When \"S. Okonkwo\" borrows \"Neuromancer\"
+    Then \"Neuromancer\" is borrowed by \"S. Okonkwo\"
+"
+end
+
+make a function called count_occurrences takes text, needle returns n
+  let h = str_intern(text)
+  let hn = sc_len(h)
+  let count = 0
+  let i = 0
+  while i + sc_len(str_intern(needle)) <= hn do
+    if sm_at(h, hn, needle, i) then
+      let count = count + 1
+    end
+    let i = i + 1
+  end
+  return count
+end
+
+t_init()
+
+# ---- the capture-inference mechanism on its own ----
+let r1 = zi_templatize("\"Dune\" is in the catalogue")
+check("a quoted span becomes a placeholder", r1[0], "\"{p1}\" is in the catalogue")
+check("its captured value is recorded", r1[1][0], "Dune")
+
+let r2 = zi_templatize("Bowen inserts 10 dollars")
+check("a bare number becomes a placeholder", r2[0], "Bowen inserts {p1} dollars")
+check("its captured value is recorded as text", r2[1][0], "10")
+
+let r3 = zi_templatize("cookie is in stock")
+check("plain unquoted words are left alone (a real, documented limitation)", r3[0], "cookie is in stock")
+check("no captures are invented for them", to_num(list_len(r3[1])), 0)
+
+let r4 = zi_templatize("\"A. Diallo\" borrows \"Dune\"")
+check("two quoted spans become two placeholders", r4[0], "\"{p1}\" borrows \"{p2}\"")
+check("captures are positional and in order", r4[1][0], "A. Diallo")
+check("second capture in order", r4[1][1], "Dune")
+
+let r5 = zi_templatize("the library holds its standard catalogue")
+check("a line with nothing to capture is left exactly as written", r5[0], "the library holds its standard catalogue")
+
+# ---- the full skeleton ----
+let skeleton = zi_infer_skeleton(borrowing_feature())
+check("the skeleton names a schema", contains_text(skeleton, "schema "), true)
+check("the operation is named from the goal", contains_text(skeleton, "operation BorrowABook("), true)
+check("the operation has two inputs, from the When line's two captures", contains_text(skeleton, "operation BorrowABook(p1, p2)"), true)
+check("a placeholder precondition is present", contains_text(skeleton, "require true"), true)
+check("a placeholder postcondition is present", contains_text(skeleton, "ensure true"), true)
+check("the Given fact is inferred, deduplicated across both scenarios", count_occurrences(skeleton, "fact \"{p1}\" is in the catalogue => true"), 1)
+check("the When action is inferred as a do line", contains_text(skeleton, "do \"{p1}\" borrows \"{p2}\" => BorrowABook(p1, p2)"), true)
+check("the Then outcome is inferred as a then line", contains_text(skeleton, "then \"{p1}\" is borrowed by \"{p2}\" => true"), true)
+check("the goal line maps the narrative to the inferred operation", contains_text(skeleton, "goal borrow a book => BorrowABook"), true)
+check("a TODO marks where state variables belong", contains_text(skeleton, "TODO"), true)
+
+# ---- the skeleton is real, loadable PatLang, from the moment it is written ----
+let loaded = zs_load(skeleton)
+check("the skeleton loads without a syntax error", loaded[0], "ok")
+
+# Exploring it honestly fails: no domain was declared for either input, and
+# none was guessed at.
+let name = loaded[1]
+check("exploring the bare skeleton is refused, not guessed at", zs_explore(name, 1000)[0], "missing_domain")
+
+# ---- a feature with only one scenario still infers correctly (no repeat needed) ----
+let single_feature = "Feature: A single scenario
+  Someone wants to do a thing
+
+  Scenario: Only one
+    Given \"X\" is ready
+    When \"X\" is used
+    Then \"X\" is consumed
+"
+let single_skeleton = zi_infer_skeleton(single_feature)
+check("a single occurrence still infers a capture (quoting is the signal, not repetition)", contains_text(single_skeleton, "fact \"{p1}\" is ready => true"), true)
+
+# ---- a feature with no goal narrative still infers something usable ----
+let no_goal_feature = "Feature: No narrative
+  Scenario: Something happens
+    Given \"X\" exists
+    When \"X\" is touched
+    Then \"X\" changes
+"
+let no_goal_skeleton = zi_infer_skeleton(no_goal_feature)
+check("a missing goal narrative gets a generic operation name, not a crash", contains_text(no_goal_skeleton, "operation Op1("), true)
+check("no goal line is written when there is no narrative to draw one from", contains_text(no_goal_skeleton, "goal "), false)
+
+# ---- Phase 2: proposing already-declared facts as candidate requires ----
+#
+# A person has filled in real facts on a schema; some traced-through states
+# are known (from checking a feature) to precede an ACCEPTED scenario's
+# operation, others to precede a REJECTED one. A fact that holds in every
+# accepted state and fails in some rejected one is a real, checkable
+# correlation -- worth proposing as a `require`, though never as more than
+# that.
+let induction_schema = "schema Induction
+  state cnt, amt
+  init cnt = 0
+  init amt = 0
+
+  fact balance is positive => cnt > 0
+  fact amount is small => amt <= 10
+"
+let iloaded = zs_load(induction_schema)
+check("the induction test schema loads", iloaded[0], "ok")
+let ientry = zs_entry(iloaded[1])
+
+let accepted_envs = [[["cnt", 5], ["amt", 1]], [["cnt", 5], ["amt", 2]]]
+let rejected_envs = [[["cnt", 5], ["amt", 100]]]
+let suggestions = zi_suggest_requires(ientry, accepted_envs, rejected_envs)
+
+check("exactly one fact is proposed: the one that actually discriminates", to_num(list_len(suggestions)), 1)
+check("the proposed fact is the discriminating one, not the always-true one", suggestions[0][0], "amount is small")
+check("it reports its support count across accepted states", suggestions[0][1], 2)
+check("it reports how many rejected states it correctly excludes", suggestions[0][2], 1)
+check("it reports the total rejected states it was checked against", suggestions[0][3], 1)
+
+# A fact true everywhere (accepted AND rejected) is a real fact, but does
+# not discriminate, so it is correctly left unsuggested -- not every true
+# fact is a precondition, and this must not over-claim that it is.
+let always_true_envs = [[["cnt", 5], ["amt", 1]]]
+let no_signal = zi_suggest_requires(ientry, accepted_envs, always_true_envs)
+check("a fact holding in every accepted AND every rejected state is not proposed", to_num(list_len(no_signal)), 0)
+
+# With no accepted states at all, there is nothing to require support from,
+# so nothing is proposed -- an empty accepted set must never be treated as
+# vacuously satisfied.
+let no_accepted = zi_suggest_requires(ientry, [], rejected_envs)
+check("no accepted states means no suggestions, not a vacuous true", to_num(list_len(no_accepted)), 0)
+
+t_report()

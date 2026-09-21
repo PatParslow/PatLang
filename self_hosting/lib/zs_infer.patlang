@@ -1,0 +1,358 @@
+# =============================================================================
+# zs_infer: infer a declared-schema skeleton from an existing Gherkin feature
+# -- the reverse direction of zs_generate.patlang (schema -> Gherkin).
+#
+# What is genuinely inferable from Gherkin text alone, and what is not, is
+# the whole design constraint here:
+#
+#   - A QUOTED span, or a bare number, that appears in a Given/When/Then line
+#     is a real, mechanical signal that the value varies -- generalise it to
+#     a `{pN}` placeholder and capture it. This is not a guess: it is the
+#     same quoting convention every hand-written feature in this codebase
+#     already follows (a fact/then/do template only ever generalises a
+#     quoted span or a number), so reading it back out is just reversing an
+#     encoding, not inventing one.
+#   - Plain unquoted word variation is NOT a usable signal and is left as
+#     fixed literal text. Two scenarios that say "cookie is in stock" and
+#     "chips are in stock" do not obviously share a template -- a human has
+#     to decide that. This is a real, documented limitation, not an
+#     oversight.
+#   - WHAT a phrase asserts about the schema's state is not inferable at
+#     all: nothing in Gherkin text names a state model. The skeleton's
+#     `require`/`ensure` clauses are therefore honest placeholders
+#     (`require true` / `ensure true`) -- vacuously true, so the skeleton is
+#     valid, loadable PatLang the moment it is written, but asserting
+#     nothing until a person fills them in. Presenting a guessed clause as
+#     if it were checked would misrepresent what was actually derived.
+#
+# Phase 2 (zi_suggest_requires) goes one step further, but only for a schema
+# whose facts a person has already filled in with real meaning: it proposes
+# ALREADY-DECLARED facts as candidate `require` clauses, by checking which
+# facts hold in every state a person has classed "accepted" and fail in at
+# least one classed "rejected". Picking which states are relevant to a given
+# operation -- the ones reached immediately before it runs, across a set of
+# accepted and rejected scenarios -- is the caller's job (zs_feature.patlang
+# already computes exactly these states while checking a feature); this
+# function only does the induction once that selection has been made. This
+# is deliberately not open-ended expression synthesis -- it reuses
+# vocabulary the person already wrote, and every suggestion is returned as a
+# hypothesis for confirmation, never asserted as a checked fact.
+# =============================================================================
+
+include "zs_feature.patlang"
+
+# ---- capture inference: the encoding zi_templatize reverses ----
+
+make a function called zi_is_digit takes c returns r
+  return (c >= 48) and (c <= 57)
+end
+
+make a function called zi_is_alnum takes c returns r
+  return zi_is_digit(c) or ((c >= 65) and (c <= 90)) or ((c >= 97) and (c <= 122))
+end
+
+# Generalises a Given/When/Then line into a {pN} template plus the ordered
+# list of what each placeholder captured (as text). A quoted span always
+# becomes a placeholder, whatever it contains; an unquoted run of characters
+# becomes one only when every character in it is a digit. Everything else
+# is copied through as literal text, unchanged.
+make a function called zi_templatize takes text returns result
+  let h = str_intern(text)
+  let n = sc_len(h)
+  let out = sb_new()
+  let caps = []
+  let k = 0
+  let i = 0
+  while i < n do
+    let c = sc_code(h, i)
+    if c == 34 then
+      let j = i + 1
+      while (j < n) and (sc_code(h, j) != 34) do
+        let j = j + 1
+      end
+      let inner = sc_substr(h, i + 1, j - i - 1)
+      let k = k + 1
+      sb_push(out, "\"{p" + k + "}\"")
+      let caps = list_push(caps, inner)
+      let i = j + 1
+    elif zi_is_alnum(c) then
+      let j = i
+      while (j < n) and zi_is_alnum(sc_code(h, j)) do
+        let j = j + 1
+      end
+      let word = sc_substr(h, i, j - i)
+      if zi_all_digits(word) then
+        let k = k + 1
+        sb_push(out, "{p" + k + "}")
+        let caps = list_push(caps, word)
+      else
+        sb_push(out, word)
+      end
+      let i = j
+    else
+      sb_push(out, sc_char(h, i))
+      let i = i + 1
+    end
+  end
+  return [sb_str(out), caps]
+end
+
+make a function called zi_all_digits takes s returns r
+  let h = str_intern(s)
+  let n = sc_len(h)
+  if n == 0 then
+    return false
+  end
+  let i = 0
+  while i < n do
+    if zi_is_digit(sc_code(h, i)) == false then
+      return false
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+# ---- naming: PascalCase("borrow a book") -> "BorrowABook" ----
+
+make a function called zi_pascal_case takes text returns name
+  let h = str_intern(text)
+  let n = sc_len(h)
+  let out = sb_new()
+  let at_start = true
+  let i = 0
+  while i < n do
+    let c = sc_code(h, i)
+    if zi_is_alnum(c) then
+      if at_start then
+        sb_push(out, zi_upper_char(c))
+        let at_start = false
+      else
+        sb_push(out, sc_char(h, i))
+      end
+    else
+      let at_start = true
+    end
+    let i = i + 1
+  end
+  return sb_str(out)
+end
+
+make a function called zi_upper_char takes c returns ch
+  if (c >= 97) and (c <= 122) then
+    return chr(c - 32)
+  end
+  return chr(c)
+end
+
+make a function called zi_join_comma takes items returns text
+  return zi_join_with(items, ", ")
+end
+
+make a function called zi_join_with takes items, sep returns text
+  let out = sb_new()
+  let i = 0
+  let n = to_num(list_len(items))
+  while i < n do
+    if i > 0 then
+      sb_push(out, sep)
+    end
+    sb_push(out, items[i])
+    let i = i + 1
+  end
+  return sb_str(out)
+end
+
+# Ordered-unique append: pushes s onto list only when it is not already there.
+make a function called zi_add_unique takes list, s returns out
+  if ze_names_has(list, s) then
+    return list
+  end
+  return list_push(list, s)
+end
+
+# ---- Phase 1: the skeleton ----
+
+# Infers a declared-schema skeleton from a Gherkin feature's text. The
+# result is valid PatLang (zs_load accepts it) as soon as it is written --
+# it names one operation, keyed off the feature's own "wants to" narrative
+# when one is present, and generalises every Given/When/Then line seen
+# across every scenario into a deduplicated fact/do/then template. It
+# asserts nothing about the schema's state: `require true`/`ensure true`
+# are honest placeholders, and the missing state/domain declarations are
+# left as TODO comments rather than guessed at.
+make a function called zi_infer_skeleton takes feature_text returns text
+  let parsed = zf_parse_feature(feature_text)
+  let goal_str = parsed[0]
+  let scenarios = parsed[1]
+
+  let op_name = "Op1"
+  if goal_str != "" then
+    let op_name = zi_pascal_case(goal_str)
+  end
+
+  # Every When (and its following And/But lines) in a scenario is one
+  # combined action, not several: a real feature routinely spreads one
+  # operation's inputs across multiple When/And lines (this project's own
+  # examples/zs/vending_machine.feature does exactly this -- "Bowen inserts
+  # 10 dollars" / "And Bowen selects cookie"). Templatizing each line
+  # separately would infer one `do` line per line instead of one per
+  # scenario, each with its own, usually different, capture count -- and
+  # since every `do` line for an operation must call it with exactly the
+  # arity that operation declares, that produces a skeleton that fails to
+  # load. Joining a scenario's When/And lines into one string before
+  # templatizing keeps the arity one-per-scenario, matching how the goal's
+  # single inferred operation is actually invoked.
+  let given_templates = []
+  let when_templates = []
+  let then_templates = []
+  let si = 0
+  let sn = to_num(list_len(scenarios))
+  while si < sn do
+    let steps = scenarios[si][1]
+    let when_parts = []
+    let ti = 0
+    let tn = to_num(list_len(steps))
+    while ti < tn do
+      let phase = steps[ti][0]
+      if phase == "given" then
+        let tmpl = zi_templatize(steps[ti][1])[0]
+        let given_templates = zi_add_unique(given_templates, tmpl)
+      elif phase == "when" then
+        let when_parts = list_push(when_parts, steps[ti][1])
+      else
+        let tmpl = zi_templatize(steps[ti][1])[0]
+        let then_templates = zi_add_unique(then_templates, tmpl)
+      end
+      let ti = ti + 1
+    end
+    if to_num(list_len(when_parts)) > 0 then
+      let when_tmpl = zi_templatize(zi_join_with(when_parts, " and "))[0]
+      let when_templates = zi_add_unique(when_templates, when_tmpl)
+    end
+    let si = si + 1
+  end
+
+  # The operation's own parameters come from the first distinct combined
+  # When template seen -- the canonical action for the single operation
+  # this phase infers. A feature whose scenarios genuinely combine a
+  # different number of values per scenario for the same goal (rarer, and
+  # not exercised by this codebase's own features) still generates its own
+  # `do` line per shape, which then needs a person to reconcile the
+  # resulting arity mismatch by hand -- an honest remaining limit, not a
+  # silent one, since zs_load refuses to load it.
+  let op_inputs = []
+  if to_num(list_len(when_templates)) > 0 then
+    let op_inputs = sm_parse_template(when_templates[0])[1]
+  end
+
+  let out = sb_new()
+  let schema_name = "InferredSchema"
+  if goal_str != "" then
+    let schema_name = op_name + "Schema"
+  end
+  sb_push(out, "schema " + schema_name + "\n")
+  sb_push(out, "# TODO: this schema has no state yet -- Gherkin text names no\n")
+  sb_push(out, "# state model, so none was guessed at. Add one, e.g.:\n")
+  sb_push(out, "#   state someVariable\n")
+  sb_push(out, "#   init someVariable = ...\n\n")
+
+  sb_push(out, "operation " + op_name + "(" + zi_join_comma(op_inputs) + ")\n")
+  sb_push(out, "  # TODO: replace with the real precondition(s) for " + op_name + ".\n")
+  sb_push(out, "  require true\n")
+  sb_push(out, "  # TODO: replace with the real effect(s)/postcondition(s).\n")
+  sb_push(out, "  ensure true\n")
+  sb_push(out, "end\n\n")
+
+  let gi = 0
+  let gn = to_num(list_len(given_templates))
+  while gi < gn do
+    sb_push(out, "fact " + given_templates[gi] + " => true\n")
+    let gi = gi + 1
+  end
+  if gn > 0 then
+    sb_push(out, "\n")
+  end
+
+  let wi = 0
+  let wn = to_num(list_len(when_templates))
+  while wi < wn do
+    let caps = sm_parse_template(when_templates[wi])[1]
+    sb_push(out, "do " + when_templates[wi] + " => " + op_name + "(" + zi_join_comma(caps) + ")\n")
+    let wi = wi + 1
+  end
+  if wn > 0 then
+    sb_push(out, "\n")
+  end
+
+  let hi = 0
+  let hn = to_num(list_len(then_templates))
+  while hi < hn do
+    sb_push(out, "then " + then_templates[hi] + " => true\n")
+    let hi = hi + 1
+  end
+  if hn > 0 then
+    sb_push(out, "\n")
+  end
+
+  if goal_str != "" then
+    sb_push(out, "goal " + goal_str + " => " + op_name + "\n")
+  end
+
+  return sb_str(out)
+end
+
+# ---- Phase 2: proposing already-declared facts as candidate requires ----
+#
+# For a schema entry whose `fact` lines a person has already filled in with
+# real meaning, and a feature whose scenarios are marked accepted/rejected
+# (an accepted scenario is one whose outcome the schema's own checker
+# confirms; a rejected one is a `negative` scenario, or one the checker
+# reports as violated), this proposes `require <fact>` for a candidate
+# operation: any already-declared fact that holds in the state reached by
+# every accepted scenario before that operation runs, and fails to hold
+# before at least one rejected one. Each result is a suggestion, carrying
+# its own support/counter-example counts, not an assertion -- it must be
+# reviewed and confirmed by a person before it is added to the schema, the
+# same way any induced hypothesis must be, since a fact merely correlating
+# with acceptance is not the same claim as a fact the schema's author
+# intended as a precondition.
+make a function called zi_suggest_requires takes entry, accepted_envs, rejected_envs returns suggestions
+  let facts = entry[7]
+  let out = []
+  let fi = 0
+  let nfacts = to_num(list_len(facts))
+  while fi < nfacts do
+    let fact_text = facts[fi][0]
+    let fact_ast = facts[fi][2]
+    let holds_all_accepted = true
+    let ai = 0
+    let an = to_num(list_len(accepted_envs))
+    while ai < an do
+      ze_rt_clear()
+      let v = ze_eval(fact_ast, accepted_envs[ai])
+      if (ze_rt_error() != "") or (v != true) then
+        let holds_all_accepted = false
+      end
+      let ai = ai + 1
+    end
+    let fails_some_rejected = false
+    let counter_examples = 0
+    let ri = 0
+    let rn = to_num(list_len(rejected_envs))
+    while ri < rn do
+      ze_rt_clear()
+      let v = ze_eval(fact_ast, rejected_envs[ri])
+      if (ze_rt_error() != "") or (v != true) then
+        let fails_some_rejected = true
+        let counter_examples = counter_examples + 1
+      end
+      let ri = ri + 1
+    end
+    if holds_all_accepted and (an > 0) and fails_some_rejected then
+      let out = list_push(out, [fact_text, an, counter_examples, rn])
+    end
+    let fi = fi + 1
+  end
+  return out
+end
