@@ -56,6 +56,15 @@
 # the table actually names it, never from an ordinary noun like the item or
 # the actor. A feature with no such phrase gets exactly Phase 1's plain,
 # state-free output back.
+#
+# A Given/Then line can itself say "X and Y", not just spread X and Y
+# across separate Gherkin And-steps. zi_split_and_clauses tries each
+# top-level "and"-joined side independently, so a compound line contributes
+# every recognised clause, not only the first (or, before this was bounded,
+# a corrupted one -- an unbounded item capture used to read past "and"/"or"
+# into the rest of the sentence). "or" is deliberately never split the same
+# way: two separately-required clauses would demand BOTH sides, turning a
+# genuine disjunction into a stronger, wrong precondition.
 # =============================================================================
 
 include "zs_feature.patlang"
@@ -308,6 +317,59 @@ make a function called zi_first_word_and_rest takes text returns parts
   return [sc_substr(h, 0, i), zs_trim(sc_substr(h, i, n - i))]
 end
 
+# text up to (not including) the first top-level " and " or " or ",
+# whichever comes first; text unchanged when neither appears. Bounds an
+# item/field capture so a Given/Then line that goes on to say "... and
+# Bowen's balance is at least 10 dollars" doesn't read the rest of the
+# sentence as part of the first clause's own value.
+make a function called zi_before_conjunction takes text returns before
+  let h = str_intern(text)
+  let n = sc_len(h)
+  let idx_and = sm_find(h, n, " and ", 0)
+  let idx_or = sm_find(h, n, " or ", 0)
+  let idx = -1
+  if (idx_and >= 0) and ((idx_or < 0) or (idx_and < idx_or)) then
+    let idx = idx_and
+  elif idx_or >= 0 then
+    let idx = idx_or
+  end
+  if idx < 0 then
+    return text
+  end
+  return zs_trim(sc_substr(h, 0, idx))
+end
+
+# Splits text on top-level " and " (outside double-quoted spans) into its
+# conjuncts, so each can be tried against zi_match_require/zi_match_ensure
+# independently -- "X contains at least one cookie and Y is at least 10
+# dollars" is two real preconditions, not one. Deliberately never splits on
+# " or ": two separately-required clauses would demand BOTH sides, turning
+# a genuine disjunction into a strictly stronger, wrong precondition. A
+# line with no top-level " and " is returned as the single original text.
+make a function called zi_split_and_clauses takes text returns clauses
+  let h = str_intern(text)
+  let n = sc_len(h)
+  let out = []
+  let start = 0
+  let quoted = false
+  let i = 0
+  while i < n do
+    let c = sc_code(h, i)
+    if c == 34 then
+      let quoted = quoted == false
+    end
+    if (quoted == false) and sm_at(h, n, " and ", i) then
+      let out = list_push(out, zs_trim(sc_substr(h, start, i - start)))
+      let i = i + 5
+      let start = i
+    else
+      let i = i + 1
+    end
+  end
+  let out = list_push(out, zs_trim(sc_substr(h, start, n - start)))
+  return out
+end
+
 # Structurally recognises a require-shaped Given phrase, independent of
 # whether its subject is a declared state variable:
 #   "{subject} contains at least|at most|exactly {qty} {item}"
@@ -333,8 +395,9 @@ make a function called zi_parse_require_phrase takes text returns parsed
       let rest = zs_trim(sc_substr(h, idx + plen, n - idx - plen))
       let qr = zi_first_word_and_rest(rest)
       let qty = zi_word_to_number(qr[0])
-      if (qty >= 0) and (qr[1] != "") then
-        return ["map", zi_last_word(subject), op, qty, qr[1]]
+      let item = zi_before_conjunction(qr[1])
+      if (qty >= 0) and (item != "") then
+        return ["map", zi_last_word(subject), op, qty, item]
       end
     end
     let k = k + 1
@@ -402,8 +465,9 @@ make a function called zi_parse_ensure_phrase takes text returns parsed
       let rest = zs_trim(sc_substr(h, idx + plen, n - idx - plen))
       let qr = zi_first_word_and_rest(rest)
       let qty = zi_word_to_number(qr[0])
-      if (qty >= 0) and (qr[1] != "") then
-        return ["map", zi_last_word(subject), sign, qty, qr[1]]
+      let item = zi_before_conjunction(qr[1])
+      if (qty >= 0) and (item != "") then
+        return ["map", zi_last_word(subject), sign, qty, item]
       end
     end
     let k = k + 1
@@ -499,9 +563,15 @@ make a function called zi_infer_state_vars takes feature_text returns names
     while ti < tn do
       let phase = steps[ti][0]
       if (phase == "given") or (phase == "then") then
-        let cand = zi_candidate_state_var(steps[ti][1])
-        if cand != "" then
-          let out = zi_add_unique(out, cand)
+        let clauses = zi_split_and_clauses(steps[ti][1])
+        let ci = 0
+        let cn = to_num(list_len(clauses))
+        while ci < cn do
+          let cand = zi_candidate_state_var(clauses[ci])
+          if cand != "" then
+            let out = zi_add_unique(out, cand)
+          end
+          let ci = ci + 1
         end
       end
       let ti = ti + 1
@@ -564,20 +634,36 @@ make a function called zi_infer_skeleton_with_state takes feature_text, state_na
     while ti < tn do
       let phase = steps[ti][0]
       if phase == "given" then
+        # The fact/then vocabulary layer below still treats the whole line
+        # as one phrase, matching how the real checker matches a whole
+        # step's text -- only require/ensure inference looks inside it for
+        # more than one recognisable clause.
         let tmpl = zi_templatize(steps[ti][1])[0]
         let given_templates = zi_add_unique(given_templates, tmpl)
-        let req = zi_match_require(steps[ti][1], state_names)
-        if req[0] == "hit" then
-          let require_clauses = zi_add_unique(require_clauses, req[1])
+        let clauses = zi_split_and_clauses(steps[ti][1])
+        let ci = 0
+        let cn = to_num(list_len(clauses))
+        while ci < cn do
+          let req = zi_match_require(clauses[ci], state_names)
+          if req[0] == "hit" then
+            let require_clauses = zi_add_unique(require_clauses, req[1])
+          end
+          let ci = ci + 1
         end
       elif phase == "when" then
         let when_parts = list_push(when_parts, steps[ti][1])
       else
         let tmpl = zi_templatize(steps[ti][1])[0]
         let then_templates = zi_add_unique(then_templates, tmpl)
-        let ens = zi_match_ensure(steps[ti][1], state_names)
-        if ens[0] == "hit" then
-          let ensure_clauses = zi_add_unique(ensure_clauses, ens[1])
+        let clauses = zi_split_and_clauses(steps[ti][1])
+        let ci = 0
+        let cn = to_num(list_len(clauses))
+        while ci < cn do
+          let ens = zi_match_ensure(clauses[ci], state_names)
+          if ens[0] == "hit" then
+            let ensure_clauses = zi_add_unique(ensure_clauses, ens[1])
+          end
+          let ci = ci + 1
         end
       end
       let ti = ti + 1
