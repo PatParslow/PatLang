@@ -33,6 +33,7 @@ ORDER = [
     "zs_feature.patlang",
     "zs_refine.patlang",
     "zs_generate.patlang",
+    "zs_infer.patlang",
     "zs_demo.patlang",
 ]
 
