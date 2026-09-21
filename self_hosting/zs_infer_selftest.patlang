@@ -38,6 +38,23 @@ make a function called borrowing_feature returns text
 "
 end
 
+# Checks a zi_match_require/zi_match_ensure result by its tag and clause
+# text separately, rather than comparing the whole ["hit", text] or ["no"]
+# result as one list: the native x64 backend's `==` does not do value
+# equality on List (confirmed with a minimal repro -- ["no"] == ["no"] is
+# false there, unrelated to anything this file tests), so a whole-list
+# comparison would read as a real failure natively while the actual result
+# is correct. Every other check in this file already compares scalar
+# sub-fields for the same reason; this keeps that convention.
+make a function called check_match takes label, hit, expected_tag, expected_text returns ok
+  let tag_ok = check(label + " (tag)", hit[0], expected_tag)
+  if expected_tag != "hit" then
+    return tag_ok
+  end
+  let text_ok = check(label + " (clause)", hit[1], expected_text)
+  return tag_ok and text_ok
+end
+
 make a function called count_occurrences takes text, needle returns n
   let h = str_intern(text)
   let hn = sc_len(h)
@@ -119,6 +136,99 @@ let no_goal_feature = "Feature: No narrative
 let no_goal_skeleton = zi_infer_skeleton(no_goal_feature)
 check("a missing goal narrative gets a generic operation name, not a crash", contains_text(no_goal_skeleton, "operation Op1("), true)
 check("no goal line is written when there is no narrative to draw one from", contains_text(no_goal_skeleton, "goal "), false)
+
+# ---- Phase 3: real require/ensure clauses from a closed phrase vocabulary ----
+#
+# zi_word_to_number: digits and the small closed set of number words this
+# phase recognises.
+check("a digit string is a number", zi_word_to_number("10"), 10)
+check("the indefinite article means one", zi_word_to_number("a"), 1)
+check("\"an\" also means one", zi_word_to_number("an"), 1)
+check("\"one\" spelled out", zi_word_to_number("one"), 1)
+check("\"ten\" spelled out", zi_word_to_number("ten"), 10)
+check("an unrecognised word is not a number", zi_word_to_number("dog"), -1)
+
+# zi_match_require: the map-shaped and scalar-shaped precondition patterns.
+let states1 = ["inventory", "balance"]
+check_match("a map \"contains at least\" phrase becomes a real require clause",
+  zi_match_require("vending machine inventory contains at least one cookie", states1),
+  "hit", "map_get_or(inventory, \"cookie\", 0) >= 1")
+check_match("\"contains at most\" becomes <=",
+  zi_match_require("inventory contains at most 3 chips", states1),
+  "hit", "map_get_or(inventory, \"chips\", 0) <= 3")
+check_match("a possessive \"is at least\" phrase becomes a real require clause",
+  zi_match_require("Bowen's balance is at least 10 dollars", states1),
+  "hit", "balance >= 10")
+check_match("\"is exactly\" becomes ==",
+  zi_match_require("Bowen's balance is exactly 5 dollars", states1),
+  "hit", "balance == 5")
+check_match("an unresolved subject is refused, not guessed at",
+  zi_match_require("the queue contains at least one ticket", states1),
+  "no", "")
+check_match("plain prose with no pattern is left alone",
+  zi_match_require("cookie is in stock", states1),
+  "no", "")
+
+# zi_match_ensure: the map-shaped and scalar-shaped postcondition patterns.
+check_match("a map \"subtracts\" phrase becomes a real ensure clause",
+  zi_match_ensure("the vending machine inventory subtracts a cookie", states1),
+  "hit", "inventory' == map_put(inventory, \"cookie\", map_get(inventory, \"cookie\") - 1)")
+check_match("\"adds\" becomes +",
+  zi_match_ensure("inventory adds 2 chips", states1),
+  "hit", "inventory' == map_put(inventory, \"chips\", map_get(inventory, \"chips\") + 2)")
+check_match("a possessive \"is decreased by\" phrase becomes a real ensure clause",
+  zi_match_ensure("Bowen's balance is decreased by 10 dollars", states1),
+  "hit", "balance' == balance - 10")
+check_match("\"is increased by\" becomes +",
+  zi_match_ensure("Bowen's balance is increased by 5 dollars", states1),
+  "hit", "balance' == balance + 5")
+check_match("\"becomes\" sets the value directly",
+  zi_match_ensure("Bowen's balance becomes 0 dollars", states1),
+  "hit", "balance' == 0")
+check_match("an unrelated Then phrase is left alone",
+  zi_match_ensure("the vending machine dispenses a cookie", states1),
+  "no", "")
+
+# The full skeleton, given the real state names, with the user's own example.
+let priced_feature = "Feature: Buying a snack using money
+  As a user
+  Bowen wants to buy a snack with money
+  So that Bowen can get a snack to eat
+
+  Scenario: Buying a cookie using money when the cookie is in stock
+    Given cookie is in stock
+    And vending machine inventory contains at least one cookie
+    And Bowen's balance is at least 10 dollars
+    When Bowen inserts 10 dollars
+    And Bowen selects cookie
+    Then the vending machine dispenses a cookie
+    And the vending machine inventory subtracts a cookie
+    And Bowen's balance is decreased by 10 dollars
+"
+let priced_skeleton = zi_infer_skeleton_with_state(priced_feature, ["inventory", "balance"])
+check("state is declared for real once the caller supplies real names", contains_text(priced_skeleton, "state inventory, balance"), true)
+check("the map precondition is inferred", contains_text(priced_skeleton, "require map_get_or(inventory, \"cookie\", 0) >= 1"), true)
+check("the scalar precondition is inferred", contains_text(priced_skeleton, "require balance >= 10"), true)
+check("the placeholder require is dropped once real ones exist", contains_text(priced_skeleton, "require true"), false)
+check("the map postcondition is inferred", contains_text(priced_skeleton, "ensure inventory' == map_put(inventory, \"cookie\", map_get(inventory, \"cookie\") - 1)"), true)
+check("the scalar postcondition is inferred", contains_text(priced_skeleton, "ensure balance' == balance - 10"), true)
+check("the placeholder ensure is dropped once real ones exist", contains_text(priced_skeleton, "ensure true"), false)
+check("the plain, pattern-less Given still becomes a vacuous fact, unchanged", contains_text(priced_skeleton, "fact cookie is in stock => true"), true)
+check("the plain, pattern-less Then still becomes a vacuous then, unchanged", contains_text(priced_skeleton, "then the vending machine dispenses a cookie => true"), true)
+
+# The inferred clauses must be real PatLang that a fully-specified schema
+# (init added by hand, since no phrase says what things start at) actually
+# loads and explores -- not merely text that looks right.
+let priced_full = priced_skeleton + "\ninit inventory = map_of(\"cookie\", 2)\ninit balance = 0\n"
+let priced_loaded = zs_load(priced_full)
+check("the inferred clauses parse as real, loadable clause expressions", priced_loaded[0], "ok")
+
+# Backward compatibility: the original one-argument entry point must behave
+# exactly as before -- no state names in means no real clauses out.
+let unstated_skeleton = zi_infer_skeleton(priced_feature)
+check("with no state names supplied, the placeholder require is unchanged", contains_text(unstated_skeleton, "require true"), true)
+check("with no state names supplied, the placeholder ensure is unchanged", contains_text(unstated_skeleton, "ensure true"), true)
+check("with no state names supplied, the TODO state comment is unchanged", contains_text(unstated_skeleton, "TODO: this schema has no state yet"), true)
 
 # ---- Phase 2: proposing already-declared facts as candidate requires ----
 #

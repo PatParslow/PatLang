@@ -37,6 +37,16 @@
 # is deliberately not open-ended expression synthesis -- it reuses
 # vocabulary the person already wrote, and every suggestion is returned as a
 # hypothesis for confirmation, never asserted as a checked fact.
+#
+# Phase 3 (zi_infer_skeleton_with_state, zi_match_require, zi_match_ensure)
+# recognises a small, closed table of quantity/arithmetic PHRASINGS ("contains
+# at least N X", "is decreased by N") that, unlike free prose, do have one
+# fixed formal meaning -- and only ever emits a clause when the phrase's own
+# subject literally names one of the schema's already-declared state
+# variables. A feature written this precisely has largely already written
+# the clause in English, so this is closer to compiling a small controlled
+# vocabulary than to reading arbitrary BDD; the value is real but
+# conditional on that discipline, not a general upgrade to Phase 1.
 # =============================================================================
 
 include "zs_feature.patlang"
@@ -182,6 +192,243 @@ end
 # are honest placeholders, and the missing state/domain declarations are
 # left as TODO comments rather than guessed at.
 make a function called zi_infer_skeleton takes feature_text returns text
+  return zi_infer_skeleton_with_state(feature_text, [])
+end
+
+# ---- Phase 3: real require/ensure clauses from a known, closed vocabulary ----
+#
+# Phase 1's require/ensure clauses stay the placeholder `true` because free
+# English carries no fixed formal meaning -- "the cookie is nice" and "the
+# cookie is in stock" are indistinguishable to a parser. But a small set of
+# quantity and arithmetic PHRASINGS do have one fixed, unambiguous meaning
+# ("contains at least N X", "is decreased by N"), the same way a quoted span
+# or a bare number does. zi_match_require/zi_match_ensure recognise exactly
+# those phrasings against a CLOSED table, and only ever produce a clause
+# when the phrase's own subject or field resolves, by exact name, to one of
+# the schema's already-declared state variables -- never against arbitrary
+# prose, and never by guessing which variable was meant. A phrase outside
+# this table, or one whose subject doesn't literally name a declared state
+# variable, is left exactly as Phase 1 leaves it: a vacuous `fact`/`then`
+# line, not a fabricated clause.
+#
+# This still requires state variables to already be declared (Phase 1's own
+# TODO), which is a real, worth-stating boundary: a feature written this
+# precisely has largely already written the formal clause in English, so
+# recognising it is closer to compiling a small controlled vocabulary than
+# to reading arbitrary BDD. The value is real for a feature disciplined
+# enough to write it, and conditional on that discipline.
+
+make a function called zi_lower_char takes c returns ch
+  if (c >= 65) and (c <= 90) then
+    return chr(c + 32)
+  end
+  return chr(c)
+end
+
+make a function called zi_lower takes text returns out
+  let h = str_intern(text)
+  let n = sc_len(h)
+  let b = sb_new()
+  let i = 0
+  while i < n do
+    sb_push(b, zi_lower_char(sc_code(h, i)))
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+# A number spelled as a digit string or one of a small, closed set of number
+# words ("a"/"an"/"one" through "ten"); -1 when neither.
+make a function called zi_word_to_number takes word returns n
+  if zi_all_digits(word) then
+    return to_num(word)
+  end
+  let w = zi_lower(word)
+  if (w == "a") or (w == "an") or (w == "one") then
+    return 1
+  end
+  if w == "two" then
+    return 2
+  end
+  if w == "three" then
+    return 3
+  end
+  if w == "four" then
+    return 4
+  end
+  if w == "five" then
+    return 5
+  end
+  if w == "six" then
+    return 6
+  end
+  if w == "seven" then
+    return 7
+  end
+  if w == "eight" then
+    return 8
+  end
+  if w == "nine" then
+    return 9
+  end
+  if w == "ten" then
+    return 10
+  end
+  return -1
+end
+
+# The last whitespace-separated token of text, trimmed.
+make a function called zi_last_word takes text returns word
+  let h = str_intern(zs_trim(text))
+  let n = sc_len(h)
+  let i = n
+  while (i > 0) and (sc_code(h, i - 1) != 32) do
+    let i = i - 1
+  end
+  return sc_substr(h, i, n - i)
+end
+
+# [first_word, rest] of text, trimmed; rest is "" when text is one word.
+make a function called zi_first_word_and_rest takes text returns parts
+  let h = str_intern(zs_trim(text))
+  let n = sc_len(h)
+  let i = 0
+  while (i < n) and (sc_code(h, i) != 32) do
+    let i = i + 1
+  end
+  return [sc_substr(h, 0, i), zs_trim(sc_substr(h, i, n - i))]
+end
+
+# Recognises a require-shaped Given phrase against declared state_names:
+#   "{subject} contains at least|at most|exactly {qty} {item}"
+#     -> map_get_or(subject, "item", 0) >=|<=|== qty, when subject's own
+#        last word literally names a declared state variable
+#   "{subject}'s {field} is at least|at most|exactly {qty}"
+#     -> field >=|<=|== qty, when field literally names a declared
+#        state variable
+# ["no"] when nothing in the table matches, or the named variable isn't
+# actually declared -- never a guessed clause.
+make a function called zi_match_require takes text, state_names returns hit
+  let h = str_intern(text)
+  let n = sc_len(h)
+  let map_ops = [[" contains at least ", ">="], [" contains at most ", "<="], [" contains exactly ", "=="]]
+  let k = 0
+  while k < 3 do
+    let phrase = map_ops[k][0]
+    let op = map_ops[k][1]
+    let idx = sm_find(h, n, phrase, 0)
+    if idx >= 0 then
+      let subject = zs_trim(sc_substr(h, 0, idx))
+      let plen = sc_len(str_intern(phrase))
+      let rest = zs_trim(sc_substr(h, idx + plen, n - idx - plen))
+      let qr = zi_first_word_and_rest(rest)
+      let qty = zi_word_to_number(qr[0])
+      let subj = zi_last_word(subject)
+      if (qty >= 0) and (qr[1] != "") and ze_names_has(state_names, subj) then
+        return ["hit", "map_get_or(" + subj + ", \"" + qr[1] + "\", 0) " + op + " " + qty]
+      end
+    end
+    let k = k + 1
+  end
+  let idx_apos = sm_find(h, n, "'s ", 0)
+  if idx_apos >= 0 then
+    let remainder = sc_substr(h, idx_apos + 3, n - idx_apos - 3)
+    let rh = str_intern(remainder)
+    let rn = sc_len(rh)
+    let scalar_ops = [[" is at least ", ">="], [" is at most ", "<="], [" is exactly ", "=="]]
+    let j = 0
+    while j < 3 do
+      let phrase = scalar_ops[j][0]
+      let op = scalar_ops[j][1]
+      let idxc = sm_find(rh, rn, phrase, 0)
+      if idxc >= 0 then
+        let field = zs_trim(sc_substr(rh, 0, idxc))
+        let plen = sc_len(str_intern(phrase))
+        let rest = zs_trim(sc_substr(rh, idxc + plen, rn - idxc - plen))
+        let qty = zi_word_to_number(zi_first_word_and_rest(rest)[0])
+        if (qty >= 0) and ze_names_has(state_names, field) then
+          return ["hit", field + " " + op + " " + qty]
+        end
+      end
+      let j = j + 1
+    end
+  end
+  return ["no"]
+end
+
+# Recognises an ensure-shaped Then phrase against declared state_names:
+#   "{subject} subtracts|adds {qty} {item}"
+#     -> subject' == map_put(subject, "item", map_get(subject, "item") -|+ qty)
+#   "{subject}'s {field} is decreased by|increased by {qty}"
+#     -> field' == field -|+ qty
+#   "{subject}'s {field} becomes {qty}"
+#     -> field' == qty
+# ["no"] on the same terms as zi_match_require.
+make a function called zi_match_ensure takes text, state_names returns hit
+  let h = str_intern(text)
+  let n = sc_len(h)
+  let map_ops = [[" subtracts ", "-"], [" adds ", "+"]]
+  let k = 0
+  while k < 2 do
+    let phrase = map_ops[k][0]
+    let sign = map_ops[k][1]
+    let idx = sm_find(h, n, phrase, 0)
+    if idx >= 0 then
+      let subject = zs_trim(sc_substr(h, 0, idx))
+      let plen = sc_len(str_intern(phrase))
+      let rest = zs_trim(sc_substr(h, idx + plen, n - idx - plen))
+      let qr = zi_first_word_and_rest(rest)
+      let qty = zi_word_to_number(qr[0])
+      let subj = zi_last_word(subject)
+      if (qty >= 0) and (qr[1] != "") and ze_names_has(state_names, subj) then
+        return ["hit", subj + "' == map_put(" + subj + ", \"" + qr[1] + "\", map_get(" + subj + ", \"" + qr[1] + "\") " + sign + " " + qty + ")"]
+      end
+    end
+    let k = k + 1
+  end
+  let idx_apos = sm_find(h, n, "'s ", 0)
+  if idx_apos >= 0 then
+    let remainder = sc_substr(h, idx_apos + 3, n - idx_apos - 3)
+    let rh = str_intern(remainder)
+    let rn = sc_len(rh)
+    let scalar_ops = [[" is decreased by ", "-"], [" is increased by ", "+"]]
+    let j = 0
+    while j < 2 do
+      let phrase = scalar_ops[j][0]
+      let sign = scalar_ops[j][1]
+      let idxc = sm_find(rh, rn, phrase, 0)
+      if idxc >= 0 then
+        let field = zs_trim(sc_substr(rh, 0, idxc))
+        let plen = sc_len(str_intern(phrase))
+        let rest = zs_trim(sc_substr(rh, idxc + plen, rn - idxc - plen))
+        let qty = zi_word_to_number(zi_first_word_and_rest(rest)[0])
+        if (qty >= 0) and ze_names_has(state_names, field) then
+          return ["hit", field + "' == " + field + " " + sign + " " + qty]
+        end
+      end
+      let j = j + 1
+    end
+    let idxb = sm_find(rh, rn, " becomes ", 0)
+    if idxb >= 0 then
+      let field = zs_trim(sc_substr(rh, 0, idxb))
+      let plen = sc_len(str_intern(" becomes "))
+      let rest = zs_trim(sc_substr(rh, idxb + plen, rn - idxb - plen))
+      let qty = zi_word_to_number(zi_first_word_and_rest(rest)[0])
+      if (qty >= 0) and ze_names_has(state_names, field) then
+        return ["hit", field + "' == " + qty]
+      end
+    end
+  end
+  return ["no"]
+end
+
+# As zi_infer_skeleton, but given the target schema's already-declared state
+# variable names, also tries every Given phrase against zi_match_require and
+# every Then phrase against zi_match_ensure. Where one matches, the real
+# clause replaces the `true` placeholder for that half of the operation
+# (deduplicated across scenarios); where none matches for a half, that half
+# keeps today's honest placeholder and TODO exactly as Phase 1 alone would.
+make a function called zi_infer_skeleton_with_state takes feature_text, state_names returns text
   let parsed = zf_parse_feature(feature_text)
   let goal_str = parsed[0]
   let scenarios = parsed[1]
@@ -206,6 +453,8 @@ make a function called zi_infer_skeleton takes feature_text returns text
   let given_templates = []
   let when_templates = []
   let then_templates = []
+  let require_clauses = []
+  let ensure_clauses = []
   let si = 0
   let sn = to_num(list_len(scenarios))
   while si < sn do
@@ -218,11 +467,19 @@ make a function called zi_infer_skeleton takes feature_text returns text
       if phase == "given" then
         let tmpl = zi_templatize(steps[ti][1])[0]
         let given_templates = zi_add_unique(given_templates, tmpl)
+        let req = zi_match_require(steps[ti][1], state_names)
+        if req[0] == "hit" then
+          let require_clauses = zi_add_unique(require_clauses, req[1])
+        end
       elif phase == "when" then
         let when_parts = list_push(when_parts, steps[ti][1])
       else
         let tmpl = zi_templatize(steps[ti][1])[0]
         let then_templates = zi_add_unique(then_templates, tmpl)
+        let ens = zi_match_ensure(steps[ti][1], state_names)
+        if ens[0] == "hit" then
+          let ensure_clauses = zi_add_unique(ensure_clauses, ens[1])
+        end
       end
       let ti = ti + 1
     end
@@ -252,16 +509,40 @@ make a function called zi_infer_skeleton takes feature_text returns text
     let schema_name = op_name + "Schema"
   end
   sb_push(out, "schema " + schema_name + "\n")
-  sb_push(out, "# TODO: this schema has no state yet -- Gherkin text names no\n")
-  sb_push(out, "# state model, so none was guessed at. Add one, e.g.:\n")
-  sb_push(out, "#   state someVariable\n")
-  sb_push(out, "#   init someVariable = ...\n\n")
+  if to_num(list_len(state_names)) == 0 then
+    sb_push(out, "# TODO: this schema has no state yet -- Gherkin text names no\n")
+    sb_push(out, "# state model, so none was guessed at. Add one, e.g.:\n")
+    sb_push(out, "#   state someVariable\n")
+    sb_push(out, "#   init someVariable = ...\n\n")
+  else
+    sb_push(out, "state " + zi_join_comma(state_names) + "\n")
+    sb_push(out, "# TODO: no phrase in the feature says what these start at.\n")
+    sb_push(out, "#   init " + state_names[0] + " = ...\n\n")
+  end
 
   sb_push(out, "operation " + op_name + "(" + zi_join_comma(op_inputs) + ")\n")
-  sb_push(out, "  # TODO: replace with the real precondition(s) for " + op_name + ".\n")
-  sb_push(out, "  require true\n")
-  sb_push(out, "  # TODO: replace with the real effect(s)/postcondition(s).\n")
-  sb_push(out, "  ensure true\n")
+  if to_num(list_len(require_clauses)) == 0 then
+    sb_push(out, "  # TODO: replace with the real precondition(s) for " + op_name + ".\n")
+    sb_push(out, "  require true\n")
+  else
+    let ri = 0
+    let rn = to_num(list_len(require_clauses))
+    while ri < rn do
+      sb_push(out, "  require " + require_clauses[ri] + "\n")
+      let ri = ri + 1
+    end
+  end
+  if to_num(list_len(ensure_clauses)) == 0 then
+    sb_push(out, "  # TODO: replace with the real effect(s)/postcondition(s).\n")
+    sb_push(out, "  ensure true\n")
+  else
+    let ei = 0
+    let en = to_num(list_len(ensure_clauses))
+    while ei < en do
+      sb_push(out, "  ensure " + ensure_clauses[ei] + "\n")
+      let ei = ei + 1
+    end
+  end
   sb_push(out, "end\n\n")
 
   let gi = 0
