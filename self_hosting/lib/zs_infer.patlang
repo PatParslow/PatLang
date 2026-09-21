@@ -47,6 +47,15 @@
 # the clause in English, so this is closer to compiling a small controlled
 # vocabulary than to reading arbitrary BDD; the value is real but
 # conditional on that discipline, not a general upgrade to Phase 1.
+#
+# zi_infer_state_vars/zi_infer_skeleton_auto read that same closed table one
+# more way: for the variable NAME a require/ensure-shaped phrase names,
+# whether or not any schema has declared it yet. This removes the need to
+# already know the state variable names by hand -- zi_infer_skeleton_auto
+# takes only feature text -- but proposes a variable only when a phrase in
+# the table actually names it, never from an ordinary noun like the item or
+# the actor. A feature with no such phrase gets exactly Phase 1's plain,
+# state-free output back.
 # =============================================================================
 
 include "zs_feature.patlang"
@@ -299,16 +308,17 @@ make a function called zi_first_word_and_rest takes text returns parts
   return [sc_substr(h, 0, i), zs_trim(sc_substr(h, i, n - i))]
 end
 
-# Recognises a require-shaped Given phrase against declared state_names:
+# Structurally recognises a require-shaped Given phrase, independent of
+# whether its subject is a declared state variable:
 #   "{subject} contains at least|at most|exactly {qty} {item}"
-#     -> map_get_or(subject, "item", 0) >=|<=|== qty, when subject's own
-#        last word literally names a declared state variable
+#     -> ["map", subject's own last word, op, qty, item]
 #   "{subject}'s {field} is at least|at most|exactly {qty}"
-#     -> field >=|<=|== qty, when field literally names a declared
-#        state variable
-# ["no"] when nothing in the table matches, or the named variable isn't
-# actually declared -- never a guessed clause.
-make a function called zi_match_require takes text, state_names returns hit
+#     -> ["scalar", field, op, qty]
+#   ["none"] when nothing in the table matches at all.
+# zi_match_require and zi_infer_state_vars are the two consumers: one checks
+# the subject against already-declared names before building a clause, the
+# other proposes the subject itself as a candidate declaration.
+make a function called zi_parse_require_phrase takes text returns parsed
   let h = str_intern(text)
   let n = sc_len(h)
   let map_ops = [[" contains at least ", ">="], [" contains at most ", "<="], [" contains exactly ", "=="]]
@@ -323,9 +333,8 @@ make a function called zi_match_require takes text, state_names returns hit
       let rest = zs_trim(sc_substr(h, idx + plen, n - idx - plen))
       let qr = zi_first_word_and_rest(rest)
       let qty = zi_word_to_number(qr[0])
-      let subj = zi_last_word(subject)
-      if (qty >= 0) and (qr[1] != "") and ze_names_has(state_names, subj) then
-        return ["hit", "map_get_or(" + subj + ", \"" + qr[1] + "\", 0) " + op + " " + qty]
+      if (qty >= 0) and (qr[1] != "") then
+        return ["map", zi_last_word(subject), op, qty, qr[1]]
       end
     end
     let k = k + 1
@@ -346,25 +355,39 @@ make a function called zi_match_require takes text, state_names returns hit
         let plen = sc_len(str_intern(phrase))
         let rest = zs_trim(sc_substr(rh, idxc + plen, rn - idxc - plen))
         let qty = zi_word_to_number(zi_first_word_and_rest(rest)[0])
-        if (qty >= 0) and ze_names_has(state_names, field) then
-          return ["hit", field + " " + op + " " + qty]
+        if qty >= 0 then
+          return ["scalar", field, op, qty]
         end
       end
       let j = j + 1
     end
   end
+  return ["none"]
+end
+
+# As zi_parse_require_phrase, but only ever returns a hit whose subject
+# literally names one of state_names -- never a guessed clause.
+make a function called zi_match_require takes text, state_names returns hit
+  let p = zi_parse_require_phrase(text)
+  if (p[0] == "map") and ze_names_has(state_names, p[1]) then
+    return ["hit", "map_get_or(" + p[1] + ", \"" + p[4] + "\", 0) " + p[2] + " " + p[3]]
+  end
+  if (p[0] == "scalar") and ze_names_has(state_names, p[1]) then
+    return ["hit", p[1] + " " + p[2] + " " + p[3]]
+  end
   return ["no"]
 end
 
-# Recognises an ensure-shaped Then phrase against declared state_names:
+# Structurally recognises an ensure-shaped Then phrase, independent of
+# whether its subject is a declared state variable:
 #   "{subject} subtracts|adds {qty} {item}"
-#     -> subject' == map_put(subject, "item", map_get(subject, "item") -|+ qty)
+#     -> ["map", subject's own last word, sign, qty, item]
 #   "{subject}'s {field} is decreased by|increased by {qty}"
-#     -> field' == field -|+ qty
+#     -> ["scalar", field, sign, qty]
 #   "{subject}'s {field} becomes {qty}"
-#     -> field' == qty
-# ["no"] on the same terms as zi_match_require.
-make a function called zi_match_ensure takes text, state_names returns hit
+#     -> ["scalar", field, "=", qty]
+#   ["none"] when nothing in the table matches at all.
+make a function called zi_parse_ensure_phrase takes text returns parsed
   let h = str_intern(text)
   let n = sc_len(h)
   let map_ops = [[" subtracts ", "-"], [" adds ", "+"]]
@@ -379,9 +402,8 @@ make a function called zi_match_ensure takes text, state_names returns hit
       let rest = zs_trim(sc_substr(h, idx + plen, n - idx - plen))
       let qr = zi_first_word_and_rest(rest)
       let qty = zi_word_to_number(qr[0])
-      let subj = zi_last_word(subject)
-      if (qty >= 0) and (qr[1] != "") and ze_names_has(state_names, subj) then
-        return ["hit", subj + "' == map_put(" + subj + ", \"" + qr[1] + "\", map_get(" + subj + ", \"" + qr[1] + "\") " + sign + " " + qty + ")"]
+      if (qty >= 0) and (qr[1] != "") then
+        return ["map", zi_last_word(subject), sign, qty, qr[1]]
       end
     end
     let k = k + 1
@@ -402,8 +424,8 @@ make a function called zi_match_ensure takes text, state_names returns hit
         let plen = sc_len(str_intern(phrase))
         let rest = zs_trim(sc_substr(rh, idxc + plen, rn - idxc - plen))
         let qty = zi_word_to_number(zi_first_word_and_rest(rest)[0])
-        if (qty >= 0) and ze_names_has(state_names, field) then
-          return ["hit", field + "' == " + field + " " + sign + " " + qty]
+        if qty >= 0 then
+          return ["scalar", field, sign, qty]
         end
       end
       let j = j + 1
@@ -414,12 +436,89 @@ make a function called zi_match_ensure takes text, state_names returns hit
       let plen = sc_len(str_intern(" becomes "))
       let rest = zs_trim(sc_substr(rh, idxb + plen, rn - idxb - plen))
       let qty = zi_word_to_number(zi_first_word_and_rest(rest)[0])
-      if (qty >= 0) and ze_names_has(state_names, field) then
-        return ["hit", field + "' == " + qty]
+      if qty >= 0 then
+        return ["scalar", field, "=", qty]
       end
     end
   end
+  return ["none"]
+end
+
+# As zi_parse_ensure_phrase, but only ever returns a hit whose subject
+# literally names one of state_names -- never a guessed clause.
+make a function called zi_match_ensure takes text, state_names returns hit
+  let p = zi_parse_ensure_phrase(text)
+  if (p[0] == "map") and ze_names_has(state_names, p[1]) then
+    return ["hit", p[1] + "' == map_put(" + p[1] + ", \"" + p[4] + "\", map_get(" + p[1] + ", \"" + p[4] + "\") " + p[2] + " " + p[3] + ")"]
+  end
+  if (p[0] == "scalar") and ze_names_has(state_names, p[1]) then
+    if p[2] == "=" then
+      return ["hit", p[1] + "' == " + p[3]]
+    end
+    return ["hit", p[1] + "' == " + p[1] + " " + p[2] + " " + p[3]]
+  end
   return ["no"]
+end
+
+# The candidate state variable a require- or ensure-shaped phrase names --
+# "" when the phrase matches neither table. This is the same closed
+# vocabulary zi_match_require/zi_match_ensure read, just read for the
+# variable's NAME instead of for a clause: "vending machine inventory
+# contains at least one cookie" names a candidate variable ("inventory")
+# whether or not any schema has declared it yet, the same way a quoted span
+# names a capture whether or not it is ever bound to an operation input.
+# Never proposes a name from ordinary prose with no recognised shape.
+make a function called zi_candidate_state_var takes text returns name
+  let pr = zi_parse_require_phrase(text)
+  if pr[0] != "none" then
+    return pr[1]
+  end
+  let pe = zi_parse_ensure_phrase(text)
+  if pe[0] != "none" then
+    return pe[1]
+  end
+  return ""
+end
+
+# The state variables a feature's own Given/Then phrases name, in the order
+# first seen, deduplicated. Built from the same closed table as
+# zi_match_require/zi_match_ensure, so a variable is only ever proposed when
+# some phrase in the feature actually names it through a recognised
+# quantity/arithmetic shape -- never from an arbitrary noun, and never a
+# guess at what unrelated words like the item ("cookie") or the actor
+# ("Bowen") might mean.
+make a function called zi_infer_state_vars takes feature_text returns names
+  let scenarios = zf_parse_feature(feature_text)[1]
+  let out = []
+  let si = 0
+  let sn = to_num(list_len(scenarios))
+  while si < sn do
+    let steps = scenarios[si][1]
+    let ti = 0
+    let tn = to_num(list_len(steps))
+    while ti < tn do
+      let phase = steps[ti][0]
+      if (phase == "given") or (phase == "then") then
+        let cand = zi_candidate_state_var(steps[ti][1])
+        if cand != "" then
+          let out = zi_add_unique(out, cand)
+        end
+      end
+      let ti = ti + 1
+    end
+    let si = si + 1
+  end
+  return out
+end
+
+# Fully automatic: infers the schema's state variables from the same closed
+# phrase table as the require/ensure clauses themselves, then infers the
+# skeleton using them. Nothing here is guessed beyond what the table already
+# licenses -- a feature with no recognised quantity/arithmetic phrase still
+# gets Phase 1's plain, state-free skeleton, exactly as zi_infer_skeleton
+# alone would.
+make a function called zi_infer_skeleton_auto takes feature_text returns text
+  return zi_infer_skeleton_with_state(feature_text, zi_infer_state_vars(feature_text))
 end
 
 # As zi_infer_skeleton, but given the target schema's already-declared state
