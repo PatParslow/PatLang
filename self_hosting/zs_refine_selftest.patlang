@@ -1,0 +1,355 @@
+# Selftest for lib/zs_refine.patlang: data refinement between declared schemas.
+#
+# A concrete schema says `refines Abstract` and gives a `retrieve` line for each
+# abstract state variable, defining it in terms of the concrete state. The
+# checks are the standard forward-simulation conditions, run over every state
+# the concrete schema reaches:
+#   - initialisation: retrieving the concrete initial state gives the abstract
+#     initial state;
+#   - every retrieved state satisfies the abstract invariants;
+#   - applicability: wherever the abstract operation is enabled on the
+#     retrieved state, the concrete operation is enabled;
+#   - correctness: where both are enabled, retrieving the concrete after-state
+#     gives the abstract after-state;
+#   - a concrete operation the abstract schema has no counterpart for changes
+#     nothing that can be retrieved.
+# A concrete operation may be enabled where the abstract one is not
+# (weakening a precondition is allowed).
+#
+# The second half asks Bowen Liu's question about consistency after
+# refinement (his thesis lists it as open): a feature consistent with the
+# abstract schema is checked against the concrete one, with the abstract facts
+# read through the retrieve function.
+#
+# Run from the repo root:
+#   rust-runtime/target/release/pat.exe --ir-run self_hosting/zs_refine_selftest.patlang
+
+include "lib/test.patlang"
+include "lib/zs_refine.patlang"
+
+make a function called counter_abstract returns text
+  return "schema Counter
+state n
+init n = 0
+invariant n >= 0 and n <= 5
+operation Inc()
+  require n < 5
+  ensure n' == n + 1
+end
+operation Dec()
+  require n > 0
+  ensure n' == n - 1
+end
+"
+end
+
+# A concrete counter that also caches the parity of n. `variant` plants a defect:
+#   ok            a correct refinement
+#   bad_init      starts at 1
+#   wrong_step    Inc adds two
+#   strict_pre    Inc is refused from 3 upward (abstract allows it up to 4)
+#   loose_inv     the invariant allows 6, so a retrieved state breaks the abstract one
+#   missing_op    no Dec
+#   stutter_op    an extra operation that changes n
+#   no_retrieve   retrieves nothing
+make a function called counter_concrete takes variant returns text
+  let init_n = "0"
+  let inc_pre = "n < 5"
+  let inc_eff = "n + 1"
+  let inv = "n >= 0 and n <= 5"
+  if variant == "bad_init" then
+    let init_n = "1"
+  end
+  if variant == "wrong_step" then
+    let inc_pre = "n < 4"
+    let inc_eff = "n + 2"
+  end
+  if variant == "strict_pre" then
+    let inc_pre = "n < 3"
+  end
+  if variant == "loose_inv" then
+    let inc_pre = "n < 6"
+    let inv = "n >= 0 and n <= 6"
+  end
+  let dec = "operation Dec()
+  require n > 0
+  ensure n' == n - 1
+  ensure isEven' == (not isEven)
+end
+"
+  if variant == "missing_op" then
+    let dec = ""
+  end
+  let extra = ""
+  if variant == "stutter_op" then
+    let extra = "operation Bump()
+  require n < 5
+  ensure n' == n + 1
+  ensure isEven' == (not isEven)
+end
+"
+  end
+  let retrieve = "retrieve n = n
+"
+  if variant == "no_retrieve" then
+    let retrieve = ""
+  end
+  return "schema CounterCached
+state n, isEven
+init n = " + init_n + "
+init isEven = true
+invariant " + inv + "
+refines Counter
+" + retrieve + "operation Inc()
+  require " + inc_pre + "
+  ensure n' == " + inc_eff + "
+  ensure isEven' == (not isEven)
+end
+" + dec + extra
+end
+
+make a function called loans_titles returns text
+  return "set_of(\"Dune\", \"Neuromancer\", \"Foundation\", \"Hobbit\")"
+end
+
+make a function called loans_abstract returns text
+  return "schema LoansSimple
+state books, borrowedBy
+const titles = " + loans_titles() + "
+init books = titles
+init borrowedBy = empty_map()
+domain title = titles
+domain member = set_of(\"A. Diallo\", \"S. Okonkwo\")
+invariant subset(dom(borrowedBy), books)
+operation BorrowBook(title, member)
+  require title in books
+  require not map_has(borrowedBy, title)
+  ensure borrowedBy' == map_put(borrowedBy, title, member)
+end
+operation ReturnBook(title)
+  require map_has(borrowedBy, title)
+  ensure borrowedBy' == map_remove(borrowedBy, title)
+end
+"
+end
+
+# Adds a loan count. `limited` adds the three-loan limit, which the abstract
+# schema does not have.
+make a function called loans_concrete takes limited returns text
+  let limit = ""
+  if limited then
+    let limit = "  require map_get_or(loanCount, member, 0) < 3
+"
+  end
+  return "schema LoansCounted
+state books, borrowedBy, loanCount
+const titles = " + loans_titles() + "
+init books = titles
+init borrowedBy = empty_map()
+init loanCount = empty_map()
+domain title = titles
+domain member = set_of(\"A. Diallo\", \"S. Okonkwo\")
+invariant subset(dom(borrowedBy), books)
+refines LoansSimple
+retrieve books = books
+retrieve borrowedBy = borrowedBy
+operation BorrowBook(title, member)
+  require title in books
+  require not map_has(borrowedBy, title)
+" + limit + "  ensure borrowedBy' == map_put(borrowedBy, title, member)
+  ensure loanCount' == map_put(loanCount, member, map_get_or(loanCount, member, 0) + 1)
+end
+operation ReturnBook(title)
+  require map_has(borrowedBy, title)
+  ensure borrowedBy' == map_remove(borrowedBy, title)
+  ensure loanCount' == map_put(loanCount, map_get(borrowedBy, title), map_get(loanCount, map_get(borrowedBy, title)) - 1)
+end
+"
+end
+
+make a function called vending_abstract returns text
+  return "schema VendingMachine
+state inventory, currentMoneyValue
+const snacks = set_of(\"cookie\", \"chocolate\", \"chips\")
+const price = map_of(\"cookie\", 5, \"chocolate\", 7, \"chips\", 3)
+const maxMoney = 20
+init inventory = map_of(\"cookie\", 2, \"chocolate\", 1, \"chips\", 0)
+init currentMoneyValue = 0
+domain item = snacks
+domain amount = set_of(1, 5, 10)
+invariant subset(dom(inventory), snacks)
+invariant currentMoneyValue >= 0 and currentMoneyValue <= maxMoney
+operation InsertMoney(amount)
+  require amount > 0
+  require currentMoneyValue + amount <= maxMoney
+  ensure currentMoneyValue' == currentMoneyValue + amount
+end
+operation BuyVM(item)
+  require item in snacks
+  require map_get_or(inventory, item, 0) > 0
+  require currentMoneyValue >= map_get(price, item)
+  ensure currentMoneyValue' == currentMoneyValue - map_get(price, item)
+  ensure inventory' == map_put(inventory, item, map_get(inventory, item) - 1)
+end
+fact {item} is in stock => map_get_or(inventory, item, 0) > 0
+fact Bowen inserts {amount} dollars => currentMoneyValue > 0
+fact Bowen selects {item} => item in snacks
+goal buy a snack with money => BuyVM
+"
+end
+
+# The vending machine with a sales counter. `weak` drops the requirement that
+# enough money has been inserted (and clamps the balance at zero instead).
+make a function called vending_concrete takes weak returns text
+  let money_req = "  require currentMoneyValue >= map_get(price, item)
+"
+  let money_eff = "  ensure currentMoneyValue' == currentMoneyValue - map_get(price, item)
+"
+  if weak then
+    let money_req = ""
+    let money_eff = "  ensure currentMoneyValue' == max(currentMoneyValue - map_get(price, item), 0)
+"
+  end
+  return "schema VendingLog
+state inventory, currentMoneyValue, sales
+const snacks = set_of(\"cookie\", \"chocolate\", \"chips\")
+const price = map_of(\"cookie\", 5, \"chocolate\", 7, \"chips\", 3)
+const maxMoney = 20
+init inventory = map_of(\"cookie\", 2, \"chocolate\", 1, \"chips\", 0)
+init currentMoneyValue = 0
+init sales = 0
+domain item = snacks
+domain amount = set_of(1, 5, 10)
+invariant subset(dom(inventory), snacks)
+invariant currentMoneyValue >= 0 and currentMoneyValue <= maxMoney
+invariant sales >= 0 and sales <= 3
+refines VendingMachine
+retrieve inventory = inventory
+retrieve currentMoneyValue = currentMoneyValue
+operation InsertMoney(amount)
+  require amount > 0
+  require currentMoneyValue + amount <= maxMoney
+  ensure currentMoneyValue' == currentMoneyValue + amount
+end
+operation BuyVM(item)
+  require item in snacks
+  require map_get_or(inventory, item, 0) > 0
+" + money_req + money_eff + "  ensure inventory' == map_put(inventory, item, map_get(inventory, item) - 1)
+  ensure sales' == sales + 1
+end
+"
+end
+
+make a function called listing_15 returns text
+  return "Feature: Buying a snack using money
+  Bowen wants to buy a snack with money
+
+  Scenario: Buying a cookie using money when the cookie is in stock
+    Given cookie is in stock
+    When Bowen inserts 10 dollars
+    And Bowen selects cookie
+    Then the vending machine dispenses a cookie
+"
+end
+
+make a function called load_ok takes text returns tag
+  return zs_load(text)[0]
+end
+
+make a function called finding_of takes findings, tag returns payload
+  let i = 0
+  let n = to_num(list_len(findings))
+  while i < n do
+    if findings[i][0] == tag then
+      return findings[i][1]
+    end
+    let i = i + 1
+  end
+  return ""
+end
+
+t_init()
+
+# ---- a correct refinement ----
+check("the abstract counter loads", load_ok(counter_abstract()), "ok")
+check("the concrete counter loads", load_ok(counter_concrete("ok")), "ok")
+let good = zs_refines("CounterCached", 1000, "")
+check("a correct refinement is accepted", good[0], "ok")
+check("it was checked over every concrete state", good[1][0], 6)
+check("the search was exhaustive", good[1][2], true)
+check("instances were compared", good[1][1], 10)
+
+# ---- each way a refinement can fail ----
+check("bad-init counter loads", load_ok(counter_concrete("bad_init")), "ok")
+let bi = zs_refines("CounterCached", 1000, "")
+check("a wrong initial state is reported", bi[0], "init_not_refined")
+check("the variable is named", bi[1][0], "n")
+
+check("wrong-step counter loads", load_ok(counter_concrete("wrong_step")), "ok")
+let ws = zs_refines("CounterCached", 1000, "")
+check("an operation that computes a different outcome is reported", ws[0], "outcome_differs")
+check("the operation is named", ws[1][0], "Inc")
+check("the variable is named", ws[1][2], "n")
+check("the abstract outcome is given", ws[1][3], 1)
+check("the retrieved concrete outcome is given", ws[1][4], 2)
+
+check("strict-precondition counter loads", load_ok(counter_concrete("strict_pre")), "ok")
+let sp = zs_refines("CounterCached", 1000, "")
+check("a stricter precondition is reported as not applicable", sp[0], "not_applicable")
+check("the operation is named", sp[1][0], "Inc")
+check("the concrete clause that refuses it is named", sp[1][2], "n < 3")
+
+check("loose-invariant counter loads", load_ok(counter_concrete("loose_inv")), "ok")
+let li = zs_refines("CounterCached", 1000, "")
+check("a retrieved state that breaks the abstract invariant is reported", li[0], "retrieve_breaks_invariant")
+check("the abstract invariant is named", li[1][0], "n >= 0 and n <= 5")
+
+check("missing-op counter loads", load_ok(counter_concrete("missing_op")), "ok")
+check("a missing operation is reported", zs_refines("CounterCached", 1000, "")[0], "operation_missing")
+
+check("stutter-op counter loads", load_ok(counter_concrete("stutter_op")), "ok")
+let st = zs_refines("CounterCached", 1000, "")
+check("an extra operation that changes the retrieved state is reported", st[0], "extra_operation_changes_abstract_state")
+check("the extra operation is named", st[1][0], "Bump")
+
+check("no-retrieve counter loads", load_ok(counter_concrete("no_retrieve")), "ok")
+let nr = zs_refines("CounterCached", 1000, "")
+check("an abstract variable with no retrieve line is reported", nr[0], "retrieve_incomplete")
+check("the variable is named", nr[1][0], "n")
+
+check("a schema that refines nothing is reported", zs_refines("Counter", 1000, "")[0], "not_a_refinement")
+check("an unknown schema is reported", zs_refines("NoSuchSchema", 1000, "")[0], "unknown_schema")
+let orphan = zs_load("schema Orphan\nstate a\ninit a = 0\nrefines Nowhere\nretrieve a = a\n")
+check("a schema refining an unknown schema loads", orphan[0], "ok")
+check("but it cannot be checked", zs_refines("Orphan", 1000, "")[0], "unknown_abstract")
+
+# ---- the plan's example: a refinement that adds a limit ----
+check("simple loans loads", load_ok(loans_abstract()), "ok")
+check("counted loans without a limit loads", load_ok(loans_concrete(false)), "ok")
+let cached = zs_refines("LoansCounted", 100000, "")
+check("adding a maintained loan count refines the simple schema", cached[0], "ok")
+check("limited loans loads", load_ok(loans_concrete(true)), "ok")
+let limited = zs_refines("LoansCounted", 100000, "")
+check("adding a three-loan limit does not", limited[0], "not_applicable")
+check("the operation is named", limited[1][0], "BorrowBook")
+check("the limit clause is named", limited[1][2], "map_get_or(loanCount, member, 0) < 3")
+check("the trace to the state where it matters is given", to_num(list_len(limited[1][3])) >= 3, true)
+
+# ---- consistency after refinement: Liu's open question ----
+check("abstract vending machine loads", load_ok(vending_abstract()), "ok")
+check("a faithful concrete vending machine loads", load_ok(vending_concrete(false)), "ok")
+check("it refines the abstract one", zs_refines("VendingLog", 100000, "")[0], "ok")
+let faithful = zs_analyse_feature_refined("VendingLog", listing_15(), 100000)
+check("the feature stays consistent through a faithful refinement", faithful[0], "consistent")
+
+check("a concrete vending machine that sells with no money loads", load_ok(vending_concrete(true)), "ok")
+let weak_ref = zs_refines("VendingLog", 100000, "")
+check("weakening a precondition is still a refinement", weak_ref[0], "ok")
+let weak_feature = zs_analyse_feature_refined("VendingLog", listing_15(), 100000)
+check("but the feature is no longer consistent with it", weak_feature[0], "inconsistent")
+let missing = finding_of(weak_feature[1][3], "requirement_not_in_schema")
+check("the requirement the refinement lost is named", missing[0], "Bowen inserts {amount} dollars")
+
+check("a refined analysis of a schema that refines nothing is reported", zs_analyse_feature_refined("Counter", listing_15(), 100)[0], "not_a_refinement")
+
+t_report()

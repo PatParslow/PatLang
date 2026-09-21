@@ -1,0 +1,334 @@
+# =============================================================================
+# zs_refine: data refinement between declared schemas.
+#
+# A concrete schema declares `refines Abstract` and one `retrieve a = expr` line
+# for each abstract state variable a, defining it in terms of the concrete
+# state (a total function from concrete states to abstract ones). zs_refines
+# checks the forward-simulation conditions over every state the concrete schema
+# reaches, for a deterministic pair of schemas:
+#
+#   initialisation   retrieve(concrete init) equals the abstract init state
+#   invariants       every retrieved state satisfies the abstract invariants
+#   applicability    where the abstract operation is enabled on the retrieved
+#                    state, the concrete operation of the same name is enabled
+#                    (the concrete precondition may be weaker, never stronger)
+#   correctness      where both are enabled, retrieve(concrete after-state)
+#                    equals the abstract after-state
+#   internal steps   a concrete operation with no abstract counterpart leaves
+#                    the retrieved state unchanged
+#
+# The abstract and concrete operations must have the same inputs, and the
+# concrete schema's input domains supply the values tried. Like the explorer,
+# the check covers the states reachable through those domains and says so when
+# the search stopped at its bound.
+#
+# zs_analyse_feature_refined asks Bowen Liu's open question about consistency
+# after refinement: a feature that is consistent with the abstract schema is
+# analysed against the concrete one, with each abstract fact and outcome read
+# through the retrieve function (the abstract state variables are replaced by
+# their retrieve expressions, after-state variables by the primed expressions).
+# A concrete schema can be a correct refinement and still lose a requirement,
+# for instance by weakening a precondition, and this is where that shows.
+#
+# Results are [tag, payload]:
+#   ["ok" | "ok_bounded", [states, instances_compared, exhaustive]]
+#   ["init_not_refined", [var, retrieved, abstract]]
+#   ["retrieve_breaks_invariant", [clause, trace]]
+#   ["not_applicable", [op, inputs, concrete_clause, trace]]
+#   ["outcome_differs", [op, inputs, var, abstract_after, retrieved_after, trace]]
+#   ["extra_operation_changes_abstract_state", [op, inputs, var, before, after, trace]]
+#   ["operation_missing", [op]]   ["input_mismatch", [op, abstract, concrete]]
+#   ["retrieve_incomplete", [var]]   ["abstract_missing_init", [var]]
+#   ["not_a_refinement", [name]]   ["unknown_schema", [name]]
+#   ["unknown_abstract", [name]]   ["concrete_unsound", [diagnosis]]
+#   ["runtime_error", [message]]   ["aborted", [states]]
+# and, for the explorer's own refusals, its tags (missing_domain, not_explorable).
+# =============================================================================
+
+include "zs_feature.patlang"
+
+make a function called zr_find_retrieve takes retrieves, var returns tree
+  let i = 0
+  let n = to_num(list_len(retrieves))
+  while i < n do
+    if retrieves[i][0] == var then
+      return retrieves[i][2]
+    end
+    let i = i + 1
+  end
+  return ""
+end
+
+# The abstract state a concrete state stands for: each retrieve expression
+# evaluated in env (the concrete constants and state).
+make a function called zr_retrieved takes retrieves, abstract_names, env returns values
+  let out = []
+  let i = 0
+  let n = to_num(list_len(abstract_names))
+  while i < n do
+    let out = list_push(out, ze_eval(zr_find_retrieve(retrieves, abstract_names[i]), env))
+    let i = i + 1
+  end
+  return out
+end
+
+# The concrete operation of the same name, or "".
+make a function called zr_find_op takes ops, name returns op
+  let i = 0
+  let n = to_num(list_len(ops))
+  while i < n do
+    if ops[i][0] == name then
+      return ops[i]
+    end
+    let i = i + 1
+  end
+  return ""
+end
+
+# Checks a schema is declared as a refinement of a loaded one. Returns
+# ["ok", abstract_entry] or the failure.
+make a function called zr_shape takes concrete_name returns result
+  let ec = zs_entry(concrete_name)
+  if type_of(ec) != "list" then
+    return ["unknown_schema", [concrete_name]]
+  end
+  if ec[13] == "" then
+    return ["not_a_refinement", [concrete_name]]
+  end
+  let ea = zs_entry(ec[13])
+  if type_of(ea) != "list" then
+    return ["unknown_abstract", [ec[13]]]
+  end
+  let i = 0
+  let n = to_num(list_len(ea[1]))
+  while i < n do
+    if type_of(zr_find_retrieve(ec[14], ea[1][i])) != "list" then
+      return ["retrieve_incomplete", [ea[1][i]]]
+    end
+    let i = i + 1
+  end
+  let j = 0
+  let jn = to_num(list_len(ea[6]))
+  while j < jn do
+    let cop = zr_find_op(ec[6], ea[6][j][0])
+    if type_of(cop) != "list" then
+      return ["operation_missing", [ea[6][j][0]]]
+    end
+    if ze_val_eq(cop[1], ea[6][j][1]) == false then
+      return ["input_mismatch", [ea[6][j][0], ea[6][j][1], cop[1]]]
+    end
+    let j = j + 1
+  end
+  return ["ok", ea]
+end
+
+make a function called zs_refines takes concrete_name, max_states, tick_fn returns result
+  let shape = zr_shape(concrete_name)
+  if shape[0] != "ok" then
+    return shape
+  end
+  let ec = zs_entry(concrete_name)
+  let ea = shape[1]
+  let anames = ea[1]
+
+  let ainit = []
+  let i = 0
+  let n = to_num(list_len(anames))
+  while i < n do
+    let found = false
+    let value = ""
+    let k = 0
+    let kn = to_num(list_len(ea[3]))
+    while k < kn do
+      if ea[3][k][0] == anames[i] then
+        let found = true
+        let value = ea[3][k][1]
+      end
+      let k = k + 1
+    end
+    if found == false then
+      return ["abstract_missing_init", [anames[i]]]
+    end
+    let ainit = list_push(ainit, value)
+    let i = i + 1
+  end
+  let prep_a = zs_prepare_mode(ea, false)
+  if prep_a[0] != "ok" then
+    return prep_a
+  end
+
+  let bfs = zs_bfs(concrete_name, max_states, tick_fn)
+  let diag = bfs[0]
+  if diag[0] == "aborted" then
+    return ["aborted", [diag[1][0]]]
+  end
+  if (diag[0] != "ok") and (diag[0] != "ok_bounded") then
+    return ["concrete_unsound", [diag]]
+  end
+  let states = bfs[1]
+  let parents = bfs[2]
+  let vias = bfs[3]
+  let prep_c = bfs[4]
+  let cconsts = ec[2]
+  let cnames = ec[1]
+  let aconsts = ea[2]
+
+  zs_set_phase("checking the refinement")
+  ze_rt_clear()
+  let checks = 0
+  let ci = 0
+  let cn = to_num(list_len(states))
+  while ci < cn do
+    let c = states[ci]
+    let env_c = zs_env_add(cconsts, cnames, c, "")
+    let a = zr_retrieved(ec[14], anames, env_c)
+    if ze_rt_error() != "" then
+      return ["runtime_error", [ze_rt_error()]]
+    end
+    if ci == 0 then
+      let v = 0
+      while v < n do
+        if ze_val_eq(a[v], ainit[v]) == false then
+          return ["init_not_refined", [anames[v], a[v], ainit[v]]]
+        end
+        let v = v + 1
+      end
+    end
+    let env_a = zs_env_add(aconsts, anames, a, "")
+    let fi = zs_first_failing(ea[4], env_a)
+    if fi >= 0 then
+      return ["retrieve_breaks_invariant", [ea[4][fi][0], zs_trace(states, parents, vias, ci)]]
+    end
+    let oi = 0
+    let on_total = to_num(list_len(prep_c))
+    while oi < on_total do
+      let pc = prep_c[oi]
+      let pa = zs_find_prepared(prep_a[1], pc[0])
+      let tuples = pc[2]
+      let ti = 0
+      let tn = to_num(list_len(tuples))
+      while ti < tn do
+        if zs_tick_poll(tick_fn, ci, cn, ti) == false then
+          return ["aborted", [cn]]
+        end
+        let env_op_c = zs_env_add(env_c, pc[1], tuples[ti], "")
+        let fc = zs_first_failing(pc[3], env_op_c)
+        if ze_rt_error() != "" then
+          return ["runtime_error", [ze_rt_error()]]
+        end
+        if type_of(pa) == "list" then
+          let env_op_a = zs_env_add(env_a, pa[1], tuples[ti], "")
+          let fa = zs_first_failing(pa[3], env_op_a)
+          if (fa < 0) and (fc >= 0) then
+            return ["not_applicable", [pc[0], tuples[ti], pc[3][fc][0], zs_trace(states, parents, vias, ci)]]
+          end
+          if (fa < 0) and (fc < 0) then
+            let after_c = zs_apply_effects(pc[5], c, env_op_c)
+            let after_a = zs_apply_effects(pa[5], a, env_op_a)
+            let back = zr_retrieved(ec[14], anames, zs_env_add(cconsts, cnames, after_c, ""))
+            let v = 0
+            while v < n do
+              if ze_val_eq(back[v], after_a[v]) == false then
+                return ["outcome_differs", [pc[0], tuples[ti], anames[v], after_a[v], back[v], zs_trace(states, parents, vias, ci)]]
+              end
+              let v = v + 1
+            end
+            let checks = checks + 1
+          end
+        else
+          if fc < 0 then
+            let after_c = zs_apply_effects(pc[5], c, env_op_c)
+            let back = zr_retrieved(ec[14], anames, zs_env_add(cconsts, cnames, after_c, ""))
+            let v = 0
+            while v < n do
+              if ze_val_eq(back[v], a[v]) == false then
+                return ["extra_operation_changes_abstract_state", [pc[0], tuples[ti], anames[v], a[v], back[v], zs_trace(states, parents, vias, ci)]]
+              end
+              let v = v + 1
+            end
+            let checks = checks + 1
+          end
+        end
+        if ze_rt_error() != "" then
+          return ["runtime_error", [ze_rt_error()]]
+        end
+        let ti = ti + 1
+      end
+      let oi = oi + 1
+    end
+    let ci = ci + 1
+  end
+  let tag = "ok"
+  if diag[0] == "ok_bounded" then
+    let tag = "ok_bounded"
+  end
+  return [tag, [cn, checks, diag[0] == "ok"]]
+end
+
+# ---- a feature carried through a refinement ----
+
+# The concrete schema with the abstract schema's facts, goals and outcome
+# claims rewritten over the concrete state. Registered as
+# "<concrete>@<abstract>" and returned by name.
+make a function called zr_derive takes concrete_name, ea returns name
+  let ec = zs_entry(concrete_name)
+  let retrieves = ec[14]
+  let unprimed = []
+  let primed = []
+  let cprime = []
+  let c = 0
+  let cn = to_num(list_len(ec[1]))
+  while c < cn do
+    let cprime = list_push(cprime, [ec[1][c], ["var", ec[1][c] + "'"]])
+    let c = c + 1
+  end
+  let r = 0
+  let rn = to_num(list_len(retrieves))
+  while r < rn do
+    let unprimed = list_push(unprimed, [retrieves[r][0], retrieves[r][2]])
+    let primed = list_push(primed, [retrieves[r][0] + "'", ze_subst(retrieves[r][2], cprime, [])])
+    let r = r + 1
+  end
+  let both = zs_concat(unprimed, primed)
+
+  let facts = []
+  let f = 0
+  let fn_total = to_num(list_len(ea[7]))
+  while f < fn_total do
+    let facts = list_push(facts, [ea[7][f][0], ea[7][f][1], ze_subst(ea[7][f][2], unprimed, [])])
+    let f = f + 1
+  end
+  let thens = []
+  let t = 0
+  let tn = to_num(list_len(ea[12]))
+  while t < tn do
+    let thens = list_push(thens, [ea[12][t][0], ea[12][t][1], ze_subst(ea[12][t][2], both, [])])
+    let t = t + 1
+  end
+  let consts = ec[2]
+  let cnames = zs_pair_names(ec[2])
+  let k = 0
+  let kn = to_num(list_len(ea[2]))
+  while k < kn do
+    if ze_names_has(cnames, ea[2][k][0]) == false then
+      let consts = list_appended(consts, ea[2][k])
+    end
+    let k = k + 1
+  end
+  let derived = concrete_name + "@" + ea[0]
+  send(zs_registry(), "set", derived, [derived, ec[1], consts, ec[3], ec[4], ec[5], ec[6], facts, ea[8], ea[9], ea[10], ea[11], thens, "", [], ea[15]])
+  return derived
+end
+
+make a function called zs_analyse_feature_refined takes concrete_name, feature_text, max_states returns result
+  return zs_analyse_feature_refined_ticked(concrete_name, feature_text, max_states, "")
+end
+
+make a function called zs_analyse_feature_refined_ticked takes concrete_name, feature_text, max_states, tick_fn returns result
+  let shape = zr_shape(concrete_name)
+  if shape[0] != "ok" then
+    return shape
+  end
+  let derived = zr_derive(concrete_name, shape[1])
+  return zs_analyse_feature_ticked(derived, feature_text, max_states, tick_fn)
+end

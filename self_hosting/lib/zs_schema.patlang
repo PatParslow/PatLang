@@ -30,6 +30,19 @@
 #                                    where the goal is not achieved
 #   action template                  a phrase that performs the goal itself
 #                                    (not a condition, so it asserts no fact)
+#   do template => Op(arg, ...)      a phrase that runs an operation; the
+#                                    arguments read the phrase's captures
+#   then template => expr            a phrase that claims something about the
+#                                    outcome of the operation just run; expr
+#                                    reads before-state names, after-state
+#                                    (primed) names, and the captures
+#   reject template => clause        a Then phrase naming the require clause
+#                                    (its exact text) the scenario expects to
+#                                    be the one that fails; also marks the
+#                                    scenario negative
+#   refines Name                     this schema refines the schema Name
+#   retrieve a = expr                what abstract variable a is, in terms of
+#                                    this schema's state (one line per variable)
 #
 # An ensure clause of the form  a' == expr  (expr reading only before-state
 # names and inputs) also states how the operation changes a; the explorer
@@ -39,10 +52,14 @@
 #
 # Entry layout, as stored by zs_load:
 #   schema: [name, state_names, consts, inits, invariants, domains, ops,
-#            facts, goals, negatives, actions]
+#            facts, goals, negatives, actions, dos, thens, refines,
+#            retrieves, rejects]
 #     consts, inits, domains: lists of [name, value]
 #     invariants: lists of [text, tree]
 #     facts: [template, expr_text, tree]     goals: [text, op_name]
+#     dos: [template, op_name, arg_trees, arg_texts, line]
+#     thens: [template, expr_text, tree]     retrieves: [var, expr_text, tree]
+#     rejects: [template, clause_text, line]
 #   operation: [name, input_names, requires, ensures, effects]
 #     requires, ensures: lists of [text, tree]
 #     effects: lists of [state_name, tree, index_into_ensures]
@@ -97,6 +114,23 @@ make a function called zs_find_op takes entry, op_name returns op
     let i = i + 1
   end
   return ""
+end
+
+# True when op_name was declared with a `query` line: no ensure clause of the
+# schema may give it an effect (the Xi convention -- the operation is
+# asserted, and checked at load time, to change no state variable). An
+# unknown schema or operation is reported as false, not an error; callers
+# checking the schema's shape should confirm the operation exists first.
+make a function called zs_is_query_op takes schema_name, op_name returns is_query
+  let entry = zs_entry(schema_name)
+  if type_of(entry) != "list" then
+    return false
+  end
+  let op = zs_find_op(entry, op_name)
+  if type_of(op) != "list" then
+    return false
+  end
+  return op[5] == true
 end
 
 # ---- text helpers (every scan goes through interned handles) ----
@@ -286,6 +320,41 @@ make a function called zs_effect_var takes ast, state_names returns var
   return base
 end
 
+# Splits text at commas that sit outside parentheses and string quotes.
+make a function called zs_split_top_commas takes s returns parts
+  let h = str_intern(s)
+  let n = sc_len(h)
+  let out = []
+  let buf = sb_new()
+  let depth = 0
+  let quoted = false
+  let i = 0
+  while i < n do
+    let c = sc_code(h, i)
+    if c == 34 then
+      let quoted = quoted == false
+    end
+    if (quoted == false) and (c == 40) then
+      let depth = depth + 1
+    end
+    if (quoted == false) and (c == 41) then
+      let depth = depth - 1
+    end
+    if (quoted == false) and (depth == 0) and (c == 44) then
+      let out = list_push(out, zs_trim(sb_str(buf)))
+      let buf = sb_new()
+    else
+      sb_push(buf, sc_char(h, i))
+    end
+    let i = i + 1
+  end
+  let last = zs_trim(sb_str(buf))
+  if (last != "") or (to_num(list_len(out)) > 0) then
+    let out = list_push(out, last)
+  end
+  return out
+end
+
 make a function called zs_err takes lineno, msg returns result
   return ["error", [lineno, msg]]
 end
@@ -310,6 +379,11 @@ make a function called zs_load takes text returns result
   let goals = []
   let negs = []
   let acts = []
+  let dos = []
+  let thens = []
+  let refines_name = ""
+  let retrieves = []
+  let rejects = []
   let in_op = false
   let op_name = ""
   let op_line = 0
@@ -317,6 +391,7 @@ make a function called zs_load takes text returns result
   let op_pre = []
   let op_post = []
   let op_eff = []
+  let op_is_query = false
   let i = 0
   while i < n do
     let lineno = lines[i][0]
@@ -410,6 +485,15 @@ make a function called zs_load takes text returns result
       let op_pre = []
       let op_post = []
       let op_eff = []
+      let op_is_query = false
+    elif kw == "query" then
+      if in_op == false then
+        return zs_err(lineno, "query belongs inside an operation")
+      end
+      if (to_num(list_len(op_pre)) > 0) or (to_num(list_len(op_post)) > 0) then
+        return zs_err(lineno, "query must be the first line of an operation")
+      end
+      let op_is_query = true
     elif kw == "require" then
       if in_op == false then
         return zs_err(lineno, "require belongs inside an operation")
@@ -430,6 +514,9 @@ make a function called zs_load takes text returns result
       end
       let ev = zs_effect_var(c[1], state)
       if ev != "" then
+        if op_is_query then
+          return zs_err(lineno, "query operation " + op_name + " may not define an after-state: " + rest)
+        end
         let op_eff = list_push(op_eff, [ev, c[1][3], to_num(list_len(op_post))])
       end
       let op_post = list_push(op_post, [rest, c[1]])
@@ -437,7 +524,7 @@ make a function called zs_load takes text returns result
       if in_op == false then
         return zs_err(lineno, "end without an open operation")
       end
-      let ops = list_push(ops, [op_name, op_inputs, op_pre, op_post, op_eff])
+      let ops = list_push(ops, [op_name, op_inputs, op_pre, op_post, op_eff, op_is_query])
       let in_op = false
     elif kw == "fact" then
       let parts = zs_split_at(rest, " => ")
@@ -460,6 +547,68 @@ make a function called zs_load takes text returns result
       let negs = list_push(negs, rest)
     elif kw == "action" then
       let acts = list_push(acts, rest)
+    elif kw == "do" then
+      let parts = zs_split_at(rest, " => ")
+      if to_num(list_len(parts)) != 2 then
+        return zs_err(lineno, "do needs: do template => Operation(arg, ...)")
+      end
+      let caps = sm_parse_template(parts[0])[1]
+      let call = zs_split_at(parts[1], "(")
+      if to_num(list_len(call)) != 2 then
+        return zs_err(lineno, "do needs an operation call: Operation(arg, ...)")
+      end
+      let args_text = zs_trim(call[1])
+      let ah = str_intern(args_text)
+      let an = sc_len(ah)
+      if (an == 0) or (sc_code(ah, an - 1) != 41) then
+        return zs_err(lineno, "the operation call is missing its closing )")
+      end
+      let arg_texts = zs_split_top_commas(sc_substr(ah, 0, an - 1))
+      let arg_trees = []
+      let g = 0
+      let gn = to_num(list_len(arg_texts))
+      while g < gn do
+        let c = zs_clause(arg_texts[g], zs_concat(caps, zs_pair_names(consts)))
+        if c[0] != "ok" then
+          return zs_err(lineno, c[1])
+        end
+        let arg_trees = list_push(arg_trees, c[1])
+        let g = g + 1
+      end
+      let dos = list_push(dos, [parts[0], call[0], arg_trees, arg_texts, lineno])
+    elif kw == "then" then
+      let parts = zs_split_at(rest, " => ")
+      if to_num(list_len(parts)) != 2 then
+        return zs_err(lineno, "then needs: then template => expr")
+      end
+      let caps = sm_parse_template(parts[0])[1]
+      let allowed = zs_concat(zs_concat(zs_concat(state, zs_primed(state)), caps), zs_pair_names(consts))
+      let c = zs_clause(parts[1], allowed)
+      if c[0] != "ok" then
+        return zs_err(lineno, c[1])
+      end
+      let thens = list_push(thens, [parts[0], parts[1], c[1]])
+    elif kw == "reject" then
+      let parts = zs_split_at(rest, " => ")
+      if to_num(list_len(parts)) != 2 then
+        return zs_err(lineno, "reject needs: reject template => the text of a require clause")
+      end
+      let rejects = list_push(rejects, [parts[0], parts[1], lineno])
+    elif kw == "refines" then
+      if rest == "" then
+        return zs_err(lineno, "refines needs the name of the schema it refines")
+      end
+      let refines_name = rest
+    elif kw == "retrieve" then
+      let parts = zs_split_at(rest, " = ")
+      if to_num(list_len(parts)) != 2 then
+        return zs_err(lineno, "retrieve needs: retrieve abstract_var = expr over this schema's state")
+      end
+      let c = zs_clause(parts[1], zs_concat(state, zs_pair_names(consts)))
+      if c[0] != "ok" then
+        return zs_err(lineno, c[1])
+      end
+      let retrieves = list_push(retrieves, [parts[0], parts[1], c[1]])
     else
       return zs_err(lineno, "unknown keyword " + kw)
     end
@@ -470,6 +619,48 @@ make a function called zs_load takes text returns result
   end
   if in_op then
     return zs_err(op_line, "operation " + op_name + " is not closed with end")
+  end
+  let d = 0
+  let dn = to_num(list_len(dos))
+  while d < dn do
+    let found = false
+    let k = 0
+    let kn = to_num(list_len(ops))
+    while k < kn do
+      if ops[k][0] == dos[d][1] then
+        let found = true
+        if to_num(list_len(ops[k][1])) != to_num(list_len(dos[d][3])) then
+          return zs_err(dos[d][4], "do calls " + dos[d][1] + " with " + to_num(list_len(dos[d][3])) + " argument(s), and it takes " + to_num(list_len(ops[k][1])))
+        end
+      end
+      let k = k + 1
+    end
+    if found == false then
+      return zs_err(dos[d][4], "do names " + dos[d][1] + ", which is not an operation of " + name)
+    end
+    let d = d + 1
+  end
+  let rj = 0
+  let rjn = to_num(list_len(rejects))
+  while rj < rjn do
+    let found = false
+    let k = 0
+    let kn = to_num(list_len(ops))
+    while k < kn do
+      let q = 0
+      let qn = to_num(list_len(ops[k][2]))
+      while q < qn do
+        if ops[k][2][q][0] == rejects[rj][1] then
+          let found = true
+        end
+        let q = q + 1
+      end
+      let k = k + 1
+    end
+    if found == false then
+      return zs_err(rejects[rj][2], "reject names a clause no operation requires: " + rejects[rj][1])
+    end
+    let rj = rj + 1
   end
   let g = 0
   let gn = to_num(list_len(goals))
@@ -488,7 +679,7 @@ make a function called zs_load takes text returns result
     end
     let g = g + 1
   end
-  send(zs_registry(), "set", name, [name, state, consts, inits, invs, domains, ops, facts, goals, negs, acts])
+  send(zs_registry(), "set", name, [name, state, consts, inits, invs, domains, ops, facts, goals, negs, acts, dos, thens, refines_name, retrieves, rejects])
   return ["ok", name]
 end
 

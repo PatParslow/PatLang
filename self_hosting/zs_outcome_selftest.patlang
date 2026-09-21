@@ -1,0 +1,276 @@
+# Selftest for the outcome, negative-scenario and sequence checks
+# (lib/zs_run.patlang, and the modes added to lib/zs_feature.patlang).
+#
+# Until now a scenario's claimed outcome was checked against the schema's
+# postconditions, but the schema never computed the outcome itself, so a
+# scenario and its `ensure` clause could agree with each other and both be
+# wrong. Here the schema runs the operation: zs_apply computes the after-state
+# from the ensure equations, a `then` phrase states what the scenario claims
+# about it, and a claim the computed state contradicts is reported.
+#
+# Negative scenarios (a Then matching a `negative` or `reject` phrase) are
+# checked for a state where the operation is disabled, and a `reject` phrase
+# names the require clause the scenario expects to be the one that fails.
+# A scenario with `do` steps runs as a sequence through the schema.
+#
+# Run from the repo root:
+#   rust-runtime/target/release/pat.exe --ir-run self_hosting/zs_outcome_selftest.patlang
+
+include "lib/test.patlang"
+include "lib/zs_feature.patlang"
+
+make a function called vm_text takes extra returns text
+  return "schema VendingMachine
+state inventory, currentMoneyValue
+const snacks = set_of(\"cookie\", \"chocolate\", \"chips\")
+const price = map_of(\"cookie\", 5, \"chocolate\", 7, \"chips\", 3)
+const maxMoney = 20
+init inventory = map_of(\"cookie\", 2, \"chocolate\", 1, \"chips\", 0)
+init currentMoneyValue = 0
+domain item = snacks
+domain amount = set_of(1, 5, 10)
+invariant subset(dom(inventory), snacks)
+invariant currentMoneyValue >= 0 and currentMoneyValue <= maxMoney
+
+operation InsertMoney(amount)
+  require amount > 0
+  require currentMoneyValue + amount <= maxMoney
+  ensure currentMoneyValue' == currentMoneyValue + amount
+end
+
+operation BuyVM(item)
+  require item in snacks
+  require map_get_or(inventory, item, 0) > 0
+  require currentMoneyValue >= map_get(price, item)
+  ensure currentMoneyValue' == currentMoneyValue - map_get(price, item)
+  ensure inventory' == map_put(inventory, item, map_get(inventory, item) - 1)
+end
+" + extra + "
+fact {item} is in stock => map_get_or(inventory, item, 0) > 0
+fact {item} is out of stock => map_get_or(inventory, item, 0) == 0
+fact Bowen inserts {amount} dollars => currentMoneyValue > 0
+fact Bowen selects {item} => item in snacks
+fact no money has been inserted => currentMoneyValue == 0
+fact Bowen has plenty of money => currentMoneyValue >= 10
+goal buy a snack with money => BuyVM
+
+do Bowen puts {amount} dollars in the slot => InsertMoney(amount)
+do Bowen presses {item} => BuyVM(item)
+
+then the vending machine dispenses {item} => map_get(inventory', item) == map_get(inventory, item) - 1
+then the stock of {item} is unchanged => map_get(inventory', item) == map_get(inventory, item)
+then the balance drops by {cost} => currentMoneyValue' == currentMoneyValue - cost
+then the balance is {total} => currentMoneyValue' == total
+
+negative the vending machine reports {reason}
+reject the vending machine reports {what} out of stock => map_get_or(inventory, item, 0) > 0
+reject the machine asks for more money => currentMoneyValue >= map_get(price, item)
+"
+end
+
+make a function called map_of_helper returns m
+  return pmap_put(pmap_put(pmap_put(pmap_new(), "cookie", 2), "chocolate", 1), "chips", 0)
+end
+
+make a function called finding_of takes findings, tag returns payload
+  let i = 0
+  let n = to_num(list_len(findings))
+  while i < n do
+    if findings[i][0] == tag then
+      return findings[i][1]
+    end
+    let i = i + 1
+  end
+  return ""
+end
+
+make a function called has_finding takes findings, tag returns r
+  return type_of(finding_of(findings, tag)) == "list"
+end
+
+# The findings of the first scenario of an analysis result.
+make a function called scenario_findings takes result, idx returns findings
+  return result[1][2][idx][2]
+end
+
+make a function called feature_of takes body returns text
+  return "Feature: Buying a snack using money
+  Bowen wants to buy a snack with money
+
+" + body
+end
+
+t_init()
+
+# ---- zs_apply: the schema computes the outcome ----
+check("the vending machine schema loads", zs_load(vm_text(""))[0], "ok")
+let before = [map_of_helper(), 5]
+let applied = zs_apply("VendingMachine", "BuyVM", before, ["cookie"])
+check("zs_apply computes an enabled operation's after-state", applied[0], "ok")
+check("the after-state has the balance lowered by the price", applied[1][0][1], 0)
+check("the after-state has the stock lowered by one", pmap_get(applied[1][0][0], "cookie"), 1)
+check("the before-state is left as it was", pmap_get(before[0], "cookie"), 2)
+let disabled = zs_apply("VendingMachine", "BuyVM", [map_of_helper(), 2], ["cookie"])
+check("a disabled operation is reported with the clause that failed", disabled[0], "disabled")
+check("the failing clause is named", disabled[1][0], "currentMoneyValue >= map_get(price, item)")
+let right = zs_claim_check("VendingMachine", "BuyVM", before, ["cookie"], [pmap_put(map_of_helper(), "cookie", 1), 0])
+check("a claimed outcome equal to the computed one is accepted", right[0], "ok")
+let wrong = zs_claim_check("VendingMachine", "BuyVM", before, ["cookie"], [pmap_put(map_of_helper(), "cookie", 1), 1])
+check("a claimed outcome that differs is reported", wrong[0], "outcome_differs")
+check("the differing variable is named", wrong[1][0], "currentMoneyValue")
+check("the computed value is given", wrong[1][1], 0)
+check("the claimed value is given", wrong[1][2], 1)
+
+# ---- outcome claims in a goal-based scenario ----
+let confirmed = zs_analyse_feature("VendingMachine", feature_of("  Scenario: Buying a cookie
+    Given cookie is in stock
+    When Bowen inserts 10 dollars
+    And Bowen selects cookie
+    Then the vending machine dispenses cookie
+"), 100000)
+check("a correct outcome claim keeps the feature consistent", confirmed[0], "consistent")
+check("the outcome is confirmed for every instance the scenario covers", has_finding(scenario_findings(confirmed, 0), "outcome_confirmed"), true)
+
+let contradicted = zs_analyse_feature("VendingMachine", feature_of("  Scenario: A claim the schema contradicts
+    Given cookie is in stock
+    When Bowen inserts 10 dollars
+    And Bowen selects cookie
+    Then the stock of cookie is unchanged
+"), 100000)
+check("an outcome claim the schema contradicts makes the feature inconsistent", contradicted[0], "inconsistent")
+let oc = finding_of(scenario_findings(contradicted, 0), "outcome_contradicts_schema")
+check("the contradicted claim is named", oc[0], "the stock of {item} is unchanged")
+
+let unchecked = zs_analyse_feature("VendingMachine", feature_of("  Scenario: A claim with no meaning declared
+    Given cookie is in stock
+    When Bowen inserts 10 dollars
+    And Bowen selects cookie
+    Then the machine hums contentedly
+"), 100000)
+check("an outcome phrase with no declared meaning is listed, not ignored", has_finding(scenario_findings(unchecked, 0), "unchecked_outcome"), true)
+check("an unchecked outcome does not make the feature inconsistent", unchecked[0], "consistent")
+
+# ---- sequences: the schema runs the scenario ----
+let seq_ok = zs_analyse_feature("VendingMachine", feature_of("  Scenario: Insert money, then buy
+    Given no money has been inserted
+    When Bowen puts 10 dollars in the slot
+    Then the balance is 10
+    When Bowen presses cookie
+    Then the vending machine dispenses cookie
+    And the balance drops by 5
+"), 100000)
+check("a correct multi-step scenario is consistent", seq_ok[0], "consistent")
+check("it is reported as realised by running the schema", has_finding(scenario_findings(seq_ok, 0), "sequence_realised"), true)
+
+let seq_disabled = zs_analyse_feature("VendingMachine", feature_of("  Scenario: Buying with no money
+    Given no money has been inserted
+    When Bowen presses cookie
+    Then the vending machine dispenses cookie
+"), 100000)
+check("a step the schema will not run is inconsistent", seq_disabled[0], "inconsistent")
+let sd = finding_of(scenario_findings(seq_disabled, 0), "sequence_step_disabled")
+check("the disabled step is named", sd[0], "Bowen presses cookie")
+check("the clause that stopped it is named", sd[1], "currentMoneyValue >= map_get(price, item)")
+
+let seq_wrong = zs_analyse_feature("VendingMachine", feature_of("  Scenario: A wrong price
+    Given no money has been inserted
+    When Bowen puts 10 dollars in the slot
+    And Bowen presses cookie
+    Then the balance drops by 4
+"), 100000)
+check("a step outcome the schema contradicts is inconsistent", seq_wrong[0], "inconsistent")
+check("it is reported as a contradicted outcome", has_finding(scenario_findings(seq_wrong, 0), "outcome_contradicts_schema"), true)
+
+let seq_unmapped = zs_analyse_feature("VendingMachine", feature_of("  Scenario: A step nobody defined
+    Given no money has been inserted
+    When Bowen kicks the machine
+    Then the balance is 0
+"), 100000)
+check("a When that is neither a fact nor an operation is unmapped", has_finding(scenario_findings(seq_unmapped, 0), "unmapped_step"), true)
+
+# ---- negative scenarios are checked, not skipped ----
+let neg_ok = zs_analyse_feature("VendingMachine", feature_of("  Scenario: Buying chips when there are none
+    Given chips is out of stock
+    When Bowen inserts 10 dollars
+    Then the vending machine reports an out of stock
+"), 100000)
+check("a rejection the schema supports is consistent", neg_ok[0], "consistent")
+check("a disabled instance is found", has_finding(scenario_findings(neg_ok, 0), "rejection_witnessed"), true)
+check("the named clause is among those that failed", has_finding(scenario_findings(neg_ok, 0), "rejection_reason_confirmed"), true)
+check("the scenario is marked negative", neg_ok[1][2][0][1], "negative")
+
+let neg_generic = zs_analyse_feature("VendingMachine", feature_of("  Scenario: Buying chips when there are none
+    Given chips is out of stock
+    When Bowen inserts 10 dollars
+    Then the vending machine reports something
+"), 100000)
+check("a negative phrase with no named clause needs only a disabled instance", neg_generic[0], "consistent")
+
+let neg_reason = zs_analyse_feature("VendingMachine", feature_of("  Scenario: The wrong reason
+    Given chips is out of stock
+    And Bowen has plenty of money
+    When Bowen selects chips
+    Then the machine asks for more money
+"), 100000)
+check("a rejection blamed on a clause that never fails is inconsistent", neg_reason[0], "inconsistent")
+check("the reason is reported as a mismatch", has_finding(scenario_findings(neg_reason, 0), "rejection_reason_mismatch"), true)
+
+let neg_accepted = zs_analyse_feature("VendingMachine", feature_of("  Scenario: Claimed rejection of an available snack
+    Given cookie is in stock
+    And Bowen has plenty of money
+    When Bowen selects cookie
+    Then the vending machine reports an out of stock
+"), 100000)
+check("a rejection the schema never makes is inconsistent", neg_accepted[0], "inconsistent")
+check("it is reported as contradicting the schema", has_finding(scenario_findings(neg_accepted, 0), "rejection_contradicts_schema"), true)
+
+let neg_unreachable = zs_analyse_feature("VendingMachine", feature_of("  Scenario: Chips that are in stock and out of stock
+    Given chips is in stock
+    When Bowen inserts 10 dollars
+    Then the vending machine reports something
+"), 100000)
+check("a negative scenario whose Given is unreachable is inconsistent", has_finding(scenario_findings(neg_unreachable, 0), "given_unreachable"), true)
+
+# ---- operations that can never run ----
+let ghost = zs_load("schema Ghosts
+state n
+init n = 0
+invariant n >= 0
+operation Tick()
+  require n < 5
+  ensure n' == n + 1
+end
+operation Ghost()
+  require n < 0
+  ensure n' == n
+end
+fact n is small => n < 10
+goal haunt => Ghost
+")
+check("the ghost schema loads", ghost[0], "ok")
+check("an operation that is never enabled is listed", zs_dead_ops("Ghosts", 100)[0], "Ghost")
+check("only that operation is listed", to_num(list_len(zs_dead_ops("Ghosts", 100))), 1)
+let haunted = zs_analyse_feature("Ghosts", "Feature: F
+  Someone wants to haunt
+
+  Scenario: S
+    Given n is small
+", 100)
+check("a goal operation that can never run is inconsistent", has_finding(haunted[1][3], "operation_never_enabled"), true)
+
+# ---- declarations for the new keywords ----
+make a function called err_line takes text returns n
+  let r = zs_load(text)
+  if r[0] != "error" then
+    return -1
+  end
+  return r[1][0]
+end
+let base = "schema S\nstate a\ninit a = 0\noperation Op(x)\n  require x > 0\n  ensure a' == a + x\nend\n"
+check("a do phrase naming no operation is rejected", err_line(base + "do call {x} => Nope(x)\n") > 0, true)
+check("a do phrase with the wrong argument count is rejected", err_line(base + "do call {x} => Op(x, x)\n") > 0, true)
+check("a then phrase with an unbound name is rejected", err_line(base + "then it is {x} => nothing == x\n") > 0, true)
+check("a reject phrase naming no require clause is rejected", err_line(base + "reject nothing works => x < 0\n") > 0, true)
+check("valid do, then and reject lines load", zs_load(base + "do call {x} => Op(x)\nthen it is {y} => a' == y\nreject it fails => x > 0\n")[0], "ok")
+
+t_report()

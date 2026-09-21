@@ -1,0 +1,363 @@
+# =============================================================================
+# zs_generate: generate Gherkin scenarios from a declared schema, instead of a
+# person writing them by hand -- the direction schemas-and-scenarios.html
+# names as unbuilt ("The Other Direction: Schema Suggesting Scenarios"),
+# after property-based testing's own idea of generating concrete cases from a
+# stated property.
+#
+# For one operation, zs_generate_feature produces one normal scenario (a
+# reachable state and input where the operation is enabled) and one scenario
+# per require clause (a reachable state and input where every OTHER clause
+# holds and that one alone fails) -- the same shape Liu's thesis and Shao's
+# dissertation both build by hand for their own vending-machine examples.
+# Each witness is found by searching the schema's own reachable states and
+# declared input domains, the same search zs_explore.patlang already runs;
+# this is that same search used to find a witness instead of a counterexample.
+#
+# What is printed, and the rule that keeps it honest: every word is either
+# fixed text the schema's author wrote (a fact/then/reject template, an
+# operation or clause name) or a value taken directly from the witness that
+# was found and independently checked. A fact is only used to phrase a Given
+# when every name its template captures is one of the operation's own inputs
+# (so there is a concrete value to print) and its expression is actually true
+# in that witness -- nothing is invented to fill a gap in the schema's own
+# vocabulary. A require clause with no independent witness (for instance one
+# implied by another, so it can never fail alone) is reported as unwitnessed
+# rather than given a fabricated scenario.
+#
+# The generated feature is not merely printed and trusted: running it back
+# through zs_analyse_feature against the same schema is how a caller confirms
+# the witnesses it found actually hold up, the same round-trip a synthesised
+# rule is checked against its own training data by re-running it.
+#
+# Result: ["ok", [feature_text, unwitnessed_clause_texts]]
+#   ["unknown_schema", [name]]   ["unknown_operation", [schema, op]]
+#   ["schema_unsound", [diagnosis]]
+# =============================================================================
+
+include "zs_feature.patlang"
+
+# The capture-name/value pairs needed to fill a template, given that every
+# capture the template declares is one of input_names (checked by the caller
+# with zf_generalised before this is used).
+make a function called zg_bindings_for takes template, input_names, tuple returns pairs
+  let caps = sm_parse_template(template)[1]
+  let out = []
+  let i = 0
+  let n = to_num(list_len(caps))
+  while i < n do
+    let idx = zs_index_of(input_names, caps[i])
+    let out = list_push(out, [caps[i], tuple[idx]])
+    let i = i + 1
+  end
+  return out
+end
+
+# Every declared fact that is both phraseable (every capture it names is one
+# of this operation's own inputs, or it names none) and true in env, as
+# [phrase, capture_names] in declaration order. capture_names is the
+# template's own captures (already guaranteed to be a subset of input_names
+# by eligibility): a fact naming one or more inputs pins their value for the
+# checker's own search the same way it would for a scenario a person wrote by
+# hand (schema_bdd's own convention, matching Liu's "Given cookie is in
+# stock" example, which names the very input the When step goes on to use) --
+# there is no separate notion of a "trigger" line the checker requires.
+make a function called zg_matched_facts takes entry, input_names, tuple, env returns lines
+  let out = []
+  let facts = entry[7]
+  let i = 0
+  let n = to_num(list_len(facts))
+  while i < n do
+    let template = facts[i][0]
+    if zf_generalised(template, input_names) then
+      ze_rt_clear()
+      if ze_eval(facts[i][2], env) == true then
+        let phrase = sm_fill(template, zg_bindings_for(template, input_names, tuple))
+        let out = list_push(out, [phrase, sm_parse_template(template)[1]])
+      end
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# Every name in b that is also in a.
+make a function called zg_union_covers takes names, wanted returns ok
+  let i = 0
+  let n = to_num(list_len(wanted))
+  while i < n do
+    if ze_names_has(names, wanted[i]) == false then
+      return false
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+# A declared `then` phrase for this operation whose expression holds between
+# env_before and env_after, or "" if none is both phraseable and true.
+make a function called zg_matched_then takes entry, input_names, tuple, env_before, env_after returns phrase
+  let thens = entry[12]
+  let i = 0
+  let n = to_num(list_len(thens))
+  while i < n do
+    let template = thens[i][0]
+    if zf_generalised(template, input_names) then
+      ze_rt_clear()
+      if ze_eval(thens[i][2], zs_concat(env_before, env_after)) == true then
+        return sm_fill(template, zg_bindings_for(template, input_names, tuple))
+      end
+    end
+    let i = i + 1
+  end
+  return ""
+end
+
+# A declared `reject` phrase naming exactly this require clause's own text,
+# filled if phraseable, or "" if none names it or it cannot be filled.
+make a function called zg_reject_phrase takes entry, clause_text, input_names, tuple returns phrase
+  let rejects = entry[15]
+  let i = 0
+  let n = to_num(list_len(rejects))
+  while i < n do
+    if rejects[i][1] == clause_text then
+      if zf_generalised(rejects[i][0], input_names) then
+        return sm_fill(rejects[i][0], zg_bindings_for(rejects[i][0], input_names, tuple))
+      end
+    end
+    let i = i + 1
+  end
+  return ""
+end
+
+# A declared `negative` marker, filled with the clause's own text wherever it
+# has a placeholder. zf_scenario_mode only looks for a match against zs_load's
+# negs/rejects templates, not at any expression, so filling a marker's
+# placeholder this way makes no claim that needs checking -- it exists purely
+# so the generated Then line is recognised as a rejection, the way a person's
+# own scenario would need to be. "" if the schema declares no negative marker
+# at all, in which case a generated rejection scenario cannot be told apart
+# from an ordinary positive one by the checker.
+make a function called zg_negative_marker_phrase takes entry, clause_text returns phrase
+  let negs = entry[9]
+  if to_num(list_len(negs)) == 0 then
+    return ""
+  end
+  let template = negs[0]
+  let caps = sm_parse_template(template)[1]
+  let bindings = []
+  let i = 0
+  let n = to_num(list_len(caps))
+  while i < n do
+    let bindings = list_push(bindings, [caps[i], clause_text])
+    let i = i + 1
+  end
+  return sm_fill(template, bindings)
+end
+
+# The first (state_index, tuple) where every require clause holds except
+# skip_index (-1 for none, meaning all must hold), and, if skip_index >= 0,
+# that one clause fails. Returns ["ok", state_index, tuple] or ["none"].
+make a function called zg_find_witness takes states, consts, state_names, prep_op, skip_index returns result
+  let input_names = prep_op[1]
+  let requires = prep_op[3]
+  let tuples = prep_op[2]
+  let si = 0
+  let sn = to_num(list_len(states))
+  while si < sn do
+    let env_state = zs_env_add(consts, state_names, states[si], "")
+    let ti = 0
+    let tn = to_num(list_len(tuples))
+    while ti < tn do
+      let env = zs_env_add(env_state, input_names, tuples[ti], "")
+      let ok = true
+      let ri = 0
+      let rn = to_num(list_len(requires))
+      while ri < rn do
+        let holds = ze_eval(requires[ri][1], env) == true
+        if ri == skip_index then
+          if holds then
+            let ok = false
+          end
+        elif holds == false then
+          let ok = false
+        end
+        let ri = ri + 1
+      end
+      if ok then
+        return ["ok", si, tuples[ti]]
+      end
+      let ti = ti + 1
+    end
+    let si = si + 1
+  end
+  return ["none"]
+end
+
+make a function called zg_indent takes lines, keyword_first returns text
+  let out = sb_new()
+  let i = 0
+  let n = to_num(list_len(lines))
+  while i < n do
+    if i == 0 then
+      sb_push(out, "  " + keyword_first + " " + lines[i] + "\n")
+    else
+      sb_push(out, "  And " + lines[i] + "\n")
+    end
+    let i = i + 1
+  end
+  return sb_str(out)
+end
+
+# One witness turned into a full "Scenario: ..." block. Returns [text,
+# fully_covered]: fully_covered is false when some input has no declared fact
+# naming it, so the synthetic fallback line was used -- that scenario is not
+# expected to round-trip back through zs_analyse_feature, since nothing in
+# the schema's own vocabulary describes choosing that input's value.
+make a function called zg_render_scenario takes entry, op_name, prep_op, states, consts, state_names, state_idx, tuple, violated returns result
+  let input_names = prep_op[1]
+  let env = zs_env_add(zs_env_add(consts, state_names, states[state_idx], ""), input_names, tuple, "")
+  let matched = zg_matched_facts(entry, input_names, tuple, env)
+
+  # A zero-capture Given is stated only for the normal scenario. There, by
+  # construction, every require clause holds, so a true zero-capture fact
+  # really is something the checker's necessity pass may treat as required
+  # for the operation to run. For a rejection scenario the witness only
+  # incidentally makes such a fact true (it played no part in choosing that
+  # witness), and stating it would tell the same necessity pass that it is
+  # required everywhere the operation is enabled -- which is not something
+  # this witness actually establishes, and not a claim the generator can
+  # honestly make. The reject phrase's Then line already explains why the
+  # operation is rejected without it.
+  let given = []
+  let when_lines = []
+  let covered = []
+  let m = 0
+  let mn = to_num(list_len(matched))
+  while m < mn do
+    if to_num(list_len(matched[m][1])) == 0 then
+      if violated == "" then
+        let given = list_push(given, matched[m][0])
+      end
+    else
+      let when_lines = list_push(when_lines, matched[m][0])
+      let covered = zs_concat(covered, matched[m][1])
+    end
+    let m = m + 1
+  end
+
+  let fully_covered = zg_union_covers(covered, input_names)
+  if fully_covered == false then
+    let n = to_num(list_len(input_names))
+    if n > 0 then
+      let b = sb_new()
+      sb_push(b, op_name + " is invoked with ")
+      let k = 0
+      while k < n do
+        if k > 0 then
+          sb_push(b, ", ")
+        end
+        sb_push(b, input_names[k] + " = " + ze_show(tuple[k]))
+        let k = k + 1
+      end
+      let when_lines = list_push(when_lines, sb_str(b))
+    else
+      let when_lines = list_push(when_lines, op_name + " is invoked")
+    end
+  end
+
+  let out = sb_new()
+  if violated == "" then
+    sb_push(out, "Scenario: " + op_name + " succeeds\n")
+    sb_push(out, zg_indent(given, "Given"))
+    sb_push(out, zg_indent(when_lines, "When"))
+    let phrase = zg_matched_then(entry, input_names, tuple, env, zs_env_add(entry[2], entry[1], zs_apply_effects(prep_op[5], states[state_idx], env), ""))
+    if phrase == "" then
+      let phrase = op_name + " succeeds"
+    end
+    sb_push(out, "  Then " + phrase + "\n")
+  else
+    sb_push(out, "Scenario: " + op_name + " is rejected: " + violated[0] + "\n")
+    sb_push(out, zg_indent(given, "Given"))
+    sb_push(out, zg_indent(when_lines, "When"))
+    let phrase = zg_reject_phrase(entry, violated[0], input_names, tuple)
+    if phrase == "" then
+      let phrase = zg_negative_marker_phrase(entry, violated[0])
+    end
+    if phrase == "" then
+      let phrase = op_name + " is rejected because " + violated[0] + " does not hold"
+    end
+    sb_push(out, "  Then " + phrase + "\n")
+  end
+  return [sb_str(out), fully_covered]
+end
+
+make a function called zs_generate_feature takes schema_name, op_name, max_states returns result
+  let entry = zs_entry(schema_name)
+  if type_of(entry) != "list" then
+    return ["unknown_schema", [schema_name]]
+  end
+  let bfs = zs_bfs(schema_name, max_states, "")
+  let diag = bfs[0]
+  if (diag[0] != "ok") and (diag[0] != "ok_bounded") then
+    return ["schema_unsound", [diag]]
+  end
+  let states = bfs[1]
+  let prep_op = zf_find_prepared(bfs[4], op_name)
+  if type_of(prep_op) != "list" then
+    return ["unknown_operation", [schema_name, op_name]]
+  end
+  let consts = entry[2]
+  let state_names = entry[1]
+  let requires = prep_op[3]
+
+  let body = sb_new()
+  let unwitnessed = []
+
+  let normal = zg_find_witness(states, consts, state_names, prep_op, -1)
+  if normal[0] == "ok" then
+    sb_push(body, zg_render_scenario(entry, op_name, prep_op, states, consts, state_names, normal[1], normal[2], "")[0])
+    sb_push(body, "\n")
+  else
+    let unwitnessed = list_push(unwitnessed, "(enabled at all)")
+  end
+
+  let ri = 0
+  let rn = to_num(list_len(requires))
+  while ri < rn do
+    let w = zg_find_witness(states, consts, state_names, prep_op, ri)
+    if w[0] == "ok" then
+      sb_push(body, zg_render_scenario(entry, op_name, prep_op, states, consts, state_names, w[1], w[2], [requires[ri][0]])[0])
+      sb_push(body, "\n")
+    else
+      let unwitnessed = list_push(unwitnessed, requires[ri][0])
+    end
+    let ri = ri + 1
+  end
+
+  let header = sb_new()
+  sb_push(header, "Feature: " + op_name + " (" + schema_name + ")\n")
+  let goal_text = zg_goal_text_for(entry, op_name)
+  if goal_text != "" then
+    sb_push(header, "  Someone wants to " + goal_text + "\n")
+  end
+  sb_push(header, "\n")
+  return ["ok", [sb_str(header) + sb_str(body), unwitnessed]]
+end
+
+# The declared goal text mapping to op_name, or "" if none names it. Needed
+# so the generated feature's narrative lets zs_analyse_feature find the same
+# goal-related operation back again (zf_parse_feature reads the goal from a
+# " wants to " sentence, the only place it looks).
+make a function called zg_goal_text_for takes entry, op_name returns text
+  let goals = entry[8]
+  let i = 0
+  let n = to_num(list_len(goals))
+  while i < n do
+    if goals[i][1] == op_name then
+      return goals[i][0]
+    end
+    let i = i + 1
+  end
+  return ""
+end

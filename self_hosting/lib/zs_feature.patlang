@@ -35,10 +35,24 @@
 #   - A schema that breaks its own invariants is reported before any feature
 #     is analysed (schema_unsound), since every later answer would rest on it.
 #
-# Scope, as in the thesis: only positive scenarios feed the checks. A scenario
-# whose Then matches a `negative` template is skipped and reported as skipped.
-# Facts are read as independent necessary conditions; the order they hold in,
-# and dependencies between them, are not modelled.
+# A scenario is read in one of three modes, by its steps:
+#   positive (the thesis's case): Given/When phrases are facts about the
+#     state, checked as above. Then phrases that match a `then` declaration are
+#     checked against the after-state the schema computes for every reachable
+#     instance the scenario covers (outcome_confirmed, or
+#     outcome_contradicts_schema with the instance); a Then phrase with no
+#     declared meaning is listed (unchecked_outcome), not ignored.
+#   negative: a Then phrase matching a `negative` or `reject` declaration. The
+#     thesis leaves these out. Here the scenario needs a reachable state where
+#     the facts hold and the goal operation is disabled (rejection_witnessed),
+#     and a `reject` phrase names the require clause expected to be among those
+#     that fail (rejection_reason_confirmed or _mismatch). If every such state
+#     accepts the operation the scenario contradicts the schema.
+#   sequence: When phrases matching a `do` declaration run operations. The
+#     schema executes the scenario step by step from every reachable state that
+#     satisfies its Given facts, checking each `then` claim on the state that
+#     step produced. The order of events is checked by running it.
+# Within a mode, facts are independent necessary conditions.
 #
 # Result: [tag, payload].
 #   ["consistent" | "inconsistent",
@@ -51,7 +65,18 @@
 #   given_unreachable []            no reachable state satisfies the facts
 #   contradicts_schema []           states satisfy them, the operation never runs
 #   witnessed [state_index, inputs, trace]   a reachable state where it does
-#   negative_skipped []
+#   outcome_confirmed [instances]   every covered instance has the claimed outcome
+#   outcome_contradicts_schema [then_template, then_expr, ...]
+#   unchecked_outcome [text]        a Then phrase with no declared meaning
+#   rejection_witnessed [state_index, inputs, failing_clauses, trace,
+#                        disabled_count, accepted_count]
+#   rejection_reason_confirmed [clause]   rejection_reason_mismatch [clause, failing]
+#   rejection_contradicts_schema [accepted_count]
+#   sequence_realised [starting_states, state_index, trace, operations_run]
+#   sequence_step_disabled [step_text, clause, state]
+#   sequence_step_violates [step_text, tag, detail]   sequence_fact_fails [text]
+#   operation_never_enabled [op]    (goal-level) no reachable state enables it
+#   negative_skipped []             (no longer produced; kept for old reports)
 #   requirement_not_in_schema [fact_template, fact_expr, trace, inputs]
 #       a reachable state (reached by trace) and input where the operation is
 #       enabled and the fact is false
@@ -62,7 +87,7 @@
 #   runtime_error [message]
 # =============================================================================
 
-include "zs_explore.patlang"
+include "zs_run.patlang"
 
 # ---- parsing a feature ----
 
@@ -164,9 +189,13 @@ make a function called zf_literal takes s returns v
   return to_num(s)
 end
 
-# [fact_index, captures] for the first fact whose template matches text, or [].
+# [index, captures] for the first entry of list (whose first field is a
+# template) matching text, or [].
 make a function called zf_match_fact takes entry, text returns hit
-  let facts = entry[7]
+  return zf_match_in(entry[7], text)
+end
+
+make a function called zf_match_in takes facts, text returns hit
   let i = 0
   let n = to_num(list_len(facts))
   while i < n do
@@ -274,6 +303,12 @@ end
 
 make a function called zf_is_blocking takes tag returns r
   if (tag == "unmapped_step") or (tag == "given_unreachable") or (tag == "contradicts_schema") or (tag == "requirement_not_in_schema") or (tag == "disjoint_from_schema") or (tag == "runtime_error") then
+    return true
+  end
+  if (tag == "outcome_contradicts_schema") or (tag == "rejection_contradicts_schema") or (tag == "rejection_reason_mismatch") or (tag == "operation_never_enabled") then
+    return true
+  end
+  if (tag == "sequence_step_disabled") or (tag == "sequence_step_violates") or (tag == "sequence_fact_fails") then
     return true
   end
   return false
@@ -411,6 +446,433 @@ make a function called zf_necessity takes entry, fact_index, caps, prep_op, stat
   return []
 end
 
+# The mode a scenario is read in: negative, sequence or positive.
+make a function called zf_scenario_mode takes entry, steps returns mode
+  let neg = false
+  let seq = false
+  let i = 0
+  let n = to_num(list_len(steps))
+  while i < n do
+    let phase = steps[i][0]
+    let text = steps[i][1]
+    if zf_matches_any(entry[9], text) then
+      let neg = true
+    end
+    if to_num(list_len(zf_match_in(entry[15], text))) > 0 then
+      let neg = true
+    end
+    if phase != "then" then
+      if to_num(list_len(zf_match_in(entry[11], text))) > 0 then
+        let seq = true
+      end
+    end
+    let i = i + 1
+  end
+  if neg then
+    return "negative"
+  end
+  if seq then
+    return "sequence"
+  end
+  return "positive"
+end
+
+# The require clause a scenario's `reject` phrase names, or "".
+make a function called zf_reject_clause takes entry, steps returns clause
+  let i = 0
+  let n = to_num(list_len(steps))
+  while i < n do
+    let hit = zf_match_in(entry[15], steps[i][1])
+    if to_num(list_len(hit)) > 0 then
+      return entry[15][hit[0]][1]
+    end
+    let i = i + 1
+  end
+  return ""
+end
+
+# The Then phrases of a positive scenario: [then_hits, findings], the findings
+# being unchecked_outcome for a phrase with no declared meaning.
+make a function called zf_collect_thens takes entry, steps returns result
+  let hits = []
+  let findings = []
+  let i = 0
+  let n = to_num(list_len(steps))
+  while i < n do
+    if steps[i][0] == "then" then
+      let hit = zf_match_in(entry[12], steps[i][1])
+      if to_num(list_len(hit)) == 0 then
+        let findings = list_push(findings, ["unchecked_outcome", [steps[i][1]]])
+      else
+        let hits = list_push(hits, hit)
+      end
+    end
+    let i = i + 1
+  end
+  return [hits, findings]
+end
+
+# The outcome claims of a positive scenario, checked against the after-state
+# the schema computes for every reachable instance the scenario covers: the
+# Given/When facts hold there and the goal operation is enabled.
+make a function called zf_outcome_check takes entry, matched, then_hits, prep_op, states, parents, vias, tick_fn returns findings
+  if to_num(list_len(then_hits)) == 0 then
+    return []
+  end
+  let consts = entry[2]
+  let state_names = entry[1]
+  let input_names = prep_op[1]
+  let all_caps = []
+  let m = 0
+  let mn = to_num(list_len(matched))
+  while m < mn do
+    let all_caps = zs_concat(all_caps, matched[m][1])
+    let m = m + 1
+  end
+  let q = 0
+  let qn = to_num(list_len(then_hits))
+  while q < qn do
+    let all_caps = zs_concat(all_caps, then_hits[q][1])
+    let q = q + 1
+  end
+  ze_rt_clear()
+  let count = 0
+  let si = 0
+  let sn = to_num(list_len(states))
+  while si < sn do
+    let env_state = zs_env_add(consts, state_names, states[si], "")
+    let tuples = prep_op[2]
+    let ti = 0
+    let tn = to_num(list_len(tuples))
+    while ti < tn do
+      if zf_tuple_consistent(tuples[ti], input_names, all_caps) then
+        if zs_tick_poll(tick_fn, si, sn, ti) == false then
+          return []
+        end
+        let env_op = zs_env_add(env_state, input_names, tuples[ti], "")
+        let env_facts = zs_concat(env_op, all_caps)
+        let holds = true
+        let f = 0
+        while (f < mn) and holds do
+          if ze_eval(entry[7][matched[f][0]][2], env_facts) != true then
+            let holds = false
+          end
+          let f = f + 1
+        end
+        if holds and (zs_first_failing(prep_op[3], env_op) < 0) then
+          let r = zs_run_op(entry, prep_op, states[si], tuples[ti])
+          if r[0] == "ok" then
+            let after = r[1][0]
+            let env_then = zs_env_add(env_facts, state_names, after, "'")
+            let t = 0
+            while t < qn do
+              let tf = entry[12][then_hits[t][0]]
+              if ze_eval(tf[2], env_then) != true then
+                if ze_rt_error() != "" then
+                  return [["runtime_error", [ze_rt_error()]]]
+                end
+                return [["outcome_contradicts_schema", [tf[0], tf[1], zs_trace(states, parents, vias, si), tuples[ti], after]]]
+              end
+              let t = t + 1
+            end
+            let count = count + 1
+          end
+        end
+      end
+      let ti = ti + 1
+    end
+    let si = si + 1
+  end
+  if ze_rt_error() != "" then
+    return [["runtime_error", [ze_rt_error()]]]
+  end
+  if count == 0 then
+    return []
+  end
+  return [["outcome_confirmed", [count]]]
+end
+
+# A negative scenario: some reachable state must satisfy its facts and disable
+# the goal operation, and a named reason must be among the clauses that fail.
+make a function called zf_negative_check takes entry, steps, prep_op, states, parents, vias, bounded, tick_fn returns findings
+  let findings = []
+  let matched = []
+  let i = 0
+  let n = to_num(list_len(steps))
+  while i < n do
+    if steps[i][0] != "then" then
+      let hit = zf_match_in(entry[7], steps[i][1])
+      if to_num(list_len(hit)) == 0 then
+        if zf_matches_any(entry[10], steps[i][1]) == false then
+          let findings = list_push(findings, ["unmapped_step", [steps[i][1]]])
+        end
+      else
+        let matched = list_push(matched, hit)
+      end
+    end
+    let i = i + 1
+  end
+  if zf_any_blocking(findings) then
+    return findings
+  end
+  let reason = zf_reject_clause(entry, steps)
+  let consts = entry[2]
+  let state_names = entry[1]
+  let input_names = prep_op[1]
+  let all_caps = []
+  let m = 0
+  let mn = to_num(list_len(matched))
+  while m < mn do
+    let all_caps = zs_concat(all_caps, matched[m][1])
+    let m = m + 1
+  end
+  ze_rt_clear()
+  let sat = false
+  let disabled_count = 0
+  let accepted_count = 0
+  let witness = []
+  let reason_hit = false
+  let sample = []
+  let si = 0
+  let sn = to_num(list_len(states))
+  while si < sn do
+    let env_state = zs_env_add(consts, state_names, states[si], "")
+    let tuples = prep_op[2]
+    let ti = 0
+    let tn = to_num(list_len(tuples))
+    while ti < tn do
+      if zf_tuple_consistent(tuples[ti], input_names, all_caps) then
+        if zs_tick_poll(tick_fn, si, sn, ti) == false then
+          return findings
+        end
+        let env_op = zs_env_add(env_state, input_names, tuples[ti], "")
+        let env_facts = zs_concat(env_op, all_caps)
+        let holds = true
+        let f = 0
+        while (f < mn) and holds do
+          if ze_eval(entry[7][matched[f][0]][2], env_facts) != true then
+            let holds = false
+          end
+          let f = f + 1
+        end
+        if holds then
+          let sat = true
+          let failing = zs_failing_clauses(prep_op[3], env_op)
+          if to_num(list_len(failing)) == 0 then
+            let accepted_count = accepted_count + 1
+          else
+            let disabled_count = disabled_count + 1
+            if to_num(list_len(witness)) == 0 then
+              let witness = [si, tuples[ti], failing, zs_trace(states, parents, vias, si)]
+            end
+            if reason != "" then
+              if ze_names_has(failing, reason) then
+                let reason_hit = true
+              end
+              if to_num(list_len(sample)) == 0 then
+                let sample = failing
+              end
+            end
+          end
+        end
+      end
+      let ti = ti + 1
+    end
+    let si = si + 1
+  end
+  if ze_rt_error() != "" then
+    return list_appended(findings, ["runtime_error", [ze_rt_error()]])
+  end
+  if sat == false then
+    if bounded then
+      return list_appended(findings, ["not_found_within_bound", []])
+    end
+    return list_appended(findings, ["given_unreachable", []])
+  end
+  if disabled_count == 0 then
+    if bounded then
+      return list_appended(findings, ["not_found_within_bound", []])
+    end
+    return list_appended(findings, ["rejection_contradicts_schema", [accepted_count]])
+  end
+  let findings = list_appended(findings, ["rejection_witnessed", [witness[0], witness[1], witness[2], witness[3], disabled_count, accepted_count]])
+  if reason != "" then
+    if reason_hit then
+      let findings = list_appended(findings, ["rejection_reason_confirmed", [reason]])
+    else
+      let findings = list_appended(findings, ["rejection_reason_mismatch", [reason, sample]])
+    end
+  end
+  return findings
+end
+
+# A sequence scenario: run it through the schema from every reachable state
+# that satisfies its Given facts. A frontier entry is [state, state_before_the
+# _last_operation, index_of_the_starting_state, operations_run].
+make a function called zf_sequence_check takes entry, steps, prep, states, parents, vias, bounded, tick_fn returns findings
+  let findings = []
+  let items = []
+  let i = 0
+  let n = to_num(list_len(steps))
+  while i < n do
+    let phase = steps[i][0]
+    let text = steps[i][1]
+    if phase == "then" then
+      let hit = zf_match_in(entry[12], text)
+      if to_num(list_len(hit)) == 0 then
+        let findings = list_push(findings, ["unchecked_outcome", [text]])
+      else
+        let items = list_push(items, ["then", hit[0], hit[1], text])
+      end
+    else
+      let dohit = []
+      if phase == "when" then
+        let dohit = zf_match_in(entry[11], text)
+      end
+      if to_num(list_len(dohit)) > 0 then
+        let items = list_push(items, ["do", dohit[0], dohit[1], text])
+      else
+        let fh = zf_match_in(entry[7], text)
+        if to_num(list_len(fh)) == 0 then
+          if zf_matches_any(entry[10], text) == false then
+            let findings = list_push(findings, ["unmapped_step", [text]])
+          end
+        else
+          let items = list_push(items, ["fact", fh[0], fh[1], text])
+        end
+      end
+    end
+    let i = i + 1
+  end
+  if zf_any_blocking(findings) then
+    return findings
+  end
+
+  let consts = entry[2]
+  let state_names = entry[1]
+  let frontier = []
+  let si = 0
+  let sn = to_num(list_len(states))
+  while si < sn do
+    let frontier = list_push(frontier, [states[si], states[si], si, []])
+    let si = si + 1
+  end
+  let ran = false
+  let k = 0
+  let kn = to_num(list_len(items))
+  while k < kn do
+    let it = items[k]
+    let kind = it[0]
+    let text = it[3]
+    let caps = it[2]
+    let next_frontier = []
+    ze_rt_clear()
+    if kind == "fact" then
+      let ast = entry[7][it[1]][2]
+      let e = 0
+      let en = to_num(list_len(frontier))
+      while e < en do
+        if zs_tick_poll(tick_fn, e, en, k) == false then
+          return findings
+        end
+        let env = zs_concat(zs_env_add(consts, state_names, frontier[e][0], ""), caps)
+        if ze_eval(ast, env) == true then
+          let next_frontier = list_push(next_frontier, frontier[e])
+        end
+        let e = e + 1
+      end
+      if ze_rt_error() != "" then
+        return list_appended(findings, ["runtime_error", [ze_rt_error()]])
+      end
+      if to_num(list_len(next_frontier)) == 0 then
+        if bounded then
+          return list_appended(findings, ["not_found_within_bound", [text]])
+        end
+        if ran then
+          return list_appended(findings, ["sequence_fact_fails", [text]])
+        end
+        return list_appended(findings, ["given_unreachable", []])
+      end
+    elif kind == "do" then
+      let dentry = entry[11][it[1]]
+      let op = zs_find_prepared(prep, dentry[1])
+      let env_c = zs_concat(consts, caps)
+      let args = []
+      let g = 0
+      let gn = to_num(list_len(dentry[2]))
+      while g < gn do
+        let args = list_push(args, ze_eval(dentry[2][g], env_c))
+        let g = g + 1
+      end
+      if ze_rt_error() != "" then
+        return list_appended(findings, ["runtime_error", [ze_rt_error()]])
+      end
+      let sample_clause = ""
+      let sample_state = []
+      let violation = []
+      let e = 0
+      let en = to_num(list_len(frontier))
+      while e < en do
+        if zs_tick_poll(tick_fn, e, en, k) == false then
+          return findings
+        end
+        let r = zs_run_op(entry, op, frontier[e][0], args)
+        if r[0] == "ok" then
+          let next_frontier = list_push(next_frontier, [r[1][0], frontier[e][0], frontier[e][2], list_appended(frontier[e][3], [dentry[1], args])])
+        elif r[0] == "disabled" then
+          if sample_clause == "" then
+            let sample_clause = r[1][0]
+            let sample_state = frontier[e][0]
+          end
+        else
+          if to_num(list_len(violation)) == 0 then
+            let violation = [r[0], r[1]]
+          end
+        end
+        let e = e + 1
+      end
+      if to_num(list_len(next_frontier)) == 0 then
+        if bounded then
+          return list_appended(findings, ["not_found_within_bound", [text]])
+        end
+        if sample_clause != "" then
+          return list_appended(findings, ["sequence_step_disabled", [text, sample_clause, sample_state]])
+        end
+        return list_appended(findings, ["sequence_step_violates", [text, violation[0], violation[1]]])
+      end
+      let ran = true
+    else
+      let tf = entry[12][it[1]]
+      let e = 0
+      let en = to_num(list_len(frontier))
+      while e < en do
+        if zs_tick_poll(tick_fn, e, en, k) == false then
+          return findings
+        end
+        let env_before = zs_env_add(consts, state_names, frontier[e][1], "")
+        let env = zs_concat(zs_env_add(env_before, state_names, frontier[e][0], "'"), caps)
+        if ze_eval(tf[2], env) == true then
+          let next_frontier = list_push(next_frontier, frontier[e])
+        end
+        let e = e + 1
+      end
+      if ze_rt_error() != "" then
+        return list_appended(findings, ["runtime_error", [ze_rt_error()]])
+      end
+      if to_num(list_len(next_frontier)) == 0 then
+        if bounded then
+          return list_appended(findings, ["not_found_within_bound", [text]])
+        end
+        return list_appended(findings, ["outcome_contradicts_schema", [tf[0], tf[1], frontier[0][1], frontier[0][0]]])
+      end
+    end
+    let frontier = next_frontier
+    let k = k + 1
+  end
+  let first = frontier[0]
+  return list_appended(findings, ["sequence_realised", [to_num(list_len(frontier)), first[2], zs_trace(states, parents, vias, first[2]), first[3]]])
+end
+
 make a function called zs_analyse_feature takes schema_name, feature_text, max_states returns result
   return zs_analyse_feature_ticked(schema_name, feature_text, max_states, "")
 end
@@ -427,7 +889,17 @@ make a function called zs_analyse_feature_ticked takes schema_name, feature_text
   let feature = zf_parse_feature(feature_text)
   let goal_text = feature[0]
   let op_name = zf_goal_op(entry, goal_text)
-  if op_name == "" then
+  let scenarios = feature[1]
+  let needs_goal = false
+  let mi = 0
+  let mn = to_num(list_len(scenarios))
+  while mi < mn do
+    if zf_scenario_mode(entry, scenarios[mi][1]) != "sequence" then
+      let needs_goal = true
+    end
+    let mi = mi + 1
+  end
+  if needs_goal and (op_name == "") then
     return ["unmapped_goal", [goal_text]]
   end
   let bfs = zs_bfs(schema_name, max_states, tick_fn)
@@ -442,43 +914,67 @@ make a function called zs_analyse_feature_ticked takes schema_name, feature_text
   let states = bfs[1]
   let parents = bfs[2]
   let vias = bfs[3]
-  let prep_op = zf_find_prepared(bfs[4], op_name)
-  let input_names = prep_op[1]
+  let prep_op = ""
+  let input_names = []
+  if op_name != "" then
+    let prep_op = zf_find_prepared(bfs[4], op_name)
+    let input_names = prep_op[1]
+  end
 
   let goal_findings = []
   if bounded then
     let goal_findings = list_push(goal_findings, ["bound_reached", [to_num(list_len(states))]])
   end
+  if (op_name != "") and (bounded == false) then
+    let oi = 0
+    let on_total = to_num(list_len(bfs[4]))
+    while oi < on_total do
+      if (bfs[4][oi][0] == op_name) and (bfs[5][oi] == 0) then
+        let goal_findings = list_push(goal_findings, ["operation_never_enabled", [op_name]])
+      end
+      let oi = oi + 1
+    end
+  end
   let reports = []
   let obligations = []
   let seen_keys = []
-  let scenarios = feature[1]
   let si = 0
   let sn = to_num(list_len(scenarios))
   while si < sn do
     let name = scenarios[si][0]
     let steps = scenarios[si][1]
-    let negative = false
-    let k = 0
-    let kn = to_num(list_len(steps))
-    while k < kn do
-      if zf_matches_any(entry[9], steps[k][1]) then
-        let negative = true
+    let mode = zf_scenario_mode(entry, steps)
+    zs_set_phase("checking scenario: " + name)
+    if mode == "negative" then
+      let fs = zf_negative_check(entry, steps, prep_op, states, parents, vias, bounded, tick_fn)
+      if zs_aborted() then
+        return ["aborted", [zs_phase()]]
       end
-      let k = k + 1
-    end
-    if negative then
-      let reports = list_push(reports, [name, "negative", [["negative_skipped", []]]])
+      let reports = list_push(reports, [name, "negative", fs])
+    elif mode == "sequence" then
+      let fs = zf_sequence_check(entry, steps, bfs[4], states, parents, vias, bounded, tick_fn)
+      if zs_aborted() then
+        return ["aborted", [zs_phase()]]
+      end
+      let reports = list_push(reports, [name, "sequence", fs])
     else
-      zs_set_phase("checking scenario: " + name)
       let r = zf_scenario_check(entry, steps, prep_op, states, parents, vias, bounded, tick_fn)
       if zs_aborted() then
         return ["aborted", [zs_phase()]]
       end
-      let reports = list_push(reports, [name, "positive", r[0]])
+      let fs = r[0]
+      let thens = zf_collect_thens(entry, steps)
+      let fs = zs_concat(fs, thens[1])
+      if zf_any_blocking(r[0]) == false then
+        let fs = zs_concat(fs, zf_outcome_check(entry, r[1], thens[0], prep_op, states, parents, vias, tick_fn))
+        if zs_aborted() then
+          return ["aborted", [zs_phase()]]
+        end
+      end
+      let reports = list_push(reports, [name, "positive", fs])
       let m = 0
-      let mn = to_num(list_len(r[1]))
-      while m < mn do
+      let mcount = to_num(list_len(r[1]))
+      while m < mcount do
         let idx = r[1][m][0]
         let caps = r[1][m][1]
         let template = entry[7][idx][0]
@@ -574,7 +1070,71 @@ make a function called zf_describe_finding takes finding returns lines
   if tag == "negative_skipped" then
     return ["    negative scenario, not checked (the thesis excludes negative scenarios)"]
   end
+  if tag == "outcome_confirmed" then
+    return ["    outcome confirmed: the schema computes the claimed result in all " + p[0] + " instance(s) the scenario covers"]
+  end
+  if tag == "outcome_contradicts_schema" then
+    return ["    the schema computes a different outcome from the claim: \"" + p[0] + "\" (" + p[1] + ")"]
+  end
+  if tag == "unchecked_outcome" then
+    return ["    outcome not checked, no meaning is declared for: " + p[0]]
+  end
+  if tag == "rejection_witnessed" then
+    return ["    rejection supported: the operation is disabled in " + p[4] + " instance(s) and accepted in " + p[5] + "; failing clause(s) in the first: " + zsr_join(p[2])]
+  end
+  if tag == "rejection_reason_confirmed" then
+    return ["    the named reason is among the failing clauses: " + p[0]]
+  end
+  if tag == "rejection_reason_mismatch" then
+    return ["    the named reason (" + p[0] + ") never fails where the operation is disabled; in the first disabled instance the failing clause(s) are: " + zsr_join(p[1])]
+  end
+  if tag == "rejection_contradicts_schema" then
+    return ["    the schema accepts the operation in all " + p[0] + " instance(s) the facts cover, so the scenario's rejection never happens"]
+  end
+  if tag == "sequence_realised" then
+    return ["    realised by running the schema from " + p[0] + " starting state(s); one run: " + zsr_ops(p[3])]
+  end
+  if tag == "sequence_step_disabled" then
+    return ["    the step \"" + p[0] + "\" is not enabled; the clause that fails is: " + p[1]]
+  end
+  if tag == "sequence_step_violates" then
+    return ["    the step \"" + p[0] + "\" runs but breaks a clause of the schema (" + p[1] + ")"]
+  end
+  if tag == "sequence_fact_fails" then
+    return ["    no state reached by the earlier steps satisfies: " + p[0]]
+  end
   return ["    " + tag]
+end
+
+make a function called zsr_join takes items returns text
+  let b = sb_new()
+  let i = 0
+  let n = to_num(list_len(items))
+  while i < n do
+    if i > 0 then
+      sb_push(b, "; ")
+    end
+    sb_push(b, items[i])
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+# The operations a sequence run performed, as "Op(args) then Op(args)".
+make a function called zsr_ops takes ran returns text
+  let b = sb_new()
+  let i = 0
+  let n = to_num(list_len(ran))
+  while i < n do
+    if i > 0 then
+      sb_push(b, " then ")
+    end
+    sb_push(b, ran[i][0])
+    sb_push(b, " with ")
+    sb_push(b, ze_show(ran[i][1]))
+    let i = i + 1
+  end
+  return sb_str(b)
 end
 
 # One string per line.
@@ -618,6 +1178,8 @@ make a function called zs_format_analysis takes result returns lines
     if fd[0] == "requirement_not_in_schema" then
       let out = list_push(out, "Requirement missing from the schema: \"" + fd[1][0] + "\" (" + fd[1][1] + ")")
       let out = list_push(out, "    " + p[1] + " is enabled with inputs " + ze_show(fd[1][3]) + " in a state reached by " + to_num(list_len(fd[1][2])) + " step(s), where that fact is false")
+    elif fd[0] == "operation_never_enabled" then
+      let out = list_push(out, "The goal operation " + fd[1][0] + " is not enabled in any state the schema can reach.")
     elif fd[0] == "disjoint_from_schema" then
       let out = list_push(out, "Fact reads nothing of the schema: \"" + fd[1][0] + "\"")
     elif fd[0] == "bound_reached" then
@@ -628,7 +1190,7 @@ make a function called zs_format_analysis takes result returns lines
     let g = g + 1
   end
   if tag == "consistent" then
-    let out = list_push(out, "Consistent: every fact is enforced by " + p[1] + ", and every positive scenario is realisable.")
+    let out = list_push(out, "Consistent: every fact is enforced by " + p[1] + ", and each scenario holds when the schema runs it.")
   else
     let out = list_push(out, "Inconsistent: the feature and the schema disagree.")
   end

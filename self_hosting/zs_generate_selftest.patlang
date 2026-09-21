@@ -1,0 +1,175 @@
+# Selftest for lib/zs_generate.patlang: generating Gherkin scenarios from a
+# declared schema instead of a person writing them by hand -- the direction
+# the schemas-and-scenarios page names as unbuilt ("The Other Direction:
+# Schema Suggesting Scenarios").
+#
+# Deterministic, no LLM: one normal scenario (the operation is enabled) and
+# one scenario per require clause (every OTHER clause holds, that one does
+# not), found by searching the schema's own reachable states and declared
+# input domains -- the same search zs_explore already does, reused here to
+# find witnesses instead of counterexamples.
+#
+# The real correctness property this must satisfy: feeding the generated
+# feature back into zs_analyse_feature against the SAME schema must report
+# it consistent. A generator that produced a scenario the schema itself
+# would reject would be worthless regardless of how natural it reads.
+#
+# Run from the repo root:
+#   rust-runtime/target/release/pat.exe --ir-run self_hosting/zs_generate_selftest.patlang
+
+include "lib/test.patlang"
+include "lib/zs_generate.patlang"
+
+make a function called vm_text returns text
+  return "schema VendingMachine
+state inventory, currentMoneyValue
+const snacks = set_of(\"cookie\", \"chocolate\", \"chips\")
+const price = map_of(\"cookie\", 5, \"chocolate\", 7, \"chips\", 3)
+const maxMoney = 20
+init inventory = map_of(\"cookie\", 2, \"chocolate\", 1, \"chips\", 0)
+init currentMoneyValue = 0
+domain item = snacks
+domain amount = set_of(1, 5, 10)
+invariant subset(dom(inventory), snacks)
+invariant currentMoneyValue >= 0 and currentMoneyValue <= maxMoney
+
+operation InsertMoney(amount)
+  require amount > 0
+  require currentMoneyValue + amount <= maxMoney
+  ensure currentMoneyValue' == currentMoneyValue + amount
+end
+
+operation BuyVM(item)
+  require item in snacks
+  require map_get_or(inventory, item, 0) > 0
+  require currentMoneyValue >= map_get(price, item)
+  ensure currentMoneyValue' == currentMoneyValue - map_get(price, item)
+  ensure inventory' == map_put(inventory, item, map_get(inventory, item) - 1)
+end
+
+fact {item} is in stock => map_get_or(inventory, item, 0) > 0
+fact the machine already holds some money => currentMoneyValue > 0
+fact Bowen selects {item} => item in snacks
+fact Bowen inserts {amount} dollars => amount > 0
+goal buy a snack with money => BuyVM
+goal insert money => InsertMoney
+negative the vending machine reports {reason}
+reject the vending machine reports {item} out of stock => map_get_or(inventory, item, 0) > 0
+"
+end
+
+make a function called count_occurrences takes text, needle returns n
+  let h = str_intern(text)
+  let hn = sc_len(h)
+  let count = 0
+  let i = 0
+  while i + sc_len(str_intern(needle)) <= hn do
+    if sm_at(h, hn, needle, i) then
+      let count = count + 1
+    end
+    let i = i + 1
+  end
+  return count
+end
+
+make a function called has_finding_zg takes unwitnessed, clause returns r
+  let i = 0
+  while i < to_num(list_len(unwitnessed)) do
+    if unwitnessed[i] == clause then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called has_finding_zg2 takes findings, tag returns r
+  let i = 0
+  while i < to_num(list_len(findings)) do
+    if findings[i][0] == tag then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+t_init()
+
+check("the vending machine schema loads", zs_load(vm_text())[0], "ok")
+
+# ---- BuyVM: three require clauses, so four scenarios (1 normal + 3 abnormal) ----
+let gen = zs_generate_feature("VendingMachine", "BuyVM", 100000)
+check("generation succeeds", gen[0], "ok")
+let feature_text = gen[1][0]
+check("the feature names the schema", contains_text(feature_text, "VendingMachine"), true)
+# BuyVM has three require clauses, but "item in snacks" can never fail on its
+# own: the operation's own domain for item IS snacks (domain item = snacks),
+# so every value the search can even try already satisfies it. One normal
+# scenario plus the two require clauses that DO have an independent witness.
+check("there are three scenarios (the tautological clause has none)", count_occurrences(feature_text, "Scenario:"), 3)
+check("one scenario is the normal case", count_occurrences(feature_text, "Scenario: BuyVM succeeds"), 1)
+check("the tautological clause is reported as unwitnessed, not given a fake scenario", has_finding_zg(gen[1][1], "item in snacks"), true)
+check("exactly one clause is unwitnessed", to_num(list_len(gen[1][1])), 1)
+
+# The parsed feature has the right shape.
+let parsed = zf_parse_feature(feature_text)
+check("three scenarios parse back out", to_num(list_len(parsed[1])), 3)
+
+# The round-trip property: analysing the generated feature against the same
+# schema must find it consistent -- the generator's own witnesses must
+# satisfy the schema it read them from.
+let checked = zs_analyse_feature("VendingMachine", feature_text, 100000)
+check("the generated feature is consistent with the schema it came from", checked[0], "consistent")
+let reports = checked[1][2]
+check("the normal scenario is read as positive and witnessed", reports[0][1], "positive")
+check("the normal scenario has a real witness", has_finding_zg2(reports[0][2], "witnessed"), true)
+check("the stock-violation scenario is read as negative, not positive", reports[1][1], "negative")
+check("the stock-violation scenario has a real disabled-state witness", has_finding_zg2(reports[1][2], "rejection_witnessed"), true)
+check("the money-violation scenario is also read as negative", reports[2][1], "negative")
+check("the money-violation scenario also has a real disabled-state witness", has_finding_zg2(reports[2][2], "rejection_witnessed"), true)
+
+
+# The Given side uses the schema's own fact vocabulary, not raw state dumps.
+check("the normal scenario states the item is in stock, in the analyst's own words", contains_text(feature_text, "is in stock"), true)
+check("a state-only fact with no captures is used too, not only input-matching ones", contains_text(feature_text, "already holds some money"), true)
+
+# The negative scenario for the stock clause reuses the declared reject phrasing.
+check("the stock violation uses the reject template", contains_text(feature_text, "reports"), true)
+check("the stock violation names the actual out-of-stock item", contains_text(feature_text, "out of stock"), true)
+
+# ---- InsertMoney: two require clauses, so three scenarios ----
+let gen2 = zs_generate_feature("VendingMachine", "InsertMoney", 100000)
+check("InsertMoney generation succeeds", gen2[0], "ok")
+# InsertMoney's own domain (set_of(1, 5, 10)) is entirely positive values, so
+# "amount > 0" is as tautological within it as "item in snacks" was for BuyVM:
+# one normal scenario plus the one require clause that DOES have a witness.
+check("InsertMoney gets two scenarios (amount > 0 is tautological in its own domain)", count_occurrences(gen2[1][0], "Scenario:"), 2)
+check("the tautological clause is reported, not faked", has_finding_zg(gen2[1][1], "amount > 0"), true)
+check("InsertMoney's generated feature is consistent with its schema", zs_analyse_feature("VendingMachine", gen2[1][0], 100000)[0], "consistent")
+
+# ---- a require clause with no independent witness is reported, not invented ----
+let unreachable_clause_schema = "schema Guarded
+state n
+init n = 0
+invariant n >= 0 and n <= 100
+domain step = set_of(1, 2, 3)
+operation Grow(step)
+  require n < 100
+  require n < 3
+  ensure n' == n + step
+end
+"
+check("a schema with a redundant precondition loads", zs_load(unreachable_clause_schema)[0], "ok")
+let redundant = zs_generate_feature("Guarded", "Grow", 100000)
+check("generation still succeeds", redundant[0], "ok")
+check("the redundant clause has no witness, and is reported rather than faked", has_finding_zg(redundant[1][1], "n < 100"), true)
+
+# ---- errors are reported, not guessed at ----
+check("an unknown schema is reported", zs_generate_feature("NoSuchSchema", "BuyVM", 100)[0], "unknown_schema")
+check("an unknown operation is reported", zs_generate_feature("VendingMachine", "Nope", 100)[0], "unknown_operation")
+let unsound = zs_load("schema Bad\nstate n\ninit n = 5\ninvariant n < 3\noperation Op()\n  ensure n' == n\nend\n")
+check("an unsound schema loads", unsound[0], "ok")
+check("generating from an unsound schema is refused", zs_generate_feature("Bad", "Op", 100)[0], "schema_unsound")
+
+t_report()
