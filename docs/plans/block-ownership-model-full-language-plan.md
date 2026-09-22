@@ -4,10 +4,14 @@
 design by contract, object orientation, cooperative fiber_yield, logic-
 programming facts, numeric tower, system integration) complete and
 verified — `self_hosting/block_model/run_block_model_spec_suite.patlang`
-reports 83/83 passing, no regressions. Phase 17 also corrected a wrong
-premise in this plan's own text (there is no generic `CallHost` dispatch
-in this engine at all — every host function needs individual recognition,
-the same as every earlier phase's own host-function work). Phase 13 also found and fixed two real,
+reports 83/83 passing, no regressions. Phase 18 (library-level parity)
+was genuinely attempted and genuinely fails, as real, checked evidence
+of how much further coverage remains — not a completed checkpoint; see
+its own section for the exact failure and what it traces to. Phase 17
+also corrected a wrong premise in this plan's own text (there is no
+generic `CallHost` dispatch in this engine at all — every host function
+needs individual recognition, the same as every earlier phase's own
+host-function work). Phase 13 also found and fixed two real,
 pre-existing bugs (`HandlerRegister`'s append-only behavior, and its own
 downstream exposure of already-filed issue #145's native x64 `list_set`
 aliasing bug) — see Phase 13's own section below for the full account.
@@ -527,6 +531,31 @@ specific code written for them at all.
 **Checkpoint:** the existing suites pass against the new engine unmodified,
 or every failure is traced back to a specific earlier phase and fixed
 there.
+
+**Attempted (2026-09-22), genuinely fails — a real, checked result, not a
+skipped phase.** Ran `self_hosting/lib/zs_schema.patlang` itself (the
+`zs_*` DSL's own parser/implementation file — real, unmodified library
+code, not a synthetic test) through `bm_lower_program`/`bi_run`.
+Result: `bm_lower(): does not support: expression shape 'Call'` — a
+generic, unrecognized function call, immediately, before any schema-
+specific logic is even reached.
+
+**Traced to specific, already-named earlier-phase gaps, per this
+checkpoint's own instruction — not a new, unexplained failure:** real
+library files use List literals (no `bm_lower_expr` support at all,
+named as a real gap since Phase 11's PGlob/PList exclusion), generic
+host-function calls beyond the individually-recognized set Phases 10–17
+built up one at a time (named repeatedly, most explicitly in Phase 17's
+own premise-correction), and very likely closures/classes-with-methods
+(Phase 13's own named exclusion) once past the first failure. This is
+exactly the signal the phase's own checkpoint anticipated: the language
+surface built so far (Phases 10–17) is real but still narrow, and real-
+world library code exercises far more of it than any single hand-picked
+scenario does. **Not remedied here** — doing so would mean building
+List-literal support and generic host-call dispatch, which are Phase 17's
+own already-named, separately-scoped follow-ups, not this phase's job.
+This phase's own result stands as recorded evidence of how much further
+coverage a genuine drop-in claim would need, not a completed checkpoint.
 
 ---
 
