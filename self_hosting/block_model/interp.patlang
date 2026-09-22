@@ -44,6 +44,37 @@ make a function called bm_ensure_heap_ready returns done
   return true
 end
 
+# Phase 4 (Fork B): a plain assoc-list, walked linearly -- the SAME shape
+# and cost profile as bm_loc_get/bm_loc_set above, just operating on a
+# runtime VALUE (the "__globals" pointer itself) rather than the
+# interpreter's own locals. No refcounted heap involved: a globals value
+# is ordinary program state threaded explicitly, not a mutation-
+# exclusivity concern (that's Box's own job).
+make a function called bm_rt_assoc_get takes assoc, key returns v
+  let n = list_len(assoc)
+  let i = 0
+  while i < n do
+    let entry = list_get(assoc, i)
+    if list_get(entry, 0) == key then
+      return list_get(entry, 1)
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called bm_rt_assoc_set takes assoc, key, v returns out
+  let n = list_len(assoc)
+  let i = 0
+  while i < n do
+    if list_get(list_get(assoc, i), 0) == key then
+      return list_set(assoc, i, [key, v])
+    end
+    let i = i + 1
+  end
+  return list_push(assoc, [key, v])
+end
+
 make a function called bm_loc_new returns locs
   return []
 end
@@ -246,6 +277,40 @@ make a function called bi_run_block takes prog, blk, locs returns outcome
     elif op == "ContractFail" then
       contract_check("bm_block", "assert", list_get(instr, 1), false)
       let pc = pc + 1
+    elif op == "GlobalGet" then
+      let popped_g = bm_st_pop(stack)
+      let globals_val = list_get(popped_g, 0)
+      let popped_k = bm_st_pop(list_get(popped_g, 1))
+      let stack = bm_st_push(list_get(popped_k, 1), bm_rt_assoc_get(globals_val, list_get(popped_k, 0)))
+      let pc = pc + 1
+    elif op == "GlobalSet" then
+      # Writes "__globals" directly (no push) -- see lower.patlang's own
+      # header on why this is what makes set_global(...) read like an
+      # ordinary ambient call at the source level.
+      let popped_g = bm_st_pop(stack)
+      let globals_val = list_get(popped_g, 0)
+      let popped_k = bm_st_pop(list_get(popped_g, 1))
+      let key = list_get(popped_k, 0)
+      let popped_v = bm_st_pop(list_get(popped_k, 1))
+      let stack = list_get(popped_v, 1)
+      let locs = bm_loc_set(locs, "__globals", bm_rt_assoc_set(globals_val, key, list_get(popped_v, 0)))
+      let pc = pc + 1
+    elif op == "HandlerNew" then
+      let stack = bm_st_push(stack, [])
+      let pc = pc + 1
+    elif op == "HandlerRegister" then
+      let popped_h = bm_st_pop(stack)
+      let handler = list_get(popped_h, 0)
+      let popped_n = bm_st_pop(list_get(popped_h, 1))
+      let popped_r = bm_st_pop(list_get(popped_n, 1))
+      let stack = bm_st_push(list_get(popped_r, 1), list_push(handler, [list_get(popped_n, 0), list_get(popped_r, 0)]))
+      let pc = pc + 1
+    elif op == "HandlerLookup" then
+      let popped_h = bm_st_pop(stack)
+      let handler = list_get(popped_h, 0)
+      let popped_n = bm_st_pop(list_get(popped_h, 1))
+      let stack = bm_st_push(list_get(popped_n, 1), bm_rt_assoc_get(handler, list_get(popped_n, 0)))
+      let pc = pc + 1
     elif op == "JumpBlock" then
       let target_name = list_get(instr, 1)
       let param_names = list_get(instr, 2)
@@ -285,7 +350,12 @@ end
 make a function called bi_run takes prog returns result
   set_var("bm_heap_ready", false)
   let cur = bi_find_block(prog, bi_program_entry(prog))
-  let locs = bm_loc_new()
+  # The entry block never has anything jumped INTO it, so the very first
+  # pointer's own globals-view section (section 3.2/3.3) is seeded here,
+  # once, as the program's true starting state -- every later block gets
+  # it purely by JumpBlock forwarding (lower.patlang's own doing), never
+  # by re-seeding.
+  let locs = bm_loc_set(bm_loc_new(), "__globals", [])
   while true do
     let outcome = bi_run_block(prog, cur, locs)
     if list_get(outcome, 0) == "halt" then

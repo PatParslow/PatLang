@@ -40,6 +40,35 @@
 # is always allowed (this phase's guarantee is about a block's incoming
 # pointer, not general alias tracking through arbitrary local reassignment --
 # that's the flight check's own, later job, Phase 7).
+#
+# Phase 4 adds Fork B's full elimination of ambient state, for real:
+#
+#   - set_global(name, value)/get_global(name) look, from the SOURCE's own
+#     point of view, exactly like today's ambient set_var/get -- but
+#     `__globals` is a HIDDEN parameter this lowerer appends to EVERY
+#     function's own param list (bm_lower_program, below) and to EVERY
+#     JumpBlock's own forwarded fields (bm_lower_jump_call, below), never
+#     written by the program itself. That's section 3.3's actual claim
+#     ("the PatLang source someone actually wrote... never changes")
+#     realized directly, not just described: a program using these two
+#     calls reads exactly like it always ambiently could, while every
+#     block boundary in between structurally carries the pointer, matching
+#     section 3.2's "everything reachable is in the one pointer, or is
+#     global" with globals now literally IN that one pointer.
+#
+#   - handler_new()/handler_register(h, name, ref)/handler_lookup(h, name)
+#     realize the OTHER half of Fork B: `new`/`send`'s deliberate-naming
+#     minority (docs/plans/block-ownership-model.md, section 6, Fork B).
+#     A handler is an ORDINARY value (an assoc-list, no refcounted heap
+#     involved) passed around EXPLICITLY like any other parameter --
+#     `handler_register` returns an UPDATED handler the caller re-Stores,
+#     the same "reassign to the result" convention as box_set/list_set.
+#     The ephemeral majority of that same fork (`new("Dict", "prefix_" +
+#     counter)`-style workarounds) has NOTHING further to build here: this
+#     engine's own Box (Phase 1-3) was designed from the start with no
+#     name parameter at all, so two independently created boxes are
+#     already, unconditionally, independent objects -- there was never a
+#     collision risk to demonstrate fixing, only to note the connection.
 
 include "block_ir.patlang"
 
@@ -109,6 +138,21 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
       let instrs = bm_lower_expr(target, instrs, block_names, immut_params)
       let instrs = bm_lower_expr(list_get(args, 1), instrs, block_names, immut_params)
       return list_push(instrs, ["BoxSet"])
+    elif name == "get_global" then
+      let instrs = bm_lower_expr(list_get(args, 0), instrs, block_names, immut_params)
+      let instrs = list_push(instrs, ["Load", "__globals"])
+      return list_push(instrs, ["GlobalGet"])
+    elif name == "handler_new" then
+      return list_push(instrs, ["HandlerNew"])
+    elif name == "handler_register" then
+      let instrs = bm_lower_expr(list_get(args, 2), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(list_get(args, 1), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(list_get(args, 0), instrs, block_names, immut_params)
+      return list_push(instrs, ["HandlerRegister"])
+    elif name == "handler_lookup" then
+      let instrs = bm_lower_expr(list_get(args, 1), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(list_get(args, 0), instrs, block_names, immut_params)
+      return list_push(instrs, ["HandlerLookup"])
     end
   end
   bm_lower_unsupported("expression shape '" + ty + "'")
@@ -121,6 +165,11 @@ end
 # param_name, in that order", so the callee's declared parameter names
 # double as the field names the jump populates, matching section 3.2's
 # "populated by name when the jump happens" exactly.
+# A Call to another declared block: lowers its args (each pushed, in
+# order), then an implicit extra push of the CURRENT "__globals" value
+# (never written at the source call site -- section 3.3's threading,
+# automatic here), then a single JumpBlock naming the callee's OWN param
+# list, which bm_lower_program has already appended "__globals" onto.
 make a function called bm_lower_jump_call takes call_node, instrs, block_names, blocks_by_name, immut_params returns out
   let target = list_get(call_node, 1)
   let args = list_get(call_node, 2)
@@ -133,6 +182,7 @@ make a function called bm_lower_jump_call takes call_node, instrs, block_names, 
     let instrs = bm_lower_expr(list_get(args, i), instrs, block_names, immut_params)
     let i = i + 1
   end
+  let instrs = list_push(instrs, ["Load", "__globals"])
   return list_push(instrs, ["JumpBlock", target, params])
 end
 
@@ -159,16 +209,26 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
     let call = list_get(node, 1)
     if list_get(call, 0) == "Call" then
       let name = list_get(call, 1)
+      let call_args = list_get(call, 2)
       if name == "print" then
-        let instrs = bm_lower_expr(list_get(list_get(call, 2), 0), instrs, block_names, immut_params)
+        let instrs = bm_lower_expr(list_get(call_args, 0), instrs, block_names, immut_params)
         return list_push(instrs, ["Print"])
-      elif (name == "box_set") or (name == "box_share") or (name == "box_new") or (name == "box_get") then
+      elif name == "set_global" then
+        # Statement-only (unlike get_global): auto-writes "__globals"
+        # directly, so it never leaves a value on the stack to consume --
+        # exactly matching how the real ambient set_var(...) is used
+        # today (a bare statement, never an expression).
+        let instrs = bm_lower_expr(list_get(call_args, 1), instrs, block_names, immut_params)
+        let instrs = bm_lower_expr(list_get(call_args, 0), instrs, block_names, immut_params)
+        let instrs = list_push(instrs, ["Load", "__globals"])
+        return list_push(instrs, ["GlobalSet"])
+      elif (name == "box_set") or (name == "box_share") or (name == "box_new") or (name == "box_get") or (name == "get_global") or (name == "handler_new") or (name == "handler_register") or (name == "handler_lookup") then
         return bm_lower_expr(call, instrs, block_names, immut_params)
       elif bm_list_contains(block_names, name) then
         return bm_lower_jump_call(call, instrs, block_names, blocks_by_name, immut_params)
       end
     end
-    bm_lower_unsupported("a call to anything other than print, a box_* builtin, or a declared block")
+    bm_lower_unsupported("a call to anything other than print, a box_*/global/handler builtin, or a declared block")
     return instrs
   elif ty == "Return" then
     let e = list_get(node, 1)
@@ -215,6 +275,11 @@ make a function called bm_lower_program takes ast returns prog
   # Pass 1: every declared function name, and its own empty-bodied BlockIR
   # (params only) -- built first so a jump to a function declared LATER in
   # source order still resolves during pass 2's actual body lowering.
+  # "__globals" is appended to EVERY block's own param list here, hidden
+  # from the source program entirely (section 3.3/Fork B) -- both passes
+  # append it identically so a block's own declared param list (used for
+  # box_set's mut-check, immut_params below) never includes it, while
+  # JumpBlock's field-name list (bi_block_params) always does.
   let block_names = []
   let blocks_by_name = []
   let i = 0
@@ -222,7 +287,7 @@ make a function called bm_lower_program takes ast returns prog
     let stmt = list_get(stmts, i)
     if list_get(stmt, 0) == "Func" then
       let name = list_get(stmt, 1)
-      let params = list_get(stmt, 2)
+      let params = list_push(list_get(stmt, 2), "__globals")
       let block_names = list_push(block_names, name)
       let blocks_by_name = list_push(blocks_by_name, [name, ["BlockIR", name, params, []]])
     end
@@ -241,16 +306,19 @@ make a function called bm_lower_program takes ast returns prog
     let stmt = list_get(stmts, i)
     if list_get(stmt, 0) == "Func" then
       let name = list_get(stmt, 1)
-      let params = list_get(stmt, 2)
+      let declared_params = list_get(stmt, 2)
+      let params = list_push(declared_params, "__globals")
       let body = list_get(stmt, 3)
       if entry == false then
         let entry = name
       end
+      # immut_params is computed from declared_params ONLY -- "__globals"
+      # is never a user-facing mut/immut target, just plumbing.
       let immut_params = []
-      let pn = list_len(params)
+      let pn = list_len(declared_params)
       let pi = 0
       while pi < pn do
-        let pname = list_get(params, pi)
+        let pname = list_get(declared_params, pi)
         if not bm_is_mut_param_name(pname) then
           let immut_params = list_push(immut_params, pname)
         end
