@@ -1,0 +1,122 @@
+# Block Ownership Model, Phase 6 (Fork E): real free-variable analysis
+# over a loop body, replacing Phase 5's wholesale-capture placeholder.
+#
+# Walks the restricted AST subset this engine actually supports (Num/
+# Str/Bool/Var/Bin/Un/Call, and Let/If/Expr/Return at the statement
+# level -- the same subset lower.patlang lowers), collecting every Var
+# reference not already bound by an EARLIER statement in the same walk,
+# recursively through if/else branches (a name bound only inside a
+# branch does not escape it, matching lower.patlang's own if-branch
+# scoping choice not to extend known_locals across an if).
+#
+# Scope note, disclosed rather than glossed over: docs/plans/
+# block-ownership-model-implementation-plan.md originally described this
+# pass serving BOTH closures and loop bodies. This engine never built
+# closures as a feature (Phases 1-5 never needed one), so there is only
+# one real consumer here: bm_lower_while's own wholesale placeholder.
+# Nothing about the analysis itself is closure-specific -- it would
+# apply unchanged the day a closure literal is added -- but claiming
+# this file "also handles closures" today would be describing code that
+# doesn't exist.
+
+make a function called bm_fv_list_contains takes xs, v returns yes
+  let n = list_len(xs)
+  let i = 0
+  while i < n do
+    if list_get(xs, i) == v then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called bm_fv_expr takes node, bound, free returns free
+  let ty = list_get(node, 0)
+  if ty == "Var" then
+    let name = list_get(node, 1)
+    if (not bm_fv_list_contains(bound, name)) and (not bm_fv_list_contains(free, name)) then
+      return list_push(free, name)
+    end
+    return free
+  elif ty == "Bin" then
+    let free = bm_fv_expr(list_get(node, 2), bound, free)
+    return bm_fv_expr(list_get(node, 3), bound, free)
+  elif ty == "Un" then
+    return bm_fv_expr(list_get(node, 2), bound, free)
+  elif ty == "Call" then
+    let args = list_get(node, 2)
+    let n = list_len(args)
+    let i = 0
+    while i < n do
+      let free = bm_fv_expr(list_get(args, i), bound, free)
+      let i = i + 1
+    end
+    return free
+  end
+  # Num/Str/Bool: no free references.
+  return free
+end
+
+make a function called bm_fv_stmt takes stmt, bound, free returns out
+  let ty = list_get(stmt, 0)
+  if ty == "Let" then
+    let free = bm_fv_expr(list_get(stmt, 2), bound, free)
+    let bound = list_push(bound, list_get(stmt, 1))
+    return [bound, free]
+  elif ty == "If" then
+    let free = bm_fv_expr(list_get(stmt, 1), bound, free)
+    let then_out = bm_fv_stmt_list(list_get(stmt, 2), bound, free)
+    let free = list_get(then_out, 1)
+    let else_out = bm_fv_stmt_list(list_get(stmt, 3), bound, free)
+    let free = list_get(else_out, 1)
+    return [bound, free]
+  elif ty == "Expr" then
+    let call = list_get(stmt, 1)
+    if list_get(call, 0) == "Call" then
+      let free = bm_fv_expr(call, bound, free)
+    end
+    return [bound, free]
+  elif ty == "Return" then
+    let free = bm_fv_expr(list_get(stmt, 1), bound, free)
+    return [bound, free]
+  end
+  return [bound, free]
+end
+
+make a function called bm_fv_stmt_list takes stmts, bound, free returns out
+  let n = list_len(stmts)
+  let i = 0
+  while i < n do
+    let result = bm_fv_stmt(list_get(stmts, i), bound, free)
+    let bound = list_get(result, 0)
+    let free = list_get(result, 1)
+    let i = i + 1
+  end
+  return [bound, free]
+end
+
+# The actual entry point: every name referenced in body_stmts that isn't
+# bound BY body_stmts itself -- callers (bm_lower_while) still intersect
+# this against known_locals, since a name free here but not in the
+# enclosing scope at all is a genuine unbound-variable bug, left for
+# bm_loc_get's existing runtime check to catch exactly as before, not
+# silently absorbed into "capture nothing" by this pass.
+make a function called bm_free_vars_of_body takes body_stmts returns free
+  let result = bm_fv_stmt_list(body_stmts, [], [])
+  return list_get(result, 1)
+end
+
+make a function called bm_intersect_preserving_order takes ordered, filter_set returns out
+  let n = list_len(ordered)
+  let result = []
+  let i = 0
+  while i < n do
+    let name = list_get(ordered, i)
+    if bm_fv_list_contains(filter_set, name) then
+      let result = list_push(result, name)
+    end
+    let i = i + 1
+  end
+  return result
+end
