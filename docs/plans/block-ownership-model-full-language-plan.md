@@ -16,8 +16,12 @@ now, ahead of Phase 19 as the plan itself permits — its own real
 decisions (a hard switch, gated on both full-suite parity and issues
 #145/#113 actually being fixed, not waived) are recorded, and acting on
 them is explicitly not yet authorized. Phase 19 (consolidated native x64
-+ WASM codegen for the whole new language surface) is the one phase of
-10–20 not yet started. Phase 13 also found and fixed two real,
++ WASM codegen) is scoped in real, checked detail (18 opcodes total need
+translation, a concrete per-opcode plan exists, one genuine open design
+question already resolved) but not implemented this session — the true
+remaining size is comparable to Phase 9's own original effort, not
+rushed past this plan's own RED/GREEN discipline. Phase 13 also found and
+fixed two real,
 pre-existing bugs (`HandlerRegister`'s append-only behavior, and its own
 downstream exposure of already-filed issue #145's native x64 `list_set`
 aliasing bug) — see Phase 13's own section below for the full account.
@@ -590,6 +594,60 @@ per paradigm (per this round's backend-cadence decision).
 Phases 2–18 passes identically on interpreter, native x64, and WASM —
 the same three-way parity bar Phase 9 already met for the restricted
 subset, now for the whole language.
+
+**Scoped and partially verified (2026-09-22); not completed this
+session — a real, sized remainder, not a vague "still TODO."**
+
+The true remaining scope, checked directly against
+`native_codegen.patlang`'s own header before estimating it, is larger
+than "the Phases 10–18 additions alone": that file's own header already
+named `BoxNew`/`BoxGet`/`BoxSet`/`BoxSetUnchecked`/`BoxShare`/
+`ContractFail`/`GlobalGet`/`GlobalSet`/`HandlerNew`/`HandlerRegister`/
+`HandlerLookup` as explicitly un-translated back in Phase 9 itself — this
+phase inherits that pre-existing gap on top of the 7 new opcodes Phases
+10–17 added (`Emit`, `FiberYield`, `Fact`, `Query`, `TypeOf`, `ReadFile`,
+`WriteFile`). **18 opcodes total need real x64 translation**, comparable
+in size to Phase 9's own original undertaking, which itself needed
+several real bug fixes along the way (the `JumpIfFalse`/`Jump` target-
+fixup bug, the `main`-collision issue, the `g_apply_table` gap) — not
+attempted in the same pass as writing this plan update, to avoid rushing
+untested native-codegen changes past this document's own established
+RED/GREEN/verify discipline.
+
+**One genuine open question was resolved before any implementation, so
+the next session can start directly rather than re-deriving it:** the
+real self-hosted `lower.patlang`'s own ordinary `Call` lowering
+(`lower_expr`'s `"Call"` arm) confirms args are pushed in **written
+order** (`args[0]` first, `args[1]` second, ...), consumed by
+`["Call", callee, argc]` — the same "push in the order the callee
+expects" convention this engine's own Box/Handler instructions already
+follow internally. This settles how each new opcode's translation should
+push its own args before calling the real underlying function.
+
+**Concrete per-opcode translation plan for the next session, each an
+ordinary `Call` against an already-proven-compilable real function
+(reusing Phase 1/3's own native heap and following `Print`'s established
+`Call`-vs-`CallHost` per-backend split), not new x64 emission code:**
+
+| Opcode(s) | Real function | Notes |
+|---|---|---|
+| `BoxNew` | `bm_alloc(8)` then `bm_box_write(ptr, v)` | two calls; needs a synthesized temp to hold `ptr` between them (the same `Store`/`Load`-temp pattern this session's own lowering work already uses repeatedly) |
+| `BoxGet` | `bm_box_read(ptr)` | one call |
+| `BoxSet` / `BoxSetUnchecked` | `bm_rc_touch_for_mutation(ptr)` + `bm_box_write` (checked) or `bm_box_write` alone (unchecked) | mirrors the interpreter's own branching logic, now as emitted `JumpIfFalse`/`Jump` around two `Call` paths instead of a PatLang `if` |
+| `BoxShare` | `bm_rc_inc(ptr)` | one call, pointer unchanged |
+| `ContractFail` | `contract_check(func_name, kind, text, false)` | a 4-arg `CallHost` — confirmed as the real convention lower.patlang itself already emits for `Assert`, not guessed |
+| `GlobalGet` / `GlobalSet` | plain list operations (`list_get`/`list_set`-equivalent on the globals value) | no heap.patlang involvement, ordinary list manipulation already proven to compile |
+| `HandlerNew` / `HandlerRegister` / `HandlerLookup` | ordinary list construction/lookup, mirroring `bm_rt_assoc_get`/`bm_rt_assoc_set`'s own logic (**note the Phase 13 fix**: use the `list_push`-rebuild form, never `list_set`, to avoid re-triggering issue #145 on native x64) | |
+| `Emit` | recursive call structurally mirrors `interp.patlang`'s own approach but needs a REAL native call mechanism where `interp.patlang` had none (Fork A) — the one opcode here that may need actual new design, not just a `Call` translation, named explicitly rather than assumed as easy as the rest |
+| `FiberYield` | `Call "fiber_yield", 1` | already proven to compile natively (`fiber_demo.patlang`'s own header states this backend works "interpreted, natively compiled... and compiled to threaded WASM") |
+| `Fact` / `Query` | `Call "fact", 3` / `Call "query", 3` | ordinary calls, already proven under `--ir-run`; native compilation not yet separately checked |
+| `TypeOf` / `ReadFile` / `WriteFile` | `Call "type_of"/"read_file"/"write_file", 1 or 2` | same pattern |
+
+**Not started:** the WASM re-verification pass, and the "watch for the
+same class of gotcha Phase 9 already hit" checkpoint item — both wait for
+the native x64 translation above to exist first, per the plan's own
+established sequencing (native before WASM, self-hosted-interpreter
+proof before either).
 
 ---
 
