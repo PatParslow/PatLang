@@ -1,10 +1,10 @@
 # Block Ownership Model: full-language expansion plan
 
-**Status (2026-09-22): Phases 10–15 (event dispatch, pattern matching,
+**Status (2026-09-22): Phases 10–16 (event dispatch, pattern matching,
 design by contract, object orientation, cooperative fiber_yield, logic-
-programming facts) complete and verified —
+programming facts, numeric tower) complete and verified —
 `self_hosting/block_model/run_block_model_spec_suite.patlang` reports
-78/78 passing, no regressions. Phase 13 also found and fixed two real,
+82/82 passing, no regressions. Phase 13 also found and fixed two real,
 pre-existing bugs (`HandlerRegister`'s append-only behavior, and its own
 downstream exposure of already-filed issue #145's native x64 `list_set`
 aliasing bug) — see Phase 13's own section below for the full account.
@@ -18,7 +18,7 @@ design, proof, and native/WASM verification) were already complete on
 `feature/block-ownership-model` — see
 [`block-ownership-model-implementation-plan.md`](block-ownership-model-implementation-plan.md)
 for that record, which this document continues rather than replaces.
-Phases 16–20 below are not built yet.**
+Phases 17–20 below are not built yet.**
 
 Companion to [`block-ownership-model.md`](block-ownership-model.md) (the
 design doc, Forks A–E) and the Phase 0–9 implementation plan. Those decided
@@ -427,6 +427,29 @@ restricted subset exercised.
 **Checkpoint:** the feature passes; any numeric type found to be
 heap-allocated has a refcount scenario analogous to Phase 1's, not just an
 arithmetic-correctness one.
+
+**Done (2026-09-22) — needed no new mechanism at all, checked before
+writing anything:** a probe run under `--ir-run` confirmed the self-
+hosted `parser.patlang` produces a single `"Num"` AST tag for every
+numeric literal (no separate `BigNumber`/`Float` shape), carrying only
+raw decimal text that `bm_lower_expr` already passes straight through to
+a `Const` instruction, evaluated via the real `to_num` — which already
+performs the full auto-promotion the real language defines.
+`bm_apply_bin`'s own `l + r` etc. are genuine PatLang operators too. Only
+`type_of(x)` was added, purely to make that claim independently
+checkable from a block-model program's own output.
+
+**Answer to the heap-allocation/refcount checkpoint question:** no
+refcount scenario is needed, and this isn't a gap — bigint/rational/
+complex values are ordinary PatLang runtime values living on the block
+model's own operand stack, never wrapped in *this engine's* Box/refcount
+mechanism (Phase 1) at all, since nothing ever calls `box_new` on them.
+More fundamentally, numbers are immutable value types: arithmetic always
+produces a *new* value rather than mutating one in place, so there is no
+exclusivity question to prove for them the way there is for `List`/
+`String`/objects — the same "sharing something nobody can change is
+always safe" property the design doc already states for read-only
+parameters. 4/4 scenarios pass; full suite 82/82, no regressions.
 
 ---
 
