@@ -69,6 +69,46 @@
 #     name parameter at all, so two independently created boxes are
 #     already, unconditionally, independent objects -- there was never a
 #     collision risk to demonstrate fixing, only to note the connection.
+#
+# Phase 5 adds `while` (section 4.1/4.2): a loop body becomes its own
+# synthesized block, entered by a genuine back edge -- the model's own
+# core mechanic (section 3.1-3.2) applied where the "next" block happens
+# to be the current one, exactly as section 4.1 describes. A synthesized
+# `__loop_exit_N` block, holding whatever textually followed the `while`
+# in source, is what makes this correct without a call stack: "continuing
+# after the loop" is exactly the same kind of jump target as "continuing
+# after a function call" was in Phase 2, so `while` is deliberately only
+# supported as the point a function's OWN body reaches, never nested
+# inside an if/else here -- bm_lower_top_level_stmt_list (the only place
+# that knows how to split a block at a `while`) is never called
+# recursively for an if-branch's own then/else lists, which still go
+# through the ORIGINAL bm_lower_stmt_list/bm_lower_stmt (unchanged) --
+# a `while` reached that way hits bm_lower_unsupported, named plainly, not
+# silently dropped.
+#
+# The loop's own `inherited` section (its synthesized block's own declared
+# params) is WHOLESALE capture -- every name known to be bound in the
+# enclosing function body BEFORE the `while` is reached (known_locals,
+# threaded alongside pending through bm_lower_top_level_stmt_list) --
+# matching section 4.1's own explicit decision to use Fork E's real
+# free-variable analysis eventually, with wholesale as this phase's own,
+# named placeholder (Phase 6 replaces it). A further, honest
+# simplification on top of that: known_locals is tracked ONLY at a
+# function's own top level, not descended into if-branches, so a `let`
+# introduced inside an if/else before a later top-level `while` is NOT
+# part of what gets captured -- a narrower wholesale than the real
+# lower_closure_literal's own (which tracks locals fully), but sufficient
+# to prove section 4.1's actual claim (a loop body is a block needing
+# closure-like capture, distinct from being a closure) without first
+# solving how two branches' own newly-bound names should merge.
+#
+# section 4.2's own claim is enforced as a natural consequence, not a
+# special case: a scratch `let` declared INSIDE the loop body extends
+# body_result's own known_locals for lowering the REST of that same
+# iteration's body, but the back-edge JumpBlock only ever forwards the
+# ORIGINAL captured set computed before the loop started -- so it can
+# never survive into the next iteration unless it was already part of
+# what's captured.
 
 include "block_ir.patlang"
 
@@ -255,6 +295,93 @@ make a function called bm_lower_stmt_list takes stmts, instrs, block_names, bloc
   return instrs
 end
 
+make a function called bm_next_synth_name takes prefix returns name
+  let n = get("__vars", "bm_synth_counter")
+  set_var("bm_synth_counter", n + 1)
+  return prefix + "_" + n
+end
+
+make a function called bm_push_loads takes instrs, names returns out
+  let n = list_len(names)
+  let i = 0
+  while i < n do
+    let instrs = list_push(instrs, ["Load", list_get(names, i)])
+    let i = i + 1
+  end
+  return instrs
+end
+
+# The ONLY place a `while` is recognized -- a function's own top level
+# (see this file's own header on why). Every non-While statement here
+# delegates straight to the ORIGINAL bm_lower_stmt (unchanged), so
+# everything Phases 2-4 already support keeps working identically; only
+# `let` additionally extends known_locals for a LATER while's own capture
+# set, and `while` itself hands off the statements after it to a
+# synthesized exit block rather than continuing this same loop.
+make a function called bm_lower_top_level_stmt_list takes stmts, start_idx, instrs, block_names, blocks_by_name, immut_params, known_locals, pending returns out
+  let n = list_len(stmts)
+  let i = start_idx
+  while i < n do
+    let stmt = list_get(stmts, i)
+    let ty = list_get(stmt, 0)
+    if ty == "While" then
+      return bm_lower_while(stmt, stmts, i, instrs, block_names, blocks_by_name, immut_params, known_locals, pending)
+    elif ty == "Let" then
+      let instrs = bm_lower_stmt(stmt, instrs, block_names, blocks_by_name, immut_params)
+      let known_locals = list_push(known_locals, list_get(stmt, 1))
+      let i = i + 1
+    else
+      let instrs = bm_lower_stmt(stmt, instrs, block_names, blocks_by_name, immut_params)
+      let i = i + 1
+    end
+  end
+  return [instrs, pending]
+end
+
+make a function called bm_lower_while takes stmt, stmts, idx, instrs, block_names, blocks_by_name, immut_params, known_locals, pending returns out
+  let cond = list_get(stmt, 1)
+  let body_stmts = list_get(stmt, 2)
+  let head_name = bm_next_synth_name("__loop_head")
+  let exit_name = bm_next_synth_name("__loop_exit")
+  let captured = known_locals
+  let jump_params = list_push(captured, "__globals")
+
+  # 1) At the current point in the CALLING block: enter the loop head for
+  #    the first time, forwarding captured's own current values.
+  let instrs = bm_push_loads(instrs, captured)
+  let instrs = list_push(instrs, ["Load", "__globals"])
+  let instrs = list_push(instrs, ["JumpBlock", head_name, jump_params])
+
+  # 2) The loop head block itself: cond; JumpIfFalse to the false-path
+  #    tail (position fixed up once known); the body; an unconditional
+  #    back edge to head_name; then the false-path tail (forward captured,
+  #    jump to exit_name) -- the SAME shape as an ordinary if/else with an
+  #    always-taken true branch (section 4.1: nothing new invented here).
+  let head_instrs = bm_lower_expr(cond, [], block_names, immut_params)
+  let head_instrs = list_push(head_instrs, ["JumpIfFalse", 0])
+  let jif_pos = list_len(head_instrs) - 1
+  let body_result = bm_lower_top_level_stmt_list(body_stmts, 0, head_instrs, block_names, blocks_by_name, immut_params, captured, pending)
+  let head_instrs = list_get(body_result, 0)
+  let pending = list_get(body_result, 1)
+  let head_instrs = bm_push_loads(head_instrs, captured)
+  let head_instrs = list_push(head_instrs, ["Load", "__globals"])
+  let head_instrs = list_push(head_instrs, ["JumpBlock", head_name, jump_params])
+  let head_instrs = list_set(head_instrs, jif_pos, ["JumpIfFalse", list_len(head_instrs)])
+  let head_instrs = bm_push_loads(head_instrs, captured)
+  let head_instrs = list_push(head_instrs, ["Load", "__globals"])
+  let head_instrs = list_push(head_instrs, ["JumpBlock", exit_name, jump_params])
+  let pending = list_push(pending, ["BlockIR", head_name, jump_params, head_instrs])
+
+  # 3) The loop exit block: same captured params, body = whatever
+  #    statements textually followed the while in the enclosing function.
+  let exit_result = bm_lower_top_level_stmt_list(stmts, idx + 1, [], block_names, blocks_by_name, immut_params, captured, pending)
+  let exit_instrs = list_get(exit_result, 0)
+  let pending = list_get(exit_result, 1)
+  let pending = list_push(pending, ["BlockIR", exit_name, jump_params, exit_instrs])
+
+  return [instrs, pending]
+end
+
 make a function called bm_assoc_get takes assoc, key returns v
   let n = list_len(assoc)
   let i = 0
@@ -269,6 +396,7 @@ make a function called bm_assoc_get takes assoc, key returns v
 end
 
 make a function called bm_lower_program takes ast returns prog
+  set_var("bm_synth_counter", 0)
   let stmts = list_get(ast, 1)
   let n = list_len(stmts)
 
@@ -324,8 +452,16 @@ make a function called bm_lower_program takes ast returns prog
         end
         let pi = pi + 1
       end
-      let instrs = bm_lower_stmt_list(body, [], block_names, blocks_by_name, immut_params)
+      let top_result = bm_lower_top_level_stmt_list(body, 0, [], block_names, blocks_by_name, immut_params, declared_params, [])
+      let instrs = list_get(top_result, 0)
+      let synthesized = list_get(top_result, 1)
       let blocks = list_push(blocks, ["BlockIR", name, params, instrs])
+      let sn = list_len(synthesized)
+      let si = 0
+      while si < sn do
+        let blocks = list_push(blocks, list_get(synthesized, si))
+        let si = si + 1
+      end
     end
     let i = i + 1
   end
