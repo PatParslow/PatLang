@@ -114,9 +114,26 @@
 # disclosed scope note (this engine never built closures, so there is
 # only one real consumer of it here, bm_lower_while -- nothing about the
 # analysis is closure-specific, but nothing here calls it for one either).
+#
+# Phase 7 adds (section 6, Fork C, wired in for real): flight_check
+# .patlang's own `fresh` tracking, threaded through
+# bm_lower_top_level_stmt_list (see its own Let-handling below), decides
+# whether a box_set call site is patched from BoxSet (Phase 3's runtime
+# refcount check) to BoxSetUnchecked (skip it -- proven safe statically).
+# See flight_check.patlang's own header for exactly how narrow that
+# proof is kept (a straight line of top-level statements only; anything
+# else -- if/else, while, a jump-call -- invalidates the whole set rather
+# than being reasoned through). `fresh` is deliberately NOT threaded into
+# bm_lower_expr's own signature for this: since only ONE call shape
+# (`let X = box_set(Y, ...)`) is ever eligible, patching the single
+# instruction bm_lower_stmt already emitted (always immediately before
+# the Store it also emits) is simpler and less error-prone than adding a
+# parameter to every one of bm_lower_expr's ~20 call sites for a decision
+# only one of them needs.
 
 include "block_ir.patlang"
 include "free_vars.patlang"
+include "flight_check.patlang"
 
 make a function called bm_is_mut_param_name takes name returns yes
   if name.length < 4 then
@@ -324,7 +341,7 @@ end
 # `let` additionally extends known_locals for a LATER while's own capture
 # set, and `while` itself hands off the statements after it to a
 # synthesized exit block rather than continuing this same loop.
-make a function called bm_lower_top_level_stmt_list takes stmts, start_idx, instrs, block_names, blocks_by_name, immut_params, known_locals, pending returns out
+make a function called bm_lower_top_level_stmt_list takes stmts, start_idx, instrs, block_names, blocks_by_name, immut_params, known_locals, pending, fresh returns out
   let n = list_len(stmts)
   let i = start_idx
   while i < n do
@@ -333,11 +350,32 @@ make a function called bm_lower_top_level_stmt_list takes stmts, start_idx, inst
     if ty == "While" then
       return bm_lower_while(stmt, stmts, i, instrs, block_names, blocks_by_name, immut_params, known_locals, pending)
     elif ty == "Let" then
+      let val_node = list_get(stmt, 2)
       let instrs = bm_lower_stmt(stmt, instrs, block_names, blocks_by_name, immut_params)
       let known_locals = list_push(known_locals, list_get(stmt, 1))
+      # Phase 7 (Fork C): if this Let's value was box_set(TARGET, ...) and
+      # TARGET is provably unique right now (flight_check.patlang's own
+      # `fresh` tracking), patch the BoxSet bm_lower_stmt just emitted
+      # (always the instruction right before the Store it also emitted)
+      # into BoxSetUnchecked -- simpler and far less error-prone than
+      # threading `fresh` through bm_lower_expr's entire recursive
+      # signature for the sake of this one call shape.
+      if (list_get(val_node, 0) == "Call") and (list_get(val_node, 1) == "box_set") then
+        let target_node = list_get(list_get(val_node, 2), 0)
+        if (list_get(target_node, 0) == "Var") and bm_fc_is_provably_unique(fresh, list_get(target_node, 1)) then
+          let boxset_pos = list_len(instrs) - 2
+          let instrs = list_set(instrs, boxset_pos, ["BoxSetUnchecked"])
+        end
+      end
+      let fresh = bm_fc_after_let(fresh, list_get(stmt, 1), val_node)
       let i = i + 1
     else
+      # If/Return/Expr (including a bare jump-call): conservatively
+      # invalidate `fresh` entirely -- this narrow, straight-line-only
+      # analysis doesn't reason through any of these (flight_check
+      # .patlang's own header).
       let instrs = bm_lower_stmt(stmt, instrs, block_names, blocks_by_name, immut_params)
+      let fresh = []
       let i = i + 1
     end
   end
@@ -373,7 +411,7 @@ make a function called bm_lower_while takes stmt, stmts, idx, instrs, block_name
   let head_instrs = bm_lower_expr(cond, [], block_names, immut_params)
   let head_instrs = list_push(head_instrs, ["JumpIfFalse", 0])
   let jif_pos = list_len(head_instrs) - 1
-  let body_result = bm_lower_top_level_stmt_list(body_stmts, 0, head_instrs, block_names, blocks_by_name, immut_params, captured, pending)
+  let body_result = bm_lower_top_level_stmt_list(body_stmts, 0, head_instrs, block_names, blocks_by_name, immut_params, captured, pending, [])
   let head_instrs = list_get(body_result, 0)
   let pending = list_get(body_result, 1)
   let head_instrs = bm_push_loads(head_instrs, captured)
@@ -387,7 +425,7 @@ make a function called bm_lower_while takes stmt, stmts, idx, instrs, block_name
 
   # 3) The loop exit block: same captured params, body = whatever
   #    statements textually followed the while in the enclosing function.
-  let exit_result = bm_lower_top_level_stmt_list(stmts, idx + 1, [], block_names, blocks_by_name, immut_params, captured, pending)
+  let exit_result = bm_lower_top_level_stmt_list(stmts, idx + 1, [], block_names, blocks_by_name, immut_params, captured, pending, [])
   let exit_instrs = list_get(exit_result, 0)
   let pending = list_get(exit_result, 1)
   let pending = list_push(pending, ["BlockIR", exit_name, jump_params, exit_instrs])
@@ -465,7 +503,7 @@ make a function called bm_lower_program takes ast returns prog
         end
         let pi = pi + 1
       end
-      let top_result = bm_lower_top_level_stmt_list(body, 0, [], block_names, blocks_by_name, immut_params, declared_params, [])
+      let top_result = bm_lower_top_level_stmt_list(body, 0, [], block_names, blocks_by_name, immut_params, declared_params, [], [])
       let instrs = list_get(top_result, 0)
       let synthesized = list_get(top_result, 1)
       let blocks = list_push(blocks, ["BlockIR", name, params, instrs])

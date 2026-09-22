@@ -36,6 +36,20 @@
 include "block_ir.patlang"
 include "heap.patlang"
 
+# Phase 7 (Fork C): a counter of how many times the RUNTIME refcount
+# check (BoxSet, not BoxSetUnchecked) actually fired -- the concrete,
+# measurable form of "most mutations should be proven safe before this
+# code ever runs" (design doc section 3.5). Seeded in bi_run, alongside
+# bm_heap_ready.
+make a function called bm_note_runtime_check_performed returns done
+  set_var("bm_runtime_check_count", get("__vars", "bm_runtime_check_count") + 1)
+  return true
+end
+
+make a function called bm_get_runtime_check_count returns n
+  return get("__vars", "bm_runtime_check_count")
+end
+
 make a function called bm_ensure_heap_ready returns done
   if get("__vars", "bm_heap_ready") == false then
     bm_heap_init()
@@ -259,6 +273,7 @@ make a function called bi_run_block takes prog, blk, locs returns outcome
       let popped_p = bm_st_pop(list_get(popped_v, 1))
       let ptr = list_get(popped_p, 0)
       let stack = list_get(popped_p, 1)
+      bm_note_runtime_check_performed()
       if bm_rc_touch_for_mutation(ptr) == 1 then
         bm_box_write(ptr, v)
         let stack = bm_st_push(stack, ptr)
@@ -267,6 +282,20 @@ make a function called bi_run_block takes prog, blk, locs returns outcome
         bm_box_write(newptr, v)
         let stack = bm_st_push(stack, newptr)
       end
+      let pc = pc + 1
+    elif op == "BoxSetUnchecked" then
+      # Only ever emitted by lower.patlang's own flight check
+      # (flight_check.patlang) at a call site it has PROVEN statically
+      # can only ever see refcount 1 -- skips bm_rc_touch_for_mutation
+      # and bm_note_runtime_check_performed entirely, always mutating in
+      # place. Same pop order as BoxSet.
+      let popped_v = bm_st_pop(stack)
+      let v = list_get(popped_v, 0)
+      let popped_p = bm_st_pop(list_get(popped_v, 1))
+      let ptr = list_get(popped_p, 0)
+      let stack = list_get(popped_p, 1)
+      bm_box_write(ptr, v)
+      let stack = bm_st_push(stack, ptr)
       let pc = pc + 1
     elif op == "BoxShare" then
       let popped = bm_st_pop(stack)
@@ -349,6 +378,7 @@ end
 # explicitly named.
 make a function called bi_run takes prog returns result
   set_var("bm_heap_ready", false)
+  set_var("bm_runtime_check_count", 0)
   let cur = bi_find_block(prog, bi_program_entry(prog))
   # The entry block never has anything jumped INTO it, so the very first
   # pointer's own globals-view section (section 3.2/3.3) is seeded here,

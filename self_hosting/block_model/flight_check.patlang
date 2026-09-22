@@ -1,0 +1,110 @@
+# Block Ownership Model, Phase 7 (Fork C): a bounded static analysis
+# proving, for SOME box_set call sites, that the target can only ever have
+# refcount 1 -- letting lower.patlang emit BoxSetUnchecked (skip the
+# runtime check entirely) instead of BoxSet (Phase 3's runtime fallback).
+#
+# Scope, kept deliberately narrow and stated plainly rather than
+# oversold: this tracks a `fresh` set (names PROVEN uniquely owned right
+# now) through a STRAIGHT LINE of top-level statements in ONE function
+# body ONLY -- the moment anything this analysis can't reason about
+# precisely is reached (an if/else, a while, a jump to another block), the
+# ENTIRE set is invalidated rather than reasoned about further. This is
+# maximally conservative, not a general points-to analysis (section 9's
+# own non-goal) -- it proves the easy, common case (create a box, mutate
+# it a few times in the same straight-line block, before anything else
+# happens) and honestly falls back to Phase 3's runtime check for
+# everything else, exactly matching Fork C's own hybrid resolution
+# (docs/plans/block-ownership-model.md, section 6): prove what's provable,
+# never reject a program outright, never claim more than what's actually
+# checked.
+#
+# What this does NOT attempt, named rather than silently absent: proving
+# anything about a value that arrived as a PARAMETER (the caller's own
+# aliasing state is invisible to a single block's own local analysis --
+# exactly the kind of cross-block reasoning Fork C's own downside #4
+# names as close to research territory in general); an equivalent of
+# "run_ir" firing the flight check again for a dynamically-compiled
+# fragment (this engine has no such dynamic-compilation entry point at
+# all -- there is nothing to wire this into for that case, not something
+# skipped).
+#
+# What this DOES prove, soundly: a box_set on a name is safe to leave
+# UNCHECKED if that name was bound, in this same straight-line run, by
+# `let X = box_new(...)` or `let X = box_set(...)` (a box_set's own result
+# is ALWAYS a uniquely-owned pointer, whether it mutated in place or
+# cloned -- either way nothing else could hold that exact returned
+# pointer yet), and has not been used as a jump-call argument or passed to
+# box_share since.
+
+make a function called bm_fc_list_without takes xs, v returns out
+  let n = list_len(xs)
+  let result = []
+  let i = 0
+  while i < n do
+    let item = list_get(xs, i)
+    if item != v then
+      let result = list_push(result, item)
+    end
+    let i = i + 1
+  end
+  return result
+end
+
+make a function called bm_fc_contains takes xs, v returns yes
+  let n = list_len(xs)
+  let i = 0
+  while i < n do
+    if list_get(xs, i) == v then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called bm_fc_is_provably_unique takes fresh, name returns yes
+  return bm_fc_contains(fresh, name)
+end
+
+# Updates `fresh` after lowering `let name = value_node`. box_new/box_set
+# results are always uniquely owned right after being bound (see this
+# file's own header); box_share's result never is, and its OWN argument
+# (the box being shared) is genuinely no longer provably unique either --
+# a real second live reference now exists via the returned pointer, and
+# bm_rc_inc really did bump the header count, so failing to invalidate it
+# here would be a new, real unsoundness, not an inherited one. Anything
+# else (an ordinary value, a plain `let c = b` copy) just clears whatever
+# `name` may have meant before.
+#
+# Named limitation, INHERITED from lower.patlang's own Phase 3/4 design,
+# not introduced here: a plain `let c = b` copy of an already-fresh box
+# pointer does not remove `b` from `fresh`, because it doesn't remove
+# it from being usable as a refcount-1 mutation target under the RUNTIME
+# check either -- lower.patlang's own header already discloses that
+# automatic refcounting on every value copy was never built (box_share is
+# the one explicit op that does), so a later box_set(b, ...) mutating in
+# place while `c` silently aliases it is a pre-existing gap in what the
+# runtime check itself can catch, not something this analysis makes
+# worse. This flight check's own soundness claim is relative to that
+# already-disclosed baseline: whatever the runtime check would also have
+# concluded, this analysis is not permitted to disagree with in the
+# unsafe direction.
+make a function called bm_fc_after_let takes fresh, name, value_node returns out
+  let fresh = bm_fc_list_without(fresh, name)
+  if list_get(value_node, 0) == "Call" then
+    let callee = list_get(value_node, 1)
+    let args = list_get(value_node, 2)
+    if (callee == "box_new") or (callee == "box_set") then
+      return list_push(fresh, name)
+    elif callee == "box_share" then
+      if list_len(args) > 0 then
+        let arg0 = list_get(args, 0)
+        if list_get(arg0, 0) == "Var" then
+          return bm_fc_list_without(fresh, list_get(arg0, 1))
+        end
+      end
+      return fresh
+    end
+  end
+  return fresh
+end
