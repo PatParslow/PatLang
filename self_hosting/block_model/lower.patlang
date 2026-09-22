@@ -24,10 +24,31 @@
 # build), closures (Phase 6), `Return EXPR` where EXPR is not a call to
 # another declared block (there is no call stack to return a value up
 # through yet -- see interp.patlang's own header on why), and calling
-# anything that isn't either `print` or another function declared in this
-# same program (no host-function dispatch beyond `print` in this phase).
+# anything that isn't either `print`/`box_new`/`box_get`/`box_set`/
+# `box_share` or another function declared in this same program (no
+# general host-function dispatch in this phase).
+#
+# Phase 3 adds box_new(v)/box_get(ptr)/box_set(ptr, v)/box_share(ptr) as
+# recognized Call expressions (section 3.4/3.5, Fork D wired in for real --
+# see block_ir.patlang's own header for the instructions and the `mut_`
+# parameter-name convention standing in for real `mut` param syntax).
+# box_set's own mut-check is deliberately narrow, matching section 3.4's
+# literal scope ("extend mut... to parameter declarations"): calling
+# box_set on a bare reference to one of THIS block's own declared
+# parameters is checked against that parameter's mut_-prefix; calling it
+# on an ordinary `let`-bound local, or on any other expression shape,
+# is always allowed (this phase's guarantee is about a block's incoming
+# pointer, not general alias tracking through arbitrary local reassignment --
+# that's the flight check's own, later job, Phase 7).
 
 include "block_ir.patlang"
+
+make a function called bm_is_mut_param_name takes name returns yes
+  if name.length < 4 then
+    return false
+  end
+  return substr(name, 0, 4) == "mut_"
+end
 
 make a function called bm_list_contains takes xs, v returns yes
   let n = list_len(xs)
@@ -46,7 +67,7 @@ make a function called bm_lower_unsupported takes what returns nothing
   return false
 end
 
-make a function called bm_lower_expr takes node, instrs, block_names returns out
+make a function called bm_lower_expr takes node, instrs, block_names, immut_params returns out
   let ty = list_get(node, 0)
   if ty == "Num" then
     return list_push(instrs, ["Const", "num", list_get(node, 1)])
@@ -57,12 +78,38 @@ make a function called bm_lower_expr takes node, instrs, block_names returns out
   elif ty == "Var" then
     return list_push(instrs, ["Load", list_get(node, 1)])
   elif ty == "Bin" then
-    let instrs = bm_lower_expr(list_get(node, 2), instrs, block_names)
-    let instrs = bm_lower_expr(list_get(node, 3), instrs, block_names)
+    let instrs = bm_lower_expr(list_get(node, 2), instrs, block_names, immut_params)
+    let instrs = bm_lower_expr(list_get(node, 3), instrs, block_names, immut_params)
     return list_push(instrs, ["Bin", list_get(node, 1)])
   elif ty == "Un" then
-    let instrs = bm_lower_expr(list_get(node, 2), instrs, block_names)
+    let instrs = bm_lower_expr(list_get(node, 2), instrs, block_names, immut_params)
     return list_push(instrs, ["Un", list_get(node, 1)])
+  elif ty == "Call" then
+    let name = list_get(node, 1)
+    let args = list_get(node, 2)
+    if name == "box_new" then
+      let instrs = bm_lower_expr(list_get(args, 0), instrs, block_names, immut_params)
+      return list_push(instrs, ["BoxNew"])
+    elif name == "box_get" then
+      let instrs = bm_lower_expr(list_get(args, 0), instrs, block_names, immut_params)
+      return list_push(instrs, ["BoxGet"])
+    elif name == "box_share" then
+      let instrs = bm_lower_expr(list_get(args, 0), instrs, block_names, immut_params)
+      return list_push(instrs, ["BoxShare"])
+    elif name == "box_set" then
+      let target = list_get(args, 0)
+      if (list_get(target, 0) == "Var") and bm_list_contains(immut_params, list_get(target, 1)) then
+        # Matches section 3.4's own original template exactly: a RUNTIME
+        # guaranteed-fail check at the violation point (only fails when
+        # this line actually executes), not a compile-time reject --
+        # consistent with how self_hosting/lib/lower.patlang's own
+        # immutable-reassignment check works (see that file's `Let` arm).
+        return list_push(instrs, ["ContractFail", "box_set on read-only parameter '" + list_get(target, 1) + "' (declare it `mut_" + list_get(target, 1) + "` to allow mutation)"])
+      end
+      let instrs = bm_lower_expr(target, instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(list_get(args, 1), instrs, block_names, immut_params)
+      return list_push(instrs, ["BoxSet"])
+    end
   end
   bm_lower_unsupported("expression shape '" + ty + "'")
   return instrs
@@ -74,7 +121,7 @@ end
 # param_name, in that order", so the callee's declared parameter names
 # double as the field names the jump populates, matching section 3.2's
 # "populated by name when the jump happens" exactly.
-make a function called bm_lower_jump_call takes call_node, instrs, block_names, blocks_by_name returns out
+make a function called bm_lower_jump_call takes call_node, instrs, block_names, blocks_by_name, immut_params returns out
   let target = list_get(call_node, 1)
   let args = list_get(call_node, 2)
   let target_blk = bm_assoc_get(blocks_by_name, target)
@@ -83,29 +130,29 @@ make a function called bm_lower_jump_call takes call_node, instrs, block_names, 
   let instrs = instrs
   let i = 0
   while i < n do
-    let instrs = bm_lower_expr(list_get(args, i), instrs, block_names)
+    let instrs = bm_lower_expr(list_get(args, i), instrs, block_names, immut_params)
     let i = i + 1
   end
   return list_push(instrs, ["JumpBlock", target, params])
 end
 
-make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_name returns out
+make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_name, immut_params returns out
   let ty = list_get(node, 0)
   if ty == "Let" then
-    let instrs = bm_lower_expr(list_get(node, 2), instrs, block_names)
+    let instrs = bm_lower_expr(list_get(node, 2), instrs, block_names, immut_params)
     return list_push(instrs, ["Store", list_get(node, 1)])
   elif ty == "If" then
     let cond = list_get(node, 1)
     let then_stmts = list_get(node, 2)
     let else_stmts = list_get(node, 3)
-    let instrs = bm_lower_expr(cond, instrs, block_names)
+    let instrs = bm_lower_expr(cond, instrs, block_names, immut_params)
     let instrs = list_push(instrs, ["JumpIfFalse", 0])
     let jif_pos = list_len(instrs) - 1
-    let instrs = bm_lower_stmt_list(then_stmts, instrs, block_names, blocks_by_name)
+    let instrs = bm_lower_stmt_list(then_stmts, instrs, block_names, blocks_by_name, immut_params)
     let instrs = list_push(instrs, ["Jump", 0])
     let jmp_pos = list_len(instrs) - 1
     let instrs = list_set(instrs, jif_pos, ["JumpIfFalse", list_len(instrs)])
-    let instrs = bm_lower_stmt_list(else_stmts, instrs, block_names, blocks_by_name)
+    let instrs = bm_lower_stmt_list(else_stmts, instrs, block_names, blocks_by_name, immut_params)
     let instrs = list_set(instrs, jmp_pos, ["Jump", list_len(instrs)])
     return instrs
   elif ty == "Expr" then
@@ -113,20 +160,22 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
     if list_get(call, 0) == "Call" then
       let name = list_get(call, 1)
       if name == "print" then
-        let instrs = bm_lower_expr(list_get(list_get(call, 2), 0), instrs, block_names)
+        let instrs = bm_lower_expr(list_get(list_get(call, 2), 0), instrs, block_names, immut_params)
         return list_push(instrs, ["Print"])
+      elif (name == "box_set") or (name == "box_share") or (name == "box_new") or (name == "box_get") then
+        return bm_lower_expr(call, instrs, block_names, immut_params)
       elif bm_list_contains(block_names, name) then
-        return bm_lower_jump_call(call, instrs, block_names, blocks_by_name)
+        return bm_lower_jump_call(call, instrs, block_names, blocks_by_name, immut_params)
       end
     end
-    bm_lower_unsupported("a call to anything other than print or a declared block")
+    bm_lower_unsupported("a call to anything other than print, a box_* builtin, or a declared block")
     return instrs
   elif ty == "Return" then
     let e = list_get(node, 1)
     if list_get(e, 0) == "Call" then
       let name = list_get(e, 1)
       if bm_list_contains(block_names, name) then
-        return bm_lower_jump_call(e, instrs, block_names, blocks_by_name)
+        return bm_lower_jump_call(e, instrs, block_names, blocks_by_name, immut_params)
       end
     end
     bm_lower_unsupported("`return EXPR` where EXPR isn't a call to a declared block (no call stack to return a value up through yet)")
@@ -136,11 +185,11 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
   return instrs
 end
 
-make a function called bm_lower_stmt_list takes stmts, instrs, block_names, blocks_by_name returns out
+make a function called bm_lower_stmt_list takes stmts, instrs, block_names, blocks_by_name, immut_params returns out
   let n = list_len(stmts)
   let i = 0
   while i < n do
-    let instrs = bm_lower_stmt(list_get(stmts, i), instrs, block_names, blocks_by_name)
+    let instrs = bm_lower_stmt(list_get(stmts, i), instrs, block_names, blocks_by_name, immut_params)
     let i = i + 1
   end
   return instrs
@@ -181,7 +230,10 @@ make a function called bm_lower_program takes ast returns prog
   end
 
   # Pass 2: lower each function's real body now that every target name is
-  # known, replacing each placeholder's empty instrs.
+  # known, replacing each placeholder's empty instrs. Each function's own
+  # immut_params (its declared params WITHOUT the `mut_` prefix) is
+  # recomputed here, per block -- box_set's mut-check only ever looks at
+  # THIS block's own parameter list, never a caller's or callee's.
   let blocks = []
   let entry = false
   let i = 0
@@ -194,7 +246,17 @@ make a function called bm_lower_program takes ast returns prog
       if entry == false then
         let entry = name
       end
-      let instrs = bm_lower_stmt_list(body, [], block_names, blocks_by_name)
+      let immut_params = []
+      let pn = list_len(params)
+      let pi = 0
+      while pi < pn do
+        let pname = list_get(params, pi)
+        if not bm_is_mut_param_name(pname) then
+          let immut_params = list_push(immut_params, pname)
+        end
+        let pi = pi + 1
+      end
+      let instrs = bm_lower_stmt_list(body, [], block_names, blocks_by_name, immut_params)
       let blocks = list_push(blocks, ["BlockIR", name, params, instrs])
     end
     let i = i + 1

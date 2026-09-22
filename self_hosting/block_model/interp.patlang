@@ -18,8 +18,31 @@
 # by bm_loc_get/bm_loc_set/bm_st_pop -- O(depth) per op, not O(input size):
 # fine for a prototype interpreter whose stack/locals depth is bounded by
 # one block's own expression complexity, never by program input.
+#
+# Phase 3 adds Box*/ContractFail (section 3.4/3.5, Fork D wired in for
+# real) via heap.patlang -- and heap.patlang's own functions are, in turn,
+# native-x64-only (they call mem_peek_qword/mem_poke_qword/rt_heap_alloc,
+# none of which self_hosting/lib/interp.patlang or rust-runtime/src/ir/
+# hosts.rs implement, checked directly, same as Phase 1's own finding).
+# `include`-ing heap.patlang here is harmless under --ir-run by itself
+# (just function definitions, never executed unless called); Phase 2's own
+# fixtures (which never use box_new/box_set) keep working unchanged under
+# the interpreter. Only a program that actually uses a Box instruction
+# needs native compilation -- bm_ensure_heap_ready's own lazy init (rather
+# than an unconditional call in bi_run) is what keeps that boundary real
+# instead of accidentally breaking Phase 2's suite the moment this file
+# was extended.
 
 include "block_ir.patlang"
+include "heap.patlang"
+
+make a function called bm_ensure_heap_ready returns done
+  if get("__vars", "bm_heap_ready") == false then
+    bm_heap_init()
+    set_var("bm_heap_ready", true)
+  end
+  return true
+end
 
 make a function called bm_loc_new returns locs
   return []
@@ -180,6 +203,49 @@ make a function called bi_run_block takes prog, blk, locs returns outcome
       let stack = list_get(popped, 1)
       print(list_get(popped, 0))
       let pc = pc + 1
+    elif op == "BoxNew" then
+      bm_ensure_heap_ready()
+      let popped = bm_st_pop(stack)
+      let ptr = bm_alloc(8)
+      bm_box_write(ptr, list_get(popped, 0))
+      let stack = bm_st_push(list_get(popped, 1), ptr)
+      let pc = pc + 1
+    elif op == "BoxGet" then
+      let popped = bm_st_pop(stack)
+      let stack = bm_st_push(list_get(popped, 1), bm_box_read(list_get(popped, 0)))
+      let pc = pc + 1
+    elif op == "BoxSet" then
+      # Pops (value, ptr) -- value was pushed AFTER ptr at the lowering
+      # site (block_ir.patlang's own header), so it's on top and pops
+      # first. section 3.5's actual ownership check: refcount 1 mutates
+      # this SAME cell in place; anything higher clones into a fresh cell
+      # and pushes THAT pointer instead, leaving the original (and
+      # whoever else holds it) untouched -- the caller must re-Store the
+      # result, exactly like list_set's own "reassign to the result"
+      # convention elsewhere in this codebase.
+      let popped_v = bm_st_pop(stack)
+      let v = list_get(popped_v, 0)
+      let popped_p = bm_st_pop(list_get(popped_v, 1))
+      let ptr = list_get(popped_p, 0)
+      let stack = list_get(popped_p, 1)
+      if bm_rc_touch_for_mutation(ptr) == 1 then
+        bm_box_write(ptr, v)
+        let stack = bm_st_push(stack, ptr)
+      else
+        let newptr = bm_alloc(8)
+        bm_box_write(newptr, v)
+        let stack = bm_st_push(stack, newptr)
+      end
+      let pc = pc + 1
+    elif op == "BoxShare" then
+      let popped = bm_st_pop(stack)
+      let ptr = list_get(popped, 0)
+      bm_rc_inc(ptr)
+      let stack = bm_st_push(list_get(popped, 1), ptr)
+      let pc = pc + 1
+    elif op == "ContractFail" then
+      contract_check("bm_block", "assert", list_get(instr, 1), false)
+      let pc = pc + 1
     elif op == "JumpBlock" then
       let target_name = list_get(instr, 1)
       let param_names = list_get(instr, 2)
@@ -217,6 +283,7 @@ end
 # previous block can leak forward except what a JumpBlock instruction
 # explicitly named.
 make a function called bi_run takes prog returns result
+  set_var("bm_heap_ready", false)
   let cur = bi_find_block(prog, bi_program_entry(prog))
   let locs = bm_loc_new()
   while true do
