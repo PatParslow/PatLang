@@ -281,6 +281,30 @@ silently mishandled) — real, separate future work, most plausibly via
 ordinary `Call` instructions to `heap.patlang`'s own already-compilable
 functions, which Phases 1 and 3 already proved compile correctly.
 
+## Self-hosting fixpoint, checked both directions
+
+Two claims this whole effort rests on, verified directly rather than
+assumed after Phase 9 landed:
+
+- **The interpreter can be interpreted to run code.** `pat.exe --ir-run`
+  (the Rust host interpreter) interprets `self_hosting/block_model/
+  {lower,interp}.patlang`'s own PatLang source, which in turn interprets
+  a block-model program — correct output, already exercised throughout
+  Phases 2–8, re-confirmed here as part of this check.
+- **The compiler can be compiled to compile code.** `native_codegen
+  .patlang` and its `tools/build_native.patlang` driver were themselves
+  compiled to a native executable via `patc1.exe`, and *that compiled
+  tool* was then run to translate `new_sum_loop_800000.patlang` into
+  real x64 — which assembled, linked, and ran to the exact correct
+  result (`319999600000`). This is the deeper, previously-untested half:
+  it confirms the Phase 9 toolchain isn't secretly dependent on staying
+  interpreted, the same way `patc1.exe` itself is a natively-compiled
+  tool despite being written in PatLang. No bugs turned up doing this —
+  the toolchain is built entirely from ordinary PatLang functions
+  reusing the same `emit_program_x64`/`lower_program` machinery
+  `patc1.exe` already relies on, so it was self-hostable without
+  further fixes.
+
 ## What this does and doesn't say about the design
 
 The Block Ownership Model's own claims (block/jump dispatch replacing
