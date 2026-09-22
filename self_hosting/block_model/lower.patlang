@@ -115,6 +115,25 @@
 # only one real consumer of it here, bm_lower_while -- nothing about the
 # analysis is closure-specific, but nothing here calls it for one either).
 #
+# Phase 12 adds `require`/`ensure`/`assert` (design-by-contract). The real
+# self-hosted lower.patlang lowers all three identically to a single
+# contract_check(func_name, kind, text, ok) host call -- this engine has
+# no generic host-function-call expression support yet (Phase 17's own
+# job), so this phase reuses the existing ContractFail instruction
+# (already used for immutable-reassignment and no-arm-matched failures)
+# behind a JumpIfFalse instead: same OBSERVABLE behaviour (aborts with a
+# named message when false, silently continues when true), not yet the
+# same host-call shape.
+#
+# Checked directly, not assumed: this is entirely independent of the
+# flight check (Fork C, Phase 7) -- that check's own bounded points-to/
+# shape analysis is sized to proving box_set mutation-exclusivity
+# specifically (see flight_check.patlang's own header) and has nothing to
+# say about an arbitrary boolean expression. A require/ensure/assert is
+# never subsumed by it, not "not yet wired up" -- see
+# spec_library/block_model/contracts.feature's own header for the same
+# note stated for the record.
+#
 # Phase 11 adds `match`/`case` (section 4.1's own "forks don't need their
 # own boundary" finding, verified there only for if/else -- this phase
 # checks it against Match too). Reuses the real self-hosted
@@ -311,11 +330,51 @@ make a function called bm_compile_pattern takes pattern, scrutinee_node returns 
   return [["Bool", "false"], []]
 end
 
+# Phase 12: a small pretty-printer for this engine's own restricted
+# expression shapes, mirroring what ast_to_source_text gives the real
+# contract_check its own diagnostic text from -- scoped to exactly the
+# expression kinds bm_lower_expr already understands (Num/Str/Bool/Var/
+# Bin/Un), not a general unparser.
+make a function called bm_expr_to_text takes node returns s
+  let ty = list_get(node, 0)
+  if ty == "Num" then
+    return "" + list_get(node, 1)
+  elif ty == "Str" then
+    return "\"" + list_get(node, 1) + "\""
+  elif ty == "Bool" then
+    return "" + list_get(node, 1)
+  elif ty == "Var" then
+    return list_get(node, 1)
+  elif ty == "Bin" then
+    return bm_expr_to_text(list_get(node, 2)) + " " + list_get(node, 1) + " " + bm_expr_to_text(list_get(node, 3))
+  elif ty == "Un" then
+    return list_get(node, 1) + bm_expr_to_text(list_get(node, 2))
+  end
+  return "<expr>"
+end
+
 make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_name, immut_params returns out
   let ty = list_get(node, 0)
   if ty == "Let" then
     let instrs = bm_lower_expr(list_get(node, 2), instrs, block_names, immut_params)
     return list_push(instrs, ["Store", list_get(node, 1)])
+  elif ty == "Assert" then
+    # require/ensure/assert -- kind is one of those three literal strings
+    # (see parser.patlang's own parse_stmt: `["Assert", tx, e[0]]`).
+    # `cond true` -> fall through; `cond false` -> ContractFail naming the
+    # kind and the condition's own source text, matching contract_check's
+    # own diagnostic shape as closely as this engine's instructions allow.
+    let kind = list_get(node, 1)
+    let cond = list_get(node, 2)
+    let instrs = bm_lower_expr(cond, instrs, block_names, immut_params)
+    let instrs = list_push(instrs, ["JumpIfFalse", 0])
+    let jif_pos = list_len(instrs) - 1
+    let instrs = list_push(instrs, ["Jump", 0])
+    let jmp_pos = list_len(instrs) - 1
+    let instrs = list_set(instrs, jif_pos, ["JumpIfFalse", list_len(instrs)])
+    let instrs = list_push(instrs, ["ContractFail", kind + " failed: " + bm_expr_to_text(cond)])
+    let instrs = list_set(instrs, jmp_pos, ["Jump", list_len(instrs)])
+    return instrs
   elif ty == "Match" then
     # Mirrors the real lower_match's own shape exactly: store the
     # scrutinee once (re-evaluating a side-effecting expression per arm
