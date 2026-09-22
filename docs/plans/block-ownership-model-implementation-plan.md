@@ -1,5 +1,14 @@
 # Block Ownership Model: implementation plan
 
+**Status (2026-09-22): Phases 0–8 complete and verified on
+`feature/block-ownership-model` (commits `9dc23d6`..`6e24fd1`; GitHub
+issues #135–143, all closed). Phase 9 (#144) is a deliberate, tracked
+deferral, not an oversight — see its own section below. Final suite
+state: `run_block_model_spec_suite.patlang` → 34 passed, 0 failed;
+Phase 1's separate native-only check
+(`refcounted_heap_native_check.sh`) → 7 passed, 0 failed. Nothing here
+is on `main`.**
+
 Companion to [`block-ownership-model.md`](block-ownership-model.md) (the design
 document, Forks A–E). That document decided *what*; this one decides *how to
 build it incrementally*, based on four architecture calls made on 2026-09-22:
