@@ -1,14 +1,18 @@
 # Block Ownership Model: full-language expansion plan
 
-**Status (2026-09-22): Phases 10–12 (event dispatch, pattern matching,
-design by contract) complete and verified —
+**Status (2026-09-22): Phases 10–13 (event dispatch, pattern matching,
+design by contract, object orientation) complete and verified —
 `self_hosting/block_model/run_block_model_spec_suite.patlang` reports
-63/63 passing, no regressions. Phases 0–9 (the restricted-subset design,
-proof, and native/WASM verification) were already complete on
-`feature/block-ownership-model` — see
+71/71 passing, no regressions. Phase 13 also found and fixed two real,
+pre-existing bugs (`HandlerRegister`'s append-only behavior, and its own
+downstream exposure of already-filed issue #145's native x64 `list_set`
+aliasing bug) — see Phase 13's own section below for the full account.
+Phases 0–9 (the restricted-subset design, proof, and native/WASM
+verification) were already complete on `feature/block-ownership-model` —
+see
 [`block-ownership-model-implementation-plan.md`](block-ownership-model-implementation-plan.md)
 for that record, which this document continues rather than replaces.
-Phases 13–20 below are not built yet.**
+Phases 14–20 below are not built yet.**
 
 Companion to [`block-ownership-model.md`](block-ownership-model.md) (the
 design doc, Forks A–E) and the Phase 0–9 implementation plan. Those decided
@@ -222,6 +226,42 @@ inheritance/trait resolution all at once.
 **Checkpoint:** all four scenario families pass, including the
 mut-on-fields question resolved with an explicit answer (not silently
 left as "works for lists only").
+
+**Done (2026-09-22), scoped down to fields only** — checked before
+writing code, not discovered as a gap afterward: methods and inheritance/
+traits are explicitly rejected (naming which one), since real methods
+need call-with-return dispatch this engine's only such mechanism (Emit)
+is deliberately too narrow for, and methods-as-closures need first-class
+closures this engine has never built. An object is a Box wrapping a
+Handler-shaped assoc-list — no new heap layout, and deliberately not the
+real engine's own name-keyed `new`/`class_def` mechanism (which Fork B
+already wants to move away from). Answer to the mut-on-fields question:
+**yes**, exactly — a field write literally calls `box_set` on the whole
+record, so it inherits Phase 3's refcount-checked mutate-in-place-vs-clone
+behavior with zero new mechanism.
+
+Debugging this phase found and fixed two real, pre-existing bugs, neither
+introduced here but both first exercised here:
+
+1. **`HandlerRegister` (Phase 4) was append-only.** Re-registering an
+   already-used key left a stale duplicate entry; `HandlerLookup`'s
+   forward scan kept returning the FIRST (stale) match, so no field write
+   through a Handler ever became visible. `object_handler.feature` never
+   caught it because it only ever registered two *different* names.
+   Fixed by routing through `bm_rt_assoc_set` (a real check-and-replace)
+   instead of a bare `list_push`.
+2. **That fix then directly exposed already-filed issue #145** (native
+   x64's `list_set` aliasing bug): `bm_rt_assoc_set`'s own in-place
+   `list_set` could corrupt an assoc-list's backing storage before
+   `BoxSet`'s clone-vs-mutate decision ever mattered — observed as an
+   aliased object's clone correctly getting the new value while the
+   *original* alias also showed it, instead of staying at the old value.
+   Fixed by rebuilding the assoc-list via `list_push` only, never
+   `list_set`, avoiding the buggy primitive rather than patching around
+   it. Also fixes latent, never-yet-exercised exposure in `GlobalSet`
+   (built on the same helper) for the same-key-set-twice case.
+
+4/4 scenarios pass; full suite 71/71, no regressions.
 
 ---
 
