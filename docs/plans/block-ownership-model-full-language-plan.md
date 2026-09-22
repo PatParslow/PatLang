@@ -1,14 +1,14 @@
 # Block Ownership Model: full-language expansion plan
 
-**Status (2026-09-22): Phase 10 (event dispatch) and Phase 11 (pattern
-matching) complete and verified —
+**Status (2026-09-22): Phases 10–12 (event dispatch, pattern matching,
+design by contract) complete and verified —
 `self_hosting/block_model/run_block_model_spec_suite.patlang` reports
-54/54 passing, no regressions. Phases 0–9 (the restricted-subset design,
+63/63 passing, no regressions. Phases 0–9 (the restricted-subset design,
 proof, and native/WASM verification) were already complete on
 `feature/block-ownership-model` — see
 [`block-ownership-model-implementation-plan.md`](block-ownership-model-implementation-plan.md)
 for that record, which this document continues rather than replaces.
-Phases 12–20 below are not built yet.**
+Phases 13–20 below are not built yet.**
 
 Companion to [`block-ownership-model.md`](block-ownership-model.md) (the
 design doc, Forks A–E) and the Phase 0–9 implementation plan. Those decided
@@ -172,6 +172,16 @@ statement itself can be lowered.
 
 **Checkpoint:** the feature passes; the flight-check-subsumption question
 above is answered one way or the other, not left ambiguous.
+
+**Done (2026-09-22).** Answer: no, never — the flight check's bounded
+points-to/shape analysis is sized to proving box_set mutation-exclusivity
+specifically and has nothing to say about an arbitrary boolean condition;
+the two are orthogonal concerns, not a "not yet wired up" gap. Implemented
+via the existing ContractFail instruction behind a JumpIfFalse rather than
+a real `contract_check` host call (this engine has no generic host-
+function-call expression support yet, Phase 17's job) — same observable
+behavior, not yet the same host-call shape, named plainly. 4/4 scenarios
+pass; full suite 63/63, no regressions.
 
 ---
 
