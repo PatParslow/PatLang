@@ -11,7 +11,13 @@ its own section for the exact failure and what it traces to. Phase 17
 also corrected a wrong premise in this plan's own text (there is no
 generic `CallHost` dispatch in this engine at all — every host function
 needs individual recognition, the same as every earlier phase's own
-host-function work). Phase 13 also found and fixed two real,
+host-function work). Phase 20 (migration/cutover design) is also written
+now, ahead of Phase 19 as the plan itself permits — its own real
+decisions (a hard switch, gated on both full-suite parity and issues
+#145/#113 actually being fixed, not waived) are recorded, and acting on
+them is explicitly not yet authorized. Phase 19 (consolidated native x64
++ WASM codegen for the whole new language surface) is the one phase of
+10–20 not yet started. Phase 13 also found and fixed two real,
 pre-existing bugs (`HandlerRegister`'s append-only behavior, and its own
 downstream exposure of already-filed issue #145's native x64 `list_set`
 aliasing bug) — see Phase 13's own section below for the full account.
@@ -631,6 +637,74 @@ above (not a leaning), and is reviewed before anything in it is acted on —
 per the branch-discipline note, nothing about this document authorizes
 touching `self_hosting/lib/*` on its own; that's a separate, later,
 explicit step even after this document is written.
+
+**Done (2026-09-22).** Written now, deliberately not waiting for Phase
+19 — this is a document, not code touching the old pipeline, and Phase
+18's own genuine, checked failure this session makes the real distance
+between "current coverage" and "drop-in replacement" concrete enough to
+decide against honestly, rather than a hypothetical to reason about in
+the abstract.
+
+**Decision — Acceptance gate.** The block-model engine is a genuine
+drop-in replacement only once **both**: (1) it passes the entire existing
+`spec_library/language/*.feature` suite (all 37 files) unmodified,
+matching what `run_language_spec_suite.patlang` already runs against
+today's pipeline, and (2) issues **#145 and #113 are actually fixed**,
+not waived. Not sufficient on its own: this session's own Phase 18
+result shows real library code (not just hand-picked scenarios) needs
+list-literal support, generic host-call dispatch, and almost certainly
+closures/classes-with-methods before (1) is even attemptable — so (1)
+alone, even if it somehow passed, would not yet mean real programs run.
+Waiving #145/#113 was considered and rejected: the entire motivating
+premise of this design (design doc §1) is fixing exactly those bugs: a
+"drop-in replacement" that still carries a known, silent aliasing
+correctness bug would be a regression dressed as a migration, not a
+genuine one.
+
+**Decision — Cutover shape.** A **hard switch**, once the acceptance gate
+above is met — not a dual-path window, and not permanent parallel
+existence. This project already carries one recurring maintenance
+burden of exactly this shape (the mirror-sync debt between
+`codegen.rs`/`runtime_rs.patlang` and the self-hosted grammar, per the
+`mirror-check` skill) purely from having two implementations that must
+agree. A dual-path window between the old pipeline and the block-model
+engine would open a *second*, structurally identical burden — keeping
+`codegen_x64.patlang` and `native_codegen.patlang` (once it exists,
+Phase 19) in sync indefinitely — for exactly as long as the window
+lasts. Given that this project has already lived the cost of one such
+burden, deliberately opening a second one as the default cutover shape
+isn't justified; a hard switch, gated on the acceptance criteria above
+actually being met, avoids it entirely.
+
+**Decision — Debugger, REPL, and `run_ir`.**
+- **Debugger**: carries over **unchanged**, not merely "expected to." Fork
+  A's own claim (pause/resume via `fiber_yield` is representation-
+  agnostic) is not a projection here — Phase 8 already built and proved
+  it directly on this engine's own `interp.patlang`, and Phase 14 proved
+  a block-model *program* can drive the same mechanism from the inside
+  too. Nothing further is needed for this piece specifically.
+- **REPL / playground `run_ir` fragment path**: does **not** carry over
+  automatically, and is a named **precondition for cutover**, not
+  something to discover missing afterward. `run_ir` compiles and runs a
+  fragment of IR *during* an already-running program with no whole-program
+  flight check ever having covered it (Fork C's own "before either path
+  begins" note already flagged this as a real gap). Before cutover, the
+  block-model engine needs its own equivalent: an on-demand
+  `bm_lower_program`-then-`bi_run` (or block-level equivalent) path,
+  with the flight check re-run for that fragment specifically, exactly as
+  Fork C originally specified. Until that exists, REPL/playground users
+  would silently lose fragment-level interaction at cutover — unacceptable
+  for a "drop-in" claim, so it blocks cutover rather than following it.
+
+**Decision — Sequencing.** This document is written now (see above), but
+**acting** on it — actually retiring anything under `self_hosting/lib/*`
+— is not authorized by anything above and does not start until: Phase
+19's three-way (interpreter/native x64/WASM) parity bar is met for the
+full language, the REPL/`run_ir` prerequisite above is built, and the
+acceptance gate's own two conditions are independently verified true.
+Given Phase 18's own result this session, that point is genuinely further
+away than "one more phase" — stated plainly here rather than implied to
+be imminent.
 
 ---
 
