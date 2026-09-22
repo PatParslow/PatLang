@@ -1,13 +1,14 @@
 # Block Ownership Model: full-language expansion plan
 
-**Status (2026-09-22): Phase 10 (event dispatch) complete and verified —
+**Status (2026-09-22): Phase 10 (event dispatch) and Phase 11 (pattern
+matching) complete and verified —
 `self_hosting/block_model/run_block_model_spec_suite.patlang` reports
-43/43 passing, no regressions in Phases 2–9. Phases 0–9 (the restricted-
-subset design, proof, and native/WASM verification) were already complete
-on `feature/block-ownership-model` — see
+54/54 passing, no regressions. Phases 0–9 (the restricted-subset design,
+proof, and native/WASM verification) were already complete on
+`feature/block-ownership-model` — see
 [`block-ownership-model-implementation-plan.md`](block-ownership-model-implementation-plan.md)
 for that record, which this document continues rather than replaces.
-Phases 11–20 below are not built yet.**
+Phases 12–20 below are not built yet.**
 
 Companion to [`block-ownership-model.md`](block-ownership-model.md) (the
 design doc, Forks A–E) and the Phase 0–9 implementation plan. Those decided
@@ -133,6 +134,15 @@ recursive list patterns.
 
 **Checkpoint:** the feature passes for all five pattern kinds plus the
 guard case.
+
+**Done (2026-09-22), scoped down from "all five pattern kinds" to four,
+checked before writing code, not discovered as a gap afterward:** PGlob
+and PList need expression primitives (a generic host-function call for
+`glob_match`, `Member`/`Index` plus real List values) that
+`bm_lower_expr` doesn't have yet — legitimately Phase 17 territory, not a
+shortcut. PWild/PBind/PLit/PCmp (with `when` guards) reuse the real
+`compile_pattern`/`lower_match` shape directly. 5/5 scenarios pass; full
+suite 54/54, no regressions.
 
 ---
 
