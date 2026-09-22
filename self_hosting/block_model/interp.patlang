@@ -92,16 +92,40 @@ make a function called bm_rt_assoc_get takes assoc, key returns v
 end
 
 make a function called bm_rt_assoc_set takes assoc, key, v returns out
+  # Phase 13 found this needed reworking while debugging why a cloned-on-
+  # alias object still showed the mutated value through BOTH references:
+  # `list_set` mutates shared native x64 storage IN PLACE when the
+  # underlying block has spare capacity (issue #145, already filed and
+  # confirmed elsewhere in this project) -- so the in-place `list_set`
+  # this used to do here could corrupt the ORIGINAL assoc-list's own
+  # backing storage before BoxSet's own clone-vs-mutate decision ever
+  # matters, independent of whether that decision picks "clone" or
+  # "in place". Rebuilding via list_push only (never list_set) avoids
+  # relying on a primitive with a known, already-filed native-x64
+  # aliasing bug, rather than reaching for a compensating workaround.
+  # This same fix benefits GlobalSet too (also built on this function) --
+  # its own existing tests never exercised setting the SAME key twice, so
+  # this exact bug was latent there as well, just not yet caught.
   let n = list_len(assoc)
+  let out = []
+  let replaced = false
   let i = 0
   while i < n do
-    if list_get(list_get(assoc, i), 0) == key then
-      return list_set(assoc, i, [key, v])
+    let entry = list_get(assoc, i)
+    if list_get(entry, 0) == key then
+      let out = list_push(out, [key, v])
+      let replaced = true
+    else
+      let out = list_push(out, entry)
     end
     let i = i + 1
   end
-  return list_push(assoc, [key, v])
+  if replaced then
+    return out
+  end
+  return list_push(out, [key, v])
 end
+
 
 make a function called bm_loc_new returns locs
   return []
@@ -365,11 +389,23 @@ make a function called bi_run_block takes prog, blk, locs returns outcome
       let stack = bm_st_push(stack, [])
       let pc = pc + 1
     elif op == 40752 then # "HandlerRegister"
+      # Phase 13 found a real, pre-existing Phase 4 bug here while
+      # debugging object field writes: this used a bare list_push (always
+      # APPEND), never checking for an existing entry under the same key.
+      # object_handler.feature never caught it because it only ever
+      # registered two DIFFERENT names ("alice"/"bob"); re-registering the
+      # SAME key (e.g. writing the same object field twice) left a stale
+      # duplicate entry, and HandlerLookup's own bm_rt_assoc_get scans
+      # forward and returns the FIRST match, so every later write silently
+      # never became visible. Fixed by reusing bm_rt_assoc_set (already
+      # defined above for GlobalSet's own use) -- a real check-and-replace,
+      # not a fudge: a Handler is meant to be a key/value map, and
+      # `list_push`-only was never a correct implementation of one.
       let popped_h = bm_st_pop(stack)
       let handler = list_get(popped_h, 0)
       let popped_n = bm_st_pop(list_get(popped_h, 1))
       let popped_r = bm_st_pop(list_get(popped_n, 1))
-      let stack = bm_st_push(list_get(popped_r, 1), list_push(handler, [list_get(popped_n, 0), list_get(popped_r, 0)]))
+      let stack = bm_st_push(list_get(popped_r, 1), bm_rt_assoc_set(handler, list_get(popped_n, 0), list_get(popped_r, 0)))
       let pc = pc + 1
     elif op == 841425 then # "HandlerLookup"
       let popped_h = bm_st_pop(stack)

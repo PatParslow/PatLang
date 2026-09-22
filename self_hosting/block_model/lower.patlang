@@ -115,6 +115,56 @@
 # only one real consumer of it here, bm_lower_while -- nothing about the
 # analysis is closure-specific, but nothing here calls it for one either).
 #
+# Phase 13 adds object orientation, scoped deliberately to FIELDS ONLY --
+# checked before writing code, not discovered as a gap afterward: real
+# methods need genuine call-with-return dispatch into user code (this
+# engine's only call-with-return mechanism, Phase 10's Emit, is
+# deliberately too narrow -- a handler can never itself call another
+# block), and real methods-as-closures need first-class closures, which
+# this engine has never built (see event_dispatch.feature's own note). A
+# `ClassDecl` declaring `inherits`/methods/traits is rejected plainly via
+# bm_lower_unsupported, not silently mishandled.
+#
+# An object is represented as a Box (Phase 1/3) wrapping a Handler-shaped
+# assoc-list (Phase 4) of field name/value pairs -- NOT a new heap layout.
+# This is a deliberate design choice, not a shortcut: it answers the plan's
+# own flagged "does mut extend to field writes" question directly (yes,
+# via the SAME box_set refcount-checked mutate-in-place-vs-clone mechanism
+# Phase 3 already proved, since writing a field literally IS calling
+# box_set on the object's own whole record), and it means Phase 13 needed
+# ZERO new heap/runtime primitives. `new("ClassName")` is resolved entirely
+# at LOWERING time against a compile-time class registry (bm_class_
+# registry, below) -- deliberately NOT the real engine's own runtime
+# `new`/`class_def`/OBJECTS-registry mechanism (a name-keyed global store
+# the design doc's own Fork B explicitly wants to move AWAY from, see
+# block-ownership-model.md section 6) -- so Phase 13's `new(...)` only
+# ever takes a single literal class-name string, no extra constructor args
+# and no compatibility with the OLDER `new("Class", "instance_name", ...)`
+# form.
+#
+# Since Box is native-x64-only (checked directly: `host fn 'rt_heap_alloc'
+# not found` under --ir-run, same finding Phase 1 already made), EVERY
+# scenario that actually constructs an object needs native x64 compilation
+# (the same `./patc1.exe ... --x64` two-step Phase 3/7 already established)
+# -- but the inherits/methods/traits REJECTION happens purely at lowering
+# time, before any Box instruction is ever emitted, so those fixtures run
+# fine under the plain interpreter.
+make a function called bm_class_registry_set takes registry, name, fields returns out
+  let n = list_len(registry)
+  let i = 0
+  while i < n do
+    if list_get(list_get(registry, i), 0) == name then
+      return list_set(registry, i, [name, fields])
+    end
+    let i = i + 1
+  end
+  return list_push(registry, [name, fields])
+end
+
+make a function called bm_class_fields takes class_name returns fields
+  return bm_assoc_get(get("__vars", "bm_class_registry"), class_name)
+end
+
 # Phase 12 adds `require`/`ensure`/`assert` (design-by-contract). The real
 # self-hosted lower.patlang lowers all three identically to a single
 # contract_check(func_name, kind, text, ok) host call -- this engine has
@@ -238,10 +288,52 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
   elif ty == "Un" then
     let instrs = bm_lower_expr(list_get(node, 2), instrs, block_names, immut_params)
     return list_push(instrs, ["Un", list_get(node, 1)])
+  elif ty == "Member" then
+    # obj.prop (read) -- reuses HandlerLookup exactly: an object's own
+    # payload (once BoxGet'd) IS a Handler-shaped assoc-list (Phase 13's
+    # own header note above). Pop order matches handler_lookup's own Call
+    # case below: name pushed first (bottom), handler pushed second (top).
+    let obj_node = list_get(node, 1)
+    let prop = list_get(node, 2)
+    let instrs = list_push(instrs, ["Const", "str", prop])
+    let instrs = bm_lower_expr(obj_node, instrs, block_names, immut_params)
+    let instrs = list_push(instrs, ["BoxGet"])
+    return list_push(instrs, ["HandlerLookup"])
   elif ty == "Call" then
     let name = list_get(node, 1)
     let args = list_get(node, 2)
-    if name == "box_new" then
+    if name == "new" then
+      # Phase 13: new("ClassName") only -- see this file's own header for
+      # why this deliberately doesn't match the real engine's own runtime
+      # new/class_def/OBJECTS-registry mechanism.
+      let class_name_node = list_get(args, 0)
+      if list_get(class_name_node, 0) != "Str" then
+        bm_lower_unsupported("new(...) with a non-literal class name (Phase 13 requires new(\"ClassName\") with a literal string)")
+        return instrs
+      end
+      let class_name = list_get(class_name_node, 1)
+      let fields = bm_class_fields(class_name)
+      if fields == false then
+        bm_lower_unsupported("new(\"" + class_name + "\") -- no class named '" + class_name + "' was declared with `class " + class_name + " do ... end` (Phase 13 does not support the older name-registry new(...) form)")
+        return instrs
+      end
+      let tmp = bm_next_synth_name("__newobj")
+      let instrs = list_push(instrs, ["HandlerNew"])
+      let instrs = list_push(instrs, ["Store", tmp])
+      let flds_n = list_len(fields)
+      let fi = 0
+      while fi < flds_n do
+        let fld = list_get(fields, fi)
+        let instrs = bm_lower_expr(list_get(fld, 1), instrs, block_names, immut_params)
+        let instrs = list_push(instrs, ["Const", "str", list_get(fld, 0)])
+        let instrs = list_push(instrs, ["Load", tmp])
+        let instrs = list_push(instrs, ["HandlerRegister"])
+        let instrs = list_push(instrs, ["Store", tmp])
+        let fi = fi + 1
+      end
+      let instrs = list_push(instrs, ["Load", tmp])
+      return list_push(instrs, ["BoxNew"])
+    elif name == "box_new" then
       let instrs = bm_lower_expr(list_get(args, 0), instrs, block_names, immut_params)
       return list_push(instrs, ["BoxNew"])
     elif name == "box_get" then
@@ -375,6 +467,57 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
     let instrs = list_push(instrs, ["ContractFail", kind + " failed: " + bm_expr_to_text(cond)])
     let instrs = list_set(instrs, jmp_pos, ["Jump", list_len(instrs)])
     return instrs
+  elif ty == "MemberAssign" then
+    # obj.prop = value -- reuses box_set's OWN mut-check and refcount
+    # mutate-in-place-vs-clone mechanism unmodified (Phase 13's own header
+    # note: writing a field literally IS calling box_set on the object's
+    # whole record). The mut-check runs FIRST, before anything else is
+    # lowered, matching box_set's own established style (the Call-expr
+    # case above) rather than lowering everything then discarding it.
+    let obj_node = list_get(node, 1)
+    let prop = list_get(node, 2)
+    let value_node = list_get(node, 3)
+    if (list_get(obj_node, 0) == "Var") and bm_list_contains(immut_params, list_get(obj_node, 1)) then
+      return list_push(instrs, ["ContractFail", "field write on read-only parameter '" + list_get(obj_node, 1) + "' (declare it `mut_" + list_get(obj_node, 1) + "` to allow mutation)"])
+    end
+    # Store obj into a fresh temp ONCE (never re-evaluate a possibly
+    # side-effecting object expression twice, the same reasoning
+    # compile_pattern's own scrutinee-caching comment gives). Build the
+    # updated assoc-list via HandlerRegister (ref, then name, then the
+    # CURRENT handler read back via BoxGet each time -- same pop order as
+    # the handler_register Call-expr case above) into a SECOND temp, since
+    # box_set's own pop order is (ptr pushed first/bottom, value pushed
+    # second/top, per the box_set Call-expr case above) -- the opposite of
+    # what falls out of computing the updated record right before BoxSet
+    # would give, so it's computed first and reloaded in the right order
+    # rather than pushed in the wrong order (a real bug caught here via a
+    # genuine segfault, not assumed correct from the shape alone).
+    let tmp = bm_next_synth_name("__objref")
+    let tmp2 = bm_next_synth_name("__objnewval")
+    let instrs = bm_lower_expr(obj_node, instrs, block_names, immut_params)
+    let instrs = list_push(instrs, ["Store", tmp])
+    let instrs = bm_lower_expr(value_node, instrs, block_names, immut_params)
+    let instrs = list_push(instrs, ["Const", "str", prop])
+    let instrs = list_push(instrs, ["Load", tmp])
+    let instrs = list_push(instrs, ["BoxGet"])
+    let instrs = list_push(instrs, ["HandlerRegister"])
+    let instrs = list_push(instrs, ["Store", tmp2])
+    let instrs = list_push(instrs, ["Load", tmp])
+    let instrs = list_push(instrs, ["Load", tmp2])
+    let instrs = list_push(instrs, ["BoxSet"])
+    # box_set may return a DIFFERENT pointer (clone-on-alias, Phase 3) --
+    # if obj_node is a bare Var, re-Store the result into that SAME
+    # source-level name so this block's own later reads see the write,
+    # exactly matching box_set's own "reassign to the result" convention,
+    # just automated here since MemberAssign gives source no place to
+    # write an explicit reassignment. When obj_node isn't a bare Var,
+    # there's no name to re-point -- discarded, a real, named, narrow gap
+    # (mutating through a non-Var object expression won't observe its own
+    # post-clone update within the same block), not silently papered over.
+    if list_get(obj_node, 0) == "Var" then
+      return list_push(instrs, ["Store", list_get(obj_node, 1)])
+    end
+    return list_push(instrs, ["Store", bm_next_synth_name("__discard")])
   elif ty == "Match" then
     # Mirrors the real lower_match's own shape exactly: store the
     # scrutinee once (re-evaluating a side-effecting expression per arm
@@ -706,6 +849,37 @@ make a function called bm_lower_program takes ast returns prog
   set_var("bm_synth_counter", 0)
   let stmts = list_get(ast, 1)
   let n = list_len(stmts)
+
+  # Pass 0 (Phase 13): a compile-time-only class registry (name -> field
+  # defaults), scanned before Pass 1 so a `new("ClassName")` call site can
+  # resolve regardless of source order, same reasoning as Pass 1's own
+  # forward-reference support for ordinary functions. A ClassDecl
+  # declaring `inherits`/methods/traits is rejected here, plainly, before
+  # any of its fields are even registered -- see this file's own Phase 13
+  # header note for exactly why those three are out of scope.
+  set_var("bm_class_registry", [])
+  let i = 0
+  while i < n do
+    let stmt = list_get(stmts, i)
+    if list_get(stmt, 0) == "ClassDecl" then
+      let cname = list_get(stmt, 1)
+      let cparent = list_get(stmt, 2)
+      let cfields = list_get(stmt, 3)
+      let cmethods = list_get(stmt, 4)
+      let ctraits = list_get(stmt, 5)
+      if cparent != "" then
+        bm_lower_unsupported("class '" + cname + "' declares `inherits " + cparent + "` -- Phase 13's restricted subset supports fields only, no inheritance yet")
+      end
+      if list_len(cmethods) > 0 then
+        bm_lower_unsupported("class '" + cname + "' declares a method -- Phase 13's restricted subset supports fields only, no method dispatch yet")
+      end
+      if list_len(ctraits) > 0 then
+        bm_lower_unsupported("class '" + cname + "' declares traits -- Phase 13's restricted subset supports fields only, no traits yet")
+      end
+      set_var("bm_class_registry", bm_class_registry_set(get("__vars", "bm_class_registry"), cname, cfields))
+    end
+    let i = i + 1
+  end
 
   # Pass 1: every declared function name, and its own empty-bodied BlockIR
   # (params only) -- built first so a jump to a function declared LATER in
