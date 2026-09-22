@@ -16,11 +16,18 @@ now, ahead of Phase 19 as the plan itself permits — its own real
 decisions (a hard switch, gated on both full-suite parity and issues
 #145/#113 actually being fixed, not waived) are recorded, and acting on
 them is explicitly not yet authorized. Phase 19 (consolidated native x64
-+ WASM codegen) is scoped in real, checked detail (18 opcodes total need
-translation, a concrete per-opcode plan exists, one genuine open design
-question already resolved) but not implemented this session — the true
-remaining size is comparable to Phase 9's own original effort, not
-rushed past this plan's own RED/GREEN discipline. Phase 13 also found and
++ WASM codegen) was investigated twice this session: an initial 18-opcode
+estimate turned out wrong on closer check — 6 of those opcodes
+(`fiber_yield`/`fact`/`query`/`type_of`/`read_file`/`write_file`) have
+literally zero native x64 support today (confirmed by direct grep, not
+assumed from `pat --patc`'s different backend), and Box's own
+`heap.patlang` isn't bundled into the one real native-build driver this
+project has at all. Corrected scope: 11 achievable opcodes
+(`Box*`/`ContractFail`/`Global*`/`Handler*`) plus a real build-plumbing
+prerequisite (bundle `heap.patlang`), with the other 7 opcodes deferred
+as needing genuinely new runtime primitives — not implemented this
+session either way, to avoid rushing untested native-codegen changes
+past this plan's own RED/GREEN discipline. Phase 13 also found and
 fixed two real,
 pre-existing bugs (`HandlerRegister`'s append-only behavior, and its own
 downstream exposure of already-filed issue #145's native x64 `list_set`
@@ -624,24 +631,70 @@ expects" convention this engine's own Box/Handler instructions already
 follow internally. This settles how each new opcode's translation should
 push its own args before calling the real underlying function.
 
-**Concrete per-opcode translation plan for the next session, each an
-ordinary `Call` against an already-proven-compilable real function
-(reusing Phase 1/3's own native heap and following `Print`'s established
-`Call`-vs-`CallHost` per-backend split), not new x64 emission code:**
+**Correction (2026-09-22, same day, before any implementation was
+written): the per-opcode table below this note (kept for the record) was
+wrong about which opcodes are actually easy, found by checking each
+claim directly rather than trusting the pattern-match to `Print`'s own
+precedent.** Two real, verified findings that change the picture:
+
+1. **`fiber_yield`/`fact`/`query`/`type_of`/`read_file`/`write_file` have
+   ZERO native x64 support today — not "already proven to compile
+   natively," which was flatly wrong.** `fiber_demo.patlang`'s own header
+   claim ("works... natively compiled") refers to `pat --patc` (the
+   Rust-native `codegen.rs` backend) — a *different* native path from
+   `patc1.exe --x64` (`codegen_x64.patlang`), which this whole plan's own
+   backend-preference order treats as the real target. Checked directly:
+   grepping `codegen_x64.patlang` and `x64_runtime.patlang` for any of
+   these six names returns nothing at all. Compiling them to
+   `patc1.exe --x64` would need genuinely new x64 runtime primitives
+   (real file I/O, a native fact-store, a real fiber-yield mechanism)
+   built from scratch in `x64_runtime.patlang` — a materially larger,
+   separate undertaking, not a same-pattern `Call` translation.
+2. **Box's own heap.patlang is not bundled into the existing native
+   build path at all.** `self_hosting/block_model/tools/
+   build_native.patlang` (the one real native-build driver this project
+   has) only links against the pre-built `x64_runtime.obj` via
+   `extern_names` — it never `include`s `heap.patlang`, and no other
+   driver in this tree does either (checked directly, zero matches).
+   Box-instruction translation needs that wired up first — either
+   bundling `heap.patlang`'s source into the same compilation unit
+   (Phase 1's own native check, `refcounted_heap_native_check.sh`, does
+   exactly this, so the pattern exists to copy) or pre-building it into
+   its own `.obj` and externing it the same way `x64_runtime.obj`
+   already is — untested either way as of this note.
+
+**Real, achievable Phase 19 v1 scope, given these corrections:**
+`BoxNew`/`BoxGet`/`BoxSet`/`BoxSetUnchecked`/`BoxShare`/`ContractFail`
+(needs the heap.patlang bundling fix above first) plus
+`GlobalGet`/`GlobalSet`/`HandlerNew`/`HandlerRegister`/`HandlerLookup`
+(ordinary list operations, no heap.patlang dependency — `BuildList` is
+already a real, working `codegen_x64.patlang` instruction, confirmed by
+`native_codegen.patlang`'s own existing `init_instrs` use of it for
+`__globals`). **`Emit`, `FiberYield`, `Fact`, `Query`, `TypeOf`,
+`ReadFile`, `WriteFile` are deferred as a distinct, larger follow-up**
+needing new `x64_runtime.patlang` primitives, not attempted alongside the
+achievable slice above. The original per-opcode table is kept below for
+the parts that still hold (`ContractFail`'s real `contract_check`
+convention, the Handler/`list_push`-not-`list_set` note), but its
+"already proven to compile natively" claims for the six host-function
+opcodes should be read as superseded by this correction.
+
+Original table, for the record (see the correction above for what's
+actually still trustworthy in it):
 
 | Opcode(s) | Real function | Notes |
 |---|---|---|
-| `BoxNew` | `bm_alloc(8)` then `bm_box_write(ptr, v)` | two calls; needs a synthesized temp to hold `ptr` between them (the same `Store`/`Load`-temp pattern this session's own lowering work already uses repeatedly) |
-| `BoxGet` | `bm_box_read(ptr)` | one call |
-| `BoxSet` / `BoxSetUnchecked` | `bm_rc_touch_for_mutation(ptr)` + `bm_box_write` (checked) or `bm_box_write` alone (unchecked) | mirrors the interpreter's own branching logic, now as emitted `JumpIfFalse`/`Jump` around two `Call` paths instead of a PatLang `if` |
-| `BoxShare` | `bm_rc_inc(ptr)` | one call, pointer unchanged |
+| `BoxNew` | `bm_alloc(8)` then `bm_box_write(ptr, v)` | two calls; needs a synthesized temp to hold `ptr` between them (the same `Store`/`Load`-temp pattern this session's own lowering work already uses repeatedly); needs heap.patlang bundled into the build first (correction above) |
+| `BoxGet` | `bm_box_read(ptr)` | one call; same heap.patlang-bundling prerequisite |
+| `BoxSet` / `BoxSetUnchecked` | `bm_rc_touch_for_mutation(ptr)` + `bm_box_write` (checked) or `bm_box_write` alone (unchecked) | mirrors the interpreter's own branching logic, now as emitted `JumpIfFalse`/`Jump` around two `Call` paths instead of a PatLang `if`; same prerequisite |
+| `BoxShare` | `bm_rc_inc(ptr)` | one call, pointer unchanged; same prerequisite |
 | `ContractFail` | `contract_check(func_name, kind, text, false)` | a 4-arg `CallHost` — confirmed as the real convention lower.patlang itself already emits for `Assert`, not guessed |
 | `GlobalGet` / `GlobalSet` | plain list operations (`list_get`/`list_set`-equivalent on the globals value) | no heap.patlang involvement, ordinary list manipulation already proven to compile |
 | `HandlerNew` / `HandlerRegister` / `HandlerLookup` | ordinary list construction/lookup, mirroring `bm_rt_assoc_get`/`bm_rt_assoc_set`'s own logic (**note the Phase 13 fix**: use the `list_push`-rebuild form, never `list_set`, to avoid re-triggering issue #145 on native x64) | |
-| `Emit` | recursive call structurally mirrors `interp.patlang`'s own approach but needs a REAL native call mechanism where `interp.patlang` had none (Fork A) — the one opcode here that may need actual new design, not just a `Call` translation, named explicitly rather than assumed as easy as the rest |
-| `FiberYield` | `Call "fiber_yield", 1` | already proven to compile natively (`fiber_demo.patlang`'s own header states this backend works "interpreted, natively compiled... and compiled to threaded WASM") |
-| `Fact` / `Query` | `Call "fact", 3` / `Call "query", 3` | ordinary calls, already proven under `--ir-run`; native compilation not yet separately checked |
-| `TypeOf` / `ReadFile` / `WriteFile` | `Call "type_of"/"read_file"/"write_file", 1 or 2` | same pattern |
+| `Emit` | **deferred** — recursive call structurally mirrors `interp.patlang`'s own approach but needs a REAL native call mechanism where `interp.patlang` had none (Fork A) — the one opcode here that may need actual new design, not just a `Call` translation |
+| `FiberYield` | **deferred, needs a new native primitive** — no `codegen_x64.patlang`/`x64_runtime.patlang` support exists (correction above) |
+| `Fact` / `Query` | **deferred, needs a new native primitive** — same finding |
+| `TypeOf` / `ReadFile` / `WriteFile` | **deferred, needs a new native primitive** — same finding |
 
 **Not started:** the WASM re-verification pass, and the "watch for the
 same class of gotcha Phase 9 already hit" checkpoint item — both wait for
