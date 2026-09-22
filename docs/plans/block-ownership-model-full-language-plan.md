@@ -1,18 +1,21 @@
 # Block Ownership Model: full-language expansion plan
 
-**Status (2026-09-22): Phases 10–13 (event dispatch, pattern matching,
-design by contract, object orientation) complete and verified —
-`self_hosting/block_model/run_block_model_spec_suite.patlang` reports
-71/71 passing, no regressions. Phase 13 also found and fixed two real,
-pre-existing bugs (`HandlerRegister`'s append-only behavior, and its own
-downstream exposure of already-filed issue #145's native x64 `list_set`
-aliasing bug) — see Phase 13's own section below for the full account.
-Phases 0–9 (the restricted-subset design, proof, and native/WASM
-verification) were already complete on `feature/block-ownership-model` —
-see
+**Status (2026-09-22): Phases 10–14 (event dispatch, pattern matching,
+design by contract, object orientation, cooperative fiber_yield) complete
+and verified — `self_hosting/block_model/run_block_model_spec_suite.patlang`
+reports 76/76 passing, no regressions. Phase 13 also found and fixed two
+real, pre-existing bugs (`HandlerRegister`'s append-only behavior, and its
+own downstream exposure of already-filed issue #145's native x64
+`list_set` aliasing bug) — see Phase 13's own section below for the full
+account. Phase 14 found its own flagged refcount-thread-safety fork to be
+moot for the slice it actually covers (fiber_yield is cooperative, never
+real parallelism) — see Phase 14's own section for the real scope this
+left deferred. Phases 0–9 (the restricted-subset design, proof, and
+native/WASM verification) were already complete on
+`feature/block-ownership-model` — see
 [`block-ownership-model-implementation-plan.md`](block-ownership-model-implementation-plan.md)
 for that record, which this document continues rather than replaces.
-Phases 14–20 below are not built yet.**
+Phases 15–20 below are not built yet.**
 
 Companion to [`block-ownership-model.md`](block-ownership-model.md) (the
 design doc, Forks A–E) and the Phase 0–9 implementation plan. Those decided
@@ -308,6 +311,39 @@ any code in this phase is written; the feature passes, including the
 race scenario run enough times to be credible evidence rather than a
 single lucky pass (concurrency bugs are exactly the kind that pass most of
 the time by accident).
+
+**Done (2026-09-22), scoped down to fiber_yield only — the refcount-
+thread-safety fork above turned out to be moot for this slice, checked
+before writing code rather than assumed:**
+`self_hosting/examples/fiber_demo.patlang`'s own header states plainly
+that fibers are "implemented on real OS threads under the hood... but
+never actually running concurrently — a mutex+condvar pair ensures only
+one fiber's thread is ever unparked at a time... distinct from
+`parallel_map`, which IS real parallelism." Cooperative fiber-based
+yielding is deterministic and single-threaded in effect, so there is no
+refcount race to design around for it at all — the fork above applies
+only to genuine OS-thread parallelism (`thread_spawn`/`parallel_map`),
+which this phase does **not** cover.
+
+What shipped: a block-model *source program* can call `fiber_yield(x)` as
+an ordinary mid-block instruction (an outside driver wraps running the
+whole program in a fiber and resumes it step by step, observing real,
+changing progress) — Phase 8's own debugger already proved the mechanism
+works at this engine's level from the outside; this phase lets a program
+use it from the inside. 2/2 scenarios pass; full suite 76/76, no
+regressions.
+
+**Explicitly deferred, not silently dropped:**
+- The full `Expr::Budgeted` sugar syntax (`budgeted(ms) { ... }` with
+  automatic while-loop yield injection and `existing`-based resumption) —
+  `fiber_yield` is the load-bearing primitive underneath it and is now
+  proven; the syntactic sugar on top is a smaller, separable follow-up,
+  not attempted in this pass.
+- Real OS-thread parallelism (`thread_spawn`, `parallel_map`) and the
+  refcount-thread-safety fork it actually requires — genuinely untestable
+  under this whole plan's self-hosted-interpreter backend cadence anyway,
+  since Box (the thing that would race) is native-x64-only. Revisit when
+  Phase 19's native codegen makes it exercisable, not before.
 
 ---
 
