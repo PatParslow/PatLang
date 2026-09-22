@@ -1,11 +1,13 @@
 # Block Ownership Model: full-language expansion plan
 
-**Status (2026-09-22): planning. Phases 0–9 (the restricted-subset design,
-proof, and native/WASM verification) are complete on
-`feature/block-ownership-model` — see
+**Status (2026-09-22): Phase 10 (event dispatch) complete and verified —
+`self_hosting/block_model/run_block_model_spec_suite.patlang` reports
+43/43 passing, no regressions in Phases 2–9. Phases 0–9 (the restricted-
+subset design, proof, and native/WASM verification) were already complete
+on `feature/block-ownership-model` — see
 [`block-ownership-model-implementation-plan.md`](block-ownership-model-implementation-plan.md)
 for that record, which this document continues rather than replaces.
-Nothing in this document is built yet.**
+Phases 11–20 below are not built yet.**
 
 Companion to [`block-ownership-model.md`](block-ownership-model.md) (the
 design doc, Forks A–E) and the Phase 0–9 implementation plan. Those decided
@@ -80,6 +82,32 @@ mechanic loops turned out to be (§4.1).
 of whether the Phase 0–9 restricted-subset engine generalizes cheaply the
 way the design doc predicted, or whether the "almost free" claim needs
 revising before the rest of this plan is trusted.
+
+**Done (2026-09-22): the "almost free" claim did NOT hold as originally
+stated, checked against real interpreter behavior before writing any
+code, not assumed.** `rust-runtime/src/ir/interpreter.rs`'s own
+`CallHost("emit", ...)` handling calls each registered handler via
+`run_function` — a genuine call-with-return, not a jump-and-never-return —
+and the real self-hosted `lower.patlang` has itself since moved `when`
+from a static `EventIR` table to a runtime-registered closure
+(`register_event_handler`), specifically to fix a bug where an isolated
+handler couldn't see enclosing scope. Neither matches the design doc §8
+framing this phase started from. The block-model engine has no call stack
+at all (Fork A), so `Emit` was built as a narrowly-scoped, explicit
+exception rather than either of those: a handler block runs as a bounded,
+non-tail sub-execution (a recursive `bi_run_block` call, safe only because
+the lowerer guarantees a handler body can never itself `JumpBlock`), and a
+handler is isolated to its own two auto-bound params plus `__globals` —
+not a real closure over outer scope, a v1 restriction named plainly in
+`block_ir.patlang`'s own header rather than silently passed off as parity
+with production `when` semantics. 5/5 scenarios pass (payload delivery,
+isolation, multi-handler ordering, control genuinely returning to the
+emitting block, and a handler's global write being visible immediately
+afterward); full suite 43/43, no regressions. Real first-class closures
+for the block model (needed for actual production-equivalent `when`) are
+not built by this phase and are not currently scheduled in Phases 11–20
+below — flagged here as a gap this plan doesn't yet cover, not silently
+absorbed into "done."
 
 ---
 
