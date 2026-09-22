@@ -115,6 +115,25 @@
 # only one real consumer of it here, bm_lower_while -- nothing about the
 # analysis is closure-specific, but nothing here calls it for one either).
 #
+# Phase 11 adds `match`/`case` (section 4.1's own "forks don't need their
+# own boundary" finding, verified there only for if/else -- this phase
+# checks it against Match too). Reuses the real self-hosted
+# self_hosting/lib/lower.patlang's own compile_pattern/lower_match exactly
+# as the template (same [testNode, letStmts] desugaring, same
+# bindings-before-guard ordering, same JumpIfFalse-chain-per-arm shape,
+# same guaranteed-fail tail when no arm matches) -- not a new pattern-
+# compilation scheme invented for this engine.
+#
+# Deliberately scoped to PWild/PBind/PLit/PCmp -- the four pattern kinds
+# expressible with bm_lower_expr's existing Const/Var/Bin support. PGlob
+# (needs a generic host-function-call expression, glob_match) and PList
+# (needs Member/Index expression support plus real List values) are
+# explicitly NOT supported here -- checked before writing this, not
+# discovered as a gap afterward: bm_lower_expr has neither Member/Index
+# nor generic host-function-call support today (Phase 17's own job, per
+# docs/plans/block-ownership-model-full-language-plan.md). A PGlob/PList
+# pattern hits bm_lower_unsupported, named plainly.
+#
 # Phase 10 adds event dispatch (section 8's own claim, checked directly
 # against the real Rust interpreter and found narrower than stated -- see
 # block_ir.patlang's own Phase 10 note for the full finding): a top-level
@@ -273,11 +292,94 @@ make a function called bm_lower_jump_call takes call_node, instrs, block_names, 
   return list_push(instrs, ["JumpBlock", target, params])
 end
 
+# Phase 11: mirrors self_hosting/lib/lower.patlang's own compile_pattern
+# exactly, restricted to the four pattern kinds this engine's expression
+# lowering can actually handle (see this file's own Phase 11 header note
+# for PGlob/PList's real, checked-not-assumed exclusion).
+make a function called bm_compile_pattern takes pattern, scrutinee_node returns r
+  let tag = list_get(pattern, 0)
+  if tag == "PWild" then
+    return [["Bool", "true"], []]
+  elif tag == "PBind" then
+    return [["Bool", "true"], [["Let", list_get(pattern, 1), scrutinee_node, false, false]]]
+  elif tag == "PLit" then
+    return [["Bin", "==", scrutinee_node, list_get(pattern, 1)], []]
+  elif tag == "PCmp" then
+    return [["Bin", list_get(pattern, 1), scrutinee_node, list_get(pattern, 2)], []]
+  end
+  bm_lower_unsupported("match pattern kind '" + tag + "' (Phase 11 supports PWild/PBind/PLit/PCmp only)")
+  return [["Bool", "false"], []]
+end
+
 make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_name, immut_params returns out
   let ty = list_get(node, 0)
   if ty == "Let" then
     let instrs = bm_lower_expr(list_get(node, 2), instrs, block_names, immut_params)
     return list_push(instrs, ["Store", list_get(node, 1)])
+  elif ty == "Match" then
+    # Mirrors the real lower_match's own shape exactly: store the
+    # scrutinee once (re-evaluating a side-effecting expression per arm
+    # would be a real correctness bug, matching that file's own reasoning
+    # verbatim), then a JumpIfFalse-chained sequence of (pattern test,
+    # bindings, optional guard, body) per arm, ending in a guaranteed-fail
+    # ContractFail if nothing matched -- PatLang has no static
+    # exhaustiveness check, so an unmatched scrutinee is a genuine runtime
+    # bug, not a silent no-op (the real engine's own issue #44 decision).
+    let scrutinee_node = list_get(node, 1)
+    let arms = list_get(node, 2)
+    let tmp = bm_next_synth_name("__match")
+    let instrs = bm_lower_expr(scrutinee_node, instrs, block_names, immut_params)
+    let instrs = list_push(instrs, ["Store", tmp])
+    let scrutinee_var = ["Var", tmp]
+    let end_jumps = []
+    let an = list_len(arms)
+    let ai = 0
+    while ai < an do
+      let arm = list_get(arms, ai)
+      let pattern = list_get(arm, 0)
+      let guard = list_get(arm, 1)
+      let body = list_get(arm, 2)
+      let comp = bm_compile_pattern(pattern, scrutinee_var)
+      let test_node = list_get(comp, 0)
+      let let_stmts = list_get(comp, 1)
+      let instrs = bm_lower_expr(test_node, instrs, block_names, immut_params)
+      let instrs = list_push(instrs, ["JumpIfFalse", 0])
+      let jif_pattern_pos = list_len(instrs) - 1
+      # Bindings a pattern introduced (PBind) must exist before the guard
+      # runs -- a guard referencing that binding (`case n when n > 100`)
+      # would otherwise read an unbound name, exactly the real
+      # lower_match's own documented reasoning for this ordering.
+      let ln = list_len(let_stmts)
+      let li = 0
+      while li < ln do
+        let instrs = bm_lower_stmt(list_get(let_stmts, li), instrs, block_names, blocks_by_name, immut_params)
+        let li = li + 1
+      end
+      let jif_guard_pos = 0 - 1
+      if guard != false then
+        let instrs = bm_lower_expr(guard, instrs, block_names, immut_params)
+        let instrs = list_push(instrs, ["JumpIfFalse", 0])
+        let jif_guard_pos = list_len(instrs) - 1
+      end
+      let instrs = bm_lower_stmt_list(body, instrs, block_names, blocks_by_name, immut_params)
+      let instrs = list_push(instrs, ["Jump", 0])
+      let end_jumps = list_push(end_jumps, list_len(instrs) - 1)
+      let next_arm_pc = list_len(instrs)
+      let instrs = list_set(instrs, jif_pattern_pos, ["JumpIfFalse", next_arm_pc])
+      if jif_guard_pos >= 0 then
+        let instrs = list_set(instrs, jif_guard_pos, ["JumpIfFalse", next_arm_pc])
+      end
+      let ai = ai + 1
+    end
+    let instrs = list_push(instrs, ["ContractFail", "match: no arm matched"])
+    let end_pos = list_len(instrs)
+    let en = list_len(end_jumps)
+    let ei = 0
+    while ei < en do
+      let instrs = list_set(instrs, list_get(end_jumps, ei), ["Jump", end_pos])
+      let ei = ei + 1
+    end
+    return instrs
   elif ty == "If" then
     let cond = list_get(node, 1)
     let then_stmts = list_get(node, 2)
