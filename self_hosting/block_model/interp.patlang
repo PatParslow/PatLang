@@ -377,8 +377,7 @@ end
 # previous block can leak forward except what a JumpBlock instruction
 # explicitly named.
 make a function called bi_run takes prog returns result
-  set_var("bm_heap_ready", false)
-  set_var("bm_runtime_check_count", 0)
+  bi_init_run_state()
   let cur = bi_find_block(prog, bi_program_entry(prog))
   # The entry block never has anything jumped INTO it, so the very first
   # pointer's own globals-view section (section 3.2/3.3) is seeded here,
@@ -387,6 +386,69 @@ make a function called bi_run takes prog returns result
   # by re-seeding.
   let locs = bm_loc_set(bm_loc_new(), "__globals", [])
   while true do
+    let outcome = bi_run_block(prog, cur, locs)
+    if list_get(outcome, 0) == "halt" then
+      return list_get(outcome, 1)
+    end
+    let cur = list_get(outcome, 1)
+    let locs = list_get(outcome, 2)
+  end
+  return "unit"
+end
+
+make a function called bi_init_run_state returns done
+  set_var("bm_heap_ready", false)
+  set_var("bm_runtime_check_count", 0)
+  return true
+end
+
+# Phase 8 (Fork A's own one identified real gap): a jump-history trail,
+# replacing the call-stack view a real call stack gives for free in
+# today's model -- there is no call stack here at all (this file's own
+# header). Bounded, not a growing log: bm_trail_push drops the oldest
+# entry past bi_trail_max(), the concrete, small-scale form of Fork D
+# making "keep this bounded and free old entries" a straightforward thing
+# to build (design doc, Fork A's own reasoning) rather than another
+# unbounded log.
+make a function called bi_trail_max returns n
+  return 5
+end
+
+make a function called bm_trail_push takes trail, name returns out
+  let trail = list_push(trail, name)
+  if list_len(trail) > bi_trail_max() then
+    let n = list_len(trail)
+    let out = []
+    let i = 1
+    while i < n do
+      let out = list_push(out, list_get(trail, i))
+      let i = i + 1
+    end
+    return out
+  end
+  return trail
+end
+
+# The SAME execution loop as bi_run, but runnable as a fiber body
+# (fiber_new("bi_debug_run")) so an external caller can genuinely pause
+# it and query "how did we get here" mid-execution via fiber_resume,
+# rather than only ever seeing a finished result. Checked directly
+# (self_hosting/examples/fiber_demo.patlang, run via --ir-run): fiber_new/
+# fiber_yield/fiber_resume/fiber_alive are special-cased in the Rust
+# interpreter's own instruction dispatch (rust-runtime/src/ir/
+# interpreter.rs), not something only the native backend provides --
+# representation-agnostic, exactly Fork A's own finding about the real
+# debugger's pause/resume mechanism carrying over unchanged. This is a
+# second, parallel entry point rather than a flag on bi_run itself,
+# since fiber_new needs a plain top-level function name to spawn.
+make a function called bi_debug_run takes prog returns result
+  bi_init_run_state()
+  let cur = bi_find_block(prog, bi_program_entry(prog))
+  let locs = bm_loc_set(bm_loc_new(), "__globals", [])
+  let trail = []
+  while true do
+    let trail = bm_trail_push(trail, bi_block_name(cur))
+    fiber_yield(trail)
     let outcome = bi_run_block(prog, cur, locs)
     if list_get(outcome, 0) == "halt" then
       return list_get(outcome, 1)
