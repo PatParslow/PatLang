@@ -1,21 +1,24 @@
 # Block Ownership Model: full-language expansion plan
 
-**Status (2026-09-22): Phases 10–14 (event dispatch, pattern matching,
-design by contract, object orientation, cooperative fiber_yield) complete
-and verified — `self_hosting/block_model/run_block_model_spec_suite.patlang`
-reports 76/76 passing, no regressions. Phase 13 also found and fixed two
-real, pre-existing bugs (`HandlerRegister`'s append-only behavior, and its
-own downstream exposure of already-filed issue #145's native x64
-`list_set` aliasing bug) — see Phase 13's own section below for the full
-account. Phase 14 found its own flagged refcount-thread-safety fork to be
-moot for the slice it actually covers (fiber_yield is cooperative, never
-real parallelism) — see Phase 14's own section for the real scope this
-left deferred. Phases 0–9 (the restricted-subset design, proof, and
-native/WASM verification) were already complete on
+**Status (2026-09-22): Phases 10–15 (event dispatch, pattern matching,
+design by contract, object orientation, cooperative fiber_yield, logic-
+programming facts) complete and verified —
+`self_hosting/block_model/run_block_model_spec_suite.patlang` reports
+78/78 passing, no regressions. Phase 13 also found and fixed two real,
+pre-existing bugs (`HandlerRegister`'s append-only behavior, and its own
+downstream exposure of already-filed issue #145's native x64 `list_set`
+aliasing bug) — see Phase 13's own section below for the full account.
+Phase 14 found its own flagged refcount-thread-safety fork to be moot for
+the slice it actually covers (fiber_yield is cooperative, never real
+parallelism). Phase 15 found `rule`/`goal`/`pursue`/`activate`/`plan`
+genuinely need list-literal support this engine doesn't have yet, and
+scoped down to `fact`/`query` accordingly — see each phase's own section
+below for the real scope left deferred. Phases 0–9 (the restricted-subset
+design, proof, and native/WASM verification) were already complete on
 `feature/block-ownership-model` — see
 [`block-ownership-model-implementation-plan.md`](block-ownership-model-implementation-plan.md)
 for that record, which this document continues rather than replaces.
-Phases 15–20 below are not built yet.**
+Phases 16–20 below are not built yet.**
 
 Companion to [`block-ownership-model.md`](block-ownership-model.md) (the
 design doc, Forks A–E) and the Phase 0–9 implementation plan. Those decided
@@ -372,6 +375,36 @@ doc's own §8 connection to issues #131–133) whether this phase gives
 capability discovery a real structural pre/postcondition to plan against,
 or whether that remains future work beyond this phase's scope — state
 which, don't imply the connection is now complete unless it demonstrably is.
+
+**Done (2026-09-22), scoped down to `fact`/`query` only** — checked
+against `rust-runtime/src/ir/hosts.rs` before writing code: both take
+exactly 3 scalar arguments, not a list, so neither needed this engine's
+missing list-literal/`BuildList` support. `rule`/`goal` declarative sugar
+(`RuleDecl`/`GoalDecl`) genuinely do build compound `[pred,[args]]` lists
+via the real engine's own `BuildList` instruction, which this engine has
+no equivalent of — explicitly deferred alongside Phase 17's own generic
+host-call/list-literal work rather than attempted with half the needed
+machinery. `pursue`/`activate`/`plan` (the GOAP orchestration layer built
+on top of rules/goals) are deferred for the same reason.
+
+A real, previously-unnoted finding: `fact`'s own backing store
+(`FACTS` in `hosts.rs`) is a `thread_local!` HashMap, entirely outside
+PatLang's `__vars`/`set_var`/`get` mechanism and therefore outside this
+engine's own `__globals` threading (Fork B, Phase 4) — a fact asserted in
+one block is visible from any other block *not* because `__globals`
+carried it there, but because it was never scoped by Fork B's own
+mechanism at all. The design doc's own Fork B never named this ambient
+mechanism (it only covers `set_var`/`get` and `new`/`send`) — a genuine
+gap in that document's own coverage, recorded here rather than silently
+treated as already handled.
+
+**Answer to this phase's own checkpoint question:** capability discovery
+(issues #131–133) does **not** yet have a real structural pre/
+postcondition to plan against — `fact`/`query` alone give it a queryable
+store of binary relations, not the `rule`/`goal` declarative structure
+issue #131's own framing implies. That remains genuinely deferred work,
+not something this slice completes. 2/2 scenarios pass; full suite 78/78,
+no regressions.
 
 ---
 
