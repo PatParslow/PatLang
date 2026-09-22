@@ -1,0 +1,191 @@
+# Block Ownership Model, Phase 1 (Fork D): a standalone reference-counted
+# layer, proven in isolation from any block/jump execution machinery or
+# `mut` parameter syntax -- see docs/plans/block-ownership-model.md (design)
+# and docs/plans/block-ownership-model-implementation-plan.md (this phase).
+#
+# Built ON TOP OF rt_heap_alloc (self_hosting/lib/x64_runtime.patlang),
+# called as an ordinary function, not reimplemented -- checked before
+# assuming otherwise: codegen_x64.patlang hardcodes a `call rt_heap_alloc`
+# into the emitted code for ordinary list/string/object literals (see its
+# own comments near the list-literal codegen), so ANY native x64 PatLang
+# program that uses so much as a list literal already depends on
+# x64_runtime.patlang's rt_heap_alloc, and that function owns the ONE
+# shared g_heap_base/g_heap_state pair codegen_x64.patlang's raw
+# mem_heap_base()/mem_heap_state_addr() intrinsics expose (there is no
+# second, independent heap region to reserve). Reimplementing a second raw
+# bump allocator here would silently race the real one over the same
+# memory rather than being genuinely parallel. Depending on rt_heap_alloc as
+# a plain function call keeps this phase honest about that, and is a more
+# faithful standalone proof of Fork D's actual claim anyway: Fork D adds a
+# count field to the EXISTING heap's objects, not a second heap.
+#
+# Layout: an allocation is [refcount:8 bytes][payload:N bytes]. Every
+# function here takes/returns a pointer to the PAYLOAD (rt_heap_alloc's own
+# return value, plus 8) -- refcount is never exposed except through
+# bm_rc_get/bm_rc_touch_for_mutation. The header's 8 bytes are reused for a
+# free-list "next" pointer while a block is on the free list (mutually
+# exclusive with being live and holding a refcount) -- deliberate reuse,
+# not a bug.
+#
+# Reclamation: rt_heap_alloc itself never frees or reuses memory (its own
+# header says so). A size-keyed free list reuses freed blocks instead of
+# calling rt_heap_alloc again -- what makes "heap high-water mark stays
+# flat across many alloc+drop cycles" a real, checkable claim.
+#
+# The free list's own bookkeeping is a fixed-size RAW memory table (64
+# slots of [size:8][head:8], allocated ONCE in bm_heap_init), not an
+# ordinary PatLang list -- found out why the hard way, not by design up
+# front: an earlier version of this file kept the table as a PatLang
+# list via set_var/get, and Phase 1's own 100000-cycle scenario failed
+# with the heap growing by exactly 64 bytes per cycle despite the payload
+# block genuinely being reused -- list_set/list_push on a 2-element list
+# literal each allocate a fresh list value on every call, so the
+# BOOKKEEPING was defeating the exact thing it existed to prove. A raw
+# table peeked/poked with mem_peek_qword/mem_poke_qword allocates nothing
+# after its one-time setup, which is what actually makes the flat-heap
+# claim true rather than just plausible. Deliberately scoped to a small,
+# fixed number of size classes (64) proving the mechanism, not a
+# general-purpose size-class allocator (that's later work, if/when this
+# merges into the real heap).
+
+make a function called bm_freelist_table_size returns n
+  return 64
+end
+
+make a function called bm_heap_init returns done
+  let slots = bm_freelist_table_size()
+  let table = rt_heap_alloc(slots * 16)
+  let i = 0
+  while i < slots do
+    mem_poke_qword(table, i * 16, 0)
+    mem_poke_qword(table, i * 16 + 8, 0)
+    let i = i + 1
+  end
+  set_var("bm_freelist_table", table)
+  return true
+end
+
+make a function called bm_freelist_table_addr returns addr
+  return get("__vars", "bm_freelist_table")
+end
+
+make a function called bm_freelist_slot_offset takes size returns off
+  # Linear scan for a matching size, or the first empty slot (size 0,
+  # never a real aligned payload size) to claim for a new size class --
+  # fine for this phase's small, fixed number of classes; a hash table
+  # would only matter past bm_freelist_table_size()'s own slot count.
+  let table = bm_freelist_table_addr()
+  let slots = bm_freelist_table_size()
+  let i = 0
+  while i < slots do
+    let off = i * 16
+    let s = mem_peek_qword(table, off)
+    if s == size then
+      return off
+    end
+    if s == 0 then
+      mem_poke_qword(table, off, size)
+      return off
+    end
+    let i = i + 1
+  end
+  # Ran out of size-class slots: a real limit of this phase's fixed table,
+  # not a general allocator's answer. Signals "no free list for this
+  # size" so bm_alloc just always raw-allocates for it instead.
+  return 0 - 1
+end
+
+make a function called bm_align8 takes size returns aligned
+  let rem = size % 8
+  if rem != 0 then
+    return size + (8 - rem)
+  end
+  return size
+end
+
+make a function called bm_bytes_bumped returns n
+  # rt_heap_alloc's own raw bump-pointer high-water mark -- NOT "bytes
+  # currently live." Used only to prove reclamation: if this stays flat
+  # across many alloc+drop cycles of one size, freed blocks are genuinely
+  # being reused rather than the allocator quietly growing forever
+  # underneath the free list.
+  return mem_peek_qword(mem_heap_state_addr(), 0)
+end
+
+make a function called bm_freelist_pop takes size returns addr
+  let off = bm_freelist_slot_offset(size)
+  if off == 0 - 1 then
+    return 0
+  end
+  let table = bm_freelist_table_addr()
+  let head = mem_peek_qword(table, off + 8)
+  if head == 0 then
+    return 0
+  end
+  let next = mem_peek_qword(head, 0)
+  mem_poke_qword(table, off + 8, next)
+  return head
+end
+
+make a function called bm_freelist_push takes size, base returns done
+  let off = bm_freelist_slot_offset(size)
+  if off == 0 - 1 then
+    return false
+  end
+  let table = bm_freelist_table_addr()
+  let head = mem_peek_qword(table, off + 8)
+  mem_poke_qword(base, 0, head)
+  mem_poke_qword(table, off + 8, base)
+  return true
+end
+
+make a function called bm_alloc takes payload_size returns ptr
+  let aligned = bm_align8(payload_size)
+  let reused = bm_freelist_pop(aligned)
+  if reused != 0 then
+    mem_poke_qword(reused, 0, 1)
+    return reused + 8
+  end
+  let base = rt_heap_alloc(8 + aligned)
+  mem_poke_qword(base, 0, 1)
+  return base + 8
+end
+
+make a function called bm_rc_get takes ptr returns n
+  return mem_peek_qword(ptr, 0 - 8)
+end
+
+make a function called bm_rc_inc takes ptr returns n
+  let n = mem_peek_qword(ptr, 0 - 8) + 1
+  mem_poke_qword(ptr, 0 - 8, n)
+  return n
+end
+
+make a function called bm_rc_dec takes ptr, payload_size returns n
+  # payload_size must be the same (aligned or not -- bm_align8 handles
+  # either) size bm_alloc was originally called with for this pointer: this
+  # phase's free list is size-keyed, and there is no header field
+  # recording an object's own size yet. A real merge into x64_runtime
+  # .patlang's actual heap would need one; deliberately out of scope for
+  # proving Fork D standalone.
+  let n = mem_peek_qword(ptr, 0 - 8) - 1
+  if n <= 0 then
+    bm_freelist_push(bm_align8(payload_size), ptr - 8)
+    return 0
+  end
+  mem_poke_qword(ptr, 0 - 8, n)
+  return n
+end
+
+make a function called bm_rc_touch_for_mutation takes ptr returns mode
+  # Fork C/3.5's ownership check, standalone: 1 ("in place") when this is
+  # provably the only live reference right now, 0 ("clone first")
+  # otherwise. This phase does not perform the clone itself -- that needs
+  # a real payload shape to copy, which doesn't exist until the block/jump
+  # engine gives a pointer real fields (Phase 2+). It exposes the same
+  # decision Fork C/3.5 describes, checkable on its own.
+  if mem_peek_qword(ptr, 0 - 8) == 1 then
+    return 1
+  end
+  return 0
+end

@@ -1,0 +1,131 @@
+# Native (x64-only) check for spec_library/block_model/refcounted_heap.feature.
+#
+# Why this isn't run through self_hosting/lib/test.patlang's interpreter-based
+# Gherkin runner like every other spec in this repo: this phase's whole
+# subject is the raw-memory primitives (mem_heap_base, mem_peek_qword,
+# mem_poke_qword, rt_atomic_fetch_add, mem_heap_ensure_committed) that
+# self_hosting/lib/codegen_x64.patlang gives special native-codegen meaning
+# to -- checked directly, neither self_hosting/lib/interp.patlang nor
+# rust-runtime/src/ir/hosts.rs implements any of them, so this file can only
+# ever run compiled to real x64, not via --ir-run. Each scenario below is
+# named after its Given/When/Then in the .feature file and prints an
+# "ok: .../FAIL: ..." line plus a final "tests: N passed, M failed" summary,
+# in the same wording self_hosting/lib/test.patlang's check()/t_report() use,
+# so a human or a grep -E "^tests:" reads it exactly the same way, even
+# though the mechanism running it is different.
+#
+# Build + run:
+#   ./patc1.exe self_hosting/block_model/refcounted_heap_native_check.patlang self_hosting/build/refcounted_heap_native_check.exe --x64
+#   ./self_hosting/build/refcounted_heap_native_check.exe
+
+# patc1.exe --x64 already bundles x64_runtime.patlang's functions (rt_heap_alloc,
+# rt_print_i64, print, ...) automatically as built-in shadowing primitives --
+# found out by checking, not assuming: an explicit include here collided with
+# them ("defined BOTH by this program and by x64_runtime.patlang's own
+# shadowing primitives"). Only heap.patlang (this phase's own new code) needs
+# including.
+include "heap.patlang"
+
+let g_pass = 0
+let g_fail = 0
+
+make a function called nc_check_eq takes label, actual, expected returns ok
+  if actual == expected then
+    print("  ok: " + label)
+    return true
+  else
+    print("  FAIL: " + label + " (got ")
+    rt_print_i64(actual)
+    print(", want ")
+    rt_print_i64(expected)
+    print(")" + chr(10))
+    return false
+  end
+end
+
+bm_heap_init()
+
+# Scenario: a fresh allocation starts at refcount 1
+let blk1 = bm_alloc(24)
+if nc_check_eq("fresh allocation starts at refcount 1", bm_rc_get(blk1), 1) then
+  let g_pass = g_pass + 1
+else
+  let g_fail = g_fail + 1
+end
+
+# Scenario: copying a reference increments the refcount
+bm_rc_inc(blk1)
+if nc_check_eq("copying a reference increments the refcount", bm_rc_get(blk1), 2) then
+  let g_pass = g_pass + 1
+else
+  let g_fail = g_fail + 1
+end
+
+# Scenario: dropping one of two references leaves the other refcount at 1
+bm_rc_dec(blk1, 24)
+if nc_check_eq("dropping one of two references leaves refcount at 1", bm_rc_get(blk1), 1) then
+  let g_pass = g_pass + 1
+else
+  let g_fail = g_fail + 1
+end
+
+# Scenario: dropping the last reference makes the block reusable
+bm_rc_dec(blk1, 24)
+let blk2 = bm_alloc(24)
+if nc_check_eq("dropping the last reference makes the block reusable (same address reused)", blk2, blk1) then
+  let g_pass = g_pass + 1
+else
+  let g_fail = g_fail + 1
+end
+
+# Scenario: many alloc-and-drop cycles of the same size do not grow the heap
+# Warm-up first: the very first allocation of a never-before-seen size is a
+# genuine, one-time raw allocation (correctly -- there's nothing to reuse
+# yet), so measuring from before that would-be warm-up wrongly counts it as
+# "growth from the cycles" instead of "growth from being new." The real
+# claim ("flat, not linear with cycle count") is rigorously proven by
+# running a SECOND full batch after warm-up and checking it adds nothing at
+# all -- if the free list weren't actually being reused, this second batch
+# would show the same growth as a from-scratch batch, not zero.
+let blk_warm = bm_alloc(24)
+bm_rc_dec(blk_warm, 24)
+let after_warmup = bm_bytes_bumped()
+let i = 0
+while i < 100000 do
+  let blk = bm_alloc(24)
+  bm_rc_dec(blk, 24)
+  let i = i + 1
+end
+let after_batch = bm_bytes_bumped()
+if nc_check_eq("100000 further alloc+drop cycles after warm-up cause zero additional heap growth", after_batch, after_warmup) then
+  let g_pass = g_pass + 1
+else
+  let g_fail = g_fail + 1
+end
+
+# Scenario: mutation at refcount 1 is safe in place
+let blk3 = bm_alloc(16)
+if nc_check_eq("mutation at refcount 1 reports in place", bm_rc_touch_for_mutation(blk3), 1) then
+  let g_pass = g_pass + 1
+else
+  let g_fail = g_fail + 1
+end
+
+# Scenario: mutation at refcount 2 is not safe in place
+bm_rc_inc(blk3)
+if nc_check_eq("mutation at refcount 2 reports clone first", bm_rc_touch_for_mutation(blk3), 0) then
+  let g_pass = g_pass + 1
+else
+  let g_fail = g_fail + 1
+end
+
+print("tests: ")
+rt_print_i64(g_pass)
+print(" passed, ")
+rt_print_i64(g_fail)
+print(" failed" + chr(10))
+if g_fail == 0 then
+  print("ALL TESTS PASSED" + chr(10))
+else
+  print("TESTS FAILED" + chr(10))
+end
