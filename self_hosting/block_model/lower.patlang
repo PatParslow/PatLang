@@ -1,0 +1,203 @@
+# Block Ownership Model, Phase 2 (Fork A): lowers a RESTRICTED subset of
+# ordinary PatLang source into block_ir.patlang's BlockProgramIR shape.
+# Reuses self_hosting/lib/lexer.patlang and lib/parser.patlang UNCHANGED --
+# only lowering and execution are new here, matching Fork A's own scope
+# (a new execution engine, not new source syntax).
+#
+# What's supported, and why the cut is drawn here rather than further out:
+# a program is a flat sequence of top-level `make a function called X
+# takes ... returns ... ... end` declarations. Each one becomes exactly one
+# BlockIR, named after the function. A function's body may contain:
+#   - Let name = EXPR, where EXPR is Num/Str/Bool/Var/Bin/Un (arithmetic,
+#     comparison, boolean)
+#   - If/else (recursively, over the same restricted statement set)
+#   - print(EXPR)                       -> a Print instruction
+#   - Return CALL_TO_ANOTHER_FUNCTION(args...), or a bare
+#     CALL_TO_ANOTHER_FUNCTION(args...) statement -> a JumpBlock
+#     instruction, since Fork A replaces calls between these blocks with
+#     jumps, never a call-with-return
+#
+# Explicitly NOT supported yet (a real gap, not silently mishandled --
+# bm_lower_unsupported below raises a guaranteed-fail contract_check
+# naming exactly what wasn't recognized): `while` loops (Phase 5's own
+# job, needing an `inherited` section this phase deliberately doesn't
+# build), closures (Phase 6), `Return EXPR` where EXPR is not a call to
+# another declared block (there is no call stack to return a value up
+# through yet -- see interp.patlang's own header on why), and calling
+# anything that isn't either `print` or another function declared in this
+# same program (no host-function dispatch beyond `print` in this phase).
+
+include "block_ir.patlang"
+
+make a function called bm_list_contains takes xs, v returns yes
+  let n = list_len(xs)
+  let i = 0
+  while i < n do
+    if list_get(xs, i) == v then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called bm_lower_unsupported takes what returns nothing
+  contract_check("bm_lower", "assert", "block-model Phase 2's restricted subset does not support: " + what, false)
+  return false
+end
+
+make a function called bm_lower_expr takes node, instrs, block_names returns out
+  let ty = list_get(node, 0)
+  if ty == "Num" then
+    return list_push(instrs, ["Const", "num", list_get(node, 1)])
+  elif ty == "Str" then
+    return list_push(instrs, ["Const", "str", list_get(node, 1)])
+  elif ty == "Bool" then
+    return list_push(instrs, ["Const", "bool", list_get(node, 1)])
+  elif ty == "Var" then
+    return list_push(instrs, ["Load", list_get(node, 1)])
+  elif ty == "Bin" then
+    let instrs = bm_lower_expr(list_get(node, 2), instrs, block_names)
+    let instrs = bm_lower_expr(list_get(node, 3), instrs, block_names)
+    return list_push(instrs, ["Bin", list_get(node, 1)])
+  elif ty == "Un" then
+    let instrs = bm_lower_expr(list_get(node, 2), instrs, block_names)
+    return list_push(instrs, ["Un", list_get(node, 1)])
+  end
+  bm_lower_unsupported("expression shape '" + ty + "'")
+  return instrs
+end
+
+# A Call to another declared block: lowers its args (each pushed, in
+# order) then a single JumpBlock naming the callee's OWN param list --
+# JumpBlock's own contract (block_ir.patlang) is "pop one value per
+# param_name, in that order", so the callee's declared parameter names
+# double as the field names the jump populates, matching section 3.2's
+# "populated by name when the jump happens" exactly.
+make a function called bm_lower_jump_call takes call_node, instrs, block_names, blocks_by_name returns out
+  let target = list_get(call_node, 1)
+  let args = list_get(call_node, 2)
+  let target_blk = bm_assoc_get(blocks_by_name, target)
+  let params = bi_block_params(target_blk)
+  let n = list_len(args)
+  let instrs = instrs
+  let i = 0
+  while i < n do
+    let instrs = bm_lower_expr(list_get(args, i), instrs, block_names)
+    let i = i + 1
+  end
+  return list_push(instrs, ["JumpBlock", target, params])
+end
+
+make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_name returns out
+  let ty = list_get(node, 0)
+  if ty == "Let" then
+    let instrs = bm_lower_expr(list_get(node, 2), instrs, block_names)
+    return list_push(instrs, ["Store", list_get(node, 1)])
+  elif ty == "If" then
+    let cond = list_get(node, 1)
+    let then_stmts = list_get(node, 2)
+    let else_stmts = list_get(node, 3)
+    let instrs = bm_lower_expr(cond, instrs, block_names)
+    let instrs = list_push(instrs, ["JumpIfFalse", 0])
+    let jif_pos = list_len(instrs) - 1
+    let instrs = bm_lower_stmt_list(then_stmts, instrs, block_names, blocks_by_name)
+    let instrs = list_push(instrs, ["Jump", 0])
+    let jmp_pos = list_len(instrs) - 1
+    let instrs = list_set(instrs, jif_pos, ["JumpIfFalse", list_len(instrs)])
+    let instrs = bm_lower_stmt_list(else_stmts, instrs, block_names, blocks_by_name)
+    let instrs = list_set(instrs, jmp_pos, ["Jump", list_len(instrs)])
+    return instrs
+  elif ty == "Expr" then
+    let call = list_get(node, 1)
+    if list_get(call, 0) == "Call" then
+      let name = list_get(call, 1)
+      if name == "print" then
+        let instrs = bm_lower_expr(list_get(list_get(call, 2), 0), instrs, block_names)
+        return list_push(instrs, ["Print"])
+      elif bm_list_contains(block_names, name) then
+        return bm_lower_jump_call(call, instrs, block_names, blocks_by_name)
+      end
+    end
+    bm_lower_unsupported("a call to anything other than print or a declared block")
+    return instrs
+  elif ty == "Return" then
+    let e = list_get(node, 1)
+    if list_get(e, 0) == "Call" then
+      let name = list_get(e, 1)
+      if bm_list_contains(block_names, name) then
+        return bm_lower_jump_call(e, instrs, block_names, blocks_by_name)
+      end
+    end
+    bm_lower_unsupported("`return EXPR` where EXPR isn't a call to a declared block (no call stack to return a value up through yet)")
+    return instrs
+  end
+  bm_lower_unsupported("statement shape '" + ty + "'")
+  return instrs
+end
+
+make a function called bm_lower_stmt_list takes stmts, instrs, block_names, blocks_by_name returns out
+  let n = list_len(stmts)
+  let i = 0
+  while i < n do
+    let instrs = bm_lower_stmt(list_get(stmts, i), instrs, block_names, blocks_by_name)
+    let i = i + 1
+  end
+  return instrs
+end
+
+make a function called bm_assoc_get takes assoc, key returns v
+  let n = list_len(assoc)
+  let i = 0
+  while i < n do
+    let entry = list_get(assoc, i)
+    if list_get(entry, 0) == key then
+      return list_get(entry, 1)
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called bm_lower_program takes ast returns prog
+  let stmts = list_get(ast, 1)
+  let n = list_len(stmts)
+
+  # Pass 1: every declared function name, and its own empty-bodied BlockIR
+  # (params only) -- built first so a jump to a function declared LATER in
+  # source order still resolves during pass 2's actual body lowering.
+  let block_names = []
+  let blocks_by_name = []
+  let i = 0
+  while i < n do
+    let stmt = list_get(stmts, i)
+    if list_get(stmt, 0) == "Func" then
+      let name = list_get(stmt, 1)
+      let params = list_get(stmt, 2)
+      let block_names = list_push(block_names, name)
+      let blocks_by_name = list_push(blocks_by_name, [name, ["BlockIR", name, params, []]])
+    end
+    let i = i + 1
+  end
+
+  # Pass 2: lower each function's real body now that every target name is
+  # known, replacing each placeholder's empty instrs.
+  let blocks = []
+  let entry = false
+  let i = 0
+  while i < n do
+    let stmt = list_get(stmts, i)
+    if list_get(stmt, 0) == "Func" then
+      let name = list_get(stmt, 1)
+      let params = list_get(stmt, 2)
+      let body = list_get(stmt, 3)
+      if entry == false then
+        let entry = name
+      end
+      let instrs = bm_lower_stmt_list(body, [], block_names, blocks_by_name)
+      let blocks = list_push(blocks, ["BlockIR", name, params, instrs])
+    end
+    let i = i + 1
+  end
+  return ["BlockProgramIR", entry, blocks]
+end
