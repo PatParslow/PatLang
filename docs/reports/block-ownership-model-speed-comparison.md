@@ -6,12 +6,20 @@ commands and source are in that directory; this file is the write-up.
 
 **Bottom line up front:** the new engine, as it stands after Phase 8, is
 dramatically slower than the existing pipeline at runtime — roughly
-300x slower interpreted, and still roughly 760x slower even when its own
-interpreter loop is compiled to native machine code. Compilation/lowering
-speed is much closer (roughly on par, new is a little slower). Neither
-number is a surprise once you know what Phase 9 does and doesn't cover,
-but the *size* of the native-vs-native gap is worth being precise about
-rather than waving at "it's a prototype."
+300x slower interpreted, and (in its original, unoptimized form) roughly
+760x slower even when its own interpreter loop is compiled to native
+machine code. Compilation/lowering speed is much closer (roughly on par,
+new is a little slower). Neither number is a surprise once you know what
+Phase 9 does and doesn't cover, but the *size* of the native-vs-native
+gap was worth being precise about rather than waving at "it's a
+prototype" — and precision here paid off: a follow-up round of targeted
+interpreter optimization (see "Follow-up" below), measured before and
+after rather than assumed, cut the native gap from ~760x to **~270x** by
+replacing `bi_run`'s own string-based instruction dispatch with a
+hashed-integer one. A second attempted optimization (slot-indexed
+locals) was tried, measured, found to make things slightly *worse*, and
+reverted — kept in this report as a real, informative negative result,
+not smoothed over.
 
 ## What was measured
 
@@ -117,6 +125,71 @@ backend that compiles the block-model IR itself to machine code (skipping
 language today), or at minimum reworking `bi_run`'s own locals/stack
 representation away from linear-scan lists. Worth naming explicitly as a
 follow-up decision, not assuming Phase 9 alone would have closed it.
+
+## Follow-up: closing part of the interpreter-side gap
+
+The native snapshot above (764x) prompted a real question: how much of
+that gap is closeable by fixing `bi_run`'s own design, without touching
+Phase 9 at all? Two attempts were made and measured, not just proposed.
+
+**Attempt 1: slot-indexed locals (reverted).** `bm_loc_get`/`bm_loc_set`
+scan a list of `[name, value]` pairs, comparing strings, on every
+`Load`/`Store`. The obvious fix: resolve names to integer array slots
+once at lowering time, then use real O(1) indexed access at runtime.
+Implemented (scoped to blocks with no `if` inside, to avoid touching the
+existing name-based path used by branching code), and it passed all 34
+existing tests cleanly. Measured result: interpreted got ~4-7% faster,
+but **native got ~8% slower** (35,139 ms → 37,938 ms). Root cause,
+checked rather than assumed: this benchmark only has 2-3 locals per
+block, so the original linear scan was already close to O(1) in
+practice — the fix wrapped locals in an extra `[slots, overflow]`
+container, and that added indirection cost more than the scan it
+removed. **Reverted** rather than kept as a wash-to-negative change with
+added complexity.
+
+**Attempt 2: integer opcode-hash dispatch (kept).** `bi_run_block`'s own
+instruction dispatch, and `bm_apply_bin`'s operator dispatch, compared
+opcode strings via long `if`/`elif` chains (up to 20 branches, each a
+string comparison) on *every single instruction executed*. Fix: hash
+every opcode/operator string to an integer once, at lowering time
+(`block_ir.patlang`'s `bm_op_hash` — a small custom hash, not
+`x64_runtime.patlang`'s own `hash_string`, which returns a 16-character
+hex *string* and would have made comparisons slower, not faster — checked
+before assuming otherwise), collision-checked against all 32
+opcode/operator strings this engine uses
+(`self_hosting/block_model/bench/hash_check.patlang`, 0 collisions), and
+compare hardcoded integer constants at dispatch time. Also passed all 34
+existing tests cleanly.
+
+Measured result:
+
+| | before | after | change |
+|---|---|---|---|
+| Interpreted (double), N=800,000 | 39,261 ms | 38,547 ms | ~2% (noise-level) |
+| **Native, N=800,000** | **35,139 ms** | **12,421 ms** | **~2.8x faster** |
+| Native vs. OLD native (46 ms) | ~764x | ~270x | gap cut by two-thirds |
+
+The interpreted number barely moved, and that's expected, not a
+disappointment: under double interpretation, the Rust interpreter's own
+per-PatLang-function-call overhead dominates so heavily that shaving the
+cost of one string comparison inside code that's *itself* being
+interpreted doesn't show up. The native number is where a CPU-level
+integer compare vs. a CPU-level string compare actually shows its real
+difference — and it's substantial: **cutting the native gap from ~764x
+to ~270x**, the single biggest improvement made to this engine's actual
+running speed so far.
+
+**What's still open, going by the same reasoning applied to what's left:**
+the value stack still rebuilds itself on every pop (a real cost for
+expressions deeper than this benchmark's own 2-3-deep stack); every
+instruction is still a heap-allocated PatLang list requiring `list_get`
+calls to decode; and every `Load`/`Store`/dispatch step is still several
+separate PatLang function calls, each with its own call overhead even
+when compiled. None of these were touched this round. ~270x is a real,
+earned improvement, not a claim that the gap is closed — closing it the
+rest of the way most plausibly still needs actual Phase 9 (compiling the
+block-model IR itself, no interpretation loop at all), not further
+interpreter tuning alone.
 
 ## What this does and doesn't say about the design
 
