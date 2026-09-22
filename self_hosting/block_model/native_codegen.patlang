@@ -1,0 +1,315 @@
+# Block Ownership Model, Phase 9: translates a BlockProgramIR into a
+# single, real, flat FuncIR ("main"), reusing self_hosting/lib/
+# codegen_x64.patlang's OWN, already-proven emit_program_x64 for
+# EVERYTHING ELSE (register allocation, tagged-fixnum arithmetic, PE
+# headers, entry stub, calling conventions) -- no new x64 emission code
+# written here at all.
+#
+# The key insight this relies on, verified before building on it rather
+# than assumed: the design doc's own Fork A reasoning already
+# established that today's Jump/JumpIfFalse in self_hosting/lib/
+# lower.patlang's own FuncIR ARE exactly the block/jump mechanism this
+# whole model is built on -- "n is an absolute index into the SAME
+# array" is already true of the EXISTING FuncIR shape. So JumpBlock's
+# own semantics (forward specific values by name, then transfer
+# control, no call stack) map DIRECTLY onto: ordinary Store instructions
+# (writing the forwarded values into the TARGET block's own local
+# names, in reverse order to match the values already sitting on the
+# stack) followed by an ordinary Jump to that block's own start
+# position in the FLATTENED instruction array -- no new instruction
+# TYPE needed in the real backend at all. Concatenating every block's
+# own instrs into ONE flat array and jumping between them via ordinary
+# Jump is EXACTLY what "no call stack, turtles all the way down" (Fork
+# A's own decision) means at the native level: there is no CALL/RET
+# anywhere in the translated output for block-to-block transfer, only
+# JMP -- confirmed, not just claimed, by checking the emitted assembly
+# has no `call`/`ret` between block labels (see this phase's own
+# verification notes).
+#
+# Each block's own local NAMES are prefixed with the block's own name
+# (e.g. "combine__s") before flattening, since concatenating unprefixed
+# blocks into ONE function would let two DIFFERENT blocks' own,
+# unrelated locals silently alias if they happened to share a name --
+# a real collision risk this pass exists specifically to rule out, not
+# a theoretical one. A genuinely unbound reference inside one block
+# (referencing a name never bound anywhere in ITS OWN, now-prefixed
+# instructions) is still caught -- not silently allowed -- but
+# differently than the interpreter: self_hosting/lib/codegen_x64.patlang
+# has its own existing "undefined variable" check (found and confirmed
+# directly, not assumed) that rejects this at COMPILE time, where the
+# interpreter's bm_loc_get instead raises a guaranteed-fail error at
+# RUNTIME. A real, disclosed behavioral difference, not a silent gap.
+#
+# Print translates to an ordinary Call "print" -- NOT CallHost "print"
+# (tried first, rejected by codegen_x64.patlang as "not a real function
+# and not in the OS-boundary allowlist": found out by checking, not
+# assumed), and NOT x64_runtime.patlang's rt_print_i64 either (this
+# backend's own arithmetic produces TAGGED fixnum values; rt_print_i64
+# expects a RAW, untagged i64 -- an internal utility for values already
+# peeked straight from memory elsewhere in that file -- so feeding it a
+# tagged value would print corrupted garbage, not the real number).
+# x64_runtime.patlang defines `print` as an ORDINARY PatLang function
+# (checked directly), resolved as a plain Call against the SAME rt_funcs
+# this driver already bundles in -- not a host primitive at all.
+#
+# Explicitly NOT translated in this pass (named, not silently dropped):
+# BoxNew/BoxGet/BoxSet/BoxSetUnchecked/BoxShare/ContractFail/GlobalGet/
+# GlobalSet/HandlerNew/HandlerRegister/HandlerLookup -- this phase's own
+# benchmark needs none of them; translating them (most plausibly into
+# ordinary Call instructions against heap.patlang's own, already-
+# compilable functions, which Phase 1/3 already proved compile
+# correctly) is real, separate future work, not attempted here.
+
+# Reads block instrs AFTER lower.patlang's own bm_hash_rewrite_instrs
+# (the opcode-hash-dispatch optimization) -- bm_lower_program's output is
+# ALREADY hash-tagged by the time this pass ever sees it (that rewrite is
+# applied unconditionally to every block at construction time), so this
+# pass recognizes instructions by the SAME hardcoded bm_op_hash constants
+# interp.patlang's own dispatch chain uses, then EMITS ordinary,
+# plain-STRING-tagged FuncIR instructions -- what self_hosting/lib/
+# codegen_x64.patlang actually expects, since it knows nothing about
+# this engine's own hashing scheme. This pass does double duty:
+# de-hashing AND flattening/renaming, in one walk.
+include "block_ir.patlang"
+
+make a function called bm_nc_unsupported takes what returns nothing
+  contract_check("bm_native_codegen", "assert", "Phase 9's translation does not support: " + what, false)
+  return false
+end
+
+make a function called bm_nc_prefix takes block_name, name returns out
+  return block_name + "__" + name
+end
+
+# Pass 1: translate ONE block's own instrs independently. Load/Store
+# names get prefixed; Jump/JumpIfFalse targets are left as block-LOCAL
+# indices for now (fixed up to absolute indices once every block's own
+# start offset in the flattened array is known -- pass 2, below).
+# JumpBlock is expanded here directly into Store (reverse param order,
+# matching what's already on the stack) + a placeholder Jump, later
+# resolved to the target block's own absolute start position.
+make a function called bm_nc_translate_block_instrs takes block_name, instrs returns out
+  # Returns [translated_instrs, index_map] -- index_map[k] is the
+  # position in translated_instrs where ORIGINAL instrs[k] starts, for
+  # k in 0..n (index_map[n] is the "one past the end" sentinel, for a
+  # JumpIfFalse/Jump target that means "fall off the end of this
+  # block"). Needed because JumpBlock expands into SEVERAL instructions
+  # (a Store per forwarded value, plus a Jump) -- a JumpIfFalse/Jump
+  # target computed against the ORIGINAL, one-JumpBlock-is-one-
+  # instruction numbering does NOT equal its own position in the
+  # EXPANDED output once anything earlier in the block was a JumpBlock,
+  # which is exactly what a loop head (section 4.1) always has: found
+  # as a genuine, reproduced infinite-loop bug (a tiny 3-iteration test
+  # case hung indefinitely; self_hosting/block_model/bench/
+  # diag_dump_funcir.patlang's own instruction dump showed the loop's
+  # own JumpIfFalse landing MID-WAY through the back-edge's own Store
+  # sequence instead of at the exit block's own), not assumed or
+  # designed around in advance.
+  let n = list_len(instrs)
+  let out = []
+  let index_map = []
+  let i = 0
+  while i < n do
+    let index_map = list_push(index_map, list_len(out))
+    let instr = list_get(instrs, i)
+    let op = list_get(instr, 0)
+    if op == 487138 then # "Const"
+      let out = list_push(out, ["Const", list_get(instr, 1), list_get(instr, 2)])
+    elif op == 277141 then # "Load"
+      let out = list_push(out, ["Load", bm_nc_prefix(block_name, list_get(instr, 1))])
+    elif op == 642543 then # "Store"
+      let out = list_push(out, ["Store", bm_nc_prefix(block_name, list_get(instr, 1))])
+    elif op == 451867 then # "Bin"
+      let out = list_push(out, ["Bin", bm_nc_bin_op_string(list_get(instr, 1))])
+    elif op == 862809 then # "Un"
+      let out = list_push(out, ["Un", bm_nc_un_op_string(list_get(instr, 1))])
+    elif op == 34716 then # "JumpIfFalse"
+      let out = list_push(out, ["JumpIfFalse", list_get(instr, 1)])
+    elif op == 212209 then # "Jump"
+      let out = list_push(out, ["Jump", list_get(instr, 1)])
+    elif op == 6264 then # "Print"
+      # x64_runtime.patlang defines print as an ORDINARY function
+      # (checked directly, not assumed after CallHost "print" was
+      # rejected as "not a real function and not in the OS-boundary
+      # allowlist") -- an ordinary Call, resolved against the bundled
+      # rt_funcs this driver already links in, not a host primitive.
+      let out = list_push(out, ["Call", "print", 1])
+    elif op == 974555 then # "JumpBlock"
+      let target_name = list_get(instr, 1)
+      let param_names = list_get(instr, 2)
+      let pn = list_len(param_names)
+      let j = pn - 1
+      while j >= 0 do
+        let out = list_push(out, ["Store", bm_nc_prefix(target_name, list_get(param_names, j))])
+        let j = j - 1
+      end
+      let out = list_push(out, ["__JumpBlockTarget", target_name])
+    else
+      bm_nc_unsupported("instruction hash '" + op + "'")
+    end
+    let i = i + 1
+  end
+  let index_map = list_push(index_map, list_len(out))
+  return [out, index_map]
+end
+
+# Bin/Un operator hashes (also bm_op_hash'd by lower.patlang's rewrite)
+# need to become real operator STRINGS again for the real FuncIR's own
+# Bin/Un instructions, which self_hosting/lib/codegen_x64.patlang parses
+# as literal "+"/"-"/etc.
+make a function called bm_nc_bin_op_string takes h returns s
+  if h == 177616 then
+    return "+"
+  elif h == 177618 then
+    return "-"
+  elif h == 177615 then
+    return "*"
+  elif h == 177620 then
+    return "/"
+  elif h == 177610 then
+    return "%"
+  elif h == 861968 then
+    return "=="
+  elif h == 861044 then
+    return "!="
+  elif h == 177633 then
+    return "<"
+  elif h == 861935 then
+    return "<="
+  elif h == 177635 then
+    return ">"
+  elif h == 862001 then
+    return ">="
+  end
+  bm_nc_unsupported("Bin operator hash '" + h + "'")
+  return "+"
+end
+
+make a function called bm_nc_un_op_string takes h returns s
+  if h == 499987 then
+    return "not"
+  elif h == 177618 then
+    return "-"
+  end
+  bm_nc_unsupported("Un operator hash '" + h + "'")
+  return "not"
+end
+
+make a function called bm_nc_assoc_get takes assoc, key returns v
+  let n = list_len(assoc)
+  let i = 0
+  while i < n do
+    let entry = list_get(assoc, i)
+    if list_get(entry, 0) == key then
+      return list_get(entry, 1)
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# The whole translation: concatenate every block's own translated
+# instrs, record each block's absolute start pc, then a final pass
+# rewrites block-LOCAL Jump/JumpIfFalse targets to absolute indices and
+# resolves each __JumpBlockTarget placeholder into a real, absolute
+# Jump.
+make a function called bm_to_real_funcir takes prog returns funcir
+  let blocks = bi_program_blocks(prog)
+  let bn = list_len(blocks)
+
+  # bi_run seeds the ENTRY block's own "__globals" specially
+  # (bm_loc_set(bm_loc_new(), "__globals", []) in interp.patlang) --
+  # nothing ever JumpBlocks INTO the entry block to populate it via an
+  # ordinary Store, so without this init instruction, the entry block's
+  # own prefixed "__globals" name would be read (via the forwarding
+  # Load every block unconditionally has) before ever being written,
+  # which codegen_x64.patlang's own undefined-variable check correctly
+  # catches (confirmed directly: this exact error is what surfaced this
+  # gap in the first place, not something anticipated in advance).
+  let entry_name = bi_program_entry(prog)
+  let init_instrs = [["BuildList", 0], ["Store", bm_nc_prefix(entry_name, "__globals")]]
+
+  # Pass 1: translate each block independently; record where its own
+  # (still block-local) instrs will start once concatenated -- offset by
+  # init_instrs' own length, since those run first.
+  let translated = []
+  let starts = []
+  let running_len = list_len(init_instrs)
+  let bi = 0
+  while bi < bn do
+    let blk = list_get(blocks, bi)
+    let name = bi_block_name(blk)
+    let result = bm_nc_translate_block_instrs(name, bi_block_instrs(blk))
+    let t = list_get(result, 0)
+    let index_map = list_get(result, 1)
+    let translated = list_push(translated, [name, t, index_map])
+    let starts = list_push(starts, [name, running_len])
+    let running_len = running_len + list_len(t)
+    let bi = bi + 1
+  end
+
+  # Pass 2: flatten, fixing up Jump/JumpIfFalse (block-local original
+  # index -> its own EXPANDED position via that block's own index_map,
+  # THEN absolute by adding this block's own start offset -- NOT
+  # block-local original index + start offset directly, which silently
+  # gives the wrong answer the moment anything earlier in the block was
+  # a JumpBlock, since those expand into more than one instruction) and
+  # __JumpBlockTarget (-> an ordinary, absolute Jump to the TARGET
+  # block's own start).
+  let flat = init_instrs
+  let bi = 0
+  while bi < bn do
+    let entry = list_get(translated, bi)
+    let name = list_get(entry, 0)
+    let t = list_get(entry, 1)
+    let index_map = list_get(entry, 2)
+    let base = bm_nc_assoc_get(starts, name)
+    let tn = list_len(t)
+    let ti = 0
+    while ti < tn do
+      let instr = list_get(t, ti)
+      let op = list_get(instr, 0)
+      if (op == "Jump") or (op == "JumpIfFalse") then
+        let mapped = list_get(index_map, list_get(instr, 1))
+        let flat = list_push(flat, [op, base + mapped])
+      elif op == "__JumpBlockTarget" then
+        let target_base = bm_nc_assoc_get(starts, list_get(instr, 1))
+        let flat = list_push(flat, ["Jump", target_base])
+      else
+        let flat = list_push(flat, instr)
+      end
+      let ti = ti + 1
+    end
+    let bi = bi + 1
+  end
+
+  let flat = list_push(flat, ["Const", "unit", ""])
+  let flat = list_push(flat, ["Return"])
+  return ["FuncIR", "main", [], flat, []]
+end
+
+# Namespacing note: an earlier version of this file bundled
+# x64_runtime.patlang's own source directly into the same compilation
+# unit as the translated block-model program, and salted (prefixed)
+# every one of its ~326 function names to avoid collisions with a
+# block-model program's own names. Tried, and abandoned after a REAL
+# link failure: codegen_x64.patlang hardcodes raw `call
+# rt_bigint_from_i64`-style asm text directly for overflow-checked
+# arithmetic (x64_binop_asm_dynamic and similar), invisible to any
+# IR-level Call/MakeClosure rename -- confirmed via that file's own
+# header comment on emit_program_x64's `extern_names` parameter, which
+# exists SPECIFICALLY because "most runtime calls... are hand-assembled
+# string literals... invisible to any IR-level call-graph walk."
+# Salting would have needed to also chase down every one of those
+# hardcoded references, an open-ended, easy-to-miss list.
+#
+# The build now used instead (self_hosting/block_model/bench/
+# build_phase9_native.patlang) sidesteps this category of problem
+# entirely: a real two-CHUNK build, linking against the already-built,
+# already-cached self_hosting/build/x64_runtime.obj (never re-lowered
+# here) via emit_program_x64's own `extern_names` mechanism -- true
+# linker-level namespace separation, which can't silently miss a
+# hardcoded reference the way textual renaming could, since an
+# unresolved symbol is a loud link error, not quiet misbehavior.
+# Mirrors self_hosting/build_x64_runtime.patlang's own established
+# two-chunk convention exactly, not a new invention.

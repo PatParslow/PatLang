@@ -1,25 +1,24 @@
 # Block Ownership Model: speed comparison against the existing pipeline
 
-Measured 2026-09-22 on `feature/block-ownership-model` (Phases 0-8 complete),
+Measured 2026-09-22 on `feature/block-ownership-model` (Phases 0-9 complete),
 via `self_hosting/block_model/bench/run_speed_comparison.patlang`. Raw
 commands and source are in that directory; this file is the write-up.
 
-**Bottom line up front:** the new engine, as it stands after Phase 8, is
+**Bottom line up front:** the new engine, immediately after Phase 8, was
 dramatically slower than the existing pipeline at runtime — roughly
 300x slower interpreted, and (in its original, unoptimized form) roughly
-760x slower even when its own interpreter loop is compiled to native
-machine code. Compilation/lowering speed is much closer (roughly on par,
-new is a little slower). Neither number is a surprise once you know what
-Phase 9 does and doesn't cover, but the *size* of the native-vs-native
-gap was worth being precise about rather than waving at "it's a
-prototype" — and precision here paid off: a follow-up round of targeted
-interpreter optimization (see "Follow-up" below), measured before and
-after rather than assumed, cut the native gap from ~760x to **~270x** by
-replacing `bi_run`'s own string-based instruction dispatch with a
-hashed-integer one. A second attempted optimization (slot-indexed
-locals) was tried, measured, found to make things slightly *worse*, and
-reverted — kept in this report as a real, informative negative result,
-not smoothed over.
+760x slower even when its own interpreter loop (`bi_run`) was compiled
+to native machine code. That native gap was cut to ~270x by an
+interpreter-level fix (opcode-hash dispatch, replacing string
+comparisons with integer ones), and then closed entirely — down to
+ordinary process-timing noise — by Phase 9, real native codegen for the
+block-model IR itself, with no interpretation loop left at runtime at
+all. The full arc, in order, each step measured before being trusted
+rather than assumed: 764x → 270x (interpreter tuning) → **~1x** (real
+codegen). Compilation/lowering speed was close to on par with the
+existing pipeline throughout (new was a little slower, mostly explained
+by compiling substantially more real source once the new engine's own
+size grew).
 
 ## What was measured
 
@@ -187,9 +186,100 @@ calls to decode; and every `Load`/`Store`/dispatch step is still several
 separate PatLang function calls, each with its own call overhead even
 when compiled. None of these were touched this round. ~270x is a real,
 earned improvement, not a claim that the gap is closed — closing it the
-rest of the way most plausibly still needs actual Phase 9 (compiling the
-block-model IR itself, no interpretation loop at all), not further
-interpreter tuning alone.
+rest of the way needed actual Phase 9 (compiling the block-model IR
+itself, no interpretation loop at all), which is exactly what follows.
+
+## Phase 9: real native codegen closes the gap
+
+Phase 9 (`self_hosting/block_model/native_codegen.patlang`) translates a
+`BlockProgramIR` into a single, real, flat `FuncIR` — every block's own
+instructions concatenated, `JumpBlock` expanded into ordinary `Store`
+instructions (forwarding values by name) plus a real `Jump` — and reuses
+`self_hosting/lib/codegen_x64.patlang`'s own, already-proven
+`emit_program_x64` for everything else: register allocation,
+tagged-fixnum arithmetic, PE headers, the entry stub, calling
+conventions. No new x64 emission code was written; no interpretation of
+the block-model IR happens at runtime at all.
+
+This relies on an insight already present in the design doc itself,
+checked rather than assumed before building on it: today's real
+`Jump`/`JumpIfFalse` in `self_hosting/lib/lower.patlang`'s own `FuncIR`
+already are the block/jump mechanism Fork A describes — "n is an
+absolute index into the same array." Concatenating every block into one
+flat array and jumping between them via ordinary `Jump` is exactly what
+"no call stack, turtles all the way down" means at the native level, and
+this is now *verified*, not just designed for: the emitted assembly's
+only `call` instructions are to genuine runtime helpers (`rt_bigint_add`,
+`print`, `ExitProcess`, ...) for actual computation — never to another
+block's own label. Every transfer of control between blocks is a plain
+`jmp`.
+
+**Two real problems were found and fixed getting here, not designed
+around in advance:**
+
+1. **Two build-time collisions**, both from bundling `x64_runtime.patlang`
+   naively into one compilation unit: it synthesizes its own (empty)
+   `main` even with no top-level statements of its own, colliding with
+   this engine's own translated entry function; and `codegen_x64.patlang`
+   hardcodes raw `call rt_bigint_from_i64`-style assembly text directly
+   for overflow-checked arithmetic, invisible to any IR-level rename —
+   found after a first attempt to fix the naming collision by *salting*
+   (prefixing) the runtime's own function names hit an unresolved-symbol
+   link error from exactly this hardcoding. Fixed by switching to a real
+   two-chunk build (mirroring `self_hosting/build_x64_runtime.patlang`'s
+   own established convention): this engine's own translated program
+   links against the already-built, already-cached
+   `self_hosting/build/x64_runtime.obj` via `emit_program_x64`'s own
+   `extern_names` mechanism, true linker-level namespace separation that
+   can't silently miss a hardcoded reference the way textual renaming
+   could.
+2. **A genuine infinite-loop bug**, caught by a small, deliberately
+   cheap test (a 3-iteration loop) before ever reaching the full
+   benchmark: `JumpBlock` expands into *multiple* instructions (a
+   `Store` per forwarded value, plus a `Jump`), so a `JumpIfFalse`/`Jump`
+   target computed against the original, one-`JumpBlock`-is-one-
+   instruction numbering does not equal its own position in the expanded
+   output, the moment anything earlier in the same block was itself a
+   `JumpBlock` — exactly the shape every loop head has. The loop's own
+   condition check ended up jumping mid-way through its own back edge's
+   Store sequence instead of to the exit block, producing a real hang.
+   Fixed with a per-block index map from original instruction position
+   to its own expanded position, resolved before adding each block's
+   absolute offset. The large-N benchmark's own earlier "VirtualAlloc
+   commit failed" crash (reported when Phase 9 work was interrupted
+   mid-session) was almost certainly the same bug: an infinite loop's
+   sum growing without bound until repeated BigInt promotion exhausted
+   the heap, not a separate, unrelated problem.
+
+**Result, at N=800,000, confirmed correct (byte-identical to every
+other execution path) before being trusted:**
+
+| | time |
+|---|---|
+| OLD native (baseline) | 16 ms |
+| bi_run compiled, hash-dispatch (previous best) | ~12,400 ms |
+| **Phase 9: real native codegen** | **~12–18 ms** |
+
+The gap is closed, not just narrowed. Phase 9's own native codegen runs
+within ordinary process-to-process timing noise of the existing
+pipeline's own native path — because it is now doing the same kind of
+work: real compiled jumps, real compiled tagged-fixnum arithmetic, real
+function calls only for actual computation. This is the number that
+answers this report's own original question in full: the ~764x-to-1x
+gap was never inherent to the Block Ownership Model's own design: it was
+entirely attributable to `bi_run` being an interpreter, and it closes
+once that interpretation loop is removed, exactly as the earlier
+sections of this report predicted before Phase 9 was attempted.
+
+Scope, disclosed rather than assumed complete: this translation covers
+`Const`/`Load`/`Store`/`Bin`/`Un`/`JumpIfFalse`/`Jump`/`Print`/
+`JumpBlock` — everything the speed-comparison benchmark needs.
+`BoxNew`/`BoxGet`/`BoxSet`/`BoxSetUnchecked`/`BoxShare`/`ContractFail`/
+`GlobalGet`/`GlobalSet`/`HandlerNew`/`HandlerRegister`/`HandlerLookup`
+are not translated (a clear, contract-checked "unsupported" error, not
+silently mishandled) — real, separate future work, most plausibly via
+ordinary `Call` instructions to `heap.patlang`'s own already-compilable
+functions, which Phases 1 and 3 already proved compile correctly.
 
 ## What this does and doesn't say about the design
 
