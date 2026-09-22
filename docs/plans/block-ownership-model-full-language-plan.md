@@ -1,10 +1,13 @@
 # Block Ownership Model: full-language expansion plan
 
-**Status (2026-09-22): Phases 10–16 (event dispatch, pattern matching,
+**Status (2026-09-22): Phases 10–17 (event dispatch, pattern matching,
 design by contract, object orientation, cooperative fiber_yield, logic-
-programming facts, numeric tower) complete and verified —
-`self_hosting/block_model/run_block_model_spec_suite.patlang` reports
-82/82 passing, no regressions. Phase 13 also found and fixed two real,
+programming facts, numeric tower, system integration) complete and
+verified — `self_hosting/block_model/run_block_model_spec_suite.patlang`
+reports 83/83 passing, no regressions. Phase 17 also corrected a wrong
+premise in this plan's own text (there is no generic `CallHost` dispatch
+in this engine at all — every host function needs individual recognition,
+the same as every earlier phase's own host-function work). Phase 13 also found and fixed two real,
 pre-existing bugs (`HandlerRegister`'s append-only behavior, and its own
 downstream exposure of already-filed issue #145's native x64 `list_set`
 aliasing bug) — see Phase 13's own section below for the full account.
@@ -18,7 +21,7 @@ design, proof, and native/WASM verification) were already complete on
 `feature/block-ownership-model` — see
 [`block-ownership-model-implementation-plan.md`](block-ownership-model-implementation-plan.md)
 for that record, which this document continues rather than replaces.
-Phases 17–20 below are not built yet.**
+Phases 18–20 below are not built yet.**
 
 Companion to [`block-ownership-model.md`](block-ownership-model.md) (the
 design doc, Forks A–E) and the Phase 0–9 implementation plan. Those decided
@@ -473,6 +476,36 @@ lowering mechanism.
 
 **Checkpoint:** the feature passes; the "is this really just CallHost"
 question is answered per primitive, not assumed uniformly.
+
+**Done (2026-09-22) — the plan's own premise here needed correcting,
+checked against real code before trusting it:** "already supported since
+Phase 2's function-call lowering" turned out to be wrong. Phase 2's own
+call lowering (`bm_lower_jump_call`) only handles calls to *other
+declared blocks* (via `JumpBlock`) — this engine has **no generic
+`CallHost` dispatch at all**; every recognized host function needs its
+own individually-named `Call` case in `bm_lower_expr`/`bm_lower_stmt`
+(the same pattern Print/Emit/FiberYield/Fact/Query/TypeOf already use).
+So this phase is not pure verification as planned — it's the same kind of
+one-function-at-a-time work every earlier host-function addition needed.
+
+Scoped down to `read_file`/`write_file` accordingly (both genuine, fixed-
+arity host functions), with the rest of this phase's own planned scope
+named as real, separable follow-ups rather than attempted with
+insufficient machinery:
+- `spawn`/`exec_capture` take a **variadic** argument list, which this
+  engine's fixed-arity recognized-call pattern doesn't accommodate
+  without real design work (an argc-carrying instruction, mirroring how
+  `JumpBlock`'s own param count already varies per call site).
+- `queue_publish`/`consume`/`ack` turned out **not to be Rust host
+  functions at all** (checked directly) but ordinary PatLang library
+  functions (`self_hosting/lib/queue.patlang`) — callable the same way
+  once that file is `include`d, but a real library dependency this pass
+  doesn't pull in.
+- `signal_*` is deferred for the same library-dependency reason.
+- TCP networking and `argv` weren't attempted this pass either.
+
+1/1 scenario passes (a file write/read round-trip through two different
+blocks); full suite 83/83, no regressions.
 
 ---
 
