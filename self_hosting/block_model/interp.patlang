@@ -19,6 +19,20 @@
 # fine for a prototype interpreter whose stack/locals depth is bounded by
 # one block's own expression complexity, never by program input.
 #
+# Phase 10 adds Emit (event dispatch) -- the ONE place in this file that
+# calls bi_run_block recursively rather than returning a "jump" outcome to
+# bi_run's own flat loop. This is a deliberate, narrowly-scoped exception
+# to this file's own "no call stack anywhere" claim above, not a quiet
+# reintroduction of general calls: lower.patlang's own Phase 10 note
+# guarantees a handler body can never itself contain a JumpBlock (its
+# block_names/blocks_by_name are lowered as empty on purpose), so a
+# recursive bi_run_block call for a handler is guaranteed to return
+# ["halt", ...] and nothing else -- there is no nested jump to unwind, so
+# no real call-stack growth risk despite the recursion. See block_ir
+# .patlang's own Phase 10 note for why this doesn't fully match the real
+# engine's runtime, closure-based `when` semantics (a v1 restriction,
+# named plainly).
+#
 # Phase 3 adds Box*/ContractFail (section 3.4/3.5, Fork D wired in for
 # real) via heap.patlang -- and heap.patlang's own functions are, in turn,
 # native-x64-only (they call mem_peek_qword/mem_poke_qword/rt_heap_alloc,
@@ -363,6 +377,48 @@ make a function called bi_run_block takes prog, blk, locs returns outcome
       let popped_n = bm_st_pop(list_get(popped_h, 1))
       let stack = bm_st_push(list_get(popped_n, 1), bm_rt_assoc_get(handler, list_get(popped_n, 0)))
       let pc = pc + 1
+    elif op == 23684 then # "Emit"
+      # Pops (globals, event_name, payload) -- same push order as
+      # lower.patlang's own bm_lower_stmt "emit" case (payload, then
+      # event_name, then __globals), so globals pops first. Runs every
+      # registered handler for event_name, in registration order, as a
+      # bounded sub-execution via a RECURSIVE bi_run_block call (see this
+      # file's own Phase 10 header for why that's safe here specifically),
+      # threading each handler's own resulting "__globals" into the next
+      # one's incoming pointer, then writing the final result back into
+      # THIS block's own "__globals" local before falling through --
+      # genuinely returning control, unlike every other jump in this file.
+      let popped_g = bm_st_pop(stack)
+      let globals_val = list_get(popped_g, 0)
+      let popped_e = bm_st_pop(list_get(popped_g, 1))
+      let event_name = list_get(popped_e, 0)
+      let popped_p = bm_st_pop(list_get(popped_e, 1))
+      let payload = list_get(popped_p, 0)
+      let stack = list_get(popped_p, 1)
+      let handler_names = bm_rt_assoc_get(bi_program_events(prog), event_name)
+      if handler_names == false then
+        let handler_names = []
+      end
+      let hn = list_len(handler_names)
+      let hi = 0
+      let cur_globals = globals_val
+      while hi < hn do
+        let handler_name = list_get(handler_names, hi)
+        let handler_blk = bi_find_block(prog, handler_name)
+        let handler_locs = bm_loc_new()
+        let handler_locs = bm_loc_set(handler_locs, "event_name", event_name)
+        let handler_locs = bm_loc_set(handler_locs, "event_data", payload)
+        let handler_locs = bm_loc_set(handler_locs, "__globals", cur_globals)
+        let handler_outcome = bi_run_block(prog, handler_blk, handler_locs)
+        if list_get(handler_outcome, 0) != "halt" then
+          contract_check("bm_interp", "assert", "event handler '" + handler_name + "' attempted to jump to another block -- unsupported under Phase 10's restricted event model (a handler body can only reach print/box_*/global_*/handler_*/emit)", false)
+        end
+        let final_handler_locs = list_get(handler_outcome, 2)
+        let cur_globals = bm_loc_get(final_handler_locs, "__globals")
+        let hi = hi + 1
+      end
+      let locs = bm_loc_set(locs, "__globals", cur_globals)
+      let pc = pc + 1
     elif op == 974555 then # "JumpBlock"
       let target_name = list_get(instr, 1)
       let param_names = list_get(instr, 2)
@@ -391,7 +447,14 @@ make a function called bi_run_block takes prog, blk, locs returns outcome
       contract_check("bm_interp", "assert", "unknown block-model instruction: " + op, false)
     end
   end
-  return ["halt", "unit"]
+  # Phase 10: a 3rd element (this block's own final locs) is appended here
+  # now, purely additive -- bi_run/bi_debug_run's own consumption of a
+  # "halt" outcome only ever reads elements 0/1, unchanged. Emit's own
+  # recursive bi_run_block call is the one real consumer of element 2: it
+  # needs a handler's own final "__globals" value, which only a "halt"
+  # outcome (guaranteed for a handler body, per lower.patlang's own Phase
+  # 10 note) can expose.
+  return ["halt", "unit", locs]
 end
 
 # The whole engine's own top-level loop -- flat, not recursive: this is

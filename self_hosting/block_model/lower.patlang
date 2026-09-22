@@ -115,6 +115,30 @@
 # only one real consumer of it here, bm_lower_while -- nothing about the
 # analysis is closure-specific, but nothing here calls it for one either).
 #
+# Phase 10 adds event dispatch (section 8's own claim, checked directly
+# against the real Rust interpreter and found narrower than stated -- see
+# block_ir.patlang's own Phase 10 note for the full finding): a top-level
+# `["When", event_name, body, line]` node lowers to its own synthesized,
+# non-jump-callable BlockIR, registered in the program's own compile-time
+# event table (bi_program_events) rather than block_names/blocks_by_name --
+# deliberately excluded from both, so a handler can NEVER be reached via
+# an ordinary JumpBlock/Call, only through Emit's own table lookup. Its
+# body is lowered with block_names/blocks_by_name passed as EMPTY lists on
+# purpose: this phase's Emit instruction runs a handler as a bounded,
+# non-tail sub-execution with no call stack to unwind through a nested
+# jump (interp.patlang's own header), so a handler calling another
+# declared function is out of scope here, not silently allowed -- it hits
+# bm_lower_unsupported exactly like any other unrecognized call shape. A
+# `while` loop IS still reachable inside a handler body for free (nothing
+# about bm_lower_top_level_stmt_list's own While handling depends on
+# block_names), since a loop's own JumpBlock targets are always its own
+# synthesized head/exit blocks, never a user-declared function.
+#
+# `emit(event, payload)` lowers as a bare statement (bm_lower_stmt's own
+# "Expr" arm) to a MID-BLOCK ["Emit"] instruction, never a JumpBlock --
+# see block_ir.patlang's own header for exactly why (it returns control,
+# unlike everything else this engine's blocks end with).
+#
 # Phase 7 adds (section 6, Fork C, wired in for real): flight_check
 # .patlang's own `fresh` tracking, threaded through
 # bm_lower_top_level_stmt_list (see its own Let-handling below), decides
@@ -287,6 +311,16 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
         return list_push(instrs, ["GlobalSet"])
       elif (name == "box_set") or (name == "box_share") or (name == "box_new") or (name == "box_get") or (name == "get_global") or (name == "handler_new") or (name == "handler_register") or (name == "handler_lookup") then
         return bm_lower_expr(call, instrs, block_names, immut_params)
+      elif name == "emit" then
+        # Mid-block, unlike everything else emitted here (JumpBlock always
+        # ends the block; Emit never does) -- see block_ir.patlang's own
+        # Phase 10 header for why: emit() genuinely returns control to the
+        # statement after it, matching the real interpreter's own
+        # call-with-return semantics, not a jump-and-never-return one.
+        let instrs = bm_lower_expr(list_get(call_args, 1), instrs, block_names, immut_params)
+        let instrs = bm_lower_expr(list_get(call_args, 0), instrs, block_names, immut_params)
+        let instrs = list_push(instrs, ["Load", "__globals"])
+        return list_push(instrs, ["Emit"])
       elif bm_list_contains(block_names, name) then
         return bm_lower_jump_call(call, instrs, block_names, blocks_by_name, immut_params)
       end
@@ -433,6 +467,24 @@ make a function called bm_lower_while takes stmt, stmts, idx, instrs, block_name
   return [instrs, pending]
 end
 
+# Phase 10: registers handler_name against event_name in registration
+# order, appending to that event's own handler list if it's already seen
+# (the "multiple handlers for the same event" case) rather than
+# overwriting -- unlike bm_rt_assoc_set (interp.patlang), which always
+# replaces a single value, since an event key maps to a GROWING list here.
+make a function called bm_events_register takes events, event_name, handler_name returns out
+  let n = list_len(events)
+  let i = 0
+  while i < n do
+    let entry = list_get(events, i)
+    if list_get(entry, 0) == event_name then
+      return list_set(events, i, [event_name, list_push(list_get(entry, 1), handler_name)])
+    end
+    let i = i + 1
+  end
+  return list_push(events, [event_name, [handler_name]])
+end
+
 make a function called bm_assoc_get takes assoc, key returns v
   let n = list_len(assoc)
   let i = 0
@@ -480,7 +532,7 @@ make a function called bm_hash_rewrite_instrs takes instrs returns out
       let out = list_push(out, [bm_op_hash(op), list_get(instr, 1), list_get(instr, 2)])
     else
       # Print/BoxNew/BoxGet/BoxSet/BoxSetUnchecked/BoxShare/GlobalGet/
-      # GlobalSet/HandlerNew/HandlerRegister/HandlerLookup: no operand
+      # GlobalSet/HandlerNew/HandlerRegister/HandlerLookup/Emit: no operand
       # beyond the opcode itself.
       let out = list_push(out, [bm_op_hash(op)])
     end
@@ -522,6 +574,7 @@ make a function called bm_lower_program takes ast returns prog
   # recomputed here, per block -- box_set's mut-check only ever looks at
   # THIS block's own parameter list, never a caller's or callee's.
   let blocks = []
+  let events = []
   let entry = false
   let i = 0
   while i < n do
@@ -556,8 +609,30 @@ make a function called bm_lower_program takes ast returns prog
         let blocks = list_push(blocks, list_get(synthesized, si))
         let si = si + 1
       end
+    elif list_get(stmt, 0) == "When" then
+      # Phase 10: see this file's own header above for why block_names/
+      # blocks_by_name are EMPTY here (a handler can't JumpBlock to a
+      # declared function) and why this handler is never added to the
+      # program's own block_names -- it's reachable only through `events`.
+      let event_name = list_get(stmt, 1)
+      let body = list_get(stmt, 2)
+      let handler_name = bm_next_synth_name("__on_" + event_name)
+      let handler_params = ["event_name", "event_data", "__globals"]
+      let handler_immut_params = ["event_name", "event_data"]
+      let handler_known_locals = ["event_name", "event_data"]
+      let top_result = bm_lower_top_level_stmt_list(body, 0, [], [], [], handler_immut_params, handler_known_locals, [], [])
+      let handler_instrs = list_get(top_result, 0)
+      let handler_synth = list_get(top_result, 1)
+      let blocks = list_push(blocks, ["BlockIR", handler_name, handler_params, bm_hash_rewrite_instrs(handler_instrs)])
+      let hs = list_len(handler_synth)
+      let hi = 0
+      while hi < hs do
+        let blocks = list_push(blocks, list_get(handler_synth, hi))
+        let hi = hi + 1
+      end
+      let events = bm_events_register(events, event_name, handler_name)
     end
     let i = i + 1
   end
-  return ["BlockProgramIR", entry, blocks]
+  return ["BlockProgramIR", entry, blocks, events]
 end

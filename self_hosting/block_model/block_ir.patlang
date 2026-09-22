@@ -102,6 +102,45 @@
 #                                    flight_check.patlang's own header for
 #                                    exactly how narrow that proof is kept.
 #
+# Phase 10 adds event dispatch (design doc section 8's own claim, checked
+# directly against rust-runtime/src/ir/interpreter.rs BEFORE building this
+# and found to be WRONG as stated: `emit` is not a one-way jump, it's a
+# real call-with-return -- each registered handler runs via run_function,
+# then control resumes at the emit() call site. This engine has no call
+# stack (Fork A), so Emit is a narrowly-scoped, explicit exception: a
+# bounded sub-execution of exactly one handler block at a time, which the
+# lowerer guarantees can never itself contain a JumpBlock (see
+# lower.patlang's own Phase 10 note), so there is nothing to unwind.
+#   ["Emit"]                     -- pops (globals, event_name, payload),
+#                                    looks up every handler block name
+#                                    registered against event_name in the
+#                                    program's own event table
+#                                    (bi_program_events, below), runs each
+#                                    one in registration order as a bounded
+#                                    sub-execution (interp.patlang's own
+#                                    bi_run_block, called recursively --
+#                                    see its header for why this is safe),
+#                                    threading each handler's own possibly-
+#                                    updated "__globals" into the next, and
+#                                    writes the final result back into the
+#                                    CURRENT block's own "__globals" local
+#                                    before falling through to the next
+#                                    instruction. Never ends the current
+#                                    block the way JumpBlock does.
+#
+# BlockProgramIR gains a 4th element as of Phase 10:
+#   ["BlockProgramIR", entry_block_name, [blocks], events]
+# where `events` is `[[event_name, [handler_block_name, ...]], ...]`, in
+# registration (source) order -- a compile-time table, deliberately
+# narrower than the real engine's runtime `register_event_handler` (which
+# lets a handler close over arbitrary outer-scope locals as a genuine
+# closure -- this engine never built first-class closures, see
+# lower.patlang's own Phase 6 note, so that's out of reach here without
+# first generalizing loop-body free-variable capture into real closure
+# values, which this phase does not attempt). Named plainly as a v1
+# restriction, not silently assumed equivalent to production `when`
+# semantics.
+#
 # "__globals" is a HIDDEN param every block gets automatically (added by
 # lower.patlang, never written in a function's own `takes` clause) and
 # every JumpBlock forwards automatically -- see lower.patlang's own header
@@ -170,6 +209,18 @@ end
 
 make a function called bi_program_blocks takes prog returns blocks
   return prog[2]
+end
+
+# Phase 10: the compile-time event table -- `[]` for any program built
+# before this phase (a plain length check, not an assumption every caller
+# was updated) since bm_lower_program is the only real constructor and it
+# always includes this element now, but a hand-built BlockProgramIR from a
+# fixture/tool predating Phase 10 should degrade gracefully, not crash.
+make a function called bi_program_events takes prog returns events
+  if list_len(prog) > 3 then
+    return list_get(prog, 3)
+  end
+  return []
 end
 
 make a function called bi_find_block takes prog, name returns blk
