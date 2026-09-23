@@ -1112,6 +1112,96 @@ be imminent.
 
 ---
 
+## Phase 21 — Call-with-return for ordinary functions
+
+**Realizes:** the real blocker Phase 18 found and precisely diagnosed —
+a block-model function can only "return" via a tail call to another
+declared block (`JumpBlock`); there is no mechanism for returning a
+plain computed value, which real library code needs constantly. This
+phase builds that mechanism, generalizing the exact design Phase 19's
+own `Emit` already proved (a handler compiled as its own real, separate
+FuncIR, reached via ordinary native `Call`), rather than inventing a
+new one.
+
+**Decided (2026-09-23), before implementation, per this document's own
+front-load-the-architecture-questions discipline:**
+
+- **Classification is by call SITE, not by the callee's own return
+  shape.** A single linear pass over the whole program's AST finds every
+  `Call` node reached through `bm_lower_expr` (expression/value context)
+  rather than only `bm_lower_jump_call` (bare tail-statement context);
+  that callee's name joins the "needs real call/return" set. No
+  fixed-point/transitive analysis is needed — a function's own body
+  calling another function as a value is just another instance of the
+  same syntactic pattern, caught by the same single scan. Every function
+  NOT in this set keeps today's unchanged treatment (flattened into
+  `main`, zero stack frames, zero behavior change).
+- **A function in that set is compiled ONCE, uniformly, as a real,
+  separate call/return FuncIR — including at its own tail-call sites,
+  not just its value-context ones.** The alternative (compile it twice:
+  flattened for tail-call sites, a separate FuncIR for value sites) was
+  considered and rejected — it keeps every existing tail-call site at
+  zero cost, but doubles the compiled code for such a function and adds
+  real complexity (two independent lowerings of the same source function
+  that must stay in sync). One code path, matching this project's own
+  "prove correctness first" priority; some stack-frame overhead at call
+  sites that didn't strictly need it is an acceptable, disclosed cost,
+  not a silent one.
+- **Reuses Emit's own family/closure/flatten machinery directly**
+  (`bm_nc_collect_block_closure`/`bm_nc_flatten_blocks` from
+  `native_codegen.patlang`, and the equivalent grouping this phase adds
+  to `lower.patlang`/`interp.patlang` for the plain-interpreter path) —
+  a function's own family is itself plus any of its own synthesized
+  descendant blocks (its own `while` loops) it can reach via internal
+  `JumpBlock`, exactly the same reachability-closure proof Emit already
+  established.
+- **Return value shape: a real 2-element List `[value, updated_globals]`**,
+  built via Phase 18's own new `BuildList`, since such a function still
+  needs to thread `__globals` (Fork B's own convention) while ALSO
+  returning a genuine value — the same problem Emit's own handlers had,
+  solved there by returning only `__globals` (a handler is void from the
+  caller's perspective); a general value-returning function can't get
+  away with returning only one of the two. A call site destructures the
+  popped list via `Index`/`CallHost "list_get"` (Phase 18's own new
+  mechanism) — twice, once for the value, once to re-`Store` the
+  updated `__globals` — not a new instruction.
+- **A mid-body `return EXPR` inside one of these functions becomes a
+  genuine `Return`, wherever it occurs** (including nested inside
+  if/else) — this needs NO jump-target patching at all, unlike
+  `JumpBlock`'s absolute-position bookkeeping, since a real FuncIR's own
+  `Return` instruction already works at any point by construction (the
+  same behavior any ordinary multi-function PatLang program already
+  relies on). A function whose body falls off the end without an
+  explicit `return` gets a synthesized default tail (`Const unit ""`,
+  current `__globals`, `BuildList 2`, `Return`), mirroring `main`'s own
+  existing `Const unit + Return` convention, generalized to also carry
+  globals.
+- **Recursion (direct or mutual) between value-callable functions is
+  expected to work for free**, not specially handled — real x64
+  `call`/`ret` supports it natively; this is a genuine, incidental
+  capability gain over today's flat-JumpBlock model, which structurally
+  cannot express recursion at all (no call stack to unwind through).
+  Verify this directly rather than assuming it, once built.
+
+**Checkpoint:** a real, previously-rejected program shape — a declared
+function called as a sub-expression, its result used in further
+computation (`let x = helper(5) + 1`) — runs correctly through
+`bm_lower_program`/`bi_run`, cross-checked against `pat --ir-run` on the
+identical source; the equivalent native x64 translation (extending
+Phase 19's own `native_codegen.patlang`) produces the same result;
+zero regressions in the full interpreter suite and `native_codegen_check
+.sh`. Re-running Phase 18's own checkpoint (`self_hosting/lib/
+zs_schema.patlang` through `bm_lower_program`) afterward to find
+whatever the NEXT real blocker is (very likely closures/classes-with-
+methods, per Phase 18's own remaining named exclusion) is this phase's
+own natural follow-up, not attempted in the same pass as building this.
+
+**Not started.** This section records the decision only; implementation
+begins in a following session/turn under the usual RED/GREEN/verify
+discipline.
+
+---
+
 ## What this plan deliberately does not cover
 
 - Actually retiring or modifying `self_hosting/lib/{lower,codegen_x64,
