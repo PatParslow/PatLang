@@ -67,3 +67,22 @@ Feature: loops as back-edge blocks (Block Ownership Model, section 4.1)
   natural end is always "just stop" -- correctly threading "what happens
   next" through however many levels of nested `while`/`if` a function's
   body actually has, not just one.
+
+  A third, related bug (Phase 22, found while re-attempting Phase 18's
+  own checkpoint one level further out): `bm_lower_while`'s own
+  captured-variable computation only ever scanned the loop's own BODY
+  statements -- never the loop's own CONDITION expression, even though
+  the head block re-evaluates that condition on every single iteration.
+  A variable referenced ONLY in the condition (`let n = ...` before the
+  loop, then `while i < n do ... end` where the body never re-mentions
+  `n`) was missing from the head block's own forwarded params entirely.
+  Confirmed via self_hosting/lib/test.patlang's own `run_feature` (`let
+  n = sc_len(h); while i <= n do ... end`) and a minimal, standalone
+  repro independent of it. Fixed by unioning the condition's own free
+  variables into `captured` too, using the SAME `bm_fv_expr` analysis
+  already used for the body/after/continuation cases above.
+
+  Scenario: a variable referenced only in the loop's own condition, never inside its own body, is still captured
+    Given a while loop whose condition alone references a variable set before the loop, never mentioned again inside the body
+    When it runs through bm_lower_program/bi_run
+    Then the loop runs to completion, matching exactly what pat --ir-run produces for the identical source

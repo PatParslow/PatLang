@@ -138,3 +138,47 @@ Feature: library-level parity, generic host calls and list literals (Phase 18 of
     Given a program that takes the .length of a String and of a List, never a Box-wrapped object
     When it runs through bm_lower_program/bi_run under the interpreter
     Then both lengths match exactly what pat --ir-run produces for the identical source
+
+  A sixth finding, from the same re-attempt: `and`/`or` were being
+  lowered like every other `Bin` op -- eagerly evaluating BOTH sides,
+  then a plain `Bin` instruction, which `interp.patlang`'s own
+  `bm_apply_bin` has no case for at all ("unknown Bin op hash"). Doubly
+  wrong regardless of the missing-op error: real PatLang short-circuits
+  (`self_hosting/lib/lower.patlang`'s own `"and"`/`"or"` arms), so
+  eagerly evaluating the right-hand side can run code that should never
+  run at all. Found via `self_hosting/lib/test.patlang`'s own
+  `run_feature` (`(c == 10) or (c == -1)`). Fixed by mirroring
+  `lower.patlang`'s own short-circuit lowering exactly, using this
+  engine's own existing `JumpIfFalse`/`Jump`/`Un`/`Const` instructions --
+  no new bytecode needed.
+
+  Scenario: and/or genuinely short-circuit under block-model, not just avoid the missing-op error
+    Given an or whose left side alone determines the result, with a right side that would crash if evaluated
+    When it runs through bm_lower_program/bi_run
+    Then the right side never runs, matching exactly what pat --ir-run produces for the identical source
+
+  A seventh finding, one level deeper in the same checkpoint:
+  `bm_fv_expr` (`self_hosting/block_model/free_vars.patlang`), the
+  free-variable analysis `bm_lower_while` relies on, had no case at all
+  for `"Index"` (`obj[idx]`) or `"List"` (`[a, b, c]`) AST nodes -- both
+  silently fell through to "no free references", so a loop-body variable
+  referenced ONLY via indexing or ONLY inside a list literal was
+  invisibly missing from every caller's own captured set. Found chained
+  through this same checkpoint: `self_hosting/lib/list_copy.patlang`'s
+  own `list_copy` (`l[i]`, `l` never referenced any other way in the
+  loop body) and `self_hosting/lib/pmap.patlang`'s own `pmap_put`
+  (`list_push(out, [key, value])`, `value` never referenced any other
+  way). Fixed by adding `"Index"`/`"List"` cases to `bm_fv_expr`
+  (recursing into the object+index sub-expressions, and into every list
+  item, respectively) -- plus `"Member"` (`obj.prop`), the same class of
+  gap, fixed opportunistically in the same pass since it shares the
+  exact same root cause, though not independently exercised here (real
+  object field access is native-x64-only, so this specific combination
+  --  a variable captured only via `.field` access inside an
+  interpreted loop -- has no way to be driven under the interpreter
+  alone).
+
+  Scenario: a loop-body variable referenced only via indexing, or only inside a list literal, is still captured
+    Given a function using list_copy's own l[i] idiom and pmap_put's own [key, value] idiom, each inside its own while loop
+    When it runs through bm_lower_program/bi_run
+    Then every value matches exactly what pat --ir-run produces for the identical source

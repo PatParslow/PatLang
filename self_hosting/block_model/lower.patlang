@@ -360,9 +360,57 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
   elif ty == "Var" then
     return list_push(instrs, ["Load", list_get(node, 1)])
   elif ty == "Bin" then
+    let op = list_get(node, 1)
+    if op == "and" then
+      # Phase 22, third correction: "and"/"or" were being lowered like
+      # every other Bin op -- eagerly evaluating BOTH sides, then a plain
+      # "Bin" instruction -- which interp.patlang's own bm_apply_bin has
+      # no case for at all ("unknown Bin op hash"), and is doubly wrong
+      # regardless: real PatLang short-circuits (self_hosting/lib/lower
+      # .patlang's own "Bin" case, `node[1] == "and"`/`"or"` arms), so
+      # eagerly evaluating the RHS can run code that should never have
+      # run at all (confirmed via a minimal repro: `(x == 0) or (10 / x
+      # > 1)` crashed with a genuine division-by-zero from the RHS, not
+      # just the missing-op error, when x == 0 should have short-
+      # circuited "or" before ever evaluating it). Found while
+      # re-attempting Phase 18's own checkpoint one level further out
+      # (self_hosting/lib/test.patlang's own run_feature uses `(c == 10)
+      # or (c == -1)`). Mirrors lower.patlang's own "and" arm exactly,
+      # using this engine's own existing JumpIfFalse/Jump/Un/Const
+      # instructions -- no new bytecode needed.
+      let instrs = bm_lower_expr(list_get(node, 2), instrs, block_names, immut_params)
+      let instrs = list_push(instrs, ["Un", "not"])
+      let jif_pos = list_len(instrs)
+      let instrs = list_push(instrs, ["JumpIfFalse", 0])
+      let instrs = list_push(instrs, ["Const", "bool", "false"])
+      let jmp_pos = list_len(instrs)
+      let instrs = list_push(instrs, ["Jump", 0])
+      let instrs = list_set(instrs, jif_pos, ["JumpIfFalse", list_len(instrs)])
+      let instrs = bm_lower_expr(list_get(node, 3), instrs, block_names, immut_params)
+      let instrs = list_push(instrs, ["Un", "not"])
+      let instrs = list_push(instrs, ["Un", "not"])
+      let instrs = list_set(instrs, jmp_pos, ["Jump", list_len(instrs)])
+      return instrs
+    elif op == "or" then
+      # Mirrors lower.patlang's own "or" arm exactly -- see the "and"
+      # case just above for the full rationale.
+      let instrs = bm_lower_expr(list_get(node, 2), instrs, block_names, immut_params)
+      let instrs = list_push(instrs, ["Un", "not"])
+      let jif_pos = list_len(instrs)
+      let instrs = list_push(instrs, ["JumpIfFalse", 0])
+      let instrs = bm_lower_expr(list_get(node, 3), instrs, block_names, immut_params)
+      let instrs = list_push(instrs, ["Un", "not"])
+      let instrs = list_push(instrs, ["Un", "not"])
+      let jmp_pos = list_len(instrs)
+      let instrs = list_push(instrs, ["Jump", 0])
+      let instrs = list_set(instrs, jif_pos, ["JumpIfFalse", list_len(instrs)])
+      let instrs = list_push(instrs, ["Const", "bool", "true"])
+      let instrs = list_set(instrs, jmp_pos, ["Jump", list_len(instrs)])
+      return instrs
+    end
     let instrs = bm_lower_expr(list_get(node, 2), instrs, block_names, immut_params)
     let instrs = bm_lower_expr(list_get(node, 3), instrs, block_names, immut_params)
-    return list_push(instrs, ["Bin", list_get(node, 1)])
+    return list_push(instrs, ["Bin", op])
   elif ty == "Un" then
     let instrs = bm_lower_expr(list_get(node, 2), instrs, block_names, immut_params)
     return list_push(instrs, ["Un", list_get(node, 1)])
@@ -1345,11 +1393,26 @@ make a function called bm_lower_while takes stmt, stmts, idx, instrs, block_name
   # `unused_big`, referenced neither inside the body nor after it) --
   # free_variable_capture.feature's own existing guarantee is unaffected,
   # confirmed by re-running it, not merely reasoned about.
+  # Phase 22, second correction: the loop's own CONDITION is re-evaluated
+  # in the head block on every single iteration (that's what a while
+  # loop's head block IS) -- a variable referenced ONLY in `cond`,
+  # never inside body_stmts itself (e.g. `let n = ...` before the loop,
+  # then `while i < n do ... end` where the body never re-mentions `n`),
+  # was missing from the head block's own forwarded params entirely,
+  # since body_free only ever scanned body_stmts. A real, confirmed,
+  # pre-existing bug -- found via self_hosting/lib/test.patlang's own
+  # run_feature (`let n = sc_len(h); while i <= n do ... end`, `n` never
+  # referenced again inside the loop body) while re-attempting Phase
+  # 18's own checkpoint one level further out. Confirmed via a minimal,
+  # standalone repro independent of that file: `let n = 3; let i = 0;
+  # while i < n do print(i); let i = i + 1 end` crashed identically
+  # before this fix.
+  let cond_free = bm_intersect_preserving_order(known_locals, bm_fv_expr(cond, [], []))
   let body_free = bm_intersect_preserving_order(known_locals, bm_free_vars_of_body(body_stmts))
   let after_stmts = bm_list_slice_from(stmts, idx + 1)
   let after_free = bm_intersect_preserving_order(known_locals, bm_free_vars_of_body(after_stmts))
   let k_captured = bm_continuation_captured(k)
-  let captured = bm_union_preserving_order(body_free, bm_union_preserving_order(after_free, k_captured))
+  let captured = bm_union_preserving_order(cond_free, bm_union_preserving_order(body_free, bm_union_preserving_order(after_free, k_captured)))
   let jump_params = list_push(captured, "__globals")
 
   # 1) At the current point in the CALLING block: enter the loop head for
