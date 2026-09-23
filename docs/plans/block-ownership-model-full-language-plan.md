@@ -7,31 +7,33 @@ verified — `self_hosting/block_model/run_block_model_spec_suite.patlang`
 reports 83/83 passing, no regressions. Phase 18 (library-level parity)
 was genuinely attempted and genuinely fails, as real, checked evidence
 of how much further coverage remains — not a completed checkpoint; see
-its own section for the exact failure and what it traces to. Phase 17
-also corrected a wrong premise in this plan's own text (there is no
-generic `CallHost` dispatch in this engine at all — every host function
-needs individual recognition, the same as every earlier phase's own
-host-function work). Phase 20 (migration/cutover design) is also written
-now, ahead of Phase 19 as the plan itself permits — its own real
-decisions (a hard switch, gated on both full-suite parity and issues
-#145/#113 actually being fixed, not waived) are recorded, and acting on
-them is explicitly not yet authorized. Phase 19 (consolidated native x64
-+ WASM codegen) was investigated twice this session: an initial 18-opcode
-estimate turned out wrong on closer check — 6 of those opcodes
-(`fiber_yield`/`fact`/`query`/`type_of`/`read_file`/`write_file`) have
-literally zero native x64 support today (confirmed by direct grep, not
-assumed from `pat --patc`'s different backend), and Box's own
-`heap.patlang` isn't bundled into the one real native-build driver this
-project has at all. Corrected scope: 11 achievable opcodes
-(`Box*`/`ContractFail`/`Global*`/`Handler*`) plus a real build-plumbing
-prerequisite (bundle `heap.patlang`), with the other 7 opcodes deferred
-as needing genuinely new runtime primitives — not implemented this
-session either way, to avoid rushing untested native-codegen changes
-past this plan's own RED/GREEN discipline. Phase 13 also found and
-fixed two real,
-pre-existing bugs (`HandlerRegister`'s append-only behavior, and its own
-downstream exposure of already-filed issue #145's native x64 `list_set`
-aliasing bug) — see Phase 13's own section below for the full account.
+its own section for the exact failure and what it traces to. Phase 20
+(migration/cutover design) is written, with real decisions recorded
+(a hard switch, gated on both full-suite parity and issues #145/#113
+actually being fixed, not waived) and acting on them explicitly not yet
+authorized.
+
+**Phase 19 is now partially implemented, not just scoped** — after two
+rounds of wrong estimates, both corrected before (and one after) writing
+code: `FiberYield`/`Fact`/`Query`/`TypeOf`/`ReadFile`/`WriteFile`/
+`ContractFail` all now have real, verified native x64 translations
+(`native_codegen_check.sh`: 10/10 passing). Proving this end to end
+found and fixed a real, project-wide bug (not block-model-specific):
+without `-Wl,--disable-dynamicbase`, Windows can relocate a linked
+image away from the fixed `0x140000000` base `x64_family_code_asm`'s
+own classification logic hardcodes, silently misclassifying every
+string literal and breaking `print()`'s own dispatch for it — fixed at
+every linker call site in the shared `x64_build.patlang`, benefiting
+every native build in the project. A second, separate latent bug was
+also found and fixed in `lower.patlang` itself (bare-statement calls to
+twelve different builtins never discarded their own unused return
+value, corrupting the block's own stack — affects the interpreter too,
+not just native). `Box*`/`Global*`/`Handler*`/`Emit` remain genuinely
+deferred. See Phase 19's own section below for the full, corrected
+account. Phase 13 also found and fixed two real, pre-existing bugs
+(`HandlerRegister`'s append-only behavior, and its own downstream
+exposure of already-filed issue #145's native x64 `list_set` aliasing
+bug) — see Phase 13's own section below for that account.
 Phase 14 found its own flagged refcount-thread-safety fork to be moot for
 the slice it actually covers (fiber_yield is cooperative, never real
 parallelism). Phase 15 found `rule`/`goal`/`pursue`/`activate`/`plan`
@@ -701,6 +703,58 @@ same class of gotcha Phase 9 already hit" checkpoint item — both wait for
 the native x64 translation above to exist first, per the plan's own
 established sequencing (native before WASM, self-hosted-interpreter
 proof before either).
+
+**Second correction, same day, after actually implementing (2026-09-22):
+the correction immediately above was ALSO wrong.** `FiberYield`/`Fact`/
+`Query`/`TypeOf`/`ReadFile`/`WriteFile` do NOT need new native
+primitives — they already exist as real, complete, already-compiled
+`x64_runtime.patlang` functions (confirmed present in the linkable
+`x64_runtime.build/x64_runtime.funcs` manifest). The earlier "zero
+support" claim came from grepping for quoted host-call-name strings
+(the `CallHost` dispatch pattern), not for each function's actual
+`make a function called NAME` definition — a real methodology error,
+caught by redoing the search correctly before implementing rather than
+after. All six now translate as ordinary `Call`/`CallHost` instructions,
+implemented and verified via real native builds (10/10 scenarios in
+`native_codegen_check.sh`, including the whole existing suite re-run
+with zero regressions).
+
+**A real, project-wide bug was found and fixed proving this end to
+end, not designed around in advance.** Without `-Wl,--disable-
+dynamicbase`, Windows can relocate a linked image away from the fixed
+`0x140000000` base `x64_family_code_asm`'s own classification logic
+hardcodes (needed to distinguish a `.data` string literal's address
+from a plain int). Confirmed via a hand-instrumented raw address dump:
+the actual runtime address landed far outside `[0x140000000,
+0x150000000)`, silently misclassifying every string constant as
+"other"/"int" and corrupting `print()`'s own dispatch for it, while
+`patc1.exe`'s own single-object-file builds happened not to trigger it.
+Fixed at every linker call site in `self_hosting/lib/x64_build.patlang`
+(the shared helper, so this benefits every native build in the project,
+not just the block model) and in `build_and_run_native.sh`
+independently.
+
+**A second, real, latent bug was found in `lower.patlang` itself while
+debugging the above** (affects the interpreter too, not native-
+specific): bare-statement calls to `box_set`/`box_share`/`box_new`/
+`box_get`/`get_global`/`handler_new`/`handler_register`/
+`handler_lookup`/`type_of`/`read_file`/`write_file`/`query` never
+discarded their own unused return value, corrupting whatever the block
+did next. Fixed at the one shared delegation point, matching the real
+compiler's own `Store "__discard"` convention. Never previously
+exercised because no earlier fixture chained two of these bare-
+statement calls in one block.
+
+**Genuinely still deferred:** `BoxNew`/`BoxGet`/`BoxSet`/
+`BoxSetUnchecked`/`BoxShare` (heap.patlang isn't bundled into the native
+build path yet), `GlobalGet`/`GlobalSet`/`HandlerNew`/`HandlerRegister`/
+`HandlerLookup` (not attempted this pass, though likely similarly
+tractable), and `Emit` (needs handlers compiled as separate `FuncIR`
+entries — a real, small design change, not attempted this pass).
+`fiber_yield` compiles but segfaults with no active fiber context
+established — a real, separate, deliberately out-of-scope finding (a
+bare smoke test with no fiber machinery isn't a valid usage pattern for
+it), not silently papered over.
 
 ---
 
