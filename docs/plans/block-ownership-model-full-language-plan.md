@@ -1564,6 +1564,55 @@ a recurring pattern for any spec suite involving `spawn()`/cross-process
 fixtures, not a one-off fluke, since it happened twice independently in
 the same session.
 
+**A fourth, more severe finding — bare-statement declared-function
+calls silently dropped every statement written after them.** Re-running
+`schema_bdd_selftest_full_run.patlang` (the checkpoint harness built to
+push past the `.length` fix) with `t_pass`/`t_fail` correctly read from
+the returned `__globals` (not via `get_global` in the driver's own
+scope — a completely separate ambient store from block-model's own
+internal `__globals` List, a mistake caught before it produced another
+false positive) still showed `t_pass=0, t_fail=0` with nothing printed
+at all — not even `run_schema_bdd_selftest`'s own first line. Traced to
+`bm_lower_stmt`'s own bare-statement dispatch for a call to a declared
+function: it ALWAYS lowered via `JumpBlock`, a one-way, non-returning
+transfer — correct only when that call is genuinely the very last thing
+that ever runs. `run_schema_bdd_selftest` calls `t_init()`,
+`register_library_loans_schema()`, `register_library_loans_steps()`,
+`run_feature(...)`, `t_report()` as ordinary bare statements in
+sequence — reaching the FIRST one (`t_init`) permanently transferred
+control away and never returned, silently discarding all four
+statements after it, with no error of any kind. Confirmed as a general
+bug (not specific to this file) via two minimal, standalone repros:
+`a(); b(); print(999)` printed only `a`'s own output; `if true then
+helper() end; print(999)` never reached the `print` after the `if`
+(the SAME bug, reached through `bm_lower_stmt_list`, which threads no
+continuation information through an ordinary if/else branch at all).
+
+Fixed (commit `6ab8efe`): `bm_lower_stmt`'s bare-call dispatch now
+always uses the same `Call`+discard convention already established for
+`apply()`/the generic `CallHost` fallback; a new special case in
+`bm_lower_top_level_stmt_list` (checked before falling through to
+`bm_lower_stmt`) keeps using `JumpBlock` for the ONE genuinely safe
+shape — a bare call that is provably the very last statement of a
+top-level list with no enclosing continuation pending either. Checked
+directly, before implementing, that no currently-passing
+`native_codegen_check.sh` fixture relies on the removed bug (every
+multi-function native fixture already uses `return F(...)`, a genuine
+tail call via the other, already-correct call site) — confirmed
+empirically after the fix too: still 24/24. Block-model spec suite:
+105/105 (two new scenarios added,
+`spec_library/block_model/call_with_return.feature`). Full language
+spec gate re-confirmed 150/150 in isolation, unaffected.
+
+With this fix, `schema_bdd_selftest_full_run.patlang` gets meaningfully
+further — past `t_init()` and into the Gherkin runner itself — but now
+hits a NEW, different, NOT-yet-diagnosed error: `contract violation:
+assertion failed in bm_interp(): unbound in this block's own pointer:
+n`. This is the next real blocker for Phase 18's own checkpoint,
+reported here plainly rather than investigated further in this same
+pass — each fix so far has revealed exactly one new blocker, and this
+is the pattern continuing, not a sign of an ever-receding goal.
+
 ---
 
 ## What this plan deliberately does not cover
