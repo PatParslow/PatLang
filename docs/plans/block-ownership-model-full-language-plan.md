@@ -1404,6 +1404,128 @@ per Phase 18's own remaining named exclusion).
 
 ---
 
+## Phase 22 — Re-attempting Phase 18's checkpoint one level further out: `apply()`, a compat-shim bug, a methodology gap, and a foundational blocker found (2026-09-23)
+
+**Goal:** push `self_hosting/lib/zs_schema.patlang` past merely lowering
+(Phase 18's checkpoint) toward actually RUNNING its own selftest suite
+through block-model — the real, further-out goal named at the end of
+Phase 18's own re-attempt. Reached partway; a genuine new architectural
+blocker was found and is reported below rather than fixed unilaterally.
+
+**`apply()` / `CallDynamic` — a third, genuinely new call mechanism.**
+`self_hosting/lib/test.patlang`'s own Gherkin runner (`run_feature`)
+dispatches a matched step to its registered handler via `apply(fname)`,
+where `fname` is a STRING computed at runtime (looked up from a
+registry), not a literal known at lowering time. Neither `JumpBlock`
+(Fork A's own tail-call mechanism) nor Phase 21's new `Call` instruction
+can express this — both require a compile-time-literal callee name baked
+directly into the instruction. Confirmed `interp_call_host` does not
+already support `"apply"` either (isolated test: `["Err", "host function
+'apply' not supported..."]`) — this needed a genuinely new instruction,
+not another `CallHost` name. Added `CallDynamic` (hash `915129`, no
+collision — see `bench/hash_check.patlang`): pops `(fname, __globals)`,
+resolves `fname` to a block via `bi_find_block`, runs it with a fresh
+locals set via `bi_run_from`, pushes the result, updates the caller's
+`__globals`. Deliberately scoped narrowly to match every real call site
+of `apply()` in this codebase: zero extra arguments, callee takes zero
+declared params beyond `__globals`.
+
+**Compat-shim body-lowering bug (found, fixed).**
+`self_hosting/lib/block_model_compat.patlang` (from Phase 18's re-attempt)
+provides real-function equivalents of block-model's own sugar names
+(`get_global`, `set_global`, `handler_new`, `handler_register`,
+`handler_lookup`) — transparent under block-model because every real
+call site is always intercepted by a hardcoded name match before any
+declared-function lookup runs. `bm_lower_program` was still unconditionally
+lowering the BODY of these 5 functions anyway (they're still ordinary
+declared `Func` nodes), and their bodies necessarily use raw ambient
+`set_var`/`get` — which the Phase 18 ambient-state denylist correctly
+rejects. Fixed via new `bm_lower_is_compat_shim_name`, excluding these 5
+names from both passes of `bm_lower_program` (block-name collection and
+body lowering) — their bodies are provably dead code under block-model.
+This incidentally also fixes a latent entry-point bug: with proper
+include expansion (see below), these shim functions — textually first via
+transitive includes — would otherwise become the wrongly-chosen program
+entry (`bm_lower_program` picks the first declared `Func` as entry).
+
+**Ambient-state ports completed for the framework itself.**
+`self_hosting/lib/test.patlang` and `self_hosting/lib/gherkin_contracts.patlang`
+(the Gherkin runner and its `require`/`ensure` contract-clause handling —
+i.e. the framework that actually RUNS `zs_schema.patlang`'s own selftest
+suite) are now fully ported from ambient `set_var`/`get("__vars", ...)`
+onto `block_model_compat.patlang`'s `set_global`/`get_global`, including
+`test.patlang`'s own exact-step registry (previously
+`new("Step", text)` + `send(text, "set", "fn", fname)`, now the same
+shared Handler-based registry pattern `zs_registry()` already uses).
+`self_hosting/schema_bdd_selftest.patlang`'s 5 remaining
+`get("__vars", ...)` call sites were renamed to `get_global(...)` to
+match; re-verified 5/5 on the real engine (observably identical — these
+are thin wrappers over the same `set_var`/`get` calls).
+
+**Verification:** full language spec gate 150/150; block-model spec
+suite 96/96 (zero regressions from either `CallDynamic` or the
+compat-shim fix); native x64 codegen check still 24/24. Committed as
+`5b22750`.
+
+**Methodology finding — an honest correction to earlier claims in this
+document.** Every "X.patlang lowers completely" test run this session
+(Phase 18's own re-attempt included) used the self-hosted lexer/parser
+(`self_hosting/lib/{lexer,parser}.patlang`) directly via
+`tokenize(read_file(path))` — which has ZERO handling of `include`
+directives. Confirmed via a direct AST dump: `include "foo.patlang"`
+parses as `[Expr, [Var, include], 1]` immediately followed by a
+parse-error node for the trailing string literal, and `bm_lower_program`
+silently ignores both (it only recognizes top-level `"Func"`/`"When"`
+statements). This means every prior "lowers completely" claim in this
+plan document never actually exercised the CONTENT of that file's own
+included files — a real methodology gap in how this phase's own checks
+were run, not a claim about the block-model engine's own correctness.
+The fix: `self_hosting/lib/includes.patlang`'s existing
+`expand_includes(source, base_dir)` (a self-hosted mirror of
+`rust-runtime/src/preprocess.rs`, built for exactly this reason — see
+that file's own header) must run on the raw source BEFORE
+`tokenize`/`parse_program`. Re-verified with real include expansion:
+`zs_schema.patlang` and `test.patlang` both still genuinely lower
+completely end-to-end (not just their own top-level statements) — Phase
+18's own core claim holds, but was previously under-tested.
+
+**New foundational blocker found, NOT fixed — Member-access (`.length`
+and friends) unconditionally assumes a Box+Handler receiver.**
+Re-verifying `schema_bdd_selftest.patlang` with real include expansion
+got as far as actually attempting to RUN it (not just lower it) — and
+caught, via this project's own "verify success signals" discipline, a
+false positive: `bi_run_from` on the selftest entry point returned
+`RESULT: true` with zero Gherkin output printed. Dumping `t_pass`/
+`t_fail` from the returned globals showed `t_pass=0, t_fail=0` — nothing
+had actually run; "0 failures" was vacuous, not 5 genuine passes. Tracing
+this found the real blocker: `bm_lower_expr`'s `"Member"` case
+(`obj.prop`) unconditionally lowers to `Const "prop"` + `Load obj` +
+`BoxGet` + `HandlerLookup` — i.e. it always assumes the receiver is a
+Box-wrapped Handler-shaped object (the representation Phase 13 built for
+class-field access). For an ordinary STRING or LIST (`s.length`, an
+extremely common, pervasive PatLang idiom), this is wrong: `BoxGet` calls
+`bm_box_read`, which calls `mem_peek_qword(s, 0)` — treating the string's
+own tagged value as a raw memory address. `mem_peek_qword` is
+native-x64-only (not implemented under `pat --ir-run` at all, an
+already-established project fact), so this crashes with `IR runtime
+error: host fn 'mem_peek_qword' not found`. Confirmed via a minimal,
+standalone repro: `let s = "hello"; print(s.length)` crashes identically
+under block-model, independent of `zs_schema.patlang`/`schema_bdd_selftest.patlang`
+entirely.
+
+This is a pervasive, foundational gap — it affects essentially any real
+PatLang code that uses `.length` (or any other bare `.prop` access) on a
+non-Box value, not a narrow edge case. Fixing it is a real design
+decision (a static heuristic on the expression's inferred kind? a
+runtime type tag check emitted at the access site? separate syntax for
+primitive vs. object property access?), not a small patch, and is
+explicitly NOT attempted in this phase — reported here as the next
+blocker for a future phase to design and scope properly, matching this
+document's own established practice of naming a found blocker precisely
+rather than papering over it.
+
+---
+
 ## What this plan deliberately does not cover
 
 - Actually retiring or modifying `self_hosting/lib/{lower,codegen_x64,
