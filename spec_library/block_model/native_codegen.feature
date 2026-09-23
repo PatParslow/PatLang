@@ -43,3 +43,34 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
     Given the assembly emitted for the small loop above
     When the instructions between block labels are inspected directly
     Then every transfer of control between blocks is an ordinary jmp, with no call/ret introducing a call stack that was never there in the design
+
+  Scenario: fact/query/type_of/read_file/write_file compile through real native codegen (Phase 19)
+    Given a program using fact, query, type_of, write_file, and read_file
+    When it is built and run as a real, fully native executable
+    Then each one produces the exact same result the interpreter already gives
+
+  Scenario: a failing require aborts through real native codegen, exiting with a nonzero code (Phase 19)
+    Given a program whose require fails
+    When it is built and run as a real, fully native executable
+    Then it aborts with the same guaranteed-fail message the interpreter gives, and a nonzero exit code
+
+  A real, project-wide bug was found and fixed while proving this, not
+  designed around in advance: without `-Wl,--disable-dynamicbase`,
+  Windows can relocate a linked image away from the fixed 0x140000000
+  base `x64_family_code_asm`'s own classification logic hardcodes
+  (needed to distinguish a string literal's `.data` address from a
+  plain int) -- confirmed via a hand-instrumented raw address dump
+  showing the actual runtime address far outside
+  [0x140000000, 0x150000000), silently misclassifying every string
+  constant as "other"/"int" and corrupting `print()`'s own dispatch for
+  it. Fixed in `self_hosting/lib/x64_build.patlang` (every linker call
+  site) and `self_hosting/block_model/tools/build_and_run_native.sh` --
+  not block-model-specific, affects any native build linking more than
+  one object file where the OS happens to relocate it.
+
+  `fiber_yield` compiles but segfaults when called with no active fiber
+  context established (no prior `fiber_new`/`fiber_resume`) -- a real,
+  separate, deliberately out-of-scope finding for this pass, not
+  silently papered over: a bare native smoke test with no fiber
+  machinery around it isn't a valid usage pattern for it, matching the
+  scoping this whole feature's Phase 19 slice already commits to.

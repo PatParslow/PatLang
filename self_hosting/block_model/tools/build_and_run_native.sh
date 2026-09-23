@@ -23,6 +23,18 @@ fi
 "$PAT" --ir-run self_hosting/block_model/tools/build_native.patlang "$SRC" "$OUT" || exit 1
 nasm -f win64 -o "$OUT.obj" "$OUT.asm" || exit 1
 nasm -f win64 -o "${OUT}_apply.obj" "${OUT}_apply.asm" || exit 1
+# Phase 19 found a real, project-wide bug here (not block-model-
+# specific): without -Wl,--disable-dynamicbase, Windows can relocate
+# this image away from the fixed 0x140000000 base x64_family_code_asm's
+# own classification logic hardcodes (see self_hosting/lib/
+# x64_build.patlang's own header note on this same fix) -- confirmed
+# directly via a hand-instrumented raw address dump showing the
+# relocated address far outside [0x140000000, 0x150000000), silently
+# misclassifying every string literal and breaking print()'s own
+# dispatch for any string constant. Fixed at the shared x64_build
+# .patlang level too, for every OTHER caller of x64_build_linked; this
+# script's own direct gcc invocation needed the same fix independently
+# since it doesn't go through that helper.
 gcc -o "$OUT.exe" "$OUT.obj" "${OUT}_apply.obj" self_hosting/build/x64_runtime.obj \
-  -Wl,--subsystem,console -lkernel32 -luser32 -lgdi32 -lws2_32 || exit 1
+  -Wl,--subsystem,console -Wl,--disable-dynamicbase -lkernel32 -luser32 -lgdi32 -lws2_32 || exit 1
 "./$OUT.exe"

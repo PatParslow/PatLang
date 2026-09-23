@@ -61,6 +61,24 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+echo "Scenario: fact/query/type_of/read_file/write_file compile through real native codegen (Phase 19)"
+OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/native_misc_calls.patlang phase19_misc 2>&1)
+check "query finds the just-asserted fact (1 match)" "$OUT" "1"
+check "type_of(42) reports int" "$OUT" "int"
+check "read_file reads back exactly what write_file wrote" "$OUT" "native round trip"
+
+echo "Scenario: a failing require aborts through real native codegen, exiting with a nonzero code (Phase 19)"
+bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/native_contract_fail.patlang phase19_contract_fail >/tmp/phase19_contract_fail.out 2>&1
+CONTRACT_CODE=$?
+check "names the failing require, matching the interpreter's own message" "$(cat /tmp/phase19_contract_fail.out)" "require failed: 1 > 2"
+if [ "$CONTRACT_CODE" -ne 0 ]; then
+  echo "  ok: exits with a nonzero code (contract violation), not a silent success"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL: exited 0 despite a failing require (expected nonzero)"
+  FAIL=$((FAIL + 1))
+fi
+
 echo ""
 echo "tests: $PASS passed, $FAIL failed"
 if [ "$FAIL" -eq 0 ]; then
