@@ -91,3 +91,35 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
   examine, not as a subtly wrong result. Found via systematically
   narrowing a minimal repro (a single `handler_register` followed by
   one `handler_lookup`), not by inspection alone.
+
+  Scenario: Box* compiles through real native codegen, linked against a third heap_chunk.obj chunk
+    Given a program that mutates a Box in a straight line (patched to BoxSetUnchecked by the flight check) and a second Box that is shared before being mutated (falling back to checked BoxSet)
+    When it is built and run as a real, fully native executable, linked against self_hosting/build/{x64_runtime,heap_chunk}.obj
+    Then the straight-line chain ends at the last value written, and the shared Box keeps its original value while the mutated one gets the new value -- real copy-on-write, not aliasing
+
+  A real bug was found and fixed proving this scenario, not designed
+  around in advance: `heap.patlang`'s own free-list table
+  (`bm_freelist_table_addr`'s backing `"__vars"` entry) is populated by
+  `bm_heap_init`, which interp.patlang's own `bm_ensure_heap_ready` calls
+  lazily, once, before the first BoxNew -- the native path had no
+  equivalent call at all, so the first `bm_alloc` walked
+  `bm_freelist_pop -> bm_freelist_slot_offset -> bm_freelist_table_addr`
+  through an uninitialized table address, segfaulting immediately.
+  Confirmed via a real segfault (exit 139) running this exact fixture,
+  not predicted from reading the code. Fixed by calling `bm_heap_init()`
+  unconditionally at native program start (`bm_to_real_funcir`'s own
+  `init_instrs`, alongside the existing entry-block `__globals` init) --
+  eager rather than lazily flag-gated like the interpreter, since a
+  native program has exactly one start (unlike `bi_run`'s shared
+  interpreter process, reset per call), and cheap even when a program
+  never touches a Box at all.
+
+  Box is native-x64-only (heap.patlang's own `rt_heap_alloc`/
+  `mem_peek_qword`/`mem_poke_qword` calls are not host functions under
+  `pat --ir-run` at all -- confirmed directly, matching lower.patlang's
+  own established finding for Phase 1/3), so this scenario cannot be
+  cross-checked against a plain interpreter run. It is instead
+  cross-checked against `bi_run` (interp.patlang's own bytecode
+  interpreter for this exact block-model IR) compiled to native code via
+  `./patc1.exe ... --x64` -- two independent code paths over the
+  identical program, both genuinely native, agreeing on the same output.

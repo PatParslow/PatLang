@@ -20,6 +20,15 @@ if [ ! -f self_hosting/build/x64_runtime.obj ]; then
   exit 1
 fi
 
+# Phase 19: a THIRD chunk, needed for Box* (BoxNew/BoxGet/BoxSet/
+# BoxSetUnchecked/BoxShare) to call into heap.patlang's own bm_alloc/
+# bm_box_read/etc -- see tools/build_heap_chunk.patlang's own header.
+if [ ! -f self_hosting/build/heap_chunk.obj ]; then
+  echo "FAIL: self_hosting/build/heap_chunk.obj missing -- run:"
+  echo "  $PAT --ir-run self_hosting/block_model/tools/build_heap_chunk.patlang"
+  exit 1
+fi
+
 "$PAT" --ir-run self_hosting/block_model/tools/build_native.patlang "$SRC" "$OUT" || exit 1
 nasm -f win64 -o "$OUT.obj" "$OUT.asm" || exit 1
 nasm -f win64 -o "${OUT}_apply.obj" "${OUT}_apply.asm" || exit 1
@@ -35,6 +44,6 @@ nasm -f win64 -o "${OUT}_apply.obj" "${OUT}_apply.asm" || exit 1
 # .patlang level too, for every OTHER caller of x64_build_linked; this
 # script's own direct gcc invocation needed the same fix independently
 # since it doesn't go through that helper.
-gcc -o "$OUT.exe" "$OUT.obj" "${OUT}_apply.obj" self_hosting/build/x64_runtime.obj \
+gcc -o "$OUT.exe" "$OUT.obj" "${OUT}_apply.obj" self_hosting/build/x64_runtime.obj self_hosting/build/heap_chunk.obj \
   -Wl,--subsystem,console -Wl,--disable-dynamicbase -lkernel32 -luser32 -lgdi32 -lws2_32 || exit 1
 "./$OUT.exe"

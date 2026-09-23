@@ -274,6 +274,71 @@ make a function called bm_nc_prefix takes block_name, name returns out
   return block_name + "__" + name
 end
 
+# Phase 19 (Box*): pops (value, ptr) already on the stack (value on top,
+# matching BoxSet/BoxSetUnchecked's own established pop order in
+# interp.patlang -- popped_v = bm_st_pop(stack) happens FIRST, i.e. value
+# is on top). Checked (unchecked == false): branches on
+# bm_rc_touch_for_mutation(ptr) exactly like interp.patlang's own BoxSet
+# -- refcount 1 mutates ptr's own cell in place and pushes ptr back;
+# anything higher allocates a fresh cell, writes the new value there
+# instead, and pushes THAT pointer -- leaving the original untouched, the
+# same "reassign to the result" contract BoxSet already has interpreted
+# (the caller must re-Store). Unchecked (unchecked == true): always
+# mutates in place, skipping the refcount check entirely -- only ever
+# emitted by lower.patlang's own flight check at a call site already
+# proven statically safe (see interp.patlang's own BoxSetUnchecked
+# header); matches its own identical pop order.
+#
+# bm_note_runtime_check_performed() (interp.patlang's own diagnostic
+# counter, incremented on every checked BoxSet) is deliberately NOT
+# replicated here -- confirmed by checking its only two call sites
+# (self_hosting/block_model/spec_fixtures/flight_check_*.patlang) are
+# both interpreter-driven (bi_run) fixtures, never read back by any
+# native fixture or native_codegen_check.sh scenario, so it isn't part of
+# Box*'s own observable native behavior -- a disclosed scope decision,
+# not an oversight.
+make a function called bm_nc_emit_box_set takes out, block_name, uniq, unchecked returns out2
+  let v_l = bm_nc_local(block_name, uniq, "v")
+  let ptr_l = bm_nc_local(block_name, uniq, "p")
+  let discard_l = bm_nc_prefix(block_name, "__bm_discard")
+  let out = list_push(out, ["Store", v_l])
+  let out = list_push(out, ["Store", ptr_l])
+  if unchecked then
+    let out = list_push(out, ["Load", ptr_l])
+    let out = list_push(out, ["Load", v_l])
+    let out = list_push(out, ["Call", "bm_box_write", 2])
+    let out = list_push(out, ["Store", discard_l])
+    return list_push(out, ["Load", ptr_l])
+  end
+  let newptr_l = bm_nc_local(block_name, uniq, "np")
+  let out = list_push(out, ["Load", ptr_l])
+  let out = list_push(out, ["Call", "bm_rc_touch_for_mutation", 1])
+  let out = list_push(out, ["Const", "num", "1"])
+  let out = list_push(out, ["Bin", "=="])
+  let out = list_push(out, ["__RawJumpIfFalse", 0])
+  let jif_clone_pos = list_len(out) - 1
+  let out = list_push(out, ["Load", ptr_l])
+  let out = list_push(out, ["Load", v_l])
+  let out = list_push(out, ["Call", "bm_box_write", 2])
+  let out = list_push(out, ["Store", discard_l])
+  let out = list_push(out, ["Load", ptr_l])
+  let out = list_push(out, ["__RawJump", 0])
+  let jmp_done_pos = list_len(out) - 1
+  let clone_target = list_len(out)
+  let out = list_set(out, jif_clone_pos, ["__RawJumpIfFalse", clone_target])
+  let out = list_push(out, ["Const", "num", "8"])
+  let out = list_push(out, ["Call", "bm_alloc", 1])
+  let out = list_push(out, ["Store", newptr_l])
+  let out = list_push(out, ["Load", newptr_l])
+  let out = list_push(out, ["Load", v_l])
+  let out = list_push(out, ["Call", "bm_box_write", 2])
+  let out = list_push(out, ["Store", discard_l])
+  let out = list_push(out, ["Load", newptr_l])
+  let done_target = list_len(out)
+  let out = list_set(out, jmp_done_pos, ["__RawJump", done_target])
+  return out
+end
+
 # Pass 1: translate ONE block's own instrs independently. Load/Store
 # names get prefixed; Jump/JumpIfFalse targets are left as block-LOCAL
 # indices for now (fixed up to absolute indices once every block's own
@@ -420,6 +485,55 @@ make a function called bm_nc_translate_block_instrs takes block_name, instrs, pr
       # a local directly).
       let out = bm_nc_emit_assoc_set(out, block_name, i)
       let out = list_push(out, ["Store", bm_nc_prefix(block_name, "__globals")])
+    elif op == 258931 then # "BoxNew"
+      # Pops one value (already on top of the native stack, pushed by
+      # whatever instruction computed it), allocates an 8-byte cell via
+      # heap.patlang's own bm_alloc (heap_chunk.obj, linked as a THIRD
+      # extern chunk -- see tools/build_heap_chunk.patlang), writes the
+      # value into it, and pushes the resulting pointer -- matching
+      # interp.patlang's own BoxNew exactly (bm_ensure_heap_ready is a
+      # no-op in this native path: the heap is a single flat bump/
+      # freelist region backed by rt_heap_alloc, initialized the first
+      # time bm_alloc actually needs fresh memory -- see bm_heap_init's
+      # own lazy-init call inside bm_freelist_pop/rt_heap_alloc's own
+      # first-touch path, not a separate step native code must call).
+      let v_l = bm_nc_local(block_name, i, "v")
+      let ptr_l = bm_nc_local(block_name, i, "p")
+      let out = list_push(out, ["Store", v_l])
+      let out = list_push(out, ["Const", "num", "8"])
+      let out = list_push(out, ["Call", "bm_alloc", 1])
+      let out = list_push(out, ["Store", ptr_l])
+      let out = list_push(out, ["Load", ptr_l])
+      let out = list_push(out, ["Load", v_l])
+      let out = list_push(out, ["Call", "bm_box_write", 2])
+      let out = list_push(out, ["Store", bm_nc_prefix(block_name, "__bm_discard")])
+      let out = list_push(out, ["Load", ptr_l])
+    elif op == 251305 then # "BoxGet"
+      # Pops ptr (already on top of the native stack) and pushes
+      # bm_box_read(ptr) directly -- no Store/Load needed at all, exactly
+      # like FiberYield/Fact's own single-Call translation above: the
+      # value is already sitting in the right place for Call's own
+      # pop-arg-then-push-result convention to consume it.
+      let out = list_push(out, ["Call", "bm_box_read", 1])
+    elif op == 264373 then # "BoxSet"
+      let out = bm_nc_emit_box_set(out, block_name, i, false)
+    elif op == 902425 then # "BoxSetUnchecked"
+      let out = bm_nc_emit_box_set(out, block_name, i, true)
+    elif op == 992319 then # "BoxShare"
+      # Pops ptr, increments its refcount via bm_rc_inc (return value
+      # discarded -- BoxShare is void beyond the refcount side effect),
+      # then pushes the SAME ptr back unchanged, matching interp.patlang's
+      # own BoxShare exactly. ptr is needed both as bm_rc_inc's own arg
+      # and as this instruction's own result, so it's Stored once and
+      # Loaded twice (an ordinary Call consumes/pops its arg off the
+      # stack, so the first Load is consumed by the call and a second
+      # Load is needed to leave the pointer behind afterward).
+      let ptr_l = bm_nc_local(block_name, i, "p")
+      let out = list_push(out, ["Store", ptr_l])
+      let out = list_push(out, ["Load", ptr_l])
+      let out = list_push(out, ["Call", "bm_rc_inc", 1])
+      let out = list_push(out, ["Store", bm_nc_prefix(block_name, "__bm_discard")])
+      let out = list_push(out, ["Load", ptr_l])
     else
       bm_nc_unsupported("instruction hash '" + op + "'")
     end
@@ -503,7 +617,23 @@ make a function called bm_to_real_funcir takes prog, print_op returns funcir
   # catches (confirmed directly: this exact error is what surfaced this
   # gap in the first place, not something anticipated in advance).
   let entry_name = bi_program_entry(prog)
-  let init_instrs = [["BuildList", 0], ["Store", bm_nc_prefix(entry_name, "__globals")]]
+  # Phase 19 (Box*): interp.patlang's own bm_ensure_heap_ready() lazily
+  # calls bm_heap_init() exactly once, guarded by a get("__vars",
+  # "bm_heap_ready") flag, before the FIRST BoxNew -- heap.patlang's own
+  # free-list table (bm_freelist_table_addr's "__vars" entry) is
+  # otherwise never set, and bm_alloc's own bm_freelist_pop ->
+  # bm_freelist_slot_offset -> bm_freelist_table_addr chain reads it
+  # unconditionally: skipping this init is a real, confirmed segfault
+  # (peeking/poking through an uninitialized table address), not a
+  # theoretical gap -- found by running this exact fixture before this
+  # fix existed. The native path calls bm_heap_init() unconditionally
+  # and eagerly at program start instead of lazily gating it on a flag:
+  # simpler and equally correct (there is exactly one program start,
+  # unlike bi_run's own single shared interpreter process that resets
+  # "bm_heap_ready" to false per bi_run call), and cheap even for a
+  # program that never touches a Box at all (one rt_heap_alloc(1024) for
+  # the free-list table, nothing more).
+  let init_instrs = [["BuildList", 0], ["Store", bm_nc_prefix(entry_name, "__globals")], ["Call", "bm_heap_init", 0], ["Store", bm_nc_prefix(entry_name, "__bm_discard")]]
 
   # Pass 1: translate each block independently; record where its own
   # (still block-local) instrs will start once concatenated -- offset by

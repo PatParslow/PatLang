@@ -1,0 +1,135 @@
+# Block Ownership Model, Phase 19: compiles self_hosting/block_model/
+# heap.patlang ALONE into a cached heap_chunk.obj -- the missing
+# build-plumbing piece Box* native translation needs, following
+# self_hosting/build_x64_runtime.patlang's own established fingerprint-
+# cache pattern exactly (a real, proven pattern to copy, not a new
+# invention). heap.patlang is ordinary PatLang source (no `include`s of
+# its own, confirmed directly) that calls into x64_runtime.patlang's own
+# functions (rt_heap_alloc, mem_peek_qword, mem_poke_qword) purely by
+# name, resolved at link time -- so it compiles with owns_globals=false
+# and x64_runtime.funcs's own name list as extern_names, exactly like an
+# ordinary program chunk does.
+#
+# Run from the repo root:
+#   rust-runtime/target/release/pat --ir-run self_hosting/block_model/tools/build_heap_chunk.patlang
+# Produces self_hosting/build/heap_chunk.obj and self_hosting/build/
+# heap_chunk.funcs (heap.patlang's own function-name manifest, for a
+# FINAL program build to extern in turn -- it calls INTO heap.patlang's
+# own bm_alloc/bm_box_read/etc, the reverse relationship from how the
+# program chunk relates to x64_runtime.obj).
+
+include "../../lib/lexer.patlang"
+include "../../lib/parser.patlang"
+include "../../lib/lower.patlang"
+include "../../lib/codegen_x64.patlang"
+include "../../lib/x64_build.patlang"
+
+let heap_src = read_file("self_hosting/block_model/heap.patlang")
+let rt_src = read_file("self_hosting/lib/x64_runtime.patlang")
+let fingerprint_file = "self_hosting/build/heap_chunk.fingerprint"
+let obj_path = "self_hosting/build/heap_chunk.obj"
+let compiler_src = read_file("self_hosting/lib/lexer.patlang") + read_file("self_hosting/lib/parser.patlang") + read_file("self_hosting/lib/lower.patlang") + read_file("self_hosting/lib/codegen_x64.patlang")
+# The fingerprint also depends on rt_src now (see the real bug found and
+# fixed below), for the same reason build_x64_runtime.patlang's own
+# fingerprint depends on its compiler inputs -- blind to changes upstream
+# of the file most obviously "the" source otherwise.
+let fingerprint = hash_string(heap_src + rt_src + compiler_src)
+let up_to_date = false
+if (file_exists(fingerprint_file) == true) and (file_exists(obj_path) == true) then
+  if read_file(fingerprint_file) == fingerprint then
+    let up_to_date = true
+  end
+end
+
+if up_to_date then
+  print("[cache] heap_chunk.obj unchanged, skipping rebuild")
+else
+  # Real bug found and fixed here: lowering heap.patlang ALONE made
+  # lower_program treat its own calls into x64_runtime.patlang's
+  # functions (rt_heap_alloc, mem_peek_qword, mem_poke_qword, set_var,
+  # get) as CallHost primitives instead of ordinary Call -- it has no
+  # visibility into x64_runtime.patlang's own function declarations, so
+  # `contains_str(fns, callee)` was always false for them. codegen_x64
+  # .patlang then printed "unsupported primitive (not a real function
+  # and not in the OS-boundary allowlist)" for each one and emitted a
+  # broken placeholder instead of a real call -- confirmed directly from
+  # the build's own printed warnings, not caught only after a later
+  # crash. Fixed by lowering the CONCATENATION of x64_runtime.patlang's
+  # own source and heap.patlang's own source together (so lower_program
+  # sees every real function name and correctly emits Call for all of
+  # them), then filtering the resulting function list down to ONLY
+  # heap.patlang's own functions before emission -- x64_runtime's own
+  # function BODIES are dropped here (already compiled into
+  # x64_runtime.obj; emitting them again would be a duplicate-symbol
+  # link error), only its NAMES were ever needed, for name resolution
+  # during lowering. Different from the salting approach Phase 9's own
+  # header already documents abandoning (no renaming happens here at
+  # all, so codegen_x64.patlang's own hardcoded raw-asm runtime-call
+  # text, invisible to a rename, is never a concern in this approach).
+  let heap_own_names = []
+  let heap_own_toks = tokenize(heap_src)
+  let heap_own_ast = parse_program(heap_own_toks)
+  let heap_own_stmts = heap_own_ast[1]
+  let hi = 0
+  let h_count = heap_own_stmts.length
+  while hi < h_count do
+    if heap_own_stmts[hi][0] == "Func" then
+      let heap_own_names = list_push(heap_own_names, heap_own_stmts[hi][1])
+    end
+    let hi = hi + 1
+  end
+
+  let combined_src = rt_src + chr(10) + heap_src
+  let toks = tokenize(combined_src)
+  let ast = parse_program(toks)
+  let err = parse_find_error(ast[1])
+  if err[0] != "" then
+    print(format_parse_error(err[0], err[1], combined_src))
+  else
+    let ir = lower_program(ast)
+    # lower_program synthesizes an empty "main" for every source unit
+    # regardless -- dropped here for the same reason build_x64_runtime
+    # .patlang already drops its own, on top of filtering down to
+    # heap.patlang's own functions specifically (per the fix above).
+    let all_funcs = ir[2]
+    let heap_funcs = []
+    let fi = 0
+    let f_count = all_funcs.length
+    while fi < f_count do
+      let fname = all_funcs[fi][1]
+      if contains_str(heap_own_names, fname) then
+        let heap_funcs = list_push(heap_funcs, all_funcs[fi])
+      end
+      let fi = fi + 1
+    end
+    let heap_ir = [ir[0], ir[1], heap_funcs, ir[3]]
+    let rt_names_raw = split_lines(read_file("self_hosting/build/x64_runtime.funcs"))
+    let rt_names = []
+    let ni = 0
+    while ni < list_len(rt_names_raw) do
+      let nm = list_get(rt_names_raw, ni)
+      if nm != "" then
+        let rt_names = list_push(rt_names, nm)
+      end
+      let ni = ni + 1
+    end
+    let asm = emit_program_x64(heap_ir, false, rt_names)
+    let asm_path = "self_hosting/build/heap_chunk.asm"
+    let result = x64_assemble(asm, asm_path, obj_path)
+    if x64_build_contains(result, "NASM ERROR:") then
+      print(result)
+    else
+      write_file(fingerprint_file, fingerprint)
+      let names_sb = sb_new()
+      let ni = 0
+      let n_count = heap_funcs.length
+      while ni < n_count do
+        sb_push(names_sb, heap_funcs[ni][1])
+        sb_push(names_sb, chr(10))
+        let ni = ni + 1
+      end
+      write_file("self_hosting/build/heap_chunk.funcs", sb_str(names_sb))
+      print("[build] heap_chunk.obj: " + obj_path)
+    end
+  end
+end

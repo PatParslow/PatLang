@@ -86,6 +86,12 @@ OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/b
 check "\"alice\" resolves to 111" "$OUT" "111"
 check "\"bob\" resolves to 222" "$OUT" "222"
 
+echo "Scenario: Box* compiles through real native codegen, linked against a THIRD heap_chunk.obj chunk (Phase 19)"
+OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/native_box_ops.patlang phase19_box 2>&1)
+check "a straight-line box_set chain (patched to BoxSetUnchecked) ends at 30" "$OUT" "30"
+check "box_set after box_share clones instead of mutating in place: the mutated box reads 999" "$OUT" "999"
+check "...and the box shared BEFORE the mutation still reads the ORIGINAL 100, proving real COW" "$OUT" "100"
+
 echo ""
 echo "tests: $PASS passed, $FAIL failed"
 if [ "$FAIL" -eq 0 ]; then

@@ -745,16 +745,120 @@ compiler's own `Store "__discard"` convention. Never previously
 exercised because no earlier fixture chained two of these bare-
 statement calls in one block.
 
-**Genuinely still deferred:** `BoxNew`/`BoxGet`/`BoxSet`/
-`BoxSetUnchecked`/`BoxShare` (heap.patlang isn't bundled into the native
-build path yet), `GlobalGet`/`GlobalSet`/`HandlerNew`/`HandlerRegister`/
-`HandlerLookup` (not attempted this pass, though likely similarly
-tractable), and `Emit` (needs handlers compiled as separate `FuncIR`
-entries — a real, small design change, not attempted this pass).
 `fiber_yield` compiles but segfaults with no active fiber context
 established — a real, separate, deliberately out-of-scope finding (a
 bare smoke test with no fiber machinery isn't a valid usage pattern for
 it), not silently papered over.
+
+**`GlobalGet`/`GlobalSet`/`HandlerNew`/`HandlerRegister`/`HandlerLookup`
+done (2026-09-22).** No new build plumbing needed — `HandlerNew` is just
+`BuildList 0` (already a real, working `codegen_x64.patlang`
+instruction); `GlobalGet`/`HandlerLookup` and `GlobalSet`/
+`HandlerRegister` reduce to the SAME two assoc-list walks
+(`interp.patlang`'s own `bm_rt_assoc_get`/`bm_rt_assoc_set` logic),
+hand-emitted directly as real `Jump`/`JumpIfFalse` loops calling
+`rt_list_get`/`rt_list_len`/`rt_str_eq`/`rt_list_push` — all four already
+present in `x64_runtime.funcs`, confirmed rather than assumed. This
+needed one new mechanism in `bm_to_real_funcir`: `__RawJump`/
+`__RawJumpIfFalse`, for a jump target synthesized entirely within one
+instruction's own expansion (never a real block-model `Jump`), resolved
+with `+base` only, bypassing `index_map` (which would otherwise
+misinterpret it as an original, pre-expansion instruction index and
+remap it to the wrong position). A real bug was found and fixed proving
+this, not designed around in advance: `rt_list_push(l, v)` (list
+argument first, value second) had its two arguments backwards in three
+call sites inside the hand-emitted set-loop, corrupting the handler's
+own backing list via `rt_list_push`'s own address/length read against
+the wrong operand — a genuine segfault the moment the loop actually ran
+with at least one real entry (an empty-handler smoke test had passed by
+accident, masking it). Found by narrowing a minimal repro (a single
+`handler_register` then `handler_lookup`) and reading the generated
+`.asm` directly, not by inspection alone. Verified via
+`native_codegen_check.sh` (13/13) and the full interpreter suite (83/83,
+zero regressions).
+
+**`BoxNew`/`BoxGet`/`BoxSet`/`BoxSetUnchecked`/`BoxShare` done
+(2026-09-23).** The prerequisite this section originally named —
+`heap.patlang` isn't bundled into the native build path — is now solved
+via a real, separate, THIRD compilation chunk (mirroring
+`x64_runtime.obj`'s own established fingerprint-cache convention, not a
+new invention): `tools/build_heap_chunk.patlang` lowers the
+CONCATENATION of `x64_runtime.patlang` + `heap.patlang`'s own source
+together (so `lower_program` can see every real function name and
+correctly emit `Call` rather than a broken `CallHost` placeholder for
+`heap.patlang`'s own calls into `rt_heap_alloc`/`mem_peek_qword`/
+`mem_poke_qword`), then filters the resulting function list down to only
+`heap.patlang`'s own functions before emission (avoiding a duplicate-
+symbol link error against the already-built `x64_runtime.obj`), producing
+`heap_chunk.obj`/`heap_chunk.funcs`. `build_native.patlang` and
+`build_and_run_native.sh` now read/extern/link all three chunks.
+Translation itself: `BoxNew` → `bm_alloc(8)` + `bm_box_write`, pushing
+the pointer; `BoxGet` → a bare `Call "bm_box_read", 1` (the pointer is
+already on top of the native stack from a prior instruction, exactly
+like `FiberYield`/`Fact`'s own single-`Call` translation — no `Store`/
+`Load` needed at all); `BoxSet`/`BoxSetUnchecked` → a hand-emitted
+`__RawJumpIfFalse` branch around two `Call "bm_box_write", 2` paths
+(mutate-in-place vs. allocate-and-write-fresh), branching on
+`bm_rc_touch_for_mutation(ptr) == 1` for the checked form, always taking
+the mutate-in-place path for the unchecked form (matching
+`interp.patlang`'s own branching exactly); `BoxShare` → `bm_rc_inc(ptr)`
+(return discarded) with the same pointer re-`Load`ed afterward so it
+survives the `Call`'s own arg-consuming convention, unchanged.
+
+A real bug was found and fixed proving this, not designed around in
+advance: `heap.patlang`'s own free-list table
+(`bm_freelist_table_addr`'s backing `"__vars"` entry) is populated by
+`bm_heap_init`, which `interp.patlang`'s own `bm_ensure_heap_ready` calls
+lazily, once, before the first `BoxNew` — the native path had no
+equivalent call at all, so the first `bm_alloc` walked
+`bm_freelist_pop -> bm_freelist_slot_offset -> bm_freelist_table_addr`
+through an uninitialized table address, segfaulting immediately (exit
+139, confirmed directly running the new fixture, not predicted from
+reading the code). Fixed by calling `bm_heap_init()` unconditionally at
+native program start (`bm_to_real_funcir`'s own `init_instrs`, alongside
+the existing entry-block `__globals` init) rather than lazily
+flag-gating it like the interpreter — simpler and equally correct, since
+a native program has exactly one start (unlike `bi_run`'s shared
+interpreter process, reset per call), and cheap even for a program that
+never touches a Box at all.
+
+Verified two ways: `native_codegen_check.sh` (16/16, zero regressions)
+and, since Box is native-x64-only (`heap.patlang`'s `rt_heap_alloc`/
+`mem_peek_qword`/`mem_poke_qword` are not host functions under
+`pat --ir-run` at all — a plain interpreter cross-check is structurally
+impossible, confirmed directly), a real independent cross-check instead:
+the SAME block-model program run through `bi_run` (`interp.patlang`'s
+own bytecode interpreter) compiled to native code via
+`./patc1.exe ... --x64` agrees exactly with the direct
+`native_codegen.patlang` translation: both print `30`, `999`, `100` —
+the last two proving real copy-on-write (a Box shared before mutation
+keeps its original value; the mutated one gets the new value) — two
+independent code paths over the identical IR, both genuinely native.
+
+**Also noted, not yet acted on (2026-09-23):** every Block Ownership
+Model native build script (`build_heap_chunk.patlang`,
+`build_native.patlang`'s helpers via `x64_build.patlang`'s
+`x64_assemble`/`x64_link`/`x64_build_linked*`, `build_and_run_native.sh`)
+calls `nasm`/`gcc` directly and never consults
+`x64_build_use_native_toolchain()` — the self-hosted PatLang assembler+
+linker (`x64_asm.patlang`/`x64_pe_link.patlang`) that `patc1.exe --x64`'s
+own CLI dispatch already defaults to. Deliberately left as-is for this
+phase (confirmed ~68x slower per the project's own real measurement —
+9 min vs. 8s — which would slow every remaining Phase 19 iteration), a
+disclosed choice, not an oversight. **When Block Ownership Model's own
+build tooling reaches a stage where routing through the self-hosted
+toolchain matters, it needs updating too** — it does not happen
+automatically just because `x64_build_use_native_toolchain()` exists
+elsewhere in the project.
+
+**Genuinely still deferred:** `Emit` only — needs handlers compiled as
+separate `FuncIR` entries (today's whole program is one flat "main"
+function; `MakeClosure`/`CallValue` need real, separate named function
+labels the current IR shape doesn't have), a single-block-only handler
+restriction, and compile-time-literal-only event names — a real, small
+design change, not attempted this pass. Investigated deeply enough to
+name these concrete requirements before deferring, not deferred on a
+vague "seems hard."
 
 ---
 
