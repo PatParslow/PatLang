@@ -1123,78 +1123,111 @@ own `Emit` already proved (a handler compiled as its own real, separate
 FuncIR, reached via ordinary native `Call`), rather than inventing a
 new one.
 
-**Decided (2026-09-23), before implementation, per this document's own
-front-load-the-architecture-questions discipline:**
+**Correction (2026-09-23, same day, before implementation): the
+classification/dual-mechanism design immediately below this note (kept
+for the record) was more complex than necessary — found by tracing the
+INTERPRETER's own actual execution model concretely instead of
+designing purely from the native x64 side's constraints.** The
+interpreter (`bi_run`/`bi_run_block`) never concatenates blocks into one
+flat array at all — that flattening is a NATIVE-codegen-only artifact
+(Phase 9's own optimization). `bi_run`'s own top-level loop is already
+exactly "run a block, follow `jump` outcomes, stop at `halt`" — so a
+function call with return, for the interpreter, is just an ordinary
+RECURSIVE invocation of that same loop (generalized into a new helper,
+`bi_run_from`), with recursion handled for free by the host interpreter
+(Rust)'s own real call stack — the same mechanism Emit's own recursive
+`bi_run_block` call already uses for handlers, just generalized past a
+single call. This means, for the interpreter specifically, there is **no
+flattened-vs-separate distinction to classify at all** — a function's
+`BlockIR` is the same whether reached via `JumpBlock` (existing tail
+calls, left completely unchanged) or via a NEW `Call`/`ReturnValue`
+instruction pair (value-context calls and non-call `return EXPR`,
+respectively) — so the interpreter-side design is purely ADDITIVE, not a
+fixed-point classification over the whole program.
 
-- **Classification is by call SITE, not by the callee's own return
-  shape.** A single linear pass over the whole program's AST finds every
-  `Call` node reached through `bm_lower_expr` (expression/value context)
-  rather than only `bm_lower_jump_call` (bare tail-statement context);
-  that callee's name joins the "needs real call/return" set. No
-  fixed-point/transitive analysis is needed — a function's own body
-  calling another function as a value is just another instance of the
-  same syntactic pattern, caught by the same single scan. Every function
-  NOT in this set keeps today's unchanged treatment (flattened into
-  `main`, zero stack frames, zero behavior change).
-- **A function in that set is compiled ONCE, uniformly, as a real,
-  separate call/return FuncIR — including at its own tail-call sites,
-  not just its value-context ones.** The alternative (compile it twice:
-  flattened for tail-call sites, a separate FuncIR for value sites) was
-  considered and rejected — it keeps every existing tail-call site at
-  zero cost, but doubles the compiled code for such a function and adds
-  real complexity (two independent lowerings of the same source function
-  that must stay in sync). One code path, matching this project's own
-  "prove correctness first" priority; some stack-frame overhead at call
-  sites that didn't strictly need it is an acceptable, disclosed cost,
-  not a silent one.
-- **Reuses Emit's own family/closure/flatten machinery directly**
-  (`bm_nc_collect_block_closure`/`bm_nc_flatten_blocks` from
-  `native_codegen.patlang`, and the equivalent grouping this phase adds
-  to `lower.patlang`/`interp.patlang` for the plain-interpreter path) —
-  a function's own family is itself plus any of its own synthesized
-  descendant blocks (its own `while` loops) it can reach via internal
-  `JumpBlock`, exactly the same reachability-closure proof Emit already
-  established.
-- **Return value shape: a real 2-element List `[value, updated_globals]`**,
-  built via Phase 18's own new `BuildList`, since such a function still
-  needs to thread `__globals` (Fork B's own convention) while ALSO
-  returning a genuine value — the same problem Emit's own handlers had,
-  solved there by returning only `__globals` (a handler is void from the
-  caller's perspective); a general value-returning function can't get
-  away with returning only one of the two. A call site destructures the
-  popped list via `Index`/`CallHost "list_get"` (Phase 18's own new
-  mechanism) — twice, once for the value, once to re-`Store` the
-  updated `__globals` — not a new instruction.
-- **A mid-body `return EXPR` inside one of these functions becomes a
-  genuine `Return`, wherever it occurs** (including nested inside
-  if/else) — this needs NO jump-target patching at all, unlike
-  `JumpBlock`'s absolute-position bookkeeping, since a real FuncIR's own
-  `Return` instruction already works at any point by construction (the
-  same behavior any ordinary multi-function PatLang program already
-  relies on). A function whose body falls off the end without an
-  explicit `return` gets a synthesized default tail (`Const unit ""`,
-  current `__globals`, `BuildList 2`, `Return`), mirroring `main`'s own
-  existing `Const unit + Return` convention, generalized to also carry
-  globals.
-- **Recursion (direct or mutual) between value-callable functions is
-  expected to work for free**, not specially handled — real x64
-  `call`/`ret` supports it natively; this is a genuine, incidental
-  capability gain over today's flat-JumpBlock model, which structurally
-  cannot express recursion at all (no call stack to unwind through).
-  Verify this directly rather than assuming it, once built.
+**A real, previously-undiagnosed bug was found proving this, not
+designed around in advance:** Emit's own existing handler dispatch
+(Phase 19) does exactly ONE `bi_run_block` call and treats anything
+other than an immediate `"halt"` outcome as an error — but
+`block_ir.patlang`'s own header claims "a while loop IS still reachable
+inside a handler body for free". Checked directly: a handler containing
+a `while` loop hits the FIRST `JumpBlock` (the loop's own back-edge) and
+returns a `"jump"` outcome, not `"halt"`, which Emit's own single-call
+code then rejects as "attempted to jump to another block -- unsupported"
+— a genuine, previously-shipped, silently-wrong claim in that header,
+confirmed via a direct repro (a `when` handler with a 3-iteration
+`while` loop), not assumed. The new `bi_run_from` helper this phase adds
+fixes this for free (it follows `jump` outcomes to completion instead of
+erroring on the first one) — Emit's own handler dispatch is rewired onto
+it as part of this same phase, not left broken alongside the new,
+correctly-built mechanism.
 
-**Checkpoint:** a real, previously-rejected program shape — a declared
-function called as a sub-expression, its result used in further
-computation (`let x = helper(5) + 1`) — runs correctly through
-`bm_lower_program`/`bi_run`, cross-checked against `pat --ir-run` on the
-identical source; the equivalent native x64 translation (extending
-Phase 19's own `native_codegen.patlang`) produces the same result;
-zero regressions in the full interpreter suite and `native_codegen_check
-.sh`. Re-running Phase 18's own checkpoint (`self_hosting/lib/
-zs_schema.patlang` through `bm_lower_program`) afterward to find
-whatever the NEXT real blocker is (very likely closures/classes-with-
-methods, per Phase 18's own remaining named exclusion) is this phase's
-own natural follow-up, not attempted in the same pass as building this.
+**Revised plan for the interpreter slice (native x64 remains the
+dual-mechanism design below, deferred to its own later pass, matching
+this project's own established interpreter-before-native cadence):**
+
+- New `bi_run_from(prog, block, locs) -> [value, final_locs]`: repeatedly
+  calls `bi_run_block`, following `"jump"` outcomes, until `"halt"`;
+  `bi_run` itself becomes a thin wrapper over it starting from the
+  program's entry block (an internal refactor, not a behavior change);
+  Emit's own handler dispatch calls it instead of a single bare
+  `bi_run_block` call (the bug fix above).
+- New `ReturnValue` instruction: pops one value, returns `["halt",
+  value, locs]` immediately, usable anywhere a block's own instrs
+  reach it (mid-body, including nested inside if/else) — `bm_lower_stmt`'s
+  own "Return" case falls back to this for any `EXPR` that ISN'T a call
+  to a declared block, instead of `bm_lower_unsupported`.
+- New `Call` instruction (block-model bytecode, distinct from
+  `JumpBlock`): pops args + current `__globals` (in the same "written
+  order" convention as `JumpBlock`'s own params), calls `bi_run_from` on
+  the named function's own entry block with a FRESH locals set, pushes
+  the returned value onto the CALLER's stack, and updates the caller's
+  own `"__globals"` local to the callee's returned final globals —
+  `bm_lower_expr`'s own "Call" case emits this (instead of rejecting the
+  callee as unsupported) whenever the callee is in `block_names`,
+  superseding this phase's own earlier defensive-rejection message from
+  Phase 18.
+- Existing `JumpBlock`-based tail-call sites (`return F(...)`, a bare
+  `F(...)` statement) are left COMPLETELY UNCHANGED — zero regression
+  risk, since nothing about them needs to change for this to work; a
+  function ever ALSO called via the new value-context `Call` mechanism
+  is simply the same `BlockIR`, reachable both ways, with no dual
+  compilation or classification needed on the interpreter side at all.
+- Recursion (direct or mutual) between functions called via the new
+  `Call` instruction is expected to work for free, the same way Emit's
+  own existing recursive `bi_run_block` call already does (bounded only
+  by the HOST interpreter's own real call stack) — a genuine, incidental
+  capability gain over the flat model's own inability to recurse at all.
+  Verify directly once built, not assumed.
+
+**Native x64 (deferred, not attempted in the interpreter-first pass
+above) — original design, kept as still the right shape for when this
+is picked up:** classification by call SITE (`bm_lower_expr` vs
+`bm_lower_jump_call` reachability, closed under one additional rule: a
+function tail-called FROM an already-real function must also become
+real, since a separate FuncIR cannot `JumpBlock` into `main`'s own
+array — this fixed-point requirement does NOT apply to the interpreter,
+only to native's own flattened-vs-separate compilation choice). A
+function in that set is compiled ONCE, uniformly, as a real, separate
+call/return FuncIR (reusing Emit's own `bm_nc_collect_block_closure`/
+`bm_nc_flatten_blocks` machinery) — including at its own tail-call
+sites, not compiled twice — returning a real 2-element List `[value,
+updated_globals]` via Phase 18's own `BuildList`, destructured at each
+call site via `Index`/`CallHost "list_get"`.
+
+**Checkpoint (interpreter slice):** a real, previously-rejected program
+shape — a declared function called as a sub-expression, its result used
+in further computation (`let x = helper(5) + 1`) — runs correctly
+through `bm_lower_program`/`bi_run`, cross-checked against `pat --ir-run`
+on the identical source; a `when` handler containing a `while` loop now
+runs correctly too (the bug fix above, verified via its own scenario,
+not just claimed fixed); recursion between two functions works; zero
+regressions in the full interpreter suite. Native x64 codegen for the
+new instructions, and re-running Phase 18's own checkpoint (`self_
+hosting/lib/zs_schema.patlang`) to find the NEXT real blocker (very
+likely closures/classes-with-methods) are this phase's own explicitly
+separate, later follow-ups, not attempted in the same pass as the
+interpreter slice.
 
 **Not started.** This section records the decision only; implementation
 begins in a following session/turn under the usual RED/GREEN/verify
