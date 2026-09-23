@@ -108,3 +108,33 @@ Feature: library-level parity, generic host calls and list literals (Phase 18 of
     Given self_hosting/lib/zs_schema.patlang, real and unmodified
     When it is lowered through bm_lower_program
     Then it lowers completely, with no unsupported construct left anywhere in it
+
+  A second, deeper finding turned up while re-verifying self_hosting/lib/
+  schema_bdd_selftest.patlang with real `include` expansion applied (see
+  this project's own plan doc, Phase 22): `bm_lower_expr`'s own "Member"
+  case (`obj.prop`) unconditionally assumed the receiver is a Box-wrapped
+  Handler-shaped object (Phase 13's own class-field-access
+  representation), routing EVERY `.prop` -- including the extremely
+  common `.length` idiom on an ordinary String or List -- through
+  `BoxGet`+`HandlerLookup`. This is doubly wrong for a primitive value:
+  semantically (a raw String/List is not a Handler-shaped assoc-list) and
+  mechanically (`BoxGet` is native-x64-only, since `heap.patlang`'s own
+  `bm_box_read` calls `mem_peek_qword` directly, which neither the
+  interpreter nor `rust-runtime/src/ir/hosts.rs` implement). Confirmed via
+  a minimal, standalone repro (`let s = "hello"; print(s.length)`,
+  independent of either schema file) crashing with "host fn
+  'mem_peek_qword' not found" before this fix. Fixed by mirroring the REAL
+  self-hosted `lower.patlang`'s own Member case exactly (that file's own
+  `lower_expr`, `ty == "Member"` arm): `.length`/`.len` now lowers
+  straight to `CallHost "len"` -- a genuine, already-"feature complete"
+  host function that works correctly under BOTH backends -- with
+  `BoxGet`+`HandlerLookup` reserved for every OTHER property name
+  (genuine object field access, unchanged, still native-x64-only as
+  before). A real, incidental capability gain, not just a bug fix:
+  `.length` now works under the INTERPRETER for the first time, where
+  genuine `obj.field` access still correctly requires native compilation.
+
+  Scenario: .length/.len on an ordinary String or List works under the interpreter, distinct from Box+Handler object-field access
+    Given a program that takes the .length of a String and of a List, never a Box-wrapped object
+    When it runs through bm_lower_program/bi_run under the interpreter
+    Then both lengths match exactly what pat --ir-run produces for the identical source
