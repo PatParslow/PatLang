@@ -77,3 +77,34 @@ Feature: library-level parity, generic host calls and list literals (Phase 18 of
   reasoning alone. `new` was already blocked separately (Phase 13's own
   class-registry interception); `get`/`send`/`set_var` (in value
   context) were not, until now.
+
+  Scenario: a genuine host function called as a bare statement also gets the generic fallback
+    Given a program that calls sb_push as a bare statement, its own return value never consumed
+    When it runs through bm_lower_program/bi_run
+    Then it produces exactly what pat --ir-run produces for the identical source
+
+  A real, previously-missing case, found while re-attempting Phase 18's
+  own zs_schema.patlang checkpoint (self_hosting/lib/zs_schema.patlang's
+  own `zs_lines()` calls `sb_push(buf, sc_char(h, i))` exactly this way):
+  `bm_lower_expr`'s own generic CallHost fallback only ever covered
+  VALUE-context calls; `bm_lower_stmt`'s own separate bare-statement
+  dispatch chain (used for a call that's a whole statement on its own,
+  not part of a larger expression) never got the analogous fallback at
+  all, still ending in "a call to anything other than print, a box_*/
+  global/handler builtin, or a declared block" for any host function not
+  individually named. Fixed the same way as the value-context case, at
+  the SAME shared dispatch point, discarding the (real Call's own,
+  always-present) return value via the identical `Store "__bm_discard"`
+  convention this file's own other bare-statement builtins (Fact,
+  box_set, etc.) already use.
+
+  With both this and the nested-while fix (spec_library/block_model/
+  loop_blocks.feature), self_hosting/lib/zs_schema.patlang -- the exact
+  file Phase 18's own checkpoint named -- now lowers COMPLETELY under
+  bm_lower_program, confirmed directly by lowering the real, unmodified
+  file end to end, not a synthetic excerpt.
+
+  Scenario: self_hosting/lib/zs_schema.patlang lowers completely
+    Given self_hosting/lib/zs_schema.patlang, real and unmodified
+    When it is lowered through bm_lower_program
+    Then it lowers completely, with no unsupported construct left anywhere in it

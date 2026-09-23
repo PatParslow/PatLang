@@ -868,6 +868,34 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
         return list_push(instrs, ["Emit"])
       elif bm_list_contains(block_names, name) then
         return bm_lower_jump_call(call, instrs, block_names, blocks_by_name, immut_params)
+      elif bm_lower_is_ambient_state_name(name) then
+        # Same rejection bm_lower_expr's own generic fallback already
+        # has, reached here too now that bare statements get a generic
+        # fallback of their own -- see that check's own comment for the
+        # full rationale (Fork B's own ambient-state elimination).
+        bm_lower_unsupported("calling '" + name + "' directly -- this reaches genuine, process-wide ambient state (self_hosting/lib/interp.patlang's own interp_call_host), which Fork B's own design (docs/plans/block-ownership-model.md section 6) deliberately eliminates from this engine; use set_global/get_global or handler_new/handler_register/handler_lookup instead")
+        return instrs
+      else
+        # Phase 22: the bare-statement twin of bm_lower_expr's own
+        # generic CallHost fallback (Phase 17/18) -- found missing while
+        # re-attempting Phase 18's own zs_schema.patlang checkpoint
+        # (self_hosting/lib/zs_schema.patlang's own zs_lines() calls
+        # sb_push(...) as a bare statement, a genuine, real, stateless
+        # host function never individually recognized by name here).
+        # Pushes args in written order, then CallHost, then discards the
+        # (always present, from a REAL Call's own convention) return
+        # value -- same "Store __bm_discard" convention this file's own
+        # bare-statement Fact/box_*/etc. cases above already use, for
+        # the identical reason (a bare statement's own result is never
+        # consumed by anything).
+        let ai = 0
+        let an = list_len(call_args)
+        while ai < an do
+          let instrs = bm_lower_expr(list_get(call_args, ai), instrs, block_names, immut_params)
+          let ai = ai + 1
+        end
+        let instrs = list_push(instrs, ["CallHost", name, an])
+        return list_push(instrs, ["Store", "__bm_discard"])
       end
     end
     bm_lower_unsupported("a call to anything other than print, a box_*/global/handler builtin, or a declared block")
@@ -923,6 +951,201 @@ make a function called bm_push_loads takes instrs, names returns out
   return instrs
 end
 
+# Phase 22: does `stmts` contain a `while` ANYWHERE reachable without
+# crossing a function boundary -- directly, or nested inside an `if`'s
+# own then/else (recursively, to arbitrary depth)? Does NOT need to
+# recurse into a `while`'s OWN body: a while found there already means
+# "yes" via the direct check at that position, and this function is only
+# ever asked about an if-BRANCH's own statement list, never about
+# reaching inside an unrelated nested loop's own interior. Used to decide
+# whether an `if` needs the "must split" treatment below (bm_lower_if_
+# with_nested_while) or can keep using bm_lower_stmt's own original,
+# non-splitting If lowering unchanged.
+make a function called bm_stmt_list_contains_while takes stmts returns yes
+  let n = list_len(stmts)
+  let i = 0
+  while i < n do
+    let stmt = list_get(stmts, i)
+    let ty = list_get(stmt, 0)
+    if ty == "While" then
+      return true
+    elif ty == "If" then
+      if bm_stmt_list_contains_while(list_get(stmt, 2)) then
+        return true
+      end
+      if bm_stmt_list_contains_while(list_get(stmt, 3)) then
+        return true
+      end
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# Phase 22 correction, same day, before this was ever committed: the
+# version immediately below this note (kept for the record) had a real,
+# confirmed bug, found by testing it directly rather than trusting the
+# design. `bm_lower_top_level_stmt_list`'s own "natural end of this
+# statement list" case always just returned `[instrs, pending]` as-is --
+# fine for a FUNCTION's own top level (there's genuinely nothing further
+# to do), but WRONG the moment this same function is used one level
+# deeper: a while LOOP's own body reaching the natural end of ITS OWN
+# statement list must append the loop's own BACK-EDGE, not just stop --
+# and the ORIGINAL code only ever appended that back-edge in
+# `bm_lower_while`'s own caller-side code, AFTER its call into
+# `bm_lower_top_level_stmt_list` returned. That works fine when the body
+# has no nested split of its own (the call returns normally, back-edge
+# appended by the caller as always) -- but the INSTANT the body's last
+# reachable statement is itself a `while` (or, now, an `if` containing
+# one), `bm_lower_top_level_stmt_list` returns EARLY via `bm_lower_while`
+# /`bm_lower_if_with_nested_while` directly, and the caller-side code
+# that was meant to append the back-edge never runs at all -- silently
+# losing the loop's own back-edge entirely. Confirmed as a REAL,
+# PRE-EXISTING bug, not something this phase's own new "if" case
+# introduced: a plain `while` nested directly inside another `while`
+# (with any statement after the inner one), no `if` involved anywhere,
+# already crashed with "unbound in this block's own pointer" before this
+# fix -- checked directly with a minimal repro, not assumed.
+#
+# The fix: `bm_lower_top_level_stmt_list` now takes an explicit
+# CONTINUATION parameter `k` -- a tagged value (`["none"]` or `["jump",
+# target_name, captured, jump_params]`), not a closure (this file's own
+# established style is tagged-list dispatch throughout, not first-class
+# functions, so a data-shaped continuation is used instead of a real
+# closure literal, even though the language itself would support one).
+# Applied via `bm_apply_continuation` at the ACTUAL natural-end point,
+# wherever that turns out to be -- correctly threading "what happens
+# next" through however many levels of nested while/if a body actually
+# has, not just one. A function's own top-level body (and a handler's)
+# still passes `["none"]` (nothing further, matching today's unchanged
+# behavior there); a loop's own body passes a `["jump", head_name, ...]`
+# continuation (the back-edge); an if-with-nested-while's own then/else
+# branches pass a `["jump", after_name, ...]` continuation; and BOTH of
+# those cases still hand their OWN exit/after block the CALLER's own
+# `k` (not a fresh `["none"]`), so the propagation is genuinely correct
+# to arbitrary nesting depth, not just one level.
+make a function called bm_apply_continuation takes k, instrs, pending returns out
+  let kind = list_get(k, 0)
+  if kind == "none" then
+    return [instrs, pending]
+  elif kind == "jump" then
+    let target_name = list_get(k, 1)
+    let captured = list_get(k, 2)
+    let jump_params = list_get(k, 3)
+    let instrs = bm_push_loads(instrs, captured)
+    let instrs = list_push(instrs, ["Load", "__globals"])
+    let instrs = list_push(instrs, ["JumpBlock", target_name, jump_params])
+    return [instrs, pending]
+  end
+  bm_lower_unsupported("unknown continuation kind '" + kind + "'")
+  return [instrs, pending]
+end
+
+# Whatever names a "jump" continuation itself needs forwarded, or []
+# for "none" -- used so a block that must apply `k` at its own natural
+# end can be sure it captured everything `k` will go on to need, not
+# just what ITS OWN body/tail happens to reference.
+make a function called bm_continuation_captured takes k returns names
+  if list_get(k, 0) == "jump" then
+    return list_get(k, 2)
+  end
+  return []
+end
+
+# A plain sub-list, xs[start_idx..] -- used to run free-variable
+# analysis (bm_free_vars_of_body, which expects an ordinary statement
+# list) over "whatever textually follows a given point", not the whole
+# original list.
+make a function called bm_list_slice_from takes xs, start_idx returns out
+  let n = list_len(xs)
+  let out = []
+  let i = start_idx
+  while i < n do
+    let out = list_push(out, list_get(xs, i))
+    let i = i + 1
+  end
+  return out
+end
+
+# Sibling to free_vars.patlang's own bm_intersect_preserving_order:
+# `base`'s own order is kept, then any name in `extra` not already
+# present is appended (also in `extra`'s own order) -- a plain ordered
+# set union, not otherwise available in that file (which only ever
+# needed intersection until now).
+make a function called bm_union_preserving_order takes base, extra returns out
+  let out = base
+  let n = list_len(extra)
+  let i = 0
+  while i < n do
+    let name = list_get(extra, i)
+    if not bm_fv_list_contains(out, name) then
+      let out = list_push(out, name)
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# Phase 22: an `if` whose then/else branch contains a `while` (found via
+# bm_stmt_list_contains_while above) needs a REAL block split, the same
+# way a top-level `while` always has -- this engine's own control-flow
+# model has no way to jump backwards WITHIN one block's own instruction
+# stream at all (Fork A's own design), only via a JumpBlock creating a
+# fresh block invocation, so a nested loop's own back-edge needs a real
+# target block regardless of how deep the nesting is. Generalizes bm_
+# lower_while's own "hand the code after the loop to a synthesized exit
+# block" pattern to `if` instead of `while`: the code AFTER this `if`
+# (stmts[idx+1..]) becomes its own synthesized "after" block, reached by
+# an UNCONDITIONAL JumpBlock at the end of BOTH branches -- safe even
+# when a branch already ended in a Return/JumpBlock of its own (the
+# extra JumpBlock is then simply dead code, never reached, the identical
+# reasoning bm_lower_while's own exit-block construction already relies
+# on for this same class of case). The AFTER block's own natural end
+# uses the CALLER's own continuation `k`, not a fresh `["none"]` -- see
+# this file's own correction note just above for why that distinction
+# is exactly what fixes the real bug found here.
+#
+# `captured` is deliberately just `known_locals` UNCHANGED here, not a
+# fresh, more precise free-variable analysis of "after" specifically
+# (unlike bm_lower_while, which at least intersects with the loop BODY's
+# own free vars) -- a disclosed, correctness-first simplification for
+# this first cut: every name in known_locals is, by definition, already
+# bound in the enclosing scope, so forwarding all of them is SOUND
+# (nothing is ever under-captured), just not minimal (some forwarded
+# names may go unused by the after-block). Tightening this to genuine
+# free-variable precision is real, separate follow-up work, not
+# attempted in this same pass.
+make a function called bm_lower_if_with_nested_while takes stmt, stmts, idx, instrs, block_names, blocks_by_name, immut_params, known_locals, pending, k returns out
+  let cond = list_get(stmt, 1)
+  let then_stmts = list_get(stmt, 2)
+  let else_stmts = list_get(stmt, 3)
+  let after_name = bm_next_synth_name("__if_after")
+  let captured = known_locals
+  let jump_params = list_push(captured, "__globals")
+  let after_k = ["jump", after_name, captured, jump_params]
+
+  let instrs = bm_lower_expr(cond, instrs, block_names, immut_params)
+  let instrs = list_push(instrs, ["JumpIfFalse", 0])
+  let jif_pos = list_len(instrs) - 1
+
+  let then_result = bm_lower_top_level_stmt_list(then_stmts, 0, instrs, block_names, blocks_by_name, immut_params, captured, pending, [], after_k)
+  let instrs = list_get(then_result, 0)
+  let pending = list_get(then_result, 1)
+
+  let instrs = list_set(instrs, jif_pos, ["JumpIfFalse", list_len(instrs)])
+
+  let else_result = bm_lower_top_level_stmt_list(else_stmts, 0, instrs, block_names, blocks_by_name, immut_params, captured, pending, [], after_k)
+  let instrs = list_get(else_result, 0)
+  let pending = list_get(else_result, 1)
+
+  let after_result = bm_lower_top_level_stmt_list(stmts, idx + 1, [], block_names, blocks_by_name, immut_params, captured, pending, [], k)
+  let after_instrs = list_get(after_result, 0)
+  let pending = list_get(after_result, 1)
+  let pending = list_push(pending, ["BlockIR", after_name, jump_params, bm_hash_rewrite_instrs(after_instrs)])
+
+  return [instrs, pending]
+end
+
 # The ONLY place a `while` is recognized -- a function's own top level
 # (see this file's own header on why). Every non-While statement here
 # delegates straight to the ORIGINAL bm_lower_stmt (unchanged), so
@@ -930,14 +1153,22 @@ end
 # `let` additionally extends known_locals for a LATER while's own capture
 # set, and `while` itself hands off the statements after it to a
 # synthesized exit block rather than continuing this same loop.
-make a function called bm_lower_top_level_stmt_list takes stmts, start_idx, instrs, block_names, blocks_by_name, immut_params, known_locals, pending, fresh returns out
+#
+# Phase 22 adds one more case: an `if` whose then/else branch contains a
+# nested `while` (checked via bm_stmt_list_contains_while) is handed off
+# to bm_lower_if_with_nested_while, above, which needs the SAME
+# splitting treatment `while` itself already gets -- every OTHER `if`
+# (the overwhelming common case) is entirely unaffected, still lowered
+# by bm_lower_stmt's own original, non-splitting If case exactly as
+# before.
+make a function called bm_lower_top_level_stmt_list takes stmts, start_idx, instrs, block_names, blocks_by_name, immut_params, known_locals, pending, fresh, k returns out
   let n = list_len(stmts)
   let i = start_idx
   while i < n do
     let stmt = list_get(stmts, i)
     let ty = list_get(stmt, 0)
     if ty == "While" then
-      return bm_lower_while(stmt, stmts, i, instrs, block_names, blocks_by_name, immut_params, known_locals, pending)
+      return bm_lower_while(stmt, stmts, i, instrs, block_names, blocks_by_name, immut_params, known_locals, pending, k)
     elif ty == "Let" then
       let val_node = list_get(stmt, 2)
       let instrs = bm_lower_stmt(stmt, instrs, block_names, blocks_by_name, immut_params)
@@ -958,6 +1189,14 @@ make a function called bm_lower_top_level_stmt_list takes stmts, start_idx, inst
       end
       let fresh = bm_fc_after_let(fresh, list_get(stmt, 1), val_node)
       let i = i + 1
+    elif (ty == "If") and (bm_stmt_list_contains_while(list_get(stmt, 2)) or bm_stmt_list_contains_while(list_get(stmt, 3))) then
+      # Phase 22: this If's own then/else contains a nested while --
+      # needs the real block split above, not the ordinary in-place
+      # If lowering the `else` branch below still uses for every other
+      # If. Own dispatch case (not folded into the `else` below) so it's
+      # checked BEFORE falling through to the unconditional, ordinary
+      # If handling.
+      return bm_lower_if_with_nested_while(stmt, stmts, i, instrs, block_names, blocks_by_name, immut_params, known_locals, pending, k)
     else
       # If/Return/Expr (including a bare jump-call): conservatively
       # invalidate `fresh` entirely -- this narrow, straight-line-only
@@ -968,10 +1207,10 @@ make a function called bm_lower_top_level_stmt_list takes stmts, start_idx, inst
       let i = i + 1
     end
   end
-  return [instrs, pending]
+  return bm_apply_continuation(k, instrs, pending)
 end
 
-make a function called bm_lower_while takes stmt, stmts, idx, instrs, block_names, blocks_by_name, immut_params, known_locals, pending returns out
+make a function called bm_lower_while takes stmt, stmts, idx, instrs, block_names, blocks_by_name, immut_params, known_locals, pending, k returns out
   let cond = list_get(stmt, 1)
   let body_stmts = list_get(stmt, 2)
   let head_name = bm_next_synth_name("__loop_head")
@@ -982,8 +1221,29 @@ make a function called bm_lower_while takes stmt, stmts, idx, instrs, block_name
   # left for bm_loc_get's existing runtime check to catch, not silently
   # absorbed here) -- replaces Phase 5's own `captured = known_locals`
   # wholesale placeholder.
-  let free = bm_free_vars_of_body(body_stmts)
-  let captured = bm_intersect_preserving_order(known_locals, free)
+  #
+  # Phase 22 correction: the body's own free variables ALONE are not
+  # enough. The loop's own false-path/exit-transfer code lives, textually,
+  # INSIDE the head block's own scope (see step 2's own comment below --
+  # "the SAME shape as an ordinary if/else", so the false branch shares
+  # the head's own declared params) -- so the head block ALSO needs
+  # whatever the code AFTER the loop needs, and whatever the ENCLOSING
+  # continuation `k` itself needs, or the exit path could try to forward
+  # a name that was never actually bound within the head block at all. A
+  # real, confirmed, pre-existing bug, found by testing a shape neither
+  # existing fixture happened to exercise (a value read only AFTER a
+  # loop, never inside its own body): `unbound in this block's own
+  # pointer` the moment such code ran. Verified this UNION still
+  # correctly excludes a truly-never-referenced local (self_hosting/
+  # block_model/spec_fixtures/free_var_capture_precise.patlang's own
+  # `unused_big`, referenced neither inside the body nor after it) --
+  # free_variable_capture.feature's own existing guarantee is unaffected,
+  # confirmed by re-running it, not merely reasoned about.
+  let body_free = bm_intersect_preserving_order(known_locals, bm_free_vars_of_body(body_stmts))
+  let after_stmts = bm_list_slice_from(stmts, idx + 1)
+  let after_free = bm_intersect_preserving_order(known_locals, bm_free_vars_of_body(after_stmts))
+  let k_captured = bm_continuation_captured(k)
+  let captured = bm_union_preserving_order(body_free, bm_union_preserving_order(after_free, k_captured))
   let jump_params = list_push(captured, "__globals")
 
   # 1) At the current point in the CALLING block: enter the loop head for
@@ -997,15 +1257,22 @@ make a function called bm_lower_while takes stmt, stmts, idx, instrs, block_name
   #    back edge to head_name; then the false-path tail (forward captured,
   #    jump to exit_name) -- the SAME shape as an ordinary if/else with an
   #    always-taken true branch (section 4.1: nothing new invented here).
+  #
+  # Phase 22 correction: the body's own back-edge is now threaded in as
+  # a CONTINUATION (bm_apply_continuation's own header has the full
+  # story) rather than appended here unconditionally right after the
+  # call -- the latter silently never ran at all whenever the body's own
+  # last reachable statement was itself a further split (a nested while,
+  # or now an if containing one), a real, confirmed, pre-existing bug
+  # fixed as part of this same phase, not merely worked around for the
+  # NEW if-with-nested-while case this phase also adds.
+  let back_edge_k = ["jump", head_name, captured, jump_params]
   let head_instrs = bm_lower_expr(cond, [], block_names, immut_params)
   let head_instrs = list_push(head_instrs, ["JumpIfFalse", 0])
   let jif_pos = list_len(head_instrs) - 1
-  let body_result = bm_lower_top_level_stmt_list(body_stmts, 0, head_instrs, block_names, blocks_by_name, immut_params, captured, pending, [])
+  let body_result = bm_lower_top_level_stmt_list(body_stmts, 0, head_instrs, block_names, blocks_by_name, immut_params, captured, pending, [], back_edge_k)
   let head_instrs = list_get(body_result, 0)
   let pending = list_get(body_result, 1)
-  let head_instrs = bm_push_loads(head_instrs, captured)
-  let head_instrs = list_push(head_instrs, ["Load", "__globals"])
-  let head_instrs = list_push(head_instrs, ["JumpBlock", head_name, jump_params])
   let head_instrs = list_set(head_instrs, jif_pos, ["JumpIfFalse", list_len(head_instrs)])
   let head_instrs = bm_push_loads(head_instrs, captured)
   let head_instrs = list_push(head_instrs, ["Load", "__globals"])
@@ -1013,8 +1280,12 @@ make a function called bm_lower_while takes stmt, stmts, idx, instrs, block_name
   let pending = list_push(pending, ["BlockIR", head_name, jump_params, bm_hash_rewrite_instrs(head_instrs)])
 
   # 3) The loop exit block: same captured params, body = whatever
-  #    statements textually followed the while in the enclosing function.
-  let exit_result = bm_lower_top_level_stmt_list(stmts, idx + 1, [], block_names, blocks_by_name, immut_params, captured, pending, [])
+  #    statements textually followed the while in the enclosing function,
+  #    ending in the CALLER's own continuation `k` (not a fresh
+  #    `["none"]`) -- so a while nested inside yet another construct
+  #    still correctly reaches whatever THAT construct needs once this
+  #    whole while (and everything after it) is finally done.
+  let exit_result = bm_lower_top_level_stmt_list(stmts, idx + 1, [], block_names, blocks_by_name, immut_params, captured, pending, [], k)
   let exit_instrs = list_get(exit_result, 0)
   let pending = list_get(exit_result, 1)
   let pending = list_push(pending, ["BlockIR", exit_name, jump_params, bm_hash_rewrite_instrs(exit_instrs)])
@@ -1201,7 +1472,7 @@ make a function called bm_lower_program takes ast returns prog
         end
         let pi = pi + 1
       end
-      let top_result = bm_lower_top_level_stmt_list(body, 0, [], block_names, blocks_by_name, immut_params, declared_params, [], [])
+      let top_result = bm_lower_top_level_stmt_list(body, 0, [], block_names, blocks_by_name, immut_params, declared_params, [], [], ["none"])
       let instrs = list_get(top_result, 0)
       let synthesized = list_get(top_result, 1)
       let blocks = list_push(blocks, ["BlockIR", name, params, bm_hash_rewrite_instrs(instrs)])
@@ -1222,7 +1493,7 @@ make a function called bm_lower_program takes ast returns prog
       let handler_params = ["event_name", "event_data", "__globals"]
       let handler_immut_params = ["event_name", "event_data"]
       let handler_known_locals = ["event_name", "event_data"]
-      let top_result = bm_lower_top_level_stmt_list(body, 0, [], [], [], handler_immut_params, handler_known_locals, [], [])
+      let top_result = bm_lower_top_level_stmt_list(body, 0, [], [], [], handler_immut_params, handler_known_locals, [], [], ["none"])
       let handler_instrs = list_get(top_result, 0)
       let handler_synth = list_get(top_result, 1)
       let blocks = list_push(blocks, ["BlockIR", handler_name, handler_params, bm_hash_rewrite_instrs(handler_instrs)])

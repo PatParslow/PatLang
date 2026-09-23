@@ -703,18 +703,83 @@ real blockers, one fixed, one newly diagnosed and NOT yet fixed:**
    .patlang` 3, `library_loans_schema_demo.patlang` 7, and `zs_refine_
    selftest.patlang` 62 — 172 checks total, none broken) and the full
    block-model suite (91/91, zero regressions there too).
-3. **The REAL next blocker, found by re-running the checkpoint after (1)
-   and (2), NOT yet fixed:** `zs_schema.patlang`'s own `zs_lines()`
-   function contains a `while` loop NESTED inside an `if` block —
-   `does not support: statement shape 'While'`. Block-model's own Phase
-   5 only ever supported `while` at a function's OWN top level (a loop
-   reached via `bm_lower_stmt`, i.e. nested inside an if/else, hits
-   `bm_lower_unsupported` by design, not a silent gap) — extending it to
-   nested loops is a genuinely separate, sizable feature (each nesting
-   level needs its own captured-variable threading through the existing
-   head/exit block-splitting scheme, not a small patch), not attempted
-   in this pass. Named plainly rather than guessed at further without
-   confirming it empirically first.
+3. **The blocker named above IS now fixed (2026-09-23, same day) — real
+   scope, not the smaller estimate first given, and it found TWO more
+   real, pre-existing bugs along the way.** `bm_lower_top_level_stmt_list`
+   now takes an explicit CONTINUATION parameter (a tagged value, `["none"]`
+   or `["jump", target_name, captured, jump_params]`, applied via a new
+   `bm_apply_continuation` at whatever point turns out to be a statement
+   list's own actual natural end) instead of assuming "the natural end is
+   always just stop" — the earlier estimate ("each nesting level needs
+   its own captured-variable threading... not a small patch") undersold
+   just how deep this went: it's a genuine CPS-style restructuring, not a
+   localized patch.
+   - A new `bm_lower_if_with_nested_while` handles an `if` whose
+     then/else contains a `while` (checked via a new
+     `bm_stmt_list_contains_while`, recursive to arbitrary depth): the
+     code after the `if` becomes a synthesized "after" block, reached by
+     an unconditional `JumpBlock` at the end of BOTH branches (dead code
+     when a branch already transferred control unconditionally of its
+     own, the same reasoning `bm_lower_while`'s own exit block already
+     relied on).
+   - **A real, PRE-EXISTING bug, confirmed via a minimal repro with NO
+     `if` involved at all** (a plain `while` directly nested inside
+     another `while`, with any statement after the inner one): the outer
+     loop's own back-edge/exit-transfer code was appended by
+     `bm_lower_while`'s own CALLER-side code, immediately AFTER its call
+     into `bm_lower_top_level_stmt_list` returned — which works fine
+     when that call returns normally, but is silently skipped entirely
+     the instant the body's own last reachable statement is ITSELF a
+     further split (a nested `while`, or now an `if` containing one),
+     since that call then returns EARLY via `bm_lower_while`/`bm_lower_
+     if_with_nested_while` directly. Crashed with "unbound in this
+     block's own pointer" the moment such a shape actually ran — not
+     something either existing loop fixture happened to exercise. Fixed
+     by the continuation mechanism above, not a targeted workaround.
+   - **A second, real, PRE-EXISTING bug**, found immediately after fixing
+     the first: a loop's own exit path lives, textually, INSIDE its own
+     head block's own scope (the false-path of its own condition check),
+     so it needs access to whatever the code AFTER the loop needs too —
+     not just the loop BODY's own free variables, which is all `captured`
+     (Phase 6/Fork E's own precision analysis) ever computed. A value
+     referenced only after a loop, never inside its own body, crashed
+     the same way, for the same underlying reason. Fixed by unioning the
+     body's own free vars with free vars of "everything after the loop"
+     (via two new helpers, `bm_list_slice_from`/`bm_union_preserving_
+     order`) and whatever the enclosing continuation itself needs —
+     confirmed this union still correctly EXCLUDES a value referenced
+     nowhere at all, by re-running `free_variable_capture.feature`'s own
+     dedicated precision scenarios unchanged, not merely reasoning that
+     it should.
+   - **A third, real, MISSING case**, found immediately after re-running
+     the checkpoint past the nested-while fix: `zs_lines()` also calls
+     `sb_push(...)` as a BARE STATEMENT — Phase 18's own generic CallHost
+     fallback only ever covered VALUE-context calls (`bm_lower_expr`);
+     `bm_lower_stmt`'s own separate bare-statement dispatch chain never
+     got the analogous fallback at all. Fixed the same way, at the same
+     shared dispatch point, discarding the return value via the
+     established `Store "__bm_discard"` convention.
+   - **Milestone: `self_hosting/lib/zs_schema.patlang` — the exact file
+     Phase 18's own checkpoint named — now lowers COMPLETELY** through
+     `bm_lower_program`, confirmed directly (a new permanent regression
+     scenario in `library_parity.feature` lowers the real, unmodified
+     file end to end and checks for zero unsupported-construct errors),
+     not a synthetic excerpt. Verified with zero regressions: the full
+     block-model interpreter suite (96/96, up from 93), native codegen
+     checks (24/24, unaffected), and all real-engine test suites that
+     touch these files (unaffected — the fixes are entirely inside
+     `self_hosting/block_model/lower.patlang`, which the real engine
+     never consults).
+   - **Still not attempted, a separate, further undertaking:** actually
+     RUNNING the full, original `zs_schema` selftest suite (`self_
+     hosting/tools/run_zs_selftests.patlang`) through the block-model
+     engine, as the checkpoint's own broader goal describes — that needs
+     `self_hosting/lib/test.patlang` (the Gherkin runner itself) and
+     several more files (`zs_refine`, `zs_explore`, `zs_generate`,
+     `zs_infer`, `pset`, `pmap`, ...) to ALSO lower, which will very
+     likely surface further, currently-unknown blockers of its own —
+     lowering ONE library file completely is real, necessary progress,
+     not the same claim as "the whole selftest suite runs end to end."
 
 ---
 
