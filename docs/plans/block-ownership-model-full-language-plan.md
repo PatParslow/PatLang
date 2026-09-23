@@ -13,24 +13,28 @@ its own section for the exact failure and what it traces to. Phase 20
 actually being fixed, not waived) and acting on them explicitly not yet
 authorized.
 
-**Phase 19 is now partially implemented, not just scoped** — after two
-rounds of wrong estimates, both corrected before (and one after) writing
-code: `FiberYield`/`Fact`/`Query`/`TypeOf`/`ReadFile`/`WriteFile`/
-`ContractFail` all now have real, verified native x64 translations
-(`native_codegen_check.sh`: 10/10 passing). Proving this end to end
-found and fixed a real, project-wide bug (not block-model-specific):
-without `-Wl,--disable-dynamicbase`, Windows can relocate a linked
-image away from the fixed `0x140000000` base `x64_family_code_asm`'s
-own classification logic hardcodes, silently misclassifying every
-string literal and breaking `print()`'s own dispatch for it — fixed at
-every linker call site in the shared `x64_build.patlang`, benefiting
-every native build in the project. A second, separate latent bug was
-also found and fixed in `lower.patlang` itself (bare-statement calls to
-twelve different builtins never discarded their own unused return
-value, corrupting the block's own stack — affects the interpreter too,
-not just native). `Box*`/`Global*`/`Handler*`/`Emit` remain genuinely
-deferred. See Phase 19's own section below for the full, corrected
-account. Phase 13 also found and fixed two real, pre-existing bugs
+**Phase 19 is now fully complete (2026-09-23)** — every opcode this
+phase scoped (`ContractFail`/`FiberYield`/`Fact`/`Query`/`TypeOf`/
+`ReadFile`/`WriteFile`/`GlobalGet`/`GlobalSet`/`HandlerNew`/
+`HandlerRegister`/`HandlerLookup`/`BoxNew`/`BoxGet`/`BoxSet`/
+`BoxSetUnchecked`/`BoxShare`/`Emit`) now has a real, verified native x64
+translation (`native_codegen_check.sh`: 22/22 passing). Proving this end
+to end found and fixed several real bugs along the way, not just added
+dispatch cases: a project-wide ASLR/relocation bug (missing
+`-Wl,--disable-dynamicbase`, fixed at every linker call site in the
+shared `x64_build.patlang`, benefiting every native build in the
+project); a latent `lower.patlang` bug where twelve different builtins'
+bare-statement calls never discarded their own unused return value
+(affects the interpreter too, not just native); an `rt_list_push`
+argument-order bug in the hand-emitted Global*/Handler* loops; a missing
+`bm_heap_init()` call causing a real Box* segfault; and, for `Emit`, a
+new architectural piece (`bm_to_real_funcir` now returns a LIST of
+FuncIRs — one per handler, plus `main` — instead of always exactly one)
+that turned out to need no new call-with-return mechanism or
+compile-time-literal restriction, contrary to an earlier, more
+pessimistic read. See Phase 19's own section below for the full,
+corrected account of every finding. Phase 13 also found and fixed two
+real, pre-existing bugs
 (`HandlerRegister`'s append-only behavior, and its own downstream
 exposure of already-filed issue #145's native x64 `list_set` aliasing
 bug) — see Phase 13's own section below for that account.
@@ -851,14 +855,67 @@ toolchain matters, it needs updating too** — it does not happen
 automatically just because `x64_build_use_native_toolchain()` exists
 elsewhere in the project.
 
-**Genuinely still deferred:** `Emit` only — needs handlers compiled as
-separate `FuncIR` entries (today's whole program is one flat "main"
-function; `MakeClosure`/`CallValue` need real, separate named function
-labels the current IR shape doesn't have), a single-block-only handler
-restriction, and compile-time-literal-only event names — a real, small
-design change, not attempted this pass. Investigated deeply enough to
-name these concrete requirements before deferring, not deferred on a
-vague "seems hard."
+**`Emit` done (2026-09-23) — Phase 19 is now fully complete: all 18
+opcodes this phase originally scoped translate through real native x64
+codegen, nothing left deferred.** The two restrictions floated in the
+note above it (compile-time-literal-only event names, and needing a
+brand-new call-with-return mechanism) both turned out to be avoidable
+once actually designed, not required — found by working through the
+design rather than assumed from the initial "this looks hard" read:
+
+- **No new call-with-return mechanism needed at all.** By the time
+  Emit's own dispatch runs, every handler registered anywhere in the
+  program has already been compiled as its own real, separate FuncIR
+  (previously every block — function or handler — was flattened into
+  ONE shared "main" FuncIR; `bm_to_real_funcir` now returns a LIST of
+  FuncIRs instead of always exactly one). Emit itself then only needs an
+  ordinary native `Call`/`Return` to reach a handler and get its final
+  `__globals` back — the SAME mechanism every other real function call
+  in this backend already uses, not a new one. No `MakeClosure`/
+  `CallValue` needed either: the compile-time event table already names
+  every handler a given event can reach, so dispatch is a straight-line
+  runtime `rt_str_eq` chain over known names, never an indirect
+  function-pointer call.
+- **No compile-time-literal restriction on event names.** A runtime-
+  computed event name (e.g. a `Var`) works exactly like a literal string
+  at the dispatch site — both are just a value compared with `rt_str_eq`
+  — so the general case was no harder to support than the literal-only
+  one would have been.
+
+The one real new piece of machinery: partitioning `bi_program_blocks
+(prog)` into `main` (everything NOT owned by a handler) and one family
+per handler root, via a genuine reachability closure over `JumpBlock`
+edges (`bm_nc_collect_block_closure`) — proven correct rather than
+assumed, since a synthesized descendant block's name (a loop head/exit,
+etc.) is always a fresh, globally-unique value referenced from nowhere
+except the one body that created it, so a handler's own closure can
+never accidentally pull in a block belonging to `main` or a different
+handler. Each handler's own family is flattened via the SAME core pass
+Phase 9 always used (factored out as `bm_nc_flatten_blocks`, reused for
+both `main` and every handler), ending in `Load "__globals"` + `Return`
+instead of `main`'s own `Const unit` + `Return` tail.
+
+Verified via `native_codegen_check.sh` (22/22, zero regressions) and the
+full interpreter suite (83/83, zero regressions). Since Emit/Global* (unlike
+Box*) need no native-only primitive, cross-checked the simpler way: the
+SAME source run through `pat --ir-run`'s own `bm_lower_program`/`bi_run`
+directly agrees exactly with the native translation on all five printed
+values (`100`, `200`, `42`, `2`, `3`) — two handlers registered for the
+same event both fire in declaration order, a handler's own `set_global`
+is visible in the emitting block immediately after `emit()` returns, and
+`emit()` genuinely returns control (the statement after it, and the
+enclosing function's own subsequent `return`, both still run).
+
+**Noted follow-up, not yet acted on:** `run_block_model_spec_suite
+.patlang`'s own 55 `exec_capture`-spawning scenarios run strictly
+sequentially on one core, even though this machine has 20 logical
+cores — the multi-minute full-suite runs this session repeatedly needed
+are one core doing serial work while 19 sit idle. Parallelizing
+independent scenarios (via concurrent `exec_capture` calls or
+`thread_spawn`) is a real, worthwhile speedup for this specific
+recurring pain point, flagged for later rather than changed mid-run
+while this exact suite was being used as the correctness gate for
+Emit's own verification.
 
 ---
 

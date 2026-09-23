@@ -123,3 +123,37 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
   interpreter for this exact block-model IR) compiled to native code via
   `./patc1.exe ... --x64` -- two independent code paths over the
   identical program, both genuinely native, agreeing on the same output.
+
+  Scenario: Emit compiles through real native codegen, each handler as its own separate FuncIR
+    Given a program with two handlers registered for the same event, and a handler whose own set_global must be visible in the emitting block right after emit() returns
+    When it is built and run as a real, fully native executable
+    Then both handlers fire in declaration order, the emitting block sees the handler's own global write immediately, emit() genuinely returns control (the statement after it still runs), and the enclosing function still returns to its own caller afterward
+
+  Unlike every other Phase 19 opcode, this needed real new architecture,
+  not just a dispatch case: by the time Emit runs, every handler
+  registered anywhere in the program is compiled as its own real,
+  separate FuncIR (not inlined, and not merged into the single flat
+  "main" the way ordinary function/loop blocks always were), so Emit
+  itself only ever needs an ordinary native Call -- no new call-with-
+  return mechanism, no MakeClosure/CallValue, and no restriction to
+  compile-time-literal event names (an event name computed at runtime
+  works exactly like a literal, since both are just a string value
+  compared with `rt_str_eq` at the dispatch site). `bm_to_real_funcir`
+  now returns a LIST of FuncIRs (previously always exactly one) --
+  `main`, partitioned to exclude every block owned by some handler, plus
+  one FuncIR per handler root. A handler's own family (its root plus
+  every synthesized descendant it can reach, e.g. a loop head/exit) is
+  found via a real reachability closure over `JumpBlock` edges, proven
+  correct rather than assumed: a synthesized block's name is always a
+  fresh, globally-unique value referenced from nowhere except the one
+  body that created it, so a handler's own closure can never
+  accidentally pull in a block belonging to `main` or to a different
+  handler. Each handler FuncIR ends by loading and returning its own
+  final `__globals` -- exactly the value `interp.patlang`'s own Emit
+  case already reads back out of a handler's "halt" outcome once it
+  naturally finishes.
+
+  Cross-checked against `pat --ir-run` running the SAME source through
+  `bm_lower_program`/`bi_run` directly (unlike Box*, Emit/Global* need no
+  native-only primitive, so this simpler cross-check is valid here) --
+  both agree exactly: `100`, `200`, `42`, `2`, `3`.

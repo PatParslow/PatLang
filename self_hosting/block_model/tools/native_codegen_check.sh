@@ -92,6 +92,25 @@ check "a straight-line box_set chain (patched to BoxSetUnchecked) ends at 30" "$
 check "box_set after box_share clones instead of mutating in place: the mutated box reads 999" "$OUT" "999"
 check "...and the box shared BEFORE the mutation still reads the ORIGINAL 100, proving real COW" "$OUT" "100"
 
+echo "Scenario: Emit compiles through real native codegen, each handler as its own separate FuncIR (Phase 19)"
+OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/native_emit.patlang phase19_emit 2>&1)
+check "two handlers registered for the same event both fire, first one (100)" "$OUT" "100"
+check "...and the second, in declaration order (200)" "$OUT" "200"
+check "a handler's own set_global is visible in the emitting block right after emit() returns (41+1)" "$OUT" "42"
+check "emit() genuinely returns control: the statement after it still runs" "$OUT" "2"
+check "...and the function emit() was called from still returns to ITS OWN caller afterward" "$OUT" "3"
+if [ "$(echo "$OUT" | grep -n '^100$')" ] && [ "$(echo "$OUT" | grep -n '^200$')" ]; then
+  L100=$(echo "$OUT" | grep -n '^100$' | head -1 | cut -d: -f1)
+  L200=$(echo "$OUT" | grep -n '^200$' | head -1 | cut -d: -f1)
+  if [ "$L100" -lt "$L200" ]; then
+    echo "  ok: 100 prints before 200 (real declaration order, not coincidental)"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL: 200 printed before 100 (wrong handler order)"
+    FAIL=$((FAIL + 1))
+  fi
+fi
+
 echo ""
 echo "tests: $PASS passed, $FAIL failed"
 if [ "$FAIL" -eq 0 ]; then

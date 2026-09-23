@@ -1,9 +1,11 @@
-# Block Ownership Model, Phase 9: translates a BlockProgramIR into a
-# single, real, flat FuncIR ("main"), reusing self_hosting/lib/
-# codegen_x64.patlang's OWN, already-proven emit_program_x64 for
-# EVERYTHING ELSE (register allocation, tagged-fixnum arithmetic, PE
-# headers, entry stub, calling conventions) -- no new x64 emission code
-# written here at all.
+# Block Ownership Model, Phase 9 (extended in Phase 19 for Emit):
+# translates a BlockProgramIR into a real, flat "main" FuncIR -- plus,
+# as of Phase 19, one further real, separate FuncIR per event handler
+# (see bm_to_real_funcir's own header near the end of this file) --
+# reusing self_hosting/lib/codegen_x64.patlang's OWN, already-proven
+# emit_program_x64 for EVERYTHING ELSE (register allocation,
+# tagged-fixnum arithmetic, PE headers, entry stub, calling conventions)
+# -- no new x64 emission code written here at all.
 #
 # The key insight this relies on, verified before building on it rather
 # than assumed: the design doc's own Fork A reasoning already
@@ -52,27 +54,25 @@
 # (checked directly), resolved as a plain Call against the SAME rt_funcs
 # this driver already bundles in -- not a host primitive at all.
 #
-# Explicitly NOT translated in this pass (named, not silently dropped):
-# BoxNew/BoxGet/BoxSet/BoxSetUnchecked/BoxShare/GlobalGet/GlobalSet/
-# HandlerNew/HandlerRegister/HandlerLookup/Emit -- this phase's own
-# benchmark needs none of them; translating Box* (most plausibly into
-# ordinary Call instructions against heap.patlang's own, already-
-# compilable functions, which Phase 1/3 already proved compile
-# correctly) needs heap.patlang bundled into this build path first,
-# which it isn't yet (checked directly: build_native.patlang only
-# `include`s codegen_x64.patlang, never heap.patlang) -- real, separate
-# future work, not attempted here.
+# Historical note: this pass originally (Phase 9) translated only
+# Phase 2's restricted subset, explicitly declining BoxNew/BoxGet/
+# BoxSet/BoxSetUnchecked/BoxShare/GlobalGet/GlobalSet/HandlerNew/
+# HandlerRegister/HandlerLookup/Emit. Phase 19 has since added every one
+# of them (see their own cases in bm_nc_translate_block_instrs, and
+# bm_to_real_funcir's own header for Emit's own separate-FuncIR-per-
+# handler design) -- this pass now translates the WHOLE language surface
+# Phases 2-18 defined, nothing left declining on principle.
 #
-# Phase 19 adds ContractFail/FiberYield/Fact/Query/TypeOf/ReadFile/
-# WriteFile (see their own cases in bm_nc_translate_block_instrs below) --
-# all genuine, already-compiled x64_runtime.patlang functions (confirmed
-# present in self_hosting/build/x64_runtime.funcs, not assumed from a
-# different backend's own claims), needing only ordinary Call/CallHost
-# translation, no new runtime primitives at all. A prior version of this
-# plan's own documentation wrongly claimed these needed new native
-# primitives -- found and corrected by searching for each one's actual
-# `make a function called NAME` definition, not by grepping for a quoted
-# host-call-name string (which produced a false negative for all six).
+# Phase 19 added ContractFail/FiberYield/Fact/Query/TypeOf/ReadFile/
+# WriteFile first -- all genuine, already-compiled x64_runtime.patlang
+# functions (confirmed present in self_hosting/build/x64_runtime.funcs,
+# not assumed from a different backend's own claims), needing only
+# ordinary Call/CallHost translation, no new runtime primitives at all.
+# A prior version of this plan's own documentation wrongly claimed these
+# needed new native primitives -- found and corrected by searching for
+# each one's actual `make a function called NAME` definition, not by
+# grepping for a quoted host-call-name string (which produced a false
+# negative for all six).
 
 # Reads block instrs AFTER lower.patlang's own bm_hash_rewrite_instrs
 # (the opcode-hash-dispatch optimization) -- bm_lower_program's output is
@@ -346,7 +346,7 @@ end
 # JumpBlock is expanded here directly into Store (reverse param order,
 # matching what's already on the stack) + a placeholder Jump, later
 # resolved to the target block's own absolute start position.
-make a function called bm_nc_translate_block_instrs takes block_name, instrs, print_op returns out
+make a function called bm_nc_translate_block_instrs takes block_name, instrs, print_op, prog returns out
   # Returns [translated_instrs, index_map] -- index_map[k] is the
   # position in translated_instrs where ORIGINAL instrs[k] starts, for
   # k in 0..n (index_map[n] is the "one past the end" sentinel, for a
@@ -534,6 +534,79 @@ make a function called bm_nc_translate_block_instrs takes block_name, instrs, pr
       let out = list_push(out, ["Call", "bm_rc_inc", 1])
       let out = list_push(out, ["Store", bm_nc_prefix(block_name, "__bm_discard")])
       let out = list_push(out, ["Load", ptr_l])
+    elif op == 23684 then # "Emit"
+      # Pops (globals, event_name, payload) -- same order as interp
+      # .patlang's own bm_st_pop chain (globals on top, popped first;
+      # see block_ir.patlang's own Phase 10 header). Unlike every other
+      # opcode in this file, Emit does NOT inline anything here -- by the
+      # time this dispatch runs, every handler registered anywhere in the
+      # program has ALREADY been compiled as its own real, separate
+      # FuncIR (see bm_nc_build_handler_funcirs below), reachable by an
+      # ordinary native Call. This dispatch only needs to emit the
+      # RUNTIME dispatch: a chain of string comparisons against
+      # bi_program_events(prog)'s own compile-time event table (an
+      # event_name computed at runtime, e.g. a Var, works exactly like a
+      # literal -- both are just a string value compared with rt_str_eq
+      # at runtime, no compile-time-literal restriction needed at all),
+      # each matching branch calling every one of that event's own
+      # registered handler FuncIRs in registration order, threading each
+      # one's own returned "__globals" into the next -- exactly
+      # interp.patlang's own cur_globals loop, translated. An event_name
+      # matching NOTHING falls through with "__globals" already correct
+      # (never touched), matching bi_run_block's own "handler_names ==
+      # false -> [] -> zero iterations -> cur_globals stays globals_val"
+      # exactly.
+      let globals_l = bm_nc_local(block_name, i, "g")
+      let event_l = bm_nc_local(block_name, i, "e")
+      let payload_l = bm_nc_local(block_name, i, "p")
+      let cur_l = bm_nc_local(block_name, i, "cg")
+      let out = list_push(out, ["Store", globals_l])
+      let out = list_push(out, ["Store", event_l])
+      let out = list_push(out, ["Store", payload_l])
+      let events = bi_program_events(prog)
+      let en = list_len(events)
+      let done_positions = []
+      let ei = 0
+      while ei < en do
+        let entry = list_get(events, ei)
+        let ev_name = list_get(entry, 0)
+        let handler_names = list_get(entry, 1)
+        let out = list_push(out, ["Load", event_l])
+        let out = list_push(out, ["Const", "str", ev_name])
+        let out = list_push(out, ["Call", "rt_str_eq", 2])
+        let out = list_push(out, ["__RawJumpIfFalse", 0])
+        let jif_next_pos = list_len(out) - 1
+        let out = list_push(out, ["Load", globals_l])
+        let out = list_push(out, ["Store", cur_l])
+        let hn = list_len(handler_names)
+        let hj = 0
+        while hj < hn do
+          let hname = list_get(handler_names, hj)
+          # Push args in handler_params' own written order (event_name,
+          # event_data, __globals) -- matches lower_expr's own "push in
+          # written order, argc of them" Call convention exactly, same as
+          # every other real Call in this file.
+          let out = list_push(out, ["Const", "str", ev_name])
+          let out = list_push(out, ["Load", payload_l])
+          let out = list_push(out, ["Load", cur_l])
+          let out = list_push(out, ["Call", hname, 3])
+          let out = list_push(out, ["Store", cur_l])
+          let hj = hj + 1
+        end
+        let out = list_push(out, ["Load", cur_l])
+        let out = list_push(out, ["Store", bm_nc_prefix(block_name, "__globals")])
+        let out = list_push(out, ["__RawJump", 0])
+        let done_positions = list_push(done_positions, list_len(out) - 1)
+        let next_target = list_len(out)
+        let out = list_set(out, jif_next_pos, ["__RawJumpIfFalse", next_target])
+        let ei = ei + 1
+      end
+      let after_target = list_len(out)
+      let dpi = 0
+      while dpi < list_len(done_positions) do
+        let out = list_set(out, list_get(done_positions, dpi), ["__RawJump", after_target])
+        let dpi = dpi + 1
+      end
     else
       bm_nc_unsupported("instruction hash '" + op + "'")
     end
@@ -598,14 +671,229 @@ make a function called bm_nc_assoc_get takes assoc, key returns v
   return false
 end
 
-# The whole translation: concatenate every block's own translated
-# instrs, record each block's absolute start pc, then a final pass
-# rewrites block-LOCAL Jump/JumpIfFalse targets to absolute indices and
-# resolves each __JumpBlockTarget placeholder into a real, absolute
-# Jump.
-make a function called bm_to_real_funcir takes prog, print_op returns funcir
+# Phase 19 (Emit): the transitive closure of block names reachable from
+# `root_name` by following still-hashed "JumpBlock" (974555) edges --
+# root_name itself plus every synthesized descendant (a loop head/exit,
+# etc.) a handler's own body can reach. This closure is EXACTLY "this
+# handler's own family": a synthesized descendant's name is always a
+# fresh, globally-unique bm_next_synth_name() value referenced from
+# nowhere except the ONE body that created it (confirmed directly
+# against lower.patlang's own construction: bm_lower_while is only ever
+# called with a SPECIFIC handler/function's own statement list in
+# scope), so this can never accidentally pull in a block belonging to
+# `main` or to a DIFFERENT handler. An index-based worklist over
+# `visited` itself (rather than a separate queue) avoids needing a "pop
+# front" list primitive.
+make a function called bm_nc_collect_block_closure takes prog, root_name returns names
+  let visited = [root_name]
+  let i = 0
+  while i < list_len(visited) do
+    let cur_name = list_get(visited, i)
+    let blk = bi_find_block(prog, cur_name)
+    let instrs = bi_block_instrs(blk)
+    let n = list_len(instrs)
+    let j = 0
+    while j < n do
+      let instr = list_get(instrs, j)
+      if list_get(instr, 0) == 974555 then # "JumpBlock"
+        let target = list_get(instr, 1)
+        if not bm_list_contains(visited, target) then
+          let visited = list_push(visited, target)
+        end
+      end
+      let j = j + 1
+    end
+    let i = i + 1
+  end
+  return visited
+end
+
+# Every handler root registered anywhere in the event table, each paired
+# with its own closure (bm_nc_collect_block_closure above) -- computed
+# ONCE up front so both family-partitioning (bm_to_real_funcir) and
+# handler-FuncIR construction (bm_nc_build_handler_funcirs) can reuse the
+# same closures without recomputing them.
+make a function called bm_nc_handler_closures takes prog returns pairs
+  let events = bi_program_events(prog)
+  let en = list_len(events)
+  let pairs = []
+  let seen = []
+  let ei = 0
+  while ei < en do
+    let handler_names = list_get(list_get(events, ei), 1)
+    let hn = list_len(handler_names)
+    let hi = 0
+    while hi < hn do
+      let root = list_get(handler_names, hi)
+      if not bm_list_contains(seen, root) then
+        let seen = list_push(seen, root)
+        let pairs = list_push(pairs, [root, bm_nc_collect_block_closure(prog, root)])
+      end
+      let hi = hi + 1
+    end
+    let ei = ei + 1
+  end
+  return pairs
+end
+
+# Which handler (if any) owns `name`, per the closures above -- false if
+# `name` belongs to `main` instead (not registered under any handler's
+# own closure).
+make a function called bm_nc_owning_handler takes closures, name returns owner
+  let n = list_len(closures)
+  let i = 0
+  while i < n do
+    let pair = list_get(closures, i)
+    if bm_list_contains(list_get(pair, 1), name) then
+      return list_get(pair, 0)
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# The core flatten pass (Phase 9's own original bm_to_real_funcir body,
+# generalized): concatenate `blocks`' own translated instrs (in the
+# order given -- callers pass them in bi_program_blocks(prog)'s own
+# original relative order, which already keeps each function/handler's
+# own synthesized descendants correctly contiguous and correctly
+# ORDERED, exactly the order Phase 9's own single-family version always
+# relied on for "falls off the end lands in the right place" to hold),
+# record each block's absolute start pc (offset by init_instrs' own
+# length), then a final pass rewrites block-LOCAL Jump/JumpIfFalse
+# targets to absolute indices and resolves __JumpBlockTarget/__RawJump*
+# placeholders -- unchanged from Phase 9/13/19's own original logic,
+# just no longer hardcoded to bi_program_blocks(prog) as a whole.
+make a function called bm_nc_flatten_blocks takes prog, blocks, init_instrs, print_op returns flat
+  let bn = list_len(blocks)
+  let translated = []
+  let starts = []
+  let running_len = list_len(init_instrs)
+  let bi = 0
+  while bi < bn do
+    let blk = list_get(blocks, bi)
+    let name = bi_block_name(blk)
+    let result = bm_nc_translate_block_instrs(name, bi_block_instrs(blk), print_op, prog)
+    let t = list_get(result, 0)
+    let index_map = list_get(result, 1)
+    let translated = list_push(translated, [name, t, index_map])
+    let starts = list_push(starts, [name, running_len])
+    let running_len = running_len + list_len(t)
+    let bi = bi + 1
+  end
+
+  let flat = init_instrs
+  let bi = 0
+  while bi < bn do
+    let entry = list_get(translated, bi)
+    let name = list_get(entry, 0)
+    let t = list_get(entry, 1)
+    let index_map = list_get(entry, 2)
+    let base = bm_nc_assoc_get(starts, name)
+    let tn = list_len(t)
+    let ti = 0
+    while ti < tn do
+      let instr = list_get(t, ti)
+      let op = list_get(instr, 0)
+      if (op == "Jump") or (op == "JumpIfFalse") then
+        let mapped = list_get(index_map, list_get(instr, 1))
+        let flat = list_push(flat, [op, base + mapped])
+      elif op == "__JumpBlockTarget" then
+        let target_base = bm_nc_assoc_get(starts, list_get(instr, 1))
+        let flat = list_push(flat, ["Jump", target_base])
+      elif (op == "__RawJump") or (op == "__RawJumpIfFalse") then
+        # Phase 19 (Global*/Handler*/Emit loop/dispatch emission): a
+        # target SYNTHESIZED entirely within bm_nc_translate_block_instrs
+        # 's own emission of one instruction's own expansion, not a real
+        # block-model Jump/JumpIfFalse at all -- its own operand is
+        # ALREADY a valid index into THIS block's own translated stream
+        # `t` (computed via list_len(out) as the sequence was built,
+        # backpatched the same way bm_lower_stmt's own If/Match cases
+        # already do), so it needs only `+base`, never an index_map
+        # lookup (which would misinterpret it as an ORIGINAL,
+        # pre-expansion block-model instruction index and remap it to
+        # the wrong position).
+        let real_op = "Jump"
+        if op == "__RawJumpIfFalse" then
+          let real_op = "JumpIfFalse"
+        end
+        let flat = list_push(flat, [real_op, base + list_get(instr, 1)])
+      else
+        let flat = list_push(flat, instr)
+      end
+      let ti = ti + 1
+    end
+    let bi = bi + 1
+  end
+  return flat
+end
+
+# Phase 19 (Emit): one real, separate FuncIR per handler root -- what
+# lets Emit translate to an ordinary native Call/Return instead of
+# needing any new call-with-return mechanism in this backend. Each
+# handler's own params are its own bm_nc_prefix'd "event_name"/
+# "event_data"/"__globals" (matching what bm_nc_translate_block_instrs
+# already prefixes Load/Store references to inside the handler's own
+# body -- the incoming Call args must land in the SAME prefixed names
+# the body expects to Load them from), and it ends by Loading and
+# returning its own final "__globals" -- exactly the value
+# interp.patlang's own Emit case reads back out of bi_run_block's
+# "halt" outcome (bm_loc_get(final_handler_locs, "__globals")) once the
+# handler naturally finishes.
+make a function called bm_nc_build_handler_funcirs takes prog, closures, print_op returns funcirs
+  let all_blocks = bi_program_blocks(prog)
+  let abn = list_len(all_blocks)
+  let cn = list_len(closures)
+  let funcirs = []
+  let ci = 0
+  while ci < cn do
+    let pair = list_get(closures, ci)
+    let root = list_get(pair, 0)
+    let member_names = list_get(pair, 1)
+    let hblocks = []
+    let abi = 0
+    while abi < abn do
+      let blk = list_get(all_blocks, abi)
+      if bm_list_contains(member_names, bi_block_name(blk)) then
+        let hblocks = list_push(hblocks, blk)
+      end
+      let abi = abi + 1
+    end
+    let h_flat = bm_nc_flatten_blocks(prog, hblocks, [], print_op)
+    let h_flat = list_push(h_flat, ["Load", bm_nc_prefix(root, "__globals")])
+    let h_flat = list_push(h_flat, ["Return"])
+    let params = [bm_nc_prefix(root, "event_name"), bm_nc_prefix(root, "event_data"), bm_nc_prefix(root, "__globals")]
+    let funcirs = list_push(funcirs, ["FuncIR", root, params, h_flat, []])
+    let ci = ci + 1
+  end
+  return funcirs
+end
+
+# The whole translation: partitions bi_program_blocks(prog) into `main`
+# (every ordinary function/loop-descendant block, i.e. everything NOT
+# owned by some handler's own closure) and one family per handler root,
+# flattens `main` into a single "main" FuncIR exactly as Phase 9/13
+# always did, and -- new in Phase 19 -- compiles every handler into its
+# OWN separate FuncIR (bm_nc_build_handler_funcirs above), reachable via
+# an ordinary native Call from Emit's own dispatch (see its own case in
+# bm_nc_translate_block_instrs). Returns a LIST of FuncIRs (was a single
+# FuncIR before Emit existed, since there was never more than one) --
+# every caller must pass the WHOLE list into emit_program_x64's own
+# `funcs` argument now, not just the first element.
+make a function called bm_to_real_funcir takes prog, print_op returns funcirs
   let blocks = bi_program_blocks(prog)
   let bn = list_len(blocks)
+  let closures = bm_nc_handler_closures(prog)
+
+  let main_blocks = []
+  let bi = 0
+  while bi < bn do
+    let blk = list_get(blocks, bi)
+    if bm_nc_owning_handler(closures, bi_block_name(blk)) == false then
+      let main_blocks = list_push(main_blocks, blk)
+    end
+    let bi = bi + 1
+  end
 
   # bi_run seeds the ENTRY block's own "__globals" specially
   # (bm_loc_set(bm_loc_new(), "__globals", []) in interp.patlang) --
@@ -635,80 +923,19 @@ make a function called bm_to_real_funcir takes prog, print_op returns funcir
   # the free-list table, nothing more).
   let init_instrs = [["BuildList", 0], ["Store", bm_nc_prefix(entry_name, "__globals")], ["Call", "bm_heap_init", 0], ["Store", bm_nc_prefix(entry_name, "__bm_discard")]]
 
-  # Pass 1: translate each block independently; record where its own
-  # (still block-local) instrs will start once concatenated -- offset by
-  # init_instrs' own length, since those run first.
-  let translated = []
-  let starts = []
-  let running_len = list_len(init_instrs)
-  let bi = 0
-  while bi < bn do
-    let blk = list_get(blocks, bi)
-    let name = bi_block_name(blk)
-    let result = bm_nc_translate_block_instrs(name, bi_block_instrs(blk), print_op)
-    let t = list_get(result, 0)
-    let index_map = list_get(result, 1)
-    let translated = list_push(translated, [name, t, index_map])
-    let starts = list_push(starts, [name, running_len])
-    let running_len = running_len + list_len(t)
-    let bi = bi + 1
-  end
+  let main_flat = bm_nc_flatten_blocks(prog, main_blocks, init_instrs, print_op)
+  let main_flat = list_push(main_flat, ["Const", "unit", ""])
+  let main_flat = list_push(main_flat, ["Return"])
+  let main_funcir = ["FuncIR", "main", [], main_flat, []]
 
-  # Pass 2: flatten, fixing up Jump/JumpIfFalse (block-local original
-  # index -> its own EXPANDED position via that block's own index_map,
-  # THEN absolute by adding this block's own start offset -- NOT
-  # block-local original index + start offset directly, which silently
-  # gives the wrong answer the moment anything earlier in the block was
-  # a JumpBlock, since those expand into more than one instruction) and
-  # __JumpBlockTarget (-> an ordinary, absolute Jump to the TARGET
-  # block's own start).
-  let flat = init_instrs
-  let bi = 0
-  while bi < bn do
-    let entry = list_get(translated, bi)
-    let name = list_get(entry, 0)
-    let t = list_get(entry, 1)
-    let index_map = list_get(entry, 2)
-    let base = bm_nc_assoc_get(starts, name)
-    let tn = list_len(t)
-    let ti = 0
-    while ti < tn do
-      let instr = list_get(t, ti)
-      let op = list_get(instr, 0)
-      if (op == "Jump") or (op == "JumpIfFalse") then
-        let mapped = list_get(index_map, list_get(instr, 1))
-        let flat = list_push(flat, [op, base + mapped])
-      elif op == "__JumpBlockTarget" then
-        let target_base = bm_nc_assoc_get(starts, list_get(instr, 1))
-        let flat = list_push(flat, ["Jump", target_base])
-      elif (op == "__RawJump") or (op == "__RawJumpIfFalse") then
-        # Phase 19 (Global*/Handler* loop emission): a target SYNTHESIZED
-        # entirely within bm_nc_translate_block_instrs's own emission of
-        # one instruction's own expansion (an assoc-get/assoc-set loop),
-        # not a real block-model Jump/JumpIfFalse at all -- its own
-        # operand is ALREADY a valid index into THIS block's own
-        # translated stream `t` (computed via list_len(out) as the loop
-        # was built, backpatched the same way bm_lower_stmt's own If/
-        # Match cases already do), so it needs only `+base`, never an
-        # index_map lookup (which would misinterpret it as an ORIGINAL,
-        # pre-expansion block-model instruction index and remap it to
-        # the wrong position).
-        let real_op = "Jump"
-        if op == "__RawJumpIfFalse" then
-          let real_op = "JumpIfFalse"
-        end
-        let flat = list_push(flat, [real_op, base + list_get(instr, 1)])
-      else
-        let flat = list_push(flat, instr)
-      end
-      let ti = ti + 1
-    end
-    let bi = bi + 1
+  let handler_funcirs = bm_nc_build_handler_funcirs(prog, closures, print_op)
+  let funcirs = [main_funcir]
+  let hi = 0
+  while hi < list_len(handler_funcirs) do
+    let funcirs = list_push(funcirs, list_get(handler_funcirs, hi))
+    let hi = hi + 1
   end
-
-  let flat = list_push(flat, ["Const", "unit", ""])
-  let flat = list_push(flat, ["Return"])
-  return ["FuncIR", "main", [], flat, []]
+  return funcirs
 end
 
 # Namespacing note: an earlier version of this file bundled
