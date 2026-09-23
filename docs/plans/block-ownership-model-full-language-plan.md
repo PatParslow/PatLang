@@ -1489,8 +1489,9 @@ that file's own header) must run on the raw source BEFORE
 completely end-to-end (not just their own top-level statements) — Phase
 18's own core claim holds, but was previously under-tested.
 
-**New foundational blocker found, NOT fixed — Member-access (`.length`
-and friends) unconditionally assumes a Box+Handler receiver.**
+**Member-access (`.length` and friends) unconditionally assumed a
+Box+Handler receiver — found, then fixed the same day, smaller in scope
+than first assessed.**
 Re-verifying `schema_bdd_selftest.patlang` with real include expansion
 got as far as actually attempting to RUN it (not just lower it) — and
 caught, via this project's own "verify success signals" discipline, a
@@ -1513,16 +1514,55 @@ standalone repro: `let s = "hello"; print(s.length)` crashes identically
 under block-model, independent of `zs_schema.patlang`/`schema_bdd_selftest.patlang`
 entirely.
 
-This is a pervasive, foundational gap — it affects essentially any real
-PatLang code that uses `.length` (or any other bare `.prop` access) on a
-non-Box value, not a narrow edge case. Fixing it is a real design
-decision (a static heuristic on the expression's inferred kind? a
-runtime type tag check emitted at the access site? separate syntax for
-primitive vs. object property access?), not a small patch, and is
-explicitly NOT attempted in this phase — reported here as the next
-blocker for a future phase to design and scope properly, matching this
-document's own established practice of naming a found blocker precisely
-rather than papering over it.
+This affects essentially any real PatLang code that uses `.length` (or
+any other bare `.prop` access) on a non-Box value, not a narrow edge
+case — but it turned out NOT to need the open-ended design decision
+first assessed here (a static heuristic? a runtime type tag check?
+separate syntax?). Checking the existing, non-block-model compiler
+pipeline first (rather than assuming block-model needed to invent
+something new) found it had already solved exactly this: the real
+self-hosted `lower.patlang`'s own `"Member"` case
+(`self_hosting/lib/lower.patlang`, `lower_expr`'s `ty == "Member"` arm)
+already special-cases `.length`/`.len` as `CallHost "len"` —  a genuine,
+already-"feature complete" host function — falling back to the
+Box/Handler-equivalent (`CallHost "get"`, ambient object-field access)
+only for every other property name; `codegen_x64.patlang` mirrors this
+identically for native. Checking the native x64 string/list memory
+layout directly (`x64_len_asm`, `self_hosting/lib/codegen_x64.patlang`)
+also confirmed both already carry a real 8-byte length field at their
+own `[addr+0]` — native strings are NOT bare pointers needing a
+representation change; this was purely a block-model LOWERING gap, one
+this project's own existing compiler had already correctly solved
+elsewhere, not a foundational representation problem to design from
+scratch.
+
+**Fixed the same day**: `bm_lower_expr`'s `"Member"` case now
+special-cases `.length`/`.len` to lower straight to `CallHost "len"`
+(mirroring `lower.patlang`/`codegen_x64.patlang` exactly), keeping
+`BoxGet`+`HandlerLookup` unchanged for every other property name. A real
+capability gain incidentally falls out of this too: `.length` now works
+under the INTERPRETER for the first time (`CallHost "len"` runs fine
+there), where genuine `obj.field` access still correctly requires native
+compilation (`BoxGet` remains native-x64-only, unchanged). RED/GREEN
+fixtures added (`spec_fixtures/member_length_primitives.patlang` + its
+`_reference.patlang` twin), wired into
+`spec_library/block_model/library_parity.feature`. Verified: block-model
+spec suite 98/98 (up from 96, +2 for the new scenario), full language
+spec gate 150/150, native x64 codegen check still 24/24.
+
+A genuinely unrelated, systemic finding turned up while re-verifying
+this fix: TWO separate background suite runs this session left an
+orphaned `pat.exe` process behind — each still bound to real TCP ports
+(one, one; the other, four) — after their own top-level wrapper reported
+"completed." This caused real, reproducible port-contention flakiness in
+the language spec suite's own signal-claim test (a `FAIL` that
+disappeared once the orphans were killed and confirmed gone via
+`Get-Process`/`Get-NetTCPConnection`, not assumed from re-running alone).
+Matches this project's own documented "Killing backgrounded processes"
+gotcha (a wrapper spawning a child that outlives it) — worth flagging as
+a recurring pattern for any spec suite involving `spawn()`/cross-process
+fixtures, not a one-off fluke, since it happened twice independently in
+the same session.
 
 ---
 
