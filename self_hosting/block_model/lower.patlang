@@ -292,7 +292,13 @@ end
 # `while` loop IS still reachable inside a handler body for free (nothing
 # about bm_lower_top_level_stmt_list's own While handling depends on
 # block_names), since a loop's own JumpBlock targets are always its own
-# synthesized head/exit blocks, never a user-declared function.
+# synthesized head/exit blocks, never a user-declared function. This
+# claim was correct at LOWERING time but Emit's own EXECUTION of it was
+# not, for several sessions: interp.patlang's own Emit case used to make
+# a single bare bi_run_block call and reject the loop's own first
+# "jump" outcome as unsupported -- found and fixed in Phase 21 (see
+# interp.patlang's own bi_run_from header), not caught here since this
+# comment only ever described lowering, not execution.
 #
 # `emit(event, payload)` lowers as a bare statement (bm_lower_stmt's own
 # "Expr" arm) to a MID-BLOCK ["Emit"] instruction, never a JumpBlock --
@@ -487,27 +493,27 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
       let instrs = bm_lower_expr(list_get(args, 0), instrs, block_names, immut_params)
       return list_push(instrs, ["HandlerLookup"])
     elif bm_list_contains(block_names, name) then
-      # A call to another DECLARED block-model function, used as a
-      # SUB-EXPRESSION (NOT in tail/return position) -- genuinely not
-      # supported, named explicitly rather than silently misrouted into
-      # the generic CallHost fallback just below (which would instead
-      # fail with a confusing "unknown host function" once it reached
-      # interp_call_host, obscuring the REAL cause). This engine's own
-      # call mechanism (JumpBlock, via bm_lower_jump_call) is a ONE-WAY
-      # transfer with no return -- Fork A's own "no call stack" design --
-      # so a declared function can only ever be called in TAIL position
-      # (`return foo(...)`), never mid-expression. A genuine gap found
-      # while completing Phase 18 (the "does not support: expression
-      # shape 'Call'" failure traced further than List-literals/generic-
-      # host-calls alone): real library code calls its own helper
-      # functions from the middle of an expression constantly, and doing
-      # that would need a real call-with-return mechanism for ordinary
-      # functions -- a genuinely new, separate architectural piece (this
-      # engine has exactly one such exception today, Emit, deliberately
-      # narrow -- see block_ir.patlang's own Phase 10 header), not
-      # something to invent unbidden here.
-      bm_lower_unsupported("calling declared function '" + name + "' as a sub-expression (not in tail/return position) -- only a tail call (`return " + name + "(...)`, lowered via JumpBlock) is supported; this engine has no call-with-return mechanism for ordinary functions (Emit is the one deliberately narrow exception)")
-      return instrs
+      # Phase 21: a call to another DECLARED block-model function, used
+      # as a SUB-EXPRESSION (NOT in tail/return position) -- the real
+      # gap Phase 18 found and this phase fills in. Distinct from
+      # JumpBlock (bm_lower_jump_call): JumpBlock is a one-way transfer
+      # with no return, correct for and unchanged at every EXISTING
+      # tail-call site; this is a genuine call WITH return, via the new
+      # "Call" instruction (interp.patlang's own case, which recurses
+      # through bi_run_from -- see that function's own header for why
+      # this needs no classification/flattening distinction at all on
+      # the interpreter side, unlike native x64's own later, separate
+      # design). Same "args, then an implicit __globals push" convention
+      # as bm_lower_jump_call, so the callee's own params (which already
+      # end in "__globals", bm_lower_program's own doing) bind correctly.
+      let ai = 0
+      let an = list_len(args)
+      while ai < an do
+        let instrs = bm_lower_expr(list_get(args, ai), instrs, block_names, immut_params)
+        let ai = ai + 1
+      end
+      let instrs = list_push(instrs, ["Load", "__globals"])
+      return list_push(instrs, ["Call", name, an + 1])
     else
       # Phase 17/18's own named-but-deferred generic host-call fallback,
       # now filled in: any name not individually recognized above, and
@@ -829,8 +835,18 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
         return bm_lower_jump_call(e, instrs, block_names, blocks_by_name, immut_params)
       end
     end
-    bm_lower_unsupported("`return EXPR` where EXPR isn't a call to a declared block (no call stack to return a value up through yet)")
-    return instrs
+    # Phase 21: any other EXPR shape (not itself a TAIL call to a
+    # declared block) -- lower it as an ordinary expression, then a new
+    # ReturnValue instruction (interp.patlang's own case), ending this
+    # bi_run_block call immediately with that value. This is what makes
+    # calling a declared function AS A VALUE meaningful in the first
+    # place (bm_lower_expr's own new "Call" case, below): `return n * 2`
+    # only matters to a caller that actually reads the result. This
+    # supersedes the earlier, narrower restriction here (kept in this
+    # file's own history/commit log, not restated) that only accepted a
+    # tail call as EXPR at all.
+    let instrs = bm_lower_expr(e, instrs, block_names, immut_params)
+    return list_push(instrs, ["ReturnValue"])
   end
   bm_lower_unsupported("statement shape '" + ty + "'")
   return instrs
@@ -1034,11 +1050,16 @@ make a function called bm_hash_rewrite_instrs takes instrs returns out
       # Same class of bug, same fix -- CallHost carries TWO operands
       # (the callee name, the arg count), both needed at dispatch time.
       let out = list_push(out, [bm_op_hash(op), list_get(instr, 1), list_get(instr, 2)])
+    elif op == "Call" then
+      # Phase 21: same shape as CallHost (callee name + arg count), same
+      # reason -- both operands are needed at dispatch time and would be
+      # silently dropped by the generic "no operand" else branch.
+      let out = list_push(out, [bm_op_hash(op), list_get(instr, 1), list_get(instr, 2)])
     else
       # Print/BoxNew/BoxGet/BoxSet/BoxSetUnchecked/BoxShare/GlobalGet/
       # GlobalSet/HandlerNew/HandlerRegister/HandlerLookup/Emit/
-      # FiberYield/Fact/Query/TypeOf/ReadFile/WriteFile: no operand beyond
-      # the opcode itself.
+      # FiberYield/Fact/Query/TypeOf/ReadFile/WriteFile/ReturnValue: no
+      # operand beyond the opcode itself.
       let out = list_push(out, [bm_op_hash(op)])
     end
     let i = i + 1

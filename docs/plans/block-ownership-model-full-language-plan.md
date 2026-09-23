@@ -1229,9 +1229,55 @@ likely closures/classes-with-methods) are this phase's own explicitly
 separate, later follow-ups, not attempted in the same pass as the
 interpreter slice.
 
-**Not started.** This section records the decision only; implementation
-begins in a following session/turn under the usual RED/GREEN/verify
-discipline.
+**Interpreter slice done (2026-09-23) — matches the corrected design
+above exactly, no further surprises found during implementation.**
+
+- `bi_run_from(prog, block, locs) -> [value, final_locs]` added to
+  `interp.patlang`; `bi_run` is now a thin wrapper over it.
+- Two new block-model instructions: `Call` (pops args + current
+  `__globals`, recurses via `bi_run_from`, pushes the result, updates
+  the caller's own `__globals`) and `ReturnValue` (pops one value, ends
+  the current `bi_run_block` call immediately with it). `bm_lower_stmt`'s
+  own "Return" case now falls back to `ReturnValue` for any `EXPR` that
+  isn't itself a tail call to a declared block; `bm_lower_expr`'s own
+  "Call" case now emits `Call` for a declared function used as a value,
+  superseding this same day's earlier defensive-rejection message.
+- Emit's own handler dispatch (Phase 19) is rewired onto `bi_run_from`,
+  fixing the real, previously-shipped bug found while designing this
+  (a handler containing a `while` loop used to be rejected — see the
+  correction note above).
+- A real bug was found and fixed in `bm_hash_rewrite_instrs` while
+  adding `Call`'s own hash case, the same class already fixed twice this
+  session for `BuildList`/`CallHost` (Phase 18) — caught before it
+  shipped, not after a confusing runtime failure, by checking every new
+  instruction against that function's own per-opcode whitelist as a
+  matter of habit now.
+- One real bug was found in my OWN first test of this, not in the
+  implementation: declaring the helper function before `start` in a
+  throwaway repro made the HELPER the program's own entry
+  (`bm_lower_program` picks the first declared `Func`), producing a
+  confusing "unbound: n" failure that looked like a real bug in `Call`'s
+  own arg-binding until traced to the test's own declaration order —
+  recorded here as a reminder, not because it affected anything shipped
+  (the committed fixtures all declare `start` first, matching every
+  other fixture in this tree).
+
+Verified: `native_codegen_check.sh` still 24/24 (native correctly and
+cleanly rejects `Call`/`ReturnValue` via the existing `bm_nc_unsupported`
+path, confirmed directly rather than assumed — native support remains
+explicitly deferred, per the design above); the full interpreter suite
+91/91 (up from 87 — the 4 new checks this phase adds, zero regressions).
+A declared function called as a sub-expression (`let x = helper(5) +
+1`), a direct-recursion factorial, and a `when` handler containing a
+`while` loop all now run correctly, cross-checked against `pat --ir-run`
+on the identical source where applicable.
+
+**Not started, explicitly deferred (unchanged from the design above):**
+native x64 codegen for `Call`/`ReturnValue` (the classification-and-
+separate-FuncIR design), and re-running Phase 18's own checkpoint
+(`self_hosting/lib/zs_schema.patlang` through `bm_lower_program`) to
+find the next real blocker (very likely closures/classes-with-methods,
+per Phase 18's own remaining named exclusion).
 
 ---
 

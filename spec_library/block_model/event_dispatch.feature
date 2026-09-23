@@ -45,3 +45,21 @@ Feature: event dispatch (Phase 10 of the full-language expansion)
     Given a handler that sets a global
     When the event that triggers it is emitted
     Then the block that emitted it reads the updated global right after the emit call
+
+  Scenario: a handler containing a while loop runs to completion (regression, Phase 21)
+    Given a when handler whose body contains a while loop
+    When the event is emitted
+    Then the loop runs to completion and the handler's own statements after it also run
+
+  A real, previously-shipped bug was found and fixed proving this
+  scenario, not designed around in advance: this file's own header claim
+  above ("a handler block runs to completion as a bounded sub-
+  execution") and the lowering-side claim that a `while` loop is
+  reachable inside a handler body "for free" were both only half true --
+  Emit's own dispatch (Phase 19) made a single bare `bi_run_block` call
+  and rejected the loop's own first `JumpBlock` (its back-edge, `jump`,
+  not `halt`) as "attempted to jump to another block -- unsupported".
+  Fixed in Phase 21 by rewiring Emit's own handler dispatch onto a new
+  `bi_run_from` helper, which follows `jump` outcomes to completion the
+  same way `bi_run`'s own top-level loop always did, instead of assuming
+  one call suffices.

@@ -539,11 +539,18 @@ make a function called bi_run_block takes prog, blk, locs returns outcome
         let handler_locs = bm_loc_set(handler_locs, "event_name", event_name)
         let handler_locs = bm_loc_set(handler_locs, "event_data", payload)
         let handler_locs = bm_loc_set(handler_locs, "__globals", cur_globals)
-        let handler_outcome = bi_run_block(prog, handler_blk, handler_locs)
-        if list_get(handler_outcome, 0) != "halt" then
-          contract_check("bm_interp", "assert", "event handler '" + handler_name + "' attempted to jump to another block -- unsupported under Phase 10's restricted event model (a handler body can only reach print/box_*/global_*/handler_*/emit)", false)
-        end
-        let final_handler_locs = list_get(handler_outcome, 2)
+        # Phase 21: bi_run_from (not a single bare bi_run_block call)
+        # so a handler's own internal `while` loop -- which JumpBlocks to
+        # its own synthesized head/exit blocks, returning "jump", not
+        # "halt", on its very first iteration -- actually runs to
+        # completion instead of being rejected as "attempted to jump to
+        # another block". A real, previously-shipped bug, found by
+        # testing lower.patlang's own "for free" claim directly rather
+        # than trusting it: this exact call used to be a single bare
+        # bi_run_block, which errored on that first "jump" outcome. Fixed
+        # here, at the source, rather than special-cased around.
+        let handler_outcome = bi_run_from(prog, handler_blk, handler_locs)
+        let final_handler_locs = list_get(handler_outcome, 1)
         let cur_globals = bm_loc_get(final_handler_locs, "__globals")
         let hi = hi + 1
       end
@@ -601,6 +608,63 @@ make a function called bi_run_block takes prog, blk, locs returns outcome
       end
       let stack = bm_st_push(list_get(popped, 1), list_get(call_result, 1))
       let pc = pc + 1
+    elif op == 131889 then # "ReturnValue"
+      # Phase 21: `return EXPR` for any EXPR that ISN'T itself a call to
+      # a declared block (bm_lower_stmt's own "Return" case falls back
+      # to this instead of bm_lower_unsupported). Pops the one value
+      # EXPR evaluated to and ends THIS bi_run_block call immediately
+      # with it -- exactly the same "halt" outcome shape every other
+      # natural end-of-block already produces, just reachable mid-body
+      # (including nested inside if/else) rather than only at the
+      # textual end of a block's own instrs. No new outcome kind needed:
+      # a value-returning function's own caller (the new "Call"
+      # instruction, below) already expects a "halt" outcome, the same
+      # as bi_run_from's own loop already handles for every other block.
+      let popped = bm_st_pop(stack)
+      return ["halt", list_get(popped, 0), locs]
+    elif op == 938836 then # "Call"
+      # Phase 21: a declared function called AS A VALUE (bm_lower_expr's
+      # own "Call" case, when the callee is in block_names) -- distinct
+      # from JumpBlock, which remains exactly as it always was for every
+      # EXISTING tail-call site (`return F(...)`, a bare `F(...)`
+      # statement), left completely unchanged. Pops instr[2] values
+      # (written order, restored by bm_st_pop_n: the callee's own args,
+      # then the CURRENT __globals, matching JumpBlock's own "args, then
+      # an implicit __globals push" convention exactly -- see lower
+      # .patlang's own bm_lower_jump_call), binds them by name into a
+      # FRESH locals set (the callee's own declared params, found via
+      # bi_block_params -- already includes "__globals" last, the same
+      # hidden-param convention every block already has), and recurses
+      # via bi_run_from (not bi_run_block directly) so the callee's own
+      # internal `while` loops run to completion correctly -- the SAME
+      # fix Emit's own handler dispatch just got, generalized. Pushes
+      # the callee's own returned value onto THIS caller's stack, and
+      # updates THIS caller's own "__globals" local to the callee's
+      # final one -- Fork B's threading, preserved across a REAL call
+      # boundary, not just a flat jump. Recursion (direct or mutual)
+      # between functions called this way works for free: this is an
+      # ordinary recursive PatLang call, handled by the HOST
+      # interpreter's own real call stack, the same as Emit's own
+      # pre-existing recursion into a handler already relied on --  a
+      # genuine, incidental capability gain over JumpBlock's own flat
+      # model, which cannot express recursion at all.
+      let callee_name = list_get(instr, 1)
+      let popped = bm_st_pop_n(stack, list_get(instr, 2))
+      let args = list_get(popped, 0)
+      let stack = list_get(popped, 1)
+      let callee_blk = bi_find_block(prog, callee_name)
+      let param_names = bi_block_params(callee_blk)
+      let pn = list_len(param_names)
+      let callee_locs = bm_loc_new()
+      let pi = 0
+      while pi < pn do
+        let callee_locs = bm_loc_set(callee_locs, list_get(param_names, pi), list_get(args, pi))
+        let pi = pi + 1
+      end
+      let call_outcome = bi_run_from(prog, callee_blk, callee_locs)
+      let stack = bm_st_push(stack, list_get(call_outcome, 0))
+      let locs = bm_loc_set(locs, "__globals", bm_loc_get(list_get(call_outcome, 1), "__globals"))
+      let pc = pc + 1
     else
       contract_check("bm_interp", "assert", "unknown block-model instruction: " + op, false)
     end
@@ -615,11 +679,52 @@ make a function called bi_run_block takes prog, blk, locs returns outcome
   return ["halt", "unit", locs]
 end
 
+# Phase 21: the reusable "run to completion" loop -- generalizes what
+# bi_run's own top-level loop already was (see this file's own header
+# for why THAT loop being flat, not recursive, is what Fork A's "no call
+# stack" claim actually rests on) to start from an ARBITRARY block/locs
+# pair, not just the program's entry, and to return BOTH the final value
+# AND the final locs (bi_run itself only ever needed the value, so it
+# never had to). This is the ONE new piece of machinery Phase 21's whole
+# call-with-return mechanism needs: a value-returning `Call` just
+# recurses into this function (an ordinary, HOST-interpreter-native
+# recursive PatLang call -- Rust's own real call stack handles it, the
+# same way Emit's own pre-existing recursive bi_run_block call already
+# relied on host recursion, just now generalized past a single call).
+#
+# A real, previously-shipped bug was found and fixed proving this, not
+# designed around in advance: Emit's own handler dispatch (Phase 19)
+# used to make exactly ONE bi_run_block call and reject anything other
+# than an immediate "halt" outcome as unsupported -- but lower.patlang's
+# own header claims a `while` loop is reachable inside a handler body
+# "for free" (true at lowering time; the bug was purely in this file's
+# own execution of it). Checked directly: a handler containing a
+# `while` loop hits its own loop's first JumpBlock (the back-edge) and
+# returns a "jump" outcome, which the old single-call code rejected.
+# This function fixes that (see bi_run/Emit's own rewiring onto it
+# below) by doing what bi_run's own loop always did -- follow "jump"
+# outcomes to completion -- rather than assuming one call suffices.
+make a function called bi_run_from takes prog, block, locs returns pair
+  let cur = block
+  let locs = locs
+  while true do
+    let outcome = bi_run_block(prog, cur, locs)
+    if list_get(outcome, 0) == "halt" then
+      return [list_get(outcome, 1), list_get(outcome, 2)]
+    end
+    let cur = list_get(outcome, 1)
+    let locs = list_get(outcome, 2)
+  end
+end
+
 # The whole engine's own top-level loop -- flat, not recursive: this is
 # where Fork A's "no call stack" claim actually lives. Each iteration
 # starts a block completely fresh (bm_loc_new()), so nothing from a
 # previous block can leak forward except what a JumpBlock instruction
-# explicitly named.
+# explicitly named. Now a thin wrapper over bi_run_from (Phase 21) --
+# purely an internal refactor, not a behavior change: bi_run never
+# needed the final locs bi_run_from also returns, so it simply discards
+# them.
 make a function called bi_run takes prog returns result
   bi_init_run_state()
   let cur = bi_find_block(prog, bi_program_entry(prog))
@@ -629,15 +734,8 @@ make a function called bi_run takes prog returns result
   # it purely by JumpBlock forwarding (lower.patlang's own doing), never
   # by re-seeding.
   let locs = bm_loc_set(bm_loc_new(), "__globals", [])
-  while true do
-    let outcome = bi_run_block(prog, cur, locs)
-    if list_get(outcome, 0) == "halt" then
-      return list_get(outcome, 1)
-    end
-    let cur = list_get(outcome, 1)
-    let locs = list_get(outcome, 2)
-  end
-  return "unit"
+  let outcome = bi_run_from(prog, cur, locs)
+  return list_get(outcome, 0)
 end
 
 make a function called bi_init_run_state returns done
