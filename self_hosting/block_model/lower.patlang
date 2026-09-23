@@ -912,7 +912,35 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
         let instrs = list_push(instrs, ["CallDynamic"])
         return list_push(instrs, ["Store", "__bm_discard"])
       elif bm_list_contains(block_names, name) then
-        return bm_lower_jump_call(call, instrs, block_names, blocks_by_name, immut_params)
+        # Phase 22: a real, previously-undisclosed, confirmed correctness
+        # bug -- this used to ALWAYS lower via bm_lower_jump_call
+        # (JumpBlock), a one-way, non-returning transfer. That's only
+        # safe when this bare call is genuinely the very last thing that
+        # ever runs (bm_lower_top_level_stmt_list's own special case just
+        # above handles that ONE safe shape via JumpBlock directly,
+        # before a statement ever reaches this dispatch at all).
+        # Anywhere else -- more statements after it in the same list, OR
+        # inside an ordinary if/else branch (bm_lower_stmt_list, used for
+        # every If without a nested while, threads NO continuation
+        # information at all) -- JumpBlock silently discarded every
+        # statement written after it, with no error. Confirmed via a
+        # minimal repro: `a(); b(); print(999)` (a/b two trivial declared
+        # functions) printed only a()'s own output; b() and print(999)
+        # never ran. Fixed by using the same Call+discard convention as
+        # apply()/the generic CallHost fallback above -- correct in every
+        # position, at the cost of native x64 support (deferred, same as
+        # every other Call use since Phase 21; checked directly that no
+        # currently-passing native_codegen_check.sh fixture relies on the
+        # bug this removes).
+        let ai = 0
+        let an = list_len(call_args)
+        while ai < an do
+          let instrs = bm_lower_expr(list_get(call_args, ai), instrs, block_names, immut_params)
+          let ai = ai + 1
+        end
+        let instrs = list_push(instrs, ["Load", "__globals"])
+        let instrs = list_push(instrs, ["Call", name, an + 1])
+        return list_push(instrs, ["Store", "__bm_discard"])
       elif bm_lower_is_ambient_state_name(name) then
         # Same rejection bm_lower_expr's own generic fallback already
         # has, reached here too now that bare statements get a generic
@@ -1206,6 +1234,21 @@ end
 # (the overwhelming common case) is entirely unaffected, still lowered
 # by bm_lower_stmt's own original, non-splitting If case exactly as
 # before.
+# true only for `stmt` shaped exactly like `["Expr", ["Call", name, args,
+# ...], ...]` where `name` is a DECLARED block-model function -- the one
+# shape bm_lower_top_level_stmt_list's own tail-position special case
+# above may safely lower via JumpBlock instead of Call+discard.
+make a function called bm_is_tail_safe_bare_call takes stmt, block_names returns yes
+  if list_get(stmt, 0) != "Expr" then
+    return false
+  end
+  let call = list_get(stmt, 1)
+  if list_get(call, 0) != "Call" then
+    return false
+  end
+  return bm_list_contains(block_names, list_get(call, 1))
+end
+
 make a function called bm_lower_top_level_stmt_list takes stmts, start_idx, instrs, block_names, blocks_by_name, immut_params, known_locals, pending, fresh, k returns out
   let n = list_len(stmts)
   let i = start_idx
@@ -1242,6 +1285,24 @@ make a function called bm_lower_top_level_stmt_list takes stmts, start_idx, inst
       # checked BEFORE falling through to the unconditional, ordinary
       # If handling.
       return bm_lower_if_with_nested_while(stmt, stmts, i, instrs, block_names, blocks_by_name, immut_params, known_locals, pending, k)
+    elif (i == n - 1) and (list_get(k, 0) == "none") and bm_is_tail_safe_bare_call(stmt, block_names) then
+      # Phase 22: a bare statement call to a declared block-model
+      # function is a genuinely safe, one-way JumpBlock tail call ONLY
+      # here -- truly the LAST statement of this top-level list, with no
+      # enclosing continuation waiting to run afterward either (k ==
+      # "none"). Everywhere else a bare call reaches bm_lower_stmt's own
+      # dispatch, which now always uses Call+discard instead (see that
+      # case's own header for the real, confirmed bug this fixes: a bare
+      # call anywhere else previously used JumpBlock too, silently
+      # dropping every statement written after it -- including inside an
+      # ordinary if/else branch, which bm_lower_stmt_list doesn't thread
+      # continuations through at all). Kept as a real, deliberate
+      # optimization (native x64 can only compile JumpBlock, not Call,
+      # today) rather than folded away for uniformity, since checking
+      # every currently-passing native_codegen_check.sh fixture found
+      # none relies on the bug this fix removes.
+      let call = list_get(stmt, 1)
+      return bm_lower_jump_call(call, instrs, block_names, blocks_by_name, immut_params)
     else
       # If/Return/Expr (including a bare jump-call): conservatively
       # invalidate `fresh` entirely -- this narrow, straight-line-only

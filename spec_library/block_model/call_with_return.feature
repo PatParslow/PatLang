@@ -39,6 +39,39 @@ Feature: call-with-return for ordinary functions (Phase 21 of the full-language 
     When it runs through bm_lower_program/bi_run
     Then it computes the correct result
 
+  A third, more severe finding turned up while re-attempting Phase 18's
+  own checkpoint one level further out (self_hosting/schema_bdd_selftest
+  .patlang's own run_schema_bdd_selftest calls several declared functions
+  as ordinary BARE statements in sequence, each expected to run in turn):
+  a bare-statement call to a declared function ALWAYS lowered via
+  `JumpBlock` -- a one-way, non-returning transfer -- correct only when
+  that call is genuinely the very last thing that ever runs. Reached
+  anywhere else (more statements after it in the same list, or as the
+  last statement of an ordinary if/else branch, since
+  `bm_lower_stmt_list` threads no continuation information through at
+  all), it silently discarded every statement written after it, with NO
+  ERROR of any kind. Confirmed via two minimal repros before fixing:
+  `a(); b(); print(999)` printed only `a`'s own output; an `if true then
+  helper() end` followed by `print(999)` never reached that `print`
+  either. Fixed by using the SAME `Call`+discard convention already
+  established for `apply()`/the generic `CallHost` fallback everywhere
+  this bare call is NOT provably the enclosing list's own final
+  statement with nothing pending afterward -- that one safe shape keeps
+  using `JumpBlock` (checked directly: no currently-passing
+  native_codegen_check.sh fixture relies on the bug this removes, since
+  every native fixture with a bare declared-function call already uses it
+  only in that genuinely safe position).
+
+  Scenario: a bare-statement call to a declared function is followed by more code, which still runs
+    Given a function that calls two other declared functions as bare statements, then prints a value of its own
+    When it runs through bm_lower_program/bi_run
+    Then all three effects happen in order, matching exactly what pat --ir-run produces for the identical source
+
+  Scenario: a bare-statement call inside an ordinary if branch is followed by more code after the whole if
+    Given an if branch whose only statement is a bare call to a declared function, followed by a print after the if
+    When it runs through bm_lower_program/bi_run
+    Then the print after the if still runs, matching exactly what pat --ir-run produces for the identical source
+
   Native x64 codegen for `Call`/`ReturnValue` (which needs a genuinely
   different design -- classification by call site, closed under one
   additional fixed-point rule, and each qualifying function compiled as
