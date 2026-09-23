@@ -79,6 +79,13 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+echo "Scenario: Global*/Handler* compile through real native codegen, as hand-emitted assoc-list loops (Phase 19)"
+OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/native_globals.patlang phase19_globals 2>&1)
+check "a global set in one block, read back two jumps later, prints 42" "$OUT" "42"
+OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/native_handler.patlang phase19_handler 2>&1)
+check "\"alice\" resolves to 111" "$OUT" "111"
+check "\"bob\" resolves to 222" "$OUT" "222"
+
 echo ""
 echo "tests: $PASS passed, $FAIL failed"
 if [ "$FAIL" -eq 0 ]; then

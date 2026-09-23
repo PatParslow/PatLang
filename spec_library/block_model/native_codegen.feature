@@ -74,3 +74,20 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
   silently papered over: a bare native smoke test with no fiber
   machinery around it isn't a valid usage pattern for it, matching the
   scoping this whole feature's Phase 19 slice already commits to.
+
+  Scenario: Global*/Handler* compile through real native codegen, as hand-emitted assoc-list loops (Phase 19)
+    Given a program using set_global/get_global across a jump chain, and a handler with two names registered
+    When each is built and run as a real, fully native executable
+    Then both produce the exact same result the interpreter already gives
+
+  A real, previously-undiscovered bug in this same new code was found
+  and fixed proving the scenario above, not designed around in advance:
+  `rt_list_push(l, v)` (list argument first, value second) had its two
+  arguments pushed in the WRONG order in three call sites inside the
+  hand-emitted `HandlerRegister`/`GlobalSet` loop -- corrupting the
+  handler's own backing list via `rt_list_push`'s own address/length
+  read against the wrong operand, which surfaced as a genuine, real
+  segfault the moment the loop actually ran with at least one entry to
+  examine, not as a subtly wrong result. Found via systematically
+  narrowing a minimal repro (a single `handler_register` followed by
+  one `handler_lookup`), not by inspection alone.

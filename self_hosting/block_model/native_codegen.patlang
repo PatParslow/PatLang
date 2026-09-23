@@ -91,6 +91,185 @@ make a function called bm_nc_unsupported takes what returns nothing
   return false
 end
 
+# Phase 19 (Global*/Handler*): both GlobalGet/HandlerLookup reduce to the
+# SAME assoc-list "get" walk (bm_rt_assoc_get's own logic, interp.patlang),
+# and GlobalSet/HandlerRegister to the SAME "set" walk (bm_rt_assoc_set's
+# own rebuild-via-list_push logic, Phase 13's own fix -- never list_set,
+# to avoid re-triggering issue #145's native x64 aliasing bug). Rather
+# than bundling interp.patlang's own PatLang source into the native build
+# (a real, separate option, not chosen here), these are hand-emitted as
+# real Jump/JumpIfFalse loops directly, calling rt_list_get/rt_list_len/
+# rt_str_eq/rt_list_push -- all four already confirmed present in
+# self_hosting/build/x64_runtime.funcs, no new runtime primitives needed.
+#
+# Loop-internal jump targets use __RawJump/__RawJumpIfFalse (see
+# bm_to_real_funcir's own header), backpatched via the identical
+# "push a placeholder, record its own position, list_set it once the
+# real target is known" technique bm_lower_stmt's own If/Match cases
+# already use -- just operating on `out` (this instruction's own
+# expansion) instead of a whole block's instrs.
+#
+# `uniq` (the ORIGINAL block-model instruction's own index within its
+# block, passed in by the caller) plus `block_name`'s own existing
+# prefixing keeps every synthesized local name globally unique, the same
+# guarantee Load/Store's own bm_nc_prefix already provides for ordinary
+# names.
+make a function called bm_nc_local takes block_name, uniq, suffix returns out
+  return bm_nc_prefix(block_name, "__ah" + uniq + "_" + suffix)
+end
+
+# Pops (handler, name) already on the stack (handler on top, matching
+# HandlerLookup/GlobalGet's own established pop order), pushes the
+# looked-up value or false. `out` is the instruction stream so far;
+# returns the updated stream with this whole loop appended.
+make a function called bm_nc_emit_assoc_get takes out, block_name, uniq returns out2
+  let handler_l = bm_nc_local(block_name, uniq, "h")
+  let name_l = bm_nc_local(block_name, uniq, "k")
+  let i_l = bm_nc_local(block_name, uniq, "i")
+  let n_l = bm_nc_local(block_name, uniq, "n")
+  let entry_l = bm_nc_local(block_name, uniq, "e")
+  let result_l = bm_nc_local(block_name, uniq, "r")
+  let out = list_push(out, ["Store", handler_l])
+  let out = list_push(out, ["Store", name_l])
+  let out = list_push(out, ["Const", "num", "0"])
+  let out = list_push(out, ["Store", i_l])
+  let out = list_push(out, ["Load", handler_l])
+  let out = list_push(out, ["Call", "rt_list_len", 1])
+  let out = list_push(out, ["Store", n_l])
+  let loop_start = list_len(out)
+  let out = list_push(out, ["Load", i_l])
+  let out = list_push(out, ["Load", n_l])
+  let out = list_push(out, ["Bin", "<"])
+  let out = list_push(out, ["__RawJumpIfFalse", 0])
+  let jif_notfound_pos = list_len(out) - 1
+  let out = list_push(out, ["Load", handler_l])
+  let out = list_push(out, ["Load", i_l])
+  let out = list_push(out, ["Call", "rt_list_get", 2])
+  let out = list_push(out, ["Store", entry_l])
+  let out = list_push(out, ["Load", entry_l])
+  let out = list_push(out, ["Const", "num", "0"])
+  let out = list_push(out, ["Call", "rt_list_get", 2])
+  let out = list_push(out, ["Load", name_l])
+  let out = list_push(out, ["Call", "rt_str_eq", 2])
+  let out = list_push(out, ["__RawJumpIfFalse", 0])
+  let jif_continue_pos = list_len(out) - 1
+  let out = list_push(out, ["Load", entry_l])
+  let out = list_push(out, ["Const", "num", "1"])
+  let out = list_push(out, ["Call", "rt_list_get", 2])
+  let out = list_push(out, ["Store", result_l])
+  let out = list_push(out, ["__RawJump", 0])
+  let jmp_done_pos = list_len(out) - 1
+  let continue_target = list_len(out)
+  let out = list_set(out, jif_continue_pos, ["__RawJumpIfFalse", continue_target])
+  let out = list_push(out, ["Load", i_l])
+  let out = list_push(out, ["Const", "num", "1"])
+  let out = list_push(out, ["Bin", "+"])
+  let out = list_push(out, ["Store", i_l])
+  let out = list_push(out, ["__RawJump", loop_start])
+  let notfound_target = list_len(out)
+  let out = list_set(out, jif_notfound_pos, ["__RawJumpIfFalse", notfound_target])
+  let out = list_push(out, ["Const", "bool", "false"])
+  let out = list_push(out, ["Store", result_l])
+  let done_target = list_len(out)
+  let out = list_set(out, jmp_done_pos, ["__RawJump", done_target])
+  return list_push(out, ["Load", result_l])
+end
+
+# Pops (handler, name, ref) already on the stack (handler on top, matching
+# HandlerRegister/GlobalSet's own established pop order), pushes a real,
+# rebuilt updated list (never mutates the original -- same list_push-only
+# rule as bm_rt_assoc_set's own interpreted logic).
+make a function called bm_nc_emit_assoc_set takes out, block_name, uniq returns out2
+  let handler_l = bm_nc_local(block_name, uniq, "h")
+  let name_l = bm_nc_local(block_name, uniq, "k")
+  let ref_l = bm_nc_local(block_name, uniq, "v")
+  let i_l = bm_nc_local(block_name, uniq, "i")
+  let n_l = bm_nc_local(block_name, uniq, "n")
+  let entry_l = bm_nc_local(block_name, uniq, "e")
+  let out_l = bm_nc_local(block_name, uniq, "o")
+  let replaced_l = bm_nc_local(block_name, uniq, "rp")
+  let out = list_push(out, ["Store", handler_l])
+  let out = list_push(out, ["Store", name_l])
+  let out = list_push(out, ["Store", ref_l])
+  let out = list_push(out, ["Load", handler_l])
+  let out = list_push(out, ["Call", "rt_list_len", 1])
+  let out = list_push(out, ["Store", n_l])
+  let out = list_push(out, ["Const", "num", "0"])
+  let out = list_push(out, ["Store", i_l])
+  let out = list_push(out, ["BuildList", 0])
+  let out = list_push(out, ["Store", out_l])
+  let out = list_push(out, ["Const", "bool", "false"])
+  let out = list_push(out, ["Store", replaced_l])
+  let loop_start = list_len(out)
+  let out = list_push(out, ["Load", i_l])
+  let out = list_push(out, ["Load", n_l])
+  let out = list_push(out, ["Bin", "<"])
+  let out = list_push(out, ["__RawJumpIfFalse", 0])
+  let jif_loopend_pos = list_len(out) - 1
+  let out = list_push(out, ["Load", handler_l])
+  let out = list_push(out, ["Load", i_l])
+  let out = list_push(out, ["Call", "rt_list_get", 2])
+  let out = list_push(out, ["Store", entry_l])
+  let out = list_push(out, ["Load", entry_l])
+  let out = list_push(out, ["Const", "num", "0"])
+  let out = list_push(out, ["Call", "rt_list_get", 2])
+  let out = list_push(out, ["Load", name_l])
+  let out = list_push(out, ["Call", "rt_str_eq", 2])
+  let out = list_push(out, ["__RawJumpIfFalse", 0])
+  let jif_notmatch_pos = list_len(out) - 1
+  # matched: push the UPDATED [name, ref] entry instead of the original.
+  # rt_list_push(l, v) -- list FIRST, value SECOND (a real bug, found
+  # here: this used to push the [name,ref] entry before the list,
+  # backwards, corrupting the list via rt_list_push's own address/length
+  # read against the wrong operand -- confirmed via a real segfault, not
+  # assumed correct from the shape alone).
+  let out = list_push(out, ["Load", out_l])
+  let out = list_push(out, ["Load", name_l])
+  let out = list_push(out, ["Load", ref_l])
+  let out = list_push(out, ["BuildList", 2])
+  let out = list_push(out, ["Call", "rt_list_push", 2])
+  let out = list_push(out, ["Store", out_l])
+  let out = list_push(out, ["Const", "bool", "true"])
+  let out = list_push(out, ["Store", replaced_l])
+  let out = list_push(out, ["__RawJump", 0])
+  let jmp_afterentry_pos = list_len(out) - 1
+  let notmatch_target = list_len(out)
+  let out = list_set(out, jif_notmatch_pos, ["__RawJumpIfFalse", notmatch_target])
+  # no match: carry the original entry over unchanged. Same fix: list
+  # (out_l) pushed first, value (entry_l) second.
+  let out = list_push(out, ["Load", out_l])
+  let out = list_push(out, ["Load", entry_l])
+  let out = list_push(out, ["Call", "rt_list_push", 2])
+  let out = list_push(out, ["Store", out_l])
+  let afterentry_target = list_len(out)
+  let out = list_set(out, jmp_afterentry_pos, ["__RawJump", afterentry_target])
+  let out = list_push(out, ["Load", i_l])
+  let out = list_push(out, ["Const", "num", "1"])
+  let out = list_push(out, ["Bin", "+"])
+  let out = list_push(out, ["Store", i_l])
+  let out = list_push(out, ["__RawJump", loop_start])
+  let loopend_target = list_len(out)
+  let out = list_set(out, jif_loopend_pos, ["__RawJumpIfFalse", loopend_target])
+  let out = list_push(out, ["Load", replaced_l])
+  let out = list_push(out, ["__RawJumpIfFalse", 0])
+  let jif_append_pos = list_len(out) - 1
+  let out = list_push(out, ["__RawJump", 0])
+  let jmp_done_pos = list_len(out) - 1
+  let append_target = list_len(out)
+  let out = list_set(out, jif_append_pos, ["__RawJumpIfFalse", append_target])
+  # Same fix again: list (out_l) pushed first, the newly-built [name,
+  # ref] entry second.
+  let out = list_push(out, ["Load", out_l])
+  let out = list_push(out, ["Load", name_l])
+  let out = list_push(out, ["Load", ref_l])
+  let out = list_push(out, ["BuildList", 2])
+  let out = list_push(out, ["Call", "rt_list_push", 2])
+  let out = list_push(out, ["Store", out_l])
+  let done_target = list_len(out)
+  let out = list_set(out, jmp_done_pos, ["__RawJump", done_target])
+  return list_push(out, ["Load", out_l])
+end
+
 make a function called bm_nc_prefix takes block_name, name returns out
   return block_name + "__" + name
 end
@@ -221,6 +400,26 @@ make a function called bm_nc_translate_block_instrs takes block_name, instrs, pr
       let out = list_push(out, ["Call", "read_file", 1])
     elif op == 36537 then # "WriteFile"
       let out = list_push(out, ["Call", "write_file", 2])
+    elif op == 54830 then # "HandlerNew"
+      # An empty handler is just an empty list -- BuildList 0 is already
+      # a real, working codegen_x64.patlang instruction (confirmed by
+      # this file's own init_instrs use of it for the entry block's
+      # __globals), no loop needed at all.
+      let out = list_push(out, ["BuildList", 0])
+    elif op == 841425 then # "HandlerLookup"
+      let out = bm_nc_emit_assoc_get(out, block_name, i)
+    elif op == 40752 then # "HandlerRegister"
+      let out = bm_nc_emit_assoc_set(out, block_name, i)
+    elif op == 695659 then # "GlobalGet"
+      let out = bm_nc_emit_assoc_get(out, block_name, i)
+    elif op == 708727 then # "GlobalSet"
+      # Unlike HandlerRegister, GlobalSet writes the updated list
+      # directly into "__globals" rather than leaving it on the stack --
+      # matching interp.patlang's own GlobalSet semantics exactly (see
+      # its own header note on why this one instruction uniquely writes
+      # a local directly).
+      let out = bm_nc_emit_assoc_set(out, block_name, i)
+      let out = list_push(out, ["Store", bm_nc_prefix(block_name, "__globals")])
     else
       bm_nc_unsupported("instruction hash '" + op + "'")
     end
@@ -352,6 +551,23 @@ make a function called bm_to_real_funcir takes prog, print_op returns funcir
       elif op == "__JumpBlockTarget" then
         let target_base = bm_nc_assoc_get(starts, list_get(instr, 1))
         let flat = list_push(flat, ["Jump", target_base])
+      elif (op == "__RawJump") or (op == "__RawJumpIfFalse") then
+        # Phase 19 (Global*/Handler* loop emission): a target SYNTHESIZED
+        # entirely within bm_nc_translate_block_instrs's own emission of
+        # one instruction's own expansion (an assoc-get/assoc-set loop),
+        # not a real block-model Jump/JumpIfFalse at all -- its own
+        # operand is ALREADY a valid index into THIS block's own
+        # translated stream `t` (computed via list_len(out) as the loop
+        # was built, backpatched the same way bm_lower_stmt's own If/
+        # Match cases already do), so it needs only `+base`, never an
+        # index_map lookup (which would misinterpret it as an ORIGINAL,
+        # pre-expansion block-model instruction index and remap it to
+        # the wrong position).
+        let real_op = "Jump"
+        if op == "__RawJumpIfFalse" then
+          let real_op = "JumpIfFalse"
+        end
+        let flat = list_push(flat, [real_op, base + list_get(instr, 1)])
       else
         let flat = list_push(flat, instr)
       end
