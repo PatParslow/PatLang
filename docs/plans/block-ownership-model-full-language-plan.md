@@ -1613,6 +1613,56 @@ reported here plainly rather than investigated further in this same
 pass — each fix so far has revealed exactly one new blocker, and this
 is the pattern continuing, not a sign of an ever-receding goal.
 
+**Three more real bugs found and fixed chasing that `unbound: n`
+(commit `46c98cc`).** Traced to `bm_lower_while`'s own captured-variable
+computation never scanning the loop's own CONDITION expression, only
+its BODY — a variable referenced ONLY in the condition (`run_feature`'s
+own `let n = sc_len(h); while i <= n do ... end`) was missing from the
+head block's forwarded params. Fixed by unioning the condition's own
+free variables in too, via the same `bm_fv_expr` analysis already used
+elsewhere. Re-running the checkpoint then hit a second, unrelated bug:
+`and`/`or` were lowered like every other `Bin` op — eagerly evaluating
+BOTH sides, then a plain `Bin` instruction with no case in
+`bm_apply_bin` at all — doubly wrong since real PatLang short-circuits;
+confirmed via a repro where the RHS's own division-by-zero ran despite
+the LHS alone determining the `or`'s result. Fixed by mirroring
+`lower.patlang`'s own short-circuit lowering exactly. Re-running the
+checkpoint a third time found the deepest of the three: `bm_fv_expr`
+itself (the shared free-variable analysis) had no case for `"Index"`
+(`obj[idx]`) or `"List"` (`[a, b, c]`) AST nodes at all, so a loop-body
+variable referenced only via indexing or only inside a list literal was
+invisibly missing from EVERY caller's own captured set, not just this
+one checkpoint's own code — found via `self_hosting/lib/list_copy
+.patlang`'s own `l[i]` and `self_hosting/lib/pmap.patlang`'s own
+`[key, value]`. Fixed by adding both cases (plus `"Member"`,
+opportunistically, same root cause). Verified: block-model spec suite
+114/114 (up from 105), native x64 codegen check still 24/24, language
+spec gate 150/150 in isolation.
+
+**A fourth, materially larger finding — `apply()` with extra
+arguments.** With all three bugs above fixed, the checkpoint now runs
+past `t_init`, into the Gherkin runner, and genuinely processes its
+first scenario (`Feature: Library loans` / `Scenario: Borrowing an
+available book` both print for real) before hitting: `CallHost 'apply'
+failed: host function 'apply' not supported by interpret_ir`.
+`self_hosting/lib/schema_bdd.patlang` calls `apply(invariant_fn,
+state_before)`, `apply(require_fn, state_before, inputs)`, and similar
+— dynamic dispatch WITH extra arguments beyond the function name, in
+VALUE context. This is exactly the extension Phase 22's own
+`CallDynamic` design explicitly named as out of scope at the time
+("`apply(name, arg1, ...)` is a real, separate, NOT-yet-supported
+extension... named here rather than silently assumed covered") — that
+scoping check was done before `schema_bdd.patlang` specifically was in
+view. Supporting it needs `CallDynamic` (or a new sibling instruction)
+to accept N extra argument values, resolve the callee block, read ITS
+OWN declared parameter names, and bind each argument positionally
+before `__globals` — a real, moderate-complexity feature addition (the
+interpreter needs to inspect a resolved block's own parameter list at
+runtime, not just its name), not a one-line correctness fix like the
+bugs above. Not attempted in this pass — named plainly as the next
+piece of real design work, matching this document's own established
+practice.
+
 ---
 
 ## What this plan deliberately does not cover
