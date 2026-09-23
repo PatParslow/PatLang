@@ -65,22 +65,51 @@
 #     effects: lists of [state_name, tree, index_into_ensures]
 # =============================================================================
 
+include "block_model_compat.patlang"
 include "schema_bdd.patlang"
 include "zs_expr.patlang"
 include "step_match.patlang"
 
+# Was new("Dict", "zs_registry") + ambient set_var/get -- the REAL
+# engine's own name-registry object system, exactly the "ephemeral
+# majority" pattern the Block Ownership Model's own Fork B redesign
+# (docs/plans/block-ownership-model.md section 6) was built to
+# eliminate; block-model's own `new(...)` only supports its `class`-
+# declared form (Phase 13), so this genuinely could not run there
+# unmodified. Ported to the blessed get_global/set_global/handler_new
+# idiom instead -- observably identical for the real engine (same
+# single, memoized, mutable registry), and now also runs under
+# block-model. `existing` is checked by TYPE, not truthiness: an EMPTY
+# list (`handler_new()`'s own first-creation value) is falsy in PatLang,
+# confirmed directly before relying on this, so `if existing then` would
+# have silently recreated a fresh, empty registry on every single call
+# forever, never actually accumulating anything -- a real, non-obvious
+# correctness trap caught before shipping, not after.
 make a function called zs_registry returns registry
-  let existing = get("__vars", "zs_registry_obj")
-  if existing then
+  let existing = get_global("zs_registry_obj")
+  if type_of(existing) == "list" then
     return existing
   end
-  let registry = new("Dict", "zs_registry")
-  set_var("zs_registry_obj", registry)
+  let registry = handler_new()
+  set_global("zs_registry_obj", registry)
   return registry
 end
 
+# Was send(zs_registry(), "set", name, entry) -- the real Dict's own
+# in-place, name-keyed mutation. handler_register (unlike that) returns
+# an UPDATED value rather than mutating in place, so the write must go
+# through get_global/set_global directly rather than through whatever
+# zs_registry() happens to currently return (a snapshot, not a live
+# handle) -- this one function replaces BOTH call sites that used to
+# write through send (self_hosting/lib/zs_schema.patlang and
+# zs_refine.patlang).
+make a function called zs_registry_set takes name, entry returns done
+  set_global("zs_registry_obj", handler_register(zs_registry(), name, entry))
+  return true
+end
+
 make a function called zs_entry takes name returns entry
-  let e = get(zs_registry(), name)
+  let e = handler_lookup(zs_registry(), name)
   if type_of(e) != "list" then
     return ""
   end
@@ -679,7 +708,7 @@ make a function called zs_load takes text returns result
     end
     let g = g + 1
   end
-  send(zs_registry(), "set", name, [name, state, consts, inits, invs, domains, ops, facts, goals, negs, acts, dos, thens, refines_name, retrieves, rejects])
+  zs_registry_set(name, [name, state, consts, inits, invs, domains, ops, facts, goals, negs, acts, dos, thens, refines_name, retrieves, rejects])
   return ["ok", name]
 end
 

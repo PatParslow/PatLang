@@ -514,10 +514,34 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
       end
       let instrs = list_push(instrs, ["Load", "__globals"])
       return list_push(instrs, ["Call", name, an + 1])
+    elif bm_lower_is_ambient_state_name(name) then
+      # Phase 21: a real, previously-undisclosed leak in the generic
+      # CallHost fallback just below, found while working on zs_schema
+      # .patlang's own `new("Dict", ...)`-based registry: `set_var`/`get`/
+      # `send` are genuine, real host functions (interp_call_host already
+      # supports all three), so the generic fallback would otherwise
+      # dispatch them straight through to the REAL, PROCESS-WIDE ambient
+      # `__vars`/OBJECTS store -- completely bypassing Fork B's own
+      # stated "full elimination of ambient globals" guarantee for any
+      # block-model program that calls them directly instead of the
+      # blessed `set_global`/`get_global`/`handler_*` sugar. `new` is
+      # already blocked separately (Phase 13's own class-registry
+      # interception, checked first, above), but `get`/`send` were not,
+      # and neither was `set_var` when called in VALUE context (a bare
+      # statement already failed for an unrelated reason -- bm_lower_stmt
+      # 's own separate Call dispatch never got a generic fallback at
+      # all -- but that's an accident of that dispatch chain's own scope,
+      # not a deliberate block, so relying on it would have been fragile).
+      # Confirmed as a real, exploitable gap via a direct repro (`let x =
+      # set_var("key", 42)` then reading it back through `get`) before
+      # fixing it here, not assumed from reasoning alone.
+      bm_lower_unsupported("calling '" + name + "' directly -- this reaches genuine, process-wide ambient state (self_hosting/lib/interp.patlang's own interp_call_host), which Fork B's own design (docs/plans/block-ownership-model.md section 6) deliberately eliminates from this engine; use set_global/get_global or handler_new/handler_register/handler_lookup instead")
+      return instrs
     else
       # Phase 17/18's own named-but-deferred generic host-call fallback,
-      # now filled in: any name not individually recognized above, and
-      # not a declared block-model function either, is assumed a genuine
+      # now filled in: any name not individually recognized above, not a
+      # declared block-model function either, and not one of the ambient-
+      # state names rejected just above, is assumed a genuine, STATELESS
       # host function -- pushes args in WRITTEN order (matching every
       # other Call/CallHost convention in this file) then a CallHost
       # instruction, dispatched at runtime via interp_call_host (self_
@@ -540,6 +564,27 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
   end
   bm_lower_unsupported("expression shape '" + ty + "'")
   return instrs
+end
+
+# Phase 21: names that reach genuine, process-wide ambient state through
+# interp_call_host, blocked from the generic CallHost fallback above --
+# see that call site's own comment for the full rationale. A narrow,
+# specifically-verified list (each one directly confirmed reachable and
+# exploitable, not a guess at every possible ambient host function) --
+# `new` is NOT included here since it's already intercepted separately,
+# earlier in this same dispatch chain (Phase 13's own class-registry
+# check).
+make a function called bm_lower_is_ambient_state_name takes name returns yes
+  if name == "set_var" then
+    return true
+  end
+  if name == "get" then
+    return true
+  end
+  if name == "send" then
+    return true
+  end
+  return false
 end
 
 # A Call to another declared block: lowers its args (each pushed, in

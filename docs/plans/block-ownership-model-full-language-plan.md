@@ -658,6 +658,64 @@ guess had it. This phase's own result stands as recorded evidence of
 exactly how much further coverage a genuine drop-in claim would need,
 not a completed checkpoint.
 
+**Re-attempted after Phase 21 (2026-09-23) — got further, found two more
+real blockers, one fixed, one newly diagnosed and NOT yet fixed:**
+
+1. **A real, previously-undisclosed leak in Phase 18's own generic
+   CallHost fallback, found and closed.** `set_var`/`get`/`send` are
+   genuine, real host functions (`interp_call_host` already supports all
+   three), so the generic fallback would dispatch them straight through
+   to REAL, process-wide ambient state — completely bypassing Fork B's
+   own "full elimination of ambient globals" guarantee for any program
+   calling them directly instead of the blessed `set_global`/
+   `get_global`/`handler_*` sugar. Confirmed exploitable via a direct
+   repro before fixing it. `bm_lower_expr`'s own generic-CallHost branch
+   now rejects these three names explicitly
+   (`bm_lower_is_ambient_state_name`), with a message naming the
+   rationale — verified via a new scenario in `library_parity.feature`.
+2. **`self_hosting/lib/zs_schema.patlang`'s own `zs_registry()`, and two
+   sibling files' own equivalent patterns, used `new("Dict", name)` +
+   ambient `set_var`/`get` — exactly the "ephemeral majority" pattern
+   Fork B (design doc section 6) names as what it eliminates, and which
+   block-model's own `new(...)` genuinely cannot run (Phase 13 only
+   supports the `class`-declared form). Ported to `get_global`/
+   `set_global`/`handler_new`/`handler_register`/`handler_lookup`
+   instead, across THREE files, not one — `self_hosting/lib/{zs_schema,
+   schema_bdd}.patlang`'s own registries, and `zs_expr.patlang`'s own
+   scalar ambient state, each traced by re-running the checkpoint and
+   finding the NEXT failure, not assumed from reading the code. Real,
+   non-obvious correctness trap found and avoided before shipping: an
+   empty List is FALSY in PatLang (confirmed directly), so a naive
+   `if existing then` "does the registry already exist" check would have
+   silently recreated a fresh, empty registry on every call forever,
+   never accumulating anything — fixed by checking `type_of(existing) ==
+   "list"` instead. A new shared file, `self_hosting/lib/
+   block_model_compat.patlang` (real-function implementations of block-
+   model's own sugar names, transparent under block-model since its own
+   lowerer always intercepts these exact names by an earlier, hardcoded
+   match), holds the wrappers — needed as its own file, not bundled into
+   any one of the three consumers, because `schema_bdd.patlang` and
+   `zs_expr.patlang` are ALSO each included independently elsewhere
+   without `zs_schema.patlang`. Verified with zero regressions against
+   ALL SIX real-engine test suites that exercise these files
+   (`run_zs_selftests.patlang`'s own 14, plus `zs_expr_selftest.patlang`
+   81, `schema_bdd_selftest.patlang` 5, `schema_synthesis_hook_selftest
+   .patlang` 3, `library_loans_schema_demo.patlang` 7, and `zs_refine_
+   selftest.patlang` 62 — 172 checks total, none broken) and the full
+   block-model suite (91/91, zero regressions there too).
+3. **The REAL next blocker, found by re-running the checkpoint after (1)
+   and (2), NOT yet fixed:** `zs_schema.patlang`'s own `zs_lines()`
+   function contains a `while` loop NESTED inside an `if` block —
+   `does not support: statement shape 'While'`. Block-model's own Phase
+   5 only ever supported `while` at a function's OWN top level (a loop
+   reached via `bm_lower_stmt`, i.e. nested inside an if/else, hits
+   `bm_lower_unsupported` by design, not a silent gap) — extending it to
+   nested loops is a genuinely separate, sizable feature (each nesting
+   level needs its own captured-variable threading through the existing
+   head/exit block-splitting scheme, not a small patch), not attempted
+   in this pass. Named plainly rather than guessed at further without
+   confirming it empirically first.
+
 ---
 
 ## Phase 19 — Consolidated native x64 + WASM codegen

@@ -47,32 +47,61 @@
 # =============================================================================
 
 include "pmap.patlang"
+include "block_model_compat.patlang"
 
 # Single, process-wide registry (like Step's own new("Step", text)
 # convention -- schemas and operations are inherently global, not
 # per-instance, so one lazily-created Dict is simpler than
 # primitive_registry.patlang's counter-named multi-registry support, which
 # this doesn't need).
+#
+# Was new("Dict", ...) + ambient set_var/get -- the same "ephemeral
+# majority" pattern zs_registry() (self_hosting/lib/zs_schema.patlang)
+# already had, ported the same way and for the same reason: the Block
+# Ownership Model's own Fork B redesign (docs/plans/block-ownership-
+# model.md section 6) has no `new(...)` support for this form at all, so
+# this genuinely could not lower under it unmodified. get_global/
+# set_global/handler_new/handler_register/handler_lookup are real,
+# ordinary functions (self_hosting/lib/block_model_compat.patlang's
+# own, included above since this file is also consumed standalone
+# elsewhere, without zs_schema.patlang) -- block-model's own lowerer
+# always intercepts these exact names earlier, by a hardcoded match,
+# before any declared-function lookup runs, so
+# this file's own body is transparent there while the REAL engine gets a
+# working implementation. `existing` is checked by TYPE, not truthiness,
+# for the same reason zs_registry() checks it that way -- an empty list
+# is falsy in PatLang, confirmed directly, which `if existing then`
+# would have silently broken on first use.
 make a function called schema_registry returns registry
-  let existing = get("__vars", "schema_bdd_registry_obj")
-  if existing then
+  let existing = get_global("schema_bdd_registry_obj")
+  if type_of(existing) == "list" then
     return existing
   end
-  let registry = new("Dict", "schema_bdd_registry")
-  set_var("schema_bdd_registry_obj", registry)
+  let registry = handler_new()
+  set_global("schema_bdd_registry_obj", registry)
   return registry
+end
+
+# Was send(schema_registry(), "set", key, val) -- see zs_registry_set's
+# own comment (zs_schema.patlang) for why the write must go through
+# get_global/set_global directly rather than through schema_registry()'s
+# own return value, which is a snapshot, not a live handle, once it's an
+# ordinary Handler value instead of a real Dict object.
+make a function called schema_registry_set takes key, entry returns done
+  set_global("schema_bdd_registry_obj", handler_register(schema_registry(), key, entry))
+  return true
 end
 
 # state_var_names: list of strings naming the schema's declared state.
 # invariant_fn: name of a function taking ONE argument (the state values,
 # in the same order as state_var_names) and returning bool.
 make a function called schema_define takes name, state_var_names, invariant_fn returns done
-  send(schema_registry(), "set", name + "__schema", [state_var_names, invariant_fn])
+  schema_registry_set(name + "__schema", [state_var_names, invariant_fn])
   return true
 end
 
 make a function called schema_lookup takes name returns entry
-  return get(schema_registry(), name + "__schema")
+  return handler_lookup(schema_registry(), name + "__schema")
 end
 
 # input_names: list of strings naming the operation's declared inputs.
@@ -81,38 +110,48 @@ end
 # ensure_fn: name of a function taking (before_values, after_values,
 # input_values), returning bool -- the operation's postcondition.
 make a function called schema_operation takes schema_name, op_name, input_names, require_fn, ensure_fn returns done
-  send(schema_registry(), "set", schema_name + "::" + op_name + "__op", [schema_name, input_names, require_fn, ensure_fn])
+  schema_registry_set(schema_name + "::" + op_name + "__op", [schema_name, input_names, require_fn, ensure_fn])
   return true
 end
 
 make a function called schema_lookup_operation takes schema_name, op_name returns entry
-  return get(schema_registry(), schema_name + "::" + op_name + "__op")
+  return handler_lookup(schema_registry(), schema_name + "::" + op_name + "__op")
 end
 
 # ---- binding: a scenario's own step functions call these ----
+#
+# Ordinary keyed ambient state (no Dict/registry object involved at
+# all) -- a straight set_var/get(__vars,...) -> set_global/get_global
+# rename, same as zs_expr.patlang's own scalar state (ze_rt_error, etc.)
+# needed. Dynamic, runtime-computed key names work identically under
+# both get_global (block-model's own GlobalGet has no compile-time-
+# literal-key restriction) and the real engine's own get/set_var.
 
 make a function called schema_bind_state takes schema, var_name, phase, value returns done
-  set_var(schema + "__" + var_name + "__" + phase, value)
+  set_global(schema + "__" + var_name + "__" + phase, value)
   return true
 end
 
 make a function called schema_bind_input takes schema, op, param_name, value returns done
-  set_var(schema + "__" + op + "__in__" + param_name, value)
+  set_global(schema + "__" + op + "__in__" + param_name, value)
   return true
 end
 
-# Not-yet-bound sentinel: get("__vars", ...) on an unset key -- same
+# Not-yet-bound sentinel: get_global(...) on an unset key -- same
 # absence convention already relied on throughout this codebase (e.g.
-# gherkin_contracts.patlang's `already_bound` check). Never distinguishes
-# "never bound" from "bound to this same falsy value"; low risk for the
-# LibraryLoans-shaped schemas this was designed against (string/list-typed
-# state), a documented hard limit for anything boolean- or zero-valued.
+# gherkin_contracts.patlang's `already_bound` check), now normalized to
+# `false` for an absent key under BOTH engines (get_global's own header,
+# zs_schema.patlang) rather than the real engine's own raw Unit. Never
+# distinguishes "never bound" from "bound to this same falsy value";
+# low risk for the LibraryLoans-shaped schemas this was designed against
+# (string/list-typed state), a documented hard limit for anything
+# boolean- or zero-valued.
 make a function called schema_state_values takes schema, state_var_names returns values
   let out = []
   let i = 0
   let n = to_num(list_len(state_var_names))
   while i < n do
-    let out = list_push(out, get("__vars", schema + "__" + state_var_names[i] + "__before"))
+    let out = list_push(out, get_global(schema + "__" + state_var_names[i] + "__before"))
     let i = i + 1
   end
   return out
@@ -123,7 +162,7 @@ make a function called schema_state_values_after takes schema, state_var_names r
   let i = 0
   let n = to_num(list_len(state_var_names))
   while i < n do
-    let out = list_push(out, get("__vars", schema + "__" + state_var_names[i] + "__after"))
+    let out = list_push(out, get_global(schema + "__" + state_var_names[i] + "__after"))
     let i = i + 1
   end
   return out
@@ -134,7 +173,7 @@ make a function called schema_input_values takes schema, op, input_names returns
   let i = 0
   let n = to_num(list_len(input_names))
   while i < n do
-    let out = list_push(out, get("__vars", schema + "__" + op + "__in__" + input_names[i]))
+    let out = list_push(out, get_global(schema + "__" + op + "__in__" + input_names[i]))
     let i = i + 1
   end
   return out
@@ -241,12 +280,12 @@ end
 # matters once there's a synthesized candidate to check, not for the
 # scenario-witnessing use in schema_check above.
 make a function called schema_register_synthesis_check takes func_name, schema_name, op_name, harness_fn returns done
-  send(schema_registry(), "set", func_name + "__synthesis_check", [schema_name, op_name, harness_fn])
+  schema_registry_set(func_name + "__synthesis_check", [schema_name, op_name, harness_fn])
   return true
 end
 
 make a function called schema_lookup_synthesis_check takes func_name returns entry
-  return get(schema_registry(), func_name + "__synthesis_check")
+  return handler_lookup(schema_registry(), func_name + "__synthesis_check")
 end
 
 # Runs a registered synthesis hook for func_name and returns its
