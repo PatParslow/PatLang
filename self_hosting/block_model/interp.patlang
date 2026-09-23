@@ -49,6 +49,17 @@
 
 include "block_ir.patlang"
 include "heap.patlang"
+# Phase 18: reuses self_hosting/lib/interp.patlang's own interp_call_host
+# (name, args) dispatcher AS-IS for BuildList/CallHost's generic host-
+# function calls, rather than reinventing a second one -- checked
+# directly (a throwaway include-both-files smoke test) for name
+# collisions with this file's own bm_-/bi_-prefixed functions before
+# relying on it: none found. That file's own header describes it as
+# "feature complete" for every stateless utility chunk (core,
+# strings_ext, collections_handles, files, io_misc, math) -- real
+# functions like `list_get`/`hash_string`/`char_code`, not this file's
+# own block-model-specific opcodes.
+include "../lib/interp.patlang"
 
 # Phase 7 (Fork C): a counter of how many times the RUNTIME refcount
 # check (BoxSet, not BoxSetUnchecked) actually fired -- the concrete,
@@ -187,6 +198,33 @@ make a function called bm_st_pop takes stack returns out
     let i = i + 1
   end
   return [v, rest]
+end
+
+# Phase 18: pops `n` values, returning them as [values_in_ORIGINAL_
+# push_order, remaining_stack] -- needed by BuildList/CallHost, whose
+# own args were pushed in WRITTEN order (first arg pushed first, so
+# it's the DEEPEST of the n popped values, not the top). Popped one at a
+# time via bm_st_pop (top-to-bottom = REVERSE of push order), collected,
+# then reversed back -- the exact technique self_hosting/lib/interp
+# .patlang's own stack_pop_n already uses for the SAME reason, not a new
+# invention.
+make a function called bm_st_pop_n takes stack, n returns pair
+  let vals_rev = []
+  let cur = stack
+  let i = 0
+  while i < n do
+    let popped = bm_st_pop(cur)
+    let vals_rev = list_push(vals_rev, list_get(popped, 0))
+    let cur = list_get(popped, 1)
+    let i = i + 1
+  end
+  let vals = []
+  let j = n - 1
+  while j >= 0 do
+    let vals = list_push(vals, list_get(vals_rev, j))
+    let j = j - 1
+  end
+  return [vals, cur]
 end
 
 # Optimization (post-Phase-8): op is now bm_op_hash("+") etc. (an
@@ -535,6 +573,34 @@ make a function called bi_run_block takes prog, blk, locs returns outcome
       end
       let target_blk = bi_find_block(prog, target_name)
       return ["jump", target_blk, new_locs]
+    elif op == 550066 then # "BuildList"
+      # A literal `[a, b, c]` -- pops instr[1] values (already pushed in
+      # WRITTEN order by lower.patlang's own "List" case) via bm_st_pop_n,
+      # which restores that original order, then pushes the resulting
+      # List directly -- matches self_hosting/lib/interp.patlang's own
+      # "BuildList" case exactly (stack_pop_n's own `popped[0]` IS already
+      # the reconstructed list, nothing further needed).
+      let popped = bm_st_pop_n(stack, list_get(instr, 1))
+      let stack = bm_st_push(list_get(popped, 1), list_get(popped, 0))
+      let pc = pc + 1
+    elif op == 700058 then # "CallHost"
+      # Phase 17/18's own named-but-deferred generic host-function
+      # dispatch, now filled in: pops instr[2] args (written order,
+      # restored by bm_st_pop_n) and dispatches by NAME through self_
+      # hosting/lib/interp.patlang's own interp_call_host -- reused
+      # as-is (see this file's own include comment above), not
+      # reimplemented. On "Err" (unknown name, wrong arity, etc.), raises
+      # a guaranteed-fail contract violation naming the real cause,
+      # matching this engine's own established convention for every
+      # other unrecoverable condition (ContractFail, bm_lower_unsupported)
+      # rather than silently pushing a placeholder value.
+      let popped = bm_st_pop_n(stack, list_get(instr, 2))
+      let call_result = interp_call_host(list_get(instr, 1), list_get(popped, 0))
+      if list_get(call_result, 0) == "Err" then
+        contract_check("bm_interp", "assert", "CallHost '" + list_get(instr, 1) + "' failed: " + list_get(call_result, 1), false)
+      end
+      let stack = bm_st_push(list_get(popped, 1), list_get(call_result, 1))
+      let pc = pc + 1
     else
       contract_check("bm_interp", "assert", "unknown block-model instruction: " + op, false)
     end

@@ -157,3 +157,18 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
   `bm_lower_program`/`bi_run` directly (unlike Box*, Emit/Global* need no
   native-only primitive, so this simpler cross-check is valid here) --
   both agree exactly: `100`, `200`, `42`, `2`, `3`.
+
+  Scenario: BuildList and generic CallHost (Phase 18's own new opcodes) compile through real native codegen
+    Given a program that builds a List literal via a bracket expression, calls list_len on it, and indexes into it
+    When it is built and run as a real, fully native executable
+    Then it produces the correct length and the correct indexed value
+
+  Both translate as direct passthroughs to codegen_x64.patlang's own
+  already-real `BuildList`/`CallHost` instructions -- no new native
+  emission logic needed. `BuildList` always works (it has no allowlist
+  restriction); `CallHost` for an ARBITRARY name is not guaranteed to
+  (codegen_x64.patlang enforces its own "OS-boundary allowlist" for
+  CallHost targets), so this scenario only confirms two names
+  (`list_len`, `list_get`) that happen to fall inside it -- not a claim
+  that every host function Phase 18's own interpreter-side
+  `interp_call_host` fallback covers also compiles natively.

@@ -574,11 +574,89 @@ own premise-correction), and very likely closures/classes-with-methods
 exactly the signal the phase's own checkpoint anticipated: the language
 surface built so far (Phases 10–17) is real but still narrow, and real-
 world library code exercises far more of it than any single hand-picked
-scenario does. **Not remedied here** — doing so would mean building
-List-literal support and generic host-call dispatch, which are Phase 17's
-own already-named, separately-scoped follow-ups, not this phase's job.
-This phase's own result stands as recorded evidence of how much further
-coverage a genuine drop-in claim would need, not a completed checkpoint.
+scenario does.
+
+**The two named Phase 17 follow-ups are now built (2026-09-23) — List
+literals and generic host-call dispatch both work — but the checkpoint
+still does not fully pass; the REAL remaining blocker, found by
+re-attempting it, is a third, deeper, pre-existing gap this phase's own
+scope never covered.**
+
+- `["BuildList", n]` (a new block-model bytecode instruction: pops `n`
+  values pushed in written order, pushes a fresh List) and a generic
+  `["CallHost", name, argc]` fallback (for any `Call` whose callee isn't
+  one of this engine's own individually-recognized builtins, and isn't a
+  declared block-model function either) are both implemented in
+  `lower.patlang`/`interp.patlang`, mirroring the REAL self-hosted
+  `lower.patlang`'s own equivalent "List"/"Index"/"Call" cases exactly,
+  not invented from scratch. `["Index"]` (`lst[i]`) needed no separate
+  instruction at all — it lowers straight to `["CallHost", "list_get",
+  2]` through the same new mechanism.
+- The generic dispatch reuses `self_hosting/lib/interp.patlang`'s own
+  `interp_call_host(name, args)` — a real, already-"feature complete" (for
+  every stateless utility chunk: core, strings_ext, collections_handles,
+  files, io_misc, math) host-function-by-name dispatcher — rather than
+  reinventing one. Confirmed no name collisions with this file's own
+  `bm_-`/`bi_-`prefixed functions before including it, via a throwaway
+  smoke test, not assumed safe.
+- A call to a DECLARED block-model function used as a sub-expression
+  (not in tail/return position) is explicitly rejected with a clear,
+  named message rather than silently misrouted into the generic
+  CallHost fallback (which would otherwise fail downstream with a
+  confusing "unknown host function", obscuring the real cause).
+- A real bug was found and fixed proving this, not designed around in
+  advance: `bm_hash_rewrite_instrs` (the opcode-hash-dispatch rewrite
+  every block's own instrs go through before native codegen ever sees
+  them) has an explicit per-opcode operand whitelist; anything not
+  listed falls into a bucket that assumes NO operand at all. Both new
+  instructions carry operands (`BuildList`'s own count, `CallHost`'s own
+  name+argc) that would have been silently DROPPED — not just
+  miscompiled, gone entirely — had this not been caught by tracing the
+  code path before shipping, rather than after a confusing runtime
+  failure.
+- Verified via a new `spec_library/block_model/library_parity.feature`
+  (List literal + indexing + `list_len`/`list_push`, never individually
+  recognized by name, + `hash_string`, a genuine stateless-chunk host
+  function — all cross-checked against `pat --ir-run`'s own output for
+  the identical source) and the full interpreter suite, zero
+  regressions. Also given real, if disclosed-incomplete, native x64
+  support (Phase 19's own `native_codegen.patlang`): both instructions
+  are direct passthroughs to `codegen_x64.patlang`'s own already-real
+  `BuildList`/`CallHost` — `BuildList` always works, `CallHost` only for
+  whatever names happen to fall inside that backend's own separate
+  "OS-boundary allowlist" (confirmed for `list_len`/`list_get`, not
+  claimed for every name `interp_call_host` covers).
+
+**Re-attempting Phase 18's own original checkpoint with this new support
+in place, empirically, not assumed:** lowering `self_hosting/lib/
+zs_schema.patlang` now gets further (past the original "expression
+shape 'Call'" failure) before hitting a DIFFERENT, deeper, PRE-EXISTING
+restriction from Phase 2 itself: **"`return EXPR` where EXPR isn't a
+call to a declared block (no call stack to return a value up through
+yet)"**. A block-model function can only ever "return" via a TAIL call
+to another declared block (`JumpBlock`); it has no mechanism at all for
+returning a plain computed value (`return 5`, `return x + 1`, or the
+result of calling a helper mid-expression) — which real library code
+needs constantly, and which is NOT one of Phase 18's two named gaps.
+This is Fork A's own foundational "no call stack" design choice (design
+doc section 3.1), not an oversight this phase's own scope covers: fixing
+it would mean designing a genuine call-with-return mechanism for
+ORDINARY functions (this engine has exactly one such mechanism today,
+`Emit`, deliberately narrow and reserved for event handlers specifically
+— see `block_ir.patlang`'s own Phase 10 header) — a separate, materially
+larger architectural decision, correctly out of scope for "fill in an
+already-named follow-up" work, and **not attempted here without an
+explicit decision to do so.**
+
+**Not remedied here, still genuinely incomplete as a checkpoint:** this
+phase's own two named gaps are done and verified; the checkpoint's own
+broader goal (real, unmodified library code running end to end) is not
+met, and the actual remaining blocker is now precisely diagnosed —
+ordinary non-tail function calls with return, not "closures/classes-
+with-methods, probably" as this section's own earlier, less precise
+guess had it. This phase's own result stands as recorded evidence of
+exactly how much further coverage a genuine drop-in claim would need,
+not a completed checkpoint.
 
 ---
 

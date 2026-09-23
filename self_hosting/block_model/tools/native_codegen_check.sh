@@ -111,6 +111,11 @@ if [ "$(echo "$OUT" | grep -n '^100$')" ] && [ "$(echo "$OUT" | grep -n '^200$')
   fi
 fi
 
+echo "Scenario: BuildList/generic-CallHost (Phase 18's new opcodes) compile through real native codegen as direct passthroughs (Phase 19)"
+OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/native_buildlist.patlang phase18_buildlist 2>&1)
+check "list_len(xs) on a real List literal prints 3" "$OUT" "3"
+check "indexing xs[1] prints 20" "$OUT" "20"
+
 echo ""
 echo "tests: $PASS passed, $FAIL failed"
 if [ "$FAIL" -eq 0 ]; then
