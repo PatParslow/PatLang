@@ -1,17 +1,22 @@
 # Block Ownership Model: full-language expansion plan
 
-**Status (2026-09-22): Phases 10–17 (event dispatch, pattern matching,
-design by contract, object orientation, cooperative fiber_yield, logic-
-programming facts, numeric tower, system integration) complete and
-verified — `self_hosting/block_model/run_block_model_spec_suite.patlang`
-reports 83/83 passing, no regressions. Phase 18 (library-level parity)
-was genuinely attempted and genuinely fails, as real, checked evidence
-of how much further coverage remains — not a completed checkpoint; see
-its own section for the exact failure and what it traces to. Phase 20
-(migration/cutover design) is written, with real decisions recorded
-(a hard switch, gated on both full-suite parity and issues #145/#113
-actually being fixed, not waived) and acting on them explicitly not yet
-authorized.
+**Status (2026-09-24): Phases 10–19 and 21 are complete, and Phase 18's
+checkpoint is met** — six real, unmodified library selftests (`schema_bdd`,
+`pset`, `pmap`, `step_match`, `zs_expr`, `zs_schema`; 177 checks) run under the
+block-model engine with output identical to `pat --ir-run`, gated by
+`spec_library/block_model/library_selftest_parity.feature` (Phase 23 below).
+Native x64 call-with-return (`Call`/`ReturnValue`/`CallDynamic`, #173) and the
+WASM path (#174, #181) are done. Phase 20 (migration/cutover design) is written,
+with real decisions recorded (a hard switch, gated on both full-suite parity and
+issues #145/#113 actually being fixed, not waived); acting on it is explicitly
+NOT authorized (#180). Everything still open — methods/inherits/traits,
+`budgeted`/threads, GOAP rules, `signal_*`, the `zs_explore` port, the lowering
+cost — is tracked on the project board under epic #160.
+
+*Earlier status, kept for the record (2026-09-22):* Phases 10–17 verified at
+83/83; Phase 18 genuinely attempted and genuinely failing, recorded as checked
+evidence of how much coverage remained rather than as a completed checkpoint.
+The sections below tell that story in order, including the corrections.
 
 **Phase 19 is now fully complete (2026-09-23)** — every opcode this
 phase scoped (`ContractFail`/`FiberYield`/`Fact`/`Query`/`TypeOf`/
@@ -48,7 +53,8 @@ design, proof, and native/WASM verification) were already complete on
 `feature/block-ownership-model` — see
 [`block-ownership-model-implementation-plan.md`](block-ownership-model-implementation-plan.md)
 for that record, which this document continues rather than replaces.
-Phases 18–20 below are not built yet.**
+(An earlier version of this note said Phases 18–20 were not built yet; see
+the status paragraph at the top for where each stands now.)**
 
 Companion to [`block-ownership-model.md`](block-ownership-model.md) (the
 design doc, Forks A–E) and the Phase 0–9 implementation plan. Those decided
@@ -1395,6 +1401,10 @@ A declared function called as a sub-expression (`let x = helper(5) +
 `while` loop all now run correctly, cross-checked against `pat --ir-run`
 on the identical source where applicable.
 
+*(Update 2026-09-24: both items below are now done — native x64 codegen for
+`Call`/`ReturnValue`/`CallDynamic` under #173, and re-running Phase 18's
+checkpoint, which is met; see Phase 23. The text is kept as it was written.)*
+
 **Not started, explicitly deferred (unchanged from the design above):**
 native x64 codegen for `Call`/`ReturnValue` (the classification-and-
 separate-FuncIR design), and re-running Phase 18's own checkpoint
@@ -1662,6 +1672,155 @@ runtime, not just its name), not a one-line correctness fix like the
 bugs above. Not attempted in this pass — named plainly as the next
 piece of real design work, matching this document's own established
 practice.
+
+---
+
+## Phase 23 — Closing Phase 18's checkpoint, native call-with-return, and WASM re-verification (2026-09-24)
+
+**Results**
+
+- **Phase 18's checkpoint is met.** Six real, unmodified library selftests —
+  `schema_bdd`, `pset`, `pmap`, `step_match`, `zs_expr`, `zs_schema` (177 checks
+  between them) — run to completion through `bm_lower_program`/`bi_run_from` with
+  real `include` expansion, each printing exactly what `pat --ir-run` prints, with
+  pass/fail counts read out of the run's own returned `__globals`. The standing
+  gate is `spec_library/block_model/library_selftest_parity.feature` (one scenario
+  per selftest, one generic driver, `spec_fixtures/selftest_under_block_model.patlang`).
+- **Native x64 call-with-return is done** (#173): `Call`, `ReturnValue` and
+  `CallDynamic` now build and run natively.
+- **The WASM path is re-verified and repaired** (#174, #181): every opcode set
+  except `Box*` and `FiberYield` builds for `wasm32-wasip1` and prints what the
+  native build prints; those two are native-only by design and fail at build time
+  naming why.
+
+Gates at the end of this phase: block-model suite 166/166, native check 28/28,
+WASM check 15/15, language spec gate 150/150, step-text uniqueness check clean.
+
+**Every defect found was filed, reproduced RED, fixed GREEN, and closed under its
+own issue** (epic #160):
+
+| Issue | Defect | Found by |
+|---|---|---|
+| #148 | `.length` on a String/List routed through Box+Handler | first run past `t_init` |
+| #149 | bare call to a declared function dropped every later statement | `run_schema_bdd_selftest` did only its first call |
+| #150 | while-condition-only variable not captured | `test.patlang`'s `run_feature` |
+| #151 | `and`/`or` evaluated both sides, no short-circuit | `run_feature` |
+| #152 | free-variable analysis blind to `Index`/`List`/`Member` | `list_copy`, `pmap_put` |
+| #153 | `apply(fn, args…)` in value context unsupported | `schema_bdd.patlang` |
+| #154 | `""`, `0`, `[]` truthy as a condition (`JumpIfFalse` tested `== false`) | stray `[]` in scenario output |
+| #155 | top-level statements silently ignored | every script-style selftest |
+| #157 | tail-position bare call returned the wrong shape | `pset`/`pmap` selftests |
+| #158 | free-variable analysis blind to `While`/`Assert`/`Match`/`MemberAssign` | `zs_expr` (`ze_msort`) |
+| #159 | `sc_substr` missing from the host table | `step_match`, `zs_schema` |
+| #181 | WASM path broken since Phase 19 (unconditional `bm_heap_init`) | running the standalone WASM check |
+| #156 | lowering is O(n²) in a body's statement count (measured, not blocking) | scaling benchmark |
+
+Four of these are worth stating as lessons rather than just fixes:
+
+- **#157 was a regression I introduced in #149's fix, in a branch no test
+  reached.** I kept `JumpBlock` for the provably-safe tail-position case, wrote
+  that special case to return a bare instruction list instead of the
+  `[instrs, pending]` pair every other return path returns, and shipped it
+  described as "a deliberate optimization" with no fixture that ended a body in
+  a bare call. The native suite staying green proved nothing about it, because
+  no native fixture reaches that branch either. Every special case now gets a
+  fixture that reaches it.
+- **#158 came from comparing two lists that should have matched.** The
+  free-variable analysis covers `Let`/`If`/`Expr`/`Return`; the lowerer handles
+  seven statement kinds plus `While`. Diffing the two lists found four uncovered
+  kinds at once. #152 had fixed the expression half one node type at a time and
+  never made that comparison; when an analysis mirrors a lowerer, check coverage
+  of the whole set, not only the case that just failed.
+- **#154 was found by comparing output text, not by a failing check.** Both
+  engines "passed" the same selftest; only a line-for-line diff of their output
+  showed `Scenario: X  []` against `Scenario: X`. The parity gate compares every
+  line for that reason.
+- **#181 is what an unrun gate looks like.** The WASM check is a standalone
+  script, outside the suite and the language gate, and it had been failing every
+  scenario since Phase 19 without anyone noticing. Standalone checks are now part
+  of the pre-commit gate below, and the check script removes its previous output
+  before building, because a stale `.wasm` once made a failed build look like a
+  passing run.
+
+**Design decisions made on the way**
+
+- *Top-level statements* (#155): every non-declaration top-level statement is
+  collected, in order, into a synthesized zero-parameter `__main`, lowered like
+  any function body, and made the entry only when such statements exist.
+  Anything at top level the lowerer cannot handle fails loudly; an un-expanded
+  `include` gets its own message, since that was the real way content used to
+  vanish.
+- *Host functions* (#159): `interp_call_host` lives in
+  `self_hosting/lib/interp.patlang`, one of the four files this plan protects
+  until the cutover. A host function it lacks is added to a block-model-local
+  table (`bi_call_host_extension`), consulted only after the shared table returns
+  an error so the success path pays nothing. The table grows only on evidence.
+- *Free-variable analysis of `Match`* over-approximates (pattern-bound names are
+  not removed from the free set): it can capture something unneeded, never miss
+  something needed, and captures are intersected with the enclosing scope anyway.
+- *Native call-with-return* (#173), generalizing what `Emit` already does for
+  handlers: every function that is the target of a `Call` gets its own separate
+  FuncIR (`bm_fn_<name>`) holding its whole `JumpBlock`-reachable family of
+  blocks and returning `[value, final_globals]`, which the call site unpacks (the
+  value stays on the stack; the globals go back into the caller's own
+  `__globals`, so Fork B's threading survives a real call boundary). Inside a
+  callee every block ends with an explicit halt returning
+  `[unit, its own __globals]`, because a block running off its own end is a halt
+  in the interpreter and must never fall through into whichever block happens to
+  follow in the flattened array. `CallDynamic` dispatches on the runtime name
+  with an `rt_str_eq` chain, like `Emit`'s event dispatch.
+  Building it exposed one thing the plan's design did not anticipate: `main` held
+  every block not owned by a handler, harmless while every function was reached
+  by `JumpBlock` (whose stores bind the callee's parameters) but wrong for a
+  function reached only by a `Call`, whose parameters are bound at no site inside
+  `main` — `codegen_x64`'s undefined-variable check correctly rejected `main`'s
+  dead copy of it. `main` now holds exactly the blocks reachable from the entry.
+- *WASM retargeting* (#174): one rewrite pass at the end of flattening, applied
+  only when the translator targets the Rust-source backend, maps each x64-runtime
+  call (`rt_list_len`/`get`/`push`, `rt_str_eq`, and the runtime-defined `fact`,
+  `query`, `type_of`, `read_file`, `write_file`) to its ordinary host equivalent,
+  one instruction for one so no jump target moves. `Box*` and `FiberYield` stay
+  native-only and fail at build time.
+
+**Tooling added.** `self_hosting/block_model/run_one_feature.patlang` runs one
+feature file (with one or several comma-separated step registrations) for fast
+per-issue verification, since the full suite takes about 35 minutes, mostly native
+compiles. `self_hosting/block_model/tools/check_step_texts_unique.sh` guards a
+silent hazard in the Gherkin runner: the exact-step registry is keyed by step
+text, and re-registering a text replaces the earlier registration with no error,
+so two features sharing a phrase quietly run the wrong check. That nearly
+happened twice while adding these scenarios. Each new step registration is now
+self-contained (it registers the shared `st_noop` steps it uses) so a feature can
+be run alone.
+
+**Pre-commit gate** (all must be green; the first is the slow one):
+
+1. `rust-runtime/target/release/pat.exe --ir-run self_hosting/block_model/run_block_model_spec_suite.patlang`
+2. `bash self_hosting/block_model/tools/native_codegen_check.sh`
+3. `bash self_hosting/block_model/tools/wasm_codegen_check.sh`
+4. `rust-runtime/target/release/pat.exe --ir-run self_hosting/tools/run_language_spec_suite.patlang`
+   (run it alone — it holds real TCP ports, and running it beside another suite
+   made its signal test fail spuriously)
+5. `sh self_hosting/block_model/tools/check_step_texts_unique.sh`
+
+**Practice worth keeping.** The full suite spawns a fresh process per fixture, and
+each reads `lower.patlang`/`interp.patlang`/`free_vars.patlang` from disk when it
+starts, so editing them mid-run silently contaminates the run (feature files too:
+each is read when the suite reaches it). Development during a long run goes in a
+scratch copy of the engine files, and results are ported back afterwards as a
+reviewed set of hunks, diffed with `--strip-trailing-cr` because the working tree
+is CRLF.
+
+**Not in the parity gate, and why.** `zs_refine_selftest`: its `zs_explore`
+dependency keeps a visited-set `Dict` and abort/progress flags in ambient state.
+The flags are a mechanical port; the visited set is a design question (an
+assoc-list would make exploration quadratic in the real engine as well), tracked
+in #179.
+
+**Still open, all tracked on the board (epic #160):** methods, inherits and traits
+(#175); `budgeted`/threads (#176); GOAP rules/goals (#177); `signal_*` (#178); the
+`zs_explore` port (#179); lowering's O(n²) statement-count cost (#156); and the
+cutover itself (#180), which is designed but not authorized.
 
 ---
 
