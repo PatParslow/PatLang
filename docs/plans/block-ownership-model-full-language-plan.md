@@ -1936,11 +1936,39 @@ loopback TCP, sends `quit` and reads the child's log, identical to `pat --ir-run
 'set_var' directly ... ambient state"). `spawn`, `sleep_ms`, `is_alive` and the
 `tcp_*` calls needed nothing new.
 
+**`zs_explore` and `zs_refine` under block-model (#179).** The issue expected the
+breadth-first search's visited set to need a new persistent structure, with a risk of
+making exploration quadratic on the real engine. Nothing was replaced. Once the
+named-object contract (#178) served `new("Dict", name)`, `send` and `get` from the
+real registry, the visited set stayed a hash lookup and `get("__vars", …)` flags
+worked as they are, so the library is byte-for-byte unchanged and the real engine's
+timings cannot have moved. The one missing host function was `object_delete`, which
+joined the host extension table. `zs_explore_selftest` (41 checks) and
+`zs_refine_selftest` (62) now run under block-model with the real engine's counts.
+The O(n) requirement is checked directly: a bounded counter with K + 1 reachable
+states is explored at K = 100, 200, 400 and 800 under both engines
+(`bench/explore_scaling.patlang`, `exploration_scaling.feature`). Real engine: 8, 17,
+32, 63 ms. Block-model: 3855, 7834, 15871, 32077 ms. Each doubles as K doubles, so
+both are linear; the block-model constant is about 480 times the real engine's, the
+price of running the interpreter on the interpreter. Comparing K = 800 with K = 100
+(8 times the states) the scenario asserts a ratio under 24, where quadratic would be
+about 64.
+
 **Still open, all tracked on the board (epic #160):** methods, inherits and traits
 (#175: the named-object registry now exists in block-model, so what remains is whether
 methods dispatch through it or through records); `thread_spawn` from block-model
-source (#176 follow-up); the `zs_explore` port (#179); and the cutover itself (#180),
-which is designed but not authorized.
+source (#184); and the cutover itself (#180), which is designed but not authorized.
+
+**Where #180 stands.** Its recorded gates are full-suite parity (the block-model
+suite, the language spec gate and the native check all green), native
+Call/ReturnValue/CallDynamic (#173, done), and issues #145 and #113 actually fixed
+rather than waived. Everything the block-model side owes has been delivered. #145
+(native `list_push`/`list_set` mutate shared storage in place) and #113 (native `==`
+on structurally identical lists built by different paths returns false) are bugs in
+the native codegen and runtime, `self_hosting/lib/{codegen_x64,x64_runtime}.patlang`,
+which the plan protects until the cutover is authorized, so they were not touched.
+They are the remaining work before an authorization decision, and the block-model
+design does not fix either.
 
 ---
 

@@ -25,12 +25,18 @@ Feature: real library selftests run under block-model with the real engine's own
   three selftests' own ambient `set_var`/`get` calls to
   `set_global`/`get_global`.
 
-  Not in this gate, deliberately: `zs_refine_selftest`, `zs_explore`'s
-  breadth-first search keeps its visited set in an ambient hash-backed
-  Dict and its abort/progress flags in ambient state, and replacing the
-  Dict with an assoc-list Handler would make exploration quadratic in the
-  REAL engine too -- a design and benchmark question tracked in its own
-  issue, not a rename.
+  zs_explore_selftest (41 checks) and zs_refine_selftest (62) are in the gate as
+  of issue #179. They were left out because zs_explore's breadth-first search
+  keeps its visited set in a hash-backed named Dict and its progress flags in
+  `set_var`/`get`, and the worry was that replacing the Dict with a list-backed
+  structure would make exploration quadratic on the REAL engine too. Nothing was
+  replaced: the named-object contract (#178, named_objects.feature) serves the Dict
+  from the real registry, so a visited-set lookup is still one hash lookup, and
+  `object_delete` joined the host extension table. The library is byte-for-byte
+  unchanged, so the real engine's timings cannot have moved.
+  exploration_scaling.feature checks that exploration under block-model is linear
+  in the number of states, at doubling sizes. Each of the two runs is slow
+  (about 2 and 9 minutes) because the interpreter here runs on the interpreter.
 
   The signal stack (issue #178): signal_discovery_selftest (34 checks),
   task_registry_selftest (7) and queue_signals_vfs_selftest (31) run unmodified.
@@ -85,3 +91,13 @@ Feature: real library selftests run under block-model with the real engine's own
     Given self_hosting/queue_signals_vfs_selftest.patlang, real and unmodified
     When it runs under block-model with real include expansion
     Then the output and counts of queue_signals_vfs_selftest match what pat --ir-run produces
+
+  Scenario: zs_explore_selftest runs under block-model
+    Given self_hosting/zs_explore_selftest.patlang, real and unmodified
+    When it runs under block-model with real include expansion
+    Then the output and counts of zs_explore_selftest match what pat --ir-run produces
+
+  Scenario: zs_refine_selftest runs under block-model
+    Given self_hosting/zs_refine_selftest.patlang, real and unmodified
+    When it runs under block-model with real include expansion
+    Then the output and counts of zs_refine_selftest match what pat --ir-run produces

@@ -24,3 +24,13 @@ Feature: the named-object contract (GitHub issue #178)
     Given a function that creates two named objects, sets and reads their properties, uses set_var and get("__vars", key), and reads an unset property
     When it runs through bm_lower_program/bi_run
     Then it prints the same five values as pat --ir-run does for the identical source
+
+  `object_delete(name)` is a real host function the shared host table does not
+  serve, so it joins the block-model host extension table (#159). zs_explore's
+  breadth-first search keeps its visited set in a named Dict, so exploration stays
+  as cheap as under the real engine: a hash lookup per state, not a scan (issue #179).
+
+  Scenario: object_delete drops a named object exactly as under the real engine
+    Given a function that creates a named Dict, sets a key, reads it, deletes the object and reads the key again
+    When it runs through bm_lower_program/bi_run
+    Then it prints 1, an empty line and unit, as pat --ir-run does for the identical source
