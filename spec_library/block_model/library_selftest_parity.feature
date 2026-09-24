@@ -32,6 +32,15 @@ Feature: real library selftests run under block-model with the real engine's own
   REAL engine too -- a design and benchmark question tracked in its own
   issue, not a rename.
 
+  The signal stack (issue #178): signal_discovery_selftest (34 checks),
+  task_registry_selftest (7) and queue_signals_vfs_selftest (31) run unmodified.
+  They needed two engine changes, each with its own scenario elsewhere:
+  the named-object contract (named_objects.feature -- `signal_wrap` uses
+  `new(class, name)`, `send` and `get`, and its owner decision was to keep that
+  contract) and handlers that call declared functions (event_dispatch.feature --
+  a `when signal` handler calls `signal_reply`). The real two-process case
+  is two_process_signals.feature.
+
   Scenario: pset_selftest runs under block-model
     Given self_hosting/pset_selftest.patlang, real and unmodified
     When it runs under block-model with real include expansion
@@ -61,3 +70,18 @@ Feature: real library selftests run under block-model with the real engine's own
     Given self_hosting/schema_bdd_selftest.patlang, real and unmodified
     When it runs under block-model with real include expansion
     Then the output and counts of schema_bdd_selftest match what pat --ir-run produces
+
+  Scenario: signal_discovery_selftest runs under block-model
+    Given self_hosting/signal_discovery_selftest.patlang, real and unmodified
+    When it runs under block-model with real include expansion
+    Then the output and counts of signal_discovery_selftest match what pat --ir-run produces
+
+  Scenario: task_registry_selftest runs under block-model
+    Given self_hosting/task_registry_selftest.patlang, real and unmodified
+    When it runs under block-model with real include expansion
+    Then the output and counts of task_registry_selftest match what pat --ir-run produces
+
+  Scenario: queue_signals_vfs_selftest runs under block-model
+    Given self_hosting/queue_signals_vfs_selftest.patlang, real and unmodified
+    When it runs under block-model with real include expansion
+    Then the output and counts of queue_signals_vfs_selftest match what pat --ir-run produces

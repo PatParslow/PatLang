@@ -57,26 +57,14 @@ Feature: library-level parity, generic host calls and list literals (Phase 18 of
   remaining blocker is now precisely diagnosed rather than bundled under
   a vague "closures/classes-with-methods, probably" guess.
 
-  Scenario: the generic CallHost fallback rejects genuine ambient-state host functions
-    Given a program that calls set_var/get in value context
-    When it is lowered
-    Then it fails with a guaranteed contract violation naming the ambient-state rationale, not a silent CallHost dispatch
-
-  A real, previously-undisclosed bug in this same generic fallback was
-  found and fixed while porting self_hosting/lib/zs_schema.patlang off
-  `new("Dict", ...)` (Phase 21/22's own investigation of Phase 18's
-  original checkpoint): `set_var`/`get`/`send` are genuine, real host
-  functions (`interp_call_host` already supports all three), so the
-  generic fallback would otherwise dispatch them straight through to the
-  REAL, process-wide ambient `__vars`/`OBJECTS` store -- completely
-  bypassing Fork B's own stated "full elimination of ambient globals"
-  guarantee for any block-model program calling them directly instead of
-  the blessed `set_global`/`get_global`/`handler_*` sugar. Confirmed
-  exploitable via a direct repro (`let x = set_var("key", 42)` then
-  reading it back through `get`) before fixing it, not assumed from
-  reasoning alone. `new` was already blocked separately (Phase 13's own
-  class-registry interception); `get`/`send`/`set_var` (in value
-  context) were not, until now.
+  (History, kept because it explains a design change.) This point used to hold a
+  scenario asserting that `set_var`, `get` and `send` called through the generic
+  fallback were REJECTED at lowering, a Phase 21 guard against reaching the
+  process-wide `__vars`/named-object registry by accident. Issue #178 replaced it:
+  the owner decided the named-object contract stays for existing callers
+  (`signal_wrap`), so those calls are now served from that registry and the
+  guarantee is stated in named_objects.feature, with a scenario proving they behave
+  as under the real engine.
 
   Scenario: a genuine host function called as a bare statement also gets the generic fallback
     Given a program that calls sb_push as a bare statement, its own return value never consumed

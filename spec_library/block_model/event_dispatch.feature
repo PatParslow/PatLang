@@ -63,3 +63,16 @@ Feature: event dispatch (Phase 10 of the full-language expansion)
   `bi_run_from` helper, which follows `jump` outcomes to completion the
   same way `bi_run`'s own top-level loop always did, instead of assuming
   one call suffices.
+
+  Phase 10 lowered a handler body with empty declared-function tables because a
+  handler ran as one bounded step with no way to follow a jump, so a handler
+  calling a declared function fell through to the host-call path and failed
+  ("host function 'shout' not supported"). Emit has run handlers through
+  `bi_run_from` since Phase 21, which completes both jumps and value calls, so the
+  tables are now passed for real (issue #178; the signal library's `when`
+  handlers call `signal_reply`, an ordinary declared function).
+
+  Scenario: a when-handler can call declared functions, as a value, as a bare statement, and in tail position
+    Given a handler that stores a declared function's result and calls it again as a statement, and a second handler whose only statement is such a call
+    When it runs through bm_lower_program/bi_run
+    Then it prints the same lines in the same order as pat --ir-run does for the identical source

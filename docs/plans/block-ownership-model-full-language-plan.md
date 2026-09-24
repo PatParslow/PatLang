@@ -1908,12 +1908,39 @@ five runs are correct (`tools/thread_safety_check.sh`). Not covered: `thread_spa
 from block-model source, since block-model closures are lists and the runtime's
 `thread_spawn` takes its own closure value.
 
+**The signal stack and the named-object contract (#178).** The issue's premise
+needed correcting twice. `signal_*` are PatLang library functions (`signals.patlang`,
+built on `tcp_*`), so this was library parity, and the owner's decision on the one
+real design question was that `signal_wrap` keeps its named-object contract:
+`new("SignalProxy", name)`, `send(name, "set", k, v)`, `get(name, k)`, plus
+`set_var` and `get("__vars", k)`, which are the same registry under a reserved name.
+Fork B removed ambient state for a program's own globals and that stands (they are
+threaded through `__globals`). Named objects were never part of `__globals`; like
+`fact`/`query` and the rule/goal/action stores they live in one process-wide registry,
+now a stated part of the contract instead of something the lowerer blocked. The
+Phase 21 guard that rejected `set_var`/`get`/`send` is gone, its scenario replaced by
+`named_objects.feature`, which proves those calls behave exactly as under the real
+engine; one-argument `new("Class")` stays the Box-based Phase 13 object.
+
+The second blocker was a Phase 10 restriction: a `when` handler was lowered with empty
+declared-function tables, so a `when signal` handler calling `signal_reply` (an
+ordinary declared function) fell through to the host-call path. Emit has run handlers
+through `bi_run_from` since Phase 21, which completes jumps and value calls, so the
+tables are passed for real (`event_dispatch.feature`, value, statement and tail
+position). With those two changes `signal_discovery_selftest` (34 checks),
+`task_registry_selftest` (7) and `queue_signals_vfs_selftest` (31) run unmodified with
+the real engine's output and counts, and the acceptance scenario passes: a block-model
+program spawns a real signal primary in another OS process, `signal_query`s it over
+loopback TCP, sends `quit` and reads the child's log, identical to `pat --ir-run`
+(`two_process_signals.feature`, RED first against the pre-change engine: "calling
+'set_var' directly ... ambient state"). `spawn`, `sleep_ms`, `is_alive` and the
+`tcp_*` calls needed nothing new.
+
 **Still open, all tracked on the board (epic #160):** methods, inherits and traits
-(#175, blocked on an owner decision about mutation semantics, since real objects are
-ambient named references and block-model values are records); `budgeted`/threads
-(#176, `thread_spawn` from block-model source); `signal_*` (#178); the `zs_explore` port (#179);
-lowering's O(n²) statement-count cost (#156); and the cutover itself
-(#180), which is designed but not authorized.
+(#175: the named-object registry now exists in block-model, so what remains is whether
+methods dispatch through it or through records); `thread_spawn` from block-model
+source (#176 follow-up); the `zs_explore` port (#179); and the cutover itself (#180),
+which is designed but not authorized.
 
 ---
 
