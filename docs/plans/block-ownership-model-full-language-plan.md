@@ -1817,10 +1817,56 @@ The flags are a mechanical port; the visited set is a design question (an
 assoc-list would make exploration quadratic in the real engine as well), tracked
 in #179.
 
+**GOAP rule and goal declarations (#177, first slice).** Phase 15 deferred `rule`
+and `goal` because they build compound `[pred, [args…]]` lists, which needed
+`BuildList` (Phase 18). Both now lower exactly as the real lowerer's own arms do
+— every argument a compile-time string token, ending in `CallHost rule_add 3` /
+`CallHost goal_def 2` — and `rule_add`, `goal_def`, `solve`, `plan`, `pursue` and
+`action_add` are served from the block-model host extension table (#159), since
+the shared table lists logic among its exclusions. A program declaring a rule and
+a goal, then calling `solve` and `pursue`, prints the same solution count, binding
+and plan length as `pat --ir-run`. As with `fact`/`query`, the rule/goal/action
+stores are process-wide thread-locals outside `__globals`, the gap Phase 15
+recorded. `activate` and `action_bind` are covered in the closures paragraphs
+below. Interpreter only: native `CallHost` enforces an OS-boundary allowlist that
+these names are not in.
+
+**First-class closures (#182).** Methods (#175), `budgeted` (#176) and `activate`
+(#177) all needed closures, so they came first. The real engine snapshots the
+whole enclosing scope at creation, which is by-value capture and fits Fork B
+naturally: `let snap = 100; let show = |u| { return snap }; let snap = 200` then
+`show(0)` is 100 under both engines. A closure is the list
+`["__closure", block_name, [captured…]]`. Creating one synthesizes a function
+block `__closure_N(__captured, params…, __globals)` whose prologue unpacks each
+captured name with `list_get`; the captured set is the body's free variables
+intersected with the names the enclosing function binds. Blocks synthesized inside
+an expression go in a compile-time registry that `bm_lower_program` drains, the
+pattern `bm_class_registry` already uses. A call `f(a)` where `f` is a parameter or
+`let` of the current function lowers to `apply(list_get(f, 1), list_get(f, 2), a)`
+over the existing `CallDynamic`. The free-variable analysis gained a `Closure`
+case, and it now counts a call's callee name as a variable reference, since a
+closure held in a local and only ever called was otherwise never captured or
+forwarded through a loop. Verified against `pat --ir-run` (`15 7 21 100 7`, and a
+loop total of 309). Interpreter only: native `CallDynamic` dispatches over declared
+functions and does not include the synthesized `__closure_N` blocks, so closures
+under native/WASM are a follow-up.
+
+**`activate` (#177, second slice).** The real lowerer does not treat `activate` as
+a host call, because host functions cannot call back into the interpreter. It
+synthesizes ordinary `Let`/`While`/`If`/`Call` AST that walks the plan, finds each
+step's bound closure with `action_lookup`, and calls it through a variable.
+Block-model applies the same rewrite to a body before lowering, for the two shapes
+the real lowerer recognizes (`let x = activate(P)` and a bare `activate(P)`), and
+serves `action_bind`/`action_lookup`/`action_base_name`/`action_label_args` from the
+host extension table. Result: `true` when every bound closure returns true, `false`
+when one is re-bound to fail, as under `pat --ir-run`.
+
 **Still open, all tracked on the board (epic #160):** methods, inherits and traits
-(#175); `budgeted`/threads (#176); GOAP rules/goals (#177); `signal_*` (#178); the
-`zs_explore` port (#179); lowering's O(n²) statement-count cost (#156); and the
-cutover itself (#180), which is designed but not authorized.
+(#175, blocked on an owner decision about mutation semantics, since real objects are
+ambient named references and block-model values are records); `budgeted`/threads
+(#176); `signal_*` (#178); the `zs_explore` port (#179); native/WASM support for
+closures (#183); lowering's O(n²) statement-count cost (#156); and the cutover itself
+(#180), which is designed but not authorized.
 
 ---
 

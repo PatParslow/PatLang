@@ -349,6 +349,247 @@ make a function called bm_lower_unsupported takes what returns nothing
   return false
 end
 
+# Issue #182: first-class closures.
+#
+# A closure is the list ["__closure", <block name>, [captured values...]],
+# built with BuildList. `|params| { body }` synthesizes a function block
+# `__closure_N` whose parameters are (__captured, params..., __globals); its
+# prologue unpacks each captured name out of __captured with list_get. The
+# captured set is the body's free variables (bm_fv_*, so an enclosing loop
+# forwards a variable used only inside a closure) intersected with the names
+# the ENCLOSING function binds -- by-value capture at creation, which is what
+# the real engine does (checked: a later rebinding is not seen) and what
+# Fork B's value semantics already give.
+#
+# An expression cannot hand a new block back to its caller, so synthesized
+# closure blocks are collected in a compile-time registry that
+# bm_lower_program drains into the program, the same pattern bm_class_registry
+# already uses. The compile-time blocks_by_name is stashed the same way so a
+# closure body can tail-call declared functions.
+
+# Issue #177: `activate PLAN`. Mirrors self_hosting/lib/lower.patlang's
+# lower_activate_stmt (which mirrors the native lowerer's lower_activate):
+# host functions cannot call back into the interpreter to run a closure, so
+# `activate` is not a host call at all but ordinary control-flow AST --
+# Let/While/If/Call -- that walks the plan, looks up each step's bound closure
+# (action_lookup), and calls it THROUGH A VARIABLE with the step's bound
+# argument values as a single list, stopping at the first step that returns
+# false. Here it is an AST -> AST rewrite applied to a function body BEFORE
+# lowering, so the synthesized lets are seen by the bound-name analysis and
+# the closure-call path (#182) handles `fn(args)` like any other closure call.
+# Only the two statement shapes the real lowerer recognizes are expanded:
+# `let x = activate(P)` and a bare `activate(P)`.
+make a function called bm_activate_synth takes plan_node, n returns synth
+  let plan_var = n + "_plan"
+  let i_var = n + "_i"
+  let ok_var = n + "_ok"
+  let label_var = n + "_label"
+  let fn_var = n + "_fn"
+  let args_var = n + "_args"
+  let r_var = n + "_r"
+  return [
+    ["Let", plan_var, plan_node, false, false],
+    ["Let", i_var, ["Num", "0"], false, true],
+    ["Let", ok_var, ["Bool", "true"], false, true],
+    ["While",
+      ["Bin", "and",
+        ["Var", ok_var],
+        ["Bin", "<", ["Var", i_var], ["Call", "to_num", [["Call", "list_len", [["Var", plan_var]]]]]]
+      ],
+      [
+        ["Let", label_var, ["Index", ["Var", plan_var], ["Var", i_var]], false, false],
+        ["Let", fn_var, ["Call", "action_lookup", [["Call", "action_base_name", [["Var", label_var]]]]], false, false],
+        ["Let", args_var, ["Call", "action_label_args", [["Var", label_var]]], false, false],
+        ["Let", r_var, ["Call", fn_var, [["Var", args_var]]], false, false],
+        ["If", ["Bin", "==", ["Var", r_var], ["Bool", "false"]],
+          [["Let", ok_var, ["Bool", "false"], true, false]],
+          []
+        ],
+        ["Let", i_var, ["Bin", "+", ["Var", i_var], ["Num", "1"]], true, false]
+      ]
+    ]
+  ]
+end
+
+make a function called bm_is_activate_call takes e returns yes
+  if list_get(e, 0) != "Call" then
+    return false
+  end
+  return (list_get(e, 1) == "activate") and (list_len(list_get(e, 2)) == 1)
+end
+
+make a function called bm_expand_activate_list takes stmts returns out
+  let out = []
+  let n = list_len(stmts)
+  let i = 0
+  while i < n do
+    let s = list_get(stmts, i)
+    let ty = list_get(s, 0)
+    if (ty == "Let") and bm_is_activate_call(list_get(s, 2)) then
+      let base = bm_next_synth_name("__act")
+      let synth = bm_activate_synth(list_get(list_get(list_get(s, 2), 2), 0), base)
+      let k = 0
+      while k < list_len(synth) do
+        let out = list_push(out, list_get(synth, k))
+        let k = k + 1
+      end
+      let out = list_push(out, list_set(s, 2, ["Var", base + "_ok"]))
+    elif (ty == "Expr") and bm_is_activate_call(list_get(s, 1)) then
+      let base = bm_next_synth_name("__act")
+      let synth = bm_activate_synth(list_get(list_get(list_get(s, 1), 2), 0), base)
+      let k = 0
+      while k < list_len(synth) do
+        let out = list_push(out, list_get(synth, k))
+        let k = k + 1
+      end
+    elif ty == "If" then
+      let s2 = list_set(s, 2, bm_expand_activate_list(list_get(s, 2)))
+      let out = list_push(out, list_set(s2, 3, bm_expand_activate_list(list_get(s, 3))))
+    elif ty == "While" then
+      let out = list_push(out, list_set(s, 2, bm_expand_activate_list(list_get(s, 2))))
+    elif ty == "Match" then
+      let arms = list_get(s, 2)
+      let new_arms = []
+      let ai = 0
+      while ai < list_len(arms) do
+        let arm = list_get(arms, ai)
+        let new_arms = list_push(new_arms, list_set(arm, 2, bm_expand_activate_list(list_get(arm, 2))))
+        let ai = ai + 1
+      end
+      let out = list_push(out, list_set(s, 2, new_arms))
+    else
+      let out = list_push(out, s)
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# Every name a function body binds: its parameters plus every `let`, at any
+# depth of if/while/match, NOT descending into closure literals (a closure is
+# its own scope). Used to recognize `f(x)` as a call through a variable.
+make a function called bm_bound_names_of takes params, body returns names
+  let names = []
+  let pn = list_len(params)
+  let pi = 0
+  while pi < pn do
+    let names = bm_union_preserving_order(names, [list_get(params, pi)])
+    let pi = pi + 1
+  end
+  return bm_collect_let_names(body, names)
+end
+
+make a function called bm_collect_let_names takes stmts, names returns out
+  let n = list_len(stmts)
+  let i = 0
+  while i < n do
+    let s = list_get(stmts, i)
+    let ty = list_get(s, 0)
+    if ty == "Let" then
+      let names = bm_union_preserving_order(names, [list_get(s, 1)])
+    elif ty == "If" then
+      let names = bm_collect_let_names(list_get(s, 2), names)
+      let names = bm_collect_let_names(list_get(s, 3), names)
+    elif ty == "While" then
+      let names = bm_collect_let_names(list_get(s, 2), names)
+    elif ty == "Match" then
+      let arms = list_get(s, 2)
+      let an = list_len(arms)
+      let ai = 0
+      while ai < an do
+        let names = bm_collect_let_names(list_get(list_get(arms, ai), 2), names)
+        let ai = ai + 1
+      end
+    end
+    let i = i + 1
+  end
+  return names
+end
+
+make a function called bm_is_fn_bound_name takes name returns yes
+  let bound = get("__vars", "bm_fn_bound_names")
+  if type_of(bound) != "list" then
+    return false
+  end
+  return bm_list_contains(bound, name)
+end
+
+make a function called bm_lower_closure_expr takes node, instrs, block_names, immut_params returns out
+  let params = list_get(node, 1)
+  let body = bm_expand_activate_list(list_get(node, 2))
+  let outer_bound = get("__vars", "bm_fn_bound_names")
+  let free = list_get(bm_fv_stmt_list(body, params, []), 1)
+  let captured = bm_intersect_preserving_order(outer_bound, free)
+  let name = bm_next_synth_name("__closure")
+  # The closure body's own scope: __captured, its params, every captured
+  # name, and whatever its body binds.
+  let inner_names = bm_bound_names_of(bm_union_preserving_order(["__captured"], bm_union_preserving_order(params, captured)), body)
+  set_var("bm_fn_bound_names", inner_names)
+  let prologue = []
+  let cn = list_len(captured)
+  let ci = 0
+  while ci < cn do
+    let prologue = list_push(prologue, ["Load", "__captured"])
+    let prologue = list_push(prologue, ["Const", "num", "" + ci])
+    let prologue = list_push(prologue, ["CallHost", "list_get", 2])
+    let prologue = list_push(prologue, ["Store", list_get(captured, ci)])
+    let ci = ci + 1
+  end
+  let inner_immut = []
+  let pn = list_len(params)
+  let pi = 0
+  while pi < pn do
+    if not bm_is_mut_param_name(list_get(params, pi)) then
+      let inner_immut = list_push(inner_immut, list_get(params, pi))
+    end
+    let pi = pi + 1
+  end
+  let known = bm_union_preserving_order(captured, params)
+  let top = bm_lower_top_level_stmt_list(body, 0, prologue, block_names, get("__vars", "bm_ct_blocks_by_name"), inner_immut, known, [], [], ["none"])
+  set_var("bm_fn_bound_names", outer_bound)
+  let closure_params = list_push(bm_union_preserving_order(["__captured"], params), "__globals")
+  let registry = get("__vars", "bm_closure_blocks")
+  let registry = list_push(registry, ["BlockIR", name, closure_params, bm_hash_rewrite_instrs(list_get(top, 0))])
+  let sn = list_len(list_get(top, 1))
+  let si = 0
+  while si < sn do
+    let registry = list_push(registry, list_get(list_get(top, 1), si))
+    let si = si + 1
+  end
+  set_var("bm_closure_blocks", registry)
+  # Creation site: ["__closure", name, [captured...]].
+  let instrs = list_push(instrs, ["Const", "str", "__closure"])
+  let instrs = list_push(instrs, ["Const", "str", name])
+  let ci = 0
+  while ci < cn do
+    let instrs = list_push(instrs, ["Load", list_get(captured, ci)])
+    let ci = ci + 1
+  end
+  let instrs = list_push(instrs, ["BuildList", cn])
+  return list_push(instrs, ["BuildList", 3])
+end
+
+# `f(a1..an)` where f is bound in the current function: unpack the closure
+# value and dispatch through CallDynamic (#153) with the captured list as the
+# first extra argument. Stack for CallDynamic: extra args, callee name,
+# __globals.
+make a function called bm_lower_closure_call takes name, args, instrs, block_names, immut_params returns out
+  let instrs = list_push(instrs, ["Load", name])
+  let instrs = list_push(instrs, ["Const", "num", "2"])
+  let instrs = list_push(instrs, ["CallHost", "list_get", 2])
+  let an = list_len(args)
+  let ai = 0
+  while ai < an do
+    let instrs = bm_lower_expr(list_get(args, ai), instrs, block_names, immut_params)
+    let ai = ai + 1
+  end
+  let instrs = list_push(instrs, ["Load", name])
+  let instrs = list_push(instrs, ["Const", "num", "1"])
+  let instrs = list_push(instrs, ["CallHost", "list_get", 2])
+  let instrs = list_push(instrs, ["Load", "__globals"])
+  return list_push(instrs, ["CallDynamic", an + 1])
+end
+
 # Issue #153: `apply(fname, a1, ..., an)` -- emits a1..an in written order
 # (deepest on the stack), then the callee-name expression, then the
 # current __globals, then ["CallDynamic", n]. interp.patlang's own case
@@ -435,6 +676,9 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
   elif ty == "Un" then
     let instrs = bm_lower_expr(list_get(node, 2), instrs, block_names, immut_params)
     return list_push(instrs, ["Un", list_get(node, 1)])
+  elif ty == "Closure" then
+    # Issue #182: see bm_lower_closure_expr.
+    return bm_lower_closure_expr(node, instrs, block_names, immut_params)
   elif ty == "Member" then
     let obj_node = list_get(node, 1)
     let prop = list_get(node, 2)
@@ -580,6 +824,11 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
       # Issue #153: value-context apply(fname, a1, ..., an) -- the callee's
       # return value stays on the stack for the surrounding expression.
       return bm_lower_apply(args, instrs, block_names, immut_params)
+    elif bm_is_fn_bound_name(name) then
+      # Issue #182: `f(a, b)` where f is a parameter or `let` of the current
+      # function -- a call through a closure value. A local shadows a
+      # declared function of the same name, as in the real engine.
+      return bm_lower_closure_call(name, args, instrs, block_names, immut_params)
     elif bm_list_contains(block_names, name) then
       # Phase 21: a call to another DECLARED block-model function, used
       # as a SUB-EXPRESSION (NOT in tail/return position) -- the real
@@ -749,6 +998,72 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
   if ty == "Let" then
     let instrs = bm_lower_expr(list_get(node, 2), instrs, block_names, immut_params)
     return list_push(instrs, ["Store", list_get(node, 1)])
+  elif ty == "RuleDecl" then
+    # Issue #177: `rule head(A, B) :- goal1(..), goal2(..).` -- sugar that
+    # lowers to EXACTLY the instruction sequence a hand-written
+    # rule_add(head_pred, [head_args...], [[pred, [args...]], ...]) call
+    # already produces, mirroring self_hosting/lib/lower.patlang's own
+    # "RuleDecl" arm. Every argument is a compile-time string TOKEN (a bare
+    # rule-head `X` is a logic-variable NAME, not a local to evaluate).
+    # Phase 15 deferred this because it builds compound lists; BuildList
+    # (Phase 18) is what makes it expressible. The host function is reached
+    # through the generic CallHost path (rule_add is in this engine's own
+    # host extension table, since the shared table excludes logic).
+    let head_args = list_get(node, 2)
+    let body = list_get(node, 3)
+    let instrs = list_push(instrs, ["Const", "str", list_get(node, 1)])
+    let hn = list_len(head_args)
+    let hi = 0
+    while hi < hn do
+      let instrs = list_push(instrs, ["Const", "str", list_get(list_get(head_args, hi), 1)])
+      let hi = hi + 1
+    end
+    let instrs = list_push(instrs, ["BuildList", hn])
+    let bn = list_len(body)
+    let bi = 0
+    while bi < bn do
+      let bodygoal = list_get(body, bi)
+      let bargs = list_get(bodygoal, 1)
+      let instrs = list_push(instrs, ["Const", "str", list_get(bodygoal, 0)])
+      let an = list_len(bargs)
+      let ai = 0
+      while ai < an do
+        let instrs = list_push(instrs, ["Const", "str", list_get(list_get(bargs, ai), 1)])
+        let ai = ai + 1
+      end
+      let instrs = list_push(instrs, ["BuildList", an])
+      let instrs = list_push(instrs, ["BuildList", 2])
+      let bi = bi + 1
+    end
+    let instrs = list_push(instrs, ["BuildList", bn])
+    let instrs = list_push(instrs, ["CallHost", "rule_add", 3])
+    return list_push(instrs, ["Store", "__bm_discard"])
+  elif ty == "GoalDecl" then
+    # Issue #177: `goal NAME { dep1(..), dep2(..) }` -- lowers to the
+    # instruction sequence a hand-written goal_def(NAME, [[pred, [args...]],
+    # ...]) call produces, mirroring the real lowerer's "GoalDecl" arm; dep
+    # args are compile-time string tokens too.
+    let deps = list_get(node, 2)
+    let instrs = list_push(instrs, ["Const", "str", list_get(node, 1)])
+    let dn = list_len(deps)
+    let di = 0
+    while di < dn do
+      let depgoal = list_get(deps, di)
+      let dargs = list_get(depgoal, 1)
+      let instrs = list_push(instrs, ["Const", "str", list_get(depgoal, 0)])
+      let an = list_len(dargs)
+      let ai = 0
+      while ai < an do
+        let instrs = list_push(instrs, ["Const", "str", list_get(list_get(dargs, ai), 1)])
+        let ai = ai + 1
+      end
+      let instrs = list_push(instrs, ["BuildList", an])
+      let instrs = list_push(instrs, ["BuildList", 2])
+      let di = di + 1
+    end
+    let instrs = list_push(instrs, ["BuildList", dn])
+    let instrs = list_push(instrs, ["CallHost", "goal_def", 2])
+    return list_push(instrs, ["Store", "__bm_discard"])
   elif ty == "Assert" then
     # require/ensure/assert -- kind is one of those three literal strings
     # (see parser.patlang's own parse_stmt: `["Assert", tx, e[0]]`).
@@ -980,6 +1295,10 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
         # with bm_lower_expr's value-context "apply" case via
         # bm_lower_apply, so the two contexts cannot drift apart.
         let instrs = bm_lower_apply(call_args, instrs, block_names, immut_params)
+        return list_push(instrs, ["Store", "__bm_discard"])
+      elif bm_is_fn_bound_name(name) then
+        # Issue #182: a call through a closure value used as a statement.
+        let instrs = bm_lower_closure_call(name, call_args, instrs, block_names, immut_params)
         return list_push(instrs, ["Store", "__bm_discard"])
       elif bm_list_contains(block_names, name) then
         # Phase 22: a real, previously-undisclosed, confirmed correctness
@@ -1684,6 +2003,9 @@ end
 
 make a function called bm_lower_program takes ast returns prog
   set_var("bm_synth_counter", 0)
+  set_var("bm_closure_blocks", [])
+  set_var("bm_fn_bound_names", [])
+  set_var("bm_ct_blocks_by_name", [])
   let stmts = bm_collect_toplevel_main(list_get(ast, 1))
   let n = list_len(stmts)
 
@@ -1745,6 +2067,7 @@ make a function called bm_lower_program takes ast returns prog
   # immut_params (its declared params WITHOUT the `mut_` prefix) is
   # recomputed here, per block -- box_set's mut-check only ever looks at
   # THIS block's own parameter list, never a caller's or callee's.
+  set_var("bm_ct_blocks_by_name", blocks_by_name)
   let blocks = []
   let events = []
   let entry = false
@@ -1755,7 +2078,7 @@ make a function called bm_lower_program takes ast returns prog
       let name = list_get(stmt, 1)
       let declared_params = list_get(stmt, 2)
       let params = list_push(declared_params, "__globals")
-      let body = list_get(stmt, 3)
+      let body = bm_expand_activate_list(list_get(stmt, 3))
       if entry == false then
         let entry = name
       end
@@ -1771,6 +2094,7 @@ make a function called bm_lower_program takes ast returns prog
         end
         let pi = pi + 1
       end
+      set_var("bm_fn_bound_names", bm_bound_names_of(declared_params, body))
       let top_result = bm_lower_top_level_stmt_list(body, 0, [], block_names, blocks_by_name, immut_params, declared_params, [], [], ["none"])
       let instrs = list_get(top_result, 0)
       let synthesized = list_get(top_result, 1)
@@ -1787,11 +2111,12 @@ make a function called bm_lower_program takes ast returns prog
       # declared function) and why this handler is never added to the
       # program's own block_names -- it's reachable only through `events`.
       let event_name = list_get(stmt, 1)
-      let body = list_get(stmt, 2)
+      let body = bm_expand_activate_list(list_get(stmt, 2))
       let handler_name = bm_next_synth_name("__on_" + event_name)
       let handler_params = ["event_name", "event_data", "__globals"]
       let handler_immut_params = ["event_name", "event_data"]
       let handler_known_locals = ["event_name", "event_data"]
+      set_var("bm_fn_bound_names", bm_bound_names_of(["event_name", "event_data"], body))
       let top_result = bm_lower_top_level_stmt_list(body, 0, [], [], [], handler_immut_params, handler_known_locals, [], [], ["none"])
       let handler_instrs = list_get(top_result, 0)
       let handler_synth = list_get(top_result, 1)
@@ -1805,6 +2130,13 @@ make a function called bm_lower_program takes ast returns prog
       let events = bm_events_register(events, event_name, handler_name)
     end
     let i = i + 1
+  end
+  # Issue #182: drain the closure blocks synthesized while lowering expressions.
+  let closure_blocks = get("__vars", "bm_closure_blocks")
+  let cbi = 0
+  while cbi < list_len(closure_blocks) do
+    let blocks = list_push(blocks, list_get(closure_blocks, cbi))
+    let cbi = cbi + 1
   end
   return ["BlockProgramIR", entry, blocks, events]
 end
