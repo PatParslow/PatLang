@@ -1847,9 +1847,11 @@ over the existing `CallDynamic`. The free-variable analysis gained a `Closure`
 case, and it now counts a call's callee name as a variable reference, since a
 closure held in a local and only ever called was otherwise never captured or
 forwarded through a loop. Verified against `pat --ir-run` (`15 7 21 100 7`, and a
-loop total of 309). Interpreter only: native `CallDynamic` dispatches over declared
-functions and does not include the synthesized `__closure_N` blocks, so closures
-under native/WASM are a follow-up.
+loop total of 309). Native and WASM followed in #183: native `CallDynamic` dispatches
+over declared functions, and a synthesized `__closure_N` block is now callable there
+too (`bm_nc_is_callable_name`), getting its own callee FuncIR and a slot in the
+`rt_str_eq` chain; every other `__` block stays non-callable. Both closure programs
+print the same values natively and under wasmtime as under `pat --ir-run`.
 
 **`activate` (#177, second slice).** The real lowerer does not treat `activate` as
 a host call, because host functions cannot call back into the interpreter. It
@@ -1864,8 +1866,8 @@ when one is re-bound to fail, as under `pat --ir-run`.
 **Still open, all tracked on the board (epic #160):** methods, inherits and traits
 (#175, blocked on an owner decision about mutation semantics, since real objects are
 ambient named references and block-model values are records); `budgeted`/threads
-(#176); `signal_*` (#178); the `zs_explore` port (#179); native/WASM support for
-closures (#183); lowering's O(n²) statement-count cost (#156); and the cutover itself
+(#176); `signal_*` (#178); the `zs_explore` port (#179);
+lowering's O(n²) statement-count cost (#156); and the cutover itself
 (#180), which is designed but not authorized.
 
 ---

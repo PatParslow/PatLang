@@ -228,3 +228,8 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
     Given a program using apply with two, one-statement and zero arguments
     When it is built and run as a real, fully native executable
     Then every applied function runs and returns exactly what the interpreter's own run does
+
+  Scenario: closures dispatch natively, capturing, returning, passing and nesting exactly as the interpreter does (issue #183)
+    Given the closure programs of closures.feature, whose closure values are called through apply's runtime dispatch
+    When each is built and run as a real, fully native executable
+    Then the native output is the same sequence of values as pat --ir-run prints for the identical source

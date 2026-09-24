@@ -92,3 +92,8 @@ Feature: the same block-model IR also compiles correctly to WASM (Block Ownershi
     Given a program using Box operations and a program using fiber_yield
     When each is translated for the WASM backend
     Then each fails while translating with a message naming the missing native heap or the x64 runtime's stack switching, and no .wasm is produced
+
+  Scenario: closures run under WASM through the same runtime dispatch (issue #183)
+    Given the closure programs of closures.feature, built for wasm32-wasip1
+    When each runs under wasmtime
+    Then the output is the same sequence of values as pat --ir-run prints for the identical source

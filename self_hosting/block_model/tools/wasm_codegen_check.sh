@@ -91,6 +91,12 @@ check_seq "a callee returning from a loop-exit block: 10 99" "$(timeout 30 wasmt
 wasm_build native_call_dynamic wasm174_call_dynamic >/dev/null
 check_seq "apply with a runtime name and arguments: 7 10 20 0" "$(timeout 30 wasmtime run self_hosting/build/wasm174_call_dynamic.wasm 2>&1)" "7 10 20 0"
 
+echo "Scenario: closures run under WASM through the same runtime dispatch (issue #183)"
+wasm_build closures_basic_reference wasm183_closures_basic >/dev/null
+check_seq "captured local 15, returned closure 7, passed closure 21, snapshot 100, closure calling closure 7" "$(timeout 30 wasmtime run self_hosting/build/wasm183_closures_basic.wasm 2>&1)" "15 7 21 100 7"
+wasm_build closures_in_loops_reference wasm183_closures_in_loops >/dev/null
+check_seq "a closure created and a closure held in a local inside a loop totals 309" "$(timeout 30 wasmtime run self_hosting/build/wasm183_closures_in_loops.wasm 2>&1)" "309"
+
 echo "Scenario: fact/query/type_of/read_file/write_file run under WASM (issue #174)"
 wasm_build native_misc_calls wasm174_misc >/dev/null
 # --dir=. grants WASI the directory write_file needs; without it the SANDBOX,

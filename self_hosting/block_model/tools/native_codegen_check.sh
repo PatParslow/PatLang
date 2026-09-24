@@ -152,6 +152,12 @@ echo "Scenario: apply() with a runtime name and arguments dispatches natively (i
 OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/native_call_dynamic.patlang issue173_call_dynamic 2>&1)
 check_seq "apply add2 returns 7, the bare-statement apply prints 10 20, the zero-argument apply returns 0" "$OUT" "7 10 20 0"
 
+echo "Scenario: closures dispatch natively, capturing, returning, passing and nesting exactly as the interpreter does (issue #183)"
+OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/closures_basic_reference.patlang issue183_closures_basic 2>&1)
+check_seq "captured local 15, returned closure 7, passed closure 21, snapshot 100, closure calling closure 7" "$OUT" "15 7 21 100 7"
+OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/closures_in_loops_reference.patlang issue183_closures_in_loops 2>&1)
+check_seq "the loop with a closure created and a closure held in a local totals 309" "$OUT" "309"
+
 echo ""
 echo "tests: $PASS passed, $FAIL failed"
 if [ "$FAIL" -eq 0 ]; then
