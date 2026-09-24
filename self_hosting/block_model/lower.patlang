@@ -676,6 +676,19 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
   elif ty == "Un" then
     let instrs = bm_lower_expr(list_get(node, 2), instrs, block_names, immut_params)
     return list_push(instrs, ["Un", list_get(node, 1)])
+  elif ty == "Budgeted" then
+    # Issue #176: ["Budgeted", ms, existing, body]. Lowered as a call to the
+    # interpreter-intercepted `bm_budgeted_run(ms, closure, existing,
+    # __globals)`, where the body is a zero-parameter closure (#182) lowered
+    # with the budget depth raised, so every `while` back-edge inside it gets
+    # a `budget_check` (see bm_lower_while).
+    let instrs = bm_lower_expr(list_get(node, 1), instrs, block_names, immut_params)
+    set_var("bm_budgeted_depth", get("__vars", "bm_budgeted_depth") + 1)
+    let instrs = bm_lower_closure_expr(["Closure", [], list_get(node, 3)], instrs, block_names, immut_params)
+    set_var("bm_budgeted_depth", get("__vars", "bm_budgeted_depth") - 1)
+    let instrs = bm_lower_expr(list_get(node, 2), instrs, block_names, immut_params)
+    let instrs = list_push(instrs, ["Load", "__globals"])
+    return list_push(instrs, ["CallHost", "bm_budgeted_run", 4])
   elif ty == "Closure" then
     # Issue #182: see bm_lower_closure_expr.
     return bm_lower_closure_expr(node, instrs, block_names, immut_params)
@@ -1494,6 +1507,11 @@ make a function called bm_apply_continuation takes k, instrs, pending returns ou
     let target_name = list_get(k, 1)
     let captured = list_get(k, 2)
     let jump_params = list_get(k, 3)
+    if list_len(k) > 4 then
+      # Issue #176: a loop back-edge inside a budgeted block.
+      let instrs = list_push(instrs, ["CallHost", "budget_check", 0])
+      let instrs = list_push(instrs, ["Store", "__bm_discard"])
+    end
     let instrs = bm_push_loads(instrs, captured)
     let instrs = list_push(instrs, ["Load", "__globals"])
     let instrs = list_push(instrs, ["JumpBlock", target_name, jump_params])
@@ -1782,6 +1800,11 @@ make a function called bm_lower_while takes stmt, stmts, idx, instrs, block_name
   # fixed as part of this same phase, not merely worked around for the
   # NEW if-with-nested-while case this phase also adds.
   let back_edge_k = ["jump", head_name, captured, jump_params]
+  if get("__vars", "bm_budgeted_depth") > 0 then
+    # Issue #176: lexically inside a budgeted block -- the back-edge yields
+    # when the deadline is near (bm_apply_continuation reads the 5th slot).
+    let back_edge_k = list_push(back_edge_k, true)
+  end
   let head_instrs = bm_lower_expr(cond, [], block_names, immut_params)
   let head_instrs = list_push(head_instrs, ["JumpIfFalse", 0])
   let jif_pos = list_len(head_instrs) - 1
@@ -2004,6 +2027,7 @@ end
 make a function called bm_lower_program takes ast returns prog
   set_var("bm_synth_counter", 0)
   set_var("bm_closure_blocks", [])
+  set_var("bm_budgeted_depth", 0)
   set_var("bm_fn_bound_names", [])
   set_var("bm_ct_blocks_by_name", [])
   let stmts = bm_collect_toplevel_main(list_get(ast, 1))

@@ -97,3 +97,8 @@ Feature: the same block-model IR also compiles correctly to WASM (Block Ownershi
     Given the closure programs of closures.feature, built for wasm32-wasip1
     When each runs under wasmtime
     Then the output is the same sequence of values as pat --ir-run prints for the identical source
+
+  Scenario: budgeted blocks fail at build time under WASM, naming why (issue #176)
+    Given a program using budgeted(ms) { ... }
+    When it is built for wasm32-wasip1
+    Then translation is rejected, naming the missing fiber host functions, and no .wasm is produced

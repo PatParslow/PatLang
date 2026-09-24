@@ -73,6 +73,13 @@ include "../lib/interp.patlang"
 # some real library actually calls under block-model -- never speculatively.
 # Returns ["Ok", value], or ["Unhandled"] for any name it does not own.
 make a function called bi_call_host_extension takes name, args returns result
+  if name == "budget_check" then
+    # Issue #176: yields the current fiber when its budgeted deadline is
+    # near; a no-op outside any fiber. Injected on `while` back-edges inside
+    # a budgeted block by lower.patlang.
+    budget_check()
+    return ["Ok", true]
+  end
   if name == "sc_substr" then
     return ["Ok", sc_substr(list_get(args, 0), list_get(args, 1), list_get(args, 2))]
   end
@@ -121,6 +128,30 @@ end
 # measurable form of "most mutations should be proven safe before this
 # code ever runs" (design doc section 3.5). Seeded in bi_run, alongside
 # bm_heap_ready.
+# Issue #176: `budgeted(ms, handle) { body }`. args = [ms, closure, existing,
+# globals]; `closure` is the body lowered as a zero-parameter closure value
+# ["__closure", block_name, [captured...]]. Runs it through the REAL
+# budgeted_run host function, whose fiber entry is bi_budget_entry below --
+# a declared function of this very program, since every driver includes this
+# file. Returns ["done", value] or ["paused", handle], the real engine's own
+# shape. On resume (`existing` is a handle) the host ignores the entry
+# argument: the fiber's own call stack is the saved state.
+make a function called bi_budgeted_run takes prog, args returns result
+  let closure = list_get(args, 1)
+  return budgeted_run(list_get(args, 0), "bi_budget_entry", [prog, list_get(closure, 1), list_get(closure, 2), list_get(args, 3)], list_get(args, 2))
+end
+
+# The fiber body: run the closure block with its captured list and the
+# enclosing __globals, and hand back the body's own value. Its final globals
+# are discarded (documented limit in budgeted.feature).
+make a function called bi_budget_entry takes arg returns value
+  let prog = list_get(arg, 0)
+  let blk = bi_find_block(prog, list_get(arg, 1))
+  let locs = bm_loc_set(bm_loc_new(), list_get(bi_block_params(blk), 0), list_get(arg, 2))
+  let locs = bm_loc_set(locs, "__globals", list_get(arg, 3))
+  return list_get(bi_run_from(prog, blk, locs), 0)
+end
+
 make a function called bm_note_runtime_check_performed returns done
   set_var("bm_runtime_check_count", get("__vars", "bm_runtime_check_count") + 1)
   return true
@@ -663,7 +694,15 @@ make a function called bi_run_block takes prog, blk, locs returns outcome
       # other unrecoverable condition (ContractFail, bm_lower_unsupported)
       # rather than silently pushing a placeholder value.
       let popped = bm_st_pop_n(stack, list_get(instr, 2))
-      let call_result = interp_call_host(list_get(instr, 1), list_get(popped, 0))
+      if list_get(instr, 1) == "bm_budgeted_run" then
+        # Issue #176: needs the RUNNING PROGRAM (the fiber entry function
+        # re-enters this interpreter on a closure block), which a host
+        # function's `(name, args)` signature cannot carry -- so it is
+        # handled here, where `prog` is in scope.
+        let call_result = ["Ok", bi_budgeted_run(prog, list_get(popped, 0))]
+      else
+        let call_result = interp_call_host(list_get(instr, 1), list_get(popped, 0))
+      end
       if list_get(call_result, 0) == "Err" then
         # Issue #159: the shared dispatcher (lib/interp.patlang, protected
         # by the plan's Phase 20 rule) has no answer -- try this engine's

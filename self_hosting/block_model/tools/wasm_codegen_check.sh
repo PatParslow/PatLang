@@ -116,6 +116,17 @@ fi
 OUT=$(wasm_build native_fiber_yield wasm174_fiber)
 check "a FiberYield program is rejected while translating, naming the x64 runtime's stack switching" "$OUT" "fibers need the x64 runtime"
 
+echo "Scenario: budgeted blocks are fiber-backed and fail at BUILD time under WASM, naming why (issue #176)"
+OUT=$(wasm_build budgeted_basic_reference wasm176_budgeted)
+check "a budgeted program is rejected while translating, naming the missing fiber host functions" "$OUT" "the Rust-source backend has no fiber host functions"
+if [ -f self_hosting/build/wasm176_budgeted.wasm ]; then
+  echo "  FAIL: a .wasm was produced for a budgeted program"
+  FAIL=$((FAIL + 1))
+else
+  echo "  ok: no .wasm is produced for a budgeted program"
+  PASS=$((PASS + 1))
+fi
+
 echo ""
 echo "tests: $PASS passed, $FAIL failed"
 if [ "$FAIL" -eq 0 ]; then

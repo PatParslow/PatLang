@@ -1863,10 +1863,31 @@ serves `action_bind`/`action_lookup`/`action_base_name`/`action_label_args` from
 host extension table. Result: `true` when every bound closure returns true, `false`
 when one is re-bound to fail, as under `pat --ir-run`.
 
+**`budgeted` blocks (#176, first half).** `budgeted(ms[, handle]) { body }` is an
+expression evaluating to `["done", value]` or `["paused", handle]`; handing the
+handle back resumes the body where it stopped. The real lowerer compiles the body
+to a synthesized function run by the host `budgeted_run` inside a fiber, and injects
+`budget_check` on every `while` back-edge lexically inside it. A host function cannot
+call back into a block-model function, so block-model reuses what it has: the body
+lowers as a zero-parameter closure (#182), the interpreter intercepts
+`bm_budgeted_run` itself (it alone holds the running program) and calls the real
+`budgeted_run` with `bi_budget_entry` as the fiber entry, which re-enters
+`bi_run_from` on the closure block; a loop back-edge inside the body carries a fifth
+slot on its continuation that makes `bm_apply_continuation` emit the check. A fiber's
+own call stack is the saved state, so resumption needs nothing new. Checked first:
+`budgeted_run`/`budget_check` are callable from plain source, `set_var` state is
+visible inside a fiber, and a zero budget pauses once per back-edge, so scenarios are
+deterministic. Result: `done 10 10 5` from block-model and from `pat --ir-run`.
+Limits: the body's own changes to globals are not written back to the caller (the
+real engine's globals are ambient); native rejects the host name at codegen and WASM
+rejects it at translation time, since neither runtime has fiber host functions for
+this. `thread_spawn`/`parallel_map` remain blocked on the refcount-thread-safety
+design note.
+
 **Still open, all tracked on the board (epic #160):** methods, inherits and traits
 (#175, blocked on an owner decision about mutation semantics, since real objects are
 ambient named references and block-model values are records); `budgeted`/threads
-(#176); `signal_*` (#178); the `zs_explore` port (#179);
+(#176, threads half); `signal_*` (#178); the `zs_explore` port (#179);
 lowering's O(n²) statement-count cost (#156); and the cutover itself
 (#180), which is designed but not authorized.
 
