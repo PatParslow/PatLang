@@ -116,6 +116,42 @@ OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/b
 check "list_len(xs) on a real List literal prints 3" "$OUT" "3"
 check "indexing xs[1] prints 20" "$OUT" "20"
 
+# Issue #173: Call / ReturnValue / CallDynamic. check_seq is stricter than
+# check: it normalizes all whitespace/newlines to single spaces and requires
+# the expected values to appear as ONE ADJACENT SEQUENCE, so both the values
+# and their ORDER are verified (a substring check would let "1 2" pass "2 1").
+check_seq() {
+  label="$1"
+  actual=$(echo "$2" | tr -s '\r\n\t ' ' ')
+  expected="$3"
+  case "$actual" in
+    *"$expected"*)
+      echo "  ok: $label"
+      PASS=$((PASS + 1))
+      ;;
+    *)
+      echo "  FAIL: $label (want the sequence \"$expected\" in: $actual)"
+      FAIL=$((FAIL + 1))
+      ;;
+  esac
+}
+
+echo "Scenario: a declared function called as a value, including recursion, runs through real native codegen (issue #173)"
+OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/native_call_value.patlang issue173_call_value 2>&1)
+check_seq "double(5) + 1 prints 11, then fact_r(5) prints 120" "$OUT" "11 120"
+
+echo "Scenario: a callee's final globals come back through the native Call and become the caller's (issue #173)"
+OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/native_call_globals.patlang issue173_call_globals 2>&1)
+check_seq "the returned value 101 then the caller's own counter 42 (40 + 2 from inside the callee)" "$OUT" "101 42"
+
+echo "Scenario: a callee whose return runs in a synthesized loop-exit block returns that block's own state (issue #173)"
+OUT=$(timeout 60 bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/native_call_loop.patlang issue173_call_loop 2>&1)
+check_seq "sum_to(5) prints 10, then the caller continues and prints 99" "$OUT" "10 99"
+
+echo "Scenario: apply() with a runtime name and arguments dispatches natively (issue #173)"
+OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/native_call_dynamic.patlang issue173_call_dynamic 2>&1)
+check_seq "apply add2 returns 7, the bare-statement apply prints 10 20, the zero-argument apply returns 0" "$OUT" "7 10 20 0"
+
 echo ""
 echo "tests: $PASS passed, $FAIL failed"
 if [ "$FAIL" -eq 0 ]; then

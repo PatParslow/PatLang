@@ -39,3 +39,56 @@ Feature: the same block-model IR also compiles correctly to WASM (Block Ownershi
     Given the same benchmark loop used for the engine's own speed comparison, at N=800000
     When it is compiled via emit_program_rs and run under a real WASM host
     Then it prints the exact value every other execution path already agreed on
+
+  A regression and a re-verification (GitHub issues #181 and #174). This
+  feature's own check script had been failing every scenario since Phase 19,
+  unnoticed: Phase 19 made `main`'s initialization call `bm_heap_init`
+  unconditionally, which the WASM path (`emit_program_rs`, no heap chunk) does
+  not have, so EVERY WASM program failed at startup on a function it never
+  used. It went unnoticed because the check is a standalone script that
+  nothing runs -- it is now part of the pre-commit gate recorded in the plan.
+  The fix emits the heap initialization only for a program that contains a
+  Box instruction.
+
+  Fixing that exposed the real remaining WASM gap, measured rather than
+  guessed by building every native fixture for `wasm32-wasip1`: the
+  hand-emitted `Global*`/`Handler*` walks and the `Emit` and `apply()`
+  dispatch chains call `x64_runtime.patlang`'s own `rt_list_len`,
+  `rt_list_get`, `rt_list_push` and `rt_str_eq`, and `Fact`/`Query`/
+  `TypeOf`/`ReadFile`/`WriteFile` call runtime-defined functions; none exist
+  under the Rust-source backend. When the translator targets that backend
+  (`print_op` = `"CallHost"`) a single rewrite pass at the end of flattening
+  retargets each to its ordinary host equivalent (`CallHost list_len` and so
+  on, `Bin "=="` for the string comparison) -- one instruction for one, so no
+  jump target moves. The heap (`Box*`) and fibers are native-only BY DESIGN
+  (they depend on `heap_chunk.obj` and the x64 runtime's own stack switching)
+  and now fail at BUILD time naming the reason, instead of at startup or
+  partway through a run.
+
+  Each scenario below is checked as an ORDERED, adjacent sequence of printed
+  values against what the native build prints for the same fixture.
+
+  Scenario: Global and Handler operations run correctly under WASM
+    Given programs that set a global read several blocks later, and register two handler names to two values
+    When they are compiled via emit_program_rs and run under a real WASM host
+    Then they print exactly what the native build prints
+
+  Scenario: Emit's event dispatch runs correctly under WASM
+    Given a program with two handlers on one event, a handler that sets a global, and statements after each emit
+    When it is compiled via emit_program_rs and run under a real WASM host
+    Then handlers fire in declaration order, the emitter sees the handler's global, and control returns
+
+  Scenario: call-with-return, including apply() with arguments, runs correctly under WASM
+    Given programs calling a function as a value, threading globals through a call, returning from a loop-exit block, and using apply
+    When they are compiled via emit_program_rs and run under a real WASM host
+    Then they print exactly what the native build prints
+
+  Scenario: fact, query, type_of, read_file and write_file run correctly under WASM
+    Given a program using all five, given access to the working directory by the WASM host
+    When it is compiled via emit_program_rs and run under a real WASM host
+    Then it prints exactly what the native build prints
+
+  Scenario: Box and FiberYield programs are rejected at build time under WASM, naming why
+    Given a program using Box operations and a program using fiber_yield
+    When each is translated for the WASM backend
+    Then each fails while translating with a message naming the missing native heap or the x64 runtime's stack switching, and no .wasm is produced

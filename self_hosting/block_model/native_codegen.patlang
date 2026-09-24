@@ -346,7 +346,152 @@ end
 # JumpBlock is expanded here directly into Store (reverse param order,
 # matching what's already on the stack) + a placeholder Jump, later
 # resolved to the target block's own absolute start position.
-make a function called bm_nc_translate_block_instrs takes block_name, instrs, print_op, prog returns out
+# Issue #173: native call-with-return (Call / ReturnValue / CallDynamic).
+#
+# Every function that is the target of a Call anywhere in the program is
+# compiled as its OWN separate FuncIR, named by bm_nc_fn_name, containing
+# that function's whole JumpBlock-reachable family of blocks (the same
+# family notion Emit already uses for a handler, bm_nc_collect_block_closure).
+# It returns a two-element list [value, final_globals]; a call site
+# unpacks it. The function's blocks ALSO remain in `main` when reachable
+# there by an ordinary JumpBlock tail call -- the same block compiled into
+# two FuncIRs is fine, each FuncIR having its own local namespace.
+make a function called bm_nc_fn_name takes name returns fname
+  return "bm_fn_" + name
+end
+
+# A synthesized block (loop head/exit, handler, match temp...) is named
+# with a leading "__"; a declared function never is.
+make a function called bm_nc_is_synth_name takes name returns yes
+  if name.length < 2 then
+    return false
+  end
+  return substr(name, 0, 2) == "__"
+end
+
+# Stack on entry: [r], r = [value, final_globals] as a native Call returned
+# it. On exit: [value], and this block's own __globals holds final_globals.
+make a function called bm_nc_emit_call_unpack takes out, block_name, uniq returns out2
+  let r_l = bm_nc_local(block_name, uniq, "r")
+  let out = list_push(out, ["Store", r_l])
+  let out = list_push(out, ["Load", r_l])
+  let out = list_push(out, ["Const", "num", "1"])
+  let out = list_push(out, ["CallHost", "list_get", 2])
+  let out = list_push(out, ["Store", bm_nc_prefix(block_name, "__globals")])
+  let out = list_push(out, ["Load", r_l])
+  let out = list_push(out, ["Const", "num", "0"])
+  let out = list_push(out, ["CallHost", "list_get", 2])
+  return out
+end
+
+# Every function name that needs its own callee FuncIR: each name some Call
+# instruction names, plus -- if the program contains any CallDynamic, whose
+# callee is a runtime value -- every declared function.
+make a function called bm_nc_call_roots takes prog returns roots
+  let blocks = bi_program_blocks(prog)
+  let bn = list_len(blocks)
+  let roots = []
+  let any_dynamic = false
+  let bi = 0
+  while bi < bn do
+    let instrs = bi_block_instrs(list_get(blocks, bi))
+    let n = list_len(instrs)
+    let i = 0
+    while i < n do
+      let instr = list_get(instrs, i)
+      let op = list_get(instr, 0)
+      if op == 938836 then # "Call"
+        let callee = list_get(instr, 1)
+        if not bm_list_contains(roots, callee) then
+          let roots = list_push(roots, callee)
+        end
+      elif op == 915129 then # "CallDynamic"
+        let any_dynamic = true
+      end
+      let i = i + 1
+    end
+    let bi = bi + 1
+  end
+  if any_dynamic then
+    let bi = 0
+    while bi < bn do
+      let name = bi_block_name(list_get(blocks, bi))
+      if (not bm_nc_is_synth_name(name)) and (not bm_list_contains(roots, name)) then
+        let roots = list_push(roots, name)
+      end
+      let bi = bi + 1
+    end
+  end
+  return roots
+end
+
+# CallDynamic: a runtime name chooses the callee, so this emits a chain of
+# rt_str_eq comparisons, one per declared function that takes AT LEAST the
+# n_extra arguments supplied -- the same dispatch shape Emit uses for an
+# event name. Stack on entry: extra args (written order, deepest first),
+# then the callee-name string, then __globals on top. Parameters the call
+# does not supply are passed as unit (the interpreter leaves them unbound;
+# reading one is a loud error there). A name that matches nothing reaches a
+# guaranteed contract failure, which does not return.
+make a function called bm_nc_emit_call_dynamic takes out, block_name, uniq, n_extra, prog returns out2
+  let g_l = bm_nc_local(block_name, uniq, "g")
+  let f_l = bm_nc_local(block_name, uniq, "f")
+  let out = list_push(out, ["Store", g_l])
+  let out = list_push(out, ["Store", f_l])
+  let k = n_extra - 1
+  while k >= 0 do
+    let out = list_push(out, ["Store", bm_nc_local(block_name, uniq, "a" + k)])
+    let k = k - 1
+  end
+  let blocks = bi_program_blocks(prog)
+  let bn = list_len(blocks)
+  let done_positions = []
+  let bi = 0
+  while bi < bn do
+    let cname = bi_block_name(list_get(blocks, bi))
+    let declared = list_len(bi_block_params(list_get(blocks, bi))) - 1
+    if (not bm_nc_is_synth_name(cname)) and (declared >= n_extra) then
+      let out = list_push(out, ["Load", f_l])
+      let out = list_push(out, ["Const", "str", cname])
+      let out = list_push(out, ["Call", "rt_str_eq", 2])
+      let out = list_push(out, ["__RawJumpIfFalse", 0])
+      let jif_pos = list_len(out) - 1
+      let ai = 0
+      while ai < n_extra do
+        let out = list_push(out, ["Load", bm_nc_local(block_name, uniq, "a" + ai)])
+        let ai = ai + 1
+      end
+      let pi = n_extra
+      while pi < declared do
+        let out = list_push(out, ["Const", "unit", ""])
+        let pi = pi + 1
+      end
+      let out = list_push(out, ["Load", g_l])
+      let out = list_push(out, ["Call", bm_nc_fn_name(cname), declared + 1])
+      let out = bm_nc_emit_call_unpack(out, block_name, "" + uniq + "_" + bi)
+      let out = list_push(out, ["__RawJump", 0])
+      let done_positions = list_push(done_positions, list_len(out) - 1)
+      let out = list_set(out, jif_pos, ["__RawJumpIfFalse", list_len(out)])
+    end
+    let bi = bi + 1
+  end
+  let out = list_push(out, ["Const", "str", "bm_native"])
+  let out = list_push(out, ["Const", "str", "assert"])
+  let out = list_push(out, ["Const", "str", "apply: no declared function with that name and enough parameters"])
+  let out = list_push(out, ["Const", "bool", "false"])
+  let out = list_push(out, ["CallHost", "contract_check", 4])
+  let out = list_push(out, ["Store", bm_nc_prefix(block_name, "__bm_discard")])
+  let out = list_push(out, ["Const", "unit", ""])
+  let end_pos = list_len(out)
+  let di = 0
+  while di < list_len(done_positions) do
+    let out = list_set(out, list_get(done_positions, di), ["__RawJump", end_pos])
+    let di = di + 1
+  end
+  return out
+end
+
+make a function called bm_nc_translate_block_instrs takes block_name, instrs, print_op, prog, mode returns out
   # Returns [translated_instrs, index_map] -- index_map[k] is the
   # position in translated_instrs where ORIGINAL instrs[k] starts, for
   # k in 0..n (index_map[n] is the "one past the end" sentinel, for a
@@ -629,12 +774,57 @@ make a function called bm_nc_translate_block_instrs takes block_name, instrs, pr
       # every possible CallHost name; genuinely untested beyond whatever
       # names this phase's own native_codegen_check.sh scenarios cover.
       let out = list_push(out, ["CallHost", list_get(instr, 1), list_get(instr, 2)])
+    elif op == 938836 then # "Call"
+      # Issue #173: a declared function called with a return value. The
+      # callee is its own separate FuncIR (bm_nc_build_callee_funcirs),
+      # reached by an ordinary native Call exactly as Emit reaches a
+      # handler; the args and the current __globals are already on the
+      # stack in the callee's own declared-param order (lower.patlang's
+      # own "args, then Load __globals" convention). It returns the
+      # two-element list [value, final_globals]; unpack both here.
+      let out = list_push(out, ["Call", bm_nc_fn_name(list_get(instr, 1)), list_get(instr, 2)])
+      let out = bm_nc_emit_call_unpack(out, block_name, i)
+    elif op == 131889 then # "ReturnValue"
+      # Issue #173: pops one value and ends the CURRENT function with it.
+      # Inside a callee FuncIR that means returning [value, globals] (the
+      # convention Call above unpacks); in `main` or a handler there is no
+      # caller to return a value to, so the value is discarded and the
+      # function ends the way it would have by running off its own end.
+      if mode == "callee" then
+        let out = list_push(out, ["Load", bm_nc_prefix(block_name, "__globals")])
+        let out = list_push(out, ["BuildList", 2])
+        let out = list_push(out, ["Return"])
+      elif mode == "handler" then
+        let out = list_push(out, ["Store", bm_nc_prefix(block_name, "__bm_discard")])
+        let out = list_push(out, ["Load", bm_nc_prefix(block_name, "__globals")])
+        let out = list_push(out, ["Return"])
+      else
+        let out = list_push(out, ["Store", bm_nc_prefix(block_name, "__bm_discard")])
+        let out = list_push(out, ["Const", "unit", ""])
+        let out = list_push(out, ["Return"])
+      end
+    elif op == 915129 then # "CallDynamic"
+      let out = bm_nc_emit_call_dynamic(out, block_name, i, list_get(instr, 1), prog)
     else
       bm_nc_unsupported("instruction hash '" + op + "'")
     end
     let i = i + 1
   end
   let index_map = list_push(index_map, list_len(out))
+  # Issue #173: inside a callee FuncIR every block ends with an explicit
+  # halt that returns [unit, this block's own final __globals] -- a block
+  # that runs off its own end is a HALT in the interpreter (bi_run_from
+  # returns), never a fall-through into whichever block happens to follow
+  # in the flattened array. Appended AFTER the end-of-block sentinel above,
+  # so a Jump/JumpIfFalse whose target is "one past the last instruction"
+  # (the sentinel) lands on this halt, exactly as the interpreter's own
+  # "pc == length" ends the block.
+  if mode == "callee" then
+    let out = list_push(out, ["Const", "unit", ""])
+    let out = list_push(out, ["Load", bm_nc_prefix(block_name, "__globals")])
+    let out = list_push(out, ["BuildList", 2])
+    let out = list_push(out, ["Return"])
+  end
   return [out, index_map]
 end
 
@@ -786,7 +976,7 @@ end
 # targets to absolute indices and resolves __JumpBlockTarget/__RawJump*
 # placeholders -- unchanged from Phase 9/13/19's own original logic,
 # just no longer hardcoded to bi_program_blocks(prog) as a whole.
-make a function called bm_nc_flatten_blocks takes prog, blocks, init_instrs, print_op returns flat
+make a function called bm_nc_flatten_blocks takes prog, blocks, init_instrs, print_op, mode returns flat
   let bn = list_len(blocks)
   let translated = []
   let starts = []
@@ -795,7 +985,7 @@ make a function called bm_nc_flatten_blocks takes prog, blocks, init_instrs, pri
   while bi < bn do
     let blk = list_get(blocks, bi)
     let name = bi_block_name(blk)
-    let result = bm_nc_translate_block_instrs(name, bi_block_instrs(blk), print_op, prog)
+    let result = bm_nc_translate_block_instrs(name, bi_block_instrs(blk), print_op, prog, mode)
     let t = list_get(result, 0)
     let index_map = list_get(result, 1)
     let translated = list_push(translated, [name, t, index_map])
@@ -847,7 +1037,58 @@ make a function called bm_nc_flatten_blocks takes prog, blocks, init_instrs, pri
     end
     let bi = bi + 1
   end
+  # Issue #174: the Rust-source backend (print_op == "CallHost", the
+  # wasm32-wasip1 path) has no x64 runtime, so retarget the runtime calls the
+  # translations above emit.
+  if print_op == "CallHost" then
+    return bm_nc_wasm_rewrite(flat)
+  end
   return flat
+end
+
+# Issue #174: retargets a flattened instruction stream for the Rust-source /
+# WASM backend. The translations above emit calls to x64_runtime.patlang's
+# own rt_* functions (assoc-list walks for Global*/Handler*, event and
+# apply() dispatch chains) and to runtime-defined fact/query/type_of/
+# read_file/write_file; none exist under emit_program_rs, so each becomes
+# its ordinary host equivalent. One instruction is replaced by exactly one,
+# so no jump target moves. The heap (Box*) and fibers are native-only BY
+# DESIGN -- they depend on heap_chunk.obj and the x64 runtime's own stacks --
+# and fail HERE, at translation time, naming the reason, rather than at
+# program start (#181) or partway through a run.
+make a function called bm_nc_wasm_rewrite takes flat returns out
+  let n = list_len(flat)
+  let out = []
+  let i = 0
+  while i < n do
+    let instr = list_get(flat, i)
+    if list_get(instr, 0) == "Call" then
+      let nm = list_get(instr, 1)
+      if nm == "rt_list_len" then
+        let out = list_push(out, ["CallHost", "list_len", 1])
+      elif nm == "rt_list_get" then
+        let out = list_push(out, ["CallHost", "list_get", 2])
+      elif nm == "rt_list_push" then
+        let out = list_push(out, ["CallHost", "list_push", 2])
+      elif nm == "rt_str_eq" then
+        let out = list_push(out, ["Bin", "=="])
+      elif (nm == "fact") or (nm == "query") or (nm == "type_of") or (nm == "read_file") or (nm == "write_file") then
+        let out = list_push(out, ["CallHost", nm, list_get(instr, 2)])
+      elif nm == "fiber_yield" then
+        bm_nc_unsupported("FiberYield under WASM -- fibers need the x64 runtime's own stack switching")
+        let out = list_push(out, instr)
+      elif (substr(nm, 0, 3) == "bm_") and (substr(nm, 0, 6) != "bm_fn_") then
+        bm_nc_unsupported("'" + nm + "' under WASM -- Box instructions need the native refcounted heap (heap_chunk.obj), which the Rust-source backend does not have")
+        let out = list_push(out, instr)
+      else
+        let out = list_push(out, instr)
+      end
+    else
+      let out = list_push(out, instr)
+    end
+    let i = i + 1
+  end
+  return out
 end
 
 # Phase 19 (Emit): one real, separate FuncIR per handler root -- what
@@ -881,7 +1122,7 @@ make a function called bm_nc_build_handler_funcirs takes prog, closures, print_o
       end
       let abi = abi + 1
     end
-    let h_flat = bm_nc_flatten_blocks(prog, hblocks, [], print_op)
+    let h_flat = bm_nc_flatten_blocks(prog, hblocks, [], print_op, "handler")
     let h_flat = list_push(h_flat, ["Load", bm_nc_prefix(root, "__globals")])
     let h_flat = list_push(h_flat, ["Return"])
     let params = [bm_nc_prefix(root, "event_name"), bm_nc_prefix(root, "event_data"), bm_nc_prefix(root, "__globals")]
@@ -889,6 +1130,73 @@ make a function called bm_nc_build_handler_funcirs takes prog, closures, print_o
     let ci = ci + 1
   end
   return funcirs
+end
+
+# Issue #173: one real, separate FuncIR per Call target (bm_nc_call_roots),
+# named bm_nc_fn_name(root), whose params are the ROOT block's own declared
+# params (bi_block_params -- "__globals" already last) under the same
+# bm_nc_prefix its own body Loads them from, so the incoming native Call
+# args land in the names the body expects. Its body is the root's whole
+# JumpBlock-reachable family flattened in "callee" mode, where every block
+# ends with an explicit halt returning [unit, own __globals] and a
+# ReturnValue returns [value, own __globals] -- the [value, globals] pair a
+# call site unpacks. Blocks keep bi_program_blocks(prog)'s own relative
+# order, the same "descendants stay contiguous and correctly ordered"
+# property the handler builder above relies on.
+make a function called bm_nc_build_callee_funcirs takes prog, roots, print_op returns funcirs
+  let all_blocks = bi_program_blocks(prog)
+  let abn = list_len(all_blocks)
+  let rn = list_len(roots)
+  let funcirs = []
+  let ri = 0
+  while ri < rn do
+    let root = list_get(roots, ri)
+    let member_names = bm_nc_collect_block_closure(prog, root)
+    let cblocks = []
+    let abi = 0
+    while abi < abn do
+      let blk = list_get(all_blocks, abi)
+      if bm_list_contains(member_names, bi_block_name(blk)) then
+        let cblocks = list_push(cblocks, blk)
+      end
+      let abi = abi + 1
+    end
+    let flat = bm_nc_flatten_blocks(prog, cblocks, [], print_op, "callee")
+    let root_params = bi_block_params(bi_find_block(prog, root))
+    let params = []
+    let pi = 0
+    while pi < list_len(root_params) do
+      let params = list_push(params, bm_nc_prefix(root, list_get(root_params, pi)))
+      let pi = pi + 1
+    end
+    let funcirs = list_push(funcirs, ["FuncIR", bm_nc_fn_name(root), params, flat, []])
+    let ri = ri + 1
+  end
+  return funcirs
+end
+
+# Issue #181: true when any block anywhere contains a Box instruction (the
+# only instructions that touch heap.patlang's own refcounted heap):
+# BoxNew 258931, BoxGet 251305, BoxSet 264373, BoxSetUnchecked 902425,
+# BoxShare 992319 -- the same opcode hashes interp.patlang dispatches on.
+make a function called bm_nc_program_uses_heap takes prog returns yes
+  let blocks = bi_program_blocks(prog)
+  let bn = list_len(blocks)
+  let bi = 0
+  while bi < bn do
+    let instrs = bi_block_instrs(list_get(blocks, bi))
+    let n = list_len(instrs)
+    let i = 0
+    while i < n do
+      let op = list_get(list_get(instrs, i), 0)
+      if (op == 258931) or (op == 251305) or (op == 264373) or (op == 902425) or (op == 992319) then
+        return true
+      end
+      let i = i + 1
+    end
+    let bi = bi + 1
+  end
+  return false
 end
 
 # The whole translation: partitions bi_program_blocks(prog) into `main`
@@ -907,11 +1215,21 @@ make a function called bm_to_real_funcir takes prog, print_op returns funcirs
   let bn = list_len(blocks)
   let closures = bm_nc_handler_closures(prog)
 
+  # Issue #173: `main` holds exactly the blocks reachable from the ENTRY by
+  # JumpBlock edges (its own family, the same closure notion a handler or a
+  # Call target gets), in bi_program_blocks's own relative order. It used to
+  # hold every block not owned by a handler, which was harmless while every
+  # function was reached by JumpBlock (whose Stores bind the callee's
+  # params) but is wrong for a function reached ONLY by a Call: its
+  # parameters are bound at no site inside main, so codegen_x64's
+  # undefined-variable check correctly rejected main's dead copy of it.
+  # A Call target is compiled into its own FuncIR instead.
+  let entry_family = bm_nc_collect_block_closure(prog, bi_program_entry(prog))
   let main_blocks = []
   let bi = 0
   while bi < bn do
     let blk = list_get(blocks, bi)
-    if bm_nc_owning_handler(closures, bi_block_name(blk)) == false then
+    if bm_list_contains(entry_family, bi_block_name(blk)) and (bm_nc_owning_handler(closures, bi_block_name(blk)) == false) then
       let main_blocks = list_push(main_blocks, blk)
     end
     let bi = bi + 1
@@ -943,9 +1261,20 @@ make a function called bm_to_real_funcir takes prog, print_op returns funcirs
   # "bm_heap_ready" to false per bi_run call), and cheap even for a
   # program that never touches a Box at all (one rt_heap_alloc(1024) for
   # the free-list table, nothing more).
-  let init_instrs = [["BuildList", 0], ["Store", bm_nc_prefix(entry_name, "__globals")], ["Call", "bm_heap_init", 0], ["Store", bm_nc_prefix(entry_name, "__bm_discard")]]
+  # Issue #181: the heap is initialized only when the program actually
+  # contains a Box instruction. Doing it unconditionally (Phase 19) made
+  # EVERY program depend on heap_chunk.obj's bm_heap_init, which the WASM
+  # path (emit_program_rs, no heap chunk) does not have -- so every WASM
+  # program failed at startup on a function it never used, silently, since
+  # the WASM check is a standalone script nothing ran. A program without a
+  # Box has no use for the heap, so the native path loses nothing.
+  let init_instrs = [["BuildList", 0], ["Store", bm_nc_prefix(entry_name, "__globals")]]
+  if bm_nc_program_uses_heap(prog) then
+    let init_instrs = list_push(init_instrs, ["Call", "bm_heap_init", 0])
+    let init_instrs = list_push(init_instrs, ["Store", bm_nc_prefix(entry_name, "__bm_discard")])
+  end
 
-  let main_flat = bm_nc_flatten_blocks(prog, main_blocks, init_instrs, print_op)
+  let main_flat = bm_nc_flatten_blocks(prog, main_blocks, init_instrs, print_op, "main")
   let main_flat = list_push(main_flat, ["Const", "unit", ""])
   let main_flat = list_push(main_flat, ["Return"])
   let main_funcir = ["FuncIR", "main", [], main_flat, []]
@@ -956,6 +1285,13 @@ make a function called bm_to_real_funcir takes prog, print_op returns funcirs
   while hi < list_len(handler_funcirs) do
     let funcirs = list_push(funcirs, list_get(handler_funcirs, hi))
     let hi = hi + 1
+  end
+  # Issue #173: one more separate FuncIR per Call target.
+  let callee_funcirs = bm_nc_build_callee_funcirs(prog, bm_nc_call_roots(prog), print_op)
+  let ci = 0
+  while ci < list_len(callee_funcirs) do
+    let funcirs = list_push(funcirs, list_get(callee_funcirs, ci))
+    let ci = ci + 1
   end
   return funcirs
 end

@@ -172,3 +172,59 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
   (`list_len`, `list_get`) that happen to fall inside it -- not a claim
   that every host function Phase 18's own interpreter-side
   `interp_call_host` fallback covers also compiles natively.
+
+  Native call-with-return (GitHub issue #173), the native half of Phase 21
+  and of `apply` with arguments (#153): `Call`, `ReturnValue` and
+  `CallDynamic` used to be rejected cleanly by `bm_nc_unsupported`, so a
+  program that called a declared function as a value, returned a computed
+  value, or used `apply()` could not be built natively at all.
+
+  Design, generalizing what `Emit` already does for a handler: every
+  function that is the target of a `Call` gets its OWN separate native
+  FuncIR (named `bm_fn_<name>`), holding that function's whole
+  `JumpBlock`-reachable family of blocks, reached by an ordinary native
+  `Call`. It returns a two-element list `[value, final_globals]`, which the
+  call site unpacks (the value stays on the stack; the globals go back into
+  the caller's own `__globals`, so Fork B's threading survives a real call
+  boundary). Inside a callee every block ends with an explicit halt
+  returning `[unit, its own final __globals]`, and `ReturnValue` returns
+  `[value, its own __globals]` -- a block running off its own end is a halt
+  in the interpreter, never a fall-through into whichever block happens to
+  follow in the flattened array. `CallDynamic` dispatches on the runtime
+  name with a chain of `rt_str_eq` comparisons, one per declared function
+  taking at least the supplied number of arguments, like `Emit`'s event
+  dispatch; a name that matches nothing reaches a guaranteed contract
+  failure.
+
+  One consequence had to be fixed for this to build at all: `main` used to
+  hold every block not owned by a handler, harmless while every function was
+  reached by `JumpBlock` (whose stores bind the callee's parameters), but a
+  function reached ONLY by a `Call` has its parameters bound at no site
+  inside `main`, so `codegen_x64.patlang`'s undefined-variable check
+  correctly rejected `main`'s dead copy of it. `main` now holds exactly the
+  blocks reachable from the entry by `JumpBlock` -- its own family, the same
+  closure notion a handler or a call target gets.
+
+  Each scenario is cross-checked against `pat --ir-run` running the same
+  source, and checked as an ORDERED, adjacent sequence of printed values, not
+  a substring.
+
+  Scenario: a declared function called as a value, including recursion, runs through real native codegen
+    Given a program calling double(5) + 1 and a recursive factorial
+    When it is built and run as a real, fully native executable
+    Then it prints 11 and then 120
+
+  Scenario: a callee's final globals come back through the native Call and become the caller's
+    Given a callee that changes a global and returns a value, called from a function that then reads the global
+    When it is built and run as a real, fully native executable
+    Then it prints the returned value and then the updated global
+
+  Scenario: a callee whose return runs in a synthesized loop-exit block returns that block's own state
+    Given a callee containing a while loop and a return after it
+    When it is built and run as a real, fully native executable
+    Then the loop's result comes back and the caller continues
+
+  Scenario: apply with a runtime name and arguments dispatches natively
+    Given a program using apply with two, one-statement and zero arguments
+    When it is built and run as a real, fully native executable
+    Then every applied function runs and returns exactly what the interpreter's own run does
