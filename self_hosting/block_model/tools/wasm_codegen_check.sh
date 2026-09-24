@@ -127,6 +127,17 @@ else
   PASS=$((PASS + 1))
 fi
 
+echo "Scenario: parallel_map fails at BUILD time under WASM, naming why (issue #176)"
+OUT=$(wasm_build parallel_map_reference wasm176_pmap)
+check "a parallel_map program is rejected while translating, naming the by-name worker lookup" "$OUT" "looked up by name among the Rust-source program's own functions"
+if [ -f self_hosting/build/wasm176_pmap.wasm ]; then
+  echo "  FAIL: a .wasm was produced for a parallel_map program"
+  FAIL=$((FAIL + 1))
+else
+  echo "  ok: no .wasm is produced for a parallel_map program"
+  PASS=$((PASS + 1))
+fi
+
 echo ""
 echo "tests: $PASS passed, $FAIL failed"
 if [ "$FAIL" -eq 0 ]; then

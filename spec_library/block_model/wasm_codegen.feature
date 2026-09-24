@@ -102,3 +102,8 @@ Feature: the same block-model IR also compiles correctly to WASM (Block Ownershi
     Given a program using budgeted(ms) { ... }
     When it is built for wasm32-wasip1
     Then translation is rejected, naming the missing fiber host functions, and no .wasm is produced
+
+  Scenario: parallel_map fails at build time under WASM, naming why (issue #176)
+    Given a program using parallel_map(items, "fn")
+    When it is built for wasm32-wasip1
+    Then translation is rejected, naming the by-name worker lookup, and no .wasm is produced

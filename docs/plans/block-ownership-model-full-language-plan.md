@@ -1881,13 +1881,24 @@ deterministic. Result: `done 10 10 5` from block-model and from `pat --ir-run`.
 Limits: the body's own changes to globals are not written back to the caller (the
 real engine's globals are ambient); native rejects the host name at codegen and WASM
 rejects it at translation time, since neither runtime has fiber host functions for
-this. `thread_spawn`/`parallel_map` remain blocked on the refcount-thread-safety
+this. `thread_spawn` and Box-using workers remain blocked on the refcount-thread-safety
 design note.
+
+**`parallel_map` (#176, threads half).** The real host maps a declared function by
+name over real OS threads, so a block-model function is invisible to it. The
+interpreter intercepts the `parallel_map` CallHost (it alone holds the program),
+wraps each item as `[program, block name, item]`, and has the real host map
+`bi_pmap_entry`, a declared function of the interpreter that re-enters `bi_run_from`
+on the named block. Integers, strings and an empty list print the same results as
+`pat --ir-run`. Limits: a worker starts with empty `__globals` and does not write
+them back, and a worker that uses a Box is unsupported, since the refcounted heap is
+ambient non-thread-safe state, the question Phase 14 deferred. `thread_spawn` is not
+covered. Native rejects the host name at codegen and WASM at translation time.
 
 **Still open, all tracked on the board (epic #160):** methods, inherits and traits
 (#175, blocked on an owner decision about mutation semantics, since real objects are
 ambient named references and block-model values are records); `budgeted`/threads
-(#176, threads half); `signal_*` (#178); the `zs_explore` port (#179);
+(#176, `thread_spawn` and Box-using workers); `signal_*` (#178); the `zs_explore` port (#179);
 lowering's O(n²) statement-count cost (#156); and the cutover itself
 (#180), which is designed but not authorized.
 

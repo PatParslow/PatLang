@@ -123,11 +123,6 @@ make a function called bi_call_host_extension takes name, args returns result
   return ["Unhandled"]
 end
 
-# Phase 7 (Fork C): a counter of how many times the RUNTIME refcount
-# check (BoxSet, not BoxSetUnchecked) actually fired -- the concrete,
-# measurable form of "most mutations should be proven safe before this
-# code ever runs" (design doc section 3.5). Seeded in bi_run, alongside
-# bm_heap_ready.
 # Issue #176: `budgeted(ms, handle) { body }`. args = [ms, closure, existing,
 # globals]; `closure` is the body lowered as a zero-parameter closure value
 # ["__closure", block_name, [captured...]]. Runs it through the REAL
@@ -152,6 +147,44 @@ make a function called bi_budget_entry takes arg returns value
   return list_get(bi_run_from(prog, blk, locs), 0)
 end
 
+# Issue #176 (threads half): `parallel_map(items, "fn")`. The real host runs
+# a declared function by name on real OS threads, but `fn` here is a
+# block-model block, unknown to that host -- so each item is wrapped as
+# [prog, block_name, item] and the real host maps bi_pmap_entry (a declared
+# function of this very program) instead. Workers share nothing but the
+# immutable program and their own item: a worker's __globals starts empty and
+# its changes are not written back (documented in parallel_map.feature). A
+# Box-using worker is NOT supported: the refcounted heap is ambient state that
+# is not thread-safe (the deferred design question in Phase 14).
+make a function called bi_parallel_map takes prog, args returns result
+  let items = list_get(args, 0)
+  let fname = list_get(args, 1)
+  if bi_find_block(prog, fname) == false then
+    contract_check("bm_interp", "assert", "parallel_map: no declared function named '" + fname + "'", false)
+  end
+  let wrapped = []
+  let n = list_len(items)
+  let i = 0
+  while i < n do
+    let wrapped = list_push(wrapped, [prog, fname, list_get(items, i)])
+    let i = i + 1
+  end
+  return parallel_map(wrapped, "bi_pmap_entry")
+end
+
+make a function called bi_pmap_entry takes arg returns value
+  let prog = list_get(arg, 0)
+  let blk = bi_find_block(prog, list_get(arg, 1))
+  let locs = bm_loc_set(bm_loc_new(), list_get(bi_block_params(blk), 0), list_get(arg, 2))
+  let locs = bm_loc_set(locs, "__globals", [])
+  return list_get(bi_run_from(prog, blk, locs), 0)
+end
+
+# Phase 7 (Fork C): a counter of how many times the RUNTIME refcount
+# check (BoxSet, not BoxSetUnchecked) actually fired -- the concrete,
+# measurable form of "most mutations should be proven safe before this
+# code ever runs" (design doc section 3.5). Seeded in bi_run, alongside
+# bm_heap_ready.
 make a function called bm_note_runtime_check_performed returns done
   set_var("bm_runtime_check_count", get("__vars", "bm_runtime_check_count") + 1)
   return true
@@ -700,6 +733,9 @@ make a function called bi_run_block takes prog, blk, locs returns outcome
         # function's `(name, args)` signature cannot carry -- so it is
         # handled here, where `prog` is in scope.
         let call_result = ["Ok", bi_budgeted_run(prog, list_get(popped, 0))]
+      elif list_get(instr, 1) == "parallel_map" then
+        # Issue #176 (threads half): same reason -- see bi_parallel_map.
+        let call_result = ["Ok", bi_parallel_map(prog, list_get(popped, 0))]
       else
         let call_result = interp_call_host(list_get(instr, 1), list_get(popped, 0))
       end
