@@ -27,3 +27,25 @@ Feature: real free-variable analysis replaces wholesale loop capture (Block Owne
     Given the same loop body analyzed both ways on purpose
     When the wholesale set and the free-variable-analyzed set are compared directly
     Then the free-variable set is strictly smaller and excludes exactly the unreferenced local
+
+  A gap in the ANALYSIS ITSELF (GitHub issue #158), found running the real
+  `zs_expr_selftest.patlang` under block-model: `bm_fv_stmt`, the
+  statement-level half of the analysis, handled only `Let`, `If`, `Expr` and
+  `Return`. Comparing it against every statement kind the lowerer itself
+  handles showed four that silently contributed no free variables at all:
+  `While`, `Assert`, `Match` and `MemberAssign`. So both "everything after
+  this loop" and "this loop's own body" skipped over any following or inner
+  `while` entirely -- a variable used only inside one was never captured by
+  the loops around it. The real instance was `ze_msort`'s merge, three
+  loops in a row where `b` and `rn` are used only by the third
+  (`while (a < ln) and (b < rn)`, `while a < ln`, `while b < rn`).
+
+  The precision guarantee above is unchanged: an unreferenced local is
+  still NOT captured. `Match` deliberately over-approximates (names a
+  pattern binds are not removed from the free set), which can only capture
+  something unnecessary, never miss something needed.
+
+  Scenario: a variable used only inside a later or an inner while is still captured by the loops around it
+    Given two loops in a row where the second alone uses some variables, and an outer loop whose inner loop alone uses another
+    When it runs through bm_lower_program/bi_run
+    Then every printed value of both loop shapes matches exactly what pat --ir-run produces for the identical source

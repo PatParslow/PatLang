@@ -72,11 +72,31 @@ Feature: call-with-return for ordinary functions (Phase 21 of the full-language 
     When it runs through bm_lower_program/bi_run
     Then the print after the if still runs, matching exactly what pat --ir-run produces for the identical source
 
-  Native x64 codegen for `Call`/`ReturnValue` (which needs a genuinely
-  different design -- classification by call site, closed under one
-  additional fixed-point rule, and each qualifying function compiled as
-  its own separate FuncIR returning `[value, updated_globals]`, since
-  native's own flattened-vs-separate-FuncIR distinction is real where
-  the interpreter's is not) is explicitly deferred, not attempted in
-  this pass -- see docs/plans/block-ownership-model-full-language-plan
-  .md's own Phase 21 section for the recorded design.
+  Native x64 codegen for `Call`/`ReturnValue` needed a genuinely different
+  design -- each qualifying function compiled as its own separate FuncIR
+  returning `[value, updated_globals]`, since native's own
+  flattened-vs-separate-FuncIR distinction is real where the
+  interpreter's is not. It was deferred when this feature was written and
+  has since been done (GitHub issue #173, together with `CallDynamic`):
+  see spec_library/block_model/native_codegen.feature's own call-with-return
+  scenarios, and docs/plans/block-ownership-model-full-language-plan.md's
+  Phase 21 and Phase 23 sections.
+
+  A regression in the fix above (GitHub issue #157), and an instructive one:
+  the special case that keeps `JumpBlock` for a bare call that is genuinely
+  the LAST statement of its function returned the bare instruction list,
+  where every other return path of `bm_lower_top_level_stmt_list` returns the
+  `[instrs, pending]` pair. Its caller read the first instruction as
+  `instrs` and the second as the synthesized-block list, so a function ending
+  in a bare call to another declared function crashed with an unknown
+  instruction. No fixture reached that branch when it was written -- every
+  earlier bare-call fixture had the call followed by another statement or
+  inside an `if`, and the native suite (which uses `return F()`, a different
+  path) could not exercise it either. It surfaced the first time a real
+  program ended a body with a bare call: a script-style selftest's closing
+  `t_report()`.
+
+  Scenario: a bare-statement call that is the last statement of its function runs and returns control correctly
+    Given a function whose final statement is a bare call to another declared function
+    When it runs through bm_lower_program/bi_run
+    Then both functions' output appears, matching exactly what pat --ir-run produces for the identical source

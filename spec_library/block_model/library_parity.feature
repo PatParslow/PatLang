@@ -182,3 +182,65 @@ Feature: library-level parity, generic host calls and list literals (Phase 18 of
     Given a function using list_copy's own l[i] idiom and pmap_put's own [key, value] idiom, each inside its own while loop
     When it runs through bm_lower_program/bi_run
     Then every value matches exactly what pat --ir-run produces for the identical source
+
+  An eighth finding (GitHub issue #154), surfaced the moment the real
+  `schema_bdd_selftest.patlang` first ran end to end: `interp.patlang`'s
+  `JumpIfFalse` tested `== false` strictly, so `""`, `0` and `[]` used as an
+  `if`/`while` condition counted as TRUE where the real engine treats them
+  as false (`Un "not"` already used the host's own truthiness, so `if x` and
+  `not x` disagreed with each other). `self_hosting/lib/test.patlang`'s own
+  `if filter then` (filter == "") took the wrong branch, printing
+  `Scenario: X  []` under block-model where `pat --ir-run` prints
+  `Scenario: X`. Fixed by using the host's own truthiness in `JumpIfFalse`.
+
+  Scenario: a non-boolean value used as an if or while condition has the same truthiness as the real engine
+    Given a program using "", 0, [], non-empty values, true and false directly as if conditions, and an empty list as a while condition
+    When it runs through bm_lower_program/bi_run
+    Then every branch taken matches exactly what pat --ir-run produces for the identical source
+
+  Phase 18's own checkpoint, finally met: the real, unmodified
+  `self_hosting/schema_bdd_selftest.patlang` (the LibraryLoans/BorrowBook
+  worked example, driven through the real Gherkin runner and the
+  `zs_schema`/`schema_bdd` libraries) is lowered through `bm_lower_program`
+  with real `include` expansion applied and run to completion via
+  `bi_run_from`. Its pass and fail counts are read out of the RETURNED
+  `__globals` (not via `get_global` from the driver's own scope, which is a
+  separate store and produced an earlier vacuous 0/0), so 5 passed / 0
+  failed is a real result and not the absence of one.
+
+  Scenario: the real schema_bdd_selftest.patlang runs end to end under block-model with the same results as the real engine
+    Given self_hosting/schema_bdd_selftest.patlang, real and unmodified, with its includes expanded
+    When it is lowered through bm_lower_program and run to completion
+    Then all five of its checks pass, its Gherkin output has no stray tag suffix, and its counts are read from the run's own final globals
+
+  A ninth finding (GitHub issue #159), from running the real `step_match` and
+  `zs_schema` selftests: `CallHost` dispatches through
+  `self_hosting/lib/interp.patlang`'s `interp_call_host`, which has
+  `sc_len`/`sc_code`/`sc_char` but not `sc_substr`, though the real runtime
+  does and `step_match.patlang`'s `sm_match` calls it. That file is one of the
+  four this plan protects until the cutover is authorized, so rather than
+  edit it, this engine now has its own extension table
+  (`bi_call_host_extension`, in `self_hosting/block_model/interp.patlang`),
+  consulted only AFTER the shared table returns an error so the success path
+  pays nothing. The table grows only on evidence. Both an ASCII and a
+  non-ASCII string are checked, since the real host takes a different path
+  for each.
+
+  Scenario: a host function the shared dispatcher lacks is served by this engine's own extension table
+    Given a program calling sc_substr on an ASCII and on a non-ASCII interned string, and then a host function that exists nowhere
+    When it runs through bm_lower_program/bi_run
+    Then the substrings match pat --ir-run exactly and the unknown host function still fails with the unchanged message
+
+  A correction to an earlier scenario in this same file, found while running
+  the full suite against top-level statement support (GitHub issue #155):
+  "self_hosting/lib/zs_schema.patlang lowers completely" had been lowering the
+  RAW file, whose `include "..."` lines the self-hosted parser turns into a
+  bare `include` expression plus a stray string and `bm_lower_program`
+  silently dropped. So the claim was true of the file's own text and nothing
+  more -- it never exercised a line of `zs_expr`, `pset`, `pmap`, `list_copy`
+  or `block_model_compat`. Top-level statement support made that silence loud,
+  which is how it surfaced. The fixture now expands the includes first, so the
+  scenario's claim ("with no unsupported construct left anywhere in it")
+  covers the whole include closure. Checked every other fixture that reads a
+  file: the remaining two use `read_file` as the host operation under test,
+  not to lower a file, so none has the same flaw.

@@ -349,6 +349,27 @@ make a function called bm_lower_unsupported takes what returns nothing
   return false
 end
 
+# Issue #153: `apply(fname, a1, ..., an)` -- emits a1..an in written order
+# (deepest on the stack), then the callee-name expression, then the
+# current __globals, then ["CallDynamic", n]. interp.patlang's own case
+# pops globals, name, then n args (restoring written order via
+# bm_st_pop_n), binds them positionally to the resolved callee block's
+# own declared parameters, and leaves the callee's return value on the
+# caller's stack. Shared by bm_lower_expr (value context, result kept) and
+# bm_lower_stmt (bare statement, result discarded by its own caller).
+make a function called bm_lower_apply takes call_args, instrs, block_names, immut_params returns out
+  let total = list_len(call_args)
+  let extra = total - 1
+  let ai = 1
+  while ai < total do
+    let instrs = bm_lower_expr(list_get(call_args, ai), instrs, block_names, immut_params)
+    let ai = ai + 1
+  end
+  let instrs = bm_lower_expr(list_get(call_args, 0), instrs, block_names, immut_params)
+  let instrs = list_push(instrs, ["Load", "__globals"])
+  return list_push(instrs, ["CallDynamic", extra])
+end
+
 make a function called bm_lower_expr takes node, instrs, block_names, immut_params returns out
   let ty = list_get(node, 0)
   if ty == "Num" then
@@ -555,6 +576,10 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
       let instrs = bm_lower_expr(list_get(args, 1), instrs, block_names, immut_params)
       let instrs = bm_lower_expr(list_get(args, 0), instrs, block_names, immut_params)
       return list_push(instrs, ["HandlerLookup"])
+    elif name == "apply" then
+      # Issue #153: value-context apply(fname, a1, ..., an) -- the callee's
+      # return value stays on the stack for the surrounding expression.
+      return bm_lower_apply(args, instrs, block_names, immut_params)
     elif bm_list_contains(block_names, name) then
       # Phase 21: a call to another DECLARED block-model function, used
       # as a SUB-EXPRESSION (NOT in tail/return position) -- the real
@@ -948,16 +973,13 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
         # documented exclusions), so this needed a genuinely new
         # mechanism, not just another name added to an existing fallback.
         #
-        # Scoped narrowly to match every real call site in this whole
-        # codebase (checked directly, not assumed): always `apply(name)`
-        # with NO further arguments, calling a zero-declared-param step
-        # function -- `apply(name, arg1, ...)` is a real, separate,
-        # NOT-yet-supported extension (CallDynamic's own interp.patlang
-        # case only ever binds "__globals", nothing else), named here
-        # rather than silently assumed covered.
-        let instrs = bm_lower_expr(list_get(call_args, 0), instrs, block_names, immut_params)
-        let instrs = list_push(instrs, ["Load", "__globals"])
-        let instrs = list_push(instrs, ["CallDynamic"])
+        # Issue #153: now supports extra arguments too, `apply(name, a1,
+        # ..., an)` -- the original narrow zero-argument scoping (checked
+        # against only test.patlang's own call sites) missed
+        # schema_bdd.patlang's own apply(fn, state, inputs) calls. Shared
+        # with bm_lower_expr's value-context "apply" case via
+        # bm_lower_apply, so the two contexts cannot drift apart.
+        let instrs = bm_lower_apply(call_args, instrs, block_names, immut_params)
         return list_push(instrs, ["Store", "__bm_discard"])
       elif bm_list_contains(block_names, name) then
         # Phase 22: a real, previously-undisclosed, confirmed correctness
@@ -1350,7 +1372,12 @@ make a function called bm_lower_top_level_stmt_list takes stmts, start_idx, inst
       # every currently-passing native_codegen_check.sh fixture found
       # none relies on the bug this fix removes.
       let call = list_get(stmt, 1)
-      return bm_lower_jump_call(call, instrs, block_names, blocks_by_name, immut_params)
+      # Issue #157: this function's contract is to return [instrs, pending]
+      # on EVERY path (see bm_apply_continuation at the bottom). This
+      # branch used to return the bare instruction list, so its caller read
+      # the first instruction as `instrs` and the second as the synthesized
+      # block list -- a regression from #149's fix that no fixture reached.
+      return [bm_lower_jump_call(call, instrs, block_names, blocks_by_name, immut_params), pending]
     else
       # If/Return/Expr (including a bare jump-call): conservatively
       # invalidate `fresh` entirely -- this narrow, straight-line-only
@@ -1540,6 +1567,12 @@ make a function called bm_hash_rewrite_instrs takes instrs returns out
       # reason -- both operands are needed at dispatch time and would be
       # silently dropped by the generic "no operand" else branch.
       let out = list_push(out, [bm_op_hash(op), list_get(instr, 1), list_get(instr, 2)])
+    elif op == "CallDynamic" then
+      # Issue #153: carries ONE operand now -- the count of extra
+      # arguments (below the callee name and __globals) apply() passed
+      # through. Same operand-dropping bug class as BuildList/CallHost/
+      # Call above, caught here before it shipped.
+      let out = list_push(out, [bm_op_hash(op), list_get(instr, 1)])
     else
       # Print/BoxNew/BoxGet/BoxSet/BoxSetUnchecked/BoxShare/GlobalGet/
       # GlobalSet/HandlerNew/HandlerRegister/HandlerLookup/Emit/
@@ -1595,9 +1628,63 @@ make a function called bm_lower_is_compat_shim_name takes name returns yes
   return false
 end
 
+# Issue #155: script-style programs. Every top-level statement that is NOT
+# a declaration (Func / When / ClassDecl) is collected, in source order,
+# into a synthesized zero-parameter function `__main`, which is placed FIRST
+# so it becomes the program's entry (bm_lower_program picks the first
+# declared Func as entry) and is then lowered exactly like any other
+# function body by the passes below -- so `let`, bare calls, `if`, `while`
+# and their nesting reuse the existing machinery with no special cases.
+# When there are no such statements the list is returned UNCHANGED, so a
+# functions-only program still enters at its first function exactly as
+# before (every earlier fixture relies on that).
+#
+# Before this, every non-declaration top-level statement was silently
+# ignored -- and most of this repo's real programs (all the selftests of
+# the libraries Phase 18 ported) are script-style, so under block-model
+# they ran nothing and exited cleanly: a silent false pass. Anything at top
+# level that cannot be lowered now fails LOUDLY through the normal
+# unsupported-construct path. An un-expanded `include "x"` line (which the
+# self-hosted parser turns into a bare `include` expression plus a stray
+# string) gets its own explicit message, since it was the real-world way
+# top-level content used to vanish unnoticed.
+make a function called bm_collect_toplevel_main takes stmts returns out
+  let main_stmts = []
+  let decl_stmts = []
+  let n = list_len(stmts)
+  let i = 0
+  while i < n do
+    let s = list_get(stmts, i)
+    let ty = list_get(s, 0)
+    if (ty == "Func") or (ty == "When") or (ty == "ClassDecl") then
+      let decl_stmts = list_push(decl_stmts, s)
+    else
+      if ty == "Expr" then
+        let e = list_get(s, 1)
+        if (list_get(e, 0) == "Var") and (list_get(e, 1) == "include") then
+          bm_lower_unsupported("a top-level `include` directive that was never expanded -- run the source through expand_includes (self_hosting/lib/includes.patlang) before lowering; the self-hosted lexer/parser has no include handling of its own")
+        end
+      end
+      let main_stmts = list_push(main_stmts, s)
+    end
+    let i = i + 1
+  end
+  if list_len(main_stmts) == 0 then
+    return stmts
+  end
+  let out = [["Func", "__main", [], main_stmts, "r"]]
+  let j = 0
+  let dn = list_len(decl_stmts)
+  while j < dn do
+    let out = list_push(out, list_get(decl_stmts, j))
+    let j = j + 1
+  end
+  return out
+end
+
 make a function called bm_lower_program takes ast returns prog
   set_var("bm_synth_counter", 0)
-  let stmts = list_get(ast, 1)
+  let stmts = bm_collect_toplevel_main(list_get(ast, 1))
   let n = list_len(stmts)
 
   # Pass 0 (Phase 13): a compile-time-only class registry (name -> field

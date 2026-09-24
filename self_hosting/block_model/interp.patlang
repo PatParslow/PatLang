@@ -66,6 +66,24 @@ include "../lib/interp.patlang"
 # measurable form of "most mutations should be proven safe before this
 # code ever runs" (design doc section 3.5). Seeded in bi_run, alongside
 # bm_heap_ready.
+# Issue #159: this engine's OWN host-function extension table, consulted by
+# CallHost only when self_hosting/lib/interp.patlang's shared
+# interp_call_host has no answer. That file is one of the four the plan's
+# Phase 20 rule protects ("nothing in self_hosting/lib/{lower,codegen_x64,
+# x64_runtime,interp}.patlang is touched until the cutover is explicitly
+# authorized"), so a host function it lacks is added HERE, keeping this
+# engine fully parallel. Each entry is a passthrough to the real host
+# function of the same name, the same shape as interp_call_host's own
+# sc_len/sc_code/sc_char siblings. Grows only on evidence -- a host function
+# some real library actually calls under block-model -- never speculatively.
+# Returns ["Ok", value], or ["Unhandled"] for any name it does not own.
+make a function called bi_call_host_extension takes name, args returns result
+  if name == "sc_substr" then
+    return ["Ok", sc_substr(list_get(args, 0), list_get(args, 1), list_get(args, 2))]
+  end
+  return ["Unhandled"]
+end
+
 make a function called bm_note_runtime_check_performed returns done
   set_var("bm_runtime_check_count", get("__vars", "bm_runtime_check_count") + 1)
   return true
@@ -335,7 +353,13 @@ make a function called bi_run_block takes prog, blk, locs returns outcome
     elif op == 34716 then # "JumpIfFalse"
       let popped = bm_st_pop(stack)
       let stack = list_get(popped, 1)
-      if list_get(popped, 0) == false then
+      # Issue #154: the host language's OWN truthiness (`not v`, the same
+      # primitive "Un not" already uses), not a strict `== false` -- the
+      # strict test made "", 0 and [] count as TRUE here where the real
+      # engine treats them as false, so `if x` and `not x` disagreed with
+      # each other and a real library (test.patlang's `if filter then`,
+      # filter == "") took the wrong branch.
+      if not list_get(popped, 0) then
         let pc = list_get(instr, 1)
       else
         let pc = pc + 1
@@ -604,6 +628,16 @@ make a function called bi_run_block takes prog, blk, locs returns outcome
       let popped = bm_st_pop_n(stack, list_get(instr, 2))
       let call_result = interp_call_host(list_get(instr, 1), list_get(popped, 0))
       if list_get(call_result, 0) == "Err" then
+        # Issue #159: the shared dispatcher (lib/interp.patlang, protected
+        # by the plan's Phase 20 rule) has no answer -- try this engine's
+        # OWN extension table before failing. Tried only AFTER an "Err" so
+        # the common success path pays nothing for it.
+        let ext_result = bi_call_host_extension(list_get(instr, 1), list_get(popped, 0))
+        if list_get(ext_result, 0) == "Ok" then
+          let call_result = ext_result
+        end
+      end
+      if list_get(call_result, 0) == "Err" then
         contract_check("bm_interp", "assert", "CallHost '" + list_get(instr, 1) + "' failed: " + list_get(call_result, 1), false)
       end
       let stack = bm_st_push(list_get(popped, 1), list_get(call_result, 1))
@@ -666,30 +700,51 @@ make a function called bi_run_block takes prog, blk, locs returns outcome
       let locs = bm_loc_set(locs, "__globals", bm_loc_get(list_get(call_outcome, 1), "__globals"))
       let pc = pc + 1
     elif op == 915129 then # "CallDynamic"
-      # `apply(fname)` -- see lower.patlang's own "apply" case for the
-      # full rationale. Pops (fname, __globals) -- written-order, so
-      # __globals pops first, matching every other "args then an
-      # implicit __globals push" convention in this file. Deliberately
-      # narrow, matching every real call site in this whole codebase:
-      # the callee is assumed to take ZERO declared params beyond
-      # "__globals" (no general arg-forwarding for a dynamically-named
-      # callee attempted here). `bi_find_block` raises its own
-      # guaranteed-fail error if `fname` doesn't name a real block --
-      # not specially handled here, the same as any other lookup by a
-      # possibly-wrong name elsewhere in this file.
+      # `apply(fname, a1, ..., an)` -- see lower.patlang's own
+      # bm_lower_apply for the full rationale. instr[1] is n, the count
+      # of extra args (issue #153; was always zero before). Pops
+      # __globals first, then the callee-name, then the n args (written
+      # order restored by bm_st_pop_n), matching every other "args then
+      # an implicit __globals push" convention in this file. The args
+      # bind positionally to the resolved callee's OWN declared params
+      # (bi_block_params, "__globals" last, exactly as Call does).
+      # bi_find_block returns `false` for an unknown name rather than
+      # raising -- an earlier version of this comment claimed it raised
+      # its own error, which was wrong -- so both that case and an
+      # over-supplied argument list are checked and reported explicitly
+      # here, by name, rather than failing obscurely on `false`.
+      let n_extra = list_get(instr, 1)
       let popped_g = bm_st_pop(stack)
       let globals_val = list_get(popped_g, 0)
       let popped_f = bm_st_pop(list_get(popped_g, 1))
       let fname = list_get(popped_f, 0)
-      let stack = list_get(popped_f, 1)
+      let popped_a = bm_st_pop_n(list_get(popped_f, 1), n_extra)
+      let call_args = list_get(popped_a, 0)
+      let stack = list_get(popped_a, 1)
       let callee_blk = bi_find_block(prog, fname)
+      if callee_blk == false then
+        contract_check("bm_interp", "assert", "apply: no declared function named '" + fname + "'", false)
+      end
+      let callee_params = bi_block_params(callee_blk)
+      let declared_count = list_len(callee_params) - 1
+      if n_extra > declared_count then
+        contract_check("bm_interp", "assert", "apply: '" + fname + "' declares " + declared_count + " parameter(s) but was called with " + n_extra + " argument(s)", false)
+      end
       let callee_locs = bm_loc_set(bm_loc_new(), "__globals", globals_val)
+      let bi = 0
+      while bi < n_extra do
+        let callee_locs = bm_loc_set(callee_locs, list_get(callee_params, bi), list_get(call_args, bi))
+        let bi = bi + 1
+      end
       let call_outcome = bi_run_from(prog, callee_blk, callee_locs)
       let stack = bm_st_push(stack, list_get(call_outcome, 0))
       let locs = bm_loc_set(locs, "__globals", bm_loc_get(list_get(call_outcome, 1), "__globals"))
       let pc = pc + 1
     else
-      contract_check("bm_interp", "assert", "unknown block-model instruction: " + op, false)
+      # Names WHERE it happened (block, pc, the instruction itself): a bare
+      # hash gave no location, and finding which block produced a malformed
+      # instruction (#157) needed a separate dump harness.
+      contract_check("bm_interp", "assert", "unknown block-model instruction: " + op + " at pc=" + pc + " in block " + bi_block_name(blk) + " instr=" + instr, false)
     end
   end
   # Phase 10: a 3rd element (this block's own final locs) is appended here
