@@ -486,7 +486,12 @@ make a function called bm_collect_let_names takes stmts, names returns out
     let s = list_get(stmts, i)
     let ty = list_get(s, 0)
     if ty == "Let" then
-      let names = bm_union_preserving_order(names, [list_get(s, 1)])
+      # Issue #156: check and push INLINE -- passing `names` to
+      # bm_union_preserving_order would make its push copy the whole list
+      # (the caller still holds it), once per `let`.
+      if not bm_list_contains(names, list_get(s, 1)) then
+        let names = list_push(names, list_get(s, 1))
+      end
     elif ty == "If" then
       let names = bm_collect_let_names(list_get(s, 2), names)
       let names = bm_collect_let_names(list_get(s, 3), names)
@@ -1400,11 +1405,45 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
   return instrs
 end
 
+# Issue #156: `frag` was lowered starting from an EMPTY instruction list, so
+# every JumpIfFalse/Jump target in it is relative to the fragment's own start.
+# Returns a copy with those targets shifted by `base`, the length of the list
+# the fragment is about to be appended to. Costs O(len(frag)) -- the caller's
+# accumulated list is never passed in, which is the whole point: any callee
+# that pushes onto a list its caller still holds copies it.
+make a function called bm_relocate_jumps takes frag, base returns out
+  if base == 0 then
+    return frag
+  end
+  let n = list_len(frag)
+  let out = []
+  let i = 0
+  while i < n do
+    let ins = list_get(frag, i)
+    let op = list_get(ins, 0)
+    if (op == "JumpIfFalse") or (op == "Jump") then
+      let ins = [op, list_get(ins, 1) + base]
+    end
+    let out = list_push(out, ins)
+    let i = i + 1
+  end
+  return out
+end
+
 make a function called bm_lower_stmt_list takes stmts, instrs, block_names, blocks_by_name, immut_params returns out
   let n = list_len(stmts)
   let i = 0
   while i < n do
-    let instrs = bm_lower_stmt(list_get(stmts, i), instrs, block_names, blocks_by_name, immut_params)
+    # Issue #156: lower into a fresh fragment and append it inline, rather
+    # than handing the growing `instrs` to a callee (which would copy it on
+    # every statement: O(n^2) in the body's statement count).
+    let frag = bm_relocate_jumps(bm_lower_stmt(list_get(stmts, i), [], block_names, blocks_by_name, immut_params), list_len(instrs))
+    let frag_n = list_len(frag)
+    let fi = 0
+    while fi < frag_n do
+      let instrs = list_push(instrs, list_get(frag, fi))
+      let fi = fi + 1
+    end
     let i = i + 1
   end
   return instrs
@@ -1666,8 +1705,13 @@ make a function called bm_lower_top_level_stmt_list takes stmts, start_idx, inst
       return bm_lower_while(stmt, stmts, i, instrs, block_names, blocks_by_name, immut_params, known_locals, pending, k)
     elif ty == "Let" then
       let val_node = list_get(stmt, 2)
-      let instrs = bm_lower_stmt(stmt, instrs, block_names, blocks_by_name, immut_params)
-      let known_locals = list_push(known_locals, list_get(stmt, 1))
+      # Issue #156: lower into a fresh fragment (patched and relocated below)
+      # and append it inline -- see bm_relocate_jumps.
+      let frag = bm_lower_stmt(stmt, [], block_names, blocks_by_name, immut_params)
+      # Issue #156: a set of names, so a rebinding does not grow it.
+      if not bm_list_contains(known_locals, list_get(stmt, 1)) then
+        let known_locals = list_push(known_locals, list_get(stmt, 1))
+      end
       # Phase 7 (Fork C): if this Let's value was box_set(TARGET, ...) and
       # TARGET is provably unique right now (flight_check.patlang's own
       # `fresh` tracking), patch the BoxSet bm_lower_stmt just emitted
@@ -1678,9 +1722,16 @@ make a function called bm_lower_top_level_stmt_list takes stmts, start_idx, inst
       if (list_get(val_node, 0) == "Call") and (list_get(val_node, 1) == "box_set") then
         let target_node = list_get(list_get(val_node, 2), 0)
         if (list_get(target_node, 0) == "Var") and bm_fc_is_provably_unique(fresh, list_get(target_node, 1)) then
-          let boxset_pos = list_len(instrs) - 2
-          let instrs = list_set(instrs, boxset_pos, ["BoxSetUnchecked"])
+          let boxset_pos = list_len(frag) - 2
+          let frag = list_set(frag, boxset_pos, ["BoxSetUnchecked"])
         end
+      end
+      let frag = bm_relocate_jumps(frag, list_len(instrs))
+      let frag_n = list_len(frag)
+      let fi = 0
+      while fi < frag_n do
+        let instrs = list_push(instrs, list_get(frag, fi))
+        let fi = fi + 1
       end
       let fresh = bm_fc_after_let(fresh, list_get(stmt, 1), val_node)
       let i = i + 1
@@ -1720,7 +1771,13 @@ make a function called bm_lower_top_level_stmt_list takes stmts, start_idx, inst
       # invalidate `fresh` entirely -- this narrow, straight-line-only
       # analysis doesn't reason through any of these (flight_check
       # .patlang's own header).
-      let instrs = bm_lower_stmt(stmt, instrs, block_names, blocks_by_name, immut_params)
+      let frag = bm_relocate_jumps(bm_lower_stmt(stmt, [], block_names, blocks_by_name, immut_params), list_len(instrs))
+      let frag_n = list_len(frag)
+      let fi = 0
+      while fi < frag_n do
+        let instrs = list_push(instrs, list_get(frag, fi))
+        let fi = fi + 1
+      end
       let fresh = []
       let i = i + 1
     end
