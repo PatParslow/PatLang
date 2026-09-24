@@ -1961,14 +1961,16 @@ source (#184); and the cutover itself (#180), which is designed but not authoriz
 
 **Where #180 stands.** Its recorded gates are full-suite parity (the block-model
 suite, the language spec gate and the native check all green), native
-Call/ReturnValue/CallDynamic (#173, done), and issues #145 and #113 actually fixed
-rather than waived. Everything the block-model side owes has been delivered. #145
-(native `list_push`/`list_set` mutate shared storage in place) and #113 (native `==`
-on structurally identical lists built by different paths returns false) are bugs in
-the native codegen and runtime, `self_hosting/lib/{codegen_x64,x64_runtime}.patlang`,
-which the plan protects until the cutover is authorized, so they were not touched.
-They are the remaining work before an authorization decision, and the block-model
-design does not fix either.
+Call/ReturnValue/CallDynamic (#173), and issues #145 and #113 actually fixed rather
+than waived. All are met. #145 and #113 were bugs in
+the native runtime (`x64_runtime`/`codegen_x64`), fixed there with the owner's
+go-ahead, so the block-model native output, which links the same runtime, gets
+them too. Native lists are now persistent arrays (see `x64-persistent-lists.md`): a
+list copied from another is no longer changed by a later push or set, and `==`
+compares lists structurally, both checked against the interpreter line for line
+(`x64_list_semantics.feature`, including 6000 random aliasing steps). The price is
+about 50 ns and 48 bytes per list write instead of 15-23 ns. What remains is the
+authorisation decision itself.
 
 ---
 

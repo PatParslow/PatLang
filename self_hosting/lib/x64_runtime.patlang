@@ -1990,22 +1990,59 @@ end
 # not-yet-built follow-up, same spirit as strings' `+`-stays-int-only
 # limit).
 
+# ---- persistent lists (GitHub #145) ----
+#
+# History, because the reasoning still constrains the design. The first
+# rt_list_push reallocated and copied every element on every call, so a loop
+# accumulating N items cost O(N^2) -- found by a self-compile that burned 20+
+# CPU-minutes on the compiler's own source. It was made to mutate in place
+# whenever the buffer had room, and rt_list_set_functional was later made
+# in-place too (issue #89: the linker's per-byte relocation patching cost
+# O(relocations * image size) with a copy per call and exhausted the heap).
+# Both gave up the interpreter's value semantics -- "only PROBABLY safe",
+# their own headers said -- and issue #145 is what that cost: a list copied
+# from another changed underneath it. This backend has no reference counts and
+# no collector, so plain copy-on-write is not an answer (an element write in a
+# loop would allocate a whole new buffer every time and never free one); the
+# version nodes below give value semantics with the same O(1) fast path.
+#
+# A list VALUE is a tagged pointer to a 48-byte VERSION NODE:
+#     [0] len   [8] kind   [16] buf   [24] idx   [32] val   [40] next
+# len is at offset 0 in every kind, so the inline `.length` path in
+# codegen_x64.patlang keeps working.
+#   kind 0, ARR:   `buf` is a buffer [cap:8][spare:8][elements...] (elements at
+#                  +16). This is the NEWEST version over that buffer, and there is
+#                  exactly one ARR node per buffer. Reads and writes go straight
+#                  to the buffer.
+#   kind 1, SET:   an OLDER version. It equals `next` except that element `idx`
+#                  is `val`.
+#   kind 2, TRUNC: an OLDER version. It is the first `len` elements of `next`.
+#
+# Lists are values: a push or a set on the newest version updates the buffer in
+# place (so accumulating and patching loops stay O(1) per step) and turns the
+# node it replaced into a SET/TRUNC diff pointing at the new node, so every
+# other holder of the old node still reads its original contents. A write to an
+# OLDER version copies (materialises) it into a fresh buffer first. This keeps
+# the interpreter's copy-on-write meaning without reference counts. The old
+# behaviour mutated the shared buffer in place, so a list copied from another
+# changed underneath it (issue #145).
+#
+# Diffs are written before the kind flips, and the buffer element is changed
+# last, so a reader that sees the old kind still sees consistent data. Two threads
+# writing the SAME list are not synchronised, as before.
+
 make a function called rt_list_tag returns tag
   return 3 shl 60
 end
 
-# List block format, TWO qwords of header, not one: [length:8]
-# [capacity:8][elements: capacity*8 bytes]. Elements start at offset
-# 16, not 8 -- a real, deliberate format change from the original
-# Slice 4 layout (see rt_list_push's own header for why capacity
-# tracking is necessary, not cosmetic). rt_list_new/BuildList (in
-# codegen_x64.patlang) both allocate TIGHT (capacity == length, no
-# spare room) -- only rt_list_push ever creates a list with genuine
-# spare capacity.
+# A list of n slots, nodes and buffer in one allocation. The elements are
+# unset; callers fill a fresh list with rt_list_set before sharing it.
 make a function called rt_list_new takes n returns tagged
-  let addr = rt_heap_alloc(16 + n * 8)
+  let addr = rt_heap_alloc(64 + n * 8)
   mem_poke_qword(addr, 0, n)
-  mem_poke_qword(addr, 8, n)
+  mem_poke_qword(addr, 8, 0)
+  mem_poke_qword(addr, 16, addr + 48)
+  mem_poke_qword(addr, 48, n)
   return addr bor rt_list_tag()
 end
 
@@ -2014,25 +2051,33 @@ make a function called rt_list_len takes l returns len
   return mem_peek_qword(addr, 0)
 end
 
-# Real bug found (GitHub incremental-compile-caching plan, self-hosting
-# fixpoint investigation): `s[i]` index syntax ALWAYS lowers to
-# CallHost("list_get", 2) regardless of whether the receiver is a
-# String or a List (see x64_callhost_asm's own header on this, lower.
-# patlang's own doing) -- this function used to unconditionally apply
-# the LIST layout (8-byte-per-element, data starting at offset 16),
-# which is simply the wrong byte offsets for a String (1-byte-per-char,
-# data starting at offset 8). Confirmed directly: `let s = "abc";
-# print(s[1])` printed 256 instead of "b" under --x64 (matches the
-# interpreter exactly for --ir-run/--patc, only --x64 was wrong) --
-# never caught before because nothing in the self-hosted compiler's own
-# internals happened to index into a STRING via `[i]` syntax under
-# --x64 until lib/json.patlang's json_escape (newly exercised by this
-# feature's own content-hashing, not something json.patlang did
-# differently -- it was always broken, just never reached). Fixed by
-# checking the family tag first: a String receiver returns a genuine
-# new one-character tagged String (matching the interpreter's own
-# `s[i]` semantics exactly), a List receiver keeps the original
-# qword-element behavior.
+# A new ARR node of length len over an existing buffer.
+make a function called rt_list_node_new takes len, buf returns node
+  let node = rt_heap_alloc(48)
+  mem_poke_qword(node, 0, len)
+  mem_poke_qword(node, 8, 0)
+  mem_poke_qword(node, 16, buf)
+  return node
+end
+
+# Rewrites `node` (currently ARR) as an older version pointing at `next`. The
+# payload goes in first and the kind last.
+make a function called rt_list_retire_set takes node, idx, val, next returns done
+  mem_poke_qword(node, 24, idx)
+  mem_poke_qword(node, 32, val)
+  mem_poke_qword(node, 40, next)
+  mem_poke_qword(node, 8, 1)
+  return true
+end
+
+make a function called rt_list_retire_trunc takes node, next returns done
+  mem_poke_qword(node, 40, next)
+  mem_poke_qword(node, 8, 2)
+  return true
+end
+
+# `s[i]` on a String lowers to list_get too (see below), so this checks the
+# family first.
 make a function called rt_list_get takes l, i returns value
   let family_mask = 17293822569102704640
   let family = l band family_mask
@@ -2044,60 +2089,95 @@ make a function called rt_list_get takes l, i returns value
     mem_poke_byte(out, 8, ch)
     return out bor rt_string_tag()
   end
-  let addr = l band rt_payload_mask()
-  return mem_peek_qword(addr, 16 + i * 8)
+  let node = l band rt_payload_mask()
+  while true do
+    let kind = mem_peek_qword(node, 8)
+    if kind == 0 then
+      return mem_peek_qword(mem_peek_qword(node, 16), 16 + i * 8)
+    end
+    if kind == 1 then
+      if i == mem_peek_qword(node, 24) then
+        return mem_peek_qword(node, 32)
+      end
+    end
+    let node = mem_peek_qword(node, 40)
+  end
+  return 0
 end
 
+# In-place write into a FRESH list's buffer (rt_list_new followed by filling
+# it). Not for a list that may be shared: use list_set (rt_list_set_functional).
 make a function called rt_list_set takes l, i, v returns done
-  let addr = l band rt_payload_mask()
-  mem_poke_qword(addr, 16 + i * 8, v)
+  let node = l band rt_payload_mask()
+  mem_poke_qword(mem_peek_qword(node, 16), 16 + i * 8, v)
   return true
 end
 
-# Growable lists: list_push(list, item) -> a list with item appended.
-#
-# REAL PERFORMANCE BUG found and fixed here (not by review -- by an
-# actual self-compile attempt burning 20+ CPU-minutes on ~10K lines
-# of the compiler's own source before being killed): the original
-# version always reallocated a tightly-sized block and copied EVERY
-# existing element on EVERY push, an O(n) cost per call -- meaning a
-# loop that accumulates N items one push at a time (exactly how
-# lexer.patlang builds its token list, one token per push) costs
-# O(n^2) total. The interpreter's own list_push is O(1) amortized
-# (`Arc::make_mut(&mut xs).push(...)` -- Rust's Vec grows by
-# doubling, and Arc::make_mut only copies when the list is actually
-# SHARED, mutating in place otherwise). Fixed by tracking real spare
-# CAPACITY in the block header (see the format comment above) and
-# growing geometrically (doubling) only when capacity is exhausted,
-# mutating in place (bumping length, writing into already-reserved
-# space) whenever there's room.
-#
-# NAMED, DELIBERATE SEMANTIC DEVIATION from the interpreter's own
-# safety guarantee: Arc::make_mut only mutates in place when the
-# reference count is 1 (i.e. provably unshared), copying otherwise --
-# this backend has NO reference counting at all, so it cannot tell
-# whether an older list value still aliases the same block. The
-# in-place growth path here is therefore only PROBABLY safe, not
-# PROVABLY safe: it's correct for the dominant, realistic pattern
-# (`let xs = list_push(xs, item)` accumulated in a loop, where the
-# old binding is never read again), but a program that keeps an OLDER
-# list reference around, then pushes onto a chain descended from it
-# MULTIPLE times while that older reference still has spare capacity,
-# could observe the older reference's contents change underneath it.
-# This tradeoff is deliberate -- realistic performance for the
-# overwhelmingly common accumulation pattern (needed for self-hosting
-# at all) over perfect aliasing safety for a rarer divergent-branches
-# pattern. x64_growable_list_demo.patlang's own "the original list
-# stays length 0" check still passes (it never re-reads a list that
-# was later pushed onto), but is not a general proof of safety.
+# Copies the version `node` (any kind) into a fresh ARR node over a new buffer
+# of capacity `cap` (>= its length) and returns that node. The copy starts from
+# the root buffer's first `len` elements and then applies the SET diffs on the
+# way back from the root, nearest the root first, so the ones closest to `node`
+# win. The result is unshared.
+make a function called rt_list_materialize takes node, cap returns fresh
+  let n0 = mem_peek_qword(node, 0)
+  let depth = 0
+  let cur = node
+  while mem_peek_qword(cur, 8) != 0 do
+    let depth = depth + 1
+    let cur = mem_peek_qword(cur, 40)
+  end
+  let root_buf = mem_peek_qword(cur, 16)
+  let buf = rt_heap_alloc(16 + cap * 8)
+  mem_poke_qword(buf, 0, cap)
+  let k = 0
+  while k < n0 do
+    mem_poke_qword(buf, 16 + k * 8, mem_peek_qword(root_buf, 16 + k * 8))
+    let k = k + 1
+  end
+  if depth > 0 then
+    let path = rt_heap_alloc(depth * 8)
+    let cur = node
+    let j = 0
+    while j < depth do
+      mem_poke_qword(path, j * 8, cur)
+      let cur = mem_peek_qword(cur, 40)
+      let j = j + 1
+    end
+    let j = depth - 1
+    while j >= 0 do
+      let nd = mem_peek_qword(path, j * 8)
+      if mem_peek_qword(nd, 8) == 1 then
+        let ix = mem_peek_qword(nd, 24)
+        if ix < n0 then
+          mem_poke_qword(buf, 16 + ix * 8, mem_peek_qword(nd, 32))
+        end
+      end
+      let j = j - 1
+    end
+  end
+  return rt_list_node_new(n0, buf)
+end
+
+# list_push(list, item) -> a list with item appended. In place when `l` is the
+# newest version and its buffer has room; otherwise it copies (a full buffer
+# doubles; an older version is materialised first).
 make a function called rt_list_push takes l, v returns tagged
-  let addr = l band rt_payload_mask()
-  let n = mem_peek_qword(addr, 0)
-  let cap = mem_peek_qword(addr, 8)
+  let node = l band rt_payload_mask()
+  let n = mem_peek_qword(node, 0)
+  let owned = false
+  if mem_peek_qword(node, 8) != 0 then
+    let node = rt_list_materialize(node, n * 2 + 4)
+    let owned = true
+  end
+  let buf = mem_peek_qword(node, 16)
+  let cap = mem_peek_qword(buf, 0)
   if n < cap then
-    mem_poke_qword(addr, 16 + n * 8, v)
-    mem_poke_qword(addr, 0, n + 1)
-    return l
+    let fresh = rt_list_node_new(n + 1, buf)
+    if owned == false then
+      rt_list_retire_trunc(node, fresh)
+    end
+    mem_poke_qword(buf, 16 + n * 8, v)
+    return fresh bor rt_list_tag()
   end
   let new_cap = cap * 2
   if new_cap < 1 then
@@ -2106,54 +2186,36 @@ make a function called rt_list_push takes l, v returns tagged
   if new_cap < n + 1 then
     let new_cap = n + 1
   end
-  let new_addr = rt_heap_alloc(16 + new_cap * 8)
-  mem_poke_qword(new_addr, 0, n + 1)
-  mem_poke_qword(new_addr, 8, new_cap)
+  let new_buf = rt_heap_alloc(16 + new_cap * 8)
+  mem_poke_qword(new_buf, 0, new_cap)
   let i = 0
   while i < n do
-    mem_poke_qword(new_addr, 16 + i * 8, mem_peek_qword(addr, 16 + i * 8))
+    mem_poke_qword(new_buf, 16 + i * 8, mem_peek_qword(buf, 16 + i * 8))
     let i = i + 1
   end
-  mem_poke_qword(new_addr, 16 + n * 8, v)
-  return new_addr bor rt_list_tag()
+  mem_poke_qword(new_buf, 16 + n * 8, v)
+  return rt_list_node_new(n + 1, new_buf) bor rt_list_tag()
 end
 
-# GitHub #29 (original design, see codegen_x64.patlang's x64_callhost_
-# asm comment on `list_set` for the full history): plain `list_set` was
-# deliberately aliased to a SEPARATE function from the mutating
-# `rt_list_set` above, to keep PatLang's own observable list_set
-# semantics (copy-on-write, matching the interpreter's host_list_set)
-# intact -- reallocating and copying every element on every call.
-#
-# REVERSED (issue #89's linker-scaling follow-up, 2026-09-06): that
-# unconditional O(n)-per-call copy, with NO in-place fast path at all,
-# made x64_pe_link.patlang's relocation-patching loop (list_set called
-# once per patched byte against `merged_text`/`merged_data`, potentially
-# megabytes) cost O(relocations * image_size) -- confirmed directly via
-# self_hosting/examples/x64_linker_scaling_probe.exe: fine up to 1500
-# synthetic one-function chunks, exhausts a 1.9GB heap by 1800. This
-# backend has no reference counting at all (same fact rt_list_push's own
-# header already leans on), so there was never a way to detect "is this
-# safe to mutate in place" here -- rt_list_push already accepts that and
-# mutates in place unconditionally when capacity allows ("only PROBABLY
-# safe, not PROVABLY safe... deliberate tradeoff", its own words). This
-# now makes the SAME tradeoff for list_set: mutate in place and return
-# the SAME tagged pointer (the address never changes -- no growth is
-# possible here, `i` is always < the existing length). Checked both real
-# callers of plain list_set before making this change (x64_pe_link.
-# patlang's own relocation patching and index building;
-# codegen_x64.patlang's x64_vstack_push/x64_analyze_dynamic_bins) --
-# all follow the same `let x = list_set(x, ...)` reassign-and-never-
-# reread-the-old-binding shape that already makes rt_list_push's
-# identical tradeoff safe. The risk this reintroduces, stated the same
-# way rt_list_push's header states its own: a program that keeps an
-# OLDER list value alive while ALSO list_set-ing a descendant of it
-# would observe the older value change underneath it. Not exercised by
-# any current caller; worth remembering if a future one appears.
+# list_set(list, i, item) -> a list with element i replaced, as a value: no
+# other holder of `l` sees the change.
 make a function called rt_list_set_functional takes l, i, v returns tagged
-  let addr = l band rt_payload_mask()
-  mem_poke_qword(addr, 16 + i * 8, v)
-  return l
+  let node = l band rt_payload_mask()
+  let n = mem_peek_qword(node, 0)
+  if mem_peek_qword(node, 8) != 0 then
+    let fresh = rt_list_materialize(node, n)
+    mem_poke_qword(mem_peek_qword(fresh, 16), 16 + i * 8, v)
+    return fresh bor rt_list_tag()
+  end
+  let buf = mem_peek_qword(node, 16)
+  let old = mem_peek_qword(buf, 16 + i * 8)
+  if old == v then
+    return l
+  end
+  let fresh = rt_list_node_new(n, buf)
+  rt_list_retire_set(node, i, old, fresh)
+  mem_poke_qword(buf, 16 + i * 8, v)
+  return fresh bor rt_list_tag()
 end
 
 # ---- bool_array (Slice 1, GitHub #45) ----
