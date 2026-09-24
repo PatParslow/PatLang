@@ -1881,7 +1881,7 @@ deterministic. Result: `done 10 10 5` from block-model and from `pat --ir-run`.
 Limits: the body's own changes to globals are not written back to the caller (the
 real engine's globals are ambient); native rejects the host name at codegen and WASM
 rejects it at translation time, since neither runtime has fiber host functions for
-this. `thread_spawn` and Box-using workers remain blocked on the refcount-thread-safety
+this. `thread_spawn` and Box-using workers were blocked on the refcount-thread-safety
 design note.
 
 **`parallel_map` (#176, threads half).** The real host maps a declared function by
@@ -1891,14 +1891,27 @@ wraps each item as `[program, block name, item]`, and has the real host map
 `bi_pmap_entry`, a declared function of the interpreter that re-enters `bi_run_from`
 on the named block. Integers, strings and an empty list print the same results as
 `pat --ir-run`. Limits: a worker starts with empty `__globals` and does not write
-them back, and a worker that uses a Box is unsupported, since the refcounted heap is
-ambient non-thread-safe state, the question Phase 14 deferred. `thread_spawn` is not
+them back, and a worker that uses a Box is unsupported (Box exists only in native
+builds, where the heap is now thread-safe; see below). `thread_spawn` is not
 covered. Native rejects the host name at codegen and WASM at translation time.
+
+**Thread safety of the refcounted heap (#176).** The design note is
+`block-ownership-model-thread-safety.md`. Refcount changes are atomic, the free list
+sits behind a ticket lock, and the free-list table is the first heap allocation so
+worker threads find it at `mem_heap_base()` without `get` (which the runtime forbids
+in spawned closures). Option (b), a separate path only for objects crossing a
+`thread_spawn`, is unsound because a Box payload can hold a pointer to another Box
+with no type information to say so. Cost: about 156 ms to 208 ms per ten million
+single-threaded inc/dec pairs. Evidence: four real threads on the unmodified heap
+returned a shared count of 5369234655 (want 1) and crashed; after the change five of
+five runs are correct (`tools/thread_safety_check.sh`). Not covered: `thread_spawn`
+from block-model source, since block-model closures are lists and the runtime's
+`thread_spawn` takes its own closure value.
 
 **Still open, all tracked on the board (epic #160):** methods, inherits and traits
 (#175, blocked on an owner decision about mutation semantics, since real objects are
 ambient named references and block-model values are records); `budgeted`/threads
-(#176, `thread_spawn` and Box-using workers); `signal_*` (#178); the `zs_explore` port (#179);
+(#176, `thread_spawn` from block-model source); `signal_*` (#178); the `zs_explore` port (#179);
 lowering's O(n²) statement-count cost (#156); and the cutover itself
 (#180), which is designed but not authorized.
 

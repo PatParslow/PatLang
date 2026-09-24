@@ -52,21 +52,93 @@ make a function called bm_freelist_table_size returns n
   return 64
 end
 
+# Thread safety (GitHub #176). The table starts with a 24-byte header, a
+# ticket lock (two words, [next_ticket:8][now_serving:8]) and an init marker, followed by
+# the 64 slots. See docs/plans/block-ownership-model-thread-safety.md for why
+# every refcount operation is atomic (option (a)) rather than only those of
+# objects crossing a thread_spawn boundary.
+#
+# When the table is the first heap allocation its address is exactly
+# mem_heap_base() and needs no lookup. The older lookup, get("__vars", ...), is
+# not safe from a worker: g_vars_table has no lock, thread_spawn itself writes to
+# it (the thread-id counter), and the runtime's own rule is that a spawned
+# closure must not call set_var/get -- so a worker allocating or freeing a Box
+# raced with the main thread spawning the next worker. See bm_heap_init for when
+# each arrangement applies.
+make a function called bm_freelist_header_bytes returns n
+  return 24
+end
+
+make a function called bm_heap_magic returns n
+  return 8102931470111
+end
+
+# True when the table is at the heap base with its marker in the header: the
+# thread-safe arrangement. The bytes-used check comes first because an untouched
+# heap page may not be committed to read yet.
+make a function called bm_heap_fixed_ready returns yes
+  if mem_peek_qword(mem_heap_state_addr(), 0) >= bm_freelist_header_bytes() then
+    return mem_peek_qword(mem_heap_base(), 16) == bm_heap_magic()
+  end
+  return false
+end
+
+# Two arrangements, chosen by what is true when this runs:
+#
+# 1. The table is the FIRST heap allocation, so it sits at mem_heap_base() with
+#    its marker in the header and every thread finds it without any lookup.
+#    Native code the block-model generator builds always gets this (its main
+#    starts with the heap init and has no runtime class declarations).
+# 2. Something already allocated -- for example a program that carries a
+#    top-level `class`, whose class_def runs at startup, such as the
+#    block-model engine compiled natively for its own tests. The table then
+#    goes wherever the heap has room and its address is kept in
+#    set_var/get, exactly as before. That lookup is not thread-safe, so
+#    this arrangement is single-threaded only.
 make a function called bm_heap_init returns done
   let slots = bm_freelist_table_size()
-  let table = rt_heap_alloc(slots * 16)
+  if bm_heap_fixed_ready() then
+    return true
+  end
+  let table = rt_heap_alloc(bm_freelist_header_bytes() + slots * 16)
+  mem_poke_qword(table, 0, 0)
+  mem_poke_qword(table, 8, 0)
+  mem_poke_qword(table, 16, bm_heap_magic())
   let i = 0
   while i < slots do
-    mem_poke_qword(table, i * 16, 0)
-    mem_poke_qword(table, i * 16 + 8, 0)
+    mem_poke_qword(table, bm_freelist_header_bytes() + i * 16, 0)
+    mem_poke_qword(table, bm_freelist_header_bytes() + i * 16 + 8, 0)
     let i = i + 1
   end
-  set_var("bm_freelist_table", table)
+  if table != mem_heap_base() then
+    set_var("bm_freelist_table", table)
+  end
   return true
 end
 
 make a function called bm_freelist_table_addr returns addr
+  if bm_heap_fixed_ready() then
+    return mem_heap_base()
+  end
   return get("__vars", "bm_freelist_table")
+end
+
+# Ticket lock over the free list, built from rt_atomic_fetch_add alone (no
+# compare-and-swap exists as an intrinsic): take the next ticket, spin until
+# it is being served, and hand over by bumping now_serving. Held only across a
+# handful of loads and stores, so contention stays short.
+make a function called bm_freelist_lock returns done
+  let table = bm_freelist_table_addr()
+  let mine = rt_atomic_fetch_add(table, 1)
+  while mem_peek_qword(table, 8) != mine do
+    let spin = 0
+  end
+  return true
+end
+
+make a function called bm_freelist_unlock returns done
+  rt_atomic_fetch_add(bm_freelist_table_addr() + 8, 1)
+  return true
 end
 
 make a function called bm_freelist_slot_offset takes size returns off
@@ -78,7 +150,7 @@ make a function called bm_freelist_slot_offset takes size returns off
   let slots = bm_freelist_table_size()
   let i = 0
   while i < slots do
-    let off = i * 16
+    let off = bm_freelist_header_bytes() + i * 16
     let s = mem_peek_qword(table, off)
     if s == size then
       return off
@@ -113,29 +185,36 @@ make a function called bm_bytes_bumped returns n
 end
 
 make a function called bm_freelist_pop takes size returns addr
+  bm_freelist_lock()
   let off = bm_freelist_slot_offset(size)
   if off == 0 - 1 then
+    bm_freelist_unlock()
     return 0
   end
   let table = bm_freelist_table_addr()
   let head = mem_peek_qword(table, off + 8)
   if head == 0 then
+    bm_freelist_unlock()
     return 0
   end
   let next = mem_peek_qword(head, 0)
   mem_poke_qword(table, off + 8, next)
+  bm_freelist_unlock()
   return head
 end
 
 make a function called bm_freelist_push takes size, base returns done
+  bm_freelist_lock()
   let off = bm_freelist_slot_offset(size)
   if off == 0 - 1 then
+    bm_freelist_unlock()
     return false
   end
   let table = bm_freelist_table_addr()
   let head = mem_peek_qword(table, off + 8)
   mem_poke_qword(base, 0, head)
   mem_poke_qword(table, off + 8, base)
+  bm_freelist_unlock()
   return true
 end
 
@@ -155,9 +234,16 @@ make a function called bm_rc_get takes ptr returns n
   return mem_peek_qword(ptr, 0 - 8)
 end
 
+# Atomic (issue #176): rt_atomic_fetch_add is `lock xadd`, so concurrent
+# increments and decrements never lose an update, and exactly one thread sees
+# the count fall to zero and frees the block. bm_rc_get and
+# bm_rc_touch_for_mutation stay plain reads: a count of 1 means this thread
+# holds the only reference, and a second reference can only ever be created
+# from an existing one, so nothing can raise it concurrently -- the check
+# followed by an in-place write is sound. A larger count merely makes the
+# caller clone, which is safe whatever other threads do.
 make a function called bm_rc_inc takes ptr returns n
-  let n = mem_peek_qword(ptr, 0 - 8) + 1
-  mem_poke_qword(ptr, 0 - 8, n)
+  let n = rt_atomic_fetch_add(ptr - 8, 1) + 1
   return n
 end
 
@@ -168,12 +254,11 @@ make a function called bm_rc_dec takes ptr, payload_size returns n
   # recording an object's own size yet. A real merge into x64_runtime
   # .patlang's actual heap would need one; deliberately out of scope for
   # proving Fork D standalone.
-  let n = mem_peek_qword(ptr, 0 - 8) - 1
+  let n = rt_atomic_fetch_add(ptr - 8, 0 - 1) - 1
   if n <= 0 then
     bm_freelist_push(bm_align8(payload_size), ptr - 8)
     return 0
   end
-  mem_poke_qword(ptr, 0 - 8, n)
   return n
 end
 
