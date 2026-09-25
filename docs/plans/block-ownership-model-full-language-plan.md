@@ -1974,6 +1974,95 @@ authorisation decision itself.
 
 ---
 
+
+## Phase 24 — The cutover (issue #180), executed 2026-09-25
+
+The project owner gave an explicit go-ahead to execute the cutover this session,
+after #145 and #113 were fixed (with a further explicit go-ahead to fix those two
+in the protected native files first, "so they don't get lost in the noise, and so
+hopefully cutover becomes relatively trivial") and after the acceptance gate's
+remaining pieces (#173, closures, classes/methods, the named-object contract,
+list patterns) were delivered.
+
+**What "cutover" means here, as decided.** Given a choice between switching only
+`patc1`'s native entry point, absorbing every file into `block_model/`, or a
+dual-path window, the owner chose the smallest-change option: `self_hosting/lib/
+{lower,codegen_x64,x64_runtime,interp}.patlang` are left in place, and `patc1`'s
+`--x64` flag (previously: lex/parse/lower via `lib/lower.patlang`, then emit
+through `codegen_x64.patlang`) now lowers through the block-model engine instead
+(`block_model/patc_backend.patlang`: `bm_lower_program` then
+`bm_to_real_funcir`), feeding the same per-function object cache and linker.
+`--bm` is kept as an accepted alias for the same path. `codegen_x64.patlang` and
+`x64_runtime.patlang` are not a competing pipeline being retired — they are the
+shared native backend the new lowering emits through, unchanged. `lib/
+lower.patlang` keeps serving the one path `--x64` never used: `patc1`'s
+WASM/rustc-target compile (`emit_program_rs`/`emit_program_rs_chunked`), a
+different backend this cutover does not touch. `lib/interp.patlang` was never a
+competing pipeline either; `block_model/interp.patlang` already reused its
+shared host-function dispatch (`interp_call_host`) since Phase 18, unchanged
+here. Nothing under `self_hosting/lib/` was deleted; the choice was made with
+that understood.
+
+**A real, general native-codegen bug found and fixed while proving the switch,
+not merely while adding features.** Two sequential, sibling `while` loops at the
+top level of one function (or handler) compiled to an infinite loop: the first
+loop's own exit block is a short trampoline into the second loop's head, and
+`bm_lower_while` pushes it to `pending` AFTER the second loop's real exit block
+(a post-order artifact of the recursive construction, present since the design
+was first built), so their physical order in the flattened instruction array
+does not match execution order. The interpreter is unaffected (`bi_run_from`
+follows `JumpBlock` by name and halts the instant any block's instructions run
+out, regardless of array position); native fallthrough between physically
+adjacent blocks silently assumed the two orders agreed. This had already been
+fixed once, correctly, for `"callee"`-mode functions (Phase 21, #173) but never
+extended to `"main"` or `"handler"` mode, because no existing fixture combined
+sequential top-level loops with either. Fixed the same way Phase 21 already
+established: `bm_nc_translate_block_instrs` now appends an explicit terminator
+to every block, per mode (`main`: `Const unit; Return`; `handler`: `Load
+__globals; Return`; `callee`: unchanged), so physical adjacency is never load-
+bearing. RED: `native_sequential_loops.patlang` printed `0 1 2 100 101 102 done`
+then looped `100 101 102 done` forever. GREEN: prints exactly once.
+
+**Other gaps closed while proving parity, each mechanical:** functions defined
+twice by a diamond `include` (first definition wins, #180); a function whose
+whole body tail-calls one declared earlier in the source started executing in
+the callee's own body (the callee-mode block set now starts with the root
+block, `bm_nc_ordered_members`); the bitwise `Bin` operators (`band`/`bor`/
+`bxor`/`shl`/`shr`) were missing from the native operator-hash table (parsed
+identically to `+`/`-`, just never added).
+
+**Acceptance measurement.** A parity harness
+(`self_hosting/tools/bm_parity_one.sh`) compiles each of the 81
+`self_hosting/*_selftest.patlang` files with `patc1.exe <src> <exe> --x64`, runs
+the executable, and compares its output line-for-line with `pat --ir-run`
+(dropping one trailing `true`/`unit`/empty line, the interpreter's own final
+script-value echo). Before the cutover, `lib/lower.patlang`-based `--x64`
+passes 27 of 81. After, the block-model-based `--x64` passes 30 of 81: every
+one of the old pipeline's 27, plus 3 more (`schema_goap_bridge_selftest`,
+`schema_synthesis_hook_selftest`, `zs_explore_selftest`), zero regressions.
+Every remaining failure was checked directly against the same failure under the
+old pipeline: each is identical (an interpreter-only performance-warning line
+neither backend prints; a handful of genuine crashes and output differences
+present in both), except one that changed from a segfault (old) to a clean
+output mismatch (new) — an improvement, not a new gap. Per the owner's own
+guidance during this work ("lean towards correct and consistent behaviour
+rather than necessarily matching existing system precisely"), no attempt was
+made to reproduce the tree-walking interpreter's own silent-unbound-variable-
+reads-as-unit quirk, which is what a few of the never-passing selftests rely on
+(a bare `null` identifier, never bound anywhere) — both native backends
+correctly reject it as undefined.
+
+**Gates, all green after every fix above:** the block-model spec suite (222
+scenarios), the native codegen check (34), the WASM codegen check (21), and the
+full `spec_library/language/*.feature` gate (37 files), run alone per the
+project's own signal-port convention.
+
+**Left open, not blocking this cutover:** issue #185 (native `%` on a bigint
+exits with a heap-commit failure, found and worked around while building an
+unrelated fixture); `thread_spawn` from block-model source (#184); methods vs.
+records as the final answer for class dispatch beyond what #175 already
+delivers; the handful of pre-existing native-compile crashes/gaps the
+measurement above found identical on both sides of the cutover.
 ## What this plan deliberately does not cover
 
 - Actually retiring or modifying `self_hosting/lib/{lower,codegen_x64,

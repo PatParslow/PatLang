@@ -166,6 +166,14 @@ echo "Scenario: a function that tail-calls one declared earlier starts in its ow
 OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/native_tail_call_order.patlang issue180_tail 2>&1)
 check_seq "app prints [A], tailapp prints [B] and [x, C] instead of garbage" "$OUT" "[A] [B] [x, C]"
 
+echo "Scenario: two sequential top-level while loops both run to completion and the program ends (issue #180)"
+OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/native_sequential_loops.patlang issue180_seq 2>&1)
+check_seq "0 1 2 (first loop), 100 101 102 (second loop), done -- not an infinite repeat of the second loop" "$OUT" "0 1 2 100 101 102 done"
+
+echo "Scenario: bitwise Bin operators compile natively (issue #180)"
+OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/native_bitwise_ops.patlang issue180_bitwise 2>&1)
+check_seq "band=8, bor=14, bxor=6, shl=48, shr=6" "$OUT" "8 14 6 48 6"
+
 echo ""
 echo "tests: $PASS passed, $FAIL failed"
 if [ "$FAIL" -eq 0 ]; then

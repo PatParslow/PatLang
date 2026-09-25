@@ -243,3 +243,13 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
     Given a function whose whole body is `return app(l, v)` where `app` is declared before it
     When it is built and run as a real, fully native executable
     Then it prints [A], [B] and [x, C], not values built from stale stack contents
+
+  Scenario: two sequential top-level while loops both run to completion and the program ends (issue #180)
+    Given two sibling while loops at the top level, each printing its own values, followed by one more print
+    When it is built and run as a real, fully native executable
+    Then it prints both loops' values once each and the final print, not an infinite repeat of the second loop
+
+  Scenario: bitwise Bin operators compile natively (issue #180)
+    Given band, bor, bxor, shl and shr on plain ints
+    When it is built and run as a real, fully native executable
+    Then it prints 8, 14, 6, 48 and 6, matching the interpreter
