@@ -2871,6 +2871,131 @@ make a function called rt_bigint_cmp takes tagged_a, tagged_b returns cmp
   end
 end
 
+
+# GitHub #185: |a| * BASE^k (prepends k zero limbs, i.e. shifts the magnitude
+# up by k decimal-limb positions). Used by rt_bigint_mag_divmod's own
+# schoolbook long division below to align the divisor with each output
+# limb position without ever re-deriving it from scratch. k >= 0; the
+# result's own limb count genuinely grows (no trim needed -- the added
+# limbs are all zero and sit BELOW the existing, already-nonzero top limb,
+# so rt_bigint_mag_cmp's own limb-count-first comparison stays correct).
+make a function called rt_bigint_mag_shift takes addr, k returns shifted
+  if k == 0 then
+    return addr
+  end
+  let n = mem_peek_qword(addr, 8)
+  let out = rt_heap_alloc(16 + (n + k) * 8)
+  mem_poke_qword(out, 0, 0)
+  mem_poke_qword(out, 8, n + k)
+  let i = 0
+  while i < k do
+    mem_poke_qword(out, 16 + i * 8, 0)
+    let i = i + 1
+  end
+  let i = 0
+  while i < n do
+    mem_poke_qword(out, 16 + (k + i) * 8, mem_peek_qword(addr, 16 + i * 8))
+    let i = i + 1
+  end
+  return out
+end
+
+# GitHub #185: magnitude long division, |a| = q*|b| + r, 0 <= r < |b|.
+# Schoolbook division, one base-10^9 limb of the quotient at a time (most
+# significant first), each limb found by binary search in [0, 999999999]
+# (about 30 steps) using only rt_bigint_mag_mul/rt_bigint_mag_cmp/
+# rt_bigint_mag_sub -- already-correct, already-tested building blocks --
+# rather than hand-rolled digit arithmetic that could silently overflow a
+# 64-bit accumulator (a single limb times a divisor of unbounded size does
+# not fit in 64 bits the way limb-times-limb does; this sidesteps that
+# entirely by never combining a limb with more than one BASE at a time).
+# Precondition: |b| is nonzero (caller's job -- division by zero is a
+# distinct, separately-checked error, not something this loop can detect
+# cleanly since a zero divisor never satisfies the binary search's own
+# invariant). Returns [quotient_addr, remainder_addr], both unsigned
+# magnitudes; the caller applies whatever sign convention it needs.
+make a function called rt_bigint_mag_divmod takes a_addr, b_addr returns pair
+  if rt_bigint_mag_cmp(a_addr, b_addr) < 0 then
+    return [(rt_bigint_from_i64(0) band rt_payload_mask()), a_addr]
+  end
+  let na = mem_peek_qword(a_addr, 8)
+  let nb = mem_peek_qword(b_addr, 8)
+  let qn = na - nb + 1
+  let q = rt_heap_alloc(16 + qn * 8)
+  mem_poke_qword(q, 0, 0)
+  mem_poke_qword(q, 8, qn)
+  let remainder = a_addr
+  let i = qn - 1
+  while i >= 0 do
+    let shifted = rt_bigint_mag_shift(b_addr, i)
+    let lo = 0
+    let hi = 999999999
+    while lo < hi do
+      let mid = lo + rt_trunc_div(hi - lo + 1, 2)
+      let cand = rt_bigint_mag_mul(shifted, rt_bigint_from_i64(mid) band rt_payload_mask())
+      if rt_bigint_mag_cmp(cand, remainder) <= 0 then
+        let lo = mid
+      else
+        let hi = mid - 1
+      end
+    end
+    mem_poke_qword(q, 16 + i * 8, lo)
+    if lo > 0 then
+      let prod = rt_bigint_mag_mul(shifted, rt_bigint_from_i64(lo) band rt_payload_mask())
+      let remainder = rt_bigint_mag_sub(remainder, prod)
+    end
+    let i = i - 1
+  end
+  return [rt_bigint_trim(q), remainder]
+end
+
+# GitHub #185: `%` with a BigInt operand. Native x64 dispatches `%`
+# through its own dedicated dynamic-mode path (x64_binop_asm_mod_dynamic,
+# codegen_x64.patlang), which handles two genuine fixnums directly and
+# used to hard-exit(97) for anything else -- BigInt `%` had no runtime
+# implementation at all, only that trap (see this function's own call
+# site for the full history). Truncating-toward-zero, matching this
+# backend's plain-int `%` (an ordinary `idiv` remainder) and the
+# interpreter's own BigInt `%`: the result's sign is the DIVIDEND's sign
+# (or zero), never the divisor's. Rational/Complex/Interval have no
+# meaningful `%` in this tower (unchanged from before this fix) and a
+# zero divisor is a genuine error, not silently-wrong output -- both
+# still exit 97, the same distinctive code this trap always used, now
+# reached only for a genuinely unsupported case rather than for BigInt
+# arithmetic that has a well-defined answer.
+make a function called rt_bigint_mod takes a, b returns result
+  let ka = type_of(a)
+  let kb = type_of(b)
+  let ka_ok = (ka == "int") or (ka == "bigint")
+  let kb_ok = (kb == "int") or (kb == "bigint")
+  if (not ka_ok) or (not kb_ok) then
+    os_exit(97)
+  end
+  let pa = a
+  let pb = b
+  if ka == "int" then
+    let pa = rt_bigint_from_i64(a)
+  end
+  if kb == "int" then
+    let pb = rt_bigint_from_i64(b)
+  end
+  let addr_a = pa band rt_payload_mask()
+  let addr_b = pb band rt_payload_mask()
+  let b_is_zero = (mem_peek_qword(addr_b, 8) == 1) and (mem_peek_qword(addr_b, 16) == 0)
+  if b_is_zero then
+    os_exit(97)
+  end
+  let divmod = rt_bigint_mag_divmod(addr_a, addr_b)
+  let r_addr = list_get(divmod, 1)
+  let r_is_zero = (mem_peek_qword(r_addr, 8) == 1) and (mem_peek_qword(r_addr, 16) == 0)
+  let sign_a = mem_peek_qword(addr_a, 0)
+  if (sign_a == 1) and (not r_is_zero) then
+    mem_poke_qword(r_addr, 0, 1)
+  else
+    mem_poke_qword(r_addr, 0, 0)
+  end
+  return r_addr bor rt_bigint_tag()
+end
 # ---- numeric tower: Rational (tower level 2, i64-backed only) ----
 #
 # Rational's tag: family 0x1 (Numeric), local bits 0b011 (bit0 ">=
