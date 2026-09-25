@@ -42,3 +42,15 @@ Feature: full pattern matching (Phase 11 of the full-language expansion)
     Given a match with only literal arms and no wildcard, run against a scrutinee none of them match
     When it runs
     Then it fails with a guaranteed error naming that no arm matched
+
+  List patterns. `case [1, x]` matches a value that is a list of exactly that
+  length whose elements match their own sub-patterns, binding names as it goes,
+  as the real lowerer's compile_list_pattern does; the length is only asked of
+  something already known to be a list, because `and` short-circuits. Three real
+  programs (parser_harness, shape_smoke and the router DSL demo) used them and
+  were rejected as "match pattern kind 'PList'".
+
+  Scenario: list patterns bind elements and fall through exactly as the real engine does
+    Given a function matching an empty list, a literal-and-binding list and a literal-and-two-bindings list, with a string and a number that match no list arm
+    When it runs through bm_lower_program/bi_run
+    Then it prints the same six lines as pat --ir-run does for the identical source

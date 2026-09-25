@@ -4,13 +4,11 @@ Feature: object orientation, fields only (Phase 13 of the full-language expansio
   afterward: this phase supports a class's declared FIELDS only --
   `new("ClassName")` constructs a real, refcounted object from its field
   defaults, and `obj.field` / `obj.field = value` read and write them.
-  Methods, `inherits`, and `traits` are explicitly rejected with a plain
-  message naming which one, not silently ignored -- they need genuine
-  method dispatch (calling into user code with a real return value), which
-  this engine's only call-with-return mechanism (Phase 10's Emit) is
-  deliberately too narrow for (a handler can never itself call another
-  block). Real methods need first-class closures, which this engine has
-  never built (see event_dispatch.feature's own note).
+  Methods, `inherits`, and `traits` were rejected here with a plain message
+  naming which one; issue #175 lifted that restriction (see
+  class_methods.feature: classes are expanded before lowering, methods compile
+  to ordinary functions, and calls dispatch through a per-method dispatcher).
+  This feature keeps its own scope, class fields on Box objects.
 
   An object here is represented as a refcounted Box (Phase 1/3) holding an
   ordinary Handler-shaped assoc-list (Phase 4) of field name/value pairs --
@@ -39,7 +37,7 @@ Feature: object orientation, fields only (Phase 13 of the full-language expansio
     When a field is written through the mut reference
     Then the mut reference's own local sees the new value while the other alias still sees the original
 
-  Scenario: a class declaring inheritance, methods, or traits is rejected plainly
+  Scenario: a class declaring inheritance, methods, or traits is accepted (issue #175)
     Given a class declaration that uses inherits, or declares a method, or declares traits
     When the program is lowered
-    Then it fails with a guaranteed error naming exactly which unsupported feature was used
+    Then it lowers without error: inheritance, methods and traits are supported (issue #175)

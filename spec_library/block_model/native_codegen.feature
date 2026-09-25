@@ -233,3 +233,13 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
     Given the closure programs of closures.feature, whose closure values are called through apply's runtime dispatch
     When each is built and run as a real, fully native executable
     Then the native output is the same sequence of values as pat --ir-run prints for the identical source
+
+  Scenario: a function defined twice by a diamond include builds natively with the first definition winning (issue #180)
+    Given a function defined twice, byte for byte, with an early return inside a loop
+    When it is built and run as a real, fully native executable
+    Then it builds and prints 3 then 2, as it does when the function is defined once
+
+  Scenario: a function that tail-calls one declared earlier starts in its own body (issue #180)
+    Given a function whose whole body is `return app(l, v)` where `app` is declared before it
+    When it is built and run as a real, fully native executable
+    Then it prints [A], [B] and [x, C], not values built from stale stack contents

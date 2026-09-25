@@ -1,0 +1,56 @@
+# The block-model backend for patc1 (GitHub #180, the cutover). patc1 parses a
+# program, lowers it, and hands the resulting FuncIRs to the per-function object
+# cache and the self-hosted assembler and linker. This file is the lowering
+# step of that pipeline built on the block-model engine instead of
+# lib/lower.patlang: bm_lower_program (blocks, JumpBlock, call-with-return,
+# closures, threaded globals) then native_codegen.patlang's bm_to_real_funcir,
+# which produces the same FuncIR shape the old lowerer did, so everything
+# downstream of lowering is shared.
+#
+# Runtime functions (x64_runtime.patlang's rt_* and the library layer) are not
+# lowered here: they live in the cached x64_runtime.obj and reach the program
+# as externs by name. The old lowerer decided Call versus CallHost by whether it
+# saw a definition of the name in the same compilation unit (the runtime was
+# concatenated in front of the program); the block-model lowerer never sees the
+# runtime, so its generic host-call fallback emits CallHost for every name it
+# does not know. bm_patc_resolve_runtime_calls applies the old rule afterwards:
+# a CallHost whose name the runtime defines becomes a Call, with the same
+# argument count and stack layout.
+
+make a function called bm_patc_resolve_instrs takes instrs, rt_names returns out
+  let out = []
+  let n = list_len(instrs)
+  let i = 0
+  while i < n do
+    let instr = list_get(instrs, i)
+    if list_get(instr, 0) == "CallHost" then
+      if x64_name_in_list(rt_names, list_get(instr, 1)) then
+        let out = list_push(out, ["Call", list_get(instr, 1), list_get(instr, 2)])
+      else
+        let out = list_push(out, instr)
+      end
+    else
+      let out = list_push(out, instr)
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called bm_patc_resolve_runtime_calls takes funcirs, rt_names returns out
+  let out = []
+  let n = list_len(funcirs)
+  let i = 0
+  while i < n do
+    let fir = list_get(funcirs, i)
+    let out = list_push(out, list_set(fir, 3, bm_patc_resolve_instrs(list_get(fir, 3), rt_names)))
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called bm_patc_lower takes ast, rt_names returns ir
+  let bm_prog = bm_lower_program(ast)
+  let funcirs = bm_to_real_funcir(bm_prog, "Call")
+  return ["ProgramIR", "main", bm_patc_resolve_runtime_calls(funcirs, rt_names), []]
+end

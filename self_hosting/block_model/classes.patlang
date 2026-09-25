@@ -1,0 +1,475 @@
+# Block Ownership Model: classes with methods, single inheritance and traits, on
+# named objects (GitHub #175).
+#
+# The real engine registers a class's methods as closures at run time and
+# resolves `send(obj, "m", ...)` by the object's `type`: own class, then traits
+# (the LAST listed wins), then the parent, repeating up the chain. Every class is
+# declared in the program, so this pass resolves that at COMPILE time instead, as
+# an AST rewrite that runs before lowering (see bm_expand_classes):
+#
+#   * each method becomes an ordinary top-level function `__cm_<Class>__<m>` with
+#     the method's own parameters (the first is `self`, the object's name);
+#   * a class that has methods, a parent or traits also gets a `class_def(...)`
+#     call in program order, so the real registry supplies field defaults and the
+#     `type` link that `new(class, name)` uses (its methods list is empty: methods
+#     are compiled, not registered);
+#   * each method name called anywhere, with a given argument count, gets one
+#     dispatcher `__send_<m>_<argc>(recv, a0, ...)` that reads `get(recv, "type")`
+#     and calls the resolved method function, falling back to the host `send` so
+#     "set" and unknown methods behave as before;
+#   * `recv.m(args)` and `send(recv, "m", args)` are rewritten to call the
+#     dispatcher; a receiver that is a bare identifier bound nowhere in the
+#     enclosing function stands for the object's NAME, as in the real lowerer.
+#
+# A class table entry is [name, parent, traits, methods], methods being
+# [method_name, params] pairs.
+
+make a function called bm_cls_find takes table, name returns entry
+  let n = list_len(table)
+  let i = 0
+  while i < n do
+    if list_get(list_get(table, i), 0) == name then
+      return list_get(table, i)
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called bm_cls_own_method takes entry, m returns params
+  let methods = list_get(entry, 3)
+  let n = list_len(methods)
+  let i = 0
+  while i < n do
+    if list_get(list_get(methods, i), 0) == m then
+      return list_get(list_get(methods, i), 1)
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# The class that defines the method `m` a call on an object of class `cname`
+# reaches: own class, then traits last-listed-first, then the parent, up the
+# chain (the same order and 64-step guard as the real resolve_class_method).
+# Returns "" when nothing in the chain defines it.
+make a function called bm_cls_resolve takes table, cname, m returns defining
+  let cur = cname
+  let guard = 0
+  while (cur != "") and (guard < 64) do
+    let guard = guard + 1
+    let entry = bm_cls_find(table, cur)
+    if entry == false then
+      return ""
+    end
+    if bm_cls_own_method(entry, m) != false then
+      return cur
+    end
+    let traits = list_get(entry, 2)
+    let ti = list_len(traits) - 1
+    while ti >= 0 do
+      let te = bm_cls_find(table, list_get(traits, ti))
+      if te != false then
+        if bm_cls_own_method(te, m) != false then
+          return list_get(traits, ti)
+        end
+      end
+      let ti = ti - 1
+    end
+    let cur = list_get(entry, 1)
+  end
+  return ""
+end
+
+make a function called bm_cls_method_block takes cls, m returns name
+  return "__cm_" + cls + "__" + m
+end
+
+make a function called bm_cls_dispatch_name takes m, argc returns name
+  return "__send_" + m + "_" + argc
+end
+
+make a function called bm_cls_table_of takes stmts returns table
+  let table = []
+  let n = list_len(stmts)
+  let i = 0
+  while i < n do
+    let s = list_get(stmts, i)
+    if list_get(s, 0) == "ClassDecl" then
+      let methods = []
+      let ms = list_get(s, 4)
+      let mi = 0
+      while mi < list_len(ms) do
+        let methods = list_push(methods, [list_get(list_get(ms, mi), 0), list_get(list_get(ms, mi), 1)])
+        let mi = mi + 1
+      end
+      let table = list_push(table, [list_get(s, 1), list_get(s, 2), list_get(s, 5), methods])
+    end
+    let i = i + 1
+  end
+  return table
+end
+
+# Every [method, argc] pair some `recv.m(...)` or `send(recv, "m", ...)` in the
+# AST calls. A generic walk over nested lists: only the two call shapes matter.
+make a function called bm_cls_scan_sends takes node, acc returns found
+  if type_of(node) != "list" then
+    return acc
+  end
+  let n = list_len(node)
+  if n == 0 then
+    return acc
+  end
+  let tag = list_get(node, 0)
+  if (tag == "MethodCall") and (n >= 4) then
+    let pair = [list_get(node, 2), list_len(list_get(node, 3))]
+    if not bm_cls_pairs_contain(acc, pair) then
+      let acc = list_push(acc, pair)
+    end
+  elif (tag == "Call") and (n >= 3) then
+    if list_get(node, 1) == "send" then
+      let args = list_get(node, 2)
+      if list_len(args) >= 2 then
+        let mnode = list_get(args, 1)
+        if (type_of(mnode) == "list") and (list_len(mnode) >= 2) then
+          if list_get(mnode, 0) == "Str" then
+            let pair = [list_get(mnode, 1), list_len(args) - 2]
+            if not bm_cls_pairs_contain(acc, pair) then
+              let acc = list_push(acc, pair)
+            end
+          end
+        end
+      end
+    end
+  end
+  let i = 0
+  while i < n do
+    let acc = bm_cls_scan_sends(list_get(node, i), acc)
+    let i = i + 1
+  end
+  return acc
+end
+
+make a function called bm_cls_pairs_contain takes pairs, pair returns yes
+  let n = list_len(pairs)
+  let i = 0
+  while i < n do
+    let p = list_get(pairs, i)
+    if (list_get(p, 0) == list_get(pair, 0)) and (list_get(p, 1) == list_get(pair, 1)) then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# The dispatcher for method `m` called with `argc` arguments, or false when no
+# class resolves it with a matching parameter count (the call then stays a plain
+# host send). The fallback inside is the host `send` itself, which is safe from
+# the rewrite because dispatchers are built AFTER the rewrite has run.
+make a function called bm_cls_dispatcher takes table, m, argc returns func
+  let params = ["recv"]
+  let ai = 0
+  while ai < argc do
+    let params = list_push(params, "a" + ai)
+    let ai = ai + 1
+  end
+  let call_args = []
+  let ci = 0
+  while ci < list_len(params) do
+    let call_args = list_push(call_args, ["Var", list_get(params, ci)])
+    let ci = ci + 1
+  end
+  let branches = []
+  let n = list_len(table)
+  let i = 0
+  while i < n do
+    let cname = list_get(list_get(table, i), 0)
+    let defining = bm_cls_resolve(table, cname, m)
+    if defining != "" then
+      let mparams = bm_cls_own_method(bm_cls_find(table, defining), m)
+      if list_len(mparams) == argc + 1 then
+        let branches = list_push(branches, [cname, defining])
+      end
+    end
+    let i = i + 1
+  end
+  if list_len(branches) == 0 then
+    return false
+  end
+  let send_args = [["Var", "recv"], ["Str", m]]
+  let si = 1
+  while si < list_len(params) do
+    let send_args = list_push(send_args, ["Var", list_get(params, si)])
+    let si = si + 1
+  end
+  let chain = [["Return", ["Call", "send", send_args], 0]]
+  let bi = list_len(branches) - 1
+  while bi >= 0 do
+    let b = list_get(branches, bi)
+    let target = ["Call", bm_cls_method_block(list_get(b, 1), m), call_args]
+    let chain = [["If", ["Bin", "==", ["Var", "__t"], ["Str", list_get(b, 0)]], [["Return", target, 0]], chain]]
+    let bi = bi - 1
+  end
+  let body = [["Let", "__t", ["Call", "get", [["Var", "recv"], ["Str", "type"]]], false, false]]
+  let body = list_push(body, list_get(chain, 0))
+  return ["Func", bm_cls_dispatch_name(m, argc), params, body, "r"]
+end
+
+# A receiver that is a bare identifier bound nowhere in the enclosing function
+# is the object's name (the real lowerer treats an unbound variable in receiver
+# position as its own name).
+make a function called bm_cls_recv takes node, bound returns recv
+  if type_of(node) == "list" then
+    if (list_len(node) >= 2) and (list_get(node, 0) == "Var") then
+      if not bm_list_contains(bound, list_get(node, 1)) then
+        return ["Str", list_get(node, 1)]
+      end
+    end
+  end
+  return node
+end
+
+make a function called bm_cls_rewrite_list takes items, bound, disp returns out
+  let out = []
+  let n = list_len(items)
+  let i = 0
+  while i < n do
+    let out = list_push(out, bm_cls_rewrite(list_get(items, i), bound, disp))
+    let i = i + 1
+  end
+  return out
+end
+
+# `disp` is the list of [method, argc] pairs that got a dispatcher.
+make a function called bm_cls_rewrite takes node, bound, disp returns out
+  if type_of(node) != "list" then
+    return node
+  end
+  let n = list_len(node)
+  if n == 0 then
+    return node
+  end
+  let tag = list_get(node, 0)
+  if (tag == "Closure") and (n >= 3) then
+    let params = list_get(node, 1)
+    let body = list_get(node, 2)
+    let inner = bm_bound_names_of(bm_union_preserving_order(bound, params), body)
+    return ["Closure", params, bm_cls_rewrite_list(body, inner, disp)]
+  end
+  if (tag == "Budgeted") and (n >= 4) then
+    let body = list_get(node, 3)
+    let inner = bm_bound_names_of(bound, body)
+    return ["Budgeted", bm_cls_rewrite(list_get(node, 1), bound, disp), bm_cls_rewrite(list_get(node, 2), bound, disp), bm_cls_rewrite_list(body, inner, disp)]
+  end
+  let kids = bm_cls_rewrite_list(node, bound, disp)
+  if (tag == "MethodCall") and (n >= 4) then
+    let m = list_get(node, 2)
+    let args = list_get(kids, 3)
+    let recv = bm_cls_recv(list_get(kids, 1), bound)
+    if bm_cls_pairs_contain(disp, [m, list_len(args)]) then
+      return ["Call", bm_cls_dispatch_name(m, list_len(args)), list_concat_one(recv, args)]
+    end
+    return ["Call", "send", list_concat_one(recv, list_concat_one(["Str", m], args))]
+  end
+  if (tag == "Call") and (n >= 3) then
+    if list_get(node, 1) == "send" then
+      let args = list_get(kids, 2)
+      if list_len(args) >= 2 then
+        let mnode = list_get(args, 1)
+        let recv = bm_cls_recv(list_get(args, 0), bound)
+        let rest = bm_cls_slice_from(args, 2)
+        if (type_of(mnode) == "list") and (list_len(mnode) >= 2) then
+          if (list_get(mnode, 0) == "Str") and bm_cls_pairs_contain(disp, [list_get(mnode, 1), list_len(rest)]) then
+            return ["Call", bm_cls_dispatch_name(list_get(mnode, 1), list_len(rest)), list_concat_one(recv, rest)]
+          end
+        end
+        return ["Call", "send", list_concat_one(recv, list_concat_one(mnode, rest))]
+      end
+    end
+  end
+  if (tag == "Member") and (n >= 3) then
+    let prop = list_get(node, 2)
+    if (prop != "length") and (prop != "len") then
+      return ["Member", bm_cls_recv(list_get(kids, 1), bound), prop]
+    end
+  end
+  if (tag == "MemberAssign") and (n >= 4) then
+    return ["MemberAssign", bm_cls_recv(list_get(kids, 1), bound), list_get(node, 2), list_get(kids, 3)]
+  end
+  return kids
+end
+
+# [item] ++ items, and the tail of a list from index `start`.
+make a function called list_concat_one takes first, rest returns out
+  let out = [first]
+  let n = list_len(rest)
+  let i = 0
+  while i < n do
+    let out = list_push(out, list_get(rest, i))
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called bm_cls_slice_from takes xs, start returns out
+  let out = []
+  let n = list_len(xs)
+  let i = start
+  while i < n do
+    let out = list_push(out, list_get(xs, i))
+    let i = i + 1
+  end
+  return out
+end
+
+# The `class_def(name, parent, [[field, default]...], [], [trait...])` call for a
+# class, as an expression statement.
+make a function called bm_cls_class_def_stmt takes decl returns stmt
+  let fields = []
+  let fs = list_get(decl, 3)
+  let fi = 0
+  while fi < list_len(fs) do
+    let fields = list_push(fields, ["List", [["Str", list_get(list_get(fs, fi), 0)], list_get(list_get(fs, fi), 1)]])
+    let fi = fi + 1
+  end
+  let traits = []
+  let ts = list_get(decl, 5)
+  let ti = 0
+  while ti < list_len(ts) do
+    let traits = list_push(traits, ["Str", list_get(ts, ti)])
+    let ti = ti + 1
+  end
+  return ["Expr", ["Call", "class_def", [["Str", list_get(decl, 1)], ["Str", list_get(decl, 2)], ["List", fields], ["List", []], ["List", traits]]]]
+end
+
+make a function called bm_cls_is_extended takes decl returns yes
+  return (list_len(list_get(decl, 4)) > 0) or (list_get(decl, 2) != "") or (list_len(list_get(decl, 5)) > 0)
+end
+
+# The pass itself: returns the program's top-level statements with classes
+# expanded (see the header). A program with no extended class and no method call
+# to dispatch comes back unchanged.
+make a function called bm_expand_classes takes stmts returns out
+  let table = bm_cls_table_of(stmts)
+  let any_extended = false
+  let n = list_len(stmts)
+  let i = 0
+  while i < n do
+    let s = list_get(stmts, i)
+    if (list_get(s, 0) == "ClassDecl") and bm_cls_is_extended(s) then
+      let any_extended = true
+    end
+    let i = i + 1
+  end
+  if not any_extended then
+    return stmts
+  end
+  let sends = bm_cls_scan_sends(stmts, [])
+  let disp = []
+  let dispatchers = []
+  let si = 0
+  while si < list_len(sends) do
+    let pair = list_get(sends, si)
+    let d = bm_cls_dispatcher(table, list_get(pair, 0), list_get(pair, 1))
+    if d != false then
+      let disp = list_push(disp, pair)
+      let dispatchers = list_push(dispatchers, d)
+    end
+    let si = si + 1
+  end
+  # Pass A: rewrite call sites, one enclosing scope at a time.
+  let top_bound = []
+  let ti = 0
+  while ti < n do
+    let s = list_get(stmts, ti)
+    let ty = list_get(s, 0)
+    if (ty != "Func") and (ty != "When") and (ty != "ClassDecl") then
+      let top_bound = bm_collect_let_names([s], top_bound)
+    end
+    let ti = ti + 1
+  end
+  let rewritten = []
+  let has_main = false
+  let methods_out = []
+  let class_defs = []
+  let first_func = 0 - 1
+  let i = 0
+  while i < n do
+    let s = list_get(stmts, i)
+    let ty = list_get(s, 0)
+    if ty == "Func" then
+      if first_func < 0 then
+        let first_func = list_len(rewritten)
+      end
+      let params = list_get(s, 2)
+      let body = list_get(s, 3)
+      let bound = bm_bound_names_of(params, body)
+      let rewritten = list_push(rewritten, list_set(s, 3, bm_cls_rewrite_list(body, bound, disp)))
+    elif ty == "When" then
+      let body = list_get(s, 2)
+      let bound = bm_bound_names_of(["event_name", "event_data"], body)
+      let rewritten = list_push(rewritten, list_set(s, 2, bm_cls_rewrite_list(body, bound, disp)))
+    elif ty == "ClassDecl" then
+      let rewritten = list_push(rewritten, s)
+      let ms = list_get(s, 4)
+      let mi = 0
+      while mi < list_len(ms) do
+        let mth = list_get(ms, mi)
+        let mbody = list_get(mth, 2)
+        let mbound = bm_bound_names_of(list_get(mth, 1), mbody)
+        let methods_out = list_push(methods_out, ["Func", bm_cls_method_block(list_get(s, 1), list_get(mth, 0)), list_get(mth, 1), bm_cls_rewrite_list(mbody, mbound, disp), "r"])
+        let mi = mi + 1
+      end
+      if bm_cls_is_extended(s) then
+        let def_stmt = bm_cls_class_def_stmt(s)
+        let class_defs = list_push(class_defs, def_stmt)
+        let rewritten = list_push(rewritten, def_stmt)
+      end
+    else
+      let has_main = true
+      let rewritten = list_push(rewritten, bm_cls_rewrite(s, top_bound, disp))
+    end
+    let i = i + 1
+  end
+  # No top-level statements: the class_def calls have nowhere to run, so they go
+  # at the start of the first function (the entry), and out of the main list.
+  if (not has_main) and (first_func >= 0) then
+    let cleaned = []
+    let ri = 0
+    while ri < list_len(rewritten) do
+      let r = list_get(rewritten, ri)
+      if list_get(r, 0) != "Expr" then
+        let cleaned = list_push(cleaned, r)
+      end
+      let ri = ri + 1
+    end
+    let ff = list_get(cleaned, first_func)
+    let ff_body = list_get(ff, 3)
+    let cleaned = list_set(cleaned, first_func, list_set(ff, 3, bm_cls_concat(class_defs, ff_body)))
+    let rewritten = cleaned
+  end
+  let out = rewritten
+  let mi = 0
+  while mi < list_len(methods_out) do
+    let out = list_push(out, list_get(methods_out, mi))
+    let mi = mi + 1
+  end
+  let di = 0
+  while di < list_len(dispatchers) do
+    let out = list_push(out, list_get(dispatchers, di))
+    let di = di + 1
+  end
+  return out
+end
+
+make a function called bm_cls_concat takes a, b returns out
+  let out = a
+  let n = list_len(b)
+  let i = 0
+  while i < n do
+    let out = list_push(out, list_get(b, i))
+    let i = i + 1
+  end
+  return out
+end

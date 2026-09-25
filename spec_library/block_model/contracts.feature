@@ -38,3 +38,15 @@ Feature: design by contract (Phase 12 of the full-language expansion)
     Given a block with a statement before a failing assert and a statement after it
     When it runs
     Then the statement before the assert already ran and the statement after it never does
+
+  Since Phase 17 this engine can call any host function, so require, ensure and
+  assert now lower to the same `contract_check(func_name, kind, text, ok)` host
+  call the real lowerer emits (issue #180). Besides failing the way the real engine
+  does when `ok` is false, a passing check records a `contract_holds` fact that
+  `solve("contract_holds", [function, "X"])` can find; the earlier ContractFail
+  branch never recorded one, so a program that queried its own contracts got none.
+
+  Scenario: passing contracts are recorded as queryable facts, as in the real engine
+    Given a function with one passing require and one passing ensure, called once, then a solve over contract_holds for that function
+    When it runs through bm_lower_program/bi_run
+    Then solve finds two facts, as pat --ir-run does for the identical source

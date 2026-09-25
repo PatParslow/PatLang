@@ -70,7 +70,7 @@ check "read_file reads back exactly what write_file wrote" "$OUT" "native round 
 echo "Scenario: a failing require aborts through real native codegen, exiting with a nonzero code (Phase 19)"
 bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/native_contract_fail.patlang phase19_contract_fail >/tmp/phase19_contract_fail.out 2>&1
 CONTRACT_CODE=$?
-check "names the failing require, matching the interpreter's own message" "$(cat /tmp/phase19_contract_fail.out)" "require failed: 1 > 2"
+check "names the failing require, the real engine's own wording" "$(cat /tmp/phase19_contract_fail.out)" "precondition failed in start(): 1 > 2"
 if [ "$CONTRACT_CODE" -ne 0 ]; then
   echo "  ok: exits with a nonzero code (contract violation), not a silent success"
   PASS=$((PASS + 1))
@@ -157,6 +157,14 @@ OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/b
 check_seq "captured local 15, returned closure 7, passed closure 21, snapshot 100, closure calling closure 7" "$OUT" "15 7 21 100 7"
 OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/closures_in_loops_reference.patlang issue183_closures_in_loops 2>&1)
 check_seq "the loop with a closure created and a closure held in a local totals 309" "$OUT" "309"
+
+echo "Scenario: a function defined twice by a diamond include builds natively with the first definition winning (issue #180)"
+OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/native_duplicate_decls.patlang issue180_dup 2>&1)
+check_seq "count_to(10) returns 3 from inside the loop, count_to(2) runs the loop out and returns 2" "$OUT" "3 2"
+
+echo "Scenario: a function that tail-calls one declared earlier starts in its own body (issue #180)"
+OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/native_tail_call_order.patlang issue180_tail 2>&1)
+check_seq "app prints [A], tailapp prints [B] and [x, C] instead of garbage" "$OUT" "[A] [B] [x, C]"
 
 echo ""
 echo "tests: $PASS passed, $FAIL failed"

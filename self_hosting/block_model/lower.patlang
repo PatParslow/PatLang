@@ -329,6 +329,7 @@ end
 include "block_ir.patlang"
 include "free_vars.patlang"
 include "flight_check.patlang"
+include "classes.patlang"
 
 make a function called bm_is_mut_param_name takes name returns yes
   if name.length < 4 then
@@ -686,6 +687,21 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
   elif ty == "Un" then
     let instrs = bm_lower_expr(list_get(node, 2), instrs, block_names, immut_params)
     return list_push(instrs, ["Un", list_get(node, 1)])
+  elif ty == "MethodCall" then
+    # Issue #175: `obj.method(args)` is the host `send(obj, "method", args...)`,
+    # exactly what the real lowerer emits. A program with classes has already had
+    # its dispatchable calls rewritten to call a dispatcher (bm_expand_classes);
+    # what reaches here is a call on an ad hoc named object or a built-in
+    # method, served by the host send.
+    let margs = list_get(node, 3)
+    let instrs = bm_lower_expr(list_get(node, 1), instrs, block_names, immut_params)
+    let instrs = list_push(instrs, ["Const", "str", list_get(node, 2)])
+    let mi = 0
+    while mi < list_len(margs) do
+      let instrs = bm_lower_expr(list_get(margs, mi), instrs, block_names, immut_params)
+      let mi = mi + 1
+    end
+    return list_push(instrs, ["CallHost", "send", 2 + list_len(margs)])
   elif ty == "Budgeted" then
     # Issue #176: ["Budgeted", ms, existing, body]. Lowered as a call to the
     # interpreter-intercepted `bm_budgeted_run(ms, closure, existing,
@@ -724,10 +740,37 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
     # assoc-list (Phase 13's own header note above). Pop order matches
     # handler_lookup's own Call case below: name pushed first (bottom),
     # handler pushed second (top).
-    let instrs = list_push(instrs, ["Const", "str", prop])
+    # Issue #175: the receiver is EITHER a named object (a string: the name the
+    # real registry knows it by, read with the host `get`) or a Box+Handler
+    # object from new("Class"). The two are told apart at run time by
+    # type_of == "string", so `self.field` inside a method and `obj.field` on a
+    # variable holding a name both work, next to Phase 13's Box objects.
+    if get("__vars", "bm_uses_box") != true then
+      # No Box object can exist in this program: every receiver is a named object.
+      let instrs = bm_lower_expr(obj_node, instrs, block_names, immut_params)
+      let instrs = list_push(instrs, ["Const", "str", prop])
+      return list_push(instrs, ["CallHost", "get", 2])
+    end
+    let tmp = bm_next_synth_name("__mobj")
     let instrs = bm_lower_expr(obj_node, instrs, block_names, immut_params)
+    let instrs = list_push(instrs, ["Store", tmp])
+    let instrs = list_push(instrs, ["Load", tmp])
+    let instrs = list_push(instrs, ["TypeOf"])
+    let instrs = list_push(instrs, ["Const", "str", "string"])
+    let instrs = list_push(instrs, ["Bin", "=="])
+    let instrs = list_push(instrs, ["JumpIfFalse", 0])
+    let jif_pos = list_len(instrs) - 1
+    let instrs = list_push(instrs, ["Load", tmp])
+    let instrs = list_push(instrs, ["Const", "str", prop])
+    let instrs = list_push(instrs, ["CallHost", "get", 2])
+    let instrs = list_push(instrs, ["Jump", 0])
+    let jmp_pos = list_len(instrs) - 1
+    let instrs = list_set(instrs, jif_pos, ["JumpIfFalse", list_len(instrs)])
+    let instrs = list_push(instrs, ["Const", "str", prop])
+    let instrs = list_push(instrs, ["Load", tmp])
     let instrs = list_push(instrs, ["BoxGet"])
-    return list_push(instrs, ["HandlerLookup"])
+    let instrs = list_push(instrs, ["HandlerLookup"])
+    return list_set(instrs, jmp_pos, ["Jump", list_len(instrs)])
   elif ty == "List" then
     # Phase 18: a literal `[a, b, c]` -- lower each item (in written
     # order, matching the real self-hosted lower.patlang's own "List"
@@ -949,8 +992,34 @@ make a function called bm_compile_pattern takes pattern, scrutinee_node returns 
     return [["Bin", "==", scrutinee_node, list_get(pattern, 1)], []]
   elif tag == "PCmp" then
     return [["Bin", list_get(pattern, 1), scrutinee_node, list_get(pattern, 2)], []]
+  elif tag == "PGlob" then
+    # Issue #180: a glob pattern is the host `glob_match(scrutinee, "pattern")`,
+    # as in the real lowerer; it binds nothing.
+    return [["Call", "glob_match", [scrutinee_node, ["Str", list_get(pattern, 1)]]], []]
+  elif tag == "PList" then
+    # Issue #180, mirroring the real compile_list_pattern: the scrutinee is a
+    # list of exactly this many elements and each element matches its own
+    # sub-pattern (which may bind names). `and` short-circuits, so the length
+    # is only asked of something already known to be a list.
+    let subs = list_get(pattern, 1)
+    let pn = list_len(subs)
+    let test = ["Bin", "and", ["Bin", "==", ["Call", "type_of", [scrutinee_node]], ["Str", "list"]], ["Bin", "==", ["Member", scrutinee_node, "length"], ["Num", "" + pn]]]
+    let lets = []
+    let pi = 0
+    while pi < pn do
+      let sub = bm_compile_pattern(list_get(subs, pi), ["Index", scrutinee_node, ["Num", "" + pi]])
+      let test = ["Bin", "and", test, list_get(sub, 0)]
+      let sub_lets = list_get(sub, 1)
+      let sj = 0
+      while sj < list_len(sub_lets) do
+        let lets = list_push(lets, list_get(sub_lets, sj))
+        let sj = sj + 1
+      end
+      let pi = pi + 1
+    end
+    return [test, lets]
   end
-  bm_lower_unsupported("match pattern kind '" + tag + "' (Phase 11 supports PWild/PBind/PLit/PCmp only)")
+  bm_lower_unsupported("match pattern kind '" + tag + "' (supported: PWild/PBind/PLit/PCmp/PGlob/PList)")
   return [["Bool", "false"], []]
 end
 
@@ -1056,15 +1125,15 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
     # own diagnostic shape as closely as this engine's instructions allow.
     let kind = list_get(node, 1)
     let cond = list_get(node, 2)
+    # Issue #180: the real host contract_check(func_name, kind, text, ok), as the
+    # real lowerer emits. It fails the way the real engine does when `ok` is
+    # false and, when true, records a contract_holds fact solve() can query.
+    let instrs = list_push(instrs, ["Const", "str", get("__vars", "bm_current_fn")])
+    let instrs = list_push(instrs, ["Const", "str", kind])
+    let instrs = list_push(instrs, ["Const", "str", bm_expr_to_text(cond)])
     let instrs = bm_lower_expr(cond, instrs, block_names, immut_params)
-    let instrs = list_push(instrs, ["JumpIfFalse", 0])
-    let jif_pos = list_len(instrs) - 1
-    let instrs = list_push(instrs, ["Jump", 0])
-    let jmp_pos = list_len(instrs) - 1
-    let instrs = list_set(instrs, jif_pos, ["JumpIfFalse", list_len(instrs)])
-    let instrs = list_push(instrs, ["ContractFail", kind + " failed: " + bm_expr_to_text(cond)])
-    let instrs = list_set(instrs, jmp_pos, ["Jump", list_len(instrs)])
-    return instrs
+    let instrs = list_push(instrs, ["CallHost", "contract_check", 4])
+    return list_push(instrs, ["Store", bm_next_synth_name("__discard")])
   elif ty == "MemberAssign" then
     # obj.prop = value -- reuses box_set's OWN mut-check and refcount
     # mutate-in-place-vs-clone mechanism unmodified (Phase 13's own header
@@ -1075,9 +1144,7 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
     let obj_node = list_get(node, 1)
     let prop = list_get(node, 2)
     let value_node = list_get(node, 3)
-    if (list_get(obj_node, 0) == "Var") and bm_list_contains(immut_params, list_get(obj_node, 1)) then
-      return list_push(instrs, ["ContractFail", "field write on read-only parameter '" + list_get(obj_node, 1) + "' (declare it `mut_" + list_get(obj_node, 1) + "` to allow mutation)"])
-    end
+    let immut_obj = (list_get(obj_node, 0) == "Var") and bm_list_contains(immut_params, list_get(obj_node, 1))
     # Store obj into a fresh temp ONCE (never re-evaluate a possibly
     # side-effecting object expression twice, the same reasoning
     # compile_pattern's own scrutinee-caching comment gives). Build the
@@ -1090,10 +1157,44 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
     # would give, so it's computed first and reloaded in the right order
     # rather than pushed in the wrong order (a real bug caught here via a
     # genuine segfault, not assumed correct from the shape alone).
+    if get("__vars", "bm_uses_box") != true then
+      # No Box object can exist in this program: a write is the host send "set".
+      let instrs = bm_lower_expr(obj_node, instrs, block_names, immut_params)
+      let instrs = list_push(instrs, ["Const", "str", "set"])
+      let instrs = list_push(instrs, ["Const", "str", prop])
+      let instrs = bm_lower_expr(value_node, instrs, block_names, immut_params)
+      let instrs = list_push(instrs, ["CallHost", "send", 4])
+      return list_push(instrs, ["Store", bm_next_synth_name("__discard")])
+    end
     let tmp = bm_next_synth_name("__objref")
     let tmp2 = bm_next_synth_name("__objnewval")
     let instrs = bm_lower_expr(obj_node, instrs, block_names, immut_params)
     let instrs = list_push(instrs, ["Store", tmp])
+    # Issue #175: a named object (the receiver is a string) is written with the
+    # host `send(name, "set", prop, value)`, the same call the real lowerer
+    # emits; anything else is a Box+Handler object and takes the path below.
+    let instrs = list_push(instrs, ["Load", tmp])
+    let instrs = list_push(instrs, ["TypeOf"])
+    let instrs = list_push(instrs, ["Const", "str", "string"])
+    let instrs = list_push(instrs, ["Bin", "=="])
+    let instrs = list_push(instrs, ["JumpIfFalse", 0])
+    let ma_jif_pos = list_len(instrs) - 1
+    let instrs = list_push(instrs, ["Load", tmp])
+    let instrs = list_push(instrs, ["Const", "str", "set"])
+    let instrs = list_push(instrs, ["Const", "str", prop])
+    let instrs = bm_lower_expr(value_node, instrs, block_names, immut_params)
+    let instrs = list_push(instrs, ["CallHost", "send", 4])
+    let instrs = list_push(instrs, ["Store", bm_next_synth_name("__discard")])
+    let instrs = list_push(instrs, ["Jump", 0])
+    let ma_jmp_pos = list_len(instrs) - 1
+    let instrs = list_set(instrs, ma_jif_pos, ["JumpIfFalse", list_len(instrs)])
+    # Issue #175: the read-only-parameter check belongs to the Box path only: a
+    # named object's name is a plain string, and writing through it (self.n = 0
+    # inside a method) changes the registry, not the parameter.
+    if immut_obj then
+      let instrs = list_push(instrs, ["ContractFail", "field write on read-only parameter '" + list_get(obj_node, 1) + "' (declare it `mut_" + list_get(obj_node, 1) + "` to allow mutation)"])
+      return list_set(instrs, ma_jmp_pos, ["Jump", list_len(instrs)])
+    end
     let instrs = bm_lower_expr(value_node, instrs, block_names, immut_params)
     let instrs = list_push(instrs, ["Const", "str", prop])
     let instrs = list_push(instrs, ["Load", tmp])
@@ -1113,9 +1214,11 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
     # (mutating through a non-Var object expression won't observe its own
     # post-clone update within the same block), not silently papered over.
     if list_get(obj_node, 0) == "Var" then
-      return list_push(instrs, ["Store", list_get(obj_node, 1)])
+      let instrs = list_push(instrs, ["Store", list_get(obj_node, 1)])
+    else
+      let instrs = list_push(instrs, ["Store", bm_next_synth_name("__discard")])
     end
-    return list_push(instrs, ["Store", bm_next_synth_name("__discard")])
+    return list_set(instrs, ma_jmp_pos, ["Jump", list_len(instrs)])
   elif ty == "Match" then
     # Mirrors the real lower_match's own shape exactly: store the
     # scrutinee once (re-evaluating a side-effecting expression per arm
@@ -1337,8 +1440,8 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
         return list_push(instrs, ["Store", "__bm_discard"])
       end
     end
-    bm_lower_unsupported("a call to anything other than print, a box_*/global/handler builtin, or a declared block")
-    return instrs
+    let instrs = bm_lower_expr(call, instrs, block_names, immut_params)
+    return list_push(instrs, ["Store", "__bm_discard"])
   elif ty == "Return" then
     let e = list_get(node, 1)
     if list_get(e, 0) == "Call" then
@@ -2040,13 +2143,95 @@ make a function called bm_collect_toplevel_main takes stmts returns out
   return out
 end
 
+# Issue #180: true when the program can create a Box+Handler object at all: a
+# one-argument `new("Class")`, or any of the box_*/handler_* builtins. Member
+# reads and writes only need the Box branch (and, natively, the heap) in that
+# case; otherwise every receiver is a named object and they lower to the host
+# get/send directly.
+make a function called bm_ast_uses_box takes node returns yes
+  if type_of(node) != "list" then
+    return false
+  end
+  let n = list_len(node)
+  if n == 0 then
+    return false
+  end
+  if (list_get(node, 0) == "Call") and (n >= 3) then
+    let name = list_get(node, 1)
+    if (name == "box_new") or (name == "box_get") or (name == "box_set") or (name == "box_share") or (name == "handler_new") or (name == "handler_register") or (name == "handler_lookup") then
+      return true
+    end
+    if (name == "new") and (list_len(list_get(node, 2)) == 1) then
+      return true
+    end
+  end
+  let i = 0
+  while i < n do
+    if bm_ast_uses_box(list_get(node, i)) then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# A bucket index in 0..1023 for a short key (a declaration name), by a plain
+# polynomial hash over its characters. Keys are short, so scanning them is fine.
+make a function called bm_key_slot takes key returns slot
+  let h = 7
+  let n = key.length
+  let i = 0
+  while i < n do
+    let h = (h * 31 + char_code(key, i)) % 1000003
+    let i = i + 1
+  end
+  return h % 1024
+end
+
+# Issue #180: `include` is plain textual splicing, so a file reached through more
+# than one path (a diamond) defines its functions more than once, byte for byte.
+# The old pipeline kept the FIRST definition of each name (patc1's program_funcs
+# filter); the block-model program must too, or two blocks share one name and the
+# flattening cannot tell them apart. Only functions and classes are deduplicated.
+# Names are tracked in a hash-bucketed set (1024 buckets keyed by hash_string) so
+# the pass is linear in the number of functions, not quadratic.
+make a function called bm_dedupe_decls takes stmts returns out
+  let out = []
+  let buckets = []
+  let bi = 0
+  while bi < 1024 do
+    let buckets = list_push(buckets, [])
+    let bi = bi + 1
+  end
+  let n = list_len(stmts)
+  let i = 0
+  while i < n do
+    let s = list_get(stmts, i)
+    let ty = list_get(s, 0)
+    if (ty == "Func") or (ty == "ClassDecl") then
+      let key = ty + ":" + list_get(s, 1)
+      let slot = bm_key_slot(key)
+      let bucket = list_get(buckets, slot)
+      if not bm_list_contains(bucket, key) then
+        let buckets = list_set(buckets, slot, list_push(bucket, key))
+        let out = list_push(out, s)
+      end
+    else
+      let out = list_push(out, s)
+    end
+    let i = i + 1
+  end
+  return out
+end
+
 make a function called bm_lower_program takes ast returns prog
   set_var("bm_synth_counter", 0)
   set_var("bm_closure_blocks", [])
   set_var("bm_budgeted_depth", 0)
   set_var("bm_fn_bound_names", [])
   set_var("bm_ct_blocks_by_name", [])
-  let stmts = bm_collect_toplevel_main(list_get(ast, 1))
+  set_var("bm_uses_box", bm_ast_uses_box(list_get(ast, 1)))
+  let stmts = bm_collect_toplevel_main(bm_expand_classes(bm_dedupe_decls(list_get(ast, 1))))
   let n = list_len(stmts)
 
   # Pass 0 (Phase 13): a compile-time-only class registry (name -> field
@@ -2066,15 +2251,9 @@ make a function called bm_lower_program takes ast returns prog
       let cfields = list_get(stmt, 3)
       let cmethods = list_get(stmt, 4)
       let ctraits = list_get(stmt, 5)
-      if cparent != "" then
-        bm_lower_unsupported("class '" + cname + "' declares `inherits " + cparent + "` -- Phase 13's restricted subset supports fields only, no inheritance yet")
-      end
-      if list_len(cmethods) > 0 then
-        bm_lower_unsupported("class '" + cname + "' declares a method -- Phase 13's restricted subset supports fields only, no method dispatch yet")
-      end
-      if list_len(ctraits) > 0 then
-        bm_lower_unsupported("class '" + cname + "' declares traits -- Phase 13's restricted subset supports fields only, no traits yet")
-      end
+      # Issue #175: inherits, methods and traits are now handled by
+      # bm_expand_classes before this pass (see classes.patlang); the registry
+      # here still holds each class's OWN fields, for new("Class") objects.
       set_var("bm_class_registry", bm_class_registry_set(get("__vars", "bm_class_registry"), cname, cfields))
     end
     let i = i + 1
@@ -2135,6 +2314,7 @@ make a function called bm_lower_program takes ast returns prog
         let pi = pi + 1
       end
       set_var("bm_fn_bound_names", bm_bound_names_of(declared_params, body))
+      set_var("bm_current_fn", name)
       let top_result = bm_lower_top_level_stmt_list(body, 0, [], block_names, blocks_by_name, immut_params, declared_params, [], [], ["none"])
       let instrs = list_get(top_result, 0)
       let synthesized = list_get(top_result, 1)
@@ -2157,6 +2337,7 @@ make a function called bm_lower_program takes ast returns prog
       let handler_immut_params = ["event_name", "event_data"]
       let handler_known_locals = ["event_name", "event_data"]
       set_var("bm_fn_bound_names", bm_bound_names_of(["event_name", "event_data"], body))
+      set_var("bm_current_fn", handler_name)
       # Issue #178: the declared-function tables are passed for real, so a
       # handler can call declared functions. Phase 10 passed empty tables
       # because a handler was run as a single bounded step with no way to
