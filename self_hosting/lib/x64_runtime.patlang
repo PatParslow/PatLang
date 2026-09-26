@@ -769,7 +769,24 @@ end
 # no chr() primitive" workaround rt_dquote_str's own header used to
 # note; that function is left as-is (already correct), just no longer
 # the only way to build a 1-byte string.
-make a function called chr takes n returns s
+#
+# GitHub #186: `n` used to be taken as a raw tagged word with no type
+# check at all (`mem_poke_byte(result, 8, n)`) -- correct only when `n`
+# is a genuine plain int. `/` on two ints promotes to Rational unless
+# exact (this backend's own dynamic-mode `/`, matching the interpreter),
+# so any byte-math idiom like `chr(192 + cp / 64)` (lib/utf8.patlang's
+# own UTF-8 encoder) hands chr() a Rational-tagged heap pointer, whose
+# low byte is unrelated to the intended value -- wrong output, not a
+# crash (mem_poke_byte never dereferences `n` itself). The interpreter's
+# own host_chr truncates any numeric value toward zero first
+# (`as_number()` then `as u32`); this does the same for the case that
+# actually reaches native code, a Rational built from two fixnums.
+make a function called chr takes n0 returns s
+  let n = n0
+  if type_of(n0) == "rational" then
+    let raddr = n0 band rt_payload_mask()
+    let n = rt_trunc_div(mem_peek_qword(raddr, 0), mem_peek_qword(raddr, 8))
+  end
   if n < 0 then
     let result = rt_heap_alloc(8)
     mem_poke_qword(result, 0, 0)
@@ -1306,12 +1323,77 @@ end
 # unset key returns 0 (matches how every actual key is initialized via
 # set_var before its first get, e.g. lower.patlang:629
 # `set_var("__closure_seq", 0)`), not Rust's Unit/nil.
+
+# GitHub #186: same dispatch as print() above, but returning the string
+# instead of writing it -- needed so `get(v, "to_s")` (what `v.to_s`
+# lowers to, a paren-less Member access on a primitive, per lower.
+# patlang's own generic "Member" case) can give the SAME primitive-
+# method result the real interpreter's own host_get/builtin_primitive_
+# method already gives, instead of falling into rt_ns_get's ambient-
+# namespace lookup with a non-string `store` (see get's own header for
+# the real bug this fixes: `rt_ns_find` calls `rt_str_eq` against
+# whatever `v` is once any OTHER namespace already exists, and a plain
+# int/bigint/etc there is not a valid string pointer -- a genuine
+# segfault, not just a wrong "0" result, confirmed via a minimal
+# repro: `set_var("x", 0)` anywhere earlier in the same program, then
+# `print(233.to_s)`).
+make a function called rt_to_display_string takes v returns s
+  let kind = type_of(v)
+  if kind == "int" then
+    return rt_int_to_str(v)
+  elif kind == "float" then
+    return rt_format_float_parts(rt_float_decompose(rt_unbox_float_bits(v)))
+  elif kind == "string" then
+    return v
+  elif kind == "bigint" then
+    return rt_bigint_to_string(v)
+  elif kind == "rational" then
+    return rt_rational_to_string(v)
+  elif kind == "complex" then
+    return rt_complex_to_string(v)
+  elif kind == "interval" then
+    return rt_interval_to_string(v)
+  elif kind == "list" then
+    return rt_list_to_display_string(v)
+  elif kind == "bool" then
+    return rt_bool_to_string(v)
+  elif kind == "unit" then
+    return ""
+  end
+  return rt_int_to_str(v)
+end
+
 make a function called set_var takes key, value returns done
   return rt_ns_set("__vars", key, value)
 end
 
 make a function called get takes store, key returns value
-  return rt_ns_get(store, key)
+  # GitHub #186: `v.to_s` (a paren-less Member access, lower.patlang's own
+  # generic "Member" case) lowers to this same CallHost, matching the real
+  # interpreter's host_get: a String receiver is a namespace/object NAME
+  # (rt_ns_get, unchanged -- __vars is always passed this way, a literal
+  # string), anything else is a primitive value and only "to_s" is a
+  # recognized method on it (matching the interpreter's own
+  # builtin_primitive_method, which returns Unit for any other key). Before
+  # this fix EVERY receiver went through rt_ns_get regardless of type, so
+  # `(some int/bigint/...).to_s` passed a non-string `store` into
+  # rt_ns_find, which calls rt_str_eq against it as soon as any OTHER
+  # namespace already existed -- a genuine segfault (a plain int is not a
+  # valid string pointer), not just the wrong "0" it silently returned
+  # when no other namespace existed yet to trigger that comparison.
+  if type_of(store) == "string" then
+    return rt_ns_get(store, key)
+  end
+  if key == "to_s" then
+    return rt_to_display_string(store)
+  end
+  # No `unit` literal exists in this dialect (see print()'s own header,
+  # above) -- the same top-level no-else-if idiom produces a genuine
+  # Const(Unit), matching the interpreter's own builtin_primitive_
+  # method's None -> Value::Unit for any primitive method other than
+  # "to_s".
+  if false then
+  end
 end
 
 # ---- real classes for x64 (non-inheriting subset) ----
@@ -2949,23 +3031,79 @@ make a function called rt_bigint_mag_divmod takes a_addr, b_addr returns pair
   return [rt_bigint_trim(q), remainder]
 end
 
-# GitHub #185: `%` with a BigInt operand. Native x64 dispatches `%`
-# through its own dedicated dynamic-mode path (x64_binop_asm_mod_dynamic,
-# codegen_x64.patlang), which handles two genuine fixnums directly and
-# used to hard-exit(97) for anything else -- BigInt `%` had no runtime
-# implementation at all, only that trap (see this function's own call
-# site for the full history). Truncating-toward-zero, matching this
+# GitHub #185: `%` between two BigInt/int values (both already promoted to
+# BigInt by rt_dynamic_mod, below). Truncating-toward-zero, matching this
 # backend's plain-int `%` (an ordinary `idiv` remainder) and the
 # interpreter's own BigInt `%`: the result's sign is the DIVIDEND's sign
-# (or zero), never the divisor's. Rational/Complex/Interval have no
-# meaningful `%` in this tower (unchanged from before this fix) and a
-# zero divisor is a genuine error, not silently-wrong output -- both
-# still exit 97, the same distinctive code this trap always used, now
-# reached only for a genuinely unsupported case rather than for BigInt
-# arithmetic that has a well-defined answer.
+# (or zero), never the divisor's.
+make a function called rt_bigint_mod_impl takes addr_a, addr_b returns result
+  let divmod = rt_bigint_mag_divmod(addr_a, addr_b)
+  let r_addr = list_get(divmod, 1)
+  let r_is_zero = (mem_peek_qword(r_addr, 8) == 1) and (mem_peek_qword(r_addr, 16) == 0)
+  let sign_a = mem_peek_qword(addr_a, 0)
+  if (sign_a == 1) and (not r_is_zero) then
+    mem_poke_qword(r_addr, 0, 1)
+  else
+    mem_poke_qword(r_addr, 0, 0)
+  end
+  return r_addr bor rt_bigint_tag()
+end
+
+# GitHub #186: `%` between two Rational (or Rational-and-int) values, real
+# floating-point-style modulo (a - b*trunc(a/b)), matching the interpreter
+# exactly -- confirmed directly (`(117/4) % 64` is `117/4` unchanged since
+# 117/4 < 64, `64 % (7/2)` is the plain int `1`), not the "no meaningful
+# %" case an earlier pass at #185 assumed Rational to be before actually
+# checking. trunc(a/b) is computed by cross-multiplying the two fractions'
+# numerators/denominators (rt_rational_new's own invariant keeps every
+# denominator positive, so rt_trunc_div's sign handling needs no
+# adjustment), reusing the already-correct rt_rational_mul/sub -- no new
+# arithmetic primitive needed.
+make a function called rt_rational_mod takes a, b returns result
+  let addr_a = a band rt_payload_mask()
+  let addr_b = b band rt_payload_mask()
+  let na = mem_peek_qword(addr_a, 0)
+  let da = mem_peek_qword(addr_a, 8)
+  let nb = mem_peek_qword(addr_b, 0)
+  let db = mem_peek_qword(addr_b, 8)
+  let q = rt_trunc_div(na * db, da * nb)
+  return rt_rational_sub(a, rt_rational_mul(b, rt_rational_from_i64(q)))
+end
+
+# GitHub #185/#186: `%` with a BigInt or Rational operand. Native x64
+# dispatches `%` through its own dedicated dynamic-mode path
+# (x64_binop_asm_mod_dynamic, codegen_x64.patlang), which handles two
+# genuine fixnums directly and used to hard-exit(97) for ANYTHING else --
+# BigInt and Rational `%` had no runtime implementation at all, only that
+# trap. int-vs-int can never reach here (the fixnum fast path handles it),
+# so the mixed/promoted cases below are the only int-typed ones possible.
+# Complex/Interval genuinely have no `%` defined in this tower and a zero
+# divisor is a real error, not silently-wrong output -- both still exit
+# 97, the same distinctive code this trap always used, now reached only
+# for a genuinely unsupported case.
 make a function called rt_bigint_mod takes a, b returns result
   let ka = type_of(a)
   let kb = type_of(b)
+  if (ka == "rational") or (kb == "rational") then
+    let ka_rat_ok = (ka == "int") or (ka == "rational")
+    let kb_rat_ok = (kb == "int") or (kb == "rational")
+    if (not ka_rat_ok) or (not kb_rat_ok) then
+      os_exit(97)
+    end
+    let pa = a
+    let pb = b
+    if ka == "int" then
+      let pa = rt_rational_from_i64(a)
+    end
+    if kb == "int" then
+      let pb = rt_rational_from_i64(b)
+    end
+    let b_addr = pb band rt_payload_mask()
+    if mem_peek_qword(b_addr, 0) == 0 then
+      os_exit(97)
+    end
+    return rt_rational_mod(pa, pb)
+  end
   let ka_ok = (ka == "int") or (ka == "bigint")
   let kb_ok = (kb == "int") or (kb == "bigint")
   if (not ka_ok) or (not kb_ok) then
@@ -2985,16 +3123,7 @@ make a function called rt_bigint_mod takes a, b returns result
   if b_is_zero then
     os_exit(97)
   end
-  let divmod = rt_bigint_mag_divmod(addr_a, addr_b)
-  let r_addr = list_get(divmod, 1)
-  let r_is_zero = (mem_peek_qword(r_addr, 8) == 1) and (mem_peek_qword(r_addr, 16) == 0)
-  let sign_a = mem_peek_qword(addr_a, 0)
-  if (sign_a == 1) and (not r_is_zero) then
-    mem_poke_qword(r_addr, 0, 1)
-  else
-    mem_poke_qword(r_addr, 0, 0)
-  end
-  return r_addr bor rt_bigint_tag()
+  return rt_bigint_mod_impl(addr_a, addr_b)
 end
 # ---- numeric tower: Rational (tower level 2, i64-backed only) ----
 #
