@@ -724,6 +724,20 @@ end
 # only 1 (Numeric)/2 (String)/3 (List)/4 (Closure)/5 (Object), so nibble
 # 0xF can ONLY be this sign-extension leak, never a genuine tagged
 # family -- safe to treat identically to nibble 0 (clean fixnum).
+# An inexact `/` yields a Rational, and code that then uses it as an index
+# (`list_get(l, n / 3)`) hands an index-taking primitive a Rational-tagged
+# heap pointer. The interpreter's own as_index truncates a Rational toward
+# zero; this does the same for native. Callers guard with an inline nibble
+# check first (a plain fixnum -- nibble 0, or 15 for a negative one --
+# never reaches here), so the common all-int case pays no call.
+make a function called rt_index_int takes i returns n
+  if type_of(i) == "rational" then
+    let ra = i band rt_payload_mask()
+    return rt_trunc_div(mem_peek_qword(ra, 0), mem_peek_qword(ra, 8))
+  end
+  return i
+end
+
 make a function called to_num takes v returns n
   let nibble = (v shr 60) band 15
   if nibble == 0 then
@@ -801,7 +815,15 @@ end
 # substr(s, start, count) -> byte slice, clamped to the string's actual
 # length (matching Rust's ASCII-path clamping: `st = start.min(len)`,
 # `en = (st+count).min(len)`).
-make a function called substr takes s, start, count returns result
+make a function called substr takes s, start0, count0 returns result
+  let start = start0
+  if (((start0 shr 60) band 15) != 0) and (((start0 shr 60) band 15) != 15) then
+    let start = rt_index_int(start0)
+  end
+  let count = count0
+  if (((count0 shr 60) band 15) != 0) and (((count0 shr 60) band 15) != 15) then
+    let count = rt_index_int(count0)
+  end
   let addr = s band rt_payload_mask()
   let len = mem_peek_qword(addr, 0)
   let st = start
@@ -845,7 +867,11 @@ make a function called sc_len takes handle returns len
   return mem_peek_qword(handle, 0)
 end
 
-make a function called sc_code takes handle, i returns code
+make a function called sc_code takes handle, i0 returns code
+  let i = i0
+  if (((i0 shr 60) band 15) != 0) and (((i0 shr 60) band 15) != 15) then
+    let i = rt_index_int(i0)
+  end
   let len = mem_peek_qword(handle, 0)
   if i < len then
     return mem_peek_byte(handle, 8 + i)
@@ -929,7 +955,11 @@ end
 # char_code(s, idx) -> ASCII byte at idx, or -1 if out of range. Same
 # shape as sc_code, but takes a plain (tagged) string directly rather
 # than an interned handle.
-make a function called char_code takes s, idx returns code
+make a function called char_code takes s, idx0 returns code
+  let idx = idx0
+  if (((idx0 shr 60) band 15) != 0) and (((idx0 shr 60) band 15) != 15) then
+    let idx = rt_index_int(idx0)
+  end
   let addr = s band rt_payload_mask()
   let len = mem_peek_qword(addr, 0)
   if idx < len then
@@ -2160,7 +2190,11 @@ end
 
 # `s[i]` on a String lowers to list_get too (see below), so this checks the
 # family first.
-make a function called rt_list_get takes l, i returns value
+make a function called rt_list_get takes l, i0 returns value
+  let i = i0
+  if (((i0 shr 60) band 15) != 0) and (((i0 shr 60) band 15) != 15) then
+    let i = rt_index_int(i0)
+  end
   let family_mask = 17293822569102704640
   let family = l band family_mask
   if family == rt_string_tag() then
@@ -2281,7 +2315,11 @@ end
 
 # list_set(list, i, item) -> a list with element i replaced, as a value: no
 # other holder of `l` sees the change.
-make a function called rt_list_set_functional takes l, i, v returns tagged
+make a function called rt_list_set_functional takes l, i0, v returns tagged
+  let i = i0
+  if (((i0 shr 60) band 15) != 0) and (((i0 shr 60) band 15) != 15) then
+    let i = rt_index_int(i0)
+  end
   let node = l band rt_payload_mask()
   let n = mem_peek_qword(node, 0)
   if mem_peek_qword(node, 8) != 0 then
@@ -3067,7 +3105,7 @@ make a function called rt_rational_mod takes a, b returns result
   let nb = mem_peek_qword(addr_b, 0)
   let db = mem_peek_qword(addr_b, 8)
   let q = rt_trunc_div(na * db, da * nb)
-  return rt_rational_sub(a, rt_rational_mul(b, rt_rational_from_i64(q)))
+  return rt_rational_demote(rt_rational_sub(a, rt_rational_mul(b, rt_rational_from_i64(q))))
 end
 
 # GitHub #185/#186: `%` with a BigInt or Rational operand. Native x64
@@ -3198,6 +3236,34 @@ make a function called rt_rational_to_string takes tagged returns s
     return rt_int_to_str(n)
   end
   return rt_str_concat(rt_str_concat(rt_int_to_str(n), "/"), rt_int_to_str(d))
+end
+
+# GitHub #186: an exact Rational result (reduced denominator 1) demotes to a
+# plain int -- or a BigInt when it no longer fits a fixnum -- exactly as the
+# interpreter's own ir/numeric.rs::normalize does, so `(1/2) + (1/2)` is `int`
+# on every backend. Applied to a Rational-arithmetic RESULT only; an operand
+# promotion (rt_rational_from_i64) must stay a genuine Rational.
+#
+# The boundary literal is 140737488355327 (2^47 - 1), NOT 140737488355328
+# (2^47): x64_num_const_needs_bigint_promotion's own safe-literal range
+# (codegen_x64.patlang) is +-140737488355327, one narrower on the negative
+# side than the true 48-bit signed range -- using -140737488355328 here
+# forces THAT literal to be BigInt-promoted at the source, making this
+# whole comparison dynamic-mode and feeding `n` (raw memory content, never
+# itself a tagged Value) into family-aware dynamic comparison logic that
+# expects one -- a real, confirmed bug (segfault on the totally unrelated
+# `print(1/2)`, bisected down to this exact off-by-one) before being
+# narrowed to the compiler's own accepted range.
+make a function called rt_rational_demote takes r returns v
+  let ra = r band rt_payload_mask()
+  if mem_peek_qword(ra, 8) == 1 then
+    let n = mem_peek_qword(ra, 0)
+    if (n > 0 - 140737488355327) and (n < 140737488355327) then
+      return n
+    end
+    return rt_bigint_from_i64(n)
+  end
+  return r
 end
 
 make a function called rt_rational_add takes a, b returns tagged
@@ -3812,12 +3878,12 @@ make a function called rt_dynamic_numeric_binop takes a, b, op_code returns resu
       return c >= 0
     end
     if op_code == 0 then
-      return rt_rational_add(pa, pb)
+      return rt_rational_demote(rt_rational_add(pa, pb))
     end
     if op_code == 1 then
-      return rt_rational_sub(pa, pb)
+      return rt_rational_demote(rt_rational_sub(pa, pb))
     end
-    return rt_rational_mul(pa, pb)
+    return rt_rational_demote(rt_rational_mul(pa, pb))
   end
   # Default: BigInt (matches the original DYN_HASTAG fallthrough --
   # any remaining Numeric-family pair that isn't Interval/Complex/

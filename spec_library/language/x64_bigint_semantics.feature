@@ -43,3 +43,35 @@ Feature: BigInt arithmetic agrees between the interpreter and native x64 (GitHub
     Given int, Rational, Bool and List values stringified with .to_s, a byte built via chr() on a Rational produced by /, and several Rational % combinations including negative operands
     When the file is run under `pat --ir-run` and compiled+run via `--x64`
     Then both print the same thirteen lines
+
+  A third, unrelated gap (GitHub #188), found writing a fixture for the second:
+  the self-hosted lexer (used only by `patc1 --x64`, not the interpreter) reads
+  a `.` as the start of a float literal without checking whether a digit
+  follows it, so `233.to_s` (an int literal immediately followed by a
+  paren-less member access, no space) tokenized as the malformed number text
+  "233." with no `.` token left at all for the parser to see -- a parse error,
+  not a runtime issue. Fixed to match the real lexer, which only commits to a
+  float literal when a digit genuinely follows the dot.
+
+  Scenario: an int literal immediately followed by .member parses and runs, matching the interpreter
+    Given 233.to_s, 4.to_s, [1, 2, 3].length, and n.to_s through a variable
+    When the file is run under `pat --ir-run` and compiled+run via `--x64`
+    Then both print the same five lines
+
+  A fourth gap (GitHub #186), found once the previous three were fixed: an
+  exact Rational result never demoted back to Int/BigInt on native x64, even
+  though the interpreter always has (`(1/2) + (1/2)` is `int`, not
+  `rational`). Both backends now agree with the interpreter's own behaviour:
+  Rational demotes on an exact result, matching every other numeric-tower
+  demotion this backend already does (BigInt -> Int, Rational's own
+  `rt_rational_to_string` "d == 1" display case). This matters beyond
+  `type_of`: native x64 decides per-operation whether later arithmetic on a
+  value takes the plain-int or dynamic-mode path from its own static
+  analysis, so a Rational escaping an exact `/`/`%` broke ordinary integer
+  idioms like `(n - n % k) / k` used throughout this codebase, not just the
+  reported type.
+
+  Scenario: an exact Rational result demotes to int, an inexact one stays Rational, matching the interpreter
+    Given exact and inexact sums, an exact and inexact product, an exact subtraction, exact and inexact division, and an exact modulo, all built from Rationals
+    When the file is run under `pat --ir-run` and compiled+run via `--x64`
+    Then both print the same twelve lines
