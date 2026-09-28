@@ -4128,6 +4128,18 @@ make a function called x64_os_exec_run_asm returns asm
   sb_push(sb, "    jmp .exec_cpy_loop_" + suffix + x64_nl_char())
   sb_push(sb, "  .exec_cpy_done_" + suffix + ":" + x64_nl_char())
   sb_push(sb, "    mov byte [r14+rsi], 0" + x64_nl_char())
+  # Wall-clock timeout (exec_capture_io's 4th arg, set via os_set_exec_timeout
+  # right before this run): consumed and cleared here so it applies to this
+  # one run only. [rsp+312]=timeout_ms (0 = none), [rsp+296]=absolute
+  # GetTickCount64 deadline, [rsp+288]=child-has-exited flag, [rsp+320]=
+  # timed-out flag. All inside this function's own 344-byte frame, clear of
+  # PROCESS_INFORMATION (240-263), the bytesRead scratch (272) and the rbx
+  # save slot (280).
+  sb_push(sb, "    mov rax, [rel g_exec_timeout_ms]" + x64_nl_char())
+  sb_push(sb, "    mov qword [rel g_exec_timeout_ms], 0" + x64_nl_char())
+  sb_push(sb, "    mov [rsp+312], rax" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+288], 0" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+320], 0" + x64_nl_char())
   # SECURITY_ATTRIBUTES @80: nLength=24, lpSecurityDescriptor=0, bInheritHandle=1
   sb_push(sb, "    mov qword [rsp+80], 24" + x64_nl_char())
   sb_push(sb, "    mov qword [rsp+88], 0" + x64_nl_char())
@@ -4261,7 +4273,54 @@ make a function called x64_os_exec_run_asm returns asm
   # storing, until real EOF (ReadFile returns 0 bytes), only then
   # falling through to WaitForSingleObject.
   sb_push(sb, "    mov r12, [rsp+104]" + x64_nl_char())
+  # Timeout deadline: a blocking ReadFile cannot time out, so when a
+  # timeout is set the loop below first polls PeekNamedPipe and only calls
+  # ReadFile once data is pending (so it never blocks), sleeping in
+  # WaitForSingleObject(child, 10ms) between polls -- which doubles as the
+  # exit detector -- and killing the child once the deadline passes. Without
+  # a timeout ([rsp+312] == 0) the original blocking loop runs unchanged.
+  sb_push(sb, "    cmp qword [rsp+312], 0" + x64_nl_char())
+  sb_push(sb, "    je .exec_read_loop_" + suffix + x64_nl_char())
+  sb_push(sb, "    call GetTickCount64" + x64_nl_char())
+  sb_push(sb, "    add rax, [rsp+312]" + x64_nl_char())
+  sb_push(sb, "    mov [rsp+296], rax" + x64_nl_char())
   sb_push(sb, "  .exec_read_loop_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    cmp qword [rsp+312], 0" + x64_nl_char())
+  sb_push(sb, "    je .exec_gate_done_" + suffix + x64_nl_char())
+  sb_push(sb, "  .exec_gate_poll_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rcx, r12" + x64_nl_char())
+  sb_push(sb, "    xor rdx, rdx" + x64_nl_char())
+  sb_push(sb, "    xor r8, r8" + x64_nl_char())
+  sb_push(sb, "    xor r9, r9" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+304], 0" + x64_nl_char())
+  sb_push(sb, "    lea rax, [rsp+304]" + x64_nl_char())
+  sb_push(sb, "    mov [rsp+32], rax" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+40], 0" + x64_nl_char())
+  sb_push(sb, "    call PeekNamedPipe" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+  sb_push(sb, "    je .exec_read_done_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov eax, [rsp+304]" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+  sb_push(sb, "    jne .exec_gate_done_" + suffix + x64_nl_char())
+  sb_push(sb, "    cmp qword [rsp+288], 0" + x64_nl_char())
+  sb_push(sb, "    jne .exec_read_done_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rsp+240]" + x64_nl_char())
+  sb_push(sb, "    mov rdx, 10" + x64_nl_char())
+  sb_push(sb, "    call WaitForSingleObject" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+  sb_push(sb, "    jne .exec_gate_deadline_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+288], 1" + x64_nl_char())
+  sb_push(sb, "    jmp .exec_gate_poll_" + suffix + x64_nl_char())
+  sb_push(sb, "  .exec_gate_deadline_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    call GetTickCount64" + x64_nl_char())
+  sb_push(sb, "    cmp rax, [rsp+296]" + x64_nl_char())
+  sb_push(sb, "    jl .exec_gate_poll_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov rcx, [rsp+240]" + x64_nl_char())
+  sb_push(sb, "    mov rdx, 1" + x64_nl_char())
+  sb_push(sb, "    call TerminateProcess" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+320], 1" + x64_nl_char())
+  sb_push(sb, "    jmp .exec_read_done_" + suffix + x64_nl_char())
+  sb_push(sb, "  .exec_gate_done_" + suffix + ":" + x64_nl_char())
   sb_push(sb, "    cmp rbx, r14" + x64_nl_char())
   sb_push(sb, "    jl .exec_read_normal_" + suffix + x64_nl_char())
   sb_push(sb, "    lea rdx, [rel g_scratch]" + x64_nl_char())
@@ -4312,6 +4371,12 @@ make a function called x64_os_exec_run_asm returns asm
   sb_push(sb, "    call GetExitCodeProcess" + x64_nl_char())
   sb_push(sb, "    mov rax, [rsp+272]" + x64_nl_char())
   sb_push(sb, "    mov [rel g_last_exec_exit_code], rax" + x64_nl_char())
+  # -2 marks "killed by the wall-clock timeout", distinct from -1
+  # (CreateProcessA failed) and every real 0-255 exit code.
+  sb_push(sb, "    cmp qword [rsp+320], 0" + x64_nl_char())
+  sb_push(sb, "    je .exec_not_timed_out_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov qword [rel g_last_exec_exit_code], -2" + x64_nl_char())
+  sb_push(sb, "  .exec_not_timed_out_" + suffix + ":" + x64_nl_char())
   sb_push(sb, "    mov rcx, r12" + x64_nl_char())
   sb_push(sb, "    call CloseHandle" + x64_nl_char())
   sb_push(sb, "    mov rcx, [rsp+240]" + x64_nl_char())
@@ -7816,6 +7881,12 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
     sb_push(sb, x64_exec_capture_asm(argc))
   elif name == "os_last_exec_exit_code" then
     sb_push(sb, x64_os_last_exec_exit_code_asm())
+  elif name == "os_set_exec_timeout" then
+    # os_set_exec_timeout(ms): arms a one-shot wall-clock timeout for the
+    # NEXT os_exec_run (consumed and cleared by it). Returns its argument.
+    sb_push(sb, "    pop rax" + x64_nl_char())
+    sb_push(sb, "    mov [rel g_exec_timeout_ms], rax" + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
   elif name == "os_exec_run" then
     # Exposes the SAME primitive x64_exec_capture_asm's CallHost handling
     # already wraps (CreateProcessA + pipe capture, cmdline_addr/
@@ -10333,7 +10404,7 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
   sb_push(sb, x64_nl_char())
   sb_push(sb, "section .bss" + x64_nl_char())
   if owns_globals then
-    sb_push(sb, "    global g_written, g_scratch, g_scratch2, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap_base, g_heap_committed, g_heap_reserved_ready, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init, g_last_recv_error, g_vfs_table, g_classes_table, g_goal_defs_table, g_finddata, g_last_exec_exit_code, g_hwnd, g_canvas_buf, g_canvas_w, g_canvas_h, g_mem_dc, g_msg_scratch, g_paintstruct_scratch, g_bmih_scratch, g_conpty_hpc, g_conpty_in_write, g_conpty_out_read, g_conpty_process, g_pta_list, g_pta_size, g_startupinfoex, g_process_info, g_scratch_cs, g_scratch_cs_ready, g_threads_table, g_resize_pending, g_resize_w, g_resize_h, g_fiber_tls_slot, g_fiber_tls_ready, g_fiber_table_cs, g_fiber_table_cs_ready, g_fiber_table, g_fiber_id_ctr" + x64_nl_char())
+    sb_push(sb, "    global g_written, g_scratch, g_scratch2, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap_base, g_heap_committed, g_heap_reserved_ready, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init, g_last_recv_error, g_vfs_table, g_classes_table, g_goal_defs_table, g_finddata, g_last_exec_exit_code, g_exec_timeout_ms, g_hwnd, g_canvas_buf, g_canvas_w, g_canvas_h, g_mem_dc, g_msg_scratch, g_paintstruct_scratch, g_bmih_scratch, g_conpty_hpc, g_conpty_in_write, g_conpty_out_read, g_conpty_process, g_pta_list, g_pta_size, g_startupinfoex, g_process_info, g_scratch_cs, g_scratch_cs_ready, g_threads_table, g_resize_pending, g_resize_w, g_resize_h, g_fiber_tls_slot, g_fiber_tls_ready, g_fiber_table_cs, g_fiber_table_cs_ready, g_fiber_table, g_fiber_id_ctr" + x64_nl_char())
     sb_push(sb, "    align 8" + x64_nl_char())
     sb_push(sb, "    g_written resd 1" + x64_nl_char())
     sb_push(sb, "    align 8" + x64_nl_char())
@@ -10413,6 +10484,10 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
     # CreateProcessA never started the child at all (no real exit code
     # exists), distinct from any genuine 0-255 process exit code.
     sb_push(sb, "    g_last_exec_exit_code resq 1" + x64_nl_char())
+    sb_push(sb, "    align 8" + x64_nl_char())
+    # One-shot wall-clock timeout for the next os_exec_run (0 = none), see
+    # os_set_exec_timeout. -2 in g_last_exec_exit_code means it fired.
+    sb_push(sb, "    g_exec_timeout_ms resq 1" + x64_nl_char())
     sb_push(sb, "    align 8" + x64_nl_char())
     # Canvas host, Phase 1: window handle + pixel-surface state.
     # Persistent globals (unlike STARTUPINFOA/MSG/WNDCLASSEXW/
@@ -10534,7 +10609,7 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
     sb_push(sb, "    g_fiber_table resq 1" + x64_nl_char())
     sb_push(sb, "    g_fiber_id_ctr resq 1" + x64_nl_char())
   else
-    sb_push(sb, "extern g_written, g_scratch, g_scratch2, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap_base, g_heap_committed, g_heap_reserved_ready, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init, g_last_recv_error, g_vfs_table, g_classes_table, g_goal_defs_table, g_finddata, g_last_exec_exit_code, g_hwnd, g_canvas_buf, g_canvas_w, g_canvas_h, g_mem_dc, g_msg_scratch, g_paintstruct_scratch, g_bmih_scratch, g_conpty_hpc, g_conpty_in_write, g_conpty_out_read, g_conpty_process, g_pta_list, g_pta_size, g_startupinfoex, g_process_info, g_scratch_cs, g_scratch_cs_ready, g_threads_table, g_resize_pending, g_resize_w, g_resize_h, g_fiber_tls_slot, g_fiber_tls_ready, g_fiber_table_cs, g_fiber_table_cs_ready, g_fiber_table, g_fiber_id_ctr" + x64_nl_char())
+    sb_push(sb, "extern g_written, g_scratch, g_scratch2, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_heap_base, g_heap_committed, g_heap_reserved_ready, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init, g_last_recv_error, g_vfs_table, g_classes_table, g_goal_defs_table, g_finddata, g_last_exec_exit_code, g_exec_timeout_ms, g_hwnd, g_canvas_buf, g_canvas_w, g_canvas_h, g_mem_dc, g_msg_scratch, g_paintstruct_scratch, g_bmih_scratch, g_conpty_hpc, g_conpty_in_write, g_conpty_out_read, g_conpty_process, g_pta_list, g_pta_size, g_startupinfoex, g_process_info, g_scratch_cs, g_scratch_cs_ready, g_threads_table, g_resize_pending, g_resize_w, g_resize_h, g_fiber_tls_slot, g_fiber_tls_ready, g_fiber_table_cs, g_fiber_table_cs_ready, g_fiber_table, g_fiber_id_ctr" + x64_nl_char())
     # patlang_wndproc_trampoline AND the two fixed wide-string data
     # labels are only DEFINED by the owns_globals unit (see x64_win_
     # data_and_trampoline_asm, only emitted there) -- every other unit

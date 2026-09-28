@@ -2158,7 +2158,19 @@ make a function called rt_list_new takes n returns tagged
   return addr bor rt_list_tag()
 end
 
+# GitHub #190: list_len(v) on anything that isn't genuinely a String or List
+# is 0, matching the interpreter -- this used to dereference `v`'s raw bits
+# as a heap pointer unconditionally, the same missing-type-check bug
+# rt_list_get had (see its own header). Reachable the same way: a helper
+# that returns `[]` on failure (e.g. synth8_best_join, no join found) feeds
+# straight into `list_len` one line later in several synthesis_*
+# selftests.
 make a function called rt_list_len takes l returns len
+  let family_mask = 17293822569102704640
+  let family = l band family_mask
+  if (family != rt_string_tag()) and (family != rt_list_tag()) then
+    return 0
+  end
   let addr = l band rt_payload_mask()
   return mem_peek_qword(addr, 0)
 end
@@ -2190,6 +2202,23 @@ end
 
 # `s[i]` on a String lowers to list_get too (see below), so this checks the
 # family first.
+#
+# GitHub #190: neither the String nor the List branch bounds-checked `i`
+# against the real length, and there was no guard at all for `l` not being
+# a String or List in the first place -- a raw, arbitrary 64-bit value
+# (e.g. `0` or another out-of-range index's own stray result) then got
+# treated as a heap pointer and dereferenced. The interpreter is never this
+# permissive: an out-of-range String index gives an empty string, an
+# out-of-range List index (or a negative one, either kind) gives Unit, and
+# indexing something that's neither is a type error it never even reaches
+# via ordinary `[i]` syntax. Confirmed as a real, reachable crash, not a
+# theoretical one: `self_hosting/lib/synthesis_disjunctive.patlang`'s own
+# `synth8_best_join` legitimately returns `[]` when no candidate joins,
+# and the caller's very next line indexes it (`cand[0]`/`cand[1]`) --
+# every subsequent list op on that garbage result read further outside
+# any real allocation, segfaulting several `synthesis_*_selftest.patlang`
+# programs under --x64 (not the interpreter, which never dereferences
+# anything for an out-of-range index at all).
 make a function called rt_list_get takes l, i0 returns value
   let i = i0
   if (((i0 shr 60) band 15) != 0) and (((i0 shr 60) band 15) != 15) then
@@ -2199,26 +2228,44 @@ make a function called rt_list_get takes l, i0 returns value
   let family = l band family_mask
   if family == rt_string_tag() then
     let addr = l band rt_payload_mask()
-    let ch = mem_peek_byte(addr, 8 + i)
-    let out = rt_heap_alloc(9)
-    mem_poke_qword(out, 0, 1)
-    mem_poke_byte(out, 8, ch)
+    let slen = mem_peek_qword(addr, 0)
+    if (i >= 0) and (i < slen) then
+      let ch = mem_peek_byte(addr, 8 + i)
+      let out = rt_heap_alloc(9)
+      mem_poke_qword(out, 0, 1)
+      mem_poke_byte(out, 8, ch)
+      return out bor rt_string_tag()
+    end
+    # Out of range: an empty string, matching the interpreter's own
+    # `s[i]` behaviour for any i outside [0, len).
+    let out = rt_heap_alloc(8)
+    mem_poke_qword(out, 0, 0)
     return out bor rt_string_tag()
   end
-  let node = l band rt_payload_mask()
-  while true do
-    let kind = mem_peek_qword(node, 8)
-    if kind == 0 then
-      return mem_peek_qword(mem_peek_qword(node, 16), 16 + i * 8)
-    end
-    if kind == 1 then
-      if i == mem_peek_qword(node, 24) then
-        return mem_peek_qword(node, 32)
+  if family == rt_list_tag() then
+    let node = l band rt_payload_mask()
+    let n = mem_peek_qword(node, 0)
+    if (i >= 0) and (i < n) then
+      while true do
+        let kind = mem_peek_qword(node, 8)
+        if kind == 0 then
+          return mem_peek_qword(mem_peek_qword(node, 16), 16 + i * 8)
+        end
+        if kind == 1 then
+          if i == mem_peek_qword(node, 24) then
+            return mem_peek_qword(node, 32)
+          end
+        end
+        let node = mem_peek_qword(node, 40)
       end
     end
-    let node = mem_peek_qword(node, 40)
   end
-  return 0
+  # Out of range, or `l` isn't a String or List at all: Unit, matching the
+  # interpreter (no `unit` literal exists in this dialect -- the same
+  # no-else-if idiom `get()` and `print()` already use produces a genuine
+  # Const(Unit)).
+  if false then
+  end
 end
 
 # In-place write into a FRESH list's buffer (rt_list_new followed by filling
@@ -4431,6 +4478,50 @@ end
 # because of this. Quoting only when actually needed (this fix) matches
 # the interpreter's real, already-correct behavior exactly, rather than
 # chasing cmd.exe's own idiosyncratic /c re-parsing rules directly.
+# GitHub #190: CreateProcessA (called with lpApplicationName=NULL, so it
+# parses the executable out of lpCommandLine's own first token itself --
+# x64_os_exec_run_asm's own header) fails outright for a relative path
+# with a directory component and no `./`/`.\` prefix, e.g.
+# "rust-runtime/target/release/pat.exe" -- confirmed directly: the exact
+# same string with a leading "./" spawns and captures output correctly,
+# without it CreateProcessA returns FALSE and nothing runs at all. Rust's
+# own std::process::Command (what every OTHER backend's exec_capture goes
+# through) has no such requirement, so this is a genuine native-only gap,
+# not a documented Windows requirement worth reproducing -- normalize it
+# here, the one place every exec_capture/exec_capture_io caller's program
+# argument passes through, rather than at each call site (self_hosting/
+# lib/interp_run.patlang's own hardcoded default path was the first real
+# one found broken this way, reachable from any synthesis_*_selftest.
+# patlang that batch-tests candidate hypotheses in a subprocess).
+make a function called rt_exec_normalize_program_path takes p returns out
+  let plen = rt_str_len(p)
+  if plen == 0 then
+    return p
+  end
+  let c0 = char_code(p, 0)
+  if (c0 == 46) or (c0 == 47) or (c0 == 92) then
+    return p
+  end
+  if plen >= 2 then
+    if char_code(p, 1) == 58 then
+      return p
+    end
+  end
+  let has_slash = false
+  let i = 0
+  while i < plen do
+    let ch = char_code(p, i)
+    if (ch == 47) or (ch == 92) then
+      let has_slash = true
+    end
+    let i = i + 1
+  end
+  if has_slash then
+    return "./" + p
+  end
+  return p
+end
+
 make a function called rt_exec_join_args takes arr, count returns tagged
   let q = rt_dquote_str()
   let e = rt_heap_alloc(8)
@@ -4439,6 +4530,9 @@ make a function called rt_exec_join_args takes arr, count returns tagged
   let i = 0
   while i < count do
     let item = mem_peek_qword(arr, i * 8)
+    if i == 0 then
+      let item = rt_exec_normalize_program_path(item)
+    end
     if i > 0 then
       let result = rt_str_concat(result, " ")
     end
@@ -4455,7 +4549,7 @@ make a function called rt_exec_join_args takes arr, count returns tagged
   return result
 end
 
-# exec_capture_io(program, args, stdin_text) -> [stdout, stderr, success],
+# exec_capture_io(program, args, stdin_text, timeout_ms) -> [stdout, stderr, success],
 # shadowing hosts.rs's own exec_capture_io (list-based args, not
 # variadic) so code written against it -- self_hosting/lib/proc.patlang,
 # in particular -- works UNCHANGED under this native --x64 backend, not
@@ -4477,6 +4571,17 @@ end
 #      os_exec_run primitive. Fine for every current caller
 #      (proc.patlang always passes "") -- a real gap for a future one
 #      that needs it.
+#   2b. timeout_ms > 0 is a real wall-clock timeout, as in the
+#      interpreter: os_set_exec_timeout arms it for the one os_exec_run
+#      that follows, which then polls the pipe instead of blocking in
+#      ReadFile and TerminateProcess-es the child at the deadline. A
+#      timed-out run returns success=false and the stderr slot gets
+#      "timeout after N ms" appended, exactly what the interpreter's
+#      host_exec_capture_io reports. timeout_ms == 0 keeps the plain
+#      blocking path. (The parameter must be declared at all because
+#      interp_run.patlang passes 4 arguments: under the native caller-
+#      pushes/caller-cleans-up convention an arity mismatch corrupts the
+#      callee's own frame, where the interpreter silently drops extras.)
 #   3. `success` IS a real process exit code check (exit code == 0),
 #      via os_last_exec_exit_code -- x64_os_exec_run_asm was extended to
 #      call GetExitCodeProcess and stash the result in a shared global
@@ -4489,7 +4594,7 @@ end
 #      still produces non-empty output, so that heuristic misreported
 #      almost every real failure as success. Fixed for real, not just
 #      documented as a gap.
-make a function called exec_capture_io takes program, args, stdin_text returns result
+make a function called exec_capture_io takes program, args, stdin_text, timeout_ms returns result
   let n = args.length
   let arr = rt_heap_alloc((n + 1) * 8)
   mem_poke_qword(arr, 0, program)
@@ -4501,11 +4606,19 @@ make a function called exec_capture_io takes program, args, stdin_text returns r
   let cmdline = rt_exec_join_args(arr, n + 1)
   let addr = (cmdline band rt_payload_mask()) + 8
   let len = rt_str_len(cmdline)
+  if timeout_ms > 0 then os_set_exec_timeout(timeout_ms) end
   let raw = os_exec_run(addr, len)
   let combined = raw bor rt_string_tag()
   let exit_code = os_last_exec_exit_code()
   let success = exit_code == 0
-  return [combined, combined, success]
+  let errtext = combined
+  if exit_code == 0 - 2 then
+    if rt_str_len(combined) > 0 and char_code(combined, rt_str_len(combined) - 1) != 10 then
+      let errtext = combined + chr(10)
+    end
+    let errtext = errtext + "timeout after " + timeout_ms + " ms"
+  end
+  return [combined, errtext, success]
 end
 
 # ---- rustc_build / rustc_build_chunked_texts (compiled-code
