@@ -8823,7 +8823,7 @@ make a function called label_asm_safe takes ignored returns label
   return "" + n
 end
 
-make a function called x64_emit_instr takes instr, func_name, regmap, spilled, label, is_float_bin, is_float_const, is_dynamic_bin, bool_print_override, float_print_override, is_tower_ctor_arg returns asm
+make a function called x64_emit_instr takes instr, func_name, regmap, spilled, label, is_float_bin, is_float_const, is_dynamic_bin, bool_print_override, float_print_override, is_tower_ctor_arg, float_box_single, float_box_receiver returns asm
   let sb = sb_new()
   sb_push(sb, label + ":" + x64_nl_char())
   let ty = instr[0]
@@ -9124,6 +9124,42 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
                 sb_push(sb, x64_callhost_asm(instr[1], instr[2], spilled))
               else
                 if ty == "Call" then
+                  # GitHub #189: box a genuine unboxed float onto the real
+                  # heap (rt_box_float) immediately before it reaches
+                  # type_of/get, so those see a real runtime tag instead
+                  # of raw float64 bits indistinguishable from a fixnum.
+                  # type_of(v) (1 arg): the single argument is already on
+                  # top of the real stack -- pop it, box it, push the
+                  # boxed result back in its place.
+                  if float_box_single then
+                    # The single argument is already on top of the real
+                    # stack in exactly the position rt_box_float expects
+                    # its own one argument -- call it directly.
+                    sb_push(sb, "    call rt_box_float" + x64_nl_char())
+                    sb_push(sb, "    add rsp, 8" + x64_nl_char())
+                    sb_push(sb, "    push rax" + x64_nl_char())
+                  end
+                  # get(store, key) (2 args): key was pushed last (on top),
+                  # receiver underneath it -- only the receiver may be a
+                  # float (the key is always a string literal like
+                  # "to_s"). rt_box_float's own body gives NO register-
+                  # preservation guarantee (this backend's established
+                  # rule for any ordinary compiled-function call), so key
+                  # is saved on the REAL machine stack across the call,
+                  # not held in a register.
+                  if float_box_receiver then
+                    sb_push(sb, "    pop rcx" + x64_nl_char())
+                    sb_push(sb, "    pop rax" + x64_nl_char())
+                    sb_push(sb, "    push rcx" + x64_nl_char())
+                    sb_push(sb, "    push rax" + x64_nl_char())
+                    sb_push(sb, "    call rt_box_float" + x64_nl_char())
+                    sb_push(sb, "    add rsp, 8" + x64_nl_char())
+                    sb_push(sb, "    push rax" + x64_nl_char())
+                    sb_push(sb, "    pop rax" + x64_nl_char())
+                    sb_push(sb, "    pop rdx" + x64_nl_char())
+                    sb_push(sb, "    push rax" + x64_nl_char())
+                    sb_push(sb, "    push rdx" + x64_nl_char())
+                  end
                   if bool_print_override then
                     sb_push(sb, "    call rt_print_bool" + x64_nl_char())
                   else
@@ -9519,11 +9555,15 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
   let float_instr_indices = []
   let produces_float = []
   let float_const_indices = []
+  let float_box_single_indices = []
+  let float_box_receiver_indices = []
   if float_mode then
     let float_result = x64_analyze_float_bins(instrs, float_func_names)
     let float_instr_indices = float_result[0]
     let produces_float = float_result[1]
     let float_const_indices = x64_analyze_float_consts(instrs, float_result[2], float_instr_indices)
+    let float_box_single_indices = x64_float_box_single_indices(instrs, float_mode, produces_float)
+    let float_box_receiver_indices = x64_float_box_receiver_indices(instrs, float_mode, produces_float)
   end
   let bool_print_overrides = x64_bool_print_call_indices(instrs)
   let i = 0
@@ -9605,7 +9645,9 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
       let is_float_bin = x64_str_in_list(float_instr_indices, i)
       let is_float_const = x64_str_in_list(float_const_indices, i)
       let is_tower_ctor_arg = x64_str_in_list(tower_ctor_arg_indices, i)
-      sb_push(sb, x64_emit_instr(instr, func_name, regmap, spilled, label, is_float_bin, is_float_const, is_dynamic_bin, is_bool_print, is_float_print, is_tower_ctor_arg))
+      let is_float_box_single = x64_str_in_list(float_box_single_indices, i)
+      let is_float_box_receiver = x64_str_in_list(float_box_receiver_indices, i)
+      sb_push(sb, x64_emit_instr(instr, func_name, regmap, spilled, label, is_float_bin, is_float_const, is_dynamic_bin, is_bool_print, is_float_print, is_tower_ctor_arg, is_float_box_single, is_float_box_receiver))
       let i = i + 1
     end
   end
@@ -9889,6 +9931,74 @@ end
 # way to distinguish a float's raw bit pattern from any other family
 # (see print()'s own header in x64_runtime.patlang: it's why floats
 # fell through to the "<value>" placeholder in the first place).
+# GitHub #189: type_of()/.to_s (get) on a genuine unboxed float misreport
+# it as int/garbage -- x64_family_code can only recognize a BOXED float
+# (rt_box_float), and boxing only happens during dynamic-mode arithmetic
+# promotion (see x64_runtime.patlang's rt_box_float header, which already
+# names this exact gap as deliberately deferred compiler-side analysis:
+# "does NOT yet include the compiler-side analysis that would
+# automatically decide WHERE to box a float value before passing it
+# across an unprovable call boundary"). Scoped exactly like
+# x64_float_print_call_indices just above: a Call to type_of (1 arg) or
+# get (2 args -- the RECEIVER only; the key is always a string literal
+# like "to_s", never float-tainted) whose argument is float-tainted per
+# Stage 1's own produces_float array gets boxed via rt_box_float
+# immediately before the call, so type_of/get see a real runtime tag.
+# Deliberately narrow, matching this file's own "named scope limit, not
+# an oversight" convention: does NOT box a float value crossing an
+# ordinary Call argument/Return boundary to another PatLang function --
+# that's the harder, more general case rt_box_float's own header names as
+# real follow-up work, not attempted here.
+make a function called x64_float_box_single_indices takes instrs, float_mode, produces_float returns indices
+  let out = []
+  if not float_mode then
+    return out
+  end
+  let n = to_num(list_len(instrs))
+  let i = 0
+  while i < n do
+    let instr = instrs[i]
+    if instr[0] == "Call" then
+      if instr[1] == "type_of" then
+        if to_num(instr[2]) == 1 then
+          if i > 0 then
+            if produces_float[i - 1] then
+              let out = list_push(out, i)
+            end
+          end
+        end
+      end
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called x64_float_box_receiver_indices takes instrs, float_mode, produces_float returns indices
+  let out = []
+  if not float_mode then
+    return out
+  end
+  let n = to_num(list_len(instrs))
+  let i = 0
+  while i < n do
+    let instr = instrs[i]
+    if instr[0] == "Call" then
+      if instr[1] == "get" then
+        if to_num(instr[2]) == 2 then
+          if i > 1 then
+            if produces_float[i - 2] then
+              let out = list_push(out, i)
+            end
+          end
+        end
+      end
+    end
+    let i = i + 1
+  end
+  return out
+end
+
 make a function called x64_float_print_call_indices takes instrs, float_mode, int_overrides, bool_print_overrides returns overrides
   let out = []
   if not float_mode then

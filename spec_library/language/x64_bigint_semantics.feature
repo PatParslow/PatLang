@@ -75,3 +75,25 @@ Feature: BigInt arithmetic agrees between the interpreter and native x64 (GitHub
     Given exact and inexact sums, an exact and inexact product, an exact subtraction, exact and inexact division, and an exact modulo, all built from Rationals
     When the file is run under `pat --ir-run` and compiled+run via `--x64`
     Then both print the same twelve lines
+
+  A fifth gap (GitHub #189), found testing #187's own .to_s fix against a
+  float value directly: type_of() and .to_s only ever recognized a BOXED
+  float (rt_box_float), and boxing only happened as a side effect of
+  dynamic-mode arithmetic promotion. A genuine unboxed float -- a bare
+  float literal in a function with no other dynamic-mode trigger, or the
+  direct result of sqrt()/sin()/etc. -- carries no runtime tag at all, so
+  type_of misread its raw bit pattern as a plain int. rt_box_float's own
+  header already named the missing piece: "the compiler-side analysis that
+  would automatically decide WHERE to box a float value ... across an
+  unprovable call boundary." Native x64 now runs that analysis (reusing
+  the same per-instruction float taint used for print's own float-aware
+  fix) for the two call boundaries that actually need a real tag: a Call
+  to type_of, and the receiver argument of a Call to get (the primitive
+  behind .to_s and other generic member access) -- boxing the value there,
+  immediately before the call, rather than trying to box every float the
+  moment it's created.
+
+  Scenario: type_of and .to_s recognize a genuine unboxed float, whether from a bare literal or sqrt()'s direct result
+    Given a bare float literal and the direct, un-promoted result of sqrt()
+    When the file is run under `pat --ir-run` and compiled+run via `--x64`
+    Then both print the same six lines: float, its string form, float again, the sqrt result's string form, the literal's own correct print, and "after"
