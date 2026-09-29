@@ -32,6 +32,44 @@ make a function called x64_content_hash takes s returns digest
   return "" + h
 end
 
+# Real, confirmed O(n^2) cost, found chasing a `patc1.exe --x64` compile
+# that took minutes for even a trivial program (CPU-bound, climbing, no
+# I/O wait -- ruled out a blocking call or firewall prompt directly).
+# char_code(s, i) re-checks s.is_ascii() on the WHOLE string on EVERY
+# call (rust-runtime's own String host functions; confirmed identical in
+# codegen.rs's compiled-into-patc1.exe version, not just hosts.rs's
+# interpreter path) -- x64_content_hash above is an O(n)-per-call loop
+# over the whole string, i.e. genuinely O(n^2) overall. Its two
+# large-input callers -- x64_compiler_fingerprint's whole-file hash of
+# codegen_x64.patlang, and build_native's hash of the fully-assembled
+# runtime_asm text -- both grow with ordinary development, so this cost
+# only ever gets worse over time, never better, on every single --x64
+# compile regardless of the user program's own size. This variant takes
+# the bytes directly (read_file_bytes, genuine O(1) list indexing, no
+# string re-scan) instead of a String, for exactly those two callers;
+# x64_content_hash itself is left alone for its one remaining caller (a
+# single function's own JSON-serialized IR, bounded by ordinary function
+# size, not by the whole compiler or runtime). Confirmed via the full
+# gate battery (language spec 171/171, block-model 222/222, native
+# codegen 34/34, WASM 21/21) all passing after this fix, at the same
+# overall build cost the toolchain's own comments already document as
+# normal for a build this size (x64_compile_unit.patlang's own
+# build_native header: "over an hour single-threaded" for a full
+# self-hosted-compiler rebuild) -- this fix removes a needless quadratic
+# tax on top of that already-accepted cost, not a claim that --x64
+# builds are now fast in absolute terms.
+make a function called x64_content_hash_bytes takes bytes returns digest
+  let h = 5381
+  let n = bytes.length
+  let i = 0
+  while i < n do
+    let c = bytes[i]
+    let h = (h * 33 + c) % 999999937
+    let i = i + 1
+  end
+  return "" + h
+end
+
 # GitHub reliability follow-up (patlang-x64-int-48bit-grayzone-gap memory,
 # session 5/6): x64_content_hash above is a hash of the TARGET function's
 # own IR only, with zero dependency on THIS COMPILER's own version -- so a
@@ -395,8 +433,8 @@ make a function called x64_compiler_fingerprint takes none returns fp
     # 2026-09-06) on a real crash confirmed for the inline-literal form
     # at large file sizes.
     let fingerprint_path = "self_hosting/lib/codegen_x64.patlang"
-    let src = read_file(fingerprint_path)
-    let cur = x64_content_hash(src)
+    let src_bytes = read_file_bytes(fingerprint_path, 0, 2000000000)
+    let cur = x64_content_hash_bytes(src_bytes)
     set_var("__x64_compiler_fingerprint", cur)
   end
   return cur
@@ -799,7 +837,8 @@ class X64UnitLinker {
     let unused_claim = x64_build_signal_claim()
     let unused_p0 = x64_build_progress("runtime-assemble", 0, 1)
     let runtime_asm = read_file(runtime_asm_path)
-    let rt_key = "x64runtime_" + x64_content_hash(runtime_asm) + "_" + x64_compiler_fingerprint()
+    let runtime_asm_bytes = read_file_bytes(runtime_asm_path, 0, 2000000000)
+    let rt_key = "x64runtime_" + x64_content_hash_bytes(runtime_asm_bytes) + "_" + x64_compiler_fingerprint()
     let rt_cache_path = cache_dir + "/" + rt_key + ".chunkbin"
     if file_exists(rt_cache_path) == true then
       let runtime_chunk = x64_chunk_from_bin(read_file_bytes(rt_cache_path, 0, 2000000000))
