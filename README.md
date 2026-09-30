@@ -80,6 +80,17 @@ interpreter) needs only the `pat` binary itself once built.
   this project get found, including a lexer bug that silently corrupted
   non-ASCII string literals and a native-compiled-fibers bug that only
   ever showed up on the compiled path, not the interpreter.
+- **`patc1.exe --x64` now does genuine native code generation**: real x64
+  machine code, assembled and linked by a self-hosted assembler/PE linker
+  (`self_hosting/lib/x64_asm.patlang` + `x64_pe_link.patlang`), with no
+  `rustc`, `nasm`, or `gcc` involved anywhere in that path — the "Block
+  Ownership Model" runtime redesign (block/jump execution as the literal
+  compiled control flow, real refcounting-based ownership, a hybrid
+  static/runtime `mut`-exclusivity check, and real free-variable analysis
+  for closures) closed the ~764x speed gap this backend started with down
+  to roughly parity with the existing pipeline, and is now the default
+  `--x64` behavior. This is a separate, further-along claim than the
+  Performance section below makes for `pat --patc`.
 - **A numeric tower**: Int/Float/BigInt/Rational/Complex, auto-promoting on
   overflow or inexact operations rather than wrapping or crashing.
 - **A goal-oriented/logic layer with real inference, not just fact lookup**:
@@ -171,6 +182,13 @@ flow into real Rust control flow. That remaining gap is understood, but a
 real fix for it is a substantially bigger undertaking than the fixes
 already made, and hasn't been started.
 
+This does **not** apply to `patc1.exe --x64` (see above) — that path
+compiles to genuine x64 machine code, not a bytecode VM, and its own
+measured speed-up (the Block Ownership Model's Phase 9 native codegen)
+closed an initial ~764x gap against the existing pipeline down to
+roughly 1x. The two backends are at different points on this question;
+neither claim should be read as covering the other.
+
 ## What it doesn't do
 
 - **No package manager or module registry.** `include` is textual file
@@ -185,10 +203,11 @@ already made, and hasn't been started.
   (see Developer tooling above) but there's no linter yet and no IDE
   integration beyond the standalone `tools/vscode-patlang/` syntax
   highlighter.
-- **No genuine native code generation yet** — see Performance above.
-  `pat --patc`/`patc1.exe` produce real standalone binaries, but their
+- **`pat --patc` does not yet do genuine native code generation** — see
+  Performance above. It produces a real standalone binary, but its
   runtime behavior is still bytecode interpretation, not compiled control
-  flow.
+  flow. `patc1.exe --x64` is the exception: it compiles to real x64
+  machine code (see "What actually works" above), not bytecode.
 - **No fact/rule retraction.** `rule_add` is accumulate-only; nothing
   registered as a fact or GOAP action can currently be un-registered,
   which limits how far the transaction/backtracking pattern above can
@@ -220,6 +239,11 @@ rust-runtime/target/release/pat --patc hello.patlang --out hello.exe
 # Compile via the self-hosted compiler (rebuild it first if it's stale)
 rust-runtime/target/release/pat --ir-run self_hosting/build_patc1.patlang
 ./patc1.exe hello.patlang hello.exe
+
+# Compile to genuine native x64 machine code (no rustc/nasm/gcc involved) --
+# build the runtime object once, then compile any number of programs against it
+rust-runtime/target/release/pat --ir-run self_hosting/build_x64_runtime.patlang
+./patc1.exe hello.patlang hello.exe --x64
 
 # Compile to WebAssembly -- via the self-hosted compiler with an extra
 # positional target argument (pat --patc itself only ever produces a
@@ -262,7 +286,14 @@ rust-runtime/target/release/pat --ir-run self_hosting/synthesis_lgg_selftest.pat
 ├── self_hosting/
 │   ├── lib/                # The self-hosted compiler and standard library,
 │   │                        # written in PatLang (lexer/parser/lower/codegen,
-│   │                        # synthesis engine, RDBMS, regex, math, etc.)
+│   │                        # synthesis engine, RDBMS, regex, math, etc.),
+│   │                        # including the x64 backend (codegen_x64.patlang,
+│   │                        # x64_runtime.patlang, x64_asm.patlang,
+│   │                        # x64_pe_link.patlang).
+│   ├── block_model/         # The Block Ownership Model: block/jump execution,
+│   │                        # real refcounted ownership, and the native
+│   │                        # codegen path patc1.exe --x64 now lowers through
+│   │                        # by default.
 │   ├── examples/            # Runnable demo programs.
 │   └── *_selftest.patlang   # Self-hosted test suites.
 ├── friendly_cli/           # Curriculum/synthesis experiments, GOAP demos,
