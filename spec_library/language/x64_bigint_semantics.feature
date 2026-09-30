@@ -97,3 +97,28 @@ Feature: BigInt arithmetic agrees between the interpreter and native x64 (GitHub
     Given a bare float literal and the direct, un-promoted result of sqrt()
     When the file is run under `pat --ir-run` and compiled+run via `--x64`
     Then both print the same six lines: float, its string form, float again, the sqrt result's string form, the literal's own correct print, and "after"
+
+  A sixth gap (GitHub #50/#102), found reviewing #50's own scheduled
+  design question about the tagging representation: mixing a genuine int
+  local with a float literal inside the SAME Bin, in a function this
+  backend already classifies float_mode (e.g. `x + 2.5` where x is an
+  ordinary int local), was compiled as though BOTH operands already held
+  raw float64 bit patterns -- reinterpreting the int's own bits as a
+  double instead of converting it, silently discarding its real value
+  (`5 + 2.5` printed `2.5`, not `7.5`). Fixed by tracking, per Bin
+  operand, whether it is PROVEN to be a genuine plain int fully
+  accounted for within this function's own code (a literal, or
+  arithmetic built only from such values) -- only a side proven this way
+  is converted via a real cvtsi2sd; a function PARAMETER or any Call/
+  CallHost result is never trusted this way, since its true value could
+  be anything the analysis cannot see, and treating "never proven float"
+  as "definitely int" there corrupted a genuine float smuggled in from
+  outside (found the hard way: an earlier, less careful version of this
+  fix silently corrupted x64_runtime.patlang's own internal float-
+  printing code, segfaulting even a bare `print(2.5)`, which contains no
+  Bin at all in its own body).
+
+  Scenario: an ordinary int local mixed with a float literal in one Bin converts correctly on either side
+    Given `x + 2.5` where x is an int local, and `a + x` where a is a float local and x an int local
+    When the file is run under `pat --ir-run` and compiled+run via `--x64`
+    Then both print true for both comparisons against 7.5

@@ -836,6 +836,48 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
   let float_instr_indices = []
   let produces_float = []
   let bailed = false
+  # GitHub #50/#102: a Bin whose two operands are NOT both float-tainted
+  # (one is float, the other a genuine plain int -- e.g. `x + 2.5` where
+  # x is an ordinary int local) was previously classified float purely
+  # via `pr1[0] or pr2[0]`, then compiled by x64_binop_asm_float as if
+  # BOTH operands already held raw float64 bit patterns -- reinterpreting
+  # a genuine int's bits as a float instead of CONVERTING it, silently
+  # discarding the int operand's real value (confirmed directly: `let x =
+  # 5; let y = x + 2.5` printed 2.5, not 7.5, on native x64; the
+  # interpreter correctly gives 7.5). These two sparse index lists record
+  # which SPECIFIC side of a float-classified Bin is the genuine-int one
+  # (never both -- if both were plain int, result_taint itself would be
+  # false and this whole question wouldn't arise), so the emission site
+  # can insert a real cvtsi2sd conversion for exactly that side instead
+  # of a raw bit reinterpretation.
+  let mixed_left_int_indices = []
+  let mixed_right_int_indices = []
+  # GitHub #50/#102 follow-up, found the hard way: a first version of
+  # this fix trusted ANY untainted operand as "genuine plain int, safe to
+  # cvtsi2sd-convert" -- but "untainted" here only means "this analysis
+  # pass never proved it's float," which is also exactly what a bare,
+  # never-reassigned FUNCTION PARAMETER looks like (a parameter is never
+  # the target of an in-body Store, so x64_taint_get's own unset-key
+  # default (false) makes every parameter look untainted regardless of
+  # what its caller actually passed). That version corrupted a genuine
+  # boxed/passed-in float inside x64_runtime.patlang's own float-printing
+  # code the moment it reached a mixed comparison -- confirmed directly:
+  # patc1.exe segfaulted compiling and running even a bare `print(2.5)`
+  # (which has no Bin at all in ITS OWN body -- x64_runtime.patlang's
+  # own internal float-formatting function, sharing this same analysis,
+  # was the one silently corrupted). safe_map/safe_stack track a
+  # SEPARATE, stricter fact per value: is its value fully accounted for
+  # within this function's own visible code (a literal, or arithmetic
+  # built only from such values), as opposed to arriving from outside
+  # (a parameter, or any Call/CallHost result, whose own provenance this
+  # analysis cannot see)? Only a mixed side proven safe this way is ever
+  # auto-converted; a parameter or call result stays exactly as
+  # conservative as before this fix (the original, narrower bug, not a
+  # new corruption). A name never explicitly Stored (a bare parameter)
+  # naturally reads back false = unsafe via x64_taint_get's own unset-key
+  # default -- no separate parameter list needs threading in here at all.
+  let safe_stack = []
+  let safe_map = []
   let i = 0
   while i < n do
     let produces_float = list_push(produces_float, false)
@@ -853,32 +895,54 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
       let produces_float = list_set(produces_float, i, tainted)
       let pr = x64_vstack_push(stack, sp, tainted)
       let stack = pr[0]
+      let safe_pr = x64_vstack_push(safe_stack, sp, true)
+      let safe_stack = safe_pr[0]
       let sp = pr[1]
     elif ty == "Load" then
       let tainted = x64_taint_get(map, instr[1])
       let produces_float = list_set(produces_float, i, tainted)
       let pr = x64_vstack_push(stack, sp, tainted)
       let stack = pr[0]
+      let safe_pr = x64_vstack_push(safe_stack, sp, x64_taint_get(safe_map, instr[1]))
+      let safe_stack = safe_pr[0]
       let sp = pr[1]
     elif ty == "Store" then
       let pr = x64_vstack_pop(stack, sp)
+      let safe_pr = x64_vstack_pop(safe_stack, sp)
       let sp = pr[1]
       let map = x64_taint_set(map, instr[1], x64_taint_get(map, instr[1]) or pr[0])
+      let safe_map = x64_taint_set(safe_map, instr[1], safe_pr[0])
     elif ty == "Bin" then
       let pr1 = x64_vstack_pop(stack, sp)
+      let safe_pr1 = x64_vstack_pop(safe_stack, sp)
       let sp = pr1[1]
       let pr2 = x64_vstack_pop(stack, sp)
+      let safe_pr2 = x64_vstack_pop(safe_stack, sp)
       let sp = pr2[1]
       let result_taint = pr1[0] or pr2[0]
       if result_taint then
         let float_instr_indices = list_push(float_instr_indices, i)
+        # pr1 is the RHS (popped first, top of stack), pr2 the LHS --
+        # matching x64_binop_asm_float's own pop order (r10=RHS, rax=LHS).
+        # Each side needs BOTH "not float-tainted" and "proven safe" --
+        # see this function's own header above for why the second check
+        # is required.
+        if (not pr2[0]) and safe_pr2[0] then
+          let mixed_left_int_indices = list_push(mixed_left_int_indices, i)
+        end
+        if (not pr1[0]) and safe_pr1[0] then
+          let mixed_right_int_indices = list_push(mixed_right_int_indices, i)
+        end
       end
       let produces_float = list_set(produces_float, i, result_taint)
       let pr3 = x64_vstack_push(stack, sp, result_taint)
       let stack = pr3[0]
+      let safe_pr3 = x64_vstack_push(safe_stack, sp, safe_pr1[0] and safe_pr2[0])
+      let safe_stack = safe_pr3[0]
       let sp = pr3[1]
     elif ty == "Un" then
       let pr = x64_vstack_pop(stack, sp)
+      let safe_pr = x64_vstack_pop(safe_stack, sp)
       let sp = pr[1]
       if pr[0] then
         let float_instr_indices = list_push(float_instr_indices, i)
@@ -886,14 +950,18 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
       let produces_float = list_set(produces_float, i, pr[0])
       let pr2 = x64_vstack_push(stack, sp, pr[0])
       let stack = pr2[0]
+      let safe_pr2 = x64_vstack_push(safe_stack, sp, safe_pr[0])
+      let safe_stack = safe_pr2[0]
       let sp = pr2[1]
     elif ty == "Jump" then
       let sp = sp
     elif ty == "JumpIfFalse" then
       let pr = x64_vstack_pop(stack, sp)
+      let safe_pr = x64_vstack_pop(safe_stack, sp)
       let sp = pr[1]
     elif ty == "Return" then
       let pr = x64_vstack_pop(stack, sp)
+      let safe_pr = x64_vstack_pop(safe_stack, sp)
       let sp = pr[1]
     elif ty == "CallHost" then
       let argc = to_num(instr[2])
@@ -901,6 +969,7 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
       let k = 0
       while k < argc do
         let pr = x64_vstack_pop(stack, sp)
+        let safe_pr = x64_vstack_pop(safe_stack, sp)
         let sp = pr[1]
         let last_arg_taint = pr[0]
         let k = k + 1
@@ -923,6 +992,11 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
       let produces_float = list_set(produces_float, i, is_float_result)
       let pr2 = x64_vstack_push(stack, sp, is_float_result)
       let stack = pr2[0]
+      # A CallHost result's own provenance is opaque to this analysis --
+      # never safe to auto-convert, matching a bare parameter's own
+      # conservative default.
+      let safe_pr2 = x64_vstack_push(safe_stack, sp, false)
+      let safe_stack = safe_pr2[0]
       let sp = pr2[1]
     elif ty == "Call" then
       let argc = to_num(instr[2])
@@ -930,6 +1004,7 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
       let k = 0
       while k < argc do
         let pr = x64_vstack_pop(stack, sp)
+        let safe_pr = x64_vstack_pop(safe_stack, sp)
         let sp = pr[1]
         let last_arg_taint = pr[0]
         let k = k + 1
@@ -957,46 +1032,61 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
       let produces_float = list_set(produces_float, i, is_float_result)
       let pr2 = x64_vstack_push(stack, sp, is_float_result)
       let stack = pr2[0]
+      # Same reasoning as CallHost just above: an ordinary Call's result
+      # (e.g. a genuinely polymorphic function like identity(v)) is
+      # exactly as opaque to this analysis as a bare parameter -- never
+      # safe to auto-convert.
+      let safe_pr2 = x64_vstack_push(safe_stack, sp, false)
+      let safe_stack = safe_pr2[0]
       let sp = pr2[1]
     elif ty == "BuildList" then
       let argc = to_num(instr[1])
       let k = 0
       while k < argc do
         let pr = x64_vstack_pop(stack, sp)
+        let safe_pr = x64_vstack_pop(safe_stack, sp)
         let sp = pr[1]
         let k = k + 1
       end
       let pr2 = x64_vstack_push(stack, sp, false)
       let stack = pr2[0]
+      let safe_pr2 = x64_vstack_push(safe_stack, sp, false)
+      let safe_stack = safe_pr2[0]
       let sp = pr2[1]
     elif ty == "MakeClosure" then
       let argc = to_num(list_len(instr[2]))
       let k = 0
       while k < argc do
         let pr = x64_vstack_pop(stack, sp)
+        let safe_pr = x64_vstack_pop(safe_stack, sp)
         let sp = pr[1]
         let k = k + 1
       end
       let pr2 = x64_vstack_push(stack, sp, false)
       let stack = pr2[0]
+      let safe_pr2 = x64_vstack_push(safe_stack, sp, false)
+      let safe_stack = safe_pr2[0]
       let sp = pr2[1]
     elif ty == "CallValue" then
       let argc = to_num(instr[1]) + 1
       let k = 0
       while k < argc do
         let pr = x64_vstack_pop(stack, sp)
+        let safe_pr = x64_vstack_pop(safe_stack, sp)
         let sp = pr[1]
         let k = k + 1
       end
       let pr2 = x64_vstack_push(stack, sp, false)
       let stack = pr2[0]
+      let safe_pr2 = x64_vstack_push(safe_stack, sp, false)
+      let safe_stack = safe_pr2[0]
       let sp = pr2[1]
     else
       let bailed = true
     end
     let i = i + 1
   end
-  return [map, float_instr_indices, produces_float, bailed]
+  return [map, float_instr_indices, produces_float, bailed, mixed_left_int_indices, mixed_right_int_indices]
 end
 
 # Stage 1 wrapper (fixed-point loop), mirroring x64_analyze_dynamic_bins
@@ -1010,6 +1100,8 @@ make a function called x64_analyze_float_bins takes instrs, float_func_names ret
   let map = []
   let float_instr_indices = []
   let produces_float = []
+  let mixed_left_int_indices = []
+  let mixed_right_int_indices = []
   let pass = 0
   let bailed = false
   let stable = false
@@ -1019,6 +1111,8 @@ make a function called x64_analyze_float_bins takes instrs, float_func_names ret
     let float_instr_indices = result[1]
     let produces_float = result[2]
     let bailed = result[3]
+    let mixed_left_int_indices = result[4]
+    let mixed_right_int_indices = result[5]
     if x64_taint_maps_equal(map, new_map) then
       let stable = true
     end
@@ -1028,13 +1122,15 @@ make a function called x64_analyze_float_bins takes instrs, float_func_names ret
   if bailed then
     let float_instr_indices = x64_all_bin_indices(instrs)
     let produces_float = []
+    let mixed_left_int_indices = []
+    let mixed_right_int_indices = []
     let i = 0
     while i < n do
       let produces_float = list_push(produces_float, true)
       let i = i + 1
     end
   end
-  return [float_instr_indices, produces_float, map]
+  return [float_instr_indices, produces_float, map, mixed_left_int_indices, mixed_right_int_indices]
 end
 
 # Stage 2: which bare dotless "Const num" instructions must be
@@ -1419,12 +1515,30 @@ make a function called x64_float_literal_text takes text returns out
   return text + ".0"
 end
 
-make a function called x64_binop_asm_float takes op returns asm
+# GitHub #50/#102: mixed_left_int/mixed_right_int (from
+# x64_taint_one_pass_float's own per-Bin analysis) mark the ONE side, if
+# any, that is a genuine plain int rather than an already-float value --
+# that side needs a real int-to-double CONVERSION (cvtsi2sd), not a raw
+# bit reinterpretation (movq), or its true numeric value is discarded
+# (confirmed directly: `x + 2.5` for an ordinary int x printed 2.5, not
+# x+2.5, before this fix -- x's bits, reinterpreted as a double, are a
+# vanishingly small denormal that the addition effectively ignores).
+# Never both flags at once: if neither side were float-tainted, this Bin
+# would not have been classified float_bin in the first place.
+make a function called x64_binop_asm_float takes op, mixed_left_int, mixed_right_int returns asm
   let sb = sb_new()
   sb_push(sb, "    pop r10" + x64_nl_char())
   sb_push(sb, "    pop rax" + x64_nl_char())
-  sb_push(sb, "    movq xmm0, rax" + x64_nl_char())
-  sb_push(sb, "    movq xmm1, r10" + x64_nl_char())
+  if mixed_right_int then
+    sb_push(sb, "    cvtsi2sd xmm1, r10" + x64_nl_char())
+  else
+    sb_push(sb, "    movq xmm1, r10" + x64_nl_char())
+  end
+  if mixed_left_int then
+    sb_push(sb, "    cvtsi2sd xmm0, rax" + x64_nl_char())
+  else
+    sb_push(sb, "    movq xmm0, rax" + x64_nl_char())
+  end
   if op == "+" then
     sb_push(sb, "    addsd xmm0, xmm1" + x64_nl_char())
     sb_push(sb, "    movq rax, xmm0" + x64_nl_char())
@@ -8823,7 +8937,7 @@ make a function called label_asm_safe takes ignored returns label
   return "" + n
 end
 
-make a function called x64_emit_instr takes instr, func_name, regmap, spilled, label, is_float_bin, is_float_const, is_dynamic_bin, bool_print_override, float_print_override, is_tower_ctor_arg, float_box_single, float_box_receiver returns asm
+make a function called x64_emit_instr takes instr, func_name, regmap, spilled, label, is_float_bin, is_float_const, is_dynamic_bin, bool_print_override, float_print_override, is_tower_ctor_arg, float_box_single, float_box_receiver, mixed_left_int, mixed_right_int returns asm
   let sb = sb_new()
   sb_push(sb, label + ":" + x64_nl_char())
   let ty = instr[0]
@@ -9022,7 +9136,7 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
         if ty == "Bin" then
           # GitHub #37: per-instruction, not whole-function.
           if is_float_bin then
-            sb_push(sb, x64_binop_asm_float(instr[1]))
+            sb_push(sb, x64_binop_asm_float(instr[1], mixed_left_int, mixed_right_int))
           else
             if is_dynamic_bin then
               if instr[1] == "/" then
@@ -9557,10 +9671,14 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
   let float_const_indices = []
   let float_box_single_indices = []
   let float_box_receiver_indices = []
+  let mixed_left_int_indices = []
+  let mixed_right_int_indices = []
   if float_mode then
     let float_result = x64_analyze_float_bins(instrs, float_func_names)
     let float_instr_indices = float_result[0]
     let produces_float = float_result[1]
+    let mixed_left_int_indices = float_result[3]
+    let mixed_right_int_indices = float_result[4]
     let float_const_indices = x64_analyze_float_consts(instrs, float_result[2], float_instr_indices)
     let float_box_single_indices = x64_float_box_single_indices(instrs, float_mode, produces_float)
     let float_box_receiver_indices = x64_float_box_receiver_indices(instrs, float_mode, produces_float)
@@ -9647,7 +9765,9 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
       let is_tower_ctor_arg = x64_str_in_list(tower_ctor_arg_indices, i)
       let is_float_box_single = x64_str_in_list(float_box_single_indices, i)
       let is_float_box_receiver = x64_str_in_list(float_box_receiver_indices, i)
-      sb_push(sb, x64_emit_instr(instr, func_name, regmap, spilled, label, is_float_bin, is_float_const, is_dynamic_bin, is_bool_print, is_float_print, is_tower_ctor_arg, is_float_box_single, is_float_box_receiver))
+      let is_mixed_left_int = x64_str_in_list(mixed_left_int_indices, i)
+      let is_mixed_right_int = x64_str_in_list(mixed_right_int_indices, i)
+      sb_push(sb, x64_emit_instr(instr, func_name, regmap, spilled, label, is_float_bin, is_float_const, is_dynamic_bin, is_bool_print, is_float_print, is_tower_ctor_arg, is_float_box_single, is_float_box_receiver, is_mixed_left_int, is_mixed_right_int))
       let i = i + 1
     end
   end
