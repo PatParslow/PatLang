@@ -1612,6 +1612,74 @@ make a function called x64_binop_asm_float takes op, mixed_left_int, mixed_right
   return sb_str(sb)
 end
 
+# GitHub #194 (follow-up to #50/#102): rt_dynamic_binop (x64_runtime.
+# patlang) dispatches purely dynamic-mode arithmetic (a function whose
+# own body has no float_mode trigger, e.g. a genuinely polymorphic
+# `plus(a, b)`) by inspecting type_of(a)/type_of(b) at runtime -- but it
+# has no way to DO real float arithmetic on the raw bits once it
+# recognizes one, since ordinary PatLang `+`/`-`/etc. inside that
+# function's own body would themselves need to be float_mode-classified,
+# which a parameter-sourced value can never prove (see the mixed-int-
+# float fix's own header, x64_taint_one_pass_float, for exactly why a
+# parameter can't be trusted that way). These six primitives expose the
+# same raw float64 arithmetic x64_binop_asm_float already does inline
+# for a float_mode function's own Bin instructions, as ordinary callable
+# CallHost primitives instead -- so PLAIN PatLang code (rt_dynamic_
+# numeric_binop's new float branch) can request "add these two float64
+# bit patterns" without itself needing to be float_mode. Comparison is a
+# single three-way primitive (-1/0/1, matching rt_rational_cmp's own
+# convention) rather than six separate ops, so callers derive </<=/>/>=
+# /==/!= from one ordinary PatLang comparison against 0 instead of this
+# file growing six near-identical setcc emitters.
+make a function called x64_int_to_float_bits_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    cvtsi2sd xmm0, rax" + x64_nl_char())
+  sb_push(sb, "    movq rax, xmm0" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
+make a function called x64_float_arith_bits_asm takes op returns asm
+  let sb = sb_new()
+  sb_push(sb, "    pop r10" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    movq xmm0, rax" + x64_nl_char())
+  sb_push(sb, "    movq xmm1, r10" + x64_nl_char())
+  if op == "+" then
+    sb_push(sb, "    addsd xmm0, xmm1" + x64_nl_char())
+  else
+    if op == "-" then
+      sb_push(sb, "    subsd xmm0, xmm1" + x64_nl_char())
+    else
+      if op == "*" then
+        sb_push(sb, "    mulsd xmm0, xmm1" + x64_nl_char())
+      else
+        sb_push(sb, "    divsd xmm0, xmm1" + x64_nl_char())
+      end
+    end
+  end
+  sb_push(sb, "    movq rax, xmm0" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
+make a function called x64_float_cmp_bits_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    pop r10" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    movq xmm0, rax" + x64_nl_char())
+  sb_push(sb, "    movq xmm1, r10" + x64_nl_char())
+  sb_push(sb, "    ucomisd xmm0, xmm1" + x64_nl_char())
+  sb_push(sb, "    seta al" + x64_nl_char())
+  sb_push(sb, "    movzx rax, al" + x64_nl_char())
+  sb_push(sb, "    setb cl" + x64_nl_char())
+  sb_push(sb, "    movzx rcx, cl" + x64_nl_char())
+  sb_push(sb, "    sub rax, rcx" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
 make a function called x64_dynamic_op_supported takes op returns yes
   if op == "+" then
     return true
@@ -8001,6 +8069,18 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
     sb_push(sb, "    pop rax" + x64_nl_char())
     sb_push(sb, "    mov [rel g_exec_timeout_ms], rax" + x64_nl_char())
     sb_push(sb, "    push rax" + x64_nl_char())
+  elif name == "x64_int_to_float_bits" then
+    sb_push(sb, x64_int_to_float_bits_asm())
+  elif name == "x64_float_add_bits" then
+    sb_push(sb, x64_float_arith_bits_asm("+"))
+  elif name == "x64_float_sub_bits" then
+    sb_push(sb, x64_float_arith_bits_asm("-"))
+  elif name == "x64_float_mul_bits" then
+    sb_push(sb, x64_float_arith_bits_asm("*"))
+  elif name == "x64_float_div_bits" then
+    sb_push(sb, x64_float_arith_bits_asm("/"))
+  elif name == "x64_float_cmp_bits" then
+    sb_push(sb, x64_float_cmp_bits_asm())
   elif name == "os_exec_run" then
     # Exposes the SAME primitive x64_exec_capture_asm's CallHost handling
     # already wraps (CreateProcessA + pipe capture, cmdline_addr/
@@ -9802,6 +9882,72 @@ make a function called x64_str_in_list takes items, target returns yes
   return false
 end
 
+# GitHub #195 (follow-up to #50/#102): x64_collect_float_func_names only
+# ever sees the functions in ITS OWN caller's `funcs` list -- correct
+# for a whole-program single emit_program_x64 call (every old driver
+# script, build_x64_runtime.patlang), but the per-function object-cache
+# pipeline (x64_compile_unit.patlang's ensure_chunk_native/
+# emit_asm_native) compiles each function as its own isolated unit
+# (`emit_program_x64(["ProgramIR", "main", [func_ir], []], ...)`), so a
+# caller compiled in one unit can never see whether a separately-
+# compiled callee (in a DIFFERENT unit) proves float from its own body
+# -- confirmed directly: even a trivial `make_half() { return 1.0/2.0 }`
+# printed its raw bits as an int at the call site. Threaded via the
+# ambient __vars namespace (get/set_var), matching this codebase's own
+# established pattern for cross-cutting compiler state that would
+# otherwise mean updating every one of emit_program_x64's ~30 existing
+# callers (old standalone driver scripts, none of which need this) just
+# to add a 4th parameter only the per-unit pipeline actually uses.
+# Newline-joined, matching x64_runtime.funcs' own on-disk convention
+# (split_lines(read_file(...))) rather than inventing a new delimiter.
+#
+# STATUS, named honestly: this closes the NAME-VISIBILITY half of #195
+# (confirmed directly -- a block-model-lowered call site's own callee
+# name, e.g. "bm_fn_make_half", now correctly appears in this unit's
+# float_func_names, matching what x64_collect_float_func_names(program_
+# funcs) computed whole-program). It does NOT yet make
+# `type_of(make_half())` report "float" end-to-end -- a block-model-
+# lowered Call to a user function was found, while building this, to
+# carry an extra argument (argc=1 for a ZERO-parameter source function)
+# not accounted for anywhere in this taint analysis, strongly suggesting
+# some form of implicit state (globals-threading, per native_codegen.
+# patlang's own "[value, final_globals]" call-unpacking convention) rides
+# along with the return value in a shape this analysis was never told
+# about. Root-causing that shape is real, separate follow-up work inside
+# block-model's own calling convention, not attempted here -- left for
+# whoever picks up #195 next with that context already in hand, rather
+# than guessed at further under time pressure.
+# Deliberately NOT read via read_file_bytes-style O(1) byte access
+# (this string is already in memory, not backed by a file) -- the
+# char_code/substr-per-character cost here scales with the number of
+# FUNCTION NAMES in one program (low thousands at the very worst), not
+# with file size in KB/MB the way the O(n^2) content-hash bug (fixed
+# separately) did, so this stays acceptable without the same fix.
+make a function called x64_extra_float_func_names returns names
+  let raw = "" + get("__vars", "__x64_extra_float_func_names")
+  if raw == "" then
+    return []
+  end
+  let out = []
+  let cur = sb_new()
+  let i = 0
+  let n = raw.length
+  while i < n do
+    let c = substr(raw, i, 1)
+    if c == chr(10) then
+      let out = list_push(out, sb_str(cur))
+      let cur = sb_new()
+    else
+      sb_push(cur, c)
+    end
+    let i = i + 1
+  end
+  if sb_str(cur) != "" then
+    let out = list_push(out, sb_str(cur))
+  end
+  return out
+end
+
 make a function called x64_collect_float_func_names takes funcs returns names
   let out = []
   let i = 0
@@ -10878,6 +11024,14 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
   x64_string_label_reset()
   let n = to_num(list_len(funcs))
   let float_func_names = x64_collect_float_func_names(funcs)
+  let extra_float_func_names = x64_extra_float_func_names()
+  let efi = 0
+  while efi < to_num(list_len(extra_float_func_names)) do
+    if not x64_str_in_list(float_func_names, extra_float_func_names[efi]) then
+      let float_func_names = list_push(float_func_names, extra_float_func_names[efi])
+    end
+    let efi = efi + 1
+  end
   let i = 0
   while i < n do
     sb_push(sb, x64_emit_func(funcs[i], x64_func_is_float(funcs[i]), x64_func_is_dynamic(funcs[i]), float_func_names))

@@ -3844,6 +3844,73 @@ make a function called rt_dynamic_numeric_binop takes a, b, op_code returns resu
     end
     return a >= b
   end
+  # GitHub #194 (follow-up to #50/#102): a genuinely polymorphic function
+  # (no float literal anywhere in its own body, so never classified
+  # float_mode) whose parameter holds an unboxed float previously
+  # segfaulted here -- type_of() on a raw, untagged float64 bit pattern
+  # reads its top nibble as whatever OTHER family it happens to decode
+  # to (often List or Closure) and this dispatcher would then hand it to
+  # rt_dynamic_plus_obj/rt_dynamic_cmp_obj, which dereference it as a
+  # heap pointer. That specific crash is fixed by boxing a float-tainted
+  # value before it crosses into a callee that isn't provably float_mode
+  # (see x64_float_box_call_arg_indices in codegen_x64.patlang) -- once
+  # boxed, type_of() correctly reports "float", reaching HERE. This
+  # branch is what was still missing even after boxing: real float
+  # arithmetic on the now-correctly-recognized value, via the same raw
+  # float64 ops x64_binop_asm_float already does inline for a float_mode
+  # function's own Bin instructions, now exposed as callable primitives
+  # (x64_int_to_float_bits/x64_float_*_bits, codegen_x64.patlang) so
+  # this ordinary (non-float_mode) PatLang function can use them.
+  # Scoped to +, -, *, and the six comparisons -- the only operators
+  # that reach rt_dynamic_binop at all ("/" and "%" have their own
+  # separate dynamic fast-paths, x64_binop_asm_div_dynamic/
+  # x64_binop_asm_mod_dynamic, which do not call this function and do
+  # not yet have their own float case -- a further, separate gap, not
+  # attempted here). Checked before interval/complex/rational so a
+  # float mixed with a plain int is handled directly; a float mixed
+  # with one of those richer numeric types falls through unchanged to
+  # their own existing promotion chains below (a real, pre-existing,
+  # not-newly-introduced gap for that rarer combination).
+  if ((ka == "float") and ((kb == "float") or (kb == "int"))) or ((kb == "float") and (ka == "int")) then
+    let abits = a
+    if ka == "int" then
+      let abits = x64_int_to_float_bits(a)
+    else
+      let abits = rt_unbox_float_bits(a)
+    end
+    let bbits = b
+    if kb == "int" then
+      let bbits = x64_int_to_float_bits(b)
+    else
+      let bbits = rt_unbox_float_bits(b)
+    end
+    if op_code == 0 then
+      return rt_box_float(x64_float_add_bits(abits, bbits))
+    end
+    if op_code == 1 then
+      return rt_box_float(x64_float_sub_bits(abits, bbits))
+    end
+    if op_code == 2 then
+      return rt_box_float(x64_float_mul_bits(abits, bbits))
+    end
+    let c = x64_float_cmp_bits(abits, bbits)
+    if op_code == 3 then
+      return c == 0
+    end
+    if op_code == 4 then
+      return c != 0
+    end
+    if op_code == 5 then
+      return c < 0
+    end
+    if op_code == 6 then
+      return c <= 0
+    end
+    if op_code == 7 then
+      return c > 0
+    end
+    return c >= 0
+  end
   if (ka == "interval") or (kb == "interval") then
     let pa = a
     let pb = b
@@ -4139,8 +4206,13 @@ end
 make a function called rt_dynamic_binop takes a, b, op_code returns result
   let ka = type_of(a)
   let kb = type_of(b)
-  let ka_numeric = (ka == "int") or (ka == "bigint") or (ka == "rational") or (ka == "complex") or (ka == "interval")
-  let kb_numeric = (kb == "int") or (kb == "bigint") or (kb == "rational") or (kb == "complex") or (kb == "interval")
+  # GitHub #194: "float" was missing from this list entirely -- a
+  # boxed float reaching here (once boxed at all; see
+  # x64_float_box_call_arg_indices) fell through to the Object-identity
+  # branches below instead of rt_dynamic_numeric_binop's own new float
+  # case.
+  let ka_numeric = (ka == "int") or (ka == "bigint") or (ka == "rational") or (ka == "complex") or (ka == "interval") or (ka == "float")
+  let kb_numeric = (kb == "int") or (kb == "bigint") or (kb == "rational") or (kb == "complex") or (kb == "interval") or (kb == "float")
   if ka_numeric and kb_numeric then
     return rt_dynamic_numeric_binop(a, b, op_code)
   end

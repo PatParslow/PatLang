@@ -122,3 +122,32 @@ Feature: BigInt arithmetic agrees between the interpreter and native x64 (GitHub
     Given `x + 2.5` where x is an int local, and `a + x` where a is a float local and x an int local
     When the file is run under `pat --ir-run` and compiled+run via `--x64`
     Then both print true for both comparisons against 7.5
+
+  A seventh gap (GitHub #194, a follow-up to #50's own scheduled design
+  review): a genuinely polymorphic function (no float literal anywhere in
+  its own body, so never classified float_mode -- e.g. `make a function
+  called plus takes a, b returns r; return a + b end`) compiles its own
+  `a + b` through the DYNAMIC-mode arithmetic dispatch instead
+  (x64_binop_asm_dynamic -> rt_dynamic_binop), which had no awareness of
+  the boxed-float family tag at all -- a float argument reaching it had
+  its raw bits misread as whichever OTHER family they happened to decode
+  to (often List or Closure) and dereferenced as a heap pointer, a real
+  segfault, not just a wrong value. Fixed by giving rt_dynamic_binop's
+  own numeric dispatch (rt_dynamic_numeric_binop) a genuine float case,
+  using new raw-float64-arithmetic primitives (x64_int_to_float_bits,
+  x64_float_add/sub/mul/div_bits, x64_float_cmp_bits) that expose the
+  same real SSE2 ops x64_binop_asm_float already does inline for a
+  float_mode function's own Bin instructions, as ordinary callable
+  primitives a non-float_mode function's dynamic dispatch can use too.
+  Verified with a value boxed explicitly (`rt_box_float`, this backend's
+  own internal representation, not reachable from the interpreter, so
+  this scenario is native-only) rather than relying on automatic
+  boxing at the call site, which remains real, separate follow-up work
+  (see GitHub #195 for the precise reason it isn't done yet -- a
+  block-model calling-convention detail found but not yet root-caused
+  while investigating it).
+
+  Scenario: a boxed float reaching a non-float-mode function's dynamic arithmetic computes and reports its type correctly
+    Given plus(a, b) with no float literal in its own body, called with an explicitly boxed 1.5 and a plain int 2
+    When the file is compiled and run via --x64 only (rt_box_float has no interpreter equivalent)
+    Then it prints 3.5 and then float, not a segfault
