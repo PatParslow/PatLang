@@ -935,6 +935,7 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
   # of a raw bit reinterpretation.
   let mixed_left_int_indices = []
   let mixed_right_int_indices = []
+  let call_box_entries = []
   # GitHub #50/#102 follow-up, found the hard way: a first version of
   # this fix trusted ANY untainted operand as "genuine plain int, safe to
   # cvtsi2sd-convert" -- but "untainted" here only means "this analysis
@@ -1095,12 +1096,45 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
     elif ty == "Call" then
       let argc = to_num(instr[2])
       let last_arg_taint = false
+      # GitHub #194 (second half): box a float-tainted argument before a
+      # Call to a callee that is NOT float_mode (not in float_func_names)
+      # -- the callee's own body routes its parameters through DYNAMIC-
+      # mode dispatch (x64_binop_asm_dynamic -> rt_dynamic_binop, given
+      # a genuine float case by this same issue's first half), which
+      # correctly recognizes a BOXED float (rt_box_float's own family
+      # tag) via type_of() but still misreads a raw, unboxed one. Only
+      # relevant when the CALLEE isn't float_mode: a float_mode callee's
+      # own body expects raw bits directly (x64_binop_asm_float's own
+      # movq/cvtsi2sd convention), so boxing there would corrupt it
+      # instead -- see x64_bm_fn_prefixed's own header for why a block-
+      # model-lowered call's trailing __globals argument (pop position 0,
+      # pushed last) must never be considered for boxing either. Recorded
+      # as [call_index, pop_position] pairs (pop_position 0 = the LAST-
+      # pushed argument, closest to the call) rather than boxing inline
+      # here, because boxing happens at the CALL SITE in real asm
+      # (operating on the already-pushed real stack slots), not during
+      # this purely-simulated analysis pass.
+      let callee_is_float_mode = x64_str_in_list(float_func_names, instr[1])
+      let callee_is_bm_fn = x64_bm_fn_prefixed(instr[1])
+      let skip_globals_pos = 0 - 1
+      if callee_is_bm_fn then
+        let skip_globals_pos = 0
+      end
       let k = 0
       while k < argc do
         let pr = x64_vstack_pop(stack, sp)
         let safe_pr = x64_vstack_pop(safe_stack, sp)
         let sp = pr[1]
         let last_arg_taint = pr[0]
+        # Restrict to genuine block-model-lowered user functions only --
+        # NOT to runtime primitives like type_of/get (already boxed via
+        # the dedicated float_box_single/float_box_receiver mechanism
+        # from #189; boxing here too would double-box) or floor (expects
+        # raw unboxed bits directly; boxing would corrupt its own
+        # internal bit-masking -- see #99 note above).
+        if (not callee_is_float_mode) and callee_is_bm_fn and pr[0] and (k != skip_globals_pos) then
+          let call_box_entries = list_push(call_box_entries, [i, k])
+        end
         let k = k + 1
       end
       # GitHub #99: `floor` is an ordinary Call (not CallHost), because
@@ -1190,7 +1224,7 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
     end
     let i = i + 1
   end
-  return [map, float_instr_indices, produces_float, bailed, mixed_left_int_indices, mixed_right_int_indices]
+  return [map, float_instr_indices, produces_float, bailed, mixed_left_int_indices, mixed_right_int_indices, call_box_entries]
 end
 
 # Stage 1 wrapper (fixed-point loop), mirroring x64_analyze_dynamic_bins
@@ -1206,6 +1240,7 @@ make a function called x64_analyze_float_bins takes instrs, float_func_names ret
   let produces_float = []
   let mixed_left_int_indices = []
   let mixed_right_int_indices = []
+  let call_box_entries = []
   let pass = 0
   let bailed = false
   let stable = false
@@ -1217,6 +1252,7 @@ make a function called x64_analyze_float_bins takes instrs, float_func_names ret
     let bailed = result[3]
     let mixed_left_int_indices = result[4]
     let mixed_right_int_indices = result[5]
+    let call_box_entries = result[6]
     if x64_taint_maps_equal(map, new_map) then
       let stable = true
     end
@@ -1228,13 +1264,14 @@ make a function called x64_analyze_float_bins takes instrs, float_func_names ret
     let produces_float = []
     let mixed_left_int_indices = []
     let mixed_right_int_indices = []
+    let call_box_entries = []
     let i = 0
     while i < n do
       let produces_float = list_push(produces_float, true)
       let i = i + 1
     end
   end
-  return [float_instr_indices, produces_float, map, mixed_left_int_indices, mixed_right_int_indices]
+  return [float_instr_indices, produces_float, map, mixed_left_int_indices, mixed_right_int_indices, call_box_entries]
 end
 
 # Stage 2: which bare dotless "Const num" instructions must be
@@ -9121,7 +9158,7 @@ make a function called label_asm_safe takes ignored returns label
   return "" + n
 end
 
-make a function called x64_emit_instr takes instr, func_name, regmap, spilled, label, is_float_bin, is_float_const, is_dynamic_bin, bool_print_override, float_print_override, is_tower_ctor_arg, float_box_single, float_box_receiver, mixed_left_int, mixed_right_int returns asm
+make a function called x64_emit_instr takes instr, func_name, regmap, spilled, label, is_float_bin, is_float_const, is_dynamic_bin, bool_print_override, float_print_override, is_tower_ctor_arg, float_box_single, float_box_receiver, mixed_left_int, mixed_right_int, call_box_positions returns asm
   let sb = sb_new()
   sb_push(sb, label + ":" + x64_nl_char())
   let ty = instr[0]
@@ -9422,6 +9459,21 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
                 sb_push(sb, x64_callhost_asm(instr[1], instr[2], spilled))
               else
                 if ty == "Call" then
+                  # GitHub #194 (second half): a float argument passed to
+                  # an ordinary (non-float_mode) bm_fn_-prefixed callee is
+                  # still raw, unboxed float64 bits on the real stack at
+                  # this point -- the callee's own body only recognizes a
+                  # BOXED float via type_of()-based dynamic dispatch. Box
+                  # each flagged pop-position in place, in its own
+                  # self-contained push/call/cleanup so positions never
+                  # interact, before the call itself is emitted. Mutually
+                  # exclusive with float_box_single/float_box_receiver
+                  # below (those only ever fire for type_of/get, which are
+                  # never bm_fn_-prefixed -- see the #99/#189 scoping note
+                  # at this fix's analysis site).
+                  if call_box_positions != [] then
+                    sb_push(sb, x64_emit_call_box_asm(call_box_positions))
+                  end
                   # GitHub #189: box a genuine unboxed float onto the real
                   # heap (rt_box_float) immediately before it reaches
                   # type_of/get, so those see a real runtime tag instead
@@ -9857,12 +9909,14 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
   let float_box_receiver_indices = []
   let mixed_left_int_indices = []
   let mixed_right_int_indices = []
+  let call_box_entries = []
   if float_mode then
     let float_result = x64_analyze_float_bins(instrs, float_func_names)
     let float_instr_indices = float_result[0]
     let produces_float = float_result[1]
     let mixed_left_int_indices = float_result[3]
     let mixed_right_int_indices = float_result[4]
+    let call_box_entries = float_result[5]
     let float_const_indices = x64_analyze_float_consts(instrs, float_result[2], float_instr_indices)
     let float_box_single_indices = x64_float_box_single_indices(instrs, float_mode, produces_float)
     let float_box_receiver_indices = x64_float_box_receiver_indices(instrs, float_mode, produces_float)
@@ -9951,7 +10005,8 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
       let is_float_box_receiver = x64_str_in_list(float_box_receiver_indices, i)
       let is_mixed_left_int = x64_str_in_list(mixed_left_int_indices, i)
       let is_mixed_right_int = x64_str_in_list(mixed_right_int_indices, i)
-      sb_push(sb, x64_emit_instr(instr, func_name, regmap, spilled, label, is_float_bin, is_float_const, is_dynamic_bin, is_bool_print, is_float_print, is_tower_ctor_arg, is_float_box_single, is_float_box_receiver, is_mixed_left_int, is_mixed_right_int))
+      let call_box_positions_here = x64_call_box_positions_at(call_box_entries, i)
+      sb_push(sb, x64_emit_instr(instr, func_name, regmap, spilled, label, is_float_bin, is_float_const, is_dynamic_bin, is_bool_print, is_float_print, is_tower_ctor_arg, is_float_box_single, is_float_box_receiver, is_mixed_left_int, is_mixed_right_int, call_box_positions_here))
       let i = i + 1
     end
   end
@@ -10367,6 +10422,52 @@ make a function called x64_float_box_receiver_indices takes instrs, float_mode, 
     let i = i + 1
   end
   return out
+end
+
+# GitHub #194 (second half): pop-positions, within THIS "Call"
+# instruction's own argument list, that need boxing -- filtered from
+# call_box_entries' own whole-function [call_index, pop_position] pairs
+# down to just this one call site, matching the established "precompute
+# per-instruction, pass the small result in" pattern every other flag in
+# this file already uses, rather than threading the whole-function list
+# plus the current index into x64_emit_instr.
+make a function called x64_call_box_positions_at takes call_box_entries, call_index returns positions
+  let out = []
+  let n = to_num(list_len(call_box_entries))
+  let i = 0
+  while i < n do
+    let entry = call_box_entries[i]
+    if entry[0] == call_index then
+      let out = list_push(out, entry[1])
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# GitHub #194 (second half): emit, for each flagged pop-position, a
+# self-contained box-in-place sequence against the real machine stack --
+# read the raw bits at [rsp+8*p] (BEFORE pushing anything, so the offset
+# is relative to the still-untouched stack), push them as rt_box_float's
+# own sole argument, call it, clean up the call's own push, then write
+# the boxed result back into the SAME slot. Each position restores rsp
+# to its starting value before the next iteration, so positions never
+# interact and order doesn't matter.
+make a function called x64_emit_call_box_asm takes positions returns asm
+  let sb = sb_new()
+  let n = to_num(list_len(positions))
+  let i = 0
+  while i < n do
+    let p = positions[i]
+    let off = p * 8
+    sb_push(sb, "    mov rax, [rsp+" + off + "]" + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
+    sb_push(sb, "    call rt_box_float" + x64_nl_char())
+    sb_push(sb, "    add rsp, 8" + x64_nl_char())
+    sb_push(sb, "    mov [rsp+" + off + "], rax" + x64_nl_char())
+    let i = i + 1
+  end
+  return sb_str(sb)
 end
 
 make a function called x64_float_print_call_indices takes instrs, float_mode, int_overrides, bool_print_overrides returns overrides

@@ -176,3 +176,23 @@ Feature: BigInt arithmetic agrees between the interpreter and native x64 (GitHub
     Given make_half() returning 1.0/2.0, with no caller-side float evidence of its own
     When the file is run under `pat --ir-run` and compiled+run via `--x64`
     Then both report type_of "float" and both confirm the value equals 0.5
+
+  A ninth gap, closing #194's own remaining half (the first half, the
+  core dynamic-dispatch segfault, was fixed in the "boxed 1.5" scenario
+  above): a float argument passed to an ORDINARY call site -- no manual
+  `rt_box_float` anywhere in the source -- still reached a non-float-mode
+  callee's dynamic arithmetic as raw, unboxed bits, silently misread as
+  a fixnum. Fixed by computing, during the existing per-instruction taint
+  analysis, which Call arguments are float-tainted AND the callee is both
+  not float_mode and a genuine block-model-lowered user function
+  ("bm_fn_"-prefixed) -- deliberately excluding runtime primitives like
+  `type_of`/`get` (already boxed via #189's own dedicated, narrower
+  mechanism; boxing here too would double-box) and `floor` (expects raw
+  bits directly, per #99's own adaptive-dispatch note) -- then emitting a
+  self-contained box-in-place sequence against the real stack slot for
+  each flagged position, immediately before the call itself.
+
+  Scenario: a float literal argument at an ordinary call site is auto-boxed, no manual boxing needed
+    Given plus(a, b) with no float literal in its own body, called directly as plus(1.5, 2)
+    When the file is run under `pat --ir-run` and compiled+run via `--x64`
+    Then both print 3.5, with no manual rt_box_float call anywhere in the source
