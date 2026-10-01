@@ -20,6 +20,11 @@ include "lib/parser.patlang"
 include "lib/lower.patlang"
 include "lib/codegen_x64.patlang"
 include "lib/x64_build.patlang"
+include "lib/json.patlang"
+include "lib/ir_io.patlang"
+include "lib/build_progress.patlang"
+include "lib/x64_obj_cache.patlang"
+include "lib/x64_compile_unit.patlang"
 
 let rt_src = read_file("self_hosting/lib/x64_runtime.patlang")
 let fingerprint_file = "self_hosting/build/x64_runtime.fingerprint"
@@ -81,10 +86,83 @@ else
     # this, apply()'s own compiled body fails to assemble at all
     # ("symbol 'g_apply_table' not defined"), since this build's own
     # extern_names list was empty.
+    #
+    # GitHub #192's own build-side fix: this used to emit the WHOLE
+    # runtime as one giant asm text (one emit_program_x64 call over
+    # every rt_func) and hand it to ONE nasm invocation -- confirmed via
+    # `nasm -Ov` that this was already sitting at NASM's own `-Ox`
+    # convergence cap (323 of its own internal pass limit on the
+    # unmodified source), so the smallest new function broke it
+    # outright. This matters even though x64_build_use_native_toolchain()
+    # always routes ordinary --x64 compiles through the self-hosted
+    # assembler (never nasm) for the .obj's own CONTENT: patc1_main.
+    # patlang's own staleness gate still refuses to compile anything
+    # under --x64 unless THIS script reports success and writes a fresh
+    # fingerprint, so a failed nasm step here blocked every --x64
+    # compile, not just the (otherwise unused) nasm/gcc .obj itself.
+    #
+    # Fixed in two independent halves:
+    # (1) self_hosting/build/x64_runtime.asm -- the text build_native
+    # (x64_compile_unit.patlang) actually reads at compile time -- is
+    # now written directly, with NO nasm invocation on it at all, so it
+    # can never be blocked by nasm's own pass cap.
+    # (2) self_hosting/build/x64_runtime.obj (the nasm/gcc path's own
+    # artifact, kept for whatever still expects it to exist, and for
+    # the staleness gate's own `file_exists(obj_path)` check) is built
+    # from the SAME per-function CompileUnit/ObjCache units the program
+    # side already uses -- each its own tiny nasm invocation, nowhere
+    # near the pass cap, cached by content hash -- then combined into
+    # ONE relocatable object via `ld -r` (x64_link_objs_relocatable,
+    # x64_build.patlang). The globals (g_scratch, the extern list, etc.)
+    # still need exactly ONE owning unit: a function-less emit_program_x64
+    # call (owns_globals=true, empty func list) emits just the
+    # .bss/extern declarations and no code at all.
     let asm = emit_program_x64(rt_ir, true, ["g_apply_table", "g_apply_table_count"])
     let asm_path = "self_hosting/build/x64_runtime.asm"
-    let result = x64_assemble(asm, asm_path, obj_path)
-    if x64_build_contains(result, "NASM ERROR:") then
+    write_file(asm_path, asm)
+    let globals_asm = emit_program_x64(["ProgramIR", "main", [], []], true, ["g_apply_table", "g_apply_table_count"])
+    let globals_asm_path = "self_hosting/build/x64_runtime_globals.asm"
+    let globals_obj_path = "self_hosting/build/x64_runtime_globals.obj"
+    let globals_result = x64_assemble(globals_asm, globals_asm_path, globals_obj_path)
+    if x64_build_contains(globals_result, "NASM ERROR:") then
+      let result = globals_result
+    else
+      let cache = new("ObjCache", "runtime_obj_cache")
+      cache.cache_dir = "self_hosting/build/x64_obj_cache"
+      let units = []
+      let ui = 0
+      let u_count = rt_funcs.length
+      while ui < u_count do
+        let unit = x64_make_compile_unit(rt_funcs[ui])
+        # rt_names="" (empty): every rt_func is already covered by
+        # x64_extern_names_for's own "every OTHER entry in funcs" loop
+        # below -- there is no SEPARATE "other runtime" layer here, this
+        # function list IS the whole runtime.
+        let extern_names = x64_extern_names_for(rt_funcs, ui, [])
+        send(unit, "prepare", cache, extern_names)
+        let units = list_push(units, unit)
+        let ui = ui + 1
+      end
+      let unit_objs = []
+      let link_err = ""
+      let fi2 = 0
+      while fi2 < u_count do
+        let obj_or_err = send(units[fi2], "finish", cache)
+        if x64_build_contains(obj_or_err, "NASM ERROR:") then
+          let link_err = obj_or_err
+        else
+          let unit_objs = list_push(unit_objs, obj_or_err)
+        end
+        let fi2 = fi2 + 1
+      end
+      if link_err != "" then
+        let result = link_err
+      else
+        let all_objs = list_push(unit_objs, globals_obj_path)
+        let result = x64_link_objs_relocatable(all_objs, obj_path)
+      end
+    end
+    if x64_build_contains(result, "LINK ERROR:") or x64_build_contains(result, "NASM ERROR:") then
       print(result)
     else
       write_file(fingerprint_file, fingerprint)

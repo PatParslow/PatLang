@@ -1594,10 +1594,74 @@ make a function called read_file takes path returns s
   return rt_read_file(path)
 end
 
+# create_directory(path) -> Bool, via CreateDirectoryA. A 0 return
+# covers both a genuine failure AND "the directory already exists" --
+# this backend has no GetLastError primitive wired up to tell them
+# apart, but rt_mkdir_parents (below) does not need to: it is only ever
+# used as a best-effort auto-create, exactly like the interpreter's own
+# `let _ = std::fs::create_dir_all(parent);` (hosts.rs's host_write_file)
+# silently ignores the same already-exists case.
+make a function called create_directory takes path returns ok
+  let addr = path band rt_payload_mask()
+  let path_len = mem_peek_qword(addr, 0)
+  let r = os_create_directory(addr + 8, path_len)
+  return r != 0
+end
+
+# GitHub #192's root cause: write_file (rt_write_file, just below) never
+# created its own parent directory, unlike the interpreter's write_file
+# -- a first-ever write into a not-yet-existing directory (e.g.
+# task_registry.patlang's ".patlang_queue/" beacon files) silently
+# failed natively with nothing surfaced (this backend's own named gap:
+# no exception mechanism at all), so signal_discovery_selftest's own
+# tr_announce never actually wrote anything, and every discovery read
+# back empty rather than merely wrong. Creates every path segment from
+# the root down (CreateDirectoryA has no recursive mode of its own,
+# unlike create_dir_all), ignoring each segment's own result -- an
+# already-existing segment (the common case for every write after the
+# first) is expected, not an error to react to.
+make a function called rt_mkdir_parents takes dir_path returns done
+  if dir_path.length == 0 then
+    return true
+  end
+  let i = 0
+  let n = dir_path.length
+  while i < n do
+    if char_code(dir_path, i) == 47 then
+      # Assigned, not bare -- see write_file's own note on this.
+      let unused_seg = create_directory(substr(dir_path, 0, i))
+    end
+    let i = i + 1
+  end
+  let unused_leaf = create_directory(dir_path)
+  return true
+end
+
+# Splits off and auto-creates path's own parent directory (everything
+# before its last "/"), matching the interpreter's write_file exactly
+# -- a path with no "/" at all (writing into the current directory) has
+# no parent to create, so this is a no-op for that case.
+make a function called rt_write_file_mkdir_parent takes path returns done
+  let n = path.length
+  let i = n - 1
+  while i >= 0 do
+    if char_code(path, i) == 47 then
+      return rt_mkdir_parents(substr(path, 0, i))
+    end
+    let i = i - 1
+  end
+  return true
+end
+
 # A real Bool, like hosts.rs's host_write_file (rt_write_file keeps this backend's
 # own 1/0). Callers write `write_file(...) == true`, and a bare 0 or "0" would
 # be truthy.
 make a function called write_file takes path, contents returns ok
+  # Assigned, not a bare statement -- x64_obj_cache.patlang's own
+  # ObjCache.store docstring names a real, confirmed native x64 bug
+  # where a bare, unassigned call(...) statement (no `let`) silently
+  # never executes at all. Same shape here, so avoided the same way.
+  let unused_mkdir = rt_write_file_mkdir_parent(path)
   return rt_write_file(path, contents) != 0
 end
 
@@ -4328,9 +4392,7 @@ end
 # GAP: no error propagation mechanism exists in this backend at all
 # (no exceptions, no Result type) -- a failed read_file returns an
 # empty string rather than raising an error, unlike the interpreter's
-# own Err(...) on a missing file. write_file also does NOT create
-# parent directories first (the interpreter's own version does) -- a
-# real, separate piece of Win32 work (recursive mkdir), deferred.
+# own Err(...) on a missing file.
 
 make a function called rt_read_file takes path returns tagged
   let addr = path band rt_payload_mask()
@@ -4445,12 +4507,19 @@ make a function called read_file_bytes takes path, offset, length returns bytes
   return out
 end
 
+# GitHub #192-adjacent fix: os_file_size's own CreateFileA call fails
+# for a directory (no FILE_FLAG_BACKUP_SEMANTICS), so file_exists used
+# to read false for a directory that genuinely existed -- confirmed
+# directly, and load-bearing for task_registry.patlang's own
+# tr_discover_all, whose first line is file_exists(q_dir()). GetFileAttributesA
+# (os_path_exists) works uniformly for a file or a directory, matching
+# the interpreter's own file_exists (Path::exists()) exactly.
 make a function called rt_file_exists takes path returns s
   let addr = path band rt_payload_mask()
   let path_len = mem_peek_qword(addr, 0)
   let path_bytes = addr + 8
-  let size = os_file_size(path_bytes, path_len)
-  if size < 0 then
+  let r = os_path_exists(path_bytes, path_len)
+  if r == 0 then
     return "0"
   end
   return "1"

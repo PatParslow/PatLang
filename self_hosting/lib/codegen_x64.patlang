@@ -3400,6 +3400,96 @@ make a function called x64_os_delete_file_asm returns asm
   return sb_str(sb)
 end
 
+# os_create_directory(path_addr, path_len) -> 1/0, via CreateDirectoryA
+# (lpSecurityAttributes=NULL). GitHub #192's own root cause: write_file
+# (os_write_file below) does NOT create parent directories first, unlike
+# the interpreter's own write_file (std::fs::create_dir_all before the
+# write) -- a first-ever write into a not-yet-existing directory (e.g.
+# task_registry.patlang's own ".patlang_queue/" beacon files) silently
+# fails natively with no error surfaced (this backend's own named gap:
+# no exception mechanism at all), so every discovery that depends on
+# that write having happened reads back nothing. The caller (write_file,
+# x64_runtime.patlang) does its own per-segment recursive walk and
+# tolerates a 0 here for "already exists" exactly like the
+# interpreter's own "let _ = ..." does -- no GetLastError check needed.
+make a function called x64_os_create_directory_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, x64_lock_acquire_asm(suffix))
+  sb_push(sb, "    pop r10" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, x64_os_null_terminate_path_asm(suffix))
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [rel g_scratch]" + x64_nl_char())
+  sb_push(sb, "    xor rdx, rdx" + x64_nl_char())
+  sb_push(sb, "    call CreateDirectoryA" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    mov r14, rax" + x64_nl_char())
+  sb_push(sb, x64_lock_release_asm())
+  sb_push(sb, "    push r14" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# os_path_exists(path_addr, path_len) -> 1/0, via GetFileAttributesA.
+# GitHub #192-adjacent fix: os_file_size (above) opens the path with a
+# plain CreateFileA (no FILE_FLAG_BACKUP_SEMANTICS), which fails for a
+# DIRECTORY -- confirmed directly: file_exists(".patlang_queue") read
+# false immediately after create_directory(".patlang_queue") itself
+# reported success, while `ls -d` showed the directory genuinely
+# existed on disk. This diverges from the interpreter's own file_exists
+# (std::path::Path::exists(), which is true for a file OR a directory
+# alike) and breaks task_registry.patlang's own tr_discover_all, whose
+# very first line is `file_exists(q_dir())`. GetFileAttributesA works
+# uniformly for both: INVALID_FILE_ATTRIBUTES (0xFFFFFFFF, i.e. -1 as a
+# 32-bit value) means "doesn't exist", anything else means it does,
+# file or directory alike -- no separate directory-specific code path
+# needed.
+make a function called x64_os_path_exists_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, x64_lock_acquire_asm(suffix))
+  sb_push(sb, "    pop r10" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, x64_os_null_terminate_path_asm(suffix))
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [rel g_scratch]" + x64_nl_char())
+  sb_push(sb, "    call GetFileAttributesA" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  # TWO real, separate bugs found and fixed here, confirmed each time
+  # via objdump on the real compiled binary, not assumed:
+  # (1) `cmp eax, -1` (a 32-bit register mnemonic) assembled as a
+  # 64-bit `cmp rax, -1` regardless of the mnemonic used -- a genuine
+  # DWORD -1 result zero-extends into RAX's upper 32 bits (the call's
+  # own `mov eax, ...` convention), so RAX can never equal the
+  # 64-bit-sign-extended -1 the wrong-width compare checked against.
+  # (2) the first fix attempt, `cmp rax, 4294967295` (a reg-vs-imm32
+  # form), hits a genuine x86-64 ENCODING constraint, not an assembler
+  # bug: CMP/AND r64, imm32 always SIGN-extends the 32-bit immediate,
+  # and 4294967295 (0xFFFFFFFF) as a signed 32-bit value IS -1 -- so
+  # this also compared against the 64-bit sign-extended -1, identically
+  # wrong. Since RAX's upper bits are already zero (per (1) above), no
+  # masking is even needed; fixed by loading the exact value into a
+  # register first via MOV r64, imm64 (which has no sign-extension
+  # ambiguity for any 64-bit value) and comparing register-to-register
+  # -- the SAME pattern this file's own masking idioms already use
+  # elsewhere (e.g. "mov r10, 281474976710655" then "and rax, r10").
+  sb_push(sb, "    mov r11, 4294967295" + x64_nl_char())
+  sb_push(sb, "    cmp rax, r11" + x64_nl_char())
+  sb_push(sb, "    je .ope_missing_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov r14, 1" + x64_nl_char())
+  sb_push(sb, "    jmp .ope_done_" + suffix + x64_nl_char())
+  sb_push(sb, "  .ope_missing_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov r14, 0" + x64_nl_char())
+  sb_push(sb, "  .ope_done_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, x64_lock_release_asm())
+  sb_push(sb, "    push r14" + x64_nl_char())
+  return sb_str(sb)
+end
+
 # os_read_line() -> tagged String, one line from stdin without the
 # trailing newline (a lone trailing \r from a CRLF source is stripped
 # too, matching hosts.rs's own host_read_line), or "" at EOF. Primitive-
@@ -8036,6 +8126,10 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
     sb_push(sb, x64_os_rename_file_asm())
   elif name == "os_delete_file" then
     sb_push(sb, x64_os_delete_file_asm())
+  elif name == "os_create_directory" then
+    sb_push(sb, x64_os_create_directory_asm())
+  elif name == "os_path_exists" then
+    sb_push(sb, x64_os_path_exists_asm())
   elif name == "os_read_line" then
     sb_push(sb, x64_os_read_line_asm())
   elif name == "os_enable_raw_mode" then
@@ -10930,7 +11024,7 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
     end
     sb_push(sb, sb_str(gl_line) + x64_nl_char())
   end
-  sb_push(sb, "extern GetStdHandle, WriteFile, ExitProcess, CreateFileA, GetFileSize, CloseHandle, ReadFile, CreateProcessA, CreatePipe, SetHandleInformation, WaitForSingleObject, GetCommandLineA, GetEnvironmentVariableA, GetExitCodeProcess, TerminateProcess, WSAStartup, WSAGetLastError, socket, bind, listen, accept, connect, send, recv, closesocket, shutdown, getaddrinfo, freeaddrinfo, getsockname, ioctlsocket, htons, ntohs, Sleep, GetTickCount64, CopyFileA, MoveFileExA, DeleteFileA, RemoveDirectoryA, FindFirstFileA, FindNextFileA, FindClose, GetConsoleMode, SetConsoleMode, SetConsoleOutputCP, SetConsoleCP, GetCurrentDirectoryA, SetCurrentDirectoryA, VirtualAlloc" + x64_nl_char())
+  sb_push(sb, "extern GetStdHandle, WriteFile, ExitProcess, CreateFileA, GetFileSize, CloseHandle, ReadFile, CreateProcessA, CreatePipe, SetHandleInformation, WaitForSingleObject, GetCommandLineA, GetEnvironmentVariableA, GetExitCodeProcess, TerminateProcess, WSAStartup, WSAGetLastError, socket, bind, listen, accept, connect, send, recv, closesocket, shutdown, getaddrinfo, freeaddrinfo, getsockname, ioctlsocket, htons, ntohs, Sleep, GetTickCount64, CopyFileA, MoveFileExA, DeleteFileA, RemoveDirectoryA, CreateDirectoryA, GetFileAttributesA, FindFirstFileA, FindNextFileA, FindClose, GetConsoleMode, SetConsoleMode, SetConsoleOutputCP, SetConsoleCP, GetCurrentDirectoryA, SetCurrentDirectoryA, VirtualAlloc" + x64_nl_char())
   # Canvas host, Phase 1 (win32_window.patlang's own backing
   # primitives): window creation, message pump, GDI pixel blit.
   # user32.dll/gdi32.dll are already linked (x64_build.patlang) but

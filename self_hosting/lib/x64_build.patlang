@@ -184,6 +184,56 @@ make a function called x64_link_objs takes obj_paths, runtime_obj_path, out_path
   return out_path
 end
 
+# x64_link_objs_relocatable(obj_paths, out_path) -- combines several
+# ALREADY-ASSEMBLED .obj files into ONE relocatable .obj (via `ld -r`,
+# a genuine "partial link": still unlinked/relocatable, unlike gcc's
+# own final-executable link above), rather than a final .exe. Built for
+# GitHub #192's own build-side fix: build_x64_runtime.patlang's single
+# whole-file emit_program_x64 + ONE nasm invocation was already sitting
+# at NASM's own `-Ox` convergence cap -- confirmed directly via `-Ov`,
+# which reported the unmodified runtime needing 323 of its own internal
+# pass limit, so adding even a small new function pushed it to 324 and
+# NASM gave up outright ("label ... changed during code generation" on
+# ~18,500 labels, not a handful -- a hard wall, not a borderline case).
+# This matters even though x64_build_use_native_toolchain() always
+# routes ordinary --x64 compiles through the SELF-HOSTED assembler/
+# linker (x64_asm.patlang/x64_pe_link.patlang), not nasm, for the actual
+# .obj content: patc1_main.patlang's own staleness GATE still refuses
+# to compile ANYTHING under --x64 unless build_x64_runtime.patlang's
+# own run reported success and wrote a fresh fingerprint -- so a failed
+# nasm step here blocks every --x64 compile, not just the (otherwise
+# unused) nasm/gcc build path. Splitting the runtime into the SAME
+# per-function CompileUnit/ObjCache units the program side already uses
+# (x64_compile_unit.patlang) keeps every individual nasm invocation
+# tiny -- nowhere near the pass cap -- but still needs to end up as ONE
+# combined object exposing the runtime's own globals + every function,
+# matching x64_runtime.obj's existing external contract exactly. `ld -r`
+# is the standard tool for exactly this: combine N relocatable objects
+# into one relocatable object, no final link, no libc/startup objects
+# pulled in (confirmed directly with a minimal 3-file repro: two
+# objects partial-linked with `ld -r`, then the combined result linked
+# into a real .exe alongside a third object that called into it across
+# the join -- correct end to end).
+make a function called x64_link_objs_relocatable takes obj_paths, out_path returns result
+  let resp = sb_new()
+  sb_push(resp, "-r" + chr(10))
+  sb_push(resp, "-o" + chr(10))
+  sb_push(resp, out_path + chr(10))
+  let oi = 0
+  let ocount = to_num(list_len(obj_paths))
+  while oi < ocount do
+    sb_push(resp, obj_paths[oi] + chr(10))
+    let oi = oi + 1
+  end
+  let resp_path = out_path + ".ld_args.rsp"
+  write_file(resp_path, sb_str(resp))
+  let ld_out = exec_capture("ld", "@" + resp_path)
+  if x64_build_contains(ld_out, "error") then
+    return "LINK ERROR:\n" + ld_out
+  end
+  return out_path
+end
+
 make a function called x64_build_linked_multi takes program_asm_chunks, runtime_obj_path, out_path returns result
   let n = to_num(list_len(program_asm_chunks))
   let objs = []
@@ -257,7 +307,7 @@ end
 # declare it, so any program rounding a float failed to link natively.)
 make a function called x64_default_import_spec returns spec
   return [
-    ["KERNEL32.DLL", ["GetStdHandle", "WriteFile", "ExitProcess", "CreateFileA", "GetFileSize", "CloseHandle", "ReadFile", "CreateProcessA", "CreatePipe", "SetHandleInformation", "WaitForSingleObject", "GetCommandLineA", "GetEnvironmentVariableA", "GetExitCodeProcess", "TerminateProcess", "Sleep", "GetTickCount64", "CopyFileA", "MoveFileExA", "DeleteFileA", "RemoveDirectoryA", "FindFirstFileA", "FindNextFileA", "FindClose", "GetConsoleMode", "SetConsoleMode", "SetConsoleOutputCP", "SetConsoleCP", "GetCurrentDirectoryA", "SetCurrentDirectoryA", "CreatePseudoConsole", "ResizePseudoConsole", "ClosePseudoConsole", "InitializeProcThreadAttributeList", "UpdateProcThreadAttribute", "CreateProcessW", "PeekNamedPipe", "GetLastError", "CreateThread", "ExitThread", "InitializeCriticalSection", "EnterCriticalSection", "LeaveCriticalSection", "TlsAlloc", "TlsGetValue", "TlsSetValue", "AcquireSRWLockExclusive", "ReleaseSRWLockExclusive", "SleepConditionVariableSRW", "WakeConditionVariable", "GetModuleHandleW", "GlobalAlloc", "GlobalLock", "GlobalUnlock", "GlobalSize", "VirtualAlloc"]],
+    ["KERNEL32.DLL", ["GetStdHandle", "WriteFile", "ExitProcess", "CreateFileA", "GetFileSize", "CloseHandle", "ReadFile", "CreateProcessA", "CreatePipe", "SetHandleInformation", "WaitForSingleObject", "GetCommandLineA", "GetEnvironmentVariableA", "GetExitCodeProcess", "TerminateProcess", "Sleep", "GetTickCount64", "CopyFileA", "MoveFileExA", "DeleteFileA", "RemoveDirectoryA", "CreateDirectoryA", "GetFileAttributesA", "FindFirstFileA", "FindNextFileA", "FindClose", "GetConsoleMode", "SetConsoleMode", "SetConsoleOutputCP", "SetConsoleCP", "GetCurrentDirectoryA", "SetCurrentDirectoryA", "CreatePseudoConsole", "ResizePseudoConsole", "ClosePseudoConsole", "InitializeProcThreadAttributeList", "UpdateProcThreadAttribute", "CreateProcessW", "PeekNamedPipe", "GetLastError", "CreateThread", "ExitThread", "InitializeCriticalSection", "EnterCriticalSection", "LeaveCriticalSection", "TlsAlloc", "TlsGetValue", "TlsSetValue", "AcquireSRWLockExclusive", "ReleaseSRWLockExclusive", "SleepConditionVariableSRW", "WakeConditionVariable", "GetModuleHandleW", "GlobalAlloc", "GlobalLock", "GlobalUnlock", "GlobalSize", "VirtualAlloc"]],
     ["WS2_32.DLL", ["WSAStartup", "WSAGetLastError", "socket", "bind", "listen", "accept", "connect", "send", "recv", "closesocket", "shutdown", "getaddrinfo", "freeaddrinfo", "getsockname", "ioctlsocket", "htons", "ntohs"]],
     ["USER32.DLL", ["RegisterClassExW", "CreateWindowExW", "ShowWindow", "UpdateWindow", "DefWindowProcW", "PeekMessageW", "TranslateMessage", "DispatchMessageW", "BeginPaint", "EndPaint", "InvalidateRect", "GetClientRect", "DestroyWindow", "GetKeyState", "OpenClipboard", "CloseClipboard", "EmptyClipboard", "SetClipboardData", "GetClipboardData", "SetWindowTextA", "GetDC", "ReleaseDC"]],
     ["GDI32.DLL", ["CreateCompatibleDC", "CreateDIBSection", "SelectObject", "BitBlt", "TextOutA", "SetTextColor", "SetBkMode", "DeleteObject", "StretchDIBits"]],
