@@ -151,3 +151,28 @@ Feature: BigInt arithmetic agrees between the interpreter and native x64 (GitHub
     Given plus(a, b) with no float literal in its own body, called with an explicitly boxed 1.5 and a plain int 2
     When the file is compiled and run via --x64 only (rt_box_float has no interpreter equivalent)
     Then it prints 3.5 and then float, not a segfault
+
+  An eighth gap (GitHub #195, the cross-compilation-unit half of #50's
+  own design review): a float-returning function, compiled as its own
+  isolated per-function unit by the object-cache pipeline, was invisible
+  to its CALLER's own unit -- `type_of(make_half())` reported "int" for
+  `make_half() { return 1.0/2.0 }` even though make_half's own body has
+  an obvious float literal. Root-caused to two compounding gaps: (1)
+  float_func_names was computed fresh per compilation unit instead of
+  whole-program (now threaded across units via the ambient __vars
+  namespace, see x64_extra_float_func_names's own header), and (2), the
+  deeper one: the Block Ownership Model's own calling convention wraps
+  every declared function's return value as a two-element
+  [value, final_globals] list (Fork B's elimination of ambient global
+  state), unpacked by a fixed instruction sequence immediately after
+  every Call -- the taint analysis was treating the Call's own raw
+  result (always a List, never a float) as directly the float-or-not
+  value, instead of the unpack sequence's own final list_get. Fixed by
+  recognizing block-model-lowered calls by their "bm_fn_" name prefix
+  and shifting the float classification to the unpack's own tail
+  instruction (x64_bm_unpack_value_callee).
+
+  Scenario: a float-returning function proves float across the per-unit compilation boundary
+    Given make_half() returning 1.0/2.0, with no caller-side float evidence of its own
+    When the file is run under `pat --ir-run` and compiled+run via `--x64`
+    Then both report type_of "float" and both confirm the value equals 0.5

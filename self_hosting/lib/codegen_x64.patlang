@@ -828,6 +828,89 @@ make a function called x64_float_producing_host_names returns names
   return ["sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "log", "exp", "pow", "fabs"]
 end
 
+# GitHub #195 (root-caused, follow-up to #50/#102/#194): a block-model-
+# lowered call to a declared PatLang function (self_hosting/block_model/
+# native_codegen.patlang's own bm_nc_fn_name/bm_nc_emit_call_unpack) does
+# NOT leave the callee's own return value on the stack directly -- Fork
+# B's elimination of ambient global state means every such call actually
+# returns a two-element list [value, final_globals], and the FIXED,
+# 8-instruction sequence bm_nc_emit_call_unpack always emits immediately
+# afterward unpacks it: Store/Load the raw pair, list_get index 1 into
+# this block's own __globals, then list_get index 0 -- THAT index-0
+# list_get, not the Call instruction itself, is what actually carries
+# the callee's own return value onto the stack. Confirmed directly
+# (debug-dumped the real lowered IR): `Call bm_fn_make_half` has argc=1
+# for a ZERO-parameter source function (the extra argument is the
+# threaded __globals bundle), and its own raw result is a genuine List
+# (family 3) -- type_of(make_half()) reported "int" because the taint
+# analysis was, until this fix, treating the Call's own result as
+# directly the float-or-not value, when it is ALWAYS a list regardless
+# of what the callee returns. Detected here by name convention alone
+# (every block-model-lowered function is named "bm_fn_<original>", never
+# any other Call target in this backend) rather than needing a passed-in
+# flag -- this taint analysis has no other way to know which pipeline
+# produced a given FuncIR, and the prefix is already the ONLY thing
+# distinguishing this call shape from an ordinary, non-block-model Call
+# (a floor()/type_of()-style runtime-primitive call, which returns its
+# value directly, no unpacking).
+make a function called x64_bm_fn_prefixed takes name returns yes
+  if name.length < 6 then
+    return false
+  end
+  return substr(name, 0, 6) == "bm_fn_"
+end
+
+# Returns the callee name being unpacked if instrs[i] is EXACTLY the
+# value-extracting (index-0) list_get at the tail of a bm_nc_emit_
+# call_unpack sequence immediately following a block-model Call, or ""
+# if instrs[i] is any other instruction (including the globals-
+# extracting, index-1 list_get earlier in the SAME sequence). Matches
+# bm_nc_emit_call_unpack's own emission order exactly: Call, Store r,
+# Load r, Const num 1, CallHost list_get 2, Store __globals, Load r
+# (same r), Const num 0, CallHost list_get 2 (this one).
+make a function called x64_bm_unpack_value_callee takes instrs, i returns callee
+  if i < 8 then
+    return ""
+  end
+  let call_i = instrs[i - 8]
+  if call_i[0] != "Call" then
+    return ""
+  end
+  if not x64_bm_fn_prefixed(call_i[1]) then
+    return ""
+  end
+  let store_r = instrs[i - 7]
+  if store_r[0] != "Store" then
+    return ""
+  end
+  let r_name = store_r[1]
+  let load_r1 = instrs[i - 6]
+  if (load_r1[0] != "Load") or (load_r1[1] != r_name) then
+    return ""
+  end
+  let const_1 = instrs[i - 5]
+  if (const_1[0] != "Const") or (const_1[1] != "num") or (const_1[2] != "1") then
+    return ""
+  end
+  let lg1 = instrs[i - 4]
+  if (lg1[0] != "CallHost") or (lg1[1] != "list_get") or (to_num(lg1[2]) != 2) then
+    return ""
+  end
+  let store_g = instrs[i - 3]
+  if store_g[0] != "Store" then
+    return ""
+  end
+  let load_r2 = instrs[i - 2]
+  if (load_r2[0] != "Load") or (load_r2[1] != r_name) then
+    return ""
+  end
+  let const_0 = instrs[i - 1]
+  if (const_0[0] != "Const") or (const_0[1] != "num") or (const_0[2] != "0") then
+    return ""
+  end
+  return call_i[1]
+end
+
 make a function called x64_taint_one_pass_float takes instrs, locals_taint, float_func_names returns result
   let n = to_num(list_len(instrs))
   let stack = []
@@ -989,12 +1072,23 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
       if not x64_str_in_list(["abs", "ceil", "floor", "round", "trunc"], instr[1]) then
         let is_float_result = x64_str_in_list(x64_float_producing_host_names(), instr[1])
       end
+      # GitHub #195: if THIS instruction is specifically the value-
+      # extracting (index-0) list_get at the tail of a block-model call's
+      # own unpack sequence, its real taint is the UNPACKED callee's own
+      # float-ness (float_func_names), not list_get's own (always-false,
+      # list_get isn't in x64_float_producing_host_names) classification.
+      let bm_unpack_callee = x64_bm_unpack_value_callee(instrs, i)
+      if bm_unpack_callee != "" then
+        let is_float_result = x64_str_in_list(float_func_names, bm_unpack_callee)
+      end
       let produces_float = list_set(produces_float, i, is_float_result)
       let pr2 = x64_vstack_push(stack, sp, is_float_result)
       let stack = pr2[0]
       # A CallHost result's own provenance is opaque to this analysis --
       # never safe to auto-convert, matching a bare parameter's own
-      # conservative default.
+      # conservative default. (The unpacked block-model return value is
+      # no exception: it's exactly as opaque as any other Call result,
+      # see the "Call" case's own identical reasoning below.)
       let safe_pr2 = x64_vstack_push(safe_stack, sp, false)
       let safe_stack = safe_pr2[0]
       let sp = pr2[1]
@@ -1028,6 +1122,16 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
       let is_float_result = x64_str_in_list(float_func_names, instr[1])
       if instr[1] == "floor" then
         let is_float_result = last_arg_taint
+      end
+      # GitHub #195: a block-model-lowered call's OWN raw result is
+      # ALWAYS a two-element [value, final_globals] list (see
+      # x64_bm_fn_prefixed's own header) -- never the callee's actual
+      # return value directly, regardless of what float_func_names says
+      # about the callee. The real float-or-not question is answered
+      # instead at the tail of the immediately-following unpack sequence
+      # (the "CallHost" case below, via x64_bm_unpack_value_callee).
+      if x64_bm_fn_prefixed(instr[1]) then
+        let is_float_result = false
       end
       let produces_float = list_set(produces_float, i, is_float_result)
       let pr2 = x64_vstack_push(stack, sp, is_float_result)
