@@ -52,6 +52,7 @@ argv() and dispatches on args[0] ("lower"/"emit_x64"/"emit_rust"/
 
 import sys
 import os
+import json
 import shutil
 import math
 import time
@@ -119,7 +120,18 @@ def interp_bin(op, a, b):
     if op == "/":
         return bin_div(a, b)
     if op == "%":
-        return a % b
+        # PatLang's % truncates toward the DIVIDEND's sign (confirmed:
+        # -10 % 3 == -1), unlike Python's own %, which floors toward the
+        # DIVISOR's sign (-10 % 3 == 2 in plain Python) -- found adding
+        # the bitwise operators below and re-checking every operator
+        # here against the real semantics rather than assuming Python's
+        # own meaning matched.
+        if isinstance(a, int) and isinstance(b, int):
+            r = a % b
+            if r != 0 and (r < 0) != (a < 0):
+                r -= b
+            return r
+        return math.fmod(a, b)
     if op == "==":
         return a == b
     if op == "!=":
@@ -136,6 +148,16 @@ def interp_bin(op, a, b):
         return bool(a) and bool(b)
     if op == "or":
         return bool(a) or bool(b)
+    if op == "band":
+        return a & b
+    if op == "bor":
+        return a | b
+    if op == "bxor":
+        return a ^ b
+    if op == "shl":
+        return a << b
+    if op == "shr":
+        return a >> b
     raise PatLangError("unsupported binary operator '%s'" % op)
 
 
@@ -144,6 +166,8 @@ def interp_un(op, a):
         return 0 - a
     if op == "not":
         return not a
+    if op == "bnot":
+        return ~a
     raise PatLangError("unsupported unary operator '%s'" % op)
 
 
@@ -165,8 +189,55 @@ def interp_const(kind, text):
 # matching PatLang's own value semantics for plain lists.
 # ---------------------------------------------------------------------------
 
+# Live progress, checked FROM INSIDE the actual run_function instruction
+# loop (and the generated code's own per-block loop, once that exists --
+# see GitHub #196) -- not just declared once outside it and forgotten.
+# That's a standing, previously-hit failure mode on the PatLang side of
+# this project (a status handler registered but never actually polled
+# during the real work, so a caller can't tell "slow" from "stuck"): the
+# exact same risk applies here, and this session's own 50+ minute,
+# totally silent decisive-verification run was a live demonstration of
+# it. A plain, periodically-rewritten JSON status file is this tool's
+# own equivalent of PatLang's signal_query -- anyone (another process,
+# or a person) can read it at any time to see what's happening right
+# now, with no live request/response server to build. Throttled by a
+# cheap instruction-count modulo check (not a time.time() call on every
+# single instruction) so it costs effectively nothing in the hot path.
+PROGRESS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "compile_status.json")
+PROGRESS_EVERY_N = 20000
+
+
+class Progress:
+    def __init__(self, path=PROGRESS_PATH, every_n=PROGRESS_EVERY_N, min_interval_s=0.25):
+        self.path = path
+        self.every_n = every_n
+        self.min_interval_s = min_interval_s
+        self.count = 0
+        self.start = time.time()
+        self.last_write = 0.0
+
+    def tick(self, **fields):
+        self.count += 1
+        if self.count % self.every_n != 0:
+            return
+        now = time.time()
+        if now - self.last_write < self.min_interval_s:
+            return
+        self.last_write = now
+        fields["elapsed_s"] = round(now - self.start, 1)
+        fields["instructions_seen"] = self.count
+        try:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(fields, f)
+            os.replace(tmp, self.path)
+        except OSError:
+            pass  # best-effort: a failed status write must never break the actual compile
+
+
 class HostState:
     def __init__(self, argv_list, funcs):
+        self.progress = Progress()
         self.vecs = {}
         self.next_vec = 0
         self.sbs = {}
@@ -195,6 +266,14 @@ class HostState:
         # nasm/gcc directly for the final link.
         self.procs = {}
         self.next_pid = 1
+        # In-memory VFS -- genuinely reached (not interp.patlang's unrelated
+        # surface): signals.patlang/mailbox.patlang (both bundled, the
+        # latter transitively via signals.patlang's own include) check
+        # vfs_exists/etc as part of their own driver bookkeeping even
+        # when host_caps() ultimately selects the "fs" driver elsewhere.
+        # A plain dict is enough -- this process never outlives one
+        # compile, so nothing needs to persist it to real disk.
+        self.vfs = {}
 
     def ns(self, name):
         return self.namespaces.setdefault(name, {})
@@ -210,11 +289,29 @@ def call_host(name, args, state):
     if name == "list_len":
         return len(args[0])
     if name == "list_push":
-        return args[0] + [args[1]]
+        # Mutate in place, matching NATIVE x64's own already-shipped,
+        # already-audited behavior (confirmed: "native list_push mutates
+        # in place when the block has spare capacity... despite a
+        # codegen note saying it is copy-on-write" -- see this project's
+        # own gotchas notes) -- NOT PatLang's documented "lists are
+        # immutable by value" ideal, but the real, load-bearing behavior
+        # every accumulator-loop in this codebase (x64_compile_unit.
+        # patlang's own x64_chunk_to_bin, x64_asm.patlang, etc.) is
+        # ALREADY written and audited to require, specifically BECAUSE
+        # native x64 behaves this way. The original copy-and-return-new
+        # version reintroduced the EXACT O(n^2) bug x64_chunk_to_bin's
+        # own header comment documents as GitHub #75 ("turned this
+        # encoder from seconds into did not finish in 38 minutes") --
+        # confirmed here too: compiling a trivial 4-line program via
+        # --x64 under this interpreter needed 900M+ block-transitions
+        # and was still running after 15 minutes, with the per-item rate
+        # visibly collapsing as the accumulator grew (668K/s -> 34K/s),
+        # the textbook signature of a hidden O(n^2).
+        args[0].append(args[1])
+        return args[0]
     if name == "list_set":
-        l = list(args[0])
-        l[int(args[1])] = args[2]
-        return l
+        args[0][int(args[1])] = args[2]
+        return args[0]
     if name == "type_of":
         v = args[0]
         if isinstance(v, bool):
@@ -254,20 +351,43 @@ def call_host(name, args, state):
     if name == "chr":
         return chr(int(args[0]))
     if name == "to_num":
+        # Matches hosts.rs's host_to_num exactly: Int/Float/BigInt/
+        # Rational pass through unchanged; a String is parsed; anything
+        # else (Unit/None, Bool, List) falls back to 0 -- NOT an error.
+        # bool is checked before int/float since Python's bool is a
+        # subclass of int (isinstance(True, int) is True), which would
+        # otherwise return True/False themselves instead of matching
+        # Rust's real "anything non-numeric falls back to 0" fallback.
         s = args[0]
+        if isinstance(s, bool):
+            return 0
+        if isinstance(s, (int, float)):
+            return s
+        if not isinstance(s, str):
+            return 0
         try:
-            if isinstance(s, (int, float)):
-                return s
             if "." in s:
                 return float(s)
             return int(s)
         except ValueError:
             return 0
     if name == "hash_string":
-        h = 2166136261
-        for ch in args[0]:
-            h = (h ^ ord(ch)) * 16777619 & 0xFFFFFFFF
-        return format(h, "08x")
+        # FNV-1a 64-bit, over UTF-8 bytes, 16 lowercase hex digits -- must
+        # match hosts.rs's host_hash_string EXACTLY (hashes computed here
+        # are compared against fingerprint files written by the real
+        # native hash_string, e.g. x64_runtime.fingerprint/patc1.fingerprint).
+        # A prior version of this used 32-bit FNV-1a parameters, which
+        # produced a completely different digest for the same input --
+        # every build-cache staleness check against a fingerprint written
+        # by the real interpreter then spuriously failed every time,
+        # regardless of whether the underlying files had actually
+        # changed. Found re-verifying GitHub #25 Piece 2: the compiler's
+        # own staleness gate reported x64_runtime.obj as stale even
+        # immediately after a genuine, fresh rebuild.
+        h = 0xcbf29ce484222325
+        for b in args[0].encode("utf-8"):
+            h = ((h ^ b) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+        return format(h, "016x")
     if name == "vec_new":
         handle = state.next_vec
         state.next_vec += 1
@@ -304,7 +424,16 @@ def call_host(name, args, state):
     if name == "sb_str":
         return "".join(state.sbs[args[0]])
     if name == "read_file":
-        with open(args[0], "r", encoding="utf-8") as f:
+        # newline="" disables Python's universal-newline translation --
+        # without it, a CRLF file (this repo's own convention on Windows,
+        # confirmed via `file lexer.patlang`) reads back with every \r
+        # silently stripped, while Rust's read_to_string (hosts.rs) reads
+        # the raw bytes verbatim, \r\n intact. Any hash_string(read_file(...))
+        # comparison against a fingerprint written by the real interpreter
+        # then mismatches on byte count alone, regardless of hash_string's
+        # own algorithm being correct -- found immediately after fixing
+        # hash_string itself and still seeing the same staleness failure.
+        with open(args[0], "r", encoding="utf-8", newline="") as f:
             return f.read()
     if name == "write_file":
         path = args[0]
@@ -313,6 +442,26 @@ def call_host(name, args, state):
             os.makedirs(parent, exist_ok=True)
         with open(path, "w", encoding="utf-8", newline="") as f:
             f.write(args[1])
+        return True
+    if name == "getenv":
+        return os.environ.get(args[0], "")
+    if name == "write_file_bytes":
+        # write_file_bytes(path, byte_list) -> True. Raw binary output
+        # (a PE image, machine code) -- write_file's own UTF-8 text
+        # mode can't represent arbitrary byte sequences at all, same
+        # reason hosts.rs itself special-cases this one primitive.
+        path, byte_list = args
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        out = bytearray()
+        for i, b in enumerate(byte_list):
+            n = int(b)
+            if not (0 <= n <= 255):
+                raise PatLangError("write_file_bytes: byte at index %d (%d) is out of range 0-255" % (i, n))
+            out.append(n)
+        with open(path, "wb") as f:
+            f.write(bytes(out))
         return True
     if name == "touch_file":
         path = args[0]
@@ -424,6 +573,20 @@ def call_host(name, args, state):
         if method == "set":
             state.ns(recv)[rest[0]] = rest[1]
             return None
+        if method == "push":
+            # send(recv, "push", field, val): append to a List field --
+            # a GENERIC built-in on any named object (hosts.rs:2394-2400),
+            # not specific to any particular class/"type" field, so this
+            # must be checked before the class-method lookup below, same
+            # order as "set" is. "Dict" (new("Dict", name)) is not a real
+            # registered class anywhere in this bundle -- it's just a
+            # conventionally-named, unregistered object used as a map,
+            # and send(dict_obj, "push", k, v) on one hits exactly this
+            # path, never a class-method dispatch.
+            field = rest[0]
+            cur = state.ns(recv).get(field, [])
+            state.ns(recv)[field] = cur + [rest[1]]
+            return None
         cname = state.ns(recv).get("type")
         entry = state.classes.get(cname)
         closure = None
@@ -482,6 +645,57 @@ def call_host(name, args, state):
     if name == "sleep_ms":
         time.sleep(args[0] / 1000.0)
         return None
+    if name == "vfs_exists":
+        return "1" if args[0] in state.vfs else "0"
+    if name == "vfs_read":
+        if args[0] not in state.vfs:
+            raise PatLangError("vfs_read: not found: %s" % args[0])
+        return state.vfs[args[0]]
+    if name == "vfs_write":
+        state.vfs[args[0]] = args[1] if isinstance(args[1], str) else str(args[1])
+        return True
+    if name == "vfs_delete":
+        return state.vfs.pop(args[0], None) is not None
+    if name == "vfs_list":
+        prefix = args[0]
+        return sorted(k for k in state.vfs if k.startswith(prefix))
+    if name == "read_file_bytes":
+        # read_file_bytes(path, offset, length) -> List of Int (0-255),
+        # fail-soft (hosts.rs: any open/seek/read error, or a file shorter
+        # than offset+length, returns fewer bytes or [] rather than
+        # raising) -- used for binary-format inspection (e.g. a PE
+        # header's Subsystem field) without reading a whole executable
+        # just to look at a handful of bytes.
+        path, offset, length = args
+        try:
+            with open(path, "rb") as f:
+                f.seek(int(offset))
+                return list(f.read(int(length)))
+        except OSError:
+            return []
+    if name == "host_caps":
+        # Honest about what THIS interpreter actually has, matching the
+        # pattern native x64's own host_caps() follows (hosts.rs:3531-3534
+        # is the real interpreter's list; this is not that -- no world_swap
+        # here, since there's no way to swap worlds in a single-shot
+        # script, and no tcp/threads since those aren't implemented
+        # below). Real file I/O and real subprocess spawn are genuinely
+        # supported (see "spawn"/"exec_capture"/"read_file"/"write_file"
+        # elsewhere in this dispatch), so those are listed for real.
+        return ["subprocess", "fs"]
+    if name == "register_event_handler":
+        # No-op, deliberately: self_hosting/lib/build_progress.patlang
+        # (added 2026-09-06, after this bootstrap was first verified)
+        # registers a top-level `when x64_status do ... end` handler so
+        # an EXTERNAL process can signal_query a long-running build's
+        # progress while it's happening. This interpreter's own compile
+        # runs single-shot and synchronously -- nothing else is running
+        # concurrently to ever send it that query -- so the handler
+        # genuinely never needs to fire; the registration call itself
+        # just needs to not crash. Revisit with a real implementation
+        # only if this bootstrap path is ever asked to run as a
+        # long-lived, externally-queryable process.
+        return None
     raise PatLangError(
         "host function '%s' not supported by bootstrap_interp.py -- "
         "this is deliberately scoped to the compiler's own lex/parse/"
@@ -512,6 +726,13 @@ def run_function(funcs, func, arg_values, state):
     while True:
         if pc >= len(instrs):
             return None
+        # Checked HERE, inside the real per-instruction loop -- not once
+        # before/after it. A handler that only gets a turn between calls,
+        # never during one, is not actually live while the real work is
+        # happening (this project's own standing rule, previously learned
+        # the hard way on the PatLang/signal_poll side; the same trap
+        # applies here just as easily).
+        state.progress.tick(func=func[1], pc=pc, stack_depth=len(stack))
         instr = instrs[pc]
         op = instr[0]
         if op == "Const":
