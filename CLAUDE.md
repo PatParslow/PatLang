@@ -197,3 +197,80 @@ that prompted the program didn't mention it explicitly.
   right output eventually" is not the same claim as "it can be checked on
   and safely interrupted," and the two should never be conflated in a
   summary.
+
+---
+
+## 7. Thread safety: `__vars` is one shared namespace across `parallel_map`/`thread_spawn` workers
+
+Found via GitHub #197 (native x64 parallel assembly, already built and
+measured at 10.9x on the mechanism itself, blocked on this): `get("__vars",
+key)`/`set_var(key, val)` reads/writes ONE process-wide table. A
+`parallel_map`/`thread_spawn` worker does NOT get its own isolated copy of
+it — code that assumes otherwise races, non-deterministically, and the
+failure often looks unrelated to concurrency at first (e.g. "undefined
+symbol 'S2'" on one run, a different symbol on the next). A full audit
+(2026-10-02) found this is not a one-off mistake but a recurring shape
+across the self-hosted codebase, worth checking for explicitly any time a
+new `parallel_map`/`thread_spawn` call site is added, or an existing one's
+callee graph changes. Three distinct hazard shapes, each with its own fix
+— don't reach for a lock/mutex for any of them, PatLang has none, and all
+three have a lock-free fix that removes the shared mutable state instead:
+
+**a) Shared uniqueness counters.** A `get("__vars", "X_counter")` /
+increment / `set_var` triple used to generate a unique name/ID (label,
+symbol, synthesized function name). Confirmed actually racing: `__x64_str_
+counter`/`__x64_cv_counter` (`codegen_x64.patlang`), `xa_id_counter`
+(`x64_asm.patlang`) via `x64_compile_unit.patlang`'s parallel units; `lower.
+patlang`'s `__closure_seq`/`__budgeted_seq`/`__match_seq`/`__activate_seq`
+via `tools/build_portfolio.patlang`'s own `parallel_map` calls (each worker
+runs a full `patc1_compile` on a different demo program) -- a SEPARATE
+at-risk call path, found by the same audit, not previously tracked
+anywhere. Several other same-shaped counters exist (`pr_id_counter`,
+`__iso_seq`, `__isop_seq`, `__interp_run_seq`, `__interp_seq`, `__evloop_
+seq`, `bm_synth_counter`, `zs_bfs_counter`) but are not currently reachable
+from any `parallel_map`/`thread_spawn` call site -- safe today, same shape,
+re-check if that ever changes.
+  - **Fix**: derive uniqueness from something already unique per unit (the
+    function's own name, a caller-supplied task ID) plus a LOCAL counter,
+    instead of a shared global one. This removes the race by removing the
+    shared mutable state, not by synchronizing access to it.
+
+**b) Shared resource-handle state.** A port/socket/file-handle claimed by
+one thread, with its "have I already claimed one" check reading from
+shared state another thread can also read. Confirmed: `build_progress.
+patlang`'s `x64_build_signal_claim` records the claimed port in
+`__x64_build_port`; its own idempotency guard ("if already set, return it"
+-- correct for one thread, added for issue #89) means a parallel worker
+reads another worker's port number and believes it holds a live listener
+it never actually bound. Current code works around this by disabling
+ticks during the parallel phase (`x64_compile_unit.patlang:683`,
+`__x64_build_port` forced to `"-1"`) rather than fixing it.
+  - **Fix**: make the "did I claim one" check itself genuinely per-thread
+    (derived from the same per-unit identity as (a)), not a shared `__vars`
+    read -- the underlying port-range retry loop (walk ports until
+    `signal_claim` succeeds) is already correct and doesn't need to change.
+
+**c) Shared accumulators.** A `list_push`/`vec_push` onto a list/cache kept
+in `__vars` rather than a local variable. One confirmed instance,
+currently NOT reachable from a parallel call site (`report.patlang`'s
+`report_log`, accumulated via string-concat, not even `list_push` -- also
+worth a look under §4.5's string-building rule separately if ever called
+in a hot loop), so not yet a live bug, but the shape to watch for.
+  - **Fix**: accumulate per-worker (a local list each worker returns), merge
+    the results AFTER `parallel_map` returns -- never write to a shared
+    structure from inside a worker.
+
+**The safe pattern already in use, worth copying deliberately**: `goap_
+synthesis.patlang`'s and `synthesis_by_example.patlang`'s own worker
+functions (`goap_eval_candidate_chunk_worker`, `sbe_eval_candidate_chunk_
+worker`) only ever READ `__vars` keys that were set ONCE, before
+`parallel_map` starts, and never written again during the parallel phase.
+Read-only broadcast state is fine; the hazard is specifically a WRITE
+(even an idempotent-looking one, per (b)) from inside a worker.
+
+**Before adding, or extending the callee graph of, any `parallel_map`/
+`thread_spawn` call site**: check whether anything it calls, transitively,
+writes to `__vars` (`set_var`, or `get`+increment+`set_var`). A write there
+is fine if it happens before the parallel phase starts or after it
+finishes; a write reachable DURING the parallel phase needs one of the two
+fixes above, not a mutex (there isn't one).
