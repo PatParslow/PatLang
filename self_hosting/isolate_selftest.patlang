@@ -46,10 +46,17 @@ let e = mbox_put("box", "alice", "later")
 check("ids are never reused after a box empties", e != a and e != b and e != c, true)
 check("boxes are independent", mbox_count("other"), 0)
 
-# --- isolate: needs world_swap (host_caps); a native x64 program has
-# none (x64_runtime.patlang's own host_caps lists no "world_swap" --
-# a native program is not an interpreter host, so a real swap-and-run
-# cannot be built there, by design, not by omission). isolate_start
+# --- isolate: needs world_swap OR subprocess (host_caps). A native x64
+# program has no world_swap (x64_runtime.patlang's own host_caps lists no
+# "world_swap" -- a native program is not an interpreter host, so a real
+# swap-and-run cannot be built there, by design, not by omission) but DOES
+# have "subprocess"+"fs", so isolate_caps() there reports "process", not
+# empty -- isolate_process.patlang's spawned-pat.exe turns cover it (see
+# the forced-["backend","process"] block further down, which exercises
+# that path for real here and is what actually runs natively on x64).
+# This block is specifically the WORLD/"turns" behavioral suite, so it only
+# runs when that backend auto-detects; a truly capability-less host (the
+# only remaining "refused" case) falls to the else below. isolate_start
 # already checks this itself and refuses cleanly before doing anything
 # else -- but every check below assumes isolate_start SUCCEEDED, so
 # running them unguarded against a refused (id == "") handle chases
@@ -57,13 +64,12 @@ check("boxes are independent", mbox_count("other"), 0)
 # so isolate_turns/isolate_state's own vfs_read calls land on paths
 # like "/iso//__iso__/turn" -- the doubled slash is a direct, expected
 # symptom of this missing guard, not a separate bug in its own right).
-# This is the same guard queue_signals_vfs_selftest.patlang already
-# uses for its own isolate section; when missing, confirm isolate_start
-# refuses cleanly (reported, not a crash and not a half-run) instead of
-# running the turn-based checks that need it.
-if list_len(isolate_caps()) == 0 then
-  check("without world_swap an isolate is refused, not half-run", isolate_ok(isolate_start("print(1)", [])), false)
-  check("the refusal names the missing capability", contains_text(isolate_start("print(1)", [])[1], "world_swap"), true)
+let top_caps = isolate_caps()
+if list_len(top_caps) > 0 and top_caps[0] == "process" then
+  check("isolate_caps lists process-based isolates (no world_swap, has subprocess)", top_caps[0], "process")
+elif list_len(top_caps) == 0 then
+  check("without world_swap or subprocess an isolate is refused, not half-run", isolate_ok(isolate_start("print(1)", [])), false)
+  check("the refusal names the missing capabilities", contains_text(isolate_start("print(1)", [])[1], "world_swap"), true)
 else
   # --- a stateful ping-pong across turns ---
   let worker = ist_src([
@@ -152,6 +158,102 @@ else
   check("the compile error is reported", starts_with(bad[1], "parse error"), true)
 
   check("isolate_caps lists turn-based isolates", isolate_caps()[0], "turns")
+end
+
+# --- process backend: the same isolate semantics, but each turn runs by
+# spawning a genuine, separate pat.exe --ir-run subprocess instead of an
+# in-process world_run swap (self_hosting/lib/isolate_process.patlang). This
+# is native x64's own real path (host_caps has "subprocess"+"fs" but never
+# "world_swap" there), but forcing it here with ["backend", "process"]
+# exercises it under the interpreter too -- which has world_swap and would
+# otherwise never pick this path on its own -- for a fast RED/GREEN loop
+# before the slower native --x64 compile-and-run confirmation. Needs the
+# same "subprocess" + a real pat.exe that isolate_caps() itself checks for;
+# skip cleanly if neither is available (mirrors the world-backend guard
+# above).
+if (iri_has_cap("subprocess") == false) or (file_exists(interp_pat_path([])) == false) then
+  check("process backend skipped: no subprocess capability or pat.exe", true, true)
+else
+  let popts = [["backend", "process"]]
+  let pworker = ist_src([
+    "include \"lib/mailbox.patlang\"",
+    "let n = 0",
+    "if vfs_exists(\"/state/n\") == \"1\" then",
+    "  let n = to_num(vfs_read(\"/state/n\"))",
+    "end",
+    "let msgs = mbox_drain(\"in\")",
+    "let i = 0",
+    "while i < list_len(msgs) do",
+    "  let n = n + 1",
+    "  mbox_put(\"out\", vfs_read(\"/__iso__/self\"), \"pong:\" + msgs[i][1] + \"#\" + n)",
+    "  let i = i + 1",
+    "end",
+    "vfs_write(\"/state/n\", \"\" + n)"
+  ])
+  let pexpanded = expand_includes(pworker, "self_hosting")
+  let ph = isolate_start(pexpanded, popts)
+  check("process backend: the worker compiles", isolate_ok(ph), true)
+  let ph2 = isolate_start(pexpanded, popts)
+  check("process backend: each isolate gets its own id", ph[0] != ph2[0], true)
+
+  isolate_send(ph, "main", "a")
+  isolate_send(ph, "main", "b")
+  check("process backend: messages wait in the inbox until a turn runs", isolate_pending(ph), 2)
+  let pr1 = isolate_step(ph)
+  check("process backend: the first turn succeeds", pr1[0], true)
+  check("process backend: the turn consumed the inbox", isolate_pending(ph), 0)
+  let pout1 = isolate_recv(ph)
+  check("process backend: both replies came back", list_len(pout1), 2)
+  check("process backend: replies keep order", pout1[0][1], "pong:a#1")
+  check("process backend: second reply carries updated state", pout1[1][1], "pong:b#2")
+
+  isolate_send(ph, "main", "c")
+  let pr2 = isolate_step(ph)
+  let pout2 = isolate_recv(ph)
+  check("process backend: state persisted across a spawned turn", pout2[0][1], "pong:c#3")
+  check("process backend: the parent can read the isolate's state", isolate_state(ph, "n"), "3")
+  check("process backend: turns are counted", isolate_turns(ph), 2)
+
+  # --- isolation (even more strongly true here -- a different OS process,
+  # not just a swapped world in the same process memory -- but still worth
+  # asserting for parity with the world backend's own guarantee) ---
+  check("process backend: the other isolate's state is untouched", isolate_state(ph2, "n"), "")
+  set_var("ist_pk", "parent")
+  let pleak = ist_src(["set_var(\"ist_pk\", \"child\")", "fact(\"ist_pf\", \"a\", \"b\")"])
+  let phl = isolate_start(pleak, popts)
+  isolate_step(phl)
+  check("process backend: a child's variables do not reach the parent", get("__vars", "ist_pk"), "parent")
+  check("process backend: a child's facts do not reach the parent", query("ist_pf", "a", "_"), 0)
+
+  # --- a failed turn commits nothing and keeps the message ---
+  let pcrashy = ist_src([
+    "include \"lib/mailbox.patlang\"",
+    "vfs_write(\"/state/touched\", \"yes\")",
+    "let m = mbox_take(\"in\")",
+    "let x = no_such_function(1)"
+  ])
+  let phc = isolate_start(expand_includes(pcrashy, "self_hosting"), popts)
+  isolate_send(phc, "main", "keep me")
+  let prc = isolate_step(phc)
+  check("process backend: a crashing turn reports failure", prc[0], false)
+  check("process backend: its writes were rolled back", isolate_state(phc, "touched"), "")
+  check("process backend: its inbox message is still there", isolate_pending(phc), 1)
+  check("process backend: a failed turn is not counted", isolate_turns(phc), 0)
+
+  # --- budget: wall-clock timeout_ms, NOT max_steps (the world backend's
+  # option) -- a plain subprocess has no step-count instrumentation to
+  # enforce, only how long exec_capture_io is willing to wait for it.
+  let pspin = isolate_start(ist_src(["while true do", "end"]), [["backend", "process"], ["timeout_ms", 2000]])
+  let prs = isolate_step(pspin)
+  check("process backend: an isolate that never returns is stopped by timeout_ms", prs[0], false)
+
+  # --- run_until_idle works the same regardless of backend ---
+  let phi = isolate_start(pexpanded, popts)
+  isolate_send(phi, "main", "x")
+  isolate_send(phi, "main", "y")
+  let pidle = isolate_run_until_idle(phi, 5)
+  check("process backend: run_until_idle stops when the inbox is empty", pidle[1], true)
+  check("process backend: one turn was enough to drain both", pidle[0], 1)
 end
 
 t_report()

@@ -1,0 +1,93 @@
+# isolate_process.patlang -- a process-backed isolate turn, for hosts with
+# no world_swap (host_caps) but with "subprocess" + "fs" -- the native x64
+# backend's own actual capability set (x64_runtime.patlang's host_caps
+# returns ["x64", "subprocess", "tcp", "fs"], never "world_swap": a native
+# program is not an interpreter host, so a real in-process swap-and-run
+# cannot be built there, by design -- see isolate.patlang's header).
+#
+# A genuinely separate OS process gives the SAME "empty global state"
+# guarantee world_run provides in-process, for free, just by being a fresh
+# process -- no new primitive needed. Reuses interp_run.patlang's existing
+# subprocess machinery (interp_pat_path, iri_quiet_supported, exec_capture_io)
+# rather than re-inventing it, and json.patlang (via isolate_process_runtime.
+# patlang) to marshal the VFS snapshot through temp files, so no value ever
+# needs escaping into generated PatLang source text -- only the (self-
+# generated, always-safe) temp file paths get spliced into source.
+#
+# Protocol per turn:
+#   1. parent writes the isolate's current VFS snapshot (iso_snapshot) to a
+#      fresh JSON temp file.
+#   2. parent builds a runner source: isolate_process_runtime.patlang's
+#      isopr_restore(snapshot_path), then the isolate body verbatim, then
+#      isopr_dump(dump_path) -- expand_includes'd into one self-contained
+#      file (the child has no access to the parent's own include graph).
+#   3. parent spawns `pat.exe --ir-run <runner>` via exec_capture_io, with an
+#      optional wall-clock timeout_ms (the process-backend's budget
+#      mechanism -- no step-count instrumentation is possible for a plain
+#      subprocess, so this does NOT behave identically to the world
+#      backend's own max_steps; see isolate_selftest.patlang's own
+#      "process" branch for the exact difference this implies).
+#   4. If the child exited ok AND actually wrote the dump file, the turn
+#      succeeded: its VFS entries become this turn's result. Any other
+#      outcome (nonzero exit, timeout, or an ok exit that still somehow
+#      left no dump -- e.g. a crash after isopr_restore but before
+#      isopr_dump) is reported as failure with nothing committed, exactly
+#      matching a crashing world_run turn's own rollback semantics.
+
+include "isolate_process_runtime.patlang"
+
+make a function called isop_tmp_path takes tag returns path
+  let n = to_num("0" + get("__vars", "__isop_seq")) + 1
+  set_var("__isop_seq", "" + n)
+  return "self_hosting/build/_isop_" + tag + "_" + now_ms() + "_" + n + ".patlang"
+end
+
+make a function called isop_build_runner_source takes body, snapshot_path, dump_path returns text
+  return "include \"lib/isolate_process_runtime.patlang\"" + chr(10) +
+    "isopr_restore(\"" + snapshot_path + "\")" + chr(10) +
+    body + chr(10) +
+    "isopr_dump(\"" + dump_path + "\")" + chr(10)
+end
+
+# isolate_step_process(handle) -> [stdout, stderr, ok, vfs_out_entries],
+# matching interp_run_ir's own 4-tuple shape so isolate_step's commit logic
+# is identical regardless of which backend produced it.
+make a function called isolate_step_process takes handle returns result
+  let id = handle[0]
+  let body = handle[3]
+  let opts = handle[2]
+  let snapshot_path = isop_tmp_path("in")
+  let dump_path = isop_tmp_path("out")
+  write_file(snapshot_path, isop_entries_to_json(iso_snapshot(id)))
+  let runner = expand_includes(isop_build_runner_source(body, snapshot_path, dump_path), "self_hosting")
+  let runner_path = isop_tmp_path("prog")
+  write_file(runner_path, runner)
+  let pat = interp_pat_path(opts)
+  let quiet = iri_quiet_supported(pat)
+  let args = ["--ir-run", runner_path]
+  if quiet then
+    let args = ["--quiet", "--ir-run", runner_path]
+  end
+  let timeout = iri_opt(opts, "timeout_ms", 0)
+  let r = exec_capture_io(pat, args, "", timeout)
+  let out = r[0]
+  if (quiet == false) and r[2] then
+    # An unpatched pat.exe echoes the program's final value after its own
+    # output (matching iri_run_process's own handling of the same quirk).
+    if out.length > 0 then
+      let out = substr(out, 0, out.length - 1)
+    end
+  end
+  remove_file(snapshot_path)
+  remove_file(runner_path)
+  if r[2] == false then
+    remove_file(dump_path)
+    return [out, r[1], false, []]
+  end
+  if file_exists(dump_path) == false then
+    return [out, "isolate_step_process: child exited ok but left no dump file (crashed after isopr_restore, before isopr_dump)", false, []]
+  end
+  let entries = isop_json_to_entries(read_file(dump_path))
+  remove_file(dump_path)
+  return [out, r[1], true, entries]
+end
