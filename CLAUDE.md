@@ -4,6 +4,62 @@
 
 PatLang was deliberately pushed to self-host: the lexer, parser, lowerer, and code generator are all written in PatLang itself (`self_hosting/lib/ {lexer,parser,lower,codegen,runtime_rs}.patlang`), not just as a novelty but so that PatLang programs actually get compiled by a PatLang-authored compiler.
 
+## The pure-PatLang (self-hosted) route is PRIMARY. Rust is legacy, mirrored for correctness checking.
+
+`self_hosting/lib/*.patlang` (lexer/parser/lower/codegen/codegen_x64/x64_asm/
+runtime_rs/...) is the CANONICAL implementation of the compiler's logic.
+`rust-runtime/src/ir/{hosts,codegen}.rs` is a NECESSARY but subordinate
+piece, kept for exactly two reasons, neither of which makes it the place
+to reason about correctness:
+
+1. **Bootstrapping Gen A.** `patc1.exe` must be built the very first time
+   via `rustc` + `codegen.rs`'s native Rust-source emission, because no
+   self-hosted binary exists yet to build it with (an unavoidable
+   chicken-and-egg, not a design preference). Gen B/C (`patc1.exe`
+   compiling `patc1_all.patlang` into `patc2.exe`/`patc3.exe`) goes
+   through the real self-hosted route instead (`emit_program_rs_chunked`,
+   sourcing chunk text from `runtime_rs.patlang`'s `emit_chunk_<name>`
+   functions, NOT from `codegen.rs`'s `PRELUDE_*` constants) -- this is
+   the genuinely-canonical path, and the one that should be trusted and
+   tested as "the compiler," not Gen A's rustc-bootstrapped shortcut.
+2. **Correctness-checking mirror.** `codegen.rs`'s `PRELUDE_*` constants
+   and `hosts.rs`'s host-function bodies exist so `cargo test ... --test
+   selfhost_pipeline -- selfhost_runtime_text_parity` has something
+   independent to check the self-hosted emission against. The mirror
+   being correct does not make it primary -- a mismatch means fix
+   whichever side is wrong, usually by making the Rust side match the
+   self-hosted PatLang logic, not the other way around, unless the
+   self-hosted side itself has the actual bug.
+
+**Consequence for day-to-day work:**
+- When fixing a bug or adding a feature in compiler logic that already
+  has a self-hosted form (lexing, parsing, lowering, x64/WASM codegen,
+  the assembler, the linker), edit the `.patlang` file. Never treat
+  `codegen.rs`/`codegen.patlang`-emitted text as the "real" version to
+  patch around a self-hosted gap.
+- When a genuinely new HOST primitive is needed (something PatLang
+  itself cannot express -- true host-boundary state like thread-local
+  storage, raw TCP, file I/O), it must exist in Rust at the host-function
+  boundary regardless, in **both** `hosts.rs` (interpreter) and wherever
+  the self-hosted compiler's own emission target expects it
+  (`codegen.rs`'s `PRELUDE_*` for Gen A, mirrored into `runtime_rs.
+  patlang`'s matching `emit_chunk_<name>` for Gen B/C). Implement both in
+  the SAME pass, not as a deferred follow-up -- a primitive that exists
+  natively but not in the self-hosted mirror is not "done," it has
+  silently reintroduced a rustc dependency Gen B/C doesn't actually need.
+  Run `selfhost_runtime_text_parity` immediately after touching either
+  side, not at session end -- it catches exactly this class of mistake
+  (confirmed directly, GitHub #197's own follow-up: a new primitive
+  landed in the wrong CHUNK on the self-hosted side, parity caught it in
+  one run, a real Gen B/C self-compile + a --x64 program exercising the
+  primitive then proved the fix genuinely works end-to-end, not just that
+  the text comparison passes).
+- `pat --ir-run` (the interpreter, backed by `hosts.rs`) is NOT legacy --
+  it stays the fast default dev loop for diagnostics and iteration. What
+  is legacy is specifically `codegen.rs`'s native Rust-source-emission
+  path (`pat --patc`) and treating it as a development target in its own
+  right rather than a bootstrap/correctness-check mirror.
+
 ---
 
 ## 1. Compilers
@@ -16,7 +72,7 @@ PatLang was deliberately pushed to self-host: the lexer, parser, lowerer, and co
 
 
 
-* **`pat --patc`**: Testing native compiler/runtime (`codegen.rs`) only. Do not use for routine builds.
+* **`pat --patc`**: Testing native compiler/runtime (`codegen.rs`) only -- legacy/bootstrap/correctness-mirror, per the section above. Do not use for routine builds, and do not treat it as the place to decide what's correct.
 
 
 * **Goal**: Transition from `rustc` bootstrap to pure PatLang-to-native emission.
@@ -25,18 +81,18 @@ PatLang was deliberately pushed to self-host: the lexer, parser, lowerer, and co
 
 ---
 
-## 2. Mirror Sync (`codegen.rs` $\rightarrow$ `self_hosting/`)
+## 2. Mirror Sync (`self_hosting/` is canonical; `codegen.rs` is the legacy mirror checked against it)
 
-* **Rule**: Update mirror before session end or explicitly report deferred gaps.
+* **Rule**: Update both sides in the SAME pass, not "mirror before session end" -- a primitive or fix that only lands on one side is not done. Run the parity check as part of making the change, not as a final cleanup step.
 
 
 * **Workflow**:
-1. Check parity: `cargo test --release --manifest-path rust-runtime/Cargo.toml --test selfhost_pipeline -- selfhost_runtime_text_parity`
+1. Implement/fix the logic in `self_hosting/lib/*.patlang` first -- this is the canonical version.
+2. If it's a host-boundary primitive Rust must also provide, add it to `rust-runtime/src/ir/hosts.rs` AND to the matching `PRELUDE_*`/`emit_chunk_<name>` pair in `codegen.rs`/`runtime_rs.patlang`, same chunk, same text, same position relative to neighboring functions.
+3. Check parity immediately: `cargo test --release --manifest-path rust-runtime/Cargo.toml --test selfhost_pipeline -- selfhost_runtime_text_parity`
 
-2. Update matching `emit_chunk_<name>` in `self_hosting/lib/runtime_rs.patlang` via `sb_push`.
-
-
-3. Report precise un-mirrored chunk counts if deferring.
+4. For anything that changes compile-time behavior (not just adds a primitive), also prove it through the real self-hosted route, not just the text-equality check: rebuild `patc1.exe`, run the Gen B fixpoint (`./patc1.exe self_hosting/build/patc1_all.patlang patc2.exe`), and exercise the change with `patc2.exe`.
+5. Report precise un-mirrored chunk counts if a mismatch is genuinely deferred -- but deferring should be rare now, not the default assumption.
 
 
 
