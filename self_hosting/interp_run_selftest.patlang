@@ -142,4 +142,80 @@ check("a parameterized GOAP plan is identical across 15 runs", goap_diffs, 0)
 let none = interp_run("print(1)", [["backend", "process"], ["pat_path", "does/not/exist.exe"]])
 check("a missing pat.exe is ok=false, not a crash", none[2], false)
 
+# --- syntax { ... } DSL blocks compile on both backends (#120) -- the
+# self-hosted lexer/parser used by the world backend has no knowledge of
+# this grammar at all, so without interp_compile expanding it first, a
+# world-backend compile failed immediately with a generic parse error
+# while the process backend succeeded for free (its spawned real pat.exe
+# gets the native parser's own built-in syntax_dsl.rs support). Uses a
+# real example (router_dsl_source.patlang) rather than a hand-rolled one --
+# this grammar's trigger-matching is sensitive enough that a naive minimal
+# repro silently fails to expand at all instead of raising a clear error.
+let dsl_src = read_file("self_hosting/examples/router_dsl_source.patlang")
+let dsl_w = interp_run_full(dsl_src, [["backend", "world"]])
+let dsl_p = interp_run_full(dsl_src, [["backend", "process"]])
+check("world: a syntax DSL program compiles and runs", dsl_w[2], true)
+check("process: the same program also succeeds", dsl_p[2], true)
+check("both backends agree on a syntax DSL program", dsl_w[0], dsl_p[0])
+
+# --- world_run refuses while a fiber is alive (#120: documents an
+# already-enforced, deliberate scope boundary -- concurrent isolates via
+# fibers/parallel_map are not supported, not a bug to fix). world_run's
+# own precondition checks (this one, and the stdin rejection above) raise
+# as a genuine IR runtime error rather than returning ok=false -- unlike a
+# CHILD program crashing INSIDE a world_run call, which world_run itself
+# catches and reports as a value. Calling it directly here would crash
+# this very selftest, so the repro runs in its own subprocess instead,
+# exactly like interp_run's own process backend does for anything that
+# might not return cleanly.
+let fiber_repro = irt_src([
+  "include \"lib/interp_run.patlang\"",
+  "make a function called irt_fiber_gen takes unused returns done",
+  "  while true do",
+  "    fiber_yield(1)",
+  "  end",
+  "  return \"unreachable\"",
+  "end",
+  "let g = fiber_new(\"irt_fiber_gen\")",
+  "let r = fiber_resume(g, 0)",
+  "print(\"alive=\" + fiber_alive(g))",
+  "let w = interp_run(\"print(1)\", [[\"backend\", \"world\"]])",
+  "print(\"ok=\" + w[2])",
+  "print(w[1])"
+])
+let fiber_result = interp_run_full(expand_includes(fiber_repro, "self_hosting"), [["backend", "process"]])
+check("the fiber is alive mid-generator", starts_with(fiber_result[0], "alive=true"), true)
+check("world_run refuses while a fiber is alive", fiber_result[2], false)
+check("the refusal names the fiber as the reason", contains_text(fiber_result[1], "fiber"), true)
+
+# --- print() with no args: interp_run's own two backends genuinely
+# DIFFER (#120), confirmed here rather than assumed -- a plain `pat
+# --ir-run` of `print()` alone emits one blank line (confirmed separately
+# outside interp_run), and the process backend matches that (it spawns a
+# real such process); but world_run's own captured-stdout handling (Rust,
+# hosts.rs) returns "" (empty, not even a newline) for the exact same
+# program -- a real divergence this corpus check didn't catch because no
+# self_hosting/examples/*.patlang file happens to call print() with zero
+# arguments. This looks like a genuine small gap in world_run's native
+# stdout capture specifically for a zero-byte print, not an inherent
+# platform difference -- left as a documented, regression-pinned known
+# difference rather than fixed here, since fixing it means editing
+# rust-runtime/src/ir/hosts.rs, outside this pass's self-hosted-library
+# scope.
+let bare_w = interp_run("print()", [["backend", "world"]])
+let bare_p = interp_run("print()", [["backend", "process"]])
+check("world: bare print() captures as empty, not even a newline", bare_w[0], "")
+check("process: bare print() emits one blank line, UNLIKE world", bare_p[0], nl)
+
+# --- #{...} interpolation: the interpreter's own print() (both interp_run
+# backends go through it) never interpolates #{...} -- only the natively
+# COMPILED runtime's own print (x64_runtime.patlang) does that. Not a
+# backend-vs-backend divergence at all; both interp_run backends agree,
+# confirmed here, with the real difference against the compiled runtime
+# left undocumented until now.
+let interp_w = interp_run("print(\"#{1+1}\")", [["backend", "world"]])
+let interp_p = interp_run("print(\"#{1+1}\")", [["backend", "process"]])
+check("world: #{...} is NOT interpolated by --ir-run's print", interp_w[0], "#{1+1}" + nl)
+check("process: agrees with world -- neither interpolates #{...}", interp_p[0], "#{1+1}" + nl)
+
 t_report()

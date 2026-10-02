@@ -89,20 +89,35 @@ make a function called auto_probe_looks_like_error takes output returns yes
     return true
   end
   # Real incident: a guessed candidate call hung `pat --ir-run`
-  # indefinitely -- exec_capture has NO timeout at all (host_exec_
-  # capture's std::process::Command::output() blocks forever), so this
-  # silently froze the whole batch for 2+ hours with no error and no
-  # further progress, with zombie processes still alive and consuming
-  # CPU when finally found. auto_probe_try_guess below no longer calls
-  # exec_capture directly -- it shells through auto_probe_runner.ps1,
-  # a hard-timeout wrapper that force-kills the child and emits this
-  # marker if it had to.
+  # indefinitely -- plain exec_capture has NO timeout at all
+  # (host_exec_capture's std::process::Command::output() blocks
+  # forever), so this silently froze the whole batch for 2+ hours with
+  # no error and no further progress, with zombie processes still alive
+  # and consuming CPU when finally found. Originally fixed by shelling
+  # through auto_probe_runner.ps1, a PowerShell hard-timeout wrapper
+  # (Start-Process/WaitForExit/Stop-Process -Force); auto_probe_try_guess
+  # now calls exec_capture_io directly instead (#120) -- its own 4th
+  # argument gives the same real wall-clock timeout + force-kill
+  # (hosts.rs's host_exec_capture_io: child.kill() past the deadline) with
+  # no PowerShell subprocess layer in between. Its own timeout message is
+  # "timeout after N ms" in stderr, not this marker -- kept here (rather
+  # than deleted) so a leftover captured transcript from before this
+  # migration still classifies correctly, same as the other literal error
+  # markers above.
   if contains_text(output, "AUTO_PROBE_TIMEOUT") then
+    return true
+  end
+  if contains_text(output, "timeout after") then
     return true
   end
   return not contains_text(output, "AUTO_PROBE_OK:")
 end
 
+# No longer called by auto_probe_try_guess (see its own comment) -- kept
+# for friendly_cli/auto_probe_runner.ps1's own still-valid existence and
+# the spec_library/patlang_stdlib_auto/ feature that references this
+# function by name (that directory is explicitly out of scope per
+# project CLAUDE.md; left untouched).
 make a function called auto_probe_runner_script returns path
   return "friendly_cli/auto_probe_runner.ps1"
 end
@@ -117,14 +132,18 @@ make a function called auto_probe_timeout_ms returns ms
 end
 
 # Runs ONE guess for ONE candidate, via a real isolated subprocess,
-# now with a HARD TIMEOUT (see auto_probe_looks_like_error's own
-# comment for the incident this fixes). pat_exe should be the real
-# interpreter binary path, passed in by the caller rather than
-# hardcoded here.
+# with a HARD TIMEOUT (see auto_probe_looks_like_error's own comment for
+# the incident this fixes). pat_exe should be the real interpreter
+# binary path, passed in by the caller rather than hardcoded here.
+# exec_capture_io's own 3rd return slot is a real exit-success bool, but
+# auto_probe_looks_like_error already classifies a timed-out/crashed run
+# correctly from the combined text alone (no "AUTO_PROBE_OK:" marker
+# ever gets printed), so it is not threaded through separately here.
 make a function called auto_probe_try_guess takes pat_exe, func_name, param_count, file_path, guess_literal, tmp_path returns result
   let src = auto_probe_build_source(func_name, param_count, file_path, guess_literal)
   write_file(tmp_path, src)
-  let output = exec_capture("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", auto_probe_runner_script(), pat_exe, tmp_path, "" + auto_probe_timeout_ms())
+  let r = exec_capture_io(pat_exe, ["--ir-run", tmp_path], "", auto_probe_timeout_ms())
+  let output = r[0] + r[1]
   if auto_probe_looks_like_error(output) then
     return ["fail", output]
   end

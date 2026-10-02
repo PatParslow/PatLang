@@ -1,19 +1,33 @@
 # A durable, file-backed message queue -- entirely PatLang, no new Rust host
-# functions. Built on read_file/write_file/file_exists (hosts.rs already
-# provides these), the same way build_daemon.patlang's history file works:
-# a plain text log, whole-file read-modify-write on every call.
+# functions. One key/file PER MESSAGE (self_hosting/lib/mailbox.patlang's own
+# layout, independently reimplemented here rather than included -- queue.patlang
+# is included from files that already include mailbox.patlang transitively
+# [e.g. via isolate.patlang], and this codebase's include mechanism has no
+# dedup, so a second copy of the SAME functions would collide; a few small
+# local helpers (q_pad etc.) cost far less than that risk):
+#   fs driver:  q_dir()/<topic>/<padded_id>         (plus .../.seq, the next-id counter)
+#   vfs driver: /queue/<topic>/<padded_id>          (plus .../.seq)
+# Each message's own file/key holds "status<TAB>payload". Originally one flat
+# log file per topic (q_dir()/<topic>.log, tab-separated id/status/payload
+# lines, rewritten WHOLE on every publish/ack/consume) -- GitHub #120: that
+# shape meant a crash mid-write during any one call could corrupt or lose
+# EVERY message in the topic, not just the one being touched. Per-message
+# storage means a crash only ever risks the one message actually being
+# written; every other already-committed message's own file is untouched.
+# This does NOT add new protection against two CONCURRENT writers to the SAME
+# topic racing on the same logical operation (the id-allocation counter is
+# still a single read-then-write value, same residual limitation mailbox.
+# patlang's own header honestly documents for its own counter) -- the
+# established mitigation for that, unchanged, is still queue_writer_topic:
+# give each writer its own topic so no two writers ever touch the same
+# message set at all.
 #
-# One log file per topic: q_dir()/<topic>.log, tab-separated lines
-#   id<TAB>status<TAB>payload
-# where status is "pending" or "acked". Because every publish/ack writes
-# straight through to disk (no separate flush step), durability and
-# restart-resumption fall out for free: queue_pending(topic) after a crash
-# just reflects whatever was last written to the file. There is no locking
-# primitive in PatLang today, so concurrent writers to the SAME topic from
-# multiple processes at the same instant can race and clobber each other's
-# write -- same accepted caveat build_daemon.patlang's history file already
-# lives with. Don't rely on this for high-contention concurrent publishers
-# to one topic; separate topics are fully independent (separate files).
+# An existing topic in the OLD flat-log shape is migrated the first time
+# ANY call touches it (q_migrate_if_old): its rows are read once, written
+# into the new per-message layout, and the old file/key is removed -- so a
+# live system upgrading across this change loses nothing already durably
+# published, and every topic ends up in exactly one place after its first
+# touch post-upgrade, not two formats checked forever.
 #
 # The saga/contract-shaped wrapper (queue_attempt) realizes the pattern:
 # intent = require, attempt = do the risky thing, outcome = ensure. If the
@@ -38,6 +52,9 @@ make a function called q_dir returns path
   return ".patlang_queue"
 end
 
+# OLD flat-file-per-topic path/key -- kept only for one-time migration
+# (q_migrate_if_old) and queue_remove_topic's own belt-and-suspenders
+# cleanup; no longer written to by anything.
 make a function called q_file takes topic returns path
   return q_dir() + "/" + topic + ".log"
 end
@@ -69,9 +86,9 @@ make a function called q_tab returns t
   return chr(9)
 end
 
-# Split a log line into [id, status, payload]. Payload may itself contain
-# no tabs or newlines (callers should avoid them); this is a simple format,
-# not a general-purpose encoder.
+# Split an OLD-format flat-log line into [id, status, payload]. Only used
+# by the one-time migration read now (q_read_old_fs/q_read_old_vfs);
+# everything else goes through the new per-message layout directly.
 make a function called q_parse_line takes line returns fields
   let t = q_tab()
   let first = find_substr_queue(line, t)
@@ -105,22 +122,137 @@ make a function called find_substr_queue takes hay, needle returns idx
   return -1
 end
 
-# Read a topic's log into a list of [id, status, payload] triples.
-# Returns [] if the topic has no log file yet.
-make a function called q_read takes topic returns rows
-  let raw = ""
-  if queue_driver() == "vfs" then
-    if vfs_exists(q_key(topic)) != "1" then
-      return []
-    end
-    let raw = vfs_read(q_key(topic))
-  else
-    let path = q_file(topic)
-    if file_exists(path) != true then
-      return []
-    end
-    let raw = read_file(path)
+# ---- new per-message storage (mailbox-shaped) ----
+
+make a function called q_msg_dir takes topic returns path
+  return q_dir() + "/" + topic
+end
+
+make a function called q_msg_prefix takes topic returns prefix
+  return "/queue/" + topic + "/"
+end
+
+make a function called q_pad takes n returns text
+  let s = "" + n
+  while s.length < 10 do
+    let s = "0" + s
   end
+  return s
+end
+
+make a function called q_counter_path takes topic returns path
+  return q_msg_dir(topic) + "/.seq"
+end
+
+make a function called q_counter_key takes topic returns key
+  return q_msg_prefix(topic) + ".seq"
+end
+
+make a function called q_pack_status_payload takes status, payload returns text
+  return status + q_tab() + payload
+end
+
+make a function called q_unpack_status_payload takes text returns pair
+  let sep = find_substr_queue(text, q_tab())
+  if sep < 0 then
+    return ["", text]
+  end
+  return [substr(text, 0, sep), substr(text, sep + 1, text.length - sep - 1)]
+end
+
+make a function called q_get_counter takes topic returns next_id
+  if queue_driver() == "vfs" then
+    if vfs_exists(q_counter_key(topic)) == "1" then
+      return to_num(vfs_read(q_counter_key(topic)))
+    end
+    return 0
+  end
+  if file_exists(q_counter_path(topic)) == true then
+    return to_num(read_file(q_counter_path(topic)))
+  end
+  return 0
+end
+
+make a function called q_set_counter takes topic, next_id returns done
+  if queue_driver() == "vfs" then
+    vfs_write(q_counter_key(topic), "" + next_id)
+  else
+    write_file(q_counter_path(topic), "" + next_id)
+  end
+  return true
+end
+
+make a function called q_put_message takes topic, id, status, payload returns done
+  let text = q_pack_status_payload(status, payload)
+  if queue_driver() == "vfs" then
+    vfs_write(q_msg_prefix(topic) + q_pad(id), text)
+  else
+    write_file(q_msg_dir(topic) + "/" + q_pad(id), text)
+  end
+  return true
+end
+
+make a function called q_delete_message takes topic, padded_id returns done
+  if queue_driver() == "vfs" then
+    vfs_delete(q_msg_prefix(topic) + padded_id)
+  else
+    remove_file(q_msg_dir(topic) + "/" + padded_id)
+  end
+  return true
+end
+
+make a function called q_read_message takes topic, padded_id returns text
+  if queue_driver() == "vfs" then
+    return vfs_read(q_msg_prefix(topic) + padded_id)
+  end
+  return read_file(q_msg_dir(topic) + "/" + padded_id)
+end
+
+# Padded message ids for a topic, oldest first (vfs_list/list_dir are both
+# already sorted, and equal-width zero-padded ids sort identically as
+# strings or numbers).
+make a function called q_message_ids takes topic returns ids
+  if queue_driver() == "vfs" then
+    let prefix = q_msg_prefix(topic)
+    let keys = vfs_list(prefix)
+    let out = []
+    let i = 0
+    while i < list_len(keys) do
+      let suf = substr(keys[i], prefix.length, keys[i].length - prefix.length)
+      if suf != ".seq" then
+        let out = list_push(out, suf)
+      end
+      let i = i + 1
+    end
+    return out
+  end
+  if file_exists(q_msg_dir(topic)) != true then
+    return []
+  end
+  let entries = list_dir(q_msg_dir(topic))
+  let out = []
+  let i = 0
+  while i < list_len(entries) do
+    if entries[i] != ".seq" then
+      let out = list_push(out, entries[i])
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called q_list_contains takes xs, v returns found
+  let i = 0
+  while i < list_len(xs) do
+    if xs[i] == v then return true end
+    let i = i + 1
+  end
+  return false
+end
+
+# ---- one-time migration from the old flat-log shape ----
+
+make a function called q_parse_raw takes raw returns rows
   let lines = split_lines(raw)
   let out = []
   let i = 0
@@ -135,41 +267,126 @@ make a function called q_read takes topic returns rows
   return out
 end
 
+make a function called q_read_old_fs takes topic returns rows
+  if file_exists(q_file(topic)) != true then
+    return []
+  end
+  return q_parse_raw(read_file(q_file(topic)))
+end
+
+make a function called q_read_old_vfs takes topic returns rows
+  if vfs_exists(q_key(topic)) != "1" then
+    return []
+  end
+  return q_parse_raw(vfs_read(q_key(topic)))
+end
+
+# Writes a full [id, status, payload] row list into the new per-message
+# layout from scratch, and advances the topic's counter past the highest
+# id written (never backward). Used by migration and by q_write below.
+make a function called q_write_rows_new takes topic, rows returns done
+  let i = 0
+  let n = to_num(list_len(rows))
+  let max_id = -1
+  while i < n do
+    let row = rows[i]
+    let id = to_num(row[0])
+    if id > max_id then
+      let max_id = id
+    end
+    q_put_message(topic, id, row[1], row[2])
+    let i = i + 1
+  end
+  if max_id + 1 > q_get_counter(topic) then
+    q_set_counter(topic, max_id + 1)
+  end
+  return true
+end
+
+make a function called q_migrate_if_old takes topic returns done
+  if queue_driver() == "vfs" then
+    if vfs_exists(q_key(topic)) == "1" then
+      q_write_rows_new(topic, q_read_old_vfs(topic))
+      vfs_delete(q_key(topic))
+    end
+  else
+    if file_exists(q_file(topic)) == true then
+      q_write_rows_new(topic, q_read_old_fs(topic))
+      remove_file(q_file(topic))
+    end
+  end
+  return true
+end
+
+# ---- public read/write (queue_publish/consume/ack/pending, and
+# task_registry.patlang's own direct calls, are all built on just these
+# two -- unchanged contract from the caller's point of view) ----
+
+# Read a topic's rows as [id, status, payload] triples, oldest first.
+# Returns [] if the topic has no messages yet.
+make a function called q_read takes topic returns rows
+  q_migrate_if_old(topic)
+  let ids = q_message_ids(topic)
+  let out = []
+  let i = 0
+  let n = to_num(list_len(ids))
+  while i < n do
+    let padded = ids[i]
+    let unpacked = q_unpack_status_payload(q_read_message(topic, padded))
+    let out = list_push(out, ["" + to_num(padded), unpacked[0], unpacked[1]])
+    let i = i + 1
+  end
+  return out
+end
+
+# Replaces a topic's entire content with exactly these rows -- any
+# existing message not present in `rows` is removed. This is the exact
+# semantics task_registry.patlang's own direct q_write(topic, [[0, ...]])
+# call relies on (the presence-beacon idiom: "this topic holds only its
+# latest state"), and what queue_ack below reconstructs internally.
 make a function called q_write takes topic, rows returns done
-  let b = sb_new()
-  let t = q_tab()
+  q_migrate_if_old(topic)
+  let existing = q_message_ids(topic)
+  let keep = []
   let i = 0
   let n = to_num(list_len(rows))
   while i < n do
     let row = rows[i]
-    sb_push(b, row[0] + t + row[1] + t + row[2] + chr(10))
+    let id = to_num(row[0])
+    q_put_message(topic, id, row[1], row[2])
+    let keep = list_push(keep, q_pad(id))
     let i = i + 1
   end
-  if queue_driver() == "vfs" then
-    vfs_write(q_key(topic), sb_str(b))
-  else
-    write_file(q_file(topic), sb_str(b))
+  let j = 0
+  let en = to_num(list_len(existing))
+  while j < en do
+    if q_list_contains(keep, existing[j]) == false then
+      q_delete_message(topic, existing[j])
+    end
+    let j = j + 1
+  end
+  let max_id = -1
+  let k = 0
+  while k < n do
+    let rid = to_num(rows[k][0])
+    if rid > max_id then
+      let max_id = rid
+    end
+    let k = k + 1
+  end
+  if max_id + 1 > q_get_counter(topic) then
+    q_set_counter(topic, max_id + 1)
   end
   return true
 end
 
 # queue_publish(topic, payload) -> msg_id (as a string). Appends a new
-# "pending" row and writes the whole topic log back to disk.
+# "pending" message.
 make a function called queue_publish takes topic, payload returns msg_id
-  let rows = q_read(topic)
-  let max_id = -1
-  let i = 0
-  let n = to_num(list_len(rows))
-  while i < n do
-    let existing = to_num(rows[i][0])
-    if existing > max_id then
-      let max_id = existing
-    end
-    let i = i + 1
-  end
-  let new_id = max_id + 1
-  let rows = list_push(rows, [new_id, "pending", payload])
-  q_write(topic, rows)
+  q_migrate_if_old(topic)
+  let new_id = q_get_counter(topic)
+  q_put_message(topic, new_id, "pending", payload)
+  q_set_counter(topic, new_id + 1)
   return new_id
 end
 
@@ -191,28 +408,23 @@ make a function called queue_consume takes topic returns payload
   return ""
 end
 
-# queue_ack(topic, msg_id) -> marks the given message acked.
+# queue_ack(topic, msg_id) -> marks the given message acked (rewrites
+# only that one message's own file/key, not the whole topic).
 make a function called queue_ack takes topic, msg_id returns done
-  let rows = q_read(topic)
-  let out = []
-  let i = 0
-  let n = to_num(list_len(rows))
-  while i < n do
-    let row = rows[i]
-    if to_num(row[0]) == to_num(msg_id) then
-      let out = list_push(out, [row[0], "acked", row[2]])
-    else
-      let out = list_push(out, row)
-    end
-    let i = i + 1
+  q_migrate_if_old(topic)
+  let padded = q_pad(to_num(msg_id))
+  let existing = q_message_ids(topic)
+  if q_list_contains(existing, padded) == false then
+    return true
   end
-  q_write(topic, out)
+  let unpacked = q_unpack_status_payload(q_read_message(topic, padded))
+  q_put_message(topic, to_num(msg_id), "acked", unpacked[1])
   return true
 end
 
 # queue_pending(topic) -> list of message ids still pending. What makes the
 # queue "resumable": on a fresh process, this is simply whatever is still
-# unacked in the file -- no separate load/restore step needed.
+# unacked, read straight from storage -- no separate load/restore step.
 make a function called queue_pending takes topic returns ids
   let rows = q_read(topic)
   let out = []
@@ -228,17 +440,108 @@ make a function called queue_pending takes topic returns ids
   return out
 end
 
+# queue_remove_topic(topic) -> done. Fully removes every message and the
+# topic's own counter, so the next publish starts completely fresh (ids
+# restart at 0). For test/spec fixture resets: truncating or deleting the
+# old q_file(topic) path no longer has any effect once a topic is in the
+# new per-message layout, so anything that used to reset a topic that way
+# should call this instead.
+make a function called queue_remove_topic takes topic returns done
+  q_migrate_if_old(topic)
+  if queue_driver() == "vfs" then
+    if vfs_exists(q_key(topic)) == "1" then
+      vfs_delete(q_key(topic))
+    end
+    let keys = vfs_list(q_msg_prefix(topic))
+    let i = 0
+    while i < list_len(keys) do
+      vfs_delete(keys[i])
+      let i = i + 1
+    end
+    return true
+  end
+  if file_exists(q_file(topic)) == true then
+    remove_file(q_file(topic))
+  end
+  if file_exists(q_msg_dir(topic)) == true then
+    let entries = list_dir(q_msg_dir(topic))
+    let i = 0
+    while i < list_len(entries) do
+      remove_file(q_msg_dir(topic) + "/" + entries[i])
+      let i = i + 1
+    end
+    remove_file(q_msg_dir(topic))
+  end
+  return true
+end
+
+# queue_list_topics() -> every topic name with any content, old or new
+# format, de-duplicated. Replaces the old idiom of a caller scanning
+# list_dir(q_dir()) and stripping ".log" itself (task_registry.patlang
+# used to do exactly that -- a direct dependency on this module's own
+# on-disk shape that this migration would otherwise have broken).
+# list_dir suffixes directory entries with "/" (hosts.rs's own host_
+# list_dir), which is what distinguishes a new-format topic directory
+# from an old, not-yet-migrated ".log" file here.
+make a function called queue_list_topics returns topics
+  if queue_driver() == "vfs" then
+    return q_list_topics_vfs()
+  end
+  if file_exists(q_dir()) != true then
+    return []
+  end
+  let entries = list_dir(q_dir())
+  let out = []
+  let i = 0
+  let n = to_num(list_len(entries))
+  while i < n do
+    let entry = entries[i]
+    if str_ends_with(entry, "/") then
+      let out = list_push(out, substr(entry, 0, entry.length - 1))
+    elif str_ends_with(entry, ".log") then
+      let out = list_push(out, substr(entry, 0, entry.length - 4))
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+make a function called q_list_topics_vfs returns topics
+  let keys = vfs_list("/queue/")
+  let seen = []
+  let out = []
+  let i = 0
+  while i < list_len(keys) do
+    let rel = substr(keys[i], 7, keys[i].length - 7)
+    let topic = ""
+    if str_ends_with(rel, ".log") then
+      let topic = substr(rel, 0, rel.length - 4)
+    else
+      let slash = find_substr_queue(rel, "/")
+      if slash >= 0 then
+        let topic = substr(rel, 0, slash)
+      end
+    end
+    if (topic != "") and (q_list_contains(seen, topic) == false) then
+      let seen = list_push(seen, topic)
+      let out = list_push(out, topic)
+    end
+    let i = i + 1
+  end
+  return out
+end
+
 # ---- multi-topic reads, for the "give every writer its own topic" idiom ----
 #
 # PatLang has no locking primitive, so a topic shared between multiple
-# concurrent writers can race (two whole-file read-modify-writes landing at
-# the same instant can clobber each other). The idiomatic fix isn't locking
-# -- it's giving each writer its own topic name (e.g. queue_writer_topic
-# below: a base name plus the writer's own identity) so no two writers ever
-# touch the same file, avoiding the race by construction rather than by
-# coordination. A reader that needs the combined stream then reads across
-# that whole family of topics with the functions below, rather than one
-# consumer trying to read one shared, contended file.
+# concurrent writers can still race on id allocation (unchanged by the
+# per-message storage above -- see this file's own header). The idiomatic
+# fix isn't locking -- it's giving each writer its own topic name (e.g.
+# queue_writer_topic below: a base name plus the writer's own identity) so
+# no two writers ever touch the same message set at all. A reader that
+# needs the combined stream then reads across that whole family of topics
+# with the functions below, rather than one consumer trying to read one
+# shared, contended topic.
 
 # queue_writer_topic(base, writer_id) -> a topic name namespaced to one
 # writer, e.g. queue_writer_topic("orders", "worker_1") -> "orders__worker_1".
