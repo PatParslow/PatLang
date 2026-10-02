@@ -1336,6 +1336,37 @@ make a function called parse_stmt_inner takes toks, pos returns r
     return [["Err", "a bare '{ ... }' isn't a statement on its own -- it's a function literal as a VALUE (e.g. `let f = { ... }`, then call it with `f()`), not something to write standalone", t[2]], pos + 1]
   else
   if ty == "IDENT" then
+    if (tx == "end") or (tx == "else") or (tx == "elif") then
+      # Real bug found and fixed here: this lexer has no distinct
+      # keyword token type for structural words (confirmed: `let end =
+      # n` is a genuine, valid local in lib/includes.patlang), so
+      # "end"/"else"/"elif" are ordinary IDENT tokens, recognized as
+      # block terminators only by the SPECIFIC callers that explicitly
+      # check for them (at_block_stop, used inside parse_stmts_until).
+      # parse_program's own top-level loop has no such check at all --
+      # a leftover "end"/"else"/"elif" (confirmed root cause of GitHub
+      # fuzz_selftest's own native-only failure: one genuine extra
+      # `end` in fuzz_gen_body's 5-level else-if chain) used to fall
+      # straight through to the generic expression-statement fallback
+      # below, silently parsed as an ordinary bare-identifier reference,
+      # and surface only much later as a confusing, native-x64-only
+      # "undefined variable" error naming a synthesized function-scoped
+      # name. None of these three words is EVER valid as the first
+      # token of a genuinely new statement (every real statement that
+      # needs "end"/"else"/"elif" as a plain identifier does so inside
+      # an expression -- after `=`, as a call argument, in an operator
+      # chain -- never as the statement's own opening token), so this
+      # is unconditionally safe.
+      # pos + 1, not pos: parse_program's own top-level loop has no
+      # "stop on first Err" check (matching every other error path in
+      # this file, e.g. the bare-'{' rejection a few lines up) -- it
+      # just keeps calling parse_stmt at whatever position it's handed,
+      # so returning the SAME, unconsumed position here would spin
+      # forever reporting the identical error (confirmed directly: an
+      # early version of this fix returning `pos` hung the interpreter
+      # until killed).
+      return [["Err", "unexpected '" + tx + "' -- check for a missing or extra block terminator (end/else/elif) nearby", t[2]], pos + 1]
+    end
     if tx == "let" then
       let mutTok = vec_get(toks, pos + 1)
       let isMut = tok_is(mutTok, "IDENT", "mut")
@@ -1367,6 +1398,27 @@ make a function called parse_stmt_inner takes toks, pos returns r
             return [["Assert", tx, e[0]], e[1]]
           else
           if tx == "return" then
+            # Real bug found and fixed here: a `return` immediately
+            # followed by a genuine block-stop token (end/else/elif, or
+            # EOF) used to fall straight into parse_expr anyway, which
+            # happily parses a bare "end"/"else"/"elif" as an ordinary
+            # IDENTIFIER expression -- the lexer has no distinct keyword
+            # token type for these (confirmed: `let end = n`, a real
+            # local in lib/includes.patlang, is valid), so nothing ELSE
+            # catches this. This is exactly the shape a genuine extra/
+            # misplaced `end` elsewhere in the SAME function produces: a
+            # LATER, legitimately-enclosing block's own closer ends up
+            # sitting directly after an unrelated `return`, gets silently
+            # swallowed as that return's own value, and the real mistake
+            # (confirmed via GitHub fuzz_selftest's own fuzz_gen_body,
+            # one extra `end` in a 5-level else-if chain) surfaces only
+            # as a much-later, confusing native-x64-only "undefined
+            # variable" error -- the self-hosted parser itself, and the
+            # interpreter's own frontend, silently accepted the
+            # malformed nesting. Caught here, immediately, by name.
+            if at_block_stop(toks, pos + 1) then
+              return [["Err", "expected an expression after 'return', found '" + vec_get(toks, pos + 1)[1] + "' -- check for a missing or extra block terminator (end/else/elif) nearby", vec_get(toks, pos + 1)[2]], pos + 1]
+            end
             let e = parse_expr(toks, pos + 1)
             return [["Return", e[0]], e[1]]
           else
