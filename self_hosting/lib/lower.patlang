@@ -75,40 +75,49 @@ make a function called find_mut_flag takes locals, mutables, name returns r
   return result
 end
 
-make a function called next_closure_name returns name
-  let n = get("__vars", "__closure_seq")
-  if not n then
-    let n = 0
-  end
-  set_var("__closure_seq", n + 1)
-  return "__closure_" + n
+# These four used to read/increment a shared __vars counter
+# (__closure_seq/__budgeted_seq/__match_seq/__activate_seq) -- safe for a
+# single-threaded lowering pass, but __vars is ONE process-wide table
+# shared across every parallel_map worker (confirmed: OBJECTS in hosts.rs
+# is a plain Mutex<HashMap>, deliberately NOT thread_local, so a broadcast
+# value set by one worker is visible to others -- see CLAUDE.md's own
+# §7). A worker whose own counter read-increment-write interleaves with
+# ANOTHER worker's can have its own next value clobbered back to one it
+# already consumed, producing a genuine duplicate name within its own
+# output program (GitHub #197's own repro: three different "undefined
+# symbol" errors across three runs of identical input).
+#
+# Fixed WITHOUT touching any of lower_expr/lower_stmt/lower_block/lower_
+# closure_literal/lower_budgeted_literal/lower_match/lower_activate_stmt's
+# own signatures or their ~50 call sites: derive the number from
+# vec_len(...) of a vec ALREADY threaded through to each of these four
+# generators' own single call site (pending for closures/budgeted blocks,
+# locals for match/activate temp names) instead of a shared __vars key.
+# vec_* handles are genuinely thread_local in hosts.rs (VECS, unlike
+# OBJECTS) -- no two parallel_map workers ever see the same vec handle at
+# all, so there is no shared state left to race on. Each caller already
+# pushes its own new entry onto that same vec immediately after calling
+# the generator, so a later call within the SAME lowering pass always
+# sees a larger vec_len and never repeats a number already used by an
+# earlier call in that same pass -- genuinely unique within one output
+# program, which is all any of these names ever needed to be (two
+# DIFFERENT parallel workers' programs sharing a number, e.g. both
+# producing their own "__closure_0", is harmless: they're unrelated
+# binaries, never linked together).
+make a function called next_closure_name takes scope returns name
+  return "__closure_" + to_num(vec_len(scope))
 end
 
-make a function called next_budgeted_name returns name
-  let n = get("__vars", "__budgeted_seq")
-  if not n then
-    let n = 0
-  end
-  set_var("__budgeted_seq", n + 1)
-  return "__budgeted_" + n
+make a function called next_budgeted_name takes scope returns name
+  return "__budgeted_" + to_num(vec_len(scope))
 end
 
-make a function called next_match_name returns name
-  let n = get("__vars", "__match_seq")
-  if not n then
-    let n = 0
-  end
-  set_var("__match_seq", n + 1)
-  return "__match_" + n
+make a function called next_match_name takes scope returns name
+  return "__match_" + to_num(vec_len(scope))
 end
 
-make a function called next_activate_name returns name
-  let n = get("__vars", "__activate_seq")
-  if not n then
-    let n = 0
-  end
-  set_var("__activate_seq", n + 1)
-  return "__act_" + n
+make a function called next_activate_name takes scope returns name
+  return "__act_" + to_num(vec_len(scope))
 end
 
 # Nesting-depth counter (not a bool, so a budgeted block nested inside
@@ -352,7 +361,7 @@ end
 # and emits the Load.../MakeClosure sequence at the creation site into `code`.
 make a function called lower_closure_literal takes params, body, code, fns, locals, pending, lines returns out
   let captured = vec_to_list(locals)
-  let func_name = next_closure_name()
+  let func_name = next_closure_name(pending)
   let all_params = []
   let i = 0
   while i < captured.length do
@@ -404,7 +413,7 @@ end
 # same as Unit: "no handle yet, start a new fiber".
 make a function called lower_budgeted_literal takes msNode, existingNode, body, code, fns, locals, pending, lines returns out
   let captured = vec_to_list(locals)
-  let func_name = next_budgeted_name()
+  let func_name = next_budgeted_name(pending)
 
   let inner_locals = vec_new()
   let inner_mutables = vec_new()
@@ -460,7 +469,7 @@ end
 # only known once the planner has run), and the loop stops immediately,
 # reporting failure, the moment one returns false.
 make a function called lower_activate_stmt takes plan_node, code, fns, fname, locals, mutables, pending, lines returns out
-  let n = next_activate_name()
+  let n = next_activate_name(locals)
   let plan_var = "__act_plan_" + n
   let i_var = "__act_i_" + n
   let ok_var = "__act_ok_" + n
@@ -637,7 +646,7 @@ make a function called lower_match takes node, code, fns, fname, locals, mutable
   # names: re-evaluating an expression with side effects once per arm
   # (e.g. `match next_event() do ...`) would be a real correctness bug,
   # not just wasted work.
-  let tmp = next_match_name()
+  let tmp = next_match_name(locals)
   let code = lower_expr(scrutineeExpr, code, fns, locals, pending, lines)
   vec_push(code, ["Store", tmp])
   vec_push(locals, tmp)

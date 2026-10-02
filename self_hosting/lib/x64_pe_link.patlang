@@ -117,12 +117,22 @@ end
 # or misresolve entries when compiled at scale in this codebase (see
 # patlang-x64-selfhosted-assembler-phase1 memory), which is exactly why
 # the symbol table is a pair of parallel lists in the first place.
+# GitHub #197's own string-label fix (codegen_x64.patlang's
+# x64_string_label_for) made string-literal symbol names much longer
+# ("S_funcname_i" instead of "S42"), which exposed a pre-existing O(n^2)
+# trap here: char_code(s, i) re-checks s.is_ascii() over the WHOLE
+# string on EVERY call (rust-runtime/src/ir/hosts.rs), so hashing an
+# n-char name cost O(n^2), not O(n) -- harmless at "S42"'s length, not
+# at a full function name's. Fixed by interning once (str_intern, which
+# does the is_ascii/char-split work ONCE) and reading bytes via sc_code,
+# which is genuinely O(1) per character.
 make a function called xpl_hash_bucket takes s, nbuckets returns idx
+  let handle = str_intern(s)
   let h = 5381
-  let n = s.length
+  let n = to_num(sc_len(handle))
   let i = 0
   while i < n do
-    let h = (h * 33 + char_code(s, i)) % 999999937
+    let h = (h * 33 + sc_code(handle, i)) % 999999937
     let i = i + 1
   end
   return h % nbuckets
@@ -213,13 +223,15 @@ make a function called x64_link takes chunks, import_spec, entry_symbol, out_pat
     let merged_bss = merged_bss + chunk[3]
 
     # Real bug found (session 8, native-toolchain cutover): every chunk
-    # is assembled independently, and x64_string_label_next() (codegen_
-    # x64.patlang) resets its own counter to S0 at the start of EVERY
+    # is assembled independently, and x64_string_label_for() (codegen_
+    # x64.patlang) derives its labels from THIS chunk's own func_name+
+    # instruction-index pairs, starting again from "S_<fn>_0" for every
     # emit_program_x64() call -- meaning the runtime chunk's own string
-    # labels ("S0", "S1", ...) and the SEPARATE per-function program
-    # chunks' own string labels (each function is its own tiny "program"
-    # per x64_compile_unit.patlang's ensure_chunk_native, so EACH ALSO
-    # restarts at S0) all reuse the exact same bare names. None of these
+    # labels and the SEPARATE per-function program chunks' own string
+    # labels (each function is its own tiny "program" per x64_compile_
+    # unit.patlang's ensure_chunk_native) can still reuse the exact same
+    # bare names across chunks (same func_name, e.g. two chunks each
+    # defining their own "main"). None of these
     # are ever declared `global` (only real cross-chunk references like
     # function names are), so `is_global` (sym[3]) is false for all of
     # them -- but this flat symbol table used to key EVERY symbol by its

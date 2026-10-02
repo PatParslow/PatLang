@@ -147,6 +147,28 @@ pub fn host_substr(args: &[Value]) -> Result<Value, String> {
 thread_local! {
     static VECS: RefCell<Vec<Vec<Value>>> = RefCell::new(Vec::new());
     static SBUFS: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    // GitHub #197: a genuinely per-thread counter, keyed by name, for code
+    // that needs a monotonically-increasing id (NASM label suffixes, etc.)
+    // and runs under parallel_map/thread_spawn -- unlike __vars (OBJECTS,
+    // below), which is a single process-wide table shared across every OS
+    // thread by design (see its own comment). Each thread's own map starts
+    // empty, so "tls_counter_next(key)" returns 0,1,2,... independently per
+    // (thread, key) with no cross-thread interleaving possible at all.
+    static TLS_COUNTERS: RefCell<std::collections::HashMap<String, i64>> = RefCell::new(std::collections::HashMap::new());
+}
+
+pub fn host_tls_counter_next(args: &[Value]) -> Result<Value, String> {
+    let key = match args.first() {
+        Some(Value::String(s)) => s.to_string(),
+        _ => return Err("tls_counter_next: expected a string key".into()),
+    };
+    let n = TLS_COUNTERS.with(|c| {
+        let mut c = c.borrow_mut();
+        let n = *c.get(&key).unwrap_or(&0);
+        c.insert(key, n + 1);
+        n
+    });
+    Ok(Value::Int(n))
 }
 
 fn arg_usize(args: &[Value], i: usize, what: &str) -> Result<usize, String> {
@@ -3866,6 +3888,7 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("hash_string", host_hash_string);
     interp.host.insert("argv", host_argv);
     interp.host.insert("now_ms", host_now_ms);
+    interp.host.insert("tls_counter_next", host_tls_counter_next);
     interp.host.insert("read_line", host_read_line);
     interp.host.insert("byte_length", host_byte_length);
     interp.host.insert("read_file_b64", host_read_file_b64);

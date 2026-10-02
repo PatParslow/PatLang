@@ -122,6 +122,7 @@ const HOST_CHUNK_TABLE: &[(&str, ChunkId)] = &[
     ("getenv", ChunkId::Files),
     ("exec_capture_io", ChunkId::Files),
     ("now_ms", ChunkId::IoMisc),
+    ("tls_counter_next", ChunkId::IoMisc),
     ("byte_length", ChunkId::IoMisc),
     ("read_line", ChunkId::IoMisc),
     ("argv", ChunkId::IoMisc),
@@ -3450,6 +3451,24 @@ fn resolve_interp_var(key: &str) -> String {
     String::new()
 }
 
+thread_local! {
+    // GitHub #197: a genuinely per-OS-thread counter, keyed by name, for
+    // code (codegen_x64.patlang's label_asm_safe, x64_asm.patlang's
+    // xa_next_id) that needs a monotonically-increasing id and runs under
+    // parallel_map. Mirrors ir/hosts.rs's own TLS_COUNTERS -- unlike
+    // __vars (OBJECTS), which is one process-wide table shared across
+    // every OS thread by design.
+    static TLS_COUNTERS: RefCell<HashMap<String, i64>> = RefCell::new(HashMap::new());
+}
+fn tls_counter_next(key: &str) -> i64 {
+    TLS_COUNTERS.with(|c| {
+        let mut c = c.borrow_mut();
+        let n = *c.get(key).unwrap_or(&0);
+        c.insert(key.to_string(), n + 1);
+        n
+    })
+}
+
 fn host_call_io_misc_inner(name: &str, args: &[Value]) -> Result<Value, String> {
     match name {
 "now_ms" => {
@@ -3459,6 +3478,11 @@ fn host_call_io_misc_inner(name: &str, args: &[Value]) -> Result<Value, String> 
                     .map(|d| d.as_millis() as f64)
                     .unwrap_or(0.0);
                 Ok(Value::Number(ms))
+            }
+            "tls_counter_next" => {
+                // tls_counter_next(key) -> Int: see TLS_COUNTERS above (GitHub #197).
+                let key = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), _ => return Err("tls_counter_next: expected a string key".to_string()) };
+                Ok(Value::Int(tls_counter_next(&key)))
             }
             "byte_length" => {
                 // byte_length(s) -> Number of UTF-8 bytes (unlike .length,
@@ -3535,7 +3559,7 @@ fn host_call_io_misc_inner(name: &str, args: &[Value]) -> Result<Value, String> 
 
 fn host_call_io_misc(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match name {
-        "now_ms" | "byte_length" | "read_line" | "argv" | "print" | "sed" | "add" | "multiply" | "subtract" | "max" | "min" | "calculate" | "calculate_result" | "get_value" | "process" | "validate" | "len" => Some(host_call_io_misc_inner(name, args)),
+        "now_ms" | "tls_counter_next" | "byte_length" | "read_line" | "argv" | "print" | "sed" | "add" | "multiply" | "subtract" | "max" | "min" | "calculate" | "calculate_result" | "get_value" | "process" | "validate" | "len" => Some(host_call_io_misc_inner(name, args)),
         _ => None,
     }
 }

@@ -631,38 +631,45 @@ end
 #
 # Note this deliberately does NOT accumulate anything across a call
 # boundary (GitHub #75) -- it pushes to no shared list at all.
-# OFF, and it must stay off until code generation is thread-safe.
 #
-# Assembling units in a parallel_map pool is not merely unproven here --
-# it is actively WRONG, and it corrupts the binaries it produces.
-# parallel_map workers get fresh interpreter state but SHARE the global
-# variable table, and code generation keeps three counters in exactly
-# that table:
+# GitHub #197, fixed 2026-10-02: this used to be actively WRONG, and
+# corrupted the binaries it produced. parallel_map workers get fresh
+# interpreter state but SHARE the global variable table, and code
+# generation kept three counters in exactly that table:
 #
-#   __x64_str_counter  (codegen_x64: string-literal labels S0, S1, ...)
-#   __x64_cv_counter   (codegen_x64: captured-value labels)
-#   xa_id_counter      (x64_asm: the assembler's own id counter)
-#
-# The string-label counter is the one that bites. Each unit emits its
-# .data labels and its code references in two passes that both restart
-# that counter and must agree; with several units emitting at once the
-# passes interleave, and a chunk ends up DEFINING S0 while REFERENCING
-# some other unit's number. That is a silent miscompile which only
-# becomes visible at link time, as "undefined symbol 'S<n>'".
+#   __x64_str_counter  (codegen_x64: string-literal labels)
+#   __x64_cv_counter   (codegen_x64: captured-value labels, label_asm_safe)
+#   xa_id_counter      (x64_asm: the assembler's own id counter, xa_next_id)
 #
 # Demonstrated, not inferred: a three-function program compiled three
 # times in a row failed with undefined symbol 'S2', then 'S3', then
-# 'S0'. Different answer each run from identical input is a data race,
-# and it means a build that happens to link cannot be trusted either --
-# the same race can leave a chunk pointing at a WRONG but existing
-# label, which links cleanly and misbehaves at runtime.
+# 'S0' -- a real data race, not a theoretical one.
 #
-# Parallelising only the assembler would not help: xa_id_counter is
-# shared too. The fix is per-emission (or per-thread) counter state
-# rather than process-global counters; until then this stays false.
-# Kept rather than deleted so the work is picked up, not rediscovered.
+# Fixed two different ways, per counter: __x64_str_counter is GONE
+# entirely -- x64_collect_string_data/x64_emit_instr now independently
+# derive the identical deterministic label from (func_name, instruction
+# index), which both passes already have, so there is no shared state
+# left to race on. __x64_cv_counter/xa_id_counter instead use
+# tls_counter_next (rust-runtime/src/ir/hosts.rs + its runtime_rs.
+# patlang mirror), a genuinely per-OS-thread counter -- label_asm_safe's
+# ~55 call sites have no func_name/instruction-index available to derive
+# a deterministic label from, so making the counter itself thread-local
+# was cheaper and less invasive than threading two new parameters
+# through every one of them.
+#
+# NOTE (2026-10-02): as of this fix, this function and
+# x64_assemble_unit_batch have NO caller anywhere in the codebase --
+# build_native's own live parallel path (its PASS 1a/1b, same file,
+# below) was superseded by separate-OS-PROCESS parallelism (`spawn`,
+# one child per assemble job) before this fix landed, which sidesteps
+# shared __vars state entirely via process isolation, the same
+# principle tools/build_portfolio.patlang's workers already use. This
+# flag is flipped true because the thread-safety blocker it names is
+# genuinely gone, not because anything currently reads it -- kept, with
+# an accurate comment, in case in-process thread parallelism (lower
+# overhead than spawning a process per unit) is ever worth reviving.
 make a function called x64_build_use_parallel_units returns enabled
-  return false
+  return true
 end
 
 make a function called x64_assemble_unit_batch takes item returns done

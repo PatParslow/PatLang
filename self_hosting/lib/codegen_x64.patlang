@@ -167,15 +167,28 @@ end
 # ordinary x64_emit_func/x64_emit_instr codegen walk (pass 2) therefore
 # assign IDENTICAL S0/S1/S2/... labels to the same Const "str" nodes
 # without needing any lookup table between the two passes.
-make a function called x64_string_label_reset returns done
-  set_var("__x64_str_counter", 0)
-  return true
-end
-
-make a function called x64_string_label_next returns label
-  let n = to_num(get("__vars", "__x64_str_counter"))
-  set_var("__x64_str_counter", n + 1)
-  return "S" + n
+# GitHub #197: this used to be a shared `__vars` counter
+# (__x64_str_counter), reset once then incremented once per label by
+# BOTH x64_collect_string_data (pass 1) and x64_emit_instr (pass 2) --
+# correct only because the two passes always ran in the same order with
+# nothing else touching the counter between them. The moment
+# x64_assemble_unit_batch's parallel_map workers started calling
+# emit_program_x64 concurrently, each unit's own pass-1/pass-2 sequence
+# could be interleaved by ANOTHER unit's reset/increment, desyncing the
+# two passes' label numbering within that unit's own chunk (confirmed
+# repro: "undefined symbol 'S2'"/'S3'/'S0' across three runs of
+# identical input).
+#
+# Fixed by removing the shared counter entirely rather than making it
+# thread-safe: `x64_emit_instr`'s own per-instruction label parameter
+# ("L_" + func_name + "_" + i, already unique within one function, see
+# its caller just below) and the matching "L_" + func_name + "_" + i
+# pass-1 computes for itself are *already* enough to derive a string-
+# data label deterministically -- no counter, no shared state, no two
+# passes that need to "agree" because they independently compute the
+# identical label from the same (func_name, instruction index) pair.
+make a function called x64_string_label_for takes instr_label returns label
+  return "S_" + instr_label
 end
 
 # A string literal's raw bytes as NASM `db` byte-value text (e.g.
@@ -272,13 +285,11 @@ end
 # per Const "str" node encountered, in encounter order. GitHub #40:
 # also emits one for each oversized Const "num" literal that pass 2
 # will promote to a real BigInt via rt_bigint_from_decimal_str -- MUST
-# stay in the same encounter order and use the SAME tower-ctor-arg
-# exclusion as x64_emit_instr's own Const branch, or the two passes'
-# label counters (both driven by the same shared x64_string_label_next
-# counter) desync and every subsequent string label in the function
-# points at the wrong .data block.
+# use the SAME tower-ctor-arg exclusion as x64_emit_instr's own Const
+# branch, or this pass emits a .data label for a Const that pass 2's
+# own x64_string_label_for(label) call (same func_name+instruction-index
+# derivation, see GitHub #197) never references, or vice versa.
 make a function called x64_collect_string_data takes ir returns asm
-  x64_string_label_reset()
   let funcs = ir[2]
   let sb = sb_new()
   let fn_i = 0
@@ -292,7 +303,7 @@ make a function called x64_collect_string_data takes ir returns asm
       let instr = instrs[i]
       if instr[0] == "Const" then
         if instr[1] == "str" then
-          let label = x64_string_label_next()
+          let label = x64_string_label_for("L_" + funcs[fn_i][1] + "_" + i)
           sb_push(sb, label + ":" + x64_nl_char())
           sb_push(sb, "    dq " + to_num(sc_len(str_intern(instr[2]))) + x64_nl_char())
           sb_push(sb, "    db " + x64_bytes_of(instr[2]) + x64_nl_char())
@@ -301,7 +312,7 @@ make a function called x64_collect_string_data takes ir returns asm
             if not x64_contains(instr[2], ".") then
               if not x64_str_in_list(tower_ctor_arg_indices, i) then
                 if x64_num_const_needs_bigint_promotion(instr[2]) then
-                  let label = x64_string_label_next()
+                  let label = x64_string_label_for("L_" + funcs[fn_i][1] + "_" + i)
                   sb_push(sb, label + ":" + x64_nl_char())
                   sb_push(sb, "    dq " + to_num(sc_len(str_intern(instr[2]))) + x64_nl_char())
                   sb_push(sb, "    db " + x64_bytes_of(instr[2]) + x64_nl_char())
@@ -9242,14 +9253,19 @@ make a function called x64_callvalue_asm takes argc, spilled returns asm
   return sb_str(sb)
 end
 
-# CallValue call sites need locally-unique NASM labels for their
-# internal push-captured-values loop -- set_var-based counter, same
-# pattern as the string-literal labels, since a program can contain
-# more than one CallValue instruction.
+# CallValue (and other multi-instruction asm snippets, e.g. the heap
+# reserve/commit spinlocks in x64_callhost_asm) need locally-unique NASM
+# labels for their own internal loops. Unlike the string-literal labels
+# above, these call sites span ~55 different functions with no
+# func_name/instruction-index parameter threaded through any of them --
+# rather than invasively adding one to each, this uses tls_counter_next
+# (GitHub #197), a genuinely per-OS-thread counter (rust-runtime/src/ir/
+# hosts.rs + its runtime_rs.patlang mirror), so no two parallel_map
+# workers (x64_assemble_unit_batch) can ever interleave on it. Previously
+# a `set_var`-based counter on the shared __vars table -- confirmed
+# racing the exact same way as the string-literal counter did.
 make a function called label_asm_safe takes ignored returns label
-  let n = to_num(get("__vars", "__x64_cv_counter"))
-  set_var("__x64_cv_counter", n + 1)
-  return "" + n
+  return "" + tls_counter_next("x64_cv")
 end
 
 make a function called x64_emit_instr takes instr, func_name, regmap, spilled, label, is_float_bin, is_float_const, is_dynamic_bin, bool_print_override, float_print_override, is_tower_ctor_arg, float_box_single, float_box_receiver, mixed_left_int, mixed_right_int, call_box_positions returns asm
@@ -9280,7 +9296,7 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
         sb_push(sb, "    push rax" + x64_nl_char())
       else
       if kind == "str" then
-        let label = x64_string_label_next()
+        let label = x64_string_label_for(label)
         sb_push(sb, "    lea rax, [rel " + label + "]" + x64_nl_char())
         sb_push(sb, "    mov rcx, 2305843009213693952" + x64_nl_char())
         sb_push(sb, "    or rax, rcx" + x64_nl_char())
@@ -9383,7 +9399,7 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
             # decimal TEXT directly via rt_bigint_from_decimal_str,
             # loaded from the .data label x64_collect_string_data (pass
             # 1) already reserved for this exact instruction.
-            let label = x64_string_label_next()
+            let label = x64_string_label_for(label)
             sb_push(sb, "    lea rax, [rel " + label + "]" + x64_nl_char())
             sb_push(sb, "    mov rcx, 2305843009213693952" + x64_nl_char())
             sb_push(sb, "    or rax, rcx" + x64_nl_char())
@@ -11320,7 +11336,6 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
   end
   sb_push(sb, "section .text" + x64_nl_char())
   sb_push(sb, x64_nl_char())
-  x64_string_label_reset()
   let n = to_num(list_len(funcs))
   let float_func_names = x64_collect_float_func_names(funcs)
   let extra_float_func_names = x64_extra_float_func_names()

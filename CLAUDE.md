@@ -134,6 +134,46 @@ primary control.
 
 ---
 
+## 4.6 Top-level `let` bindings are NOT shared across functions — don't reach for them as a default
+
+A top-level `let x = ...` is local to the synthesized top-level `main`
+function's own scope. There is no automatic cross-function sharing of it —
+referencing it from inside another function (passing it as a bare name
+instead of a parameter, e.g. `action_bind("a", step_a)` where `step_a` was
+declared via `make a function called step_a ...` at top level and then
+used as a value) fails under the self-hosted x64 codegen with:
+
+```
+codegen_x64: undefined variable '__main__step_a' referenced (not a parameter or
+local of the enclosing function -- PatLang has no automatic cross-function
+sharing for top-level `let` bindings; pass it as a parameter instead)
+```
+
+This has recurred across multiple separate sessions (almost every session,
+per the project owner) — it is not a one-off typo, it is a reflex toward
+writing top-level `let`s and then using them as if PatLang had closures-
+over-globals or hoisted function references, which it does not.
+
+* **Rule**: Don't use a top-level `let` binding unless there's a specific,
+  stated reason it needs to live at that scope (e.g. it's only ever used
+  inside the same top-level sequence of statements that declared it, never
+  passed into or referenced from a different function body). Default to
+  passing values as parameters instead of reaching for a top-level `let`.
+* **If a function needs to be passed around as a value** (e.g. into
+  `action_bind`, `parallel_map`, `thread_spawn`, or stored in a list), bind
+  it as a closure literal (`let step_a = |args| do ... end`) in the SAME
+  scope that uses it, not as a `make a function called ...` declaration
+  referenced by bare name from a different function — a top-level function
+  declaration's name is not an in-scope local/parameter anywhere else,
+  including other top-level statements executed as part of the same
+  synthesized `main`.
+* **Before writing a new top-level `let`**, ask: will anything other than
+  the literal next top-level statement in this same file need this value?
+  If yes, it needs to be threaded through as a parameter (or be a function
+  declaration called normally, not referenced by name as a value) instead.
+
+---
+
 ## 5. Output Rules
 
 * Keep turn narration to lean, concise text.
@@ -220,35 +260,63 @@ three have a lock-free fix that removes the shared mutable state instead:
 increment / `set_var` triple used to generate a unique name/ID (label,
 symbol, synthesized function name). Confirmed actually racing: `__x64_str_
 counter`/`__x64_cv_counter` (`codegen_x64.patlang`), `xa_id_counter`
-(`x64_asm.patlang`) via `x64_compile_unit.patlang`'s parallel units; `lower.
-patlang`'s `__closure_seq`/`__budgeted_seq`/`__match_seq`/`__activate_seq`
-via `tools/build_portfolio.patlang`'s own `parallel_map` calls (each worker
-runs a full `patc1_compile` on a different demo program) -- a SEPARATE
-at-risk call path, found by the same audit, not previously tracked
-anywhere. Several other same-shaped counters exist (`pr_id_counter`,
-`__iso_seq`, `__isop_seq`, `__interp_run_seq`, `__interp_seq`, `__evloop_
-seq`, `bm_synth_counter`, `zs_bfs_counter`) but are not currently reachable
-from any `parallel_map`/`thread_spawn` call site -- safe today, same shape,
+(`x64_asm.patlang`) -- both hit from inside `x64_compile_unit.patlang`'s
+`x64_assemble_unit_batch`, the actual `parallel_map` worker for per-unit
+codegen/assembly. This is the one confirmed-live instance; everything else
+audited turned out NOT to be reachable from a real parallel phase (see
+correction below), so this is the fix that actually matters for #197.
+Several other same-shaped counters exist (`pr_id_counter`, `__iso_seq`,
+`__isop_seq`, `__interp_run_seq`, `__interp_seq`, `__evloop_seq`,
+`bm_synth_counter`, `zs_bfs_counter`) but are not currently reachable from
+any `parallel_map`/`thread_spawn` call site -- safe today, same shape,
 re-check if that ever changes.
   - **Fix**: derive uniqueness from something already unique per unit (the
     function's own name, a caller-supplied task ID) plus a LOCAL counter,
     instead of a shared global one. This removes the race by removing the
     shared mutable state, not by synchronizing access to it.
+  - **Correction (2026-10-02)**: an earlier version of this section also
+    named `lower.patlang`'s `__closure_seq`/`__budgeted_seq`/`__match_seq`/
+    `__activate_seq`, claimed reachable via `tools/build_portfolio.patlang`'s
+    `parallel_map` calls. Both halves of that claim were wrong, found while
+    verifying the fix (since applied anyway, as a harmless, correct
+    simplification -- see `next_closure_name` et al., now derived from
+    `vec_len()` of an already-thread-local `vec_*` handle instead of
+    `__vars`): (1) `build_portfolio.patlang`'s workers each shell out to a
+    *separate OS process* (`patc1_compile` -> `exec_capture("./patc1.exe",
+    ...)`), which has its own private memory -- nothing shared across
+    workers there at all. (2) More fundamentally, lexing/parsing/lowering
+    always runs once, sequentially, *before* `x64_compile_unit.patlang`
+    splits the IR into units for parallel assembly -- `lower.patlang`'s
+    counters are never invoked from inside any parallel phase in the
+    current architecture, by either lowering pipeline (see next point).
+    Also as of this session, `patc1_main.patlang`'s `--x64`/`--bm` compile
+    path calls `bm_patc_lower` (Block Ownership Model lowering), not
+    `lower.patlang`'s `lower_program`, at all -- `lower_program` remains
+    live for the Rust/self-hosted parity tests, the WASM backend, and
+    direct callers, just not the x64 CLI path. `block_model/lower.patlang`'s
+    own equivalent counter (`bm_synth_counter`) has the same shape but the
+    same non-reachability (sequential lowering only) -- listed above, not
+    separately broken out.
 
 **b) Shared resource-handle state.** A port/socket/file-handle claimed by
 one thread, with its "have I already claimed one" check reading from
-shared state another thread can also read. Confirmed: `build_progress.
-patlang`'s `x64_build_signal_claim` records the claimed port in
-`__x64_build_port`; its own idempotency guard ("if already set, return it"
--- correct for one thread, added for issue #89) means a parallel worker
-reads another worker's port number and believes it holds a live listener
-it never actually bound. Current code works around this by disabling
-ticks during the parallel phase (`x64_compile_unit.patlang:683`,
-`__x64_build_port` forced to `"-1"`) rather than fixing it.
-  - **Fix**: make the "did I claim one" check itself genuinely per-thread
-    (derived from the same per-unit identity as (a)), not a shared `__vars`
-    read -- the underlying port-range retry loop (walk ports until
-    `signal_claim` succeeds) is already correct and doesn't need to change.
+shared state another thread can also read.
+  - **Correction (2026-10-02)**: an earlier version of this section claimed
+    `build_progress.patlang`'s `x64_build_signal_claim` was a confirmed
+    instance of this bug (reading another worker's claimed port and
+    believing it holds a live listener it never bound). Direct tracing of
+    its actual call sites found this is already a complete, correct fix,
+    not a bug: `x64_build_signal_claim()` is only ever called from
+    sequential/parent-thread code (`patc1_main.patlang`,
+    `x64_compile_unit.patlang`'s own `build_native` setup) -- never from
+    inside a `parallel_map` worker. `x64_assemble_unit_batch` (the real
+    worker) only sets `__x64_build_port` to the sentinel `"-1"`
+    (`x64_compile_unit.patlang:683`) so its own ticks no-op; it never reads
+    or trusts another worker's claimed port. The fork-join nature of
+    `parallel_map` guarantees no worker is still running when the parent
+    restores the real port afterward. No fix needed here -- kept as a
+    worked example of the *shape* in case a future port/socket/handle claim
+    is added somewhere that genuinely IS called from inside a worker.
 
 **c) Shared accumulators.** A `list_push`/`vec_push` onto a list/cache kept
 in `__vars` rather than a local variable. One confirmed instance,
