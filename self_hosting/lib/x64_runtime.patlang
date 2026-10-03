@@ -1225,6 +1225,40 @@ end
 # the real work; `get`/`set_var` are now thin, backward-compatible
 # wrappers (every existing 2-arg `set_var(key,value)` call site is
 # unaffected, since it's just sugar for `rt_ns_set("__vars",key,value)`).
+#
+# GitHub #198: g_vars_table had NO synchronization at all -- two threads
+# calling rt_ns_set/rt_ns_get/rt_ns_push concurrently could lose a new
+# namespace or key entirely (both see table==0, both allocate, one
+# write is overwritten), not just compute a stale value. This is exactly
+# the kind of corruption block-ownership-model-thread-safety.md's own
+# "What is actually at risk" already named for g_vars_table, left
+# unaddressed there because thread_spawn wasn't reachable from block-
+# model source yet (#184, since fixed) -- named-object classes/methods
+# (#175/#178) are the one thing EVERY block-model program with a `class`
+# already routes through this exact table, so this was always reachable
+# from ordinary single-threaded code too, just never raced until a
+# worker could also reach it.
+#
+# Ticket lock, same [next_ticket:8][now_serving:8] shape block_model/
+# heap.patlang's own bm_freelist_lock already uses for #176, built from
+# rt_atomic_fetch_add alone (no compare-and-swap intrinsic exists). No
+# "first allocation" workaround needed here, unlike the free list's own
+# table: g_vars_lock's address is a real compile-time-known global
+# (mem_vars_lock_addr), never looked up at runtime.
+make a function called rt_vars_lock returns done
+  let addr = mem_vars_lock_addr()
+  let mine = rt_atomic_fetch_add(addr, 1)
+  while mem_peek_qword(addr, 8) != mine do
+    let spin = 0
+  end
+  return true
+end
+
+make a function called rt_vars_unlock returns done
+  rt_atomic_fetch_add(mem_vars_lock_addr() + 8, 1)
+  return true
+end
+
 make a function called rt_ns_find takes table, store returns idx
   let n = rt_list_len(table)
   let i = 0
@@ -1238,6 +1272,7 @@ make a function called rt_ns_find takes table, store returns idx
 end
 
 make a function called rt_ns_set takes store, key, value returns done
+  rt_vars_lock()
   let table_addr = mem_vars_table_addr()
   let table = mem_peek_qword(table_addr, 0)
   if table == 0 then
@@ -1264,6 +1299,7 @@ make a function called rt_ns_set takes store, key, value returns done
   while i < n do
     if rt_str_eq(rt_list_get(keys, i), key) then
       rt_list_set(vals, i, value)
+      rt_vars_unlock()
       return true
     end
     let i = i + 1
@@ -1272,6 +1308,7 @@ make a function called rt_ns_set takes store, key, value returns done
   let new_vals = rt_list_push(vals, value)
   rt_list_set(ns, 1, new_keys)
   rt_list_set(ns, 2, new_vals)
+  rt_vars_unlock()
   return true
 end
 
@@ -1285,6 +1322,7 @@ end
 # exists for API completeness with rt_ns_set, not because anything here
 # currently depends on it.
 make a function called rt_ns_push takes store, key, value returns done
+  rt_vars_lock()
   let table_addr = mem_vars_table_addr()
   let table = mem_peek_qword(table_addr, 0)
   if table == 0 then
@@ -1311,6 +1349,7 @@ make a function called rt_ns_push takes store, key, value returns done
   while i < n do
     if rt_str_eq(rt_list_get(keys, i), key) then
       rt_list_set(vals, i, rt_list_push(rt_list_get(vals, i), value))
+      rt_vars_unlock()
       return true
     end
     let i = i + 1
@@ -1319,18 +1358,22 @@ make a function called rt_ns_push takes store, key, value returns done
   let new_vals = rt_list_push(vals, rt_list_push(rt_list_new(0), value))
   rt_list_set(ns, 1, new_keys)
   rt_list_set(ns, 2, new_vals)
+  rt_vars_unlock()
   return true
 end
 
 # Returns 0 on an unset key -- matches this function's own pre-existing
 # convention (documented below on `get`), not Rust's Unit/nil.
 make a function called rt_ns_get takes store, key returns value
+  rt_vars_lock()
   let table = mem_peek_qword(mem_vars_table_addr(), 0)
   if table == 0 then
+    rt_vars_unlock()
     return 0
   end
   let ns_idx = rt_ns_find(table, store)
   if ns_idx < 0 then
+    rt_vars_unlock()
     return 0
   end
   let ns = rt_list_get(table, ns_idx)
@@ -1340,10 +1383,13 @@ make a function called rt_ns_get takes store, key returns value
   let i = 0
   while i < n do
     if rt_str_eq(rt_list_get(keys, i), key) then
-      return rt_list_get(vals, i)
+      let result = rt_list_get(vals, i)
+      rt_vars_unlock()
+      return result
     end
     let i = i + 1
   end
+  rt_vars_unlock()
   return 0
 end
 
@@ -1936,14 +1982,19 @@ make a function called progress_report takes text returns done
 end
 
 # object_delete(name): drop an object's namespace from the shared table.
+# GitHub #198: a fourth, previously-unguarded direct access to g_vars_
+# table alongside rt_ns_set/get/push -- same lock, same reasoning.
 make a function called object_delete takes name returns done
+  rt_vars_lock()
   let table_addr = mem_vars_table_addr()
   let table = mem_peek_qword(table_addr, 0)
   if table == 0 then
+    rt_vars_unlock()
     return unit
   end
   let idx = rt_ns_find(table, name)
   if idx < 0 then
+    rt_vars_unlock()
     return unit
   end
   let n = rt_list_len(table)
@@ -1958,6 +2009,7 @@ make a function called object_delete takes name returns done
     let i = i + 1
   end
   mem_poke_qword(table_addr, 0, out)
+  rt_vars_unlock()
   return unit
 end
 

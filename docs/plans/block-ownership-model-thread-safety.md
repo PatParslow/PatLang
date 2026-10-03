@@ -30,6 +30,30 @@ Reading `heap.patlang` against the runtime found four hazards, three of them rea
 
 The bump allocator underneath (`rt_heap_alloc`) was already atomic.
 
+**Update (GitHub #198, 2026-10-03)**: point 3's own "`g_vars_table` has no
+lock" is no longer true. `rt_ns_set`/`rt_ns_get`/`rt_ns_push`/`object_delete`
+(`x64_runtime.patlang`) now hold a ticket lock (`g_vars_lock`, same
+`[next_ticket:8][now_serving:8]`/`rt_atomic_fetch_add` shape as this file's
+own `bm_freelist_lock` below) across their whole body -- driven by named-
+object classes/methods (#175/#178) routing every `new("Class","name")`/
+`send`/`get`/`set_var`/`obj.field` through this exact table, now reachable
+from a real `thread_spawn` worker since #184. This fixes CORRUPTION of the
+table's own structure (a lost namespace or key, a corrupted list pointer
+from two concurrent `rt_list_push` calls) -- confirmed by `spec_library/
+block_model/thread_safety_vars_table.feature`'s own stress fixture (8
+threads, 2000 writes each to a distinct key, zero mismatches across 5
+runs). It does NOT make an arbitrary compound read-modify-write on one key
+atomic across two separate calls (`self.n = self.n + 1` is a `get` then a
+`set`, two separate lock/unlock cycles) -- not attempted, and the real
+engine makes no such promise either.
+`get`/`set_var` being individually safe now very likely also makes
+arrangement 2's own free-list-table lookup (point 3, immediately above)
+safe for concurrent READS of an already-set key -- the write itself still
+happens once, sequentially, during `bm_heap_init`, before any worker
+starts. Noted as a likely consequence, not independently re-verified under
+real concurrent load with its own dedicated test; the "single-threaded
+only" caution on arrangement 2 is left as written until that's done.
+
 ## The options
 
 The plan named (a) atomic counts everywhere, (b) a separate thread-safe path only
@@ -98,5 +122,14 @@ phase crashed with a segmentation fault. After it, five of five runs print 1 and
 - `thread_spawn` from block-model source. Block-model closures are lists, while the
   x64 runtime's `thread_spawn` takes its own closure value, so block-model source
   cannot reach it yet. The fixture calls the runtime's `thread_spawn` directly.
+  **Fixed by GitHub #184** (2026-10-03): `bm_closure_entry`, an injected helper
+  reusing `apply`'s own `CallDynamic` dispatch, lets `thread_spawn(closure)` work
+  from ordinary block-model source.
 - Any use of `set_var`/`get` from a worker. That remains forbidden by the runtime.
+  **Fixed by GitHub #198** (2026-10-03): see this file's own "Update" note under
+  "What is actually at risk" above -- `set_var`/`get` (and `send`/`new("Class",
+  "name")`, which route through the same table) are now genuinely safe from a
+  worker, for the table-corruption hazard this note originally meant. Compound
+  read-modify-write atomicity on one key across two separate calls is still not
+  provided, matching the real engine's own lack of that guarantee.
 - Interpreter Box use, which does not exist.

@@ -1,0 +1,73 @@
+# Native-only fixture for spec_library/block_model/thread_safety_vars_table.feature
+# (GitHub issue #198). Real OS threads hammer g_vars_table (set_var/get's
+# shared, named-object-backing table, rt_ns_set/rt_ns_get/rt_ns_push in
+# x64_runtime.patlang) through thread_spawn (#184) -- not calling the
+# runtime's thread_spawn directly, through ordinary block-model source.
+#
+# Each of N threads writes to its OWN distinct key many times, reading it
+# back after every write -- no contention on the SAME key, so this is not
+# testing (and does not need) atomicity of a compound read-modify-write on
+# one key; it is testing whether concurrent table mutation (new namespace,
+# new key, list growth) from DIFFERENT threads corrupts the shared
+# structure out from under each other -- the confirmed, concrete hazard
+# GitHub #198 fixed (lost namespaces/keys, corrupted list pointers from
+# concurrent rt_list_push), not a broader promise about compound-op
+# atomicity on a single key, which the real engine does not promise
+# either (named_objects.feature's own "the same exposure the real
+# engine's library code already has").
+#
+# The worker logic is inlined directly into each closure body, not
+# factored into a separate declared function called from inside it --
+# that combination (a declared function called from a thread_spawn
+# closure's own body) hit an unrelated native-codegen gap (a prefixed
+# local name escaping its own callee's scope) while writing this fixture;
+# filed separately, not part of #198's own scope.
+#
+# Prints 1 if every thread's every read-back matched what it just wrote,
+# 0 if any single mismatch happened anywhere.
+
+make a function called start returns r
+  let n_threads = 8
+  let per_thread = 2000
+  let fs = []
+  let i = 0
+  while i < n_threads do
+    let id = i
+    let n = per_thread
+    let f = || do
+      let key = "ts_key_" + id
+      let j = 0
+      let ok = true
+      while j < n do
+        set_var(key, id * 1000000 + j)
+        let readback = get("__vars", key)
+        if readback != (id * 1000000 + j) then
+          let ok = false
+        end
+        let j = j + 1
+      end
+      return ok
+    end
+    let fs = list_push(fs, thread_spawn(f))
+    let i = i + 1
+  end
+  let all_ok = true
+  let i = 0
+  while i < n_threads do
+    let tid = fs[i]
+    let done = false
+    while not done do
+      let done = thread_poll(tid)
+    end
+    if not thread_result(tid) then
+      let all_ok = false
+    end
+    let i = i + 1
+  end
+  if all_ok then
+    print(1)
+  else
+    print(0)
+  end
+  return 0
+end
