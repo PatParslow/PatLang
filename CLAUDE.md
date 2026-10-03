@@ -398,3 +398,49 @@ writes to `__vars` (`set_var`, or `get`+increment+`set_var`). A write there
 is fine if it happens before the parallel phase starts or after it
 finishes; a write reachable DURING the parallel phase needs one of the two
 fixes above, not a mutex (there isn't one).
+
+---
+
+## 8. Output discipline for long-running/batch tools: write live, not buffered
+
+Found as a real, repeated friction point (not theoretical): `run_benchmarks.
+sh`, `bm_parity_one.sh`/the all-selftest parity driver, and the full language/
+block-model spec gates all went completely silent for 20-30+ minutes at a
+stretch while genuinely working underneath, because their output was fully
+buffered until the whole process exited. The only way to tell "slow" from
+"stuck" was checking process memory/CPU by hand -- exactly the gap signals
+instrumentation (§6) already exists to close, just not yet applied to this
+class of tool.
+
+- **Rule**: a long-running or batch tool (a benchmark suite, a multi-file
+  checker, a spec-suite runner) writes its progress to a NAMED FILE as it
+  happens, not to stdout alone. Stdout captured by a pipe/redirect/backgrounded
+  shell is fully buffered by the OS/shell until the process exits; a file the
+  tool itself flushes after each unit of work is tailable/pollable mid-run.
+  This is the same root cause CLAUDE.md's own "Long-running background
+  processes" section (user-level) already names for Python -- the fix here is
+  the same shape, just applied to shell/PatLang tooling in this repo.
+- **Rule**: default new tools to an explicit `--interactive`/`--batch` (or
+  equivalent) flag when behavior should differ by context. Batch mode writes
+  unbuffered, per-item status to a file (and exits with a real process code);
+  interactive mode can keep ordinary terminal output. Don't silently assume
+  one or the other.
+- **Rule**: for a tool that runs many independent units (one per file, one
+  per benchmark), apply the SAME signals pattern (§6: `signal_claim`/
+  `signal_poll`/`signal_query`/`signal_reply`, matching `build_progress.
+  patlang`'s own role for a real build) so a live `signal_query(...,
+  "status", "")` can report which unit is currently running and how many are
+  done -- the general "tick manager"/work-dispatcher shape §6 already
+  recommends over scattered ad hoc status writes, applied to test/benchmark
+  runners specifically now, not just build scripts.
+- **Caveat, stated explicitly, not glossed over**: only add this where it
+  genuinely cannot skew the thing being measured. A benchmark whose own
+  timing is the result under test must not gain a signal-polling listener
+  INSIDE the timed region -- instrument the OUTER driver (which unit is
+  running, elapsed wall-clock per unit) instead of the benchmark's own
+  measured code path. When in doubt, prefer an external progress file the
+  driver writes BETWEEN timed runs, never instrumentation inside one.
+- **Not yet retrofitted**: existing tools (`run_benchmarks.sh`/`.patlang`,
+  `bm_parity_one.sh`, the spec-suite runners) still buffer fully as of this
+  writing -- this section is the policy for new work and a flagged backlog
+  item for existing tools, not a claim that the retrofit has happened.
