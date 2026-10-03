@@ -893,6 +893,37 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
       # Issue #153: value-context apply(fname, a1, ..., an) -- the callee's
       # return value stays on the stack for the surrounding expression.
       return bm_lower_apply(args, instrs, block_names, immut_params)
+    elif name == "thread_spawn" then
+      # Issue #184: thread_spawn(closure) -- see bm_inject_closure_entry_
+      # helper's own header for why this needs its own instruction rather
+      # than the generic CallHost fallback (which would hand the x64
+      # runtime's thread_spawn a plain List instead of a real closure
+      # value, and segfault). Lowers its one closure-expr argument
+      # (produces the ["__closure", name, captured] List on the stack),
+      # then a bare ThreadSpawn instruction -- native_codegen.patlang
+      # does the actual List -> real-closure conversion; the interpreter
+      # rejects it outright (no real-engine equivalent exists to match).
+      let instrs = bm_lower_expr(list_get(args, 0), instrs, block_names, immut_params)
+      return list_push(instrs, ["ThreadSpawn"])
+    elif name == "thread_result" then
+      # Issue #184: thread_result(id) -- an ordinary generic-CallHost-
+      # fallback call to the real runtime function (promoted to a plain
+      # Call by bm_patc_resolve_instrs, same as thread_poll), EXCEPT the
+      # raw value it reads back is whatever bm_closure_entry itself
+      # returned -- and bm_closure_entry is an ordinary "callee"-mode
+      # block-model function, so ITS OWN ReturnValue already wrapped the
+      # real result as [value, globals] (bm_nc_translate_block_instrs's
+      # universal convention for every callee, not specific to threads).
+      # The native thread trampoline has no idea about that convention;
+      # it just stores whatever bm_closure_entry returned verbatim. So
+      # thread_result unwraps it here, the one place that knows a
+      # bm_closure_entry-style callee is on the other end -- confirmed
+      # directly: without this, thread_result(id) for a closure computing
+      # 42 returned [42, []], not 42.
+      let instrs = bm_lower_expr(list_get(args, 0), instrs, block_names, immut_params)
+      let instrs = list_push(instrs, ["CallHost", "thread_result", 1])
+      let instrs = list_push(instrs, ["Const", "num", "0"])
+      return list_push(instrs, ["CallHost", "list_get", 2])
     elif bm_is_fn_bound_name(name) then
       # Issue #182: `f(a, b)` where f is a parameter or `let` of the current
       # function -- a call through a closure value. A local shadows a
@@ -1382,6 +1413,21 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
         # with bm_lower_expr's value-context "apply" case via
         # bm_lower_apply, so the two contexts cannot drift apart.
         let instrs = bm_lower_apply(call_args, instrs, block_names, immut_params)
+        return list_push(instrs, ["Store", "__bm_discard"])
+      elif name == "thread_spawn" then
+        # Issue #184: same as bm_lower_expr's own case, used as a bare
+        # statement (the spawned-thread id is still produced and
+        # discarded, matching apply's own bare-statement handling above).
+        let instrs = bm_lower_expr(list_get(call_args, 0), instrs, block_names, immut_params)
+        let instrs = list_push(instrs, ["ThreadSpawn"])
+        return list_push(instrs, ["Store", "__bm_discard"])
+      elif name == "thread_result" then
+        # Issue #184: same as bm_lower_expr's own case, used as a bare
+        # statement.
+        let instrs = bm_lower_expr(list_get(call_args, 0), instrs, block_names, immut_params)
+        let instrs = list_push(instrs, ["CallHost", "thread_result", 1])
+        let instrs = list_push(instrs, ["Const", "num", "0"])
+        let instrs = list_push(instrs, ["CallHost", "list_get", 2])
         return list_push(instrs, ["Store", "__bm_discard"])
       elif bm_is_fn_bound_name(name) then
         # Issue #182: a call through a closure value used as a statement.
@@ -2224,7 +2270,80 @@ make a function called bm_dedupe_decls takes stmts returns out
   return out
 end
 
+# GitHub #184: thread_spawn(closure) needs a REAL native closure value
+# (the x64 runtime's os_thread_spawn_raw reads [code_addr][captured_count]
+# [captured...] directly off the closure's own raw memory), but a block-
+# model closure's creation site builds a plain List (["__closure", name,
+# [captured...]], #182) -- no code address a trampoline could call at all.
+# Rather than hand-build native IR for a generic "dispatch by runtime
+# name" trampoline, this tiny helper is written as ordinary block-model
+# SOURCE (reusing apply()'s own already-correct CallDynamic dispatch,
+# #153) and spliced into the program's own statement list before the real
+# lowering passes run, ONLY when the source actually calls thread_spawn
+# (bm_ast_uses_thread_spawn below) -- unlike self_hosting/lib/x64_runtime.
+# patlang's own always-bundled runtime functions, this helper's mere
+# presence has a real cost for EVERY program, not just ones using it:
+# bm_nc_call_roots treats "any CallDynamic anywhere" as "every declared
+# function becomes a call root," and this helper's own body is exactly
+# one CallDynamic (via apply) -- unconditional injection would silently
+# impose that on every native compile, not just thread_spawn users.
+# bm_lower_expr's own "thread_spawn" case (above) builds a genuine native
+# closure pointed at this function via MakeClosure, with [block_name,
+# captured_list] as its two captured values -- so when the native thread
+# trampoline invokes it with exactly those two arguments, it dispatches to
+# the right closure body with the right captured list, through the exact
+# same mechanism an ordinary `f(a, b)` closure-variable call already uses
+# (bm_lower_closure_call).
+make a function called bm_closure_entry_helper_src returns src
+  return "make a function called bm_closure_entry takes name, captured returns value" + chr(10) + "  return apply(name, captured)" + chr(10) + "end" + chr(10)
+end
+
+make a function called bm_ast_uses_thread_spawn takes node returns yes
+  if type_of(node) != "list" then
+    return false
+  end
+  let n = list_len(node)
+  if n == 0 then
+    return false
+  end
+  if (list_get(node, 0) == "Call") and (n >= 2) and (list_get(node, 1) == "thread_spawn") then
+    return true
+  end
+  let i = 0
+  while i < n do
+    if bm_ast_uses_thread_spawn(list_get(node, i)) then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called bm_inject_closure_entry_helper takes ast returns ast2
+  if not bm_ast_uses_thread_spawn(list_get(ast, 1)) then
+    return ast
+  end
+  # Appended, never prepended: bm_lower_program's own entry-point rule is
+  # "the first Func statement encountered" (see its Pass 2 below) -- a
+  # helper prepended here would silently become the program's own entry
+  # point instead of the user's actual first function (confirmed directly:
+  # broke even a trivial "start() -> return 1" program, with no thread_
+  # spawn involved at all, until this was appended instead).
+  let helper_toks = tokenize(bm_closure_entry_helper_src())
+  let helper_ast = parse_program(helper_toks)
+  let helper_stmts = list_get(helper_ast, 1)
+  let combined = list_get(ast, 1)
+  let n = list_len(helper_stmts)
+  let i = 0
+  while i < n do
+    let combined = list_push(combined, list_get(helper_stmts, i))
+    let i = i + 1
+  end
+  return list_set(ast, 1, combined)
+end
+
 make a function called bm_lower_program takes ast returns prog
+  let ast = bm_inject_closure_entry_helper(ast)
   set_var("bm_synth_counter", 0)
   set_var("bm_closure_blocks", [])
   set_var("bm_budgeted_depth", 0)
