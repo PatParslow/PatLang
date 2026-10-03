@@ -2342,6 +2342,47 @@ make a function called bm_inject_closure_entry_helper takes ast returns ast2
   return list_set(ast, 1, combined)
 end
 
+# GitHub #199: returns "start" if any top-level Func statement declares
+# it, else false (falls back to "first encountered" at this function's
+# own call site). Returns false unconditionally -- deferring to the
+# unchanged "first encountered" fallback -- whenever `__main` exists
+# anywhere in stmts: bm_collect_toplevel_main's own header comment
+# guarantees `__main` is placed FIRST whenever it exists at all (every
+# top-level non-declaration statement -- a bare `start()` call, a
+# class's own `class_def(...)` statement bm_expand_classes could not
+# prepend into a function because one WASN'T the program's only top-
+# level content -- collected into it, specifically so it runs first).
+# Overriding that to prefer a literal "start" unconditionally was a
+# REAL regression, caught by the full block-model suite, not reasoned
+# out in advance: class_methods_reference.patlang's own class_def calls
+# never ran, since they live in `__main` (it has a trailing `start()`
+# call, so `has_main` was true in bm_expand_classes and its class_defs
+# were never prepended into a function body either) -- "start" ran
+# directly as entry with every class's fields never registered, so
+# `new("Animal", "a1")` initialized nothing and every field read back
+# empty. A plain linear scan over the ALREADY-deduped/expanded
+# statement list -- stmts.length is the program's own top-level
+# declaration count, never large enough for this to matter.
+make a function called bm_lower_find_start_entry takes stmts, n returns entry
+  let i = 0
+  while i < n do
+    let stmt = list_get(stmts, i)
+    if (list_get(stmt, 0) == "Func") and (list_get(stmt, 1) == "__main") then
+      return false
+    end
+    let i = i + 1
+  end
+  let i = 0
+  while i < n do
+    let stmt = list_get(stmts, i)
+    if (list_get(stmt, 0) == "Func") and (list_get(stmt, 1) == "start") then
+      return "start"
+    end
+    let i = i + 1
+  end
+  return false
+end
+
 make a function called bm_lower_program takes ast returns prog
   let ast = bm_inject_closure_entry_helper(ast)
   set_var("bm_synth_counter", 0)
@@ -2408,7 +2449,27 @@ make a function called bm_lower_program takes ast returns prog
   set_var("bm_ct_blocks_by_name", blocks_by_name)
   let blocks = []
   let events = []
-  let entry = false
+  # GitHub #199: the entry used to be unconditionally "the first Func
+  # statement encountered" -- wrong whenever any OTHER function (one
+  # with its own declared params) is written before the one actually
+  # meant to run first. The native "main" FuncIR always takes zero
+  # params (it's the program's real OS entry, called with none), so
+  # that other function's own params are never bound anywhere, and
+  # reading them inside its body -- now compiled as if it WERE main --
+  # fails as "undefined variable", regardless of thread_spawn/closures/
+  # CallDynamic (confirmed: a program with nothing but two ordinary
+  # functions, the parameterized one declared first, hits the identical
+  # error). The real engine has no equivalent trap: its own top-level
+  # statements run directly as main, and a declared function is never
+  # auto-invoked just by being declared -- "start" is only ever run
+  # because every existing fixture explicitly calls it or relies on it
+  # being first by convention, not because the language auto-selects it.
+  # Pre-scanning for a function literally named "start" and preferring
+  # it, before falling back to "first encountered," fixes this for the
+  # overwhelmingly common convention (every block-model fixture already
+  # uses "start") without changing behavior for any program that does
+  # not declare one.
+  let entry = bm_lower_find_start_entry(stmts, n)
   let i = 0
   while i < n do
     let stmt = list_get(stmts, i)
