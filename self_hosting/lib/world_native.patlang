@@ -121,8 +121,38 @@ make a function called world_release_lock_if_held returns done
   return true
 end
 
+# A world swaps the process-wide store tables, so no other thread or fiber may
+# be running while it does. Worlds marked by world_run itself (nested worlds
+# run on the outer world's own thread) do not count as other work.
+make a function called world_is_world_fiber takes row returns yes
+  return (row[4].length == 1) and (row[4][0] == "world")
+end
+
+make a function called world_busy returns busy
+  let threads = logic_threads_list()
+  let i = 0
+  while i < threads.length do
+    if not thread_poll(threads[i][0]) then
+      return true
+    end
+    let i = i + 1
+  end
+  let fibers = logic_fibers_list()
+  let j = 0
+  while j < fibers.length do
+    if os_fiber_alive(fibers[j][1]) and not world_is_world_fiber(fibers[j]) then
+      return true
+    end
+    let j = j + 1
+  end
+  return false
+end
+
 # world_run(ir, opts) -> [stdout, stderr, ok, vfs_out, classes_out]
 make a function called world_run takes ir, opts returns result
+  if world_busy() then
+    return ["", "world_run: refused: another thread or fiber is still running", false, [], []]
+  end
   let stdin_text = world_opt(opts, "stdin", "")
   if stdin_text != "" then
     return ["", "world_run: unsupported: stdin", false, [], []]
@@ -153,10 +183,11 @@ make a function called world_run takes ir, opts returns result
     world_swap_in(saved)
     return ["", "world_run: could not start the world fiber", false, [], []]
   end
+  fibers_table_update_row(fid, 0 - 1, 0 - 1, ["world"])
   set_var("__world_ir", ir)
   let resumed = fiber_resume(fid, 0)
   let halted = resumed[0] == "__world_halt"
-  let r = resumed[0]
+  let r = resumed
   world_release_lock_if_held()
   let out = sb_str(buf)
   let vfs_out = []
@@ -169,6 +200,10 @@ make a function called world_run takes ir, opts returns result
   let classes_out = world_classes_not_ours(mem_peek_qword(mem_classes_table_addr(), 0))
   world_swap_in(saved)
   if halted then
+    let frow = fibers_table_row(fid)
+    if frow != false then
+      mem_poke_qword(frow[1], 64, 0)
+    end
     return [out, "native halt: exit code " + resumed[1], false, vfs_out, classes_out]
   end
   if r[0] == "Ok" then
