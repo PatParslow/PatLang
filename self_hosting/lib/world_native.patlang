@@ -1,0 +1,178 @@
+# world_native.patlang -- world_run for native x64 programs.
+#
+# A world run executes IR in a clean world: every per-store table is swapped
+# for an empty one, print output is captured, and the caller's tables are put
+# back afterwards. The store list mirrors rust-runtime/src/ir/hosts.rs's
+# world_enter. Each native store is its own g_*_table pointer, and a table
+# pointer of 0 is created on first use, so clearing a pointer gives a fresh
+# store. Including this file is what makes host_caps() report "world_swap".
+#
+# Classes: the world starts with only the interpreter's own classes (see
+# world_is_ours). Other classes are not visible unless passed in with
+# classes_in; the world's classes come back as the fifth result element.
+# VFS: the world starts empty. vfs_in preloads it; vfs_out_prefix selects
+# which paths come back in the fourth result element.
+#
+# Runtime halts (os_exit, unsupported host functions, VFS misses) end the
+# world with ok=false and a "native halt" stderr line; the process continues.
+# Hardware faults (access violations) still end the process: they do not go
+# through halt_process.
+#
+# Not covered yet: threads started inside a world share the swapped stores
+# with the parent, so a world must not run concurrently with other threads.
+
+include "interp.patlang"
+
+set_var("__world_native", true)
+
+make a function called world_store_addrs returns addrs
+  return [mem_vars_table_addr(), mem_vec_table_addr(), mem_sb_table_addr(), mem_rules_table_addr(), mem_actions_table_addr(), mem_action_bodies_table_addr(), mem_goal_defs_table_addr(), mem_procs_table_addr(), mem_listeners_table_addr(), mem_conns_table_addr(), mem_vfs_table_addr()]
+end
+
+make a function called world_is_ours takes name returns yes
+  return name == "Interpreter"
+end
+
+make a function called world_classes_ours takes table returns kept
+  let kept = []
+  let i = 0
+  while i < table.length do
+    if world_is_ours(table[i][0]) then
+      let kept = list_push(kept, table[i])
+    end
+    let i = i + 1
+  end
+  return kept
+end
+
+make a function called world_classes_not_ours takes table returns theirs
+  let theirs = []
+  if table == 0 then
+    return theirs
+  end
+  let i = 0
+  while i < table.length do
+    if not world_is_ours(table[i][0]) then
+      let theirs = list_push(theirs, table[i])
+    end
+    let i = i + 1
+  end
+  return theirs
+end
+
+make a function called world_swap_out returns saved
+  let addrs = world_store_addrs()
+  let saved = []
+  let i = 0
+  while i < addrs.length do
+    let saved = list_push(saved, mem_peek_qword(addrs[i], 0))
+    mem_poke_qword(addrs[i], 0, 0)
+    let i = i + 1
+  end
+  let classes_addr = mem_classes_table_addr()
+  let saved_classes = mem_peek_qword(classes_addr, 0)
+  let kept = []
+  if saved_classes != 0 then
+    let kept = world_classes_ours(saved_classes)
+  end
+  mem_poke_qword(classes_addr, 0, kept)
+  return [saved, saved_classes]
+end
+
+make a function called world_swap_in takes saved returns done
+  let addrs = world_store_addrs()
+  let stores = saved[0]
+  let i = 0
+  while i < addrs.length do
+    mem_poke_qword(addrs[i], 0, stores[i])
+    let i = i + 1
+  end
+  mem_poke_qword(mem_classes_table_addr(), 0, saved[1])
+  return true
+end
+
+make a function called world_opt takes opts, key, fallback returns value
+  let i = 0
+  while i < opts.length do
+    if opts[i][0] == key then
+      return opts[i][1]
+    end
+    let i = i + 1
+  end
+  return fallback
+end
+
+# The world's interpreter runs on its own fiber so a runtime halt can end just
+# that fiber (see halt_process in x64_runtime.patlang). The body marks its own
+# store table, which is what makes halt_process yield instead of exiting.
+make a function called world_body takes arg returns result
+  set_var("__in_world", true)
+  return interpret_ir(get("__vars", "__world_ir"))
+end
+
+# A halt can leave the variable-table lock held by the halted fiber. The
+# parent is the only other thread at that point, so a lock with next_ticket
+# ahead of now_serving is held by the dead fiber and is released here.
+make a function called world_release_lock_if_held returns done
+  let addr = mem_vars_lock_addr()
+  if mem_peek_qword(addr, 0) != mem_peek_qword(addr, 8) then
+    rt_vars_unlock()
+  end
+  return true
+end
+
+# world_run(ir, opts) -> [stdout, stderr, ok, vfs_out, classes_out]
+make a function called world_run takes ir, opts returns result
+  let stdin_text = world_opt(opts, "stdin", "")
+  if stdin_text != "" then
+    return ["", "world_run: unsupported: stdin", false, [], []]
+  end
+  let max_steps = world_opt(opts, "max_steps", 0)
+  let classes_in = world_opt(opts, "classes_in", [])
+  let vfs_in = world_opt(opts, "vfs_in", [])
+  let vfs_prefix = world_opt(opts, "vfs_out_prefix", "")
+  let saved = world_swap_out()
+  let buf = sb_new()
+  set_var("__output_buffer", buf)
+  set_var("__output_buffering", true)
+  set_var("__interp_budget_on", max_steps > 0)
+  set_var("__interp_steps", max_steps)
+  let i = 0
+  while i < vfs_in.length do
+    vfs_table_set(vfs_in[i][0], vfs_in[i][1])
+    let i = i + 1
+  end
+  let i = 0
+  while i < classes_in.length do
+    let c = classes_in[i]
+    class_def_register(c[0], "", c[1], c[2], [])
+    let i = i + 1
+  end
+  let fid = fiber_new("world_body")
+  if fid == 0 - 1 then
+    world_swap_in(saved)
+    return ["", "world_run: could not start the world fiber", false, [], []]
+  end
+  set_var("__world_ir", ir)
+  let resumed = fiber_resume(fid, 0)
+  let halted = resumed[0] == "__world_halt"
+  let r = resumed[0]
+  world_release_lock_if_held()
+  let out = sb_str(buf)
+  let vfs_out = []
+  let paths = vfs_list(vfs_prefix)
+  let i = 0
+  while i < paths.length do
+    let vfs_out = list_push(vfs_out, [paths[i], vfs_table_lookup(paths[i])])
+    let i = i + 1
+  end
+  let classes_out = world_classes_not_ours(mem_peek_qword(mem_classes_table_addr(), 0))
+  world_swap_in(saved)
+  if halted then
+    return [out, "native halt: exit code " + resumed[1], false, vfs_out, classes_out]
+  end
+  if r[0] == "Ok" then
+    return [out, "", true, vfs_out, classes_out]
+  end
+  return [out, "IR runtime error: " + r[1], false, vfs_out, classes_out]
+end

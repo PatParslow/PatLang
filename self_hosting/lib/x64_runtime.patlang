@@ -191,6 +191,9 @@ make a function called rt_heap_alloc takes size returns addr
 end
 
 make a function called rt_print_i64 takes n returns done
+  if get("__vars", "__output_buffering") then
+    return rt_print_str(rt_int_to_str(n))
+  end
   let buf = mem_scratch_addr()
   let len = rt_int_to_string(n, buf)
   mem_poke_byte(buf, len, 10)
@@ -552,12 +555,26 @@ make a function called rt_print_bool takes v returns done
   return rt_print_str(rt_bool_to_string(v))
 end
 
-make a function called rt_print_str takes s returns done
+# Every line of program output goes through here. A world run sets
+# __output_buffer to a string builder that receives each line; with no buffer
+# set, the line goes to the console.
+make a function called rt_emit_line takes s returns done
+  if get("__vars", "__output_buffering") then
+    let buf = get("__vars", "__output_buffer")
+    sb_push(buf, s)
+    sb_push(buf, chr(10))
+    return unit
+  end
   let addr = s band rt_payload_mask()
   let len = rt_str_len(s)
   os_write_console_bytes(addr + 8, len)
   mem_poke_byte(mem_scratch_addr(), 0, 10)
   os_write_console_bytes(mem_scratch_addr(), 1)
+  return unit
+end
+
+make a function called rt_print_str takes s returns done
+  rt_emit_line(s)
   # GitHub #63 item #2: used to return `true` as a "success" stand-in,
   # a convention that predates Unit having its own distinct family tag
   # (and predates the `unit` literal even being writable in Stage1
@@ -759,6 +776,10 @@ make a function called to_num takes v returns n
       let i = 1
     end
   end
+  let dot = rt_num_dot(addr, len)
+  if dot < len then
+    return rt_parse_decimal(addr, len, i, dot, neg)
+  end
   let acc = 0
   while i < len do
     let d = mem_peek_byte(addr, 8 + i)
@@ -773,6 +794,64 @@ make a function called to_num takes v returns n
     return 0 - acc
   end
   return acc
+end
+
+# halt_process(code): the single exit point for native runtime halts and
+# os_exit calls. Inside a world, __in_world is set only in that world's own
+# store table, so the halt yields a marker to the parent fiber and never
+# returns (the parent is never resumed again). Outside a world it exits.
+make a function called halt_process takes code returns done
+  if get("__vars", "__in_world") then
+    fiber_yield(["__world_halt", code])
+  end
+  os_exit_process(code)
+  return unit
+end
+
+# Index helpers for rt_parse_decimal. They are plain int functions so that
+# the float-mode parser below contains no bare integer literals (see
+# rt_float_decompose's note on float-mode Const wrapping).
+make a function called rt_num_next takes i returns n
+  return i + 1
+end
+
+make a function called rt_num_digit takes addr, i returns d
+  return mem_peek_byte(addr, 8 + i) - 48
+end
+
+make a function called rt_num_dot takes addr, len returns pos
+  let i = 0
+  while i < len do
+    if mem_peek_byte(addr, 8 + i) == 46 then
+      return i
+    end
+    let i = rt_num_next(i)
+  end
+  return len
+end
+
+# Decimal text -> boxed float. The integer and fractional digits are
+# accumulated as floats; the fraction is divided by an exact power of ten.
+make a function called rt_parse_decimal takes addr, len, start, dot, neg returns tagged
+  let ipart = 0.0
+  let i = start
+  while i < dot do
+    let ipart = ipart * 10.0 + i64_to_f64(rt_num_digit(addr, i))
+    let i = rt_num_next(i)
+  end
+  let fpart = 0.0
+  let denom = 1.0
+  let i = rt_num_next(dot)
+  while i < len do
+    let fpart = fpart * 10.0 + i64_to_f64(rt_num_digit(addr, i))
+    let denom = denom * 10.0
+    let i = rt_num_next(i)
+  end
+  let value = ipart + fpart / denom
+  if neg then
+    let value = 0.0 - value
+  end
+  return rt_box_float(value)
 end
 
 # chr(n) -> 1-byte string (empty for n < 0). Single-byte only (this
@@ -5920,20 +5999,13 @@ make a function called plan_with_state takes goal_facts returns result
   return plan_facts_with_state(goal_facts)
 end
 
-# host_caps() / world_run(): capability probe and clean-interpreter run
-# (ground truth: rust-runtime/src/ir/hosts.rs). A native x64 program is not
-# an interpreter host -- the compiled interp.patlang shares this program's
-# own global state, so a real swap-and-run cannot be built here. host_caps
-# says so (no "world_swap"), lists what a native program does have (files,
-# subprocesses, tcp), and world_run answers the same
-# [stdout, stderr, ok, vfs_out] shape with ok=false so a caller that
-# ignores the probe gets a checkable failure instead of a crash.
+# "world_swap" is reported only when self_hosting/lib/world_native.patlang is
+# included (it defines world_run and sets __world_native at top level).
 make a function called host_caps returns caps
+  if get("__vars", "__world_native") then
+    return ["x64", "world_swap", "subprocess", "tcp", "fs"]
+  end
   return ["x64", "subprocess", "tcp", "fs"]
-end
-
-make a function called world_run takes ir, opts returns result
-  return ["", "world_run: unsupported on native x64", false, []]
 end
 
 # =============================================================================
