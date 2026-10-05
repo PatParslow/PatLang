@@ -350,6 +350,28 @@ make a function called bm_list_contains takes xs, v returns yes
   return false
 end
 
+# Built-in forms lowered by name below. A function the program declares with
+# one of these names is called as the program's own function (it shadows the
+# built-in form), and the compiler warns about it.
+make a function called bm_builtin_form_names returns names
+  return ["new", "type_of", "read_file", "write_file", "query", "box_new", "box_get", "box_share", "box_set", "get_global", "set_global", "handler_new", "handler_register", "handler_lookup", "apply", "thread_spawn", "thread_result", "print", "fact", "fiber_yield", "emit"]
+end
+
+make a function called bm_user_fn_wins takes name, block_names returns yes
+  return bm_list_contains(block_names, name) and (not bm_is_fn_bound_name(name))
+end
+
+make a function called bm_lower_declared_call takes name, args, instrs, block_names, immut_params returns out
+  let ai = 0
+  let an = list_len(args)
+  while ai < an do
+    let instrs = bm_lower_expr(list_get(args, ai), instrs, block_names, immut_params)
+    let ai = ai + 1
+  end
+  let instrs = list_push(instrs, ["Load", "__globals"])
+  return list_push(instrs, ["Call", name, an + 1])
+end
+
 make a function called bm_lower_unsupported takes what returns nothing
   contract_check("bm_lower", "assert", "block-model Phase 2's restricted subset does not support: " + what, false)
   return false
@@ -808,7 +830,9 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
   elif ty == "Call" then
     let name = list_get(node, 1)
     let args = list_get(node, 2)
-    if (name == "new") and (list_len(args) == 1) then
+    if bm_user_fn_wins(name, block_names) then
+      return bm_lower_declared_call(name, args, instrs, block_names, immut_params)
+    elif (name == "new") and (list_len(args) == 1) then
       # Issue #178: the two-or-more-argument form, new(class, name), creates a
       # NAMED object in the process-wide registry and is served by the generic
       # host-call fallback below (see named_objects.feature).
@@ -934,28 +958,6 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
       # function -- a call through a closure value. A local shadows a
       # declared function of the same name, as in the real engine.
       return bm_lower_closure_call(name, args, instrs, block_names, immut_params)
-    elif bm_list_contains(block_names, name) then
-      # Phase 21: a call to another DECLARED block-model function, used
-      # as a SUB-EXPRESSION (NOT in tail/return position) -- the real
-      # gap Phase 18 found and this phase fills in. Distinct from
-      # JumpBlock (bm_lower_jump_call): JumpBlock is a one-way transfer
-      # with no return, correct for and unchanged at every EXISTING
-      # tail-call site; this is a genuine call WITH return, via the new
-      # "Call" instruction (interp.patlang's own case, which recurses
-      # through bi_run_from -- see that function's own header for why
-      # this needs no classification/flattening distinction at all on
-      # the interpreter side, unlike native x64's own later, separate
-      # design). Same "args, then an implicit __globals push" convention
-      # as bm_lower_jump_call, so the callee's own params (which already
-      # end in "__globals", bm_lower_program's own doing) bind correctly.
-      let ai = 0
-      let an = list_len(args)
-      while ai < an do
-        let instrs = bm_lower_expr(list_get(args, ai), instrs, block_names, immut_params)
-        let ai = ai + 1
-      end
-      let instrs = list_push(instrs, ["Load", "__globals"])
-      return list_push(instrs, ["Call", name, an + 1])
     else
       # Phase 17/18's own named-but-deferred generic host-call fallback,
       # now filled in: any name not individually recognized above, not a
@@ -1338,7 +1340,10 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
     if list_get(call, 0) == "Call" then
       let name = list_get(call, 1)
       let call_args = list_get(call, 2)
-      if name == "print" then
+      if bm_user_fn_wins(name, block_names) then
+        let instrs = bm_lower_expr(call, instrs, block_names, immut_params)
+        return list_push(instrs, ["Store", "__bm_discard"])
+      elif name == "print" then
         let instrs = bm_lower_expr(list_get(call_args, 0), instrs, block_names, immut_params)
         return list_push(instrs, ["Print"])
       elif name == "set_global" then
@@ -2444,6 +2449,16 @@ make a function called bm_lower_program takes ast returns prog
       let blocks_by_name = list_push(blocks_by_name, [name, ["BlockIR", name, params, []]])
     end
     let i = i + 1
+  end
+
+  let builtin_names = bm_builtin_form_names()
+  let bi = 0
+  while bi < list_len(builtin_names) do
+    let bname = list_get(builtin_names, bi)
+    if bm_list_contains(block_names, bname) then
+      print("warning: function '" + bname + "' shadows the built-in form '" + bname + "'; calls to '" + bname + "' now call your function")
+    end
+    let bi = bi + 1
   end
 
   # Pass 2: lower each function's real body now that every target name is
