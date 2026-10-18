@@ -1,3 +1,5 @@
+include "includes.patlang"
+
 # ObjCache -- content-addressed cache of assembled .obj files, keyed by
 # a caller-supplied content hash (see CompileUnit's own header,
 # self_hosting/lib/x64_compile_unit.patlang, for what gets hashed). The
@@ -42,7 +44,27 @@ class ObjCache {
     # underlying discarded-result interpreter behavior is a real,
     # separate bug worth its own investigation, not something this
     # class needs to work around further than this.
-    let copy_result = copy_file(built_obj_path, send(self, "path_for", hash))
+    #
+    # Confirmed, root-caused via std::fs::copy's own implementation
+    # (host_copy_file, rust-runtime/src/ir/hosts.rs): a plain copy
+    # truncates-then-writes the destination in place, so a concurrent
+    # `has()` check (or a THIRD worker's own `store()` for the same
+    # content hash) can observe a partially-written .obj mid-copy and
+    # link against a truncated/corrupt object file -- this is the
+    # mechanism behind the parity suite's own documented
+    # nondeterministic pass counts under concurrency (2026-09-25
+    # cutover report). `copy_file` to a per-writer-unique temp path
+    # inside the SAME cache_dir, then `rename_file` (std::fs::rename,
+    # atomic on a single filesystem/volume) into the final hash-named
+    # path, removes the race instead of synchronizing around it: a
+    # reader only ever sees either no file or the complete one.
+    # `path_basename(built_obj_path)` is unique per writer (each
+    # CompileUnit's own out_path is unique), so no shared counter is
+    # needed for the uniquifier.
+    let final_path = send(self, "path_for", hash)
+    let temp_path = final_path + ".tmp." + path_basename(built_obj_path)
+    let copy_result = copy_file(built_obj_path, temp_path)
+    let rename_result = rename_file(temp_path, final_path)
     return true
   end
 }
