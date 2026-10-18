@@ -342,8 +342,19 @@ patc1: this program uses constructs that exist only in the native x64 backend, s
 
 The build exits with status 1. Build such programs with `--x64`.
 
-**Known differences on WASM** (tracked in #210 and #204):
-- The host `world_run` ignores `classes_in` and `classes_out`.
-- A bare `vfs_write(...)` in a world prints an extra value on WASM.
+**Known differences on WASM** (#210):
+- A WASM (or `--patc`) program's own top-level script, if its last statement
+  is a loop or any other non-`print` expression, has that expression's value
+  printed as one extra trailing line -- e.g. a `while i < n do ... end` as the
+  last statement prints the final value of `i`. This comes from the
+  Rust-source-emission backend's generated `main()` (`emit_main_rs` in
+  `self_hosting/lib/codegen.patlang`, mirrored in `codegen.rs`), which always
+  prints the program's own return value; native x64 has no such convention.
+  End a script with an explicit `print(...)` (whose own return value is
+  `Unit`, printed as an empty line that most output can absorb unnoticed) to
+  avoid a meaningful stray value. Not fixed -- `--ir-run` and `--patc` are
+  deliberately tested for parity on this exact behavior
+  (`interp_compiled_parity.feature`), so removing it would need to change
+  that contract too.
 - A missing VFS file in a world is reported as an `IR runtime error`, not as a
-  native halt. Both give `ok=false`.
+  native halt. Both give `ok=false`; this is a wording difference only.

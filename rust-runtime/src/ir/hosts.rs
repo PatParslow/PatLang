@@ -3487,19 +3487,81 @@ fn opt_get(opts: &Value, key: &str) -> Option<Value> {
     }
 }
 
-fn world_result(out: String, err: String, ok: bool, vfs_out: Vec<Value>) -> Value {
+fn world_result(out: String, err: String, ok: bool, vfs_out: Vec<Value>, classes_out: Vec<Value>) -> Value {
     Value::List(Arc::new(vec![
         Value::String(out.into()),
         Value::String(err.into()),
         Value::Bool(ok),
         Value::List(Arc::new(vfs_out)),
+        Value::List(Arc::new(classes_out)),
     ]))
 }
 
-/// world_run(ir_shape, opts) -> [stdout, stderr, ok, vfs_out]
+// classes_in entries are [name, field_defaults, methods] (methods optional),
+// the same 3-element shape world_native.patlang's classes_in accepts -- see
+// its own class_def_register(c[0], "", c[1], c[2], []) call. field_defaults
+// is [[field_name, default_value], ...]; methods is [[method_name, closure],
+// ...].
+fn world_classes_in(opts: &Value) -> Vec<(String, Vec<(String, Value)>, HashMap<String, Value>)> {
+    match opt_get(opts, "classes_in") {
+        Some(Value::List(xs)) => xs.iter().filter_map(|c| match c {
+            Value::List(fields) if fields.len() >= 2 => {
+                let name = match &fields[0] { Value::String(s) => s.as_ref().clone(), v => to_s(v) };
+                let field_defaults: Vec<(String, Value)> = match &fields[1] {
+                    Value::List(ps) => ps.iter().filter_map(|p| match p {
+                        Value::List(kv) if kv.len() == 2 => {
+                            let fname = match &kv[0] { Value::String(s) => s.as_ref().clone(), v => to_s(v) };
+                            Some((fname, kv[1].clone()))
+                        }
+                        _ => None,
+                    }).collect(),
+                    _ => Vec::new(),
+                };
+                let methods: HashMap<String, Value> = match fields.get(2) {
+                    Some(Value::List(ms)) => ms.iter().filter_map(|p| match p {
+                        Value::List(kv) if kv.len() == 2 => {
+                            let mname = match &kv[0] { Value::String(s) => s.as_ref().clone(), v => to_s(v) };
+                            Some((mname, kv[1].clone()))
+                        }
+                        _ => None,
+                    }).collect(),
+                    _ => HashMap::new(),
+                };
+                Some((name, field_defaults, methods))
+            }
+            _ => None,
+        }).collect(),
+        _ => Vec::new(),
+    }
+}
+
+// classes_out mirrors classes_in's own shape: [name, field_defaults,
+// methods]. CLASSES is swapped to a fresh empty map on world entry (see
+// world_enter), so every entry left in it belongs to this world -- no
+// "ours vs theirs" filtering is needed here the way native's world_native.
+// patlang needs to exclude its own "Interpreter" class.
+fn world_classes_out() -> Vec<Value> {
+    let classes = CLASSES.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap();
+    classes.iter().map(|(name, def)| {
+        let fields: Vec<Value> = def.field_defaults.iter()
+            .map(|(k, v)| Value::List(Arc::new(vec![Value::String(k.clone().into()), v.clone()])))
+            .collect();
+        let methods: Vec<Value> = def.methods.iter()
+            .map(|(k, v)| Value::List(Arc::new(vec![Value::String(k.clone().into()), v.clone()])))
+            .collect();
+        Value::List(Arc::new(vec![
+            Value::String(name.clone().into()),
+            Value::List(Arc::new(fields)),
+            Value::List(Arc::new(methods)),
+        ]))
+    }).collect()
+}
+
+/// world_run(ir_shape, opts) -> [stdout, stderr, ok, vfs_out, classes_out]
 /// opts (Object or list of [key, value] pairs), all optional:
 ///   vfs_in         list of [path, content] preloaded into the child's VFS
 ///   vfs_out_prefix only VFS paths with this prefix are returned (default "")
+///   classes_in     list of [name, field_defaults, methods] classes visible to the world
 ///   max_steps      loop/call budget; exhausted => ok=false
 /// A crashing child yields ok=false and stderr "IR runtime error: ...".
 pub fn host_world_run(args: &[Value]) -> Result<Value, String> {
@@ -3507,7 +3569,7 @@ pub fn host_world_run(args: &[Value]) -> Result<Value, String> {
     let opts = args.get(1).cloned().unwrap_or(Value::Unit);
     let program = match ir_shape_to_program(shape) {
         Ok(p) => p,
-        Err(e) => return Ok(world_result(String::new(), format!("IR decode error: {}", e), false, Vec::new())),
+        Err(e) => return Ok(world_result(String::new(), format!("IR decode error: {}", e), false, Vec::new(), Vec::new())),
     };
     if let Some(Value::String(s)) = opt_get(&opts, "stdin") {
         if !s.is_empty() { return Err("world_run: unsupported: stdin".into()); }
@@ -3525,9 +3587,14 @@ pub fn host_world_run(args: &[Value]) -> Result<Value, String> {
         }).collect(),
         _ => Vec::new(),
     };
+    let classes_in = world_classes_in(&opts);
 
     let guard = world_enter(max_steps);
     for (k, v) in vfs_in { vfs_set(k, v); }
+    for (name, field_defaults, methods) in classes_in {
+        CLASSES.get_or_init(|| std::sync::Mutex::new(HashMap::new())).lock().unwrap()
+            .insert(name, ClassDef { parent: None, field_defaults, methods, traits: Vec::new() });
+    }
     let mut interp = Interpreter::new();
     interp.host.insert("print", playground_print);
     register_stage0_shims(&mut interp);
@@ -3537,14 +3604,15 @@ pub fn host_world_run(args: &[Value]) -> Result<Value, String> {
     let vfs_out: Vec<Value> = keys.into_iter().filter_map(|k| {
         vfs_get(&k).map(|v| Value::List(Arc::new(vec![Value::String(k.into()), Value::String(v.into())])))
     }).collect();
+    let classes_out = world_classes_out();
     let out = guard.captured();
     drop(guard);
     Ok(match ran {
-        Ok(Ok(_)) => world_result(out, String::new(), true, vfs_out),
-        Ok(Err(e)) => world_result(out, format!("IR runtime error: {}", e), false, vfs_out),
+        Ok(Ok(_)) => world_result(out, String::new(), true, vfs_out, classes_out),
+        Ok(Err(e)) => world_result(out, format!("IR runtime error: {}", e), false, vfs_out, classes_out),
         Err(p) => {
             let msg = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_else(|| "panic".into());
-            world_result(out, format!("IR runtime error: panic: {}", msg), false, vfs_out)
+            world_result(out, format!("IR runtime error: panic: {}", msg), false, vfs_out, classes_out)
         }
     })
 }

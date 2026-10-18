@@ -551,6 +551,15 @@ fn classes_insert(name: String, def: ClassDef) {
     CLASSES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap().insert(name, def);
 }
 
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+fn classes_all() -> Vec<(String, ClassDef)> {
+    CLASSES.with(|c| c.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+}
+#[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+fn classes_all() -> Vec<(String, ClassDef)> {
+    CLASSES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap().iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
 // Slice 4 (inline `new(...)` inheritance): fetch-or-default, mutate, then
 // reinsert -- merges onto an existing ClassDef without clobbering fields
 // the caller didn't ask to change.
@@ -5592,7 +5601,7 @@ fn host_call_codegen_bootstrap_inner(name: &str, args: &[Value]) -> Result<Value
                 })();
                 let (program, events) = match decoded {
                     Ok(d) => d,
-                    Err(e) if name == "world_run" => return Ok(rt_world_result(String::new(), format!("IR decode error: {}", e), false, Vec::new())),
+                    Err(e) if name == "world_run" => return Ok(rt_world_result(String::new(), format!("IR decode error: {}", e), false, Vec::new(), Vec::new())),
                     Err(e) => return Err(e),
                 };
                 if name == "world_run" { return rt_world_run(&program, events, args.get(1)); }
@@ -5611,13 +5620,70 @@ fn host_call_codegen_bootstrap_inner(name: &str, args: &[Value]) -> Result<Value
     }
 }
 
-fn rt_world_result(out: String, err: String, ok: bool, vfs_out: Vec<Value>) -> Value {
+fn rt_world_result(out: String, err: String, ok: bool, vfs_out: Vec<Value>, classes_out: Vec<Value>) -> Value {
     Value::List(Arc::new(vec![
         Value::String(out.into()),
         Value::String(err.into()),
         Value::Bool(ok),
         Value::List(Arc::new(vfs_out)),
+        Value::List(Arc::new(classes_out)),
     ]))
+}
+
+// classes_in entries are [name, field_defaults, methods] (methods optional) --
+// the same shape world_native.patlang's classes_in accepts. Mirrors ir/hosts.
+// rs's world_classes_in.
+fn rt_world_classes_in(opts: Option<&Value>) -> Vec<(String, Vec<(String, Value)>, HashMap<String, Value>)> {
+    match rt_opt_get(opts, "classes_in") {
+        Some(Value::List(xs)) => xs.iter().filter_map(|c| match c {
+            Value::List(fields) if fields.len() >= 2 => {
+                let name = match &fields[0] { Value::String(s) => s.as_ref().clone(), v => display_value(v) };
+                let field_defaults: Vec<(String, Value)> = match &fields[1] {
+                    Value::List(ps) => ps.iter().filter_map(|p| match p {
+                        Value::List(kv) if kv.len() == 2 => {
+                            let fname = match &kv[0] { Value::String(s) => s.as_ref().clone(), v => display_value(v) };
+                            Some((fname, kv[1].clone()))
+                        }
+                        _ => None,
+                    }).collect(),
+                    _ => Vec::new(),
+                };
+                let methods: HashMap<String, Value> = match fields.get(2) {
+                    Some(Value::List(ms)) => ms.iter().filter_map(|p| match p {
+                        Value::List(kv) if kv.len() == 2 => {
+                            let mname = match &kv[0] { Value::String(s) => s.as_ref().clone(), v => display_value(v) };
+                            Some((mname, kv[1].clone()))
+                        }
+                        _ => None,
+                    }).collect(),
+                    _ => HashMap::new(),
+                };
+                Some((name, field_defaults, methods))
+            }
+            _ => None,
+        }).collect(),
+        _ => Vec::new(),
+    }
+}
+
+// classes_out mirrors classes_in's own shape. CLASSES is swapped to a fresh
+// empty map on world entry (rt_swap_shared! below), so every entry left in
+// it belongs to this world -- no "ours vs theirs" filtering needed here,
+// unlike native's world_native.patlang excluding its own "Interpreter" class.
+fn rt_world_classes_out() -> Vec<Value> {
+    classes_all().into_iter().map(|(name, def)| {
+        let fields: Vec<Value> = def.field_defaults.iter()
+            .map(|(k, v)| Value::List(Arc::new(vec![Value::String(k.clone().into()), v.clone()])))
+            .collect();
+        let methods: Vec<Value> = def.methods.iter()
+            .map(|(k, v)| Value::List(Arc::new(vec![Value::String(k.clone().into()), v.clone()])))
+            .collect();
+        Value::List(Arc::new(vec![
+            Value::String(name.clone().into()),
+            Value::List(Arc::new(fields)),
+            Value::List(Arc::new(methods)),
+        ]))
+    }).collect()
 }
 
 fn rt_opt_get(opts: Option<&Value>, key: &str) -> Option<Value> {
@@ -5679,6 +5745,7 @@ fn rt_world_run(program: &Program, events: Vec<(String, String)>, opts: Option<&
         }).collect(),
         _ => Vec::new(),
     };
+    let classes_in = rt_world_classes_in(opts);
 
     let depth = WORLD_DEPTH.with(|d| { let n = d.get(); d.set(n + 1); n });
     #[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
@@ -5710,6 +5777,9 @@ fn rt_world_run(program: &Program, events: Vec<(String, String)>, opts: Option<&
     let prev_budget = step_budget_set(max_steps);
 
     for (k, v) in vfs_in { vfs_set(k, v); }
+    for (name, field_defaults, methods) in classes_in {
+        classes_insert(name, ClassDef { parent: None, field_defaults, methods, traits: Vec::new() });
+    }
     for (event, handler) in events { event_handlers_register(event, handler); }
     let ran = match program.functions.get(&program.entry) {
         None => Err("entry not found".to_string()),
@@ -5724,6 +5794,7 @@ fn rt_world_run(program: &Program, events: Vec<(String, String)>, opts: Option<&
     let vfs_out: Vec<Value> = keys.into_iter().filter_map(|k| {
         vfs_get(&k).map(|v| Value::List(Arc::new(vec![Value::String(k.into()), Value::String(v.into())])))
     }).collect();
+    let classes_out = rt_world_classes_out();
     let out = CAPTURE.with(|c| c.borrow().clone().unwrap_or_default());
 
     CHILD_PROCS.with(|c| { for (_, ch) in c.borrow_mut().iter_mut() { let _ = ch.kill(); let _ = ch.wait(); } });
@@ -5733,8 +5804,8 @@ fn rt_world_run(program: &Program, events: Vec<(String, String)>, opts: Option<&
     WORLD_DEPTH.with(|d| d.set(d.get() - 1));
 
     Ok(match ran {
-        Ok(_) => rt_world_result(out, String::new(), true, vfs_out),
-        Err(e) => rt_world_result(out, format!("IR runtime error: {}", e), false, vfs_out),
+        Ok(_) => rt_world_result(out, String::new(), true, vfs_out, classes_out),
+        Err(e) => rt_world_result(out, format!("IR runtime error: {}", e), false, vfs_out, classes_out),
     })
 }
 
