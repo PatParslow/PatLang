@@ -1,0 +1,94 @@
+# x64_build_fresh.patlang -- wraps `patc1.exe <src> <out> --x64` with the
+# rebuild step its own staleness check only ever prints instructions for.
+#
+# Found the hard way (2026-10-17): patc1_main.patlang already detects a stale
+# x64_runtime.obj via a content hash (GitHub #101, see its own header) and
+# prints "run: pat --ir-run self_hosting/build_x64_runtime.patlang" -- but it
+# does NOT run that itself, and it exits 0 either way. A script (or a person)
+# that only checks the exit code, not whether <out> actually exists, silently
+# keeps using a stale or missing binary. This wraps the two steps patc1's own
+# message names, in order, and checks the real ground truth (does <out> exist
+# afterward) rather than trusting either step's exit code.
+#
+# Usage: pat --ir-run self_hosting/tools/x64_build_fresh.patlang <src> <out>
+#   [target-triple]
+# target-triple is optional, same as patc1's own third positional arg (e.g.
+# "wasm32-wasip1"); omit it for a native --x64 build.
+#
+# This is a thin example of the general pattern, not a general build system:
+# it only knows about x64_runtime.obj's own fingerprint file, because that is
+# the one cache patc1's own --x64 path currently has. A future cache (the
+# per-function x64_obj_cache, say) would need the same "check, rebuild if
+# stale, then verify the real output exists" shape added here or alongside it.
+
+make a function called xbf_contains takes hay, needle returns found
+  if needle.length > hay.length then
+    return false
+  end
+  let i = 0
+  while i <= hay.length - needle.length do
+    if substr(hay, i, needle.length) == needle then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+let args = argv()
+if list_len(args) < 2 then
+  print("usage: x64_build_fresh.patlang <src.patlang> <out> [target-triple]")
+  os_exit(64)
+end
+let src = args[0]
+let out = args[1]
+let triple = ""
+if list_len(args) >= 3 then
+  let triple = args[2]
+end
+
+if not file_exists(src) then
+  print("x64_build_fresh: no such source file: " + src)
+  os_exit(66)
+end
+
+# Step 1: ensure the cached runtime object is fresh. Cheap when it already
+# is -- build_x64_runtime.patlang's own fingerprint check skips the rebuild
+# in that case, same hash patc1_main.patlang's --x64 path checks before
+# linking against it.
+let rebuild_out = exec_capture("rust-runtime/target/release/pat.exe", "--ir-run", "self_hosting/build_x64_runtime.patlang")
+if xbf_contains(rebuild_out, "NASM ERROR") or xbf_contains(rebuild_out, "LINK ERROR") then
+  print("x64_build_fresh: runtime object rebuild failed:")
+  print(rebuild_out)
+  os_exit(1)
+end
+
+# Step 2: the real compile. patc1's third positional arg is REQUIRED to
+# select a backend -- there is no "omit it for native" default (confirmed
+# the hard way: omitting it silently falls through to patc1's legacy
+# Rust-source-emission path instead of the native x64/NASM pipeline, which
+# doesn't bundle x64_runtime.patlang's shadowing primitives at all, so
+# anything calling one -- logic_threads_list, class_def_register, etc --
+# fails with "host fn not found" even though the real native pipeline
+# resolves it fine). Default to "--x64" when no target-triple was given;
+# only a target-triple build (wasm32-wasip1) doesn't touch x64_runtime.obj
+# at all, but running step 1 first is harmless either way.
+let compile_args = [src, out]
+if triple != "" then
+  let compile_args = list_push(compile_args, triple)
+else
+  let compile_args = list_push(compile_args, "--x64")
+end
+let compile_out = exec_capture_io("./patc1.exe", compile_args, "")
+
+# Ground truth: does the output actually exist now? patc1 exits 0 whether
+# this step succeeded or not (confirmed directly, GitHub #205/#201 work),
+# so the exit code alone is not evidence either way.
+if file_exists(out) then
+  print("x64_build_fresh: built " + out)
+else
+  print("x64_build_fresh: build did NOT produce " + out + ". patc1's own output:")
+  print(compile_out[0])
+  print(compile_out[1])
+  os_exit(1)
+end
