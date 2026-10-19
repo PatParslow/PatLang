@@ -351,15 +351,27 @@ own fixture proves correctness through an output comparison against
 `pat --ir-run` instead (three top-level strings built and discarded,
 native output matches exactly).
 
-**Not yet started:** call-argument/return-value crossing where the
-value is passed to something OTHER than being directly returned (e.g.
-stored into a longer-lived structure via another function); list/dict-
-element storage; locals that are reassigned (more than one `Store`);
-and loops (closures spanning more than one block, via `JumpBlock`) --
-the single biggest remaining real-world gap, and the riskiest, since it
-touches the same inter-block `JumpBlock`/liveness territory where
-issues #215 and #216 both found real bugs. Deliberately not attempted
-in the same pass as the increments above.
+**Call-argument crossing: verified, not a gap at all.** Passing a
+candidate as an argument to some other call well before its own
+decrement was never disqualified by anything in `bm_nc_insert_string_
+rc_decs` -- it only ever special-cases the single instruction
+immediately before a terminal (is it the value being returned there),
+never anything else a local gets used for. No code change needed; this
+increment is purely an explicit proof (a function that creates a
+string, passes it to `print()`, then returns something else, called 20
+times) rather than an assumption from the absence of a disqualifying
+check. Checked both ways in the same run: the printed sequence matches
+exactly (ruling out a too-early decrement corrupting the read) and the
+heap shows exactly zero growth after warm-up (ruling out a too-late
+one).
+
+**Not yet started:** list/dict-element storage; locals that are
+reassigned (more than one `Store`); and loops (closures spanning more
+than one block, via `JumpBlock`) -- the single biggest remaining real-
+world gap, and the riskiest, since it touches the same inter-block
+`JumpBlock`/liveness territory where issues #215 and #216 both found
+real bugs. Deliberately not attempted in the same pass as the
+increments above.
 
 **Checkpoint:** both the generalized-allocator proof (above) and the
 free-list fast-path's own genuine reachability are confirmed, not

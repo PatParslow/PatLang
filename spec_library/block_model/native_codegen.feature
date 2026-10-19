@@ -461,6 +461,26 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
     And handler functions (bm_nc_build_handler_funcirs) get the same
       pass under the same single-block gate, for the same reason.
 
+  Scenario: a local passed as an argument to another call, well before its own decrement, is still handled correctly (docs/plans/general-refcounting.md, Phase 2, verified not just assumed)
+    Given a function that creates a string, passes it to print() (an
+      ordinary external call, ordinary argument-passing) well before
+      the function's own terminal, then returns something else entirely
+      -- called 20 times through the ordinary --x64 CLI, alternating
+      which character gets built each cycle
+    When bm_nc_insert_string_rc_decs (native_codegen.patlang) decides
+      eligibility
+    Then nothing about being used as a call argument disqualifies the
+      local at all -- this pass only ever special-cases the single
+      instruction immediately before a terminal (is it the value being
+      returned there), never anything else a local gets used for, so
+      this was never a gap needing new code, only an explicit proof it
+      already worked rather than an assumption from the absence of a
+      disqualifying check. If the decrement were happening too early
+      (before print's own use), the printed character would be
+      corrupted; too late, and the heap would grow. Checked both ways
+      in the same run: the printed sequence matches exactly, and the
+      real heap shows exactly zero growth after warm-up.
+
   Scenario: apply with a runtime name and arguments dispatches natively
     Given a program using apply with two, one-statement and zero arguments
     When it is built and run as a real, fully native executable

@@ -270,6 +270,17 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+echo "Scenario: a local passed as an argument to another call, well before its own decrement, is still handled correctly (general-refcounting.md Phase 2, verified not just assumed)"
+rm -f self_hosting/build/native_string_rc_dec_call_arg.exe
+BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_string_rc_dec_call_arg.patlang self_hosting/build/native_string_rc_dec_call_arg.exe --x64 2>&1)
+if [ -f self_hosting/build/native_string_rc_dec_call_arg.exe ]; then
+  OUT=$(./self_hosting/build/native_string_rc_dec_call_arg.exe 2>&1)
+  check_seq "20 cycles passing the string to print() as an argument, both the output sequence and zero heap growth" "$OUT" "A A B C D E F G H I J A B C D E F G H I J growth= 0"
+else
+  echo "  FAIL: the call-arg fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
 echo ""
 echo "tests: $PASS passed, $FAIL failed"
 if [ "$FAIL" -eq 0 ]; then
