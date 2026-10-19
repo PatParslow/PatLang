@@ -451,6 +451,204 @@ make a function called bm_nc_call_roots takes prog returns roots
   return roots
 end
 
+# GitHub #215: every Call site's own [value, final_globals] heap-list
+# wrap/unpack (bm_nc_emit_call_unpack, ReturnValue's "callee" mode below)
+# costs a BuildList allocation plus two rt_list_get dispatches, on EVERY
+# call, because Fork B's globals-threading (docs/plans/block-ownership-
+# model.md 6) is unconditional -- regardless of whether the callee (or
+# anything it calls) ever actually reads or writes a global. Measured
+# directly against the pre-cutover lowerer: ~9x slower on both recursive
+# and flat function-call-heavy code, with a call-free loop showing no
+# difference at all -- isolating this wrapper, not something else, as
+# the cost.
+#
+# A function that never touches __globals, directly or transitively, can
+# skip the wrapper at both ends of every call reaching it -- a pure
+# native-codegen decision (the canonical BlockProgramIR shape, lower.
+# patlang's own output, and interp.patlang's execution are completely
+# unchanged; only how THIS backend compiles a provably safe case differs).
+#
+# "Pure" here means, for every block in a root's own JumpBlock-connected
+# family: no GlobalGet (695659), GlobalSet (708727), or Emit (23684) --
+# Emit's own handler_params include __globals, so a handler it might
+# reach could touch one -- and no CallDynamic (915129) or a Call/CallHost
+# to something bm_nc_dispatches_by_name flags (apply/fiber_new/
+# budgeted_run): the actual callee there is a runtime value, not a
+# compile-time name, so nothing here can rule out what it might do.
+# Purity propagates transitively over the real call graph to a fixed
+# point (a function that only calls provably-pure functions is pure too,
+# even if it never touches a global directly itself) -- the same
+# "optimistic, taint only grows" shape codegen_x64.patlang's own dynamic-
+# bin analysis already uses for a different question.
+make a function called bm_nc_program_has_dynamic_dispatch takes prog returns yes
+  # Closures are a further way a "pure"-looking function name could be
+  # reached without an ordinary Call this analysis's own call-graph walk
+  # would see (thread_spawn's own closure trampoline, bm_closure_entry,
+  # dispatches a captured closure by a mechanism not traced here).
+  # bm_lower_program already tracks whether any closure literal was ever
+  # lowered (bm_closure_blocks, reset empty at its own start) -- reusing
+  # that existing signal is simpler and safer than re-deriving it here.
+  if list_len(get("__vars", "bm_closure_blocks")) > 0 then
+    return true
+  end
+  # Same reasoning once more: Emit dispatches to a handler by
+  # bm_nc_fn_name(handler), hardcoded to always take/return __globals
+  # (bm_nc_build_handler_funcirs), completely independent of this
+  # analysis's own pure_fns set. If a handler name were ALSO reachable
+  # as an ordinary declared-function root and happened to look locally
+  # pure, the two codegen paths could disagree about its own calling
+  # convention. Simplest safe rule: any program with events/handlers at
+  # all skips this optimization, rather than proving no name collision
+  # is possible between the two namespaces.
+  if list_len(bi_program_events(prog)) > 0 then
+    return true
+  end
+  let blocks = bi_program_blocks(prog)
+  let bn = list_len(blocks)
+  let bi = 0
+  while bi < bn do
+    let instrs = bi_block_instrs(list_get(blocks, bi))
+    let n = list_len(instrs)
+    let i = 0
+    while i < n do
+      let instr = list_get(instrs, i)
+      let op = list_get(instr, 0)
+      if op == 915129 then # "CallDynamic"
+        return true
+      end
+      if (op == 938836) and bm_nc_dispatches_by_name(list_get(instr, 1)) then # "Call"
+        return true
+      end
+      if (op == 700058) and bm_nc_dispatches_by_name(list_get(instr, 1)) then # "CallHost"
+        return true
+      end
+      let i = i + 1
+    end
+    let bi = bi + 1
+  end
+  return false
+end
+
+make a function called bm_nc_root_is_locally_pure_and_edges takes prog, root returns pure_and_edges
+  let members = bm_nc_collect_block_closure(prog, root)
+  let locally_pure = true
+  let edges = []
+  let mi = 0
+  let mn = list_len(members)
+  while mi < mn do
+    let blk = bi_find_block(prog, list_get(members, mi))
+    let instrs = bi_block_instrs(blk)
+    let n = list_len(instrs)
+    let i = 0
+    while i < n do
+      let instr = list_get(instrs, i)
+      let op = list_get(instr, 0)
+      if (op == 695659) or (op == 708727) or (op == 23684) or (op == 915129) then
+        let locally_pure = false
+      elif op == 938836 then # "Call"
+        let callee = list_get(instr, 1)
+        if bm_nc_dispatches_by_name(callee) then
+          let locally_pure = false
+        elif not bm_list_contains(edges, callee) then
+          let edges = list_push(edges, callee)
+        end
+      elif (op == 700058) and bm_nc_dispatches_by_name(list_get(instr, 1)) then # "CallHost"
+        let locally_pure = false
+      end
+      let i = i + 1
+    end
+    let mi = mi + 1
+  end
+  return [locally_pure, edges]
+end
+
+make a function called bm_nc_compute_pure_fns takes prog, roots returns pure_names
+  # Real bug found and fixed while building this: CallDynamic's own
+  # dispatch (bm_nc_emit_call_dynamic) calls bm_nc_fn_name(cname) for
+  # EVERY declared function matching the supplied arity, unconditionally
+  # pushing __globals and unpacking [value, globals] -- it has no idea
+  # which callees this analysis marks pure, and a perfectly pure function
+  # (e.g. `double`) is a completely valid dynamic-dispatch target even
+  # though nothing calls it BY NAME anywhere (apply("double", [5]) is
+  # exactly this). A pure callee built with no __globals parameter and no
+  # wrapped return would desync from that dispatch's own fixed assumption
+  # -- confirmed as a real risk by reading bm_nc_emit_call_dynamic's own
+  # body, not just suspected. Rather than make dynamic dispatch purity-
+  # aware too (real, but a second change, not needed for this program
+  # shape to see the whole benefit), this analysis conservatively treats
+  # the WHOLE program as having no pure functions at all the moment ANY
+  # dynamic dispatch exists anywhere in it -- the same "prove it
+  # statically or fall back to the always-correct path" shape Fork C's
+  # own flight check already uses for mut-exclusivity. bench_fib/bench_
+  # manycalls/ordinary recursive and flat call-heavy code have no
+  # apply/fiber_new/budgeted_run/closures anywhere, so this costs them
+  # nothing; a program that DOES use dynamic dispatch anywhere keeps the
+  # exact behavior it already had before this change, correctness over
+  # optimization coverage.
+  if bm_nc_program_has_dynamic_dispatch(prog) then
+    return []
+  end
+  let rn = list_len(roots)
+  let locally_pure = []
+  let call_edges = []
+  let ri = 0
+  while ri < rn do
+    let root = list_get(roots, ri)
+    let pe = bm_nc_root_is_locally_pure_and_edges(prog, root)
+    let locally_pure = list_push(locally_pure, list_get(pe, 0))
+    let call_edges = list_push(call_edges, list_get(pe, 1))
+    let ri = ri + 1
+  end
+  # Fixed point: start optimistic (pure unless locally disqualified),
+  # then spread impurity along call edges until nothing changes -- bounded
+  # by `rn` passes (one root can only flip from pure to impure once, so a
+  # full pass with zero flips means truly stable, never a real loop).
+  let impure = []
+  let ri = 0
+  while ri < rn do
+    if list_get(locally_pure, ri) == false then
+      let impure = list_push(impure, list_get(roots, ri))
+    end
+    let ri = ri + 1
+  end
+  let pass = 0
+  let changed = true
+  while changed and (pass < (rn + 1)) do
+    let changed = false
+    let ri = 0
+    while ri < rn do
+      let root = list_get(roots, ri)
+      if not bm_list_contains(impure, root) then
+        let edges = list_get(call_edges, ri)
+        let en = list_len(edges)
+        let ei = 0
+        while ei < en do
+          let callee = list_get(edges, ei)
+          if bm_list_contains(impure, callee) then
+            let impure = list_push(impure, root)
+            let changed = true
+            let ei = en
+          else
+            let ei = ei + 1
+          end
+        end
+      end
+      let ri = ri + 1
+    end
+    let pass = pass + 1
+  end
+  let pure_names = []
+  let ri = 0
+  while ri < rn do
+    let root = list_get(roots, ri)
+    if not bm_list_contains(impure, root) then
+      let pure_names = list_push(pure_names, root)
+    end
+    let ri = ri + 1
+  end
+  return pure_names
+end
+
 # CallDynamic: a runtime name chooses the callee, so this emits a chain of
 # rt_str_eq comparisons, one per declared function that takes AT LEAST the
 # n_extra arguments supplied -- the same dispatch shape Emit uses for an
@@ -863,8 +1061,33 @@ make a function called bm_nc_translate_block_instrs takes block_name, instrs, pr
       # stack in the callee's own declared-param order (lower.patlang's
       # own "args, then Load __globals" convention). It returns the
       # two-element list [value, final_globals]; unpack both here.
-      let out = list_push(out, ["Call", bm_nc_fn_name(list_get(instr, 1)), list_get(instr, 2)])
-      let out = bm_nc_emit_call_unpack(out, block_name, i)
+      #
+      # GitHub #215: UNLESS the callee is provably pure (bm_nc_compute_
+      # pure_fns, stashed by bm_to_real_funcir), in which case it was
+      # compiled with no __globals parameter and no wrap on return (see
+      # "callee_pure" mode below) -- its bare value is already exactly
+      # where this call site needs it, on top of the stack. The single
+      # instruction just before this one in `out` is always that Load's
+      # own translation (bm_lower_declared_call emits "push args, Load
+      # __globals, Call" as one fixed, uninterrupted sequence -- lower.
+      # patlang's own header, Phase 4 -- so nothing else can have been
+      # appended to `out` in between): dropping exactly that one entry
+      # and reducing argc by 1 undoes pushing a value the pure callee was
+      # never going to read anyway.
+      let callee_name = list_get(instr, 1)
+      let argc = list_get(instr, 2)
+      if bm_list_contains(get("__vars", "bm_pure_fns"), callee_name) then
+        let trimmed = []
+        let oi = 0
+        while oi < (list_len(out) - 1) do
+          let trimmed = list_push(trimmed, list_get(out, oi))
+          let oi = oi + 1
+        end
+        let out = list_push(trimmed, ["Call", bm_nc_fn_name(callee_name), argc - 1])
+      else
+        let out = list_push(out, ["Call", bm_nc_fn_name(callee_name), argc])
+        let out = bm_nc_emit_call_unpack(out, block_name, i)
+      end
     elif op == 131889 then # "ReturnValue"
       # Issue #173: pops one value and ends the CURRENT function with it.
       # Inside a callee FuncIR that means returning [value, globals] (the
@@ -874,6 +1097,12 @@ make a function called bm_nc_translate_block_instrs takes block_name, instrs, pr
       if mode == "callee" then
         let out = list_push(out, ["Load", bm_nc_prefix(block_name, "__globals")])
         let out = list_push(out, ["BuildList", 2])
+        let out = list_push(out, ["Return"])
+      elif mode == "callee_pure" then
+        # GitHub #215: a provably pure function returns its value bare --
+        # no __globals to load (it was never given one as a param, see
+        # bm_nc_build_callee_funcirs), no BuildList wrap, matching the
+        # call site's own skip of bm_nc_emit_call_unpack above.
         let out = list_push(out, ["Return"])
       elif mode == "handler" then
         let out = list_push(out, ["Store", bm_nc_prefix(block_name, "__bm_discard")])
@@ -917,6 +1146,12 @@ make a function called bm_nc_translate_block_instrs takes block_name, instrs, pr
     let out = list_push(out, ["Const", "unit", ""])
     let out = list_push(out, ["Load", bm_nc_prefix(block_name, "__globals")])
     let out = list_push(out, ["BuildList", 2])
+    let out = list_push(out, ["Return"])
+  elif mode == "callee_pure" then
+    # GitHub #215: same reasoning as ReturnValue's own "callee_pure"
+    # branch above -- a pure function's implicit end-of-block halt
+    # returns a bare unit, no wrap.
+    let out = list_push(out, ["Const", "unit", ""])
     let out = list_push(out, ["Return"])
   elif mode == "main" then
     let out = list_push(out, ["Const", "unit", ""])
@@ -1281,18 +1516,52 @@ make a function called bm_nc_build_callee_funcirs takes prog, roots, print_op re
   let all_blocks = bi_program_blocks(prog)
   let abn = list_len(all_blocks)
   let rn = list_len(roots)
+  let pure_fns = get("__vars", "bm_pure_fns")
   let funcirs = []
   let ri = 0
   while ri < rn do
     let root = list_get(roots, ri)
     let member_names = bm_nc_collect_block_closure(prog, root)
     let cblocks = bm_nc_ordered_members(all_blocks, member_names, root)
-    let flat = bm_nc_flatten_blocks(prog, cblocks, [], print_op, "callee")
     let root_params = bi_block_params(bi_find_block(prog, root))
+    let is_pure = bm_list_contains(pure_fns, root)
+    # GitHub #215: dropping "__globals" from EXTERNAL params only --
+    # a real bug found and fixed while building this against the
+    # existing suite (the loop-exit/tail-call/diamond-include scenarios
+    # all regressed): a pure root can still contain INTERNAL blocks (a
+    # while loop's own body/exit) that thread "__globals" between
+    # THEMSELVES via ordinary JumpBlock params, same as every other
+    # block-to-block value -- that is pure bookkeeping, nothing to do
+    # with whether the FUNCTION itself ever touches an actual global,
+    # and removing the incoming parameter broke it (the entry block had
+    # nothing to Store into its own "__globals" local before its first
+    # JumpBlock needed to forward it). Fixed the same way the overall
+    # program's own entry block already handles this exact situation
+    # (bm_to_real_funcir's own init_instrs, just above): seed a fresh
+    # empty "__globals" at the start of the root's own body instead of
+    # receiving one as a parameter, so every internal JumpBlock inside
+    # this closure keeps working completely unchanged -- only the
+    # EXTERNAL calling convention (no parameter, no wrapped return)
+    # actually differs for a pure function.
+    let flat_mode = "callee"
+    let params_to_use = root_params
+    let pure_init = []
+    if is_pure then
+      let flat_mode = "callee_pure"
+      let trimmed = []
+      let ti = 0
+      while ti < (list_len(root_params) - 1) do
+        let trimmed = list_push(trimmed, list_get(root_params, ti))
+        let ti = ti + 1
+      end
+      let params_to_use = trimmed
+      let pure_init = [["BuildList", 0], ["Store", bm_nc_prefix(root, "__globals")]]
+    end
+    let flat = bm_nc_flatten_blocks(prog, cblocks, pure_init, print_op, flat_mode)
     let params = []
     let pi = 0
-    while pi < list_len(root_params) do
-      let params = list_push(params, bm_nc_prefix(root, list_get(root_params, pi)))
+    while pi < list_len(params_to_use) do
+      let params = list_push(params, bm_nc_prefix(root, list_get(params_to_use, pi)))
       let pi = pi + 1
     end
     let funcirs = list_push(funcirs, ["FuncIR", bm_nc_fn_name(root), params, flat, []])
@@ -1337,6 +1606,17 @@ end
 # every caller must pass the WHOLE list into emit_program_x64's own
 # `funcs` argument now, not just the first element.
 make a function called bm_to_real_funcir takes prog, print_op returns funcirs
+  # GitHub #215: computed ONCE, before main/handlers/every callee is
+  # translated, so every Call site anywhere (not just inside callee
+  # FuncIRs) can see the same answer. Stashed via set_var/get rather than
+  # threaded as a new parameter through bm_nc_flatten_blocks's and bm_nc_
+  # translate_block_instrs's whole call chain, matching this file's own
+  # established convention for compile-time-only context that many
+  # unrelated call sites need (bm_synth_counter, bm_current_fn, etc.) --
+  # read-only for the rest of this function's own call tree, never
+  # written again during it.
+  let pure_roots = bm_nc_call_roots(prog)
+  set_var("bm_pure_fns", bm_nc_compute_pure_fns(prog, pure_roots))
   let blocks = bi_program_blocks(prog)
   let bn = list_len(blocks)
   let closures = bm_nc_handler_closures(prog)
@@ -1413,7 +1693,7 @@ make a function called bm_to_real_funcir takes prog, print_op returns funcirs
     let hi = hi + 1
   end
   # Issue #173: one more separate FuncIR per Call target.
-  let callee_funcirs = bm_nc_build_callee_funcirs(prog, bm_nc_call_roots(prog), print_op)
+  let callee_funcirs = bm_nc_build_callee_funcirs(prog, pure_roots, print_op)
   let ci = 0
   while ci < list_len(callee_funcirs) do
     let funcirs = list_push(funcirs, list_get(callee_funcirs, ci))

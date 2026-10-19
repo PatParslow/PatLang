@@ -224,6 +224,40 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
     When it is built and run as a real, fully native executable
     Then the loop's result comes back and the caller continues
 
+  GitHub issue #215: every call site above, pure or not, paid the SAME
+  cost -- the callee's return value arrives wrapped in a heap-allocated
+  `[value, final_globals]` list, unpacked at the call site via two
+  separate `rt_list_get` calls, because Fork B's globals-threading is
+  unconditional (docs/plans/block-ownership-model.md 6, Fork B). Measured
+  directly comparing this against the pre-cutover lowerer: ~9x slower on
+  both recursive and flat function-call-heavy code, with a pure loop (no
+  calls at all) showing no difference -- confirming the call-with-return
+  wrapper itself, not something else, as the cost.
+
+  Fix: a function that never reads or writes `__globals`, directly or
+  through anything it calls (checked transitively, to a fixed point, over
+  the real call graph -- `bm_nc_compute_pure_fns`), skips the wrapper
+  entirely at BOTH ends of the call it's reached by: the callee's own
+  compiled FuncIR drops the trailing `__globals` parameter and returns its
+  value bare (no `BuildList`), and the call site drops the `Load
+  __globals` push `bm_lower_declared_call` always emits and the two
+  `rt_list_get` unpack calls, using the bare return value directly. A
+  function reached through `CallDynamic`, `apply`, `fiber_new`, or
+  `budgeted_run` -- where the actual callee is a runtime value, not a
+  compile-time name -- is conservatively never classified pure, since
+  nothing here can rule out what it might call. This is purely a native
+  x64 codegen decision: the canonical `BlockProgramIR` shape, `lower.
+  patlang`'s own output, and `interp.patlang`'s execution are completely
+  unchanged -- Fork B's actual guarantee (every block's own `__globals`
+  before and after it runs stays observably correct) still holds for
+  every function, impure functions are untouched, and only a fast-path
+  choice about machine code generation changes for provably pure ones.
+
+  Scenario: a function that never touches globals, directly or transitively, skips the globals wrapper entirely
+    Given a program with a pure function, a pure recursive function, an impure function, and a function that calls the impure one without touching globals itself
+    When it is built and run as a real, fully native executable
+    Then every function's output is exactly what the interpreter produces, AND the generated assembly shows the globals-unpack sequence only for the genuinely impure call sites, not the pure ones
+
   Scenario: apply with a runtime name and arguments dispatches natively
     Given a program using apply with two, one-statement and zero arguments
     When it is built and run as a real, fully native executable

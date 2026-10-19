@@ -174,6 +174,28 @@ echo "Scenario: bitwise Bin operators compile natively (issue #180)"
 OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/native_bitwise_ops.patlang issue180_bitwise 2>&1)
 check_seq "band=8, bor=14, bxor=6, shl=48, shr=6" "$OUT" "8 14 6 48 6"
 
+echo "Scenario: a function that never touches globals, directly or transitively, skips the globals wrapper entirely (issue #215)"
+OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/native_call_pure.patlang issue215_pure 2>&1)
+check_seq "double(3)+2=8, fact_r(5)=120, relay(1)=142, counter=41" "$OUT" "8 120 142 41"
+# Baseline (unoptimized): 23 total `call rt_list_get` -- 3 pure call
+# sites (double x1, fact_r x2: direct + self-recursive) each unpacking
+# [value, globals] via 2 calls (6 total), plus 17 from genuinely impure
+# call sites (relay, bumper) and GlobalGet/GlobalSet's OWN unrelated
+# internal use of rt_list_get to walk the globals assoc-list. A function
+# that never touches __globals, directly or transitively (checked via
+# bm_nc_compute_pure_fns over the real call graph), must skip the
+# wrapper at BOTH ends of its own call sites -- exactly 6 fewer calls
+# (the 3 pure call sites' own pairs), never the ones belonging to
+# GlobalGet/GlobalSet or to the genuinely impure relay/bumper.
+TOTAL_UNPACK=$(grep -c "call rt_list_get" self_hosting/build/issue215_pure.asm)
+if [ "$TOTAL_UNPACK" -eq 17 ]; then
+  echo "  ok: rt_list_get calls dropped from 23 to 17 -- exactly the 3 pure call sites' own pairs removed, nothing else"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL: expected exactly 17 rt_list_get calls after the purity fix (double/fact_r's own 6 removed from the 23 baseline), found $TOTAL_UNPACK"
+  FAIL=$((FAIL + 1))
+fi
+
 echo ""
 echo "tests: $PASS passed, $FAIL failed"
 if [ "$FAIL" -eq 0 ]; then
