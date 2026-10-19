@@ -207,6 +207,30 @@ pub fn host_vec_push(args: &[Value]) -> Result<Value, String> {
     Ok(Value::Unit)
 }
 
+pub fn host_vec_extend(args: &[Value]) -> Result<Value, String> {
+    // vec_extend(vec_id, list) -> appends every element of `list` to the
+    // vec in ONE bulk Rust-level call (extend_from_slice), not one
+    // host-call dispatch per element. Added alongside the Block
+    // Ownership Model perf investigation (2026-10-19): x64_pe_link.
+    // patlang's own chunk-merging loop called vec_push/list_push once
+    // per BYTE to build a ~531KB buffer, each call independently cheap
+    // but 531,125 of them dominating a --x64 compile's wall time
+    // regardless of host-call cost per se -- the real fix is fewer,
+    // bigger calls, not a faster single call.
+    let id = arg_usize(args, 0, "vec_extend")?;
+    let items: &[Value] = match args.get(1) {
+        Some(Value::List(xs)) => xs.as_ref(),
+        _ => return Err("vec_extend: expected a list as the second argument".into()),
+    };
+    VECS.with(|v| {
+        let mut b = v.borrow_mut();
+        let xs = b.get_mut(id).ok_or_else(|| format!("vec_extend: unknown vec {}", id))?;
+        xs.extend_from_slice(items);
+        Ok::<(), String>(())
+    })?;
+    Ok(Value::Unit)
+}
+
 pub fn host_vec_set(args: &[Value]) -> Result<Value, String> {
     let id = arg_usize(args, 0, "vec_set")?;
     let idx = arg_usize(args, 1, "vec_set")?;
@@ -3927,6 +3951,7 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("list_set", host_list_set);
     interp.host.insert("vec_new", host_vec_new);
     interp.host.insert("vec_push", host_vec_push);
+    interp.host.insert("vec_extend", host_vec_extend);
     interp.host.insert("vec_set", host_vec_set);
     interp.host.insert("vec_get", host_vec_get);
     interp.host.insert("vec_len", host_vec_len);

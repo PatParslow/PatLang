@@ -2985,6 +2985,25 @@ fn host_call_collections_handles_inner(name: &str, args: &[Value]) -> Result<Val
                 })?;
                 Ok(Value::Unit)
             }
+            "vec_extend" => {
+                // vec_extend(vec_id, list) -> appends every element of
+                // `list` in ONE bulk call (extend_from_slice), not one
+                // host-call dispatch per element. See hosts.rs's own
+                // host_vec_extend for the full rationale (2026-10-19
+                // Block Ownership Model perf investigation).
+                let id = arg_usize(&args, 0, "vec_extend")?;
+                let items: &[Value] = match args.get(1) {
+                    Some(Value::List(xs)) => xs.as_ref(),
+                    _ => return Err("vec_extend: expected a list as the second argument".into()),
+                };
+                VECS.with(|v| {
+                    let mut b = v.borrow_mut();
+                    let xs = b.get_mut(id).ok_or_else(|| format!("vec_extend: unknown vec {}", id))?;
+                    xs.extend_from_slice(items);
+                    Ok::<(), String>(())
+                })?;
+                Ok(Value::Unit)
+            }
             "vec_set" => {
                 let id = arg_usize(&args, 0, "vec_set")?;
                 let idx = arg_usize(&args, 1, "vec_set")?;
@@ -3119,7 +3138,7 @@ fn host_call_collections_handles_inner(name: &str, args: &[Value]) -> Result<Val
 
 fn host_call_collections_handles(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match name {
-        "vec_new" | "vec_push" | "vec_set" | "vec_get" | "vec_len" | "vec_to_list" | "str_intern" | "sc_len" | "sc_code" | "sc_char" | "sc_substr" | "sb_new" | "sb_push" | "sb_str" => Some(host_call_collections_handles_inner(name, args)),
+        "vec_new" | "vec_push" | "vec_extend" | "vec_set" | "vec_get" | "vec_len" | "vec_to_list" | "str_intern" | "sc_len" | "sc_code" | "sc_char" | "sc_substr" | "sb_new" | "sb_push" | "sb_str" => Some(host_call_collections_handles_inner(name, args)),
         _ => None,
     }
 }

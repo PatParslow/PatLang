@@ -138,26 +138,57 @@ make a function called xpl_hash_bucket takes s, nbuckets returns idx
   return h % nbuckets
 end
 
+make a function called xpl_vec_lookup takes names_vec, values_vec, target returns v_or_false
+  let i = 0
+  let n = vec_len(names_vec)
+  while i < n do
+    if vec_get(names_vec, i) == target then
+      return vec_get(values_vec, i)
+    end
+    let i = i + 1
+  end
+  return false
+end
+
 make a function called xpl_build_index takes names, values returns index
   # ~8 names per bucket at the compiler bundle's own symbol count; the
   # bucket lists stay short enough that the residual per-bucket linear
   # scan is genuinely cheap, without allocating an absurd number of
   # empty lists for a small program.
+  #
+  # Each bucket is a vec_* handle (mutable, O(1)-amortized push), not a
+  # plain List. A plain List made this whole function O(n_buckets *
+  # n_symbols): list_set(bn, k, ...) copies the ENTIRE 4096-slot OUTER
+  # list on every single insertion (List's copy-on-write semantics),
+  # not just the one bucket being appended to. Confirmed as the
+  # dominant cost of EVERY --x64 compile, not just the self-hosted
+  # compiler's own ~330-function bundle this function's own header
+  # already profiled once before: a trivial, few-line user program pays
+  # the same ~100s+ cost here, since this scales with x64_runtime.obj's
+  # own total symbol count (tens of thousands), not the user program's
+  # size (confirmed via a live x64_build_status poll showing the build
+  # parked in "link-index-symbols" for the entire duration). Same
+  # List-in-a-hot-loop anti-pattern already documented for Strings
+  # (project CLAUDE.md's "String Building" section) and already fixed
+  # elsewhere for exactly this shape (bench_listbuild.patlang's own
+  # header) -- vec_* was already the established answer, just not
+  # applied here yet. Still deliberately not Dict, per this file's own
+  # header note just above.
   let nbuckets = 4096
-  let bn = []
-  let bv = []
+  let bn = vec_new()
+  let bv = vec_new()
   let b = 0
   while b < nbuckets do
-    let bn = list_push(bn, [])
-    let bv = list_push(bv, [])
+    vec_push(bn, vec_new())
+    vec_push(bv, vec_new())
     let b = b + 1
   end
   let n = to_num(list_len(names))
   let j = 0
   while j < n do
     let k = xpl_hash_bucket(names[j], nbuckets)
-    let bn = list_set(bn, k, list_push(bn[k], names[j]))
-    let bv = list_set(bv, k, list_push(bv[k], values[j]))
+    vec_push(vec_get(bn, k), names[j])
+    vec_push(vec_get(bv, k), values[j])
     let j = j + 1
   end
   return [bn, bv, nbuckets]
@@ -165,7 +196,7 @@ end
 
 make a function called xpl_index_lookup takes index, target returns v_or_false
   let k = xpl_hash_bucket(target, index[2])
-  return xpl_list_lookup(index[0][k], index[1][k], target)
+  return xpl_vec_lookup(vec_get(index[0], k), vec_get(index[1], k), target)
 end
 
 # ---- layout + link ----
@@ -186,40 +217,36 @@ make a function called x64_link takes chunks, import_spec, entry_symbol, out_pat
   # offset within the merged text/data/bss regions and every symbol's
   # ABSOLUTE offset within its section (not yet an RVA -- the section's
   # own RVA is only known after import-table size is decided below).
-  let merged_text = []
-  let merged_data = []
+  # merged_text/merged_data/all_symbols/all_relocs are vec_* handles, not
+  # plain Lists, and every chunk's own text/data bytes are copied in via
+  # vec_extend (one bulk call per chunk) rather than a per-byte loop.
+  # GitHub #75's own fix (inlining this loop instead of calling
+  # xa_emit_bytes once per chunk) addressed the OUTER per-chunk
+  # function-call cost; this addresses the INNER one-call-per-byte cost
+  # the same way, for the same reason (a CallHost dispatch per byte, not
+  # per chunk). This specific change was NOT the fix for the ~100-second
+  # --x64 compile-time regression investigated 2026-10-19 -- isolated
+  # standalone timing proved list_push/vec_push called 531K times takes
+  # a fraction of a second either way; the real cause, found by
+  # instrumenting further once this change alone didn't move the
+  # measured time at all, was list_contains_str's own linear scan a few
+  # dozen lines down (see its own comment there). Kept anyway: avoiding
+  # one host-call dispatch per byte of a ~531KB buffer is a real,
+  # independently worthwhile improvement, just not the dominant one here.
+  let merged_text = vec_new()
+  let merged_data = vec_new()
   let merged_bss = 0
-  let all_symbols = []
-  let all_relocs = []
+  let all_symbols = vec_new()
+  let all_relocs = vec_new()
   let ci = 0
   let cn = to_num(list_len(chunks))
   while ci < cn do
     let chunk = chunks[ci]
-    let text_base = to_num(list_len(merged_text))
-    let data_base = to_num(list_len(merged_data))
+    let text_base = vec_len(merged_text)
+    let data_base = vec_len(merged_data)
     let bss_base = merged_bss
-    # Appended INLINE rather than via xa_emit_bytes, for the same reason
-    # the relocation patching below is inline: handing the ACCUMULATING
-    # merged image to a function that appends and returns it copies the
-    # whole thing per call (GitHub #75). Here that is once per chunk
-    # against a list growing into the megabytes -- 535 chunks for the
-    # self-hosted compiler's own bundle. xa_emit_bytes itself is fine and
-    # stays in use elsewhere; it is passing a large accumulator across
-    # the boundary that is not.
-    let ct = chunk[1]
-    let ctn = to_num(list_len(ct))
-    let bi = 0
-    while bi < ctn do
-      let merged_text = list_push(merged_text, ct[bi])
-      let bi = bi + 1
-    end
-    let cd = chunk[2]
-    let cdn = to_num(list_len(cd))
-    let bi = 0
-    while bi < cdn do
-      let merged_data = list_push(merged_data, cd[bi])
-      let bi = bi + 1
-    end
+    vec_extend(merged_text, chunk[1])
+    vec_extend(merged_data, chunk[2])
     let merged_bss = merged_bss + chunk[3]
 
     # Real bug found (session 8, native-toolchain cutover): every chunk
@@ -270,10 +297,27 @@ make a function called x64_link takes chunks, import_spec, entry_symbol, out_pat
         let key = "$L" + ci + "$" + name
         let local_names = list_push(local_names, name)
       end
-      let all_symbols = list_push(all_symbols, [key, section, base + offset])
+      vec_push(all_symbols, [key, section, base + offset])
       let si = si + 1
     end
 
+    # Real bug found (2026-10-19, same investigation as the chunk-merge
+    # fix above): list_contains_str(local_names, target) below was a
+    # LINEAR SCAN over local_names, called once per RELOCATION -- for
+    # the runtime chunk specifically (tens of thousands of local symbols
+    # AND tens of thousands of relocations), that is tens of millions of
+    # string comparisons per --x64 compile, dominating the whole link
+    # step (confirmed via direct timing: ~98 of ~100 seconds, isolated
+    # precisely to this one loop). Completely unrelated to the chunk-
+    # merge/list_push issue above -- found only by instrumenting further
+    # once fixing that one didn't move the measured time at all. Fixed
+    # the same way xpl_build_index already fixes the equivalent problem
+    # for the full symbol table: index local_names ONCE per chunk,
+    # rather than linear-scanning it once per relocation. Values don't
+    # matter for a membership check -- local_names doubles as its own
+    # value list; xpl_index_lookup returning anything other than `false`
+    # means "found".
+    let local_names_index = xpl_build_index(local_names, local_names)
     let relocs = chunk[5]
     let ri = 0
     let rn = to_num(list_len(relocs))
@@ -289,10 +333,10 @@ make a function called x64_link takes chunks, import_spec, entry_symbol, out_pat
         let base = data_base
       end
       let target_key = target
-      if list_contains_str(local_names, target) then
+      if xpl_index_lookup(local_names_index, target) != false then
         let target_key = "$L" + ci + "$" + target
       end
-      let all_relocs = list_push(all_relocs, [section, base + offset, target_key, kind, addend])
+      vec_push(all_relocs, [section, base + offset, target_key, kind, addend])
       let ri = ri + 1
     end
     let ci = ci + 1
@@ -330,10 +374,10 @@ make a function called x64_link takes chunks, import_spec, entry_symbol, out_pat
   # confirmed directly. xpl_section_span floors at one page.
   let headers_size = xpl_round_up(1024, file_align)
   let text_rva = section_align
-  let text_size_raw = thunk_area_size + to_num(list_len(merged_text))
+  let text_size_raw = thunk_area_size + vec_len(merged_text)
   let text_size = xpl_round_up(text_size_raw, file_align)
   let data_rva = text_rva + xpl_section_span(text_size_raw, section_align)
-  let data_size_raw = to_num(list_len(merged_data))
+  let data_size_raw = vec_len(merged_data)
   let data_size = xpl_round_up(data_size_raw, file_align)
   let bss_rva = data_rva + xpl_section_span(data_size_raw, section_align)
   let bss_size_raw = merged_bss
@@ -516,9 +560,9 @@ make a function called x64_link takes chunks, import_spec, entry_symbol, out_pat
   let symtab_names = []
   let symtab_values = []
   let si = 0
-  let sn = to_num(list_len(all_symbols))
+  let sn = vec_len(all_symbols)
   while si < sn do
-    let sym = all_symbols[si]
+    let sym = vec_get(all_symbols, si)
     let name = sym[0]
     let section = sym[1]
     let offset = sym[2]
@@ -548,7 +592,7 @@ make a function called x64_link takes chunks, import_spec, entry_symbol, out_pat
   let unused_pidx = x64_build_progress("link-index-symbols", 0, to_num(list_len(symtab_names)))
   let symtab_index = xpl_build_index(symtab_names, symtab_values)
   let ri = 0
-  let rn = to_num(list_len(all_relocs))
+  let rn = vec_len(all_relocs)
   # Reported every 500 relocations rather than every one: enough
   # resolution to see the loop advancing (or not) on a build that takes
   # minutes, without paying a status update per iteration on the
@@ -562,7 +606,7 @@ make a function called x64_link takes chunks, import_spec, entry_symbol, out_pat
         x64_build_tick()
       end
     end
-    let reloc = all_relocs[ri]
+    let reloc = vec_get(all_relocs, ri)
     let section = reloc[0]
     let offset = reloc[1]
     let target = reloc[2]
@@ -608,7 +652,7 @@ make a function called x64_link takes chunks, import_spec, entry_symbol, out_pat
       let value_bytes = xa_int_to_bytes_le(image_base + target_rva + addend, 8)
       let bi = 0
       while bi < 8 do
-        let merged_data = list_set(merged_data, offset + bi, value_bytes[bi])
+        vec_set(merged_data, offset + bi, value_bytes[bi])
         let bi = bi + 1
       end
     else
@@ -617,7 +661,7 @@ make a function called x64_link takes chunks, import_spec, entry_symbol, out_pat
       let value_bytes = xa_int_to_bytes_le(value, 4)
       let bi = 0
       while bi < 4 do
-        let merged_text = list_set(merged_text, offset + bi, value_bytes[bi])
+        vec_set(merged_text, offset + bi, value_bytes[bi])
         let bi = bi + 1
       end
     end
@@ -639,17 +683,22 @@ make a function called x64_link takes chunks, import_spec, entry_symbol, out_pat
 
   let hdr = xpl_build_headers(headers_size, image_base, section_align, file_align,
     entry_rva, sizeof_image,
-    text_rva, text_size, thunk_area_size + to_num(list_len(merged_text)), text_file_offset,
+    text_rva, text_size, thunk_area_size + vec_len(merged_text), text_file_offset,
     data_rva, data_size, data_size_raw, data_file_offset,
     bss_rva, xpl_round_up(bss_size_raw, section_align),
     idata_rva, idata_size, idata_size_raw, idata_datadir_size, idata_file_offset,
     iat_region_start, iat_region_size)
 
+  # One conversion back to a plain List each, here at the very end where
+  # xa_emit_bytes needs List indexing -- a single O(n) copy, not one per
+  # byte, so none of the cost this whole function exists to avoid.
+  let merged_text_list = vec_to_list(merged_text)
+  let merged_data_list = vec_to_list(merged_data)
   let out = xpl_pad_to(hdr, headers_size)
   let out = xa_emit_bytes(out, thunks)
-  let out = xa_emit_bytes(out, merged_text)
+  let out = xa_emit_bytes(out, merged_text_list)
   let out = xpl_pad_to(out, headers_size + text_size)
-  let out = xa_emit_bytes(out, merged_data)
+  let out = xa_emit_bytes(out, merged_data_list)
   let out = xpl_pad_to(out, headers_size + text_size + data_size)
   let out = xa_emit_bytes(out, idata)
   let out = xpl_pad_to(out, headers_size + text_size + data_size + idata_size)
