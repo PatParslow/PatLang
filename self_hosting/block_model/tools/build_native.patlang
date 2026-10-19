@@ -24,6 +24,26 @@ include "../../lib/includes.patlang"
 include "../../lib/codegen_x64.patlang"
 include "../lower.patlang"
 include "../native_codegen.patlang"
+include "../patc_backend.patlang"
+
+# bm_patc_resolve_instrs (patc_backend.patlang) calls x64_name_in_list,
+# which is only ever defined in patc1_main.patlang itself (not a
+# library file) -- that file is never included here (it has its own
+# top-level CLI argument-parsing that would conflict with this script's
+# own), so this tiny, stable helper is copied directly instead, same
+# workaround needed when exercising patc_backend.patlang standalone for
+# any other reason.
+make a function called x64_name_in_list takes names, name returns yes
+  let n = names.length
+  let i = 0
+  while i < n do
+    if names[i] == name then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
 
 let args = argv()
 let src_path = list_get(args, 0)
@@ -37,7 +57,7 @@ let bm_prog = bm_lower_program(bm_ast)
 # "main" plus one real, separate FuncIR per event handler (see its own
 # header in native_codegen.patlang) -- not a single FuncIR as it did
 # before Emit existed.
-let funcirs = bm_to_real_funcir(bm_prog, "Call")
+let funcirs_unresolved = bm_to_real_funcir(bm_prog, "Call")
 
 make a function called bm_nc_read_names_file takes path returns names
   let raw = split_lines(read_file(path))
@@ -60,6 +80,21 @@ end
 # duplicate every entry in extern_names.
 let rt_names = bm_nc_read_names_file("self_hosting/build/x64_runtime.funcs")
 let extern_names = rt_names
+
+# Issue #219: this harness used to skip bm_patc_resolve_runtime_calls,
+# the step bm_patc_lower (the ordinary --x64 CLI's own path) always
+# applies -- a CallHost whose name the runtime actually defines becomes
+# a Call, with the same argument count and stack layout (see that
+# function's own header in patc_backend.patlang). Every existing
+# fixture through this harness happened to never call an external
+# runtime function directly by name, so the gap went unnoticed until
+# docs/plans/general-refcounting.md's own loop-handling increment
+# started inserting real rt_string_rc_dec calls into ordinary block-
+# model test fixtures (tailapp, issue #180) -- confirmed directly: that
+# fixture failed with "codegen_x64: unsupported primitive... not in the
+# OS-boundary allowlist: rt_string_rc_dec" before this fix, the exact
+# symptom this issue predicted.
+let funcirs = bm_patc_resolve_runtime_calls(funcirs_unresolved, rt_names)
 
 let program_ir = ["ProgramIR", "main", funcirs, []]
 let asm = emit_program_x64(program_ir, false, extern_names)

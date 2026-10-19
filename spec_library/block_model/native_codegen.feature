@@ -481,6 +481,41 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
       in the same run: the printed sequence matches exactly, and the
       real heap shows exactly zero growth after warm-up.
 
+  Scenario: a string built and discarded inside a real while loop is decremented at the loop's own back-edge but not its exit (docs/plans/general-refcounting.md, Phase 2, loop increment)
+    Given a while loop (always modeled as a multi-block closure in this
+      project's own architecture -- a head block, here combined with
+      the body, connected to itself via a back-edge JumpBlock and to an
+      exit block via another) that builds a string fresh each iteration
+      via a known producer, uses it for nothing, and never forwards it
+      -- called through the ordinary --x64 CLI for 50000 real
+      iterations
+    When bm_nc_raw_block_index_dominates (native_codegen.patlang) is
+      asked, independently, whether the string's own creation point
+      dominates the back-edge exit and whether it dominates the
+      loop-exit exit
+    Then it says yes for the back-edge (reached only by running the
+      loop body, which always creates the string first) and no for the
+      loop-exit (reached directly by the condition's own JumpIfFalse,
+      which skips the body -- and the string's own creation -- entirely
+      when the loop is about to end). A decrement is inserted before the
+      back-edge but not the loop-exit -- checking dominance against
+      EVERY exit uniformly, the way the single-block passes do, would
+      reject this candidate outright, since it can never dominate the
+      loop-exit path by construction; checking each exit independently
+      is what makes this the single biggest real-world case this whole
+      plan has targeted (strings built and discarded inside a loop)
+      actually work. The real heap shows exactly zero growth across all
+      50000 iterations.
+      Found and fixed building this, not designed around in advance: a
+      pre-existing, previously low-impact gap (issue #219 -- block-
+      model's own build_native.patlang test harness never called bm_
+      patc_resolve_runtime_calls the way the ordinary CLI's own bm_
+      patc_lower does) became a REAL failure the moment this increment
+      started inserting genuine rt_string_rc_dec calls into existing
+      block-model fixtures (tailapp, issue #180) -- fixed directly
+      rather than worked around again, since it was now blocking real
+      test infrastructure, not just a hypothetical gap.
+
   Scenario: apply with a runtime name and arguments dispatches natively
     Given a program using apply with two, one-statement and zero arguments
     When it is built and run as a real, fully native executable

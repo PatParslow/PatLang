@@ -1852,6 +1852,356 @@ make a function called bm_nc_insert_string_rc_decs takes root, instrs returns ou
   return out
 end
 
+# docs/plans/general-refcounting.md, Phase 2: loops. A multi-block
+# closure (while loops are ALWAYS modeled this way in this project's own
+# architecture -- a head block, a body, an exit, connected via
+# JumpBlock) needs its OWN per-block version of everything above,
+# applied to each RAW block independently, BEFORE bm_nc_flatten_blocks
+# runs (not after -- JumpBlock is still a single, explicit instruction
+# at this stage, with its own forwarded-names list right there to read;
+# bm_nc_flatten_blocks has already destructively expanded it into a
+# Store-per-param sequence plus a plain Jump by the time the single-
+# block pass above runs, with no instruction left that still says "this
+# is a JumpBlock" at all).
+#
+# Scoped deliberately narrow for this first increment: the whole
+# PROGRAM must contain zero closures anywhere (bm_closure_blocks empty,
+# the same check bm_nc_program_has_dynamic_dispatch already uses for a
+# different reason). Found and confirmed directly, not assumed: a raw
+# closure's own CREATION has no single "MakeClosure" opcode at this
+# level at all -- bm_lower_closure_expr emits Const "__closure" + one
+# Load per captured name + two BuildLists, which only gets recognized
+# and folded into a single "MakeClosure" instruction LATER, during
+# bm_nc_translate_block_instrs's own translation (too late for this raw
+# pass to see). Reliably detecting "is this Load part of a closure's
+# own capture list" at the raw level would need pattern-matching that
+# specific Const/Load/BuildList sequence, not a single opcode check --
+# deferred rather than risked in this increment; bailing out whenever
+# ANY closure exists anywhere in the program is conservative, not
+# unsafe, matching this plan's own established shape for every
+# increment so far.
+make a function called bm_nc_program_has_any_closures takes prog returns yes
+  return list_len(get("__vars", "bm_closure_blocks")) > 0
+end
+
+# Every name appearing in ANY JumpBlock's own forwarded-params list,
+# anywhere in a block's raw instrs -- a name forwarded this way must
+# survive into the target block, so this pass must never decrement it
+# in the source block at all, regardless of whether it would otherwise
+# dominate every exit.
+make a function called bm_nc_raw_jumpblock_forwarded_names takes instrs returns names
+  let names = []
+  let n = list_len(instrs)
+  let i = 0
+  while i < n do
+    let instr = list_get(instrs, i)
+    if list_get(instr, 0) == 974555 then # "JumpBlock"
+      let forwarded = list_get(instr, 2)
+      let fi = 0
+      while fi < list_len(forwarded) do
+        let names = list_push(names, list_get(forwarded, fi))
+        let fi = fi + 1
+      end
+    end
+    let i = i + 1
+  end
+  return names
+end
+
+# Every ReturnValue (131889) or JumpBlock (974555) index in a block's
+# raw instrs -- both count as "this block is finished" for a LOCAL
+# candidate's own liveness purposes: a JumpBlock that doesn't forward
+# the candidate (bm_nc_raw_jumpblock_forwarded_names already excludes
+# anything that DOES) means nothing on the other side of it can ever
+# read this block's own copy of that local again, exactly like a real
+# return does.
+make a function called bm_nc_raw_block_exit_indices takes instrs returns indices
+  let indices = []
+  let n = list_len(instrs)
+  let i = 0
+  while i < n do
+    let op = list_get(list_get(instrs, i), 0)
+    if (op == 131889) or (op == 974555) then # "ReturnValue" or "JumpBlock"
+      let indices = list_push(indices, i)
+    end
+    let i = i + 1
+  end
+  return indices
+end
+
+# Same dominance condition as bm_nc_local_dominates_all_terminals, at
+# the raw (op-hash) level instead of the flat (string-op) level: `p`
+# strictly before every exit, and no Jump(212209)/JumpIfFalse(34716)
+# positioned before `p` targets an index after it.
+# Every instruction index reachable from `start`, in a forward-jump-
+# only DAG (confirmed true of any single block's own raw instrs: no
+# loops are possible WITHIN one block, those always cross blocks via
+# JumpBlock -- see this whole section's own header), WITHOUT ever
+# passing through `avoid`. Treats ReturnValue (131889) and JumpBlock
+# (974555) as having no successor at all (both genuinely end this
+# block's own execution); Jump (212209) as unconditionally following
+# its target; JumpIfFalse (34716) as following EITHER its target OR the
+# next instruction (since we want every path THIS traversal could take,
+# to answer "could E be reached while avoiding P" honestly); anything
+# else as falling through to the next instruction. A plain worklist
+# (not recursion) to avoid any stack-depth concern on a large block.
+make a function called bm_nc_raw_reaches_avoiding takes instrs, avoid, start returns visited
+  let n = list_len(instrs)
+  let visited = []
+  let worklist = [start]
+  let wi = 0
+  while wi < list_len(worklist) do
+    let idx = list_get(worklist, wi)
+    if (idx != avoid) and (idx >= 0) and (idx < n) and (not bm_list_contains(visited, idx)) then
+      let visited = list_push(visited, idx)
+      let instr = list_get(instrs, idx)
+      let op = list_get(instr, 0)
+      if op == 212209 then # "Jump"
+        let worklist = list_push(worklist, list_get(instr, 1))
+      elif op == 34716 then # "JumpIfFalse"
+        let worklist = list_push(worklist, list_get(instr, 1))
+        let worklist = list_push(worklist, idx + 1)
+      elif (op == 131889) or (op == 974555) then # "ReturnValue" or "JumpBlock" -- true dead end
+        let unused_terminal = 0
+      else
+        let worklist = list_push(worklist, idx + 1)
+      end
+    end
+    let wi = wi + 1
+  end
+  return visited
+end
+
+# `p` dominates `e` (every path from this block's own entry to `e`
+# passes through `p`) exactly when `e` is NOT reachable while avoiding
+# `p`. Checked per (candidate, exit) PAIR, not once per candidate
+# against every exit at once -- a real correctness gap found and fixed
+# building this, not designed around in advance: requiring universal
+# dominance over every exit rejected a local created INSIDE a loop
+# body's own guarded region outright, since the loop's own "condition
+# false, skip the body entirely" exit path can never have created it by
+# construction -- that's not a reason to refuse the DIFFERENT exit path
+# (the back-edge, reached only by running the body) where it plainly IS
+# safe. Confirmed directly: `let s = chr(i)` inside `while i < n do ...
+# end` has its own Store at index 6, dominates the back-edge exit at 19
+# (nothing else can reach 19 without passing through 6) but not the
+# loop-exit at 24 (reached directly via the condition's own
+# JumpIfFalse, which skips 6 entirely) -- exactly the two different
+# answers this function needs to give for the SAME candidate.
+make a function called bm_nc_raw_block_index_dominates takes instrs, p, e returns yes
+  let reached = bm_nc_raw_reaches_avoiding(instrs, p, 0)
+  return not bm_list_contains(reached, e)
+end
+
+# How many instructions get inserted at a given raw exit index for
+# THESE specific (already pre-filtered to "dominates this exit")
+# eligible names -- one triple per name, except (at a ReturnValue exit
+# specifically) whichever one is the value actually being returned
+# right there. A JumpBlock exit never has this exception: anything
+# eligible here already excluded every forwarded name entirely
+# (bm_nc_raw_jumpblock_forwarded_names), so every remaining eligible
+# name is always safe to decrement before it.
+make a function called bm_nc_raw_rc_dec_count_at_exit takes instrs, idx, names_here returns count
+  let op = list_get(list_get(instrs, idx), 0)
+  let returned_name = ""
+  if op == 131889 then # "ReturnValue"
+    if idx > 0 then
+      let prev = list_get(instrs, idx - 1)
+      if list_get(prev, 0) == 277141 then # "Load"
+        let returned_name = list_get(prev, 1)
+      end
+    end
+  end
+  let count = 0
+  let ei = 0
+  while ei < list_len(names_here) do
+    if list_get(names_here, ei) != returned_name then
+      let count = count + 1
+    end
+    let ei = ei + 1
+  end
+  return count
+end
+
+# Raw-level counterpart of bm_nc_cumulative_shift_at -- same shape,
+# same reasoning (see that function's own header).
+make a function called bm_nc_raw_cumulative_shift_at takes exits, insert_counts, idx returns shift
+  let shift = 0
+  let ei = 0
+  while ei < list_len(exits) do
+    if list_get(exits, ei) <= idx then
+      let shift = shift + list_get(insert_counts, ei)
+    end
+    let ei = ei + 1
+  end
+  return shift
+end
+
+# The actual per-block rewrite: finds every eligible local LOCAL TO THIS
+# ONE BLOCK (direct producer provenance -- CallHost 700058 or Call
+# 938836 immediately followed by a Store 642543 -- exactly one such
+# Store in this block, never forwarded by any JumpBlock here) and, for
+# EACH of this block's own exits INDEPENDENTLY, inserts a decrement
+# immediately before it whenever this candidate's own creation point
+# dominates THAT SPECIFIC exit (bm_nc_raw_block_index_dominates) -- a
+# ReturnValue exit excepting the local actually being returned there, a
+# JumpBlock exit never excepting anything (forwarded names are already
+# excluded globally). A candidate need not dominate every exit to be
+# considered at all (see that function's own header for why requiring
+# that would make this pass inert for the most common loop-body shape).
+# Every existing Jump/JumpIfFalse target gets corrected for the shift,
+# same two-pass approach as the flat-level version and for the
+# identical reason (found there first: inserting instructions without
+# correcting existing jump targets sends them to the wrong place).
+# Returns `blk` completely unchanged if no eligible local is found in
+# it at all.
+make a function called bm_nc_rewrite_block_for_string_rc takes blk returns new_blk
+  let instrs = bi_block_instrs(blk)
+  let exits = bm_nc_raw_block_exit_indices(instrs)
+  if list_len(exits) == 0 then
+    return blk
+  end
+  let forwarded_names = bm_nc_raw_jumpblock_forwarded_names(instrs)
+  let n = list_len(instrs)
+  let eligible_names = []
+  let i = 0
+  while i < (n - 1) do
+    let instr = list_get(instrs, i)
+    let op = list_get(instr, 0)
+    if (op == 700058) or (op == 938836) then # "CallHost" or "Call"
+      let next = list_get(instrs, i + 1)
+      if list_get(next, 0) == 642543 then # "Store"
+        let name = list_get(next, 1)
+        if not bm_list_contains(forwarded_names, name) then
+          let store_count = 0
+          let sj = 0
+          while sj < n do
+            let sinstr = list_get(instrs, sj)
+            if (list_get(sinstr, 0) == 642543) and (list_get(sinstr, 1) == name) then
+              let store_count = store_count + 1
+            end
+            let sj = sj + 1
+          end
+          if store_count == 1 then
+            let eligible_names = list_push(eligible_names, name)
+          end
+        end
+      end
+    end
+    let i = i + 1
+  end
+  if list_len(eligible_names) == 0 then
+    return blk
+  end
+  # Per (exit, candidate): does this candidate's own store (p = store
+  # index) dominate THIS exit? Collected once up front so both the
+  # insert-count pass and the emission pass agree exactly.
+  let names_per_exit = []
+  let xi = 0
+  while xi < list_len(exits) do
+    let x = list_get(exits, xi)
+    let here = []
+    let ni = 0
+    while ni < list_len(eligible_names) do
+      let name = list_get(eligible_names, ni)
+      let p = 0 - 1
+      let sj = 0
+      while sj < n do
+        if (list_get(list_get(instrs, sj), 0) == 642543) and (list_get(list_get(instrs, sj), 1) == name) then
+          let p = sj
+        end
+        let sj = sj + 1
+      end
+      if bm_nc_raw_block_index_dominates(instrs, p, x) then
+        let here = list_push(here, name)
+      end
+      let ni = ni + 1
+    end
+    let names_per_exit = list_push(names_per_exit, here)
+    let xi = xi + 1
+  end
+  let insert_counts = []
+  let xi2 = 0
+  while xi2 < list_len(exits) do
+    let x = list_get(exits, xi2)
+    let names_here = list_get(names_per_exit, xi2)
+    let insert_counts = list_push(insert_counts, bm_nc_raw_rc_dec_count_at_exit(instrs, x, names_here) * 3)
+    let xi2 = xi2 + 1
+  end
+  # Bare, not pre-prefixed: this rewrite runs on RAW instrs, still ahead
+  # of bm_nc_translate_block_instrs's own translation step, which
+  # prefixes EVERY bare Store/Load name with this block's own name
+  # unconditionally (confirmed directly: pre-prefixing here doubled up,
+  # producing "__loop_head_0____loop_head_0____bm_string_rc_discard").
+  # "s"/"total"/"i" themselves are equally bare at this stage -- this
+  # discard name just needs to follow the same convention they do.
+  let discard_name = "__bm_string_rc_discard"
+  let out = []
+  let i2 = 0
+  while i2 < n do
+    let exit_pos = 0 - 1
+    let xi3 = 0
+    while xi3 < list_len(exits) do
+      if list_get(exits, xi3) == i2 then
+        let exit_pos = xi3
+      end
+      let xi3 = xi3 + 1
+    end
+    if exit_pos != (0 - 1) then
+      let names_here = list_get(names_per_exit, exit_pos)
+      let op_here = list_get(list_get(instrs, i2), 0)
+      let returned_name = ""
+      if op_here == 131889 then # "ReturnValue"
+        if i2 > 0 then
+          let prev = list_get(instrs, i2 - 1)
+          if list_get(prev, 0) == 277141 then # "Load"
+            let returned_name = list_get(prev, 1)
+          end
+        end
+      end
+      let ei = 0
+      while ei < list_len(names_here) do
+        let name = list_get(names_here, ei)
+        if name != returned_name then
+          let out = list_push(out, [277141, name]) # "Load"
+          let out = list_push(out, [700058, "rt_string_rc_dec", 1]) # "CallHost"
+          let out = list_push(out, [642543, discard_name]) # "Store"
+        end
+        let ei = ei + 1
+      end
+    end
+    let instr = list_get(instrs, i2)
+    let op = list_get(instr, 0)
+    if (op == 212209) or (op == 34716) then # "Jump" or "JumpIfFalse"
+      let target = list_get(instr, 1)
+      let new_target = target + bm_nc_raw_cumulative_shift_at(exits, insert_counts, target)
+      let out = list_push(out, [op, new_target])
+    else
+      let out = list_push(out, instr)
+    end
+    let i2 = i2 + 1
+  end
+  return ["BlockIR", bi_block_name(blk), bi_block_params(blk), out]
+end
+
+# Applies bm_nc_rewrite_block_for_string_rc to every block in a multi-
+# block closure, only when the whole program has zero closures anywhere
+# (bm_nc_program_has_any_closures) -- the scope this increment commits
+# to, see that function's own header for exactly why. Returns `cblocks`
+# completely unchanged otherwise.
+make a function called bm_nc_rewrite_multi_block_for_string_rc takes prog, cblocks returns new_cblocks
+  if bm_nc_program_has_any_closures(prog) then
+    return cblocks
+  end
+  let new_cblocks = []
+  let i = 0
+  while i < list_len(cblocks) do
+    let new_cblocks = list_push(new_cblocks, bm_nc_rewrite_block_for_string_rc(list_get(cblocks, i)))
+    let i = i + 1
+  end
+  return new_cblocks
+end
+
 make a function called bm_nc_build_callee_funcirs takes prog, roots, print_op returns funcirs
   let all_blocks = bi_program_blocks(prog)
   let abn = list_len(all_blocks)
@@ -1926,6 +2276,9 @@ make a function called bm_nc_build_callee_funcirs takes prog, roots, print_op re
       # native_check.patlang's own "100000 cycles stay flat" scenario
       # (previously failing for exactly bm_alloc/bm_freelist_pop/
       # bm_rc_dec's own multi-block shape) now passes with zero growth.
+    end
+    if list_len(cblocks) > 1 then
+      let cblocks = bm_nc_rewrite_multi_block_for_string_rc(prog, cblocks)
     end
     let flat = bm_nc_flatten_blocks(prog, cblocks, pure_init, print_op, flat_mode)
     if bm_nc_closure_is_single_block(cblocks) then

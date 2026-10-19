@@ -365,18 +365,116 @@ exactly (ruling out a too-early decrement corrupting the read) and the
 heap shows exactly zero growth after warm-up (ruling out a too-late
 one).
 
+**Phase 2's loop increment: the single biggest real-world win this
+plan has targeted.** A `while` loop is always modeled as a multi-block
+closure in this project's own architecture (a head block, a body, an
+exit, connected via `JumpBlock`), and JumpBlock is a single, explicit,
+still-intact instruction only at the RAW (pre-flatten) level -- by the
+time `bm_nc_flatten_blocks` runs, it has been destructively expanded
+into a Store-per-forwarded-param sequence plus a plain Jump, with
+nothing left that still says "this is a JumpBlock" at all. So this
+increment's whole mechanism runs EARLIER and operates PER BLOCK
+(`bm_nc_rewrite_block_for_string_rc`), not on the already-flattened
+function the single-block passes use -- a genuinely new pipeline stage,
+not a generalization of the existing one.
+
+Scoped deliberately narrow for this first pass: the whole PROGRAM must
+contain zero closures anywhere (`bm_nc_program_has_any_closures`, the
+same `bm_closure_blocks` check `bm_nc_program_has_dynamic_dispatch`
+already uses for a different reason). Confirmed directly, not assumed:
+a raw closure's own creation has no single `MakeClosure` opcode at this
+level at all -- `bm_lower_closure_expr` emits `Const "__closure"` plus
+one `Load` per captured name plus two `BuildList`s, only recognized and
+folded into a single `MakeClosure` instruction LATER, during
+`bm_nc_translate_block_instrs`'s own translation (too late for this raw
+pass to see). Reliably detecting "is this Load part of a closure's own
+capture list" at the raw level would need pattern-matching that
+specific instruction sequence, not a single opcode check -- deferred
+rather than risked in this increment.
+
+**A real, significant correctness gap found building this, not
+designed around in advance: requiring a candidate to dominate EVERY
+exit uniformly (the same shape the single-block passes already use)
+makes this pass completely inert for the single most common loop-body
+shape.** A loop's own "condition false, exit the loop" path is, BY
+CONSTRUCTION, reached without ever running the loop body -- so anything
+created inside the body, including the most ordinary "build a string
+each iteration and discard it" case this whole plan exists for, can
+NEVER dominate that exit. Confirmed directly with the motivating
+example: `let s = chr(i)` inside `while i < n do ... end` has its own
+Store at index 6, dominates the loop's own back-edge exit at index 19
+(nothing else can reach 19 without passing through 6) but NOT the
+loop-exit at index 24 (reached directly via the condition's own
+`JumpIfFalse`, which skips 6 entirely). Fixed by checking dominance per
+(candidate, exit) PAIR instead of once per candidate against every
+exit: a genuine graph reachability computation
+(`bm_nc_raw_reaches_avoiding`, an iterative worklist BFS over the
+block's own forward-jump-only instruction graph -- confirmed no loops
+are possible WITHIN one block at all, those always cross blocks via
+JumpBlock, so a worklist over a finite DAG terminates cleanly), not the
+simpler position-and-skip heuristic the single-block passes still use
+(noted below as a found-but-deferred improvement opportunity there
+too). A decrement gets inserted before exactly the exits a candidate
+actually dominates, never the ones it doesn't.
+
+Two further bugs found and fixed verifying this, both caught before
+committing, neither by re-reading the code a second time:
+- The discard-local's own name was being double-prefixed
+  (`__loop_head_0____loop_head_0____bm_string_rc_discard`): this
+  rewrite runs on RAW instrs, still ahead of `bm_nc_translate_block_
+  instrs`'s own translation step, which prefixes every bare Store/Load
+  name with the block's own name unconditionally -- pre-prefixing here
+  (the way the flat-level pass correctly does, at ITS OWN, later,
+  already-prefixed stage) doubled it up. Fixed by using the same bare
+  name convention every other raw local (`s`, `total`, `i`) already
+  follows at this stage.
+- Issue #219 (a previously low-impact, filed-but-not-fixed gap:
+  `build_native.patlang`'s own test harness never called `bm_patc_
+  resolve_runtime_calls`, the step the ordinary CLI's own `bm_patc_
+  lower` always applies) went from hypothetical to a real, confirmed
+  failure the moment this increment started inserting genuine `rt_
+  string_rc_dec` calls into an EXISTING block-model fixture (`tailapp`,
+  issue #180) -- fixed directly rather than worked around again, since
+  it was now blocking real test infrastructure, not just a planned-for
+  gap. A second, smaller gap surfaced fixing that one: `patc_backend
+  .patlang`'s own `bm_patc_resolve_instrs` calls `x64_name_in_list`,
+  defined only in `patc1_main.patlang` itself (never included here, its
+  own top-level CLI parsing would conflict) -- the same tiny, stable
+  helper this plan's own diagnostic driver already had to copy
+  separately, copied into `build_native.patlang` too.
+
+Verified with an IR dump first (manually traced every instruction
+index by hand against the actual jump targets, not just glanced at --
+confirmed the back-edge Jump still correctly targets index 13 and the
+loop-exit's own `JumpIfFalse` correctly lands on index 40, exactly where
+the loop-exit-forwarding sequence begins, with zero extra instructions
+in between), then with a real native fixture: 50,000 genuine `while`-
+loop iterations, each building and discarding a string, exactly zero
+heap growth.
+
+**A found-but-deferred improvement opportunity, noted for a future
+session, not attempted here:** the single-block passes (increments one
+through four) still require a candidate to dominate EVERY terminal
+uniformly, using the simpler position-and-skip heuristic rather than
+this increment's own proper reachability computation. The exact same
+gap this increment just fixed for loops almost certainly also applies
+there (a string created inside one `if`-branch, used only within it,
+with a DIFFERENT branch's own early return that never created it,
+would be rejected outright today) -- not attempted in this same pass,
+since the single-block passes are already proven and working, and
+retrofitting them is a separate, additional risk with its own
+verification burden, not a free side effect of this one.
+
 **Not yet started:** list/dict-element storage; locals that are
-reassigned (more than one `Store`); and loops (closures spanning more
-than one block, via `JumpBlock`) -- the single biggest remaining real-
-world gap, and the riskiest, since it touches the same inter-block
-`JumpBlock`/liveness territory where issues #215 and #216 both found
-real bugs. Deliberately not attempted in the same pass as the
-increments above.
+reassigned (more than one `Store`); and the closures exclusion this
+loop increment itself deferred (detecting a raw closure's own capture
+list reliably, to lift the "zero closures anywhere in the program"
+restriction).
 
 **Checkpoint:** both the generalized-allocator proof (above) and the
 free-list fast-path's own genuine reachability are confirmed, not
 assumed -- `refcounted_heap_native_check.patlang`'s full suite (13/13)
-and `native_codegen_check.sh`'s full suite (38/38) both pass.
+and `native_codegen_check.sh`'s full suite (46/46) both pass.
 
 ---
 

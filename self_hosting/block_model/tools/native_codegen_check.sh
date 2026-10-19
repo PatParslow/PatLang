@@ -281,6 +281,17 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+echo "Scenario: a string built and discarded inside a real while loop is decremented at the loop's own back-edge but not its exit (general-refcounting.md Phase 2, loop increment)"
+rm -f self_hosting/build/native_string_rc_dec_loop.exe
+BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_string_rc_dec_loop.patlang self_hosting/build/native_string_rc_dec_loop.exe --x64 2>&1)
+if [ -f self_hosting/build/native_string_rc_dec_loop.exe ]; then
+  OUT=$(./self_hosting/build/native_string_rc_dec_loop.exe 2>&1)
+  check_seq "50000 real while-loop iterations, each building and discarding a string, cause exactly zero heap growth" "$OUT" "result= 50000 growth= 0"
+else
+  echo "  FAIL: the loop fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
 echo ""
 echo "tests: $PASS passed, $FAIL failed"
 if [ "$FAIL" -eq 0 ]; then
