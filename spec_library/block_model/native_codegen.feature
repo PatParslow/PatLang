@@ -258,10 +258,9 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
     When it is built and run as a real, fully native executable
     Then every function's output is exactly what the interpreter produces, AND the generated assembly shows the globals-unpack sequence only for the genuinely impure call sites, not the pure ones
 
-  Scenario: a single-block pure function's entry seed is dropped too, not just its external calling convention (issue #216, follow-up to #215)
-    Given a pure, branch-free function (one block, so no internal JumpBlock
-      could ever thread "__globals" between two of its own blocks) called
-      many times in a loop
+  Scenario: a pure function's internal __globals forwarding, and its entry seed, are both dropped -- single-block or multi-block (issue #216, follow-up to #215)
+    Given a pure, branch-free function (one block) called many times in a
+      loop
     When it is built and run as a real, fully native executable, reading
       the real heap's own bump-pointer high-water mark before and after
       the loop
@@ -275,13 +274,20 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
       docs/plans/general-refcounting.md's own foundational assumption
       that the refcounted heap's existing "many alloc+drop cycles stay
       flat" guarantee (refcounted_heap_native_check.patlang) still held.
-      A MULTI-block pure function (one with its own if/while) still pays
-      this cost -- BOM's own universal "every block forwards __globals"
+      A MULTI-block pure function (one with its own if/while) paid this
+      cost too -- BOM's own universal "every block forwards __globals"
       convention (Fork B) threads it between a pure root's OWN internal
-      blocks unconditionally, same as before -- tracked separately as a
-      deeper, riskier fix (dropping that internal forwarding too, not
-      just the entry seed and the external calling convention) rather
-      than bundled into this narrower, zero-risk one.
+      blocks unconditionally, regardless of purity -- closed by making
+      every internal JumpBlock within a pure root's own closure drop
+      "__globals" from its forwarded params and pop the single Load that
+      fed it (lower.patlang always emits exactly one such Load
+      immediately before any JumpBlock/Call, the same invariant the
+      external Call-site fix already relies on). With that in place the
+      entry seed became unconditionally unnecessary for any pure root,
+      not just single-block ones, and refcounted_heap_native_check.
+      patlang's own "100000 cycles stay flat" scenario -- regressed by
+      #215, exercising exactly this multi-block shape via bm_alloc/
+      bm_freelist_pop/bm_rc_dec -- now passes again.
 
   Scenario: apply with a runtime name and arguments dispatches natively
     Given a program using apply with two, one-statement and zero arguments

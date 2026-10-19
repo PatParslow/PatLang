@@ -773,6 +773,58 @@ make a function called bm_nc_translate_block_instrs takes block_name, instrs, pr
       let target_name = list_get(instr, 1)
       let param_names = list_get(instr, 2)
       let pn = list_len(param_names)
+      # Issue #216 (full fix, follow-up to the entry-seed-only fix above):
+      # BOM's own universal convention (lower.patlang) appends "__globals"
+      # as the LAST entry of EVERY JumpBlock's own param list, and ALWAYS
+      # emits exactly one ["Load", "__globals"] immediately before the
+      # JumpBlock to feed it -- confirmed by reading every JumpBlock
+      # emission site in lower.patlang, not assumed. For a pure root this
+      # is dead weight purely at the codegen level: the forwarded value is
+      # never semantically read by anything (GlobalGet/GlobalSet, the only
+      # things that would read it, are exactly what disqualifies purity in
+      # the first place), yet the Store sequence below still required the
+      # entry seed above to exist so this Store has something to target.
+      # Dropping "__globals" from param_names here, and popping the single
+      # Load that fed it, removes the need for that seed entirely for a
+      # root whose closure is nothing BUT such internal forwards -- the
+      # exact same "drop the one entry that fed this, right before it"
+      # shape the Call case below already uses for the EXTERNAL calling
+      # convention. Guarded by checking the Load is really there (prove it
+      # or fall back, never assume): anything else preceding a JumpBlock in
+      # a pure closure would mean this specific invariant doesn't hold here
+      # and the safe, unoptimized path still applies.
+      let pure_trim = false
+      if mode == "callee_pure" then
+        if pn > 0 then
+          if list_get(param_names, pn - 1) == "__globals" then
+            if list_len(out) > 0 then
+              let last_out = list_get(out, list_len(out) - 1)
+              if list_get(last_out, 0) == "Load" then
+                if list_get(last_out, 1) == bm_nc_prefix(block_name, "__globals") then
+                  let pure_trim = true
+                end
+              end
+            end
+          end
+        end
+      end
+      if pure_trim then
+        let trimmed_params = []
+        let tj = 0
+        while tj < (pn - 1) do
+          let trimmed_params = list_push(trimmed_params, list_get(param_names, tj))
+          let tj = tj + 1
+        end
+        let param_names = trimmed_params
+        let pn = list_len(param_names)
+        let trimmed_out = []
+        let oj = 0
+        while oj < (list_len(out) - 1) do
+          let trimmed_out = list_push(trimmed_out, list_get(out, oj))
+          let oj = oj + 1
+        end
+        let out = trimmed_out
+      end
       let j = pn - 1
       while j >= 0 do
         let out = list_push(out, ["Store", bm_nc_prefix(target_name, list_get(param_names, j))])
@@ -1555,26 +1607,37 @@ make a function called bm_nc_build_callee_funcirs takes prog, roots, print_op re
         let ti = ti + 1
       end
       let params_to_use = trimmed
-      # Issue #216 follow-up to #215: the seed above exists ONLY to give
-      # an internal JumpBlock something to forward when this root's own
+      # Issue #216 (full fix, follow-up to #215, and to this fix's own
+      # first, narrower attempt): the seed above existed ONLY to give an
+      # internal JumpBlock something to forward when this root's own
       # closure has more than one block (a loop body/exit, for example --
-      # see the comment above this one for why that's needed at all). A
-      # root whose closure is a single block has no internal JumpBlock,
-      # so nothing can ever read this seed -- confirmed directly: every
-      # such function still unconditionally ran `[BuildList, 0]`, a REAL
-      # `call rt_heap_alloc(64)` (x64_buildlist_asm, codegen_x64.patlang)
-      # on EVERY call, never reclaimed, for a value nothing referenced.
-      # Found chasing why refcounted_heap_native_check.patlang's own
-      # "100000 cycles stay flat" scenario started failing: a function as
-      # trivial as `let r = x + 1; return r` leaked exactly 64 bytes per
-      # call (verified with a from-scratch minimal repro, zero includes),
-      # and every heap.patlang helper -- none of which touch a real
-      # global -- paid it too, compounding across nested pure-call
-      # chains. Single-block closures are the common case for ordinary
-      # leaf functions, so this was not a narrow corner case.
-      if list_len(cblocks) > 1 then
-        let pure_init = [["BuildList", 0], ["Store", bm_nc_prefix(root, "__globals")]]
-      end
+      # see the comment above this one for why that seemed needed at
+      # all). An EARLIER version of this fix made the seed conditional on
+      # `list_len(cblocks) > 1`, closing the single-block case (a real,
+      # confirmed `rt_heap_alloc(64)` per call via `[BuildList, 0]`,
+      # x64_buildlist_asm/codegen_x64.patlang) but leaving multi-block
+      # pure functions (bm_alloc/bm_freelist_pop/bm_rc_dec, each with
+      # their own if) still paying it, since BOM's own universal "every
+      # block forwards __globals to the next" convention (lower.patlang)
+      # threads it between a pure root's OWN internal blocks
+      # unconditionally, regardless of purity.
+      #
+      # The REAL fix is in bm_nc_translate_block_instrs's own JumpBlock
+      # case, just above bm_nc_flatten_blocks in this file: for a pure
+      # root, EVERY internal JumpBlock now drops "__globals" from its own
+      # forwarded param list and pops the single Load that fed it
+      # (lower.patlang always emits exactly one ["Load", "__globals"]
+      # immediately before any JumpBlock/Call, so nothing else can have
+      # been appended to `out` in between -- the same invariant the Call
+      # case below already relies on for the EXTERNAL calling
+      # convention). With that in place, NOTHING in a pure root's closure
+      # ever Loads or Stores a "..._globals" local anymore, at any block,
+      # for any root shape -- so the entry seed is now provably
+      # unnecessary unconditionally, not just for single-block roots.
+      # Confirmed, not assumed: self_hosting/block_model/refcounted_heap_
+      # native_check.patlang's own "100000 cycles stay flat" scenario
+      # (previously failing for exactly bm_alloc/bm_freelist_pop/
+      # bm_rc_dec's own multi-block shape) now passes with zero growth.
     end
     let flat = bm_nc_flatten_blocks(prog, cblocks, pure_init, print_op, flat_mode)
     let params = []
