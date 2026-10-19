@@ -87,6 +87,26 @@ end
 # running a SECOND full batch after warm-up and checking it adds nothing at
 # all -- if the free list weren't actually being reused, this second batch
 # would show the same growth as a from-scratch batch, not zero.
+#
+# KNOWN FAILING as of issue #216 (filed; see its own tracking for current
+# status), found re-verifying this exact claim while scoping docs/plans/
+# general-refcounting.md: bm_alloc/bm_freelist_pop/bm_rc_dec each contain
+# their own if-branch, so each is a MULTI-block closure under the Block
+# Ownership Model's native codegen -- and Fork B's own universal "every
+# block forwards __globals to the next" convention threads a __globals
+# value between a pure function's OWN internal blocks unconditionally,
+# even though nothing in a pure function ever reads it. #216's own fix
+# (native_codegen.patlang) removed this entry seed for SINGLE-block pure
+# functions, where it is provably dead (confirmed: self_hosting/block_
+# model/spec_fixtures/native_call_pure_no_leak.patlang shows exactly zero
+# growth over 2000 calls) -- but a multi-block pure function like the
+# three below still pays one real, unreclaimed rt_heap_alloc(64) per call,
+# a smaller but still nonzero regression from the SAME source. Fully
+# closing this needs a deeper change (dropping __globals from a pure
+# root's OWN internal JumpBlock forwarding, not just its entry seed and
+# external calling convention) -- correctly left failing here rather than
+# weakened, since the original claim is real and should eventually hold
+# again in full.
 let blk_warm = bm_alloc(24)
 bm_rc_dec(blk_warm, 24)
 let after_warmup = bm_bytes_bumped()
@@ -114,6 +134,64 @@ end
 # Scenario: mutation at refcount 2 is not safe in place
 bm_rc_inc(blk3)
 if nc_check_eq("mutation at refcount 2 reports clone first", bm_rc_touch_for_mutation(blk3), 0) then
+  let g_pass = g_pass + 1
+else
+  let g_fail = g_fail + 1
+end
+
+# Scenario: the mechanism is already payload-shape-agnostic, not Box-specific
+# (docs/plans/general-refcounting.md, Phase 1). A 3-field packed struct --
+# [tag:8][len:8][extra:8], 24 bytes, a shape Box never uses (Box is one
+# field) -- allocated/shared/dropped/reclaimed through bm_alloc/bm_rc_inc/
+# bm_rc_dec/bm_rc_touch_for_mutation with ZERO new or modified allocator
+# code. Uses mem_peek_qword/mem_poke_qword directly on the payload (standing
+# in for whatever real accessor a String/List type would define) precisely
+# BECAUSE bm_box_read/bm_box_write are Box-specific and deliberately not
+# used here -- the claim under test is that nothing below the box-specific
+# accessors cares about payload shape at all.
+let shape_blk1 = bm_alloc(24)
+mem_poke_qword(shape_blk1, 0, 777)
+mem_poke_qword(shape_blk1, 8, 3)
+mem_poke_qword(shape_blk1, 16, 42)
+if nc_check_eq("non-Box 3-field shape: fresh allocation starts at refcount 1", bm_rc_get(shape_blk1), 1) then
+  let g_pass = g_pass + 1
+else
+  let g_fail = g_fail + 1
+end
+
+bm_rc_inc(shape_blk1)
+if nc_check_eq("non-Box shape: copying a reference increments the refcount", bm_rc_get(shape_blk1), 2) then
+  let g_pass = g_pass + 1
+else
+  let g_fail = g_fail + 1
+end
+
+bm_rc_dec(shape_blk1, 24)
+if nc_check_eq("non-Box shape: dropping one of two references leaves refcount at 1, fields intact", mem_peek_qword(shape_blk1, 0), 777) then
+  let g_pass = g_pass + 1
+else
+  let g_fail = g_fail + 1
+end
+
+bm_rc_dec(shape_blk1, 24)
+let shape_blk2 = bm_alloc(24)
+if nc_check_eq("non-Box shape: dropping the last reference makes the block reusable (same address reused)", shape_blk2, shape_blk1) then
+  let g_pass = g_pass + 1
+else
+  let g_fail = g_fail + 1
+end
+
+mem_poke_qword(shape_blk2, 0, 1)
+mem_poke_qword(shape_blk2, 8, 1)
+mem_poke_qword(shape_blk2, 16, 1)
+if nc_check_eq("non-Box shape: mutation at refcount 1 reports in place", bm_rc_touch_for_mutation(shape_blk2), 1) then
+  let g_pass = g_pass + 1
+else
+  let g_fail = g_fail + 1
+end
+
+bm_rc_inc(shape_blk2)
+if nc_check_eq("non-Box shape: mutation at refcount 2 reports clone first", bm_rc_touch_for_mutation(shape_blk2), 0) then
   let g_pass = g_pass + 1
 else
   let g_fail = g_fail + 1

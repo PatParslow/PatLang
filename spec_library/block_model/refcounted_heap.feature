@@ -43,3 +43,19 @@ Feature: standalone reference-counted heap (Block Ownership Model, Fork D)
     Given a block with refcount 2
     When a mutating operation is attempted
     Then the ownership check reports "clone first"
+
+  Scenario: the mechanism is already payload-shape-agnostic, not Box-specific
+    Given this phase's own allocate/share/drop/reclaim functions (bm_alloc,
+      bm_rc_inc, bm_rc_dec, bm_rc_touch_for_mutation) take only a byte size,
+      never a payload shape -- only bm_box_read/bm_box_write assume Box's
+      single-8-byte-cell layout, and nothing else in this file does
+    When a multi-field payload shaped nothing like Box (three packed fields
+      at a size Box itself never uses) is allocated, shared, dropped, and
+      reclaimed through the exact same functions, with no new or modified
+      allocator code
+    Then sharing, dropping, and reclamation all behave identically to Box's
+      own scenarios above, at the new shape's own size class, proving
+      docs/plans/general-refcounting.md's Phase 1 ("generalize the
+      allocator") is already satisfied by the existing mechanism -- the
+      real remaining work is wiring a real type to it, not building a new
+      generalized allocator

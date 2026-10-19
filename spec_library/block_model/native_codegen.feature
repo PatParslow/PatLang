@@ -258,6 +258,31 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
     When it is built and run as a real, fully native executable
     Then every function's output is exactly what the interpreter produces, AND the generated assembly shows the globals-unpack sequence only for the genuinely impure call sites, not the pure ones
 
+  Scenario: a single-block pure function's entry seed is dropped too, not just its external calling convention (issue #216, follow-up to #215)
+    Given a pure, branch-free function (one block, so no internal JumpBlock
+      could ever thread "__globals" between two of its own blocks) called
+      many times in a loop
+    When it is built and run as a real, fully native executable, reading
+      the real heap's own bump-pointer high-water mark before and after
+      the loop
+    Then the heap shows exactly zero growth across every call -- not
+      merely less growth than before. The #215 fix's own entry seed
+      ([BuildList, 0] + a Store, meant only to give an internal JumpBlock
+      something to forward for a multi-block pure root) was being emitted
+      unconditionally for EVERY pure function, including single-block
+      ones where nothing could ever reference it: a real, unreclaimed
+      rt_heap_alloc(64) on every call, found while re-verifying
+      docs/plans/general-refcounting.md's own foundational assumption
+      that the refcounted heap's existing "many alloc+drop cycles stay
+      flat" guarantee (refcounted_heap_native_check.patlang) still held.
+      A MULTI-block pure function (one with its own if/while) still pays
+      this cost -- BOM's own universal "every block forwards __globals"
+      convention (Fork B) threads it between a pure root's OWN internal
+      blocks unconditionally, same as before -- tracked separately as a
+      deeper, riskier fix (dropping that internal forwarding too, not
+      just the entry seed and the external calling convention) rather
+      than bundled into this narrower, zero-risk one.
+
   Scenario: apply with a runtime name and arguments dispatches natively
     Given a program using apply with two, one-statement and zero arguments
     When it is built and run as a real, fully native executable

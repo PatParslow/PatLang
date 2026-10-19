@@ -196,6 +196,10 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+echo "Scenario: a single-block pure function's entry seed is dropped too, not just its external calling convention (issue #216, follow-up to #215)"
+OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/native_call_pure_no_leak.patlang issue216_no_leak 2>&1)
+check_seq "2000 calls to a single-block pure function cause exactly zero heap growth" "$OUT" "total= 2000 growth= 0"
+
 echo ""
 echo "tests: $PASS passed, $FAIL failed"
 if [ "$FAIL" -eq 0 ]; then
