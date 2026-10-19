@@ -130,6 +130,47 @@ verified via a deterministic fixture (checks the free-list table's own
 magic marker directly, not a timing measurement) and a scaling check
 (500k/1M/2M box_set/box_get cycles: 32ms/37ms/49ms, linear).
 
+**A third prerequisite, found starting Phase 2's own first increment:**
+Phase 2 needs `bm_alloc`/`bm_rc_inc`/`bm_rc_dec` available to ORDINARY
+compiled programs, not just block-model's own test tooling -- and
+`box_new`'s own LINK ERROR above is exactly that gap, confirmed directly:
+the ordinary `--x64` CLI never links `heap_chunk.obj` at all (only
+`build_native.patlang` does). Fixed the cleanest way available:
+`build_x64_runtime.patlang` now concatenates `heap.patlang`'s own source
+into what it compiles into `x64_runtime.obj` (already linked into every
+native program), rather than building new multi-chunk-linking
+infrastructure for the ordinary CLI -- zero change to either file's own
+content, so `interp.patlang`'s own `include "heap.patlang"` (the
+interpreter's path, source-level inclusion, not link-time resolution)
+keeps working completely unchanged. `patc1_main.patlang`'s own
+independent fingerprint check (which must agree with
+`build_x64_runtime.patlang`'s, per that file's own header) updated to
+match. `box_new`/`box_get`/`box_set` now work through the ordinary CLI
+for the first time; block-model's own now-redundant `heap_chunk.obj`
+third-chunk linking (`build_native.patlang`/`build_and_run_native.sh`)
+was simplified away. Verified: `native_codegen_check.sh` (39/39,
+including a new scenario for this exact capability),
+`refcounted_heap_native_check.patlang` (13/13), and the real-threads
+stress test (`thread_safety_check.sh`, 5/5) all still pass.
+
+One known, minor, non-blocking gap left open: `patc1_main.patlang`'s own
+collision check ("a name defined both by this program and by
+x64_runtime.patlang's own shadowing primitives") doesn't know
+`heap.patlang`'s content is now folded into `x64_runtime.obj`, so a
+program that both `include`s `heap.patlang` AND relies on the runtime's
+copy wouldn't be flagged if the two ever diverged in a way that mattered
+-- not a live bug today (confirmed: a program's own `include`d copy
+simply shadows the runtime's at link time, same as any other symbol,
+and `x64_runtime.obj`'s own internal cross-references stay self-
+consistent regardless, since it's a pre-linked, self-contained object),
+but worth tightening if this pattern grows.
+
+Also adopts a design idea raised at this point, worth keeping in mind
+for Phase 2's own implementation (see below): since string producers
+should funnel through one canonical low-level constructor rather than
+each calling `rt_heap_alloc` directly, the SAME single-choke-point
+principle that made this prerequisite tractable applies there too.
+
 **Checkpoint:** both the generalized-allocator proof (above) and the
 free-list fast-path's own genuine reachability are confirmed, not
 assumed -- `refcounted_heap_native_check.patlang`'s full suite (13/13)

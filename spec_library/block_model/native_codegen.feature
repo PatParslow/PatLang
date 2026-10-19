@@ -309,6 +309,26 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
       checked directly (500k/1M/2M box_set/box_get cycles: 32ms/37ms/49ms,
       linear, not the earlier pathological per-call cost).
 
+  Scenario: box_new/box_get/box_set now work through the ordinary --x64 CLI, not just block-model's own test tooling (docs/plans/general-refcounting.md, Phase 1)
+    Given an ordinary program (built directly with ./patc1.exe, not via
+      block-model's own build_native.patlang/build_and_run_native.sh
+      tooling) that calls box_new/box_get/box_set in a loop
+    When it is compiled via the plain --x64 CLI flag
+    Then it links and runs successfully, giving the correct answer --
+      before this fix it failed outright with "LINK ERROR: undefined
+      symbol 'bm_heap_init'", since heap.patlang's own functions were
+      never linked into an ordinary --x64 build at all, only into
+      block-model's own separate heap_chunk.obj. Folding heap.patlang's
+      source into build_x64_runtime.patlang's own compile (so bm_alloc/
+      bm_rc_*/bm_heap_init become part of x64_runtime.obj, already
+      linked into every program) fixes this for free, with zero change
+      to either file's own content -- interp.patlang's own
+      `include "heap.patlang"` (the interpreter's path, source-level
+      inclusion, not link-time resolution) keeps working completely
+      unchanged. block-model's own heap_chunk.obj third-chunk linking
+      (build_native.patlang/build_and_run_native.sh) is now redundant
+      and was simplified away.
+
   Scenario: apply with a runtime name and arguments dispatches natively
     Given a program using apply with two, one-statement and zero arguments
     When it is built and run as a real, fully native executable

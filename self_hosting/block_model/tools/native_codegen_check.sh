@@ -204,6 +204,17 @@ echo "Scenario: bm_heap_init runs before main's own entry seed, so the free-list
 OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/native_box_heap_init_order.patlang native_box_heap_init_order 2>&1)
 check_seq "the free-list table's own magic marker is set at the heap's base address" "$OUT" "fixed_ready=true value=42"
 
+echo "Scenario: box_new/box_get/box_set now work through the ordinary --x64 CLI, not just block-model's own test tooling (general-refcounting.md Phase 1)"
+rm -f self_hosting/build/native_box_ordinary_cli.exe
+BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_box_ordinary_cli.patlang self_hosting/build/native_box_ordinary_cli.exe --x64 2>&1)
+if [ -f self_hosting/build/native_box_ordinary_cli.exe ]; then
+  OUT=$(./self_hosting/build/native_box_ordinary_cli.exe 2>&1)
+  check_seq "200000 box_set/box_get cycles through the ordinary CLI give the right answer" "$OUT" "final=200000"
+else
+  echo "  FAIL: box_new via the ordinary --x64 CLI did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
 echo ""
 echo "tests: $PASS passed, $FAIL failed"
 if [ "$FAIL" -eq 0 ]; then
