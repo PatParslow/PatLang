@@ -259,6 +259,17 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+echo "Scenario: main's own top-level code gets the same string-decrement pass as ordinary callee functions (general-refcounting.md Phase 2, fourth increment)"
+rm -f self_hosting/build/native_string_rc_dec_main_toplevel.exe
+BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_string_rc_dec_main_toplevel.patlang self_hosting/build/native_string_rc_dec_main_toplevel.exe --x64 2>&1)
+if [ -f self_hosting/build/native_string_rc_dec_main_toplevel.exe ]; then
+  OUT=$(./self_hosting/build/native_string_rc_dec_main_toplevel.exe 2>&1)
+  check_seq "main's own top-level string-build-and-discard statements match pat --ir-run exactly" "$OUT" "A B C"
+else
+  echo "  FAIL: the main-toplevel fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
 echo ""
 echo "tests: $PASS passed, $FAIL failed"
 if [ "$FAIL" -eq 0 ]; then

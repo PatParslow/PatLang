@@ -441,6 +441,26 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
       never corrupted by a premature or missing decrement on either
       path.
 
+  Scenario: main's own top-level code gets the same string-decrement pass as ordinary callee functions (docs/plans/general-refcounting.md, Phase 2, fourth increment)
+    Given a short program (single-block top-level code, no loop) that
+      builds and discards three strings via known producers directly at
+      the top level, not inside any declared function, built through
+      the ordinary --x64 CLI
+    When bm_nc_closure_is_single_block is asked whether main's own
+      closure (main_blocks) is eligible, the same gate ordinary callee
+      functions already use
+    Then bm_nc_insert_string_rc_decs runs on main's own flattened
+      instructions too, and the output matches pat --ir-run exactly.
+      Unlike every earlier increment's own fixture, this one proves
+      correctness through output comparison rather than a heap-growth
+      measurement: main only ever runs once per process, so there is no
+      LATER allocation within the same run that could show a freed
+      block being reused -- the only thing actually at risk for main's
+      own case is something being freed too early and corrupting a
+      later read, which wrong printed output would reveal directly.
+    And handler functions (bm_nc_build_handler_funcirs) get the same
+      pass under the same single-block gate, for the same reason.
+
   Scenario: apply with a runtime name and arguments dispatches natively
     Given a program using apply with two, one-statement and zero arguments
     When it is built and run as a real, fully native executable

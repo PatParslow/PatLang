@@ -332,13 +332,34 @@ identical source directly -- byte-identical across 50 alternating
 cycles repeatedly reusing the same freed block, proving no corruption
 on either path.
 
+**Phase 2's fourth increment: `main` and handler functions.** The exact
+same pass ordinary callee functions already use (`bm_nc_closure_is_
+single_block` gate, then `bm_nc_insert_string_rc_decs`), wired into
+`bm_to_real_funcir`'s own construction of `main`'s FuncIR and `bm_nc_
+build_handler_funcirs`'s own construction of each handler's. No new
+logic needed -- the existing mechanism is already fully generic over
+any flat instruction list.
+
+Verified differently from every earlier increment, deliberately: `main`
+only ever runs once per process, so there is no later allocation
+*within the same run* that could show a freed block being reused --
+the heap-growth measurement every earlier increment relied on isn't a
+meaningful question here. The only thing actually at risk for `main`'s
+own case is something being freed too early and corrupting a later
+read, which wrong output would reveal directly -- so this increment's
+own fixture proves correctness through an output comparison against
+`pat --ir-run` instead (three top-level strings built and discarded,
+native output matches exactly).
+
 **Not yet started:** call-argument/return-value crossing where the
 value is passed to something OTHER than being directly returned (e.g.
 stored into a longer-lived structure via another function); list/dict-
 element storage; locals that are reassigned (more than one `Store`);
-loops (closures spanning more than one block, via `JumpBlock`); and
-`main`/handler functions (the pass above only applies to ordinary
-callee functions via `bm_nc_build_callee_funcirs`).
+and loops (closures spanning more than one block, via `JumpBlock`) --
+the single biggest remaining real-world gap, and the riskiest, since it
+touches the same inter-block `JumpBlock`/liveness territory where
+issues #215 and #216 both found real bugs. Deliberately not attempted
+in the same pass as the increments above.
 
 **Checkpoint:** both the generalized-allocator proof (above) and the
 free-list fast-path's own genuine reachability are confirmed, not
