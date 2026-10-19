@@ -226,6 +226,17 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+echo "Scenario: a merging if/else (no early return) still has exactly one reachable terminal, so its own eligible local gets decremented too (general-refcounting.md Phase 2, second increment)"
+rm -f self_hosting/build/native_string_rc_dec_merging_if.exe
+BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_string_rc_dec_merging_if.patlang self_hosting/build/native_string_rc_dec_merging_if.exe --x64 2>&1)
+if [ -f self_hosting/build/native_string_rc_dec_merging_if.exe ]; then
+  OUT=$(./self_hosting/build/native_string_rc_dec_merging_if.exe 2>&1)
+  check_seq "50000 cycles through a merging if/else (both branches exercised) cause exactly zero heap growth" "$OUT" "total= 0 growth= 0"
+else
+  echo "  FAIL: the merging-if fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
 echo ""
 echo "tests: $PASS passed, $FAIL failed"
 if [ "$FAIL" -eq 0 ]; then

@@ -250,10 +250,41 @@ impact today since no existing `build_native.patlang` fixture needed
 this, but worth fixing before relying on that harness for Phase 2's
 later increments.
 
-**Not yet started:** anything beyond this narrowest slice -- call-
-argument/return-value crossing, list/dict-element storage, locals that
-survive a branch, and `main`/handler functions (the pass above only
-applies to ordinary callee functions via `bm_nc_build_callee_funcirs`).
+**Phase 2's second increment: internal branching, when it still leaves
+exactly one reachable exit.** The eligibility gate (renamed
+`bm_nc_closure_has_unambiguous_single_terminal`, from the stricter
+`bm_nc_closure_is_branch_free`) now allows internal `Jump`/
+`JumpIfFalse` -- a common, safe real-world shape (a merging `if`/`else`
+that conditionally computes something but never returns early) was
+being rejected outright by the original, stricter check for no good
+reason. Generalized by checking something more precise than "no jumps
+exist": find the function's own first `ReturnValue`, then verify no
+`Jump`/`JumpIfFalse` instruction's own TARGET lands at or after it. A
+merging `if`/`else`'s jump targets always land strictly before its one
+shared return (confirmed directly: targets of 12, return at index 14);
+a genuine early return's jump targets always land at or past its first
+return instead (confirmed directly, same method: targets of 10, first
+return at index 8) -- correctly keeping that harder case excluded
+without a looser check accidentally lumping it in. Nothing else in the
+pipeline needed changing: `bm_nc_insert_string_rc_decs` already finds
+whatever terminal this gate confirms is unambiguous and inserts the
+decrement there, unchanged.
+
+Verified both directions with a dedicated IR dump before touching
+anything further, the same discipline used throughout this plan: the
+merging-if case gets the decrement inserted once this generalization
+landed; the early-return case (tested side by side, same driver)
+correctly still does not. Then with a real native fixture: 50,000
+cycles through a merging `if`/`else`, alternating which branch runs
+each cycle, exactly zero heap growth after warm-up.
+
+**Not yet started:** a genuine early return (needing the decrement
+duplicated at each of multiple reachable exit points, with correct
+per-path liveness -- not attempted by this gate, which simply declines
+to touch any such function); call-argument/return-value crossing;
+list/dict-element storage; locals that survive a branch; and `main`/
+handler functions (the pass above only applies to ordinary callee
+functions via `bm_nc_build_callee_funcirs`).
 
 **Checkpoint:** both the generalized-allocator proof (above) and the
 free-list fast-path's own genuine reachability are confirmed, not

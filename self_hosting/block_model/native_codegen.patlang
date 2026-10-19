@@ -1600,22 +1600,54 @@ make a function called bm_nc_is_string_producer_call takes instr returns yes
   return bm_list_contains(bm_nc_string_producer_names(), list_get(instr, 1))
 end
 
-# Only a single-block, zero-Jump/JumpIfFalse closure is eligible -- see
-# this section's own header for why ("insert before the one terminal"
-# would be ambiguous otherwise).
-make a function called bm_nc_closure_is_branch_free takes cblocks returns yes
+# Single-block closures only (a later increment, not this one, would
+# need to handle a root whose closure spans more than one block --
+# loops, via JumpBlock). Internal Jump/JumpIfFalse IS allowed here --
+# generalized from an earlier, stricter version of this check that
+# required NONE at all -- as long as none of them can ever bypass the
+# function's own FIRST ReturnValue to reach a DIFFERENT, LATER exit
+# point: verified directly by requiring every jump TARGET be strictly
+# before that first terminal's own index, not merely "zero jumps
+# exist." This distinguishes a merging if/else (only conditionally
+# computes something before ONE shared return -- every jump target
+# lands before that return, confirmed directly: `let s = chr(n); if
+# cond > 0 then let s = chr(n+1) end; return n` emits jump targets of
+# 13 with its own real return at index 14) from a genuine early return
+# (an if branch that itself returns, leaving a DIFFERENT return
+# reachable for the other branch -- confirmed directly: `if cond then
+# return 0 end; return n` emits jump targets of 10 while the first
+# Return sits at index 8, 10 >= 8, correctly rejected). A function with
+# NO raw ReturnValue at all (implicit void, falling through to bm_nc_
+# flatten_blocks's own synthesized tail) is also rejected here --
+# conservative, not unsafe: strictly less coverage than handling it
+# would give, deferred rather than risked in this same pass.
+make a function called bm_nc_closure_has_unambiguous_single_terminal takes cblocks returns yes
   if list_len(cblocks) != 1 then
     return false
   end
   let instrs = bi_block_instrs(list_get(cblocks, 0))
   let n = list_len(instrs)
+  let terminal_idx = 0 - 1
   let i = 0
-  while i < n do
-    let op = list_get(list_get(instrs, i), 0)
-    if (op == 212209) or (op == 34716) then # "Jump" or "JumpIfFalse"
-      return false
+  while (i < n) and (terminal_idx == 0 - 1) do
+    if list_get(list_get(instrs, i), 0) == 131889 then # "ReturnValue"
+      let terminal_idx = i
     end
     let i = i + 1
+  end
+  if terminal_idx == 0 - 1 then
+    return false
+  end
+  let j = 0
+  while j < n do
+    let instr = list_get(instrs, j)
+    let op = list_get(instr, 0)
+    if (op == 212209) or (op == 34716) then # "Jump" or "JumpIfFalse"
+      if list_get(instr, 1) >= terminal_idx then
+        return false
+      end
+    end
+    let j = j + 1
   end
   return true
 end
@@ -1643,10 +1675,10 @@ make a function called bm_nc_closure_captured_names takes instrs returns names
 end
 
 # The index of the function's own single reachable terminal -- the
-# FIRST Return/ReturnValue, since (given bm_nc_closure_is_branch_free's
-# own guarantee of zero Jump/JumpIfFalse) nothing can ever reach a LATER
-# one; everything after it is bm_nc_flatten_blocks's own unreachable
-# tail fallback.
+# FIRST Return/ReturnValue, since (given bm_nc_closure_has_unambiguous_
+# single_terminal's own guarantee that no jump target reaches at or past
+# it) nothing can ever reach a LATER one; everything after it is bm_nc_
+# flatten_blocks's own unreachable tail fallback.
 make a function called bm_nc_find_single_terminal_index takes instrs returns idx
   let n = list_len(instrs)
   let i = 0
@@ -1808,7 +1840,7 @@ make a function called bm_nc_build_callee_funcirs takes prog, roots, print_op re
       # bm_rc_dec's own multi-block shape) now passes with zero growth.
     end
     let flat = bm_nc_flatten_blocks(prog, cblocks, pure_init, print_op, flat_mode)
-    if bm_nc_closure_is_branch_free(cblocks) then
+    if bm_nc_closure_has_unambiguous_single_terminal(cblocks) then
       let flat = bm_nc_insert_string_rc_decs(root, flat)
     end
     let params = []

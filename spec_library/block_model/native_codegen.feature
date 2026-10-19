@@ -363,6 +363,29 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
       return, needing the decrement duplicated at each exit point) is
       deliberately out of scope for this increment.
 
+  Scenario: a merging if/else (no early return) still has exactly one reachable terminal, so its own eligible local gets decremented too (docs/plans/general-refcounting.md, Phase 2, second increment)
+    Given a function with internal Jump/JumpIfFalse (a merging if/else
+      that conditionally recomputes an unrelated local, never
+      re-touching the one holding a known-producer string) built and
+      called 50000 times through the ordinary --x64 CLI, alternating
+      which branch runs each cycle, reading the real heap's own bump-
+      pointer high-water mark before and after (after one warm-up call)
+    When bm_nc_closure_has_unambiguous_single_terminal (native_codegen
+      .patlang) is asked whether this closure is eligible
+    Then it says yes -- generalized from an earlier, stricter version of
+      this check (which required ZERO internal Jump/JumpIfFalse at all,
+      rejecting this common, safe shape outright) to instead verify
+      directly that every jump TARGET lands strictly before the
+      function's own first ReturnValue, not merely that no jumps exist.
+      A merging if/else's own jump targets always land before its one
+      shared return (confirmed directly: targets of 12, return at index
+      14); a genuine early return's own jump targets always land at or
+      past its first return instead (confirmed directly: targets of 10,
+      first return at index 8), correctly keeping that harder case
+      excluded without being lumped in by a looser check. The heap
+      shows exactly zero growth across every cycle, both branches
+      genuinely exercised.
+
   Scenario: apply with a runtime name and arguments dispatches natively
     Given a program using apply with two, one-statement and zero arguments
     When it is built and run as a real, fully native executable
