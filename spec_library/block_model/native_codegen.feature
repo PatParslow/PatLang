@@ -386,6 +386,61 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
       shows exactly zero growth across every cycle, both branches
       genuinely exercised.
 
+  Scenario: a genuine early return still gets a decrement at every terminal it dominates (docs/plans/general-refcounting.md, Phase 2, third increment)
+    Given a function that creates a string via a known producer
+      UNCONDITIONALLY, before any branching at all, then has a genuine
+      early return (an if branch that itself returns, leaving a
+      DIFFERENT, later return reachable for the other branch) -- called
+      50000 times through the ordinary --x64 CLI, alternating which
+      branch runs each cycle
+    When bm_nc_local_dominates_all_terminals (native_codegen.patlang) is
+      asked whether this local's own creation point dominates every
+      terminal in the function
+    Then it says yes -- the string's own Store instruction sits before
+      every Return/ReturnValue in the function (real or dead-tail), and
+      nothing jumps over it from earlier in the stream, so nothing can
+      ever reach ANY exit without having created it first. A decrement
+      gets inserted before EACH of the function's own terminals, not
+      just one. Generalized from this plan's own second increment,
+      which only handled a function with exactly one reachable exit --
+      a genuine early return (a DIFFERENT, real shape, not the same
+      thing as a merging if/else that happens to have two Jump targets)
+      was previously left untouched entirely, a missed but safe
+      opportunity, not a bug. The heap shows exactly zero growth across
+      every cycle.
+      A real bug was found and fixed building this, not just designed
+      around: an early version of the rewrite inserted decrements at
+      each terminal without adjusting EXISTING Jump/JumpIfFalse targets
+      for the shift this caused, so a jump whose target landed at or
+      after an earlier insertion point would land in the wrong place --
+      confirmed directly by a real measurement (nonzero heap growth
+      where the whole point of this pass is exactly zero), since the
+      interpreted IR dump used to design this pass only ever displays
+      the instruction list and never executes a jump, so it could not
+      have caught this. Fixed with a proper two-pass rewrite
+      (bm_nc_cumulative_shift_at) that corrects every existing jump
+      target before returning the rewritten instruction list.
+
+  Scenario: a local returned at one terminal and discarded at another, in the same function, is handled correctly at each (docs/plans/general-refcounting.md, Phase 2, third increment)
+    Given a function that creates a string, returns IT directly on one
+      path (ownership transfers to the caller there) but discards it on
+      the other (returns something else entirely) -- called 50 times
+      through the ordinary --x64 CLI, alternating which path runs each
+      cycle, repeatedly reusing the SAME freed block via the free list
+    When bm_nc_insert_string_rc_decs (native_codegen.patlang) decides,
+      AT EACH terminal independently, whether this local is the value
+      actually being returned right there (a Load of that same name
+      immediately before that specific Return/ReturnValue)
+    Then no decrement is inserted at the terminal where it IS being
+      returned, but a decrement IS inserted at the terminal where it
+      is NOT -- a local can dominate every terminal in a function yet
+      only actually be returned at one of them. Verified against pat
+      --ir-run on the identical source, not merely "did not crash": the
+      native output matches the interpreted output's own first 50 lines
+      exactly, proving the repeatedly-reused block's own content is
+      never corrupted by a premature or missing decrement on either
+      path.
+
   Scenario: apply with a runtime name and arguments dispatches natively
     Given a program using apply with two, one-statement and zero arguments
     When it is built and run as a real, fully native executable

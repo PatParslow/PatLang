@@ -237,6 +237,28 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+echo "Scenario: a genuine early return still gets a decrement at every terminal it dominates (general-refcounting.md Phase 2, third increment)"
+rm -f self_hosting/build/native_string_rc_dec_early_return.exe
+BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_string_rc_dec_early_return.patlang self_hosting/build/native_string_rc_dec_early_return.exe --x64 2>&1)
+if [ -f self_hosting/build/native_string_rc_dec_early_return.exe ]; then
+  OUT=$(./self_hosting/build/native_string_rc_dec_early_return.exe 2>&1)
+  check_seq "50000 cycles through a genuine early return (alternating which branch runs) cause exactly zero heap growth" "$OUT" "total= 0 growth= 0"
+else
+  echo "  FAIL: the early-return fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: a local returned at one terminal and discarded at another, in the same function, is handled correctly at each (general-refcounting.md Phase 2, third increment)"
+rm -f self_hosting/build/native_string_rc_dec_mixed_exit.exe
+BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_string_rc_dec_mixed_exit.patlang self_hosting/build/native_string_rc_dec_mixed_exit.exe --x64 2>&1)
+if [ -f self_hosting/build/native_string_rc_dec_mixed_exit.exe ]; then
+  OUT=$(./self_hosting/build/native_string_rc_dec_mixed_exit.exe 2>&1)
+  check_seq "50 cycles alternating 'return the string' and 'discard it' match pat --ir-run exactly, reusing the same freed block repeatedly with no corruption" "$OUT" "65 B 67 D 69 F 71 H 73 J 65 B 67 D 69 F 71 H 73 J 65 B 67 D 69 F 71 H 73 J 65 B 67 D 69 F 71 H 73 J 65 B 67 D 69 F 71 H 73 J"
+else
+  echo "  FAIL: the mixed-exit fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
 echo ""
 echo "tests: $PASS passed, $FAIL failed"
 if [ "$FAIL" -eq 0 ]; then

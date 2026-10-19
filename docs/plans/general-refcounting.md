@@ -278,13 +278,67 @@ correctly still does not. Then with a real native fixture: 50,000
 cycles through a merging `if`/`else`, alternating which branch runs
 each cycle, exactly zero heap growth after warm-up.
 
-**Not yet started:** a genuine early return (needing the decrement
-duplicated at each of multiple reachable exit points, with correct
-per-path liveness -- not attempted by this gate, which simply declines
-to touch any such function); call-argument/return-value crossing;
-list/dict-element storage; locals that survive a branch; and `main`/
-handler functions (the pass above only applies to ordinary callee
-functions via `bm_nc_build_callee_funcirs`).
+**Phase 2's third increment: genuine early returns, via dominance.**
+The gate simplified back down (`bm_nc_closure_is_single_block` -- just
+"is this one block," no terminal-counting at all); the real work moved
+into the detection pass itself, which now asks a sharper, per-candidate
+question instead of a single whole-function one: for a local created at
+instruction index `p`, does `p` dominate EVERY terminal (real or dead-
+tail) in the function? Given this pass only ever runs on a single-block
+closure (no loops -- those always cross blocks via `JumpBlock`), two
+conditions together are sufficient: `p` sits strictly before every
+terminal's own index, and no `Jump`/`JumpIfFalse` positioned before `p`
+targets an index after it (nothing can skip `p`'s own creation and
+still reach a later exit). Confirmed directly both ways: a string
+created unconditionally before any branching dominates every one of
+its function's terminals, early return included; a string created only
+inside one branch, after an unrelated early return in a different
+branch, fails immediately (its own terminal check catches it before the
+jump check even runs) and is correctly left untouched entirely.
+
+Per-terminal precision matters here in a way the earlier increments
+didn't need: a local can dominate every terminal yet be the value
+*actually returned* at only one of them -- checked independently per
+terminal (is the instruction right before THIS one a `Load` of THIS
+candidate), not once globally, so a function can correctly return a
+string on one path while discarding it (decrementing it) on another.
+
+**A real bug found by measurement, not by re-reading the code --
+exactly the discipline this whole plan has leaned on.** The first
+version of this increment's rewrite inserted decrements at every
+eligible terminal but never adjusted *existing* `Jump`/`JumpIfFalse`
+targets for the shift its own insertions caused -- any jump whose
+target landed at or after an earlier insertion point would land in the
+wrong place post-rewrite. The interpreted IR dump this whole plan has
+used to design every increment so far only ever *displays* the
+instruction list; it never executes a jump, so it structurally could
+not have caught this. Only a real native measurement could, and did: a
+genuine early-return fixture (alternating which branch runs) first
+measured nonzero heap growth (600,000 bytes over 50,000 cycles) where
+the whole point of the pass is exactly zero. Fixed with a proper two-
+pass rewrite (`bm_nc_cumulative_shift_at`): compute how many
+instructions land at each terminal first, then correct every existing
+jump's own target using the cumulative shift *at that target* (not at
+the jump's own position -- a different question) before emitting it.
+
+Verified with two real native fixtures, not one: 50,000 cycles through
+a genuine early return (unconditional string creation, alternating
+branches) show exactly zero heap growth after the fix; and, since
+growth alone can't distinguish "freed correctly" from "freed too early
+but coincidentally reused without visibly crashing," a second fixture
+specifically exercises the local-returned-at-one-terminal-discarded-at-
+another case and compares native output against `pat --ir-run` on the
+identical source directly -- byte-identical across 50 alternating
+cycles repeatedly reusing the same freed block, proving no corruption
+on either path.
+
+**Not yet started:** call-argument/return-value crossing where the
+value is passed to something OTHER than being directly returned (e.g.
+stored into a longer-lived structure via another function); list/dict-
+element storage; locals that are reassigned (more than one `Store`);
+loops (closures spanning more than one block, via `JumpBlock`); and
+`main`/handler functions (the pass above only applies to ordinary
+callee functions via `bm_nc_build_callee_funcirs`).
 
 **Checkpoint:** both the generalized-allocator proof (above) and the
 free-list fast-path's own genuine reachability are confirmed, not
