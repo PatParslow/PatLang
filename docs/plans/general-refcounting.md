@@ -171,6 +171,46 @@ should funnel through one canonical low-level constructor rather than
 each calling `rt_heap_alloc` directly, the SAME single-choke-point
 principle that made this prerequisite tractable applies there too.
 
+**Phase 2's own first increment, started.** `rt_string_new(content_len)`
+now exists in `x64_runtime.patlang` as that one canonical constructor --
+allocates via `bm_alloc` (not `rt_heap_alloc`) and writes the length
+header, returning an untagged pointer the caller fills with content
+bytes and tags itself, exactly as every producer already did before
+this refactor. All 8 producer functions (`rt_str_concat`, `sb_str`,
+`chr`, `substr`, `sc_char`, `rt_unit_to_str`, `rt_int_to_str`,
+`rt_limb9_to_str`, `rt_dquote_str`) now call it instead of
+`rt_heap_alloc` directly -- confirmed zero remaining direct
+`rt_heap_alloc` calls in any of the 8 by grepping every call site back
+to its enclosing function.
+
+**A second real bug found verifying this, same shape as the others
+caught so far in this plan: a "looks narrow" change again had more
+depth than expected.** `bm_nc_program_uses_heap`'s own gate (only call
+`bm_heap_init()` when the program contains a real `BoxNew`-family IR
+instruction) made sense when only Box used `bm_alloc` -- but now
+strings do too, and a program that builds a string without ever
+calling `box_new` (nearly every real program) would never initialize
+the free-list table at all. Confirmed directly as a real, reproduced
+segfault (not a theoretical gap), then isolated precisely through a
+long chain of elimination -- plain cross-half function calls from
+`x64_runtime.patlang` into `heap.patlang` work fine (confirmed with
+`bm_rc_get`, `bm_align8`, `bm_freelist_pop`, each tested individually);
+only `bm_alloc` itself crashed, and only because nothing had ever
+called `bm_heap_init()` for a program with no Box instruction anywhere.
+Fixed by making `bm_heap_init()` unconditional in `bm_to_real_funcir`
+again (it was made conditional once before, for issue #181, specifically
+to avoid breaking the WASM path -- which turns out never to reach this
+function at all, since WASM lowers via plain `lower_program`, never
+`bm_lower_program`/`bm_to_real_funcir`, so that original concern never
+actually applied here). Verified: `native_codegen_check.sh` (39/39),
+`refcounted_heap_native_check.patlang` (13/13), the real-threads stress
+test (5/5), and the original failing repro (`print(10)` via
+`build_native.patlang`) all pass.
+
+Phase 2's own remaining scope (the narrow-slice detection pass itself --
+finding provably-eligible locals in a single, straight-line block, and
+inserting `rc_inc`/`rc_dec`) has not started yet.
+
 **Checkpoint:** both the generalized-allocator proof (above) and the
 free-list fast-path's own genuine reachability are confirmed, not
 assumed -- `refcounted_heap_native_check.patlang`'s full suite (13/13)

@@ -233,14 +233,38 @@ make a function called rt_str_len takes s returns len
   return mem_peek_qword(addr, 0)
 end
 
+# docs/plans/general-refcounting.md, Phase 2: the one canonical, low-
+# level string constructor every string-producing function below calls
+# through, instead of each calling rt_heap_alloc directly and writing
+# its own length header. Returns an UNTAGGED pointer with the length
+# header already written (matching 0, bytes [8..8+content_len) still
+# uninitialized) -- the caller fills in the content bytes and applies
+# `bor rt_string_tag()` itself, exactly as every producer already did
+# before this refactor; only the allocation step changes.
+#
+# Calls bm_alloc (heap.patlang, concatenated into this same compiled
+# unit by build_x64_runtime.patlang -- see that file's own header) in
+# place of rt_heap_alloc, which is the ENTIRE point: every string this
+# backend produces now goes through the refcounted, size-keyed free
+# list, not a pure bump allocator that never reuses memory. A single
+# choke point here means later work (detecting which locals are
+# provably string-valued, per Phase 2's own plan) only ever needs to
+# recognize the PRODUCER functions below, not reason about allocation
+# directly -- and any future change to how strings are allocated only
+# needs to happen once, here.
+make a function called rt_string_new takes content_len returns addr
+  let result = bm_alloc(8 + content_len)
+  mem_poke_qword(result, 0, content_len)
+  return result
+end
+
 make a function called rt_str_concat takes a, b returns result
   let addr_a = a band rt_payload_mask()
   let addr_b = b band rt_payload_mask()
   let len_a = rt_str_len(a)
   let len_b = rt_str_len(b)
   let total = len_a + len_b
-  let result = rt_heap_alloc(8 + total)
-  mem_poke_qword(result, 0, total)
+  let result = rt_string_new(total)
   let i = 0
   while i < len_a do
     mem_poke_byte(result, 8 + i, mem_peek_byte(addr_a, 8 + i))
@@ -709,8 +733,7 @@ make a function called sb_str takes handle returns s
   let table = mem_peek_qword(mem_sb_table_addr(), 0)
   let entry = rt_list_get(table, handle)
   let len = mem_peek_qword(entry, 0)
-  let result = rt_heap_alloc(8 + len)
-  mem_poke_qword(result, 0, len)
+  let result = rt_string_new(len)
   let i = 0
   while i < len do
     mem_poke_byte(result, 8 + i, mem_peek_byte(entry, 16 + i))
@@ -881,12 +904,10 @@ make a function called chr takes n0 returns s
     let n = rt_trunc_div(mem_peek_qword(raddr, 0), mem_peek_qword(raddr, 8))
   end
   if n < 0 then
-    let result = rt_heap_alloc(8)
-    mem_poke_qword(result, 0, 0)
+    let result = rt_string_new(0)
     return result bor rt_string_tag()
   end
-  let result = rt_heap_alloc(9)
-  mem_poke_qword(result, 0, 1)
+  let result = rt_string_new(1)
   mem_poke_byte(result, 8, n)
   return result bor rt_string_tag()
 end
@@ -914,8 +935,7 @@ make a function called substr takes s, start0, count0 returns result
     let en = len
   end
   let n = en - st
-  let result = rt_heap_alloc(8 + n)
-  mem_poke_qword(result, 0, n)
+  let result = rt_string_new(n)
   let i = 0
   while i < n do
     mem_poke_byte(result, 8 + i, mem_peek_byte(addr, 8 + st + i))
@@ -963,8 +983,7 @@ make a function called sc_char takes handle, i returns s
   if i < len then
     return chr(mem_peek_byte(handle, 8 + i))
   end
-  let result = rt_heap_alloc(8)
-  mem_poke_qword(result, 0, 0)
+  let result = rt_string_new(0)
   return result bor rt_string_tag()
 end
 
@@ -2778,16 +2797,14 @@ end
 # exact same push-arg/call/pop-result convention already used for the
 # List/Number coercions right above it in that function.
 make a function called rt_unit_to_str takes v returns s
-  let s = rt_heap_alloc(8)
-  mem_poke_qword(s, 0, 0)
+  let s = rt_string_new(0)
   return s bor rt_string_tag()
 end
 
 make a function called rt_int_to_str takes n returns s
   let buf = mem_scratch_addr()
   let len = rt_int_to_string(n, buf)
-  let s = rt_heap_alloc(8 + len)
-  mem_poke_qword(s, 0, len)
+  let s = rt_string_new(len)
   let i = 0
   while i < len do
     mem_poke_byte(s, 8 + i, mem_peek_byte(buf, i))
@@ -2799,8 +2816,7 @@ end
 # Zero-padded to exactly 9 digits -- for every limb EXCEPT the most
 # significant one when printing a BigInt (base 10^9 per limb).
 make a function called rt_limb9_to_str takes n returns s
-  let s = rt_heap_alloc(8 + 9)
-  mem_poke_qword(s, 0, 9)
+  let s = rt_string_new(9)
   let v = n
   let i = 8
   while i >= 0 do
@@ -4705,8 +4721,7 @@ end
 # it doesn't handle a literal embedded quote character within an
 # argument (not needed for this project's own actual invocations).
 make a function called rt_dquote_str returns s
-  let s = rt_heap_alloc(9)
-  mem_poke_qword(s, 0, 1)
+  let s = rt_string_new(1)
   mem_poke_byte(s, 8, 34)
   return s bor rt_string_tag()
 end
