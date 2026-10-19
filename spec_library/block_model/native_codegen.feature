@@ -329,6 +329,40 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
       (build_native.patlang/build_and_run_native.sh) is now redundant
       and was simplified away.
 
+  Scenario: a string built via a known producer, stored once and never returned, in a branch-free function, gets its refcount decremented and genuinely reclaimed (docs/plans/general-refcounting.md, Phase 2, first increment)
+    Given a branch-free function (one block, no internal Jump/
+      JumpIfFalse at all) that calls one of the 8 known string-
+      producing functions (rt_str_concat/sb_str/chr/substr/sc_char/
+      rt_unit_to_str/rt_int_to_str/rt_limb9_to_str/rt_dquote_str),
+      stores the result in a local that is never reassigned, never
+      returned, and never closure-captured, and returns something else
+      entirely
+    When it is built directly with ./patc1.exe (the ordinary --x64 CLI,
+      not block-model's own build_native.patlang -- that test harness
+      has a separate, pre-existing gap calling an external runtime
+      function by name from block-model source directly, unrelated to
+      this feature, found and worked around rather than fixed here) and
+      called 50000 times in a loop, reading the real heap's own bump-
+      pointer high-water mark before and after (after one warm-up call,
+      the same warm-up discipline refcounted_heap_native_check.patlang's
+      own "100000 cycles" scenario already established -- the first
+      allocation of a never-before-seen size is a genuine one-time cost,
+      not growth from the cycles themselves)
+    Then the heap shows exactly zero growth across every cycle -- not
+      merely less growth than before rt_string_new existed (which alone
+      only avoids unnecessary allocation, proven earlier in this same
+      plan; it does not, by itself, reclaim anything without an actual
+      decrement). bm_nc_insert_string_rc_decs (native_codegen.patlang)
+      finds the eligible local and inserts a single rt_string_rc_dec
+      call immediately before the function's own one reachable
+      terminal -- unambiguous because a branch-free closure is
+      guaranteed to have exactly one such terminal (bm_nc_flatten_
+      blocks's own tail-fallback Return, appended unconditionally after
+      every root, is provably unreachable dead code in this specific
+      shape). A branching function (an if/else with its own early
+      return, needing the decrement duplicated at each exit point) is
+      deliberately out of scope for this increment.
+
   Scenario: apply with a runtime name and arguments dispatches natively
     Given a program using apply with two, one-statement and zero arguments
     When it is built and run as a real, fully native executable

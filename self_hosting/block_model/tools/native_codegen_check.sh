@@ -215,6 +215,17 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+echo "Scenario: a string built via a known producer, stored once and never returned, in a branch-free function, gets its refcount decremented and genuinely reclaimed (general-refcounting.md Phase 2, first increment)"
+rm -f self_hosting/build/native_string_rc_dec_no_leak.exe
+BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_string_rc_dec_no_leak.patlang self_hosting/build/native_string_rc_dec_no_leak.exe --x64 2>&1)
+if [ -f self_hosting/build/native_string_rc_dec_no_leak.exe ]; then
+  OUT=$(./self_hosting/build/native_string_rc_dec_no_leak.exe 2>&1)
+  check_seq "50000 build-and-discard cycles after warm-up cause exactly zero heap growth" "$OUT" "total= 0 growth= 0"
+else
+  echo "  FAIL: the string-rc-dec fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
 echo ""
 echo "tests: $PASS passed, $FAIL failed"
 if [ "$FAIL" -eq 0 ]; then

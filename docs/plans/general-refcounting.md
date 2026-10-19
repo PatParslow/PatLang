@@ -207,9 +207,53 @@ actually applied here). Verified: `native_codegen_check.sh` (39/39),
 test (5/5), and the original failing repro (`print(10)` via
 `build_native.patlang`) all pass.
 
-Phase 2's own remaining scope (the narrow-slice detection pass itself --
-finding provably-eligible locals in a single, straight-line block, and
-inserting `rc_inc`/`rc_dec`) has not started yet.
+**Phase 2's own detection pass, done for the narrowest slice.**
+`bm_nc_insert_string_rc_decs` (native_codegen.patlang) now finds every
+eligible local in a function whose entire closure is a single,
+branch-free block (no internal `Jump`/`JumpIfFalse` at all -- checked
+directly, not assumed, since that guarantees exactly one reachable
+terminal `Return`/`ReturnValue`: `bm_nc_flatten_blocks`'s own tail-
+fallback `Return`, appended unconditionally after every root, is
+provably unreachable dead code in this specific shape). Eligible means:
+a direct, syntactic result of one of the 8 known producer calls, stored
+exactly once, never the value actually being returned, never named in
+any `MakeClosure`'s own captured list. One `rt_string_rc_dec` call
+(a new helper in `x64_runtime.patlang`, recovering the exact size
+`bm_alloc` was originally called with from the string's own length
+header) gets inserted immediately before that one terminal, per
+eligible local -- no `rc_inc` needed anywhere in this increment, since
+nothing is ever copied into a second binding; the local is the only
+reference from creation to this one discard point.
+
+A branching function (an `if`/`else` with its own early return, needing
+the decrement duplicated at each exit point) is explicitly out of
+scope, deferred to a later, separate increment.
+
+Verified with a zero-tolerance fixture: a branch-free function builds a
+string via `chr`, stores it in a local it never touches again, returns
+its own parameter instead -- called 50,000 times after one warm-up
+call, the real heap's own bump-pointer shows **exactly zero** growth.
+Before this pass existed, the same measurement (no warm-up) showed 24
+bytes of growth; `rt_string_new` alone (routing allocation through
+`bm_alloc`) only avoids *unnecessary* allocation -- it does not, by
+itself, reclaim anything without an actual decrement call, confirmed by
+this exact before/after comparison, not assumed.
+
+A real, small, separate gap found along the way, filed as its own issue
+(#219) rather than fixed here: `build_native.patlang`'s own test
+harness never calls `bm_patc_resolve_runtime_calls` the way
+`bm_patc_lower` (the ordinary CLI's own path) does, so it can't compile
+a block-model fixture that calls an external runtime function directly
+by name. Worked around by building the verification fixture through the
+ordinary CLI instead, which already resolves this correctly -- low
+impact today since no existing `build_native.patlang` fixture needed
+this, but worth fixing before relying on that harness for Phase 2's
+later increments.
+
+**Not yet started:** anything beyond this narrowest slice -- call-
+argument/return-value crossing, list/dict-element storage, locals that
+survive a branch, and `main`/handler functions (the pass above only
+applies to ordinary callee functions via `bm_nc_build_callee_funcirs`).
 
 **Checkpoint:** both the generalized-allocator proof (above) and the
 free-list fast-path's own genuine reachability are confirmed, not

@@ -1564,6 +1564,174 @@ end
 # call site unpacks. Blocks keep bi_program_blocks(prog)'s own relative
 # order, the same "descendants stay contiguous and correctly ordered"
 # property the handler builder above relies on.
+# docs/plans/general-refcounting.md, Phase 2 (narrowest slice, per the
+# plan's own staging decision -- "only refcount a string that's a
+# direct result of one of the 8 producer calls, stored in exactly one
+# never-reassigned/never-passed local, decremented at function exit").
+# True now because rt_string_new routes string allocation through
+# bm_alloc: this is the FIRST increment that actually reclaims memory --
+# everything in this plan before this point only avoided UNNECESSARY
+# allocation cost; nothing yet decremented a string's own refcount, so
+# every string ever built still sat at refcount 1 forever (the same
+# bump-forever growth as before this plan started, just with an unused
+# header).
+#
+# Deliberately narrow: only a function whose ENTIRE closure is a single,
+# branch-free block (no internal Jump/JumpIfFalse at all, not merely "no
+# JumpBlock") is considered. That guarantees exactly ONE reachable
+# terminal Return/ReturnValue: bm_nc_flatten_blocks's own tail-fallback
+# Return, appended unconditionally after every root, is provably
+# unreachable dead code in this specific shape (nothing can jump past
+# the real terminal when there is no Jump/JumpIfFalse anywhere in the
+# block), so "insert the decrement right before that one terminal" is
+# unambiguous. A branching function (an if/else with its own early
+# return, for example) would need the decrement duplicated at EACH exit
+# point -- deliberately deferred to a later, separate increment rather
+# than attempted here.
+make a function called bm_nc_string_producer_names returns names
+  return ["rt_str_concat", "sb_str", "chr", "substr", "sc_char", "rt_unit_to_str", "rt_int_to_str", "rt_limb9_to_str", "rt_dquote_str"]
+end
+
+make a function called bm_nc_is_string_producer_call takes instr returns yes
+  let op = list_get(instr, 0)
+  if (op != "Call") and (op != "CallHost") then
+    return false
+  end
+  return bm_list_contains(bm_nc_string_producer_names(), list_get(instr, 1))
+end
+
+# Only a single-block, zero-Jump/JumpIfFalse closure is eligible -- see
+# this section's own header for why ("insert before the one terminal"
+# would be ambiguous otherwise).
+make a function called bm_nc_closure_is_branch_free takes cblocks returns yes
+  if list_len(cblocks) != 1 then
+    return false
+  end
+  let instrs = bi_block_instrs(list_get(cblocks, 0))
+  let n = list_len(instrs)
+  let i = 0
+  while i < n do
+    let op = list_get(list_get(instrs, i), 0)
+    if (op == 212209) or (op == 34716) then # "Jump" or "JumpIfFalse"
+      return false
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+# Every name appearing in any MakeClosure's own captured-names list,
+# anywhere in `instrs` -- a local this narrow pass must never decrement,
+# since a closure might keep it alive past this function's own return.
+make a function called bm_nc_closure_captured_names takes instrs returns names
+  let names = []
+  let n = list_len(instrs)
+  let i = 0
+  while i < n do
+    let instr = list_get(instrs, i)
+    if list_get(instr, 0) == "MakeClosure" then
+      let captured = list_get(instr, 2)
+      let ci = 0
+      while ci < list_len(captured) do
+        let names = list_push(names, list_get(captured, ci))
+        let ci = ci + 1
+      end
+    end
+    let i = i + 1
+  end
+  return names
+end
+
+# The index of the function's own single reachable terminal -- the
+# FIRST Return/ReturnValue, since (given bm_nc_closure_is_branch_free's
+# own guarantee of zero Jump/JumpIfFalse) nothing can ever reach a LATER
+# one; everything after it is bm_nc_flatten_blocks's own unreachable
+# tail fallback.
+make a function called bm_nc_find_single_terminal_index takes instrs returns idx
+  let n = list_len(instrs)
+  let i = 0
+  while i < n do
+    let op = list_get(list_get(instrs, i), 0)
+    if (op == "Return") or (op == "ReturnValue") then
+      return i
+    end
+    let i = i + 1
+  end
+  return 0 - 1
+end
+
+# The actual rewrite: finds every eligible local (per this section's own
+# header: direct producer provenance, exactly one Store, never the
+# value being returned, never closure-captured) and inserts a decrement
+# for each, once, immediately before the function's own single
+# terminal. Returns `instrs` completely unchanged if the closure isn't
+# branch-free, or no eligible local is found -- purely additive, never
+# a correctness risk to anything this pass doesn't recognize.
+make a function called bm_nc_insert_string_rc_decs takes root, instrs returns out
+  let terminal_idx = bm_nc_find_single_terminal_index(instrs)
+  if terminal_idx == 0 - 1 then
+    return instrs
+  end
+  let captured_names = bm_nc_closure_captured_names(instrs)
+  let returned_name = ""
+  if terminal_idx > 0 then
+    let prev = list_get(instrs, terminal_idx - 1)
+    if list_get(prev, 0) == "Load" then
+      let returned_name = list_get(prev, 1)
+    end
+  end
+  let n = list_len(instrs)
+  let eligible = []
+  let i = 0
+  while i < (n - 1) do
+    let instr = list_get(instrs, i)
+    if bm_nc_is_string_producer_call(instr) then
+      let next = list_get(instrs, i + 1)
+      if list_get(next, 0) == "Store" then
+        let name = list_get(next, 1)
+        if (name != returned_name) and (not bm_list_contains(captured_names, name)) then
+          let store_count = 0
+          let sj = 0
+          while sj < n do
+            let sinstr = list_get(instrs, sj)
+            if (list_get(sinstr, 0) == "Store") and (list_get(sinstr, 1) == name) then
+              let store_count = store_count + 1
+            end
+            let sj = sj + 1
+          end
+          if store_count == 1 then
+            let eligible = list_push(eligible, name)
+          end
+        end
+      end
+    end
+    let i = i + 1
+  end
+  if list_len(eligible) == 0 then
+    return instrs
+  end
+  let out = []
+  let bi = 0
+  while bi < terminal_idx do
+    let out = list_push(out, list_get(instrs, bi))
+    let bi = bi + 1
+  end
+  let discard_name = bm_nc_prefix(root, "__bm_string_rc_discard")
+  let ei = 0
+  while ei < list_len(eligible) do
+    let out = list_push(out, ["Load", list_get(eligible, ei)])
+    let out = list_push(out, ["Call", "rt_string_rc_dec", 1])
+    let out = list_push(out, ["Store", discard_name])
+    let ei = ei + 1
+  end
+  let ai = terminal_idx
+  while ai < n do
+    let out = list_push(out, list_get(instrs, ai))
+    let ai = ai + 1
+  end
+  return out
+end
+
 make a function called bm_nc_build_callee_funcirs takes prog, roots, print_op returns funcirs
   let all_blocks = bi_program_blocks(prog)
   let abn = list_len(all_blocks)
@@ -1640,6 +1808,9 @@ make a function called bm_nc_build_callee_funcirs takes prog, roots, print_op re
       # bm_rc_dec's own multi-block shape) now passes with zero growth.
     end
     let flat = bm_nc_flatten_blocks(prog, cblocks, pure_init, print_op, flat_mode)
+    if bm_nc_closure_is_branch_free(cblocks) then
+      let flat = bm_nc_insert_string_rc_decs(root, flat)
+    end
     let params = []
     let pi = 0
     while pi < list_len(params_to_use) do
