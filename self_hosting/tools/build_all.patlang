@@ -1,0 +1,78 @@
+# build_all.patlang -- ONE command to bring every native x64 build
+# artifact up to date, in the right order, so nobody (human or agent)
+# has to remember which of several separate build scripts to re-run,
+# in what sequence, or to manually clear a stale cache. Each step below
+# already does correct, fast, content-hash-based staleness detection on
+# its own (build_x64_runtime.patlang, build_patc1.patlang) -- this
+# script's only job is sequencing them and giving one clear command
+# instead of several, plus a clean summary of what it actually did.
+#
+# Written after a real, repeated friction point in one session: x64_
+# runtime.obj and patc1.exe each have their own fingerprint cache, but
+# nothing sequenced "rebuild the runtime, THEN the compiler" for you,
+# and one specific bug (docs/plans/general-refcounting.md, issue #218's
+# own investigation) came from the two caches' underlying fingerprint
+# computations drifting out of sync for a while -- since fixed by
+# sharing one function (x64_runtime_source_fingerprint, lib/x64_build.
+# patlang) rather than two independently-maintained copies. This script
+# is the OTHER half of the same fix: even with the fingerprints correct,
+# a human still had to know to run build_x64_runtime.patlang BEFORE
+# build_patc1.patlang (never the reverse -- patc1.exe's own staleness
+# check, baked in at ITS build time, compares against x64_runtime.
+# fingerprint, so rebuilding patc1.exe against a stale runtime
+# fingerprint bakes in a mismatch that only surfaces on the next --x64
+# compile, exactly the shape of bug this whole investigation started
+# from).
+#
+# Order matters, and is fixed below:
+#   1. x64_runtime.obj (+ .funcs/.asm) -- self_hosting/build_x64_runtime.patlang
+#   2. patc1.exe -- self_hosting/build_patc1.patlang
+# Each already skips its own work when nothing relevant changed, so
+# running this with nothing stale is fast and prints "[cache] ...
+# skipping rebuild" for every step, not a silent no-op.
+#
+# Run from the repo root:
+#   rust-runtime/target/release/pat --ir-run self_hosting/tools/build_all.patlang
+#
+# Exits 0 only if every step reported success; stops at the first
+# failure and prints that step's own stdout+stderr in full, rather than
+# continuing to build something on top of a broken earlier step.
+
+make a function called build_all_run_step takes label, script_path, timeout_ms returns ok
+  print("=== build_all: " + label + " ===" + chr(10))
+  let pat_exe = "rust-runtime/target/release/pat.exe"
+  let result = exec_capture_io(pat_exe, ["--ir-run", script_path], "", timeout_ms)
+  let out = list_get(result, 0)
+  let err = list_get(result, 1)
+  let success = list_get(result, 2)
+  if out != "" then
+    print(out)
+  end
+  if err != "" then
+    print(err)
+  end
+  if success == false then
+    print("build_all: " + label + " FAILED -- stopping, nothing after this step was attempted" + chr(10))
+    return false
+  end
+  return true
+end
+
+# x64_runtime.obj first: patc1.exe's own --x64 staleness check (baked in
+# at ITS build time) compares against x64_runtime.fingerprint, so
+# rebuilding patc1.exe against an already-stale runtime fingerprint
+# would bake in a mismatch invisible until the next --x64 compile.
+let step1_ok = build_all_run_step("x64_runtime.obj", "self_hosting/build_x64_runtime.patlang", 300000)
+if step1_ok == false then
+  exit_with(1)
+end
+
+# patc1.exe second: a full rustc-backed rebuild, genuinely slow (minutes,
+# not seconds) when the compiler bundle's own fingerprint is stale --
+# the generous timeout matches that, not the fast-path case.
+let step2_ok = build_all_run_step("patc1.exe", "self_hosting/build_patc1.patlang", 1800000)
+if step2_ok == false then
+  exit_with(1)
+end
+
+print("=== build_all: done, x64_runtime.obj and patc1.exe are both up to date ===" + chr(10))
