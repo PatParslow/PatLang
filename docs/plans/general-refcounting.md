@@ -92,19 +92,48 @@ harness runs. Realizes nothing yet.
 
 ### Phase 1 -- Generalize `heap.patlang`'s allocator, no real type touched
 
-Take `bm_alloc`/`rc_inc`/`rc_dec`/`bm_rc_touch_for_mutation` and the
-size-keyed free list, and make them accept an arbitrary byte size instead
-of Box's fixed shape. Proven via a standalone driver (mirroring
-`x64_heap_rc_driver.patlang`'s own pattern), with scenarios identical in
-spirit to Fork D's own Phase 1 checkpoint: allocate at various sizes,
-share, drop, confirm flat heap-bytes-used across many cycles at each size
-class. **Zero change to `codegen_x64.patlang`, `x64_runtime.patlang`'s
-existing String/List functions, or anything a real program currently
-exercises** -- this phase is purely additive, the lowest-risk step in the
-whole plan.
+**Status: done, with no code change needed.** Re-reading `heap.patlang`
+while scoping this plan found `bm_alloc`/`bm_rc_inc`/`bm_rc_dec`/
+`bm_rc_touch_for_mutation` and the size-keyed free list already take only
+a byte size, never a payload shape -- only `bm_box_read`/`bm_box_write`
+(simple convenience accessors nothing else calls) assume Box's specific
+one-field layout. Proved rather than assumed: a new scenario in
+`refcounted_heap_native_check.patlang`/`refcounted_heap.feature`
+allocates, shares, drops, and reclaims a 3-field packed struct a Box
+never uses, through the exact same functions, with zero new or modified
+allocator code -- already committed. Fork F's own decision ("generalize
+Fork D's mechanism") turned out to already be satisfied by Fork D's own
+original design.
 
-**Checkpoint:** the generalized allocator passes the same class of proof
-Fork D's own Phase 1 did, at multiple size classes, not just Box's one.
+**A second, real bug turned up while re-verifying this checkpoint, fixed
+in the same pass.** `heap.patlang`'s own lock-free fast path
+(`bm_heap_fixed_ready`: "is the free-list table the heap's first
+allocation, so every thread finds it with no lookup at all") depends on
+genuinely being first -- but `bm_to_real_funcir` (native_codegen.patlang)
+used to call `bm_heap_init()` *after* seeding `main`'s own `[BuildList,
+0]` `"__globals"`, which is unconditionally the very first thing any
+compiled program's `main` does. That seed had therefore always already
+claimed the heap's first allocation, for every real program, making the
+fast path structurally unreachable outside `refcounted_heap_native_
+check.patlang`'s own standalone, heap.patlang-is-the-only-thing test.
+Every `bm_alloc`/`bm_rc_inc`/`bm_rc_dec` call fell through to the slow,
+lock-plus-`"__vars"`-lookup path instead -- measured directly at roughly
+700x slower per alloc+drop cycle (5,000,000 cycles: 62ms expected-shape
+vs. 43,656ms measured). This wasn't yet live/user-facing: the ordinary
+`./patc1.exe --x64` CLI path doesn't currently link `heap_chunk.obj` at
+all, so `box_new` fails to link outside block-model's own test tooling
+(`build_native.patlang`) -- but it would have gone live the moment this
+plan's own Phase 2 (or anything else) wired `bm_alloc` into a real
+compiler path, so fixing it now rather than inheriting it was the right
+call. Fixed by calling `bm_heap_init()` *before* the `__globals` seed;
+verified via a deterministic fixture (checks the free-list table's own
+magic marker directly, not a timing measurement) and a scaling check
+(500k/1M/2M box_set/box_get cycles: 32ms/37ms/49ms, linear).
+
+**Checkpoint:** both the generalized-allocator proof (above) and the
+free-list fast-path's own genuine reachability are confirmed, not
+assumed -- `refcounted_heap_native_check.patlang`'s full suite (13/13)
+and `native_codegen_check.sh`'s full suite (38/38) both pass.
 
 ---
 

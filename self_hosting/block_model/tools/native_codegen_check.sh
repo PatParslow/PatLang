@@ -200,6 +200,10 @@ echo "Scenario: a single-block pure function's entry seed is dropped too, not ju
 OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/native_call_pure_no_leak.patlang issue216_no_leak 2>&1)
 check_seq "2000 calls to a single-block pure function cause exactly zero heap growth" "$OUT" "total= 2000 growth= 0"
 
+echo "Scenario: bm_heap_init runs before main's own entry seed, so the free-list table genuinely lands first (general-refcounting.md Phase 1)"
+OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/native_box_heap_init_order.patlang native_box_heap_init_order 2>&1)
+check_seq "the free-list table's own magic marker is set at the heap's base address" "$OUT" "fixed_ready=true value=42"
+
 echo ""
 echo "tests: $PASS passed, $FAIL failed"
 if [ "$FAIL" -eq 0 ]; then

@@ -1756,11 +1756,31 @@ make a function called bm_to_real_funcir takes prog, print_op returns funcirs
   # program failed at startup on a function it never used, silently, since
   # the WASM check is a standalone script nothing ran. A program without a
   # Box has no use for the heap, so the native path loses nothing.
-  let init_instrs = [["BuildList", 0], ["Store", bm_nc_prefix(entry_name, "__globals")]]
+  #
+  # Ordering fix (found scoping docs/plans/general-refcounting.md's Phase
+  # 1 checkpoint): bm_heap_init() used to run AFTER the [BuildList, 0]
+  # seed just below, meaning that seed -- unconditionally the first thing
+  # ANY program's own main does -- had always already claimed the heap's
+  # first allocation by the time bm_heap_init ran. heap.patlang's own
+  # bm_heap_fixed_ready() check (its "is the free-list table the FIRST
+  # heap allocation, so every thread can find it with no lookup at all"
+  # fast path) could therefore never be true for a real program with any
+  # other startup code -- confirmed directly: even the single-line
+  # program `print("x")` already shows a 64-byte heap bump before its own
+  # first statement runs. Every bm_alloc/bm_rc_inc/bm_rc_dec call then
+  # fell through to the slow, lock-plus-"__vars"-lookup path instead of
+  # the lock-free one -- measured at roughly 700x slower per alloc+drop
+  # cycle (5,000,000 cycles: 62ms expected-shape vs 43,656ms measured).
+  # Calling bm_heap_init() FIRST, before the __globals seed, makes the
+  # free-list table genuinely the first allocation whenever a program
+  # uses Box at all, restoring the fast path for real.
+  let init_instrs = []
   if bm_nc_program_uses_heap(prog) then
     let init_instrs = list_push(init_instrs, ["Call", "bm_heap_init", 0])
     let init_instrs = list_push(init_instrs, ["Store", bm_nc_prefix(entry_name, "__bm_discard")])
   end
+  let init_instrs = list_push(init_instrs, ["BuildList", 0])
+  let init_instrs = list_push(init_instrs, ["Store", bm_nc_prefix(entry_name, "__globals")])
 
   let main_flat = bm_nc_flatten_blocks(prog, main_blocks, init_instrs, print_op, "main")
   let main_flat = list_push(main_flat, ["Const", "unit", ""])

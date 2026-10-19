@@ -289,6 +289,26 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
       #215, exercising exactly this multi-block shape via bm_alloc/
       bm_freelist_pop/bm_rc_dec -- now passes again.
 
+  Scenario: bm_heap_init runs before main's own entry seed, so the free-list table genuinely lands first (docs/plans/general-refcounting.md, Phase 1)
+    Given a program that uses box_new (so bm_nc_program_uses_heap is true)
+    When it is built and run as a real, fully native executable
+    Then a direct check of the free-list table's own magic marker at the
+      heap's base address reports true -- the table landed at the heap's
+      genuine first allocation. bm_heap_init() used to run AFTER main's
+      own [BuildList, 0] "__globals" seed (unconditionally the very first
+      thing any program's main does), so heap.patlang's own lock-free
+      fast path (bm_heap_fixed_ready, "is the table the first allocation,
+      so every thread finds it with no lookup at all") could never be
+      true for a real program with any other startup code -- confirmed
+      directly: even a single `print("x")` already shows a 64-byte heap
+      bump before its own first statement runs. Every bm_alloc/
+      bm_rc_inc/bm_rc_dec call then fell through to the slow,
+      lock-plus-"__vars"-lookup path instead, measured at roughly 700x
+      slower per alloc+drop cycle. Calling bm_heap_init() first, before
+      the seed, fixes this for any program that uses Box at all -- scaling
+      checked directly (500k/1M/2M box_set/box_get cycles: 32ms/37ms/49ms,
+      linear, not the earlier pathological per-call cost).
+
   Scenario: apply with a runtime name and arguments dispatches natively
     Given a program using apply with two, one-statement and zero arguments
     When it is built and run as a real, fully native executable
