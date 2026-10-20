@@ -1606,6 +1606,52 @@ make a function called bm_nc_is_string_producer_call takes instr returns yes
   return bm_list_contains(bm_nc_string_producer_names(), list_get(instr, 1))
 end
 
+# docs/plans/general-refcounting.md, Phase 4b: a BuildList (any list
+# literal, including a closure's own captured-values list) always
+# produces a brand-new, uniquely-owned list node -- a genuine producer,
+# the list-level counterpart of bm_nc_is_string_producer_call. list_push
+# and list_set ALSO always return a brand-new node (never the same node
+# as their own first argument -- see Phase 4a's own header on heap.
+# patlang: the in-place-growth path retires the old node and returns a
+# DIFFERENT, freshly bm_alloc'd one; the doubling path does too), so a
+# local storing either of THEIR results is just as eligible a candidate
+# as a bare list literal.
+make a function called bm_nc_list_producer_names returns names
+  return ["list_push", "list_set"]
+end
+
+make a function called bm_nc_is_list_producer_call takes instr returns yes
+  let op = list_get(instr, 0)
+  if op == "BuildList" then
+    return true
+  end
+  if (op != "Call") and (op != "CallHost") then
+    return false
+  end
+  return bm_list_contains(bm_nc_list_producer_names(), list_get(instr, 1))
+end
+
+# Either kind this pass currently knows how to decrement -- used only to
+# decide "is this instruction a producer at all" when scanning for
+# candidate Store sites; bm_nc_rc_dec_fn_for_name (below) decides WHICH
+# decrement call a given eligible name actually needs, once eligibility
+# is otherwise established.
+make a function called bm_nc_is_refcounted_producer_call takes instr returns yes
+  return bm_nc_is_string_producer_call(instr) or bm_nc_is_list_producer_call(instr)
+end
+
+# The real decrement function to call for a value this pass is about to
+# release, given the producer instruction that created it -- "rt_string_
+# rc_dec" or "rt_list_rc_dec" (block_model/heap.patlang's own generic
+# bm_rc_dec, wrapped the same way rt_string_rc_dec already wraps it for
+# strings: unmask the tag, recover the real allocation size, decrement).
+make a function called bm_nc_rc_dec_fn_for_producer takes instr returns name
+  if bm_nc_is_list_producer_call(instr) then
+    return "rt_list_rc_dec"
+  end
+  return "rt_string_rc_dec"
+end
+
 # Single-block closures only -- a later increment, not this one, would
 # need to handle a root whose closure spans more than one block (loops,
 # via JumpBlock).
@@ -1860,7 +1906,7 @@ make a function called bm_nc_reassignable_eligible_names takes instrs, captured_
   let i = 0
   while i < (n - 1) do
     let instr = list_get(instrs, i)
-    if bm_nc_is_string_producer_call(instr) then
+    if bm_nc_is_refcounted_producer_call(instr) then
       let next = list_get(instrs, i + 1)
       if list_get(next, 0) == "Store" then
         let name = list_get(next, 1)
@@ -1882,23 +1928,41 @@ make a function called bm_nc_reassignable_eligible_names takes instrs, captured_
       let p = list_get(positions, pi)
       if p == 0 then
         let all_producer_preceded = false
-      elif not bm_nc_is_string_producer_call(list_get(instrs, p - 1)) then
+      elif not bm_nc_is_refcounted_producer_call(list_get(instrs, p - 1)) then
         let all_producer_preceded = false
       end
       let pi = pi + 1
     end
     if all_producer_preceded then
       let first_p = list_get(positions, 0)
-      let dominates_all = true
-      let pj = 1
-      while pj < list_len(positions) do
-        if not bm_nc_flat_index_dominates(instrs, first_p, list_get(positions, pj)) then
-          let dominates_all = false
+      # Every Store must be producer-preceded by the SAME KIND of
+      # producer (all string, or all list) -- a local that could hold
+      # EITHER depending on which path ran would need a runtime type
+      # check to know which decrement function applies, which this pass
+      # does not do (deliberately out of scope: "prove it or fall back",
+      # not "mixed kinds never happen in practice").
+      let first_is_list = bm_nc_is_list_producer_call(list_get(instrs, first_p - 1))
+      let same_kind = true
+      let pk = 1
+      while pk < list_len(positions) do
+        let pp = list_get(positions, pk)
+        if bm_nc_is_list_producer_call(list_get(instrs, pp - 1)) != first_is_list then
+          let same_kind = false
         end
-        let pj = pj + 1
+        let pk = pk + 1
       end
-      if dominates_all then
-        let eligible = list_push(eligible, name)
+      if same_kind then
+        let dominates_all = true
+        let pj = 1
+        while pj < list_len(positions) do
+          if not bm_nc_flat_index_dominates(instrs, first_p, list_get(positions, pj)) then
+            let dominates_all = false
+          end
+          let pj = pj + 1
+        end
+        if dominates_all then
+          let eligible = list_push(eligible, name)
+        end
       end
     end
     let ci = ci + 1
@@ -1931,11 +1995,18 @@ make a function called bm_nc_insert_reassignment_decs takes root, instrs returns
   let eligible_names = bm_nc_reassignable_eligible_names(instrs, captured_names)
   let insert_names = []
   let insert_positions = []
+  let insert_fns = []
   let ei = 0
   while ei < list_len(eligible_names) do
     let name = list_get(eligible_names, ei)
     let positions = bm_nc_flat_store_positions(instrs, name)
     if list_len(positions) > 1 then
+      # Every Store of this name is producer-preceded by the SAME kind
+      # (bm_nc_reassignable_eligible_names's own "same_kind" condition),
+      # so the OLD value being overwritten is always the same kind as
+      # the NEW one -- one decrement-function lookup per name, from its
+      # first store, covers every reassignment of it.
+      let dec_fn = bm_nc_rc_dec_fn_for_producer(list_get(instrs, list_get(positions, 0) - 1))
       let pj = 1
       while pj < list_len(positions) do
         # Insert BEFORE the producer call that computes the new value
@@ -1952,6 +2023,7 @@ make a function called bm_nc_insert_reassignment_decs takes root, instrs returns
         # trusting the IR shape alone.
         let insert_names = list_push(insert_names, name)
         let insert_positions = list_push(insert_positions, list_get(positions, pj) - 1)
+        let insert_fns = list_push(insert_fns, dec_fn)
         let pj = pj + 1
       end
     end
@@ -1978,10 +2050,13 @@ make a function called bm_nc_insert_reassignment_decs takes root, instrs returns
     if min_idx != si then
       let tmp_pos = list_get(insert_positions, si)
       let tmp_name = list_get(insert_names, si)
+      let tmp_fn = list_get(insert_fns, si)
       let insert_positions = list_set(insert_positions, si, list_get(insert_positions, min_idx))
       let insert_names = list_set(insert_names, si, list_get(insert_names, min_idx))
+      let insert_fns = list_set(insert_fns, si, list_get(insert_fns, min_idx))
       let insert_positions = list_set(insert_positions, min_idx, tmp_pos)
       let insert_names = list_set(insert_names, min_idx, tmp_name)
+      let insert_fns = list_set(insert_fns, min_idx, tmp_fn)
     end
     let si = si + 1
   end
@@ -1994,7 +2069,7 @@ make a function called bm_nc_insert_reassignment_decs takes root, instrs returns
     while k < list_len(insert_positions) do
       if list_get(insert_positions, k) == i then
         let out = list_push(out, ["Load", list_get(insert_names, k)])
-        let out = list_push(out, ["Call", "rt_string_rc_dec", 1])
+        let out = list_push(out, ["Call", list_get(insert_fns, k), 1])
         let out = list_push(out, ["Store", discard_name])
       end
       let k = k + 1
@@ -2122,10 +2197,13 @@ make a function called bm_nc_insert_string_rc_decs takes root, instrs returns ou
   # ever needs the position of the FIRST store (job 2).
   let eligible_names = bm_nc_reassignable_eligible_names(instrs, captured_names)
   let eligible_stores = []
+  let eligible_fns = []
   let eni = 0
   while eni < list_len(eligible_names) do
     let positions = bm_nc_flat_store_positions(instrs, list_get(eligible_names, eni))
-    let eligible_stores = list_push(eligible_stores, list_get(positions, 0))
+    let first_p = list_get(positions, 0)
+    let eligible_stores = list_push(eligible_stores, first_p)
+    let eligible_fns = list_push(eligible_fns, bm_nc_rc_dec_fn_for_producer(list_get(instrs, first_p - 1)))
     let eni = eni + 1
   end
   if list_len(eligible_names) == 0 then
@@ -2184,8 +2262,16 @@ make a function called bm_nc_insert_string_rc_decs takes root, instrs returns ou
       while ei < list_len(names_here) do
         let name = list_get(names_here, ei)
         if name != returned_name then
+          let dec_fn = "rt_string_rc_dec"
+          let fi = 0
+          while fi < list_len(eligible_names) do
+            if list_get(eligible_names, fi) == name then
+              let dec_fn = list_get(eligible_fns, fi)
+            end
+            let fi = fi + 1
+          end
           let out = list_push(out, ["Load", name])
-          let out = list_push(out, ["Call", "rt_string_rc_dec", 1])
+          let out = list_push(out, ["Call", dec_fn, 1])
           let out = list_push(out, ["Store", discard_name])
         end
         let ei = ei + 1

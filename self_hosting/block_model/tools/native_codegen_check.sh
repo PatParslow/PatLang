@@ -347,6 +347,28 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+echo "Scenario: a list local is automatically decremented when discarded or reassigned, the same way a string local already was (docs/plans/general-refcounting.md, Phase 4b)"
+rm -f self_hosting/build/native_list_rc_local_discard.exe
+BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_list_rc_local_discard.patlang self_hosting/build/native_list_rc_local_discard.exe --x64 2>&1)
+if [ -f self_hosting/build/native_list_rc_local_discard.exe ]; then
+  OUT=$(./self_hosting/build/native_list_rc_local_discard.exe 2>&1)
+  check_seq "50000 build-and-discard cycles, and 50000 cycles reassigning a list local between two literals, both cause exactly zero heap growth" "$OUT" "total1= 49999 growth1= 0 growth2= 0"
+else
+  echo "  FAIL: the list-rc-local-discard fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: a list_push RESULT stored in a local is also automatically decremented when discarded (docs/plans/general-refcounting.md, Phase 4b)"
+rm -f self_hosting/build/native_list_rc_push_result_discard.exe
+BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_list_rc_push_result_discard.patlang self_hosting/build/native_list_rc_push_result_discard.exe --x64 2>&1)
+if [ -f self_hosting/build/native_list_rc_push_result_discard.exe ]; then
+  OUT=$(./self_hosting/build/native_list_rc_push_result_discard.exe 2>&1)
+  check_seq "50000 cycles pushing onto a stable, reused base list and discarding the result cause exactly zero heap growth" "$OUT" "total= 49999 growth= 0"
+else
+  echo "  FAIL: the list-rc-push-result-discard fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
 echo ""
 echo "tests: $PASS passed, $FAIL failed"
 if [ "$FAIL" -eq 0 ]; then

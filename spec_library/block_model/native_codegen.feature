@@ -668,6 +668,44 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
       check.sh, thread_safety_check.sh, and the full language spec gate
       all remain green.
 
+  Scenario: a list local is automatically decremented when discarded or reassigned, the same way a string local already was (docs/plans/general-refcounting.md, Phase 4b)
+    Given the single-block dominance pass (bm_nc_reassignable_eligible_
+      names / bm_nc_insert_string_rc_decs / bm_nc_insert_reassignment_
+      decs, native_codegen.patlang), previously recognizing only a
+      string-producer call as a value worth automatically decrementing
+    When BuildList, and CallHost calls to list_push/list_set, are ALSO
+      recognized as producers (bm_nc_is_list_producer_call) -- a local
+      whose every Store is producer-preceded by the SAME kind (all
+      string, or all list; a local that could hold either depending on
+      path is excluded outright, since deciding which decrement
+      function applies would need a runtime type check this pass does
+      not do) is eligible the same way a string local already was, and
+      the right decrement call (rt_string_rc_dec or the new rt_list_rc_
+      dec, x64_runtime.patlang) is chosen per name from its own first
+      store's producer
+    Then a list built via a literal, stored in a local, never returned
+      or passed into another BuildList/list_push/list_set call, is
+      decremented at its own function's terminal; a list_push RESULT
+      stored in a local and discarded the same way is decremented too;
+      and a local reassigned between two list literals is decremented
+      both at the reassignment point (job 1) and at the terminal
+      (job 2) -- 50000 cycles each, exactly zero heap growth, confirmed
+      directly (104 bytes leaked per call before this pass recognized
+      list producers at all).
+      A real regression was found and fixed verifying this: Phase 3a's
+      own native_list_rc_retire_chain.patlang fixture manually called
+      rt_list_node_rc_dec on two locals (`d` in build_and_discard, `c`
+      in sharing_cycle) that neither escape into a further list_push/
+      list_set/BuildList call nor are closure-captured -- both became
+      genuinely eligible for THIS pass the moment it landed, and the
+      fixture's own manual decrement collided with the compiler's new
+      automatic one, segfaulting from a real double-decrement. Fixed by
+      removing those two now-redundant manual calls, relying on this
+      pass instead; the fixture's OTHER locals (`a`/`b` in build_and_
+      discard, `a` in sharing_cycle) stay manually managed, since each
+      is used as list_push's own base argument at least once, which
+      this pass's escape check still conservatively excludes.
+
   Scenario: apply with a runtime name and arguments dispatches natively
     Given a program using apply with two, one-statement and zero arguments
     When it is built and run as a real, fully native executable

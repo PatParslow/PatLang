@@ -589,17 +589,61 @@ nothing had run that specific fixpoint test since whatever introduced
 it. Blocks proving self-hosting still round-trips; does not block
 ordinary `--x64` compilation, which is unaffected.
 
-**Not yet started:** 4b (a dominance-based decrement pass for LIST
-locals, mirroring Phase 2's string work -- `BuildList`/`list_push`/
-`list_set` recognized as producers of a refcounted value, the same way
-`bm_nc_reassignable_eligible_names` already does for strings); 4c
-(cascading decrement into string/list elements when a list's own
-refcount reaches zero -- the actual "list/dict-element storage" feature
-as originally named); 4d (the read side -- `list_get`/indexing a
-String/List element is also a copy site and needs its own `rc_inc`,
-symmetric with 4c). Dict: confirmed via `codegen_x64.patlang` that
---x64 has no separate Dict primitives at all, so no separate Dict work
-is needed in any of 4b-4d.
+### Phase 4b -- dominance-based decrement pass for LIST locals (done)
+
+Generalized the single-block pass (`bm_nc_reassignable_eligible_names`/
+`bm_nc_insert_string_rc_decs`/`bm_nc_insert_reassignment_decs`) from
+recognizing only a string-producer call to also recognizing `BuildList`
+and `CallHost` calls to `list_push`/`list_set` as producers
+(`bm_nc_is_list_producer_call`). A name's every Store must be producer-
+preceded by the SAME kind (all string, or all list) to be eligible --
+mixed kinds would need a runtime type check this pass does not do, so a
+local that could hold either depending on path is excluded outright,
+not guessed at. The right decrement call (`rt_string_rc_dec` or the new
+`rt_list_rc_dec`, `x64_runtime.patlang` -- the list-level counterpart of
+`rt_string_rc_dec`, unmasking the tag and calling `rt_list_node_rc_dec`)
+is chosen per eligible name from its own first store's producer.
+
+The EXISTING escape check (`bm_nc_flat_list_escaped_names`, already
+built for strings escaping into a list) needed no changes at all to
+also protect list locals: it already flags any name loaded in the same
+statement-bounded window as a `BuildList`/`list_push`/`list_set`, which
+correctly excludes a list local passed as `list_push`/`list_set`'s own
+BASE argument too (conservative -- the base is actually safe to
+decrement afterward per Phase 4a's own "list_push borrows its `l`
+argument" design, but proving that precisely needs more than a window
+check, so this increment accepts the missed optimization rather than
+risk it).
+
+Verified: three new fixtures (`native_list_rc_local_discard.patlang`,
+`native_list_rc_push_result_discard.patlang`, plus two scenarios in the
+existing feature file), 50000 cycles each, covering a bare list literal
+discarded, a `list_push` result discarded, and a reassigned list local
+-- all flat heap growth (104 bytes/call leaked before this pass
+recognized list producers at all).
+
+A real regression was found and fixed verifying this: Phase 4a's own
+`native_list_rc_retire_chain.patlang` fixture manually decremented two
+locals (`d` in `build_and_discard`, `c` in `sharing_cycle`) that turned
+out to be genuinely eligible for THIS pass the moment it landed (neither
+escapes into a further list_push/list_set/BuildList call) -- the
+fixture's manual call collided with the compiler's new automatic one, a
+real double-decrement that segfaulted. Fixed by removing those two now-
+redundant manual calls; the fixture's other locals stay manually
+managed, since each is used as `list_push`'s own base argument, which
+the escape check still conservatively excludes.
+
+Full regression suite remains green: `native_codegen_check.sh` (53/53),
+`refcounted_heap_native_check.sh` (13/13), `thread_safety_check.sh`
+(5/5), full language spec gate (178/178).
+
+**Not yet started:** 4c (cascading decrement into string/list elements
+when a list's own refcount reaches zero -- the actual "list/dict-
+element storage" feature as originally named); 4d (the read side --
+`list_get`/indexing a String/List element is also a copy site and needs
+its own `rc_inc`, symmetric with 4c). Dict: confirmed via
+`codegen_x64.patlang` that --x64 has no separate Dict primitives at
+all, so no separate Dict work is needed in either.
 
 ## 4. What this plan deliberately does not cover
 
