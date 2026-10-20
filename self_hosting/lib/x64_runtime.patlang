@@ -2434,19 +2434,36 @@ end
 # header already establishes (read whatever payload data the cascade
 # needs first, decrement second), since bm_rc_dec can push this exact
 # block onto the free list immediately, and a concurrent thread could
-# pop and start overwriting it before a post-decrement read ran.
+# pop and start overwriting it before a post-decrement read ran. Same
+# reason a kind-1 (retire_set) node's own `val` field -- the element it
+# was diffing away, see rt_list_retire_set's own header for why this
+# node holds a counted reference to it -- is also read here, before the
+# decrement, not after.
+#
+# docs/plans/general-refcounting.md, Phase 4c: a kind==0 node's own
+# `len` is also read here and threaded into rt_list_buf_rc_dec -- see
+# that function's own header for why it needs the node's real length,
+# not buf's own allocated capacity.
 make a function called rt_list_node_rc_dec takes node returns done
   let kind = mem_peek_qword(node, 8)
   let cascade_to = mem_peek_qword(node, 16)
+  let len = mem_peek_qword(node, 0)
+  let val = 0
   if kind != 0 then
     let cascade_to = mem_peek_qword(node, 40)
+  end
+  if kind == 1 then
+    let val = mem_peek_qword(node, 32)
   end
   let n = bm_rc_dec(node, rt_list_node_payload_size())
   if n == 0 then
     if kind == 0 then
-      rt_list_buf_rc_dec(cascade_to)
+      rt_list_buf_rc_dec(cascade_to, len)
     else
       rt_list_node_rc_dec(cascade_to)
+      if kind == 1 then
+        rt_rc_dec_if_refcounted(val)
+      end
     end
   end
   return true
@@ -2457,9 +2474,84 @@ make a function called rt_list_buf_rc_inc takes buf returns done
   return true
 end
 
-make a function called rt_list_buf_rc_dec takes buf returns done
+# docs/plans/general-refcounting.md, Phase 4c: the actual "list/dict-
+# element storage" feature as originally named -- when a buffer's own
+# refcount reaches zero, every element it holds that is itself a
+# String or List (rt_rc_dec_if_refcounted silently skips anything else)
+# gets decremented too, cascading the buffer's own death into whatever
+# it was the last reference to.
+#
+# Takes `len` as a SEPARATE argument from the caller (the dying node's
+# own length, read from the node BEFORE this call -- see rt_list_node_
+# rc_dec's own header), not read from buf's own `cap` header: buf's
+# allocated capacity can genuinely exceed how many of its slots were
+# ever actually populated (rt_list_push's doubling path over-allocates
+# on purpose), leaving the slots between len and cap uninitialized.
+# Cascading over cap instead of len would read that uninitialized
+# padding as a tagged value and could try to decrement garbage as if
+# it were a live String/List pointer -- a real, confirmed bug (caught
+# by native_list_rc_retire_chain.patlang's own regression, growth1= 8
+# instead of 0, once build_and_discard's own `d` -- cap 4, len 3 --
+# started getting automatically decremented by Phase 4b).
+#
+# `len` also naturally sidesteps a second, independently real issue:
+# cap can be 0 (an empty list literal's own buffer) with nothing at
+# all to cascade into -- skipping the scratch allocation entirely
+# whenever `len == 0` avoids ever calling bm_alloc/bm_rc_dec with a
+# size of exactly 0, which collides with block_model/heap.patlang's
+# own "empty slot" sentinel (`bm_freelist_slot_offset_scan`'s own
+# header: size 0 is reserved to mean "not yet claimed by any size
+# class", so a genuine size-0 request can't be distinguished from an
+# unclaimed slot) -- a second, independently real contributor to the
+# same observed growth1= 8 before this fix.
+#
+# Every element actually within `len` is read into a SEPARATE scratch
+# block BEFORE calling bm_rc_dec, not read back out of `buf` itself
+# afterward: the same "read first, decrement second" rule as rt_list_
+# node_rc_dec's own header, generalized from two fixed fields to a
+# runtime-variable count of them. The scratch block itself goes
+# through bm_alloc/bm_rc_dec (the real, reclaimable allocator), NOT
+# rt_heap_alloc -- rt_heap_alloc is a pure bump allocator with no free
+# at all (see its own header), so a per-call rt_heap_alloc here would
+# never be reclaimed and would leak a fixed `len * 8` bytes on EVERY
+# cascade, independent of the refcount bookkeeping around it
+# (confirmed empirically: this was the exact, sole remaining cause of
+# scratch_element_reclaim.patlang still showing `growth= 400000` --
+# 8 bytes/call, len=1 -- after every other increment/decrement site in
+# this file had already been balanced). A PatLang List is still
+# deliberately NOT used for this scratch copy -- list_push/BuildList
+# would re-enter this exact refcounting machinery while it is still
+# partway through freeing a buffer, a real reentrancy risk a plain
+# bm_alloc'd/bm_rc_dec'd block (never exposed as a tagged List value,
+# never touched by list_* at all) sidesteps entirely (the same reason
+# rt_list_materialize's own `path` scratch array, just above, stays a
+# plain rt_heap_alloc -- that one is a one-time-per-materialize array
+# of raw node POINTERS, not a per-cascade hot path, so its own non-
+# reclamation is comparatively cheap; worth revisiting if materialize
+# ever shows up as a real leak too).
+make a function called rt_list_buf_rc_dec takes buf, len returns done
   let cap = mem_peek_qword(buf, 0)
-  bm_rc_dec(buf, 16 + cap * 8)
+  if len > 0 then
+    let scratch = bm_alloc(len * 8)
+    let i = 0
+    while i < len do
+      mem_poke_qword(scratch, i * 8, mem_peek_qword(buf, 16 + i * 8))
+      let i = i + 1
+    end
+  end
+  let n = bm_rc_dec(buf, 16 + cap * 8)
+  if n == 0 then
+    if len > 0 then
+      let j = 0
+      while j < len do
+        rt_rc_dec_if_refcounted(mem_peek_qword(scratch, j * 8))
+        let j = j + 1
+      end
+    end
+  end
+  if len > 0 then
+    bm_rc_dec(scratch, len * 8)
+  end
   return true
 end
 
@@ -2473,6 +2565,82 @@ end
 # never called directly from ordinary PatLang source.
 make a function called rt_list_rc_dec takes l returns done
   rt_list_node_rc_dec(l band rt_payload_mask())
+  return true
+end
+
+# docs/plans/general-refcounting.md, Phase 4c: a String's tagged value
+# can point at genuine bm_alloc'd heap memory (a real refcount header
+# at ptr-8) OR at a string LITERAL's own static .data label
+# (codegen_x64.patlang's own x64_collect_string_data) -- same tag bits
+# either way, but a literal has NO refcount header at all. Cascading
+# decrement over arbitrary list elements (rt_rc_inc_if_refcounted/rt_
+# rc_dec_if_refcounted, right below) is the first mechanism in this
+# file that can ever reach a literal this way -- every earlier string-
+# refcounting site only ever touched a NAMED local assigned from a
+# KNOWN PRODUCER CALL (chr, concat, substr...), via native_codegen.
+# patlang's own compiler passes, never a bare literal. Blindly
+# incrementing/decrementing ptr-8 for a literal corrupts whatever
+# static .data happens to sit there instead (confirmed empirically:
+# x64_list_equality.patlang's own first comparison, `["rare_atlas",
+# "branch_b"] == list_push(list_push([], "rare_atlas"), "branch_b")`,
+# started returning false instead of true the moment element-level
+# cascading landed).
+#
+# Fix: only touch the refcount header when the payload address
+# genuinely falls within the heap's own live range -- reusing the
+# same [heap_base, heap_base + used) bound codegen_x64.patlang's own
+# type_of/numeric_kind payload-validity check already establishes for
+# exactly this literal-vs-heap distinction (see that file's own
+# GitHub #57/#89 header comments, around x64_family_code_asm). Lists
+# are never literal/static (BuildList always allocates fresh at
+# runtime), so this only ever actually excludes a String in practice --
+# guarding both uniformly here is simpler than special-casing just one.
+# Anything outside the heap's range is treated as immortal: never
+# incremented, never decremented, matching its real lifetime (the
+# whole program's own).
+make a function called rt_rc_payload_in_heap takes addr returns yes
+  let base = mem_heap_base()
+  let used = mem_peek_qword(mem_heap_state_addr(), 0)
+  if (addr >= base) and (addr < base + used) then
+    return true
+  end
+  return false
+end
+
+# The two generic dispatchers element-level refcounting is built on --
+# given an arbitrary tagged VALUE (which could be anything a list/
+# buffer slot ever holds: a fixnum, bool, string, list, closure,
+# object...), inc/dec it ONLY if it's actually a String or List AND
+# (per rt_rc_payload_in_heap's own header, just above) genuinely heap-
+# allocated; every other kind, or a literal, is a silent no-op, by
+# design. Increment needs no size recovery (bm_rc_inc just bumps
+# whatever's at ptr-8, regardless of kind), so both kinds share one
+# path; decrement needs the kind to know which wrapper (rt_string_rc_
+# dec/rt_list_rc_dec) can recover the right allocation size/cascade.
+make a function called rt_rc_inc_if_refcounted takes v returns done
+  let family_mask = 17293822569102704640
+  let family = v band family_mask
+  if (family == rt_string_tag()) or (family == rt_list_tag()) then
+    let addr = v band rt_payload_mask()
+    if rt_rc_payload_in_heap(addr) then
+      bm_rc_inc(addr)
+    end
+  end
+  return true
+end
+
+make a function called rt_rc_dec_if_refcounted takes v returns done
+  let family_mask = 17293822569102704640
+  let family = v band family_mask
+  if family == rt_string_tag() then
+    if rt_rc_payload_in_heap(v band rt_payload_mask()) then
+      rt_string_rc_dec(v)
+    end
+  elif family == rt_list_tag() then
+    if rt_rc_payload_in_heap(v band rt_payload_mask()) then
+      rt_list_rc_dec(v)
+    end
+  end
   return true
 end
 
@@ -2534,19 +2702,29 @@ end
 # header) exactly: a concurrent reader that observes kind != 0 already
 # sees these fully resolved, both the payload AND this node's own
 # release of its buf reference.
+#
+# docs/plans/general-refcounting.md, Phase 4c: `val` (the element this
+# diff remembers as overwritten) is ALSO a real, counted reference now
+# -- this node keeps it alive for as long as some stale reader might
+# still materialize through it, exactly like `next`. rt_list_node_rc_
+# dec's own kind==1 branch is the matching release, when this node
+# itself eventually dies.
 make a function called rt_list_retire_set takes node, idx, val, next returns done
+  let len = mem_peek_qword(node, 0)
   mem_poke_qword(node, 24, idx)
   mem_poke_qword(node, 32, val)
   mem_poke_qword(node, 40, next)
   rt_list_node_rc_inc(next)
-  rt_list_buf_rc_dec(mem_peek_qword(node, 16))
+  rt_rc_inc_if_refcounted(val)
+  rt_list_buf_rc_dec(mem_peek_qword(node, 16), len)
   mem_poke_qword(node, 8, 1)
   return true
 end
 
 make a function called rt_list_retire_trunc takes node, next returns done
+  let len = mem_peek_qword(node, 0)
   rt_list_node_rc_inc(next)
-  rt_list_buf_rc_dec(mem_peek_qword(node, 16))
+  rt_list_buf_rc_dec(mem_peek_qword(node, 16), len)
   mem_poke_qword(node, 40, next)
   mem_poke_qword(node, 8, 2)
   return true
@@ -2648,9 +2826,17 @@ make a function called rt_list_materialize takes node, cap returns fresh
   # as any other small internal working buffer elsewhere in this file).
   let buf = bm_alloc(16 + cap * 8)
   mem_poke_qword(buf, 0, cap)
+  # docs/plans/general-refcounting.md, Phase 4c: every element copied
+  # into this FRESH buffer is a genuinely NEW reference (this buffer,
+  # not just root_buf, now also holds it) -- increment it if it's a
+  # String/List. A diff applied below may immediately displace one of
+  # these copies; that displaced value gets its own matching decrement
+  # right there, not here.
   let k = 0
   while k < n0 do
-    mem_poke_qword(buf, 16 + k * 8, mem_peek_qword(root_buf, 16 + k * 8))
+    let ev = mem_peek_qword(root_buf, 16 + k * 8)
+    mem_poke_qword(buf, 16 + k * 8, ev)
+    rt_rc_inc_if_refcounted(ev)
     let k = k + 1
   end
   if depth > 0 then
@@ -2668,7 +2854,11 @@ make a function called rt_list_materialize takes node, cap returns fresh
       if mem_peek_qword(nd, 8) == 1 then
         let ix = mem_peek_qword(nd, 24)
         if ix < n0 then
-          mem_poke_qword(buf, 16 + ix * 8, mem_peek_qword(nd, 32))
+          let displaced = mem_peek_qword(buf, 16 + ix * 8)
+          let diff_val = mem_peek_qword(nd, 32)
+          mem_poke_qword(buf, 16 + ix * 8, diff_val)
+          rt_rc_inc_if_refcounted(diff_val)
+          rt_rc_dec_if_refcounted(displaced)
         end
       end
       let j = j - 1
@@ -2690,6 +2880,13 @@ end
 # buffer, and never returned or kept -- it must be explicitly released
 # here (rt_list_node_rc_dec), in BOTH the in-place and doubling paths,
 # or its one reference to its own buffer leaks forever.
+#
+# docs/plans/general-refcounting.md, Phase 4c: `v` itself is stored
+# into the buffer WITHOUT an increment here -- same reasoning as
+# rt_list_set_functional's own header comment. Each existing element
+# `ev` copied into a NEW buffer (the doubling path's copy loop) DOES
+# get incremented, since that genuinely creates a second buffer-level
+# reference to an already-established value.
 make a function called rt_list_push takes l, v returns tagged
   let node = l band rt_payload_mask()
   let n = mem_peek_qword(node, 0)
@@ -2720,9 +2917,14 @@ make a function called rt_list_push takes l, v returns tagged
   end
   let new_buf = bm_alloc(16 + new_cap * 8)
   mem_poke_qword(new_buf, 0, new_cap)
+  # docs/plans/general-refcounting.md, Phase 4c: new_buf is a genuinely
+  # NEW buffer -- every element copied into it is an additional
+  # reference, same reasoning as rt_list_materialize's own copy loop.
   let i = 0
   while i < n do
-    mem_poke_qword(new_buf, 16 + i * 8, mem_peek_qword(buf, 16 + i * 8))
+    let ev = mem_peek_qword(buf, 16 + i * 8)
+    mem_poke_qword(new_buf, 16 + i * 8, ev)
+    rt_rc_inc_if_refcounted(ev)
     let i = i + 1
   end
   mem_poke_qword(new_buf, 16 + n * 8, v)
@@ -2734,6 +2936,20 @@ end
 
 # list_set(list, i, item) -> a list with element i replaced, as a value: no
 # other holder of `l` sees the change.
+#
+# docs/plans/general-refcounting.md, Phase 4c: whichever element `v`
+# displaces at index i is losing the ONE reference that slot held (the
+# retired-input branch's own displaced value came from rt_list_
+# materialize's just-finished copy; the live branch's own `old` is
+# simultaneously gaining a NEW reference via rt_list_retire_set's own
+# `val` handling, so decrementing it HERE is what makes that a transfer
+# rather than a double-count). `v` itself is NOT incremented here: a
+# brand-new element being stored for the first time starts with
+# whatever refcount its own producer gave it (1 for an unnamed temp,
+# matching the single eventual cascade decrement; the compiler-level
+# bm_nc_insert_list_element_incs pass is what adds a second increment
+# when `v` is actually a named, independently-tracked local that will
+# ALSO be decremented at its own scope exit).
 make a function called rt_list_set_functional takes l, i0, v returns tagged
   let i = i0
   if (((i0 shr 60) band 15) != 0) and (((i0 shr 60) band 15) != 15) then
@@ -2743,7 +2959,10 @@ make a function called rt_list_set_functional takes l, i0, v returns tagged
   let n = mem_peek_qword(node, 0)
   if mem_peek_qword(node, 8) != 0 then
     let fresh = rt_list_materialize(node, n)
-    mem_poke_qword(mem_peek_qword(fresh, 16), 16 + i * 8, v)
+    let fresh_buf = mem_peek_qword(fresh, 16)
+    let displaced = mem_peek_qword(fresh_buf, 16 + i * 8)
+    mem_poke_qword(fresh_buf, 16 + i * 8, v)
+    rt_rc_dec_if_refcounted(displaced)
     return fresh bor rt_list_tag()
   end
   let buf = mem_peek_qword(node, 16)
@@ -2755,6 +2974,7 @@ make a function called rt_list_set_functional takes l, i0, v returns tagged
   let fresh = rt_list_node_new(n, buf)
   rt_list_retire_set(node, i, old, fresh)
   mem_poke_qword(buf, 16 + i * 8, v)
+  rt_rc_dec_if_refcounted(old)
   return fresh bor rt_list_tag()
 end
 

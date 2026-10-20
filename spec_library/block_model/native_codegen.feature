@@ -590,34 +590,35 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
       this fix: 24 for the overwritten first value, 24 for the discarded
       final one).
 
-  Scenario: a local whose value escapes into a list literal is never decremented while the list itself is still live (docs/plans/general-refcounting.md, list/dict-element-storage safety gate)
+  Scenario: a local whose value escapes into a list literal is never freed while the list itself is still live (docs/plans/general-refcounting.md, list/dict-element-storage safety gate)
     Given a function that builds a string via a known producer, wraps it
       in a one-element list literal, and returns the LIST -- never the
       string itself directly -- called through the ordinary --x64 CLI
       2000 times, each result kept alive in an outer list, followed by
       2000 more unrelated string allocations to create real allocation
       pressure against any wrongly-freed block
-    When bm_nc_reassignable_eligible_names (native_codegen.patlang) is
-      asked whether the string's own local qualifies for the decrement
-      pass
-    Then it says no, because bm_nc_flat_list_escaped_names finds a
-      BuildList instruction in the same statement-bounded window as that
-      local's own Load -- a REAL, confirmed memory-corruption bug found
-      scoping this plan's "list/dict-element storage" item, not a
-      missing optimization: before this exclusion existed, the local
-      dominated the function's own terminal (the LIST was the value
-      actually returned there, not the local itself), so the pass
-      decremented it anyway, freeing the string while the list still
-      held the exact same pointer. Confirmed directly: 1923 of 2000 kept-
-      alive lists came back with silently corrupted string content under
-      allocation pressure before this fix; zero after. This gate does
-      NOT implement the full list/dict-element-storage feature (actually
-      tracking and reclaiming a string stored into a list/dict element)
-      -- it only makes sure such a value is never wrongly freed out from
-      under the container still holding it, falling back to the pre-
-      Phase-2 bump-forever behavior for it instead, the same "prove it
-      or fall back" shape every other exclusion in this pass already
-      uses.
+    When this local's own value is stored into the list literal
+    Then it is NOT freed out from under the container still holding it
+      (a REAL, confirmed memory-corruption bug found scoping this plan's
+      "list/dict-element storage" item, not a missing optimization: the
+      local dominates the function's own terminal -- the LIST is the
+      value actually returned there, not the local itself -- so an
+      earlier version of this pass decremented the local anyway, freeing
+      the string while the list still held the exact same pointer.
+      Confirmed directly: 1923 of 2000 kept-alive lists came back with
+      silently corrupted string content under allocation pressure before
+      the original fix (a blanket exclusion from the decrement pass,
+      GitHub #221); zero after). Phase 4c (general-refcounting.md)
+      replaced that blanket exclusion with the real mechanism it was
+      standing in for: bm_nc_insert_list_element_incs (native_codegen.
+      patlang) inserts an explicit increment at the exact point this
+      local's value is stored into the list, giving it a genuine SECOND
+      owner -- so the local's own decrement now correctly fires again
+      (no longer excluded) and only brings the refcount from 2 down to
+      1, leaving the list's own eventual cascade (rt_list_buf_rc_dec,
+      x64_runtime.patlang) as the one reference that actually frees it.
+      The value is still never wrongly freed early; it is also no longer
+      bumped forever the way the original exclusion left it.
 
   Scenario: list nodes and buffers are genuinely refcounted and reclaimed (docs/plans/general-refcounting.md, Phase 3a foundation)
     Given self_hosting/lib/x64_runtime.patlang's persistent-list implementation
@@ -705,6 +706,73 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
       discard, `a` in sharing_cycle) stay manually managed, since each
       is used as list_push's own base argument at least once, which
       this pass's escape check still conservatively excludes.
+
+  Scenario: a buffer's own death cascades into the String/List elements it holds (docs/plans/general-refcounting.md, Phase 4c)
+    Given rt_list_buf_rc_dec (x64_runtime.patlang), previously freeing a
+      buffer without ever looking at what it held -- the actual "list/
+      dict-element storage" feature Phase 2's own header named and
+      deferred, not yet built even after Phase 3a/4b made the list's
+      own node/buffer genuinely refcounted
+    When a buffer's own refcount reaches zero, every element within
+      its node's real LENGTH (not the buffer's own allocated capacity,
+      which a doubling growth can genuinely exceed -- see the next
+      scenario) that is itself a String or List is now decremented too
+      (rt_rc_dec_if_refcounted)
+    Then a function building a one-element list wrapping an unnamed,
+      freshly built string (chr(...) fed directly into the list
+      literal) and discarding the whole list, called 50000 times,
+      causes exactly zero heap growth. Two real, confirmed bugs were
+      found and fixed getting here, each caught by the SAME heap-growth
+      measurement showing a nonzero number instead of silently passing:
+      (1) the cascade's own per-call scratch copy (needed to read every
+      element before releasing the buffer -- a concurrent thread could
+      otherwise pop and overwrite a freed block mid-read) was itself
+      allocated via the heap's plain bump allocator (rt_heap_alloc, no
+      free at all) instead of the real, reclaimable one (bm_alloc/bm_
+      rc_dec) -- leaked a fixed `len * 8` bytes on every single cascade,
+      independent of the refcount bookkeeping around it.
+      (2) once a String's tagged value could be reached by this
+      cascade, it became possible for the first time to reach a string
+      LITERAL this way (`["a", "b"]`, not a chr()-built string) -- a
+      literal's tagged pointer has the identical tag bits as a real,
+      bm_alloc'd string but points at a static .data label with NO
+      refcount header at all (codegen_x64.patlang's own x64_collect_
+      string_data), so decrementing it corrupts whatever static data
+      happens to sit there instead. Fixed in the two generic
+      dispatchers (rt_rc_inc_if_refcounted/rt_rc_dec_if_refcounted),
+      reusing the SAME [heap_base, heap_base + used) bound codegen_x64.
+      patlang's own type_of/numeric_kind payload check already
+      established for this exact literal-vs-heap distinction (GitHub
+      #57/#89) -- confirmed directly: x64_list_equality.patlang's own
+      first comparison (two structurally identical lists of string
+      literals) started returning false instead of true the moment
+      element-level cascading landed, and true again once this fix did.
+
+  Scenario: a named local stored into TWO separate lists gets a real, compiler-inserted increment at each site, not just an exclusion (docs/plans/general-refcounting.md, Phase 4c)
+    Given bm_nc_insert_list_element_incs (native_codegen.patlang), a new
+      compiler pass walking each BuildList/list_push/list_set
+      instruction's own operands (via bm_nc_flat_skip_value_backward,
+      which skips a whole compound sub-expression as one value, not
+      just one instruction, so a multi-instruction operand can't be
+      mistaken for a bare Load) -- for any operand that is exactly a
+      bare Load of a name bm_nc_reassignable_eligible_names already
+      considers independently decrement-eligible, it inserts a real
+      rt_rc_inc_if_refcounted call immediately before that Load
+    When bm_nc_flat_list_escaped_names (GitHub #221's own original
+      exclusion -- never decrement a local that escapes into a list at
+      all) is removed entirely, now that a real increment balances the
+      local's own decrement instead of needing to dodge it
+    Then a local stored into ONE list needs its own decrement to drop
+      the refcount from 2 to 1, not 0 (native_string_rc_dec_list_escape.
+      patlang, updated for this); a local stored into TWO separate
+      lists needs its own refcount at 3 (one creation plus two
+      compiler-inserted increments) against the three releases that
+      actually fire (the local's own decrement, plus each list's own
+      cascade) -- confirmed directly: a function sharing one named,
+      chr()-built local into two one-element lists, reading both back
+      and discarding everything, called 50000 times, causes exactly
+      zero heap growth and zero mismatched reads (no early free from
+      under-counting, no double-free from over-releasing).
 
   Scenario: apply with a runtime name and arguments dispatches natively
     Given a program using apply with two, one-statement and zero arguments

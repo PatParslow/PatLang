@@ -314,7 +314,7 @@ else
   FAIL=$((FAIL + 1))
 fi
 
-echo "Scenario: a local whose value escapes into a list literal is never decremented while the list itself is still live (general-refcounting.md, list/dict-element-storage safety gate)"
+echo "Scenario: a local whose value escapes into a list literal is never freed while the list itself is still live (general-refcounting.md, list/dict-element-storage safety gate)"
 rm -f self_hosting/build/native_string_rc_dec_list_escape.exe
 BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_string_rc_dec_list_escape.patlang self_hosting/build/native_string_rc_dec_list_escape.exe --x64 2>&1)
 if [ -f self_hosting/build/native_string_rc_dec_list_escape.exe ]; then
@@ -366,6 +366,28 @@ if [ -f self_hosting/build/native_list_rc_push_result_discard.exe ]; then
   check_seq "50000 cycles pushing onto a stable, reused base list and discarding the result cause exactly zero heap growth" "$OUT" "total= 49999 growth= 0"
 else
   echo "  FAIL: the list-rc-push-result-discard fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: a buffer's own death cascades into the String/List elements it holds (docs/plans/general-refcounting.md, Phase 4c)"
+rm -f self_hosting/build/native_list_rc_element_cascade.exe
+BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_list_rc_element_cascade.patlang self_hosting/build/native_list_rc_element_cascade.exe --x64 2>&1)
+if [ -f self_hosting/build/native_list_rc_element_cascade.exe ]; then
+  OUT=$(./self_hosting/build/native_list_rc_element_cascade.exe 2>&1)
+  check_seq "50000 cycles building a one-element list wrapping an unnamed, freshly built string, then discarding the whole list, cause exactly zero heap growth" "$OUT" "growth= 0"
+else
+  echo "  FAIL: the list-rc-element-cascade fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: a named local stored into TWO separate lists gets a real, compiler-inserted increment at each site, not just an exclusion (docs/plans/general-refcounting.md, Phase 4c)"
+rm -f self_hosting/build/native_list_rc_element_share.exe
+BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_list_rc_element_share.patlang self_hosting/build/native_list_rc_element_share.exe --x64 2>&1)
+if [ -f self_hosting/build/native_list_rc_element_share.exe ]; then
+  OUT=$(./self_hosting/build/native_list_rc_element_share.exe 2>&1)
+  check_seq "50000 cycles sharing one named local into two one-element lists, reading both back and discarding everything, cause exactly zero heap growth and zero mismatched reads" "$OUT" "mismatches= 0 growth= 0"
+else
+  echo "  FAIL: the list-rc-element-share fixture did not build: $BUILD_OUT"
   FAIL=$((FAIL + 1))
 fi
 

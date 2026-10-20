@@ -645,6 +645,127 @@ its own `rc_inc`, symmetric with 4c). Dict: confirmed via
 `codegen_x64.patlang` that --x64 has no separate Dict primitives at
 all, so no separate Dict work is needed in either.
 
+### Phase 4c -- cascading decrement into list elements (done)
+
+Built `rt_list_buf_rc_dec` (`x64_runtime.patlang`): when a buffer's own
+refcount reaches zero, every element within the dying node's own real
+LENGTH (passed down from `rt_list_node_rc_dec`/`rt_list_retire_set`/
+`rt_list_retire_trunc`, each of which reads it from the node before its
+own decrement) that is itself a String or List is now decremented too,
+via two new generic dispatchers (`rt_rc_inc_if_refcounted`/`rt_rc_dec_
+if_refcounted`) that check the family tag and no-op on anything else
+(a fixnum, bool, closure...).
+
+Scoping this turned up a genuine safety fork, resolved with the user
+before implementation: cascading decrement alone either leaks the
+common case (an element with no OTHER owner just gets freed, matching
+"unnamed temp, transfer semantics" -- fine) or, paired with the
+existing Phase 2 escape exclusion left over from a NAMED local's own
+decrement, risks a double-free the moment the SAME local is stored into
+two different containers. The user chose the full fix: a THIRD compiler
+pass, `bm_nc_insert_list_element_incs` (`native_codegen.patlang`),
+walks each `BuildList`/`list_push`/`list_set` instruction's own
+operands (via the new `bm_nc_flat_skip_value_backward`, which skips a
+whole compound sub-expression as one value, not just one instruction --
+needed because the OLD escape detector's coarse "same statement window"
+heuristic is safe only for EXCLUSION, not for deciding where to insert a
+real increment) and inserts an explicit `rt_rc_inc_if_refcounted` call
+immediately before any operand that is exactly a bare `Load` of a name
+`bm_nc_reassignable_eligible_names` already considers independently
+decrement-eligible. The original GitHub #221 exclusion
+(`bm_nc_flat_list_escaped_names`) was removed entirely -- it is no
+longer needed once a real increment balances the local's own decrement
+instead of needing to dodge it.
+
+Three real, confirmed bugs were found and fixed getting the core
+scenario to measure zero heap growth, each caught by a real heap-growth
+number refusing to drop to zero rather than by re-reading the code:
+
+1. **Runtime-level increments left stacked on top of the new compiler
+   pass.** Earlier in this same increment, before the safety fork above
+   was raised, `rt_list_push`/`rt_list_set_functional`/
+   `x64_buildlist_asm` had each been given an unconditional "increment
+   the new element" call. Once the compiler pass existed to insert a
+   SELECTIVE increment only for named, tracked locals, those
+   unconditional ones were double-counting (or, for an unnamed temp the
+   compiler pass correctly skips, simply over-counting with nothing to
+   balance it). Removed from all three call sites -- the copy-loop
+   increments in `rt_list_materialize` and `rt_list_push`'s own doubling
+   path stay, since copying an ALREADY-established element into a
+   second buffer is a genuine new reference, unlike storing a brand-new
+   element for the first time.
+2. **The cascade's own scratch copy leaked on every call.** Reading
+   every element before releasing the buffer (needed so a concurrent
+   thread popping and overwriting a freed block mid-read can't corrupt
+   the read) requires a scratch buffer -- allocated via the heap's
+   plain bump allocator (`rt_heap_alloc`, no free at all) instead of the
+   real, reclaimable one (`bm_alloc`/`bm_rc_dec`), leaking a fixed
+   `len * 8` bytes on every single cascade, independent of the refcount
+   bookkeeping around it.
+3. **Cascading over the buffer's own allocated capacity instead of the
+   node's real length.** `rt_list_push`'s doubling path over-allocates
+   on purpose; the slots between a node's real length and the buffer's
+   own capacity are genuinely uninitialized. Cascading over capacity
+   read that padding as a tagged value and risked decrementing garbage
+   as a live pointer. Fixed by threading the dying node's own length
+   down into `rt_list_buf_rc_dec` instead of reading the buffer's own
+   capacity header for the iteration bound (the capacity header is
+   still used for sizing `bm_rc_dec`'s own call, a separate concern).
+   This also sidesteps a second, independently real issue: an empty
+   list's own buffer has capacity 0, and a genuine `bm_alloc(0)`/
+   `bm_rc_dec(ptr, 0)` round-trip collides with `block_model/heap.
+   patlang`'s own "empty slot" sentinel (`bm_freelist_slot_offset_scan`:
+   size 0 means "not yet claimed by any size class", indistinguishable
+   from a genuine size-0 request) -- skipping the scratch allocation
+   entirely whenever the real length is 0 avoids this too.
+
+A fourth, separate bug was found by the full regression suite (not the
+fixtures written for this phase), confirming Gherkin-first + full-suite
+re-runs still earn their keep: a string LITERAL's tagged pointer has
+the identical tag bits as a real, `bm_alloc`'d string, but points at a
+static `.data` label (`codegen_x64.patlang`'s own
+`x64_collect_string_data`) with NO refcount header at all. Cascading
+decrement is the first mechanism that can ever reach a literal this
+way -- every earlier string-refcounting site only ever touched a named
+local assigned from a known PRODUCER CALL, never a bare literal.
+Decrementing a literal's `ptr - 8` corrupts whatever static data
+happens to sit there instead. Confirmed directly: `x64_list_equality.
+patlang`'s own first comparison (two structurally identical lists of
+string literals) started returning `false` instead of `true` the
+moment element-level cascading landed, and a `git stash` of this
+phase's changes back to the clean Phase 4b baseline confirmed it was a
+genuine regression, not a pre-existing gap. Fixed in the two generic
+dispatchers by reusing the SAME `[heap_base, heap_base + used)` bound
+`codegen_x64.patlang`'s own `type_of`/`numeric_kind` payload check
+already established for exactly this literal-vs-heap distinction
+(GitHub #57/#89) -- a value outside the heap's own live range is
+treated as immortal (never incremented, never decremented), matching
+its real lifetime.
+
+Verified: two new fixtures (`native_list_rc_element_cascade.patlang`,
+`native_list_rc_element_share.patlang`), plus the existing `native_
+string_rc_dec_list_escape.patlang` (header comment and feature-file
+prose updated to describe the real mechanism -- a balanced increment,
+not an exclusion -- rather than the GitHub #221 shape it originally
+documented). 50000 cycles each: an unnamed temp cascaded on list death
+(zero growth), a named local shared into two separate lists with
+reads checked on every cycle (zero growth, zero mismatches), and the
+single-list escape case (zero corrupted elements, 2000 kept-alive
+lists under real allocation pressure). Full regression suite green:
+`native_codegen_check.sh` (55/55), `refcounted_heap_native_check.sh`
+(13/13), `thread_safety_check.sh` (5/5), full language spec gate
+(178/178).
+
+**Deferred, not part of this phase:** 4d (the read side --
+`list_get`/indexing a String/List element is also a copy site and needs
+its own `rc_inc`, symmetric with 4c's write side). The Gen B self-compile
+fixpoint (`patc1.exe self_hosting/build/patc1_all.patlang patc2.exe
+--x64`) could not be used as an additional regression check for this
+phase: it fails on GitHub #222 (`undefined variable
+'__loop_exit_17__program_funcs'`), confirmed via `git stash` to predate
+all of this phase's changes -- a pre-existing, separately tracked,
+unrelated bug.
+
 ## 4. What this plan deliberately does not cover
 
 - Lists' own node/aliasing scheme (Fork G) -- Phase 4a (above) answers

@@ -1549,6 +1549,7 @@ make a function called bm_nc_build_handler_funcirs takes prog, closures, print_o
     # docs/plans/general-refcounting.md, Phase 2: the same pass ordinary
     # callee functions and main already get, extended to handlers too.
     if bm_nc_closure_is_single_block(hblocks) then
+      let h_flat = bm_nc_insert_list_element_incs(root, h_flat)
       let h_flat = bm_nc_insert_reassignment_decs(root, h_flat)
       let h_flat = bm_nc_insert_string_rc_decs(root, h_flat)
     end
@@ -1778,103 +1779,22 @@ make a function called bm_nc_flat_store_positions takes instrs, name returns pos
   return positions
 end
 
-# A REAL, CONFIRMED memory-corruption bug (GitHub #221), found scoping
-# the list/dict-element-storage item this plan's own Phase 2 header
-# already lists as "not yet started": a local whose value is passed into
-# BuildList (a list literal, `[s]`) or list_push/list_set (mutating an
-# existing list)
-# gets a SECOND owner -- the list itself -- but nothing here ever
-# incremented its refcount for that, and nothing excluded it from this
-# pass either. If that local ALSO dominates a terminal where the LIST
-# (not the local itself) is the value actually returned, this pass
-# decremented the local anyway, dropping its refcount to zero and
-# freeing it while the list still held the exact same pointer -- the
-# next allocation reusing that block then silently corrupts the list's
-# own contents. Confirmed directly, not theoretical: `let lst = [s];
-# return lst` leaked the OPPOSITE of a leak -- 1923 of 2000 kept-alive
-# lists came back with corrupted string content under allocation
-# pressure, via `Load lst` (the real return value) immediately followed
-# by this pass's own `Load s; Call rt_string_rc_dec; Store discard`
-# before the Return. This is the reason bm_nc_flat_list_escaped_names
-# exists and is checked FIRST, ahead of the reassignment conditions
-# below -- it is a correctness gate, not an optimization. It does NOT
-# implement the full list/dict-element-storage feature (actually
-# tracking and reclaiming a string stored INTO a list/dict element) --
-# that remains unimplemented; this only makes sure such a value is never
-# wrongly freed out from under the container still holding it, falling
-# back to the pre-Phase-2 bump-forever behavior for it instead (the same
-# "prove it or fall back" shape every other exclusion here already
-# uses).
-#
-# Sound (conservative), not an exact data-flow analysis: a Store,
-# Return, ReturnValue, Jump, or JumpIfFalse always marks the end of one
-# statement's own expression evaluation in this flat IR -- there is no
-# way to have two independent top-level value computations back to back
-# without one of these in between, since every statement lowers to
-# "evaluate an expression, then store/return/branch on it." Scanning the
-# half-open window from right after one such boundary to the next is
-# therefore guaranteed to contain EVERY instruction that could
-# contribute to that statement's own expression tree, a strict superset
-# of whatever a BuildList/list_push/list_set inside it actually consumes
-# as arguments. Any name loaded anywhere in a window that also contains
-# one of those three is flagged -- this can only ever OVER-exclude (a
-# name that was never really an argument to it still loses the
-# optimization), never UNDER-exclude, which is the unsafe direction this
-# whole function exists to rule out. A real per-instruction stack
-# simulation (mirroring codegen_x64.patlang's own x64_taint_one_pass)
-# would catch fewer false positives, but was not needed to GUARANTEE
-# soundness, and this pass only runs on single-block (loop-free)
-# closures to begin with (bm_nc_closure_is_single_block), so there is no
-# backward-jump fixed-point concern to replicate from that function.
-make a function called bm_nc_flat_list_escaped_names takes instrs returns names
-  let names = []
-  let n = list_len(instrs)
-  let window_has_escape = false
-  let window_loaded_names = []
-  let i = 0
-  while i <= n do
-    let is_boundary = true
-    if i < n then
-      let op = list_get(list_get(instrs, i), 0)
-      let is_boundary = (op == "Store") or (op == "Return") or (op == "ReturnValue") or (op == "Jump") or (op == "JumpIfFalse")
-    end
-    if is_boundary then
-      if window_has_escape then
-        let wi = 0
-        while wi < list_len(window_loaded_names) do
-          let nm = list_get(window_loaded_names, wi)
-          if not bm_list_contains(names, nm) then
-            let names = list_push(names, nm)
-          end
-          let wi = wi + 1
-        end
-      end
-      let window_has_escape = false
-      let window_loaded_names = []
-    else
-      let instr = list_get(instrs, i)
-      let op = list_get(instr, 0)
-      if op == "Load" then
-        let window_loaded_names = list_push(window_loaded_names, list_get(instr, 1))
-      elif op == "BuildList" then
-        let window_has_escape = true
-      elif (op == "CallHost") and ((list_get(instr, 1) == "list_push") or (list_get(instr, 1) == "list_set")) then
-        let window_has_escape = true
-      end
-    end
-    let i = i + 1
-  end
-  return names
-end
-
 # Every distinct local name eligible for the decrement passes below,
 # generalizing the earlier "exactly one Store" gate to allow reassignment
 # (docs/plans/general-refcounting.md's own deferred "locals that are
 # reassigned (more than one Store)" item). A name qualifies when:
-#   1. it is never closure-captured, nor ever passed into BuildList/
-#      list_push/list_set (bm_nc_flat_list_escaped_names, just above --
-#      either one gives the value a SECOND owner this pass knows nothing
-#      about, so it must never touch it at all);
+#   1. it is never closure-captured (a closure might keep it alive past
+#      this function's own return, so this pass must never touch it at
+#      all). Being passed into BuildList/list_push/list_set is NO LONGER
+#      excluded here (Phase 4c, GitHub #221's own original fix) -- that
+#      used to be a blanket exclusion, because nothing gave the value a
+#      SECOND, independently-tracked owner when it became a list/dict
+#      element. Now something does: bm_nc_insert_list_element_incs
+#      inserts a real rc_inc at exactly that point for any name this
+#      function finds eligible, so the local's own decrement here and
+#      the container's own eventual cascade (rt_list_buf_rc_dec,
+#      x64_runtime.patlang) are two correctly-balanced references
+#      instead of one value with no owner at all;
 #   2. EVERY Store of this name anywhere in `instrs` is immediately
 #      preceded by a string-producer call -- not just the one this scan
 #      happened to find first. A single non-producer Store (e.g. `let s =
@@ -1901,7 +1821,6 @@ end
 # pass did.
 make a function called bm_nc_reassignable_eligible_names takes instrs, captured_names returns names
   let n = list_len(instrs)
-  let escaped_names = bm_nc_flat_list_escaped_names(instrs)
   let candidate_names = []
   let i = 0
   while i < (n - 1) do
@@ -1910,7 +1829,7 @@ make a function called bm_nc_reassignable_eligible_names takes instrs, captured_
       let next = list_get(instrs, i + 1)
       if list_get(next, 0) == "Store" then
         let name = list_get(next, 1)
-        if (not bm_list_contains(captured_names, name)) and (not bm_list_contains(escaped_names, name)) and (not bm_list_contains(candidate_names, name)) then
+        if (not bm_list_contains(captured_names, name)) and (not bm_list_contains(candidate_names, name)) then
           let candidate_names = list_push(candidate_names, name)
         end
       end
@@ -2103,6 +2022,180 @@ make a function called bm_nc_reassign_shift_at takes insert_positions, idx retur
     let k = k + 1
   end
   return shift
+end
+
+# docs/plans/general-refcounting.md, Phase 4c: given the index of the
+# LAST instruction of exactly one value on this flat (stack-machine)
+# instruction stream, returns the index one before the FIRST
+# instruction of that same value -- i.e., walks backward over exactly
+# the instructions that produce it, recursing into Bin/Un/Call/
+# CallHost/BuildList's own operands so a compound sub-expression is
+# skipped as a whole rather than just its own one instruction. Needed
+# to find a BuildList/list_push/list_set instruction's own Nth operand
+# precisely, rather than the coarser "anywhere in the same statement"
+# window bm_nc_insert_list_element_incs's own predecessor (bm_nc_flat_
+# list_escaped_names, removed this phase) used to settle for -- that
+# coarseness was fine for a blanket EXCLUSION (over-excluding only
+# costs a missed optimization), but would be unsound here: over-
+# including an operand that was never really consumed by the
+# BuildList/list_push/list_set in question would insert a real rc_inc
+# with no matching rc_dec anywhere, a genuine, permanent leak.
+# `pos` must be a position this scan understands as ending a value
+# (Const/Load/Un/Bin/Call/CallHost/BuildList/MakeClosure); anything
+# else (Store/Return/ReturnValue/Jump/JumpIfFalse) would mean the
+# caller's own argc bookkeeping is wrong, so this returns `pos`
+# unchanged as a bail-out sentinel rather than guess -- callers must
+# treat "no progress made" as "stop, do not trust further results from
+# this operand position," never retry it.
+make a function called bm_nc_flat_skip_value_backward takes instrs, pos returns new_pos
+  if pos < 0 then
+    return pos
+  end
+  let instr = list_get(instrs, pos)
+  let op = list_get(instr, 0)
+  if (op == "Const") or (op == "Load") or (op == "MakeClosure") then
+    return pos - 1
+  elif op == "Un" then
+    return bm_nc_flat_skip_value_backward(instrs, pos - 1)
+  elif op == "Bin" then
+    let p1 = bm_nc_flat_skip_value_backward(instrs, pos - 1)
+    return bm_nc_flat_skip_value_backward(instrs, p1)
+  elif (op == "Call") or (op == "CallHost") or (op == "BuildList") then
+    let argc = 0
+    if op == "BuildList" then
+      let argc = list_get(instr, 1)
+    else
+      let argc = list_get(instr, 2)
+    end
+    let cur = pos - 1
+    let ai = 0
+    while ai < argc do
+      let cur = bm_nc_flat_skip_value_backward(instrs, cur)
+      let ai = ai + 1
+    end
+    return cur
+  else
+    return pos
+  end
+end
+
+# docs/plans/general-refcounting.md, Phase 4c: the write-side half of
+# element-level refcounting (the read side, list_get's own copy-out, is
+# Phase 4d, separate, not yet started). Every BuildList, and every
+# CallHost call to list_push/list_set, is a point where ONE OR MORE of
+# its own operands become a NEW element of a list/dict -- for any such
+# operand that is EXACTLY a bare `Load name` (not a compound sub-
+# expression -- there is no name to credit a compound result to, and
+# nothing here needs to, since a compound result has no OTHER tracked
+# owner to balance against) where `name` is ALSO eligible for this
+# file's own decrement passes (bm_nc_reassignable_eligible_names), an
+# explicit rc_inc is inserted immediately before it. This is what makes
+# removing the old blanket escape-exclusion (GitHub #221's own original
+# fix, superseded this phase) safe: `name`'s own local-variable
+# decrement and the container's own eventual cascade (rt_list_buf_rc_
+# dec, x64_runtime.patlang) are now two independently-balanced
+# references instead of one value with no real owner tracking it at
+# all. A bare Load-only operand check, not a general stack-depth
+# simulation, is NOT a coincidence of convenience here -- bm_nc_flat_
+# skip_value_backward's own header explains why anything coarser would
+# be unsound in this direction (over-crediting an rc_inc to a name that
+# was never really consumed leaks it forever, with no matching rc_dec).
+# A compound operand (e.g. `list_push(xs, f(s))`) is simply skipped
+# over as a whole -- whatever `s` is doing inside `f` is `f`'s own,
+# already-covered concern, not this call site's.
+make a function called bm_nc_insert_list_element_incs takes root, instrs returns out
+  let captured_names = bm_nc_closure_captured_names(instrs)
+  let eligible_names = bm_nc_reassignable_eligible_names(instrs, captured_names)
+  if list_len(eligible_names) == 0 then
+    return instrs
+  end
+  let n = list_len(instrs)
+  let insert_positions = []
+  let insert_names = []
+  let i = 0
+  while i < n do
+    let instr = list_get(instrs, i)
+    let op = list_get(instr, 0)
+    let is_target = false
+    let argc = 0
+    if op == "BuildList" then
+      let is_target = true
+      let argc = list_get(instr, 1)
+    elif (op == "CallHost") and ((list_get(instr, 1) == "list_push") or (list_get(instr, 1) == "list_set")) then
+      let is_target = true
+      let argc = list_get(instr, 2)
+    end
+    if is_target then
+      let cur = i - 1
+      let ai = 0
+      while ai < argc do
+        let op_instr = list_get(instrs, cur)
+        if list_get(op_instr, 0) == "Load" then
+          let name = list_get(op_instr, 1)
+          if bm_list_contains(eligible_names, name) then
+            let insert_positions = list_push(insert_positions, cur)
+            let insert_names = list_push(insert_names, name)
+          end
+        end
+        let cur = bm_nc_flat_skip_value_backward(instrs, cur)
+        let ai = ai + 1
+      end
+    end
+    let i = i + 1
+  end
+  if list_len(insert_positions) == 0 then
+    return instrs
+  end
+  # Sort ascending, carrying insert_names along in lockstep -- same
+  # selection-sort shape as bm_nc_insert_reassignment_decs's own (found
+  # walking backward within each target, scanned forward overall, so
+  # not guaranteed globally ascending on its own).
+  let m = list_len(insert_positions)
+  let si = 0
+  while si < m do
+    let min_idx = si
+    let sj = si + 1
+    while sj < m do
+      if list_get(insert_positions, sj) < list_get(insert_positions, min_idx) then
+        let min_idx = sj
+      end
+      let sj = sj + 1
+    end
+    if min_idx != si then
+      let tmp_pos = list_get(insert_positions, si)
+      let tmp_name = list_get(insert_names, si)
+      let insert_positions = list_set(insert_positions, si, list_get(insert_positions, min_idx))
+      let insert_names = list_set(insert_names, si, list_get(insert_names, min_idx))
+      let insert_positions = list_set(insert_positions, min_idx, tmp_pos)
+      let insert_names = list_set(insert_names, min_idx, tmp_name)
+    end
+    let si = si + 1
+  end
+  let discard_name = bm_nc_prefix(root, "__bm_string_rc_discard")
+  let out = []
+  let i2 = 0
+  while i2 < n do
+    let k = 0
+    while k < list_len(insert_positions) do
+      if list_get(insert_positions, k) == i2 then
+        let out = list_push(out, ["Load", list_get(insert_names, k)])
+        let out = list_push(out, ["Call", "rt_rc_inc_if_refcounted", 1])
+        let out = list_push(out, ["Store", discard_name])
+      end
+      let k = k + 1
+    end
+    let instr = list_get(instrs, i2)
+    let op = list_get(instr, 0)
+    if (op == "Jump") or (op == "JumpIfFalse") then
+      let target = list_get(instr, 1)
+      let new_target = target + bm_nc_reassign_shift_at(insert_positions, target)
+      let out = list_push(out, [op, new_target])
+    else
+      let out = list_push(out, instr)
+    end
+    let i2 = i2 + 1
+  end
+  return out
 end
 
 # How many instructions get inserted at a given terminal t: one triple
@@ -2719,6 +2812,7 @@ make a function called bm_nc_build_callee_funcirs takes prog, roots, print_op re
     end
     let flat = bm_nc_flatten_blocks(prog, cblocks, pure_init, print_op, flat_mode)
     if bm_nc_closure_is_single_block(cblocks) then
+      let flat = bm_nc_insert_list_element_incs(root, flat)
       let flat = bm_nc_insert_reassignment_decs(root, flat)
       let flat = bm_nc_insert_string_rc_decs(root, flat)
     end
@@ -2888,6 +2982,7 @@ make a function called bm_to_real_funcir takes prog, print_op returns funcirs
   # exactly one -- but free, correct, and worth having for the genuinely
   # single-block case (a short script with no loop at all).
   if bm_nc_closure_is_single_block(main_blocks) then
+    let main_flat = bm_nc_insert_list_element_incs(entry_name, main_flat)
     let main_flat = bm_nc_insert_reassignment_decs(entry_name, main_flat)
     let main_flat = bm_nc_insert_string_rc_decs(entry_name, main_flat)
   end

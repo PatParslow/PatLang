@@ -1,0 +1,58 @@
+# Fixture for native_codegen.feature: docs/plans/general-refcounting.md
+# Phase 4c -- the compiler-level increment pass (bm_nc_insert_list_
+# element_incs, native_codegen.patlang) that makes cascading decrement
+# (native_list_rc_element_cascade.patlang) safe to pair with a NAMED,
+# independently-tracked local, not just an unnamed temp.
+#
+# A NAMED local that is ALSO eligible for its own automatic decrement
+# (bm_nc_reassignable_eligible_names) has TWO eventual owners once it
+# is stored into a list: its own scope-exit decrement, and the
+# container's own eventual cascade. Storing the SAME local into TWO
+# separate lists makes three: the local's own decrement, and each
+# list's own cascade. Without a real increment at each BuildList site
+# (one per list, two total here), the refcount would be permanently
+# under-counted -- freeing the string the moment the FIRST of the
+# three releases fires, leaving the other two to read (or decrement)
+# already-freed memory. GitHub #221's own original fix (excluding the
+# local from its own decrement entirely) would dodge this specific
+# under-count, but at the cost of the string never being reclaimed at
+# all; Phase 4c's own increment pass removes that exclusion and relies
+# on balancing the count correctly instead (see native_string_rc_dec_
+# list_escape.patlang for that single-list case).
+#
+# Given: a function that builds a string via chr(n), stores it into a
+#   named local `s`, stores `s` into TWO separate one-element list
+#   literals `a` and `b`, reads `a[0]`/`b[0]` back (to prove no read
+#   ever sees corrupted content) and returns whether they match -- `s`,
+#   `a` and `b` are then all discarded at the function's own terminal.
+# When: called 50000 times.
+# Then: the heap's own high-water mark stays flat (no leak: the local's
+#   own refcount is correctly balanced at 3 -- its own creation plus
+#   two compiler-inserted increments -- against the three releases that
+#   actually fire), and every call's own read-back matches (no early
+#   free, no double-free, no corruption).
+make a function called make_two_lists_sharing takes n returns r
+  let s = chr(n % 26 + 65)
+  let a = [s]
+  let b = [s]
+  if a[0] == b[0] then
+    return 1
+  end
+  return 0
+end
+
+let loop_count = 50000
+
+make_two_lists_sharing(0)
+let before = mem_peek_qword(mem_heap_state_addr(), 0)
+let mismatches = 0
+let i = 0
+while i < loop_count do
+  let r = make_two_lists_sharing(i)
+  if r != 1 then
+    let mismatches = mismatches + 1
+  end
+  let i = i + 1
+end
+let after = mem_peek_qword(mem_heap_state_addr(), 0)
+print("mismatches= " + mismatches + " growth= " + (after - before))
