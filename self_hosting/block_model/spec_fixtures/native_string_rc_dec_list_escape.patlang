@@ -1,0 +1,54 @@
+# Fixture for native_codegen.feature: a REAL, confirmed memory-corruption
+# bug found scoping docs/plans/general-refcounting.md's deferred
+# "list/dict-element storage" item, not a missing optimization. A string
+# local passed into a list literal (`let lst = [s]`) gets a second owner
+# (the list itself), but the single-block decrement pass had no exclusion
+# for this at all: if `s` dominated a terminal where `lst` (not `s`) was
+# the value actually returned, the pass decremented `s` anyway, freeing
+# it while the list still held the exact same pointer -- the next
+# allocation to reuse that block then silently corrupted the list's own
+# contents.
+#
+# Given: make_list_with_string(n) builds a string via chr(n), wraps it in
+#   a one-element list, and returns the LIST (never `s` itself directly).
+# When: called 2000 times, each result kept alive in an outer list, with
+#   2000 more unrelated string allocations made afterward to create real
+#   allocation pressure that would reuse any wrongly-freed block.
+# Then: every kept list's own element still holds its original,
+#   uncorrupted string -- bm_nc_flat_list_escaped_names excludes `s` from
+#   the decrement pass entirely (a BuildList instruction appears in the
+#   same statement-bounded window as `s`'s own Load), falling back to
+#   the pre-Phase-2 bump-forever behavior for it rather than freeing it
+#   out from under the list.
+
+make a function called make_list_with_string takes n returns lst
+  let s = chr(n % 26 + 65)
+  let lst = [s]
+  return lst
+end
+
+let count = 2000
+let kept = []
+let i = 0
+while i < count do
+  let r = make_list_with_string(i)
+  let kept = list_push(kept, r)
+  let i = i + 1
+end
+let junk = []
+let j = 0
+while j < count do
+  let junk = list_push(junk, chr(j % 26 + 65))
+  let j = j + 1
+end
+let mismatches = 0
+let k = 0
+while k < count do
+  let item = list_get(kept, k)
+  let expected = chr(k % 26 + 65)
+  if item[0] != expected then
+    let mismatches = mismatches + 1
+  end
+  let k = k + 1
+end
+print("mismatches= " + mismatches)

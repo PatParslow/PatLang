@@ -314,6 +314,17 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+echo "Scenario: a local whose value escapes into a list literal is never decremented while the list itself is still live (general-refcounting.md, list/dict-element-storage safety gate)"
+rm -f self_hosting/build/native_string_rc_dec_list_escape.exe
+BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_string_rc_dec_list_escape.patlang self_hosting/build/native_string_rc_dec_list_escape.exe --x64 2>&1)
+if [ -f self_hosting/build/native_string_rc_dec_list_escape.exe ]; then
+  OUT=$(./self_hosting/build/native_string_rc_dec_list_escape.exe 2>&1)
+  check_seq "2000 lists each wrapping a kept-alive string, plus 2000 more unrelated allocations afterward, show zero corrupted elements" "$OUT" "mismatches= 0"
+else
+  echo "  FAIL: the list-escape fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
 echo ""
 echo "tests: $PASS passed, $FAIL failed"
 if [ "$FAIL" -eq 0 ]; then

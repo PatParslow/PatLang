@@ -1732,13 +1732,103 @@ make a function called bm_nc_flat_store_positions takes instrs, name returns pos
   return positions
 end
 
+# A REAL, CONFIRMED memory-corruption bug (GitHub #221), found scoping
+# the list/dict-element-storage item this plan's own Phase 2 header
+# already lists as "not yet started": a local whose value is passed into
+# BuildList (a list literal, `[s]`) or list_push/list_set (mutating an
+# existing list)
+# gets a SECOND owner -- the list itself -- but nothing here ever
+# incremented its refcount for that, and nothing excluded it from this
+# pass either. If that local ALSO dominates a terminal where the LIST
+# (not the local itself) is the value actually returned, this pass
+# decremented the local anyway, dropping its refcount to zero and
+# freeing it while the list still held the exact same pointer -- the
+# next allocation reusing that block then silently corrupts the list's
+# own contents. Confirmed directly, not theoretical: `let lst = [s];
+# return lst` leaked the OPPOSITE of a leak -- 1923 of 2000 kept-alive
+# lists came back with corrupted string content under allocation
+# pressure, via `Load lst` (the real return value) immediately followed
+# by this pass's own `Load s; Call rt_string_rc_dec; Store discard`
+# before the Return. This is the reason bm_nc_flat_list_escaped_names
+# exists and is checked FIRST, ahead of the reassignment conditions
+# below -- it is a correctness gate, not an optimization. It does NOT
+# implement the full list/dict-element-storage feature (actually
+# tracking and reclaiming a string stored INTO a list/dict element) --
+# that remains unimplemented; this only makes sure such a value is never
+# wrongly freed out from under the container still holding it, falling
+# back to the pre-Phase-2 bump-forever behavior for it instead (the same
+# "prove it or fall back" shape every other exclusion here already
+# uses).
+#
+# Sound (conservative), not an exact data-flow analysis: a Store,
+# Return, ReturnValue, Jump, or JumpIfFalse always marks the end of one
+# statement's own expression evaluation in this flat IR -- there is no
+# way to have two independent top-level value computations back to back
+# without one of these in between, since every statement lowers to
+# "evaluate an expression, then store/return/branch on it." Scanning the
+# half-open window from right after one such boundary to the next is
+# therefore guaranteed to contain EVERY instruction that could
+# contribute to that statement's own expression tree, a strict superset
+# of whatever a BuildList/list_push/list_set inside it actually consumes
+# as arguments. Any name loaded anywhere in a window that also contains
+# one of those three is flagged -- this can only ever OVER-exclude (a
+# name that was never really an argument to it still loses the
+# optimization), never UNDER-exclude, which is the unsafe direction this
+# whole function exists to rule out. A real per-instruction stack
+# simulation (mirroring codegen_x64.patlang's own x64_taint_one_pass)
+# would catch fewer false positives, but was not needed to GUARANTEE
+# soundness, and this pass only runs on single-block (loop-free)
+# closures to begin with (bm_nc_closure_is_single_block), so there is no
+# backward-jump fixed-point concern to replicate from that function.
+make a function called bm_nc_flat_list_escaped_names takes instrs returns names
+  let names = []
+  let n = list_len(instrs)
+  let window_has_escape = false
+  let window_loaded_names = []
+  let i = 0
+  while i <= n do
+    let is_boundary = true
+    if i < n then
+      let op = list_get(list_get(instrs, i), 0)
+      let is_boundary = (op == "Store") or (op == "Return") or (op == "ReturnValue") or (op == "Jump") or (op == "JumpIfFalse")
+    end
+    if is_boundary then
+      if window_has_escape then
+        let wi = 0
+        while wi < list_len(window_loaded_names) do
+          let nm = list_get(window_loaded_names, wi)
+          if not bm_list_contains(names, nm) then
+            let names = list_push(names, nm)
+          end
+          let wi = wi + 1
+        end
+      end
+      let window_has_escape = false
+      let window_loaded_names = []
+    else
+      let instr = list_get(instrs, i)
+      let op = list_get(instr, 0)
+      if op == "Load" then
+        let window_loaded_names = list_push(window_loaded_names, list_get(instr, 1))
+      elif op == "BuildList" then
+        let window_has_escape = true
+      elif (op == "CallHost") and ((list_get(instr, 1) == "list_push") or (list_get(instr, 1) == "list_set")) then
+        let window_has_escape = true
+      end
+    end
+    let i = i + 1
+  end
+  return names
+end
+
 # Every distinct local name eligible for the decrement passes below,
 # generalizing the earlier "exactly one Store" gate to allow reassignment
 # (docs/plans/general-refcounting.md's own deferred "locals that are
 # reassigned (more than one Store)" item). A name qualifies when:
-#   1. it is never closure-captured (unchanged from before -- a closure
-#      might keep any of its values alive past this function's own
-#      return, so this pass must never touch it at all);
+#   1. it is never closure-captured, nor ever passed into BuildList/
+#      list_push/list_set (bm_nc_flat_list_escaped_names, just above --
+#      either one gives the value a SECOND owner this pass knows nothing
+#      about, so it must never touch it at all);
 #   2. EVERY Store of this name anywhere in `instrs` is immediately
 #      preceded by a string-producer call -- not just the one this scan
 #      happened to find first. A single non-producer Store (e.g. `let s =
@@ -1765,6 +1855,7 @@ end
 # pass did.
 make a function called bm_nc_reassignable_eligible_names takes instrs, captured_names returns names
   let n = list_len(instrs)
+  let escaped_names = bm_nc_flat_list_escaped_names(instrs)
   let candidate_names = []
   let i = 0
   while i < (n - 1) do
@@ -1773,7 +1864,7 @@ make a function called bm_nc_reassignable_eligible_names takes instrs, captured_
       let next = list_get(instrs, i + 1)
       if list_get(next, 0) == "Store" then
         let name = list_get(next, 1)
-        if (not bm_list_contains(captured_names, name)) and (not bm_list_contains(candidate_names, name)) then
+        if (not bm_list_contains(captured_names, name)) and (not bm_list_contains(escaped_names, name)) and (not bm_list_contains(candidate_names, name)) then
           let candidate_names = list_push(candidate_names, name)
         end
       end

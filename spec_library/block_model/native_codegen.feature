@@ -590,6 +590,35 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
       this fix: 24 for the overwritten first value, 24 for the discarded
       final one).
 
+  Scenario: a local whose value escapes into a list literal is never decremented while the list itself is still live (docs/plans/general-refcounting.md, list/dict-element-storage safety gate)
+    Given a function that builds a string via a known producer, wraps it
+      in a one-element list literal, and returns the LIST -- never the
+      string itself directly -- called through the ordinary --x64 CLI
+      2000 times, each result kept alive in an outer list, followed by
+      2000 more unrelated string allocations to create real allocation
+      pressure against any wrongly-freed block
+    When bm_nc_reassignable_eligible_names (native_codegen.patlang) is
+      asked whether the string's own local qualifies for the decrement
+      pass
+    Then it says no, because bm_nc_flat_list_escaped_names finds a
+      BuildList instruction in the same statement-bounded window as that
+      local's own Load -- a REAL, confirmed memory-corruption bug found
+      scoping this plan's "list/dict-element storage" item, not a
+      missing optimization: before this exclusion existed, the local
+      dominated the function's own terminal (the LIST was the value
+      actually returned there, not the local itself), so the pass
+      decremented it anyway, freeing the string while the list still
+      held the exact same pointer. Confirmed directly: 1923 of 2000 kept-
+      alive lists came back with silently corrupted string content under
+      allocation pressure before this fix; zero after. This gate does
+      NOT implement the full list/dict-element-storage feature (actually
+      tracking and reclaiming a string stored into a list/dict element)
+      -- it only makes sure such a value is never wrongly freed out from
+      under the container still holding it, falling back to the pre-
+      Phase-2 bump-forever behavior for it instead, the same "prove it
+      or fall back" shape every other exclusion in this pass already
+      uses.
+
   Scenario: apply with a runtime name and arguments dispatches natively
     Given a program using apply with two, one-statement and zero arguments
     When it is built and run as a real, fully native executable
