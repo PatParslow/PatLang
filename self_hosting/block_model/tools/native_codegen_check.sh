@@ -325,6 +325,28 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+echo "Scenario: list nodes and buffers are genuinely refcounted and reclaimed (docs/plans/general-refcounting.md, Phase 3a foundation)"
+rm -f self_hosting/build/native_list_rc_basic.exe
+BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_list_rc_basic.patlang self_hosting/build/native_list_rc_basic.exe --x64 2>&1)
+if [ -f self_hosting/build/native_list_rc_basic.exe ]; then
+  OUT=$(./self_hosting/build/native_list_rc_basic.exe 2>&1)
+  check_seq "50000 cycles building a 3-element integer list literal and explicitly releasing it cause exactly zero heap growth" "$OUT" "growth= 0"
+else
+  echo "  FAIL: the list-rc-basic fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: list_push's retire-chain (in-place growth, doubling, and a genuinely shared/materialized node) stays leak-free and correctly readable (docs/plans/general-refcounting.md, Phase 3a foundation)"
+rm -f self_hosting/build/native_list_rc_retire_chain.exe
+BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_list_rc_retire_chain.patlang self_hosting/build/native_list_rc_retire_chain.exe --x64 2>&1)
+if [ -f self_hosting/build/native_list_rc_retire_chain.exe ]; then
+  OUT=$(./self_hosting/build/native_list_rc_retire_chain.exe 2>&1)
+  check_seq "50000 build-via-push-then-discard cycles, and 50000 shared/retired-node cycles with correct read-back, both cause exactly zero heap growth" "$OUT" "growth1= 0 growth2= 0"
+else
+  echo "  FAIL: the list-rc-retire-chain fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
 echo ""
 echo "tests: $PASS passed, $FAIL failed"
 if [ "$FAIL" -eq 0 ]; then

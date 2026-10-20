@@ -536,10 +536,78 @@ real type benefits from it," matching the BOM plan's own precedent of
 treating "native codegen for the engine" (its Phase 9) as deferred detail
 until the earlier phases justified it.
 
+### Phase 4a -- List node/buffer refcounting foundation (done)
+
+Scoping Phase 4 turned up a prerequisite fact not anticipated above:
+Lists have no refcounting or "list death" event at all (a persistent,
+copy-on-write vector, `self_hosting/lib/x64_runtime.patlang`'s
+`rt_list_new`/`rt_list_push`/`rt_list_set_functional`/`rt_list_
+materialize`, allocated via plain `rt_heap_alloc` and never freed).
+Before any element-level work (cascading a decrement into a string/list
+stored in a list) is possible, the list's own node and buffer need to be
+genuinely refcounted first -- a real prerequisite, not a detour.
+
+Landed: node and buffer as two separately bm_alloc'd, refcounted blocks
+(reusing `block_model/heap.patlang`'s own generic allocator, not a new
+mechanism), with a retired node's own `next` field as a real reference
+(its successor must outlive it, since `rt_list_materialize` walks it
+forward) and its own buffer reference released at retire time (no read
+path ever consults a retired node's own buffer field again). `x64_
+buildlist_asm` (codegen_x64.patlang, every list literal including a
+closure's own captured-values list) changed to match: two separate
+`bm_alloc` calls instead of one combined `rt_heap_alloc` block.
+
+No compiler pass decides to decrement a list LOCAL yet, and nothing
+cascades into string/list elements a list contains -- both remain
+"not yet started," below. Verified via explicit rt_list_node_rc_inc/dec
+calls (the same way Phase 1 proved bm_alloc/bm_rc_inc/bm_rc_dec before
+any compiler pass called them automatically): `native_list_rc_basic.
+patlang` and `native_list_rc_retire_chain.patlang` (spec_fixtures),
+50000 cycles each, flat heap growth, covering a bare BuildList literal,
+list_push's in-place-growth and doubling paths, and a genuinely shared
+node forced through `rt_list_materialize`.
+
+A real regression was found and fixed verifying this, not just the
+mechanism itself: the `x64_buildlist_asm` change broke `thread_safety_
+check.sh` (every run hung before its own first print) -- a test
+fixture's `include "heap.patlang"`, always redundant once heap.
+patlang's functions are auto-bundled via x64_runtime.obj, created a
+duplicate/shadowed `bm_alloc` symbol that collided specifically with
+`x64_buildlist_asm`'s own hand-written `call bm_alloc`, a collision
+shape `patc1_main.patlang`'s own name-collision check does not
+currently catch. Fixed by removing that fixture's own redundant
+include, confirmed to resolve it with no other change.
+
+A separate, pre-existing, unrelated gap found verifying this and
+reported (GitHub #222), not fixed here: the Gen B self-compile fixpoint
+(`patc1.exe` compiling its own whole source into `patc2.exe`) currently
+fails with an undefined-variable error inside `patc1_main.patlang`'s own
+`--x64` build path. Confirmed via `git stash` to reproduce identically
+on the clean, last-committed baseline with none of this phase's changes
+applied -- not caused by this work, simply never caught before because
+nothing had run that specific fixpoint test since whatever introduced
+it. Blocks proving self-hosting still round-trips; does not block
+ordinary `--x64` compilation, which is unaffected.
+
+**Not yet started:** 4b (a dominance-based decrement pass for LIST
+locals, mirroring Phase 2's string work -- `BuildList`/`list_push`/
+`list_set` recognized as producers of a refcounted value, the same way
+`bm_nc_reassignable_eligible_names` already does for strings); 4c
+(cascading decrement into string/list elements when a list's own
+refcount reaches zero -- the actual "list/dict-element storage" feature
+as originally named); 4d (the read side -- `list_get`/indexing a
+String/List element is also a copy site and needs its own `rc_inc`,
+symmetric with 4c). Dict: confirmed via `codegen_x64.patlang` that
+--x64 has no separate Dict primitives at all, so no separate Dict work
+is needed in any of 4b-4d.
+
 ## 4. What this plan deliberately does not cover
 
-- Lists' own node/aliasing scheme (Fork G) -- a real, separate design
-  question, not answered here.
+- Lists' own node/aliasing scheme (Fork G) -- Phase 4a (above) answers
+  the node/buffer REFCOUNTING half of this directly (reusing the
+  existing persistent/COW node+buffer structure's own aliasing scheme
+  unchanged, not redesigning it); cascading element-level decrements
+  (4c) and the read-side rc_inc (4d) remain open.
 - A general type-inference or escape-analysis system. Phase 2's own taint
   pass answers one narrow question ("is this local provably a string")
   the same bounded way the flight check answers "is this reference

@@ -2376,15 +2376,106 @@ make a function called rt_list_tag returns tag
   return 3 shl 60
 end
 
-# A list of n slots, nodes and buffer in one allocation. The elements are
-# unset; callers fill a fresh list with rt_list_set before sharing it.
+# docs/plans/general-refcounting.md, Phase 3a: list nodes and buffers,
+# genuinely refcounted via the SAME generic bm_alloc/bm_rc_inc/bm_rc_dec
+# machinery (block_model/heap.patlang) Phase 1/2 already built and
+# proved for strings -- not a new, parallel mechanism.
+#
+# Two separately-refcounted allocations, not one: a NODE (always exactly
+# 48 bytes: [len:8][kind:8][buf:8] live, or [len:8][kind:8][idx:8][val:8]
+# [next:8] once retired) is a VIEW over a BUFFER ([cap:8][elements:
+# cap*8 bytes]). Multiple nodes can share one buffer (list_push with
+# spare capacity just creates a new node over the SAME buffer); multiple
+# List values can share one node (ordinary `let b = a` sharing). A
+# retired node's own `next` field (set only once per node -- traced
+# directly through rt_list_push/rt_list_set_functional: a node is only
+# ever retired once, pointing at exactly the node THAT specific
+# operation produced) is a REAL reference: rt_list_materialize later
+# walks it forward to find the live buffer, so the successor must stay
+# alive for as long as this retired node might still be read from.
+#
+# Design choice, deliberately: rt_list_node_new stays "dumb" -- it never
+# touches buf's refcount itself. Every CALLER decides, at its own call
+# site, whether creating a node over `buf` is a TRANSFER (a buf just
+# allocated fresh, handed to exactly one node, no separate increment
+# needed -- bm_alloc's own initial refcount of 1 IS that node's one
+# reference) or a SHARE (an EXISTING, already-referenced buf, needing an
+# explicit rt_list_buf_rc_inc first). Making node_new itself always
+# increment would double-count every transfer case; making it never
+# increment and leaving shares to remember on their own is far easier to
+# get wrong at a distance than deciding, once, at each of the few call
+# sites below.
+#
+# Only the STRUCTURAL references (node -> buf, retired-node -> next) are
+# tracked in this phase. Ordinary element VALUES stored in a buffer slot
+# -- including a retired node's own `val` (the overwritten element a
+# diff remembers) -- stay opaque 8-byte words, exactly as before: no
+# increment/decrement for a String/List stored INTO a list happens here.
+# That is Phase 3c's own job (cascading decrement when a buffer dies),
+# a separate, separately-verified increment -- doing it here would be
+# half of a mechanism with no corresponding read-side rc_inc (Phase 3d)
+# yet to balance it, which is worse than doing neither yet.
+make a function called rt_list_node_rc_inc takes node returns done
+  bm_rc_inc(node)
+  return true
+end
+
+# Node payload is always exactly 48 bytes (bm_alloc's own free list is
+# size-keyed, so this must match whatever every node was allocated
+# with -- rt_list_node_new, below, and x64_buildlist_asm's own raw-asm
+# allocation in codegen_x64.patlang, which must stay in sync with this
+# constant).
+make a function called rt_list_node_payload_size returns n
+  return 48
+end
+
+# Reads kind and whichever downstream pointer it implies BEFORE calling
+# bm_rc_dec, not after -- the same ordering rt_string_rc_dec's own
+# header already establishes (read whatever payload data the cascade
+# needs first, decrement second), since bm_rc_dec can push this exact
+# block onto the free list immediately, and a concurrent thread could
+# pop and start overwriting it before a post-decrement read ran.
+make a function called rt_list_node_rc_dec takes node returns done
+  let kind = mem_peek_qword(node, 8)
+  let cascade_to = mem_peek_qword(node, 16)
+  if kind != 0 then
+    let cascade_to = mem_peek_qword(node, 40)
+  end
+  let n = bm_rc_dec(node, rt_list_node_payload_size())
+  if n == 0 then
+    if kind == 0 then
+      rt_list_buf_rc_dec(cascade_to)
+    else
+      rt_list_node_rc_dec(cascade_to)
+    end
+  end
+  return true
+end
+
+make a function called rt_list_buf_rc_inc takes buf returns done
+  bm_rc_inc(buf)
+  return true
+end
+
+make a function called rt_list_buf_rc_dec takes buf returns done
+  let cap = mem_peek_qword(buf, 0)
+  bm_rc_dec(buf, 16 + cap * 8)
+  return true
+end
+
+# A list of n slots: node and buffer as two SEPARATE bm_alloc blocks
+# (see this section's own header for why they can't be one combined
+# allocation under this refcounting scheme the way the old single-block
+# layout used to be). The elements are unset; callers fill a fresh list
+# with rt_list_set before sharing it.
 make a function called rt_list_new takes n returns tagged
-  let addr = rt_heap_alloc(64 + n * 8)
-  mem_poke_qword(addr, 0, n)
-  mem_poke_qword(addr, 8, 0)
-  mem_poke_qword(addr, 16, addr + 48)
-  mem_poke_qword(addr, 48, n)
-  return addr bor rt_list_tag()
+  let node = bm_alloc(rt_list_node_payload_size())
+  let buf = bm_alloc(16 + n * 8)
+  mem_poke_qword(buf, 0, n)
+  mem_poke_qword(node, 0, n)
+  mem_poke_qword(node, 8, 0)
+  mem_poke_qword(node, 16, buf)
+  return node bor rt_list_tag()
 end
 
 # GitHub #190: list_len(v) on anything that isn't genuinely a String or List
@@ -2404,26 +2495,45 @@ make a function called rt_list_len takes l returns len
   return mem_peek_qword(addr, 0)
 end
 
-# A new ARR node of length len over an existing buffer.
+# A new ARR node of length len over an existing buffer. Deliberately
+# does NOT touch buf's own refcount -- see this file's own "Phase 3a"
+# header above rt_list_node_rc_inc for why that decision belongs to each
+# CALL SITE (transfer vs. share), not to this function.
 make a function called rt_list_node_new takes len, buf returns node
-  let node = rt_heap_alloc(48)
+  let node = bm_alloc(rt_list_node_payload_size())
   mem_poke_qword(node, 0, len)
   mem_poke_qword(node, 8, 0)
   mem_poke_qword(node, 16, buf)
   return node
 end
 
-# Rewrites `node` (currently ARR) as an older version pointing at `next`. The
-# payload goes in first and the kind last.
+# Rewrites `node` (currently ARR) as an older version pointing at `next`.
+# `next` becomes a real, counted reference (rt_list_materialize will
+# later walk it forward, so `next` must outlive `node` for as long as
+# `node` itself does); `node`'s own buf reference is released here, not
+# deferred to whenever `node` itself eventually dies -- rt_list_get's
+# own retired-node branch never reads a retired node's buf field at
+# all (it walks straight to `next`), so holding onto that reference any
+# longer would only delay reclaiming it, never serve a real read. The
+# refcount bookkeeping is placed between the payload pokes and the kind
+# poke, preserving the existing "payload first, kind last" ordering
+# (GitHub #176's own thread-safety comment, just below in the original
+# header) exactly: a concurrent reader that observes kind != 0 already
+# sees these fully resolved, both the payload AND this node's own
+# release of its buf reference.
 make a function called rt_list_retire_set takes node, idx, val, next returns done
   mem_poke_qword(node, 24, idx)
   mem_poke_qword(node, 32, val)
   mem_poke_qword(node, 40, next)
+  rt_list_node_rc_inc(next)
+  rt_list_buf_rc_dec(mem_peek_qword(node, 16))
   mem_poke_qword(node, 8, 1)
   return true
 end
 
 make a function called rt_list_retire_trunc takes node, next returns done
+  rt_list_node_rc_inc(next)
+  rt_list_buf_rc_dec(mem_peek_qword(node, 16))
   mem_poke_qword(node, 40, next)
   mem_poke_qword(node, 8, 2)
   return true
@@ -2519,7 +2629,11 @@ make a function called rt_list_materialize takes node, cap returns fresh
     let cur = mem_peek_qword(cur, 40)
   end
   let root_buf = mem_peek_qword(cur, 16)
-  let buf = rt_heap_alloc(16 + cap * 8)
+  # `path` is a transient scratch array of raw node POINTERS used only
+  # to walk the chain below -- never itself a list node or buffer, so it
+  # stays a plain rt_heap_alloc, outside this refcounting scheme (same
+  # as any other small internal working buffer elsewhere in this file).
+  let buf = bm_alloc(16 + cap * 8)
   mem_poke_qword(buf, 0, cap)
   let k = 0
   while k < n0 do
@@ -2553,6 +2667,16 @@ end
 # list_push(list, item) -> a list with item appended. In place when `l` is the
 # newest version and its buffer has room; otherwise it copies (a full buffer
 # doubles; an older version is materialised first).
+#
+# `l`'s own node (the caller's reference) is BORROWED, never consumed:
+# list_push never retires or decrements it directly (the caller still
+# owns it afterward exactly as before -- deciding whether/when to
+# release the CALLER's own reference is Phase 3b's job, not this
+# function's). The one exception is the MATERIALIZED temporary
+# (`owned == true`): that node is created fresh, used only to read its
+# buffer, and never returned or kept -- it must be explicitly released
+# here (rt_list_node_rc_dec), in BOTH the in-place and doubling paths,
+# or its one reference to its own buffer leaks forever.
 make a function called rt_list_push takes l, v returns tagged
   let node = l band rt_payload_mask()
   let n = mem_peek_qword(node, 0)
@@ -2564,9 +2688,12 @@ make a function called rt_list_push takes l, v returns tagged
   let buf = mem_peek_qword(node, 16)
   let cap = mem_peek_qword(buf, 0)
   if n < cap then
+    rt_list_buf_rc_inc(buf)
     let fresh = rt_list_node_new(n + 1, buf)
     if owned == false then
       rt_list_retire_trunc(node, fresh)
+    else
+      rt_list_node_rc_dec(node)
     end
     mem_poke_qword(buf, 16 + n * 8, v)
     return fresh bor rt_list_tag()
@@ -2578,7 +2705,7 @@ make a function called rt_list_push takes l, v returns tagged
   if new_cap < n + 1 then
     let new_cap = n + 1
   end
-  let new_buf = rt_heap_alloc(16 + new_cap * 8)
+  let new_buf = bm_alloc(16 + new_cap * 8)
   mem_poke_qword(new_buf, 0, new_cap)
   let i = 0
   while i < n do
@@ -2586,6 +2713,9 @@ make a function called rt_list_push takes l, v returns tagged
     let i = i + 1
   end
   mem_poke_qword(new_buf, 16 + n * 8, v)
+  if owned == true then
+    rt_list_node_rc_dec(node)
+  end
   return rt_list_node_new(n + 1, new_buf) bor rt_list_tag()
 end
 
@@ -2608,6 +2738,7 @@ make a function called rt_list_set_functional takes l, i0, v returns tagged
   if old == v then
     return l
   end
+  rt_list_buf_rc_inc(buf)
   let fresh = rt_list_node_new(n, buf)
   rt_list_retire_set(node, i, old, fresh)
   mem_poke_qword(buf, 16 + i * 8, v)

@@ -619,6 +619,55 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
       or fall back" shape every other exclusion in this pass already
       uses.
 
+  Scenario: list nodes and buffers are genuinely refcounted and reclaimed (docs/plans/general-refcounting.md, Phase 3a foundation)
+    Given self_hosting/lib/x64_runtime.patlang's persistent-list implementation
+      (rt_list_new/rt_list_node_new/rt_list_push/rt_list_set_functional/
+      rt_list_materialize), previously allocating its node and buffer via
+      plain rt_heap_alloc and never freeing either
+    When node and buffer become two separately bm_alloc'd, genuinely
+      refcounted blocks (rt_list_node_rc_inc/dec, rt_list_buf_rc_inc/dec,
+      reusing block_model/heap.patlang's own generic allocator Phase 1/2
+      already built and proved for strings) -- a retired node's own
+      `next` field becomes a real, counted reference to its successor
+      (rt_list_materialize will later walk it forward, so the successor
+      must outlive it), and a retired node releases its own buffer
+      reference at retire time rather than waiting for its own eventual
+      death, since no read path ever consults a retired node's buffer
+      field again
+    Then explicit rt_list_node_rc_inc/dec calls (no compiler pass decides
+      when to decrement a list LOCAL yet -- that is Phase 3b, separate,
+      not yet started) show the heap's own high-water mark staying flat
+      across 50000 build-and-release cycles, in three shapes: a bare
+      BuildList literal, a chain of list_push calls each retiring the
+      previous node (both the in-place-growth and buffer-doubling
+      paths), and a genuinely shared node forced through
+      rt_list_materialize, whose stale reference still reads back
+      correctly after the live one is mutated. A plain-integer list is
+      used deliberately throughout -- this phase reclaims the list's OWN
+      node/buffer only, never cascades into string/list ELEMENTS stored
+      inside it (that is Phase 3c, separate, not yet started), so a
+      string element would leak independently and mask whether the list
+      itself was genuinely reclaimed.
+      A real regression was found and fixed verifying this (not merely
+      discovered and left): x64_buildlist_asm (codegen_x64.patlang, the
+      raw-asm emission for every list LITERAL, including a closure's own
+      captured-values list) used to allocate its node and buffer as ONE
+      combined rt_heap_alloc block, incompatible with this scheme once
+      list_push/list_set treat them as independently bm_alloc'd, size-
+      keyed blocks -- changed to two separate `call bm_alloc` allocations
+      instead. That fix itself then broke thread_safety_check.sh (every
+      run hung before its own first print): a test fixture's `include
+      "heap.patlang"` -- always redundant once heap.patlang's functions
+      are auto-bundled via x64_runtime.obj, confirmed directly by
+      removing it with no other change -- created a duplicate/shadowed
+      `bm_alloc` symbol that collided specifically with x64_buildlist_
+      asm's own hand-written `call bm_alloc`, a collision shape patc1_
+      main.patlang's own name-collision check does not currently catch.
+      Fixed by removing that fixture's own redundant include. Verified
+      after both fixes: native_codegen_check.sh, refcounted_heap_native_
+      check.sh, thread_safety_check.sh, and the full language spec gate
+      all remain green.
+
   Scenario: apply with a runtime name and arguments dispatches natively
     Given a program using apply with two, one-statement and zero arguments
     When it is built and run as a real, fully native executable

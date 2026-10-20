@@ -1,0 +1,72 @@
+# Fixture for native_codegen.feature: docs/plans/general-refcounting.md
+# Phase 3a. Covers the parts native_list_rc_basic.patlang's own BuildList-
+# only scenario never touches: list_push's in-place-growth AND doubling
+# paths (both retire an old node, via rt_list_retire_trunc), and a
+# genuinely SHARED node forced through rt_list_materialize (two
+# references to the same node, one mutated via list_push while the
+# other is kept alive and read back afterward).
+#
+# Given (case 1): a 3-element list built up via three list_push calls
+#   from an empty list literal, each releasing the immediately-previous
+#   now-stale reference, then the final result released too -- nothing
+#   kept alive across iterations.
+# When: repeated 50000 times.
+# Then: the heap's own high-water mark stays flat.
+#
+# Given (case 2): a 2-element list, with an EXTRA reference count taken
+#   out on its own node (simulating a second binding, `let b = a`,
+#   still holding the ORIGINAL view) before list_push mutates a's own
+#   copy -- forcing a's own node to retire. The extra reference is read
+#   back (proving materialize-on-read through a retired node is still
+#   correct) before being released.
+# When: repeated 50000 times.
+# Then: the heap's own high-water mark stays flat, and no read ever
+#   shows corrupted content.
+
+make a function called build_and_discard returns done
+  let a = []
+  let b = list_push(a, 1)
+  rt_list_node_rc_dec(a band rt_payload_mask())
+  let c = list_push(b, 2)
+  rt_list_node_rc_dec(b band rt_payload_mask())
+  let d = list_push(c, 3)
+  rt_list_node_rc_dec(c band rt_payload_mask())
+  rt_list_node_rc_dec(d band rt_payload_mask())
+  return true
+end
+
+make a function called sharing_cycle returns done
+  let a = [1, 2]
+  let a_raw = a band rt_payload_mask()
+  rt_list_node_rc_inc(a_raw)
+  let c = list_push(a, 3)
+  if (a[0] != 1) or (a[1] != 2) then
+    print("CORRUPTION: a read wrong after retirement" + chr(10))
+  end
+  rt_list_node_rc_dec(a_raw)
+  rt_list_node_rc_dec(a_raw)
+  rt_list_node_rc_dec(c band rt_payload_mask())
+  return true
+end
+
+let loop_count = 50000
+
+build_and_discard()
+let before1 = mem_peek_qword(mem_heap_state_addr(), 0)
+let i = 0
+while i < loop_count do
+  build_and_discard()
+  let i = i + 1
+end
+let after1 = mem_peek_qword(mem_heap_state_addr(), 0)
+
+sharing_cycle()
+let before2 = mem_peek_qword(mem_heap_state_addr(), 0)
+let j = 0
+while j < loop_count do
+  sharing_cycle()
+  let j = j + 1
+end
+let after2 = mem_peek_qword(mem_heap_state_addr(), 0)
+
+print("growth1= " + (after1 - before1) + " growth2= " + (after2 - before2))
