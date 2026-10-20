@@ -303,6 +303,17 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+echo "Scenario: a local reassigned from two separate string-producer calls is decremented both at the reassignment point and at the terminal (general-refcounting.md, reassigned-locals increment)"
+rm -f self_hosting/build/native_string_rc_dec_reassigned_local.exe
+BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_string_rc_dec_reassigned_local.patlang self_hosting/build/native_string_rc_dec_reassigned_local.exe --x64 2>&1)
+if [ -f self_hosting/build/native_string_rc_dec_reassigned_local.exe ]; then
+  OUT=$(./self_hosting/build/native_string_rc_dec_reassigned_local.exe 2>&1)
+  check_seq "50000 cycles reassigning the same local from chr(n) then chr(n+1), discarding both, cause exactly zero heap growth" "$OUT" "total= 49999 growth= 0"
+else
+  echo "  FAIL: the reassigned-local fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
 echo ""
 echo "tests: $PASS passed, $FAIL failed"
 if [ "$FAIL" -eq 0 ]; then

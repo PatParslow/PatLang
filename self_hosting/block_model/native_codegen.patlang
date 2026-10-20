@@ -1549,6 +1549,7 @@ make a function called bm_nc_build_handler_funcirs takes prog, closures, print_o
     # docs/plans/general-refcounting.md, Phase 2: the same pass ordinary
     # callee functions and main already get, extended to handlers too.
     if bm_nc_closure_is_single_block(hblocks) then
+      let h_flat = bm_nc_insert_reassignment_decs(root, h_flat)
       let h_flat = bm_nc_insert_string_rc_decs(root, h_flat)
     end
     let params = [bm_nc_prefix(root, "event_name"), bm_nc_prefix(root, "event_data"), bm_nc_prefix(root, "__globals")]
@@ -1715,6 +1716,229 @@ make a function called bm_nc_flat_index_dominates takes instrs, p, e returns yes
   return not bm_list_contains(reached, e)
 end
 
+# docs/plans/general-refcounting.md, reassigned-locals increment: every
+# ["Store", name] index in `instrs`, ascending.
+make a function called bm_nc_flat_store_positions takes instrs, name returns positions
+  let positions = []
+  let n = list_len(instrs)
+  let i = 0
+  while i < n do
+    let instr = list_get(instrs, i)
+    if (list_get(instr, 0) == "Store") and (list_get(instr, 1) == name) then
+      let positions = list_push(positions, i)
+    end
+    let i = i + 1
+  end
+  return positions
+end
+
+# Every distinct local name eligible for the decrement passes below,
+# generalizing the earlier "exactly one Store" gate to allow reassignment
+# (docs/plans/general-refcounting.md's own deferred "locals that are
+# reassigned (more than one Store)" item). A name qualifies when:
+#   1. it is never closure-captured (unchanged from before -- a closure
+#      might keep any of its values alive past this function's own
+#      return, so this pass must never touch it at all);
+#   2. EVERY Store of this name anywhere in `instrs` is immediately
+#      preceded by a string-producer call -- not just the one this scan
+#      happened to find first. A single non-producer Store (e.g. `let s =
+#      some_other_var`) means this pass cannot prove the value is a fresh,
+#      uniquely-owned string at that point, so the WHOLE name is rejected
+#      rather than guessed at (the same "prove it or fall back" shape
+#      this plan's own Phase 2 header already commits to);
+#   3. this name's textually-FIRST Store dominates every OTHER Store of
+#      the same name (bm_nc_flat_index_dominates, store-to-store instead
+#      of store-to-terminal). This is what makes bm_nc_insert_
+#      reassignment_decs's own insertion safe: by the time ANY later
+#      Store runs, on ANY path, some earlier Store to this name already
+#      ran, so there is always a genuine value sitting in the local to
+#      decrement before it gets overwritten. It is also sufficient (not
+#      just necessary) for the terminal pass below to keep using the
+#      FIRST store as the one "creation point" to check dominance
+#      against: domination composes transitively here, so if the first
+#      store dominates every later store, and some later store dominates
+#      a given terminal, the first store dominates that terminal too --
+#      there is no case where a later store reaches a terminal the first
+#      one misses.
+# A name with only one Store trivially satisfies condition 3 (nothing to
+# compare against) and keeps working exactly as the original single-store
+# pass did.
+make a function called bm_nc_reassignable_eligible_names takes instrs, captured_names returns names
+  let n = list_len(instrs)
+  let candidate_names = []
+  let i = 0
+  while i < (n - 1) do
+    let instr = list_get(instrs, i)
+    if bm_nc_is_string_producer_call(instr) then
+      let next = list_get(instrs, i + 1)
+      if list_get(next, 0) == "Store" then
+        let name = list_get(next, 1)
+        if (not bm_list_contains(captured_names, name)) and (not bm_list_contains(candidate_names, name)) then
+          let candidate_names = list_push(candidate_names, name)
+        end
+      end
+    end
+    let i = i + 1
+  end
+  let eligible = []
+  let ci = 0
+  while ci < list_len(candidate_names) do
+    let name = list_get(candidate_names, ci)
+    let positions = bm_nc_flat_store_positions(instrs, name)
+    let all_producer_preceded = true
+    let pi = 0
+    while pi < list_len(positions) do
+      let p = list_get(positions, pi)
+      if p == 0 then
+        let all_producer_preceded = false
+      elif not bm_nc_is_string_producer_call(list_get(instrs, p - 1)) then
+        let all_producer_preceded = false
+      end
+      let pi = pi + 1
+    end
+    if all_producer_preceded then
+      let first_p = list_get(positions, 0)
+      let dominates_all = true
+      let pj = 1
+      while pj < list_len(positions) do
+        if not bm_nc_flat_index_dominates(instrs, first_p, list_get(positions, pj)) then
+          let dominates_all = false
+        end
+        let pj = pj + 1
+      end
+      if dominates_all then
+        let eligible = list_push(eligible, name)
+      end
+    end
+    let ci = ci + 1
+  end
+  return eligible
+end
+
+# docs/plans/general-refcounting.md, reassigned-locals increment, job 1:
+# the OLD value of an eligible reassigned local must be decremented right
+# before it gets overwritten by a LATER Store, or it leaks every time the
+# local is reassigned (confirmed directly: self_hosting/block_model/
+# spec_fixtures/native_string_rc_dec_reassigned_local.patlang leaked 48
+# bytes per call -- BOTH the overwritten first value and the still-live
+# final value -- before this pass existed; job 2, bm_nc_insert_string_rc_
+# decs below, already covers the final value once it's told to use the
+# FIRST store as the creation point instead of requiring store_count ==
+# 1, so this pass only needs to handle the ones being overwritten).
+# Inserts [Load name; Call rt_string_rc_dec,1; Store discard] immediately
+# before every Store OTHER than a name's own first one -- stack-neutral
+# (push 1, pop-then-push-1, pop 1 nets to zero), so it never disturbs the
+# NEW value a producer call already pushed for the Store it's inserted in
+# front of. Safe by bm_nc_reassignable_eligible_names's own condition 3:
+# the first store already dominates every later one, so some valid value
+# is always sitting in the local by the time any later store runs, on
+# every path that reaches it. Returns `instrs` unchanged if no eligible
+# name actually has more than one Store (the common, non-reassigned case
+# -- purely additive otherwise, same as bm_nc_insert_string_rc_decs).
+make a function called bm_nc_insert_reassignment_decs takes root, instrs returns out
+  let captured_names = bm_nc_closure_captured_names(instrs)
+  let eligible_names = bm_nc_reassignable_eligible_names(instrs, captured_names)
+  let insert_names = []
+  let insert_positions = []
+  let ei = 0
+  while ei < list_len(eligible_names) do
+    let name = list_get(eligible_names, ei)
+    let positions = bm_nc_flat_store_positions(instrs, name)
+    if list_len(positions) > 1 then
+      let pj = 1
+      while pj < list_len(positions) do
+        # Insert BEFORE the producer call that computes the new value
+        # (position - 1), not between that call and its own Store --
+        # decrementing the OLD value doesn't depend on the new one being
+        # computed yet, and inserting it there instead keeps every
+        # Store's own producer call immediately adjacent to it, which
+        # bm_nc_insert_string_rc_decs's own eligibility re-check (run
+        # AFTER this pass, on its rewritten output) requires. Confirmed
+        # directly: inserting between the call and the Store broke that
+        # adjacency and silently dropped the local from job 2 (the
+        # terminal decrement) entirely -- caught by re-measuring heap
+        # growth (half the expected reduction, not zero) rather than
+        # trusting the IR shape alone.
+        let insert_names = list_push(insert_names, name)
+        let insert_positions = list_push(insert_positions, list_get(positions, pj) - 1)
+        let pj = pj + 1
+      end
+    end
+    let ei = ei + 1
+  end
+  if list_len(insert_positions) == 0 then
+    return instrs
+  end
+  # Sort insert_positions ascending, carrying insert_names along in
+  # lockstep -- selection sort, fine at this size (bounded by how many
+  # times a handful of locals get reassigned in one function, not by
+  # input/program size).
+  let m = list_len(insert_positions)
+  let si = 0
+  while si < m do
+    let min_idx = si
+    let sj = si + 1
+    while sj < m do
+      if list_get(insert_positions, sj) < list_get(insert_positions, min_idx) then
+        let min_idx = sj
+      end
+      let sj = sj + 1
+    end
+    if min_idx != si then
+      let tmp_pos = list_get(insert_positions, si)
+      let tmp_name = list_get(insert_names, si)
+      let insert_positions = list_set(insert_positions, si, list_get(insert_positions, min_idx))
+      let insert_names = list_set(insert_names, si, list_get(insert_names, min_idx))
+      let insert_positions = list_set(insert_positions, min_idx, tmp_pos)
+      let insert_names = list_set(insert_names, min_idx, tmp_name)
+    end
+    let si = si + 1
+  end
+  let discard_name = bm_nc_prefix(root, "__bm_string_rc_discard")
+  let out = []
+  let n = list_len(instrs)
+  let i = 0
+  while i < n do
+    let k = 0
+    while k < list_len(insert_positions) do
+      if list_get(insert_positions, k) == i then
+        let out = list_push(out, ["Load", list_get(insert_names, k)])
+        let out = list_push(out, ["Call", "rt_string_rc_dec", 1])
+        let out = list_push(out, ["Store", discard_name])
+      end
+      let k = k + 1
+    end
+    let instr = list_get(instrs, i)
+    let op = list_get(instr, 0)
+    if (op == "Jump") or (op == "JumpIfFalse") then
+      let target = list_get(instr, 1)
+      let new_target = target + bm_nc_reassign_shift_at(insert_positions, target)
+      let out = list_push(out, [op, new_target])
+    else
+      let out = list_push(out, instr)
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# How far original instruction index `idx` has shifted once every
+# bm_nc_insert_reassignment_decs insertion at or before it (each a fixed
+# 3-instruction triple) is accounted for -- same reasoning as bm_nc_
+# cumulative_shift_at, simpler shape since every insertion here costs the
+# same fixed amount.
+make a function called bm_nc_reassign_shift_at takes insert_positions, idx returns shift
+  let shift = 0
+  let k = 0
+  while k < list_len(insert_positions) do
+    if list_get(insert_positions, k) <= idx then
+      let shift = shift + 3
+    end
+    let k = k + 1
+  end
+  return shift
+end
+
 # How many instructions get inserted at a given terminal t: one triple
 # (Load/Call/Store) per eligible local, except whichever one (if any)
 # is the value actually being returned right there.
@@ -1794,33 +2018,24 @@ make a function called bm_nc_insert_string_rc_decs takes root, instrs returns ou
   end
   let captured_names = bm_nc_closure_captured_names(instrs)
   let n = list_len(instrs)
-  let eligible_names = []
+  # Generalized (docs/plans/general-refcounting.md, reassigned-locals
+  # increment) from an earlier version that only accepted a name with
+  # exactly one Store: bm_nc_reassignable_eligible_names also accepts a
+  # REASSIGNED local (more than one Store), as long as every Store is
+  # producer-preceded and the first one dominates every later one --
+  # see that function's own header for why the first store is still the
+  # right (and sufficient) "creation point" to check terminal-dominance
+  # against even when there are several. Any OLD value a later Store
+  # would otherwise overwrite is handled separately, before this pass
+  # ever runs, by bm_nc_insert_reassignment_decs (job 1); this pass only
+  # ever needs the position of the FIRST store (job 2).
+  let eligible_names = bm_nc_reassignable_eligible_names(instrs, captured_names)
   let eligible_stores = []
-  let i = 0
-  while i < (n - 1) do
-    let instr = list_get(instrs, i)
-    if bm_nc_is_string_producer_call(instr) then
-      let next = list_get(instrs, i + 1)
-      if list_get(next, 0) == "Store" then
-        let name = list_get(next, 1)
-        if not bm_list_contains(captured_names, name) then
-          let store_count = 0
-          let sj = 0
-          while sj < n do
-            let sinstr = list_get(instrs, sj)
-            if (list_get(sinstr, 0) == "Store") and (list_get(sinstr, 1) == name) then
-              let store_count = store_count + 1
-            end
-            let sj = sj + 1
-          end
-          if store_count == 1 then
-            let eligible_names = list_push(eligible_names, name)
-            let eligible_stores = list_push(eligible_stores, i + 1)
-          end
-        end
-      end
-    end
-    let i = i + 1
+  let eni = 0
+  while eni < list_len(eligible_names) do
+    let positions = bm_nc_flat_store_positions(instrs, list_get(eligible_names, eni))
+    let eligible_stores = list_push(eligible_stores, list_get(positions, 0))
+    let eni = eni + 1
   end
   if list_len(eligible_names) == 0 then
     return instrs
@@ -2327,6 +2542,7 @@ make a function called bm_nc_build_callee_funcirs takes prog, roots, print_op re
     end
     let flat = bm_nc_flatten_blocks(prog, cblocks, pure_init, print_op, flat_mode)
     if bm_nc_closure_is_single_block(cblocks) then
+      let flat = bm_nc_insert_reassignment_decs(root, flat)
       let flat = bm_nc_insert_string_rc_decs(root, flat)
     end
     let params = []
@@ -2495,6 +2711,7 @@ make a function called bm_to_real_funcir takes prog, print_op returns funcirs
   # exactly one -- but free, correct, and worth having for the genuinely
   # single-block case (a short script with no loop at all).
   if bm_nc_closure_is_single_block(main_blocks) then
+    let main_flat = bm_nc_insert_reassignment_decs(entry_name, main_flat)
     let main_flat = bm_nc_insert_string_rc_decs(entry_name, main_flat)
   end
   let main_funcir = ["FuncIR", "main", [], main_flat, []]

@@ -558,6 +558,38 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
       already follows, re-confirmed by fixing the fixture alone (no code
       change) and re-running to zero.
 
+  Scenario: a local reassigned from two separate string-producer calls is decremented at the reassignment point AND at the terminal (docs/plans/general-refcounting.md, reassigned-locals increment)
+    Given a function that reassigns the same local twice -- `let s = chr(n);
+      ...; let s = chr(n + 1)` -- and never returns or otherwise uses
+      either value -- called through the ordinary --x64 CLI for 50000
+      cycles, warmed up once first
+    When bm_nc_reassignable_eligible_names is asked whether this local
+      qualifies for the decrement passes
+    Then it says yes, because every Store of this local is immediately
+      preceded by a string-producer call and the textually-first Store
+      dominates the second one -- generalized from the earlier version of
+      this check, which required EXACTLY one Store and rejected any
+      reassigned local outright, leaking BOTH values (the overwritten
+      first one, never decremented, and the still-live final one, also
+      never decremented since the whole local was excluded from the pass).
+      bm_nc_insert_reassignment_decs inserts a decrement of the OLD value
+      immediately before the producer call that computes the new one
+      (confirmed directly: inserting it AFTER that call instead, between
+      the call and its own Store, broke the producer-call-immediately-
+      followed-by-Store adjacency the terminal pass's own eligibility
+      re-check depends on, and silently dropped the local from that pass
+      entirely -- caught by re-measuring heap growth, not by re-reading
+      the IR shape, since it showed half the expected reduction rather
+      than zero). bm_nc_insert_string_rc_decs then decrements the final
+      (second) value at the terminal, using the local's FIRST store as
+      the creation point for the per-terminal dominance check -- still
+      correct with more than one Store, since the first store already
+      dominates every later one by construction, so it also dominates
+      anything a later store does. The real heap shows exactly zero
+      growth across all 50000 cycles (48 bytes leaked per call before
+      this fix: 24 for the overwritten first value, 24 for the discarded
+      final one).
+
   Scenario: apply with a runtime name and arguments dispatches natively
     Given a program using apply with two, one-statement and zero arguments
     When it is built and run as a real, fully native executable
