@@ -393,9 +393,9 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
       DIFFERENT, later return reachable for the other branch) -- called
       50000 times through the ordinary --x64 CLI, alternating which
       branch runs each cycle
-    When bm_nc_local_dominates_all_terminals (native_codegen.patlang) is
-      asked whether this local's own creation point dominates every
-      terminal in the function
+    When bm_nc_insert_string_rc_decs (native_codegen.patlang) is asked
+      whether this local's own creation point dominates every terminal
+      in the function
     Then it says yes -- the string's own Store instruction sits before
       every Return/ReturnValue in the function (real or dead-tail), and
       nothing jumps over it from earlier in the stream, so nothing can
@@ -515,6 +515,48 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
       block-model fixtures (tailapp, issue #180) -- fixed directly
       rather than worked around again, since it was now blocking real
       test infrastructure, not just a hypothetical gap.
+
+  Scenario: the single-block pass is retrofitted to per-terminal dominance, closing a gap the loop increment's own fix already closed for the raw pass (docs/plans/general-refcounting.md, single-block dominance retrofit)
+    Given a function that takes an early return in one branch and creates
+      a string, via a known producer, ONLY on the other (fall-through)
+      branch -- called through the ordinary --x64 CLI for 50000 cycles,
+      alternating which branch runs each call, warmed up once through the
+      fall-through path so the string's own free-list size class is
+      already primed before the real measurement starts
+    When bm_nc_flat_index_dominates (native_codegen.patlang) is asked,
+      independently, whether the string's own creation point dominates
+      the early-return terminal and whether it dominates the fall-through
+      function's own terminal
+    Then it says no for the early-return terminal (unreachable by
+      construction -- that path never creates the string at all, so there
+      is nothing to decrement there either way) and yes for the other
+      (nothing reaches it without already having taken the fall-through
+      path, which always creates the string first). A decrement is
+      inserted at the terminal it dominates, closing a gap the pass's own
+      earlier, uniform "dominates EVERY terminal" check left open: that
+      check saw the early-return terminal sitting at or before the
+      string's own Store and rejected the candidate OUTRIGHT, from every
+      terminal, including the one it actually dominates -- the string
+      leaked on every fall-through call (confirmed directly: 600000 bytes
+      over 50000 calls before this fix). Generalized from the raw/loop
+      pass's own bm_nc_raw_block_index_dominates and bm_nc_raw_reaches_
+      avoiding (this plan's loop increment, just above) to the flat
+      (string-op) level the single-block pass itself runs at --
+      bm_nc_flat_reaches_avoiding treats "Return" (flat emission's own
+      void/halt terminal, with no raw-level counterpart) as a dead end
+      alongside "ReturnValue", the one difference from the raw version's
+      own op set. The real heap shows exactly zero growth across all
+      50000 cycles.
+      A fixture-level mistake was found and fixed building this, kept
+      distinct from the code fix itself: the first version of this
+      scenario's own fixture warmed up through the EARLY-RETURN path
+      (never creating the string at all), leaving the free-list size
+      class unprimed and showing a small constant growth (24 bytes, two
+      cold allocations) rather than zero -- not a dominance bug, the same
+      "warm up through the path actually being measured" requirement
+      native_string_rc_dec_early_return.patlang's own warm-up call
+      already follows, re-confirmed by fixing the fixture alone (no code
+      change) and re-running to zero.
 
   Scenario: apply with a runtime name and arguments dispatches natively
     Given a program using apply with two, one-statement and zero arguments

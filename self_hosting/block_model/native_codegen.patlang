@@ -1657,55 +1657,62 @@ make a function called bm_nc_find_all_terminal_indices takes instrs returns indi
   return indices
 end
 
-# True when a local created at instruction index `p` (by a direct
-# producer call immediately before a [Store, name] there) is
-# GUARANTEED to have already been created by the time control reaches
-# EVERY index in `terminals`. Given this pass only ever runs on a
-# single-block closure (bm_nc_closure_is_single_block -- no loops; those
-# always cross blocks via JumpBlock in this project's own architecture),
-# the only way to reach a later instruction without running an earlier
-# one is a forward Jump/JumpIfFalse whose own target skips past it. Two
-# conditions, both required:
-#   1. `p` is strictly before every terminal's own index -- if some
-#      terminal sits AT OR BEFORE `p`, that path reaches it without `p`
-#      ever having run at all. Confirmed directly (not assumed): a store
-#      that happens only inside one branch, after an unrelated early
-#      return in a DIFFERENT branch (`if cond then return 0 end; let s =
-#      chr(n); return n`), has its own Store at index 9 while the early
-#      return sits at index 5 -- 5 <= 9, correctly rejected entirely, no
-#      decrement inserted anywhere for that local.
-#   2. no Jump/JumpIfFalse instruction positioned BEFORE `p` targets an
-#      index AFTER `p` -- otherwise some path could skip `p` entirely
-#      and still reach a later terminal. A jump positioned AT OR AFTER
-#      `p` can never skip `p` (p has already run to reach that jump at
-#      all), so only earlier jumps matter.
-# Confirmed directly in the other direction too: a local created
-# UNCONDITIONALLY before any branching at all (`let s = chr(n); if cond
-# then return 0 end; return n`, Store at index 2, terminals at 8/11/13,
-# no jump positioned before index 2 at all) passes both conditions and
-# is correctly treated as safe to decrement at every one of its own
-# function's terminals, early return included.
-make a function called bm_nc_local_dominates_all_terminals takes instrs, p, terminals returns yes
-  let tn = list_len(terminals)
-  let ti = 0
-  while ti < tn do
-    if list_get(terminals, ti) <= p then
-      return false
-    end
-    let ti = ti + 1
-  end
-  let i = 0
-  while i < p do
-    let instr = list_get(instrs, i)
-    let op = list_get(instr, 0)
-    if (op == 212209) or (op == 34716) then # "Jump" or "JumpIfFalse"
-      if list_get(instr, 1) > p then
-        return false
+# Flat-level counterpart of bm_nc_raw_reaches_avoiding (below, the raw/
+# loop pass's own version): every instruction index reachable from
+# `start` in this single block's own forward-jump-only instruction
+# stream, WITHOUT ever passing through `avoid`. Same op set as the
+# flat-level terminal/jump checks above ("Jump"/"JumpIfFalse" string ops,
+# not op-hashes -- this pass runs AFTER bm_nc_flatten_blocks, unlike the
+# raw pass), plus "Return"/"ReturnValue" as true dead ends (both
+# genuinely end this block's own execution; "Return" is flat-emission's
+# own void/halt terminal, with no raw-level counterpart at all -- see
+# bm_nc_find_all_terminal_indices's own header).
+make a function called bm_nc_flat_reaches_avoiding takes instrs, avoid, start returns visited
+  let n = list_len(instrs)
+  let visited = []
+  let worklist = [start]
+  let wi = 0
+  while wi < list_len(worklist) do
+    let idx = list_get(worklist, wi)
+    if (idx != avoid) and (idx >= 0) and (idx < n) and (not bm_list_contains(visited, idx)) then
+      let visited = list_push(visited, idx)
+      let instr = list_get(instrs, idx)
+      let op = list_get(instr, 0)
+      if op == "Jump" then
+        let worklist = list_push(worklist, list_get(instr, 1))
+      elif op == "JumpIfFalse" then
+        let worklist = list_push(worklist, list_get(instr, 1))
+        let worklist = list_push(worklist, idx + 1)
+      elif (op == "Return") or (op == "ReturnValue") then
+        let unused_terminal = 0
+      else
+        let worklist = list_push(worklist, idx + 1)
       end
     end
-    let i = i + 1
+    let wi = wi + 1
   end
-  return true
+  return visited
+end
+
+# `p` dominates `e` exactly when `e` is unreachable while avoiding `p` --
+# the flat-level counterpart of bm_nc_raw_block_index_dominates, checked
+# per (candidate, terminal) PAIR rather than once per candidate against
+# every terminal at once. Closes the exact gap bm_nc_local_dominates_
+# all_terminals's own header already named: a local created only on the
+# fall-through side of an earlier, unrelated branch's own early return
+# (`if cond then return 0 end; let s = chr(n); return n`) dominates the
+# SECOND terminal (nothing reaches it without already having created s)
+# even though it can never dominate the early-return terminal (that path
+# never creates s at all -- there is nothing to decrement there either
+# way, which is exactly why rejecting the candidate outright, as the
+# uniform check did, left the second terminal's own leak unfixed).
+# Confirmed directly against self_hosting/block_model/spec_fixtures/
+# native_string_rc_dec_branch_local.patlang: before this fix, 50000 calls
+# alternating which branch runs leaked 600000 bytes total (12 bytes per
+# fall-through call, s never decremented at all); after, zero.
+make a function called bm_nc_flat_index_dominates takes instrs, p, e returns yes
+  let reached = bm_nc_flat_reaches_avoiding(instrs, p, 0)
+  return not bm_list_contains(reached, e)
 end
 
 # How many instructions get inserted at a given terminal t: one triple
@@ -1757,10 +1764,10 @@ make a function called bm_nc_cumulative_shift_at takes terminals, insert_counts,
 end
 
 # The actual rewrite: finds every eligible local (direct producer
-# provenance, exactly one Store, never closure-captured, dominating
-# every terminal per bm_nc_local_dominates_all_terminals) and inserts a
-# decrement for each, once per terminal, immediately before that
-# terminal -- except at a specific terminal where the local is the
+# provenance, exactly one Store, never closure-captured) and, for EACH
+# terminal INDEPENDENTLY, inserts a decrement immediately before it
+# whenever the candidate's own creation point dominates THAT SPECIFIC
+# terminal (bm_nc_flat_index_dominates) -- except where the local is the
 # value actually being returned THERE (a Load of that same name right
 # before that specific Return/ReturnValue; a local can be returned at
 # one terminal and still correctly decremented at a different one it
@@ -1770,6 +1777,16 @@ end
 # questions). Returns `instrs` completely unchanged if no eligible local
 # is found at all -- purely additive, never a correctness risk to
 # anything this pass doesn't recognize.
+# Retrofitted (docs/plans/general-refcounting.md) from an earlier,
+# simpler version that required a candidate to dominate EVERY terminal
+# uniformly, same shape as the raw/loop pass's own bm_nc_rewrite_block_
+# for_string_rc and for the identical reason -- a uniform check rejected
+# a string created only on the fall-through side of an earlier, unrelated
+# branch's own early return outright, even though it plainly dominates
+# the OTHER terminal, leaking it on every fall-through call
+# (self_hosting/block_model/spec_fixtures/
+# native_string_rc_dec_branch_local.patlang: 600000 bytes over 50000
+# calls before this fix, confirmed directly, zero after).
 make a function called bm_nc_insert_string_rc_decs takes root, instrs returns out
   let terminals = bm_nc_find_all_terminal_indices(instrs)
   if list_len(terminals) == 0 then
@@ -1778,6 +1795,7 @@ make a function called bm_nc_insert_string_rc_decs takes root, instrs returns ou
   let captured_names = bm_nc_closure_captured_names(instrs)
   let n = list_len(instrs)
   let eligible_names = []
+  let eligible_stores = []
   let i = 0
   while i < (n - 1) do
     let instr = list_get(instrs, i)
@@ -1796,9 +1814,8 @@ make a function called bm_nc_insert_string_rc_decs takes root, instrs returns ou
             let sj = sj + 1
           end
           if store_count == 1 then
-            if bm_nc_local_dominates_all_terminals(instrs, i + 1, terminals) then
-              let eligible_names = list_push(eligible_names, name)
-            end
+            let eligible_names = list_push(eligible_names, name)
+            let eligible_stores = list_push(eligible_stores, i + 1)
           end
         end
       end
@@ -1808,18 +1825,48 @@ make a function called bm_nc_insert_string_rc_decs takes root, instrs returns ou
   if list_len(eligible_names) == 0 then
     return instrs
   end
+  # Per (terminal, candidate): does this candidate's own Store dominate
+  # THIS specific terminal? Collected once up front so the insert-count
+  # pass and the emission pass below agree exactly -- same two-pass shape
+  # as bm_nc_rewrite_block_for_string_rc's own names_per_exit.
+  let names_per_terminal = []
+  let ti0 = 0
+  while ti0 < list_len(terminals) do
+    let t = list_get(terminals, ti0)
+    let here = []
+    let ni = 0
+    while ni < list_len(eligible_names) do
+      let p = list_get(eligible_stores, ni)
+      if bm_nc_flat_index_dominates(instrs, p, t) then
+        let here = list_push(here, list_get(eligible_names, ni))
+      end
+      let ni = ni + 1
+    end
+    let names_per_terminal = list_push(names_per_terminal, here)
+    let ti0 = ti0 + 1
+  end
   let insert_counts = []
   let ti = 0
   while ti < list_len(terminals) do
     let t = list_get(terminals, ti)
-    let insert_counts = list_push(insert_counts, bm_nc_rc_dec_count_at_terminal(instrs, t, eligible_names) * 3)
+    let names_here = list_get(names_per_terminal, ti)
+    let insert_counts = list_push(insert_counts, bm_nc_rc_dec_count_at_terminal(instrs, t, names_here) * 3)
     let ti = ti + 1
   end
   let discard_name = bm_nc_prefix(root, "__bm_string_rc_discard")
   let out = []
   let i2 = 0
   while i2 < n do
-    if bm_list_contains(terminals, i2) then
+    let term_pos = 0 - 1
+    let tx = 0
+    while tx < list_len(terminals) do
+      if list_get(terminals, tx) == i2 then
+        let term_pos = tx
+      end
+      let tx = tx + 1
+    end
+    if term_pos != (0 - 1) then
+      let names_here = list_get(names_per_terminal, term_pos)
       let returned_name = ""
       if i2 > 0 then
         let prev = list_get(instrs, i2 - 1)
@@ -1828,8 +1875,8 @@ make a function called bm_nc_insert_string_rc_decs takes root, instrs returns ou
         end
       end
       let ei = 0
-      while ei < list_len(eligible_names) do
-        let name = list_get(eligible_names, ei)
+      while ei < list_len(names_here) do
+        let name = list_get(names_here, ei)
         if name != returned_name then
           let out = list_push(out, ["Load", name])
           let out = list_push(out, ["Call", "rt_string_rc_dec", 1])
@@ -1929,10 +1976,8 @@ make a function called bm_nc_raw_block_exit_indices takes instrs returns indices
   return indices
 end
 
-# Same dominance condition as bm_nc_local_dominates_all_terminals, at
-# the raw (op-hash) level instead of the flat (string-op) level: `p`
-# strictly before every exit, and no Jump(212209)/JumpIfFalse(34716)
-# positioned before `p` targets an index after it.
+# Same dominance condition as bm_nc_flat_index_dominates, at the raw
+# (op-hash) level instead of the flat (string-op) level.
 # Every instruction index reachable from `start`, in a forward-jump-
 # only DAG (confirmed true of any single block's own raw instrs: no
 # loops are possible WITHIN one block, those always cross blocks via

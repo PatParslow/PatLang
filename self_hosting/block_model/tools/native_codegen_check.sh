@@ -292,6 +292,17 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+echo "Scenario: a string created only on the fall-through side of an earlier, unrelated branch's own early return is decremented at the terminal it dominates (general-refcounting.md Phase 2, single-block dominance retrofit)"
+rm -f self_hosting/build/native_string_rc_dec_branch_local.exe
+BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_string_rc_dec_branch_local.patlang self_hosting/build/native_string_rc_dec_branch_local.exe --x64 2>&1)
+if [ -f self_hosting/build/native_string_rc_dec_branch_local.exe ]; then
+  OUT=$(./self_hosting/build/native_string_rc_dec_branch_local.exe 2>&1)
+  check_seq "50000 cycles alternating early-return and fall-through (string created only on the fall-through side) cause exactly zero heap growth" "$OUT" "total= 0 growth= 0"
+else
+  echo "  FAIL: the branch-local fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
 echo ""
 echo "tests: $PASS passed, $FAIL failed"
 if [ "$FAIL" -eq 0 ]; then
