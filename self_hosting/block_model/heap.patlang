@@ -149,25 +149,50 @@ make a function called bm_freelist_slot_offset takes size returns off
   # never a real aligned payload size) to claim for a new size class --
   # fine for this phase's small, fixed number of classes; a hash table
   # would only matter past bm_freelist_table_size()'s own slot count.
+  #
+  # Recursive, not a `while` loop, deliberately -- see GitHub #220.
+  # A `while` loop whose body contains exactly ONE bare mem_peek_qword/
+  # mem_poke_qword statement, inside a non-main function, segfaults on
+  # the very first iteration under the native x64 backend. This
+  # function originally used exactly that broken shape, and was the
+  # real cause of bm_freelist_pop/bm_alloc segfaulting when called
+  # outside the exact call patterns the existing test suite happened to
+  # exercise.
+  #
+  # The call below is deliberately NOT a tail call (`return bm_freelist_
+  # slot_offset_scan(...)`) -- that specific shape is ALSO broken,
+  # independently: a non-main function that computes a local via an
+  # earlier call (bm_freelist_table_addr() here) and then tail-calls a
+  # self-recursive function, passing that local through, corrupts the
+  # caller's own locals the moment the callee actually recurses at least
+  # once (confirmed via a minimal isolated repro -- storing the result
+  # in a local before returning it, exactly as done here, avoids the
+  # corruption entirely; calling the same recursive function directly
+  # from `main`, or in non-tail position, does not trigger it either).
+  # Both are real, narrow x64 codegen bugs, not yet root-caused to a fix
+  # in codegen_x64.patlang -- see GitHub #220.
   let table = bm_freelist_table_addr()
-  let slots = bm_freelist_table_size()
-  let i = 0
-  while i < slots do
-    let off = bm_freelist_header_bytes() + i * 16
-    let s = mem_peek_qword(table, off)
-    if s == size then
-      return off
-    end
-    if s == 0 then
-      mem_poke_qword(table, off, size)
-      return off
-    end
-    let i = i + 1
+  let result = bm_freelist_slot_offset_scan(table, size, 0)
+  return result
+end
+
+make a function called bm_freelist_slot_offset_scan takes table, size, i returns off
+  if i >= bm_freelist_table_size() then
+    # Ran out of size-class slots: a real limit of this phase's fixed
+    # table, not a general allocator's answer. Signals "no free list for
+    # this size" so bm_alloc just always raw-allocates for it instead.
+    return 0 - 1
   end
-  # Ran out of size-class slots: a real limit of this phase's fixed table,
-  # not a general allocator's answer. Signals "no free list for this
-  # size" so bm_alloc just always raw-allocates for it instead.
-  return 0 - 1
+  let off = bm_freelist_header_bytes() + i * 16
+  let s = mem_peek_qword(table, off)
+  if s == size then
+    return off
+  end
+  if s == 0 then
+    mem_poke_qword(table, off, size)
+    return off
+  end
+  return bm_freelist_slot_offset_scan(table, size, i + 1)
 end
 
 make a function called bm_align8 takes size returns aligned
