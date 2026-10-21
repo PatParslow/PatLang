@@ -774,6 +774,58 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
       zero heap growth and zero mismatched reads (no early free from
       under-counting, no double-free from over-releasing).
 
+  Scenario: reading a list element into a named local gives it a real, compiler-inserted increment, not just a borrow (docs/plans/general-refcounting.md, Phase 4d)
+    Given list_get (the host call `a[i]`/`s[i]` indexing lowers to)
+      returns a BORROW from the container by default -- a value whose
+      type cannot be known statically (an int, most of the time, in
+      many real programs), unlike chr()/concat() (always String) or
+      BuildList/list_push/list_set (always List)
+    When list_get is registered as a THIRD producer kind, "dynamic"
+      (bm_nc_producer_kind, bm_nc_is_dynamic_producer_call,
+      native_codegen.patlang), whose own decrement function is the
+      generic runtime dispatcher rt_rc_dec_if_refcounted (x64_runtime.
+      patlang -- it already checks the value's own tag at runtime and
+      no-ops on anything that isn't a String or List), and a new
+      compiler pass, bm_nc_insert_list_get_result_incs, inserts a real
+      rt_rc_inc_if_refcounted immediately AFTER the Store whenever
+      list_get's own result is stored into a name this now makes
+      independently decrement-eligible -- after, not before, unlike the
+      write-side pass: list_get's result isn't a named Load yet at the
+      point it is produced, it IS the value about to be stored for the
+      first time
+    Then a function building a one-element list, reading that element
+      into a named local, comparing it against a second, transient
+      (never stored) read of the same element, and discarding both the
+      list and the local at its own terminal, called 50000 times, shows
+      zero mismatched comparisons (no corruption from either read) and
+      exactly zero heap growth (the string's refcount is correctly
+      balanced at 2 -- its own creation plus the read-side increment --
+      against the two releases that actually fire: the list's own
+      cascade, Phase 4c, and the local's own decrement, now enabled by
+      this new producer kind). The transient second read never touches
+      the refcount at all, since nothing ever stores it anywhere
+      independently tracked.
+
+  Scenario: returning a list's own element while the list itself also dies at the same terminal does not free it out from under the return (docs/plans/general-refcounting.md, Phase 4d)
+    Given a function that builds a list, reads ONE element out into a
+      named local, and returns THAT LOCAL -- never the list itself, so
+      the list's own terminal decrement still fires (Phase 4b),
+      cascading into its buffer (Phase 4c) and decrementing the very
+      same string the local is about to return
+    When this is checked BEFORE Phase 4d's own read-side increment
+      exists
+    Then the fixture SEGFAULTS, confirmed directly via git-stash back
+      to the Phase 4c baseline, not merely prints a wrong value -- the
+      list's own cascade decrement (which runs before the final Load
+      of the returned local, the same ordering the terminal pass
+      already uses to exclude the returned value from its OWN
+      decrement) frees the string while it is still about to be handed
+      back to the caller: a real, confirmed use-after-free, not a
+      missed-reclamation optimization. After Phase 4d's own increment
+      lands, the SAME fixture (2000 calls, each kept-alive result
+      checked against 2000 more unrelated allocations made afterward
+      for real allocation pressure) shows zero corrupted elements.
+
   Scenario: apply with a runtime name and arguments dispatches natively
     Given a program using apply with two, one-statement and zero arguments
     When it is built and run as a real, fully native executable

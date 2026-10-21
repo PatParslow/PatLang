@@ -766,6 +766,86 @@ phase: it fails on GitHub #222 (`undefined variable
 all of this phase's changes -- a pre-existing, separately tracked,
 unrelated bug.
 
+### Phase 4d -- the read side: list_get's own copy-out (done)
+
+`list_get` (what `a[i]`/`s[i]` indexing lowers to, `lower.patlang`)
+hands back a BORROW from the container by default -- reading it never
+touched the refcount before this phase, symmetric with how Phase 4c's
+own write side needs no increment for a brand-new, unnamed element
+either. The gap: unlike `chr()`/`concat()` (always String) or
+`BuildList`/`list_push`/`list_set` (always List), `list_get`'s own
+return type depends on whatever is actually sitting in the container at
+runtime and cannot be known from the call site alone, so it did not fit
+either of the two existing static producer categories at all.
+
+Registered `list_get` as a THIRD producer kind, "dynamic"
+(`bm_nc_is_dynamic_producer_call`/`bm_nc_producer_kind`, `native_
+codegen.patlang`), whose own decrement function is the GENERIC runtime
+dispatcher `rt_rc_dec_if_refcounted` (already built for Phase 4c) rather
+than a type-specific one -- it already checks the value's own tag at
+runtime and no-ops on anything that isn't actually a String or List,
+exactly the "don't know statically, ask at runtime" fallback this one
+producer kind needs. `bm_nc_reassignable_eligible_names`'s own
+"same_kind" check (previously a binary string-vs-list boolean) became a
+3-way comparison over this new `bm_nc_producer_kind`. This alone makes
+`let x = a[0]` newly ELIGIBLE for Phase 2/4b's own existing decrement
+passes (job 1 reassignment-decrement, job 2 terminal-decrement) with
+zero further code changes to either -- both already dispatch through
+`bm_nc_rc_dec_fn_for_producer`, which now returns the right function
+name for all three kinds uniformly.
+
+That extension alone would be unsafe on its own (symmetric to Phase
+4c's own safety fork): if `x` becomes decrement-eligible without a
+matching increment at the point it is read, the read gives it a SECOND
+owner with nothing having balanced the count for it. A new compiler
+pass, `bm_nc_insert_list_get_result_incs`, inserts a real
+`rt_rc_inc_if_refcounted` call immediately AFTER the Store whenever
+`list_get`'s own result is stored into a name this new producer kind
+makes eligible -- after, not before, unlike the write-side pass:
+`list_get`'s result isn't a named Load yet at the point it is produced,
+it IS the value about to be stored for the first time. The insertion
+point is recorded as "one past the Store" so the existing `bm_nc_
+reassign_shift_at` jump-target-correction helper (already proven for
+the write-side pass) applies completely unchanged -- any jump that also
+originally targeted that same index (e.g. a single-sided `if cond then
+let x = a[0] end` whose false path jumps straight past the whole
+statement, never having run it) gets corrected to land after the
+inserted triple too, skipping it entirely rather than running it on a
+path that never produced a real value for `x`.
+
+This phase's own motivating hazard is NOT a missed-reclamation leak
+(the shape every other "deferred" item in this plan has been) -- it is
+a genuine, confirmed USE-AFTER-FREE. A function that builds a list,
+reads one element out into a named local, and returns that local
+(never the list) still runs the list's own terminal decrement (Phase
+4b), cascading into its buffer (Phase 4c) and decrementing the very
+value about to be returned -- the list's cascade runs before the final
+Load of the returned local (the same ordering the terminal pass already
+uses to exclude the returned value from its OWN decrement). Confirmed
+directly, not assumed: `native_list_rc_read_use_after_free.patlang`
+SEGFAULTS under a `git stash` back to the Phase 4c baseline, not merely
+prints a wrong value; zero corrupted elements across 2000 calls (plus
+2000 more unrelated allocations afterward for real pressure) after this
+phase's fix.
+
+Verified: two new fixtures (`native_list_rc_read_inc.patlang` -- the
+core read-into-a-local scenario, 50000 cycles, zero heap growth and
+zero mismatched reads, including a SECOND, transient read of the same
+element that correctly never touches the refcount at all since nothing
+ever stores it anywhere independently tracked; `native_list_rc_read_
+use_after_free.patlang` -- the use-after-free repro above). Full
+regression suite green: `native_codegen_check.sh` (57/57), `refcounted_
+heap_native_check.sh` (13/13), `thread_safety_check.sh` (5/5), full
+language spec gate (178/178). The Gen B self-compile fixpoint remains
+unusable as an additional check, same pre-existing GitHub #222 as
+Phase 4c.
+
+**This closes out the list/dict-element-storage feature as originally
+scoped** (3c/4c the write side, 3d/4d the read side) -- no further
+sub-phase is planned under this specific item. Dict: confirmed (Phase
+3a's own note) that `--x64` has no separate Dict primitives at all, so
+nothing here needs separate Dict work either.
+
 ## 4. What this plan deliberately does not cover
 
 - Lists' own node/aliasing scheme (Fork G) -- Phase 4a (above) answers

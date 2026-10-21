@@ -1,0 +1,50 @@
+# Fixture for native_codegen.feature: docs/plans/general-refcounting.md
+# Phase 4d -- the read-side counterpart of Phase 4c's own element-level
+# write-side increment. list_get (and `s[i]`/`l[i]` indexing, which
+# lowers to the identical CallHost) hands back a BORROW from the
+# container by default; storing that borrow into a NAMED, independently
+# decrement-eligible local gives it a genuine SECOND owner, needing a
+# real rt_rc_inc_if_refcounted at the point it is stored (bm_nc_insert_
+# list_get_result_incs, native_codegen.patlang).
+#
+# Given: a function that builds a one-element list wrapping a freshly
+#   built string, reads that element out via indexing into a named
+#   local `x`, compares `x` against a SECOND, transient (never stored)
+#   read of the same element, and returns whether they match -- the
+#   list itself and `x` are then both discarded at the function's own
+#   terminal.
+# When: called 50000 times.
+# Then: every call's own comparison matches (no corruption from either
+#   read), and the heap's own high-water mark stays flat -- the
+#   string's refcount is correctly balanced at 2 (its own creation plus
+#   the one increment at `x`'s own Store) against the two releases that
+#   actually fire (the list's own cascade, Phase 4c, and `x`'s own
+#   decrement, now enabled by list_get becoming a recognized "dynamic"
+#   producer kind, bm_nc_producer_kind). The transient second read
+#   never touches the refcount at all -- nothing ever stores it
+#   anywhere independently tracked, so nothing would ever balance an
+#   increment for it.
+make a function called read_and_discard takes n returns r
+  let lst = [chr(n % 26 + 65)]
+  let x = lst[0]
+  if x == lst[0] then
+    return 1
+  end
+  return 0
+end
+
+let loop_count = 50000
+
+read_and_discard(0)
+let before = mem_peek_qword(mem_heap_state_addr(), 0)
+let mismatches = 0
+let i = 0
+while i < loop_count do
+  let r = read_and_discard(i)
+  if r != 1 then
+    let mismatches = mismatches + 1
+  end
+  let i = i + 1
+end
+let after = mem_peek_qword(mem_heap_state_addr(), 0)
+print("mismatches= " + mismatches + " growth= " + (after - before))

@@ -391,6 +391,28 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+echo "Scenario: reading a list element into a named local gives it a real, compiler-inserted increment, not just a borrow (docs/plans/general-refcounting.md, Phase 4d)"
+rm -f self_hosting/build/native_list_rc_read_inc.exe
+BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_list_rc_read_inc.patlang self_hosting/build/native_list_rc_read_inc.exe --x64 2>&1)
+if [ -f self_hosting/build/native_list_rc_read_inc.exe ]; then
+  OUT=$(./self_hosting/build/native_list_rc_read_inc.exe 2>&1)
+  check_seq "50000 cycles reading a one-element list's own element into a named local, comparing it against a second transient read, then discarding both, cause exactly zero heap growth and zero mismatched reads" "$OUT" "mismatches= 0 growth= 0"
+else
+  echo "  FAIL: the list-rc-read-inc fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: returning a list's own element while the list itself also dies at the same terminal does not free it out from under the return (docs/plans/general-refcounting.md, Phase 4d)"
+rm -f self_hosting/build/native_list_rc_read_use_after_free.exe
+BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_list_rc_read_use_after_free.patlang self_hosting/build/native_list_rc_read_use_after_free.exe --x64 2>&1)
+if [ -f self_hosting/build/native_list_rc_read_use_after_free.exe ]; then
+  OUT=$(./self_hosting/build/native_list_rc_read_use_after_free.exe 2>&1)
+  check_seq "2000 lists each wrapping a string that is read out and returned (never the list itself), plus 2000 more unrelated allocations afterward, show zero corrupted elements" "$OUT" "mismatches= 0"
+else
+  echo "  FAIL: the list-rc-read-use-after-free fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
 echo ""
 echo "tests: $PASS passed, $FAIL failed"
 if [ "$FAIL" -eq 0 ]; then

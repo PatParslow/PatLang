@@ -1550,6 +1550,7 @@ make a function called bm_nc_build_handler_funcirs takes prog, closures, print_o
     # callee functions and main already get, extended to handlers too.
     if bm_nc_closure_is_single_block(hblocks) then
       let h_flat = bm_nc_insert_list_element_incs(root, h_flat)
+      let h_flat = bm_nc_insert_list_get_result_incs(root, h_flat)
       let h_flat = bm_nc_insert_reassignment_decs(root, h_flat)
       let h_flat = bm_nc_insert_string_rc_decs(root, h_flat)
     end
@@ -1632,23 +1633,71 @@ make a function called bm_nc_is_list_producer_call takes instr returns yes
   return bm_list_contains(bm_nc_list_producer_names(), list_get(instr, 1))
 end
 
-# Either kind this pass currently knows how to decrement -- used only to
+# docs/plans/general-refcounting.md, Phase 4d: list_get (and `s[i]`/
+# `l[i]` indexing, which lowers to the exact same CallHost) is a THIRD
+# producer kind, distinct from the two static ones above -- unlike
+# chr()/concat() (always String) or BuildList/list_push/list_set
+# (always List), list_get's own return type depends on whatever is
+# actually SITTING in the container at runtime (an int, most of the
+# time, in many real programs) and cannot be known from the call site
+# alone. Its own decrement function is therefore the GENERIC runtime
+# dispatcher (rt_rc_dec_if_refcounted, x64_runtime.patlang) rather than
+# a type-specific one -- it already checks the value's own tag at
+# runtime and silently no-ops on anything that isn't actually a String
+# or List, which is exactly the "don't know statically, so ask at
+# runtime" fallback this one producer kind genuinely needs.
+make a function called bm_nc_dynamic_producer_names returns names
+  return ["list_get"]
+end
+
+make a function called bm_nc_is_dynamic_producer_call takes instr returns yes
+  let op = list_get(instr, 0)
+  if (op != "Call") and (op != "CallHost") then
+    return false
+  end
+  return bm_list_contains(bm_nc_dynamic_producer_names(), list_get(instr, 1))
+end
+
+# Every kind this pass currently knows how to decrement -- used only to
 # decide "is this instruction a producer at all" when scanning for
-# candidate Store sites; bm_nc_rc_dec_fn_for_name (below) decides WHICH
-# decrement call a given eligible name actually needs, once eligibility
-# is otherwise established.
+# candidate Store sites; bm_nc_producer_kind/bm_nc_rc_dec_fn_for_
+# producer (below) decide WHICH decrement call a given eligible name
+# actually needs, once eligibility is otherwise established.
 make a function called bm_nc_is_refcounted_producer_call takes instr returns yes
-  return bm_nc_is_string_producer_call(instr) or bm_nc_is_list_producer_call(instr)
+  return bm_nc_is_string_producer_call(instr) or bm_nc_is_list_producer_call(instr) or bm_nc_is_dynamic_producer_call(instr)
+end
+
+# "string", "list" or "dynamic" -- the one property every Store of a
+# given eligible name must share (bm_nc_reassignable_eligible_names's
+# own "same_kind" check), since mixing producer kinds for the same name
+# would need a runtime type check this pass does not do at the
+# DECISION level (list_get's own dynamic dispatch is exactly that
+# runtime check, scoped to ONE already-known-dynamic producer, not a
+# license to mix it freely with a statically-known one for the same
+# name).
+make a function called bm_nc_producer_kind takes instr returns kind
+  if bm_nc_is_list_producer_call(instr) then
+    return "list"
+  end
+  if bm_nc_is_dynamic_producer_call(instr) then
+    return "dynamic"
+  end
+  return "string"
 end
 
 # The real decrement function to call for a value this pass is about to
 # release, given the producer instruction that created it -- "rt_string_
-# rc_dec" or "rt_list_rc_dec" (block_model/heap.patlang's own generic
+# rc_dec", "rt_list_rc_dec" (block_model/heap.patlang's own generic
 # bm_rc_dec, wrapped the same way rt_string_rc_dec already wraps it for
-# strings: unmask the tag, recover the real allocation size, decrement).
+# strings: unmask the tag, recover the real allocation size, decrement)
+# or, for a dynamic producer, the generic rt_rc_dec_if_refcounted.
 make a function called bm_nc_rc_dec_fn_for_producer takes instr returns name
-  if bm_nc_is_list_producer_call(instr) then
+  let kind = bm_nc_producer_kind(instr)
+  if kind == "list" then
     return "rt_list_rc_dec"
+  end
+  if kind == "dynamic" then
+    return "rt_rc_dec_if_refcounted"
   end
   return "rt_string_rc_dec"
 end
@@ -1855,17 +1904,20 @@ make a function called bm_nc_reassignable_eligible_names takes instrs, captured_
     if all_producer_preceded then
       let first_p = list_get(positions, 0)
       # Every Store must be producer-preceded by the SAME KIND of
-      # producer (all string, or all list) -- a local that could hold
-      # EITHER depending on which path ran would need a runtime type
-      # check to know which decrement function applies, which this pass
-      # does not do (deliberately out of scope: "prove it or fall back",
-      # not "mixed kinds never happen in practice").
-      let first_is_list = bm_nc_is_list_producer_call(list_get(instrs, first_p - 1))
+      # producer (all string, all list, or all dynamic/list_get) -- a
+      # local that could hold DIFFERENT kinds depending on which path
+      # ran would need a runtime type check to know which decrement
+      # function applies, which this pass does not do at this level
+      # (deliberately out of scope: "prove it or fall back", not "mixed
+      # kinds never happen in practice" -- a dynamic producer's OWN
+      # runtime dispatch is not a license to also mix it with a
+      # statically-known kind for the same name).
+      let first_kind = bm_nc_producer_kind(list_get(instrs, first_p - 1))
       let same_kind = true
       let pk = 1
       while pk < list_len(positions) do
         let pp = list_get(positions, pk)
-        if bm_nc_is_list_producer_call(list_get(instrs, pp - 1)) != first_is_list then
+        if bm_nc_producer_kind(list_get(instrs, pp - 1)) != first_kind then
           let same_kind = false
         end
         let pk = pk + 1
@@ -2194,6 +2246,97 @@ make a function called bm_nc_insert_list_element_incs takes root, instrs returns
       let out = list_push(out, instr)
     end
     let i2 = i2 + 1
+  end
+  return out
+end
+
+# docs/plans/general-refcounting.md, Phase 4d: the read-side counterpart
+# of bm_nc_insert_list_element_incs, just above. list_get's own result
+# (`a[i]`/`s[i]` lower to the identical CallHost, lower.patlang) is a
+# BORROW from the container by default -- reading it changes nothing
+# about the refcount, symmetric with how Phase 4c's own write side
+# needs no increment for a brand-new, unnamed element either. Only when
+# the read value is stored into a NAMED, independently decrement-
+# eligible local (now including the "dynamic" producer kind list_get
+# itself introduces -- bm_nc_producer_kind, above) does it gain a
+# SECOND owner needing a real increment.
+#
+# Inserted immediately AFTER the Store, not before: list_get's own
+# result isn't a named Load yet at the point it is produced (unlike the
+# write-side pass's own bare-Load operands, already stored somewhere),
+# it IS the value about to be stored for the very first time -- so
+# there is nothing to Load until the Store has actually run. The
+# [Load name; Call rt_rc_inc_if_refcounted,1; Store discard] triple is
+# otherwise identical, and recording the insertion point as "one past
+# the Store" (store_idx + 1) reuses bm_nc_reassign_shift_at's own
+# existing "insert BEFORE this index" semantics unchanged: any jump
+# that ALSO originally targeted exactly that index (e.g. a single-
+# sided `if cond then let x = a[0] end` whose false path jumps straight
+# to right after the store, never having run it at all) gets corrected
+# to land AFTER the whole inserted triple too, the same as any other
+# jump -- it skips the triple entirely rather than running it on a path
+# that never produced a real value for `name`, exactly as safe as the
+# existing decrement passes already are for the same conditionally-
+# assigned shape.
+make a function called bm_nc_insert_list_get_result_incs takes root, instrs returns out
+  let captured_names = bm_nc_closure_captured_names(instrs)
+  let eligible_names = bm_nc_reassignable_eligible_names(instrs, captured_names)
+  if list_len(eligible_names) == 0 then
+    return instrs
+  end
+  let n = list_len(instrs)
+  let insert_positions = []
+  let insert_names = []
+  let i = 0
+  while i < (n - 1) do
+    let instr = list_get(instrs, i)
+    if (list_get(instr, 0) == "CallHost") and (list_get(instr, 1) == "list_get") then
+      let next = list_get(instrs, i + 1)
+      if list_get(next, 0) == "Store" then
+        let name = list_get(next, 1)
+        if bm_list_contains(eligible_names, name) then
+          let insert_positions = list_push(insert_positions, i + 2)
+          let insert_names = list_push(insert_names, name)
+        end
+      end
+    end
+    let i = i + 1
+  end
+  if list_len(insert_positions) == 0 then
+    return instrs
+  end
+  let discard_name = bm_nc_prefix(root, "__bm_string_rc_discard")
+  let out = []
+  let i2 = 0
+  while i2 < n do
+    let instr = list_get(instrs, i2)
+    let op = list_get(instr, 0)
+    if (op == "Jump") or (op == "JumpIfFalse") then
+      let target = list_get(instr, 1)
+      let new_target = target + bm_nc_reassign_shift_at(insert_positions, target)
+      let out = list_push(out, [op, new_target])
+    else
+      let out = list_push(out, instr)
+    end
+    let k = 0
+    while k < list_len(insert_positions) do
+      if list_get(insert_positions, k) == (i2 + 1) then
+        let out = list_push(out, ["Load", list_get(insert_names, k)])
+        let out = list_push(out, ["Call", "rt_rc_inc_if_refcounted", 1])
+        let out = list_push(out, ["Store", discard_name])
+      end
+      let k = k + 1
+    end
+    let i2 = i2 + 1
+  end
+  let k2 = 0
+  while k2 < list_len(insert_positions) do
+    if list_get(insert_positions, k2) == n then
+      let out = list_push(out, ["Load", list_get(insert_names, k2)])
+      let out = list_push(out, ["Call", "rt_rc_inc_if_refcounted", 1])
+      let out = list_push(out, ["Store", discard_name])
+    end
+    let k2 = k2 + 1
   end
   return out
 end
@@ -2813,6 +2956,7 @@ make a function called bm_nc_build_callee_funcirs takes prog, roots, print_op re
     let flat = bm_nc_flatten_blocks(prog, cblocks, pure_init, print_op, flat_mode)
     if bm_nc_closure_is_single_block(cblocks) then
       let flat = bm_nc_insert_list_element_incs(root, flat)
+      let flat = bm_nc_insert_list_get_result_incs(root, flat)
       let flat = bm_nc_insert_reassignment_decs(root, flat)
       let flat = bm_nc_insert_string_rc_decs(root, flat)
     end
@@ -2983,6 +3127,7 @@ make a function called bm_to_real_funcir takes prog, print_op returns funcirs
   # single-block case (a short script with no loop at all).
   if bm_nc_closure_is_single_block(main_blocks) then
     let main_flat = bm_nc_insert_list_element_incs(entry_name, main_flat)
+    let main_flat = bm_nc_insert_list_get_result_incs(entry_name, main_flat)
     let main_flat = bm_nc_insert_reassignment_decs(entry_name, main_flat)
     let main_flat = bm_nc_insert_string_rc_decs(entry_name, main_flat)
   end

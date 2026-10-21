@@ -1,0 +1,58 @@
+# Fixture for native_codegen.feature: a REAL, confirmed use-after-free
+# bug (not just a missed-reclamation optimization) found scoping Phase
+# 4d. A function builds a list, reads ONE element out into a named
+# local, and returns THAT LOCAL -- never the list itself. The list is
+# not the value being returned, so its own terminal decrement still
+# fires (Phase 4b), cascading into its buffer (Phase 4c) and
+# decrementing the very same string the local is about to return. Before
+# Phase 4d's own read-side increment existed, that local's own read was
+# never incremented -- the list's own cascade decrement (which runs
+# BEFORE the final Load of the returned local, same ordering the
+# terminal pass already uses to exclude the returned value from ITS
+# OWN decrement) freed the string while it was still about to be
+# handed back to the caller. Confirmed directly, not assumed: this
+# exact fixture SEGFAULTS under the pre-Phase-4d compiler (git-stash
+# confirmed), not merely prints a wrong value.
+#
+# Given: extract_and_return(n) builds a one-element list, reads that
+#   element into a local via indexing, and returns the local (never the
+#   list).
+# When: called 2000 times, each result kept alive in an outer list, with
+#   2000 more unrelated string allocations made afterward to create real
+#   allocation pressure that would reuse any wrongly-freed block.
+# Then: every kept result still holds its original, uncorrupted string
+#   -- bm_nc_insert_list_get_result_incs's own increment at `x`'s Store
+#   gives the string a genuine second owner, so the list's own cascade
+#   only brings its refcount from 2 down to 1, leaving it alive for the
+#   local to actually return.
+make a function called extract_and_return takes n returns r
+  let lst = [chr(n % 26 + 65)]
+  let x = lst[0]
+  return x
+end
+
+let count = 2000
+let kept = []
+let i = 0
+while i < count do
+  let r = extract_and_return(i)
+  let kept = list_push(kept, r)
+  let i = i + 1
+end
+let junk = []
+let j = 0
+while j < count do
+  let junk = list_push(junk, chr(j % 26 + 65))
+  let j = j + 1
+end
+let mismatches = 0
+let k = 0
+while k < count do
+  let item = list_get(kept, k)
+  let expected = chr(k % 26 + 65)
+  if item != expected then
+    let mismatches = mismatches + 1
+  end
+  let k = k + 1
+end
+print("mismatches= " + mismatches)
