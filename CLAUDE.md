@@ -444,3 +444,47 @@ class of tool.
   `bm_parity_one.sh`, the spec-suite runners) still buffer fully as of this
   writing -- this section is the policy for new work and a flagged backlog
   item for existing tools, not a claim that the retrofit has happened.
+
+---
+
+## 9. Dispatch-by-name primitives: a new one must be added to EVERY registry that enumerates them, not just the one you're touching
+
+Confirmed recurring, not a one-off (GitHub #224): `bm_nc_dispatches_by_name`
+(`self_hosting/block_model/native_codegen.patlang`) is the list of host
+primitives that resolve a callee by a RUNTIME STRING NAME rather than a
+compile-time-visible `Call` target (`apply`, `fiber_new`, `parallel_map`,
+`budgeted_run`). Any function ONLY ever referenced this way (never via an
+ordinary call expression) needs this list to know it must still get its own
+standalone, addressable FuncIR emitted and registered in the apply table --
+otherwise it fails at runtime with `function '<name>' not found`, for every
+program using that primitive, not just an edge case. Found with `parallel_map`
+missing from this list entirely, **and** `fiber_new` ALSO missing despite
+being named in the list's own header comment as something it was supposed to
+cover -- the comment and the code had already drifted apart once before this
+was even looked at.
+
+- **Rule**: when adding a new host primitive whose first argument (or any
+  argument) is a function looked up by name at runtime -- not a closure, not
+  a compile-time-visible call -- add it to `bm_nc_dispatches_by_name`
+  in the SAME change, and verify by grepping for every existing caller of
+  `resolve_func_addr` (`self_hosting/lib/x64_runtime.patlang`) to confirm the
+  list's membership still matches that caller set exactly, not from memory or
+  the list's own comment.
+- **Rule**: when fixing one entry found missing from a registry like this,
+  don't stop at the one bug report named -- re-derive the FULL correct
+  membership from first principles (grep the actual call sites of whatever
+  mechanism the registry gates) and compare against the list's current
+  contents, the same way this entry's own fix found a SECOND missing name
+  nobody had reported yet.
+- **Rule**: a registry's own header comment is a claim, not a guarantee --
+  verify the code actually matches what the comment says it does before
+  trusting either one, especially when debugging exactly this class of bug.
+- **Broader pattern this is one instance of**: this project already has
+  multiple "the full set of things with property X must be kept exhaustive"
+  registries (§2's self_hosting/`rust-runtime` mirror-sync, §7's `__vars`-
+  touching-from-parallel-workers audit, now this one). Treat "which other
+  enumeration does this new thing also need to join" as a standing question
+  for ANY new primitive, pass, or capability -- not just these three known
+  instances -- since the failure mode (works for every existing caller,
+  silently or loudly breaks for the next new one) is identical across all of
+  them.

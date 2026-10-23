@@ -401,10 +401,19 @@ end
 # instruction names, plus -- if the program contains any CallDynamic, whose
 # callee is a runtime value -- every declared function.
 # Runtime functions that look a function up by name at run time (fiber_new,
-# apply, budgeted_run) need every callable emitted, the same as CallDynamic:
-# the name a program passes in is not a statically visible call.
+# apply, parallel_map, budgeted_run) need every callable emitted, the same
+# as CallDynamic: the name a program passes in is not a statically visible
+# call. GitHub #224: parallel_map was missing from this list entirely (its
+# own worker argument is always a bare string literal, never an ordinary
+# Call node, so a worker function never got its own standalone FuncIR and
+# resolve_func_addr failed with "function not found" at runtime for every
+# program using it, including the existing threading_demo.patlang example
+# -- confirmed via a clean revert to the last commit, so this predates any
+# work this session). fiber_new resolves its own argument the exact same
+# way (resolve_func_addr, x64_runtime.patlang) and was ALSO missing here,
+# though no existing test happened to exercise that specific gap yet.
 make a function called bm_nc_dispatches_by_name takes callee returns yes
-  return (callee == "fiber_new") or (callee == "apply") or (callee == "budgeted_run")
+  return (callee == "fiber_new") or (callee == "apply") or (callee == "parallel_map") or (callee == "budgeted_run")
 end
 
 make a function called bm_nc_call_roots takes prog returns roots
@@ -2710,24 +2719,63 @@ make a function called bm_nc_raw_cumulative_shift_at takes exits, insert_counts,
   return shift
 end
 
+# Hash-level counterpart of bm_nc_is_refcounted_producer_call/bm_nc_rc_
+# dec_fn_for_producer: this file's string-keyed instr, like
+# bm_nc_rewrite_block_for_string_rc's own `instrs`, has already had its
+# opcode replaced by bm_op_hash (700058/"CallHost", 938836/"Call") by
+# this point, so those two functions' own `op != "Call"`-style checks
+# never match here and silently fall through -- confirmed the real
+# cause of GitHub #226 (not assumed): this pass treated ANY CallHost/
+# Call immediately followed by a Store as a string-producing candidate,
+# with no eligibility filter and no producer-kind dispatch at all,
+# unconditionally hardcoding "rt_string_rc_dec" below. `bounds[0]`
+# lowers to `CallHost "list_get", 2` immediately followed by a Store --
+# list_get is a real producer call (Phase 4d's own "dynamic" kind, docs/
+# plans/general-refcounting.md), but its result is an ordinary int most
+# of the time, and rt_string_rc_dec unconditionally reads a refcount
+# header at [ptr-8] with no type check at all (unlike rt_rc_dec_if_
+# refcounted) -- a real, reproduced segfault, not a theoretical risk.
+# Returns false for anything that is not a known refcounted-producer
+# call by name, same three-kind vocabulary (string/list/dynamic) as the
+# single-block pass's own bm_nc_producer_kind, so both passes stay
+# provably in sync rather than drifting into two separate "what counts
+# as a producer" answers over time.
+make a function called bm_nc_raw_rc_dec_fn_for_producer takes instr returns name_or_false
+  let op = list_get(instr, 0)
+  if (op != 700058) and (op != 938836) then # "CallHost" or "Call"
+    return false
+  end
+  let callee = list_get(instr, 1)
+  if bm_list_contains(bm_nc_list_producer_names(), callee) then
+    return "rt_list_rc_dec"
+  end
+  if bm_list_contains(bm_nc_dynamic_producer_names(), callee) then
+    return "rt_rc_dec_if_refcounted"
+  end
+  if bm_list_contains(bm_nc_string_producer_names(), callee) then
+    return "rt_string_rc_dec"
+  end
+  return false
+end
+
 # The actual per-block rewrite: finds every eligible local LOCAL TO THIS
-# ONE BLOCK (direct producer provenance -- CallHost 700058 or Call
-# 938836 immediately followed by a Store 642543 -- exactly one such
-# Store in this block, never forwarded by any JumpBlock here) and, for
-# EACH of this block's own exits INDEPENDENTLY, inserts a decrement
-# immediately before it whenever this candidate's own creation point
-# dominates THAT SPECIFIC exit (bm_nc_raw_block_index_dominates) -- a
-# ReturnValue exit excepting the local actually being returned there, a
-# JumpBlock exit never excepting anything (forwarded names are already
-# excluded globally). A candidate need not dominate every exit to be
-# considered at all (see that function's own header for why requiring
-# that would make this pass inert for the most common loop-body shape).
-# Every existing Jump/JumpIfFalse target gets corrected for the shift,
-# same two-pass approach as the flat-level version and for the
-# identical reason (found there first: inserting instructions without
-# correcting existing jump targets sends them to the wrong place).
-# Returns `blk` completely unchanged if no eligible local is found in
-# it at all.
+# ONE BLOCK (direct producer provenance -- a KNOWN refcounted-producer
+# CallHost/Call, bm_nc_raw_rc_dec_fn_for_producer, immediately followed
+# by a Store -- exactly one such Store in this block, never forwarded
+# by any JumpBlock here) and, for EACH of this block's own exits
+# INDEPENDENTLY, inserts a decrement immediately before it whenever this
+# candidate's own creation point dominates THAT SPECIFIC exit
+# (bm_nc_raw_block_index_dominates) -- a ReturnValue exit excepting the
+# local actually being returned there, a JumpBlock exit never excepting
+# anything (forwarded names are already excluded globally). A candidate
+# need not dominate every exit to be considered at all (see that
+# function's own header for why requiring that would make this pass
+# inert for the most common loop-body shape). Every existing Jump/
+# JumpIfFalse target gets corrected for the shift, same two-pass
+# approach as the flat-level version and for the identical reason (found
+# there first: inserting instructions without correcting existing jump
+# targets sends them to the wrong place). Returns `blk` completely
+# unchanged if no eligible local is found in it at all.
 make a function called bm_nc_rewrite_block_for_string_rc takes blk returns new_blk
   let instrs = bi_block_instrs(blk)
   let exits = bm_nc_raw_block_exit_indices(instrs)
@@ -2737,11 +2785,12 @@ make a function called bm_nc_rewrite_block_for_string_rc takes blk returns new_b
   let forwarded_names = bm_nc_raw_jumpblock_forwarded_names(instrs)
   let n = list_len(instrs)
   let eligible_names = []
+  let eligible_fns = []
   let i = 0
   while i < (n - 1) do
     let instr = list_get(instrs, i)
-    let op = list_get(instr, 0)
-    if (op == 700058) or (op == 938836) then # "CallHost" or "Call"
+    let dec_fn = bm_nc_raw_rc_dec_fn_for_producer(instr)
+    if dec_fn != false then
       let next = list_get(instrs, i + 1)
       if list_get(next, 0) == 642543 then # "Store"
         let name = list_get(next, 1)
@@ -2757,6 +2806,7 @@ make a function called bm_nc_rewrite_block_for_string_rc takes blk returns new_b
           end
           if store_count == 1 then
             let eligible_names = list_push(eligible_names, name)
+            let eligible_fns = list_push(eligible_fns, dec_fn)
           end
         end
       end
@@ -2836,8 +2886,16 @@ make a function called bm_nc_rewrite_block_for_string_rc takes blk returns new_b
       while ei < list_len(names_here) do
         let name = list_get(names_here, ei)
         if name != returned_name then
+          let dec_fn = "rt_string_rc_dec"
+          let fi = 0
+          while fi < list_len(eligible_names) do
+            if list_get(eligible_names, fi) == name then
+              let dec_fn = list_get(eligible_fns, fi)
+            end
+            let fi = fi + 1
+          end
           let out = list_push(out, [277141, name]) # "Load"
-          let out = list_push(out, [700058, "rt_string_rc_dec", 1]) # "CallHost"
+          let out = list_push(out, [700058, dec_fn, 1]) # "CallHost"
           let out = list_push(out, [642543, discard_name]) # "Store"
         end
         let ei = ei + 1

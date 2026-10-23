@@ -1060,6 +1060,24 @@ make a function called vec_len takes handle returns n
   return rt_list_len(entry)
 end
 
+# vec_extend(handle, items) -- appends every element of [items] onto
+# the vec, same fire-and-forget bare-statement contract as vec_push
+# (GitHub #222 follow-up: this had no native x64 case at all, found via
+# x64_pe_link.patlang's own chunk-merging call sites during the Gen B
+# self-compile fixpoint).
+make a function called vec_extend takes handle, items returns done
+  let table = mem_peek_qword(mem_vec_table_addr(), 0)
+  let entry = rt_list_get(table, handle)
+  let n = rt_list_len(items)
+  let i = 0
+  while i < n do
+    let entry = rt_list_push(entry, rt_list_get(items, i))
+    let i = i + 1
+  end
+  rt_list_set(table, handle, entry)
+  return true
+end
+
 make a function called vec_to_list takes handle returns l
   let table = mem_peek_qword(mem_vec_table_addr(), 0)
   return rt_list_get(table, handle)
@@ -1370,6 +1388,58 @@ end
 make a function called rt_vars_unlock returns done
   rt_atomic_fetch_add(mem_vars_lock_addr() + 8, 1)
   return true
+end
+
+# GitHub #222 follow-up: tls_counter_next(key) exists for the
+# interpreter/Rust-source backends (hosts.rs's real per-OS-thread
+# TLS_COUNTERS, GitHub #197) but had no native x64 implementation at all
+# -- only found once the Gen B self-compile fixpoint got far enough to
+# actually RUN a --x64-compiled binary that calls it (x64_asm.patlang's
+# own unique label-id generation, reached on every native compile; the
+# #222 lowering bug blocked every earlier attempt from getting this far).
+# True per-OS-thread isolation would need real Win32 TLS slot management;
+# every actual call site only needs the race-free-uniqueness half of that
+# contract (not the "restarts at 0 per thread" half), so this is a single
+# GLOBAL counter keyed by string, same ticket-lock-guarded-table shape
+# g_vars_table/rt_vars_lock already uses for #198.
+make a function called rt_tls_lock returns done
+  let addr = mem_tls_counters_lock_addr()
+  let mine = rt_atomic_fetch_add(addr, 1)
+  while mem_peek_qword(addr, 8) != mine do
+    let spin = 0
+  end
+  return true
+end
+
+make a function called rt_tls_unlock returns done
+  rt_atomic_fetch_add(mem_tls_counters_lock_addr() + 8, 1)
+  return true
+end
+
+make a function called tls_counter_next takes key returns n
+  rt_tls_lock()
+  let table_addr = mem_tls_counters_table_addr()
+  let table = mem_peek_qword(table_addr, 0)
+  if table == 0 then
+    let table = rt_list_new(0)
+    mem_poke_qword(table_addr, 0, table)
+  end
+  let n = rt_list_len(table)
+  let i = 0
+  while i < n do
+    let entry = rt_list_get(table, i)
+    if rt_str_eq(rt_list_get(entry, 0), key) then
+      let old = rt_list_get(entry, 1)
+      rt_list_set(table, i, [key, old + 1])
+      rt_tls_unlock()
+      return old
+    end
+    let i = i + 1
+  end
+  let new_table = rt_list_push(table, [key, 1])
+  mem_poke_qword(table_addr, 0, new_table)
+  rt_tls_unlock()
+  return 0
 end
 
 make a function called rt_ns_find takes table, store returns idx
@@ -6897,7 +6967,12 @@ make a function called parallel_map takes items, fname returns results
   let ctxs = rt_list_new(n)
   let i = 0
   while i < n do
-    rt_list_set(ctxs, i, os_thread_spawn_by_addr(addr, items[i]))
+    # GitHub #224 follow-up: a fresh, empty __globals list -- every
+    # block-model-compiled callee expects one as an implicit trailing
+    # parameter (same convention ThreadSpawn's own closure path already
+    # supplies via BuildList 0, see native_codegen.patlang's own header
+    # on this exact mistake made once there already).
+    rt_list_set(ctxs, i, os_thread_spawn_by_addr(addr, items[i], rt_list_new(0)))
     let i = i + 1
   end
   let out = rt_list_new(n)
@@ -6907,7 +6982,20 @@ make a function called parallel_map takes items, fname returns results
     while mem_peek_qword(cj, 16) != 1 do
       os_sleep_ms(0)
     end
-    rt_list_set(out, j, mem_peek_qword(cj, 24))
+    # GitHub #224 follow-up: the worker at `addr` is a block-model-
+    # compiled callee, which always returns a [value, final_globals]
+    # pair (same convention as an ordinary Call, codegen_x64.patlang's
+    # own bm_nc_emit_call_unpack) -- patlang_thread_trampoline (code
+    # genx64.patlang) stores that raw pair at offset 24 unmodified, same
+    # as it does for thread_spawn's own closures (confirmed there via
+    # fiber_resume's own `delivered[0]`, and thread_result's lowering-
+    # inserted unwrap in lower.patlang: "thread_result(id) for a closure
+    # computing 42 returned [42, []], not 42" before that was added).
+    # parallel_map had no equivalent unwrap anywhere, so every caller
+    # got the raw pair back instead of the worker's real return value --
+    # unwrap here, bringing this in line with the same standard those
+    # two call sites already established.
+    rt_list_set(out, j, rt_list_get(mem_peek_qword(cj, 24), 0))
     let j = j + 1
   end
   return out

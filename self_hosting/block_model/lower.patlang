@@ -1599,6 +1599,48 @@ make a function called bm_push_loads takes instrs, names returns out
   return instrs
 end
 
+# GitHub #222: like bm_push_loads, but for a name NOT in `available`
+# (the CURRENT block's own genuinely-bound locals), pushes a plain `0`
+# constant instead of a Load that would reference a name this specific
+# block never declared at all. Needed because bm_lower_if_with_nested_
+# while's own after-block can be reached from TWO branches with
+# DIFFERENT available locals (one that binds a name the other never
+# does -- self_hosting/patc1_main.patlang's own `seen_names`/`program_
+# funcs`, bound only in the branch that also contains the nested
+# `while`), yet the after-block's own declared parameter list is ONE
+# fixed union, so EVERY caller must supply SOMETHING for EVERY
+# parameter. Forwarding more names than a given branch strictly needs
+# is sound as long as a real value exists somewhere to forward; once a
+# name has NO real value on a given path (no slot was ever allocated
+# for it in that scope, not merely "the value is None/empty"), there
+# is nothing left to Load, and a plain `0` is the only well-typed,
+# correct substitute: it is never a String or List, so even the
+# receiving block's own cascading refcount machinery correctly no-ops
+# on it if (per the gating that always protects it in practice) it is
+# ever accidentally read. Confirmed directly: a plain top-level
+# `while` immediately followed by an if/else-with-nested-while (where
+# only one branch binds a name read later, inside a common after-
+# block), both wrapped in one more enclosing if-with-ANOTHER branch
+# that does nothing like binds it at all, failed with `codegen_x64:
+# undefined variable '__main__program_funcs'` -- the OTHER (else)
+# branch's own transition to the shared after-block tried to Load a
+# name its own compiled scope never declared, because it was still
+# part of "main" itself, never having split into its own block at all.
+make a function called bm_push_loads_or_default takes instrs, names, available returns out
+  let n = list_len(names)
+  let i = 0
+  while i < n do
+    let name = list_get(names, i)
+    if bm_list_contains(available, name) then
+      let instrs = list_push(instrs, ["Load", name])
+    else
+      let instrs = list_push(instrs, ["Const", "num", "0"])
+    end
+    let i = i + 1
+  end
+  return instrs
+end
+
 # Phase 22: does `stmts` contain a `while` ANYWHERE reachable without
 # crossing a function boundary -- directly, or nested inside an `if`'s
 # own then/else (recursively, to arbitrary depth)? Does NOT need to
@@ -1628,6 +1670,82 @@ make a function called bm_stmt_list_contains_while takes stmts returns yes
     let i = i + 1
   end
   return false
+end
+
+# GitHub #222: every name this statement list binds via a top-level
+# `let`, by the time it finishes, including names bound inside a
+# NESTED `if`'s own then/else (recursing into both, unconditionally --
+# see the correction below for why neither branch is ever skipped).
+# Used in two places: bm_lower_top_level_stmt_list's own ordinary,
+# non-splitting If case (extending known_locals past an if/else that
+# initializes a name before a LATER top-level `while` references it
+# only after the loop), and bm_lower_if_with_nested_while (extending
+# `captured`, which seeds the AFTER-block's own known_locals, past an
+# if/else whose OWN branch containing the nested `while` is where the
+# name is actually bound).
+#
+# A UNION across a nested If's then/else, not an intersection: a name
+# bound by only ONE branch still needs a real parameter slot wherever
+# it is syntactically reachable downstream, even though its value is
+# only meaningful on the path that actually bound it -- matching
+# bm_lower_if_with_nested_while's own established "forwarding more
+# than strictly necessary is still SOUND" philosophy (that function's
+# own header), extended here to names bound INSIDE a split, not just
+# ones already known before it.
+#
+# Correction, found diagnosing the real Gen B self-compile fixpoint
+# directly (not reasoned about in the abstract): an EARLIER version of
+# this function skipped recursing into any nested `if` that itself
+# contained a `while`, on the theory that bm_lower_if_with_nested_while
+# already gives that shape its own real block split with its own
+# known_locals threading, so re-scanning it here was redundant. That
+# reasoning holds ONLY for this function's first call site (a single
+# if-statement already known, by the caller, to contain no nested
+# while in either branch) -- it is WRONG for the second call site,
+# where this function scans a LONGER statement list (an outer if's own
+# then_stmts/else_stmts) that can itself CONTAIN a further nested if/
+# else whose OWN branch has the real while loop. Skipping that inner
+# if entirely dropped everything it binds (self_hosting/patc1_main.
+# patlang's own `program_funcs`/`seen_names`, bound inside an if/else
+# nested one level deeper than this function's own first fix reached)
+# from the OUTER if's own `captured` -- confirmed directly: fixing only
+# the first call site (an intersection-only version of this function)
+# got the real fixpoint one step further, past `__loop_exit_17__
+# program_funcs`, but then failed identically on `__if_after_12__
+# seen_names`, and even after also fixing `captured` to use a union in
+# bm_lower_if_with_nested_while itself, a THIRD, deeper-nested case
+# (`__main__collided_names`, args.length checks wrapping an if/else
+# whose own else-branch wraps the WHOLE rest of the build, itself
+# containing program_funcs's own if/else) still failed until this
+# function stopped skipping contains-while branches altogether.
+make a function called bm_unconditionally_bound_names takes stmts returns names
+  let names = []
+  let n = list_len(stmts)
+  let i = 0
+  while i < n do
+    let stmt = list_get(stmts, i)
+    let ty = list_get(stmt, 0)
+    if ty == "Let" then
+      let name = list_get(stmt, 1)
+      if not bm_list_contains(names, name) then
+        let names = list_push(names, name)
+      end
+    elif ty == "If" then
+      let then_names = bm_unconditionally_bound_names(list_get(stmt, 2))
+      let else_names = bm_unconditionally_bound_names(list_get(stmt, 3))
+      let both = bm_union_preserving_order(then_names, else_names)
+      let bi = 0
+      while bi < list_len(both) do
+        let bname = list_get(both, bi)
+        if not bm_list_contains(names, bname) then
+          let names = list_push(names, bname)
+        end
+        let bi = bi + 1
+      end
+    end
+    let i = i + 1
+  end
+  return names
 end
 
 # Phase 22 correction, same day, before this was ever committed: the
@@ -1672,7 +1790,15 @@ end
 # those cases still hand their OWN exit/after block the CALLER's own
 # `k` (not a fresh `["none"]`), so the propagation is genuinely correct
 # to arbitrary nesting depth, not just one level.
-make a function called bm_apply_continuation takes k, instrs, pending returns out
+# GitHub #222: `known_locals` is what the CALLER's own scope genuinely
+# has bound right now -- passed through so a "jump" continuation whose
+# own `captured` list includes a name THIS specific caller never bound
+# (bm_lower_if_with_nested_while's own after_k, reached from a branch
+# that doesn't bind everything the OTHER branch does) forwards a safe
+# default for it instead of emitting a Load that references a name
+# with no real storage anywhere in the caller's own compiled scope --
+# see bm_push_loads_or_default's own header for the full story.
+make a function called bm_apply_continuation takes k, instrs, pending, known_locals returns out
   let kind = list_get(k, 0)
   if kind == "none" then
     return [instrs, pending]
@@ -1685,7 +1811,7 @@ make a function called bm_apply_continuation takes k, instrs, pending returns ou
       let instrs = list_push(instrs, ["CallHost", "budget_check", 0])
       let instrs = list_push(instrs, ["Store", "__bm_discard"])
     end
-    let instrs = bm_push_loads(instrs, captured)
+    let instrs = bm_push_loads_or_default(instrs, captured, known_locals)
     let instrs = list_push(instrs, ["Load", "__globals"])
     let instrs = list_push(instrs, ["JumpBlock", target_name, jump_params])
     return [instrs, pending]
@@ -1773,25 +1899,66 @@ make a function called bm_lower_if_with_nested_while takes stmt, stmts, idx, ins
   let then_stmts = list_get(stmt, 2)
   let else_stmts = list_get(stmt, 3)
   let after_name = bm_next_synth_name("__if_after")
-  let captured = known_locals
-  let jump_params = list_push(captured, "__globals")
-  let after_k = ["jump", after_name, captured, jump_params]
+  # GitHub #222: `after_known_locals` extends known_locals with every
+  # name EITHER then_stmts or else_stmts binds via `let` -- it seeds
+  # ONLY the AFTER-block's own known_locals/jump_params (the after
+  # block is reached only once one of these two branches has already
+  # run, so a name either one binds is just as real a local from that
+  # point on as anything already in known_locals before this if/else
+  # started). A UNION, not an intersection: a name bound by only ONE
+  # branch (self_hosting/patc1_main.patlang's own `seen_names`, bound
+  # only in the branch that also contains the nested `while`, read
+  # later only through code gated on having taken that same branch)
+  # still needs a real parameter slot wherever it's syntactically
+  # reachable, even though its value is only meaningful on the path
+  # that actually bound it -- the same "forwarding more than strictly
+  # necessary is still SOUND" philosophy this function's own header
+  # already states for `captured == known_locals` as a whole, extended
+  # to cover names bound INSIDE this split too, not just names already
+  # known before it.
+  #
+  # Correction, found diagnosing the real Gen B self-compile fixpoint
+  # directly: an earlier version of this fix used this SAME extended
+  # set as `known_locals` for the then/else branches' OWN recursive
+  # processing too (not just the after-block) -- wrong, and a NEW
+  # regression, not merely incomplete: a name bound only partway
+  # through one of these branches (program_funcs, inside its own
+  # further-nested if/else) is NOT yet a real local at the START of
+  # that branch's own processing, so pre-seeding it into known_locals
+  # there let an EARLIER, UNRELATED sibling `while` (one that textually
+  # precedes the binding, in the SAME then/else branch) believe it
+  # could forward program_funcs's own CURRENT value onward -- but nothing
+  # has stored anything into it yet, so codegen correctly reported it
+  # as undefined (`__main__program_funcs`, main's own direct flat
+  # stream being compiled before any real block split had even
+  # happened for a case this narrow). Confirmed directly with a
+  # minimal, standalone repro: a plain top-level `while` immediately
+  # before an if/else-with-nested-while, both wrapped in one more
+  # enclosing if -- failed exactly this way with the single-known_
+  # locals version, and passed once then/else kept using the
+  # ORIGINAL, un-extended known_locals for their own recursive calls;
+  # only the after-block (which by construction never runs until one
+  # branch already has) gets the extended set.
+  let after_known_locals = bm_union_preserving_order(known_locals, bm_unconditionally_bound_names(then_stmts))
+  let after_known_locals = bm_union_preserving_order(after_known_locals, bm_unconditionally_bound_names(else_stmts))
+  let jump_params = list_push(after_known_locals, "__globals")
+  let after_k = ["jump", after_name, after_known_locals, jump_params]
 
   let instrs = bm_lower_expr(cond, instrs, block_names, immut_params)
   let instrs = list_push(instrs, ["JumpIfFalse", 0])
   let jif_pos = list_len(instrs) - 1
 
-  let then_result = bm_lower_top_level_stmt_list(then_stmts, 0, instrs, block_names, blocks_by_name, immut_params, captured, pending, [], after_k)
+  let then_result = bm_lower_top_level_stmt_list(then_stmts, 0, instrs, block_names, blocks_by_name, immut_params, known_locals, pending, [], after_k)
   let instrs = list_get(then_result, 0)
   let pending = list_get(then_result, 1)
 
   let instrs = list_set(instrs, jif_pos, ["JumpIfFalse", list_len(instrs)])
 
-  let else_result = bm_lower_top_level_stmt_list(else_stmts, 0, instrs, block_names, blocks_by_name, immut_params, captured, pending, [], after_k)
+  let else_result = bm_lower_top_level_stmt_list(else_stmts, 0, instrs, block_names, blocks_by_name, immut_params, known_locals, pending, [], after_k)
   let instrs = list_get(else_result, 0)
   let pending = list_get(else_result, 1)
 
-  let after_result = bm_lower_top_level_stmt_list(stmts, idx + 1, [], block_names, blocks_by_name, immut_params, captured, pending, [], k)
+  let after_result = bm_lower_top_level_stmt_list(stmts, idx + 1, [], block_names, blocks_by_name, immut_params, after_known_locals, pending, [], k)
   let after_instrs = list_get(after_result, 0)
   let pending = list_get(after_result, 1)
   let pending = list_push(pending, ["BlockIR", after_name, jump_params, bm_hash_rewrite_instrs(after_instrs)])
@@ -1900,6 +2067,33 @@ make a function called bm_lower_top_level_stmt_list takes stmts, start_idx, inst
       # the first instruction as `instrs` and the second as the synthesized
       # block list -- a regression from #149's fix that no fixture reached.
       return [bm_lower_jump_call(call, instrs, block_names, blocks_by_name, immut_params), pending]
+    elif ty == "If" then
+      # GitHub #222: an ordinary if/else (already excluded from the
+      # nested-while case above) that unconditionally binds a name in
+      # BOTH branches makes that name just as "known" from this point
+      # on as a direct top-level `let` -- bm_unconditionally_bound_
+      # names's own header has the full story and the real bug this
+      # closes. Lowering itself is otherwise identical to the ordinary
+      # If/Return/Expr case below (still the original, non-splitting
+      # bm_lower_stmt); only known_locals gains anything here.
+      let bound = bm_unconditionally_bound_names([stmt])
+      let bi2 = 0
+      while bi2 < list_len(bound) do
+        let bname = list_get(bound, bi2)
+        if not bm_list_contains(known_locals, bname) then
+          let known_locals = list_push(known_locals, bname)
+        end
+        let bi2 = bi2 + 1
+      end
+      let frag = bm_relocate_jumps(bm_lower_stmt(stmt, [], block_names, blocks_by_name, immut_params), list_len(instrs))
+      let frag_n = list_len(frag)
+      let fi = 0
+      while fi < frag_n do
+        let instrs = list_push(instrs, list_get(frag, fi))
+        let fi = fi + 1
+      end
+      let fresh = []
+      let i = i + 1
     else
       # If/Return/Expr (including a bare jump-call): conservatively
       # invalidate `fresh` entirely -- this narrow, straight-line-only
@@ -1916,7 +2110,7 @@ make a function called bm_lower_top_level_stmt_list takes stmts, start_idx, inst
       let i = i + 1
     end
   end
-  return bm_apply_continuation(k, instrs, pending)
+  return bm_apply_continuation(k, instrs, pending, known_locals)
 end
 
 make a function called bm_lower_while takes stmt, stmts, idx, instrs, block_names, blocks_by_name, immut_params, known_locals, pending, k returns out
@@ -1966,7 +2160,28 @@ make a function called bm_lower_while takes stmt, stmts, idx, instrs, block_name
   let body_free = bm_intersect_preserving_order(known_locals, bm_free_vars_of_body(body_stmts))
   let after_stmts = bm_list_slice_from(stmts, idx + 1)
   let after_free = bm_intersect_preserving_order(known_locals, bm_free_vars_of_body(after_stmts))
-  let k_captured = bm_continuation_captured(k)
+  # GitHub #222: k_captured is intersected against known_locals too, not
+  # unioned in raw like the Phase 22 comment above might suggest -- the
+  # ENCLOSING continuation `k` can now carry a name that is not yet a
+  # real local AT THIS POINT (bm_lower_if_with_nested_while's own
+  # after_k, GitHub #222's own fix there, legitimately needs `k`'s own
+  # captured set to include a name bound only once one of ITS branches
+  # has run, for when after_k is actually APPLIED at the natural end of
+  # that branch's own processing) -- but this specific `while` can be a
+  # SIBLING statement that textually precedes that binding, inside the
+  # SAME branch, reached via the SAME `k` threaded straight through.
+  # Unioning k_captured in unconditionally would make this loop try to
+  # forward a name nothing has stored into yet, exactly the shape that
+  # produced `codegen_x64: undefined variable '__main__program_funcs'`
+  # under the real Gen B self-compile fixpoint (confirmed via a minimal
+  # repro: a plain top-level `while` immediately before an if/else-
+  # with-nested-while that binds a name only inside itself, both
+  # wrapped in one more enclosing if). For a name genuinely already
+  # bound before this while (the ORIGINAL Phase 22 bug this correction
+  # fixed), intersecting against known_locals changes nothing -- it is
+  # already there -- so that guarantee is preserved unchanged; only a
+  # NOT-yet-bound name downstream of `k` is newly, correctly excluded.
+  let k_captured = bm_intersect_preserving_order(known_locals, bm_continuation_captured(k))
   let captured = bm_union_preserving_order(cond_free, bm_union_preserving_order(body_free, bm_union_preserving_order(after_free, k_captured)))
   let jump_params = list_push(captured, "__globals")
 
@@ -2442,6 +2657,20 @@ make a function called bm_lower_find_start_entry takes stmts, n returns entry
   while i < n do
     let stmt = list_get(stmts, i)
     if (list_get(stmt, 0) == "Func") and (list_get(stmt, 1) == "start") then
+      # GitHub #225: a declared "start" is accepted here UNCONDITIONALLY
+      # by its caller (bm_lower_program's own fallback-acceptance check
+      # never runs for it, since `entry` is already non-false by the
+      # time that loop reaches it) -- same latent "entry needs zero
+      # params, nothing ever checked that" gap the fallback-first-
+      # function case had, just reached by a different trigger (a user
+      # writing `start` with a parameter instead of an empty-top-level
+      # file). Checked here instead, for the same reason: fail loudly
+      # at the one place that actually knows which candidate is about
+      # to become the unconditional entry, rather than downstream where
+      # all that's left is a corrupted FuncIR to silently emit.
+      if list_len(list_get(stmt, 2)) != 0 then
+        bm_lower_unsupported("a declared 'start' function must take zero parameters to serve as the program's entry point -- it is invoked directly by the OS with none. Found " + list_len(list_get(stmt, 2)) + " declared parameter(s)")
+      end
       return "start"
     end
     let i = i + 1
@@ -2554,7 +2783,23 @@ make a function called bm_lower_program takes ast returns prog
       let declared_params = list_get(stmt, 2)
       let params = list_push(declared_params, "__globals")
       let body = bm_expand_activate_list(list_get(stmt, 3))
-      if entry == false then
+      # GitHub #225: the native x64 PE entry point is invoked by the OS
+      # with zero PatLang-level arguments -- a fallback candidate with
+      # its own declared parameters can never correctly serve as it (the
+      # body kept its real params' names/references, but the emitted
+      # "main" FuncIR always has an empty param list, so those reads are
+      # never bound at all). Confirmed as a real, reproduced bug, not a
+      # theoretical one: self_hosting/lib/x64_asm.patlang (function
+      # declarations only, no top-level statements, no declared "start")
+      # fell back to its own first declared function, "mbox_prefix"
+      # (params ns, box) -- "main"'s own FuncIR silently became a
+      # verbatim copy of mbox_prefix's body with params forced to [],
+      # reading uninitialized garbage for ns/box at runtime. Skip any
+      # candidate with declared parameters here; bm_lower_program's own
+      # final check (after this whole scan) fails loudly if nothing
+      # zero-param is ever found, rather than silently emitting a
+      # corrupted entry.
+      if (entry == false) and (list_len(declared_params) == 0) then
         let entry = name
       end
       # immut_params is computed from declared_params ONLY -- "__globals"
@@ -2619,6 +2864,19 @@ make a function called bm_lower_program takes ast returns prog
   while cbi < list_len(closure_blocks) do
     let blocks = list_push(blocks, list_get(closure_blocks, cbi))
     let cbi = cbi + 1
+  end
+  # GitHub #225: every path above that sets `entry` (bm_lower_find_
+  # start_entry's own "start" case, __main's own always-zero-param
+  # synthesis, and the zero-param-only fallback just above) now
+  # guarantees a zero-param candidate -- so reaching here with `entry`
+  # still false means the whole program is declarations-only AND every
+  # single one of them takes at least one parameter: there is no
+  # function the OS could ever correctly invoke as the real entry
+  # point. Fail loudly (this is a pure-library file with no runnable
+  # entry at all, not something a corrupted "main" should paper over)
+  # rather than letting a later stage silently emit one anyway.
+  if entry == false then
+    bm_lower_unsupported("this program has no function the native entry point could ever call -- every declared function takes at least one parameter, and none is named 'start' with zero parameters. A file meant to be compiled standalone needs either top-level script statements, a zero-parameter 'start', or at least one other zero-parameter function; a pure library file with no such entry is not compilable on its own (it is only meant to be `include`d into one that has one)")
   end
   return ["BlockProgramIR", entry, blocks, events]
 end
