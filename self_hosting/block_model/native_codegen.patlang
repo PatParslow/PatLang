@@ -571,6 +571,10 @@ make a function called bm_nc_root_is_locally_pure_and_edges takes prog, root ret
   return [locally_pure, edges]
 end
 
+make a function called bm_nc_is_pure_fn takes name returns yes
+  return get("__vars", "bm_pure_fn_set__" + name) == true
+end
+
 make a function called bm_nc_compute_pure_fns takes prog, roots returns pure_names
   # Real bug found and fixed while building this: CallDynamic's own
   # dispatch (bm_nc_emit_call_dynamic) calls bm_nc_fn_name(cname) for
@@ -676,9 +680,32 @@ make a function called bm_nc_emit_call_dynamic takes out, block_name, uniq, n_ex
     let out = list_push(out, ["Store", bm_nc_local(block_name, uniq, "a" + k)])
     let k = k - 1
   end
+  # GitHub #223 full-test follow-up: this function (the apply()-by-name
+  # dispatch trampoline's own codegen -- one "if name==X then call X"
+  # branch per callable the whole program defines) used to backpatch
+  # each branch's own jif_pos AND every done_positions entry via
+  # list_set, called once per matching callable directly on the
+  # ever-growing `out` list. Confirmed as the real, final remaining
+  # bottleneck for the single largest real-world case
+  # ("__closure_invoke" on a genuine ~2400-block Gen B self-compile,
+  # still stalling for minutes after the first three fixes resolved
+  # earlier, broader stalls) by reading rust-runtime/src/ir/hosts.rs's
+  # own host_list_set directly: it ALWAYS clones its list argument
+  # before calling Arc::make_mut, since the caller's own reference
+  # (args[0]) keeps the refcount >= 2 for the whole call -- so every
+  # list_set is a genuine O(current length) clone, not O(1), regardless
+  # of how the PatLang-level caller discards the old value afterward.
+  # Fixed by recording every backpatch (position -> replacement
+  # instruction) in a get/set_var hashmap instead of mutating `out`
+  # directly, then rebuilding it in ONE O(n) pass at the end -- O(n+k)
+  # total for k backpatches instead of O(n*k). Keys are namespaced by
+  # block_name+uniq (this function's own call-site identity) so
+  # concurrent/later calls for a DIFFERENT CallDynamic site never
+  # collide.
   let blocks = bi_program_blocks(prog)
   let bn = list_len(blocks)
   let done_positions = []
+  let bp_prefix = "bm_cdyn_bp__" + block_name + "__" + uniq + "__"
   let bi = 0
   while bi < bn do
     let cname = bi_block_name(list_get(blocks, bi))
@@ -704,7 +731,8 @@ make a function called bm_nc_emit_call_dynamic takes out, block_name, uniq, n_ex
       let out = bm_nc_emit_call_unpack(out, block_name, "" + uniq + "_" + bi)
       let out = list_push(out, ["__RawJump", 0])
       let done_positions = list_push(done_positions, list_len(out) - 1)
-      let out = list_set(out, jif_pos, ["__RawJumpIfFalse", list_len(out)])
+      set_var(bp_prefix + "e_" + jif_pos, true)
+      set_var(bp_prefix + "v_" + jif_pos, ["__RawJumpIfFalse", list_len(out)])
     end
     let bi = bi + 1
   end
@@ -718,10 +746,23 @@ make a function called bm_nc_emit_call_dynamic takes out, block_name, uniq, n_ex
   let end_pos = list_len(out)
   let di = 0
   while di < list_len(done_positions) do
-    let out = list_set(out, list_get(done_positions, di), ["__RawJump", end_pos])
+    let dp = list_get(done_positions, di)
+    set_var(bp_prefix + "e_" + dp, true)
+    set_var(bp_prefix + "v_" + dp, ["__RawJump", end_pos])
     let di = di + 1
   end
-  return out
+  let final_out = []
+  let oi = 0
+  let on = list_len(out)
+  while oi < on do
+    if get("__vars", bp_prefix + "e_" + oi) == true then
+      let final_out = list_push(final_out, get("__vars", bp_prefix + "v_" + oi))
+    else
+      let final_out = list_push(final_out, list_get(out, oi))
+    end
+    let oi = oi + 1
+  end
+  return final_out
 end
 
 make a function called bm_nc_translate_block_instrs takes block_name, instrs, print_op, prog, mode returns out
@@ -1137,7 +1178,7 @@ make a function called bm_nc_translate_block_instrs takes block_name, instrs, pr
       # never going to read anyway.
       let callee_name = list_get(instr, 1)
       let argc = list_get(instr, 2)
-      if bm_list_contains(get("__vars", "bm_pure_fns"), callee_name) then
+      if bm_nc_is_pure_fn(callee_name) then
         let trimmed = []
         let oi = 0
         while oi < (list_len(out) - 1) do
@@ -1304,6 +1345,7 @@ end
 # front" list primitive.
 make a function called bm_nc_collect_block_closure takes prog, root_name returns names
   let visited = [root_name]
+  set_var("bm_cbc_v__" + root_name, true)
   let i = 0
   while i < list_len(visited) do
     let cur_name = list_get(visited, i)
@@ -1315,13 +1357,19 @@ make a function called bm_nc_collect_block_closure takes prog, root_name returns
       let instr = list_get(instrs, j)
       if list_get(instr, 0) == 974555 then # "JumpBlock"
         let target = list_get(instr, 1)
-        if not bm_list_contains(visited, target) then
+        if get("__vars", "bm_cbc_v__" + target) != true then
           let visited = list_push(visited, target)
+          set_var("bm_cbc_v__" + target, true)
         end
       end
       let j = j + 1
     end
     let i = i + 1
+  end
+  let ci = 0
+  while ci < list_len(visited) do
+    set_var("bm_cbc_v__" + list_get(visited, ci), false)
+    let ci = ci + 1
   end
   return visited
 end
@@ -1382,10 +1430,32 @@ end
 # targets to absolute indices and resolves __JumpBlockTarget/__RawJump*
 # placeholders -- unchanged from Phase 9/13/19's own original logic,
 # just no longer hardcoded to bi_program_blocks(prog) as a whole.
+# GitHub #223 full-test follow-up: `starts` used to be a plain assoc
+# list, looked up via bm_nc_assoc_get's own O(bn) linear scan -- fine
+# for a small, ordinary function's closure (a handful of blocks), but
+# called once per block (bn times) below, so genuinely O(bn^2) for any
+# closure with many blocks. Confirmed as the real, severe cost for
+# EXACTLY one real-world case on a genuine Gen B self-compile:
+# "__closure_invoke" (the apply()-by-name dispatch trampoline, with one
+# block per callable the whole program defines -- hundreds, for a
+# ~500-function bundle) took 7+ minutes of continuous near-100%-CPU
+# after every ordinary, few-block function had already flattened in a
+# combined ~1-2 minutes. bm_nc_assoc_get has no other caller at all
+# (grepped), so `starts` is replaced outright with a genuine O(1) index
+# (get/set_var under Gen A -- rust-runtime/src/ir/hosts.rs's OBJECTS
+# store, a real HashMap, confirmed via its own source) instead of
+# touching the still-correct, still-used-elsewhere bm_nc_assoc_get
+# itself. Block names are unique across the whole program, so stale
+# entries from an earlier bm_nc_flatten_blocks call (a different
+# function's own blocks) can never collide with a name this call
+# queries.
+make a function called bm_nc_flatten_blocks_start_key takes name returns key
+  return "bm_flatten_starts__" + name
+end
+
 make a function called bm_nc_flatten_blocks takes prog, blocks, init_instrs, print_op, mode returns flat
   let bn = list_len(blocks)
   let translated = []
-  let starts = []
   let running_len = list_len(init_instrs)
   let bi = 0
   while bi < bn do
@@ -1395,7 +1465,7 @@ make a function called bm_nc_flatten_blocks takes prog, blocks, init_instrs, pri
     let t = list_get(result, 0)
     let index_map = list_get(result, 1)
     let translated = list_push(translated, [name, t, index_map])
-    let starts = list_push(starts, [name, running_len])
+    set_var(bm_nc_flatten_blocks_start_key(name), running_len)
     let running_len = running_len + list_len(t)
     let bi = bi + 1
   end
@@ -1407,7 +1477,7 @@ make a function called bm_nc_flatten_blocks takes prog, blocks, init_instrs, pri
     let name = list_get(entry, 0)
     let t = list_get(entry, 1)
     let index_map = list_get(entry, 2)
-    let base = bm_nc_assoc_get(starts, name)
+    let base = get("__vars", bm_nc_flatten_blocks_start_key(name))
     let tn = list_len(t)
     let ti = 0
     while ti < tn do
@@ -1417,7 +1487,7 @@ make a function called bm_nc_flatten_blocks takes prog, blocks, init_instrs, pri
         let mapped = list_get(index_map, list_get(instr, 1))
         let flat = list_push(flat, [op, base + mapped])
       elif op == "__JumpBlockTarget" then
-        let target_base = bm_nc_assoc_get(starts, list_get(instr, 1))
+        let target_base = get("__vars", bm_nc_flatten_blocks_start_key(list_get(instr, 1)))
         let flat = list_push(flat, ["Jump", target_base])
       elif (op == "__RawJump") or (op == "__RawJumpIfFalse") then
         # Phase 19 (Global*/Handler*/Emit loop/dispatch emission): a
@@ -1557,9 +1627,38 @@ make a function called bm_nc_build_handler_funcirs takes prog, closures, print_o
     let h_flat = list_push(h_flat, ["Return"])
     # docs/plans/general-refcounting.md, Phase 2: the same pass ordinary
     # callee functions and main already get, extended to handlers too.
+    #
+    # GitHub #223 full-test follow-up: bm_nc_insert_list_get_result_incs
+    # runs UNCONDITIONALLY (single-block or not), unlike its 3 siblings
+    # here -- confirmed as a real, reproducible use-after-free otherwise.
+    # A list_get result stored into a named local (e.g. `let funcs =
+    # dll_entry[1]`) got NO protective increment at all in a multi-block
+    # (loop-containing) function, since this whole block only ran for
+    # single-block closures -- but the EXISTING "raw" (multi-block)
+    # decrement pass (bm_nc_rewrite_block_for_string_rc, reached via
+    # bm_nc_rewrite_multi_block_for_string_rc below) still decrements the
+    # PARENT producer (e.g. `dll_entry`) once ITS OWN last use passes,
+    # and that decrement's cascading free reaches into the child element
+    # (`funcs`) that was never given its own reference. Confirmed via a
+    # minimal 11-line repro (an outer while loop binding `funcs` from a
+    # list_get, a nested inner while loop reading funcs[fi] while growing
+    # a separate list via list_push): funcs's own length field read back
+    # corrupted (aliased with the separate list's length) under --x64,
+    # matching interpreted output exactly before this fix. The function's
+    # own logic is generic over a flat instrs list (no single-block
+    # assumption anywhere in its body -- jump-target shifting via
+    # bm_nc_reassign_shift_at already handles arbitrary insertion
+    # positions), so lifting the gate is safe. This does not yet insert
+    # the SYMMETRIC decrement for a forwarded-then-dead value in a LATER
+    # block (funcs's own true last use is in a different block than
+    # where it was produced) -- deliberately deferred, a separate,
+    # larger piece of work; this fix trades a bounded extra reference
+    # (never released until process exit) for correctness, matching the
+    # project's own "prefer a real fix over a compensating hack" standard
+    # applied to the half that's actually reachable today.
+    let h_flat = bm_nc_insert_list_get_result_incs(root, h_flat)
     if bm_nc_closure_is_single_block(hblocks) then
       let h_flat = bm_nc_insert_list_element_incs(root, h_flat)
-      let h_flat = bm_nc_insert_list_get_result_incs(root, h_flat)
       let h_flat = bm_nc_insert_reassignment_decs(root, h_flat)
       let h_flat = bm_nc_insert_string_rc_decs(root, h_flat)
     end
@@ -1773,6 +1872,21 @@ end
 # genuinely end this block's own execution; "Return" is flat-emission's
 # own void/halt terminal, with no raw-level counterpart at all -- see
 # bm_nc_find_all_terminal_indices's own header).
+# GitHub #223 full-test follow-up: `visited` used to be a plain list,
+# checked via bm_list_contains's own O(|visited|) linear scan, called
+# once per worklist item -- genuine O(V^2) for one call, where V is the
+# number of reachable instructions, and this function is called once
+# per (candidate local, terminal) PAIR (bm_nc_flat_index_dominates's own
+# header), so the real cost compounds across every candidate name in
+# the enclosing pass. Confirmed as the final remaining bottleneck for a
+# real Gen B self-compile: __closure_invoke (6229 flat instructions,
+# almost all reachable) stalled here for minutes even after the four
+# earlier algorithmic fixes landed. Fixed with a get/set_var hashmap
+# for O(1) membership during the BFS, explicitly cleared afterward
+# (instruction indices repeat across the MANY calls this function gets
+# within one enclosing pass, so entries can't be left to leak across
+# calls the way a globally-unique-per-call prefix would avoid needing
+# to).
 make a function called bm_nc_flat_reaches_avoiding takes instrs, avoid, start returns visited
   let n = list_len(instrs)
   let visited = []
@@ -1780,8 +1894,9 @@ make a function called bm_nc_flat_reaches_avoiding takes instrs, avoid, start re
   let wi = 0
   while wi < list_len(worklist) do
     let idx = list_get(worklist, wi)
-    if (idx != avoid) and (idx >= 0) and (idx < n) and (not bm_list_contains(visited, idx)) then
+    if (idx != avoid) and (idx >= 0) and (idx < n) and (get("__vars", "bm_fra_v__" + idx) != true) then
       let visited = list_push(visited, idx)
+      set_var("bm_fra_v__" + idx, true)
       let instr = list_get(instrs, idx)
       let op = list_get(instr, 0)
       if op == "Jump" then
@@ -1796,6 +1911,11 @@ make a function called bm_nc_flat_reaches_avoiding takes instrs, avoid, start re
       end
     end
     let wi = wi + 1
+  end
+  let ci = 0
+  while ci < list_len(visited) do
+    set_var("bm_fra_v__" + list_get(visited, ci), false)
+    let ci = ci + 1
   end
   return visited
 end
@@ -1877,6 +1997,55 @@ end
 # A name with only one Store trivially satisfies condition 3 (nothing to
 # compare against) and keeps working exactly as the original single-store
 # pass did.
+# GitHub #223 continued investigation: `send(obj, "push", key, value)`
+# (x64_asm.patlang's xa_record_reloc/xa_declare_symbol and others -- see
+# that file's own "in-place (rust-runtime/src/ir/hosts.rs's ...)" comment)
+# is a native host primitive that appends `value` into `obj`'s own field
+# IN PLACE, bypassing PatLang's refcounting protocol entirely -- it never
+# increments `value`. A local whose last use is as that 4th argument must
+# never be auto-decremented at a terminal: the decrement pass has no way
+# to know `obj` now holds the only remaining reference, so decrementing
+# `value` there frees it while `obj`'s own field still points at it --
+# confirmed directly as the root cause of the LINK ERROR corruption
+# (dump of xa_record_reloc showed exactly this: `entry` built via
+# BuildList, pushed via `send(state, "push", "relocs", entry)`, then
+# `rt_list_rc_dec`'d at the function's own terminal). Excluding such a
+# name from the eligible set trades a bounded leak (never decremented,
+# same tradeoff already accepted elsewhere in this file) for correctness,
+# rather than trying to model what "send" does generically.
+make a function called bm_nc_name_escapes_via_send_push takes instrs, name returns escapes
+  let n = list_len(instrs)
+  let i = 0
+  while i < n do
+    let instr = list_get(instrs, i)
+    if list_get(instr, 0) == "CallHost" then
+      if list_get(instr, 1) == "send" then
+        if list_get(instr, 2) == 4 then
+          if i >= 1 then
+            let value_arg = list_get(instrs, i - 1)
+            if list_get(value_arg, 0) == "Load" then
+              if list_get(value_arg, 1) == name then
+                if i >= 3 then
+                  let verb_arg = list_get(instrs, i - 3)
+                  if list_get(verb_arg, 0) == "Const" then
+                    if list_get(verb_arg, 1) == "str" then
+                      if list_get(verb_arg, 2) == "push" then
+                        return true
+                      end
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+    let i = i + 1
+  end
+  return false
+end
+
 make a function called bm_nc_reassignable_eligible_names takes instrs, captured_names returns names
   let n = list_len(instrs)
   let candidate_names = []
@@ -1941,7 +2110,9 @@ make a function called bm_nc_reassignable_eligible_names takes instrs, captured_
           let pj = pj + 1
         end
         if dominates_all then
-          let eligible = list_push(eligible, name)
+          if not bm_nc_name_escapes_via_send_push(instrs, name) then
+            let eligible = list_push(eligible, name)
+          end
         end
       end
     end
@@ -2634,8 +2805,9 @@ make a function called bm_nc_raw_reaches_avoiding takes instrs, avoid, start ret
   let wi = 0
   while wi < list_len(worklist) do
     let idx = list_get(worklist, wi)
-    if (idx != avoid) and (idx >= 0) and (idx < n) and (not bm_list_contains(visited, idx)) then
+    if (idx != avoid) and (idx >= 0) and (idx < n) and (get("__vars", "bm_rra_v__" + idx) != true) then
       let visited = list_push(visited, idx)
+      set_var("bm_rra_v__" + idx, true)
       let instr = list_get(instrs, idx)
       let op = list_get(instr, 0)
       if op == 212209 then # "Jump"
@@ -2650,6 +2822,11 @@ make a function called bm_nc_raw_reaches_avoiding takes instrs, avoid, start ret
       end
     end
     let wi = wi + 1
+  end
+  let ci = 0
+  while ci < list_len(visited) do
+    set_var("bm_rra_v__" + list_get(visited, ci), false)
+    let ci = ci + 1
   end
   return visited
 end
@@ -2933,19 +3110,148 @@ make a function called bm_nc_rewrite_multi_block_for_string_rc takes prog, cbloc
   return new_cblocks
 end
 
+# GitHub #223 full-test follow-up: bm_nc_build_callee_funcirs is called
+# once per Call-target root (hundreds, for a real ~500-function
+# program), and its own loop body previously called bi_find_block
+# (self_hosting/block_model/block_ir.patlang -- a linear scan over
+# EVERY block in the WHOLE program) both directly (for root_params) and
+# indirectly, once per visited block, inside bm_nc_collect_block_closure's
+# own BFS -- so a single root's own closure collection cost O(closure_
+# size * total_blocks), repeated once per root. Confirmed as the real
+# bottleneck via direct timing instrumentation on a real Gen B self-
+# compile (patc1_all.patlang, ~511 functions): every earlier sub-step of
+# bm_to_real_funcir finished in seconds, but this one never finished in
+# 7+ minutes of continuous near-100%-CPU, flat-memory execution -- the
+# signature of real but pointless repeated work, not a legitimate slow
+# analysis pass.
+#
+# Fix: build a block-name -> block index ONCE here (get/set_var under
+# Gen A is a genuine Rust HashMap -- rust-runtime/src/ir/hosts.rs's
+# OBJECTS store -- confirmed via its own source, not assumed), prefixed
+# to avoid colliding with any of this codebase's many OTHER "__vars"
+# keys (bm_pure_fns, bm_synth_counter, etc., some of which happen to
+# share a name with a real function in a program being compiled -- this
+# IS that program, since Gen B compiles the compiler's own source).
+# bi_find_block/bm_nc_collect_block_closure/bm_nc_ordered_members
+# themselves are left completely untouched for their own other callers
+# (interp.patlang, bm_nc_build_handler_funcirs's much smaller handler
+# count) -- only THIS confirmed hot call site gets the fast, indexed
+# variants below.
+make a function called bm_nc_block_index_key takes name returns key
+  return "bm_block_idx__" + name
+end
+
+make a function called bm_nc_build_block_index takes all_blocks returns done
+  let n = list_len(all_blocks)
+  let i = 0
+  while i < n do
+    let blk = list_get(all_blocks, i)
+    if (i % 500) == 0 then
+      write_file("self_hosting/build/genb_tempdebug.txt", "bncbcf_index_progress i=" + i + "/" + n + " t_ms=" + now_ms())
+    end
+    set_var(bm_nc_block_index_key(bi_block_name(blk)), blk)
+    let i = i + 1
+  end
+  return true
+end
+
+make a function called bm_nc_find_block_indexed takes name returns blk
+  return get("__vars", bm_nc_block_index_key(name))
+end
+
+# Mirrors bm_nc_collect_block_closure exactly (same BFS over JumpBlock
+# edges), but looks up each visited block via the O(1) index above
+# instead of bi_find_block's own O(total_blocks) scan.
+make a function called bm_nc_collect_block_closure_indexed takes root_name returns names
+  let visited = [root_name]
+  set_var("bm_cbci_v__" + root_name, true)
+  let i = 0
+  while i < list_len(visited) do
+    let cur_name = list_get(visited, i)
+    let blk = bm_nc_find_block_indexed(cur_name)
+    let instrs = bi_block_instrs(blk)
+    let n = list_len(instrs)
+    let j = 0
+    while j < n do
+      let instr = list_get(instrs, j)
+      if list_get(instr, 0) == 974555 then # "JumpBlock"
+        let target = list_get(instr, 1)
+        if get("__vars", "bm_cbci_v__" + target) != true then
+          let visited = list_push(visited, target)
+          set_var("bm_cbci_v__" + target, true)
+        end
+      end
+      let j = j + 1
+    end
+    let i = i + 1
+  end
+  let ci = 0
+  while ci < list_len(visited) do
+    set_var("bm_cbci_v__" + list_get(visited, ci), false)
+    let ci = ci + 1
+  end
+  return visited
+end
+
+# Mirrors bm_nc_ordered_members exactly, INCLUDING its output ordering
+# (every member block in all_blocks' own relative order, root first --
+# bm_nc_flatten_blocks downstream depends on this, not member_names'
+# own BFS-discovery order), but replaces its O(member_names) bm_list_
+# contains membership check -- run once per block in all_blocks, so
+# O(total_blocks * member_names) per root -- with an O(1) lookup into a
+# per-root membership set, built and torn down around the one all_
+# blocks scan this still needs to preserve ordering.
+make a function called bm_nc_ordered_members_indexed takes all_blocks, member_names, root returns ordered
+  let mn = list_len(member_names)
+  let mi = 0
+  while mi < mn do
+    set_var("bm_member_set__" + list_get(member_names, mi), true)
+    let mi = mi + 1
+  end
+  let ordered = []
+  let n = list_len(all_blocks)
+  let i = 0
+  while i < n do
+    let blk = list_get(all_blocks, i)
+    if bi_block_name(blk) == root then
+      let ordered = list_push(ordered, blk)
+    end
+    let i = i + 1
+  end
+  let i = 0
+  while i < n do
+    let blk = list_get(all_blocks, i)
+    let bname = bi_block_name(blk)
+    if (bname != root) and (get("__vars", "bm_member_set__" + bname) == true) then
+      let ordered = list_push(ordered, blk)
+    end
+    let i = i + 1
+  end
+  let mi = 0
+  while mi < mn do
+    set_var("bm_member_set__" + list_get(member_names, mi), false)
+    let mi = mi + 1
+  end
+  return ordered
+end
+
 make a function called bm_nc_build_callee_funcirs takes prog, roots, print_op returns funcirs
+  write_file("self_hosting/build/genb_tempdebug.txt", "bncbcf_fetch_blocks_start t_ms=" + now_ms())
   let all_blocks = bi_program_blocks(prog)
   let abn = list_len(all_blocks)
   let rn = list_len(roots)
-  let pure_fns = get("__vars", "bm_pure_fns")
+  write_file("self_hosting/build/genb_tempdebug.txt", "bncbcf_index_start abn=" + abn + " rn=" + rn + " t_ms=" + now_ms())
+  bm_nc_build_block_index(all_blocks)
+  write_file("self_hosting/build/genb_tempdebug.txt", "bncbcf_index_done t_ms=" + now_ms())
   let funcirs = []
   let ri = 0
   while ri < rn do
     let root = list_get(roots, ri)
-    let member_names = bm_nc_collect_block_closure(prog, root)
-    let cblocks = bm_nc_ordered_members(all_blocks, member_names, root)
-    let root_params = bi_block_params(bi_find_block(prog, root))
-    let is_pure = bm_list_contains(pure_fns, root)
+    write_file("self_hosting/build/genb_tempdebug.txt", "callee_funcirs_loop ri=" + ri + "/" + rn + " root=" + root + " t_ms=" + now_ms())
+    let member_names = bm_nc_collect_block_closure_indexed(root)
+    let cblocks = bm_nc_ordered_members_indexed(all_blocks, member_names, root)
+    let root_params = bi_block_params(bm_nc_find_block_indexed(root))
+    let is_pure = bm_nc_is_pure_fn(root)
     # GitHub #215: dropping "__globals" from EXTERNAL params only --
     # a real bug found and fixed while building this against the
     # existing suite (the loop-exit/tail-call/diamond-include scenarios
@@ -3012,11 +3318,22 @@ make a function called bm_nc_build_callee_funcirs takes prog, roots, print_op re
       let cblocks = bm_nc_rewrite_multi_block_for_string_rc(prog, cblocks)
     end
     let flat = bm_nc_flatten_blocks(prog, cblocks, pure_init, print_op, flat_mode)
+    write_file("self_hosting/build/genb_tempdebug.txt", "bncbcf_flatten_done root=" + root + " flat_len=" + list_len(flat) + " single_block=" + bm_nc_closure_is_single_block(cblocks) + " t_ms=" + now_ms())
+    # GitHub #223: bm_nc_insert_list_get_result_incs runs unconditionally
+    # now -- see the handler-closure call site above for the full story
+    # (a list_get result stored into a named local, in a multi-block/
+    # loop-containing function, got no protective increment at all,
+    # leaving it vulnerable to a cascading free when its own parent
+    # producer's unrelated decrement ran).
+    let flat = bm_nc_insert_list_get_result_incs(root, flat)
+    write_file("self_hosting/build/genb_tempdebug.txt", "bncbcf_incs2_done root=" + root + " t_ms=" + now_ms())
     if bm_nc_closure_is_single_block(cblocks) then
       let flat = bm_nc_insert_list_element_incs(root, flat)
-      let flat = bm_nc_insert_list_get_result_incs(root, flat)
+      write_file("self_hosting/build/genb_tempdebug.txt", "bncbcf_incs1_done root=" + root + " t_ms=" + now_ms())
       let flat = bm_nc_insert_reassignment_decs(root, flat)
+      write_file("self_hosting/build/genb_tempdebug.txt", "bncbcf_decs1_done root=" + root + " t_ms=" + now_ms())
       let flat = bm_nc_insert_string_rc_decs(root, flat)
+      write_file("self_hosting/build/genb_tempdebug.txt", "bncbcf_decs2_done root=" + root + " t_ms=" + now_ms())
     end
     let params = []
     let pi = 0
@@ -3065,7 +3382,12 @@ end
 # FuncIR before Emit existed, since there was never more than one) --
 # every caller must pass the WHOLE list into emit_program_x64's own
 # `funcs` argument now, not just the first element.
+# TEMP DEBUG (GitHub #223 full-test follow-up): coarse markers around
+# each of this function's own sub-steps, to localize a stall found via
+# the outer bm_patc_lower checkpoint (bm_to_real_funcir_start fired but
+# nothing after it for 6+ minutes on the real ~511-function bundle).
 make a function called bm_to_real_funcir takes prog, print_op returns funcirs
+  write_file("self_hosting/build/genb_tempdebug.txt", "bnc_pure_fns_start t_ms=" + now_ms())
   # GitHub #215: computed ONCE, before main/handlers/every callee is
   # translated, so every Call site anywhere (not just inside callee
   # FuncIRs) can see the same answer. Stashed via set_var/get rather than
@@ -3076,9 +3398,29 @@ make a function called bm_to_real_funcir takes prog, print_op returns funcirs
   # read-only for the rest of this function's own call tree, never
   # written again during it.
   let pure_roots = bm_nc_call_roots(prog)
-  set_var("bm_pure_fns", bm_nc_compute_pure_fns(prog, pure_roots))
+  let pure_fns_list = bm_nc_compute_pure_fns(prog, pure_roots)
+  set_var("bm_pure_fns", pure_fns_list)
+  # GitHub #223 full-test follow-up: bm_list_contains(get("__vars",
+  # "bm_pure_fns"), callee_name) (self_hosting/block_model/native_
+  # codegen.patlang's own "Call" instruction case, below) is checked
+  # ONCE PER CALL INSTRUCTION in every block translated anywhere in the
+  # program -- a plain list scan over this ~800-entry list, same shape
+  # as the other two fixes already applied today. Confirmed as the
+  # remaining severe cost for "__closure_invoke" specifically (the
+  # apply()-by-name dispatch trampoline, with roughly one Call
+  # instruction per callable the whole program defines): STILL stuck 4+
+  # minutes of continuous near-100%-CPU on this one root even after
+  # fixing bm_nc_build_callee_funcirs's and bm_nc_flatten_blocks's own
+  # O(n) lookups. Built once here as a genuine O(1) set, same pattern as
+  # those two fixes (get/set_var's real Rust HashMap).
+  let pfi = 0
+  while pfi < list_len(pure_fns_list) do
+    set_var("bm_pure_fn_set__" + list_get(pure_fns_list, pfi), true)
+    let pfi = pfi + 1
+  end
   let blocks = bi_program_blocks(prog)
   let bn = list_len(blocks)
+  write_file("self_hosting/build/genb_tempdebug.txt", "bnc_handler_closures_start bn=" + bn + " t_ms=" + now_ms())
   let closures = bm_nc_handler_closures(prog)
 
   # Issue #173: `main` holds exactly the blocks reachable from the ENTRY by
@@ -3090,7 +3432,9 @@ make a function called bm_to_real_funcir takes prog, print_op returns funcirs
   # parameters are bound at no site inside main, so codegen_x64's
   # undefined-variable check correctly rejected main's dead copy of it.
   # A Call target is compiled into its own FuncIR instead.
+  write_file("self_hosting/build/genb_tempdebug.txt", "bnc_entry_family_start t_ms=" + now_ms())
   let entry_family = bm_nc_collect_block_closure(prog, bi_program_entry(prog))
+  write_file("self_hosting/build/genb_tempdebug.txt", "main_blocks_loop_start bn=" + bn + " entry_family_len=" + list_len(entry_family) + " t_ms=" + now_ms())
   let main_blocks = []
   let bi = 0
   while bi < bn do
@@ -3173,6 +3517,7 @@ make a function called bm_to_real_funcir takes prog, print_op returns funcirs
   let init_instrs = list_push(init_instrs, ["BuildList", 0])
   let init_instrs = list_push(init_instrs, ["Store", bm_nc_prefix(entry_name, "__globals")])
 
+  write_file("self_hosting/build/genb_tempdebug.txt", "flatten_main_start main_blocks_len=" + list_len(main_blocks) + " t_ms=" + now_ms())
   let main_flat = bm_nc_flatten_blocks(prog, main_blocks, init_instrs, print_op, "main")
   let main_flat = list_push(main_flat, ["Const", "unit", ""])
   let main_flat = list_push(main_flat, ["Return"])
@@ -3183,14 +3528,17 @@ make a function called bm_to_real_funcir takes prog, print_op returns funcirs
   # so, via JumpBlock), and bm_nc_closure_is_single_block only accepts
   # exactly one -- but free, correct, and worth having for the genuinely
   # single-block case (a short script with no loop at all).
+  # GitHub #223: bm_nc_insert_list_get_result_incs runs unconditionally --
+  # see the handler-closure call site's own header for the full story.
+  let main_flat = bm_nc_insert_list_get_result_incs(entry_name, main_flat)
   if bm_nc_closure_is_single_block(main_blocks) then
     let main_flat = bm_nc_insert_list_element_incs(entry_name, main_flat)
-    let main_flat = bm_nc_insert_list_get_result_incs(entry_name, main_flat)
     let main_flat = bm_nc_insert_reassignment_decs(entry_name, main_flat)
     let main_flat = bm_nc_insert_string_rc_decs(entry_name, main_flat)
   end
   let main_funcir = ["FuncIR", "main", [], main_flat, []]
 
+  write_file("self_hosting/build/genb_tempdebug.txt", "handler_funcirs_start t_ms=" + now_ms())
   let handler_funcirs = bm_nc_build_handler_funcirs(prog, closures, print_op)
   let funcirs = [main_funcir]
   let hi = 0
@@ -3199,7 +3547,9 @@ make a function called bm_to_real_funcir takes prog, print_op returns funcirs
     let hi = hi + 1
   end
   # Issue #173: one more separate FuncIR per Call target.
+  write_file("self_hosting/build/genb_tempdebug.txt", "callee_funcirs_start pure_roots_len=" + list_len(pure_roots) + " t_ms=" + now_ms())
   let callee_funcirs = bm_nc_build_callee_funcirs(prog, pure_roots, print_op)
+  write_file("self_hosting/build/genb_tempdebug.txt", "callee_funcirs_done count=" + list_len(callee_funcirs) + " t_ms=" + now_ms())
   let ci = 0
   while ci < list_len(callee_funcirs) do
     let funcirs = list_push(funcirs, list_get(callee_funcirs, ci))

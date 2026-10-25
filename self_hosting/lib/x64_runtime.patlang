@@ -688,6 +688,9 @@ end
 # and writes the new address back into the table via rt_list_set ONLY
 # when reallocation actually happened, so the handle (the table index)
 # never needs to change.
+# GitHub #223: same leak shape as vec_new (see its own header) -- the
+# table's previous version, abandoned the moment new_table replaces it
+# in the global slot, was never decremented.
 make a function called sb_new returns handle
   let table_addr = mem_sb_table_addr()
   let table = mem_peek_qword(table_addr, 0)
@@ -701,6 +704,7 @@ make a function called sb_new returns handle
   mem_poke_qword(entry, 8, cap)
   let new_table = rt_list_push(table, entry)
   mem_poke_qword(table_addr, 0, new_table)
+  rt_rc_dec_if_refcounted(table)
   return rt_list_len(new_table) - 1
 end
 
@@ -1020,6 +1024,25 @@ end
 # "handle out, no more pushes expected afterward" idiom the ACTUAL
 # lexer.patlang call site follows: vec_to_list(tokens) is always the
 # LAST thing done with a given vec handle).
+# GitHub #223: vec_new/vec_push/vec_set/vec_extend all read the ONE
+# shared vec table via mem_peek_qword and write a replacement back via
+# mem_poke_qword/rt_list_set -- rt_list_push/rt_list_set BORROW their
+# list argument (never consume or decrement it; see rt_list_push's own
+# header), and the plain (non-functional) rt_list_set used here never
+# decrements whatever value it displaces either (unlike rt_list_set_
+# functional, which does -- this plain variant's contract is "the
+# caller already knows the slot is safe to overwrite," which holds for
+# every call site below once the fix is applied, but did NOT hold
+# before it). Confirmed as a real, severe leak via a direct repro:
+# calling tokenize() (self_hosting/lib/lexer.patlang, itself a heavy
+# vec_push user for its own token list) 20000 times in a loop grew
+# real process memory past 40GB in seconds -- every single token
+# leaked the vec's previous list-node version, forever. `rt_list_push`/
+# `rt_list_set` always return a genuinely NEW node (never the same
+# pointer as their own list argument -- confirmed via their own header
+# comments), so every explicit decrement added below is unconditionally
+# safe (no risk of decrementing a value that's actually still the one
+# being kept, which would be a premature free).
 make a function called vec_new returns handle
   let table_addr = mem_vec_table_addr()
   let table = mem_peek_qword(table_addr, 0)
@@ -1030,6 +1053,7 @@ make a function called vec_new returns handle
   let entry = rt_list_new(0)
   let new_table = rt_list_push(table, entry)
   mem_poke_qword(table_addr, 0, new_table)
+  rt_rc_dec_if_refcounted(table)
   return rt_list_len(new_table) - 1
 end
 
@@ -1038,6 +1062,7 @@ make a function called vec_push takes handle, item returns done
   let entry = rt_list_get(table, handle)
   let new_entry = rt_list_push(entry, item)
   rt_list_set(table, handle, new_entry)
+  rt_rc_dec_if_refcounted(entry)
   return true
 end
 
@@ -1050,7 +1075,11 @@ end
 make a function called vec_set takes handle, idx, item returns done
   let table = mem_peek_qword(mem_vec_table_addr(), 0)
   let entry = rt_list_get(table, handle)
+  let old = rt_list_get(entry, idx)
   rt_list_set(entry, idx, item)
+  if old != item then
+    rt_rc_dec_if_refcounted(old)
+  end
   return true
 end
 
@@ -1065,13 +1094,26 @@ end
 # (GitHub #222 follow-up: this had no native x64 case at all, found via
 # x64_pe_link.patlang's own chunk-merging call sites during the Gen B
 # self-compile fixpoint).
+#
+# GitHub #223: the loop's own chain (entry -> entry -> ... -> entry,
+# each iteration's rt_list_push producing a brand-new node over the
+# previous one) leaked every INTERMEDIATE value, not just the table's
+# final replacement -- decrement each superseded link as the loop moves
+# past it. n==0 is a genuine no-op (nothing to extend): skip rt_list_set
+# entirely rather than writing the same value back and decrementing it,
+# which would under-count a reference the table is still holding.
 make a function called vec_extend takes handle, items returns done
   let table = mem_peek_qword(mem_vec_table_addr(), 0)
   let entry = rt_list_get(table, handle)
   let n = rt_list_len(items)
+  if n == 0 then
+    return true
+  end
   let i = 0
   while i < n do
+    let old_entry = entry
     let entry = rt_list_push(entry, rt_list_get(items, i))
+    rt_rc_dec_if_refcounted(old_entry)
     let i = i + 1
   end
   rt_list_set(table, handle, entry)
@@ -1416,6 +1458,10 @@ make a function called rt_tls_unlock returns done
   return true
 end
 
+# GitHub #223: same leak shape as vec_new/vec_push (see their own
+# header) -- the entry/table values this function displaces were never
+# decremented. High-impact here specifically: reached on every unique
+# label-id allocation during a native compile.
 make a function called tls_counter_next takes key returns n
   rt_tls_lock()
   let table_addr = mem_tls_counters_table_addr()
@@ -1431,6 +1477,7 @@ make a function called tls_counter_next takes key returns n
     if rt_str_eq(rt_list_get(entry, 0), key) then
       let old = rt_list_get(entry, 1)
       rt_list_set(table, i, [key, old + 1])
+      rt_rc_dec_if_refcounted(entry)
       rt_tls_unlock()
       return old
     end
@@ -1438,6 +1485,7 @@ make a function called tls_counter_next takes key returns n
   end
   let new_table = rt_list_push(table, [key, 1])
   mem_poke_qword(table_addr, 0, new_table)
+  rt_rc_dec_if_refcounted(table)
   rt_tls_unlock()
   return 0
 end
@@ -1454,6 +1502,13 @@ make a function called rt_ns_find takes table, store returns idx
   return 0 - 1
 end
 
+# GitHub #223: same leak shape as vec_new/vec_push (see their own
+# header) -- every table/keys/vals replacement below displaced an
+# existing value without decrementing it. `set_var`/`get("__vars",
+# ...)` back onto this, and are used throughout the compiler for
+# exactly the unique-counter idioms CLAUDE.md section 7 documents
+# (__x64_str_counter, xa_id_counter, ...) -- reached constantly during
+# a real compile, not an edge case.
 make a function called rt_ns_set takes store, key, value returns done
   rt_vars_lock()
   let table_addr = mem_vars_table_addr()
@@ -1470,8 +1525,10 @@ make a function called rt_ns_set takes store, key, value returns done
     rt_list_set(ns, 0, store)
     rt_list_set(ns, 1, keys)
     rt_list_set(ns, 2, vals)
+    let old_table = table
     let table = rt_list_push(table, ns)
     mem_poke_qword(table_addr, 0, table)
+    rt_rc_dec_if_refcounted(old_table)
     let ns_idx = rt_list_len(table) - 1
   end
   let ns = rt_list_get(table, ns_idx)
@@ -1481,7 +1538,11 @@ make a function called rt_ns_set takes store, key, value returns done
   let i = 0
   while i < n do
     if rt_str_eq(rt_list_get(keys, i), key) then
+      let old_val = rt_list_get(vals, i)
       rt_list_set(vals, i, value)
+      if old_val != value then
+        rt_rc_dec_if_refcounted(old_val)
+      end
       rt_vars_unlock()
       return true
     end
@@ -1490,7 +1551,9 @@ make a function called rt_ns_set takes store, key, value returns done
   let new_keys = rt_list_push(keys, key)
   let new_vals = rt_list_push(vals, value)
   rt_list_set(ns, 1, new_keys)
+  rt_rc_dec_if_refcounted(keys)
   rt_list_set(ns, 2, new_vals)
+  rt_rc_dec_if_refcounted(vals)
   rt_vars_unlock()
   return true
 end
@@ -1504,6 +1567,7 @@ end
 # is the only one exercised in practice; the "brand new key" tail below
 # exists for API completeness with rt_ns_set, not because anything here
 # currently depends on it.
+# GitHub #223: same leak shape as rt_ns_set (see its own header).
 make a function called rt_ns_push takes store, key, value returns done
   rt_vars_lock()
   let table_addr = mem_vars_table_addr()
@@ -1520,8 +1584,10 @@ make a function called rt_ns_push takes store, key, value returns done
     rt_list_set(ns, 0, store)
     rt_list_set(ns, 1, keys)
     rt_list_set(ns, 2, vals)
+    let old_table = table
     let table = rt_list_push(table, ns)
     mem_poke_qword(table_addr, 0, table)
+    rt_rc_dec_if_refcounted(old_table)
     let ns_idx = rt_list_len(table) - 1
   end
   let ns = rt_list_get(table, ns_idx)
@@ -1531,7 +1597,10 @@ make a function called rt_ns_push takes store, key, value returns done
   let i = 0
   while i < n do
     if rt_str_eq(rt_list_get(keys, i), key) then
-      rt_list_set(vals, i, rt_list_push(rt_list_get(vals, i), value))
+      let old_inner = rt_list_get(vals, i)
+      let new_inner = rt_list_push(old_inner, value)
+      rt_list_set(vals, i, new_inner)
+      rt_rc_dec_if_refcounted(old_inner)
       rt_vars_unlock()
       return true
     end
@@ -1540,7 +1609,9 @@ make a function called rt_ns_push takes store, key, value returns done
   let new_keys = rt_list_push(keys, key)
   let new_vals = rt_list_push(vals, rt_list_push(rt_list_new(0), value))
   rt_list_set(ns, 1, new_keys)
+  rt_rc_dec_if_refcounted(keys)
   rt_list_set(ns, 2, new_vals)
+  rt_rc_dec_if_refcounted(vals)
   rt_vars_unlock()
   return true
 end
@@ -2599,28 +2670,45 @@ end
 # of raw node POINTERS, not a per-cascade hot path, so its own non-
 # reclamation is comparatively cheap; worth revisiting if materialize
 # ever shows up as a real leak too).
+  # GitHub #223: the scratch-copy-before-decrementing approach above this
+  # header comment was real, confirmed, severe O(n) PER CALL -- not just
+  # per genuine buffer death. This function is called on EVERY fast-path
+  # rt_list_push (via retire_trunc), not only when the buffer's refcount
+  # actually reaches 0 -- in the overwhelmingly common case (the buffer
+  # has other live references, e.g. mid-growth with several retired
+  # nodes still sharing it), bm_rc_dec returns > 0 and the entire scratch
+  # copy was pure waste, paid on EVERY push regardless. Confirmed via a
+  # direct repro: an ordinary `lst = list_push(lst, i)` loop (the single
+  # most basic PatLang list-accumulation idiom) showed O(n^2) real heap
+  # growth over n pushes -- traced via per-push instrumentation to
+  # exactly this scratch-copy's own `while i < len` loop running on
+  # every push, cost scaling with the list's CURRENT length.
+  #
+  # Fix: decrement atomically FIRST (inlining bm_rc_dec's own atomic op,
+  # WITHOUT its immediate bm_freelist_push), THEN only if THIS decrement
+  # is confirmed (by the atomic op itself, not a racy pre-check) to be
+  # the terminal one, read buf's elements DIRECTLY -- safe to do so
+  # because nothing else can reuse this exact block until bm_freelist_
+  # push is explicitly called below, and the atomic decrement guarantees
+  # at most one caller ever observes n<=0 for a given block. This needs
+  # no scratch copy at all: the original "read before decrementing" rule
+  # (rt_list_node_rc_dec's own header) existed specifically because that
+  # function's bm_rc_dec call frees-and-reuses in one step; inlining the
+  # decrement here separates "did we just free it" from "is it back in
+  # the free list yet," closing the same race without paying for a copy
+  # on every call.
 make a function called rt_list_buf_rc_dec takes buf, len returns done
   let cap = mem_peek_qword(buf, 0)
-  if len > 0 then
-    let scratch = bm_alloc(len * 8)
-    let i = 0
-    while i < len do
-      mem_poke_qword(scratch, i * 8, mem_peek_qword(buf, 16 + i * 8))
-      let i = i + 1
-    end
-  end
-  let n = bm_rc_dec(buf, 16 + cap * 8)
-  if n == 0 then
+  let n = rt_atomic_fetch_add(buf - 8, 0 - 1) - 1
+  if n <= 0 then
     if len > 0 then
       let j = 0
       while j < len do
-        rt_rc_dec_if_refcounted(mem_peek_qword(scratch, j * 8))
+        rt_rc_dec_if_refcounted(mem_peek_qword(buf, 16 + j * 8))
         let j = j + 1
       end
     end
-  end
-  if len > 0 then
-    bm_rc_dec(scratch, len * 8)
+    bm_freelist_push(bm_align8(16 + cap * 8), buf - 8)
   end
   return true
 end

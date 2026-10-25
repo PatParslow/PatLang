@@ -1122,9 +1122,44 @@ make a function called xa_enc_alu takes name, dst, src returns result
     let mm = xa_encode_modrm(dst, ext)
     return [xa_emit_bytes(xa_emit_bytes([rex, 129], mm[0]), xa_int_to_bytes_le(v, 4)), xa_reloc_rip_trail(xa_shift_reloc(mm[1], 2), 4)]
   end
-  # reg/reg or reg/mem: `op dst, src` -> encode as opcode /r with
-  # dst as the r/m operand and src's register number as the reg field
-  # (opcode+1 selects the "r/m, reg" -> actually reversed; see note).
+  # GitHub #227: `op reg, [mem]` (register dst, MEMORY src -- e.g.
+  # `add rax, [rsp+312]`) was falling through to the SAME "dst=r/m,
+  # src=reg" encoding used for reg/reg and mem/reg below, with
+  # `xa_encode_modrm(dst, src[1])` -- i.e. treating `dst` (a plain
+  # register) as the r/m operand via mod=11 register-direct, and
+  # `src[1]` (for a "mem" operand, just the BASE REGISTER NUMBER baked
+  # into the memory operand, e.g. 4 for rsp in `[rsp+312]`) as the reg
+  # field, as if it were a second plain register operand. The real,
+  # intended memory operand (the displacement, the actual dereference)
+  # was silently discarded entirely -- `add rax, [rsp+312]` was actually
+  # executing as `add rax, rsp`. Confirmed directly: exec_capture_io's
+  # wall-clock-timeout deadline math (`add rax, [rsp+312]` then
+  # `cmp rax, [rsp+296]`, x64_os_exec_run_asm) measurably added/compared
+  # against the live RSP register instead of the intended stack slots,
+  # producing a deadline off by exactly the current RSP value and an
+  # always-already-expired comparison -- causing an intermittent false
+  # "timeout" on the very first poll whenever the gate loop needed even
+  # one extra iteration. This specific direction (register dst, memory
+  # src) was previously UNUSED anywhere else in the codebase -- grepped
+  # across codegen_x64.patlang's entire emitted-text surface, every
+  # other add/sub/and/or/xor/cmp call site writes `op [mem_or_reg], reg`
+  # (memory/register dst, register src), which the box below still
+  # handles correctly; this is the first and only `op reg, [mem]` site.
+  if (dst[0] == "reg") and (src[0] != "reg") then
+    # Mirror xa_enc_mov's own already-correct "mov reg, r/m" case
+    # (xa_enc_mov, "mov reg, [mem]"): src is the r/m operand, dst's own
+    # register number is the reg field, and `ops[0]+2` selects this ALU
+    # opcode's "Gv, Ev" (reg, r/m) form -- these ALU opcode pairs always
+    # differ from their "Ev, Gv" (r/m, reg) counterpart by exactly 2
+    # (0x00/0x02, 0x08/0x0A, ..., 0x38/0x3A before the REX.W distinction
+    # that bumps each to .../0x01/0x03 etc. -- confirmed against the x86
+    # opcode map, not assumed).
+    let rex = xa_rex(true, xa_needs_rex_b(dst[1]), xa_needs_rex_x_for_rm(src), xa_needs_rex_b_for_rm(src))
+    let mm = xa_encode_modrm(src, dst[1])
+    return [xa_emit_bytes([rex, ops[0] + 2], mm[0]), xa_shift_reloc(mm[1], 2)]
+  end
+  # reg/reg or mem/reg: `op dst, src` -> encode as opcode /r with
+  # dst as the r/m operand and src's register number as the reg field.
   # ops[0] here is the "Eb/Ev, Gb/Gv" (dst=r/m, src=reg) form's opcode,
   # which is what every alu reg,reg / mem,reg case in this codebase's
   # emitted text needs (dst is never a bare label/imm-only target).

@@ -1416,7 +1416,7 @@ make a function called x64_analyze_float_consts takes instrs, final_map, float_i
   return out
 end
 
-make a function called x64_instr_is_call_boundary takes instr, idx, dyn_bin_indices returns is_call
+make a function called x64_instr_is_call_boundary takes instr, idx returns is_call
   let ty = instr[0]
   if ty == "Call" then
     return true
@@ -1453,7 +1453,7 @@ make a function called x64_instr_is_call_boundary takes instr, idx, dyn_bin_indi
     end
   end
   if ty == "Bin" then
-    if x64_is_jump_target(dyn_bin_indices, idx) then
+    if get("__vars", "x64_dbi_hm__" + idx) == true then
       return true
     end
     # REAL BUG FOUND AND FIXED HERE (2026-07-20, same session as the
@@ -1517,89 +1517,149 @@ end
 # Jump or JumpIfFalse with target <= its own index) that its raw last
 # use falls inside -- to a fixed point, so nested loops extend
 # correctly too.
-make a function called x64_extend_across_loops takes instrs, last returns effective
-  let n = to_num(list_len(instrs))
+# Batched variant of the old per-local x64_extend_across_loops: walks
+# ONLY the precomputed back-edge list (far smaller than the whole
+# instruction stream) to fixed point, instead of rescanning every
+# instruction to rediscover the same back-edges on every call.
+make a function called x64_extend_across_loops_fast takes back_edges, last returns effective
   let effective = last
   let changed = true
+  let bn = to_num(list_len(back_edges))
   while changed do
     let changed = false
-    let j = 0
-    while j < n do
-      let instr = instrs[j]
-      let is_edge = false
-      if instr[0] == "Jump" then
-        let is_edge = true
-      end
-      if instr[0] == "JumpIfFalse" then
-        let is_edge = true
-      end
-      if is_edge then
-        let target = to_num(instr[1])
-        if target <= j then
-          if effective >= target then
-            if effective < j then
-              let effective = j
-              let changed = true
-            end
-          end
+    let bi = 0
+    while bi < bn do
+      let edge = back_edges[bi]
+      let target = edge[0]
+      let j = edge[1]
+      if effective >= target then
+        if effective < j then
+          let effective = j
+          let changed = true
         end
       end
-      let j = j + 1
+      let bi = bi + 1
     end
   end
   return effective
 end
 
-make a function called x64_local_register_eligible takes instrs, name, dyn_bin_indices returns ok
-  let n = to_num(list_len(instrs))
-  let last = 0 - 1
-  let i = 0
-  while i < n do
-    let instr = instrs[i]
-    if instr[0] == "Load" then
-      if instr[1] == name then
-        let last = i
-      end
-    else
-      if instr[0] == "Store" then
-        if instr[1] == name then
-          let last = i
-        end
-      end
-    end
-    let i = i + 1
-  end
-  if last < 0 then
-    return true
-  end
-  let last = x64_extend_across_loops(instrs, last)
-  let i = 0
-  while i <= last do
-    if x64_instr_is_call_boundary(instrs[i], i, dyn_bin_indices) then
-      return false
-    end
-    let i = i + 1
-  end
-  return true
-end
-
-# Register-assigned locals, in `locals`' own order, capped at the pool
-# size -- parallel to x64_reg_pool()'s own order (regmap[0] gets rbx,
-# regmap[1] gets r13, regmap[2] gets r14).
+# GitHub #223 full-test follow-up (an 11th algorithmic fix found the
+# same session, same shape as the other ten): x64_build_regmap used to
+# call a per-local x64_local_register_eligible, which itself rescanned
+# the WHOLE instrs list three separate times (find last use, extend
+# across loops to a fixed point, scan 0..last for any call boundary) --
+# for a function with `locals` eligible names, that's O(locals *
+# total_instrs). Confirmed as the real cause of a real Gen B self-
+# compile hanging on regex_match_node (self_hosting/lib/regex_dsl.
+# patlang): its SOURCE is ~110 lines, but its LOWERED form has 69934
+# instructions (each of its six closure-parameter `k(...)` calls
+# expands into a full inlined candidate-dispatch chain during lowering
+# -- confirmed via direct instrumentation, instrs=69934), and it
+# apparently has enough distinct locals from those inlined chains to
+# make locals*69934 the dominant cost -- CPU pegged, zero forward
+# progress, for well over ten minutes, with the stall landing BEFORE
+# x64_emit_func's own main per-instruction loop ever started (ruled out
+# by instrumentation showing no "xef_loop" marker at all).
+#
+# Fixed by computing, ONCE for the whole function instead of once per
+# local: every local's own last-use index (one pass, keyed by name);
+# the back-edge list driving loop-extension (one pass, reused via
+# x64_extend_across_loops_fast above instead of rescanning all
+# instructions per local); and a call-boundary PREFIX flag per index
+# (one pass -- "any call boundary at or before index i" is monotonic,
+# so it collapses the old "scan 0..last" per local into one O(1)
+# lookup). Same eligibility semantics as the old per-local function,
+# just computed in shared passes instead of repeated per name.
+#
+# RULED OUT as the cause of the separate "LINK ERROR: undefined symbol
+# '' (reloc 0 of 21219, section true, kind ...)" correctness bug found
+# the same session: a controlled experiment (this fix fully reverted,
+# a full cold Gen B rebuild redone) reproduced the IDENTICAL failure,
+# proving that bug lives elsewhere (x64_pe_link.patlang's own chunk-
+# merge/relocation logic, or an earlier fix #1-10) -- reinstated here
+# since it is independently confirmed correct (real O(locals*n) fix,
+# necessary regardless) and removing it just reintroduces the 20-30
+# minute regex_match_node stall without fixing the real bug.
 make a function called x64_build_regmap takes locals, instrs, dyn_bin_indices returns names
   let pool = x64_reg_pool()
   let cap = to_num(list_len(pool))
   let n = to_num(list_len(locals))
+  let total_instrs = to_num(list_len(instrs))
+  let li = 0
+  while li < n do
+    set_var("x64brm_last__" + locals[li], 0 - 1)
+    let li = li + 1
+  end
+  let ii = 0
+  while ii < total_instrs do
+    let instr = instrs[ii]
+    if instr[0] == "Load" then
+      set_var("x64brm_last__" + instr[1], ii)
+    elif instr[0] == "Store" then
+      set_var("x64brm_last__" + instr[1], ii)
+    end
+    let ii = ii + 1
+  end
+  let back_edges = []
+  let bei = 0
+  while bei < total_instrs do
+    let instr = instrs[bei]
+    if (instr[0] == "Jump") or (instr[0] == "JumpIfFalse") then
+      let target = to_num(instr[1])
+      if target <= bei then
+        let back_edges = list_push(back_edges, [target, bei])
+      end
+    end
+    let bei = bei + 1
+  end
+  let dbihm_i = 0
+  while dbihm_i < to_num(list_len(dyn_bin_indices)) do
+    set_var("x64_dbi_hm__" + list_get(dyn_bin_indices, dbihm_i), true)
+    let dbihm_i = dbihm_i + 1
+  end
+  let has_cb_so_far = false
+  let cbi = 0
+  while cbi < total_instrs do
+    if x64_instr_is_call_boundary(instrs[cbi], cbi) then
+      let has_cb_so_far = true
+    end
+    set_var("x64brm_cb__" + cbi, has_cb_so_far)
+    let cbi = cbi + 1
+  end
+  let dbihm_ci = 0
+  while dbihm_ci < to_num(list_len(dyn_bin_indices)) do
+    set_var("x64_dbi_hm__" + list_get(dyn_bin_indices, dbihm_ci), false)
+    let dbihm_ci = dbihm_ci + 1
+  end
   let out = []
   let i = 0
   while i < n do
     if to_num(list_len(out)) < cap then
       let name = locals[i]
-      if x64_local_register_eligible(instrs, name, dyn_bin_indices) then
+      let last = get("__vars", "x64brm_last__" + name)
+      let ok = true
+      if last >= 0 then
+        let effective = x64_extend_across_loops_fast(back_edges, last)
+        if get("__vars", "x64brm_cb__" + effective) == true then
+          let ok = false
+        end
+      end
+      if ok then
         let out = list_push(out, name)
       end
     end
     let i = i + 1
+  end
+  let cli = 0
+  while cli < n do
+    set_var("x64brm_last__" + locals[cli], false)
+    let cli = cli + 1
+  end
+  let cci = 0
+  while cci < total_instrs do
+    set_var("x64brm_cb__" + cci, false)
+    let cci = cci + 1
   end
   return out
 end
@@ -9896,18 +9956,6 @@ make a function called x64_collect_jump_targets takes instrs returns targets
   return targets
 end
 
-make a function called x64_is_jump_target takes targets, idx returns yes
-  let n = to_num(list_len(targets))
-  let i = 0
-  while i < n do
-    if targets[i] == idx then
-      return true
-    end
-    let i = i + 1
-  end
-  return false
-end
-
 # Real bug found while adding band/bor/bxor/shl/shr support (needed by
 # the numeric-tower tagging scheme's own tag-packing arithmetic): this
 # was an exclude-list ("everything fuses except / and %"), so the new
@@ -10135,6 +10183,11 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
   end
   let n = to_num(list_len(instrs))
   let jump_targets = x64_collect_jump_targets(instrs)
+  let xef_jt_i = 0
+  while xef_jt_i < to_num(list_len(jump_targets)) do
+    set_var("xef_jt__" + list_get(jump_targets, xef_jt_i), true)
+    let xef_jt_i = xef_jt_i + 1
+  end
   # GitHub #37: per-INSTRUCTION float classification replaces the old
   # whole-function `float_mode` blanket (see this analysis's own
   # header comment above x64_taint_one_pass_float for the full
@@ -10165,24 +10218,85 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
     let float_box_receiver_indices = x64_float_box_receiver_indices(instrs, float_mode, produces_float)
   end
   let bool_print_overrides = x64_bool_print_call_indices(instrs)
+  # GitHub #223 full-test follow-up (9th algorithmic fix today): each of
+  # these "_indices"/"overrides" lists used to be checked per-instruction
+  # below via x64_str_in_list (a plain O(length) linear scan) -- with up
+  # to ~9 such checks per instruction across a function of n instructions,
+  # that's O(9n * avg_list_len), which blew up badly for a function whose
+  # LOWERED instruction count is far larger than its source suggests (a
+  # closure parameter called at several sites can inline a full dispatch
+  # chain per call site during lowering -- confirmed stalling real Gen B
+  # self-compile on regex_match_node for 20+ minutes). Same fix as the
+  # other 8 found today: a get/set_var hashmap built ONCE per list here,
+  # checked in O(1) below, cleared at the end of this function so index
+  # values don't bleed into the NEXT function's own check (x64_emit_func
+  # runs once per function in the whole program).
+  let xef_dbi_i = 0
+  while xef_dbi_i < to_num(list_len(dyn_bin_indices)) do
+    set_var("xef_dbi__" + list_get(dyn_bin_indices, xef_dbi_i), true)
+    let xef_dbi_i = xef_dbi_i + 1
+  end
+  let xef_fii_i = 0
+  while xef_fii_i < to_num(list_len(float_instr_indices)) do
+    set_var("xef_fii__" + list_get(float_instr_indices, xef_fii_i), true)
+    let xef_fii_i = xef_fii_i + 1
+  end
+  let xef_fci_i = 0
+  while xef_fci_i < to_num(list_len(float_const_indices)) do
+    set_var("xef_fci__" + list_get(float_const_indices, xef_fci_i), true)
+    let xef_fci_i = xef_fci_i + 1
+  end
+  let xef_bpo_i = 0
+  while xef_bpo_i < to_num(list_len(bool_print_overrides)) do
+    set_var("xef_bpo__" + list_get(bool_print_overrides, xef_bpo_i), true)
+    let xef_bpo_i = xef_bpo_i + 1
+  end
+  let xef_tca_i = 0
+  while xef_tca_i < to_num(list_len(tower_ctor_arg_indices)) do
+    set_var("xef_tca__" + list_get(tower_ctor_arg_indices, xef_tca_i), true)
+    let xef_tca_i = xef_tca_i + 1
+  end
+  let xef_fbs_i = 0
+  while xef_fbs_i < to_num(list_len(float_box_single_indices)) do
+    set_var("xef_fbs__" + list_get(float_box_single_indices, xef_fbs_i), true)
+    let xef_fbs_i = xef_fbs_i + 1
+  end
+  let xef_fbr_i = 0
+  while xef_fbr_i < to_num(list_len(float_box_receiver_indices)) do
+    set_var("xef_fbr__" + list_get(float_box_receiver_indices, xef_fbr_i), true)
+    let xef_fbr_i = xef_fbr_i + 1
+  end
+  let xef_mli_i = 0
+  while xef_mli_i < to_num(list_len(mixed_left_int_indices)) do
+    set_var("xef_mli__" + list_get(mixed_left_int_indices, xef_mli_i), true)
+    let xef_mli_i = xef_mli_i + 1
+  end
+  let xef_mri_i = 0
+  while xef_mri_i < to_num(list_len(mixed_right_int_indices)) do
+    set_var("xef_mri__" + list_get(mixed_right_int_indices, xef_mri_i), true)
+    let xef_mri_i = xef_mri_i + 1
+  end
   let i = 0
   while i < n do
+    if (i % 5000) == 0 then
+      write_file("self_hosting/build/genb_tempdebug.txt", "xef_loop i=" + i + "/" + n + " func=" + func_name + " t_ms=" + now_ms())
+    end
     let instr = instrs[i]
     let fused = false
     # GitHub #29/#37: the compact fused form assumes a plain native op
     # -- only safe when NEITHER the current Const nor the upcoming Bin
     # is dynamic OR float per their own per-instruction analyses (a
     # mixed function can still fuse its provably-plain-int Bin ops).
-    if not x64_str_in_list(dyn_bin_indices, i + 1) then
-    if not x64_str_in_list(float_instr_indices, i + 1) then
-    if not x64_str_in_list(float_const_indices, i) then
+    if get("__vars", "xef_dbi__" + (i + 1)) != true then
+    if get("__vars", "xef_fii__" + (i + 1)) != true then
+    if get("__vars", "xef_fci__" + i) != true then
     if i + 1 < n then
       let next = instrs[i + 1]
       if instr[0] == "Const" then
         if instr[1] == "num" then
           if next[0] == "Bin" then
             if x64_fusable_binop(next[1]) then
-              if not x64_is_jump_target(jump_targets, i + 1) then
+              if get("__vars", "xef_jt__" + (i + 1)) != true then
                 let fused = true
               end
             end
@@ -10200,7 +10314,7 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
       let i = i + 2
     else
       let label = "L_" + func_name + "_" + i
-      let is_bool_print = x64_str_in_list(bool_print_overrides, i)
+      let is_bool_print = get("__vars", "xef_bpo__" + i) == true
       let is_float_print = false
       # REAL BUG found and fixed here (GitHub #89 follow-up, 2026-09-06,
       # found via the patc2->patc3 self-hosting fixpoint): `produces_float`
@@ -10240,18 +10354,68 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
           end
         end
       end
-      let is_dynamic_bin = x64_str_in_list(dyn_bin_indices, i)
-      let is_float_bin = x64_str_in_list(float_instr_indices, i)
-      let is_float_const = x64_str_in_list(float_const_indices, i)
-      let is_tower_ctor_arg = x64_str_in_list(tower_ctor_arg_indices, i)
-      let is_float_box_single = x64_str_in_list(float_box_single_indices, i)
-      let is_float_box_receiver = x64_str_in_list(float_box_receiver_indices, i)
-      let is_mixed_left_int = x64_str_in_list(mixed_left_int_indices, i)
-      let is_mixed_right_int = x64_str_in_list(mixed_right_int_indices, i)
+      let is_dynamic_bin = get("__vars", "xef_dbi__" + i) == true
+      let is_float_bin = get("__vars", "xef_fii__" + i) == true
+      let is_float_const = get("__vars", "xef_fci__" + i) == true
+      let is_tower_ctor_arg = get("__vars", "xef_tca__" + i) == true
+      let is_float_box_single = get("__vars", "xef_fbs__" + i) == true
+      let is_float_box_receiver = get("__vars", "xef_fbr__" + i) == true
+      let is_mixed_left_int = get("__vars", "xef_mli__" + i) == true
+      let is_mixed_right_int = get("__vars", "xef_mri__" + i) == true
       let call_box_positions_here = x64_call_box_positions_at(call_box_entries, i)
       sb_push(sb, x64_emit_instr(instr, func_name, regmap, spilled, label, is_float_bin, is_float_const, is_dynamic_bin, is_bool_print, is_float_print, is_tower_ctor_arg, is_float_box_single, is_float_box_receiver, is_mixed_left_int, is_mixed_right_int, call_box_positions_here))
       let i = i + 1
     end
+  end
+  let xef_dbi_ci = 0
+  while xef_dbi_ci < to_num(list_len(dyn_bin_indices)) do
+    set_var("xef_dbi__" + list_get(dyn_bin_indices, xef_dbi_ci), false)
+    let xef_dbi_ci = xef_dbi_ci + 1
+  end
+  let xef_fii_ci = 0
+  while xef_fii_ci < to_num(list_len(float_instr_indices)) do
+    set_var("xef_fii__" + list_get(float_instr_indices, xef_fii_ci), false)
+    let xef_fii_ci = xef_fii_ci + 1
+  end
+  let xef_fci_ci = 0
+  while xef_fci_ci < to_num(list_len(float_const_indices)) do
+    set_var("xef_fci__" + list_get(float_const_indices, xef_fci_ci), false)
+    let xef_fci_ci = xef_fci_ci + 1
+  end
+  let xef_bpo_ci = 0
+  while xef_bpo_ci < to_num(list_len(bool_print_overrides)) do
+    set_var("xef_bpo__" + list_get(bool_print_overrides, xef_bpo_ci), false)
+    let xef_bpo_ci = xef_bpo_ci + 1
+  end
+  let xef_tca_ci = 0
+  while xef_tca_ci < to_num(list_len(tower_ctor_arg_indices)) do
+    set_var("xef_tca__" + list_get(tower_ctor_arg_indices, xef_tca_ci), false)
+    let xef_tca_ci = xef_tca_ci + 1
+  end
+  let xef_fbs_ci = 0
+  while xef_fbs_ci < to_num(list_len(float_box_single_indices)) do
+    set_var("xef_fbs__" + list_get(float_box_single_indices, xef_fbs_ci), false)
+    let xef_fbs_ci = xef_fbs_ci + 1
+  end
+  let xef_fbr_ci = 0
+  while xef_fbr_ci < to_num(list_len(float_box_receiver_indices)) do
+    set_var("xef_fbr__" + list_get(float_box_receiver_indices, xef_fbr_ci), false)
+    let xef_fbr_ci = xef_fbr_ci + 1
+  end
+  let xef_mli_ci = 0
+  while xef_mli_ci < to_num(list_len(mixed_left_int_indices)) do
+    set_var("xef_mli__" + list_get(mixed_left_int_indices, xef_mli_ci), false)
+    let xef_mli_ci = xef_mli_ci + 1
+  end
+  let xef_mri_ci = 0
+  while xef_mri_ci < to_num(list_len(mixed_right_int_indices)) do
+    set_var("xef_mri__" + list_get(mixed_right_int_indices, xef_mri_ci), false)
+    let xef_mri_ci = xef_mri_ci + 1
+  end
+  let xef_jt_ci = 0
+  while xef_jt_ci < to_num(list_len(jump_targets)) do
+    set_var("xef_jt__" + list_get(jump_targets, xef_jt_ci), false)
+    let xef_jt_ci = xef_jt_ci + 1
   end
   return sb_str(sb)
 end

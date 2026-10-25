@@ -846,6 +846,82 @@ sub-phase is planned under this specific item. Dict: confirmed (Phase
 3a's own note) that `--x64` has no separate Dict primitives at all, so
 nothing here needs separate Dict work either.
 
+### Phase 5 (GitHub #223): a native host primitive escaping a named
+local without the compiler's refcounting pass ever seeing it
+
+A genuinely different hazard shape from every phase above, found during
+a full Gen B self-compile fixpoint (`patc1.exe` compiling its own
+~1283-function bundle into `patc2.exe`, then using `patc2.exe` to
+compile a trivial program): not a missing decrement for a value this
+compiler's own passes track, but a value escaping into state the passes
+have no visibility into at all.
+
+`send(obj, "push", key, value)` (`x64_asm.patlang`'s `xa_record_reloc`
+and elsewhere) is a native host primitive that appends `value` into
+`obj`'s own field IN PLACE, bypassing PatLang's refcounting protocol
+entirely -- it never increments `value` (see `x64_runtime.patlang`'s
+own `rt_send_prepare`/`rt_ns_push`, and `x64_asm.patlang`'s own "in-place
+(rust-runtime/src/ir/hosts.rs's obj_push)" comment, issue #89). In
+`xa_record_reloc`, the relocation tuple was built into a named local
+first (`let entry = [...]`) before being pushed:
+`send(state, "push", "relocs", entry)`. Because `entry` is a *named*
+local, the terminal dominance pass (`bm_nc_insert_string_rc_decs` via
+`bm_nc_reassignable_eligible_names`) saw this as `entry`'s own last use
+and inserted a decrement right after the push -- freeing it while
+`state`'s own field still held the only remaining pointer to it. This
+produced a corrupted relocation (observed directly: `[true,
+1083114552, "", "", 0]` where `[section, offset, target, kind, addend]`
+was expected) that the linker only reported much later, as "undefined
+symbol '' ... reloc 0 of 21219" -- far from the actual corruption site.
+
+Confirmed via direct FuncIR instrumentation that this is the only call
+site with this shape: every OTHER `send(obj, "push", key, value)` call
+in the codebase either pushes a raw byte/number (not refcounted at all)
+or an inline list literal never bound to a name (`xa_declare_symbol`'s
+own symbol push), which the eligibility pass was never going to
+consider in the first place.
+
+**Fix**: `bm_nc_name_escapes_via_send_push`
+(`self_hosting/block_model/native_codegen.patlang`) excludes any local
+whose value is passed as the 4th argument to a 4-arg
+`send(..., "push", ...)` call from the decrement-eligible set entirely
+-- trading a small, bounded leak (never decremented, same tradeoff
+already accepted elsewhere in this plan, e.g. Phase 4a's own retired-
+node leak note) for correctness, rather than trying to model what an
+opaque host primitive does with its argument generically.
+
+Verified: before the fix, a minimal two-chunk `x64_link_native_chunks`
+probe's first relocation read as the corrupted tuple above; after, it
+reads as a fully sane `["text", 6, "patlang_wndproc_trampoline.
+wndproc_notsize_", "REL32", 0]`. Full regression suite green:
+`native_codegen_check.sh` (57/57), `thread_safety_check.sh` (5/5), full
+language spec gate (178/178).
+
+**Not yet closed**: fixing this exposed a SEPARATE, still-open bug.
+With Phase 5's fix applied, a full Gen B self-compile gets much further
+(past the corrupted-reloc-at-index-0 symptom entirely) but still fails
+compiling even a trivial program, with a different and genuine
+"undefined symbol 'rt_str_eq'" -- a real function, correctly declared
+into the assembler's own `symbols` list (confirmed present immediately
+after the push that adds it, and immediately after the next one or two
+pushes), that later reads as absent from the same list. Direct
+instrumentation of `rt_ns_push` itself (comparing a fresh readback
+against the value just stored, on every single "symbols" push across
+tens of thousands of calls) found zero internal inconsistency in that
+function -- whatever drops the entry is not a simple get/set mismatch
+inside `rt_ns_push`. Manually tracing `rt_list_push`'s own in-place
+(spare-capacity) branch, `rt_list_retire_trunc`, and `rt_list_node_rc_
+dec`'s retired-node cascade for the exact list length where this
+happens (symbols list length ~3878, right after a specific locally-
+unique label gets pushed) balances correctly for the straightforward
+case, so this needs either (a) a more targeted look at the actual
+buffer capacity/refcount values at that exact point (not inferred, read
+directly), or (b) ruling out instrumentation itself perturbing the
+refcounts under observation (the diagnostic code's own `rt_list_get`
+calls are not free). Left open for a follow-up investigation; the
+Phase 5 fix above stands on its own regardless of this second bug's
+outcome.
+
 ## 4. What this plan deliberately does not cover
 
 - Lists' own node/aliasing scheme (Fork G) -- Phase 4a (above) answers

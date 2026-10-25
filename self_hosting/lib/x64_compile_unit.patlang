@@ -556,7 +556,9 @@ class CompileUnit {
       return x64_chunk_from_bin(read_file_bytes(cache_path, 0, 2000000000))
     end
     let func_ir = get(self, "func_ir")
+    write_file("self_hosting/build/genb_tempdebug.txt", "ecn_emit_start name=" + get(self, "name") + " instrs=" + to_num(list_len(func_ir[3])) + " extern_names=" + to_num(list_len(extern_names)) + " t_ms=" + now_ms())
     let asm = emit_program_x64(["ProgramIR", "main", [func_ir], []], false, extern_names)
+    write_file("self_hosting/build/genb_tempdebug.txt", "ecn_asm_ready name=" + get(self, "name") + " asm_len=" + asm.length + " t_ms=" + now_ms())
     let chunk = x64_assemble_chunk(asm)
     if not chunk then
       return "ASM ERROR: x64_assemble_chunk failed for unit " + get(self, "name")
@@ -593,12 +595,84 @@ class CompileUnit {
 # class's static defaults, see x64_runtime.patlang's own class-support
 # header, so real per-instance construction is new()-then-assign, an
 # established, simple pattern rather than a gap).
+#
+# GitHub #223 full-test follow-up: x64_make_compile_unit used to hash
+# json_stringify(to_json_value(func_ir)) via x64_content_hash -- which
+# first materializes ONE combined JSON string for the whole function
+# (concatenating every instruction's own serialized text, plus quoting/
+# punctuation) and THEN re-scans that whole combined string character by
+# character via char_code, whose own O(whole-string) is_ascii recheck
+# (this file's own x64_content_hash header above) makes the combined
+# scan genuinely O(combined_length^2) -- for a function whose source is
+# short but whose LOWERED instruction count is large (confirmed: a real
+# Gen B self-compile hung for 20+ minutes hashing regex_match_node this
+# way, CPU pegged, zero forward progress), this reliably dominated the
+# whole per-unit cost despite x64_content_hash's own header explicitly
+# (and, it turns out, wrongly) assuming per-function input stays small.
+# Fixed by hashing the STRUCTURE directly (walking to_json_value's own
+# tagged shape) instead of a flattened string: each leaf (a short
+# instruction opcode, local name, numeral) is hashed via its own short
+# char_code loop, and the running polynomial is combined node-by-node
+# while walking -- no large intermediate string is ever built or
+# rescanned. Total cost is proportional to the function's own total
+# leaf-text length once, not to a quadratically-rescanned concatenation
+# of it.
+make a function called x64_chash_combine takes h, c returns h2
+  return (h * 33 + c) % 999999937
+end
+
+make a function called x64_chash_string takes h, s returns h2
+  let n = s.length
+  let i = 0
+  while i < n do
+    let h = x64_chash_combine(h, char_code(s, i))
+    let i = i + 1
+  end
+  return h
+end
+
+make a function called x64_chash_value takes j, h returns h2
+  let tag = j[0]
+  if tag == "str" then
+    let h = x64_chash_combine(h, 115)
+    return x64_chash_string(h, j[1])
+  end
+  if tag == "num" then
+    let h = x64_chash_combine(h, 110)
+    return x64_chash_string(h, "" + j[1])
+  end
+  if tag == "bool" then
+    let h = x64_chash_combine(h, 98)
+    if j[1] then
+      return x64_chash_combine(h, 1)
+    end
+    return x64_chash_combine(h, 0)
+  end
+  if tag == "arr" then
+    let h = x64_chash_combine(h, 91)
+    let items = j[1]
+    let n = items.length
+    let i = 0
+    while i < n do
+      let h = x64_chash_value(items[i], h)
+      let i = i + 1
+    end
+    return h
+  end
+  return x64_chash_combine(h, 48)
+end
+
+make a function called x64_content_hash_value takes v returns digest
+  let h = x64_chash_value(to_json_value(v), 5381)
+  return "" + h
+end
+
 make a function called x64_make_compile_unit takes func_ir returns unit
   let name = func_ir[1]
   let unit = new("CompileUnit", "cu_" + name)
   unit.func_ir = func_ir
   unit.name = name
-  unit.content_hash = name + "_" + x64_content_hash(json_stringify(to_json_value(func_ir))) + "_" + x64_compiler_fingerprint()
+  unit.content_hash = name + "_" + x64_content_hash_value(func_ir) + "_" + x64_compiler_fingerprint()
   return unit
 end
 
@@ -773,15 +847,18 @@ class X64UnitLinker {
     let units = []
     let i = 0
     while i < n do
+      write_file("self_hosting/build/genb_tempdebug.txt", "PREPARE i=" + i + "/" + n + " name=" + funcs[i][1] + " t_ms=" + now_ms())
       let unit = x64_make_compile_unit(funcs[i])
       let extern_names = x64_extern_names_for(funcs, i, rt_names)
       send(unit, "prepare", cache, extern_names)
       let units = list_push(units, unit)
       let i = i + 1
     end
+    write_file("self_hosting/build/genb_tempdebug.txt", "PREPARE_DONE t_ms=" + now_ms())
     let objs = []
     let i = 0
     while i < n do
+      write_file("self_hosting/build/genb_tempdebug.txt", "FINISH i=" + i + "/" + n + " name=" + funcs[i][1] + " t_ms=" + now_ms())
       let obj_or_err = send(units[i], "finish", cache)
       if x64_build_contains(obj_or_err, "NASM ERROR:") then
         return obj_or_err
@@ -789,6 +866,7 @@ class X64UnitLinker {
       let objs = list_push(objs, obj_or_err)
       let i = i + 1
     end
+    write_file("self_hosting/build/genb_tempdebug.txt", "FINISH_DONE t_ms=" + now_ms())
     # Apply-table unit (see codegen_x64.patlang's own "apply(fname):
     # dynamic dispatch-by-name" section header for the full design):
     # a small generated data-only object exposing g_apply_table/
@@ -943,6 +1021,7 @@ class X64UnitLinker {
     let i = 0
     while i < n do
       let unused_pi = x64_build_progress("assemble-units", i, n)
+      write_file("self_hosting/build/genb_tempdebug.txt", "pass2_i=" + i + "/" + n + " name=" + funcs[i][1] + " t_ms=" + now_ms())
       let unit = x64_make_compile_unit(funcs[i])
       let extern_names = x64_extern_names_for(funcs, i, rt_names)
       let chunk_or_err = send(unit, "ensure_chunk_native", cache_dir, extern_names)
@@ -956,8 +1035,11 @@ class X64UnitLinker {
       let chunks = list_push(chunks, chunk_or_err)
       let i = i + 1
     end
+    write_file("self_hosting/build/genb_tempdebug.txt", "pass2_done n=" + n + " t_ms=" + now_ms())
     let unused_pa = x64_build_progress("apply-table", 0, 1)
+    write_file("self_hosting/build/genb_tempdebug.txt", "apply_table_emit_start n=" + n + " t_ms=" + now_ms())
     let apply_table_asm = x64_emit_apply_table_asm(funcs)
+    write_file("self_hosting/build/genb_tempdebug.txt", "apply_table_assemble_start t_ms=" + now_ms())
     let apply_table_chunk = x64_assemble_chunk(apply_table_asm)
     if not apply_table_chunk then
       return "ASM ERROR: x64_assemble_chunk failed for the apply table"
@@ -968,7 +1050,9 @@ class X64UnitLinker {
     # worth naming explicitly so a slow build is attributable rather
     # than mysterious.
     let unused_pl = x64_build_progress("link", 0, to_num(list_len(chunks)))
+    write_file("self_hosting/build/genb_tempdebug.txt", "link_start chunks=" + to_num(list_len(chunks)) + " t_ms=" + now_ms())
     let linked = x64_link_native_chunks(chunks, out_path)
+    write_file("self_hosting/build/genb_tempdebug.txt", "link_done t_ms=" + now_ms())
     let unused_pd = x64_build_progress("done", 1, 1)
     return linked
   end
