@@ -940,9 +940,50 @@ released it, freeing a string the `symbols` tuple still pointed at.
   `Return` (the calling convention's result packing, not a stored
   container). `list_push`/`list_set` keep the eligible-only rule, since
   their first operand is the list being extended, not a new element.
-  This pass is still applied to single-block functions only; a borrowed
-  operand stored from inside a multi-block function remains unowned and
-  is the next place to look if this class of corruption reappears.
+  (Both limits of this bullet are lifted by the follow-up below.)
+
+**Follow-up: element ownership in loops and via list_push.** Three gaps
+remained, each reproduced natively by `spec_fixtures/native_element_owns_
+ref_multiblock.patlang` (2000 names per case; interpreter 0 throughout):
+
+- A, 1999/2000 corrupted: a PARAMETER stored by a list literal inside a
+  function containing a loop. `bm_nc_insert_list_element_incs` only ran
+  on single-block functions.
+- B, 2000/2000: a `substr` local stored by a list literal inside a loop
+  body. The multi-block decrement pass (`bm_nc_rewrite_block_for_
+  string_rc`) releases a producer-made local at its block's exit with no
+  check for whether a list element still points at it -- GitHub #221's
+  shape, live in loop bodies of closure-free programs.
+- C, 1988/2000: a PARAMETER stored via `list_push` in a loop-free
+  function. Only BuildList operands had dropped the eligible-only rule;
+  `list_push`/`list_set`'s own element operand (`v`) is a new element
+  exactly like a BuildList operand.
+
+Fix (`native_codegen.patlang`): the pass runs on every function, taking
+a `single_block` flag; BuildList operands and `list_push`/`list_set`'s
+last operand always get an increment; the eligible-name rule (which
+needs the single-block decrement passes' own analysis) applies only to
+the other operands, and only when `single_block` is true. Running on the
+compiler's own ~70K-instruction functions required making the pass
+linear: positions are merge-sorted (O(m log m), list_push only) and
+emitted with one forward pointer, and jump shifts come from a prefix
+count, replacing an O(m^2) selection sort, an O(n*m) emission loop and
+an O(m) per-jump shift scan.
+
+Verified: all three cases 0/2000 natively; `native_codegen_check.sh`
+59/59, `refcounted_heap_native_check.sh` 13/13, `thread_safety_check.sh`
+5/5, language spec 178/178. Compile time of the trimmed native compiler
+bundle by Gen A: 1735s before, 1675s after. That native compiler, built
+by the pre-fix `patc1`, silently produced no executable for either
+50-90-line fixture (exit 0, no output); built by the fixed `patc1` from
+the identical bundle, it compiles both, and the compiled
+`refcounted_heap_native_check.patlang` passes 13/13 (the element
+fixture's own counts still show the gaps, as expected: that bundle was
+generated before this fix, so the compiler it contains has the old pass).
+Peak memory compiling `print(1 + 2)` with each: 3,508 MB before, 3,536
+MB after, so the references left unreleased where no decrement pass
+runs (programs with closures) are not significant at this scale. The
+~3.5 GB baseline itself is a separate, pre-existing cost.
 
 Both changes trade the possibility of one unreleased reference (a caller
 handing a store a fresh temporary) for never freeing a value something

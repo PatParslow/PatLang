@@ -1657,8 +1657,9 @@ make a function called bm_nc_build_handler_funcirs takes prog, closures, print_o
     # project's own "prefer a real fix over a compensating hack" standard
     # applied to the half that's actually reachable today.
     let h_flat = bm_nc_insert_list_get_result_incs(root, h_flat)
-    if bm_nc_closure_is_single_block(hblocks) then
-      let h_flat = bm_nc_insert_list_element_incs(root, h_flat)
+    let h_single = bm_nc_closure_is_single_block(hblocks)
+    let h_flat = bm_nc_insert_list_element_incs(root, h_flat, h_single)
+    if h_single then
       let h_flat = bm_nc_insert_reassignment_decs(root, h_flat)
       let h_flat = bm_nc_insert_string_rc_decs(root, h_flat)
     end
@@ -2303,12 +2304,32 @@ end
 # immediately before every Return: that is the calling convention's own
 # result packing, unpacked by the caller at once, not a stored container
 # -- incrementing it would leak every returned parameter.
-make a function called bm_nc_insert_list_element_incs takes root, instrs returns out
-  let captured_names = bm_nc_closure_captured_names(instrs)
-  let eligible_names = bm_nc_reassignable_eligible_names(instrs, captured_names)
+#
+# Follow-up: the same reasoning holds for list_push's and list_set's own
+# ELEMENT operand (their last one, `v`) -- it is a new element exactly
+# like a BuildList operand, so it is now incremented whatever its
+# provenance (a borrowed `name` pushed via list_push was the same alias
+# bug, spec_fixtures/native_element_owns_ref_multiblock.patlang case C).
+# Only the remaining operands (the list being extended, the index) keep
+# the eligible-only rule. And the pass now runs on every function, not
+# just single-block ones (`single_block` false): a borrowed operand stored
+# from a loop-containing function needs its reference just the same
+# (case A), and the multi-block decrement pass (bm_nc_rewrite_block_for_
+# string_rc) releases a producer-made local at its block's exit with no
+# regard for whether a list element still points at it, which this
+# increment is what balances (case B). The eligible-name rule needs the
+# single-block decrement passes' own analysis, so it applies only when
+# `single_block` is true. Sorting and emission are linear-ish (merge sort,
+# a single forward pointer, a prefix count for jump shifts), since multi-
+# block functions in the compiler itself reach ~70K instructions.
+make a function called bm_nc_insert_list_element_incs takes root, instrs, single_block returns out
+  let eligible_names = []
+  if single_block then
+    let captured_names = bm_nc_closure_captured_names(instrs)
+    let eligible_names = bm_nc_reassignable_eligible_names(instrs, captured_names)
+  end
   let n = list_len(instrs)
-  let insert_positions = []
-  let insert_names = []
+  let pairs = []
   let i = 0
   while i < n do
     let instr = list_get(instrs, i)
@@ -2339,9 +2360,10 @@ make a function called bm_nc_insert_list_element_incs takes root, instrs returns
         let op_instr = list_get(instrs, cur)
         if list_get(op_instr, 0) == "Load" then
           let name = list_get(op_instr, 1)
-          if any_operand or bm_list_contains(eligible_names, name) then
-            let insert_positions = list_push(insert_positions, cur)
-            let insert_names = list_push(insert_names, name)
+          # ai == 0 is the LAST operand (walking backward): list_push's
+          # and list_set's own element `v`.
+          if any_operand or (ai == 0) or bm_list_contains(eligible_names, name) then
+            let pairs = list_push(pairs, [cur, name])
           end
         end
         let cur = bm_nc_flat_skip_value_backward(instrs, cur)
@@ -2350,59 +2372,113 @@ make a function called bm_nc_insert_list_element_incs takes root, instrs returns
     end
     let i = i + 1
   end
-  if list_len(insert_positions) == 0 then
+  if list_len(pairs) == 0 then
     return instrs
   end
-  # Sort ascending, carrying insert_names along in lockstep -- same
-  # selection-sort shape as bm_nc_insert_reassignment_decs's own (found
-  # walking backward within each target, scanned forward overall, so
-  # not guaranteed globally ascending on its own).
-  let m = list_len(insert_positions)
-  let si = 0
-  while si < m do
-    let min_idx = si
-    let sj = si + 1
-    while sj < m do
-      if list_get(insert_positions, sj) < list_get(insert_positions, min_idx) then
-        let min_idx = sj
+  # Found walking backward within each target, scanned forward overall,
+  # so not globally ascending on its own (a nested list literal's own
+  # operands come after an outer operand that precedes it).
+  let pairs = bm_nc_sort_pairs_by_pos(pairs)
+  let m = list_len(pairs)
+  # shift_upto[idx] = 3 * (number of insert positions <= idx): what every
+  # jump targeting idx must add, the same quantity bm_nc_reassign_shift_at
+  # computes per call, here precomputed once in a single forward pass.
+  let shift_upto = []
+  let pk = 0
+  let ix = 0
+  while ix < n do
+    let advancing = true
+    while advancing do
+      let advancing = false
+      if pk < m then
+        if list_get(list_get(pairs, pk), 0) <= ix then
+          let pk = pk + 1
+          let advancing = true
+        end
       end
-      let sj = sj + 1
     end
-    if min_idx != si then
-      let tmp_pos = list_get(insert_positions, si)
-      let tmp_name = list_get(insert_names, si)
-      let insert_positions = list_set(insert_positions, si, list_get(insert_positions, min_idx))
-      let insert_names = list_set(insert_names, si, list_get(insert_names, min_idx))
-      let insert_positions = list_set(insert_positions, min_idx, tmp_pos)
-      let insert_names = list_set(insert_names, min_idx, tmp_name)
-    end
-    let si = si + 1
+    let shift_upto = list_push(shift_upto, pk * 3)
+    let ix = ix + 1
   end
   let discard_name = bm_nc_prefix(root, "__bm_string_rc_discard")
   let out = []
+  let p = 0
   let i2 = 0
   while i2 < n do
-    let k = 0
-    while k < list_len(insert_positions) do
-      if list_get(insert_positions, k) == i2 then
-        let out = list_push(out, ["Load", list_get(insert_names, k)])
-        let out = list_push(out, ["Call", "rt_rc_inc_if_refcounted", 1])
-        let out = list_push(out, ["Store", discard_name])
+    let emitting = true
+    while emitting do
+      let emitting = false
+      if p < m then
+        if list_get(list_get(pairs, p), 0) == i2 then
+          let out = list_push(out, ["Load", list_get(list_get(pairs, p), 1)])
+          let out = list_push(out, ["Call", "rt_rc_inc_if_refcounted", 1])
+          let out = list_push(out, ["Store", discard_name])
+          let p = p + 1
+          let emitting = true
+        end
       end
-      let k = k + 1
     end
     let instr = list_get(instrs, i2)
     let op = list_get(instr, 0)
     if (op == "Jump") or (op == "JumpIfFalse") then
       let target = list_get(instr, 1)
-      let new_target = target + bm_nc_reassign_shift_at(insert_positions, target)
-      let out = list_push(out, [op, new_target])
+      let shift = m * 3
+      if target < n then
+        let shift = list_get(shift_upto, target)
+      end
+      let out = list_push(out, [op, target + shift])
     else
       let out = list_push(out, instr)
     end
     let i2 = i2 + 1
   end
   return out
+end
+
+# Stable bottom-up merge sort of [pos, payload] pairs, ascending by pos --
+# O(m log m), list_push only (list_set copies under Gen A's own runtime,
+# and `/` is rational in PatLang, so widths double rather than halve).
+make a function called bm_nc_sort_pairs_by_pos takes pairs returns sorted
+  let n = list_len(pairs)
+  let cur = pairs
+  let width = 1
+  while width < n do
+    let next = []
+    let lo = 0
+    while lo < n do
+      let mid = lo + width
+      if mid > n then
+        let mid = n
+      end
+      let hi = mid + width
+      if hi > n then
+        let hi = n
+      end
+      let a = lo
+      let b = mid
+      while (a < mid) or (b < hi) do
+        let take_left = false
+        if a < mid then
+          if b >= hi then
+            let take_left = true
+          elif list_get(list_get(cur, a), 0) <= list_get(list_get(cur, b), 0) then
+            let take_left = true
+          end
+        end
+        if take_left then
+          let next = list_push(next, list_get(cur, a))
+          let a = a + 1
+        else
+          let next = list_push(next, list_get(cur, b))
+          let b = b + 1
+        end
+      end
+      let lo = hi
+    end
+    let cur = next
+    let width = width + width
+  end
+  return cur
 end
 
 # docs/plans/general-refcounting.md, Phase 4d: the read-side counterpart
@@ -3302,9 +3378,10 @@ make a function called bm_nc_build_callee_funcirs takes prog, roots, print_op re
     # producer's unrelated decrement ran).
     let flat = bm_nc_insert_list_get_result_incs(root, flat)
     write_file("self_hosting/build/genb_tempdebug.txt", "bncbcf_incs2_done root=" + root + " t_ms=" + now_ms())
-    if bm_nc_closure_is_single_block(cblocks) then
-      let flat = bm_nc_insert_list_element_incs(root, flat)
-      write_file("self_hosting/build/genb_tempdebug.txt", "bncbcf_incs1_done root=" + root + " t_ms=" + now_ms())
+    let c_single = bm_nc_closure_is_single_block(cblocks)
+    let flat = bm_nc_insert_list_element_incs(root, flat, c_single)
+    write_file("self_hosting/build/genb_tempdebug.txt", "bncbcf_incs1_done root=" + root + " t_ms=" + now_ms())
+    if c_single then
       let flat = bm_nc_insert_reassignment_decs(root, flat)
       write_file("self_hosting/build/genb_tempdebug.txt", "bncbcf_decs1_done root=" + root + " t_ms=" + now_ms())
       let flat = bm_nc_insert_string_rc_decs(root, flat)
@@ -3506,8 +3583,9 @@ make a function called bm_to_real_funcir takes prog, print_op returns funcirs
   # GitHub #223: bm_nc_insert_list_get_result_incs runs unconditionally --
   # see the handler-closure call site's own header for the full story.
   let main_flat = bm_nc_insert_list_get_result_incs(entry_name, main_flat)
-  if bm_nc_closure_is_single_block(main_blocks) then
-    let main_flat = bm_nc_insert_list_element_incs(entry_name, main_flat)
+  let main_single = bm_nc_closure_is_single_block(main_blocks)
+  let main_flat = bm_nc_insert_list_element_incs(entry_name, main_flat, main_single)
+  if main_single then
     let main_flat = bm_nc_insert_reassignment_decs(entry_name, main_flat)
     let main_flat = bm_nc_insert_string_rc_decs(entry_name, main_flat)
   end

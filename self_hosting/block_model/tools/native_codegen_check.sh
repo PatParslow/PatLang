@@ -424,6 +424,17 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+echo "Scenario: a new list element owns its own reference wherever it is stored: from a loop-containing function, from a loop body, and via list_push (docs/plans/general-refcounting.md, Phase 5)"
+rm -f self_hosting/build/native_element_owns_ref_multiblock.exe
+BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_element_owns_ref_multiblock.patlang self_hosting/build/native_element_owns_ref_multiblock.exe --x64 2>&1)
+if [ -f self_hosting/build/native_element_owns_ref_multiblock.exe ]; then
+  OUT=$(./self_hosting/build/native_element_owns_ref_multiblock.exe 2>&1)
+  check_seq "2000 names each for a parameter stored by a list literal in a loop-containing function, a substr local stored by a list literal in a loop body, and a parameter stored via list_push, all read back intact" "$OUT" "bad_a= 0 bad_b= 0 bad_c= 0"
+else
+  echo "  FAIL: the element-owns-ref-multiblock fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
 echo ""
 echo "tests: $PASS passed, $FAIL failed"
 if [ "$FAIL" -eq 0 ]; then

@@ -837,6 +837,22 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
     Then every "syms" entry still holds its own original name
     And the interpreter prints the identical result
 
+  Scenario: a new list element owns its own reference wherever it is stored
+    Given a function containing a loop that stores its PARAMETER name into
+      a list literal pushed onto an object field
+    And a loop body that stores a substr-made local into a list literal
+      pushed onto an object field, the local going out of scope at the end
+      of the loop body
+    And a loop-free function that stores its PARAMETER name via list_push
+      into a list kept in an object field
+    And each caller's own name is then released by a field the next
+      name's "set" displaces
+    When it is run for 2000 names per case as a real, fully native
+      executable, with an unrelated string allocation after each
+    Then every stored element still holds its own original name, in all
+      three cases
+    And the interpreter prints the identical result
+
   Scenario: apply with a runtime name and arguments dispatches natively
     Given a program using apply with two, one-statement and zero arguments
     When it is built and run as a real, fully native executable

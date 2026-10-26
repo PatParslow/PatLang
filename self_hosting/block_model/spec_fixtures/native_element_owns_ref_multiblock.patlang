@@ -1,0 +1,93 @@
+# Fixture for native_codegen.feature: the gaps left after GitHub #223's
+# fix to bm_nc_insert_list_element_incs (docs/plans/general-refcounting.md,
+# Phase 5). A value stored as a NEW list element must get its own
+# reference wherever the store happens; three shapes did not:
+#
+#   A: a borrowed name (a parameter) stored via a list literal inside a
+#      function that contains a loop -- the pass only ran on loop-free
+#      (single-block) functions.
+#   B: a producer-made local (substr) stored via a list literal inside a
+#      loop body -- the multi-block decrement pass releases the local at
+#      the end of the loop body, with nothing holding a second reference
+#      for the list element.
+#   C: a borrowed name stored via list_push in a loop-free function --
+#      list_push/list_set element operands only got an increment when the
+#      name was one this function decrements itself.
+#
+# Each case uses its own names and its own displaced field, so fixing one
+# cannot mask another. The program contains no closures, so the multi-
+# block decrement pass is active (it is skipped for programs with any).
+#
+# Given: per label, three independently derived names, each stored once
+#   into a list element by one of the shapes above, then released by the
+#   caller (a field the next label displaces, or a loop-body exit).
+# When: run for 2000 labels with an unrelated string allocation after each.
+# Then: every stored element still holds its own original name, per case.
+make a function called declare_loop takes d, name returns ok
+  let k = 0
+  while k < 1 do
+    let k = k + 1
+  end
+  send(d, "push", "syms_a", [name, 7])
+  return true
+end
+
+make a function called build_in_loop takes d, line returns ok
+  let k = 0
+  while k < 1 do
+    let s = substr(line, 0, line.length - 1)
+    send(d, "push", "syms_b", [s, 7])
+    let k = k + 1
+  end
+  return true
+end
+
+make a function called declare_push takes d, name returns ok
+  send(d, "set", "syms_c", list_push(get(d, "syms_c"), name))
+  return true
+end
+
+make a function called on_label takes d, i returns ok
+  let name_a = substr("a_" + i + ":", 0, ("a_" + i).length)
+  declare_loop(d, name_a)
+  send(d, "set", "cur_a", name_a)
+  build_in_loop(d, "b_" + i + ":")
+  let name_c = substr("c_" + i + ":", 0, ("c_" + i).length)
+  declare_push(d, name_c)
+  send(d, "set", "cur_c", name_c)
+  return true
+end
+
+make a function called count_bad takes entries, prefix, count, wrapped returns bad
+  let bad = 0
+  let k = 0
+  while k < count do
+    let got = entries[k]
+    if wrapped then
+      let got = got[0]
+    end
+    if got != (prefix + k) then
+      let bad = bad + 1
+    end
+    let k = k + 1
+  end
+  return bad
+end
+
+let d = new("Dict", "element_owns_ref_fixture")
+send(d, "set", "syms_a", [])
+send(d, "set", "syms_b", [])
+send(d, "set", "syms_c", [])
+send(d, "set", "cur_a", "")
+send(d, "set", "cur_c", "")
+let count = 2000
+let junk = []
+let i = 0
+while i < count do
+  on_label(d, i)
+  let junk = list_push(junk, "junk_" + i)
+  let i = i + 1
+end
+print("bad_a= " + count_bad(get(d, "syms_a"), "a_", count, true))
+print("bad_b= " + count_bad(get(d, "syms_b"), "b_", count, true))
+print("bad_c= " + count_bad(get(d, "syms_c"), "c_", count, false))
