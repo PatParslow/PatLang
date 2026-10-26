@@ -1,0 +1,252 @@
+# SwarmCompile Phase 1, slice 2 of 2 (prototype -- see
+# self_hosting/swarm_compile/artefact.patlang for the SwarmArtefact
+# envelope this builds on, and self_hosting/swarm_compile/phase1_demo.
+# patlang for the end-to-end proof against a real fixture).
+#
+# A minimal, ONE-WORKER job queue making the claim -> validate -> commit
+# discipline this whole feature is prototyping EXPLICIT as real states a
+# caller can inspect, instead of implicit in a function's own control
+# flow (which is exactly what CompileUnit.ensure_chunk_native already
+# does, just without named states). This file introduces NO new
+# transformation logic at all -- "run" below calls ensure_chunk_native
+# completely unchanged; "validate" below re-checks things that were
+# already true of ensure_chunk_native's own output, it does not change
+# what that output is.
+#
+# Scope, deliberately narrow (first development slice -- do not extend
+# without re-reading the governing spec's own Phase 1 boundary): ONE
+# worker, processing jobs strictly one at a time, in a plain PatLang
+# list. This is not a scheduler and makes no parallelism claim --
+# measuring whether a queue like this is even worth its own overhead
+# (the "add measurement before adding finer granularity" rule) is
+# exactly what phase1_demo.patlang's own timing comparison is for.
+#
+# Job states, as plain strings (so they print/log/compare trivially,
+# the same reason SwarmArtefact above is a tagged list and not a new
+# class): "ready" -> "claimed" -> "candidate" -> "validated" ->
+# "committed", or "failed" at any step past "claimed".
+#
+# Job shape (plain tagged list, same convention as everywhere else in
+# this codebase):
+#   ["SwarmJob", job_id, unit, extern_names, state, candidate_artefact, error]
+#     job_id       -- the CompileUnit's OWN content_hash. Content-
+#                     addressed, not an incrementing counter and not
+#                     assigned by whichever worker claims it first --
+#                     satisfies "stable identifiers... never worker
+#                     order or completion timing" by construction: the
+#                     id exists before any worker ever sees the job.
+#     unit          -- the CompileUnit (x64_compile_unit.patlang),
+#                     holding its own immutable func_ir + name +
+#                     content_hash. Nothing about this job's input
+#                     changes after the job is created (the "every
+#                     job's input immutable for the duration of that
+#                     job" rule) -- this prototype doesn't even provide
+#                     a mutation path for it.
+#     extern_names  -- this job's own declared dependency set (see
+#                     artefact.patlang's dep_names field) -- the ONLY
+#                     external names "run" below's call into
+#                     ensure_chunk_native is allowed to assume exist.
+#                     Nothing in "run" consults __vars-held mutable
+#                     compiler-global state outside this list and the
+#                     unit's own fields (ensure_chunk_native itself
+#                     reads no __vars key other than the build-tick
+#                     port, which is progress-reporting plumbing, not a
+#                     compilation input).
+#     state         -- one of the strings above.
+#     candidate     -- 0 until "run" fills it in; the SwarmArtefact
+#                     once produced.
+#     error         -- "" unless state is "failed", in which case this
+#                     holds why.
+
+include "artefact.patlang"
+include "../lib/json.patlang"
+include "../lib/ir_io.patlang"
+
+# ---- construction ----
+
+# content_hash IS the job_id directly -- not re-derived, not
+# reformatted. This is deliberate: a job's identity must be computable
+# from its own declared inputs alone, before it is ever claimed, so two
+# independent callers building "the same job" (same function IR, same
+# compiler fingerprint) always agree on its id without having to compare
+# notes.
+make a function called swarm_make_job takes unit, extern_names returns job
+  let job_id = get(unit, "content_hash")
+  return ["SwarmJob", job_id, unit, extern_names, "ready", 0, ""]
+end
+
+make a function called swarm_job_id takes job returns id
+  return job[1]
+end
+
+make a function called swarm_job_state takes job returns state
+  return job[4]
+end
+
+make a function called swarm_job_candidate takes job returns artefact
+  return job[5]
+end
+
+make a function called swarm_job_error takes job returns err
+  return job[6]
+end
+
+# ---- claim -> run -> validate -> commit ----
+#
+# Each step RETURNS a new job tuple rather than mutating the one it was
+# given (PatLang list literals are plain values here, not aliased
+# handles) -- so a caller that keeps the "ready" job around still has
+# it; nothing is silently invalidated out from under it. This is the
+# same "treat worker output as a candidate, validate before trusting
+# it" discipline the governing spec asks for, just made into distinct
+# function boundaries instead of one combined call.
+
+# swarm_claim(job) -> the SAME job, state "claimed". In this one-worker
+# slice there is no contention to resolve (no second worker could ever
+# observe "ready" and claim the same job) -- this step exists anyway so
+# the STATE SEQUENCE is real and inspectable, matching what a genuine
+# multi-worker queue (Phase 2) would need to make atomic.
+make a function called swarm_claim takes job returns claimed_job
+  if swarm_job_state(job) != "ready" then
+    return ["SwarmJob", job[1], job[2], job[3], "failed", 0, "claim: job was not ready (state=" + swarm_job_state(job) + ")"]
+  end
+  return ["SwarmJob", job[1], job[2], job[3], "claimed", 0, ""]
+end
+
+# swarm_run(job, cache_dir) -> runs the EXISTING, UNCHANGED
+# ensure_chunk_native transformation (x64_compile_unit.patlang) on this
+# job's own unit and extern_names, wraps whatever it returns (a real
+# ChunkImage, or an "ASM ERROR:"-prefixed failure string) as a
+# SwarmArtefact, and returns the job with state "candidate" (or
+# "failed" if ensure_chunk_native itself failed -- a worker failure is
+# not swallowed here, it becomes a failed job, visible to the caller).
+make a function called swarm_run takes job, cache_dir returns run_job
+  if swarm_job_state(job) != "claimed" then
+    return ["SwarmJob", job[1], job[2], job[3], "failed", 0, "run: job was not claimed (state=" + swarm_job_state(job) + ")"]
+  end
+  let unit = job[2]
+  let extern_names = job[3]
+  let chunk_or_err = send(unit, "ensure_chunk_native", cache_dir, extern_names)
+  let artefact = swarm_make_chunk_artefact(unit, extern_names, chunk_or_err)
+  if swarm_artefact_failed(artefact) then
+    return ["SwarmJob", job[1], job[2], job[3], "failed", artefact, "run: ensure_chunk_native failed: " + chunk_or_err]
+  end
+  return ["SwarmJob", job[1], job[2], job[3], "candidate", artefact, ""]
+end
+
+# swarm_validate(job) -> treats the candidate as just that -- a
+# candidate -- and checks it on TWO axes before trusting it, neither of
+# which re-trusts anything the worker merely claimed about itself:
+#
+#   1. Identity re-derivation: recompute this job's OWN id fresh from
+#      its own unit (get(unit, "content_hash") again, independently of
+#      whatever the candidate artefact says its content_hash is) and
+#      confirm the two agree. A worker that somehow returned a
+#      candidate for the wrong content hash (a bug, not a hypothetical
+#      this prototype needs to defend against maliciously, just
+#      correctness) is caught here rather than silently committed.
+#   2. Structural round-trip: the candidate's own ChunkImage payload is
+#      encoded via x64_chunk_to_bin and decoded back via
+#      x64_chunk_from_bin (the SAME binary cache format ensure_chunk_
+#      native already persists to disk and reads back on every cache
+#      hit) and the two are compared via their own canonical JSON
+#      serialization (to_json_value + json_stringify, ir_io.patlang/
+#      json.patlang -- already used elsewhere in this codebase for
+#      exactly this kind of structural equality, see x64_compile_unit.
+#      patlang's own content-hash computation). A mismatch here would
+#      mean the cache format itself lost information -- this doesn't
+#      add a new risk, it just makes an existing implicit assumption
+#      (every cache hit reads back exactly what was written) into an
+#      explicit, checked gate.
+make a function called swarm_validate takes job returns validated_job
+  if swarm_job_state(job) != "candidate" then
+    return ["SwarmJob", job[1], job[2], job[3], "failed", job[5], "validate: job was not a candidate (state=" + swarm_job_state(job) + ")"]
+  end
+  let unit = job[2]
+  let artefact = job[5]
+  let fresh_hash = get(unit, "content_hash")
+  let claimed_hash = swarm_artefact_content_hash(artefact)
+  if fresh_hash != claimed_hash then
+    return ["SwarmJob", job[1], job[2], job[3], "failed", artefact, "validate: identity mismatch (unit says " + fresh_hash + ", artefact says " + claimed_hash + ")"]
+  end
+  let chunk = swarm_artefact_payload(artefact)
+  let encoded = x64_chunk_to_bin(chunk)
+  let decoded = x64_chunk_from_bin(encoded)
+  let chunk_json = json_stringify(to_json_value(chunk))
+  let decoded_json = json_stringify(to_json_value(decoded))
+  if chunk_json != decoded_json then
+    return ["SwarmJob", job[1], job[2], job[3], "failed", artefact, "validate: ChunkImage did not round-trip through x64_chunk_to_bin/x64_chunk_from_bin unchanged"]
+  end
+  return ["SwarmJob", job[1], job[2], job[3], "validated", artefact, ""]
+end
+
+# swarm_commit(job, committed) -> appends [job_id, artefact] to the
+# `committed` assoc-list (a plain list of 2-element lists, the same
+# "hand-emitted assoc-list loop" shape Global*/Handler* already use
+# elsewhere in this codebase for a small lookup table) and returns the
+# job with state "committed", plus the updated committed list. Refuses
+# to commit anything not already "validated" -- commit is the one step
+# that makes a result visible to the rest of the build, so it is the
+# one step most worth refusing to shortcut.
+make a function called swarm_commit takes job, committed returns result
+  if swarm_job_state(job) != "validated" then
+    return [["SwarmJob", job[1], job[2], job[3], "failed", job[5], "commit: job was not validated (state=" + swarm_job_state(job) + ")"], committed]
+  end
+  let new_job = ["SwarmJob", job[1], job[2], job[3], "committed", job[5], ""]
+  let new_committed = list_push(committed, [job[1], job[5]])
+  return [new_job, new_committed]
+end
+
+make a function called swarm_committed_lookup takes committed, job_id returns artefact
+  let n = to_num(list_len(committed))
+  let i = 0
+  while i < n do
+    let entry = committed[i]
+    if entry[0] == job_id then
+      return entry[1]
+    end
+    let i = i + 1
+  end
+  return 0
+end
+
+# ---- one-worker driver ----
+#
+# swarm_process_all(units_with_externs, cache_dir) -> [committed, jobs]
+#
+# units_with_externs: a list of [unit, extern_names] pairs. Processes
+# every job through claim -> run -> validate -> commit, SEQUENTIALLY,
+# on this one (sole) worker -- real queue states, zero real concurrency
+# in this slice, exactly matching the "Phase 1, one worker" scope limit.
+# Returns the full committed assoc-list (job_id -> SwarmArtefact) plus
+# the list of final job tuples (so a caller can report any "failed"
+# ones) -- the committed list is what a linking step reads from, by
+# content-hash id, never by scanning for "whichever job finished
+# first".
+make a function called swarm_process_all takes units_with_externs, cache_dir returns result
+  let n = to_num(list_len(units_with_externs))
+  let committed = []
+  let jobs = []
+  let i = 0
+  while i < n do
+    let pair = units_with_externs[i]
+    let unit = pair[0]
+    let extern_names = pair[1]
+    let job = swarm_make_job(unit, extern_names)
+    let job = swarm_claim(job)
+    if swarm_job_state(job) == "claimed" then
+      let job = swarm_run(job, cache_dir)
+    end
+    if swarm_job_state(job) == "candidate" then
+      let job = swarm_validate(job)
+    end
+    if swarm_job_state(job) == "validated" then
+      let commit_result = swarm_commit(job, committed)
+      let job = commit_result[0]
+      let committed = commit_result[1]
+    end
+    let jobs = list_push(jobs, job)
+    let i = i + 1
+  end
+  return [committed, jobs]
+end

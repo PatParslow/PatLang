@@ -1,0 +1,142 @@
+# SwarmCompile Phase 1, slice 1 of 2 (prototype -- see
+# self_hosting/swarm_compile/phase1_demo.patlang for the end-to-end
+# proof and self_hosting/swarm_compile/job_queue.patlang for the
+# claim/validate/commit states built on top of this).
+#
+# PURPOSE: wrap the ALREADY-WORKING, UNCHANGED per-function
+# CompileUnit -> ChunkImage step (self_hosting/lib/x64_compile_unit.
+# patlang's own CompileUnit class and ensure_chunk_native method) in an
+# explicit, inspectable identity/provenance envelope -- a "SwarmArtefact"
+# -- so a job queue (or, eventually, a distributed worker) can reason
+# about WHAT a produced value is and WHERE it came from without
+# re-deriving that from the ChunkImage's own opaque byte/symbol tables.
+#
+# This file does NOT change what gets computed. It does not touch
+# ensure_chunk_native, emit_program_x64, x64_assemble_chunk, or any
+# other codegen/assembly logic -- it only names, after the fact, the
+# identity that logic already deterministically produces.
+#
+# NAMING NOTE (explicitly required by the governing spec): "SwarmArtefact"
+# names a COMPILER-WORK product -- which worker/stage is allowed to
+# transform a compilation artefact (this function's IR, its ChunkImage).
+# It is NEVER used for, and must never be confused with, PatLang's own
+# runtime value ownership (Box/refcounting semantics a COMPILED PROGRAM
+# manipulates, e.g. general-refcounting.md's bm_rc_inc/bm_rc_dec). Those
+# are a completely different kind of "ownership," at a different level
+# (the compiler's own bookkeeping vs. the compiled program's own
+# runtime heap), and this module's vocabulary (artefact/job/claim/
+# validate/commit) is kept out of self_hosting/block_model/lower.patlang,
+# self_hosting/lib/codegen_x64.patlang, and self_hosting/lib/
+# x64_runtime.patlang entirely, on purpose, so the two can never be
+# textually confused by a future reader grepping for "owner".
+#
+# Representation: a plain tagged list, same convention as ChunkImage/
+# FuncIR/ProgramIR elsewhere in this codebase (["ChunkImage", ...],
+# ["FuncIR", ...]) rather than a new class -- this is supporting
+# vocabulary for print/inspect/compare, not a new runtime mechanism.
+#
+#   ["SwarmArtefact",
+#     artefact_id,       -- stable string, derived ONLY from kind +
+#                           content_hash (see below) -- never from
+#                           worker identity, claim order, or wall time.
+#     content_hash,       -- CompileUnit's own content_hash: a hash of
+#                           this function's canonical JSON-serialized
+#                           IR, folded with x64_compiler_fingerprint()
+#                           (a hash of codegen_x64.patlang's own
+#                           source -- see x64_compile_unit.patlang's
+#                           own header for why: so a codegen change
+#                           invalidates identity even when the
+#                           function's own IR did not change). This
+#                           already satisfies the "stable identifiers
+#                           from canonical content + declared
+#                           compilation context" rule on its own --
+#                           this module does not recompute or
+#                           reinterpret it, only carries it forward.
+#     producer,            -- the exact function that computed the
+#                           payload (a plain string, so a human or a
+#                           future validator can tell what produced
+#                           this without re-deriving it): always
+#                           "x64_compile_unit.ensure_chunk_native" for
+#                           this slice.
+#     dep_names,           -- the FULL, EXPLICIT extern-name list this
+#                           unit's own codegen was given (x64_
+#                           extern_names_for's return value) -- i.e.
+#                           every OTHER symbol this function's own
+#                           compiled body is allowed to reference.
+#                           This is the job's own declared dependency
+#                           contract: nothing outside this list may be
+#                           consulted by the transformation that
+#                           produced this artefact's payload.
+#     kind,                -- "ChunkImage" for this slice (the one
+#                           stage being wrapped). A string, not an
+#                           enum, so a later slice can add a new kind
+#                           (e.g. "ParsedAst", "LoweredIR") without
+#                           changing this shape.
+#     payload]             -- the ChunkImage itself (or, on failure,
+#                           an "ASM ERROR:"-prefixed string -- the
+#                           SAME failure convention ensure_chunk_native
+#                           already uses, carried through unchanged).
+#
+# Deliberately NOT included: a timestamp, a worker id, a sequence
+# number. Per the governing rule ("stable identifiers derived from
+# canonical content... never worker order or completion timing"), none
+# of those may be part of identity, so none are stored as if they were.
+
+include "../lib/x64_compile_unit.patlang"
+
+# swarm_artefact_id(kind, content_hash) -> the stable id string.
+# Pulled out as its own function (rather than inlined at each call
+# site) so "how an id is built from a hash" has exactly one definition
+# -- any later artefact kind reuses this unchanged.
+make a function called swarm_artefact_id takes kind, content_hash returns id
+  return "artefact:" + kind + ":" + content_hash
+end
+
+# swarm_make_chunk_artefact(unit, extern_names, chunk_or_err) -> a
+# SwarmArtefact wrapping whatever ensure_chunk_native already returned
+# for this CompileUnit. Takes the CompileUnit and the SAME extern_names
+# list that was passed into ensure_chunk_native, so dep_names reflects
+# the job's own true declared contract rather than being re-derived or
+# guessed after the fact.
+make a function called swarm_make_chunk_artefact takes unit, extern_names, chunk_or_err returns artefact
+  let content_hash = get(unit, "content_hash")
+  let aid = swarm_artefact_id("ChunkImage", content_hash)
+  return ["SwarmArtefact", aid, content_hash, "x64_compile_unit.ensure_chunk_native", extern_names, "ChunkImage", chunk_or_err]
+end
+
+# ---- field accessors (plain index reads, named so call sites don't
+# hard-code the tuple's own shape). ----
+make a function called swarm_artefact_id_of takes artefact returns id
+  return artefact[1]
+end
+
+make a function called swarm_artefact_content_hash takes artefact returns h
+  return artefact[2]
+end
+
+make a function called swarm_artefact_producer takes artefact returns p
+  return artefact[3]
+end
+
+make a function called swarm_artefact_dep_names takes artefact returns names
+  return artefact[4]
+end
+
+make a function called swarm_artefact_kind takes artefact returns k
+  return artefact[5]
+end
+
+make a function called swarm_artefact_payload takes artefact returns payload
+  return artefact[6]
+end
+
+# swarm_artefact_failed(artefact) -> true if the payload is the
+# "ASM ERROR:"-prefixed failure string ensure_chunk_native uses,
+# rather than a real ChunkImage. Checked via type_of (a ChunkImage is
+# a list; an error is a string) -- same discriminator x64_compile_
+# unit.patlang's own X64UnitLinker.build_native already uses for this
+# exact distinction, kept consistent rather than reinvented.
+make a function called swarm_artefact_failed takes artefact returns failed
+  let payload = swarm_artefact_payload(artefact)
+  return type_of(payload) == "string"
+end

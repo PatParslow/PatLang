@@ -10,6 +10,10 @@ authorized next increment, and only once GitHub #222 is fully closed and
 committed** -- nothing in this document should be started before then.
 Nothing below is implemented yet.
 
+**Update (2026-10-26):** the implementation plan for this specification,
+as a separate compiler driver with `patc1` kept as the parity oracle, is
+`docs/plans/swarm-compiler.md`.
+
 ## 0. Relationship to existing plans
 
 - **Generalizes and supersedes** `docs/plans/block-ownership-model-

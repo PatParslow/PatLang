@@ -1,0 +1,480 @@
+# SwarmCompile Phase 1 -- the measurement step the governing spec asks
+# for BEFORE any multi-worker work ("Add measurement before adding
+# finer granularity. A queue with more scheduling overhead than it
+# saves is a regression, not progress.").
+#
+# Compiles the REAL self-hosted-compiler bundle (self_hosting/build/
+# patc1_all.patlang, the same ~534-unit program build_patc1.patlang
+# itself produces and build_native's own header already estimates at
+# ~1.5s/unit single-threaded) through TWO paths, back to back, in the
+# SAME process:
+#
+#   A) DIRECT  -- exactly what X64UnitLinker.build_native's own PASS 2
+#      loop does today: send(unit, "ensure_chunk_native", cache_dir,
+#      extern_names) called sequentially, no queue, no artefact
+#      envelope, no validation step.
+#   B) SWARM   -- the SAME units, the SAME extern_names, routed through
+#      job_queue.patlang's claim -> run -> validate -> commit states.
+#
+# Both passes use their OWN fresh, empty cache directory, so both pay
+# the real, cold ensure_chunk_native cost (emit + assemble) for every
+# unit -- a warm-cache run would make the queue's own bookkeeping look
+# artificially large relative to a near-zero cache-hit cost, which is
+# not the comparison the spec asked for ("the actual transformation
+# cost held constant").
+#
+# Per CLAUDE.md's "output discipline for long-running/batch tools"
+# section: this writes live progress to a FILE (self_hosting/build/
+# swarm_bench_progress.txt), overwritten every 20 units, since stdout
+# under a backgrounded/redirected pat.exe process is not reliably
+# flushed until exit.
+#
+# Usage:
+#   rust-runtime/target/release/pat.exe --ir-run \
+#     self_hosting/swarm_compile/phase1_bench.patlang \
+#     self_hosting/build/patc1_all.patlang \
+#     self_hosting/build/swarm_bench_direct.exe \
+#     self_hosting/build/swarm_bench_swarm.exe
+
+include "../lib/lexer.patlang"
+include "../lib/parser.patlang"
+include "../lib/codegen_x64.patlang"
+include "../lib/x64_build.patlang"
+include "../block_model/block_ir.patlang"
+include "../block_model/free_vars.patlang"
+include "../block_model/flight_check.patlang"
+include "../block_model/classes.patlang"
+include "../block_model/lower.patlang"
+include "../block_model/native_codegen.patlang"
+include "../block_model/patc_backend.patlang"
+include "job_queue.patlang"
+
+make a function called x64_name_in_list takes names, name returns yes
+  let n = names.length
+  let i = 0
+  while i < n do
+    if names[i] == name then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called bench_progress takes path, text returns done
+  write_file(path, text)
+  return true
+end
+
+# bench_clear_cache_dir(dir) -> wipes every entry directly inside `dir`
+# (flat only -- every cache dir this script uses holds only .chunkbin/
+# .asm files, never subdirectories, so a non-recursive clear is
+# correct and simpler than reaching for a primitive this runtime
+# doesn't have). There is no remove_dir_all/dir_exists host primitive
+# (checked rust-runtime/src/ir/hosts.rs directly rather than assuming
+# one exists) -- file_exists + list_dir + remove_file do the same job.
+make a function called bench_join_names takes names returns s
+  let b = sb_new()
+  let n = to_num(list_len(names))
+  let i = 0
+  while i < n do
+    if i > 0 then
+      sb_push(b, ", ")
+    end
+    sb_push(b, names[i])
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+make a function called bench_clear_cache_dir takes dir returns done
+  if file_exists(dir) == false then
+    return true
+  end
+  let entries = list_dir(dir)
+  let n = to_num(list_len(entries))
+  let i = 0
+  while i < n do
+    let name = entries[i]
+    let unused = remove_file(dir + "/" + name)
+    let i = i + 1
+  end
+  return true
+end
+
+# bench_stats(durations) -> [sum, avg, max, max_index] over a plain
+# list of millisecond durations. Written as its own function (not
+# inlined at each call site) so the direct-pass and swarm-pass stats
+# are computed identically -- a hand-duplicated copy here would risk
+# the exact "same bug fixed at one call site, not the shared level"
+# pattern this project's own CLAUDE.md warns about.
+make a function called bench_stats takes durations returns stats
+  let n = to_num(list_len(durations))
+  let sum = 0
+  let max_v = 0
+  let max_i = 0
+  let i = 0
+  while i < n do
+    let d = durations[i]
+    let sum = sum + d
+    if d > max_v then
+      let max_v = d
+      let max_i = i
+    end
+    let i = i + 1
+  end
+  let avg = 0
+  if n > 0 then
+    # (sum + 0.0) forces FLOAT division (a readable decimal) rather
+    # than PatLang's own exact-rational `/` (which would print e.g.
+    # "959/5" instead of "191.8" -- confirmed directly, not assumed).
+    let avg = (sum + 0.0) / n
+  end
+  return [sum, avg, max_v, max_i, n]
+end
+
+let args = argv()
+let bundle_path = args[0]
+let direct_out = args[1]
+let swarm_out = args[2]
+let progress_path = "self_hosting/build/swarm_bench_progress.txt"
+
+let rt_names_file = "self_hosting/build/x64_runtime.funcs"
+let rt_names = split_lines(read_file(rt_names_file))
+
+bench_progress(progress_path, "lexing/parsing/lowering " + bundle_path + " ...")
+let t_lower0 = now_ms()
+# expand_includes mirrors exactly what patc1_main.patlang's own --x64
+# path does before tokenizing (see its own `let source =
+# expand_includes(raw_source, path_dirname(input))`) -- needed for a
+# standalone library file (which still has its own unexpanded
+# `include "..."` lines) to pull in its real dependencies before
+# lowering; a no-op for an already-flattened bundle like patc1_all.
+# patlang (build_patc1.patlang already expands every file's own
+# includes while concatenating it).
+let src = expand_includes(read_file(bundle_path), path_dirname(bundle_path))
+let toks = tokenize(src)
+let ast = parse_program(toks)
+let ir = bm_patc_lower(ast, rt_names)
+let all_funcs = ir[2]
+let t_lower1 = now_ms()
+
+let program_funcs = []
+let seen_names = []
+let pfi = 0
+let pf_count = all_funcs.length
+while pfi < pf_count do
+  let fname = all_funcs[pfi][1]
+  if (not x64_name_in_list(rt_names, fname)) and (not x64_name_in_list(seen_names, fname)) then
+    let program_funcs = list_push(program_funcs, all_funcs[pfi])
+    let seen_names = list_push(seen_names, fname)
+  end
+  let pfi = pfi + 1
+end
+
+# PRE-EXISTING, OUT-OF-SCOPE EXCLUSION (confirmed, not assumed): a
+# first unfiltered run of this exact bench against this exact bundle
+# hard-crashed the whole process (os_exit(98), uncatchable from
+# PatLang) inside codegen_x64.patlang's variable-resolution code --
+# "codegen_x64: undefined variable '__loop_exit_17__program_funcs'
+# referenced (not a parameter or local of the enclosing function --
+# PatLang has no automatic cross-function sharing for top-level `let`
+# bindings; pass it as a parameter instead)". This is self_hosting/
+# block_model/lower.patlang's own synthesized "__loop_exit_N"
+# continuation-block mechanism (confirmed via `grep __loop_exit_` in
+# that file) failing to correctly thread a top-level `let` (patc1_
+# main.patlang's own `program_funcs`) into one such continuation as a
+# free variable -- EXACTLY the recurring class of bug this project's
+# own CLAUDE.md section 4.6 already documents and names as "almost
+# every session." It is pre-existing in the committed self_hosted
+# compiler, has nothing to do with the SwarmArtefact/job-queue
+# wrapper being measured here (ensure_chunk_native itself, the
+# UNCHANGED transformation both the direct and swarm paths call, is
+# what hits it), and fixing block_model/lower.patlang is explicitly
+# out of scope for this measurement step (and is very plausibly what
+# the main checkout's own currently-running, uncommitted work on that
+# exact file is already addressing -- not to be duplicated or guessed
+# at here).
+#
+# os_exit(98) is an immediate, uncatchable process exit -- there is no
+# way to "catch and skip" it per-unit from PatLang once emit_program_
+# x64 is actually called on an affected unit, and re-lexing/parsing/
+# lowering this bundle from scratch to bisect for every affected name
+# is itself far too costly (the lowering step alone measured in the
+# millions of milliseconds -- see below) to pay for repeatedly. So
+# every "__loop_exit_*"-named synthesized unit is filtered out of the
+# timed set BEFORE either pass ever calls ensure_chunk_native on it --
+# a deliberately conservative exclusion (it may exclude some loop-exit
+# units that would actually compile fine) chosen to guarantee this
+# measurement run completes rather than risk hitting a second, not-yet-
+# known-by-name bad unit of the same class. extern_names for every
+# REMAINING unit, and the apply table emitted at the end, are both
+# built from this SAME filtered list -- consistent with the fact that
+# excluded units are never assembled, so nothing should declare or
+# expect their symbols either.
+let program_funcs_all = program_funcs
+let program_funcs = []
+let excluded_names = []
+let exi = 0
+while exi < to_num(list_len(program_funcs_all)) do
+  let fname = program_funcs_all[exi][1]
+  if substr(fname, 0, 12) == "__loop_exit_" then
+    let excluded_names = list_push(excluded_names, fname)
+  else
+    let program_funcs = list_push(program_funcs, program_funcs_all[exi])
+  end
+  let exi = exi + 1
+end
+if to_num(list_len(excluded_names)) > 0 then
+  print("BENCH: excluded " + to_num(list_len(excluded_names)) + " pre-existing-bug unit(s) (see header comment): " + bench_join_names(excluded_names))
+end
+
+# Optional 4th argv: cap how many of the (now-filtered) real units
+# actually get TIMED. The lexing/parsing/lowering step above is a
+# fixed, one-time cost paid regardless of this cap (it must run over
+# the WHOLE bundle for a correct free-var/extern analysis); this cap
+# exists only to keep the DIRECT+SWARM timed passes themselves inside
+# a predictable wall-clock budget when run as a backgrounded command
+# with a hard timeout -- it does not change what each timed unit's own
+# ensure_chunk_native cost looks like (same real function IR, same
+# codegen, same assembler), only how MANY real units get measured.
+# When present, this run's own executables are NOT linked (a partial
+# unit set has unresolved symbols for whatever was excluded) -- Phase
+# 1's own closures_basic_reference.patlang run already proved link
+# parity; this run's job is the TIMING measurement, at real-function
+# scale, not a second link-parity proof.
+let n_filtered = program_funcs.length
+let max_units = n_filtered
+if list_len(args) > 3 then
+  let max_units = to_num(args[3])
+  if max_units > n_filtered then
+    let max_units = n_filtered
+  end
+end
+let n = max_units
+
+print("BENCH: lowered in " + (t_lower1 - t_lower0) + "ms, " + to_num(n) + " of " + to_num(list_len(program_funcs)) + " program function(s) (compile units) will be timed")
+bench_progress(progress_path, "lowered: " + to_num(n) + " units to time (" + to_num(list_len(excluded_names)) + " excluded for the known bug). starting DIRECT pass.")
+
+let units_with_externs = []
+let i = 0
+while i < n do
+  let unit = x64_make_compile_unit(program_funcs[i])
+  let extern_names = x64_extern_names_for(program_funcs, i, rt_names)
+  let units_with_externs = list_push(units_with_externs, [unit, extern_names])
+  let i = i + 1
+end
+
+# ---- PASS A: DIRECT (cold cache, sequential, no queue) ----
+let direct_cache_dir = "self_hosting/build/swarm_bench_cache_direct"
+let unused_clear1 = bench_clear_cache_dir(direct_cache_dir)
+
+let direct_chunks = []
+let direct_durations = []
+let direct_fail_count = 0
+let t_direct0 = now_ms()
+let i = 0
+while i < n do
+  let pair = units_with_externs[i]
+  let unit = pair[0]
+  let extern_names = pair[1]
+  # Forensic trace: if this specific unit's own emit_program_x64 call
+  # hits the uncatchable os_exit(98) bug (see the exclusion-filter
+  # comment above), THIS line is the last thing the progress file will
+  # show -- naming exactly which unit, by index and real name, so it
+  # can be added to the exclusion list without guessing.
+  bench_progress(progress_path, "DIRECT attempting unit " + i + "/" + n + ": " + get(unit, "name"))
+  let t0 = now_ms()
+  let chunk_or_err = send(unit, "ensure_chunk_native", direct_cache_dir, extern_names)
+  let t1 = now_ms()
+  let direct_durations = list_push(direct_durations, t1 - t0)
+  if type_of(chunk_or_err) == "string" then
+    let direct_fail_count = direct_fail_count + 1
+  else
+    let direct_chunks = list_push(direct_chunks, chunk_or_err)
+  end
+  if (i % 20) == 0 then
+    bench_progress(progress_path, "DIRECT " + i + "/" + n + " t_ms=" + (now_ms() - t_direct0))
+  end
+  let i = i + 1
+end
+let t_direct1 = now_ms()
+let direct_total_ms = t_direct1 - t_direct0
+let direct_stats = bench_stats(direct_durations)
+
+print("DIRECT pass: total=" + direct_total_ms + "ms units=" + to_num(n) + " failed=" + direct_fail_count + " sum_of_per_job=" + direct_stats[0] + "ms avg=" + direct_stats[1] + "ms max=" + direct_stats[2] + "ms (unit#" + direct_stats[3] + ")")
+bench_progress(progress_path, "DIRECT done: " + direct_total_ms + "ms. starting SWARM pass.")
+
+# ---- PASS B: SWARM (cold cache, one worker, claim/run/validate/commit) ----
+let swarm_cache_dir = "self_hosting/build/swarm_bench_cache_swarm"
+let unused_clear2 = bench_clear_cache_dir(swarm_cache_dir)
+
+let committed = []
+let jobs = []
+let run_durations = []
+let validate_durations = []
+let claim_durations = []
+let commit_durations = []
+let job_total_durations = []
+let swarm_fail_count = 0
+let t_swarm0 = now_ms()
+let i = 0
+while i < n do
+  let pair = units_with_externs[i]
+  let unit = pair[0]
+  let extern_names = pair[1]
+  let t_job0 = now_ms()
+
+  let t_c0 = now_ms()
+  let job = swarm_make_job(unit, extern_names)
+  let job = swarm_claim(job)
+  let t_c1 = now_ms()
+  let claim_durations = list_push(claim_durations, t_c1 - t_c0)
+
+  let t_r0 = now_ms()
+  if swarm_job_state(job) == "claimed" then
+    let job = swarm_run(job, swarm_cache_dir)
+  end
+  let t_r1 = now_ms()
+  let run_durations = list_push(run_durations, t_r1 - t_r0)
+
+  let t_v0 = now_ms()
+  if swarm_job_state(job) == "candidate" then
+    let job = swarm_validate(job)
+  end
+  let t_v1 = now_ms()
+  let validate_durations = list_push(validate_durations, t_v1 - t_v0)
+
+  let t_k0 = now_ms()
+  if swarm_job_state(job) == "validated" then
+    let commit_result = swarm_commit(job, committed)
+    let job = commit_result[0]
+    let committed = commit_result[1]
+  end
+  let t_k1 = now_ms()
+  let commit_durations = list_push(commit_durations, t_k1 - t_k0)
+
+  let t_job1 = now_ms()
+  let job_total_durations = list_push(job_total_durations, t_job1 - t_job0)
+
+  if swarm_job_state(job) != "committed" then
+    let swarm_fail_count = swarm_fail_count + 1
+  end
+  let jobs = list_push(jobs, job)
+
+  if (i % 20) == 0 then
+    bench_progress(progress_path, "SWARM " + i + "/" + n + " t_ms=" + (now_ms() - t_swarm0))
+  end
+  let i = i + 1
+end
+let t_swarm1 = now_ms()
+let swarm_total_ms = t_swarm1 - t_swarm0
+
+let claim_stats = bench_stats(claim_durations)
+let run_stats = bench_stats(run_durations)
+let validate_stats = bench_stats(validate_durations)
+let commit_stats = bench_stats(commit_durations)
+let job_total_stats = bench_stats(job_total_durations)
+
+# Pure queue/bookkeeping overhead: swarm's own total wall time minus
+# the sum of its own "run" phase durations (the SAME ensure_chunk_
+# native transformation the direct pass also timed) -- this isolates
+# claim+validate+commit+loop bookkeeping from the transformation cost
+# it wraps, using ONLY numbers measured within the swarm pass itself
+# (not a cross-pass subtraction, which would also absorb filesystem-
+# cache/OS-scheduling noise between two separately-run passes).
+let overhead_ms = swarm_total_ms - run_stats[0]
+let overhead_pct = 0
+if swarm_total_ms > 0 then
+  let overhead_pct = ((overhead_ms + 0.0) * 100) / swarm_total_ms
+end
+let validate_pct = 0
+if swarm_total_ms > 0 then
+  let validate_pct = ((validate_stats[0] + 0.0) * 100) / swarm_total_ms
+end
+
+print("SWARM pass: total=" + swarm_total_ms + "ms units=" + to_num(n) + " failed=" + swarm_fail_count)
+print("  claim:    sum=" + claim_stats[0] + "ms avg=" + claim_stats[1] + "ms max=" + claim_stats[2] + "ms")
+print("  run:      sum=" + run_stats[0] + "ms avg=" + run_stats[1] + "ms max=" + run_stats[2] + "ms (unit#" + run_stats[3] + ")")
+print("  validate: sum=" + validate_stats[0] + "ms avg=" + validate_stats[1] + "ms max=" + validate_stats[2] + "ms (unit#" + validate_stats[3] + ")")
+print("  commit:   sum=" + commit_stats[0] + "ms avg=" + commit_stats[1] + "ms max=" + commit_stats[2] + "ms")
+print("  per-job total: avg=" + job_total_stats[1] + "ms max=" + job_total_stats[2] + "ms (unit#" + job_total_stats[3] + ")")
+print("OVERHEAD (swarm_total - sum(run)) = " + overhead_ms + "ms = " + overhead_pct + "% of swarm_total")
+print("VALIDATE FRACTION (sum(validate)/swarm_total) = " + validate_pct + "%")
+print("CROSS-PASS DELTA (swarm_total - direct_total) = " + (swarm_total_ms - direct_total_ms) + "ms")
+
+bench_progress(progress_path, "SWARM done: " + swarm_total_ms + "ms. both passes complete, writing summary.")
+
+let summary_path = "self_hosting/build/swarm_bench_summary.txt"
+let sb = sb_new()
+sb_push(sb, "units=" + to_num(n) + chr(10))
+sb_push(sb, "direct_total_ms=" + direct_total_ms + chr(10))
+sb_push(sb, "direct_avg_ms=" + direct_stats[1] + chr(10))
+sb_push(sb, "direct_max_ms=" + direct_stats[2] + " (unit#" + direct_stats[3] + ")" + chr(10))
+sb_push(sb, "swarm_total_ms=" + swarm_total_ms + chr(10))
+sb_push(sb, "swarm_claim_sum_ms=" + claim_stats[0] + chr(10))
+sb_push(sb, "swarm_run_sum_ms=" + run_stats[0] + chr(10))
+sb_push(sb, "swarm_validate_sum_ms=" + validate_stats[0] + chr(10))
+sb_push(sb, "swarm_commit_sum_ms=" + commit_stats[0] + chr(10))
+sb_push(sb, "swarm_job_avg_ms=" + job_total_stats[1] + chr(10))
+sb_push(sb, "swarm_job_max_ms=" + job_total_stats[2] + " (unit#" + job_total_stats[3] + ")" + chr(10))
+sb_push(sb, "overhead_ms=" + overhead_ms + chr(10))
+sb_push(sb, "overhead_pct=" + overhead_pct + chr(10))
+sb_push(sb, "validate_pct=" + validate_pct + chr(10))
+sb_push(sb, "cross_pass_delta_ms=" + (swarm_total_ms - direct_total_ms) + chr(10))
+sb_push(sb, "direct_failed=" + direct_fail_count + chr(10))
+sb_push(sb, "swarm_failed=" + swarm_fail_count + chr(10))
+write_file(summary_path, sb_str(sb))
+
+# ---- optional: link both into real executables and leave a flag file
+# noting whether this step was reached, so a caller checking in on a
+# still-running bench never has to guess whether linking was silently
+# skipped. ----
+let link_flag_path = "self_hosting/build/swarm_bench_link_status.txt"
+bench_progress(link_flag_path, "linking: starting")
+
+let runtime_asm_path = "self_hosting/build/x64_runtime.asm"
+let runtime_asm_bytes = read_file_bytes(runtime_asm_path, 0, 2000000000)
+let rt_key = "x64runtime_" + x64_content_hash_bytes(runtime_asm_bytes) + "_" + x64_compiler_fingerprint()
+let rt_cache_path = "self_hosting/build/x64_obj_cache/" + rt_key + ".chunkbin"
+
+if n < n_filtered then
+  bench_progress(link_flag_path, "linking: SKIPPED on purpose -- a capped subset (" + to_num(n) + " of " + to_num(n_filtered) + " filtered units) was timed, not linked. See header comment: Phase 1's own closures_basic_reference.patlang run already proved link parity; this run is a real-scale TIMING measurement only.")
+  print("LINK: skipped (capped subset run, " + to_num(n) + "/" + to_num(n_filtered) + " units)")
+elif (direct_fail_count > 0) or (swarm_fail_count > 0) then
+  bench_progress(link_flag_path, "linking: SKIPPED (direct_failed=" + direct_fail_count + " swarm_failed=" + swarm_fail_count + ")")
+elif file_exists(rt_cache_path) == false then
+  let runtime_chunk = x64_assemble_chunk(read_file(runtime_asm_path))
+  write_file_bytes(rt_cache_path, x64_chunk_to_bin(runtime_chunk))
+  bench_progress(link_flag_path, "linking: assembled runtime chunk fresh (was not cached)")
+else
+  let runtime_chunk = x64_chunk_from_bin(read_file_bytes(rt_cache_path, 0, 2000000000))
+
+  let direct_all_chunks = [runtime_chunk]
+  let i = 0
+  while i < to_num(list_len(direct_chunks)) do
+    let direct_all_chunks = list_push(direct_all_chunks, direct_chunks[i])
+    let i = i + 1
+  end
+  let apply_table_asm = x64_emit_apply_table_asm(program_funcs)
+  let apply_table_chunk = x64_assemble_chunk(apply_table_asm)
+  let direct_all_chunks = list_push(direct_all_chunks, apply_table_chunk)
+  let direct_linked = x64_link_native_chunks(direct_all_chunks, direct_out)
+  print("DIRECT link: " + direct_linked)
+
+  let swarm_all_chunks = [runtime_chunk]
+  let i = 0
+  while i < n do
+    let job = jobs[i]
+    let artefact = swarm_committed_lookup(committed, swarm_job_id(job))
+    let swarm_all_chunks = list_push(swarm_all_chunks, swarm_artefact_payload(artefact))
+    let i = i + 1
+  end
+  let swarm_all_chunks = list_push(swarm_all_chunks, apply_table_chunk)
+  let swarm_linked = x64_link_native_chunks(swarm_all_chunks, swarm_out)
+  print("SWARM link: " + swarm_linked)
+
+  bench_progress(link_flag_path, "linking: DONE direct=" + direct_linked + " swarm=" + swarm_linked)
+end
+
+print("BENCH DONE")

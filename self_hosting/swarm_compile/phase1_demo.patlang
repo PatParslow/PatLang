@@ -1,0 +1,164 @@
+# SwarmCompile Phase 1 development slice -- end-to-end proof.
+#
+# Compiles ONE program (a fixture given on argv) through the SAME
+# lex/parse/bm_patc_lower pipeline the ordinary `./patc1.exe <src> <out>
+# --x64` CLI already uses (self_hosting/patc1_main.patlang), but routes
+# the per-function CompileUnit -> ChunkImage step through the new
+# claim -> validate -> commit job queue (self_hosting/swarm_compile/
+# job_queue.patlang) instead of X64UnitLinker.build_native's own direct
+# two-pass loop. Nothing about lexing, parsing, lowering, codegen, or
+# assembly is reimplemented or changed here -- every one of those steps
+# is the SAME function call the existing CLI already makes; only the
+# per-function orchestration is wrapped in the new vocabulary.
+#
+# Prerequisites (same as the ordinary --x64 CLI):
+#   self_hosting/build/x64_runtime.{obj,asm,funcs} already built via
+#   `rust-runtime/target/release/pat --ir-run self_hosting/build_x64_runtime.patlang`
+#
+# Usage:
+#   rust-runtime/target/release/pat.exe --ir-run \
+#     self_hosting/swarm_compile/phase1_demo.patlang <fixture.patlang> <out.exe> [cache_dir]
+#
+# Prints, in order: every committed job's own artefact id, content
+# hash, producer, and dependency-name count (the repeatable-identity
+# proof -- diff this block across two separate process runs), then
+# "SWARM BUILD OK: <out.exe>" or a FAIL line naming the first failed
+# job.
+
+include "../lib/lexer.patlang"
+include "../lib/parser.patlang"
+include "../lib/codegen_x64.patlang"
+include "../lib/x64_build.patlang"
+include "../block_model/block_ir.patlang"
+include "../block_model/free_vars.patlang"
+include "../block_model/flight_check.patlang"
+include "../block_model/classes.patlang"
+include "../block_model/lower.patlang"
+include "../block_model/native_codegen.patlang"
+include "../block_model/patc_backend.patlang"
+include "job_queue.patlang"
+
+# Copied, not shared, for the same reason build_native.patlang
+# (self_hosting/block_model/tools/) and patc1_main.patlang each keep
+# their own copy: x64_name_in_list is defined in patc1_main.patlang, a
+# CLI driver file with its own top-level argument parsing that cannot
+# be `include`d here without colliding with this script's own.
+make a function called x64_name_in_list takes names, name returns yes
+  let n = names.length
+  let i = 0
+  while i < n do
+    if names[i] == name then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+let args = argv()
+let src_path = args[0]
+let out_path = args[1]
+let cache_dir = "self_hosting/build/swarm_obj_cache"
+if list_len(args) > 2 then
+  let cache_dir = args[2]
+end
+
+let rt_names_file = "self_hosting/build/x64_runtime.funcs"
+let rt_names = split_lines(read_file(rt_names_file))
+
+let src = read_file(src_path)
+let toks = tokenize(src)
+let ast = parse_program(toks)
+let ir = bm_patc_lower(ast, rt_names)
+let all_funcs = ir[2]
+
+# Same dedup-against-runtime-names-and-against-itself filtering
+# patc1_main.patlang's own --x64 path applies (keep only the FIRST
+# occurrence of each non-runtime name) -- so program_funcs here is
+# EXACTLY the function set the ordinary CLI would also compile, making
+# this a fair parity comparison rather than an accidentally different
+# program.
+let program_funcs = []
+let seen_names = []
+let pfi = 0
+let pf_count = all_funcs.length
+while pfi < pf_count do
+  let fname = all_funcs[pfi][1]
+  if (not x64_name_in_list(rt_names, fname)) and (not x64_name_in_list(seen_names, fname)) then
+    let program_funcs = list_push(program_funcs, all_funcs[pfi])
+    let seen_names = list_push(seen_names, fname)
+  end
+  let pfi = pfi + 1
+end
+
+print("SWARM: " + to_num(list_len(program_funcs)) + " program function(s) to compile, one job each")
+
+# ---- build the job list: one CompileUnit + its own declared
+# extern_names per function, exactly what x64_make_compile_unit/
+# x64_extern_names_for already compute for the direct path. ----
+let units_with_externs = []
+let n = program_funcs.length
+let i = 0
+while i < n do
+  let unit = x64_make_compile_unit(program_funcs[i])
+  let extern_names = x64_extern_names_for(program_funcs, i, rt_names)
+  let units_with_externs = list_push(units_with_externs, [unit, extern_names])
+  let i = i + 1
+end
+
+# ---- run every job through claim -> run -> validate -> commit on the
+# one worker this slice has. ----
+let result = swarm_process_all(units_with_externs, cache_dir)
+let committed = result[0]
+let jobs = result[1]
+
+let failed_count = 0
+let fi = 0
+while fi < to_num(list_len(jobs)) do
+  let job = jobs[fi]
+  if swarm_job_state(job) == "committed" then
+    let artefact = swarm_job_candidate(job)
+    print("  committed: id=" + swarm_artefact_id_of(artefact) + " hash=" + swarm_artefact_content_hash(artefact) + " producer=" + swarm_artefact_producer(artefact) + " deps=" + to_num(list_len(swarm_artefact_dep_names(artefact))))
+  else
+    let failed_count = failed_count + 1
+    print("  FAILED job " + swarm_job_id(job) + " (state=" + swarm_job_state(job) + "): " + swarm_job_error(job))
+  end
+  let fi = fi + 1
+end
+
+if failed_count > 0 then
+  print("SWARM BUILD FAILED: " + failed_count + " job(s) did not reach committed")
+else
+  # ---- link: the runtime chunk (loaded exactly the way
+  # X64UnitLinker.build_native already does -- same cache key
+  # computation, same on-disk .chunkbin, so this reads the SAME cached
+  # runtime chunk the ordinary CLI build already produced, rather than
+  # re-assembling ~88k lines of runtime asm for this demo) plus every
+  # committed per-function chunk, in program order, plus the apply
+  # table (x64_emit_apply_table_asm/x64_assemble_chunk, unchanged, the
+  # same two calls X64UnitLinker.build_native already makes). ----
+  let runtime_asm_path = "self_hosting/build/x64_runtime.asm"
+  let runtime_asm_bytes = read_file_bytes(runtime_asm_path, 0, 2000000000)
+  let rt_key = "x64runtime_" + x64_content_hash_bytes(runtime_asm_bytes) + "_" + x64_compiler_fingerprint()
+  let rt_cache_path = "self_hosting/build/x64_obj_cache/" + rt_key + ".chunkbin"
+  if file_exists(rt_cache_path) == false then
+    print("SWARM BUILD FAILED: runtime chunk not cached at " + rt_cache_path + " -- run the ordinary --x64 CLI once first, or self_hosting/build_x64_runtime.patlang")
+  else
+    let runtime_chunk = x64_chunk_from_bin(read_file_bytes(rt_cache_path, 0, 2000000000))
+    let chunks = [runtime_chunk]
+    let ci = 0
+    while ci < n do
+      let job = jobs[ci]
+      let job_id = swarm_job_id(job)
+      let artefact = swarm_committed_lookup(committed, job_id)
+      let chunk = swarm_artefact_payload(artefact)
+      let chunks = list_push(chunks, chunk)
+      let ci = ci + 1
+    end
+    let apply_table_asm = x64_emit_apply_table_asm(program_funcs)
+    let apply_table_chunk = x64_assemble_chunk(apply_table_asm)
+    let chunks = list_push(chunks, apply_table_chunk)
+    let linked = x64_link_native_chunks(chunks, out_path)
+    print("SWARM BUILD OK: " + linked)
+  end
+end
