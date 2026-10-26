@@ -159,6 +159,55 @@ and ends with the §5 parity gate plus the standing suites
   - Answer Fork E.
   - Exit: committed numbers for every stage. These decide where the
     payoff is: parallel lowering, incremental reuse, or both.
+  - **Results (2026-10-26).** Rather than change the markers, an outside
+    script polled `genb_tempdebug.txt` once a second and logged each
+    change with a timestamp (`self_hosting/swarm_compile/phase0_measure.sh`, output in `self_hosting/build/phase0/`), so
+    `patc1` itself stayed unchanged. Object cache cleared before each
+    run; `patc1.exe` built at eec4f77.
+
+    | Stage | mini run 1 | mini run 2 | full |
+    |---|---|---|---|
+    | Stage (marker boundaries) | mini run 1 | mini run 2 | full |
+    |---|---|---|---|
+    | start → `lexing` (read, splice, DSL) | 136s | 152s | 152s |
+    | lex + parse | 5s | 4s | 4s |
+    | `bm_lower_program_start` → `lowering_done` | 58s | 71s | 142s |
+    | `lowering_done` → first `ecn_emit_start` (no markers) | 175s | 221s | 208s |
+    | per-function codegen + assembly | 1074s | 1445s | 8335s |
+    | apply table + link | 71s | 76s | 121s |
+    | **total** | **1519s** | **1978s** | **8970s** |
+
+    The 136–152s before `lexing` is the same with and without the
+    syntax DSL, so it is reading and include splicing rather than DSL
+    expansion. The roughly 200s between lowering and the first emitted
+    function has no markers; it is unit preparation and still needs its
+    own breakdown.
+
+    - **Fork E: the link output is already deterministic.** The two mini
+      builds produced byte-identical executables (10,724,864 bytes).
+    - **Wall-clock noise is large.** The same input, with the same output
+      bytes, ran 30% slower the second time. Phase 5's speedup claim
+      needs repeated runs, not a single before/after pair.
+    - **Five functions take 75% of the full build.** `regex_match_node`,
+      `regex_match_seq`, `regex_match_at`, `regex_match_string_at` and
+      `__closure_938` each lower to 5.9–6.6 MB of assembly (for example
+      `regex_match_node` is 69,591 IR instructions). Each spends about
+      200s before its first emitted instruction and 800–1,380s in
+      assembly afterwards, about 6,700s together. The mini bundle stubs
+      out the regex/syntax-DSL code, which is why it builds 6× faster.
+    - **Per-function assembly time is roughly quadratic in assembly
+      size.** Most functions under 600 KB assemble in 1–12s, but from
+      980 KB to 1.6 MB to 6.1 MB the time goes 36s → 88s → 1,181s.
+      3.8× more text costs 13× more time, close to the 14× a square law
+      predicts.
+    - **What this means for the plan.** Everything before per-function
+      codegen takes about 500s, all of it sequential, so Phases 2–3 can
+      save at most that. Per-root parallelism (Phase 4/5) can't make the build
+      faster than its largest single root, about 1,600s. The quadratic
+      assembler, and why those regex functions are 69K instructions to
+      begin with, are separate fixes that pay off before any swarm
+      work: fixing them first shrinks the full build towards the
+      mini-bundle time. Neither has been investigated yet.
 - **Phase 1: Driver, ledger and codec, whole-program jobs.**
   - Re-run the prototype's `phase1_demo` against the current tree.
   - Add `patc1 swarm <in> <out>` with the coordinator, ledger and codec.
