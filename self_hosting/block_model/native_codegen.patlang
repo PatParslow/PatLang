@@ -1997,55 +1997,6 @@ end
 # A name with only one Store trivially satisfies condition 3 (nothing to
 # compare against) and keeps working exactly as the original single-store
 # pass did.
-# GitHub #223 continued investigation: `send(obj, "push", key, value)`
-# (x64_asm.patlang's xa_record_reloc/xa_declare_symbol and others -- see
-# that file's own "in-place (rust-runtime/src/ir/hosts.rs's ...)" comment)
-# is a native host primitive that appends `value` into `obj`'s own field
-# IN PLACE, bypassing PatLang's refcounting protocol entirely -- it never
-# increments `value`. A local whose last use is as that 4th argument must
-# never be auto-decremented at a terminal: the decrement pass has no way
-# to know `obj` now holds the only remaining reference, so decrementing
-# `value` there frees it while `obj`'s own field still points at it --
-# confirmed directly as the root cause of the LINK ERROR corruption
-# (dump of xa_record_reloc showed exactly this: `entry` built via
-# BuildList, pushed via `send(state, "push", "relocs", entry)`, then
-# `rt_list_rc_dec`'d at the function's own terminal). Excluding such a
-# name from the eligible set trades a bounded leak (never decremented,
-# same tradeoff already accepted elsewhere in this file) for correctness,
-# rather than trying to model what "send" does generically.
-make a function called bm_nc_name_escapes_via_send_push takes instrs, name returns escapes
-  let n = list_len(instrs)
-  let i = 0
-  while i < n do
-    let instr = list_get(instrs, i)
-    if list_get(instr, 0) == "CallHost" then
-      if list_get(instr, 1) == "send" then
-        if list_get(instr, 2) == 4 then
-          if i >= 1 then
-            let value_arg = list_get(instrs, i - 1)
-            if list_get(value_arg, 0) == "Load" then
-              if list_get(value_arg, 1) == name then
-                if i >= 3 then
-                  let verb_arg = list_get(instrs, i - 3)
-                  if list_get(verb_arg, 0) == "Const" then
-                    if list_get(verb_arg, 1) == "str" then
-                      if list_get(verb_arg, 2) == "push" then
-                        return true
-                      end
-                    end
-                  end
-                end
-              end
-            end
-          end
-        end
-      end
-    end
-    let i = i + 1
-  end
-  return false
-end
-
 make a function called bm_nc_reassignable_eligible_names takes instrs, captured_names returns names
   let n = list_len(instrs)
   let candidate_names = []
@@ -2110,9 +2061,7 @@ make a function called bm_nc_reassignable_eligible_names takes instrs, captured_
           let pj = pj + 1
         end
         if dominates_all then
-          if not bm_nc_name_escapes_via_send_push(instrs, name) then
-            let eligible = list_push(eligible, name)
-          end
+          let eligible = list_push(eligible, name)
         end
       end
     end
@@ -2335,12 +2284,28 @@ end
 # A compound operand (e.g. `list_push(xs, f(s))`) is simply skipped
 # over as a whole -- whatever `s` is doing inside `f` is `f`'s own,
 # already-covered concern, not this call site's.
+#
+# GitHub #223 (second bug): for BuildList (every operand of which becomes
+# a NEW element), the operand no longer has to be decrement-eligible;
+# list_push/list_set keep the eligible-only rule, since their own first
+# operand is the list being extended, not a new element. A container
+# slot owns a reference REGARDLESS of where its
+# operand came from -- an eligible local's increment balances that
+# local's own exit decrement, and a BORROWED name (a parameter, or any
+# local this function never decrements) needs one just as much, or the
+# new element merely aliases a reference somebody else will release.
+# Confirmed as the real remaining cause of the native Gen B link failure
+# ("undefined symbol 'rt_str_eq'"): x64_asm.patlang's xa_declare_symbol
+# built `[name, section, off, is_global]` from its PARAMETER `name`, so
+# the symbols tuple never owned the label string it pointed at
+# (spec_fixtures/native_ns_set_displaced_shared.patlang). The one
+# deliberate exclusion is the [value, __globals] pair lowering builds
+# immediately before every Return: that is the calling convention's own
+# result packing, unpacked by the caller at once, not a stored container
+# -- incrementing it would leak every returned parameter.
 make a function called bm_nc_insert_list_element_incs takes root, instrs returns out
   let captured_names = bm_nc_closure_captured_names(instrs)
   let eligible_names = bm_nc_reassignable_eligible_names(instrs, captured_names)
-  if list_len(eligible_names) == 0 then
-    return instrs
-  end
   let n = list_len(instrs)
   let insert_positions = []
   let insert_names = []
@@ -2349,10 +2314,20 @@ make a function called bm_nc_insert_list_element_incs takes root, instrs returns
     let instr = list_get(instrs, i)
     let op = list_get(instr, 0)
     let is_target = false
+    let any_operand = false
     let argc = 0
     if op == "BuildList" then
-      let is_target = true
-      let argc = list_get(instr, 1)
+      let is_return_pack = false
+      if (i + 1) < n then
+        if list_get(list_get(instrs, i + 1), 0) == "Return" then
+          let is_return_pack = true
+        end
+      end
+      if not is_return_pack then
+        let is_target = true
+        let any_operand = true
+        let argc = list_get(instr, 1)
+      end
     elif (op == "CallHost") and ((list_get(instr, 1) == "list_push") or (list_get(instr, 1) == "list_set")) then
       let is_target = true
       let argc = list_get(instr, 2)
@@ -2364,7 +2339,7 @@ make a function called bm_nc_insert_list_element_incs takes root, instrs returns
         let op_instr = list_get(instrs, cur)
         if list_get(op_instr, 0) == "Load" then
           let name = list_get(op_instr, 1)
-          if bm_list_contains(eligible_names, name) then
+          if any_operand or bm_list_contains(eligible_names, name) then
             let insert_positions = list_push(insert_positions, cur)
             let insert_names = list_push(insert_names, name)
           end

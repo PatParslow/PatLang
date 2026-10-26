@@ -846,8 +846,7 @@ sub-phase is planned under this specific item. Dict: confirmed (Phase
 3a's own note) that `--x64` has no separate Dict primitives at all, so
 nothing here needs separate Dict work either.
 
-### Phase 5 (GitHub #223): a native host primitive escaping a named
-local without the compiler's refcounting pass ever seeing it
+### Phase 5 (GitHub #223): stores that never took a reference to what they hold
 
 A genuinely different hazard shape from every phase above, found during
 a full Gen B self-compile fixpoint (`patc1.exe` compiling its own
@@ -881,46 +880,86 @@ or an inline list literal never bound to a name (`xa_declare_symbol`'s
 own symbol push), which the eligibility pass was never going to
 consider in the first place.
 
-**Fix**: `bm_nc_name_escapes_via_send_push`
-(`self_hosting/block_model/native_codegen.patlang`) excludes any local
-whose value is passed as the 4th argument to a 4-arg
-`send(..., "push", ...)` call from the decrement-eligible set entirely
--- trading a small, bounded leak (never decremented, same tradeoff
-already accepted elsewhere in this plan, e.g. Phase 4a's own retired-
-node leak note) for correctness, rather than trying to model what an
-opaque host primitive does with its argument generically.
+**First fix (commit 023fa68), since superseded**: `bm_nc_name_escapes_
+via_send_push` excluded any local passed as the value argument of a
+4-arg `send(..., "push", ...)` from the decrement-eligible set. It cured
+the corrupted relocation (a two-chunk `x64_link_native_chunks` probe's
+first relocation went from the tuple above to a sane `["text", 6,
+"patlang_wndproc_trampoline.wndproc_notsize_", "REL32", 0]`), but it
+patched one call shape in the compiler rather than the primitive that
+actually broke the ownership rule. It has been removed in favour of the
+runtime-level fix below, which makes the exclusion unnecessary (with it
+still in place, `entry` would simply leak).
 
-Verified: before the fix, a minimal two-chunk `x64_link_native_chunks`
-probe's first relocation read as the corrupted tuple above; after, it
-reads as a fully sane `["text", 6, "patlang_wndproc_trampoline.
-wndproc_notsize_", "REL32", 0]`. Full regression suite green:
-`native_codegen_check.sh` (57/57), `thread_safety_check.sh` (5/5), full
-language spec gate (178/178).
+**The second bug it exposed, and the root cause both share.** With the
+first fix applied, a natively compiled compiler got past the reloc-0
+symptom but still could not link anything: "undefined symbol
+'rt_str_eq'". `rt_str_eq` was correctly declared into the assembler's
+`symbols` list, then silently vanished from it as soon as the *next*
+label was declared. Direct instrumentation established, step by step:
 
-**Not yet closed**: fixing this exposed a SEPARATE, still-open bug.
-With Phase 5's fix applied, a full Gen B self-compile gets much further
-(past the corrupted-reloc-at-index-0 symptom entirely) but still fails
-compiling even a trivial program, with a different and genuine
-"undefined symbol 'rt_str_eq'" -- a real function, correctly declared
-into the assembler's own `symbols` list (confirmed present immediately
-after the push that adds it, and immediately after the next one or two
-pushes), that later reads as absent from the same list. Direct
-instrumentation of `rt_ns_push` itself (comparing a fresh readback
-against the value just stored, on every single "symbols" push across
-tens of thousands of calls) found zero internal inconsistency in that
-function -- whatever drops the entry is not a simple get/set mismatch
-inside `rt_ns_push`. Manually tracing `rt_list_push`'s own in-place
-(spare-capacity) branch, `rt_list_retire_trunc`, and `rt_list_node_rc_
-dec`'s retired-node cascade for the exact list length where this
-happens (symbols list length ~3878, right after a specific locally-
-unique label gets pushed) balances correctly for the straightforward
-case, so this needs either (a) a more targeted look at the actual
-buffer capacity/refcount values at that exact point (not inferred, read
-directly), or (b) ruling out instrumentation itself perturbing the
-refcounts under observation (the diagnostic code's own `rt_list_get`
-calls are not free). Left open for a follow-up investigation; the
-Phase 5 fix above stands on its own regardless of this second bug's
-outcome.
+- `rt_ns_push` itself was internally consistent on every push (a fresh
+  readback always matched the value just stored), and the node/buffer
+  refcounts and capacity read at the exact failing push (`node_rc=1`,
+  `buf_cap=4096`, `buf_rc=1`, in-place branch) followed the same pattern
+  as every preceding, working push -- not a premature free of the list.
+- Renaming every jump-target label to a fixed-width form
+  (`L_rt_str_eq_00000` etc.) changed nothing: same failure at the same
+  relative push, so label text and length were irrelevant.
+- A watch on one already-stored, never-touched slot of `symbols` showed
+  its contents changing between operations (a valid name, then null
+  bytes, then a name again): the *element's string* was being freed and
+  its memory reused, not the list.
+- Disabling `rt_ns_set`'s release of the displaced value made the whole
+  pipeline work end to end for the first time.
+
+Root cause: `rt_ns_set` (behind `send(obj, "set", ...)`, `set_var` and
+field assignment) stored `value` WITHOUT taking a reference to it, yet
+released one when that value was later displaced; `rt_ns_push` likewise
+stored without taking a reference. Separately, `bm_nc_insert_list_
+element_incs` only gave a new list element its own reference when the
+operand was a local this function itself decrements -- a *borrowed*
+operand such as a parameter got none. In `x64_asm.patlang`,
+`xa_process_line` builds a label name with `substr`, passes it to
+`xa_declare_symbol` (which stores it, as its PARAMETER `name`, into
+`[name, section, off, is_global]`), then stores the same name into
+`current_global`. Neither store owned a reference, so the name's one
+reference was shared; the next label displacing `current_global`
+released it, freeing a string the `symbols` tuple still pointed at.
+
+**Fix (runtime + compiler, both at the source of the rule)**:
+
+- `rt_ns_set` and `rt_ns_push` (`self_hosting/lib/x64_runtime.patlang`)
+  now take their own reference to every value they store, on both the
+  existing-key and new-key paths, symmetric with the release applied
+  when a stored value is displaced or its list dies.
+- `bm_nc_insert_list_element_incs` (`native_codegen.patlang`) now gives
+  every bare-`Load` operand of a `BuildList` its own reference, whether
+  or not that name is decrement-eligible, excluding only the
+  `[value, __globals]` pair lowering builds immediately before every
+  `Return` (the calling convention's result packing, not a stored
+  container). `list_push`/`list_set` keep the eligible-only rule, since
+  their first operand is the list being extended, not a new element.
+  This pass is still applied to single-block functions only; a borrowed
+  operand stored from inside a multi-block function remains unowned and
+  is the next place to look if this class of corruption reappears.
+
+Both changes trade the possibility of one unreleased reference (a caller
+handing a store a fresh temporary) for never freeing a value something
+still points at.
+
+Verified: new fixture `spec_fixtures/native_ns_set_displaced_shared.
+patlang` (2000 `substr`-built names, each pushed into a list element
+from a helper's parameter and stored into a field the next name
+displaces, with an unrelated allocation after each) -- 2000 of 2000
+entries corrupted before, 0 after, interpreter 0 throughout; added to
+`native_codegen_check.sh` and `native_codegen.feature`. Full regression
+suite green: `native_codegen_check.sh` (58/58), `refcounted_heap_native_
+check.sh` (13/13), `thread_safety_check.sh` (5/5), full language spec
+gate (178/178). End to end: a natively compiled compiler (the full
+bundle minus the regex/syntax-DSL machinery, replaced by a no-op stub)
+compiles a trivial program that runs and prints the right answer --
+the first time a natively compiled PatLang compiler has done so.
 
 ## 4. What this plan deliberately does not cover
 

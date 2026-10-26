@@ -413,6 +413,17 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+echo "Scenario: a borrowed name stored into a new list element and into an object field survives that field being overwritten (docs/plans/general-refcounting.md, Phase 5, GitHub #223)"
+rm -f self_hosting/build/native_ns_set_displaced_shared.exe
+BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_ns_set_displaced_shared.patlang self_hosting/build/native_ns_set_displaced_shared.exe --x64 2>&1)
+if [ -f self_hosting/build/native_ns_set_displaced_shared.exe ]; then
+  OUT=$(./self_hosting/build/native_ns_set_displaced_shared.exe 2>&1)
+  check_seq "2000 substr-built names, each pushed into a list element from a helper's PARAMETER and stored into an object field the next name then displaces, all still read back intact" "$OUT" "mismatches= 0"
+else
+  echo "  FAIL: the ns-set-displaced-shared fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
 echo ""
 echo "tests: $PASS passed, $FAIL failed"
 if [ "$FAIL" -eq 0 ]; then

@@ -1509,6 +1509,19 @@ end
 # exactly the unique-counter idioms CLAUDE.md section 7 documents
 # (__x64_str_counter, xa_id_counter, ...) -- reached constantly during
 # a real compile, not an edge case.
+#
+# GitHub #223 (second bug): the slot TAKES ITS OWN REFERENCE to `value`
+# on store, symmetric with the decrement it applies when that value is
+# later displaced. It used to store without incrementing, so a value the
+# caller still shared elsewhere (x64_asm.patlang's xa_process_line: a
+# substr-built label name stored both into a symbols tuple and into
+# "current_global") lost its only reference the moment the next label
+# displaced "current_global" -- freeing a string the symbols list still
+# pointed at (spec_fixtures/native_ns_set_displaced_shared.patlang: 2000
+# of 2000 entries corrupted before this, 0 after). Owning a reference
+# per stored slot is correct regardless of what the caller does with its
+# own; a caller handing over a fresh temporary costs one unreleased
+# reference, never a premature free.
 make a function called rt_ns_set takes store, key, value returns done
   rt_vars_lock()
   let table_addr = mem_vars_table_addr()
@@ -1539,15 +1552,15 @@ make a function called rt_ns_set takes store, key, value returns done
   while i < n do
     if rt_str_eq(rt_list_get(keys, i), key) then
       let old_val = rt_list_get(vals, i)
+      rt_rc_inc_if_refcounted(value)
       rt_list_set(vals, i, value)
-      if old_val != value then
-        rt_rc_dec_if_refcounted(old_val)
-      end
+      rt_rc_dec_if_refcounted(old_val)
       rt_vars_unlock()
       return true
     end
     let i = i + 1
   end
+  rt_rc_inc_if_refcounted(value)
   let new_keys = rt_list_push(keys, key)
   let new_vals = rt_list_push(vals, value)
   rt_list_set(ns, 1, new_keys)
@@ -1567,7 +1580,10 @@ end
 # is the only one exercised in practice; the "brand new key" tail below
 # exists for API completeness with rt_ns_set, not because anything here
 # currently depends on it.
-# GitHub #223: same leak shape as rt_ns_set (see its own header).
+# GitHub #223: same leak shape as rt_ns_set (see its own header), and
+# the same ownership rule: the appended element takes its own reference
+# to `value`, released later by the list's own cascade (general-
+# refcounting.md Phase 4c) when the list dies.
 make a function called rt_ns_push takes store, key, value returns done
   rt_vars_lock()
   let table_addr = mem_vars_table_addr()
@@ -1597,6 +1613,7 @@ make a function called rt_ns_push takes store, key, value returns done
   let i = 0
   while i < n do
     if rt_str_eq(rt_list_get(keys, i), key) then
+      rt_rc_inc_if_refcounted(value)
       let old_inner = rt_list_get(vals, i)
       let new_inner = rt_list_push(old_inner, value)
       rt_list_set(vals, i, new_inner)
@@ -1606,6 +1623,7 @@ make a function called rt_ns_push takes store, key, value returns done
     end
     let i = i + 1
   end
+  rt_rc_inc_if_refcounted(value)
   let new_keys = rt_list_push(keys, key)
   let new_vals = rt_list_push(vals, rt_list_push(rt_list_new(0), value))
   rt_list_set(ns, 1, new_keys)

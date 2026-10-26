@@ -826,6 +826,17 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
       checked against 2000 more unrelated allocations made afterward
       for real allocation pressure) shows zero corrupted elements.
 
+  Scenario: a borrowed name stored into a new list element and into an object field survives that field being overwritten (GitHub #223)
+    Given a helper that pushes [name, 7] onto an object's "syms" list
+      where name is the helper's own PARAMETER, and a caller that builds
+      name via substr, calls the helper, then sends "set" to store the
+      same name into the object's "cur" field
+    And the next name's own "set" displaces the previous one from "cur"
+    When it is run for 2000 distinct names as a real, fully native
+      executable, with an unrelated string allocation after each
+    Then every "syms" entry still holds its own original name
+    And the interpreter prints the identical result
+
   Scenario: apply with a runtime name and arguments dispatches natively
     Given a program using apply with two, one-statement and zero arguments
     When it is built and run as a real, fully native executable
