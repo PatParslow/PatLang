@@ -959,7 +959,12 @@ check.sh` (13/13), `thread_safety_check.sh` (5/5), full language spec
 gate (178/178). End to end: a natively compiled compiler (the full
 bundle minus the regex/syntax-DSL machinery, replaced by a no-op stub)
 compiles a trivial program that runs and prints the right answer --
-the first time a natively compiled PatLang compiler has done so.
+the first time a natively compiled PatLang compiler has done so. The
+full Gen B self-compile (`./patc1.exe self_hosting/build/patc1_all.
+patlang patc2.exe --x64`, complete bundle, ~1h50m) then produced a
+`patc2.exe` that compiled `print(1 + 2)` to a native executable printing
+`3` (all three steps exit 0). The trimmed bundle used for fast iteration
+is `self_hosting/build_patc1_mini.patlang`.
 
 ## 4. What this plan deliberately does not cover
 
