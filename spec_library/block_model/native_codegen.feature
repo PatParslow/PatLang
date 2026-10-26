@@ -882,3 +882,9 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
     Given band, bor, bxor, shl and shr on plain ints
     When it is built and run as a real, fully native executable
     Then it prints 8, 14, 6, 48 and 6, matching the interpreter
+
+  Scenario: a closure call's generated code does not grow with the number of functions in the program
+    Given a function that calls its closure parameter twice, in a program padded with 20 and then 80 unrelated functions
+    When both programs are translated to native FuncIR
+    Then that function has the same instruction count in both, under 200
+    And closure calls with one and two arguments, unit-padded extra parameters, captures and continuation-passing recursion still print the interpreter's values

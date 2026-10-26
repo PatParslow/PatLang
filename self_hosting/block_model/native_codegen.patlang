@@ -662,107 +662,122 @@ make a function called bm_nc_compute_pure_fns takes prog, roots returns pure_nam
   return pure_names
 end
 
-# CallDynamic: a runtime name chooses the callee, so this emits a chain of
-# rt_str_eq comparisons, one per declared function that takes AT LEAST the
-# n_extra arguments supplied -- the same dispatch shape Emit uses for an
-# event name. Stack on entry: extra args (written order, deepest first),
-# then the callee-name string, then __globals on top. Parameters the call
-# does not supply are passed as unit (the interpreter leaves them unbound;
-# reading one is a loud error there). A name that matches nothing reaches a
-# guaranteed contract failure, which does not return.
+# CallDynamic: a runtime name chooses the callee. Stack on entry: extra args
+# (written order, deepest first), then the callee-name string, then
+# __globals on top -- exactly the argument order of a call to the shared
+# dispatcher for this arity (bm_nc_build_call_dynamic_funcirs, below), so
+# a site is one Call plus the usual [value, final_globals] unpack.
+#
+# This used to inline the whole dispatch chain (one rt_str_eq branch per
+# callable in the program) at every site: ~6,300 instructions per closure
+# call in the full compiler bundle, which made the continuation-passing
+# regex matcher's functions 69,591 instructions each and about 75% of a
+# full self-compile's time (docs/plans/swarm-compiler.md, Phase 0 root
+# causes). Checked by self_hosting/block_model/tools/
+# call_dynamic_size_check.patlang.
 make a function called bm_nc_emit_call_dynamic takes out, block_name, uniq, n_extra, prog returns out2
-  let g_l = bm_nc_local(block_name, uniq, "g")
-  let f_l = bm_nc_local(block_name, uniq, "f")
-  let out = list_push(out, ["Store", g_l])
-  let out = list_push(out, ["Store", f_l])
-  let k = n_extra - 1
-  while k >= 0 do
-    let out = list_push(out, ["Store", bm_nc_local(block_name, uniq, "a" + k)])
-    let k = k - 1
-  end
-  # GitHub #223 full-test follow-up: this function (the apply()-by-name
-  # dispatch trampoline's own codegen -- one "if name==X then call X"
-  # branch per callable the whole program defines) used to backpatch
-  # each branch's own jif_pos AND every done_positions entry via
-  # list_set, called once per matching callable directly on the
-  # ever-growing `out` list. Confirmed as the real, final remaining
-  # bottleneck for the single largest real-world case
-  # ("__closure_invoke" on a genuine ~2400-block Gen B self-compile,
-  # still stalling for minutes after the first three fixes resolved
-  # earlier, broader stalls) by reading rust-runtime/src/ir/hosts.rs's
-  # own host_list_set directly: it ALWAYS clones its list argument
-  # before calling Arc::make_mut, since the caller's own reference
-  # (args[0]) keeps the refcount >= 2 for the whole call -- so every
-  # list_set is a genuine O(current length) clone, not O(1), regardless
-  # of how the PatLang-level caller discards the old value afterward.
-  # Fixed by recording every backpatch (position -> replacement
-  # instruction) in a get/set_var hashmap instead of mutating `out`
-  # directly, then rebuilding it in ONE O(n) pass at the end -- O(n+k)
-  # total for k backpatches instead of O(n*k). Keys are namespaced by
-  # block_name+uniq (this function's own call-site identity) so
-  # concurrent/later calls for a DIFFERENT CallDynamic site never
-  # collide.
+  let out = list_push(out, ["Call", bm_nc_call_dynamic_fn_name(n_extra), n_extra + 2])
+  return bm_nc_emit_call_unpack(out, block_name, "" + uniq + "_cd")
+end
+
+# The dispatcher is named like any other block-model callee ("bm_fn_"
+# prefix), because codegen_x64.patlang recognises a block-model Call by
+# that prefix to know its result is a [value, final_globals] list
+# (x64_bm_fn_prefixed). The "__" after it is reserved for synthesized
+# names, so it cannot collide with a declared function.
+make a function called bm_nc_call_dynamic_fn_name takes n_extra returns fname
+  return bm_nc_fn_name("__cdyn_" + n_extra)
+end
+
+# Every distinct CallDynamic arity in the program, in order of first
+# appearance (deterministic, so the FuncIR list is too).
+make a function called bm_nc_call_dynamic_arities takes prog returns arities
   let blocks = bi_program_blocks(prog)
-  let bn = list_len(blocks)
-  let done_positions = []
-  let bp_prefix = "bm_cdyn_bp__" + block_name + "__" + uniq + "__"
+  let arities = []
   let bi = 0
-  while bi < bn do
-    let cname = bi_block_name(list_get(blocks, bi))
-    let declared = list_len(bi_block_params(list_get(blocks, bi))) - 1
-    if bm_nc_is_callable_name(cname) and (declared >= n_extra) then
-      let out = list_push(out, ["Load", f_l])
-      let out = list_push(out, ["Const", "str", cname])
-      let out = list_push(out, ["Call", "rt_str_eq", 2])
-      let out = list_push(out, ["__RawJumpIfFalse", 0])
-      let jif_pos = list_len(out) - 1
-      let ai = 0
-      while ai < n_extra do
-        let out = list_push(out, ["Load", bm_nc_local(block_name, uniq, "a" + ai)])
-        let ai = ai + 1
+  while bi < list_len(blocks) do
+    let instrs = bi_block_instrs(list_get(blocks, bi))
+    let i = 0
+    while i < list_len(instrs) do
+      let instr = list_get(instrs, i)
+      if list_get(instr, 0) == 915129 then # "CallDynamic"
+        let n_extra = list_get(instr, 1)
+        if not bm_list_contains(arities, n_extra) then
+          let arities = list_push(arities, n_extra)
+        end
       end
-      let pi = n_extra
-      while pi < declared do
-        let out = list_push(out, ["Const", "unit", ""])
-        let pi = pi + 1
-      end
-      let out = list_push(out, ["Load", g_l])
-      let out = list_push(out, ["Call", bm_nc_fn_name(cname), declared + 1])
-      let out = bm_nc_emit_call_unpack(out, block_name, "" + uniq + "_" + bi)
-      let out = list_push(out, ["__RawJump", 0])
-      let done_positions = list_push(done_positions, list_len(out) - 1)
-      set_var(bp_prefix + "e_" + jif_pos, true)
-      set_var(bp_prefix + "v_" + jif_pos, ["__RawJumpIfFalse", list_len(out)])
+      let i = i + 1
     end
     let bi = bi + 1
   end
-  let out = list_push(out, ["Const", "str", "bm_native"])
-  let out = list_push(out, ["Const", "str", "assert"])
-  let out = list_push(out, ["Const", "str", "apply: no declared function with that name and enough parameters"])
-  let out = list_push(out, ["Const", "bool", "false"])
-  let out = list_push(out, ["CallHost", "contract_check", 4])
-  let out = list_push(out, ["Store", bm_nc_prefix(block_name, "__bm_discard")])
-  let out = list_push(out, ["Const", "unit", ""])
-  let end_pos = list_len(out)
-  let di = 0
-  while di < list_len(done_positions) do
-    let dp = list_get(done_positions, di)
-    set_var(bp_prefix + "e_" + dp, true)
-    set_var(bp_prefix + "v_" + dp, ["__RawJump", end_pos])
-    let di = di + 1
-  end
-  let final_out = []
-  let oi = 0
-  let on = list_len(out)
-  while oi < on do
-    if get("__vars", bp_prefix + "e_" + oi) == true then
-      let final_out = list_push(final_out, get("__vars", bp_prefix + "v_" + oi))
-    else
-      let final_out = list_push(final_out, list_get(out, oi))
+  return arities
+end
+
+# One dispatcher FuncIR per arity used. Parameters: the n_extra supplied
+# args, the callee-name string, then __globals. Body: a chain of rt_str_eq
+# comparisons, one per declared function or closure body taking AT LEAST
+# n_extra arguments (in block order, the same order the inline chain used);
+# the match is called with parameters the call does not supply passed as
+# unit (the interpreter leaves them unbound; reading one is a loud error
+# there), and its own [value, final_globals] result is returned unchanged.
+# A name that matches nothing reaches a guaranteed contract failure, which
+# does not return. Each branch is exactly 7 + declared instructions, so
+# every JumpIfFalse target is known when it is emitted.
+make a function called bm_nc_build_call_dynamic_funcirs takes prog returns funcirs
+  let blocks = bi_program_blocks(prog)
+  let bn = list_len(blocks)
+  let arities = bm_nc_call_dynamic_arities(prog)
+  let funcirs = []
+  let ai = 0
+  while ai < list_len(arities) do
+    let n_extra = list_get(arities, ai)
+    let params = []
+    let k = 0
+    while k < n_extra do
+      let params = list_push(params, "__cdyn_a" + k)
+      let k = k + 1
     end
-    let oi = oi + 1
+    let params = list_push(params, "__cdyn_f")
+    let params = list_push(params, "__cdyn_g")
+    let body = []
+    let bi = 0
+    while bi < bn do
+      let cname = bi_block_name(list_get(blocks, bi))
+      let declared = list_len(bi_block_params(list_get(blocks, bi))) - 1
+      if bm_nc_is_callable_name(cname) and (declared >= n_extra) then
+        let next_branch = list_len(body) + 7 + declared
+        let body = list_push(body, ["Load", "__cdyn_f"])
+        let body = list_push(body, ["Const", "str", cname])
+        let body = list_push(body, ["Call", "rt_str_eq", 2])
+        let body = list_push(body, ["JumpIfFalse", next_branch])
+        let k = 0
+        while k < n_extra do
+          let body = list_push(body, ["Load", "__cdyn_a" + k])
+          let k = k + 1
+        end
+        let k = n_extra
+        while k < declared do
+          let body = list_push(body, ["Const", "unit", ""])
+          let k = k + 1
+        end
+        let body = list_push(body, ["Load", "__cdyn_g"])
+        let body = list_push(body, ["Call", bm_nc_fn_name(cname), declared + 1])
+        let body = list_push(body, ["Return"])
+      end
+      let bi = bi + 1
+    end
+    let body = list_push(body, ["Const", "str", "bm_native"])
+    let body = list_push(body, ["Const", "str", "assert"])
+    let body = list_push(body, ["Const", "str", "apply: no declared function with that name and enough parameters"])
+    let body = list_push(body, ["Const", "bool", "false"])
+    let body = list_push(body, ["CallHost", "contract_check", 4])
+    let body = list_push(body, ["Store", "__cdyn_discard"])
+    let body = list_push(body, ["Const", "unit", ""])
+    let body = list_push(body, ["Return"])
+    let funcirs = list_push(funcirs, ["FuncIR", bm_nc_call_dynamic_fn_name(n_extra), params, body, []])
+    let ai = ai + 1
   end
-  return final_out
+  return funcirs
 end
 
 make a function called bm_nc_translate_block_instrs takes block_name, instrs, print_op, prog, mode returns out
@@ -3606,6 +3621,13 @@ make a function called bm_to_real_funcir takes prog, print_op returns funcirs
   let ci = 0
   while ci < list_len(callee_funcirs) do
     let funcirs = list_push(funcirs, list_get(callee_funcirs, ci))
+    let ci = ci + 1
+  end
+  # One shared dispatcher per CallDynamic arity (bm_nc_emit_call_dynamic).
+  let cdyn_funcirs = bm_nc_build_call_dynamic_funcirs(prog)
+  let ci = 0
+  while ci < list_len(cdyn_funcirs) do
+    let funcirs = list_push(funcirs, list_get(cdyn_funcirs, ci))
     let ci = ci + 1
   end
   return funcirs

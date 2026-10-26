@@ -18,6 +18,8 @@ is the implementation plan that follows from them.
   complement. This compiler needs no language change to work; contracts
   would later sharpen ownership summaries and give object-level effect
   boundaries (§8).
+- **`swarm-implementation-note.md`**: expressiveness
+  and contract precision; what it changes for this compiler is in §8a.
 - **`general-refcounting.md`**: unaffected. The swarm compiler runs the
   same `native_codegen.patlang` passes per function, so every refcounting
   fix lands in both compilers at once.
@@ -207,7 +209,86 @@ and ends with the §5 parity gate plus the standing suites
       assembler, and why those regex functions are 69K instructions to
       begin with, are separate fixes that pay off before any swarm
       work: fixing them first shrinks the full build towards the
-      mini-bundle time. Neither has been investigated yet.
+      mini-bundle time.
+  - **Root causes (2026-10-26, same day).**
+    - **Quadratic assembly was `split_lines`.** `x64_assemble_chunk`
+      splits the whole function's assembly text with `split_lines`
+      (`self_hosting/lib/includes.patlang`), which called
+      `char_code(s, i)` once per character of the entire text. Both
+      runtimes check `s.is_ascii()` over the whole string on every call
+      (`hosts.rs` `host_char_code`, `codegen.rs`'s `char_code` prelude),
+      so the split was O(n²). On generated label-only assembly, the split
+      went 526ms → 2,123ms for 20K → 40K lines, while `xa_process_line`
+      over the same lines went 339ms → 699ms. Include expansion also runs
+      it over each file whole, and `patc1_all.patlang` is one 2.4 MB
+      file, so it was also most of the 136–152s before `lexing`.
+    - **The 69K-instruction regex functions were inlined dynamic
+      dispatch.** Before code generation, `regex_match_node`'s
+      compilation island is 4 blocks and 493 instructions, in the full
+      bundle as in a 2-line test program. The island holds 4 functions
+      because tail calls lower to `JumpBlock`. `bm_nc_translate_block_instrs`
+      then expanded each of its 11 `CallDynamic` instructions (every
+      closure call such as `k(pos + 1)`) through
+      `bm_nc_emit_call_dynamic`. That function inlined an `rt_str_eq`
+      chain with one branch for **every callable in the whole program**
+      taking enough arguments. That was 313 instructions per site in the
+      test program and about 6,300 in the full bundle. Each root that
+      tail-calls into the island (`regex_match_at`,
+      `regex_match_string_at`, `__closure_938`) got its own copy, so the
+      same ~69.5K instructions were generated and assembled five times.
+  - **Fixes (2026-10-26).**
+    - `split_lines` now cuts the text into pieces of at most 1,024
+      characters by repeated halving with `substr` (O(n log n)), scans
+      only the pieces, and joins a line that spans pieces in a string
+      builder. No new host primitive.
+      `self_hosting/tools/split_lines_check.patlang` checks 13 edge
+      cases against the old algorithm and the scaling: 40K → 80K lines
+      went from 3,017 → 12,597ms (RED) to 197 → 373ms.
+    - Each `CallDynamic` site is now one `Call` to a shared dispatcher
+      per arity, `bm_fn___cdyn_<n>`, which holds the same comparison
+      chain in the same order (`bm_nc_build_call_dynamic_funcirs`). The
+      `bm_fn_` prefix keeps codegen_x64's block-model call unpacking
+      (`x64_bm_fn_prefixed`) applying to it.
+      `self_hosting/block_model/tools/call_dynamic_size_check.patlang`
+      lowers one function with two closure calls alongside 20 and then
+      80 filler functions: 868 vs 3,028 instructions before (RED), 66
+      and 66 after. A native fixture covers one- and two-argument calls,
+      unit padding, captures, continuation-passing recursion, and calls
+      from main, a loop and a function.
+    - Standing suites after both fixes: `native_codegen_check.sh`
+      61/61, `refcounted_heap_native_check.sh` 13/13,
+      `thread_safety_check.sh` 5/5, language spec 178/178.
+    - **Full Gen B self-compile, cleared cache: 8,970s → 1,050s.**
+
+      | Stage | before | after |
+      |---|---|---|
+      | start → `lexing` | 152s | 7s |
+      | lex + parse | 4s | 6s |
+      | lowering | 142s | 78s |
+      | `lowering_done` → first `ecn_emit_start` | 208s | 37s |
+      | per-function codegen + assembly | 8,335s | 836s |
+      | apply table + link | 121s | 75s |
+
+      The resulting compiler is 11.1 MB (was 15.3 MB) and compiles
+      `print(1 + 2)` correctly. It still segfaults compiling a closure
+      that captures a top-level `let`. A Gen B built before these fixes
+      crashes identically, so this is an existing bug, filed as #228.
+    - **Shared tail-call islands: measured, not done.** Across the full
+      bundle, the 829 call roots' islands total 195,211 instructions
+      against 170,929 with every block counted once, so absorbing other
+      functions through tail calls duplicates at most about 24K
+      instructions (≤12%). Most multi-block islands are a function's
+      own loop blocks. Sharing islands needs a real native tail call:
+      callers push arguments and pop them after the call, so a tail jump
+      can only reuse the frame when the target takes no more arguments
+      than the current function. The regex case is the opposite
+      (`regex_match_node`, 5 with `__globals`, tail-calls
+      `regex_match_seq`, 6). Ordinary calls would break constant-stack
+      tail recursion. That calling-convention change is not worth ≤12%
+      on its own; it is left for when Phase 4/5 measurements show island
+      size on the critical path.
+    - Both fixes change generated code, so the byte-parity baseline for
+      swarm Phase 1 is taken after them.
 - **Phase 1: Driver, ledger and codec, whole-program jobs.**
   - Re-run the prototype's `phase1_demo` against the current tree.
   - Add `patc1 swarm <in> <out>` with the coordinator, ledger and codec.
@@ -315,6 +396,76 @@ that should not be conflated:
   the subject of `contract-bounded-object-compilation.md`, and the
   natural point to add "mutable ambient global" diagnostics is once
   Phase 7 consumes such summaries.
+
+## 8a. Implementation note: expressiveness and contract precision
+
+`swarm-implementation-note.md` follows the
+independent-object compilation description. Its central rule: an object
+implementation observes another only through a contract, and
+**imprecision lowers guarantees and optimisation, never validity**.
+Most of it concerns the language and `contract-bounded-object-compilation.md`.
+These parts bear directly on this compiler:
+
+- **Never stricter than `patc1` (note §§19, 22–23).** The swarm driver
+  must never reject a program `patc1` accepts. Where a job can't
+  compute a precise fact (a summary, a capture set, a dispatch target),
+  it emits the conservative one, which is what the byte-parity gate
+  (§5) already enforces in practice. Validators (§3) check that an
+  artefact is well formed, never that a program is "swarm-friendly".
+- **One compiled implementation, many uses (note §1).** The note says
+  identical machine code must not be generated once per use. Phase 0
+  found that violated twice. `CallDynamic` inlined a whole-program
+  dispatch chain at every closure call; it now calls one dispatcher per
+  arity, which took the full self-compile from 8,970s to 1,050s together
+  with the `split_lines` fix. Each root that tail-calls into an island
+  still re-emits the whole island; that duplication is at most 12% of
+  the bundle's instructions and is deferred (Phase 0 fixes). Smaller,
+  more even J7/J8 units also help Phase 5's batching.
+- **Cycles are not islands (note §15).** Mutually tail-recursive
+  functions (`regex_match_node`/`_seq`/`_alt`/`_repeat`) are merged
+  into one JumpBlock island today. The note's guidance is to compile
+  each implementation against the other's contract, which here is its
+  calling convention, and only merge where the cycle is in the contracts
+  themselves. For J7 that means a root's island should stop at another
+  root's entry block (a real call or an explicit tail jump to a shared
+  symbol) instead of absorbing it. This is a later refinement: it
+  changes code shape, so it needs its own parity re-baseline.
+- **Program-wide facts become per-unit descriptors where they can
+  (note §§12, 14).** The note lowers closures to an implementation plus
+  an environment descriptor, and infers minimal contracts locally.
+  Today `bm_nc_program_has_any_closures` disables the multi-block
+  string-refcount pass for the *whole program* if any closure exists.
+  Under the note it becomes a per-declaration capture descriptor in
+  `DeclBlocks`, and B2 shrinks to the facts that really are global
+  (`uses_box`, the dispatch-by-name root set). It changes what the
+  pass does for every program with a closure, so it belongs to Phase 7.
+- **Registrations are explicit dependencies (note §§4, 13).** `when`
+  handlers, `rule`/`action_add`, and functions reached only by runtime
+  name (`apply`, `fiber_new`, `parallel_map`, `budgeted_run`; CLAUDE.md
+  §9) are the compiler's ambient dependencies. J6 should record them as
+  explicit `ProgramFacts` entries (registry, kind, target name), never
+  rediscover them by scanning. That also turns the §9 "keep the
+  registry exhaustive" rule into something a validator can check.
+- **Workers receive immutable inputs only (note §10).** This matches
+  Fork D: worker processes get artefacts and job files, never live
+  runtime state, so nothing a worker needs has to be serialisable
+  beyond the §3 codec.
+- **Metadata shape (note §18).** The ledger's artefact identity (§3)
+  covers `implementation_hash`, `compiler_contract_hash` (the
+  transformation version) and required inputs. Phase 6 adds the
+  distinction that matters for invalidation: a dependant that only uses
+  a callee's *contract* (name, arity, calling convention) is
+  invalidated only when that changes. A dependant that has inlined or
+  absorbed the callee's *implementation* (today's islands and dispatch
+  chains) depends on its body, and that edge has to be recorded
+  separately. Removing the inlining above shrinks that second kind of
+  edge, and so the rebuild scope.
+- **Out of scope here:** assurance levels (note §16), reflection
+  classes (§5), binding policies (§7), sealed/open contracts (§8),
+  identity policy (§9), foreign boundaries (§11) and runtime `eval`
+  (§6). All are language-side; one point to carry forward is that a
+  runtime compilation request must name its syntax environment, the
+  same `DslEnv` B0 makes explicit here.
 
 ## 9. Explicitly out of scope
 

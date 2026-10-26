@@ -1,0 +1,72 @@
+# Scenario: a closure call's generated code does not grow with the program
+#   Given a function `twice(k, x)` that calls its closure parameter twice
+#   And the same program padded with 20, then 80, unrelated declared functions
+#   When both are lowered and translated by bm_to_real_funcir
+#   Then bm_fn_twice has the same instruction count in both programs
+#   And it is under 200 instructions
+#
+# Why: bm_nc_emit_call_dynamic used to inline, at every CallDynamic site, a
+# string-compare chain with one branch per callable in the whole program --
+# ~6,300 instructions per closure call in the full compiler bundle, which
+# made regex_match_node 69,591 instructions and ~25 minutes to compile
+# (docs/plans/swarm-compiler.md, Phase 0 root causes).
+#
+# Run: rust-runtime/target/release/pat.exe --ir-run self_hosting/block_model/tools/call_dynamic_size_check.patlang
+include "../../lib/lexer.patlang"
+include "../../lib/parser.patlang"
+include "../../lib/codegen_x64.patlang"
+include "../../lib/x64_build.patlang"
+include "../block_ir.patlang"
+include "../free_vars.patlang"
+include "../flight_check.patlang"
+include "../classes.patlang"
+include "../lower.patlang"
+include "../native_codegen.patlang"
+
+make a function called program_with_fillers takes n returns src
+  let b = sb_new()
+  sb_push(b, "fn twice(k, x) {\n  let y = k(x)\n  return k(y)\n}\n")
+  let i = 0
+  while i < n do
+    sb_push(b, "fn filler_" + i + "(a, b, c) {\n  return a + b + c\n}\n")
+    let i = i + 1
+  end
+  sb_push(b, "print(twice(|v| { return v + 1 }, 5))\n")
+  return sb_str(b)
+end
+
+make a function called twice_size takes n returns size
+  let prog = bm_lower_program(parse_program(tokenize(program_with_fillers(n))))
+  let funcirs = bm_to_real_funcir(prog, "Call")
+  let i = 0
+  while i < list_len(funcirs) do
+    let f = list_get(funcirs, i)
+    if list_get(f, 1) == "bm_fn_twice" then
+      return list_len(list_get(f, 3))
+    end
+    let i = i + 1
+  end
+  return -1
+end
+
+let small = twice_size(20)
+let big = twice_size(80)
+print("bm_fn_twice instructions: 20 fillers " + small + ", 80 fillers " + big)
+let failures = 0
+if small < 0 then
+  print("FAIL: bm_fn_twice not found")
+  let failures = failures + 1
+end
+if small != big then
+  print("FAIL: closure-call code grows with the number of declared functions")
+  let failures = failures + 1
+end
+if big >= 200 then
+  print("FAIL: bm_fn_twice is " + big + " instructions (limit 200)")
+  let failures = failures + 1
+end
+if failures == 0 then
+  print("call_dynamic_size_check: PASS")
+else
+  print("call_dynamic_size_check: FAIL (" + failures + ")")
+end

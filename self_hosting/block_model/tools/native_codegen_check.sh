@@ -435,6 +435,19 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+echo "Scenario: a closure call's generated code does not grow with the number of functions in the program (docs/plans/swarm-compiler.md, Phase 0)"
+OUT=$(rust-runtime/target/release/pat.exe --ir-run self_hosting/block_model/tools/call_dynamic_size_check.patlang 2>&1)
+check "the same instruction count with 20 and 80 filler functions, under 200" "$OUT" "call_dynamic_size_check: PASS"
+rm -f self_hosting/build/native_call_dynamic_shared.exe
+BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_call_dynamic_shared.patlang self_hosting/build/native_call_dynamic_shared.exe --x64 2>&1)
+if [ -f self_hosting/build/native_call_dynamic_shared.exe ]; then
+  OUT=$(./self_hosting/build/native_call_dynamic_shared.exe 2>&1)
+  check_seq "closure calls through the shared dispatcher print the interpreter's values" "$OUT" "a=105 b=42 c=42 d=55 e=20"
+else
+  echo "  FAIL: the call-dynamic-shared fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
 echo ""
 echo "tests: $PASS passed, $FAIL failed"
 if [ "$FAIL" -eq 0 ]; then

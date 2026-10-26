@@ -23,6 +23,12 @@ run_one() {  # label input output
   wait $pid
   echo "END $(date +%s%3N) exit=$?" >> $log
 }
+mkdir -p $OUT
+# With arguments, time one compile: phase0_measure.sh <label> <input> <output>
+if [ $# -ge 3 ]; then
+  run_one "$1" "$2" "$3"
+  exit 0
+fi
 run_one mini1 self_hosting/build/patc1_mini_all.patlang $OUT/mini1.exe
 run_one mini2 self_hosting/build/patc1_mini_all.patlang $OUT/mini2.exe
 if cmp -s $OUT/mini1.exe $OUT/mini2.exe; then echo "DETERMINISM identical" > $OUT/determinism.txt; else cmp $OUT/mini1.exe $OUT/mini2.exe > $OUT/determinism.txt 2>&1; echo "differing bytes: $(cmp -l $OUT/mini1.exe $OUT/mini2.exe | wc -l)" >> $OUT/determinism.txt; fi

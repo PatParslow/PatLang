@@ -1,0 +1,126 @@
+# split_lines (self_hosting/lib/includes.patlang) correctness and scaling.
+#
+# Scenario: split_lines keeps its exact semantics
+#   Given texts with CRLF endings, blank lines, a trailing newline and none
+#   When each is split with split_lines
+#   Then the result matches a straightforward reference split exactly
+#
+# Scenario: split_lines is linear in the length of the text
+#   Given assembly-like text of 40,000 and then 80,000 lines
+#   When each is split with split_lines
+#   Then doubling the text costs well under 4x the time (limit 3x)
+#
+# Why: x64_assemble_chunk splits each function's whole assembly text with
+# split_lines, and the old per-character char_code loop re-checked
+# is_ascii() over the entire string on every call -- O(n^2), which made a
+# 6 MB function take ~20 minutes to assemble (docs/plans/swarm-compiler.md,
+# Phase 0 root causes).
+#
+# Run: rust-runtime/target/release/pat.exe --ir-run self_hosting/tools/split_lines_check.patlang
+include "../lib/includes.patlang"
+
+# The original algorithm, kept here as the semantic reference. Only fed
+# small inputs, where its quadratic cost does not matter.
+make a function called ref_split_lines takes s returns lines
+  let out = []
+  let n = s.length
+  let start = 0
+  let i = 0
+  while i < n do
+    if char_code(s, i) == 10 then
+      let out = list_push(out, strip_trailing_cr(substr(s, start, i - start)))
+      let start = i + 1
+    end
+    let i = i + 1
+  end
+  if start < n then
+    let out = list_push(out, strip_trailing_cr(substr(s, start, n - start)))
+  end
+  return out
+end
+
+make a function called lists_equal takes a, b returns yes
+  if list_len(a) != list_len(b) then
+    return false
+  end
+  let i = 0
+  while i < list_len(a) do
+    if list_get(a, i) != list_get(b, i) then
+      return false
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+make a function called gen_asm takes reps returns s
+  let b = sb_new()
+  let i = 0
+  while i < reps do
+    if (i % 7) == 0 then
+      sb_push(b, "\n")
+    elif (i % 5) == 0 then
+      sb_push(b, "    mov rax, [rbp-" + (i % 400) + "]\r\n")
+    else
+      sb_push(b, ".L" + i + ":\n")
+    end
+    let i = i + 1
+  end
+  sb_push(b, "    ret")
+  return sb_str(b)
+end
+
+make a function called long_line takes n returns s
+  let b = sb_new()
+  let i = 0
+  while i < n do
+    sb_push(b, "x")
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+let failures = 0
+let nl = chr(10)
+let cr = chr(13)
+let cases = ["", nl, nl + nl, "a", "a" + nl, "a" + nl + "b", "a" + cr + nl + "b" + cr + nl,
+  nl + "a" + nl + nl + "b" + nl, cr, "a" + cr, long_line(5000) + nl + "tail",
+  "head" + nl + long_line(3000) + cr + nl + long_line(2100), gen_asm(3000)]
+let ci = 0
+while ci < list_len(cases) do
+  let c = list_get(cases, ci)
+  if not lists_equal(split_lines(c), ref_split_lines(c)) then
+    print("FAIL semantics: case " + ci + " (length " + c.length + ")")
+    let failures = failures + 1
+  end
+  let ci = ci + 1
+end
+print("semantics: " + to_num(list_len(cases)) + " cases checked")
+
+let small = gen_asm(40000)
+let big = gen_asm(80000)
+let t0 = now_ms()
+let a = split_lines(small)
+let t1 = now_ms()
+let b = split_lines(big)
+let t2 = now_ms()
+let ms_small = t1 - t0
+let ms_big = t2 - t1
+if ms_small < 1 then
+  let ms_small = 1
+end
+print("scaling: 40000 lines " + ms_small + "ms, 80000 lines " + ms_big + "ms")
+if ms_big > (ms_small * 3) then
+  print("FAIL scaling: doubling the input cost more than 3x")
+  let failures = failures + 1
+end
+if list_len(b) != 80001 then
+  print("FAIL scaling: expected 80001 lines, got " + to_num(list_len(b)))
+  let failures = failures + 1
+end
+
+if failures == 0 then
+  print("split_lines_check: PASS")
+else
+  print("split_lines_check: FAIL (" + failures + ")")
+end
