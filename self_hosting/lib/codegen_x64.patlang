@@ -748,9 +748,29 @@ make a function called x64_taint_one_pass takes instrs, locals_taint returns res
 end
 
 make a function called x64_analyze_dynamic_bins takes instrs returns dyn_bin_indices
+  return x64_analyze_dynamic_bins_from(instrs, [])
+end
+
+# GitHub #229: a function's PARAMETERS start out tainted -- a caller can
+# pass anything (a boxed Float, a Rational, a BigInt, a String), so a Bin on
+# a parameter is dynamic. Leaving them untainted compiled `a > b` on two
+# parameters as a raw word compare: a boxed Float's POINTER against an int.
+# The dynamic code keeps an inline fixnum fast path, so plain ints pay only
+# that check.
+make a function called x64_analyze_dynamic_bins_for_params takes instrs, params returns dyn_bin_indices
+  let map = []
+  let pi = 0
+  while pi < params.length do
+    let map = x64_taint_set(map, params[pi], true)
+    let pi = pi + 1
+  end
+  return x64_analyze_dynamic_bins_from(instrs, map)
+end
+
+make a function called x64_analyze_dynamic_bins_from takes instrs, initial_map returns dyn_bin_indices
   let n = to_num(list_len(instrs))
   let max_passes = n + 10
-  let map = []
+  let map = initial_map
   let dyn_bin_indices = []
   let pass = 0
   let bailed = false
@@ -835,8 +855,81 @@ end
 # the common, realistic cases without a full general-dataflow origin
 # tracker, matching this file's own established "named scope limit,
 # not an oversight" convention.
+# i64_to_f64 returns raw float64 bits too (x64_runtime.patlang's float
+# formatting subtracts it from a raw float); listing it matters since
+# GitHub #229, which computes a Bin dynamically when its non-float side is
+# an unclassified call result.
 make a function called x64_float_producing_host_names returns names
-  return ["sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "log", "exp", "pow", "fabs"]
+  return ["sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "log", "exp", "pow", "fabs", "i64_to_f64"]
+end
+
+# GitHub #229: the one-argument math functions that follow the numeric
+# tower when their argument is NOT proven raw float64 bits: such a call
+# goes to x64_runtime.patlang's rt_sqrt_dynamic / rt_math1_dynamic (a
+# tagged value in, a tagged value out -- exact Int/Rational for a perfect
+# square, a boxed Float otherwise) instead of handing libm the argument's
+# raw bits. Its result is then a tagged value, not raw float bits, so the
+# float analysis treats these like abs/ceil: float only when the argument
+# was. Returns the rt_math1_dynamic function code, or -1 (-2 for sqrt,
+# which has its own exact entry point).
+make a function called x64_math1_dynamic_code takes name returns code
+  let names = ["sin", "cos", "tan", "asin", "acos", "atan", "log", "exp"]
+  if name == "sqrt" then
+    return 0 - 2
+  end
+  let i = 0
+  while i < names.length do
+    if names[i] == name then
+      return i
+    end
+    let i = i + 1
+  end
+  return 0 - 1
+end
+
+# GitHub #229: rt_roundlike_dynamic's mode for ceil/round/trunc, -1 otherwise.
+make a function called x64_roundlike_dynamic_mode takes name returns mode
+  if name == "ceil" then
+    return 0
+  end
+  if name == "round" then
+    return 1
+  end
+  if name == "trunc" then
+    return 2
+  end
+  return 0 - 1
+end
+
+# "x64_float_<fn>_bits" -> "<fn>" for the raw libm primitives the runtime
+# uses (sqrt and the eight above), "" for anything else.
+make a function called x64_raw_math1_bits_fn takes name returns fname
+  let fns = ["sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "log", "exp"]
+  let i = 0
+  while i < fns.length do
+    if name == ("x64_float_" + fns[i] + "_bits") then
+      return fns[i]
+    end
+    let i = i + 1
+  end
+  return ""
+end
+
+# A tagged-argument math call: the argument is on the stack; leaves the
+# tagged result there.
+make a function called x64_math1_dynamic_asm takes name returns asm
+  let code = x64_math1_dynamic_code(name)
+  let sb = sb_new()
+  if code == (0 - 2) then
+    sb_push(sb, "    call rt_sqrt_dynamic" + x64_nl_char())
+    sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  else
+    sb_push(sb, "    push " + code + x64_nl_char())
+    sb_push(sb, "    call rt_math1_dynamic" + x64_nl_char())
+    sb_push(sb, "    add rsp, 16" + x64_nl_char())
+  end
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
 end
 
 # GitHub #195 (root-caused, follow-up to #50/#102/#194): a block-model-
@@ -864,6 +957,14 @@ end
 # distinguishing this call shape from an ordinary, non-block-model Call
 # (a floor()/type_of()-style runtime-primitive call, which returns its
 # value directly, no unpacking).
+# GitHub #229: does this function follow the block-model convention of
+# passing and holding TAGGED values (so a parameter may be any PatLang
+# value), rather than x64_runtime.patlang's raw-word convention? Only the
+# block-model pipeline names functions bm_fn_<name>.
+make a function called x64_bm_tagged_convention takes name returns yes
+  return x64_bm_fn_prefixed(name)
+end
+
 make a function called x64_bm_fn_prefixed takes name returns yes
   if name.length < 6 then
     return false
@@ -880,6 +981,53 @@ end
 # Load r, Const num 1, CallHost list_get 2, Store __globals, Load r
 # (same r), Const num 0, CallHost list_get 2 (this one).
 make a function called x64_bm_unpack_value_callee takes instrs, i returns callee
+  # GitHub #229: native_codegen.patlang's refcounting passes insert
+  # [Load x; Call rt_rc_*/rt_*_rc_dec*, 1; Store <discard>] triples into
+  # this sequence (after the Store of __globals, for one), which made the
+  # exact 8-instruction match below fail -- so a float-returning callee's
+  # result read as of unknown type. Match against the sequence with those
+  # triples removed.
+  let seq = x64_bm_unpack_window_without_rc(instrs, i)
+  if list_len(seq) < 9 then
+    return ""
+  end
+  return x64_bm_unpack_value_callee_exact(seq, list_len(seq) - 1)
+end
+
+# The (up to) 9 instructions ending at i, in order, skipping any
+# refcounting triple. A triple is recognized by its middle Call of a
+# runtime refcount function and its Store into a "discard" local.
+make a function called x64_bm_unpack_window_without_rc takes instrs, i returns window
+  let rev = []
+  let j = i
+  while (j >= 0) and (list_len(rev) < 9) do
+    let skipped = false
+    if j >= 2 then
+      let st = instrs[j]
+      let cl = instrs[j - 1]
+      let ld = instrs[j - 2]
+      if (st[0] == "Store") and (cl[0] == "Call") and (ld[0] == "Load") then
+        if x64_contains(st[1], "discard") and (str_starts_with(cl[1], "rt_rc_") or x64_contains(cl[1], "_rc_dec")) then
+          let j = j - 3
+          let skipped = true
+        end
+      end
+    end
+    if not skipped then
+      let rev = list_push(rev, instrs[j])
+      let j = j - 1
+    end
+  end
+  let window = []
+  let k = list_len(rev) - 1
+  while k >= 0 do
+    let window = list_push(window, rev[k])
+    let k = k - 1
+  end
+  return window
+end
+
+make a function called x64_bm_unpack_value_callee_exact takes instrs, i returns callee
   if i < 8 then
     return ""
   end
@@ -922,7 +1070,7 @@ make a function called x64_bm_unpack_value_callee takes instrs, i returns callee
   return call_i[1]
 end
 
-make a function called x64_taint_one_pass_float takes instrs, locals_taint, float_func_names returns result
+make a function called x64_taint_one_pass_float takes instrs, locals_taint, float_func_names, conv returns result
   let n = to_num(list_len(instrs))
   let stack = []
   let sp = 0
@@ -947,6 +1095,7 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
   let mixed_left_int_indices = []
   let mixed_right_int_indices = []
   let call_box_entries = []
+  let float_dyn_bins = []
   # GitHub #50/#102 follow-up, found the hard way: a first version of
   # this fix trusted ANY untainted operand as "genuine plain int, safe to
   # cvtsi2sd-convert" -- but "untainted" here only means "this analysis
@@ -973,6 +1122,25 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
   # default -- no separate parameter list needs threading in here at all.
   let safe_stack = []
   let safe_map = []
+  # GitHub #229: opaque = this value's type is not visible here (a call
+  # or CallHost result, a non-numeric literal, or a tagged value built from
+  # one) -- see the Bin case. Parameters and int literals are not opaque.
+  let opaque_stack = []
+  let opaque_map = []
+  # GitHub #229: conv = [tagged, params]. In block-model ("tagged") code a
+  # raw float lives only inside one function: parameters arrive as tagged
+  # values (opaque), and a raw float leaving through a return or a call to
+  # another block-model function is boxed. x64_runtime.patlang's functions
+  # (not tagged) keep passing raw float bits between themselves.
+  let tagged = list_get(conv, 0) == true
+  if tagged then
+    let params = list_get(conv, 1)
+    let pi = 0
+    while pi < list_len(params) do
+      let opaque_map = x64_taint_set(opaque_map, list_get(params, pi), true)
+      let pi = pi + 1
+    end
+  end
   let i = 0
   while i < n do
     let produces_float = list_push(produces_float, false)
@@ -990,8 +1158,14 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
       let produces_float = list_set(produces_float, i, tainted)
       let pr = x64_vstack_push(stack, sp, tainted)
       let stack = pr[0]
-      let safe_pr = x64_vstack_push(safe_stack, sp, true)
+      # Only a NUMERIC literal is a proven number: a string, bool or unit
+      # literal mixed with a float is not arithmetic at all (GitHub #229:
+      # `"d=" + d` with d a raw float used to cvtsi2sd the string's
+      # pointer and add it as a float).
+      let safe_pr = x64_vstack_push(safe_stack, sp, instr[1] == "num")
       let safe_stack = safe_pr[0]
+      let opq_pr = x64_vstack_push(opaque_stack, sp, instr[1] != "num")
+      let opaque_stack = opq_pr[0]
       let sp = pr[1]
     elif ty == "Load" then
       let tainted = x64_taint_get(map, instr[1])
@@ -1000,22 +1174,60 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
       let stack = pr[0]
       let safe_pr = x64_vstack_push(safe_stack, sp, x64_taint_get(safe_map, instr[1]))
       let safe_stack = safe_pr[0]
+      let opq_pr = x64_vstack_push(opaque_stack, sp, x64_taint_get(opaque_map, instr[1]))
+      let opaque_stack = opq_pr[0]
       let sp = pr[1]
     elif ty == "Store" then
       let pr = x64_vstack_pop(stack, sp)
       let safe_pr = x64_vstack_pop(safe_stack, sp)
+      let opq_pr = x64_vstack_pop(opaque_stack, sp)
       let sp = pr[1]
       let map = x64_taint_set(map, instr[1], x64_taint_get(map, instr[1]) or pr[0])
       let safe_map = x64_taint_set(safe_map, instr[1], safe_pr[0])
+      let opaque_map = x64_taint_set(opaque_map, instr[1], x64_taint_get(opaque_map, instr[1]) or opq_pr[0])
     elif ty == "Bin" then
       let pr1 = x64_vstack_pop(stack, sp)
       let safe_pr1 = x64_vstack_pop(safe_stack, sp)
+      let opq_pr1 = x64_vstack_pop(opaque_stack, sp)
       let sp = pr1[1]
       let pr2 = x64_vstack_pop(stack, sp)
       let safe_pr2 = x64_vstack_pop(safe_stack, sp)
+      let opq_pr2 = x64_vstack_pop(opaque_stack, sp)
       let sp = pr2[1]
-      let result_taint = pr1[0] or pr2[0]
-      if result_taint then
+      let operand_float = pr1[0] or pr2[0]
+      let result_taint = operand_float
+      # GitHub #229: raw float arithmetic is only right when the non-float
+      # side is a number in raw form. An OPAQUE side -- a call or CallHost
+      # result, a non-numeric literal, a tagged value derived from one
+      # (opaque_stack/opaque_map) -- may be a boxed Float, a Rational, a
+      # String..., whose raw word is not a double. Such a Bin is computed
+      # dynamically instead: its raw-float side(s) are boxed and it
+      # dispatches on the operands' actual types (x64_binop_asm_float_
+      # dynamic), giving a TAGGED result, which is itself opaque and
+      # carries no raw-float taint. A bare PARAMETER is not opaque: a
+      # float_mode function's parameters keep the existing convention of
+      # arriving as raw float bits (GitHub #194's caller-side boxing only
+      # applies to non-float_mode callees), which x64_runtime.patlang's
+      # own float formatting (rt_float_decompose) relies on.
+      let opaque_side = ((not pr2[0]) and opq_pr2[0]) or ((not pr1[0]) and opq_pr1[0])
+      let result_opaque = opq_pr1[0] or opq_pr2[0]
+      let is_float_dyn = false
+      if operand_float and opaque_side and (x64_dynamic_op_supported(instr[1]) or (instr[1] == "/") or (instr[1] == "%")) then
+        let float_dyn_bins = list_push(float_dyn_bins, [i, pr2[0], pr1[0]])
+        let is_float_dyn = true
+        let result_taint = false
+        let result_opaque = true
+      end
+      # A comparison of raw floats is still compiled as one (it is in
+      # float_instr_indices), but its RESULT is a 0/1 from setcc, not raw
+      # float bits -- marking it float made it look like a raw float to
+      # whatever consumed it (GitHub #229: rt_float_decompose's
+      # `neg = v < 0.0`, stored into a list, got boxed as a float and so
+      # read back as true -- every float printed negative).
+      if x64_is_dynamic_cmp_op(instr[1]) then
+        let result_taint = false
+      end
+      if operand_float and (not is_float_dyn) then
         let float_instr_indices = list_push(float_instr_indices, i)
         # pr1 is the RHS (popped first, top of stack), pr2 the LHS --
         # matching x64_binop_asm_float's own pop order (r10=RHS, rax=LHS).
@@ -1034,10 +1246,13 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
       let stack = pr3[0]
       let safe_pr3 = x64_vstack_push(safe_stack, sp, safe_pr1[0] and safe_pr2[0])
       let safe_stack = safe_pr3[0]
+      let opq_pr3 = x64_vstack_push(opaque_stack, sp, result_opaque)
+      let opaque_stack = opq_pr3[0]
       let sp = pr3[1]
     elif ty == "Un" then
       let pr = x64_vstack_pop(stack, sp)
       let safe_pr = x64_vstack_pop(safe_stack, sp)
+      let opq_pr = x64_vstack_pop(opaque_stack, sp)
       let sp = pr[1]
       if pr[0] then
         let float_instr_indices = list_push(float_instr_indices, i)
@@ -1047,6 +1262,8 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
       let stack = pr2[0]
       let safe_pr2 = x64_vstack_push(safe_stack, sp, safe_pr[0])
       let safe_stack = safe_pr2[0]
+      let opq_pr2 = x64_vstack_push(opaque_stack, sp, opq_pr[0])
+      let opaque_stack = opq_pr2[0]
       let sp = pr2[1]
     elif ty == "Jump" then
       let sp = sp
@@ -1058,15 +1275,33 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
       let pr = x64_vstack_pop(stack, sp)
       let safe_pr = x64_vstack_pop(safe_stack, sp)
       let sp = pr[1]
+      # A pure block-model callee returns its bare value: box a raw float.
+      if tagged and pr[0] then
+        let call_box_entries = list_push(call_box_entries, [i, 0])
+      end
     elif ty == "CallHost" then
       let argc = to_num(instr[2])
       let last_arg_taint = false
       let k = 0
+      # max/min (x64_runtime.patlang rt_host_max/rt_host_min) take tagged
+      # values too, like the storing primitives.
+      let stores_value = (instr[1] == "list_push") or (instr[1] == "list_set") or (instr[1] == "set_var") or (instr[1] == "max") or (instr[1] == "min")
+      let all_args_raw = argc > 0
+      let raw_arg_positions = []
       while k < argc do
         let pr = x64_vstack_pop(stack, sp)
         let safe_pr = x64_vstack_pop(safe_stack, sp)
         let sp = pr[1]
         let last_arg_taint = pr[0]
+        let all_args_raw = all_args_raw and pr[0]
+        if pr[0] then
+          let raw_arg_positions = list_push(raw_arg_positions, k)
+        end
+        # GitHub #229: as for BuildList -- only for primitives that store
+        # a value; raw-consuming ones (f64_to_i64_trunc, libm) need raw bits.
+        if stores_value and pr[0] then
+          let call_box_entries = list_push(call_box_entries, [i, k])
+        end
         let k = k + 1
       end
       # abs/ceil/round/trunc are runtime-adaptive (x64_abs_asm/
@@ -1081,8 +1316,27 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
       # adaptive in exactly the same way, and was previously missing a
       # codegen case altogether.)
       let is_float_result = last_arg_taint
-      if not x64_str_in_list(["abs", "ceil", "floor", "round", "trunc"], instr[1]) then
+      # GitHub #229: sqrt and the one-argument math functions are adaptive
+      # too -- raw float only when their argument was (see
+      # x64_math1_dynamic_code).
+      let adaptive = x64_str_in_list(["abs", "ceil", "floor", "round", "trunc"], instr[1]) or (x64_math1_dynamic_code(instr[1]) != (0 - 1))
+      if not adaptive then
         let is_float_result = x64_str_in_list(x64_float_producing_host_names(), instr[1])
+      end
+      # GitHub #229: pow/atan2 are raw only when BOTH arguments are raw
+      # floats; otherwise they go to rt_pow_dynamic / rt_atan2_dynamic,
+      # giving a tagged result (pow(10.0, 308) read 308's int bits as a
+      # double).
+      if (instr[1] == "pow") or (instr[1] == "atan2") then
+        let is_float_result = all_args_raw
+        # Going the dynamic way, a raw-float argument must be boxed first.
+        if not all_args_raw then
+          let rp = 0
+          while rp < list_len(raw_arg_positions) do
+            let call_box_entries = list_push(call_box_entries, [i, list_get(raw_arg_positions, rp)])
+            let rp = rp + 1
+          end
+        end
       end
       # GitHub #195: if THIS instruction is specifically the value-
       # extracting (index-0) list_get at the tail of a block-model call's
@@ -1091,7 +1345,9 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
       # list_get isn't in x64_float_producing_host_names) classification.
       let bm_unpack_callee = x64_bm_unpack_value_callee(instrs, i)
       if bm_unpack_callee != "" then
-        let is_float_result = x64_str_in_list(float_func_names, bm_unpack_callee)
+        # GitHub #229: block-model callees box a float result (see the
+        # Call case), so the unpacked value is a tagged one, never raw.
+        let is_float_result = false
       end
       let produces_float = list_set(produces_float, i, is_float_result)
       let pr2 = x64_vstack_push(stack, sp, is_float_result)
@@ -1103,6 +1359,8 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
       # see the "Call" case's own identical reasoning below.)
       let safe_pr2 = x64_vstack_push(safe_stack, sp, false)
       let safe_stack = safe_pr2[0]
+      let opq_pr2 = x64_vstack_push(opaque_stack, sp, true)
+      let opaque_stack = opq_pr2[0]
       let sp = pr2[1]
     elif ty == "Call" then
       let argc = to_num(instr[2])
@@ -1143,7 +1401,11 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
         # from #189; boxing here too would double-box) or floor (expects
         # raw unboxed bits directly; boxing would corrupt its own
         # internal bit-masking -- see #99 note above).
-        if (not callee_is_float_mode) and callee_is_bm_fn and pr[0] and (k != skip_globals_pos) then
+        # GitHub #229: every block-model callee takes tagged arguments now
+        # (its parameters are opaque there, float_mode or not), so a raw
+        # float argument is always boxed. (The __globals list is never
+        # float-tainted, and a pure callee has no __globals argument.)
+        if callee_is_bm_fn and pr[0] then
           let call_box_entries = list_push(call_box_entries, [i, k])
         end
         let k = k + 1
@@ -1176,6 +1438,8 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
       # instead at the tail of the immediately-following unpack sequence
       # (the "CallHost" case below, via x64_bm_unpack_value_callee).
       if x64_bm_fn_prefixed(instr[1]) then
+        # GitHub #229: a block-model callee's result is never raw float
+        # bits -- packed or bare (a pure callee), it is boxed on return.
         let is_float_result = false
       end
       let produces_float = list_set(produces_float, i, is_float_result)
@@ -1187,20 +1451,39 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
       # safe to auto-convert.
       let safe_pr2 = x64_vstack_push(safe_stack, sp, false)
       let safe_stack = safe_pr2[0]
+      let opq_pr2 = x64_vstack_push(opaque_stack, sp, true)
+      let opaque_stack = opq_pr2[0]
       let sp = pr2[1]
     elif ty == "BuildList" then
       let argc = to_num(instr[1])
+      # A return pack ([value, globals] right before Return) is boxed like
+      # any other list in tagged code (raw floats do not cross a block-
+      # model function boundary); only untagged code (the runtime) keeps
+      # a raw float in it.
+      let is_return_pack = false
+      if (i + 1) < n then
+        let is_return_pack = instrs[i + 1][0] == "Return"
+      end
       let k = 0
       while k < argc do
         let pr = x64_vstack_pop(stack, sp)
         let safe_pr = x64_vstack_pop(safe_stack, sp)
         let sp = pr[1]
+        # GitHub #229: a raw float stored into a list element, a closure
+        # capture or a closure-call argument becomes a tagged value
+        # there -- box it in place first (x64_emit_call_box_asm), or it
+        # reads back later as garbage ([2, 0.7][1] + 5 gave 0).
+        if pr[0] and (tagged or (not is_return_pack)) then
+          let call_box_entries = list_push(call_box_entries, [i, k])
+        end
         let k = k + 1
       end
       let pr2 = x64_vstack_push(stack, sp, false)
       let stack = pr2[0]
       let safe_pr2 = x64_vstack_push(safe_stack, sp, false)
       let safe_stack = safe_pr2[0]
+      let opq_pr2 = x64_vstack_push(opaque_stack, sp, true)
+      let opaque_stack = opq_pr2[0]
       let sp = pr2[1]
     elif ty == "MakeClosure" then
       let argc = to_num(list_len(instr[2]))
@@ -1209,12 +1492,21 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
         let pr = x64_vstack_pop(stack, sp)
         let safe_pr = x64_vstack_pop(safe_stack, sp)
         let sp = pr[1]
+        # GitHub #229: a raw float stored into a list element, a closure
+        # capture or a closure-call argument becomes a tagged value
+        # there -- box it in place first (x64_emit_call_box_asm), or it
+        # reads back later as garbage ([2, 0.7][1] + 5 gave 0).
+        if pr[0] then
+          let call_box_entries = list_push(call_box_entries, [i, k])
+        end
         let k = k + 1
       end
       let pr2 = x64_vstack_push(stack, sp, false)
       let stack = pr2[0]
       let safe_pr2 = x64_vstack_push(safe_stack, sp, false)
       let safe_stack = safe_pr2[0]
+      let opq_pr2 = x64_vstack_push(opaque_stack, sp, true)
+      let opaque_stack = opq_pr2[0]
       let sp = pr2[1]
     elif ty == "CallValue" then
       let argc = to_num(instr[1]) + 1
@@ -1223,19 +1515,28 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
         let pr = x64_vstack_pop(stack, sp)
         let safe_pr = x64_vstack_pop(safe_stack, sp)
         let sp = pr[1]
+        # GitHub #229: a raw float stored into a list element, a closure
+        # capture or a closure-call argument becomes a tagged value
+        # there -- box it in place first (x64_emit_call_box_asm), or it
+        # reads back later as garbage ([2, 0.7][1] + 5 gave 0).
+        if pr[0] then
+          let call_box_entries = list_push(call_box_entries, [i, k])
+        end
         let k = k + 1
       end
       let pr2 = x64_vstack_push(stack, sp, false)
       let stack = pr2[0]
       let safe_pr2 = x64_vstack_push(safe_stack, sp, false)
       let safe_stack = safe_pr2[0]
+      let opq_pr2 = x64_vstack_push(opaque_stack, sp, true)
+      let opaque_stack = opq_pr2[0]
       let sp = pr2[1]
     else
       let bailed = true
     end
     let i = i + 1
   end
-  return [map, float_instr_indices, produces_float, bailed, mixed_left_int_indices, mixed_right_int_indices, call_box_entries]
+  return [map, float_instr_indices, produces_float, bailed, mixed_left_int_indices, mixed_right_int_indices, call_box_entries, float_dyn_bins]
 end
 
 # Stage 1 wrapper (fixed-point loop), mirroring x64_analyze_dynamic_bins
@@ -1243,7 +1544,7 @@ end
 # should be rare), falls back to the OLD whole-function behavior
 # (every Bin/Un floats, matching legacy x64_func_is_float semantics)
 # rather than silently under-classifying.
-make a function called x64_analyze_float_bins takes instrs, float_func_names returns result
+make a function called x64_analyze_float_bins takes instrs, float_func_names, conv returns result
   let n = to_num(list_len(instrs))
   let max_passes = n + 10
   let map = []
@@ -1252,11 +1553,12 @@ make a function called x64_analyze_float_bins takes instrs, float_func_names ret
   let mixed_left_int_indices = []
   let mixed_right_int_indices = []
   let call_box_entries = []
+  let float_dyn_bins = []
   let pass = 0
   let bailed = false
   let stable = false
   while (pass < max_passes) and (not stable) and (not bailed) do
-    let result = x64_taint_one_pass_float(instrs, map, float_func_names)
+    let result = x64_taint_one_pass_float(instrs, map, float_func_names, conv)
     let new_map = result[0]
     let float_instr_indices = result[1]
     let produces_float = result[2]
@@ -1264,6 +1566,7 @@ make a function called x64_analyze_float_bins takes instrs, float_func_names ret
     let mixed_left_int_indices = result[4]
     let mixed_right_int_indices = result[5]
     let call_box_entries = result[6]
+    let float_dyn_bins = result[7]
     if x64_taint_maps_equal(map, new_map) then
       let stable = true
     end
@@ -1276,13 +1579,14 @@ make a function called x64_analyze_float_bins takes instrs, float_func_names ret
     let mixed_left_int_indices = []
     let mixed_right_int_indices = []
     let call_box_entries = []
+    let float_dyn_bins = []
     let i = 0
     while i < n do
       let produces_float = list_push(produces_float, true)
       let i = i + 1
     end
   end
-  return [float_instr_indices, produces_float, map, mixed_left_int_indices, mixed_right_int_indices, call_box_entries]
+  return [float_instr_indices, produces_float, map, mixed_left_int_indices, mixed_right_int_indices, call_box_entries, float_dyn_bins]
 end
 
 # Stage 2: which bare dotless "Const num" instructions must be
@@ -2242,17 +2546,17 @@ make a function called x64_binop_asm_div_dynamic takes spilled returns asm
   sb_push(sb, "    call rt_rational_new" + x64_nl_char())
   sb_push(sb, "    add rsp, 16" + x64_nl_char())
   sb_push(sb, "    jmp .DIV_DONE_" + suffix + x64_nl_char())
+  # GitHub #211: a non-fixnum operand goes to rt_dynamic_div
+  # (x64_runtime.patlang): Float division when either side is a Float,
+  # otherwise the Rational division (promoting a fixnum side) and the
+  # GitHub #186 demotion of an exact quotient to int that this slow path
+  # always did. It used to promote both sides to Rational unconditionally,
+  # reading a boxed Float as if it were one.
   sb_push(sb, ".DIV_SLOW_" + suffix + ":" + x64_nl_char())
-  sb_push(sb, x64_dynamic_promote_both_rational_asm(suffix, spilled))
   sb_push(sb, "    push qword [rbp-" + dyn_a + "]" + x64_nl_char())
   sb_push(sb, "    push qword [rbp-" + dyn_b + "]" + x64_nl_char())
-  sb_push(sb, "    call rt_rational_div" + x64_nl_char())
+  sb_push(sb, "    call rt_dynamic_div" + x64_nl_char())
   sb_push(sb, "    add rsp, 16" + x64_nl_char())
-  # GitHub #186: an exact slow-path quotient demotes to int, as the
-  # interpreter's own normalize does.
-  sb_push(sb, "    push rax" + x64_nl_char())
-  sb_push(sb, "    call rt_rational_demote" + x64_nl_char())
-  sb_push(sb, "    add rsp, 8" + x64_nl_char())
   sb_push(sb, ".DIV_DONE_" + suffix + ":" + x64_nl_char())
   sb_push(sb, "    push rax" + x64_nl_char())
   return sb_str(sb)
@@ -2374,6 +2678,42 @@ end
 #
 # TAGMASK = top 16 bits set (0xFFFF shl 48) = 18446462598732840960.
 # PAYLOAD_MASK = low 48 bits set ((1 shl 48) - 1) = 281474976710655.
+# GitHub #229: a Bin in a float_mode function where one side is a raw
+# float and the other is of unknown type (x64_taint_one_pass_float's
+# float_dyn_bins). `sides` is [lhs_is_raw_float, rhs_is_raw_float]. The
+# raw side(s) are boxed in place, in the same two per-frame slots every
+# dynamic Bin uses, then the ordinary dynamic dispatch runs on the
+# operands' real run-time types, leaving a tagged result.
+make a function called x64_binop_asm_float_dynamic takes op, spilled, sides returns asm
+  let dyn_a = 8 * (to_num(list_len(spilled)) + 2)
+  let dyn_b = 8 * (to_num(list_len(spilled)) + 3)
+  let sb = sb_new()
+  sb_push(sb, "    pop qword [rbp-" + dyn_b + "]" + x64_nl_char())
+  sb_push(sb, "    pop qword [rbp-" + dyn_a + "]" + x64_nl_char())
+  if list_get(sides, 0) == true then
+    sb_push(sb, "    push qword [rbp-" + dyn_a + "]" + x64_nl_char())
+    sb_push(sb, "    call rt_box_float" + x64_nl_char())
+    sb_push(sb, "    add rsp, 8" + x64_nl_char())
+    sb_push(sb, "    mov [rbp-" + dyn_a + "], rax" + x64_nl_char())
+  end
+  if list_get(sides, 1) == true then
+    sb_push(sb, "    push qword [rbp-" + dyn_b + "]" + x64_nl_char())
+    sb_push(sb, "    call rt_box_float" + x64_nl_char())
+    sb_push(sb, "    add rsp, 8" + x64_nl_char())
+    sb_push(sb, "    mov [rbp-" + dyn_b + "], rax" + x64_nl_char())
+  end
+  sb_push(sb, "    push qword [rbp-" + dyn_a + "]" + x64_nl_char())
+  sb_push(sb, "    push qword [rbp-" + dyn_b + "]" + x64_nl_char())
+  if op == "/" then
+    sb_push(sb, x64_binop_asm_div_dynamic(spilled))
+  elif op == "%" then
+    sb_push(sb, x64_binop_asm_mod_dynamic(spilled))
+  else
+    sb_push(sb, x64_binop_asm_dynamic(op, spilled))
+  end
+  return sb_str(sb)
+end
+
 make a function called x64_binop_asm_dynamic takes op, spilled returns asm
   let dyn_a = 8 * (to_num(list_len(spilled)) + 2)
   let dyn_b = 8 * (to_num(list_len(spilled)) + 3)
@@ -8452,6 +8792,23 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
     sb_push(sb, x64_float_arith_bits_asm("/"))
   elif name == "x64_float_cmp_bits" then
     sb_push(sb, x64_float_cmp_bits_asm())
+  elif name == "x64_float_bits_to_int" then
+    # Truncating float64-bits -> int (rt_isqrt_exact, x64_runtime.patlang).
+    sb_push(sb, "    pop rax" + x64_nl_char())
+    sb_push(sb, "    movq xmm0, rax" + x64_nl_char())
+    sb_push(sb, "    cvttsd2si rax, xmm0" + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
+  elif name == "x64_float_pow_bits" then
+    # GitHub #229: libm pow/atan2 on raw float64 bits, for the runtime's
+    # tagged rt_pow_dynamic / rt_atan2_dynamic.
+    sb_push(sb, x64_math2_asm("pow"))
+  elif name == "x64_float_atan2_bits" then
+    sb_push(sb, x64_math2_asm("atan2"))
+  elif x64_raw_math1_bits_fn(name) != "" then
+    # GitHub #229: libm on a raw float64 bit pattern, explicitly -- what
+    # the runtime's tagged sqrt/math functions (rt_sqrt_dynamic,
+    # rt_math1_dynamic) call once they have converted their argument.
+    sb_push(sb, x64_math1_asm(x64_raw_math1_bits_fn(name)))
   elif name == "os_exec_run" then
     # Exposes the SAME primitive x64_exec_capture_asm's CallHost handling
     # already wraps (CreateProcessA + pipe capture, cmdline_addr/
@@ -9461,10 +9818,18 @@ make a function called label_asm_safe takes ignored returns label
   return "" + tls_counter_next("x64_cv")
 end
 
-make a function called x64_emit_instr takes instr, func_name, regmap, spilled, label, is_float_bin, is_float_const, is_dynamic_bin, bool_print_override, float_print_override, is_tower_ctor_arg, float_box_single, float_box_receiver, mixed_left_int, mixed_right_int, call_box_positions returns asm
+make a function called x64_emit_instr takes instr, func_name, regmap, spilled, label, is_float_bin, is_float_const, is_dynamic_bin, bool_print_override, float_print_override, is_tower_ctor_arg, float_box_single, float_box_receiver, mixed_left_int, mixed_right_int, call_box_positions, raw_math, float_dyn_sides returns asm
   let sb = sb_new()
   sb_push(sb, label + ":" + x64_nl_char())
   let ty = instr[0]
+  # GitHub #229: raw float operands about to be stored as tagged values
+  # (x64_taint_one_pass_float's call_box_entries for these four kinds; a
+  # Call boxes its own, below) are boxed in place on the stack first.
+  if (ty == "BuildList") or (ty == "CallHost") or (ty == "MakeClosure") or (ty == "CallValue") or (ty == "Return") then
+    if call_box_positions != [] then
+      sb_push(sb, x64_emit_call_box_asm(call_box_positions))
+    end
+  end
   if ty == "Const" then
     let kind = instr[1]
     if kind == "bool" then
@@ -9659,7 +10024,9 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
       else
         if ty == "Bin" then
           # GitHub #37: per-instruction, not whole-function.
-          if is_float_bin then
+          if type_of(float_dyn_sides) == "list" then
+            sb_push(sb, x64_binop_asm_float_dynamic(instr[1], spilled, float_dyn_sides))
+          elif is_float_bin then
             sb_push(sb, x64_binop_asm_float(instr[1], mixed_left_int, mixed_right_int))
           else
             if is_dynamic_bin then
@@ -9736,7 +10103,31 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
                   sb_push(sb, "    mov r10, 9223372036854775808" + x64_nl_char())
                   sb_push(sb, "    xor rax, r10" + x64_nl_char())
                 else
-                  sb_push(sb, "    neg rax" + x64_nl_char())
+                  if x64_bm_tagged_convention(func_name) or (func_name == "main") then
+                    # GitHub #229: in block-model code the operand may be
+                    # a Rational, BigInt, boxed Float... -- `neg` on its
+                    # tagged pointer made -(1/2) garbage (1 + -(1/2) gave
+                    # 0). A fixnum is negated inline; anything else is
+                    # 0 - x through rt_dynamic_binop (op 1). The result is
+                    # left in rax for the shared push below.
+                    let neg_suffix = label_asm_safe(0)
+                    sb_push(sb, "    mov rcx, rax" + x64_nl_char())
+                    sb_push(sb, "    shl rcx, 16" + x64_nl_char())
+                    sb_push(sb, "    sar rcx, 16" + x64_nl_char())
+                    sb_push(sb, "    cmp rcx, rax" + x64_nl_char())
+                    sb_push(sb, "    jne .NEG_SLOW_" + neg_suffix + x64_nl_char())
+                    sb_push(sb, "    neg rax" + x64_nl_char())
+                    sb_push(sb, "    jmp .NEG_DONE_" + neg_suffix + x64_nl_char())
+                    sb_push(sb, ".NEG_SLOW_" + neg_suffix + ":" + x64_nl_char())
+                    sb_push(sb, "    push 0" + x64_nl_char())
+                    sb_push(sb, "    push rax" + x64_nl_char())
+                    sb_push(sb, "    push 1" + x64_nl_char())
+                    sb_push(sb, "    call rt_dynamic_binop" + x64_nl_char())
+                    sb_push(sb, "    add rsp, 24" + x64_nl_char())
+                    sb_push(sb, ".NEG_DONE_" + neg_suffix + ":" + x64_nl_char())
+                  else
+                    sb_push(sb, "    neg rax" + x64_nl_char())
+                  end
                 end
               end
             end
@@ -9759,9 +10150,47 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
               sb_push(sb, "    je L_" + func_name + "_" + instr[1] + x64_nl_char())
             else
               if ty == "CallHost" then
-                sb_push(sb, x64_callhost_asm(instr[1], instr[2], spilled))
+                # GitHub #229: libm on raw bits only when the float
+                # analysis proved the argument raw float (its result is
+                # then marked float -- raw_math); a tagged argument goes
+                # through the numeric-tower runtime functions instead.
+                let tagged_code = x64_bm_tagged_convention(func_name) or (func_name == "main")
+                let roundlike_mode = x64_roundlike_dynamic_mode(instr[1])
+                if (x64_math1_dynamic_code(instr[1]) != (0 - 1)) and (not raw_math) then
+                  sb_push(sb, x64_math1_dynamic_asm(instr[1]))
+                elif ((instr[1] == "pow") or (instr[1] == "atan2")) and (not raw_math) then
+                  # GitHub #229: base/y pushed first, exponent/x on top --
+                  # the runtime function's own parameter order.
+                  sb_push(sb, "    call rt_" + instr[1] + "_dynamic" + x64_nl_char())
+                  sb_push(sb, "    add rsp, 16" + x64_nl_char())
+                  sb_push(sb, "    push rax" + x64_nl_char())
+                elif tagged_code and (not raw_math) and (instr[1] == "abs") then
+                  # GitHub #229: inline abs handles only fixnums and raw
+                  # floats; a Rational/BigInt/boxed Float goes to the
+                  # runtime. (x64_runtime.patlang's own abs/ceil/round/
+                  # trunc calls stay raw: they are applied to raw bits.)
+                  sb_push(sb, "    call rt_abs_dynamic" + x64_nl_char())
+                  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+                  sb_push(sb, "    push rax" + x64_nl_char())
+                elif tagged_code and (not raw_math) and (roundlike_mode >= 0) then
+                  sb_push(sb, "    push " + roundlike_mode + x64_nl_char())
+                  sb_push(sb, "    call rt_roundlike_dynamic" + x64_nl_char())
+                  sb_push(sb, "    add rsp, 16" + x64_nl_char())
+                  sb_push(sb, "    push rax" + x64_nl_char())
+                else
+                  sb_push(sb, x64_callhost_asm(instr[1], instr[2], spilled))
+                end
               else
                 if ty == "Call" then
+                  # GitHub #229: floor of a proven raw float is the raw
+                  # instruction itself; x64_runtime.patlang's floor() then
+                  # only ever receives tagged values, so it can recognise a
+                  # boxed Float with type_of (a bitwise tag test coerces a
+                  # Float to an int first, #102).
+                  if (instr[1] == "floor") and raw_math then
+                    sb_push(sb, x64_roundlike_asm("floor"))
+                    return sb_str(sb)
+                  end
                   # GitHub #194 (second half): a float argument passed to
                   # an ordinary (non-float_mode) bm_fn_-prefixed callee is
                   # still raw, unboxed float64 bits on the real stack at
@@ -10112,7 +10541,14 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
   # a +/-/* anywhere" -- see its own header for why.)
   let dyn_bin_indices = []
   if dynamic_mode then
-    let dyn_bin_indices = x64_analyze_dynamic_bins(instrs)
+    # GitHub #229: block-model code passes TAGGED values, so its parameters
+    # are of unknown type; x64_runtime.patlang's own functions pass raw
+    # words (addresses, tag bits, float bits) and keep the old rule.
+    if x64_bm_tagged_convention(func_name) then
+      let dyn_bin_indices = x64_analyze_dynamic_bins_for_params(instrs, params)
+    else
+      let dyn_bin_indices = x64_analyze_dynamic_bins(instrs)
+    end
   end
   # GitHub #38 follow-up: see x64_tower_ctor_arg_indices's own header --
   # a bare oversized literal passed directly to a tower-constructor
@@ -10206,13 +10642,18 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
   let mixed_left_int_indices = []
   let mixed_right_int_indices = []
   let call_box_entries = []
+  let float_dyn_bins = []
   if float_mode then
-    let float_result = x64_analyze_float_bins(instrs, float_func_names)
+    # GitHub #229: block-model code keeps raw floats inside one function
+    # only (see x64_taint_one_pass_float's conv); the runtime keeps its
+    # raw-word convention.
+    let float_result = x64_analyze_float_bins(instrs, float_func_names, [x64_bm_tagged_convention(func_name) or (func_name == "main"), params])
     let float_instr_indices = float_result[0]
     let produces_float = float_result[1]
     let mixed_left_int_indices = float_result[3]
     let mixed_right_int_indices = float_result[4]
     let call_box_entries = float_result[5]
+    let float_dyn_bins = float_result[6]
     let float_const_indices = x64_analyze_float_consts(instrs, float_result[2], float_instr_indices)
     let float_box_single_indices = x64_float_box_single_indices(instrs, float_mode, produces_float)
     let float_box_receiver_indices = x64_float_box_receiver_indices(instrs, float_mode, produces_float)
@@ -10276,6 +10717,12 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
     set_var("xef_mri__" + list_get(mixed_right_int_indices, xef_mri_i), true)
     let xef_mri_i = xef_mri_i + 1
   end
+  let xef_fdb_i = 0
+  while xef_fdb_i < to_num(list_len(float_dyn_bins)) do
+    let fdb = list_get(float_dyn_bins, xef_fdb_i)
+    set_var("xef_fdb__" + list_get(fdb, 0), [list_get(fdb, 1), list_get(fdb, 2)])
+    let xef_fdb_i = xef_fdb_i + 1
+  end
   let i = 0
   while i < n do
     if (i % 5000) == 0 then
@@ -10288,7 +10735,7 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
     # is dynamic OR float per their own per-instruction analyses (a
     # mixed function can still fuse its provably-plain-int Bin ops).
     if get("__vars", "xef_dbi__" + (i + 1)) != true then
-    if get("__vars", "xef_fii__" + (i + 1)) != true then
+    if (get("__vars", "xef_fii__" + (i + 1)) != true) and (type_of(get("__vars", "xef_fdb__" + (i + 1))) != "list") then
     if get("__vars", "xef_fci__" + i) != true then
     if i + 1 < n then
       let next = instrs[i + 1]
@@ -10363,7 +10810,15 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
       let is_mixed_left_int = get("__vars", "xef_mli__" + i) == true
       let is_mixed_right_int = get("__vars", "xef_mri__" + i) == true
       let call_box_positions_here = x64_call_box_positions_at(call_box_entries, i)
-      sb_push(sb, x64_emit_instr(instr, func_name, regmap, spilled, label, is_float_bin, is_float_const, is_dynamic_bin, is_bool_print, is_float_print, is_tower_ctor_arg, is_float_box_single, is_float_box_receiver, is_mixed_left_int, is_mixed_right_int, call_box_positions_here))
+      # GitHub #229: whether a math CallHost here has a proven raw-float
+      # argument (else it takes the tagged runtime path), and for a
+      # float-dynamic Bin which of its sides are raw floats to box.
+      let raw_math = false
+      if i < to_num(list_len(produces_float)) then
+        let raw_math = list_get(produces_float, i) == true
+      end
+      let float_dyn_sides = get("__vars", "xef_fdb__" + i)
+      sb_push(sb, x64_emit_instr(instr, func_name, regmap, spilled, label, is_float_bin, is_float_const, is_dynamic_bin, is_bool_print, is_float_print, is_tower_ctor_arg, is_float_box_single, is_float_box_receiver, is_mixed_left_int, is_mixed_right_int, call_box_positions_here, raw_math, float_dyn_sides))
       let i = i + 1
     end
   end
@@ -10411,6 +10866,11 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
   while xef_mri_ci < to_num(list_len(mixed_right_int_indices)) do
     set_var("xef_mri__" + list_get(mixed_right_int_indices, xef_mri_ci), false)
     let xef_mri_ci = xef_mri_ci + 1
+  end
+  let xef_fdb_ci = 0
+  while xef_fdb_ci < to_num(list_len(float_dyn_bins)) do
+    set_var("xef_fdb__" + list_get(list_get(float_dyn_bins, xef_fdb_ci), 0), false)
+    let xef_fdb_ci = xef_fdb_ci + 1
   end
   let xef_jt_ci = 0
   while xef_jt_ci < to_num(list_len(jump_targets)) do
@@ -11210,6 +11670,12 @@ make a function called x64_func_is_dynamic takes func returns yes
       # truncating division uses the dedicated rt_trunc_div primitive
       # (a Call, invisible to this scan) instead of the "/" operator.
       if instr[1] == "/" then
+        return true
+      end
+      # GitHub #229: a comparison or `%` in block-model code may meet a
+      # boxed Float, a Rational, a BigInt or a String (parameters and call
+      # results are tagged values there), so it needs the dynamic path too.
+      if (x64_bm_tagged_convention(func[1]) or (func[1] == "main")) and (x64_is_dynamic_cmp_op(instr[1]) or (instr[1] == "%")) then
         return true
       end
     end

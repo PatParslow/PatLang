@@ -888,3 +888,28 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
     When both programs are translated to native FuncIR
     Then that function has the same instruction count in both, under 200
     And closure calls with one and two arguments, unit-padded extra parameters, captures and continuation-passing recursion still print the interpreter's values
+
+  Scenario: a function's own returned list or string is not freed by its own return (GitHub #228)
+    Given single-block functions that return a string and a list they produced, in a program with closures (so returns are packed as [value, globals])
+    When 2000 results are kept while unrelated allocations follow each call
+    Then every kept result reads back intact
+
+  Scenario: a reassigned list's old value is released only after its new value exists (GitHub #228)
+    Given a single-block function doing `let out = list_push(out, [..., f(...)])`, in a program with closures
+    When it is called 500 times, each followed by unrelated allocations
+    Then all 2000 pushed elements read back intact, rather than the old list being freed while list_push still needs it
+
+  Scenario: sqrt, float division and float comparison follow the numeric tower natively (GitHub #229, #211)
+    Given sqrt of perfect-square Ints and Rationals, of 2 and of 2.25, across function calls, float division of a parameter, a rational times a float, and comparisons of a sqrt result
+    When the program is built and run as a real, fully native executable
+    Then it prints exactly what pat --ir-run prints: exact Int/Rational roots for perfect squares, Floats otherwise, and correct comparisons
+
+  Scenario: Rationals, floats in lists, string + float and float/int comparisons behave natively as interpreted (GitHub #229)
+    Given 1 + -(1/2) computed in a function, a float literal stored in a list and read back, "d=" + a float, and comparisons of a boxed sqrt result with ints, a float literal and other parameters
+    When the program is built and run as a real, fully native executable
+    Then it prints exactly what pat --ir-run prints
+
+  Scenario: Rationals keep exact parts of any size natively, promoting to BigInt (GitHub #229)
+    Given rational arithmetic whose numerators and denominators pass 2^63 (a product of large exact fractions, 1/3 squared six times)
+    When the program is built and run as a real, fully native executable
+    Then it prints exactly what pat --ir-run prints, rather than wrapped 64-bit parts

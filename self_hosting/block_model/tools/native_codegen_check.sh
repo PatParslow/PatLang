@@ -448,6 +448,61 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+echo "Scenario: a function's own returned list or string is not freed by its own return (GitHub #228)"
+rm -f self_hosting/build/native_returned_local_survives.exe
+BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_returned_local_survives.patlang self_hosting/build/native_returned_local_survives.exe --x64 2>&1)
+if [ -f self_hosting/build/native_returned_local_survives.exe ]; then
+  OUT=$(./self_hosting/build/native_returned_local_survives.exe 2>&1)
+  check_seq "2000 returned strings and lists, each followed by unrelated allocations, all read back intact" "$OUT" "bad_s= 0 bad_l= 0"
+else
+  echo "  FAIL: the returned-local-survives fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: a reassigned list's old value is released only after its new value exists (GitHub #228)"
+rm -f self_hosting/build/native_reassign_old_value_pending.exe
+BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_reassign_old_value_pending.patlang self_hosting/build/native_reassign_old_value_pending.exe --x64 2>&1)
+if [ -f self_hosting/build/native_reassign_old_value_pending.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_reassign_old_value_pending.exe 2>&1)
+  check_seq "500 calls of a list_push reassignment whose element contains a call, all 2000 elements intact" "$OUT" "bad= 0 len= 2000"
+else
+  echo "  FAIL: the reassign-old-value-pending fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: sqrt, float division and float comparison follow the numeric tower natively (GitHub #229, #211)"
+rm -f self_hosting/build/native_sqrt_tower.exe
+BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_sqrt_tower.patlang self_hosting/build/native_sqrt_tower.exe --x64 2>&1)
+if [ -f self_hosting/build/native_sqrt_tower.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_sqrt_tower.exe 2>&1)
+  check_seq "prints exactly what the interpreter prints" "$OUT" "a=1 int true b=4 int c=1/2 rational d=1.5 float e=1.4142135623730951 float true true f=5 int g=1/2 rational h=0.00015 float k=0.7071067811865475 float m=3.040559159102154 float pow 1024 1/2 1/4 1000 1.4142135623730951 int"
+else
+  echo "  FAIL: the sqrt-tower fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: Rationals, floats in lists, string + float and float/int comparisons behave natively as interpreted (GitHub #229)"
+rm -f self_hosting/build/native_tower_mixed.exe
+BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_tower_mixed.patlang self_hosting/build/native_tower_mixed.exe --x64 2>&1)
+if [ -f self_hosting/build/native_tower_mixed.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_tower_mixed.exe 2>&1)
+  check_seq "prints exactly what the interpreter prints" "$OUT" "x=1/2 rational s=5.7 d=2.25 cmp false true true true true rat true true sb 42,1/2,5.7 inf inf -inf true 9223372036854775807 floor 1 float 3 mod 1.5 -1.5 2 mm 3 0.3 float"
+else
+  echo "  FAIL: the tower-mixed fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: Rationals keep exact parts of any size natively, promoting to BigInt (GitHub #229)"
+rm -f self_hosting/build/native_rational_bigint.exe
+BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_rational_bigint.patlang self_hosting/build/native_rational_bigint.exe --x64 2>&1)
+if [ -f self_hosting/build/native_rational_bigint.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_rational_bigint.exe 2>&1)
+  check_seq "prints exactly what the interpreter prints" "$OUT" "dot -3124900001/20000000000 x 1/3433683820292512484657849089281 x+1 3433683820292512484657849089282/3433683820292512484657849089281 rational cmp true true true y 1/984770902183611232881 z 1 int f 333333 0"
+else
+  echo "  FAIL: the rational-bigint fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
 echo ""
 echo "tests: $PASS passed, $FAIL failed"
 if [ "$FAIL" -eq 0 ]; then

@@ -2125,11 +2125,10 @@ make a function called bm_nc_insert_reassignment_decs takes root, instrs returns
       let dec_fn = bm_nc_rc_dec_fn_for_producer(list_get(instrs, list_get(positions, 0) - 1))
       let pj = 1
       while pj < list_len(positions) do
-        # Insert BEFORE the producer call that computes the new value
-        # (position - 1), not between that call and its own Store --
-        # decrementing the OLD value doesn't depend on the new one being
-        # computed yet, and inserting it there instead keeps every
-        # Store's own producer call immediately adjacent to it, which
+        # Recorded at the producer call that computes the new value
+        # (position - 1): the old value is saved just before it and
+        # released just after the Store (see the emission loop below).
+        # Nothing goes between that call and its own Store, which
         # bm_nc_insert_string_rc_decs's own eligibility re-check (run
         # AFTER this pass, on its rewritten output) requires. Confirmed
         # directly: inserting between the call and the Store broke that
@@ -2176,6 +2175,19 @@ make a function called bm_nc_insert_reassignment_decs takes root, instrs returns
     end
     let si = si + 1
   end
+  # GitHub #228: the old value is saved into a per-site temporary just
+  # before the producer and released only AFTER the Store, once the new
+  # value exists:
+  #   Load x; Store old_k; <producer>; Store x; Load old_k; Call dec; Store discard
+  # Decrementing it in front of the producer (as this pass used to) runs
+  # while the old value may still be one of the producer's own pending
+  # operands -- `let out = list_push(out, ...)` -- so a count of 1 freed
+  # the node (and its buffer, cascading into the elements) before
+  # list_push read it. Masked whenever the leaky first-operand increment
+  # of bm_nc_insert_list_element_incs happened to fire; exposed when the
+  # pushed element contained a call. The producer stays immediately
+  # before its Store, which bm_nc_insert_string_rc_decs's eligibility
+  # re-check needs (see the comment above).
   let discard_name = bm_nc_prefix(root, "__bm_string_rc_discard")
   let out = []
   let n = list_len(instrs)
@@ -2185,8 +2197,7 @@ make a function called bm_nc_insert_reassignment_decs takes root, instrs returns
     while k < list_len(insert_positions) do
       if list_get(insert_positions, k) == i then
         let out = list_push(out, ["Load", list_get(insert_names, k)])
-        let out = list_push(out, ["Call", list_get(insert_fns, k), 1])
-        let out = list_push(out, ["Store", discard_name])
+        let out = list_push(out, ["Store", bm_nc_prefix(root, "__bm_reassign_old_" + k)])
       end
       let k = k + 1
     end
@@ -2194,21 +2205,51 @@ make a function called bm_nc_insert_reassignment_decs takes root, instrs returns
     let op = list_get(instr, 0)
     if (op == "Jump") or (op == "JumpIfFalse") then
       let target = list_get(instr, 1)
-      let new_target = target + bm_nc_reassign_shift_at(insert_positions, target)
+      let new_target = target + bm_nc_reassign_save_release_shift_at(insert_positions, target)
       let out = list_push(out, [op, new_target])
     else
       let out = list_push(out, instr)
+    end
+    let k = 0
+    while k < list_len(insert_positions) do
+      if (list_get(insert_positions, k) + 1) == i then
+        let out = list_push(out, ["Load", bm_nc_prefix(root, "__bm_reassign_old_" + k)])
+        let out = list_push(out, ["Call", list_get(insert_fns, k), 1])
+        let out = list_push(out, ["Store", discard_name])
+      end
+      let k = k + 1
     end
     let i = i + 1
   end
   return out
 end
 
-# How far original instruction index `idx` has shifted once every
-# bm_nc_insert_reassignment_decs insertion at or before it (each a fixed
-# 3-instruction triple) is accounted for -- same reasoning as bm_nc_
-# cumulative_shift_at, simpler shape since every insertion here costs the
-# same fixed amount.
+# Where original instruction index `idx` lands once bm_nc_insert_
+# reassignment_decs's insertions are accounted for: a 2-instruction save
+# in front of each producer at p, and a 3-instruction release after each
+# Store at p + 1. A jump to idx lands in front of a save AT idx (so the
+# save runs on every path into the producer) and after a release attached
+# to a Store BEFORE idx (so a path that joins after the Store never
+# releases a value it did not save).
+make a function called bm_nc_reassign_save_release_shift_at takes insert_positions, idx returns shift
+  let shift = 0
+  let k = 0
+  while k < list_len(insert_positions) do
+    let p = list_get(insert_positions, k)
+    if p < idx then
+      let shift = shift + 2
+    end
+    if (p + 1) < idx then
+      let shift = shift + 3
+    end
+    let k = k + 1
+  end
+  return shift
+end
+
+# The fixed 3-instruction-per-insertion shift bm_nc_insert_list_get_
+# result_incs uses: every triple inserted in front of an index at or
+# before idx moves idx by 3.
 make a function called bm_nc_reassign_shift_at takes insert_positions, idx returns shift
   let shift = 0
   let k = 0
@@ -2587,21 +2628,54 @@ make a function called bm_nc_insert_list_get_result_incs takes root, instrs retu
   return out
 end
 
-# How many instructions get inserted at a given terminal t: one triple
-# (Load/Call/Store) per eligible local, except whichever one (if any)
-# is the value actually being returned right there.
-make a function called bm_nc_rc_dec_count_at_terminal takes instrs, t, eligible_names returns count
-  let returned_name = ""
-  if t > 0 then
-    let prev = list_get(instrs, t - 1)
-    if list_get(prev, 0) == "Load" then
-      let returned_name = list_get(prev, 1)
+# The locals whose own reference terminal t hands to its caller, so must
+# not be decremented there: the bare `Load name` right before it (a
+# pure callee's `Load x; Return`), or every bare `Load` operand of the
+# list built right before it -- a callee's `[value, final_globals]`
+# return pack (`Load x; Load __globals; BuildList 2; Return`), which
+# takes no reference of its own (bm_nc_insert_list_element_incs skips a
+# BuildList that feeds a Return) and so owns `x` only by this transfer.
+# GitHub #228: only the bare-Load form used to be recognised, so a
+# packed return decremented its own returned list or string -- freeing
+# it, and with a list its buffer's elements, while the caller still held
+# it. Silent while the freed memory stayed unreused; the self-compiled
+# compiler segfaulted on it.
+make a function called bm_nc_flat_returned_names takes instrs, t returns names
+  let names = []
+  if t <= 0 then
+    return names
+  end
+  let prev = list_get(instrs, t - 1)
+  let op = list_get(prev, 0)
+  if op == "Load" then
+    return [list_get(prev, 1)]
+  end
+  if op == "BuildList" then
+    let cur = t - 2
+    let ai = 0
+    while ai < list_get(prev, 1) do
+      if cur >= 0 then
+        let operand = list_get(instrs, cur)
+        if list_get(operand, 0) == "Load" then
+          let names = list_push(names, list_get(operand, 1))
+        end
+      end
+      let cur = bm_nc_flat_skip_value_backward(instrs, cur)
+      let ai = ai + 1
     end
   end
+  return names
+end
+
+# How many instructions get inserted at a given terminal t: one triple
+# (Load/Call/Store) per eligible local, except whichever ones are the
+# value actually being returned right there (bm_nc_flat_returned_names).
+make a function called bm_nc_rc_dec_count_at_terminal takes instrs, t, eligible_names returns count
+  let returned_names = bm_nc_flat_returned_names(instrs, t)
   let count = 0
   let ei = 0
   while ei < list_len(eligible_names) do
-    if list_get(eligible_names, ei) != returned_name then
+    if not bm_list_contains(returned_names, list_get(eligible_names, ei)) then
       let count = count + 1
     end
     let ei = ei + 1
@@ -2733,17 +2807,11 @@ make a function called bm_nc_insert_string_rc_decs takes root, instrs returns ou
     end
     if term_pos != (0 - 1) then
       let names_here = list_get(names_per_terminal, term_pos)
-      let returned_name = ""
-      if i2 > 0 then
-        let prev = list_get(instrs, i2 - 1)
-        if list_get(prev, 0) == "Load" then
-          let returned_name = list_get(prev, 1)
-        end
-      end
+      let returned_names = bm_nc_flat_returned_names(instrs, i2)
       let ei = 0
       while ei < list_len(names_here) do
         let name = list_get(names_here, ei)
-        if name != returned_name then
+        if not bm_list_contains(returned_names, name) then
           let dec_fn = "rt_string_rc_dec"
           let fi = 0
           while fi < list_len(eligible_names) do

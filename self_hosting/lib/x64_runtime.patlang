@@ -575,9 +575,46 @@ make a function called rt_format_float_parts takes parts returns s
   return result
 end
 
+# The text of a raw float64 bit pattern. inf, -inf and NaN are written as
+# the interpreter (Rust's f64 Display) writes them; rt_float_decompose's
+# digit extraction only handles finite values and printed garbage for
+# them (GitHub #229: raytrace's infinity()).
+make a function called rt_float_bits_to_string takes bits returns s
+  let exp = (bits shr 52) band 2047
+  if exp == 2047 then
+    # The mantissa is nonzero for NaN. (Tested by shifting out the sign and
+    # exponent rather than masking: a 2^52 - 1 literal exceeds the fixnum
+    # range and would be promoted to a BigInt.)
+    if (bits shl 12) != 0 then
+      return "NaN"
+    end
+    if ((bits shr 63) band 1) == 1 then
+      return "-inf"
+    end
+    return "inf"
+  end
+  # |x| >= 2^63 (binary exponent >= 63) is integral, and the interpreter
+  # displays an integral float as `x as i64`, which Rust saturates
+  # (hosts.rs/codegen.rs display_value) -- so 1e308 prints as
+  # 9223372036854775807 there. rt_float_decompose truncates to i64 first
+  # and crashed on such values; give the interpreter's text instead.
+  if exp >= 1086 then
+    if ((bits shr 63) band 1) == 1 then
+      return "-9223372036854775808"
+    end
+    return "9223372036854775807"
+  end
+  return rt_format_float_parts(rt_float_decompose(bits))
+end
+
 make a function called rt_print_float takes v returns done
-  let parts = rt_float_decompose(v)
-  return rt_print_str(rt_format_float_parts(parts))
+  return rt_print_str(rt_float_bits_to_string(v))
+end
+
+# A BOXED float's text, as rt_print_float prints a raw one (GitHub #229:
+# string concatenation and to-string of a tagged Float).
+make a function called rt_float_to_string takes v returns s
+  return rt_float_bits_to_string(rt_unbox_float_bits(v))
 end
 
 make a function called rt_bool_to_string takes v returns s
@@ -708,7 +745,16 @@ make a function called sb_new returns handle
   return rt_list_len(new_table) - 1
 end
 
-make a function called sb_push takes handle, text returns done
+make a function called sb_push takes handle, text0 returns done
+  # GitHub #229 (raytrace ch02): the interpreter appends any value's
+  # display text (hosts.rs host_sb_push, display_value); this read every
+  # argument as a String, so sb_push(b, 42) dereferenced the int as a
+  # pointer and crashed. A one-AND family check keeps the common String
+  # case as cheap as before.
+  let text = text0
+  if (text0 band 17293822569102704640) != 2305843009213693952 then
+    let text = rt_to_display_string(text0)
+  end
   let table = mem_peek_qword(mem_sb_table_addr(), 0)
   let entry = rt_list_get(table, handle)
   let src = text band rt_payload_mask()
@@ -1690,7 +1736,7 @@ make a function called rt_to_display_string takes v returns s
   if kind == "int" then
     return rt_int_to_str(v)
   elif kind == "float" then
-    return rt_format_float_parts(rt_float_decompose(rt_unbox_float_bits(v)))
+    return rt_float_bits_to_string(rt_unbox_float_bits(v))
   elif kind == "string" then
     return v
   elif kind == "bigint" then
@@ -2204,18 +2250,27 @@ make a function called rt_host_subtract takes a, b returns r
   return a - b
 end
 
+# GitHub #229: max/min as the interpreter defines them (host_bridge.rs
+# host_bin_num): both arguments as f64, the result a Float -- max(3, 1/2)
+# is 3.0. These compared raw words, so a Rational or boxed Float compared
+# by its pointer (max(3, 1/2) gave 1/2). codegen_x64 boxes a raw-float
+# argument before the call.
 make a function called rt_host_max takes a, b returns r
-  if a >= b then
-    return a
+  let ab = rt_num_to_float_bits(a)
+  let bb = rt_num_to_float_bits(b)
+  if x64_float_cmp_bits(ab, bb) >= 0 then
+    return rt_box_float(ab)
   end
-  return b
+  return rt_box_float(bb)
 end
 
 make a function called rt_host_min takes a, b returns r
-  if a <= b then
-    return a
+  let ab = rt_num_to_float_bits(a)
+  let bb = rt_num_to_float_bits(b)
+  if x64_float_cmp_bits(ab, bb) <= 0 then
+    return rt_box_float(ab)
   end
-  return b
+  return rt_box_float(bb)
 end
 
 make a function called rt_host_calculate takes x returns r
@@ -2439,14 +2494,13 @@ end
 make a function called floor takes v returns result
   let tag = v band rt_tag_mask()
   if tag == rt_rational_tag() then
-    let addr = v band rt_payload_mask()
-    let n = mem_peek_qword(addr, 0)
-    let d = mem_peek_qword(addr, 8)
-    let q = rt_trunc_div(n, d)
-    let r = n - q * d
-    if r != 0 then
-      if n < 0 then
-        return q - 1
+    # Parts are tagged integers (rt_int_*, GitHub #229).
+    let n = rt_rational_num(v)
+    let d = rt_rational_den(v)
+    let q = rt_int_tdiv(n, d)
+    if rt_int_cmp(rt_int_mul(q, d), n) != 0 then
+      if rt_int_cmp(n, 0) < 0 then
+        return rt_int_sub(q, 1)
       end
     end
     return q
@@ -2460,6 +2514,12 @@ make a function called floor takes v returns result
   # already-int v is the identity under rt_floor_via_ceil too (its own
   # round-trip fixnum check), so no separate int/float branch is needed
   # here.
+  # GitHub #229: a BOXED Float (a sqrt result, a float-dynamic Bin's) is
+  # floored on its raw bits and stays a Float, as in the interpreter; the
+  # raw path below would floor the box's pointer.
+  if type_of(v) == "float" then
+    return rt_box_float(rt_floor_via_ceil(rt_unbox_float_bits(v)))
+  end
   return rt_floor_via_ceil(v)
 end
 
@@ -3910,14 +3970,201 @@ end
 # denominator positive, so rt_trunc_div's sign handling needs no
 # adjustment), reusing the already-correct rt_rational_mul/sub -- no new
 # arithmetic primitive needed.
+# ---- tagged integers: a fixnum or a BigInt (GitHub #229) ----
+#
+# A Rational's numerator and denominator are tagged integers, so they can
+# grow without bound the way the interpreter's BigInt-backed rationals do;
+# they used to be raw i64 words, and every product silently wrapped (an
+# exact -3124900001/20000000000 came out as -1168242959227/949111625728).
+# These helpers do the integer arithmetic: plain i64 work while both sides
+# are fixnums and the result provably fits, BigInt otherwise, and a
+# BigInt result small enough for a fixnum is demoted again. This file's
+# rt_ functions are compiled without dynamic dispatch or overflow checks
+# (codegen_x64's x64_func_is_tower_impl), so the checks are written out.
+
+# A fixnum in its ordinary (sign-extended) form.
+make a function called rt_int_is_fix takes v returns yes
+  return (v >= (0 - 140737488355327)) and (v <= 140737488355327)
+end
+
+# v as a BigInt.
+make a function called rt_int_big takes v returns b
+  if rt_int_is_fix(v) then
+    return rt_bigint_from_i64(v)
+  end
+  if type_of(v) == "bigint" then
+    return v
+  end
+  return rt_bigint_from_i64(rt_fixnum_unpack(v))
+end
+
+# v as a fixnum when it fits (a BigInt of at most two base-10^9 limbs whose
+# value is below 2^47), else unchanged.
+make a function called rt_int_norm takes v returns n
+  if rt_int_is_fix(v) then
+    return v
+  end
+  if type_of(v) != "bigint" then
+    return rt_fixnum_unpack(v)
+  end
+  let addr = v band rt_payload_mask()
+  let nl = mem_peek_qword(addr, 8)
+  if nl > 2 then
+    return v
+  end
+  let val = mem_peek_qword(addr, 16)
+  if nl == 2 then
+    let val = mem_peek_qword(addr, 24) * 1000000000 + val
+  end
+  if val > 140737488355327 then
+    return v
+  end
+  if mem_peek_qword(addr, 0) == 1 then
+    return 0 - val
+  end
+  return val
+end
+
+make a function called rt_int_add takes a, b returns r
+  if rt_int_is_fix(a) and rt_int_is_fix(b) then
+    let s = a + b
+    if rt_int_is_fix(s) then
+      return s
+    end
+    return rt_bigint_from_i64(s)
+  end
+  return rt_int_norm(rt_bigint_add(rt_int_big(a), rt_int_big(b)))
+end
+
+make a function called rt_int_sub takes a, b returns r
+  if rt_int_is_fix(a) and rt_int_is_fix(b) then
+    let s = a - b
+    if rt_int_is_fix(s) then
+      return s
+    end
+    return rt_bigint_from_i64(s)
+  end
+  return rt_int_norm(rt_bigint_sub(rt_int_big(a), rt_int_big(b)))
+end
+
+# Both below 2^31 in magnitude: the product fits an i64.
+make a function called rt_int_mul takes a, b returns r
+  if rt_int_is_fix(a) and rt_int_is_fix(b) then
+    if (a > (0 - 2147483648)) and (a < 2147483648) and (b > (0 - 2147483648)) and (b < 2147483648) then
+      let p = a * b
+      if rt_int_is_fix(p) then
+        return p
+      end
+      return rt_bigint_from_i64(p)
+    end
+  end
+  return rt_int_norm(rt_bigint_mul(rt_int_big(a), rt_int_big(b)))
+end
+
+make a function called rt_int_neg takes a returns r
+  if rt_int_is_fix(a) then
+    return 0 - a
+  end
+  return rt_int_norm(rt_bigint_negate(rt_int_big(a)))
+end
+
+# -1, 0 or 1.
+make a function called rt_int_cmp takes a, b returns c
+  if rt_int_is_fix(a) and rt_int_is_fix(b) then
+    if a < b then
+      return 0 - 1
+    end
+    if a > b then
+      return 1
+    end
+    return 0
+  end
+  return rt_bigint_cmp(rt_int_big(a), rt_int_big(b))
+end
+
+# Truncating division (toward zero), b != 0.
+make a function called rt_int_tdiv takes a, b returns q
+  if rt_int_is_fix(a) and rt_int_is_fix(b) then
+    return rt_trunc_div(a, b)
+  end
+  let ba = rt_int_big(a) band rt_payload_mask()
+  let bb = rt_int_big(b) band rt_payload_mask()
+  let q_addr = list_get(rt_bigint_mag_divmod(ba, bb), 0)
+  let neg = mem_peek_qword(ba, 0) != mem_peek_qword(bb, 0)
+  let q_zero = (mem_peek_qword(q_addr, 8) == 1) and (mem_peek_qword(q_addr, 16) == 0)
+  if neg and (not q_zero) then
+    mem_poke_qword(q_addr, 0, 1)
+  else
+    mem_poke_qword(q_addr, 0, 0)
+  end
+  return rt_int_norm(q_addr bor rt_bigint_tag())
+end
+
+make a function called rt_int_abs takes a returns r
+  if rt_int_cmp(a, 0) < 0 then
+    return rt_int_neg(a)
+  end
+  return a
+end
+
+make a function called rt_int_gcd takes a, b returns g
+  let x = rt_int_abs(a)
+  let y = rt_int_abs(b)
+  while rt_int_cmp(y, 0) != 0 do
+    if rt_int_is_fix(x) and rt_int_is_fix(y) then
+      let t = x % y
+      let x = y
+      let y = t
+    else
+      let t = rt_int_sub(x, rt_int_mul(rt_int_tdiv(x, y), y))
+      let x = y
+      let y = t
+    end
+  end
+  return x
+end
+
+make a function called rt_int_to_text takes v returns s
+  if rt_int_is_fix(v) then
+    return rt_int_to_str(v)
+  end
+  return rt_bigint_to_string(rt_int_big(v))
+end
+
+# The float64 bits of a tagged integer (a BigInt summed limb by limb).
+make a function called rt_int_to_float_bits takes v returns bits
+  if rt_int_is_fix(v) then
+    return x64_int_to_float_bits(v)
+  end
+  let addr = rt_int_big(v) band rt_payload_mask()
+  let nl = mem_peek_qword(addr, 8)
+  let base = x64_int_to_float_bits(1000000000)
+  let acc = x64_int_to_float_bits(0)
+  let i = nl - 1
+  while i >= 0 do
+    let acc = x64_float_add_bits(x64_float_mul_bits(acc, base), x64_int_to_float_bits(mem_peek_qword(addr, 16 + i * 8)))
+    let i = i - 1
+  end
+  if mem_peek_qword(addr, 0) == 1 then
+    return x64_float_sub_bits(x64_int_to_float_bits(0), acc)
+  end
+  return acc
+end
+
+make a function called rt_rational_num takes r returns n
+  return mem_peek_qword(r band rt_payload_mask(), 0)
+end
+
+make a function called rt_rational_den takes r returns d
+  return mem_peek_qword(r band rt_payload_mask(), 8)
+end
+
 make a function called rt_rational_mod takes a, b returns result
-  let addr_a = a band rt_payload_mask()
-  let addr_b = b band rt_payload_mask()
-  let na = mem_peek_qword(addr_a, 0)
-  let da = mem_peek_qword(addr_a, 8)
-  let nb = mem_peek_qword(addr_b, 0)
-  let db = mem_peek_qword(addr_b, 8)
-  let q = rt_trunc_div(na * db, da * nb)
+  let na = rt_rational_num(a)
+  let da = rt_rational_den(a)
+  let nb = rt_rational_num(b)
+  let db = rt_rational_den(b)
+  let q = rt_int_tdiv(rt_int_mul(na, db), rt_int_mul(da, nb))
   return rt_rational_demote(rt_rational_sub(a, rt_rational_mul(b, rt_rational_from_i64(q))))
 end
 
@@ -3935,6 +4182,17 @@ end
 make a function called rt_bigint_mod takes a, b returns result
   let ka = type_of(a)
   let kb = type_of(b)
+  # GitHub #229: a Float operand gives Rust's truncated remainder (sign of
+  # the dividend) as a Float, as in the interpreter: 3.5 % 2 = 1.5,
+  # -3.5 % 2 = -1.5 -- a - trunc(a / b) * b on the raw bits.
+  let a_real = (ka == "float") or (ka == "int") or (ka == "rational")
+  let b_real = (kb == "float") or (kb == "int") or (kb == "rational")
+  if ((ka == "float") or (kb == "float")) and a_real and b_real then
+    let abits = rt_num_to_float_bits(a)
+    let bbits = rt_num_to_float_bits(b)
+    let q = trunc(x64_float_div_bits(abits, bbits))
+    return rt_box_float(x64_float_sub_bits(abits, x64_float_mul_bits(q, bbits)))
+  end
   if (ka == "rational") or (kb == "rational") then
     let ka_rat_ok = (ka == "int") or (ka == "rational")
     let kb_rat_ok = (kb == "int") or (kb == "rational")
@@ -4018,19 +4276,21 @@ make a function called rt_gcd takes a, b returns g
   return x
 end
 
+# num and den are tagged integers (fixnum or BigInt, see rt_int_*): the
+# result is reduced, with a positive denominator.
 make a function called rt_rational_new takes num, den returns tagged
-  let n = num
-  let d = den
-  if d < 0 then
-    let n = 0 - n
-    let d = 0 - d
+  let n = rt_int_norm(num)
+  let d = rt_int_norm(den)
+  if rt_int_cmp(d, 0) < 0 then
+    let n = rt_int_neg(n)
+    let d = rt_int_neg(d)
   end
-  let g = rt_gcd(n, d)
-  if g == 0 then
+  let g = rt_int_gcd(n, d)
+  if rt_int_cmp(g, 0) == 0 then
     let g = 1
   end
-  let n = rt_trunc_div(n, g)
-  let d = rt_trunc_div(d, g)
+  let n = rt_int_tdiv(n, g)
+  let d = rt_int_tdiv(d, g)
   let addr = rt_heap_alloc(16)
   mem_poke_qword(addr, 0, n)
   mem_poke_qword(addr, 8, d)
@@ -4042,99 +4302,48 @@ make a function called rt_rational_from_i64 takes n returns tagged
 end
 
 make a function called rt_rational_to_string takes tagged returns s
-  let addr = tagged band rt_payload_mask()
-  let n = mem_peek_qword(addr, 0)
-  let d = mem_peek_qword(addr, 8)
+  let n = rt_rational_num(tagged)
+  let d = rt_rational_den(tagged)
   if d == 1 then
-    return rt_int_to_str(n)
+    return rt_int_to_text(n)
   end
-  return rt_str_concat(rt_str_concat(rt_int_to_str(n), "/"), rt_int_to_str(d))
+  return rt_str_concat(rt_str_concat(rt_int_to_text(n), "/"), rt_int_to_text(d))
 end
 
-# GitHub #186: an exact Rational result (reduced denominator 1) demotes to a
-# plain int -- or a BigInt when it no longer fits a fixnum -- exactly as the
-# interpreter's own ir/numeric.rs::normalize does, so `(1/2) + (1/2)` is `int`
-# on every backend. Applied to a Rational-arithmetic RESULT only; an operand
-# promotion (rt_rational_from_i64) must stay a genuine Rational.
-#
-# The boundary literal is 140737488355327 (2^47 - 1), NOT 140737488355328
-# (2^47): x64_num_const_needs_bigint_promotion's own safe-literal range
-# (codegen_x64.patlang) is +-140737488355327, one narrower on the negative
-# side than the true 48-bit signed range -- using -140737488355328 here
-# forces THAT literal to be BigInt-promoted at the source, making this
-# whole comparison dynamic-mode and feeding `n` (raw memory content, never
-# itself a tagged Value) into family-aware dynamic comparison logic that
-# expects one -- a real, confirmed bug (segfault on the totally unrelated
-# `print(1/2)`, bisected down to this exact off-by-one) before being
-# narrowed to the compiler's own accepted range.
+# An integral rational is its numerator (already a fixnum or BigInt).
 make a function called rt_rational_demote takes r returns v
-  let ra = r band rt_payload_mask()
-  if mem_peek_qword(ra, 8) == 1 then
-    let n = mem_peek_qword(ra, 0)
-    if (n > 0 - 140737488355327) and (n < 140737488355327) then
-      return n
-    end
-    return rt_bigint_from_i64(n)
+  if rt_rational_den(r) == 1 then
+    return rt_rational_num(r)
   end
   return r
 end
 
 make a function called rt_rational_add takes a, b returns tagged
-  let addr_a = a band rt_payload_mask()
-  let addr_b = b band rt_payload_mask()
-  let n1 = mem_peek_qword(addr_a, 0)
-  let d1 = mem_peek_qword(addr_a, 8)
-  let n2 = mem_peek_qword(addr_b, 0)
-  let d2 = mem_peek_qword(addr_b, 8)
-  return rt_rational_new(n1 * d2 + n2 * d1, d1 * d2)
+  let n1 = rt_rational_num(a)
+  let d1 = rt_rational_den(a)
+  let n2 = rt_rational_num(b)
+  let d2 = rt_rational_den(b)
+  return rt_rational_new(rt_int_add(rt_int_mul(n1, d2), rt_int_mul(n2, d1)), rt_int_mul(d1, d2))
 end
 
 make a function called rt_rational_sub takes a, b returns tagged
-  let addr_a = a band rt_payload_mask()
-  let addr_b = b band rt_payload_mask()
-  let n1 = mem_peek_qword(addr_a, 0)
-  let d1 = mem_peek_qword(addr_a, 8)
-  let n2 = mem_peek_qword(addr_b, 0)
-  let d2 = mem_peek_qword(addr_b, 8)
-  return rt_rational_new(n1 * d2 - n2 * d1, d1 * d2)
+  let n1 = rt_rational_num(a)
+  let d1 = rt_rational_den(a)
+  let n2 = rt_rational_num(b)
+  let d2 = rt_rational_den(b)
+  return rt_rational_new(rt_int_sub(rt_int_mul(n1, d2), rt_int_mul(n2, d1)), rt_int_mul(d1, d2))
 end
 
 make a function called rt_rational_mul takes a, b returns tagged
-  let addr_a = a band rt_payload_mask()
-  let addr_b = b band rt_payload_mask()
-  let n1 = mem_peek_qword(addr_a, 0)
-  let d1 = mem_peek_qword(addr_a, 8)
-  let n2 = mem_peek_qword(addr_b, 0)
-  let d2 = mem_peek_qword(addr_b, 8)
-  return rt_rational_new(n1 * n2, d1 * d2)
+  return rt_rational_new(rt_int_mul(rt_rational_num(a), rt_rational_num(b)), rt_int_mul(rt_rational_den(a), rt_rational_den(b)))
 end
 
 make a function called rt_rational_div takes a, b returns tagged
-  let addr_a = a band rt_payload_mask()
-  let addr_b = b band rt_payload_mask()
-  let n1 = mem_peek_qword(addr_a, 0)
-  let d1 = mem_peek_qword(addr_a, 8)
-  let n2 = mem_peek_qword(addr_b, 0)
-  let d2 = mem_peek_qword(addr_b, 8)
-  return rt_rational_new(n1 * d2, d1 * n2)
+  return rt_rational_new(rt_int_mul(rt_rational_num(a), rt_rational_den(b)), rt_int_mul(rt_rational_den(a), rt_rational_num(b)))
 end
 
 make a function called rt_rational_cmp takes a, b returns cmp
-  let addr_a = a band rt_payload_mask()
-  let addr_b = b band rt_payload_mask()
-  let n1 = mem_peek_qword(addr_a, 0)
-  let d1 = mem_peek_qword(addr_a, 8)
-  let n2 = mem_peek_qword(addr_b, 0)
-  let d2 = mem_peek_qword(addr_b, 8)
-  let lhs = n1 * d2
-  let rhs = n2 * d1
-  if lhs < rhs then
-    return 0 - 1
-  end
-  if lhs > rhs then
-    return 1
-  end
-  return 0
+  return rt_int_cmp(rt_int_mul(rt_rational_num(a), rt_rational_den(b)), rt_int_mul(rt_rational_num(b), rt_rational_den(a)))
 end
 
 # ---- numeric tower: Complex (tower level 3) ----
@@ -4225,6 +4434,9 @@ make a function called rt_num_to_string takes tagged returns s
   end
   if kind == "rational" then
     return rt_rational_to_string(tagged)
+  end
+  if kind == "float" then
+    return rt_float_to_string(tagged)
   end
   return "?"
 end
@@ -4427,6 +4639,231 @@ end
 # needed, with no numeric-tower coercion in the way.
 make a function called rt_unbox_float_bits takes v returns bits
   return rt_unbox_float_bits_raw(v)
+end
+
+# GitHub #229: sqrt and the one-argument math functions on a TAGGED value
+# (a fixnum, a Rational, or a boxed Float -- anything not proven to be raw
+# float64 bits at the call site), matching the interpreter's numeric
+# tower (rust-runtime/src/ir/hosts.rs, host_sqrt/sqrt_nonneg). codegen_x64
+# only calls libm directly on raw bits when its float analysis proved the
+# argument is a raw float; everywhere else it calls these. The raw libm
+# calls themselves are the x64_float_*_bits CallHost primitives.
+
+# The float64 bit pattern of a real numeric value.
+make a function called rt_num_to_float_bits takes v returns bits
+  let k = type_of(v)
+  if k == "float" then
+    return rt_unbox_float_bits(v)
+  end
+  if k == "rational" then
+    return x64_float_div_bits(rt_int_to_float_bits(rt_rational_num(v)), rt_int_to_float_bits(rt_rational_den(v)))
+  end
+  if (k == "int") or (k == "bigint") then
+    return rt_int_to_float_bits(v)
+  end
+  print("sqrt/math: a " + k + " argument is not supported by the native x64 backend")
+  os_exit(98)
+  return 0
+end
+
+# floor(sqrt(n)) for a fixnum n >= 0 if n is a perfect square, else -1. The
+# float estimate is corrected by +/-1 steps, so it is exact for every n a
+# fixnum can hold.
+make a function called rt_isqrt_exact takes n returns r
+  let s = x64_float_bits_to_int(x64_float_sqrt_bits(x64_int_to_float_bits(n)))
+  while (s > 0) and ((s * s) > n) do
+    let s = s - 1
+  end
+  while ((s + 1) * (s + 1)) <= n do
+    let s = s + 1
+  end
+  if (s * s) == n then
+    return s
+  end
+  return 0 - 1
+end
+
+# sqrt of a non-negative real: exact Int or Rational for a perfect square,
+# Float otherwise.
+make a function called rt_sqrt_nonneg takes v returns r
+  let k = type_of(v)
+  if k == "int" then
+    let s = rt_isqrt_exact(v)
+    if s >= 0 then
+      return s
+    end
+  end
+  # A Rational with fixnum parts can have an exact root found here; one
+  # with BigInt parts falls back to the Float.
+  if k == "rational" then
+    let rnum = rt_rational_num(v)
+    let rden = rt_rational_den(v)
+    if rt_int_is_fix(rnum) and rt_int_is_fix(rden) then
+      let rn = rt_isqrt_exact(rnum)
+      let rd = rt_isqrt_exact(rden)
+      if (rn >= 0) and (rd >= 0) then
+        if rd == 1 then
+          return rn
+        end
+        return rt_rational_new(rn, rd)
+      end
+    end
+  end
+  return rt_box_float(x64_float_sqrt_bits(rt_num_to_float_bits(v)))
+end
+
+# sqrt(x): as rt_sqrt_nonneg for x >= 0; Complex(0, sqrt(-x)) for x < 0,
+# as the interpreter does.
+make a function called rt_sqrt_dynamic takes v returns r
+  if v < 0 then
+    return rt_complex_new(rt_fixnum_pack(0), rt_sqrt_nonneg(0 - v))
+  end
+  return rt_sqrt_nonneg(v)
+end
+
+# GitHub #211: `/` when either operand is not a fixnum (codegen_x64.
+# patlang's x64_binop_asm_div_dynamic slow path): a Float if either side is
+# a Float (and both are real), otherwise exact Rational division demoted
+# back to an Int when it divides evenly -- what the slow path always did.
+make a function called rt_dynamic_div takes a, b returns r
+  let ka = type_of(a)
+  let kb = type_of(b)
+  let a_real = (ka == "float") or (ka == "int") or (ka == "rational")
+  let b_real = (kb == "float") or (kb == "int") or (kb == "rational")
+  if ((ka == "float") or (kb == "float")) and a_real and b_real then
+    return rt_box_float(x64_float_div_bits(rt_num_to_float_bits(a), rt_num_to_float_bits(b)))
+  end
+  let pa = a
+  if ka == "int" then
+    let pa = rt_rational_from_i64(a)
+  end
+  let pb = b
+  if kb == "int" then
+    let pb = rt_rational_from_i64(b)
+  end
+  return rt_rational_demote(rt_rational_div(pa, pb))
+end
+
+# GitHub #229 (raytrace ch05): abs of a TAGGED value in block-model code.
+# codegen_x64's inline abs knows only fixnums and raw floats, so a Rational
+# came back unchanged (abs(-(1/3)) was -1/3), and `abs(dy) < epsilon()`
+# called every ray parallel to the plane.
+make a function called rt_abs_dynamic takes v returns r
+  if type_of(v) == "float" then
+    return rt_box_float(abs(rt_unbox_float_bits(v)))
+  end
+  if rt_dynamic_binop(v, 0, 5) then
+    return rt_dynamic_binop(0, v, 1)
+  end
+  return v
+end
+
+# ceil (mode 0), round half away from zero (mode 1) and trunc (mode 2) of
+# a TAGGED value, as the interpreter has them: exact for a Rational (an
+# Int result), a Float for a Float, an Int unchanged. (floor has its own
+# runtime function, `floor`, above.)
+make a function called rt_roundlike_dynamic takes v, mode returns r
+  let k = type_of(v)
+  if k == "rational" then
+    let n = rt_rational_num(v)
+    let d = rt_rational_den(v)
+    let q = rt_int_tdiv(n, d)
+    let rem = rt_int_sub(n, rt_int_mul(q, d))
+    if mode == 2 then
+      return q
+    end
+    if mode == 0 then
+      if rt_int_cmp(rem, 0) > 0 then
+        return rt_int_add(q, 1)
+      end
+      return q
+    end
+    let arem = rt_int_abs(rem)
+    if rt_int_cmp(rt_int_add(arem, arem), d) >= 0 then
+      if rt_int_cmp(n, 0) < 0 then
+        return rt_int_sub(q, 1)
+      end
+      return rt_int_add(q, 1)
+    end
+    return q
+  end
+  if k == "float" then
+    let bits = rt_unbox_float_bits(v)
+    if mode == 0 then
+      return rt_box_float(ceil(bits))
+    end
+    if mode == 1 then
+      return rt_box_float(round(bits))
+    end
+    return rt_box_float(trunc(bits))
+  end
+  return v
+end
+
+# GitHub #229: pow(base, exp) of TAGGED values, as the interpreter has it
+# (hosts.rs host_pow): an Int/Rational/BigInt base with an Int exponent is
+# exact, by repeated squaring through the ordinary tower arithmetic (so it
+# promotes to BigInt, and a negative exponent gives a Rational); anything
+# else is a Float. codegen_x64 calls libm directly only when both
+# arguments are proven raw floats.
+make a function called rt_pow_dynamic takes b, e returns r
+  let kb = type_of(b)
+  let exact_base = (kb == "int") or (kb == "rational") or (kb == "bigint")
+  if exact_base and (type_of(e) == "int") then
+    let n = e
+    let neg = false
+    if n < 0 then
+      let n = 0 - n
+      let neg = true
+    end
+    let acc = 1
+    let base = b
+    while n > 0 do
+      if (n % 2) == 1 then
+        let acc = rt_dynamic_binop(acc, base, 2)
+      end
+      let n = rt_trunc_div(n, 2)
+      if n > 0 then
+        let base = rt_dynamic_binop(base, base, 2)
+      end
+    end
+    if neg then
+      return rt_dynamic_div(1, acc)
+    end
+    return acc
+  end
+  return rt_box_float(x64_float_pow_bits(rt_num_to_float_bits(b), rt_num_to_float_bits(e)))
+end
+
+make a function called rt_atan2_dynamic takes y, x returns r
+  return rt_box_float(x64_float_atan2_bits(rt_num_to_float_bits(y), rt_num_to_float_bits(x)))
+end
+
+# sin/cos/tan/asin/acos/atan/log/exp of a tagged real: always a Float.
+make a function called rt_math1_dynamic takes v, fn_code returns r
+  let x = rt_num_to_float_bits(v)
+  if fn_code == 0 then
+    return rt_box_float(x64_float_sin_bits(x))
+  end
+  if fn_code == 1 then
+    return rt_box_float(x64_float_cos_bits(x))
+  end
+  if fn_code == 2 then
+    return rt_box_float(x64_float_tan_bits(x))
+  end
+  if fn_code == 3 then
+    return rt_box_float(x64_float_asin_bits(x))
+  end
+  if fn_code == 4 then
+    return rt_box_float(x64_float_acos_bits(x))
+  end
+  if fn_code == 5 then
+    return rt_box_float(x64_float_atan_bits(x))
+  end
+  if fn_code == 6 then
+    return rt_box_float(x64_float_log_bits(x))
+  end
+  return rt_box_float(x64_float_exp_bits(x))
 end
 
 make a function called rt_interval_new takes lo, hi returns tagged
@@ -4637,19 +5074,14 @@ make a function called rt_dynamic_numeric_binop takes a, b, op_code returns resu
   # with one of those richer numeric types falls through unchanged to
   # their own existing promotion chains below (a real, pre-existing,
   # not-newly-introduced gap for that rarer combination).
-  if ((ka == "float") and ((kb == "float") or (kb == "int"))) or ((kb == "float") and (ka == "int")) then
-    let abits = a
-    if ka == "int" then
-      let abits = x64_int_to_float_bits(a)
-    else
-      let abits = rt_unbox_float_bits(a)
-    end
-    let bbits = b
-    if kb == "int" then
-      let bbits = x64_int_to_float_bits(b)
-    else
-      let bbits = rt_unbox_float_bits(b)
-    end
+  # GitHub #229 follow-up: a Rational mixed with a Float is a Float too, as
+  # in the interpreter (raytrace's exact rational coordinates times a
+  # sqrt-derived scale) -- rt_num_to_float_bits converts all three kinds.
+  let a_real = (ka == "float") or (ka == "int") or (ka == "rational")
+  let b_real = (kb == "float") or (kb == "int") or (kb == "rational")
+  if ((ka == "float") or (kb == "float")) and a_real and b_real then
+    let abits = rt_num_to_float_bits(a)
+    let bbits = rt_num_to_float_bits(b)
     if op_code == 0 then
       return rt_box_float(x64_float_add_bits(abits, bbits))
     end
@@ -4890,6 +5322,13 @@ make a function called rt_dynamic_plus_obj takes a, b returns result
   end
   if (ka == "interval") and (kb == "string") then
     return rt_str_concat(rt_interval_to_string(pa), pb)
+  end
+  # GitHub #229: a boxed Float, e.g. a sqrt result or a float-dynamic Bin's.
+  if (ka == "string") and (kb == "float") then
+    return rt_str_concat(pa, rt_float_to_string(pb))
+  end
+  if (ka == "float") and (kb == "string") then
+    return rt_str_concat(rt_float_to_string(pa), pb)
   end
   return 0
 end
