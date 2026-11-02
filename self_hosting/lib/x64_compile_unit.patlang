@@ -427,6 +427,16 @@ make a function called x64_compiler_fingerprint takes none returns fp
   # NOTE: get() on a never-set key concatenates as "" but is NOT == ""
   # (patlang-get-unset-key-not-equal-empty-string) -- coerce first.
   let cur = "" + get("__vars", "__x64_compiler_fingerprint")
+  # A built compiler (patc1.exe and its Gen B/C successors) carries the
+  # fingerprint of the generator source it was compiled from
+  # (build_patc1.patlang sets it first thing). Hashing the files on disk is
+  # right only when they ARE the running compiler, i.e. under the
+  # interpreter.
+  let built = "" + get("__vars", "__x64_compiler_build_fp")
+  if (cur == "") and (built != "") then
+    let cur = built
+    set_var("__x64_compiler_fingerprint", cur)
+  end
   if cur == "" then
     # read_file called via a local variable, not an inline literal --
     # see patc1_main.patlang's own note (issue #89 follow-up,
@@ -678,8 +688,28 @@ make a function called x64_make_compile_unit takes func_ir returns unit
   let unit = new("CompileUnit", "cu_" + name)
   unit.func_ir = func_ir
   unit.name = name
-  unit.content_hash = name + "_" + x64_content_hash_value(func_ir) + "_" + x64_compiler_fingerprint()
+  # (the whole program's float-returning functions decide how this unit
+  # types its calls, so they are part of what it is compiled from)
+  unit.content_hash = name + "_" + x64_content_hash_value(func_ir) + "_" + x64_compiler_fingerprint() + "_" + get("__vars", "__x64_extra_float_func_names_key")
   return unit
+end
+
+# Publishes the whole program's float-returning functions for units
+# compiled one at a time (x64_extra_float_func_names, codegen_x64.patlang),
+# with a short key of them for each unit's cache key.
+make a function called x64_set_extra_float_func_names takes funcs returns done
+  let names = x64_collect_float_func_names(funcs)
+  let b = sb_new()
+  let i = 0
+  while i < to_num(list_len(names)) do
+    sb_push(b, names[i])
+    sb_push(b, chr(10))
+    let i = i + 1
+  end
+  let text = sb_str(b)
+  set_var("__x64_extra_float_func_names", text)
+  set_var("__x64_extra_float_func_names_key", hash_string(text))
+  return true
 end
 
 # Every OTHER function in `funcs` (all except index `self_idx`) plus
@@ -779,6 +809,7 @@ make a function called x64_assemble_unit_batch takes item returns done
     let unit = x64_make_compile_unit(funcs[idx])
     let extern_names = x64_extern_names_for(funcs, idx, rt_names)
     let unused = send(unit, "ensure_chunk_native", cache_dir, extern_names)
+    object_delete(unit)
     let i = i + 1
   end
   return "ok"
@@ -996,6 +1027,7 @@ class X64UnitLinker {
           let asm_paths = list_push(asm_paths, ap)
           let out_paths = list_push(out_paths, cache_dir + "/" + get(unit, "content_hash") + ".chunkbin")
         end
+        object_delete(unit)
         let ei = ei + 1
       end
 
@@ -1031,6 +1063,7 @@ class X64UnitLinker {
       let unit = x64_make_compile_unit(funcs[i])
       let extern_names = x64_extern_names_for(funcs, i, rt_names)
       let chunk_or_err = send(unit, "ensure_chunk_native", cache_dir, extern_names)
+      object_delete(unit)
       # chunk_or_err is either a ChunkImage (a list) or an "ASM ERROR:"-
       # prefixed string -- check via type_of() rather than
       # x64_build_contains, which assumes a plain string and would fail

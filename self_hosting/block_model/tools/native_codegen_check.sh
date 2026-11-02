@@ -8,6 +8,10 @@
 # structurally cannot exercise.
 set -u
 cd "$(dirname "$0")/../../.." || exit 1
+# The compiler under test: by default the natively built one. PATC1=./patc1.exe
+# checks the Rust-built Gen A bootstrap compiler instead.
+PATC1="${PATC1:-self_hosting/build/patc1_x64.exe}"
+export PATC1
 PASS=0
 FAIL=0
 
@@ -196,6 +200,49 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+echo "Scenario: Pure functions skip the globals wrapper in a program with closures and events"
+OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/native_call_pure_with_closures.patlang pure_closures 2>&1)
+check_seq "prints exactly what the interpreter prints" "$OUT" "8 16 120 18 22 10"
+WRAPPED=$(grep -A1 "call bm_fn_double$" self_hosting/build/pure_closures.asm | grep -c "add rsp, 16")
+BARE=$(grep -A1 "call bm_fn_double$" self_hosting/build/pure_closures.asm | grep -c "add rsp, 8$")
+if [ "$WRAPPED" -eq 0 ] && [ "$BARE" -gt 0 ]; then
+  echo "  ok: every call to double passes its one argument and no globals ($BARE sites)"
+  PASS=$((PASS + 1))
+else
+  echo "  FAIL: expected every call to double to pass no globals; $WRAPPED pass globals, $BARE do not"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: The ownership pass's dominator tree agrees with walking the block"
+OUT=$(rust-runtime/target/release/pat.exe --quiet --ir-run self_hosting/block_model/tools/dom_tree_check.patlang self_hosting/block_model/pati_main.patlang 2>&1)
+check_seq "every pair in every block of the native interpreter agrees" "$OUT" "mismatches 0 fallback 0"
+
+echo "Scenario: set_var releases the fresh value it is given"
+OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/native_set_var_releases.patlang native_set_var_releases 2>&1)
+check_seq "the heap does not grow and the last values read back" "$OUT" "list bytes/iter under 8: true string bytes/iter under 8: true [1999, 2000, 2001] v1999"
+
+echo "Scenario: Joining a string with a number releases the number's text"
+OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/native_concat_releases_text.patlang native_concat_releases_text 2>&1)
+check_seq "each result is the interpreter's and the heap does not grow" "$OUT" "n=42 7=n f=1.5 b=true false=b l=[1, 2] [3]=l r=1/3 u==u 17780 bytes/iter under 8: true"
+
+echo "Scenario: budgeted blocks run natively, finishing or pausing and resuming from their handle"
+OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/native_budgeted_runs.patlang native_budgeted_runs 2>&1)
+check_seq "the output is the interpreter's" "$OUT" "done 10 10 5 done 4 6"
+
+echo "Scenario: a class with only fields gives natively built objects its defaults"
+OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/class_field_defaults_reference.patlang class_field_defaults 2>&1)
+check_seq "each field reads back its default, as under the interpreter" "$OUT" "50 x true [1, 2] 1.5 51 4"
+
+echo "Scenario: a native program recurses as deep as the interpreter allows"
+rm -f self_hosting/build/native_deep_recursion.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_deep_recursion.patlang self_hosting/build/native_deep_recursion.exe --x64 2>&1)
+OUT=$(./self_hosting/build/native_deep_recursion.exe 2>&1)
+check_seq "100000 non-tail calls deep returns the interpreter's answer" "$OUT" "300000"
+
+echo "Scenario: Loops at the top level and in a handler release the values they rebind"
+OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/native_main_and_handler_loops_release.patlang native_main_and_handler_loops_release 2>&1)
+check_seq "the output is the interpreter's and neither loop grows the heap" "$OUT" "[[a, true], [b, true], [c, false]] [[warm, 1999]] 1000 main bytes/iter under 8: true [[x, 1999]] handler bytes/iter under 8: true"
+
 echo "Scenario: a single-block pure function's entry seed is dropped too, not just its external calling convention (issue #216, follow-up to #215)"
 OUT=$(bash self_hosting/block_model/tools/build_and_run_native.sh self_hosting/block_model/spec_fixtures/native_call_pure_no_leak.patlang issue216_no_leak 2>&1)
 check_seq "2000 calls to a single-block pure function cause exactly zero heap growth" "$OUT" "total= 2000 growth= 0"
@@ -206,7 +253,7 @@ check_seq "the free-list table's own magic marker is set at the heap's base addr
 
 echo "Scenario: box_new/box_get/box_set now work through the ordinary --x64 CLI, not just block-model's own test tooling (general-refcounting.md Phase 1)"
 rm -f self_hosting/build/native_box_ordinary_cli.exe
-BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_box_ordinary_cli.patlang self_hosting/build/native_box_ordinary_cli.exe --x64 2>&1)
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_box_ordinary_cli.patlang self_hosting/build/native_box_ordinary_cli.exe --x64 2>&1)
 if [ -f self_hosting/build/native_box_ordinary_cli.exe ]; then
   OUT=$(./self_hosting/build/native_box_ordinary_cli.exe 2>&1)
   check_seq "200000 box_set/box_get cycles through the ordinary CLI give the right answer" "$OUT" "final=200000"
@@ -217,7 +264,7 @@ fi
 
 echo "Scenario: a string built via a known producer, stored once and never returned, in a branch-free function, gets its refcount decremented and genuinely reclaimed (general-refcounting.md Phase 2, first increment)"
 rm -f self_hosting/build/native_string_rc_dec_no_leak.exe
-BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_string_rc_dec_no_leak.patlang self_hosting/build/native_string_rc_dec_no_leak.exe --x64 2>&1)
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_string_rc_dec_no_leak.patlang self_hosting/build/native_string_rc_dec_no_leak.exe --x64 2>&1)
 if [ -f self_hosting/build/native_string_rc_dec_no_leak.exe ]; then
   OUT=$(./self_hosting/build/native_string_rc_dec_no_leak.exe 2>&1)
   check_seq "50000 build-and-discard cycles after warm-up cause exactly zero heap growth" "$OUT" "total= 0 growth= 0"
@@ -228,7 +275,7 @@ fi
 
 echo "Scenario: a merging if/else (no early return) still has exactly one reachable terminal, so its own eligible local gets decremented too (general-refcounting.md Phase 2, second increment)"
 rm -f self_hosting/build/native_string_rc_dec_merging_if.exe
-BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_string_rc_dec_merging_if.patlang self_hosting/build/native_string_rc_dec_merging_if.exe --x64 2>&1)
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_string_rc_dec_merging_if.patlang self_hosting/build/native_string_rc_dec_merging_if.exe --x64 2>&1)
 if [ -f self_hosting/build/native_string_rc_dec_merging_if.exe ]; then
   OUT=$(./self_hosting/build/native_string_rc_dec_merging_if.exe 2>&1)
   check_seq "50000 cycles through a merging if/else (both branches exercised) cause exactly zero heap growth" "$OUT" "total= 0 growth= 0"
@@ -239,7 +286,7 @@ fi
 
 echo "Scenario: a genuine early return still gets a decrement at every terminal it dominates (general-refcounting.md Phase 2, third increment)"
 rm -f self_hosting/build/native_string_rc_dec_early_return.exe
-BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_string_rc_dec_early_return.patlang self_hosting/build/native_string_rc_dec_early_return.exe --x64 2>&1)
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_string_rc_dec_early_return.patlang self_hosting/build/native_string_rc_dec_early_return.exe --x64 2>&1)
 if [ -f self_hosting/build/native_string_rc_dec_early_return.exe ]; then
   OUT=$(./self_hosting/build/native_string_rc_dec_early_return.exe 2>&1)
   check_seq "50000 cycles through a genuine early return (alternating which branch runs) cause exactly zero heap growth" "$OUT" "total= 0 growth= 0"
@@ -250,7 +297,7 @@ fi
 
 echo "Scenario: a local returned at one terminal and discarded at another, in the same function, is handled correctly at each (general-refcounting.md Phase 2, third increment)"
 rm -f self_hosting/build/native_string_rc_dec_mixed_exit.exe
-BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_string_rc_dec_mixed_exit.patlang self_hosting/build/native_string_rc_dec_mixed_exit.exe --x64 2>&1)
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_string_rc_dec_mixed_exit.patlang self_hosting/build/native_string_rc_dec_mixed_exit.exe --x64 2>&1)
 if [ -f self_hosting/build/native_string_rc_dec_mixed_exit.exe ]; then
   OUT=$(./self_hosting/build/native_string_rc_dec_mixed_exit.exe 2>&1)
   check_seq "50 cycles alternating 'return the string' and 'discard it' match pat --ir-run exactly, reusing the same freed block repeatedly with no corruption" "$OUT" "65 B 67 D 69 F 71 H 73 J 65 B 67 D 69 F 71 H 73 J 65 B 67 D 69 F 71 H 73 J 65 B 67 D 69 F 71 H 73 J 65 B 67 D 69 F 71 H 73 J"
@@ -261,7 +308,7 @@ fi
 
 echo "Scenario: main's own top-level code gets the same string-decrement pass as ordinary callee functions (general-refcounting.md Phase 2, fourth increment)"
 rm -f self_hosting/build/native_string_rc_dec_main_toplevel.exe
-BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_string_rc_dec_main_toplevel.patlang self_hosting/build/native_string_rc_dec_main_toplevel.exe --x64 2>&1)
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_string_rc_dec_main_toplevel.patlang self_hosting/build/native_string_rc_dec_main_toplevel.exe --x64 2>&1)
 if [ -f self_hosting/build/native_string_rc_dec_main_toplevel.exe ]; then
   OUT=$(./self_hosting/build/native_string_rc_dec_main_toplevel.exe 2>&1)
   check_seq "main's own top-level string-build-and-discard statements match pat --ir-run exactly" "$OUT" "A B C"
@@ -272,7 +319,7 @@ fi
 
 echo "Scenario: a local passed as an argument to another call, well before its own decrement, is still handled correctly (general-refcounting.md Phase 2, verified not just assumed)"
 rm -f self_hosting/build/native_string_rc_dec_call_arg.exe
-BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_string_rc_dec_call_arg.patlang self_hosting/build/native_string_rc_dec_call_arg.exe --x64 2>&1)
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_string_rc_dec_call_arg.patlang self_hosting/build/native_string_rc_dec_call_arg.exe --x64 2>&1)
 if [ -f self_hosting/build/native_string_rc_dec_call_arg.exe ]; then
   OUT=$(./self_hosting/build/native_string_rc_dec_call_arg.exe 2>&1)
   check_seq "20 cycles passing the string to print() as an argument, both the output sequence and zero heap growth" "$OUT" "A A B C D E F G H I J A B C D E F G H I J growth= 0"
@@ -283,7 +330,7 @@ fi
 
 echo "Scenario: a string built and discarded inside a real while loop is decremented at the loop's own back-edge but not its exit (general-refcounting.md Phase 2, loop increment)"
 rm -f self_hosting/build/native_string_rc_dec_loop.exe
-BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_string_rc_dec_loop.patlang self_hosting/build/native_string_rc_dec_loop.exe --x64 2>&1)
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_string_rc_dec_loop.patlang self_hosting/build/native_string_rc_dec_loop.exe --x64 2>&1)
 if [ -f self_hosting/build/native_string_rc_dec_loop.exe ]; then
   OUT=$(./self_hosting/build/native_string_rc_dec_loop.exe 2>&1)
   check_seq "50000 real while-loop iterations, each building and discarding a string, cause exactly zero heap growth" "$OUT" "result= 50000 growth= 0"
@@ -294,7 +341,7 @@ fi
 
 echo "Scenario: a string created only on the fall-through side of an earlier, unrelated branch's own early return is decremented at the terminal it dominates (general-refcounting.md Phase 2, single-block dominance retrofit)"
 rm -f self_hosting/build/native_string_rc_dec_branch_local.exe
-BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_string_rc_dec_branch_local.patlang self_hosting/build/native_string_rc_dec_branch_local.exe --x64 2>&1)
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_string_rc_dec_branch_local.patlang self_hosting/build/native_string_rc_dec_branch_local.exe --x64 2>&1)
 if [ -f self_hosting/build/native_string_rc_dec_branch_local.exe ]; then
   OUT=$(./self_hosting/build/native_string_rc_dec_branch_local.exe 2>&1)
   check_seq "50000 cycles alternating early-return and fall-through (string created only on the fall-through side) cause exactly zero heap growth" "$OUT" "total= 0 growth= 0"
@@ -305,7 +352,7 @@ fi
 
 echo "Scenario: a local reassigned from two separate string-producer calls is decremented both at the reassignment point and at the terminal (general-refcounting.md, reassigned-locals increment)"
 rm -f self_hosting/build/native_string_rc_dec_reassigned_local.exe
-BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_string_rc_dec_reassigned_local.patlang self_hosting/build/native_string_rc_dec_reassigned_local.exe --x64 2>&1)
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_string_rc_dec_reassigned_local.patlang self_hosting/build/native_string_rc_dec_reassigned_local.exe --x64 2>&1)
 if [ -f self_hosting/build/native_string_rc_dec_reassigned_local.exe ]; then
   OUT=$(./self_hosting/build/native_string_rc_dec_reassigned_local.exe 2>&1)
   check_seq "50000 cycles reassigning the same local from chr(n) then chr(n+1), discarding both, cause exactly zero heap growth" "$OUT" "total= 49999 growth= 0"
@@ -316,7 +363,7 @@ fi
 
 echo "Scenario: a local whose value escapes into a list literal is never freed while the list itself is still live (general-refcounting.md, list/dict-element-storage safety gate)"
 rm -f self_hosting/build/native_string_rc_dec_list_escape.exe
-BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_string_rc_dec_list_escape.patlang self_hosting/build/native_string_rc_dec_list_escape.exe --x64 2>&1)
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_string_rc_dec_list_escape.patlang self_hosting/build/native_string_rc_dec_list_escape.exe --x64 2>&1)
 if [ -f self_hosting/build/native_string_rc_dec_list_escape.exe ]; then
   OUT=$(./self_hosting/build/native_string_rc_dec_list_escape.exe 2>&1)
   check_seq "2000 lists each wrapping a kept-alive string, plus 2000 more unrelated allocations afterward, show zero corrupted elements" "$OUT" "mismatches= 0"
@@ -327,10 +374,10 @@ fi
 
 echo "Scenario: list nodes and buffers are genuinely refcounted and reclaimed (docs/plans/general-refcounting.md, Phase 3a foundation)"
 rm -f self_hosting/build/native_list_rc_basic.exe
-BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_list_rc_basic.patlang self_hosting/build/native_list_rc_basic.exe --x64 2>&1)
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_list_rc_basic.patlang self_hosting/build/native_list_rc_basic.exe --x64 2>&1)
 if [ -f self_hosting/build/native_list_rc_basic.exe ]; then
   OUT=$(./self_hosting/build/native_list_rc_basic.exe 2>&1)
-  check_seq "50000 cycles building a 3-element integer list literal and explicitly releasing it cause exactly zero heap growth" "$OUT" "growth= 0"
+  check_seq "50000 cycles rebinding a local to a 3-element integer list literal cause exactly zero heap growth" "$OUT" "growth= 0"
 else
   echo "  FAIL: the list-rc-basic fixture did not build: $BUILD_OUT"
   FAIL=$((FAIL + 1))
@@ -338,7 +385,7 @@ fi
 
 echo "Scenario: list_push's retire-chain (in-place growth, doubling, and a genuinely shared/materialized node) stays leak-free and correctly readable (docs/plans/general-refcounting.md, Phase 3a foundation)"
 rm -f self_hosting/build/native_list_rc_retire_chain.exe
-BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_list_rc_retire_chain.patlang self_hosting/build/native_list_rc_retire_chain.exe --x64 2>&1)
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_list_rc_retire_chain.patlang self_hosting/build/native_list_rc_retire_chain.exe --x64 2>&1)
 if [ -f self_hosting/build/native_list_rc_retire_chain.exe ]; then
   OUT=$(./self_hosting/build/native_list_rc_retire_chain.exe 2>&1)
   check_seq "50000 build-via-push-then-discard cycles, and 50000 shared/retired-node cycles with correct read-back, both cause exactly zero heap growth" "$OUT" "growth1= 0 growth2= 0"
@@ -349,7 +396,7 @@ fi
 
 echo "Scenario: a list local is automatically decremented when discarded or reassigned, the same way a string local already was (docs/plans/general-refcounting.md, Phase 4b)"
 rm -f self_hosting/build/native_list_rc_local_discard.exe
-BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_list_rc_local_discard.patlang self_hosting/build/native_list_rc_local_discard.exe --x64 2>&1)
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_list_rc_local_discard.patlang self_hosting/build/native_list_rc_local_discard.exe --x64 2>&1)
 if [ -f self_hosting/build/native_list_rc_local_discard.exe ]; then
   OUT=$(./self_hosting/build/native_list_rc_local_discard.exe 2>&1)
   check_seq "50000 build-and-discard cycles, and 50000 cycles reassigning a list local between two literals, both cause exactly zero heap growth" "$OUT" "total1= 49999 growth1= 0 growth2= 0"
@@ -360,7 +407,7 @@ fi
 
 echo "Scenario: a list_push RESULT stored in a local is also automatically decremented when discarded (docs/plans/general-refcounting.md, Phase 4b)"
 rm -f self_hosting/build/native_list_rc_push_result_discard.exe
-BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_list_rc_push_result_discard.patlang self_hosting/build/native_list_rc_push_result_discard.exe --x64 2>&1)
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_list_rc_push_result_discard.patlang self_hosting/build/native_list_rc_push_result_discard.exe --x64 2>&1)
 if [ -f self_hosting/build/native_list_rc_push_result_discard.exe ]; then
   OUT=$(./self_hosting/build/native_list_rc_push_result_discard.exe 2>&1)
   check_seq "50000 cycles pushing onto a stable, reused base list and discarding the result cause exactly zero heap growth" "$OUT" "total= 49999 growth= 0"
@@ -371,7 +418,7 @@ fi
 
 echo "Scenario: a buffer's own death cascades into the String/List elements it holds (docs/plans/general-refcounting.md, Phase 4c)"
 rm -f self_hosting/build/native_list_rc_element_cascade.exe
-BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_list_rc_element_cascade.patlang self_hosting/build/native_list_rc_element_cascade.exe --x64 2>&1)
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_list_rc_element_cascade.patlang self_hosting/build/native_list_rc_element_cascade.exe --x64 2>&1)
 if [ -f self_hosting/build/native_list_rc_element_cascade.exe ]; then
   OUT=$(./self_hosting/build/native_list_rc_element_cascade.exe 2>&1)
   check_seq "50000 cycles building a one-element list wrapping an unnamed, freshly built string, then discarding the whole list, cause exactly zero heap growth" "$OUT" "growth= 0"
@@ -382,7 +429,7 @@ fi
 
 echo "Scenario: a named local stored into TWO separate lists gets a real, compiler-inserted increment at each site, not just an exclusion (docs/plans/general-refcounting.md, Phase 4c)"
 rm -f self_hosting/build/native_list_rc_element_share.exe
-BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_list_rc_element_share.patlang self_hosting/build/native_list_rc_element_share.exe --x64 2>&1)
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_list_rc_element_share.patlang self_hosting/build/native_list_rc_element_share.exe --x64 2>&1)
 if [ -f self_hosting/build/native_list_rc_element_share.exe ]; then
   OUT=$(./self_hosting/build/native_list_rc_element_share.exe 2>&1)
   check_seq "50000 cycles sharing one named local into two one-element lists, reading both back and discarding everything, cause exactly zero heap growth and zero mismatched reads" "$OUT" "mismatches= 0 growth= 0"
@@ -393,7 +440,7 @@ fi
 
 echo "Scenario: reading a list element into a named local gives it a real, compiler-inserted increment, not just a borrow (docs/plans/general-refcounting.md, Phase 4d)"
 rm -f self_hosting/build/native_list_rc_read_inc.exe
-BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_list_rc_read_inc.patlang self_hosting/build/native_list_rc_read_inc.exe --x64 2>&1)
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_list_rc_read_inc.patlang self_hosting/build/native_list_rc_read_inc.exe --x64 2>&1)
 if [ -f self_hosting/build/native_list_rc_read_inc.exe ]; then
   OUT=$(./self_hosting/build/native_list_rc_read_inc.exe 2>&1)
   check_seq "50000 cycles reading a one-element list's own element into a named local, comparing it against a second transient read, then discarding both, cause exactly zero heap growth and zero mismatched reads" "$OUT" "mismatches= 0 growth= 0"
@@ -404,7 +451,7 @@ fi
 
 echo "Scenario: returning a list's own element while the list itself also dies at the same terminal does not free it out from under the return (docs/plans/general-refcounting.md, Phase 4d)"
 rm -f self_hosting/build/native_list_rc_read_use_after_free.exe
-BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_list_rc_read_use_after_free.patlang self_hosting/build/native_list_rc_read_use_after_free.exe --x64 2>&1)
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_list_rc_read_use_after_free.patlang self_hosting/build/native_list_rc_read_use_after_free.exe --x64 2>&1)
 if [ -f self_hosting/build/native_list_rc_read_use_after_free.exe ]; then
   OUT=$(./self_hosting/build/native_list_rc_read_use_after_free.exe 2>&1)
   check_seq "2000 lists each wrapping a string that is read out and returned (never the list itself), plus 2000 more unrelated allocations afterward, show zero corrupted elements" "$OUT" "mismatches= 0"
@@ -415,7 +462,7 @@ fi
 
 echo "Scenario: a borrowed name stored into a new list element and into an object field survives that field being overwritten (docs/plans/general-refcounting.md, Phase 5, GitHub #223)"
 rm -f self_hosting/build/native_ns_set_displaced_shared.exe
-BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_ns_set_displaced_shared.patlang self_hosting/build/native_ns_set_displaced_shared.exe --x64 2>&1)
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_ns_set_displaced_shared.patlang self_hosting/build/native_ns_set_displaced_shared.exe --x64 2>&1)
 if [ -f self_hosting/build/native_ns_set_displaced_shared.exe ]; then
   OUT=$(./self_hosting/build/native_ns_set_displaced_shared.exe 2>&1)
   check_seq "2000 substr-built names, each pushed into a list element from a helper's PARAMETER and stored into an object field the next name then displaces, all still read back intact" "$OUT" "mismatches= 0"
@@ -424,9 +471,108 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+echo "Scenario: object_delete frees the object's fields and table, and send releases its arguments"
+rm -f self_hosting/build/native_named_object_delete_frees.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_named_object_delete_frees.patlang self_hosting/build/native_named_object_delete_frees.exe --x64 2>&1)
+if [ -f self_hosting/build/native_named_object_delete_frees.exe ]; then
+  OUT=$(./self_hosting/build/native_named_object_delete_frees.exe 2>&1)
+  check_seq "2000 cycles of new, set (string), push (20 strings), set (int), get and object_delete grow the heap by under 64 bytes a cycle, and the string read out before deleting survives" "$OUT" "label_2000 bytes/cycle under 64: true"
+else
+  echo "  FAIL: the named-object-delete-frees fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: string builders and vecs are values the compiler releases (docs/plans/general-refcounting.md, 6e/6f)"
+rm -f self_hosting/build/native_sb_vec_release.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_sb_vec_release.patlang self_hosting/build/native_sb_vec_release.exe --x64 2>&1)
+if [ -f self_hosting/build/native_sb_vec_release.exe ]; then
+  OUT=$(./self_hosting/build/native_sb_vec_release.exe 2>&1)
+  check_seq "a builder grown past several doublings, read part-way and pushed a number, and a vec pushed, set, extended and snapshotted, give the interpreter's results, the snapshot keeps its contents, and 2000 runs grow the heap by under 64 bytes a run" "$OUT" "[230, 231, [a_7, b_7], [c_7, b_7, d, e_7], 4, e_7] [a_1999, b_1999] bytes/run under 64: true"
+else
+  echo "  FAIL: the sb-vec-release fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: BigInts, rationals with BigInt parts and complex numbers are released (docs/plans/general-refcounting.md, 6d)"
+rm -f self_hosting/build/native_numbers_released.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_numbers_released.patlang self_hosting/build/native_numbers_released.exe --x64 2>&1)
+if [ -f self_hosting/build/native_numbers_released.exe ]; then
+  OUT=$(timeout 300 ./self_hosting/build/native_numbers_released.exe 2>&1)
+  check_seq "a BigInt total, BigInt division, a rational with BigInt parts and a complex product give the interpreter's results, and no loop grows the heap" "$OUT" "140737688345000 bigint sum bytes/iteration under 8: true 12345678901234567890123582789/200 bigint division bytes/iteration under 8: true 8230452601223/24691357802469 rational bytes/iteration under 8: true 1+2i complex bytes/iteration under 8: true"
+else
+  echo "  FAIL: the numbers fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: rebuilding an older version of a list leaves nothing behind (docs/plans/general-refcounting.md, 6d)"
+rm -f self_hosting/build/native_list_old_version_rebuild_released.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_list_old_version_rebuild_released.patlang self_hosting/build/native_list_old_version_rebuild_released.exe --x64 2>&1)
+if [ -f self_hosting/build/native_list_old_version_rebuild_released.exe ]; then
+  OUT=$(timeout 120 ./self_hosting/build/native_list_old_version_rebuild_released.exe 2>&1)
+  check_seq "setting and reading a list while newer versions of it exist gives the interpreter's result without growing the heap" "$OUT" "9003000 bytes/iteration under 8: true"
+else
+  echo "  FAIL: the old-version list fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: the runtime's remaining raw blocks are released (docs/plans/general-refcounting.md, 6d)"
+rm -f self_hosting/build/native_runtime_blocks_released.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_runtime_blocks_released.patlang self_hosting/build/native_runtime_blocks_released.exe --x64 2>&1)
+if [ -f self_hosting/build/native_runtime_blocks_released.exe ]; then
+  OUT=$(timeout 300 ./self_hosting/build/native_runtime_blocks_released.exe 2>&1)
+  check_seq "write_file_bytes, a growing bool array, an object holding strings and exec_capture_io give the right results without growing the heap" "$OUT" "1 PL!9 write_file_bytes bytes/run under 8: true 50000 bool array bytes/run under 8: true field 1999 object bytes/run under 8: true 99 exec_capture_io bytes/run under 8: true"
+else
+  echo "  FAIL: the runtime blocks fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: a freed block of any size is reused (docs/plans/general-refcounting.md, 6d)"
+rm -f self_hosting/build/native_growing_string_reuses_freed.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_growing_string_reuses_freed.patlang self_hosting/build/native_growing_string_reuses_freed.exe --x64 2>&1)
+if [ -f self_hosting/build/native_growing_string_reuses_freed.exe ]; then
+  OUT=$(timeout 120 ./self_hosting/build/native_growing_string_reuses_freed.exe 2>&1)
+  check_seq "a string grown a character at a time to 4000 characters costs a few times its final size in heap" "$OUT" "4000 heap bytes per character under 40: true"
+else
+  echo "  FAIL: the growing-string fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: the runtime's own temporaries are released (docs/plans/general-refcounting.md, Phase 7)"
+rm -f self_hosting/build/native_display_temps_released.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_display_temps_released.patlang self_hosting/build/native_display_temps_released.exe --x64 2>&1)
+if [ -f self_hosting/build/native_display_temps_released.exe ]; then
+  OUT=$(timeout 120 ./self_hosting/build/native_display_temps_released.exe 2>&1)
+  check_seq "lists shown as text, a builder given a list, a rational formatted, and exec_capture give the interpreter's results, and neither loop grows the heap" "$OUT" "[7, 8] [7, s] 7/3 [1999, 2000] [1999, s] 1999/3 display bytes/run under 8: true 199 exec_capture bytes/run under 8: true"
+else
+  echo "  FAIL: the display-temps fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: an interned string is released like any other string (docs/plans/general-refcounting.md, 6l)"
+rm -f self_hosting/build/native_str_intern_release.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_str_intern_release.patlang self_hosting/build/native_str_intern_release.exe --x64 2>&1)
+if [ -f self_hosting/build/native_str_intern_release.exe ]; then
+  OUT=$(./self_hosting/build/native_str_intern_release.exe 2>&1)
+  check_seq "a freshly built string interned and read with sc_len, sc_code, sc_char and sc_substr gives the interpreter's results, and 2000 runs grow the heap by under 64 bytes a run" "$OUT" "[13, 116, o, 123] [14, 116, o, 199] bytes/run under 64: true"
+else
+  echo "  FAIL: the str-intern-release fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: object fields and set_var keys are found by hash, and the table owns its keys"
+rm -f self_hosting/build/native_namespace_hashed.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_namespace_hashed.patlang self_hosting/build/native_namespace_hashed.exe --x64 2>&1)
+if [ -f self_hosting/build/native_namespace_hashed.exe ]; then
+  OUT=$(./self_hosting/build/native_namespace_hashed.exe 2>&1)
+  check_seq "3000 objects and 500 set_var keys named by loop-built strings all read back, survive deleting and recreating half the objects, and a pushed list field holds 100 items; one field's lookup cost with 3000 objects is under 3x that with 30" "$OUT" "bad= 0 items= 100 last= 99 lookup cost with 3000 objects under 3x that with 30: true"
+else
+  echo "  FAIL: the namespace-hashed fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
 echo "Scenario: a new list element owns its own reference wherever it is stored: from a loop-containing function, from a loop body, and via list_push (docs/plans/general-refcounting.md, Phase 5)"
 rm -f self_hosting/build/native_element_owns_ref_multiblock.exe
-BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_element_owns_ref_multiblock.patlang self_hosting/build/native_element_owns_ref_multiblock.exe --x64 2>&1)
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_element_owns_ref_multiblock.patlang self_hosting/build/native_element_owns_ref_multiblock.exe --x64 2>&1)
 if [ -f self_hosting/build/native_element_owns_ref_multiblock.exe ]; then
   OUT=$(./self_hosting/build/native_element_owns_ref_multiblock.exe 2>&1)
   check_seq "2000 names each for a parameter stored by a list literal in a loop-containing function, a substr local stored by a list literal in a loop body, and a parameter stored via list_push, all read back intact" "$OUT" "bad_a= 0 bad_b= 0 bad_c= 0"
@@ -439,7 +585,7 @@ echo "Scenario: a closure call's generated code does not grow with the number of
 OUT=$(rust-runtime/target/release/pat.exe --ir-run self_hosting/block_model/tools/call_dynamic_size_check.patlang 2>&1)
 check "the same instruction count with 20 and 80 filler functions, under 200" "$OUT" "call_dynamic_size_check: PASS"
 rm -f self_hosting/build/native_call_dynamic_shared.exe
-BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_call_dynamic_shared.patlang self_hosting/build/native_call_dynamic_shared.exe --x64 2>&1)
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_call_dynamic_shared.patlang self_hosting/build/native_call_dynamic_shared.exe --x64 2>&1)
 if [ -f self_hosting/build/native_call_dynamic_shared.exe ]; then
   OUT=$(./self_hosting/build/native_call_dynamic_shared.exe 2>&1)
   check_seq "closure calls through the shared dispatcher print the interpreter's values" "$OUT" "a=105 b=42 c=42 d=55 e=20"
@@ -450,7 +596,7 @@ fi
 
 echo "Scenario: a function's own returned list or string is not freed by its own return (GitHub #228)"
 rm -f self_hosting/build/native_returned_local_survives.exe
-BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_returned_local_survives.patlang self_hosting/build/native_returned_local_survives.exe --x64 2>&1)
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_returned_local_survives.patlang self_hosting/build/native_returned_local_survives.exe --x64 2>&1)
 if [ -f self_hosting/build/native_returned_local_survives.exe ]; then
   OUT=$(./self_hosting/build/native_returned_local_survives.exe 2>&1)
   check_seq "2000 returned strings and lists, each followed by unrelated allocations, all read back intact" "$OUT" "bad_s= 0 bad_l= 0"
@@ -461,7 +607,7 @@ fi
 
 echo "Scenario: a reassigned list's old value is released only after its new value exists (GitHub #228)"
 rm -f self_hosting/build/native_reassign_old_value_pending.exe
-BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_reassign_old_value_pending.patlang self_hosting/build/native_reassign_old_value_pending.exe --x64 2>&1)
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_reassign_old_value_pending.patlang self_hosting/build/native_reassign_old_value_pending.exe --x64 2>&1)
 if [ -f self_hosting/build/native_reassign_old_value_pending.exe ]; then
   OUT=$(timeout 60 ./self_hosting/build/native_reassign_old_value_pending.exe 2>&1)
   check_seq "500 calls of a list_push reassignment whose element contains a call, all 2000 elements intact" "$OUT" "bad= 0 len= 2000"
@@ -472,7 +618,7 @@ fi
 
 echo "Scenario: sqrt, float division and float comparison follow the numeric tower natively (GitHub #229, #211)"
 rm -f self_hosting/build/native_sqrt_tower.exe
-BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_sqrt_tower.patlang self_hosting/build/native_sqrt_tower.exe --x64 2>&1)
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_sqrt_tower.patlang self_hosting/build/native_sqrt_tower.exe --x64 2>&1)
 if [ -f self_hosting/build/native_sqrt_tower.exe ]; then
   OUT=$(timeout 60 ./self_hosting/build/native_sqrt_tower.exe 2>&1)
   check_seq "prints exactly what the interpreter prints" "$OUT" "a=1 int true b=4 int c=1/2 rational d=1.5 float e=1.4142135623730951 float true true f=5 int g=1/2 rational h=0.00015 float k=0.7071067811865475 float m=3.040559159102154 float pow 1024 1/2 1/4 1000 1.4142135623730951 int"
@@ -483,10 +629,10 @@ fi
 
 echo "Scenario: Rationals, floats in lists, string + float and float/int comparisons behave natively as interpreted (GitHub #229)"
 rm -f self_hosting/build/native_tower_mixed.exe
-BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_tower_mixed.patlang self_hosting/build/native_tower_mixed.exe --x64 2>&1)
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_tower_mixed.patlang self_hosting/build/native_tower_mixed.exe --x64 2>&1)
 if [ -f self_hosting/build/native_tower_mixed.exe ]; then
   OUT=$(timeout 60 ./self_hosting/build/native_tower_mixed.exe 2>&1)
-  check_seq "prints exactly what the interpreter prints" "$OUT" "x=1/2 rational s=5.7 d=2.25 cmp false true true true true rat true true sb 42,1/2,5.7 inf inf -inf true 9223372036854775807 floor 1 float 3 mod 1.5 -1.5 2 mm 3 0.3 float"
+  check_seq "prints exactly what the interpreter prints" "$OUT" "x=1/2 rational s=5.7 d=2.25 cmp false true true true true rat true true sb 42,1/2,5.7 inf inf -inf true 100000000000000001097906362944045541740492309677311846336810682903157585404911491537163328978494688899061249669721172515611590283743140088328307009198146046031271664502933027185697489699588559043338384466165001178426897626212945177628091195786707458122783970171784415105291802893207873272974885715430223118336 floor 1 float 3 mod 1.5 -1.5 2 mm 3 0.3 float"
 else
   echo "  FAIL: the tower-mixed fixture did not build: $BUILD_OUT"
   FAIL=$((FAIL + 1))
@@ -494,12 +640,458 @@ fi
 
 echo "Scenario: Rationals keep exact parts of any size natively, promoting to BigInt (GitHub #229)"
 rm -f self_hosting/build/native_rational_bigint.exe
-BUILD_OUT=$(./patc1.exe self_hosting/block_model/spec_fixtures/native_rational_bigint.patlang self_hosting/build/native_rational_bigint.exe --x64 2>&1)
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_rational_bigint.patlang self_hosting/build/native_rational_bigint.exe --x64 2>&1)
 if [ -f self_hosting/build/native_rational_bigint.exe ]; then
   OUT=$(timeout 60 ./self_hosting/build/native_rational_bigint.exe 2>&1)
   check_seq "prints exactly what the interpreter prints" "$OUT" "dot -3124900001/20000000000 x 1/3433683820292512484657849089281 x+1 3433683820292512484657849089282/3433683820292512484657849089281 rational cmp true true true y 1/984770902183611232881 z 1 int f 333333 0"
 else
   echo "  FAIL: the rational-bigint fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: A list displays each element as print shows it alone"
+rm -f self_hosting/build/native_list_display_kinds.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_list_display_kinds.patlang self_hosting/build/native_list_display_kinds.exe --x64 2>&1)
+if [ -f self_hosting/build/native_list_display_kinds.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_list_display_kinds.exe 2>&1)
+  check_seq "prints exactly what the interpreter prints" "$OUT" "[1, 5/2, 2.5, 123456789012345678901234567890, 0+2i, s, true, [1/3, -2]] [7/4]"
+else
+  echo "  FAIL: the list-display fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: A variable given both a raw float and a dynamic value keeps its value"
+rm -f self_hosting/build/native_float_var_mixed.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_float_var_mixed.patlang self_hosting/build/native_float_var_mixed.exe --x64 2>&1)
+if [ -f self_hosting/build/native_float_var_mixed.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_float_var_mixed.exe 2>&1)
+  check_seq "prints exactly what the interpreter prints" "$OUT" "5 7 -1.875 2 2.5 1.25"
+else
+  echo "  FAIL: the float-var-mixed fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: A float mixed with the result of integer arithmetic"
+rm -f self_hosting/build/native_float_with_exact_arith.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_float_with_exact_arith.patlang self_hosting/build/native_float_with_exact_arith.exe --x64 2>&1)
+if [ -f self_hosting/build/native_float_with_exact_arith.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_float_with_exact_arith.exe 2>&1)
+  check_seq "prints exactly what the interpreter prints" "$OUT" "0 2.3499999999999996 281474976710656 0.75 562949953421312/3 1125899906842624 281474976710656"
+else
+  echo "  FAIL: the float-with-exact-arith fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: An element returned from a local list survives the list's release at return"
+rm -f self_hosting/build/native_returned_element_survives.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_returned_element_survives.patlang self_hosting/build/native_returned_element_survives.exe --x64 2>&1)
+if [ -f self_hosting/build/native_returned_element_survives.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_returned_element_survives.exe 2>&1)
+  check_seq "prints exactly what the interpreter prints" "$OUT" "closures present [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0] -81 -24300"
+else
+  echo "  FAIL: the returned-element-survives fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: A call to a declared function ahead of a later local of the same name calls the function"
+rm -f self_hosting/build/native_call_shadowed_by_later_local.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_call_shadowed_by_later_local.patlang self_hosting/build/native_call_shadowed_by_later_local.exe --x64 2>&1)
+if [ -f self_hosting/build/native_call_shadowed_by_later_local.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_call_shadowed_by_later_local.exe 2>&1)
+  check_seq "prints exactly what the interpreter prints" "$OUT" "[5, true] 6"
+else
+  echo "  FAIL: the call-shadowed-by-later-local fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: A local ahead of a call in a returned list literal keeps its reference as an element"
+rm -f self_hosting/build/native_list_operand_before_call.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_list_operand_before_call.patlang self_hosting/build/native_list_operand_before_call.exe --x64 2>&1)
+if [ -f self_hosting/build/native_list_operand_before_call.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_list_operand_before_call.exe 2>&1)
+  check_seq "prints exactly what the interpreter prints" "$OUT" "closures present [[[[0, 0], [1, 1]], [[0, 0], [1, 1], [2, 4]], [[0, 0], [1, 1], [2, 4], [3, 9]]], 3] [[0, 0], [1, 1], [2, 4], [3, 9], [4, 16]]"
+else
+  echo "  FAIL: the list-operand-before-call fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: An element read from a list and stored in a new list survives the old list's release"
+rm -f self_hosting/build/native_borrowed_element_owns_ref.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_borrowed_element_owns_ref.patlang self_hosting/build/native_borrowed_element_owns_ref.exe --x64 2>&1)
+if [ -f self_hosting/build/native_borrowed_element_owns_ref.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_borrowed_element_owns_ref.exe 2>&1)
+  check_seq "prints exactly what the interpreter prints" "$OUT" "[[0, 1], [2, 3], 9] [[1, 2]]"
+else
+  echo "  FAIL: the borrowed-element fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: A list copied from one local into another survives the original's release"
+rm -f self_hosting/build/native_local_copied_to_local.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_local_copied_to_local.patlang self_hosting/build/native_local_copied_to_local.exe --x64 2>&1)
+if [ -f self_hosting/build/native_local_copied_to_local.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_local_copied_to_local.exe 2>&1)
+  check_seq "prints exactly what the interpreter prints" "$OUT" "[7] [-1, 1/10, 7]"
+else
+  echo "  FAIL: the local-copied-to-local fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: A non-integral float prints as its shortest round-trip decimal"
+rm -f self_hosting/build/native_float_shortest_digits.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_float_shortest_digits.patlang self_hosting/build/native_float_shortest_digits.exe --x64 2>&1)
+if [ -f self_hosting/build/native_float_shortest_digits.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_float_shortest_digits.exe 2>&1)
+  WANT=$(rust-runtime/target/release/pat.exe --ir-run self_hosting/block_model/spec_fixtures/native_float_shortest_digits.patlang 2>&1 | tr -s '\r\n\t ' ' ')
+  check_seq "prints exactly what the interpreter prints" "$OUT" "${WANT% }"
+else
+  echo "  FAIL: the float-shortest-digits fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: A user function whose name contains rt_ or mem_ still uses tagged numeric dispatch"
+rm -f self_hosting/build/native_fn_name_containing_rt.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_fn_name_containing_rt.patlang self_hosting/build/native_fn_name_containing_rt.exe --x64 2>&1)
+if [ -f self_hosting/build/native_fn_name_containing_rt.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_fn_name_containing_rt.exe 2>&1)
+  check_seq "prints exactly what the interpreter prints" "$OUT" "[-1, 1/10, 11/10, 7] [false, 71/10, 7/10] [false, 2.5, 1]"
+else
+  echo "  FAIL: the rt_-named function fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: An integer literal combined with a local float keeps its value"
+rm -f self_hosting/build/native_int_literal_with_float.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_int_literal_with_float.patlang self_hosting/build/native_int_literal_with_float.exe --x64 2>&1)
+if [ -f self_hosting/build/native_int_literal_with_float.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_int_literal_with_float.exe 2>&1)
+  check_seq "prints exactly what the interpreter prints" "$OUT" "0.5 1.5 1 -0.5 3.5 [0.75, 3, 1]"
+else
+  echo "  FAIL: the int-literal-with-float fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: A Float index truncates to an Int"
+rm -f self_hosting/build/native_float_index.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_float_index.patlang self_hosting/build/native_float_index.exe --x64 2>&1)
+if [ -f self_hosting/build/native_float_index.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_float_index.exe 2>&1)
+  check_seq "prints exactly what the interpreter prints" "$OUT" "11 12 21 31 32"
+else
+  echo "  FAIL: the float-index fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: An outer loop counter times a float inside an inner loop"
+rm -f self_hosting/build/native_nested_loop_int_times_float.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_nested_loop_int_times_float.patlang self_hosting/build/native_nested_loop_int_times_float.exe --x64 2>&1)
+if [ -f self_hosting/build/native_nested_loop_int_times_float.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_nested_loop_int_times_float.exe 2>&1)
+  check_seq "prints exactly what the interpreter prints" "$OUT" "0 0 2.5 2.5 5 5 [0, 1, 2.5, 3.5, 5, 6]"
+else
+  echo "  FAIL: the nested-loop fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: argv() reads quoted, escaped and empty arguments as interpreted"
+rm -f self_hosting/build/native_argv_quotes.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_argv_quotes.patlang self_hosting/build/native_argv_quotes.exe --x64 2>&1)
+if [ -f self_hosting/build/native_argv_quotes.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_argv_quotes.exe 'x "q" y' 'p q' 'b\s' 'e\"' '' 'tail\' 2>&1)
+  check_seq "prints exactly what the interpreter prints" "$OUT" '[x "q" y] [p q] [b\s] [e\"] [] [tail\]'
+  echo "Scenario: exec_capture passes quoted, escaped and empty arguments intact"
+  rm -f self_hosting/build/native_exec_quotes.exe
+  BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_exec_quotes.patlang self_hosting/build/native_exec_quotes.exe --x64 2>&1)
+  if [ -f self_hosting/build/native_exec_quotes.exe ]; then
+    OUT=$(timeout 60 ./self_hosting/build/native_exec_quotes.exe 2>&1)
+    check_seq "the child prints each argument intact" "$OUT" '[x "q" y] [p q] [b\s] [e\"] [] [tail\]'
+  else
+    echo "  FAIL: the exec-quotes fixture did not build: $BUILD_OUT"
+    FAIL=$((FAIL + 1))
+  fi
+else
+  echo "  FAIL: the argv-quotes fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: A boxed Float allocated high in the heap is still a Float"
+rm -f self_hosting/build/native_boxed_float_high_heap.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_boxed_float_high_heap.patlang self_hosting/build/native_boxed_float_high_heap.exe --x64 2>&1)
+if [ -f self_hosting/build/native_boxed_float_high_heap.exe ]; then
+  OUT=$(timeout 120 ./self_hosting/build/native_boxed_float_high_heap.exe 2>&1)
+  check_seq "prints exactly what the interpreter prints" "$OUT" "268435456 3 3"
+else
+  echo "  FAIL: the high-heap fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: parallel_map workers each have their own vecs and string builders"
+rm -f self_hosting/build/native_thread_local_vec_sb.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_thread_local_vec_sb.patlang self_hosting/build/native_thread_local_vec_sb.exe --x64 2>&1)
+if [ -f self_hosting/build/native_thread_local_vec_sb.exe ]; then
+  for run in 1 2 3; do
+    OUT=$(timeout 60 ./self_hosting/build/native_thread_local_vec_sb.exe 2>&1)
+    check_seq "run $run prints exactly what the interpreter prints" "$OUT" "ok 8 of 8 distinct vecs 8"
+  done
+else
+  echo "  FAIL: the thread-local fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: parallel_map workers read globals set before the call"
+rm -f self_hosting/build/native_parallel_map_globals.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_parallel_map_globals.patlang self_hosting/build/native_parallel_map_globals.exe --x64 2>&1)
+if [ -f self_hosting/build/native_parallel_map_globals.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_parallel_map_globals.exe 2>&1)
+  check_seq "prints exactly what the interpreter prints" "$OUT" "[101, 102, 103]"
+else
+  echo "  FAIL: the parallel_map globals fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: A string read from a vec or __vars slot survives the slot being overwritten"
+rm -f self_hosting/build/native_container_read_survives_overwrite.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_container_read_survives_overwrite.patlang self_hosting/build/native_container_read_survives_overwrite.exe --x64 2>&1)
+if [ -f self_hosting/build/native_container_read_survives_overwrite.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_container_read_survives_overwrite.exe 2>&1)
+  check_seq "prints exactly what the interpreter prints" "$OUT" "[scenes] [scenes] [a/b]"
+else
+  echo "  FAIL: the container-read fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: Native math functions round as the interpreter's do"
+rm -f self_hosting/build/native_libm_matches_interpreter.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_libm_matches_interpreter.patlang self_hosting/build/native_libm_matches_interpreter.exe --x64 2>&1)
+if [ -f self_hosting/build/native_libm_matches_interpreter.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_libm_matches_interpreter.exe 2>&1)
+  check_seq "prints exactly what the interpreter prints" "$OUT" "0.7071067811865476 0.7071067811865476 1.0000000000000002"
+else
+  echo "  FAIL: the libm fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: A local carried round a loop gives up the values it supersedes"
+rm -f self_hosting/build/native_loop_list_push_releases.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_loop_list_push_releases.patlang self_hosting/build/native_loop_list_push_releases.exe --x64 2>&1)
+if [ -f self_hosting/build/native_loop_list_push_releases.exe ]; then
+  OUT=$(timeout 120 ./self_hosting/build/native_loop_list_push_releases.exe 2>&1)
+  check_seq "the loop keeps only what it ends with" "$OUT" "list_push bytes/elem under 32: true reassigned literal bytes/iter under 8: true 100000 99999 [99999, 100000]"
+else
+  echo "  FAIL: the loop-release fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: A loop's list returned in a literal from its exit block comes back whole"
+rm -f self_hosting/build/native_loop_exit_list_literal.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_loop_exit_list_literal.patlang self_hosting/build/native_loop_exit_list_literal.exe --x64 2>&1)
+if [ -f self_hosting/build/native_loop_exit_list_literal.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_loop_exit_list_literal.exe 2>&1)
+  check_seq "prints exactly what the interpreter prints" "$OUT" "[[[0, [0, a]], [1, [1, a]], [2, [2, a]]], 3]"
+else
+  echo "  FAIL: the loop-exit fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: Rows built by list_push in a loop survive being pushed onto an accumulator"
+rm -f self_hosting/build/native_loop_push_fresh_row.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_loop_push_fresh_row.patlang self_hosting/build/native_loop_push_fresh_row.exe --x64 2>&1)
+if [ -f self_hosting/build/native_loop_push_fresh_row.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_loop_push_fresh_row.exe 2>&1)
+  check_seq "prints exactly what the interpreter prints" "$OUT" "[[1, 0, 0, 3], [2, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]] [[1, 2, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [3, 0, 0, 1]]"
+else
+  echo "  FAIL: the fresh-row fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: A pure function returning a borrowed element through an inlined tail call hands its caller a reference"
+rm -f self_hosting/build/native_pure_return_borrow_inlined.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_pure_return_borrow_inlined.patlang self_hosting/build/native_pure_return_borrow_inlined.exe --x64 2>&1)
+if [ -f self_hosting/build/native_pure_return_borrow_inlined.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_pure_return_borrow_inlined.exe 2>&1)
+  check_seq "prints exactly what the interpreter prints" "$OUT" "0"
+else
+  echo "  FAIL: the inlined-borrow fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: A pure function's returned list literal owns its elements"
+rm -f self_hosting/build/native_pure_return_literal_owns_elements.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_pure_return_literal_owns_elements.patlang self_hosting/build/native_pure_return_literal_owns_elements.exe --x64 2>&1)
+if [ -f self_hosting/build/native_pure_return_literal_owns_elements.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_pure_return_literal_owns_elements.exe 2>&1)
+  check_seq "prints exactly what the interpreter prints" "$OUT" "[1, 2, 3] [4, 5, 6] 0"
+else
+  echo "  FAIL: the returned-literal fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: A value read out of a loop-released container keeps its own reference"
+rm -f self_hosting/build/native_loop_read_outlives_container.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_loop_read_outlives_container.patlang self_hosting/build/native_loop_read_outlives_container.exe --x64 2>&1)
+if [ -f self_hosting/build/native_loop_read_outlives_container.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_loop_read_outlives_container.exe 2>&1)
+  check_seq "prints exactly what the interpreter prints" "$OUT" "[[5], [4], [3], [2], [1]] []"
+else
+  echo "  FAIL: the read-outlives-container fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: A fresh value passed straight into a pure call is released when the call returns"
+rm -f self_hosting/build/native_pure_call_arg_temp_released.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_pure_call_arg_temp_released.patlang self_hosting/build/native_pure_call_arg_temp_released.exe --x64 2>&1)
+if [ -f self_hosting/build/native_pure_call_arg_temp_released.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_pure_call_arg_temp_released.exe 2>&1)
+  check_seq "the sum is right and argument temporaries are released" "$OUT" "399980000 arg temps bytes/iter under 8: true"
+else
+  echo "  FAIL: the argument-temporary fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: Reading a file in slices keeps the heap flat"
+rm -f self_hosting/build/native_read_file_bytes_released.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_read_file_bytes_released.patlang self_hosting/build/native_read_file_bytes_released.exe --x64 2>&1)
+if [ -f self_hosting/build/native_read_file_bytes_released.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_read_file_bytes_released.exe 2>&1)
+  check_seq "the slices are right and none is kept" "$OUT" "2131999 read slices bytes/iter under 16: true"
+else
+  echo "  FAIL: the read-slices fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: An impure call's result, its pair, and the fresh values it is given are all released"
+rm -f self_hosting/build/native_impure_call_result_released.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_impure_call_result_released.patlang self_hosting/build/native_impure_call_result_released.exe --x64 2>&1)
+if [ -f self_hosting/build/native_impure_call_result_released.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_impure_call_result_released.exe 2>&1)
+  check_seq "the values are right and nothing is kept" "$OUT" "200150000 [7, 8] impure results bytes/iter under 8: true"
+else
+  echo "  FAIL: the impure-call fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: list_set storing the value already there still hands its caller a reference"
+rm -f self_hosting/build/native_list_set_same_value_owned.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_list_set_same_value_owned.patlang self_hosting/build/native_list_set_same_value_owned.exe --x64 2>&1)
+if [ -f self_hosting/build/native_list_set_same_value_owned.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_list_set_same_value_owned.exe 2>&1)
+  check_seq "prints exactly what the interpreter prints" "$OUT" "0 [group, 1, 2, 3, 4, 5, [[], false], false]"
+else
+  echo "  FAIL: the same-value list_set fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: Reassigning a local to the same list still releases the old reference"
+rm -f self_hosting/build/native_reassign_same_value_released.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_reassign_same_value_released.patlang self_hosting/build/native_reassign_same_value_released.exe --x64 2>&1)
+if [ -f self_hosting/build/native_reassign_same_value_released.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_reassign_same_value_released.exe 2>&1)
+  check_seq "the sum is right and nothing is kept" "$OUT" "400060000 same-value reassignment bytes/iter under 8: true"
+else
+  echo "  FAIL: the same-value reassignment fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: A fresh value stored in one branch of a loop body is released"
+rm -f self_hosting/build/native_branch_local_released.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_branch_local_released.patlang self_hosting/build/native_branch_local_released.exe --x64 2>&1)
+if [ -f self_hosting/build/native_branch_local_released.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_branch_local_released.exe 2>&1)
+  check_seq "the sum is right and nothing is kept" "$OUT" "300010000 branch locals bytes/iter under 8: true"
+else
+  echo "  FAIL: the branch-local fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: Floats in released lists and arithmetic are freed"
+rm -f self_hosting/build/native_float_boxes_released.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_float_boxes_released.patlang self_hosting/build/native_float_boxes_released.exe --x64 2>&1)
+if [ -f self_hosting/build/native_float_boxes_released.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_float_boxes_released.exe 2>&1)
+  check_seq "the sum is right and nothing is kept" "$OUT" "18753750 float boxes bytes/iter under 16: true"
+else
+  echo "  FAIL: the native_float_boxes_released fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: Rationals in released lists and arithmetic are freed"
+rm -f self_hosting/build/native_rationals_released.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_rationals_released.patlang self_hosting/build/native_rationals_released.exe --x64 2>&1)
+if [ -f self_hosting/build/native_rationals_released.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_rationals_released.exe 2>&1)
+  check_seq "the sums are exact and nothing is kept" "$OUT" "8500 rationals bytes/iter under 16: true"
+else
+  echo "  FAIL: the native_rationals_released fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: A tail call's fresh arguments are released by the callee"
+rm -f self_hosting/build/native_tail_call_args_released.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_tail_call_args_released.patlang self_hosting/build/native_tail_call_args_released.exe --x64 2>&1)
+if [ -f self_hosting/build/native_tail_call_args_released.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_tail_call_args_released.exe 2>&1)
+  check_seq "the values are right and nothing is kept" "$OUT" "600130000 [5, 6] tail call args bytes/iter under 8: true"
+else
+  echo "  FAIL: the native_tail_call_args_released fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: A local copied into another is released by both"
+rm -f self_hosting/build/native_local_copy_owned.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_local_copy_owned.patlang self_hosting/build/native_local_copy_owned.exe --x64 2>&1)
+if [ -f self_hosting/build/native_local_copy_owned.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_local_copy_owned.exe 2>&1)
+  check_seq "the sum is right and nothing is kept" "$OUT" "666966665005 local copies bytes/iter under 8: true"
+else
+  echo "  FAIL: the native_local_copy_owned fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: Every runtime string producer returns a counted string"
+rm -f self_hosting/build/native_string_producers_counted.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_string_producers_counted.patlang self_hosting/build/native_string_producers_counted.exe --x64 2>&1)
+if [ -f self_hosting/build/native_string_producers_counted.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_string_producers_counted.exe 2>&1)
+  check_seq "each count is 1 and releasing them keeps the heap consistent" "$OUT" "read_file 1 index 1 getenv 1 cwd 1 exec_capture 1 churn 12000"
+else
+  echo "  FAIL: the native_string_producers_counted fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: Every operator gives the same result natively"
+rm -f self_hosting/build/native_all_operators.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_all_operators.patlang self_hosting/build/native_all_operators.exe --x64 2>&1)
+OPS_WANT="[9, 5, 14, 7/2, 1, false, true, false, false, true, true, 2, 7, 5, 28, 1] [-9, -15, -36, -4, 0, false, true, true, true, false, false, 0, -9, -9, -96, -2] [-5, -5, false, -6]"
+if [ -f self_hosting/build/native_all_operators.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_all_operators.exe 2>&1)
+  check_seq "each result is the interpreter's" "$OUT" "$OPS_WANT"
+else
+  echo "  FAIL: the native_all_operators fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+echo "Scenario: A function in a program with closures releases what it makes"
+rm -f self_hosting/build/native_closure_program_releases.exe
+BUILD_OUT=$("$PATC1" self_hosting/block_model/spec_fixtures/native_closure_program_releases.patlang self_hosting/build/native_closure_program_releases.exe --x64 2>&1)
+if [ -f self_hosting/build/native_closure_program_releases.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/native_closure_program_releases.exe 2>&1)
+  check_seq "the count is right and the heap does not grow" "$OUT" "18000 bytes/iter 0 1"
+else
+  echo "  FAIL: the native_closure_program_releases fixture did not build: $BUILD_OUT"
+  FAIL=$((FAIL + 1))
+fi
+
+# pati, the native interpreter (docs/plans/native-interpreter.md): built once,
+# then each scenario runs a fixture through it.
+rm -f self_hosting/build/pati.exe
+PATI_BUILD=$(self_hosting/block_model/tools/build_pati.sh 2>&1)
+
+echo "Scenario: pati runs every operator"
+if [ -f self_hosting/build/pati.exe ]; then
+  OUT=$(timeout 60 ./self_hosting/build/pati.exe self_hosting/block_model/spec_fixtures/native_all_operators.patlang 2>&1)
+  check_seq "each result is the interpreter's" "$OUT" "$OPS_WANT"
+else
+  echo "  FAIL: pati did not build: $PATI_BUILD"
   FAIL=$((FAIL + 1))
 fi
 

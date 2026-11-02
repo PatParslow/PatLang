@@ -28,11 +28,18 @@ end
 make a function called x64_runtime_source_fingerprint returns fp
   let lexer_path = "self_hosting/lib/lexer.patlang"
   let parser_path = "self_hosting/lib/parser.patlang"
-  let lower_path = "self_hosting/lib/lower.patlang"
   let codegen_x64_path = "self_hosting/lib/codegen_x64.patlang"
   let x64_runtime_path = "self_hosting/lib/x64_runtime.patlang"
   let heap_path = "self_hosting/block_model/heap.patlang"
-  let compiler_src = read_file(lexer_path) + read_file(parser_path) + read_file(lower_path) + read_file(codegen_x64_path)
+  # The runtime is lowered by the block-model pipeline (Phase 7).
+  let bm_sb = sb_new()
+  let bm_files = ["block_ir", "free_vars", "flight_check", "classes", "lower", "native_codegen"]
+  let bi = 0
+  while bi < bm_files.length do
+    sb_push(bm_sb, read_file("self_hosting/block_model/" + bm_files[bi] + ".patlang"))
+    let bi = bi + 1
+  end
+  let compiler_src = read_file(lexer_path) + read_file(parser_path) + sb_str(bm_sb) + read_file(codegen_x64_path)
   let rt_src = read_file(x64_runtime_path) + chr(10) + read_file(heap_path)
   return hash_string(rt_src + compiler_src)
 end
@@ -82,7 +89,7 @@ make a function called x64_build takes asm_source, out_path returns result
   # literal as "other"/"int" instead of "string", corrupting print()'s
   # own dispatch for any string constant. Reproduced with a hand-
   # instrumented raw address dump before concluding this, not assumed.
-  let gcc_out = exec_capture("gcc", "-o", out_path, obj_path, "-Wl,--subsystem,console", "-Wl,--disable-dynamicbase", "-lkernel32", "-luser32", "-lgdi32", "-lws2_32")
+  let gcc_out = exec_capture("gcc", "-o", out_path, obj_path, "-Wl,--subsystem,console", "-Wl,--stack,268435456", "-Wl,--disable-dynamicbase", "-lkernel32", "-luser32", "-lgdi32", "-lws2_32")
   if x64_build_contains(gcc_out, "error") then
     return "LINK ERROR:\n" + gcc_out
   end
@@ -133,7 +140,7 @@ make a function called x64_build_linked takes program_asm, runtime_obj_path, out
   # misclassifying as "other"/"int" instead of "string" whenever the
   # linked image gets relocated away from the fixed 0x140000000 base
   # x64_family_code_asm assumes.
-  let gcc_out = exec_capture("gcc", "-o", out_path, obj_path, runtime_obj_path, "-Wl,--subsystem,console", "-Wl,--disable-dynamicbase", "-lkernel32", "-luser32", "-lgdi32", "-lws2_32")
+  let gcc_out = exec_capture("gcc", "-o", out_path, obj_path, runtime_obj_path, "-Wl,--subsystem,console", "-Wl,--stack,268435456", "-Wl,--disable-dynamicbase", "-lkernel32", "-luser32", "-lgdi32", "-lws2_32")
   if x64_build_contains(gcc_out, "error") then
     return "LINK ERROR:\n" + gcc_out
   end
@@ -194,6 +201,8 @@ make a function called x64_link_objs takes obj_paths, runtime_obj_path, out_path
   end
   sb_push(resp, runtime_obj_path + chr(10))
   sb_push(resp, "-Wl,--subsystem,console" + chr(10))
+  # 256 MB stack reserve, as x64_pe_link.patlang's own linker sets.
+  sb_push(resp, "-Wl,--stack,268435456" + chr(10))
   # -Wl,--disable-dynamicbase: see x64_build's own header note above.
   sb_push(resp, "-Wl,--disable-dynamicbase" + chr(10))
   sb_push(resp, "-lkernel32" + chr(10))
@@ -320,23 +329,28 @@ end
 # explicit, verified-against-the-real-DLLs list here rather than derived
 # from a ChunkImage's own `externs`.
 #
-# round/trunc are deliberately ABSENT and must stay absent: msvcrt.dll
-# exports ceil, floor and fabs but neither round nor trunc (checked
-# against the real DLL's export table). Importing them would name two
-# symbols that do not exist -- exactly the Phase 4 bug already found and
-# fixed once. x64_roundlike_asm therefore synthesises both from
+# round/trunc are not imported: msvcrt.dll, which this list used to name,
+# exports ceil, floor and fabs but neither round nor trunc, so importing
+# them named two symbols that did not exist -- the Phase 4 bug already
+# found and fixed once. x64_roundlike_asm therefore synthesises both from
 # floor/ceil; see its own header. (An earlier version of this comment
 # claimed roundlike used SSE roundsd and never called out at all; that
 # had stopped being true, and the stale claim hid a real bug -- codegen
 # was emitting `call round` against an import list that rightly did not
 # declare it, so any program rounding a float failed to link natively.)
+#
+# The math functions come from UCRTBASE.DLL, the C runtime Rust's std
+# (and so the interpreter) calls: MSVCRT.DLL's sin(pi/4) is
+# 0.7071067811865475, one ulp below ucrtbase's 0.7071067811865476, and
+# that ulp, through raytrace's rotations, changed printed results
+# (ch11/ch19).
 make a function called x64_default_import_spec returns spec
   return [
-    ["KERNEL32.DLL", ["GetStdHandle", "WriteFile", "ExitProcess", "CreateFileA", "GetFileSize", "CloseHandle", "ReadFile", "CreateProcessA", "CreatePipe", "SetHandleInformation", "WaitForSingleObject", "GetCommandLineA", "GetEnvironmentVariableA", "GetExitCodeProcess", "TerminateProcess", "Sleep", "GetTickCount64", "CopyFileA", "MoveFileExA", "DeleteFileA", "RemoveDirectoryA", "CreateDirectoryA", "GetFileAttributesA", "FindFirstFileA", "FindNextFileA", "FindClose", "GetConsoleMode", "SetConsoleMode", "SetConsoleOutputCP", "SetConsoleCP", "GetCurrentDirectoryA", "SetCurrentDirectoryA", "CreatePseudoConsole", "ResizePseudoConsole", "ClosePseudoConsole", "InitializeProcThreadAttributeList", "UpdateProcThreadAttribute", "CreateProcessW", "PeekNamedPipe", "GetLastError", "CreateThread", "ExitThread", "InitializeCriticalSection", "EnterCriticalSection", "LeaveCriticalSection", "TlsAlloc", "TlsGetValue", "TlsSetValue", "AcquireSRWLockExclusive", "ReleaseSRWLockExclusive", "SleepConditionVariableSRW", "WakeConditionVariable", "GetModuleHandleW", "GlobalAlloc", "GlobalLock", "GlobalUnlock", "GlobalSize", "VirtualAlloc"]],
+    ["KERNEL32.DLL", ["GetStdHandle", "WriteFile", "ExitProcess", "CreateFileA", "GetFileSize", "CloseHandle", "ReadFile", "CreateProcessA", "CreatePipe", "SetHandleInformation", "WaitForSingleObject", "GetCommandLineA", "GetEnvironmentVariableA", "GetExitCodeProcess", "TerminateProcess", "Sleep", "GetTickCount64", "CopyFileA", "MoveFileExA", "DeleteFileA", "RemoveDirectoryA", "CreateDirectoryA", "GetFileAttributesA", "FindFirstFileA", "FindNextFileA", "FindClose", "GetConsoleMode", "SetConsoleMode", "SetConsoleOutputCP", "SetConsoleCP", "GetCurrentDirectoryA", "SetCurrentDirectoryA", "CreatePseudoConsole", "ResizePseudoConsole", "ClosePseudoConsole", "InitializeProcThreadAttributeList", "UpdateProcThreadAttribute", "CreateProcessW", "PeekNamedPipe", "GetLastError", "CreateThread", "ExitThread", "InitializeCriticalSection", "EnterCriticalSection", "LeaveCriticalSection", "TlsAlloc", "TlsGetValue", "TlsSetValue", "AcquireSRWLockExclusive", "ReleaseSRWLockExclusive", "SleepConditionVariableSRW", "WakeConditionVariable", "GetModuleHandleW", "GlobalAlloc", "GlobalLock", "GlobalUnlock", "GlobalSize", "VirtualAlloc", "SetFilePointerEx"]],
     ["WS2_32.DLL", ["WSAStartup", "WSAGetLastError", "socket", "bind", "listen", "accept", "connect", "send", "recv", "closesocket", "shutdown", "getaddrinfo", "freeaddrinfo", "getsockname", "ioctlsocket", "htons", "ntohs"]],
     ["USER32.DLL", ["RegisterClassExW", "CreateWindowExW", "ShowWindow", "UpdateWindow", "DefWindowProcW", "PeekMessageW", "TranslateMessage", "DispatchMessageW", "BeginPaint", "EndPaint", "InvalidateRect", "GetClientRect", "DestroyWindow", "GetKeyState", "OpenClipboard", "CloseClipboard", "EmptyClipboard", "SetClipboardData", "GetClipboardData", "SetWindowTextA", "GetDC", "ReleaseDC"]],
     ["GDI32.DLL", ["CreateCompatibleDC", "CreateDIBSection", "SelectObject", "BitBlt", "TextOutA", "SetTextColor", "SetBkMode", "DeleteObject", "StretchDIBits"]],
-    ["MSVCRT.DLL", ["sqrt", "pow", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "log", "exp", "ceil", "floor", "fabs"]]
+    ["UCRTBASE.DLL", ["sqrt", "pow", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "log", "exp", "ceil", "floor", "fabs"]]
   ]
 end
 

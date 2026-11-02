@@ -9,9 +9,9 @@ Feature: parallel_map over real threads (GitHub issue #176, threads half)
   `bi_run_from` on the named block. The interpreter intercepts the `parallel_map`
   CallHost because it alone holds the running program.
 
-  Limits, stated plainly. Workers share only the immutable program and their own
-  item: a worker starts with empty `__globals` and its changes to globals are not
-  written back. A worker that uses a Box is unsupported -- the refcounted heap is
+  Limits, stated plainly. Workers share the immutable program and the caller's
+  globals, and have their own item: a worker starts with the caller's `__globals`
+  and its changes to globals are not written back. A worker that uses a Box is unsupported -- the refcounted heap is
   ambient, non-thread-safe state, which is exactly the refcount-thread-safety
   question Phase 14 deferred. `thread_spawn` is not covered here. Interpreter
   only: native and WASM reject the host name.

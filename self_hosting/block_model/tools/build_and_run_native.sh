@@ -46,5 +46,5 @@ nasm -f win64 -o "${OUT}_apply.obj" "${OUT}_apply.asm" || exit 1
 # script's own direct gcc invocation needed the same fix independently
 # since it doesn't go through that helper.
 gcc -o "$OUT.exe" "$OUT.obj" "${OUT}_apply.obj" self_hosting/build/x64_runtime.obj \
-  -Wl,--subsystem,console -Wl,--disable-dynamicbase -lkernel32 -luser32 -lgdi32 -lws2_32 || exit 1
+  -Wl,--subsystem,console -Wl,--stack,268435456 -Wl,--disable-dynamicbase -lkernel32 -luser32 -lgdi32 -lws2_32 || exit 1
 "./$OUT.exe"

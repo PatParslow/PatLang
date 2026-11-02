@@ -144,6 +144,7 @@ const HOST_CHUNK_TABLE: &[(&str, ChunkId)] = &[
     ("set_var", ChunkId::Oo),
     ("get", ChunkId::Oo),
     ("send", ChunkId::Oo),
+    ("object_delete", ChunkId::Oo),
     ("infer_type_for", ChunkId::Logic),
     ("fact", ChunkId::Logic),
     ("goal", ChunkId::Logic),
@@ -466,6 +467,10 @@ fn obj_set(name: &str, prop: &str, val: Value) {
     });
 }
 #[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+fn obj_delete(name: &str) {
+    OBJECTS.with(|o| { o.borrow_mut().remove(name); });
+}
+#[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
 fn obj_push(name: &str, prop: &str, val: Value) {
     OBJECTS.with(|o| {
         let mut b = o.borrow_mut();
@@ -485,6 +490,10 @@ fn obj_get(name: &str, prop: &str) -> Option<Value> {
 fn obj_set(name: &str, prop: &str, val: Value) {
     let mut b = OBJECTS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
     b.entry(name.to_string()).or_insert_with(HashMap::new).insert(prop.to_string(), val);
+}
+#[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
+fn obj_delete(name: &str) {
+    OBJECTS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap().remove(name);
 }
 #[cfg(any(not(target_arch = "wasm32"), target_feature = "atomics"))]
 fn obj_push(name: &str, prop: &str, val: Value) {
@@ -1750,7 +1759,22 @@ enum Value {
     List(Arc<Vec<Value>>),
     Object(HashMap<String, Value>),
     Closure { func_name: String, captured: Vec<(String, Value)> },
+    StringBuilder(CellT<String>),
+    Vec(CellT<Vec<Value>>),
 }
+
+// A string builder (sb_new) and a vec (vec_new) are values with a stable
+// identity, freed with their last reference, compared by identity
+// (docs/plans/general-refcounting.md, 6e/6f).
+#[derive(Clone)]
+struct CellT<T>(Arc<std::sync::Mutex<T>>);
+impl<T> CellT<T> {
+    fn new(v: T) -> Self { CellT(Arc::new(std::sync::Mutex::new(v))) }
+    fn lock(&self) -> std::sync::MutexGuard<'_, T> { self.0.lock().unwrap_or_else(|e| e.into_inner()) }
+}
+// (trait impls on one line: the chunked build makes each indented fn pub)
+impl<T> PartialEq for CellT<T> { fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) } }
+impl<T> std::fmt::Debug for CellT<T> { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "Cell@{:p}", Arc::as_ptr(&self.0)) } }
 
 impl Value {
     fn as_number(&self) -> Result<f64, String> {
@@ -1773,6 +1797,7 @@ impl Value {
             Value::List(xs) => Ok(!xs.is_empty()),
             Value::Object(map) => Ok(!map.is_empty()),
             Value::Closure { .. } => Ok(true),
+            Value::StringBuilder(_) | Value::Vec(_) => Ok(true),
         }
     }
 }
@@ -1781,9 +1806,9 @@ fn display_value(v: &Value) -> String {
     match v {
         Value::Unit => String::new(),
         Value::Bool(b) => b.to_string(),
-        Value::Number(n) => if n.fract()==0.0 { format!("{}", *n as i64) } else { n.to_string() },
+        Value::Number(n) => if n.fract()==0.0 { if n.abs() < 9.2e18 { format!("{}", *n as i64) } else { format!("{:.0}", n) } } else { n.to_string() },
         Value::Int(n) => n.to_string(),
-        Value::Float(n) => if n.fract()==0.0 && n.is_finite() { format!("{}", *n as i64) } else { n.to_string() },
+        Value::Float(n) => if n.fract()==0.0 && n.is_finite() { if n.abs() < 9.2e18 { format!("{}", *n as i64) } else { format!("{:.0}", n) } } else { n.to_string() },
         Value::String(s) => s.as_ref().clone(),
         Value::List(xs) => {
             let parts: Vec<String> = xs.iter().map(|x| display_value(x)).collect();
@@ -1795,6 +1820,8 @@ fn display_value(v: &Value) -> String {
             format!("{{{}}}", kvs.join(", "))
         }
         Value::Closure { .. } => "<closure>".into(),
+        Value::StringBuilder(_) => "<string_builder>".into(),
+        Value::Vec(_) => "<vec>".into(),
     }
 }
 
@@ -1858,7 +1885,7 @@ fn cmp(k:&BinOpKind,a:&Value,b:&Value)->Result<Value,String>{
     };
     Ok(Value::Bool(res))
 }
-fn to_s(v:&Value)->String{ match v { Value::Unit=>String::new(), Value::Bool(b)=>b.to_string(), Value::Number(n)=> if n.fract()==0.0 {format!("{}",*n as i64)} else {n.to_string()}, Value::Int(n)=>n.to_string(), Value::Float(n)=> if n.fract()==0.0 && n.is_finite() {format!("{}",*n as i64)} else {n.to_string()}, Value::String(s)=>s.as_ref().clone(), Value::List(xs)=>{ let parts:Vec<String>=xs.iter().map(|x|to_s(x)).collect(); format!("[{}]", parts.join(", ")) }, Value::Object(map)=>{ let mut kvs:Vec<String>=map.iter().map(|(k,v)| format!("{}: {}",k,to_s(v))).collect(); kvs.sort(); format!("{{{}}}", kvs.join(", ")) }, Value::Closure{..} => "<closure>".to_string() } }
+fn to_s(v:&Value)->String{ match v { Value::Unit=>String::new(), Value::Bool(b)=>b.to_string(), Value::Number(n)=> if n.fract()==0.0 { if n.abs() < 9.2e18 {format!("{}",*n as i64)} else {format!("{:.0}",n)} } else {n.to_string()}, Value::Int(n)=>n.to_string(), Value::Float(n)=> if n.fract()==0.0 && n.is_finite() { if n.abs() < 9.2e18 {format!("{}",*n as i64)} else {format!("{:.0}",n)} } else {n.to_string()}, Value::String(s)=>s.as_ref().clone(), Value::List(xs)=>{ let parts:Vec<String>=xs.iter().map(|x|to_s(x)).collect(); format!("[{}]", parts.join(", ")) }, Value::Object(map)=>{ let mut kvs:Vec<String>=map.iter().map(|(k,v)| format!("{}: {}",k,to_s(v))).collect(); kvs.sort(); format!("{{{}}}", kvs.join(", ")) }, Value::Closure{..} => "<closure>".to_string(), Value::StringBuilder(_) => "<string_builder>".to_string(), Value::Vec(_) => "<vec>".to_string() } }
 fn type_of_impl(args: &[Value]) -> Value {
     let v = match args.get(0) { Some(v) => v, None => return Value::String("unit".to_string().into()) };
     let s = match v {
@@ -1871,6 +1898,8 @@ fn type_of_impl(args: &[Value]) -> Value {
         Value::List(_) => "list",
         Value::Object(_) => "object",
         Value::Closure{..} => "closure",
+        Value::StringBuilder(_) => "string_builder",
+        Value::Vec(_) => "vec",
     };
     Value::String(s.to_string().into())
 }
@@ -1905,7 +1934,22 @@ enum Value {
     List(Arc<Vec<Value>>),
     Object(HashMap<String, Value>),
     Closure { func_name: String, captured: Vec<(String, Value)> },
+    StringBuilder(CellT<String>),
+    Vec(CellT<Vec<Value>>),
 }
+
+// A string builder (sb_new) and a vec (vec_new) are values with a stable
+// identity, freed with their last reference, compared by identity
+// (docs/plans/general-refcounting.md, 6e/6f).
+#[derive(Clone)]
+struct CellT<T>(Arc<std::sync::Mutex<T>>);
+impl<T> CellT<T> {
+    fn new(v: T) -> Self { CellT(Arc::new(std::sync::Mutex::new(v))) }
+    fn lock(&self) -> std::sync::MutexGuard<'_, T> { self.0.lock().unwrap_or_else(|e| e.into_inner()) }
+}
+// (trait impls on one line: the chunked build makes each indented fn pub)
+impl<T> PartialEq for CellT<T> { fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) } }
+impl<T> std::fmt::Debug for CellT<T> { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "Cell@{:p}", Arc::as_ptr(&self.0)) } }
 
 // ===== BigIntT (hand-transcribed from ir/bignum_template.rs, unmodified logic) =====
 
@@ -2347,6 +2391,7 @@ impl Value {
             Value::List(xs) => Ok(!xs.is_empty()),
             Value::Object(map) => Ok(!map.is_empty()),
             Value::Closure { .. } => Ok(true),
+            Value::StringBuilder(_) | Value::Vec(_) => Ok(true),
         }
     }
 }
@@ -2355,9 +2400,9 @@ fn nt_value_to_string(v: &Value) -> String {
     match v {
         Value::Unit => String::new(),
         Value::Bool(b) => b.to_string(),
-        Value::Number(n) => if n.fract()==0.0 { format!("{}", *n as i64) } else { n.to_string() },
+        Value::Number(n) => if n.fract()==0.0 { if n.abs() < 9.2e18 { format!("{}", *n as i64) } else { format!("{:.0}", n) } } else { n.to_string() },
         Value::Int(n) => n.to_string(),
-        Value::Float(n) => if n.fract()==0.0 && n.is_finite() { format!("{}", *n as i64) } else { n.to_string() },
+        Value::Float(n) => if n.fract()==0.0 && n.is_finite() { if n.abs() < 9.2e18 { format!("{}", *n as i64) } else { format!("{:.0}", n) } } else { n.to_string() },
         Value::BigInt(b) => b.to_string(),
         Value::Rational(r) => format!("{}/{}", r.num, r.den),
         Value::Complex(c) => format!("{}+{}i", nt_num_to_string(&c.re), nt_num_to_string(&c.im)),
@@ -2369,12 +2414,14 @@ fn nt_value_to_string(v: &Value) -> String {
             format!("{{{}}}", kvs.join(", "))
         }
         Value::Closure { .. } => "<closure>".into(),
+        Value::StringBuilder(_) => "<string_builder>".into(),
+        Value::Vec(_) => "<vec>".into(),
     }
 }
 fn nt_num_to_string(n: &NumT) -> String {
     match n {
         NumT::Int(x) => x.to_string(),
-        NumT::Float(x) => if x.fract()==0.0 && x.is_finite() { format!("{}", *x as i64) } else { x.to_string() },
+        NumT::Float(x) => if x.fract()==0.0 && x.is_finite() { if x.abs() < 9.2e18 { format!("{}", *x as i64) } else { format!("{:.0}", x) } } else { x.to_string() },
         NumT::Big(b) => b.to_string(),
         NumT::Rat(r) => format!("{}/{}", r.num, r.den),
     }
@@ -2566,6 +2613,8 @@ fn type_of_impl(args: &[Value]) -> Value {
         Value::List(_) => "list",
         Value::Object(_) => "object",
         Value::Closure{..} => "closure",
+        Value::StringBuilder(_) => "string_builder",
+        Value::Vec(_) => "vec",
     };
     Value::String(s.to_string().into())
 }
@@ -2955,182 +3004,150 @@ fn host_call_strings_ext(name: &str, args: &[Value]) -> Option<Result<Value, Str
 
 "##;
 
-    const PRELUDE_COLLECTIONS_HANDLES: &'static str = r##"thread_local! {
-    static VECS: RefCell<Vec<Vec<Value>>> = RefCell::new(Vec::new());
-    static SBUFS: RefCell<Vec<String>> = RefCell::new(Vec::new());
-    static ISTRINGS: RefCell<Vec<(String, bool, Vec<char>)>> = RefCell::new(Vec::new());
+    const PRELUDE_COLLECTIONS_HANDLES: &'static str = r##"// str_intern(s) returns s itself; what sc_* need to stay O(1) -- whether it
+// is ASCII, and a non-ASCII string's chars -- is cached per string object,
+// holding only a Weak reference so the entry dies with the string. It was an
+// integer handle into a table that only grew (general-refcounting.md, 6l).
+struct InternInfo { owner: std::sync::Weak<String>, ascii: bool, chars: Arc<Vec<char>> }
+thread_local! {
+    static INTERN_INFO: RefCell<(HashMap<usize, InternInfo>, usize)> = RefCell::new((HashMap::new(), 64));
+}
+
+fn intern_info(s: &Arc<String>) -> (bool, Arc<Vec<char>>) {
+    let key = Arc::as_ptr(s) as usize;
+    INTERN_INFO.with(|c| {
+        let mut c = c.borrow_mut();
+        if let Some(e) = c.0.get(&key) {
+            if let Some(o) = e.owner.upgrade() {
+                if Arc::ptr_eq(&o, s) { return (e.ascii, e.chars.clone()); }
+            }
+        }
+        if c.0.len() >= c.1 {
+            c.0.retain(|_, e| e.owner.strong_count() > 0);
+            c.1 = (c.0.len() * 2).max(64);
+        }
+        let ascii = s.is_ascii();
+        let chars = Arc::new(if ascii { Vec::new() } else { s.chars().collect() });
+        c.0.insert(key, InternInfo { owner: Arc::downgrade(s), ascii, chars: chars.clone() });
+        (ascii, chars)
+    })
+}
+
+fn arg_interned(args: &[Value], what: &str) -> Result<Arc<String>, String> {
+    match args.get(0) {
+        Some(Value::String(s)) => Ok(s.clone()),
+        _ => Err(format!("{}: expected an interned string", what)),
+    }
 }
 
 fn host_call_collections_handles_inner(name: &str, args: &[Value]) -> Result<Value, String> {
     match name {
 "vec_new" => {
                 // Optional capacity hint -- see hosts.rs's matching host_
-                // vec_new comment: pre-reserves storage via Vec::with_
-                // capacity so a caller who knows the eventual size avoids
-                // the reallocate-and-copy cycles Vec::new()+repeated push
-                // would otherwise pay. Correctness-identical either way.
+                // vec_new comment. A vec is a value (Value::Vec), freed with
+                // its last reference; it was an index into a table that
+                // only grew.
                 let capacity = match args.get(0) {
                     Some(v) => v.as_number().ok().map(|n| n.max(0.0) as usize).unwrap_or(0),
                     None => 0,
                 };
-                let id = VECS.with(|v| { let mut b = v.borrow_mut(); b.push(Vec::with_capacity(capacity)); b.len() - 1 });
-                Ok(Value::Number(id as f64))
+                Ok(Value::Vec(CellT::new(Vec::with_capacity(capacity))))
             }
             "vec_push" => {
-                let id = arg_usize(&args, 0, "vec_push")?;
                 let item = args.get(1).cloned().unwrap_or(Value::Unit);
-                VECS.with(|v| {
-                    let mut b = v.borrow_mut();
-                    b.get_mut(id).ok_or_else(|| format!("vec_push: unknown vec {}", id)).map(|xs| xs.push(item))
-                })?;
+                match args.get(0) { Some(Value::Vec(c)) => c.lock().push(item), _ => return Err("vec_push: expected a vec".into()) }
                 Ok(Value::Unit)
             }
             "vec_extend" => {
-                // vec_extend(vec_id, list) -> appends every element of
-                // `list` in ONE bulk call (extend_from_slice), not one
-                // host-call dispatch per element. See hosts.rs's own
-                // host_vec_extend for the full rationale (2026-10-19
-                // Block Ownership Model perf investigation).
-                let id = arg_usize(&args, 0, "vec_extend")?;
-                let items: &[Value] = match args.get(1) {
-                    Some(Value::List(xs)) => xs.as_ref(),
+                // vec_extend(vec, list) -> appends every element of `list`
+                // in ONE bulk call. See hosts.rs's own host_vec_extend.
+                let items: Vec<Value> = match args.get(1) {
+                    Some(Value::List(xs)) => xs.as_ref().clone(),
                     _ => return Err("vec_extend: expected a list as the second argument".into()),
                 };
-                VECS.with(|v| {
-                    let mut b = v.borrow_mut();
-                    let xs = b.get_mut(id).ok_or_else(|| format!("vec_extend: unknown vec {}", id))?;
-                    xs.extend_from_slice(items);
-                    Ok::<(), String>(())
-                })?;
+                match args.get(0) { Some(Value::Vec(c)) => c.lock().extend(items), _ => return Err("vec_extend: expected a vec".into()) }
                 Ok(Value::Unit)
             }
             "vec_set" => {
-                let id = arg_usize(&args, 0, "vec_set")?;
                 let idx = arg_usize(&args, 1, "vec_set")?;
                 let item = args.get(2).cloned().unwrap_or(Value::Unit);
-                VECS.with(|v| {
-                    let mut b = v.borrow_mut();
-                    let xs = b.get_mut(id).ok_or_else(|| format!("vec_set: unknown vec {}", id))?;
-                    if idx >= xs.len() { return Err(format!("vec_set: index {} out of range (len {})", idx, xs.len())); }
-                    xs[idx] = item;
-                    Ok(())
-                })?;
+                let c = match args.get(0) { Some(Value::Vec(c)) => c, _ => return Err("vec_set: expected a vec".into()) };
+                let mut xs = c.lock();
+                if idx >= xs.len() { return Err(format!("vec_set: index {} out of range (len {})", idx, xs.len())); }
+                xs[idx] = item;
                 Ok(Value::Unit)
             }
             "vec_get" => {
-                let id = arg_usize(&args, 0, "vec_get")?;
                 let idx = arg_usize(&args, 1, "vec_get")?;
-                VECS.with(|v| {
-                    let b = v.borrow();
-                    b.get(id).ok_or_else(|| format!("vec_get: unknown vec {}", id))
-                        .map(|xs| xs.get(idx).cloned().unwrap_or(Value::Unit))
-                })
+                match args.get(0) { Some(Value::Vec(c)) => Ok(c.lock().get(idx).cloned().unwrap_or(Value::Unit)), _ => Err("vec_get: expected a vec".into()) }
             }
             "vec_len" => {
-                let id = arg_usize(&args, 0, "vec_len")?;
-                VECS.with(|v| {
-                    let b = v.borrow();
-                    b.get(id).ok_or_else(|| format!("vec_len: unknown vec {}", id)).map(|xs| Value::Number(xs.len() as f64))
-                })
+                match args.get(0) { Some(Value::Vec(c)) => Ok(Value::Number(c.lock().len() as f64)), _ => Err("vec_len: expected a vec".into()) }
             }
             "vec_to_list" => {
-                let id = arg_usize(&args, 0, "vec_to_list")?;
-                VECS.with(|v| {
-                    let b = v.borrow();
-                    b.get(id).ok_or_else(|| format!("vec_to_list: unknown vec {}", id)).map(|xs| Value::List(Arc::new(xs.clone())))
-                })
+                match args.get(0) { Some(Value::Vec(c)) => Ok(Value::List(Arc::new(c.lock().clone()))), _ => Err("vec_to_list: expected a vec".into()) }
             }
             "str_intern" => {
-                let s = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => to_s(v), None => String::new() };
-                let is_ascii = s.is_ascii();
-                let chars: Vec<char> = if is_ascii { Vec::new() } else { s.chars().collect() };
-                let id = ISTRINGS.with(|v| { let mut b = v.borrow_mut(); b.push((s, is_ascii, chars)); b.len() - 1 });
-                Ok(Value::Number(id as f64))
+                let s: Arc<String> = match args.get(0) { Some(Value::String(s)) => s.clone(), Some(v) => Arc::new(to_s(v)), None => Arc::new(String::new()) };
+                intern_info(&s);
+                Ok(Value::String(s))
             }
             "sc_len" => {
                 // GitHub #96 (follow-up): a string LENGTH is always an
-                // integer -- Value::Number(f64) here poisons any numeric-
-                // tower-aware arithmetic built on it (e.g. `i < sc_len(h)`
-                // loop bounds, or accumulation) into float-space, same bug
-                // class as char_code below. sc_len is used in essentially
-                // every self-hosted lexer loop (self_hosting/lib/lexer.
-                // patlang's tokenize), so this has broad reach.
-                let id = arg_usize(&args, 0, "sc_len")?;
-                ISTRINGS.with(|v| {
-                    let b = v.borrow();
-                    b.get(id).ok_or_else(|| format!("sc_len: unknown string {}", id))
-                        .map(|(s, is_ascii, chars)| Value::Int(if *is_ascii { s.len() as i64 } else { chars.len() as i64 }))
-                })
+                // integer -- Value::Number(f64) here poisons numeric-tower
+                // arithmetic built on it (self_hosting/lib/lexer.patlang's
+                // tokenize loop bounds).
+                let s = arg_interned(&args, "sc_len")?;
+                let (ascii, chars) = intern_info(&s);
+                Ok(Value::Int(if ascii { s.len() as i64 } else { chars.len() as i64 }))
             }
             "sc_code" => {
-                // GitHub #96 (follow-up): same fix as char_code above -- a
-                // character code is always an integer.
-                let id = arg_usize(&args, 0, "sc_code")?;
+                // GitHub #96 (follow-up): a character code is always an integer.
+                let s = arg_interned(&args, "sc_code")?;
                 let idx = arg_usize(&args, 1, "sc_code")?;
-                ISTRINGS.with(|v| {
-                    let b = v.borrow();
-                    let (s, is_ascii, chars) = b.get(id).ok_or_else(|| format!("sc_code: unknown string {}", id))?;
-                    if *is_ascii {
-                        return Ok(Value::Int(match s.as_bytes().get(idx) { Some(c) => *c as i64, None => -1 }));
-                    }
-                    Ok(Value::Int(match chars.get(idx) { Some(c) => *c as u32 as i64, None => -1 }))
-                })
+                let (ascii, chars) = intern_info(&s);
+                if ascii {
+                    return Ok(Value::Int(match s.as_bytes().get(idx) { Some(c) => *c as i64, None => -1 }));
+                }
+                Ok(Value::Int(match chars.get(idx) { Some(c) => *c as u32 as i64, None => -1 }))
             }
             "sc_char" => {
-                let id = arg_usize(&args, 0, "sc_char")?;
+                let s = arg_interned(&args, "sc_char")?;
                 let idx = arg_usize(&args, 1, "sc_char")?;
-                ISTRINGS.with(|v| {
-                    let b = v.borrow();
-                    let (s, is_ascii, chars) = b.get(id).ok_or_else(|| format!("sc_char: unknown string {}", id))?;
-                    if *is_ascii {
-                        return Ok(match s.as_bytes().get(idx) { Some(c) => Value::String((*c as char).to_string().into()), None => Value::String(String::new().into()) });
-                    }
-                    Ok(match chars.get(idx) { Some(c) => Value::String(c.to_string().into()), None => Value::String(String::new().into()) })
-                })
+                let (ascii, chars) = intern_info(&s);
+                if ascii {
+                    return Ok(match s.as_bytes().get(idx) { Some(c) => Value::String((*c as char).to_string().into()), None => Value::String(String::new().into()) });
+                }
+                Ok(match chars.get(idx) { Some(c) => Value::String(c.to_string().into()), None => Value::String(String::new().into()) })
             }
             "sc_substr" => {
-                // GitHub #74: same fix as sc_char/sc_code above, applied to
-                // substr()'s own untouched is_ascii() cost -- a parser
-                // calling substr() once per token (e.g. a numeric literal or
-                // a \u escape) on a multi-megabyte document pays the full
-                // is_ascii() scan on every token, itself O(n) calls for a
-                // document made of many small tokens -- the second O(n^2)
-                // contributor json_parse's quadratic blowup came from,
-                // alongside sc_char replacing raw s[p].
-                let id = arg_usize(&args, 0, "sc_substr")?;
+                // GitHub #74: substr()'s own is_ascii() scan per call made a
+                // token-by-token parser quadratic; reuses the cached flag.
+                let s = arg_interned(&args, "sc_substr")?;
                 let start = arg_usize(&args, 1, "sc_substr")?;
                 let count = arg_usize(&args, 2, "sc_substr")?;
-                ISTRINGS.with(|v| {
-                    let b = v.borrow();
-                    let (s, is_ascii, chars) = b.get(id).ok_or_else(|| format!("sc_substr: unknown string {}", id))?;
-                    if *is_ascii {
-                        let bytes = s.as_bytes();
-                        let st = start.min(bytes.len());
-                        let en = st.saturating_add(count).min(bytes.len());
-                        return Ok(Value::String(String::from_utf8_lossy(&bytes[st..en]).to_string().into()));
-                    }
-                    Ok(Value::String(chars.iter().skip(start).take(count).collect::<String>().into()))
-                })
+                let (ascii, chars) = intern_info(&s);
+                if ascii {
+                    let bytes = s.as_bytes();
+                    let st = start.min(bytes.len());
+                    let en = st.saturating_add(count).min(bytes.len());
+                    return Ok(Value::String(String::from_utf8_lossy(&bytes[st..en]).to_string().into()));
+                }
+                Ok(Value::String(chars.iter().skip(start).take(count).collect::<String>().into()))
             }
             "sb_new" => {
-                let id = SBUFS.with(|v| { let mut b = v.borrow_mut(); b.push(String::new()); b.len() - 1 });
-                Ok(Value::Number(id as f64))
+                // A string builder is a value (Value::StringBuilder), freed
+                // with its last reference; it was an index into a table
+                // that only grew.
+                Ok(Value::StringBuilder(CellT::new(String::new())))
             }
             "sb_push" => {
-                let id = arg_usize(&args, 0, "sb_push")?;
                 let text = match args.get(1) { Some(Value::String(s)) => s.as_ref().clone(), Some(v) => to_s(v), None => String::new() };
-                SBUFS.with(|v| {
-                    let mut b = v.borrow_mut();
-                    b.get_mut(id).ok_or_else(|| format!("sb_push: unknown buffer {}", id)).map(|s| s.push_str(&text))
-                })?;
+                match args.get(0) { Some(Value::StringBuilder(c)) => c.lock().push_str(&text), _ => return Err("sb_push: expected a string builder".into()) }
                 Ok(Value::Unit)
             }
             "sb_str" => {
-                let id = arg_usize(&args, 0, "sb_str")?;
-                SBUFS.with(|v| {
-                    let b = v.borrow();
-                    b.get(id).ok_or_else(|| format!("sb_str: unknown buffer {}", id)).map(|s| Value::String(s.clone().into()))
-                })
+                match args.get(0) { Some(Value::StringBuilder(c)) => Ok(Value::String(c.lock().clone().into())), _ => Err("sb_str: expected a string builder".into()) }
             }
                     _ => Err(format!("host fn '{}' not found", name)),
     }
@@ -3738,13 +3755,18 @@ fn host_call_io_misc(name: &str, args: &[Value]) -> Option<Result<Value, String>
                     _ => Ok(Value::Unit),
                 }
             }
+"object_delete" => {
+                if args.len() != 1 { return Err("object_delete: expected 1 arg (name)".into()); }
+                obj_delete(&to_s(&args[0]));
+                Ok(Value::Unit)
+            }
                     _ => Err(format!("host fn '{}' not found", name)),
     }
 }
 
 fn host_call_oo(name: &str, args: &[Value]) -> Option<Result<Value, String>> {
     match name {
-        "new" | "set_var" | "get" | "send" | "class_def" => Some(host_call_oo_inner(name, args)),
+        "new" | "set_var" | "get" | "send" | "class_def" | "object_delete" => Some(host_call_oo_inner(name, args)),
         _ => None,
     }
 }
@@ -5772,9 +5794,6 @@ fn rt_world_run(program: &Program, events: Vec<(String, String)>, opts: Option<&
     #[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
     let _ = depth;
     let mut r: Vec<Box<dyn FnOnce()>> = Vec::new();
-    rt_swap_local!(r, VECS, Vec::new());
-    rt_swap_local!(r, SBUFS, Vec::new());
-    rt_swap_local!(r, ISTRINGS, Vec::new());
     rt_swap_local!(r, FACTS, HashMap::new());
     rt_swap_local!(r, GOALS, Vec::new());
     rt_swap_local!(r, TYPE_RULES, HashMap::new());
@@ -6154,6 +6173,10 @@ fn host_call_codegen_bootstrap(name: &str, args: &[Value]) -> Option<Result<Valu
                 // Closures are always created at runtime via MakeClosure, never
                 // as a Const literal; a lowerer that emits one is a bug.
                 panic!("emit_value: closures cannot appear as compile-time constants");
+            }
+            Value::StringBuilder(_) | Value::Vec(_) => {
+                // Made only by sb_new/vec_new at run time, like closures.
+                panic!("emit_value: string builders and vecs cannot appear as compile-time constants");
             }
         }
     }

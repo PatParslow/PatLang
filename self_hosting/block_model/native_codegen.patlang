@@ -122,12 +122,18 @@ end
 # HandlerLookup/GlobalGet's own established pop order), pushes the
 # looked-up value or false. `out` is the instruction stream so far;
 # returns the updated stream with this whole loop appended.
+# Every rt_list_get returns a reference of its own (Phase 7,
+# docs/plans/general-refcounting.md); the walk releases each, and the
+# value found stays a borrow from the table, as it always was: the
+# globals and handler tables are threaded, not counted.
 make a function called bm_nc_emit_assoc_get takes out, block_name, uniq returns out2
   let handler_l = bm_nc_local(block_name, uniq, "h")
   let name_l = bm_nc_local(block_name, uniq, "k")
   let i_l = bm_nc_local(block_name, uniq, "i")
   let n_l = bm_nc_local(block_name, uniq, "n")
   let entry_l = bm_nc_local(block_name, uniq, "e")
+  let key_l = bm_nc_local(block_name, uniq, "ek")
+  let eq_l = bm_nc_local(block_name, uniq, "eq")
   let result_l = bm_nc_local(block_name, uniq, "r")
   let out = list_push(out, ["Store", handler_l])
   let out = list_push(out, ["Store", name_l])
@@ -149,18 +155,26 @@ make a function called bm_nc_emit_assoc_get takes out, block_name, uniq returns 
   let out = list_push(out, ["Load", entry_l])
   let out = list_push(out, ["Const", "num", "0"])
   let out = list_push(out, ["Call", "rt_list_get", 2])
+  let out = list_push(out, ["Store", key_l])
+  let out = list_push(out, ["Load", key_l])
   let out = list_push(out, ["Load", name_l])
   let out = list_push(out, ["Call", "rt_str_eq", 2])
+  let out = list_push(out, ["Store", eq_l])
+  let out = bm_nc_emit_release(out, block_name, key_l)
+  let out = list_push(out, ["Load", eq_l])
   let out = list_push(out, ["__RawJumpIfFalse", 0])
   let jif_continue_pos = list_len(out) - 1
   let out = list_push(out, ["Load", entry_l])
   let out = list_push(out, ["Const", "num", "1"])
   let out = list_push(out, ["Call", "rt_list_get", 2])
   let out = list_push(out, ["Store", result_l])
+  let out = bm_nc_emit_release(out, block_name, result_l)
+  let out = bm_nc_emit_release(out, block_name, entry_l)
   let out = list_push(out, ["__RawJump", 0])
   let jmp_done_pos = list_len(out) - 1
   let continue_target = list_len(out)
   let out = list_set(out, jif_continue_pos, ["__RawJumpIfFalse", continue_target])
+  let out = bm_nc_emit_release(out, block_name, entry_l)
   let out = list_push(out, ["Load", i_l])
   let out = list_push(out, ["Const", "num", "1"])
   let out = list_push(out, ["Bin", "+"])
@@ -175,10 +189,36 @@ make a function called bm_nc_emit_assoc_get takes out, block_name, uniq returns 
   return list_push(out, ["Load", result_l])
 end
 
+# Appends a release of the value in local `name` (the reference-count
+# entry point leaves `true`, which is discarded).
+make a function called bm_nc_emit_release takes out, block_name, name returns out2
+  let out = list_push(out, ["Load", name])
+  let out = list_push(out, ["Call", "rt_rc_dec_if_refcounted", 1])
+  return list_push(out, ["Store", bm_nc_prefix(block_name, "__bm_discard")])
+end
+
+# Appends `out_l = rt_list_push(out_l, <value on the stack>)`, the value
+# kept in tmp_l, and releases the version it replaces: list_push borrows
+# its list and takes its own reference to the element.
+make a function called bm_nc_emit_push_onto takes out, block_name, out_l, tmp_l returns out2
+  let old_l = tmp_l + "_old"
+  let out = list_push(out, ["Store", tmp_l])
+  let out = list_push(out, ["Load", out_l])
+  let out = list_push(out, ["Store", old_l])
+  let out = list_push(out, ["Load", old_l])
+  let out = list_push(out, ["Load", tmp_l])
+  let out = list_push(out, ["Call", "rt_list_push", 2])
+  let out = list_push(out, ["Store", out_l])
+  return bm_nc_emit_release(out, block_name, old_l)
+end
+
 # Pops (handler, name, ref) already on the stack (handler on top, matching
 # HandlerRegister/GlobalSet's own established pop order), pushes a real,
 # rebuilt updated list (never mutates the original -- same list_push-only
-# rule as bm_rt_assoc_set's own interpreted logic).
+# rule as bm_rt_assoc_set's own interpreted logic). Each superseded version
+# of the list being built, each entry read and each fresh [name, ref] pair
+# is released once the new version holds it (Phase 7); the new list is the
+# caller's.
 make a function called bm_nc_emit_assoc_set takes out, block_name, uniq returns out2
   let handler_l = bm_nc_local(block_name, uniq, "h")
   let name_l = bm_nc_local(block_name, uniq, "k")
@@ -186,6 +226,9 @@ make a function called bm_nc_emit_assoc_set takes out, block_name, uniq returns 
   let i_l = bm_nc_local(block_name, uniq, "i")
   let n_l = bm_nc_local(block_name, uniq, "n")
   let entry_l = bm_nc_local(block_name, uniq, "e")
+  let key_l = bm_nc_local(block_name, uniq, "ek")
+  let eq_l = bm_nc_local(block_name, uniq, "eq")
+  let pair_l = bm_nc_local(block_name, uniq, "pr")
   let out_l = bm_nc_local(block_name, uniq, "o")
   let replaced_l = bm_nc_local(block_name, uniq, "rp")
   let out = list_push(out, ["Store", handler_l])
@@ -213,36 +256,38 @@ make a function called bm_nc_emit_assoc_set takes out, block_name, uniq returns 
   let out = list_push(out, ["Load", entry_l])
   let out = list_push(out, ["Const", "num", "0"])
   let out = list_push(out, ["Call", "rt_list_get", 2])
+  let out = list_push(out, ["Store", key_l])
+  let out = list_push(out, ["Load", key_l])
   let out = list_push(out, ["Load", name_l])
   let out = list_push(out, ["Call", "rt_str_eq", 2])
+  let out = list_push(out, ["Store", eq_l])
+  let out = bm_nc_emit_release(out, block_name, key_l)
+  let out = list_push(out, ["Load", eq_l])
   let out = list_push(out, ["__RawJumpIfFalse", 0])
   let jif_notmatch_pos = list_len(out) - 1
-  # matched: push the UPDATED [name, ref] entry instead of the original.
+  # matched: the UPDATED [name, ref] entry instead of the original.
   # rt_list_push(l, v) -- list FIRST, value SECOND (a real bug, found
   # here: this used to push the [name,ref] entry before the list,
   # backwards, corrupting the list via rt_list_push's own address/length
   # read against the wrong operand -- confirmed via a real segfault, not
   # assumed correct from the shape alone).
-  let out = list_push(out, ["Load", out_l])
   let out = list_push(out, ["Load", name_l])
   let out = list_push(out, ["Load", ref_l])
   let out = list_push(out, ["BuildList", 2])
-  let out = list_push(out, ["Call", "rt_list_push", 2])
-  let out = list_push(out, ["Store", out_l])
+  let out = bm_nc_emit_push_onto(out, block_name, out_l, pair_l)
+  let out = bm_nc_emit_release(out, block_name, pair_l)
   let out = list_push(out, ["Const", "bool", "true"])
   let out = list_push(out, ["Store", replaced_l])
   let out = list_push(out, ["__RawJump", 0])
   let jmp_afterentry_pos = list_len(out) - 1
   let notmatch_target = list_len(out)
   let out = list_set(out, jif_notmatch_pos, ["__RawJumpIfFalse", notmatch_target])
-  # no match: carry the original entry over unchanged. Same fix: list
-  # (out_l) pushed first, value (entry_l) second.
-  let out = list_push(out, ["Load", out_l])
+  # no match: carry the original entry over unchanged.
   let out = list_push(out, ["Load", entry_l])
-  let out = list_push(out, ["Call", "rt_list_push", 2])
-  let out = list_push(out, ["Store", out_l])
+  let out = bm_nc_emit_push_onto(out, block_name, out_l, pair_l)
   let afterentry_target = list_len(out)
   let out = list_set(out, jmp_afterentry_pos, ["__RawJump", afterentry_target])
+  let out = bm_nc_emit_release(out, block_name, entry_l)
   let out = list_push(out, ["Load", i_l])
   let out = list_push(out, ["Const", "num", "1"])
   let out = list_push(out, ["Bin", "+"])
@@ -257,14 +302,12 @@ make a function called bm_nc_emit_assoc_set takes out, block_name, uniq returns 
   let jmp_done_pos = list_len(out) - 1
   let append_target = list_len(out)
   let out = list_set(out, jif_append_pos, ["__RawJumpIfFalse", append_target])
-  # Same fix again: list (out_l) pushed first, the newly-built [name,
-  # ref] entry second.
-  let out = list_push(out, ["Load", out_l])
+  # Not there before: the newly-built [name, ref] entry goes on the end.
   let out = list_push(out, ["Load", name_l])
   let out = list_push(out, ["Load", ref_l])
   let out = list_push(out, ["BuildList", 2])
-  let out = list_push(out, ["Call", "rt_list_push", 2])
-  let out = list_push(out, ["Store", out_l])
+  let out = bm_nc_emit_push_onto(out, block_name, out_l, pair_l)
+  let out = bm_nc_emit_release(out, block_name, pair_l)
   let done_target = list_len(out)
   let out = list_set(out, jmp_done_pos, ["__RawJump", done_target])
   return list_push(out, ["Load", out_l])
@@ -357,6 +400,9 @@ end
 # there by an ordinary JumpBlock tail call -- the same block compiled into
 # two FuncIRs is fine, each FuncIR having its own local namespace.
 make a function called bm_nc_fn_name takes name returns fname
+  if get("__vars", "bm_library_mode") == true then
+    return name
+  end
   return "bm_fn_" + name
 end
 
@@ -401,7 +447,7 @@ end
 # instruction names, plus -- if the program contains any CallDynamic, whose
 # callee is a runtime value -- every declared function.
 # Runtime functions that look a function up by name at run time (fiber_new,
-# apply, parallel_map, budgeted_run) need every callable emitted, the same
+# apply, parallel_map/bm_parallel_map, budgeted_run/bm_budgeted_run) need every callable emitted, the same
 # as CallDynamic: the name a program passes in is not a statically visible
 # call. GitHub #224: parallel_map was missing from this list entirely (its
 # own worker argument is always a bare string literal, never an ordinary
@@ -413,7 +459,7 @@ end
 # way (resolve_func_addr, x64_runtime.patlang) and was ALSO missing here,
 # though no existing test happened to exercise that specific gap yet.
 make a function called bm_nc_dispatches_by_name takes callee returns yes
-  return (callee == "fiber_new") or (callee == "apply") or (callee == "parallel_map") or (callee == "budgeted_run")
+  return (callee == "fiber_new") or (callee == "apply") or (callee == "parallel_map") or (callee == "bm_parallel_map") or (callee == "budgeted_run") or (callee == "bm_budgeted_run")
 end
 
 make a function called bm_nc_call_roots takes prog returns roots
@@ -490,28 +536,6 @@ end
 # "optimistic, taint only grows" shape codegen_x64.patlang's own dynamic-
 # bin analysis already uses for a different question.
 make a function called bm_nc_program_has_dynamic_dispatch takes prog returns yes
-  # Closures are a further way a "pure"-looking function name could be
-  # reached without an ordinary Call this analysis's own call-graph walk
-  # would see (thread_spawn's own closure trampoline, bm_closure_entry,
-  # dispatches a captured closure by a mechanism not traced here).
-  # bm_lower_program already tracks whether any closure literal was ever
-  # lowered (bm_closure_blocks, reset empty at its own start) -- reusing
-  # that existing signal is simpler and safer than re-deriving it here.
-  if list_len(get("__vars", "bm_closure_blocks")) > 0 then
-    return true
-  end
-  # Same reasoning once more: Emit dispatches to a handler by
-  # bm_nc_fn_name(handler), hardcoded to always take/return __globals
-  # (bm_nc_build_handler_funcirs), completely independent of this
-  # analysis's own pure_fns set. If a handler name were ALSO reachable
-  # as an ordinary declared-function root and happened to look locally
-  # pure, the two codegen paths could disagree about its own calling
-  # convention. Simplest safe rule: any program with events/handlers at
-  # all skips this optimization, rather than proving no name collision
-  # is possible between the two namespaces.
-  if list_len(bi_program_events(prog)) > 0 then
-    return true
-  end
   let blocks = bi_program_blocks(prog)
   let bn = list_len(blocks)
   let bi = 0
@@ -598,9 +622,18 @@ make a function called bm_nc_compute_pure_fns takes prog, roots returns pure_nam
   # nothing; a program that DOES use dynamic dispatch anywhere keeps the
   # exact behavior it already had before this change, correctness over
   # optimization coverage.
-  if bm_nc_program_has_dynamic_dispatch(prog) then
-    return []
-  end
+  # Name dispatch (CallDynamic, apply/parallel_map/fiber_new by name) no
+  # longer disqualifies the whole program: the CallDynamic dispatcher calls
+  # a pure target bare and wraps its result, and the apply table points a
+  # pure function's name at its adapter (bm_nc_build_dyn_adapter_funcirs),
+  # so every by-name caller still sees the [value, globals] convention.
+  # Only a function that itself dispatches by name is impure (it cannot
+  # know what it calls), as bm_nc_root_is_locally_pure_and_edges decides.
+  # Closures need nothing more: a closure call is a CallDynamic, and the
+  # thread and runtime entry points (bm_closure_entry, __closure_invoke)
+  # call apply, so they are impure and keep the __globals convention.
+  # Event handlers (named "__on_...", never a declared name) are compiled
+  # with __globals and are not roots; Emit itself is impure.
   let rn = list_len(roots)
   let locally_pure = []
   let call_edges = []
@@ -744,7 +777,30 @@ make a function called bm_nc_build_call_dynamic_funcirs takes prog returns funci
     while bi < bn do
       let cname = bi_block_name(list_get(blocks, bi))
       let declared = list_len(bi_block_params(list_get(blocks, bi))) - 1
-      if bm_nc_is_callable_name(cname) and (declared >= n_extra) then
+      if bm_nc_is_callable_name(cname) and (declared >= n_extra) and bm_nc_is_pure_fn(cname) then
+        # A pure target takes no __globals and returns its value bare:
+        # call it so, and wrap the result the way every other branch
+        # returns it.
+        let next_branch = list_len(body) + 8 + declared
+        let body = list_push(body, ["Load", "__cdyn_f"])
+        let body = list_push(body, ["Const", "str", cname])
+        let body = list_push(body, ["Call", "rt_str_eq", 2])
+        let body = list_push(body, ["JumpIfFalse", next_branch])
+        let k = 0
+        while k < n_extra do
+          let body = list_push(body, ["Load", "__cdyn_a" + k])
+          let k = k + 1
+        end
+        let k = n_extra
+        while k < declared do
+          let body = list_push(body, ["Const", "unit", ""])
+          let k = k + 1
+        end
+        let body = list_push(body, ["Call", bm_nc_fn_name(cname), declared])
+        let body = list_push(body, ["Load", "__cdyn_g"])
+        let body = list_push(body, ["BuildList", 2])
+        let body = list_push(body, ["Return"])
+      elif bm_nc_is_callable_name(cname) and (declared >= n_extra) then
         let next_branch = list_len(body) + 7 + declared
         let body = list_push(body, ["Load", "__cdyn_f"])
         let body = list_push(body, ["Const", "str", cname])
@@ -1283,66 +1339,22 @@ end
 # Bin/Un operator hashes (also bm_op_hash'd by lower.patlang's rewrite)
 # need to become real operator STRINGS again for the real FuncIR's own
 # Bin/Un instructions, which self_hosting/lib/codegen_x64.patlang parses
-# as literal "+"/"-"/etc.
+# as literal "+"/"-"/etc. The names come from block_ir.patlang's one
+# operator table, which the interpreter uses too.
 make a function called bm_nc_bin_op_string takes h returns s
-  if h == 177616 then
-    return "+"
-  elif h == 177618 then
-    return "-"
-  elif h == 177615 then
-    return "*"
-  elif h == 177620 then
-    return "/"
-  elif h == 177610 then
-    return "%"
-  elif h == 861968 then
-    return "=="
-  elif h == 861044 then
-    return "!="
-  elif h == 177633 then
-    return "<"
-  elif h == 861935 then
-    return "<="
-  elif h == 177635 then
-    return ">"
-  elif h == 862001 then
-    return ">="
-  elif h == 52935 then
-    return "band"
-  elif h == 486917 then
-    return "bor"
-  elif h == 78029 then
-    return "bxor"
-  elif h == 505193 then
-    return "shl"
-  elif h == 505199 then
-    return "shr"
+  let s = bm_bin_op_name(h)
+  if s == "" then
+    bm_nc_unsupported("Bin operator hash '" + h + "'")
   end
-  bm_nc_unsupported("Bin operator hash '" + h + "'")
-  return "+"
+  return s
 end
 
 make a function called bm_nc_un_op_string takes h returns s
-  if h == 499987 then
-    return "not"
-  elif h == 177618 then
-    return "-"
+  let s = bm_un_op_name(h)
+  if s == "" then
+    bm_nc_unsupported("Un operator hash '" + h + "'")
   end
-  bm_nc_unsupported("Un operator hash '" + h + "'")
-  return "not"
-end
-
-make a function called bm_nc_assoc_get takes assoc, key returns v
-  let n = list_len(assoc)
-  let i = 0
-  while i < n do
-    let entry = list_get(assoc, i)
-    if list_get(entry, 0) == key then
-      return list_get(entry, 1)
-    end
-    let i = i + 1
-  end
-  return false
+  return s
 end
 
 # Phase 19 (Emit): the transitive closure of block names reachable from
@@ -1455,12 +1467,9 @@ end
 # block per callable the whole program defines -- hundreds, for a
 # ~500-function bundle) took 7+ minutes of continuous near-100%-CPU
 # after every ordinary, few-block function had already flattened in a
-# combined ~1-2 minutes. bm_nc_assoc_get has no other caller at all
-# (grepped), so `starts` is replaced outright with a genuine O(1) index
-# (get/set_var under Gen A -- rust-runtime/src/ir/hosts.rs's OBJECTS
-# store, a real HashMap, confirmed via its own source) instead of
-# touching the still-correct, still-used-elsewhere bm_nc_assoc_get
-# itself. Block names are unique across the whole program, so stale
+# combined ~1-2 minutes. `starts` is now an index kept with get/set_var
+# (under Gen A, rust-runtime/src/ir/hosts.rs's OBJECTS store, a real
+# HashMap). Block names are unique across the whole program, so stale
 # entries from an earlier bm_nc_flatten_blocks call (a different
 # function's own blocks) can never collide with a name this call
 # queries.
@@ -1577,7 +1586,7 @@ make a function called bm_nc_wasm_rewrite takes flat returns out
     elif (list_get(instr, 0) == "CallHost") and ((list_get(instr, 1) == "bm_budgeted_run") or (list_get(instr, 1) == "budget_check")) then
       bm_nc_unsupported("'" + list_get(instr, 1) + "' (budgeted blocks, #176) under WASM -- they run in a fiber, and the Rust-source backend has no fiber host functions")
       let out = list_push(out, instr)
-    elif (list_get(instr, 0) == "CallHost") and (list_get(instr, 1) == "parallel_map") then
+    elif (list_get(instr, 0) == "CallHost") and ((list_get(instr, 1) == "parallel_map") or (list_get(instr, 1) == "bm_parallel_map")) then
       bm_nc_unsupported("'parallel_map' (#176) under WASM -- its worker is looked up by name among the Rust-source program's own functions, which the block-model FuncIRs are not")
       let out = list_push(out, instr)
     else
@@ -1637,47 +1646,19 @@ make a function called bm_nc_build_handler_funcirs takes prog, closures, print_o
     let root = list_get(pair, 0)
     let member_names = list_get(pair, 1)
     let hblocks = bm_nc_ordered_members(all_blocks, member_names, root)
+    # The same block-family ownership pass a function gets (see main's in
+    # bm_to_real_funcir); a handler's loop used to keep every value it
+    # rebound.
+    let hblocks = bm_nc_rewrite_multi_block_for_string_rc(prog, hblocks)
     let h_flat = bm_nc_flatten_blocks(prog, hblocks, [], print_op, "handler")
     let h_flat = list_push(h_flat, ["Load", bm_nc_prefix(root, "__globals")])
     let h_flat = list_push(h_flat, ["Return"])
     # docs/plans/general-refcounting.md, Phase 2: the same pass ordinary
     # callee functions and main already get, extended to handlers too.
     #
-    # GitHub #223 full-test follow-up: bm_nc_insert_list_get_result_incs
-    # runs UNCONDITIONALLY (single-block or not), unlike its 3 siblings
-    # here -- confirmed as a real, reproducible use-after-free otherwise.
-    # A list_get result stored into a named local (e.g. `let funcs =
-    # dll_entry[1]`) got NO protective increment at all in a multi-block
-    # (loop-containing) function, since this whole block only ran for
-    # single-block closures -- but the EXISTING "raw" (multi-block)
-    # decrement pass (bm_nc_rewrite_block_for_string_rc, reached via
-    # bm_nc_rewrite_multi_block_for_string_rc below) still decrements the
-    # PARENT producer (e.g. `dll_entry`) once ITS OWN last use passes,
-    # and that decrement's cascading free reaches into the child element
-    # (`funcs`) that was never given its own reference. Confirmed via a
-    # minimal 11-line repro (an outer while loop binding `funcs` from a
-    # list_get, a nested inner while loop reading funcs[fi] while growing
-    # a separate list via list_push): funcs's own length field read back
-    # corrupted (aliased with the separate list's length) under --x64,
-    # matching interpreted output exactly before this fix. The function's
-    # own logic is generic over a flat instrs list (no single-block
-    # assumption anywhere in its body -- jump-target shifting via
-    # bm_nc_reassign_shift_at already handles arbitrary insertion
-    # positions), so lifting the gate is safe. This does not yet insert
-    # the SYMMETRIC decrement for a forwarded-then-dead value in a LATER
-    # block (funcs's own true last use is in a different block than
-    # where it was produced) -- deliberately deferred, a separate,
-    # larger piece of work; this fix trades a bounded extra reference
-    # (never released until process exit) for correctness, matching the
-    # project's own "prefer a real fix over a compensating hack" standard
-    # applied to the half that's actually reachable today.
-    let h_flat = bm_nc_insert_list_get_result_incs(root, h_flat)
-    let h_single = bm_nc_closure_is_single_block(hblocks)
-    let h_flat = bm_nc_insert_list_element_incs(root, h_flat, h_single)
-    if h_single then
-      let h_flat = bm_nc_insert_reassignment_decs(root, h_flat)
-      let h_flat = bm_nc_insert_string_rc_decs(root, h_flat)
-    end
+    let h_flat = bm_nc_insert_list_element_incs(root, h_flat, false)
+    let h_flat = bm_nc_release_pure_call_arg_temps(root, h_flat)
+    let h_flat = bm_nc_release_call_pairs(root, h_flat)
     let params = [bm_nc_prefix(root, "event_name"), bm_nc_prefix(root, "event_data"), bm_nc_prefix(root, "__globals")]
     let funcirs = list_push(funcirs, ["FuncIR", root, params, h_flat, []])
     let ci = ci + 1
@@ -1721,7 +1702,7 @@ end
 # point -- deliberately deferred to a later, separate increment rather
 # than attempted here.
 make a function called bm_nc_string_producer_names returns names
-  return ["rt_str_concat", "sb_str", "chr", "substr", "sc_char", "rt_unit_to_str", "rt_int_to_str", "rt_limb9_to_str", "rt_dquote_str"]
+  return ["rt_str_concat", "sb_str", "chr", "substr", "sc_char", "sc_substr", "rt_unit_to_str", "rt_int_to_str", "rt_limb9_to_str", "rt_dquote_str"]
 end
 
 make a function called bm_nc_is_string_producer_call takes instr returns yes
@@ -1742,8 +1723,10 @@ end
 # DIFFERENT, freshly bm_alloc'd one; the doubling path does too), so a
 # local storing either of THEIR results is just as eligible a candidate
 # as a bare list literal.
+# read_file_bytes too: it always returns a list of its own (rt_list_new),
+# and a caller reading a picture row by row kept every row.
 make a function called bm_nc_list_producer_names returns names
-  return ["list_push", "list_set"]
+  return ["list_push", "list_set", "read_file_bytes"]
 end
 
 make a function called bm_nc_is_list_producer_call takes instr returns yes
@@ -1757,29 +1740,65 @@ make a function called bm_nc_is_list_producer_call takes instr returns yes
   return bm_list_contains(bm_nc_list_producer_names(), list_get(instr, 1))
 end
 
-# docs/plans/general-refcounting.md, Phase 4d: list_get (and `s[i]`/
-# `l[i]` indexing, which lowers to the exact same CallHost) is a THIRD
-# producer kind, distinct from the two static ones above -- unlike
-# chr()/concat() (always String) or BuildList/list_push/list_set
-# (always List), list_get's own return type depends on whatever is
-# actually SITTING in the container at runtime (an int, most of the
-# time, in many real programs) and cannot be known from the call site
-# alone. Its own decrement function is therefore the GENERIC runtime
-# dispatcher (rt_rc_dec_if_refcounted, x64_runtime.patlang) rather than
-# a type-specific one -- it already checks the value's own tag at
-# runtime and silently no-ops on anything that isn't actually a String
-# or List, which is exactly the "don't know statically, so ask at
-# runtime" fallback this one producer kind genuinely needs.
-make a function called bm_nc_dynamic_producer_names returns names
-  return ["list_get"]
+# Runtime functions returning a value of their own whose kind the compiler
+# does not track statically: a string builder or vec cell (x64_runtime
+# .patlang's counted cells), an interned string, and what the OS-facing
+# calls return -- a string adopted from an OS buffer, or a literal on some
+# paths (tcp_read_or_empty's ""), so they are released with the generic
+# dispatcher, which leaves a literal alone. Owned like a pure call's
+# result. The reads (list_get, vec_get, vec_to_list, get) are owned too
+# since Phase 7, and rt_fresh/rt_keep (codegen_x64 intrinsics) are the
+# runtime's own markers of
+# an owned value (x64_runtime.patlang).
+make a function called bm_nc_owned_runtime_producer_names returns names
+  return ["list_get", "vec_get", "vec_to_list", "get", "rt_fresh", "rt_keep", "rt_rc_retain", "sb_new", "vec_new", "str_intern", "getenv", "exec_capture", "exec_capture_io", "cwd", "os_get_cwd", "read_line", "os_read_line", "tcp_read", "tcp_read_or_empty", "os_recv", "list_dir", "os_find_data_name", "win_clipboard_get_text"]
 end
 
-make a function called bm_nc_is_dynamic_producer_call takes instr returns yes
+# A call -- Call or CallHost, as the block IR still spells a runtime call
+# before bm_patc_resolve_runtime_calls -- to a runtime function returning a
+# value, which its caller owns: a value function (bm_nc_library_value_fns),
+# known while compiling the runtime itself and, for a program, from the
+# runtime's exported list (bm_nc_load_runtime_value_fns).
+make a function called bm_nc_is_value_fn takes name returns yes
+  return get("__vars", "bm_value_fn__" + name) == true
+end
+
+# What a program needs to know about the runtime it links with (Phase 7):
+# every runtime function borrows its arguments, and a value function's
+# result is the caller's. `names` is the runtime's function list
+# (x64_runtime.funcs), `values` its value functions (x64_runtime.values,
+# bm_nc_library_value_fns).
+make a function called bm_nc_set_runtime_fns takes names, values returns done
+  let i = 0
+  while i < list_len(names) do
+    set_var("bm_rt_fn__" + list_get(names, i), true)
+    let i = i + 1
+  end
+  let i = 0
+  while i < list_len(values) do
+    set_var("bm_value_fn__" + list_get(values, i), true)
+    let i = i + 1
+  end
+  return true
+end
+
+# The functions the ownership passes count references with: each takes,
+# releases or counts the reference it is handed rather than borrowing it.
+make a function called bm_nc_is_rc_entry takes name returns yes
+  return bm_list_contains(["rt_rc_dec_if_refcounted", "rt_rc_inc_if_refcounted", "rt_rc_release_old", "rt_rc_retain", "rt_keep", "rt_fresh", "rt_list_rc_dec", "rt_string_rc_dec", "rt_list_release_shell", "bm_rc_inc", "bm_rc_dec"], name)
+end
+
+make a function called bm_nc_library_mode returns yes
+  return get("__vars", "bm_library_mode") == true
+end
+
+make a function called bm_nc_is_owned_runtime_producer_call takes instr returns yes
   let op = list_get(instr, 0)
   if (op != "Call") and (op != "CallHost") then
     return false
   end
-  return bm_list_contains(bm_nc_dynamic_producer_names(), list_get(instr, 1))
+  let name = list_get(instr, 1)
+  return bm_list_contains(bm_nc_owned_runtime_producer_names(), name) or bm_nc_is_value_fn(name)
 end
 
 # Every kind this pass currently knows how to decrement -- used only to
@@ -1788,7 +1807,59 @@ end
 # producer (below) decide WHICH decrement call a given eligible name
 # actually needs, once eligibility is otherwise established.
 make a function called bm_nc_is_refcounted_producer_call takes instr returns yes
-  return bm_nc_is_string_producer_call(instr) or bm_nc_is_list_producer_call(instr) or bm_nc_is_dynamic_producer_call(instr)
+  return bm_nc_is_string_producer_call(instr) or bm_nc_is_list_producer_call(instr) or bm_nc_is_pure_user_call(instr) or bm_nc_is_fresh_arith(instr) or bm_nc_is_owned_runtime_producer_call(instr)
+end
+
+# An arithmetic result is always a value of its own: an immediate int or raw
+# float (counting it is free, codegen_x64's x64_rc_call_asm), or a fresh
+# Rational, BigInt, boxed Float or concatenated string. Owned like a call's
+# result, it is released on reassignment, at exit, and -- as an operand --
+# after the operation that used it; left unowned, every intermediate value
+# of exact or float arithmetic stayed on the heap. Not `and`/`or`, which
+# may hand back an operand.
+make a function called bm_nc_is_arith_op takes op returns yes
+  return (op == "+") or (op == "-") or (op == "*") or (op == "/") or (op == "%")
+end
+
+# The same five operators as block IR spells them before flattening (the
+# hashes interp.patlang's bm_apply_bin dispatches on).
+make a function called bm_nc_is_raw_arith_op takes op returns yes
+  return (op == 177616) or (op == 177618) or (op == 177615) or (op == 177620) or (op == 177610) # + - * / %
+end
+
+# The runtime's arithmetic is on raw machine words (codegen_x64 compiles
+# its functions in the raw convention), never a value of its own.
+make a function called bm_nc_is_fresh_arith takes instr returns yes
+  if bm_nc_library_mode() then
+    return false
+  end
+  return (list_get(instr, 0) == "Bin") and bm_nc_is_arith_op(list_get(instr, 1))
+end
+
+# A raw Call to a function of this program -- pure, or impure with the
+# [value, final_globals] pair -- whose returned value the caller owns
+# (bm_nc_rewrite_pure_call_ownership). Not the by-name dispatchers, which
+# are runtime functions with conventions of their own.
+make a function called bm_nc_is_user_callee takes callee returns yes
+  return not bm_nc_dispatches_by_name(callee)
+end
+
+# A call to a pure function of this program, whose result the caller owns
+# (bm_nc_rewrite_pure_call_ownership).
+make a function called bm_nc_is_pure_user_call takes instr returns yes
+  if list_get(instr, 0) != "Call" then
+    return false
+  end
+  let callee = list_get(instr, 1)
+  if bm_nc_library_mode() then
+    # a runtime function calling another under its own name: owned when it
+    # returns a value
+    return bm_nc_is_value_fn(callee)
+  end
+  if (callee.length <= 6) or (substr(callee, 0, 6) != "bm_fn_") then
+    return false
+  end
+  return bm_nc_is_pure_fn(substr(callee, 6, callee.length - 6))
 end
 
 # "string", "list" or "dynamic" -- the one property every Store of a
@@ -1803,34 +1874,15 @@ make a function called bm_nc_producer_kind takes instr returns kind
   if bm_nc_is_list_producer_call(instr) then
     return "list"
   end
-  if bm_nc_is_dynamic_producer_call(instr) then
+  # A pure call's result is an owned reference released with the generic
+  # dispatcher, like a read once bm_nc_insert_list_get_result_incs has
+  # taken its reference: one kind, so a local mixing the two (the
+  # interpreter's `stack`, from bm_st_push or from list_get) is still
+  # tracked, and its reads still get their reference.
+  if bm_nc_is_pure_user_call(instr) or bm_nc_is_fresh_arith(instr) or bm_nc_is_owned_runtime_producer_call(instr) then
     return "dynamic"
   end
   return "string"
-end
-
-# The real decrement function to call for a value this pass is about to
-# release, given the producer instruction that created it -- "rt_string_
-# rc_dec", "rt_list_rc_dec" (block_model/heap.patlang's own generic
-# bm_rc_dec, wrapped the same way rt_string_rc_dec already wraps it for
-# strings: unmask the tag, recover the real allocation size, decrement)
-# or, for a dynamic producer, the generic rt_rc_dec_if_refcounted.
-make a function called bm_nc_rc_dec_fn_for_producer takes instr returns name
-  let kind = bm_nc_producer_kind(instr)
-  if kind == "list" then
-    return "rt_list_rc_dec"
-  end
-  if kind == "dynamic" then
-    return "rt_rc_dec_if_refcounted"
-  end
-  return "rt_string_rc_dec"
-end
-
-# Single-block closures only -- a later increment, not this one, would
-# need to handle a root whose closure spans more than one block (loops,
-# via JumpBlock).
-make a function called bm_nc_closure_is_single_block takes cblocks returns yes
-  return list_len(cblocks) == 1
 end
 
 # Every name appearing in any MakeClosure's own captured-names list,
@@ -1973,6 +2025,38 @@ make a function called bm_nc_flat_store_positions takes instrs, name returns pos
   return positions
 end
 
+# Every name copied into a different local (`Load a; Store b`, b != a).
+# The ownership pass's own save of a reassigned name's old value
+# (bm_fam_rewrite_block: `Load s; Store ...__bm_reassign_old_k`) is not a
+# copy: that slot is released straight after the new Store.
+make a function called bm_nc_flat_copied_names takes instrs returns names
+  let names = []
+  let i = 0
+  while i < (list_len(instrs) - 1) do
+    let a = list_get(instrs, i)
+    let b = list_get(instrs, i + 1)
+    if (list_get(a, 0) == "Load") and (list_get(b, 0) == "Store") then
+      if (list_get(a, 1) != list_get(b, 1)) and (not bm_nc_is_reassign_save_name(list_get(b, 1))) and (not bm_list_contains(names, list_get(a, 1))) then
+        let names = list_push(names, list_get(a, 1))
+      end
+    end
+    let i = i + 1
+  end
+  return names
+end
+
+make a function called bm_nc_is_reassign_save_name takes name returns yes
+  let marker = "__bm_reassign_old_"
+  let i = 0
+  while (i + marker.length) <= name.length do
+    if substr(name, i, marker.length) == marker then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
 # Every distinct local name eligible for the decrement passes below,
 # generalizing the earlier "exactly one Store" gate to allow reassignment
 # (docs/plans/general-refcounting.md's own deferred "locals that are
@@ -2009,12 +2093,19 @@ end
 #      store dominates every later store, and some later store dominates
 #      a given terminal, the first store dominates that terminal too --
 #      there is no case where a later store reaches a terminal the first
-#      one misses.
+#      one misses;
+#   4. it is never copied into another local (`let out = placed`: `Load
+#      placed; Store out`, bm_nc_flat_copied_names). The copy is a second
+#      owner that no decrement pass tracks (`out`, stored from a Load, is
+#      never eligible itself), so releasing `placed` freed what `out`
+#      still held -- `let out = placed; return out` returned freed memory
+#      (raytrace ch17's insertion sort). Falls back to not releasing it.
 # A name with only one Store trivially satisfies condition 3 (nothing to
 # compare against) and keeps working exactly as the original single-store
 # pass did.
 make a function called bm_nc_reassignable_eligible_names takes instrs, captured_names returns names
   let n = list_len(instrs)
+  let copied_names = bm_nc_flat_copied_names(instrs)
   let candidate_names = []
   let i = 0
   while i < (n - 1) do
@@ -2023,7 +2114,8 @@ make a function called bm_nc_reassignable_eligible_names takes instrs, captured_
       let next = list_get(instrs, i + 1)
       if list_get(next, 0) == "Store" then
         let name = list_get(next, 1)
-        if (not bm_list_contains(captured_names, name)) and (not bm_list_contains(candidate_names, name)) then
+        # (the threaded globals are never counted: see bm_nc_is_globals_name)
+        if (not bm_list_contains(captured_names, name)) and (not bm_list_contains(copied_names, name)) and (not bm_list_contains(candidate_names, name)) and (not bm_nc_is_globals_name(name)) then
           let candidate_names = list_push(candidate_names, name)
         end
       end
@@ -2086,167 +2178,6 @@ make a function called bm_nc_reassignable_eligible_names takes instrs, captured_
   return eligible
 end
 
-# docs/plans/general-refcounting.md, reassigned-locals increment, job 1:
-# the OLD value of an eligible reassigned local must be decremented right
-# before it gets overwritten by a LATER Store, or it leaks every time the
-# local is reassigned (confirmed directly: self_hosting/block_model/
-# spec_fixtures/native_string_rc_dec_reassigned_local.patlang leaked 48
-# bytes per call -- BOTH the overwritten first value and the still-live
-# final value -- before this pass existed; job 2, bm_nc_insert_string_rc_
-# decs below, already covers the final value once it's told to use the
-# FIRST store as the creation point instead of requiring store_count ==
-# 1, so this pass only needs to handle the ones being overwritten).
-# Inserts [Load name; Call rt_string_rc_dec,1; Store discard] immediately
-# before every Store OTHER than a name's own first one -- stack-neutral
-# (push 1, pop-then-push-1, pop 1 nets to zero), so it never disturbs the
-# NEW value a producer call already pushed for the Store it's inserted in
-# front of. Safe by bm_nc_reassignable_eligible_names's own condition 3:
-# the first store already dominates every later one, so some valid value
-# is always sitting in the local by the time any later store runs, on
-# every path that reaches it. Returns `instrs` unchanged if no eligible
-# name actually has more than one Store (the common, non-reassigned case
-# -- purely additive otherwise, same as bm_nc_insert_string_rc_decs).
-make a function called bm_nc_insert_reassignment_decs takes root, instrs returns out
-  let captured_names = bm_nc_closure_captured_names(instrs)
-  let eligible_names = bm_nc_reassignable_eligible_names(instrs, captured_names)
-  let insert_names = []
-  let insert_positions = []
-  let insert_fns = []
-  let ei = 0
-  while ei < list_len(eligible_names) do
-    let name = list_get(eligible_names, ei)
-    let positions = bm_nc_flat_store_positions(instrs, name)
-    if list_len(positions) > 1 then
-      # Every Store of this name is producer-preceded by the SAME kind
-      # (bm_nc_reassignable_eligible_names's own "same_kind" condition),
-      # so the OLD value being overwritten is always the same kind as
-      # the NEW one -- one decrement-function lookup per name, from its
-      # first store, covers every reassignment of it.
-      let dec_fn = bm_nc_rc_dec_fn_for_producer(list_get(instrs, list_get(positions, 0) - 1))
-      let pj = 1
-      while pj < list_len(positions) do
-        # Recorded at the producer call that computes the new value
-        # (position - 1): the old value is saved just before it and
-        # released just after the Store (see the emission loop below).
-        # Nothing goes between that call and its own Store, which
-        # bm_nc_insert_string_rc_decs's own eligibility re-check (run
-        # AFTER this pass, on its rewritten output) requires. Confirmed
-        # directly: inserting between the call and the Store broke that
-        # adjacency and silently dropped the local from job 2 (the
-        # terminal decrement) entirely -- caught by re-measuring heap
-        # growth (half the expected reduction, not zero) rather than
-        # trusting the IR shape alone.
-        let insert_names = list_push(insert_names, name)
-        let insert_positions = list_push(insert_positions, list_get(positions, pj) - 1)
-        let insert_fns = list_push(insert_fns, dec_fn)
-        let pj = pj + 1
-      end
-    end
-    let ei = ei + 1
-  end
-  if list_len(insert_positions) == 0 then
-    return instrs
-  end
-  # Sort insert_positions ascending, carrying insert_names along in
-  # lockstep -- selection sort, fine at this size (bounded by how many
-  # times a handful of locals get reassigned in one function, not by
-  # input/program size).
-  let m = list_len(insert_positions)
-  let si = 0
-  while si < m do
-    let min_idx = si
-    let sj = si + 1
-    while sj < m do
-      if list_get(insert_positions, sj) < list_get(insert_positions, min_idx) then
-        let min_idx = sj
-      end
-      let sj = sj + 1
-    end
-    if min_idx != si then
-      let tmp_pos = list_get(insert_positions, si)
-      let tmp_name = list_get(insert_names, si)
-      let tmp_fn = list_get(insert_fns, si)
-      let insert_positions = list_set(insert_positions, si, list_get(insert_positions, min_idx))
-      let insert_names = list_set(insert_names, si, list_get(insert_names, min_idx))
-      let insert_fns = list_set(insert_fns, si, list_get(insert_fns, min_idx))
-      let insert_positions = list_set(insert_positions, min_idx, tmp_pos)
-      let insert_names = list_set(insert_names, min_idx, tmp_name)
-      let insert_fns = list_set(insert_fns, min_idx, tmp_fn)
-    end
-    let si = si + 1
-  end
-  # GitHub #228: the old value is saved into a per-site temporary just
-  # before the producer and released only AFTER the Store, once the new
-  # value exists:
-  #   Load x; Store old_k; <producer>; Store x; Load old_k; Call dec; Store discard
-  # Decrementing it in front of the producer (as this pass used to) runs
-  # while the old value may still be one of the producer's own pending
-  # operands -- `let out = list_push(out, ...)` -- so a count of 1 freed
-  # the node (and its buffer, cascading into the elements) before
-  # list_push read it. Masked whenever the leaky first-operand increment
-  # of bm_nc_insert_list_element_incs happened to fire; exposed when the
-  # pushed element contained a call. The producer stays immediately
-  # before its Store, which bm_nc_insert_string_rc_decs's eligibility
-  # re-check needs (see the comment above).
-  let discard_name = bm_nc_prefix(root, "__bm_string_rc_discard")
-  let out = []
-  let n = list_len(instrs)
-  let i = 0
-  while i < n do
-    let k = 0
-    while k < list_len(insert_positions) do
-      if list_get(insert_positions, k) == i then
-        let out = list_push(out, ["Load", list_get(insert_names, k)])
-        let out = list_push(out, ["Store", bm_nc_prefix(root, "__bm_reassign_old_" + k)])
-      end
-      let k = k + 1
-    end
-    let instr = list_get(instrs, i)
-    let op = list_get(instr, 0)
-    if (op == "Jump") or (op == "JumpIfFalse") then
-      let target = list_get(instr, 1)
-      let new_target = target + bm_nc_reassign_save_release_shift_at(insert_positions, target)
-      let out = list_push(out, [op, new_target])
-    else
-      let out = list_push(out, instr)
-    end
-    let k = 0
-    while k < list_len(insert_positions) do
-      if (list_get(insert_positions, k) + 1) == i then
-        let out = list_push(out, ["Load", bm_nc_prefix(root, "__bm_reassign_old_" + k)])
-        let out = list_push(out, ["Call", list_get(insert_fns, k), 1])
-        let out = list_push(out, ["Store", discard_name])
-      end
-      let k = k + 1
-    end
-    let i = i + 1
-  end
-  return out
-end
-
-# Where original instruction index `idx` lands once bm_nc_insert_
-# reassignment_decs's insertions are accounted for: a 2-instruction save
-# in front of each producer at p, and a 3-instruction release after each
-# Store at p + 1. A jump to idx lands in front of a save AT idx (so the
-# save runs on every path into the producer) and after a release attached
-# to a Store BEFORE idx (so a path that joins after the Store never
-# releases a value it did not save).
-make a function called bm_nc_reassign_save_release_shift_at takes insert_positions, idx returns shift
-  let shift = 0
-  let k = 0
-  while k < list_len(insert_positions) do
-    let p = list_get(insert_positions, k)
-    if p < idx then
-      let shift = shift + 2
-    end
-    if (p + 1) < idx then
-      let shift = shift + 3
-    end
-    let k = k + 1
-  end
-  return shift
-end
-
 # The fixed 3-instruction-per-insertion shift bm_nc_insert_list_get_
 # result_incs uses: every triple inserted in front of an index at or
 # before idx moves idx by 3.
@@ -2285,6 +2216,17 @@ end
 # unchanged as a bail-out sentinel rather than guess -- callers must
 # treat "no progress made" as "stop, do not trust further results from
 # this operand position," never retry it.
+#
+# A value can be preceded, inside the same expression, by statements that
+# leave the stack as they found it ([value; Store x]): a closure-mode
+# call's own unpack (bm_nc_emit_call_unpack: `Call; Store r; Load r;
+# Const 1; list_get; Store __globals; Load r; Const 0; list_get`, whose
+# value by stack accounting is only the last three) and the inserted
+# [Load; Call rt_rc_inc_if_refcounted; Store discard] triples. Once a
+# value is skipped, those are stepped over too, so the result is the end
+# of the value before it -- stopping at the Store instead made every
+# operand ahead of a call in a list literal invisible (`[grad, f(x)]` gave
+# `grad` no element reference, and a callee returning it freed it).
 make a function called bm_nc_flat_skip_value_backward takes instrs, pos returns new_pos
   if pos < 0 then
     return pos
@@ -2292,7 +2234,7 @@ make a function called bm_nc_flat_skip_value_backward takes instrs, pos returns 
   let instr = list_get(instrs, pos)
   let op = list_get(instr, 0)
   if (op == "Const") or (op == "Load") or (op == "MakeClosure") then
-    return pos - 1
+    return bm_nc_flat_skip_statements_backward(instrs, pos - 1)
   elif op == "Un" then
     return bm_nc_flat_skip_value_backward(instrs, pos - 1)
   elif op == "Bin" then
@@ -2311,10 +2253,50 @@ make a function called bm_nc_flat_skip_value_backward takes instrs, pos returns 
       let cur = bm_nc_flat_skip_value_backward(instrs, cur)
       let ai = ai + 1
     end
-    return cur
+    return bm_nc_flat_skip_statements_backward(instrs, cur)
   else
     return pos
   end
+end
+
+# Steps back over [value; Store x] statements ending at pos (see above).
+make a function called bm_nc_flat_skip_statements_backward takes instrs, pos returns new_pos
+  let cur = pos
+  while cur >= 0 do
+    if list_get(list_get(instrs, cur), 0) != "Store" then
+      return cur
+    end
+    let before = bm_nc_flat_skip_value_backward(instrs, cur - 1)
+    if before == (cur - 1) then
+      return cur
+    end
+    let cur = before
+  end
+  return cur
+end
+
+# Whether the list_get at pos is the value half of a closure-mode call's
+# unpack (bm_nc_emit_call_unpack) -- the call's own result, handed over,
+# not a borrow from a container.
+make a function called bm_nc_flat_is_call_unpack_value takes instrs, pos returns yes
+  if pos < 4 then
+    return false
+  end
+  let st = list_get(instrs, pos - 3)
+  let ld = list_get(instrs, pos - 2)
+  if (list_get(st, 0) != "Store") or (list_get(ld, 0) != "Load") then
+    return false
+  end
+  let g = list_get(st, 1)
+  let r = list_get(ld, 1)
+  if (g.length < 9) or (r.length < 2) then
+    return false
+  end
+  if (substr(g, g.length - 9, 9) != "__globals") or (substr(r, r.length - 2, 2) != "_r") then
+    return false
+  end
+  let gget = list_get(instrs, pos - 4)
+  return (list_get(gget, 0) == "CallHost") and (list_get(gget, 1) == "list_get")
 end
 
 # docs/plans/general-refcounting.md, Phase 4c: the write-side half of
@@ -2370,12 +2352,15 @@ end
 # the eligible-only rule. And the pass now runs on every function, not
 # just single-block ones (`single_block` false): a borrowed operand stored
 # from a loop-containing function needs its reference just the same
-# (case A), and the multi-block decrement pass (bm_nc_rewrite_block_for_
-# string_rc) releases a producer-made local at its block's exit with no
+# (case A), and the multi-block decrement pass (bm_fam_rewrite_block)
+# releases a producer-made local at its block's exit with no
 # regard for whether a list element still points at it, which this
 # increment is what balances (case B). The eligible-name rule needs the
 # single-block decrement passes' own analysis, so it applies only when
-# `single_block` is true. Sorting and emission are linear-ish (merge sort,
+# `single_block` is true. Since Phase 7 list_push and list_set take their
+# own reference to the element (rt_list_push and rt_list_set_functional,
+# x64_runtime.patlang), as every runtime function borrows its arguments, so
+# they are no longer targets here. Sorting and emission are linear-ish (merge sort,
 # a single forward pointer, a prefix count for jump shifts), since multi-
 # block functions in the compiler itself reach ~70K instructions.
 make a function called bm_nc_insert_list_element_incs takes root, instrs, single_block returns out
@@ -2394,20 +2379,18 @@ make a function called bm_nc_insert_list_element_incs takes root, instrs, single
     let any_operand = false
     let argc = 0
     if op == "BuildList" then
-      let is_return_pack = false
-      if (i + 1) < n then
-        if list_get(list_get(instrs, i + 1), 0) == "Return" then
-          let is_return_pack = true
-        end
-      end
-      if not is_return_pack then
+      if not bm_nc_flat_is_return_pack(instrs, i) then
         let is_target = true
         let any_operand = true
         let argc = list_get(instr, 1)
       end
-    elif (op == "CallHost") and ((list_get(instr, 1) == "list_push") or (list_get(instr, 1) == "list_set")) then
+    elif op == "MakeClosure" then
+      # thread_spawn's trampoline closure (bm_nc_translate_block_instrs) holds
+      # its operands raw and is never released, so each takes a reference of
+      # its own, or the owner releasing it would free it under the thread.
       let is_target = true
-      let argc = list_get(instr, 2)
+      let any_operand = true
+      let argc = list_len(list_get(instr, 2))
     end
     if is_target then
       let cur = i - 1
@@ -2436,9 +2419,13 @@ make a function called bm_nc_insert_list_element_incs takes root, instrs, single
   # operands come after an outer operand that precedes it).
   let pairs = bm_nc_sort_pairs_by_pos(pairs)
   let m = list_len(pairs)
-  # shift_upto[idx] = 3 * (number of insert positions <= idx): what every
-  # jump targeting idx must add, the same quantity bm_nc_reassign_shift_at
-  # computes per call, here precomputed once in a single forward pass.
+  # shift_upto[idx] = 3 * (number of insert positions < idx): what every
+  # jump targeting idx must add. An increment goes just before the Load of
+  # its operand, so a jump to that Load (the first instruction of the block
+  # a JumpBlock entered) must run it: counting the insertions AT idx too
+  # sent such a jump past it, and a parameter stored into a list literal
+  # first thing in a loop's exit block was then released once too often
+  # by the ownership pass (bm_fam_rewrite_block).
   let shift_upto = []
   let pk = 0
   let ix = 0
@@ -2447,7 +2434,7 @@ make a function called bm_nc_insert_list_element_incs takes root, instrs, single
     while advancing do
       let advancing = false
       if pk < m then
-        if list_get(list_get(pairs, pk), 0) <= ix then
+        if list_get(list_get(pairs, pk), 0) < ix then
           let pk = pk + 1
           let advancing = true
         end
@@ -2565,67 +2552,351 @@ end
 # that never produced a real value for `name`, exactly as safe as the
 # existing decrement passes already are for the same conditionally-
 # assigned shape.
-make a function called bm_nc_insert_list_get_result_incs takes root, instrs returns out
-  let captured_names = bm_nc_closure_captured_names(instrs)
-  let eligible_names = bm_nc_reassignable_eligible_names(instrs, captured_names)
-  if list_len(eligible_names) == 0 then
+# Whether instrs at i already take name's reference (`Load name; Call
+# rt_rc_inc_if_refcounted`), as the multi-block pass does after an owned
+# name's read (bm_fam_rewrite_block).
+# A fresh value passed straight into a pure call (`ga_outer(w, mat_col(m,
+# c))`) is owned by nobody once the call returns: a pure callee only borrows
+# its arguments (anything it returns or stores takes its own reference), so
+# the caller releases it there. Each such argument is held in a temporary
+# (`Store t; Load t` after it is made) and released just after the call.
+# Only arguments of a pure call, and the list operand of list_push/list_set:
+# a list literal and those two keep their element, a read returns a borrow
+# into its argument, and an impure callee's own conventions are not assumed
+# here. Skipped where an operand cannot be
+# walked back to (bm_nc_flat_skip_value_backward makes no progress) or a
+# jump lands between the argument and the call. Runs last, so no other
+# pass treats the temporaries as locals. Before this, every such argument
+# leaked (raytrace's mat_wedge: hundreds of MB of multivectors per scene).
+# The index of the Store that takes the value produced at v, or -1: the next
+# instruction; or after the multi-block pass's save of the old value of a
+# reassigned name (`Load x; Store __bm_reassign_old_N; Store x`); or after a
+# discarded call's release (`Call rt_rc_dec_if_refcounted; Store`).
+make a function called bm_nc_flat_value_store_at takes instrs, v returns st
+  let n = list_len(instrs)
+  if (v + 1) >= n then
+    return -1
+  end
+  let a = list_get(instrs, v + 1)
+  if list_get(a, 0) == "Store" then
+    return v + 1
+  end
+  if (v + 2) >= n then
+    return -1
+  end
+  let b = list_get(instrs, v + 2)
+  if (list_len(a) > 1) and (list_get(a, 1) == "rt_rc_dec_if_refcounted") and (list_get(b, 0) == "Store") then
+    return v + 2
+  end
+  if (v + 3) >= n then
+    return -1
+  end
+  let c = list_get(instrs, v + 3)
+  if (list_get(a, 0) == "Load") and (list_get(b, 0) == "Store") and (list_get(c, 0) == "Store") then
+    if contains_text_nc(list_get(b, 1), "__bm_reassign_old_") and (list_get(c, 1) == list_get(a, 1)) then
+      return v + 3
+    end
+  end
+  return -1
+end
+
+make a function called contains_text_nc takes s, part returns yes
+  let n = s.length
+  let m = part.length
+  let i = 0
+  while i + m <= n do
+    if substr(s, i, m) == part then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# Whether instrs[i] calls an impure function of this program: a bm_fn_
+# Call followed by its [value, final_globals] unpack, whose value read is
+# at i + 8 (bm_nc_emit_call_unpack).
+make a function called bm_nc_flat_is_impure_user_call takes instrs, i returns yes
+  let instr = list_get(instrs, i)
+  if list_get(instr, 0) != "Call" then
+    return false
+  end
+  let callee = list_get(instr, 1)
+  if (callee.length <= 6) or (substr(callee, 0, 6) != "bm_fn_") then
+    return false
+  end
+  if (i + 8) >= list_len(instrs) then
+    return false
+  end
+  return bm_nc_flat_is_call_unpack_value(instrs, i + 8)
+end
+
+# Runtime functions that only borrow their arguments: whatever they keep,
+# they take their own reference to, so a fresh argument is released after
+# the call like a pure call's. Each entry is checked against its body in
+# x64_runtime.patlang: set_var stores through rt_ns_set, which increments
+# the stored value and (rt_hmap_insert) the key; send's rest list and the
+# stores it reaches (rt_send_prepare_arr) do the same, and a method it
+# invokes borrows like any callee; get and object_delete only look the
+# name and key up; print only reads its argument. vec_push, vec_set and
+# vec_extend take a reference to each item they keep; sb_push and sb_str
+# copy bytes out of their arguments; len, list_len and char_code return an
+# int computed from theirs; str_intern retains what it returns, and sc_*
+# only read their string; getenv, exec_capture, exec_capture_io and
+# list_dir copy their arguments' bytes (rt_exec_join_args). Not a default for every runtime function: some
+# keep an argument without counting it, and some return it or part of it
+# (to_num, list_get, new), which releasing the argument would free
+# (docs/plans/general-refcounting.md, 6k).
+make a function called bm_nc_runtime_borrows_args takes callee returns yes
+  return bm_list_contains(["list_get", "set_var", "send", "get", "object_delete", "print", "vec_push", "vec_set", "vec_extend", "sb_push", "sb_str", "len", "list_len", "char_code", "str_intern", "sc_len", "sc_code", "sc_char", "sc_substr", "getenv", "exec_capture", "exec_capture_io", "list_dir"], callee)
+end
+
+make a function called bm_nc_release_pure_call_arg_temps takes root, instrs returns out
+  let n = list_len(instrs)
+  let is_target = []
+  let i = 0
+  while i <= n do
+    let is_target = list_push(is_target, false)
+    let i = i + 1
+  end
+  let i = 0
+  while i < n do
+    let op = list_get(list_get(instrs, i), 0)
+    if (op == "Jump") or (op == "JumpIfFalse") then
+      let t = list_get(list_get(instrs, i), 1)
+      if (t >= 0) and (t <= n) then
+        let is_target = list_set(is_target, t, true)
+      end
+    end
+    let i = i + 1
+  end
+  # temps: [producer index, consumer index]
+  let temps = []
+  let i = 0
+  while i < n do
+    let instr = list_get(instrs, i)
+    # list_push/list_set always return a new version and keep no hold on
+    # the list they were given: `list_set(ga_zero(), mask, coeff)` left the
+    # zero multivector behind. Since Phase 7 they take their own reference
+    # to the element too (rt_list_push, x64_runtime.patlang), so a fresh
+    # element is released after the call like the list.
+    let list_op = (list_get(instr, 0) == "CallHost") and ((list_get(instr, 1) == "list_push") or (list_get(instr, 1) == "list_set"))
+    # An impure call borrows its arguments the same way; its result comes
+    # back in a pair whose unpack must follow the Call directly, so the
+    # release waits until the value has been stored (`settle`).
+    let settle = i
+    # an operator borrows its operands (not `and`/`or`, whose result may be one)
+    let bin_op = (list_get(instr, 0) == "Bin") and (list_get(instr, 1) != "and") and (list_get(instr, 1) != "or")
+    let rt_borrow = ((list_get(instr, 0) == "Call") or (list_get(instr, 0) == "CallHost")) and bm_nc_runtime_borrows_args(list_get(instr, 1))
+    # every runtime function borrows its arguments: in the runtime itself
+    # each Call is to one, and a program calls one by CallHost -- except the
+    # reference-count entry points, which take or count the reference they
+    # are handed (a discarded result's release is one)
+    let rc_entry = bm_nc_is_rc_entry(list_get(instr, 1))
+    let lib_call = bm_nc_library_mode() and (list_get(instr, 0) == "Call") and (not rc_entry)
+    let rt_call = (list_get(instr, 0) == "CallHost") and (get("__vars", "bm_rt_fn__" + list_get(instr, 1)) == true) and (not rc_entry)
+    let consumer = bm_nc_is_pure_user_call(instr) or list_op or bin_op or rt_borrow or lib_call or rt_call
+    if (not consumer) and bm_nc_flat_is_impure_user_call(instrs, i) then
+      let st = bm_nc_flat_value_store_at(instrs, i + 8)
+      if st >= 0 then
+        let settle = st
+        let consumer = true
+      end
+    end
+    if consumer then
+      let argc = 2
+      if not bin_op then
+        let argc = list_get(instr, 2)
+      end
+      let cur = i - 1
+      let ai = 0
+      let ok = true
+      while ok and (ai < argc) do
+        if cur < 0 then
+          let ok = false
+        else
+          let prod = list_get(instrs, cur)
+          # (an impure call's unpacked value is fresh too, as every list_get
+          # is; once it goes into the temporary's Store,
+          # bm_nc_release_call_pairs releases its pair as well)
+          let fresh = bm_nc_is_pure_user_call(prod) or bm_nc_is_list_producer_call(prod) or bm_nc_is_string_producer_call(prod) or bm_nc_is_fresh_arith(prod) or bm_nc_is_owned_runtime_producer_call(prod)
+          if fresh then
+            let clear = true
+            let q = cur + 1
+            while clear and (q <= settle) do
+              if list_get(is_target, q) then
+                let clear = false
+              end
+              let q = q + 1
+            end
+            if clear then
+              let temps = list_push(temps, [cur, settle])
+            end
+          end
+          let nxt = bm_nc_flat_skip_value_backward(instrs, cur)
+          if nxt == cur then
+            let ok = false
+          end
+          let cur = nxt
+        end
+        let ai = ai + 1
+      end
+    end
+    let i = i + 1
+  end
+  if list_len(temps) == 0 then
     return instrs
   end
-  let n = list_len(instrs)
-  let insert_positions = []
-  let insert_names = []
+  # after[q]: instructions to run after original index q
+  let after = []
   let i = 0
-  while i < (n - 1) do
+  while i < n do
+    let after = list_push(after, [])
+    let i = i + 1
+  end
+  let discard = bm_nc_prefix(root, "__bm_string_rc_discard")
+  let k = 0
+  while k < list_len(temps) do
+    let t = list_get(temps, k)
+    let name = bm_nc_prefix(root, "__bm_argtmp_" + k)
+    let p = list_get(t, 0)
+    let c = list_get(t, 1)
+    let after = list_set(after, p, list_push(list_push(list_get(after, p), ["Store", name]), ["Load", name]))
+    let after = list_set(after, c, list_push(list_push(list_push(list_get(after, c), ["Load", name]), ["Call", "rt_rc_dec_if_refcounted", 1]), ["Store", discard]))
+    let k = k + 1
+  end
+  # land[q]: where a jump to original index q goes -- past whatever runs
+  # after q - 1, which a jump from elsewhere did not come through
+  let land = []
+  let added = 0
+  let q = 0
+  while q <= n do
+    let land = list_push(land, q + added)
+    if q < n then
+      let added = added + list_len(list_get(after, q))
+    end
+    let q = q + 1
+  end
+  let out = []
+  let i = 0
+  while i < n do
     let instr = list_get(instrs, i)
-    if (list_get(instr, 0) == "CallHost") and (list_get(instr, 1) == "list_get") then
-      let next = list_get(instrs, i + 1)
-      if list_get(next, 0) == "Store" then
-        let name = list_get(next, 1)
-        if bm_list_contains(eligible_names, name) then
-          let insert_positions = list_push(insert_positions, i + 2)
-          let insert_names = list_push(insert_names, name)
+    let op = list_get(instr, 0)
+    if (op == "Jump") or (op == "JumpIfFalse") then
+      let out = list_push(out, [op, list_get(land, list_get(instr, 1))])
+    else
+      let out = list_push(out, instr)
+    end
+    let extra = list_get(after, i)
+    let a = 0
+    while a < list_len(extra) do
+      let out = list_push(out, list_get(extra, a))
+      let a = a + 1
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# An impure call returns a [value, final_globals] pair its caller unpacks
+# (bm_nc_emit_call_unpack): the value is the reference the callee handed
+# over and the globals were never counted by the pair, so once the value
+# is stored the pair's own list is released without its elements
+# (rt_list_release_shell). Every impure call used to leave its pair behind
+# (raytrace's ga_product reads the GA tables through get_global, so every
+# geometric product did). Only where the value goes into a Store
+# (bm_nc_flat_value_store_at) with no jump landing in between; elsewhere
+# the pair is left as before. Runs last.
+make a function called bm_nc_release_call_pairs takes root, instrs returns out
+  let n = list_len(instrs)
+  let is_target = []
+  let i = 0
+  while i <= n do
+    let is_target = list_push(is_target, false)
+    let i = i + 1
+  end
+  let i = 0
+  while i < n do
+    let op = list_get(list_get(instrs, i), 0)
+    if (op == "Jump") or (op == "JumpIfFalse") then
+      let t = list_get(list_get(instrs, i), 1)
+      if (t >= 0) and (t <= n) then
+        let is_target = list_set(is_target, t, true)
+      end
+    end
+    let i = i + 1
+  end
+  # after[q]: [pair name] to release after original index q
+  let after = []
+  let i = 0
+  while i < n do
+    let after = list_push(after, "")
+    let i = i + 1
+  end
+  let any = false
+  let i = 0
+  while i < n do
+    let instr = list_get(instrs, i)
+    if (list_get(instr, 0) == "CallHost") and (list_get(instr, 1) == "list_get") and bm_nc_flat_is_call_unpack_value(instrs, i) then
+      let st = bm_nc_flat_value_store_at(instrs, i)
+      if st >= 0 then
+        let clear = true
+        let q = i + 1
+        while clear and (q <= st + 1) do
+          if (q <= n) and list_get(is_target, q) then
+            let clear = false
+          end
+          let q = q + 1
+        end
+        if clear then
+          let after = list_set(after, st, list_get(list_get(instrs, i - 2), 1))
+          let any = true
         end
       end
     end
     let i = i + 1
   end
-  if list_len(insert_positions) == 0 then
+  if not any then
     return instrs
   end
-  let discard_name = bm_nc_prefix(root, "__bm_string_rc_discard")
+  let discard = bm_nc_prefix(root, "__bm_string_rc_discard")
+  let land = []
+  let added = 0
+  let q = 0
+  while q <= n do
+    let land = list_push(land, q + added)
+    if q < n then
+      if list_get(after, q) != "" then
+        let added = added + 3
+      end
+    end
+    let q = q + 1
+  end
   let out = []
-  let i2 = 0
-  while i2 < n do
-    let instr = list_get(instrs, i2)
+  let i = 0
+  while i < n do
+    let instr = list_get(instrs, i)
     let op = list_get(instr, 0)
     if (op == "Jump") or (op == "JumpIfFalse") then
-      let target = list_get(instr, 1)
-      let new_target = target + bm_nc_reassign_shift_at(insert_positions, target)
-      let out = list_push(out, [op, new_target])
+      let out = list_push(out, [op, list_get(land, list_get(instr, 1))])
     else
       let out = list_push(out, instr)
     end
-    let k = 0
-    while k < list_len(insert_positions) do
-      if list_get(insert_positions, k) == (i2 + 1) then
-        let out = list_push(out, ["Load", list_get(insert_names, k)])
-        let out = list_push(out, ["Call", "rt_rc_inc_if_refcounted", 1])
-        let out = list_push(out, ["Store", discard_name])
-      end
-      let k = k + 1
+    let r = list_get(after, i)
+    if r != "" then
+      # (both halves were read with references of their own, list_get being
+      # owned since Phase 7, so the pair goes with its elements)
+      let out = list_push(out, ["Load", r])
+      let out = list_push(out, ["Call", "rt_rc_dec_if_refcounted", 1])
+      let out = list_push(out, ["Store", discard])
     end
-    let i2 = i2 + 1
-  end
-  let k2 = 0
-  while k2 < list_len(insert_positions) do
-    if list_get(insert_positions, k2) == n then
-      let out = list_push(out, ["Load", list_get(insert_names, k2)])
-      let out = list_push(out, ["Call", "rt_rc_inc_if_refcounted", 1])
-      let out = list_push(out, ["Store", discard_name])
-    end
-    let k2 = k2 + 1
+    let i = i + 1
   end
   return out
+end
+
+make a function called bm_nc_is_globals_name takes name returns yes
+  return (name.length >= 9) and (substr(name, name.length - 9, 9) == "__globals")
 end
 
 # The locals whose own reference terminal t hands to its caller, so must
@@ -2640,47 +2911,28 @@ end
 # it, and with a list its buffer's elements, while the caller still held
 # it. Silent while the freed memory stayed unreused; the self-compiled
 # compiler segfaulted on it.
-make a function called bm_nc_flat_returned_names takes instrs, t returns names
-  let names = []
-  if t <= 0 then
-    return names
+# Whether the BuildList at i is a callee's [value, final_globals] return
+# pack (`...; Load <block>__globals; BuildList 2; Return`), the calling
+# convention's own wrapping rather than a list the program built. A pure
+# function's `return [origin, direction]` is also a BuildList right before
+# Return, and was taken for one: its elements got no reference of their own,
+# so releasing the returned list (its caller owns a pure call's result)
+# released the caller's origin and direction too (raytrace's ray(), via
+# shadow_blocker: a stripe pattern read the wrong colour).
+make a function called bm_nc_flat_is_return_pack takes instrs, i returns yes
+  if (i < 1) or ((i + 1) >= list_len(instrs)) then
+    return false
   end
-  let prev = list_get(instrs, t - 1)
-  let op = list_get(prev, 0)
-  if op == "Load" then
-    return [list_get(prev, 1)]
+  let instr = list_get(instrs, i)
+  if (list_get(instr, 1) != 2) or (list_get(list_get(instrs, i + 1), 0) != "Return") then
+    return false
   end
-  if op == "BuildList" then
-    let cur = t - 2
-    let ai = 0
-    while ai < list_get(prev, 1) do
-      if cur >= 0 then
-        let operand = list_get(instrs, cur)
-        if list_get(operand, 0) == "Load" then
-          let names = list_push(names, list_get(operand, 1))
-        end
-      end
-      let cur = bm_nc_flat_skip_value_backward(instrs, cur)
-      let ai = ai + 1
-    end
+  let prev = list_get(instrs, i - 1)
+  if list_get(prev, 0) != "Load" then
+    return false
   end
-  return names
-end
-
-# How many instructions get inserted at a given terminal t: one triple
-# (Load/Call/Store) per eligible local, except whichever ones are the
-# value actually being returned right there (bm_nc_flat_returned_names).
-make a function called bm_nc_rc_dec_count_at_terminal takes instrs, t, eligible_names returns count
-  let returned_names = bm_nc_flat_returned_names(instrs, t)
-  let count = 0
-  let ei = 0
-  while ei < list_len(eligible_names) do
-    if not bm_list_contains(returned_names, list_get(eligible_names, ei)) then
-      let count = count + 1
-    end
-    let ei = ei + 1
-  end
-  return count
+  let name = list_get(prev, 1)
+  return (name.length >= 9) and (substr(name, name.length - 9, 9) == "__globals")
 end
 
 # How far original instruction index `idx` has shifted once every
@@ -2709,138 +2961,6 @@ make a function called bm_nc_cumulative_shift_at takes terminals, insert_counts,
   return shift
 end
 
-# The actual rewrite: finds every eligible local (direct producer
-# provenance, exactly one Store, never closure-captured) and, for EACH
-# terminal INDEPENDENTLY, inserts a decrement immediately before it
-# whenever the candidate's own creation point dominates THAT SPECIFIC
-# terminal (bm_nc_flat_index_dominates) -- except where the local is the
-# value actually being returned THERE (a Load of that same name right
-# before that specific Return/ReturnValue; a local can be returned at
-# one terminal and still correctly decremented at a different one it
-# also dominates). Every EXISTING Jump/JumpIfFalse target gets corrected
-# via bm_nc_cumulative_shift_at, using the shift AT THE TARGET (not at
-# the jump instruction's own position -- those answer different
-# questions). Returns `instrs` completely unchanged if no eligible local
-# is found at all -- purely additive, never a correctness risk to
-# anything this pass doesn't recognize.
-# Retrofitted (docs/plans/general-refcounting.md) from an earlier,
-# simpler version that required a candidate to dominate EVERY terminal
-# uniformly, same shape as the raw/loop pass's own bm_nc_rewrite_block_
-# for_string_rc and for the identical reason -- a uniform check rejected
-# a string created only on the fall-through side of an earlier, unrelated
-# branch's own early return outright, even though it plainly dominates
-# the OTHER terminal, leaking it on every fall-through call
-# (self_hosting/block_model/spec_fixtures/
-# native_string_rc_dec_branch_local.patlang: 600000 bytes over 50000
-# calls before this fix, confirmed directly, zero after).
-make a function called bm_nc_insert_string_rc_decs takes root, instrs returns out
-  let terminals = bm_nc_find_all_terminal_indices(instrs)
-  if list_len(terminals) == 0 then
-    return instrs
-  end
-  let captured_names = bm_nc_closure_captured_names(instrs)
-  let n = list_len(instrs)
-  # Generalized (docs/plans/general-refcounting.md, reassigned-locals
-  # increment) from an earlier version that only accepted a name with
-  # exactly one Store: bm_nc_reassignable_eligible_names also accepts a
-  # REASSIGNED local (more than one Store), as long as every Store is
-  # producer-preceded and the first one dominates every later one --
-  # see that function's own header for why the first store is still the
-  # right (and sufficient) "creation point" to check terminal-dominance
-  # against even when there are several. Any OLD value a later Store
-  # would otherwise overwrite is handled separately, before this pass
-  # ever runs, by bm_nc_insert_reassignment_decs (job 1); this pass only
-  # ever needs the position of the FIRST store (job 2).
-  let eligible_names = bm_nc_reassignable_eligible_names(instrs, captured_names)
-  let eligible_stores = []
-  let eligible_fns = []
-  let eni = 0
-  while eni < list_len(eligible_names) do
-    let positions = bm_nc_flat_store_positions(instrs, list_get(eligible_names, eni))
-    let first_p = list_get(positions, 0)
-    let eligible_stores = list_push(eligible_stores, first_p)
-    let eligible_fns = list_push(eligible_fns, bm_nc_rc_dec_fn_for_producer(list_get(instrs, first_p - 1)))
-    let eni = eni + 1
-  end
-  if list_len(eligible_names) == 0 then
-    return instrs
-  end
-  # Per (terminal, candidate): does this candidate's own Store dominate
-  # THIS specific terminal? Collected once up front so the insert-count
-  # pass and the emission pass below agree exactly -- same two-pass shape
-  # as bm_nc_rewrite_block_for_string_rc's own names_per_exit.
-  let names_per_terminal = []
-  let ti0 = 0
-  while ti0 < list_len(terminals) do
-    let t = list_get(terminals, ti0)
-    let here = []
-    let ni = 0
-    while ni < list_len(eligible_names) do
-      let p = list_get(eligible_stores, ni)
-      if bm_nc_flat_index_dominates(instrs, p, t) then
-        let here = list_push(here, list_get(eligible_names, ni))
-      end
-      let ni = ni + 1
-    end
-    let names_per_terminal = list_push(names_per_terminal, here)
-    let ti0 = ti0 + 1
-  end
-  let insert_counts = []
-  let ti = 0
-  while ti < list_len(terminals) do
-    let t = list_get(terminals, ti)
-    let names_here = list_get(names_per_terminal, ti)
-    let insert_counts = list_push(insert_counts, bm_nc_rc_dec_count_at_terminal(instrs, t, names_here) * 3)
-    let ti = ti + 1
-  end
-  let discard_name = bm_nc_prefix(root, "__bm_string_rc_discard")
-  let out = []
-  let i2 = 0
-  while i2 < n do
-    let term_pos = 0 - 1
-    let tx = 0
-    while tx < list_len(terminals) do
-      if list_get(terminals, tx) == i2 then
-        let term_pos = tx
-      end
-      let tx = tx + 1
-    end
-    if term_pos != (0 - 1) then
-      let names_here = list_get(names_per_terminal, term_pos)
-      let returned_names = bm_nc_flat_returned_names(instrs, i2)
-      let ei = 0
-      while ei < list_len(names_here) do
-        let name = list_get(names_here, ei)
-        if not bm_list_contains(returned_names, name) then
-          let dec_fn = "rt_string_rc_dec"
-          let fi = 0
-          while fi < list_len(eligible_names) do
-            if list_get(eligible_names, fi) == name then
-              let dec_fn = list_get(eligible_fns, fi)
-            end
-            let fi = fi + 1
-          end
-          let out = list_push(out, ["Load", name])
-          let out = list_push(out, ["Call", dec_fn, 1])
-          let out = list_push(out, ["Store", discard_name])
-        end
-        let ei = ei + 1
-      end
-    end
-    let instr = list_get(instrs, i2)
-    let op = list_get(instr, 0)
-    if (op == "Jump") or (op == "JumpIfFalse") then
-      let target = list_get(instr, 1)
-      let new_target = target + bm_nc_cumulative_shift_at(terminals, insert_counts, target)
-      let out = list_push(out, [op, new_target])
-    else
-      let out = list_push(out, instr)
-    end
-    let i2 = i2 + 1
-  end
-  return out
-end
-
 # docs/plans/general-refcounting.md, Phase 2: loops. A multi-block
 # closure (while loops are ALWAYS modeled this way in this project's own
 # architecture -- a head block, a body, an exit, connected via
@@ -2852,26 +2972,6 @@ end
 # Store-per-param sequence plus a plain Jump by the time the single-
 # block pass above runs, with no instruction left that still says "this
 # is a JumpBlock" at all).
-#
-# Scoped deliberately narrow for this first increment: the whole
-# PROGRAM must contain zero closures anywhere (bm_closure_blocks empty,
-# the same check bm_nc_program_has_dynamic_dispatch already uses for a
-# different reason). Found and confirmed directly, not assumed: a raw
-# closure's own CREATION has no single "MakeClosure" opcode at this
-# level at all -- bm_lower_closure_expr emits Const "__closure" + one
-# Load per captured name + two BuildLists, which only gets recognized
-# and folded into a single "MakeClosure" instruction LATER, during
-# bm_nc_translate_block_instrs's own translation (too late for this raw
-# pass to see). Reliably detecting "is this Load part of a closure's
-# own capture list" at the raw level would need pattern-matching that
-# specific Const/Load/BuildList sequence, not a single opcode check --
-# deferred rather than risked in this increment; bailing out whenever
-# ANY closure exists anywhere in the program is conservative, not
-# unsafe, matching this plan's own established shape for every
-# increment so far.
-make a function called bm_nc_program_has_any_closures takes prog returns yes
-  return list_len(get("__vars", "bm_closure_blocks")) > 0
-end
 
 # Every name appearing in ANY JumpBlock's own forwarded-params list,
 # anywhere in a block's raw instrs -- a name forwarded this way must
@@ -2895,27 +2995,6 @@ make a function called bm_nc_raw_jumpblock_forwarded_names takes instrs returns 
     let i = i + 1
   end
   return names
-end
-
-# Every ReturnValue (131889) or JumpBlock (974555) index in a block's
-# raw instrs -- both count as "this block is finished" for a LOCAL
-# candidate's own liveness purposes: a JumpBlock that doesn't forward
-# the candidate (bm_nc_raw_jumpblock_forwarded_names already excludes
-# anything that DOES) means nothing on the other side of it can ever
-# read this block's own copy of that local again, exactly like a real
-# return does.
-make a function called bm_nc_raw_block_exit_indices takes instrs returns indices
-  let indices = []
-  let n = list_len(instrs)
-  let i = 0
-  while i < n do
-    let op = list_get(list_get(instrs, i), 0)
-    if (op == 131889) or (op == 974555) then # "ReturnValue" or "JumpBlock"
-      let indices = list_push(indices, i)
-    end
-    let i = i + 1
-  end
-  return indices
 end
 
 # Same dominance condition as bm_nc_flat_index_dominates, at the raw
@@ -2986,53 +3065,143 @@ make a function called bm_nc_raw_block_index_dominates takes instrs, p, e return
   return not bm_list_contains(reached, e)
 end
 
-# How many instructions get inserted at a given raw exit index for
-# THESE specific (already pre-filtered to "dominates this exit")
-# eligible names -- one triple per name, except (at a ReturnValue exit
-# specifically) whichever one is the value actually being returned
-# right there. A JumpBlock exit never has this exception: anything
-# eligible here already excluded every forwarded name entirely
-# (bm_nc_raw_jumpblock_forwarded_names), so every remaining eligible
-# name is always safe to decrement before it.
-make a function called bm_nc_raw_rc_dec_count_at_exit takes instrs, idx, names_here returns count
-  let op = list_get(list_get(instrs, idx), 0)
-  let returned_name = ""
-  if op == 131889 then # "ReturnValue"
-    if idx > 0 then
-      let prev = list_get(instrs, idx - 1)
-      if list_get(prev, 0) == 277141 then # "Load"
-        let returned_name = list_get(prev, 1)
+# The dominator tree of a block's raw instrs, from index 0, as
+# [tin, size]: p dominates e exactly when tin[p] <= tin[e] < tin[p] +
+# size[p] (preorder numbering of the tree). Successors are as in
+# bm_nc_raw_reaches_avoiding. Every jump inside a block goes forward, so
+# index order is a topological order: each instruction's predecessors are
+# final before it is visited, and an immediate dominator always has a
+# smaller index (which the intersection walk and both numbering passes
+# rely on). An unreached instruction has tin -1. false if a jump goes
+# backward, for which bm_fam_dominates falls back to the walk. Built once
+# per block; the walk per query made the ownership pass take hours on a
+# block the size of the interpreter's bi_run_block.
+make a function called bm_nc_raw_dom_tree takes instrs returns tree
+  let n = list_len(instrs)
+  let idom = []
+  let i = 0
+  while i < n do
+    let idom = list_push(idom, 0 - 2)
+    let i = i + 1
+  end
+  if n == 0 then
+    return [[], []]
+  end
+  let idom = list_set(idom, 0, 0 - 1)
+  let i = 0
+  while i < n do
+    if list_get(idom, i) != (0 - 2) then
+      let instr = list_get(instrs, i)
+      let op = list_get(instr, 0)
+      let succs = []
+      if op == 212209 then # "Jump"
+        let succs = [list_get(instr, 1)]
+      elif op == 34716 then # "JumpIfFalse"
+        let succs = [list_get(instr, 1), i + 1]
+      elif (op == 131889) or (op == 974555) then # "ReturnValue" or "JumpBlock"
+        let succs = []
+      else
+        let succs = [i + 1]
+      end
+      let si = 0
+      while si < list_len(succs) do
+        let t = list_get(succs, si)
+        if (t >= 0) and (t < n) then
+          if t <= i then
+            return false
+          end
+          let cur = list_get(idom, t)
+          if cur == (0 - 2) then
+            let idom = list_set(idom, t, i)
+          else
+            let a = cur
+            let b = i
+            while a != b do
+              if a > b then
+                let a = list_get(idom, a)
+              else
+                let b = list_get(idom, b)
+              end
+            end
+            let idom = list_set(idom, t, a)
+          end
+        end
+        let si = si + 1
       end
     end
+    let i = i + 1
   end
-  let count = 0
-  let ei = 0
-  while ei < list_len(names_here) do
-    if list_get(names_here, ei) != returned_name then
-      let count = count + 1
+  let size = []
+  let i = 0
+  while i < n do
+    if list_get(idom, i) == (0 - 2) then
+      let size = list_push(size, 0)
+    else
+      let size = list_push(size, 1)
     end
-    let ei = ei + 1
+    let i = i + 1
   end
-  return count
+  let i = n - 1
+  while i > 0 do
+    let d = list_get(idom, i)
+    if d >= 0 then
+      let size = list_set(size, d, list_get(size, d) + list_get(size, i))
+    end
+    let i = i - 1
+  end
+  let tin = []
+  let nxt = []
+  let i = 0
+  while i < n do
+    let tin = list_push(tin, 0 - 1)
+    let nxt = list_push(nxt, 0)
+    let i = i + 1
+  end
+  let tin = list_set(tin, 0, 0)
+  let nxt = list_set(nxt, 0, 1)
+  let i = 1
+  while i < n do
+    let d = list_get(idom, i)
+    if d >= 0 then
+      let tin = list_set(tin, i, list_get(nxt, d))
+      let nxt = list_set(nxt, d, list_get(nxt, d) + list_get(size, i))
+      let nxt = list_set(nxt, i, list_get(tin, i) + 1)
+    end
+    let i = i + 1
+  end
+  return [tin, size]
 end
 
-# Raw-level counterpart of bm_nc_cumulative_shift_at -- same shape,
-# same reasoning (see that function's own header).
-make a function called bm_nc_raw_cumulative_shift_at takes exits, insert_counts, idx returns shift
-  let shift = 0
-  let ei = 0
-  while ei < list_len(exits) do
-    if list_get(exits, ei) <= idx then
-      let shift = shift + list_get(insert_counts, ei)
-    end
-    let ei = ei + 1
+# Whether p dominates e in the block bm_fam_block_info described, with the
+# same answers as bm_nc_raw_block_index_dominates: true for an e no path
+# reaches, false for a p no path reaches when e is reached.
+make a function called bm_fam_dominates takes info, p, e returns yes
+  let tree = list_get(info, 8)
+  if tree == false then
+    return bm_nc_raw_block_index_dominates(list_get(info, 2), p, e)
   end
-  return shift
+  let tin = list_get(tree, 0)
+  let n = list_len(tin)
+  if (e < 0) or (e >= n) then
+    return true
+  end
+  let te = list_get(tin, e)
+  if te < 0 then
+    return true
+  end
+  if (p < 0) or (p >= n) then
+    return false
+  end
+  let tp = list_get(tin, p)
+  if tp < 0 then
+    return false
+  end
+  return (tp <= te) and (te < (tp + list_get(list_get(tree, 1), p)))
 end
 
 # Hash-level counterpart of bm_nc_is_refcounted_producer_call/bm_nc_rc_
-# dec_fn_for_producer: this file's string-keyed instr, like
-# bm_nc_rewrite_block_for_string_rc's own `instrs`, has already had its
+# dec_fn_for_producer: this file's string-keyed instr, like the raw
+# ownership pass's own `instrs` (bm_fam_block_info), has already had its
 # opcode replaced by bm_op_hash (700058/"CallHost", 938836/"Call") by
 # this point, so those two functions' own `op != "Call"`-style checks
 # never match here and silently fall through -- confirmed the real
@@ -3060,7 +3229,7 @@ make a function called bm_nc_raw_rc_dec_fn_for_producer takes instr returns name
   if bm_list_contains(bm_nc_list_producer_names(), callee) then
     return "rt_list_rc_dec"
   end
-  if bm_list_contains(bm_nc_dynamic_producer_names(), callee) then
+  if bm_list_contains(bm_nc_owned_runtime_producer_names(), callee) or bm_nc_is_value_fn(callee) then
     return "rt_rc_dec_if_refcounted"
   end
   if bm_list_contains(bm_nc_string_producer_names(), callee) then
@@ -3069,179 +3238,755 @@ make a function called bm_nc_raw_rc_dec_fn_for_producer takes instr returns name
   return false
 end
 
-# The actual per-block rewrite: finds every eligible local LOCAL TO THIS
-# ONE BLOCK (direct producer provenance -- a KNOWN refcounted-producer
-# CallHost/Call, bm_nc_raw_rc_dec_fn_for_producer, immediately followed
-# by a Store -- exactly one such Store in this block, never forwarded
-# by any JumpBlock here) and, for EACH of this block's own exits
-# INDEPENDENTLY, inserts a decrement immediately before it whenever this
-# candidate's own creation point dominates THAT SPECIFIC exit
-# (bm_nc_raw_block_index_dominates) -- a ReturnValue exit excepting the
-# local actually being returned there, a JumpBlock exit never excepting
-# anything (forwarded names are already excluded globally). A candidate
-# need not dominate every exit to be considered at all (see that
-# function's own header for why requiring that would make this pass
-# inert for the most common loop-body shape). Every existing Jump/
-# JumpIfFalse target gets corrected for the shift, same two-pass
-# approach as the flat-level version and for the identical reason (found
-# there first: inserting instructions without correcting existing jump
-# targets sends them to the wrong place). Returns `blk` completely
-# unchanged if no eligible local is found in it at all.
-make a function called bm_nc_rewrite_block_for_string_rc takes blk returns new_blk
-  let instrs = bi_block_instrs(blk)
-  let exits = bm_nc_raw_block_exit_indices(instrs)
-  if list_len(exits) == 0 then
-    return blk
-  end
-  let forwarded_names = bm_nc_raw_jumpblock_forwarded_names(instrs)
-  let n = list_len(instrs)
-  let eligible_names = []
-  let eligible_fns = []
+# ---- reference ownership across a function's blocks ----
+#
+# A function with a loop or a split if is a family of blocks joined by
+# JumpBlocks, each of which hands the values it pushes just before it (one
+# Load or Const per name, lower.patlang's bm_push_loads_or_default) to the
+# target's parameters of the same position. Such a hand-over is a MOVE, not a
+# copy: the sending block ends there. This pass finds which locals own a
+# reference to the value they hold and releases it when nothing else will:
+#
+# - a local owns its value when every Store to it takes a FRESH value (a list
+#   literal, list_push/list_set, a string producer: bm_nc_raw_is_fresh_
+#   producer) and it is never copied into another local (`Load a; Store b`);
+# - a block's parameter owns its value when every JumpBlock into that block
+#   moves an owned value (or a Const) into it -- the largest such assignment,
+#   found by dropping parameters until nothing changes, since a loop's
+#   back edge makes the question depend on itself. The root block's
+#   parameters are the function's own, borrowed arguments: never owned;
+# - an owned local reassigned with a fresh value gives up the old one after
+#   the Store (rt_rc_release_old); at each exit it gives up the one it holds
+#   unless that JumpBlock moves it on or that ReturnValue returns it.
+#
+# Before this, a local carried round a loop was never released: `let st =
+# list_push(st, k)` kept every superseded node, about 77 bytes a push, and
+# raytrace's picture reader (3 million pushes a picture) ran past 8GB (ch36).
+# A local given a BORROWED value (list_get/vec_get/get, the dynamic
+# producers) owns it only through the increment bm_nc_insert_list_get_result_
+# incs adds after flattening, which a moved name does not get: such locals
+# keep the narrower rule this pass used to apply to every local -- one Store
+# in the block, never forwarded, released at the exits that Store dominates.
+
+make a function called bm_fam_index takes names, name returns idx
+  let n = list_len(names)
   let i = 0
-  while i < (n - 1) do
-    let instr = list_get(instrs, i)
-    let dec_fn = bm_nc_raw_rc_dec_fn_for_producer(instr)
-    if dec_fn != false then
-      let next = list_get(instrs, i + 1)
-      if list_get(next, 0) == 642543 then # "Store"
-        let name = list_get(next, 1)
-        if not bm_list_contains(forwarded_names, name) then
-          let store_count = 0
-          let sj = 0
-          while sj < n do
-            let sinstr = list_get(instrs, sj)
-            if (list_get(sinstr, 0) == 642543) and (list_get(sinstr, 1) == name) then
-              let store_count = store_count + 1
-            end
-            let sj = sj + 1
-          end
-          if store_count == 1 then
-            let eligible_names = list_push(eligible_names, name)
-            let eligible_fns = list_push(eligible_fns, dec_fn)
-          end
-        end
-      end
+  while i < n do
+    if list_get(names, i) == name then
+      return i
     end
     let i = i + 1
   end
-  if list_len(eligible_names) == 0 then
-    return blk
+  return 0 - 1
+end
+
+make a function called bm_fam_is_internal takes name returns yes
+  if name.length < 2 then
+    return false
   end
-  # Per (exit, candidate): does this candidate's own store (p = store
-  # index) dominate THIS exit? Collected once up front so both the
-  # insert-count pass and the emission pass agree exactly.
-  let names_per_exit = []
-  let xi = 0
-  while xi < list_len(exits) do
-    let x = list_get(exits, xi)
-    let here = []
-    let ni = 0
-    while ni < list_len(eligible_names) do
-      let name = list_get(eligible_names, ni)
-      let p = 0 - 1
-      let sj = 0
-      while sj < n do
-        if (list_get(list_get(instrs, sj), 0) == 642543) and (list_get(list_get(instrs, sj), 1) == name) then
-          let p = sj
-        end
-        let sj = sj + 1
+  return substr(name, 0, 2) == "__"
+end
+
+# Whether a Call's result is the caller's: any function of a program but
+# the by-name dispatchers; in the runtime, a value function (raw-word
+# helpers return no reference) or rt_rc_retain.
+make a function called bm_nc_raw_owned_callee takes callee returns yes
+  if bm_nc_library_mode() then
+    return bm_nc_is_value_fn(callee) or (callee == "rt_rc_retain")
+  end
+  return bm_nc_is_user_callee(callee)
+end
+
+make a function called bm_nc_raw_is_fresh_producer takes instr returns yes
+  let op = list_get(instr, 0)
+  if op == 550066 then # "BuildList"
+    return true
+  end
+  if op == 451867 then # "Bin"
+    # (the runtime's arithmetic is on raw words, bm_nc_is_fresh_arith)
+    return (not bm_nc_library_mode()) and bm_nc_is_raw_arith_op(list_get(instr, 1))
+  end
+  if (op != 700058) and (op != 938836) then # "CallHost", "Call"
+    return false
+  end
+  let callee = list_get(instr, 1)
+  if op == 938836 then # "Call"
+    return bm_nc_raw_owned_callee(callee)
+  end
+  if bm_list_contains(bm_nc_owned_runtime_producer_names(), callee) or bm_nc_is_value_fn(callee) then
+    return true
+  end
+  return bm_list_contains(bm_nc_list_producer_names(), callee) or bm_list_contains(bm_nc_string_producer_names(), callee)
+end
+
+# A pure function hands its caller one reference to what it returns (and
+# the caller owns a pure call's result, bm_nc_raw_is_fresh_producer /
+# bm_nc_is_pure_user_call): every returned value that is not already the
+# function's own takes one here, just before its ReturnValue -- a Load (a
+# parameter's borrow, or a local whose own release at this exit now runs
+# after it), or any other computed value, a list_get's borrow included.
+# Fresh producers, a pure call's result and constants are already the
+# caller's. The retain goes in before the multi-block pass puts this exit's
+# releases between the value and the ReturnValue, which hid a bare
+# list_get from bm_nc_insert_borrowed_element_incs's own retain (an inlined
+# tail call `return pattern_at(...)` handed back `p[1]` borrowed, and its
+# caller released it: raytrace ch10). A jump landing on the
+# ReturnValue brings a value from elsewhere, so that exit always retains.
+# A pure call's discarded result (`Store __bm_discard`) is released there.
+# Pure functions only: an impure call returns a [value, globals] pair its
+# caller unpacks and keeps nothing of, so neither side changes for it.
+# Before this every fresh value a function returned leaked in its caller
+# (raytrace's fa_num/ga_zero: gigabytes per scene in ch36/37/39).
+make a function called bm_nc_rewrite_pure_call_ownership takes cblocks, retain_returns returns new_cblocks
+  let out_blocks = []
+  let bi = 0
+  while bi < list_len(cblocks) do
+    let blk = list_get(cblocks, bi)
+    let instrs = bi_block_instrs(blk)
+    let n = list_len(instrs)
+    let targets = []
+    let i = 0
+    while i < n do
+      let op = list_get(list_get(instrs, i), 0)
+      if (op == 212209) or (op == 34716) then # "Jump", "JumpIfFalse"
+        let targets = list_push(targets, list_get(list_get(instrs, i), 1))
       end
-      if bm_nc_raw_block_index_dominates(instrs, p, x) then
-        let here = list_push(here, name)
-      end
-      let ni = ni + 1
+      let i = i + 1
     end
-    let names_per_exit = list_push(names_per_exit, here)
-    let xi = xi + 1
+    # inserts: [position, instrs to run before the original instruction there]
+    let inserts = []
+    let i = 1
+    while i < n do
+      let ins = list_get(instrs, i)
+      let op = list_get(ins, 0)
+      let prev = list_get(instrs, i - 1)
+      if (op == 131889) and retain_returns then # "ReturnValue"
+        let pop = list_get(prev, 0)
+        let keep = bm_nc_raw_is_fresh_producer(prev) or (pop == 487138) # "Const"
+        if (pop == 277141) or bm_list_contains(targets, i) then # "Load"
+          let keep = false
+        end
+        if not keep then
+          let inserts = list_push(inserts, [i, [[700058, "rt_rc_retain", 1]]])
+        end
+      elif (op == 642543) and (list_get(ins, 1) == "__bm_discard") then # "Store"
+        if (list_get(prev, 0) == 938836) and bm_nc_raw_owned_callee(list_get(prev, 1)) and (not bm_list_contains(targets, i)) then
+          let inserts = list_push(inserts, [i, [[700058, "rt_rc_dec_if_refcounted", 1]]])
+        end
+      end
+      let i = i + 1
+    end
+    if list_len(inserts) == 0 then
+      let out_blocks = list_push(out_blocks, blk)
+    else
+      # land[t]: where original index t ends up -- at the start of what is
+      # inserted before it, so a jump to t runs that too.
+      let land = []
+      let added = 0
+      let k = 0
+      let t = 0
+      while t <= n do
+        let land = list_push(land, t + added)
+        if k < list_len(inserts) then
+          if list_get(list_get(inserts, k), 0) == t then
+            let added = added + list_len(list_get(list_get(inserts, k), 1))
+            let k = k + 1
+          end
+        end
+        let t = t + 1
+      end
+      let new_instrs = []
+      let k = 0
+      let i = 0
+      while i < n do
+        if k < list_len(inserts) then
+          if list_get(list_get(inserts, k), 0) == i then
+            let extra = list_get(list_get(inserts, k), 1)
+            let a = 0
+            while a < list_len(extra) do
+              let new_instrs = list_push(new_instrs, list_get(extra, a))
+              let a = a + 1
+            end
+            let k = k + 1
+          end
+        end
+        let ins = list_get(instrs, i)
+        let op = list_get(ins, 0)
+        if (op == 212209) or (op == 34716) then # "Jump", "JumpIfFalse"
+          let new_instrs = list_push(new_instrs, [op, list_get(land, list_get(ins, 1))])
+        else
+          let new_instrs = list_push(new_instrs, ins)
+        end
+        let i = i + 1
+      end
+      let out_blocks = list_push(out_blocks, ["BlockIR", bi_block_name(blk), bi_block_params(blk), new_instrs])
+    end
+    let bi = bi + 1
   end
-  let insert_counts = []
-  let xi2 = 0
-  while xi2 < list_len(exits) do
-    let x = list_get(exits, xi2)
-    let names_here = list_get(names_per_exit, xi2)
-    let insert_counts = list_push(insert_counts, bm_nc_raw_rc_dec_count_at_exit(instrs, x, names_here) * 3)
-    let xi2 = xi2 + 1
+  return out_blocks
+end
+
+# [name, params, instrs, copied, store_names, store_lists, jumps, exits,
+# dom_tree (bm_nc_raw_dom_tree)];
+# a jump is [index, target, param_names, source_names ("" for a Const),
+# opaque] -- opaque when the values it hands over are not all a plain Load
+# or Const just before it.
+make a function called bm_fam_block_info takes blk returns info
+  let instrs = bi_block_instrs(blk)
+  let n = list_len(instrs)
+  let copied = []
+  let snames = []
+  let slists = []
+  let jumps = []
+  let exits = []
+  let i = 0
+  while i < n do
+    let ins = list_get(instrs, i)
+    let op = list_get(ins, 0)
+    if op == 642543 then # "Store"
+      let nm = list_get(ins, 1)
+      let k = bm_fam_index(snames, nm)
+      if k < 0 then
+        let snames = list_push(snames, nm)
+        let slists = list_push(slists, [i])
+      else
+        let slists = list_set(slists, k, list_push(list_get(slists, k), i))
+      end
+      if i > 0 then
+        let prev = list_get(instrs, i - 1)
+        if (list_get(prev, 0) == 277141) and (list_get(prev, 1) != nm) then # "Load"
+          if not bm_list_contains(copied, list_get(prev, 1)) then
+            let copied = list_push(copied, list_get(prev, 1))
+          end
+        end
+      end
+    elif op == 974555 then # "JumpBlock"
+      let pnames = list_get(ins, 2)
+      let pn = list_len(pnames)
+      let sources = []
+      let opaque = i < pn
+      let j = 0
+      while (j < pn) and (not opaque) do
+        let src = list_get(instrs, i - pn + j)
+        let sop = list_get(src, 0)
+        if sop == 277141 then # "Load"
+          let sources = list_push(sources, list_get(src, 1))
+        elif (sop == 487138) and bm_fam_const_is_value(src) then # "Const"
+          let sources = list_push(sources, "")
+        else
+          let opaque = true
+        end
+        let j = j + 1
+      end
+      let jumps = list_push(jumps, [i, list_get(ins, 1), pnames, sources, opaque])
+      let exits = list_push(exits, i)
+    elif op == 131889 then # "ReturnValue"
+      let exits = list_push(exits, i)
+    end
+    let i = i + 1
   end
-  # Bare, not pre-prefixed: this rewrite runs on RAW instrs, still ahead
-  # of bm_nc_translate_block_instrs's own translation step, which
-  # prefixes EVERY bare Store/Load name with this block's own name
-  # unconditionally (confirmed directly: pre-prefixing here doubled up,
-  # producing "__loop_head_0____loop_head_0____bm_string_rc_discard").
-  # "s"/"total"/"i" themselves are equally bare at this stage -- this
-  # discard name just needs to follow the same convention they do.
-  let discard_name = "__bm_string_rc_discard"
+  return [bi_block_name(blk), bi_block_params(blk), instrs, copied, snames, slists, jumps, exits, bm_nc_raw_dom_tree(instrs)]
+end
+
+make a function called bm_fam_stores takes info, x returns stores
+  let k = bm_fam_index(list_get(info, 4), x)
+  if k < 0 then
+    return []
+  end
+  return list_get(list_get(info, 5), k)
+end
+
+# Whether instr, just before a Store to x, is a Load of another local: a
+# copy, which takes a reference of its own after the Store
+# (bm_fam_rewrite_block), so the copy and the local it copies each own one.
+# Never the globals table, which no pass counts.
+make a function called bm_fam_is_copy_of_other takes instr, x returns yes
+  if list_get(instr, 0) != 277141 then # "Load"
+    return false
+  end
+  let src = list_get(instr, 1)
+  if bm_nc_library_mode() then
+    # in the runtime only a copy of a value: a raw word copied is not counted
+    if get("__vars", "bm_lib_vv_" + get("__vars", "bm_lib_current_root") + "__" + src) != true then
+      return false
+    end
+  end
+  return (src != x) and (not bm_nc_is_globals_name(src))
+end
+
+# Whether a Const is a value the passes may count: always in a program,
+# where every constant is a tagged value; in the runtime, where an integer
+# constant is a raw word (a mask, a tag), only one in fixnum range, which
+# counting leaves alone (codegen_x64's x64_rc_call_asm).
+make a function called bm_fam_const_is_value takes instr returns yes
+  if not bm_nc_library_mode() then
+    return true
+  end
+  if list_get(instr, 1) != "num" then
+    return true
+  end
+  let v = to_num(list_get(instr, 2))
+  return (v > (0 - 140737488355328)) and (v < 140737488355328)
+end
+
+# x may own its value in this block: not internal, every Store to it fresh
+# or a copy of another local. Being copied does not stop x owning its value:
+# the copy takes its own reference. (Before, a local copied into another was
+# owned by neither: raytrace's ia_mul, `let lo = p1`, leaked every product.)
+make a function called bm_fam_fresh_candidate takes info, x returns yes
+  if bm_fam_is_internal(x) then
+    return false
+  end
+  if get("__vars", "bm_fam_poked__" + x) == true then
+    return false
+  end
+  let instrs = list_get(info, 2)
+  let stores = bm_fam_stores(info, x)
+  let i = 0
+  while i < list_len(stores) do
+    let s = list_get(stores, i)
+    if s == 0 then
+      return false
+    end
+    # a constant is owned trivially: releasing it does nothing
+    let prev = list_get(instrs, s - 1)
+    let is_const = (list_get(prev, 0) == 487138) and bm_fam_const_is_value(prev) # "Const"
+    if (not bm_nc_raw_is_fresh_producer(prev)) and (not is_const) and (not bm_fam_is_copy_of_other(prev, x)) then
+      return false
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+# Owned names that need a defined starting value at the block's entry: stored
+# here, not a parameter, and not covered from their first Store -- some exit
+# or later Store is not dominated by it (`let m = ia_mul(...)` in one branch
+# of an if chain). A local slot keeps its last iteration's value, which that
+# iteration's own exit already released, so releasing it again on a path that
+# never stored it would be a second release; starting it at 0 (what the
+# interpreter reads for a name the block stores, bi_load_local) makes every
+# exit and every reassignment see a value this block owns.
+make a function called bm_fam_needs_init takes info, x returns yes
+  if bm_list_contains(list_get(info, 1), x) then
+    return false
+  end
+  let instrs = list_get(info, 2)
+  let stores = bm_fam_stores(info, x)
+  if list_len(stores) == 0 then
+    return false
+  end
+  let first = list_get(stores, 0)
+  let k = 1
+  while k < list_len(stores) do
+    if not bm_fam_dominates(info, first, list_get(stores, k)) then
+      return true
+    end
+    let k = k + 1
+  end
+  let exits = list_get(info, 7)
+  let k = 0
+  while k < list_len(exits) do
+    if not bm_fam_dominates(info, first, list_get(exits, k)) then
+      return true
+    end
+    let k = k + 1
+  end
+  return false
+end
+
+# x holds a value it owns at instruction e.
+make a function called bm_fam_owned_at takes info, owned_params, x, e returns yes
+  if not bm_fam_fresh_candidate(info, x) then
+    return false
+  end
+  if bm_list_contains(owned_params, x) then
+    return true
+  end
+  # started at 0 on entry (bm_fam_needs_init): owned on every path
+  if bm_fam_needs_init(info, x) then
+    return true
+  end
+  let instrs = list_get(info, 2)
+  let stores = bm_fam_stores(info, x)
+  let i = 0
+  while i < list_len(stores) do
+    if bm_fam_dominates(info, list_get(stores, i), e) then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called bm_fam_count takes names, name returns c
+  let c = 0
+  let i = 0
+  while i < list_len(names) do
+    if list_get(names, i) == name then
+      let c = c + 1
+    end
+    let i = i + 1
+  end
+  return c
+end
+
+make a function called bm_fam_without takes names, name returns out
+  let out = []
+  let i = 0
+  while i < list_len(names) do
+    if list_get(names, i) != name then
+      let out = list_push(out, list_get(names, i))
+    end
+    let i = i + 1
+  end
+  return out
+end
+
+# For each block, the parameters that own their value (root first, never).
+make a function called bm_fam_owned_params takes infos returns owned
+  let nb = list_len(infos)
+  let bnames = []
+  let owned = []
+  let b = 0
+  while b < nb do
+    let info = list_get(infos, b)
+    let bnames = list_push(bnames, list_get(info, 0))
+    let ps = []
+    if b > 0 then
+      let params = list_get(info, 1)
+      let pi = 0
+      while pi < list_len(params) do
+        let p = list_get(params, pi)
+        if bm_fam_fresh_candidate(info, p) and (not bm_list_contains(ps, p)) then
+          let ps = list_push(ps, p)
+        end
+        let pi = pi + 1
+      end
+    end
+    let owned = list_push(owned, ps)
+    let b = b + 1
+  end
+  let changed = true
+  while changed do
+    let changed = false
+    let a = 0
+    while a < nb do
+      let info = list_get(infos, a)
+      let jumps = list_get(info, 6)
+      let ji = 0
+      while ji < list_len(jumps) do
+        let jmp = list_get(jumps, ji)
+        let t = bm_fam_index(bnames, list_get(jmp, 1))
+        if t >= 0 then
+          let pnames = list_get(jmp, 2)
+          let pj = 0
+          while pj < list_len(pnames) do
+            let p = list_get(pnames, pj)
+            if bm_list_contains(list_get(owned, t), p) then
+              let ok = true
+              if list_get(jmp, 4) then
+                let ok = false
+              else
+                let sources = list_get(jmp, 3)
+                let src = list_get(sources, pj)
+                if src != "" then
+                  if bm_fam_count(sources, src) > 1 then
+                    let ok = false
+                  elif not bm_fam_owned_at(info, list_get(owned, a), src, list_get(jmp, 0)) then
+                    let ok = false
+                  end
+                end
+              end
+              if not ok then
+                let owned = list_set(owned, t, bm_fam_without(list_get(owned, t), p))
+                let changed = true
+              end
+            end
+            let pj = pj + 1
+          end
+        end
+        let ji = ji + 1
+      end
+      let a = a + 1
+    end
+  end
+  return owned
+end
+
+make a function called bm_fam_add_at takes slots, i, instrs returns out
+  let cur = list_get(slots, i)
+  let k = 0
+  while k < list_len(instrs) do
+    let cur = list_push(cur, list_get(instrs, k))
+    let k = k + 1
+  end
+  return list_set(slots, i, cur)
+end
+
+# The jump at exit e, or false.
+make a function called bm_fam_jump_at takes info, e returns jmp
+  let jumps = list_get(info, 6)
+  let i = 0
+  while i < list_len(jumps) do
+    if list_get(list_get(jumps, i), 0) == e then
+      return list_get(jumps, i)
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# Whether exit e hands x on (moves or returns it): no release there.
+make a function called bm_fam_exit_keeps takes info, x, e returns yes
+  let instrs = list_get(info, 2)
+  let jmp = bm_fam_jump_at(info, e)
+  if jmp != false then
+    return list_get(jmp, 4) or bm_list_contains(list_get(jmp, 3), x)
+  end
+  if e > 0 then
+    let prev = list_get(instrs, e - 1)
+    if (list_get(prev, 0) == 277141) and (list_get(prev, 1) == x) then # "Load"
+      return true
+    end
+  end
+  return false
+end
+
+# Where exit e's releases go: before a JumpBlock's trailing argument pushes,
+# so they never split the pushes from the jump (a pure function's internal
+# JumpBlock drops the `Load __globals` it expects just before the jump).
+make a function called bm_fam_exit_insert_at takes info, e returns at
+  let jmp = bm_fam_jump_at(info, e)
+  if jmp == false then
+    return e
+  end
+  let instrs = list_get(info, 2)
+  let pn = list_len(list_get(jmp, 2))
+  let count = 0
+  while (count < pn) and (e - 1 - count >= 0) do
+    let op = list_get(list_get(instrs, e - 1 - count), 0)
+    if (op != 277141) and (op != 487138) then # "Load", "Const"
+      return e - count
+    end
+    let count = count + 1
+  end
+  return e - count
+end
+
+make a function called bm_fam_rewrite_block takes info, owned_params returns new_blk
+  let instrs = list_get(info, 2)
+  let n = list_len(instrs)
+  let exits = list_get(info, 7)
+  let params = list_get(info, 1)
+  let discard = "__bm_string_rc_discard"
+  # incl[i]: run by a jump to i (an exit's release, an old value's save);
+  # excl[i]: skipped by a jump to i (the release just after a Store).
+  let incl = []
+  let excl = []
+  let i = 0
+  while i <= n do
+    let incl = list_push(incl, [])
+    let excl = list_push(excl, [])
+    let i = i + 1
+  end
+  let any = false
+  let saves = 0
+  # Owned locals and parameters: fresh values, moved between blocks.
+  let names = []
+  let pi = 0
+  while pi < list_len(owned_params) do
+    let names = list_push(names, list_get(owned_params, pi))
+    let pi = pi + 1
+  end
+  let snames = list_get(info, 4)
+  let si = 0
+  while si < list_len(snames) do
+    let x = list_get(snames, si)
+    if (not bm_list_contains(names, x)) and bm_fam_fresh_candidate(info, x) then
+      let names = list_push(names, x)
+    end
+    let si = si + 1
+  end
+  let ni = 0
+  while ni < list_len(names) do
+    let x = list_get(names, ni)
+    let is_owned_param = bm_list_contains(owned_params, x)
+    let needs_init = (not is_owned_param) and bm_fam_needs_init(info, x)
+    if needs_init then
+      let incl = bm_fam_add_at(incl, 0, [[487138, "num", "0"], [642543, x]]) # "Const", "Store"
+      let any = true
+    end
+    let stores = bm_fam_stores(info, x)
+    let k = 0
+    while k < list_len(stores) do
+      let s = list_get(stores, k)
+      # A copy of another local takes a reference of its own right after
+      # the Store, so releasing the other cannot free what this one holds.
+      # (A read -- list_get, vec_get, get -- needed the same until Phase 7
+      # made it return a reference of its own.)
+      if s > 0 then
+        if bm_fam_is_copy_of_other(list_get(instrs, s - 1), x) then
+          let excl = bm_fam_add_at(excl, s + 1, [[277141, x], [700058, "rt_rc_inc_if_refcounted", 1], [642543, discard]])
+          let any = true
+        end
+      end
+      let held = is_owned_param or needs_init
+      let k2 = 0
+      while (k2 < k) and (not held) do
+        if bm_fam_dominates(info, list_get(stores, k2), s) then
+          let held = true
+        end
+        let k2 = k2 + 1
+      end
+      if held then
+        let old = "__bm_reassign_old_" + saves
+        let saves = saves + 1
+        # Saved just before the Store (the new value waits on the stack), not
+        # before the producer: that would split its operands from the call,
+        # and bm_nc_insert_list_element_incs finds them by adjacency.
+        let incl = bm_fam_add_at(incl, s, [[277141, x], [642543, old]])
+        let excl = bm_fam_add_at(excl, s + 1, [[277141, old], [277141, x], [700058, "rt_rc_release_old", 2], [642543, discard]])
+        let any = true
+      end
+      let k = k + 1
+    end
+    let xi = 0
+    while xi < list_len(exits) do
+      let e = list_get(exits, xi)
+      if bm_fam_owned_at(info, owned_params, x, e) and (not bm_fam_exit_keeps(info, x, e)) then
+        let incl = bm_fam_add_at(incl, bm_fam_exit_insert_at(info, e), [[277141, x], [700058, "rt_rc_dec_if_refcounted", 1], [642543, discard]])
+        let any = true
+      end
+      let xi = xi + 1
+    end
+    let ni = ni + 1
+  end
+  # Borrowed values (dynamic producers) and any other producer-made local
+  # not covered above: one Store in this block, never forwarded or copied,
+  # released at the exits that Store dominates.
+  let forwarded = bm_nc_raw_jumpblock_forwarded_names(instrs)
+  let ki = 0
+  while ki < list_len(snames) do
+    let x = list_get(snames, ki)
+    let stores = list_get(list_get(info, 5), ki)
+    if (not bm_list_contains(names, x)) and (not bm_list_contains(params, x)) and (not bm_fam_is_internal(x)) and (list_len(stores) == 1) and (not bm_list_contains(forwarded, x)) and (not bm_list_contains(list_get(info, 3), x)) then
+      let s = list_get(stores, 0)
+      if s > 0 then
+        let dec_fn = bm_nc_raw_rc_dec_fn_for_producer(list_get(instrs, s - 1))
+        if dec_fn != false then
+          let xi = 0
+          while xi < list_len(exits) do
+            let e = list_get(exits, xi)
+            if bm_fam_dominates(info, s, e) and (not bm_fam_exit_keeps(info, x, e)) then
+              let incl = bm_fam_add_at(incl, bm_fam_exit_insert_at(info, e), [[277141, x], [700058, dec_fn, 1], [642543, discard]])
+              let any = true
+            end
+            let xi = xi + 1
+          end
+        end
+      end
+    end
+    let ki = ki + 1
+  end
+  if not any then
+    return ["BlockIR", list_get(info, 0), params, instrs]
+  end
+  # Where old index t lands: everything inserted before it, plus what a
+  # jump to t skips.
+  let land = []
+  let before = 0
+  let t = 0
+  while t <= n do
+    let land = list_push(land, t + before + list_len(list_get(excl, t)))
+    let before = before + list_len(list_get(excl, t)) + list_len(list_get(incl, t))
+    let t = t + 1
+  end
   let out = []
   let i2 = 0
   while i2 < n do
-    let exit_pos = 0 - 1
-    let xi3 = 0
-    while xi3 < list_len(exits) do
-      if list_get(exits, xi3) == i2 then
-        let exit_pos = xi3
-      end
-      let xi3 = xi3 + 1
+    let ex = list_get(excl, i2)
+    let a = 0
+    while a < list_len(ex) do
+      let out = list_push(out, list_get(ex, a))
+      let a = a + 1
     end
-    if exit_pos != (0 - 1) then
-      let names_here = list_get(names_per_exit, exit_pos)
-      let op_here = list_get(list_get(instrs, i2), 0)
-      let returned_name = ""
-      if op_here == 131889 then # "ReturnValue"
-        if i2 > 0 then
-          let prev = list_get(instrs, i2 - 1)
-          if list_get(prev, 0) == 277141 then # "Load"
-            let returned_name = list_get(prev, 1)
-          end
-        end
-      end
-      let ei = 0
-      while ei < list_len(names_here) do
-        let name = list_get(names_here, ei)
-        if name != returned_name then
-          let dec_fn = "rt_string_rc_dec"
-          let fi = 0
-          while fi < list_len(eligible_names) do
-            if list_get(eligible_names, fi) == name then
-              let dec_fn = list_get(eligible_fns, fi)
-            end
-            let fi = fi + 1
-          end
-          let out = list_push(out, [277141, name]) # "Load"
-          let out = list_push(out, [700058, dec_fn, 1]) # "CallHost"
-          let out = list_push(out, [642543, discard_name]) # "Store"
-        end
-        let ei = ei + 1
-      end
+    let inn = list_get(incl, i2)
+    let a = 0
+    while a < list_len(inn) do
+      let out = list_push(out, list_get(inn, a))
+      let a = a + 1
     end
     let instr = list_get(instrs, i2)
     let op = list_get(instr, 0)
-    if (op == 212209) or (op == 34716) then # "Jump" or "JumpIfFalse"
-      let target = list_get(instr, 1)
-      let new_target = target + bm_nc_raw_cumulative_shift_at(exits, insert_counts, target)
-      let out = list_push(out, [op, new_target])
+    if (op == 212209) or (op == 34716) then # "Jump", "JumpIfFalse"
+      let out = list_push(out, [op, list_get(land, list_get(instr, 1))])
     else
       let out = list_push(out, instr)
     end
     let i2 = i2 + 1
   end
-  return ["BlockIR", bi_block_name(blk), bi_block_params(blk), out]
+  return ["BlockIR", list_get(info, 0), params, out]
 end
 
-# Applies bm_nc_rewrite_block_for_string_rc to every block in a multi-
-# block closure, only when the whole program has zero closures anywhere
-# (bm_nc_program_has_any_closures) -- the scope this increment commits
-# to, see that function's own header for exactly why. Returns `cblocks`
-# completely unchanged otherwise.
+# Applies the ownership pass to a root's block family. It runs whatever else
+# the program contains: a closure's captures are an ordinary BuildList of
+# Loads at its creation site, whose elements get their own reference
+# (bm_nc_insert_list_element_incs), and its body reads each one back with
+# list_get, a borrowed read the pass retains. It used to be skipped for any
+# program with a closure anywhere, which left every function in such a
+# program -- the native interpreter among them -- releasing nothing.
 make a function called bm_nc_rewrite_multi_block_for_string_rc takes prog, cblocks returns new_cblocks
-  if bm_nc_program_has_any_closures(prog) then
-    return cblocks
+  let poked = bm_fam_poked_names(cblocks)
+  let infos = []
+  let i = 0
+  while i < list_len(cblocks) do
+    let infos = list_push(infos, bm_fam_block_info(list_get(cblocks, i)))
+    let i = i + 1
   end
+  let owned = bm_fam_owned_params(infos)
   let new_cblocks = []
   let i = 0
   while i < list_len(cblocks) do
-    let new_cblocks = list_push(new_cblocks, bm_nc_rewrite_block_for_string_rc(list_get(cblocks, i)))
+    let new_cblocks = list_push(new_cblocks, bm_fam_rewrite_block(list_get(infos, i), list_get(owned, i)))
+    let i = i + 1
+  end
+  let i = 0
+  while i < list_len(poked) do
+    set_var("bm_fam_poked__" + list_get(poked, i), false)
     let i = i + 1
   end
   return new_cblocks
+end
+
+# In the runtime, storing a local's value raw into memory (mem_poke_qword)
+# is how a structure takes it over: the memory now holds that reference, so
+# the local, anywhere in the function (a family's blocks keep their names),
+# owns nothing to release. Releasing it freed the class table just written
+# into its slot. Marked for bm_fam_fresh_candidate; [] outside the runtime.
+make a function called bm_fam_poked_names takes cblocks returns names
+  let names = []
+  if not bm_nc_library_mode() then
+    return names
+  end
+  let b = 0
+  while b < list_len(cblocks) do
+    let instrs = bi_block_instrs(list_get(cblocks, b))
+    let i = 1
+    while i < list_len(instrs) do
+      let ins = list_get(instrs, i)
+      if (list_get(ins, 0) == 700058) and (list_get(ins, 1) == "mem_poke_qword") then # "CallHost"
+        let prev = list_get(instrs, i - 1)
+        if list_get(prev, 0) == 277141 then # "Load"
+          let names = list_push(names, list_get(prev, 1))
+          set_var("bm_fam_poked__" + list_get(prev, 1), true)
+        end
+      end
+      let i = i + 1
+    end
+    let b = b + 1
+  end
+  return names
 end
 
 # GitHub #223 full-test follow-up: bm_nc_build_callee_funcirs is called
@@ -3448,27 +4193,26 @@ make a function called bm_nc_build_callee_funcirs takes prog, roots, print_op re
       # (previously failing for exactly bm_alloc/bm_freelist_pop/
       # bm_rc_dec's own multi-block shape) now passes with zero growth.
     end
-    if list_len(cblocks) > 1 then
+    let passes = get("__vars", "bm_library_passes") != false
+    if passes then
+      # A raw-word helper of the runtime returns no reference (and what it
+      # returns may not be a value at all).
+      let retain_returns = (not bm_nc_library_mode()) or bm_nc_is_value_fn(root)
+      # (whose value locals bm_fam_is_copy_of_other consults, in the runtime)
+      set_var("bm_lib_current_root", root)
+      let cblocks = bm_nc_rewrite_pure_call_ownership(cblocks, retain_returns)
+      # The block-family ownership pass covers a one-block function too, so a
+      # function without loops follows the same rules as one with them (a copy
+      # takes its own reference, a branch-local is started at 0, a reassigned
+      # name releases its old value).
       let cblocks = bm_nc_rewrite_multi_block_for_string_rc(prog, cblocks)
     end
     let flat = bm_nc_flatten_blocks(prog, cblocks, pure_init, print_op, flat_mode)
-    write_file("self_hosting/build/genb_tempdebug.txt", "bncbcf_flatten_done root=" + root + " flat_len=" + list_len(flat) + " single_block=" + bm_nc_closure_is_single_block(cblocks) + " t_ms=" + now_ms())
-    # GitHub #223: bm_nc_insert_list_get_result_incs runs unconditionally
-    # now -- see the handler-closure call site above for the full story
-    # (a list_get result stored into a named local, in a multi-block/
-    # loop-containing function, got no protective increment at all,
-    # leaving it vulnerable to a cascading free when its own parent
-    # producer's unrelated decrement ran).
-    let flat = bm_nc_insert_list_get_result_incs(root, flat)
-    write_file("self_hosting/build/genb_tempdebug.txt", "bncbcf_incs2_done root=" + root + " t_ms=" + now_ms())
-    let c_single = bm_nc_closure_is_single_block(cblocks)
-    let flat = bm_nc_insert_list_element_incs(root, flat, c_single)
-    write_file("self_hosting/build/genb_tempdebug.txt", "bncbcf_incs1_done root=" + root + " t_ms=" + now_ms())
-    if c_single then
-      let flat = bm_nc_insert_reassignment_decs(root, flat)
-      write_file("self_hosting/build/genb_tempdebug.txt", "bncbcf_decs1_done root=" + root + " t_ms=" + now_ms())
-      let flat = bm_nc_insert_string_rc_decs(root, flat)
-      write_file("self_hosting/build/genb_tempdebug.txt", "bncbcf_decs2_done root=" + root + " t_ms=" + now_ms())
+    if passes then
+      write_file("self_hosting/build/genb_tempdebug.txt", "bncbcf_flatten_done root=" + root + " flat_len=" + list_len(flat) + " blocks=" + list_len(cblocks) + " t_ms=" + now_ms())
+      let flat = bm_nc_insert_list_element_incs(root, flat, false)
+      let flat = bm_nc_release_pure_call_arg_temps(root, flat)
+      let flat = bm_nc_release_call_pairs(root, flat)
     end
     let params = []
     let pi = 0
@@ -3653,25 +4397,17 @@ make a function called bm_to_real_funcir takes prog, print_op returns funcirs
   let init_instrs = list_push(init_instrs, ["Store", bm_nc_prefix(entry_name, "__globals")])
 
   write_file("self_hosting/build/genb_tempdebug.txt", "flatten_main_start main_blocks_len=" + list_len(main_blocks) + " t_ms=" + now_ms())
+  # main goes through the same block-family ownership pass as a function
+  # (bm_nc_build_callee_funcirs). It used to get only the single-block
+  # pass, which any top-level loop ruled out, so a loop at the top level
+  # kept every value it rebound.
+  let main_blocks = bm_nc_rewrite_multi_block_for_string_rc(prog, main_blocks)
   let main_flat = bm_nc_flatten_blocks(prog, main_blocks, init_instrs, print_op, "main")
   let main_flat = list_push(main_flat, ["Const", "unit", ""])
   let main_flat = list_push(main_flat, ["Return"])
-  # docs/plans/general-refcounting.md, Phase 2: the same pass ordinary
-  # callee functions already get (bm_nc_build_callee_funcirs, below),
-  # extended to main itself. Low-impact in practice -- a real program's
-  # own main is usually multi-block (any top-level while loop makes it
-  # so, via JumpBlock), and bm_nc_closure_is_single_block only accepts
-  # exactly one -- but free, correct, and worth having for the genuinely
-  # single-block case (a short script with no loop at all).
-  # GitHub #223: bm_nc_insert_list_get_result_incs runs unconditionally --
-  # see the handler-closure call site's own header for the full story.
-  let main_flat = bm_nc_insert_list_get_result_incs(entry_name, main_flat)
-  let main_single = bm_nc_closure_is_single_block(main_blocks)
-  let main_flat = bm_nc_insert_list_element_incs(entry_name, main_flat, main_single)
-  if main_single then
-    let main_flat = bm_nc_insert_reassignment_decs(entry_name, main_flat)
-    let main_flat = bm_nc_insert_string_rc_decs(entry_name, main_flat)
-  end
+  let main_flat = bm_nc_insert_list_element_incs(entry_name, main_flat, false)
+  let main_flat = bm_nc_release_pure_call_arg_temps(entry_name, main_flat)
+  let main_flat = bm_nc_release_call_pairs(entry_name, main_flat)
   let main_funcir = ["FuncIR", "main", [], main_flat, []]
 
   write_file("self_hosting/build/genb_tempdebug.txt", "handler_funcirs_start t_ms=" + now_ms())
@@ -3698,7 +4434,260 @@ make a function called bm_to_real_funcir takes prog, print_op returns funcirs
     let funcirs = list_push(funcirs, list_get(cdyn_funcirs, ci))
     let ci = ci + 1
   end
+  let dyn_funcirs = bm_nc_build_dyn_adapter_funcirs(prog, pure_fns_list)
+  let ci = 0
+  while ci < list_len(dyn_funcirs) do
+    let funcirs = list_push(funcirs, list_get(dyn_funcirs, ci))
+    let ci = ci + 1
+  end
   return funcirs
+end
+
+# The name apply/parallel_map/fiber_new find a pure function under: its
+# adapter, which has the [value, globals] convention every by-name caller
+# uses (x64_emit_apply_table_asm lists it under the function's own name).
+make a function called bm_nc_dyn_adapter_fn_name takes name returns fname
+  return bm_nc_fn_name("__dyn_" + name)
+end
+
+# For each pure callable when anything dispatches by name: parameters the
+# declared ones plus __globals, body a bare call to the pure function and
+# the [value, globals] pair a block-model callee returns.
+make a function called bm_nc_build_dyn_adapter_funcirs takes prog, pure_names returns funcirs
+  let funcirs = []
+  if not bm_nc_program_has_dynamic_dispatch(prog) then
+    return funcirs
+  end
+  let pi = 0
+  while pi < list_len(pure_names) do
+    let name = list_get(pure_names, pi)
+    let blk = bi_find_block(prog, name)
+    if bm_nc_is_callable_name(name) and (blk != false) then
+      let declared = list_len(bi_block_params(blk)) - 1
+      let params = []
+      let body = []
+      let k = 0
+      while k < declared do
+        let params = list_push(params, "__dyn_a" + k)
+        let body = list_push(body, ["Load", "__dyn_a" + k])
+        let k = k + 1
+      end
+      let params = list_push(params, "__dyn_g")
+      let body = list_push(body, ["Call", bm_nc_fn_name(name), declared])
+      let body = list_push(body, ["Load", "__dyn_g"])
+      let body = list_push(body, ["BuildList", 2])
+      let body = list_push(body, ["Return"])
+      let funcirs = list_push(funcirs, ["FuncIR", bm_nc_dyn_adapter_fn_name(name), params, body, []])
+    end
+    let pi = pi + 1
+  end
+  return funcirs
+end
+
+# docs/plans/general-refcounting.md, Phase 7: the runtime as a library.
+# Every declared function becomes a FuncIR under its own name with only its
+# declared parameters, the convention generated asm and programs already
+# call the runtime with: no `main`, no __globals, no [value, globals] pair.
+# A runtime function never touches a global, so each one is compiled pure;
+# the by-name dispatchers it calls (bm_parallel_map, fiber_new,
+# budgeted_run) are ordinary runtime functions here, resolving their target
+# in the program's apply table at run time. `passes` false compiles without
+# the ownership passes. The value functions found (bm_nc_library_value_fns)
+# are left in "bm_library_value_fns" for the build to export.
+make a function called bm_to_library_funcirs takes prog, passes returns funcirs
+  let blocks = bi_program_blocks(prog)
+  let roots = []
+  let bi = 0
+  while bi < list_len(blocks) do
+    let name = bi_block_name(list_get(blocks, bi))
+    if not bm_nc_is_synth_name(name) then
+      let roots = list_push(roots, name)
+      set_var("bm_pure_fn_set__" + name, true)
+      set_var("bm_lib_root__" + name, true)
+    end
+    let bi = bi + 1
+  end
+  set_var("bm_pure_fns", roots)
+  set_var("bm_library_mode", true)
+  set_var("bm_library_passes", passes)
+  let value_fns = bm_nc_library_value_fns(prog, roots)
+  set_var("bm_library_value_fns", value_fns)
+  let funcirs = bm_nc_build_callee_funcirs(prog, roots, "Call")
+  # The passes' own release and retain calls name runtime functions as
+  # CallHost (as for a program, before bm_patc_resolve_runtime_calls).
+  let resolved = []
+  let fi = 0
+  while fi < list_len(funcirs) do
+    let fir = list_get(funcirs, fi)
+    let body = list_get(fir, 3)
+    let out = []
+    let k = 0
+    while k < list_len(body) do
+      let ins = list_get(body, k)
+      if (list_get(ins, 0) == "CallHost") and (get("__vars", "bm_lib_root__" + list_get(ins, 1)) == true) then
+        let out = list_push(out, ["Call", list_get(ins, 1), list_get(ins, 2)])
+      else
+        let out = list_push(out, ins)
+      end
+      let k = k + 1
+    end
+    let resolved = list_push(resolved, list_set(fir, 3, out))
+    let fi = fi + 1
+  end
+  set_var("bm_library_mode", false)
+  set_var("bm_library_passes", true)
+  return resolved
+end
+
+# Whether the raw instruction `ins` computes a value (a tagged, counted or
+# immediate PatLang value) rather than a raw machine word, given the value
+# functions and value locals found so far (bm_nc_library_value_fns).
+make a function called bm_nc_lib_is_value_expr takes ins, family_key returns yes
+  let op = list_get(ins, 0)
+  if op == 550066 then # "BuildList"
+    return true
+  end
+  if op == 487138 then # "Const"
+    return list_get(ins, 1) == "str"
+  end
+  if op == 938836 then # "Call"
+    return bm_nc_raw_owned_callee(list_get(ins, 1))
+  end
+  if op == 700058 then # "CallHost"
+    let name = list_get(ins, 1)
+    return bm_list_contains(bm_nc_owned_runtime_producer_names(), name) or bm_list_contains(bm_nc_list_producer_names(), name)
+  end
+  if op == 277141 then # "Load"
+    return get("__vars", family_key + list_get(ins, 1)) == true
+  end
+  return false
+end
+
+# The runtime's value functions: those returning a value on some path --
+# rt_fresh(...) or rt_keep(...), a list literal, a string constant, a
+# list operation, a call to a value function, or a local some store gives
+# one of those (by name across the function's blocks, which keep their
+# variables' names). Least fixpoint, so a function is raw unless something
+# grounds it. Every other runtime function is a raw-word helper: its
+# result is not a reference, and it retains nothing it returns. A value
+# function that also returns arithmetic or a raw read gets that retained
+# like any value; they are listed in "bm_library_value_mixed" for review,
+# since a raw word there would be counted. A raw function returning one of
+# its parameters is listed in "bm_library_raw_param_returns": if that is a
+# value, its caller may release the argument (a temporary) right after the
+# call and be left holding a freed one, so it must return rt_keep(p).
+make a function called bm_nc_library_value_fns takes prog, roots returns value_fns
+  let rn = list_len(roots)
+  # per root: [returned instrs, [stored name, instr] pairs]
+  let facts = []
+  let ri = 0
+  while ri < rn do
+    let root = list_get(roots, ri)
+    let members = bm_nc_collect_block_closure(prog, root)
+    let rets = []
+    let stores = []
+    let mi = 0
+    while mi < list_len(members) do
+      let instrs = bi_block_instrs(bi_find_block(prog, list_get(members, mi)))
+      let i = 1
+      while i < list_len(instrs) do
+        let ins = list_get(instrs, i)
+        let op = list_get(ins, 0)
+        if op == 131889 then # "ReturnValue"
+          let rets = list_push(rets, list_get(instrs, i - 1))
+        elif op == 642543 then # "Store"
+          let stores = list_push(stores, [list_get(ins, 1), list_get(instrs, i - 1)])
+        end
+        let i = i + 1
+      end
+      let mi = mi + 1
+    end
+    let facts = list_push(facts, [rets, stores])
+    let ri = ri + 1
+  end
+  let value_fns = []
+  let changed = true
+  while changed do
+    let changed = false
+    let ri = 0
+    while ri < rn do
+      let root = list_get(roots, ri)
+      let key = "bm_lib_vv_" + root + "__"
+      let stores = list_get(list_get(facts, ri), 1)
+      # value locals, to a fixpoint of their own (a copy of a copy). Grown for
+      # a value function too: a local can become one only when a callee does,
+      # later in the outer fixpoint (rt_int_gcd's t, from rt_int_rem), and an
+      # unmarked one is copied without a reference of its own.
+      let grew = true
+      while grew do
+        let grew = false
+        let si = 0
+        while si < list_len(stores) do
+          let st = list_get(stores, si)
+          let nm = list_get(st, 0)
+          if get("__vars", key + nm) != true then
+            if bm_nc_lib_is_value_expr(list_get(st, 1), key) then
+              set_var(key + nm, true)
+              let grew = true
+              let changed = true
+            end
+          end
+          let si = si + 1
+        end
+      end
+      if not bm_nc_is_value_fn(root) then
+        let rets = list_get(list_get(facts, ri), 0)
+        let k = 0
+        while k < list_len(rets) do
+          if bm_nc_lib_is_value_expr(list_get(rets, k), key) then
+            set_var("bm_value_fn__" + root, true)
+            let value_fns = list_push(value_fns, root)
+            let changed = true
+            let k = list_len(rets)
+          end
+          let k = k + 1
+        end
+      end
+      let ri = ri + 1
+    end
+  end
+  let mixed = []
+  let param_returns = []
+  let ri = 0
+  while ri < rn do
+    let root = list_get(roots, ri)
+    if not bm_nc_is_value_fn(root) then
+      let params = bi_block_params(bi_find_block(prog, root))
+      let rets = list_get(list_get(facts, ri), 0)
+      let k = 0
+      while k < list_len(rets) do
+        let ret = list_get(rets, k)
+        if list_get(ret, 0) == 277141 then # "Load"
+          if bm_list_contains(params, list_get(ret, 1)) then
+            let param_returns = list_push(param_returns, root)
+            let k = list_len(rets)
+          end
+        end
+        let k = k + 1
+      end
+    end
+    if bm_nc_is_value_fn(root) then
+      let rets = list_get(list_get(facts, ri), 0)
+      let k = 0
+      while k < list_len(rets) do
+        let op = list_get(list_get(rets, k), 0)
+        if (op == 451867) or ((op == 700058) and (not bm_nc_lib_is_value_expr(list_get(rets, k), "bm_lib_vv_" + root + "__"))) then # "Bin", a raw CallHost
+          let mixed = list_push(mixed, root)
+          let k = list_len(rets)
+        end
+        let k = k + 1
+      end
+    end
+    let ri = ri + 1
+  end
+  set_var("bm_library_value_mixed", mixed)
+  set_var("bm_library_raw_param_returns", param_returns)
+  return value_fns
 end
 
 # Namespacing note: an earlier version of this file bundled

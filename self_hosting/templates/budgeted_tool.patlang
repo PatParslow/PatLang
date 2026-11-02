@@ -1,0 +1,259 @@
+# Template: a long-running PatLang tool, driven by budgeted slices and
+# controllable through signals.
+#
+# Given a tool started as `budgeted_tool.patlang [units]`,
+# When another process sends it `status`, `pause`, `resume` or `quit`
+#   while it is busy,
+# Then it answers within one slice (SLICE_MS plus one unit of work),
+#   pauses and resumes without losing or repeating a unit, stops cleanly
+#   on quit, and prints the same final result however often it was
+#   interrupted.
+#
+# Run it:          pat --ir-run self_hosting/templates/budgeted_tool.patlang 400
+# Talk to it:      pat --ir-run self_hosting/templates/budgeted_tool.patlang status
+#                  (also pause / resume / quit). A second copy finds the
+#                  port taken and sends its argument to the running one.
+# Native:          ./patc1.exe self_hosting/templates/budgeted_tool.patlang tool.exe --x64
+#
+# Shape
+#   * No loose globals. State lives in objects, one class per concern:
+#       ToolSettings  fixed configuration (port, slice and poll times)
+#       ToolControl   run state: running / paused / stopping
+#       ToolProgress  phase, units done, timings; renders `status`
+#       Workload      the actual job -- the only class you normally rewrite
+#       Tool          owns the names of the four objects above and answers
+#                     signals; `when` handlers are one-line calls into it
+#     Objects are named, so a handler reaches them by name; every other
+#     function takes the names it needs as parameters. Nothing here uses
+#     set_var/get("__vars", ...).
+#   * The orchestrator (run_tool) owns the loop. Work only ever runs inside
+#     `budgeted(SLICE_MS, handle) { ... }`, so the signal poll gets a turn at
+#     least every slice. A slice that runs out of time pauses at a loop
+#     back-edge and is resumed from its handle next time round; one that
+#     sees pause/quit finishes the unit in hand and returns early.
+#   * Workload.do_unit(i) must be one bounded step. If one step can take
+#     longer than a slice, split it into smaller units: the slice can only
+#     pause inside a loop, and status is answered between slices.
+#
+# Make a new tool: copy this file, pick a free PORT, rewrite Workload
+# (total_units, do_unit, result), add any extra signals as a method on
+# Tool plus a one-line `when`. Keep run_tool as it is.
+#
+# Not included: crash-safe resumption. If losing finished units on a crash
+# matters, publish each finished unit with queue_publish and ack it only
+# once its result is stored (see self_hosting/lib/queue.patlang).
+
+include "../lib/signals.patlang"
+
+class ToolSettings {
+  field port = 9710
+  field slice_ms = 50
+  field poll_ms = 20
+}
+
+class ToolControl {
+  field state = "running"
+  make a function called pause takes self returns r
+    if self.state == "running" then
+      self.state = "paused"
+    end
+    return self.state
+  end
+  make a function called resume takes self returns r
+    if self.state == "paused" then
+      self.state = "running"
+    end
+    return self.state
+  end
+  make a function called stop takes self returns r
+    self.state = "stopping"
+    return self.state
+  end
+}
+
+class ToolProgress {
+  field phase = "starting"
+  field done = 0
+  field total = 0
+  field slices = 0
+  field started_ms = 0
+  make a function called begin takes self, total returns r
+    self.total = total
+    self.done = 0
+    self.phase = "working"
+    self.started_ms = now_ms()
+    return total
+  end
+  make a function called report takes self, state returns r
+    let sb = sb_new()
+    sb_push(sb, "phase=" + self.phase)
+    sb_push(sb, " state=" + state)
+    sb_push(sb, " done=" + self.done + "/" + self.total)
+    sb_push(sb, " slices=" + self.slices)
+    sb_push(sb, " elapsed_ms=" + (now_ms() - self.started_ms))
+    return sb_str(sb)
+  end
+}
+
+# ---- the job: rewrite this class for a real tool ----
+# Demo: sums a small, deliberately slow-ish calculation per unit, so the
+# answer shows whether any unit was skipped or done twice.
+class Workload {
+  field units = 200
+  field acc = 0
+  make a function called total_units takes self returns n
+    return self.units
+  end
+  make a function called do_unit takes self, i returns r
+    let s = 0
+    let k = 0
+    while k < 4000 do
+      let s = s + ((i * k) % 7)
+      let k = k + 1
+    end
+    self.acc = self.acc + s
+    return s
+  end
+  make a function called result takes self returns r
+    return "acc=" + self.acc
+  end
+}
+
+class Tool {
+  field settings = ""
+  field control = ""
+  field progress = ""
+  field work = ""
+  make a function called on_status takes self returns r
+    let ctl = self.control
+    signal_reply(send(self.progress, "report", get(ctl, "state")))
+    return true
+  end
+  make a function called on_pause takes self returns r
+    signal_reply(send(self.control, "pause"))
+    return true
+  end
+  make a function called on_resume takes self returns r
+    signal_reply(send(self.control, "resume"))
+    return true
+  end
+  make a function called on_quit takes self returns r
+    signal_reply(send(self.control, "stop"))
+    return true
+  end
+}
+
+# One `when` per signal, each a single call into the tool object.
+when status do
+  send("tool", "on_status")
+end
+when pause do
+  send("tool", "on_pause")
+end
+when resume do
+  send("tool", "on_resume")
+end
+when quit do
+  send("tool", "on_quit")
+end
+
+# make_tool(units) -> the tool object's name, with its parts created and
+# wired together.
+make a function called make_tool takes units returns tool
+  new("ToolSettings", "tool_settings")
+  new("ToolControl", "tool_control")
+  new("ToolProgress", "tool_progress")
+  new("Workload", "tool_work")
+  send("tool_work", "set", "units", units)
+  new("Tool", "tool")
+  send("tool", "set", "settings", "tool_settings")
+  send("tool", "set", "control", "tool_control")
+  send("tool", "set", "progress", "tool_progress")
+  send("tool", "set", "work", "tool_work")
+  return "tool"
+end
+
+# run_tool(tool, port_id) -- the orchestrator. Runs the workload in budgeted
+# slices, polling for signals between slices (and while paused), until the
+# work is done or a quit arrives. Returns "done" or "stopped".
+make a function called run_tool takes tool, port_id returns outcome
+  let cfg = get(tool, "settings")
+  let ctl = get(tool, "control")
+  let prog = get(tool, "progress")
+  let work = get(tool, "work")
+  let slice_ms = get(cfg, "slice_ms")
+  let poll_ms = get(cfg, "poll_ms")
+  let total = send(work, "total_units")
+  send(prog, "begin", total)
+  let handle = false
+  while get(ctl, "state") != "stopping" and get(prog, "done") < total do
+    if get(ctl, "state") == "paused" and handle == false then
+      signal_poll(port_id, poll_ms)
+    else
+      let start = get(prog, "done")
+      let r = budgeted(slice_ms, handle) {
+        let i = start
+        while i < total and get(ctl, "state") == "running" do
+          send(work, "do_unit", i)
+          let i = i + 1
+          send(prog, "set", "done", i)
+        end
+        return i
+      }
+      send(prog, "set", "slices", get(prog, "slices") + 1)
+      if r[0] == "done" then
+        let handle = false
+      else
+        let handle = r[1]
+      end
+      signal_poll(port_id, 1)
+    end
+  end
+  if get(prog, "done") < total then
+    send(prog, "set", "phase", "stopped")
+    return "stopped"
+  end
+  send(prog, "set", "phase", "finished")
+  return "done"
+end
+
+make a function called tool_main returns last_line
+  let args = argv()
+  let arg = ""
+  if args.length > 0 then
+    let arg = args[args.length - 1]
+  end
+  let tool = make_tool(200)
+  let port = get(get(tool, "settings"), "port")
+  let port_id = signal_claim(port)
+  if port_id < 0 then
+    # Another copy is running: pass this invocation's argument to it.
+    if arg == "" or is_digits(arg) then
+      let arg = "status"
+    end
+    return signal_query(port, arg, "")
+  end
+  if arg != "" and is_digits(arg) then
+    send(get(tool, "work"), "set", "units", to_num(arg))
+  end
+  let outcome = run_tool(tool, port_id)
+  print(outcome + " " + send(get(tool, "progress"), "report", get(get(tool, "control"), "state")))
+  return send(get(tool, "work"), "result")
+end
+
+make a function called is_digits takes s returns ok
+  if s.length == 0 then
+    return false
+  end
+  let i = 0
+  while i < s.length do
+    let c = char_code(s, i)
+    if c < 48 or c > 57 then
+      return false
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+print(tool_main())

@@ -551,18 +551,42 @@ make a function called bm_collect_let_names takes stmts, names returns out
   return names
 end
 
+# A name the function binds, and binds BEFORE this point in the body: a
+# parameter or captured name, or a `let` already lowered (bm_lower_stmt
+# adds it to bm_fn_seen_names). The interpreter binds a local only when its
+# `let` runs, so `world()` ahead of a later `let world = ...` calls the
+# declared function; treating every name the body binds anywhere as a
+# local made it a call through the unassigned local (the raytrace
+# scene_build_lines segfault). Only a name that is also a declared
+# function is decided this way; any other bound name has nothing else to
+# call (a loop can reach the call again once its `let` has run).
 make a function called bm_is_fn_bound_name takes name returns yes
   let bound = get("__vars", "bm_fn_bound_names")
   if type_of(bound) != "list" then
     return false
   end
-  return bm_list_contains(bound, name)
+  if not bm_list_contains(bound, name) then
+    return false
+  end
+  let declared = get("__vars", "bm_declared_fn_names")
+  if type_of(declared) != "list" then
+    return true
+  end
+  if not bm_list_contains(declared, name) then
+    return true
+  end
+  let seen = get("__vars", "bm_fn_seen_names")
+  if type_of(seen) != "list" then
+    return true
+  end
+  return bm_list_contains(seen, name)
 end
 
 make a function called bm_lower_closure_expr takes node, instrs, block_names, immut_params returns out
   let params = list_get(node, 1)
   let body = bm_expand_activate_list(list_get(node, 2))
   let outer_bound = get("__vars", "bm_fn_bound_names")
+  let outer_seen = get("__vars", "bm_fn_seen_names")
   let free = list_get(bm_fv_stmt_list(body, params, []), 1)
   let captured = bm_intersect_preserving_order(outer_bound, free)
   let name = bm_next_synth_name("__closure")
@@ -570,6 +594,7 @@ make a function called bm_lower_closure_expr takes node, instrs, block_names, im
   # name, and whatever its body binds.
   let inner_names = bm_bound_names_of(bm_union_preserving_order(["__captured"], bm_union_preserving_order(params, captured)), body)
   set_var("bm_fn_bound_names", inner_names)
+  set_var("bm_fn_seen_names", bm_union_preserving_order(["__captured"], bm_union_preserving_order(params, captured)))
   let prologue = []
   let cn = list_len(captured)
   let ci = 0
@@ -592,6 +617,7 @@ make a function called bm_lower_closure_expr takes node, instrs, block_names, im
   let known = bm_union_preserving_order(captured, params)
   let top = bm_lower_top_level_stmt_list(body, 0, prologue, block_names, get("__vars", "bm_ct_blocks_by_name"), inner_immut, known, [], [], ["none"])
   set_var("bm_fn_bound_names", outer_bound)
+  set_var("bm_fn_seen_names", outer_seen)
   let closure_params = list_push(bm_union_preserving_order(["__captured"], params), "__globals")
   let registry = get("__vars", "bm_closure_blocks")
   let registry = list_push(registry, ["BlockIR", name, closure_params, bm_hash_rewrite_instrs(list_get(top, 0))])
@@ -936,6 +962,14 @@ make a function called bm_lower_expr takes node, instrs, block_names, immut_para
       # Issue #153: value-context apply(fname, a1, ..., an) -- the callee's
       # return value stays on the stack for the surrounding expression.
       return bm_lower_apply(args, instrs, block_names, immut_params)
+    elif (name == "parallel_map") and (list_len(args) == 2) then
+      # The caller's current __globals goes to every worker (as a value; a
+      # worker's changes are not written back), so a global set before the
+      # call reads the same inside it, as interpreted (raytrace ch37).
+      let instrs = bm_lower_expr(list_get(args, 0), instrs, block_names, immut_params)
+      let instrs = bm_lower_expr(list_get(args, 1), instrs, block_names, immut_params)
+      let instrs = list_push(instrs, ["Load", "__globals"])
+      return list_push(instrs, ["CallHost", "bm_parallel_map", 3])
     elif name == "thread_spawn" then
       let unused_spawn_check = bm_check_spawn_arg(args)
       # Issue #184: thread_spawn(closure) -- see bm_inject_closure_entry_
@@ -1015,6 +1049,13 @@ end
 # (never written at the source call site -- section 3.3's threading,
 # automatic here), then a single JumpBlock naming the callee's OWN param
 # list, which bm_lower_program has already appended "__globals" onto.
+# An argument that is more than one Load or Const is computed first, in
+# order, into a local of its own (`bm_tailarg_<pos>_<i>`), and the jump's
+# pushes are then all plain Loads and Consts. The ownership passes see a
+# jump's arguments only through those pushes (bm_fam_block_info): with a call
+# or a list in among them the jump was opaque, so the callee's parameters did
+# not own what they were given and every fresh argument of a tail call
+# (`return sum2(mk(x), mk(2))`) was never released.
 make a function called bm_lower_jump_call takes call_node, instrs, block_names, blocks_by_name, immut_params returns out
   let target = list_get(call_node, 1)
   let args = list_get(call_node, 2)
@@ -1022,9 +1063,30 @@ make a function called bm_lower_jump_call takes call_node, instrs, block_names, 
   let params = bi_block_params(target_blk)
   let n = list_len(args)
   let instrs = instrs
+  let pos = list_len(instrs)
+  let pushes = []
   let i = 0
   while i < n do
-    let instrs = bm_lower_expr(list_get(args, i), instrs, block_names, immut_params)
+    let frag = bm_lower_expr(list_get(args, i), [], block_names, immut_params)
+    let op = list_get(list_get(frag, 0), 0)
+    if (list_len(frag) == 1) and ((op == "Load") or (op == "Const")) then
+      let pushes = list_push(pushes, list_get(frag, 0))
+    else
+      let frag = bm_relocate_jumps(frag, list_len(instrs))
+      let fi = 0
+      while fi < list_len(frag) do
+        let instrs = list_push(instrs, list_get(frag, fi))
+        let fi = fi + 1
+      end
+      let tmp = "bm_tailarg_" + pos + "_" + i
+      let instrs = list_push(instrs, ["Store", tmp])
+      let pushes = list_push(pushes, ["Load", tmp])
+    end
+    let i = i + 1
+  end
+  let i = 0
+  while i < n do
+    let instrs = list_push(instrs, list_get(pushes, i))
     let i = i + 1
   end
   let instrs = list_push(instrs, ["Load", "__globals"])
@@ -1103,6 +1165,13 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
   let ty = list_get(node, 0)
   if ty == "Let" then
     let instrs = bm_lower_expr(list_get(node, 2), instrs, block_names, immut_params)
+    # From here on `name(...)` calls through this local (bm_is_fn_bound_name).
+    let seen = get("__vars", "bm_fn_seen_names")
+    if type_of(seen) == "list" then
+      if not bm_list_contains(seen, list_get(node, 1)) then
+        set_var("bm_fn_seen_names", list_push(seen, list_get(node, 1)))
+      end
+    end
     return list_push(instrs, ["Store", list_get(node, 1)])
   elif ty == "RuleDecl" then
     # Issue #177: `rule head(A, B) :- goal1(..), goal2(..).` -- sugar that
@@ -1516,7 +1585,7 @@ make a function called bm_lower_stmt takes node, instrs, block_names, blocks_by_
     return list_push(instrs, ["Store", "__bm_discard"])
   elif ty == "Return" then
     let e = list_get(node, 1)
-    if list_get(e, 0) == "Call" then
+    if (list_get(e, 0) == "Call") and (not bm_lowering_library()) then
       let name = list_get(e, 1)
       if bm_list_contains(block_names, name) then
         return bm_lower_jump_call(e, instrs, block_names, blocks_by_name, immut_params)
@@ -2044,7 +2113,7 @@ make a function called bm_lower_top_level_stmt_list takes stmts, start_idx, inst
       # checked BEFORE falling through to the unconditional, ordinary
       # If handling.
       return bm_lower_if_with_nested_while(stmt, stmts, i, instrs, block_names, blocks_by_name, immut_params, known_locals, pending, k)
-    elif (i == n - 1) and (list_get(k, 0) == "none") and bm_is_tail_safe_bare_call(stmt, block_names) then
+    elif (i == n - 1) and (list_get(k, 0) == "none") and (not bm_lowering_library()) and bm_is_tail_safe_bare_call(stmt, block_names) then
       # Phase 22: a bare statement call to a declared block-model
       # function is a genuinely safe, one-way JumpBlock tail call ONLY
       # here -- truly the LAST statement of this top-level list, with no
@@ -2183,6 +2252,13 @@ make a function called bm_lower_while takes stmt, stmts, idx, instrs, block_name
   # NOT-yet-bound name downstream of `k` is newly, correctly excluded.
   let k_captured = bm_intersect_preserving_order(known_locals, bm_continuation_captured(k))
   let captured = bm_union_preserving_order(cond_free, bm_union_preserving_order(body_free, bm_union_preserving_order(after_free, k_captured)))
+  # The runtime (bm_lower_library_program) keeps every local alive until its
+  # function returns: a raw word derived from a value (an address, a buffer)
+  # is used after the value's last mention, and releasing the value when a
+  # loop no longer names it freed what the loop still read.
+  if bm_lowering_library() then
+    let captured = bm_union_preserving_order(captured, known_locals)
+  end
   let jump_params = list_push(captured, "__globals")
 
   # 1) At the current point in the CALLING block: enter the loop head for
@@ -2561,6 +2637,11 @@ make a function called bm_ast_uses_thread_spawn takes node returns yes
 end
 
 make a function called bm_ast_uses_closure takes node returns yes
+  return bm_ast_has_node(node, "Closure")
+end
+
+# Whether any node under `node` has type `ty`.
+make a function called bm_ast_has_node takes node, ty returns yes
   if type_of(node) != "list" then
     return false
   end
@@ -2568,12 +2649,12 @@ make a function called bm_ast_uses_closure takes node returns yes
   if n == 0 then
     return false
   end
-  if list_get(node, 0) == "Closure" then
+  if list_get(node, 0) == ty then
     return true
   end
   let i = 0
   while i < n do
-    if bm_ast_uses_closure(list_get(node, i)) then
+    if bm_ast_has_node(list_get(node, i), ty) then
       return true
     end
     let i = i + 1
@@ -2588,10 +2669,20 @@ make a function called bm_closure_invoke_helper_src returns src
   return "make a function called __closure_invoke takes c, arg returns result" + chr(10) + "  return apply(list_get(c, 1), list_get(c, 2), arg)" + chr(10) + "end" + chr(10)
 end
 
+# bm_budget_invoke(c): the fiber entry the native runtime's bm_budgeted_run
+# hands to budgeted_run, which starts a fiber on a function NAME; it runs the
+# budgeted block's body, a zero-parameter closure value c, with its captures.
+# A plain declared name, like bm_closure_entry: a "__" name is a synthesized
+# block (bm_nc_is_synth_name), which gets no FuncIR and no apply-table entry.
+make a function called bm_budget_invoke_helper_src returns src
+  return "make a function called bm_budget_invoke takes c returns result" + chr(10) + "  return apply(list_get(c, 1), list_get(c, 2))" + chr(10) + "end" + chr(10)
+end
+
 make a function called bm_inject_closure_entry_helper takes ast returns ast2
   let uses_spawn = bm_ast_uses_thread_spawn(list_get(ast, 1))
   let uses_closures = bm_ast_uses_closure(list_get(ast, 1))
-  if (not uses_spawn) and (not uses_closures) then
+  let uses_budgeted = bm_ast_has_node(list_get(ast, 1), "Budgeted")
+  if (not uses_spawn) and (not uses_closures) and (not uses_budgeted) then
     return ast
   end
   let srcs = []
@@ -2600,6 +2691,9 @@ make a function called bm_inject_closure_entry_helper takes ast returns ast2
   end
   if uses_closures then
     let srcs = list_push(srcs, bm_closure_invoke_helper_src())
+  end
+  if uses_budgeted then
+    let srcs = list_push(srcs, bm_budget_invoke_helper_src())
   end
   # Appended, never prepended: bm_lower_program's own entry-point rule is
   # "the first Func statement encountered" (see its Pass 2 below) -- a
@@ -2678,12 +2772,31 @@ make a function called bm_lower_find_start_entry takes stmts, n returns entry
   return false
 end
 
+# docs/plans/general-refcounting.md, Phase 7: the runtime lowered as a
+# library. Its raw words derived from values (an address, a buffer) are
+# invisible to the ownership passes, so a value must outlive them: every
+# local stays alive until its function returns (bm_lower_while forwards
+# all of them), and `return f(x)` is a call and a return, not a jump into
+# f's blocks, which would release the caller's locals before f had used
+# what it was handed from them.
+make a function called bm_lower_library_program takes ast returns prog
+  set_var("bm_lower_library", true)
+  let prog = bm_lower_program(ast)
+  set_var("bm_lower_library", false)
+  return prog
+end
+
+make a function called bm_lowering_library returns yes
+  return get("__vars", "bm_lower_library") == true
+end
+
 make a function called bm_lower_program takes ast returns prog
   let ast = bm_inject_closure_entry_helper(ast)
   set_var("bm_synth_counter", 0)
   set_var("bm_closure_blocks", [])
   set_var("bm_budgeted_depth", 0)
   set_var("bm_fn_bound_names", [])
+  set_var("bm_fn_seen_names", [])
   set_var("bm_ct_blocks_by_name", [])
   set_var("bm_uses_box", bm_ast_uses_box(list_get(ast, 1)))
   let stmts = bm_collect_toplevel_main(bm_expand_classes(bm_dedupe_decls(list_get(ast, 1))))
@@ -2752,6 +2865,7 @@ make a function called bm_lower_program takes ast returns prog
   # recomputed here, per block -- box_set's mut-check only ever looks at
   # THIS block's own parameter list, never a caller's or callee's.
   set_var("bm_ct_blocks_by_name", blocks_by_name)
+  set_var("bm_declared_fn_names", block_names)
   let blocks = []
   let events = []
   # GitHub #199: the entry used to be unconditionally "the first Func
@@ -2828,6 +2942,7 @@ make a function called bm_lower_program takes ast returns prog
         let pi = pi + 1
       end
       set_var("bm_fn_bound_names", bm_bound_names_of(declared_params, body))
+      set_var("bm_fn_seen_names", declared_params)
       set_var("bm_current_fn", name)
       let top_result = bm_lower_top_level_stmt_list(body, 0, [], block_names, blocks_by_name, immut_params, declared_params, [], [], ["none"])
       let instrs = list_get(top_result, 0)
@@ -2851,6 +2966,7 @@ make a function called bm_lower_program takes ast returns prog
       let handler_immut_params = ["event_name", "event_data"]
       let handler_known_locals = ["event_name", "event_data"]
       set_var("bm_fn_bound_names", bm_bound_names_of(["event_name", "event_data"], body))
+      set_var("bm_fn_seen_names", ["event_name", "event_data"])
       set_var("bm_current_fn", handler_name)
       # Issue #178: the declared-function tables are passed for real, so a
       # handler can call declared functions. Phase 10 passed empty tables

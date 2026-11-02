@@ -108,6 +108,11 @@ this list before assuming something needs to be built from scratch.
 
 ## 4. Long-running programs: signals, queue, budgeted yields
 
+Start new tools from `self_hosting/templates/budgeted_tool.patlang`:
+budgeted slices driven by one orchestrator, status/pause/resume/quit
+signals, and state held in objects rather than in `__vars`. Its checker,
+`check_budgeted_tool.sh`, runs the live status test described below.
+
 Any program expected to run more than a few seconds, or as a daemon, needs
 this built in from the start, not bolted on after a hang is discovered (see
 project `CLAUDE.md` §6 for the canonical statement -- summarized here):

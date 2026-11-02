@@ -32,8 +32,8 @@
 # calling rt_heap_alloc again -- what makes "heap high-water mark stays
 # flat across many alloc+drop cycles" a real, checkable claim.
 #
-# The free list's own bookkeeping is a fixed-size RAW memory table (64
-# slots of [size:8][head:8], allocated ONCE in bm_heap_init), not an
+# The free list's own bookkeeping is a fixed-size RAW memory table (one
+# slot of [size:8][head:8] per size class, allocated ONCE in bm_heap_init), not an
 # ordinary PatLang list -- found out why the hard way, not by design up
 # front: an earlier version of this file kept the table as a PatLang
 # list via set_var/get, and Phase 1's own 100000-cycle scenario failed
@@ -43,13 +43,17 @@
 # BOOKKEEPING was defeating the exact thing it existed to prove. A raw
 # table peeked/poked with mem_peek_qword/mem_poke_qword allocates nothing
 # after its one-time setup, which is what actually makes the flat-heap
-# claim true rather than just plausible. Deliberately scoped to a small,
-# fixed number of size classes (64) proving the mechanism, not a
-# general-purpose size-class allocator (that's later work, if/when this
-# merges into the real heap).
+# claim true rather than just plausible.
+#
+# Size classes (bm_size_class): 8-byte steps up to 256 bytes, then four
+# classes per power of two up to 2^40, 160 in all. A request is rounded up to
+# its class, so a freed block serves any later request in that class. The
+# table used to hold the first 64 exact sizes seen and drop every freed block
+# of any other size: a string grown a byte at a time used them up past 512
+# bytes and leaked every intermediate after that.
 
 make a function called bm_freelist_table_size returns n
-  return 64
+  return 160
 end
 
 # Thread safety (GitHub #176). The table starts with a 24-byte header, a
@@ -144,55 +148,52 @@ make a function called bm_freelist_unlock returns done
   return true
 end
 
+# The table offset of a size class's slot (size is a bm_size_class result),
+# or -1 past the largest class, which is then never reused.
 make a function called bm_freelist_slot_offset takes size returns off
-  # Linear scan for a matching size, or the first empty slot (size 0,
-  # never a real aligned payload size) to claim for a new size class --
-  # fine for this phase's small, fixed number of classes; a hash table
-  # would only matter past bm_freelist_table_size()'s own slot count.
-  #
-  # Recursive, not a `while` loop, deliberately -- see GitHub #220.
-  # A `while` loop whose body contains exactly ONE bare mem_peek_qword/
-  # mem_poke_qword statement, inside a non-main function, segfaults on
-  # the very first iteration under the native x64 backend. This
-  # function originally used exactly that broken shape, and was the
-  # real cause of bm_freelist_pop/bm_alloc segfaulting when called
-  # outside the exact call patterns the existing test suite happened to
-  # exercise.
-  #
-  # The call below is deliberately NOT a tail call (`return bm_freelist_
-  # slot_offset_scan(...)`) -- that specific shape is ALSO broken,
-  # independently: a non-main function that computes a local via an
-  # earlier call (bm_freelist_table_addr() here) and then tail-calls a
-  # self-recursive function, passing that local through, corrupts the
-  # caller's own locals the moment the callee actually recurses at least
-  # once (confirmed via a minimal isolated repro -- storing the result
-  # in a local before returning it, exactly as done here, avoids the
-  # corruption entirely; calling the same recursive function directly
-  # from `main`, or in non-tail position, does not trigger it either).
-  # Both are real, narrow x64 codegen bugs, not yet root-caused to a fix
-  # in codegen_x64.patlang -- see GitHub #220.
-  let table = bm_freelist_table_addr()
-  let result = bm_freelist_slot_offset_scan(table, size, 0)
-  return result
-end
-
-make a function called bm_freelist_slot_offset_scan takes table, size, i returns off
-  if i >= bm_freelist_table_size() then
-    # Ran out of size-class slots: a real limit of this phase's fixed
-    # table, not a general allocator's answer. Signals "no free list for
-    # this size" so bm_alloc just always raw-allocates for it instead.
+  let idx = bm_size_class_index(size)
+  if (idx < 0) or (idx >= bm_freelist_table_size()) then
     return 0 - 1
   end
-  let off = bm_freelist_header_bytes() + i * 16
-  let s = mem_peek_qword(table, off)
-  if s == size then
-    return off
+  return bm_freelist_header_bytes() + idx * 16
+end
+
+# The largest power of two below size, for a size above 256.
+make a function called bm_size_class_base takes size returns base
+  let base = 256
+  while base * 2 < size do
+    let base = base * 2
   end
-  if s == 0 then
-    mem_poke_qword(table, off, size)
-    return off
+  return base
+end
+
+# A class's index: 0-31 for the 8-byte steps up to 256, then four per power
+# of two (base + step, + 2 steps, + 3 steps, 2 * base, step = base shr 2).
+make a function called bm_size_class_index takes size returns idx
+  if size <= 256 then
+    return (size shr 3) - 1
   end
-  return bm_freelist_slot_offset_scan(table, size, i + 1)
+  if size > 1099511627776 then
+    return 0 - 1
+  end
+  let base = bm_size_class_base(size)
+  let k = 0
+  let b = base
+  while b > 256 do
+    let b = b shr 1
+    let k = k + 1
+  end
+  return 32 + k * 4 + bm_size_class_steps(base, size) - 1
+end
+
+# How many quarter steps of base (1 to 4) reach size, rounding up.
+make a function called bm_size_class_steps takes base, size returns j
+  let step = base shr 2
+  let j = 1
+  while base + j * step < size do
+    let j = j + 1
+  end
+  return j
 end
 
 make a function called bm_align8 takes size returns aligned
@@ -225,7 +226,7 @@ make a function called bm_freelist_pop takes size returns addr
     bm_freelist_unlock()
     return 0
   end
-  let next = mem_peek_qword(head, 0)
+  let next = mem_peek_qword(head, 8)
   mem_poke_qword(table, off + 8, next)
   bm_freelist_unlock()
   return head
@@ -239,15 +240,35 @@ make a function called bm_freelist_push takes size, base returns done
     return false
   end
   let table = bm_freelist_table_addr()
+  # The link lives in the payload's first word: the count word stays 0 while
+  # the block is free, so a further release takes it below zero and is
+  # caught (bm_rc_underflow) rather than freeing the block a second time.
   let head = mem_peek_qword(table, off + 8)
-  mem_poke_qword(base, 0, head)
+  mem_poke_qword(base, 0, 0)
+  mem_poke_qword(base, 8, head)
   mem_poke_qword(table, off + 8, base)
   bm_freelist_unlock()
   return true
 end
 
-make a function called bm_alloc takes payload_size returns ptr
+# A payload's size class: at least one word, where a free block keeps its
+# free-list link; 8-aligned up to 256 bytes, then rounded up to a quarter
+# step of its power of two (bm_size_class_index). Above 2^40 the size itself,
+# which no free list holds.
+make a function called bm_size_class takes payload_size returns size
   let aligned = bm_align8(payload_size)
+  if aligned < 8 then
+    return 8
+  end
+  if (aligned <= 256) or (aligned > 1099511627776) then
+    return aligned
+  end
+  let base = bm_size_class_base(aligned)
+  return base + bm_size_class_steps(base, aligned) * (base shr 2)
+end
+
+make a function called bm_alloc takes payload_size returns ptr
+  let aligned = bm_size_class(payload_size)
   let reused = bm_freelist_pop(aligned)
   if reused != 0 then
     mem_poke_qword(reused, 0, 1)
@@ -283,11 +304,23 @@ make a function called bm_rc_dec takes ptr, payload_size returns n
   # .patlang's actual heap would need one; deliberately out of scope for
   # proving Fork D standalone.
   let n = rt_atomic_fetch_add(ptr - 8, 0 - 1) - 1
-  if n <= 0 then
-    bm_freelist_push(bm_align8(payload_size), ptr - 8)
+  if n < 0 then
+    bm_rc_underflow()
+  end
+  if n == 0 then
+    bm_freelist_push(bm_size_class(payload_size), ptr - 8)
     return 0
   end
   return n
+end
+
+# A count falling below zero is a release with no reference behind it: the
+# block was already freed, and pushing it again would hand it to two later
+# allocations. Stop loudly instead.
+make a function called bm_rc_underflow returns done
+  print("bm_rc_dec: reference count below zero (a block released twice)")
+  os_exit(95)
+  return true
 end
 
 make a function called bm_box_read takes ptr returns v

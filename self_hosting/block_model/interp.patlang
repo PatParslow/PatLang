@@ -156,15 +156,20 @@ end
 # Issue #176 (threads half): `parallel_map(items, "fn")`. The real host runs
 # a declared function by name on real OS threads, but `fn` here is a
 # block-model block, unknown to that host -- so each item is wrapped as
-# [prog, block_name, item] and the real host maps bi_pmap_entry (a declared
-# function of this very program) instead. Workers share nothing but the
-# immutable program and their own item: a worker's __globals starts empty and
-# its changes are not written back (documented in parallel_map.feature). A
+# [prog, block_name, item, globals] and the real host maps bi_pmap_entry (a
+# declared function of this very program) instead. Workers share the
+# immutable program and the caller's __globals (bm_parallel_map's third
+# argument; empty for a bare parallel_map), and have their own item; a
+# worker's changes to globals are not written back (parallel_map.feature). A
 # Box-using worker is NOT supported: the refcounted heap is ambient state that
 # is not thread-safe (the deferred design question in Phase 14).
 make a function called bi_parallel_map takes prog, args returns result
   let items = list_get(args, 0)
   let fname = list_get(args, 1)
+  let globals = []
+  if list_len(args) > 2 then
+    let globals = list_get(args, 2)
+  end
   if bi_find_block(prog, fname) == false then
     contract_check("bm_interp", "assert", "parallel_map: no declared function named '" + fname + "'", false)
   end
@@ -172,7 +177,7 @@ make a function called bi_parallel_map takes prog, args returns result
   let n = list_len(items)
   let i = 0
   while i < n do
-    let wrapped = list_push(wrapped, [prog, fname, list_get(items, i)])
+    let wrapped = list_push(wrapped, [prog, fname, list_get(items, i), globals])
     let i = i + 1
   end
   return parallel_map(wrapped, "bi_pmap_entry")
@@ -182,7 +187,7 @@ make a function called bi_pmap_entry takes arg returns value
   let prog = list_get(arg, 0)
   let blk = bi_find_block(prog, list_get(arg, 1))
   let locs = bm_loc_set(bm_loc_new(), list_get(bi_block_params(blk), 0), list_get(arg, 2))
-  let locs = bm_loc_set(locs, "__globals", [])
+  let locs = bm_loc_set(locs, "__globals", list_get(arg, 3))
   return list_get(bi_run_from(prog, blk, locs), 0)
 end
 
@@ -272,6 +277,42 @@ make a function called bm_loc_has takes locs, name returns yes
   let i = 0
   while i < n do
     if list_get(list_get(locs, i), 0) == name then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# A Load in a block: the bound value, or, for a local of this very block
+# whose `let` did not run on this path (bound in an earlier if branch not
+# taken), 0 -- its native slot exists and reads 0, the value a jump
+# forwards for it (bm_push_loads_or_default). zs_expr's ze_parse_atom
+# forwarded `v` into a loop from a branch that never bound it. A name the
+# block never stores is still the violation bm_loc_get reports.
+make a function called bi_load_local takes locs, name, instrs returns v
+  let n = list_len(locs)
+  let i = 0
+  while i < n do
+    let entry = list_get(locs, i)
+    if list_get(entry, 0) == name then
+      return list_get(entry, 1)
+    end
+    let i = i + 1
+  end
+  if bi_block_stores(instrs, name) then
+    return 0
+  end
+  return bm_loc_get(locs, name)
+end
+
+# Whether this block's own instructions store to `name` (Store's hash).
+make a function called bi_block_stores takes instrs, name returns yes
+  let n = list_len(instrs)
+  let i = 0
+  while i < n do
+    let instr = list_get(instrs, i)
+    if (list_get(instr, 0) == 642543) and (list_get(instr, 1) == name) then
       return true
     end
     let i = i + 1
@@ -386,7 +427,18 @@ make a function called bm_apply_bin takes op, l, r returns v
     return l > r
   elif op == 862001 then # ">="
     return l >= r
+  elif op == 52935 then # "band"
+    return l band r
+  elif op == 486917 then # "bor"
+    return l bor r
+  elif op == 78029 then # "bxor"
+    return l bxor r
+  elif op == 505193 then # "shl"
+    return l shl r
+  elif op == 505199 then # "shr"
+    return l shr r
   end
+  # Every operator in block_ir.patlang's bm_bin_op_name has a branch above.
   contract_check("bm_interp", "assert", "unknown Bin op hash: " + op, false)
   return false
 end
@@ -396,7 +448,10 @@ make a function called bm_apply_un takes op, v returns out
     return not v
   elif op == 177618 then # "-"
     return 0 - v
+  elif op == 67141 then # "bnot"
+    return bnot v
   end
+  # Every operator in block_ir.patlang's bm_un_op_name has a branch above.
   contract_check("bm_interp", "assert", "unknown Un op hash: " + op, false)
   return false
 end
@@ -438,7 +493,7 @@ make a function called bi_run_block takes prog, blk, locs returns outcome
       let pc = pc + 1
     elif op == 277141 then # "Load"
       let name = list_get(instr, 1)
-      let stack = bm_st_push(stack, bm_loc_get(locs, name))
+      let stack = bm_st_push(stack, bi_load_local(locs, name, instrs))
       let pc = pc + 1
     elif op == 642543 then # "Store"
       let name = list_get(instr, 1)
@@ -739,7 +794,7 @@ make a function called bi_run_block takes prog, blk, locs returns outcome
         # function's `(name, args)` signature cannot carry -- so it is
         # handled here, where `prog` is in scope.
         let call_result = ["Ok", bi_budgeted_run(prog, list_get(popped, 0))]
-      elif list_get(instr, 1) == "parallel_map" then
+      elif (list_get(instr, 1) == "parallel_map") or (list_get(instr, 1) == "bm_parallel_map") then
         # Issue #176 (threads half): same reason -- see bi_parallel_map.
         let call_result = ["Ok", bi_parallel_map(prog, list_get(popped, 0))]
       else

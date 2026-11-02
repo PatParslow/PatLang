@@ -258,6 +258,91 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
     When it is built and run as a real, fully native executable
     Then every function's output is exactly what the interpreter produces, AND the generated assembly shows the globals-unpack sequence only for the genuinely impure call sites, not the pure ones
 
+  Scenario: Pure functions skip the globals wrapper in a program with closures and events
+    Given self_hosting/block_model/spec_fixtures/native_call_pure_with_closures.patlang,
+      whose pure functions are called from top-level code, from closure
+      bodies, from an event handler and through apply
+    When it is built and run natively
+    Then it prints 8 16 120 18 22 10, as the interpreter does
+    And every call to double in the generated asm pops one argument and
+      no __globals. A closure call is a CallDynamic, whose dispatcher
+      already calls a pure target bare; the closure entry helpers call
+      apply and are impure; handlers are named "__on_..." and are not
+      roots. So closures and events no longer switch the analysis off for
+      the whole program.
+
+  Scenario: The ownership pass's dominator tree agrees with walking the block
+    Given every block of the native interpreter's source
+      (self_hosting/block_model/pati_main.patlang) after bm_lower_program
+    When self_hosting/block_model/tools/dom_tree_check.patlang asks, for
+      pairs of stores, exits and entry, whether one dominates the other
+    Then bm_fam_dominates (a dominator tree built once per block, each
+      answer O(1)) agrees with bm_nc_raw_block_index_dominates (a walk of
+      the block per question) on every pair, and no block needs the
+      walk as a fallback. The walk made a native build of the
+      interpreter take hours once the ownership pass ran on programs
+      with closures.
+
+  Scenario: set_var releases the fresh value it is given
+    Given self_hosting/block_model/spec_fixtures/native_set_var_releases.patlang,
+      which stores a fresh list, then a fresh string, under one key 2000
+      times
+    When it is built and run natively
+    Then the heap grows by under 8 bytes per store and the last values
+      read back. set_var keeps its own reference (rt_ns_set), so the
+      caller releases the fresh argument after the call, as for a pure
+      call (bm_nc_runtime_borrows_args). Each store used to stay on the
+      heap.
+
+  Scenario: Joining a string with a number releases the number's text
+    Given self_hosting/block_model/spec_fixtures/native_concat_releases_text.patlang,
+      which joins strings with ints, a float, bools, lists, a rational
+      and Unit
+    When it is built and run natively
+    Then each result is the interpreter's, and 2000 rounds of `"v" + i`
+      and `i + "w"` grow the heap by under 8 bytes each. The text "+"
+      made for the non-string operand used to be kept (24 bytes a call).
+
+  Scenario: Budgeted blocks run natively
+    Given self_hosting/block_model/spec_fixtures/native_budgeted_runs.patlang,
+      with a budgeted block that finishes inside its budget, a zero-budget
+      block resumed from its handle until done, and a top-level block that
+      writes to an object
+    When it is built and run natively
+    Then it prints what the interpreter prints: "done", 10, 10, 5 pauses,
+      and "done 4 6". The native runtime had no bm_budgeted_run, so any
+      program using budgeted() failed to build; it now runs the body on a
+      fiber through budgeted_run, entered by name via bm_budget_invoke.
+
+  Scenario: A class with only fields gives natively built objects its defaults
+    Given self_hosting/block_model/spec_fixtures/class_field_defaults_reference.patlang,
+      with a fields-only class (int, string, bool, list and float
+      defaults) and a class with a method
+    When it is built and run natively
+    Then each field reads back its default: 50, x, true, [1, 2], 1.5, 51
+      and 4, as under the interpreter. A fields-only class was never
+      registered with class_def, so every field read 0.
+
+  Scenario: A native program recurses as deep as the interpreter allows
+    Given self_hosting/block_model/spec_fixtures/native_deep_recursion.patlang,
+      an impure function recursing 100000 calls deep, not as a tail call
+    When it is built natively with the compiler's own linker
+    Then it prints 300000, as the interpreter does. Native executables
+      reserved a 1 MB stack where the interpreter runs on 256 MB, so this
+      died with a stack overflow (0xC00000FD), and so did the native
+      compiler compiling itself.
+
+  Scenario: Loops at the top level and in a handler release the values they rebind
+    Given self_hosting/block_model/spec_fixtures/native_main_and_handler_loops_release.patlang,
+      whose top-level while loop and `when tick` handler loop each rebind
+      a local to a fresh nested list every iteration
+    When it is built and run natively
+    Then the output is the interpreter's, and neither loop grows the heap
+      by 8 bytes or more an iteration. main and handlers only had the
+      single-block ownership pass, so a loop in either kept every value
+      it rebound (184 bytes an iteration for `[[name, true]]`); they now
+      get the block-family pass functions get.
+
   Scenario: a pure function's internal __globals forwarding, and its entry seed, are both dropped -- single-block or multi-block (issue #216, follow-up to #215)
     Given a pure, branch-free function (one block) called many times in a
       loop
@@ -637,7 +722,9 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
       field again
     Then explicit rt_list_node_rc_inc/dec calls (no compiler pass decides
       when to decrement a list LOCAL yet -- that is Phase 3b, separate,
-      not yet started) show the heap's own high-water mark staying flat
+      not yet started; the bare-literal shape, native_list_rc_basic, is
+      now a top-level loop rebinding a local, which main's ownership pass
+      releases itself) show the heap's own high-water mark staying flat
       across 50000 build-and-release cycles, in three shapes: a bare
       BuildList literal, a chain of list_push calls each retiring the
       previous node (both the in-place-growth and buffer-doubling
@@ -835,6 +922,42 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
     When it is run for 2000 distinct names as a real, fully native
       executable, with an unrelated string allocation after each
     Then every "syms" entry still holds its own original name
+
+  Scenario: object_delete frees the object's fields and table, and send releases its arguments
+    Given a function that creates a named object, sends "set" with a
+      freshly built string, pushes 20 freshly built strings onto a list
+      field, sets a number field, reads the string back, and deletes the
+      object
+    When it runs 2000 times as a real, fully native executable
+    Then the heap grows by under 64 bytes a cycle
+    And the string read back before the delete is intact ("label_2000")
+
+  Scenario: string builders and vecs are values the compiler releases
+    Given a function that grows a string builder past several doublings,
+      reads it part-way and pushes a number, and pushes freshly built
+      strings to a vec, sets, extends and snapshots it with vec_to_list
+      before changing it again
+    When it runs 2000 times as a real, fully native executable
+    Then its results are the interpreter's ("[230, 231, [a_7, b_7],
+      [c_7, b_7, d, e_7], 4, e_7]"), the snapshot keeps the contents it
+      had when taken, and the heap grows by under 64 bytes a run
+
+  Scenario: an interned string is released like any other string
+    Given a function that interns a freshly built string and reads it with
+      sc_len, sc_code, sc_char and sc_substr
+    When it runs 2000 times as a real, fully native executable
+    Then its results are the interpreter's ("[13, 116, o, 123]") and the
+      heap grows by under 64 bytes a run
+
+  Scenario: object fields and set_var keys are found by hash, and the table owns its keys
+    Given 3000 objects with two fields each and 500 set_var keys, all
+      named by strings built in a loop
+    When every field and key is read back, every other object is deleted
+      and recreated with new values, and a list field is pushed to 100
+      times, as a real, fully native executable
+    Then every read returns what was stored ("bad= 0 items= 100 last= 99")
+    And reading one field 20000 times with 3000 objects alive costs under
+      3x what it costs with 30
     And the interpreter prints the identical result
 
   Scenario: a new list element owns its own reference wherever it is stored
@@ -913,3 +1036,228 @@ Feature: real native codegen for the block-model IR (Block Ownership Model, Fork
     Given rational arithmetic whose numerators and denominators pass 2^63 (a product of large exact fractions, 1/3 squared six times)
     When the program is built and run as a real, fully native executable
     Then it prints exactly what pat --ir-run prints, rather than wrapped 64-bit parts
+
+  Scenario: A list displays each element the way print shows it alone
+    Given a list holding an int, a rational, a float, a BigInt, a complex, a string, a bool and a nested list
+    When the program is built and run as a real, fully native executable
+    Then it prints exactly what pat --ir-run prints, rather than the rational/complex parts as BigInt digits
+
+  Scenario: A variable assigned both a raw float and a dynamically computed value keeps its value natively
+    Given v = 0.0 then v = v * t + c[k] (Horner's scheme) with t and c passed in, and a parameter rescaled by a float
+    When the program is built and run as a real, fully native executable
+    Then it prints exactly what pat --ir-run prints
+
+  Scenario: A float mixed with the result of integer arithmetic keeps the exact value's meaning natively
+    Given 0.1 - (1/10), a Rational local times cos(0.0), a loop counter times 0.7, a BigInt product and a BigInt-sized literal times 0.5, and that BigInt divided by 3 and by 0.5
+    When the program is built and run as a real, fully native executable
+    Then it prints exactly what pat --ir-run prints, rather than reading the Rational or BigInt pointer as an int
+
+  Scenario: An element returned from a local list survives the list's release at return
+    Given a function returning `ns[f]` from its own local list of lists, with a closure present so callees use the packed return
+    When the caller builds a new list from the returned element's values and reads it through several more calls, 900 times
+    Then the element is still the list it was and every read matches pat --ir-run, rather than reading the element the list's cascade freed
+
+  Scenario: A call to a declared function ahead of a later local of the same name calls the function
+    Given a function that calls `world()` and later in its body declares `let world = ...`
+    When the program is built and run as a real, fully native executable
+    Then `world()` calls the declared function, printing what pat --ir-run prints, rather than calling through the unassigned local
+
+  Scenario: A local ahead of a call in a returned list literal keeps its reference as an element
+    Given a program with closures, and a function returning `[g, count(g)]` where `g` is a local list
+    When the program is built and run as a real, fully native executable
+    Then `g` survives the function's release of its locals as the returned list's element, printing what pat --ir-run prints
+
+  Scenario: An element read from a list and stored in a new list survives the old list's release
+    Given a list built as `[c[0], c[2], 9]` and via `list_push(ys, c[1])` from a list `c` held in a vec
+    When the old list is released (vec_set over it) and the program is built and run as a real, fully native executable
+    Then the new lists' elements are intact, printing what pat --ir-run prints
+
+  Scenario: A list copied from one local into another survives the original's release
+    Given `let out = placed` where `placed` holds a fresh list, in a straight-line function and in a loop body
+    When the program is built and run as a real, fully native executable
+    Then returning `out` gives the list intact, printing what pat --ir-run prints
+
+  Scenario: A non-integral float prints as its shortest round-trip decimal
+    Given non-integral floats needing 1 to 17 significant digits, from 2^-1074 up to 1e15 in magnitude
+    When they are printed, and concatenated into text, by a real, fully native executable
+    Then each prints the shortest digits that read back as the same double, in plain notation, exactly as pat --ir-run prints them
+
+  Scenario: A user function whose name contains rt_ or mem_ still uses tagged numeric dispatch
+    Given user functions named sort_numbers and check_mem_ok that compare, add and multiply ints, rationals and floats
+    When the program is built and run as a real, fully native executable
+    Then the results are numeric, printing what pat --ir-run prints, rather than raw-word operations on tagged values
+
+  Scenario: An integer literal combined with a local float keeps its value
+    Given `1 - v`, `2 * v` and `(1 - v) * (h - 1)` with v a local float, at top level and inside a function
+    When the program is built and run as a real, fully native executable
+    Then each result is the arithmetic pat --ir-run prints, rather than the literal's float bits converted again as an integer
+
+  Scenario: A Float index truncates to an Int
+    Given vec_get, vec_set and list indexing with an index that is a Float, such as floor() of a float
+    When the program is built and run as a real, fully native executable
+    Then the element at the truncated index is used, as pat --ir-run does, rather than the boxed Float's tagged word
+
+  Scenario: An outer loop counter times a float inside an inner loop
+    Given `i * 2.5` with i an outer loop's counter, evaluated inside an inner loop, at top level and inside a function
+    When the program is built and run as a real, fully native executable
+    Then the products are what pat --ir-run prints, rather than i's integer bits read as a double
+
+  Scenario: argv() reads quoted, escaped and empty arguments as interpreted
+    Given arguments holding embedded double quotes, backslashes, spaces and an empty string
+    When the program is built and run as a real, fully native executable with them
+    Then argv() returns each argument intact, as pat --ir-run does, rather than splitting at every quote mark
+
+  Scenario: exec_capture passes quoted, escaped and empty arguments intact
+    Given a native child that prints its argv
+    When a native build passes it arguments holding quotes, backslashes, spaces and an empty string through exec_capture
+    Then the child prints each one back intact, as when the parent is interpreted
+
+  Scenario: A boxed Float allocated high in the heap is still a Float
+    Given a heap grown past 0x150000000, then floor() and a bitwise op on a boxed Float allocated there
+    When the program is built and run as a real, fully native executable
+    Then both read it as the Float it is, as pat --ir-run does, rather than as an int whose tag test reads a null box
+
+  Scenario: BigInts, rationals with BigInt parts and complex numbers are released
+    Given loops whose numbers live on the heap: a total past 2^47, BigInt division and remainder, a rational whose parts are BigInts, and a complex product, each value replacing the last
+    When the program is built and run as a real, fully native executable
+    Then every result is the interpreter's and no loop grows the heap: a BigInt, Complex or Interval is a counted block, and a Rational, Complex or Interval releases its parts with it
+
+  Scenario: rebuilding an older version of a list leaves nothing behind
+    Given a list kept alive while newer versions of it are made with list_set
+    When its elements are set and read back 3000 times as a real, fully native executable
+    Then every result is the interpreter's and the heap does not grow: the scratch chain of versions used to rebuild the older one is freed
+
+  Scenario: the runtime's remaining raw blocks are released
+    Given loops that write a file from a byte list, grow a bool array, build an object holding strings, and run exec_capture_io
+    When the program is built and run as a real, fully native executable
+    Then every result is right and no loop grows the heap: the byte buffer and the argument array are freed after use, and bool arrays and objects are counted blocks
+
+  Scenario: a freed block of any size is reused
+    Given a string grown a character at a time, each version replacing the last
+    When it is built to 4000 characters as a real, fully native executable
+    Then the heap grows by a few times the final string's size: every freed block goes to the free list of its size class, whatever its size
+
+  Scenario: the runtime's own temporaries are released
+    Given a loop that shows lists as text with `+` and through a string builder, formats a rational, and a loop that runs exec_capture
+    When the program is built and run as a real, fully native executable
+    Then every result is the interpreter's and neither loop grows the heap: the runtime, compiled with the ownership passes, releases the display strings, command lines and argument arrays it made
+
+  Scenario: parallel_map workers each have their own vecs and string builders
+    Given parallel_map workers that each build a vec and a string builder at the same time
+    When the program is built and run as a real, fully native executable
+    Then every worker's results are intact and each worker's vec is a distinct value of type vec, as pat --ir-run gives them
+
+  Scenario: parallel_map workers read globals set before the call
+    Given a global set with set_global before parallel_map
+    When the program is built and run as a real, fully native executable and the workers read it with get_global
+    Then each worker sees its value, as pat --ir-run does, rather than false
+
+  Scenario: A string read from a vec or __vars slot survives the slot being overwritten
+    Given a string read with vec_get or get, then its slot overwritten and the heap reused
+    When the program is built and run as a real, fully native executable
+    Then the string is still what it was, as pat --ir-run prints it, rather than freed under the local that holds it
+
+  Scenario: Native math functions round as the interpreter's do
+    Given sin and cos of pi/4
+    When the program is built and run as a real, fully native executable
+    Then they print what pat --ir-run prints, rather than msvcrt's sin one ulp low
+
+  Scenario: A local carried round a loop gives up the values it supersedes
+    Given a function building a 100000-element list with list_push in a loop, and one reassigning a list literal each time round
+    When the program is built and run as a real, fully native executable
+    Then the heap grows by what the final values need, not by every superseded value
+
+  Scenario: A loop's list returned in a literal from its exit block comes back whole
+    Given a loop pushing list literals, with an early return, that returns [list, count] after it
+    When the program is built and run as a real, fully native executable
+    Then the list is what pat --ir-run prints, rather than freed under the caller
+
+  Scenario: Rows built by list_push in a loop survive being pushed onto an accumulator
+    Given a pure function whose inner loop builds a fresh row by list_push and whose outer loop pushes each row onto a result
+    When the program is built and run as a real, fully native executable
+    Then both transposes print what pat --ir-run prints, rather than freed rows or a build failure
+
+  Scenario: A pure function returning a borrowed element through an inlined tail call hands its caller a reference
+    Given a pure wrapper whose inlined tail call returns an element of its argument after a branch, with a local released at that exit
+    When it is called in a loop that keeps allocating, built and run as a real, fully native executable
+    Then every element read back is the pattern's own, as pat --ir-run prints, rather than released by the caller
+
+  Scenario: A pure function's returned list literal owns its elements
+    Given a pure function returning a list literal of its own parameters, called in a loop whose caller releases each result
+    When the program is built and run as a real, fully native executable
+    Then the caller's own lists are intact, as pat --ir-run prints, rather than released with the returned list
+
+  Scenario: A value read out of a loop-released container keeps its own reference
+    Given a loop that pops a pair with a pure function and reads the rest of the stack out of that pair
+    When the program is built and run as a real, fully native executable
+    Then the stack is reversed as pat --ir-run prints, rather than read from the pair after its release
+
+  Scenario: A fresh value passed straight into a pure call is released when the call returns
+    Given a loop passing a pure call's result and a list literal straight into pure calls
+    When the program is built and run as a real, fully native executable
+    Then the sum is right and the heap grows by under 8 bytes an iteration, rather than keeping every argument
+
+  Scenario: Reading a file in slices keeps the heap flat
+    Given a loop reading 1000-byte slices of a file with read_file_bytes
+    When the program is built and run as a real, fully native executable
+    Then each slice is right and the heap grows by under 16 bytes a read, rather than keeping every buffer and slice
+
+  Scenario: An impure call's result, its pair, and the fresh values it is given are all released
+    Given impure functions (they read a global) returning a fresh list, their parameter, and a list_set of a fresh list, called in a loop with results kept, discarded and reassigned
+    When the program is built and run as a real, fully native executable
+    Then the values are what pat --ir-run prints and the heap grows by under 8 bytes an iteration
+
+  Scenario: list_set storing the value already there still hands its caller a reference
+    Given a nested list_set whose outer call stores the value already in place, with the inner result a released temporary
+    When the program is built and run as a real, fully native executable
+    Then the frame is intact, as pat --ir-run prints, rather than freed with the temporary
+
+  Scenario: Reassigning a local to the same list still releases the old reference
+    Given a function reassigning a local to list_set of the value already in place, called in a loop
+    When the program is built and run as a real, fully native executable
+    Then the sum is right and the heap grows by under 8 bytes an iteration
+
+  Scenario: A fresh value stored in one branch of a loop body is released
+    Given a loop whose if/elif branches each store a fresh result in a local of their own
+    When the program is built and run as a real, fully native executable
+    Then the sum is right and the heap grows by under 8 bytes an iteration
+
+  Scenario: Floats in released lists and arithmetic are freed
+    Given lists of floats built and dropped in a loop, and floats passed between functions and accumulated
+    When the program is built and run as a real, fully native executable
+    Then the sum is right and the heap grows by under 16 bytes an iteration, rather than keeping every float box
+
+  Scenario: Rationals in released lists and arithmetic are freed
+    Given multivectors of exact rationals built, scaled and dropped in a loop
+    When the program is built and run as a real, fully native executable
+    Then the sums are exact and the heap grows by under 16 bytes an iteration, rather than keeping every rational
+
+  Scenario: A tail call's fresh arguments are released by the callee
+    Given functions ending in `return f(g(), h())`, `return f(g(), v)` with v a fresh local, and `return f(keep, g())` with keep a parameter, called in a loop
+    When the program is built and run as a real, fully native executable
+    Then the values are what pat --ir-run prints and the heap grows by under 8 bytes an iteration, rather than keeping every argument
+
+  Scenario: A local copied into another is released by both
+    Given a function computing float products into locals and copying them into others (`let lo = p1`, then reassigned in branches), and one copying a list local, called in a loop
+    When the program is built and run as a real, fully native executable
+    Then the sum is what pat --ir-run prints and the heap grows by under 8 bytes an iteration, rather than keeping every product
+
+  Scenario: Every runtime string producer returns a counted string
+    Given strings from read_file, indexing a string, getenv, cwd and exec_capture, each also stored in lists and released 3000 times
+    When the program is built and run as a real, fully native executable
+    Then each string starts with a reference count of exactly 1 and the releases complete without a count going below zero, rather than retains and releases overwriting the block before an uncounted string
+
+  Scenario: Every operator gives the same result natively
+    Given every binary operator the parser produces (+ - * / % == != < <= > >= band bor bxor shl shr) and every unary one (- not bnot), applied to function parameters
+    When the program is built and run as a real, fully native executable
+    Then each result is what pat --ir-run prints, and the operator names come from block_ir.patlang's one table
+
+  Scenario: A function in a program with closures releases what it makes
+    Given a loop slicing a string into one-character pieces, in a program that also contains an unrelated closure literal, called 2000 times
+    When the program is built and run as a real, fully native executable
+    Then the count is what pat --ir-run prints and the heap does not grow, rather than every function of a program with any closure keeping what it makes
+
+  Scenario: pati runs every operator
+    Given the same program
+    When it is run by pati, the native interpreter (self_hosting/block_model/pati_main.patlang built with patc1 --x64)
+    Then each result is what pat --ir-run prints, rather than the bitwise operators stopping with "unknown Bin op hash"

@@ -155,6 +155,55 @@ end
 # of address space or page file at 64GB reserved), not "hit an
 # arbitrary constant" -- essentially unreachable in practice, kept as
 # the fallback path rather than removed.
+# Allocation profiling (PATLANG_HEAP_PROFILE set in the environment): each
+# time the heap's bump pointer passes another MB, the return addresses of
+# the ten frames above rt_heap_alloc are printed after a "PROF" line, so a
+# run's output says, byte-weighted, which call paths grow the heap
+# (summarised against the executable's symbol map, PATC_MAP=1). The state
+# word is 0 until the first allocation decides, then 1 (off) or 2 (on); it
+# is set to 1 before getenv runs, since getenv itself allocates.
+make a function called rt_heap_prof_init returns done
+  mem_poke_qword(mem_heap_prof_addr(), 0, 1)
+  # The raw buffer, not getenv's counted string: this runs inside the first
+  # heap allocation, before the counted allocator's table exists.
+  let raw = os_getenv_raw("PATLANG_HEAP_PROFILE")
+  if mem_peek_qword(raw, 0) > 0 then
+    mem_poke_qword(mem_heap_prof_addr(), 0, 2)
+  end
+  return true
+end
+
+# Writes with os_write_console_bytes alone: print reads __vars, whose lock
+# an allocating caller (rt_ns_set) may already hold, so printing from here
+# deadlocked. The scratch bytes it formats into are restored afterwards.
+make a function called rt_heap_prof_sample returns done
+  let buf = mem_scratch_addr()
+  let s0 = mem_peek_qword(buf, 0)
+  let s1 = mem_peek_qword(buf, 8)
+  let s2 = mem_peek_qword(buf, 16)
+  let s3 = mem_peek_qword(buf, 24)
+  mem_poke_byte(buf, 0, 80)
+  mem_poke_byte(buf, 1, 82)
+  mem_poke_byte(buf, 2, 79)
+  mem_poke_byte(buf, 3, 70)
+  mem_poke_byte(buf, 4, 10)
+  os_write_console_bytes(buf, 5)
+  let f = mem_frame_addr()
+  let k = 0
+  while (k < 10) and (f != 0) do
+    let len = rt_int_to_string(mem_peek_qword(f, 8), buf)
+    mem_poke_byte(buf, len, 10)
+    os_write_console_bytes(buf, len + 1)
+    let f = mem_peek_qword(f, 0)
+    let k = k + 1
+  end
+  mem_poke_qword(buf, 0, s0)
+  mem_poke_qword(buf, 8, s1)
+  mem_poke_qword(buf, 16, s2)
+  mem_poke_qword(buf, 24, s3)
+  return true
+end
+
 make a function called rt_heap_alloc takes size returns addr
   let aligned_size = size
   let rem = aligned_size % 8
@@ -164,6 +213,14 @@ make a function called rt_heap_alloc takes size returns addr
   let base = mem_heap_base()
   let used = rt_atomic_fetch_add(mem_heap_state_addr(), aligned_size)
   let new_used = used + aligned_size
+  let prof = mem_peek_qword(mem_heap_prof_addr(), 0)
+  if prof != 1 then
+    if prof == 0 then
+      rt_heap_prof_init()
+    elif rt_trunc_div(used, 1048576) != rt_trunc_div(new_used, 1048576) then
+      rt_heap_prof_sample()
+    end
+  end
   let committed = mem_heap_ensure_committed(new_used)
   if committed == 0 then
     # GitHub #89 follow-up: this used to build ONE concatenated string
@@ -258,6 +315,55 @@ make a function called rt_string_new takes content_len returns addr
   return result
 end
 
+# A counted, tagged string holding a copy of a raw [length][bytes] buffer
+# (an untagged address). OS-facing producers -- read_line, cwd, getenv,
+# exec_capture, recv, the command line, directory names, clipboard text --
+# fill scratch buffers from rt_heap_alloc, which have no reference count.
+# A string-tagged heap word is always treated as counted (its count is the
+# word before the payload), so such a buffer is never tagged itself: it is
+# adopted through this copy instead. Tagging it directly let every retain
+# and release overwrite the end of the block before it.
+make a function called rt_string_adopt takes raw returns s
+  let n = mem_peek_qword(raw, 0)
+  let out = rt_string_new(n)
+  let i = 0
+  while i < n do
+    mem_poke_byte(out, 8 + i, mem_peek_byte(raw, 8 + i))
+    let i = i + 1
+  end
+  rt_scratch_free(raw)
+  return rt_fresh(out bor rt_string_tag())
+end
+
+# Scratch buffers for generated asm and the runtime: a counted block that
+# records its own size in the word before the address handed out, so
+# rt_scratch_free needs only the address. Called exactly as rt_heap_alloc
+# is (one argument, the address back in rax), which those call sites used
+# before and never freed (docs/plans/general-refcounting.md, 6c).
+# rt_string_adopt frees the buffer it copies, so every OS-facing string
+# producer allocates its buffer here.
+make a function called rt_scratch_alloc takes n returns addr
+  let p = bm_alloc(n + 8)
+  mem_poke_qword(p, 0, n + 8)
+  return p + 8
+end
+
+make a function called rt_scratch_free takes addr returns done
+  bm_rc_dec(addr - 8, mem_peek_qword(addr - 8, 0))
+  return true
+end
+
+# exec_capture(program, arg1, ...): `arr` holds the call's n values (a
+# scratch buffer, freed here), joined into one command line, run, and the
+# combined output adopted. The generated code used to do this inline and
+# keep the array and the command line forever.
+make a function called rt_exec_capture_arr takes arr, n returns s
+  let cmdline = rt_exec_join_args(arr, n)
+  rt_scratch_free(arr)
+  let raw = os_exec_run((cmdline band rt_payload_mask()) + 8, rt_str_len(cmdline))
+  return rt_string_adopt(raw)
+end
+
 # docs/plans/general-refcounting.md, Phase 2: the one place a string's
 # own refcount gets decremented, given its TAGGED value -- recovers the
 # exact size bm_alloc was originally called with (8 + the string's own
@@ -290,7 +396,7 @@ make a function called rt_str_concat takes a, b returns result
     mem_poke_byte(result, 8 + len_a + j, mem_peek_byte(addr_b, 8 + j))
     let j = j + 1
   end
-  return result bor rt_string_tag()
+  return rt_fresh(result bor rt_string_tag())
 end
 
 # Real gap found (GitHub #24) via the cross-backend benchmark suite:
@@ -575,6 +681,314 @@ make a function called rt_format_float_parts takes parts returns s
   return result
 end
 
+# ---- exact shortest round-trip float text (Burger & Dybvig free-format) ----
+#
+# The interpreter prints a non-integral float with Rust's f64 Display: the
+# shortest digit string that reads back as the same double, never in
+# exponent notation. These functions produce the same digits exactly, with
+# integer arithmetic only: the double is m * 2^e, the digits are generated
+# from r/s, and the gaps to the neighbouring doubles (m+ and m-) decide
+# when the digits so far already identify the value.
+#
+# Bignums are little-endian Lists of 24-bit limbs, so a limb times 10 or
+# times 2^16, plus a carry, stays well inside the 48-bit fixnum range. All
+# of these are plain integer functions (no float, no string literal).
+
+make a function called rt_bn_norm takes a returns out
+  let n = a.length
+  while (n > 1) and (a[n - 1] == 0) do
+    let n = n - 1
+  end
+  if n == a.length then
+    return a
+  end
+  let out = []
+  let i = 0
+  while i < n do
+    let out = list_push(out, a[i])
+    let i = i + 1
+  end
+  return out
+end
+
+# m is at most 2^16.
+make a function called rt_bn_mul_small takes a, m returns out
+  let out = []
+  let carry = 0
+  let i = 0
+  while i < a.length do
+    let t = a[i] * m + carry
+    let out = list_push(out, t band 16777215)
+    let carry = t shr 24
+    let i = i + 1
+  end
+  while carry > 0 do
+    let out = list_push(out, carry band 16777215)
+    let carry = carry shr 24
+  end
+  return rt_bn_norm(out)
+end
+
+# a * 2^n
+make a function called rt_bn_shl takes a, n returns out
+  let out = []
+  let left = n
+  while left >= 24 do
+    let out = list_push(out, 0)
+    let left = left - 24
+  end
+  let i = 0
+  while i < a.length do
+    let out = list_push(out, a[i])
+    let i = i + 1
+  end
+  while left >= 16 do
+    let out = rt_bn_mul_small(out, 65536)
+    let left = left - 16
+  end
+  return rt_bn_mul_small(out, 1 shl left)
+end
+
+make a function called rt_bn_add takes a, b returns out
+  let out = []
+  let carry = 0
+  let i = 0
+  while (i < a.length) or (i < b.length) do
+    let t = carry
+    if i < a.length then
+      let t = t + a[i]
+    end
+    if i < b.length then
+      let t = t + b[i]
+    end
+    let out = list_push(out, t band 16777215)
+    let carry = t shr 24
+    let i = i + 1
+  end
+  if carry > 0 then
+    let out = list_push(out, carry)
+  end
+  return out
+end
+
+# a - b, for a >= b
+make a function called rt_bn_sub takes a, b returns out
+  let out = []
+  let borrow = 0
+  let i = 0
+  while i < a.length do
+    let t = a[i] - borrow
+    if i < b.length then
+      let t = t - b[i]
+    end
+    if t < 0 then
+      let t = t + 16777216
+      let borrow = 1
+    else
+      let borrow = 0
+    end
+    let out = list_push(out, t)
+    let i = i + 1
+  end
+  return rt_bn_norm(out)
+end
+
+# -1, 0 or 1 as a < b, a == b, a > b (both normalized)
+make a function called rt_bn_cmp takes a, b returns c
+  if a.length != b.length then
+    if a.length < b.length then
+      return 0 - 1
+    end
+    return 1
+  end
+  let i = a.length - 1
+  while i >= 0 do
+    if a[i] != b[i] then
+      if a[i] < b[i] then
+        return 0 - 1
+      end
+      return 1
+    end
+    let i = i - 1
+  end
+  return 0
+end
+
+# True when r + m+ has not reached s: the digits generated so far, rounded
+# up, would overshoot the value's rounding interval. The interval's ends
+# belong to it when the mantissa is even (round-half-even reads them back
+# to this double), as in Rust's flt2dec.
+make a function called rt_bn_high_below takes r, mp, s, inclusive returns ok
+  let c = rt_bn_cmp(rt_bn_add(r, mp), s)
+  if inclusive == 1 then
+    return c < 0
+  end
+  return c <= 0
+end
+
+# [digits, k] for the non-zero finite double with these bits (sign
+# ignored): its shortest round-trip decimal is 0.d1d2...dn * 10^k.
+make a function called rt_float_shortest takes bits returns result
+  let be = (bits shr 52) band 2047
+  let lo = bits band 16777215
+  let mid = (bits shr 24) band 16777215
+  let hi = (bits shr 48) band 15
+  let e = be - 1075
+  let f = [lo, mid, hi]
+  # The gap below is half the gap above at an exact power of two (other
+  # than the smallest normal exponent), where the exponent steps down.
+  let unequal = 0
+  if be == 0 then
+    let e = 0 - 1074
+  else
+    let f = [lo, mid, hi + 16]
+    if (lo == 0) and (mid == 0) and (hi == 0) and (be > 1) then
+      let unequal = 1
+    end
+  end
+  let f = rt_bn_norm(f)
+  let inclusive = 0
+  if (lo band 1) == 0 then
+    let inclusive = 1
+  end
+  let one = [1]
+  let r = one
+  let s = one
+  let mp = one
+  let mm = one
+  if e >= 0 then
+    let gap = rt_bn_shl(one, e)
+    if unequal == 1 then
+      let r = rt_bn_shl(f, e + 2)
+      let s = [4]
+      let mp = rt_bn_shl(gap, 1)
+      let mm = gap
+    else
+      let r = rt_bn_shl(f, e + 1)
+      let s = [2]
+      let mp = gap
+      let mm = gap
+    end
+  else
+    if unequal == 1 then
+      let r = rt_bn_shl(f, 2)
+      let s = rt_bn_shl(one, 2 - e)
+      let mp = [2]
+      let mm = one
+    else
+      let r = rt_bn_shl(f, 1)
+      let s = rt_bn_shl(one, 1 - e)
+      let mp = one
+      let mm = one
+    end
+  end
+  # k: the smallest exponent with (r + m+) / s inside [0, 1).
+  let k = 0
+  while not rt_bn_high_below(r, mp, s, inclusive) do
+    let s = rt_bn_mul_small(s, 10)
+    let k = k + 1
+  end
+  while rt_bn_high_below(rt_bn_mul_small(r, 10), rt_bn_mul_small(mp, 10), s, inclusive) do
+    let r = rt_bn_mul_small(r, 10)
+    let mp = rt_bn_mul_small(mp, 10)
+    let mm = rt_bn_mul_small(mm, 10)
+    let k = k - 1
+  end
+  let digits = []
+  let done = 0
+  while done == 0 do
+    let r = rt_bn_mul_small(r, 10)
+    let mp = rt_bn_mul_small(mp, 10)
+    let mm = rt_bn_mul_small(mm, 10)
+    let d = 0
+    while rt_bn_cmp(r, s) >= 0 do
+      let r = rt_bn_sub(r, s)
+      let d = d + 1
+    end
+    # low: stopping at d stays inside the interval; high: so does d + 1.
+    let cl = rt_bn_cmp(r, mm)
+    let low = (cl < 0) or ((inclusive == 1) and (cl == 0))
+    let high = not rt_bn_high_below(r, mp, s, inclusive)
+    if low and high then
+      # Both read back as this double: take the nearer, a tie rounding up.
+      if rt_bn_cmp(rt_bn_shl(r, 1), s) < 0 then
+        let digits = list_push(digits, d)
+      else
+        let digits = list_push(digits, d + 1)
+      end
+      let done = 1
+    elif low then
+      let digits = list_push(digits, d)
+      let done = 1
+    elif high then
+      let digits = list_push(digits, d + 1)
+      let done = 1
+    else
+      let digits = list_push(digits, d)
+    end
+  end
+  return [digits, k]
+end
+
+# 1 when the finite double with these bits is a whole number (so the
+# interpreter prints it as `x as i64`), else 0.
+make a function called rt_float_bits_integral takes bits returns yes
+  let be = (bits shr 52) band 2047
+  if be >= 1075 then
+    return 1
+  end
+  if be < 1023 then
+    if (bits shl 1) == 0 then
+      return 1
+    end
+    return 0
+  end
+  if (bits shl (64 - (1075 - be))) == 0 then
+    return 1
+  end
+  return 0
+end
+
+# The plain-notation text of a non-integral finite double, as Rust's f64
+# Display writes it.
+make a function called rt_float_shortest_text takes bits returns s
+  let res = rt_float_shortest(bits)
+  let digits = res[0]
+  let k = res[1]
+  let n = digits.length
+  let b = sb_new()
+  if ((bits shr 63) band 1) == 1 then
+    sb_push(b, "-")
+  end
+  if k <= 0 then
+    sb_push(b, "0.")
+    let z = 0
+    while z < (0 - k) do
+      sb_push(b, "0")
+      let z = z + 1
+    end
+    let i = 0
+    while i < n do
+      sb_push(b, rt_int_to_str(digits[i]))
+      let i = i + 1
+    end
+    return sb_str(b)
+  end
+  let i = 0
+  while i < n do
+    if i == k then
+      sb_push(b, ".")
+    end
+    sb_push(b, rt_int_to_str(digits[i]))
+    let i = i + 1
+  end
+  while i < k do
+    sb_push(b, "0")
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
 # The text of a raw float64 bit pattern. inf, -inf and NaN are written as
 # the interpreter (Rust's f64 Display) writes them; rt_float_decompose's
 # digit extraction only handles finite values and printed garbage for
@@ -593,18 +1007,44 @@ make a function called rt_float_bits_to_string takes bits returns s
     end
     return "inf"
   end
-  # |x| >= 2^63 (binary exponent >= 63) is integral, and the interpreter
-  # displays an integral float as `x as i64`, which Rust saturates
-  # (hosts.rs/codegen.rs display_value) -- so 1e308 prints as
-  # 9223372036854775807 there. rt_float_decompose truncates to i64 first
-  # and crashed on such values; give the interpreter's text instead.
+  # |x| >= 2^63 (binary exponent >= 63) is integral, and an integral float
+  # prints as the integer it is (GitHub #230: this was the saturated i64,
+  # 1e308 printing 9223372036854775807, matching an interpreter that cast
+  # with `as i64`). rt_float_decompose truncates to i64 first, so it is
+  # built exactly here instead.
   if exp >= 1086 then
-    if ((bits shr 63) band 1) == 1 then
-      return "-9223372036854775808"
-    end
-    return "9223372036854775807"
+    return rt_float_big_integral_text(bits)
   end
-  return rt_format_float_parts(rt_float_decompose(bits))
+  if rt_float_bits_integral(bits) == 1 then
+    return rt_format_float_parts(rt_float_decompose(bits))
+  end
+  return rt_float_shortest_text(bits)
+end
+
+# The decimal text of a finite double with |x| >= 2^63: exactly its
+# mantissa times 2^(exponent - 1075), as a (Big)Int. The mantissa is put
+# together from 24-bit pieces, as rt_float_shortest does, since `shr` is
+# arithmetic, and with rt_int_* throughout: a 53-bit mantissa is past the
+# fixnum range, where rt_int_* read a raw word as a BigInt pointer.
+make a function called rt_float_big_integral_text takes bits returns s
+  let be = (bits shr 52) band 2047
+  let lo = bits band 16777215
+  let mid = (bits shr 24) band 16777215
+  let hi = ((bits shr 48) band 15) + 16
+  let v = rt_int_add(lo, rt_int_mul(mid, 16777216))
+  let v = rt_int_add(v, rt_int_mul(rt_int_mul(hi, 16777216), 16777216))
+  let e = be - 1075
+  while e >= 30 do
+    let v = rt_int_mul(v, 1073741824)
+    let e = e - 30
+  end
+  if e > 0 then
+    let v = rt_int_mul(v, 1 shl e)
+  end
+  if ((bits shr 63) band 1) == 1 then
+    let v = rt_int_neg(v)
+  end
+  return rt_to_display_string(v)
 end
 
 make a function called rt_print_float takes v returns done
@@ -702,47 +1142,25 @@ end
 # prepended for --x64 compiles, so this can't affect the rustc-text
 # backend or interpreter's own, correct, existing host functions) makes
 # ORDINARY function-call codegen handle them -- no new hand-assembled
-# asm needed for any of these (mem_sb_table_addr, added to
-# codegen_x64.patlang's x64_callhost_asm alongside this, is the one
-# genuinely new native primitive this whole batch needed). Each mirrors
+# asm needed for any of these. Each mirrors
 # its Rust counterpart's semantics as closely as makes sense for this
 # backend's actual tagged-value representation (fixnum-or-family-tag,
 # not Rust's richer Value enum) -- documented per-function below.
 
-# StringBuilder. Rust's host_sb_push has a fire-and-forget contract
-# (returns Unit; existing call sites everywhere in codegen_x64.patlang
-# do `sb_push(sb, "...")` as a bare statement, never `let sb =
-# sb_push(...)`) -- so a handle's IDENTITY must survive across pushes
-# even when its backing storage grows, unlike rt_list_push's own
-# "caller rebinds the return value" contract. Design: a persistent
-# global table (g_sb_table, an ordinary PatLang List value stored
-# through the one dedicated .bss slot mem_sb_table_addr() -- see that
-# primitive's own header in codegen_x64.patlang) holds each
-# StringBuilder's CURRENT entry address; sb_new appends a fresh entry
-# and returns its stable INDEX as the handle; sb_push looks the entry
-# up by index, grows it (same amortized-doubling discipline as
-# rt_list_push -- mutate in place when there's room, else reallocate),
-# and writes the new address back into the table via rt_list_set ONLY
-# when reallocation actually happened, so the handle (the table index)
-# never needs to change.
-# GitHub #223: same leak shape as vec_new (see its own header) -- the
-# table's previous version, abandoned the moment new_table replaces it
-# in the global slot, was never decremented.
+# StringBuilder: a counted cell (rt_cell_new, below) with three fields
+# [len][cap][buf], `buf` a counted block of `cap` bytes. sb_push grows it
+# by doubling and releases the outgrown block; releasing the cell releases
+# `buf` (rt_cell_rc_dec). A builder is a value like any other: the
+# compiler releases it when the last reference goes. It used to be an
+# index into a table that only grew, with every outgrown buffer and the
+# final one left allocated (docs/plans/general-refcounting.md, 6e).
 make a function called sb_new returns handle
-  let table_addr = mem_sb_table_addr()
-  let table = mem_peek_qword(table_addr, 0)
-  if table == 0 then
-    let table = rt_list_new(0)
-    mem_poke_qword(table_addr, 0, table)
-  end
   let cap = 64
-  let entry = rt_heap_alloc(16 + cap)
-  mem_poke_qword(entry, 0, 0)
-  mem_poke_qword(entry, 8, cap)
-  let new_table = rt_list_push(table, entry)
-  mem_poke_qword(table_addr, 0, new_table)
-  rt_rc_dec_if_refcounted(table)
-  return rt_list_len(new_table) - 1
+  let c = rt_cell_new(rt_cell_sb_type(), 3)
+  mem_poke_qword(c, 16, 0)
+  mem_poke_qword(c, 24, cap)
+  mem_poke_qword(c, 32, bm_alloc(cap))
+  return rt_fresh(c bor rt_object_tag())
 end
 
 make a function called sb_push takes handle, text0 returns done
@@ -755,56 +1173,53 @@ make a function called sb_push takes handle, text0 returns done
   if (text0 band 17293822569102704640) != 2305843009213693952 then
     let text = rt_to_display_string(text0)
   end
-  let table = mem_peek_qword(mem_sb_table_addr(), 0)
-  let entry = rt_list_get(table, handle)
+  let c = handle band rt_payload_mask()
   let src = text band rt_payload_mask()
   let n = mem_peek_qword(src, 0)
-  let len = mem_peek_qword(entry, 0)
-  let cap = mem_peek_qword(entry, 8)
-  if len + n <= cap then
+  let len = mem_peek_qword(c, 16)
+  let cap = mem_peek_qword(c, 24)
+  let buf = mem_peek_qword(c, 32)
+  if len + n > cap then
+    let new_cap = cap * 2
+    if new_cap < len + n then
+      let new_cap = len + n
+    end
+    let new_buf = bm_alloc(new_cap)
     let i = 0
-    while i < n do
-      mem_poke_byte(entry, 16 + len + i, mem_peek_byte(src, 8 + i))
+    while i < len do
+      mem_poke_byte(new_buf, i, mem_peek_byte(buf, i))
       let i = i + 1
     end
-    mem_poke_qword(entry, 0, len + n)
-    return true
-  end
-  let new_cap = cap * 2
-  if new_cap < len + n then
-    let new_cap = len + n
-  end
-  let new_entry = rt_heap_alloc(16 + new_cap)
-  mem_poke_qword(new_entry, 0, len + n)
-  mem_poke_qword(new_entry, 8, new_cap)
-  let i = 0
-  while i < len do
-    mem_poke_byte(new_entry, 16 + i, mem_peek_byte(entry, 16 + i))
-    let i = i + 1
+    bm_rc_dec(buf, cap)
+    mem_poke_qword(c, 24, new_cap)
+    mem_poke_qword(c, 32, new_buf)
+    let buf = new_buf
   end
   let j = 0
   while j < n do
-    mem_poke_byte(new_entry, 16 + len + j, mem_peek_byte(src, 8 + j))
+    mem_poke_byte(buf, len + j, mem_peek_byte(src, 8 + j))
     let j = j + 1
   end
-  rt_list_set(table, handle, new_entry)
+  mem_poke_qword(c, 16, len + n)
+  if text != text0 then
+    rt_rc_dec_if_refcounted(text)
+  end
   return true
 end
 
-# Clones the buffer's current content into a fresh tagged string
-# (matching Rust's `.clone()` sb_str -- safe to keep pushing to the same
-# handle afterward, even though no existing call site actually does).
+# A fresh string holding the builder's current content (the builder can be
+# pushed to afterwards, as in the interpreter).
 make a function called sb_str takes handle returns s
-  let table = mem_peek_qword(mem_sb_table_addr(), 0)
-  let entry = rt_list_get(table, handle)
-  let len = mem_peek_qword(entry, 0)
+  let c = handle band rt_payload_mask()
+  let len = mem_peek_qword(c, 16)
+  let buf = mem_peek_qword(c, 32)
   let result = rt_string_new(len)
   let i = 0
   while i < len do
-    mem_poke_byte(result, 8 + i, mem_peek_byte(entry, 16 + i))
+    mem_poke_byte(result, 8 + i, mem_peek_byte(buf, i))
     let i = i + 1
   end
-  return result bor rt_string_tag()
+  return rt_fresh(result bor rt_string_tag())
 end
 
 # to_num(v): if v is already numeric (fixnum, or ANY Numeric-family
@@ -836,9 +1251,17 @@ end
 # check first (a plain fixnum -- nibble 0, or 15 for a negative one --
 # never reaches here), so the common all-int case pays no call.
 make a function called rt_index_int takes i returns n
-  if type_of(i) == "rational" then
+  if x64_family_code(i) == 7 then
     let ra = i band rt_payload_mask()
     return rt_trunc_div(mem_peek_qword(ra, 0), mem_peek_qword(ra, 8))
+  end
+  # A Float index truncates, as interpreted (ops.rs as_index) -- floor()
+  # of a float is a Float, so pixel_at(img, floor(fx), floor(fy)) indexed
+  # with the box's tagged word. Callers test x64_family_code(i) != 0
+  # before calling here, not the tag nibble: a shift or mask of a boxed
+  # Float converts it to an int first (#102), so the nibble read 0.
+  if x64_family_code(i) == 14 then
+    return x64_float_bits_to_int(rt_unbox_float_bits(i))
   end
   return i
 end
@@ -962,19 +1385,22 @@ end
 # own host_chr truncates any numeric value toward zero first
 # (`as_number()` then `as u32`); this does the same for the case that
 # actually reaches native code, a Rational built from two fixnums.
+# A fixnum is used as it is; any other number (Rational, Float) truncates
+# through rt_index_int, as substr does. This used to call type_of on every
+# argument, which built a type-name string and compared it per byte in
+# x64_bin_get_str's chunk-cache reads, and left a Float untruncated.
 make a function called chr takes n0 returns s
   let n = n0
-  if type_of(n0) == "rational" then
-    let raddr = n0 band rt_payload_mask()
-    let n = rt_trunc_div(mem_peek_qword(raddr, 0), mem_peek_qword(raddr, 8))
+  if x64_family_code(n0) != 0 then
+    let n = rt_index_int(n0)
   end
   if n < 0 then
     let result = rt_string_new(0)
-    return result bor rt_string_tag()
+    return rt_fresh(result bor rt_string_tag())
   end
   let result = rt_string_new(1)
   mem_poke_byte(result, 8, n)
-  return result bor rt_string_tag()
+  return rt_fresh(result bor rt_string_tag())
 end
 
 # substr(s, start, count) -> byte slice, clamped to the string's actual
@@ -982,11 +1408,11 @@ end
 # `en = (st+count).min(len)`).
 make a function called substr takes s, start0, count0 returns result
   let start = start0
-  if (((start0 shr 60) band 15) != 0) and (((start0 shr 60) band 15) != 15) then
+  if x64_family_code(start0) != 0 then
     let start = rt_index_int(start0)
   end
   let count = count0
-  if (((count0 shr 60) band 15) != 0) and (((count0 shr 60) band 15) != 15) then
+  if x64_family_code(count0) != 0 then
     let count = rt_index_int(count0)
   end
   let addr = s band rt_payload_mask()
@@ -1006,169 +1432,113 @@ make a function called substr takes s, start0, count0 returns result
     mem_poke_byte(result, 8 + i, mem_peek_byte(addr, 8 + st + i))
     let i = i + 1
   end
-  return result bor rt_string_tag()
+  return rt_fresh(result bor rt_string_tag())
 end
 
-# str_intern/sc_len/sc_code/sc_char: Rust's versions hand out a stable
-# integer id into a global interned-string TABLE so a hot scanning loop
-# (the lexer indexes the whole source per character) never re-clones a
-# Value::String local on every access. This backend has no such cloning
-# cost to avoid (strings are already heap blocks referenced by address,
-# not deep-copied per access) -- confirmed via lexer.patlang's own
-# usage (the ONLY call site in the whole self-hosted compiler source):
-# str_intern is called EXACTLY ONCE per tokenize() call, and the
-# returned handle is used only within that same call, never crossing
-# into another function or needing to persist. So the "handle" can just
-# BE the string's own masked address -- no table, no id-to-entry
-# lookup, nothing to grow or manage. A deliberately simpler, still
-# fully general, implementation (works correctly regardless of how many
-# strings are ever interned or how many times), not a scope-limited one.
+# The interned "handle" is the string itself, with a reference of its own
+# (the compiler owns the result and releases the argument,
+# bm_nc_owned_runtime_producer_names / bm_nc_runtime_borrows_args). It used
+# to be the bare address, a reference nobody counted: a fresh argument was
+# never released, and a handle could outlive its string
+# (docs/plans/general-refcounting.md, 6l). The interpreter likewise returns
+# the string, caching what sc_* need per string object.
 make a function called str_intern takes s returns handle
-  return s band rt_payload_mask()
+  return rt_keep(s)
 end
 
 make a function called sc_len takes handle returns len
-  return mem_peek_qword(handle, 0)
+  return mem_peek_qword(handle band rt_payload_mask(), 0)
 end
 
 make a function called sc_code takes handle, i0 returns code
   let i = i0
-  if (((i0 shr 60) band 15) != 0) and (((i0 shr 60) band 15) != 15) then
+  if x64_family_code(i0) != 0 then
     let i = rt_index_int(i0)
   end
-  let len = mem_peek_qword(handle, 0)
+  let a = handle band rt_payload_mask()
+  let len = mem_peek_qword(a, 0)
   if i < len then
-    return mem_peek_byte(handle, 8 + i)
+    return mem_peek_byte(a, 8 + i)
   end
   return 0 - 1
 end
 
-make a function called sc_char takes handle, i returns s
-  let len = mem_peek_qword(handle, 0)
+make a function called sc_char takes handle, i0 returns s
+  let i = i0
+  if x64_family_code(i0) != 0 then
+    let i = rt_index_int(i0)
+  end
+  let a = handle band rt_payload_mask()
+  let len = mem_peek_qword(a, 0)
   if i < len then
-    return chr(mem_peek_byte(handle, 8 + i))
+    return chr(mem_peek_byte(a, 8 + i))
   end
   let result = rt_string_new(0)
-  return result bor rt_string_tag()
+  return rt_fresh(result bor rt_string_tag())
 end
 
-# vec_new/vec_push/vec_get/vec_set/vec_len/vec_to_list: Rust's
-# "handle-based builder" for O(1) push/index on large collections
-# (rust-runtime/src/ir/hosts.rs's VECS thread-local), used by
-# lexer.patlang to accumulate its token list (`vec_push(tokens,
-# item)`, called as a bare statement -- same fire-and-forget contract
-# as sb_push, so this needs the EXACT same "stable handle across
-# growth" design as sb_new/sb_push/sb_str above (see that block's own
-# header for the full reasoning: a naive address-as-handle design
-# breaks the moment growth reallocates, since existing call sites never
-# rebind the handle). Simpler than sb_* though: each entry here is an
-# ORDINARY PatLang List (not a hand-rolled byte buffer), so entry
-# growth just reuses the ALREADY O(1)-amortized rt_list_push directly
-# -- no byte-copying logic to write. vec_to_list needs no copy either:
-# a PatLang List IS already this backend's native list representation,
-# so returning the entry's current tagged value as-is is correct (same
-# "handle out, no more pushes expected afterward" idiom the ACTUAL
-# lexer.patlang call site follows: vec_to_list(tokens) is always the
-# LAST thing done with a given vec handle).
-# GitHub #223: vec_new/vec_push/vec_set/vec_extend all read the ONE
-# shared vec table via mem_peek_qword and write a replacement back via
-# mem_poke_qword/rt_list_set -- rt_list_push/rt_list_set BORROW their
-# list argument (never consume or decrement it; see rt_list_push's own
-# header), and the plain (non-functional) rt_list_set used here never
-# decrements whatever value it displaces either (unlike rt_list_set_
-# functional, which does -- this plain variant's contract is "the
-# caller already knows the slot is safe to overwrite," which holds for
-# every call site below once the fix is applied, but did NOT hold
-# before it). Confirmed as a real, severe leak via a direct repro:
-# calling tokenize() (self_hosting/lib/lexer.patlang, itself a heavy
-# vec_push user for its own token list) 20000 times in a loop grew
-# real process memory past 40GB in seconds -- every single token
-# leaked the vec's previous list-node version, forever. `rt_list_push`/
-# `rt_list_set` always return a genuinely NEW node (never the same
-# pointer as their own list argument -- confirmed via their own header
-# comments), so every explicit decrement added below is unconditionally
-# safe (no risk of decrementing a value that's actually still the one
-# being kept, which would be a premature free).
+# vec_new/vec_push/vec_get/vec_set/vec_len/vec_extend/vec_to_list: a
+# growable list with a stable identity (lexer.patlang's token list:
+# `vec_push(tokens, item)` as a bare statement, never rebound). A counted
+# cell (rt_cell_new) with one field, the current List; pushes replace that
+# list with rt_list_push's new version. The list owns its elements, so a
+# pushed or set item takes its own reference and releasing the vec
+# releases them (rt_cell_rc_dec). vec_get and vec_to_list are borrows the
+# compiler takes its own reference to (bm_nc_dynamic_producer_names,
+# native_codegen). A vec used to be an index into a table that only grew
+# (docs/plans/general-refcounting.md, 6f).
 make a function called vec_new returns handle
-  let table_addr = mem_vec_table_addr()
-  let table = mem_peek_qword(table_addr, 0)
-  if table == 0 then
-    let table = rt_list_new(0)
-    mem_poke_qword(table_addr, 0, table)
-  end
-  let entry = rt_list_new(0)
-  let new_table = rt_list_push(table, entry)
-  mem_poke_qword(table_addr, 0, new_table)
-  rt_rc_dec_if_refcounted(table)
-  return rt_list_len(new_table) - 1
+  let c = rt_cell_new(rt_cell_vec_type(), 1)
+  mem_poke_qword(c, 16, rt_list_new(0))
+  return rt_fresh(c bor rt_object_tag())
 end
 
 make a function called vec_push takes handle, item returns done
-  let table = mem_peek_qword(mem_vec_table_addr(), 0)
-  let entry = rt_list_get(table, handle)
-  let new_entry = rt_list_push(entry, item)
-  rt_list_set(table, handle, new_entry)
+  let c = handle band rt_payload_mask()
+  let entry = mem_peek_qword(c, 16)
+  mem_poke_qword(c, 16, rt_list_push(entry, item))
   rt_rc_dec_if_refcounted(entry)
   return true
 end
 
 make a function called vec_get takes handle, idx returns value
-  let table = mem_peek_qword(mem_vec_table_addr(), 0)
-  let entry = rt_list_get(table, handle)
-  return rt_list_get(entry, idx)
+  return rt_list_get(mem_peek_qword(handle band rt_payload_mask(), 16), idx)
 end
 
+# A new version of the list, so a list vec_to_list handed out earlier keeps
+# its own contents, as in the interpreter (this used to write the shared
+# list in place). raytrace ch37: setting a slot back to the value it
+# already holds must not release it.
 make a function called vec_set takes handle, idx, item returns done
-  let table = mem_peek_qword(mem_vec_table_addr(), 0)
-  let entry = rt_list_get(table, handle)
-  let old = rt_list_get(entry, idx)
-  rt_list_set(entry, idx, item)
-  if old != item then
-    rt_rc_dec_if_refcounted(old)
+  let c = handle band rt_payload_mask()
+  let entry = mem_peek_qword(c, 16)
+  if rt_list_get(entry, idx) == item then
+    return true
   end
+  mem_poke_qword(c, 16, rt_list_set_functional(entry, idx, item))
+  rt_rc_dec_if_refcounted(entry)
   return true
 end
 
 make a function called vec_len takes handle returns n
-  let table = mem_peek_qword(mem_vec_table_addr(), 0)
-  let entry = rt_list_get(table, handle)
-  return rt_list_len(entry)
+  return rt_list_len(mem_peek_qword(handle band rt_payload_mask(), 16))
 end
 
-# vec_extend(handle, items) -- appends every element of [items] onto
-# the vec, same fire-and-forget bare-statement contract as vec_push
-# (GitHub #222 follow-up: this had no native x64 case at all, found via
-# x64_pe_link.patlang's own chunk-merging call sites during the Gen B
-# self-compile fixpoint).
-#
-# GitHub #223: the loop's own chain (entry -> entry -> ... -> entry,
-# each iteration's rt_list_push producing a brand-new node over the
-# previous one) leaked every INTERMEDIATE value, not just the table's
-# final replacement -- decrement each superseded link as the loop moves
-# past it. n==0 is a genuine no-op (nothing to extend): skip rt_list_set
-# entirely rather than writing the same value back and decrementing it,
-# which would under-count a reference the table is still holding.
+# vec_extend(handle, items) -- appends every element of [items] onto the
+# vec, the same bare-statement contract as vec_push (GitHub #222
+# follow-up: x64_pe_link.patlang's chunk-merging call sites).
 make a function called vec_extend takes handle, items returns done
-  let table = mem_peek_qword(mem_vec_table_addr(), 0)
-  let entry = rt_list_get(table, handle)
   let n = rt_list_len(items)
-  if n == 0 then
-    return true
-  end
   let i = 0
   while i < n do
-    let old_entry = entry
-    let entry = rt_list_push(entry, rt_list_get(items, i))
-    rt_rc_dec_if_refcounted(old_entry)
+    vec_push(handle, rt_list_get(items, i))
     let i = i + 1
   end
-  rt_list_set(table, handle, entry)
   return true
 end
 
 make a function called vec_to_list takes handle returns l
-  let table = mem_peek_qword(mem_vec_table_addr(), 0)
-  return rt_list_get(table, handle)
+  return rt_keep(mem_peek_qword(handle band rt_payload_mask(), 16))
 end
 
 # char_code(s, idx) -> ASCII byte at idx, or -1 if out of range. Same
@@ -1176,7 +1546,7 @@ end
 # than an interned handle.
 make a function called char_code takes s, idx0 returns code
   let idx = idx0
-  if (((idx0 shr 60) band 15) != 0) and (((idx0 shr 60) band 15) != 15) then
+  if x64_family_code(idx0) != 0 then
     let idx = rt_index_int(idx0)
   end
   let addr = s band rt_payload_mask()
@@ -1310,46 +1680,11 @@ make a function called rt_list_to_display_string takes v returns s
     if i > 0 then
       sb_push(sb, ", ")
     end
-    let elem = rt_list_get(v, i)
-    let family_mask = 17293822569102704640
-    let elem_family = elem band family_mask
-    let list_family = 3458764513820540928
-    let string_family = 2305843009213693952
-    let bigint_family = 1152921504606846976
-    let rational_family = 1153765929536978944
-    let complex_family = 1154891829443821568
-    let interval_family = 1157425104234217472
-    let bool_family = 6917529027641081856
-    # GitHub #47-adjacent fix: same "String/List/BigInt/Rational/
-    # Complex/Interval always have a nonzero payload (a real heap
-    # address, never 0)" guard as print()'s own dispatch just above --
-    # a zero-payload false match on any of these six is coincidence,
-    # not a genuine tagged value (Bool is the exception, since its
-    # payload directly encodes true/false and 0 is legitimate there).
-    let payload_mask = 281474976710655
-    let elem_payload = elem band payload_mask
-    let has_payload = elem_payload != 0
-    if has_payload and (elem_family == list_family) then
-      sb_push(sb, rt_list_to_display_string(elem))
-    elif elem_family == 0 then
-      sb_push(sb, rt_int_to_str(elem))
-    elif elem_family == family_mask then
-      sb_push(sb, rt_int_to_str(elem))
-    elif has_payload and (elem_family == string_family) then
-      sb_push(sb, elem)
-    elif has_payload and (elem_family == bigint_family) then
-      sb_push(sb, rt_bigint_to_string(elem))
-    elif has_payload and (elem_family == rational_family) then
-      sb_push(sb, rt_rational_to_string(elem))
-    elif has_payload and (elem_family == complex_family) then
-      sb_push(sb, rt_complex_to_string(elem))
-    elif has_payload and (elem_family == interval_family) then
-      sb_push(sb, rt_interval_to_string(elem))
-    elif elem_family == bool_family then
-      sb_push(sb, rt_bool_to_string(elem))
-    else
-      sb_push(sb, "<value>")
-    end
+    # Each element displays exactly as print() would display it on its
+    # own. The kind comes from type_of: a top-4-bit family mask alone
+    # cannot tell BigInt from Rational/Complex/Interval/boxed Float, which
+    # share the 1<<60 family and differ only in their subtag bits.
+    sb_push(sb, rt_to_display_string(rt_list_get(v, i)))
     let i = i + 1
   end
   sb_push(sb, "]")
@@ -1439,8 +1774,8 @@ end
 # `get(self, "field")`/`obj.field = value` to read/write a DIFFERENT
 # object's own namespace -- every object would have silently aliased the
 # same global "__vars" table instead of its own fields. Fixed by making
-# the underlying table a list of [namespace_name, keys, vals] triples,
-# looked up by `store`/`key` together -- `rt_ns_get`/`rt_ns_set` below do
+# the underlying table map each store name to that store's own key table
+# (both rt_hmap hash tables, below), looked up by `store`/`key` together -- `rt_ns_get`/`rt_ns_set` below do
 # the real work; `get`/`set_var` are now thin, backward-compatible
 # wrappers (every existing 2-arg `set_var(key,value)` call site is
 # unaffected, since it's just sugar for `rt_ns_set("__vars",key,value)`).
@@ -1511,11 +1846,10 @@ end
 make a function called tls_counter_next takes key returns n
   rt_tls_lock()
   let table_addr = mem_tls_counters_table_addr()
-  let table = mem_peek_qword(table_addr, 0)
-  if table == 0 then
-    let table = rt_list_new(0)
-    mem_poke_qword(table_addr, 0, table)
+  if mem_peek_qword(table_addr, 0) == 0 then
+    mem_poke_qword(table_addr, 0, rt_list_new(0))
   end
+  let table = mem_peek_qword(table_addr, 0)
   let n = rt_list_len(table)
   let i = 0
   while i < n do
@@ -1523,29 +1857,221 @@ make a function called tls_counter_next takes key returns n
     if rt_str_eq(rt_list_get(entry, 0), key) then
       let old = rt_list_get(entry, 1)
       rt_list_set(table, i, [key, old + 1])
-      rt_rc_dec_if_refcounted(entry)
       rt_tls_unlock()
       return old
     end
     let i = i + 1
   end
-  let new_table = rt_list_push(table, [key, 1])
-  mem_poke_qword(table_addr, 0, new_table)
+  mem_poke_qword(table_addr, 0, rt_list_push(table, [key, 1]))
   rt_rc_dec_if_refcounted(table)
   rt_tls_unlock()
   return 0
 end
 
-make a function called rt_ns_find takes table, store returns idx
-  let n = rt_list_len(table)
+# ---- rt_hmap: a string-keyed hash table ----
+#
+# One primitive for every by-name table the runtime keeps (docs/plans/
+# native-interpreter.md, Phase 2; GitHub #231). The store table below was
+# a list scanned with rt_str_eq on every get/set/send, so each access cost
+# time in proportion to the number of objects ever created, and a cold
+# patc1_x64 compile, whose assembler makes objects per unit, was quadratic
+# in units.
+#
+# A table is a raw block [used, cap, slots, live]: `used` counts live and
+# deleted slots, `live` only live ones, `cap` is a power of two. `slots`
+# is cap entries of [key, value, hash]; a key of 0 is empty and 1 is
+# deleted (no tagged string is either). Lookup probes linearly from
+# hash band (cap - 1). The table owns one reference to each key: a key is
+# usually a temporary the caller releases, and a stored key that shares
+# its block gets overwritten by the next allocation
+# (spec_fixtures/native_namespace_hashed.patlang). Values are the
+# caller's to own.
+make a function called rt_str_hash takes s returns h
+  # Polynomial (h * 33 + byte), kept to 48 bits so no step overflows.
+  let addr = s band rt_payload_mask()
+  let n = mem_peek_qword(addr, 0)
+  let h = 5381
   let i = 0
   while i < n do
-    if rt_str_eq(rt_list_get(rt_list_get(table, i), 0), store) then
-      return i
+    let h = ((h * 33) + mem_peek_byte(addr, 8 + i)) band 281474976710655
+    let i = i + 1
+  end
+  return h
+end
+
+make a function called rt_hmap_slots_new takes cap returns slots
+  let slots = bm_alloc(cap * 24)
+  let i = 0
+  while i < cap do
+    mem_poke_qword(slots, i * 24, 0)
+    let i = i + 1
+  end
+  return slots
+end
+
+make a function called rt_hmap_new returns m
+  let m = bm_alloc(32)
+  mem_poke_qword(m, 0, 0)
+  mem_poke_qword(m, 8, 16)
+  mem_poke_qword(m, 16, rt_hmap_slots_new(16))
+  mem_poke_qword(m, 24, 0)
+  return m
+end
+
+# The slot holding `key`, or 0.
+make a function called rt_hmap_slot takes m, key returns slot
+  let h = rt_str_hash(key)
+  let cap = mem_peek_qword(m, 8)
+  let slots = mem_peek_qword(m, 16)
+  let i = h band (cap - 1)
+  let probes = 0
+  while probes < cap do
+    let s = slots + i * 24
+    let k = mem_peek_qword(s, 0)
+    if k == 0 then
+      return 0
+    end
+    if (k != 1) and (mem_peek_qword(s, 16) == h) then
+      if rt_str_eq(k, key) then
+        return s
+      end
+    end
+    let i = (i + 1) band (cap - 1)
+    let probes = probes + 1
+  end
+  return 0
+end
+
+make a function called rt_hmap_get takes m, key returns value
+  let s = rt_hmap_slot(m, key)
+  if s == 0 then
+    return 0
+  end
+  return mem_peek_qword(s, 8)
+end
+
+# Places an entry in the first empty slot of its probe sequence; the key
+# reference is the caller's to have taken.
+make a function called rt_hmap_place takes slots, cap, key, value, h returns slot
+  let i = h band (cap - 1)
+  while mem_peek_qword(slots, i * 24) != 0 do
+    let i = (i + 1) band (cap - 1)
+  end
+  let s = slots + i * 24
+  mem_poke_qword(s, 0, key)
+  mem_poke_qword(s, 8, value)
+  mem_poke_qword(s, 16, h)
+  return s
+end
+
+# Rebuilds the slots without deleted entries, doubling cap when more than
+# half of it would be live.
+make a function called rt_hmap_rehash takes m returns done
+  let cap = mem_peek_qword(m, 8)
+  let slots = mem_peek_qword(m, 16)
+  let live = mem_peek_qword(m, 24)
+  let new_cap = cap
+  if (live + 1) * 2 > cap then
+    let new_cap = cap * 2
+  end
+  let new_slots = rt_hmap_slots_new(new_cap)
+  let i = 0
+  while i < cap do
+    let s = slots + i * 24
+    let k = mem_peek_qword(s, 0)
+    if k > 1 then
+      rt_hmap_place(new_slots, new_cap, k, mem_peek_qword(s, 8), mem_peek_qword(s, 16))
     end
     let i = i + 1
   end
-  return 0 - 1
+  bm_rc_dec(slots, cap * 24)
+  mem_poke_qword(m, 0, live)
+  mem_poke_qword(m, 8, new_cap)
+  mem_poke_qword(m, 16, new_slots)
+  return true
+end
+
+# Adds a key the table does not hold, taking its own references to the key
+# and the value; returns its slot.
+make a function called rt_hmap_insert takes m, key, value returns slot
+  if (mem_peek_qword(m, 0) + 1) * 4 > mem_peek_qword(m, 8) * 3 then
+    rt_hmap_rehash(m)
+  end
+  rt_rc_inc_if_refcounted(key)
+  rt_rc_inc_if_refcounted(value)
+  let s = rt_hmap_place(mem_peek_qword(m, 16), mem_peek_qword(m, 8), key, value, rt_str_hash(key))
+  mem_poke_qword(m, 0, mem_peek_qword(m, 0) + 1)
+  mem_poke_qword(m, 24, mem_peek_qword(m, 24) + 1)
+  return s
+end
+
+make a function called rt_hmap_set takes m, key, value returns done
+  let s = rt_hmap_slot(m, key)
+  if s == 0 then
+    rt_hmap_insert(m, key, value)
+    return true
+  end
+  let old = mem_peek_qword(s, 8)
+  mem_poke_qword(s, 8, rt_keep(value))
+  rt_rc_dec_if_refcounted(old)
+  return true
+end
+
+# Removes `key`, returning whether it was there. The value is the
+# caller's to release.
+make a function called rt_hmap_delete takes m, key returns found
+  let s = rt_hmap_slot(m, key)
+  if s == 0 then
+    return false
+  end
+  let k = mem_peek_qword(s, 0)
+  mem_poke_qword(s, 0, 1)
+  mem_poke_qword(s, 8, 0)
+  mem_poke_qword(m, 24, mem_peek_qword(m, 24) - 1)
+  rt_rc_dec_if_refcounted(k)
+  return true
+end
+
+# Frees a table, releasing its keys and (tagged, refcounted) values.
+make a function called rt_hmap_free takes m returns done
+  let cap = mem_peek_qword(m, 8)
+  let slots = mem_peek_qword(m, 16)
+  let i = 0
+  while i < cap do
+    let k = mem_peek_qword(slots, i * 24)
+    if k > 1 then
+      rt_rc_dec_if_refcounted(mem_peek_qword(slots, i * 24 + 8))
+      rt_rc_dec_if_refcounted(k)
+    end
+    let i = i + 1
+  end
+  bm_rc_dec(slots, cap * 24)
+  bm_rc_dec(m, 32)
+  return true
+end
+
+# The key table of `store`, or 0 when it has none and `create` is false.
+# Callers hold rt_vars_lock.
+make a function called rt_ns_store takes store, create returns ns
+  let table_addr = mem_vars_table_addr()
+  let table = mem_peek_qword(table_addr, 0)
+  if table == 0 then
+    if not create then
+      return 0
+    end
+    let table = rt_hmap_new()
+    mem_poke_qword(table_addr, 0, table)
+  end
+  let s = rt_hmap_slot(table, store)
+  if s != 0 then
+    return mem_peek_qword(s, 8)
+  end
+  if not create then
+    return 0
+  end
+  let ns = rt_hmap_new()
+  rt_hmap_insert(table, store, ns)
+  return ns
 end
 
 # GitHub #223: same leak shape as vec_new/vec_push (see their own
@@ -1570,49 +2096,7 @@ end
 # reference, never a premature free.
 make a function called rt_ns_set takes store, key, value returns done
   rt_vars_lock()
-  let table_addr = mem_vars_table_addr()
-  let table = mem_peek_qword(table_addr, 0)
-  if table == 0 then
-    let table = rt_list_new(0)
-    mem_poke_qword(table_addr, 0, table)
-  end
-  let ns_idx = rt_ns_find(table, store)
-  if ns_idx < 0 then
-    let keys = rt_list_new(0)
-    let vals = rt_list_new(0)
-    let ns = rt_list_new(3)
-    rt_list_set(ns, 0, store)
-    rt_list_set(ns, 1, keys)
-    rt_list_set(ns, 2, vals)
-    let old_table = table
-    let table = rt_list_push(table, ns)
-    mem_poke_qword(table_addr, 0, table)
-    rt_rc_dec_if_refcounted(old_table)
-    let ns_idx = rt_list_len(table) - 1
-  end
-  let ns = rt_list_get(table, ns_idx)
-  let keys = rt_list_get(ns, 1)
-  let vals = rt_list_get(ns, 2)
-  let n = rt_list_len(keys)
-  let i = 0
-  while i < n do
-    if rt_str_eq(rt_list_get(keys, i), key) then
-      let old_val = rt_list_get(vals, i)
-      rt_rc_inc_if_refcounted(value)
-      rt_list_set(vals, i, value)
-      rt_rc_dec_if_refcounted(old_val)
-      rt_vars_unlock()
-      return true
-    end
-    let i = i + 1
-  end
-  rt_rc_inc_if_refcounted(value)
-  let new_keys = rt_list_push(keys, key)
-  let new_vals = rt_list_push(vals, value)
-  rt_list_set(ns, 1, new_keys)
-  rt_rc_dec_if_refcounted(keys)
-  rt_list_set(ns, 2, new_vals)
-  rt_rc_dec_if_refcounted(vals)
+  rt_hmap_set(rt_ns_store(store, true), key, value)
   rt_vars_unlock()
   return true
 end
@@ -1632,50 +2116,16 @@ end
 # refcounting.md Phase 4c) when the list dies.
 make a function called rt_ns_push takes store, key, value returns done
   rt_vars_lock()
-  let table_addr = mem_vars_table_addr()
-  let table = mem_peek_qword(table_addr, 0)
-  if table == 0 then
-    let table = rt_list_new(0)
-    mem_poke_qword(table_addr, 0, table)
+  let ns = rt_ns_store(store, true)
+  let s = rt_hmap_slot(ns, key)
+  if s == 0 then
+    rt_hmap_insert(ns, key, rt_list_push(rt_list_new(0), value))
+    rt_vars_unlock()
+    return true
   end
-  let ns_idx = rt_ns_find(table, store)
-  if ns_idx < 0 then
-    let keys = rt_list_new(0)
-    let vals = rt_list_new(0)
-    let ns = rt_list_new(3)
-    rt_list_set(ns, 0, store)
-    rt_list_set(ns, 1, keys)
-    rt_list_set(ns, 2, vals)
-    let old_table = table
-    let table = rt_list_push(table, ns)
-    mem_poke_qword(table_addr, 0, table)
-    rt_rc_dec_if_refcounted(old_table)
-    let ns_idx = rt_list_len(table) - 1
-  end
-  let ns = rt_list_get(table, ns_idx)
-  let keys = rt_list_get(ns, 1)
-  let vals = rt_list_get(ns, 2)
-  let n = rt_list_len(keys)
-  let i = 0
-  while i < n do
-    if rt_str_eq(rt_list_get(keys, i), key) then
-      rt_rc_inc_if_refcounted(value)
-      let old_inner = rt_list_get(vals, i)
-      let new_inner = rt_list_push(old_inner, value)
-      rt_list_set(vals, i, new_inner)
-      rt_rc_dec_if_refcounted(old_inner)
-      rt_vars_unlock()
-      return true
-    end
-    let i = i + 1
-  end
-  rt_rc_inc_if_refcounted(value)
-  let new_keys = rt_list_push(keys, key)
-  let new_vals = rt_list_push(vals, rt_list_push(rt_list_new(0), value))
-  rt_list_set(ns, 1, new_keys)
-  rt_rc_dec_if_refcounted(keys)
-  rt_list_set(ns, 2, new_vals)
-  rt_rc_dec_if_refcounted(vals)
+  let old_inner = mem_peek_qword(s, 8)
+  mem_poke_qword(s, 8, rt_list_push(old_inner, value))
+  rt_rc_dec_if_refcounted(old_inner)
   rt_vars_unlock()
   return true
 end
@@ -1684,31 +2134,14 @@ end
 # convention (documented below on `get`), not Rust's Unit/nil.
 make a function called rt_ns_get takes store, key returns value
   rt_vars_lock()
-  let table = mem_peek_qword(mem_vars_table_addr(), 0)
-  if table == 0 then
+  let ns = rt_ns_store(store, false)
+  if ns == 0 then
     rt_vars_unlock()
     return 0
   end
-  let ns_idx = rt_ns_find(table, store)
-  if ns_idx < 0 then
-    rt_vars_unlock()
-    return 0
-  end
-  let ns = rt_list_get(table, ns_idx)
-  let keys = rt_list_get(ns, 1)
-  let vals = rt_list_get(ns, 2)
-  let n = rt_list_len(keys)
-  let i = 0
-  while i < n do
-    if rt_str_eq(rt_list_get(keys, i), key) then
-      let result = rt_list_get(vals, i)
-      rt_vars_unlock()
-      return result
-    end
-    let i = i + 1
-  end
+  let result = rt_hmap_get(ns, key)
   rt_vars_unlock()
-  return 0
+  return result
 end
 
 # The bundled compiler source's OWN pre-existing usage (checked every call
@@ -1725,8 +2158,8 @@ end
 # method result the real interpreter's own host_get/builtin_primitive_
 # method already gives, instead of falling into rt_ns_get's ambient-
 # namespace lookup with a non-string `store` (see get's own header for
-# the real bug this fixes: `rt_ns_find` calls `rt_str_eq` against
-# whatever `v` is once any OTHER namespace already exists, and a plain
+# the real bug this fixes: the store lookup hashes and compares
+# whatever `v` is as a string, and a plain
 # int/bigint/etc there is not a valid string pointer -- a genuine
 # segfault, not just a wrong "0" result, confirmed via a minimal
 # repro: `set_var("x", 0)` anywhere earlier in the same program, then
@@ -1751,6 +2184,12 @@ make a function called rt_to_display_string takes v returns s
     return rt_list_to_display_string(v)
   elif kind == "bool" then
     return rt_bool_to_string(v)
+  elif kind == "bool_array" then
+    let sb = sb_new()
+    sb_push(sb, "<bool_array len=")
+    sb_push(sb, rt_int_to_str(bool_array_len(v)))
+    sb_push(sb, ">")
+    return sb_str(sb)
   elif kind == "unit" then
     return ""
   end
@@ -1771,10 +2210,8 @@ make a function called get takes store, key returns value
   # builtin_primitive_method, which returns Unit for any other key). Before
   # this fix EVERY receiver went through rt_ns_get regardless of type, so
   # `(some int/bigint/...).to_s` passed a non-string `store` into
-  # rt_ns_find, which calls rt_str_eq against it as soon as any OTHER
-  # namespace already existed -- a genuine segfault (a plain int is not a
-  # valid string pointer), not just the wrong "0" it silently returned
-  # when no other namespace existed yet to trigger that comparison.
+  # the store lookup, which reads it as a string -- a genuine segfault (a
+  # plain int is not a valid string pointer).
   if type_of(store) == "string" then
     return rt_ns_get(store, key)
   end
@@ -1840,10 +2277,14 @@ end
 # list if `name` was never registered (matches the real host's own
 # "unregistered class -> zero defaults, no methods" fallback, not an
 # error).
+# The class's [name, field_defaults, methods] entry (borrowed), or 0. A miss
+# used to return a fresh [], so the result's ownership depended on whether
+# the class existed and no caller could release it: one leaked list per
+# new() or send() on an unregistered class such as "Dict".
 make a function called class_def_lookup takes name returns entry
   let table = mem_peek_qword(mem_classes_table_addr(), 0)
   if table == 0 then
-    return []
+    return 0
   end
   let n = rt_list_len(table)
   let i = 0
@@ -1853,7 +2294,7 @@ make a function called class_def_lookup takes name returns entry
     end
     let i = i + 1
   end
-  return []
+  return 0
 end
 
 # Resolves `method` on `class` (single-class only, per this file's own
@@ -1861,7 +2302,7 @@ end
 # closure value, or 0 if unregistered/not found.
 make a function called class_method_lookup takes class, method returns closure_or_zero
   let entry = class_def_lookup(class)
-  if rt_list_len(entry) == 0 then
+  if entry == 0 then
     return 0
   end
   let methods = rt_list_get(entry, 2)
@@ -1890,7 +2331,7 @@ end
 # shadows it directly, same convention as get/set_var above.
 make a function called new takes class, name returns tagged_name
   let entry = class_def_lookup(class)
-  if rt_list_len(entry) > 0 then
+  if entry != 0 then
     let field_defaults = rt_list_get(entry, 1)
     let n = rt_list_len(field_defaults)
     let i = 0
@@ -1901,7 +2342,7 @@ make a function called new takes class, name returns tagged_name
     end
   end
   rt_ns_set(name, "type", class)
-  return name
+  return rt_keep(name)
 end
 
 # send(recv, method, arg1, ...) is variadic (CallHost, real codegen-level
@@ -1940,6 +2381,23 @@ make a function called rt_send_prepare takes recv, method, rest_args returns clo
   end
   let class = rt_ns_get(recv, "type")
   return class_method_lookup(class, method)
+end
+
+# A send site's entry point (x64_callhost_asm's "send" case). `arr` holds
+# the call's argc values (recv, method, then the rest). The rest list
+# takes its own reference to each element and is released before
+# returning: rt_send_prepare keeps nothing of it beyond what rt_ns_set /
+# rt_ns_push take for themselves. The generated code built that list
+# itself and never released it, and allocated `arr` raw on every call.
+make a function called rt_send_prepare_arr takes arr, argc returns closure_or_zero
+  let k = argc - 2
+  let rest = rt_list_new(k)
+  let i = 0
+  while i < k do
+    rt_list_set(rest, i, mem_peek_qword(arr, (2 + i) * 8))
+    let i = i + 1
+  end
+  return rt_send_prepare(mem_peek_qword(arr, 0), mem_peek_qword(arr, 8), rest)
 end
 
 # read_file/write_file/file_exists: thin shadows over the rt_* wrappers
@@ -2045,50 +2503,74 @@ end
 # here, that's only relevant to `pat --ir-run`'s own wrapper, not a
 # standalone --x64-compiled .exe. The ONE genuinely new native
 # primitive this needed is os_get_command_line (codegen_x64.patlang,
-# wraps GetCommandLineA) -- everything else here, quote-aware
-# tokenization, is ordinary PatLang. Basic double-quote support only
-# (a quoted segment's internal spaces don't split it, quotes
-# themselves stripped) -- same "sufficient for ordinary paths/flags,
-# doesn't handle an embedded escaped quote" scope limit
-# rt_dquote_str's own header already names for the exec_capture side
-# of this identical problem.
+# wraps GetCommandLineA) -- everything else here, the tokenizing, is
+# ordinary PatLang, by the rules the MSVC runtime and Rust's std use:
+# whitespace outside quotes ends an argument; a quote toggles quoting;
+# "" inside quotes is a literal quote; 2n backslashes then a quote give
+# n backslashes and the quote acts, 2n+1 give n and a literal quote;
+# other backslashes are literal. argv[0] is only quote-delimited.
 make a function called argv returns args
-  let cmdline = os_get_command_line() bor rt_string_tag()
+  let cmdline = rt_string_adopt(os_get_command_line())
   let len = rt_str_len(cmdline)
-  let tokens = []
   let i = 0
+  let inq = false
+  while (i < len) and (inq or (not rt_is_space(char_code(cmdline, i)))) do
+    if char_code(cmdline, i) == 34 then
+      let inq = not inq
+    end
+    let i = i + 1
+  end
+  let out = []
   while i < len do
     while (i < len) and (rt_is_space(char_code(cmdline, i))) do
       let i = i + 1
     end
     if i < len then
-      if char_code(cmdline, i) == 34 then
-        let i = i + 1
-        let start = i
-        while (i < len) and (char_code(cmdline, i) != 34) do
+      let b = sb_new()
+      let inq = false
+      let going = true
+      while going and (i < len) do
+        let c = char_code(cmdline, i)
+        if (not inq) and rt_is_space(c) then
+          let going = false
+        elif c == 92 then
+          let nb = 0
+          while ((i + nb) < len) and (char_code(cmdline, i + nb) == 92) do
+            let nb = nb + 1
+          end
+          let quote_follows = false
+          if (i + nb) < len then
+            let quote_follows = char_code(cmdline, i + nb) == 34
+          end
+          let keep = nb
+          if quote_follows then
+            let keep = nb shr 1
+          end
+          let m = 0
+          while m < keep do
+            sb_push(b, chr(92))
+            let m = m + 1
+          end
+          let i = i + nb
+          if quote_follows and ((nb band 1) == 1) then
+            sb_push(b, chr(34))
+            let i = i + 1
+          end
+        elif c == 34 then
+          if inq and ((i + 1) < len) and (char_code(cmdline, i + 1) == 34) then
+            sb_push(b, chr(34))
+            let i = i + 2
+          else
+            let inq = not inq
+            let i = i + 1
+          end
+        else
+          sb_push(b, substr(cmdline, i, 1))
           let i = i + 1
         end
-        let tok = substr(cmdline, start, i - start)
-        let tokens = list_push(tokens, tok)
-        if i < len then
-          let i = i + 1
-        end
-      else
-        let start = i
-        while (i < len) and (not rt_is_space(char_code(cmdline, i))) do
-          let i = i + 1
-        end
-        let tok = substr(cmdline, start, i - start)
-        let tokens = list_push(tokens, tok)
       end
+      let out = list_push(out, sb_str(b))
     end
-  end
-  let out = []
-  let n = list_len(tokens)
-  let j = 1
-  while j < n do
-    let out = list_push(out, tokens[j])
-    let j = j + 1
   end
   return out
 end
@@ -2122,7 +2604,7 @@ end
 # sc_substr(handle, start, count): the characters substr would return, read
 # from a str_intern handle (x64 strings are byte-indexed, like its sc_code).
 make a function called sc_substr takes handle, start, count returns s
-  return substr(handle bor rt_string_tag(), start, count)
+  return substr(handle, start, count)
 end
 
 # sed(cmd, input): main.rs's ir_host_sed -- a LITERAL (not regex) substitution,
@@ -2313,29 +2795,13 @@ end
 # table alongside rt_ns_set/get/push -- same lock, same reasoning.
 make a function called object_delete takes name returns done
   rt_vars_lock()
-  let table_addr = mem_vars_table_addr()
-  let table = mem_peek_qword(table_addr, 0)
-  if table == 0 then
-    rt_vars_unlock()
-    return unit
-  end
-  let idx = rt_ns_find(table, name)
-  if idx < 0 then
-    rt_vars_unlock()
-    return unit
-  end
-  let n = rt_list_len(table)
-  let out = rt_list_new(n - 1)
-  let i = 0
-  let j = 0
-  while i < n do
-    if i != idx then
-      rt_list_set(out, j, rt_list_get(table, i))
-      let j = j + 1
+  let table = mem_peek_qword(mem_vars_table_addr(), 0)
+  if table != 0 then
+    let ns = rt_hmap_get(table, name)
+    if rt_hmap_delete(table, name) then
+      rt_hmap_free(ns)
     end
-    let i = i + 1
   end
-  mem_poke_qword(table_addr, 0, out)
   rt_vars_unlock()
   return unit
 end
@@ -2778,7 +3244,10 @@ end
 make a function called rt_list_buf_rc_dec takes buf, len returns done
   let cap = mem_peek_qword(buf, 0)
   let n = rt_atomic_fetch_add(buf - 8, 0 - 1) - 1
-  if n <= 0 then
+  if n < 0 then
+    bm_rc_underflow()
+  end
+  if n == 0 then
     if len > 0 then
       let j = 0
       while j < len do
@@ -2786,7 +3255,7 @@ make a function called rt_list_buf_rc_dec takes buf, len returns done
         let j = j + 1
       end
     end
-    bm_freelist_push(bm_align8(16 + cap * 8), buf - 8)
+    bm_freelist_push(bm_size_class(16 + cap * 8), buf - 8)
   end
   return true
 end
@@ -2801,6 +3270,30 @@ end
 # never called directly from ordinary PatLang source.
 make a function called rt_list_rc_dec takes l returns done
   rt_list_node_rc_dec(l band rt_payload_mask())
+  return true
+end
+
+# Releases a list without releasing its elements: a block-model call's
+# [value, final_globals] return pair, whose caller has taken the value
+# (one reference, handed over by the callee) and the globals (which the
+# pair never counted), so only the pair's own node and buffer are left.
+make a function called rt_list_release_shell takes l returns done
+  let family_mask = 17293822569102704640
+  if (l band family_mask) != rt_list_tag() then
+    return true
+  end
+  let node = l band rt_payload_mask()
+  if not rt_rc_payload_in_heap(node) then
+    return true
+  end
+  if mem_peek_qword(node, 8) != 0 then
+    rt_list_node_rc_dec(node)
+    return true
+  end
+  let buf = mem_peek_qword(node, 16)
+  if bm_rc_dec(node, rt_list_node_payload_size()) == 0 then
+    rt_list_buf_rc_dec(buf, 0)
+  end
   return true
 end
 
@@ -2856,13 +3349,135 @@ end
 make a function called rt_rc_inc_if_refcounted takes v returns done
   let family_mask = 17293822569102704640
   let family = v band family_mask
-  if (family == rt_string_tag()) or (family == rt_list_tag()) then
+  if (family == rt_string_tag()) or (family == rt_list_tag()) or (family == rt_bool_array_tag()) or (rt_rc_numeric_payload(v, family) > 0) then
     let addr = v band rt_payload_mask()
     if rt_rc_payload_in_heap(addr) then
       bm_rc_inc(addr)
     end
+  elif rt_is_cell(v, family) then
+    bm_rc_inc(v band rt_payload_mask())
   end
   return true
+end
+
+# A Rational ([num][den], 16 bytes, rt_rational_new) and a boxed Float (8
+# bytes, rt_box_float) are counted like a string or a list: releasing a list
+# releases the numbers in it, which arithmetic otherwise left behind forever.
+# Their payload size, or 0 for anything else; only the numeric family is
+# asked for its exact kind.
+make a function called rt_rc_numeric_payload takes v, family returns size
+  if family != (1 shl 60) then
+    return 0
+  end
+  let code = x64_family_code(v)
+  if code == 6 then
+    return 16 + mem_peek_qword(v band rt_payload_mask(), 8) * 8
+  end
+  if (code == 7) or (code == 8) or (code == 9) then
+    return 16
+  end
+  if code == 14 then
+    return 8
+  end
+  return 0
+end
+
+# Releases a counted number's block (size from rt_rc_numeric_payload). A
+# Rational, Complex or Interval holds a reference to each of its two parts,
+# released with it: they are read before the block goes on the free list,
+# which reuses its first word.
+make a function called rt_numeric_rc_dec takes v, addr, size returns done
+  let n = rt_atomic_fetch_add(addr - 8, 0 - 1) - 1
+  if n < 0 then
+    bm_rc_underflow()
+  end
+  if n == 0 then
+    let code = x64_family_code(v)
+    if (code == 7) or (code == 8) or (code == 9) then
+      let first = mem_peek_qword(addr, 0)
+      let second = mem_peek_qword(addr, 8)
+      bm_freelist_push(bm_size_class(size), addr - 8)
+      rt_rc_dec_if_refcounted(first)
+      rt_rc_dec_if_refcounted(second)
+    else
+      bm_freelist_push(bm_size_class(size), addr - 8)
+    end
+  end
+  return true
+end
+
+# ---- counted cells ----
+#
+# A mutable runtime value with a stable identity -- a string builder, a vec,
+# an rt_object_new object (and Box objects, docs/plans/general-refcounting.md
+# 6h) -- is a counted block (bm_alloc) tagged as an object:
+# [type_id][field_count][fields...]. The runtime's own cells have negative
+# type ids; rt_object_new's objects use type ids from 0 up. A cell holds a
+# reference to each field (a string builder's are raw: its length, capacity
+# and buffer). rt_rc_inc_if_refcounted/
+# rt_rc_dec_if_refcounted count cells like strings and lists, so the
+# compiler's ownership passes release them with no cell-specific code.
+make a function called rt_cell_sb_type returns t
+  return 0 - 2
+end
+
+make a function called rt_cell_vec_type returns t
+  return 0 - 3
+end
+
+make a function called rt_cell_new takes type_id, nfields returns addr
+  let c = bm_alloc(16 + nfields * 8)
+  mem_poke_qword(c, 0, type_id)
+  mem_poke_qword(c, 8, nfields)
+  return c
+end
+
+make a function called rt_is_cell takes v, family returns yes
+  if family != rt_object_tag() then
+    return false
+  end
+  return rt_rc_payload_in_heap(v band rt_payload_mask())
+end
+
+# Releases one reference to a cell; at zero, what the cell holds goes too.
+# The fields are read first: bm_rc_dec reuses the block's first word.
+# The last release frees the fields before the block goes on the free list,
+# which reuses its first word.
+make a function called rt_cell_rc_dec takes c returns done
+  let n = rt_atomic_fetch_add(c - 8, 0 - 1) - 1
+  if n < 0 then
+    bm_rc_underflow()
+  end
+  if n > 0 then
+    return true
+  end
+  let type_id = mem_peek_qword(c, 0)
+  let nfields = mem_peek_qword(c, 8)
+  if type_id == rt_cell_sb_type() then
+    bm_rc_dec(mem_peek_qword(c, 32), mem_peek_qword(c, 24))
+  else
+    let k = 0
+    while k < nfields do
+      rt_rc_dec_if_refcounted(mem_peek_qword(c, 16 + k * 8))
+      let k = k + 1
+    end
+  end
+  bm_freelist_push(bm_size_class(16 + nfields * 8), c - 8)
+  return true
+end
+
+# v itself, after taking a reference to it: what the ownership passes put
+# before a function returns a borrowed value (a real call, so a raw float
+# argument is boxed first), and what generated code calls by name. The
+# runtime's own code uses the rt_keep intrinsic (codegen_x64) instead where
+# memory is to own a value it stores raw: `mem_poke_qword(addr, 0,
+# rt_keep(x))`. Its partner rt_fresh(v) marks a value just made as already
+# the caller's: a constructor returns rt_fresh(addr bor rt_string_tag()),
+# which would otherwise be taken for a borrowed word and retained a second
+# time (docs/plans/general-refcounting.md, Phase 7).
+make a function called rt_rc_retain takes v returns r
+  rt_rc_inc_if_refcounted(v)
+  return v
 end
 
 make a function called rt_rc_dec_if_refcounted takes v returns done
@@ -2876,23 +3491,56 @@ make a function called rt_rc_dec_if_refcounted takes v returns done
     if rt_rc_payload_in_heap(v band rt_payload_mask()) then
       rt_list_rc_dec(v)
     end
+  elif rt_is_cell(v, family) then
+    rt_cell_rc_dec(v band rt_payload_mask())
+  elif family == rt_bool_array_tag() then
+    let addr = v band rt_payload_mask()
+    if rt_rc_payload_in_heap(addr) then
+      bm_rc_dec(addr, 16 + mem_peek_qword(addr, 8) * 8)
+    end
+  else
+    let size = rt_rc_numeric_payload(v, family)
+    if size > 0 then
+      let addr = v band rt_payload_mask()
+      if rt_rc_payload_in_heap(addr) then
+        rt_numeric_rc_dec(v, addr, size)
+      end
+    end
   end
+  return true
+end
+
+# A reassigned local's old value, released once the new one is stored
+# (native_codegen.patlang's family ownership pass): skipped when the two
+# are the very same object, which releasing would free under the new
+# owner.
+# The old value of a reassigned owned local, released after the Store. Every
+# producer that makes a value owned hands over a reference of its own (list_set
+# too, when it gives back the same list), so the old reference goes even when
+# the new value is the same word -- skipping it then kept that list forever.
+make a function called rt_rc_release_old takes old, new returns done
+  rt_rc_dec_if_refcounted(old)
   return true
 end
 
 # A list of n slots: node and buffer as two SEPARATE bm_alloc blocks
 # (see this section's own header for why they can't be one combined
 # allocation under this refcounting scheme the way the old single-block
-# layout used to be). The elements are unset; callers fill a fresh list
-# with rt_list_set before sharing it.
+# layout used to be). The elements start as 0; callers fill a fresh list
+# with rt_list_set before sharing it, which releases what it replaces.
 make a function called rt_list_new takes n returns tagged
   let node = bm_alloc(rt_list_node_payload_size())
   let buf = bm_alloc(16 + n * 8)
   mem_poke_qword(buf, 0, n)
+  let k = 0
+  while k < n do
+    mem_poke_qword(buf, 16 + k * 8, 0)
+    let k = k + 1
+  end
   mem_poke_qword(node, 0, n)
   mem_poke_qword(node, 8, 0)
   mem_poke_qword(node, 16, buf)
-  return node bor rt_list_tag()
+  return rt_fresh(node bor rt_list_tag())
 end
 
 # GitHub #190: list_len(v) on anything that isn't genuinely a String or List
@@ -2987,7 +3635,7 @@ end
 # anything for an out-of-range index at all).
 make a function called rt_list_get takes l, i0 returns value
   let i = i0
-  if (((i0 shr 60) band 15) != 0) and (((i0 shr 60) band 15) != 15) then
+  if x64_family_code(i0) != 0 then
     let i = rt_index_int(i0)
   end
   let family_mask = 17293822569102704640
@@ -2997,16 +3645,14 @@ make a function called rt_list_get takes l, i0 returns value
     let slen = mem_peek_qword(addr, 0)
     if (i >= 0) and (i < slen) then
       let ch = mem_peek_byte(addr, 8 + i)
-      let out = rt_heap_alloc(9)
-      mem_poke_qword(out, 0, 1)
+      let out = rt_string_new(1)
       mem_poke_byte(out, 8, ch)
-      return out bor rt_string_tag()
+      return rt_fresh(out bor rt_string_tag())
     end
     # Out of range: an empty string, matching the interpreter's own
     # `s[i]` behaviour for any i outside [0, len).
-    let out = rt_heap_alloc(8)
-    mem_poke_qword(out, 0, 0)
-    return out bor rt_string_tag()
+    let out = rt_string_new(0)
+    return rt_fresh(out bor rt_string_tag())
   end
   if family == rt_list_tag() then
     let node = l band rt_payload_mask()
@@ -3036,9 +3682,17 @@ end
 
 # In-place write into a FRESH list's buffer (rt_list_new followed by filling
 # it). Not for a list that may be shared: use list_set (rt_list_set_functional).
-make a function called rt_list_set takes l, i, v returns done
-  let node = l band rt_payload_mask()
-  mem_poke_qword(mem_peek_qword(node, 16), 16 + i * 8, v)
+# The slot takes its own reference to `v` and releases what it held.
+make a function called rt_list_set takes l, i0, v returns done
+  let i = i0
+  if x64_family_code(i0) != 0 then
+    let i = rt_index_int(i0)
+  end
+  let buf = mem_peek_qword(l band rt_payload_mask(), 16)
+  let old = mem_peek_qword(buf, 16 + i * 8)
+  rt_rc_inc_if_refcounted(v)
+  mem_poke_qword(buf, 16 + i * 8, v)
+  rt_rc_dec_if_refcounted(old)
   return true
 end
 
@@ -3076,7 +3730,8 @@ make a function called rt_list_materialize takes node, cap returns fresh
     let k = k + 1
   end
   if depth > 0 then
-    let path = rt_heap_alloc(depth * 8)
+    # scratch: the versions from node to the newest, freed below
+    let path = bm_alloc(depth * 8)
     let cur = node
     let j = 0
     while j < depth do
@@ -3099,6 +3754,7 @@ make a function called rt_list_materialize takes node, cap returns fresh
       end
       let j = j - 1
     end
+    bm_rc_dec(path, depth * 8)
   end
   return rt_list_node_new(n0, buf)
 end
@@ -3117,11 +3773,11 @@ end
 # here (rt_list_node_rc_dec), in BOTH the in-place and doubling paths,
 # or its one reference to its own buffer leaks forever.
 #
-# docs/plans/general-refcounting.md, Phase 4c: `v` itself is stored
-# into the buffer WITHOUT an increment here -- same reasoning as
-# rt_list_set_functional's own header comment. Each existing element
-# `ev` copied into a NEW buffer (the doubling path's copy loop) DOES
-# get incremented, since that genuinely creates a second buffer-level
+# docs/plans/general-refcounting.md, Phase 7: the new slot takes its own
+# reference to `v`, which the caller only lends (it used to be stored
+# without one, and the compiler added it for a named element). Each
+# existing element `ev` copied into a NEW buffer (the doubling path's copy
+# loop) is incremented too, since that creates a second buffer-level
 # reference to an already-established value.
 make a function called rt_list_push takes l, v returns tagged
   let node = l band rt_payload_mask()
@@ -3141,8 +3797,9 @@ make a function called rt_list_push takes l, v returns tagged
     else
       rt_list_node_rc_dec(node)
     end
+    rt_rc_inc_if_refcounted(v)
     mem_poke_qword(buf, 16 + n * 8, v)
-    return fresh bor rt_list_tag()
+    return rt_fresh(fresh bor rt_list_tag())
   end
   let new_cap = cap * 2
   if new_cap < 1 then
@@ -3163,11 +3820,12 @@ make a function called rt_list_push takes l, v returns tagged
     rt_rc_inc_if_refcounted(ev)
     let i = i + 1
   end
+  rt_rc_inc_if_refcounted(v)
   mem_poke_qword(new_buf, 16 + n * 8, v)
   if owned == true then
     rt_list_node_rc_dec(node)
   end
-  return rt_list_node_new(n + 1, new_buf) bor rt_list_tag()
+  return rt_fresh(rt_list_node_new(n + 1, new_buf) bor rt_list_tag())
 end
 
 # list_set(list, i, item) -> a list with element i replaced, as a value: no
@@ -3179,16 +3837,11 @@ end
 # materialize's just-finished copy; the live branch's own `old` is
 # simultaneously gaining a NEW reference via rt_list_retire_set's own
 # `val` handling, so decrementing it HERE is what makes that a transfer
-# rather than a double-count). `v` itself is NOT incremented here: a
-# brand-new element being stored for the first time starts with
-# whatever refcount its own producer gave it (1 for an unnamed temp,
-# matching the single eventual cascade decrement; the compiler-level
-# bm_nc_insert_list_element_incs pass is what adds a second increment
-# when `v` is actually a named, independently-tracked local that will
-# ALSO be decremented at its own scope exit).
+# rather than a double-count). Since Phase 7 the slot takes its own
+# reference to `v`, which the caller only lends.
 make a function called rt_list_set_functional takes l, i0, v returns tagged
   let i = i0
-  if (((i0 shr 60) band 15) != 0) and (((i0 shr 60) band 15) != 15) then
+  if x64_family_code(i0) != 0 then
     let i = rt_index_int(i0)
   end
   let node = l band rt_payload_mask()
@@ -3197,21 +3850,28 @@ make a function called rt_list_set_functional takes l, i0, v returns tagged
     let fresh = rt_list_materialize(node, n)
     let fresh_buf = mem_peek_qword(fresh, 16)
     let displaced = mem_peek_qword(fresh_buf, 16 + i * 8)
+    rt_rc_inc_if_refcounted(v)
     mem_poke_qword(fresh_buf, 16 + i * 8, v)
     rt_rc_dec_if_refcounted(displaced)
-    return fresh bor rt_list_tag()
+    return rt_fresh(fresh bor rt_list_tag())
   end
   let buf = mem_peek_qword(node, 16)
   let old = mem_peek_qword(buf, 16 + i * 8)
+  # Nothing changes, so the same list comes back -- with a reference of its
+  # own, as a new version would have (the retain every value function puts
+  # before returning a borrowed value): the caller owns list_set's result,
+  # and a temporary passed in is released after the call (raytrace's
+  # group_frame freed its own frame when element 7 was already false).
   if old == v then
     return l
   end
   rt_list_buf_rc_inc(buf)
   let fresh = rt_list_node_new(n, buf)
   rt_list_retire_set(node, i, old, fresh)
+  rt_rc_inc_if_refcounted(v)
   mem_poke_qword(buf, 16 + i * 8, v)
   rt_rc_dec_if_refcounted(old)
-  return fresh bor rt_list_tag()
+  return rt_fresh(fresh bor rt_list_tag())
 end
 
 # ---- bool_array (Slice 1, GitHub #45) ----
@@ -3249,10 +3909,10 @@ make a function called bool_array_new takes n returns tagged
   if (n band 63) != 0 then
     let cap_words = cap_words + 1
   end
-  let addr = rt_heap_alloc(16 + cap_words * 8)
+  let addr = bm_alloc(16 + cap_words * 8)
   mem_poke_qword(addr, 0, n)
   mem_poke_qword(addr, 8, cap_words)
-  return addr bor rt_bool_array_tag()
+  return rt_fresh(addr bor rt_bool_array_tag())
 end
 
 make a function called bool_array_len takes arr returns len
@@ -3289,11 +3949,10 @@ end
 # capacity) whenever the pushed bit's own word already exists;
 # reallocates+copies (doubling capacity_words, or growing to exactly
 # fit if doubling still wouldn't cover the new bit) only when it
-# doesn't. Same named, deliberate aliasing tradeoff as rt_list_push
-# (no reference counting in this backend, so in-place growth is only
-# PROBABLY safe against an older alias, not provably so) -- see that
-# function's own header comment for the full reasoning, unchanged
-# here.
+# doesn't. Either way the caller gets a reference of its own: the same
+# array retained, or the new one. A bool array is a counted block
+# (rt_rc_inc_if_refcounted), but growing in place still changes it under
+# any other holder of the same array, unlike rt_list_push.
 make a function called bool_array_push takes arr, v returns tagged
   let addr = arr band rt_payload_mask()
   let n = mem_peek_qword(addr, 0)
@@ -3302,7 +3961,7 @@ make a function called bool_array_push takes arr, v returns tagged
   if needed_word < cap_words then
     mem_poke_qword(addr, 0, n + 1)
     bool_array_set(arr, n, v)
-    return arr
+    return rt_keep(arr)
   end
   let new_cap_words = cap_words * 2
   if new_cap_words < 1 then
@@ -3311,7 +3970,7 @@ make a function called bool_array_push takes arr, v returns tagged
   if new_cap_words <= needed_word then
     let new_cap_words = needed_word + 1
   end
-  let new_addr = rt_heap_alloc(16 + new_cap_words * 8)
+  let new_addr = bm_alloc(16 + new_cap_words * 8)
   mem_poke_qword(new_addr, 0, n + 1)
   mem_poke_qword(new_addr, 8, new_cap_words)
   let i = 0
@@ -3319,7 +3978,7 @@ make a function called bool_array_push takes arr, v returns tagged
     mem_poke_qword(new_addr, 16 + i * 8, mem_peek_qword(addr, 16 + i * 8))
     let i = i + 1
   end
-  let new_tagged = new_addr bor rt_bool_array_tag()
+  let new_tagged = rt_fresh(new_addr bor rt_bool_array_tag())
   bool_array_set(new_tagged, n, v)
   return new_tagged
 end
@@ -3413,7 +4072,7 @@ end
 # List/Number coercions right above it in that function.
 make a function called rt_unit_to_str takes v returns s
   let s = rt_string_new(0)
-  return s bor rt_string_tag()
+  return rt_fresh(s bor rt_string_tag())
 end
 
 make a function called rt_int_to_str takes n returns s
@@ -3425,7 +4084,7 @@ make a function called rt_int_to_str takes n returns s
     mem_poke_byte(s, 8 + i, mem_peek_byte(buf, i))
     let i = i + 1
   end
-  return s bor rt_string_tag()
+  return rt_fresh(s bor rt_string_tag())
 end
 
 # Zero-padded to exactly 9 digits -- for every limb EXCEPT the most
@@ -3440,7 +4099,7 @@ make a function called rt_limb9_to_str takes n returns s
     let v = rt_trunc_div(v, 10)
     let i = i - 1
   end
-  return s bor rt_string_tag()
+  return rt_fresh(s bor rt_string_tag())
 end
 
 # Real bug found here: an earlier draft used list_push/list_len to
@@ -3473,7 +4132,7 @@ make a function called rt_bigint_from_i64 takes n returns tagged
       let t = rt_trunc_div(t, 1000000000)
     end
   end
-  let addr = rt_heap_alloc(16 + n_limbs * 8)
+  let addr = bm_alloc(16 + n_limbs * 8)
   mem_poke_qword(addr, 0, sign)
   mem_poke_qword(addr, 8, n_limbs)
   if v == 0 then
@@ -3487,7 +4146,7 @@ make a function called rt_bigint_from_i64 takes n returns tagged
       let i = i + 1
     end
   end
-  return addr bor rt_bigint_tag()
+  return rt_fresh(addr bor rt_bigint_tag())
 end
 
 # GitHub #40: rt_bigint_from_i64 only ever received a single i64
@@ -3525,7 +4184,7 @@ make a function called rt_bigint_from_decimal_str takes s returns tagged
     let n_limbs = 1
   end
   let first_chunk_len = digit_len - (n_limbs - 1) * 9
-  let addr = rt_heap_alloc(16 + n_limbs * 8)
+  let addr = bm_alloc(16 + n_limbs * 8)
   mem_poke_qword(addr, 8, n_limbs)
   let pos = start
   let val = 0
@@ -3557,7 +4216,7 @@ make a function called rt_bigint_from_decimal_str takes s returns tagged
     end
   end
   mem_poke_qword(addr, 0, sign)
-  return addr bor rt_bigint_tag()
+  return rt_fresh(addr bor rt_bigint_tag())
 end
 
 make a function called rt_bigint_to_string takes tagged returns s
@@ -3615,7 +4274,9 @@ make a function called rt_bigint_mag_cmp takes addr_a, addr_b returns cmp
 end
 
 # |a| + |b| (sign-agnostic), a fresh heap block, sign left as 0 --
-# caller (rt_bigint_add) sets the real sign afterward.
+# caller (rt_bigint_add) sets the real sign afterward. The block holds the
+# longer operand's limb count, and is moved to one a limb longer only for a
+# final carry (rt_bigint_fit's rule).
 make a function called rt_bigint_mag_add takes addr_a, addr_b returns addr
   let na = mem_peek_qword(addr_a, 8)
   let nb = mem_peek_qword(addr_b, 8)
@@ -3623,7 +4284,7 @@ make a function called rt_bigint_mag_add takes addr_a, addr_b returns addr
   if nb > n then
     let n = nb
   end
-  let addr = rt_heap_alloc(16 + (n + 1) * 8)
+  let addr = bm_alloc(16 + n * 8)
   let carry = 0
   let i = 0
   let out_n = 0
@@ -3647,13 +4308,47 @@ make a function called rt_bigint_mag_add takes addr_a, addr_b returns addr
     let out_n = i + 1
     let i = i + 1
   end
-  if carry > 0 then
-    mem_poke_qword(addr, 16 + out_n * 8, carry)
-    let out_n = out_n + 1
-  end
   mem_poke_qword(addr, 0, 0)
   mem_poke_qword(addr, 8, out_n)
+  if carry > 0 then
+    let grown = rt_bigint_resize(addr, n, n + 1)
+    mem_poke_qword(grown, 16 + n * 8, carry)
+    return grown
+  end
   return addr
+end
+
+# A BigInt block's size class is always the one its recorded limb count
+# gives, so releasing it (which knows only that count) returns it to the
+# free list it came from. After a result is trimmed below the limbs it was
+# allocated with, it moves to a block of its own size when the class
+# differs; otherwise it stays. alloc_limbs is what addr was allocated with.
+make a function called rt_bigint_fit takes addr, alloc_limbs returns fitted
+  let n = mem_peek_qword(addr, 8)
+  if bm_size_class(16 + n * 8) == bm_size_class(16 + alloc_limbs * 8) then
+    return addr
+  end
+  return rt_bigint_resize(addr, alloc_limbs, n)
+end
+
+# A copy of addr's sign, count and first min(old_limbs, new_limbs) limbs in a
+# block of new_limbs limbs (the count set to new_limbs); addr, allocated with
+# old_limbs, is freed.
+make a function called rt_bigint_resize takes addr, old_limbs, new_limbs returns out
+  let out = bm_alloc(16 + new_limbs * 8)
+  mem_poke_qword(out, 0, mem_peek_qword(addr, 0))
+  mem_poke_qword(out, 8, new_limbs)
+  let keep = old_limbs
+  if new_limbs < keep then
+    let keep = new_limbs
+  end
+  let i = 0
+  while i < keep do
+    mem_poke_qword(out, 16 + i * 8, mem_peek_qword(addr, 16 + i * 8))
+    let i = i + 1
+  end
+  bm_rc_dec(addr, 16 + old_limbs * 8)
+  return out
 end
 
 # Drop leading (most-significant) zero limbs down to a minimum of 1.
@@ -3681,7 +4376,7 @@ end
 make a function called rt_bigint_mag_sub takes addr_a, addr_b returns addr
   let na = mem_peek_qword(addr_a, 8)
   let nb = mem_peek_qword(addr_b, 8)
-  let addr = rt_heap_alloc(16 + na * 8)
+  let addr = bm_alloc(16 + na * 8)
   let borrow = 0
   let i = 0
   while i < na do
@@ -3702,7 +4397,7 @@ make a function called rt_bigint_mag_sub takes addr_a, addr_b returns addr
   end
   mem_poke_qword(addr, 0, 0)
   mem_poke_qword(addr, 8, na)
-  return rt_bigint_trim(addr)
+  return rt_bigint_fit(rt_bigint_trim(addr), na)
 end
 
 # Real signed BigInt add: same-sign -> magnitude add, keep sign;
@@ -3732,7 +4427,7 @@ make a function called rt_bigint_add takes tagged_a, tagged_b returns tagged
       end
     end
   end
-  return result bor rt_bigint_tag()
+  return rt_fresh(result bor rt_bigint_tag())
 end
 
 # Negation: flips the sign, EXCEPT for a zero-magnitude value, which
@@ -3758,7 +4453,7 @@ make a function called rt_bigint_negate takes tagged returns tagged2
   if sign == 1 then
     let new_sign = 0
   end
-  let addr2 = rt_heap_alloc(16 + count * 8)
+  let addr2 = bm_alloc(16 + count * 8)
   mem_poke_qword(addr2, 0, new_sign)
   mem_poke_qword(addr2, 8, count)
   let i = 0
@@ -3766,7 +4461,7 @@ make a function called rt_bigint_negate takes tagged returns tagged2
     mem_poke_qword(addr2, 16 + i * 8, mem_peek_qword(addr, 16 + i * 8))
     let i = i + 1
   end
-  return addr2 bor rt_bigint_tag()
+  return rt_fresh(addr2 bor rt_bigint_tag())
 end
 
 make a function called rt_bigint_sub takes tagged_a, tagged_b returns tagged
@@ -3781,7 +4476,7 @@ end
 make a function called rt_bigint_mag_mul takes addr_a, addr_b returns addr
   let na = mem_peek_qword(addr_a, 8)
   let nb = mem_peek_qword(addr_b, 8)
-  let addr = rt_heap_alloc(16 + (na + nb) * 8)
+  let addr = bm_alloc(16 + (na + nb) * 8)
   let z = 0
   while z < na + nb do
     mem_poke_qword(addr, 16 + z * 8, 0)
@@ -3814,7 +4509,7 @@ make a function called rt_bigint_mag_mul takes addr_a, addr_b returns addr
   end
   mem_poke_qword(addr, 0, 0)
   mem_poke_qword(addr, 8, na + nb)
-  return rt_bigint_trim(addr)
+  return rt_bigint_fit(rt_bigint_trim(addr), na + nb)
 end
 
 make a function called rt_bigint_mul takes tagged_a, tagged_b returns tagged
@@ -3837,7 +4532,7 @@ make a function called rt_bigint_mul takes tagged_a, tagged_b returns tagged
     end
   end
   mem_poke_qword(mag, 0, result_sign)
-  return mag bor rt_bigint_tag()
+  return rt_fresh(mag bor rt_bigint_tag())
 end
 
 # Full signed compare: -1/0/1. Differing signs resolve immediately;
@@ -3877,7 +4572,7 @@ make a function called rt_bigint_mag_shift takes addr, k returns shifted
     return addr
   end
   let n = mem_peek_qword(addr, 8)
-  let out = rt_heap_alloc(16 + (n + k) * 8)
+  let out = bm_alloc(16 + (n + k) * 8)
   mem_poke_qword(out, 0, 0)
   mem_poke_qword(out, 8, n + k)
   let i = 0
@@ -3907,26 +4602,50 @@ end
 # cleanly since a zero divisor never satisfies the binary search's own
 # invariant). Returns [quotient_addr, remainder_addr], both unsigned
 # magnitudes; the caller applies whatever sign convention it needs.
+#
+# The remainder is a private copy of |a| reduced in place, and every trial
+# product b*m goes into one scratch buffer: allocating a fresh product for
+# each of ~30 trials per limb cost a rational multiply tens of kilobytes,
+# since nothing here is ever freed (raytrace ch26: 7.5 GB in 1500
+# evaluations). The search for each limb also starts from the bounds the
+# remainder's top two limbs give: with T those limbs over b's top limb bt,
+# T/(bt+1) <= q <= T/bt.
 make a function called rt_bigint_mag_divmod takes a_addr, b_addr returns pair
+  # Both halves are new blocks the caller owns: the remainder is never a_addr
+  # itself, whose owner would release it too (and rt_bigint_mod_impl sets the
+  # remainder's sign in place).
   if rt_bigint_mag_cmp(a_addr, b_addr) < 0 then
-    return [(rt_bigint_from_i64(0) band rt_payload_mask()), a_addr]
+    return [rt_bigint_zero_block(), rt_bigint_mag_copy(a_addr)]
   end
   let na = mem_peek_qword(a_addr, 8)
   let nb = mem_peek_qword(b_addr, 8)
   let qn = na - nb + 1
-  let q = rt_heap_alloc(16 + qn * 8)
+  let q = bm_alloc(16 + qn * 8)
   mem_poke_qword(q, 0, 0)
   mem_poke_qword(q, 8, qn)
-  let remainder = a_addr
+  # one spare top limb, so the window at i + nb always exists
+  let rem = bm_alloc(16 + (na + 1) * 8)
+  mem_poke_qword(rem, 0, 0)
+  let k = 0
+  while k < na do
+    mem_poke_qword(rem, 16 + k * 8, mem_peek_qword(a_addr, 16 + k * 8))
+    let k = k + 1
+  end
+  mem_poke_qword(rem, 16 + na * 8, 0)
+  let scratch = bm_alloc(16 + (nb + 1) * 8)
+  let bt = mem_peek_qword(b_addr, 16 + (nb - 1) * 8)
   let i = qn - 1
   while i >= 0 do
-    let shifted = rt_bigint_mag_shift(b_addr, i)
-    let lo = 0
-    let hi = 999999999
+    let t = mem_peek_qword(rem, 16 + (i + nb) * 8) * 1000000000 + mem_peek_qword(rem, 16 + (i + nb - 1) * 8)
+    let lo = rt_trunc_div(t, bt + 1)
+    let hi = rt_trunc_div(t, bt)
+    if hi > 999999999 then
+      let hi = 999999999
+    end
     while lo < hi do
       let mid = lo + rt_trunc_div(hi - lo + 1, 2)
-      let cand = rt_bigint_mag_mul(shifted, rt_bigint_from_i64(mid) band rt_payload_mask())
-      if rt_bigint_mag_cmp(cand, remainder) <= 0 then
+      rt_bigint_mag_mul_small_into(scratch, b_addr, mid)
+      if rt_bigint_mag_cmp_window(scratch, rem, i) <= 0 then
         let lo = mid
       else
         let hi = mid - 1
@@ -3934,12 +4653,99 @@ make a function called rt_bigint_mag_divmod takes a_addr, b_addr returns pair
     end
     mem_poke_qword(q, 16 + i * 8, lo)
     if lo > 0 then
-      let prod = rt_bigint_mag_mul(shifted, rt_bigint_from_i64(lo) band rt_payload_mask())
-      let remainder = rt_bigint_mag_sub(remainder, prod)
+      rt_bigint_mag_mul_small_into(scratch, b_addr, lo)
+      rt_bigint_mag_sub_window(rem, scratch, i)
     end
     let i = i - 1
   end
-  return [rt_bigint_trim(q), remainder]
+  mem_poke_qword(rem, 8, na + 1)
+  bm_rc_dec(scratch, 16 + (nb + 1) * 8)
+  return [rt_bigint_fit(rt_bigint_trim(q), qn), rt_bigint_fit(rt_bigint_trim(rem), na + 1)]
+end
+
+# A counted BigInt block holding 0, untagged (rt_bigint_mag_divmod's halves).
+make a function called rt_bigint_zero_block returns addr
+  let addr = bm_alloc(24)
+  mem_poke_qword(addr, 0, 0)
+  mem_poke_qword(addr, 8, 1)
+  mem_poke_qword(addr, 16, 0)
+  return addr
+end
+
+# A copy of a BigInt block's magnitude, sign 0, untagged.
+make a function called rt_bigint_mag_copy takes src returns addr
+  let n = mem_peek_qword(src, 8)
+  let addr = bm_alloc(16 + n * 8)
+  mem_poke_qword(addr, 0, 0)
+  mem_poke_qword(addr, 8, n)
+  let i = 0
+  while i < n do
+    mem_poke_qword(addr, 16 + i * 8, mem_peek_qword(src, 16 + i * 8))
+    let i = i + 1
+  end
+  return addr
+end
+
+# Releases an untagged BigInt block this code made and did not tag (its size
+# class matches its limb count: rt_bigint_fit).
+make a function called rt_bigint_free_block takes addr returns done
+  bm_rc_dec(addr, 16 + mem_peek_qword(addr, 8) * 8)
+  return true
+end
+
+# dst = |b| * m for 0 <= m < BASE, as nb + 1 limbs (the top one may be 0).
+make a function called rt_bigint_mag_mul_small_into takes dst, b_addr, m returns done
+  let nb = mem_peek_qword(b_addr, 8)
+  let carry = 0
+  let j = 0
+  while j < nb do
+    let p = mem_peek_qword(b_addr, 16 + j * 8) * m + carry
+    let carry = rt_trunc_div(p, 1000000000)
+    mem_poke_qword(dst, 16 + j * 8, p - carry * 1000000000)
+    let j = j + 1
+  end
+  mem_poke_qword(dst, 16 + nb * 8, carry)
+  mem_poke_qword(dst, 8, nb + 1)
+  return true
+end
+
+# Compares p (nb + 1 limbs, as rt_bigint_mag_mul_small_into leaves it) with
+# rem's limbs i .. i + nb. Below i rem only adds less than one unit at limb
+# i, so p <= rem / BASE^i exactly when p <= that window.
+make a function called rt_bigint_mag_cmp_window takes p, rem, i returns cmp
+  let n = mem_peek_qword(p, 8)
+  let j = n - 1
+  while j >= 0 do
+    let lp = mem_peek_qword(p, 16 + j * 8)
+    let lr = mem_peek_qword(rem, 16 + (i + j) * 8)
+    if lp != lr then
+      if lp > lr then
+        return 1
+      end
+      return 0 - 1
+    end
+    let j = j - 1
+  end
+  return 0
+end
+
+# rem's limbs i .. i + n - 1 -= p (p no greater than that window).
+make a function called rt_bigint_mag_sub_window takes rem, p, i returns done
+  let n = mem_peek_qword(p, 8)
+  let borrow = 0
+  let j = 0
+  while j < n do
+    let d = mem_peek_qword(rem, 16 + (i + j) * 8) - mem_peek_qword(p, 16 + j * 8) - borrow
+    if d < 0 then
+      let d = d + 1000000000
+      let borrow = 1
+    else
+      let borrow = 0
+    end
+    mem_poke_qword(rem, 16 + (i + j) * 8, d)
+    let j = j + 1
+  end
+  return true
 end
 
 # GitHub #185: `%` between two BigInt/int values (both already promoted to
@@ -3949,6 +4755,7 @@ end
 # (or zero), never the divisor's.
 make a function called rt_bigint_mod_impl takes addr_a, addr_b returns result
   let divmod = rt_bigint_mag_divmod(addr_a, addr_b)
+  rt_bigint_free_block(list_get(divmod, 0))
   let r_addr = list_get(divmod, 1)
   let r_is_zero = (mem_peek_qword(r_addr, 8) == 1) and (mem_peek_qword(r_addr, 16) == 0)
   let sign_a = mem_peek_qword(addr_a, 0)
@@ -3957,7 +4764,7 @@ make a function called rt_bigint_mod_impl takes addr_a, addr_b returns result
   else
     mem_poke_qword(r_addr, 0, 0)
   end
-  return r_addr bor rt_bigint_tag()
+  return rt_fresh(r_addr bor rt_bigint_tag())
 end
 
 # GitHub #186: `%` between two Rational (or Rational-and-int) values, real
@@ -3992,32 +4799,34 @@ make a function called rt_int_big takes v returns b
   if rt_int_is_fix(v) then
     return rt_bigint_from_i64(v)
   end
-  if type_of(v) == "bigint" then
+  if x64_family_code(v) == 6 then
     return v
   end
   return rt_bigint_from_i64(rt_fixnum_unpack(v))
 end
 
 # v as a fixnum when it fits (a BigInt of at most two base-10^9 limbs whose
-# value is below 2^47), else unchanged.
+# value is below 2^47), else v with a reference of its own: like every value
+# the rt_int_ helpers return, the caller's (docs/plans/general-refcounting.md,
+# 6d -- returning v itself handed back a BigInt its caller then released).
 make a function called rt_int_norm takes v returns n
   if rt_int_is_fix(v) then
     return v
   end
-  if type_of(v) != "bigint" then
+  if x64_family_code(v) != 6 then
     return rt_fixnum_unpack(v)
   end
   let addr = v band rt_payload_mask()
   let nl = mem_peek_qword(addr, 8)
   if nl > 2 then
-    return v
+    return rt_keep(v)
   end
   let val = mem_peek_qword(addr, 16)
   if nl == 2 then
     let val = mem_peek_qword(addr, 24) * 1000000000 + val
   end
   if val > 140737488355327 then
-    return v
+    return rt_keep(v)
   end
   if mem_peek_qword(addr, 0) == 1 then
     return 0 - val
@@ -4087,9 +4896,13 @@ make a function called rt_int_tdiv takes a, b returns q
   if rt_int_is_fix(a) and rt_int_is_fix(b) then
     return rt_trunc_div(a, b)
   end
-  let ba = rt_int_big(a) band rt_payload_mask()
-  let bb = rt_int_big(b) band rt_payload_mask()
-  let q_addr = list_get(rt_bigint_mag_divmod(ba, bb), 0)
+  let big_a = rt_int_big(a)
+  let big_b = rt_int_big(b)
+  let ba = big_a band rt_payload_mask()
+  let bb = big_b band rt_payload_mask()
+  let divmod = rt_bigint_mag_divmod(ba, bb)
+  rt_bigint_free_block(list_get(divmod, 1))
+  let q_addr = list_get(divmod, 0)
   let neg = mem_peek_qword(ba, 0) != mem_peek_qword(bb, 0)
   let q_zero = (mem_peek_qword(q_addr, 8) == 1) and (mem_peek_qword(q_addr, 16) == 0)
   if neg and (not q_zero) then
@@ -4097,31 +4910,39 @@ make a function called rt_int_tdiv takes a, b returns q
   else
     mem_poke_qword(q_addr, 0, 0)
   end
-  return rt_int_norm(q_addr bor rt_bigint_tag())
+  let q = rt_fresh(q_addr bor rt_bigint_tag())
+  return rt_int_norm(q)
 end
 
 make a function called rt_int_abs takes a returns r
   if rt_int_cmp(a, 0) < 0 then
     return rt_int_neg(a)
   end
-  return a
+  return rt_keep(a)
 end
 
 make a function called rt_int_gcd takes a, b returns g
   let x = rt_int_abs(a)
   let y = rt_int_abs(b)
   while rt_int_cmp(y, 0) != 0 do
-    if rt_int_is_fix(x) and rt_int_is_fix(y) then
-      let t = x % y
-      let x = y
-      let y = t
-    else
-      let t = rt_int_sub(x, rt_int_mul(rt_int_tdiv(x, y), y))
-      let x = y
-      let y = t
-    end
+    let t = rt_int_rem(x, y)
+    let x = y
+    let y = t
   end
   return x
+end
+
+# Truncating remainder (the dividend's sign), b != 0: the division's own
+# remainder, rather than a - (a / b) * b.
+make a function called rt_int_rem takes a, b returns r
+  if rt_int_is_fix(a) and rt_int_is_fix(b) then
+    return a % b
+  end
+  let big_a = rt_int_big(a)
+  let big_b = rt_int_big(b)
+  let ba = big_a band rt_payload_mask()
+  let bb = big_b band rt_payload_mask()
+  return rt_int_norm(rt_bigint_mod_impl(ba, bb))
 end
 
 make a function called rt_int_to_text takes v returns s
@@ -4136,7 +4957,8 @@ make a function called rt_int_to_float_bits takes v returns bits
   if rt_int_is_fix(v) then
     return x64_int_to_float_bits(v)
   end
-  let addr = rt_int_big(v) band rt_payload_mask()
+  let big = rt_int_big(v)
+  let addr = big band rt_payload_mask()
   let nl = mem_peek_qword(addr, 8)
   let base = x64_int_to_float_bits(1000000000)
   let acc = x64_int_to_float_bits(0)
@@ -4180,52 +5002,40 @@ end
 # 97, the same distinctive code this trap always used, now reached only
 # for a genuinely unsupported case.
 make a function called rt_bigint_mod takes a, b returns result
-  let ka = type_of(a)
-  let kb = type_of(b)
+  let ka = x64_family_code(a)
+  let kb = x64_family_code(b)
   # GitHub #229: a Float operand gives Rust's truncated remainder (sign of
   # the dividend) as a Float, as in the interpreter: 3.5 % 2 = 1.5,
   # -3.5 % 2 = -1.5 -- a - trunc(a / b) * b on the raw bits.
-  let a_real = (ka == "float") or (ka == "int") or (ka == "rational")
-  let b_real = (kb == "float") or (kb == "int") or (kb == "rational")
-  if ((ka == "float") or (kb == "float")) and a_real and b_real then
+  let a_real = (ka == 14) or (ka == 0) or (ka == 7)
+  let b_real = (kb == 14) or (kb == 0) or (kb == 7)
+  if ((ka == 14) or (kb == 14)) and a_real and b_real then
     let abits = rt_num_to_float_bits(a)
     let bbits = rt_num_to_float_bits(b)
     let q = trunc(x64_float_div_bits(abits, bbits))
     return rt_box_float(x64_float_sub_bits(abits, x64_float_mul_bits(q, bbits)))
   end
-  if (ka == "rational") or (kb == "rational") then
-    let ka_rat_ok = (ka == "int") or (ka == "rational")
-    let kb_rat_ok = (kb == "int") or (kb == "rational")
+  if (ka == 7) or (kb == 7) then
+    let ka_rat_ok = (ka == 0) or (ka == 7)
+    let kb_rat_ok = (kb == 0) or (kb == 7)
     if (not ka_rat_ok) or (not kb_rat_ok) then
       os_exit(97)
     end
-    let pa = a
-    let pb = b
-    if ka == "int" then
-      let pa = rt_rational_from_i64(a)
-    end
-    if kb == "int" then
-      let pb = rt_rational_from_i64(b)
-    end
+    let pa = rt_as_rational(a)
+    let pb = rt_as_rational(b)
     let b_addr = pb band rt_payload_mask()
     if mem_peek_qword(b_addr, 0) == 0 then
       os_exit(97)
     end
     return rt_rational_mod(pa, pb)
   end
-  let ka_ok = (ka == "int") or (ka == "bigint")
-  let kb_ok = (kb == "int") or (kb == "bigint")
+  let ka_ok = (ka == 0) or (ka == 6)
+  let kb_ok = (kb == 0) or (kb == 6)
   if (not ka_ok) or (not kb_ok) then
     os_exit(97)
   end
-  let pa = a
-  let pb = b
-  if ka == "int" then
-    let pa = rt_bigint_from_i64(a)
-  end
-  if kb == "int" then
-    let pb = rt_bigint_from_i64(b)
-  end
+  let pa = rt_int_big(a)
+  let pb = rt_int_big(b)
   let addr_a = pa band rt_payload_mask()
   let addr_b = pb band rt_payload_mask()
   let b_is_zero = (mem_peek_qword(addr_b, 8) == 1) and (mem_peek_qword(addr_b, 16) == 0)
@@ -4291,10 +5101,10 @@ make a function called rt_rational_new takes num, den returns tagged
   end
   let n = rt_int_tdiv(n, g)
   let d = rt_int_tdiv(d, g)
-  let addr = rt_heap_alloc(16)
-  mem_poke_qword(addr, 0, n)
-  mem_poke_qword(addr, 8, d)
-  return addr bor rt_rational_tag()
+  let addr = bm_alloc(16)
+  mem_poke_qword(addr, 0, rt_keep(n))
+  mem_poke_qword(addr, 8, rt_keep(d))
+  return rt_fresh(addr bor rt_rational_tag())
 end
 
 make a function called rt_rational_from_i64 takes n returns tagged
@@ -4311,11 +5121,38 @@ make a function called rt_rational_to_string takes tagged returns s
 end
 
 # An integral rational is its numerator (already a fixnum or BigInt).
+# It borrows `r` like any runtime function and returns a reference of its
+# own, to the numerator or to r: the caller releases the rational it made,
+# which releases its parts.
 make a function called rt_rational_demote takes r returns v
   if rt_rational_den(r) == 1 then
-    return rt_rational_num(r)
+    return rt_keep(rt_rational_num(r))
   end
-  return r
+  return rt_keep(r)
+end
+
+# v as a Rational if it is an integer, else v itself; either way a reference
+# the caller owns, so a promoted operand is released like any other value.
+make a function called rt_as_rational takes v returns r
+  let k = x64_family_code(v)
+  if (k == 0) or (k == 6) then
+    return rt_rational_from_i64(v)
+  end
+  return rt_keep(v)
+end
+
+make a function called rt_as_complex takes v returns r
+  if x64_family_code(v) == 8 then
+    return rt_keep(v)
+  end
+  return rt_complex_from_num(v)
+end
+
+make a function called rt_as_interval takes v returns r
+  if x64_family_code(v) == 9 then
+    return rt_keep(v)
+  end
+  return rt_interval_from_num(v)
 end
 
 make a function called rt_rational_add takes a, b returns tagged
@@ -4391,10 +5228,10 @@ make a function called rt_fixnum_pack takes n returns tagged
 end
 
 make a function called rt_complex_new takes re, im returns tagged
-  let addr = rt_heap_alloc(16)
-  mem_poke_qword(addr, 0, re)
-  mem_poke_qword(addr, 8, im)
-  return addr bor rt_complex_tag()
+  let addr = bm_alloc(16)
+  mem_poke_qword(addr, 0, rt_keep(re))
+  mem_poke_qword(addr, 8, rt_keep(im))
+  return rt_fresh(addr bor rt_complex_tag())
 end
 
 # Wraps ANY already-tagged numeric value (fixnum/BigInt/Rational) as
@@ -4425,17 +5262,17 @@ make a function called rt_num_to_string takes tagged returns s
   # every check to the "?" placeholder. Fixed to reuse type_of, which
   # already gets this right (and picks up GitHub #51's heap-bounds fix
   # for free).
-  let kind = type_of(tagged)
-  if kind == "int" then
+  let kind = x64_family_code(tagged)
+  if kind == 0 then
     return rt_int_to_str(rt_fixnum_unpack(tagged))
   end
-  if kind == "bigint" then
+  if kind == 6 then
     return rt_bigint_to_string(tagged)
   end
-  if kind == "rational" then
+  if kind == 7 then
     return rt_rational_to_string(tagged)
   end
-  if kind == "float" then
+  if kind == 14 then
     return rt_float_to_string(tagged)
   end
   return "?"
@@ -4613,10 +5450,14 @@ end
 # -- the caller is responsible for having a genuine float64 bit pattern
 # in hand already (e.g. the direct result of a float expression); this
 # function never inspects or converts it, only stores and tags it.
+# The box is counted like a string, a list or a rational (bm_alloc, and the
+# numeric case of rt_rc_inc_if_refcounted / rt_rc_dec_if_refcounted), so a
+# list or a local that releases a Float frees its box; a raw rt_heap_alloc
+# box was never freed (16 bytes for every float that left a register).
 make a function called rt_box_float takes bits returns tagged
-  let addr = rt_heap_alloc(8)
+  let addr = bm_alloc(8)
   mem_poke_qword(addr, 0, bits)
-  return addr bor rt_float_tag()
+  return rt_fresh(addr bor rt_float_tag())
 end
 
 # rt_unbox_float_bits(v) -> the raw float64 bit pattern stored in a
@@ -4651,17 +5492,17 @@ end
 
 # The float64 bit pattern of a real numeric value.
 make a function called rt_num_to_float_bits takes v returns bits
-  let k = type_of(v)
-  if k == "float" then
+  let k = x64_family_code(v)
+  if k == 14 then
     return rt_unbox_float_bits(v)
   end
-  if k == "rational" then
+  if k == 7 then
     return x64_float_div_bits(rt_int_to_float_bits(rt_rational_num(v)), rt_int_to_float_bits(rt_rational_den(v)))
   end
-  if (k == "int") or (k == "bigint") then
+  if (k == 0) or (k == 6) then
     return rt_int_to_float_bits(v)
   end
-  print("sqrt/math: a " + k + " argument is not supported by the native x64 backend")
+  print("sqrt/math: a " + type_of(v) + " argument is not supported by the native x64 backend")
   os_exit(98)
   return 0
 end
@@ -4686,8 +5527,8 @@ end
 # sqrt of a non-negative real: exact Int or Rational for a perfect square,
 # Float otherwise.
 make a function called rt_sqrt_nonneg takes v returns r
-  let k = type_of(v)
-  if k == "int" then
+  let k = x64_family_code(v)
+  if k == 0 then
     let s = rt_isqrt_exact(v)
     if s >= 0 then
       return s
@@ -4695,7 +5536,7 @@ make a function called rt_sqrt_nonneg takes v returns r
   end
   # A Rational with fixnum parts can have an exact root found here; one
   # with BigInt parts falls back to the Float.
-  if k == "rational" then
+  if k == 7 then
     let rnum = rt_rational_num(v)
     let rden = rt_rational_den(v)
     if rt_int_is_fix(rnum) and rt_int_is_fix(rden) then
@@ -4726,22 +5567,17 @@ end
 # a Float (and both are real), otherwise exact Rational division demoted
 # back to an Int when it divides evenly -- what the slow path always did.
 make a function called rt_dynamic_div takes a, b returns r
-  let ka = type_of(a)
-  let kb = type_of(b)
-  let a_real = (ka == "float") or (ka == "int") or (ka == "rational")
-  let b_real = (kb == "float") or (kb == "int") or (kb == "rational")
-  if ((ka == "float") or (kb == "float")) and a_real and b_real then
+  let ka = x64_family_code(a)
+  let kb = x64_family_code(b)
+  let a_real = (ka == 14) or (ka == 0) or (ka == 7) or (ka == 6)
+  let b_real = (kb == 14) or (kb == 0) or (kb == 7) or (kb == 6)
+  if ((ka == 14) or (kb == 14)) and a_real and b_real then
     return rt_box_float(x64_float_div_bits(rt_num_to_float_bits(a), rt_num_to_float_bits(b)))
   end
-  let pa = a
-  if ka == "int" then
-    let pa = rt_rational_from_i64(a)
-  end
-  let pb = b
-  if kb == "int" then
-    let pb = rt_rational_from_i64(b)
-  end
-  return rt_rational_demote(rt_rational_div(pa, pb))
+  let pa = rt_as_rational(a)
+  let pb = rt_as_rational(b)
+  let q = rt_rational_div(pa, pb)
+  return rt_rational_demote(q)
 end
 
 # GitHub #229 (raytrace ch05): abs of a TAGGED value in block-model code.
@@ -4749,7 +5585,7 @@ end
 # came back unchanged (abs(-(1/3)) was -1/3), and `abs(dy) < epsilon()`
 # called every ray parallel to the plane.
 make a function called rt_abs_dynamic takes v returns r
-  if type_of(v) == "float" then
+  if x64_family_code(v) == 14 then
     return rt_box_float(abs(rt_unbox_float_bits(v)))
   end
   if rt_dynamic_binop(v, 0, 5) then
@@ -4763,8 +5599,8 @@ end
 # Int result), a Float for a Float, an Int unchanged. (floor has its own
 # runtime function, `floor`, above.)
 make a function called rt_roundlike_dynamic takes v, mode returns r
-  let k = type_of(v)
-  if k == "rational" then
+  let k = x64_family_code(v)
+  if k == 7 then
     let n = rt_rational_num(v)
     let d = rt_rational_den(v)
     let q = rt_int_tdiv(n, d)
@@ -4787,7 +5623,7 @@ make a function called rt_roundlike_dynamic takes v, mode returns r
     end
     return q
   end
-  if k == "float" then
+  if k == 14 then
     let bits = rt_unbox_float_bits(v)
     if mode == 0 then
       return rt_box_float(ceil(bits))
@@ -4807,9 +5643,9 @@ end
 # else is a Float. codegen_x64 calls libm directly only when both
 # arguments are proven raw floats.
 make a function called rt_pow_dynamic takes b, e returns r
-  let kb = type_of(b)
-  let exact_base = (kb == "int") or (kb == "rational") or (kb == "bigint")
-  if exact_base and (type_of(e) == "int") then
+  let kb = x64_family_code(b)
+  let exact_base = (kb == 0) or (kb == 7) or (kb == 6)
+  if exact_base and (x64_family_code(e) == 0) then
     let n = e
     let neg = false
     if n < 0 then
@@ -4867,10 +5703,10 @@ make a function called rt_math1_dynamic takes v, fn_code returns r
 end
 
 make a function called rt_interval_new takes lo, hi returns tagged
-  let addr = rt_heap_alloc(16)
-  mem_poke_qword(addr, 0, lo)
-  mem_poke_qword(addr, 8, hi)
-  return addr bor rt_interval_tag()
+  let addr = bm_alloc(16)
+  mem_poke_qword(addr, 0, rt_keep(lo))
+  mem_poke_qword(addr, 8, rt_keep(hi))
+  return rt_fresh(addr bor rt_interval_tag())
 end
 
 # Degenerate interval [v,v] wrapping any already-tagged numeric value
@@ -5018,9 +5854,9 @@ end
 # "==", which would recurse for non-numeric operands).
 
 make a function called rt_dynamic_numeric_binop takes a, b, op_code returns result
-  let ka = type_of(a)
-  let kb = type_of(b)
-  if (ka == "int") and (kb == "int") then
+  let ka = x64_family_code(a)
+  let kb = x64_family_code(b)
+  if (ka == 0) and (kb == 0) then
     if op_code == 0 then
       return a + b
     end
@@ -5076,10 +5912,11 @@ make a function called rt_dynamic_numeric_binop takes a, b, op_code returns resu
   # not-newly-introduced gap for that rarer combination).
   # GitHub #229 follow-up: a Rational mixed with a Float is a Float too, as
   # in the interpreter (raytrace's exact rational coordinates times a
-  # sqrt-derived scale) -- rt_num_to_float_bits converts all three kinds.
-  let a_real = (ka == "float") or (ka == "int") or (ka == "rational")
-  let b_real = (kb == "float") or (kb == "int") or (kb == "rational")
-  if ((ka == "float") or (kb == "float")) and a_real and b_real then
+  # sqrt-derived scale) -- rt_num_to_float_bits converts all four kinds (a
+  # BigInt times a Float is a Float as well).
+  let a_real = (ka == 14) or (ka == 0) or (ka == 7) or (ka == 6)
+  let b_real = (kb == 14) or (kb == 0) or (kb == 7) or (kb == 6)
+  if ((ka == 14) or (kb == 14)) and a_real and b_real then
     let abits = rt_num_to_float_bits(a)
     let bbits = rt_num_to_float_bits(b)
     if op_code == 0 then
@@ -5109,15 +5946,9 @@ make a function called rt_dynamic_numeric_binop takes a, b, op_code returns resu
     end
     return c >= 0
   end
-  if (ka == "interval") or (kb == "interval") then
-    let pa = a
-    let pb = b
-    if ka != "interval" then
-      let pa = rt_interval_from_num(a)
-    end
-    if kb != "interval" then
-      let pb = rt_interval_from_num(b)
-    end
+  if (ka == 9) or (kb == 9) then
+    let pa = rt_as_interval(a)
+    let pb = rt_as_interval(b)
     if op_code == 3 then
       return rt_interval_eq(pa, pb) == 1
     end
@@ -5135,15 +5966,9 @@ make a function called rt_dynamic_numeric_binop takes a, b, op_code returns resu
     end
     return rt_interval_mul(pa, pb)
   end
-  if (ka == "complex") or (kb == "complex") then
-    let pa = a
-    let pb = b
-    if ka != "complex" then
-      let pa = rt_complex_from_num(a)
-    end
-    if kb != "complex" then
-      let pb = rt_complex_from_num(b)
-    end
+  if (ka == 8) or (kb == 8) then
+    let pa = rt_as_complex(a)
+    let pb = rt_as_complex(b)
     if op_code == 3 then
       return rt_complex_eq(pa, pb) == 1
     end
@@ -5161,15 +5986,9 @@ make a function called rt_dynamic_numeric_binop takes a, b, op_code returns resu
     end
     return rt_complex_mul(pa, pb)
   end
-  if (ka == "rational") or (kb == "rational") then
-    let pa = a
-    let pb = b
-    if ka != "rational" then
-      let pa = rt_rational_from_i64(a)
-    end
-    if kb != "rational" then
-      let pb = rt_rational_from_i64(b)
-    end
+  if (ka == 7) or (kb == 7) then
+    let pa = rt_as_rational(a)
+    let pb = rt_as_rational(b)
     if op_code >= 3 then
       let c = rt_rational_cmp(pa, pb)
       if op_code == 3 then
@@ -5189,25 +6008,21 @@ make a function called rt_dynamic_numeric_binop takes a, b, op_code returns resu
       end
       return c >= 0
     end
+    let r = 0
     if op_code == 0 then
-      return rt_rational_demote(rt_rational_add(pa, pb))
+      let r = rt_rational_add(pa, pb)
+    elif op_code == 1 then
+      let r = rt_rational_sub(pa, pb)
+    else
+      let r = rt_rational_mul(pa, pb)
     end
-    if op_code == 1 then
-      return rt_rational_demote(rt_rational_sub(pa, pb))
-    end
-    return rt_rational_demote(rt_rational_mul(pa, pb))
+    return rt_rational_demote(r)
   end
   # Default: BigInt (matches the original DYN_HASTAG fallthrough --
   # any remaining Numeric-family pair that isn't Interval/Complex/
   # Rational is BigInt, or a fixnum mixed with one).
-  let pa = a
-  let pb = b
-  if ka == "int" then
-    let pa = rt_bigint_from_i64(a)
-  end
-  if kb == "int" then
-    let pb = rt_bigint_from_i64(b)
-  end
+  let pa = rt_int_big(a)
+  let pb = rt_int_big(b)
   if op_code >= 3 then
     let c = rt_bigint_cmp(pa, pb)
     if op_code == 3 then
@@ -5236,101 +6051,32 @@ make a function called rt_dynamic_numeric_binop takes a, b, op_code returns resu
   return rt_bigint_mul(pa, pb)
 end
 
-# "+" on at least one non-Numeric-family operand -- string concat,
-# auto-stringify a fixnum against a string, or list-to-display-string
-# first. Mirrors the original DYN_OBJPLUS chain exactly (GitHub #19/
-# #35's own fixes, now expressed as ordinary type_of checks instead of
-# hand-rolled family-tag bit twiddling).
+# "+" on at least one non-Numeric-family operand: string concatenation, with
+# the other operand shown as text (to_s's rendering: a number, a bool, a
+# list's display form, Unit as ""). A list counts as text on either side.
+# Any other pairing (an Object, a closure) gives 0, as the original
+# DYN_OBJPLUS chain did (GitHub #19/#35/#85/#100/#103/#229 added the kinds
+# one at a time). The text made for a non-string operand is released after
+# the concatenation; it used to be kept, so every `"..." + n` left its
+# number's text on the heap.
+make a function called rt_plus_text_kind takes k returns yes
+  return (k == "string") or (k == "list") or (k == "int") or (k == "bool") or (k == "bigint") or (k == "rational") or (k == "complex") or (k == "interval") or (k == "float") or (k == "unit")
+end
+
 make a function called rt_dynamic_plus_obj takes a, b returns result
-  let pa = a
-  let pb = b
-  if type_of(pa) == "list" then
-    let pa = rt_list_to_display_string(pa)
+  let ka = type_of(a)
+  let kb = type_of(b)
+  let a_text = (ka == "string") or (ka == "list")
+  let b_text = (kb == "string") or (kb == "list")
+  if not (a_text or b_text) then
+    return 0
   end
-  if type_of(pb) == "list" then
-    let pb = rt_list_to_display_string(pb)
+  if not (rt_plus_text_kind(ka) and rt_plus_text_kind(kb)) then
+    return 0
   end
-  let ka = type_of(pa)
-  let kb = type_of(pb)
-  if (ka == "string") and (kb == "string") then
-    return rt_str_concat(pa, pb)
-  end
-  if (ka == "string") and (kb == "int") then
-    return rt_str_concat(pa, rt_int_to_str(pb))
-  end
-  if (ka == "int") and (kb == "string") then
-    return rt_str_concat(rt_int_to_str(pa), pb)
-  end
-  # GitHub #85: the interpreter stringifies Unit to "" when concatenated
-  # with a string (matching to_s's own Unit case), preserving the string
-  # operand -- e.g. `"value: " + unit` == "value: ". This dispatch had no
-  # "unit" case at all, so it fell through to `return 0`, silently
-  # dropping the string entirely and returning Unit's raw payload bits
-  # (0, below the family tag) as if the whole expression were a plain
-  # integer, not a string concatenation. `print(...)` returning Unit (per
-  # the implicit-return/auto-print feature) is the easiest way to produce
-  # this: `let x = print("hello"); print("value: " + x)`.
-  if (ka == "string") and (kb == "unit") then
-    return pa
-  end
-  if (ka == "unit") and (kb == "string") then
-    return pb
-  end
-  # GitHub #100: no "bool" case existed either, so a genuine Bool operand
-  # (not a Unit-vs-Bool tagging confusion -- see #85's comment thread for
-  # that separate issue) fell through the same way, silently dropping the
-  # string and returning 0 for e.g. `"real bool: " + true`.
-  if (ka == "string") and (kb == "bool") then
-    return rt_str_concat(pa, rt_bool_to_string(pb))
-  end
-  if (ka == "bool") and (kb == "string") then
-    return rt_str_concat(rt_bool_to_string(pa), pb)
-  end
-  # GitHub #103 (found chasing the patc1->patc2->patc3 self-hosting
-  # fixpoint's Gen B segfault): same gap, same symptom, for the whole
-  # numeric tower this time -- no "bigint"/"rational"/"complex"/
-  # "interval" case existed either, so `"..." + <a genuine multi-limb
-  # BigInt>` silently dropped the string and returned 0, exactly like
-  # #85/#100 did for Unit/Bool. A single-limb BigInt (small enough to
-  # still print correctly via some other, unrelated path) never
-  # exposed this; hash_string's own FNV accumulator -- called
-  # extensively by this session's own #101 fingerprint-check addition
-  # to patc1_main.patlang -- produces genuinely multi-limb BigInts
-  # within a few iterations, string-concatenated into diagnostic
-  # messages elsewhere in the bundle, which is what actually surfaced
-  # this during the fixpoint attempt.
-  if (ka == "string") and (kb == "bigint") then
-    return rt_str_concat(pa, rt_bigint_to_string(pb))
-  end
-  if (ka == "bigint") and (kb == "string") then
-    return rt_str_concat(rt_bigint_to_string(pa), pb)
-  end
-  if (ka == "string") and (kb == "rational") then
-    return rt_str_concat(pa, rt_rational_to_string(pb))
-  end
-  if (ka == "rational") and (kb == "string") then
-    return rt_str_concat(rt_rational_to_string(pa), pb)
-  end
-  if (ka == "string") and (kb == "complex") then
-    return rt_str_concat(pa, rt_complex_to_string(pb))
-  end
-  if (ka == "complex") and (kb == "string") then
-    return rt_str_concat(rt_complex_to_string(pa), pb)
-  end
-  if (ka == "string") and (kb == "interval") then
-    return rt_str_concat(pa, rt_interval_to_string(pb))
-  end
-  if (ka == "interval") and (kb == "string") then
-    return rt_str_concat(rt_interval_to_string(pa), pb)
-  end
-  # GitHub #229: a boxed Float, e.g. a sqrt result or a float-dynamic Bin's.
-  if (ka == "string") and (kb == "float") then
-    return rt_str_concat(pa, rt_float_to_string(pb))
-  end
-  if (ka == "float") and (kb == "string") then
-    return rt_str_concat(rt_float_to_string(pa), pb)
-  end
-  return 0
+  let ta = rt_to_display_string(a)
+  let tb = rt_to_display_string(b)
+  return rt_str_concat(ta, tb)
 end
 
 # Comparison on at least one non-Numeric-family operand -- real content
@@ -5409,15 +6155,15 @@ end
 # DYN_NOTFAST path calls straight into this (push a, push b, push
 # op_code, call) instead of hand-assembling the whole chain inline.
 make a function called rt_dynamic_binop takes a, b, op_code returns result
-  let ka = type_of(a)
-  let kb = type_of(b)
+  let ka = x64_family_code(a)
+  let kb = x64_family_code(b)
   # GitHub #194: "float" was missing from this list entirely -- a
   # boxed float reaching here (once boxed at all; see
   # x64_float_box_call_arg_indices) fell through to the Object-identity
   # branches below instead of rt_dynamic_numeric_binop's own new float
   # case.
-  let ka_numeric = (ka == "int") or (ka == "bigint") or (ka == "rational") or (ka == "complex") or (ka == "interval") or (ka == "float")
-  let kb_numeric = (kb == "int") or (kb == "bigint") or (kb == "rational") or (kb == "complex") or (kb == "interval") or (kb == "float")
+  let ka_numeric = (ka == 0) or (ka == 6) or (ka == 7) or (ka == 8) or (ka == 9) or (ka == 14)
+  let kb_numeric = (kb == 0) or (kb == 6) or (kb == 7) or (kb == 8) or (kb == 9) or (kb == 14)
   if ka_numeric and kb_numeric then
     return rt_dynamic_numeric_binop(a, b, op_code)
   end
@@ -5488,15 +6234,13 @@ make a function called rt_object_tag returns tag
 end
 
 make a function called rt_object_new takes type_id, field_count returns tagged
-  let addr = rt_heap_alloc(16 + field_count * 8)
-  mem_poke_qword(addr, 0, type_id)
-  mem_poke_qword(addr, 8, field_count)
+  let addr = rt_cell_new(type_id, field_count)
   let i = 0
   while i < field_count do
     mem_poke_qword(addr, 16 + i * 8, rt_fixnum_pack(0))
     let i = i + 1
   end
-  return addr bor rt_object_tag()
+  return rt_fresh(addr bor rt_object_tag())
 end
 
 make a function called rt_object_type takes obj returns type_id
@@ -5509,16 +6253,21 @@ make a function called rt_object_field_count takes obj returns n
   return mem_peek_qword(addr, 8)
 end
 
+# The field with a reference of its own, the caller's (the object may be
+# released first).
 make a function called rt_object_get takes obj, i returns tagged
   let addr = obj band rt_payload_mask()
-  return mem_peek_qword(addr, 16 + i * 8)
+  return rt_keep(mem_peek_qword(addr, 16 + i * 8))
 end
 
 # In-place mutation (same convention as rt_list_set, not the
-# interpreter's copy-on-write semantics).
+# interpreter's copy-on-write semantics): the field takes its own reference
+# to `v` and releases what it held.
 make a function called rt_object_set takes obj, i, v returns done
   let addr = obj band rt_payload_mask()
-  mem_poke_qword(addr, 16 + i * 8, v)
+  let old = mem_peek_qword(addr, 16 + i * 8)
+  mem_poke_qword(addr, 16 + i * 8, rt_keep(v))
+  rt_rc_dec_if_refcounted(old)
   return true
 end
 
@@ -5541,14 +6290,12 @@ make a function called rt_read_file takes path returns tagged
   let path_bytes = addr + 8
   let size = os_file_size(path_bytes, path_len)
   if size < 0 then
-    let e = rt_heap_alloc(8)
-    mem_poke_qword(e, 0, 0)
-    return e bor rt_string_tag()
+    let e = rt_string_new(0)
+    return rt_fresh(e bor rt_string_tag())
   end
-  let buf = rt_heap_alloc(8 + size)
-  mem_poke_qword(buf, 0, size)
+  let buf = rt_string_new(size)
   os_read_file_into(path_bytes, path_len, buf + 8, size)
-  return buf bor rt_string_tag()
+  return rt_fresh(buf bor rt_string_tag())
 end
 
 make a function called rt_write_file takes path, contents returns ok
@@ -5579,13 +6326,15 @@ make a function called write_file_bytes takes path, byte_list returns ok
   let path_len = mem_peek_qword(addr, 0)
   let path_bytes = addr + 8
   let n = rt_list_len(byte_list)
-  let buf = rt_heap_alloc(n)
+  let buf = bm_alloc(n)
   let i = 0
   while i < n do
     mem_poke_byte(buf, i, rt_list_get(byte_list, i))
     let i = i + 1
   end
-  return os_write_file(path_bytes, path_len, buf, n)
+  let ok = os_write_file(path_bytes, path_len, buf, n)
+  bm_rc_dec(buf, n)
+  return ok
 end
 
 # read_file_bytes(path, offset, length) -- the compiled-code counterpart
@@ -5598,12 +6347,11 @@ end
 # header on this primitive for why that's deliberate), and a request
 # that runs past EOF is silently clamped to what's actually available.
 #
-# There is no native file-seek primitive in this backend, so unlike the
-# interpreter's Seek-based implementation, this always reads the WHOLE
-# file into a scratch buffer first and slices out [offset,offset+want)
-# from that -- wasteful for a small slice out of a huge file, cheap for
-# the actual call shape every caller in this codebase uses
-# (offset always 0, length a large cap meaning "the whole file").
+# Reads just [offset, offset+want) (os_read_file_range seeks, as the
+# interpreter's implementation does). It read the whole file into a
+# scratch buffer for every call and sliced the range out: raytrace's
+# row-at-a-time picture reader then read a 3MB picture 1024 times, about
+# 6GB never freed (ch36).
 #
 # The result list is built via rt_list_new(want) + rt_list_set in a
 # single inline loop, deliberately NOT rt_list_push in a loop and
@@ -5637,14 +6385,18 @@ make a function called read_file_bytes takes path, offset, length returns bytes
   if want <= 0 then
     return rt_list_new(0)
   end
-  let buf = rt_heap_alloc(size)
-  let unused = os_read_file_into(path_bytes, path_len, buf, size)
-  let out = rt_list_new(want)
+  # the read buffer is only scratch: borrowed from the refcounted heap and
+  # handed back once copied (a raw rt_heap_alloc was never freed, a
+  # picture's size again for every row read)
+  let buf = bm_alloc(want)
+  let got = os_read_file_range(path_bytes, path_len, buf, offset, want)
+  let out = rt_list_new(got)
   let i = 0
-  while i < want do
-    rt_list_set(out, i, mem_peek_byte(buf, offset + i))
+  while i < got do
+    rt_list_set(out, i, mem_peek_byte(buf, i))
     let i = i + 1
   end
+  bm_rc_dec(buf, want)
   return out
 end
 
@@ -5717,7 +6469,7 @@ end
 make a function called rt_dquote_str returns s
   let s = rt_string_new(1)
   mem_poke_byte(s, 8, 34)
-  return s bor rt_string_tag()
+  return rt_fresh(s bor rt_string_tag())
 end
 
 # A token needs quoting only if an UNQUOTED copy of it would be split
@@ -5733,12 +6485,54 @@ make a function called rt_exec_arg_needs_quoting takes item returns needed
   end
   let i = 0
   while i < len do
-    if char_code(item, i) == 32 then
+    let c = char_code(item, i)
+    if (c == 32) or (c == 9) then
       return true
     end
     let i = i + 1
   end
   return false
+end
+
+# One argument as Rust's Command::args writes it into the command line,
+# so argv() (or any MSVC-rules child) reads it back intact: quoted only
+# when needed, an embedded quote escaped with a backslash, and the
+# backslashes before an escaped quote or the closing quote doubled.
+make a function called rt_exec_quote_arg takes item returns s
+  let quote = rt_exec_arg_needs_quoting(item)
+  let b = sb_new()
+  if quote then
+    sb_push(b, chr(34))
+  end
+  let len = rt_str_len(item)
+  let nb = 0
+  let i = 0
+  while i < len do
+    let c = char_code(item, i)
+    if c == 92 then
+      let nb = nb + 1
+    elif c == 34 then
+      let m = 0
+      while m <= nb do
+        sb_push(b, chr(92))
+        let m = m + 1
+      end
+      let nb = 0
+    else
+      let nb = 0
+    end
+    sb_push(b, substr(item, i, 1))
+    let i = i + 1
+  end
+  if quote then
+    let m = 0
+    while m < nb do
+      sb_push(b, chr(92))
+      let m = m + 1
+    end
+    sb_push(b, chr(34))
+  end
+  return sb_str(b)
 end
 
 # GitHub #40-adjacent selftest gap: quoting EVERY argument unconditionally
@@ -5777,15 +6571,15 @@ end
 make a function called rt_exec_normalize_program_path takes p returns out
   let plen = rt_str_len(p)
   if plen == 0 then
-    return p
+    return rt_keep(p)
   end
   let c0 = char_code(p, 0)
   if (c0 == 46) or (c0 == 47) or (c0 == 92) then
-    return p
+    return rt_keep(p)
   end
   if plen >= 2 then
     if char_code(p, 1) == 58 then
-      return p
+      return rt_keep(p)
     end
   end
   let has_slash = false
@@ -5798,16 +6592,13 @@ make a function called rt_exec_normalize_program_path takes p returns out
     let i = i + 1
   end
   if has_slash then
-    return "./" + p
+    return rt_str_concat("./", p)
   end
-  return p
+  return rt_keep(p)
 end
 
 make a function called rt_exec_join_args takes arr, count returns tagged
-  let q = rt_dquote_str()
-  let e = rt_heap_alloc(8)
-  mem_poke_qword(e, 0, 0)
-  let result = e bor rt_string_tag()
+  let b = sb_new()
   let i = 0
   while i < count do
     let item = mem_peek_qword(arr, i * 8)
@@ -5815,19 +6606,12 @@ make a function called rt_exec_join_args takes arr, count returns tagged
       let item = rt_exec_normalize_program_path(item)
     end
     if i > 0 then
-      let result = rt_str_concat(result, " ")
+      sb_push(b, " ")
     end
-    let needs_q = rt_exec_arg_needs_quoting(item)
-    if needs_q then
-      let result = rt_str_concat(result, q)
-    end
-    let result = rt_str_concat(result, item)
-    if needs_q then
-      let result = rt_str_concat(result, q)
-    end
+    sb_push(b, rt_exec_quote_arg(item))
     let i = i + 1
   end
-  return result
+  return sb_str(b)
 end
 
 # exec_capture_io(program, args, stdin_text, timeout_ms) -> [stdout, stderr, success],
@@ -5877,19 +6661,26 @@ end
 #      documented as a gap.
 make a function called exec_capture_io takes program, args, stdin_text, timeout_ms returns result
   let n = args.length
-  let arr = rt_heap_alloc((n + 1) * 8)
-  mem_poke_qword(arr, 0, program)
+  # each slot holds a reference (args[i] reads one), released with the array
+  let arr = rt_scratch_alloc((n + 1) * 8)
+  mem_poke_qword(arr, 0, rt_keep(program))
   let i = 0
   while i < n do
     mem_poke_qword(arr, (i + 1) * 8, args[i])
     let i = i + 1
   end
   let cmdline = rt_exec_join_args(arr, n + 1)
+  let i = 0
+  while i <= n do
+    rt_rc_dec_if_refcounted(mem_peek_qword(arr, i * 8))
+    let i = i + 1
+  end
+  rt_scratch_free(arr)
   let addr = (cmdline band rt_payload_mask()) + 8
   let len = rt_str_len(cmdline)
   if timeout_ms > 0 then os_set_exec_timeout(timeout_ms) end
   let raw = os_exec_run(addr, len)
-  let combined = raw bor rt_string_tag()
+  let combined = rt_string_adopt(raw)
   let exit_code = os_last_exec_exit_code()
   let success = exit_code == 0
   let errtext = combined
@@ -6023,7 +6814,7 @@ make a function called rustc_build takes rust_src, out_path, target, opt_level r
   if file_exists(out_path) != true then
     return "RUSTC ERROR: rustc_build: rustc reported success but " + out_path + " does not exist"
   end
-  return out_path
+  return rt_keep(out_path)
 end
 
 # chunk_texts: a list of [name, text] pairs (base_name is not treated
@@ -6267,7 +7058,10 @@ make a function called logic_rules_list returns l
 end
 
 make a function called logic_rules_list_set takes l returns done
-  mem_poke_qword(mem_rules_table_addr(), 0, l)
+  let addr = mem_rules_table_addr()
+  let old = mem_peek_qword(addr, 0)
+  mem_poke_qword(addr, 0, rt_keep(l))
+  rt_rc_dec_if_refcounted(old)
   return true
 end
 
@@ -6527,7 +7321,10 @@ make a function called logic_actions_list returns l
 end
 
 make a function called logic_actions_list_set takes l returns done
-  mem_poke_qword(mem_actions_table_addr(), 0, l)
+  let addr = mem_actions_table_addr()
+  let old = mem_peek_qword(addr, 0)
+  mem_poke_qword(addr, 0, rt_keep(l))
+  rt_rc_dec_if_refcounted(old)
   return true
 end
 
@@ -6683,19 +7480,24 @@ make a function called action_instance_label takes name, preconds, subst returns
     let i = i + 1
   end
   if seen.length == 0 then
-    return name
+    return rt_keep(name)
   end
-  let parts = ""
+  let b = sb_new()
+  sb_push(b, name)
+  sb_push(b, "(")
   let j = 0
   let jn = seen.length
   while j < jn do
     if j > 0 then
-      let parts = parts + ","
+      sb_push(b, ",")
     end
-    let parts = parts + seen[j] + "=" + logic_walk(seen[j], subst)
+    sb_push(b, seen[j])
+    sb_push(b, "=")
+    sb_push(b, logic_walk(seen[j], subst))
     let j = j + 1
   end
-  return name + "(" + parts + ")"
+  sb_push(b, ")")
+  return sb_str(b)
 end
 
 # Real correctness hazard avoided here, same class as
@@ -7040,7 +7842,10 @@ make a function called logic_action_bodies_list returns l
 end
 
 make a function called logic_action_bodies_list_set takes l returns done
-  mem_poke_qword(mem_action_bodies_table_addr(), 0, l)
+  let addr = mem_action_bodies_table_addr()
+  let old = mem_peek_qword(addr, 0)
+  mem_poke_qword(addr, 0, rt_keep(l))
+  rt_rc_dec_if_refcounted(old)
   return true
 end
 
@@ -7195,7 +8000,10 @@ make a function called logic_procs_list returns l
 end
 
 make a function called logic_procs_list_set takes l returns done
-  mem_poke_qword(mem_procs_table_addr(), 0, l)
+  let addr = mem_procs_table_addr()
+  let old = mem_peek_qword(addr, 0)
+  mem_poke_qword(addr, 0, rt_keep(l))
+  rt_rc_dec_if_refcounted(old)
   return true
 end
 
@@ -7290,7 +8098,10 @@ make a function called logic_listeners_list returns l
 end
 
 make a function called logic_listeners_list_set takes l returns done
-  mem_poke_qword(mem_listeners_table_addr(), 0, l)
+  let addr = mem_listeners_table_addr()
+  let old = mem_peek_qword(addr, 0)
+  mem_poke_qword(addr, 0, rt_keep(l))
+  rt_rc_dec_if_refcounted(old)
   return true
 end
 
@@ -7325,7 +8136,10 @@ make a function called logic_conns_list returns l
 end
 
 make a function called logic_conns_list_set takes l returns done
-  mem_poke_qword(mem_conns_table_addr(), 0, l)
+  let addr = mem_conns_table_addr()
+  let old = mem_peek_qword(addr, 0)
+  mem_poke_qword(addr, 0, rt_keep(l))
+  rt_rc_dec_if_refcounted(old)
   return true
 end
 
@@ -7405,7 +8219,10 @@ make a function called logic_threads_list returns l
 end
 
 make a function called logic_threads_list_set takes l returns done
-  mem_poke_qword(mem_threads_table_addr(), 0, l)
+  let addr = mem_threads_table_addr()
+  let old = mem_peek_qword(addr, 0)
+  mem_poke_qword(addr, 0, rt_keep(l))
+  rt_rc_dec_if_refcounted(old)
   return true
 end
 
@@ -7503,6 +8320,14 @@ end
 # parallel_map -- this backend does not make parallel_map safer than
 # the interpreter, only equally (un)safe, which is what parity means.
 make a function called parallel_map takes items, fname returns results
+  return bm_parallel_map(items, fname, rt_list_new(0))
+end
+
+# parallel_map as block-model code calls it (block_model/lower.patlang): the
+# caller's __globals goes to every worker as its trailing parameter, so a
+# global set before the call reads the same inside it, as interpreted. A
+# worker's changes are not written back.
+make a function called bm_parallel_map takes items, fname, globals returns results
   let addr = resolve_func_addr(fname)
   if addr == 0 - 1 then
     print("parallel_map: function '" + fname + "' not found")
@@ -7512,12 +8337,10 @@ make a function called parallel_map takes items, fname returns results
   let ctxs = rt_list_new(n)
   let i = 0
   while i < n do
-    # GitHub #224 follow-up: a fresh, empty __globals list -- every
-    # block-model-compiled callee expects one as an implicit trailing
-    # parameter (same convention ThreadSpawn's own closure path already
-    # supplies via BuildList 0, see native_codegen.patlang's own header
-    # on this exact mistake made once there already).
-    rt_list_set(ctxs, i, os_thread_spawn_by_addr(addr, items[i], rt_list_new(0)))
+    # GitHub #224 follow-up: every block-model-compiled callee expects a
+    # __globals list as an implicit trailing parameter (see native_codegen.
+    # patlang's ThreadSpawn header on this exact mistake made once there).
+    rt_list_set(ctxs, i, os_thread_spawn_by_addr(addr, items[i], globals))
     let i = i + 1
   end
   let out = rt_list_new(n)
@@ -7585,7 +8408,10 @@ make a function called logic_fibers_list returns l
 end
 
 make a function called logic_fibers_list_set takes l returns done
-  mem_poke_qword(mem_fiber_table_addr(), 0, l)
+  let addr = mem_fiber_table_addr()
+  let old = mem_peek_qword(addr, 0)
+  mem_poke_qword(addr, 0, rt_keep(l))
+  rt_rc_dec_if_refcounted(old)
   return true
 end
 
@@ -7706,6 +8532,12 @@ make a function called budgeted_run takes ms, func_name, captured, existing retu
   let first_call = existing == false
   if first_call then
     let id = fiber_new(func_name)
+    # Carrying on with id -1 reported ["done", -1] without running the
+    # body, and a caller looping until its work is done never finished.
+    if id == 0 - 1 then
+      print("budgeted_run: no function named '" + func_name + "' in this build")
+      os_exit(94)
+    end
   else
     let id = existing
   end
@@ -7721,6 +8553,17 @@ make a function called budgeted_run takes ms, func_name, captured, existing retu
   else
     return ["done", result]
   end
+end
+
+# bm_budgeted_run(ms, closure, existing, globals) -- what the block-model
+# lowering makes of `budgeted(ms, existing) { body }`: the body is a
+# zero-parameter closure value ["__closure", name, captured], run on a fiber
+# by bm_budget_invoke, which the lowering adds to any program using
+# budgeted(). Returns ["done", value] or ["paused", handle], as budgeted_run.
+# The body's changes to globals are not handed back, as in the block-model
+# interpreter (bi_budget_entry).
+make a function called bm_budgeted_run takes ms, closure, existing, globals returns out
+  return budgeted_run(ms, "bm_budget_invoke", closure, existing)
 end
 
 # predict_next_duration_ms(samples) -- direct port of fiber.rs's OLS-
@@ -7974,7 +8817,10 @@ make a function called logic_vfs_list returns l
 end
 
 make a function called logic_vfs_list_set takes l returns done
-  mem_poke_qword(mem_vfs_table_addr(), 0, l)
+  let addr = mem_vfs_table_addr()
+  let old = mem_peek_qword(addr, 0)
+  mem_poke_qword(addr, 0, rt_keep(l))
+  rt_rc_dec_if_refcounted(old)
   return true
 end
 
@@ -8136,6 +8982,12 @@ end
 # notes throughout) -- family code 0 covers all four, and this always
 # reports "int" for it, never "bool"/"unit"/"float". A real but
 # scoped-down implementation, not a stub.
+# type_of names the code x64_family_code gives: 0 int, 2 string, 3 list,
+# 4 closure, 5 object (a cell: string_builder or vec), 6 bigint, 7 rational,
+# 8 complex, 9 interval, 11 bool, 12 bool_array, 13 unit, 14 float. The
+# runtime's numeric dispatch (rt_dynamic_numeric_binop and its helpers)
+# compares these codes directly rather than building the name and comparing
+# strings, which took a quarter of a BigInt sum's time.
 make a function called type_of takes v returns result
   let code = x64_family_code(v)
   if code == 2 then
@@ -8148,6 +9000,15 @@ make a function called type_of takes v returns result
     return "closure"
   end
   if code == 5 then
+    if rt_is_cell(v, rt_object_tag()) then
+      let cell_type = mem_peek_qword(v band rt_payload_mask(), 0)
+      if cell_type == rt_cell_sb_type() then
+        return "string_builder"
+      end
+      if cell_type == rt_cell_vec_type() then
+        return "vec"
+      end
+    end
     return "object"
   end
   if code == 6 then
@@ -8434,12 +9295,11 @@ make a function called list_dir takes path returns entries
   let has_more = 1
   while has_more == 1 do
     let name = os_find_data_name()
-    if (not rt_str_eq(name, ".")) and (not rt_str_eq(name, "..")) then
-      if os_find_data_is_dir() == 1 then
-        let entries = list_push(entries, name + "/")
-      else
-        let entries = list_push(entries, name)
-      end
+    if rt_str_eq(name, ".") or rt_str_eq(name, "..") then
+    elif os_find_data_is_dir() == 1 then
+      let entries = list_push(entries, rt_str_concat(name, "/"))
+    else
+      let entries = list_push(entries, name)
     end
     let has_more = os_find_next(handle)
   end

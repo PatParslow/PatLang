@@ -39,10 +39,14 @@ Feature: BigInt arithmetic agrees between the interpreter and native x64 (GitHub
   meaningful definition -- checked directly against the interpreter and it
   does: real floating-point-style modulo).
 
+  `chr()` on a Float had the same gap: native code used the boxed Float's
+  tagged word as the byte, where the interpreter truncates (`chr(66.9)` is
+  `"B"`).
+
   Scenario: v.to_s on primitives, chr() on a Rational, and Rational %, match the interpreter
-    Given int, Rational, Bool and List values stringified with .to_s, a byte built via chr() on a Rational produced by /, and several Rational % combinations including negative operands
+    Given int, Rational, Bool and List values stringified with .to_s, a byte built via chr() on a Rational produced by / and on a Float, and several Rational % combinations including negative operands
     When the file is run under `pat --ir-run` and compiled+run via `--x64`
-    Then both print the same thirteen lines
+    Then both print the same fourteen lines
 
   A third, unrelated gap (GitHub #188), found writing a fixture for the second:
   the self-hosted lexer (used only by `patc1 --x64`, not the interpreter) reads
@@ -196,3 +200,8 @@ Feature: BigInt arithmetic agrees between the interpreter and native x64 (GitHub
     Given plus(a, b) with no float literal in its own body, called directly as plus(1.5, 2)
     When the file is run under `pat --ir-run` and compiled+run via `--x64`
     Then both print 3.5, with no manual rt_box_float call anywhere in the source
+
+  Scenario: an integral float prints as the integer it is, however large (GitHub #230)
+    Given 2^1023, -2^1000, 2^70, 2^62 and 3 * 2^64 as floats (pow(2.0, n)), 4.0, and "" + 2^66
+    When the integral float file is run under `pat --ir-run` and compiled+run via `--x64`
+    Then both print each value's exact integer text, never the saturated 9223372036854775807

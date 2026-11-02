@@ -39,6 +39,15 @@ Feature: classes with methods, inheritance and traits on named objects (GitHub #
     When it runs through bm_lower_program/bi_run
     Then it prints the same eight lines as pat --ir-run does for the identical source
 
+  Every class is registered with class_def, so `new(class, name)` gives its
+  objects their field defaults. Only a class with methods, a parent or traits
+  used to be, so a class with fields alone had none.
+
+  Scenario: a class with only fields gives new objects its defaults, matching the real engine
+    Given a fields-only class with an int, string, bool, list and float default, and a class with a method, instantiated with new(class, name) at the top level and in a function
+    When it runs through bm_lower_program/bi_run
+    Then it prints the same seven lines as pat --ir-run does for the identical source
+
   Method-call syntax without a class. `obj.method(args)` is the host
   `send(obj, "method", args...)`. It is now lowered as an expression, and any
   expression statement that is not a plain call (a method call used for its

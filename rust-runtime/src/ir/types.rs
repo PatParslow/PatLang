@@ -68,6 +68,31 @@ pub enum Value {
     // captured names ++ the closure's own params, in that order) plus the
     // captured environment snapshotted at closure-creation time.
     Closure { func_name: String, captured: Vec<(String, Value)> },
+    // A string builder (sb_new) and a vec (vec_new): mutable values with a
+    // stable identity, freed with their last reference. They used to be
+    // integer handles into thread-local tables that only grew
+    // (docs/plans/general-refcounting.md, 6e/6f); native code keeps them as
+    // counted cells (x64_runtime.patlang, rt_cell_new).
+    StringBuilder(Cell<String>),
+    Vec(Cell<Vec<Value>>),
+}
+
+// Shared, mutable contents compared by identity, as native cells are: two
+// builders are equal only if they are the same builder.
+#[derive(Clone)]
+pub struct Cell<T>(pub Arc<std::sync::Mutex<T>>);
+
+impl<T> Cell<T> {
+    pub fn new(v: T) -> Self { Cell(Arc::new(std::sync::Mutex::new(v))) }
+    pub fn lock(&self) -> std::sync::MutexGuard<'_, T> { self.0.lock().unwrap_or_else(|e| e.into_inner()) }
+}
+
+impl<T> PartialEq for Cell<T> {
+    fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
+}
+
+impl<T> std::fmt::Debug for Cell<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "Cell@{:p}", Arc::as_ptr(&self.0)) }
 }
 
 // Lossy BigInt/Rational -> f64 conversion via decimal string round-trip.
@@ -105,6 +130,7 @@ impl Value {
             Value::Object(map) => Ok(!map.is_empty()),
             Value::HostFunction(_) => Ok(true),
             Value::Closure { .. } => Ok(true),
+            Value::StringBuilder(_) | Value::Vec(_) => Ok(true),
         }
     }
 }

@@ -498,24 +498,24 @@ make a function called x64_taint_get takes map, name returns tainted
   return false
 end
 
+# The map with name's flag set to tainted: the same map when it already
+# holds that value (most Stores, taint only growing), else one pair
+# replaced or added. It used to copy every pair on every call, which in a
+# large function's fixed point (stores x locals x passes) was the
+# compiler's biggest allocator building pati.
 make a function called x64_taint_set takes map, name, tainted returns out
   let n = to_num(list_len(map))
-  let out = []
-  let found = false
   let i = 0
   while i < n do
     if map[i][0] == name then
-      let out = list_push(out, [name, tainted])
-      let found = true
-    else
-      let out = list_push(out, map[i])
+      if map[i][1] == tainted then
+        return map
+      end
+      return list_set(map, i, [name, tainted])
     end
     let i = i + 1
   end
-  if not found then
-    let out = list_push(out, [name, tainted])
-  end
-  return out
+  return list_push(map, [name, tainted])
 end
 
 make a function called x64_taint_maps_equal takes m1, m2 returns yes
@@ -527,6 +527,29 @@ make a function called x64_taint_maps_equal takes m1, m2 returns yes
       return false
     end
     let i = i + 1
+  end
+  return true
+end
+
+# The [opaque, safe_seen, unsafe] maps x64_taint_one_pass_float carries
+# between passes; [] before the first pass.
+# The x64_runtime.patlang functions whose parameter is a raw float64 bit
+# pattern, not a tagged value: a raw float argument is passed to them as it
+# is, never boxed (rt_box_float boxed the box's own pointer instead).
+make a function called x64_raw_float_param_fns returns names
+  return ["rt_box_float", "rt_print_float", "rt_float_bits_to_string", "rt_float_shortest", "rt_float_shortest_text", "rt_float_bits_integral", "rt_float_big_integral_text", "rt_float_decompose"]
+end
+
+make a function called x64_carried_maps_equal takes c1, c2 returns yes
+  if (c1 == []) or (c2 == []) then
+    return c1 == c2
+  end
+  let k = 0
+  while k < 3 do
+    if not x64_taint_maps_equal(list_get(c1, k), list_get(c2, k)) then
+      return false
+    end
+    let k = k + 1
   end
   return true
 end
@@ -1109,7 +1132,7 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
   # patc1.exe segfaulted compiling and running even a bare `print(2.5)`
   # (which has no Bin at all in ITS OWN body -- x64_runtime.patlang's
   # own internal float-formatting function, sharing this same analysis,
-  # was the one silently corrupted). safe_map/safe_stack track a
+  # was the one silently corrupted). safe_seen_map/unsafe_map/safe_stack track a
   # SEPARATE, stricter fact per value: is its value fully accounted for
   # within this function's own visible code (a literal, or arithmetic
   # built only from such values), as opposed to arriving from outside
@@ -1121,7 +1144,6 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
   # naturally reads back false = unsafe via x64_taint_get's own unset-key
   # default -- no separate parameter list needs threading in here at all.
   let safe_stack = []
-  let safe_map = []
   # GitHub #229: opaque = this value's type is not visible here (a call
   # or CallHost result, a non-numeric literal, or a tagged value built from
   # one) -- see the Bin case. Parameters and int literals are not opaque.
@@ -1141,6 +1163,33 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
       let pi = pi + 1
     end
   end
+  # This analysis gives each variable ONE representation for the whole
+  # function. In tagged code a variable can be assigned a raw float
+  # (`let v = 0.0`) and, elsewhere, a tagged value (`let v = v * t` with t
+  # a parameter, computed dynamically) -- its slot would then hold both,
+  # and a raw-float reading of it misreads the tagged ones. tagged_stores
+  # records variables given a tagged (opaque, non-raw) value; the wrapper
+  # demotes any that is also float-tainted (conv[2]): such a variable is
+  # always tagged, a raw float stored into it is boxed at the Store.
+  let demoted = []
+  if list_len(conv) > 2 then
+    let demoted = list_get(conv, 2)
+  end
+  # Whether a variable is opaque or safe is a fact about ALL its stores,
+  # not the ones this linear pass has seen so far: a loop body laid out
+  # before the stores that feed it (a nested loop's head) read its
+  # counter as neither, so `i * 2.5` read i's int bits as a double. So,
+  # like map, they carry across passes (conv[3]): opaque if any store is
+  # opaque; safe only once some store was seen and none is unsafe.
+  let unsafe_map = []
+  let safe_seen_map = []
+  if list_len(conv) > 3 then
+    let carried = list_get(conv, 3)
+    let opaque_map = list_get(carried, 0)
+    let safe_seen_map = list_get(carried, 1)
+    let unsafe_map = list_get(carried, 2)
+  end
+  let tagged_stores = []
   let i = 0
   while i < n do
     let produces_float = list_push(produces_float, false)
@@ -1162,9 +1211,15 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
       # literal mixed with a float is not arithmetic at all (GitHub #229:
       # `"d=" + d` with d a raw float used to cvtsi2sd the string's
       # pointer and add it as a float).
-      let safe_pr = x64_vstack_push(safe_stack, sp, instr[1] == "num")
+      # A literal past the fixnum range is a BigInt at run time
+      # (x64_num_const_needs_bigint_promotion), not a raw int either.
+      let raw_num = false
+      if instr[1] == "num" then
+        let raw_num = not x64_num_const_needs_bigint_promotion(instr[2])
+      end
+      let safe_pr = x64_vstack_push(safe_stack, sp, raw_num)
       let safe_stack = safe_pr[0]
-      let opq_pr = x64_vstack_push(opaque_stack, sp, instr[1] != "num")
+      let opq_pr = x64_vstack_push(opaque_stack, sp, not raw_num)
       let opaque_stack = opq_pr[0]
       let sp = pr[1]
     elif ty == "Load" then
@@ -1172,7 +1227,8 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
       let produces_float = list_set(produces_float, i, tainted)
       let pr = x64_vstack_push(stack, sp, tainted)
       let stack = pr[0]
-      let safe_pr = x64_vstack_push(safe_stack, sp, x64_taint_get(safe_map, instr[1]))
+      let load_safe = x64_taint_get(safe_seen_map, instr[1]) and (not x64_taint_get(unsafe_map, instr[1]))
+      let safe_pr = x64_vstack_push(safe_stack, sp, load_safe)
       let safe_stack = safe_pr[0]
       let opq_pr = x64_vstack_push(opaque_stack, sp, x64_taint_get(opaque_map, instr[1]))
       let opaque_stack = opq_pr[0]
@@ -1182,9 +1238,24 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
       let safe_pr = x64_vstack_pop(safe_stack, sp)
       let opq_pr = x64_vstack_pop(opaque_stack, sp)
       let sp = pr[1]
-      let map = x64_taint_set(map, instr[1], x64_taint_get(map, instr[1]) or pr[0])
-      let safe_map = x64_taint_set(safe_map, instr[1], safe_pr[0])
-      let opaque_map = x64_taint_set(opaque_map, instr[1], x64_taint_get(opaque_map, instr[1]) or opq_pr[0])
+      if x64_taint_get(demoted, instr[1]) then
+        if pr[0] then
+          let call_box_entries = list_push(call_box_entries, [i, 0])
+        end
+        let unsafe_map = x64_taint_set(unsafe_map, instr[1], true)
+        let opaque_map = x64_taint_set(opaque_map, instr[1], true)
+      else
+        let map = x64_taint_set(map, instr[1], x64_taint_get(map, instr[1]) or pr[0])
+        if safe_pr[0] then
+          let safe_seen_map = x64_taint_set(safe_seen_map, instr[1], true)
+        else
+          let unsafe_map = x64_taint_set(unsafe_map, instr[1], true)
+        end
+        let opaque_map = x64_taint_set(opaque_map, instr[1], x64_taint_get(opaque_map, instr[1]) or opq_pr[0])
+        if tagged and (not pr[0]) and opq_pr[0] then
+          let tagged_stores = x64_taint_set(tagged_stores, instr[1], true)
+        end
+      end
     elif ty == "Bin" then
       let pr1 = x64_vstack_pop(stack, sp)
       let safe_pr1 = x64_vstack_pop(safe_stack, sp)
@@ -1211,6 +1282,15 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
       # own float formatting (rt_float_decompose) relies on.
       let opaque_side = ((not pr2[0]) and opq_pr2[0]) or ((not pr1[0]) and opq_pr1[0])
       let result_opaque = opq_pr1[0] or opq_pr2[0]
+      let result_safe = safe_pr1[0] and safe_pr2[0]
+      # In tagged code integer arithmetic is computed dynamically, so even
+      # literal operands do not give a proven raw int: 1/10 is a Rational,
+      # 2**70 or a product past 2^47 a BigInt. Converting one with cvtsi2sd
+      # read its pointer as a number (`0.1 - (1/10)` gave garbage).
+      if tagged and (not operand_float) and (not x64_is_dynamic_cmp_op(instr[1])) then
+        let result_opaque = true
+        let result_safe = false
+      end
       let is_float_dyn = false
       if operand_float and opaque_side and (x64_dynamic_op_supported(instr[1]) or (instr[1] == "/") or (instr[1] == "%")) then
         let float_dyn_bins = list_push(float_dyn_bins, [i, pr2[0], pr1[0]])
@@ -1244,7 +1324,7 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
       let produces_float = list_set(produces_float, i, result_taint)
       let pr3 = x64_vstack_push(stack, sp, result_taint)
       let stack = pr3[0]
-      let safe_pr3 = x64_vstack_push(safe_stack, sp, safe_pr1[0] and safe_pr2[0])
+      let safe_pr3 = x64_vstack_push(safe_stack, sp, result_safe)
       let safe_stack = safe_pr3[0]
       let opq_pr3 = x64_vstack_push(opaque_stack, sp, result_opaque)
       let opaque_stack = opq_pr3[0]
@@ -1284,8 +1364,9 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
       let last_arg_taint = false
       let k = 0
       # max/min (x64_runtime.patlang rt_host_max/rt_host_min) take tagged
-      # values too, like the storing primitives.
-      let stores_value = (instr[1] == "list_push") or (instr[1] == "list_set") or (instr[1] == "set_var") or (instr[1] == "max") or (instr[1] == "min")
+      # values too, like the storing primitives, and so does list_get's
+      # index (xs[floor(fy)] -- rt_list_get truncates a boxed Float).
+      let stores_value = (instr[1] == "list_push") or (instr[1] == "list_set") or (instr[1] == "set_var") or (instr[1] == "max") or (instr[1] == "min") or (instr[1] == "list_get")
       let all_args_raw = argc > 0
       let raw_arg_positions = []
       while k < argc do
@@ -1385,6 +1466,17 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
       # this purely-simulated analysis pass.
       let callee_is_float_mode = x64_str_in_list(float_func_names, instr[1])
       let callee_is_bm_fn = x64_bm_fn_prefixed(instr[1])
+      # A runtime function called from tagged code takes tagged values too
+      # (vec_get(store, floor(fy)) passed 1.0's raw bits as the index),
+      # except the ones that already handle a raw float themselves: print
+      # (rerouted to rt_print_float), type_of/get (boxed by
+      # x64_float_box_single/receiver_indices), floor (its result
+      # follows its argument's taint, below) and the runtime entry points
+      # that take a raw float's bits (x64_raw_float_param_fns).
+      let callee_takes_tagged = callee_is_bm_fn
+      if tagged and (not callee_is_bm_fn) and (not callee_is_float_mode) then
+        let callee_takes_tagged = not (x64_str_in_list(["print", "type_of", "get", "floor"], instr[1]) or x64_str_in_list(x64_raw_float_param_fns(), instr[1]))
+      end
       let skip_globals_pos = 0 - 1
       if callee_is_bm_fn then
         let skip_globals_pos = 0
@@ -1405,7 +1497,7 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
         # (its parameters are opaque there, float_mode or not), so a raw
         # float argument is always boxed. (The __globals list is never
         # float-tainted, and a pure callee has no __globals argument.)
-        if callee_is_bm_fn and pr[0] then
+        if callee_takes_tagged and pr[0] then
           let call_box_entries = list_push(call_box_entries, [i, k])
         end
         let k = k + 1
@@ -1536,7 +1628,7 @@ make a function called x64_taint_one_pass_float takes instrs, locals_taint, floa
     end
     let i = i + 1
   end
-  return [map, float_instr_indices, produces_float, bailed, mixed_left_int_indices, mixed_right_int_indices, call_box_entries, float_dyn_bins]
+  return [map, float_instr_indices, produces_float, bailed, mixed_left_int_indices, mixed_right_int_indices, call_box_entries, float_dyn_bins, tagged_stores, [opaque_map, safe_seen_map, unsafe_map]]
 end
 
 # Stage 1 wrapper (fixed-point loop), mirroring x64_analyze_dynamic_bins
@@ -1557,8 +1649,20 @@ make a function called x64_analyze_float_bins takes instrs, float_func_names, co
   let pass = 0
   let bailed = false
   let stable = false
+  # Variables kept tagged (see x64_taint_one_pass_float's tagged_stores).
+  # Each demotion restarts the fixed point from an empty map, since taint
+  # that flowed out of a demoted variable no longer holds; demoted only
+  # grows, so this terminates.
+  let demoted = []
+  # opaque/safe facts carried between passes, like map (see the pass).
+  let carried = []
   while (pass < max_passes) and (not stable) and (not bailed) do
-    let result = x64_taint_one_pass_float(instrs, map, float_func_names, conv)
+    let pass_conv = [list_get(conv, 0), list_get(conv, 1), demoted]
+    if carried != [] then
+      let pass_conv = [list_get(conv, 0), list_get(conv, 1), demoted, carried]
+    end
+    let result = x64_taint_one_pass_float(instrs, map, float_func_names, pass_conv)
+    let new_carried = result[9]
     let new_map = result[0]
     let float_instr_indices = result[1]
     let produces_float = result[2]
@@ -1567,11 +1671,29 @@ make a function called x64_analyze_float_bins takes instrs, float_func_names, co
     let mixed_right_int_indices = result[5]
     let call_box_entries = result[6]
     let float_dyn_bins = result[7]
-    if x64_taint_maps_equal(map, new_map) then
-      let stable = true
+    let tagged_stores = result[8]
+    let newly_demoted = false
+    let ti = 0
+    while ti < list_len(tagged_stores) do
+      let tname = list_get(list_get(tagged_stores, ti), 0)
+      if x64_taint_get(new_map, tname) and (not x64_taint_get(demoted, tname)) then
+        let demoted = x64_taint_set(demoted, tname, true)
+        let newly_demoted = true
+      end
+      let ti = ti + 1
     end
-    let map = new_map
-    let pass = pass + 1
+    if newly_demoted then
+      let map = []
+      let carried = []
+      let pass = 0
+    else
+      if x64_taint_maps_equal(map, new_map) and x64_carried_maps_equal(carried, new_carried) then
+        let stable = true
+      end
+      let map = new_map
+      let carried = new_carried
+      let pass = pass + 1
+    end
   end
   if bailed then
     let float_instr_indices = x64_all_bin_indices(instrs)
@@ -1593,7 +1715,11 @@ end
 # re-encoded as a float bit pattern. See this section's own header
 # comment above for the two rules implemented (direct Bin/Un operand;
 # immediately-preceding a Store into an eventually-float local).
-make a function called x64_analyze_float_consts takes instrs, final_map, float_instr_indices returns float_const_indices
+# A literal operand on a mixed int side (mixed_left/mixed_right, from stage
+# 1) is NOT re-encoded: x64_binop_asm_float converts that side with
+# cvtsi2sd, and converting the bits of 1.0 as an integer made `1 - v` about
+# 4.6e18.
+make a function called x64_analyze_float_consts takes instrs, final_map, float_instr_indices, mixed_left, mixed_right returns float_const_indices
   let n = to_num(list_len(instrs))
   let out = []
   let stack = []
@@ -1630,10 +1756,10 @@ make a function called x64_analyze_float_consts takes instrs, final_map, float_i
       let pr2 = x64_vstack_pop(stack, sp)
       let sp = pr2[1]
       if x64_str_in_list(float_instr_indices, i) then
-        if pr1[0] >= 0 then
+        if (pr1[0] >= 0) and (not x64_str_in_list(mixed_right, i)) then
           let out = list_push(out, pr1[0])
         end
-        if pr2[0] >= 0 then
+        if (pr2[0] >= 0) and (not x64_str_in_list(mixed_left, i)) then
           let out = list_push(out, pr2[0])
         end
       end
@@ -2684,9 +2810,16 @@ end
 # raw side(s) are boxed in place, in the same two per-frame slots every
 # dynamic Bin uses, then the ordinary dynamic dispatch runs on the
 # operands' real run-time types, leaving a tagged result.
-make a function called x64_binop_asm_float_dynamic takes op, spilled, sides returns asm
+# A raw float side is boxed to reach the runtime's dynamic arithmetic, which
+# only borrows it; the box is released once the result is on the stack (the
+# pointer is kept in a box-save slot, x64_box_save_slots, since the dynamic
+# paths reuse dyn_a/dyn_b). Each one used to be left behind on every mixed
+# float operation.
+make a function called x64_binop_asm_float_dynamic takes op, spilled, sides, slot_base returns asm
   let dyn_a = 8 * (to_num(list_len(spilled)) + 2)
   let dyn_b = 8 * (to_num(list_len(spilled)) + 3)
+  let box_a = slot_base + 8
+  let box_b = slot_base + 16
   let sb = sb_new()
   sb_push(sb, "    pop qword [rbp-" + dyn_b + "]" + x64_nl_char())
   sb_push(sb, "    pop qword [rbp-" + dyn_a + "]" + x64_nl_char())
@@ -2695,12 +2828,14 @@ make a function called x64_binop_asm_float_dynamic takes op, spilled, sides retu
     sb_push(sb, "    call rt_box_float" + x64_nl_char())
     sb_push(sb, "    add rsp, 8" + x64_nl_char())
     sb_push(sb, "    mov [rbp-" + dyn_a + "], rax" + x64_nl_char())
+    sb_push(sb, "    mov [rbp-" + box_a + "], rax" + x64_nl_char())
   end
   if list_get(sides, 1) == true then
     sb_push(sb, "    push qword [rbp-" + dyn_b + "]" + x64_nl_char())
     sb_push(sb, "    call rt_box_float" + x64_nl_char())
     sb_push(sb, "    add rsp, 8" + x64_nl_char())
     sb_push(sb, "    mov [rbp-" + dyn_b + "], rax" + x64_nl_char())
+    sb_push(sb, "    mov [rbp-" + box_b + "], rax" + x64_nl_char())
   end
   sb_push(sb, "    push qword [rbp-" + dyn_a + "]" + x64_nl_char())
   sb_push(sb, "    push qword [rbp-" + dyn_b + "]" + x64_nl_char())
@@ -2710,6 +2845,16 @@ make a function called x64_binop_asm_float_dynamic takes op, spilled, sides retu
     sb_push(sb, x64_binop_asm_mod_dynamic(spilled))
   else
     sb_push(sb, x64_binop_asm_dynamic(op, spilled))
+  end
+  if list_get(sides, 0) == true then
+    sb_push(sb, "    push qword [rbp-" + box_a + "]" + x64_nl_char())
+    sb_push(sb, "    call rt_rc_dec_if_refcounted" + x64_nl_char())
+    sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  end
+  if list_get(sides, 1) == true then
+    sb_push(sb, "    push qword [rbp-" + box_b + "]" + x64_nl_char())
+    sb_push(sb, "    call rt_rc_dec_if_refcounted" + x64_nl_char())
+    sb_push(sb, "    add rsp, 8" + x64_nl_char())
   end
   return sb_str(sb)
 end
@@ -2803,6 +2948,17 @@ make a function called x64_binop_asm_dynamic takes op, spilled returns asm
     sb_push(sb, "    push qword [rbp-" + dyn_b + "]" + x64_nl_char())
     sb_push(sb, "    call " + x64_bigint_fn_for_op(op) + x64_nl_char())
     sb_push(sb, "    add rsp, 16" + x64_nl_char())
+    # Both operands were fixnums promoted just above: those two BigInts are
+    # this sequence's own, released once the result is made (counted since
+    # docs/plans/general-refcounting.md 6d).
+    sb_push(sb, "    push rax" + x64_nl_char())
+    sb_push(sb, "    push qword [rbp-" + dyn_a + "]" + x64_nl_char())
+    sb_push(sb, "    call rt_rc_dec_if_refcounted" + x64_nl_char())
+    sb_push(sb, "    add rsp, 8" + x64_nl_char())
+    sb_push(sb, "    push qword [rbp-" + dyn_b + "]" + x64_nl_char())
+    sb_push(sb, "    call rt_rc_dec_if_refcounted" + x64_nl_char())
+    sb_push(sb, "    add rsp, 8" + x64_nl_char())
+    sb_push(sb, "    pop rax" + x64_nl_char())
     sb_push(sb, "    jmp .DYN_DONE_" + suffix + x64_nl_char())
   end
   # NOTFAST: at least one operand isn't fixnum. Real bug found and
@@ -2996,6 +3152,12 @@ end
 make a function called x64_str_aware_plus_asm returns asm
   let suffix = label_asm_safe(0)
   let sb = sb_new()
+  # Two slots for the strings made from a list, number or unit operand
+  # ([rsp] the right's, [rsp+8] the left's), released once the result is
+  # made: each conversion returns a string of its own (docs/plans/
+  # general-refcounting.md, Phase 7), which `"" + [k]` used to leave behind.
+  sb_push(sb, "    push 0" + x64_nl_char())
+  sb_push(sb, "    push 0" + x64_nl_char())
   # Real bug found (GitHub #35 investigation): a natural "stringify a
   # list for display" idiom, `"" + some_list`, silently fell all the
   # way through this function's own String-vs-String AND-chain below
@@ -3020,6 +3182,7 @@ make a function called x64_str_aware_plus_asm returns asm
   sb_push(sb, "    call rt_list_to_display_string" + x64_nl_char())
   sb_push(sb, "    add rsp, 8" + x64_nl_char())
   sb_push(sb, "    pop r10" + x64_nl_char())
+  sb_push(sb, "    mov [rsp+8], rax" + x64_nl_char())
   sb_push(sb, ".PLUSNOTLIST1_" + suffix + ":" + x64_nl_char())
   sb_push(sb, "    mov rcx, r10" + x64_nl_char())
   sb_push(sb, "    and rcx, r15" + x64_nl_char())
@@ -3031,6 +3194,7 @@ make a function called x64_str_aware_plus_asm returns asm
   sb_push(sb, "    add rsp, 8" + x64_nl_char())
   sb_push(sb, "    mov r10, rax" + x64_nl_char())
   sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    mov [rsp], r10" + x64_nl_char())
   sb_push(sb, ".PLUSNOTLIST2_" + suffix + ":" + x64_nl_char())
   # Number-to-string coercion (GitHub #89 follow-up) -- mirrors the List
   # conversion above exactly, for the equally common "number + string"/
@@ -3067,6 +3231,7 @@ make a function called x64_str_aware_plus_asm returns asm
   sb_push(sb, "    call rt_int_to_str" + x64_nl_char())
   sb_push(sb, "    add rsp, 8" + x64_nl_char())
   sb_push(sb, "    pop r10" + x64_nl_char())
+  sb_push(sb, "    mov [rsp+8], rax" + x64_nl_char())
   sb_push(sb, ".PLUSNOTNUM1_" + suffix + ":" + x64_nl_char())
   sb_push(sb, "    mov rcx, r10" + x64_nl_char())
   sb_push(sb, "    and rcx, r15" + x64_nl_char())
@@ -3086,6 +3251,7 @@ make a function called x64_str_aware_plus_asm returns asm
   sb_push(sb, "    add rsp, 8" + x64_nl_char())
   sb_push(sb, "    mov r10, rax" + x64_nl_char())
   sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    mov [rsp], r10" + x64_nl_char())
   sb_push(sb, ".PLUSNOTNUM2_" + suffix + ":" + x64_nl_char())
   # Unit-to-empty-string coercion (GitHub #85) -- mirrors the List/Number
   # coercion above exactly, for `"..." + unit`/`unit + "..."` (the
@@ -3115,6 +3281,7 @@ make a function called x64_str_aware_plus_asm returns asm
   sb_push(sb, "    call rt_unit_to_str" + x64_nl_char())
   sb_push(sb, "    add rsp, 8" + x64_nl_char())
   sb_push(sb, "    pop r10" + x64_nl_char())
+  sb_push(sb, "    mov [rsp+8], rax" + x64_nl_char())
   sb_push(sb, ".PLUSNOTUNIT1_" + suffix + ":" + x64_nl_char())
   # Reload r15/r8 rather than trusting them across the call above (r8 is
   # caller-saved under Win64 -- a callee is free to clobber it -- even
@@ -3131,6 +3298,7 @@ make a function called x64_str_aware_plus_asm returns asm
   sb_push(sb, "    add rsp, 8" + x64_nl_char())
   sb_push(sb, "    mov r10, rax" + x64_nl_char())
   sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    mov [rsp], r10" + x64_nl_char())
   sb_push(sb, ".PLUSNOTUNIT2_" + suffix + ":" + x64_nl_char())
   # Same bug class as x64_str_aware_eq_asm just above, same fix: only
   # concatenate once BOTH operands independently pass the string-
@@ -3165,6 +3333,23 @@ make a function called x64_str_aware_plus_asm returns asm
   sb_push(sb, "    call rt_str_concat" + x64_nl_char())
   sb_push(sb, "    add rsp, 16" + x64_nl_char())
   sb_push(sb, ".PLUSDONE_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rsp+8]" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+  sb_push(sb, "    je .PLUSREL1_" + suffix + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    call rt_rc_dec_if_refcounted" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, ".PLUSREL1_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rsp+16]" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+  sb_push(sb, "    je .PLUSREL2_" + suffix + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    call rt_rc_dec_if_refcounted" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, ".PLUSREL2_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    add rsp, 16" + x64_nl_char())
   return sb_str(sb)
 end
 
@@ -3313,10 +3498,12 @@ make a function called x64_maybe_coerce_boxed_float_asm takes reg returns asm
   sb_push(sb, "    mov r12, 5368709120" + x64_nl_char())
   sb_push(sb, "    cmp r9, r12" + x64_nl_char())
   sb_push(sb, "    jl .mcbf_checkheap_" + suffix + x64_nl_char())
+  # Above the image it may still be the heap, which VirtualAlloc can place
+  # just past it: a box beyond 0x150000000 used to skip the heap test and
+  # be taken for an int (raytrace ch34). As x64_family_code_asm does.
   sb_push(sb, "    mov r12, 5637144576" + x64_nl_char())
   sb_push(sb, "    cmp r9, r12" + x64_nl_char())
   sb_push(sb, "    jl .mcbf_unbox_" + suffix + x64_nl_char())
-  sb_push(sb, "    jmp .mcbf_skip_" + suffix + x64_nl_char())
   sb_push(sb, ".mcbf_checkheap_" + suffix + ":" + x64_nl_char())
   sb_push(sb, "    mov r12, [rel g_heap_base]" + x64_nl_char())
   sb_push(sb, "    cmp r9, r12" + x64_nl_char())
@@ -3342,7 +3529,13 @@ make a function called x64_maybe_coerce_boxed_float_asm takes reg returns asm
   return sb_str(sb)
 end
 
-make a function called x64_binop_asm takes op returns asm
+# `coerce`: whether a boxed Float reaching a bitwise operator is truncated
+# to an int first (the user-level meaning, as in the interpreter). False in
+# the runtime's own raw-word functions (x64_func_is_tower_impl): they mask
+# tags and payloads of any value on purpose, and coercing there turned a
+# boxed Float into its numeric value -- rt_rc_dec_if_refcounted then saw
+# no Float tag and never released a box.
+make a function called x64_binop_asm takes op, coerce returns asm
   let sb = sb_new()
   sb_push(sb, "    pop r10" + x64_nl_char())
   sb_push(sb, "    pop rax" + x64_nl_char())
@@ -3387,29 +3580,39 @@ make a function called x64_binop_asm takes op returns asm
             # too, these ops need real codegen here, not just in the
             # rustc-text backend).
             if op == "band" then
-              sb_push(sb, x64_maybe_coerce_boxed_float_asm("rax"))
-              sb_push(sb, x64_maybe_coerce_boxed_float_asm("r10"))
+              if coerce then
+                sb_push(sb, x64_maybe_coerce_boxed_float_asm("rax"))
+                sb_push(sb, x64_maybe_coerce_boxed_float_asm("r10"))
+              end
               sb_push(sb, "    and rax, r10" + x64_nl_char())
             else
               if op == "bor" then
-                sb_push(sb, x64_maybe_coerce_boxed_float_asm("rax"))
-                sb_push(sb, x64_maybe_coerce_boxed_float_asm("r10"))
+                if coerce then
+                  sb_push(sb, x64_maybe_coerce_boxed_float_asm("rax"))
+                  sb_push(sb, x64_maybe_coerce_boxed_float_asm("r10"))
+                end
                 sb_push(sb, "    or rax, r10" + x64_nl_char())
               else
                 if op == "bxor" then
-                  sb_push(sb, x64_maybe_coerce_boxed_float_asm("rax"))
-                  sb_push(sb, x64_maybe_coerce_boxed_float_asm("r10"))
+                  if coerce then
+                    sb_push(sb, x64_maybe_coerce_boxed_float_asm("rax"))
+                    sb_push(sb, x64_maybe_coerce_boxed_float_asm("r10"))
+                  end
                   sb_push(sb, "    xor rax, r10" + x64_nl_char())
                 else
                   if op == "shl" then
-                    sb_push(sb, x64_maybe_coerce_boxed_float_asm("rax"))
-                    sb_push(sb, x64_maybe_coerce_boxed_float_asm("r10"))
+                    if coerce then
+                      sb_push(sb, x64_maybe_coerce_boxed_float_asm("rax"))
+                      sb_push(sb, x64_maybe_coerce_boxed_float_asm("r10"))
+                    end
                     sb_push(sb, "    mov rcx, r10" + x64_nl_char())
                     sb_push(sb, "    shl rax, cl" + x64_nl_char())
                   else
                     if op == "shr" then
-                      sb_push(sb, x64_maybe_coerce_boxed_float_asm("rax"))
-                      sb_push(sb, x64_maybe_coerce_boxed_float_asm("r10"))
+                      if coerce then
+                        sb_push(sb, x64_maybe_coerce_boxed_float_asm("rax"))
+                        sb_push(sb, x64_maybe_coerce_boxed_float_asm("r10"))
+                      end
                       sb_push(sb, "    mov rcx, r10" + x64_nl_char())
                       sb_push(sb, "    sar rax, cl" + x64_nl_char())
                     else
@@ -3631,6 +3834,58 @@ make a function called x64_fiber_tls_ensure_asm takes suffix returns asm
   sb_push(sb, "    jmp .ftls_check_" + suffix + x64_nl_char())
   sb_push(sb, "  .ftls_ready_" + suffix + ":" + x64_nl_char())
   sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# Pushes the address of this thread's cell at `offset` in its own 16-byte
+# block of table roots ([sb table][vec table]), made zeroed on the thread's
+# first use and kept in a lazily TlsAlloc()'d slot (the 3-state race of
+# x64_fiber_tls_ensure_asm). One process-wide slot each made parallel_map
+# workers race on the same tables, and a worker's handles did not start at
+# 0 as interpreted (raytrace ch37). rbx and r12 are preserved; the rest is
+# a call's usual clobbers.
+make a function called x64_thread_tables_cell_asm takes offset, suffix returns asm
+  let sb = sb_new()
+  sb_push(sb, "    push r12" + x64_nl_char())
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "  .ttls_check_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rel g_tables_tls_ready]" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 2" + x64_nl_char())
+  sb_push(sb, "    je .ttls_ready_" + suffix + x64_nl_char())
+  sb_push(sb, "    xor rax, rax" + x64_nl_char())
+  sb_push(sb, "    mov rcx, 1" + x64_nl_char())
+  sb_push(sb, "    lock cmpxchg [rel g_tables_tls_ready], rcx" + x64_nl_char())
+  sb_push(sb, "    jne .ttls_spin_" + suffix + x64_nl_char())
+  sb_push(sb, "    call TlsAlloc" + x64_nl_char())
+  sb_push(sb, "    mov [rel g_tables_tls_slot], rax" + x64_nl_char())
+  sb_push(sb, "    mov qword [rel g_tables_tls_ready], 2" + x64_nl_char())
+  sb_push(sb, "    jmp .ttls_ready_" + suffix + x64_nl_char())
+  sb_push(sb, "  .ttls_spin_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    pause" + x64_nl_char())
+  sb_push(sb, "    jmp .ttls_check_" + suffix + x64_nl_char())
+  sb_push(sb, "  .ttls_ready_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov ecx, [rel g_tables_tls_slot]" + x64_nl_char())
+  sb_push(sb, "    call TlsGetValue" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+  sb_push(sb, "    jne .ttls_have_" + suffix + x64_nl_char())
+  # VirtualAlloc(NULL, 4096, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE): zeroed.
+  sb_push(sb, "    xor ecx, ecx" + x64_nl_char())
+  sb_push(sb, "    mov edx, 4096" + x64_nl_char())
+  sb_push(sb, "    mov r8d, 12288" + x64_nl_char())
+  sb_push(sb, "    mov r9d, 4" + x64_nl_char())
+  sb_push(sb, "    call VirtualAlloc" + x64_nl_char())
+  sb_push(sb, "    mov r12, rax" + x64_nl_char())
+  sb_push(sb, "    mov ecx, [rel g_tables_tls_slot]" + x64_nl_char())
+  sb_push(sb, "    mov rdx, r12" + x64_nl_char())
+  sb_push(sb, "    call TlsSetValue" + x64_nl_char())
+  sb_push(sb, "    mov rax, r12" + x64_nl_char())
+  sb_push(sb, "  .ttls_have_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    pop r12" + x64_nl_char())
+  sb_push(sb, "    add rax, " + offset + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
   return sb_str(sb)
 end
 
@@ -3901,6 +4156,19 @@ make a function called x64_os_path_exists_asm returns asm
   return sb_str(sb)
 end
 
+# Ends an OS-facing string producer whose raw [length][bytes] buffer
+# address is in rax: the buffer came from rt_heap_alloc and has no reference
+# count, so instead of tagging it the result is a counted copy made by the
+# runtime's rt_string_adopt (see its header). Pushes the tagged string.
+make a function called x64_adopt_raw_string_asm returns asm
+  let sb = sb_new()
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    call rt_string_adopt" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
 # os_read_line() -> tagged String, one line from stdin without the
 # trailing newline (a lone trailing \r from a CRLF source is stripped
 # too, matching hosts.rs's own host_read_line), or "" at EOF. Primitive-
@@ -3972,7 +4240,7 @@ make a function called x64_os_read_line_asm returns asm
   sb_push(sb, "    mov rax, r12" + x64_nl_char())
   sb_push(sb, "    add rax, 8" + x64_nl_char())
   sb_push(sb, "    push rax" + x64_nl_char())
-  sb_push(sb, "    call rt_heap_alloc" + x64_nl_char())
+  sb_push(sb, "    call rt_scratch_alloc" + x64_nl_char())
   sb_push(sb, "    add rsp, 8" + x64_nl_char())
   sb_push(sb, "    mov r13, rax" + x64_nl_char())
   sb_push(sb, "    pop r12" + x64_nl_char())
@@ -3994,9 +4262,7 @@ make a function called x64_os_read_line_asm returns asm
   sb_push(sb, "    mov r14, r13" + x64_nl_char())
   sb_push(sb, x64_lock_release_asm())
   sb_push(sb, "    mov rax, r14" + x64_nl_char())
-  sb_push(sb, "    mov rcx, 2305843009213693952" + x64_nl_char())
-  sb_push(sb, "    or rax, rcx" + x64_nl_char())
-  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, x64_adopt_raw_string_asm())
   return sb_str(sb)
 end
 
@@ -4179,7 +4445,7 @@ make a function called x64_os_get_cwd_asm returns asm
   sb_push(sb, "    push r15" + x64_nl_char())
   sb_push(sb, "    mov rax, 1032" + x64_nl_char())
   sb_push(sb, "    push rax" + x64_nl_char())
-  sb_push(sb, "    call rt_heap_alloc" + x64_nl_char())
+  sb_push(sb, "    call rt_scratch_alloc" + x64_nl_char())
   sb_push(sb, "    add rsp, 8" + x64_nl_char())
   sb_push(sb, "    pop r15" + x64_nl_char())
   sb_push(sb, "    mov r14, rax" + x64_nl_char())
@@ -4191,9 +4457,7 @@ make a function called x64_os_get_cwd_asm returns asm
   sb_push(sb, "    mov qword [r14], rax" + x64_nl_char())
   sb_push(sb, "    mov rsp, r15" + x64_nl_char())
   sb_push(sb, "    mov rax, r14" + x64_nl_char())
-  sb_push(sb, "    mov rcx, 2305843009213693952" + x64_nl_char())
-  sb_push(sb, "    or rax, rcx" + x64_nl_char())
-  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, x64_adopt_raw_string_asm())
   return sb_str(sb)
 end
 
@@ -4353,10 +4617,26 @@ make a function called x64_emit_apply_table_asm takes funcs returns asm
   # match against. Block-model functions are emitted as bm_fn_<name>, and the
   # program refers to them as <name>, so each one gets a second entry under
   # the plain name, pointing at the same code.
+  # A pure block-model function takes no __globals and returns its value
+  # bare, so its plain name points at its adapter, bm_fn___dyn_<name>
+  # (native_codegen.patlang's bm_nc_build_dyn_adapter_funcirs), which has
+  # the [value, globals] convention every by-name caller expects.
   let externs = []
   let labels = []
   let shown = []
   let n_all = funcs.length
+  let dyn_prefix = "bm_fn___dyn_"
+  let adapted = []
+  let fi = 0
+  while fi < n_all do
+    let fname = funcs[fi][1]
+    if (fname.length > dyn_prefix.length) and (substr(fname, 0, dyn_prefix.length) == dyn_prefix) then
+      let target = substr(fname, dyn_prefix.length, fname.length - dyn_prefix.length)
+      set_var("x64_apply_adapted__" + target, true)
+      let adapted = list_push(adapted, target)
+    end
+    let fi = fi + 1
+  end
   let fi = 0
   while fi < n_all do
     let fname = funcs[fi][1]
@@ -4364,12 +4644,22 @@ make a function called x64_emit_apply_table_asm takes funcs returns asm
       let externs = list_push(externs, fname)
       let labels = list_push(labels, fname)
       let shown = list_push(shown, fname)
-      if substr(fname, 0, 6) == "bm_fn_" then
+      if (fname.length > dyn_prefix.length) and (substr(fname, 0, dyn_prefix.length) == dyn_prefix) then
         let labels = list_push(labels, fname)
-        let shown = list_push(shown, substr(fname, 6, fname.length - 6))
+        let shown = list_push(shown, substr(fname, dyn_prefix.length, fname.length - dyn_prefix.length))
+      elif substr(fname, 0, 6) == "bm_fn_" then
+        if get("__vars", "x64_apply_adapted__" + substr(fname, 6, fname.length - 6)) != true then
+          let labels = list_push(labels, fname)
+          let shown = list_push(shown, substr(fname, 6, fname.length - 6))
+        end
       end
     end
     let fi = fi + 1
+  end
+  let ai = 0
+  while ai < adapted.length do
+    set_var("x64_apply_adapted__" + adapted[ai], false)
+    let ai = ai + 1
   end
   let n = labels.length
   let sb = sb_new()
@@ -4597,7 +4887,7 @@ make a function called x64_os_find_data_name_asm returns asm
   sb_push(sb, "    mov rax, rcx" + x64_nl_char())
   sb_push(sb, "    add rax, 8" + x64_nl_char())
   sb_push(sb, "    push rax" + x64_nl_char())
-  sb_push(sb, "    call rt_heap_alloc" + x64_nl_char())
+  sb_push(sb, "    call rt_scratch_alloc" + x64_nl_char())
   sb_push(sb, "    add rsp, 8" + x64_nl_char())
   sb_push(sb, "    mov r13, rax" + x64_nl_char())
   sb_push(sb, "    pop rcx" + x64_nl_char())
@@ -4618,9 +4908,7 @@ make a function called x64_os_find_data_name_asm returns asm
   sb_push(sb, "    jmp .fdn_copy" + x64_nl_char())
   sb_push(sb, "  .fdn_copy_done:" + x64_nl_char())
   sb_push(sb, "    mov rax, r13" + x64_nl_char())
-  sb_push(sb, "    mov rcx, 2305843009213693952" + x64_nl_char())
-  sb_push(sb, "    or rax, rcx" + x64_nl_char())
-  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, x64_adopt_raw_string_asm())
   return sb_str(sb)
 end
 
@@ -4753,6 +5041,71 @@ make a function called x64_os_read_file_into_asm returns asm
   return sb_str(sb)
 end
 
+# os_read_file_range(path_addr, path_len, buf_addr, offset, len) -> bytes
+# read (0 if the file couldn't be opened or the seek failed): os_read_file_
+# into from `offset` on, via SetFilePointerEx, so read_file_bytes of a range
+# reads just that range. Reading the whole file for every range made
+# raytrace's row-at-a-time picture reader read a 3MB picture 1024 times,
+# about 6GB, never freed (ch36).
+make a function called x64_os_read_file_range_asm returns asm
+  let suffix = label_asm_safe(0)
+  let sb = sb_new()
+  sb_push(sb, x64_lock_acquire_asm(suffix))
+  sb_push(sb, "    pop r12" + x64_nl_char())
+  sb_push(sb, "    pop r11" + x64_nl_char())
+  sb_push(sb, "    pop r13" + x64_nl_char())
+  sb_push(sb, "    pop r10" + x64_nl_char())
+  sb_push(sb, "    pop rax" + x64_nl_char())
+  sb_push(sb, "    push r11" + x64_nl_char())
+  sb_push(sb, x64_os_null_terminate_path_asm(suffix))
+  sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+  sb_push(sb, "    sub rsp, 80" + x64_nl_char())
+  sb_push(sb, "    and rsp, -16" + x64_nl_char())
+  sb_push(sb, "    lea rcx, [rel g_scratch]" + x64_nl_char())
+  sb_push(sb, "    mov rdx, 2147483648" + x64_nl_char())
+  sb_push(sb, "    mov r8, 1" + x64_nl_char())
+  sb_push(sb, "    xor r9, r9" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+32], 3" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+40], 128" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+48], 0" + x64_nl_char())
+  sb_push(sb, "    call CreateFileA" + x64_nl_char())
+  sb_push(sb, "    cmp rax, -1" + x64_nl_char())
+  sb_push(sb, "    je .orr_invalid_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov r14, rax" + x64_nl_char())
+  # SetFilePointerEx(handle, offset, NULL, FILE_BEGIN)
+  sb_push(sb, "    mov rcx, r14" + x64_nl_char())
+  sb_push(sb, "    mov rdx, [r15]" + x64_nl_char())
+  sb_push(sb, "    xor r8, r8" + x64_nl_char())
+  sb_push(sb, "    xor r9, r9" + x64_nl_char())
+  sb_push(sb, "    call SetFilePointerEx" + x64_nl_char())
+  sb_push(sb, "    cmp rax, 0" + x64_nl_char())
+  sb_push(sb, "    je .orr_seekfail_" + suffix + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+56], 0" + x64_nl_char())
+  sb_push(sb, "    mov rcx, r14" + x64_nl_char())
+  sb_push(sb, "    mov rdx, r13" + x64_nl_char())
+  sb_push(sb, "    mov r8, r12" + x64_nl_char())
+  sb_push(sb, "    lea r9, [rsp+56]" + x64_nl_char())
+  sb_push(sb, "    mov qword [rsp+32], 0" + x64_nl_char())
+  sb_push(sb, "    call ReadFile" + x64_nl_char())
+  sb_push(sb, "    mov rcx, r14" + x64_nl_char())
+  sb_push(sb, "    call CloseHandle" + x64_nl_char())
+  sb_push(sb, "    mov rax, [rsp+56]" + x64_nl_char())
+  sb_push(sb, "    jmp .orr_done_" + suffix + x64_nl_char())
+  sb_push(sb, "  .orr_seekfail_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rcx, r14" + x64_nl_char())
+  sb_push(sb, "    call CloseHandle" + x64_nl_char())
+  sb_push(sb, "  .orr_invalid_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rax, 0" + x64_nl_char())
+  sb_push(sb, "  .orr_done_" + suffix + ":" + x64_nl_char())
+  sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, "    mov r14, rax" + x64_nl_char())
+  sb_push(sb, x64_lock_release_asm())
+  sb_push(sb, "    mov rax, r14" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  return sb_str(sb)
+end
+
 # os_getenv(name_addr, name_len) -> tagged string: the real OS
 # environment variable's value, or "" if unset (matching getenv's own
 # interpreter-side contract, host_getenv in hosts.rs: distinct from
@@ -4778,7 +5131,11 @@ end
 # likely) -- a genuinely different failure mode from every other gap
 # tonight, since a placeholder to an OPTIONAL, off-by-default feature
 # still crashed the WHOLE COMPILER rather than just being unreachable.
-make a function called x64_os_getenv_asm returns asm
+# adopt: true for getenv(name), a counted string; false for os_getenv_raw(name),
+# the raw untagged [length][bytes] buffer, for the heap profiler's own start-up
+# check, which runs inside the first heap allocation, before bm_alloc can be
+# used.
+make a function called x64_os_getenv_asm takes adopt returns asm
   let suffix = label_asm_safe(0)
   let sb = sb_new()
   sb_push(sb, x64_lock_acquire_asm(suffix))
@@ -4799,7 +5156,15 @@ make a function called x64_os_getenv_asm returns asm
   # established reasoning for its buffer allocation.
   sb_push(sb, "    mov rax, 32768" + x64_nl_char())
   sb_push(sb, "    push rax" + x64_nl_char())
-  sb_push(sb, "    call rt_heap_alloc" + x64_nl_char())
+  # Adopted, the buffer is scratch that rt_string_adopt frees. Raw
+  # (os_getenv_raw), it is read inside the very first heap allocation
+  # (rt_heap_prof_init), before the counted allocator can run, so it comes
+  # from the bump allocator itself, once.
+  if adopt then
+    sb_push(sb, "    call rt_scratch_alloc" + x64_nl_char())
+  else
+    sb_push(sb, "    call rt_heap_alloc" + x64_nl_char())
+  end
   sb_push(sb, "    add rsp, 8" + x64_nl_char())
   sb_push(sb, "    mov r14, rax" + x64_nl_char())
   sb_push(sb, "    mov r15, rsp" + x64_nl_char())
@@ -4812,11 +5177,13 @@ make a function called x64_os_getenv_asm returns asm
   sb_push(sb, "    mov rsp, r15" + x64_nl_char())
   sb_push(sb, "    mov [r14], rax" + x64_nl_char())
   sb_push(sb, "    mov r13, r14" + x64_nl_char())
-  sb_push(sb, "    mov rcx, 2305843009213693952" + x64_nl_char())
-  sb_push(sb, "    or r13, rcx" + x64_nl_char())
   sb_push(sb, x64_lock_release_asm())
   sb_push(sb, "    mov rax, r13" + x64_nl_char())
-  sb_push(sb, "    push rax" + x64_nl_char())
+  if adopt then
+    sb_push(sb, x64_adopt_raw_string_asm())
+  else
+    sb_push(sb, "    push rax" + x64_nl_char())
+  end
   return sb_str(sb)
 end
 
@@ -4904,9 +5271,11 @@ end
 make a function called x64_exec_capture_asm takes argc returns asm
   let n = to_num(argc)
   let sb = sb_new()
+  # The argc values go into a scratch array; rt_exec_capture_arr joins,
+  # runs, adopts the output and frees what it used (x64_runtime.patlang).
   sb_push(sb, "    mov rax, " + (n * 8) + x64_nl_char())
   sb_push(sb, "    push rax" + x64_nl_char())
-  sb_push(sb, "    call rt_heap_alloc" + x64_nl_char())
+  sb_push(sb, "    call rt_scratch_alloc" + x64_nl_char())
   sb_push(sb, "    add rsp, 8" + x64_nl_char())
   sb_push(sb, "    mov r12, rax" + x64_nl_char())
   let k = n - 1
@@ -4917,19 +5286,8 @@ make a function called x64_exec_capture_asm takes argc returns asm
   end
   sb_push(sb, "    push r12" + x64_nl_char())
   sb_push(sb, "    push " + n + x64_nl_char())
-  sb_push(sb, "    call rt_exec_join_args" + x64_nl_char())
+  sb_push(sb, "    call rt_exec_capture_arr" + x64_nl_char())
   sb_push(sb, "    add rsp, 16" + x64_nl_char())
-  sb_push(sb, "    mov r13, rax" + x64_nl_char())
-  sb_push(sb, "    mov r15, 281474976710655" + x64_nl_char())
-  sb_push(sb, "    and r13, r15" + x64_nl_char())
-  sb_push(sb, "    mov rax, [r13]" + x64_nl_char())
-  sb_push(sb, "    lea r10, [r13+8]" + x64_nl_char())
-  sb_push(sb, "    push r10" + x64_nl_char())
-  sb_push(sb, "    push rax" + x64_nl_char())
-  sb_push(sb, x64_os_exec_run_asm())
-  sb_push(sb, "    pop rax" + x64_nl_char())
-  sb_push(sb, "    mov r15, 2305843009213693952" + x64_nl_char())
-  sb_push(sb, "    or rax, r15" + x64_nl_char())
   sb_push(sb, "    push rax" + x64_nl_char())
   return sb_str(sb)
 end
@@ -4952,7 +5310,7 @@ make a function called x64_os_exec_run_asm returns asm
   sb_push(sb, "    mov rax, r10" + x64_nl_char())
   sb_push(sb, "    add rax, 1" + x64_nl_char())
   sb_push(sb, "    push rax" + x64_nl_char())
-  sb_push(sb, "    call rt_heap_alloc" + x64_nl_char())
+  sb_push(sb, "    call rt_scratch_alloc" + x64_nl_char())
   sb_push(sb, "    add rsp, 8" + x64_nl_char())
   sb_push(sb, "    mov r14, rax" + x64_nl_char())
   sb_push(sb, "    pop r10" + x64_nl_char())
@@ -5073,10 +5431,16 @@ make a function called x64_os_exec_run_asm returns asm
   # compiled, which doesn't share this backend's register convention at
   # all. Fixed the same way r14/cmdline already is: push r15 onto the
   # REAL machine stack before the call, pop it back immediately after.
+  # the command line (r14) is not needed once CreateProcessA has run
+  sb_push(sb, "    push r15" + x64_nl_char())
+  sb_push(sb, "    push r14" + x64_nl_char())
+  sb_push(sb, "    call rt_scratch_free" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, "    pop r15" + x64_nl_char())
   sb_push(sb, "    push r15" + x64_nl_char())
   sb_push(sb, "    mov rax, 65544" + x64_nl_char())
   sb_push(sb, "    push rax" + x64_nl_char())
-  sb_push(sb, "    call rt_heap_alloc" + x64_nl_char())
+  sb_push(sb, "    call rt_scratch_alloc" + x64_nl_char())
   sb_push(sb, "    add rsp, 8" + x64_nl_char())
   sb_push(sb, "    pop r15" + x64_nl_char())
   sb_push(sb, "    mov rsi, rax" + x64_nl_char())
@@ -5249,10 +5613,16 @@ make a function called x64_os_exec_run_asm returns asm
   sb_push(sb, "    mov rcx, [rsp+112]" + x64_nl_char())
   sb_push(sb, "    call CloseHandle" + x64_nl_char())
   # Same r15-across-rt_heap_alloc bug as the success path above, same fix.
+  # the command line (r14) is not needed once CreateProcessA has run
+  sb_push(sb, "    push r15" + x64_nl_char())
+  sb_push(sb, "    push r14" + x64_nl_char())
+  sb_push(sb, "    call rt_scratch_free" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, "    pop r15" + x64_nl_char())
   sb_push(sb, "    push r15" + x64_nl_char())
   sb_push(sb, "    mov rax, 8" + x64_nl_char())
   sb_push(sb, "    push rax" + x64_nl_char())
-  sb_push(sb, "    call rt_heap_alloc" + x64_nl_char())
+  sb_push(sb, "    call rt_scratch_alloc" + x64_nl_char())
   sb_push(sb, "    add rsp, 8" + x64_nl_char())
   sb_push(sb, "    pop r15" + x64_nl_char())
   sb_push(sb, "    mov qword [rax], 0" + x64_nl_char())
@@ -6457,7 +6827,7 @@ make a function called x64_win_clipboard_get_text_asm returns asm
   sb_push(sb, "    mov rax, r12" + x64_nl_char())
   sb_push(sb, "    add rax, 8" + x64_nl_char())
   sb_push(sb, "    push rax" + x64_nl_char())
-  sb_push(sb, "    call rt_heap_alloc" + x64_nl_char())
+  sb_push(sb, "    call rt_scratch_alloc" + x64_nl_char())
   sb_push(sb, "    add rsp, 8" + x64_nl_char())
   sb_push(sb, "    mov r11, rax" + x64_nl_char())
   sb_push(sb, "    pop r12" + x64_nl_char())
@@ -6491,21 +6861,17 @@ make a function called x64_win_clipboard_get_text_asm returns asm
   sb_push(sb, "    call CloseClipboard" + x64_nl_char())
   sb_push(sb, "    mov rsp, r15" + x64_nl_char())
   sb_push(sb, "    mov rax, r12" + x64_nl_char())
-  sb_push(sb, "    mov rcx, 2305843009213693952" + x64_nl_char())
-  sb_push(sb, "    or rax, rcx" + x64_nl_char())
-  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, x64_adopt_raw_string_asm())
   sb_push(sb, "    jmp .cbget_ret_" + suffix + x64_nl_char())
   sb_push(sb, "  .cbget_empty_" + suffix + ":" + x64_nl_char())
   sb_push(sb, "    call CloseClipboard" + x64_nl_char())
   sb_push(sb, "    mov rsp, r15" + x64_nl_char())
   sb_push(sb, "    mov rax, 9" + x64_nl_char())
   sb_push(sb, "    push rax" + x64_nl_char())
-  sb_push(sb, "    call rt_heap_alloc" + x64_nl_char())
+  sb_push(sb, "    call rt_scratch_alloc" + x64_nl_char())
   sb_push(sb, "    add rsp, 8" + x64_nl_char())
   sb_push(sb, "    mov qword [rax], 0" + x64_nl_char())
-  sb_push(sb, "    mov rcx, 2305843009213693952" + x64_nl_char())
-  sb_push(sb, "    or rax, rcx" + x64_nl_char())
-  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, x64_adopt_raw_string_asm())
   sb_push(sb, "  .cbget_ret_" + suffix + ":" + x64_nl_char())
   return sb_str(sb)
 end
@@ -7478,7 +7844,7 @@ make a function called x64_os_recv_asm returns asm
   sb_push(sb, "    push rax" + x64_nl_char())
   sb_push(sb, "    mov rax, 65544" + x64_nl_char())
   sb_push(sb, "    push rax" + x64_nl_char())
-  sb_push(sb, "    call rt_heap_alloc" + x64_nl_char())
+  sb_push(sb, "    call rt_scratch_alloc" + x64_nl_char())
   sb_push(sb, "    add rsp, 8" + x64_nl_char())
   sb_push(sb, "    mov r13, rax" + x64_nl_char())
   sb_push(sb, "    pop rax" + x64_nl_char())
@@ -7519,9 +7885,7 @@ make a function called x64_os_recv_asm returns asm
   sb_push(sb, "    mov qword [r13], rax" + x64_nl_char())
   sb_push(sb, ".recv_done_" + suffix + ":" + x64_nl_char())
   sb_push(sb, "    mov rax, r13" + x64_nl_char())
-  sb_push(sb, "    mov rcx, 2305843009213693952" + x64_nl_char())
-  sb_push(sb, "    or rax, rcx" + x64_nl_char())
-  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, x64_adopt_raw_string_asm())
   return sb_str(sb)
 end
 
@@ -8226,10 +8590,12 @@ make a function called x64_os_get_command_line_asm returns asm
   # 8-byte length HEADER plus `length` bytes of content into it -- an
   # 8-byte overflow past the block's own end, clobbering whatever the
   # bump allocator placed right after it. Must allocate length+8.
+  # A scratch buffer (rt_scratch_alloc): argv adopts it with
+  # rt_string_adopt, which frees it as one.
   sb_push(sb, "    mov rax, r14" + x64_nl_char())
   sb_push(sb, "    add rax, 8" + x64_nl_char())
   sb_push(sb, "    push rax" + x64_nl_char())
-  sb_push(sb, "    call rt_heap_alloc" + x64_nl_char())
+  sb_push(sb, "    call rt_scratch_alloc" + x64_nl_char())
   sb_push(sb, "    add rsp, 8" + x64_nl_char())
   sb_push(sb, "    pop r14" + x64_nl_char())
   sb_push(sb, "    pop r13" + x64_nl_char())
@@ -8332,6 +8698,31 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
   # self-contained early return, same reasoning as rt_raw_word_eq just
   # below: NOT inserted into the long if/else chain further down (which
   # nests without `elif` past a certain point).
+  # docs/plans/general-refcounting.md, Phase 7: the runtime's ownership
+  # markers. rt_fresh(v) is v, marked for the ownership passes as a value
+  # its caller owns: no code. rt_keep(v) is v after taking a reference to it
+  # (rt_rc_inc_if_refcounted), decided inline for a fixnum, as the release
+  # entry points are (x64_rc_call_asm). The runtime's own code writes it;
+  # it boxes no raw float, so the passes' retain is rt_rc_retain instead,
+  # which x64_rc_retain_asm boxes a raw float for.
+  if name == "rt_fresh" then
+    return ""
+  end
+  if name == "rt_keep" then
+    let kp_suffix = label_asm_safe(0)
+    let kp_sb = sb_new()
+    sb_push(kp_sb, "    mov rax, [rsp]" + x64_nl_char())
+    sb_push(kp_sb, "    mov rcx, rax" + x64_nl_char())
+    sb_push(kp_sb, "    shl rcx, 16" + x64_nl_char())
+    sb_push(kp_sb, "    sar rcx, 16" + x64_nl_char())
+    sb_push(kp_sb, "    cmp rcx, rax" + x64_nl_char())
+    sb_push(kp_sb, "    je .keep_done_" + kp_suffix + x64_nl_char())
+    sb_push(kp_sb, "    push rax" + x64_nl_char())
+    sb_push(kp_sb, "    call rt_rc_inc_if_refcounted" + x64_nl_char())
+    sb_push(kp_sb, "    add rsp, 8" + x64_nl_char())
+    sb_push(kp_sb, "  .keep_done_" + kp_suffix + ":" + x64_nl_char())
+    return sb_str(kp_sb)
+  end
   if name == "contract_check" then
     let cc_sb = sb_new()
     sb_push(cc_sb, "    call rt_contract_check" + x64_nl_char())
@@ -8479,9 +8870,12 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
     # 1. Collect all argc pushed values into a heap array (exact idiom
     #    as x64_exec_capture_asm's own arg collection): arr[0]=recv,
     #    arr[1]=method, arr[2..]=rest args.
+    #    The array is a counted block (bm_alloc), freed once the send is
+    #    done on either path below; it used to come from rt_heap_alloc and
+    #    was never freed, one per call.
     sb_push(sb, "    mov rax, " + (to_num(argc) * 8) + x64_nl_char())
     sb_push(sb, "    push rax" + x64_nl_char())
-    sb_push(sb, "    call rt_heap_alloc" + x64_nl_char())
+    sb_push(sb, "    call bm_alloc" + x64_nl_char())
     sb_push(sb, "    add rsp, 8" + x64_nl_char())
     sb_push(sb, "    mov r12, rax" + x64_nl_char())
     let ai = to_num(argc) - 1
@@ -8490,34 +8884,16 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
       sb_push(sb, "    mov [r12+" + (ai * 8) + "], r10" + x64_nl_char())
       let ai = ai - 1
     end
-    # 2. Re-push recv, method, then rest-args (building rest_list),
-    #    for rt_send_prepare(recv, method, rest_list). Real bug found
-    #    and fixed here via WinDbg (genuine null-pointer segfault, rax=0
-    #    reading a bogus "recv"): x64_buildlist_asm's OWN generated code
-    #    freely reassigns r12 for its own list-header bookkeeping (see
-    #    its own header -- this backend gives no register-preservation
-    #    guarantee across an embedded call/block any more than a real
-    #    `call`), clobbering `arr`'s pointer out from under this
-    #    function the moment it's invoked. `arr` must survive it (and
-    #    the real `call rt_send_prepare` right after, which clobbers
-    #    every register too) -- preserved on the real machine stack via
-    #    push/pop, same idiom x64_os_exec_run_asm already uses for its
-    #    own cmdline_addr/cmdline_len across an internal rt_heap_alloc
-    #    call.
+    # 2. rt_send_prepare_arr(arr, argc) builds the rest list (owning its
+    #    elements, and released before it returns) and resolves the
+    #    method. Every call clobbers every register, so `arr` is kept on
+    #    the machine stack across it (a real WinDbg-traced segfault came
+    #    from relying on r12 surviving an embedded call).
     sb_push(sb, "    push r12" + x64_nl_char())
-    sb_push(sb, "    mov rax, [r12+0]" + x64_nl_char())
-    sb_push(sb, "    push rax" + x64_nl_char())
-    sb_push(sb, "    mov rax, [r12+8]" + x64_nl_char())
-    sb_push(sb, "    push rax" + x64_nl_char())
-    let ri = 0
-    while ri < k do
-      sb_push(sb, "    mov rax, [r12+" + ((2 + ri) * 8) + "]" + x64_nl_char())
-      sb_push(sb, "    push rax" + x64_nl_char())
-      let ri = ri + 1
-    end
-    sb_push(sb, x64_buildlist_asm(k))
-    sb_push(sb, "    call rt_send_prepare" + x64_nl_char())
-    sb_push(sb, "    add rsp, 24" + x64_nl_char())
+    sb_push(sb, "    push r12" + x64_nl_char())
+    sb_push(sb, "    push " + to_num(argc) + x64_nl_char())
+    sb_push(sb, "    call rt_send_prepare_arr" + x64_nl_char())
+    sb_push(sb, "    add rsp, 16" + x64_nl_char())
     sb_push(sb, "    mov r13, rax" + x64_nl_char())
     sb_push(sb, "    pop r12" + x64_nl_char())
     sb_push(sb, "    cmp r13, 0" + x64_nl_char())
@@ -8533,6 +8909,7 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
     #    null-pointer segfault (r14=0 inside x64_callvalue_asm's own
     #    closure-deref, once the wrong value got popped as "the
     #    closure").
+    sb_push(sb, "    push r12" + x64_nl_char())
     sb_push(sb, "    push r13" + x64_nl_char())
     sb_push(sb, "    mov rax, [r12+0]" + x64_nl_char())
     sb_push(sb, "    push rax" + x64_nl_char())
@@ -8543,12 +8920,24 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
       let ri = ri + 1
     end
     sb_push(sb, x64_callvalue_asm(k + 1, spilled))
+    # Result on top, `arr` under it: free `arr`, leave the result.
+    sb_push(sb, "    pop rax" + x64_nl_char())
+    sb_push(sb, "    pop r12" + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
+    sb_push(sb, "    push r12" + x64_nl_char())
+    sb_push(sb, "    push " + (to_num(argc) * 8) + x64_nl_char())
+    sb_push(sb, "    call bm_rc_dec" + x64_nl_char())
+    sb_push(sb, "    add rsp, 16" + x64_nl_char())
     sb_push(sb, "    jmp .SEND_ALLDONE_" + suffix + x64_nl_char())
     sb_push(sb, ".SEND_DONE_" + suffix + ":" + x64_nl_char())
     # "set" (or, out of this slice's scope, a genuinely unresolvable
     # method -- see rt_send_prepare's own header) already handled with
-    # nothing further to invoke; push a placeholder so CallHost's own
-    # "push exactly 1 result" contract still holds.
+    # nothing further to invoke; free `arr` and push a placeholder so
+    # CallHost's own "push exactly 1 result" contract still holds.
+    sb_push(sb, "    push r12" + x64_nl_char())
+    sb_push(sb, "    push " + (to_num(argc) * 8) + x64_nl_char())
+    sb_push(sb, "    call bm_rc_dec" + x64_nl_char())
+    sb_push(sb, "    add rsp, 16" + x64_nl_char())
     sb_push(sb, "    push 0" + x64_nl_char())
     sb_push(sb, ".SEND_ALLDONE_" + suffix + ":" + x64_nl_char())
   elif name == "contract_check" then
@@ -8585,457 +8974,9 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
   if name == "os_file_size" then
     sb_push(sb, x64_os_file_size_asm())
   else
-  if name == "os_read_file_into" then
-    sb_push(sb, x64_os_read_file_into_asm())
-  else
-  if name == "os_write_file" then
-    sb_push(sb, x64_os_write_file_asm())
-  elif name == "os_copy_file" then
-    # Deliberately `elif`, not another "else\nif...end" nesting level
-    # -- per this session's own CLAUDE.md convention (added after a
-    # real bug from exactly that pattern), a new branch on an existing
-    # deferred-end chain should use elif so the end-count can't drift.
-    sb_push(sb, x64_os_copy_file_asm())
-  elif name == "os_rename_file" then
-    sb_push(sb, x64_os_rename_file_asm())
-  elif name == "os_delete_file" then
-    sb_push(sb, x64_os_delete_file_asm())
-  elif name == "os_create_directory" then
-    sb_push(sb, x64_os_create_directory_asm())
-  elif name == "os_path_exists" then
-    sb_push(sb, x64_os_path_exists_asm())
-  elif name == "os_read_line" then
-    sb_push(sb, x64_os_read_line_asm())
-  elif name == "os_enable_raw_mode" then
-    sb_push(sb, x64_os_enable_raw_mode_asm())
-  elif name == "os_disable_raw_mode" then
-    sb_push(sb, x64_os_disable_raw_mode_asm())
-  elif name == "os_read_raw_byte" then
-    sb_push(sb, x64_os_read_raw_byte_asm())
-  elif name == "os_set_console_utf8" then
-    sb_push(sb, x64_os_set_console_utf8_asm())
-  elif name == "os_get_cwd" then
-    sb_push(sb, x64_os_get_cwd_asm())
-  elif name == "os_set_cwd" then
-    sb_push(sb, x64_os_set_cwd_asm())
-  elif name == "os_enable_ansi_colors" then
-    sb_push(sb, x64_os_enable_ansi_colors_asm())
-  elif name == "os_apply_table_count" then
-    sb_push(sb, x64_os_apply_table_count_asm())
-  elif name == "os_apply_table_name_at" then
-    sb_push(sb, x64_os_apply_table_name_at_asm())
-  elif name == "os_apply_table_func_at" then
-    sb_push(sb, x64_os_apply_table_func_at_asm())
-  elif name == "os_call_indirect" then
-    sb_push(sb, x64_os_call_indirect_asm())
-  elif name == "os_call_bridge" then
-    sb_push(sb, x64_os_call_bridge_asm())
-  elif name == "os_find_first" then
-    sb_push(sb, x64_os_find_first_asm())
-  elif name == "os_find_next" then
-    sb_push(sb, x64_os_find_next_asm())
-  elif name == "os_find_data_name" then
-    sb_push(sb, x64_os_find_data_name_asm())
-  elif name == "os_find_data_is_dir" then
-    sb_push(sb, x64_os_find_data_is_dir_asm())
-  elif name == "os_find_close" then
-    sb_push(sb, x64_os_find_close_asm())
-  elif name == "win_create_window" then
-    sb_push(sb, x64_win_create_window_asm())
-  elif name == "win_canvas_alloc" then
-    sb_push(sb, x64_win_canvas_alloc_asm())
-  elif name == "win_canvas_init_dib" then
-    sb_push(sb, x64_win_canvas_init_dib_asm())
-  elif name == "win_text_out" then
-    sb_push(sb, x64_win_text_out_asm())
-  elif name == "win_canvas_fill" then
-    sb_push(sb, x64_win_canvas_fill_asm())
-  elif name == "win_canvas_blit" then
-    sb_push(sb, x64_win_canvas_blit_asm())
-  elif name == "win_last_wparam" then
-    # wParam is WPARAM (UINT_PTR), a full 8-byte field at MSG offset
-    # 16 on x64 -- NOT 4 bytes (unlike `message`, an actual DWORD).
-    sb_push(sb, "    mov rax, [rel g_msg_scratch+16]" + x64_nl_char())
-    sb_push(sb, "    push rax" + x64_nl_char())
-  elif name == "win_canvas_set_size" then
-    sb_push(sb, x64_win_canvas_set_size_asm())
-  elif name == "win_invalidate" then
-    sb_push(sb, x64_win_invalidate_asm())
-  elif name == "win_set_title" then
-    sb_push(sb, x64_win_set_title_asm())
-  elif name == "win_ctrl_down" then
-    sb_push(sb, x64_win_ctrl_down_asm())
-  elif name == "win_clipboard_set_text" then
-    sb_push(sb, x64_win_clipboard_set_text_asm())
-  elif name == "win_clipboard_get_text" then
-    sb_push(sb, x64_win_clipboard_get_text_asm())
-  elif name == "os_thread_spawn_raw" then
-    sb_push(sb, x64_os_thread_spawn_raw_asm())
-  elif name == "os_fiber_spawn" then
-    sb_push(sb, x64_os_fiber_spawn_asm())
-  elif name == "os_thread_spawn_by_addr" then
-    sb_push(sb, x64_os_thread_spawn_by_addr_asm())
-  elif name == "os_fiber_resume" then
-    sb_push(sb, x64_os_fiber_resume_asm())
-  elif name == "os_fiber_yield" then
-    sb_push(sb, x64_os_fiber_yield_asm())
-  elif name == "os_fiber_alive" then
-    sb_push(sb, x64_os_fiber_alive_asm())
-  elif name == "os_fiber_current_id" then
-    sb_push(sb, x64_os_fiber_current_id_asm())
-  elif name == "os_fiber_table_lock_acquire" then
-    sb_push(sb, x64_os_fiber_table_lock_acquire_asm())
-  elif name == "os_fiber_table_lock_release" then
-    sb_push(sb, x64_os_fiber_table_lock_release_asm())
-  elif name == "rt_invoke_closure2" then
-    # rt_invoke_closure2(closure, a, b) -> result -- calls `closure` as
-    # if the source had written `closure(a, b)` directly. Exists so
-    # `emit`/`register_event_handler` (x64_runtime.patlang, ordinary
-    # PatLang built on this ONE new raw primitive) can invoke an
-    # arbitrary event-handler closure without needing their own new
-    # asm: x64_callvalue_asm already does exactly this, it just needs
-    # `spilled` (a codegen-TIME concept -- the enclosing function's own
-    # spilled-locals list, used to compute a private scratch-slot
-    # offset) which only a CallHost case compiled inline like this one
-    # has access to; an ordinary PatLang function never could.
-    #
-    # REAL BUG found and fixed here via cdb, not by re-reading code a
-    # second time (which found nothing): the FIRST version of this
-    # primitive declared `(a, b, closure)`, closure LAST, on the
-    # assumption that x64_callvalue_asm pops the closure value FIRST
-    # (so it should be pushed last/on top). That assumption was
-    # backwards. x64_callvalue_asm's own step 1 pops its N own-args
-    # OFF THE TOP first (assuming THEY are topmost) and only THEN pops
-    # the closure -- so the closure must be the DEEPEST of the three,
-    # i.e. pushed FIRST, matching how a genuine source-level
-    # `myclosure(x0, x1)` CallValue site naturally pushes its callee
-    # expression before its arguments. With the old `(a, b, closure)`
-    # order, a call site's normal left-to-right push left the CLOSURE
-    # on top and the FIRST ARGUMENT deepest -- so x64_callvalue_asm's
-    # `pop r14` grabbed the first argument instead of the closure.
-    # Confirmed via cdb on the actual crash: r13 (meant to be the
-    # closure's captured_count) held 0x00000f5445455247 -- the raw
-    # bytes of the string "GREET", the event name that was `emit`'s
-    # OWN first argument -- read as a captured-value loop bound, this
-    # pushed captured "values" until the stack was exhausted
-    # (STATUS_STACK_OVERFLOW, zero program output since the crash
-    # happened before the handler, or even `emit`, ever returned).
-    sb_push(sb, x64_callvalue_asm(2, spilled))
-  elif name == "register_event_handler" then
-    # lower.patlang's own "When" case (a source-level `when EVENT { ...
-    # }` block) ALWAYS emits `CallHost("register_event_handler", 2)`
-    # unconditionally -- unlike an ordinary call to a plain name, this
-    # is never routed through the normal "is this name a known
-    # function?" Call-vs-CallHost classification at all, so defining
-    # register_event_handler as a real function in x64_runtime.patlang
-    # (which it also is, for the case of a program calling it directly
-    # as ordinary source syntax) is not sufficient on its own -- this
-    # CallHost case is what the `when`-generated instruction actually
-    # reaches. Simply calls that same real function and reclaims its 2
-    # args, exactly the "call a real function, argc*8 caller-cleans"
-    # shape the "list_push" case above already establishes.
-    sb_push(sb, "    call register_event_handler" + x64_nl_char())
-    sb_push(sb, "    add rsp, 16" + x64_nl_char())
-    sb_push(sb, "    push rax" + x64_nl_char())
-  elif name == "budgeted_run" then
-    # lower.patlang's own lower_budgeted_literal emits this as a raw
-    # CallHost op UNCONDITIONALLY (see its header there) -- it never
-    # goes through the ordinary "is this name a real function?" Call
-    # path, even though budgeted_run IS one (x64_runtime.patlang), so
-    # it needs its own thin bridge here: same call/add-rsp/push-rax
-    # shape the ordinary "Call" instruction case uses (this file's own
-    # x64_emit_instr, the "ty == Call" branch), just reached via
-    # CallHost dispatch instead.
-    sb_push(sb, "    call " + x64_asm_label_for_func("budgeted_run") + x64_nl_char())
-    sb_push(sb, "    add rsp, 32" + x64_nl_char())
-    sb_push(sb, "    push rax" + x64_nl_char())
-  elif name == "budget_check" then
-    # Same bridge as budgeted_run just above, 0 args (nothing to pop).
-    sb_push(sb, "    call " + x64_asm_label_for_func("budget_check") + x64_nl_char())
-    sb_push(sb, "    push rax" + x64_nl_char())
-  elif name == "win_canvas_resize" then
-    sb_push(sb, x64_win_canvas_resize_asm())
-  elif name == "win_peek_message" then
-    sb_push(sb, x64_win_peek_message_asm())
-  elif name == "conpty_create" then
-    sb_push(sb, x64_conpty_create_asm())
-  elif name == "conpty_spawn" then
-    sb_push(sb, x64_conpty_spawn_asm())
-  elif name == "conpty_read_nonblocking" then
-    sb_push(sb, x64_conpty_read_nonblocking_asm())
-  elif name == "conpty_write_raw" then
-    sb_push(sb, x64_conpty_write_raw_asm())
-  elif name == "conpty_resize" then
-    sb_push(sb, x64_conpty_resize_asm())
-  elif name == "conpty_close" then
-    sb_push(sb, x64_conpty_close_asm())
-  else
-  if name == "exec_capture" then
-    sb_push(sb, x64_exec_capture_asm(argc))
-  elif name == "os_last_exec_exit_code" then
-    sb_push(sb, x64_os_last_exec_exit_code_asm())
-  elif name == "os_set_exec_timeout" then
-    # os_set_exec_timeout(ms): arms a one-shot wall-clock timeout for the
-    # NEXT os_exec_run (consumed and cleared by it). Returns its argument.
-    sb_push(sb, "    pop rax" + x64_nl_char())
-    sb_push(sb, "    mov [rel g_exec_timeout_ms], rax" + x64_nl_char())
-    sb_push(sb, "    push rax" + x64_nl_char())
-  elif name == "x64_int_to_float_bits" then
-    sb_push(sb, x64_int_to_float_bits_asm())
-  elif name == "x64_float_add_bits" then
-    sb_push(sb, x64_float_arith_bits_asm("+"))
-  elif name == "x64_float_sub_bits" then
-    sb_push(sb, x64_float_arith_bits_asm("-"))
-  elif name == "x64_float_mul_bits" then
-    sb_push(sb, x64_float_arith_bits_asm("*"))
-  elif name == "x64_float_div_bits" then
-    sb_push(sb, x64_float_arith_bits_asm("/"))
-  elif name == "x64_float_cmp_bits" then
-    sb_push(sb, x64_float_cmp_bits_asm())
-  elif name == "x64_float_bits_to_int" then
-    # Truncating float64-bits -> int (rt_isqrt_exact, x64_runtime.patlang).
-    sb_push(sb, "    pop rax" + x64_nl_char())
-    sb_push(sb, "    movq xmm0, rax" + x64_nl_char())
-    sb_push(sb, "    cvttsd2si rax, xmm0" + x64_nl_char())
-    sb_push(sb, "    push rax" + x64_nl_char())
-  elif name == "x64_float_pow_bits" then
-    # GitHub #229: libm pow/atan2 on raw float64 bits, for the runtime's
-    # tagged rt_pow_dynamic / rt_atan2_dynamic.
-    sb_push(sb, x64_math2_asm("pow"))
-  elif name == "x64_float_atan2_bits" then
-    sb_push(sb, x64_math2_asm("atan2"))
-  elif x64_raw_math1_bits_fn(name) != "" then
-    # GitHub #229: libm on a raw float64 bit pattern, explicitly -- what
-    # the runtime's tagged sqrt/math functions (rt_sqrt_dynamic,
-    # rt_math1_dynamic) call once they have converted their argument.
-    sb_push(sb, x64_math1_asm(x64_raw_math1_bits_fn(name)))
-  elif name == "os_exec_run" then
-    # Exposes the SAME primitive x64_exec_capture_asm's CallHost handling
-    # already wraps (CreateProcessA + pipe capture, cmdline_addr/
-    # cmdline_len args, RAW untagged output address returned) as an
-    # independently name-dispatchable 2-arg primitive, so ordinary
-    # PatLang code (x64_runtime.patlang's exec_capture_io wrapper) can
-    # call it directly with a RUNTIME-VARIABLE argument count already
-    # joined into one string -- exec_capture's own variadic CallHost
-    # form requires a compile-time-fixed arg count at every call site,
-    # which can't express "however many args a runtime list happens to
-    # hold." No new assembly: x64_os_exec_run_asm's own calling
-    # convention (pop cmdline_len then cmdline_addr) already matches an
-    # ordinary 2-arg call (cmdline_addr, cmdline_len) pushed in that
-    # order, unchanged.
-    sb_push(sb, x64_os_exec_run_asm())
-  elif name == "spawn" then
-    # Stage A of the interp.patlang-compilation roadmap (#25, past
-    # #26/#27): spawn(path, arg1, arg2, ...) -> Int PID, non-blocking.
-    # Deliberately a CallHost primitive (like exec_capture, not an
-    # ordinary PatLang function) since real callers (interp.patlang's
-    # own dispatch) invoke it with a VARYING argument count (1-4) --
-    # PatLang has no variadic function definitions, so an ordinary
-    # fixed-arity function couldn't serve every call site.
-    sb_push(sb, x64_spawn_asm(argc))
-  elif name == "os_get_exit_code_process" then
-    # Thin wrapper: GetExitCodeProcess(handle) -> exit code Int, or the
-    # STILL_ACTIVE (259) sentinel if the process hasn't finished. Used
-    # by is_alive/wait (both ordinary PatLang functions in x64_runtime.
-    # patlang) rather than exposing raw GetExitCodeProcess plumbing there.
-    sb_push(sb, "    pop rcx" + x64_nl_char())
-    sb_push(sb, "    mov r15, rsp" + x64_nl_char())
-    sb_push(sb, "    sub rsp, 48" + x64_nl_char())
-    sb_push(sb, "    and rsp, -16" + x64_nl_char())
-    sb_push(sb, "    lea rdx, [rsp+32]" + x64_nl_char())
-    sb_push(sb, "    call GetExitCodeProcess" + x64_nl_char())
-    sb_push(sb, "    mov eax, [rsp+32]" + x64_nl_char())
-    sb_push(sb, "    mov rsp, r15" + x64_nl_char())
-    sb_push(sb, "    push rax" + x64_nl_char())
-  elif name == "os_terminate_process" then
-    # TerminateProcess(handle) -- best-effort, failure (already-exited)
-    # is not surfaced as an error, matching the real host's `let _ =
-    # child.kill()` semantics (rust-runtime/src/ir/hosts.rs).
-    #
-    # Real bug found and fixed here: a plain `sub rsp, N`/`add rsp, N`
-    # (no `and rsp, -16`) silently ASSUMES the incoming rsp is already
-    # 16-aligned -- but this backend's own value-stack pushes/pops use
-    # the real machine rsp directly for expression evaluation, and a
-    # function's post-prologue baseline alignment depends on that
-    # function's own frame_size (8 * (spilled_count + 3)) mod 16, which
-    # varies function to function. Confirmed directly: os_socket_tcp
-    # with a bare `sub rsp, 32` crashed in some call sites but not
-    # others, purely depending on which enclosing function's frame_size
-    # parity happened to leave rsp already aligned. Every one of these
-    # thin OS-primitive wrappers now self-aligns via the same
-    # save-rsp/and/restore dance x64_os_write_file_asm/x64_os_exec_run_
-    # asm/x64_os_wsa_startup_asm already used, matching this file's own
-    # established (if not universally followed) precedent.
-    sb_push(sb, "    pop rcx" + x64_nl_char())
-    sb_push(sb, "    mov rdx, 1" + x64_nl_char())
-    sb_push(sb, "    mov r15, rsp" + x64_nl_char())
-    sb_push(sb, "    sub rsp, 32" + x64_nl_char())
-    sb_push(sb, "    and rsp, -16" + x64_nl_char())
-    sb_push(sb, "    call TerminateProcess" + x64_nl_char())
-    sb_push(sb, "    mov rsp, r15" + x64_nl_char())
-    sb_push(sb, "    push 0" + x64_nl_char())
-  elif name == "os_wait_for_single_object" then
-    # WaitForSingleObject(handle, INFINITE) -- blocking wait used by
-    # wait()'s reap-to-completion semantics.
-    sb_push(sb, "    pop rcx" + x64_nl_char())
-    sb_push(sb, "    mov rdx, -1" + x64_nl_char())
-    sb_push(sb, "    mov r15, rsp" + x64_nl_char())
-    sb_push(sb, "    sub rsp, 32" + x64_nl_char())
-    sb_push(sb, "    and rsp, -16" + x64_nl_char())
-    sb_push(sb, "    call WaitForSingleObject" + x64_nl_char())
-    sb_push(sb, "    mov rsp, r15" + x64_nl_char())
-    sb_push(sb, "    push 0" + x64_nl_char())
-  elif name == "os_close_handle" then
-    sb_push(sb, "    pop rcx" + x64_nl_char())
-    sb_push(sb, "    mov r15, rsp" + x64_nl_char())
-    sb_push(sb, "    sub rsp, 32" + x64_nl_char())
-    sb_push(sb, "    and rsp, -16" + x64_nl_char())
-    sb_push(sb, "    call CloseHandle" + x64_nl_char())
-    sb_push(sb, "    mov rsp, r15" + x64_nl_char())
-    sb_push(sb, "    push 0" + x64_nl_char())
-  elif name == "os_sleep_ms" then
-    sb_push(sb, "    pop rcx" + x64_nl_char())
-    sb_push(sb, "    mov r15, rsp" + x64_nl_char())
-    sb_push(sb, "    sub rsp, 32" + x64_nl_char())
-    sb_push(sb, "    and rsp, -16" + x64_nl_char())
-    sb_push(sb, "    call Sleep" + x64_nl_char())
-    sb_push(sb, "    mov rsp, r15" + x64_nl_char())
-    sb_push(sb, "    push 0" + x64_nl_char())
-  elif name == "os_wsa_startup" then
-    # Idempotent (Winsock reference-counts WSAStartup internally, and
-    # this process never calls WSACleanup) -- called unconditionally at
-    # the top of tcp_listen/tcp_try_listen/tcp_connect rather than
-    # gated behind g_wsa_init, since the g_wsa_init check itself would
-    # need the exact same save/restore-rsp dance this already does.
-    sb_push(sb, x64_os_wsa_startup_asm())
-    sb_push(sb, "    push 0" + x64_nl_char())
-  elif name == "os_socket_tcp" then
-    sb_push(sb, "    mov r15, rsp" + x64_nl_char())
-    sb_push(sb, "    sub rsp, 32" + x64_nl_char())
-    sb_push(sb, "    and rsp, -16" + x64_nl_char())
-    sb_push(sb, "    mov ecx, 2" + x64_nl_char())
-    sb_push(sb, "    mov edx, 1" + x64_nl_char())
-    sb_push(sb, "    mov r8d, 6" + x64_nl_char())
-    sb_push(sb, "    call socket" + x64_nl_char())
-    sb_push(sb, "    mov rsp, r15" + x64_nl_char())
-    sb_push(sb, "    push rax" + x64_nl_char())
-  elif name == "os_bind_listen" then
-    sb_push(sb, x64_os_bind_listen_asm())
-  elif name == "os_accept" then
-    sb_push(sb, x64_os_accept_asm())
-  elif name == "os_connect" then
-    sb_push(sb, x64_os_connect_asm())
-  elif name == "os_connect_try" then
-    sb_push(sb, x64_os_connect_try_asm())
-  elif name == "getenv" then
-    sb_push(sb, x64_os_getenv_asm())
-  elif name == "os_recv" then
-    sb_push(sb, x64_os_recv_asm())
-  elif name == "os_recv_had_error" then
-    sb_push(sb, "    mov rax, [rel g_last_recv_error]" + x64_nl_char())
-    sb_push(sb, "    push rax" + x64_nl_char())
-  elif name == "os_send" then
-    sb_push(sb, x64_os_send_asm())
-  elif name == "os_closesocket" then
-    sb_push(sb, "    pop rcx" + x64_nl_char())
-    sb_push(sb, "    mov r15, rsp" + x64_nl_char())
-    sb_push(sb, "    sub rsp, 32" + x64_nl_char())
-    sb_push(sb, "    and rsp, -16" + x64_nl_char())
-    sb_push(sb, "    call closesocket" + x64_nl_char())
-    sb_push(sb, "    mov rsp, r15" + x64_nl_char())
-    sb_push(sb, "    push 0" + x64_nl_char())
-  elif name == "os_set_nonblocking" then
-    # ioctlsocket(sock, FIONBIO, &1) -- Stage B part 2 (#25):
-    # tcp_accept_timeout's non-blocking poll variant.
-    sb_push(sb, "    pop rcx" + x64_nl_char())
-    sb_push(sb, "    mov r15, rsp" + x64_nl_char())
-    sb_push(sb, "    sub rsp, 48" + x64_nl_char())
-    sb_push(sb, "    and rsp, -16" + x64_nl_char())
-    sb_push(sb, "    mov dword [rsp+40], 1" + x64_nl_char())
-    sb_push(sb, "    mov rdx, 0 - 2147195266" + x64_nl_char())
-    sb_push(sb, "    lea r8, [rsp+40]" + x64_nl_char())
-    sb_push(sb, "    call ioctlsocket" + x64_nl_char())
-    sb_push(sb, "    mov rsp, r15" + x64_nl_char())
-    sb_push(sb, "    push 0" + x64_nl_char())
-  elif name == "os_accept_nonblocking" then
-    sb_push(sb, "    pop rcx" + x64_nl_char())
-    sb_push(sb, "    mov r12, rcx" + x64_nl_char())
-    sb_push(sb, "    mov r15, rsp" + x64_nl_char())
-    sb_push(sb, "    sub rsp, 32" + x64_nl_char())
-    sb_push(sb, "    and rsp, -16" + x64_nl_char())
-    sb_push(sb, "    mov rcx, r12" + x64_nl_char())
-    sb_push(sb, "    xor rdx, rdx" + x64_nl_char())
-    sb_push(sb, "    xor r8, r8" + x64_nl_char())
-    sb_push(sb, "    call accept" + x64_nl_char())
-    sb_push(sb, "    mov rsp, r15" + x64_nl_char())
-    sb_push(sb, "    push rax" + x64_nl_char())
-  elif name == "os_get_tick_count" then
-    sb_push(sb, "    mov r15, rsp" + x64_nl_char())
-    sb_push(sb, "    sub rsp, 32" + x64_nl_char())
-    sb_push(sb, "    and rsp, -16" + x64_nl_char())
-    sb_push(sb, "    call GetTickCount64" + x64_nl_char())
-    sb_push(sb, "    mov rsp, r15" + x64_nl_char())
-    sb_push(sb, "    push rax" + x64_nl_char())
-  elif name == "sqrt" then
-    sb_push(sb, x64_math1_asm("sqrt"))
-  elif name == "sin" then
-    sb_push(sb, x64_math1_asm("sin"))
-  elif name == "cos" then
-    sb_push(sb, x64_math1_asm("cos"))
-  elif name == "tan" then
-    sb_push(sb, x64_math1_asm("tan"))
-  elif name == "asin" then
-    sb_push(sb, x64_math1_asm("asin"))
-  elif name == "acos" then
-    sb_push(sb, x64_math1_asm("acos"))
-  elif name == "atan" then
-    sb_push(sb, x64_math1_asm("atan"))
-  elif name == "log" then
-    sb_push(sb, x64_math1_asm("log"))
-  elif name == "exp" then
-    sb_push(sb, x64_math1_asm("exp"))
-  elif name == "pow" then
-    sb_push(sb, x64_math2_asm("pow"))
-  elif name == "atan2" then
-    sb_push(sb, x64_math2_asm("atan2"))
-  elif name == "abs" then
-    sb_push(sb, x64_abs_asm())
-  elif name == "ceil" then
-    sb_push(sb, x64_roundlike_asm("ceil"))
-  elif name == "floor" then
-    # There was no `floor` case here at all, so it fell through to the
-    # generic path and came back as the argument's raw float64 BITS
-    # printed as an integer: floor(2.4) gave 4612586738352862003, which
-    # is exactly 2.4's bit pattern. It is a direct C call like ceil --
-    # msvcrt does export floor.
-    sb_push(sb, x64_roundlike_asm("floor"))
-  elif name == "round" then
-    sb_push(sb, x64_roundlike_asm("round"))
-  elif name == "trunc" then
-    sb_push(sb, x64_roundlike_asm("trunc"))
-  elif name == "bit_get" then
-    sb_push(sb, "    pop rcx" + x64_nl_char())
-    sb_push(sb, "    pop rax" + x64_nl_char())
-    sb_push(sb, "    sar rax, cl" + x64_nl_char())
-    sb_push(sb, "    and rax, 1" + x64_nl_char())
-    sb_push(sb, "    push rax" + x64_nl_char())
-  elif name == "bit_set" then
-    sb_push(sb, x64_bit_set_asm())
-  elif name == "bit_slice" then
-    sb_push(sb, x64_bit_slice_asm())
-  elif name == "bit_set_slice" then
-    sb_push(sb, x64_bit_set_slice_asm())
-  elif name == "x64_family_code" then
-    # Internal (not user-facing) primitive backing the ordinary PatLang
-    # type_of/numeric_kind wrapper functions in x64_runtime.patlang --
-    # returns a small int code classifying v's family, which those
-    # wrappers map to the real string result via ordinary literal
-    # Consts (going through the normal string-literal pipeline, unlike
-    # trying to emit a fresh string constant directly from raw asm
-    # here). 0=fixnum, 2=string, 3=list, 4=closure, 5=object,
-    # 6=bigint, 7=rational, 8=complex, 9=interval, 10=other (doesn't
-    # round-trip as a fixnum AND doesn't match any known family/subtag).
-    sb_push(sb, x64_family_code_asm())
+  let family_asm = x64_callhost_family_asm(name, argc, spilled)
+  if family_asm != false then
+    sb_push(sb, family_asm)
   else
   if name == "list_len" then
     sb_push(sb, "    call rt_list_len" + x64_nl_char())
@@ -9165,6 +9106,15 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
       if name == "mem_heap_state_addr" then
         sb_push(sb, "    lea rax, [rel g_heap_state]" + x64_nl_char())
         sb_push(sb, "    push rax" + x64_nl_char())
+      elif name == "mem_heap_prof_addr" then
+        # the allocation profiler's state word (rt_heap_alloc /
+        # rt_heap_prof_sample, x64_runtime.patlang)
+        sb_push(sb, "    lea rax, [rel g_heap_prof]" + x64_nl_char())
+        sb_push(sb, "    push rax" + x64_nl_char())
+      elif name == "mem_frame_addr" then
+        # this function's frame pointer: [rbp] is the caller's, [rbp+8]
+        # the return address -- what the allocation profiler walks
+        sb_push(sb, "    push rbp" + x64_nl_char())
       elif name == "rt_atomic_fetch_add" then
         # rt_atomic_fetch_add(addr, delta) -> the value at addr BEFORE
         # adding delta, with the add itself happening atomically (a
@@ -9192,22 +9142,17 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
         sb_push(sb, x64_len_asm())
       else
       if name == "mem_sb_table_addr" then
-        # Persistent 8-byte global holding the CURRENT tagged-list value
-        # of sb_new/sb_push/sb_str's (self_hosting/lib/x64_runtime.patlang)
-        # StringBuilder-entries table -- same "fixed .bss slot, real
-        # PatLang list value stored through it" pattern as
-        # mem_heap_state_addr, needed because sb_push's handle (a stable
-        # index) must keep working even when its own entry reallocates.
-        sb_push(sb, "    lea rax, [rel g_sb_table]" + x64_nl_char())
-        sb_push(sb, "    push rax" + x64_nl_char())
+        # The 8-byte cell holding the CURRENT tagged-list value of sb_new/
+        # sb_push/sb_str's (self_hosting/lib/x64_runtime.patlang)
+        # StringBuilder-entries table, needed because sb_push's handle (a
+        # stable index) must keep working even when its own entry
+        # reallocates. One per thread, as hosts.rs's thread_local SBUFS.
+        sb_push(sb, x64_thread_tables_cell_asm(0, label_asm_safe(0)))
       else
       if name == "mem_vec_table_addr" then
-        # Same pattern as mem_sb_table_addr, for vec_new/vec_push/
-        # vec_get/vec_set/vec_len/vec_to_list's own table of entries
-        # (each entry an ordinary PatLang List instead of a byte
-        # buffer -- see x64_runtime.patlang's own header on these).
-        sb_push(sb, "    lea rax, [rel g_vec_table]" + x64_nl_char())
-        sb_push(sb, "    push rax" + x64_nl_char())
+        # Same, for vec_new/vec_push/vec_get/vec_set/vec_len/vec_to_list's
+        # table of entries (hosts.rs's thread_local VECS).
+        sb_push(sb, x64_thread_tables_cell_asm(8, label_asm_safe(0)))
       else
       if name == "mem_vars_table_addr" then
         # Same pattern again, for set_var/get's global named-counter
@@ -9531,9 +9476,617 @@ make a function called x64_callhost_asm takes name, argc, spilled returns asm
   end
   end
   end
-  end
-  end
   return sb_str(sb)
+end
+
+# x64_callhost_family_asm(name, argc, spilled): the asm for a host primitive
+# served by one of the family functions below, or false when none of them
+# serves name. These were one dispatch chain of 116 branches inside
+# x64_callhost_asm; the parser nests each elif in the previous else, so
+# that chain was 116 levels deep for every pass over the syntax tree.
+make a function called x64_callhost_family_asm takes name, argc, spilled returns asm
+  let asm = x64_callhost_files_asm(name, argc, spilled)
+  if asm != false then
+    return asm
+  end
+  let asm = x64_callhost_console_asm(name, argc, spilled)
+  if asm != false then
+    return asm
+  end
+  let asm = x64_callhost_dispatch_asm(name, argc, spilled)
+  if asm != false then
+    return asm
+  end
+  let asm = x64_callhost_window_asm(name, argc, spilled)
+  if asm != false then
+    return asm
+  end
+  let asm = x64_callhost_fiber_asm(name, argc, spilled)
+  if asm != false then
+    return asm
+  end
+  let asm = x64_callhost_conpty_asm(name, argc, spilled)
+  if asm != false then
+    return asm
+  end
+  let asm = x64_callhost_process_asm(name, argc, spilled)
+  if asm != false then
+    return asm
+  end
+  let asm = x64_callhost_socket_asm(name, argc, spilled)
+  if asm != false then
+    return asm
+  end
+  let asm = x64_callhost_float_bits_asm(name, argc, spilled)
+  if asm != false then
+    return asm
+  end
+  let asm = x64_callhost_math_asm(name, argc, spilled)
+  if asm != false then
+    return asm
+  end
+  let asm = x64_callhost_bits_asm(name, argc, spilled)
+  if asm != false then
+    return asm
+  end
+  return false
+end
+
+# The file and directory primitives, or false.
+make a function called x64_callhost_files_asm takes name, argc, spilled returns asm
+  if name == "os_read_file_into" then
+    return x64_os_read_file_into_asm()
+  elif name == "os_read_file_range" then
+    return x64_os_read_file_range_asm()
+  elif name == "os_write_file" then
+    return x64_os_write_file_asm()
+  elif name == "os_copy_file" then
+    # Deliberately `elif`, not another "else\nif...end" nesting level
+    # -- per this session's own CLAUDE.md convention (added after a
+    # real bug from exactly that pattern), a new branch on an existing
+    # deferred-end chain should use elif so the end-count can't drift.
+    return x64_os_copy_file_asm()
+  elif name == "os_rename_file" then
+    return x64_os_rename_file_asm()
+  elif name == "os_delete_file" then
+    return x64_os_delete_file_asm()
+  elif name == "os_create_directory" then
+    return x64_os_create_directory_asm()
+  elif name == "os_path_exists" then
+    return x64_os_path_exists_asm()
+  elif name == "os_get_cwd" then
+    return x64_os_get_cwd_asm()
+  elif name == "os_set_cwd" then
+    return x64_os_set_cwd_asm()
+  elif name == "os_find_first" then
+    return x64_os_find_first_asm()
+  elif name == "os_find_next" then
+    return x64_os_find_next_asm()
+  elif name == "os_find_data_name" then
+    return x64_os_find_data_name_asm()
+  elif name == "os_find_data_is_dir" then
+    return x64_os_find_data_is_dir_asm()
+  elif name == "os_find_close" then
+    return x64_os_find_close_asm()
+  end
+  return false
+end
+
+# The console primitives, or false.
+make a function called x64_callhost_console_asm takes name, argc, spilled returns asm
+  if name == "os_read_line" then
+    return x64_os_read_line_asm()
+  elif name == "os_enable_raw_mode" then
+    return x64_os_enable_raw_mode_asm()
+  elif name == "os_disable_raw_mode" then
+    return x64_os_disable_raw_mode_asm()
+  elif name == "os_read_raw_byte" then
+    return x64_os_read_raw_byte_asm()
+  elif name == "os_set_console_utf8" then
+    return x64_os_set_console_utf8_asm()
+  elif name == "os_enable_ansi_colors" then
+    return x64_os_enable_ansi_colors_asm()
+  end
+  return false
+end
+
+# The apply-table, indirect-call and event-handler primitives, or false.
+make a function called x64_callhost_dispatch_asm takes name, argc, spilled returns asm
+  if name == "os_apply_table_count" then
+    return x64_os_apply_table_count_asm()
+  elif name == "os_apply_table_name_at" then
+    return x64_os_apply_table_name_at_asm()
+  elif name == "os_apply_table_func_at" then
+    return x64_os_apply_table_func_at_asm()
+  elif name == "os_call_indirect" then
+    return x64_os_call_indirect_asm()
+  elif name == "os_call_bridge" then
+    return x64_os_call_bridge_asm()
+  elif name == "rt_invoke_closure2" then
+    # rt_invoke_closure2(closure, a, b) -> result -- calls `closure` as
+    # if the source had written `closure(a, b)` directly. Exists so
+    # `emit`/`register_event_handler` (x64_runtime.patlang, ordinary
+    # PatLang built on this ONE new raw primitive) can invoke an
+    # arbitrary event-handler closure without needing their own new
+    # asm: x64_callvalue_asm already does exactly this, it just needs
+    # `spilled` (a codegen-TIME concept -- the enclosing function's own
+    # spilled-locals list, used to compute a private scratch-slot
+    # offset) which only a CallHost case compiled inline like this one
+    # has access to; an ordinary PatLang function never could.
+    #
+    # REAL BUG found and fixed here via cdb, not by re-reading code a
+    # second time (which found nothing): the FIRST version of this
+    # primitive declared `(a, b, closure)`, closure LAST, on the
+    # assumption that x64_callvalue_asm pops the closure value FIRST
+    # (so it should be pushed last/on top). That assumption was
+    # backwards. x64_callvalue_asm's own step 1 pops its N own-args
+    # OFF THE TOP first (assuming THEY are topmost) and only THEN pops
+    # the closure -- so the closure must be the DEEPEST of the three,
+    # i.e. pushed FIRST, matching how a genuine source-level
+    # `myclosure(x0, x1)` CallValue site naturally pushes its callee
+    # expression before its arguments. With the old `(a, b, closure)`
+    # order, a call site's normal left-to-right push left the CLOSURE
+    # on top and the FIRST ARGUMENT deepest -- so x64_callvalue_asm's
+    # `pop r14` grabbed the first argument instead of the closure.
+    # Confirmed via cdb on the actual crash: r13 (meant to be the
+    # closure's captured_count) held 0x00000f5445455247 -- the raw
+    # bytes of the string "GREET", the event name that was `emit`'s
+    # OWN first argument -- read as a captured-value loop bound, this
+    # pushed captured "values" until the stack was exhausted
+    # (STATUS_STACK_OVERFLOW, zero program output since the crash
+    # happened before the handler, or even `emit`, ever returned).
+    return x64_callvalue_asm(2, spilled)
+  elif name == "register_event_handler" then
+    let sb = sb_new()
+    # lower.patlang's own "When" case (a source-level `when EVENT { ...
+    # }` block) ALWAYS emits `CallHost("register_event_handler", 2)`
+    # unconditionally -- unlike an ordinary call to a plain name, this
+    # is never routed through the normal "is this name a known
+    # function?" Call-vs-CallHost classification at all, so defining
+    # register_event_handler as a real function in x64_runtime.patlang
+    # (which it also is, for the case of a program calling it directly
+    # as ordinary source syntax) is not sufficient on its own -- this
+    # CallHost case is what the `when`-generated instruction actually
+    # reaches. Simply calls that same real function and reclaims its 2
+    # args, exactly the "call a real function, argc*8 caller-cleans"
+    # shape the "list_push" case above already establishes.
+    sb_push(sb, "    call register_event_handler" + x64_nl_char())
+    sb_push(sb, "    add rsp, 16" + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
+    return sb_str(sb)
+  end
+  return false
+end
+
+# The window and canvas primitives, or false.
+make a function called x64_callhost_window_asm takes name, argc, spilled returns asm
+  if name == "win_create_window" then
+    return x64_win_create_window_asm()
+  elif name == "win_canvas_alloc" then
+    return x64_win_canvas_alloc_asm()
+  elif name == "win_canvas_init_dib" then
+    return x64_win_canvas_init_dib_asm()
+  elif name == "win_text_out" then
+    return x64_win_text_out_asm()
+  elif name == "win_canvas_fill" then
+    return x64_win_canvas_fill_asm()
+  elif name == "win_canvas_blit" then
+    return x64_win_canvas_blit_asm()
+  elif name == "win_last_wparam" then
+    let sb = sb_new()
+    # wParam is WPARAM (UINT_PTR), a full 8-byte field at MSG offset
+    # 16 on x64 -- NOT 4 bytes (unlike `message`, an actual DWORD).
+    sb_push(sb, "    mov rax, [rel g_msg_scratch+16]" + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
+    return sb_str(sb)
+  elif name == "win_canvas_set_size" then
+    return x64_win_canvas_set_size_asm()
+  elif name == "win_invalidate" then
+    return x64_win_invalidate_asm()
+  elif name == "win_set_title" then
+    return x64_win_set_title_asm()
+  elif name == "win_ctrl_down" then
+    return x64_win_ctrl_down_asm()
+  elif name == "win_clipboard_set_text" then
+    return x64_win_clipboard_set_text_asm()
+  elif name == "win_clipboard_get_text" then
+    return x64_win_clipboard_get_text_asm()
+  elif name == "win_canvas_resize" then
+    return x64_win_canvas_resize_asm()
+  elif name == "win_peek_message" then
+    return x64_win_peek_message_asm()
+  end
+  return false
+end
+
+# The thread, fiber and budget primitives, or false.
+make a function called x64_callhost_fiber_asm takes name, argc, spilled returns asm
+  if name == "os_thread_spawn_raw" then
+    return x64_os_thread_spawn_raw_asm()
+  elif name == "os_fiber_spawn" then
+    return x64_os_fiber_spawn_asm()
+  elif name == "os_thread_spawn_by_addr" then
+    return x64_os_thread_spawn_by_addr_asm()
+  elif name == "os_fiber_resume" then
+    return x64_os_fiber_resume_asm()
+  elif name == "os_fiber_yield" then
+    return x64_os_fiber_yield_asm()
+  elif name == "os_fiber_alive" then
+    return x64_os_fiber_alive_asm()
+  elif name == "os_fiber_current_id" then
+    return x64_os_fiber_current_id_asm()
+  elif name == "os_fiber_table_lock_acquire" then
+    return x64_os_fiber_table_lock_acquire_asm()
+  elif name == "os_fiber_table_lock_release" then
+    return x64_os_fiber_table_lock_release_asm()
+  elif name == "budgeted_run" then
+    let sb = sb_new()
+    # lower.patlang's own lower_budgeted_literal emits this as a raw
+    # CallHost op UNCONDITIONALLY (see its header there) -- it never
+    # goes through the ordinary "is this name a real function?" Call
+    # path, even though budgeted_run IS one (x64_runtime.patlang), so
+    # it needs its own thin bridge here: same call/add-rsp/push-rax
+    # shape the ordinary "Call" instruction case uses (this file's own
+    # x64_emit_instr, the "ty == Call" branch), just reached via
+    # CallHost dispatch instead.
+    sb_push(sb, "    call " + x64_asm_label_for_func("budgeted_run") + x64_nl_char())
+    sb_push(sb, "    add rsp, 32" + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
+    return sb_str(sb)
+  elif name == "budget_check" then
+    let sb = sb_new()
+    # Same bridge as budgeted_run just above, 0 args (nothing to pop).
+    sb_push(sb, "    call " + x64_asm_label_for_func("budget_check") + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
+    return sb_str(sb)
+  end
+  return false
+end
+
+# The pseudo-console primitives, or false.
+make a function called x64_callhost_conpty_asm takes name, argc, spilled returns asm
+  if name == "conpty_create" then
+    return x64_conpty_create_asm()
+  elif name == "conpty_spawn" then
+    return x64_conpty_spawn_asm()
+  elif name == "conpty_read_nonblocking" then
+    return x64_conpty_read_nonblocking_asm()
+  elif name == "conpty_write_raw" then
+    return x64_conpty_write_raw_asm()
+  elif name == "conpty_resize" then
+    return x64_conpty_resize_asm()
+  elif name == "conpty_close" then
+    return x64_conpty_close_asm()
+  end
+  return false
+end
+
+# The process, environment and clock primitives, or false.
+make a function called x64_callhost_process_asm takes name, argc, spilled returns asm
+  if name == "exec_capture" then
+    return x64_exec_capture_asm(argc)
+  elif name == "os_last_exec_exit_code" then
+    return x64_os_last_exec_exit_code_asm()
+  elif name == "os_set_exec_timeout" then
+    let sb = sb_new()
+    # os_set_exec_timeout(ms): arms a one-shot wall-clock timeout for the
+    # NEXT os_exec_run (consumed and cleared by it). Returns its argument.
+    sb_push(sb, "    pop rax" + x64_nl_char())
+    sb_push(sb, "    mov [rel g_exec_timeout_ms], rax" + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
+    return sb_str(sb)
+  elif name == "os_exec_run" then
+    # Exposes the SAME primitive x64_exec_capture_asm's CallHost handling
+    # already wraps (CreateProcessA + pipe capture, cmdline_addr/
+    # cmdline_len args, RAW untagged output address returned) as an
+    # independently name-dispatchable 2-arg primitive, so ordinary
+    # PatLang code (x64_runtime.patlang's exec_capture_io wrapper) can
+    # call it directly with a RUNTIME-VARIABLE argument count already
+    # joined into one string -- exec_capture's own variadic CallHost
+    # form requires a compile-time-fixed arg count at every call site,
+    # which can't express "however many args a runtime list happens to
+    # hold." No new assembly: x64_os_exec_run_asm's own calling
+    # convention (pop cmdline_len then cmdline_addr) already matches an
+    # ordinary 2-arg call (cmdline_addr, cmdline_len) pushed in that
+    # order, unchanged.
+    return x64_os_exec_run_asm()
+  elif name == "spawn" then
+    # Stage A of the interp.patlang-compilation roadmap (#25, past
+    # #26/#27): spawn(path, arg1, arg2, ...) -> Int PID, non-blocking.
+    # Deliberately a CallHost primitive (like exec_capture, not an
+    # ordinary PatLang function) since real callers (interp.patlang's
+    # own dispatch) invoke it with a VARYING argument count (1-4) --
+    # PatLang has no variadic function definitions, so an ordinary
+    # fixed-arity function couldn't serve every call site.
+    return x64_spawn_asm(argc)
+  elif name == "os_get_exit_code_process" then
+    let sb = sb_new()
+    # Thin wrapper: GetExitCodeProcess(handle) -> exit code Int, or the
+    # STILL_ACTIVE (259) sentinel if the process hasn't finished. Used
+    # by is_alive/wait (both ordinary PatLang functions in x64_runtime.
+    # patlang) rather than exposing raw GetExitCodeProcess plumbing there.
+    sb_push(sb, "    pop rcx" + x64_nl_char())
+    sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+    sb_push(sb, "    sub rsp, 48" + x64_nl_char())
+    sb_push(sb, "    and rsp, -16" + x64_nl_char())
+    sb_push(sb, "    lea rdx, [rsp+32]" + x64_nl_char())
+    sb_push(sb, "    call GetExitCodeProcess" + x64_nl_char())
+    sb_push(sb, "    mov eax, [rsp+32]" + x64_nl_char())
+    sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
+    return sb_str(sb)
+  elif name == "os_terminate_process" then
+    let sb = sb_new()
+    # TerminateProcess(handle) -- best-effort, failure (already-exited)
+    # is not surfaced as an error, matching the real host's `let _ =
+    # child.kill()` semantics (rust-runtime/src/ir/hosts.rs).
+    #
+    # Real bug found and fixed here: a plain `sub rsp, N`/`add rsp, N`
+    # (no `and rsp, -16`) silently ASSUMES the incoming rsp is already
+    # 16-aligned -- but this backend's own value-stack pushes/pops use
+    # the real machine rsp directly for expression evaluation, and a
+    # function's post-prologue baseline alignment depends on that
+    # function's own frame_size (8 * (spilled_count + 3)) mod 16, which
+    # varies function to function. Confirmed directly: os_socket_tcp
+    # with a bare `sub rsp, 32` crashed in some call sites but not
+    # others, purely depending on which enclosing function's frame_size
+    # parity happened to leave rsp already aligned. Every one of these
+    # thin OS-primitive wrappers now self-aligns via the same
+    # save-rsp/and/restore dance x64_os_write_file_asm/x64_os_exec_run_
+    # asm/x64_os_wsa_startup_asm already used, matching this file's own
+    # established (if not universally followed) precedent.
+    sb_push(sb, "    pop rcx" + x64_nl_char())
+    sb_push(sb, "    mov rdx, 1" + x64_nl_char())
+    sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+    sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+    sb_push(sb, "    and rsp, -16" + x64_nl_char())
+    sb_push(sb, "    call TerminateProcess" + x64_nl_char())
+    sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+    sb_push(sb, "    push 0" + x64_nl_char())
+    return sb_str(sb)
+  elif name == "os_wait_for_single_object" then
+    let sb = sb_new()
+    # WaitForSingleObject(handle, INFINITE) -- blocking wait used by
+    # wait()'s reap-to-completion semantics.
+    sb_push(sb, "    pop rcx" + x64_nl_char())
+    sb_push(sb, "    mov rdx, -1" + x64_nl_char())
+    sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+    sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+    sb_push(sb, "    and rsp, -16" + x64_nl_char())
+    sb_push(sb, "    call WaitForSingleObject" + x64_nl_char())
+    sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+    sb_push(sb, "    push 0" + x64_nl_char())
+    return sb_str(sb)
+  elif name == "os_close_handle" then
+    let sb = sb_new()
+    sb_push(sb, "    pop rcx" + x64_nl_char())
+    sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+    sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+    sb_push(sb, "    and rsp, -16" + x64_nl_char())
+    sb_push(sb, "    call CloseHandle" + x64_nl_char())
+    sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+    sb_push(sb, "    push 0" + x64_nl_char())
+    return sb_str(sb)
+  elif name == "os_sleep_ms" then
+    let sb = sb_new()
+    sb_push(sb, "    pop rcx" + x64_nl_char())
+    sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+    sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+    sb_push(sb, "    and rsp, -16" + x64_nl_char())
+    sb_push(sb, "    call Sleep" + x64_nl_char())
+    sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+    sb_push(sb, "    push 0" + x64_nl_char())
+    return sb_str(sb)
+  elif name == "getenv" then
+    return x64_os_getenv_asm(true)
+  elif name == "os_getenv_raw" then
+    return x64_os_getenv_asm(false)
+  elif name == "os_get_tick_count" then
+    let sb = sb_new()
+    sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+    sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+    sb_push(sb, "    and rsp, -16" + x64_nl_char())
+    sb_push(sb, "    call GetTickCount64" + x64_nl_char())
+    sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
+    return sb_str(sb)
+  end
+  return false
+end
+
+# The socket primitives, or false.
+make a function called x64_callhost_socket_asm takes name, argc, spilled returns asm
+  if name == "os_wsa_startup" then
+    let sb = sb_new()
+    # Idempotent (Winsock reference-counts WSAStartup internally, and
+    # this process never calls WSACleanup) -- called unconditionally at
+    # the top of tcp_listen/tcp_try_listen/tcp_connect rather than
+    # gated behind g_wsa_init, since the g_wsa_init check itself would
+    # need the exact same save/restore-rsp dance this already does.
+    sb_push(sb, x64_os_wsa_startup_asm())
+    sb_push(sb, "    push 0" + x64_nl_char())
+    return sb_str(sb)
+  elif name == "os_socket_tcp" then
+    let sb = sb_new()
+    sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+    sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+    sb_push(sb, "    and rsp, -16" + x64_nl_char())
+    sb_push(sb, "    mov ecx, 2" + x64_nl_char())
+    sb_push(sb, "    mov edx, 1" + x64_nl_char())
+    sb_push(sb, "    mov r8d, 6" + x64_nl_char())
+    sb_push(sb, "    call socket" + x64_nl_char())
+    sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
+    return sb_str(sb)
+  elif name == "os_bind_listen" then
+    return x64_os_bind_listen_asm()
+  elif name == "os_accept" then
+    return x64_os_accept_asm()
+  elif name == "os_connect" then
+    return x64_os_connect_asm()
+  elif name == "os_connect_try" then
+    return x64_os_connect_try_asm()
+  elif name == "os_recv" then
+    return x64_os_recv_asm()
+  elif name == "os_recv_had_error" then
+    let sb = sb_new()
+    sb_push(sb, "    mov rax, [rel g_last_recv_error]" + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
+    return sb_str(sb)
+  elif name == "os_send" then
+    return x64_os_send_asm()
+  elif name == "os_closesocket" then
+    let sb = sb_new()
+    sb_push(sb, "    pop rcx" + x64_nl_char())
+    sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+    sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+    sb_push(sb, "    and rsp, -16" + x64_nl_char())
+    sb_push(sb, "    call closesocket" + x64_nl_char())
+    sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+    sb_push(sb, "    push 0" + x64_nl_char())
+    return sb_str(sb)
+  elif name == "os_set_nonblocking" then
+    let sb = sb_new()
+    # ioctlsocket(sock, FIONBIO, &1) -- Stage B part 2 (#25):
+    # tcp_accept_timeout's non-blocking poll variant.
+    sb_push(sb, "    pop rcx" + x64_nl_char())
+    sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+    sb_push(sb, "    sub rsp, 48" + x64_nl_char())
+    sb_push(sb, "    and rsp, -16" + x64_nl_char())
+    sb_push(sb, "    mov dword [rsp+40], 1" + x64_nl_char())
+    sb_push(sb, "    mov rdx, 0 - 2147195266" + x64_nl_char())
+    sb_push(sb, "    lea r8, [rsp+40]" + x64_nl_char())
+    sb_push(sb, "    call ioctlsocket" + x64_nl_char())
+    sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+    sb_push(sb, "    push 0" + x64_nl_char())
+    return sb_str(sb)
+  elif name == "os_accept_nonblocking" then
+    let sb = sb_new()
+    sb_push(sb, "    pop rcx" + x64_nl_char())
+    sb_push(sb, "    mov r12, rcx" + x64_nl_char())
+    sb_push(sb, "    mov r15, rsp" + x64_nl_char())
+    sb_push(sb, "    sub rsp, 32" + x64_nl_char())
+    sb_push(sb, "    and rsp, -16" + x64_nl_char())
+    sb_push(sb, "    mov rcx, r12" + x64_nl_char())
+    sb_push(sb, "    xor rdx, rdx" + x64_nl_char())
+    sb_push(sb, "    xor r8, r8" + x64_nl_char())
+    sb_push(sb, "    call accept" + x64_nl_char())
+    sb_push(sb, "    mov rsp, r15" + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
+    return sb_str(sb)
+  end
+  return false
+end
+
+# The raw float64 bit-pattern primitives, or false.
+make a function called x64_callhost_float_bits_asm takes name, argc, spilled returns asm
+  if name == "x64_int_to_float_bits" then
+    return x64_int_to_float_bits_asm()
+  elif name == "x64_float_add_bits" then
+    return x64_float_arith_bits_asm("+")
+  elif name == "x64_float_sub_bits" then
+    return x64_float_arith_bits_asm("-")
+  elif name == "x64_float_mul_bits" then
+    return x64_float_arith_bits_asm("*")
+  elif name == "x64_float_div_bits" then
+    return x64_float_arith_bits_asm("/")
+  elif name == "x64_float_cmp_bits" then
+    return x64_float_cmp_bits_asm()
+  elif name == "x64_float_bits_to_int" then
+    let sb = sb_new()
+    # Truncating float64-bits -> int (rt_isqrt_exact, x64_runtime.patlang).
+    sb_push(sb, "    pop rax" + x64_nl_char())
+    sb_push(sb, "    movq xmm0, rax" + x64_nl_char())
+    sb_push(sb, "    cvttsd2si rax, xmm0" + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
+    return sb_str(sb)
+  elif name == "x64_float_pow_bits" then
+    # GitHub #229: libm pow/atan2 on raw float64 bits, for the runtime's
+    # tagged rt_pow_dynamic / rt_atan2_dynamic.
+    return x64_math2_asm("pow")
+  elif name == "x64_float_atan2_bits" then
+    return x64_math2_asm("atan2")
+  elif x64_raw_math1_bits_fn(name) != "" then
+    # GitHub #229: libm on a raw float64 bit pattern, explicitly -- what
+    # the runtime's tagged sqrt/math functions (rt_sqrt_dynamic,
+    # rt_math1_dynamic) call once they have converted their argument.
+    return x64_math1_asm(x64_raw_math1_bits_fn(name))
+  end
+  return false
+end
+
+# The math functions, or false.
+make a function called x64_callhost_math_asm takes name, argc, spilled returns asm
+  if name == "sqrt" then
+    return x64_math1_asm("sqrt")
+  elif name == "sin" then
+    return x64_math1_asm("sin")
+  elif name == "cos" then
+    return x64_math1_asm("cos")
+  elif name == "tan" then
+    return x64_math1_asm("tan")
+  elif name == "asin" then
+    return x64_math1_asm("asin")
+  elif name == "acos" then
+    return x64_math1_asm("acos")
+  elif name == "atan" then
+    return x64_math1_asm("atan")
+  elif name == "log" then
+    return x64_math1_asm("log")
+  elif name == "exp" then
+    return x64_math1_asm("exp")
+  elif name == "pow" then
+    return x64_math2_asm("pow")
+  elif name == "atan2" then
+    return x64_math2_asm("atan2")
+  elif name == "abs" then
+    return x64_abs_asm()
+  elif name == "ceil" then
+    return x64_roundlike_asm("ceil")
+  elif name == "floor" then
+    # There was no `floor` case here at all, so it fell through to the
+    # generic path and came back as the argument's raw float64 BITS
+    # printed as an integer: floor(2.4) gave 4612586738352862003, which
+    # is exactly 2.4's bit pattern. It is a direct C call like ceil --
+    # msvcrt does export floor.
+    return x64_roundlike_asm("floor")
+  elif name == "round" then
+    return x64_roundlike_asm("round")
+  elif name == "trunc" then
+    return x64_roundlike_asm("trunc")
+  end
+  return false
+end
+
+# The bit and value-family primitives, or false.
+make a function called x64_callhost_bits_asm takes name, argc, spilled returns asm
+  if name == "bit_get" then
+    let sb = sb_new()
+    sb_push(sb, "    pop rcx" + x64_nl_char())
+    sb_push(sb, "    pop rax" + x64_nl_char())
+    sb_push(sb, "    sar rax, cl" + x64_nl_char())
+    sb_push(sb, "    and rax, 1" + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
+    return sb_str(sb)
+  elif name == "bit_set" then
+    return x64_bit_set_asm()
+  elif name == "bit_slice" then
+    return x64_bit_slice_asm()
+  elif name == "bit_set_slice" then
+    return x64_bit_set_slice_asm()
+  elif name == "x64_family_code" then
+    # Internal (not user-facing) primitive backing the ordinary PatLang
+    # type_of/numeric_kind wrapper functions in x64_runtime.patlang --
+    # returns a small int code classifying v's family, which those
+    # wrappers map to the real string result via ordinary literal
+    # Consts (going through the normal string-literal pipeline, unlike
+    # trying to emit a fresh string constant directly from raw asm
+    # here). 0=fixnum, 2=string, 3=list, 4=closure, 5=object,
+    # 6=bigint, 7=rational, 8=complex, 9=interval, 10=other (doesn't
+    # round-trip as a fixnum AND doesn't match any known family/subtag).
+    return x64_family_code_asm()
+  end
+  return false
 end
 
 # BuildList (Slice 4): the argc elements are already on the real stack
@@ -9822,12 +10375,17 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
   let sb = sb_new()
   sb_push(sb, label + ":" + x64_nl_char())
   let ty = instr[0]
+  if ((ty == "Call") or (ty == "CallHost")) and x64_is_rc_fn(instr[1]) then
+    sb_push(sb, x64_rc_call_asm(instr[1], call_box_positions, label))
+    return sb_str(sb)
+  end
   # GitHub #229: raw float operands about to be stored as tagged values
-  # (x64_taint_one_pass_float's call_box_entries for these four kinds; a
-  # Call boxes its own, below) are boxed in place on the stack first.
-  if (ty == "BuildList") or (ty == "CallHost") or (ty == "MakeClosure") or (ty == "CallValue") or (ty == "Return") then
+  # (x64_taint_one_pass_float's call_box_entries for these kinds, a Store
+  # being one into a variable kept tagged; a Call boxes its own, below)
+  # are boxed in place on the stack first.
+  if (ty == "BuildList") or (ty == "CallHost") or (ty == "MakeClosure") or (ty == "CallValue") or (ty == "Return") or (ty == "Store") then
     if call_box_positions != [] then
-      sb_push(sb, x64_emit_call_box_asm(call_box_positions))
+      sb_push(sb, x64_emit_call_box_asm(call_box_positions, x64_box_slot_base(regmap, spilled)))
     end
   end
   if ty == "Const" then
@@ -10025,7 +10583,7 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
         if ty == "Bin" then
           # GitHub #37: per-instruction, not whole-function.
           if type_of(float_dyn_sides) == "list" then
-            sb_push(sb, x64_binop_asm_float_dynamic(instr[1], spilled, float_dyn_sides))
+            sb_push(sb, x64_binop_asm_float_dynamic(instr[1], spilled, float_dyn_sides, x64_box_slot_base(regmap, spilled)))
           elif is_float_bin then
             sb_push(sb, x64_binop_asm_float(instr[1], mixed_left_int, mixed_right_int))
           else
@@ -10045,12 +10603,12 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
                     # arithmetic on the raw tagged word inside a dynamic-
                     # mode function -- only correct if that operand is
                     # actually a fixnum. See x64_runtime.patlang's header.
-                    sb_push(sb, x64_binop_asm(instr[1]))
+                    sb_push(sb, x64_binop_asm(instr[1], not x64_func_is_tower_impl(func_name)))
                   end
                 end
               end
             else
-              sb_push(sb, x64_binop_asm(instr[1]))
+              sb_push(sb, x64_binop_asm(instr[1], not x64_func_is_tower_impl(func_name)))
             end
           end
         else
@@ -10204,7 +10762,7 @@ make a function called x64_emit_instr takes instr, func_name, regmap, spilled, l
                   # never bm_fn_-prefixed -- see the #99/#189 scoping note
                   # at this fix's analysis site).
                   if call_box_positions != [] then
-                    sb_push(sb, x64_emit_call_box_asm(call_box_positions))
+                    sb_push(sb, x64_emit_call_box_asm(call_box_positions, x64_box_slot_base(regmap, spilled)))
                   end
                   # GitHub #189: box a genuine unboxed float onto the real
                   # heap (rt_box_float) immediately before it reaches
@@ -10589,7 +11147,9 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
   let pool_used = x64_reg_pool()
   let pool_used_n = to_num(list_len(regmap))
   let save_base = to_num(list_len(spilled)) + 3
-  let frame_size = 8 * (save_base + pool_used_n)
+  # (plus the box-save slots, x64_box_save_slots: 64 bytes, so the
+  # frame's 16-byte parity is unchanged)
+  let frame_size = 8 * (save_base + pool_used_n + x64_box_save_slots())
   if frame_size < 16 then
     let frame_size = 16
   end
@@ -10654,7 +11214,7 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
     let mixed_right_int_indices = float_result[4]
     let call_box_entries = float_result[5]
     let float_dyn_bins = float_result[6]
-    let float_const_indices = x64_analyze_float_consts(instrs, float_result[2], float_instr_indices)
+    let float_const_indices = x64_analyze_float_consts(instrs, float_result[2], float_instr_indices, mixed_left_int_indices, mixed_right_int_indices)
     let float_box_single_indices = x64_float_box_single_indices(instrs, float_mode, produces_float)
     let float_box_receiver_indices = x64_float_box_receiver_indices(instrs, float_mode, produces_float)
   end
@@ -10794,7 +11354,7 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
             if to_num(instr[2]) == 1 then
               if not is_bool_print then
                 if i > 0 then
-                  let is_float_print = produces_float[i - 1]
+                  let is_float_print = produces_float[x64_value_producer_before(instrs, i)]
                 end
               end
             end
@@ -10819,6 +11379,17 @@ make a function called x64_emit_func takes func, float_mode, dynamic_mode, float
       end
       let float_dyn_sides = get("__vars", "xef_fdb__" + i)
       sb_push(sb, x64_emit_instr(instr, func_name, regmap, spilled, label, is_float_bin, is_float_const, is_dynamic_bin, is_bool_print, is_float_print, is_tower_ctor_arg, is_float_box_single, is_float_box_receiver, is_mixed_left_int, is_mixed_right_int, call_box_positions_here, raw_math, float_dyn_sides))
+      # the boxes made for a call's arguments are the caller's to release
+      # (list_push and list_set take their own reference to the element,
+      # docs/plans/general-refcounting.md Phase 7); a list literal, a
+      # closure capture, a Store and a Return keep theirs
+      if call_box_positions_here != [] then
+        let kind = instr[0]
+        let borrows = ((kind == "Call") or (kind == "CallValue") or (kind == "CallHost")) and (not x64_is_rc_fn(instr[1]))
+        if borrows then
+          sb_push(sb, x64_emit_box_release_asm(to_num(list_len(call_box_positions_here)), x64_box_slot_base(regmap, spilled)))
+        end
+      end
       let i = i + 1
     end
   end
@@ -11241,6 +11812,42 @@ end
 # ordinary Call argument/Return boundary to another PatLang function --
 # that's the harder, more general case rt_box_float's own header names as
 # real follow-up work, not attempted here.
+# The index of the instruction that produced the value on top of the stack
+# just before instrs[i], stepping back over the block-model ownership passes'
+# releases (`Load t; Call rt_rc_*; Store <...>__bm_string_rc_discard`), which
+# leave the stack as they found it. Looking only at instrs[i - 1] took such a
+# release for the value: print then printed a raw float's bits as an int.
+make a function called x64_value_producer_before takes instrs, i returns j
+  let j = i - 1
+  let going = true
+  while going and (j >= 2) do
+    let st = instrs[j]
+    let going = false
+    if (st[0] == "Store") and x64_ends_with(st[1], "__bm_string_rc_discard") then
+      let call = instrs[j - 1]
+      if ((call[0] == "Call") or (call[0] == "CallHost")) and x64_is_rc_fn(call[1]) then
+        # its arguments: Loads only (rt_rc_release_old takes two)
+        let argc = to_num(call[2])
+        let loads = true
+        let k = 1
+        while k <= argc do
+          if (j - 1 - k) < 0 then
+            let loads = false
+          elif instrs[j - 1 - k][0] != "Load" then
+            let loads = false
+          end
+          let k = k + 1
+        end
+        if loads then
+          let j = j - 2 - argc
+          let going = true
+        end
+      end
+    end
+  end
+  return j
+end
+
 make a function called x64_float_box_single_indices takes instrs, float_mode, produces_float returns indices
   let out = []
   if not float_mode then
@@ -11254,7 +11861,7 @@ make a function called x64_float_box_single_indices takes instrs, float_mode, pr
       if instr[1] == "type_of" then
         if to_num(instr[2]) == 1 then
           if i > 0 then
-            if produces_float[i - 1] then
+            if produces_float[x64_value_producer_before(instrs, i)] then
               let out = list_push(out, i)
             end
           end
@@ -11279,8 +11886,11 @@ make a function called x64_float_box_receiver_indices takes instrs, float_mode, 
       if instr[1] == "get" then
         if to_num(instr[2]) == 2 then
           if i > 1 then
-            if produces_float[i - 2] then
-              let out = list_push(out, i)
+            let key_at = x64_value_producer_before(instrs, i)
+            if key_at > 0 then
+              if produces_float[x64_value_producer_before(instrs, key_at)] then
+                let out = list_push(out, i)
+              end
             end
           end
         end
@@ -11320,7 +11930,7 @@ end
 # the boxed result back into the SAME slot. Each position restores rsp
 # to its starting value before the next iteration, so positions never
 # interact and order doesn't matter.
-make a function called x64_emit_call_box_asm takes positions returns asm
+make a function called x64_emit_call_box_asm takes positions, slot_base returns asm
   let sb = sb_new()
   let n = to_num(list_len(positions))
   let i = 0
@@ -11332,6 +11942,130 @@ make a function called x64_emit_call_box_asm takes positions returns asm
     sb_push(sb, "    call rt_box_float" + x64_nl_char())
     sb_push(sb, "    add rsp, 8" + x64_nl_char())
     sb_push(sb, "    mov [rsp+" + off + "], rax" + x64_nl_char())
+    if i < x64_box_save_slots() then
+      sb_push(sb, "    mov [rbp-" + (slot_base + 8 * (i + 1)) + "], rax" + x64_nl_char())
+    end
+    let i = i + 1
+  end
+  return sb_str(sb)
+end
+
+# A raw float passed where a tagged value is expected is boxed (above); the
+# box is the caller's, borrowed by the callee, which takes a reference of
+# its own if it keeps it (vec_set, rt_ns_set, a list element). So the caller
+# releases it once the instruction is done. The pointers are kept in these
+# frame slots, after the saved pool registers, because an argument slot may
+# be popped by an inline primitive before the instruction ends. Boxes past
+# the last slot are left (unreleased, as before).
+# The reference-count entry points the ownership passes insert. A fixnum
+# or a raw float is not on the heap, so counting it does nothing: both are
+# decided inline, and only a heap value reaches the runtime function. This
+# keeps owned arithmetic results (an int loop counter, a float temporary)
+# from costing a call -- or, for a raw float, a box made only to be freed.
+make a function called x64_is_rc_fn takes name returns yes
+  return (name == "rt_rc_dec_if_refcounted") or (name == "rt_rc_inc_if_refcounted") or (name == "rt_rc_release_old") or (name == "rt_rc_retain")
+end
+
+# rt_rc_retain(v), the retain the ownership passes put before a return, gives
+# back v with a reference of its own: a fixnum is itself, a raw float marked
+# for boxing becomes a new box (the reference), and only a heap value calls
+# the runtime.
+make a function called x64_rc_retain_asm takes box_positions, label returns asm
+  let sb = sb_new()
+  if list_len(box_positions) > 0 then
+    sb_push(sb, "    call rt_box_float" + x64_nl_char())
+    sb_push(sb, "    add rsp, 8" + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
+    return sb_str(sb)
+  end
+  let done = ".rc_done_" + label
+  sb_push(sb, "    mov rax, [rsp]" + x64_nl_char())
+  sb_push(sb, "    mov rcx, rax" + x64_nl_char())
+  sb_push(sb, "    shl rcx, 16" + x64_nl_char())
+  sb_push(sb, "    sar rcx, 16" + x64_nl_char())
+  sb_push(sb, "    cmp rcx, rax" + x64_nl_char())
+  sb_push(sb, "    je " + done + x64_nl_char())
+  sb_push(sb, "    call rt_rc_retain" + x64_nl_char())
+  sb_push(sb, "    add rsp, 8" + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, done + ":" + x64_nl_char())
+  return sb_str(sb)
+end
+
+# Stack on entry: the arguments (rt_rc_release_old: old, then new on top).
+# Leaves one result (true) in their place, as the call would.
+make a function called x64_rc_call_asm takes name, box_positions, label returns asm
+  if name == "rt_rc_retain" then
+    return x64_rc_retain_asm(box_positions, label)
+  end
+  let sb = sb_new()
+  let true_word = "6917529027641081857"
+  let argc = 1
+  let depth = 0
+  if name == "rt_rc_release_old" then
+    let argc = 2
+    let depth = 8
+  end
+  # the value counted is the deepest argument; a raw float there (marked
+  # for boxing) needs nothing
+  let raw = false
+  let k = 0
+  while k < list_len(box_positions) do
+    if list_get(box_positions, k) == (argc - 1) then
+      let raw = true
+    end
+    let k = k + 1
+  end
+  if raw then
+    sb_push(sb, "    add rsp, " + (argc * 8) + x64_nl_char())
+    sb_push(sb, "    mov rax, " + true_word + x64_nl_char())
+    sb_push(sb, "    push rax" + x64_nl_char())
+    return sb_str(sb)
+  end
+  let skip = ".rc_skip_" + label
+  let done = ".rc_done_" + label
+  sb_push(sb, "    mov rax, [rsp+" + depth + "]" + x64_nl_char())
+  sb_push(sb, "    mov rcx, rax" + x64_nl_char())
+  sb_push(sb, "    shl rcx, 16" + x64_nl_char())
+  sb_push(sb, "    sar rcx, 16" + x64_nl_char())
+  sb_push(sb, "    cmp rcx, rax" + x64_nl_char())
+  sb_push(sb, "    je " + skip + x64_nl_char())
+  sb_push(sb, "    call " + name + x64_nl_char())
+  sb_push(sb, "    add rsp, " + (argc * 8) + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, "    jmp " + done + x64_nl_char())
+  sb_push(sb, skip + ":" + x64_nl_char())
+  sb_push(sb, "    add rsp, " + (argc * 8) + x64_nl_char())
+  sb_push(sb, "    mov rax, " + true_word + x64_nl_char())
+  sb_push(sb, "    push rax" + x64_nl_char())
+  sb_push(sb, done + ":" + x64_nl_char())
+  return sb_str(sb)
+end
+
+make a function called x64_box_save_slots returns n
+  return 8
+end
+
+# Byte offset below rbp where the box-save slots start (they follow the
+# spill slots, the three always-reserved slots and the saved pool registers,
+# matching x64_emit_function's frame).
+make a function called x64_box_slot_base takes regmap, spilled returns base
+  return 8 * (to_num(list_len(spilled)) + 3 + to_num(list_len(regmap)))
+end
+
+# Releases the boxes an argument-boxing instruction saved, after it has
+# pushed its result (left untouched on the stack).
+make a function called x64_emit_box_release_asm takes count, slot_base returns asm
+  let sb = sb_new()
+  let n = count
+  if n > x64_box_save_slots() then
+    let n = x64_box_save_slots()
+  end
+  let i = 0
+  while i < n do
+    sb_push(sb, "    push qword [rbp-" + (slot_base + 8 * (i + 1)) + "]" + x64_nl_char())
+    sb_push(sb, "    call rt_rc_dec_if_refcounted" + x64_nl_char())
+    sb_push(sb, "    add rsp, 8" + x64_nl_char())
     let i = i + 1
   end
   return sb_str(sb)
@@ -11380,6 +12114,20 @@ end
 # scripts include only THIS file, so it needs its own copy, same
 # reasoning x64_build.patlang used for not depending on lib/
 # test.patlang's contains_text).
+make a function called x64_ends_with takes hay, suffix returns r
+  if hay.length < suffix.length then
+    return false
+  end
+  return substr(hay, hay.length - suffix.length, suffix.length) == suffix
+end
+
+make a function called x64_starts_with takes hay, prefix returns r
+  if prefix.length > hay.length then
+    return false
+  end
+  return substr(hay, 0, prefix.length) == prefix
+end
+
 make a function called x64_contains takes hay, needle returns r
   let hn = to_num(sc_len(str_intern(hay)))
   let nn = to_num(sc_len(str_intern(needle)))
@@ -11469,10 +12217,18 @@ make a function called x64_func_is_tower_impl takes name returns yes
   # by design -- none of them should ever have user-level numeric-tower
   # promotion semantics applied to their own internal arithmetic, so the
   # whole prefix is excluded now, not just the bigint/rational subset.
-  if x64_contains(name, "rt_") then
+  # It is a PREFIX: matching "rt_"/"mem_" anywhere in the name also caught
+  # user functions such as bm_fn_sort_numbers or bm_fn_check_mem_ok, whose
+  # tagged values then met raw-word compares and adds (`7 < 1/10` compared
+  # the rational's pointer bits). A block-model function holds tagged
+  # values by convention, whatever its name.
+  if x64_bm_tagged_convention(name) then
+    return false
+  end
+  if x64_starts_with(name, "rt_") then
     return true
   end
-  if x64_contains(name, "mem_") then
+  if x64_starts_with(name, "mem_") then
     return true
   end
   # Real bug found (GitHub #24-adjacent investigation): hash_string's
@@ -11803,7 +12559,7 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
     end
     sb_push(sb, sb_str(gl_line) + x64_nl_char())
   end
-  sb_push(sb, "extern GetStdHandle, WriteFile, ExitProcess, CreateFileA, GetFileSize, CloseHandle, ReadFile, CreateProcessA, CreatePipe, SetHandleInformation, WaitForSingleObject, GetCommandLineA, GetEnvironmentVariableA, GetExitCodeProcess, TerminateProcess, WSAStartup, WSAGetLastError, socket, bind, listen, accept, connect, send, recv, closesocket, shutdown, getaddrinfo, freeaddrinfo, getsockname, ioctlsocket, htons, ntohs, Sleep, GetTickCount64, CopyFileA, MoveFileExA, DeleteFileA, RemoveDirectoryA, CreateDirectoryA, GetFileAttributesA, FindFirstFileA, FindNextFileA, FindClose, GetConsoleMode, SetConsoleMode, SetConsoleOutputCP, SetConsoleCP, GetCurrentDirectoryA, SetCurrentDirectoryA, VirtualAlloc" + x64_nl_char())
+  sb_push(sb, "extern GetStdHandle, WriteFile, ExitProcess, CreateFileA, GetFileSize, CloseHandle, ReadFile, CreateProcessA, CreatePipe, SetHandleInformation, WaitForSingleObject, GetCommandLineA, GetEnvironmentVariableA, GetExitCodeProcess, TerminateProcess, WSAStartup, WSAGetLastError, socket, bind, listen, accept, connect, send, recv, closesocket, shutdown, getaddrinfo, freeaddrinfo, getsockname, ioctlsocket, htons, ntohs, Sleep, GetTickCount64, CopyFileA, MoveFileExA, DeleteFileA, RemoveDirectoryA, CreateDirectoryA, GetFileAttributesA, FindFirstFileA, FindNextFileA, FindClose, GetConsoleMode, SetConsoleMode, SetConsoleOutputCP, SetConsoleCP, GetCurrentDirectoryA, SetCurrentDirectoryA, VirtualAlloc, SetFilePointerEx" + x64_nl_char())
   # Canvas host, Phase 1 (win32_window.patlang's own backing
   # primitives): window creation, message pump, GDI pixel blit.
   # user32.dll/gdi32.dll are already linked (x64_build.patlang) but
@@ -11858,7 +12614,7 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
   sb_push(sb, x64_nl_char())
   sb_push(sb, "section .bss" + x64_nl_char())
   if owns_globals then
-    sb_push(sb, "    global g_written, g_scratch, g_scratch2, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_vars_lock, g_tls_counters_table, g_tls_counters_lock, g_heap_base, g_heap_committed, g_heap_reserved_ready, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init, g_last_recv_error, g_vfs_table, g_classes_table, g_goal_defs_table, g_finddata, g_last_exec_exit_code, g_exec_timeout_ms, g_hwnd, g_canvas_buf, g_canvas_w, g_canvas_h, g_mem_dc, g_msg_scratch, g_paintstruct_scratch, g_bmih_scratch, g_conpty_hpc, g_conpty_in_write, g_conpty_out_read, g_conpty_process, g_pta_list, g_pta_size, g_startupinfoex, g_process_info, g_scratch_cs, g_scratch_cs_ready, g_threads_table, g_resize_pending, g_resize_w, g_resize_h, g_fiber_tls_slot, g_fiber_tls_ready, g_fiber_table_cs, g_fiber_table_cs_ready, g_fiber_table, g_fiber_id_ctr" + x64_nl_char())
+    sb_push(sb, "    global g_written, g_scratch, g_scratch2, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_vars_lock, g_tls_counters_table, g_tls_counters_lock, g_heap_base, g_heap_committed, g_heap_reserved_ready, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init, g_last_recv_error, g_vfs_table, g_classes_table, g_goal_defs_table, g_finddata, g_last_exec_exit_code, g_exec_timeout_ms, g_hwnd, g_canvas_buf, g_canvas_w, g_canvas_h, g_mem_dc, g_msg_scratch, g_paintstruct_scratch, g_bmih_scratch, g_conpty_hpc, g_conpty_in_write, g_conpty_out_read, g_conpty_process, g_pta_list, g_pta_size, g_startupinfoex, g_process_info, g_scratch_cs, g_scratch_cs_ready, g_threads_table, g_resize_pending, g_resize_w, g_resize_h, g_fiber_tls_slot, g_fiber_tls_ready, g_fiber_table_cs, g_fiber_table_cs_ready, g_fiber_table, g_fiber_id_ctr, g_tables_tls_slot, g_tables_tls_ready, g_heap_prof" + x64_nl_char())
     sb_push(sb, "    align 8" + x64_nl_char())
     sb_push(sb, "    g_written resd 1" + x64_nl_char())
     sb_push(sb, "    align 8" + x64_nl_char())
@@ -12078,8 +12834,12 @@ make a function called emit_program_x64 takes ir, owns_globals, extern_names ret
     sb_push(sb, "    align 8" + x64_nl_char())
     sb_push(sb, "    g_fiber_table resq 1" + x64_nl_char())
     sb_push(sb, "    g_fiber_id_ctr resq 1" + x64_nl_char())
+    # The thread's own sb/vec tables (x64_thread_tables_cell_asm).
+    sb_push(sb, "    g_tables_tls_slot resq 1" + x64_nl_char())
+    sb_push(sb, "    g_tables_tls_ready resq 1" + x64_nl_char())
+    sb_push(sb, "    g_heap_prof resq 1" + x64_nl_char())
   else
-    sb_push(sb, "extern g_written, g_scratch, g_scratch2, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_vars_lock, g_tls_counters_table, g_tls_counters_lock, g_heap_base, g_heap_committed, g_heap_reserved_ready, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init, g_last_recv_error, g_vfs_table, g_classes_table, g_goal_defs_table, g_finddata, g_last_exec_exit_code, g_exec_timeout_ms, g_hwnd, g_canvas_buf, g_canvas_w, g_canvas_h, g_mem_dc, g_msg_scratch, g_paintstruct_scratch, g_bmih_scratch, g_conpty_hpc, g_conpty_in_write, g_conpty_out_read, g_conpty_process, g_pta_list, g_pta_size, g_startupinfoex, g_process_info, g_scratch_cs, g_scratch_cs_ready, g_threads_table, g_resize_pending, g_resize_w, g_resize_h, g_fiber_tls_slot, g_fiber_tls_ready, g_fiber_table_cs, g_fiber_table_cs_ready, g_fiber_table, g_fiber_id_ctr" + x64_nl_char())
+    sb_push(sb, "extern g_written, g_scratch, g_scratch2, g_heap_state, g_sb_table, g_vec_table, g_vars_table, g_vars_lock, g_tls_counters_table, g_tls_counters_lock, g_heap_base, g_heap_committed, g_heap_reserved_ready, g_rules_table, g_actions_table, g_action_bodies_table, g_procs_table, g_listeners_table, g_conns_table, g_wsa_init, g_last_recv_error, g_vfs_table, g_classes_table, g_goal_defs_table, g_finddata, g_last_exec_exit_code, g_exec_timeout_ms, g_hwnd, g_canvas_buf, g_canvas_w, g_canvas_h, g_mem_dc, g_msg_scratch, g_paintstruct_scratch, g_bmih_scratch, g_conpty_hpc, g_conpty_in_write, g_conpty_out_read, g_conpty_process, g_pta_list, g_pta_size, g_startupinfoex, g_process_info, g_scratch_cs, g_scratch_cs_ready, g_threads_table, g_resize_pending, g_resize_w, g_resize_h, g_fiber_tls_slot, g_fiber_tls_ready, g_fiber_table_cs, g_fiber_table_cs_ready, g_fiber_table, g_fiber_id_ctr, g_tables_tls_slot, g_tables_tls_ready, g_heap_prof" + x64_nl_char())
     # patlang_wndproc_trampoline AND the two fixed wide-string data
     # labels are only DEFINED by the owns_globals unit (see x64_win_
     # data_and_trampoline_asm, only emitted there) -- every other unit

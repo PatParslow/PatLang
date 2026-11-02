@@ -17,8 +17,9 @@
 
 include "lib/lexer.patlang"
 include "lib/parser.patlang"
-include "lib/lower.patlang"
 include "lib/codegen_x64.patlang"
+include "block_model/lower.patlang"
+include "block_model/native_codegen.patlang"
 include "lib/x64_build.patlang"
 include "lib/json.patlang"
 include "lib/ir_io.patlang"
@@ -65,23 +66,38 @@ else
   if err[0] != "" then
     print(format_parse_error(err[0], err[1], rt_src))
   else
-    let ir = lower_program(ast)
-    # lower_program synthesizes an (empty, since x64_runtime.patlang
-    # has no top-level executable code of its own) "main" for every
-    # source unit regardless -- must be dropped here, since the
-    # PROGRAM chunk always defines the real one, and NASM/ld would
-    # reject two chunks both defining the same global symbol.
-    let all_funcs = ir[2]
-    let rt_funcs = []
-    let fi = 0
-    let f_count = all_funcs.length
-    while fi < f_count do
-      if all_funcs[fi][1] != "main" then
-        let rt_funcs = list_push(rt_funcs, all_funcs[fi])
-      end
-      let fi = fi + 1
+    # docs/plans/general-refcounting.md, Phase 7: the block-model lowering,
+    # as for programs, in library mode (bm_to_library_funcirs): one FuncIR
+    # per runtime function under its own name, and no `main`, which the
+    # program chunk defines.
+    let rt_funcs = bm_to_library_funcirs(bm_lower_library_program(ast), true)
+    let rt_ir = ["ProgramIR", "main", rt_funcs, []]
+    # The value functions (bm_nc_library_value_fns), for programs to know
+    # which runtime results they own, and the two lists to review by hand
+    # whenever they change.
+    let value_fns = get("__vars", "bm_library_value_fns")
+    let values_sb = sb_new()
+    let vi = 0
+    while vi < value_fns.length do
+      sb_push(values_sb, value_fns[vi])
+      sb_push(values_sb, chr(10))
+      let vi = vi + 1
     end
-    let rt_ir = [ir[0], ir[1], rt_funcs, ir[3]]
+    let review = "value functions also returning arithmetic or a raw read: " + get("__vars", "bm_library_value_mixed") + chr(10) + "raw functions returning a parameter: " + get("__vars", "bm_library_raw_param_returns") + chr(10)
+    write_file("self_hosting/build/x64_runtime.value_review.txt", review)
+    # A runtime function the passes take for a producer of an owned value
+    # must be one (it retains what it returns), or a program would release
+    # a reference it never got.
+    let owned_names = bm_nc_owned_runtime_producer_names()
+    let not_values = []
+    let oi = 0
+    while oi < owned_names.length do
+      let on = owned_names[oi]
+      if (on != "rt_rc_retain") and (get("__vars", "bm_lib_root__" + on) == true) and (not bm_nc_is_value_fn(on)) then
+        let not_values = list_push(not_values, on)
+      end
+      let oi = oi + 1
+    end
     # g_apply_table/g_apply_table_count: NOT part of the standard
     # owns_globals shared-.bss list (g_scratch etc) -- they're
     # regenerated fresh PER FINAL PROGRAM by X64UnitLinker.build
@@ -134,6 +150,10 @@ else
     if x64_build_contains(globals_result, "NASM ERROR:") then
       let result = globals_result
     else
+      # Each unit sees which of the runtime's functions return raw floats
+      # (as patc1_main.patlang does for a program); compiled alone it
+      # mistyped every call to another one, which garbled float printing.
+      x64_set_extra_float_func_names(rt_funcs)
       let cache = new("ObjCache", "runtime_obj_cache")
       cache.cache_dir = "self_hosting/build/x64_obj_cache"
       let units = []
@@ -169,9 +189,13 @@ else
         let result = x64_link_objs_relocatable(all_objs, obj_path)
       end
     end
+    if not_values.length > 0 then
+      let result = "LINK ERROR: runtime functions the ownership passes take for owned producers return no reference: " + not_values
+    end
     if x64_build_contains(result, "LINK ERROR:") or x64_build_contains(result, "NASM ERROR:") then
       print(result)
     else
+      write_file("self_hosting/build/x64_runtime.values", sb_str(values_sb))
       write_file(fingerprint_file, fingerprint)
       # Cached function-name manifest, one per line -- lets
       # patc1_main.patlang's --x64 path skip re-lexing/parsing/

@@ -1007,6 +1007,282 @@ patlang patc2.exe --x64`, complete bundle, ~1h50m) then produced a
 `3` (all three steps exit 0). The trimmed bundle used for fast iteration
 is `self_hosting/build_patc1_mini.patlang`.
 
+### Phase 6 -- every remaining leak (decided 2026-11-01)
+
+A code read after the native self-compile ran past 20 GB. The aim is no
+leaks at all, not only the largest. Decisions: string builders and vecs
+become first-class reference-counted values in both engines; named
+objects keep explicit lifetime, with `object_delete` releasing
+everything; Box objects are counted, with trial deletion (Bacon-Rajan)
+for cycles, which only Boxes can form; closures and the boxed numbers
+are immutable and are simply counted.
+
+| # | Leak | Fix |
+|---|---|---|
+| 6a | `object_delete` unlinked the name only | done: it frees the object's table, releasing keys and values (`rt_hmap_free`) |
+| 6b | `send` allocated its argument array with raw `rt_heap_alloc` and never released its rest-argument list; fresh arguments to `send`, `get`, `object_delete` and `print` were never released by the caller; `class_def_lookup` returned a fresh `[]` on a miss | done: counted array freed after the call, rest list owns its elements (`rt_send_prepare_arr`), those calls join `bm_nc_runtime_borrows_args`, a miss returns 0 |
+| 6c | 24 raw `rt_heap_alloc` sites in generated asm (`codegen_x64.patlang`): temporary buffers never freed, and strings made by `getenv`, `cwd`, `read_line`, `recv` and others with no count header, which a later release corrupts | temporaries freed; produced values allocated with `bm_alloc` |
+| 6d | raw `rt_heap_alloc` in the runtime: BigInt, Complex, Interval, `rt_object_new`, bool arrays, `exec_capture_io`, `write_file_bytes` | numbers, below; the scratch array of versions `rt_list_materialize` used for each older list version it rebuilt (`native_list_old_version_rebuild_released.patlang`); and (`native_runtime_blocks_released.patlang`) `rt_object_new`'s objects are counted cells whose last release frees every field (`rt_cell_rc_dec`; `rt_object_get` returns a reference), bool arrays are counted blocks, `write_file_bytes` frees its byte buffer, and `exec_capture_io`'s argument array holds a reference per slot, released with it. No raw `rt_heap_alloc` is left in `x64_runtime.patlang`. Verified: both fixtures, the native check (126/126), the block-model suite (224/224) and the language suite (184/184) |
+| 6e | string builders: a table entry per `sb_new`, every outgrown buffer abandoned, the final buffer kept | done natively: a counted cell (`rt_cell_new`, type id -2) the compiler releases (`bm_nc_owned_runtime_producer_names`); the interpreter and the Gen A prelude hold `Value::StringBuilder` |
+| 6f | `vec_new`: a table entry per handle, never released; `vec_set` also wrote a list `vec_to_list` had handed out | done natively: a counted cell (type id -3) holding the current list, set functionally; the interpreter and the Gen A prelude hold `Value::Vec` |
+| 6g | closures never freed | counted; released with their captures |
+| 6h | Box objects never freed; a vec that holds itself, directly or through other vecs or Boxes, is a cycle counting alone never frees (in the interpreter too: `Arc`) | Boxes become counted cells (type id -1); trial deletion over every cell kind that can hold values |
+| 6i | the compiler never deletes its scratch objects (`xa_state_N` per chunk, `cu_<name>` per unit) | done: `object_delete` after the last use |
+| 6j | `world_swap_in` (`world_native.patlang`) restores the caller's tables and drops the world's own without freeing them | free the world's tables on the way out |
+| 6k | runtime functions outside `bm_nc_runtime_borrows_args` keep a fresh argument nobody releases | audit each runtime function and list every one that borrows |
+| 6l | `str_intern`: natively the string's raw address, an uncounted reference (a fresh argument is never released, and a handle can outlive its string); in the interpreter a table that only grows | a counted value in both engines that `type_of` calls "string": natively the string itself, retained; in the interpreter an immutable shared value carrying the per-character cache |
+
+Code that used a vec or builder handle as a number no longer works. One
+known case, left to its owner: raytrace's threaded renders set the global
+`fa_scratch` to `[0, 1, 2, 3]` (`lib/camera.patlang`), meaning "this
+thread's first four vecs", and `fa_run` (`lib/ifunc.patlang`) reads it.
+Each thread's register vecs have to reach `fa_run` some other way.
+
+Each lands with a native fixture that measures heap growth per iteration,
+wired into `native_codegen_check.sh` and `native_codegen.feature`.
+
+6d, numbers (`native_numbers_released.patlang`; the free list:
+`native_growing_string_reuses_freed.patlang`; all gates pass with them, as
+in the table row above):
+
+- The free list (`heap.patlang`) held the first 64 exact sizes it saw and
+  dropped every freed block of any other size; a string grown a byte at a
+  time leaked every version past 512 bytes (`bench_strconcat`, 400,000
+  appends, reached 80 GB on the old build). It now has 160 size classes,
+  8-byte steps to 256 bytes and four per power of two to 2^40, found by
+  computation rather than a scan; a request rounds up to its class.
+- BigInt, Complex and Interval blocks come from `bm_alloc` and are sized by
+  `rt_rc_numeric_payload` (a BigInt from its limb count). A Rational,
+  Complex or Interval keeps its two parts (`rt_keep`) and releases them with
+  itself (`rt_numeric_rc_dec`).
+- A BigInt block's size class is always the one its recorded limb count
+  gives (`rt_bigint_fit`, `rt_bigint_resize`): a result trimmed below what
+  it was allocated with moves when the class differs, and a sum grows by a
+  limb only for a final carry. Otherwise its release, which knows only the
+  count, put it on a smaller class's list that the next sum never asked for.
+- `rt_bigint_mag_divmod` returned its own argument as the remainder when
+  |a| < |b|, which `rt_bigint_mod_impl` then re-signed in place and tagged
+  as new; it returns a copy. Its scratch block, and whichever half a caller
+  does not use, are freed.
+- The `rt_int_*` helpers follow the uniform convention: `rt_int_norm` and
+  `rt_int_abs` returned their argument without a reference of its own, so a
+  fresh BigInt passed in came back already released.
+- An operand promoted with `let pa = a` then `let pa = rt_bigint_from_i64(a)`
+  on one branch was a local the passes could not own, so the promotion
+  leaked. Each is one store from a function whose result the caller owns
+  (`rt_int_big`, `rt_as_rational`, `rt_as_complex`, `rt_as_interval`);
+  `rt_rational_drop_promoted` is gone.
+- Two fixnums that overflow are promoted inline (`x64_dynamic_promote_both_asm`);
+  the two BigInts are released after the operation.
+- The library value-local analysis (`bm_nc_library_value_fns`) stopped
+  growing a function's value locals once the function was a value function,
+  so a local whose callee became one in a later round was copied without a
+  reference (`rt_int_gcd`'s `t`, a double release).
+
+### Phase 7 -- the runtime through the block-model pipeline (decided 2026-11-02)
+
+`x64_runtime.patlang` is compiled with `lib/lower.patlang`'s
+`lower_program` (`build_x64_runtime.patlang`, and patc1 when the cached
+object is stale), which has none of the ownership passes. Every temporary
+a runtime function makes therefore leaks: displaying a list leaks 168
+bytes, `exec_capture` 960, and a runtime loop that grows a list keeps
+every old version. Phase 6's fixes stop at the runtime boundary for the
+same reason: the compiler only releases what a list of runtime function
+names (`bm_nc_*_producer_names`, `bm_nc_runtime_borrows_args`) says, and
+each name missing from a list was a leak found one at a time.
+
+Decisions: the runtime is compiled by the same block-model lowering and
+passes as programs, and every runtime function follows the convention a
+pure user function already has: it borrows its arguments and returns a
+reference the caller owns. The name lists then go away.
+
+Steps, each behind fixtures and the native check:
+
+1. **Probe.** Lower `x64_runtime.patlang` with `bm_lower_program` and list
+   what the restricted subset rejects.
+2. **Library mode.** `native_codegen` emits a FuncIR for every runtime
+   function under its own name, with no `main`; runtime functions never
+   thread `__globals`.
+3. **The convention inside the runtime.** Hand-written counting that only
+   made up for the missing passes is removed; counting that implements a
+   structure's own ownership (a list's elements, a table's keys and
+   values, a cell's contents) stays. Each function that returns a borrowed
+   value (`rt_list_get`, `get`, `vec_get`) now returns its own reference.
+4. **Programs.** Every runtime call is treated as a pure call: its result
+   is owned and its arguments are released after it like a pure call's.
+5. **Generated asm.** The direct calls `codegen_x64.patlang` emits into the
+   runtime (about 300 sites, about 60 functions) release what they do not
+   keep.
+6. **Bootstrap.** `build_x64_runtime.patlang` and patc1's stale-object path
+   compile the runtime this way; Gen A/B/C fixpoint.
+What the convention implies, worked out before starting:
+
+- One rule for every call: user function or runtime function, the result
+  is the caller's and the arguments are borrowed. A runtime function
+  compiled with the passes then gets this for free: a value it returns
+  without owning it (a peeked list element, a parameter) takes a reference
+  just before its return, as a pure user function's does.
+- A value built by tagging a fresh block (`result bor rt_string_tag()`) is
+  not recognisable as fresh, and would be retained a second time. Those
+  constructors return through an identity, `rt_fresh(v)`, that the passes
+  treat as a producer.
+- A hand-written release of a local holding a runtime call's result
+  becomes a double release once the passes release it too; each one is
+  reviewed. `rt_rc_retain` becomes the identity, since the return retains.
+- A direct asm call that discards or consumes a result releases it.
+
+7. **Measure.** The convention adds a retain and release around borrowed
+   reads. Measured with `self_hosting/benchmarks/*` and
+   `examples/bench_tower_x64.patlang`, against the compiler and runtime
+   from before this phase (median of 5 runs; every output the same):
+
+   | bench | time, new / old | peak memory |
+   |---|---|---|
+   | fib | 0.86 | 5.8 MB both |
+   | listbuild | 1.06 | 39 MB both |
+   | manycalls | 1.14 | 5.8 MB both |
+   | oo_events | 1.19 | 65 MB to 36 MB |
+   | sort | 1.06 | 6.8 MB both |
+   | sumloop | 1.20 | 532 MB to 5.9 MB |
+   | tower_x64 | 1.18 | 19 MB to 5.9 MB |
+
+   The old build's own times vary by up to 15% between runs. Before two
+   changes, sumloop and tower_x64 took 2.5 and 2.25 times as long: the
+   runtime's numeric dispatch built `type_of` names and compared strings (a
+   quarter of a BigInt sum), and now compares `x64_family_code`'s codes;
+   and the retain the passes put before a return called `rt_rc_retain`
+   (then `rt_rc_inc_if_refcounted`) even for a fixnum, and is now decided
+   inline (`x64_rc_retain_asm`), a raw float boxed as the reference.
+   What remains in manycalls is the release of a rebound local, an inline
+   fixnum test, which stays while an int can overflow to a counted BigInt.
+   `bench_strconcat` is not in the table: the old build kept every
+   intermediate string (80 GB for its 400,000 appends) and the new one was
+   not yet timed on an idle machine.
+
+Step 2 is done: `build_x64_runtime.patlang` lowers the runtime with
+`bm_lower_program` and `bm_to_library_funcirs` (`native_codegen.patlang`),
+which compiles every declared function as a pure FuncIR under its own name
+(`bm_nc_fn_name` drops the `bm_fn_` prefix in library mode), so codegen_x64
+still treats them as runtime functions (`x64_bm_tagged_convention` goes by
+that prefix). Same 464 functions; a function that ends in a tail call now
+carries its callee's blocks (a JumpBlock), which doubles the asm (162,843
+to 333,251 lines). With the passes off it passed the native check as the
+old runtime did.
+
+Inside the runtime, step 3 means:
+
+- A structure takes its own reference to what it stores: `rt_list_push`,
+  `rt_list_set_functional` and `rt_list_set` increment the element (and
+  `rt_list_set` releases the one it displaces; `rt_list_new` zeroes its
+  slots so there is always something to release), the hash table its key
+  and value, cells and objects their fields. Several stores that kept a
+  borrowed element without counting it (`rt_list_set(out, i, subst[i])`
+  in the logic engine) are fixed by this rather than case by case.
+- `mem_poke_qword` is a raw store with no ownership: where the memory
+  should own a counted value, the code retains it (`rt_rc_retain`) before
+  storing.
+- `rt_fresh(v)` is a compiler intrinsic (no code) the passes count as an
+  owned producer. A constructor that tags a block it just allocated
+  returns `rt_fresh(addr bor rt_string_tag())`, which would otherwise be
+  retained a second time.
+- Releases that only made up for the missing passes go
+  (`rt_exec_capture_arr`, `sb_push`, `rt_dynamic_plus_obj`,
+  `rt_rational_demote`, `list_dir`, ...); releases a structure makes of
+  what it displaces stay.
+
+The runtime holds raw machine words as well as values: hashes, float bit
+patterns, masks, limb counts. The passes assume every local is a tagged
+value, and a raw word whose top bits read as a string or list tag, with a
+payload that falls inside the heap, would have a stranger's block counted
+(a 64-bit hash does so about once in tens of thousands). Library mode
+therefore types functions:
+
+- A **value function** returns a value on at least one path: `rt_fresh(...)`
+  or `rt_rc_retain(...)` (both intrinsics), a list literal, a string
+  constant, `list_push`/`list_set`/`list_get`, a call to a value function,
+  or a local some store gives one of those. Least fixpoint over the call
+  graph; every other function is raw.
+- Only a value function's result is owned by its caller, and only a value
+  function retains what it returns. Arithmetic in the runtime is raw, so a
+  `Bin` result is never a fresh value there.
+- Two intrinsics mark ownership in the runtime's own code: `rt_fresh(v)`
+  (no code) for a value just made, and `rt_keep(v)` (an inline retain)
+  where memory is to own a value stored raw, `mem_poke_qword(addr, 0,
+  rt_keep(x))`. The pass's own retain before a value function returns a
+  borrowed value stays a call to `rt_rc_retain`: a call boxes a raw float
+  argument first, which the intrinsic does not (with `rt_keep` there, a
+  function returning a float local returned its raw bits).
+- Chained indexing (`m[2][1]`): `list_get` borrows its arguments like any
+  runtime call, so an inner read's temporary is released after the outer
+  one.
+
+The value-function set is written beside the runtime's function list, so
+programs (step 4) own exactly the results of value functions.
+
+Two more differences between the runtime and a program, both found as
+corrupted output once the passes ran in the runtime:
+
+- **Integer constants and copies.** The family pass counts a constant as an
+  owned value (releasing a tagged constant does nothing) and a copy of
+  another local as a reference of its own. In the runtime a constant can be
+  a raw word (`0xF000000000000000`, the family mask, recursed forever inside
+  `rt_rc_dec_if_refcounted`), so there only a fixnum-range integer constant
+  counts, and only a copy of a local already typed as a value
+  (`bm_fam_const_is_value`, `bm_fam_is_copy_of_other`).
+- **Raw words derived from a value.** `let buf = mem_peek_qword(c, 32)`
+  points into the value `c` came from, which the passes cannot see. The
+  family pass released a value at the first block boundary after its last
+  mention, while a loop still read through the address: `sb_str`'s copy
+  loop read a freed buffer, garbling every list display. The runtime is
+  therefore lowered with `bm_lower_library_program`: a loop forwards every
+  local in scope, so each value lives until its function returns, and
+  `return f(x)` is a call and a return instead of a jump into f's blocks
+  (which released the caller's locals before f used what it was handed).
+  The second also removed the callee copies that had doubled the asm:
+  245,055 lines, against 162,843 from the old lowering.
+
+The runtime's per-function .obj build (`build_x64_runtime.patlang`, used
+by the gcc route) compiled each function without knowing which other
+runtime functions return raw floats, as patc1 already told a program's
+units; `x64_set_extra_float_func_names` now gives each unit the whole set,
+and its key is part of the unit's cache key. (Floats print correctly in
+that route now; whether this or the lowering change cured the float crash
+known there was not separated.)
+
+Steps 3 and 4 landed together, since a list's element ownership has to
+change on both sides at once:
+
+- **Programs.** Every runtime function borrows: a fresh temporary passed
+  to one is released after the call (`bm_nc_release_pure_call_arg_temps`,
+  for a CallHost whose name `bm_nc_set_runtime_fns` lists), and the result
+  of a value function is owned. The reads are no longer borrows, so the
+  passes that took a reference after `list_get`/`vec_get`/`get`
+  (`bm_nc_insert_list_get_result_incs`, `bm_nc_insert_borrowed_element_incs`)
+  are gone, as is the increment of a `list_push`/`list_set` element; an
+  element temporary is released after the push. An impure call's
+  `[value, globals]` pair is released with its elements, both halves having
+  been read with references of their own. The reference-count entry points
+  themselves (`bm_nc_is_rc_entry`) are never taken for borrowing calls: a
+  discarded result's release was otherwise followed by a second.
+- **Emitted loops.** The `get_global`/handler lookups and `set_global`
+  rebuild that the translator writes out (`bm_nc_emit_assoc_get/set`)
+  release each read and each superseded version of the list they build;
+  a looked-up value stays a borrow from the table, as before.
+- **The runtime.** In library mode a local whose value is stored raw into
+  memory (`mem_poke_qword`) has moved there and is never released
+  (`bm_fam_poked_names`); the class table was freed right after being
+  written into its slot.
+
+Step 5, the generated asm: the plain `+` fast path
+(`x64_str_aware_plus_asm`) releases the strings it makes from a list,
+number or unit operand. Fixture `native_display_temps_released.patlang`:
+before, a list shown as text and an `exec_capture` both grew the heap
+every run; now neither does.
+
+A compiler built before this keeps its old passes: run against the new
+runtime it takes extra references (it still retains reads and elements)
+and leaks where it used to borrow, but it does not free early.
+
 ## 4. What this plan deliberately does not cover
 
 - Lists' own node/aliasing scheme (Fork G) -- Phase 4a (above) answers
@@ -1020,6 +1296,8 @@ is `self_hosting/build_patc1_mini.patlang`.
   provably unique," not a general soundness-for-everything system.
 - Any change to `pat --ir-run`'s or `pat --patc`'s own heap behavior --
   scoped to the native x64 backend specifically, same boundary this
-  session's #214/#215 fixes already drew.
+  session's #214/#215 fixes already drew. Phase 6e/6f are the exception:
+  string builders and vecs change representation in both engines, so
+  that both keep one spec.
 - Merging any of this into `main` before it's built and proven, per the
   same branch-discipline note the original BOM plan opened with.

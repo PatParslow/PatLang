@@ -426,7 +426,11 @@ pub fn v_to_string(v: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Int(n) => n.to_string(),
         Value::Float(n) => {
-            if n.fract() == 0.0 && n.is_finite() { format!("{}", *n as i64) } else { n.to_string() }
+            if n.fract() == 0.0 && n.is_finite() {
+                // GitHub #230: `as i64` saturates, so 1e308 printed as i64::MAX.
+                // {:.0} writes a double's exact decimal value.
+                if n.abs() < 9.2e18 { format!("{}", *n as i64) } else { format!("{:.0}", n) }
+            } else { n.to_string() }
         }
         Value::BigInt(b) => b.to_string(),
         Value::Rational(n, d) => format!("{}/{}", n, d),
@@ -438,6 +442,8 @@ pub fn v_to_string(v: &Value) -> String {
         }
         Value::HostFunction(_) => "<hostfn>".into(),
         Value::Closure { .. } => "<closure>".into(),
+        Value::StringBuilder(_) => "<string_builder>".into(),
+        Value::Vec(_) => "<vec>".into(),
         Value::Object(map) => {
             let mut kvs: Vec<String> = map.iter().map(|(k, v)| format!("{}: {}", k, v_to_string(v))).collect();
             kvs.sort();
