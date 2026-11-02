@@ -124,9 +124,29 @@ Every allocation and free takes the free list's one ticket lock, which
 threads contend for.
 
 The new version keeps this: one reservation, chunked commits, its own
-free lists. It should give each thread its own free lists to remove the
-shared lock, and its two-word values (decision 6) need no block for an int
-or a float.
+free lists. Its two-word values (decision 6) need no block for an int or a
+float. It removes the shared lock from ordinary allocation:
+
+- **Each thread has its own free lists**, a table found through a
+  thread-local slot (the runtime already uses TLS for fibers). Allocating
+  from and freeing to them takes no lock and no atomic operation.
+- **Each thread bumps within its own chunk.** It takes a chunk (for
+  instance 1 MB) from the shared reservation with one atomic add, then
+  allocates from it with plain arithmetic, touching shared state once per
+  chunk.
+- **A block freed by another thread goes onto the freeing thread's lists.**
+  Within a size class any block serves, so this needs no lock. Schemes
+  that send a block back to the thread that allocated it rely on
+  compare-and-swap queues, and the runtime's only atomic is fetch-and-add.
+- **Imbalance is returned in batches.** When one thread mostly frees what
+  another allocates, the freeing thread's lists grow while the other keeps
+  taking new chunks. Past a threshold, a thread hands a batch of blocks to
+  a shared pool, and a thread with an empty list takes a batch from it.
+  That takes a lock once per batch, not once per block.
+- **Counts stay atomic** (`lock xadd`), since a value may be shared between
+  threads. Where the ownership analysis proves a value never leaves its
+  thread, its count could be a plain add. That is an optimisation to
+  consider, not a requirement.
 
 ### 3f. The two engines
 
