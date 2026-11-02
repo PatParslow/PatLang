@@ -173,8 +173,9 @@ and what to leave out. Step 3's single source of truth is a design
 requirement of the new version. Steps 4 and 5 compare the new version
 against the current one as well as against the interpreter.
 
-1. **Write the rules as a short normative spec** (a new
-   `spec_library/block_model/ownership.feature` plus a prose page). Draft:
+1. **Write the rules as a short normative spec.** Drafted 2026-11-02:
+   `docs/spec/values-and-memory.md`, executable as
+   `spec_library/values_and_memory/` (not yet wired). Draft:
    - every call borrows its arguments and returns a reference the caller
      owns;
    - a structure owns what it stores, and releases it when it is freed or
