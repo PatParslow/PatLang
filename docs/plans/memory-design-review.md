@@ -110,6 +110,24 @@ recurring failure.
 - Numeric dispatch compares `x64_family_code` codes, not `type_of` names.
 - A string builder cell's fields are raw (length, capacity, buffer).
 
+### 3e2. Where memory comes from
+
+PatLang manages its own memory and makes no system call per allocation.
+The heap reserves a large address range once (`VirtualAlloc`,
+`MEM_RESERVE`; `x64_dynamic_heap_growth.md`). `bm_alloc` reuses a block
+from its size class's free list (`heap.patlang`), else bumps a pointer with
+one atomic add (`rt_heap_alloc`). Pages are committed from the system only
+when the bump pointer passes the committed mark, up to the next 256 MB
+boundary (`mem_heap_ensure_committed`). Freed blocks go back to PatLang's
+free lists, never to the system, so a program's footprint is its peak.
+Every allocation and free takes the free list's one ticket lock, which
+threads contend for.
+
+The new version keeps this: one reservation, chunked commits, its own
+free lists. It should give each thread its own free lists to remove the
+shared lock, and its two-word values (decision 6) need no block for an int
+or a float.
+
 ### 3f. The two engines
 
 - The interpreter (`rust-runtime`, `hosts.rs`) holds values in Rust memory:
