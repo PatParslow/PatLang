@@ -1,7 +1,7 @@
 # Memory design review: plan (for discussion)
 
-Status: proposed 2026-11-02, not started. Nothing here is a decision yet;
-section 6 lists the questions that need one.
+Status: proposed 2026-11-02, not started. Section 6 records the decisions
+taken so far and the questions still open.
 
 ## 1. Why
 
@@ -128,6 +128,13 @@ interpreter eventually running on the native PatLang runtime.
 
 ## 4. Method
 
+With decision 5 (section 6), these steps feed a new version of the compiler
+and runtime instead of edits to the current one. The classification in
+step 2 tells the new version what to infer, what to state as a contract,
+and what to leave out. Step 3's single source of truth is a design
+requirement of the new version. Steps 4 and 5 compare the new version
+against the current one as well as against the interpreter.
+
 1. **Write the rules as a short normative spec** (a new
    `spec_library/block_model/ownership.feature` plus a prose page). Draft:
    - every call borrows its arguments and returns a reference the caller
@@ -166,11 +173,12 @@ interpreter eventually running on the native PatLang runtime.
 
 - Retains of raw words in the 17 "value_mixed" functions. They are no-ops
   only because heap addresses are below 2^47.
-- `bool_array_push` grows in place, so a second holder of the same array
-  sees the change. Lists copy when an older version is changed. Bool
-  arrays have no interpreter counterpart to decide which is right.
+- `bool_array_push` changes the array in place while it has room, and
+  returns a new one when it grows, so the old one's other holders miss
+  the new element. Decided as identity semantics (section 6, decision 8).
 - `rt_object_new` objects are mutable and compared by identity natively,
-  but the interpreter's `Value::Object` is a map copied by value.
+  but the interpreter's `Value::Object` is a map copied by value. Decided
+  as identity (decision 8).
 - A loop counter pays a release check on every rebinding, because an int
   can overflow into a counted BigInt. A range analysis could prove a
   local always fits a fixnum.
@@ -178,16 +186,71 @@ interpreter eventually running on the native PatLang runtime.
   still open, and should be designed against the spec this review writes,
   not before it.
 
-## 6. Questions for a decision
+## 6. Decisions and open questions
 
-1. Should runtime ownership be declared in the runtime's source, or
-   inferred, with the name lists removed either way?
-2. Bool arrays and objects: value semantics (copy on change, as lists) or
-   identity semantics (as builders and vecs)? Then make the interpreter
-   match.
-3. Should the interpreter move onto the native PatLang runtime as part of
-   this, or after it?
-4. Is the 48-bit fixnum a language-visible fact or purely a runtime
-   representation? Today it is visible: for `140737488355327 + 10`
-   (2^47 + 9), `type_of` says `int` in the interpreter and `bigint`
-   natively.
+Decided (2026-11-02):
+
+1. **The runtime is compiled by the PatLang compiler with no special cases,
+   except ones expressed in PatLang itself.** The compiler holds no list of
+   facts about runtime functions. Anything it must know about a runtime
+   function's ownership is written in that function's PatLang source, or
+   follows from it. This applies to section 3b (removed), 3a (each marker
+   kept only if it is a PatLang construct the language defines) and 3c
+   (library-mode rules allowed only as general rules, none naming a
+   function).
+2. **Everything is an object at the language level; the runtime
+   optimises underneath, in the manner of Ruby.** Ruby has one object
+   model, and the VM stores small integers, `nil` and booleans as
+   immediates. A program never sees a value lose its class, while the VM
+   never allocates for those values. Section 3e's shortcuts are judged
+   against that.
+3. **The fixnum is visible to programs, and whether a value is an `int` or
+   a `bigint` is one clear rule both engines share.** The engines must not
+   disagree, as they do now: for `140737488355327 + 10` (2^47 + 9),
+   `type_of` says `int` in the interpreter and `bigint` natively.
+4. **The interpreter moves onto the native runtime after this review's
+   problems are sorted out**, not as part of it.
+5. **The compiler and the runtime are written again as a new version, not
+   edited into shape.** The current code stays as the reference, to compare
+   against and to bootstrap from, until the new version passes the same
+   gates. Everything in the new version is protected by contracts
+   (`require`/`ensure`/`assert`): each ownership rule in the spec becomes a
+   condition the code checks, so a broken rule fails where it is broken,
+   where today it shows up later as a leak or a double release.
+6. **Values carry their type in a word of their own (the new version's
+   representation).** Today the type is packed into a value's top 16 bits.
+   That costs 48-bit integers (#233), the raw/boxed float split, the
+   address-range test that tells string literals from heap strings, and
+   any place to record metadata. In the new version a value is two words:
+   a type-and-metadata word and a full 64-bit data word. Ints and floats
+   sit inline at full range with no allocation; strings, lists and objects
+   put a pointer in the data word. Lists and arguments double in size,
+   which is accepted. One bit of the type word is reserved for per-value
+   metadata if a use appears; none is designed now.
+7. **Every value answers methods and raises events through its type.**
+   `3.to_s` and `3.14.to_s` are lookups on the type, which is always
+   present. An operation is a message: `3 + 5` sends `+` to 3 with 5. It
+   can raise events through the types and the operation: "I was added to
+   5" for 3, "I was added to 3" for 5, "I added 3 and 5" for `+`. They are
+   ordinary PatLang events, raised and handled like every other event
+   (`emit`, `when`), with nothing specific to operators; like any event,
+   each is named where it is declared. Handlers are
+   registered on a type or an operation, not on an individual value, so an
+   int needs no per-value state to take part. With no handler registered,
+   an operation costs at most one flag test, and none where the compiler
+   can see there is no handler.
+8. **Objects and bool arrays have identity semantics.** An object is
+   mutable and can raise and handle events, so a change or a handler made
+   through one name is seen through every other. The interpreter's
+   `Value::Object`, a map copied by value, changes to match. A bool array
+   is a mutable container like a vec: a cell holding its buffer, so
+   `bool_array_push` keeps the same array even when the buffer grows, where
+   today it returns a new one. The interpreter gains bool arrays.
+9. **#233 (int vs bigint between 2^47 and 2^63) is not fixed in the current
+   code.** The new version's 64-bit ints remove it.
+10. Rebuilding the compilers (`patc1_x64`, the Gen B fixpoint) should become
+   reliable as a consequence of getting this architecture right. Their
+   current fragility is treated as a symptom to recheck afterwards, not
+   worked around now.
+
+Open: nothing at present.
