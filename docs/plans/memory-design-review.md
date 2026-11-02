@@ -292,3 +292,56 @@ Decided (2026-11-02):
    worked around now.
 
 Open: nothing at present.
+
+## 7. The new version's structure: swarm-shaped from the start
+
+`block-ownership-model-swarm-compilation.md` and `swarm-compiler.md` plan
+artefact-based, parallel compilation as a new driver around `patc1`'s
+existing stages, changing nothing they compute. That constraint made them
+hard: lowering keeps program-wide state in `__vars`, and most of
+`swarm-compiler.md`'s Phase 3 is untangling it. The new version (decision
+5) is built in that shape from the start.
+
+- **Stages are pure jobs.** Each takes explicit input artefacts and
+  produces an output artefact, and reads or writes no `__vars`. The
+  program-wide facts are the swarm plan's three barriers, each an
+  explicit input:
+  - B0, the program's `syntax` definitions;
+  - B1, the symbol index;
+  - B2, the program facts (uses Box, the roots reached only by name).
+- **Names come from declarations.** A synthesized name is the
+  declaration's identity plus a counter local to it, never a shared
+  counter. Any order of work then gives the same output.
+- **Registrations are recorded, not rediscovered.** `when` handlers, rules,
+  and functions reached only by name (`apply`, `fiber_new`, `parallel_map`,
+  `budgeted_run`) are entries in the program facts. CLAUDE.md section 9's
+  keep-the-registry-exhaustive rule becomes a check a validator runs.
+- **Ownership summaries are per-function artefacts, and contracts.** The
+  swarm plan's Forks C and D want each function's ownership transfer
+  (consumes, borrows, retains, escapes) as an explicit artefact. That is
+  what replaces the compiler's name lists here (section 3b, decision 1):
+  derived from the function's PatLang source, recorded per function, and
+  stated as its contract (`require`/`ensure`), so a caller depends on the
+  summary and the function is checked against it.
+  `contract-bounded-object-compilation.md`'s rule (an object observes
+  another only through its contract) is the same idea for objects.
+- **The runtime is compiled by the same pipeline**, as one more program
+  whose functions are cached per function.
+- **The parity gate is behavioural.** Two-word values (decision 6) mean the
+  new version cannot match `patc1`'s output byte for byte, so the swarm
+  plan's byte-parity gate becomes:
+  - the spec suites;
+  - the native fixtures;
+  - the interpreter's output;
+  - the current compiler, kept as a behavioural reference.
+
+  Byte parity still holds within the new version, between a sequential
+  and a parallel build of the same input (the swarm plan's determinism
+  test).
+- **Threads become an option.** The swarm plan chose worker processes
+  because stages write `__vars`. Stages that write none can run on threads,
+  with the per-thread allocation of section 3e2.
+- **Staging.** The stages run sequentially through the job queue first.
+  Parallel workers come only after the new version passes the behavioural
+  gate, so the new representation and the parallelism are never debugged
+  together.

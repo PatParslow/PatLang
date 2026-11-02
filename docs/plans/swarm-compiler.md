@@ -9,6 +9,15 @@ remains the record of the specification's mapping onto this repo, its
 Phase 0 global-state survey and its Phase 1 measurements; this document
 is the implementation plan that follows from them.
 
+**Update (2026-11-02):** the compiler and runtime are to be written again
+as a new version (`memory-design-review.md`, section 6, decision 5), built
+in this plan's shape from the start instead of retrofitted around `patc1`:
+pure stage jobs with no `__vars`, declaration-derived names, recorded
+registrations, per-function ownership summaries as contracts, and a
+behavioural parity gate in place of byte parity with `patc1`. See
+`memory-design-review.md` section 7. The phases below describe the
+retrofit and stand as the record of that approach and its measurements.
+
 ## 0. Relationship to existing plans
 
 - **`block-ownership-model-swarm-compilation.md`**: source of the stage

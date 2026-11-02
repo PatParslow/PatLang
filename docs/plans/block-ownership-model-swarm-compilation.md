@@ -14,6 +14,11 @@ Nothing below is implemented yet.
 as a separate compiler driver with `patc1` kept as the parity oracle, is
 `docs/plans/swarm-compiler.md`.
 
+**Update (2026-11-02):** the new compiler and runtime version planned in
+`memory-design-review.md` adopts this specification's structure from the
+start (its section 7), with a behavioural parity gate instead of byte
+parity with `patc1`.
+
 ## 0. Relationship to existing plans
 
 - **Generalizes and supersedes** `docs/plans/block-ownership-model-
