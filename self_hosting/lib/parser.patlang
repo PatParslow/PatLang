@@ -713,6 +713,28 @@ make a function called pf_check_main_reserved takes nameTok returns r
   return ["", 0]
 end
 
+make a function called pf_is_operator_name takes tok returns yes
+  if tok[0] != "OP" then
+    return false
+  end
+  let ops = ["+", "-", "*", "/", "%", "<", ">", "<=", ">=", "==", "!="]
+  let i = 0
+  while i < list_len(ops) do
+    if tok[1] == ops[i] then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+make a function called pf_func_node takes name, params, body, return_hint, raises returns node
+  if list_len(raises) > 0 then
+    return ["Func", name, params, body, return_hint, raises]
+  end
+  return ["Func", name, params, body, return_hint]
+end
+
 make a function called parse_function_def takes toks, pos returns r
   # pos points at 'make'; expect: make a function called NAME
   #   [takes a, b] [returns r] NL body end
@@ -729,6 +751,11 @@ make a function called parse_function_def takes toks, pos returns r
     let p = p + 1
   end
   let nameTok = vec_get(toks, p)
+  # An operator may name a method (docs/spec/values-and-memory.md 1.4):
+  # `make a function called + takes self, other ...` inside a class.
+  if pf_is_operator_name(nameTok) then
+    let nameTok = ["IDENT", nameTok[1], nameTok[2]]
+  end
   if nameTok[0] == "IDENT" then
     let name = nameTok[1]
     let mainErr = pf_check_main_reserved(nameTok)
@@ -772,12 +799,34 @@ make a function called parse_function_def takes toks, pos returns r
       end
       let p = p + 2
     end
+    # `raises NAME, NAME`: the events the function raises after its body
+    # returns (docs/spec/values-and-memory.md 1.4); the Func node's sixth
+    # element when present.
+    let raises = []
+    if tok_is(vec_get(toks, p), "IDENT", "raises") then
+      let p = p + 1
+      let rlooping = true
+      while rlooping do
+        let rt = vec_get(toks, p)
+        if rt[0] == "IDENT" then
+          let raises = list_push(raises, rt[1])
+          let p = p + 1
+          if tok_is(vec_get(toks, p), "OP", ",") then
+            let p = p + 1
+          else
+            let rlooping = false
+          end
+        else
+          let rlooping = false
+        end
+      end
+    end
     # Body may be `... end` (word form) or `{ ... }` (brace form).
     if tok_is(vec_get(toks, p), "OP", "{") then
       let body = parse_stmts_until(toks, p + 1)
       let p2 = body[1]
       if tok_is(vec_get(toks, p2), "OP", "}") then
-        return [["Func", name, params, body[0], return_hint], p2 + 1]
+        return [pf_func_node(name, params, body[0], return_hint, raises), p2 + 1]
       else
         return [["Err", "expected } after function body", vec_get(toks, p2)[2]], p2]
       end
@@ -785,7 +834,7 @@ make a function called parse_function_def takes toks, pos returns r
       let body = parse_stmts_until(toks, p)
       let p2 = body[1]
       if tok_is(vec_get(toks, p2), "IDENT", "end") then
-        return [["Func", name, params, body[0], return_hint], p2 + 1]
+        return [pf_func_node(name, params, body[0], return_hint, raises), p2 + 1]
       else
         return [["Err", "expected end after function body", vec_get(toks, p2)[2]], p2]
       end
@@ -1305,7 +1354,11 @@ make a function called parse_class_decl takes toks, pos returns r
             if fnode[0] == "Err" then
               return [fnode, fr[1]]
             else
-              let methods = list_push(methods, [fnode[1], fnode[2], fnode[3]])
+              let raises = []
+              if list_len(fnode) > 5 then
+                let raises = fnode[5]
+              end
+              let methods = list_push(methods, [fnode[1], fnode[2], fnode[3], raises])
               let p = skip_nl(toks, fr[1])
             end
           else

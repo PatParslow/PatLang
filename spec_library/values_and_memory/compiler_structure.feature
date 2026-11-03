@@ -6,6 +6,11 @@ Feature: one compiler, stages as jobs, no special cases (spec 2.5)
     When it is compiled
     Then it goes through the same stages as a user program, with no runtime-only branch in any stage
 
+  Scenario: a built-in class's method is declared in PatLang (spec 1.2)
+    Given the runtime's source
+    When the declaration of int's to_s is looked for
+    Then it is a PatLang method declaration in int's class, not a name the compiler recognises
+
   Scenario: no stage touches shared mutable state
     Given every compiler stage
     When its source is searched for __vars reads and writes

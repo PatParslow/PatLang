@@ -58,6 +58,11 @@ any event is (`emit`, `when`), with nothing specific to operators.
 - The order is: the receiver's `added_to`, the argument's `added_to`, then
   `added`, all after the result is computed. A handler cannot change the
   result.
+- While a handler for an event runs, nothing it does on the same thread
+  raises that event again: an `added` handler that adds two ints does not
+  call itself. Other events are raised as usual. (Added 2026-11-02, while
+  writing the scenarios: without it, any handler for an arithmetic event
+  that does arithmetic never returns.)
 
 ### 1.5 Value semantics and identity semantics
 

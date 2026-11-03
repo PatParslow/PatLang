@@ -1,0 +1,350 @@
+# v2 runtime: strings' primitives, numbers from text, files, processes,
+# the command line and the environment, through the Windows API
+# (extern_call). Structures Windows fills in are uncounted rt_alloc blocks,
+# their fields from 16, freed after the call.
+quiet_operators()
+
+# ---- strings ----
+
+make a function called chr takes n returns s
+  require (value_class(n) == 2) and (n >= 0) and (n < 256)
+  let block = rt_str_alloc(1)
+  mem_store_byte(block, 24, n)
+  let s = value_make(rt_string_heap_type(), block)
+  ensure (value_class(s) == 8) and (str_len(s) == 1)
+  return s
+end
+
+make a function called char_code takes s, i returns n
+  require (value_class(s) == 8) and (value_class(i) == 2)
+  rt_check_index(i, str_len(s))
+  let n = mem_load_byte(rt_str_bytes(s), i)
+  ensure (n >= 0) and (n < 256)
+  return n
+end
+
+make a function called substr takes s, start, len returns r
+  require (value_class(s) == 8) and (value_class(start) == 2) and (value_class(len) == 2)
+  let n = str_len(s)
+  let from = start
+  if from < 0 then
+    let from = 0
+  end
+  if from > n then
+    let from = n
+  end
+  let count = len
+  if from + count > n then
+    let count = n - from
+  end
+  if count < 0 then
+    let count = 0
+  end
+  let block = rt_str_alloc(count)
+  rt_copy_bytes(block + 24, rt_str_bytes(s) + from, count)
+  let r = value_make(rt_string_heap_type(), block)
+  ensure (value_class(r) == 8) and (str_len(r) <= str_len(s))
+  return r
+end
+
+# A NUL-terminated copy of a string, for Windows: an uncounted block, its
+# bytes from 16. The caller frees it.
+make a function called rt_cstr takes s returns block
+  require (value_class(s) == 8)
+  let n = str_len(s)
+  let block = rt_alloc(n + 1)
+  rt_copy_bytes(block + 16, rt_str_bytes(s), n)
+  mem_store_byte(block, 16 + n, 0)
+  ensure mem_load_byte(block, 16 + str_len(s)) == 0
+  return block
+end
+
+# A string of n bytes read from memory.
+make a function called rt_str_from_bytes takes addr, n returns s
+  require (n >= 0) and ((n == 0) or (addr != 0))
+  let block = rt_str_alloc(n)
+  rt_copy_bytes(block + 24, addr, n)
+  let s = value_make(rt_string_heap_type(), block)
+  ensure (value_class(s) == 8) and (str_len(s) == n)
+  return s
+end
+
+# ---- numbers from text ----
+
+# The number a string spells: an int or bigint for digits, a float when it
+# has a point (exact digits over a power of ten, rounded once).
+make a function called to_num takes s returns v
+  require rt_live(s)
+  if value_class(s) != 8 then
+    let v = s
+    ensure rt_live(v)
+    return v
+  end
+  let n = str_len(s)
+  let at = rt_str_bytes(s)
+  let dot = 0 - 1
+  let k = 0
+  while k < n do
+    if mem_load_byte(at, k) == 46 then
+      let dot = k
+    end
+    let k = k + 1
+  end
+  if dot < 0 then
+    let v = int_from_text(s)
+    ensure rt_live(v)
+    return v
+  end
+  let digits = str_concat(substr(s, 0, dot), substr(s, dot + 1, n - dot - 1))
+  let num = int_from_text(digits)
+  let den = 1
+  let k = 0
+  while k < n - dot - 1 do
+    let den = den * 10
+    let k = k + 1
+  end
+  let v = rt_float(float_div(rt_float_bits_of(num), rt_float_bits_of(den)))
+  ensure rt_live(v)
+  return v
+end
+
+# ---- files ----
+
+make a function called read_file takes path returns text
+  require (value_class(path) == 8)
+  let cpath = rt_cstr(path)
+  # GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL
+  let h = extern_call("KERNEL32.DLL", "CreateFileA", cpath + 16, 2147483648, 1, 0, 3, 128, 0)
+  rt_free(cpath)
+  if h == 0 - 1 then
+    let text = ""
+    ensure value_class(text) == 8
+    return text
+  end
+  let size = extern_call("KERNEL32.DLL", "GetFileSize", h, 0)
+  let block = rt_str_alloc(size)
+  extern_call("KERNEL32.DLL", "ReadFile", h, block + 24, size, runtime_state(), 0)
+  extern_call("KERNEL32.DLL", "CloseHandle", h)
+  let text = value_make(rt_string_heap_type(), block)
+  ensure value_class(text) == 8
+  return text
+end
+
+make a function called write_file takes path, text returns ok
+  require (value_class(path) == 8) and rt_live(text)
+  let cpath = rt_cstr(path)
+  # GENERIC_WRITE, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL
+  let h = extern_call("KERNEL32.DLL", "CreateFileA", cpath + 16, 1073741824, 0, 0, 2, 128, 0)
+  rt_free(cpath)
+  if h == 0 - 1 then
+    let ok = false
+    ensure value_class(ok) == 1
+    return ok
+  end
+  let t = to_s(text)
+  extern_call("KERNEL32.DLL", "WriteFile", h, rt_str_bytes(t), str_len(t), runtime_state(), 0)
+  extern_call("KERNEL32.DLL", "CloseHandle", h)
+  let ok = true
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called file_exists takes path returns yes
+  require (value_class(path) == 8)
+  let cpath = rt_cstr(path)
+  let attrs = extern_call("KERNEL32.DLL", "GetFileAttributesA", cpath + 16)
+  rt_free(cpath)
+  let yes = word_and(attrs, 4294967295) != 4294967295
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# ---- the command line and the environment ----
+
+# The program's arguments, its own path left out: the command line split
+# by the Windows rules (spaces separate arguments; quotes group; a
+# backslash before a quote escapes it).
+make a function called argv returns args
+  let line = extern_call("KERNEL32.DLL", "GetCommandLineA")
+  let n = 0
+  while mem_load_byte(line, n) != 0 do
+    let n = n + 1
+  end
+  let parts = rt_split_command_line(rt_str_from_bytes(line, n))
+  let out = []
+  let k = 1
+  while k < list_len(parts) do
+    let out = list_push(out, parts[k])
+    let k = k + 1
+  end
+  let args = out
+  ensure (value_class(args) == 9)
+  return args
+end
+
+make a function called rt_split_command_line takes s returns parts
+  require (value_class(s) == 8)
+  let parts = []
+  let n = str_len(s)
+  let at = rt_str_bytes(s)
+  let i = 0
+  while i < n do
+    while (i < n) and ((mem_load_byte(at, i) == 32) or (mem_load_byte(at, i) == 9)) do
+      let i = i + 1
+    end
+    if i < n then
+      let codes = []
+      let quoted = false
+      let more = true
+      while (i < n) and more do
+        let c = mem_load_byte(at, i)
+        if (c == 92) and (i + 1 < n) and (mem_load_byte(at, i + 1) == 34) then
+          let codes = list_push(codes, 34)
+          let i = i + 2
+        elif c == 34 then
+          let quoted = not quoted
+          let i = i + 1
+        elif ((c == 32) or (c == 9)) and (not quoted) then
+          let more = false
+        else
+          let codes = list_push(codes, c)
+          let i = i + 1
+        end
+      end
+      let parts = list_push(parts, rt_str_from_codes(codes))
+    end
+  end
+  ensure (value_class(parts) == 9)
+  return parts
+end
+
+make a function called rt_str_from_codes takes codes returns s
+  require (value_class(codes) == 9)
+  let n = list_len(codes)
+  let block = rt_str_alloc(n)
+  let k = 0
+  while k < n do
+    mem_store_byte(block, 24 + k, codes[k])
+    let k = k + 1
+  end
+  let s = value_make(rt_string_heap_type(), block)
+  ensure (value_class(s) == 8) and (str_len(s) == list_len(codes))
+  return s
+end
+
+make a function called getenv takes name returns v
+  require (value_class(name) == 8)
+  let cname = rt_cstr(name)
+  let buf = rt_alloc(32768)
+  let n = extern_call("KERNEL32.DLL", "GetEnvironmentVariableA", cname + 16, buf + 16, 32767)
+  let v = rt_str_from_bytes(buf + 16, n)
+  rt_free(buf)
+  rt_free(cname)
+  ensure value_class(v) == 8
+  return v
+end
+
+# ---- processes ----
+
+# One argument as the Windows rules read it back: quoted when it has a
+# space, a tab or a quote, a quote escaped with a backslash.
+make a function called rt_quote_arg takes a returns q
+  require (value_class(a) == 8)
+  let n = str_len(a)
+  let at = rt_str_bytes(a)
+  let needs = n == 0
+  let k = 0
+  while k < n do
+    let c = mem_load_byte(at, k)
+    if (c == 32) or (c == 9) or (c == 34) then
+      let needs = true
+    end
+    let k = k + 1
+  end
+  if not needs then
+    let q = a
+    ensure (value_class(q) == 8) and (str_len(q) >= str_len(a))
+    return q
+  end
+  let codes = [34]
+  let k = 0
+  while k < n do
+    let c = mem_load_byte(at, k)
+    if c == 34 then
+      let codes = list_push(codes, 92)
+    end
+    let codes = list_push(codes, c)
+    let k = k + 1
+  end
+  let codes = list_push(codes, 34)
+  let q = rt_str_from_codes(codes)
+  ensure (value_class(q) == 8) and (str_len(q) >= str_len(a))
+  return q
+end
+
+# The program run with its arguments; what it writes to its output and
+# its error stream.
+make a function called exec_capture takes program, rest returns out
+  require rt_live(program) and (value_class(rest) == 9)
+  let parts = [rt_quote_arg(to_s(program))]
+  let k = 0
+  while k < list_len(rest) do
+    let parts = list_push(parts, rt_quote_arg(to_s(rest[k])))
+    let k = k + 1
+  end
+  let cmd = rt_cstr(str_join(parts, " "))
+  # SECURITY_ATTRIBUTES: inheritable handles
+  let sa = rt_alloc(24)
+  mem_store(sa, 16, 24)
+  mem_store(sa, 24, 0)
+  mem_store(sa, 32, 1)
+  let pipe = rt_alloc(16)
+  extern_call("KERNEL32.DLL", "CreatePipe", pipe + 16, pipe + 24, sa + 16, 0)
+  let read_end = mem_load(pipe, 16)
+  let write_end = mem_load(pipe, 24)
+  # the read end stays with this process (HANDLE_FLAG_INHERIT off)
+  extern_call("KERNEL32.DLL", "SetHandleInformation", read_end, 1, 0)
+  # STARTUPINFOA, 104 bytes: cb, then dwFlags = STARTF_USESTDHANDLES at
+  # 60, the standard handles at 80, 88, 96
+  let si = rt_alloc(104)
+  let k = 0
+  while k < 13 do
+    mem_store(si, 16 + 8 * k, 0)
+    let k = k + 1
+  end
+  mem_store(si, 16, 104)
+  mem_store(si, 76, 256)
+  mem_store(si, 96, extern_call("KERNEL32.DLL", "GetStdHandle", 0 - 10))
+  mem_store(si, 104, write_end)
+  mem_store(si, 112, write_end)
+  let pi = rt_alloc(24)
+  let ok = extern_call("KERNEL32.DLL", "CreateProcessA", 0, cmd + 16, 0, 0, 1, 0, 0, 0, si + 16, pi + 16)
+  extern_call("KERNEL32.DLL", "CloseHandle", write_end)
+  let chunks = []
+  if ok != 0 then
+    let buf = rt_alloc(4096)
+    let reading = true
+    while reading do
+      let got = extern_call("KERNEL32.DLL", "ReadFile", read_end, buf + 16, 4096, runtime_state(), 0)
+      let n = word_and(mem_load(runtime_state(), 0), 4294967295)
+      if (got == 0) or (n == 0) then
+        let reading = false
+      else
+        let chunks = list_push(chunks, rt_str_from_bytes(buf + 16, n))
+      end
+    end
+    rt_free(buf)
+    extern_call("KERNEL32.DLL", "WaitForSingleObject", mem_load(pi, 16), 4294967295)
+    extern_call("KERNEL32.DLL", "CloseHandle", mem_load(pi, 16))
+    extern_call("KERNEL32.DLL", "CloseHandle", mem_load(pi, 24))
+  end
+  extern_call("KERNEL32.DLL", "CloseHandle", read_end)
+  rt_free(cmd)
+  rt_free(sa)
+  rt_free(pipe)
+  rt_free(si)
+  rt_free(pi)
+  let out = str_join(chunks, "")
+  ensure value_class(out) == 8
+  return out
+end

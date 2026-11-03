@@ -1,0 +1,123 @@
+# v2 runtime: core (docs/plans/v2-implementation.md). Ordinary PatLang,
+# compiled by the same stages as any program; what PatLang cannot say in
+# terms of other PatLang is a primitive (ir_prim_arity).
+#
+# Every runtime function states its contract (docs/spec/values-and-memory.md
+# 2.4): require clauses on what it is given, ensure clauses on what it
+# returns, each checked where it is written. rt_live(v) is the invariant
+# every value meets: a type word with only its defined bits, a class that
+# exists, and, for a heap value, a block still counted.
+#
+# runtime_state() is a 64 KB area the runtime owns:
+#   0   bytes written by the last WriteFile
+#   64  a 64-byte scratch buffer for formatting a number
+quiet_operators()
+
+# A value as the runtime keeps it: its type word's bits are 0 to 33 only,
+# its class one that exists, and a heap value's block has a count of at
+# least 1 (released values are never seen again).
+make a function called rt_live takes v returns ok
+  require word_shr(value_type_word(v), 34) == 0
+  let c = value_class(v)
+  let known = (c <= 13) or (c >= 63)
+  let ok = known
+  if known and (word_and(value_type_word(v), 4294967296) != 0) then
+    let ok = mem_load(value_data(v), 0) >= 1
+  end
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called runtime_init returns r
+  rt_memory_init()
+  rt_objects_init()
+  rt_logic_init()
+  let r = rt_threads_init()
+  ensure r == 0
+  return r
+end
+
+make a function called rt_stdout returns h
+  let h = extern_call("KERNEL32.DLL", "GetStdHandle", 0 - 11)
+  ensure value_class(h) == 2
+  return h
+end
+
+make a function called rt_write takes addr, len returns r
+  require (value_class(addr) == 2) and (value_class(len) == 2) and (len >= 0)
+  let r = extern_call("KERNEL32.DLL", "WriteFile", rt_stdout(), addr, len, runtime_state(), 0)
+  ensure value_class(r) == 2
+  return r
+end
+
+make a function called rt_write_byte takes c returns r
+  require (value_class(c) == 2) and (c >= 0) and (c < 256)
+  let buf = runtime_state() + 64
+  mem_store_byte(buf, 0, c)
+  let r = rt_write(buf, 1)
+  ensure value_class(r) == 2
+  return r
+end
+
+# The decimal digits of a 64-bit int, written from the end of the scratch
+# buffer backwards.
+make a function called rt_write_int takes n returns r
+  require value_class(n) == 2
+  let buf = runtime_state() + 64
+  let end_at = 63
+  let pos = end_at
+  let v = n
+  if v == 0 then
+    mem_store_byte(buf, pos, 48)
+    let pos = pos - 1
+  end
+  while v != 0 do
+    let digit = word_rem(v, 10)
+    if digit < 0 then
+      let digit = 0 - digit
+    end
+    mem_store_byte(buf, pos, 48 + digit)
+    let pos = pos - 1
+    let v = word_div(v, 10)
+  end
+  if n < 0 then
+    mem_store_byte(buf, pos, 45)
+    let pos = pos - 1
+  end
+  let r = rt_write(buf + pos + 1, end_at - pos)
+  ensure value_class(r) == 2
+  return r
+end
+
+make a function called print takes v returns r
+  require rt_live(v)
+  let text = to_s(v)
+  rt_write(rt_str_bytes(text), str_len(text))
+  rt_write_byte(10)
+  let r = value_make(0, 0)
+  ensure value_class(r) == 0
+  return r
+end
+
+# Stops the program: an operation met a class it does not handle.
+make a function called rt_fail_class takes c returns r
+  require value_class(c) == 2
+  rt_write_byte(33)
+  rt_write_int(c)
+  rt_write_byte(10)
+  extern_call("KERNEL32.DLL", "ExitProcess", 70)
+  # ExitProcess does not return
+  ensure false
+  return 0
+end
+
+# A require, ensure or assert clause was false: stop, naming it as the
+# interpreter does.
+make a function called rt_contract_failed takes kind, text, fname returns r
+  require (value_class(kind) == 8) and (value_class(text) == 8) and (value_class(fname) == 8)
+  print("contract violation: " + kind + " failed in " + fname + "(): " + text)
+  extern_call("KERNEL32.DLL", "ExitProcess", 3)
+  # ExitProcess does not return
+  ensure false
+  return 0
+end

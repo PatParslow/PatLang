@@ -1,0 +1,236 @@
+# v2 runtime: string builders, vecs and bool arrays (spec 1.5): mutable,
+# with identity, so a change through one holder is seen through every
+# holder. Each is a counted block; a builder and a bool array keep their
+# bytes in a buffer block of their own (an uncounted rt_alloc block, freed
+# with them), a vec its list.
+#   string builder (class 11): 16 length, 24 capacity, 32 buffer
+#   vec (class 12): 16 its list
+#   bool array (class 13): 16 length in bits, 24 capacity in words,
+#                          32 buffer of 64-bit words
+quiet_operators()
+
+# ---- string builders ----
+
+make a function called sb_new returns b
+  let block = rt_alloc(24)
+  mem_store(block, 16, 0)
+  mem_store(block, 24, 32)
+  mem_store(block, 32, rt_alloc(32))
+  let b = value_make(4294967307, block)
+  ensure (value_class(b) == 11) and (sb_len(b) == 0)
+  return b
+end
+
+# Room for at least n bytes, the buffer doubling as it grows.
+make a function called rt_sb_reserve takes block, n returns r
+  require (block != 0) and (n >= 0)
+  let cap = mem_load(block, 24)
+  if n <= cap then
+    let r = 0
+    ensure mem_load(block, 24) >= n
+    return r
+  end
+  let new_cap = cap
+  while new_cap < n do
+    let new_cap = word_mul(new_cap, 2)
+  end
+  let old = mem_load(block, 32)
+  let buf = rt_alloc(new_cap)
+  rt_copy_bytes(buf + 16, old + 16, mem_load(block, 16))
+  rt_free(old)
+  mem_store(block, 32, buf)
+  mem_store(block, 24, new_cap)
+  let r = 0
+  ensure mem_load(block, 24) >= n
+  return r
+end
+
+make a function called sb_push takes b, x returns r
+  require (value_class(b) == 11) and rt_live(x)
+  let text = to_s(x)
+  let n = str_len(text)
+  let block = value_data(b)
+  let len = mem_load(block, 16)
+  rt_sb_reserve(block, len + n)
+  rt_copy_bytes(mem_load(block, 32) + 16 + len, rt_str_bytes(text), n)
+  mem_store(block, 16, len + n)
+  let r = b
+  ensure value_class(r) == 11
+  return r
+end
+
+make a function called sb_str takes b returns s
+  require value_class(b) == 11
+  let block = value_data(b)
+  let len = mem_load(block, 16)
+  let out = rt_str_alloc(len)
+  rt_copy_bytes(out + 24, mem_load(block, 32) + 16, len)
+  let s = value_make(rt_string_heap_type(), out)
+  ensure (value_class(s) == 8) and (str_len(s) == sb_len(b))
+  return s
+end
+
+make a function called sb_len takes b returns n
+  require value_class(b) == 11
+  let n = mem_load(value_data(b), 16)
+  ensure n >= 0
+  return n
+end
+
+# ---- vecs ----
+
+make a function called vec_new returns v
+  let block = rt_alloc(16)
+  mem_store(block, 16, 0)
+  mem_store(block, 24, 0)
+  mem_init_value(block, 16, [])
+  let v = value_make(4294967308, block)
+  ensure (value_class(v) == 12) and (vec_len(v) == 0)
+  return v
+end
+
+# The vec's list taken out (the vec holds unit meanwhile), so its count is
+# 1 and list_push and list_set change it in place; then put back.
+make a function called vec_push takes v, x returns r
+  require (value_class(v) == 12) and rt_live(x)
+  let block = value_data(v)
+  let l = mem_take_value(block, 16)
+  let l = list_push(l, x)
+  mem_init_value(block, 16, l)
+  let r = v
+  ensure value_class(r) == 12
+  return r
+end
+
+make a function called vec_set takes v, i, x returns r
+  require (value_class(v) == 12) and (value_class(i) == 2) and rt_live(x)
+  let block = value_data(v)
+  let l = mem_take_value(block, 16)
+  let l = list_set(l, i, x)
+  mem_init_value(block, 16, l)
+  let r = v
+  ensure value_class(r) == 12
+  return r
+end
+
+make a function called vec_get takes v, i returns x
+  require value_class(v) == 12
+  let x = list_get(mem_load_value(value_data(v), 16), i)
+  ensure rt_live(x)
+  return x
+end
+
+make a function called vec_len takes v returns n
+  require value_class(v) == 12
+  let n = list_len(mem_load_value(value_data(v), 16))
+  ensure n >= 0
+  return n
+end
+
+# The vec's list as a value: shared until either changes it, when the
+# count makes the change copy.
+make a function called vec_to_list takes v returns l
+  require value_class(v) == 12
+  let l = mem_load_value(value_data(v), 16)
+  ensure (value_class(l) == 9)
+  return l
+end
+
+# ---- bool arrays ----
+
+make a function called bool_array_new takes n returns a
+  require (value_class(n) == 2) and (n >= 0)
+  let words = word_shr(n + 63, 6)
+  if words < 1 then
+    let words = 1
+  end
+  let block = rt_alloc(24)
+  mem_store(block, 16, n)
+  mem_store(block, 24, words)
+  let buf = rt_alloc(8 * words)
+  let k = 0
+  while k < words do
+    mem_store(buf, 16 + 8 * k, 0)
+    let k = k + 1
+  end
+  mem_store(block, 32, buf)
+  let a = value_make(4294967309, block)
+  ensure (value_class(a) == 13) and (bool_array_len(a) == n)
+  return a
+end
+
+make a function called bool_array_len takes a returns n
+  require value_class(a) == 13
+  let n = mem_load(value_data(a), 16)
+  ensure n >= 0
+  return n
+end
+
+make a function called bool_array_get takes a, i returns v
+  require value_class(a) == 13
+  let block = value_data(a)
+  rt_check_index(i, mem_load(block, 16))
+  let word = mem_load(mem_load(block, 32), 16 + 8 * word_shr(i, 6))
+  let v = word_and(word_shr(word, word_and(i, 63)), 1) == 1
+  ensure value_class(v) == 1
+  return v
+end
+
+make a function called bool_array_set takes a, i, v returns r
+  require (value_class(a) == 13) and (value_class(v) == 1)
+  let block = value_data(a)
+  rt_check_index(i, mem_load(block, 16))
+  let at = mem_load(block, 32) + 16 + 8 * word_shr(i, 6)
+  let mask = word_shl(1, word_and(i, 63))
+  if v then
+    mem_store(at, 0, word_or(mem_load(at, 0), mask))
+  else
+    mem_store(at, 0, word_and(mem_load(at, 0), word_xor(mask, 0 - 1)))
+  end
+  let r = a
+  ensure value_class(r) == 13
+  return r
+end
+
+# Grows in place, the buffer doubling: the array stays the same array.
+make a function called bool_array_push takes a, v returns r
+  require (value_class(a) == 13) and (value_class(v) == 1)
+  let block = value_data(a)
+  let n = mem_load(block, 16)
+  let words = mem_load(block, 24)
+  if word_shr(n, 6) >= words then
+    let new_words = word_mul(words, 2)
+    let old = mem_load(block, 32)
+    let buf = rt_alloc(8 * new_words)
+    let k = 0
+    while k < new_words do
+      if k < words then
+        mem_store(buf, 16 + 8 * k, mem_load(old, 16 + 8 * k))
+      else
+        mem_store(buf, 16 + 8 * k, 0)
+      end
+      let k = k + 1
+    end
+    rt_free(old)
+    mem_store(block, 32, buf)
+    mem_store(block, 24, new_words)
+  end
+  mem_store(block, 16, n + 1)
+  bool_array_set(a, n, v)
+  let r = a
+  ensure (value_class(r) == 13) and (bool_array_len(r) == n + 1)
+  return r
+end
+
+# Frees what a freed cell holds (rt_finalize).
+make a function called rt_cell_finalize takes cls, block returns r
+  require (cls >= 11) and (cls <= 13) and (mem_load(block, 0) == 0)
+  if cls == 12 then
+    rt_release_value_at(block, 16)
+  else
+    rt_free(mem_load(block, 32))
+  end
+  let r = 0
+  ensure r == 0
+  return r
+end

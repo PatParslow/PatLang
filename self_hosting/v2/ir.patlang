@@ -1,0 +1,218 @@
+# v2's intermediate representation (docs/plans/v2-implementation.md, section 3).
+#
+# A function is ["Fn", name, nparams, nslots, instrs, vars]. Slots
+# 0 .. nparams-1 hold the parameters; vars lists the slots of named
+# variables (every other slot is a temporary, written and read once); every
+# slot is one two-word value in the frame.
+# Instructions:
+#   ["const", dst, kind, text]     kind: int, float, bool, unit, str
+#   ["copy", dst, src]
+#   ["call", dst, name, [slots]]   a PatLang function, user or runtime alike
+#   ["op", dst, op, a, b]          a binary operator; ["un", dst, op, a]
+#   ["prim", dst, name, [slots]]   a machine primitive (ir_prim_arity)
+#   ["extern", dst, lib, func, [slots]]   extern_call: a Windows x64 call
+#   ["externf", dst, lib, func, [slots]]  extern_call_float: the same, its
+#                        arguments and result doubles (IEEE bit words)
+#   ["label", n], ["jump", n], ["branch", slot, n_true, n_false]
+#   ["return", slot]
+#   ["retain", slot], ["release", slot]   only after the ownership stage
+#   ["move", dst, src]   only after the ownership stage: dst takes src's
+#                        value without counting, and src becomes unit
+#   ["clear", slot]      only after the ownership stage: the slot becomes unit
+#   ["take", dst, var]   before the ownership stage: dst takes var's value,
+#                        and var becomes unit (lower.patlang, lw_let_giving)
+#   ["list", dst, [slots]]  a new list of those values
+#   ["closure", dst, fn_name, [slots]]  a closure of that lifted function,
+#                        holding those values
+#   ["callv", dst, [slots]]  a call of the closure in the first slot, with
+#                        it and the rest as arguments
+
+make a function called ir_fn takes name, nparams, nslots, instrs, vars returns func
+  return ["Fn", name, nparams, nslots, instrs, vars]
+end
+
+make a function called ir_fn_vars takes func returns vars
+  return func[5]
+end
+
+make a function called ir_fn_name takes func returns n
+  return func[1]
+end
+
+make a function called ir_fn_nparams takes func returns n
+  return func[2]
+end
+
+make a function called ir_fn_nslots takes func returns n
+  return func[3]
+end
+
+make a function called ir_fn_instrs takes func returns instrs
+  return func[4]
+end
+
+# The machine primitives (docs/plans/v2-implementation.md, section 4) and
+# how many arguments each takes; -1 for extern_call, which takes a library,
+# a function name and up to 12 words. Part of the language: the compiler
+# knows them as it knows +, and knows nothing about any runtime function.
+make a function called ir_prim_arity takes name returns n
+  if (name == "value_class") or (name == "value_data") or (name == "value_type_word") then
+    return 1
+  end
+  if (name == "value_make") or (name == "mem_load") or (name == "mem_load_byte") or (name == "mem_load_value") or (name == "mem_take_value") or (name == "atomic_add") then
+    return 2
+  end
+  if (name == "mem_store") or (name == "mem_store_byte") or (name == "mem_store_value") or (name == "mem_init_value") then
+    return 3
+  end
+  if (name == "word_div") or (name == "word_rem") or (name == "word_and") or (name == "word_or") or (name == "word_xor") or (name == "word_shl") or (name == "word_shr") or (name == "word_add") or (name == "word_sub") or (name == "word_mul") then
+    return 2
+  end
+  if (name == "runtime_state") or (name == "thread_entry_address") then
+    return 0
+  end
+  if (name == "int_to_float") or (name == "float_to_int") then
+    return 1
+  end
+  if (name == "float_add") or (name == "float_sub") or (name == "float_mul") or (name == "float_div") or (name == "float_lt") or (name == "float_eq") then
+    return 2
+  end
+  if (name == "extern_call") or (name == "extern_call_float") then
+    return 0 - 1
+  end
+  return 0 - 2
+end
+
+make a function called ir_is_prim takes name returns yes
+  return ir_prim_arity(name) != (0 - 2)
+end
+
+# ---- the IR's contract ----
+
+make a function called ir_slot_ok takes func, s returns ok
+  return (s >= 0) and (s < ir_fn_nslots(func))
+end
+
+# Every slot an instruction names is in range, every jump target is a label
+# of this function, and retain/release appear only once ownership is done.
+make a function called ir_well_formed takes func, owned returns ok
+  let instrs = ir_fn_instrs(func)
+  let labels = []
+  let i = 0
+  while i < list_len(instrs) do
+    if instrs[i][0] == "label" then
+      let labels = list_push(labels, instrs[i][1])
+    end
+    let i = i + 1
+  end
+  let i = 0
+  while i < list_len(instrs) do
+    let ins = instrs[i]
+    let op = ins[0]
+    if (op == "const") or (op == "copy") or (op == "call") or (op == "op") or (op == "un") or (op == "prim") or (op == "return") or (op == "retain") or (op == "release") or (op == "branch") then
+      if not ir_slot_ok(func, ins[1]) then
+        return false
+      end
+    end
+    if (op == "closure") or (op == "callv") then
+      if not ir_slot_ok(func, ins[1]) then
+        return false
+      end
+      let all = ins[2]
+      if op == "closure" then
+        let all = ins[3]
+      end
+      let k = 0
+      while k < list_len(all) do
+        if not ir_slot_ok(func, all[k]) then
+          return false
+        end
+        let k = k + 1
+      end
+    end
+    if (op == "take") or (op == "list") or (op == "clear") then
+      if not ir_slot_ok(func, ins[1]) then
+        return false
+      end
+    end
+    if op == "take" then
+      if not ir_slot_ok(func, ins[2]) then
+        return false
+      end
+    end
+    if op == "list" then
+      let k = 0
+      while k < list_len(ins[2]) do
+        if not ir_slot_ok(func, ins[2][k]) then
+          return false
+        end
+        let k = k + 1
+      end
+    end
+    if (op == "copy") or (op == "move") then
+      if (not ir_slot_ok(func, ins[1])) or (not ir_slot_ok(func, ins[2])) then
+        return false
+      end
+    end
+    if (op == "call") or (op == "prim") then
+      let k = 0
+      while k < list_len(ins[3]) do
+        if not ir_slot_ok(func, ins[3][k]) then
+          return false
+        end
+        let k = k + 1
+      end
+    end
+    if (op == "extern") or (op == "externf") then
+      if not ir_slot_ok(func, ins[1]) then
+        return false
+      end
+      let k = 0
+      while k < list_len(ins[4]) do
+        if not ir_slot_ok(func, ins[4][k]) then
+          return false
+        end
+        let k = k + 1
+      end
+    end
+    if op == "op" then
+      if (not ir_slot_ok(func, ins[3])) or (not ir_slot_ok(func, ins[4])) then
+        return false
+      end
+    end
+    if op == "un" then
+      if not ir_slot_ok(func, ins[3]) then
+        return false
+      end
+    end
+    if op == "jump" then
+      if not v2_contains(labels, ins[1]) then
+        return false
+      end
+    end
+    if op == "branch" then
+      if (not v2_contains(labels, ins[2])) or (not v2_contains(labels, ins[3])) then
+        return false
+      end
+    end
+    if (op == "take") and owned then
+      return false
+    end
+    if ((op == "retain") or (op == "release") or (op == "move") or (op == "clear")) and (not owned) then
+      return false
+    end
+    let i = i + 1
+  end
+  return true
+end
+
+make a function called v2_contains takes items, x returns yes
+  let i = 0
+  while i < list_len(items) do
+    if items[i] == x then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end

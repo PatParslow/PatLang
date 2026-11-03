@@ -7,8 +7,8 @@ Feature: operators are methods, and raise ordinary events (spec 1.4)
     Then the result is a Money with 425 cents
 
   Scenario: a method declaration names the events it raises
-    Given a class Money whose + is declared `raises added`
-    And a handler `when added do ... end` recording event_data
+    Given a class Money whose + is declared `raises money_added`
+    And a handler `when money_added do ... end` recording event_data
     When m1 + m2 is evaluated
     Then the handler ran once, with event_data [m1, m2, the result]
 
@@ -22,6 +22,11 @@ Feature: operators are methods, and raise ordinary events (spec 1.4)
     Given a handler for added that tries to return 0
     When 3 + 5 is evaluated
     Then the value is 8
+
+  Scenario: a handler's own operations do not raise its event again
+    Given a handler for added that adds 1 + 1 and counts how many times it ran
+    When 3 + 5 is evaluated
+    Then the handler ran once
 
   Scenario: operator events are ordinary events
     Given a handler for added registered with `when added do ... end`

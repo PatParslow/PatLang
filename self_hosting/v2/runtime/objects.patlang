@@ -1,0 +1,595 @@
+# v2 runtime: classes, objects, methods and events
+# (docs/spec/values-and-memory.md 1.1, 1.2, 1.4, 1.5, 1.6).
+quiet_operators()
+
+# The runtime's values live in its state area (rt_global_get/set):
+#   4096 event handlers: a list of [event name, closure]
+#   4112 unused (the events whose handlers are running are each thread's:
+#        memory.patlang's thread context, rt_active_events)
+#   4128 which classes' methods raise which events: [class id, event]
+#   4144 the classes: a list of class records (rt_class_*)
+#   4160 named objects: a list of [name, object]
+#   4176 the next class id for a declared class
+# (4208 is threads.patlang's functions by name, 4224 logic.patlang's rules)
+# and, at 2048 + 8 * class id (ids below 256), each class's event flag:
+# nonzero once a handler is registered for an event its methods raise.
+#
+# A class record is [name, id, parent name, field defaults [[name, value]],
+# methods [[name, closure]], traits [names]].
+#
+# An object is a block holding its class id at 16, its name at 24 (unit
+# when unnamed) and its fields at 40: a list of [name, value]. Its type
+# word is its class id with the heap bit, so value_class gives the class.
+
+make a function called rt_global_get takes off returns v
+  require (off >= 4096) and (off < 4400) and (word_and(off, 7) == 0)
+  let v = mem_load_value(runtime_state(), off)
+  ensure rt_live(v)
+  return v
+end
+
+make a function called rt_global_set takes off, v returns r
+  require (off >= 4096) and (off < 4400) and (word_and(off, 7) == 0) and rt_live(v)
+  let r = mem_store_value(runtime_state(), off, v)
+  ensure value_class(r) == 0
+  return r
+end
+
+make a function called rt_objects_init returns r
+  let st = runtime_state()
+  let off = 4096
+  while off <= 4160 do
+    mem_store(st, off, 0)
+    mem_store(st, word_add(off, 8), 0)
+    mem_init_value(st, off, [])
+    let off = word_add(off, 16)
+  end
+  mem_store(st, 4176, 0)
+  mem_store(st, 4184, 0)
+  mem_init_value(st, 4176, 64)
+  let k = 0
+  while k < 256 do
+    mem_store(st, word_add(2048, word_mul(8, k)), 0)
+    let k = word_add(k, 1)
+  end
+  rt_builtin_classes()
+  let r = 0
+  ensure (r == 0) and (list_len(rt_global_get(4144)) == 14)
+  return r
+end
+
+# ---- classes ----
+
+make a function called rt_class_def takes name, id, parent, defaults, methods, traits returns r
+  require (value_class(name) == 8) and (value_class(id) == 2) and (value_class(defaults) == 9) and (value_class(methods) == 9) and (value_class(traits) == 9)
+  let rec = [name, id, parent, defaults, methods, traits]
+  rt_global_set(4144, list_push(rt_global_get(4144), rec))
+  let r = id
+  ensure r == id
+  return r
+end
+
+# A declared class: the next id, its methods' events recorded.
+make a function called class_define takes name, parent, defaults, methods, traits, raises returns id
+  require (value_class(name) == 8) and (value_class(parent) == 8) and (value_class(defaults) == 9) and (value_class(methods) == 9) and (value_class(traits) == 9) and (value_class(raises) == 9)
+  let id = rt_global_get(4176)
+  rt_global_set(4176, word_add(id, 1))
+  let k = 0
+  while k < list_len(raises) do
+    rt_declare_raises(id, raises[k])
+    let k = word_add(k, 1)
+  end
+  let id = rt_class_def(name, id, parent, defaults, methods, traits)
+  ensure (id >= 64) and (rt_class_by_id(id) != false)
+  return id
+end
+
+make a function called rt_class_by_name takes name returns rec
+  require (value_class(name) == 8)
+  let classes = rt_global_get(4144)
+  let k = 0
+  while k < list_len(classes) do
+    if classes[k][0] == name then
+      let rec = classes[k]
+      ensure (rec == false) or (value_class(rec) == 9)
+      return rec
+    end
+    let k = word_add(k, 1)
+  end
+  let rec = false
+  ensure (rec == false) or (value_class(rec) == 9)
+  return rec
+end
+
+make a function called rt_class_by_id takes id returns rec
+  require (value_class(id) == 2)
+  let classes = rt_global_get(4144)
+  let k = 0
+  while k < list_len(classes) do
+    if classes[k][1] == id then
+      let rec = classes[k]
+      ensure (rec == false) or (value_class(rec) == 9)
+      return rec
+    end
+    let k = word_add(k, 1)
+  end
+  let rec = false
+  ensure (rec == false) or (value_class(rec) == 9)
+  return rec
+end
+
+# A method of a class, looked up in the class, then its traits (the last
+# listed first), then its parent, and up; false when none has it.
+make a function called rt_find_method takes rec, m returns f
+  require (value_class(m) == 8)
+  if rec == false then
+    let f = false
+    ensure (f == false) or (value_class(f) == 10)
+    return f
+  end
+  let methods = rec[4]
+  let k = 0
+  while k < list_len(methods) do
+    if methods[k][0] == m then
+      let f = methods[k][1]
+      ensure (f == false) or (value_class(f) == 10)
+      return f
+    end
+    let k = word_add(k, 1)
+  end
+  let traits = rec[5]
+  let t = word_sub(list_len(traits), 1)
+  while t >= 0 do
+    let f = rt_find_method(rt_class_by_name(traits[t]), m)
+    if f != false then
+      ensure (f == false) or (value_class(f) == 10)
+      return f
+    end
+    let t = word_sub(t, 1)
+  end
+  if rec[2] == "" then
+    let f = false
+    ensure (f == false) or (value_class(f) == 10)
+    return f
+  end
+  let f = rt_find_method(rt_class_by_name(rec[2]), m)
+  ensure (f == false) or (value_class(f) == 10)
+  return f
+end
+
+# The field defaults of a class and its ancestors, the class's own last.
+make a function called rt_class_defaults takes rec returns pairs
+  require (rec == false) or (value_class(rec) == 9)
+  if rec == false then
+    let pairs = []
+    ensure (value_class(pairs) == 9)
+    return pairs
+  end
+  let pairs = []
+  if rec[2] != "" then
+    let pairs = rt_class_defaults(rt_class_by_name(rec[2]))
+  end
+  let own = rec[3]
+  let k = 0
+  while k < list_len(own) do
+    let pairs = rt_pairs_set(pairs, own[k][0], own[k][1])
+    let k = word_add(k, 1)
+  end
+  ensure (value_class(pairs) == 9)
+  return pairs
+end
+
+# ---- [name, value] lists ----
+
+make a function called rt_pairs_index takes pairs, key returns i
+  require (value_class(pairs) == 9)
+  let k = 0
+  while k < list_len(pairs) do
+    if pairs[k][0] == key then
+      let i = k
+      ensure (i >= 0 - 1) and (i < list_len(pairs))
+      return i
+    end
+    let k = word_add(k, 1)
+  end
+  let i = 0 - 1
+  ensure (i >= 0 - 1) and (i < list_len(pairs))
+  return i
+end
+
+make a function called rt_pairs_set takes pairs, key, v returns out
+  require (value_class(pairs) == 9) and rt_live(key) and rt_live(v)
+  let i = rt_pairs_index(pairs, key)
+  if i < 0 then
+    let out = list_push(pairs, [key, v])
+    ensure rt_pairs_index(out, key) >= 0
+    return out
+  end
+  let out = list_set(pairs, i, [key, v])
+  ensure rt_pairs_index(out, key) >= 0
+  return out
+end
+
+# ---- objects ----
+
+make a function called rt_object_alloc takes cid, name, fields returns o
+  require (cid >= 63) and (value_class(fields) == 9)
+  let block = rt_alloc(40)
+  mem_store(block, 16, cid)
+  mem_init_value(block, 24, name)
+  mem_init_value(block, 40, fields)
+  let o = value_make(word_or(cid, 4294967296), block)
+  ensure value_class(o) == cid
+  return o
+end
+
+make a function called rt_is_object takes v returns yes
+  require rt_live(v)
+  let yes = value_class(v) >= 63
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# new(class) makes an object of that class, its fields its defaults;
+# new(class, name) also names it, findable by that name until
+# object_delete. A class never declared is declared here, with no fields.
+make a function called new takes cls, name returns o
+  require (value_class(cls) == 8) and ((value_class(name) == 8) or (value_class(name) == 0))
+  let rec = rt_class_by_name(cls)
+  if rec == false then
+    class_define(cls, "", [], [], [], [])
+    let rec = rt_class_by_name(cls)
+  end
+  let fields = rt_class_defaults(rec)
+  let fields = rt_pairs_set(fields, "type", cls)
+  if value_class(name) == 8 then
+    let fields = rt_pairs_set(fields, "name", name)
+  end
+  let o = rt_object_alloc(rec[1], name, fields)
+  if value_class(name) == 8 then
+    rt_global_set(4160, list_push(rt_global_get(4160), [name, o]))
+  end
+  ensure rt_is_object(o) and (type_of(o) == cls)
+  return o
+end
+
+# An object, or a named object given its name.
+make a function called rt_resolve takes v returns o
+  require rt_live(v)
+  if value_class(v) == 8 then
+    let named = rt_global_get(4160)
+    let i = rt_pairs_index(named, v)
+    if i < 0 then
+      let o = false
+      ensure (o == false) or rt_live(o)
+      return o
+    end
+    let o = named[i][1]
+    ensure (o == false) or rt_live(o)
+    return o
+  end
+  let o = v
+  ensure (o == false) or rt_live(o)
+  return o
+end
+
+make a function called object_delete takes v returns r
+  require rt_live(v)
+  let o = rt_resolve(v)
+  if o == false then
+    let r = false
+    ensure value_class(r) == 1
+    return r
+  end
+  let named = rt_global_get(4160)
+  let kept = []
+  let k = 0
+  while k < list_len(named) do
+    if named[k][1] != o then
+      let kept = list_push(kept, named[k])
+    end
+    let k = word_add(k, 1)
+  end
+  rt_global_set(4160, kept)
+  let r = true
+  ensure value_class(r) == 1
+  return r
+end
+
+make a function called rt_fields takes o returns f
+  require rt_is_object(o)
+  let f = mem_load_value(value_data(o), 40)
+  ensure (value_class(f) == 9)
+  return f
+end
+
+make a function called get takes v, key returns r
+  require rt_live(v) and (value_class(key) == 8)
+  let o = rt_resolve(v)
+  if o == false then
+    let r = false
+    ensure rt_live(r)
+    return r
+  end
+  let fields = rt_fields(o)
+  let i = rt_pairs_index(fields, key)
+  if i < 0 then
+    let r = false
+    ensure rt_live(r)
+    return r
+  end
+  let r = fields[i][1]
+  ensure rt_live(r)
+  return r
+end
+
+make a function called rt_field_set takes v, key, x returns r
+  require rt_live(v) and rt_live(x) and (value_class(key) == 8)
+  let o = rt_resolve(v)
+  mem_store_value(value_data(o), 40, rt_pairs_set(rt_fields(o), key, x))
+  let r = x
+  ensure rt_live(r)
+  return r
+end
+
+# o.name: a field when the object has one, else the method called with no
+# arguments.
+make a function called rt_member takes v, m returns r
+  require rt_live(v) and (value_class(m) == 8)
+  if rt_is_object(v) then
+    let fields = rt_fields(v)
+    let i = rt_pairs_index(fields, m)
+    if i >= 0 then
+      let r = fields[i][1]
+      ensure rt_live(r)
+      return r
+    end
+  end
+  let r = send(v, m)
+  ensure rt_live(r)
+  return r
+end
+
+# send(o, m, args...): "set" sets a field; any other is the method's call,
+# the object first. A name finds a named object.
+make a function called send takes v, m, rest returns r
+  require rt_live(v) and (value_class(m) == 8) and (value_class(rest) == 9)
+  let o = rt_resolve(v)
+  if m == "set" then
+    let r = rt_field_set(o, rest[0], rest[1])
+    ensure rt_live(r)
+    return r
+  end
+  let f = rt_find_method(rt_class_by_id(value_class(o)), m)
+  if f == false then
+    print("no method " + m + " for " + type_of(o))
+    let r = extern_call("KERNEL32.DLL", "ExitProcess", 75)
+    ensure rt_live(r)
+    return r
+  end
+  let r = rt_apply(f, list_push(rt_list_alloc(0), o) + rest)
+  ensure rt_live(r)
+  return r
+end
+
+# f's call with the arguments in a list.
+make a function called rt_apply takes f, args returns r
+  require (value_class(f) == 10) and (value_class(args) == 9) and (list_len(args) <= 8)
+  let n = list_len(args)
+  if n == 0 then
+    let r = f()
+    ensure rt_live(r)
+    return r
+  end
+  if n == 1 then
+    let r = f(args[0])
+    ensure rt_live(r)
+    return r
+  end
+  if n == 2 then
+    let r = f(args[0], args[1])
+    ensure rt_live(r)
+    return r
+  end
+  if n == 3 then
+    let r = f(args[0], args[1], args[2])
+    ensure rt_live(r)
+    return r
+  end
+  if n == 4 then
+    let r = f(args[0], args[1], args[2], args[3])
+    ensure rt_live(r)
+    return r
+  end
+  if n == 5 then
+    let r = f(args[0], args[1], args[2], args[3], args[4])
+    ensure rt_live(r)
+    return r
+  end
+  if n == 6 then
+    let r = f(args[0], args[1], args[2], args[3], args[4], args[5])
+    ensure rt_live(r)
+    return r
+  end
+  if n == 7 then
+    let r = f(args[0], args[1], args[2], args[3], args[4], args[5], args[6])
+    ensure rt_live(r)
+    return r
+  end
+  let r = f(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7])
+  ensure rt_live(r)
+  return r
+end
+
+make a function called rt_class_name takes cid returns name
+  require (value_class(cid) == 2)
+  let rec = rt_class_by_id(cid)
+  if rec == false then
+    let name = "object"
+    ensure value_class(name) == 8
+    return name
+  end
+  let name = rec[0]
+  ensure value_class(name) == 8
+  return name
+end
+
+# ---- events ----
+
+make a function called rt_declare_raises takes cid, event returns r
+  require (value_class(cid) == 2) and (value_class(event) == 8)
+  rt_global_set(4128, list_push(rt_global_get(4128), [cid, event]))
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# when EVENT: the handler is called for every emit of EVENT; the classes
+# whose methods raise it are flagged, so their operators look for it.
+make a function called rt_on takes event, handler returns r
+  require (value_class(event) == 8) and (value_class(handler) == 10)
+  rt_global_set(4096, list_push(rt_global_get(4096), [event, handler]))
+  let raises = rt_global_get(4128)
+  let k = 0
+  while k < list_len(raises) do
+    if raises[k][1] == event then
+      let cid = raises[k][0]
+      if cid < 256 then
+        mem_store(runtime_state(), word_add(2048, word_mul(8, cid)), 1)
+      end
+    end
+    let k = word_add(k, 1)
+  end
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+make a function called rt_event_flag takes cid returns on
+  require (value_class(cid) == 2) and (cid >= 0)
+  if cid >= 256 then
+    let on = true
+    ensure value_class(on) == 1
+    return on
+  end
+  let on = mem_load(runtime_state(), word_add(2048, word_mul(8, cid))) != 0
+  ensure value_class(on) == 1
+  return on
+end
+
+# The events whose handlers are running on this thread: a list kept in the
+# thread's context, unit (an empty list) until the first emit.
+make a function called rt_active_events returns events
+  let v = mem_load_value(rt_context(), 2576)
+  if value_class(v) != 9 then
+    let events = []
+    ensure value_class(events) == 9
+    return events
+  end
+  let events = v
+  ensure value_class(events) == 9
+  return events
+end
+
+make a function called rt_set_active_events takes events returns r
+  require value_class(events) == 9
+  mem_store_value(rt_context(), 2576, events)
+  let r = 0
+  ensure value_class(mem_load_value(rt_context(), 2576)) == 9
+  return r
+end
+
+# Calls every handler for the event, unless its handlers are running now on
+# this thread: nothing a handler does raises its own event again (spec 1.4).
+make a function called emit takes event, data returns r
+  require (value_class(event) == 8) and rt_live(data)
+  let active = rt_active_events()
+  if rt_pairs_index_name(active, event) >= 0 then
+    let r = false
+    ensure value_class(r) == 1
+    return r
+  end
+  rt_set_active_events(list_push(active, event))
+  let handlers = rt_global_get(4096)
+  let k = 0
+  while k < list_len(handlers) do
+    if handlers[k][0] == event then
+      let h = handlers[k][1]
+      h(event, data)
+    end
+    let k = word_add(k, 1)
+  end
+  let still = rt_active_events()
+  let kept = []
+  let k = 0
+  while k < list_len(still) do
+    if still[k] != event then
+      let kept = list_push(kept, still[k])
+    end
+    let k = word_add(k, 1)
+  end
+  rt_set_active_events(kept)
+  let r = true
+  ensure value_class(r) == 1
+  return r
+end
+
+make a function called rt_pairs_index_name takes names, x returns i
+  require (value_class(names) == 9)
+  let k = 0
+  while k < list_len(names) do
+    if names[k] == x then
+      let i = k
+      ensure (i >= 0 - 1) and (i < list_len(names))
+      return i
+    end
+    let k = word_add(k, 1)
+  end
+  let i = 0 - 1
+  ensure (i >= 0 - 1) and (i < list_len(names))
+  return i
+end
+
+# ---- the built-in classes and their methods, declared in PatLang ----
+
+make a function called rt_builtin_classes returns r
+  let shared = [["to_s", |v| { return to_s(v) }], ["length", |v| { return dot_length(v) }]]
+  let names = ["unit", "bool", "int", "float", "bigint", "rational", "complex", "interval", "string", "list", "closure", "string_builder", "vec", "bool_array"]
+  let k = 0
+  while k < list_len(names) do
+    if k != 2 then
+      rt_class_def(names[k], k, "", [], shared, [])
+    end
+    let k = word_add(k, 1)
+  end
+  # int's + raises added_to, once for each operand, then added (spec 1.4)
+  let plus = [["+", |a, b| { return rt_int_plus_events(a, b) }]]
+  rt_class_def("int", 2, "", [], v2_list_concat(plus, shared), [])
+  rt_declare_raises(2, "added_to")
+  rt_declare_raises(2, "added")
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+make a function called v2_list_concat takes a, b returns out
+  require (value_class(a) == 9) and (value_class(b) == 9)
+  let out = a
+  let k = 0
+  while k < list_len(b) do
+    let out = list_push(out, b[k])
+    let k = word_add(k, 1)
+  end
+  ensure list_len(out) == list_len(a) + list_len(b)
+  return out
+end
+
+make a function called rt_int_plus_events takes a, b returns r
+  require (value_class(a) == 2) and (value_class(b) == 2)
+  let r = op_add_quiet(a, b)
+  emit("added_to", [a, b])
+  emit("added_to", [b, a])
+  emit("added", [a, b, r])
+  ensure rt_is_integer(r)
+  return r
+end

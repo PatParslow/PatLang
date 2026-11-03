@@ -1,0 +1,815 @@
+# v2 code generation: one function's IR (ir.patlang) to NASM-subset text for
+# self_hosting/lib/x64_asm.patlang. Values are two words
+# (docs/plans/v2-implementation.md, section 2): slot s's type word is at
+# [rbp-(16s+16)], its data word at [rbp-(16s+8)]. Parameter i arrives at
+# [rbp+16+16i] (type) and [rbp+24+16i] (data). A result returns in rax
+# (type word) and rdx (data word).
+
+make a function called xv_nl returns s
+  return chr(10)
+end
+
+# A function's assembly name: f_ and its name, any character other than a
+# letter, digit or underscore written as _xNN_.
+make a function called xv_sym takes name returns sym
+  let b = sb_new()
+  sb_push(b, "f_")
+  let i = 0
+  while i < name.length do
+    let c = char_code(name, i)
+    let ok = ((c >= 48) and (c <= 57)) or ((c >= 65) and (c <= 90)) or ((c >= 97) and (c <= 122)) or (c == 95)
+    if ok then
+      sb_push(b, chr(c))
+    else
+      sb_push(b, "_x" + c + "_")
+    end
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+make a function called xv_t takes s returns mem
+  return "[rbp-" + (16 * s + 16) + "]"
+end
+
+make a function called xv_d takes s returns mem
+  return "[rbp-" + (16 * s + 8) + "]"
+end
+
+make a function called xv_line takes b, text returns done
+  sb_push(b, "    " + text + xv_nl())
+  return true
+end
+
+make a function called xv_label takes fname, n returns l
+  return ".L" + n
+end
+
+# The class ids (docs/plans/v2-implementation.md, section 2).
+make a function called xv_class_of_kind takes kind returns id
+  if kind == "unit" then
+    return 0
+  end
+  if kind == "bool" then
+    return 1
+  end
+  if kind == "int" then
+    return 2
+  end
+  if kind == "float" then
+    return 3
+  end
+  return 0 - 1
+end
+
+# Store rax as an int into slot d.
+make a function called xv_store_int takes b, d returns done
+  xv_line(b, "mov rcx, 2")
+  xv_line(b, "mov " + xv_t(d) + ", rcx")
+  xv_line(b, "mov " + xv_d(d) + ", rax")
+  return true
+end
+
+make a function called xv_store_result takes b, d returns done
+  xv_line(b, "mov " + xv_t(d) + ", rax")
+  xv_line(b, "mov " + xv_d(d) + ", rdx")
+  return true
+end
+
+make a function called xv_push_arg takes b, s returns done
+  xv_line(b, "push qword " + xv_d(s))
+  xv_line(b, "push qword " + xv_t(s))
+  return true
+end
+
+# A call: the arguments pushed last first, popped after.
+make a function called xv_call takes b, name, slots, d returns done
+  let i = list_len(slots) - 1
+  while i >= 0 do
+    xv_push_arg(b, slots[i])
+    let i = i - 1
+  end
+  xv_line(b, "call " + xv_sym(name))
+  if list_len(slots) > 0 then
+    xv_line(b, "add rsp, " + (16 * list_len(slots)))
+  end
+  xv_store_result(b, d)
+  return true
+end
+
+# The runtime function an operator falls back to when its fast path does
+# not apply.
+make a function called xv_op_fn takes op returns name
+  if op == "+" then
+    return "op_add"
+  end
+  if op == "q+" then
+    return "op_add_quiet"
+  end
+  if op == "-" then
+    return "op_sub"
+  end
+  if op == "*" then
+    return "op_mul"
+  end
+  if op == "/" then
+    return "op_div"
+  end
+  if op == "%" then
+    return "op_mod"
+  end
+  if op == "<" then
+    return "op_lt"
+  end
+  if op == ">" then
+    return "op_gt"
+  end
+  if op == "<=" then
+    return "op_le"
+  end
+  if op == ">=" then
+    return "op_ge"
+  end
+  if op == "==" then
+    return "op_eq"
+  end
+  if op == "!=" then
+    return "op_ne"
+  end
+  if op == "band" then
+    return "op_band"
+  end
+  if op == "bor" then
+    return "op_bor"
+  end
+  if op == "bxor" then
+    return "op_bxor"
+  end
+  if op == "shl" then
+    return "op_shl"
+  end
+  if op == "shr" then
+    return "op_shr"
+  end
+  return "op_unknown"
+end
+
+make a function called xv_cmp_jump takes op returns j
+  if op == "<" then
+    return "jl"
+  end
+  if op == ">" then
+    return "jg"
+  end
+  if op == "<=" then
+    return "jle"
+  end
+  if op == ">=" then
+    return "jge"
+  end
+  if op == "==" then
+    return "je"
+  end
+  return "jne"
+end
+
+# a op b. For two ints: + - * inline, an overflow taking the slow path;
+# comparisons inline. Anything else: the operator's runtime function.
+make a function called xv_op takes b, op, d, a, c, n, plus_events returns done
+  let slow = ".op_slow_" + n
+  let done = ".op_done_" + n
+  let arith = (op == "+") or (op == "q+") or (op == "-") or (op == "*")
+  let cmp = (op == "<") or (op == ">") or (op == "<=") or (op == ">=") or (op == "==") or (op == "!=")
+  let bits = (op == "band") or (op == "bor") or (op == "bxor") or (op == "shl") or (op == "shr") or (op == "%")
+  if bits then
+    xv_line(b, "mov rax, " + xv_t(a))
+    xv_line(b, "cmp rax, 2")
+    xv_line(b, "jne " + slow)
+    xv_line(b, "mov rax, " + xv_t(c))
+    xv_line(b, "cmp rax, 2")
+    xv_line(b, "jne " + slow)
+    xv_line(b, "mov rax, " + xv_d(a))
+    xv_line(b, "mov rcx, " + xv_d(c))
+    if op == "band" then
+      xv_line(b, "and rax, rcx")
+    elif op == "bor" then
+      xv_line(b, "or rax, rcx")
+    elif op == "bxor" then
+      xv_line(b, "xor rax, rcx")
+    elif op == "shl" then
+      xv_line(b, "shl rax, cl")
+    elif op == "shr" then
+      xv_line(b, "sar rax, cl")
+    else
+      # a zero divisor takes the slow path, which reports it
+      xv_line(b, "test rcx, rcx")
+      xv_line(b, "jz " + slow)
+      xv_line(b, "cqo")
+      xv_line(b, "idiv rcx")
+      xv_line(b, "mov rax, rdx")
+    end
+    xv_store_int(b, d)
+    xv_line(b, "jmp " + done)
+  end
+  if arith or cmp then
+    xv_line(b, "mov rax, " + xv_t(a))
+    xv_line(b, "cmp rax, 2")
+    xv_line(b, "jne " + slow)
+    xv_line(b, "mov rax, " + xv_t(c))
+    xv_line(b, "cmp rax, 2")
+    xv_line(b, "jne " + slow)
+    if (op == "+") and plus_events then
+      # int's event flag (runtime/objects.patlang): with a handler for its
+      # events, + takes the slow path, which raises them
+      xv_line(b, "lea rax, [rel v2_runtime_state]")
+      xv_line(b, "mov rax, [rax+2064]")
+      xv_line(b, "test rax, rax")
+      xv_line(b, "jne " + slow)
+    end
+    xv_line(b, "mov rax, " + xv_d(a))
+    xv_line(b, "mov rcx, " + xv_d(c))
+    if arith then
+      if (op == "+") or (op == "q+") then
+        xv_line(b, "add rax, rcx")
+      elif op == "-" then
+        xv_line(b, "sub rax, rcx")
+      else
+        xv_line(b, "imul rax, rcx")
+      end
+      xv_line(b, "jo " + slow)
+      xv_store_int(b, d)
+    else
+      xv_line(b, "cmp rax, rcx")
+      xv_line(b, "mov rax, 1")
+      xv_line(b, xv_cmp_jump(op) + " " + done + "_t")
+      xv_line(b, "mov rax, 0")
+      sb_push(b, done + "_t:" + xv_nl())
+      xv_line(b, "mov rcx, 1")
+      xv_line(b, "mov " + xv_t(d) + ", rcx")
+      xv_line(b, "mov " + xv_d(d) + ", rax")
+    end
+    xv_line(b, "jmp " + done)
+  end
+  sb_push(b, slow + ":" + xv_nl())
+  xv_call(b, xv_op_fn(op), [a, c], d)
+  sb_push(b, done + ":" + xv_nl())
+  return true
+end
+
+make a function called xv_un takes b, op, d, a, n returns done
+  let slow = ".un_slow_" + n
+  let done = ".un_done_" + n
+  if op == "-" then
+    xv_line(b, "mov rax, " + xv_t(a))
+    xv_line(b, "cmp rax, 2")
+    xv_line(b, "jne " + slow)
+    xv_line(b, "mov rax, " + xv_d(a))
+    xv_line(b, "neg rax")
+    xv_line(b, "jo " + slow)
+    xv_store_int(b, d)
+    xv_line(b, "jmp " + done)
+    sb_push(b, slow + ":" + xv_nl())
+    xv_call(b, "op_neg", [a], d)
+  else
+    xv_line(b, "mov rax, " + xv_t(a))
+    xv_line(b, "cmp rax, 1")
+    xv_line(b, "jne " + slow)
+    xv_line(b, "mov rax, " + xv_d(a))
+    xv_line(b, "xor rax, 1")
+    xv_line(b, "mov rcx, 1")
+    xv_line(b, "mov " + xv_t(d) + ", rcx")
+    xv_line(b, "mov " + xv_d(d) + ", rax")
+    xv_line(b, "jmp " + done)
+    sb_push(b, slow + ":" + xv_nl())
+    xv_call(b, "op_not", [a], d)
+  end
+  sb_push(b, done + ":" + xv_nl())
+  return true
+end
+
+# Machine primitives (ir_prim_arity). A word result is an int.
+make a function called xv_prim takes b, name, d, args, n returns done
+  if name == "value_class" then
+    xv_line(b, "mov rax, " + xv_t(args[0]))
+    xv_line(b, "mov rcx, 4294967295")
+    xv_line(b, "and rax, rcx")
+    return xv_store_int(b, d)
+  end
+  if name == "value_data" then
+    xv_line(b, "mov rax, " + xv_d(args[0]))
+    return xv_store_int(b, d)
+  end
+  if name == "value_type_word" then
+    xv_line(b, "mov rax, " + xv_t(args[0]))
+    return xv_store_int(b, d)
+  end
+  if name == "value_make" then
+    xv_line(b, "mov rax, " + xv_d(args[0]))
+    xv_line(b, "mov rdx, " + xv_d(args[1]))
+    return xv_store_result(b, d)
+  end
+  if name == "runtime_state" then
+    xv_line(b, "lea rax, [rel v2_runtime_state]")
+    return xv_store_int(b, d)
+  end
+  if name == "thread_entry_address" then
+    xv_line(b, "lea rax, [rel v2_thread_entry]")
+    return xv_store_int(b, d)
+  end
+  if name == "atomic_add" then
+    xv_line(b, "mov rax, " + xv_d(args[0]))
+    xv_line(b, "mov rcx, " + xv_d(args[1]))
+    xv_line(b, "lock xadd [rax], rcx")
+    xv_line(b, "mov rax, rcx")
+    return xv_store_int(b, d)
+  end
+  if name == "mem_load_value" then
+    # the value read, with a reference of its own (rule 1)
+    xv_line(b, "mov rax, " + xv_d(args[0]))
+    xv_line(b, "mov rcx, " + xv_d(args[1]))
+    xv_line(b, "add rax, rcx")
+    xv_line(b, "mov rcx, [rax]")
+    xv_line(b, "mov " + xv_t(d) + ", rcx")
+    xv_line(b, "mov rcx, [rax+8]")
+    xv_line(b, "mov " + xv_d(d) + ", rcx")
+    return xv_count(b, "rt_retain", d, "ml" + n)
+  end
+  if name == "mem_take_value" then
+    # the value moved out, the memory left unit: no count changes
+    xv_line(b, "mov rax, " + xv_d(args[0]))
+    xv_line(b, "mov rcx, " + xv_d(args[1]))
+    xv_line(b, "add rax, rcx")
+    xv_line(b, "mov rcx, [rax]")
+    xv_line(b, "mov " + xv_t(d) + ", rcx")
+    xv_line(b, "mov rcx, [rax+8]")
+    xv_line(b, "mov " + xv_d(d) + ", rcx")
+    xv_line(b, "mov rcx, 0")
+    xv_line(b, "mov [rax], rcx")
+    xv_line(b, "mov [rax+8], rcx")
+    return true
+  end
+  if (name == "mem_store_value") or (name == "mem_init_value") then
+    # the memory takes a reference to the value (rule 3); mem_store_value
+    # releases the value it overwrites, read into d first
+    xv_count(b, "rt_retain", args[2], "ms" + n)
+    if name == "mem_store_value" then
+      xv_line(b, "mov rax, " + xv_d(args[0]))
+      xv_line(b, "mov rcx, " + xv_d(args[1]))
+      xv_line(b, "add rax, rcx")
+      xv_line(b, "mov rcx, [rax]")
+      xv_line(b, "mov " + xv_t(d) + ", rcx")
+      xv_line(b, "mov rcx, [rax+8]")
+      xv_line(b, "mov " + xv_d(d) + ", rcx")
+      xv_count(b, "rt_release", d, "mo" + n)
+    end
+    xv_line(b, "mov rax, " + xv_d(args[0]))
+    xv_line(b, "mov rcx, " + xv_d(args[1]))
+    xv_line(b, "add rax, rcx")
+    xv_line(b, "mov rcx, " + xv_t(args[2]))
+    xv_line(b, "mov [rax], rcx")
+    xv_line(b, "mov rcx, " + xv_d(args[2]))
+    xv_line(b, "mov [rax+8], rcx")
+    xv_line(b, "mov rax, 0")
+    xv_line(b, "mov " + xv_t(d) + ", rax")
+    xv_line(b, "mov " + xv_d(d) + ", rax")
+    return true
+  end
+  if (name == "mem_load") or (name == "mem_load_byte") or (name == "mem_store") or (name == "mem_store_byte") then
+    xv_line(b, "mov rax, " + xv_d(args[0]))
+    xv_line(b, "mov rcx, " + xv_d(args[1]))
+    xv_line(b, "add rax, rcx")
+    if name == "mem_load" then
+      xv_line(b, "mov rax, [rax]")
+      return xv_store_int(b, d)
+    end
+    if name == "mem_load_byte" then
+      xv_line(b, "movzx rax, byte [rax]")
+      return xv_store_int(b, d)
+    end
+    xv_line(b, "mov rcx, " + xv_d(args[2]))
+    if name == "mem_store" then
+      xv_line(b, "mov [rax], rcx")
+    else
+      xv_line(b, "mov byte [rax], cl")
+    end
+    xv_line(b, "mov rax, 0")
+    xv_line(b, "mov " + xv_t(d) + ", rax")
+    xv_line(b, "mov " + xv_d(d) + ", rax")
+    return true
+  end
+  if (name == "int_to_float") or (name == "float_to_int") then
+    xv_line(b, "mov rax, " + xv_d(args[0]))
+    if name == "int_to_float" then
+      xv_line(b, "cvtsi2sd xmm0, rax")
+      xv_line(b, "movq rax, xmm0")
+    else
+      xv_line(b, "movq xmm0, rax")
+      xv_line(b, "cvttsd2si rax, xmm0")
+    end
+    return xv_store_int(b, d)
+  end
+  if (name == "float_add") or (name == "float_sub") or (name == "float_mul") or (name == "float_div") or (name == "float_lt") or (name == "float_eq") then
+    xv_line(b, "mov rax, " + xv_d(args[0]))
+    xv_line(b, "movq xmm0, rax")
+    xv_line(b, "mov rax, " + xv_d(args[1]))
+    xv_line(b, "movq xmm1, rax")
+    if name == "float_lt" then
+      # 1 when a < b, that is b > a: CF and ZF both clear after b ? a
+      xv_line(b, "ucomisd xmm1, xmm0")
+      xv_line(b, "mov rax, 0")
+      xv_line(b, "seta al")
+      return xv_store_int(b, d)
+    end
+    if name == "float_eq" then
+      # 1 when ZF is set and the comparison was ordered (PF clear)
+      xv_line(b, "ucomisd xmm0, xmm1")
+      xv_line(b, "mov rax, 0")
+      xv_line(b, "jne .fe_" + n)
+      xv_line(b, "mov rax, 1")
+      sb_push(b, ".fe_" + n + ":" + xv_nl())
+      return xv_store_int(b, d)
+    end
+    if name == "float_add" then
+      xv_line(b, "addsd xmm0, xmm1")
+    elif name == "float_sub" then
+      xv_line(b, "subsd xmm0, xmm1")
+    elif name == "float_mul" then
+      xv_line(b, "mulsd xmm0, xmm1")
+    else
+      xv_line(b, "divsd xmm0, xmm1")
+    end
+    xv_line(b, "movq rax, xmm0")
+    return xv_store_int(b, d)
+  end
+  xv_line(b, "mov rax, " + xv_d(args[0]))
+  xv_line(b, "mov rcx, " + xv_d(args[1]))
+  if name == "word_add" then
+    xv_line(b, "add rax, rcx")
+  elif name == "word_sub" then
+    xv_line(b, "sub rax, rcx")
+  elif name == "word_mul" then
+    xv_line(b, "imul rax, rcx")
+  elif name == "word_and" then
+    xv_line(b, "and rax, rcx")
+  elif name == "word_or" then
+    xv_line(b, "or rax, rcx")
+  elif name == "word_xor" then
+    xv_line(b, "xor rax, rcx")
+  elif name == "word_shl" then
+    xv_line(b, "shl rax, cl")
+  elif name == "word_shr" then
+    xv_line(b, "shr rax, cl")
+  elif (name == "word_div") or (name == "word_rem") then
+    xv_line(b, "cqo")
+    xv_line(b, "idiv rcx")
+    if name == "word_rem" then
+      xv_line(b, "mov rax, rdx")
+    end
+  end
+  return xv_store_int(b, d)
+end
+
+# A Windows x64 call: rsp aligned, 32 bytes of shadow space, the first four
+# words in rcx, rdx, r8, r9 and the rest on the stack after the shadow
+# space. rsp is restored from rbp after it (frame_bytes below rbp).
+make a function called xv_extern takes b, fname, d, args, frame_bytes, floats returns done
+  let n = list_len(args)
+  let extra = 0
+  if n > 4 then
+    let extra = 8 * (n - 4)
+  end
+  let space = 32 + extra
+  if (space % 16) != 0 then
+    let space = space + 8
+  end
+  xv_line(b, "and rsp, -16")
+  xv_line(b, "sub rsp, " + space)
+  let k = 4
+  while k < n do
+    xv_line(b, "mov rax, " + xv_d(args[k]))
+    xv_line(b, "mov [rsp+" + (32 + 8 * (k - 4)) + "], rax")
+    let k = k + 1
+  end
+  let regs = ["rcx", "rdx", "r8", "r9"]
+  let xregs = ["xmm0", "xmm1", "xmm2", "xmm3"]
+  let k = 0
+  while (k < n) and (k < 4) do
+    if floats then
+      xv_line(b, "mov rax, " + xv_d(args[k]))
+      xv_line(b, "movq " + xregs[k] + ", rax")
+    else
+      xv_line(b, "mov " + regs[k] + ", " + xv_d(args[k]))
+    end
+    let k = k + 1
+  end
+  xv_line(b, "call " + fname)
+  if floats then
+    xv_line(b, "movq rax, xmm0")
+  end
+  xv_line(b, "lea rsp, [rbp-" + frame_bytes + "]")
+  return xv_store_int(b, d)
+end
+
+# retain/release (ownership stage only): a call to the runtime's rt_retain
+# or rt_release, made only when the type word's heap bit (bit 32) is set.
+# rt_retain/rt_release take the value's type word and data word as two
+# ints, so compiling them by the ownership rules calls nothing.
+make a function called xv_count takes b, which, s, n returns done
+  let skip = ".rc_skip_" + n
+  xv_line(b, "mov rax, " + xv_t(s))
+  xv_line(b, "mov rcx, 4294967296")
+  xv_line(b, "test rax, rcx")
+  xv_line(b, "jz " + skip)
+  xv_line(b, "push qword " + xv_d(s))
+  xv_line(b, "mov rax, 2")
+  xv_line(b, "push rax")
+  xv_line(b, "push qword " + xv_t(s))
+  xv_line(b, "push rax")
+  xv_line(b, "call " + xv_sym(which))
+  xv_line(b, "add rsp, 32")
+  sb_push(b, skip + ":" + xv_nl())
+  return true
+end
+
+# A string literal is data laid out as a heap string ([count][size][len]
+# [bytes]) with its heap bit clear, so it is read like one and never counted.
+make a function called xv_str_data takes label, text returns asm
+  let b = sb_new()
+  sb_push(b, "align 8" + xv_nl())
+  sb_push(b, label + ":" + xv_nl())
+  sb_push(b, "    dq 0, 0, " + text.length + xv_nl())
+  if text.length > 0 then
+    let i = 0
+    while i < text.length do
+      let line = sb_new()
+      sb_push(line, "    db ")
+      let k = 0
+      while (k < 32) and (i < text.length) do
+        if k > 0 then
+          sb_push(line, ", ")
+        end
+        sb_push(line, char_code(text, i) + "")
+        let k = k + 1
+        let i = i + 1
+      end
+      sb_push(b, sb_str(line) + xv_nl())
+    end
+  end
+  return sb_str(b)
+end
+
+# A list literal: rt_list_alloc(n), then each element, with a reference of
+# its own (rule 3), written at block + 32 + 16k.
+make a function called xv_list takes b, d, slots, n returns done
+  let count = list_len(slots)
+  xv_line(b, "mov rax, " + count)
+  xv_line(b, "push rax")
+  xv_line(b, "mov rax, 2")
+  xv_line(b, "push rax")
+  xv_line(b, "call " + xv_sym("rt_list_alloc"))
+  xv_line(b, "add rsp, 16")
+  xv_store_result(b, d)
+  let k = 0
+  while k < count do
+    xv_count(b, "rt_retain", slots[k], "li" + n + "_" + k)
+    xv_line(b, "mov rax, " + xv_d(d))
+    xv_line(b, "mov rcx, " + xv_t(slots[k]))
+    xv_line(b, "mov [rax+" + (32 + 16 * k) + "], rcx")
+    xv_line(b, "mov rcx, " + xv_d(slots[k]))
+    xv_line(b, "mov [rax+" + (40 + 16 * k) + "], rcx")
+    let k = k + 1
+  end
+  return true
+end
+
+# A closure: rt_closure_alloc(n), its code address at block + 16, then each
+# captured value, with a reference of its own, at block + 32 + 16k.
+make a function called xv_closure takes b, d, fname, slots, n returns done
+  let count = list_len(slots)
+  xv_line(b, "mov rax, " + count)
+  xv_line(b, "push rax")
+  xv_line(b, "mov rax, 2")
+  xv_line(b, "push rax")
+  xv_line(b, "call " + xv_sym("rt_closure_alloc"))
+  xv_line(b, "add rsp, 16")
+  xv_store_result(b, d)
+  xv_line(b, "mov rcx, " + xv_d(d))
+  xv_line(b, "lea rax, [rel " + xv_sym(fname) + "]")
+  xv_line(b, "mov [rcx+16], rax")
+  let k = 0
+  while k < count do
+    xv_count(b, "rt_retain", slots[k], "cl" + n + "_" + k)
+    xv_line(b, "mov rax, " + xv_d(d))
+    xv_line(b, "mov rcx, " + xv_t(slots[k]))
+    xv_line(b, "mov [rax+" + (32 + 16 * k) + "], rcx")
+    xv_line(b, "mov rcx, " + xv_d(slots[k]))
+    xv_line(b, "mov [rax+" + (40 + 16 * k) + "], rcx")
+    let k = k + 1
+  end
+  return true
+end
+
+# A call of the closure in slots[0]: every slot pushed as an argument, the
+# closure first, then a call to the code address it holds.
+make a function called xv_callv takes b, d, slots returns done
+  let i = list_len(slots) - 1
+  while i >= 0 do
+    xv_push_arg(b, slots[i])
+    let i = i - 1
+  end
+  xv_line(b, "mov rax, " + xv_d(slots[0]))
+  xv_line(b, "mov rax, [rax+16]")
+  xv_line(b, "call rax")
+  xv_line(b, "add rsp, " + (16 * list_len(slots)))
+  xv_store_result(b, d)
+  return true
+end
+
+make a function called xv_const takes b, ins, data, label returns done
+  let d = ins[1]
+  let kind = ins[2]
+  if kind == "str" then
+    sb_push(data, xv_str_data(label, ins[3]))
+    xv_line(b, "mov rax, 8")
+    xv_line(b, "mov " + xv_t(d) + ", rax")
+    xv_line(b, "lea rax, [rel " + label + "]")
+    xv_line(b, "mov " + xv_d(d) + ", rax")
+    return true
+  end
+  if kind == "float" then
+    let bits = float_to_bits(to_num(ins[3]))
+    if bits >= 9223372036854775808 then
+      let bits = bits - 18446744073709551616
+    end
+    xv_line(b, "mov rax, 3")
+    xv_line(b, "mov " + xv_t(d) + ", rax")
+    xv_line(b, "mov rax, " + bits)
+    xv_line(b, "mov " + xv_d(d) + ", rax")
+    return true
+  end
+  let cls = xv_class_of_kind(kind)
+  if cls < 0 then
+    xv_line(b, "; unsupported constant kind " + kind)
+    return false
+  end
+  xv_line(b, "mov rax, " + cls)
+  xv_line(b, "mov " + xv_t(d) + ", rax")
+  if (kind == "unit") then
+    xv_line(b, "mov rax, 0")
+  else
+    xv_line(b, "mov rax, " + ins[3])
+  end
+  xv_line(b, "mov " + xv_d(d) + ", rax")
+  return true
+end
+
+# What code generation reads of the program facts (lower.patlang,
+# lw_program), and all it reads: whether some `when` handles int's +
+# events, added_to or added (runtime/objects.patlang). A function's code
+# depends on the facts through this alone, so it is what a job's key
+# holds (jobs.patlang).
+make a function called xv_facts_used takes facts returns used
+  return [v2_contains(facts[0], "added") or v2_contains(facts[0], "added_to")]
+end
+
+# facts: the program facts.
+make a function called xv_fn_asm takes func, facts returns asm
+  require ir_well_formed(func, true)
+  # int's + tests its event flag only when its events are handled
+  let plus_events = xv_facts_used(facts)[0]
+  let b = sb_new()
+  let name = ir_fn_name(func)
+  let nslots = ir_fn_nslots(func)
+  let frame_bytes = 16 * nslots
+  let sym = xv_sym(name)
+  sb_push(b, "global " + sym + xv_nl())
+  sb_push(b, sym + ":" + xv_nl())
+  xv_line(b, "push rbp")
+  xv_line(b, "mov rbp, rsp")
+  if frame_bytes > 0 then
+    xv_line(b, "sub rsp, " + frame_bytes)
+    xv_line(b, "mov rax, 0")
+    let s = 0
+    while s < nslots do
+      xv_line(b, "mov " + xv_t(s) + ", rax")
+      let s = s + 1
+    end
+  end
+  let p = 0
+  while p < ir_fn_nparams(func) do
+    xv_line(b, "mov rax, [rbp+" + (16 + 16 * p) + "]")
+    xv_line(b, "mov " + xv_t(p) + ", rax")
+    xv_line(b, "mov rax, [rbp+" + (24 + 16 * p) + "]")
+    xv_line(b, "mov " + xv_d(p) + ", rax")
+    let p = p + 1
+  end
+  let data = sb_new()
+  let instrs = ir_fn_instrs(func)
+  let i = 0
+  while i < list_len(instrs) do
+    let ins = instrs[i]
+    let op = ins[0]
+    if op == "const" then
+      xv_const(b, ins, data, sym + "_s" + i)
+    elif op == "copy" then
+      xv_line(b, "mov rax, " + xv_t(ins[2]))
+      xv_line(b, "mov " + xv_t(ins[1]) + ", rax")
+      xv_line(b, "mov rax, " + xv_d(ins[2]))
+      xv_line(b, "mov " + xv_d(ins[1]) + ", rax")
+    elif op == "call" then
+      xv_call(b, ins[2], ins[3], ins[1])
+    elif op == "op" then
+      xv_op(b, ins[2], ins[1], ins[3], ins[4], i, plus_events)
+    elif op == "un" then
+      xv_un(b, ins[2], ins[1], ins[3], i)
+    elif op == "prim" then
+      xv_prim(b, ins[2], ins[1], ins[3], i)
+    elif op == "extern" then
+      xv_extern(b, ins[3], ins[1], ins[4], frame_bytes, false)
+    elif op == "externf" then
+      xv_extern(b, ins[3], ins[1], ins[4], frame_bytes, true)
+    elif op == "label" then
+      sb_push(b, xv_label(name, ins[1]) + ":" + xv_nl())
+    elif op == "jump" then
+      xv_line(b, "jmp " + xv_label(name, ins[1]))
+    elif op == "branch" then
+      xv_line(b, "mov rax, " + xv_d(ins[1]))
+      xv_line(b, "test rax, rax")
+      xv_line(b, "jz " + xv_label(name, ins[3]))
+      xv_line(b, "jmp " + xv_label(name, ins[2]))
+    elif op == "return" then
+      xv_line(b, "mov rax, " + xv_t(ins[1]))
+      xv_line(b, "mov rdx, " + xv_d(ins[1]))
+      xv_line(b, "leave")
+      xv_line(b, "ret")
+    elif op == "retain" then
+      xv_count(b, "rt_retain", ins[1], i)
+    elif op == "release" then
+      xv_count(b, "rt_release", ins[1], i)
+    elif op == "clear" then
+      xv_line(b, "mov rax, 0")
+      xv_line(b, "mov " + xv_t(ins[1]) + ", rax")
+    elif op == "list" then
+      xv_list(b, ins[1], ins[2], i)
+    elif op == "closure" then
+      xv_closure(b, ins[1], ins[2], ins[3], i)
+    elif op == "callv" then
+      xv_callv(b, ins[1], ins[2])
+    elif op == "move" then
+      xv_line(b, "mov rax, " + xv_t(ins[2]))
+      xv_line(b, "mov " + xv_t(ins[1]) + ", rax")
+      xv_line(b, "mov rax, " + xv_d(ins[2]))
+      xv_line(b, "mov " + xv_d(ins[1]) + ", rax")
+      xv_line(b, "mov rax, 0")
+      xv_line(b, "mov " + xv_t(ins[2]) + ", rax")
+    end
+    let i = i + 1
+  end
+  let d = sb_str(data)
+  if d.length > 0 then
+    sb_push(b, "section .data" + xv_nl())
+    sb_push(b, d)
+    sb_push(b, "section .text" + xv_nl())
+  end
+  let asm = sb_str(b)
+  # the text declares the function's symbol and defines it
+  ensure str_starts_with(asm, "global " + sym + xv_nl() + sym + ":")
+  return asm
+end
+
+# The program's entry: the runtime's initialisation, the program's
+# top-level statements (__main), then ExitProcess(0); and the runtime's
+# state area.
+make a function called xv_entry_asm returns asm
+  let b = sb_new()
+  sb_push(b, "default rel" + xv_nl())
+  sb_push(b, "section .text" + xv_nl())
+  sb_push(b, "global main" + xv_nl())
+  sb_push(b, "main:" + xv_nl())
+  xv_line(b, "push rbp")
+  xv_line(b, "mov rbp, rsp")
+  xv_line(b, "call " + xv_sym("runtime_init"))
+  xv_line(b, "call " + xv_sym("__main"))
+  xv_line(b, "and rsp, -16")
+  xv_line(b, "sub rsp, 32")
+  xv_line(b, "mov rcx, 0")
+  xv_line(b, "call ExitProcess")
+  # A thread's start (CreateThread, runtime/threads.patlang): the Windows
+  # convention passes the job in rcx; rt_thread_main(job) takes it as an
+  # int, and the thread's result is 0.
+  sb_push(b, "global v2_thread_entry" + xv_nl())
+  sb_push(b, "v2_thread_entry:" + xv_nl())
+  xv_line(b, "push rbp")
+  xv_line(b, "mov rbp, rsp")
+  xv_line(b, "push rcx")
+  xv_line(b, "mov rax, 2")
+  xv_line(b, "push rax")
+  xv_line(b, "call " + xv_sym("rt_thread_main"))
+  xv_line(b, "mov rax, 0")
+  xv_line(b, "leave")
+  xv_line(b, "ret")
+  sb_push(b, "section .bss" + xv_nl())
+  sb_push(b, "global v2_runtime_state" + xv_nl())
+  sb_push(b, "v2_runtime_state resb 65536" + xv_nl())
+  return sb_str(b)
+end

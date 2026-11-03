@@ -1,0 +1,431 @@
+# v2 jobs and artefacts (docs/plans/memory-design-review.md section 7;
+# docs/plans/v2-implementation.md, milestone 8).
+#
+# After the lowering, each function is one job: the ownership stage, code
+# generation and assembly, giving the function's chunk. A job's key is a
+# hash of everything its output depends on:
+#   - the function's IR;
+#   - what code generation reads of the program facts (B2:
+#     xv_facts_used);
+#   - the ownership summary of every function it calls (never their
+#     bodies);
+#   - the compiler: its stages' source text.
+# Its output is an artefact stored under that key, so a later build whose
+# job has the same key reuses it instead of running the job.
+#
+# The jobs run on a number of workers, each taking its share of the jobs
+# in the order given; the chunks are linked in declaration order whatever
+# order the jobs ran in, so any worker count gives the same executable.
+
+# ---- hashing: two 32-bit FNV-1a lanes ----
+
+make a function called jb_mix takes h, c returns out
+  let a = ((h[0] bxor c) * 16777619) % 4294967296
+  let b = ((h[1] bxor ((c + 101) % 256)) * 16777619) % 4294967296
+  return [a, b]
+end
+
+make a function called jb_hash_new returns h
+  return [2166136261, 84696351]
+end
+
+make a function called jb_mix_text takes h, s returns out
+  let h = jb_mix(h, 83)
+  let n = s.length
+  let h = jb_mix_int(h, n)
+  let i = 0
+  while i < n do
+    let h = jb_mix(h, char_code(s, i))
+    let i = i + 1
+  end
+  return h
+end
+
+make a function called jb_mix_int takes h, n returns out
+  let h = jb_mix(h, 73)
+  return jb_mix_text_plain(h, "" + n)
+end
+
+make a function called jb_mix_text_plain takes h, s returns out
+  let i = 0
+  while i < s.length do
+    let h = jb_mix(h, char_code(s, i))
+    let i = i + 1
+  end
+  return h
+end
+
+# A value's structure: a list's length then each element; a string's
+# length then its bytes; anything else its printed form, tagged.
+make a function called jb_mix_value takes h, v returns out
+  let t = type_of(v)
+  if t == "list" then
+    let h = jb_mix(h, 76)
+    let h = jb_mix_int(h, list_len(v))
+    let i = 0
+    while i < list_len(v) do
+      let h = jb_mix_value(h, v[i])
+      let i = i + 1
+    end
+    return h
+  end
+  if t == "string" then
+    return jb_mix_text(h, v)
+  end
+  let h = jb_mix(h, 79)
+  return jb_mix_text_plain(h, t + ":" + v)
+end
+
+# A file's bytes as a list (O(n) to walk, where indexing a large string is
+# not): read_file_bytes(path, offset, length) in 1 MB windows until one
+# comes back short.
+make a function called jb_read_bytes takes path returns bytes
+  let window = 1048576
+  let bytes = []
+  let offset = 0
+  let more = true
+  while more do
+    let part = read_file_bytes(path, offset, window)
+    let k = 0
+    while k < list_len(part) do
+      let bytes = list_push(bytes, part[k])
+      let k = k + 1
+    end
+    let offset = offset + list_len(part)
+    let more = list_len(part) == window
+  end
+  return bytes
+end
+
+make a function called jb_mix_file takes h, path returns out
+  let bytes = jb_read_bytes(path)
+  let h = jb_mix_int(h, list_len(bytes))
+  let i = 0
+  while i < list_len(bytes) do
+    let h = jb_mix(h, bytes[i])
+    let i = i + 1
+  end
+  return h
+end
+
+# A hash as text: its two lanes in decimal.
+make a function called jb_key_text takes h returns s
+  return "" + h[0] + "_" + h[1]
+end
+
+# ---- ownership summaries ----
+
+# What a caller may assume of a function: under the ownership stage's
+# uniform rules (own.patlang), every parameter is borrowed and the result
+# is owned by the caller. A function's arity is the only thing that varies.
+make a function called jb_summary takes func returns s
+  return [ir_fn_name(func), ir_fn_nparams(func), "borrows every parameter", "result owned by the caller"]
+end
+
+# The names a function calls.
+make a function called jb_callees takes func returns names
+  let names = []
+  let instrs = ir_fn_instrs(func)
+  let i = 0
+  while i < list_len(instrs) do
+    let ins = instrs[i]
+    if ins[0] == "call" then
+      if not v2_contains(names, ins[2]) then
+        let names = list_push(names, ins[2])
+      end
+    end
+    let i = i + 1
+  end
+  return names
+end
+
+# A table from a function's name to its summary: 1024 buckets by the
+# name's hash, each a list of [name, summary].
+make a function called jb_bucket takes name returns i
+  let h = jb_mix_text(jb_hash_new(), name)
+  return h[0] % 1024
+end
+
+make a function called jb_summaries takes fns returns table
+  let table = vec_new()
+  let i = 0
+  while i < 1024 do
+    vec_push(table, [])
+    let i = i + 1
+  end
+  let i = 0
+  while i < list_len(fns) do
+    let s = jb_summary(fns[i])
+    let k = jb_bucket(s[0])
+    vec_set(table, k, list_push(vec_get(table, k), [s[0], s]))
+    let i = i + 1
+  end
+  return table
+end
+
+make a function called jb_summary_of takes table, name returns s
+  let entries = vec_get(table, jb_bucket(name))
+  let i = 0
+  while i < list_len(entries) do
+    if entries[i][0] == name then
+      return entries[i][1]
+    end
+    let i = i + 1
+  end
+  # a runtime primitive, or a name the linker will report
+  return [name, "no summary"]
+end
+
+# ---- keys ----
+
+# The compiler's part of every key: its stages' sources.
+make a function called jb_compiler_hash returns h
+  let files = ["self_hosting/v2/ir.patlang", "self_hosting/v2/own.patlang", "self_hosting/v2/x64.patlang", "self_hosting/v2/jobs.patlang", "self_hosting/lib/x64_asm.patlang"]
+  let h = jb_hash_new()
+  let i = 0
+  while i < list_len(files) do
+    let h = jb_mix_file(h, files[i])
+    let i = i + 1
+  end
+  return h
+end
+
+make a function called jb_fn_key takes base, func, facts, table returns key
+  let h = jb_mix_value(base, xv_facts_used(facts))
+  let h = jb_mix_value(h, func)
+  let callees = jb_callees(func)
+  let i = 0
+  while i < list_len(callees) do
+    let h = jb_mix_value(h, jb_summary_of(table, callees[i]))
+    let i = i + 1
+  end
+  return jb_key_text(h)
+end
+
+# ---- chunk artefacts: the text and data sections' bytes as they are
+# (KEY.text, KEY.data), and the rest one record per line, fields
+# separated by spaces (KEY.chunk) ----
+#   t N               the text section's length
+#   d N               the data section's length
+#   b N               the bss size
+#   s NAME SECTION OFFSET GLOBAL(0|1)
+#   r SECTION OFFSET LABEL KIND ADDEND
+#   e NAME
+# A chunk with a name holding a space or line break is not stored.
+
+make a function called jb_plain takes s returns ok
+  let i = 0
+  while i < s.length do
+    let c = char_code(s, i)
+    if (c == 32) or (c == 10) or (c == 13) then
+      return false
+    end
+    let i = i + 1
+  end
+  return s.length > 0
+end
+
+make a function called jb_chunk_text takes chunk returns text
+  let b = sb_new()
+  sb_push(b, "t " + list_len(chunk[1]) + chr(10))
+  sb_push(b, "d " + list_len(chunk[2]) + chr(10))
+  sb_push(b, "b " + chunk[3] + chr(10))
+  let syms = chunk[4]
+  let i = 0
+  while i < list_len(syms) do
+    let s = syms[i]
+    if not (jb_plain(s[0]) and jb_plain(s[1])) then
+      return false
+    end
+    let g = 0
+    if s[3] then
+      let g = 1
+    end
+    sb_push(b, "s " + s[0] + " " + s[1] + " " + s[2] + " " + g + chr(10))
+    let i = i + 1
+  end
+  let relocs = chunk[5]
+  let i = 0
+  while i < list_len(relocs) do
+    let r = relocs[i]
+    if not (jb_plain(r[0]) and jb_plain(r[2]) and jb_plain(r[3])) then
+      return false
+    end
+    sb_push(b, "r " + r[0] + " " + r[1] + " " + r[2] + " " + r[3] + " " + r[4] + chr(10))
+    let i = i + 1
+  end
+  let ext = chunk[6]
+  let i = 0
+  while i < list_len(ext) do
+    if not jb_plain(ext[i]) then
+      return false
+    end
+    sb_push(b, "e " + ext[i] + chr(10))
+    let i = i + 1
+  end
+  return sb_str(b)
+end
+
+# A stored chunk back: its records' bytes (KEY.chunk), each line's fields
+# read byte by byte, then its sections from KEY.text and KEY.data.
+make a function called jb_chunk_from_bytes takes bytes, stem returns chunk
+  let text_bytes = []
+  let data_bytes = []
+  let bss = 0
+  let syms = []
+  let relocs = []
+  let ext = []
+  let n = list_len(bytes)
+  let i = 0
+  while i < n do
+    let fields = []
+    let field = sb_new()
+    let has = false
+    while (i < n) and (bytes[i] != 10) do
+      let c = bytes[i]
+      if c == 32 then
+        let fields = list_push(fields, sb_str(field))
+        let field = sb_new()
+      elif c != 13 then
+        sb_push(field, chr(c))
+      end
+      let i = i + 1
+    end
+    let fields = list_push(fields, sb_str(field))
+    let i = i + 1
+    let tag = fields[0]
+    if tag == "t" then
+      let text_bytes = read_file_bytes(stem + ".text", 0, to_num(fields[1]))
+    elif tag == "d" then
+      let data_bytes = read_file_bytes(stem + ".data", 0, to_num(fields[1]))
+    elif tag == "b" then
+      let bss = to_num(fields[1])
+    elif tag == "s" then
+      let syms = list_push(syms, [fields[1], fields[2], to_num(fields[3]), fields[4] == "1"])
+    elif tag == "r" then
+      let relocs = list_push(relocs, [fields[1], to_num(fields[2]), fields[3], fields[4], to_num(fields[5])])
+    elif tag == "e" then
+      let ext = list_push(ext, fields[1])
+    end
+  end
+  return ["ChunkImage", text_bytes, data_bytes, bss, syms, relocs, ext]
+end
+
+# ---- running the jobs ----
+
+make a function called jb_artefact_path takes dir, key, ext returns path
+  return dir + "/" + key + ext
+end
+
+# One job: [index, kind, payload, facts, key, dir]. Gives [index, chunk,
+# assembly text, "reused" or "built", [ms reading or generating code, ms
+# assembling, ms storing]]. kind "fn": payload is a function's
+# IR; kind "asm": payload is assembly text (the entry). Its artefacts are
+# the chunk (KEY.chunk) and the assembly text (KEY.asm); dir "" stores
+# nothing.
+make a function called jb_run_job takes job returns result
+  let dir = job[5]
+  let chunk_path = jb_artefact_path(dir, job[4], ".chunk")
+  let asm_path = jb_artefact_path(dir, job[4], ".asm")
+  let t0 = now_ms()
+  if (dir != "") and file_exists(chunk_path) and file_exists(asm_path) then
+    let chunk = jb_chunk_from_bytes(jb_read_bytes(chunk_path), jb_artefact_path(dir, job[4], ""))
+    return [job[0], chunk, read_file(asm_path), "reused", [now_ms() - t0, 0, 0]]
+  end
+  let asm = job[2]
+  if job[1] == "fn" then
+    let asm = xv_fn_asm(own_function(job[2]), job[3])
+  end
+  let t1 = now_ms()
+  let chunk = x64_assemble_chunk("section .text" + xv_nl() + asm)
+  let t2 = now_ms()
+  if (dir != "") and (chunk != false) then
+    let text = jb_chunk_text(chunk)
+    if text != false then
+      write_file(asm_path, asm)
+      write_file_bytes(jb_artefact_path(dir, job[4], ".text"), chunk[1])
+      write_file_bytes(jb_artefact_path(dir, job[4], ".data"), chunk[2])
+      # written last: a job's artefacts are complete once this exists
+      write_file(chunk_path, text)
+    end
+  end
+  return [job[0], chunk, asm, "built", [t1 - t0, t2 - t1, now_ms() - t2]]
+end
+
+# A worker's share: its jobs, run in the order given.
+make a function called jb_worker takes jobs returns results
+  let results = []
+  let i = 0
+  while i < list_len(jobs) do
+    let results = list_push(results, jb_run_job(jobs[i]))
+    let i = i + 1
+  end
+  return results
+end
+
+# The order the jobs become ready in: as given, or shuffled by a seed (a
+# linear congruential sequence), to show the output does not depend on it.
+make a function called jb_order takes n, seed returns order
+  let order = []
+  let i = 0
+  while i < n do
+    let order = list_push(order, i)
+    let i = i + 1
+  end
+  if seed == 0 then
+    return order
+  end
+  let x = seed
+  let i = n - 1
+  while i > 0 do
+    let x = (x * 1103515245 + 12345) % 2147483648
+    let j = x % (i + 1)
+    let t = order[i]
+    let order = list_set(order, i, order[j])
+    let order = list_set(order, j, t)
+    let i = i - 1
+  end
+  return order
+end
+
+# Runs every job on `workers` workers, the ready order shuffled by `seed`;
+# gives each job's [chunk, assembly text, how, times] in the jobs' own
+# order.
+make a function called jb_run_all takes jobs, workers, seed returns results
+  let order = jb_order(list_len(jobs), seed)
+  let shares = []
+  let w = 0
+  while w < workers do
+    let shares = list_push(shares, [])
+    let w = w + 1
+  end
+  let i = 0
+  while i < list_len(order) do
+    let w = i % workers
+    let shares = list_set(shares, w, list_push(shares[w], jobs[order[i]]))
+    let i = i + 1
+  end
+  let done = []
+  if workers == 1 then
+    let done = [jb_worker(shares[0])]
+  else
+    let done = parallel_map(shares, "jb_worker")
+  end
+  let slots = vec_new()
+  let i = 0
+  while i < list_len(jobs) do
+    vec_push(slots, false)
+    let i = i + 1
+  end
+  let w = 0
+  while w < list_len(done) do
+    let k = 0
+    while k < list_len(done[w]) do
+      let r = done[w][k]
+      vec_set(slots, r[0], [r[1], r[2], r[3], r[4]])
+      let k = k + 1
+    end
+    let w = w + 1
+  end
+  return vec_to_list(slots)
+end

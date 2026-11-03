@@ -1,0 +1,475 @@
+# v2 runtime: the memory manager (docs/spec/values-and-memory.md 2.3).
+#
+# One address range is reserved at start; pages are committed from the
+# system in steps of 256 MB, only as the bump pointer passes the committed
+# mark. A block is a 16-byte header, [count:8][size:8], then its payload;
+# size is the block's whole size, its size class (rt_size_class), so
+# freeing never recomputes it.
+#
+# Each thread has a context of its own, found through a TLS slot: its bump
+# chunk and its free lists, one per size class, linked through each free
+# block's first payload word. A thread allocates from and frees to its own
+# context with no lock and no atomic operation; a block freed by another
+# thread goes onto the freeing thread's lists. When a thread's list for a
+# class grows past rt_batch_high(), half of it goes to the shared pool, and
+# an empty list takes a batch from the pool before taking new memory. The
+# pool's lock is taken once per batch, never per block.
+#
+# runtime_state() layout used here:
+#   128  reserved range's base       136  committed end (an address)
+#   144  global bump pointer         200  the TLS slot of thread contexts
+#   208  pool lock: next ticket      216  pool lock: ticket being served
+#   224  commits made                232  reservations made
+#   240  pool lock acquisitions
+#   8192 the pool: 160 list heads, then at 9472 their lengths
+#   12288 the first thread's context
+# A thread context (rt_context_bytes): 0 chunk cursor, 8 chunk end,
+# 16 + 8 * class index: that class's list head, 1296 + 8 * class index:
+# its length; 2576 a value, the events whose handlers are running on this
+# thread (objects.patlang, emit).
+quiet_operators()
+
+make a function called rt_reserve_bytes returns n
+  let n = 68719476736
+  ensure (n > 0) and (word_and(n, 4095) == 0)
+  return n
+end
+
+make a function called rt_chunk_bytes returns n
+  let n = 1048576
+  ensure n >= 4096
+  return n
+end
+
+make a function called rt_commit_step returns n
+  let n = 268435456
+  ensure (n > 0) and (word_and(n, 4095) == 0)
+  return n
+end
+
+make a function called rt_context_bytes returns n
+  let n = 2592
+  ensure n == 16 + 8 * 322
+  return n
+end
+
+make a function called rt_batch_high returns n
+  let n = 256
+  ensure n >= 2
+  return n
+end
+
+make a function called rt_memory_init returns r
+  let st = runtime_state()
+  # MEM_RESERVE, PAGE_READWRITE
+  let base = extern_call("KERNEL32.DLL", "VirtualAlloc", 0, rt_reserve_bytes(), 8192, 4)
+  if base == 0 then
+    rt_fail_memory()
+  end
+  mem_store(st, 128, base)
+  mem_store(st, 136, base)
+  mem_store(st, 144, base)
+  mem_store(st, 208, 0)
+  mem_store(st, 216, 0)
+  mem_store(st, 224, 0)
+  mem_store(st, 232, 1)
+  mem_store(st, 240, 0)
+  let i = 0
+  while i < 320 do
+    mem_store(st, 8192 + 8 * i, 0)
+    let i = i + 1
+  end
+  let ctx = st + 12288
+  rt_context_clear(ctx)
+  mem_store(st, 200, extern_call("KERNEL32.DLL", "TlsAlloc"))
+  extern_call("KERNEL32.DLL", "TlsSetValue", mem_load(st, 200), ctx)
+  let r = 0
+  ensure (r == 0) and (rt_context() == runtime_state() + 12288)
+  return r
+end
+
+make a function called rt_context_clear takes ctx returns r
+  require ctx != 0
+  let i = 0
+  while i < 324 do
+    mem_store(ctx, 8 * i, 0)
+    let i = i + 1
+  end
+  let r = 0
+  ensure (mem_load(ctx, 0) == 0) and (mem_load(ctx, 8) == 0)
+  return r
+end
+
+# This thread's context.
+make a function called rt_context returns ctx
+  let ctx = extern_call("KERNEL32.DLL", "TlsGetValue", mem_load(runtime_state(), 200))
+  ensure ctx != 0
+  return ctx
+end
+
+make a function called rt_fail_memory returns r
+  rt_write_byte(77)
+  rt_write_byte(10)
+  let r = extern_call("KERNEL32.DLL", "ExitProcess", 71)
+  ensure false
+  return r
+end
+
+# ---- the pool's lock: a ticket lock on atomic_add ----
+
+make a function called rt_pool_lock returns r
+  let st = runtime_state()
+  let mine = atomic_add(st + 208, 1)
+  while mem_load(st, 216) != mine do
+    let spin = 0
+  end
+  mem_store(st, 240, mem_load(st, 240) + 1)
+  let r = 0
+  ensure (r == 0) and (mem_load(runtime_state(), 208) > mem_load(runtime_state(), 216))
+  return r
+end
+
+make a function called rt_pool_unlock returns r
+  atomic_add(runtime_state() + 216, 1)
+  let r = 0
+  ensure (r == 0) and (mem_load(runtime_state(), 216) <= mem_load(runtime_state(), 208))
+  return r
+end
+
+# ---- size classes ----
+
+# The largest power of two below n, for n above 256.
+make a function called rt_class_base takes n returns base
+  require n > 256
+  let base = 256
+  while base * 2 < n do
+    let base = base * 2
+  end
+  ensure (base < n) and (base * 2 >= n) and (word_and(base, base - 1) == 0)
+  return base
+end
+
+# How many quarter steps of base (1 to 4) reach n, rounding up.
+make a function called rt_class_steps takes base, n returns j
+  require (base >= 256) and (n > base) and (n <= base * 2)
+  let step = word_shr(base, 2)
+  let j = 1
+  while base + j * step < n do
+    let j = j + 1
+  end
+  ensure (j >= 1) and (j <= 4)
+  return j
+end
+
+# A block's whole size: header and payload, 8-aligned, at least 24 bytes;
+# above 256 bytes, rounded up to a quarter step of its power of two.
+make a function called rt_size_class takes payload returns size
+  require (value_class(payload) == 2) and (payload >= 0)
+  let n = 16 + payload
+  let rem = word_and(n, 7)
+  if rem != 0 then
+    let n = n + 8 - rem
+  end
+  if n < 24 then
+    let n = 24
+  end
+  if n <= 256 then
+    let size = n
+    ensure (size >= 16 + payload) and (size >= 24) and (word_and(size, 7) == 0)
+    return size
+  end
+  let base = rt_class_base(n)
+  let size = base + rt_class_steps(base, n) * word_shr(base, 2)
+  ensure (size >= 16 + payload) and (size >= 24) and (word_and(size, 7) == 0)
+  return size
+end
+
+# A size class's list index: 0-31 for the 8-byte steps up to 256, then four
+# per power of two.
+make a function called rt_class_index takes size returns idx
+  require (size >= 24) and (word_and(size, 7) == 0)
+  if size <= 256 then
+    let idx = word_shr(size, 3) - 1
+    ensure (idx >= 0) and (idx < 160)
+    return idx
+  end
+  let base = rt_class_base(size)
+  let k = 0
+  let b = base
+  while b > 256 do
+    let b = word_shr(b, 1)
+    let k = k + 1
+  end
+  let idx = 32 + k * 4 + rt_class_steps(base, size) - 1
+  ensure (idx >= 0) and (idx < 160)
+  return idx
+end
+
+# ---- memory from the system ----
+
+# Takes bytes from the reserved range, committing pages as needed. Shared
+# by every thread, so under the pool's lock.
+make a function called rt_take_from_range takes bytes returns addr
+  require bytes > 0
+  let st = runtime_state()
+  rt_pool_lock()
+  let addr = mem_load(st, 144)
+  let new_end = addr + bytes
+  let committed = mem_load(st, 136)
+  if new_end > committed then
+    let want = new_end - committed
+    let step = rt_commit_step()
+    if want < step then
+      let want = step
+    end
+    # MEM_COMMIT, PAGE_READWRITE
+    let ok = extern_call("KERNEL32.DLL", "VirtualAlloc", committed, want, 4096, 4)
+    if ok == 0 then
+      rt_pool_unlock()
+      rt_fail_memory()
+    end
+    mem_store(st, 136, committed + want)
+    mem_store(st, 224, mem_load(st, 224) + 1)
+  end
+  mem_store(st, 144, new_end)
+  rt_pool_unlock()
+  ensure (addr >= mem_load(runtime_state(), 128)) and (addr + bytes <= mem_load(runtime_state(), 136))
+  return addr
+end
+
+# ---- the pool ----
+
+# Moves up to count blocks of a class from one list to another: the lists
+# given by their head and length addresses.
+make a function called rt_move_blocks takes from_head, from_len, to_head, to_len, count returns moved
+  require (from_head != 0) and (to_head != 0) and (count >= 0)
+  let moved = 0
+  while (moved < count) and (mem_load(from_head, 0) != 0) do
+    let block = mem_load(from_head, 0)
+    mem_store(from_head, 0, mem_load(block, 16))
+    mem_store(block, 16, mem_load(to_head, 0))
+    mem_store(to_head, 0, block)
+    let moved = moved + 1
+  end
+  mem_store(from_len, 0, mem_load(from_len, 0) - moved)
+  mem_store(to_len, 0, mem_load(to_len, 0) + moved)
+  ensure (moved >= 0) and (moved <= count)
+  return moved
+end
+
+make a function called rt_pool_head takes idx returns addr
+  require (idx >= 0) and (idx < 160)
+  let addr = runtime_state() + 8192 + 8 * idx
+  ensure addr == runtime_state() + 8192 + 8 * idx
+  return addr
+end
+
+make a function called rt_pool_len takes idx returns addr
+  require (idx >= 0) and (idx < 160)
+  let addr = runtime_state() + 9472 + 8 * idx
+  ensure addr == runtime_state() + 9472 + 8 * idx
+  return addr
+end
+
+# ---- allocation ----
+
+# A block of the given payload size, its count 1.
+make a function called rt_alloc takes payload returns block
+  require (value_class(payload) == 2) and (payload >= 0)
+  let ctx = rt_context()
+  let size = rt_size_class(payload)
+  let idx = rt_class_index(size)
+  let head_at = ctx + 16 + 8 * idx
+  let len_at = ctx + 1296 + 8 * idx
+  if mem_load(head_at, 0) == 0 then
+    if mem_load(rt_pool_len(idx), 0) > 0 then
+      rt_pool_lock()
+      rt_move_blocks(rt_pool_head(idx), rt_pool_len(idx), head_at, len_at, word_shr(rt_batch_high(), 1))
+      rt_pool_unlock()
+    end
+  end
+  let block = mem_load(head_at, 0)
+  if block != 0 then
+    mem_store(head_at, 0, mem_load(block, 16))
+    mem_store(len_at, 0, mem_load(len_at, 0) - 1)
+  else
+    let cursor = mem_load(ctx, 0)
+    if cursor + size > mem_load(ctx, 8) then
+      rt_retire_chunk(ctx)
+      let chunk = rt_chunk_bytes()
+      if size > chunk then
+        let chunk = size
+      end
+      let cursor = rt_take_from_range(chunk)
+      mem_store(ctx, 8, cursor + chunk)
+    end
+    let block = cursor
+    mem_store(ctx, 0, cursor + size)
+  end
+  mem_store(block, 0, 1)
+  mem_store(block, 8, size)
+  ensure (mem_load(block, 0) == 1) and (mem_load(block, 8) == rt_size_class(payload))
+  return block
+end
+
+# Puts a block on this thread's list for its class; past rt_batch_high(),
+# half the list goes to the pool.
+make a function called rt_free takes block returns r
+  require (block != 0) and (mem_load(block, 0) <= 1) and (mem_load(block, 8) >= 24)
+  let ctx = rt_context()
+  let idx = rt_class_index(mem_load(block, 8))
+  let head_at = ctx + 16 + 8 * idx
+  let len_at = ctx + 1296 + 8 * idx
+  mem_store(block, 16, mem_load(head_at, 0))
+  mem_store(head_at, 0, block)
+  let n = mem_load(len_at, 0) + 1
+  mem_store(len_at, 0, n)
+  if n > rt_batch_high() then
+    rt_pool_lock()
+    rt_move_blocks(head_at, len_at, rt_pool_head(idx), rt_pool_len(idx), word_shr(n, 1))
+    rt_pool_unlock()
+  end
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# The unused end of a thread's chunk becomes free blocks, so no memory is
+# lost when a chunk is replaced or its thread ends.
+make a function called rt_retire_chunk takes ctx returns r
+  require ctx != 0
+  let cursor = mem_load(ctx, 0)
+  let left = mem_load(ctx, 8) - cursor
+  while left >= 24 do
+    let size = rt_largest_class_within(left)
+    mem_store(cursor, 0, 0)
+    mem_store(cursor, 8, size)
+    rt_free(cursor)
+    let cursor = cursor + size
+    let left = left - size
+  end
+  mem_store(ctx, 0, 0)
+  mem_store(ctx, 8, 0)
+  let r = 0
+  ensure (mem_load(ctx, 0) == 0) and (mem_load(ctx, 8) == 0)
+  return r
+end
+
+# The largest size class not above n (n at least 24).
+make a function called rt_largest_class_within takes n returns size
+  require n >= 24
+  let m = word_and(n, 0 - 8)
+  if m <= 256 then
+    let size = m
+    ensure (size <= n) and (size >= 24) and (rt_size_class(size - 16) == size)
+    return size
+  end
+  let base = rt_class_base(m)
+  let step = word_shr(base, 2)
+  let j = 4
+  while base + j * step > m do
+    let j = j - 1
+  end
+  if j == 0 then
+    let size = base
+    ensure (size <= n) and (size >= 24) and (rt_size_class(size - 16) == size)
+    return size
+  end
+  let size = base + j * step
+  ensure (size <= n) and (size >= 24) and (rt_size_class(size - 16) == size)
+  return size
+end
+
+# A thread's context when it ends: its chunk's end and every block on its
+# lists go to the pool.
+make a function called rt_context_retire takes ctx returns r
+  require ctx != 0
+  let saved = rt_context()
+  extern_call("KERNEL32.DLL", "TlsSetValue", mem_load(runtime_state(), 200), ctx)
+  # what the thread still holds goes onto its own lists first
+  rt_release_value_at(ctx, 2576)
+  mem_store(ctx, 2576, 0)
+  mem_store(ctx, 2584, 0)
+  rt_retire_chunk(ctx)
+  rt_pool_lock()
+  let idx = 0
+  while idx < 160 do
+    rt_move_blocks(ctx + 16 + 8 * idx, ctx + 1296 + 8 * idx, rt_pool_head(idx), rt_pool_len(idx), 4611686018427387904)
+    let idx = idx + 1
+  end
+  rt_pool_unlock()
+  extern_call("KERNEL32.DLL", "TlsSetValue", mem_load(runtime_state(), 200), saved)
+  let r = 0
+  ensure (r == 0) and (mem_load(ctx, 0) == 0)
+  return r
+end
+
+# ---- counting (spec 2.2). The compiler calls these only for a value whose
+# type word has the heap bit; they take the value's two words as ints, so
+# compiling them by the same rules calls nothing. ----
+
+make a function called rt_retain takes type_word, block returns r
+  require (word_and(type_word, 4294967296) != 0) and (mem_load(block, 0) >= 1)
+  atomic_add(block, 1)
+  let r = 0
+  ensure (r == 0) and (mem_load(block, 0) >= 2)
+  return r
+end
+
+make a function called rt_release takes type_word, block returns r
+  require (word_and(type_word, 4294967296) != 0) and (mem_load(block, 0) >= 1)
+  let before = atomic_add(block, 0 - 1)
+  if before == 1 then
+    rt_finalize(word_and(type_word, 4294967295), block)
+  end
+  if before < 1 then
+    rt_fail_released_twice()
+  end
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+make a function called rt_fail_released_twice returns r
+  rt_write_byte(82)
+  rt_write_byte(10)
+  let r = extern_call("KERNEL32.DLL", "ExitProcess", 72)
+  ensure false
+  return r
+end
+
+# The last reference to a block is gone: release what it holds, then free it.
+make a function called rt_finalize takes cls, block returns r
+  require (cls >= 0) and (mem_load(block, 0) == 0)
+  if cls == 9 then
+    rt_list_release_elements(block)
+  elif cls == 4 then
+    rt_release_value_at(block, 24)
+  elif cls == 10 then
+    rt_closure_release_captures(block)
+  elif (cls == 11) or (cls == 12) or (cls == 13) then
+    rt_cell_finalize(cls, block)
+  elif cls >= 63 then
+    # an object: its name and its fields (runtime/objects.patlang)
+    rt_release_value_at(block, 24)
+    rt_release_value_at(block, 40)
+  elif (cls == 5) or (cls == 6) or (cls == 7) then
+    rt_release_value_at(block, 16)
+    rt_release_value_at(block, 32)
+  end
+  let r = rt_free(block)
+  ensure r == 0
+  return r
+end
+
+# Releases the value held at block + off, read as its two words.
+make a function called rt_release_value_at takes block, off returns r
+  require (block != 0) and (off >= 16)
+  let tw = mem_load(block, off)
+  if word_and(tw, 4294967296) != 0 then
+    rt_release(tw, mem_load(block, off + 8))
+  end
+  let r = 0
+  ensure r == 0
+  return r
+end

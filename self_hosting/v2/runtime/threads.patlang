@@ -1,0 +1,110 @@
+# v2 runtime: functions reached by name, and threads.
+#
+# A function a program reaches only by its name (apply, parallel_map: a
+# parameter named by_name) is registered at start under that name, with a
+# closure that calls it (lower.patlang, lw_register_by_name), in the list
+# at runtime_state() + 4208: [name, closure].
+#
+# parallel_map runs a function on every item on threads of their own. Each
+# thread gets its own memory context (memory.patlang), made by the thread
+# that starts it, and given back to the pool when it has finished. A job is
+# an uncounted block: 16 the function, 32 the item, 48 the result,
+# 64 the thread's context, 72 its handle.
+quiet_operators()
+
+make a function called rt_threads_init returns r
+  let st = runtime_state()
+  mem_store(st, 4208, 0)
+  mem_store(st, 4216, 0)
+  mem_init_value(st, 4208, [])
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+make a function called rt_register_function takes name, f returns r
+  require (value_class(name) == 8) and (value_class(f) == 10)
+  rt_global_set(4208, list_push(rt_global_get(4208), [name, f]))
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+make a function called rt_function_named takes name returns f
+  require (value_class(name) == 8)
+  let fns = rt_global_get(4208)
+  let i = rt_pairs_index(fns, name)
+  if i < 0 then
+    print("function '" + name + "' not found")
+    let f = extern_call("KERNEL32.DLL", "ExitProcess", 76)
+    ensure value_class(f) == 10
+    return f
+  end
+  let f = fns[i][1]
+  ensure value_class(f) == 10
+  return f
+end
+
+make a function called apply takes by_name, rest returns r
+  require (value_class(by_name) == 8) and (value_class(rest) == 9)
+  let r = rt_apply(rt_function_named(by_name), rest)
+  ensure rt_live(r)
+  return r
+end
+
+make a function called parallel_map takes items, by_name returns results
+  require (value_class(items) == 9) and (value_class(by_name) == 8)
+  let f = rt_function_named(by_name)
+  let n = list_len(items)
+  let jobs = []
+  let k = 0
+  while k < n do
+    let job = rt_alloc(64)
+    mem_store(job, 16, 0)
+    mem_store(job, 24, 0)
+    mem_store(job, 32, 0)
+    mem_store(job, 40, 0)
+    mem_store(job, 48, 0)
+    mem_store(job, 56, 0)
+    mem_init_value(job, 16, f)
+    mem_init_value(job, 32, items[k])
+    let ctx = rt_alloc(rt_context_bytes())
+    rt_context_clear(ctx + 16)
+    mem_store(job, 64, ctx + 16)
+    let h = extern_call("KERNEL32.DLL", "CreateThread", 0, 0, thread_entry_address(), job, 0, 0)
+    mem_store(job, 72, h)
+    let jobs = list_push(jobs, job)
+    let k = k + 1
+  end
+  let results = []
+  let k = 0
+  while k < n do
+    let job = jobs[k]
+    extern_call("KERNEL32.DLL", "WaitForSingleObject", mem_load(job, 72), 4294967295)
+    extern_call("KERNEL32.DLL", "CloseHandle", mem_load(job, 72))
+    let results = list_push(results, mem_load_value(job, 48))
+    rt_release_value_at(job, 16)
+    rt_release_value_at(job, 32)
+    rt_release_value_at(job, 48)
+    let ctx = mem_load(job, 64)
+    rt_context_retire(ctx)
+    rt_free(ctx - 16)
+    rt_free(job)
+    let k = k + 1
+  end
+  ensure list_len(results) == list_len(items)
+  return results
+end
+
+# A thread's first PatLang code (x64.patlang, v2_thread_entry): its memory
+# context, then the job's function on its item.
+make a function called rt_thread_main takes job returns r
+  require job != 0
+  extern_call("KERNEL32.DLL", "TlsSetValue", mem_load(runtime_state(), 200), mem_load(job, 64))
+  let f = mem_load_value(job, 16)
+  let item = mem_load_value(job, 32)
+  mem_init_value(job, 48, f(item))
+  let r = 0
+  ensure r == 0
+  return r
+end

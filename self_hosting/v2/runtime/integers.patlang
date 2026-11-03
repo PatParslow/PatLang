@@ -1,0 +1,519 @@
+# v2 runtime: integers of any size (docs/spec/values-and-memory.md 1.3).
+# An integer that fits in 64 bits is an int (class 2, its value in the data
+# word); any other is a bigint (class 4): a block holding its sign (0 or 1)
+# at 16 and its magnitude at 24, a list of base-10^9 limbs, least
+# significant first, with no leading zero limbs. Every operation here
+# returns an int whenever the result fits.
+#
+# A limb product is below 10^18, inside a 64-bit int, so the limb
+# arithmetic is ordinary int arithmetic.
+quiet_operators()
+
+make a function called rt_bigint_heap_type returns t
+  let t = 4294967300
+  ensure (word_and(t, 4294967295) == 4) and (word_and(t, 4294967296) != 0)
+  return t
+end
+
+make a function called rt_limb_base returns b
+  let b = 1000000000
+  ensure b == 1000000000
+  return b
+end
+
+make a function called rt_is_integer takes v returns yes
+  require rt_live(v)
+  let c = value_class(v)
+  let yes = (c == 2) or (c == 4)
+  ensure value_class(yes) == 1
+  return yes
+end
+
+make a function called rt_int_negative takes v returns yes
+  require rt_is_integer(v)
+  if value_class(v) == 2 then
+    let yes = v < 0
+    ensure value_class(yes) == 1
+    return yes
+  end
+  let yes = mem_load(value_data(v), 16) == 1
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# |v|'s limbs.
+make a function called rt_int_mag takes v returns limbs
+  require rt_is_integer(v)
+  if value_class(v) == 4 then
+    let limbs = mem_load_value(value_data(v), 24)
+    ensure (value_class(limbs) == 9) and (list_len(limbs) >= 1)
+    return limbs
+  end
+  let limbs = []
+  let n = v
+  if n == 0 then
+    let limbs = [0]
+    ensure (value_class(limbs) == 9) and (list_len(limbs) >= 1)
+    return limbs
+  end
+  # digits of a negative number taken with their sign flipped, so -2^63
+  # needs no negation
+  while n != 0 do
+    let r = word_rem(n, 1000000000)
+    if r < 0 then
+      let r = 0 - r
+    end
+    let limbs = list_push(limbs, r)
+    let n = word_div(n, 1000000000)
+  end
+  ensure (value_class(limbs) == 9) and (list_len(limbs) >= 1)
+  return limbs
+end
+
+make a function called rt_mag_norm takes a returns out
+  require (value_class(a) == 9) and (list_len(a) >= 1)
+  let n = a.length
+  while (n > 1) and (a[n - 1] == 0) do
+    let n = n - 1
+  end
+  if n == a.length then
+    let out = a
+    ensure (list_len(out) >= 1) and ((list_len(out) == 1) or (out[list_len(out) - 1] != 0))
+    return out
+  end
+  let out = []
+  let i = 0
+  while i < n do
+    let out = list_push(out, a[i])
+    let i = i + 1
+  end
+  ensure (list_len(out) >= 1) and ((list_len(out) == 1) or (out[list_len(out) - 1] != 0))
+  return out
+end
+
+make a function called rt_mag_is_zero takes a returns yes
+  require (value_class(a) == 9)
+  let yes = (a.length == 1) and (a[0] == 0)
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# The integer with this sign and magnitude: an int when it fits.
+make a function called rt_int_make takes negative, mag returns v
+  require (value_class(negative) == 1) and (value_class(mag) == 9)
+  let m = rt_mag_norm(mag)
+  if rt_mag_is_zero(m) then
+    let v = 0
+    ensure rt_is_integer(v) and ((value_class(v) == 2) or (not rt_mag_fits(negative, rt_mag_norm(mag))))
+    return v
+  end
+  if rt_mag_fits(negative, m) then
+    let v = 0
+    let i = m.length - 1
+    while i >= 0 do
+      if negative then
+        let v = v * 1000000000 - m[i]
+      else
+        let v = v * 1000000000 + m[i]
+      end
+      let i = i - 1
+    end
+    ensure rt_is_integer(v) and ((value_class(v) == 2) or (not rt_mag_fits(negative, rt_mag_norm(mag))))
+    return v
+  end
+  let block = rt_alloc(24)
+  if negative then
+    mem_store(block, 16, 1)
+  else
+    mem_store(block, 16, 0)
+  end
+  mem_init_value(block, 24, m)
+  let v = value_make(rt_bigint_heap_type(), block)
+  ensure rt_is_integer(v) and ((value_class(v) == 2) or (not rt_mag_fits(negative, rt_mag_norm(mag))))
+  return v
+end
+
+# Whether the magnitude, with this sign, is inside -2^63 .. 2^63 - 1.
+make a function called rt_mag_fits takes negative, m returns yes
+  require (value_class(negative) == 1) and (value_class(m) == 9)
+  if m.length < 3 then
+    let yes = true
+    ensure value_class(yes) == 1
+    return yes
+  end
+  if m.length > 3 then
+    let yes = false
+    ensure value_class(yes) == 1
+    return yes
+  end
+  let limit = [854775807, 223372036, 9]
+  if negative then
+    let limit = [854775808, 223372036, 9]
+  end
+  let yes = rt_mag_cmp(m, limit) <= 0
+  ensure value_class(yes) == 1
+  return yes
+end
+
+make a function called rt_mag_cmp takes a, b returns c
+  require (value_class(a) == 9) and (value_class(b) == 9)
+  if a.length != b.length then
+    if a.length < b.length then
+      let c = 0 - 1
+      ensure (c == 0 - 1) or (c == 0) or (c == 1)
+      return c
+    end
+    let c = 1
+    ensure (c == 0 - 1) or (c == 0) or (c == 1)
+    return c
+  end
+  let i = a.length - 1
+  while i >= 0 do
+    if a[i] != b[i] then
+      if a[i] < b[i] then
+        let c = 0 - 1
+        ensure (c == 0 - 1) or (c == 0) or (c == 1)
+        return c
+      end
+      let c = 1
+      ensure (c == 0 - 1) or (c == 0) or (c == 1)
+      return c
+    end
+    let i = i - 1
+  end
+  let c = 0
+  ensure (c == 0 - 1) or (c == 0) or (c == 1)
+  return c
+end
+
+make a function called rt_mag_add takes a, b returns out
+  require (value_class(a) == 9) and (value_class(b) == 9)
+  let out = []
+  let carry = 0
+  let i = 0
+  while (i < a.length) or (i < b.length) do
+    let t = carry
+    if i < a.length then
+      let t = t + a[i]
+    end
+    if i < b.length then
+      let t = t + b[i]
+    end
+    if t >= 1000000000 then
+      let out = list_push(out, t - 1000000000)
+      let carry = 1
+    else
+      let out = list_push(out, t)
+      let carry = 0
+    end
+    let i = i + 1
+  end
+  if carry > 0 then
+    let out = list_push(out, carry)
+  end
+  ensure list_len(out) >= 1
+  return out
+end
+
+# a - b, for a >= b
+make a function called rt_mag_sub takes a, b returns out
+  require (value_class(a) == 9) and (value_class(b) == 9) and (rt_mag_cmp(a, b) >= 0)
+  let out = []
+  let borrow = 0
+  let i = 0
+  while i < a.length do
+    let t = a[i] - borrow
+    if i < b.length then
+      let t = t - b[i]
+    end
+    if t < 0 then
+      let t = t + 1000000000
+      let borrow = 1
+    else
+      let borrow = 0
+    end
+    let out = list_push(out, t)
+    let i = i + 1
+  end
+  let out = rt_mag_norm(out)
+  ensure list_len(out) >= 1
+  return out
+end
+
+make a function called rt_mag_mul takes a, b returns out
+  require (value_class(a) == 9) and (value_class(b) == 9)
+  let n = a.length + b.length
+  let out = []
+  let i = 0
+  while i < n do
+    let out = list_push(out, 0)
+    let i = i + 1
+  end
+  let i = 0
+  while i < a.length do
+    let carry = 0
+    let j = 0
+    while j < b.length do
+      let t = out[i + j] + a[i] * b[j] + carry
+      let out = list_set(out, i + j, word_rem(t, 1000000000))
+      let carry = word_div(t, 1000000000)
+      let j = j + 1
+    end
+    let k = i + b.length
+    while carry > 0 do
+      let t = out[k] + carry
+      let out = list_set(out, k, word_rem(t, 1000000000))
+      let carry = word_div(t, 1000000000)
+      let k = k + 1
+    end
+    let i = i + 1
+  end
+  let out = rt_mag_norm(out)
+  ensure list_len(out) >= 1
+  return out
+end
+
+# a * m for 0 <= m < 10^9
+make a function called rt_mag_mul_small takes a, m returns out
+  require (value_class(a) == 9) and (m >= 0) and (m < 1000000000)
+  let out = []
+  let carry = 0
+  let i = 0
+  while i < a.length do
+    let t = a[i] * m + carry
+    let out = list_push(out, word_rem(t, 1000000000))
+    let carry = word_div(t, 1000000000)
+    let i = i + 1
+  end
+  if carry > 0 then
+    let out = list_push(out, carry)
+  end
+  let out = rt_mag_norm(out)
+  ensure list_len(out) >= 1
+  return out
+end
+
+# [q, r] with a = q * b + r, 0 <= r < b (b not zero): schoolbook long
+# division, one limb of q at a time, each found by binary search.
+make a function called rt_mag_divmod takes a, b returns qr
+  require (value_class(a) == 9) and (value_class(b) == 9) and (not rt_mag_is_zero(b))
+  if rt_mag_cmp(a, b) < 0 then
+    let qr = [[0], a]
+    ensure (list_len(qr) == 2) and (rt_mag_cmp(qr[1], b) < 0)
+    return qr
+  end
+  let q = []
+  let i = 0
+  while i < a.length do
+    let q = list_push(q, 0)
+    let i = i + 1
+  end
+  let r = [0]
+  let i = a.length - 1
+  while i >= 0 do
+    # r = r * BASE + a[i]
+    let shifted = [a[i]]
+    let k = 0
+    while k < r.length do
+      let shifted = list_push(shifted, r[k])
+      let k = k + 1
+    end
+    let r = rt_mag_norm(shifted)
+    let lo = 0
+    let hi = 999999999
+    while lo < hi do
+      let mid = lo + word_div(hi - lo + 1, 2)
+      if rt_mag_cmp(rt_mag_mul_small(b, mid), r) <= 0 then
+        let lo = mid
+      else
+        let hi = mid - 1
+      end
+    end
+    let q = list_set(q, i, lo)
+    if lo > 0 then
+      let r = rt_mag_sub(r, rt_mag_mul_small(b, lo))
+    end
+    let i = i - 1
+  end
+  let qr = [rt_mag_norm(q), r]
+  ensure (list_len(qr) == 2) and (rt_mag_cmp(qr[1], b) < 0)
+  return qr
+end
+
+# ---- the integer operations, on ints and bigints alike ----
+
+make a function called int_add takes a, b returns r
+  require rt_is_integer(a) and rt_is_integer(b)
+  let na = rt_int_negative(a)
+  let nb = rt_int_negative(b)
+  let ma = rt_int_mag(a)
+  let mb = rt_int_mag(b)
+  if na == nb then
+    let r = rt_int_make(na, rt_mag_add(ma, mb))
+    ensure rt_is_integer(r)
+    return r
+  end
+  if rt_mag_cmp(ma, mb) >= 0 then
+    let r = rt_int_make(na, rt_mag_sub(ma, mb))
+    ensure rt_is_integer(r)
+    return r
+  end
+  let r = rt_int_make(nb, rt_mag_sub(mb, ma))
+  ensure rt_is_integer(r)
+  return r
+end
+
+make a function called int_neg takes a returns r
+  require rt_is_integer(a)
+  let r = rt_int_make(not rt_int_negative(a), rt_int_mag(a))
+  ensure rt_is_integer(r)
+  return r
+end
+
+make a function called int_sub takes a, b returns r
+  require rt_is_integer(a) and rt_is_integer(b)
+  let r = int_add(a, int_neg(b))
+  ensure rt_is_integer(r)
+  return r
+end
+
+make a function called int_mul takes a, b returns r
+  require rt_is_integer(a) and rt_is_integer(b)
+  let r = rt_int_make(rt_int_negative(a) != rt_int_negative(b), rt_mag_mul(rt_int_mag(a), rt_int_mag(b)))
+  ensure rt_is_integer(r)
+  return r
+end
+
+make a function called int_cmp takes a, b returns c
+  require rt_is_integer(a) and rt_is_integer(b)
+  let na = rt_int_negative(a)
+  let nb = rt_int_negative(b)
+  if na != nb then
+    if na then
+      let c = 0 - 1
+      ensure (c == 0 - 1) or (c == 0) or (c == 1)
+      return c
+    end
+    let c = 1
+    ensure (c == 0 - 1) or (c == 0) or (c == 1)
+    return c
+  end
+  let c = rt_mag_cmp(rt_int_mag(a), rt_int_mag(b))
+  if na then
+    let c = 0 - c
+    ensure (c == 0 - 1) or (c == 0) or (c == 1)
+    return c
+  end
+  ensure (c == 0 - 1) or (c == 0) or (c == 1)
+  return c
+end
+
+# [q, r], truncating toward zero: r has the dividend's sign.
+make a function called int_divmod takes a, b returns qr
+  require rt_is_integer(a) and rt_is_integer(b) and (b != 0)
+  let na = rt_int_negative(a)
+  let nb = rt_int_negative(b)
+  let qr = rt_mag_divmod(rt_int_mag(a), rt_int_mag(b))
+  let qr = [rt_int_make(na != nb, qr[0]), rt_int_make(na, qr[1])]
+  ensure (list_len(qr) == 2) and rt_is_integer(qr[0]) and rt_is_integer(qr[1])
+  return qr
+end
+
+make a function called int_abs takes a returns r
+  require rt_is_integer(a)
+  let r = rt_int_make(false, rt_int_mag(a))
+  ensure rt_is_integer(r) and (not rt_int_negative(r))
+  return r
+end
+
+make a function called int_gcd takes a, b returns g
+  require rt_is_integer(a) and rt_is_integer(b)
+  let x = int_abs(a)
+  let y = int_abs(b)
+  while y != 0 do
+    let t = int_divmod(x, y)[1]
+    let x = y
+    let y = t
+  end
+  let g = x
+  ensure rt_is_integer(g) and (not rt_int_negative(g))
+  return g
+end
+
+# A decimal integer literal's value (lower.patlang, for a literal too large
+# for an int).
+make a function called int_from_text takes s returns v
+  require (value_class(s) == 8) and (str_len(s) > 0)
+  let n = str_len(s)
+  let at = rt_str_bytes(s)
+  let start = 0
+  let negative = false
+  if (n > 0) and (mem_load_byte(at, 0) == 45) then
+    let negative = true
+    let start = 1
+  end
+  let limbs = []
+  let stop = n
+  while stop > start do
+    let from = stop - 9
+    if from < start then
+      let from = start
+    end
+    let limb = 0
+    let k = from
+    while k < stop do
+      let limb = limb * 10 + (mem_load_byte(at, k) - 48)
+      let k = k + 1
+    end
+    let limbs = list_push(limbs, limb)
+    let stop = from
+  end
+  let v = rt_int_make(negative, limbs)
+  ensure rt_is_integer(v)
+  return v
+end
+
+make a function called rt_bigint_to_s takes v returns s
+  require value_class(v) == 4
+  let m = rt_int_mag(v)
+  let parts = []
+  if rt_int_negative(v) then
+    let parts = list_push(parts, "-")
+  end
+  let i = m.length - 1
+  let parts = list_push(parts, rt_int_to_s(m[i]))
+  let i = i - 1
+  while i >= 0 do
+    let digits = rt_int_to_s(m[i])
+    let pad = 9 - str_len(digits)
+    while pad > 0 do
+      let parts = list_push(parts, "0")
+      let pad = pad - 1
+    end
+    let parts = list_push(parts, digits)
+    let i = i - 1
+  end
+  let s = str_join(parts, "")
+  ensure value_class(s) == 8
+  return s
+end
+
+make a function called rt_bigint_to_float_bits takes v returns bits
+  require value_class(v) == 4
+  let m = rt_int_mag(v)
+  let base = int_to_float(1000000000)
+  let acc = int_to_float(0)
+  let i = m.length - 1
+  while i >= 0 do
+    let acc = float_add(float_mul(acc, base), int_to_float(m[i]))
+    let i = i - 1
+  end
+  if rt_int_negative(v) then
+    let bits = float_sub(int_to_float(0), acc)
+    ensure value_class(bits) == 2
+    return bits
+  end
+  let bits = acc
+  ensure value_class(bits) == 2
+  return bits
+end

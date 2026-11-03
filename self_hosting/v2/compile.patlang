@@ -1,0 +1,276 @@
+# The v2 compiler (docs/plans/v2-implementation.md):
+#
+#   pat --ir-run self_hosting/v2/compile.patlang SRC.patlang OUT.exe
+#       [--workers N] [--shuffle SEED] [--no-cache]
+#
+# Stages, each a function of its inputs: parse the runtime and the program,
+# lower each declaration (lower.patlang), then one job per function
+# (jobs.patlang): the ownership stage (own.patlang), code generation
+# (x64.patlang) and assembly (lib/x64_asm.patlang); then linking
+# (lib/x64_pe_link.patlang). The runtime is compiled with the program, by
+# the same stages. The jobs run on N workers (1 by default), in an order
+# shuffled by SEED (0, the default, is declaration order); a job whose key
+# was seen before reuses its stored artefacts (self_hosting/build/
+# v2_artefacts) unless --no-cache. Besides OUT.exe the build writes
+# OUT.asm, OUT.facts (the program facts), OUT.ledger (each job's
+# function and whether it was built or reused) and OUT.timing (each
+# phase's time in ms).
+include "../lib/lexer.patlang"
+include "../lib/parser.patlang"
+include "../lib/x64_pe_link.patlang"
+include "ir.patlang"
+include "lower.patlang"
+include "own.patlang"
+include "contracts.patlang"
+include "x64.patlang"
+include "jobs.patlang"
+
+make a function called v2_runtime_files returns files
+  return ["self_hosting/v2/runtime/core.patlang", "self_hosting/v2/runtime/memory.patlang", "self_hosting/v2/runtime/strings.patlang", "self_hosting/v2/runtime/lists.patlang", "self_hosting/v2/runtime/integers.patlang", "self_hosting/v2/runtime/rationals.patlang", "self_hosting/v2/runtime/floats.patlang", "self_hosting/v2/runtime/numbers.patlang", "self_hosting/v2/runtime/closures.patlang", "self_hosting/v2/runtime/objects.patlang", "self_hosting/v2/runtime/logic.patlang", "self_hosting/v2/runtime/cells.patlang", "self_hosting/v2/runtime/system.patlang", "self_hosting/v2/runtime/threads.patlang"]
+end
+
+# A file's statements, and any parse errors in it: [stmts, errors].
+make a function called v2_parse_file takes path returns result
+  let ast = parse_program(tokenize(read_file(path)))
+  let stmts = ast[1]
+  let errors = []
+  let i = 0
+  while i < list_len(stmts) do
+    if stmts[i][0] == "Err" then
+      let errors = list_push(errors, path + ": line " + stmts[i][2] + ": " + stmts[i][1])
+    end
+    let i = i + 1
+  end
+  return [stmts, errors]
+end
+
+# Function names declared twice (the program and the runtime share one
+# namespace for now).
+make a function called v2_duplicate_names takes fns returns dups
+  let seen = []
+  let dups = []
+  let i = 0
+  while i < list_len(fns) do
+    let n = ir_fn_name(fns[i])
+    if v2_contains(seen, n) then
+      let dups = list_push(dups, n)
+    end
+    let seen = list_push(seen, n)
+    let i = i + 1
+  end
+  return dups
+end
+
+# The import list for the linker: every extern_call's library and function,
+# and ExitProcess for the entry.
+make a function called v2_import_spec takes fns returns spec
+  let libs = ["KERNEL32.DLL"]
+  let names = [["ExitProcess"]]
+  let i = 0
+  while i < list_len(fns) do
+    let instrs = ir_fn_instrs(fns[i])
+    let k = 0
+    while k < list_len(instrs) do
+      let ins = instrs[k]
+      if (ins[0] == "extern") or (ins[0] == "externf") then
+        let lib = ins[2]
+        let fname = ins[3]
+        let li = 0
+        let found = 0 - 1
+        while li < list_len(libs) do
+          if libs[li] == lib then
+            let found = li
+          end
+          let li = li + 1
+        end
+        if found < 0 then
+          let libs = list_push(libs, lib)
+          let names = list_push(names, [fname])
+        elif not v2_contains(names[found], fname) then
+          let names = list_set(names, found, list_push(names[found], fname))
+        end
+      end
+      let k = k + 1
+    end
+    let i = i + 1
+  end
+  let spec = []
+  let li = 0
+  while li < list_len(libs) do
+    let spec = list_push(spec, [libs[li], names[li]])
+    let li = li + 1
+  end
+  return spec
+end
+
+# Whether a file declares quiet_operators() at its top level: its
+# operators raise no events (docs/plans/v2-implementation.md, section 4).
+make a function called v2_declares_quiet takes stmts returns yes
+  let i = 0
+  while i < list_len(stmts) do
+    let st = stmts[i]
+    if (st[0] == "Expr") and (st[1][0] == "Call") and (st[1][1] == "quiet_operators") then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# The program facts (lower.patlang, lw_program) as the build's facts
+# artefact, one per line: "event NAME", "by_name NAME" ("*" when a name is
+# computed at run time), "rule PREDICATE/ARITY".
+make a function called v2_facts_text takes facts returns text
+  let b = sb_new()
+  let kinds = ["event", "by_name", "rule"]
+  let k = 0
+  while k < 3 do
+    let items = facts[k]
+    let i = 0
+    while i < list_len(items) do
+      sb_push(b, kinds[k] + " " + items[i] + xv_nl())
+      let i = i + 1
+    end
+    let k = k + 1
+  end
+  return sb_str(b)
+end
+
+make a function called v2_artefact_dir returns dir
+  return "self_hosting/build/v2_artefacts"
+end
+
+# A phase's time, in ms since the last mark, for OUT.timing.
+make a function called v2_mark takes times, phase returns done
+  let now = now_ms()
+  vec_push(times, [phase, now - vec_get(times, 0)])
+  vec_set(times, 0, now)
+  return true
+end
+
+make a function called v2_compile takes src_path, out_path, workers, seed, cache returns result
+  let times = vec_new()
+  vec_push(times, now_ms())
+  let parsed_files = []
+  let errors = []
+  let files = list_push(v2_runtime_files(), src_path)
+  let i = 0
+  while i < list_len(files) do
+    let parsed = v2_parse_file(files[i])
+    let parsed_files = list_push(parsed_files, [parsed[0], v2_declares_quiet(parsed[0])])
+    let errors = v2_concat(errors, parsed[1])
+    let i = i + 1
+  end
+  if list_len(errors) > 0 then
+    return ["error", errors]
+  end
+  v2_mark(times, "parse")
+  let lowered = lw_program(parsed_files)
+  v2_mark(times, "lower")
+  if list_len(lowered[1]) > 0 then
+    return ["error", lowered[1]]
+  end
+  let fns = lowered[0]
+  let dups = v2_duplicate_names(fns)
+  if list_len(dups) > 0 then
+    return ["error", ["declared twice: " + dups]]
+  end
+  write_file(out_path + ".facts", v2_facts_text(lowered[2]))
+  let facts = lowered[2]
+  let dir = ""
+  if cache then
+    let dir = v2_artefact_dir()
+    if not file_exists(dir) then
+      # cmd reads / as a switch: the path with backslashes
+      exec_capture("cmd", "/c", "mkdir", "self_hosting" + chr(92) + "build" + chr(92) + "v2_artefacts")
+    end
+  end
+  let base = jb_compiler_hash()
+  v2_mark(times, "compiler hash")
+  let table = jb_summaries(fns)
+  let entry = xv_entry_asm()
+  let jobs = [[0, "asm", entry, facts, jb_key_text(jb_mix_text(base, entry)), dir]]
+  let i = 0
+  while i < list_len(fns) do
+    let jobs = list_push(jobs, [i + 1, "fn", fns[i], facts, jb_fn_key(base, fns[i], facts, table), dir])
+    let i = i + 1
+  end
+  v2_mark(times, "keys")
+  let results = jb_run_all(jobs, workers, seed)
+  v2_mark(times, "jobs")
+  let b = sb_new()
+  let ledger = sb_new()
+  let chunks = []
+  let job_ms = [0, 0, 0]
+  let i = 0
+  while i < list_len(results) do
+    let r = results[i]
+    let job_ms = [job_ms[0] + r[3][0], job_ms[1] + r[3][1], job_ms[2] + r[3][2]]
+    if i == 1 then
+      sb_push(b, "section .text" + xv_nl())
+    end
+    sb_push(b, r[1])
+    let name = "(entry)"
+    if i > 0 then
+      let name = ir_fn_name(fns[i - 1])
+    end
+    sb_push(ledger, r[2] + " " + name + xv_nl())
+    if r[0] == false then
+      write_file(out_path + ".asm", sb_str(b))
+      return ["error", ["assembly failed for " + name + ": see " + out_path + ".asm"]]
+    end
+    let chunks = list_push(chunks, r[0])
+    let i = i + 1
+  end
+  write_file(out_path + ".asm", sb_str(b))
+  write_file(out_path + ".ledger", sb_str(ledger))
+  vec_push(times, ["jobs: reading or generating code", job_ms[0]])
+  vec_push(times, ["jobs: assembling", job_ms[1]])
+  vec_push(times, ["jobs: storing", job_ms[2]])
+  vec_set(times, 0, now_ms())
+  let linked = x64_link(chunks, v2_import_spec(fns), "main", out_path)
+  v2_mark(times, "link")
+  let tb = sb_new()
+  let k = 1
+  while k < vec_len(times) do
+    sb_push(tb, vec_get(times, k)[0] + " " + vec_get(times, k)[1] + xv_nl())
+    let k = k + 1
+  end
+  write_file(out_path + ".timing", sb_str(tb))
+  if str_starts_with(linked, "LINK ERROR") then
+    return ["error", [linked]]
+  end
+  return ["ok", out_path]
+end
+
+let args = argv()
+if list_len(args) < 2 then
+  print("usage: compile.patlang SRC.patlang OUT.exe [--workers N] [--shuffle SEED] [--no-cache]")
+else
+  let workers = 1
+  let seed = 0
+  let cache = true
+  let i = 2
+  while i < list_len(args) do
+    if (args[i] == "--workers") and (i + 1 < list_len(args)) then
+      let workers = to_num(args[i + 1])
+      let i = i + 1
+    elif (args[i] == "--shuffle") and (i + 1 < list_len(args)) then
+      let seed = to_num(args[i + 1])
+      let i = i + 1
+    elif args[i] == "--no-cache" then
+      let cache = false
+    end
+    let i = i + 1
+  end
+  let r = v2_compile(args[0], args[1], workers, seed, cache)
+  if r[0] == "ok" then
+    print("v2: " + r[1])
+  else
+    let i = 0
+    while i < list_len(r[1]) do
+      print("v2 error: " + r[1][i])
+      let i = i + 1
+    end
+  end
+end

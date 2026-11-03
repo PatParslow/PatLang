@@ -1,0 +1,366 @@
+# Runs spec_library/values_and_memory's @language features
+# (docs/spec/values-and-memory.md, Part 1) against one engine:
+#
+#   pat --ir-run self_hosting/v2/spec/run_values_and_memory.patlang [interp|v2]
+#
+# interp runs each fixture with pat --ir-run; v2 compiles it with the new
+# compiler (self_hosting/v2/compile.patlang) and runs the executable. Each
+# scenario's fixture is in self_hosting/v2/spec/fixtures/, its expected
+# output here. engines_agree.feature runs every fixture on both engines.
+include "../../lib/test.patlang"
+
+make a function called vm_engine returns e
+  let a = argv()
+  if list_len(a) > 0 then
+    return a[0]
+  end
+  return "interp"
+end
+
+make a function called vm_pat returns p
+  return "rust-runtime/target/release/pat.exe"
+end
+
+make a function called vm_fixture takes name returns path
+  return "self_hosting/v2/spec/fixtures/" + name + ".patlang"
+end
+
+# The executable the v2 engine builds for a fixture.
+make a function called vm_exe takes name returns path
+  return "self_hosting/build/v2_spec_" + name + ".exe"
+end
+
+# Output with carriage returns dropped and trailing blank lines removed.
+make a function called vm_clean takes text returns out
+  let b = sb_new()
+  let i = 0
+  let n = text.length
+  while i < n do
+    let c = char_code(text, i)
+    if c != 13 then
+      sb_push(b, chr(c))
+    end
+    let i = i + 1
+  end
+  return str_trim(sb_str(b))
+end
+
+# Builds a fixture with the v2 compiler, once per run; "" on success, else
+# the compiler's output.
+make a function called vm_v2_build takes name returns err
+  let done = get_global("vm_built_" + name)
+  if type_of(done) == "string" then
+    return done
+  end
+  let err = vm_v2_build_now(name)
+  set_global("vm_built_" + name, err)
+  return err
+end
+
+make a function called vm_v2_build_now takes name returns err
+  let out = exec_capture(vm_pat(), "--ir-run", "self_hosting/v2/compile.patlang", vm_fixture(name), vm_exe(name))
+  # the compiler prints "v2: OUT" when it wrote the executable
+  if contains_text(out, "v2: " + vm_exe(name)) then
+    return ""
+  end
+  return "v2 build failed: " + vm_clean(out)
+end
+
+make a function called vm_run_on takes engine, name, args returns out
+  if engine == "v2" then
+    let err = vm_v2_build(name)
+    if err != "" then
+      return err
+    end
+    return vm_clean(list_get(exec_peak_memory(vm_exe(name), args), 0))
+  end
+  let full = ["--ir-run", vm_fixture(name)]
+  let i = 0
+  while i < list_len(args) do
+    let full = list_push(full, args[i])
+    let i = i + 1
+  end
+  return vm_clean(list_get(exec_peak_memory(vm_pat(), full), 0))
+end
+
+make a function called vm_run takes name returns out
+  return vm_run_on(vm_engine(), name, [])
+end
+
+# Peak working set, in bytes, of a fixture run with these arguments, or -1
+# unless the run reached its end (printed "done"): a program that stopped
+# early proves nothing about its memory.
+make a function called vm_peak takes name, args returns bytes
+  let r = []
+  if vm_engine() == "v2" then
+    let err = vm_v2_build(name)
+    if err != "" then
+      return 0 - 1
+    end
+    let r = exec_peak_memory(vm_exe(name), args)
+  else
+    let full = ["--ir-run", vm_fixture(name)]
+    let i = 0
+    while i < list_len(args) do
+      let full = list_push(full, args[i])
+      let i = i + 1
+    end
+    let r = exec_peak_memory(vm_pat(), full)
+  end
+  if vm_clean(list_get(r, 0)) != "done" then
+    return 0 - 1
+  end
+  return list_get(r, 1)
+end
+
+make a function called vm_mb takes bytes returns mb
+  return floor(bytes / 1048576)
+end
+
+make a function called vm_expect takes label, name, expected returns ok
+  return check(label, vm_run(name), expected)
+end
+
+make a function called nl returns s
+  return chr(10)
+end
+
+make a function called st_vm_noop returns ok
+  return true
+end
+
+make a function called vm_noops takes texts returns done
+  let i = 0
+  while i < list_len(texts) do
+    step(texts[i], "st_vm_noop")
+    let i = i + 1
+  end
+  return true
+end
+
+# ---- values_are_objects.feature (1.1, 1.2) ----
+
+make a function called st_vo_type_of returns ok
+  return vm_expect("type_of names every kind of value's class", "vo_type_of", "-" + nl() + "int" + nl() + "bigint" + nl() + "float" + nl() + "rational" + nl() + "bool" + nl() + "unit" + nl() + "string" + nl() + "list" + nl() + "closure" + nl() + "string_builder" + nl() + "vec" + nl() + "bool_array")
+end
+
+make a function called st_vo_new_object returns ok
+  return vm_expect("new returns an object of class Widget", "vo_new_object", "Widget")
+end
+
+make a function called st_vo_keeps_class returns ok
+  return vm_expect("1.5 comes back a float, 1.5", "vo_keeps_class", "float" + nl() + "1.5")
+end
+
+make a function called st_vo_methods returns ok
+  return vm_expect("3.to_s, 3.14.to_s, [1, 2, 3].length, n.to_s", "vo_methods", "3" + nl() + "3.14" + nl() + "3" + nl() + "42")
+end
+
+# ---- integers.feature (1.3) ----
+
+make a function called st_int_extremes returns ok
+  return vm_expect("2^63 - 1 and -2^63 are ints", "int_extremes", "int" + nl() + "int")
+end
+
+make a function called st_int_mid returns ok
+  return vm_expect("2^47 + 9 is an int", "int_mid", "int" + nl() + "140737488355337")
+end
+
+make a function called st_int_leave_return returns ok
+  return vm_expect("2^63 is a bigint, and 2^63 - 1 an int again", "int_leave_return", "bigint" + nl() + "9223372036854775808" + nl() + "int" + nl() + "9223372036854775807")
+end
+
+make a function called st_int_below returns ok
+  return vm_expect("-2^63 - 1 is a bigint, and one more an int", "int_below", "bigint" + nl() + "int")
+end
+
+make a function called st_int_division returns ok
+  return vm_expect("3/1, 6/4 and 2^70/2^69", "int_division", "int" + nl() + "rational" + nl() + "int")
+end
+
+make a function called st_int_mul_overflow returns ok
+  return vm_expect("2^32 * 2^32 is the exact bigint", "int_mul_overflow", "bigint" + nl() + "18446744073709551616")
+end
+
+# ---- operator_events.feature (1.4) ----
+
+make a function called st_ev_operator_method returns ok
+  return vm_expect("Money's + gives a Money of 425 cents", "ev_operator_method", "Money" + nl() + "425")
+end
+
+make a function called st_ev_raises returns ok
+  return vm_expect("money_added ran once with [m1, m2, result]", "ev_raises", "1" + nl() + "true" + nl() + "true" + nl() + "true")
+end
+
+make a function called st_ev_int_order returns ok
+  return vm_expect("added_to, added_to, added, in order", "ev_int_order", "[added_to, [3, 5]]" + nl() + "[added_to, [5, 3]]" + nl() + "[added, [3, 5, 8]]" + nl() + "8")
+end
+
+make a function called st_ev_no_change returns ok
+  return vm_expect("a handler returning 0 leaves 3 + 5 as 8", "ev_no_change", "8")
+end
+
+make a function called st_ev_no_reentry returns ok
+  return vm_expect("an added handler adding 1 + 1 runs once", "ev_no_reentry", "1")
+end
+
+make a function called st_ev_ordinary returns ok
+  return vm_expect("emit reaches the same handler", "ev_ordinary", "[1, 2, 3]")
+end
+
+make a function called st_ev_no_handler returns ok
+  return vm_expect("8, 3 and ab, and 1.5 * 2 a float", "ev_no_handler", "8" + nl() + "3" + nl() + "ab" + nl() + "float")
+end
+
+# ---- value_and_identity.feature (1.5) ----
+
+make a function called st_vi_list_set returns ok
+  return vm_expect("list_set leaves a unchanged", "vi_list_set", "[1, 2, 3]" + nl() + "[9, 2, 3]")
+end
+
+make a function called st_vi_list_push returns ok
+  return vm_expect("list_push leaves a unchanged", "vi_list_push", "10" + nl() + "99" + nl() + "77")
+end
+
+make a function called st_vi_list_eq returns ok
+  return vm_expect("equal lists are equal", "vi_list_eq", "true")
+end
+
+make a function called st_vi_object_shared returns ok
+  return vm_expect("a change through p is seen through o", "vi_object_shared", "red")
+end
+
+make a function called st_vi_object_eq returns ok
+  return vm_expect("two Points are different objects", "vi_object_eq", "false" + nl() + "true")
+end
+
+make a function called st_vi_sb returns ok
+  return vm_expect("a builder is shared", "vi_sb", "hi")
+end
+
+make a function called st_vi_vec returns ok
+  return vm_expect("a vec is shared", "vi_vec", "1")
+end
+
+make a function called st_vi_bool_array returns ok
+  return vm_expect("a bool array keeps its identity when it grows", "vi_bool_array", "100" + nl() + "true")
+end
+
+# ---- bounded_memory.feature (1.6) ----
+
+# The two runs of a fixture, N and 10N: the longer may peak at most 10% higher.
+make a function called vm_not_growing takes label, name, kind, n returns ok
+  let args_n = [n.to_s]
+  let args_10n = [(n * 10).to_s]
+  if kind != "" then
+    let args_n = [kind, n.to_s]
+    let args_10n = [kind, (n * 10).to_s]
+  end
+  let short = vm_peak(name, args_n)
+  let long = vm_peak(name, args_10n)
+  if (short <= 0) or (long <= 0) then
+    return check(label + " (no measurement: the program did not run to its end)", false, true)
+  end
+  let growth = ((long - short) * 100) / short
+  return check(label + ": " + vm_mb(short) + " MB at " + n + ", " + vm_mb(long) + " MB at " + (n * 10) + ", grows under 10%", growth < 10, true)
+end
+
+make a function called st_bm_loops returns ok
+  let kinds = ["str_concat", "str_grow", "list3", "list_push", "list_set_older", "bigint", "rational", "complex", "object", "sb", "vec", "bool_array", "closure", "exec", "read_file"]
+  let all = true
+  let i = 0
+  while i < list_len(kinds) do
+    let n = 2000
+    if kinds[i] == "exec" then
+      let n = 20
+    end
+    if not vm_not_growing(kinds[i], "bm_loops", kinds[i], n) then
+      let all = false
+    end
+    let i = i + 1
+  end
+  return all
+end
+
+make a function called st_bm_named_delete returns ok
+  return vm_not_growing("named objects deleted each iteration", "bm_named_delete", "", 2000)
+end
+
+make a function called st_bm_named_kept returns ok
+  return vm_expect("w0's field is still red after 100 more objects", "bm_named_kept", "red")
+end
+
+# ---- engines_agree.feature (1.7) ----
+
+make a function called st_engines_agree returns ok
+  let names = ["vo_type_of", "vo_new_object", "vo_keeps_class", "vo_methods", "int_extremes", "int_mid", "int_leave_return", "int_below", "int_division", "int_mul_overflow", "ev_operator_method", "ev_raises", "ev_int_order", "ev_no_change", "ev_no_reentry", "ev_ordinary", "ev_no_handler", "vi_list_set", "vi_list_push", "vi_list_eq", "vi_object_shared", "vi_object_eq", "vi_sb", "vi_vec", "vi_bool_array", "bm_named_kept"]
+  let all = true
+  let i = 0
+  while i < list_len(names) do
+    let a = vm_run_on("interp", names[i], [])
+    let b = vm_run_on("v2", names[i], [])
+    if not check(names[i] + ": the interpreter and v2 print the same", a == b, true) then
+      let all = false
+    end
+    let i = i + 1
+  end
+  return all
+end
+
+make a function called register_values_and_memory_steps returns done
+  vm_noops(["the values 7, 2^70, 1.5, 6/4, true, the unit value print returns, \"hi\", [1, 2], a closure, sb_new(), vec_new() and bool_array_new(3)", "type_of is applied to each", "w = new(\"Widget\", \"w1\")", "type_of(w) is read", "the value 1.5 stored in a list, passed to a function, returned, and read back", "type_of is applied to what was read back", "3.to_s, 3.14.to_s, [1, 2, 3].length, and n.to_s where n is 42", "each is evaluated"])
+  step("the results are int, bigint, float, rational, bool, unit, string, list, closure, string_builder, vec, bool_array", "st_vo_type_of")
+  step("it is Widget", "st_vo_new_object")
+  step("it is float, and the value is 1.5", "st_vo_keeps_class")
+  step("they are \"3\", \"3.14\", 3 and \"42\"", "st_vo_methods")
+
+  vm_noops(["9223372036854775807 and 0 - 9223372036854775807 - 1", "type_of is applied to each", "140737488355327 + 10", "type_of is applied", "big = 9223372036854775807 + 1, and back = big - 1", "low = 0 - 9223372036854775807 - 1 - 1", "3 / 1, 6 / 4 and 2^70 / 2^69", "4294967296 * 4294967296", "it is evaluated"])
+  step("both are int", "st_int_extremes")
+  step("it is int, and the value is 140737488355337", "st_int_mid")
+  step("big is bigint with value 9223372036854775808, and back is int with value 9223372036854775807", "st_int_leave_return")
+  step("it is bigint, and low + 1 is int", "st_int_below")
+  step("they are int, rational and int", "st_int_division")
+  step("it is bigint with value 18446744073709551616", "st_int_mul_overflow")
+
+  vm_noops(["a class Money with a field cents and a method + taking other, returning a Money with the two amounts' cents summed", "m1 + m2 is evaluated, with 150 and 275 cents", "a class Money whose + is declared `raises money_added`", "a handler `when money_added do ... end` recording event_data", "m1 + m2 is evaluated", "handlers for added_to and added that append event_name and event_data to a log", "3 + 5 is evaluated", "the value of 3 + 5 is 8", "a handler for added that tries to return 0", "a handler for added that adds 1 + 1 and counts how many times it ran", "a handler for added registered with `when added do ... end`", "emit(\"added\", [1, 2, 3]) is called directly", "no handler registered for any event", "3 + 5, 1.5 * 2 and \"a\" + \"b\" are evaluated"])
+  step("the result is a Money with 425 cents", "st_ev_operator_method")
+  step("the handler ran once, with event_data [m1, m2, the result]", "st_ev_raises")
+  step("the log is: added_to [3, 5], added_to [5, 3], added [3, 5, 8]", "st_ev_int_order")
+  step("the value is 8", "st_ev_no_change")
+  step("the handler ran once", "st_ev_no_reentry")
+  step("the same handler runs, with event_data [1, 2, 3]", "st_ev_ordinary")
+  step("they print as 8, 3 and ab, and 1.5 * 2 is a float", "st_ev_no_handler")
+
+  vm_noops(["a = [1, 2, 3] and b = list_set(a, 0, 9)", "both are read", "a list a built by 10 list_push calls, then b = list_push(a, 99) and c = list_push(a, 77)", "all three are read", "[\"x\", \"y\"] and list_push(list_push([], \"x\"), \"y\")", "they are compared with ==", "o = new(\"Widget\", \"w1\"), p = o, and send(p, \"set\", \"color\", \"red\")", "get(o, \"color\") is read", "two objects of class Point, each with x = 1 and y = 2", "b = sb_new(), c = b, sb_push(c, \"hi\")", "sb_str(b) is read", "v = vec_new(), w = v, vec_push(w, 5)", "vec_len(v) is read", "a = bool_array_new(0), b = a, then 100 bool_array_push calls on a", "bool_array_len(b) is read"])
+  step("a is [1, 2, 3] and b is [9, 2, 3]", "st_vi_list_set")
+  step("a has 10 elements, b ends in 99, and c ends in 77", "st_vi_list_push")
+  step("the result is true", "st_vi_list_eq")
+  step("it is \"red\"", "st_vi_object_shared")
+  step("the result is false, and an object compared with itself is true", "st_vi_object_eq")
+  step("it is \"hi\"", "st_vi_sb")
+  step("it is 1", "st_vi_vec")
+  step("it is 100, and a == b is true", "st_vi_bool_array")
+
+  vm_noops(["loops of N iterations that each replace a local every iteration with one of these producers:", "each runs for N and for 10N iterations", "a loop that makes new(\"Widget\", \"w\" + i) and calls object_delete on it each iteration", "it runs for N and for 10N iterations", "a loop that makes new(\"Widget\", \"w\" + i) without object_delete, then reads get of the first", "it runs"])
+  step("no loop's peak memory grows", "st_bm_loops")
+  step("the peak memory does not grow", "st_bm_named_delete")
+  step("the first object's fields are still readable after the loop", "st_bm_named_kept")
+
+  vm_noops(["each @language scenario in spec_library/values_and_memory", "it runs under the interpreter and as a native executable"])
+  step("both pass, with the same printed output", "st_engines_agree")
+  return true
+end
+
+t_init()
+register_values_and_memory_steps()
+print("engine: " + vm_engine())
+let features = ["values_are_objects", "integers", "operator_events", "value_and_identity", "bounded_memory"]
+if vm_engine() == "both" then
+  let features = ["engines_agree"]
+end
+let i = 0
+while i < list_len(features) do
+  run_feature_file("spec_library/values_and_memory/" + features[i] + ".feature")
+  let i = i + 1
+end
+t_report()

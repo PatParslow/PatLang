@@ -705,6 +705,55 @@ pub fn host_exec_capture(args: &[Value]) -> Result<Value, String> {
     Ok(Value::String((text).into()))
 }
 
+pub fn host_exec_peak_memory(args: &[Value]) -> Result<Value, String> {
+    // exec_peak_memory(path, [arg1, ...]) -> [stdout, peak working set in
+    // bytes]. For a harness checking that a program's memory stays bounded
+    // (docs/spec/values-and-memory.md 1.6): the child's own peak, read from
+    // the OS after it exits. A program has no primitive for its own memory.
+    // -1 where the OS gives no figure.
+    use std::io::Read;
+    let p = match args.get(0) { Some(Value::String(s)) => s.as_ref().clone(), _ => return Err("exec_peak_memory: expected program path".into()) };
+    let extra: Vec<String> = match args.get(1) {
+        Some(Value::List(xs)) => xs.iter().filter_map(|v| match v { Value::String(s) => Some(s.as_ref().clone()), _ => None }).collect(),
+        _ => Vec::new(),
+    };
+    let mut child = std::process::Command::new(&p).args(&extra)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn().map_err(|e| format!("exec_peak_memory: {}: {}", p, e))?;
+    let mut so = child.stdout.take().ok_or("exec_peak_memory: no stdout pipe")?;
+    let mut se = child.stderr.take().ok_or("exec_peak_memory: no stderr pipe")?;
+    let err_reader = std::thread::spawn(move || { let mut b = Vec::new(); let _ = se.read_to_end(&mut b); b });
+    let mut out = Vec::new();
+    so.read_to_end(&mut out).map_err(|e| format!("exec_peak_memory: {}: {}", p, e))?;
+    let status = child.wait().map_err(|e| format!("exec_peak_memory: {}: {}", p, e))?;
+    let err = err_reader.join().unwrap_or_default();
+    let peak: i64 = {
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            #[repr(C)]
+            struct ProcessMemoryCounters { cb: u32, page_fault_count: u32, peak_working_set_size: usize, working_set_size: usize, quota_peak_paged_pool_usage: usize, quota_paged_pool_usage: usize, quota_peak_non_paged_pool_usage: usize, quota_non_paged_pool_usage: usize, pagefile_usage: usize, peak_pagefile_usage: usize }
+            #[link(name = "kernel32")]
+            unsafe extern "system" { fn K32GetProcessMemoryInfo(process: *mut std::ffi::c_void, counters: *mut ProcessMemoryCounters, cb: u32) -> i32; }
+            let mut c = ProcessMemoryCounters { cb: std::mem::size_of::<ProcessMemoryCounters>() as u32, page_fault_count: 0, peak_working_set_size: 0, working_set_size: 0, quota_peak_paged_pool_usage: 0, quota_paged_pool_usage: 0, quota_peak_non_paged_pool_usage: 0, quota_non_paged_pool_usage: 0, pagefile_usage: 0, peak_pagefile_usage: 0 };
+            let ok = unsafe { K32GetProcessMemoryInfo(child.as_raw_handle() as *mut std::ffi::c_void, &mut c, c.cb) };
+            if ok != 0 { c.peak_working_set_size as i64 } else { -1 }
+        }
+        #[cfg(not(windows))]
+        { -1 }
+    };
+    let mut text = String::from_utf8_lossy(&out).to_string();
+    if !status.success() {
+        let e = String::from_utf8_lossy(&err);
+        if !e.trim().is_empty() {
+            if !text.is_empty() && !text.ends_with('\n') { text.push('\n'); }
+            text.push_str(&e);
+        }
+    }
+    Ok(Value::List(Arc::new(vec![Value::String(text.into()), Value::Int(peak)])))
+}
+
 pub fn host_exec_capture_io(args: &[Value]) -> Result<Value, String> {
     // exec_capture_io(path, [arg1, ...], stdin_text) -> [stdout, stderr, success]
     // Unlike exec_capture (which merges stderr into stdout on failure and
@@ -3966,6 +4015,7 @@ pub fn register_stage0_shims(interp: &mut Interpreter) {
     interp.host.insert("getenv", host_getenv);
     interp.host.insert("exec_capture", host_exec_capture);
     interp.host.insert("exec_capture_io", host_exec_capture_io);
+    interp.host.insert("exec_peak_memory", host_exec_peak_memory);
     interp.host.insert("compile_shape", host_compile_shape);
     interp.host.insert("compile_ir", host_compile_ir);
     interp.host.insert("run_ir", host_run_ir);

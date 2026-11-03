@@ -1,0 +1,213 @@
+# v2 runtime: lists. A list's block payload is [len:8][cap:8], then cap
+# elements of 16 bytes (type word, data word), from block + 32. A list is a
+# value (spec 1.5): list_push and list_set never change a list anyone else
+# can see. They change it in place only when its count is 1: the caller
+# gave its only reference to the call (own.patlang), so no one else holds
+# it. Otherwise they copy. The count is read directly from the parameter's
+# block (mem_load of value_data, primitives, which take no reference):
+# passing the list to a helper would itself add a reference, so a helper
+# never sees a count of 1.
+quiet_operators()
+
+make a function called rt_list_heap_type returns t
+  let t = 4294967305
+  ensure (word_and(t, 4294967295) == 9) and (word_and(t, 4294967296) != 0)
+  return t
+end
+
+make a function called rt_list_block_alloc takes cap returns block
+  require (value_class(cap) == 2) and (cap >= 0)
+  let block = rt_alloc(16 + 16 * cap)
+  mem_store(block, 16, 0)
+  mem_store(block, 24, cap)
+  ensure (mem_load(block, 24) == cap) and (mem_load(block, 16) == 0)
+  return block
+end
+
+# A list of n unit elements (a list literal fills them in, x64.patlang).
+make a function called rt_list_alloc takes n returns l
+  require (value_class(n) == 2) and (n >= 0)
+  let block = rt_list_block_alloc(n)
+  mem_store(block, 16, n)
+  let k = 0
+  while k < n do
+    mem_store(block, 32 + 16 * k, 0)
+    mem_store(block, 40 + 16 * k, 0)
+    let k = k + 1
+  end
+  let l = value_make(rt_list_heap_type(), block)
+  ensure (value_class(l) == 9) and (list_len(l) == n)
+  return l
+end
+
+make a function called list_len takes l returns n
+  require (value_class(l) == 9) and rt_live(l)
+  let n = mem_load(value_data(l), 16)
+  ensure (n >= 0) and (n <= mem_load(value_data(l), 24))
+  return n
+end
+
+
+make a function called rt_check_index takes i, n returns r
+  require (value_class(n) == 2)
+  if (value_class(i) != 2) or (i < 0) or (i >= n) then
+    rt_fail_index()
+  end
+  let r = 0
+  ensure (value_class(i) == 2) and (i >= 0) and (i < n)
+  return r
+end
+
+make a function called rt_fail_index returns r
+  print("index out of range")
+  let r = extern_call("KERNEL32.DLL", "ExitProcess", 73)
+  ensure false
+  return r
+end
+
+make a function called list_get takes l, i returns v
+  require (value_class(l) == 9) and rt_live(l)
+  rt_check_index(i, list_len(l))
+  let v = mem_load_value(value_data(l), 32 + 16 * i)
+  ensure rt_live(v)
+  return v
+end
+
+# A copy of l's elements in a block with room for cap, each element with a
+# reference of its own.
+make a function called rt_list_copy takes l, cap returns block
+  require (value_class(l) == 9) and (cap >= list_len(l))
+  let n = list_len(l)
+  let src = value_data(l)
+  let block = rt_list_block_alloc(cap)
+  mem_store(block, 16, n)
+  let k = 0
+  while k < n do
+    mem_init_value(block, 32 + 16 * k, mem_load_value(src, 32 + 16 * k))
+    let k = k + 1
+  end
+  ensure (mem_load(block, 16) == list_len(l)) and (mem_load(block, 24) == cap)
+  return block
+end
+
+make a function called list_push takes l, x returns r
+  require (value_class(l) == 9) and rt_live(l) and rt_live(x)
+  let block = value_data(l)
+  let n = mem_load(block, 16)
+  if (mem_load(block, 0) == 1) and (n < mem_load(block, 24)) then
+    mem_init_value(block, 32 + 16 * n, x)
+    mem_store(block, 16, n + 1)
+    let r = l
+    ensure (value_class(r) == 9) and (list_len(r) == n + 1)
+    return r
+  end
+  let cap = 4
+  if n * 2 > cap then
+    let cap = n * 2
+  end
+  let copy = rt_list_copy(l, cap)
+  mem_init_value(copy, 32 + 16 * n, x)
+  mem_store(copy, 16, n + 1)
+  let r = value_make(rt_list_heap_type(), copy)
+  ensure (value_class(r) == 9) and (list_len(r) == n + 1)
+  return r
+end
+
+make a function called list_set takes l, i, x returns r
+  require (value_class(l) == 9) and rt_live(l) and rt_live(x)
+  rt_check_index(i, list_len(l))
+  if mem_load(value_data(l), 0) == 1 then
+    mem_store_value(value_data(l), 32 + 16 * i, x)
+    let r = l
+    ensure (value_class(r) == 9) and (list_len(r) == list_len(l))
+    return r
+  end
+  let copy = rt_list_copy(l, list_len(l))
+  mem_store_value(copy, 32 + 16 * i, x)
+  let r = value_make(rt_list_heap_type(), copy)
+  ensure (value_class(r) == 9) and (list_len(r) == list_len(l))
+  return r
+end
+
+# Releases a freed list's elements (rt_finalize).
+make a function called rt_list_release_elements takes block returns r
+  require mem_load(block, 0) == 0
+  let n = mem_load(block, 16)
+  let k = 0
+  while k < n do
+    let tw = mem_load(block, 32 + 16 * k)
+    if word_and(tw, 4294967296) != 0 then
+      rt_release(tw, mem_load(block, 40 + 16 * k))
+    end
+    let k = k + 1
+  end
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+make a function called rt_list_eq takes a, b returns yes
+  require (value_class(a) == 9) and (value_class(b) == 9)
+  let n = list_len(a)
+  if n != list_len(b) then
+    let yes = false
+    ensure value_class(yes) == 1
+    return yes
+  end
+  let k = 0
+  while k < n do
+    if not op_eq(list_get(a, k), list_get(b, k)) then
+      let yes = false
+      ensure value_class(yes) == 1
+      return yes
+    end
+    let k = k + 1
+  end
+  let yes = true
+  ensure value_class(yes) == 1
+  return yes
+end
+
+make a function called rt_list_to_s takes l returns s
+  require (value_class(l) == 9)
+  let parts = []
+  let n = list_len(l)
+  let k = 0
+  while k < n do
+    let parts = list_push(parts, to_s(list_get(l, k)))
+    let k = k + 1
+  end
+  let s = "[" + str_join(parts, ", ") + "]"
+  ensure value_class(s) == 8
+  return s
+end
+
+make a function called rt_list_concat takes a, b returns l
+  require (value_class(a) == 9) and (value_class(b) == 9)
+  let l = rt_list_alloc(0)
+  let k = 0
+  while k < list_len(a) do
+    let l = list_push(l, list_get(a, k))
+    let k = k + 1
+  end
+  let k = 0
+  while k < list_len(b) do
+    let l = list_push(l, list_get(b, k))
+    let k = k + 1
+  end
+  ensure list_len(l) == list_len(a) + list_len(b)
+  return l
+end
+
+make a function called index_get takes v, i returns r
+  require rt_live(v)
+  let c = value_class(v)
+  if c == 9 then
+    let r = list_get(v, i)
+    ensure rt_live(r)
+    return r
+  end
+  let r = rt_fail_class(c)
+  ensure rt_live(r)
+  return r
+end

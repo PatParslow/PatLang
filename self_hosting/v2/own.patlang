@@ -1,0 +1,217 @@
+# v2 ownership stage (docs/spec/values-and-memory.md 2.2): inserts the
+# retains and releases the five rules require, the same way for every
+# function, runtime or program. A retain or release does something only for
+# a value whose type word has the heap bit (x64.patlang, xv_count).
+#
+# - Parameters are borrowed (rule 1): never released here. The lowering
+#   copies a parameter the body reassigns into a local first, so a
+#   parameter slot is never written.
+# - Every instruction that produces a value writes it to a fresh
+#   temporary; the slot's old value is released, then the new one moves in.
+# - A copy from a named variable takes a reference of its own (rule 2); a
+#   copy from a temporary, which is never read again, is a move. `take`
+#   (from the lowering) moves a variable's value out, leaving it unit.
+# - A call's arguments each hold a reference of their own: a variable is
+#   passed through a temporary that takes one, and every argument temporary
+#   is released right after the call. So a callee seeing a count of 1 knows
+#   nothing else holds the value, and may change it in place.
+# - Every other instruction's temporaries are released right after it reads
+#   them, so a value lives no longer than something holds it. A temporary
+#   no instruction reads (a call made for its effect) is released as soon
+#   as it is made.
+# - A return retains its value for the caller (rule 1), then releases every
+#   slot but the parameters.
+
+make a function called own_produces takes op returns yes
+  return (op == "const") or (op == "call") or (op == "op") or (op == "un") or (op == "prim") or (op == "extern") or (op == "externf") or (op == "list") or (op == "closure") or (op == "callv")
+end
+
+make a function called own_function takes func returns out
+  require ir_well_formed(func, false)
+  let nslots = ir_fn_nslots(func)
+  let nparams = ir_fn_nparams(func)
+  let vars = ir_fn_vars(func)
+  let instrs = ir_fn_instrs(func)
+  let counter = vec_new()
+  vec_push(counter, nslots)
+  let read = own_read_slots(instrs, nslots)
+  let res = vec_new()
+  let i = 0
+  while i < list_len(instrs) do
+    let ins = instrs[i]
+    let op = ins[0]
+    if own_produces(op) then
+      let d = ins[1]
+      let t = own_new_slot(counter)
+      if op == "call" then
+        let passed = own_args(res, counter, vars, ins[3])
+        vec_push(res, ["call", t, ins[2], passed])
+        own_release_temps(res, passed, ins[3])
+      elif op == "callv" then
+        let passed = own_args(res, counter, vars, ins[2])
+        vec_push(res, ["callv", t, passed])
+        own_release_temps(res, passed, ins[2])
+      else
+        vec_push(res, list_set(ins, 1, t))
+      end
+      vec_push(res, ["release", d])
+      vec_push(res, ["move", d, t])
+      if (op != "call") and (op != "callv") then
+        own_release_operand_temps(res, vars, own_operands(ins), d)
+      end
+      if (not v2_contains(vars, d)) and (not vec_get(read, d)) then
+        vec_push(res, ["release", d])
+        vec_push(res, ["clear", d])
+      end
+    elif op == "copy" then
+      let d = ins[1]
+      let s = ins[2]
+      if d != s then
+        if v2_contains(vars, s) then
+          vec_push(res, ["retain", s])
+          vec_push(res, ["release", d])
+          vec_push(res, ["copy", d, s])
+        else
+          vec_push(res, ["release", d])
+          vec_push(res, ["move", d, s])
+        end
+      end
+    elif op == "take" then
+      vec_push(res, ["release", ins[1]])
+      vec_push(res, ["move", ins[1], ins[2]])
+    elif op == "return" then
+      let s = ins[1]
+      vec_push(res, ["retain", s])
+      let k = nparams
+      while k < nslots do
+        vec_push(res, ["release", k])
+        let k = k + 1
+      end
+      vec_push(res, ins)
+    else
+      vec_push(res, ins)
+    end
+    let i = i + 1
+  end
+  let out = ir_fn(ir_fn_name(func), nparams, vec_get(counter, 0), vec_to_list(res), vars)
+  ensure ir_well_formed(out, true)
+  return out
+end
+
+# The slots an instruction reads.
+make a function called own_operands takes ins returns slots
+  let op = ins[0]
+  if op == "op" then
+    return [ins[3], ins[4]]
+  end
+  if op == "un" then
+    return [ins[3]]
+  end
+  if (op == "prim") or (op == "list") or (op == "closure") then
+    if op == "closure" then
+      return ins[3]
+    end
+    if op == "prim" then
+      return ins[3]
+    end
+    return ins[2]
+  end
+  if (op == "extern") or (op == "externf") then
+    return ins[4]
+  end
+  return []
+end
+
+# Every slot an instruction reads, operands or not.
+make a function called own_reads takes ins returns slots
+  let op = ins[0]
+  if op == "call" then
+    return ins[3]
+  end
+  if op == "callv" then
+    return ins[2]
+  end
+  if (op == "copy") or (op == "take") then
+    return [ins[2]]
+  end
+  if (op == "return") or (op == "branch") then
+    return [ins[1]]
+  end
+  return own_operands(ins)
+end
+
+# For each slot, whether any instruction reads it.
+make a function called own_read_slots takes instrs, nslots returns read
+  let read = vec_new()
+  let k = 0
+  while k < nslots do
+    vec_push(read, false)
+    let k = k + 1
+  end
+  let i = 0
+  while i < list_len(instrs) do
+    let slots = own_reads(instrs[i])
+    let k = 0
+    while k < list_len(slots) do
+      vec_set(read, slots[k], true)
+      let k = k + 1
+    end
+    let i = i + 1
+  end
+  return read
+end
+
+# After an instruction, each temporary it read is released and left unit:
+# a temporary is read once, so its value is held no longer than needed.
+# (A variable keeps its value; d, the instruction's own result, is kept.)
+make a function called own_release_operand_temps takes res, vars, slots, d returns done
+  let seen = []
+  let k = 0
+  while k < list_len(slots) do
+    let s = slots[k]
+    if (not v2_contains(vars, s)) and (s != d) and (not v2_contains(seen, s)) then
+      vec_push(res, ["release", s])
+      vec_push(res, ["clear", s])
+      let seen = list_push(seen, s)
+    end
+    let k = k + 1
+  end
+  return true
+end
+
+make a function called own_new_slot takes counter returns s
+  let s = vec_get(counter, 0)
+  vec_set(counter, 0, s + 1)
+  return s
+end
+
+# A call's argument slots: a variable's value passed through a temporary
+# holding a reference of its own; a temporary passed as it is.
+make a function called own_args takes res, counter, vars, args returns passed
+  let passed = []
+  let k = 0
+  while k < list_len(args) do
+    let a = args[k]
+    if v2_contains(vars, a) then
+      let t = own_new_slot(counter)
+      vec_push(res, ["retain", a])
+      vec_push(res, ["copy", t, a])
+      let passed = list_push(passed, t)
+    else
+      let passed = list_push(passed, a)
+    end
+    let k = k + 1
+  end
+  return passed
+end
+
+# After a call: every argument temporary is released and left unit.
+make a function called own_release_temps takes res, passed, args returns done
+  let k = 0
+  while k < list_len(passed) do
+    vec_push(res, ["release", passed[k]])
+    vec_push(res, ["clear", passed[k]])
+    let k = k + 1
+  end
+  return true
+end

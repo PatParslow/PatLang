@@ -6,17 +6,12 @@ Feature: a program with bounded live data runs in bounded memory (spec 1.6)
   shorter's by less than 10%. The program itself has no way to read its
   memory use.
 
-  Scenario Outline: a loop replacing one value each iteration does not grow memory
-    Given a loop of N iterations that replaces a local with <producer> each time
-    When it runs for N and for 10N iterations
-    Then the peak memory does not grow
-
-    Examples:
-      | producer                                   |
+  Scenario: a loop replacing one value each iteration does not grow memory
+    Given loops of N iterations that each replace a local every iteration with one of these producers:
       | the string "x" + i                         |
-      | the string grown by one character          |
+      | a string grown by one character, restarted every 100 characters |
       | a 3-element list [i, i + 1, "s"]           |
-      | list_push of i onto the previous list      |
+      | list_push of i onto a list restarted every 100 elements |
       | list_set of an element of an older version |
       | a total past 2^63, so a bigint             |
       | i / 7, a rational                          |
@@ -28,6 +23,8 @@ Feature: a program with bounded live data runs in bounded memory (spec 1.6)
       | a closure capturing i                      |
       | exec_capture of "echo"                     |
       | read_file of a small file                  |
+    When each runs for N and for 10N iterations
+    Then no loop's peak memory grows
 
   Scenario: a named object lives until object_delete
     Given a loop that makes new("Widget", "w" + i) and calls object_delete on it each iteration

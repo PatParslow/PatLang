@@ -1,0 +1,385 @@
+# v2 runtime: strings. A string's block payload is [len:8] then its bytes;
+# a literal is data with the same layout and its heap bit clear
+# (x64.patlang, xv_str_data), so length and bytes are always at the same
+# offsets from the data word, and only a heap string is ever counted.
+quiet_operators()
+
+make a function called rt_string_class returns c
+  let c = 8
+  ensure c == 8
+  return c
+end
+
+# A heap string's type word: class 8 with the heap bit (bit 32).
+make a function called rt_string_heap_type returns t
+  let t = 4294967304
+  ensure (word_and(t, 4294967295) == 8) and (word_and(t, 4294967296) != 0)
+  return t
+end
+
+make a function called str_len takes s returns n
+  require (value_class(s) == 8) and rt_live(s)
+  let n = mem_load(value_data(s), 16)
+  ensure n >= 0
+  return n
+end
+
+make a function called rt_str_bytes takes s returns addr
+  require (value_class(s) == 8)
+  let addr = value_data(s) + 24
+  ensure addr == value_data(s) + 24
+  return addr
+end
+
+# A new string of len bytes, its bytes not yet written.
+make a function called rt_str_alloc takes len returns block
+  require (value_class(len) == 2) and (len >= 0)
+  let block = rt_alloc(8 + len)
+  mem_store(block, 16, len)
+  ensure mem_load(block, 16) == len
+  return block
+end
+
+make a function called rt_copy_bytes takes dst, src, n returns r
+  require (n >= 0) and ((n == 0) or ((dst != 0) and (src != 0)))
+  let i = 0
+  while i < n do
+    mem_store_byte(dst, i, mem_load_byte(src, i))
+    let i = i + 1
+  end
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+make a function called str_concat takes a, b returns s
+  require (value_class(a) == 8) and (value_class(b) == 8) and rt_live(a) and rt_live(b)
+  let la = str_len(a)
+  let lb = str_len(b)
+  let block = rt_str_alloc(la + lb)
+  rt_copy_bytes(block + 24, rt_str_bytes(a), la)
+  rt_copy_bytes(block + 24 + la, rt_str_bytes(b), lb)
+  let s = value_make(rt_string_heap_type(), block)
+  ensure (value_class(s) == 8) and (str_len(s) == str_len(a) + str_len(b))
+  return s
+end
+
+# -1, 0 or 1 comparing bytes, a shorter prefix first.
+make a function called str_cmp takes a, b returns c
+  require (value_class(a) == 8) and (value_class(b) == 8)
+  let la = str_len(a)
+  let lb = str_len(b)
+  let pa = rt_str_bytes(a)
+  let pb = rt_str_bytes(b)
+  let i = 0
+  while (i < la) and (i < lb) do
+    let x = mem_load_byte(pa, i)
+    let y = mem_load_byte(pb, i)
+    if x != y then
+      if x < y then
+        let c = 0 - 1
+        ensure (c == 0 - 1) or (c == 0) or (c == 1)
+        return c
+      end
+      let c = 1
+      ensure (c == 0 - 1) or (c == 0) or (c == 1)
+      return c
+    end
+    let i = i + 1
+  end
+  if la < lb then
+    let c = 0 - 1
+    ensure (c == 0 - 1) or (c == 0) or (c == 1)
+    return c
+  end
+  if la > lb then
+    let c = 1
+    ensure (c == 0 - 1) or (c == 0) or (c == 1)
+    return c
+  end
+  let c = 0
+  ensure (c == 0 - 1) or (c == 0) or (c == 1)
+  return c
+end
+
+make a function called str_eq takes a, b returns yes
+  require (value_class(a) == 8) and (value_class(b) == 8)
+  let n = str_len(a)
+  if n != str_len(b) then
+    let yes = false
+    ensure value_class(yes) == 1
+    return yes
+  end
+  let pa = rt_str_bytes(a)
+  let pb = rt_str_bytes(b)
+  let i = 0
+  while i < n do
+    if mem_load_byte(pa, i) != mem_load_byte(pb, i) then
+      let yes = false
+      ensure value_class(yes) == 1
+      return yes
+    end
+    let i = i + 1
+  end
+  let yes = true
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# The decimal text of a 64-bit int.
+make a function called rt_int_to_s takes n returns s
+  require (value_class(n) == 2)
+  let digits = 0
+  let v = n
+  if v == 0 then
+    let digits = 1
+  end
+  while v != 0 do
+    let digits = digits + 1
+    let v = word_div(v, 10)
+  end
+  let len = digits
+  if n < 0 then
+    let len = len + 1
+  end
+  let block = rt_str_alloc(len)
+  let at = block + 24
+  let pos = len - 1
+  let v = n
+  if v == 0 then
+    mem_store_byte(at, 0, 48)
+  end
+  while v != 0 do
+    let digit = word_rem(v, 10)
+    if digit < 0 then
+      let digit = 0 - digit
+    end
+    mem_store_byte(at, pos, 48 + digit)
+    let pos = pos - 1
+    let v = word_div(v, 10)
+  end
+  if n < 0 then
+    mem_store_byte(at, 0, 45)
+  end
+  let s = value_make(rt_string_heap_type(), block)
+  ensure (value_class(s) == 8) and (str_len(s) >= 1)
+  return s
+end
+
+# Every value's text, as print shows it.
+make a function called to_s takes v returns s
+  require rt_live(v)
+  let c = value_class(v)
+  if c == 8 then
+    let s = v
+    ensure value_class(s) == 8
+    return s
+  end
+  if c == 2 then
+    let s = rt_int_to_s(value_data(v))
+    ensure value_class(s) == 8
+    return s
+  end
+  if c == 1 then
+    if value_data(v) == 0 then
+      let s = "false"
+      ensure value_class(s) == 8
+      return s
+    end
+    let s = "true"
+    ensure value_class(s) == 8
+    return s
+  end
+  if c == 0 then
+    let s = "()"
+    ensure value_class(s) == 8
+    return s
+  end
+  if c == 9 then
+    let s = rt_list_to_s(v)
+    ensure value_class(s) == 8
+    return s
+  end
+  if c == 3 then
+    let s = rt_float_text(value_data(v))
+    ensure value_class(s) == 8
+    return s
+  end
+  if c == 4 then
+    let s = rt_bigint_to_s(v)
+    ensure value_class(s) == 8
+    return s
+  end
+  if c == 5 then
+    let s = rt_rational_to_s(v)
+    ensure value_class(s) == 8
+    return s
+  end
+  if c == 6 then
+    let s = rt_complex_to_s(v)
+    ensure value_class(s) == 8
+    return s
+  end
+  if c == 10 then
+    let s = "<closure>"
+    ensure value_class(s) == 8
+    return s
+  end
+  if c == 11 then
+    let s = "<string_builder>"
+    ensure value_class(s) == 8
+    return s
+  end
+  if c == 12 then
+    let s = "<vec>"
+    ensure value_class(s) == 8
+    return s
+  end
+  if c == 13 then
+    let s = "<bool_array>"
+    ensure value_class(s) == 8
+    return s
+  end
+  if c >= 63 then
+    let s = "<" + rt_class_name(c) + ">"
+    ensure value_class(s) == 8
+    return s
+  end
+  let s = "<" + type_of(v) + ">"
+  ensure value_class(s) == 8
+  return s
+end
+
+make a function called dot_to_s takes v returns s
+  require rt_live(v)
+  let s = to_s(v)
+  ensure value_class(s) == 8
+  return s
+end
+
+make a function called type_of takes v returns name
+  require rt_live(v)
+  let c = value_class(v)
+  if c == 0 then
+    let name = "unit"
+    ensure (value_class(name) == 8) and (str_len(name) > 0)
+    return name
+  end
+  if c == 1 then
+    let name = "bool"
+    ensure (value_class(name) == 8) and (str_len(name) > 0)
+    return name
+  end
+  if c == 2 then
+    let name = "int"
+    ensure (value_class(name) == 8) and (str_len(name) > 0)
+    return name
+  end
+  if c == 3 then
+    let name = "float"
+    ensure (value_class(name) == 8) and (str_len(name) > 0)
+    return name
+  end
+  if c == 4 then
+    let name = "bigint"
+    ensure (value_class(name) == 8) and (str_len(name) > 0)
+    return name
+  end
+  if c == 5 then
+    let name = "rational"
+    ensure (value_class(name) == 8) and (str_len(name) > 0)
+    return name
+  end
+  if c == 6 then
+    let name = "complex"
+    ensure (value_class(name) == 8) and (str_len(name) > 0)
+    return name
+  end
+  if c == 7 then
+    let name = "interval"
+    ensure (value_class(name) == 8) and (str_len(name) > 0)
+    return name
+  end
+  if c == 8 then
+    let name = "string"
+    ensure (value_class(name) == 8) and (str_len(name) > 0)
+    return name
+  end
+  if c == 9 then
+    let name = "list"
+    ensure (value_class(name) == 8) and (str_len(name) > 0)
+    return name
+  end
+  if c == 10 then
+    let name = "closure"
+    ensure (value_class(name) == 8) and (str_len(name) > 0)
+    return name
+  end
+  if c == 11 then
+    let name = "string_builder"
+    ensure (value_class(name) == 8) and (str_len(name) > 0)
+    return name
+  end
+  if c == 12 then
+    let name = "vec"
+    ensure (value_class(name) == 8) and (str_len(name) > 0)
+    return name
+  end
+  if c == 13 then
+    let name = "bool_array"
+    ensure (value_class(name) == 8) and (str_len(name) > 0)
+    return name
+  end
+  let name = rt_class_name(c)
+  ensure (value_class(name) == 8) and (str_len(name) > 0)
+  return name
+end
+
+make a function called dot_length takes v returns n
+  require (value_class(v) == 8) or (value_class(v) == 9)
+  if value_class(v) == 8 then
+    let n = str_len(v)
+    ensure n >= 0
+    return n
+  end
+  if value_class(v) == 9 then
+    let n = list_len(v)
+    ensure n >= 0
+    return n
+  end
+  let n = rt_fail_class(value_class(v))
+  ensure n >= 0
+  return n
+end
+
+# The strings of a list joined with sep between them: the length is summed
+# first, then every byte is copied once.
+make a function called str_join takes parts, sep returns s
+  require (value_class(parts) == 9) and (value_class(sep) == 8)
+  let n = list_len(parts)
+  let total = 0
+  let k = 0
+  while k < n do
+    let total = total + str_len(list_get(parts, k))
+    let k = k + 1
+  end
+  if n > 1 then
+    let total = total + str_len(sep) * (n - 1)
+  end
+  let block = rt_str_alloc(total)
+  let at = block + 24
+  let k = 0
+  while k < n do
+    if k > 0 then
+      rt_copy_bytes(at, rt_str_bytes(sep), str_len(sep))
+      let at = at + str_len(sep)
+    end
+    let part = list_get(parts, k)
+    rt_copy_bytes(at, rt_str_bytes(part), str_len(part))
+    let at = at + str_len(part)
+    let k = k + 1
+  end
+  let s = value_make(rt_string_heap_type(), block)
+  ensure value_class(s) == 8
+  return s
+end

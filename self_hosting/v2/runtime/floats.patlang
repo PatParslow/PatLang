@@ -1,0 +1,481 @@
+# v2 runtime: floats. A float's data word is its IEEE 754 bits (class 3, no
+# heap block). Arithmetic is the float_* primitives; the text is what the
+# interpreter (Rust's f64 Display) prints: NaN, inf, -inf; a whole number as
+# the integer it is; otherwise the shortest decimal that reads back as the
+# same double, never in exponent notation.
+quiet_operators()
+
+make a function called rt_float takes bits returns f
+  require (value_class(bits) == 2)
+  let f = value_make(3, bits)
+  ensure value_class(f) == 3
+  return f
+end
+
+# A number's value as float bits (int and float for now; bigints and
+# rationals with them).
+make a function called rt_float_bits_of takes v returns bits
+  require rt_is_real(v)
+  let c = value_class(v)
+  if c == 3 then
+    let bits = value_data(v)
+    ensure (value_class(bits) == 2)
+    return bits
+  end
+  if c == 2 then
+    let bits = int_to_float(value_data(v))
+    ensure (value_class(bits) == 2)
+    return bits
+  end
+  if c == 4 then
+    let bits = rt_bigint_to_float_bits(v)
+    ensure (value_class(bits) == 2)
+    return bits
+  end
+  if c == 5 then
+    let bits = float_div(rt_float_bits_of(rational_num(v)), rt_float_bits_of(rational_den(v)))
+    ensure (value_class(bits) == 2)
+    return bits
+  end
+  let bits = rt_fail_class(c)
+  ensure (value_class(bits) == 2)
+  return bits
+end
+
+make a function called rt_is_real takes v returns yes
+  require rt_live(v)
+  let c = value_class(v)
+  let yes = (c == 2) or (c == 3) or (c == 4) or (c == 5)
+  ensure value_class(yes) == 1
+  return yes
+end
+
+make a function called sqrt takes x returns r
+  require rt_is_real(x)
+  let bits = rt_float_bits_of(x)
+  if float_lt(bits, 0) == 1 then
+    let r = rt_sqrt_negative(x)
+    ensure rt_is_number(r)
+    return r
+  end
+  if value_class(x) == 3 then
+    let r = rt_float(extern_call_float("UCRTBASE.DLL", "sqrt", bits))
+    ensure rt_is_number(r)
+    return r
+  end
+  let r = rt_sqrt_exact(x)
+  ensure rt_is_number(r)
+  return r
+end
+
+make a function called floor takes x returns r
+  require rt_is_real(x)
+  let c = value_class(x)
+  if (c == 2) or (c == 4) then
+    let r = x
+    ensure rt_is_real(r)
+    return r
+  end
+  if c == 5 then
+    let r = rational_floor(x)
+    ensure rt_is_real(r)
+    return r
+  end
+  let r = rt_float(extern_call_float("UCRTBASE.DLL", "floor", rt_float_bits_of(x)))
+  ensure rt_is_real(r)
+  return r
+end
+
+# ---- text ----
+
+make a function called rt_float_text takes bits returns s
+  require (value_class(bits) == 2)
+  let be = word_and(word_shr(bits, 52), 2047)
+  let negative = word_shr(bits, 63) == 1
+  if be == 2047 then
+    if word_shl(bits, 12) != 0 then
+      let s = "NaN"
+      ensure value_class(s) == 8
+      return s
+    end
+    if negative then
+      let s = "-inf"
+      ensure value_class(s) == 8
+      return s
+    end
+    let s = "inf"
+    ensure value_class(s) == 8
+    return s
+  end
+  if rt_float_bits_integral(bits) then
+    if be >= 1086 then
+      let s = to_s(rt_float_big_integral(bits))
+      ensure value_class(s) == 8
+      return s
+    end
+    let text = rt_int_to_s(float_to_int(bits))
+    if negative and (float_to_int(bits) == 0) then
+      let s = "-0"
+      ensure value_class(s) == 8
+      return s
+    end
+    let s = text
+    ensure value_class(s) == 8
+    return s
+  end
+  let s = rt_float_shortest_text(bits)
+  ensure value_class(s) == 8
+  return s
+end
+
+# Whether the finite double with these bits is a whole number.
+make a function called rt_float_bits_integral takes bits returns yes
+  require (value_class(bits) == 2)
+  let be = word_and(word_shr(bits, 52), 2047)
+  if be >= 1075 then
+    let yes = true
+    ensure value_class(yes) == 1
+    return yes
+  end
+  if be < 1023 then
+    let yes = word_shl(bits, 1) == 0
+    ensure value_class(yes) == 1
+    return yes
+  end
+  let yes = word_shl(bits, 64 - (1075 - be)) == 0
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# A whole double of magnitude 2^63 or more: its mantissa times 2^(e - 1075),
+# exactly, as a bigint.
+make a function called rt_float_big_integral takes bits returns v
+  require (value_class(bits) == 2) and (word_and(word_shr(bits, 52), 2047) >= 1075)
+  let be = word_and(word_shr(bits, 52), 2047)
+  let mantissa = word_or(word_and(bits, 4503599627370495), 4503599627370496)
+  let v = mantissa
+  let e = be - 1075
+  while e > 0 do
+    let v = v * 2
+    let e = e - 1
+  end
+  if word_shr(bits, 63) == 1 then
+    let v = 0 - v
+    ensure rt_is_integer(v)
+    return v
+  end
+  ensure rt_is_integer(v)
+  return v
+end
+
+# ---- shortest round-trip digits (Burger & Dybvig free-format), on
+# bignums held as little-endian lists of 24-bit limbs ----
+
+make a function called rt_bn_norm takes a returns out
+  require (value_class(a) == 9) and (list_len(a) >= 1)
+  let n = a.length
+  while (n > 1) and (a[n - 1] == 0) do
+    let n = n - 1
+  end
+  if n == a.length then
+    let out = a
+    ensure list_len(out) >= 1
+    return out
+  end
+  let out = []
+  let i = 0
+  while i < n do
+    let out = list_push(out, a[i])
+    let i = i + 1
+  end
+  ensure list_len(out) >= 1
+  return out
+end
+
+# m is at most 2^16.
+make a function called rt_bn_mul_small takes a, m returns out
+  require (value_class(a) == 9) and (m >= 0) and (m <= 65536)
+  let out = []
+  let carry = 0
+  let i = 0
+  while i < a.length do
+    let t = a[i] * m + carry
+    let out = list_push(out, t band 16777215)
+    let carry = t shr 24
+    let i = i + 1
+  end
+  while carry > 0 do
+    let out = list_push(out, carry band 16777215)
+    let carry = carry shr 24
+  end
+  let out = rt_bn_norm(out)
+  ensure list_len(out) >= 1
+  return out
+end
+
+# a * 2^n
+make a function called rt_bn_shl takes a, n returns out
+  require (value_class(a) == 9) and (n >= 0)
+  let out = []
+  let left = n
+  while left >= 24 do
+    let out = list_push(out, 0)
+    let left = left - 24
+  end
+  let i = 0
+  while i < a.length do
+    let out = list_push(out, a[i])
+    let i = i + 1
+  end
+  while left >= 16 do
+    let out = rt_bn_mul_small(out, 65536)
+    let left = left - 16
+  end
+  let out = rt_bn_mul_small(out, 1 shl left)
+  ensure list_len(out) >= 1
+  return out
+end
+
+make a function called rt_bn_add takes a, b returns out
+  require (value_class(a) == 9) and (value_class(b) == 9)
+  let out = []
+  let carry = 0
+  let i = 0
+  while (i < a.length) or (i < b.length) do
+    let t = carry
+    if i < a.length then
+      let t = t + a[i]
+    end
+    if i < b.length then
+      let t = t + b[i]
+    end
+    let out = list_push(out, t band 16777215)
+    let carry = t shr 24
+    let i = i + 1
+  end
+  if carry > 0 then
+    let out = list_push(out, carry)
+  end
+  ensure list_len(out) >= 1
+  return out
+end
+
+# a - b, for a >= b
+make a function called rt_bn_sub takes a, b returns out
+  require (value_class(a) == 9) and (value_class(b) == 9) and (rt_bn_cmp(a, b) >= 0)
+  let out = []
+  let borrow = 0
+  let i = 0
+  while i < a.length do
+    let t = a[i] - borrow
+    if i < b.length then
+      let t = t - b[i]
+    end
+    if t < 0 then
+      let t = t + 16777216
+      let borrow = 1
+    else
+      let borrow = 0
+    end
+    let out = list_push(out, t)
+    let i = i + 1
+  end
+  let out = rt_bn_norm(out)
+  ensure list_len(out) >= 1
+  return out
+end
+
+# -1, 0 or 1 as a < b, a == b, a > b (both normalized)
+make a function called rt_bn_cmp takes a, b returns c
+  require (value_class(a) == 9) and (value_class(b) == 9)
+  if a.length != b.length then
+    if a.length < b.length then
+      let c = 0 - 1
+      ensure (c == 0 - 1) or (c == 0) or (c == 1)
+      return c
+    end
+    let c = 1
+    ensure (c == 0 - 1) or (c == 0) or (c == 1)
+    return c
+  end
+  let i = a.length - 1
+  while i >= 0 do
+    if a[i] != b[i] then
+      if a[i] < b[i] then
+        let c = 0 - 1
+        ensure (c == 0 - 1) or (c == 0) or (c == 1)
+        return c
+      end
+      let c = 1
+      ensure (c == 0 - 1) or (c == 0) or (c == 1)
+      return c
+    end
+    let i = i - 1
+  end
+  let c = 0
+  ensure (c == 0 - 1) or (c == 0) or (c == 1)
+  return c
+end
+
+# True when r + m+ has not reached s. The interval's ends belong to it when
+# the mantissa is even (round-half-even reads them back to this double).
+make a function called rt_bn_high_below takes r, mp, s, inclusive returns ok
+  require (value_class(r) == 9) and (value_class(mp) == 9) and (value_class(s) == 9)
+  let c = rt_bn_cmp(rt_bn_add(r, mp), s)
+  if inclusive then
+    let ok = c < 0
+    ensure value_class(ok) == 1
+    return ok
+  end
+  let ok = c <= 0
+  ensure value_class(ok) == 1
+  return ok
+end
+
+# [digits, k] for the non-zero finite double with these bits (sign
+# ignored): its shortest round-trip decimal is 0.d1d2...dn * 10^k.
+make a function called rt_float_shortest takes bits returns result
+  require (value_class(bits) == 2) and (word_and(word_shr(bits, 52), 2047) != 2047)
+  let be = word_and(word_shr(bits, 52), 2047)
+  let lo = word_and(bits, 16777215)
+  let mid = word_and(word_shr(bits, 24), 16777215)
+  let hi = word_and(word_shr(bits, 48), 15)
+  let e = be - 1075
+  let f = [lo, mid, hi]
+  # At an exact power of two (other than the smallest normal exponent) the
+  # gap below is half the gap above.
+  let unequal = false
+  if be == 0 then
+    let e = 0 - 1074
+  else
+    let f = [lo, mid, hi + 16]
+    if (lo == 0) and (mid == 0) and (hi == 0) and (be > 1) then
+      let unequal = true
+    end
+  end
+  let f = rt_bn_norm(f)
+  let inclusive = word_and(lo, 1) == 0
+  let one = [1]
+  let r = one
+  let s = one
+  let mp = one
+  let mm = one
+  if e >= 0 then
+    let gap = rt_bn_shl(one, e)
+    if unequal then
+      let r = rt_bn_shl(f, e + 2)
+      let s = [4]
+      let mp = rt_bn_shl(gap, 1)
+      let mm = gap
+    else
+      let r = rt_bn_shl(f, e + 1)
+      let s = [2]
+      let mp = gap
+      let mm = gap
+    end
+  else
+    if unequal then
+      let r = rt_bn_shl(f, 2)
+      let s = rt_bn_shl(one, 2 - e)
+      let mp = [2]
+      let mm = one
+    else
+      let r = rt_bn_shl(f, 1)
+      let s = rt_bn_shl(one, 1 - e)
+      let mp = one
+      let mm = one
+    end
+  end
+  # k: the smallest exponent with (r + m+) / s inside [0, 1).
+  let k = 0
+  while not rt_bn_high_below(r, mp, s, inclusive) do
+    let s = rt_bn_mul_small(s, 10)
+    let k = k + 1
+  end
+  while rt_bn_high_below(rt_bn_mul_small(r, 10), rt_bn_mul_small(mp, 10), s, inclusive) do
+    let r = rt_bn_mul_small(r, 10)
+    let mp = rt_bn_mul_small(mp, 10)
+    let mm = rt_bn_mul_small(mm, 10)
+    let k = k - 1
+  end
+  let digits = []
+  let done = false
+  while not done do
+    let r = rt_bn_mul_small(r, 10)
+    let mp = rt_bn_mul_small(mp, 10)
+    let mm = rt_bn_mul_small(mm, 10)
+    let d = 0
+    while rt_bn_cmp(r, s) >= 0 do
+      let r = rt_bn_sub(r, s)
+      let d = d + 1
+    end
+    # low: stopping at d stays inside the interval; high: so does d + 1.
+    let cl = rt_bn_cmp(r, mm)
+    let low = (cl < 0) or (inclusive and (cl == 0))
+    let high = not rt_bn_high_below(r, mp, s, inclusive)
+    if low and high then
+      # both read back as this double: the nearer, a tie rounding up
+      if rt_bn_cmp(rt_bn_shl(r, 1), s) < 0 then
+        let digits = list_push(digits, d)
+      else
+        let digits = list_push(digits, d + 1)
+      end
+      let done = true
+    elif low then
+      let digits = list_push(digits, d)
+      let done = true
+    elif high then
+      let digits = list_push(digits, d + 1)
+      let done = true
+    else
+      let digits = list_push(digits, d)
+    end
+  end
+  let result = [digits, k]
+  ensure (list_len(result) == 2) and (list_len(result[0]) >= 1)
+  return result
+end
+
+# The plain-notation text of a non-integral finite double.
+make a function called rt_float_shortest_text takes bits returns s
+  require (value_class(bits) == 2) and (word_and(word_shr(bits, 52), 2047) != 2047)
+  let res = rt_float_shortest(bits)
+  let digits = res[0]
+  let k = res[1]
+  let n = digits.length
+  let parts = []
+  if word_shr(bits, 63) == 1 then
+    let parts = list_push(parts, "-")
+  end
+  if k <= 0 then
+    let parts = list_push(parts, "0.")
+    let z = 0
+    while z < (0 - k) do
+      let parts = list_push(parts, "0")
+      let z = z + 1
+    end
+    let i = 0
+    while i < n do
+      let parts = list_push(parts, rt_int_to_s(digits[i]))
+      let i = i + 1
+    end
+    let s = str_join(parts, "")
+    ensure value_class(s) == 8
+    return s
+  end
+  let i = 0
+  while i < n do
+    if i == k then
+      let parts = list_push(parts, ".")
+    end
+    let parts = list_push(parts, rt_int_to_s(digits[i]))
+    let i = i + 1
+  end
+  while i < k do
+    let parts = list_push(parts, "0")
+    let i = i + 1
+  end
+  let s = str_join(parts, "")
+  ensure value_class(s) == 8
+  return s
+end
