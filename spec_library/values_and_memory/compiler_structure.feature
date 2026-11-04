@@ -31,6 +31,11 @@ Feature: one compiler, stages as jobs, no special cases (spec 2.5)
     When the two executables are compared
     Then they are byte-identical
 
+  Scenario: a file is included once
+    Given a program whose two included files both include a third
+    When it is compiled and run
+    Then the third file's statements run once, before the files that include it
+
   Scenario: synthesized names come from their declaration
     Given two functions each containing a closure and a loop
     When they are compiled in either order

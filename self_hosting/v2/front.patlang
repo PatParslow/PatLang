@@ -1,0 +1,135 @@
+# What the v2 compiler and the v2 interpreter share: from a program's path to its
+# IR. Parses the runtime and the program, each file once, and lowers them.
+include "../lib/lexer.patlang"
+include "../lib/parser.patlang"
+include "../lib/includes.patlang"
+include "ir.patlang"
+include "lower.patlang"
+include "contracts.patlang"
+
+make a function called v2_runtime_files returns files
+  return ["self_hosting/v2/runtime/core.patlang", "self_hosting/v2/runtime/memory.patlang", "self_hosting/v2/runtime/strings.patlang", "self_hosting/v2/runtime/lists.patlang", "self_hosting/v2/runtime/integers.patlang", "self_hosting/v2/runtime/rationals.patlang", "self_hosting/v2/runtime/floats.patlang", "self_hosting/v2/runtime/numbers.patlang", "self_hosting/v2/runtime/closures.patlang", "self_hosting/v2/runtime/objects.patlang", "self_hosting/v2/runtime/logic.patlang", "self_hosting/v2/runtime/vfs.patlang", "self_hosting/v2/runtime/net.patlang", "self_hosting/v2/runtime/hosts.patlang", "self_hosting/v2/runtime/cells.patlang", "self_hosting/v2/runtime/system.patlang", "self_hosting/v2/runtime/threads.patlang"]
+end
+
+# A program's files, each once however many files include it, each before
+# the files that include it: pushes [path, text] onto `files`. An include
+# line is blank in the text, so line numbers stay the file's own; its path
+# resolves against the including file.
+make a function called v2_collect_files takes path, seen, files returns done
+  let key = path_normalize(path)
+  let k = 0
+  while k < vec_len(seen) do
+    if vec_get(seen, k) == key then
+      return true
+    end
+    let k = k + 1
+  end
+  vec_push(seen, key)
+  let lines = split_lines(read_file(path))
+  let text = sb_new()
+  let i = 0
+  while i < list_len(lines) do
+    let t = str_trim(lines[i])
+    if str_starts_with(t, "include ") then
+      v2_collect_files(path_join(path_dirname(path), strip_quotes(str_trim(substr(t, 8, t.length - 8)))), seen, files)
+    else
+      sb_push(text, lines[i])
+    end
+    sb_push(text, chr(10))
+    let i = i + 1
+  end
+  vec_push(files, [path, sb_str(text)])
+  return true
+end
+
+# A file's statements, and any parse errors in it: [stmts, errors].
+make a function called v2_parse_file takes path, text returns result
+  let ast = parse_program(tokenize(text))
+  let stmts = ast[1]
+  let errors = []
+  let i = 0
+  while i < list_len(stmts) do
+    if stmts[i][0] == "Err" then
+      let errors = list_push(errors, path + ": line " + stmts[i][2] + ": " + stmts[i][1])
+    end
+    let i = i + 1
+  end
+  return [stmts, errors]
+end
+
+# Function names declared twice (the program and the runtime share one
+# namespace for now).
+make a function called v2_duplicate_names takes fns returns dups
+  let seen = []
+  let dups = []
+  let i = 0
+  while i < list_len(fns) do
+    let n = ir_fn_name(fns[i])
+    if v2_contains(seen, n) then
+      let dups = list_push(dups, n)
+    end
+    let seen = list_push(seen, n)
+    let i = i + 1
+  end
+  return dups
+end
+
+# Whether a file declares quiet_operators() at its top level: its
+# operators raise no events (docs/plans/v2-implementation.md, section 4).
+make a function called v2_declares_quiet takes stmts returns yes
+  return v2_declares(stmts, "quiet_operators")
+end
+
+# Whether a file declares runtime_functions_by_name() at its top level: every
+# runtime function can then be reached by its name (lower.patlang,
+# lw_by_name_registrations). The interpreter is what needs it.
+make a function called v2_declares_all_by_name takes stmts returns yes
+  return v2_declares(stmts, "runtime_functions_by_name")
+end
+
+make a function called v2_declares takes stmts, name returns yes
+  let i = 0
+  while i < list_len(stmts) do
+    let st = stmts[i]
+    if (st[0] == "Expr") and (st[1][0] == "Call") and (st[1][1] == name) then
+      return true
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# ["ok", lw_program's result], or ["error", messages].
+make a function called v2_front_end takes src_path returns result
+  let collected = vec_new()
+  let seen = vec_new()
+  let runtime_files = v2_runtime_files()
+  let i = 0
+  while i < list_len(runtime_files) do
+    v2_collect_files(runtime_files[i], seen, collected)
+    let i = i + 1
+  end
+  v2_collect_files(src_path, seen, collected)
+  let files = vec_to_list(collected)
+  let parsed_files = []
+  let errors = []
+  let i = 0
+  while i < list_len(files) do
+    let parsed = v2_parse_file(files[i][0], files[i][1])
+    let parsed_files = list_push(parsed_files, [parsed[0], v2_declares_quiet(parsed[0]), v2_declares_all_by_name(parsed[0])])
+    let errors = v2_concat(errors, parsed[1])
+    let i = i + 1
+  end
+  if list_len(errors) > 0 then
+    return ["error", errors]
+  end
+  let lowered = lw_program(parsed_files)
+  if list_len(lowered[1]) > 0 then
+    return ["error", lowered[1]]
+  end
+  let dups = v2_duplicate_names(lowered[0])
+  if list_len(dups) > 0 then
+    return ["error", ["declared twice: " + dups]]
+  end
+  return ["ok", lowered]
+end

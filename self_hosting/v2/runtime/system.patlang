@@ -17,9 +17,12 @@ end
 
 make a function called char_code takes s, i returns n
   require (value_class(s) == 8) and (value_class(i) == 2)
-  rt_check_index(i, str_len(s))
-  let n = mem_load_byte(rt_str_bytes(s), i)
-  ensure (n >= 0) and (n < 256)
+  # past either end: -1
+  let n = 0 - 1
+  if (i >= 0) and (i < str_len(s)) then
+    let n = mem_load_byte(rt_str_bytes(s), i)
+  end
+  ensure (n >= 0 - 1) and (n < 256)
   return n
 end
 
@@ -71,40 +74,172 @@ end
 
 # ---- numbers from text ----
 
-# The number a string spells: an int or bigint for digits, a float when it
-# has a point (exact digits over a power of ten, rounded once).
-make a function called to_num takes s returns v
-  require rt_live(s)
-  if value_class(s) != 8 then
-    let v = s
-    ensure rt_live(v)
-    return v
+# The bytes [from, to) are all digits, and there is at least one.
+make a function called rt_all_digits takes s, from, to returns yes
+  require (value_class(s) == 8) and (from >= 0) and (to <= str_len(s))
+  let yes = to > from
+  let k = from
+  while yes and (k < to) do
+    let c = char_code(s, k)
+    let yes = (c >= 48) and (c <= 57)
+    let k = k + 1
   end
-  let n = str_len(s)
-  let at = rt_str_bytes(s)
-  let dot = 0 - 1
-  let k = 0
-  while k < n do
-    if mem_load_byte(at, k) == 46 then
-      let dot = k
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# A string without the spaces, tabs and line ends around it.
+make a function called rt_trim takes s returns t
+  require value_class(s) == 8
+  let from = 0
+  let to = str_len(s)
+  while (from < to) and rt_is_space(char_code(s, from)) do
+    let from = from + 1
+  end
+  while (to > from) and rt_is_space(char_code(s, to - 1)) do
+    let to = to - 1
+  end
+  let t = substr(s, from, to - from)
+  ensure value_class(t) == 8
+  return t
+end
+
+make a function called rt_is_space takes c returns yes
+  require value_class(c) == 2
+  let yes = (c == 32) or ((c >= 9) and (c <= 13))
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# Text as the nearest float: [sign] digits [. digits] [e [sign] digits]; 0.0 for
+# anything else.
+make a function called rt_float_from_text takes t returns v
+  require value_class(t) == 8
+  let n = str_len(t)
+  let at = 0
+  let negative = false
+  if (n > 0) and ((char_code(t, 0) == 45) or (char_code(t, 0) == 43)) then
+    let negative = char_code(t, 0) == 45
+    let at = 1
+  end
+  let digits = sb_new()
+  let fraction = 0
+  let stage = 0
+  let exp_from = n
+  let valid = true
+  let k = at
+  while valid and (k < n) do
+    let c = char_code(t, k)
+    if (c >= 48) and (c <= 57) then
+      sb_push(digits, chr(c))
+      if stage == 1 then
+        let fraction = fraction + 1
+      end
+    elif (c == 46) and (stage == 0) then
+      let stage = 1
+    elif (c == 101) or (c == 69) then
+      let exp_from = k + 1
+      let k = n
+    else
+      let valid = false
     end
     let k = k + 1
   end
-  if dot < 0 then
-    let v = int_from_text(s)
-    ensure rt_live(v)
+  let scale = 0 - fraction
+  if valid and (exp_from < n) then
+    let from = exp_from
+    let exp_negative = char_code(t, from) == 45
+    if exp_negative or (char_code(t, from) == 43) then
+      let from = from + 1
+    end
+    if rt_all_digits(t, from, n) then
+      let e = int_from_text(substr(t, from, n - from))
+      if exp_negative then
+        let scale = scale - e
+      else
+        let scale = scale + e
+      end
+    else
+      let valid = false
+    end
+  end
+  if (not valid) or (sb_len(digits) == 0) then
+    let v = rt_float(rt_float_bits_of(0))
+    ensure value_class(v) == 3
     return v
   end
-  let digits = str_concat(substr(s, 0, dot), substr(s, dot + 1, n - dot - 1))
-  let num = int_from_text(digits)
-  let den = 1
-  let k = 0
-  while k < n - dot - 1 do
-    let den = den * 10
-    let k = k + 1
+  let num = int_from_text(sb_str(digits))
+  # past these no float can tell the difference: the largest is near 2 ^ 1024,
+  # the smallest near 2 ^ -1074
+  let bits = 0
+  if (num != 0) and (scale > 400) then
+    let bits = word_shl(2047, 52)
+  elif (num != 0) and (scale + sb_len(digits) >= 0 - 400) then
+    let power = 1
+    let steps = scale
+    if steps < 0 then
+      let steps = 0 - steps
+    end
+    let p = 0
+    while p < steps do
+      let power = int_mul(power, 10)
+      let p = p + 1
+    end
+    if scale < 0 then
+      let bits = rt_ratio_bits(num, power)
+    else
+      let bits = rt_ratio_bits(int_mul(num, power), 1)
+    end
   end
-  let v = rt_float(float_div(rt_float_bits_of(num), rt_float_bits_of(den)))
-  ensure rt_live(v)
+  if negative then
+    let bits = word_xor(bits, word_shl(1, 63))
+  end
+  let v = rt_float(bits)
+  ensure value_class(v) == 3
+  return v
+end
+
+# A number as it is; a bool as 1 or 0; text, trimmed, as the number it spells
+# (an int or bigint for digits with an optional sign, else a float, 0.0 when it
+# spells none); anything else 0.
+make a function called to_num takes s returns v
+  require value_live(s)
+  let c = value_class(s)
+  if (c >= 2) and (c <= 5) then
+    let v = s
+    ensure value_live(v)
+    return v
+  end
+  if c == 1 then
+    let v = 0
+    if s then
+      let v = 1
+    end
+    ensure value_live(v)
+    return v
+  end
+  if c != 8 then
+    let v = 0
+    ensure value_live(v)
+    return v
+  end
+  let t = rt_trim(s)
+  let from = 0
+  if (str_len(t) > 0) and ((char_code(t, 0) == 45) or (char_code(t, 0) == 43)) then
+    let from = 1
+  end
+  if rt_all_digits(t, from, str_len(t)) then
+    if (from == 1) and (char_code(t, 0) == 43) then
+      let v = int_from_text(substr(t, 1, str_len(t) - 1))
+      ensure value_live(v)
+      return v
+    end
+    let v = int_from_text(t)
+    ensure value_live(v)
+    return v
+  end
+  let v = rt_float_from_text(t)
+  ensure value_live(v)
   return v
 end
 
@@ -130,11 +265,33 @@ make a function called read_file takes path returns text
   return text
 end
 
+# Every directory above a path, those that exist staying as they are.
+make a function called rt_make_parents takes path returns done
+  require value_class(path) == 8
+  let k = 1
+  while k < str_len(path) do
+    let c = char_code(path, k)
+    if (c == 47) or (c == 92) then
+      let dir = rt_cstr(substr(path, 0, k))
+      extern_call("KERNEL32.DLL", "CreateDirectoryA", dir + 16, 0)
+      rt_free(dir)
+    end
+    let k = k + 1
+  end
+  let done = true
+  ensure done
+  return done
+end
+
 make a function called write_file takes path, text returns ok
-  require (value_class(path) == 8) and rt_live(text)
+  require (value_class(path) == 8) and value_live(text)
   let cpath = rt_cstr(path)
   # GENERIC_WRITE, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL
   let h = extern_call("KERNEL32.DLL", "CreateFileA", cpath + 16, 1073741824, 0, 0, 2, 128, 0)
+  if h == 0 - 1 then
+    rt_make_parents(path)
+    let h = extern_call("KERNEL32.DLL", "CreateFileA", cpath + 16, 1073741824, 0, 0, 2, 128, 0)
+  end
   rt_free(cpath)
   if h == 0 - 1 then
     let ok = false
@@ -172,7 +329,7 @@ make a function called argv returns args
   end
   let parts = rt_split_command_line(rt_str_from_bytes(line, n))
   let out = []
-  let k = 1
+  let k = mem_load(runtime_state(), 4408)
   while k < list_len(parts) do
     let out = list_push(out, parts[k])
     let k = k + 1
@@ -246,6 +403,31 @@ end
 
 # ---- processes ----
 
+# A program's path for a command line: Windows searches for a first token with
+# no leading "./", so a relative path with a directory in it gets one.
+make a function called rt_program_token takes program returns t
+  require value_live(program)
+  let p = to_s(program)
+  let n = str_len(p)
+  let has_dir = false
+  let k = 0
+  while k < n do
+    let c = char_code(p, k)
+    if (c == 47) or (c == 92) then
+      let has_dir = true
+    end
+    let k = k + 1
+  end
+  let first = sc_code(p, 0)
+  let relative = (first != 46) and (first != 47) and (first != 92) and (sc_code(p, 1) != 58)
+  let t = p
+  if has_dir and relative then
+    let t = "./" + p
+  end
+  ensure value_class(t) == 8
+  return t
+end
+
 # One argument as the Windows rules read it back: quoted when it has a
 # space, a tab or a quote, a quote escaped with a backslash.
 make a function called rt_quote_arg takes a returns q
@@ -285,8 +467,8 @@ end
 # The program run with its arguments; what it writes to its output and
 # its error stream.
 make a function called exec_capture takes program, rest returns out
-  require rt_live(program) and (value_class(rest) == 9)
-  let parts = [rt_quote_arg(to_s(program))]
+  require value_live(program) and (value_class(rest) == 9)
+  let parts = [rt_quote_arg(rt_program_token(program))]
   let k = 0
   while k < list_len(rest) do
     let parts = list_push(parts, rt_quote_arg(to_s(rest[k])))

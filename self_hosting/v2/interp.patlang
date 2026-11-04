@@ -1,0 +1,557 @@
+# The v2 interpreter (docs/plans/v2-implementation.md, milestone 11):
+#
+#   interp.exe SRC.patlang [args...]
+#
+# Built by the v2 compiler (self_hosting/v2/compile.patlang), so it runs on the
+# v2 runtime. It takes a program through the compiler's own front end, the same
+# parser and lowering, and walks the IR that gives. Its values are the runtime's
+# values; an operator here is that operator, compiled by the same compiler; a
+# call of a runtime function is that function. So the interpreter and a compiled
+# program can differ only in how they step from one instruction to the next.
+#
+# A function runs in a frame: a list with a slot per IR slot, its values counted
+# like any others. A named variable's slot keeps its value when read; a
+# temporary's value moves out when read, which is what gives a callee the same
+# counts it would see compiled (own.patlang), so a list held once changes in
+# place here too.
+#
+# An instruction is translated on the first call of its function: its kind
+# becomes a small int, its labels instruction numbers, its constants values, its
+# slots ints (a temporary's as -1 - slot).
+quiet_operators()
+runtime_functions_by_name()
+include "ir.patlang"
+include "lower.patlang"
+include "front.patlang"
+
+# ---- translating a function ----
+
+make a function called iv_slot takes vars, s returns code
+  if v2_contains(vars, s) then
+    return s
+  end
+  return 0 - 1 - s
+end
+
+make a function called iv_slots takes vars, slots returns codes
+  let codes = []
+  let i = 0
+  while i < list_len(slots) do
+    let codes = list_push(codes, iv_slot(vars, slots[i]))
+    let i = i + 1
+  end
+  return codes
+end
+
+make a function called iv_const_value takes ins returns v
+  let kind = ins[2]
+  if kind == "int" then
+    return to_num(ins[3])
+  end
+  if kind == "float" then
+    return rt_float(rt_float_bits_of(to_num(ins[3])))
+  end
+  if kind == "bool" then
+    return ins[3] == "1"
+  end
+  if kind == "str" then
+    return ins[3]
+  end
+  return value_make(0, 0)
+end
+
+# The operators, by number: arithmetic, comparison, bits.
+make a function called iv_op_code takes op returns code
+  let ops = ["+", "-", "*", "/", "%", "<", ">", "<=", ">=", "==", "!=", "band", "bor", "bxor", "shl", "shr"]
+  let i = 0
+  while i < list_len(ops) do
+    if ops[i] == op then
+      return i
+    end
+    let i = i + 1
+  end
+  print("interpreter: unknown operator " + op)
+  return extern_call("KERNEL32.DLL", "ExitProcess", 80)
+end
+
+# [kind, dst, ...]: 0 const, 1 copy, 2 call, 3 op, 4 unary, 5 primitive, 6 jump,
+# 7 branch, 8 return, 9 take, 10 list, 11 closure, 12 closure call, 13 nothing
+# (a label).
+make a function called iv_translate takes func returns code
+  let instrs = ir_fn_instrs(func)
+  let vars = ir_fn_vars(func)
+  let labels = vec_new()
+  let i = 0
+  while i < list_len(instrs) do
+    if instrs[i][0] == "label" then
+      while vec_len(labels) <= instrs[i][1] do
+        vec_push(labels, 0 - 1)
+      end
+      vec_set(labels, instrs[i][1], i)
+    end
+    let i = i + 1
+  end
+  let out = []
+  let i = 0
+  while i < list_len(instrs) do
+    let ins = instrs[i]
+    let op = ins[0]
+    let t = [13]
+    if op == "const" then
+      let t = [0, ins[1], iv_const_value(ins)]
+    elif op == "copy" then
+      let t = [1, ins[1], iv_slot(vars, ins[2])]
+    elif op == "call" then
+      # the function itself is found at the first call; slot 4 keeps it
+      let t = [2, ins[1], ins[2], iv_slots(vars, ins[3]), vec_new()]
+    elif op == "op" then
+      let t = [3, ins[1], iv_op_code(ins[2]), iv_slot(vars, ins[3]), iv_slot(vars, ins[4])]
+    elif op == "un" then
+      let t = [4, ins[1], ins[2] == "-", iv_slot(vars, ins[3])]
+    elif op == "prim" then
+      let t = [5, ins[1], ins[2], iv_slots(vars, ins[3])]
+    elif op == "jump" then
+      let t = [6, vec_get(labels, ins[1])]
+    elif op == "branch" then
+      let t = [7, iv_slot(vars, ins[1]), vec_get(labels, ins[2]), vec_get(labels, ins[3])]
+    elif op == "return" then
+      let t = [8, iv_slot(vars, ins[1])]
+    elif op == "take" then
+      let t = [9, ins[1], ins[2]]
+    elif op == "list" then
+      let t = [10, ins[1], iv_slots(vars, ins[2])]
+    elif op == "closure" then
+      let t = [11, ins[1], ins[2], iv_slots(vars, ins[3])]
+    elif op == "callv" then
+      let t = [12, ins[1], iv_slots(vars, ins[2])]
+    elif op != "label" then
+      print("interpreter: " + op + " needs the compiler")
+      let t = [14, op]
+    end
+    let out = list_push(out, t)
+    let i = i + 1
+  end
+  return out
+end
+
+# ---- the program ----
+
+# The program's functions, the runtime's being compiled: a vec of 1024 buckets of
+# [name, func, a vec holding its translated code once it has any].
+make a function called iv_table takes fns, runtime_names returns table
+  let table = vec_new()
+  let i = 0
+  while i < 1024 do
+    vec_push(table, [])
+    let i = i + 1
+  end
+  let i = 0
+  while i < list_len(fns) do
+    if not v2_contains(runtime_names, ir_fn_name(fns[i])) then
+      let k = iv_bucket(ir_fn_name(fns[i]))
+      vec_set(table, k, list_push(vec_get(table, k), [ir_fn_name(fns[i]), fns[i], vec_new()]))
+    end
+    let i = i + 1
+  end
+  return table
+end
+
+make a function called iv_bucket takes name returns k
+  let h = 5381
+  let i = 0
+  while i < name.length do
+    let h = word_and(word_mul(h, 33) + char_code(name, i), 1073741823)
+    let i = i + 1
+  end
+  return word_and(h, 1023)
+end
+
+# A name's entry in the program, false when it is not the program's.
+make a function called iv_find takes table, name returns entry
+  let entries = vec_get(table, iv_bucket(name))
+  let i = 0
+  while i < list_len(entries) do
+    if entries[i][0] == name then
+      return entries[i]
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# A function's translated code, made on its first call. Two threads doing that
+# at once make the same code.
+make a function called iv_code_of takes entry returns code
+  if vec_len(entry[2]) == 0 then
+    vec_push(entry[2], iv_translate(entry[1]))
+  end
+  return vec_get(entry[2], 0)
+end
+
+# ---- frames ----
+
+make a function called iv_frame takes nslots returns frame
+  let frame = rt_list_alloc(nslots)
+  return frame
+end
+
+# A slot read: a variable's value stays, a temporary's moves out.
+make a function called iv_read takes block, s returns v
+  if s >= 0 then
+    return mem_load_value(block, 32 + 16 * s)
+  end
+  return mem_take_value(block, 32 + 16 * (0 - 1 - s))
+end
+
+make a function called iv_write takes block, s, v returns done
+  mem_store_value(block, 32 + 16 * s, v)
+  return true
+end
+
+make a function called iv_read_all takes block, codes returns vals
+  let vals = []
+  let i = 0
+  while i < list_len(codes) do
+    let vals = list_push(vals, iv_read(block, codes[i]))
+    let i = i + 1
+  end
+  return vals
+end
+
+# ---- running ----
+
+# A function of the program, called with its arguments' values in a list.
+make a function called iv_run takes table, entry, args returns result
+  let func = entry[1]
+  let frame = iv_frame(ir_fn_nslots(func))
+  let block = value_data(frame)
+  let a = 0
+  while a < list_len(args) do
+    mem_store_value(block, 32 + 16 * a, args[a])
+    let a = a + 1
+  end
+  return iv_loop(table, iv_code_of(entry), block)
+end
+
+make a function called iv_loop takes table, code, block returns result
+  let pc = 0
+  let n = list_len(code)
+  while pc < n do
+    let ins = code[pc]
+    let kind = ins[0]
+    let pc = pc + 1
+    if kind == 3 then
+      iv_write(block, ins[1], iv_op(ins[2], iv_read(block, ins[3]), iv_read(block, ins[4])))
+    elif kind == 2 then
+      iv_write(block, ins[1], iv_call(table, ins, block))
+    elif kind == 1 then
+      iv_write(block, ins[1], iv_read(block, ins[2]))
+    elif kind == 0 then
+      iv_write(block, ins[1], ins[2])
+    elif kind == 7 then
+      if iv_read(block, ins[1]) then
+        let pc = ins[2]
+      else
+        let pc = ins[3]
+      end
+    elif kind == 6 then
+      let pc = ins[1]
+    elif kind == 8 then
+      return iv_read(block, ins[1])
+    elif kind == 9 then
+      iv_write(block, ins[1], mem_take_value(block, 32 + 16 * ins[2]))
+    elif kind == 10 then
+      iv_write(block, ins[1], iv_read_all(block, ins[2]))
+    elif kind == 4 then
+      if ins[2] then
+        iv_write(block, ins[1], -iv_read(block, ins[3]))
+      else
+        iv_write(block, ins[1], not iv_read(block, ins[3]))
+      end
+    elif kind == 5 then
+      iv_write(block, ins[1], iv_prim(ins[2], iv_read_all(block, ins[3])))
+    elif kind == 11 then
+      iv_write(block, ins[1], iv_closure(table, ins[2], iv_read_all(block, ins[3])))
+    elif kind == 12 then
+      let vals = iv_read_all(block, ins[2])
+      iv_write(block, ins[1], iv_call_closure(vals))
+    elif kind == 14 then
+      return extern_call("KERNEL32.DLL", "ExitProcess", 80)
+    end
+  end
+  return value_make(0, 0)
+end
+
+# The operators: the same ones a compiled program runs. + goes to op_add, which
+# raises int's events when a handler wants them; this file itself is quiet.
+make a function called iv_op takes code, a, b returns r
+  if code == 0 then
+    return op_add(a, b)
+  end
+  if code == 1 then
+    return a - b
+  end
+  if code == 2 then
+    return a * b
+  end
+  if code == 3 then
+    return a / b
+  end
+  if code == 4 then
+    return a % b
+  end
+  if code == 5 then
+    return a < b
+  end
+  if code == 6 then
+    return a > b
+  end
+  if code == 7 then
+    return a <= b
+  end
+  if code == 8 then
+    return a >= b
+  end
+  if code == 9 then
+    return a == b
+  end
+  if code == 10 then
+    return a != b
+  end
+  if code == 11 then
+    return a band b
+  end
+  if code == 12 then
+    return a bor b
+  end
+  if code == 13 then
+    return a bxor b
+  end
+  if code == 14 then
+    return a shl b
+  end
+  return a shr b
+end
+
+# A call: of a function of the program, or a runtime function through its
+# closure. ins[4] keeps what the name means after the first call: [entry] or
+# [false, closure].
+make a function called iv_call takes table, ins, block returns r
+  let cache = ins[4]
+  if vec_len(cache) == 0 then
+    let entry = iv_find(table, ins[2])
+    vec_push(cache, entry)
+    if entry == false then
+      vec_push(cache, iv_runtime_function(ins[2]))
+    end
+  end
+  let entry = vec_get(cache, 0)
+  if entry != false then
+    return iv_run(table, entry, iv_read_all(block, ins[3]))
+  end
+  return iv_call_native(vec_get(cache, 1), block, ins[3])
+end
+
+# A runtime function's closure, or one that stops the program as a compiled call
+# of an undeclared name does.
+make a function called iv_runtime_function takes name returns f
+  let fns = rt_global_get(4208)
+  let i = rt_pairs_index(fns, name)
+  if i < 0 then
+    return |a, b, c, d, e, g, h, j| { return rt_undeclared(name) }
+  end
+  return fns[i][1]
+end
+
+# Each argument passed as a temporary, so that a value moved out of a temporary
+# reaches the function held once.
+make a function called iv_call_native takes f, block, s returns r
+  let n = list_len(s)
+  if n == 0 then
+    return f()
+  end
+  if n == 1 then
+    return f(iv_read(block, s[0]))
+  end
+  if n == 2 then
+    return f(iv_read(block, s[0]), iv_read(block, s[1]))
+  end
+  if n == 3 then
+    return f(iv_read(block, s[0]), iv_read(block, s[1]), iv_read(block, s[2]))
+  end
+  if n == 4 then
+    return f(iv_read(block, s[0]), iv_read(block, s[1]), iv_read(block, s[2]), iv_read(block, s[3]))
+  end
+  if n == 5 then
+    return f(iv_read(block, s[0]), iv_read(block, s[1]), iv_read(block, s[2]), iv_read(block, s[3]), iv_read(block, s[4]))
+  end
+  return rt_apply(f, iv_read_all(block, s))
+end
+
+# ---- closures ----
+
+# The holder a lifted function reads its captured values from: laid out as a
+# compiled closure's block (runtime/closures.patlang), counted and freed like
+# one; it is only read, never called.
+make a function called iv_holder takes captured returns holder
+  let holder = rt_closure_alloc(list_len(captured))
+  let block = value_data(holder)
+  let k = 0
+  while k < list_len(captured) do
+    mem_init_value(block, 32 + 16 * k, captured[k])
+    let k = k + 1
+  end
+  return holder
+end
+
+# A closure of a lifted function of the program, callable by anything a compiled
+# closure is. Its parameters after the holder are the lifted function's.
+make a function called iv_closure takes table, name, captured returns c
+  let entry = iv_find(table, name)
+  let holder = iv_holder(captured)
+  let n = ir_fn_nparams(entry[1]) - 1
+  if n == 0 then
+    return { return iv_run(table, entry, [holder]) }
+  end
+  if n == 1 then
+    return |a| { return iv_run(table, entry, [holder, a]) }
+  end
+  if n == 2 then
+    return |a, b| { return iv_run(table, entry, [holder, a, b]) }
+  end
+  if n == 3 then
+    return |a, b, c| { return iv_run(table, entry, [holder, a, b, c]) }
+  end
+  if n == 4 then
+    return |a, b, c, d| { return iv_run(table, entry, [holder, a, b, c, d]) }
+  end
+  if n == 5 then
+    return |a, b, c, d, e| { return iv_run(table, entry, [holder, a, b, c, d, e]) }
+  end
+  if n == 6 then
+    return |a, b, c, d, e, g| { return iv_run(table, entry, [holder, a, b, c, d, e, g]) }
+  end
+  if n == 7 then
+    return |a, b, c, d, e, g, h| { return iv_run(table, entry, [holder, a, b, c, d, e, g, h]) }
+  end
+  return |a, b, c, d, e, g, h, j| { return iv_run(table, entry, [holder, a, b, c, d, e, g, h, j]) }
+end
+
+# ["callv", dst, [closure, args...]].
+make a function called iv_call_closure takes vals returns r
+  let args = []
+  let i = 1
+  while i < list_len(vals) do
+    let args = list_push(args, vals[i])
+    let i = i + 1
+  end
+  return rt_apply(vals[0], args)
+end
+
+# ---- primitives ----
+
+make a function called iv_prim takes name, a returns r
+  if name == "value_data" then
+    return value_data(a[0])
+  end
+  if name == "mem_load_value" then
+    return mem_load_value(a[0], a[1])
+  end
+  if name == "value_class" then
+    return value_class(a[0])
+  end
+  if name == "value_type_word" then
+    return value_type_word(a[0])
+  end
+  if name == "value_live" then
+    return value_live(a[0])
+  end
+  if name == "value_make" then
+    return value_make(a[0], a[1])
+  end
+  if name == "mem_load" then
+    return mem_load(a[0], a[1])
+  end
+  if name == "mem_load_byte" then
+    return mem_load_byte(a[0], a[1])
+  end
+  if name == "mem_store" then
+    return mem_store(a[0], a[1], a[2])
+  end
+  if name == "mem_store_byte" then
+    return mem_store_byte(a[0], a[1], a[2])
+  end
+  if name == "mem_store_value" then
+    return mem_store_value(a[0], a[1], a[2])
+  end
+  if name == "mem_init_value" then
+    return mem_init_value(a[0], a[1], a[2])
+  end
+  if name == "mem_take_value" then
+    return mem_take_value(a[0], a[1])
+  end
+  if name == "runtime_state" then
+    return runtime_state()
+  end
+  if name == "atomic_add" then
+    return atomic_add(a[0], a[1])
+  end
+  if name == "word_add" then
+    return word_add(a[0], a[1])
+  end
+  if name == "word_sub" then
+    return word_sub(a[0], a[1])
+  end
+  if name == "word_mul" then
+    return word_mul(a[0], a[1])
+  end
+  if name == "word_div" then
+    return word_div(a[0], a[1])
+  end
+  if name == "word_rem" then
+    return word_rem(a[0], a[1])
+  end
+  if name == "word_and" then
+    return word_and(a[0], a[1])
+  end
+  if name == "word_or" then
+    return word_or(a[0], a[1])
+  end
+  if name == "word_xor" then
+    return word_xor(a[0], a[1])
+  end
+  if name == "word_shl" then
+    return word_shl(a[0], a[1])
+  end
+  if name == "word_shr" then
+    return word_shr(a[0], a[1])
+  end
+  print("interpreter: the primitive " + name + " needs the compiler")
+  return extern_call("KERNEL32.DLL", "ExitProcess", 80)
+end
+
+# ---- the program's run ----
+
+make a function called iv_main returns code
+  let args = argv()
+  if list_len(args) < 1 then
+    print("usage: interp SRC.patlang [args...]")
+    return 2
+  end
+  # the program's argv() starts after its own path
+  mem_store(runtime_state(), 4408, 2)
+  let lowered = v2_front_end(args[0])
+  if lowered[0] == "error" then
+    let i = 0
+    while i < list_len(lowered[1]) do
+      print("error: " + lowered[1][i])
+      let i = i + 1
+    end
+    return 1
+  end
+  let table = iv_table(lowered[1][0], lowered[1][3])
+  iv_run(table, iv_find(table, "__main"), [])
+  return 0
+end
+
+extern_call("KERNEL32.DLL", "ExitProcess", iv_main())

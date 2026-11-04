@@ -228,6 +228,16 @@ Questions found on the way, for the project owner:
   handler's own event therefore runs that handler again on the worker's
   thread. Spec 1.4 does not say whether a worker's operations are the
   handler's own.
+- `include` in v2 takes a file once, by its normalised path, before the
+  files that include it. The interpreter and the current compiler splice
+  text every time, so a file reached by two includes runs its top-level
+  statements twice there and its later declarations replace the earlier.
+  Spec 1.7 needs one answer; v2's is the one `compiler_structure.feature`
+  states.
+- A contract clause that holds is a `contract_holds` fact once in v2, on
+  the first thread; the interpreter adds a rule at every pass, which grows
+  without limit in a loop. `solve` therefore counts clauses in v2 and passes
+  in the interpreter. The spec's bounded-memory rule decides for v2's.
 - The reused assembler keeps its state in named objects (`new`/`send`),
   shared mutable state that `compiler_structure.feature` rules out for a
   stage.
@@ -237,6 +247,82 @@ Questions found on the way, for the project owner:
   construct's protocol, not ownership facts: the compiler holds no fact
   about any function's ownership, which the ownership stage derives the
   same way for all.
+
+## 7a. Milestone 9: the language suite without globals
+
+The language suite (`spec_library/language`, run by
+`self_hosting/tools/run_language_spec_suite.patlang`) runs its steps as
+PatLang functions under the Gherkin runner `lib/test.patlang`. For v2 to
+run it, v2 compiles the runner, the steps and the libraries they test as
+one program. The runner and steps keep their state in globals
+(`set_global`/`get_global`, `set_var`/`get("__vars", ...)`), which v2 does
+not provide and the project is removing, so they move to an explicit
+context first, keeping the suite green under the interpreter throughout:
+
+- `lib/gherkin.patlang`, a runner beside `test.patlang`: a run's state is
+  one context, a vec (pass and fail counts, the tag filter, the step
+  registry, the current step's captures, the run's variables, pending
+  contract clauses). Its functions take it: `expect(ctx, label, actual,
+  expected)`, `step(ctx, text, fname)`, `run_feature(ctx, text)`; a step
+  function takes `ctx` (called by name through `apply`). Feature text is
+  read as bytes, so the runner has no interpreter-only string cursor.
+  `test.patlang` stays for the other suites, unchanged.
+- `spec_steps_language.patlang` moves to it: a step's values in the run's
+  variables (`ctx_set`/`ctx_get`); a top-level `when` handler, which can
+  take no context, records what it sees in a named object. Done: the suite
+  passes 184 of 184 under the interpreter with output identical, line for
+  line, to `test.patlang`'s. The clause helpers both runners use are in
+  `lib/gherkin_clauses.patlang`, the text helpers in
+  `lib/gherkin_text.patlang`.
+- Then v2 compiles the suite: what it needs is found by compiling it
+  (`include`, the libraries the steps test).
+- The libraries the steps test (signals, queue, sql, task_registry) are
+  checked for globals the same way when v2 reaches them.
+
+Status of milestones 9 to 11, 2026-11-04. Every result below was run on the
+sources as committed with this text.
+
+- **Milestone 9.** The language suite compiles as one v2 program and passes 184
+  of 184, its output identical to the interpreter's line for line. That proves
+  the runner and each step's code run on v2. Scenarios that compare engines by
+  spawning `pat --ir-run` and `patc1 --x64` still run those engines as
+  subprocesses, so they check them, not v2. `match`, fibers, `thread_spawn`,
+  `budgeted` and `syntax` definitions are not built in v2: a call to a function
+  v2 lacks stops the program when reached, with the interpreter's message, and
+  the match suite and the block-model suite have not been run on v2.
+- **What it took**, each found by a failing run and matched to the interpreter:
+  a block's value is its last statement's (`returns NAME` first, when the body
+  assigns it); a bare expression that can only give a value prints it; `and`
+  and `or` give bools; what counts as true; `to_num` on text; out-of-range reads
+  give unit or `""`; `write_file` makes directories; a program path with a
+  directory gets `./`; unit prints as nothing. Floats from text, bigints and
+  rationals round exactly once (`rt_ratio_bits`).
+- **Speed.** Inline counting (`lock xadd`, the runtime called only at the last
+  reference), `value_live` as a primitive, and held slots (own.patlang) took
+  `l[3]` from 1880 to 245 ns or less and an allocation with its free from 3 us
+  to under 1 us. Small ints no longer go through limbs (`10 / 2`: 90 ms to 50 us).
+- **Milestone 11.** `self_hosting/v2/interp.patlang` is the interpreter: written
+  in PatLang, built by v2, on the v2 runtime, walking the IR the compiler's own
+  front end gives. Part 1 passes 42 of 42 on it, against 32 of 42 on
+  `pat --ir-run`, `engines_agree.feature` passes 26 of 26, and the language suite
+  passes 184 of 184 on it. `pat --ir-run` still hosts the older suites and the
+  spec runners.
+- **Milestone 10.** v2 compiles itself to a fixed point: the compiler built by
+  `pat --ir-run`, its build of itself and that build's build of itself are byte
+  identical, as is their assembly, and the last one builds a program that runs. A
+  cold self-compile takes about 8.5 minutes on 8 workers, most of it allocation in
+  the assembler.
+- **v2 gates:** Part 1 42/42 on v2 and on the interpreter; Part 2 50/52; the
+  language suite 184/184 on each. The two Part 2 failures are "returning a borrowed
+  argument without a reference" and "an int type word with a pointer in its data
+  word". Neither applies to two-word values as written, and how to restate them is
+  an open question. `FAIL: require violated by synthesized plan` in the language
+  log is a diagnostic the scenario expects.
+- **The current compiler, with a runtime object matching its source:** native
+  126/126, block model 224/224, language 184/184, match 11/11, the text parity
+  check, and a Gen B self-compile whose output builds a program that runs. Runs
+  made while the runtime object was stale do not count: their `--x64` steps ran
+  old executables.
 
 ## 8. Baseline
 

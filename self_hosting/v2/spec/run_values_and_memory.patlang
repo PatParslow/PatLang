@@ -1,10 +1,12 @@
 # Runs spec_library/values_and_memory's @language features
 # (docs/spec/values-and-memory.md, Part 1) against one engine:
 #
-#   pat --ir-run self_hosting/v2/spec/run_values_and_memory.patlang [interp|v2]
+#   pat --ir-run self_hosting/v2/spec/run_values_and_memory.patlang [interp|v2|both|rust]
 #
-# interp runs each fixture with pat --ir-run; v2 compiles it with the new
-# compiler (self_hosting/v2/compile.patlang) and runs the executable. Each
+# interp runs each fixture with the v2 interpreter (self_hosting/v2/interp.patlang,
+# itself built by v2); v2 compiles it with the new compiler
+# (self_hosting/v2/compile.patlang) and runs the executable; both compares them;
+# rust runs it with pat --ir-run, the interpreter this replaces. Each
 # scenario's fixture is in self_hosting/v2/spec/fixtures/, its expected
 # output here. engines_agree.feature runs every fixture on both engines.
 include "../../lib/test.patlang"
@@ -66,21 +68,56 @@ make a function called vm_v2_build_now takes name returns err
   return "v2 build failed: " + vm_clean(out)
 end
 
-make a function called vm_run_on takes engine, name, args returns out
+# The v2 interpreter, built once per run.
+make a function called vm_interp_exe returns path
+  return "self_hosting/build/v2_interp.exe"
+end
+
+make a function called vm_interp_build returns err
+  let done = get_global("vm_built_interp")
+  if type_of(done) == "string" then
+    return done
+  end
+  let out = exec_capture(vm_pat(), "--ir-run", "self_hosting/v2/compile.patlang", "self_hosting/v2/interp.patlang", vm_interp_exe())
+  let err = ""
+  if not contains_text(out, "v2: " + vm_interp_exe()) then
+    let err = "interpreter build failed: " + vm_clean(out)
+  end
+  set_global("vm_built_interp", err)
+  return err
+end
+
+# A fixture run on an engine: [its output, its peak working set], or the build's
+# error as its output with a peak of -1.
+make a function called vm_exec_on takes engine, name, args returns r
   if engine == "v2" then
     let err = vm_v2_build(name)
     if err != "" then
-      return err
+      return [err, 0 - 1]
     end
-    return vm_clean(list_get(exec_peak_memory(vm_exe(name), args), 0))
+    return exec_peak_memory(vm_exe(name), args)
   end
-  let full = ["--ir-run", vm_fixture(name)]
+  let full = [vm_fixture(name)]
+  if engine == "rust" then
+    let full = ["--ir-run", vm_fixture(name)]
+  end
   let i = 0
   while i < list_len(args) do
     let full = list_push(full, args[i])
     let i = i + 1
   end
-  return vm_clean(list_get(exec_peak_memory(vm_pat(), full), 0))
+  if engine == "rust" then
+    return exec_peak_memory(vm_pat(), full)
+  end
+  let err = vm_interp_build()
+  if err != "" then
+    return [err, 0 - 1]
+  end
+  return exec_peak_memory(vm_interp_exe(), full)
+end
+
+make a function called vm_run_on takes engine, name, args returns out
+  return vm_clean(list_get(vm_exec_on(engine, name, args), 0))
 end
 
 make a function called vm_run takes name returns out
@@ -91,22 +128,7 @@ end
 # unless the run reached its end (printed "done"): a program that stopped
 # early proves nothing about its memory.
 make a function called vm_peak takes name, args returns bytes
-  let r = []
-  if vm_engine() == "v2" then
-    let err = vm_v2_build(name)
-    if err != "" then
-      return 0 - 1
-    end
-    let r = exec_peak_memory(vm_exe(name), args)
-  else
-    let full = ["--ir-run", vm_fixture(name)]
-    let i = 0
-    while i < list_len(args) do
-      let full = list_push(full, args[i])
-      let i = i + 1
-    end
-    let r = exec_peak_memory(vm_pat(), full)
-  end
+  let r = vm_exec_on(vm_engine(), name, args)
   if vm_clean(list_get(r, 0)) != "done" then
     return 0 - 1
   end

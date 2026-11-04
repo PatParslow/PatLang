@@ -15,50 +15,112 @@
 # OUT.asm, OUT.facts (the program facts), OUT.ledger (each job's
 # function and whether it was built or reused) and OUT.timing (each
 # phase's time in ms).
-include "../lib/lexer.patlang"
-include "../lib/parser.patlang"
 include "../lib/x64_pe_link.patlang"
 include "ir.patlang"
 include "lower.patlang"
+include "front.patlang"
 include "own.patlang"
 include "contracts.patlang"
 include "x64.patlang"
 include "jobs.patlang"
 
-make a function called v2_runtime_files returns files
-  return ["self_hosting/v2/runtime/core.patlang", "self_hosting/v2/runtime/memory.patlang", "self_hosting/v2/runtime/strings.patlang", "self_hosting/v2/runtime/lists.patlang", "self_hosting/v2/runtime/integers.patlang", "self_hosting/v2/runtime/rationals.patlang", "self_hosting/v2/runtime/floats.patlang", "self_hosting/v2/runtime/numbers.patlang", "self_hosting/v2/runtime/closures.patlang", "self_hosting/v2/runtime/objects.patlang", "self_hosting/v2/runtime/logic.patlang", "self_hosting/v2/runtime/cells.patlang", "self_hosting/v2/runtime/system.patlang", "self_hosting/v2/runtime/threads.patlang"]
-end
-
-# A file's statements, and any parse errors in it: [stmts, errors].
-make a function called v2_parse_file takes path returns result
-  let ast = parse_program(tokenize(read_file(path)))
-  let stmts = ast[1]
-  let errors = []
+# A name's index in fns, from a table of 1024 buckets of [name, index]; -1 when
+# no function declares it.
+make a function called v2_index_table takes fns returns table
+  let table = vec_new()
   let i = 0
-  while i < list_len(stmts) do
-    if stmts[i][0] == "Err" then
-      let errors = list_push(errors, path + ": line " + stmts[i][2] + ": " + stmts[i][1])
-    end
+  while i < 1024 do
+    vec_push(table, [])
     let i = i + 1
   end
-  return [stmts, errors]
-end
-
-# Function names declared twice (the program and the runtime share one
-# namespace for now).
-make a function called v2_duplicate_names takes fns returns dups
-  let seen = []
-  let dups = []
   let i = 0
   while i < list_len(fns) do
-    let n = ir_fn_name(fns[i])
-    if v2_contains(seen, n) then
-      let dups = list_push(dups, n)
-    end
-    let seen = list_push(seen, n)
+    let k = jb_bucket(ir_fn_name(fns[i]))
+    vec_set(table, k, list_push(vec_get(table, k), [ir_fn_name(fns[i]), i]))
     let i = i + 1
   end
-  return dups
+  return table
+end
+
+make a function called v2_index_of takes table, name returns i
+  let entries = vec_get(table, jb_bucket(name))
+  let k = 0
+  while k < list_len(entries) do
+    if entries[k][0] == name then
+      return entries[k][1]
+    end
+    let k = k + 1
+  end
+  return 0 - 1
+end
+
+# The functions a function refers to by name: what it calls, and the bodies of
+# the closures it makes.
+make a function called v2_references takes func returns names
+  let names = jb_callees(func)
+  let instrs = ir_fn_instrs(func)
+  let i = 0
+  while i < list_len(instrs) do
+    if instrs[i][0] == "closure" then
+      let names = list_push(names, instrs[i][2])
+    end
+    let i = i + 1
+  end
+  return names
+end
+
+# The functions a program can reach, in declaration order, from its top level
+# (__main, __register) and the runtime, whose functions the generated code calls
+# by name; and a function for each name reached that nothing declares.
+make a function called v2_reachable takes fns, runtime_names returns kept
+  let table = v2_index_table(fns)
+  let seen = vec_new()
+  let i = 0
+  while i < list_len(fns) do
+    vec_push(seen, false)
+    let i = i + 1
+  end
+  let work = vec_new()
+  let undeclared = vec_new()
+  let roots = list_push(list_push(runtime_names, "__main"), "__register")
+  let i = 0
+  while i < list_len(roots) do
+    vec_push(work, roots[i])
+    let i = i + 1
+  end
+  let at = 0
+  while at < vec_len(work) do
+    let name = vec_get(work, at)
+    let at = at + 1
+    let k = v2_index_of(table, name)
+    if k < 0 then
+      if not v2_contains(vec_to_list(undeclared), name) then
+        vec_push(undeclared, name)
+      end
+    elif not vec_get(seen, k) then
+      vec_set(seen, k, true)
+      let refs = v2_references(fns[k])
+      let r = 0
+      while r < list_len(refs) do
+        vec_push(work, refs[r])
+        let r = r + 1
+      end
+    end
+  end
+  let out = vec_new()
+  let i = 0
+  while i < list_len(fns) do
+    if vec_get(seen, i) then
+      vec_push(out, fns[i])
+    end
+    let i = i + 1
+  end
+  let i = 0
+  while i < vec_len(undeclared) do
+    vec_push(out, lw_undeclared_function(vec_get(undeclared, i)))
+    let i = i + 1
+  end
+  return vec_to_list(out)
 end
 
 # The import list for the linker: every extern_call's library and function,
@@ -103,20 +165,6 @@ make a function called v2_import_spec takes fns returns spec
   return spec
 end
 
-# Whether a file declares quiet_operators() at its top level: its
-# operators raise no events (docs/plans/v2-implementation.md, section 4).
-make a function called v2_declares_quiet takes stmts returns yes
-  let i = 0
-  while i < list_len(stmts) do
-    let st = stmts[i]
-    if (st[0] == "Expr") and (st[1][0] == "Call") and (st[1][1] == "quiet_operators") then
-      return true
-    end
-    let i = i + 1
-  end
-  return false
-end
-
 # The program facts (lower.patlang, lw_program) as the build's facts
 # artefact, one per line: "event NAME", "by_name NAME" ("*" when a name is
 # computed at run time), "rule PREDICATE/ARITY".
@@ -140,41 +188,37 @@ make a function called v2_artefact_dir returns dir
   return "self_hosting/build/v2_artefacts"
 end
 
-# A phase's time, in ms since the last mark, for OUT.timing.
-make a function called v2_mark takes times, phase returns done
+# A phase's time, in ms since the last mark, for OUT.timing. Each mark also
+# rewrites OUT.progress, the finished phases so far, so a build can be watched
+# from outside: slow and stuck look the same otherwise.
+make a function called v2_mark takes times, phase, out_path returns done
   let now = now_ms()
   vec_push(times, [phase, now - vec_get(times, 0)])
   vec_set(times, 0, now)
+  write_file(out_path + ".progress", v2_times_text(times))
   return true
+end
+
+make a function called v2_times_text takes times returns text
+  let tb = sb_new()
+  let k = 1
+  while k < vec_len(times) do
+    sb_push(tb, vec_get(times, k)[0] + " " + vec_get(times, k)[1] + xv_nl())
+    let k = k + 1
+  end
+  return sb_str(tb)
 end
 
 make a function called v2_compile takes src_path, out_path, workers, seed, cache returns result
   let times = vec_new()
   vec_push(times, now_ms())
-  let parsed_files = []
-  let errors = []
-  let files = list_push(v2_runtime_files(), src_path)
-  let i = 0
-  while i < list_len(files) do
-    let parsed = v2_parse_file(files[i])
-    let parsed_files = list_push(parsed_files, [parsed[0], v2_declares_quiet(parsed[0])])
-    let errors = v2_concat(errors, parsed[1])
-    let i = i + 1
+  let front = v2_front_end(src_path)
+  v2_mark(times, "front end", out_path)
+  if front[0] == "error" then
+    return front
   end
-  if list_len(errors) > 0 then
-    return ["error", errors]
-  end
-  v2_mark(times, "parse")
-  let lowered = lw_program(parsed_files)
-  v2_mark(times, "lower")
-  if list_len(lowered[1]) > 0 then
-    return ["error", lowered[1]]
-  end
-  let fns = lowered[0]
-  let dups = v2_duplicate_names(fns)
-  if list_len(dups) > 0 then
-    return ["error", ["declared twice: " + dups]]
-  end
+  let lowered = front[1]
+  let fns = v2_reachable(lowered[0], lowered[3])
   write_file(out_path + ".facts", v2_facts_text(lowered[2]))
   let facts = lowered[2]
   let dir = ""
@@ -186,7 +230,7 @@ make a function called v2_compile takes src_path, out_path, workers, seed, cache
     end
   end
   let base = jb_compiler_hash()
-  v2_mark(times, "compiler hash")
+  v2_mark(times, "compiler hash", out_path)
   let table = jb_summaries(fns)
   let entry = xv_entry_asm()
   let jobs = [[0, "asm", entry, facts, jb_key_text(jb_mix_text(base, entry)), dir]]
@@ -195,9 +239,9 @@ make a function called v2_compile takes src_path, out_path, workers, seed, cache
     let jobs = list_push(jobs, [i + 1, "fn", fns[i], facts, jb_fn_key(base, fns[i], facts, table), dir])
     let i = i + 1
   end
-  v2_mark(times, "keys")
+  v2_mark(times, "keys", out_path)
   let results = jb_run_all(jobs, workers, seed)
-  v2_mark(times, "jobs")
+  v2_mark(times, "jobs", out_path)
   let b = sb_new()
   let ledger = sb_new()
   let chunks = []
@@ -229,14 +273,8 @@ make a function called v2_compile takes src_path, out_path, workers, seed, cache
   vec_push(times, ["jobs: storing", job_ms[2]])
   vec_set(times, 0, now_ms())
   let linked = x64_link(chunks, v2_import_spec(fns), "main", out_path)
-  v2_mark(times, "link")
-  let tb = sb_new()
-  let k = 1
-  while k < vec_len(times) do
-    sb_push(tb, vec_get(times, k)[0] + " " + vec_get(times, k)[1] + xv_nl())
-    let k = k + 1
-  end
-  write_file(out_path + ".timing", sb_str(tb))
+  v2_mark(times, "link", out_path)
+  write_file(out_path + ".timing", v2_times_text(times))
   if str_starts_with(linked, "LINK ERROR") then
     return ["error", [linked]]
   end

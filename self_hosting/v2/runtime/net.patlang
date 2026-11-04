@@ -1,0 +1,341 @@
+# v2 runtime: TCP on 127.0.0.1, through Winsock (extern_call). Listeners are a
+# list of [port, socket] at runtime_state() + 4320, connections a list of [id,
+# socket] at 4336, the next connection id a word at 4352, whether Winsock has
+# started a word at 4360. Winsock's int results come back as 32 bits in a word
+# (rt_i32); a failed socket call's reason is WSAGetLastError's.
+quiet_operators()
+
+make a function called rt_net_init returns r
+  let st = runtime_state()
+  let off = 4320
+  while off <= 4336 do
+    mem_store(st, off, 0)
+    mem_store(st, word_add(off, 8), 0)
+    mem_init_value(st, off, [])
+    let off = word_add(off, 16)
+  end
+  mem_store(st, 4352, 1)
+  mem_store(st, 4360, 0)
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+make a function called rt_i32 takes w returns n
+  require (value_class(w) == 2)
+  let v = word_and(w, 4294967295)
+  if v >= 2147483648 then
+    let n = v - 4294967296
+    ensure (n >= 0 - 2147483648) and (n < 2147483648)
+    return n
+  end
+  let n = v
+  ensure (n >= 0 - 2147483648) and (n < 2147483648)
+  return n
+end
+
+make a function called rt_wsa_start returns done
+  if atomic_add(runtime_state() + 4360, 1) == 0 then
+    let data = rt_alloc(512)
+    extern_call("WS2_32.DLL", "WSAStartup", 514, data + 16)
+    rt_free(data)
+  end
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
+make a function called rt_net_fail takes what returns r
+  require (value_class(what) == 8)
+  print(what)
+  let r = extern_call("KERNEL32.DLL", "ExitProcess", 96)
+  ensure false
+  return r
+end
+
+make a function called rt_socket returns sock
+  rt_wsa_start()
+  let sock = extern_call("WS2_32.DLL", "socket", 2, 1, 6)
+  ensure (value_class(sock) == 2)
+  return sock
+end
+
+# An IPv4 sockaddr for an address's four bytes and a port: an uncounted block,
+# 16 bytes from 16. The caller frees it.
+make a function called rt_sockaddr takes a, b, c, d, port returns block
+  require (value_class(a) == 2) and (value_class(b) == 2) and (value_class(c) == 2) and (value_class(d) == 2) and (value_class(port) == 2) and (port >= 0) and (port < 65536)
+  let block = rt_alloc(16)
+  mem_store(block, 16, 0)
+  mem_store(block, 24, 0)
+  mem_store_byte(block, 16, 2)
+  mem_store_byte(block, 18, word_shr(port, 8))
+  mem_store_byte(block, 19, word_and(port, 255))
+  mem_store_byte(block, 20, a)
+  mem_store_byte(block, 21, b)
+  mem_store_byte(block, 22, c)
+  mem_store_byte(block, 23, d)
+  ensure mem_load_byte(block, 16) == 2
+  return block
+end
+
+# Binds and listens on 127.0.0.1: the port it got, or -1 when the address is in
+# use, -2 on any other failure.
+make a function called rt_bind_listen takes sock, port returns actual
+  require (value_class(sock) == 2) and (value_class(port) == 2)
+  let addr = rt_sockaddr(127, 0, 0, 1, port)
+  let bound = rt_i32(extern_call("WS2_32.DLL", "bind", sock, addr + 16, 16))
+  if bound != 0 then
+    let reason = rt_i32(extern_call("WS2_32.DLL", "WSAGetLastError"))
+    rt_free(addr)
+    if reason == 10048 then
+      let actual = 0 - 1
+      ensure (actual >= 0 - 2) and (actual < 65536)
+      return actual
+    end
+    let actual = 0 - 2
+    ensure (actual >= 0 - 2) and (actual < 65536)
+    return actual
+  end
+  let size = rt_alloc(8)
+  mem_store(size, 16, 16)
+  extern_call("WS2_32.DLL", "getsockname", sock, addr + 16, size + 16)
+  let actual = mem_load_byte(addr, 18) * 256 + mem_load_byte(addr, 19)
+  rt_free(size)
+  rt_free(addr)
+  if rt_i32(extern_call("WS2_32.DLL", "listen", sock, 128)) != 0 then
+    let actual = 0 - 2
+    ensure (actual >= 0 - 2) and (actual < 65536)
+    return actual
+  end
+  ensure (actual >= 0 - 2) and (actual < 65536)
+  return actual
+end
+
+make a function called tcp_try_listen takes port returns actual
+  require (value_class(port) == 2)
+  let sock = rt_socket()
+  let actual = rt_bind_listen(sock, port)
+  if actual == 0 - 2 then
+    let actual = rt_net_fail("tcp_try_listen: bind " + port + ": failed")
+    ensure (actual >= 0 - 1) and (actual < 65536)
+    return actual
+  end
+  if actual == 0 - 1 then
+    extern_call("WS2_32.DLL", "closesocket", sock)
+    ensure (actual >= 0 - 1) and (actual < 65536)
+    return actual
+  end
+  rt_global_set(4320, list_push(rt_global_get(4320), [actual, sock]))
+  ensure (actual >= 0 - 1) and (actual < 65536)
+  return actual
+end
+
+make a function called tcp_listen takes port returns actual
+  require (value_class(port) == 2)
+  let actual = tcp_try_listen(port)
+  if actual == 0 - 1 then
+    let actual = rt_net_fail("tcp_listen: bind " + port + ": address already in use")
+    ensure (actual >= 0) and (actual < 65536)
+    return actual
+  end
+  ensure (actual >= 0) and (actual < 65536)
+  return actual
+end
+
+make a function called rt_conn_add takes sock returns id
+  require (value_class(sock) == 2)
+  let id = atomic_add(runtime_state() + 4352, 1)
+  rt_global_set(4336, list_push(rt_global_get(4336), [id, sock]))
+  ensure id >= 1
+  return id
+end
+
+make a function called rt_conn_socket takes conn returns sock
+  require value_live(conn)
+  let conns = rt_global_get(4336)
+  let i = rt_pairs_index(conns, conn)
+  if i < 0 then
+    let sock = rt_net_fail("tcp: unknown connection " + conn)
+    ensure (value_class(sock) == 2)
+    return sock
+  end
+  let sock = conns[i][1]
+  ensure (value_class(sock) == 2)
+  return sock
+end
+
+# An address's four bytes: "localhost", or a dotted quad.
+make a function called rt_host_bytes takes host returns bytes
+  require (value_class(host) == 8)
+  if host == "localhost" then
+    let bytes = [127, 0, 0, 1]
+    ensure list_len(bytes) == 4
+    return bytes
+  end
+  let out = []
+  let start = 0
+  let i = 0
+  while i <= str_len(host) do
+    if (i == str_len(host)) or (char_code(host, i) == 46) then
+      let out = list_push(out, to_num(substr(host, start, i - start)))
+      let start = i + 1
+    end
+    let i = i + 1
+  end
+  let bytes = out
+  ensure list_len(bytes) == 4
+  return bytes
+end
+
+make a function called tcp_connect takes host, port returns id
+  require (value_class(host) == 8) and (value_class(port) == 2)
+  let sock = rt_socket()
+  let b = rt_host_bytes(host)
+  let addr = rt_sockaddr(b[0], b[1], b[2], b[3], port)
+  let got = rt_i32(extern_call("WS2_32.DLL", "connect", sock, addr + 16, 16))
+  rt_free(addr)
+  if got != 0 then
+    let id = rt_net_fail("tcp_connect: " + host + ":" + port + ": failed")
+    ensure id >= 1
+    return id
+  end
+  let id = rt_conn_add(sock)
+  ensure id >= 1
+  return id
+end
+
+make a function called rt_listener_socket takes port, what returns sock
+  require (value_class(port) == 2) and (value_class(what) == 8)
+  let listeners = rt_global_get(4320)
+  let i = rt_pairs_index(listeners, port)
+  if i < 0 then
+    let sock = rt_net_fail(what + ": no listener on port " + port)
+    ensure (value_class(sock) == 2)
+    return sock
+  end
+  let sock = listeners[i][1]
+  ensure (value_class(sock) == 2)
+  return sock
+end
+
+# FIONBIO: 1 non-blocking, 0 blocking.
+make a function called rt_set_nonblocking takes sock, on returns done
+  require (value_class(sock) == 2) and (value_class(on) == 2)
+  let arg = rt_alloc(8)
+  mem_store(arg, 16, on)
+  extern_call("WS2_32.DLL", "ioctlsocket", sock, 2147772030, arg + 16)
+  rt_free(arg)
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
+make a function called tcp_accept takes port returns id
+  require (value_class(port) == 2)
+  let sock = rt_listener_socket(port, "tcp_accept")
+  let id = rt_conn_add(extern_call("WS2_32.DLL", "accept", sock, 0, 0))
+  ensure id >= 1
+  return id
+end
+
+# A connection accepted within ms, else -1. An accepted socket inherits its
+# listener's non-blocking mode, so it is set back.
+make a function called tcp_accept_timeout takes port, ms returns id
+  require (value_class(port) == 2) and (value_class(ms) == 2)
+  let sock = rt_listener_socket(port, "tcp_accept_timeout")
+  rt_set_nonblocking(sock, 1)
+  let deadline = now_ms() + ms
+  while true do
+    let got = extern_call("WS2_32.DLL", "accept", sock, 0, 0)
+    if got != 0 - 1 then
+      rt_set_nonblocking(got, 0)
+      let id = rt_conn_add(got)
+      ensure id >= 0 - 1
+      return id
+    end
+    if now_ms() >= deadline then
+      let id = 0 - 1
+      ensure id >= 0 - 1
+      return id
+    end
+    sleep_ms(2)
+  end
+  let id = 0 - 1
+  ensure id >= 0 - 1
+  return id
+end
+
+# What one recv gave, "" at the end of the stream; [text, whether it failed].
+make a function called rt_recv takes conn returns result
+  require value_live(conn)
+  let sock = rt_conn_socket(conn)
+  let buf = rt_alloc(65536)
+  let n = rt_i32(extern_call("WS2_32.DLL", "recv", sock, buf + 16, 65536, 0))
+  let text = ""
+  if n > 0 then
+    let text = rt_str_from_bytes(buf + 16, n)
+  end
+  rt_free(buf)
+  let result = [text, n < 0]
+  ensure (value_class(result[0]) == 8) and (value_class(result[1]) == 1)
+  return result
+end
+
+make a function called tcp_read takes conn returns data
+  require value_live(conn)
+  let r = rt_recv(conn)
+  if r[1] then
+    let data = rt_net_fail("tcp_read: connection " + conn + ": recv failed")
+    ensure value_class(data) == 8
+    return data
+  end
+  let data = r[0]
+  ensure value_class(data) == 8
+  return data
+end
+
+make a function called tcp_read_or_empty takes conn returns data
+  require value_live(conn)
+  let data = rt_recv(conn)[0]
+  ensure value_class(data) == 8
+  return data
+end
+
+make a function called tcp_write takes conn, data returns ok
+  require value_live(conn) and value_live(data)
+  let sock = rt_conn_socket(conn)
+  let text = to_s(data)
+  let at = rt_str_bytes(text)
+  let left = str_len(text)
+  while left > 0 do
+    let sent = rt_i32(extern_call("WS2_32.DLL", "send", sock, at, left, 0))
+    if sent <= 0 then
+      let ok = rt_net_fail("tcp_write: connection " + conn + ": send failed")
+      ensure value_class(ok) == 1
+      return ok
+    end
+    let at = at + sent
+    let left = left - sent
+  end
+  let ok = true
+  ensure value_class(ok) == 1
+  return ok
+end
+
+make a function called tcp_close takes conn returns done
+  require value_live(conn)
+  let conns = rt_global_get(4336)
+  extern_call("WS2_32.DLL", "closesocket", rt_conn_socket(conn))
+  let out = []
+  let i = 0
+  while i < list_len(conns) do
+    if conns[i][0] != conn then
+      let out = list_push(out, conns[i])
+    end
+    let i = i + 1
+  end
+  rt_global_set(4336, out)
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end

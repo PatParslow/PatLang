@@ -16,6 +16,6 @@ Feature: Gherkin-driven contract clauses for GOAP synthesis (require/ensure step
     Then the violation is detected and reported -- the scenario's own meta-check ("a contract-violating candidate is correctly rejected") is what passes, honestly distinguishing "the feature works" from "the underlying candidate happened to satisfy its contract"
 
   Scenario: The contract-checking mechanism never becomes a runtime assertion itself
-    Given the library that implements require/ensure clause checking (self_hosting/lib/gherkin_contracts.patlang)
+    Given the library that implements require/ensure clause checking (self_hosting/lib/gherkin.patlang, gherkin_clauses.patlang)
     When its own source text is inspected directly
     Then it contains no call to contract_check(...) -- the host primitive require/ensure/assert always lower to elsewhere in the language -- confirming the guard is genuinely separate from (and happens before) any code that would run the checked action for real

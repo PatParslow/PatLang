@@ -1,30 +1,775 @@
-# v2 runtime: rules (logic programming). A rule is registered at start as
-# data (lower.patlang, lw_rule_registration), in the list at
-# runtime_state() + 4224: [predicate, arity, head terms, body goals]. A term
-# is ["var", name] for a logic variable, else its value; a goal is
-# [predicate, terms]. Queries over them are milestone 9.
+# v2 runtime: logic programming and GOAP planning.
+#
+# A rule is [predicate, head tokens, body goals], a goal being [predicate,
+# tokens] and a capitalised token a logic variable; a ground fact is a rule
+# with an empty body. Solving is depth-first with backtracking, depth 200;
+# planning is uniform-cost search over states, sets of ground facts, up to 5000
+# expansions, an action being [name, preconditions, adds, deletes, cost].
+#
+# State (runtime_state(), rt_global_get/set):
+#   4224 the rules
+#   4240 the actions
+#   4256 what each action runs: [name, closure]
+#   4272 named goals: [name, goals]
+#   4288 a counter (a word, not a value) for renaming a rule's variables
+#   4384 words: the clauses that have held: a table of addresses (an uncounted
+#   4392 block), how many it holds, and at 4400 its slots, a power of two
 quiet_operators()
 
 make a function called rt_logic_init returns r
   let st = runtime_state()
-  mem_store(st, 4224, 0)
-  mem_store(st, 4232, 0)
-  mem_init_value(st, 4224, [])
-  let r = 0
-  ensure value_class(rt_global_get(4224)) == 9
-  return r
-end
-
-make a function called rt_rule_add takes pred, head, body returns r
-  require (value_class(pred) == 8) and (value_class(head) == 9) and (value_class(body) == 9)
-  rt_global_set(4224, list_push(rt_global_get(4224), [pred, list_len(head), head, body]))
+  let off = 4224
+  while off <= 4272 do
+    mem_store(st, off, 0)
+    mem_store(st, word_add(off, 8), 0)
+    mem_init_value(st, off, [])
+    let off = word_add(off, 16)
+  end
+  mem_store(st, 4288, 0)
+  let table = rt_alloc(8 * 256)
+  let k = 0
+  while k < 256 do
+    mem_store(table, 16 + 8 * k, 0)
+    let k = k + 1
+  end
+  mem_store(st, 4384, table)
+  mem_store(st, 4392, 0)
+  mem_store(st, 4400, 256)
   let r = 0
   ensure r == 0
   return r
 end
 
-make a function called rt_rules returns rules
+make a function called rule_add takes head_pred, head_args, body returns done
+  require (value_class(head_pred) == 8) and (value_class(head_args) == 9) and (value_class(body) == 9)
+  rt_global_set(4224, list_push(rt_global_get(4224), [head_pred, head_args, body]))
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
+# ---- contract clauses that held ----
+
+# Puts an address in a table of cap slots (a power of two) unless it is there:
+# whether it was added.
+make a function called rt_table_add takes table, cap, addr returns added
+  require (table != 0) and (cap >= 2) and (word_and(cap, cap - 1) == 0) and (addr != 0)
+  let at = word_and(word_shr(addr, 4), cap - 1)
+  while mem_load(table, 16 + 8 * at) != 0 do
+    if mem_load(table, 16 + 8 * at) == addr then
+      let added = false
+      ensure value_class(added) == 1
+      return added
+    end
+    let at = word_and(at + 1, cap - 1)
+  end
+  mem_store(table, 16 + 8 * at, addr)
+  let added = true
+  ensure value_class(added) == 1
+  return added
+end
+
+# Twice the room, so the table stays below half full.
+make a function called rt_held_grow returns new_cap
+  let st = runtime_state()
+  let old = mem_load(st, 4384)
+  let cap = mem_load(st, 4400)
+  let new_cap = word_mul(cap, 2)
+  let table = rt_alloc(8 * new_cap)
+  let k = 0
+  while k < new_cap do
+    mem_store(table, 16 + 8 * k, 0)
+    let k = k + 1
+  end
+  let k = 0
+  while k < cap do
+    let addr = mem_load(old, 16 + 8 * k)
+    if addr != 0 then
+      rt_table_add(table, new_cap, addr)
+    end
+    let k = k + 1
+  end
+  mem_store(st, 4384, table)
+  mem_store(st, 4400, new_cap)
+  rt_free(old)
+  ensure new_cap >= 512
+  return new_cap
+end
+
+# A clause held: the first time, it becomes the fact contract_holds(function,
+# "kind:text"). A clause is known by its text literal's address, its own, so
+# the repeat costs one table probe and allocates nothing. Only the first thread
+# records: the rules are not safe to write from a worker, and a worker's facts
+# never reached its parent (the interpreter's rule store is per thread too).
+make a function called rt_contract_held takes fname, kind, text returns done
+  require (value_class(fname) == 8) and (value_class(kind) == 8) and (value_class(text) == 8)
+  let st = runtime_state()
+  if rt_context() != st + 12288 then
+    let done = false
+    ensure value_class(done) == 1
+    return done
+  end
+  if not rt_table_add(mem_load(st, 4384), mem_load(st, 4400), value_data(text)) then
+    let done = false
+    ensure value_class(done) == 1
+    return done
+  end
+  mem_store(st, 4392, mem_load(st, 4392) + 1)
+  if mem_load(st, 4392) * 2 >= mem_load(st, 4400) then
+    rt_held_grow()
+  end
+  rule_add("contract_holds", [fname, kind + ":" + text], [])
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
+# ---- terms and substitutions ----
+
+make a function called is_logic_var takes term returns yes
+  require value_live(term)
+  if value_class(term) != 8 then
+    let yes = false
+    ensure value_class(yes) == 1
+    return yes
+  end
+  if str_len(term) == 0 then
+    let yes = false
+    ensure value_class(yes) == 1
+    return yes
+  end
+  let c = char_code(term, 0)
+  let yes = (c >= 65) and (c <= 90)
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# A substitution's entry for a variable: its value, or the variable itself.
+make a function called rt_subst_get takes subst, var returns v
+  require (value_class(subst) == 9) and value_live(var)
+  let i = 0
+  while i < list_len(subst) do
+    if subst[i][0] == var then
+      let v = subst[i][1]
+      ensure value_live(v)
+      return v
+    end
+    let i = i + 1
+  end
+  let v = var
+  ensure value_live(v)
+  return v
+end
+
+# A term followed through the substitution, at most 1000 steps.
+make a function called logic_walk takes term, subst returns out
+  require value_live(term) and (value_class(subst) == 9)
+  let cur = term
+  let hops = 0
+  while is_logic_var(cur) and (hops < 1000) do
+    let next = rt_subst_get(subst, cur)
+    if next == cur then
+      let out = cur
+      ensure value_live(out)
+      return out
+    end
+    let cur = next
+    let hops = hops + 1
+  end
+  let out = cur
+  ensure value_live(out)
+  return out
+end
+
+# ["Ok", substitution] when the two lists of terms unify, else ["Err", ""].
+make a function called unify_args takes query_args, target_args, subst returns result
+  require (value_class(query_args) == 9) and (value_class(target_args) == 9) and (value_class(subst) == 9)
+  if list_len(query_args) != list_len(target_args) then
+    let result = ["Err", ""]
+    ensure list_len(result) == 2
+    return result
+  end
+  let s = subst
+  let i = 0
+  while i < list_len(query_args) do
+    let qw = logic_walk(query_args[i], s)
+    let tw = logic_walk(target_args[i], s)
+    if qw != tw then
+      if is_logic_var(qw) then
+        let s = list_push(s, [qw, tw])
+      elif is_logic_var(tw) then
+        let s = list_push(s, [tw, qw])
+      else
+        let result = ["Err", ""]
+        ensure list_len(result) == 2
+        return result
+      end
+    end
+    let i = i + 1
+  end
+  let result = ["Ok", s]
+  ensure list_len(result) == 2
+  return result
+end
+
+make a function called apply_subst takes args, subst returns out
+  require (value_class(args) == 9) and (value_class(subst) == 9)
+  let out = []
+  let i = 0
+  while i < list_len(args) do
+    let out = list_push(out, logic_walk(args[i], subst))
+    let i = i + 1
+  end
+  ensure list_len(out) == list_len(args)
+  return out
+end
+
+# ---- solving ----
+
+# A rule with its variables given names no other use of it has, so recursion
+# into the same rule keeps each attempt's bindings apart.
+make a function called rt_rename_args takes args, suffix returns out
+  require (value_class(args) == 9) and (value_class(suffix) == 8)
+  let out = []
+  let i = 0
+  while i < list_len(args) do
+    if is_logic_var(args[i]) then
+      let out = list_push(out, args[i] + suffix)
+    else
+      let out = list_push(out, args[i])
+    end
+    let i = i + 1
+  end
+  ensure list_len(out) == list_len(args)
+  return out
+end
+
+make a function called logic_fresh_rename takes rule returns renamed
+  require (value_class(rule) == 9) and (list_len(rule) == 3)
+  let suffix = "__" + atomic_add(runtime_state() + 4288, 1)
+  let body = []
+  let i = 0
+  while i < list_len(rule[2]) do
+    let body = list_push(body, [rule[2][i][0], rt_rename_args(rule[2][i][1], suffix)])
+    let i = i + 1
+  end
+  let renamed = [rule[0], rt_rename_args(rule[1], suffix), body]
+  ensure list_len(renamed) == 3
+  return renamed
+end
+
+make a function called solve_goal takes pred, args, subst, depth returns results
+  require value_live(pred) and (value_class(args) == 9) and (value_class(subst) == 9) and (value_class(depth) == 2)
+  if depth > 200 then
+    let results = []
+    ensure (value_class(results) == 9)
+    return results
+  end
   let rules = rt_global_get(4224)
-  ensure value_class(rules) == 9
-  return rules
+  let out = []
+  let i = 0
+  while i < list_len(rules) do
+    if rules[i][0] == pred then
+      let rule = logic_fresh_rename(rules[i])
+      let u = unify_args(args, rule[1], subst)
+      if u[0] == "Ok" then
+        let out = v2_list_concat(out, resolve_conjuncts(rule[2], u[1], depth + 1))
+      end
+    end
+    let i = i + 1
+  end
+  let results = out
+  ensure (value_class(results) == 9)
+  return results
+end
+
+# A body's goals in order; neq(A, B) is a filter on the terms as bound so far.
+make a function called resolve_conjuncts takes body, subst, depth returns results
+  require (value_class(body) == 9) and (value_class(subst) == 9) and (value_class(depth) == 2)
+  if list_len(body) == 0 then
+    let results = [subst]
+    ensure (value_class(results) == 9)
+    return results
+  end
+  let first = body[0]
+  let rest = []
+  let i = 1
+  while i < list_len(body) do
+    let rest = list_push(rest, body[i])
+    let i = i + 1
+  end
+  if first[0] == "neq" then
+    if logic_walk(first[1][0], subst) != logic_walk(first[1][1], subst) then
+      let results = resolve_conjuncts(rest, subst, depth)
+      ensure (value_class(results) == 9)
+      return results
+    end
+    let results = []
+    ensure (value_class(results) == 9)
+    return results
+  end
+  let found = solve_goal(first[0], apply_subst(first[1], subst), subst, depth)
+  let out = []
+  let i = 0
+  while i < list_len(found) do
+    let out = v2_list_concat(out, resolve_conjuncts(rest, found[i], depth))
+    let i = i + 1
+  end
+  let results = out
+  ensure (value_class(results) == 9)
+  return results
+end
+
+# The query's arguments under each way of proving it.
+make a function called solve takes pred, query_args returns solutions
+  require value_live(pred) and (value_class(query_args) == 9)
+  let results = solve_goal(pred, query_args, [], 0)
+  let out = []
+  let i = 0
+  while i < list_len(results) do
+    let out = list_push(out, apply_subst(query_args, results[i]))
+    let i = i + 1
+  end
+  let solutions = out
+  ensure (value_class(solutions) == 9)
+  return solutions
+end
+
+make a function called fact takes pred, a, b returns done
+  require value_live(pred) and value_live(a) and value_live(b)
+  rule_add(pred, [a, b], [])
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
+make a function called query takes pred, a, ignored returns count
+  require value_live(pred) and value_live(a)
+  let count = list_len(solve(pred, [a, "Q"]))
+  ensure count >= 0
+  return count
+end
+
+# ---- planning ----
+
+make a function called action_add takes name, preconds, add_effects, del_effects, cost returns done
+  require value_live(name) and value_live(cost) and (value_class(preconds) == 9) and (value_class(add_effects) == 9) and (value_class(del_effects) == 9)
+  rt_global_set(4240, list_push(rt_global_get(4240), [name, preconds, add_effects, del_effects, cost]))
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
+make a function called rt_is_ground takes args returns yes
+  require (value_class(args) == 9)
+  let i = 0
+  while i < list_len(args) do
+    if is_logic_var(args[i]) then
+      let yes = false
+      ensure value_class(yes) == 1
+      return yes
+    end
+    let i = i + 1
+  end
+  let yes = true
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# The state a plan starts from: every rule that is a ground fact.
+make a function called rt_ground_facts returns state
+  let rules = rt_global_get(4224)
+  let out = []
+  let i = 0
+  while i < list_len(rules) do
+    if (list_len(rules[i][2]) == 0) and rt_is_ground(rules[i][1]) then
+      let out = list_push(out, [rules[i][0], rules[i][1]])
+    end
+    let i = i + 1
+  end
+  let state = out
+  ensure (value_class(state) == 9)
+  return state
+end
+
+make a function called rt_state_contains takes state, f returns yes
+  require (value_class(state) == 9) and value_live(f)
+  let i = 0
+  while i < list_len(state) do
+    if state[i] == f then
+      let yes = true
+      ensure value_class(yes) == 1
+      return yes
+    end
+    let i = i + 1
+  end
+  let yes = false
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# Every substitution under which all of the preconditions hold in the state:
+# added to `out`, starting at precondition k.
+make a function called rt_instances takes preconds, k, state, subst, out returns all
+  require (value_class(preconds) == 9) and (value_class(state) == 9) and (value_class(subst) == 9) and (value_class(out) == 9) and (value_class(k) == 2)
+  if k >= list_len(preconds) then
+    let all = list_push(out, subst)
+    ensure list_len(all) >= list_len(out)
+    return all
+  end
+  let goal = preconds[k]
+  let applied = apply_subst(goal[1], subst)
+  let cur = out
+  let i = 0
+  while i < list_len(state) do
+    if state[i][0] == goal[0] then
+      let u = unify_args(applied, state[i][1], subst)
+      if u[0] == "Ok" then
+        let cur = rt_instances(preconds, k + 1, state, u[1], cur)
+      end
+    end
+    let i = i + 1
+  end
+  let all = cur
+  ensure list_len(all) >= list_len(out)
+  return all
+end
+
+# A plan step's label: the action's name, with its preconditions' variables as
+# bound ("build(X=house,Y=2)") when it has any.
+make a function called action_instance_label takes name, preconds, subst returns label
+  require (value_class(name) == 8) and (value_class(preconds) == 9) and (value_class(subst) == 9)
+  let seen = []
+  let i = 0
+  while i < list_len(preconds) do
+    let args = preconds[i][1]
+    let k = 0
+    while k < list_len(args) do
+      if is_logic_var(args[k]) and (not rt_state_contains(seen, args[k])) then
+        let seen = list_push(seen, args[k])
+      end
+      let k = k + 1
+    end
+    let i = i + 1
+  end
+  if list_len(seen) == 0 then
+    let label = name
+    ensure value_class(label) == 8
+    return label
+  end
+  let b = sb_new()
+  sb_push(b, name)
+  sb_push(b, "(")
+  let j = 0
+  while j < list_len(seen) do
+    if j > 0 then
+      sb_push(b, ",")
+    end
+    sb_push(b, seen[j])
+    sb_push(b, "=")
+    sb_push(b, logic_walk(seen[j], subst))
+    let j = j + 1
+  end
+  sb_push(b, ")")
+  let label = sb_str(b)
+  ensure value_class(label) == 8
+  return label
+end
+
+make a function called rt_fact_text takes f returns s
+  require (value_class(f) == 9) and (list_len(f) == 2)
+  let b = sb_new()
+  sb_push(b, f[0])
+  sb_push(b, "(")
+  let i = 0
+  while i < list_len(f[1]) do
+    if i > 0 then
+      sb_push(b, ",")
+    end
+    sb_push(b, f[1][i])
+    let i = i + 1
+  end
+  sb_push(b, ")")
+  let s = sb_str(b)
+  ensure value_class(s) == 8
+  return s
+end
+
+# A state's facts as one text, whatever their order.
+make a function called rt_state_key takes state returns key
+  require (value_class(state) == 9)
+  let texts = []
+  let i = 0
+  while i < list_len(state) do
+    let texts = list_push(texts, rt_fact_text(state[i]))
+    let i = i + 1
+  end
+  let key = str_join(rt_sort_strings(texts), "|")
+  ensure value_class(key) == 8
+  return key
+end
+
+make a function called rt_state_without takes state, f returns out
+  require (value_class(state) == 9) and value_live(f)
+  let out = []
+  let i = 0
+  while i < list_len(state) do
+    if state[i] != f then
+      let out = list_push(out, state[i])
+    end
+    let i = i + 1
+  end
+  ensure list_len(out) <= list_len(state)
+  return out
+end
+
+make a function called rt_state_effects takes state, effects, subst, adding returns out
+  require (value_class(state) == 9) and (value_class(effects) == 9) and (value_class(subst) == 9) and (value_class(adding) == 1)
+  let cur = state
+  let i = 0
+  while i < list_len(effects) do
+    let f = [effects[i][0], apply_subst(effects[i][1], subst)]
+    if not adding then
+      let cur = rt_state_without(cur, f)
+    elif not rt_state_contains(cur, f) then
+      let cur = list_push(cur, f)
+    end
+    let i = i + 1
+  end
+  let out = cur
+  ensure (value_class(out) == 9)
+  return out
+end
+
+make a function called rt_state_satisfies takes state, goals returns yes
+  require (value_class(state) == 9) and (value_class(goals) == 9)
+  let i = 0
+  while i < list_len(goals) do
+    if not rt_state_contains(state, goals[i]) then
+      let yes = false
+      ensure value_class(yes) == 1
+      return yes
+    end
+    let i = i + 1
+  end
+  let yes = true
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# The frontier's cheapest node, the first of equals, and the frontier without
+# it: [node, rest].
+make a function called rt_frontier_pop takes frontier returns result
+  require (value_class(frontier) == 9) and (list_len(frontier) > 0)
+  let best = 0
+  let i = 1
+  while i < list_len(frontier) do
+    if frontier[i][0] < frontier[best][0] then
+      let best = i
+    end
+    let i = i + 1
+  end
+  let rest = []
+  let i = 0
+  while i < list_len(frontier) do
+    if i != best then
+      let rest = list_push(rest, frontier[i])
+    end
+    let i = i + 1
+  end
+  let result = [frontier[best], rest]
+  ensure list_len(result[1]) == list_len(frontier) - 1
+  return result
+end
+
+# [path, the state it reaches], or [[], []] when no plan is found.
+make a function called plan_with_state takes goal_facts returns result
+  require (value_class(goal_facts) == 9)
+  let actions = rt_global_get(4240)
+  let frontier = [[0, rt_ground_facts(), []]]
+  let visited = []
+  let expansions = 0
+  while list_len(frontier) > 0 do
+    if expansions >= 5000 then
+      let result = [[], []]
+      ensure list_len(result) == 2
+      return result
+    end
+    let popped = rt_frontier_pop(frontier)
+    let node = popped[0]
+    let frontier = popped[1]
+    let state = node[1]
+    let expansions = expansions + 1
+    if rt_state_satisfies(state, goal_facts) then
+      let result = [node[2], state]
+      ensure list_len(result) == 2
+      return result
+    end
+    let key = rt_state_key(state)
+    if not rt_state_contains(visited, key) then
+      let visited = list_push(visited, key)
+      let a = 0
+      while a < list_len(actions) do
+        let action = actions[a]
+        let insts = rt_instances(action[1], 0, state, [], [])
+        let k = 0
+        while k < list_len(insts) do
+          let subst = insts[k]
+          let next = rt_state_effects(state, action[3], subst, false)
+          let next = rt_state_effects(next, action[2], subst, true)
+          let path = list_push(node[2], action_instance_label(action[0], action[1], subst))
+          let frontier = list_push(frontier, [node[0] + action[4], next, path])
+          let k = k + 1
+        end
+        let a = a + 1
+      end
+    end
+  end
+  let result = [[], []]
+  ensure list_len(result) == 2
+  return result
+end
+
+make a function called plan takes goal_facts returns path
+  require (value_class(goal_facts) == 9)
+  let path = plan_with_state(goal_facts)[0]
+  ensure (value_class(path) == 9)
+  return path
+end
+
+# ---- goals and actions ----
+
+make a function called goal_def takes name, deps returns done
+  require value_live(name) and (value_class(deps) == 9)
+  let goals = rt_global_get(4272)
+  let i = rt_pairs_index(goals, name)
+  if i >= 0 then
+    rt_global_set(4272, list_set(goals, i, [name, deps]))
+  else
+    rt_global_set(4272, list_push(goals, [name, deps]))
+  end
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
+# A named goal's plan; a goal never declared has none.
+make a function called pursue takes name returns steps
+  require value_live(name)
+  let goals = rt_global_get(4272)
+  let i = rt_pairs_index(goals, name)
+  if i < 0 then
+    let steps = []
+    ensure (value_class(steps) == 9)
+    return steps
+  end
+  let steps = plan(goals[i][1])
+  ensure (value_class(steps) == 9)
+  return steps
+end
+
+make a function called action_bind takes name, closure returns done
+  require value_live(name) and value_live(closure)
+  let bodies = rt_global_get(4256)
+  let i = rt_pairs_index(bodies, name)
+  if i >= 0 then
+    rt_global_set(4256, list_set(bodies, i, [name, closure]))
+  else
+    rt_global_set(4256, list_push(bodies, [name, closure]))
+  end
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
+make a function called action_lookup takes name returns closure
+  require (value_class(name) == 8)
+  let bodies = rt_global_get(4256)
+  let i = rt_pairs_index(bodies, name)
+  if i < 0 then
+    print("activate: no action bound to '" + name + "' (call action_bind(\"" + name + "\", ...) first)")
+    let closure = extern_call("KERNEL32.DLL", "ExitProcess", 99)
+    ensure value_class(closure) == 10
+    return closure
+  end
+  let closure = bodies[i][1]
+  ensure value_class(closure) == 10
+  return closure
+end
+
+make a function called rt_byte_index takes s, c returns i
+  require (value_class(s) == 8) and (value_class(c) == 2)
+  let i = 0
+  while i < str_len(s) do
+    if char_code(s, i) == c then
+      ensure (i >= 0 - 1) and (i < str_len(s))
+      return i
+    end
+    let i = i + 1
+  end
+  let i = 0 - 1
+  ensure (i >= 0 - 1) and (i < str_len(s))
+  return i
+end
+
+make a function called action_base_name takes label returns name
+  require (value_class(label) == 8)
+  let open_at = rt_byte_index(label, 40)
+  if open_at < 0 then
+    let name = label
+    ensure str_len(name) <= str_len(label)
+    return name
+  end
+  let name = substr(label, 0, open_at)
+  ensure str_len(name) <= str_len(label)
+  return name
+end
+
+# A plan step's bound values, in order: "build(X=house,Y=2)" gives
+# ["house", "2"].
+make a function called action_label_args takes label returns vals
+  require (value_class(label) == 8)
+  let open_at = rt_byte_index(label, 40)
+  let vals = []
+  if open_at < 0 then
+    ensure (value_class(vals) == 9)
+    return vals
+  end
+  let inner = substr(label, open_at + 1, str_len(label) - open_at - 2)
+  let n = str_len(inner)
+  if n == 0 then
+    ensure (value_class(vals) == 9)
+    return vals
+  end
+  let start = 0
+  let i = 0
+  while i <= n do
+    if (i == n) or (char_code(inner, i) == 44) then
+      let part = substr(inner, start, i - start)
+      let eq = rt_byte_index(part, 61)
+      let vals = list_push(vals, substr(part, eq + 1, str_len(part) - eq - 1))
+      let start = i + 1
+    end
+    let i = i + 1
+  end
+  ensure (value_class(vals) == 9)
+  return vals
+end
+
+# Runs a plan's steps in order, each step's closure given its bound values as
+# one list, stopping at the first that returns false. Whether every step ran.
+make a function called activate takes steps returns ok
+  require (value_class(steps) == 9)
+  let ok = true
+  let i = 0
+  while ok and (i < list_len(steps)) do
+    let f = action_lookup(action_base_name(steps[i]))
+    let r = f(action_label_args(steps[i]))
+    if r == false then
+      let ok = false
+    end
+    let i = i + 1
+  end
+  ensure value_class(ok) == 1
+  return ok
 end

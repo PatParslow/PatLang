@@ -289,6 +289,43 @@ end
 
 # Machine primitives (ir_prim_arity). A word result is an int.
 make a function called xv_prim takes b, name, d, args, n returns done
+  if name == "value_live" then
+    # the invariant every value meets: only the type word's defined bits, a
+    # class that exists, and a heap value's block still counted
+    let bad = ".live_bad_" + n
+    let known = ".live_known_" + n
+    let good = ".live_good_" + n
+    let store = ".live_store_" + n
+    xv_line(b, "mov rax, " + xv_t(args[0]))
+    xv_line(b, "mov rcx, rax")
+    xv_line(b, "shr rcx, 34")
+    xv_line(b, "test rcx, rcx")
+    xv_line(b, "jne " + bad)
+    xv_line(b, "mov rcx, 4294967295")
+    xv_line(b, "and rcx, rax")
+    xv_line(b, "cmp rcx, 13")
+    xv_line(b, "jle " + known)
+    xv_line(b, "cmp rcx, 63")
+    xv_line(b, "jl " + bad)
+    sb_push(b, known + ":" + xv_nl())
+    xv_line(b, "mov rcx, 4294967296")
+    xv_line(b, "test rax, rcx")
+    xv_line(b, "jz " + good)
+    xv_line(b, "mov rcx, " + xv_d(args[0]))
+    xv_line(b, "mov rcx, [rcx]")
+    xv_line(b, "cmp rcx, 1")
+    xv_line(b, "jl " + bad)
+    sb_push(b, good + ":" + xv_nl())
+    xv_line(b, "mov rax, 1")
+    xv_line(b, "jmp " + store)
+    sb_push(b, bad + ":" + xv_nl())
+    xv_line(b, "mov rax, 0")
+    sb_push(b, store + ":" + xv_nl())
+    xv_line(b, "mov rcx, 1")
+    xv_line(b, "mov " + xv_t(d) + ", rcx")
+    xv_line(b, "mov " + xv_d(d) + ", rax")
+    return true
+  end
   if name == "value_class" then
     xv_line(b, "mov rax, " + xv_t(args[0]))
     xv_line(b, "mov rcx, 4294967295")
@@ -520,13 +557,30 @@ make a function called xv_count takes b, which, s, n returns done
   xv_line(b, "mov rcx, 4294967296")
   xv_line(b, "test rax, rcx")
   xv_line(b, "jz " + skip)
-  xv_line(b, "push qword " + xv_d(s))
-  xv_line(b, "mov rax, 2")
-  xv_line(b, "push rax")
-  xv_line(b, "push qword " + xv_t(s))
-  xv_line(b, "push rax")
-  xv_line(b, "call " + xv_sym(which))
-  xv_line(b, "add rsp, 32")
+  xv_line(b, "mov rcx, " + xv_d(s))
+  if which == "rt_retain" then
+    xv_line(b, "mov rax, 1")
+    xv_line(b, "lock xadd [rcx], rax")
+    xv_line(b, "cmp rax, 1")
+    xv_line(b, "jge " + skip)
+    xv_line(b, "call " + xv_sym("rt_fail_released_twice"))
+  else
+    xv_line(b, "mov rax, -1")
+    xv_line(b, "lock xadd [rcx], rax")
+    xv_line(b, "cmp rax, 1")
+    xv_line(b, "jg " + skip)
+    # the last reference, or one too many: the runtime's to deal with, given
+    # the type word, the block and the count before, each as an int
+    xv_line(b, "mov rcx, 2")
+    xv_line(b, "push rax")
+    xv_line(b, "push rcx")
+    xv_line(b, "push qword " + xv_d(s))
+    xv_line(b, "push rcx")
+    xv_line(b, "push qword " + xv_t(s))
+    xv_line(b, "push rcx")
+    xv_line(b, "call " + xv_sym("rt_release_last"))
+    xv_line(b, "add rsp, 48")
+  end
   sb_push(b, skip + ":" + xv_nl())
   return true
 end
@@ -687,13 +741,8 @@ make a function called xv_fn_asm takes func, facts returns asm
   xv_line(b, "push rbp")
   xv_line(b, "mov rbp, rsp")
   if frame_bytes > 0 then
+    # the ownership stage clears the slots that need it
     xv_line(b, "sub rsp, " + frame_bytes)
-    xv_line(b, "mov rax, 0")
-    let s = 0
-    while s < nslots do
-      xv_line(b, "mov " + xv_t(s) + ", rax")
-      let s = s + 1
-    end
   end
   let p = 0
   while p < ir_fn_nparams(func) do
@@ -733,7 +782,20 @@ make a function called xv_fn_asm takes func, facts returns asm
     elif op == "jump" then
       xv_line(b, "jmp " + xv_label(name, ins[1]))
     elif op == "branch" then
+      # unit, a bool and an int are true by their data word; any other value
+      # by rt_truthy (runtime/numbers.patlang)
+      xv_line(b, "mov rax, " + xv_t(ins[1]))
+      xv_line(b, "cmp rax, 2")
+      xv_line(b, "jg .br_slow_" + i)
       xv_line(b, "mov rax, " + xv_d(ins[1]))
+      xv_line(b, "jmp .br_test_" + i)
+      sb_push(b, ".br_slow_" + i + ":" + xv_nl())
+      xv_line(b, "push qword " + xv_d(ins[1]))
+      xv_line(b, "push qword " + xv_t(ins[1]))
+      xv_line(b, "call " + xv_sym("rt_truthy"))
+      xv_line(b, "add rsp, 16")
+      xv_line(b, "mov rax, rdx")
+      sb_push(b, ".br_test_" + i + ":" + xv_nl())
       xv_line(b, "test rax, rax")
       xv_line(b, "jz " + xv_label(name, ins[3]))
       xv_line(b, "jmp " + xv_label(name, ins[2]))

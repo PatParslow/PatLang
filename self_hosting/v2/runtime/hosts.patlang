@@ -1,0 +1,586 @@
+# v2 runtime: the string cursor, kinds of number, sorting, files, the clock and
+# child processes. Children spawned are a list of [pid, process handle] at
+# runtime_state() + 4304.
+quiet_operators()
+
+make a function called rt_hosts_init returns r
+  let st = runtime_state()
+  mem_store(st, 4304, 0)
+  mem_store(st, 4312, 0)
+  mem_init_value(st, 4304, [])
+  let r = 0
+  ensure r == 0
+  return r
+end
+
+# ---- the string cursor: a string indexes in O(1) here, so a cursor is the
+# string itself ----
+
+make a function called str_intern takes s returns h
+  require (value_class(s) == 8)
+  let h = s
+  ensure value_class(h) == 8
+  return h
+end
+
+make a function called sc_len takes h returns n
+  require (value_class(h) == 8)
+  let n = str_len(h)
+  ensure n >= 0
+  return n
+end
+
+# A byte, -1 past either end.
+make a function called sc_code takes h, i returns c
+  require (value_class(h) == 8) and (value_class(i) == 2)
+  if (i < 0) or (i >= str_len(h)) then
+    let c = 0 - 1
+    ensure (c >= 0 - 1) and (c < 256)
+    return c
+  end
+  let c = char_code(h, i)
+  ensure (c >= 0 - 1) and (c < 256)
+  return c
+end
+
+make a function called sc_char takes h, i returns s
+  require (value_class(h) == 8) and (value_class(i) == 2)
+  let s = substr(h, i, 1)
+  ensure value_class(s) == 8
+  return s
+end
+
+make a function called sc_substr takes h, start, len returns s
+  require (value_class(h) == 8) and (value_class(start) == 2) and (value_class(len) == 2)
+  let s = substr(h, start, len)
+  ensure value_class(s) == 8
+  return s
+end
+
+# ---- numbers ----
+
+make a function called numeric_kind takes v returns kind
+  require value_live(v)
+  let c = value_class(v)
+  if c == 2 then
+    let kind = "int"
+    ensure value_class(kind) == 8
+    return kind
+  end
+  if c == 3 then
+    let kind = "float"
+    ensure value_class(kind) == 8
+    return kind
+  end
+  if c == 4 then
+    let kind = "bigint"
+    ensure value_class(kind) == 8
+    return kind
+  end
+  if c == 5 then
+    let kind = "rational"
+    ensure value_class(kind) == 8
+    return kind
+  end
+  if c == 6 then
+    let kind = "complex"
+    ensure value_class(kind) == 8
+    return kind
+  end
+  let kind = "other"
+  ensure value_class(kind) == 8
+  return kind
+end
+
+# ---- sorting: a merge sort of strings by their bytes ----
+
+make a function called rt_sort_strings takes items returns sorted
+  require (value_class(items) == 9)
+  let n = list_len(items)
+  if n < 2 then
+    let sorted = items
+    ensure list_len(sorted) == list_len(items)
+    return sorted
+  end
+  let mid = word_div(n, 2)
+  let left = []
+  let right = []
+  let i = 0
+  while i < n do
+    if i < mid then
+      let left = list_push(left, items[i])
+    else
+      let right = list_push(right, items[i])
+    end
+    let i = i + 1
+  end
+  let left = rt_sort_strings(left)
+  let right = rt_sort_strings(right)
+  let out = []
+  let a = 0
+  let b = 0
+  while (a < list_len(left)) or (b < list_len(right)) do
+    if b >= list_len(right) then
+      let out = list_push(out, left[a])
+      let a = a + 1
+    elif a >= list_len(left) then
+      let out = list_push(out, right[b])
+      let b = b + 1
+    elif str_cmp(right[b], left[a]) < 0 then
+      let out = list_push(out, right[b])
+      let b = b + 1
+    else
+      let out = list_push(out, left[a])
+      let a = a + 1
+    end
+  end
+  let sorted = out
+  ensure list_len(sorted) == list_len(items)
+  return sorted
+end
+
+# ---- files ----
+
+# Up to `length` bytes from `offset`, as a list of ints; a file that cannot be
+# read gives fewer, down to none.
+make a function called read_file_bytes takes path, offset, length returns bytes
+  require (value_class(path) == 8) and (value_class(offset) == 2) and (value_class(length) == 2)
+  let cpath = rt_cstr(path)
+  # GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL
+  let h = extern_call("KERNEL32.DLL", "CreateFileA", cpath + 16, 2147483648, 1, 0, 3, 128, 0)
+  rt_free(cpath)
+  if h == 0 - 1 then
+    let bytes = []
+    ensure list_len(bytes) <= length
+    return bytes
+  end
+  let size = word_and(extern_call("KERNEL32.DLL", "GetFileSize", h, 0), 4294967295)
+  let want = length
+  if offset >= size then
+    let want = 0
+  elif offset + want > size then
+    let want = size - offset
+  end
+  let out = []
+  if want > 0 then
+    # FILE_BEGIN
+    extern_call("KERNEL32.DLL", "SetFilePointerEx", h, offset, 0, 0)
+    let buf = rt_alloc(want)
+    extern_call("KERNEL32.DLL", "ReadFile", h, buf + 16, want, runtime_state(), 0)
+    let got = word_and(mem_load(runtime_state(), 0), 4294967295)
+    let k = 0
+    while k < got do
+      let out = list_push(out, mem_load_byte(buf, 16 + k))
+      let k = k + 1
+    end
+    rt_free(buf)
+  end
+  extern_call("KERNEL32.DLL", "CloseHandle", h)
+  let bytes = out
+  ensure list_len(bytes) <= length
+  return bytes
+end
+
+make a function called rt_is_directory takes cpath returns yes
+  require cpath != 0
+  let attrs = word_and(extern_call("KERNEL32.DLL", "GetFileAttributesA", cpath + 16), 4294967295)
+  let yes = (attrs != 4294967295) and (word_and(attrs, 16) != 0)
+  ensure value_class(yes) == 1
+  return yes
+end
+
+# "OK", or "ERR: " and the reason.
+make a function called remove_file takes path returns result
+  require (value_class(path) == 8)
+  let cpath = rt_cstr(path)
+  let ok = 0
+  if rt_is_directory(cpath) then
+    let ok = rt_i32(extern_call("KERNEL32.DLL", "RemoveDirectoryA", cpath + 16))
+  else
+    let ok = rt_i32(extern_call("KERNEL32.DLL", "DeleteFileA", cpath + 16))
+  end
+  rt_free(cpath)
+  if ok != 0 then
+    let result = "OK"
+    ensure value_class(result) == 8
+    return result
+  end
+  let result = "ERR: Windows error " + rt_i32(extern_call("KERNEL32.DLL", "GetLastError"))
+  ensure value_class(result) == 8
+  return result
+end
+
+# A directory's entries, sorted, a subdirectory's with a trailing "/".
+# WIN32_FIND_DATAA: attributes at 0, the file name at 44.
+make a function called list_dir takes path returns entries
+  require (value_class(path) == 8)
+  let cpath = rt_cstr(path + "/*")
+  let data = rt_alloc(320)
+  let h = extern_call("KERNEL32.DLL", "FindFirstFileA", cpath + 16, data + 16)
+  rt_free(cpath)
+  if h == 0 - 1 then
+    rt_free(data)
+    print("list_dir: " + path + ": cannot be read")
+    let entries = extern_call("KERNEL32.DLL", "ExitProcess", 94)
+    ensure (value_class(entries) == 9)
+    return entries
+  end
+  let names = []
+  let more = true
+  while more do
+    let n = 0
+    while mem_load_byte(data, 60 + n) != 0 do
+      let n = n + 1
+    end
+    let name = rt_str_from_bytes(data + 60, n)
+    if (name != ".") and (name != "..") then
+      if word_and(mem_load(data, 16), 16) != 0 then
+        let name = name + "/"
+      end
+      let names = list_push(names, name)
+    end
+    let more = rt_i32(extern_call("KERNEL32.DLL", "FindNextFileA", h, data + 16)) != 0
+  end
+  extern_call("KERNEL32.DLL", "FindClose", h)
+  rt_free(data)
+  let entries = rt_sort_strings(names)
+  ensure (value_class(entries) == 9)
+  return entries
+end
+
+# A list of bytes as a file's whole contents, its directories made as for
+# write_file; whether it was written.
+make a function called write_file_bytes takes path, items returns ok
+  require (value_class(path) == 8) and (value_class(items) == 9)
+  let cpath = rt_cstr(path)
+  # GENERIC_WRITE, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL
+  let h = extern_call("KERNEL32.DLL", "CreateFileA", cpath + 16, 1073741824, 0, 0, 2, 128, 0)
+  if h == 0 - 1 then
+    rt_make_parents(path)
+    let h = extern_call("KERNEL32.DLL", "CreateFileA", cpath + 16, 1073741824, 0, 0, 2, 128, 0)
+  end
+  rt_free(cpath)
+  if h == 0 - 1 then
+    let ok = false
+    ensure value_class(ok) == 1
+    return ok
+  end
+  let n = list_len(items)
+  let buf = rt_alloc(n + 8)
+  let k = 0
+  while k < n do
+    mem_store_byte(buf, 16 + k, items[k])
+    let k = k + 1
+  end
+  extern_call("KERNEL32.DLL", "WriteFile", h, buf + 16, n, runtime_state(), 0)
+  rt_free(buf)
+  extern_call("KERNEL32.DLL", "CloseHandle", h)
+  let ok = true
+  ensure value_class(ok) == 1
+  return ok
+end
+
+# ---- the clock ----
+
+# Milliseconds since 1970: FILETIME counts 100 ns from 1601.
+make a function called now_ms returns ms
+  let buf = rt_alloc(8)
+  extern_call("KERNEL32.DLL", "GetSystemTimeAsFileTime", buf + 16)
+  let ticks = mem_load(buf, 16)
+  rt_free(buf)
+  let ms = word_div(ticks, 10000) - 11644473600000
+  ensure (value_class(ms) == 2)
+  return ms
+end
+
+make a function called sleep_ms takes ms returns done
+  require (value_class(ms) == 2)
+  extern_call("KERNEL32.DLL", "Sleep", ms)
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
+make a function called host_caps returns caps
+  let caps = ["x64", "subprocess", "tcp", "fs"]
+  ensure (value_class(caps) == 9)
+  return caps
+end
+
+# ---- processes ----
+
+# The command line a program and its arguments make, as a C string: an
+# uncounted block the caller frees.
+make a function called rt_command_line takes program, args returns block
+  require value_live(program) and (value_class(args) == 9)
+  let parts = [rt_quote_arg(rt_program_token(program))]
+  let k = 0
+  while k < list_len(args) do
+    let parts = list_push(parts, rt_quote_arg(to_s(args[k])))
+    let k = k + 1
+  end
+  let block = rt_cstr(str_join(parts, " "))
+  ensure block != 0
+  return block
+end
+
+# Starts a program with the given standard handles: its PROCESS_INFORMATION
+# (an uncounted block, the process at 16, the thread at 24, the pid at 32, the
+# caller frees it), or 0 when it could not start.
+make a function called rt_start_process takes program, args, h_in, h_out, h_err returns pi
+  require value_live(program) and (value_class(args) == 9)
+  let cmd = rt_command_line(program, args)
+  # STARTUPINFOA, 104 bytes: cb, then dwFlags = STARTF_USESTDHANDLES at 60,
+  # the standard handles at 80, 88, 96
+  let si = rt_alloc(104)
+  let k = 0
+  while k < 13 do
+    mem_store(si, 16 + 8 * k, 0)
+    let k = k + 1
+  end
+  mem_store(si, 16, 104)
+  mem_store(si, 76, 256)
+  mem_store(si, 96, h_in)
+  mem_store(si, 104, h_out)
+  mem_store(si, 112, h_err)
+  let pi = rt_alloc(24)
+  let ok = extern_call("KERNEL32.DLL", "CreateProcessA", 0, cmd + 16, 0, 0, 1, 0, 0, 0, si + 16, pi + 16)
+  rt_free(cmd)
+  rt_free(si)
+  if ok == 0 then
+    rt_free(pi)
+    let pi = 0
+    ensure (value_class(pi) == 2)
+    return pi
+  end
+  ensure (value_class(pi) == 2)
+  return pi
+end
+
+# SECURITY_ATTRIBUTES whose handles a child inherits: an uncounted block.
+make a function called rt_inherit_attrs returns sa
+  let sa = rt_alloc(24)
+  mem_store(sa, 16, 24)
+  mem_store(sa, 24, 0)
+  mem_store(sa, 32, 1)
+  ensure sa != 0
+  return sa
+end
+
+# A pipe a child inherits one end of: [read end, write end]. `child_reads`
+# says which; the other end stays with this process.
+make a function called rt_pipe takes child_reads returns ends
+  require value_class(child_reads) == 1
+  let sa = rt_inherit_attrs()
+  let pipe = rt_alloc(16)
+  extern_call("KERNEL32.DLL", "CreatePipe", pipe + 16, pipe + 24, sa + 16, 0)
+  let r = mem_load(pipe, 16)
+  let w = mem_load(pipe, 24)
+  rt_free(pipe)
+  rt_free(sa)
+  # HANDLE_FLAG_INHERIT off for this process's end
+  if child_reads then
+    extern_call("KERNEL32.DLL", "SetHandleInformation", w, 1, 0)
+  else
+    extern_call("KERNEL32.DLL", "SetHandleInformation", r, 1, 0)
+  end
+  let ends = [r, w]
+  ensure list_len(ends) == 2
+  return ends
+end
+
+# A process that runs on with its output discarded; its pid.
+make a function called spawn takes program, rest returns pid
+  require value_live(program) and (value_class(rest) == 9)
+  let sa = rt_inherit_attrs()
+  let cnul = rt_cstr("NUL")
+  # GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, OPEN_EXISTING
+  let nul = extern_call("KERNEL32.DLL", "CreateFileA", cnul + 16, 1073741824, 3, sa + 16, 3, 128, 0)
+  rt_free(cnul)
+  rt_free(sa)
+  let pi = rt_start_process(program, rest, extern_call("KERNEL32.DLL", "GetStdHandle", 0 - 10), nul, nul)
+  extern_call("KERNEL32.DLL", "CloseHandle", nul)
+  if pi == 0 then
+    print("spawn: " + program + ": could not start")
+    let pid = extern_call("KERNEL32.DLL", "ExitProcess", 93)
+    ensure (value_class(pid) == 2)
+    return pid
+  end
+  let pid = word_and(mem_load(pi, 32), 4294967295)
+  rt_global_set(4304, list_push(rt_global_get(4304), [pid, mem_load(pi, 16)]))
+  extern_call("KERNEL32.DLL", "CloseHandle", mem_load(pi, 24))
+  rt_free(pi)
+  ensure (value_class(pid) == 2)
+  return pid
+end
+
+make a function called rt_process_of takes pid returns h
+  require value_live(pid)
+  let procs = rt_global_get(4304)
+  let i = rt_pairs_index(procs, pid)
+  if i < 0 then
+    let h = 0 - 1
+    ensure (value_class(h) == 2)
+    return h
+  end
+  let h = procs[i][1]
+  ensure (value_class(h) == 2)
+  return h
+end
+
+make a function called rt_process_forget takes pid returns done
+  require value_live(pid)
+  let procs = rt_global_get(4304)
+  let out = []
+  let i = 0
+  while i < list_len(procs) do
+    if procs[i][0] != pid then
+      let out = list_push(out, procs[i])
+    end
+    let i = i + 1
+  end
+  rt_global_set(4304, out)
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
+# A process's exit code; 259 is still running.
+make a function called rt_exit_code takes h returns code
+  require (value_class(h) == 2)
+  extern_call("KERNEL32.DLL", "GetExitCodeProcess", h, runtime_state())
+  let code = word_and(mem_load(runtime_state(), 0), 4294967295)
+  ensure code >= 0
+  return code
+end
+
+make a function called is_alive takes pid returns yes
+  require value_live(pid)
+  let h = rt_process_of(pid)
+  if h == 0 - 1 then
+    let yes = false
+    ensure value_class(yes) == 1
+    return yes
+  end
+  let yes = rt_exit_code(h) == 259
+  ensure value_class(yes) == 1
+  return yes
+end
+
+make a function called wait takes pid returns code
+  require value_live(pid)
+  let h = rt_process_of(pid)
+  if h == 0 - 1 then
+    let code = 0 - 1
+    ensure (value_class(code) == 2)
+    return code
+  end
+  extern_call("KERNEL32.DLL", "WaitForSingleObject", h, 4294967295)
+  let code = rt_exit_code(h)
+  extern_call("KERNEL32.DLL", "CloseHandle", h)
+  rt_process_forget(pid)
+  ensure (value_class(code) == 2)
+  return code
+end
+
+make a function called kill takes pid returns done
+  require value_live(pid)
+  let h = rt_process_of(pid)
+  if h != 0 - 1 then
+    extern_call("KERNEL32.DLL", "TerminateProcess", h, 1)
+    extern_call("KERNEL32.DLL", "CloseHandle", h)
+    rt_process_forget(pid)
+  end
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
+# What has arrived on a pipe so far, without waiting: pushed onto the builder.
+make a function called rt_drain_pipe takes h, b returns done
+  require (value_class(h) == 2) and (value_class(b) == 11)
+  let buf = rt_alloc(4096)
+  let more = true
+  while more do
+    extern_call("KERNEL32.DLL", "PeekNamedPipe", h, 0, 0, 0, runtime_state(), 0)
+    let avail = word_and(mem_load(runtime_state(), 0), 4294967295)
+    if avail == 0 then
+      let more = false
+    else
+      let want = avail
+      if want > 4096 then
+        let want = 4096
+      end
+      extern_call("KERNEL32.DLL", "ReadFile", h, buf + 16, want, runtime_state(), 0)
+      sb_push(b, rt_str_from_bytes(buf + 16, word_and(mem_load(runtime_state(), 0), 4294967295)))
+    end
+  end
+  rt_free(buf)
+  let done = true
+  ensure value_class(done) == 1
+  return done
+end
+
+# Runs a program, giving it stdin_text: [stdout, stderr, whether it succeeded].
+# With timeout_ms above 0, a process still running then is killed, and the
+# error text says so. The pipes are polled, so neither filling can stop it.
+make a function called exec_capture_io takes program, args, stdin_text, timeout_ms returns result
+  require value_live(program) and value_live(stdin_text) and (value_class(args) == 9)
+  let in_pipe = rt_pipe(true)
+  let out_pipe = rt_pipe(false)
+  let err_pipe = rt_pipe(false)
+  let pi = rt_start_process(program, args, in_pipe[0], out_pipe[1], err_pipe[1])
+  extern_call("KERNEL32.DLL", "CloseHandle", in_pipe[0])
+  extern_call("KERNEL32.DLL", "CloseHandle", out_pipe[1])
+  extern_call("KERNEL32.DLL", "CloseHandle", err_pipe[1])
+  if pi == 0 then
+    print("exec_capture_io: " + program + ": could not start")
+    let result = extern_call("KERNEL32.DLL", "ExitProcess", 93)
+    ensure (list_len(result) == 3) and (value_class(result[2]) == 1)
+    return result
+  end
+  let text = to_s(stdin_text)
+  extern_call("KERNEL32.DLL", "WriteFile", in_pipe[1], rt_str_bytes(text), str_len(text), runtime_state(), 0)
+  extern_call("KERNEL32.DLL", "CloseHandle", in_pipe[1])
+  let h = mem_load(pi, 16)
+  let deadline = 0
+  let limited = (value_class(timeout_ms) == 2) and (timeout_ms > 0)
+  if limited then
+    let deadline = now_ms() + timeout_ms
+  end
+  let out_text = sb_new()
+  let err_text = sb_new()
+  let timed_out = false
+  let running = true
+  while running do
+    # WAIT_OBJECT_0 is 0: the process has ended
+    let waited = rt_i32(extern_call("KERNEL32.DLL", "WaitForSingleObject", h, 2))
+    rt_drain_pipe(out_pipe[0], out_text)
+    rt_drain_pipe(err_pipe[0], err_text)
+    if waited == 0 then
+      let running = false
+    elif limited and (now_ms() >= deadline) then
+      extern_call("KERNEL32.DLL", "TerminateProcess", h, 1)
+      extern_call("KERNEL32.DLL", "WaitForSingleObject", h, 4294967295)
+      let timed_out = true
+      let running = false
+    end
+  end
+  rt_drain_pipe(out_pipe[0], out_text)
+  rt_drain_pipe(err_pipe[0], err_text)
+  let ok = (rt_exit_code(h) == 0) and (not timed_out)
+  extern_call("KERNEL32.DLL", "CloseHandle", out_pipe[0])
+  extern_call("KERNEL32.DLL", "CloseHandle", err_pipe[0])
+  extern_call("KERNEL32.DLL", "CloseHandle", h)
+  extern_call("KERNEL32.DLL", "CloseHandle", mem_load(pi, 24))
+  rt_free(pi)
+  if timed_out then
+    if sb_len(err_text) > 0 then
+      sb_push(err_text, chr(10))
+    end
+    sb_push(err_text, "timeout after " + timeout_ms + " ms")
+  end
+  let result = [sb_str(out_text), sb_str(err_text), ok]
+  ensure (list_len(result) == 3) and (value_class(result[2]) == 1)
+  return result
+end

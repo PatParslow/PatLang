@@ -213,6 +213,19 @@ make a function called lw_expr takes fb, e returns s
   if kind == "Call" then
     return lw_call(fb, e[1], e[2])
   end
+  # A function reached by its name: its wrapper hands its parameters straight
+  # on, exactly as given (own.patlang)
+  if kind == "CallThrough" then
+    let slots = []
+    let i = 0
+    while i < list_len(e[2]) do
+      let slots = list_push(slots, lw_var_slot(fb, e[2][i]))
+      let i = i + 1
+    end
+    let d = lw_new_slot(fb)
+    lw_emit(fb, ["call", d, e[1], slots, "through"])
+    return d
+  end
   # v.name: the runtime's dot_name(v), until classes give every value its
   # methods (docs/plans/v2-implementation.md, milestone 5)
   if kind == "Member" then
@@ -247,20 +260,27 @@ make a function called lw_expr takes fb, e returns s
 end
 
 # a and b: b is evaluated only when a is true; a or b, only when a is false.
+# `and` and `or` give a bool, the right side evaluated only when needed.
 make a function called lw_logic takes fb, op, ea, eb returns d
   let d = lw_new_slot(fb)
   let a = lw_expr(fb, ea)
-  lw_emit(fb, ["copy", d, a])
   let l_rhs = lw_new_label(fb)
+  let l_true = lw_new_label(fb)
+  let l_false = lw_new_label(fb)
   let l_end = lw_new_label(fb)
   if op == "and" then
-    lw_emit(fb, ["branch", d, l_rhs, l_end])
+    lw_emit(fb, ["branch", a, l_rhs, l_false])
   else
-    lw_emit(fb, ["branch", d, l_end, l_rhs])
+    lw_emit(fb, ["branch", a, l_true, l_rhs])
   end
   lw_emit(fb, ["label", l_rhs])
   let b = lw_expr(fb, eb)
-  lw_emit(fb, ["copy", d, b])
+  lw_emit(fb, ["branch", b, l_true, l_false])
+  lw_emit(fb, ["label", l_true])
+  lw_emit(fb, ["copy", d, lw_const(fb, "bool", "1")])
+  lw_emit(fb, ["jump", l_end])
+  lw_emit(fb, ["label", l_false])
+  lw_emit(fb, ["copy", d, lw_const(fb, "bool", "0")])
   lw_emit(fb, ["jump", l_end])
   lw_emit(fb, ["label", l_end])
   return d
@@ -293,7 +313,7 @@ make a function called lw_call takes fb, name, args returns d
     let i = i + 1
   end
   let d = lw_new_slot(fb)
-  if name == "quiet_operators" then
+  if (name == "quiet_operators") or (name == "runtime_functions_by_name") then
     return lw_const(fb, "unit", "")
   end
   if ir_is_prim(name) then
@@ -463,6 +483,95 @@ make a function called lw_stmts takes fb, stmts returns done
   return true
 end
 
+# A block whose value is wanted: its value is its last statement's, unit when it
+# has none. Gives the slot holding it.
+make a function called lw_block_value takes fb, stmts returns slot
+  let n = list_len(stmts)
+  if n == 0 then
+    return lw_const(fb, "unit", "")
+  end
+  let i = 0
+  while i < n - 1 do
+    lw_stmt(fb, stmts[i])
+    let i = i + 1
+  end
+  return lw_stmt_value(fb, stmts[n - 1])
+end
+
+# A statement's value: what a `let` bound, an expression's value, the taken
+# branch's block for an `if`, the last iteration's block for a `while` (unit if
+# none ran); unit for any other.
+make a function called lw_stmt_value takes fb, st returns slot
+  let kind = st[0]
+  if kind == "Let" then
+    lw_stmt(fb, st)
+    return lw_var_slot(fb, st[1])
+  end
+  if kind == "Expr" then
+    return lw_expr(fb, st[1])
+  end
+  if kind == "If" then
+    let d = lw_new_slot(fb)
+    let c = lw_expr(fb, st[1])
+    let l_then = lw_new_label(fb)
+    let l_else = lw_new_label(fb)
+    let l_end = lw_new_label(fb)
+    lw_emit(fb, ["branch", c, l_then, l_else])
+    lw_emit(fb, ["label", l_then])
+    lw_emit(fb, ["copy", d, lw_block_value(fb, st[2])])
+    lw_emit(fb, ["jump", l_end])
+    lw_emit(fb, ["label", l_else])
+    lw_emit(fb, ["copy", d, lw_block_value(fb, st[3])])
+    lw_emit(fb, ["jump", l_end])
+    lw_emit(fb, ["label", l_end])
+    return d
+  end
+  if kind == "While" then
+    let d = lw_new_slot(fb)
+    lw_emit(fb, ["copy", d, lw_const(fb, "unit", "")])
+    let l_test = lw_new_label(fb)
+    let l_body = lw_new_label(fb)
+    let l_end = lw_new_label(fb)
+    lw_emit(fb, ["jump", l_test])
+    lw_emit(fb, ["label", l_test])
+    let c = lw_expr(fb, st[1])
+    lw_emit(fb, ["branch", c, l_body, l_end])
+    lw_emit(fb, ["label", l_body])
+    lw_emit(fb, ["copy", d, lw_block_value(fb, st[2])])
+    lw_emit(fb, ["jump", l_test])
+    lw_emit(fb, ["label", l_end])
+    return d
+  end
+  lw_stmt(fb, st)
+  return lw_const(fb, "unit", "")
+end
+
+# An expression that can do nothing but give its value: as a statement, whose
+# value nothing takes, it prints it.
+make a function called lw_only_a_value takes e returns yes
+  let kind = e[0]
+  if (kind == "Num") or (kind == "Str") or (kind == "Bool") or (kind == "Var") then
+    return true
+  end
+  if kind == "Un" then
+    return lw_only_a_value(e[2])
+  end
+  if kind == "Bin" then
+    return lw_only_a_value(e[2]) and lw_only_a_value(e[3])
+  end
+  if kind == "List" then
+    let i = 0
+    while i < list_len(e[1]) do
+      if not lw_only_a_value(e[1][i]) then
+        return false
+      end
+      let i = i + 1
+    end
+    return true
+  end
+  return false
+end
+
 make a function called lw_stmt takes fb, st returns done
   let kind = st[0]
   if kind == "Let" then
@@ -477,13 +586,26 @@ make a function called lw_stmt takes fb, st returns done
     return true
   end
   if kind == "Expr" then
-    lw_expr(fb, st[1])
+    if lw_only_a_value(st[1]) then
+      lw_expr(fb, ["Call", "print", [st[1]]])
+    else
+      lw_expr(fb, st[1])
+    end
     return true
   end
   if kind == "Return" then
     let r = lw_expr(fb, st[1])
     lw_raise_events(fb, r)
     lw_emit(fb, ["return", r])
+    return true
+  end
+  if kind == "RuleDecl" then
+    vec_push(fb[7][4], st[1] + "/" + list_len(st[2]))
+    lw_expr(fb, ["Call", "rule_add", [["Str", st[1]], lw_rule_tokens(st[2]), lw_rule_goals(st[3])]])
+    return true
+  end
+  if kind == "GoalDecl" then
+    lw_expr(fb, ["Call", "goal_def", [["Str", st[1]], lw_rule_goals(st[2])]])
     return true
   end
   if kind == "When" then
@@ -530,6 +652,10 @@ make a function called lw_stmt takes fb, st returns done
   if kind == "Assert" then
     return lw_contract(fb, st[1], st[2], st[3])
   end
+  if kind == "Err" then
+    lw_error(fb, "line " + st[2] + ": " + st[1])
+    return false
+  end
   lw_error(fb, "unsupported statement " + kind)
   return false
 end
@@ -561,6 +687,15 @@ make a function called lw_contract takes fb, which, cond, line returns done
   lw_emit(fb, ["call", d, "rt_contract_failed", [w, t, n]])
   lw_emit(fb, ["jump", l_ok])
   lw_emit(fb, ["label", l_ok])
+  # a clause that held is a fact (runtime/logic.patlang); a quiet file's raise
+  # nothing
+  if not fb[7][0] then
+    let held_name = lw_const(fb, "str", fb[5])
+    let held_kind = lw_const(fb, "str", which)
+    let held_text = lw_const(fb, "str", lw_text(cond))
+    let held = lw_new_slot(fb)
+    lw_emit(fb, ["call", held, "rt_contract_held", [held_name, held_kind, held_text]])
+  end
   return true
 end
 
@@ -795,9 +930,8 @@ make a function called lw_function_with takes name, params, body, captured, lift
       let k = k + 1
     end
   end
-  lw_stmts(fb, body)
-  # falling off the end returns unit
-  let u = lw_const(fb, "unit", "")
+  # falling off the end returns the body's value
+  let u = lw_block_value(fb, body)
   lw_raise_events(fb, u)
   lw_emit(fb, ["return", u])
   let func = ir_fn(name, list_len(pnames), vec_get(fb[3], 0), vec_to_list(fb[0]), vec_to_list(fb[2]))
@@ -814,6 +948,7 @@ make a function called lw_program takes files returns result
   let by_name = vec_new()
   let handled = vec_new()
   let rules = vec_new()
+  let runtime_names = vec_new()
   let fns = []
   let errors = []
   let top = []
@@ -822,7 +957,7 @@ make a function called lw_program takes files returns result
   let f = 0
   while f < list_len(files) do
     let stmts = files[f][0]
-    let ctx = [files[f][1], symbols, by_name, handled]
+    let ctx = [files[f][1], symbols, by_name, handled, rules]
     let i = 0
     while i < list_len(stmts) do
       let st = stmts[i]
@@ -831,14 +966,19 @@ make a function called lw_program takes files returns result
         if list_len(st) > 5 then
           let raises = st[5]
         end
-        let r = lw_function_with(st[1], lw_param_names(st[2]), st[3], [], lifted, false, ctx, raises)
+        # `returns NAME`: the function's result, when the body assigns it
+        let body = st[3]
+        if (list_len(st) > 4) and (st[4] != "") and lw_assigns(body, st[4]) then
+          let body = list_push(body, ["Return", ["Var", st[4]]])
+        end
+        let r = lw_function_with(st[1], lw_param_names(st[2]), body, [], lifted, false, ctx, raises)
         let fns = list_push(fns, r[0])
+        if files[f][1] then
+          vec_push(runtime_names, st[1])
+        end
         let errors = v2_concat(errors, r[1])
       elif st[0] == "ClassDecl" then
         let classes = list_push(classes, lw_class_registration(st))
-      elif st[0] == "RuleDecl" then
-        vec_push(rules, st[1] + "/" + list_len(st[2]))
-        let classes = list_push(classes, lw_rule_registration(st))
       else
         let top = list_push(top, st)
       end
@@ -849,53 +989,50 @@ make a function called lw_program takes files returns result
   # __main registers the functions reached by name first: __register is
   # lowered last, when every by_name call has been seen
   let start = ["Expr", ["Call", "__register", []], 0]
-  let r = lw_function_with("__main", [], v2_concat([start], v2_concat(classes, top)), [], lifted, false, [false, symbols, by_name, handled], [])
+  let r = lw_function_with("__main", [], v2_concat([start], v2_concat(classes, top)), [], lifted, false, [false, symbols, by_name, handled, rules], [])
   let fns = list_push(fns, r[0])
   let errors = v2_concat(errors, r[1])
   let registrations = lw_by_name_registrations(files, symbols, vec_to_list(by_name))
-  let r = lw_function_with("__register", [], registrations, [], lifted, false, [false, symbols, by_name, handled], [])
+  let r = lw_function_with("__register", [], registrations, [], lifted, false, [false, symbols, by_name, handled, rules], [])
   let fns = list_push(fns, r[0])
   let errors = v2_concat(errors, r[1])
   # the program facts (B2), each recorded where it was declared: the events
   # handled, the names passed for by_name parameters, the rules
   let facts = [vec_to_list(handled), vec_to_list(by_name), vec_to_list(rules)]
   let fns = v2_concat(fns, vec_to_list(lifted))
-  return [fns, errors, facts]
+  return [fns, errors, facts, vec_to_list(runtime_names)]
 end
 
-# A rule as the statement that registers it at start (runtime/logic.patlang):
-# its predicate, head terms and body goals as data.
-make a function called lw_rule_registration takes decl returns st
-  let goals = []
-  let i = 0
-  while i < list_len(decl[3]) do
-    let g = decl[3][i]
-    let goals = list_push(goals, ["List", [["Str", g[0]], lw_rule_terms(g[1])]])
-    let i = i + 1
-  end
-  return ["Expr", ["Call", "rt_rule_add", [["Str", decl[1]], lw_rule_terms(decl[2]), ["List", goals]]], 0]
+# What a call to a name nothing declares reaches: it stops the program there,
+# the lines before it having run (spec_library/language: "stop at it with host
+# fn 'no_such_host' not found").
+make a function called lw_undeclared_function takes name returns func
+  let body = [["Return", ["Call", "rt_undeclared", [["Str", name]]]]]
+  let r = lw_function_with(name, [], body, [], vec_new(), false, [true, [], vec_new(), vec_new(), vec_new()], [])
+  return r[0]
 end
 
-# A goal's arguments as data: a capitalised name is a logic variable,
-# ["var", name]; any other name is an atom, its text; anything else its value.
-make a function called lw_rule_terms takes args returns node
-  let terms = []
+# A goal's arguments as the logic engine takes them (runtime/logic.patlang):
+# each its token's text, a capitalised one a logic variable.
+make a function called lw_rule_tokens takes args returns node
+  let tokens = []
   let i = 0
   while i < list_len(args) do
-    let a = args[i]
-    if a[0] == "Var" then
-      let c = char_code(a[1], 0)
-      if (c >= 65) and (c <= 90) then
-        let terms = list_push(terms, ["List", [["Str", "var"], ["Str", a[1]]]])
-      else
-        let terms = list_push(terms, ["Str", a[1]])
-      end
-    else
-      let terms = list_push(terms, a)
-    end
+    let tokens = list_push(tokens, ["Str", args[i][1]])
     let i = i + 1
   end
-  return ["List", terms]
+  return ["List", tokens]
+end
+
+# A list of goals, [pred, args] each, as a list literal.
+make a function called lw_rule_goals takes goals returns node
+  let out = []
+  let i = 0
+  while i < list_len(goals) do
+    let out = list_push(out, ["List", [["Str", goals[i][0]], lw_rule_tokens(goals[i][1])]])
+    let i = i + 1
+  end
+  return ["List", out]
 end
 
 # A class declaration as the statement that registers it: class_define
@@ -949,10 +1086,20 @@ make a function called lw_by_name_registrations takes files, symbols, names retu
     end
     let i = i + 1
   end
-  if all then
+  let all_runtime = false
+  let f = 0
+  while f < list_len(files) do
+    if files[f][2] then
+      let all_runtime = true
+    end
+    let f = f + 1
+  end
+  if all or all_runtime then
     let f = 0
     while f < list_len(files) do
-      if not files[f][1] then
+      # a program's own files when a name is computed at run time; the runtime's
+      # (its quiet files) when a file asks for them
+      if (all and (not files[f][1])) or (all_runtime and files[f][1]) then
         let stmts = files[f][0]
         let k = 0
         while k < list_len(stmts) do
@@ -977,13 +1124,7 @@ make a function called lw_by_name_registrations takes files, symbols, names retu
       let k = k + 1
     end
     if params != false then
-      let call_args = []
-      let p = 0
-      while p < list_len(params) do
-        let call_args = list_push(call_args, ["Var", params[p]])
-        let p = p + 1
-      end
-      let wrapper = ["Closure", params, [["Return", ["Call", wanted[i], call_args], 0]]]
+      let wrapper = ["Closure", params, [["Return", ["CallThrough", wanted[i], params], 0]]]
       let out = list_push(out, ["Expr", ["Call", "rt_register_function", [["Str", wanted[i]], wrapper]], 0])
     end
     let i = i + 1

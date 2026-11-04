@@ -14,6 +14,126 @@ end
 
 # A number's value as float bits (int and float for now; bigints and
 # rationals with them).
+# About how many bits a non-negative integer has: each base 10 ^ 9 limb holds
+# 29.897 of them.
+make a function called rt_bit_estimate takes v returns bits
+  require rt_is_integer(v) and (not rt_int_negative(v))
+  let m = rt_int_mag(v)
+  let top = m[list_len(m) - 1]
+  let bits = word_div((list_len(m) - 1) * 29897, 1000)
+  while top > 0 do
+    let top = word_shr(top, 1)
+    let bits = bits + 1
+  end
+  ensure bits >= 0
+  return bits
+end
+
+# 2 ^ e by repeated squaring.
+make a function called rt_power_of_two takes e returns r
+  require (value_class(e) == 2) and (e >= 0)
+  let r = 1
+  let square = 2
+  let left = e
+  while left > 0 do
+    if word_and(left, 1) == 1 then
+      let r = int_mul(r, square)
+    end
+    let left = word_shr(left, 1)
+    if left > 0 then
+      let square = int_mul(square, square)
+    end
+  end
+  ensure rt_is_integer(r) and (r > 0)
+  return r
+end
+
+# n / d as the nearest float's bits, ties to even: n a non-negative integer, d a
+# positive one. Scales them so that the quotient q has 55 bits, value = q * 2^-k,
+# then rounds q to the 53 a float keeps (fewer below the normal range), r != 0
+# standing for the bits past the quotient. Infinity beyond the largest float.
+make a function called rt_ratio_bits takes n, d returns bits
+  require rt_is_integer(n) and rt_is_integer(d) and (d > 0) and (n >= 0)
+  if n == 0 then
+    let bits = 0
+    ensure value_class(bits) == 2
+    return bits
+  end
+  let num = n
+  let den = d
+  let k = 0
+  let high = word_shl(1, 55)
+  let low = word_shl(1, 54)
+  # most of the way at once, from their sizes; the loops below finish it
+  let jump = rt_bit_estimate(n) - rt_bit_estimate(d) - 55
+  if jump > 0 then
+    let den = int_mul(den, rt_power_of_two(jump))
+    let k = 0 - jump
+  elif jump < 0 then
+    let num = int_mul(num, rt_power_of_two(0 - jump))
+    let k = 0 - jump
+  end
+  while num >= int_mul(den, high) do
+    let den = int_mul(den, 2)
+    let k = k - 1
+  end
+  while num < int_mul(den, low) do
+    let num = int_mul(num, 2)
+    let k = k + 1
+  end
+  let qr = int_divmod(num, den)
+  let q = qr[0]
+  let sticky = qr[1] != 0
+  let exponent = 54 - k
+  # how many of q's bits go: 2 for a normal float, more below the normal range
+  let drop = 2
+  if exponent < 0 - 1022 then
+    let drop = 2 + (0 - 1022 - exponent)
+  end
+  if drop > 56 then
+    let bits = 0
+    ensure value_class(bits) == 2
+    return bits
+  end
+  let m = word_shr(q, drop)
+  let rest = word_and(q, word_shl(1, drop) - 1)
+  let half = word_shl(1, drop - 1)
+  if (rest > half) or ((rest == half) and (sticky or (word_and(m, 1) == 1))) then
+    let m = m + 1
+  end
+  if exponent < 0 - 1022 then
+    # below the normal range: the rounded mantissa is the bits, a carry into
+    # bit 52 making it the smallest normal
+    let bits = m
+    ensure value_class(bits) == 2
+    return bits
+  end
+  if m == word_shl(1, 53) then
+    let m = word_shr(m, 1)
+    let exponent = exponent + 1
+  end
+  if exponent > 1023 then
+    let bits = word_shl(2047, 52)
+    ensure value_class(bits) == 2
+    return bits
+  end
+  let bits = word_or(word_shl(exponent + 1023, 52), word_and(m, word_shl(1, 52) - 1))
+  ensure value_class(bits) == 2
+  return bits
+end
+
+# The nearest float to n / d, either sign.
+make a function called rt_exact_bits takes n, d returns bits
+  require rt_is_integer(n) and rt_is_integer(d) and (d != 0)
+  let negative = rt_int_negative(n) != rt_int_negative(d)
+  let bits = rt_ratio_bits(int_abs(n), int_abs(d))
+  if negative then
+    let bits = word_xor(bits, word_shl(1, 63))
+  end
+  ensure value_class(bits) == 2
+  return bits
+end
+
 make a function called rt_float_bits_of takes v returns bits
   require rt_is_real(v)
   let c = value_class(v)
@@ -33,7 +153,7 @@ make a function called rt_float_bits_of takes v returns bits
     return bits
   end
   if c == 5 then
-    let bits = float_div(rt_float_bits_of(rational_num(v)), rt_float_bits_of(rational_den(v)))
+    let bits = rt_exact_bits(rational_num(v), rational_den(v))
     ensure (value_class(bits) == 2)
     return bits
   end
@@ -43,7 +163,7 @@ make a function called rt_float_bits_of takes v returns bits
 end
 
 make a function called rt_is_real takes v returns yes
-  require rt_live(v)
+  require value_live(v)
   let c = value_class(v)
   let yes = (c == 2) or (c == 3) or (c == 4) or (c == 5)
   ensure value_class(yes) == 1
@@ -173,11 +293,11 @@ end
 
 make a function called rt_bn_norm takes a returns out
   require (value_class(a) == 9) and (list_len(a) >= 1)
-  let n = a.length
+  let n = list_len(a)
   while (n > 1) and (a[n - 1] == 0) do
     let n = n - 1
   end
-  if n == a.length then
+  if n == list_len(a) then
     let out = a
     ensure list_len(out) >= 1
     return out
@@ -198,7 +318,7 @@ make a function called rt_bn_mul_small takes a, m returns out
   let out = []
   let carry = 0
   let i = 0
-  while i < a.length do
+  while i < list_len(a) do
     let t = a[i] * m + carry
     let out = list_push(out, t band 16777215)
     let carry = t shr 24
@@ -223,7 +343,7 @@ make a function called rt_bn_shl takes a, n returns out
     let left = left - 24
   end
   let i = 0
-  while i < a.length do
+  while i < list_len(a) do
     let out = list_push(out, a[i])
     let i = i + 1
   end
@@ -241,12 +361,12 @@ make a function called rt_bn_add takes a, b returns out
   let out = []
   let carry = 0
   let i = 0
-  while (i < a.length) or (i < b.length) do
+  while (i < list_len(a)) or (i < list_len(b)) do
     let t = carry
-    if i < a.length then
+    if i < list_len(a) then
       let t = t + a[i]
     end
-    if i < b.length then
+    if i < list_len(b) then
       let t = t + b[i]
     end
     let out = list_push(out, t band 16777215)
@@ -266,9 +386,9 @@ make a function called rt_bn_sub takes a, b returns out
   let out = []
   let borrow = 0
   let i = 0
-  while i < a.length do
+  while i < list_len(a) do
     let t = a[i] - borrow
-    if i < b.length then
+    if i < list_len(b) then
       let t = t - b[i]
     end
     if t < 0 then
@@ -288,8 +408,8 @@ end
 # -1, 0 or 1 as a < b, a == b, a > b (both normalized)
 make a function called rt_bn_cmp takes a, b returns c
   require (value_class(a) == 9) and (value_class(b) == 9)
-  if a.length != b.length then
-    if a.length < b.length then
+  if list_len(a) != list_len(b) then
+    if list_len(a) < list_len(b) then
       let c = 0 - 1
       ensure (c == 0 - 1) or (c == 0) or (c == 1)
       return c
@@ -298,7 +418,7 @@ make a function called rt_bn_cmp takes a, b returns c
     ensure (c == 0 - 1) or (c == 0) or (c == 1)
     return c
   end
-  let i = a.length - 1
+  let i = list_len(a) - 1
   while i >= 0 do
     if a[i] != b[i] then
       if a[i] < b[i] then
@@ -442,7 +562,7 @@ make a function called rt_float_shortest_text takes bits returns s
   let res = rt_float_shortest(bits)
   let digits = res[0]
   let k = res[1]
-  let n = digits.length
+  let n = list_len(digits)
   let parts = []
   if word_shr(bits, 63) == 1 then
     let parts = list_push(parts, "-")

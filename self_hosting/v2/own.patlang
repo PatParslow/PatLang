@@ -14,13 +14,22 @@
 # - A call's arguments each hold a reference of their own: a variable is
 #   passed through a temporary that takes one, and every argument temporary
 #   is released right after the call. So a callee seeing a count of 1 knows
-#   nothing else holds the value, and may change it in place.
+#   nothing else holds the value, and may change it in place. A wrapper's call
+#   marked "through" hands on the parameters it was given, uncounted: the
+#   references its own caller holds are the ones the callee should see.
 # - Every other instruction's temporaries are released right after it reads
 #   them, so a value lives no longer than something holds it. A temporary
 #   no instruction reads (a call made for its effect) is released as soon
 #   as it is made.
-# - A return retains its value for the caller (rule 1), then releases every
-#   slot but the parameters.
+# - A return retains its value for the caller (rule 1), then releases what a
+#   slot can still hold there.
+#
+# A temporary made and used within one statement has nothing to release before
+# it is written, and no return can see it holding anything: its reader releases
+# and clears it. So only the slots that outlive a statement are "held": the named
+# variables, and the temporaries a branch or a return reads or a copy writes.
+# Only those start as unit and are released at a return; a result going to any
+# other temporary goes straight there.
 
 make a function called own_produces takes op returns yes
   return (op == "const") or (op == "call") or (op == "op") or (op == "un") or (op == "prim") or (op == "extern") or (op == "externf") or (op == "list") or (op == "closure") or (op == "callv")
@@ -35,15 +44,30 @@ make a function called own_function takes func returns out
   let counter = vec_new()
   vec_push(counter, nslots)
   let read = own_read_slots(instrs, nslots)
+  let held = own_held_slots(instrs, nslots, vars)
   let res = vec_new()
+  let k = nparams
+  while k < nslots do
+    if vec_get(held, k) then
+      vec_push(res, ["clear", k])
+    end
+    let k = k + 1
+  end
   let i = 0
   while i < list_len(instrs) do
     let ins = instrs[i]
     let op = ins[0]
     if own_produces(op) then
       let d = ins[1]
-      let t = own_new_slot(counter)
-      if op == "call" then
+      # the result goes straight to a temporary nothing else can be holding
+      let t = d
+      if vec_get(held, d) then
+        let t = own_new_slot(counter)
+      end
+      if (op == "call") and (list_len(ins) > 4) then
+        # through: the caller's references hold the arguments for this call too
+        vec_push(res, ["call", t, ins[2], ins[3]])
+      elif op == "call" then
         let passed = own_args(res, counter, vars, ins[3])
         vec_push(res, ["call", t, ins[2], passed])
         own_release_temps(res, passed, ins[3])
@@ -54,8 +78,10 @@ make a function called own_function takes func returns out
       else
         vec_push(res, list_set(ins, 1, t))
       end
-      vec_push(res, ["release", d])
-      vec_push(res, ["move", d, t])
+      if t != d then
+        vec_push(res, ["release", d])
+        vec_push(res, ["move", d, t])
+      end
       if (op != "call") and (op != "callv") then
         own_release_operand_temps(res, vars, own_operands(ins), d)
       end
@@ -84,7 +110,9 @@ make a function called own_function takes func returns out
       vec_push(res, ["retain", s])
       let k = nparams
       while k < nslots do
-        vec_push(res, ["release", k])
+        if vec_get(held, k) then
+          vec_push(res, ["release", k])
+        end
         let k = k + 1
       end
       vec_push(res, ins)
@@ -159,6 +187,26 @@ make a function called own_read_slots takes instrs, nslots returns read
     let i = i + 1
   end
   return read
+end
+
+# For each slot, whether it outlives a statement (see the top of this file).
+make a function called own_held_slots takes instrs, nslots, vars returns held
+  let held = vec_new()
+  let k = 0
+  while k < nslots do
+    vec_push(held, v2_contains(vars, k))
+    let k = k + 1
+  end
+  let i = 0
+  while i < list_len(instrs) do
+    let ins = instrs[i]
+    let op = ins[0]
+    if (op == "branch") or (op == "return") or (op == "copy") or (op == "take") then
+      vec_set(held, ins[1], true)
+    end
+    let i = i + 1
+  end
+  return held
 end
 
 # After an instruction, each temporary it read is released and left unit:

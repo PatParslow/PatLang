@@ -1,0 +1,326 @@
+# A Gherkin runner whose state is one explicit context, with no globals
+# (docs/plans/v2-implementation.md, section 7a). test.patlang is the older
+# runner the other suites still use.
+#
+#   let ctx = ctx_new()
+#   step(ctx, "a fresh till", "st_fresh_till")
+#   run_feature_file(ctx, "spec_library/till.feature")
+#   ctx_report(ctx)
+#
+# A step function takes the context and is called by name. It records what
+# it finds with expect(ctx, label, actual, expected), and keeps what a later
+# step needs with ctx_set(ctx, name, value) and ctx_get(ctx, name).
+#
+# The context is a vec of slots:
+#   0 checks passed       1 checks failed
+#   2 the tag filter      3 the last @tag line, until a scenario takes it
+#   4 skipping this scenario
+#   5 exact steps, a vec of 512 buckets of [text, function name]
+#   6 pattern steps, [text, function name], first registered wins
+#   7 the captures of the step being run, [name, value]
+#   8 the run's variables, [name, value]
+#   9 contract clauses deferred until a plan binds their variable
+include "gherkin_text.patlang"
+include "gherkin_clauses.patlang"
+include "step_match.patlang"
+
+make a function called ctx_new returns ctx
+  let buckets = vec_new()
+  let i = 0
+  while i < 512 do
+    vec_push(buckets, [])
+    let i = i + 1
+  end
+  let ctx = vec_new()
+  vec_push(ctx, 0)
+  vec_push(ctx, 0)
+  vec_push(ctx, "")
+  vec_push(ctx, "")
+  vec_push(ctx, false)
+  vec_push(ctx, buckets)
+  vec_push(ctx, [])
+  vec_push(ctx, [])
+  vec_push(ctx, [])
+  vec_push(ctx, [])
+  return ctx
+end
+
+make a function called ctx_failed takes ctx returns n
+  return vec_get(ctx, 1)
+end
+
+make a function called ctx_count_failure takes ctx returns done
+  vec_set(ctx, 1, vec_get(ctx, 1) + 1)
+  return true
+end
+
+make a function called expect takes ctx, label, actual, expected returns ok
+  if actual == expected then
+    vec_set(ctx, 0, vec_get(ctx, 0) + 1)
+    print("  ok: " + label)
+    return true
+  end
+  ctx_count_failure(ctx)
+  print("  FAIL: " + label + " (got " + actual + ", want " + expected + ")")
+  return false
+end
+
+make a function called ctx_report takes ctx returns ok
+  let f = vec_get(ctx, 1)
+  print("tests: " + vec_get(ctx, 0) + " passed, " + f + " failed")
+  if f == 0 then
+    print("ALL TESTS PASSED")
+    return true
+  end
+  print("TESTS FAILED")
+  return false
+end
+
+# ---- the run's variables ----
+
+make a function called ctx_var_index takes ctx, name returns i
+  let vars = vec_get(ctx, 8)
+  let i = 0
+  while i < list_len(vars) do
+    if vars[i][0] == name then
+      return i
+    end
+    let i = i + 1
+  end
+  return -1
+end
+
+make a function called ctx_has takes ctx, name returns yes
+  return ctx_var_index(ctx, name) >= 0
+end
+
+# A variable's value, false when it has none.
+make a function called ctx_get takes ctx, name returns v
+  let i = ctx_var_index(ctx, name)
+  if i < 0 then
+    return false
+  end
+  return vec_get(ctx, 8)[i][1]
+end
+
+make a function called ctx_set takes ctx, name, v returns done
+  let i = ctx_var_index(ctx, name)
+  if i < 0 then
+    vec_set(ctx, 8, list_push(vec_get(ctx, 8), [name, v]))
+  else
+    vec_set(ctx, 8, list_set(vec_get(ctx, 8), i, [name, v]))
+  end
+  return true
+end
+
+make a function called ctx_pending_contracts takes ctx returns clauses
+  return vec_get(ctx, 9)
+end
+
+make a function called ctx_clear_pending_contracts takes ctx returns done
+  vec_set(ctx, 9, [])
+  return true
+end
+
+# ---- registering steps ----
+
+# A step's bucket, from its length and its first and last characters.
+make a function called ctx_bucket takes text returns i
+  let n = text.length
+  if n == 0 then
+    return 0
+  end
+  return (n * 31 + char_code(text, 0) * 7 + char_code(text, n - 1)) % 512
+end
+
+# A text with {name} placeholders is a pattern (step_match.patlang); any other
+# is an exact step, looked up first. Registering a text again replaces it.
+make a function called step takes ctx, text, fname returns done
+  if contains_text(text, "{") then
+    return ctx_register_pattern(ctx, text, fname)
+  end
+  let buckets = vec_get(ctx, 5)
+  let k = ctx_bucket(text)
+  let entries = vec_get(buckets, k)
+  let i = 0
+  while i < list_len(entries) do
+    if entries[i][0] == text then
+      vec_set(buckets, k, list_set(entries, i, [text, fname]))
+      return true
+    end
+    let i = i + 1
+  end
+  vec_set(buckets, k, list_push(entries, [text, fname]))
+  return true
+end
+
+make a function called ctx_register_pattern takes ctx, text, fname returns done
+  let pats = vec_get(ctx, 6)
+  let i = 0
+  while i < list_len(pats) do
+    if pats[i][0] == text then
+      vec_set(ctx, 6, list_set(pats, i, [text, fname]))
+      return true
+    end
+    let i = i + 1
+  end
+  vec_set(ctx, 6, list_push(pats, [text, fname]))
+  return true
+end
+
+# The function an exact step names, false when there is none.
+make a function called ctx_exact_step takes ctx, text returns fname
+  let entries = vec_get(vec_get(ctx, 5), ctx_bucket(text))
+  let i = 0
+  while i < list_len(entries) do
+    if entries[i][0] == text then
+      return entries[i][1]
+    end
+    let i = i + 1
+  end
+  return false
+end
+
+# The first registered pattern that matches: ["ok", captures, fname] or ["no"].
+make a function called ctx_match_pattern takes ctx, text returns result
+  let pats = vec_get(ctx, 6)
+  let i = 0
+  while i < list_len(pats) do
+    let m = sm_match(pats[i][0], text)
+    if m[0] == "ok" then
+      return ["ok", m[1], pats[i][1]]
+    end
+    let i = i + 1
+  end
+  return ["no"]
+end
+
+# The text captured by {name} in the step being run.
+make a function called step_arg takes ctx, name returns value
+  let caps = vec_get(ctx, 7)
+  let i = 0
+  while i < list_len(caps) do
+    if caps[i][0] == name then
+      return caps[i][1]
+    end
+    let i = i + 1
+  end
+  return ""
+end
+
+# ---- contract clauses in a scenario ----
+
+# "And require x < 10" / "And ensure x < 10": checked now against the run's
+# variable x if it has one, else deferred until a plan binds it (see
+# gherkin_contracts.patlang's header). A deferred clause counts nothing: the
+# scenario's own expect decides what its outcome should be.
+make a function called ctx_contract_step takes ctx, kind, clause_text returns done
+  let clause = parse_contract_clause(clause_text)
+  if clause[0] == "ERR" then
+    ctx_count_failure(ctx)
+    print("  FAIL: " + clause[1])
+    return true
+  end
+  let var_name = clause[0]
+  if ctx_has(ctx, var_name) then
+    if eval_cmp_typed(clause[1], ctx_get(ctx, var_name), clause[2]) then
+      print("  ok: " + kind + " " + clause_text)
+    else
+      ctx_count_failure(ctx)
+      print("  FAIL: " + kind + " violated: " + clause_text)
+    end
+    return true
+  end
+  vec_set(ctx, 9, list_push(vec_get(ctx, 9), [kind, var_name, clause[1], clause[2]]))
+  print("  (deferred) " + kind + " " + clause_text)
+  return true
+end
+
+# ---- running features ----
+
+make a function called ctx_run_step takes ctx, text returns done
+  if starts_with(text, "require ") then
+    return ctx_contract_step(ctx, "require", substr(text, 8, text.length - 8))
+  end
+  if starts_with(text, "ensure ") then
+    return ctx_contract_step(ctx, "ensure", substr(text, 7, text.length - 7))
+  end
+  let fname = ctx_exact_step(ctx, text)
+  if fname != false then
+    apply(fname, ctx)
+    return true
+  end
+  let pm = ctx_match_pattern(ctx, text)
+  if pm[0] == "ok" then
+    vec_set(ctx, 7, pm[1])
+    apply(pm[2], ctx)
+    return true
+  end
+  ctx_count_failure(ctx)
+  print("  FAIL: undefined step: " + text)
+  return true
+end
+
+# A scenario line: whether its tags pass the filter decides whether its
+# steps run.
+make a function called ctx_start_scenario takes ctx, raw returns done
+  let filter = vec_get(ctx, 2)
+  let tags = vec_get(ctx, 3)
+  vec_set(ctx, 3, "")
+  if filter == "" then
+    vec_set(ctx, 4, false)
+    print(raw)
+  elif (tags != "") and contains_text(tags, filter) then
+    vec_set(ctx, 4, false)
+    print(raw + "  [" + tags + "]")
+  else
+    vec_set(ctx, 4, true)
+    print(raw + "  [skipped: needs " + filter + "]")
+  end
+  return true
+end
+
+make a function called ctx_run_line takes ctx, raw returns done
+  if starts_with(raw, "@") then
+    vec_set(ctx, 3, raw)
+  end
+  if starts_with(raw, "Feature:") then
+    print(raw)
+  end
+  if starts_with(raw, "Scenario:") then
+    return ctx_start_scenario(ctx, raw)
+  end
+  let text = step_text(raw)
+  if (text != "") and (not vec_get(ctx, 4)) then
+    ctx_run_step(ctx, text)
+  end
+  return true
+end
+
+# A feature file, line by line. Its bytes are read as a list, which is O(1)
+# to index under every engine; each line is built one byte at a time, so a
+# feature's text is ASCII.
+make a function called run_feature_file takes ctx, path returns ok
+  let window = 1048576
+  let offset = 0
+  let line = sb_new()
+  let more = true
+  while more do
+    let part = read_file_bytes(path, offset, window)
+    let i = 0
+    while i < list_len(part) do
+      let c = part[i]
+      if c == 10 then
+        ctx_run_line(ctx, trim_left(sb_str(line)))
+        let line = sb_new()
+      elif c != 13 then
+        sb_push(line, chr(c))
+      end
+      let i = i + 1
+    end
+    let offset = offset + list_len(part)
+    let more = list_len(part) == window
+  end
+  ctx_run_line(ctx, trim_left(sb_str(line)))
+  return true
+end
